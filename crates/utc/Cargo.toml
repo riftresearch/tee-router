@@ -7,9 +7,9 @@ repository.workspace = true
 
 [dependencies]
 chrono = { workspace = true }
-mock_instant = { workspace = true }
+mock_instant = { workspace = true, optional = true }
 
 [features]
 default = []
 # When enabled, utc::now() uses mock_instant's global SystemTime/UNIX_EPOCH.
-mock-time = []
+mock-time = ["dep:mock_instant"]

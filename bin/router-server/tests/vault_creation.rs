@@ -166,18 +166,6 @@ impl TestHarness {
         self.with_devnet(|devnet| devnet.ethereum.funded_address)
     }
 
-    fn ethereum_private_key(&self) -> String {
-        self.with_devnet(|devnet| anvil_private_key(&devnet.ethereum))
-    }
-
-    fn ethereum_paymaster_private_key(&self) -> String {
-        self.with_devnet(|devnet| anvil_paymaster_private_key(&devnet.ethereum))
-    }
-
-    fn base_paymaster_private_key(&self) -> String {
-        self.with_devnet(|devnet| anvil_paymaster_private_key(&devnet.base))
-    }
-
     fn ethereum_spawned_api_paymaster_private_key(&self) -> String {
         self.with_devnet(|devnet| anvil_spawned_api_paymaster_private_key(&devnet.ethereum))
     }
@@ -681,19 +669,12 @@ fn make_cancellation_pair() -> (String, String) {
     )
 }
 
-fn anvil_private_key(devnet: &devnet::EthDevnet) -> String {
-    format!(
-        "0x{}",
-        alloy::hex::encode(devnet.anvil.keys()[0].to_bytes())
-    )
-}
-
 /// Dedicated anvil account for the EVM paymaster in tests. Kept separate from
-/// `anvil_private_key` (account #0) because test helpers like `anvil_mint_erc20`
-/// and `anvil_send_native_on` submit from account #0 directly, which advances
-/// its on-chain nonce outside the long-lived paymaster actor's cached
-/// NonceFiller — producing "nonce too low" errors when the paymaster later
-/// tries to sponsor gas.
+/// account #0 because test helpers like `anvil_mint_erc20` and
+/// `anvil_send_native_on` submit from account #0 directly, which advances its
+/// on-chain nonce outside the long-lived paymaster actor's cached NonceFiller
+/// — producing "nonce too low" errors when the paymaster later tries to sponsor
+/// gas.
 fn anvil_paymaster_private_key(devnet: &devnet::EthDevnet) -> String {
     format!(
         "0x{}",
@@ -1879,176 +1860,6 @@ async fn maybe_provider_operation_by_type(
         .find(|operation| operation.operation_type == operation_type)
 }
 
-async fn assert_mock_failure_escalates_to_refund_required(
-    fixture: &FundedMarketOrderFixture,
-    failed_step_type: OrderExecutionStepType,
-    expected_error: &str,
-) {
-    let execution_manager = OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        Arc::new(ActionProviderRegistry::mock_http(fixture.mocks.base_url())),
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    );
-    execution_manager.process_planning_pass(10).await.unwrap();
-
-    // Drive the order forward until the retry budget is exhausted and the
-    // order is escalated to refund_required. Each async leg must be advanced
-    // in lockstep: AcrossBridge waits for a FundsDeposited event, UnitDeposit
-    // waits for a mock unit operation to complete + a chain-detector hint, and
-    // so on.
-    let mut across_hint_recorded = false;
-    let mut destination_vault_funded = false;
-    let mut unit_deposit_hint_recorded = false;
-    let start = std::time::Instant::now();
-    let terminal = loop {
-        execution_manager.process_worker_pass(10).await.unwrap();
-
-        let operations = fixture
-            .db
-            .orders()
-            .get_provider_operations(fixture.order_id)
-            .await
-            .unwrap();
-        let across_operation = operations
-            .iter()
-            .find(|op| op.operation_type == ProviderOperationType::AcrossBridge)
-            .cloned();
-        let unit_deposit_operation = operations
-            .iter()
-            .find(|op| op.operation_type == ProviderOperationType::UnitDeposit)
-            .cloned();
-
-        if !across_hint_recorded {
-            if let Some(op) = across_operation.as_ref() {
-                if matches!(op.status, ProviderOperationStatus::WaitingExternal) {
-                    wait_for_across_deposit_indexed(
-                        &fixture.mocks,
-                        fixture.vault_address,
-                        Duration::from_secs(10),
-                    )
-                    .await;
-                    record_detector_provider_status_hint(&execution_manager, op).await;
-                    execution_manager
-                        .process_provider_operation_hints(10)
-                        .await
-                        .unwrap();
-                    across_hint_recorded = true;
-                    // Fund the destination vault in the same iteration to avoid
-                    // racing the next worker pass that would kick off UnitDeposit.
-                    if !destination_vault_funded {
-                        fund_destination_execution_vault_from_across(&fixture.db, fixture.order_id)
-                            .await;
-                        destination_vault_funded = true;
-                    }
-                }
-            }
-        }
-
-        if !unit_deposit_hint_recorded {
-            if let Some(op) = unit_deposit_operation.as_ref() {
-                if matches!(op.status, ProviderOperationStatus::WaitingExternal) {
-                    fixture
-                        .mocks
-                        .complete_unit_operation(provider_ref(op))
-                        .await
-                        .unwrap();
-                    record_chain_detector_unit_deposit_hint(&execution_manager, &fixture.db, op)
-                        .await;
-                    execution_manager
-                        .process_provider_operation_hints(10)
-                        .await
-                        .unwrap();
-                    let op = fixture
-                        .db
-                        .orders()
-                        .get_provider_operation(op.id)
-                        .await
-                        .unwrap();
-                    credit_hyperliquid_spot_from_unit_deposit(
-                        &fixture.mocks,
-                        &fixture.db,
-                        fixture.order_id,
-                        &op,
-                    )
-                    .await;
-                    unit_deposit_hint_recorded = true;
-                }
-            }
-        }
-
-        let order = fixture.db.orders().get(fixture.order_id).await.unwrap();
-        if matches!(
-            order.status,
-            RouterOrderStatus::RefundRequired
-                | RouterOrderStatus::Refunding
-                | RouterOrderStatus::Refunded
-                | RouterOrderStatus::Failed
-                | RouterOrderStatus::Completed
-        ) {
-            break order;
-        }
-        if start.elapsed() >= Duration::from_secs(15) {
-            dump_order_state(&fixture.db, fixture.order_id).await;
-            panic!(
-                "order {} did not reach a terminal state within 15s while expecting `{}`",
-                fixture.order_id, expected_error
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
-
-    assert_eq!(terminal.status, RouterOrderStatus::RefundRequired);
-    let vault = fixture.db.vaults().get(fixture.vault_id).await.unwrap();
-    assert_eq!(vault.status, DepositVaultStatus::RefundRequired);
-    let internal_vaults = internal_custody_vaults_for_order(&fixture.db, fixture.order_id).await;
-    if !internal_vaults.is_empty() {
-        assert!(internal_vaults.iter().all(|vault| {
-            vault.status == CustodyVaultStatus::Failed
-                && vault.metadata["lifecycle_terminal_reason"] == json!("order_refund_required")
-                && vault.metadata["lifecycle_order_status"] == json!("refund_required")
-                && vault.metadata["lifecycle_balance_verified"] == json!(false)
-        }));
-    }
-    let attempts = fixture
-        .db
-        .orders()
-        .get_execution_attempts(fixture.order_id)
-        .await
-        .unwrap();
-    assert_eq!(attempts.len(), 3);
-    assert_eq!(attempts[0].status, OrderExecutionAttemptStatus::Failed);
-    assert_eq!(attempts[1].status, OrderExecutionAttemptStatus::Failed);
-    assert_eq!(
-        attempts[2].status,
-        OrderExecutionAttemptStatus::RefundRequired
-    );
-    assert_eq!(
-        attempts[2].attempt_kind,
-        OrderExecutionAttemptKind::RefundRecovery
-    );
-    let steps = fixture
-        .db
-        .orders()
-        .get_execution_steps(fixture.order_id)
-        .await
-        .unwrap();
-    let failed_step = steps
-        .iter()
-        .filter(|step| {
-            step.step_type == failed_step_type && step.status == OrderExecutionStepStatus::Failed
-        })
-        .max_by_key(|step| step.created_at)
-        .unwrap_or_else(|| {
-            dump_order_state_sync(&steps);
-            panic!(
-                "no step of type {:?} found; expected error `{}`",
-                failed_step_type, expected_error
-            )
-        });
-    assert!(failed_step.error.to_string().contains(expected_error));
-}
-
 async fn drive_unit_deposit_failures_to_refund_required(
     fixture: &FundedMarketOrderFixture,
     error_message: &str,
@@ -2111,15 +1922,6 @@ async fn drive_unit_deposit_failures_to_refund_required(
     assert_eq!(vault.status, DepositVaultStatus::RefundRequired);
 
     execution_manager
-}
-
-fn dump_order_state_sync(steps: &[OrderExecutionStep]) {
-    for step in steps {
-        eprintln!(
-            "step #{} type={:?} status={:?} error={}",
-            step.step_index, step.step_type, step.status, step.error
-        );
-    }
 }
 
 #[tokio::test]

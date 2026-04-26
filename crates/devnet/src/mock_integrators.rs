@@ -776,35 +776,6 @@ impl MockIntegratorLedger {
             hyperliquid_exchange_submissions,
         }
     }
-
-    fn credit_hyperliquid(&mut self, order_id: Uuid, asset: &MockAssetRef, amount: u128) {
-        credit(
-            &mut self.hyperliquid_balances,
-            balance_key(order_id, asset),
-            amount,
-        );
-    }
-
-    fn debit_hyperliquid(
-        &mut self,
-        order_id: Uuid,
-        asset: &MockAssetRef,
-        amount: u128,
-    ) -> Result<(), String> {
-        debit(
-            &mut self.hyperliquid_balances,
-            balance_key(order_id, asset),
-            amount,
-        )
-    }
-
-    fn credit_recipient(&mut self, recipient: &str, asset: &MockAssetRef, amount: u128) {
-        credit(
-            &mut self.recipient_balances,
-            recipient_balance_key(recipient, asset),
-            amount,
-        );
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -4121,38 +4092,11 @@ fn parse_amount(field: &str, value: &str) -> Result<u128, String> {
     Ok(amount)
 }
 
-fn credit(balances: &mut BTreeMap<String, u128>, key: String, amount: u128) {
-    *balances.entry(key).or_default() += amount;
-}
-
-fn debit(balances: &mut BTreeMap<String, u128>, key: String, amount: u128) -> Result<(), String> {
-    let balance = balances.entry(key.clone()).or_default();
-    if *balance < amount {
-        return Err(format!(
-            "insufficient mock balance for {key}: have {}, need {amount}",
-            *balance
-        ));
-    }
-    *balance -= amount;
-    if *balance == 0 {
-        balances.remove(&key);
-    }
-    Ok(())
-}
-
 fn stringify_balances(balances: &BTreeMap<String, u128>) -> BTreeMap<String, String> {
     balances
         .iter()
         .map(|(key, value)| (key.clone(), value.to_string()))
         .collect()
-}
-
-fn balance_key(order_id: Uuid, _asset: &MockAssetRef) -> String {
-    format!("order:{order_id}")
-}
-
-fn recipient_balance_key(recipient: &str, asset: &MockAssetRef) -> String {
-    format!("recipient:{recipient}:{}:{}", asset.chain_id, asset.asset)
 }
 
 #[derive(Debug, Serialize)]
