@@ -1,0 +1,1115 @@
+//! `lib.rs` — central library code.
+
+pub mod across_spoke_pool_mock;
+pub mod bitcoin_devnet;
+pub mod evm_devnet;
+pub mod hyperliquid_bridge_mock;
+pub mod mock_integrators;
+pub mod token_indexerd;
+
+pub use bitcoin_devnet::BitcoinDevnet;
+use blockchain_utils::P2WPKHBitcoinWallet;
+pub use evm_devnet::EthDevnet;
+
+use evm_devnet::ForkConfig;
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+use tempfile::NamedTempFile;
+use tokio::task::JoinSet;
+use tokio::time::Instant;
+use tracing::{info, warn};
+
+use bitcoincore_rpc_async::RpcApi;
+
+use alloy::{
+    network::EthereumWallet,
+    primitives::{keccak256, Address},
+    providers::Provider,
+    signers::local::LocalSigner,
+};
+
+// ================== Deploy Function ================== //
+
+use crate::evm_devnet::Mode;
+
+const _LOG_CHUNK_SIZE: u64 = 10000;
+
+pub struct RiftDevnetCache {
+    pub cache_dir: PathBuf,
+    populated: bool,
+}
+
+const CACHE_DIR_NAME: &str = "rift-devnet";
+const BITCOIN_DATADIR_NAME: &str = "bitcoin-datadir";
+const ESPLORA_DATADIR_NAME: &str = "esplora-datadir";
+const ANVIL_DATADIR_NAME: &str = "anvil-datadir";
+const ANVIL_BASE_DATADIR_NAME: &str = "anvil-base-datadir";
+const TEMP_DIR_NAME: &str = "tmp";
+const TEMP_ENTRY_PREFIX: &str = "rift-devnet-p";
+const ERROR_MESSAGE: &str = "Cache must be populated before utilizing it,";
+
+pub fn get_new_temp_dir() -> Result<tempfile::TempDir> {
+    let temp_root = devnet_temp_root()?;
+    let prefix = current_process_temp_entry_prefix();
+    tempfile::Builder::new()
+        .prefix(&prefix)
+        .tempdir_in(temp_root)
+        .map_err(|e| eyre::eyre!("Failed to create devnet temp directory: {}", e).into())
+}
+
+pub fn get_new_temp_file() -> Result<NamedTempFile> {
+    let temp_root = devnet_temp_root()?;
+    let prefix = current_process_temp_entry_prefix();
+    tempfile::Builder::new()
+        .prefix(&prefix)
+        .tempfile_in(temp_root)
+        .map_err(|e| eyre::eyre!("Failed to create devnet temp file: {}", e).into())
+}
+
+fn devnet_cache_root() -> Result<PathBuf> {
+    dirs::cache_dir()
+        .map(|cache_dir| cache_dir.join(CACHE_DIR_NAME))
+        .ok_or_else(|| eyre::eyre!("Failed to find user cache directory").into())
+}
+
+fn devnet_temp_root() -> Result<PathBuf> {
+    let temp_root = devnet_temp_root_path()?;
+    std::fs::create_dir_all(&temp_root)
+        .map_err(|e| eyre::eyre!("Failed to create devnet temp root: {}", e))?;
+    Ok(temp_root)
+}
+
+fn devnet_temp_root_path() -> Result<PathBuf> {
+    Ok(devnet_cache_root()?.join(TEMP_DIR_NAME))
+}
+
+fn current_process_temp_entry_prefix() -> String {
+    format!("{TEMP_ENTRY_PREFIX}{}-", std::process::id())
+}
+
+pub fn cleanup_current_process_temp_dirs() -> Result<usize> {
+    let temp_root = devnet_temp_root_path()?;
+    if !temp_root.exists() {
+        return Ok(0);
+    }
+
+    cleanup_temp_entries_for_pid(&temp_root, std::process::id())
+        .map_err(|e| eyre::eyre!("Failed to cleanup current devnet temp dirs: {}", e).into())
+}
+
+pub fn cleanup_stale_devnet_temp_dirs() -> Result<usize> {
+    let temp_root = devnet_temp_root_path()?;
+    if !temp_root.exists() {
+        return Ok(0);
+    }
+
+    cleanup_stale_temp_entries(&temp_root)
+        .map_err(|e| eyre::eyre!("Failed to cleanup stale devnet temp dirs: {}", e).into())
+}
+
+fn cleanup_temp_entries_for_pid(temp_root: &Path, pid: u32) -> io::Result<usize> {
+    let mut removed = 0;
+    for entry in fs::read_dir(temp_root)? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+
+        if temp_entry_pid(file_name) == Some(pid) {
+            remove_temp_entry(&entry.path())?;
+            removed += 1;
+        }
+    }
+
+    Ok(removed)
+}
+
+fn cleanup_stale_temp_entries(temp_root: &Path) -> io::Result<usize> {
+    let current_pid = std::process::id();
+    let mut removed = 0;
+    for entry in fs::read_dir(temp_root)? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(pid) = temp_entry_pid(file_name) else {
+            continue;
+        };
+
+        if pid != current_pid && !process_is_running(pid) {
+            remove_temp_entry(&entry.path())?;
+            removed += 1;
+        }
+    }
+
+    Ok(removed)
+}
+
+fn temp_entry_pid(file_name: &str) -> Option<u32> {
+    let rest = file_name.strip_prefix(TEMP_ENTRY_PREFIX)?;
+    let (pid, _) = rest.split_once('-')?;
+    pid.parse().ok()
+}
+
+fn remove_temp_entry(path: &Path) -> io::Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+
+    if metadata.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
+#[cfg(unix)]
+fn process_is_running(pid: u32) -> bool {
+    let status = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    status == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn process_is_running(_pid: u32) -> bool {
+    true
+}
+
+impl Default for RiftDevnetCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RiftDevnetCache {
+    #[must_use]
+    pub fn new() -> Self {
+        let cache_dir = devnet_cache_root().expect("Failed to find user cache directory");
+        let populated = Self::cache_is_populated(&cache_dir);
+        Self {
+            cache_dir,
+            populated,
+        }
+    }
+
+    fn cache_is_populated(cache_dir: &Path) -> bool {
+        [
+            BITCOIN_DATADIR_NAME,
+            ESPLORA_DATADIR_NAME,
+            ANVIL_DATADIR_NAME,
+            ANVIL_BASE_DATADIR_NAME,
+        ]
+        .iter()
+        .all(|dir_name| cache_dir.join(dir_name).is_dir())
+    }
+
+    /// Generic helper to copy a cached directory to a new temporary directory
+    async fn copy_cached_dir(
+        &self,
+        dir_name: &str,
+        operation_name: &str,
+    ) -> Result<tempfile::TempDir> {
+        if !self.populated {
+            return Err(eyre::eyre!("{} {}", ERROR_MESSAGE, operation_name).into());
+        }
+
+        let cache_dir = self.cache_dir.join(dir_name);
+        let temp_dir = get_new_temp_dir()?;
+
+        // We need to copy the directory contents, not the directory itself
+        let output = tokio::process::Command::new("cp")
+            .arg("-R")
+            .arg(format!("{}/.", cache_dir.to_string_lossy()))
+            .arg(temp_dir.path())
+            .output()
+            .await
+            .map_err(|e| eyre::eyre!("Failed to copy {}: {}", operation_name, e))?;
+
+        if !output.status.success() {
+            return Err(eyre::eyre!(
+                "Failed to copy {}: {}",
+                operation_name,
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+
+        Ok(temp_dir)
+    }
+
+    pub async fn create_bitcoin_datadir(&self) -> Result<tempfile::TempDir> {
+        let temp_dir = self
+            .copy_cached_dir(BITCOIN_DATADIR_NAME, "bitcoin datadir")
+            .await?;
+
+        // Remove the cached .cookie file as bitcoind will generate a new one
+        let cookie_path = temp_dir.path().join("regtest").join(".cookie");
+        if cookie_path.exists() {
+            tokio::fs::remove_file(&cookie_path)
+                .await
+                .map_err(|e| eyre::eyre!("Failed to remove cookie file: {}", e))?;
+            tracing::info!("Removed cached .cookie file to allow bitcoind to generate a new one");
+        }
+
+        Ok(temp_dir)
+    }
+
+    pub async fn create_electrsd_datadir(&self) -> Result<tempfile::TempDir> {
+        self.copy_cached_dir(ESPLORA_DATADIR_NAME, "electrsd datadir")
+            .await
+    }
+
+    pub async fn create_anvil_datadir(&self) -> Result<tempfile::TempDir> {
+        self.copy_cached_dir(ANVIL_DATADIR_NAME, "anvil datadir")
+            .await
+    }
+
+    pub async fn create_anvil_base_datadir(&self) -> Result<tempfile::TempDir> {
+        self.copy_cached_dir(ANVIL_BASE_DATADIR_NAME, "anvil base datadir")
+            .await
+    }
+
+    pub async fn save_devnet(&self, mut devnet: RiftDevnet) -> Result<()> {
+        use fs2::FileExt;
+        use std::fs;
+        let save_start = Instant::now();
+
+        // Create cache directory if it doesn't exist
+        fs::create_dir_all(&self.cache_dir)
+            .map_err(|e| eyre::eyre!("Failed to create cache directory: {}", e))?;
+
+        // Get a file lock to prevent concurrent saves
+        let lock_file_path = self.cache_dir.join(".lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&lock_file_path)
+            .map_err(|e| eyre::eyre!("Failed to open lock file: {}", e))?;
+
+        // Try to get exclusive lock
+        lock_file
+            .try_lock_exclusive()
+            .map_err(|_| eyre::eyre!("Another process is already saving the cache"))?;
+
+        // Check if cache was populated while waiting for lock
+        if self.cache_dir.join(BITCOIN_DATADIR_NAME).exists() {
+            tracing::info!("Cache already populated by another process");
+            return Ok(());
+        }
+
+        info!("[Cache] Starting devnet save to cache...");
+
+        // stop all tasks in the join set so the services dont complain about bitcoin + evm shutting down
+        devnet.join_set.abort_all();
+
+        // 1. Gracefully shut down Bitcoin Core to ensure all blocks are flushed to disk
+        let bitcoin_shutdown_start = Instant::now();
+        info!("[Cache] Shutting down Bitcoin Core to flush all data to disk...");
+        match devnet.bitcoin.rpc_client.stop().await {
+            Ok(_) => {
+                info!("[Cache] Bitcoin Core shutdown initiated successfully");
+                // Wait a bit for shutdown to complete
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                info!(
+                    "[Cache] Bitcoin shutdown took {:?}",
+                    bitcoin_shutdown_start.elapsed()
+                );
+            }
+            Err(e) => {
+                // If stop fails, it might already be shutting down or have other issues
+                tracing::warn!(
+                    "Failed to stop Bitcoin Core gracefully: {}. Proceeding anyway.",
+                    e
+                );
+            }
+        }
+
+        // 2. Gracefully shut down the Ethereum anvil instance
+        let anvil_shutdown_start = Instant::now();
+        info!("[Cache] Shutting down Ethereum Anvil to flush all data to disk...");
+        let anvil_pid = devnet.ethereum.anvil.child().id();
+        tokio::process::Command::new("kill")
+            .arg("-SIGTERM")
+            .arg(anvil_pid.to_string())
+            .output()
+            .await
+            .map_err(|e| eyre::eyre!("Failed to shutdown Ethereum Anvil: {}", e))?;
+        info!(
+            "[Cache] Ethereum Anvil shutdown took {:?}",
+            anvil_shutdown_start.elapsed()
+        );
+
+        // 3. Gracefully shut down the Base anvil instance
+        let base_anvil_shutdown_start = Instant::now();
+        info!("[Cache] Shutting down Base Anvil to flush all data to disk...");
+        let base_anvil_pid = devnet.base.anvil.child().id();
+        tokio::process::Command::new("kill")
+            .arg("-SIGTERM")
+            .arg(base_anvil_pid.to_string())
+            .output()
+            .await
+            .map_err(|e| eyre::eyre!("Failed to shutdown Base Anvil: {}", e))?;
+        info!(
+            "[Cache] Base Anvil shutdown took {:?}",
+            base_anvil_shutdown_start.elapsed()
+        );
+
+        // 2. Save Bitcoin datadir (now with all blocks properly flushed)
+        let _copy_start = Instant::now();
+        info!("[Cache] Starting to copy directories to cache...");
+        let bitcoin_datadir_src = devnet.bitcoin.bitcoin_datadir.path();
+        let bitcoin_datadir_dst = self.cache_dir.join(BITCOIN_DATADIR_NAME);
+        let bitcoin_copy_start = Instant::now();
+        Self::copy_dir_recursive(bitcoin_datadir_src, &bitcoin_datadir_dst)
+            .await
+            .map_err(|e| eyre::eyre!("Failed to copy Bitcoin datadir: {}", e))?;
+        info!(
+            "[Cache] Bitcoin datadir copied in {:?}",
+            bitcoin_copy_start.elapsed()
+        );
+
+        // Remove the .cookie file from cache as it will be regenerated on startup
+        let cached_cookie = bitcoin_datadir_dst.join("regtest").join(".cookie");
+        if cached_cookie.exists() {
+            tokio::fs::remove_file(&cached_cookie)
+                .await
+                .map_err(|e| eyre::eyre!("Failed to remove .cookie file: {}", e))?;
+            info!("[Cache] Removed .cookie file from cache");
+        }
+
+        // 4. Save Electrsd datadir
+        let electrsd_datadir_src = devnet.bitcoin.electrsd_datadir.path();
+        let electrsd_datadir_dst = self.cache_dir.join(ESPLORA_DATADIR_NAME);
+        let electrsd_copy_start = Instant::now();
+        Self::copy_dir_recursive(electrsd_datadir_src, &electrsd_datadir_dst).await?;
+        info!(
+            "[Cache] Electrsd datadir copied in {:?}",
+            electrsd_copy_start.elapsed()
+        );
+
+        // 7. Save Ethereum Anvil state file
+        // Anvil automatically dumps state on exit to the anvil_datafile when --dump-state is used
+        // We just need to copy it to our cache directory
+        let anvil_dump_path = devnet.ethereum.anvil_dump_path.path();
+        info!(
+            "[Cache] Saving Ethereum anvil state from {}",
+            anvil_dump_path.to_string_lossy()
+        );
+
+        let anvil_dst = self.cache_dir.join(ANVIL_DATADIR_NAME);
+        let anvil_copy_start = Instant::now();
+        Self::copy_dir_recursive(anvil_dump_path, &anvil_dst).await?;
+        info!(
+            "[Cache] Ethereum Anvil state copied in {:?}",
+            anvil_copy_start.elapsed()
+        );
+
+        // 8. Save Base Anvil state file
+        let base_anvil_dump_path = devnet.base.anvil_dump_path.path();
+        info!(
+            "[Cache] Saving Base anvil state from {}",
+            base_anvil_dump_path.to_string_lossy()
+        );
+
+        let base_anvil_dst = self.cache_dir.join(ANVIL_BASE_DATADIR_NAME);
+        let base_anvil_copy_start = Instant::now();
+        Self::copy_dir_recursive(base_anvil_dump_path, &base_anvil_dst).await?;
+        info!(
+            "[Cache] Base Anvil state copied in {:?}",
+            base_anvil_copy_start.elapsed()
+        );
+
+        // Release lock by dropping it
+        drop(lock_file);
+
+        info!(
+            "[Cache] Devnet saved to cache successfully! Total time: {:?}",
+            save_start.elapsed()
+        );
+        Ok(())
+    }
+
+    async fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
+        tokio::fs::create_dir_all(dst)
+            .await
+            .map_err(|e| eyre::eyre!("Failed to create directory: {}", e))?;
+
+        // Copy contents of src to dst
+        let output = tokio::process::Command::new("cp")
+            .arg("-R")
+            .arg(format!("{}/.", src.to_string_lossy()))
+            .arg(dst)
+            .output()
+            .await
+            .map_err(|e| eyre::eyre!("Failed to copy directory: {}", e))?;
+
+        if !output.status.success() {
+            return Err(eyre::eyre!(
+                "Failed to copy directory: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_is_populated_requires_all_persistent_directories() {
+        let cache_dir = tempfile::tempdir().expect("create temp cache dir");
+
+        std::fs::create_dir(cache_dir.path().join(TEMP_DIR_NAME)).expect("create temp dir");
+        assert!(!RiftDevnetCache::cache_is_populated(cache_dir.path()));
+
+        for dir_name in [
+            BITCOIN_DATADIR_NAME,
+            ESPLORA_DATADIR_NAME,
+            ANVIL_DATADIR_NAME,
+            ANVIL_BASE_DATADIR_NAME,
+        ] {
+            std::fs::create_dir(cache_dir.path().join(dir_name))
+                .expect("create persistent cache dir");
+        }
+
+        assert!(RiftDevnetCache::cache_is_populated(cache_dir.path()));
+    }
+
+    #[test]
+    fn temp_entry_pid_only_parses_pid_scoped_devnet_names() {
+        assert_eq!(temp_entry_pid("rift-devnet-p123-abc"), Some(123));
+        assert_eq!(temp_entry_pid("rift-devnet-p123-abc.tmp"), Some(123));
+        assert_eq!(temp_entry_pid("rift-devnet-legacy"), None);
+        assert_eq!(temp_entry_pid("other-p123-abc"), None);
+    }
+
+    #[test]
+    fn cleanup_temp_entries_for_pid_removes_only_matching_entries() {
+        let temp_root = tempfile::tempdir().expect("create temp root");
+        let matching_dir = temp_root.path().join("rift-devnet-p123-alpha");
+        let matching_file = temp_root.path().join("rift-devnet-p123-beta");
+        let other_pid_dir = temp_root.path().join("rift-devnet-p456-alpha");
+        let legacy_dir = temp_root.path().join("rift-devnet-legacy");
+
+        std::fs::create_dir(&matching_dir).expect("create matching dir");
+        std::fs::write(matching_dir.join("state.json"), "{}").expect("write nested file");
+        std::fs::write(&matching_file, "{}").expect("write matching file");
+        std::fs::create_dir(&other_pid_dir).expect("create other pid dir");
+        std::fs::create_dir(&legacy_dir).expect("create legacy dir");
+
+        let removed =
+            cleanup_temp_entries_for_pid(temp_root.path(), 123).expect("cleanup pid entries");
+
+        assert_eq!(removed, 2);
+        assert!(!matching_dir.exists());
+        assert!(!matching_file.exists());
+        assert!(other_pid_dir.exists());
+        assert!(legacy_dir.exists());
+    }
+}
+
+#[derive(Debug, snafu::Snafu)]
+pub enum DevnetError {
+    #[snafu(display("Failed to build devnet: {}", source))]
+    Build { source: eyre::Report },
+
+    #[snafu(display("Timeout waiting for esplora to sync after {timeout:?}"))]
+    EsploraSyncTimeout { timeout: std::time::Duration },
+}
+
+impl From<eyre::Report> for DevnetError {
+    fn from(report: eyre::Report) -> Self {
+        DevnetError::Build { source: report }
+    }
+}
+
+pub type Result<T, E = DevnetError> = std::result::Result<T, E>;
+
+// ================== RiftDevnet ================== //
+
+/// The "combined" Devnet which holds:
+/// - a `BitcoinDevnet`
+/// - an `EthDevnet` for Ethereum (chain ID 31337)
+/// - an `EthDevnet` for Base (chain ID 8453, port 50102)
+pub struct RiftDevnet {
+    pub bitcoin: Arc<BitcoinDevnet>,
+    pub ethereum: Arc<EthDevnet>,
+    pub base: Arc<EthDevnet>,
+    pub join_set: JoinSet<Result<()>>,
+}
+
+impl RiftDevnet {
+    #[must_use]
+    pub fn builder() -> RiftDevnetBuilder {
+        RiftDevnetBuilder::new()
+    }
+
+    #[must_use]
+    pub fn builder_for_cached() -> RiftDevnetBuilder {
+        RiftDevnetBuilder::for_cached()
+    }
+}
+
+/// A builder for configuring a `RiftDevnet` instantiation.
+#[derive(Default)]
+pub struct RiftDevnetBuilder {
+    interactive: bool,
+    funded_evm_addresses: Vec<String>,
+    funded_bitcoin_addreses: Vec<String>,
+    fork_config: Option<ForkConfig>,
+    using_esplora: bool,
+    token_indexer_database_url: Option<String>,
+    bitcoin_mining_mode: crate::bitcoin_devnet::MiningMode,
+}
+
+impl RiftDevnetBuilder {
+    /// Create a new builder with all default values.
+    #[must_use]
+    pub fn new() -> Self {
+        Default::default()
+    }
+
+    /// Create a builder with settings for a cached devnet.
+    #[must_use]
+    pub fn for_cached() -> Self {
+        RiftDevnetBuilder {
+            interactive: false,
+            funded_evm_addresses: vec![],
+            funded_bitcoin_addreses: vec![],
+            fork_config: None,
+            using_esplora: true,
+            token_indexer_database_url: None,
+            bitcoin_mining_mode: crate::bitcoin_devnet::MiningMode::default(),
+        }
+    }
+
+    /// Toggle whether the devnet runs in "interactive" mode:
+    /// - If true, binds Anvil on a stable port and starts a local `RiftIndexerServer`.
+    /// - If false, does minimal ephemeral setup.
+    #[must_use]
+    pub fn interactive(mut self, value: bool) -> Self {
+        self.interactive = value;
+        self
+    }
+
+    pub fn using_token_indexer(mut self, database_url: String) -> Self {
+        self.token_indexer_database_url = Some(database_url);
+        self
+    }
+
+    /// Optionally fund a given EVM address with Ether and tokens.
+    pub fn funded_evm_address<T: Into<String>>(mut self, address: T) -> Self {
+        self.funded_evm_addresses.push(address.into());
+        self
+    }
+
+    /// Optionally fund a given Bitcoin address.
+    pub fn funded_bitcoin_address<T: Into<String>>(mut self, address: T) -> Self {
+        self.funded_bitcoin_addreses.push(address.into());
+        self
+    }
+
+    pub fn bitcoin_mining_mode(mut self, mining_mode: crate::bitcoin_devnet::MiningMode) -> Self {
+        self.bitcoin_mining_mode = mining_mode;
+        self
+    }
+
+    /// Provide a fork configuration (RPC URL/block) if you want to fork a public chain.
+    #[must_use]
+    pub fn fork_config(mut self, config: ForkConfig) -> Self {
+        self.fork_config = Some(config);
+        self
+    }
+
+    /// Start a blockstream/electrs esplora REST API server for bitcoin data indexing.
+    #[must_use]
+    pub fn using_esplora(mut self, value: bool) -> Self {
+        self.using_esplora = value;
+        self
+    }
+
+    pub async fn build(self) -> Result<(crate::RiftDevnet, u64)> {
+        match cleanup_stale_devnet_temp_dirs() {
+            Ok(removed) if removed > 0 => {
+                tracing::info!("Removed {removed} stale devnet temp entries");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!("Failed to cleanup stale devnet temp entries: {error}");
+            }
+        }
+
+        // dont bother with the cache if we're in interactive mode for now
+        // could help startup time a little bit if we care to enable it later
+        if self.interactive {
+            Ok(self.build_internal(None).await?)
+        } else {
+            let cache = Arc::new(RiftDevnetCache::new());
+
+            if cache.populated {
+                tracing::info!("Cache directory exists, loading devnet from cache...");
+                let (devnet, funded_sats) = self.build_internal(Some(cache.clone())).await?;
+                Ok((devnet, funded_sats))
+            } else {
+                tracing::info!("Cache directory does not exist, building fresh devnet...");
+                let (devnet, funded_sats) = self.build_internal(None).await?;
+                Ok((devnet, funded_sats))
+            }
+        }
+    }
+
+    /// Actually build the `RiftDevnet`, consuming this builder.
+    ///
+    /// Returns a tuple of:
+    ///   - The devnet instance
+    ///   - The number of satoshis funded to `funded_bitcoin_address` (if any)
+    async fn build_internal(
+        self,
+        devnet_cache: Option<Arc<RiftDevnetCache>>,
+    ) -> Result<(crate::RiftDevnet, u64)> {
+        let build_start = Instant::now();
+        info!("[Devnet Builder] Starting devnet build...");
+        let mut join_set = JoinSet::new();
+
+        // 1) Bitcoin side
+        let bitcoin_start = Instant::now();
+        let bitcoin_setup = crate::bitcoin_devnet::BitcoinDevnet::setup(
+            self.funded_bitcoin_addreses.clone(),
+            self.using_esplora,
+            self.interactive,
+            self.bitcoin_mining_mode,
+            &mut join_set,
+            devnet_cache.clone(),
+        )
+        .await;
+        let (bitcoin_devnet, current_mined_height) = match bitcoin_setup {
+            Ok(result) => result,
+            Err(error) if devnet_cache.is_some() => {
+                warn!(
+                    "Cached Bitcoin devnet setup failed: {}. Retrying with a fresh bitcoin datadir.",
+                    error
+                );
+                crate::bitcoin_devnet::BitcoinDevnet::setup(
+                    self.funded_bitcoin_addreses.clone(),
+                    self.using_esplora,
+                    self.interactive,
+                    self.bitcoin_mining_mode,
+                    &mut join_set,
+                    None,
+                )
+                .await
+                .map_err(|retry_error| {
+                    eyre::eyre!(
+                        "[devnet builder] Failed to setup Bitcoin devnet from cache ({}) and fresh ({})",
+                        error,
+                        retry_error
+                    )
+                })?
+            }
+            Err(error) => {
+                return Err(eyre::eyre!(
+                    "[devnet builder] Failed to setup Bitcoin devnet: {}",
+                    error
+                )
+                .into())
+            }
+        };
+        info!(
+            "[Devnet Builder] Bitcoin devnet setup took {:?}",
+            bitcoin_start.elapsed()
+        );
+
+        // Drop build lock here, only really necessary for bitcoin devnet setup
+        let funding_sats = bitcoin_devnet.funded_sats;
+
+        // 2) Collect Bitcoin checkpoint leaves
+        info!(
+            "[Devnet Builder] Processing checkpoint leaves from block range 0..{current_mined_height}"
+        );
+
+        let deploy_mode = if let Some(fork_config) = self.fork_config.clone() {
+            Mode::Fork(fork_config)
+        } else {
+            Mode::Local
+        };
+
+        // 5) Ethereum side (chain ID 31337, default port)
+        let ethereum_start = Instant::now();
+
+        let ethereum_devnet = crate::evm_devnet::EthDevnet::setup(
+            deploy_mode.clone(),
+            devnet_cache.clone(),
+            self.token_indexer_database_url.clone(),
+            self.interactive,
+            1, // Ethereum chain ID
+            if self.interactive { Some(50101) } else { None },
+            if self.interactive { Some(50104) } else { None }, // Ethereum token indexer port
+        )
+        .await
+        .map_err(|e| eyre::eyre!("[devnet builder] Failed to setup Ethereum devnet: {}", e))?;
+
+        info!(
+            "[Devnet Builder] Ethereum devnet setup took {:?}",
+            ethereum_start.elapsed()
+        );
+
+        // 6) Base side (chain ID 8453, port 50102 in interactive mode)
+        let base_start = Instant::now();
+
+        let base_devnet = crate::evm_devnet::EthDevnet::setup(
+            deploy_mode,
+            devnet_cache.clone(), // Use cache for Base
+            self.token_indexer_database_url.clone(),
+            self.interactive,
+            8453,                                              // Base chain ID
+            if self.interactive { Some(50102) } else { None }, // Base port
+            if self.interactive { Some(50105) } else { None }, // Base token indexer port
+        )
+        .await
+        .map_err(|e| eyre::eyre!("[devnet builder] Failed to setup Base devnet: {}", e))?;
+
+        info!(
+            "[Devnet Builder] Base devnet setup took {:?}",
+            base_start.elapsed()
+        );
+
+        // 9) Fund optional EVM address with Ether + tokens on both chains
+        let funding_start = if self.funded_evm_addresses.is_empty() {
+            None
+        } else {
+            info!(
+                "[Devnet Builder] Funding {} EVM addresses on Ethereum and Base...",
+                self.funded_evm_addresses.len()
+            );
+            Some(Instant::now())
+        };
+        for addr_str in self.funded_evm_addresses.clone() {
+            use alloy::primitives::Address;
+            use std::str::FromStr;
+            let address = Address::from_str(&addr_str)
+                .map_err(|e| eyre::eyre!("Failed to parse EVM address: {}", e))?;
+
+            // ~10 ETH on Ethereum
+            ethereum_devnet
+                .fund_eth_address(
+                    address,
+                    alloy::primitives::U256::from_str("10000000000000000000")
+                        .map_err(|e| eyre::eyre!("Failed to parse U256: {}", e))?,
+                )
+                .await
+                .map_err(|e| {
+                    eyre::eyre!(
+                        "[devnet builder] Failed to fund ETH address on Ethereum: {}",
+                        e
+                    )
+                })?;
+
+            // ~10 ETH on Base
+            base_devnet
+                .fund_eth_address(
+                    address,
+                    alloy::primitives::U256::from_str("10000000000000000000")
+                        .map_err(|e| eyre::eyre!("Failed to parse U256: {}", e))?,
+                )
+                .await
+                .map_err(|e| {
+                    eyre::eyre!("[devnet builder] Failed to fund ETH address on Base: {}", e)
+                })?;
+
+            // Debugging: check funded balances
+            let eth_balance = ethereum_devnet
+                .funded_provider
+                .get_balance(address)
+                .await
+                .map_err(|e| {
+                    eyre::eyre!(
+                        "[devnet builder] Failed to get ETH balance on Ethereum: {}",
+                        e
+                    )
+                })?;
+            info!("[Devnet Builder] Ethereum Balance of {addr_str} => {eth_balance:?}");
+
+            let base_balance = base_devnet
+                .funded_provider
+                .get_balance(address)
+                .await
+                .map_err(|e| {
+                    eyre::eyre!("[devnet builder] Failed to get ETH balance on Base: {}", e)
+                })?;
+            info!("[Devnet Builder] Base Balance of {addr_str} => {base_balance:?}");
+        }
+        if let Some(start) = funding_start {
+            info!("[Devnet Builder] Funded addresses in {:?}", start.elapsed());
+        }
+
+        if self.interactive {
+            self.setup_interactive_mode(
+                &bitcoin_devnet,
+                &ethereum_devnet,
+                &base_devnet,
+                self.using_esplora,
+            )
+            .await?;
+        }
+
+        // 11) Create the devnet
+        let devnet = crate::RiftDevnet {
+            bitcoin: Arc::new(bitcoin_devnet),
+            ethereum: Arc::new(ethereum_devnet),
+            base: Arc::new(base_devnet),
+            join_set,
+        };
+        info!(
+            "[Devnet Builder] Devnet setup took {:?}",
+            build_start.elapsed()
+        );
+
+        Ok((devnet, funding_sats))
+    }
+
+    /// Setup interactive mode with demo funding, auto-mining, and logging
+    async fn setup_interactive_mode(
+        &self,
+        bitcoin_devnet: &BitcoinDevnet,
+        ethereum_devnet: &EthDevnet,
+        base_devnet: &EthDevnet,
+        using_esplora: bool,
+    ) -> Result<()> {
+        let setup_start = Instant::now();
+
+        let demo_account = MultichainAccount::new(110101);
+
+        let funding_start = Instant::now();
+        info!("[Interactive Setup] Funding demo_account with ETH...");
+        ethereum_devnet
+            .fund_eth_address(
+                demo_account.ethereum_address,
+                alloy::primitives::U256::from_str_radix("1000000000000000000000000", 10)
+                    .map_err(|e| eyre::eyre!("Conversion error: {}", e))?,
+            )
+            .await
+            .map_err(|e| {
+                eyre::eyre!(
+                    "[devnet builder-demo_account] Failed to fund ETH address: {}",
+                    e
+                )
+            })?;
+
+        let funding_amount = bitcoin::Amount::from_btc(1000.0).unwrap().to_sat();
+
+        // Fund demo_account with the mock ERC-20 on Ethereum
+        let _tx_hash = ethereum_devnet
+            .mint_mock_erc20(
+                demo_account.ethereum_address,
+                alloy::primitives::U256::from(funding_amount),
+            )
+            .await?;
+
+        // Fund demo_account with ETH on Base
+        info!("[Interactive Setup] Funding demo_account with ETH on Base...");
+        base_devnet
+            .fund_eth_address(
+                demo_account.ethereum_address,
+                alloy::primitives::U256::from_str_radix("1000000000000000000000000", 10)
+                    .map_err(|e| eyre::eyre!("Conversion error: {}", e))?,
+            )
+            .await
+            .map_err(|e| {
+                eyre::eyre!(
+                    "[devnet builder-demo_account] Failed to fund ETH address on Base: {}",
+                    e
+                )
+            })?;
+
+        // Fund demo_account with the mock ERC-20 on Base
+        let _tx_hash = base_devnet
+            .mint_mock_erc20(
+                demo_account.ethereum_address,
+                alloy::primitives::U256::from(funding_amount),
+            )
+            .await?;
+
+        // Fund demo_account with Bitcoin
+        info!("[Interactive Setup] Funding demo_account with Bitcoin...");
+        bitcoin_devnet
+            .deal_bitcoin(
+                &demo_account.bitcoin_wallet.address,
+                &bitcoin::Amount::from_sat(funding_amount),
+            )
+            .await
+            .map_err(|e| {
+                eyre::eyre!(
+                    "[devnet builder-demo_account] Failed to deal bitcoin: {}",
+                    e
+                )
+            })?;
+
+        info!(
+            "[Interactive Setup] Account funding took {:?}",
+            funding_start.elapsed()
+        );
+
+        // Log interactive info
+        info!(
+            "[Interactive Setup] Interactive mode setup complete in {:?}",
+            setup_start.elapsed()
+        );
+        println!("---RIFT DEVNET---");
+        println!(
+            "Demo EVM Address:           {}",
+            demo_account.ethereum_address
+        );
+        println!(
+            "Demo BTC Address:           {}",
+            demo_account.bitcoin_wallet.address
+        );
+        println!(
+            "Demo EVM Private Key:       {}",
+            alloy::hex::encode(demo_account.secret_bytes)
+        );
+        println!(
+            "Demo BTC Descriptor:        {}",
+            demo_account.bitcoin_wallet.descriptor()
+        );
+        println!(
+            "Ethereum Anvil HTTP Url:    http://0.0.0.0:{}",
+            ethereum_devnet.anvil.port()
+        );
+        println!(
+            "Ethereum Anvil WS Url:      ws://0.0.0.0:{}",
+            ethereum_devnet.anvil.port()
+        );
+        println!(
+            "Ethereum Chain ID:          {}",
+            ethereum_devnet.anvil.chain_id()
+        );
+        println!(
+            "Base Anvil HTTP Url:        http://0.0.0.0:{}",
+            base_devnet.anvil.port()
+        );
+        println!(
+            "Base Anvil WS Url:          ws://0.0.0.0:{}",
+            base_devnet.anvil.port()
+        );
+        println!(
+            "Base Chain ID:              {}",
+            base_devnet.anvil.chain_id()
+        );
+        println!(
+            "Bitcoin RPC URL:            {}",
+            bitcoin_devnet.rpc_url_with_cookie
+        );
+
+        if using_esplora {
+            println!(
+                "Esplora API URL:            {}",
+                bitcoin_devnet.esplora_url.as_ref().unwrap()
+            );
+        }
+
+        if let Some(eth_indexer) = &ethereum_devnet.token_indexer {
+            println!("Ethereum Token Indexer:     {}", eth_indexer.api_server_url);
+        }
+
+        if let Some(base_indexer) = &base_devnet.token_indexer {
+            println!(
+                "Base Token Indexer:         {}",
+                base_indexer.api_server_url
+            );
+        }
+
+        match self.bitcoin_mining_mode {
+            crate::bitcoin_devnet::MiningMode::Interval(interval) => {
+                println!("Bitcoin Auto-mining:        Every {} seconds", interval);
+            }
+            crate::bitcoin_devnet::MiningMode::Manual => {
+                println!("Bitcoin Auto-mining:        Disabled");
+            }
+        }
+
+        println!("Anvil Auto-mining:          Every 1 second");
+        println!("---RIFT DEVNET---");
+
+        Ok(())
+    }
+}
+
+/// Holds the components of a multichain account including secret bytes and wallets.
+#[derive(Debug)]
+pub struct MultichainAccount {
+    /// The raw secret bytes used to derive wallets
+    pub secret_bytes: [u8; 32],
+    /// The BIP-39 mnemonic phrase for the Bitcoin wallet (seeded from the secret bytes)
+    pub bitcoin_mnemonic: bip39::Mnemonic,
+    /// The Ethereum wallet derived from the secret
+    pub ethereum_wallet: EthereumWallet,
+    /// The Ethereum address associated with the wallet
+    pub ethereum_address: Address,
+    /// The Bitcoin wallet derived from the secret
+    pub bitcoin_wallet: P2WPKHBitcoinWallet,
+}
+
+impl MultichainAccount {
+    /// Creates a new multichain account from the given derivation salt
+    #[must_use]
+    pub fn new(derivation_salt: u32) -> Self {
+        let secret_bytes: [u8; 32] = keccak256(derivation_salt.to_le_bytes()).into();
+
+        let ethereum_wallet =
+            EthereumWallet::new(LocalSigner::from_bytes(&secret_bytes.into()).unwrap());
+
+        let ethereum_address = ethereum_wallet.default_signer().address();
+
+        let bitcoin_mnemonic = bip39::Mnemonic::from_entropy(&secret_bytes).unwrap();
+
+        let bitcoin_wallet = P2WPKHBitcoinWallet::from_mnemonic(
+            &bitcoin_mnemonic.to_string(),
+            None,
+            ::bitcoin::Network::Regtest,
+            None,
+        );
+
+        Self {
+            secret_bytes,
+            ethereum_wallet,
+            ethereum_address,
+            bitcoin_mnemonic,
+            bitcoin_wallet: bitcoin_wallet.unwrap(),
+        }
+    }
+
+    /// Creates a new multichain account with the Bitcoin network explicitly specified
+    #[must_use]
+    pub fn with_network(derivation_salt: u32, network: ::bitcoin::Network) -> Self {
+        let secret_bytes: [u8; 32] = keccak256(derivation_salt.to_le_bytes()).into();
+
+        let ethereum_wallet =
+            EthereumWallet::new(LocalSigner::from_bytes(&secret_bytes.into()).unwrap());
+
+        let ethereum_address = ethereum_wallet.default_signer().address();
+
+        let bitcoin_mnemonic = bip39::Mnemonic::from_entropy(&secret_bytes).unwrap();
+
+        let bitcoin_wallet =
+            P2WPKHBitcoinWallet::from_mnemonic(&bitcoin_mnemonic.to_string(), None, network, None);
+
+        Self {
+            secret_bytes,
+            bitcoin_mnemonic,
+            ethereum_wallet,
+            ethereum_address,
+            bitcoin_wallet: bitcoin_wallet.unwrap(),
+        }
+    }
+}

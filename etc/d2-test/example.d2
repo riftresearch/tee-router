@@ -1,0 +1,26 @@
+direction: right
+
+user: User {
+  shape: person
+}
+
+lb: Load Balancer {
+  shape: hexagon
+}
+
+api: API Service {
+  shape: rectangle
+}
+
+db: Database {
+  shape: cylinder
+}
+
+cache: Cache {
+  shape: cylinder
+}
+
+user -> lb: HTTPS
+lb -> api: forward
+api -> db: query
+api -> cache: read/write

@@ -1,0 +1,37 @@
+[package]
+name = "chains"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+router-primitives = { workspace = true }
+snafu = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+async-trait = {workspace = true}
+
+blockchain-utils = {workspace=true}
+
+# Bitcoin dependencies
+bitcoin = {workspace = true}
+bitcoincore-rpc-async = {workspace=true}
+esplora-client = {workspace = true}
+bdk_wallet = { workspace = true }
+
+# Ethereum dependencies (using Alloy)
+alloy = { workspace = true }
+evm-token-indexer-client = {workspace=true}
+eip3009-erc20-contract = {workspace=true}
+
+# Common
+sha2 = { workspace = true }
+hkdf = { workspace = true }
+getrandom = { workspace = true }
+reqwest = {workspace=true}
+
+# Metrics
+metrics = { workspace = true }
+tower = { version = "0.5", features = ["util"] }

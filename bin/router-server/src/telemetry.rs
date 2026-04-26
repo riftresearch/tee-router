@@ -1,0 +1,308 @@
+use crate::{
+    models::{DepositVault, DepositVaultStatus},
+    protocol::{AssetId, ChainId, DepositAsset},
+    services::vault_manager::VaultError,
+};
+use metrics::{counter, gauge, histogram};
+use std::time::Duration;
+
+pub fn record_http_response(route: &str, method: &str, status: u16, duration: Duration) {
+    let status_class = status_class(status);
+    counter!(
+        "tee_router_http_requests_total",
+        "route" => route.to_string(),
+        "method" => method.to_string(),
+        "status_class" => status_class,
+    )
+    .increment(1);
+    histogram!(
+        "tee_router_http_request_duration_seconds",
+        "route" => route.to_string(),
+        "method" => method.to_string(),
+        "status_class" => status_class,
+    )
+    .record(duration.as_secs_f64());
+}
+
+pub fn record_db_query(operation: &'static str, success: bool, duration: Duration) {
+    let status = success_status(success);
+    counter!(
+        "tee_router_db_queries_total",
+        "operation" => operation,
+        "status" => status,
+    )
+    .increment(1);
+    histogram!(
+        "tee_router_db_query_duration_seconds",
+        "operation" => operation,
+        "status" => status,
+    )
+    .record(duration.as_secs_f64());
+}
+
+pub fn record_vault_created(vault: &DepositVault) {
+    counter!(
+        "tee_router_vault_created_total",
+        "chain" => vault.deposit_asset.chain.as_str().to_string(),
+        "asset_kind" => asset_kind(&vault.deposit_asset.asset),
+    )
+    .increment(1);
+}
+
+pub fn record_vault_create_failed(request: &DepositAsset, error: &VaultError) {
+    counter!(
+        "tee_router_vault_create_failed_total",
+        "chain" => chain_label(&request.chain),
+        "asset_kind" => asset_kind(&request.asset),
+        "error_kind" => vault_error_kind(error),
+    )
+    .increment(1);
+}
+
+pub fn record_vault_cancel_requested(vault: &DepositVault) {
+    counter!(
+        "tee_router_vault_cancel_requested_total",
+        "chain" => vault.deposit_asset.chain.as_str().to_string(),
+        "asset_kind" => asset_kind(&vault.deposit_asset.asset),
+        "status" => vault.status.to_db_string(),
+    )
+    .increment(1);
+}
+
+pub fn record_vault_cancel_failed(error: &VaultError) {
+    counter!(
+        "tee_router_vault_cancel_failed_total",
+        "error_kind" => vault_error_kind(error),
+    )
+    .increment(1);
+}
+
+pub fn record_vault_transition(
+    vault: &DepositVault,
+    from_status: DepositVaultStatus,
+    to_status: DepositVaultStatus,
+) {
+    counter!(
+        "tee_router_vault_transition_total",
+        "chain" => vault.deposit_asset.chain.as_str().to_string(),
+        "asset_kind" => asset_kind(&vault.deposit_asset.asset),
+        "from_status" => from_status.to_db_string(),
+        "to_status" => to_status.to_db_string(),
+    )
+    .increment(1);
+}
+
+pub fn record_refund_pass(stage: &'static str, scanned: usize, duration: Duration) {
+    counter!(
+        "tee_router_refund_pass_total",
+        "stage" => stage,
+    )
+    .increment(1);
+    histogram!(
+        "tee_router_refund_pass_duration_seconds",
+        "stage" => stage,
+    )
+    .record(duration.as_secs_f64());
+    gauge!(
+        "tee_router_refund_pass_scanned",
+        "stage" => stage,
+    )
+    .set(scanned as f64);
+}
+
+pub fn record_refund_attempt(vault: &DepositVault) {
+    counter!(
+        "tee_router_vault_refund_attempt_total",
+        "chain" => vault.deposit_asset.chain.as_str().to_string(),
+        "asset_kind" => asset_kind(&vault.deposit_asset.asset),
+        "status" => vault.status.to_db_string(),
+    )
+    .increment(1);
+}
+
+pub fn record_refund_success(vault: &DepositVault, duration: Duration) {
+    counter!(
+        "tee_router_vault_refund_success_total",
+        "chain" => vault.deposit_asset.chain.as_str().to_string(),
+        "asset_kind" => asset_kind(&vault.deposit_asset.asset),
+    )
+    .increment(1);
+    histogram!(
+        "tee_router_vault_refund_duration_seconds",
+        "chain" => vault.deposit_asset.chain.as_str().to_string(),
+        "asset_kind" => asset_kind(&vault.deposit_asset.asset),
+        "status" => "success",
+    )
+    .record(duration.as_secs_f64());
+}
+
+pub fn record_refund_failure(vault: &DepositVault, failure_kind: &'static str, duration: Duration) {
+    counter!(
+        "tee_router_vault_refund_failure_total",
+        "chain" => vault.deposit_asset.chain.as_str().to_string(),
+        "asset_kind" => asset_kind(&vault.deposit_asset.asset),
+        "failure_kind" => failure_kind,
+    )
+    .increment(1);
+    histogram!(
+        "tee_router_vault_refund_duration_seconds",
+        "chain" => vault.deposit_asset.chain.as_str().to_string(),
+        "asset_kind" => asset_kind(&vault.deposit_asset.asset),
+        "status" => "failure",
+    )
+    .record(duration.as_secs_f64());
+}
+
+pub fn record_worker_tick(worker: &'static str, duration: Duration) {
+    counter!(
+        "tee_router_worker_tick_total",
+        "worker" => worker,
+    )
+    .increment(1);
+    histogram!(
+        "tee_router_worker_tick_duration_seconds",
+        "worker" => worker,
+    )
+    .record(duration.as_secs_f64());
+}
+
+pub fn record_worker_lease_event(event: &'static str, status: &'static str) {
+    counter!(
+        "tee_router_worker_lease_events_total",
+        "event" => event,
+        "status" => status,
+    )
+    .increment(1);
+}
+
+pub fn record_worker_active(active: bool) {
+    gauge!("tee_router_worker_active").set(if active { 1.0 } else { 0.0 });
+}
+
+pub fn record_market_order_quote_requested(source_asset: &DepositAsset) {
+    counter!(
+        "tee_router_market_order_quote_requested_total",
+        "source_chain" => chain_label(&source_asset.chain),
+        "source_asset_kind" => asset_kind(&source_asset.asset),
+    )
+    .increment(1);
+}
+
+pub fn record_market_order_quote_success(source_asset: &DepositAsset, duration: Duration) {
+    counter!(
+        "tee_router_market_order_quote_success_total",
+        "source_chain" => chain_label(&source_asset.chain),
+        "source_asset_kind" => asset_kind(&source_asset.asset),
+    )
+    .increment(1);
+    histogram!(
+        "tee_router_market_order_quote_duration_seconds",
+        "source_chain" => chain_label(&source_asset.chain),
+        "source_asset_kind" => asset_kind(&source_asset.asset),
+        "status" => "success",
+    )
+    .record(duration.as_secs_f64());
+}
+
+pub fn record_market_order_quote_no_route(
+    source_asset: &DepositAsset,
+    reason: &'static str,
+    duration: Duration,
+) {
+    counter!(
+        "tee_router_market_order_quote_no_route_total",
+        "source_chain" => chain_label(&source_asset.chain),
+        "source_asset_kind" => asset_kind(&source_asset.asset),
+        "reason" => reason,
+    )
+    .increment(1);
+    histogram!(
+        "tee_router_market_order_quote_duration_seconds",
+        "source_chain" => chain_label(&source_asset.chain),
+        "source_asset_kind" => asset_kind(&source_asset.asset),
+        "status" => "no_route",
+    )
+    .record(duration.as_secs_f64());
+}
+
+pub fn record_provider_quote_blocked(provider: &str, reason: &str) {
+    counter!(
+        "tee_router_provider_quote_blocked_total",
+        "provider" => provider.to_string(),
+        "reason" => reason.to_string(),
+    )
+    .increment(1);
+}
+
+pub fn record_provider_execution_blocked(provider: &str, state: &str, reason: &str) {
+    counter!(
+        "tee_router_provider_execution_blocked_total",
+        "provider" => provider.to_string(),
+        "state" => state.to_string(),
+        "reason" => reason.to_string(),
+    )
+    .increment(1);
+}
+
+pub fn record_background_task_exit(task_name: &str, exit_kind: &'static str) {
+    counter!(
+        "tee_router_background_task_exit_total",
+        "task" => task_name.to_string(),
+        "exit_kind" => exit_kind,
+    )
+    .increment(1);
+}
+
+fn success_status(success: bool) -> &'static str {
+    if success {
+        "success"
+    } else {
+        "error"
+    }
+}
+
+fn status_class(status: u16) -> &'static str {
+    match status {
+        100..=199 => "1xx",
+        200..=299 => "2xx",
+        300..=399 => "3xx",
+        400..=499 => "4xx",
+        500..=599 => "5xx",
+        _ => "unknown",
+    }
+}
+
+fn asset_kind(asset: &AssetId) -> &'static str {
+    match asset {
+        AssetId::Native => "native",
+        AssetId::Reference(_) => "reference",
+    }
+}
+
+fn chain_label(chain: &ChainId) -> &'static str {
+    match chain.as_str() {
+        "bitcoin" => "bitcoin",
+        "evm:1" => "evm:1",
+        "evm:8453" => "evm:8453",
+        _ => "unsupported",
+    }
+}
+
+fn vault_error_kind(error: &VaultError) -> &'static str {
+    match error {
+        VaultError::ChainNotSupported { .. } => "chain_not_supported",
+        VaultError::InvalidAssetId { .. } => "invalid_asset_id",
+        VaultError::InvalidRecoveryAddress { .. } => "invalid_recovery_address",
+        VaultError::InvalidMetadata { .. } => "invalid_metadata",
+        VaultError::InvalidCancellationCommitment { .. } => "invalid_cancellation_commitment",
+        VaultError::InvalidCancellationSecret => "invalid_cancellation_secret",
+        VaultError::RefundNotAllowed { .. } => "refund_not_allowed",
+        VaultError::InvalidOrderBinding { .. } => "invalid_order_binding",
+        VaultError::InvalidFundingAmount { .. } => "invalid_funding_amount",
+        VaultError::FundingCheck { .. } => "funding_check",
+        VaultError::Random { .. } => "random",
+        VaultError::WalletDerivation { .. } => "wallet_derivation",
+        VaultError::DepositAddress { .. } => "deposit_address",
+        VaultError::Database { .. } => "database",
+    }
+}

@@ -1,0 +1,2571 @@
+use std::{
+    env,
+    error::Error,
+    future::Future,
+    net::IpAddr,
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::OnceLock,
+    time::{Duration, Instant},
+};
+
+use alloy::{
+    network::{EthereumWallet, TransactionBuilder},
+    primitives::{Address, U256},
+    providers::{ext::AnvilApi, Provider, ProviderBuilder},
+    rpc::types::TransactionRequest,
+    signers::local::PrivateKeySigner,
+    sol,
+};
+use bitcoincore_rpc_async::Auth;
+use chains::ChainRegistry;
+use devnet::{
+    mock_integrators::{MockIntegratorConfig, MockIntegratorServer},
+    token_indexerd::TokenIndexerInstance,
+    RiftDevnet,
+};
+use eip3009_erc20_contract::GenericEIP3009ERC20::GenericEIP3009ERC20Instance;
+use router_server::{
+    app::{initialize_components, PaymasterMode},
+    db::Database,
+    models::{
+        CustodyVaultControlType, CustodyVaultRole, DepositVaultStatus, OrderExecutionStepType,
+        OrderProviderOperation, ProviderAddressRole, ProviderOperationStatus,
+        ProviderOperationType, RouterOrderEnvelope, RouterOrderQuoteEnvelope, RouterOrderStatus,
+    },
+    protocol::{backend_chain_for_id, AssetId, ChainId},
+    server::run_api,
+    services::deposit_address::derive_deposit_salt_for_quote,
+    worker::{run_worker_loop, RouterWorkerConfig},
+    RouterServerArgs,
+};
+use sauron::discovery::{evm_erc20::EvmErc20DiscoveryBackend, DiscoveryBackend};
+use sauron::{run as run_sauron, SauronArgs};
+use serde_json::{json, Value};
+use sqlx_core::connection::Connection;
+use sqlx_postgres::{PgConnectOptions, PgConnection, PgPoolOptions};
+use testcontainers::{
+    core::{IntoContainerPort, WaitFor},
+    runners::AsyncRunner,
+    ContainerAsync, GenericImage, ImageExt,
+};
+use tokio::task::JoinHandle;
+use uuid::Uuid;
+
+const MOCK_ERC20_ADDRESS: &str = "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf";
+const BASE_USDC_ADDRESS: &str = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+const ARBITRUM_USDC_ADDRESS: &str = "0xaf88d065e77c8cc2239327c5edb3a432268e5831";
+const MAINNET_HYPERLIQUID_BRIDGE_ADDRESS: &str = "0x2df1c51e09aecf9cacb7bc98cb1742757f163df7";
+const POSTGRES_PORT: u16 = 5432;
+const POSTGRES_USER: &str = "postgres";
+const POSTGRES_PASSWORD: &str = "password";
+const POSTGRES_DATABASE: &str = "postgres";
+const ROUTER_TEST_DATABASE_URL_ENV: &str = "ROUTER_TEST_DATABASE_URL";
+const LIVE_RUNTIME_RUN_FLAG: &str = "ROUTER_LIVE_RUNTIME_E2E";
+const LIVE_SPEND_CONFIRM_ENV: &str = "ROUTER_LIVE_CONFIRM_SPEND";
+const LIVE_SPEND_CONFIRM_VALUE: &str = "I_UNDERSTAND_THIS_SPENDS_REAL_FUNDS";
+const LIVE_TEST_PRIVATE_KEY_ENV: &str = "LIVE_TEST_PRIVATE_KEY";
+const ROUTER_LIVE_SOURCE_PRIVATE_KEY_ENV: &str = "ROUTER_LIVE_SOURCE_PRIVATE_KEY";
+const ETH_RPC_URL_ENV: &str = "ETH_RPC_URL";
+const EVM_RPC_URL_ENV: &str = "EVM_RPC_URL";
+const BASE_RPC_URL_ENV: &str = "BASE_RPC_URL";
+const BASE_FUNDING_RPC_URL_ENV: &str = "ROUTER_LIVE_BASE_FUNDING_RPC_URL";
+const ARBITRUM_RPC_URL_ENV: &str = "ARBITRUM_RPC_URL";
+const ELECTRUM_HTTP_SERVER_URL_ENV: &str = "ELECTRUM_HTTP_SERVER_URL";
+const BITCOIN_RPC_URL_ENV: &str = "BITCOIN_RPC_URL";
+const BITCOIN_RPC_AUTH_ENV: &str = "BITCOIN_RPC_AUTH";
+const BITCOIN_ZMQ_RAWTX_ENDPOINT_ENV: &str = "BITCOIN_ZMQ_RAWTX_ENDPOINT";
+const BITCOIN_ZMQ_SEQUENCE_ENDPOINT_ENV: &str = "BITCOIN_ZMQ_SEQUENCE_ENDPOINT";
+const ACROSS_API_URL_ENV: &str = "ACROSS_API_URL";
+const ACROSS_API_KEY_ENV: &str = "ACROSS_API_KEY";
+const ACROSS_INTEGRATOR_ID_ENV: &str = "ACROSS_INTEGRATOR_ID";
+const HYPERUNIT_API_URL_ENV: &str = "HYPERUNIT_API_URL";
+const HYPERUNIT_PROXY_URL_ENV: &str = "HYPERUNIT_PROXY_URL";
+const HYPERLIQUID_API_URL_ENV: &str = "HYPERLIQUID_API_URL";
+const HYPERLIQUID_NETWORK_ENV: &str = "HYPERLIQUID_NETWORK";
+const HYPERLIQUID_EXECUTION_PRIVATE_KEY_ENV: &str = "HYPERLIQUID_EXECUTION_PRIVATE_KEY";
+const HYPERLIQUID_ACCOUNT_ADDRESS_ENV: &str = "HYPERLIQUID_ACCOUNT_ADDRESS";
+const HYPERLIQUID_VAULT_ADDRESS_ENV: &str = "HYPERLIQUID_VAULT_ADDRESS";
+const ROUTER_LIVE_HYPERLIQUID_PRIVATE_KEY_ENV: &str = "ROUTER_LIVE_HYPERLIQUID_PRIVATE_KEY";
+const ROUTER_LIVE_HYPERLIQUID_DESTINATION_ADDRESS_ENV: &str =
+    "ROUTER_LIVE_HYPERLIQUID_DESTINATION_ADDRESS";
+const ROUTER_LIVE_HYPERLIQUID_ACCOUNT_ADDRESS_ENV: &str = "ROUTER_LIVE_HYPERLIQUID_ACCOUNT_ADDRESS";
+const ROUTER_LIVE_HYPERLIQUID_VAULT_ADDRESS_ENV: &str = "ROUTER_LIVE_HYPERLIQUID_VAULT_ADDRESS";
+const ETHEREUM_PAYMASTER_PRIVATE_KEY_ENV: &str = "ETHEREUM_PAYMASTER_PRIVATE_KEY";
+const BASE_PAYMASTER_PRIVATE_KEY_ENV: &str = "BASE_PAYMASTER_PRIVATE_KEY";
+const ARBITRUM_PAYMASTER_PRIVATE_KEY_ENV: &str = "ARBITRUM_PAYMASTER_PRIVATE_KEY";
+const ROUTER_LIVE_BTC_RECIPIENT_ADDRESS_ENV: &str = "ROUTER_LIVE_BTC_RECIPIENT_ADDRESS";
+const ROUTER_LIVE_WITHDRAW_RECIPIENT_ADDRESS_ENV: &str = "ROUTER_LIVE_WITHDRAW_RECIPIENT_ADDRESS";
+const ETHEREUM_TOKEN_INDEXER_URL_ENV: &str = "ETHEREUM_TOKEN_INDEXER_URL";
+const BASE_TOKEN_INDEXER_URL_ENV: &str = "BASE_TOKEN_INDEXER_URL";
+const ARBITRUM_TOKEN_INDEXER_URL_ENV: &str = "ARBITRUM_TOKEN_INDEXER_URL";
+const LIVE_BASE_ETH_AMOUNT_WEI_ENV: &str = "ROUTER_LIVE_BASE_ETH_TO_BTC_AMOUNT_WEI";
+const LIVE_BASE_USDC_AMOUNT_ENV: &str = "ROUTER_LIVE_BASE_USDC_TO_BTC_AMOUNT";
+const LIVE_RECOVERY_DIR_ENV: &str = "ROUTER_LIVE_RECOVERY_DIR";
+const DEFAULT_LIVE_ACROSS_API_URL: &str = "https://app.across.to/api";
+const DEFAULT_LIVE_HYPERUNIT_API_URL: &str = "https://api.hyperunit.xyz";
+const DEFAULT_LIVE_HYPERLIQUID_API_URL: &str = "https://api.hyperliquid.xyz";
+const DEFAULT_LIVE_BASE_FUNDING_RPC_URL: &str = "https://mainnet.base.org";
+const DEFAULT_LIVE_BASE_ETH_AMOUNT_WEI: &str = "30000000000000000";
+const DEFAULT_LIVE_BASE_USDC_AMOUNT: &str = "60000000";
+const LIVE_TERMINAL_TIMEOUT: Duration = Duration::from_secs(45 * 60);
+const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
+const LIVE_RPC_RETRY_ATTEMPTS: usize = 10;
+const LIVE_RPC_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(2);
+const LIVE_NATIVE_SOURCE_GAS_BUFFER_WEI: u128 = 1_200_000_000_000_000;
+const LIVE_RECOVERY_TABLES: &[(&str, &str)] = &[
+    ("router_orders", "created_at ASC, id ASC"),
+    ("market_order_quotes", "created_at ASC, id ASC"),
+    ("market_order_actions", "created_at ASC, order_id ASC"),
+    ("deposit_vaults", "created_at ASC, id ASC"),
+    ("custody_vaults", "created_at ASC, id ASC"),
+    ("order_execution_steps", "step_index ASC, id ASC"),
+    ("order_provider_operations", "created_at ASC, id ASC"),
+    ("order_provider_addresses", "created_at ASC, id ASC"),
+    ("order_provider_operation_hints", "created_at ASC, id ASC"),
+    ("router_worker_leases", "lease_name ASC"),
+    ("order_custody_accounts", "created_at ASC, id ASC"),
+];
+
+sol! {
+    #[sol(rpc)]
+    interface IERC20 {
+        function balanceOf(address owner) external view returns (uint256);
+        function transfer(address to, uint256 amount) external returns (bool);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RuntimeRoute {
+    BaseEthToBtc,
+    BaseUsdcToBtc,
+}
+
+#[derive(Clone, Copy)]
+struct RuntimeChainTokens {
+    ethereum_reference_token: &'static str,
+    base_reference_token: &'static str,
+    arbitrum_reference_token: &'static str,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RuntimeTokenIndexerUrls {
+    ethereum: Option<String>,
+    base: Option<String>,
+    arbitrum: Option<String>,
+}
+
+struct TestPostgres {
+    admin_database_url: String,
+    _container: Option<ContainerAsync<GenericImage>>,
+}
+
+struct RuntimeTask {
+    handle: JoinHandle<()>,
+}
+
+impl Drop for RuntimeTask {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+#[derive(Clone)]
+struct LiveRuntimeConfig {
+    private_key: String,
+    ethereum_rpc_url: String,
+    base_rpc_url: String,
+    arbitrum_rpc_url: String,
+    bitcoin_rpc_url: String,
+    bitcoin_rpc_auth: Auth,
+    bitcoin_zmq_rawtx_endpoint: String,
+    bitcoin_zmq_sequence_endpoint: String,
+    electrum_http_server_url: String,
+    across_api_url: String,
+    across_api_key: String,
+    across_integrator_id: Option<String>,
+    hyperunit_api_url: String,
+    hyperunit_proxy_url: Option<String>,
+    hyperliquid_api_url: String,
+    hyperliquid_network: router_server::services::custody_action_executor::HyperliquidCallNetwork,
+    hyperliquid_execution_private_key: Option<String>,
+    hyperliquid_account_address: Option<String>,
+    hyperliquid_vault_address: Option<String>,
+    ethereum_paymaster_private_key: Option<String>,
+    base_paymaster_private_key: Option<String>,
+    arbitrum_paymaster_private_key: Option<String>,
+    bitcoin_recipient_address: String,
+    ethereum_token_indexer_url: Option<String>,
+    base_token_indexer_url: Option<String>,
+    arbitrum_token_indexer_url: Option<String>,
+}
+
+impl LiveRuntimeConfig {
+    fn from_env() -> Self {
+        load_repo_env_once();
+        Self {
+            private_key: env_var_any(&[
+                ROUTER_LIVE_SOURCE_PRIVATE_KEY_ENV,
+                LIVE_TEST_PRIVATE_KEY_ENV,
+            ])
+            .expect("live runtime requires a source private key"),
+            ethereum_rpc_url: env_var_optional(ETH_RPC_URL_ENV)
+                .or_else(|| env_var_optional(EVM_RPC_URL_ENV))
+                .expect("live runtime requires ETH_RPC_URL or EVM_RPC_URL"),
+            base_rpc_url: env_var_required(BASE_RPC_URL_ENV),
+            arbitrum_rpc_url: env_var_required(ARBITRUM_RPC_URL_ENV),
+            bitcoin_rpc_url: env_var_required(BITCOIN_RPC_URL_ENV),
+            bitcoin_rpc_auth: parse_auth_env(BITCOIN_RPC_AUTH_ENV),
+            bitcoin_zmq_rawtx_endpoint: env_var_required(BITCOIN_ZMQ_RAWTX_ENDPOINT_ENV),
+            bitcoin_zmq_sequence_endpoint: env_var_required(BITCOIN_ZMQ_SEQUENCE_ENDPOINT_ENV),
+            electrum_http_server_url: env_var_required(ELECTRUM_HTTP_SERVER_URL_ENV),
+            across_api_url: env_var_optional(ACROSS_API_URL_ENV)
+                .unwrap_or_else(|| DEFAULT_LIVE_ACROSS_API_URL.to_string()),
+            across_api_key: env_var_required(ACROSS_API_KEY_ENV),
+            across_integrator_id: env_var_optional(ACROSS_INTEGRATOR_ID_ENV),
+            hyperunit_api_url: env_var_optional(HYPERUNIT_API_URL_ENV)
+                .unwrap_or_else(|| DEFAULT_LIVE_HYPERUNIT_API_URL.to_string()),
+            hyperunit_proxy_url: env_var_optional(HYPERUNIT_PROXY_URL_ENV),
+            hyperliquid_api_url: env_var_optional(HYPERLIQUID_API_URL_ENV)
+                .unwrap_or_else(|| DEFAULT_LIVE_HYPERLIQUID_API_URL.to_string()),
+            hyperliquid_network: parse_hyperliquid_network(
+                &env_var_optional(HYPERLIQUID_NETWORK_ENV).unwrap_or_else(|| "mainnet".to_string()),
+            ),
+            hyperliquid_execution_private_key: env_var_any(&[
+                HYPERLIQUID_EXECUTION_PRIVATE_KEY_ENV,
+                ROUTER_LIVE_HYPERLIQUID_PRIVATE_KEY_ENV,
+            ]),
+            hyperliquid_account_address: env_var_any(&[
+                HYPERLIQUID_ACCOUNT_ADDRESS_ENV,
+                ROUTER_LIVE_HYPERLIQUID_ACCOUNT_ADDRESS_ENV,
+                ROUTER_LIVE_HYPERLIQUID_DESTINATION_ADDRESS_ENV,
+            ]),
+            hyperliquid_vault_address: env_var_any(&[
+                HYPERLIQUID_VAULT_ADDRESS_ENV,
+                ROUTER_LIVE_HYPERLIQUID_VAULT_ADDRESS_ENV,
+            ]),
+            ethereum_paymaster_private_key: env_var_optional(ETHEREUM_PAYMASTER_PRIVATE_KEY_ENV),
+            base_paymaster_private_key: env_var_optional(BASE_PAYMASTER_PRIVATE_KEY_ENV),
+            arbitrum_paymaster_private_key: env_var_optional(ARBITRUM_PAYMASTER_PRIVATE_KEY_ENV),
+            bitcoin_recipient_address: env_var_optional(ROUTER_LIVE_BTC_RECIPIENT_ADDRESS_ENV)
+                .or_else(|| env_var_optional(ROUTER_LIVE_WITHDRAW_RECIPIENT_ADDRESS_ENV))
+                .expect("live runtime requires a BTC recipient address"),
+            ethereum_token_indexer_url: env_var_optional(ETHEREUM_TOKEN_INDEXER_URL_ENV),
+            base_token_indexer_url: env_var_optional(BASE_TOKEN_INDEXER_URL_ENV),
+            arbitrum_token_indexer_url: env_var_optional(ARBITRUM_TOKEN_INDEXER_URL_ENV),
+        }
+    }
+}
+
+fn load_repo_env_once() {
+    static DOTENV: OnceLock<()> = OnceLock::new();
+    DOTENV.get_or_init(|| {
+        let _ = dotenvy::from_filename(".env");
+    });
+}
+
+fn env_var_required(key: &str) -> String {
+    env::var(key).unwrap_or_else(|_| panic!("missing required env var {key}"))
+}
+
+fn env_var_optional(key: &str) -> Option<String> {
+    env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn env_var_any(keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| env_var_optional(key))
+}
+
+fn parse_auth_env(key: &str) -> Auth {
+    let raw = env_var_required(key);
+    if raw.eq_ignore_ascii_case("none") {
+        Auth::None
+    } else {
+        let mut split = raw.splitn(2, ':');
+        let username = split
+            .next()
+            .filter(|part| !part.is_empty())
+            .unwrap_or_else(|| panic!("{key} must contain username:password"));
+        let password = split
+            .next()
+            .filter(|part| !part.is_empty())
+            .unwrap_or_else(|| panic!("{key} must contain username:password"));
+        Auth::UserPass(username.to_string(), password.to_string())
+    }
+}
+
+fn parse_hyperliquid_network(
+    raw: &str,
+) -> router_server::services::custody_action_executor::HyperliquidCallNetwork {
+    use router_server::services::custody_action_executor::HyperliquidCallNetwork;
+
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "mainnet" => HyperliquidCallNetwork::Mainnet,
+        "testnet" => HyperliquidCallNetwork::Testnet,
+        other => panic!("invalid {HYPERLIQUID_NETWORK_ENV} value {other:?}"),
+    }
+}
+
+fn require_live_spend_confirmation() {
+    let confirmation = env_var_required(LIVE_SPEND_CONFIRM_ENV);
+    assert_eq!(
+        confirmation, LIVE_SPEND_CONFIRM_VALUE,
+        "refusing to run a live Soron runtime route without {LIVE_SPEND_CONFIRM_ENV}={LIVE_SPEND_CONFIRM_VALUE}"
+    );
+}
+
+async fn write_live_recovery_snapshot(
+    label: &str,
+    route: RuntimeRoute,
+    live: &LiveRuntimeConfig,
+    database_url: &str,
+    config_dir: &Path,
+    db: &Database,
+    chain_registry: &ChainRegistry,
+    order_id: Option<Uuid>,
+    quote_id: Option<Uuid>,
+    extra: Value,
+) {
+    match try_write_live_recovery_snapshot(
+        label,
+        route,
+        live,
+        database_url,
+        config_dir,
+        db,
+        chain_registry,
+        order_id,
+        quote_id,
+        extra,
+    )
+    .await
+    {
+        Ok(path) => eprintln!("live recovery snapshot written to {}", path.display()),
+        Err(error) => eprintln!("failed to write live recovery snapshot: {error}"),
+    }
+}
+
+async fn try_write_live_recovery_snapshot(
+    label: &str,
+    route: RuntimeRoute,
+    live: &LiveRuntimeConfig,
+    database_url: &str,
+    config_dir: &Path,
+    db: &Database,
+    chain_registry: &ChainRegistry,
+    order_id: Option<Uuid>,
+    quote_id: Option<Uuid>,
+    extra: Value,
+) -> Result<PathBuf, Box<dyn Error + Send + Sync>> {
+    let master_key_hex = read_router_master_key_hex(config_dir);
+    let master_key_bytes = master_key_hex
+        .as_deref()
+        .and_then(decode_router_master_key_hex);
+    let source_address = live
+        .private_key
+        .parse::<PrivateKeySigner>()
+        .map(|signer| format!("{:#x}", signer.address()))
+        .unwrap_or_else(|error| format!("invalid live source private key: {error}"));
+    let order_context = collect_order_recovery_context(
+        db,
+        chain_registry,
+        master_key_bytes.as_ref(),
+        order_id,
+        quote_id,
+    )
+    .await;
+    let database_snapshot = collect_live_database_snapshot(database_url).await;
+    let created_at = chrono::Utc::now();
+    let snapshot = json!({
+        "schema_version": 1,
+        "kind": "router_live_test_recovery_snapshot",
+        "label": label,
+        "created_at": created_at,
+        "route": route_order_metadata(route),
+        "order_id": order_id,
+        "quote_id": quote_id,
+        "database": {
+            "url_redacted": redact_database_url(database_url),
+            "snapshot": database_snapshot,
+        },
+        "router_key_material": {
+            "config_dir": config_dir.display().to_string(),
+            "master_key_hex": master_key_hex,
+            "master_key_available": master_key_bytes.is_some(),
+            "note": "master_key_hex plus each salt can recreate router-derived vault keys; derived_private_key entries are included for immediate recovery."
+        },
+        "live_context": {
+            "source_address": source_address,
+            "source_private_key_env_candidates": [
+                ROUTER_LIVE_SOURCE_PRIVATE_KEY_ENV,
+                LIVE_TEST_PRIVATE_KEY_ENV
+            ],
+            "paymaster_private_key_envs": {
+                "ethereum": ETHEREUM_PAYMASTER_PRIVATE_KEY_ENV,
+                "base": BASE_PAYMASTER_PRIVATE_KEY_ENV,
+                "arbitrum": ARBITRUM_PAYMASTER_PRIVATE_KEY_ENV,
+            },
+            "configured_private_keys_present": {
+                "ethereum_paymaster": live.ethereum_paymaster_private_key.is_some(),
+                "base_paymaster": live.base_paymaster_private_key.is_some(),
+                "arbitrum_paymaster": live.arbitrum_paymaster_private_key.is_some(),
+                "hyperliquid_execution": live.hyperliquid_execution_private_key.is_some(),
+            },
+            "hyperliquid": {
+                "api_url": &live.hyperliquid_api_url,
+                "network": format!("{:?}", live.hyperliquid_network),
+                "execution_private_key_env_candidates": [
+                    HYPERLIQUID_EXECUTION_PRIVATE_KEY_ENV,
+                    ROUTER_LIVE_HYPERLIQUID_PRIVATE_KEY_ENV
+                ],
+                "account_address": &live.hyperliquid_account_address,
+                "vault_address": &live.hyperliquid_vault_address,
+            },
+            "providers": {
+                "across_api_url": &live.across_api_url,
+                "across_api_key_configured": !live.across_api_key.trim().is_empty(),
+                "across_integrator_id": &live.across_integrator_id,
+                "hyperunit_api_url": &live.hyperunit_api_url,
+                "hyperunit_proxy_configured": live.hyperunit_proxy_url.is_some(),
+            },
+            "btc_recipient_address": &live.bitcoin_recipient_address,
+        },
+        "order_context": order_context,
+        "extra": extra,
+    });
+
+    let dir = live_recovery_dir();
+    std::fs::create_dir_all(&dir)?;
+    let file_name = format!(
+        "{}-{}-{}-{}.json",
+        created_at.format("%Y%m%dT%H%M%S%.3fZ"),
+        route_order_metadata(route),
+        sanitize_snapshot_label(label),
+        order_id
+            .map(|id| id.simple().to_string())
+            .or_else(|| quote_id.map(|id| id.simple().to_string()))
+            .unwrap_or_else(|| "no-id".to_string())
+    );
+    let path = dir.join(file_name);
+    std::fs::write(&path, serde_json::to_vec_pretty(&snapshot)?)?;
+    Ok(path)
+}
+
+async fn collect_order_recovery_context(
+    db: &Database,
+    chain_registry: &ChainRegistry,
+    master_key: Option<&[u8; 64]>,
+    order_id: Option<Uuid>,
+    quote_id: Option<Uuid>,
+) -> Value {
+    let mut derived_wallets = Vec::new();
+    let mut order_value = Value::Null;
+    let mut quote_value = Value::Null;
+    let mut funding_vault_value = Value::Null;
+    let mut custody_vaults_value = Value::Null;
+    let mut execution_steps_value = Value::Null;
+    let mut provider_operations_value = Value::Null;
+    let mut provider_addresses_value = Value::Null;
+
+    if let Some(order_id) = order_id {
+        match db.orders().get(order_id).await {
+            Ok(order) => {
+                if let Some(vault_id) = order.funding_vault_id {
+                    match db.vaults().get(vault_id).await {
+                        Ok(vault) => {
+                            if let Some(master_key) = master_key {
+                                derived_wallets.push(derive_recovery_wallet_snapshot(
+                                    chain_registry,
+                                    master_key,
+                                    &vault.deposit_asset.chain,
+                                    &vault.deposit_vault_salt,
+                                    &vault.deposit_vault_address,
+                                    json!({
+                                        "kind": "funding_deposit_vault",
+                                        "vault_id": vault.id,
+                                        "order_id": vault.order_id,
+                                        "asset": &vault.deposit_asset,
+                                    }),
+                                ));
+                            }
+                            funding_vault_value = json_value(vault);
+                        }
+                        Err(error) => {
+                            funding_vault_value =
+                                json!({"error": format!("failed to load funding vault: {error}")});
+                        }
+                    }
+                }
+                order_value = json_value(order);
+            }
+            Err(error) => {
+                order_value = json!({"error": format!("failed to load order: {error}")});
+            }
+        }
+
+        match db.orders().get_market_order_quote(order_id).await {
+            Ok(quote) => {
+                if let Some(master_key) = master_key {
+                    let salt = derive_deposit_salt_for_quote(master_key, quote.id);
+                    derived_wallets.push(derive_recovery_wallet_snapshot(
+                        chain_registry,
+                        master_key,
+                        &quote.source_asset.chain,
+                        &salt,
+                        "",
+                        json!({
+                            "kind": "quote_source_deposit_address",
+                            "quote_id": quote.id,
+                            "order_id": quote.order_id,
+                            "asset": &quote.source_asset,
+                        }),
+                    ));
+                }
+                quote_value = json_value(quote);
+            }
+            Err(error) => {
+                quote_value = json!({"error": format!("failed to load quote by order: {error}")});
+            }
+        }
+
+        match db.orders().get_custody_vaults(order_id).await {
+            Ok(vaults) => {
+                if let Some(master_key) = master_key {
+                    for vault in vaults.iter().filter(|vault| {
+                        vault.control_type == CustodyVaultControlType::RouterDerivedKey
+                    }) {
+                        if let Some(salt) = vault.derivation_salt {
+                            derived_wallets.push(derive_recovery_wallet_snapshot(
+                                chain_registry,
+                                master_key,
+                                &vault.chain,
+                                &salt,
+                                &vault.address,
+                                json!({
+                                    "kind": "custody_vault",
+                                    "vault_id": vault.id,
+                                    "order_id": vault.order_id,
+                                    "role": vault.role,
+                                    "asset": &vault.asset,
+                                }),
+                            ));
+                        }
+                    }
+                }
+                custody_vaults_value = json_value(vaults);
+            }
+            Err(error) => {
+                custody_vaults_value =
+                    json!({"error": format!("failed to load custody vaults: {error}")});
+            }
+        }
+
+        execution_steps_value = json_result(db.orders().get_execution_steps(order_id).await);
+        provider_operations_value =
+            json_result(db.orders().get_provider_operations(order_id).await);
+        provider_addresses_value = json_result(db.orders().get_provider_addresses(order_id).await);
+    } else if let Some(quote_id) = quote_id {
+        match db.orders().get_market_order_quote_by_id(quote_id).await {
+            Ok(quote) => {
+                if let Some(master_key) = master_key {
+                    let salt = derive_deposit_salt_for_quote(master_key, quote.id);
+                    derived_wallets.push(derive_recovery_wallet_snapshot(
+                        chain_registry,
+                        master_key,
+                        &quote.source_asset.chain,
+                        &salt,
+                        "",
+                        json!({
+                            "kind": "quote_source_deposit_address",
+                            "quote_id": quote.id,
+                            "order_id": quote.order_id,
+                            "asset": &quote.source_asset,
+                        }),
+                    ));
+                }
+                quote_value = json_value(quote);
+            }
+            Err(error) => {
+                quote_value = json!({"error": format!("failed to load quote by id: {error}")});
+            }
+        }
+    }
+
+    json!({
+        "order": order_value,
+        "quote": quote_value,
+        "funding_vault": funding_vault_value,
+        "custody_vaults": custody_vaults_value,
+        "execution_steps": execution_steps_value,
+        "provider_operations": provider_operations_value,
+        "provider_addresses": provider_addresses_value,
+        "derived_wallets": derived_wallets,
+    })
+}
+
+fn derive_recovery_wallet_snapshot(
+    chain_registry: &ChainRegistry,
+    master_key: &[u8; 64],
+    chain_id: &ChainId,
+    salt: &[u8; 32],
+    expected_address: &str,
+    context: Value,
+) -> Value {
+    let Some(backend_chain) = backend_chain_for_id(chain_id) else {
+        return json!({
+            "context": context,
+            "chain": chain_id,
+            "salt_hex": format!("0x{}", alloy::hex::encode(salt)),
+            "error": "unsupported chain",
+        });
+    };
+    let Some(chain) = chain_registry.get(&backend_chain) else {
+        return json!({
+            "context": context,
+            "chain": chain_id,
+            "salt_hex": format!("0x{}", alloy::hex::encode(salt)),
+            "error": "chain is not registered",
+        });
+    };
+    match chain.derive_wallet(master_key, salt) {
+        Ok(wallet) => {
+            let address = wallet.address.clone();
+            let address_matches_expected =
+                expected_address.is_empty() || address.eq_ignore_ascii_case(expected_address);
+            json!({
+            "context": context,
+            "chain": chain_id,
+            "salt_hex": format!("0x{}", alloy::hex::encode(salt)),
+            "address": address,
+            "expected_address": expected_address,
+            "address_matches_expected": address_matches_expected,
+            "private_key": wallet.private_key(),
+            })
+        }
+        Err(error) => json!({
+            "context": context,
+            "chain": chain_id,
+            "salt_hex": format!("0x{}", alloy::hex::encode(salt)),
+            "error": format!("failed to derive wallet: {error}"),
+        }),
+    }
+}
+
+async fn collect_live_database_snapshot(database_url: &str) -> Value {
+    let pool = match PgPoolOptions::new()
+        .max_connections(1)
+        .min_connections(0)
+        .connect(database_url)
+        .await
+    {
+        Ok(pool) => pool,
+        Err(error) => return json!({"error": format!("failed to connect for snapshot: {error}")}),
+    };
+
+    let mut tables = serde_json::Map::new();
+    for (table, order_by) in LIVE_RECOVERY_TABLES {
+        let query = format!(
+            "SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) \
+             FROM (SELECT * FROM {table} ORDER BY {order_by}) AS t"
+        );
+        let value = match sqlx_core::query_scalar::query_scalar::<_, Value>(&query)
+            .fetch_one(&pool)
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => json!({"error": error.to_string()}),
+        };
+        tables.insert((*table).to_string(), value);
+    }
+
+    Value::Object(tables)
+}
+
+fn json_result<T, E>(result: Result<T, E>) -> Value
+where
+    T: serde::Serialize,
+    E: std::fmt::Display,
+{
+    match result {
+        Ok(value) => serde_json::to_value(value)
+            .unwrap_or_else(|error| json!({"serialization_error": error.to_string()})),
+        Err(error) => json!({"error": error.to_string()}),
+    }
+}
+
+fn json_value<T>(value: T) -> Value
+where
+    T: serde::Serialize,
+{
+    serde_json::to_value(value)
+        .unwrap_or_else(|error| json!({"serialization_error": error.to_string()}))
+}
+
+fn live_recovery_dir() -> PathBuf {
+    env_var_optional(LIVE_RECOVERY_DIR_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/live-recovery")
+        })
+}
+
+fn read_router_master_key_hex(config_dir: &Path) -> Option<String> {
+    std::fs::read_to_string(config_dir.join("router-server-master-key.hex"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn write_router_master_key(config_dir: &Path) -> PathBuf {
+    let path = config_dir.join("router-server-master-key.hex");
+    if !path.exists() {
+        std::fs::write(&path, alloy::hex::encode([0x42_u8; 64])).expect("write router master key");
+    }
+    path
+}
+
+fn decode_router_master_key_hex(master_key_hex: &str) -> Option<[u8; 64]> {
+    let decoded = alloy::hex::decode(master_key_hex).ok()?;
+    decoded.try_into().ok()
+}
+
+fn redact_database_url(database_url: &str) -> String {
+    let Ok(mut url) = url::Url::parse(database_url) else {
+        return "<invalid database url>".to_string();
+    };
+    if url.password().is_some() {
+        let _ = url.set_password(Some("REDACTED"));
+    }
+    url.to_string()
+}
+
+fn sanitize_snapshot_label(label: &str) -> String {
+    label
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+async fn test_postgres() -> TestPostgres {
+    if let Ok(admin_database_url) = std::env::var(ROUTER_TEST_DATABASE_URL_ENV) {
+        return TestPostgres {
+            admin_database_url,
+            _container: None,
+        };
+    }
+
+    let image = GenericImage::new("postgres", "15-alpine")
+        .with_exposed_port(POSTGRES_PORT.tcp())
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
+        .with_env_var("POSTGRES_USER", POSTGRES_USER)
+        .with_env_var("POSTGRES_PASSWORD", POSTGRES_PASSWORD)
+        .with_env_var("POSTGRES_DB", POSTGRES_DATABASE);
+
+    let container = image.start().await.unwrap_or_else(|err| {
+        panic!(
+            "failed to start Postgres testcontainer; ensure Docker is running or set {ROUTER_TEST_DATABASE_URL_ENV}: {err}"
+        )
+    });
+    let port = container
+        .get_host_port_ipv4(POSTGRES_PORT.tcp())
+        .await
+        .expect("read Postgres testcontainer port");
+    let admin_database_url = format!(
+        "postgres://{POSTGRES_USER}:{POSTGRES_PASSWORD}@127.0.0.1:{port}/{POSTGRES_DATABASE}"
+    );
+
+    TestPostgres {
+        admin_database_url,
+        _container: Some(container),
+    }
+}
+
+async fn create_test_database(admin_database_url: &str) -> String {
+    let connect_options =
+        PgConnectOptions::from_str(admin_database_url).expect("parse test database admin URL");
+    let mut admin = PgConnection::connect_with(&connect_options)
+        .await
+        .expect("connect to test database admin URL");
+    let database_name = format!("sauron_e2e_{}", Uuid::now_v7().simple());
+
+    sqlx_core::query::query(&format!(r#"CREATE DATABASE "{database_name}""#))
+        .execute(&mut admin)
+        .await
+        .expect("create isolated test database");
+
+    let mut database_url =
+        url::Url::parse(admin_database_url).expect("parse test database admin URL");
+    database_url.set_path(&database_name);
+    database_url.to_string()
+}
+
+async fn spawn_router_api(mut args: RouterServerArgs) -> (String, RuntimeTask) {
+    args.host = IpAddr::from([127, 0, 0, 1]);
+    args.port = reserve_local_port().await;
+    let base_url = format!("http://{}:{}", args.host, args.port);
+    let status_url = format!("{base_url}/status");
+    let handle = tokio::spawn(async move {
+        run_api(args)
+            .await
+            .expect("router API should keep running until test aborts");
+    });
+    let client = reqwest::Client::new();
+    wait_until("router API status", Duration::from_secs(20), || {
+        let client = client.clone();
+        let status_url = status_url.clone();
+        async move {
+            client
+                .get(&status_url)
+                .send()
+                .await
+                .ok()
+                .filter(|response| response.status().is_success())
+                .map(|_| ())
+        }
+    })
+    .await;
+
+    (base_url, RuntimeTask { handle })
+}
+
+async fn reserve_local_port() -> u16 {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind ephemeral test port");
+    let port = listener.local_addr().expect("test listener addr").port();
+    drop(listener);
+    port
+}
+
+fn route_chain_tokens(route: RuntimeRoute) -> RuntimeChainTokens {
+    match route {
+        RuntimeRoute::BaseEthToBtc => RuntimeChainTokens {
+            ethereum_reference_token: MOCK_ERC20_ADDRESS,
+            base_reference_token: MOCK_ERC20_ADDRESS,
+            arbitrum_reference_token: MOCK_ERC20_ADDRESS,
+        },
+        RuntimeRoute::BaseUsdcToBtc => RuntimeChainTokens {
+            ethereum_reference_token: MOCK_ERC20_ADDRESS,
+            base_reference_token: BASE_USDC_ADDRESS,
+            arbitrum_reference_token: ARBITRUM_USDC_ADDRESS,
+        },
+    }
+}
+
+fn live_route_chain_tokens(route: RuntimeRoute) -> RuntimeChainTokens {
+    match route {
+        RuntimeRoute::BaseEthToBtc => RuntimeChainTokens {
+            ethereum_reference_token: ZERO_ADDRESS,
+            base_reference_token: ZERO_ADDRESS,
+            arbitrum_reference_token: ZERO_ADDRESS,
+        },
+        RuntimeRoute::BaseUsdcToBtc => RuntimeChainTokens {
+            ethereum_reference_token: ZERO_ADDRESS,
+            base_reference_token: BASE_USDC_ADDRESS,
+            arbitrum_reference_token: ARBITRUM_USDC_ADDRESS,
+        },
+    }
+}
+
+fn router_args(
+    devnet: &RiftDevnet,
+    config_dir: &std::path::Path,
+    database_url: String,
+    chain_tokens: RuntimeChainTokens,
+    mocks: &MockIntegratorServer,
+) -> RouterServerArgs {
+    RouterServerArgs {
+        host: IpAddr::from([127, 0, 0, 1]),
+        port: 0,
+        database_url,
+        db_max_connections: 8,
+        db_min_connections: 1,
+        log_level: "warn".to_string(),
+        master_key_path: write_router_master_key(config_dir)
+            .to_string_lossy()
+            .to_string(),
+        ethereum_mainnet_rpc_url: devnet.ethereum.anvil.endpoint_url().to_string(),
+        ethereum_reference_token: chain_tokens.ethereum_reference_token.to_string(),
+        ethereum_paymaster_private_key: Some(anvil_private_key(&devnet.ethereum)),
+        base_rpc_url: devnet.base.anvil.endpoint_url().to_string(),
+        base_reference_token: chain_tokens.base_reference_token.to_string(),
+        base_paymaster_private_key: Some(anvil_private_key(&devnet.base)),
+        arbitrum_rpc_url: devnet.base.anvil.endpoint_url().to_string(),
+        arbitrum_reference_token: chain_tokens.arbitrum_reference_token.to_string(),
+        arbitrum_paymaster_private_key: Some(anvil_private_key(&devnet.base)),
+        evm_paymaster_vault_gas_buffer_wei: "100000000000000".to_string(),
+        evm_paymaster_vault_gas_target_wei: None,
+        bitcoin_rpc_url: bitcoin_rpc_url(devnet),
+        bitcoin_rpc_auth: Auth::CookieFile(devnet.bitcoin.cookie.clone()),
+        untrusted_esplora_http_server_url: devnet
+            .bitcoin
+            .esplora_url
+            .as_ref()
+            .expect("esplora URL")
+            .clone(),
+        bitcoin_network: bitcoin::Network::Regtest,
+        bitcoin_paymaster_private_key: None,
+        cors_domain: None,
+        chainalysis_host: None,
+        chainalysis_token: None,
+        loki_url: None,
+        across_api_url: Some(mocks.base_url().to_string()),
+        across_api_key: Some("mock-across-api-key".to_string()),
+        across_integrator_id: None,
+        hyperunit_api_url: Some(mocks.base_url().to_string()),
+        hyperunit_proxy_url: None,
+        hyperliquid_api_url: Some(mocks.base_url().to_string()),
+        velora_api_url: None,
+        velora_partner: None,
+        hyperliquid_execution_private_key: None,
+        hyperliquid_account_address: None,
+        hyperliquid_vault_address: None,
+        hyperliquid_paymaster_private_key: Some(test_hyperliquid_paymaster_private_key()),
+        router_detector_api_key: Some("test-detector-secret".to_string()),
+        router_admin_api_key: None,
+        hyperliquid_network:
+            router_server::services::custody_action_executor::HyperliquidCallNetwork::Mainnet,
+        hyperliquid_order_timeout_ms: 30_000,
+        worker_id: Some(format!("router-worker-{}", Uuid::now_v7())),
+        worker_lease_name: Some(format!("router-worker-e2e-{}", Uuid::now_v7())),
+        worker_lease_seconds: 30,
+        worker_lease_renew_seconds: 5,
+        worker_standby_poll_seconds: 1,
+        worker_refund_poll_seconds: 1,
+        worker_order_execution_poll_seconds: 1,
+        worker_route_cost_refresh_seconds: 300,
+    }
+}
+
+fn live_router_args(
+    config_dir: &std::path::Path,
+    database_url: String,
+    chain_tokens: RuntimeChainTokens,
+    live: &LiveRuntimeConfig,
+) -> RouterServerArgs {
+    RouterServerArgs {
+        host: IpAddr::from([127, 0, 0, 1]),
+        port: 0,
+        database_url,
+        db_max_connections: 8,
+        db_min_connections: 1,
+        log_level: "info".to_string(),
+        master_key_path: write_router_master_key(config_dir)
+            .to_string_lossy()
+            .to_string(),
+        ethereum_mainnet_rpc_url: live.ethereum_rpc_url.clone(),
+        ethereum_reference_token: chain_tokens.ethereum_reference_token.to_string(),
+        ethereum_paymaster_private_key: live.ethereum_paymaster_private_key.clone(),
+        base_rpc_url: live.base_rpc_url.clone(),
+        base_reference_token: chain_tokens.base_reference_token.to_string(),
+        base_paymaster_private_key: live.base_paymaster_private_key.clone(),
+        arbitrum_rpc_url: live.arbitrum_rpc_url.clone(),
+        arbitrum_reference_token: chain_tokens.arbitrum_reference_token.to_string(),
+        arbitrum_paymaster_private_key: live.arbitrum_paymaster_private_key.clone(),
+        evm_paymaster_vault_gas_buffer_wei: "100000000000000".to_string(),
+        evm_paymaster_vault_gas_target_wei: None,
+        bitcoin_rpc_url: live.bitcoin_rpc_url.clone(),
+        bitcoin_rpc_auth: live.bitcoin_rpc_auth.clone(),
+        untrusted_esplora_http_server_url: live.electrum_http_server_url.clone(),
+        bitcoin_network: bitcoin::Network::Bitcoin,
+        bitcoin_paymaster_private_key: None,
+        cors_domain: None,
+        chainalysis_host: None,
+        chainalysis_token: None,
+        loki_url: None,
+        across_api_url: Some(live.across_api_url.clone()),
+        across_api_key: Some(live.across_api_key.clone()),
+        across_integrator_id: live.across_integrator_id.clone(),
+        hyperunit_api_url: Some(live.hyperunit_api_url.clone()),
+        hyperunit_proxy_url: live.hyperunit_proxy_url.clone(),
+        hyperliquid_api_url: Some(live.hyperliquid_api_url.clone()),
+        velora_api_url: None,
+        velora_partner: None,
+        hyperliquid_execution_private_key: live.hyperliquid_execution_private_key.clone(),
+        hyperliquid_account_address: live.hyperliquid_account_address.clone(),
+        hyperliquid_vault_address: live.hyperliquid_vault_address.clone(),
+        hyperliquid_paymaster_private_key: None,
+        router_detector_api_key: Some("test-detector-secret".to_string()),
+        router_admin_api_key: None,
+        hyperliquid_network: live.hyperliquid_network,
+        hyperliquid_order_timeout_ms: 30_000,
+        worker_id: Some(format!("router-worker-{}", Uuid::now_v7())),
+        worker_lease_name: Some(format!("router-worker-e2e-{}", Uuid::now_v7())),
+        worker_lease_seconds: 30,
+        worker_lease_renew_seconds: 5,
+        worker_standby_poll_seconds: 1,
+        worker_refund_poll_seconds: 5,
+        worker_order_execution_poll_seconds: 1,
+        worker_route_cost_refresh_seconds: 300,
+    }
+}
+
+async fn spawn_sauron(
+    devnet: &RiftDevnet,
+    database_url: &str,
+    router_base_url: &str,
+    chain_tokens: RuntimeChainTokens,
+    token_indexer_urls: RuntimeTokenIndexerUrls,
+) -> RuntimeTask {
+    let args = SauronArgs {
+        log_level: "warn".to_string(),
+        router_replica_database_url: database_url.to_string(),
+        router_replica_database_name: "router_db".to_string(),
+        router_replica_notification_channel: "sauron_watch_set_changed".to_string(),
+        router_internal_base_url: router_base_url.to_string(),
+        router_detector_api_key: "test-detector-secret".to_string(),
+        electrum_http_server_url: devnet
+            .bitcoin
+            .esplora_url
+            .as_ref()
+            .expect("esplora URL")
+            .clone(),
+        bitcoin_rpc_url: bitcoin_rpc_url(devnet),
+        bitcoin_rpc_auth: Auth::CookieFile(devnet.bitcoin.cookie.clone()),
+        bitcoin_zmq_rawtx_endpoint: devnet.bitcoin.zmq_rawtx_endpoint.clone(),
+        bitcoin_zmq_sequence_endpoint: devnet.bitcoin.zmq_sequence_endpoint.clone(),
+        ethereum_mainnet_rpc_url: devnet.ethereum.anvil.endpoint_url().to_string(),
+        ethereum_token_indexer_url: token_indexer_urls.ethereum,
+        ethereum_allowed_token: chain_tokens.ethereum_reference_token.to_string(),
+        base_rpc_url: devnet.base.anvil.endpoint_url().to_string(),
+        base_token_indexer_url: token_indexer_urls.base,
+        base_allowed_token: chain_tokens.base_reference_token.to_string(),
+        arbitrum_rpc_url: devnet.base.anvil.endpoint_url().to_string(),
+        arbitrum_token_indexer_url: token_indexer_urls.arbitrum,
+        arbitrum_allowed_token: chain_tokens.arbitrum_reference_token.to_string(),
+        sauron_reconcile_interval_seconds: 2,
+        sauron_bitcoin_scan_interval_seconds: 60,
+        sauron_bitcoin_indexed_lookup_concurrency: 1,
+        sauron_evm_indexed_lookup_concurrency: 1,
+    };
+    let handle = tokio::spawn(async move {
+        run_sauron(args)
+            .await
+            .expect("Sauron should keep running until test aborts");
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    if handle.is_finished() {
+        handle
+            .await
+            .expect("Sauron task should not panic before startup");
+        panic!("Sauron exited during startup");
+    }
+    RuntimeTask { handle }
+}
+
+fn token_indexer_urls_from_devnet(devnet: &RiftDevnet) -> RuntimeTokenIndexerUrls {
+    RuntimeTokenIndexerUrls {
+        ethereum: devnet
+            .ethereum
+            .token_indexer
+            .as_ref()
+            .map(|indexer| indexer.api_server_url.clone()),
+        base: devnet
+            .base
+            .token_indexer
+            .as_ref()
+            .map(|indexer| indexer.api_server_url.clone()),
+        arbitrum: None,
+    }
+}
+
+async fn spawn_mock_arbitrum_token_indexer(
+    devnet: &RiftDevnet,
+    database_url: &str,
+    route: RuntimeRoute,
+) -> Option<TokenIndexerInstance> {
+    if !matches!(route, RuntimeRoute::BaseUsdcToBtc) {
+        return None;
+    }
+
+    let rpc_url = devnet.base.anvil.endpoint_url().to_string();
+    let ws_url = devnet.base.anvil.ws_endpoint_url().to_string();
+
+    Some(
+        TokenIndexerInstance::new(
+            false,
+            &rpc_url,
+            &ws_url,
+            false,
+            devnet.base.anvil.chain_id(),
+            database_url.to_string(),
+            None,
+        )
+        .await
+        .expect("spawn mock Arbitrum token indexer"),
+    )
+}
+
+async fn spawn_live_sauron(
+    database_url: &str,
+    router_base_url: &str,
+    chain_tokens: RuntimeChainTokens,
+    live: &LiveRuntimeConfig,
+) -> RuntimeTask {
+    let args = live_sauron_args(database_url, router_base_url, chain_tokens, live);
+    let handle = tokio::spawn(async move {
+        run_sauron(args)
+            .await
+            .expect("live Sauron should keep running until test aborts");
+    });
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    if handle.is_finished() {
+        handle
+            .await
+            .expect("live Sauron task should not panic before startup");
+        panic!("live Sauron exited during startup");
+    }
+    RuntimeTask { handle }
+}
+
+fn live_sauron_args(
+    database_url: &str,
+    router_base_url: &str,
+    chain_tokens: RuntimeChainTokens,
+    live: &LiveRuntimeConfig,
+) -> SauronArgs {
+    SauronArgs {
+        log_level: "info".to_string(),
+        router_replica_database_url: database_url.to_string(),
+        router_replica_database_name: "router_db".to_string(),
+        router_replica_notification_channel: "sauron_watch_set_changed".to_string(),
+        router_internal_base_url: router_base_url.to_string(),
+        router_detector_api_key: "test-detector-secret".to_string(),
+        electrum_http_server_url: live.electrum_http_server_url.clone(),
+        bitcoin_rpc_url: live.bitcoin_rpc_url.clone(),
+        bitcoin_rpc_auth: live.bitcoin_rpc_auth.clone(),
+        bitcoin_zmq_rawtx_endpoint: live.bitcoin_zmq_rawtx_endpoint.clone(),
+        bitcoin_zmq_sequence_endpoint: live.bitcoin_zmq_sequence_endpoint.clone(),
+        ethereum_mainnet_rpc_url: live.ethereum_rpc_url.clone(),
+        ethereum_token_indexer_url: live.ethereum_token_indexer_url.clone(),
+        ethereum_allowed_token: chain_tokens.ethereum_reference_token.to_string(),
+        base_rpc_url: live.base_rpc_url.clone(),
+        base_token_indexer_url: live.base_token_indexer_url.clone(),
+        base_allowed_token: chain_tokens.base_reference_token.to_string(),
+        arbitrum_rpc_url: live.arbitrum_rpc_url.clone(),
+        arbitrum_token_indexer_url: live.arbitrum_token_indexer_url.clone(),
+        arbitrum_allowed_token: chain_tokens.arbitrum_reference_token.to_string(),
+        sauron_reconcile_interval_seconds: 30,
+        sauron_bitcoin_scan_interval_seconds: 15,
+        sauron_bitcoin_indexed_lookup_concurrency: 1,
+        sauron_evm_indexed_lookup_concurrency: 1,
+    }
+}
+
+async fn wait_until<T, Fut>(label: &str, timeout: Duration, mut check: impl FnMut() -> Fut) -> T
+where
+    Fut: Future<Output = Option<T>>,
+{
+    let started = Instant::now();
+    loop {
+        if let Some(value) = check().await {
+            return value;
+        }
+        assert!(started.elapsed() < timeout, "timed out waiting for {label}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+fn boxed_error<E>(error: E) -> Box<dyn Error + Send + Sync>
+where
+    E: Error + Send + Sync + 'static,
+{
+    Box::new(error)
+}
+
+async fn retry_live_rpc<T, Fut, Op>(
+    label: &str,
+    mut op: Op,
+) -> Result<T, Box<dyn Error + Send + Sync>>
+where
+    Op: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, Box<dyn Error + Send + Sync>>>,
+{
+    let mut delay = LIVE_RPC_RETRY_INITIAL_DELAY;
+    for attempt in 1..=LIVE_RPC_RETRY_ATTEMPTS {
+        match op().await {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if attempt < LIVE_RPC_RETRY_ATTEMPTS
+                    && is_retryable_live_rpc_error(error.as_ref()) =>
+            {
+                eprintln!(
+                    "retrying live RPC {label} after attempt {attempt}/{LIVE_RPC_RETRY_ATTEMPTS}: {error}"
+                );
+                tokio::time::sleep(delay).await;
+                delay = delay.saturating_mul(2);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("live RPC retry loop always returns before exhausting attempts")
+}
+
+async fn wait_for_live_receipt<P>(provider: &P, tx_hash: alloy::primitives::B256, label: &str)
+where
+    P: Provider,
+{
+    for _ in 0..120 {
+        let receipt = retry_live_rpc(&format!("{label} receipt"), || async {
+            provider
+                .get_transaction_receipt(tx_hash)
+                .await
+                .map_err(boxed_error)
+        })
+        .await
+        .expect("live receipt lookup");
+
+        if let Some(receipt) = receipt {
+            assert!(receipt.status(), "{label} transaction {tx_hash} reverted");
+            return;
+        }
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    panic!("{label} transaction {tx_hash} was not mined before timeout");
+}
+
+fn is_retryable_live_rpc_error(error: &(dyn Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        let message = error.to_string().to_ascii_lowercase();
+        if message.contains("429")
+            || message.contains("rate limit")
+            || message.contains("rate-limited")
+            || message.contains("too many requests")
+            || message.contains("timeout")
+            || message.contains("timed out")
+            || message.contains("temporarily unavailable")
+            || message.contains("temporary internal error")
+            || message.contains("connection reset")
+            || message.contains("connection closed")
+            || message.contains("connection refused")
+            || message.contains("500")
+            || message.contains("502")
+            || message.contains("503")
+            || message.contains("504")
+        {
+            return true;
+        }
+        current = error.source();
+    }
+    false
+}
+
+async fn wait_for_operation(
+    db: &Database,
+    order_id: Uuid,
+    operation_type: ProviderOperationType,
+) -> OrderProviderOperation {
+    let started = Instant::now();
+    loop {
+        let operations = db
+            .orders()
+            .get_provider_operations(order_id)
+            .await
+            .expect("load provider operations");
+        if let Some(operation) = operations
+            .into_iter()
+            .find(|operation| operation.operation_type == operation_type)
+        {
+            return operation;
+        }
+        if started.elapsed() >= Duration::from_secs(30) {
+            dump_order_state(db, order_id).await;
+            panic!("timed out waiting for {}", operation_type.to_db_string());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+async fn dump_order_state(db: &Database, order_id: Uuid) {
+    let steps = db
+        .orders()
+        .get_execution_steps(order_id)
+        .await
+        .expect("load execution steps");
+    for step in &steps {
+        eprintln!(
+            "step #{} type={:?} status={:?} error={}",
+            step.step_index, step.step_type, step.status, step.error
+        );
+    }
+    let operations = db
+        .orders()
+        .get_provider_operations(order_id)
+        .await
+        .expect("load provider operations");
+    for operation in &operations {
+        eprintln!(
+            "operation type={:?} status={:?} provider_ref={:?} request={} response={} observed_state={}",
+            operation.operation_type,
+            operation.status,
+            operation.provider_ref,
+            operation.request,
+            operation.response,
+            operation.observed_state
+        );
+    }
+}
+
+async fn wait_for_operation_status(
+    db: &Database,
+    operation_id: Uuid,
+    status: ProviderOperationStatus,
+) -> OrderProviderOperation {
+    wait_for_operation_status_with_timeout(db, operation_id, status, Duration::from_secs(45)).await
+}
+
+async fn wait_for_operation_status_with_timeout(
+    db: &Database,
+    operation_id: Uuid,
+    status: ProviderOperationStatus,
+    timeout: Duration,
+) -> OrderProviderOperation {
+    wait_until(status.to_db_string(), timeout, || async {
+        let operation = db
+            .orders()
+            .get_provider_operation(operation_id)
+            .await
+            .expect("load provider operation");
+        (operation.status == status).then_some(operation)
+    })
+    .await
+}
+
+async fn wait_for_order_status(
+    db: &Database,
+    order_id: Uuid,
+    status: RouterOrderStatus,
+) -> RouterOrderStatus {
+    wait_for_order_status_with_timeout(db, order_id, status, Duration::from_secs(30)).await
+}
+
+async fn wait_for_order_status_with_timeout(
+    db: &Database,
+    order_id: Uuid,
+    status: RouterOrderStatus,
+    timeout: Duration,
+) -> RouterOrderStatus {
+    wait_until(status.to_db_string(), timeout, || async {
+        let order = db.orders().get(order_id).await.expect("load router order");
+        (order.status == status).then_some(order.status)
+    })
+    .await
+}
+
+async fn wait_for_terminal_order_status(
+    db: &Database,
+    order_id: Uuid,
+    timeout: Duration,
+) -> RouterOrderStatus {
+    wait_until("terminal router order status", timeout, || async {
+        let order = db.orders().get(order_id).await.expect("load router order");
+        matches!(
+            order.status,
+            RouterOrderStatus::Completed
+                | RouterOrderStatus::Failed
+                | RouterOrderStatus::Refunding
+                | RouterOrderStatus::Refunded
+        )
+        .then_some(order.status)
+    })
+    .await
+}
+
+fn provider_ref(operation: &OrderProviderOperation) -> &str {
+    operation
+        .provider_ref
+        .as_deref()
+        .expect("provider operation should include provider_ref")
+}
+
+async fn unit_deposit_address(db: &Database, operation_id: Uuid) -> Address {
+    let address = db
+        .orders()
+        .get_provider_addresses_by_operation(operation_id)
+        .await
+        .expect("load provider addresses")
+        .into_iter()
+        .find(|address| address.role == ProviderAddressRole::UnitDeposit)
+        .expect("unit deposit address should exist");
+    Address::from_str(&address.address).expect("unit deposit address should be EVM address")
+}
+
+async fn unit_deposit_expected_amount(db: &Database, operation: &OrderProviderOperation) -> U256 {
+    let amount = if let Some(amount) = operation
+        .request
+        .get("expected_amount")
+        .and_then(Value::as_str)
+    {
+        amount.to_string()
+    } else if let Some(step_id) = operation.execution_step_id {
+        db.orders()
+            .get_execution_step(step_id)
+            .await
+            .expect("load unit deposit execution step")
+            .amount_in
+            .unwrap_or_else(|| "1000".to_string())
+    } else {
+        "1000".to_string()
+    };
+    U256::from_str_radix(&amount, 10).expect("unit deposit expected amount should parse")
+}
+
+fn hl_deposit_coin_for_operation(operation: &OrderProviderOperation) -> String {
+    let asset = operation
+        .request
+        .get("asset")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    match asset {
+        "btc" => "UBTC".to_string(),
+        "eth" => "UETH".to_string(),
+        other => panic!("unsupported UnitDeposit asset for HL credit: {other:?}"),
+    }
+}
+
+fn hl_destination_for_unit_deposit(operation: &OrderProviderOperation) -> Address {
+    let destination = operation
+        .request
+        .get("dst_addr")
+        .and_then(Value::as_str)
+        .expect("UnitDeposit operation request should include dst_addr");
+    Address::from_str(destination).expect("UnitDeposit dst_addr should be an EVM address")
+}
+
+fn raw_units_to_f64(amount: U256, decimals: u32) -> f64 {
+    amount.to_string().parse::<f64>().expect("amount fits f64") / 10f64.powi(decimals as i32)
+}
+
+async fn fund_destination_execution_vault_from_across_native(
+    devnet: &RiftDevnet,
+    db: &Database,
+    order_id: Uuid,
+) {
+    let destination_vault = db
+        .orders()
+        .get_custody_vaults(order_id)
+        .await
+        .expect("load custody vaults")
+        .into_iter()
+        .find(|vault| vault.role == CustodyVaultRole::DestinationExecution)
+        .expect("across step should create destination execution custody vault");
+    let across_operation = db
+        .orders()
+        .get_provider_operations(order_id)
+        .await
+        .expect("load provider operations")
+        .into_iter()
+        .find(|operation| operation.operation_type == ProviderOperationType::AcrossBridge)
+        .expect("across operation should exist");
+    let output_amount = across_operation
+        .response
+        .get("expectedOutputAmount")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|amount| U256::from_str_radix(amount, 10).ok())
+        .expect("across response should include expectedOutputAmount");
+    let balance = output_amount + U256::from(1_000_000_000_000_000_000_u128);
+    let address = Address::from_str(&destination_vault.address)
+        .expect("destination execution vault address should be EVM address");
+    match destination_vault.chain.as_str() {
+        "evm:1" => send_native(&devnet.ethereum, address, balance).await,
+        "evm:8453" => send_native(&devnet.base, address, balance).await,
+        other => panic!("unsupported destination execution chain {other}"),
+    }
+}
+
+async fn fund_destination_execution_vault_from_across_usdc(
+    devnet: &RiftDevnet,
+    db: &Database,
+    order_id: Uuid,
+) {
+    let destination_vault = db
+        .orders()
+        .get_custody_vaults(order_id)
+        .await
+        .expect("load custody vaults")
+        .into_iter()
+        .find(|vault| vault.role == CustodyVaultRole::DestinationExecution)
+        .expect("across step should create destination execution custody vault");
+    assert_eq!(
+        destination_vault.chain.as_str(),
+        "evm:42161",
+        "base usdc route should land the destination execution vault on arbitrum"
+    );
+    let across_operation = db
+        .orders()
+        .get_provider_operations(order_id)
+        .await
+        .expect("load provider operations")
+        .into_iter()
+        .find(|operation| operation.operation_type == ProviderOperationType::AcrossBridge)
+        .expect("across operation should exist");
+    let output_amount = across_operation
+        .response
+        .get("expectedOutputAmount")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|amount| U256::from_str_radix(amount, 10).ok())
+        .expect("across response should include expectedOutputAmount");
+    let address = Address::from_str(&destination_vault.address)
+        .expect("destination execution vault address should be EVM address");
+    mint_erc20(
+        &devnet.base,
+        ARBITRUM_USDC_ADDRESS.parse().expect("valid arbitrum usdc"),
+        address,
+        output_amount,
+    )
+    .await;
+}
+
+async fn mint_erc20(
+    devnet: &devnet::EthDevnet,
+    token_address: Address,
+    recipient: Address,
+    amount: U256,
+) {
+    let signer = anvil_private_key(devnet)
+        .parse::<alloy::signers::local::PrivateKeySigner>()
+        .expect("valid anvil private key");
+    let provider = ProviderBuilder::new()
+        .wallet(EthereumWallet::new(signer))
+        .connect_http(devnet.anvil.endpoint_url())
+        .erased();
+    let token = GenericEIP3009ERC20Instance::new(token_address, provider);
+    let receipt = token
+        .mint(recipient, amount)
+        .send()
+        .await
+        .expect("send mint")
+        .get_receipt()
+        .await
+        .expect("mint receipt");
+    assert!(receipt.status(), "erc20 mint reverted");
+}
+
+async fn install_mock_usdc_clone(devnet: &devnet::EthDevnet, token_address: Address) {
+    let signer = anvil_private_key(devnet)
+        .parse::<alloy::signers::local::PrivateKeySigner>()
+        .expect("valid anvil private key");
+    let provider = ProviderBuilder::new()
+        .wallet(EthereumWallet::new(signer))
+        .connect_http(devnet.anvil.endpoint_url())
+        .erased();
+    let implementation_code = provider
+        .get_code_at(*devnet.mock_erc20_contract.address())
+        .await
+        .expect("load mock erc20 bytecode");
+    provider
+        .anvil_set_code(token_address, implementation_code)
+        .await
+        .expect("install mock erc20 bytecode at canonical address");
+
+    let token = GenericEIP3009ERC20Instance::new(token_address, provider.clone());
+    let admin = devnet.funded_address;
+    token
+        .initialize(
+            "Mock USD Coin".to_string(),
+            "USDC".to_string(),
+            "USDC".to_string(),
+            6,
+            admin,
+            admin,
+            admin,
+            admin,
+        )
+        .send()
+        .await
+        .expect("send mock usdc initialize")
+        .get_receipt()
+        .await
+        .expect("mock usdc initialize receipt");
+    token
+        .configureMinter(admin, U256::MAX)
+        .send()
+        .await
+        .expect("send mock usdc configureMinter")
+        .get_receipt()
+        .await
+        .expect("mock usdc configureMinter receipt");
+}
+
+async fn prepare_route_chain_state(devnet: &RiftDevnet, route: RuntimeRoute) {
+    if !matches!(route, RuntimeRoute::BaseUsdcToBtc) {
+        return;
+    }
+
+    install_mock_usdc_clone(
+        &devnet.base,
+        BASE_USDC_ADDRESS.parse().expect("valid base usdc address"),
+    )
+    .await;
+    install_mock_usdc_clone(
+        &devnet.base,
+        ARBITRUM_USDC_ADDRESS
+            .parse()
+            .expect("valid arbitrum usdc address"),
+    )
+    .await;
+}
+
+async fn send_native(devnet: &devnet::EthDevnet, recipient: Address, amount: U256) {
+    let signer = anvil_private_key(devnet)
+        .parse::<alloy::signers::local::PrivateKeySigner>()
+        .expect("valid anvil private key");
+    let wallet = EthereumWallet::new(signer);
+    let provider = ProviderBuilder::new()
+        .wallet(wallet)
+        .connect_http(devnet.anvil.endpoint_url());
+    let tx = TransactionRequest::default()
+        .with_to(recipient)
+        .with_value(amount);
+    let receipt = provider
+        .send_transaction(tx)
+        .await
+        .expect("send native transfer")
+        .get_receipt()
+        .await
+        .expect("native transfer receipt");
+    assert!(receipt.status(), "native transfer reverted");
+}
+
+async fn send_live_native(
+    rpc_url: &str,
+    private_key: &str,
+    recipient: Address,
+    amount: U256,
+) -> String {
+    let signer = private_key
+        .parse::<PrivateKeySigner>()
+        .expect("valid live private key");
+    let sender = signer.address();
+    let wallet = EthereumWallet::new(signer);
+    let provider = ProviderBuilder::new()
+        .wallet(wallet)
+        .connect_http(rpc_url.parse().expect("valid live rpc url"));
+    let sender_balance = retry_live_rpc("read live native balance", || async {
+        provider.get_balance(sender).await.map_err(boxed_error)
+    })
+    .await
+    .expect("read live native balance");
+    assert!(
+        sender_balance >= amount,
+        "live funding wallet {sender:#x} has insufficient native balance on {rpc_url}; need {} wei, have {} wei",
+        amount,
+        sender_balance
+    );
+    let tx = TransactionRequest::default()
+        .with_to(recipient)
+        .with_value(amount);
+    let pending = retry_live_rpc("send live native transfer", || async {
+        provider
+            .send_transaction(tx.clone())
+            .await
+            .map_err(boxed_error)
+    })
+    .await
+    .expect("send live native transfer");
+    let tx_hash = pending.tx_hash().to_string();
+    wait_for_live_receipt(&provider, *pending.tx_hash(), "live native transfer").await;
+    tx_hash
+}
+
+async fn send_live_erc20(
+    rpc_url: &str,
+    private_key: &str,
+    token_address: Address,
+    recipient: Address,
+    amount: U256,
+) -> String {
+    let signer = private_key
+        .parse::<PrivateKeySigner>()
+        .expect("valid live private key");
+    let sender = signer.address();
+    let wallet = EthereumWallet::new(signer);
+    let provider = ProviderBuilder::new()
+        .wallet(wallet)
+        .connect_http(rpc_url.parse().expect("valid live rpc url"));
+    let token = IERC20::new(token_address, provider.clone());
+    let token_balance = retry_live_rpc("read live erc20 balance", || async {
+        token.balanceOf(sender).call().await.map_err(boxed_error)
+    })
+    .await
+    .expect("read live erc20 balance");
+    assert!(
+        token_balance >= amount,
+        "live funding wallet {sender:#x} has insufficient ERC20 balance for token {token_address:#x} on {rpc_url}; need {}, have {}",
+        amount,
+        token_balance
+    );
+    let pending = retry_live_rpc("send live erc20 transfer", || async {
+        token
+            .transfer(recipient, amount)
+            .send()
+            .await
+            .map_err(boxed_error)
+    })
+    .await
+    .expect("send live erc20 transfer");
+    let tx_hash = pending.tx_hash().to_string();
+    wait_for_live_receipt(&provider, *pending.tx_hash(), "live erc20 transfer").await;
+    tx_hash
+}
+
+fn anvil_private_key(devnet: &devnet::EthDevnet) -> String {
+    format!(
+        "0x{}",
+        alloy::hex::encode(devnet.anvil.keys()[0].to_bytes())
+    )
+}
+
+fn test_hyperliquid_paymaster_private_key() -> String {
+    "0x59c6995e998f97a5a0044976f7ad0a7df4976fbe66f6cc18ff3c16f18a6b9e3f".to_string()
+}
+
+fn bitcoin_rpc_url(devnet: &RiftDevnet) -> String {
+    format!(
+        "http://{}:{}",
+        devnet.bitcoin.regtest.params.rpc_socket.ip(),
+        devnet.bitcoin.regtest.params.rpc_socket.port()
+    )
+}
+
+fn valid_evm_address() -> String {
+    "0x0000000000000000000000000000000000000001".to_string()
+}
+
+fn valid_regtest_btc_address() -> String {
+    "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string()
+}
+
+fn route_amount_in(route: RuntimeRoute) -> &'static str {
+    match route {
+        RuntimeRoute::BaseEthToBtc => "30000000000000000",
+        RuntimeRoute::BaseUsdcToBtc => "60000000",
+    }
+}
+
+fn live_route_amount_in(route: RuntimeRoute) -> String {
+    match route {
+        RuntimeRoute::BaseEthToBtc => env_var_optional(LIVE_BASE_ETH_AMOUNT_WEI_ENV)
+            .unwrap_or_else(|| DEFAULT_LIVE_BASE_ETH_AMOUNT_WEI.to_string()),
+        RuntimeRoute::BaseUsdcToBtc => env_var_optional(LIVE_BASE_USDC_AMOUNT_ENV)
+            .unwrap_or_else(|| DEFAULT_LIVE_BASE_USDC_AMOUNT.to_string()),
+    }
+}
+
+fn assert_route_provider_id(route: RuntimeRoute, provider_id: &str) {
+    assert!(
+        provider_id.starts_with("path:"),
+        "provider id should describe the selected transition path: {provider_id}"
+    );
+    let expected_fragments: &[&str] = match route {
+        RuntimeRoute::BaseEthToBtc => &[
+            "across_bridge:across",
+            "unit_deposit:unit",
+            "hyperliquid_trade:hyperliquid",
+            "unit_withdrawal:unit",
+            "exchange:hyperliquid",
+        ],
+        RuntimeRoute::BaseUsdcToBtc => &[
+            "across_bridge:across",
+            "hyperliquid_bridge_deposit:hyperliquid_bridge",
+            "hyperliquid_trade:hyperliquid",
+            "unit_withdrawal:unit",
+            "exchange:hyperliquid",
+        ],
+    };
+    for fragment in expected_fragments {
+        assert!(
+            provider_id.contains(fragment),
+            "provider id {provider_id} should contain {fragment}"
+        );
+    }
+}
+
+fn route_expected_funding_asset(route: RuntimeRoute) -> AssetId {
+    match route {
+        RuntimeRoute::BaseEthToBtc => AssetId::Native,
+        RuntimeRoute::BaseUsdcToBtc => AssetId::Reference(BASE_USDC_ADDRESS.to_string()),
+    }
+}
+
+fn route_order_metadata(route: RuntimeRoute) -> &'static str {
+    match route {
+        RuntimeRoute::BaseEthToBtc => "sauron_runtime_base_eth_btc",
+        RuntimeRoute::BaseUsdcToBtc => "sauron_runtime_base_usdc_btc",
+    }
+}
+
+fn route_expected_hl_trade_steps(route: RuntimeRoute) -> usize {
+    match route {
+        RuntimeRoute::BaseEthToBtc => 2,
+        RuntimeRoute::BaseUsdcToBtc => 1,
+    }
+}
+
+async fn spawn_runtime_mocks(devnet: &RiftDevnet, route: RuntimeRoute) -> MockIntegratorServer {
+    let base_spoke_pool = format!(
+        "{:#x}",
+        devnet.base.mock_across_spoke_pool_contract.address()
+    );
+    let base_ws_url = devnet.base.anvil.ws_endpoint_url().to_string();
+    let mut config = MockIntegratorConfig::default()
+        .with_across_spoke_pool_address(base_spoke_pool)
+        .with_across_evm_rpc_url(base_ws_url)
+        .with_across_status_latency(Duration::from_secs(2))
+        .with_mainnet_hyperliquid(true);
+    if matches!(route, RuntimeRoute::BaseUsdcToBtc) {
+        config = config
+            .with_hyperliquid_bridge_address(MAINNET_HYPERLIQUID_BRIDGE_ADDRESS)
+            .with_hyperliquid_evm_rpc_url(devnet.base.anvil.endpoint_url().to_string())
+            .with_hyperliquid_usdc_token_address(ARBITRUM_USDC_ADDRESS);
+    }
+    MockIntegratorServer::spawn_with_config(config)
+        .await
+        .expect("spawn mock integrators")
+}
+
+async fn submit_quote_request(
+    client: &reqwest::Client,
+    router_base_url: &str,
+    route: RuntimeRoute,
+) -> RouterOrderQuoteEnvelope {
+    submit_quote_request_custom(
+        client,
+        router_base_url,
+        route,
+        route_amount_in(route).to_string(),
+        valid_regtest_btc_address(),
+    )
+    .await
+}
+
+async fn submit_quote_request_custom(
+    client: &reqwest::Client,
+    router_base_url: &str,
+    route: RuntimeRoute,
+    amount_in: String,
+    recipient_address: String,
+) -> RouterOrderQuoteEnvelope {
+    let from_asset = match route {
+        RuntimeRoute::BaseEthToBtc => json!({
+            "chain": "evm:8453",
+            "asset": "native"
+        }),
+        RuntimeRoute::BaseUsdcToBtc => json!({
+            "chain": "evm:8453",
+            "asset": BASE_USDC_ADDRESS
+        }),
+    };
+
+    let quote_response = client
+        .post(format!("{router_base_url}/api/v1/quotes"))
+        .json(&json!({
+            "type": "market_order",
+            "from_asset": from_asset,
+            "to_asset": {
+                "chain": "bitcoin",
+                "asset": "native"
+            },
+            "recipient_address": recipient_address,
+            "kind": "exact_in",
+            "amount_in": amount_in,
+            "min_amount_out": "1"
+        }))
+        .send()
+        .await
+        .expect("quote request");
+    let status = quote_response.status();
+    let body = quote_response.text().await.expect("quote body");
+    assert_eq!(status, reqwest::StatusCode::CREATED, "{body}");
+    serde_json::from_str(&body).expect("quote response")
+}
+
+async fn submit_order_request(
+    client: &reqwest::Client,
+    router_base_url: &str,
+    quote_id: Uuid,
+    route: RuntimeRoute,
+) -> RouterOrderEnvelope {
+    let order_response = client
+        .post(format!("{router_base_url}/api/v1/orders"))
+        .json(&json!({
+            "quote_id": quote_id,
+            "refund_address": valid_evm_address(),
+            "cancellation_commitment": dummy_commitment(),
+            "metadata": {
+                "test": route_order_metadata(route)
+            }
+        }))
+        .send()
+        .await
+        .expect("order request");
+    let status = order_response.status();
+    let body = order_response.text().await.expect("order body");
+    assert_eq!(status, reqwest::StatusCode::CREATED, "{body}");
+    serde_json::from_str(&body).expect("order response")
+}
+
+async fn fund_source_vault(devnet: &RiftDevnet, route: RuntimeRoute, vault_address: Address) {
+    match route {
+        RuntimeRoute::BaseEthToBtc => {
+            let source_balance = U256::from_str_radix(route_amount_in(route), 10).unwrap()
+                + U256::from(1_000_000_000_000_000_000_u128);
+            send_native(&devnet.base, vault_address, source_balance).await;
+        }
+        RuntimeRoute::BaseUsdcToBtc => {
+            let amount = U256::from_str_radix(route_amount_in(route), 10).unwrap();
+            mint_erc20(
+                &devnet.base,
+                BASE_USDC_ADDRESS.parse().expect("valid base usdc"),
+                vault_address,
+                amount,
+            )
+            .await;
+        }
+    }
+}
+
+async fn fund_live_source_vault(
+    live: &LiveRuntimeConfig,
+    route: RuntimeRoute,
+    vault_address: Address,
+) -> String {
+    let base_funding_rpc_url = env_var_optional(BASE_FUNDING_RPC_URL_ENV)
+        .unwrap_or_else(|| DEFAULT_LIVE_BASE_FUNDING_RPC_URL.to_string());
+    match route {
+        RuntimeRoute::BaseEthToBtc => {
+            let amount = U256::from_str_radix(&live_route_amount_in(route), 10).unwrap()
+                + U256::from(LIVE_NATIVE_SOURCE_GAS_BUFFER_WEI);
+            send_live_native(
+                &base_funding_rpc_url,
+                &live.private_key,
+                vault_address,
+                amount,
+            )
+            .await
+        }
+        RuntimeRoute::BaseUsdcToBtc => {
+            let amount = U256::from_str_radix(&live_route_amount_in(route), 10).unwrap();
+            send_live_erc20(
+                &base_funding_rpc_url,
+                &live.private_key,
+                BASE_USDC_ADDRESS.parse().expect("valid base usdc"),
+                vault_address,
+                amount,
+            )
+            .await
+        }
+    }
+}
+
+fn dummy_commitment() -> String {
+    format!("0x{}", alloy::hex::encode([0xaa; 32]))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sauron_runtime_drives_router_worker_through_mock_base_eth_btc_progress() {
+    run_mock_runtime_route(RuntimeRoute::BaseEthToBtc).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sauron_runtime_drives_router_worker_through_mock_base_usdc_btc_progress() {
+    run_mock_runtime_route(RuntimeRoute::BaseUsdcToBtc).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "Validates the live Soron runtime environment without spending funds"]
+async fn live_sauron_runtime_environment_contract() {
+    load_repo_env_once();
+    if env::var(LIVE_RUNTIME_RUN_FLAG).as_deref() != Ok("1") {
+        return;
+    }
+
+    let live = LiveRuntimeConfig::from_env();
+    let signer = live
+        .private_key
+        .parse::<PrivateKeySigner>()
+        .expect("valid live runtime private key");
+    let _source_address = signer.address();
+
+    let ethereum_provider = ProviderBuilder::new().connect_http(
+        live.ethereum_rpc_url
+            .parse()
+            .expect("valid Ethereum RPC URL for live runtime"),
+    );
+    let base_provider = ProviderBuilder::new().connect_http(
+        live.base_rpc_url
+            .parse()
+            .expect("valid Base RPC URL for live runtime"),
+    );
+    let arbitrum_provider = ProviderBuilder::new().connect_http(
+        live.arbitrum_rpc_url
+            .parse()
+            .expect("valid Arbitrum RPC URL for live runtime"),
+    );
+
+    assert_eq!(
+        ethereum_provider
+            .get_chain_id()
+            .await
+            .expect("ethereum chain id"),
+        1
+    );
+    assert_eq!(
+        base_provider.get_chain_id().await.expect("base chain id"),
+        8453
+    );
+    assert_eq!(
+        arbitrum_provider
+            .get_chain_id()
+            .await
+            .expect("arbitrum chain id"),
+        42161
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "Probes the live Soron EVM backend cursor path without spending funds"]
+async fn live_sauron_evm_backend_cursor_contract() {
+    load_repo_env_once();
+    if env::var(LIVE_RUNTIME_RUN_FLAG).as_deref() != Ok("1") {
+        return;
+    }
+
+    let live = LiveRuntimeConfig::from_env();
+    let args = live_sauron_args(
+        "postgres://unused",
+        "http://127.0.0.1:9",
+        live_route_chain_tokens(RuntimeRoute::BaseEthToBtc),
+        &live,
+    );
+
+    let ethereum = EvmErc20DiscoveryBackend::new_ethereum(&args)
+        .await
+        .expect("build ethereum backend");
+    let ethereum_cursor = ethereum
+        .current_cursor()
+        .await
+        .expect("ethereum current cursor");
+    eprintln!(
+        "ethereum cursor height={} hash={}",
+        ethereum_cursor.height, ethereum_cursor.hash
+    );
+
+    let base = EvmErc20DiscoveryBackend::new_base(&args)
+        .await
+        .expect("build base backend");
+    let base_cursor = base.current_cursor().await.expect("base current cursor");
+    eprintln!(
+        "base cursor height={} hash={}",
+        base_cursor.height, base_cursor.hash
+    );
+
+    let arbitrum = EvmErc20DiscoveryBackend::new_arbitrum(&args)
+        .await
+        .expect("build arbitrum backend");
+    let arbitrum_cursor = arbitrum
+        .current_cursor()
+        .await
+        .expect("arbitrum current cursor");
+    eprintln!(
+        "arbitrum cursor height={} hash={}",
+        arbitrum_cursor.height, arbitrum_cursor.hash
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "Probes concurrent live Soron EVM backend cursor calls without spending funds"]
+async fn live_sauron_evm_backend_cursor_concurrency_contract() {
+    load_repo_env_once();
+    if env::var(LIVE_RUNTIME_RUN_FLAG).as_deref() != Ok("1") {
+        return;
+    }
+
+    let live = LiveRuntimeConfig::from_env();
+    let args = live_sauron_args(
+        "postgres://unused",
+        "http://127.0.0.1:9",
+        live_route_chain_tokens(RuntimeRoute::BaseEthToBtc),
+        &live,
+    );
+
+    let ethereum = EvmErc20DiscoveryBackend::new_ethereum(&args)
+        .await
+        .expect("build ethereum backend");
+    let base = EvmErc20DiscoveryBackend::new_base(&args)
+        .await
+        .expect("build base backend");
+    let arbitrum = EvmErc20DiscoveryBackend::new_arbitrum(&args)
+        .await
+        .expect("build arbitrum backend");
+
+    for round in 0..10 {
+        let (ethereum_cursor, base_cursor, arbitrum_cursor) = tokio::join!(
+            ethereum.current_cursor(),
+            base.current_cursor(),
+            arbitrum.current_cursor()
+        );
+        let ethereum_cursor = ethereum_cursor.unwrap_or_else(|error| {
+            panic!("ethereum current cursor failed in round {round}: {error}")
+        });
+        let base_cursor = base_cursor
+            .unwrap_or_else(|error| panic!("base current cursor failed in round {round}: {error}"));
+        let arbitrum_cursor = arbitrum_cursor.unwrap_or_else(|error| {
+            panic!("arbitrum current cursor failed in round {round}: {error}")
+        });
+        eprintln!(
+            "round={round} ethereum={} base={} arbitrum={}",
+            ethereum_cursor.height, base_cursor.height, arbitrum_cursor.height
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "SPENDS REAL FUNDS through router-api + router-worker + Sauron on live providers"]
+async fn live_sauron_runtime_drives_router_worker_through_base_eth_btc_progress() {
+    load_repo_env_once();
+    if env::var(LIVE_RUNTIME_RUN_FLAG).as_deref() != Ok("1") {
+        return;
+    }
+    require_live_spend_confirmation();
+    run_live_runtime_route(RuntimeRoute::BaseEthToBtc).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "SPENDS REAL FUNDS through router-api + router-worker + Sauron on live providers"]
+async fn live_sauron_runtime_drives_router_worker_through_base_usdc_btc_progress() {
+    load_repo_env_once();
+    if env::var(LIVE_RUNTIME_RUN_FLAG).as_deref() != Ok("1") {
+        return;
+    }
+    require_live_spend_confirmation();
+    run_live_runtime_route(RuntimeRoute::BaseUsdcToBtc).await;
+}
+
+async fn run_live_runtime_route(route: RuntimeRoute) {
+    let live = LiveRuntimeConfig::from_env();
+    let signer = live
+        .private_key
+        .parse::<PrivateKeySigner>()
+        .expect("valid live runtime private key");
+    let source_address = signer.address();
+
+    let postgres = test_postgres().await;
+    let database_url = create_test_database(&postgres.admin_database_url).await;
+    let config_dir = tempfile::tempdir().expect("router live config dir");
+    let chain_tokens = live_route_chain_tokens(route);
+    let args = live_router_args(config_dir.path(), database_url.clone(), chain_tokens, &live);
+    let worker_config = RouterWorkerConfig::from_args(&args).expect("live worker config");
+    let worker_components = initialize_components(
+        &args,
+        Some(worker_config.worker_id.clone()),
+        PaymasterMode::Enabled,
+    )
+    .await
+    .expect("initialize live worker components");
+    let db = worker_components.db.clone();
+    let chain_registry = worker_components.chain_registry.clone();
+    let (router_base_url, _api_task) = spawn_router_api(args.clone()).await;
+    let _worker_task = RuntimeTask {
+        handle: tokio::spawn(async move {
+            run_worker_loop(
+                worker_components.db,
+                worker_components.vault_manager,
+                worker_components.order_execution_manager,
+                worker_components.route_costs,
+                worker_config,
+            )
+            .await
+            .expect("live router worker loop should keep running until test aborts");
+        }),
+    };
+    let _sauron = spawn_live_sauron(&database_url, &router_base_url, chain_tokens, &live).await;
+    let client = reqwest::Client::new();
+
+    let amount_in = live_route_amount_in(route);
+    let quote = submit_quote_request_custom(
+        &client,
+        &router_base_url,
+        route,
+        amount_in.clone(),
+        live.bitcoin_recipient_address.clone(),
+    )
+    .await;
+    let market_quote = quote.quote.as_market_order().expect("market order quote");
+    assert_route_provider_id(route, &market_quote.provider_id);
+    write_live_recovery_snapshot(
+        "after_quote",
+        route,
+        &live,
+        &database_url,
+        config_dir.path(),
+        &db,
+        chain_registry.as_ref(),
+        None,
+        Some(market_quote.id),
+        json!({
+            "amount_in": amount_in,
+            "source_address": format!("{:#x}", source_address),
+            "router_base_url": &router_base_url,
+        }),
+    )
+    .await;
+
+    let order = submit_order_request(&client, &router_base_url, market_quote.id, route).await;
+    let funding_vault = order
+        .funding_vault
+        .as_ref()
+        .expect("live order should include funding vault")
+        .vault
+        .clone();
+    assert_eq!(
+        funding_vault.deposit_asset.chain,
+        ChainId::parse("evm:8453").unwrap()
+    );
+    assert_eq!(
+        funding_vault.deposit_asset.asset,
+        route_expected_funding_asset(route)
+    );
+
+    let funding_vault_address = Address::from_str(&funding_vault.deposit_vault_address)
+        .expect("funding vault should be an EVM address");
+    write_live_recovery_snapshot(
+        "before_live_funding",
+        route,
+        &live,
+        &database_url,
+        config_dir.path(),
+        &db,
+        chain_registry.as_ref(),
+        Some(order.order.id),
+        Some(market_quote.id),
+        json!({
+            "amount_in": live_route_amount_in(route),
+            "source_address": format!("{:#x}", source_address),
+            "funding_vault_address": &funding_vault.deposit_vault_address,
+            "router_base_url": &router_base_url,
+        }),
+    )
+    .await;
+    let funding_tx_hash = fund_live_source_vault(&live, route, funding_vault_address).await;
+    eprintln!(
+        "live runtime funded source vault {} from {} via tx {}",
+        funding_vault.deposit_vault_address, source_address, funding_tx_hash
+    );
+    write_live_recovery_snapshot(
+        "after_live_funding",
+        route,
+        &live,
+        &database_url,
+        config_dir.path(),
+        &db,
+        chain_registry.as_ref(),
+        Some(order.order.id),
+        Some(market_quote.id),
+        json!({
+            "funding_tx_hash": &funding_tx_hash,
+            "source_address": format!("{:#x}", source_address),
+            "funding_vault_address": &funding_vault.deposit_vault_address,
+        }),
+    )
+    .await;
+
+    let final_status =
+        wait_for_terminal_order_status(&db, order.order.id, LIVE_TERMINAL_TIMEOUT).await;
+    write_live_recovery_snapshot(
+        "terminal_order_status",
+        route,
+        &live,
+        &database_url,
+        config_dir.path(),
+        &db,
+        chain_registry.as_ref(),
+        Some(order.order.id),
+        Some(market_quote.id),
+        json!({
+            "final_status": final_status,
+            "funding_tx_hash": &funding_tx_hash,
+        }),
+    )
+    .await;
+    if final_status != RouterOrderStatus::Completed {
+        dump_order_state(&db, order.order.id).await;
+    }
+    assert_eq!(final_status, RouterOrderStatus::Completed);
+
+    let completed_vault = db
+        .vaults()
+        .get(funding_vault.id)
+        .await
+        .expect("completed live funding vault");
+    assert_eq!(completed_vault.status, DepositVaultStatus::Completed);
+
+    let steps = db
+        .orders()
+        .get_execution_steps(order.order.id)
+        .await
+        .expect("load live execution steps");
+    let hl_steps: Vec<_> = steps
+        .iter()
+        .filter(|step| step.step_type == OrderExecutionStepType::HyperliquidTrade)
+        .collect();
+    assert_eq!(
+        hl_steps.len(),
+        route_expected_hl_trade_steps(route),
+        "live runtime flow should materialize the expected number of Hyperliquid trade legs"
+    );
+
+    let operations = db
+        .orders()
+        .get_provider_operations(order.order.id)
+        .await
+        .expect("load live provider operations");
+    assert!(
+        operations
+            .iter()
+            .all(|operation| operation.status == ProviderOperationStatus::Completed),
+        "all provider operations should be completed for a successful live route"
+    );
+}
+
+async fn run_mock_runtime_route(route: RuntimeRoute) {
+    let postgres = test_postgres().await;
+    let database_url = create_test_database(&postgres.admin_database_url).await;
+    let (devnet, _) = RiftDevnet::builder()
+        .using_esplora(true)
+        .using_token_indexer(database_url.clone())
+        .build()
+        .await
+        .expect("devnet setup failed");
+    prepare_route_chain_state(&devnet, route).await;
+    let _arbitrum_token_indexer =
+        spawn_mock_arbitrum_token_indexer(&devnet, &database_url, route).await;
+    let mut token_indexer_urls = token_indexer_urls_from_devnet(&devnet);
+    token_indexer_urls.arbitrum = _arbitrum_token_indexer
+        .as_ref()
+        .map(|indexer| indexer.api_server_url.clone());
+    let config_dir = tempfile::tempdir().expect("router config dir");
+    let mocks = spawn_runtime_mocks(&devnet, route).await;
+    let chain_tokens = route_chain_tokens(route);
+    let args = router_args(
+        &devnet,
+        config_dir.path(),
+        database_url.clone(),
+        chain_tokens,
+        &mocks,
+    );
+    let worker_config = RouterWorkerConfig::from_args(&args).expect("worker config");
+    let worker_components = initialize_components(
+        &args,
+        Some(worker_config.worker_id.clone()),
+        PaymasterMode::Enabled,
+    )
+    .await
+    .expect("initialize worker components");
+    let db = worker_components.db.clone();
+    let (router_base_url, _api_task) = spawn_router_api(args.clone()).await;
+    let _worker_task = RuntimeTask {
+        handle: tokio::spawn(async move {
+            run_worker_loop(
+                worker_components.db,
+                worker_components.vault_manager,
+                worker_components.order_execution_manager,
+                worker_components.route_costs,
+                worker_config,
+            )
+            .await
+            .expect("router worker loop should keep running until test aborts");
+        }),
+    };
+    let _sauron = spawn_sauron(
+        &devnet,
+        &database_url,
+        &router_base_url,
+        chain_tokens,
+        token_indexer_urls,
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let quote = submit_quote_request(&client, &router_base_url, route).await;
+    assert_route_provider_id(
+        route,
+        &quote
+            .quote
+            .as_market_order()
+            .expect("market order quote")
+            .provider_id,
+    );
+
+    let order = submit_order_request(
+        &client,
+        &router_base_url,
+        quote
+            .quote
+            .as_market_order()
+            .expect("market order quote")
+            .id,
+        route,
+    )
+    .await;
+    let funding_vault = order
+        .funding_vault
+        .as_ref()
+        .expect("order should include funding vault")
+        .vault
+        .clone();
+    assert_eq!(
+        funding_vault.deposit_asset.chain,
+        ChainId::parse("evm:8453").unwrap()
+    );
+    assert_eq!(
+        funding_vault.deposit_asset.asset,
+        route_expected_funding_asset(route)
+    );
+
+    let funding_vault_address = Address::from_str(&funding_vault.deposit_vault_address)
+        .expect("funding vault should be an EVM address");
+    fund_source_vault(&devnet, route, funding_vault_address).await;
+    wait_for_order_status(&db, order.order.id, RouterOrderStatus::Executing).await;
+    let funded_vault = db
+        .vaults()
+        .get(funding_vault.id)
+        .await
+        .expect("funding vault after worker funding pass");
+    assert_eq!(funded_vault.status, DepositVaultStatus::Executing);
+
+    let across_operation =
+        wait_for_operation(&db, order.order.id, ProviderOperationType::AcrossBridge).await;
+    assert_eq!(
+        across_operation.status,
+        ProviderOperationStatus::WaitingExternal
+    );
+    match route {
+        RuntimeRoute::BaseEthToBtc => {
+            fund_destination_execution_vault_from_across_native(&devnet, &db, order.order.id).await;
+        }
+        RuntimeRoute::BaseUsdcToBtc => {
+            fund_destination_execution_vault_from_across_usdc(&devnet, &db, order.order.id).await;
+        }
+    }
+
+    wait_for_operation_status(&db, across_operation.id, ProviderOperationStatus::Completed).await;
+
+    if matches!(route, RuntimeRoute::BaseEthToBtc) {
+        let unit_deposit_operation =
+            wait_for_operation(&db, order.order.id, ProviderOperationType::UnitDeposit).await;
+        let unit_address = unit_deposit_address(&db, unit_deposit_operation.id).await;
+        let hl_vault_address = hl_destination_for_unit_deposit(&unit_deposit_operation);
+        let deposit_coin = hl_deposit_coin_for_operation(&unit_deposit_operation);
+        let unit_deposit_amount = unit_deposit_expected_amount(&db, &unit_deposit_operation).await;
+        let deposit_decimals = match deposit_coin.as_str() {
+            "UBTC" => 8,
+            "UETH" => 18,
+            other => panic!("unsupported UnitDeposit coin for mock HL credit: {other:?}"),
+        };
+        mocks
+            .credit_hyperliquid_balance(
+                hl_vault_address,
+                &deposit_coin,
+                raw_units_to_f64(unit_deposit_amount, deposit_decimals),
+            )
+            .await;
+        send_native(&devnet.ethereum, unit_address, unit_deposit_amount).await;
+        mocks
+            .complete_unit_operation(provider_ref(&unit_deposit_operation))
+            .await
+            .expect("complete mock Unit deposit operation");
+        wait_for_operation_status(
+            &db,
+            unit_deposit_operation.id,
+            ProviderOperationStatus::Completed,
+        )
+        .await;
+    } else {
+        let bridge_operation = wait_for_operation(
+            &db,
+            order.order.id,
+            ProviderOperationType::HyperliquidBridgeDeposit,
+        )
+        .await;
+        wait_for_operation_status(&db, bridge_operation.id, ProviderOperationStatus::Completed)
+            .await;
+    }
+
+    let unit_withdrawal_operation =
+        wait_for_operation(&db, order.order.id, ProviderOperationType::UnitWithdrawal).await;
+    mocks
+        .complete_unit_operation(provider_ref(&unit_withdrawal_operation))
+        .await
+        .expect("complete mock Unit withdrawal operation");
+    wait_for_operation_status(
+        &db,
+        unit_withdrawal_operation.id,
+        ProviderOperationStatus::Completed,
+    )
+    .await;
+
+    wait_for_order_status(&db, order.order.id, RouterOrderStatus::Completed).await;
+    let completed_vault = db
+        .vaults()
+        .get(funding_vault.id)
+        .await
+        .expect("completed funding vault");
+    assert_eq!(completed_vault.status, DepositVaultStatus::Completed);
+
+    let steps = db
+        .orders()
+        .get_execution_steps(order.order.id)
+        .await
+        .expect("load execution steps");
+    let hl_steps: Vec<_> = steps
+        .iter()
+        .filter(|step| step.step_type == OrderExecutionStepType::HyperliquidTrade)
+        .collect();
+    assert_eq!(
+        hl_steps.len(),
+        route_expected_hl_trade_steps(route),
+        "runtime flow should materialize the expected number of Hyperliquid trade legs"
+    );
+
+    assert_eq!(mocks.across_deposits().await.len(), 1);
+    let ledger = mocks.ledger_snapshot().await;
+    let deposit_ops: Vec<_> = ledger
+        .unit_operations
+        .iter()
+        .filter(|op| {
+            matches!(
+                op.kind,
+                devnet::mock_integrators::MockUnitOperationKind::Deposit
+            )
+        })
+        .collect();
+    let withdrawal_ops: Vec<_> = ledger
+        .unit_operations
+        .iter()
+        .filter(|op| {
+            matches!(
+                op.kind,
+                devnet::mock_integrators::MockUnitOperationKind::Withdrawal
+            )
+        })
+        .collect();
+    assert_eq!(
+        deposit_ops.len(),
+        usize::from(matches!(route, RuntimeRoute::BaseEthToBtc))
+    );
+    assert_eq!(withdrawal_ops.len(), 1);
+}

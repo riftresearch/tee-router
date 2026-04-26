@@ -1,0 +1,280 @@
+configs:
+  bitcoin-entrypoint:
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+
+      base_archive_url="https://snapshots.publicnode.com/bitcoin-base.tar.lz4"
+      part_archive_url="https://snapshots.publicnode.com/bitcoin-part-927450.tar.lz4"
+
+      echo "Checking Bitcoin directory: $$BITCOIN_DATA_DIR"
+
+      # If both core subdirs are missing, treat as empty
+      if [[ ! -d "$$BITCOIN_DATA_DIR/blocks" ]] && [[ ! -d "$$BITCOIN_DATA_DIR/chainstate" ]]; then
+          echo "Bitcoin data directory appears to be empty. Downloading blockchain data..."
+          echo "Download will be streamed and decompressed on the fly (lz4)."
+
+          # Ensure target dir exists
+          mkdir -p "$$BITCOIN_DATA_DIR"
+
+          echo "Downloading base snapshot from: $$base_archive_url"
+          echo "Extracting directly to: $$BITCOIN_DATA_DIR"
+
+          # Stream download -> lz4 decode -> tar extract (base)
+          if wget -O - "$$base_archive_url" | tar -I lz4 -xvf - -C "$$BITCOIN_DATA_DIR"; then
+              echo "Base snapshot download and extraction successful"
+
+              echo "Downloading part snapshot from: $$part_archive_url"
+              echo "Extracting directly to: $$BITCOIN_DATA_DIR"
+
+              # Stream download -> lz4 decode -> tar extract (part)
+              if wget -O - "$$part_archive_url" | tar -I lz4 -xvf - -C "$$BITCOIN_DATA_DIR"; then
+                  echo "Part snapshot download and extraction successful"
+              else
+                  echo "Warning: Failed to download or extract part snapshot. Bitcoin Core may need to sync remaining blocks."
+              fi
+
+              # Ensure correct ownership if running as root
+              if id -u bitcoin >/dev/null 2>&1; then
+                  chown -R bitcoin:bitcoin "$$BITCOIN_DATA_DIR" || true
+              fi
+
+              echo "Data directory size: $$(du -sh $$BITCOIN_DATA_DIR | cut -f1)"
+          else
+              echo "Warning: Failed to download or extract base snapshot. Bitcoin Core will sync from genesis."
+              echo "This will take significantly longer but is still functional."
+          fi
+      else
+          echo "Bitcoin data directory already contains blockchain data"
+          echo "Data directory size: $$(du -sh $$BITCOIN_DATA_DIR | cut -f1)"
+      fi
+
+      # Clean up any temporary files
+      rm -rf /tmp/*
+
+      echo "Starting Bitcoin Core with arguments: $*"
+      exec bitcoind "$@"
+  rathole-client-config:
+    content: |
+      # Optional client config for brokering Bitcoin RPC + ZMQ into Railway.
+      # Enable with: docker compose --profile rathole up -d
+      # Required env vars when the profile is enabled:
+      #   RATHOLE_REMOTE_ADDR
+      #   RATHOLE_BITCOIN_RPC_TOKEN
+      #   RATHOLE_ZMQ_RAWTX_TOKEN
+      #   RATHOLE_ZMQ_SEQUENCE_TOKEN
+      # Recommended Railway broker endpoint:
+      #   RATHOLE_REMOTE_ADDR=sauron-bitcoin-rathole-broker-production.up.railway.app:443
+      [client]
+      remote_addr = "${RATHOLE_REMOTE_ADDR:-}"
+
+      [client.transport]
+      type = "${RATHOLE_TRANSPORT:-websocket}"
+
+      [client.transport.tcp]
+
+      [client.transport.tls]
+      trusted_root = "${RATHOLE_TLS_TRUSTED_ROOT:-/etc/ssl/certs/ca-certificates.crt}"
+
+      [client.transport.noise]
+
+      [client.transport.websocket]
+      tls = ${RATHOLE_WEBSOCKET_TLS:-true}
+
+      [client.services.bitcoin_rpc]
+      local_addr = "bitcoin-core:8332"
+      token = "${RATHOLE_BITCOIN_RPC_TOKEN:-}"
+
+      [client.services.zmq_rawtx]
+      local_addr = "bitcoin-core:28333"
+      token = "${RATHOLE_ZMQ_RAWTX_TOKEN:-}"
+
+      [client.services.zmq_sequence]
+      local_addr = "bitcoin-core:28334"
+      token = "${RATHOLE_ZMQ_SEQUENCE_TOKEN:-}"
+
+services:
+  bitcoin-core:
+    container_name: bitcoin-core
+    build:
+      context: .
+      platforms:
+        - linux/amd64
+      dockerfile_inline: |
+        FROM debian:trixie
+        RUN apt-get update \
+          && apt-get install -y --no-install-recommends \
+            ca-certificates curl tar bash lz4 wget aria2 \
+          && rm -rf /var/lib/apt/lists/*
+        RUN useradd -m -u 1000 -s /bin/bash bitcoin \
+          && mkdir -p /home/bitcoin/.bitcoin \
+          && chown -R bitcoin:bitcoin /home/bitcoin/.bitcoin
+        WORKDIR /opt/bitcoin
+        RUN curl -fsSL "https://bitcoincore.org/bin/bitcoin-core-29.0/bitcoin-29.0-x86_64-linux-gnu.tar.gz" -o bitcoin.tar.gz \
+          && tar -xzf bitcoin.tar.gz --strip-components=1 \
+          && install -m 0755 -o root -g root -t /usr/local/bin bin/* \
+          && rm -rf /opt/bitcoin
+        EXPOSE 8332 8333 28332 28333 28334
+        VOLUME ["/home/bitcoin/.bitcoin"]
+        USER bitcoin
+        WORKDIR /home/bitcoin
+        ENTRYPOINT ["/usr/local/bin/bitcoin-entrypoint.sh"]
+    environment:
+      BITCOIN_DATA_DIR: /home/bitcoin/.bitcoin
+    ports:
+      - "8332:8332"   # RPC (if you want remote access; otherwise remove)
+      - "8333:8333"   # P2P
+    command:
+      - "-server=1"
+      - "-txindex=1"
+      # Use stable rpcauth credentials so Railway consumers do not break when bitcoind rotates .cookie on restart.
+      - "-rpcauth=${BITCOIN_RPC_AUTH_SERVER:?set BITCOIN_RPC_AUTH_SERVER}"
+      - "-rpcthreads=64"
+      - "-rpcworkqueue=256"
+      - "-dbcache=24576"
+      - "-rpcbind=0.0.0.0"
+      - "-rpcallowip=0.0.0.0/0"
+      - "-datadir=/home/bitcoin/.bitcoin"
+      - "-fallbackfee=0.0002"
+      - "-zmqpubrawblock=tcp://0.0.0.0:28332"
+      - "-zmqpubrawtx=tcp://0.0.0.0:28333"
+      - "-zmqpubsequence=tcp://0.0.0.0:28334"
+    volumes:
+      - bitcoind_data:/home/bitcoin/.bitcoin    # stored on NVMe via named volumes (as configured on your host)
+    configs:
+      - source: bitcoin-entrypoint
+        target: /usr/local/bin/bitcoin-entrypoint.sh
+        mode: 0755
+    healthcheck:
+      test: ["CMD-SHELL","bitcoin-cli -datadir=/home/bitcoin/.bitcoin getblockchaininfo > /dev/null || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    sysctls:
+      net.core.somaxconn: "4096"
+    expose:
+      - "28332"   # ZMQ to electrs only (internal network)
+      - "28333"
+      - "28334"
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ${AWSLOGS_REGION:-us-west-1}
+        awslogs-group: /rift/prod/bitcoin-core
+        awslogs-stream: ${AWSLOGS_HOST_ID:?set AWSLOGS_HOST_ID}-bitcoin-core
+        awslogs-create-group: "true"
+    networks:
+      - bitcoin-network
+    platform: linux/amd64
+
+  electrs:
+    container_name: electrs
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM rust:1.75 AS builder
+        WORKDIR /app
+        RUN apt-get update && apt-get install -y --no-install-recommends \
+            clang llvm-dev libclang-dev pkg-config cmake build-essential libssl-dev git ca-certificates \
+          && rm -rf /var/lib/apt/lists/*
+        RUN git clone https://github.com/Blockstream/electrs.git
+        WORKDIR /app/electrs
+        # Known-good commit (example from earlier)
+        RUN git checkout 811a9908b52d28a7f08303b775ae7aef8ceeee07
+        # Optimize for host
+        ENV RUSTFLAGS="-C target-cpu=native -C codegen-units=1"
+        RUN cargo build --release
+
+        FROM debian:trixie
+        RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+          && rm -rf /var/lib/apt/lists/*
+        WORKDIR /app
+        COPY --from=builder /app/electrs/target/release/electrs /app/
+        EXPOSE 3000
+        CMD ["./electrs"]
+    command:
+      - "./electrs"
+      - "--daemon-rpc-addr"
+      - "bitcoin-core:8332"
+      - "--daemon-dir"
+      - "/home/bitcoin/.bitcoin"
+      - "--db-dir"
+      - "/var/lib/electrs"
+      - "--http-addr"
+      - "0.0.0.0:3000"
+      - "--utxos-limit"
+      - "100000"
+      - "--db-parallelism"
+      - "8"
+      - "--daemon-parallelism"
+      - "8"
+      - "--db-block-cache-mb"
+      - "4096"
+      - "--db-write-buffer-size-mb"
+      - "1024"
+      - "--zmq-addr"
+      - "bitcoin-core:28332"
+      # leave --initial-sync-compaction OFF for speed
+    ports:
+      - "3000:3000"
+    volumes:
+      - bitcoind_data:/home/bitcoin/.bitcoin   # read Core datadir
+      - electrs_data:/var/lib/electrs          # RocksDB on NVMe named volume
+    depends_on:
+      bitcoin-core:
+        condition: service_healthy
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    sysctls:
+      net.core.somaxconn: "4096"
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ${AWSLOGS_REGION:-us-west-1}
+        awslogs-group: /rift/prod/electrs
+        awslogs-stream: ${AWSLOGS_HOST_ID:?set AWSLOGS_HOST_ID}-electrs
+        awslogs-create-group: "true"
+    networks:
+      - bitcoin-network
+    platform: linux/amd64
+
+  rathole-client:
+    profiles:
+      - rathole
+    build:
+      context: .
+      dockerfile: Dockerfile.rathole-client
+    container_name: rathole-client
+    configs:
+      - source: rathole-client-config
+        target: /etc/rathole/client.toml
+    depends_on:
+      bitcoin-core:
+        condition: service_healthy
+    restart: unless-stopped
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ${AWSLOGS_REGION:-us-west-1}
+        awslogs-group: /rift/prod/rathole-client
+        awslogs-stream: ${AWSLOGS_HOST_ID:?set AWSLOGS_HOST_ID}-rathole-client
+        awslogs-create-group: "true"
+    networks:
+      - bitcoin-network
+    platform: linux/amd64
+
+networks:
+  bitcoin-network:
+    driver: bridge
+
+
+volumes:
+  bitcoind_data:
+  electrs_data:

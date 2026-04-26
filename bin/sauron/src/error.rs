@@ -1,0 +1,90 @@
+use snafu::prelude::*;
+
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub(crate)))]
+pub enum Error {
+    #[snafu(display("Failed to connect to replica database"))]
+    ReplicaDatabaseConnection { source: sqlx_core::Error },
+
+    #[snafu(display("Failed to apply replica migrations"))]
+    ReplicaMigration {
+        source: sqlx_core::migrate::MigrateError,
+    },
+
+    #[snafu(display("Replica database query failed"))]
+    ReplicaDatabaseQuery { source: sqlx_core::Error },
+
+    #[snafu(display("Failed to initialize Postgres notification listener"))]
+    ReplicaListenerConnection { source: sqlx_core::Error },
+
+    #[snafu(display("Failed to subscribe to Postgres notification channel {channel}"))]
+    ReplicaListen {
+        source: sqlx_core::Error,
+        channel: String,
+    },
+
+    #[snafu(display("Failed to receive Postgres notification"))]
+    ReplicaNotificationReceive { source: sqlx_core::Error },
+
+    #[snafu(display("Replica watch row was invalid: {message}"))]
+    InvalidWatchRow { message: String },
+
+    #[snafu(display("Replica cursor row was invalid: {message}"))]
+    InvalidCursorRow { message: String },
+
+    #[snafu(display("Failed to parse replica notification payload: {source}"))]
+    NotificationPayload { source: serde_json::Error },
+
+    #[snafu(display("Failed to initialize chain {chain}: {message}"))]
+    ChainInit { chain: String, message: String },
+
+    #[snafu(display("Failed to initialize discovery backend {backend}: {message}"))]
+    DiscoveryBackendInit { backend: String, message: String },
+
+    #[snafu(display("Bitcoin esplora request failed"))]
+    BitcoinEsplora { source: esplora_client::Error },
+
+    #[snafu(display("Bitcoin RPC request failed"))]
+    BitcoinRpc {
+        source: bitcoincore_rpc_async::Error,
+    },
+
+    #[snafu(display("EVM RPC request failed: {source}"))]
+    EvmRpc {
+        source: alloy::transports::RpcError<alloy::transports::TransportErrorKind>,
+    },
+
+    #[snafu(display(
+        "EVM log scan request failed for blocks {from_height}..={to_height}: {source}"
+    ))]
+    EvmLogScan {
+        from_height: u64,
+        to_height: u64,
+        source: alloy::transports::RpcError<alloy::transports::TransportErrorKind>,
+    },
+
+    #[snafu(display("EVM token indexer request failed"))]
+    EvmTokenIndexer {
+        source: evm_token_indexer_client::Error,
+    },
+
+    #[snafu(display("ROUTER request failed"))]
+    RouterRequest { source: reqwest::Error },
+
+    #[snafu(display("ROUTER rejected provider-operation hint with status {status}: {body}"))]
+    RouterRejected {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+
+    #[snafu(display("Failed to build ROUTER URL from base {base_url}: {source}"))]
+    RouterUrl {
+        source: url::ParseError,
+        base_url: String,
+    },
+
+    #[snafu(display("A discovery backend task terminated unexpectedly"))]
+    DiscoveryTaskJoin { source: tokio::task::JoinError },
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;

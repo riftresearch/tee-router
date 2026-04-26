@@ -1,0 +1,9 @@
+[package]
+name = "eip3009-erc20-contract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+alloy = {workspace=true}

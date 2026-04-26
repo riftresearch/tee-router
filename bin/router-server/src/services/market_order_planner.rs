@@ -1,0 +1,1759 @@
+use crate::{
+    models::{
+        CustodyVaultRole, DepositVault, MarketOrderKindType, MarketOrderQuote, OrderExecutionStep,
+        OrderExecutionStepStatus, OrderExecutionStepType, RouterOrder, RouterOrderAction,
+    },
+    protocol::{AssetId, ChainId, DepositAsset},
+    services::asset_registry::{
+        AssetRegistry, MarketOrderTransitionKind, RequiredCustodyRole, TransitionDecl,
+    },
+};
+use chrono::{DateTime, Utc};
+use serde_json::{json, Value};
+use snafu::Snafu;
+use std::{collections::HashMap, sync::Arc};
+use uuid::Uuid;
+
+#[derive(Debug, Snafu)]
+pub enum MarketOrderRoutePlanError {
+    #[snafu(display("market order route planning requires a market-order action"))]
+    NonMarketOrderAction,
+
+    #[snafu(display("quote {} does not belong to order {}", quote_order_id, order_id))]
+    QuoteOrderMismatch {
+        quote_order_id: Uuid,
+        order_id: Uuid,
+    },
+
+    #[snafu(display("vault {} is not attached to order {}", vault_id, order_id))]
+    VaultOrderMismatch { vault_id: Uuid, order_id: Uuid },
+
+    #[snafu(display("order {} is not funded by vault {}", order_id, vault_id))]
+    FundingVaultMismatch { order_id: Uuid, vault_id: Uuid },
+
+    #[snafu(display("vault source asset does not match order source asset"))]
+    SourceAssetMismatch,
+
+    #[snafu(display("unsupported market-order route: {}", reason))]
+    UnsupportedRoute { reason: String },
+
+    #[snafu(display(
+        "execution step {} ({}) violates the intermediate custody invariant: {}",
+        step_index,
+        step_type,
+        reason
+    ))]
+    IntermediateCustodyInvariant {
+        step_index: i32,
+        step_type: &'static str,
+        reason: String,
+    },
+}
+
+pub type MarketOrderRoutePlanResult<T> = Result<T, MarketOrderRoutePlanError>;
+
+#[derive(Debug, Clone)]
+pub struct MarketOrderRoutePlan {
+    pub path_id: String,
+    pub transition_decl_ids: Vec<String>,
+    pub steps: Vec<OrderExecutionStep>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MarketOrderRoutePlanner {
+    asset_registry: Arc<AssetRegistry>,
+}
+
+#[derive(Debug, Clone)]
+struct QuotedTransitionPath {
+    path_id: String,
+    transitions: Vec<TransitionDecl>,
+}
+
+impl Default for MarketOrderRoutePlanner {
+    fn default() -> Self {
+        Self::new(Arc::new(AssetRegistry::default()))
+    }
+}
+
+impl MarketOrderRoutePlanner {
+    #[must_use]
+    pub fn new(asset_registry: Arc<AssetRegistry>) -> Self {
+        Self { asset_registry }
+    }
+
+    pub fn plan(
+        &self,
+        order: &RouterOrder,
+        source_vault: &DepositVault,
+        quote: &MarketOrderQuote,
+        planned_at: DateTime<Utc>,
+    ) -> MarketOrderRoutePlanResult<MarketOrderRoutePlan> {
+        self.validate_inputs(order, source_vault, quote)?;
+
+        let path = self.resolve_quoted_transition_path(order, quote)?;
+        let steps = materialize_transition_steps(order, source_vault, quote, &path, planned_at)?;
+        validate_intermediate_custody_plan(&steps)?;
+
+        Ok(MarketOrderRoutePlan {
+            path_id: path.path_id,
+            transition_decl_ids: path
+                .transitions
+                .iter()
+                .map(|transition| transition.id.clone())
+                .collect(),
+            steps,
+        })
+    }
+
+    fn validate_inputs(
+        &self,
+        order: &RouterOrder,
+        source_vault: &DepositVault,
+        quote: &MarketOrderQuote,
+    ) -> MarketOrderRoutePlanResult<()> {
+        if !matches!(order.action, RouterOrderAction::MarketOrder(_)) {
+            return Err(MarketOrderRoutePlanError::NonMarketOrderAction);
+        }
+        if quote.order_id != Some(order.id) {
+            return Err(MarketOrderRoutePlanError::QuoteOrderMismatch {
+                quote_order_id: quote.order_id.unwrap_or_default(),
+                order_id: order.id,
+            });
+        }
+        if source_vault.order_id != Some(order.id) {
+            return Err(MarketOrderRoutePlanError::VaultOrderMismatch {
+                vault_id: source_vault.id,
+                order_id: order.id,
+            });
+        }
+        if order.funding_vault_id != Some(source_vault.id) {
+            return Err(MarketOrderRoutePlanError::FundingVaultMismatch {
+                order_id: order.id,
+                vault_id: source_vault.id,
+            });
+        }
+        if source_vault.deposit_asset != order.source_asset {
+            return Err(MarketOrderRoutePlanError::SourceAssetMismatch);
+        }
+
+        Ok(())
+    }
+
+    fn resolve_quoted_transition_path(
+        &self,
+        order: &RouterOrder,
+        quote: &MarketOrderQuote,
+    ) -> MarketOrderRoutePlanResult<QuotedTransitionPath> {
+        let transition_ids: Vec<String> = quote
+            .provider_quote
+            .get("transition_decl_ids")
+            .and_then(Value::as_array)
+            .ok_or_else(|| MarketOrderRoutePlanError::UnsupportedRoute {
+                reason: "market order quote is missing provider_quote.transition_decl_ids"
+                    .to_string(),
+            })?
+            .iter()
+            .filter_map(|value| value.as_str().map(ToString::to_string))
+            .collect();
+        if transition_ids.is_empty() {
+            return Err(MarketOrderRoutePlanError::UnsupportedRoute {
+                reason: "market order quote contains no transition declarations".to_string(),
+            });
+        }
+
+        let transitions_by_id: HashMap<_, _> = self
+            .asset_registry
+            .transition_declarations()
+            .into_iter()
+            .map(|transition| (transition.id.clone(), transition))
+            .collect();
+        let mut transitions_by_id = transitions_by_id;
+        if let Some(serialized_transitions) = quote
+            .provider_quote
+            .get("transitions")
+            .and_then(Value::as_array)
+        {
+            for value in serialized_transitions {
+                let transition: TransitionDecl = serde_json::from_value(value.clone()).map_err(
+                    |err| MarketOrderRoutePlanError::UnsupportedRoute {
+                        reason: format!(
+                            "market order quote contains invalid provider_quote.transitions entry: {err}"
+                        ),
+                    },
+                )?;
+                transitions_by_id.insert(transition.id.clone(), transition);
+            }
+        }
+        let transitions: Vec<TransitionDecl> = transition_ids
+            .iter()
+            .map(|id| {
+                transitions_by_id.get(id).cloned().ok_or_else(|| {
+                    MarketOrderRoutePlanError::UnsupportedRoute {
+                        reason: format!("quoted transition declaration {id:?} is not registered"),
+                    }
+                })
+            })
+            .collect::<Result<_, _>>()?;
+
+        let first =
+            transitions
+                .first()
+                .ok_or_else(|| MarketOrderRoutePlanError::UnsupportedRoute {
+                    reason: "quoted transition path is empty".to_string(),
+                })?;
+        let last =
+            transitions
+                .last()
+                .ok_or_else(|| MarketOrderRoutePlanError::UnsupportedRoute {
+                    reason: "quoted transition path is empty".to_string(),
+                })?;
+        if first.input.asset != order.source_asset {
+            return Err(MarketOrderRoutePlanError::UnsupportedRoute {
+                reason: format!(
+                    "quoted transition path starts at {} {} instead of order source {} {}",
+                    first.input.asset.chain,
+                    first.input.asset.asset,
+                    order.source_asset.chain,
+                    order.source_asset.asset
+                ),
+            });
+        }
+        if last.output.asset != order.destination_asset {
+            return Err(MarketOrderRoutePlanError::UnsupportedRoute {
+                reason: format!(
+                    "quoted transition path ends at {} {} instead of order destination {} {}",
+                    last.output.asset.chain,
+                    last.output.asset.asset,
+                    order.destination_asset.chain,
+                    order.destination_asset.asset
+                ),
+            });
+        }
+
+        let path_id = quote
+            .provider_quote
+            .get("path_id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| transition_ids.join("|"));
+        Ok(QuotedTransitionPath {
+            path_id,
+            transitions,
+        })
+    }
+}
+
+fn materialize_transition_steps(
+    order: &RouterOrder,
+    source_vault: &DepositVault,
+    quote: &MarketOrderQuote,
+    path: &QuotedTransitionPath,
+    planned_at: DateTime<Utc>,
+) -> MarketOrderRoutePlanResult<Vec<OrderExecutionStep>> {
+    let mut legs = QuoteLegIndex::from_quote(quote)?;
+    let mut steps = Vec::new();
+    let mut step_index = 1;
+    let bridge_signer_asset = hyperliquid_bridge_signer_asset(&path.transitions);
+
+    for (transition_index, transition) in path.transitions.iter().enumerate() {
+        let is_final = transition_index + 1 == path.transitions.len();
+        match transition.kind {
+            MarketOrderTransitionKind::AcrossBridge => {
+                let leg = legs.take_one(&transition.id, transition.kind)?;
+                steps.push(across_bridge_step(
+                    order,
+                    source_vault,
+                    quote,
+                    transition,
+                    &leg,
+                    is_final,
+                    step_index,
+                    planned_at,
+                )?);
+                step_index += 1;
+            }
+            MarketOrderTransitionKind::UnitDeposit => {
+                let leg = legs.take_one(&transition.id, transition.kind)?;
+                steps.push(unit_deposit_step(
+                    order,
+                    source_vault,
+                    transition,
+                    &leg,
+                    input_custody_role_for_transition(&path.transitions, transition_index),
+                    step_index,
+                    planned_at,
+                ));
+                step_index += 1;
+            }
+            MarketOrderTransitionKind::HyperliquidBridgeDeposit => {
+                let leg = legs.take_one(&transition.id, transition.kind)?;
+                steps.push(hyperliquid_bridge_deposit_step(
+                    order,
+                    transition,
+                    &leg,
+                    input_custody_role_for_transition(&path.transitions, transition_index),
+                    step_index,
+                    planned_at,
+                )?);
+                step_index += 1;
+            }
+            MarketOrderTransitionKind::HyperliquidTrade => {
+                let transition_legs = legs.take_all(&transition.id);
+                if transition_legs.is_empty() {
+                    return Err(MarketOrderRoutePlanError::UnsupportedRoute {
+                        reason: format!(
+                            "quoted path is missing hyperliquid trade legs for transition {}",
+                            transition.id
+                        ),
+                    });
+                }
+                let custody = hyperliquid_custody_for_transition(
+                    &path.transitions,
+                    transition_index,
+                    transition_legs.len(),
+                    bridge_signer_asset.as_ref(),
+                )?;
+                for (leg_index, leg) in transition_legs.iter().enumerate() {
+                    steps.push(hyperliquid_trade_step(
+                        order,
+                        quote,
+                        leg_provider(leg, transition)?,
+                        HyperliquidCustodySpec {
+                            role: custody.role,
+                            asset: custody.asset.clone(),
+                            prefund_from_withdrawable: custody.prefund_first_trade
+                                && leg_index == 0,
+                        },
+                        leg_index,
+                        transition_legs.len(),
+                        leg,
+                        Some(transition.id.clone()),
+                        step_index,
+                        planned_at,
+                    )?);
+                    step_index += 1;
+                }
+            }
+            MarketOrderTransitionKind::UniversalRouterSwap => {
+                let leg = legs.take_one(&transition.id, transition.kind)?;
+                steps.push(universal_router_swap_step(
+                    order,
+                    source_vault,
+                    quote,
+                    transition,
+                    &leg,
+                    input_custody_role_for_transition(&path.transitions, transition_index),
+                    is_final,
+                    step_index,
+                    planned_at,
+                )?);
+                step_index += 1;
+            }
+            MarketOrderTransitionKind::UnitWithdrawal => {
+                let leg = legs.take_one(&transition.id, transition.kind)?;
+                let custody = hyperliquid_custody_for_withdrawal(
+                    &path.transitions,
+                    transition_index,
+                    bridge_signer_asset.as_ref(),
+                )?;
+                steps.push(unit_withdrawal_step(
+                    order,
+                    quote,
+                    &leg,
+                    leg_provider(&leg, transition)?,
+                    custody,
+                    Some(transition.id.clone()),
+                    step_index,
+                    planned_at,
+                )?);
+                step_index += 1;
+            }
+        }
+    }
+
+    attach_quote_gas_plan_to_steps(&mut steps, quote);
+    Ok(steps)
+}
+
+fn unit_withdrawal_step(
+    order: &RouterOrder,
+    quote: &MarketOrderQuote,
+    leg: &Value,
+    unit_provider: &str,
+    hyperliquid_custody: HyperliquidCustodySpec,
+    transition_decl_id: Option<String>,
+    step_index: i32,
+    planned_at: DateTime<Utc>,
+) -> MarketOrderRoutePlanResult<OrderExecutionStep> {
+    let min_amount_out = match quote.order_kind {
+        MarketOrderKindType::ExactIn => quote.min_amount_out.clone(),
+        MarketOrderKindType::ExactOut => Some(quote.amount_out.clone()),
+    };
+    let amount_in = required_str(leg, "amount_in")?.to_string();
+    let amount_out = required_str(leg, "amount_out")?.to_string();
+
+    Ok(step(StepSpec {
+        order_id: order.id,
+        transition_decl_id,
+        step_index,
+        step_type: OrderExecutionStepType::UnitWithdrawal,
+        provider: unit_provider.to_string(),
+        input_asset: None,
+        output_asset: Some(order.destination_asset.clone()),
+        amount_in: Some(amount_in.clone()),
+        min_amount_out: min_amount_out.clone(),
+        provider_ref: None,
+        idempotency_key: idempotency_key(order.id, unit_provider, step_index),
+        // The HyperUnitProvider will resolve `dst_chain_id`/`asset_id` to the
+        // HyperUnit wire chain/asset (bitcoin/ethereum, btc/eth) and call
+        // `GET /gen` to obtain the protocol_address. The hydrator fills in
+        // `hyperliquid_custody_vault_id`/`hyperliquid_custody_vault_address`
+        // from the router's HL spot vault — that vault is what signs the
+        // spotSend custody action to the protocol_address.
+        request: json!({
+            "order_id": order.id,
+            "dst_chain_id": order.destination_asset.chain.as_str(),
+            "asset_id": order.destination_asset.asset.as_str(),
+            "amount": amount_out,
+            "recipient_address": &order.recipient_address,
+            "min_amount_out": min_amount_out,
+            "hyperliquid_custody_vault_role": hyperliquid_custody.role.to_db_string(),
+            "hyperliquid_custody_vault_id": null,
+            "hyperliquid_custody_vault_address": null,
+            "hyperliquid_custody_vault_chain_id": hyperliquid_custody
+                .asset
+                .as_ref()
+                .map(|asset| asset.chain.as_str()),
+            "hyperliquid_custody_vault_asset_id": hyperliquid_custody
+                .asset
+                .as_ref()
+                .map(|asset| asset.asset.as_str()),
+        }),
+        details: json!({
+            "schema_version": 1,
+            "recipient_address": &order.recipient_address,
+            "destination_asset": {
+                "chain": order.destination_asset.chain.as_str(),
+                "asset": order.destination_asset.asset.as_str()
+            },
+            "hyperliquid_custody_vault_role": hyperliquid_custody.role.to_db_string(),
+            "hyperliquid_custody_vault_status": "pending_derivation"
+        }),
+        planned_at,
+    }))
+}
+
+struct StepSpec {
+    order_id: Uuid,
+    transition_decl_id: Option<String>,
+    step_index: i32,
+    step_type: OrderExecutionStepType,
+    provider: String,
+    input_asset: Option<DepositAsset>,
+    output_asset: Option<DepositAsset>,
+    amount_in: Option<String>,
+    min_amount_out: Option<String>,
+    provider_ref: Option<String>,
+    idempotency_key: Option<String>,
+    request: serde_json::Value,
+    details: serde_json::Value,
+    planned_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+struct HyperliquidCustodySpec {
+    role: CustodyVaultRole,
+    asset: Option<DepositAsset>,
+    prefund_from_withdrawable: bool,
+}
+
+#[derive(Debug, Clone)]
+struct QuoteLegIndex {
+    by_transition_id: HashMap<String, Vec<Value>>,
+}
+
+impl QuoteLegIndex {
+    fn from_quote(quote: &MarketOrderQuote) -> MarketOrderRoutePlanResult<Self> {
+        let mut by_transition_id: HashMap<String, Vec<Value>> = HashMap::new();
+        for leg in quote
+            .provider_quote
+            .get("legs")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let transition_id = leg_parent_transition_id(leg).ok_or_else(|| {
+                MarketOrderRoutePlanError::UnsupportedRoute {
+                    reason: format!(
+                        "quoted leg is missing transition declaration metadata: {}",
+                        leg
+                    ),
+                }
+            })?;
+            by_transition_id
+                .entry(transition_id)
+                .or_default()
+                .push(leg.clone());
+        }
+        Ok(Self { by_transition_id })
+    }
+
+    fn take_one(
+        &mut self,
+        transition_id: &str,
+        kind: MarketOrderTransitionKind,
+    ) -> MarketOrderRoutePlanResult<Value> {
+        let mut legs = self.take_all(transition_id);
+        if legs.len() != 1 {
+            return Err(MarketOrderRoutePlanError::UnsupportedRoute {
+                reason: format!(
+                    "quoted transition {transition_id} ({}) expected exactly 1 leg, got {}",
+                    kind.as_str(),
+                    legs.len()
+                ),
+            });
+        }
+        Ok(legs.remove(0))
+    }
+
+    fn take_all(&mut self, transition_id: &str) -> Vec<Value> {
+        self.by_transition_id
+            .remove(transition_id)
+            .unwrap_or_default()
+    }
+}
+
+impl HyperliquidCustodySpec {
+    fn spot_vault() -> Self {
+        Self {
+            role: CustodyVaultRole::HyperliquidSpot,
+            asset: None,
+            prefund_from_withdrawable: false,
+        }
+    }
+
+    fn destination_execution(asset: DepositAsset, prefund_from_withdrawable: bool) -> Self {
+        Self {
+            role: CustodyVaultRole::DestinationExecution,
+            asset: Some(asset),
+            prefund_from_withdrawable,
+        }
+    }
+}
+
+fn step(spec: StepSpec) -> OrderExecutionStep {
+    OrderExecutionStep {
+        id: Uuid::now_v7(),
+        order_id: spec.order_id,
+        execution_attempt_id: None,
+        transition_decl_id: spec.transition_decl_id,
+        step_index: spec.step_index,
+        step_type: spec.step_type,
+        provider: spec.provider,
+        status: OrderExecutionStepStatus::Planned,
+        input_asset: spec.input_asset,
+        output_asset: spec.output_asset,
+        amount_in: spec.amount_in,
+        min_amount_out: spec.min_amount_out,
+        tx_hash: None,
+        provider_ref: spec.provider_ref,
+        idempotency_key: spec.idempotency_key,
+        attempt_count: 0,
+        next_attempt_at: None,
+        started_at: None,
+        completed_at: None,
+        details: spec.details,
+        request: spec.request,
+        response: json!({}),
+        error: json!({}),
+        created_at: spec.planned_at,
+        updated_at: spec.planned_at,
+    }
+}
+
+fn idempotency_key(order_id: Uuid, provider: &str, step_index: i32) -> Option<String> {
+    Some(format!("order:{order_id}:{provider}:{step_index}"))
+}
+
+fn attach_quote_gas_plan_to_steps(steps: &mut [OrderExecutionStep], quote: &MarketOrderQuote) {
+    let Some(retention_actions) = quote
+        .provider_quote
+        .get("gas_reimbursement")
+        .and_then(|value| value.get("retention_actions"))
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+
+    for step in steps {
+        let Some(transition_decl_id) = step.transition_decl_id.as_deref() else {
+            continue;
+        };
+        let step_actions: Vec<Value> = retention_actions
+            .iter()
+            .filter(|action| {
+                action.get("transition_decl_id").and_then(Value::as_str) == Some(transition_decl_id)
+            })
+            .cloned()
+            .collect();
+        if step_actions.is_empty() {
+            continue;
+        }
+        set_object_field(
+            &mut step.request,
+            "retention_actions",
+            Value::Array(step_actions.clone()),
+        );
+        set_object_field(
+            &mut step.details,
+            "retention_actions",
+            Value::Array(step_actions),
+        );
+    }
+}
+
+fn set_object_field(object: &mut Value, key: &'static str, value: Value) {
+    if let Some(map) = object.as_object_mut() {
+        map.insert(key.to_string(), value);
+    }
+}
+
+struct UnitDepositRequestSpec<'a> {
+    order_id: Uuid,
+    unit_ingress_asset: &'a DepositAsset,
+    expected_amount: String,
+    source_custody_vault_id: Option<Uuid>,
+    source_custody_vault_role: Option<String>,
+    revert_custody_vault_id: Option<Uuid>,
+    revert_custody_vault_role: Option<String>,
+}
+
+/// The HyperUnitProvider resolves `src_chain_id`/`asset_id` to the HyperUnit
+/// wire chain/asset (bitcoin/ethereum, btc/eth) and calls `GET /gen` with the
+/// HL spot vault address as `dst_addr` to obtain the protocol_address. The
+/// hydrator fills in `hyperliquid_custody_vault_id`/`hyperliquid_custody_vault_address`
+/// from the router's HL spot vault — funds land there as UBTC/UETH once the
+/// source chain send to the protocol_address is finalized.
+fn unit_deposit_request(spec: UnitDepositRequestSpec<'_>) -> serde_json::Value {
+    json!({
+        "order_id": spec.order_id,
+        "src_chain_id": spec.unit_ingress_asset.chain.as_str(),
+        "dst_chain_id": "hyperliquid",
+        "asset_id": spec.unit_ingress_asset.asset.as_str(),
+        "amount": spec.expected_amount,
+        "source_custody_vault_id": spec.source_custody_vault_id,
+        "source_custody_vault_role": spec.source_custody_vault_role,
+        "revert_custody_vault_id": spec.revert_custody_vault_id,
+        "revert_custody_vault_role": spec.revert_custody_vault_role,
+        "hyperliquid_custody_vault_role": CustodyVaultRole::HyperliquidSpot.to_db_string(),
+        "hyperliquid_custody_vault_id": null,
+        "hyperliquid_custody_vault_address": null
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn hyperliquid_trade_step(
+    order: &RouterOrder,
+    quote: &MarketOrderQuote,
+    exchange_provider: &str,
+    hyperliquid_custody: HyperliquidCustodySpec,
+    leg_index: usize,
+    leg_count: usize,
+    leg: &Value,
+    transition_decl_id: Option<String>,
+    step_index: i32,
+    planned_at: DateTime<Utc>,
+) -> MarketOrderRoutePlanResult<OrderExecutionStep> {
+    let trade_leg = leg.get("raw").unwrap_or(leg);
+    let order_kind = required_str(trade_leg, "order_kind")?;
+    let amount_in = leg
+        .get("amount_in")
+        .and_then(Value::as_str)
+        .or_else(|| trade_leg.get("amount_in").and_then(Value::as_str))
+        .ok_or_else(|| MarketOrderRoutePlanError::UnsupportedRoute {
+            reason: "hyperliquid trade leg missing amount_in".to_string(),
+        })?;
+    let amount_out = leg
+        .get("amount_out")
+        .and_then(Value::as_str)
+        .or_else(|| trade_leg.get("amount_out").and_then(Value::as_str))
+        .ok_or_else(|| MarketOrderRoutePlanError::UnsupportedRoute {
+            reason: "hyperliquid trade leg missing amount_out".to_string(),
+        })?;
+    let min_amount_out = trade_leg
+        .get("min_amount_out")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string);
+    let max_amount_in = trade_leg
+        .get("max_amount_in")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string);
+    let input_asset =
+        leg_asset(leg, "input_asset").or_else(|_| leg_asset(trade_leg, "input_asset"))?;
+    let output_asset =
+        leg_asset(leg, "output_asset").or_else(|_| leg_asset(trade_leg, "output_asset"))?;
+
+    let request = json!({
+        "order_id": order.id,
+        "quote_id": quote.id,
+        "leg_index": leg_index,
+        "leg_count": leg_count,
+        "order_kind": order_kind,
+        "amount_in": amount_in,
+        "amount_out": amount_out,
+        "min_amount_out": min_amount_out,
+        "max_amount_in": max_amount_in,
+        "input_asset": {
+            "chain_id": input_asset.chain.as_str(),
+            "asset": input_asset.asset.as_str(),
+        },
+        "output_asset": {
+            "chain_id": output_asset.chain.as_str(),
+            "asset": output_asset.asset.as_str(),
+        },
+        "prefund_from_withdrawable": hyperliquid_custody.prefund_from_withdrawable,
+        "hyperliquid_custody_vault_role": hyperliquid_custody.role.to_db_string(),
+        "hyperliquid_custody_vault_id": null,
+        "hyperliquid_custody_vault_address": null,
+        "hyperliquid_custody_vault_chain_id": hyperliquid_custody
+            .asset
+            .as_ref()
+            .map(|asset| asset.chain.as_str()),
+        "hyperliquid_custody_vault_asset_id": hyperliquid_custody
+            .asset
+            .as_ref()
+            .map(|asset| asset.asset.as_str()),
+    });
+    let details = json!({
+        "schema_version": 1,
+        "leg_index": leg_index,
+        "leg_count": leg_count,
+        "hyperliquid_custody_vault_role": hyperliquid_custody.role.to_db_string(),
+        "hyperliquid_custody_vault_status": "pending_derivation",
+    });
+
+    Ok(step(StepSpec {
+        order_id: order.id,
+        transition_decl_id,
+        step_index,
+        step_type: OrderExecutionStepType::HyperliquidTrade,
+        provider: exchange_provider.to_string(),
+        input_asset: Some(input_asset),
+        output_asset: Some(output_asset),
+        amount_in: Some(amount_in.to_string()),
+        min_amount_out: min_amount_out.clone(),
+        provider_ref: None,
+        idempotency_key: idempotency_key(order.id, exchange_provider, step_index),
+        request,
+        details,
+        planned_at,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn universal_router_swap_step(
+    order: &RouterOrder,
+    source_vault: &DepositVault,
+    quote: &MarketOrderQuote,
+    transition: &TransitionDecl,
+    leg: &Value,
+    source_role: Option<CustodyVaultRole>,
+    is_final: bool,
+    step_index: i32,
+    planned_at: DateTime<Utc>,
+) -> MarketOrderRoutePlanResult<OrderExecutionStep> {
+    let provider = leg_provider(leg, transition)?.to_string();
+    let swap_leg = leg.get("raw").unwrap_or(leg);
+    let order_kind = required_str(swap_leg, "order_kind")?;
+    let amount_in = leg
+        .get("amount_in")
+        .and_then(Value::as_str)
+        .or_else(|| swap_leg.get("amount_in").and_then(Value::as_str))
+        .ok_or_else(|| MarketOrderRoutePlanError::UnsupportedRoute {
+            reason: "universal router swap leg missing amount_in".to_string(),
+        })?;
+    let amount_out = leg
+        .get("amount_out")
+        .and_then(Value::as_str)
+        .or_else(|| swap_leg.get("amount_out").and_then(Value::as_str))
+        .ok_or_else(|| MarketOrderRoutePlanError::UnsupportedRoute {
+            reason: "universal router swap leg missing amount_out".to_string(),
+        })?;
+    let input_asset =
+        leg_asset(leg, "input_asset").or_else(|_| leg_asset(swap_leg, "input_asset"))?;
+    let output_asset =
+        leg_asset(leg, "output_asset").or_else(|_| leg_asset(swap_leg, "output_asset"))?;
+    let input_decimals = required_u8(swap_leg, "src_decimals")?;
+    let output_decimals = required_u8(swap_leg, "dest_decimals")?;
+    let price_route = swap_leg.get("price_route").cloned().ok_or_else(|| {
+        MarketOrderRoutePlanError::UnsupportedRoute {
+            reason: "universal router swap leg missing price_route".to_string(),
+        }
+    })?;
+    let min_amount_out = swap_leg
+        .get("min_amount_out")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let max_amount_in = swap_leg
+        .get("max_amount_in")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let slippage_bps = swap_leg.get("slippage_bps").and_then(Value::as_u64);
+    let source_role_string = source_role.map(|role| role.to_db_string().to_string());
+    let (source_custody_vault_id, source_custody_vault_address) = if source_role.is_none() {
+        (
+            json!(source_vault.id),
+            json!(source_vault.deposit_vault_address.clone()),
+        )
+    } else {
+        (Value::Null, Value::Null)
+    };
+    let recipient_address = if is_final {
+        json!(order.recipient_address)
+    } else {
+        Value::Null
+    };
+    let recipient_role = if is_final {
+        Value::Null
+    } else {
+        json!(CustodyVaultRole::DestinationExecution.to_db_string())
+    };
+
+    Ok(step(StepSpec {
+        order_id: order.id,
+        transition_decl_id: Some(transition.id.clone()),
+        step_index,
+        step_type: OrderExecutionStepType::UniversalRouterSwap,
+        provider: provider.clone(),
+        input_asset: Some(input_asset.clone()),
+        output_asset: Some(output_asset.clone()),
+        amount_in: Some(amount_in.to_string()),
+        min_amount_out: min_amount_out.clone(),
+        provider_ref: None,
+        idempotency_key: idempotency_key(order.id, &provider, step_index),
+        request: json!({
+            "order_id": order.id,
+            "quote_id": quote.id,
+            "order_kind": order_kind,
+            "amount_in": amount_in,
+            "amount_out": amount_out,
+            "min_amount_out": min_amount_out,
+            "max_amount_in": max_amount_in,
+            "input_asset": {
+                "chain_id": input_asset.chain.as_str(),
+                "asset": input_asset.asset.as_str(),
+            },
+            "output_asset": {
+                "chain_id": output_asset.chain.as_str(),
+                "asset": output_asset.asset.as_str(),
+            },
+            "input_decimals": input_decimals,
+            "output_decimals": output_decimals,
+            "price_route": price_route,
+            "slippage_bps": slippage_bps,
+            "source_custody_vault_id": source_custody_vault_id,
+            "source_custody_vault_address": source_custody_vault_address,
+            "source_custody_vault_role": source_role_string,
+            "recipient_address": recipient_address,
+            "recipient_custody_vault_id": null,
+            "recipient_custody_vault_role": recipient_role,
+        }),
+        details: json!({
+            "schema_version": 1,
+            "transition_kind": transition.kind.as_str(),
+            "source_custody_vault_role": source_role.map(CustodyVaultRole::to_db_string),
+            "source_custody_vault_status": if source_role.is_some() { json!("pending_derivation") } else { json!("bound") },
+            "recipient_custody_vault_role": if is_final { Value::Null } else { json!(CustodyVaultRole::DestinationExecution.to_db_string()) },
+            "recipient_custody_vault_status": if is_final { Value::Null } else { json!("pending_derivation") },
+        }),
+        planned_at,
+    }))
+}
+
+fn leg_asset(leg: &Value, field: &'static str) -> MarketOrderRoutePlanResult<DepositAsset> {
+    let obj = leg
+        .get(field)
+        .ok_or_else(|| MarketOrderRoutePlanError::UnsupportedRoute {
+            reason: format!("hyperliquid leg missing {field}"),
+        })?;
+    let chain_id = required_str(obj, "chain_id")?;
+    let asset_str = required_str(obj, "asset")?;
+    let chain =
+        ChainId::parse(chain_id).map_err(|err| MarketOrderRoutePlanError::UnsupportedRoute {
+            reason: format!("hyperliquid leg {field} chain_id {chain_id:?}: {err}"),
+        })?;
+    let asset =
+        AssetId::parse(asset_str).map_err(|err| MarketOrderRoutePlanError::UnsupportedRoute {
+            reason: format!("hyperliquid leg {field} asset {asset_str:?}: {err}"),
+        })?;
+    Ok(DepositAsset { chain, asset })
+}
+
+fn required_u8(obj: &Value, key: &'static str) -> MarketOrderRoutePlanResult<u8> {
+    let value = obj.get(key).and_then(Value::as_u64).ok_or_else(|| {
+        MarketOrderRoutePlanError::UnsupportedRoute {
+            reason: format!("universal router swap leg missing numeric field {key}"),
+        }
+    })?;
+    u8::try_from(value).map_err(|err| MarketOrderRoutePlanError::UnsupportedRoute {
+        reason: format!("universal router swap leg field {key} does not fit u8: {err}"),
+    })
+}
+
+fn required_str<'a>(obj: &'a Value, key: &'static str) -> MarketOrderRoutePlanResult<&'a str> {
+    obj.get(key).and_then(Value::as_str).ok_or_else(|| {
+        MarketOrderRoutePlanError::UnsupportedRoute {
+            reason: format!("hyperliquid leg missing string field {key}"),
+        }
+    })
+}
+
+fn leg_parent_transition_id(leg: &Value) -> Option<String> {
+    leg.get("transition_parent_decl_id")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| {
+            leg.get("transition_decl_id")
+                .and_then(Value::as_str)
+                .map(|value| {
+                    value
+                        .split_once(":leg:")
+                        .map_or(value, |(parent, _)| parent)
+                        .to_string()
+                })
+        })
+}
+
+fn leg_provider<'a>(
+    leg: &'a Value,
+    transition: &TransitionDecl,
+) -> MarketOrderRoutePlanResult<&'a str> {
+    leg.get("provider")
+        .and_then(Value::as_str)
+        .or_else(|| Some(transition.provider.as_str()))
+        .ok_or_else(|| MarketOrderRoutePlanError::UnsupportedRoute {
+            reason: format!(
+                "quoted leg for transition {} is missing provider",
+                transition.id
+            ),
+        })
+}
+
+fn input_custody_role_for_transition(
+    transitions: &[TransitionDecl],
+    transition_index: usize,
+) -> Option<CustodyVaultRole> {
+    if transition_index == 0 {
+        return None;
+    }
+    required_role_to_custody(
+        transitions[transition_index - 1]
+            .output
+            .required_custody_role,
+    )
+}
+
+fn required_role_to_custody(role: RequiredCustodyRole) -> Option<CustodyVaultRole> {
+    match role {
+        RequiredCustodyRole::SourceOrIntermediate => None,
+        RequiredCustodyRole::IntermediateExecution => Some(CustodyVaultRole::DestinationExecution),
+        RequiredCustodyRole::HyperliquidSpot => Some(CustodyVaultRole::HyperliquidSpot),
+        RequiredCustodyRole::DestinationPayout => None,
+    }
+}
+
+fn hyperliquid_bridge_signer_asset(transitions: &[TransitionDecl]) -> Option<DepositAsset> {
+    transitions
+        .iter()
+        .find(|transition| transition.kind == MarketOrderTransitionKind::HyperliquidBridgeDeposit)
+        .map(|transition| transition.input.asset.clone())
+}
+
+#[derive(Debug, Clone)]
+struct DerivedHyperliquidCustody {
+    role: CustodyVaultRole,
+    asset: Option<DepositAsset>,
+    prefund_first_trade: bool,
+}
+
+fn hyperliquid_custody_for_transition(
+    transitions: &[TransitionDecl],
+    transition_index: usize,
+    _leg_count: usize,
+    bridge_signer_asset: Option<&DepositAsset>,
+) -> MarketOrderRoutePlanResult<DerivedHyperliquidCustody> {
+    let prior_transitions = &transitions[..transition_index];
+    if prior_transitions
+        .iter()
+        .any(|transition| transition.kind == MarketOrderTransitionKind::UnitDeposit)
+    {
+        return Ok(DerivedHyperliquidCustody {
+            role: CustodyVaultRole::HyperliquidSpot,
+            asset: None,
+            prefund_first_trade: false,
+        });
+    }
+    if prior_transitions
+        .iter()
+        .any(|transition| transition.kind == MarketOrderTransitionKind::HyperliquidBridgeDeposit)
+    {
+        let signer_asset = bridge_signer_asset.cloned().ok_or_else(|| {
+            MarketOrderRoutePlanError::UnsupportedRoute {
+                reason: "hyperliquid bridge path is missing signer asset for trade custody"
+                    .to_string(),
+            }
+        })?;
+        let prior_trade_count = prior_transitions
+            .iter()
+            .filter(|transition| transition.kind == MarketOrderTransitionKind::HyperliquidTrade)
+            .count();
+        return Ok(DerivedHyperliquidCustody {
+            role: CustodyVaultRole::DestinationExecution,
+            asset: Some(signer_asset),
+            prefund_first_trade: prior_trade_count == 0,
+        });
+    }
+    Err(MarketOrderRoutePlanError::UnsupportedRoute {
+        reason: format!(
+            "hyperliquid trade transition {} has no preceding custody ingress",
+            transitions[transition_index].id
+        ),
+    })
+}
+
+fn hyperliquid_custody_for_withdrawal(
+    transitions: &[TransitionDecl],
+    transition_index: usize,
+    bridge_signer_asset: Option<&DepositAsset>,
+) -> MarketOrderRoutePlanResult<HyperliquidCustodySpec> {
+    let prior_transitions = &transitions[..transition_index];
+    if prior_transitions
+        .iter()
+        .any(|transition| transition.kind == MarketOrderTransitionKind::UnitDeposit)
+    {
+        return Ok(HyperliquidCustodySpec::spot_vault());
+    }
+    if prior_transitions
+        .iter()
+        .any(|transition| transition.kind == MarketOrderTransitionKind::HyperliquidBridgeDeposit)
+    {
+        return Ok(HyperliquidCustodySpec::destination_execution(
+            bridge_signer_asset.cloned().ok_or_else(|| {
+                MarketOrderRoutePlanError::UnsupportedRoute {
+                    reason:
+                        "hyperliquid bridge path is missing signer asset for withdrawal custody"
+                            .to_string(),
+                }
+            })?,
+            false,
+        ));
+    }
+    Err(MarketOrderRoutePlanError::UnsupportedRoute {
+        reason: format!(
+            "unit withdrawal transition {} has no preceding Hyperliquid custody source",
+            transitions[transition_index].id
+        ),
+    })
+}
+
+fn across_bridge_step(
+    order: &RouterOrder,
+    source_vault: &DepositVault,
+    quote: &MarketOrderQuote,
+    transition: &TransitionDecl,
+    leg: &Value,
+    is_final: bool,
+    step_index: i32,
+    planned_at: DateTime<Utc>,
+) -> MarketOrderRoutePlanResult<OrderExecutionStep> {
+    let provider = leg_provider(leg, transition)?.to_string();
+    let amount_in = required_str(leg, "amount_in")?.to_string();
+    let recipient = if is_final {
+        json!(order.recipient_address)
+    } else {
+        Value::Null
+    };
+    let recipient_role = if is_final {
+        Value::Null
+    } else {
+        json!(CustodyVaultRole::DestinationExecution.to_db_string())
+    };
+    Ok(step(StepSpec {
+        order_id: order.id,
+        transition_decl_id: Some(transition.id.clone()),
+        step_index,
+        step_type: OrderExecutionStepType::AcrossBridge,
+        provider: provider.clone(),
+        input_asset: Some(transition.input.asset.clone()),
+        output_asset: Some(transition.output.asset.clone()),
+        amount_in: Some(amount_in.clone()),
+        min_amount_out: None,
+        provider_ref: Some(format!("quote-{}", quote.id)),
+        idempotency_key: idempotency_key(order.id, &provider, step_index),
+        request: json!({
+            "order_id": order.id,
+            "origin_chain_id": transition.input.asset.chain.as_str(),
+            "destination_chain_id": transition.output.asset.chain.as_str(),
+            "input_asset": transition.input.asset.asset.as_str(),
+            "output_asset": transition.output.asset.asset.as_str(),
+            "amount": amount_in,
+            "recipient": recipient,
+            "recipient_custody_vault_role": recipient_role,
+            "refund_address": &source_vault.deposit_vault_address,
+            "refund_custody_vault_id": source_vault.id,
+            "partial_fills_enabled": false,
+            "depositor_address": &source_vault.deposit_vault_address,
+            "depositor_custody_vault_id": source_vault.id
+        }),
+        details: json!({
+            "schema_version": 1,
+            "transition_kind": transition.kind.as_str(),
+            "partial_fills_enabled": false,
+            "refund_custody_vault_id": source_vault.id,
+            "recipient_custody_vault_role": if is_final { Value::Null } else { json!(CustodyVaultRole::DestinationExecution.to_db_string()) },
+            "recipient_custody_vault_status": if is_final { Value::Null } else { json!("pending_derivation") }
+        }),
+        planned_at,
+    }))
+}
+
+fn unit_deposit_step(
+    order: &RouterOrder,
+    source_vault: &DepositVault,
+    transition: &TransitionDecl,
+    leg: &Value,
+    source_role: Option<CustodyVaultRole>,
+    step_index: i32,
+    planned_at: DateTime<Utc>,
+) -> OrderExecutionStep {
+    let provider = leg_provider(leg, transition)
+        .unwrap_or(transition.provider.as_str())
+        .to_string();
+    let expected_amount = required_str(leg, "amount_in")
+        .unwrap_or_default()
+        .to_string();
+    let source_role_string = source_role.map(|role| role.to_db_string().to_string());
+    step(StepSpec {
+        order_id: order.id,
+        transition_decl_id: Some(transition.id.clone()),
+        step_index,
+        step_type: OrderExecutionStepType::UnitDeposit,
+        provider: provider.clone(),
+        input_asset: Some(transition.input.asset.clone()),
+        output_asset: None,
+        amount_in: Some(expected_amount.clone()),
+        min_amount_out: None,
+        provider_ref: None,
+        idempotency_key: idempotency_key(order.id, &provider, step_index),
+        request: unit_deposit_request(UnitDepositRequestSpec {
+            order_id: order.id,
+            unit_ingress_asset: &transition.input.asset,
+            expected_amount,
+            source_custody_vault_id: if source_role.is_none() {
+                Some(source_vault.id)
+            } else {
+                None
+            },
+            source_custody_vault_role: source_role_string.clone(),
+            revert_custody_vault_id: if source_role.is_none() {
+                Some(source_vault.id)
+            } else {
+                None
+            },
+            revert_custody_vault_role: source_role_string.clone(),
+        }),
+        details: json!({
+            "schema_version": 1,
+            "transition_kind": transition.kind.as_str(),
+            "source_custody_vault_id": if source_role.is_none() { Some(source_vault.id) } else { None },
+            "source_custody_vault_role": source_role.map(CustodyVaultRole::to_db_string),
+            "unit_deposit_provider_address_role": "unit_deposit",
+            "unit_deposit_address_status": "pending_provider_generation",
+            "hyperliquid_destination_provider_address_role": "hyperliquid_destination"
+        }),
+        planned_at,
+    })
+}
+
+fn hyperliquid_bridge_deposit_step(
+    order: &RouterOrder,
+    transition: &TransitionDecl,
+    leg: &Value,
+    source_role: Option<CustodyVaultRole>,
+    step_index: i32,
+    planned_at: DateTime<Utc>,
+) -> MarketOrderRoutePlanResult<OrderExecutionStep> {
+    let provider = leg_provider(leg, transition)?.to_string();
+    let amount_in = required_str(leg, "amount_in")?.to_string();
+    Ok(step(StepSpec {
+        order_id: order.id,
+        transition_decl_id: Some(transition.id.clone()),
+        step_index,
+        step_type: OrderExecutionStepType::HyperliquidBridgeDeposit,
+        provider: provider.clone(),
+        input_asset: Some(transition.input.asset.clone()),
+        output_asset: Some(transition.output.asset.clone()),
+        amount_in: Some(amount_in.clone()),
+        min_amount_out: None,
+        provider_ref: None,
+        idempotency_key: idempotency_key(order.id, &provider, step_index),
+        request: json!({
+            "order_id": order.id,
+            "source_chain_id": transition.input.asset.chain.as_str(),
+            "input_asset": transition.input.asset.asset.as_str(),
+            "amount": amount_in,
+            "source_custody_vault_id": null,
+            "source_custody_vault_role": source_role.map(CustodyVaultRole::to_db_string),
+            "source_custody_vault_address": null
+        }),
+        details: json!({
+            "schema_version": 1,
+            "transition_kind": transition.kind.as_str(),
+            "source_custody_vault_role": source_role.map(CustodyVaultRole::to_db_string),
+            "source_custody_vault_status": "pending_derivation"
+        }),
+        planned_at,
+    }))
+}
+
+fn validate_intermediate_custody_plan(
+    steps: &[OrderExecutionStep],
+) -> MarketOrderRoutePlanResult<()> {
+    for (index, step) in steps.iter().enumerate() {
+        let is_final = index + 1 == steps.len();
+        if is_final {
+            continue;
+        }
+        match step.step_type {
+            OrderExecutionStepType::AcrossBridge => require_request_role(
+                step,
+                "recipient_custody_vault_role",
+                &[CustodyVaultRole::DestinationExecution],
+            )?,
+            OrderExecutionStepType::UnitDeposit => require_request_role(
+                step,
+                "hyperliquid_custody_vault_role",
+                &[CustodyVaultRole::HyperliquidSpot],
+            )?,
+            OrderExecutionStepType::HyperliquidBridgeDeposit => require_request_role(
+                step,
+                "source_custody_vault_role",
+                &[CustodyVaultRole::DestinationExecution],
+            )?,
+            OrderExecutionStepType::HyperliquidTrade => require_request_role(
+                step,
+                "hyperliquid_custody_vault_role",
+                &[
+                    CustodyVaultRole::DestinationExecution,
+                    CustodyVaultRole::HyperliquidSpot,
+                ],
+            )?,
+            OrderExecutionStepType::UniversalRouterSwap => {
+                maybe_require_request_role(
+                    step,
+                    "source_custody_vault_role",
+                    &[CustodyVaultRole::DestinationExecution],
+                )?;
+                require_request_role(
+                    step,
+                    "recipient_custody_vault_role",
+                    &[CustodyVaultRole::DestinationExecution],
+                )?;
+            }
+            OrderExecutionStepType::UnitWithdrawal => {
+                return Err(MarketOrderRoutePlanError::IntermediateCustodyInvariant {
+                    step_index: step.step_index,
+                    step_type: step.step_type.to_db_string(),
+                    reason: "unit withdrawals may only appear as the final route step".to_string(),
+                });
+            }
+            OrderExecutionStepType::WaitForDeposit | OrderExecutionStepType::Refund => {
+                return Err(MarketOrderRoutePlanError::IntermediateCustodyInvariant {
+                    step_index: step.step_index,
+                    step_type: step.step_type.to_db_string(),
+                    reason: "internal-only steps must not appear in market-order route plans"
+                        .to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn require_request_role(
+    step: &OrderExecutionStep,
+    field: &'static str,
+    allowed_roles: &[CustodyVaultRole],
+) -> MarketOrderRoutePlanResult<()> {
+    let Some(role) = step.request.get(field).and_then(Value::as_str) else {
+        return Err(MarketOrderRoutePlanError::IntermediateCustodyInvariant {
+            step_index: step.step_index,
+            step_type: step.step_type.to_db_string(),
+            reason: format!("request is missing {field}"),
+        });
+    };
+    let Some(parsed) = CustodyVaultRole::from_db_string(role) else {
+        return Err(MarketOrderRoutePlanError::IntermediateCustodyInvariant {
+            step_index: step.step_index,
+            step_type: step.step_type.to_db_string(),
+            reason: format!("request field {field} contains unknown custody role {role:?}"),
+        });
+    };
+    if allowed_roles.contains(&parsed) {
+        return Ok(());
+    }
+    Err(MarketOrderRoutePlanError::IntermediateCustodyInvariant {
+        step_index: step.step_index,
+        step_type: step.step_type.to_db_string(),
+        reason: format!(
+            "request field {field} must be one of [{}], got {}",
+            allowed_roles
+                .iter()
+                .map(|role| role.to_db_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            parsed.to_db_string()
+        ),
+    })
+}
+
+fn maybe_require_request_role(
+    step: &OrderExecutionStep,
+    field: &'static str,
+    allowed_roles: &[CustodyVaultRole],
+) -> MarketOrderRoutePlanResult<()> {
+    if step
+        .request
+        .get(field)
+        .is_none_or(serde_json::Value::is_null)
+    {
+        return Ok(());
+    }
+    require_request_role(step, field, allowed_roles)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{
+        DepositVaultStatus, MarketOrderAction, MarketOrderKind, RouterOrderStatus, RouterOrderType,
+        VaultAction,
+    };
+
+    fn planned_step(
+        step_index: i32,
+        step_type: OrderExecutionStepType,
+        request: Value,
+    ) -> OrderExecutionStep {
+        OrderExecutionStep {
+            id: Uuid::now_v7(),
+            order_id: Uuid::now_v7(),
+            execution_attempt_id: None,
+            transition_decl_id: None,
+            step_index,
+            step_type,
+            provider: "test".to_string(),
+            status: OrderExecutionStepStatus::Planned,
+            input_asset: None,
+            output_asset: None,
+            amount_in: None,
+            min_amount_out: None,
+            tx_hash: None,
+            provider_ref: None,
+            idempotency_key: None,
+            attempt_count: 0,
+            next_attempt_at: None,
+            started_at: None,
+            completed_at: None,
+            details: json!({}),
+            request,
+            response: json!({}),
+            error: json!({}),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn asset(chain: &str, asset: AssetId) -> DepositAsset {
+        DepositAsset {
+            chain: ChainId::parse(chain).unwrap(),
+            asset,
+        }
+    }
+
+    #[test]
+    fn intermediate_custody_validator_rejects_nonfinal_unit_withdrawal() {
+        let steps = vec![
+            planned_step(
+                1,
+                OrderExecutionStepType::UnitWithdrawal,
+                json!({
+                    "hyperliquid_custody_vault_role": "hyperliquid_spot"
+                }),
+            ),
+            planned_step(2, OrderExecutionStepType::HyperliquidTrade, json!({})),
+        ];
+
+        let err = validate_intermediate_custody_plan(&steps).expect_err("must reject");
+        assert!(matches!(
+            err,
+            MarketOrderRoutePlanError::IntermediateCustodyInvariant { step_index: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn planner_resolves_serialized_runtime_velora_transitions_and_final_recipient() {
+        let registry = Arc::new(AssetRegistry::default());
+        let source_asset = asset(
+            "evm:8453",
+            AssetId::reference("0x3333333333333333333333333333333333333333"),
+        );
+        let destination_asset = asset(
+            "evm:8453",
+            AssetId::reference("0x4444444444444444444444444444444444444444"),
+        );
+        let path = registry
+            .select_transition_paths(&source_asset, &destination_asset, 3)
+            .into_iter()
+            .find(|path| {
+                path.transitions.len() == 2
+                    && path.transitions.iter().all(|transition| {
+                        transition.kind == MarketOrderTransitionKind::UniversalRouterSwap
+                    })
+            })
+            .expect("runtime Velora path");
+        let transition_ids = path
+            .transitions
+            .iter()
+            .map(|transition| transition.id.clone())
+            .collect::<Vec<_>>();
+        let legs = path
+            .transitions
+            .iter()
+            .map(|transition| {
+                json!({
+                    "transition_decl_id": transition.id,
+                    "transition_parent_decl_id": transition.id,
+                    "transition_kind": transition.kind.as_str(),
+                    "provider": transition.provider.as_str(),
+                    "input_asset": {
+                        "chain_id": transition.input.asset.chain.as_str(),
+                        "asset": transition.input.asset.asset.as_str(),
+                    },
+                    "output_asset": {
+                        "chain_id": transition.output.asset.chain.as_str(),
+                        "asset": transition.output.asset.asset.as_str(),
+                    },
+                    "amount_in": "1000000000000000000",
+                    "amount_out": "999000000000000000",
+                    "expires_at": (Utc::now() + chrono::Duration::minutes(5)).to_rfc3339(),
+                    "raw": {
+                        "kind": "universal_router_swap",
+                        "order_kind": "exact_in",
+                        "amount_in": "1000000000000000000",
+                        "amount_out": "999000000000000000",
+                        "min_amount_out": "1",
+                        "src_decimals": 18,
+                        "dest_decimals": 18,
+                        "slippage_bps": 100,
+                        "price_route": {
+                            "srcAmount": "1000000000000000000",
+                            "destAmount": "999000000000000000",
+                            "tokenTransferProxy": "0x9999999999999999999999999999999999999999"
+                        },
+                        "input_asset": {
+                            "chain_id": transition.input.asset.chain.as_str(),
+                            "asset": transition.input.asset.asset.as_str(),
+                        },
+                        "output_asset": {
+                            "chain_id": transition.output.asset.chain.as_str(),
+                            "asset": transition.output.asset.asset.as_str(),
+                        }
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let now = Utc::now();
+        let order_id = Uuid::now_v7();
+        let source_vault_id = Uuid::now_v7();
+        let order = RouterOrder {
+            id: order_id,
+            order_type: RouterOrderType::MarketOrder,
+            status: RouterOrderStatus::Funded,
+            funding_vault_id: Some(source_vault_id),
+            source_asset: source_asset.clone(),
+            destination_asset: destination_asset.clone(),
+            recipient_address: "0x5555555555555555555555555555555555555555".to_string(),
+            refund_address: "0x6666666666666666666666666666666666666666".to_string(),
+            action: RouterOrderAction::MarketOrder(MarketOrderAction {
+                order_kind: MarketOrderKind::ExactIn {
+                    amount_in: "1000000000000000000".to_string(),
+                    min_amount_out: "1".to_string(),
+                },
+            }),
+            action_timeout_at: now + chrono::Duration::minutes(10),
+            idempotency_key: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let source_vault = DepositVault {
+            id: source_vault_id,
+            order_id: Some(order_id),
+            deposit_asset: source_asset.clone(),
+            action: VaultAction::Null,
+            metadata: json!({}),
+            deposit_vault_salt: [7; 32],
+            deposit_vault_address: "0x7777777777777777777777777777777777777777".to_string(),
+            recovery_address: "0x8888888888888888888888888888888888888888".to_string(),
+            cancellation_commitment: "0x".to_string(),
+            cancel_after: now + chrono::Duration::minutes(10),
+            status: DepositVaultStatus::Funded,
+            refund_requested_at: None,
+            refunded_at: None,
+            refund_tx_hash: None,
+            last_refund_error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let quote = MarketOrderQuote {
+            id: Uuid::now_v7(),
+            order_id: Some(order_id),
+            source_asset: source_asset.clone(),
+            destination_asset: destination_asset.clone(),
+            recipient_address: order.recipient_address.clone(),
+            provider_id: "path:runtime-velora".to_string(),
+            order_kind: MarketOrderKindType::ExactIn,
+            amount_in: "1000000000000000000".to_string(),
+            amount_out: "999000000000000000".to_string(),
+            min_amount_out: Some("1".to_string()),
+            max_amount_in: None,
+            provider_quote: json!({
+                "path_id": path.id,
+                "transition_decl_ids": transition_ids,
+                "transitions": path.transitions,
+                "legs": legs,
+                "gas_reimbursement": {
+                    "retention_actions": []
+                }
+            }),
+            expires_at: now + chrono::Duration::minutes(5),
+            created_at: now,
+        };
+
+        let plan = MarketOrderRoutePlanner::new(registry)
+            .plan(&order, &source_vault, &quote, now)
+            .expect("runtime Velora path should plan");
+
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(plan.transition_decl_ids, transition_ids);
+        assert_eq!(
+            plan.steps
+                .iter()
+                .map(|step| step.step_type)
+                .collect::<Vec<_>>(),
+            vec![
+                OrderExecutionStepType::UniversalRouterSwap,
+                OrderExecutionStepType::UniversalRouterSwap
+            ]
+        );
+        assert_eq!(
+            plan.steps[0].request["source_custody_vault_id"],
+            json!(source_vault_id)
+        );
+        assert_eq!(
+            plan.steps[0].request["recipient_custody_vault_role"],
+            json!("destination_execution")
+        );
+        assert!(plan.steps[0].request["recipient_address"].is_null());
+        assert_eq!(
+            plan.steps[1].request["source_custody_vault_role"],
+            json!("destination_execution")
+        );
+        assert_eq!(
+            plan.steps[1].request["recipient_address"],
+            json!(order.recipient_address)
+        );
+        assert!(plan.steps[1].request["recipient_custody_vault_role"].is_null());
+        assert_eq!(plan.steps[1].output_asset, Some(destination_asset));
+    }
+
+    #[test]
+    fn planner_materializes_universal_router_swap_with_bound_source_and_final_recipient() {
+        let registry = Arc::new(AssetRegistry::default());
+        let source_asset = asset(
+            "evm:8453",
+            AssetId::reference("0x3333333333333333333333333333333333333333"),
+        );
+        let destination_asset = asset(
+            "evm:8453",
+            AssetId::reference("0x4444444444444444444444444444444444444444"),
+        );
+        let path = registry
+            .select_transition_paths(&source_asset, &destination_asset, 1)
+            .into_iter()
+            .find(|path| {
+                path.transitions.len() == 1
+                    && path.transitions[0].kind == MarketOrderTransitionKind::UniversalRouterSwap
+            })
+            .expect("direct Velora runtime path");
+        let transition = &path.transitions[0];
+        let transition_ids = vec![transition.id.clone()];
+        let now = Utc::now();
+        let order_id = Uuid::now_v7();
+        let source_vault_id = Uuid::now_v7();
+        let order = RouterOrder {
+            id: order_id,
+            order_type: RouterOrderType::MarketOrder,
+            status: RouterOrderStatus::Funded,
+            funding_vault_id: Some(source_vault_id),
+            source_asset: source_asset.clone(),
+            destination_asset: destination_asset.clone(),
+            recipient_address: "0x5555555555555555555555555555555555555555".to_string(),
+            refund_address: "0x6666666666666666666666666666666666666666".to_string(),
+            action: RouterOrderAction::MarketOrder(MarketOrderAction {
+                order_kind: MarketOrderKind::ExactIn {
+                    amount_in: "1000000000000000000".to_string(),
+                    min_amount_out: "900000000000000000".to_string(),
+                },
+            }),
+            action_timeout_at: now + chrono::Duration::minutes(10),
+            idempotency_key: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let source_vault = DepositVault {
+            id: source_vault_id,
+            order_id: Some(order_id),
+            deposit_asset: source_asset.clone(),
+            action: VaultAction::Null,
+            metadata: json!({}),
+            deposit_vault_salt: [7; 32],
+            deposit_vault_address: "0x7777777777777777777777777777777777777777".to_string(),
+            recovery_address: "0x8888888888888888888888888888888888888888".to_string(),
+            cancellation_commitment: "0x".to_string(),
+            cancel_after: now + chrono::Duration::minutes(10),
+            status: DepositVaultStatus::Funded,
+            refund_requested_at: None,
+            refunded_at: None,
+            refund_tx_hash: None,
+            last_refund_error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let leg = json!({
+            "transition_decl_id": transition.id,
+            "transition_parent_decl_id": transition.id,
+            "transition_kind": transition.kind.as_str(),
+            "provider": "velora",
+            "input_asset": {
+                "chain_id": source_asset.chain.as_str(),
+                "asset": source_asset.asset.as_str(),
+            },
+            "output_asset": {
+                "chain_id": destination_asset.chain.as_str(),
+                "asset": destination_asset.asset.as_str(),
+            },
+            "amount_in": "1000000000000000000",
+            "amount_out": "950000000000000000",
+            "expires_at": (now + chrono::Duration::minutes(5)).to_rfc3339(),
+            "raw": {
+                "kind": "universal_router_swap",
+                "order_kind": "exact_in",
+                "amount_in": "1000000000000000000",
+                "amount_out": "950000000000000000",
+                "min_amount_out": "900000000000000000",
+                "src_decimals": 18,
+                "dest_decimals": 18,
+                "slippage_bps": 526,
+                "price_route": {
+                    "srcAmount": "1000000000000000000",
+                    "destAmount": "950000000000000000",
+                    "tokenTransferProxy": "0x9999999999999999999999999999999999999999"
+                },
+                "input_asset": {
+                    "chain_id": source_asset.chain.as_str(),
+                    "asset": source_asset.asset.as_str(),
+                },
+                "output_asset": {
+                    "chain_id": destination_asset.chain.as_str(),
+                    "asset": destination_asset.asset.as_str(),
+                }
+            },
+        });
+        let quote = MarketOrderQuote {
+            id: Uuid::now_v7(),
+            order_id: Some(order_id),
+            source_asset: source_asset.clone(),
+            destination_asset: destination_asset.clone(),
+            recipient_address: order.recipient_address.clone(),
+            provider_id: "path:velora".to_string(),
+            order_kind: MarketOrderKindType::ExactIn,
+            amount_in: "1000000000000000000".to_string(),
+            amount_out: "950000000000000000".to_string(),
+            min_amount_out: Some("900000000000000000".to_string()),
+            max_amount_in: None,
+            provider_quote: json!({
+                "path_id": path.id,
+                "transition_decl_ids": transition_ids,
+                "transitions": path.transitions,
+                "legs": [leg],
+                "gas_reimbursement": {
+                    "retention_actions": []
+                }
+            }),
+            expires_at: now + chrono::Duration::minutes(5),
+            created_at: now,
+        };
+
+        let plan = MarketOrderRoutePlanner::new(registry)
+            .plan(&order, &source_vault, &quote, now)
+            .expect("Velora path should plan");
+
+        assert_eq!(plan.steps.len(), 1);
+        let step = &plan.steps[0];
+        assert_eq!(step.step_type, OrderExecutionStepType::UniversalRouterSwap);
+        assert_eq!(step.provider, "velora");
+        assert_eq!(
+            step.request["source_custody_vault_id"],
+            json!(source_vault_id)
+        );
+        assert_eq!(
+            step.request["source_custody_vault_address"],
+            json!(source_vault.deposit_vault_address)
+        );
+        assert!(step.request["source_custody_vault_role"].is_null());
+        assert_eq!(
+            step.request["recipient_address"],
+            json!(order.recipient_address)
+        );
+        assert!(step.request["recipient_custody_vault_role"].is_null());
+        assert_eq!(step.request["input_decimals"], json!(18));
+        assert_eq!(step.request["output_decimals"], json!(18));
+        assert_eq!(
+            step.request["price_route"]["tokenTransferProxy"],
+            json!("0x9999999999999999999999999999999999999999")
+        );
+    }
+
+    #[test]
+    fn intermediate_custody_validator_rejects_across_bridge_without_destination_execution() {
+        let steps = vec![
+            planned_step(
+                1,
+                OrderExecutionStepType::AcrossBridge,
+                json!({
+                    "recipient_custody_vault_role": "hyperliquid_spot"
+                }),
+            ),
+            planned_step(2, OrderExecutionStepType::UnitWithdrawal, json!({})),
+        ];
+
+        let err = validate_intermediate_custody_plan(&steps).expect_err("must reject");
+        assert!(matches!(
+            err,
+            MarketOrderRoutePlanError::IntermediateCustodyInvariant { step_index: 1, .. }
+        ));
+    }
+}

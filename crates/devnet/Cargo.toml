@@ -1,0 +1,39 @@
+[package]
+name = "devnet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde_json = { workspace = true }
+corepc-node = { workspace = true }
+tempfile = { workspace = true }
+alloy = { workspace = true }
+tokio = { workspace = true }
+bitcoincore-rpc-async = { workspace = true }
+electrsd = { workspace = true}
+esplora-client = {workspace = true}
+tracing = { workspace = true }
+bitcoin = { workspace = true }
+fs2 = { workspace = true }
+serde = { workspace = true }
+chrono = { workspace = true }
+dirs = { workspace = true }
+blockchain-utils = {workspace = true}
+bip39 = {workspace = true}
+snafu = {workspace = true}
+reqwest = {workspace = true}
+uuid = {workspace= true}
+eip7702-delegator-contract = {workspace=true}
+eip3009-erc20-contract = {workspace=true}
+hyperliquid-client = {workspace=true}
+hyperunit-client = {workspace=true}
+libc = {workspace=true} 
+utc = {workspace=true}
+eyre = {workspace=true}
+axum = { workspace = true }
+sha2 = { workspace = true }
+clap = { workspace = true }
+url = { workspace = true }
+dotenvy = { workspace = true }

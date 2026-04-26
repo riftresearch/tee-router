@@ -1,0 +1,56 @@
+[package]
+name = "router-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "router-api"
+path = "src/bin/router-api.rs"
+
+[[bin]]
+name = "router-worker"
+path = "src/bin/router-worker.rs"
+
+[dependencies]
+blockchain-utils = { workspace = true }
+chains = { workspace = true }
+chainalysis-address-screener = { workspace = true }
+hyperliquid-client = { workspace = true }
+hyperunit-client = { workspace = true }
+router-primitives = { workspace = true }
+
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-loki = { workspace = true }
+metrics = { workspace = true }
+url = { workspace = true }
+snafu = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+clap = { workspace = true }
+sqlx-core = { workspace = true }
+sqlx-postgres = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+alloy = { workspace = true }
+zeroize = { workspace = true }
+secrecy = { workspace = true }
+getrandom = { workspace = true }
+bitcoin = { workspace = true }
+bitcoincore-rpc-async = { workspace = true }
+reqwest = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { workspace = true }
+devnet = { workspace = true }
+eip3009-erc20-contract = { workspace = true }
+alloy = { workspace = true }
+ctor = { workspace = true }
+testcontainers = "0.27.2"

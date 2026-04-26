@@ -1,0 +1,64 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: evm-indexer-postgres-prod
+    environment:
+      POSTGRES_DB: ponder
+      POSTGRES_USER: ponder
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - ./postgres-data:/var/lib/postgresql/data
+      - ./postgresql.conf:/var/lib/postgresql/postgresql.conf:ro
+    command:
+      ["postgres", "-c", "config_file=/var/lib/postgresql/postgresql.conf"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ponder -d ponder"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - indexer-network
+
+  ponder-indexer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: evm-ponder-indexer-prod
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Database connection
+      DATABASE_URL: postgresql://ponder:${POSTGRES_PASSWORD}@postgres:5432/ponder
+
+      # Ponder configuration
+      PONDER_CHAIN_ID: ${PONDER_CHAIN_ID}
+      PONDER_RPC_URL_HTTP: ${PONDER_RPC_URL_HTTP}
+      PONDER_WS_URL_HTTP: ${PONDER_WS_URL_HTTP}
+      PONDER_DISABLE_CACHE: ${PONDER_DISABLE_CACHE:-false}
+      PONDER_CONTRACT_START_BLOCK: ${PONDER_CONTRACT_START_BLOCK:-0}
+      PONDER_LOG_LEVEL: ${PONDER_LOG_LEVEL:-info}
+      PONDER_PORT: ${PONDER_PORT:-4001}
+      DATABASE_SCHEMA: ${PONDER_SCHEMA:-default}
+
+      # Node environment
+      NODE_ENV: production
+    ports:
+      - "${PONDER_PORT:-4001}:${PONDER_PORT:-4001}"
+    volumes:
+      - ponder_data:/app/.ponder
+    restart: unless-stopped
+    networks:
+      - indexer-network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  ponder_data:
+    driver: local
+
+networks:
+  indexer-network:
+    driver: bridge

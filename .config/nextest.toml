@@ -1,0 +1,21 @@
+experimental = ["setup-scripts"]
+
+# cargo-nextest 0.9.95 uses the pre-0.9.98 setup script syntax.
+[script.router-postgres]
+command = 'bin/router-server/tests/setup-postgres-nextest.sh'
+slow-timeout = { period = "60s", terminate-after = 2 }
+leak-timeout = "1s"
+capture-stdout = true
+capture-stderr = true
+
+[[profile.default.scripts]]
+filter = 'package(router-server) & binary(vault_creation)'
+setup = 'router-postgres'
+
+[[profile.default.overrides]]
+filter = 'package(router-server) & binary(vault_creation)'
+threads-required = "num-test-threads"
+
+[[profile.default.overrides]]
+filter = 'package(sauron) & binary(provider_operation_e2e)'
+threads-required = "num-test-threads"

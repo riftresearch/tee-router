@@ -1,0 +1,74 @@
+title: BASE USDC → Bitcoin via tee-router (AcrossToUnit path) {near: top-center}
+
+shape: sequence_diagram
+
+# Lifelines (left → right roughly in order of involvement)
+user: User
+api: Router HTTP API
+mgr: OrderManager
+providers: Quote Providers\n(Across / HyperUnit / Hyperliquid)
+db: Postgres
+worker: Worker (lease holder)
+custody: CustodyActionExecutor
+base: Base Chain\n(Vault + Across SpokePool)
+eth: Ethereum L1\n(Vault + Unit address)
+unit: HyperUnit Guardians
+btc: Bitcoin Network
+
+# ===== Quote phase =====
+quote: Quote {
+  user -> api: "POST /api/v1/quotes (BASE USDC → BTC)"
+  api -> mgr: "quote_market_order()"
+  mgr -> providers: "fan-out price requests"
+  providers -> mgr: "candidate quotes"
+  mgr -> db: "persist best quote"
+  api -> user: "quote_id, amount_out, expires_at"
+}
+
+# ===== Order placement =====
+order: Place order {
+  user -> api: "POST /api/v1/orders (quote_id, BTC recipient)"
+  api -> custody: "derive deposit vault (master key + salt)"
+  custody -> api: "vault address on Base"
+  api -> db: "insert order = QUOTED, vault = PendingFunding"
+  api -> user: "order_id + Base deposit address"
+}
+
+# ===== User funds the vault =====
+fund: User funds vault {
+  user -> base: "send USDC to deposit vault"
+  worker -> base: "poll ERC-20 balance"
+  base -> worker: "balance ≥ expected"
+  worker -> db: "vault Funded, order FUNDED"
+}
+
+# ===== Plan + execute Across leg =====
+across: Across leg (Base → Ethereum) {
+  worker -> db: "load order, plan AcrossToUnit route"
+  worker -> custody: "execute step: AcrossBridge"
+  custody -> base: "approve + SpokePool.deposit()"
+  base -> custody: "tx hash, FundsDeposited(depositId)"
+  custody -> db: "step WaitingExternal, provider_ref = depositId"
+  base -> eth: "Across relayer fills on Ethereum"
+  worker -> db: "hint received, step Completed"
+}
+
+# ===== HyperUnit deposit leg =====
+unit_deposit: HyperUnit deposit (Ethereum) {
+  worker -> custody: "execute step: UnitDeposit"
+  custody -> unit: "generate_address() for BTC payout"
+  unit -> custody: "guardian-controlled deposit address"
+  custody -> eth: "transfer USDC to guardian address"
+  eth -> custody: "tx confirmed"
+  custody -> db: "step WaitingExternal"
+}
+
+# ===== Guardians settle to Bitcoin =====
+btc_payout: Bitcoin payout {
+  unit -> eth: "guardians observe USDC deposit"
+  unit -> btc: "broadcast BTC tx → user address"
+  worker -> unit: "poll /operations"
+  unit -> worker: "withdrawal Completed (txid)"
+  worker -> db: "order COMPLETED"
+  btc -> user: "BTC received at recipient address"
+}

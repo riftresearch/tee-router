@@ -1,0 +1,93 @@
+[workspace]
+resolver = "2"
+members = [
+    "bin/api-key-gen",
+    "bin/devnet-cli",
+    "bin/rand-wallet",
+    "bin/router-server",
+    "bin/sauron",
+    "crates/blockchain-utils",
+    "crates/chainalysis-address-screener",
+    "crates/devnet",
+    "crates/eip3009-erc20-contract",
+    "crates/eip7702-delegator-contract",
+    "crates/evm-token-indexer-client",
+    "crates/chains",
+    "crates/hyperliquid-client",
+    "crates/hyperunit-client",
+    "crates/otc-models",
+    "crates/router-primitives",
+    "crates/utc",
+]
+
+[workspace.package]
+edition = "2021"
+version = "1.8.7"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/riftresearch/tee-router"
+
+[workspace.dependencies]
+# Internal dependencies
+router-primitives = { path = "crates/router-primitives" }
+chains = { path = "crates/chains" }
+hyperliquid-client = { path = "crates/hyperliquid-client" }
+hyperunit-client = { path = "crates/hyperunit-client" }
+blockchain-utils = { path = "crates/blockchain-utils" }
+devnet = { path = "crates/devnet" }
+evm-token-indexer-client = { path = "crates/evm-token-indexer-client" }
+eip7702-delegator-contract = {path = "crates/eip7702-delegator-contract"}
+eip3009-erc20-contract = {path = "crates/eip3009-erc20-contract"}
+utc = {path = "crates/utc"}
+chainalysis-address-screener = { path = "crates/chainalysis-address-screener" }
+
+# All of the following dependences (before the empty line) are implicitly linked to the same version, if one of them is updated they must all be updated simultaneously 
+bitcoin = { version = "0.32.0", default-features = false, features = ["serde", "base64", "secp-recovery", "rand-std"] }
+bitcoincore-rpc-async = { git = "https://github.com/riftresearch/rust-bitcoincore-rpc-async", rev = "c50734a50f2af2f8a9be3f03b98832dd04e788b1" }
+corepc-node = { version = "0.8.0", features = ["29_0", "download"] }
+electrsd = { git = "https://github.com/RCasatta/electrsd", rev = "bdc97e879bad82e13e69c74d898271db12224f44", features = ["corepc-node_29_0", "esplora_a33e97e1", "legacy"] }
+esplora-client = {git = "https://github.com/riftresearch/rust-esplora-client" , rev = "b749fb95e204c7d5f5c1fa83d499a8600d72a103", default-features = false, features = ["async", "tokio", "async-https-rustls"]}
+
+alloy = { version = "1.0.23", default-features = false, features = ["std", "full", "node-bindings", "json-rpc", "eip712", "reqwest-rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.40", features = ["full", "tracing"] }
+console-subscriber = "0.4.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-loki = { version = "0.2.6", default-features = false, features = ["compat-0-2-1", "rustls"] }
+snafu = { version = "0.8", features = ["std"] }
+axum = { version = "0.7", features = ["ws"] }
+tower-http = { version = "0.6", features = ["cors"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+uuid = { version = "1.10", features = ["v7", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+zeroize = { version = "1.8", features = ["derive"] }
+secrecy = { version = "0.10", features = ["serde"] }
+getrandom = "0.2"
+url = "2.5"
+argon2 = "0.5"
+rand = "0.8"
+ctor = "0.2"
+reqwest = { version = "0.12.23", default-features = false, features = ["charset", "http2", "json", "rustls-tls-webpki-roots"] }
+dirs = "6.0.0"
+tempfile = "3.20.0"
+fs2 = "0.4"
+backoff = { version = "0.4.0", features=["tokio"] }
+sha2 = "0.10"
+hex = { version = "0.4", features = ["serde"] }
+hkdf = "0.12"
+bip39 = "2.1.0"
+async-trait = "0.1"
+bitcoin-coin-selection =  { version = "0.7.0", features = ["rand"]}
+sqlx-core = { version = "=0.8.6", default-features = false, features = ["_rt-tokio", "_tls-rustls-ring-webpki", "uuid", "chrono", "migrate", "json"] }
+sqlx-postgres = { version = "=0.8.6", default-features = false, features = ["uuid", "chrono", "migrate", "json"] }
+bdk_wallet = "2.0.0"
+metrics = "0.23.1"
+mock_instant = "0.6.0"
+libc = "0.2.176"
+dotenvy = "0.15"
+eyre = "0.6.12"
+
+[patch.crates-io]
+corepc-node = { git = "https://github.com/alpinevm/corepc", rev = "2b21b2bfeb4b4c8bc71fccba87d86054a648f242" }
+esplora-client = {git = "https://github.com/riftresearch/rust-esplora-client" , rev = "b749fb95e204c7d5f5c1fa83d499a8600d72a103"}

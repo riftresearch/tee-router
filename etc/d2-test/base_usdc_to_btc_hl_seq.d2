@@ -1,0 +1,80 @@
+title: BASE USDC → Bitcoin via tee-router (AcrossToHyperliquidBridge path) {near: top-center}
+
+shape: sequence_diagram
+
+user: User
+api: Router HTTP API
+mgr: OrderManager
+providers: Quote Providers\n(Across / Hyperliquid / HyperUnit)
+db: Postgres
+worker: Worker (lease holder)
+custody: CustodyActionExecutor
+base: Base Chain\n(Vault + Across SpokePool)
+eth: Ethereum L1\n(Vault)
+hl_bridge: Hyperliquid Bridge
+hl_dex: Hyperliquid Spot DEX\n(USDC ↔ UBTC)
+unit: HyperUnit Guardians
+btc: Bitcoin Network
+
+# ===== Quote phase =====
+quote: Quote {
+  user -> api: "POST /api/v1/quotes (BASE USDC → BTC)"
+  api -> mgr: "quote_market_order()"
+  mgr -> providers: "fan-out: Across leg + HL spot + Unit withdrawal fees"
+  providers -> mgr: "candidate quotes per route"
+  mgr -> db: "persist best quote (AcrossToHyperliquidBridge wins)"
+  api -> user: "quote_id, amount_out, expires_at"
+}
+
+# ===== Order placement =====
+order: Place order {
+  user -> api: "POST /api/v1/orders (quote_id, BTC recipient)"
+  api -> custody: "derive deposit vault on Base"
+  api -> db: "insert order = QUOTED"
+  api -> user: "Base deposit address"
+}
+
+# ===== User funds the vault =====
+fund: User funds vault {
+  user -> base: "send USDC to deposit vault"
+  worker -> base: "poll ERC-20 balance"
+  base -> worker: "balance ≥ expected"
+  worker -> db: "vault Funded, order FUNDED"
+}
+
+# ===== Step 1: Across bridge (Base → Ethereum) =====
+across: Step 1 — Across bridge {
+  worker -> db: "plan AcrossToHyperliquidBridge route"
+  worker -> custody: "execute step: AcrossBridge"
+  custody -> base: "approve + SpokePool.deposit() (USDC, dest=Eth)"
+  base -> custody: "FundsDeposited(depositId)"
+  base -> eth: "Across relayer fills USDC on Ethereum (router HL-spot vault)"
+  worker -> db: "step Completed"
+}
+
+# ===== Step 2: Deposit into Hyperliquid =====
+hl_deposit: Step 2 — Hyperliquid bridge deposit {
+  worker -> custody: "execute step: HyperliquidBridgeDeposit"
+  custody -> hl_bridge: "send USDC from Eth vault → HL bridge"
+  hl_bridge -> hl_dex: "credit USDC to router's HL spot account"
+  worker -> db: "step Completed"
+}
+
+# ===== Step 3: Spot swap on Hyperliquid =====
+hl_trade: Step 3 — Hyperliquid SPOT TRADE (USDC → UBTC) {
+  worker -> custody: "execute step: HyperliquidTrade (one or more legs)"
+  custody -> hl_dex: "place market order: SELL USDC / BUY UBTC"
+  hl_dex -> custody: "fills, UBTC credited to router HL spot vault"
+  worker -> db: "step Completed (UBTC balance)"
+}
+
+# ===== Step 4: HyperUnit withdrawal as native BTC =====
+unit_withdraw: Step 4 — HyperUnit withdrawal {
+  worker -> custody: "execute step: UnitWithdrawal"
+  custody -> unit: "request withdrawal: UBTC → user BTC address"
+  unit -> btc: "guardians broadcast Bitcoin tx"
+  worker -> unit: "poll /operations"
+  unit -> worker: "withdrawal Completed (txid)"
+  worker -> db: "order COMPLETED"
+  btc -> user: "BTC received"
+}

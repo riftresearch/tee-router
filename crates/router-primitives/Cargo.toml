@@ -1,0 +1,17 @@
+[package]
+name = "router-primitives"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+alloy = { workspace = true }
+argon2 = { workspace = true }
+secrecy = { workspace = true }
+serde = { workspace = true }
+zeroize = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+serde_json.workspace = true

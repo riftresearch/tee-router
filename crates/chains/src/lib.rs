@@ -1,0 +1,14 @@
+pub mod error;
+pub mod key_derivation;
+pub mod registry;
+pub mod traits;
+
+// Chain implementations
+pub mod bitcoin;
+pub mod evm;
+pub mod hyperliquid;
+pub mod rpc_metrics_layer;
+
+pub use error::{Error, Result};
+pub use registry::ChainRegistry;
+pub use traits::{ChainOperations, UserDepositCandidateStatus, VerifiedUserDeposit};

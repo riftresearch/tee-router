@@ -1,0 +1,140 @@
+title: |md
+  # BASE USDC → Bitcoin via tee-router
+  End-to-end swap flow (AcrossToUnit path)
+| {near: top-center}
+
+direction: down
+
+user: User {
+  shape: person
+}
+
+# ---------- Router service (off-chain) ----------
+router: Router Service (off-chain) {
+  api: HTTP API {
+    shape: rectangle
+    tooltip: bin/router-server/src/server.rs
+  }
+
+  order_mgr: OrderManager {
+    shape: rectangle
+    tooltip: services/order_manager.rs — quote aggregation
+  }
+
+  worker: Worker (lease holder) {
+    shape: hexagon
+    tooltip: Postgres lease — only one worker executes at a time
+  }
+
+  planner: MarketOrderRoutePlanner {
+    shape: rectangle
+    tooltip: services/market_order_planner.rs
+  }
+
+  custody: CustodyActionExecutor {
+    shape: rectangle
+    tooltip: derives vault keys, signs txs
+  }
+
+  db: Postgres {
+    shape: cylinder
+    tooltip: orders, vaults, steps, leases
+  }
+}
+
+# ---------- External price/quote sources ----------
+quote_sources: Quote Providers {
+  across_q: Across /quote {
+    shape: cloud
+  }
+  unit_q: HyperUnit /quote {
+    shape: cloud
+  }
+  hl_q: Hyperliquid /quote {
+    shape: cloud
+  }
+}
+
+# ---------- Chains ----------
+base: Base (L2) {
+  vault_base: Deposit Vault\n(USDC on Base) {
+    shape: cylinder
+  }
+  spoke_base: Across SpokePool {
+    shape: rectangle
+  }
+}
+
+eth: Ethereum L1 {
+  vault_eth: Internal Vault\n(USDC on Mainnet) {
+    shape: cylinder
+  }
+  unit_addr: HyperUnit Protocol Address {
+    shape: rectangle
+  }
+}
+
+unit: HyperUnit Guardians {
+  shape: cloud
+  tooltip: custodial bridge — USDC → BTC withdrawal
+}
+
+btc: Bitcoin Network {
+  user_btc: User BTC Address {
+    shape: cylinder
+  }
+}
+
+# ============== FLOW ==============
+
+# 1-3: Quote
+user -> router.api: "1. POST /api/v1/quotes\n(BASE USDC → BTC)"
+router.api -> router.order_mgr: "2. quote_market_order()"
+router.order_mgr -> quote_sources.across_q: "3a. price USDC bridge"
+router.order_mgr -> quote_sources.unit_q: "3b. price USDC→BTC"
+router.order_mgr -> quote_sources.hl_q: "3c. price (alt path)"
+router.order_mgr -> router.db: "4. persist best quote"
+router.api -> user: "5. quote_id + amount_out"
+
+# 6-7: Order + vault
+user -> router.api: "6. POST /api/v1/orders\n(quote_id, BTC recipient)"
+router.api -> router.custody: "7. derive deposit vault\n(master key + salt)"
+router.custody -> base.vault_base: "8. vault address on Base"
+router.api -> user: "9. deposit address"
+
+# 10: User funds
+user -> base.vault_base: "10. send USDC on Base"
+
+# 11-12: Worker detects funding
+router.worker -> base.vault_base: "11. poll ERC-20 balance"
+router.worker -> router.db: "12. mark order FUNDED"
+
+# 13: Plan route
+router.worker -> router.planner: "13. plan route\n(AcrossToUnit)"
+router.planner -> router.db: "14. persist execution steps"
+
+# 15: Across deposit on Base
+router.worker -> router.custody: "15. execute step:\nAcrossBridge"
+router.custody -> base.spoke_base: "16. SpokePool.deposit()\nUSDC → Ethereum"
+
+# 17: Across relays to Ethereum
+base.spoke_base -> eth.vault_eth: "17. Across relay\n(FundsDeposited → fill)"
+
+# 18-19: HyperUnit deposit
+router.worker -> router.custody: "18. execute step:\nUnitDeposit"
+router.custody -> eth.unit_addr: "19. transfer USDC\nto guardian address"
+eth.vault_eth -> eth.unit_addr: "20. on-chain transfer"
+
+# 21: Guardians observe & initiate withdrawal
+eth.unit_addr -> unit: "21. guardians observe deposit"
+unit -> btc.user_btc: "22. broadcast BTC tx\nto user address"
+
+# 23: Mark complete
+router.worker -> unit: "23. poll /operations\nfor withdrawal state"
+router.worker -> router.db: "24. mark order COMPLETED"
+
+# Styling for emphasis
+user.style.fill: "#1f6feb"
+btc.user_btc.style.fill: "#f7931a"
+btc.user_btc.style.font-color: "#000000"
+unit.style.fill: "#7c3aed"

@@ -1,0 +1,19 @@
+[package]
+name = "rand-wallet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "rand-wallet"
+path = "src/main.rs"
+
+
+[dependencies]
+rand = { version = "0.9", features = ["std_rng"] }
+blockchain-utils = { workspace = true }
+bitcoin = { workspace = true }
+clap = { workspace = true }
+alloy = { workspace = true }
+hex = { workspace = true }

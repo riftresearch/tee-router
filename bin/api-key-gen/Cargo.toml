@@ -1,0 +1,17 @@
+[package]
+name = "api-key-gen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+router-primitives = { workspace = true }
+clap = { workspace = true }
+argon2 = { workspace = true }
+uuid = { workspace = true }
+serde_json = { workspace = true }
+rand = { workspace = true }
+snafu = { workspace = true }
+console-subscriber = { workspace = true }
+blockchain-utils = { workspace = true }

@@ -1,0 +1,12 @@
+[
+  {
+    "id": "96c0bedb-bfda-4680-a8df-1317d1e09c8d",
+    "tag": "test-mm-eth",
+    "hash": "$argon2id$v=19$m=19456,t=2,p=1$xtwHECDisKE9Vpp71a0XdA$Q+d1QhDH5UGIKaFhLycFPSh7fV7bVbqR1NkKqo+W5jI"
+  },
+  {
+    "id": "f901369b-84d7-4c03-8799-f504c22125f9",
+    "tag": "test-mm-base",
+    "hash": "$argon2id$v=19$m=19456,t=2,p=1$aYjaEm00ZK5mpL0E/qlzEw$UfBaYvQmYSFtHN89A9zlNCjSHKyZ6fnqF3hV2j8jq5A"
+  }
+]
