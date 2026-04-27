@@ -101,6 +101,10 @@ impl ProviderOperationWatchStore {
         self.inner.read().await.len()
     }
 
+    pub async fn is_empty(&self) -> bool {
+        self.inner.read().await.is_empty()
+    }
+
     pub async fn snapshot(&self) -> Vec<SharedProviderOperationWatchEntry> {
         self.inner.read().await.values().cloned().collect()
     }

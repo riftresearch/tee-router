@@ -854,7 +854,7 @@ mod tests {
         let token_a = address!("1111111111111111111111111111111111111111");
         let token_b = address!("2222222222222222222222222222222222222222");
         let recipient = address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        let all_watches = vec![
+        let all_watches = [
             watch_entry(TokenIdentifier::address(token_a.to_string()), recipient),
             watch_entry(TokenIdentifier::address(token_b.to_string()), recipient),
         ];

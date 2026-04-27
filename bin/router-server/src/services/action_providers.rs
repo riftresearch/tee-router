@@ -35,6 +35,7 @@ use hyperunit_client::{
     HyperUnitClient, UnitAsset, UnitChain, UnitGenerateAddressRequest, UnitOperation,
     UnitOperationState, UnitOperationsRequest,
 };
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -105,6 +106,32 @@ pub struct BridgeQuote {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "request", rename_all = "snake_case")]
+pub enum BridgeExecutionRequest {
+    Across(AcrossExecuteStepRequest),
+    HyperliquidBridgeDeposit(HyperliquidBridgeDepositStepRequest),
+}
+
+impl BridgeExecutionRequest {
+    pub fn across_from_value(value: &Value) -> ProviderResult<Self> {
+        decode_step_request(value, "across step request").map(Self::Across)
+    }
+
+    pub fn hyperliquid_bridge_deposit_from_value(value: &Value) -> ProviderResult<Self> {
+        decode_step_request(value, "hyperliquid bridge step request")
+            .map(Self::HyperliquidBridgeDeposit)
+    }
+
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Across(_) => "across",
+            Self::HyperliquidBridgeDeposit(_) => "hyperliquid_bridge_deposit",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExchangeQuoteRequest {
     pub input_asset: DepositAsset,
     pub output_asset: DepositAsset,
@@ -128,6 +155,39 @@ pub struct ExchangeQuote {
     pub max_amount_in: Option<String>,
     pub provider_quote: Value,
     pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "request", rename_all = "snake_case")]
+pub enum ExchangeExecutionRequest {
+    HyperliquidTrade(HyperliquidTradeStepRequest),
+    UniversalRouterSwap(UniversalRouterSwapStepRequest),
+}
+
+impl ExchangeExecutionRequest {
+    pub fn hyperliquid_trade_from_value(value: &Value) -> ProviderResult<Self> {
+        decode_step_request(value, "hyperliquid trade step request").map(Self::HyperliquidTrade)
+    }
+
+    pub fn universal_router_swap_from_value(value: &Value) -> ProviderResult<Self> {
+        decode_step_request(value, "universal router swap step request")
+            .map(Self::UniversalRouterSwap)
+    }
+
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::HyperliquidTrade(_) => "hyperliquid_trade",
+            Self::UniversalRouterSwap(_) => "universal_router_swap",
+        }
+    }
+}
+
+fn decode_step_request<T>(value: &Value, label: &str) -> ProviderResult<T>
+where
+    T: DeserializeOwned,
+{
+    serde_json::from_value(value.clone()).map_err(|err| format!("invalid {label}: {err}"))
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -247,7 +307,7 @@ pub trait BridgeProvider: Send + Sync {
 
     fn execute_bridge<'a>(
         &'a self,
-        request: &'a Value,
+        request: &'a BridgeExecutionRequest,
     ) -> ProviderFuture<'a, ProviderExecutionIntent>;
 
     /// Called by the executor after a `CustodyActions` intent has finished
@@ -279,12 +339,12 @@ pub trait UnitProvider: Send + Sync {
 
     fn execute_deposit<'a>(
         &'a self,
-        request: &'a Value,
+        request: &'a UnitDepositStepRequest,
     ) -> ProviderFuture<'a, ProviderExecutionIntent>;
 
     fn execute_withdrawal<'a>(
         &'a self,
-        request: &'a Value,
+        request: &'a UnitWithdrawalStepRequest,
     ) -> ProviderFuture<'a, ProviderExecutionIntent>;
 
     /// Called after a `CustodyActions` intent finishes. For HyperUnit this is
@@ -322,7 +382,7 @@ pub trait ExchangeProvider: Send + Sync {
 
     fn execute_trade<'a>(
         &'a self,
-        request: &'a Value,
+        request: &'a ExchangeExecutionRequest,
     ) -> ProviderFuture<'a, ProviderExecutionIntent>;
 
     /// Called after a `CustodyActions` intent finishes. Exchanges like HL
@@ -673,11 +733,15 @@ impl BridgeProvider for AcrossProvider {
 
     fn execute_bridge<'a>(
         &'a self,
-        request: &'a Value,
+        request: &'a BridgeExecutionRequest,
     ) -> ProviderFuture<'a, ProviderExecutionIntent> {
         Box::pin(async move {
-            let step: AcrossExecuteStepRequest = serde_json::from_value(request.clone())
-                .map_err(|err| format!("invalid across step request: {err}"))?;
+            let BridgeExecutionRequest::Across(step) = request else {
+                return Err(format!(
+                    "across cannot execute bridge request kind {}",
+                    request.kind()
+                ));
+            };
 
             let origin_chain = ChainId::parse(&step.origin_chain_id)
                 .map_err(|err| format!("invalid origin_chain_id: {err}"))?;
@@ -852,8 +916,7 @@ impl BridgeProvider for AcrossProvider {
                         provider_ref: Some(deposit_id_str.to_string()),
                         observed_state: json!({
                             "status": "not_found",
-                            "body": serde_json::from_str::<Value>(&body)
-                                .unwrap_or_else(|_| Value::String(body)),
+                            "body": serde_json::from_str::<Value>(&body).unwrap_or(Value::String(body)),
                         }),
                         response: None,
                         tx_hash: None,
@@ -882,7 +945,7 @@ impl BridgeProvider for AcrossProvider {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AcrossExecuteStepRequest {
     pub origin_chain_id: String,
     pub destination_chain_id: String,
@@ -1093,12 +1156,9 @@ impl UnitProvider for HyperUnitProvider {
 
     fn execute_deposit<'a>(
         &'a self,
-        request: &'a Value,
+        step: &'a UnitDepositStepRequest,
     ) -> ProviderFuture<'a, ProviderExecutionIntent> {
         Box::pin(async move {
-            let step: UnitDepositStepRequest = serde_json::from_value(request.clone())
-                .map_err(|err| format!("invalid unit deposit step: {err}"))?;
-
             let src_chain_id = ChainId::parse(&step.src_chain_id)
                 .map_err(|err| format!("invalid src_chain_id: {err}"))?;
             let source_asset_id =
@@ -1187,12 +1247,9 @@ impl UnitProvider for HyperUnitProvider {
 
     fn execute_withdrawal<'a>(
         &'a self,
-        request: &'a Value,
+        step: &'a UnitWithdrawalStepRequest,
     ) -> ProviderFuture<'a, ProviderExecutionIntent> {
         Box::pin(async move {
-            let step: UnitWithdrawalStepRequest = serde_json::from_value(request.clone())
-                .map_err(|err| format!("invalid unit withdrawal step: {err}"))?;
-
             let dst_chain_id = ChainId::parse(&step.dst_chain_id)
                 .map_err(|err| format!("invalid dst_chain_id: {err}"))?;
             let dest_asset_id =
@@ -1570,11 +1627,15 @@ impl BridgeProvider for HyperliquidBridgeProvider {
 
     fn execute_bridge<'a>(
         &'a self,
-        request: &'a Value,
+        request: &'a BridgeExecutionRequest,
     ) -> ProviderFuture<'a, ProviderExecutionIntent> {
         Box::pin(async move {
-            let step: HyperliquidBridgeDepositStepRequest = serde_json::from_value(request.clone())
-                .map_err(|err| format!("invalid hyperliquid bridge step request: {err}"))?;
+            let BridgeExecutionRequest::HyperliquidBridgeDeposit(step) = request else {
+                return Err(format!(
+                    "hyperliquid bridge cannot execute bridge request kind {}",
+                    request.kind()
+                ));
+            };
             let source_chain = ChainId::parse(&step.source_chain_id)
                 .map_err(|err| format!("invalid source_chain_id: {err}"))?;
             let input_asset_id = AssetId::parse(&step.input_asset)
@@ -1597,7 +1658,7 @@ impl BridgeProvider for HyperliquidBridgeProvider {
             let source_custody_vault_id = step.source_custody_vault_id.ok_or_else(|| {
                 "hyperliquid bridge: source_custody_vault_id must be hydrated".to_string()
             })?;
-            let hyperliquid_user = step.source_custody_vault_address.ok_or_else(|| {
+            let hyperliquid_user = step.source_custody_vault_address.clone().ok_or_else(|| {
                 "hyperliquid bridge: source_custody_vault_address must be hydrated".to_string()
             })?;
             let before_state = self.clearinghouse_state(&hyperliquid_user).await?;
@@ -1718,46 +1779,55 @@ impl BridgeProvider for HyperliquidBridgeProvider {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct UnitDepositStepRequest {
-    #[allow(dead_code)]
-    order_id: Uuid,
-    src_chain_id: String,
-    dst_chain_id: String,
-    asset_id: String,
-    amount: String,
-    source_custody_vault_id: Option<Uuid>,
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct UnitDepositStepRequest {
+    pub order_id: Uuid,
+    pub src_chain_id: String,
+    pub dst_chain_id: String,
+    pub asset_id: String,
+    pub amount: String,
+    pub source_custody_vault_id: Option<Uuid>,
     #[serde(default)]
-    hyperliquid_custody_vault_address: Option<String>,
+    pub hyperliquid_custody_vault_address: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct UnitWithdrawalStepRequest {
-    #[allow(dead_code)]
-    order_id: Uuid,
-    dst_chain_id: String,
-    asset_id: String,
-    amount: String,
-    #[serde(default)]
-    min_amount_out: Option<String>,
-    recipient_address: String,
-    #[serde(default)]
-    hyperliquid_custody_vault_id: Option<Uuid>,
-    #[serde(default)]
-    hyperliquid_custody_vault_address: Option<String>,
+impl UnitDepositStepRequest {
+    pub fn from_value(value: &Value) -> ProviderResult<Self> {
+        decode_step_request(value, "unit deposit step request")
+    }
 }
 
-#[derive(Debug, Deserialize)]
-struct HyperliquidBridgeDepositStepRequest {
-    #[allow(dead_code)]
-    order_id: Uuid,
-    source_chain_id: String,
-    input_asset: String,
-    amount: String,
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct UnitWithdrawalStepRequest {
+    pub order_id: Uuid,
+    pub dst_chain_id: String,
+    pub asset_id: String,
+    pub amount: String,
     #[serde(default)]
-    source_custody_vault_id: Option<Uuid>,
+    pub min_amount_out: Option<String>,
+    pub recipient_address: String,
     #[serde(default)]
-    source_custody_vault_address: Option<String>,
+    pub hyperliquid_custody_vault_id: Option<Uuid>,
+    #[serde(default)]
+    pub hyperliquid_custody_vault_address: Option<String>,
+}
+
+impl UnitWithdrawalStepRequest {
+    pub fn from_value(value: &Value) -> ProviderResult<Self> {
+        decode_step_request(value, "unit withdrawal step request")
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HyperliquidBridgeDepositStepRequest {
+    pub order_id: Uuid,
+    pub source_chain_id: String,
+    pub input_asset: String,
+    pub amount: String,
+    #[serde(default)]
+    pub source_custody_vault_id: Option<Uuid>,
+    #[serde(default)]
+    pub source_custody_vault_address: Option<String>,
 }
 
 /// Convert a base-unit amount string (satoshis / wei / …) into the decimal
@@ -2448,11 +2518,15 @@ impl ExchangeProvider for VeloraProvider {
 
     fn execute_trade<'a>(
         &'a self,
-        request: &'a Value,
+        request: &'a ExchangeExecutionRequest,
     ) -> ProviderFuture<'a, ProviderExecutionIntent> {
         Box::pin(async move {
-            let step: UniversalRouterSwapStepRequest = serde_json::from_value(request.clone())
-                .map_err(|err| format!("invalid velora universal-router step request: {err}"))?;
+            let ExchangeExecutionRequest::UniversalRouterSwap(step) = request else {
+                return Err(format!(
+                    "velora cannot execute exchange request kind {}",
+                    request.kind()
+                ));
+            };
             let input_asset = step.input_asset.deposit_asset()?;
             let output_asset = step.output_asset.deposit_asset()?;
             if input_asset.chain != output_asset.chain {
@@ -2475,7 +2549,7 @@ impl ExchangeProvider for VeloraProvider {
                 other => return Err(format!("unsupported velora order_kind {other:?}")),
             };
             let transaction = self
-                .build_transaction(&step, &src_token, &dest_token, network, side)
+                .build_transaction(step, &src_token, &dest_token, network, side)
                 .await?;
             let swap_to = velora_response_string(&transaction, "to")?;
             let swap_data = velora_response_string(&transaction, "data")?;
@@ -2514,7 +2588,10 @@ impl ExchangeProvider for VeloraProvider {
                         operation_type: ProviderOperationType::UniversalRouterSwap,
                         status: ProviderOperationStatus::Submitted,
                         provider_ref: None,
-                        request: Some(request.clone()),
+                        request: Some(
+                            serde_json::to_value(step)
+                                .map_err(|err| format!("serialize velora step request: {err}"))?,
+                        ),
                         response: Some(transaction),
                         observed_state: Some(json!({
                             "kind": "velora_universal_router_swap",
@@ -2624,11 +2701,15 @@ impl ExchangeProvider for HyperliquidProvider {
 
     fn execute_trade<'a>(
         &'a self,
-        request: &'a Value,
+        request: &'a ExchangeExecutionRequest,
     ) -> ProviderFuture<'a, ProviderExecutionIntent> {
         Box::pin(async move {
-            let step: HyperliquidTradeStepRequest = serde_json::from_value(request.clone())
-                .map_err(|err| format!("invalid hyperliquid step request: {err}"))?;
+            let ExchangeExecutionRequest::HyperliquidTrade(step) = request else {
+                return Err(format!(
+                    "hyperliquid cannot execute exchange request kind {}",
+                    request.kind()
+                ));
+            };
 
             let input_asset = DepositAsset {
                 chain: ChainId::parse(&step.input_asset.chain_id)
@@ -2712,17 +2793,17 @@ impl ExchangeProvider for HyperliquidProvider {
                 output_decimals,
                 base_meta.sz_decimals,
             )?;
-            let limit_px = compute_limit_px(
+            let limit_px = compute_limit_px(LimitPxInput {
                 is_buy,
-                &step.order_kind,
-                &step.amount_in,
+                order_kind: &step.order_kind,
+                amount_in_wire: &step.amount_in,
                 input_decimals,
-                &step.amount_out,
+                amount_out_wire: &step.amount_out,
                 output_decimals,
-                step.min_amount_out.as_deref(),
-                step.max_amount_in.as_deref(),
-                base_meta.sz_decimals,
-            )?;
+                min_amount_out_wire: step.min_amount_out.as_deref(),
+                max_amount_in_wire: step.max_amount_in.as_deref(),
+                base_sz_decimals: base_meta.sz_decimals,
+            })?;
 
             let order = OrderRequest {
                 asset: wire_asset,
@@ -2954,33 +3035,31 @@ impl ExchangeProvider for HyperliquidProvider {
 /// Slippage fields (`min_amount_out` / `max_amount_in`) are required on the
 /// cross-token path — they bound the Hyperliquid limit price. The hydrator (in
 /// `order_executor`) fills `hyperliquid_custody_vault_{id,address}` by role.
-#[derive(Debug, Deserialize, Serialize)]
-struct HyperliquidTradeStepRequest {
-    #[allow(dead_code)]
-    order_id: Uuid,
-    #[allow(dead_code)]
-    quote_id: Uuid,
-    order_kind: String,
-    amount_in: String,
-    amount_out: String,
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HyperliquidTradeStepRequest {
+    pub order_id: Uuid,
+    pub quote_id: Uuid,
+    pub order_kind: String,
+    pub amount_in: String,
+    pub amount_out: String,
     #[serde(default)]
-    min_amount_out: Option<String>,
+    pub min_amount_out: Option<String>,
     #[serde(default)]
-    max_amount_in: Option<String>,
-    input_asset: HyperliquidTradeAssetRef,
-    output_asset: HyperliquidTradeAssetRef,
+    pub max_amount_in: Option<String>,
+    pub input_asset: HyperliquidTradeAssetRef,
+    pub output_asset: HyperliquidTradeAssetRef,
     #[serde(default)]
-    prefund_from_withdrawable: bool,
+    pub prefund_from_withdrawable: bool,
     #[serde(default)]
-    hyperliquid_custody_vault_id: Option<Uuid>,
+    pub hyperliquid_custody_vault_id: Option<Uuid>,
     #[serde(default)]
-    hyperliquid_custody_vault_address: Option<String>,
+    pub hyperliquid_custody_vault_address: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-struct HyperliquidTradeAssetRef {
-    chain_id: String,
-    asset: String,
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HyperliquidTradeAssetRef {
+    pub chain_id: String,
+    pub asset: String,
 }
 
 /// Step-request schema produced by `market_order_planner::universal_router_swap_step`.
@@ -2988,42 +3067,40 @@ struct HyperliquidTradeAssetRef {
 /// transaction-build request can send it back exactly, as required by Velora's
 /// `/transactions/:network` endpoint.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-struct UniversalRouterSwapStepRequest {
-    #[allow(dead_code)]
-    order_id: Uuid,
-    #[allow(dead_code)]
-    quote_id: Uuid,
-    order_kind: String,
-    amount_in: String,
-    amount_out: String,
+pub struct UniversalRouterSwapStepRequest {
+    pub order_id: Uuid,
+    pub quote_id: Uuid,
+    pub order_kind: String,
+    pub amount_in: String,
+    pub amount_out: String,
     #[serde(default)]
-    min_amount_out: Option<String>,
+    pub min_amount_out: Option<String>,
     #[serde(default)]
-    max_amount_in: Option<String>,
-    input_asset: UniversalRouterAssetRef,
-    output_asset: UniversalRouterAssetRef,
-    input_decimals: u8,
-    output_decimals: u8,
-    price_route: Value,
+    pub max_amount_in: Option<String>,
+    pub input_asset: UniversalRouterAssetRef,
+    pub output_asset: UniversalRouterAssetRef,
+    pub input_decimals: u8,
+    pub output_decimals: u8,
+    pub price_route: Value,
     #[serde(default)]
-    slippage_bps: Option<u64>,
-    source_custody_vault_id: Option<Uuid>,
+    pub slippage_bps: Option<u64>,
+    pub source_custody_vault_id: Option<Uuid>,
     #[serde(default)]
-    source_custody_vault_address: Option<String>,
+    pub source_custody_vault_address: Option<String>,
     #[serde(default)]
-    recipient_address: String,
+    pub recipient_address: String,
     #[serde(default)]
-    recipient_custody_vault_id: Option<Uuid>,
+    pub recipient_custody_vault_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-struct UniversalRouterAssetRef {
-    chain_id: String,
-    asset: String,
+pub struct UniversalRouterAssetRef {
+    pub chain_id: String,
+    pub asset: String,
 }
 
 impl UniversalRouterAssetRef {
-    fn deposit_asset(&self) -> ProviderResult<DepositAsset> {
+    pub fn deposit_asset(&self) -> ProviderResult<DepositAsset> {
         Ok(DepositAsset {
             chain: ChainId::parse(&self.chain_id)
                 .map_err(|err| format!("invalid universal router asset chain: {err}"))?,
@@ -3088,9 +3165,7 @@ fn velora_asset_decimals(asset: &DepositAsset, hinted: Option<u8>) -> Option<u8>
 }
 
 fn velora_token_address(asset: &DepositAsset) -> Option<String> {
-    if asset.chain.evm_chain_id().is_none() {
-        return None;
-    }
+    asset.chain.evm_chain_id()?;
     match &asset.asset {
         AssetId::Native => Some(VELORA_NATIVE_TOKEN.to_string()),
         AssetId::Reference(address) => Address::from_str(address)
@@ -3504,20 +3579,33 @@ fn compute_base_sz(
         .map(|val| format_decimal_string(val, usize::from(base_sz_decimals)))
 }
 
+struct LimitPxInput<'a> {
+    is_buy: bool,
+    order_kind: &'a str,
+    amount_in_wire: &'a str,
+    input_decimals: u8,
+    amount_out_wire: &'a str,
+    output_decimals: u8,
+    min_amount_out_wire: Option<&'a str>,
+    max_amount_in_wire: Option<&'a str>,
+    base_sz_decimals: u8,
+}
+
 /// Derive the Hyperliquid `limit_px` that bounds slippage. `limit_px` is expressed as
 /// USDC-per-base in natural units; HL spot caps it at 5 significant figures
 /// **and** `max(0, HL_SPOT_MAX_DECIMALS - base_sz_decimals)` decimal places.
-fn compute_limit_px(
-    is_buy: bool,
-    order_kind: &str,
-    amount_in_wire: &str,
-    input_decimals: u8,
-    amount_out_wire: &str,
-    output_decimals: u8,
-    min_amount_out_wire: Option<&str>,
-    max_amount_in_wire: Option<&str>,
-    base_sz_decimals: u8,
-) -> ProviderResult<String> {
+fn compute_limit_px(input: LimitPxInput<'_>) -> ProviderResult<String> {
+    let LimitPxInput {
+        is_buy,
+        order_kind,
+        amount_in_wire,
+        input_decimals,
+        amount_out_wire,
+        output_decimals,
+        min_amount_out_wire,
+        max_amount_in_wire,
+        base_sz_decimals,
+    } = input;
     // Identify (usdc_side, base_side) wire amounts for the rate computation.
     // Rate is always USDC-per-base. Use the slippage bound on whichever side
     // the user pinned so the submitted limit order never violates tolerance.
@@ -3720,7 +3808,7 @@ mod hyperliquid_math_tests {
         format_hl_spot_price, hl_leg_descriptor, observed_unit_operation_fingerprints,
         parse_decimal_to_raw_units_floor, seen_operation_fingerprints_from_request,
         unit_operation_provider_status, unit_withdrawal_minimum_raw, velora_slippage_bps,
-        wire_to_f64,
+        wire_to_f64, LimitPxInput,
     };
     use crate::{
         models::{MarketOrderKind, ProviderOperationStatus},
@@ -3886,17 +3974,17 @@ mod hyperliquid_math_tests {
     #[test]
     fn compute_limit_px_exact_in_sell_uses_min_amount_out() {
         // sell 1 UBTC for at least 50000 USDC → rate = 50000 → "50000"
-        let px = compute_limit_px(
-            false,
-            "exact_in",
-            "100000000",
-            8,
-            "5000000000000",
-            8,
-            Some("5000000000000"),
-            None,
-            5,
-        )
+        let px = compute_limit_px(LimitPxInput {
+            is_buy: false,
+            order_kind: "exact_in",
+            amount_in_wire: "100000000",
+            input_decimals: 8,
+            amount_out_wire: "5000000000000",
+            output_decimals: 8,
+            min_amount_out_wire: Some("5000000000000"),
+            max_amount_in_wire: None,
+            base_sz_decimals: 5,
+        })
         .unwrap();
         assert_eq!(px, "50000");
     }
@@ -3904,17 +3992,17 @@ mod hyperliquid_math_tests {
     #[test]
     fn compute_limit_px_exact_in_buy_uses_min_amount_out() {
         // buy with 100000 USDC, need at least 1.5 UBTC → rate = 66666.66... → floor to 5 sig figs → "66666"
-        let px = compute_limit_px(
-            true,
-            "exact_in",
-            "10000000000000",
-            8,
-            "150000000",
-            8,
-            Some("150000000"),
-            None,
-            5,
-        )
+        let px = compute_limit_px(LimitPxInput {
+            is_buy: true,
+            order_kind: "exact_in",
+            amount_in_wire: "10000000000000",
+            input_decimals: 8,
+            amount_out_wire: "150000000",
+            output_decimals: 8,
+            min_amount_out_wire: Some("150000000"),
+            max_amount_in_wire: None,
+            base_sz_decimals: 5,
+        })
         .unwrap();
         assert_eq!(px, "66666");
     }
@@ -3922,17 +4010,17 @@ mod hyperliquid_math_tests {
     #[test]
     fn compute_limit_px_exact_out_buy_uses_max_amount_in() {
         // buy 1 UBTC, willing to spend up to 70000 USDC → rate = 70000 → "70000"
-        let px = compute_limit_px(
-            true,
-            "exact_out",
-            "7000000000000",
-            8,
-            "100000000",
-            8,
-            None,
-            Some("7000000000000"),
-            5,
-        )
+        let px = compute_limit_px(LimitPxInput {
+            is_buy: true,
+            order_kind: "exact_out",
+            amount_in_wire: "7000000000000",
+            input_decimals: 8,
+            amount_out_wire: "100000000",
+            output_decimals: 8,
+            min_amount_out_wire: None,
+            max_amount_in_wire: Some("7000000000000"),
+            base_sz_decimals: 5,
+        })
         .unwrap();
         assert_eq!(px, "70000");
     }
@@ -3940,17 +4028,17 @@ mod hyperliquid_math_tests {
     #[test]
     fn compute_limit_px_exact_out_sell_uses_max_amount_in() {
         // sell up to 1.1 UBTC for 50000 USDC → rate = 45454.54... → ceil to 5 sig figs → "45455"
-        let px = compute_limit_px(
-            false,
-            "exact_out",
-            "110000000",
-            8,
-            "5000000000000",
-            8,
-            None,
-            Some("110000000"),
-            5,
-        )
+        let px = compute_limit_px(LimitPxInput {
+            is_buy: false,
+            order_kind: "exact_out",
+            amount_in_wire: "110000000",
+            input_decimals: 8,
+            amount_out_wire: "5000000000000",
+            output_decimals: 8,
+            min_amount_out_wire: None,
+            max_amount_in_wire: Some("110000000"),
+            base_sz_decimals: 5,
+        })
         .unwrap();
         assert_eq!(px, "45455");
     }

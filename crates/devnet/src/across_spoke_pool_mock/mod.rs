@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 alloy::sol! {
     #[derive(Debug)]
     #[sol(rpc)]

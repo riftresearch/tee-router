@@ -30,21 +30,24 @@ use router_server::{
     db::Database,
     models::{
         CustodyVault, CustodyVaultControlType, CustodyVaultRole, CustodyVaultStatus,
-        CustodyVaultVisibility, DepositVaultFundingHint, DepositVaultStatus, MarketOrderKind,
-        MarketOrderKindType, OrderExecutionAttempt, OrderExecutionAttemptKind,
-        OrderExecutionAttemptStatus, OrderExecutionStep, OrderExecutionStepStatus,
-        OrderExecutionStepType, OrderProviderAddress, OrderProviderOperation,
-        OrderProviderOperationHint, ProviderAddressRole, ProviderExecutionPolicyState,
-        ProviderOperationHintKind, ProviderOperationHintStatus, ProviderOperationStatus,
-        ProviderOperationType, ProviderQuotePolicyState, RouterOrderEnvelope,
-        RouterOrderQuoteEnvelope, RouterOrderStatus, VaultAction,
+        CustodyVaultVisibility, DepositVaultFundingHint, DepositVaultStatus, MarketOrderAction,
+        MarketOrderKind, MarketOrderKindType, MarketOrderQuote, OrderExecutionAttempt,
+        OrderExecutionAttemptKind, OrderExecutionAttemptStatus, OrderExecutionStep,
+        OrderExecutionStepStatus, OrderExecutionStepType, OrderProviderAddress,
+        OrderProviderOperation, OrderProviderOperationHint, ProviderAddressRole,
+        ProviderExecutionPolicyState, ProviderOperationHintKind, ProviderOperationHintStatus,
+        ProviderOperationStatus, ProviderOperationType, ProviderQuotePolicyState, RouterOrder,
+        RouterOrderAction, RouterOrderEnvelope, RouterOrderQuoteEnvelope, RouterOrderStatus,
+        RouterOrderType, VaultAction,
     },
     protocol::{AssetId, ChainId, DepositAsset},
     server::{build_api_router, AdminApiAuth, AppState, InternalApiAuth},
     services::{
         action_providers::{
-            BridgeProvider, BridgeQuote, BridgeQuoteRequest, ExchangeProvider, ExchangeQuote,
-            ExchangeQuoteRequest, ProviderFuture, UnitProvider, VeloraProvider,
+            BridgeExecutionRequest, BridgeProvider, BridgeQuote, BridgeQuoteRequest,
+            ExchangeExecutionRequest, ExchangeProvider, ExchangeQuote, ExchangeQuoteRequest,
+            ProviderFuture, UnitDepositStepRequest, UnitProvider, UnitWithdrawalStepRequest,
+            VeloraProvider,
         },
         deposit_address::derive_deposit_address_for_quote,
         market_order_planner::MarketOrderRoutePlanner,
@@ -795,22 +798,13 @@ impl UnitProvider for CustodyIntentUnitProvider {
 
     fn execute_deposit<'a>(
         &'a self,
-        request: &'a Value,
+        request: &'a UnitDepositStepRequest,
     ) -> ProviderFuture<'a, ProviderExecutionIntent> {
         Box::pin(async move {
-            let custody_vault_id = request
-                .get("source_custody_vault_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    "unit deposit request is missing source_custody_vault_id".to_string()
-                })?
-                .parse::<Uuid>()
-                .map_err(|err| format!("invalid source_custody_vault_id: {err}"))?;
-            let amount = request
-                .get("amount")
-                .and_then(Value::as_str)
-                .ok_or_else(|| "unit deposit request is missing amount".to_string())?
-                .to_string();
+            let custody_vault_id = request.source_custody_vault_id.ok_or_else(|| {
+                "unit deposit request is missing source_custody_vault_id".to_string()
+            })?;
+            let amount = request.amount.clone();
 
             Ok(ProviderExecutionIntent::CustodyAction {
                 custody_vault_id,
@@ -829,7 +823,7 @@ impl UnitProvider for CustodyIntentUnitProvider {
 
     fn execute_withdrawal<'a>(
         &'a self,
-        request: &'a Value,
+        request: &'a UnitWithdrawalStepRequest,
     ) -> ProviderFuture<'a, ProviderExecutionIntent> {
         Box::pin(async move {
             Ok(ProviderExecutionIntent::ProviderOnly {
@@ -899,13 +893,10 @@ impl UnitProvider for ObservationUnitProvider {
 
     fn execute_deposit<'a>(
         &'a self,
-        request: &'a Value,
+        request: &'a UnitDepositStepRequest,
     ) -> ProviderFuture<'a, ProviderExecutionIntent> {
         Box::pin(async move {
-            let order_id = request
-                .get("order_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| "unit deposit request is missing order_id".to_string())?;
+            let order_id = request.order_id;
             let provider_ref = format!("unit-observation-{order_id}");
             let deposit_address = "0x2000000000000000000000000000000000000001".to_string();
             let response = json!({
@@ -943,7 +934,7 @@ impl UnitProvider for ObservationUnitProvider {
 
     fn execute_withdrawal<'a>(
         &'a self,
-        request: &'a Value,
+        request: &'a UnitWithdrawalStepRequest,
     ) -> ProviderFuture<'a, ProviderExecutionIntent> {
         Box::pin(async move {
             Ok(ProviderExecutionIntent::ProviderOnly {
@@ -1026,7 +1017,7 @@ impl BridgeProvider for FailingRefundBridgeProvider {
 
     fn execute_bridge<'a>(
         &'a self,
-        _request: &'a Value,
+        _request: &'a BridgeExecutionRequest,
     ) -> ProviderFuture<'a, ProviderExecutionIntent> {
         Box::pin(async move { Err("mock refund route unavailable".to_string()) })
     }
@@ -1072,7 +1063,7 @@ impl ExchangeProvider for ProviderOnlyExchangeProvider {
 
     fn execute_trade<'a>(
         &'a self,
-        request: &'a Value,
+        request: &'a ExchangeExecutionRequest,
     ) -> ProviderFuture<'a, ProviderExecutionIntent> {
         Box::pin(async move {
             Ok(ProviderExecutionIntent::ProviderOnly {
@@ -1125,7 +1116,7 @@ impl BridgeProvider for FailingBridgeProvider {
 
     fn execute_bridge<'a>(
         &'a self,
-        _request: &'a Value,
+        _request: &'a BridgeExecutionRequest,
     ) -> ProviderFuture<'a, ProviderExecutionIntent> {
         Box::pin(async move { Err("bridge execution failed intentionally".to_string()) })
     }
@@ -2296,6 +2287,7 @@ async fn mock_velora_transaction_mints_output_token_on_local_evm() {
         .erc20_balance(MOCK_ERC20_ADDRESS, &format!("{source_address:#x}"))
         .await
         .unwrap();
+    let request = ExchangeExecutionRequest::universal_router_swap_from_value(&request).unwrap();
     let execution = velora.execute_trade(&request).await.unwrap();
     let actions = match execution {
         ProviderExecutionIntent::CustodyActions { actions, .. } => actions,
@@ -4340,6 +4332,127 @@ async fn release_quote_after_vault_creation_failure_allows_order_retry() {
         .unwrap();
     assert_eq!(retry_quote.order_id, Some(retry_order.id));
     assert_ne!(retry_order.id, order.id);
+}
+
+#[tokio::test]
+async fn expired_quote_cleanup_deletes_only_unassociated_quotes() {
+    let db = test_db().await;
+    let now = Utc::now();
+    let source_asset = DepositAsset {
+        chain: ChainId::parse("evm:1").unwrap(),
+        asset: AssetId::Native,
+    };
+    let destination_asset = DepositAsset {
+        chain: ChainId::parse("evm:8453").unwrap(),
+        asset: AssetId::Native,
+    };
+
+    let expired_unassociated = test_market_order_quote(
+        source_asset.clone(),
+        destination_asset.clone(),
+        now - chrono::Duration::minutes(5),
+    );
+    let expired_associated = test_market_order_quote(
+        source_asset.clone(),
+        destination_asset.clone(),
+        now - chrono::Duration::minutes(5),
+    );
+    let unexpired_unassociated = test_market_order_quote(
+        source_asset.clone(),
+        destination_asset.clone(),
+        now + chrono::Duration::minutes(5),
+    );
+
+    db.orders()
+        .create_market_order_quote(&expired_unassociated)
+        .await
+        .unwrap();
+    db.orders()
+        .create_market_order_quote(&expired_associated)
+        .await
+        .unwrap();
+    db.orders()
+        .create_market_order_quote(&unexpired_unassociated)
+        .await
+        .unwrap();
+
+    let order = RouterOrder {
+        id: Uuid::now_v7(),
+        order_type: RouterOrderType::MarketOrder,
+        status: RouterOrderStatus::Quoted,
+        funding_vault_id: None,
+        source_asset: source_asset.clone(),
+        destination_asset: destination_asset.clone(),
+        recipient_address: valid_evm_address(),
+        refund_address: valid_evm_address(),
+        action: RouterOrderAction::MarketOrder(MarketOrderAction {
+            order_kind: MarketOrderKind::ExactIn {
+                amount_in: "1000".to_string(),
+                min_amount_out: "1000".to_string(),
+            },
+        }),
+        action_timeout_at: now + chrono::Duration::minutes(10),
+        idempotency_key: None,
+        created_at: now,
+        updated_at: now,
+    };
+    db.orders()
+        .create_market_order_from_quote(&order, expired_associated.id)
+        .await
+        .unwrap();
+
+    let deleted = db
+        .orders()
+        .delete_expired_unassociated_market_order_quotes(now)
+        .await
+        .unwrap();
+    assert_eq!(deleted, 1);
+
+    assert!(db
+        .orders()
+        .get_market_order_quote_by_id(expired_unassociated.id)
+        .await
+        .is_err());
+    assert_eq!(
+        db.orders()
+            .get_market_order_quote_by_id(expired_associated.id)
+            .await
+            .unwrap()
+            .order_id,
+        Some(order.id)
+    );
+    assert_eq!(
+        db.orders()
+            .get_market_order_quote_by_id(unexpired_unassociated.id)
+            .await
+            .unwrap()
+            .order_id,
+        None
+    );
+    assert_eq!(db.orders().get(order.id).await.unwrap().id, order.id);
+}
+
+fn test_market_order_quote(
+    source_asset: DepositAsset,
+    destination_asset: DepositAsset,
+    expires_at: chrono::DateTime<Utc>,
+) -> MarketOrderQuote {
+    MarketOrderQuote {
+        id: Uuid::now_v7(),
+        order_id: None,
+        source_asset,
+        destination_asset,
+        recipient_address: valid_evm_address(),
+        provider_id: "test_provider".to_string(),
+        order_kind: MarketOrderKindType::ExactIn,
+        amount_in: "1000".to_string(),
+        amount_out: "1000".to_string(),
+        min_amount_out: Some("1000".to_string()),
+        max_amount_in: None,
+        provider_quote: json!({ "test": "quote_cleanup" }),
+        expires_at,
+        created_at: Utc::now(),
+    }
 }
 
 #[tokio::test]

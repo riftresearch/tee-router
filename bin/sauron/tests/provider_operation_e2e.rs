@@ -317,19 +317,30 @@ fn require_live_spend_confirmation() {
     );
 }
 
-async fn write_live_recovery_snapshot(
-    label: &str,
+struct LiveRecoverySnapshotSpec<'a> {
+    label: &'a str,
     route: RuntimeRoute,
-    live: &LiveRuntimeConfig,
-    database_url: &str,
-    config_dir: &Path,
-    db: &Database,
-    chain_registry: &ChainRegistry,
+    live: &'a LiveRuntimeConfig,
+    database_url: &'a str,
+    config_dir: &'a Path,
+    db: &'a Database,
+    chain_registry: &'a ChainRegistry,
     order_id: Option<Uuid>,
     quote_id: Option<Uuid>,
     extra: Value,
-) {
-    match try_write_live_recovery_snapshot(
+}
+
+async fn write_live_recovery_snapshot(spec: LiveRecoverySnapshotSpec<'_>) {
+    match try_write_live_recovery_snapshot(spec).await {
+        Ok(path) => eprintln!("live recovery snapshot written to {}", path.display()),
+        Err(error) => eprintln!("failed to write live recovery snapshot: {error}"),
+    }
+}
+
+async fn try_write_live_recovery_snapshot(
+    spec: LiveRecoverySnapshotSpec<'_>,
+) -> Result<PathBuf, Box<dyn Error + Send + Sync>> {
+    let LiveRecoverySnapshotSpec {
         label,
         route,
         live,
@@ -340,26 +351,7 @@ async fn write_live_recovery_snapshot(
         order_id,
         quote_id,
         extra,
-    )
-    .await
-    {
-        Ok(path) => eprintln!("live recovery snapshot written to {}", path.display()),
-        Err(error) => eprintln!("failed to write live recovery snapshot: {error}"),
-    }
-}
-
-async fn try_write_live_recovery_snapshot(
-    label: &str,
-    route: RuntimeRoute,
-    live: &LiveRuntimeConfig,
-    database_url: &str,
-    config_dir: &Path,
-    db: &Database,
-    chain_registry: &ChainRegistry,
-    order_id: Option<Uuid>,
-    quote_id: Option<Uuid>,
-    extra: Value,
-) -> Result<PathBuf, Box<dyn Error + Send + Sync>> {
+    } = spec;
     let master_key_hex = read_router_master_key_hex(config_dir);
     let master_key_bytes = master_key_hex
         .as_deref()
@@ -2207,22 +2199,22 @@ async fn run_live_runtime_route(route: RuntimeRoute) {
     .await;
     let market_quote = quote.quote.as_market_order().expect("market order quote");
     assert_route_provider_id(route, &market_quote.provider_id);
-    write_live_recovery_snapshot(
-        "after_quote",
+    write_live_recovery_snapshot(LiveRecoverySnapshotSpec {
+        label: "after_quote",
         route,
-        &live,
-        &database_url,
-        config_dir.path(),
-        &db,
-        chain_registry.as_ref(),
-        None,
-        Some(market_quote.id),
-        json!({
+        live: &live,
+        database_url: &database_url,
+        config_dir: config_dir.path(),
+        db: &db,
+        chain_registry: chain_registry.as_ref(),
+        order_id: None,
+        quote_id: Some(market_quote.id),
+        extra: json!({
             "amount_in": amount_in,
             "source_address": format!("{:#x}", source_address),
             "router_base_url": &router_base_url,
         }),
-    )
+    })
     .await;
 
     let order = submit_order_request(&client, &router_base_url, market_quote.id, route).await;
@@ -2243,64 +2235,64 @@ async fn run_live_runtime_route(route: RuntimeRoute) {
 
     let funding_vault_address = Address::from_str(&funding_vault.deposit_vault_address)
         .expect("funding vault should be an EVM address");
-    write_live_recovery_snapshot(
-        "before_live_funding",
+    write_live_recovery_snapshot(LiveRecoverySnapshotSpec {
+        label: "before_live_funding",
         route,
-        &live,
-        &database_url,
-        config_dir.path(),
-        &db,
-        chain_registry.as_ref(),
-        Some(order.order.id),
-        Some(market_quote.id),
-        json!({
+        live: &live,
+        database_url: &database_url,
+        config_dir: config_dir.path(),
+        db: &db,
+        chain_registry: chain_registry.as_ref(),
+        order_id: Some(order.order.id),
+        quote_id: Some(market_quote.id),
+        extra: json!({
             "amount_in": live_route_amount_in(route),
             "source_address": format!("{:#x}", source_address),
             "funding_vault_address": &funding_vault.deposit_vault_address,
             "router_base_url": &router_base_url,
         }),
-    )
+    })
     .await;
     let funding_tx_hash = fund_live_source_vault(&live, route, funding_vault_address).await;
     eprintln!(
         "live runtime funded source vault {} from {} via tx {}",
         funding_vault.deposit_vault_address, source_address, funding_tx_hash
     );
-    write_live_recovery_snapshot(
-        "after_live_funding",
+    write_live_recovery_snapshot(LiveRecoverySnapshotSpec {
+        label: "after_live_funding",
         route,
-        &live,
-        &database_url,
-        config_dir.path(),
-        &db,
-        chain_registry.as_ref(),
-        Some(order.order.id),
-        Some(market_quote.id),
-        json!({
+        live: &live,
+        database_url: &database_url,
+        config_dir: config_dir.path(),
+        db: &db,
+        chain_registry: chain_registry.as_ref(),
+        order_id: Some(order.order.id),
+        quote_id: Some(market_quote.id),
+        extra: json!({
             "funding_tx_hash": &funding_tx_hash,
             "source_address": format!("{:#x}", source_address),
             "funding_vault_address": &funding_vault.deposit_vault_address,
         }),
-    )
+    })
     .await;
 
     let final_status =
         wait_for_terminal_order_status(&db, order.order.id, LIVE_TERMINAL_TIMEOUT).await;
-    write_live_recovery_snapshot(
-        "terminal_order_status",
+    write_live_recovery_snapshot(LiveRecoverySnapshotSpec {
+        label: "terminal_order_status",
         route,
-        &live,
-        &database_url,
-        config_dir.path(),
-        &db,
-        chain_registry.as_ref(),
-        Some(order.order.id),
-        Some(market_quote.id),
-        json!({
+        live: &live,
+        database_url: &database_url,
+        config_dir: config_dir.path(),
+        db: &db,
+        chain_registry: chain_registry.as_ref(),
+        order_id: Some(order.order.id),
+        quote_id: Some(market_quote.id),
+        extra: json!({
             "final_status": final_status,
             "funding_tx_hash": &funding_tx_hash,
         }),
-    )
+    })
     .await;
     if final_status != RouterOrderStatus::Completed {
         dump_order_state(&db, order.order.id).await;

@@ -66,19 +66,45 @@ pub enum VaultError {
     FundingCheck { message: String },
 
     #[snafu(display("Failed to generate vault salt: {}", source))]
-    Random { source: getrandom::Error },
+    Random { source: Box<getrandom::Error> },
 
     #[snafu(display("Failed to derive wallet: {}", source))]
-    WalletDerivation { source: chains::Error },
+    WalletDerivation { source: Box<chains::Error> },
 
     #[snafu(display("Deposit address derivation failed: {}", source))]
-    DepositAddress { source: DepositAddressError },
+    DepositAddress { source: Box<DepositAddressError> },
 
     #[snafu(display("Database error: {}", source))]
-    Database { source: RouterServerError },
+    Database { source: Box<RouterServerError> },
 }
 
 pub type VaultResult<T> = Result<T, VaultError>;
+
+impl VaultError {
+    fn random(source: getrandom::Error) -> Self {
+        Self::Random {
+            source: Box::new(source),
+        }
+    }
+
+    fn wallet_derivation(source: chains::Error) -> Self {
+        Self::WalletDerivation {
+            source: Box::new(source),
+        }
+    }
+
+    fn deposit_address(source: DepositAddressError) -> Self {
+        Self::DepositAddress {
+            source: Box::new(source),
+        }
+    }
+
+    fn database(source: RouterServerError) -> Self {
+        Self::Database {
+            source: Box::new(source),
+        }
+    }
+}
 
 struct OrderBinding {
     action: VaultAction,
@@ -87,7 +113,7 @@ struct OrderBinding {
 
 #[derive(Debug, Clone)]
 enum FundingHintDisposition {
-    Funded { vault: DepositVault },
+    Funded { vault: Box<DepositVault> },
     Ignored { reason: String },
 }
 
@@ -172,7 +198,7 @@ impl VaultManager {
                     binding.quote_id,
                     &deposit_asset.chain,
                 )
-                .map_err(|source| VaultError::DepositAddress { source })?;
+                .map_err(VaultError::deposit_address)?;
                 (salt, address)
             }
             None => {
@@ -187,10 +213,10 @@ impl VaultManager {
                     },
                 )?;
                 let mut salt = [0u8; 32];
-                getrandom::getrandom(&mut salt).map_err(|source| VaultError::Random { source })?;
+                getrandom::getrandom(&mut salt).map_err(VaultError::random)?;
                 let wallet = chain
                     .derive_wallet(&self.settings.master_key_bytes(), &salt)
-                    .map_err(|source| VaultError::WalletDerivation { source })?;
+                    .map_err(VaultError::wallet_derivation)?;
                 (salt, wallet.address.clone())
             }
         };
@@ -229,7 +255,7 @@ impl VaultManager {
                 .vaults()
                 .create(&vault)
                 .await
-                .map_err(|source| VaultError::Database { source })?;
+                .map_err(VaultError::database)?;
         }
 
         telemetry::record_vault_created(&vault);
@@ -245,11 +271,7 @@ impl VaultManager {
     }
 
     pub async fn get_vault(&self, id: Uuid) -> VaultResult<DepositVault> {
-        self.db
-            .vaults()
-            .get(id)
-            .await
-            .map_err(|source| VaultError::Database { source })
+        self.db.vaults().get(id).await.map_err(VaultError::database)
     }
 
     pub async fn cancel_vault(
@@ -268,7 +290,7 @@ impl VaultManager {
             .vaults()
             .request_refund(id, now)
             .await
-            .map_err(|source| VaultError::Database { source })?;
+            .map_err(VaultError::database)?;
         if requested_vault.status != vault.status {
             telemetry::record_vault_transition(
                 &requested_vault,
@@ -286,7 +308,7 @@ impl VaultManager {
             .vaults()
             .get_pending_funding(FUNDING_PASS_LIMIT)
             .await
-            .map_err(|source| VaultError::Database { source })?;
+            .map_err(VaultError::database)?;
         let mut funded = 0_usize;
 
         for vault in vaults {
@@ -311,7 +333,7 @@ impl VaultManager {
                             );
                             continue;
                         }
-                        Err(source) => return Err(VaultError::Database { source }),
+                        Err(source) => return Err(VaultError::database(source)),
                     };
                     telemetry::record_vault_transition(
                         &funded_vault,
@@ -344,12 +366,12 @@ impl VaultManager {
             .vaults()
             .get(hint.vault_id)
             .await
-            .map_err(|source| VaultError::Database { source })?;
+            .map_err(VaultError::database)?;
         self.db
             .vaults()
             .create_funding_hint(&hint)
             .await
-            .map_err(|source| VaultError::Database { source })
+            .map_err(VaultError::database)
     }
 
     pub async fn process_funding_hints(&self, limit: i64) -> VaultResult<usize> {
@@ -365,7 +387,7 @@ impl VaultManager {
             .vaults()
             .claim_pending_funding_hints(limit, Utc::now())
             .await
-            .map_err(|source| VaultError::Database { source })?;
+            .map_err(VaultError::database)?;
         let mut summary = FundingHintPassSummary::default();
 
         for hint in hints {
@@ -380,7 +402,7 @@ impl VaultManager {
                             Utc::now(),
                         )
                         .await
-                        .map_err(|source| VaultError::Database { source })?;
+                        .map_err(VaultError::database)?;
                     summary.processed += 1;
                     if let Some(order_id) = vault.order_id {
                         summary.funded_order_ids.push(order_id);
@@ -396,7 +418,7 @@ impl VaultManager {
                             Utc::now(),
                         )
                         .await
-                        .map_err(|source| VaultError::Database { source })?;
+                        .map_err(VaultError::database)?;
                     summary.processed += 1;
                 }
                 Err(error) => {
@@ -409,7 +431,7 @@ impl VaultManager {
                             Utc::now(),
                         )
                         .await
-                        .map_err(|source| VaultError::Database { source })?;
+                        .map_err(VaultError::database)?;
                     summary.processed += 1;
                 }
             }
@@ -427,7 +449,7 @@ impl VaultManager {
             .vaults()
             .get(hint.vault_id)
             .await
-            .map_err(|source| VaultError::Database { source })?;
+            .map_err(VaultError::database)?;
         match vault.status {
             DepositVaultStatus::PendingFunding => {}
             DepositVaultStatus::Funded => {
@@ -465,7 +487,7 @@ impl VaultManager {
                     reason: "vault funding transition was already claimed".to_string(),
                 });
             }
-            Err(source) => return Err(VaultError::Database { source }),
+            Err(source) => return Err(VaultError::database(source)),
         };
         telemetry::record_vault_transition(
             &funded_vault,
@@ -481,7 +503,7 @@ impl VaultManager {
         );
 
         Ok(FundingHintDisposition::Funded {
-            vault: funded_vault,
+            vault: Box::new(funded_vault),
         })
     }
 
@@ -603,7 +625,7 @@ impl VaultManager {
                 })?;
         let deposit_wallet = chain
             .derive_wallet(&self.settings.master_key_bytes(), &vault.deposit_vault_salt)
-            .map_err(|source| VaultError::WalletDerivation { source })?;
+            .map_err(VaultError::wallet_derivation)?;
 
         let refund_result = match backend_chain {
             ChainType::Bitcoin => {
@@ -626,7 +648,7 @@ impl VaultManager {
                     .vaults()
                     .mark_refunded(vault.id, Utc::now(), &tx_hash)
                     .await
-                    .map_err(|source| VaultError::Database { source })?;
+                    .map_err(VaultError::database)?;
                 telemetry::record_refund_success(&refunded_vault, refund_started.elapsed());
                 telemetry::record_vault_transition(
                     &refunded_vault,
@@ -650,7 +672,7 @@ impl VaultManager {
                         &message,
                     )
                     .await
-                    .map_err(|source| VaultError::Database { source })
+                    .map_err(VaultError::database)
             }
         }
     }
@@ -822,7 +844,7 @@ impl VaultManager {
                 .orders()
                 .get_market_order_quote(order_id)
                 .await
-                .map_err(|source| VaultError::Database { source })?;
+                .map_err(VaultError::database)?;
             return parse_positive_u256("quote.amount_in", &quote.amount_in);
         }
 
@@ -860,24 +882,13 @@ impl VaultManager {
                 match &deposit_asset.asset {
                     AssetId::Native => Ok(deposit_asset.clone()),
                     AssetId::Reference(asset) => {
-                        let chain = self.chain_registry.get(&backend_chain).ok_or(
-                            VaultError::ChainNotSupported {
-                                chain: deposit_asset.chain.clone(),
-                            },
-                        )?;
-                        let normalized = asset.to_lowercase();
-                        if chain.validate_address(&normalized) {
-                            Ok(DepositAsset {
-                                chain: deposit_asset.chain.clone(),
-                                asset: AssetId::reference(normalized),
-                            })
-                        } else {
-                            Err(VaultError::InvalidAssetId {
+                        deposit_asset.normalized_asset_identity().map_err(|reason| {
+                            VaultError::InvalidAssetId {
                                 asset: asset.clone(),
                                 chain: deposit_asset.chain.clone(),
-                                reason: "expected a valid EVM token address".to_string(),
-                            })
-                        }
+                                reason,
+                            }
+                        })
                     }
                 }
             }
@@ -898,7 +909,7 @@ impl VaultManager {
             .orders()
             .get(order_id)
             .await
-            .map_err(|source| VaultError::Database { source })?;
+            .map_err(VaultError::database)?;
 
         if order.status != RouterOrderStatus::Quoted {
             return Err(VaultError::InvalidOrderBinding {
@@ -932,7 +943,7 @@ impl VaultManager {
             .orders()
             .get_market_order_quote(order_id)
             .await
-            .map_err(|source| VaultError::Database { source })?;
+            .map_err(VaultError::database)?;
 
         Ok(OrderBinding {
             action: expected_action,
@@ -1036,7 +1047,7 @@ fn map_create_vault_error(source: RouterServerError) -> VaultError {
         RouterServerError::Validation { message } => {
             VaultError::InvalidOrderBinding { reason: message }
         }
-        source => VaultError::Database { source },
+        source => VaultError::database(source),
     }
 }
 
@@ -1129,7 +1140,7 @@ mod tests {
     fn cancellation_commitment_uses_domain_separation() {
         let secret = test_secret();
         let commitment = compute_cancellation_commitment(&secret);
-        let raw_hash: [u8; 32] = keccak256(&secret).into();
+        let raw_hash: [u8; 32] = keccak256(secret).into();
         assert_ne!(commitment, raw_hash);
     }
 

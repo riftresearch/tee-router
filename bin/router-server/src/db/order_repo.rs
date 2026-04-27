@@ -670,6 +670,29 @@ impl OrderRepository {
         self.map_quote_row(&row)
     }
 
+    pub async fn delete_expired_unassociated_market_order_quotes(
+        &self,
+        now: DateTime<Utc>,
+    ) -> RouterServerResult<u64> {
+        let started = Instant::now();
+        let result = sqlx_core::query::query(
+            r#"
+            DELETE FROM market_order_quotes
+            WHERE order_id IS NULL
+              AND expires_at <= $1
+            "#,
+        )
+        .bind(now)
+        .execute(&self.pool)
+        .await;
+        telemetry::record_db_query(
+            "order.delete_expired_unassociated_market_order_quotes",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        Ok(result?.rows_affected())
+    }
+
     pub async fn create_execution_attempt(
         &self,
         attempt: &OrderExecutionAttempt,

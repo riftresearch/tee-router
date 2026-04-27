@@ -14,7 +14,7 @@ use crate::{
             ExchangeProvider, ExchangeQuote, ExchangeQuoteRequest, UnitProvider,
         },
         asset_registry::{
-            AssetRegistry, MarketOrderTransitionKind, TransitionDecl, TransitionPath,
+            AssetRegistry, MarketOrderTransitionKind, ProviderId, TransitionDecl, TransitionPath,
         },
         deposit_address::{derive_deposit_address_for_quote, DepositAddressError},
         gas_reimbursement::{
@@ -22,6 +22,7 @@ use crate::{
             GasReimbursementError, GasReimbursementPlan,
         },
         provider_policy::ProviderPolicyService,
+        quote_legs::{QuoteLeg, QuoteLegAsset, QuoteLegSpec},
         route_costs::RouteCostService,
         route_minimums::{RouteMinimumError, RouteMinimumService},
     },
@@ -89,17 +90,17 @@ pub enum MarketOrderError {
         amount_in: String,
         operational_min_input: String,
         hard_min_input: String,
-        source_chain: ChainId,
-        source_asset: AssetId,
-        destination_chain: ChainId,
-        destination_asset: AssetId,
+        source_chain: Box<ChainId>,
+        source_asset: Box<AssetId>,
+        destination_chain: Box<ChainId>,
+        destination_asset: Box<AssetId>,
     },
 
     #[snafu(display("Route minimum check failed: {}", reason))]
     RouteMinimum { reason: String },
 
     #[snafu(display("Gas reimbursement planning failed: {}", source))]
-    GasReimbursement { source: GasReimbursementError },
+    GasReimbursement { source: Box<GasReimbursementError> },
 
     #[snafu(display("Quote is expired"))]
     QuoteExpired,
@@ -108,13 +109,33 @@ pub enum MarketOrderError {
     QuoteAlreadyOrdered,
 
     #[snafu(display("Deposit address derivation failed: {}", source))]
-    DepositAddress { source: DepositAddressError },
+    DepositAddress { source: Box<DepositAddressError> },
 
     #[snafu(display("Database error: {}", source))]
-    Database { source: RouterServerError },
+    Database { source: Box<RouterServerError> },
 }
 
 pub type MarketOrderResult<T> = Result<T, MarketOrderError>;
+
+impl MarketOrderError {
+    fn gas_reimbursement(source: GasReimbursementError) -> Self {
+        Self::GasReimbursement {
+            source: Box::new(source),
+        }
+    }
+
+    fn deposit_address(source: DepositAddressError) -> Self {
+        Self::DepositAddress {
+            source: Box::new(source),
+        }
+    }
+
+    fn database(source: RouterServerError) -> Self {
+        Self::Database {
+            source: Box::new(source),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 struct ComposedMarketOrderQuote {
@@ -125,6 +146,16 @@ struct ComposedMarketOrderQuote {
     pub max_amount_in: Option<String>,
     pub provider_quote: Value,
     pub expires_at: chrono::DateTime<Utc>,
+}
+
+struct ComposeTransitionPathQuoteRequest<'a> {
+    request: &'a NormalizedMarketOrderQuoteRequest,
+    quote_id: Uuid,
+    source_depositor_address: &'a str,
+    path: &'a TransitionPath,
+    provider_policy_snapshot: Option<&'a crate::services::ProviderPolicySnapshot>,
+    unit: Option<&'a dyn UnitProvider>,
+    exchange: Option<&'a dyn ExchangeProvider>,
 }
 
 pub struct OrderManager {
@@ -205,7 +236,7 @@ impl OrderManager {
             quote_id,
             &normalized_request.source_asset.chain,
         )
-        .map_err(|source| MarketOrderError::DepositAddress { source })?;
+        .map_err(MarketOrderError::deposit_address)?;
 
         self.validate_route_minimum(&normalized_request, &depositor_address)
             .await?;
@@ -247,7 +278,7 @@ impl OrderManager {
             .orders()
             .create_market_order_quote(&quote)
             .await
-            .map_err(|source| MarketOrderError::Database { source })?;
+            .map_err(MarketOrderError::database)?;
 
         telemetry::record_market_order_quote_success(&quote.source_asset, started.elapsed());
         Ok(RouterOrderQuoteEnvelope {
@@ -260,7 +291,7 @@ impl OrderManager {
             .orders()
             .get_market_order_quote_by_id(quote_id)
             .await
-            .map_err(|source| MarketOrderError::Database { source })
+            .map_err(MarketOrderError::database)
     }
 
     pub async fn get_order(&self, order_id: Uuid) -> MarketOrderResult<RouterOrder> {
@@ -268,7 +299,7 @@ impl OrderManager {
             .orders()
             .get(order_id)
             .await
-            .map_err(|source| MarketOrderError::Database { source })
+            .map_err(MarketOrderError::database)
     }
 
     pub async fn get_quote_for_order(&self, order_id: Uuid) -> MarketOrderResult<MarketOrderQuote> {
@@ -276,7 +307,7 @@ impl OrderManager {
             .orders()
             .get_market_order_quote(order_id)
             .await
-            .map_err(|source| MarketOrderError::Database { source })
+            .map_err(MarketOrderError::database)
     }
 
     pub async fn mark_order_refunding(
@@ -299,7 +330,7 @@ impl OrderManager {
                     Utc::now(),
                 )
                 .await
-                .map_err(|source| MarketOrderError::Database { source }),
+                .map_err(MarketOrderError::database),
             _ => Ok(order.clone()),
         }
     }
@@ -344,7 +375,7 @@ impl OrderManager {
             .orders()
             .create_market_order_from_quote(&order, quote.id)
             .await
-            .map_err(|source| MarketOrderError::Database { source })?;
+            .map_err(MarketOrderError::database)?;
 
         Ok((order, quote))
     }
@@ -362,7 +393,7 @@ impl OrderManager {
             .orders()
             .get(order_id)
             .await
-            .map_err(|source| MarketOrderError::Database { source })?;
+            .map_err(MarketOrderError::database)?;
         let requested_idempotency_key = normalize_idempotency_key(request.idempotency_key)?;
         let requested_refund_address = self.validate_and_normalize_refund_address(
             &order.source_asset.chain,
@@ -388,7 +419,7 @@ impl OrderManager {
             .orders()
             .release_quote_and_delete_quoted_order(order_id, quote_id)
             .await
-            .map_err(|source| MarketOrderError::Database { source })
+            .map_err(MarketOrderError::database)
     }
 
     async fn best_provider_quote(
@@ -435,7 +466,7 @@ impl OrderManager {
                 service
                     .snapshot()
                     .await
-                    .map_err(|source| MarketOrderError::Database { source })?,
+                    .map_err(MarketOrderError::database)?,
             )
         } else {
             None
@@ -529,10 +560,10 @@ impl OrderManager {
                 amount_in: amount_in.clone(),
                 operational_min_input: snapshot.operational_min_input,
                 hard_min_input: snapshot.hard_min_input,
-                source_chain: request.source_asset.chain.clone(),
-                source_asset: request.source_asset.asset.clone(),
-                destination_chain: request.destination_asset.chain.clone(),
-                destination_asset: request.destination_asset.asset.clone(),
+                source_chain: Box::new(request.source_asset.chain.clone()),
+                source_asset: Box::new(request.source_asset.asset.clone()),
+                destination_chain: Box::new(request.destination_asset.chain.clone()),
+                destination_asset: Box::new(request.destination_asset.asset.clone()),
             });
         }
 
@@ -564,7 +595,7 @@ impl OrderManager {
         let unit_candidates: Vec<Option<Arc<dyn UnitProvider>>> = if requires_unit {
             self.action_providers
                 .units()
-                .into_iter()
+                .iter()
                 .filter(|unit| {
                     provider_allowed_for_new_routes(provider_policy_snapshot, unit.id())
                         && unit_path_compatible(unit.as_ref(), path)
@@ -582,7 +613,7 @@ impl OrderManager {
         let exchange_candidates: Vec<Option<Arc<dyn ExchangeProvider>>> = if requires_exchange {
             self.action_providers
                 .exchanges()
-                .into_iter()
+                .iter()
                 .filter(|exchange| {
                     provider_allowed_for_new_routes(provider_policy_snapshot, exchange.id())
                         && exchange_path_compatible(exchange.id(), path)
@@ -602,15 +633,15 @@ impl OrderManager {
         for unit in &unit_candidates {
             for exchange in &exchange_candidates {
                 let quote = self
-                    .compose_transition_path_quote(
+                    .compose_transition_path_quote(ComposeTransitionPathQuoteRequest {
                         request,
                         quote_id,
                         source_depositor_address,
                         path,
                         provider_policy_snapshot,
-                        unit.as_deref(),
-                        exchange.as_deref(),
-                    )
+                        unit: unit.as_deref(),
+                        exchange: exchange.as_deref(),
+                    })
                     .await;
                 let quote = match quote {
                     Ok(Some(quote)) => quote,
@@ -634,19 +665,22 @@ impl OrderManager {
 
     async fn compose_transition_path_quote(
         &self,
-        request: &NormalizedMarketOrderQuoteRequest,
-        quote_id: Uuid,
-        source_depositor_address: &str,
-        path: &TransitionPath,
-        provider_policy_snapshot: Option<&crate::services::ProviderPolicySnapshot>,
-        unit: Option<&dyn UnitProvider>,
-        exchange: Option<&dyn ExchangeProvider>,
+        spec: ComposeTransitionPathQuoteRequest<'_>,
     ) -> MarketOrderResult<Option<ComposedMarketOrderQuote>> {
+        let ComposeTransitionPathQuoteRequest {
+            request,
+            quote_id,
+            source_depositor_address,
+            path,
+            provider_policy_snapshot,
+            unit,
+            exchange,
+        } = spec;
         let mut expires_at = Utc::now() + ChronoDuration::minutes(10);
-        let mut legs_per_transition: Vec<Vec<Value>> = vec![Vec::new(); path.transitions.len()];
+        let mut legs_per_transition: Vec<Vec<QuoteLeg>> = vec![Vec::new(); path.transitions.len()];
         let gas_reimbursement_plan =
             optimized_paymaster_reimbursement_plan(self.asset_registry.as_ref(), path)
-                .map_err(|source| MarketOrderError::GasReimbursement { source })?;
+                .map_err(MarketOrderError::gas_reimbursement)?;
 
         match &request.action.order_kind {
             MarketOrderKind::ExactIn {
@@ -704,20 +738,20 @@ impl OrderManager {
                             };
                             expires_at = expires_at.min(bridge_quote.expires_at);
                             cursor_amount = bridge_quote.amount_out.clone();
-                            legs_per_transition[index].push(transition_leg_json(
-                                &transition.id,
-                                transition.kind,
-                                bridge.id(),
-                                &transition.input.asset,
-                                &transition.output.asset,
-                                &bridge_quote.amount_in,
-                                &bridge_quote.amount_out,
-                                bridge_quote.expires_at,
-                                bridge_quote.provider_quote,
-                            ));
+                            legs_per_transition[index].push(transition_leg(QuoteLegSpec {
+                                transition_decl_id: &transition.id,
+                                transition_kind: transition.kind,
+                                provider: transition.provider,
+                                input_asset: &transition.input.asset,
+                                output_asset: &transition.output.asset,
+                                amount_in: &bridge_quote.amount_in,
+                                amount_out: &bridge_quote.amount_out,
+                                expires_at: bridge_quote.expires_at,
+                                raw: bridge_quote.provider_quote,
+                            }));
                         }
                         MarketOrderTransitionKind::UnitDeposit => {
-                            let unit = unit.ok_or_else(|| MarketOrderError::NoRoute {
+                            unit.ok_or_else(|| MarketOrderError::NoRoute {
                                 reason: "unit provider is required for unit_deposit".to_string(),
                             })?;
                             let (unit_amount_in, provider_quote) = if let Some(fee_reserve) =
@@ -736,17 +770,17 @@ impl OrderManager {
                                 (provider_amount_in.clone(), json!({}))
                             };
                             cursor_amount = unit_amount_in.clone();
-                            legs_per_transition[index].push(transition_leg_json(
-                                &transition.id,
-                                transition.kind,
-                                unit.id(),
-                                &transition.input.asset,
-                                &transition.output.asset,
-                                &unit_amount_in,
-                                &unit_amount_in,
+                            legs_per_transition[index].push(transition_leg(QuoteLegSpec {
+                                transition_decl_id: &transition.id,
+                                transition_kind: transition.kind,
+                                provider: transition.provider,
+                                input_asset: &transition.input.asset,
+                                output_asset: &transition.output.asset,
+                                amount_in: &unit_amount_in,
+                                amount_out: &unit_amount_in,
                                 expires_at,
-                                provider_quote,
-                            ));
+                                raw: provider_quote,
+                            }));
                         }
                         MarketOrderTransitionKind::HyperliquidTrade => {
                             let exchange = exchange.ok_or_else(|| MarketOrderError::NoRoute {
@@ -787,7 +821,7 @@ impl OrderManager {
                             legs_per_transition[index] = exchange_quote_transition_legs(
                                 &transition.id,
                                 transition.kind,
-                                exchange.id(),
+                                transition.provider,
                                 &exchange_quote,
                             )?;
                         }
@@ -837,27 +871,27 @@ impl OrderManager {
                             legs_per_transition[index] = exchange_quote_transition_legs(
                                 &transition.id,
                                 transition.kind,
-                                exchange.id(),
+                                transition.provider,
                                 &exchange_quote,
                             )?;
                         }
                         MarketOrderTransitionKind::UnitWithdrawal => {
-                            let unit = unit.ok_or_else(|| MarketOrderError::NoRoute {
+                            unit.ok_or_else(|| MarketOrderError::NoRoute {
                                 reason: "unit provider is required for unit_withdrawal".to_string(),
                             })?;
-                            legs_per_transition[index].push(transition_leg_json(
-                                &transition.id,
-                                transition.kind,
-                                unit.id(),
-                                &transition.input.asset,
-                                &transition.output.asset,
-                                &provider_amount_in,
-                                &provider_amount_in,
+                            legs_per_transition[index].push(transition_leg(QuoteLegSpec {
+                                transition_decl_id: &transition.id,
+                                transition_kind: transition.kind,
+                                provider: transition.provider,
+                                input_asset: &transition.input.asset,
+                                output_asset: &transition.output.asset,
+                                amount_in: &provider_amount_in,
+                                amount_out: &provider_amount_in,
                                 expires_at,
-                                json!({
+                                raw: json!({
                                     "recipient_address": request.recipient_address,
                                 }),
-                            ));
+                            }));
                         }
                     }
                 }
@@ -868,7 +902,7 @@ impl OrderManager {
                     unit.map(|provider| provider.id()),
                     exchange.map(|provider| provider.id()),
                 );
-                return Ok(Some(ComposedMarketOrderQuote {
+                Ok(Some(ComposedMarketOrderQuote {
                     provider_id,
                     amount_in: amount_in.clone(),
                     amount_out: cursor_amount,
@@ -880,7 +914,7 @@ impl OrderManager {
                         &gas_reimbursement_plan,
                     ),
                     expires_at,
-                }));
+                }))
             }
             MarketOrderKind::ExactOut {
                 amount_out,
@@ -891,22 +925,22 @@ impl OrderManager {
                     let transition = &path.transitions[index];
                     match transition.kind {
                         MarketOrderTransitionKind::UnitWithdrawal => {
-                            let unit = unit.ok_or_else(|| MarketOrderError::NoRoute {
+                            unit.ok_or_else(|| MarketOrderError::NoRoute {
                                 reason: "unit provider is required for unit_withdrawal".to_string(),
                             })?;
-                            legs_per_transition[index].push(transition_leg_json(
-                                &transition.id,
-                                transition.kind,
-                                unit.id(),
-                                &transition.input.asset,
-                                &transition.output.asset,
-                                &required_output,
-                                &required_output,
+                            legs_per_transition[index].push(transition_leg(QuoteLegSpec {
+                                transition_decl_id: &transition.id,
+                                transition_kind: transition.kind,
+                                provider: transition.provider,
+                                input_asset: &transition.input.asset,
+                                output_asset: &transition.output.asset,
+                                amount_in: &required_output,
+                                amount_out: &required_output,
                                 expires_at,
-                                json!({
+                                raw: json!({
                                     "recipient_address": request.recipient_address,
                                 }),
-                            ));
+                            }));
                         }
                         MarketOrderTransitionKind::HyperliquidTrade => {
                             let exchange = exchange.ok_or_else(|| MarketOrderError::NoRoute {
@@ -952,7 +986,7 @@ impl OrderManager {
                             legs_per_transition[index] = exchange_quote_transition_legs(
                                 &transition.id,
                                 transition.kind,
-                                exchange.id(),
+                                transition.provider,
                                 &exchange_quote,
                             )?;
                         }
@@ -1003,7 +1037,7 @@ impl OrderManager {
                             legs_per_transition[index] = exchange_quote_transition_legs(
                                 &transition.id,
                                 transition.kind,
-                                exchange.id(),
+                                transition.provider,
                                 &exchange_quote,
                             )?;
                         }
@@ -1054,20 +1088,20 @@ impl OrderManager {
                             };
                             expires_at = expires_at.min(bridge_quote.expires_at);
                             required_output = bridge_quote.amount_in.clone();
-                            legs_per_transition[index].push(transition_leg_json(
-                                &transition.id,
-                                transition.kind,
-                                bridge.id(),
-                                &transition.input.asset,
-                                &transition.output.asset,
-                                &bridge_quote.amount_in,
-                                &bridge_quote.amount_out,
-                                bridge_quote.expires_at,
-                                bridge_quote.provider_quote,
-                            ));
+                            legs_per_transition[index].push(transition_leg(QuoteLegSpec {
+                                transition_decl_id: &transition.id,
+                                transition_kind: transition.kind,
+                                provider: transition.provider,
+                                input_asset: &transition.input.asset,
+                                output_asset: &transition.output.asset,
+                                amount_in: &bridge_quote.amount_in,
+                                amount_out: &bridge_quote.amount_out,
+                                expires_at: bridge_quote.expires_at,
+                                raw: bridge_quote.provider_quote,
+                            }));
                         }
                         MarketOrderTransitionKind::UnitDeposit => {
-                            let unit = unit.ok_or_else(|| MarketOrderError::NoRoute {
+                            unit.ok_or_else(|| MarketOrderError::NoRoute {
                                 reason: "unit provider is required for unit_deposit".to_string(),
                             })?;
                             let (unit_amount_in, upstream_required, provider_quote) =
@@ -1082,17 +1116,17 @@ impl OrderManager {
                                 } else {
                                     (required_output.clone(), required_output.clone(), json!({}))
                                 };
-                            legs_per_transition[index].push(transition_leg_json(
-                                &transition.id,
-                                transition.kind,
-                                unit.id(),
-                                &transition.input.asset,
-                                &transition.output.asset,
-                                &unit_amount_in,
-                                &unit_amount_in,
+                            legs_per_transition[index].push(transition_leg(QuoteLegSpec {
+                                transition_decl_id: &transition.id,
+                                transition_kind: transition.kind,
+                                provider: transition.provider,
+                                input_asset: &transition.input.asset,
+                                output_asset: &transition.output.asset,
+                                amount_in: &unit_amount_in,
+                                amount_out: &unit_amount_in,
                                 expires_at,
-                                provider_quote,
-                            ));
+                                raw: provider_quote,
+                            }));
                             required_output = upstream_required;
                         }
                     }
@@ -1109,7 +1143,7 @@ impl OrderManager {
                     unit.map(|provider| provider.id()),
                     exchange.map(|provider| provider.id()),
                 );
-                return Ok(Some(ComposedMarketOrderQuote {
+                Ok(Some(ComposedMarketOrderQuote {
                     provider_id,
                     amount_in: required_output,
                     amount_out: amount_out.clone(),
@@ -1121,7 +1155,7 @@ impl OrderManager {
                         &gas_reimbursement_plan,
                     ),
                     expires_at,
-                }));
+                }))
             }
         }
     }
@@ -1240,7 +1274,7 @@ impl OrderManager {
             chain_id,
         )
         .map(|(address, _)| address)
-        .map_err(|source| MarketOrderError::DepositAddress { source })
+        .map_err(MarketOrderError::deposit_address)
     }
 
     fn validate_and_normalize_quote_request(
@@ -1284,24 +1318,13 @@ impl OrderManager {
             ChainType::Ethereum | ChainType::Arbitrum | ChainType::Base => match &asset.asset {
                 AssetId::Native => Ok(asset.clone()),
                 AssetId::Reference(asset_id) => {
-                    let chain = self.chain_registry.get(&backend_chain).ok_or(
-                        MarketOrderError::ChainNotSupported {
-                            chain: asset.chain.clone(),
-                        },
-                    )?;
-                    let normalized = asset_id.to_lowercase();
-                    if chain.validate_address(&normalized) {
-                        Ok(DepositAsset {
-                            chain: asset.chain.clone(),
-                            asset: AssetId::reference(normalized),
-                        })
-                    } else {
-                        Err(MarketOrderError::InvalidAssetId {
+                    asset.normalized_asset_identity().map_err(|reason| {
+                        MarketOrderError::InvalidAssetId {
                             asset: asset_id.clone(),
                             chain: asset.chain.clone(),
-                            reason: "expected a valid EVM token address".to_string(),
-                        })
-                    }
+                            reason,
+                        }
+                    })
                 }
             },
             ChainType::Hyperliquid => Err(MarketOrderError::ChainNotSupported {
@@ -1538,43 +1561,16 @@ fn exchange_path_compatible(exchange_id: &str, path: &TransitionPath) -> bool {
         })
 }
 
-fn transition_leg_json(
-    transition_decl_id: &str,
-    transition_kind: MarketOrderTransitionKind,
-    provider: &str,
-    input_asset: &DepositAsset,
-    output_asset: &DepositAsset,
-    amount_in: &str,
-    amount_out: &str,
-    expires_at: chrono::DateTime<Utc>,
-    raw: Value,
-) -> Value {
-    json!({
-        "transition_decl_id": transition_decl_id,
-        "transition_parent_decl_id": transition_decl_id,
-        "transition_kind": transition_kind.as_str(),
-        "provider": provider,
-        "input_asset": {
-            "chain_id": input_asset.chain.as_str(),
-            "asset": input_asset.asset.as_str(),
-        },
-        "output_asset": {
-            "chain_id": output_asset.chain.as_str(),
-            "asset": output_asset.asset.as_str(),
-        },
-        "amount_in": amount_in,
-        "amount_out": amount_out,
-        "expires_at": expires_at.to_rfc3339(),
-        "raw": raw,
-    })
+fn transition_leg(spec: QuoteLegSpec<'_>) -> QuoteLeg {
+    QuoteLeg::new(spec)
 }
 
 fn exchange_quote_transition_legs(
     transition_decl_id: &str,
     transition_kind: MarketOrderTransitionKind,
-    provider: &str,
+    provider: ProviderId,
     quote: &ExchangeQuote,
-) -> MarketOrderResult<Vec<Value>> {
+) -> MarketOrderResult<Vec<QuoteLeg>> {
     let kind = quote
         .provider_quote
         .get("kind")
@@ -1586,25 +1582,35 @@ fn exchange_quote_transition_legs(
             let input_asset = quote
                 .provider_quote
                 .get("input_asset")
-                .cloned()
-                .unwrap_or_else(|| json!({}));
+                .ok_or_else(|| MarketOrderError::NoRoute {
+                    reason: "universal router quote missing input_asset".to_string(),
+                })
+                .and_then(|value| {
+                    QuoteLegAsset::from_value(value, "input_asset")
+                        .map_err(|reason| MarketOrderError::NoRoute { reason })
+                })?;
             let output_asset = quote
                 .provider_quote
                 .get("output_asset")
-                .cloned()
-                .unwrap_or_else(|| json!({}));
-            Ok(vec![json!({
-                "transition_decl_id": transition_decl_id,
-                "transition_parent_decl_id": transition_decl_id,
-                "transition_kind": transition_kind.as_str(),
-                "provider": provider,
-                "input_asset": input_asset,
-                "output_asset": output_asset,
-                "amount_in": quote.amount_in,
-                "amount_out": quote.amount_out,
-                "expires_at": quote.expires_at.to_rfc3339(),
-                "raw": quote.provider_quote.clone(),
-            })])
+                .ok_or_else(|| MarketOrderError::NoRoute {
+                    reason: "universal router quote missing output_asset".to_string(),
+                })
+                .and_then(|value| {
+                    QuoteLegAsset::from_value(value, "output_asset")
+                        .map_err(|reason| MarketOrderError::NoRoute { reason })
+                })?;
+            Ok(vec![QuoteLeg {
+                transition_decl_id: transition_decl_id.to_string(),
+                transition_parent_decl_id: transition_decl_id.to_string(),
+                transition_kind,
+                provider,
+                input_asset,
+                output_asset,
+                amount_in: quote.amount_in.clone(),
+                amount_out: quote.amount_out.clone(),
+                expires_at: quote.expires_at,
+                raw: quote.provider_quote.clone(),
+            }])
         }
         "spot_cross_token" => {
             let Some(legs) = quote.provider_quote.get("legs").and_then(Value::as_array) else {
@@ -1616,22 +1622,46 @@ fn exchange_quote_transition_legs(
                 .iter()
                 .enumerate()
                 .map(|(index, leg)| {
-                    let input_asset = leg.get("input_asset").cloned().unwrap_or_else(|| json!({}));
-                    let output_asset = leg.get("output_asset").cloned().unwrap_or_else(|| json!({}));
-                    json!({
-                        "transition_decl_id": format!("{transition_decl_id}:leg:{index}"),
-                        "transition_parent_decl_id": transition_decl_id,
-                        "transition_kind": transition_kind.as_str(),
-                        "provider": provider,
-                        "input_asset": input_asset,
-                        "output_asset": output_asset,
-                        "amount_in": leg.get("amount_in").cloned().unwrap_or_else(|| json!(quote.amount_in)),
-                        "amount_out": leg.get("amount_out").cloned().unwrap_or_else(|| json!(quote.amount_out)),
-                        "expires_at": quote.expires_at.to_rfc3339(),
-                        "raw": leg.clone(),
+                    let input_asset = leg
+                        .get("input_asset")
+                        .ok_or_else(|| MarketOrderError::NoRoute {
+                            reason: "hyperliquid cross-token leg missing input_asset".to_string(),
+                        })
+                        .and_then(|value| {
+                            QuoteLegAsset::from_value(value, "input_asset")
+                                .map_err(|reason| MarketOrderError::NoRoute { reason })
+                        })?;
+                    let output_asset = leg
+                        .get("output_asset")
+                        .ok_or_else(|| MarketOrderError::NoRoute {
+                            reason: "hyperliquid cross-token leg missing output_asset".to_string(),
+                        })
+                        .and_then(|value| {
+                            QuoteLegAsset::from_value(value, "output_asset")
+                                .map_err(|reason| MarketOrderError::NoRoute { reason })
+                        })?;
+                    Ok(QuoteLeg {
+                        transition_decl_id: format!("{transition_decl_id}:leg:{index}"),
+                        transition_parent_decl_id: transition_decl_id.to_string(),
+                        transition_kind,
+                        provider,
+                        input_asset,
+                        output_asset,
+                        amount_in: leg
+                            .get("amount_in")
+                            .and_then(Value::as_str)
+                            .unwrap_or(&quote.amount_in)
+                            .to_string(),
+                        amount_out: leg
+                            .get("amount_out")
+                            .and_then(Value::as_str)
+                            .unwrap_or(&quote.amount_out)
+                            .to_string(),
+                        expires_at: quote.expires_at,
+                        raw: leg.clone(),
                     })
                 })
-                .collect();
+                .collect::<MarketOrderResult<Vec<_>>>()?;
             Ok(mapped)
         }
         other => Err(MarketOrderError::NoRoute {
@@ -1640,7 +1670,7 @@ fn exchange_quote_transition_legs(
     }
 }
 
-fn flatten_transition_legs(legs_per_transition: Vec<Vec<Value>>) -> Vec<Value> {
+fn flatten_transition_legs(legs_per_transition: Vec<Vec<QuoteLeg>>) -> Vec<QuoteLeg> {
     let mut flattened = Vec::new();
     for mut transition_legs in legs_per_transition {
         flattened.append(&mut transition_legs);
@@ -1672,7 +1702,7 @@ fn composed_provider_id(
 
 fn transition_path_quote_blob(
     path: &TransitionPath,
-    legs: &[Value],
+    legs: &[QuoteLeg],
     gas_reimbursement_plan: &GasReimbursementPlan,
 ) -> Value {
     json!({
@@ -1686,11 +1716,6 @@ fn transition_path_quote_blob(
             .collect::<Vec<_>>(),
         "transitions": path.transitions,
         "legs": legs,
-        "path_metadata": {
-            "reliability_prior": path.metadata.reliability_prior,
-            "p50_latency_ms": path.metadata.p50_latency_ms,
-            "p95_latency_ms": path.metadata.p95_latency_ms,
-        },
         "gas_reimbursement": gas_reimbursement_plan,
     })
 }
@@ -1980,23 +2005,22 @@ fn is_better_quote(
         return false;
     }
 
-    let candidate_latency = quote_latency_ms(candidate);
-    let current_latency = quote_latency_ms(current);
-    if candidate_latency < current_latency {
+    let candidate_hops = quote_hop_count(candidate);
+    let current_hops = quote_hop_count(current);
+    if candidate_hops < current_hops {
         return true;
     }
-    if candidate_latency > current_latency {
+    if candidate_hops > current_hops {
         return false;
     }
 
     false
 }
 
-fn quote_latency_ms(quote: &ComposedMarketOrderQuote) -> u64 {
+fn quote_hop_count(quote: &ComposedMarketOrderQuote) -> usize {
     quote
         .provider_quote
-        .get("path_metadata")
-        .and_then(|value| value.get("p50_latency_ms"))
-        .and_then(Value::as_u64)
-        .unwrap_or(u64::MAX)
+        .get("transition_decl_ids")
+        .and_then(Value::as_array)
+        .map_or(usize::MAX, Vec::len)
 }

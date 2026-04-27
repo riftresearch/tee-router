@@ -19,7 +19,10 @@ use router_server::{
     models::MarketOrderKind,
     protocol::{AssetId, ChainId, DepositAsset},
     services::{
-        action_providers::{ExchangeProvider, ExchangeQuote, ExchangeQuoteRequest, VeloraProvider},
+        action_providers::{
+            ExchangeExecutionRequest, ExchangeProvider, ExchangeQuote, ExchangeQuoteRequest,
+            VeloraProvider,
+        },
         ChainCall, CustodyAction, ProviderExecutionIntent,
     },
 };
@@ -156,6 +159,7 @@ async fn live_velora_base_eth_to_usdc_swap_transcript_spends_funds() -> TestResu
     let min_amount_out = apply_slippage_bps(&loose_quote.amount_out, slippage_bps)?;
     let quote = quote_base_eth_to_usdc(&velora, user, amount_in, min_amount_out).await?;
     let step_request = velora_step_request(user, &quote);
+    let step_request = ExchangeExecutionRequest::universal_router_swap_from_value(&step_request)?;
     let execution = velora
         .execute_trade(&step_request)
         .await

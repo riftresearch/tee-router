@@ -613,6 +613,72 @@ fn normalize_screened_address(
     }
 }
 
+async fn get_chain_tip(
+    State(state): State<AppState>,
+    Path(chain): Path<String>,
+) -> RouterServerResult<Json<serde_json::Value>> {
+    let chain = ChainId::parse(chain).map_err(|err| RouterServerError::Validation {
+        message: format!("unsupported chain path: {err}"),
+    })?;
+    let backend_chain = backend_chain_for_id(&chain).ok_or(RouterServerError::Validation {
+        message: format!("chain not configured: {chain}"),
+    })?;
+    let chain_impl =
+        state
+            .chain_registry
+            .get(&backend_chain)
+            .ok_or(RouterServerError::Validation {
+                message: format!("chain not configured: {chain}"),
+            })?;
+    let block_hash = chain_impl.get_best_hash().await?;
+    Ok(Json(serde_json::json!({ "block_hash": block_hash })))
+}
+
+fn vault_response(
+    chain_registry: &ChainRegistry,
+    vault: DepositVault,
+) -> RouterServerResult<DepositVaultEnvelope> {
+    let backend_chain =
+        backend_chain_for_id(&vault.deposit_asset.chain).ok_or(RouterServerError::Validation {
+            message: format!("chain not configured: {}", vault.deposit_asset.chain),
+        })?;
+    let chain = chain_registry
+        .get(&backend_chain)
+        .ok_or(RouterServerError::Validation {
+            message: format!("chain not configured: {}", vault.deposit_asset.chain),
+        })?;
+
+    Ok(DepositVaultEnvelope {
+        deposit_requirements: DepositRequirements {
+            minimum_confirmations: chain.minimum_block_confirmations(),
+            estimated_block_time_seconds: chain.estimated_block_time().as_secs(),
+        },
+        vault,
+    })
+}
+
+async fn order_response(
+    state: AppState,
+    order: RouterOrder,
+    funding_vault: Option<DepositVault>,
+) -> RouterServerResult<RouterOrderEnvelope> {
+    let quote = state.order_manager.get_quote_for_order(order.id).await?;
+    let funding_vault = match (funding_vault, order.funding_vault_id) {
+        (Some(vault), _) => Some(vault_response(state.chain_registry.as_ref(), vault)?),
+        (None, Some(vault_id)) => {
+            let vault = state.vault_manager.get_vault(vault_id).await?;
+            Some(vault_response(state.chain_registry.as_ref(), vault)?)
+        }
+        (None, None) => None,
+    };
+
+    Ok(RouterOrderEnvelope {
+        order,
+        quote: quote.into(),
+        funding_vault,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -697,70 +763,4 @@ mod tests {
             Err(RouterServerError::Unauthorized { .. })
         ));
     }
-}
-
-async fn get_chain_tip(
-    State(state): State<AppState>,
-    Path(chain): Path<String>,
-) -> RouterServerResult<Json<serde_json::Value>> {
-    let chain = ChainId::parse(chain).map_err(|err| RouterServerError::Validation {
-        message: format!("unsupported chain path: {err}"),
-    })?;
-    let backend_chain = backend_chain_for_id(&chain).ok_or(RouterServerError::Validation {
-        message: format!("chain not configured: {chain}"),
-    })?;
-    let chain_impl =
-        state
-            .chain_registry
-            .get(&backend_chain)
-            .ok_or(RouterServerError::Validation {
-                message: format!("chain not configured: {chain}"),
-            })?;
-    let block_hash = chain_impl.get_best_hash().await?;
-    Ok(Json(serde_json::json!({ "block_hash": block_hash })))
-}
-
-fn vault_response(
-    chain_registry: &ChainRegistry,
-    vault: DepositVault,
-) -> RouterServerResult<DepositVaultEnvelope> {
-    let backend_chain =
-        backend_chain_for_id(&vault.deposit_asset.chain).ok_or(RouterServerError::Validation {
-            message: format!("chain not configured: {}", vault.deposit_asset.chain),
-        })?;
-    let chain = chain_registry
-        .get(&backend_chain)
-        .ok_or(RouterServerError::Validation {
-            message: format!("chain not configured: {}", vault.deposit_asset.chain),
-        })?;
-
-    Ok(DepositVaultEnvelope {
-        deposit_requirements: DepositRequirements {
-            minimum_confirmations: chain.minimum_block_confirmations(),
-            estimated_block_time_seconds: chain.estimated_block_time().as_secs(),
-        },
-        vault,
-    })
-}
-
-async fn order_response(
-    state: AppState,
-    order: RouterOrder,
-    funding_vault: Option<DepositVault>,
-) -> RouterServerResult<RouterOrderEnvelope> {
-    let quote = state.order_manager.get_quote_for_order(order.id).await?;
-    let funding_vault = match (funding_vault, order.funding_vault_id) {
-        (Some(vault), _) => Some(vault_response(state.chain_registry.as_ref(), vault)?),
-        (None, Some(vault_id)) => {
-            let vault = state.vault_manager.get_vault(vault_id).await?;
-            Some(vault_response(state.chain_registry.as_ref(), vault)?)
-        }
-        (None, None) => None,
-    };
-
-    Ok(RouterOrderEnvelope {
-        order,
-        quote: quote.into(),
-        funding_vault,
-    })
 }

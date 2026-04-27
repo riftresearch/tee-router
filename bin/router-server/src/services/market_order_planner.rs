@@ -3,10 +3,11 @@ use crate::{
         CustodyVaultRole, DepositVault, MarketOrderKindType, MarketOrderQuote, OrderExecutionStep,
         OrderExecutionStepStatus, OrderExecutionStepType, RouterOrder, RouterOrderAction,
     },
-    protocol::{AssetId, ChainId, DepositAsset},
+    protocol::DepositAsset,
     services::asset_registry::{
-        AssetRegistry, MarketOrderTransitionKind, RequiredCustodyRole, TransitionDecl,
+        AssetRegistry, MarketOrderTransitionKind, ProviderId, RequiredCustodyRole, TransitionDecl,
     },
+    services::quote_legs::QuoteLeg,
 };
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
@@ -261,16 +262,16 @@ fn materialize_transition_steps(
         match transition.kind {
             MarketOrderTransitionKind::AcrossBridge => {
                 let leg = legs.take_one(&transition.id, transition.kind)?;
-                steps.push(across_bridge_step(
+                steps.push(across_bridge_step(AcrossBridgeStepSpec {
                     order,
                     source_vault,
                     quote,
                     transition,
-                    &leg,
+                    leg: &leg,
                     is_final,
                     step_index,
                     planned_at,
-                )?);
+                })?);
                 step_index += 1;
             }
             MarketOrderTransitionKind::UnitDeposit => {
@@ -283,7 +284,7 @@ fn materialize_transition_steps(
                     input_custody_role_for_transition(&path.transitions, transition_index),
                     step_index,
                     planned_at,
-                ));
+                )?);
                 step_index += 1;
             }
             MarketOrderTransitionKind::HyperliquidBridgeDeposit => {
@@ -315,39 +316,42 @@ fn materialize_transition_steps(
                     bridge_signer_asset.as_ref(),
                 )?;
                 for (leg_index, leg) in transition_legs.iter().enumerate() {
-                    steps.push(hyperliquid_trade_step(
+                    steps.push(hyperliquid_trade_step(HyperliquidTradeStepSpec {
                         order,
                         quote,
-                        leg_provider(leg, transition)?,
-                        HyperliquidCustodySpec {
+                        exchange_provider: leg_provider(leg, transition)?,
+                        hyperliquid_custody: HyperliquidCustodySpec {
                             role: custody.role,
                             asset: custody.asset.clone(),
                             prefund_from_withdrawable: custody.prefund_first_trade
                                 && leg_index == 0,
                         },
                         leg_index,
-                        transition_legs.len(),
+                        leg_count: transition_legs.len(),
                         leg,
-                        Some(transition.id.clone()),
+                        transition_decl_id: Some(transition.id.clone()),
                         step_index,
                         planned_at,
-                    )?);
+                    })?);
                     step_index += 1;
                 }
             }
             MarketOrderTransitionKind::UniversalRouterSwap => {
                 let leg = legs.take_one(&transition.id, transition.kind)?;
-                steps.push(universal_router_swap_step(
+                steps.push(universal_router_swap_step(UniversalRouterSwapStepSpec {
                     order,
                     source_vault,
                     quote,
                     transition,
-                    &leg,
-                    input_custody_role_for_transition(&path.transitions, transition_index),
+                    leg: &leg,
+                    source_role: input_custody_role_for_transition(
+                        &path.transitions,
+                        transition_index,
+                    ),
                     is_final,
                     step_index,
                     planned_at,
-                )?);
+                })?);
                 step_index += 1;
             }
             MarketOrderTransitionKind::UnitWithdrawal => {
@@ -357,16 +361,16 @@ fn materialize_transition_steps(
                     transition_index,
                     bridge_signer_asset.as_ref(),
                 )?;
-                steps.push(unit_withdrawal_step(
+                steps.push(unit_withdrawal_step(UnitWithdrawalStepSpec {
                     order,
                     quote,
-                    &leg,
-                    leg_provider(&leg, transition)?,
-                    custody,
-                    Some(transition.id.clone()),
+                    leg: &leg,
+                    unit_provider: leg_provider(&leg, transition)?,
+                    hyperliquid_custody: custody,
+                    transition_decl_id: Some(transition.id.clone()),
                     step_index,
                     planned_at,
-                )?);
+                })?);
                 step_index += 1;
             }
         }
@@ -376,35 +380,50 @@ fn materialize_transition_steps(
     Ok(steps)
 }
 
-fn unit_withdrawal_step(
-    order: &RouterOrder,
-    quote: &MarketOrderQuote,
-    leg: &Value,
-    unit_provider: &str,
+struct UnitWithdrawalStepSpec<'a> {
+    order: &'a RouterOrder,
+    quote: &'a MarketOrderQuote,
+    leg: &'a QuoteLeg,
+    unit_provider: ProviderId,
     hyperliquid_custody: HyperliquidCustodySpec,
     transition_decl_id: Option<String>,
     step_index: i32,
     planned_at: DateTime<Utc>,
+}
+
+fn unit_withdrawal_step(
+    spec: UnitWithdrawalStepSpec<'_>,
 ) -> MarketOrderRoutePlanResult<OrderExecutionStep> {
+    let UnitWithdrawalStepSpec {
+        order,
+        quote,
+        leg,
+        unit_provider,
+        hyperliquid_custody,
+        transition_decl_id,
+        step_index,
+        planned_at,
+    } = spec;
     let min_amount_out = match quote.order_kind {
         MarketOrderKindType::ExactIn => quote.min_amount_out.clone(),
         MarketOrderKindType::ExactOut => Some(quote.amount_out.clone()),
     };
-    let amount_in = required_str(leg, "amount_in")?.to_string();
-    let amount_out = required_str(leg, "amount_out")?.to_string();
+    let amount_in = leg.amount_in.clone();
+    let amount_out = leg.amount_out.clone();
+    let provider = unit_provider.as_str();
 
     Ok(step(StepSpec {
         order_id: order.id,
         transition_decl_id,
         step_index,
         step_type: OrderExecutionStepType::UnitWithdrawal,
-        provider: unit_provider.to_string(),
+        provider: provider.to_string(),
         input_asset: None,
         output_asset: Some(order.destination_asset.clone()),
         amount_in: Some(amount_in.clone()),
         min_amount_out: min_amount_out.clone(),
         provider_ref: None,
-        idempotency_key: idempotency_key(order.id, unit_provider, step_index),
+        idempotency_key: idempotency_key(order.id, provider, step_index),
         // The HyperUnitProvider will resolve `dst_chain_id`/`asset_id` to the
         // HyperUnit wire chain/asset (bitcoin/ethereum, btc/eth) and call
         // `GET /gen` to obtain the protocol_address. The hydrator fills in
@@ -470,12 +489,12 @@ struct HyperliquidCustodySpec {
 
 #[derive(Debug, Clone)]
 struct QuoteLegIndex {
-    by_transition_id: HashMap<String, Vec<Value>>,
+    by_transition_id: HashMap<String, Vec<QuoteLeg>>,
 }
 
 impl QuoteLegIndex {
     fn from_quote(quote: &MarketOrderQuote) -> MarketOrderRoutePlanResult<Self> {
-        let mut by_transition_id: HashMap<String, Vec<Value>> = HashMap::new();
+        let mut by_transition_id: HashMap<String, Vec<QuoteLeg>> = HashMap::new();
         for leg in quote
             .provider_quote
             .get("legs")
@@ -483,18 +502,13 @@ impl QuoteLegIndex {
             .into_iter()
             .flatten()
         {
-            let transition_id = leg_parent_transition_id(leg).ok_or_else(|| {
+            let leg: QuoteLeg = serde_json::from_value(leg.clone()).map_err(|err| {
                 MarketOrderRoutePlanError::UnsupportedRoute {
-                    reason: format!(
-                        "quoted leg is missing transition declaration metadata: {}",
-                        leg
-                    ),
+                    reason: format!("quoted leg is invalid for typed route materialization: {err}"),
                 }
             })?;
-            by_transition_id
-                .entry(transition_id)
-                .or_default()
-                .push(leg.clone());
+            let transition_id = leg.parent_transition_id().to_string();
+            by_transition_id.entry(transition_id).or_default().push(leg);
         }
         Ok(Self { by_transition_id })
     }
@@ -503,7 +517,7 @@ impl QuoteLegIndex {
         &mut self,
         transition_id: &str,
         kind: MarketOrderTransitionKind,
-    ) -> MarketOrderRoutePlanResult<Value> {
+    ) -> MarketOrderRoutePlanResult<QuoteLeg> {
         let mut legs = self.take_all(transition_id);
         if legs.len() != 1 {
             return Err(MarketOrderRoutePlanError::UnsupportedRoute {
@@ -517,7 +531,7 @@ impl QuoteLegIndex {
         Ok(legs.remove(0))
     }
 
-    fn take_all(&mut self, transition_id: &str) -> Vec<Value> {
+    fn take_all(&mut self, transition_id: &str) -> Vec<QuoteLeg> {
         self.by_transition_id
             .remove(transition_id)
             .unwrap_or_default()
@@ -652,35 +666,39 @@ fn unit_deposit_request(spec: UnitDepositRequestSpec<'_>) -> serde_json::Value {
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn hyperliquid_trade_step(
-    order: &RouterOrder,
-    quote: &MarketOrderQuote,
-    exchange_provider: &str,
+struct HyperliquidTradeStepSpec<'a> {
+    order: &'a RouterOrder,
+    quote: &'a MarketOrderQuote,
+    exchange_provider: ProviderId,
     hyperliquid_custody: HyperliquidCustodySpec,
     leg_index: usize,
     leg_count: usize,
-    leg: &Value,
+    leg: &'a QuoteLeg,
     transition_decl_id: Option<String>,
     step_index: i32,
     planned_at: DateTime<Utc>,
+}
+
+fn hyperliquid_trade_step(
+    spec: HyperliquidTradeStepSpec<'_>,
 ) -> MarketOrderRoutePlanResult<OrderExecutionStep> {
-    let trade_leg = leg.get("raw").unwrap_or(leg);
+    let HyperliquidTradeStepSpec {
+        order,
+        quote,
+        exchange_provider,
+        hyperliquid_custody,
+        leg_index,
+        leg_count,
+        leg,
+        transition_decl_id,
+        step_index,
+        planned_at,
+    } = spec;
+    let provider = exchange_provider.as_str();
+    let trade_leg = &leg.raw;
     let order_kind = required_str(trade_leg, "order_kind")?;
-    let amount_in = leg
-        .get("amount_in")
-        .and_then(Value::as_str)
-        .or_else(|| trade_leg.get("amount_in").and_then(Value::as_str))
-        .ok_or_else(|| MarketOrderRoutePlanError::UnsupportedRoute {
-            reason: "hyperliquid trade leg missing amount_in".to_string(),
-        })?;
-    let amount_out = leg
-        .get("amount_out")
-        .and_then(Value::as_str)
-        .or_else(|| trade_leg.get("amount_out").and_then(Value::as_str))
-        .ok_or_else(|| MarketOrderRoutePlanError::UnsupportedRoute {
-            reason: "hyperliquid trade leg missing amount_out".to_string(),
-        })?;
+    let amount_in = leg.amount_in.as_str();
+    let amount_out = leg.amount_out.as_str();
     let min_amount_out = trade_leg
         .get("min_amount_out")
         .and_then(|v| v.as_str())
@@ -689,10 +707,12 @@ fn hyperliquid_trade_step(
         .get("max_amount_in")
         .and_then(|v| v.as_str())
         .map(ToString::to_string);
-    let input_asset =
-        leg_asset(leg, "input_asset").or_else(|_| leg_asset(trade_leg, "input_asset"))?;
-    let output_asset =
-        leg_asset(leg, "output_asset").or_else(|_| leg_asset(trade_leg, "output_asset"))?;
+    let input_asset = leg
+        .input_deposit_asset()
+        .map_err(|reason| MarketOrderRoutePlanError::UnsupportedRoute { reason })?;
+    let output_asset = leg
+        .output_deposit_asset()
+        .map_err(|reason| MarketOrderRoutePlanError::UnsupportedRoute { reason })?;
 
     let request = json!({
         "order_id": order.id,
@@ -738,52 +758,57 @@ fn hyperliquid_trade_step(
         transition_decl_id,
         step_index,
         step_type: OrderExecutionStepType::HyperliquidTrade,
-        provider: exchange_provider.to_string(),
+        provider: provider.to_string(),
         input_asset: Some(input_asset),
         output_asset: Some(output_asset),
         amount_in: Some(amount_in.to_string()),
         min_amount_out: min_amount_out.clone(),
         provider_ref: None,
-        idempotency_key: idempotency_key(order.id, exchange_provider, step_index),
+        idempotency_key: idempotency_key(order.id, provider, step_index),
         request,
         details,
         planned_at,
     }))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn universal_router_swap_step(
-    order: &RouterOrder,
-    source_vault: &DepositVault,
-    quote: &MarketOrderQuote,
-    transition: &TransitionDecl,
-    leg: &Value,
+struct UniversalRouterSwapStepSpec<'a> {
+    order: &'a RouterOrder,
+    source_vault: &'a DepositVault,
+    quote: &'a MarketOrderQuote,
+    transition: &'a TransitionDecl,
+    leg: &'a QuoteLeg,
     source_role: Option<CustodyVaultRole>,
     is_final: bool,
     step_index: i32,
     planned_at: DateTime<Utc>,
+}
+
+fn universal_router_swap_step(
+    spec: UniversalRouterSwapStepSpec<'_>,
 ) -> MarketOrderRoutePlanResult<OrderExecutionStep> {
-    let provider = leg_provider(leg, transition)?.to_string();
-    let swap_leg = leg.get("raw").unwrap_or(leg);
+    let UniversalRouterSwapStepSpec {
+        order,
+        source_vault,
+        quote,
+        transition,
+        leg,
+        source_role,
+        is_final,
+        step_index,
+        planned_at,
+    } = spec;
+    let provider_id = leg_provider(leg, transition)?;
+    let provider = provider_id.as_str().to_string();
+    let swap_leg = &leg.raw;
     let order_kind = required_str(swap_leg, "order_kind")?;
-    let amount_in = leg
-        .get("amount_in")
-        .and_then(Value::as_str)
-        .or_else(|| swap_leg.get("amount_in").and_then(Value::as_str))
-        .ok_or_else(|| MarketOrderRoutePlanError::UnsupportedRoute {
-            reason: "universal router swap leg missing amount_in".to_string(),
-        })?;
-    let amount_out = leg
-        .get("amount_out")
-        .and_then(Value::as_str)
-        .or_else(|| swap_leg.get("amount_out").and_then(Value::as_str))
-        .ok_or_else(|| MarketOrderRoutePlanError::UnsupportedRoute {
-            reason: "universal router swap leg missing amount_out".to_string(),
-        })?;
-    let input_asset =
-        leg_asset(leg, "input_asset").or_else(|_| leg_asset(swap_leg, "input_asset"))?;
-    let output_asset =
-        leg_asset(leg, "output_asset").or_else(|_| leg_asset(swap_leg, "output_asset"))?;
+    let amount_in = leg.amount_in.as_str();
+    let amount_out = leg.amount_out.as_str();
+    let input_asset = leg
+        .input_deposit_asset()
+        .map_err(|reason| MarketOrderRoutePlanError::UnsupportedRoute { reason })?;
+    let output_asset = leg
+        .output_deposit_asset()
+        .map_err(|reason| MarketOrderRoutePlanError::UnsupportedRoute { reason })?;
     let input_decimals = required_u8(swap_leg, "src_decimals")?;
     let output_decimals = required_u8(swap_leg, "dest_decimals")?;
     let price_route = swap_leg.get("price_route").cloned().ok_or_else(|| {
@@ -871,25 +896,6 @@ fn universal_router_swap_step(
     }))
 }
 
-fn leg_asset(leg: &Value, field: &'static str) -> MarketOrderRoutePlanResult<DepositAsset> {
-    let obj = leg
-        .get(field)
-        .ok_or_else(|| MarketOrderRoutePlanError::UnsupportedRoute {
-            reason: format!("hyperliquid leg missing {field}"),
-        })?;
-    let chain_id = required_str(obj, "chain_id")?;
-    let asset_str = required_str(obj, "asset")?;
-    let chain =
-        ChainId::parse(chain_id).map_err(|err| MarketOrderRoutePlanError::UnsupportedRoute {
-            reason: format!("hyperliquid leg {field} chain_id {chain_id:?}: {err}"),
-        })?;
-    let asset =
-        AssetId::parse(asset_str).map_err(|err| MarketOrderRoutePlanError::UnsupportedRoute {
-            reason: format!("hyperliquid leg {field} asset {asset_str:?}: {err}"),
-        })?;
-    Ok(DepositAsset { chain, asset })
-}
-
 fn required_u8(obj: &Value, key: &'static str) -> MarketOrderRoutePlanResult<u8> {
     let value = obj.get(key).and_then(Value::as_u64).ok_or_else(|| {
         MarketOrderRoutePlanError::UnsupportedRoute {
@@ -909,35 +915,20 @@ fn required_str<'a>(obj: &'a Value, key: &'static str) -> MarketOrderRoutePlanRe
     })
 }
 
-fn leg_parent_transition_id(leg: &Value) -> Option<String> {
-    leg.get("transition_parent_decl_id")
-        .and_then(Value::as_str)
-        .map(ToString::to_string)
-        .or_else(|| {
-            leg.get("transition_decl_id")
-                .and_then(Value::as_str)
-                .map(|value| {
-                    value
-                        .split_once(":leg:")
-                        .map_or(value, |(parent, _)| parent)
-                        .to_string()
-                })
-        })
-}
-
-fn leg_provider<'a>(
-    leg: &'a Value,
+fn leg_provider(
+    leg: &QuoteLeg,
     transition: &TransitionDecl,
-) -> MarketOrderRoutePlanResult<&'a str> {
-    leg.get("provider")
-        .and_then(Value::as_str)
-        .or_else(|| Some(transition.provider.as_str()))
-        .ok_or_else(|| MarketOrderRoutePlanError::UnsupportedRoute {
+) -> MarketOrderRoutePlanResult<ProviderId> {
+    if leg.provider != transition.provider {
+        return Err(MarketOrderRoutePlanError::UnsupportedRoute {
             reason: format!(
-                "quoted leg for transition {} is missing provider",
-                transition.id
+                "quote leg provider {} does not match transition provider {}",
+                leg.provider.as_str(),
+                transition.provider.as_str()
             ),
-        })
+        });
+    }
+    Ok(leg.provider)
 }
 
 fn input_custody_role_for_transition(
@@ -1057,18 +1048,33 @@ fn hyperliquid_custody_for_withdrawal(
     })
 }
 
-fn across_bridge_step(
-    order: &RouterOrder,
-    source_vault: &DepositVault,
-    quote: &MarketOrderQuote,
-    transition: &TransitionDecl,
-    leg: &Value,
+struct AcrossBridgeStepSpec<'a> {
+    order: &'a RouterOrder,
+    source_vault: &'a DepositVault,
+    quote: &'a MarketOrderQuote,
+    transition: &'a TransitionDecl,
+    leg: &'a QuoteLeg,
     is_final: bool,
     step_index: i32,
     planned_at: DateTime<Utc>,
+}
+
+fn across_bridge_step(
+    spec: AcrossBridgeStepSpec<'_>,
 ) -> MarketOrderRoutePlanResult<OrderExecutionStep> {
-    let provider = leg_provider(leg, transition)?.to_string();
-    let amount_in = required_str(leg, "amount_in")?.to_string();
+    let AcrossBridgeStepSpec {
+        order,
+        source_vault,
+        quote,
+        transition,
+        leg,
+        is_final,
+        step_index,
+        planned_at,
+    } = spec;
+    let provider_id = leg_provider(leg, transition)?;
+    let provider = provider_id.as_str().to_string();
+    let amount_in = leg.amount_in.clone();
     let recipient = if is_final {
         json!(order.recipient_address)
     } else {
@@ -1122,19 +1128,16 @@ fn unit_deposit_step(
     order: &RouterOrder,
     source_vault: &DepositVault,
     transition: &TransitionDecl,
-    leg: &Value,
+    leg: &QuoteLeg,
     source_role: Option<CustodyVaultRole>,
     step_index: i32,
     planned_at: DateTime<Utc>,
-) -> OrderExecutionStep {
-    let provider = leg_provider(leg, transition)
-        .unwrap_or(transition.provider.as_str())
-        .to_string();
-    let expected_amount = required_str(leg, "amount_in")
-        .unwrap_or_default()
-        .to_string();
+) -> MarketOrderRoutePlanResult<OrderExecutionStep> {
+    let provider_id = leg_provider(leg, transition)?;
+    let provider = provider_id.as_str().to_string();
+    let expected_amount = leg.amount_in.clone();
     let source_role_string = source_role.map(|role| role.to_db_string().to_string());
-    step(StepSpec {
+    Ok(step(StepSpec {
         order_id: order.id,
         transition_decl_id: Some(transition.id.clone()),
         step_index,
@@ -1173,19 +1176,20 @@ fn unit_deposit_step(
             "hyperliquid_destination_provider_address_role": "hyperliquid_destination"
         }),
         planned_at,
-    })
+    }))
 }
 
 fn hyperliquid_bridge_deposit_step(
     order: &RouterOrder,
     transition: &TransitionDecl,
-    leg: &Value,
+    leg: &QuoteLeg,
     source_role: Option<CustodyVaultRole>,
     step_index: i32,
     planned_at: DateTime<Utc>,
 ) -> MarketOrderRoutePlanResult<OrderExecutionStep> {
-    let provider = leg_provider(leg, transition)?.to_string();
-    let amount_in = required_str(leg, "amount_in")?.to_string();
+    let provider_id = leg_provider(leg, transition)?;
+    let provider = provider_id.as_str().to_string();
+    let amount_in = leg.amount_in.clone();
     Ok(step(StepSpec {
         order_id: order.id,
         transition_decl_id: Some(transition.id.clone()),
@@ -1340,6 +1344,7 @@ mod tests {
         DepositVaultStatus, MarketOrderAction, MarketOrderKind, RouterOrderStatus, RouterOrderType,
         VaultAction,
     };
+    use crate::protocol::{AssetId, ChainId};
 
     fn planned_step(
         step_index: i32,

@@ -1,4 +1,4 @@
-use router_primitives::ChainType;
+use router_primitives::{normalize_evm_address, ChainType};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{fmt, str::FromStr};
 
@@ -133,6 +133,17 @@ impl AssetId {
             Self::Reference(value) => value,
         }
     }
+
+    pub fn normalize_for_chain(&self, chain: &ChainId) -> Result<Self, String> {
+        if chain.evm_chain_id().is_none() {
+            return Ok(self.clone());
+        }
+
+        match self {
+            Self::Native => Ok(Self::Native),
+            Self::Reference(value) => normalize_evm_address(value).map(Self::Reference),
+        }
+    }
 }
 
 impl fmt::Display for AssetId {
@@ -166,6 +177,15 @@ pub struct DepositAsset {
     pub asset: AssetId,
 }
 
+impl DepositAsset {
+    pub fn normalized_asset_identity(&self) -> Result<Self, String> {
+        Ok(Self {
+            chain: self.chain.clone(),
+            asset: self.asset.normalize_for_chain(&self.chain)?,
+        })
+    }
+}
+
 #[must_use]
 pub fn supported_chain_ids() -> Vec<ChainId> {
     vec![
@@ -191,8 +211,8 @@ pub fn backend_chain_for_id(chain_id: &ChainId) -> Option<ChainType> {
 
 #[cfg(test)]
 mod tests {
-    use super::{backend_chain_for_id, supported_chain_ids, AssetId, ChainId};
-    use router_primitives::ChainType;
+    use super::{backend_chain_for_id, supported_chain_ids, AssetId, ChainId, DepositAsset};
+    use router_primitives::{normalize_evm_address, ChainType};
 
     #[test]
     fn parses_evm_chain_ids() {
@@ -212,6 +232,25 @@ mod tests {
         let asset = AssetId::parse("NATIVE").expect("valid native asset");
         assert!(asset.is_native());
         assert_eq!(asset.as_str(), "native");
+    }
+
+    #[test]
+    fn normalizes_evm_token_asset_addresses() {
+        let asset = DepositAsset {
+            chain: ChainId::parse("evm:1").unwrap(),
+            asset: AssetId::parse("0xA0B86991C6218B36C1D19D4A2E9EB0CE3606EB48").unwrap(),
+        };
+        let normalized = asset.normalized_asset_identity().unwrap();
+        assert_eq!(
+            normalized.asset.as_str(),
+            "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_evm_token_asset_addresses() {
+        assert!(normalize_evm_address("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48").is_err());
+        assert!(normalize_evm_address("0xnot-an-address").is_err());
     }
 
     #[test]

@@ -1267,7 +1267,7 @@ fn synthesize_hyperliquid_tx_hash(payload: &HyperliquidCallPayload, response: &V
 
 fn decode_calldata(value: &str) -> CustodyActionResult<Bytes> {
     let stripped = value.strip_prefix("0x").unwrap_or(value);
-    if stripped.len() % 2 != 0 {
+    if !stripped.len().is_multiple_of(2) {
         return Err(CustodyActionError::InvalidCalldata {
             reason: "hex calldata must have an even number of characters".to_string(),
         });

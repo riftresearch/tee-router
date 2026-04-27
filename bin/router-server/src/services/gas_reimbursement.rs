@@ -1,19 +1,19 @@
 use crate::{
-    protocol::{backend_chain_for_id, ChainId, DepositAsset},
-    services::asset_registry::{
-        AssetRegistry, MarketOrderTransitionKind, ProviderAssetCapability, ProviderId,
-        TransitionPath,
+    protocol::{ChainId, DepositAsset},
+    services::{
+        asset_registry::{
+            AssetRegistry, CanonicalAsset, MarketOrderTransitionKind, ProviderAssetCapability,
+            ProviderId, TransitionPath,
+        },
+        pricing::{apply_bps_multiplier, PricingSnapshot, BPS_DENOMINATOR},
     },
 };
 use alloy::primitives::U256;
-use router_primitives::ChainType;
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 const QUOTE_SAFETY_MULTIPLIER_BPS: u64 = 12_500;
-const BPS_DENOMINATOR: u64 = 10_000;
-const USD_MICRO: u64 = 1_000_000;
-const ETH_USD_MICRO: u64 = 3_000 * USD_MICRO;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GasReimbursementPlan {
@@ -82,12 +82,20 @@ impl std::fmt::Display for GasReimbursementError {
 
 impl std::error::Error for GasReimbursementError {}
 
-#[must_use]
 pub fn optimized_paymaster_reimbursement_plan(
     registry: &AssetRegistry,
     path: &TransitionPath,
 ) -> Result<GasReimbursementPlan, GasReimbursementError> {
-    let debts = paymaster_debts(path);
+    let pricing = PricingSnapshot::static_bootstrap(Utc::now());
+    optimized_paymaster_reimbursement_plan_with_pricing(registry, path, &pricing)
+}
+
+pub fn optimized_paymaster_reimbursement_plan_with_pricing(
+    registry: &AssetRegistry,
+    path: &TransitionPath,
+    pricing: &PricingSnapshot,
+) -> Result<GasReimbursementPlan, GasReimbursementError> {
+    let debts = paymaster_debts(path, pricing);
     if debts.is_empty() {
         return Ok(GasReimbursementPlan {
             schema_version: 1,
@@ -98,7 +106,7 @@ pub fn optimized_paymaster_reimbursement_plan(
         });
     }
 
-    let candidates = settlement_candidates(registry, path)?;
+    let candidates = settlement_candidates(registry, path, pricing)?;
     if candidates.is_empty() {
         return Err(GasReimbursementError::NoSettlementSite {
             debt_ids: debts.iter().map(|debt| debt.id.clone()).collect(),
@@ -113,7 +121,7 @@ pub fn optimized_paymaster_reimbursement_plan(
         .iter()
         .fold(U256::ZERO, |acc, debt| acc.saturating_add(debt.usd_micro()));
     let retained_usd_micro = apply_bps_multiplier(total_usd_micro, QUOTE_SAFETY_MULTIPLIER_BPS);
-    let amount = usd_micro_to_asset_raw(retained_usd_micro, &best.asset, registry)?;
+    let amount = usd_micro_to_asset_raw(retained_usd_micro, &best.asset, registry, pricing)?;
 
     Ok(GasReimbursementPlan {
         schema_version: 1,
@@ -177,7 +185,7 @@ impl GasReimbursementDebt {
     }
 }
 
-fn paymaster_debts(path: &TransitionPath) -> Vec<GasReimbursementDebt> {
+fn paymaster_debts(path: &TransitionPath, pricing: &PricingSnapshot) -> Vec<GasReimbursementDebt> {
     path.transitions
         .iter()
         .enumerate()
@@ -188,9 +196,12 @@ fn paymaster_debts(path: &TransitionPath) -> Vec<GasReimbursementDebt> {
             {
                 return None;
             }
-            let estimated_native_gas_wei =
-                estimate_paymaster_native_cost_wei(&transition.input.asset.chain, transition.kind);
-            let estimated_usd_micro = wei_to_usd_micro(estimated_native_gas_wei);
+            let estimated_native_gas_wei = estimate_paymaster_native_cost_wei(
+                &transition.input.asset.chain,
+                transition.kind,
+                pricing,
+            );
+            let estimated_usd_micro = pricing.wei_to_usd_micro(estimated_native_gas_wei);
             Some(GasReimbursementDebt {
                 id: format!("paymaster-gas:{index}"),
                 transition_decl_id: transition.id.clone(),
@@ -207,6 +218,7 @@ fn paymaster_debts(path: &TransitionPath) -> Vec<GasReimbursementDebt> {
 fn settlement_candidates(
     registry: &AssetRegistry,
     path: &TransitionPath,
+    pricing: &PricingSnapshot,
 ) -> Result<Vec<SettlementCandidate>, GasReimbursementError> {
     let mut by_site = BTreeMap::<(String, String, String), SettlementCandidate>::new();
     for transition in &path.transitions {
@@ -214,28 +226,26 @@ fn settlement_candidates(
         let Some(chain_asset) = registry.chain_asset(asset) else {
             continue;
         };
-        let (eligible, collection_cost_usd_micro, provider_asset) =
-            if asset.chain.as_str() == "hyperliquid" {
-                let provider_asset = registry
-                    .provider_asset(
-                        ProviderId::Hyperliquid,
-                        asset,
-                        ProviderAssetCapability::ExchangeInput,
-                    )
-                    .map(|entry| entry.provider_asset.clone());
-                (provider_asset.is_some(), U256::ZERO, provider_asset)
-            } else if is_evm_chain(&asset.chain) && !asset.asset.is_native() {
-                (
-                    true,
-                    wei_to_usd_micro(estimate_erc20_collection_cost_wei(
-                        &asset.chain,
-                        chain_asset.decimals,
-                    )),
-                    None,
+        let (eligible, collection_cost_usd_micro, provider_asset) = if asset.chain.as_str()
+            == "hyperliquid"
+        {
+            let provider_asset = registry
+                .provider_asset(
+                    ProviderId::Hyperliquid,
+                    asset,
+                    ProviderAssetCapability::ExchangeInput,
                 )
-            } else {
-                (false, U256::ZERO, None)
-            };
+                .map(|entry| entry.provider_asset.clone());
+            (provider_asset.is_some(), U256::ZERO, provider_asset)
+        } else if is_evm_chain(&asset.chain) && !asset.asset.is_native() {
+            (
+                true,
+                pricing.wei_to_usd_micro(estimate_erc20_collection_cost_wei(&asset.chain, pricing)),
+                None,
+            )
+        } else {
+            (false, U256::ZERO, None)
+        };
         if !eligible {
             continue;
         }
@@ -266,7 +276,11 @@ fn transition_requires_evm_sender_gas(kind: MarketOrderTransitionKind) -> bool {
     )
 }
 
-fn estimate_paymaster_native_cost_wei(chain: &ChainId, kind: MarketOrderTransitionKind) -> U256 {
+fn estimate_paymaster_native_cost_wei(
+    chain: &ChainId,
+    kind: MarketOrderTransitionKind,
+    pricing: &PricingSnapshot,
+) -> U256 {
     let action_gas_units = match kind {
         MarketOrderTransitionKind::AcrossBridge => 450_000_u64,
         MarketOrderTransitionKind::HyperliquidBridgeDeposit => 180_000_u64,
@@ -278,76 +292,38 @@ fn estimate_paymaster_native_cost_wei(chain: &ChainId, kind: MarketOrderTransiti
     };
     let top_up_gas_units = 21_000_u64;
     U256::from(action_gas_units.saturating_add(top_up_gas_units))
-        .saturating_mul(chain_gas_price_wei(chain))
+        .saturating_mul(pricing.chain_gas_price_wei(chain))
 }
 
-fn estimate_erc20_collection_cost_wei(chain: &ChainId, _decimals: u8) -> U256 {
-    U256::from(65_000_u64).saturating_mul(chain_gas_price_wei(chain))
-}
-
-fn chain_gas_price_wei(chain: &ChainId) -> U256 {
-    match backend_chain_for_id(chain) {
-        Some(ChainType::Ethereum) => U256::from(25_000_000_000_u64),
-        Some(ChainType::Arbitrum) => U256::from(100_000_000_u64),
-        Some(ChainType::Base) => U256::from(20_000_000_u64),
-        _ => U256::ZERO,
-    }
-}
-
-fn wei_to_usd_micro(wei: U256) -> U256 {
-    div_ceil(wei.saturating_mul(U256::from(ETH_USD_MICRO)), pow10(18))
+fn estimate_erc20_collection_cost_wei(chain: &ChainId, pricing: &PricingSnapshot) -> U256 {
+    U256::from(65_000_u64).saturating_mul(pricing.chain_gas_price_wei(chain))
 }
 
 fn usd_micro_to_asset_raw(
     usd_micro: U256,
     asset: &DepositAsset,
     registry: &AssetRegistry,
+    pricing: &PricingSnapshot,
 ) -> Result<U256, GasReimbursementError> {
     let chain_asset = registry.chain_asset(asset).ok_or_else(|| {
         GasReimbursementError::UnsupportedSettlementAsset {
             asset: asset.clone(),
         }
     })?;
-    let asset_usd_micro = match chain_asset.canonical {
-        crate::services::asset_registry::CanonicalAsset::Usdc
-        | crate::services::asset_registry::CanonicalAsset::Usdt => U256::from(USD_MICRO),
-        crate::services::asset_registry::CanonicalAsset::Eth => U256::from(ETH_USD_MICRO),
-        _ => {
-            return Err(GasReimbursementError::UnsupportedSettlementAsset {
+    match chain_asset.canonical {
+        CanonicalAsset::Usdc | CanonicalAsset::Usdt | CanonicalAsset::Eth => pricing
+            .usd_micro_to_asset_raw(usd_micro, chain_asset.canonical, chain_asset.decimals)
+            .ok_or_else(|| GasReimbursementError::UnsupportedSettlementAsset {
                 asset: asset.clone(),
-            });
-        }
-    };
-    Ok(div_ceil(
-        usd_micro.saturating_mul(pow10(chain_asset.decimals)),
-        asset_usd_micro,
-    ))
-}
-
-fn apply_bps_multiplier(amount: U256, multiplier_bps: u64) -> U256 {
-    div_ceil(
-        amount.saturating_mul(U256::from(multiplier_bps)),
-        U256::from(BPS_DENOMINATOR),
-    )
+            }),
+        _ => Err(GasReimbursementError::UnsupportedSettlementAsset {
+            asset: asset.clone(),
+        }),
+    }
 }
 
 fn is_evm_chain(chain: &ChainId) -> bool {
     chain.evm_chain_id().is_some()
-}
-
-fn pow10(decimals: u8) -> U256 {
-    let mut value = U256::from(1_u64);
-    for _ in 0..decimals {
-        value = value.saturating_mul(U256::from(10_u64));
-    }
-    value
-}
-
-fn div_ceil(numerator: U256, denominator: U256) -> U256 {
-    if numerator == U256::ZERO {
-        return U256::ZERO;
-    }
-    numerator.saturating_add(denominator.saturating_sub(U256::from(1_u64))) / denominator
 }
 
 #[cfg(test)]

@@ -31,6 +31,7 @@ const VAULT_FUNDING_HINT_PASS_LIMIT: i64 = 25;
 const PROVIDER_OPERATION_HINT_CHANNEL: &str = "router_provider_operation_hints";
 const VAULT_FUNDING_HINT_CHANNEL: &str = "router_vault_funding_hints";
 const VAULT_REFUND_WAKEUP_CHANNEL: &str = "router_vault_refund_wakeups";
+const QUOTE_CLEANUP_INTERVAL: Duration = Duration::from_secs(3600);
 
 #[derive(Debug, Clone)]
 pub struct RouterWorkerConfig {
@@ -151,6 +152,7 @@ struct VaultWorkOutcome {
 type VaultTaskResult = std::result::Result<VaultWorkOutcome, String>;
 type OrderTaskResult = std::result::Result<OrderWorkerPassSummary, String>;
 type RouteCostTaskResult = std::result::Result<RouteCostRefreshSummary, String>;
+type QuoteCleanupTaskResult = std::result::Result<u64, String>;
 
 pub async fn run_worker(args: RouterServerArgs) -> Result<()> {
     let config = RouterWorkerConfig::from_args(&args)?;
@@ -192,6 +194,8 @@ pub async fn run_worker_loop(
     lease_renew_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut route_cost_refresh_interval = interval(config.route_cost_refresh_interval);
     route_cost_refresh_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut quote_cleanup_interval = interval(QUOTE_CLEANUP_INTERVAL);
+    quote_cleanup_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut worker_listener = PgListener::connect(&config.database_url)
         .await
         .map_err(|err| format!("failed to connect worker listener: {err}"))?;
@@ -210,9 +214,11 @@ pub async fn run_worker_loop(
     let mut vault_tasks: JoinSet<VaultTaskResult> = JoinSet::new();
     let mut order_execution_tasks: JoinSet<OrderTaskResult> = JoinSet::new();
     let mut route_cost_tasks: JoinSet<RouteCostTaskResult> = JoinSet::new();
+    let mut quote_cleanup_tasks: JoinSet<QuoteCleanupTaskResult> = JoinSet::new();
     let mut order_wake_queue = OrderWakeQueue::default();
     let mut pending_vault_wakeup = false;
     let mut pending_route_cost_refresh = false;
+    let mut pending_quote_cleanup = false;
     let mut next_refund_due_at: Option<DateTime<Utc>> = None;
 
     loop {
@@ -230,6 +236,7 @@ pub async fn run_worker_loop(
                     active_lease = Some(lease);
                     lease_renew_interval.reset();
                     route_cost_refresh_interval.reset();
+                    quote_cleanup_interval.reset();
                     order_wake_queue.enqueue_global();
                     spawn_order_execution_work_if_idle(
                         &mut order_execution_tasks,
@@ -247,6 +254,12 @@ pub async fn run_worker_loop(
                         &mut route_cost_tasks,
                         route_costs.clone(),
                         &mut pending_route_cost_refresh,
+                    );
+                    pending_quote_cleanup = true;
+                    spawn_quote_cleanup_if_idle(
+                        &mut quote_cleanup_tasks,
+                        db.clone(),
+                        &mut pending_quote_cleanup,
                     );
                     next_refund_due_at = refresh_next_refund_due_at(&db).await?;
                 }
@@ -284,9 +297,11 @@ pub async fn run_worker_loop(
                         abort_vault_tasks(&mut vault_tasks).await;
                         abort_order_execution_tasks(&mut order_execution_tasks).await;
                         abort_route_cost_tasks(&mut route_cost_tasks).await;
+                        abort_quote_cleanup_tasks(&mut quote_cleanup_tasks).await;
                         order_wake_queue = OrderWakeQueue::default();
                         pending_vault_wakeup = false;
                         pending_route_cost_refresh = false;
+                        pending_quote_cleanup = false;
                         next_refund_due_at = None;
                     }
                     Err(err) => {
@@ -310,6 +325,14 @@ pub async fn run_worker_loop(
                     &mut route_cost_tasks,
                     route_costs.clone(),
                     &mut pending_route_cost_refresh,
+                );
+            }
+            _ = quote_cleanup_interval.tick(), if quote_cleanup_tasks.is_empty() => {
+                pending_quote_cleanup = true;
+                spawn_quote_cleanup_if_idle(
+                    &mut quote_cleanup_tasks,
+                    db.clone(),
+                    &mut pending_quote_cleanup,
                 );
             }
             hint = worker_listener.recv() => {
@@ -387,6 +410,20 @@ pub async fn run_worker_loop(
                     &mut route_cost_tasks,
                     route_costs.clone(),
                     &mut pending_route_cost_refresh,
+                );
+            }
+            quote_cleanup_result = quote_cleanup_tasks.join_next(), if !quote_cleanup_tasks.is_empty() => {
+                let deleted_quotes = handle_quote_cleanup_task_result(quote_cleanup_result)?;
+                if deleted_quotes > 0 {
+                    info!(
+                        deleted_quotes,
+                        "Router worker pruned expired unassociated quotes"
+                    );
+                }
+                spawn_quote_cleanup_if_idle(
+                    &mut quote_cleanup_tasks,
+                    db.clone(),
+                    &mut pending_quote_cleanup,
                 );
             }
         }
@@ -474,6 +511,17 @@ fn spawn_route_cost_refresh_if_idle(
     }
 }
 
+fn spawn_quote_cleanup_if_idle(
+    quote_cleanup_tasks: &mut JoinSet<QuoteCleanupTaskResult>,
+    db: Database,
+    pending_quote_cleanup: &mut bool,
+) {
+    if quote_cleanup_tasks.is_empty() && *pending_quote_cleanup {
+        *pending_quote_cleanup = false;
+        quote_cleanup_tasks.spawn(run_quote_cleanup(db));
+    }
+}
+
 async fn run_vault_work_pass(vault_manager: Arc<VaultManager>) -> VaultTaskResult {
     let started = Instant::now();
     let funding_hints = vault_manager
@@ -543,6 +591,17 @@ async fn run_route_cost_refresh(route_costs: Arc<RouteCostService>) -> RouteCost
     Ok(summary)
 }
 
+async fn run_quote_cleanup(db: Database) -> QuoteCleanupTaskResult {
+    let started = Instant::now();
+    let deleted = db
+        .orders()
+        .delete_expired_unassociated_market_order_quotes(Utc::now())
+        .await
+        .map_err(|err| err.to_string())?;
+    telemetry::record_worker_tick("quote_cleanup", started.elapsed());
+    Ok(deleted)
+}
+
 fn handle_vault_task_result(
     result: Option<std::result::Result<VaultTaskResult, JoinError>>,
 ) -> std::result::Result<VaultWorkOutcome, String> {
@@ -582,6 +641,17 @@ fn handle_route_cost_task_result(
     }
 }
 
+fn handle_quote_cleanup_task_result(
+    result: Option<std::result::Result<QuoteCleanupTaskResult, JoinError>>,
+) -> std::result::Result<u64, String> {
+    match result {
+        Some(Ok(Ok(deleted))) => Ok(deleted),
+        Some(Ok(Err(error))) => Err(format!("quote cleanup failed: {error}")),
+        Some(Err(error)) => Err(format!("quote cleanup panicked or was cancelled: {error}")),
+        None => Err("quote cleanup task set terminated unexpectedly".to_string()),
+    }
+}
+
 async fn abort_vault_tasks(vault_tasks: &mut JoinSet<VaultTaskResult>) {
     vault_tasks.abort_all();
     while vault_tasks.join_next().await.is_some() {}
@@ -595,6 +665,11 @@ async fn abort_order_execution_tasks(order_execution_tasks: &mut JoinSet<OrderTa
 async fn abort_route_cost_tasks(route_cost_tasks: &mut JoinSet<RouteCostTaskResult>) {
     route_cost_tasks.abort_all();
     while route_cost_tasks.join_next().await.is_some() {}
+}
+
+async fn abort_quote_cleanup_tasks(quote_cleanup_tasks: &mut JoinSet<QuoteCleanupTaskResult>) {
+    quote_cleanup_tasks.abort_all();
+    while quote_cleanup_tasks.join_next().await.is_some() {}
 }
 
 async fn refresh_next_refund_due_at(
@@ -616,7 +691,7 @@ fn refund_due_delay(next_refund_due_at: Option<&DateTime<Utc>>) -> Duration {
     }
     (*next_refund_due_at - now)
         .to_std()
-        .unwrap_or_else(|_| Duration::ZERO)
+        .unwrap_or(Duration::ZERO)
 }
 
 fn ensure_positive_seconds(name: &str, seconds: u64) -> Result<()> {

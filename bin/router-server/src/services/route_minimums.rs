@@ -280,7 +280,7 @@ impl RouteMinimumService {
         let unit_candidates: Vec<Option<Arc<dyn UnitProvider>>> = if requires_unit {
             self.action_providers
                 .units()
-                .into_iter()
+                .iter()
                 .filter(|unit| unit_path_compatible(unit.as_ref(), path))
                 .cloned()
                 .map(Some)
@@ -295,7 +295,7 @@ impl RouteMinimumService {
         let exchange_candidates: Vec<Option<Arc<dyn ExchangeProvider>>> = if requires_exchange {
             self.action_providers
                 .exchanges()
-                .into_iter()
+                .iter()
                 .filter(|exchange| exchange_path_compatible(exchange.id(), path))
                 .cloned()
                 .map(Some)
@@ -362,18 +362,18 @@ impl RouteMinimumService {
                     let unit = unit.ok_or_else(|| RouteMinimumError::Unsupported {
                         reason: "unit provider is required for unit withdrawal".to_string(),
                     })?;
-                    observed_legs.push(transition_floor_leg_json(
-                        &transition.id,
-                        transition.kind,
-                        unit.id(),
-                        &transition.input.asset,
-                        &transition.output.asset,
-                        &required_output,
-                        &required_output,
-                        json!({
+                    observed_legs.push(transition_floor_leg_json(TransitionFloorLegSpec {
+                        transition_decl_id: &transition.id,
+                        transition_kind: transition.kind,
+                        provider: unit.id(),
+                        input_asset: &transition.input.asset,
+                        output_asset: &transition.output.asset,
+                        amount_in: &required_output,
+                        amount_out: &required_output,
+                        raw: json!({
                             "recipient_address": recipient_address,
                         }),
-                    ));
+                    }));
                 }
                 MarketOrderTransitionKind::HyperliquidTrade => {
                     let exchange = exchange.ok_or_else(|| RouteMinimumError::Unsupported {
@@ -387,16 +387,16 @@ impl RouteMinimumService {
                         recipient_address,
                     )
                     .await?;
-                    observed_legs.push(transition_floor_leg_json(
-                        &transition.id,
-                        transition.kind,
-                        exchange.id(),
-                        &transition.input.asset,
-                        &transition.output.asset,
-                        &exchange_quote.amount_in,
-                        &exchange_quote.amount_out,
-                        exchange_quote.provider_quote,
-                    ));
+                    observed_legs.push(transition_floor_leg_json(TransitionFloorLegSpec {
+                        transition_decl_id: &transition.id,
+                        transition_kind: transition.kind,
+                        provider: exchange.id(),
+                        input_asset: &transition.input.asset,
+                        output_asset: &transition.output.asset,
+                        amount_in: &exchange_quote.amount_in,
+                        amount_out: &exchange_quote.amount_out,
+                        raw: exchange_quote.provider_quote,
+                    }));
                     let mut next_required =
                         parse_u256("exchange_quote.amount_in", &exchange_quote.amount_in)?;
                     if index > 0
@@ -433,16 +433,16 @@ impl RouteMinimumService {
                         depositor_address,
                     )
                     .await?;
-                    observed_legs.push(transition_floor_leg_json(
-                        &transition.id,
-                        transition.kind,
-                        bridge.id(),
-                        &transition.input.asset,
-                        &transition.output.asset,
-                        &bridge_quote.amount_in,
-                        &bridge_quote.amount_out,
-                        bridge_quote.provider_quote,
-                    ));
+                    observed_legs.push(transition_floor_leg_json(TransitionFloorLegSpec {
+                        transition_decl_id: &transition.id,
+                        transition_kind: transition.kind,
+                        provider: bridge.id(),
+                        input_asset: &transition.input.asset,
+                        output_asset: &transition.output.asset,
+                        amount_in: &bridge_quote.amount_in,
+                        amount_out: &bridge_quote.amount_out,
+                        raw: bridge_quote.provider_quote,
+                    }));
                     required_output = bridge_quote.amount_in;
                 }
                 MarketOrderTransitionKind::UnitDeposit => {
@@ -452,16 +452,16 @@ impl RouteMinimumService {
                     let required_in = parse_u256("required_output", &required_output)?
                         .max(unit_minimum_for_asset(&transition.input.asset));
                     required_output = required_in.to_string();
-                    observed_legs.push(transition_floor_leg_json(
-                        &transition.id,
-                        transition.kind,
-                        unit.id(),
-                        &transition.input.asset,
-                        &transition.output.asset,
-                        &required_output,
-                        &required_output,
-                        json!({}),
-                    ));
+                    observed_legs.push(transition_floor_leg_json(TransitionFloorLegSpec {
+                        transition_decl_id: &transition.id,
+                        transition_kind: transition.kind,
+                        provider: unit.id(),
+                        input_asset: &transition.input.asset,
+                        output_asset: &transition.output.asset,
+                        amount_in: &required_output,
+                        amount_out: &required_output,
+                        raw: json!({}),
+                    }));
                 }
             }
         }
@@ -619,31 +619,33 @@ fn exchange_path_compatible(exchange_id: &str, path: &TransitionPath) -> bool {
         })
 }
 
-fn transition_floor_leg_json(
-    transition_decl_id: &str,
+struct TransitionFloorLegSpec<'a> {
+    transition_decl_id: &'a str,
     transition_kind: MarketOrderTransitionKind,
-    provider: &str,
-    input_asset: &DepositAsset,
-    output_asset: &DepositAsset,
-    amount_in: &str,
-    amount_out: &str,
+    provider: &'a str,
+    input_asset: &'a DepositAsset,
+    output_asset: &'a DepositAsset,
+    amount_in: &'a str,
+    amount_out: &'a str,
     raw: Value,
-) -> Value {
+}
+
+fn transition_floor_leg_json(spec: TransitionFloorLegSpec<'_>) -> Value {
     json!({
-        "transition_decl_id": transition_decl_id,
-        "transition_kind": transition_kind.as_str(),
-        "provider": provider,
+        "transition_decl_id": spec.transition_decl_id,
+        "transition_kind": spec.transition_kind.as_str(),
+        "provider": spec.provider,
         "input_asset": {
-            "chain_id": input_asset.chain.as_str(),
-            "asset": input_asset.asset.as_str(),
+            "chain_id": spec.input_asset.chain.as_str(),
+            "asset": spec.input_asset.asset.as_str(),
         },
         "output_asset": {
-            "chain_id": output_asset.chain.as_str(),
-            "asset": output_asset.asset.as_str(),
+            "chain_id": spec.output_asset.chain.as_str(),
+            "asset": spec.output_asset.asset.as_str(),
         },
-        "amount_in": amount_in,
-        "amount_out": amount_out,
-        "raw": raw,
+        "amount_in": spec.amount_in,
+        "amount_out": spec.amount_out,
+        "raw": spec.raw,
     })
 }
 

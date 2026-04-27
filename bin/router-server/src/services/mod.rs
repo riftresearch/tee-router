@@ -8,7 +8,9 @@ pub mod gas_reimbursement;
 pub mod market_order_planner;
 pub mod order_executor;
 pub mod order_manager;
+pub mod pricing;
 pub mod provider_policy;
+pub mod quote_legs;
 pub mod route_costs;
 pub mod route_minimums;
 pub mod vault_manager;
@@ -34,6 +36,7 @@ pub use order_executor::{
     ProviderOperationStatusUpdate, ProviderOperationStatusUpdateOutcome,
 };
 pub use order_manager::OrderManager;
+pub use pricing::PricingSnapshot;
 pub use provider_policy::{ProviderPolicyService, ProviderPolicySnapshot};
 pub use route_costs::{RouteCostRefreshSummary, RouteCostService, RouteCostSnapshot};
 pub use route_minimums::{RouteMinimumError, RouteMinimumService, RouteMinimumSnapshot};

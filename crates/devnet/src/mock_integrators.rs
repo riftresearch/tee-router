@@ -980,7 +980,7 @@ async fn mock_across_real_swap_approval(
 ) -> impl IntoResponse {
     if let Err(response) = validate_across_request(&state, &headers, query.integrator_id.as_deref())
     {
-        return response;
+        return *response;
     }
     if let Some(error) = state.next_across_swap_approval_error.lock().await.take() {
         return mock_across_error_response(
@@ -1210,9 +1210,7 @@ async fn mock_across_allowance(
     owner: Address,
     spender: Address,
 ) -> Option<U256> {
-    let Some(rpc_url) = state.across_evm_rpc_url.as_deref() else {
-        return None;
-    };
+    let rpc_url = state.across_evm_rpc_url.as_deref()?;
     let provider = match ProviderBuilder::new().connect(rpc_url).await {
         Ok(provider) => provider,
         Err(err) => {
@@ -1235,9 +1233,7 @@ async fn mock_across_balance(
     token: Address,
     owner: Address,
 ) -> Option<U256> {
-    let Some(rpc_url) = state.across_evm_rpc_url.as_deref() else {
-        return None;
-    };
+    let rpc_url = state.across_evm_rpc_url.as_deref()?;
     let provider = match ProviderBuilder::new().connect(rpc_url).await {
         Ok(provider) => provider,
         Err(err) => {
@@ -1642,7 +1638,7 @@ async fn mock_across_deposit_status(
     Query(query): Query<MockAcrossDepositStatusQuery>,
 ) -> impl IntoResponse {
     if let Err(response) = validate_across_request(&state, &headers, None) {
-        return response;
+        return *response;
     }
     let deposits = state.across_deposits.lock().await;
     let record = if let (Some(origin_chain_id), Some(deposit_id)) =
@@ -4115,32 +4111,32 @@ fn validate_across_request(
     state: &MockIntegratorState,
     headers: &HeaderMap,
     integrator_id: Option<&str>,
-) -> Result<(), axum::response::Response> {
+) -> Result<(), Box<axum::response::Response>> {
     if let Some(expected_api_key) = state.across_api_key.as_deref() {
         let expected = format!("Bearer {expected_api_key}");
         let actual = headers
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok());
         if actual != Some(expected.as_str()) {
-            return Err(mock_across_error_response(
+            return Err(Box::new(mock_across_error_response(
                 StatusCode::UNAUTHORIZED,
                 "auth_error",
                 "missing_or_invalid_auth",
                 "Across API key is required",
                 None,
-            ));
+            )));
         }
     }
 
     if let Some(expected_integrator_id) = state.across_integrator_id.as_deref() {
         if integrator_id != Some(expected_integrator_id) {
-            return Err(mock_across_error_response(
+            return Err(Box::new(mock_across_error_response(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "validation_error",
                 "invalid_integrator_id",
                 "integratorId is required",
                 Some("integratorId"),
-            ));
+            )));
         }
     }
 

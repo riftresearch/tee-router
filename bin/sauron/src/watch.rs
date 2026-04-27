@@ -3,7 +3,7 @@ use std::{collections::HashMap, str::FromStr, sync::Arc, time::Instant};
 use alloy::primitives::U256;
 use chrono::{DateTime, Months, Utc};
 use metrics::{counter, gauge, histogram};
-use router_primitives::{ChainType, TokenIdentifier};
+use router_primitives::{normalize_evm_address, ChainType, TokenIdentifier};
 use serde::Deserialize;
 use snafu::ResultExt;
 use sqlx_core::row::Row;
@@ -227,6 +227,10 @@ impl WatchStore {
         self.inner.read().await.by_watch_id.len()
     }
 
+    pub async fn is_empty(&self) -> bool {
+        self.inner.read().await.by_watch_id.is_empty()
+    }
+
     pub async fn snapshot_for_chain(&self, chain: ChainType) -> Vec<SharedWatchEntry> {
         let started = Instant::now();
         let now = utc::now();
@@ -389,7 +393,8 @@ fn parse_watch_row(row: sqlx_postgres::PgRow) -> Result<WatchEntry> {
             message: format!("watch {watch_id} missing asset_id"),
         }
     })?;
-    let source_token = token_identifier_from_router_asset_id(asset_id.as_deref());
+    let source_token =
+        token_identifier_from_router_asset_id(watch_id, source_chain, asset_id.as_deref())?;
 
     let address = normalize_address(
         source_chain,
@@ -474,10 +479,28 @@ fn chain_type_from_router_chain_id(chain_id: &str) -> Option<ChainType> {
     }
 }
 
-fn token_identifier_from_router_asset_id(asset_id: Option<&str>) -> TokenIdentifier {
+fn token_identifier_from_router_asset_id(
+    watch_id: Uuid,
+    chain: ChainType,
+    asset_id: Option<&str>,
+) -> Result<TokenIdentifier> {
     match asset_id {
-        None | Some("native") => TokenIdentifier::Native,
-        Some(asset_id) => TokenIdentifier::address(asset_id),
+        None | Some("native") => Ok(TokenIdentifier::Native),
+        Some(asset_id) => match chain {
+            ChainType::Bitcoin => Err(crate::error::Error::InvalidWatchRow {
+                message: format!("watch {watch_id} had non-native Bitcoin asset_id {asset_id}"),
+            }),
+            ChainType::Ethereum
+            | ChainType::Arbitrum
+            | ChainType::Base
+            | ChainType::Hyperliquid => normalize_evm_address(asset_id)
+                .map(TokenIdentifier::Address)
+                .map_err(|reason| crate::error::Error::InvalidWatchRow {
+                    message: format!(
+                        "watch {watch_id} had invalid EVM asset_id {asset_id}: {reason}"
+                    ),
+                }),
+        },
     }
 }
 
@@ -489,7 +512,7 @@ fn deposit_vault_watch_cutoff() -> DateTime<Utc> {
 
 #[cfg(test)]
 mod tests {
-    use super::{WatchEntry, WatchStore, WatchTarget};
+    use super::{token_identifier_from_router_asset_id, WatchEntry, WatchStore, WatchTarget};
     use alloy::primitives::U256;
     use chrono::Duration;
     use router_primitives::{ChainType, TokenIdentifier};
@@ -522,6 +545,33 @@ mod tests {
             created_at: utc::now(),
             updated_at: utc::now(),
         }
+    }
+
+    #[test]
+    fn router_asset_tokens_are_normalized_for_evm_watches() {
+        let token = token_identifier_from_router_asset_id(
+            Uuid::now_v7(),
+            ChainType::Base,
+            Some("0xCbB7C0000aB88B473b1f5aFd9ef808440eed33Bf"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            token,
+            TokenIdentifier::Address("0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf".to_string())
+        );
+    }
+
+    #[test]
+    fn router_asset_tokens_reject_invalid_evm_watches() {
+        let err = token_identifier_from_router_asset_id(
+            Uuid::now_v7(),
+            ChainType::Ethereum,
+            Some("not-an-address"),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("invalid EVM asset_id"));
     }
 
     #[tokio::test]

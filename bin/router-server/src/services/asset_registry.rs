@@ -38,6 +38,17 @@ pub enum ProviderId {
 }
 
 impl ProviderId {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "across" => Some(Self::Across),
+            "unit" => Some(Self::Unit),
+            "hyperliquid_bridge" => Some(Self::HyperliquidBridge),
+            "hyperliquid" => Some(Self::Hyperliquid),
+            "velora" => Some(Self::Velora),
+            _ => None,
+        }
+    }
+
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -251,13 +262,6 @@ pub struct AssetSlot {
     pub required_custody_role: RequiredCustodyRole,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TransitionMetadata {
-    pub reliability_prior: f64,
-    pub p50_latency_ms: u64,
-    pub p95_latency_ms: u64,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransitionDecl {
     pub id: String,
@@ -285,7 +289,6 @@ impl TransitionDecl {
 pub struct TransitionPath {
     pub id: String,
     pub transitions: Vec<TransitionDecl>,
-    pub metadata: TransitionMetadata,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -568,11 +571,9 @@ impl AssetRegistry {
         while let Some(state) = queue.pop_front() {
             if state.node == goal && !state.path.is_empty() {
                 let id = transition_path_id(&state.path);
-                let metadata = aggregate_path_metadata(&state.path);
                 paths.push(TransitionPath {
                     id,
                     transitions: state.path.clone(),
-                    metadata,
                 });
             }
 
@@ -888,55 +889,6 @@ fn required_roles_for_transition_kind(
             RequiredCustodyRole::IntermediateExecution,
             RequiredCustodyRole::DestinationPayout,
         ),
-    }
-}
-
-fn transition_default_metadata(kind: MarketOrderTransitionKind) -> TransitionMetadata {
-    match kind {
-        MarketOrderTransitionKind::AcrossBridge => TransitionMetadata {
-            reliability_prior: 0.95,
-            p50_latency_ms: 120_000,
-            p95_latency_ms: 600_000,
-        },
-        MarketOrderTransitionKind::UnitDeposit | MarketOrderTransitionKind::UnitWithdrawal => {
-            TransitionMetadata {
-                reliability_prior: 0.95,
-                p50_latency_ms: 60_000,
-                p95_latency_ms: 300_000,
-            }
-        }
-        MarketOrderTransitionKind::HyperliquidBridgeDeposit => TransitionMetadata {
-            reliability_prior: 0.97,
-            p50_latency_ms: 30_000,
-            p95_latency_ms: 120_000,
-        },
-        MarketOrderTransitionKind::HyperliquidTrade => TransitionMetadata {
-            reliability_prior: 0.99,
-            p50_latency_ms: 1_500,
-            p95_latency_ms: 10_000,
-        },
-        MarketOrderTransitionKind::UniversalRouterSwap => TransitionMetadata {
-            reliability_prior: 0.96,
-            p50_latency_ms: 12_000,
-            p95_latency_ms: 60_000,
-        },
-    }
-}
-
-fn aggregate_path_metadata(transitions: &[TransitionDecl]) -> TransitionMetadata {
-    let mut reliability = 1.0_f64;
-    let mut p50 = 0_u64;
-    let mut p95 = 0_u64;
-    for transition in transitions {
-        let edge = transition_default_metadata(transition.kind);
-        reliability *= edge.reliability_prior.clamp(0.0, 1.0);
-        p50 = p50.saturating_add(edge.p50_latency_ms);
-        p95 = p95.saturating_add(edge.p95_latency_ms);
-    }
-    TransitionMetadata {
-        reliability_prior: reliability,
-        p50_latency_ms: p50,
-        p95_latency_ms: p95,
     }
 }
 

@@ -38,7 +38,7 @@ mod tests {
         assert_eq!(float_to_wire(0.12345678), "0.12345678");
         assert_eq!(float_to_wire(87_654_321.123_456_78), "87654321.12345678");
         assert_eq!(float_to_wire(987_654_321.000_000_00), "987654321");
-        assert_eq!(float_to_wire(87_654_321.1234), "87654321.1234");
+        assert_eq!(float_to_wire(87_654_321.123_4), "87654321.1234");
         assert_eq!(float_to_wire(0.000_760), "0.00076");
         assert_eq!(float_to_wire(0.00076), "0.00076");
         assert_eq!(float_to_wire(987_654_321.0), "987654321");

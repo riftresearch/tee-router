@@ -8,6 +8,7 @@ use crate::{
         asset_registry::{
             AssetRegistry, MarketOrderTransitionKind, TransitionDecl, TransitionPath,
         },
+        pricing::{div_ceil_u64, PricingSnapshot, BPS_DENOMINATOR},
     },
 };
 use alloy::primitives::U256;
@@ -20,10 +21,7 @@ use tracing::debug;
 const DEFAULT_REFRESH_TTL: Duration = Duration::from_secs(600);
 const DEFAULT_AMOUNT_BUCKET: &str = "usd_1000";
 const DEFAULT_SAMPLE_AMOUNT_USD_MICROS: u64 = 1_000_000_000;
-const BPS_DENOMINATOR: u64 = 10_000;
 const ROUTE_COST_PROVIDER_TIMEOUT: Duration = Duration::from_secs(10);
-const ETH_USD_MICRO: u64 = 3_000_000_000;
-const BTC_USD_MICRO: u64 = 100_000_000_000;
 const DUMMY_EVM_DEPOSITOR: &str = "0x1111111111111111111111111111111111111111";
 const DUMMY_EVM_RECIPIENT: &str = "0x2222222222222222222222222222222222222222";
 
@@ -74,6 +72,7 @@ pub struct RouteCostRefreshSummary {
     pub provider_quotes_attempted: usize,
     pub provider_quotes_succeeded: usize,
     pub provider_quotes_failed: usize,
+    pub pricing_source: String,
     pub refreshed_at: DateTime<Utc>,
 }
 
@@ -83,6 +82,7 @@ pub struct RouteCostService {
     action_providers: Arc<ActionProviderRegistry>,
     asset_registry: Arc<AssetRegistry>,
     ttl: Duration,
+    pricing: PricingSnapshot,
 }
 
 impl RouteCostService {
@@ -94,12 +94,19 @@ impl RouteCostService {
             action_providers,
             asset_registry,
             ttl: DEFAULT_REFRESH_TTL,
+            pricing: PricingSnapshot::static_bootstrap(Utc::now()),
         }
     }
 
     #[must_use]
     pub fn with_ttl(mut self, ttl: Duration) -> Self {
         self.ttl = ttl;
+        self
+    }
+
+    #[must_use]
+    pub fn with_pricing(mut self, pricing: PricingSnapshot) -> Self {
+        self.pricing = pricing;
         self
     }
 
@@ -120,7 +127,7 @@ impl RouteCostService {
                 LiveCostSnapshotOutcome::Succeeded(snapshot) => {
                     provider_quotes_attempted += 1;
                     provider_quotes_succeeded += 1;
-                    Some(snapshot)
+                    Some(*snapshot)
                 }
                 LiveCostSnapshotOutcome::Failed(reason) => {
                     provider_quotes_attempted += 1;
@@ -134,10 +141,9 @@ impl RouteCostService {
                     None
                 }
             };
-            snapshots.push(
-                live_snapshot
-                    .unwrap_or_else(|| structural_cost_snapshot(transition, now, expires_at)),
-            );
+            snapshots.push(live_snapshot.unwrap_or_else(|| {
+                structural_cost_snapshot(transition, now, expires_at, &self.pricing)
+            }));
         }
         self.db.route_costs().upsert_many(&snapshots).await?;
 
@@ -147,6 +153,7 @@ impl RouteCostService {
             provider_quotes_attempted,
             provider_quotes_succeeded,
             provider_quotes_failed,
+            pricing_source: self.pricing.source.clone(),
             refreshed_at: now,
         })
     }
@@ -214,9 +221,11 @@ impl RouteCostService {
         let Some(bridge) = self.action_providers.bridge(transition.provider.as_str()) else {
             return LiveCostSnapshotOutcome::NotAttempted;
         };
-        let Some(amount_in) =
-            sample_amount_for_asset(&transition.input.asset, self.asset_registry.as_ref())
-        else {
+        let Some(amount_in) = sample_amount_for_asset(
+            &transition.input.asset,
+            self.asset_registry.as_ref(),
+            &self.pricing,
+        ) else {
             return LiveCostSnapshotOutcome::NotAttempted;
         };
 
@@ -247,7 +256,7 @@ impl RouteCostService {
                 ))
             }
         };
-        let estimate = structural_cost_estimate(transition.kind);
+        let estimate = structural_cost_estimate(transition, &self.pricing);
         let estimated_fee_bps = match quote_loss_bps(amount_in, amount_out) {
             Some(fee_bps) => fee_bps,
             None => {
@@ -257,7 +266,7 @@ impl RouteCostService {
             }
         };
 
-        LiveCostSnapshotOutcome::Succeeded(RouteCostSnapshot {
+        LiveCostSnapshotOutcome::Succeeded(Box::new(RouteCostSnapshot {
             transition_id: transition.id.clone(),
             amount_bucket: DEFAULT_AMOUNT_BUCKET.to_string(),
             provider: transition.provider.as_str().to_string(),
@@ -271,13 +280,13 @@ impl RouteCostService {
             quote_source: format!("provider_quote:{}", quote.provider_id),
             refreshed_at,
             expires_at,
-        })
+        }))
     }
 }
 
 enum LiveCostSnapshotOutcome {
     NotAttempted,
-    Succeeded(RouteCostSnapshot),
+    Succeeded(Box<RouteCostSnapshot>),
     Failed(String),
 }
 
@@ -313,8 +322,9 @@ fn structural_cost_snapshot(
     transition: &TransitionDecl,
     refreshed_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
+    pricing: &PricingSnapshot,
 ) -> RouteCostSnapshot {
-    let estimate = structural_cost_estimate(transition.kind);
+    let estimate = structural_cost_estimate(transition, pricing);
     RouteCostSnapshot {
         transition_id: transition.id.clone(),
         amount_bucket: DEFAULT_AMOUNT_BUCKET.to_string(),
@@ -340,8 +350,11 @@ struct StructuralCostEstimate {
     quote_source: &'static str,
 }
 
-fn structural_cost_estimate(kind: MarketOrderTransitionKind) -> StructuralCostEstimate {
-    match kind {
+fn structural_cost_estimate(
+    transition: &TransitionDecl,
+    pricing: &PricingSnapshot,
+) -> StructuralCostEstimate {
+    match transition.kind {
         MarketOrderTransitionKind::AcrossBridge => StructuralCostEstimate {
             estimated_fee_bps: 6,
             estimated_gas_usd_micros: 0,
@@ -370,28 +383,41 @@ fn structural_cost_estimate(kind: MarketOrderTransitionKind) -> StructuralCostEs
         },
         MarketOrderTransitionKind::UniversalRouterSwap => StructuralCostEstimate {
             estimated_fee_bps: 25,
-            estimated_gas_usd_micros: 750_000,
+            estimated_gas_usd_micros: structural_gas_usd_micros(
+                pricing,
+                &transition.input.asset.chain,
+                360_000,
+            ),
             estimated_latency_ms: 12_000,
             quote_source: "static_velora_universal_router_seed",
         },
     }
 }
 
-fn sample_amount_for_asset(asset: &DepositAsset, registry: &AssetRegistry) -> Option<U256> {
+fn sample_amount_for_asset(
+    asset: &DepositAsset,
+    registry: &AssetRegistry,
+    pricing: &PricingSnapshot,
+) -> Option<U256> {
     let chain_asset = registry.chain_asset(asset)?;
-    let amount_usd_micro = U256::from(DEFAULT_SAMPLE_AMOUNT_USD_MICROS);
-    let asset_usd_micro = match chain_asset.canonical {
-        crate::services::asset_registry::CanonicalAsset::Usdc
-        | crate::services::asset_registry::CanonicalAsset::Usdt => U256::from(1_000_000_u64),
-        crate::services::asset_registry::CanonicalAsset::Eth => U256::from(ETH_USD_MICRO),
-        crate::services::asset_registry::CanonicalAsset::Btc
-        | crate::services::asset_registry::CanonicalAsset::Cbbtc => U256::from(BTC_USD_MICRO),
-        crate::services::asset_registry::CanonicalAsset::Hype => return None,
-    };
-    Some(
-        (amount_usd_micro.saturating_mul(pow10(chain_asset.decimals)) / asset_usd_micro)
-            .max(U256::from(1_u64)),
-    )
+    pricing
+        .sample_amount_raw(
+            DEFAULT_SAMPLE_AMOUNT_USD_MICROS,
+            chain_asset.canonical,
+            chain_asset.decimals,
+        )
+        .map(|amount| amount.max(U256::from(1_u64)))
+}
+
+fn structural_gas_usd_micros(
+    pricing: &PricingSnapshot,
+    chain: &crate::protocol::ChainId,
+    gas_units: u64,
+) -> u64 {
+    pricing
+        .wei_to_usd_micro(U256::from(gas_units).saturating_mul(pricing.chain_gas_price_wei(chain)))
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 fn quote_loss_bps(amount_in: U256, amount_out: U256) -> Option<u64> {
@@ -409,31 +435,12 @@ fn quote_loss_bps(amount_in: U256, amount_out: U256) -> Option<u64> {
     u64::try_from(bps).ok()
 }
 
-fn pow10(decimals: u8) -> U256 {
-    let mut value = U256::from(1_u64);
-    for _ in 0..decimals {
-        value = value.saturating_mul(U256::from(10_u64));
-    }
-    value
-}
-
-fn div_ceil_u64(numerator: u64, denominator: u64) -> u64 {
-    if denominator == 0 {
-        return u64::MAX;
-    }
-    numerator
-        .saturating_add(denominator.saturating_sub(1))
-        .saturating_div(denominator)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         protocol::{AssetId, ChainId},
-        services::asset_registry::{
-            AssetSlot, ProviderId, RequiredCustodyRole, TransitionMetadata,
-        },
+        services::asset_registry::{AssetSlot, ProviderId, RequiredCustodyRole},
     };
 
     fn asset(chain: &str) -> DepositAsset {
@@ -474,11 +481,6 @@ mod tests {
         TransitionPath {
             id: id.to_string(),
             transitions,
-            metadata: TransitionMetadata {
-                reliability_prior: 1.0,
-                p50_latency_ms: 0,
-                p95_latency_ms: 0,
-            },
         }
     }
 
@@ -561,6 +563,7 @@ mod tests {
     #[test]
     fn sample_amount_uses_asset_decimals_and_reference_prices() {
         let registry = AssetRegistry::default();
+        let pricing = PricingSnapshot::static_bootstrap(Utc::now());
         let usdt = DepositAsset {
             chain: ChainId::parse("evm:8453").unwrap(),
             asset: AssetId::reference("0xfde4c96c8593536e31f229ea8f37b2ada2699bb2"),
@@ -571,11 +574,11 @@ mod tests {
         };
 
         assert_eq!(
-            sample_amount_for_asset(&usdt, &registry),
+            sample_amount_for_asset(&usdt, &registry, &pricing),
             Some(U256::from(1_000_000_000_u64))
         );
         assert_eq!(
-            sample_amount_for_asset(&cbbtc, &registry),
+            sample_amount_for_asset(&cbbtc, &registry, &pricing),
             Some(U256::from(1_000_000_u64))
         );
     }

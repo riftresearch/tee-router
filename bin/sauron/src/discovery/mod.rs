@@ -521,7 +521,7 @@ fn spawn_indexed_lookup_tasks(
     backend: Arc<dyn DiscoveryBackend>,
     watches: &HashMap<Uuid, SharedWatchEntry>,
     backfill_state: &mut IndexedLookupBackfillState,
-    tasks: &mut JoinSet<(Uuid, DateTime<Utc>, Result<Option<DetectedDeposit>>)>,
+    tasks: &mut JoinSet<IndexedLookupTaskResult>,
 ) {
     let available_slots = backend
         .indexed_lookup_concurrency()
@@ -539,13 +539,23 @@ fn spawn_indexed_lookup_tasks(
                 "backend" => backend.name().to_string(),
             )
             .record(started.elapsed().as_secs_f64());
-            (watch_id, version, result)
+            IndexedLookupTaskResult {
+                watch_id,
+                version,
+                lookup_result: result,
+            }
         });
     }
 }
 
+struct IndexedLookupTaskResult {
+    watch_id: Uuid,
+    version: DateTime<Utc>,
+    lookup_result: Result<Option<DetectedDeposit>>,
+}
+
 async fn drain_indexed_lookup_tasks(
-    tasks: &mut JoinSet<(Uuid, DateTime<Utc>, Result<Option<DetectedDeposit>>)>,
+    tasks: &mut JoinSet<IndexedLookupTaskResult>,
     current_watch_versions: &HashMap<Uuid, DateTime<Utc>>,
     backfill_state: &mut IndexedLookupBackfillState,
     context: &DiscoveryContext,
@@ -554,7 +564,11 @@ async fn drain_indexed_lookup_tasks(
     reported_candidates: &mut HashMap<Uuid, DetectedDeposit>,
 ) -> Result<()> {
     while let Some(join_result) = tasks.try_join_next() {
-        let (watch_id, version, lookup_result) = join_result.context(DiscoveryTaskJoinSnafu)?;
+        let IndexedLookupTaskResult {
+            watch_id,
+            version,
+            lookup_result,
+        } = join_result.context(DiscoveryTaskJoinSnafu)?;
 
         if !backfill_state.finish(watch_id, version, current_watch_versions) {
             continue;
@@ -729,7 +743,7 @@ async fn submit_detected_deposit(
                 let attempts = pending_submissions
                     .get(&detected.watch_id)
                     .map_or(1, |pending| pending.attempts.saturating_add(1));
-                let retry_delay = submission_retry_delay(&detected, attempts);
+                let retry_delay = submission_retry_delay(detected, attempts);
                 pending_submissions.insert(
                     detected.watch_id,
                     PendingSubmission {
