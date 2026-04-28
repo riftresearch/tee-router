@@ -109,15 +109,15 @@ x-router-environment: &router-environment
   - CHAINALYSIS_TOKEN=${CHAINALYSIS_TOKEN:?set CHAINALYSIS_TOKEN}
   - ROUTER_DETECTOR_API_KEY=${ROUTER_DETECTOR_API_KEY:?set ROUTER_DETECTOR_API_KEY}
   - ROUTER_ADMIN_API_KEY=${ROUTER_ADMIN_API_KEY:?set ROUTER_ADMIN_API_KEY}
-  - ACROSS_API_URL=${ACROSS_API_URL:?set ACROSS_API_URL}
+  - ACROSS_API_URL=https://app.across.to/api
   - ACROSS_API_KEY=${ACROSS_API_KEY:?set ACROSS_API_KEY}
-  - HYPERUNIT_API_URL=${HYPERUNIT_API_URL:?set HYPERUNIT_API_URL}
+  - HYPERUNIT_API_URL=https://api.hyperunit.xyz
   - HYPERUNIT_PROXY_URL=${HYPERUNIT_PROXY_URL:?set HYPERUNIT_PROXY_URL}
-  - HYPERLIQUID_API_URL=${HYPERLIQUID_API_URL:?set HYPERLIQUID_API_URL}
-  - HYPERLIQUID_NETWORK=${HYPERLIQUID_NETWORK:-mainnet}
+  - HYPERLIQUID_API_URL=https://api.hyperliquid.xyz
+  - HYPERLIQUID_NETWORK=mainnet
   - HYPERLIQUID_ORDER_TIMEOUT_MS=${HYPERLIQUID_ORDER_TIMEOUT_MS:-30000}
-  - VELORA_API_URL=${VELORA_API_URL:?set VELORA_API_URL}
-  - COINBASE_PRICE_API_BASE_URL=${COINBASE_PRICE_API_BASE_URL:-https://api.coinbase.com}
+  - VELORA_API_URL=https://api.paraswap.io
+  - COINBASE_PRICE_API_BASE_URL=https://api.coinbase.com
   - ACROSS_INTEGRATOR_ID
   - CCTP_API_URL
   - CCTP_TOKEN_MESSENGER_V2_ADDRESS
@@ -231,7 +231,7 @@ services:
       - router-network
 
   router-api:
-    image: ghcr.io/riftresearch/tee-router:${ROUTER_IMAGE_TAG:?set ROUTER_IMAGE_TAG}
+    image: ghcr.io/riftresearch/tee-router:0.1.0
     container_name: router-api
     restart: unless-stopped
     environment: *router-environment
@@ -257,7 +257,7 @@ services:
       - router-network
 
   router-worker:
-    image: ghcr.io/riftresearch/tee-router:${ROUTER_IMAGE_TAG:?set ROUTER_IMAGE_TAG}
+    image: ghcr.io/riftresearch/tee-router:0.1.0
     container_name: router-worker
     restart: unless-stopped
     environment: *router-environment
