@@ -66,7 +66,6 @@ const LIVE_SPEND_CONFIRM_VALUE: &str = "I_UNDERSTAND_THIS_SPENDS_REAL_FUNDS";
 const LIVE_TEST_PRIVATE_KEY_ENV: &str = "LIVE_TEST_PRIVATE_KEY";
 const ROUTER_LIVE_SOURCE_PRIVATE_KEY_ENV: &str = "ROUTER_LIVE_SOURCE_PRIVATE_KEY";
 const ETH_RPC_URL_ENV: &str = "ETH_RPC_URL";
-const EVM_RPC_URL_ENV: &str = "EVM_RPC_URL";
 const BASE_RPC_URL_ENV: &str = "BASE_RPC_URL";
 const BASE_FUNDING_RPC_URL_ENV: &str = "ROUTER_LIVE_BASE_FUNDING_RPC_URL";
 const ARBITRUM_RPC_URL_ENV: &str = "ARBITRUM_RPC_URL";
@@ -215,8 +214,7 @@ impl LiveRuntimeConfig {
             ])
             .expect("live runtime requires a source private key"),
             ethereum_rpc_url: env_var_optional(ETH_RPC_URL_ENV)
-                .or_else(|| env_var_optional(EVM_RPC_URL_ENV))
-                .expect("live runtime requires ETH_RPC_URL or EVM_RPC_URL"),
+                .expect("live runtime requires ETH_RPC_URL"),
             base_rpc_url: env_var_required(BASE_RPC_URL_ENV),
             arbitrum_rpc_url: env_var_required(ARBITRUM_RPC_URL_ENV),
             bitcoin_rpc_url: env_var_required(BITCOIN_RPC_URL_ENV),

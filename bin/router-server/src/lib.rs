@@ -76,7 +76,7 @@ pub struct RouterServerArgs {
     pub master_key_path: String,
 
     /// Ethereum Mainnet RPC URL
-    #[arg(long, env = "EVM_RPC_URL")]
+    #[arg(long, env = "ETH_RPC_URL")]
     pub ethereum_mainnet_rpc_url: String,
 
     /// Ethereum reference token address

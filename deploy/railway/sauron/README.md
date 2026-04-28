@@ -35,7 +35,7 @@ Required chain observer environment:
 - `BITCOIN_RPC_AUTH`
 - `BITCOIN_ZMQ_RAWTX_ENDPOINT`
 - `BITCOIN_ZMQ_SEQUENCE_ENDPOINT`
-- `EVM_RPC_URL`
+- `ETH_RPC_URL`
 - `ETHEREUM_TOKEN_INDEXER_URL`
 - `ETHEREUM_ALLOWED_TOKEN` legacy compatibility value; not the ERC-20 watch limit
 - `BASE_RPC_URL`

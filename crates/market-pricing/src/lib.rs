@@ -395,9 +395,7 @@ mod tests {
             eprintln!("skipping live pricing test; set LIVE_PROVIDER_TESTS=1 to enable");
             return;
         }
-        let ethereum_rpc_url = env::var("ETH_RPC_URL")
-            .or_else(|_| env::var("EVM_RPC_URL"))
-            .expect("ETH_RPC_URL or EVM_RPC_URL");
+        let ethereum_rpc_url = env::var("ETH_RPC_URL").expect("ETH_RPC_URL");
         let config = MarketPricingOracleConfig::new(
             "https://api.coinbase.com",
             ethereum_rpc_url,

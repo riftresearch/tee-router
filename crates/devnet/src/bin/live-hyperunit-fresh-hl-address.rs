@@ -28,7 +28,6 @@ type CliResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 const LIVE_TEST_PRIVATE_KEY: &str = "LIVE_TEST_PRIVATE_KEY";
 const ETH_RPC_URL: &str = "ETH_RPC_URL";
-const EVM_RPC_URL: &str = "EVM_RPC_URL";
 const HYPERUNIT_API_URL: &str = "HYPERUNIT_API_URL";
 const HYPERUNIT_PROXY_URL: &str = "HYPERUNIT_PROXY_URL";
 const HYPERLIQUID_API_URL: &str = "HYPERLIQUID_API_URL";
@@ -46,10 +45,7 @@ const RECEIPT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 )]
 struct Args {
     #[arg(long, env = ETH_RPC_URL)]
-    eth_rpc_url: Option<String>,
-
-    #[arg(long, env = EVM_RPC_URL)]
-    evm_rpc_url: Option<String>,
+    eth_rpc_url: String,
 
     #[arg(long, env = HYPERUNIT_API_URL, default_value = DEFAULT_HYPERUNIT_API_URL)]
     hyperunit_api_url: String,
@@ -96,11 +92,7 @@ async fn main() -> CliResult<()> {
     let poll_interval = Duration::from_secs(args.poll_interval_secs);
     let timeout = Duration::from_secs(args.timeout_secs);
 
-    let eth_rpc_url: Url = args
-        .eth_rpc_url
-        .or(args.evm_rpc_url)
-        .ok_or_else(|| format!("missing {ETH_RPC_URL} or {EVM_RPC_URL}"))?
-        .parse()?;
+    let eth_rpc_url: Url = args.eth_rpc_url.parse()?;
     let read_provider = ProviderBuilder::new().connect_http(eth_rpc_url.clone());
     let write_provider = ProviderBuilder::new()
         .wallet(EthereumWallet::new(source_signer))

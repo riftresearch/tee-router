@@ -92,7 +92,7 @@ x-router-environment: &router-environment
   - DB_MAX_CONNECTIONS=${DB_MAX_CONNECTIONS:-32}
   - DB_MIN_CONNECTIONS=${DB_MIN_CONNECTIONS:-4}
   - ROUTER_MASTER_KEY_PATH=/run/router-secrets/router-master-key.hex
-  - EVM_RPC_URL=${EVM_RPC_URL:?set EVM_RPC_URL}
+  - ETH_RPC_URL=${ETH_RPC_URL:?set ETH_RPC_URL}
   - BASE_RPC_URL=${BASE_RPC_URL:?set BASE_RPC_URL}
   - ARBITRUM_RPC_URL=${ARBITRUM_RPC_URL:?set ARBITRUM_RPC_URL}
   - BITCOIN_RPC_URL=${BITCOIN_RPC_URL:?set BITCOIN_RPC_URL}
@@ -231,7 +231,7 @@ services:
       - router-network
 
   router-api:
-    image: ghcr.io/riftresearch/tee-router:0.1.0
+    image: ghcr.io/riftresearch/tee-router:0.1.1
     container_name: router-api
     restart: unless-stopped
     environment: *router-environment
@@ -257,7 +257,7 @@ services:
       - router-network
 
   router-worker:
-    image: ghcr.io/riftresearch/tee-router:0.1.0
+    image: ghcr.io/riftresearch/tee-router:0.1.1
     container_name: router-worker
     restart: unless-stopped
     environment: *router-environment

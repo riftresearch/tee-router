@@ -328,7 +328,7 @@ Router API and worker need the same core config:
 
 - `DATABASE_URL`
 - `ROUTER_MASTER_KEY_PATH`
-- `EVM_RPC_URL`
+- `ETH_RPC_URL`
 - `BASE_RPC_URL`
 - `ARBITRUM_RPC_URL`
 - `BITCOIN_RPC_URL`
