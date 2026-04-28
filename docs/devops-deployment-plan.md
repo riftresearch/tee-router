@@ -89,8 +89,7 @@ The router image should contain:
 
 Every pushed image should get a `sha-<git-sha>` tag. Semver release tags should
 be produced from git tags of the form `vX.Y.Z`; the workflow should also emit
-`X.Y.Z`, `X.Y`, and the original `vX.Y.Z` tag. The `vX.Y.Z` git tag must match
-the workspace version in `Cargo.toml`.
+`X.Y.Z`. The `vX.Y.Z` git tag must match the workspace version in `Cargo.toml`.
 
 Phala can deploy either a semver tag for human readability or a SHA tag for the
 exact source revision. For alpha, prefer pinning a semver release tag after the
@@ -232,7 +231,12 @@ Each indexer should have:
 - `PONDER_WS_URL_HTTP`
 - chain-specific `DATABASE_SCHEMA` / `PONDER_SCHEMA`
 - `PONDER_CONTRACT_START_BLOCK`
+- `PONDER_PORT=4001`
+- `PORT=4001`
 - raw transfer retention config
+
+Railway injects `PORT`; Ponder honors that value for its listener, so set both
+`PONDER_PORT` and `PORT` to `4001` to keep the private-network URL stable.
 
 The v3 start block for each chain should correspond to yesterday at midnight
 UTC relative to the deployment planning date: `2026-04-27T00:00:00Z`.
