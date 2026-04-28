@@ -417,6 +417,7 @@ impl RouteMinimumService {
                     });
                 }
                 MarketOrderTransitionKind::AcrossBridge
+                | MarketOrderTransitionKind::CctpBridge
                 | MarketOrderTransitionKind::HyperliquidBridgeDeposit => {
                     let bridge = self.bridge(transition.provider.as_str())?;
                     let mut required_out = parse_u256("required_output", &required_output)?;

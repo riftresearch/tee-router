@@ -8,8 +8,9 @@ use crate::{
             HyperliquidRuntimeConfig, PaymasterRegistry,
         },
         AcrossHttpProviderConfig, ActionProviderRegistry, AddressScreeningService,
-        CustodyActionExecutor, OrderExecutionManager, OrderManager, ProviderPolicyService,
-        RouteCostService, RouteMinimumService, VaultManager, VeloraHttpProviderConfig,
+        CctpHttpProviderConfig, CustodyActionExecutor, OrderExecutionManager, OrderManager,
+        ProviderPolicyService, RouteCostService, RouteMinimumService, VaultManager,
+        VeloraHttpProviderConfig,
     },
     Result, RouterServerArgs,
 };
@@ -20,6 +21,7 @@ use chains::{
     hyperliquid::HyperliquidChain,
     ChainRegistry,
 };
+use market_pricing::{MarketPricingOracle, MarketPricingOracleConfig};
 use router_primitives::ChainType;
 use snafu::ResultExt;
 use std::{sync::Arc, time::Duration};
@@ -90,7 +92,11 @@ pub async fn initialize_components_with_action_providers(
     let chain_registry = Arc::new(initialize_chain_registry(args, paymaster_mode).await?);
     let paymasters = paymaster_registry(args)?;
     let provider_policies = Arc::new(ProviderPolicyService::new(db.clone()));
-    let route_costs = Arc::new(RouteCostService::new(db.clone(), action_providers.clone()));
+    let route_costs = Arc::new(initialize_route_costs(
+        args,
+        db.clone(),
+        action_providers.clone(),
+    )?);
     let route_minimums = Arc::new(RouteMinimumService::new(action_providers.clone()));
     let address_screener = initialize_address_screener(args)?;
     let order_manager = Arc::new(
@@ -138,6 +144,32 @@ pub async fn initialize_components_with_action_providers(
         route_costs,
         address_screener,
     })
+}
+
+fn initialize_route_costs(
+    args: &RouterServerArgs,
+    db: Database,
+    action_providers: Arc<ActionProviderRegistry>,
+) -> Result<RouteCostService> {
+    let oracle_config = MarketPricingOracleConfig::new(
+        &args.coinbase_price_api_base_url,
+        &args.ethereum_mainnet_rpc_url,
+        &args.arbitrum_rpc_url,
+        &args.base_rpc_url,
+    )
+    .map_err(|err| crate::Error::DatabaseInit {
+        source: RouterServerError::InvalidData {
+            message: format!("invalid route-cost pricing oracle config: {err}"),
+        },
+    })?;
+    let pricing_oracle = Arc::new(MarketPricingOracle::new(oracle_config).map_err(|err| {
+        crate::Error::DatabaseInit {
+            source: RouterServerError::InvalidData {
+                message: format!("failed to initialize route-cost pricing oracle: {err}"),
+            },
+        }
+    })?);
+    Ok(RouteCostService::new(db, action_providers).with_pricing_oracle(pricing_oracle))
 }
 
 async fn initialize_chain_registry(
@@ -262,8 +294,17 @@ fn initialize_action_providers(args: &RouterServerArgs) -> Result<ActionProvider
             VeloraHttpProviderConfig::new(base_url)
                 .with_partner(normalize_optional_string(args.velora_partner.as_deref()))
         });
+    let cctp_base_url = normalize_optional_url(args.cctp_api_url.as_deref(), "CCTP API URL")?
+        .unwrap_or_else(|| CCTP_IRIS_DEFAULT_BASE_URL_FOR_CONFIG.to_string());
+    let cctp = Some(
+        CctpHttpProviderConfig::new(cctp_base_url).with_contract_addresses(
+            normalize_optional_string(args.cctp_token_messenger_v2_address.as_deref()),
+            normalize_optional_string(args.cctp_message_transmitter_v2_address.as_deref()),
+        ),
+    );
     let registry = ActionProviderRegistry::http_with_options_and_hyperliquid_timeout(
         across,
+        cctp,
         normalize_optional_url(args.hyperunit_api_url.as_deref(), "HyperUnit API URL")?,
         normalize_optional_string(args.hyperunit_proxy_url.as_deref()),
         normalize_optional_url(args.hyperliquid_api_url.as_deref(), "Hyperliquid API URL")?,
@@ -279,6 +320,8 @@ fn initialize_action_providers(args: &RouterServerArgs) -> Result<ActionProvider
     }
     Ok(registry)
 }
+
+const CCTP_IRIS_DEFAULT_BASE_URL_FOR_CONFIG: &str = "https://iris-api.circle.com";
 
 fn required_across_api_key(value: Option<&str>) -> Result<String> {
     let Some(value) = value else {
@@ -495,6 +538,9 @@ mod tests {
             across_api_url: None,
             across_api_key: None,
             across_integrator_id: None,
+            cctp_api_url: None,
+            cctp_token_messenger_v2_address: None,
+            cctp_message_transmitter_v2_address: None,
             hyperunit_api_url: None,
             hyperunit_proxy_url: None,
             hyperliquid_api_url: None,
@@ -517,6 +563,7 @@ mod tests {
             worker_refund_poll_seconds: 60,
             worker_order_execution_poll_seconds: 5,
             worker_route_cost_refresh_seconds: 300,
+            coinbase_price_api_base_url: "https://api.coinbase.com".to_string(),
         }
     }
 

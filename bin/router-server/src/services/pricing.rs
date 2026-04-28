@@ -39,6 +39,21 @@ impl PricingSnapshot {
     }
 
     #[must_use]
+    pub fn from_market(snapshot: market_pricing::MarketPricingSnapshot) -> Self {
+        Self {
+            source: snapshot.source,
+            captured_at: snapshot.captured_at,
+            expires_at: snapshot.expires_at,
+            stable_usd_micro: snapshot.stable_usd_micro,
+            eth_usd_micro: snapshot.eth_usd_micro,
+            btc_usd_micro: snapshot.btc_usd_micro,
+            ethereum_gas_price_wei: snapshot.ethereum_gas_price_wei,
+            arbitrum_gas_price_wei: snapshot.arbitrum_gas_price_wei,
+            base_gas_price_wei: snapshot.base_gas_price_wei,
+        }
+    }
+
+    #[must_use]
     pub fn is_fresh(&self, now: DateTime<Utc>) -> bool {
         self.expires_at.is_none_or(|expires_at| expires_at > now)
     }

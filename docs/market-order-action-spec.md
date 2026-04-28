@@ -163,13 +163,14 @@ transitions.
 
 ### Exact Input
 
-The user fixes `amount_in`. The router selects the provider route that maximizes
-`amount_out`, subject to the user's minimum acceptable output.
+The user fixes `amount_in` and supplies `slippage_bps`. The router first
+discovers an expected `amount_out`, then derives `min_amount_out` from that
+expected output and the requested slippage.
 
 Required user constraints:
 
 - `amount_in`
-- `min_amount_out`
+- `slippage_bps`
 
 Selection rule:
 
@@ -182,13 +183,14 @@ Execution invariant:
 
 ### Exact Output
 
-The user fixes `amount_out`. The router selects the provider route that
-minimizes `amount_in`, subject to the user's maximum acceptable input.
+The user fixes `amount_out` and supplies `slippage_bps`. The router first
+discovers an expected `amount_in`, then derives `max_amount_in` from that
+expected input and the requested slippage.
 
 Required user constraints:
 
 - `amount_out`
-- `max_amount_in`
+- `slippage_bps`
 
 Selection rule:
 
@@ -223,7 +225,7 @@ Request shape:
   },
   "kind": "exact_in",
   "amount_in": "1000000000000000000",
-  "min_amount_out": "100000",
+  "slippage_bps": 100,
   "recipient_address": "bc1...",
   "idempotency_key": "client-generated-key"
 }
@@ -243,7 +245,7 @@ Exact-output request shape:
   },
   "kind": "exact_out",
   "amount_out": "100000",
-  "max_amount_in": "1100000000000000000",
+  "slippage_bps": 100,
   "recipient_address": "bc1..."
 }
 ```
@@ -271,7 +273,8 @@ Response shape:
       "payload": {
         "kind": "exact_in",
         "amount_in": "1000000000000000000",
-        "min_amount_out": "100000"
+        "min_amount_out": "100000",
+        "slippage_bps": 100
       }
     },
     "action_timeout_at": "2026-04-14T00:10:00Z",
@@ -288,6 +291,7 @@ Response shape:
     "amount_out": "102000",
     "min_amount_out": "100000",
     "max_amount_in": null,
+    "slippage_bps": 100,
     "provider_quote": {},
     "expires_at": "2026-04-14T00:01:00Z",
     "created_at": "2026-04-14T00:00:00Z"
@@ -346,6 +350,11 @@ enum MarketOrderKind {
         amount_out: String,
         max_amount_in: String,
     },
+}
+
+struct MarketOrderAction {
+    order_kind: MarketOrderKind,
+    slippage_bps: u64,
 }
 ```
 

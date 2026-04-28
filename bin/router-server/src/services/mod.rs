@@ -16,9 +16,10 @@ pub mod route_minimums;
 pub mod vault_manager;
 
 pub use action_providers::{
-    AcrossHttpProviderConfig, ActionProviderRegistry, ProviderAddressIntent,
-    ProviderExecutionIntent, ProviderExecutionState, ProviderOperationIntent,
-    ProviderOperationObservation, ProviderOperationObservationRequest, VeloraHttpProviderConfig,
+    AcrossHttpProviderConfig, ActionProviderRegistry, CctpHttpProviderConfig,
+    ProviderAddressIntent, ProviderExecutionIntent, ProviderExecutionState,
+    ProviderOperationIntent, ProviderOperationObservation, ProviderOperationObservationRequest,
+    VeloraHttpProviderConfig,
 };
 pub use address_screening::{AddressScreeningPurpose, AddressScreeningService};
 pub use asset_registry::{

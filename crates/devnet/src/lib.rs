@@ -2,6 +2,7 @@
 
 pub mod across_spoke_pool_mock;
 pub mod bitcoin_devnet;
+pub mod cctp_mock;
 pub mod evm_devnet;
 pub mod hyperliquid_bridge_mock;
 pub mod mock_integrators;
@@ -47,6 +48,7 @@ const BITCOIN_DATADIR_NAME: &str = "bitcoin-datadir";
 const ESPLORA_DATADIR_NAME: &str = "esplora-datadir";
 const ANVIL_DATADIR_NAME: &str = "anvil-datadir";
 const ANVIL_BASE_DATADIR_NAME: &str = "anvil-base-datadir";
+const ANVIL_ARBITRUM_DATADIR_NAME: &str = "anvil-arbitrum-datadir";
 const TEMP_DIR_NAME: &str = "tmp";
 const TEMP_ENTRY_PREFIX: &str = "rift-devnet-p";
 const ERROR_MESSAGE: &str = "Cache must be populated before utilizing it,";
@@ -204,6 +206,7 @@ impl RiftDevnetCache {
             ESPLORA_DATADIR_NAME,
             ANVIL_DATADIR_NAME,
             ANVIL_BASE_DATADIR_NAME,
+            ANVIL_ARBITRUM_DATADIR_NAME,
         ]
         .iter()
         .all(|dir_name| cache_dir.join(dir_name).is_dir())
@@ -272,6 +275,11 @@ impl RiftDevnetCache {
 
     pub async fn create_anvil_base_datadir(&self) -> Result<tempfile::TempDir> {
         self.copy_cached_dir(ANVIL_BASE_DATADIR_NAME, "anvil base datadir")
+            .await
+    }
+
+    pub async fn create_anvil_arbitrum_datadir(&self) -> Result<tempfile::TempDir> {
+        self.copy_cached_dir(ANVIL_ARBITRUM_DATADIR_NAME, "anvil arbitrum datadir")
             .await
     }
 
@@ -361,6 +369,20 @@ impl RiftDevnetCache {
             base_anvil_shutdown_start.elapsed()
         );
 
+        let arbitrum_anvil_shutdown_start = Instant::now();
+        info!("[Cache] Shutting down Arbitrum Anvil to flush all data to disk...");
+        let arbitrum_anvil_pid = devnet.arbitrum.anvil.child().id();
+        tokio::process::Command::new("kill")
+            .arg("-SIGTERM")
+            .arg(arbitrum_anvil_pid.to_string())
+            .output()
+            .await
+            .map_err(|e| eyre::eyre!("Failed to shutdown Arbitrum Anvil: {}", e))?;
+        info!(
+            "[Cache] Arbitrum Anvil shutdown took {:?}",
+            arbitrum_anvil_shutdown_start.elapsed()
+        );
+
         // 2. Save Bitcoin datadir (now with all blocks properly flushed)
         let _copy_start = Instant::now();
         info!("[Cache] Starting to copy directories to cache...");
@@ -426,6 +448,20 @@ impl RiftDevnetCache {
             base_anvil_copy_start.elapsed()
         );
 
+        let arbitrum_anvil_dump_path = devnet.arbitrum.anvil_dump_path.path();
+        info!(
+            "[Cache] Saving Arbitrum anvil state from {}",
+            arbitrum_anvil_dump_path.to_string_lossy()
+        );
+
+        let arbitrum_anvil_dst = self.cache_dir.join(ANVIL_ARBITRUM_DATADIR_NAME);
+        let arbitrum_anvil_copy_start = Instant::now();
+        Self::copy_dir_recursive(arbitrum_anvil_dump_path, &arbitrum_anvil_dst).await?;
+        info!(
+            "[Cache] Arbitrum Anvil state copied in {:?}",
+            arbitrum_anvil_copy_start.elapsed()
+        );
+
         // Release lock by dropping it
         drop(lock_file);
 
@@ -478,6 +514,7 @@ mod tests {
             ESPLORA_DATADIR_NAME,
             ANVIL_DATADIR_NAME,
             ANVIL_BASE_DATADIR_NAME,
+            ANVIL_ARBITRUM_DATADIR_NAME,
         ] {
             std::fs::create_dir(cache_dir.path().join(dir_name))
                 .expect("create persistent cache dir");
@@ -540,12 +577,14 @@ pub type Result<T, E = DevnetError> = std::result::Result<T, E>;
 
 /// The "combined" Devnet which holds:
 /// - a `BitcoinDevnet`
-/// - an `EthDevnet` for Ethereum (chain ID 31337)
+/// - an `EthDevnet` for Ethereum (chain ID 1)
 /// - an `EthDevnet` for Base (chain ID 8453, port 50102)
+/// - an `EthDevnet` for Arbitrum (chain ID 42161, port 50103)
 pub struct RiftDevnet {
     pub bitcoin: Arc<BitcoinDevnet>,
     pub ethereum: Arc<EthDevnet>,
     pub base: Arc<EthDevnet>,
+    pub arbitrum: Arc<EthDevnet>,
     pub join_set: JoinSet<Result<()>>,
 }
 
@@ -768,7 +807,7 @@ impl RiftDevnetBuilder {
         let base_start = Instant::now();
 
         let base_devnet = crate::evm_devnet::EthDevnet::setup(
-            deploy_mode,
+            deploy_mode.clone(),
             devnet_cache.clone(), // Use cache for Base
             self.token_indexer_database_url.clone(),
             self.interactive,
@@ -784,12 +823,32 @@ impl RiftDevnetBuilder {
             base_start.elapsed()
         );
 
-        // 9) Fund optional EVM address with Ether + tokens on both chains
+        // 7) Arbitrum side (chain ID 42161, port 50103 in interactive mode)
+        let arbitrum_start = Instant::now();
+
+        let arbitrum_devnet = crate::evm_devnet::EthDevnet::setup(
+            deploy_mode,
+            devnet_cache.clone(),
+            self.token_indexer_database_url.clone(),
+            self.interactive,
+            42161,                                             // Arbitrum chain ID
+            if self.interactive { Some(50103) } else { None }, // Arbitrum port
+            if self.interactive { Some(50106) } else { None }, // Arbitrum token indexer port
+        )
+        .await
+        .map_err(|e| eyre::eyre!("[devnet builder] Failed to setup Arbitrum devnet: {}", e))?;
+
+        info!(
+            "[Devnet Builder] Arbitrum devnet setup took {:?}",
+            arbitrum_start.elapsed()
+        );
+
+        // 9) Fund optional EVM address with Ether on all EVM chains
         let funding_start = if self.funded_evm_addresses.is_empty() {
             None
         } else {
             info!(
-                "[Devnet Builder] Funding {} EVM addresses on Ethereum and Base...",
+                "[Devnet Builder] Funding {} EVM addresses on Ethereum, Base, and Arbitrum...",
                 self.funded_evm_addresses.len()
             );
             Some(Instant::now())
@@ -827,6 +886,21 @@ impl RiftDevnetBuilder {
                     eyre::eyre!("[devnet builder] Failed to fund ETH address on Base: {}", e)
                 })?;
 
+            // ~10 ETH on Arbitrum
+            arbitrum_devnet
+                .fund_eth_address(
+                    address,
+                    alloy::primitives::U256::from_str("10000000000000000000")
+                        .map_err(|e| eyre::eyre!("Failed to parse U256: {}", e))?,
+                )
+                .await
+                .map_err(|e| {
+                    eyre::eyre!(
+                        "[devnet builder] Failed to fund ETH address on Arbitrum: {}",
+                        e
+                    )
+                })?;
+
             // Debugging: check funded balances
             let eth_balance = ethereum_devnet
                 .funded_provider
@@ -848,6 +922,18 @@ impl RiftDevnetBuilder {
                     eyre::eyre!("[devnet builder] Failed to get ETH balance on Base: {}", e)
                 })?;
             info!("[Devnet Builder] Base Balance of {addr_str} => {base_balance:?}");
+
+            let arbitrum_balance = arbitrum_devnet
+                .funded_provider
+                .get_balance(address)
+                .await
+                .map_err(|e| {
+                    eyre::eyre!(
+                        "[devnet builder] Failed to get ETH balance on Arbitrum: {}",
+                        e
+                    )
+                })?;
+            info!("[Devnet Builder] Arbitrum Balance of {addr_str} => {arbitrum_balance:?}");
         }
         if let Some(start) = funding_start {
             info!("[Devnet Builder] Funded addresses in {:?}", start.elapsed());
@@ -858,6 +944,7 @@ impl RiftDevnetBuilder {
                 &bitcoin_devnet,
                 &ethereum_devnet,
                 &base_devnet,
+                &arbitrum_devnet,
                 self.using_esplora,
             )
             .await?;
@@ -868,6 +955,7 @@ impl RiftDevnetBuilder {
             bitcoin: Arc::new(bitcoin_devnet),
             ethereum: Arc::new(ethereum_devnet),
             base: Arc::new(base_devnet),
+            arbitrum: Arc::new(arbitrum_devnet),
             join_set,
         };
         info!(
@@ -884,6 +972,7 @@ impl RiftDevnetBuilder {
         bitcoin_devnet: &BitcoinDevnet,
         ethereum_devnet: &EthDevnet,
         base_devnet: &EthDevnet,
+        arbitrum_devnet: &EthDevnet,
         using_esplora: bool,
     ) -> Result<()> {
         let setup_start = Instant::now();
@@ -934,6 +1023,30 @@ impl RiftDevnetBuilder {
 
         // Fund demo_account with the mock ERC-20 on Base
         let _tx_hash = base_devnet
+            .mint_mock_erc20(
+                demo_account.ethereum_address,
+                alloy::primitives::U256::from(funding_amount),
+            )
+            .await?;
+
+        // Fund demo_account with ETH on Arbitrum
+        info!("[Interactive Setup] Funding demo_account with ETH on Arbitrum...");
+        arbitrum_devnet
+            .fund_eth_address(
+                demo_account.ethereum_address,
+                alloy::primitives::U256::from_str_radix("1000000000000000000000000", 10)
+                    .map_err(|e| eyre::eyre!("Conversion error: {}", e))?,
+            )
+            .await
+            .map_err(|e| {
+                eyre::eyre!(
+                    "[devnet builder-demo_account] Failed to fund ETH address on Arbitrum: {}",
+                    e
+                )
+            })?;
+
+        // Fund demo_account with the mock ERC-20 on Arbitrum
+        let _tx_hash = arbitrum_devnet
             .mint_mock_erc20(
                 demo_account.ethereum_address,
                 alloy::primitives::U256::from(funding_amount),
@@ -1007,6 +1120,18 @@ impl RiftDevnetBuilder {
             base_devnet.anvil.chain_id()
         );
         println!(
+            "Arbitrum Anvil HTTP Url:    http://0.0.0.0:{}",
+            arbitrum_devnet.anvil.port()
+        );
+        println!(
+            "Arbitrum Anvil WS Url:      ws://0.0.0.0:{}",
+            arbitrum_devnet.anvil.port()
+        );
+        println!(
+            "Arbitrum Chain ID:          {}",
+            arbitrum_devnet.anvil.chain_id()
+        );
+        println!(
             "Bitcoin RPC URL:            {}",
             bitcoin_devnet.rpc_url_with_cookie
         );
@@ -1026,6 +1151,13 @@ impl RiftDevnetBuilder {
             println!(
                 "Base Token Indexer:         {}",
                 base_indexer.api_server_url
+            );
+        }
+
+        if let Some(arbitrum_indexer) = &arbitrum_devnet.token_indexer {
+            println!(
+                "Arbitrum Token Indexer:     {}",
+                arbitrum_indexer.api_server_url
             );
         }
 

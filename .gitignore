@@ -32,6 +32,7 @@ target/
 !.env.example
 !.env.test
 etc/compose.electrs.rathole.env
+.env.prod
 
 # Temporary files
 *.swp

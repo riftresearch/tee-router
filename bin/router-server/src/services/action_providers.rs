@@ -16,7 +16,7 @@ use crate::{
 };
 use alloy::{
     hex,
-    primitives::{Address, U256},
+    primitives::{Address, Bytes, FixedBytes, U256},
     sol,
     sol_types::{SolCall, SolEvent},
 };
@@ -54,6 +54,11 @@ const VELORA_DEFAULT_PARTNER: &str = "rift-router";
 const VELORA_NATIVE_TOKEN: &str = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 const VELORA_API_VERSION: &str = "6.2";
 const VELORA_DEFAULT_SLIPPAGE_BPS: u64 = 100;
+const CCTP_TOKEN_MESSENGER_V2_ADDRESS: &str = "0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d";
+const CCTP_MESSAGE_TRANSMITTER_V2_ADDRESS: &str = "0x81D40F21F12A8F0E3252Bccb954D722d4c464B64";
+const MOCK_CCTP_TOKEN_MESSENGER_V2_ADDRESS: &str = "0xcccccccccccccccccccccccccccccccccccc0001";
+const MOCK_CCTP_MESSAGE_TRANSMITTER_V2_ADDRESS: &str = "0xcccccccccccccccccccccccccccccccccccc0002";
+const CCTP_STANDARD_FINALITY_THRESHOLD: u32 = 2_000;
 
 // Canonical Across V3 `FundsDeposited` event — field order, types, and indexed
 // topics match the real SpokePool ABI so logs emitted by real Across (and by
@@ -79,6 +84,26 @@ sol! {
 sol! {
     interface IERC20Approval {
         function approve(address spender, uint256 amount) external returns (bool);
+    }
+}
+
+sol! {
+    interface ICircleTokenMessengerV2 {
+        function depositForBurn(
+            uint256 amount,
+            uint32 destinationDomain,
+            bytes32 mintRecipient,
+            address burnToken,
+            bytes32 destinationCaller,
+            uint256 maxFee,
+            uint32 minFinalityThreshold
+        ) external returns (uint64);
+    }
+}
+
+sol! {
+    interface ICircleMessageTransmitterV2 {
+        function receiveMessage(bytes calldata message, bytes calldata attestation) external returns (bool);
     }
 }
 
@@ -109,12 +134,22 @@ pub struct BridgeQuote {
 #[serde(tag = "kind", content = "request", rename_all = "snake_case")]
 pub enum BridgeExecutionRequest {
     Across(AcrossExecuteStepRequest),
+    CctpBurn(CctpBurnStepRequest),
+    CctpReceive(CctpReceiveStepRequest),
     HyperliquidBridgeDeposit(HyperliquidBridgeDepositStepRequest),
 }
 
 impl BridgeExecutionRequest {
     pub fn across_from_value(value: &Value) -> ProviderResult<Self> {
         decode_step_request(value, "across step request").map(Self::Across)
+    }
+
+    pub fn cctp_burn_from_value(value: &Value) -> ProviderResult<Self> {
+        decode_step_request(value, "cctp burn step request").map(Self::CctpBurn)
+    }
+
+    pub fn cctp_receive_from_value(value: &Value) -> ProviderResult<Self> {
+        decode_step_request(value, "cctp receive step request").map(Self::CctpReceive)
     }
 
     pub fn hyperliquid_bridge_deposit_from_value(value: &Value) -> ProviderResult<Self> {
@@ -126,6 +161,8 @@ impl BridgeExecutionRequest {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Across(_) => "across",
+            Self::CctpBurn(_) => "cctp_burn",
+            Self::CctpReceive(_) => "cctp_receive",
             Self::HyperliquidBridgeDeposit(_) => "hyperliquid_bridge_deposit",
         }
     }
@@ -426,6 +463,13 @@ pub struct AcrossHttpProviderConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct CctpHttpProviderConfig {
+    pub base_url: String,
+    pub token_messenger_v2_address: String,
+    pub message_transmitter_v2_address: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct VeloraHttpProviderConfig {
     pub base_url: String,
     pub partner: Option<String>,
@@ -462,6 +506,41 @@ impl AcrossHttpProviderConfig {
     #[must_use]
     pub fn with_integrator_id(mut self, integrator_id: Option<String>) -> Self {
         self.integrator_id = integrator_id;
+        self
+    }
+}
+
+impl CctpHttpProviderConfig {
+    #[must_use]
+    pub fn new(base_url: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into(),
+            token_messenger_v2_address: CCTP_TOKEN_MESSENGER_V2_ADDRESS.to_string(),
+            message_transmitter_v2_address: CCTP_MESSAGE_TRANSMITTER_V2_ADDRESS.to_string(),
+        }
+    }
+
+    #[must_use]
+    pub fn mock(base_url: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into(),
+            token_messenger_v2_address: MOCK_CCTP_TOKEN_MESSENGER_V2_ADDRESS.to_string(),
+            message_transmitter_v2_address: MOCK_CCTP_MESSAGE_TRANSMITTER_V2_ADDRESS.to_string(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_contract_addresses(
+        mut self,
+        token_messenger_v2_address: Option<String>,
+        message_transmitter_v2_address: Option<String>,
+    ) -> Self {
+        if let Some(address) = token_messenger_v2_address {
+            self.token_messenger_v2_address = address;
+        }
+        if let Some(address) = message_transmitter_v2_address {
+            self.message_transmitter_v2_address = address;
+        }
         self
     }
 }
@@ -504,6 +583,7 @@ impl ActionProviderRegistry {
                 base_url.clone(),
                 MOCK_ACROSS_API_KEY,
             )),
+            Some(CctpHttpProviderConfig::mock(base_url.clone())),
             Some(base_url.clone()),
             None,
             Some(base_url),
@@ -515,6 +595,7 @@ impl ActionProviderRegistry {
 
     pub fn http(
         across: Option<AcrossHttpProviderConfig>,
+        cctp: Option<CctpHttpProviderConfig>,
         hyperunit_base_url: Option<String>,
         hyperunit_proxy_url: Option<String>,
         hyperliquid_base_url: Option<String>,
@@ -523,6 +604,7 @@ impl ActionProviderRegistry {
     ) -> Result<Self, String> {
         Self::http_with_options(
             across,
+            cctp,
             hyperunit_base_url,
             hyperunit_proxy_url,
             hyperliquid_base_url,
@@ -533,6 +615,7 @@ impl ActionProviderRegistry {
 
     pub fn http_with_options(
         across: Option<AcrossHttpProviderConfig>,
+        cctp: Option<CctpHttpProviderConfig>,
         hyperunit_base_url: Option<String>,
         hyperunit_proxy_url: Option<String>,
         hyperliquid_base_url: Option<String>,
@@ -541,6 +624,7 @@ impl ActionProviderRegistry {
     ) -> Result<Self, String> {
         Self::http_with_options_and_hyperliquid_timeout(
             across,
+            cctp,
             hyperunit_base_url,
             hyperunit_proxy_url,
             hyperliquid_base_url,
@@ -552,6 +636,7 @@ impl ActionProviderRegistry {
 
     pub fn http_with_options_and_hyperliquid_timeout(
         across: Option<AcrossHttpProviderConfig>,
+        cctp: Option<CctpHttpProviderConfig>,
         hyperunit_base_url: Option<String>,
         hyperunit_proxy_url: Option<String>,
         hyperliquid_base_url: Option<String>,
@@ -567,6 +652,14 @@ impl ActionProviderRegistry {
                 provider = provider.with_integrator_id(integrator_id);
             }
             bridges.push(Arc::new(provider));
+        }
+        if let Some(config) = cctp {
+            bridges.push(Arc::new(CctpProvider::new(
+                config.base_url,
+                config.token_messenger_v2_address,
+                config.message_transmitter_v2_address,
+                asset_registry.clone(),
+            )?));
         }
         if let Some(base_url) = hyperliquid_base_url.clone() {
             bridges.push(Arc::new(HyperliquidBridgeProvider::new(
@@ -1777,6 +1870,670 @@ impl BridgeProvider for HyperliquidBridgeProvider {
             }))
         })
     }
+}
+
+#[derive(Clone)]
+pub struct CctpProvider {
+    base_url: String,
+    http: reqwest::Client,
+    asset_registry: Arc<AssetRegistry>,
+    token_messenger_v2_address: Address,
+    message_transmitter_v2_address: Address,
+}
+
+impl CctpProvider {
+    pub fn new(
+        base_url: impl Into<String>,
+        token_messenger_v2_address: impl AsRef<str>,
+        message_transmitter_v2_address: impl AsRef<str>,
+        asset_registry: Arc<AssetRegistry>,
+    ) -> ProviderResult<Self> {
+        let token_messenger_v2_address = Address::from_str(token_messenger_v2_address.as_ref())
+            .map_err(|err| format!("invalid CCTP TokenMessengerV2 address: {err}"))?;
+        let message_transmitter_v2_address =
+            Address::from_str(message_transmitter_v2_address.as_ref())
+                .map_err(|err| format!("invalid CCTP MessageTransmitterV2 address: {err}"))?;
+        Ok(Self {
+            base_url: normalize_base_url(base_url),
+            http: rustls_http_client(),
+            asset_registry,
+            token_messenger_v2_address,
+            message_transmitter_v2_address,
+        })
+    }
+
+    fn resolve_bridge_assets(
+        &self,
+        source: &DepositAsset,
+        destination: &DepositAsset,
+    ) -> Option<CctpBridgeAssets> {
+        if source == destination {
+            return None;
+        }
+        if source.chain.evm_chain_id().is_none() || destination.chain.evm_chain_id().is_none() {
+            return None;
+        }
+        if !self
+            .asset_registry
+            .canonical_assets_match(source, destination)
+        {
+            return None;
+        }
+        let input = self.asset_registry.provider_asset(
+            ProviderId::Cctp,
+            source,
+            ProviderAssetCapability::BridgeInput,
+        )?;
+        let output = self.asset_registry.provider_asset(
+            ProviderId::Cctp,
+            destination,
+            ProviderAssetCapability::BridgeOutput,
+        )?;
+        let source_domain = input.provider_chain.parse::<u32>().ok()?;
+        let destination_domain = output.provider_chain.parse::<u32>().ok()?;
+        let burn_token = Address::from_str(&input.provider_asset).ok()?;
+        let destination_token = Address::from_str(&output.provider_asset).ok()?;
+        Some(CctpBridgeAssets {
+            source_domain,
+            destination_domain,
+            burn_token,
+            destination_token,
+        })
+    }
+
+    async fn fetch_messages(
+        &self,
+        source_domain: u32,
+        tx_hash: &str,
+    ) -> ProviderResult<Option<CctpMessagesResponse>> {
+        let url = format!("{}/v2/messages/{source_domain}", self.base_url);
+        let response = self
+            .http
+            .get(&url)
+            .query(&[("transactionHash", tx_hash)])
+            .send()
+            .await
+            .map_err(|err| format!("cctp messages request failed: {err}"))?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|err| format!("cctp messages response body failed: {err}"))?;
+        if !status.is_success() {
+            return Err(format!(
+                "cctp messages request failed with {status}: {body}"
+            ));
+        }
+        serde_json::from_str(&body)
+            .map(Some)
+            .map_err(|err| format!("cctp messages response was not JSON: {err}; body={body}"))
+    }
+
+    async fn fetch_burn_fees(
+        &self,
+        source_domain: u32,
+        destination_domain: u32,
+    ) -> ProviderResult<Vec<CctpBurnFeeEntry>> {
+        let url = format!(
+            "{}/v2/burn/USDC/fees/{source_domain}/{destination_domain}",
+            self.base_url
+        );
+        let response = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|err| format!("cctp burn fees request failed: {err}"))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|err| format!("cctp burn fees response body failed: {err}"))?;
+        if !status.is_success() {
+            return Err(format!(
+                "cctp burn fees request failed with {status}: {body}"
+            ));
+        }
+        serde_json::from_str(&body)
+            .map_err(|err| format!("cctp burn fees response was not JSON: {err}; body={body}"))
+    }
+
+    async fn standard_burn_fee_bps_micros(
+        &self,
+        source_domain: u32,
+        destination_domain: u32,
+    ) -> ProviderResult<u128> {
+        let fees = self
+            .fetch_burn_fees(source_domain, destination_domain)
+            .await?;
+        let entry = fees
+            .iter()
+            .find(|fee| fee.finality_threshold == CCTP_STANDARD_FINALITY_THRESHOLD)
+            .ok_or_else(|| {
+                format!(
+                    "cctp burn fees missing standard finality threshold {} for {source_domain}->{destination_domain}",
+                    CCTP_STANDARD_FINALITY_THRESHOLD
+                )
+            })?;
+        parse_decimal_bps_to_micros(&entry.minimum_fee_bps)
+    }
+}
+
+impl BridgeProvider for CctpProvider {
+    fn id(&self) -> &str {
+        "cctp"
+    }
+
+    fn quote_bridge<'a>(
+        &'a self,
+        request: BridgeQuoteRequest,
+    ) -> ProviderFuture<'a, Option<BridgeQuote>> {
+        Box::pin(async move {
+            let Some(assets) =
+                self.resolve_bridge_assets(&request.source_asset, &request.destination_asset)
+            else {
+                return Ok(None);
+            };
+            let fee_bps_micros = self
+                .standard_burn_fee_bps_micros(assets.source_domain, assets.destination_domain)
+                .await?;
+            let Some(amounts) = cctp_quote_amounts(&request.order_kind, fee_bps_micros)? else {
+                return Ok(None);
+            };
+
+            Ok(Some(BridgeQuote {
+                provider_id: self.id().to_string(),
+                amount_in: amounts.amount_in.to_string(),
+                amount_out: amounts.amount_out.to_string(),
+                provider_quote: json!({
+                    "schema_version": 1,
+                    "kind": "cctp_bridge",
+                    "source_domain": assets.source_domain,
+                    "destination_domain": assets.destination_domain,
+                    "burn_token": format!("{:#x}", assets.burn_token),
+                    "destination_token": format!("{:#x}", assets.destination_token),
+                    "token_messenger_v2": format!("{:#x}", self.token_messenger_v2_address),
+                    "message_transmitter_v2": format!("{:#x}", self.message_transmitter_v2_address),
+                    "fee_bps": decimal_bps_string(fee_bps_micros),
+                    "max_fee": amounts.max_fee.to_string(),
+                    "min_finality_threshold": CCTP_STANDARD_FINALITY_THRESHOLD,
+                    "transfer_mode": "standard",
+                }),
+                expires_at: Utc::now() + chrono::Duration::minutes(5),
+            }))
+        })
+    }
+
+    fn execute_bridge<'a>(
+        &'a self,
+        request: &'a BridgeExecutionRequest,
+    ) -> ProviderFuture<'a, ProviderExecutionIntent> {
+        Box::pin(async move {
+            match request {
+                BridgeExecutionRequest::CctpBurn(step) => self.execute_burn(step).await,
+                BridgeExecutionRequest::CctpReceive(step) => self.execute_receive(step).await,
+                _ => Err(format!(
+                    "cctp cannot execute bridge request kind {}",
+                    request.kind()
+                )),
+            }
+        })
+    }
+
+    fn post_execute<'a>(
+        &'a self,
+        _provider_context: &'a Value,
+        receipts: &'a [CustodyActionReceipt],
+    ) -> ProviderFuture<'a, ProviderExecutionStatePatch> {
+        Box::pin(async move {
+            let burn_receipt = receipts
+                .last()
+                .ok_or_else(|| "cctp post_execute: no custody action receipts".to_string())?;
+            Ok(ProviderExecutionStatePatch {
+                provider_ref: Some(burn_receipt.tx_hash.clone()),
+                observed_state: Some(json!({
+                    "burn_tx_hash": burn_receipt.tx_hash,
+                    "submitted_at": Utc::now(),
+                })),
+                response: None,
+                status: Some(ProviderOperationStatus::WaitingExternal),
+            })
+        })
+    }
+
+    fn observe_bridge_operation<'a>(
+        &'a self,
+        request: ProviderOperationObservationRequest,
+    ) -> ProviderFuture<'a, Option<ProviderOperationObservation>> {
+        Box::pin(async move {
+            if request.operation_type != ProviderOperationType::CctpBridge {
+                return Ok(None);
+            }
+            let source_domain = request
+                .request
+                .get("source_domain")
+                .and_then(Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| "cctp observe: request missing source_domain".to_string())?;
+            let burn_tx_hash = request
+                .provider_ref
+                .as_deref()
+                .or_else(|| {
+                    request
+                        .observed_state
+                        .get("burn_tx_hash")
+                        .and_then(Value::as_str)
+                })
+                .ok_or_else(|| "cctp observe: operation missing burn tx hash".to_string())?;
+
+            let Some(messages_response) = self.fetch_messages(source_domain, burn_tx_hash).await?
+            else {
+                return Ok(Some(ProviderOperationObservation {
+                    status: ProviderOperationStatus::WaitingExternal,
+                    provider_ref: Some(burn_tx_hash.to_string()),
+                    observed_state: json!({
+                        "burn_tx_hash": burn_tx_hash,
+                        "attestation_status": "not_observed",
+                    }),
+                    response: None,
+                    tx_hash: Some(burn_tx_hash.to_string()),
+                    error: None,
+                }));
+            };
+            let complete = messages_response.messages.iter().find(|message| {
+                message.status.eq_ignore_ascii_case("complete")
+                    && message
+                        .message
+                        .as_deref()
+                        .is_some_and(|value| !value.is_empty())
+                    && message
+                        .attestation
+                        .as_deref()
+                        .is_some_and(|value| !value.is_empty())
+            });
+            if let Some(message) = complete {
+                return Ok(Some(ProviderOperationObservation {
+                    status: ProviderOperationStatus::Completed,
+                    provider_ref: Some(burn_tx_hash.to_string()),
+                    observed_state: json!({
+                        "burn_tx_hash": burn_tx_hash,
+                        "attestation_status": message.status,
+                        "message": message.message,
+                        "attestation": message.attestation,
+                        "event_nonce": message.event_nonce,
+                        "decoded_message_body": message.decoded_message_body,
+                        "cctp_version": message.cctp_version,
+                    }),
+                    response: Some(serde_json::to_value(&messages_response).map_err(|err| {
+                        format!("cctp observe: serialize messages response: {err}")
+                    })?),
+                    tx_hash: Some(burn_tx_hash.to_string()),
+                    error: None,
+                }));
+            }
+
+            Ok(Some(ProviderOperationObservation {
+                status: ProviderOperationStatus::WaitingExternal,
+                provider_ref: Some(burn_tx_hash.to_string()),
+                observed_state: json!({
+                    "burn_tx_hash": burn_tx_hash,
+                    "attestation_status": "pending",
+                    "messages": messages_response.messages,
+                }),
+                response: Some(
+                    serde_json::to_value(&messages_response).map_err(|err| {
+                        format!("cctp observe: serialize messages response: {err}")
+                    })?,
+                ),
+                tx_hash: Some(burn_tx_hash.to_string()),
+                error: None,
+            }))
+        })
+    }
+}
+
+impl CctpProvider {
+    async fn execute_burn(
+        &self,
+        step: &CctpBurnStepRequest,
+    ) -> ProviderResult<ProviderExecutionIntent> {
+        let source_asset = DepositAsset {
+            chain: ChainId::parse(&step.source_chain_id)
+                .map_err(|err| format!("invalid cctp source_chain_id: {err}"))?,
+            asset: AssetId::parse(&step.input_asset)
+                .map_err(|err| format!("invalid cctp input_asset: {err}"))?,
+        };
+        let destination_asset = DepositAsset {
+            chain: ChainId::parse(&step.destination_chain_id)
+                .map_err(|err| format!("invalid cctp destination_chain_id: {err}"))?,
+            asset: AssetId::parse(&step.output_asset)
+                .map_err(|err| format!("invalid cctp output_asset: {err}"))?,
+        };
+        let assets = self
+            .resolve_bridge_assets(&source_asset, &destination_asset)
+            .ok_or_else(|| "cctp bridge assets are not registered".to_string())?;
+        let source_custody_vault_id = step
+            .source_custody_vault_id
+            .ok_or_else(|| "cctp burn: source_custody_vault_id must be hydrated".to_string())?;
+        let mint_recipient = Address::from_str(&step.recipient_address)
+            .map_err(|err| format!("invalid cctp recipient_address: {err}"))?;
+        let amount = U256::from_str_radix(&step.amount, 10)
+            .map_err(|err| format!("invalid cctp amount {}: {err}", step.amount))?;
+        let max_fee_raw = step.max_fee.as_deref().unwrap_or("0");
+        let max_fee = U256::from_str_radix(max_fee_raw, 10)
+            .map_err(|err| format!("invalid cctp max_fee {max_fee_raw}: {err}"))?;
+
+        let approve = CustodyAction::Call(ChainCall::Evm(EvmCall {
+            to_address: format!("{:#x}", assets.burn_token),
+            value: "0".to_string(),
+            calldata: encode_erc20_approve(
+                &format!("{:#x}", self.token_messenger_v2_address),
+                &step.amount,
+            )?,
+        }));
+        let call = ICircleTokenMessengerV2::depositForBurnCall {
+            amount,
+            destinationDomain: assets.destination_domain,
+            mintRecipient: evm_address_to_bytes32(mint_recipient),
+            burnToken: assets.burn_token,
+            destinationCaller: FixedBytes::ZERO,
+            maxFee: max_fee,
+            minFinalityThreshold: CCTP_STANDARD_FINALITY_THRESHOLD,
+        };
+        let burn = CustodyAction::Call(ChainCall::Evm(EvmCall {
+            to_address: format!("{:#x}", self.token_messenger_v2_address),
+            value: "0".to_string(),
+            calldata: format!("0x{}", hex::encode(call.abi_encode())),
+        }));
+        let operation_request = json!({
+            "transition_decl_id": step.transition_decl_id,
+            "source_chain_id": step.source_chain_id,
+            "destination_chain_id": step.destination_chain_id,
+            "input_asset": step.input_asset,
+            "output_asset": step.output_asset,
+            "amount": step.amount,
+            "source_domain": assets.source_domain,
+            "destination_domain": assets.destination_domain,
+            "mint_recipient_address": step.recipient_address,
+            "burn_token": format!("{:#x}", assets.burn_token),
+            "destination_token": format!("{:#x}", assets.destination_token),
+            "token_messenger_v2": format!("{:#x}", self.token_messenger_v2_address),
+            "message_transmitter_v2": format!("{:#x}", self.message_transmitter_v2_address),
+            "max_fee": max_fee.to_string(),
+            "min_finality_threshold": CCTP_STANDARD_FINALITY_THRESHOLD,
+        });
+
+        Ok(ProviderExecutionIntent::CustodyActions {
+            custody_vault_id: source_custody_vault_id,
+            actions: vec![approve, burn],
+            provider_context: operation_request.clone(),
+            state: ProviderExecutionState {
+                operation: Some(ProviderOperationIntent {
+                    operation_type: ProviderOperationType::CctpBridge,
+                    status: ProviderOperationStatus::Submitted,
+                    provider_ref: None,
+                    request: Some(operation_request),
+                    response: Some(json!({
+                        "kind": "cctp_burn_submitted",
+                    })),
+                    observed_state: None,
+                }),
+                addresses: vec![],
+            },
+        })
+    }
+
+    async fn execute_receive(
+        &self,
+        step: &CctpReceiveStepRequest,
+    ) -> ProviderResult<ProviderExecutionIntent> {
+        let source_custody_vault_id = step
+            .source_custody_vault_id
+            .ok_or_else(|| "cctp receive: source_custody_vault_id must be hydrated".to_string())?;
+        let message = decode_hex_bytes("cctp message", &step.message)?;
+        let attestation = decode_hex_bytes("cctp attestation", &step.attestation)?;
+        let call = ICircleMessageTransmitterV2::receiveMessageCall {
+            message: Bytes::from(message),
+            attestation: Bytes::from(attestation),
+        };
+        Ok(ProviderExecutionIntent::CustodyAction {
+            custody_vault_id: source_custody_vault_id,
+            action: CustodyAction::Call(ChainCall::Evm(EvmCall {
+                to_address: format!("{:#x}", self.message_transmitter_v2_address),
+                value: "0".to_string(),
+                calldata: format!("0x{}", hex::encode(call.abi_encode())),
+            })),
+            provider_context: json!({
+                "kind": "cctp_receive",
+                "burn_transition_decl_id": step.burn_transition_decl_id,
+                "message_transmitter_v2": format!("{:#x}", self.message_transmitter_v2_address),
+            }),
+            state: ProviderExecutionState::default(),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CctpBridgeAssets {
+    source_domain: u32,
+    destination_domain: u32,
+    burn_token: Address,
+    destination_token: Address,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct CctpMessagesResponse {
+    #[serde(default)]
+    messages: Vec<CctpMessageEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CctpBurnFeeEntry {
+    #[serde(rename = "finalityThreshold")]
+    finality_threshold: u32,
+    #[serde(rename = "minimumFee", deserialize_with = "deserialize_decimal_string")]
+    minimum_fee_bps: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CctpMessageEntry {
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    attestation: Option<String>,
+    #[serde(default)]
+    event_nonce: Option<String>,
+    #[serde(default)]
+    cctp_version: Option<u64>,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    decoded_message_body: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CctpQuoteAmounts {
+    amount_in: U256,
+    amount_out: U256,
+    max_fee: U256,
+}
+
+fn cctp_quote_amounts(
+    order_kind: &MarketOrderKind,
+    fee_bps_micros: u128,
+) -> ProviderResult<Option<CctpQuoteAmounts>> {
+    let denominator = U256::from(10_000_000_000_u128);
+    let fee = U256::from(fee_bps_micros);
+    if fee >= denominator {
+        return Err("cctp fee must be below 10000 bps".to_string());
+    }
+    match order_kind {
+        MarketOrderKind::ExactIn { amount_in, .. } => {
+            let amount_in = U256::from_str_radix(amount_in, 10)
+                .map_err(|err| format!("invalid cctp amount_in {amount_in}: {err}"))?;
+            if amount_in.is_zero() {
+                return Ok(None);
+            }
+            let max_fee = cctp_fee_amount(amount_in, fee_bps_micros);
+            if max_fee >= amount_in {
+                return Ok(None);
+            }
+            Ok(Some(CctpQuoteAmounts {
+                amount_in,
+                amount_out: amount_in.saturating_sub(max_fee),
+                max_fee,
+            }))
+        }
+        MarketOrderKind::ExactOut { amount_out, .. } => {
+            let amount_out = U256::from_str_radix(amount_out, 10)
+                .map_err(|err| format!("invalid cctp amount_out {amount_out}: {err}"))?;
+            if amount_out.is_zero() {
+                return Ok(None);
+            }
+            let gross_denominator = denominator.saturating_sub(fee);
+            let amount_in =
+                div_ceil_u256(amount_out.saturating_mul(denominator), gross_denominator);
+            let max_fee = amount_in.saturating_sub(amount_out);
+            Ok(Some(CctpQuoteAmounts {
+                amount_in,
+                amount_out,
+                max_fee,
+            }))
+        }
+    }
+}
+
+fn cctp_fee_amount(amount: U256, fee_bps_micros: u128) -> U256 {
+    div_ceil_u256(
+        amount.saturating_mul(U256::from(fee_bps_micros)),
+        U256::from(10_000_000_000_u128),
+    )
+}
+
+fn div_ceil_u256(numerator: U256, denominator: U256) -> U256 {
+    if numerator.is_zero() {
+        return U256::ZERO;
+    }
+    numerator.saturating_add(denominator.saturating_sub(U256::from(1_u64))) / denominator
+}
+
+fn parse_decimal_bps_to_micros(raw: &str) -> ProviderResult<u128> {
+    let value = raw.trim();
+    if value.is_empty() || value.starts_with('-') {
+        return Err(format!("invalid CCTP fee bps {raw:?}"));
+    }
+    let (whole, fractional) = value.split_once('.').unwrap_or((value, ""));
+    if whole.is_empty() || !whole.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err(format!("invalid CCTP fee bps {raw:?}"));
+    }
+    if !fractional.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err(format!("invalid CCTP fee bps {raw:?}"));
+    }
+    let whole = whole
+        .parse::<u128>()
+        .map_err(|err| format!("invalid CCTP fee bps {raw:?}: {err}"))?;
+    let mut padded = fractional.chars().take(6).collect::<String>();
+    while padded.len() < 6 {
+        padded.push('0');
+    }
+    let mut fractional_micros = padded
+        .parse::<u128>()
+        .map_err(|err| format!("invalid CCTP fee bps {raw:?}: {err}"))?;
+    if fractional.chars().skip(6).any(|ch| ch != '0') {
+        fractional_micros = fractional_micros.saturating_add(1);
+    }
+    Ok(whole
+        .saturating_mul(1_000_000)
+        .saturating_add(fractional_micros))
+}
+
+fn decimal_bps_string(fee_bps_micros: u128) -> String {
+    let whole = fee_bps_micros / 1_000_000;
+    let fractional = fee_bps_micros % 1_000_000;
+    if fractional == 0 {
+        return whole.to_string();
+    }
+    let trimmed = format!("{fractional:06}").trim_end_matches('0').to_string();
+    format!("{whole}.{trimmed}")
+}
+
+fn deserialize_decimal_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    match value {
+        Value::Number(number) => Ok(number.to_string()),
+        Value::String(value) => Ok(value),
+        other => Err(serde::de::Error::custom(format!(
+            "expected decimal string or number, got {other}"
+        ))),
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CctpBurnStepRequest {
+    pub order_id: Uuid,
+    pub transition_decl_id: String,
+    pub source_chain_id: String,
+    pub destination_chain_id: String,
+    pub input_asset: String,
+    pub output_asset: String,
+    pub amount: String,
+    pub recipient_address: String,
+    #[serde(default)]
+    pub recipient_custody_vault_id: Option<Uuid>,
+    #[serde(default)]
+    pub recipient_custody_vault_role: Option<String>,
+    #[serde(default)]
+    pub source_custody_vault_id: Option<Uuid>,
+    #[serde(default)]
+    pub source_custody_vault_address: Option<String>,
+    #[serde(default)]
+    pub max_fee: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CctpReceiveStepRequest {
+    pub order_id: Uuid,
+    pub burn_transition_decl_id: String,
+    pub destination_chain_id: String,
+    pub output_asset: String,
+    pub amount: String,
+    #[serde(default)]
+    pub source_custody_vault_id: Option<Uuid>,
+    #[serde(default)]
+    pub source_custody_vault_address: Option<String>,
+    #[serde(default)]
+    pub recipient_address: Option<String>,
+    #[serde(default)]
+    pub recipient_custody_vault_id: Option<Uuid>,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub attestation: String,
+}
+
+fn evm_address_to_bytes32(address: Address) -> FixedBytes<32> {
+    let mut bytes = [0_u8; 32];
+    bytes[12..].copy_from_slice(address.as_slice());
+    FixedBytes::from(bytes)
+}
+
+fn decode_hex_bytes(field: &'static str, value: &str) -> ProviderResult<Vec<u8>> {
+    let trimmed = value.trim();
+    let hex = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    if hex.is_empty() {
+        return Err(format!("{field} must not be empty"));
+    }
+    hex::decode(hex).map_err(|err| format!("invalid {field} hex: {err}"))
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -3804,16 +4561,18 @@ pub fn ethereum_native_asset() -> DepositAsset {
 #[cfg(test)]
 mod hyperliquid_math_tests {
     use super::{
-        classify_hl_leg, compute_base_sz, compute_limit_px, encode_erc20_approve,
-        format_hl_spot_price, hl_leg_descriptor, observed_unit_operation_fingerprints,
+        cctp_quote_amounts, classify_hl_leg, compute_base_sz, compute_limit_px, decimal_bps_string,
+        encode_erc20_approve, format_hl_spot_price, hl_leg_descriptor,
+        observed_unit_operation_fingerprints, parse_decimal_bps_to_micros,
         parse_decimal_to_raw_units_floor, seen_operation_fingerprints_from_request,
         unit_operation_provider_status, unit_withdrawal_minimum_raw, velora_slippage_bps,
-        wire_to_f64, LimitPxInput,
+        wire_to_f64, CctpQuoteAmounts, LimitPxInput,
     };
     use crate::{
         models::{MarketOrderKind, ProviderOperationStatus},
         protocol::{AssetId, ChainId, DepositAsset},
     };
+    use alloy::primitives::U256;
     use serde_json::json;
 
     #[test]
@@ -3875,6 +4634,47 @@ mod hyperliquid_math_tests {
 
         assert!(calldata.starts_with("0x095ea7b3"));
         assert!(calldata.contains("9999999999999999999999999999999999999999"));
+    }
+
+    #[test]
+    fn cctp_decimal_fee_parser_preserves_fractional_bps() {
+        let fee = parse_decimal_bps_to_micros("1.3").unwrap();
+        assert_eq!(fee, 1_300_000);
+        assert_eq!(decimal_bps_string(fee), "1.3");
+    }
+
+    #[test]
+    fn cctp_exact_in_quote_deducts_circle_fee() {
+        let order_kind = MarketOrderKind::ExactIn {
+            amount_in: "1000000".to_string(),
+            min_amount_out: "1".to_string(),
+        };
+
+        assert_eq!(
+            cctp_quote_amounts(&order_kind, 1_300_000).unwrap(),
+            Some(CctpQuoteAmounts {
+                amount_in: U256::from(1_000_000_u64),
+                amount_out: U256::from(999_870_u64),
+                max_fee: U256::from(130_u64),
+            })
+        );
+    }
+
+    #[test]
+    fn cctp_exact_out_quote_grosses_up_circle_fee() {
+        let order_kind = MarketOrderKind::ExactOut {
+            amount_out: "999870".to_string(),
+            max_amount_in: "1000000".to_string(),
+        };
+
+        assert_eq!(
+            cctp_quote_amounts(&order_kind, 1_300_000).unwrap(),
+            Some(CctpQuoteAmounts {
+                amount_in: U256::from(1_000_000_u64),
+                amount_out: U256::from(999_870_u64),
+                max_fee: U256::from(130_u64),
+            })
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@ use bitcoincore_rpc_async::Auth;
 use chains::{bitcoin::BitcoinChain, evm::EvmChain, hyperliquid::HyperliquidChain, ChainRegistry};
 use router_primitives::ChainType;
 use router_server::{
-    api::MarketOrderQuoteRequest,
+    api::{MarketOrderQuoteKind, MarketOrderQuoteRequest},
     config::Settings,
     db::Database,
     models::MarketOrderKind,
@@ -120,9 +120,9 @@ async fn live_router_quote_probe_pepe_eth_to_bitcoin() -> TestResult<()> {
             from_asset: source_asset.clone(),
             to_asset: destination_asset.clone(),
             recipient_address,
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: amount_in.clone(),
-                min_amount_out: "1".to_string(),
+                slippage_bps: 100,
             },
         })
         .await
@@ -174,9 +174,9 @@ async fn live_router_quote_probe_bitcoin_to_pepe_eth() -> TestResult<()> {
             from_asset: source_asset.clone(),
             to_asset: destination_asset.clone(),
             recipient_address,
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: amount_in.clone(),
-                min_amount_out: "1".to_string(),
+                slippage_bps: 100,
             },
         })
         .await
@@ -233,9 +233,9 @@ async fn live_router_quote_probe_bitcoin_to_wbtc_arbitrum() -> TestResult<()> {
             from_asset: source_asset.clone(),
             to_asset: destination_asset.clone(),
             recipient_address,
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: amount_in.clone(),
-                min_amount_out: "1".to_string(),
+                slippage_bps: 100,
             },
         })
         .await
@@ -295,9 +295,9 @@ async fn live_router_quote_probe_wbtc_arbitrum_to_bitcoin() -> TestResult<()> {
             from_asset: source_asset.clone(),
             to_asset: destination_asset.clone(),
             recipient_address,
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: amount_in.clone(),
-                min_amount_out: "1".to_string(),
+                slippage_bps: 100,
             },
         })
         .await
@@ -388,6 +388,7 @@ fn live_action_provider_registry() -> TestResult<ActionProviderRegistry> {
             AcrossHttpProviderConfig::new(across_api_url, across_api_key)
                 .with_integrator_id(Some(across_integrator_id)),
         ),
+        None,
         Some(hyperunit_api_url),
         hyperunit_proxy_url,
         Some(hyperliquid_api_url),

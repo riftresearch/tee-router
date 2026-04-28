@@ -19,6 +19,7 @@ chains = { workspace = true }
 chainalysis-address-screener = { workspace = true }
 hyperliquid-client = { workspace = true }
 hyperunit-client = { workspace = true }
+market-pricing = { workspace = true }
 router-primitives = { workspace = true }
 
 tokio = { workspace = true }

@@ -180,6 +180,18 @@ pub struct RouterServerArgs {
     #[arg(long, env = "ACROSS_INTEGRATOR_ID")]
     pub across_integrator_id: Option<String>,
 
+    /// Circle Iris CCTP API base URL
+    #[arg(long, env = "CCTP_API_URL")]
+    pub cctp_api_url: Option<String>,
+
+    /// CCTP TokenMessengerV2 contract address override
+    #[arg(long, env = "CCTP_TOKEN_MESSENGER_V2_ADDRESS")]
+    pub cctp_token_messenger_v2_address: Option<String>,
+
+    /// CCTP MessageTransmitterV2 contract address override
+    #[arg(long, env = "CCTP_MESSAGE_TRANSMITTER_V2_ADDRESS")]
+    pub cctp_message_transmitter_v2_address: Option<String>,
+
     /// HyperUnit API base URL
     #[arg(long, env = "HYPERUNIT_API_URL")]
     pub hyperunit_api_url: Option<String>,
@@ -288,6 +300,14 @@ pub struct RouterServerArgs {
         default_value = "300"
     )]
     pub worker_route_cost_refresh_seconds: u64,
+
+    /// Coinbase unauthenticated price API base URL used by route-cost pricing refresh
+    #[arg(
+        long,
+        env = "COINBASE_PRICE_API_BASE_URL",
+        default_value = "https://api.coinbase.com"
+    )]
+    pub coinbase_price_api_base_url: String,
 }
 
 impl RouterServerArgs {

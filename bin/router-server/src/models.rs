@@ -108,6 +108,7 @@ pub enum RouterOrderAction {
 pub struct MarketOrderAction {
     #[serde(flatten)]
     pub order_kind: MarketOrderKind,
+    pub slippage_bps: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -188,6 +189,7 @@ pub struct MarketOrderQuote {
     pub amount_out: String,
     pub min_amount_out: Option<String>,
     pub max_amount_in: Option<String>,
+    pub slippage_bps: u64,
     pub provider_quote: Value,
     pub expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
@@ -463,6 +465,7 @@ pub struct CustodyVault {
 #[serde(rename_all = "snake_case")]
 pub enum ProviderOperationType {
     AcrossBridge,
+    CctpBridge,
     HyperliquidBridgeDeposit,
     UnitDeposit,
     UnitWithdrawal,
@@ -475,6 +478,7 @@ impl ProviderOperationType {
     pub fn to_db_string(self) -> &'static str {
         match self {
             Self::AcrossBridge => "across_bridge",
+            Self::CctpBridge => "cctp_bridge",
             Self::HyperliquidBridgeDeposit => "hyperliquid_bridge_deposit",
             Self::UnitDeposit => "unit_deposit",
             Self::UnitWithdrawal => "unit_withdrawal",
@@ -486,6 +490,7 @@ impl ProviderOperationType {
     pub fn from_db_string(value: &str) -> Option<Self> {
         match value {
             "across_bridge" => Some(Self::AcrossBridge),
+            "cctp_bridge" => Some(Self::CctpBridge),
             "hyperliquid_bridge_deposit" => Some(Self::HyperliquidBridgeDeposit),
             "unit_deposit" => Some(Self::UnitDeposit),
             "unit_withdrawal" => Some(Self::UnitWithdrawal),
@@ -775,6 +780,8 @@ pub struct OrderProviderAddress {
 pub enum OrderExecutionStepType {
     WaitForDeposit,
     AcrossBridge,
+    CctpBurn,
+    CctpReceive,
     HyperliquidBridgeDeposit,
     UnitDeposit,
     UnitWithdrawal,
@@ -789,6 +796,8 @@ impl OrderExecutionStepType {
         match self {
             Self::WaitForDeposit => "wait_for_deposit",
             Self::AcrossBridge => "across_bridge",
+            Self::CctpBurn => "cctp_burn",
+            Self::CctpReceive => "cctp_receive",
             Self::HyperliquidBridgeDeposit => "hyperliquid_bridge_deposit",
             Self::UnitDeposit => "unit_deposit",
             Self::UnitWithdrawal => "unit_withdrawal",
@@ -802,6 +811,8 @@ impl OrderExecutionStepType {
         match value {
             "wait_for_deposit" => Some(Self::WaitForDeposit),
             "across_bridge" => Some(Self::AcrossBridge),
+            "cctp_burn" => Some(Self::CctpBurn),
+            "cctp_receive" => Some(Self::CctpReceive),
             "hyperliquid_bridge_deposit" => Some(Self::HyperliquidBridgeDeposit),
             "unit_deposit" => Some(Self::UnitDeposit),
             "unit_withdrawal" => Some(Self::UnitWithdrawal),

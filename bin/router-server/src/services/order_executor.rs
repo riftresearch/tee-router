@@ -1246,6 +1246,7 @@ impl OrderExecutionManager {
         let provider_name = operation.provider.clone();
         match operation.operation_type {
             ProviderOperationType::AcrossBridge
+            | ProviderOperationType::CctpBridge
             | ProviderOperationType::HyperliquidBridgeDeposit => {
                 let provider = self
                     .action_providers
@@ -1525,6 +1526,7 @@ impl OrderExecutionManager {
         match operation_type {
             ProviderOperationType::UnitDeposit => Some(&UNIT_DEPOSIT_VERIFIER),
             ProviderOperationType::AcrossBridge
+            | ProviderOperationType::CctpBridge
             | ProviderOperationType::HyperliquidBridgeDeposit
             | ProviderOperationType::UnitWithdrawal
             | ProviderOperationType::HyperliquidTrade
@@ -1682,6 +1684,7 @@ impl OrderExecutionManager {
         };
         let observation = match operation.operation_type {
             ProviderOperationType::AcrossBridge
+            | ProviderOperationType::CctpBridge
             | ProviderOperationType::HyperliquidBridgeDeposit => {
                 let provider = self
                     .action_providers
@@ -2455,6 +2458,7 @@ impl OrderExecutionManager {
         for (index, transition) in path.transitions.iter().enumerate() {
             match transition.kind {
                 MarketOrderTransitionKind::AcrossBridge
+                | MarketOrderTransitionKind::CctpBridge
                 | MarketOrderTransitionKind::HyperliquidBridgeDeposit => {
                     let bridge_id = transition.provider.as_str();
                     let bridge = self.action_providers.bridge(bridge_id).ok_or_else(|| {
@@ -3737,6 +3741,49 @@ impl OrderExecutionManager {
                 })?;
                 self.prepare_provider_completion(running, intent).await
             }
+            OrderExecutionStepType::CctpBurn => {
+                let request = BridgeExecutionRequest::cctp_burn_from_value(&running.request)
+                    .map_err(|message| OrderExecutionError::ProviderRequestFailed {
+                        provider: running.provider.clone(),
+                        message,
+                    })?;
+                let provider =
+                    self.action_providers
+                        .bridge(&running.provider)
+                        .ok_or_else(|| OrderExecutionError::ProviderRequestFailed {
+                            provider: running.provider.clone(),
+                            message: "bridge provider is not configured".to_string(),
+                        })?;
+                let intent = provider.execute_bridge(&request).await.map_err(|message| {
+                    OrderExecutionError::ProviderRequestFailed {
+                        provider: running.provider.clone(),
+                        message,
+                    }
+                })?;
+                self.prepare_provider_completion(running, intent).await
+            }
+            OrderExecutionStepType::CctpReceive => {
+                let hydrated_request = self.hydrate_cctp_receive_request(running).await?;
+                let request = BridgeExecutionRequest::cctp_receive_from_value(&hydrated_request)
+                    .map_err(|message| OrderExecutionError::ProviderRequestFailed {
+                        provider: running.provider.clone(),
+                        message,
+                    })?;
+                let provider =
+                    self.action_providers
+                        .bridge(&running.provider)
+                        .ok_or_else(|| OrderExecutionError::ProviderRequestFailed {
+                            provider: running.provider.clone(),
+                            message: "bridge provider is not configured".to_string(),
+                        })?;
+                let intent = provider.execute_bridge(&request).await.map_err(|message| {
+                    OrderExecutionError::ProviderRequestFailed {
+                        provider: running.provider.clone(),
+                        message,
+                    }
+                })?;
+                self.prepare_provider_completion(running, intent).await
+            }
             OrderExecutionStepType::HyperliquidBridgeDeposit => {
                 let request =
                     BridgeExecutionRequest::hyperliquid_bridge_deposit_from_value(&running.request)
@@ -3852,6 +3899,72 @@ impl OrderExecutionManager {
                 self.prepare_provider_completion(running, intent).await
             }
         }
+    }
+
+    async fn hydrate_cctp_receive_request(
+        &self,
+        running: &OrderExecutionStep,
+    ) -> OrderExecutionResult<Value> {
+        let burn_transition_decl_id = running
+            .request
+            .get("burn_transition_decl_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| OrderExecutionError::ProviderRequestFailed {
+                provider: running.provider.clone(),
+                message: "cctp receive step missing burn_transition_decl_id".to_string(),
+            })?;
+        let operations = self
+            .db
+            .orders()
+            .get_provider_operations(running.order_id)
+            .await
+            .map_err(|source| OrderExecutionError::Database { source })?;
+        let Some(operation) = operations.into_iter().rev().find(|operation| {
+            operation.operation_type == ProviderOperationType::CctpBridge
+                && operation.status == ProviderOperationStatus::Completed
+                && operation
+                    .request
+                    .get("transition_decl_id")
+                    .and_then(Value::as_str)
+                    == Some(burn_transition_decl_id)
+        }) else {
+            return Err(OrderExecutionError::ProviderRequestFailed {
+                provider: running.provider.clone(),
+                message: format!(
+                    "cctp receive step could not find completed burn operation for transition {burn_transition_decl_id}"
+                ),
+            });
+        };
+        let cctp_state = operation
+            .observed_state
+            .get("provider_observed_state")
+            .unwrap_or(&operation.observed_state);
+        let message = cctp_state
+            .get("message")
+            .and_then(Value::as_str)
+            .ok_or_else(|| OrderExecutionError::ProviderRequestFailed {
+                provider: running.provider.clone(),
+                message: "completed cctp burn operation missing attested message".to_string(),
+            })?;
+        let attestation = cctp_state
+            .get("attestation")
+            .and_then(Value::as_str)
+            .ok_or_else(|| OrderExecutionError::ProviderRequestFailed {
+                provider: running.provider.clone(),
+                message: "completed cctp burn operation missing attestation".to_string(),
+            })?;
+        let mut request = running.request.clone();
+        set_json_value(&mut request, "message", json!(message));
+        set_json_value(&mut request, "attestation", json!(attestation));
+        set_json_value(
+            &mut request,
+            "burn_provider_operation_id",
+            json!(operation.id),
+        );
+        if let Some(tx_hash) = operation.provider_ref {
+            set_json_value(&mut request, "burn_tx_hash", json!(tx_hash));
+        }
+        Ok(request)
     }
 
     async fn prepare_provider_completion(
@@ -4990,6 +5103,22 @@ fn materialize_refund_transition_steps(
                 )?);
                 step_index += 1;
             }
+            MarketOrderTransitionKind::CctpBridge => {
+                let leg = legs.take_one(&transition.id, transition.kind)?;
+                let source = refund_external_source_binding(position, transition_index)?;
+                let cctp_steps = refund_transition_cctp_bridge_steps(RefundCctpBridgeStepSpec {
+                    order,
+                    transition,
+                    leg: &leg,
+                    source,
+                    is_final,
+                    refund_attempt_id,
+                    step_index,
+                    planned_at,
+                })?;
+                step_index += i32::try_from(cctp_steps.len()).unwrap_or(0);
+                steps.extend(cctp_steps);
+            }
             MarketOrderTransitionKind::UnitDeposit => {
                 let leg = legs.take_one(&transition.id, transition.kind)?;
                 let source = refund_external_source_binding(position, transition_index)?;
@@ -5673,6 +5802,126 @@ fn refund_transition_across_bridge_step(
     }))
 }
 
+struct RefundCctpBridgeStepSpec<'a> {
+    order: &'a RouterOrder,
+    transition: &'a TransitionDecl,
+    leg: &'a QuoteLeg,
+    source: RefundExternalSourceBinding,
+    is_final: bool,
+    refund_attempt_id: Uuid,
+    step_index: i32,
+    planned_at: chrono::DateTime<Utc>,
+}
+
+fn refund_transition_cctp_bridge_steps(
+    spec: RefundCctpBridgeStepSpec<'_>,
+) -> OrderExecutionResult<Vec<OrderExecutionStep>> {
+    let RefundCctpBridgeStepSpec {
+        order,
+        transition,
+        leg,
+        source,
+        is_final,
+        refund_attempt_id,
+        step_index,
+        planned_at,
+    } = spec;
+    let provider = refund_leg_provider(leg, transition)?.as_str().to_string();
+    let amount_in = leg.amount_in.clone();
+    let amount_out = leg.amount_out.clone();
+    let source_for_details = source.clone();
+    let (source_id, source_address, source_role) = match source {
+        RefundExternalSourceBinding::Explicit {
+            vault_id,
+            address,
+            role,
+        } => (json!(vault_id), json!(address), json!(role.to_db_string())),
+        RefundExternalSourceBinding::DerivedDestinationExecution => (
+            Value::Null,
+            Value::Null,
+            json!(CustodyVaultRole::DestinationExecution.to_db_string()),
+        ),
+    };
+    let burn = refund_planned_step(RefundPlannedStepSpec {
+        order_id: order.id,
+        transition_decl_id: Some(transition.id.clone()),
+        step_index,
+        step_type: OrderExecutionStepType::CctpBurn,
+        provider: provider.clone(),
+        input_asset: Some(transition.input.asset.clone()),
+        output_asset: Some(transition.output.asset.clone()),
+        amount_in: Some(amount_in.clone()),
+        min_amount_out: None,
+        provider_ref: Some(format!("refund-attempt-{refund_attempt_id}")),
+        request: json!({
+            "order_id": order.id,
+            "transition_decl_id": transition.id,
+            "source_chain_id": transition.input.asset.chain.as_str(),
+            "destination_chain_id": transition.output.asset.chain.as_str(),
+            "input_asset": transition.input.asset.asset.as_str(),
+            "output_asset": transition.output.asset.asset.as_str(),
+            "amount": amount_in,
+            "recipient_address": if is_final { json!(order.refund_address) } else { Value::Null },
+            "recipient_custody_vault_id": null,
+            "recipient_custody_vault_role": if is_final { Value::Null } else { json!(CustodyVaultRole::DestinationExecution.to_db_string()) },
+            "source_custody_vault_id": source_id,
+            "source_custody_vault_address": source_address,
+            "source_custody_vault_role": source_role,
+        }),
+        details: json!({
+            "schema_version": 1,
+            "transition_kind": transition.kind.as_str(),
+            "refund_kind": "transition_path",
+            "source_custody_vault_role": match source_for_details {
+                RefundExternalSourceBinding::Explicit { role, .. } => json!(role.to_db_string()),
+                RefundExternalSourceBinding::DerivedDestinationExecution => json!(CustodyVaultRole::DestinationExecution.to_db_string()),
+            },
+            "source_custody_vault_status": match source_for_details {
+                RefundExternalSourceBinding::Explicit { .. } => json!("bound"),
+                RefundExternalSourceBinding::DerivedDestinationExecution => json!("pending_derivation"),
+            },
+            "recipient_custody_vault_role": if is_final { Value::Null } else { json!(CustodyVaultRole::DestinationExecution.to_db_string()) },
+            "recipient_custody_vault_status": if is_final { Value::Null } else { json!("pending_derivation") },
+        }),
+        planned_at,
+    });
+    let receive = refund_planned_step(RefundPlannedStepSpec {
+        order_id: order.id,
+        transition_decl_id: Some(format!("{}:receive", transition.id)),
+        step_index: step_index + 1,
+        step_type: OrderExecutionStepType::CctpReceive,
+        provider,
+        input_asset: Some(transition.output.asset.clone()),
+        output_asset: Some(transition.output.asset.clone()),
+        amount_in: Some(amount_out.clone()),
+        min_amount_out: None,
+        provider_ref: Some(format!("refund-attempt-{refund_attempt_id}")),
+        request: json!({
+            "order_id": order.id,
+            "burn_transition_decl_id": transition.id,
+            "destination_chain_id": transition.output.asset.chain.as_str(),
+            "output_asset": transition.output.asset.asset.as_str(),
+            "amount": amount_out,
+            "source_custody_vault_id": null,
+            "source_custody_vault_address": null,
+            "source_custody_vault_role": CustodyVaultRole::DestinationExecution.to_db_string(),
+            "recipient_address": if is_final { json!(order.refund_address) } else { Value::Null },
+            "recipient_custody_vault_id": null,
+            "message": "",
+            "attestation": "",
+        }),
+        details: json!({
+            "schema_version": 1,
+            "transition_kind": transition.kind.as_str(),
+            "refund_kind": "transition_path",
+            "source_custody_vault_role": CustodyVaultRole::DestinationExecution.to_db_string(),
+            "source_custody_vault_status": "pending_derivation",
+        }),
+        planned_at,
+    });
+    Ok(vec![burn, receive])
+}
+
 fn refund_transition_unit_deposit_step(
     order: &RouterOrder,
     transition: &TransitionDecl,
@@ -6272,6 +6521,37 @@ fn validate_materialized_intermediate_custody_step(
                     vaults_by_id,
                 )?;
             }
+        }
+        OrderExecutionStepType::CctpBurn => {
+            maybe_validate_bound_internal_vault(
+                order_id,
+                step,
+                "source_custody_vault_role",
+                "source_custody_vault_id",
+                Some("source_custody_vault_address"),
+                &[CustodyVaultRole::DestinationExecution],
+                vaults_by_id,
+            )?;
+            maybe_validate_bound_internal_vault(
+                order_id,
+                step,
+                "recipient_custody_vault_role",
+                "recipient_custody_vault_id",
+                Some("recipient_address"),
+                &[CustodyVaultRole::DestinationExecution],
+                vaults_by_id,
+            )?;
+        }
+        OrderExecutionStepType::CctpReceive => {
+            validate_bound_internal_vault(
+                order_id,
+                step,
+                "source_custody_vault_role",
+                "source_custody_vault_id",
+                Some("source_custody_vault_address"),
+                &[CustodyVaultRole::DestinationExecution],
+                vaults_by_id,
+            )?;
         }
         OrderExecutionStepType::UnitDeposit => {
             maybe_validate_bound_internal_vault(
@@ -7465,6 +7745,7 @@ mod tests {
                     amount_in: "1000000".to_string(),
                     min_amount_out: "1".to_string(),
                 },
+                slippage_bps: 100,
             }),
             action_timeout_at: Utc::now() + chrono::Duration::hours(1),
             idempotency_key: None,

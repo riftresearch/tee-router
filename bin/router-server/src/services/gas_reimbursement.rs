@@ -186,33 +186,67 @@ impl GasReimbursementDebt {
 }
 
 fn paymaster_debts(path: &TransitionPath, pricing: &PricingSnapshot) -> Vec<GasReimbursementDebt> {
-    path.transitions
-        .iter()
-        .enumerate()
-        .filter_map(|(index, transition)| {
-            if !transition_requires_evm_sender_gas(transition.kind)
-                || !is_evm_chain(&transition.input.asset.chain)
-                || transition.input.asset.asset.is_native()
+    let mut debts = Vec::new();
+    for (index, transition) in path.transitions.iter().enumerate() {
+        if transition.kind == MarketOrderTransitionKind::CctpBridge {
+            if is_evm_chain(&transition.input.asset.chain)
+                && !transition.input.asset.asset.is_native()
             {
-                return None;
+                debts.push(paymaster_debt(
+                    format!("paymaster-gas:{index}:source"),
+                    transition.id.clone(),
+                    transition.kind,
+                    &transition.input.asset.chain,
+                    pricing,
+                ));
             }
-            let estimated_native_gas_wei = estimate_paymaster_native_cost_wei(
-                &transition.input.asset.chain,
-                transition.kind,
-                pricing,
-            );
-            let estimated_usd_micro = pricing.wei_to_usd_micro(estimated_native_gas_wei);
-            Some(GasReimbursementDebt {
-                id: format!("paymaster-gas:{index}"),
-                transition_decl_id: transition.id.clone(),
-                transition_kind: transition.kind.as_str().to_string(),
-                spend_chain_id: transition.input.asset.chain.as_str().to_string(),
-                payment_model: GasPaymentModel::PaymasterAdvanced,
-                estimated_native_gas_wei: estimated_native_gas_wei.to_string(),
-                estimated_usd_micro: estimated_usd_micro.to_string(),
-            })
-        })
-        .collect()
+            if is_evm_chain(&transition.output.asset.chain) {
+                debts.push(paymaster_debt(
+                    format!("paymaster-gas:{index}:destination"),
+                    transition.id.clone(),
+                    transition.kind,
+                    &transition.output.asset.chain,
+                    pricing,
+                ));
+            }
+            continue;
+        }
+        if !transition_requires_evm_sender_gas(transition.kind)
+            || !is_evm_chain(&transition.input.asset.chain)
+            || transition.input.asset.asset.is_native()
+        {
+            continue;
+        }
+        debts.push(paymaster_debt(
+            format!("paymaster-gas:{index}"),
+            transition.id.clone(),
+            transition.kind,
+            &transition.input.asset.chain,
+            pricing,
+        ));
+    }
+    debts
+}
+
+fn paymaster_debt(
+    id: String,
+    transition_decl_id: String,
+    transition_kind: MarketOrderTransitionKind,
+    spend_chain: &ChainId,
+    pricing: &PricingSnapshot,
+) -> GasReimbursementDebt {
+    let estimated_native_gas_wei =
+        estimate_paymaster_native_cost_wei(spend_chain, transition_kind, pricing);
+    let estimated_usd_micro = pricing.wei_to_usd_micro(estimated_native_gas_wei);
+    GasReimbursementDebt {
+        id,
+        transition_decl_id,
+        transition_kind: transition_kind.as_str().to_string(),
+        spend_chain_id: spend_chain.as_str().to_string(),
+        payment_model: GasPaymentModel::PaymasterAdvanced,
+        estimated_native_gas_wei: estimated_native_gas_wei.to_string(),
+        estimated_usd_micro: estimated_usd_micro.to_string(),
+    }
 }
 
 fn settlement_candidates(
@@ -270,6 +304,7 @@ fn transition_requires_evm_sender_gas(kind: MarketOrderTransitionKind) -> bool {
     matches!(
         kind,
         MarketOrderTransitionKind::AcrossBridge
+            | MarketOrderTransitionKind::CctpBridge
             | MarketOrderTransitionKind::HyperliquidBridgeDeposit
             | MarketOrderTransitionKind::UnitDeposit
             | MarketOrderTransitionKind::UniversalRouterSwap
@@ -283,6 +318,7 @@ fn estimate_paymaster_native_cost_wei(
 ) -> U256 {
     let action_gas_units = match kind {
         MarketOrderTransitionKind::AcrossBridge => 450_000_u64,
+        MarketOrderTransitionKind::CctpBridge => 300_000_u64,
         MarketOrderTransitionKind::HyperliquidBridgeDeposit => 180_000_u64,
         MarketOrderTransitionKind::UnitDeposit => 140_000_u64,
         MarketOrderTransitionKind::UniversalRouterSwap => 360_000_u64,
@@ -358,18 +394,18 @@ mod tests {
 
         let plan = optimized_paymaster_reimbursement_plan(&registry, &path).unwrap();
 
-        assert_eq!(plan.debts.len(), 2);
+        assert_eq!(plan.debts.len(), 3);
         assert_eq!(plan.retention_actions.len(), 1);
         let action = &plan.retention_actions[0];
         assert_eq!(action.settlement_chain_id, "hyperliquid");
         assert_eq!(action.settlement_asset_id, "native");
         assert_eq!(action.settlement_provider_asset.as_deref(), Some("USDC"));
-        assert_eq!(action.debt_ids.len(), 2);
+        assert_eq!(action.debt_ids.len(), 3);
         assert!(U256::from_str_radix(&action.amount, 10).unwrap() > U256::ZERO);
     }
 
     #[test]
-    fn base_usdc_to_ethereum_usdc_has_single_base_reimbursement() {
+    fn base_usdc_to_arbitrum_usdc_has_cctp_source_and_destination_reimbursement() {
         let registry = AssetRegistry::default();
         let base_usdc = asset(
             "evm:8453",
@@ -387,7 +423,7 @@ mod tests {
 
         let plan = optimized_paymaster_reimbursement_plan(&registry, &path).unwrap();
 
-        assert_eq!(plan.debts.len(), 1);
+        assert_eq!(plan.debts.len(), 2);
         assert_eq!(plan.retention_actions.len(), 1);
         assert_eq!(plan.retention_actions[0].settlement_chain_id, "evm:8453");
     }

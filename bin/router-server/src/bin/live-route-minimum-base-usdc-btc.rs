@@ -69,6 +69,7 @@ async fn main() -> CliResult<()> {
             AcrossHttpProviderConfig::new(across_api_url, across_api_key)
                 .with_integrator_id(Some(across_integrator_id)),
         ),
+        None,
         Some(hyperunit_api_url),
         hyperunit_proxy_url,
         Some(hyperliquid_api_url),

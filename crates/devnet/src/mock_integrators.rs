@@ -5,7 +5,7 @@ use alloy::{
     providers::{DynProvider, Provider, ProviderBuilder},
     rpc::types::{Filter, TransactionRequest},
     sol,
-    sol_types::{SolCall, SolEvent},
+    sol_types::{SolCall, SolEvent, SolValue},
 };
 use axum::{
     extract::{Path, Query, State},
@@ -38,6 +38,7 @@ use uuid::Uuid;
 
 use crate::{
     across_spoke_pool_mock::MockSpokePool::{depositCall, FundsDeposited},
+    cctp_mock::MockCctpTokenMessengerV2::DepositForBurn,
     hyperliquid_bridge_mock::MockHyperliquidBridge2,
 };
 
@@ -124,6 +125,7 @@ pub struct MockIntegratorLedgerSnapshot {
     pub hyperliquid_balances: BTreeMap<String, String>,
     pub recipient_balances: BTreeMap<String, String>,
     pub unit_operations: Vec<MockUnitOperationRecord>,
+    pub cctp_burns: Vec<MockCctpBurnRecord>,
     pub hyperliquid_exchange_submissions: Vec<Value>,
 }
 
@@ -162,6 +164,15 @@ pub struct MockIntegratorConfig {
     /// ERC20 token address used as "native Arbitrum USDC" for the mock
     /// Hyperliquid bridge.
     pub hyperliquid_usdc_token_address: Option<String>,
+    /// Address of the mock CCTP TokenMessengerV2 contract deployed to the
+    /// source EVM test chain. When set with `cctp_evm_rpc_url`, the mock Iris
+    /// endpoint indexes burn events from this contract.
+    pub cctp_token_messenger_address: Option<String>,
+    /// RPC URL of the source chain hosting the mock CCTP TokenMessengerV2.
+    pub cctp_evm_rpc_url: Option<String>,
+    /// Token address that mock CCTP receiveMessage should mint on the
+    /// destination chain.
+    pub cctp_destination_token_address: Option<String>,
     /// Artificial delay before the mock Bridge2 releases the net `withdraw3`
     /// payout onto the EVM chain. Defaults to zero.
     pub hyperliquid_withdrawal_latency: Duration,
@@ -227,6 +238,24 @@ impl MockIntegratorConfig {
     }
 
     #[must_use]
+    pub fn with_cctp_token_messenger_address(mut self, address: impl Into<String>) -> Self {
+        self.cctp_token_messenger_address = Some(address.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_cctp_evm_rpc_url(mut self, url: impl Into<String>) -> Self {
+        self.cctp_evm_rpc_url = Some(url.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_cctp_destination_token_address(mut self, address: impl Into<String>) -> Self {
+        self.cctp_destination_token_address = Some(address.into());
+        self
+    }
+
+    #[must_use]
     pub fn with_hyperliquid_withdrawal_latency(mut self, latency: Duration) -> Self {
         self.hyperliquid_withdrawal_latency = latency;
         self
@@ -272,6 +301,7 @@ struct MockIntegratorState {
     unit_operations: Mutex<BTreeMap<String, Vec<MockUnitOperationEntry>>>,
     ledger: Mutex<MockIntegratorLedger>,
     across_deposits: Mutex<BTreeMap<AcrossDepositKey, MockAcrossDepositRecord>>,
+    cctp_burns: Mutex<BTreeMap<String, MockCctpBurnRecord>>,
     hyperliquid_exchange_submissions: Mutex<Vec<Value>>,
     hyperliquid: Mutex<HyperliquidMockState>,
     next_across_swap_approval_error: Mutex<Option<String>>,
@@ -302,6 +332,21 @@ pub struct MockAcrossDepositRecord {
     pub output_amount: U256,
     pub fill_deadline: u32,
     pub deposit_tx_hash: String,
+    pub block_number: u64,
+    pub indexed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MockCctpBurnRecord {
+    pub source_domain: u32,
+    pub destination_domain: u32,
+    pub nonce: u64,
+    pub burn_token: Address,
+    pub destination_token: Address,
+    pub depositor: Address,
+    pub mint_recipient: Address,
+    pub amount: U256,
+    pub burn_tx_hash: String,
     pub block_number: u64,
     pub indexed_at: DateTime<Utc>,
 }
@@ -429,6 +474,8 @@ pub struct MockIntegratorServer {
     across_indexer_handle: Option<JoinHandle<()>>,
     hyperliquid_indexer_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     hyperliquid_indexer_handle: Option<JoinHandle<()>>,
+    cctp_indexer_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    cctp_indexer_handle: Option<JoinHandle<()>>,
 }
 
 impl MockIntegratorServer {
@@ -445,17 +492,28 @@ impl MockIntegratorServer {
             maybe_spawn_across_deposit_indexer(&config, state.clone()).await?;
         let (hyperliquid_indexer_shutdown, hyperliquid_indexer_handle) =
             maybe_spawn_hyperliquid_bridge_indexer(&config, state.clone()).await?;
+        let (cctp_indexer_shutdown, cctp_indexer_handle) =
+            maybe_spawn_cctp_burn_indexer(&config, state.clone()).await?;
 
         let app = Router::new()
             .route("/swap/approval", get(mock_across_real_swap_approval))
             .route("/deposit/status", get(mock_across_deposit_status))
             .route("/prices", get(mock_velora_prices))
+            .route(
+                "/v2/prices/:currency_pair/spot",
+                get(mock_coinbase_spot_price),
+            )
             .route("/transactions/:network", post(mock_velora_transaction))
             .route(
                 "/gen/:src_chain/:dst_chain/:asset/:dst_addr",
                 get(mock_unit_gen),
             )
             .route("/operations/:address", get(mock_unit_operations))
+            .route("/v2/messages/:source_domain", get(mock_cctp_messages))
+            .route(
+                "/v2/burn/USDC/fees/:source_domain/:destination_domain",
+                get(mock_cctp_burn_fees),
+            )
             .route("/info", post(mock_hyperliquid_info))
             .route("/exchange", post(mock_hyperliquid_exchange))
             .with_state(state.clone());
@@ -480,6 +538,8 @@ impl MockIntegratorServer {
             across_indexer_handle,
             hyperliquid_indexer_shutdown,
             hyperliquid_indexer_handle,
+            cctp_indexer_shutdown,
+            cctp_indexer_handle,
         })
     }
 
@@ -516,11 +576,19 @@ impl MockIntegratorServer {
             .await
             .clone();
         let unit_operations = snapshot_unit_operations(&*self.state.unit_operations.lock().await);
+        let cctp_burns = self
+            .state
+            .cctp_burns
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect();
         self.state
             .ledger
             .lock()
             .await
-            .snapshot(exchange_submissions, unit_operations)
+            .snapshot(exchange_submissions, unit_operations, cctp_burns)
     }
 
     pub async fn fail_next_across_swap_approval(&self, error: impl Into<String>) {
@@ -618,6 +686,16 @@ impl MockIntegratorServer {
     pub async fn across_deposits(&self) -> Vec<MockAcrossDepositRecord> {
         self.state
             .across_deposits
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    pub async fn cctp_burns(&self) -> Vec<MockCctpBurnRecord> {
+        self.state
+            .cctp_burns
             .lock()
             .await
             .values()
@@ -724,6 +802,7 @@ impl MockIntegratorState {
             unit_operations: Mutex::default(),
             ledger: Mutex::default(),
             across_deposits: Mutex::default(),
+            cctp_burns: Mutex::default(),
             hyperliquid_exchange_submissions: Mutex::default(),
             hyperliquid: Mutex::new(HyperliquidMockState::new()),
             next_across_swap_approval_error: Mutex::default(),
@@ -752,11 +831,17 @@ impl Drop for MockIntegratorServer {
         if let Some(shutdown) = self.hyperliquid_indexer_shutdown.take() {
             let _ = shutdown.send(());
         }
+        if let Some(shutdown) = self.cctp_indexer_shutdown.take() {
+            let _ = shutdown.send(());
+        }
         self.handle.abort();
         if let Some(handle) = self.across_indexer_handle.take() {
             handle.abort();
         }
         if let Some(handle) = self.hyperliquid_indexer_handle.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.cctp_indexer_handle.take() {
             handle.abort();
         }
     }
@@ -767,12 +852,14 @@ impl MockIntegratorLedger {
         &self,
         hyperliquid_exchange_submissions: Vec<Value>,
         unit_operations: Vec<MockUnitOperationRecord>,
+        cctp_burns: Vec<MockCctpBurnRecord>,
     ) -> MockIntegratorLedgerSnapshot {
         MockIntegratorLedgerSnapshot {
             bridged_balances: stringify_balances(&self.bridged_balances),
             hyperliquid_balances: stringify_balances(&self.hyperliquid_balances),
             recipient_balances: stringify_balances(&self.recipient_balances),
             unit_operations,
+            cctp_burns,
             hyperliquid_exchange_submissions,
         }
     }
@@ -1739,6 +1826,113 @@ fn mock_across_pagination() -> Value {
     })
 }
 
+#[derive(Debug, Deserialize)]
+struct MockCctpMessagesQuery {
+    #[serde(rename = "transactionHash")]
+    transaction_hash: Option<String>,
+    nonce: Option<String>,
+}
+
+async fn mock_cctp_messages(
+    State(state): State<Arc<MockIntegratorState>>,
+    Path(source_domain): Path<u32>,
+    Query(query): Query<MockCctpMessagesQuery>,
+) -> impl IntoResponse {
+    let burns = state.cctp_burns.lock().await;
+    let record = if let Some(tx_hash) = query.transaction_hash.as_deref() {
+        burns.get(tx_hash).cloned()
+    } else if let Some(nonce) = query.nonce.as_deref() {
+        burns
+            .values()
+            .find(|record| record.nonce.to_string() == nonce)
+            .cloned()
+    } else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "mock CCTP /v2/messages requires transactionHash or nonce".to_string(),
+        );
+    };
+    let Some(record) = record.filter(|record| record.source_domain == source_domain) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "not found"
+            })),
+        )
+            .into_response();
+    };
+    let message = (
+        record.destination_token,
+        record.mint_recipient,
+        record.amount,
+    )
+        .abi_encode();
+    (
+        StatusCode::OK,
+        Json(json!({
+            "messages": [{
+                "message": format!("0x{}", hex::encode(message)),
+                "attestation": format!("0x{}", "11".repeat(65)),
+                "eventNonce": record.nonce.to_string(),
+                "cctpVersion": 2,
+                "status": "complete",
+                "decodedMessageBody": {
+                    "burnToken": format!("{:#x}", record.burn_token),
+                    "mintRecipient": format!("{:#x}", record.mint_recipient),
+                    "amount": record.amount.to_string(),
+                    "messageSender": format!("{:#x}", record.depositor)
+                }
+            }]
+        })),
+    )
+        .into_response()
+}
+
+async fn mock_cctp_burn_fees(
+    Path((_source_domain, _destination_domain)): Path<(u32, u32)>,
+) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(json!([
+            {
+                "finalityThreshold": 1000,
+                "minimumFee": 1.3
+            },
+            {
+                "finalityThreshold": 2000,
+                "minimumFee": 0
+            }
+        ])),
+    )
+        .into_response()
+}
+
+async fn mock_coinbase_spot_price(Path(currency_pair): Path<String>) -> impl IntoResponse {
+    let (base, amount) = match currency_pair.as_str() {
+        "ETH-USD" => ("ETH", "3000"),
+        "BTC-USD" => ("BTC", "100000"),
+        "USDC-USD" => ("USDC", "1"),
+        "USDT-USD" => ("USDT", "1"),
+        _ => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                format!("mock Coinbase spot price not found for {currency_pair}"),
+            );
+        }
+    };
+    (
+        StatusCode::OK,
+        Json(json!({
+            "data": {
+                "amount": amount,
+                "base": base,
+                "currency": "USD"
+            }
+        })),
+    )
+        .into_response()
+}
+
 async fn maybe_spawn_across_deposit_indexer(
     config: &MockIntegratorConfig,
     state: Arc<MockIntegratorState>,
@@ -1796,6 +1990,46 @@ async fn maybe_spawn_hyperliquid_bridge_indexer(
         provider,
         token_address,
         bridge_address,
+        state,
+        shutdown_rx,
+    ));
+    Ok((Some(shutdown_tx), Some(handle)))
+}
+
+async fn maybe_spawn_cctp_burn_indexer(
+    config: &MockIntegratorConfig,
+    state: Arc<MockIntegratorState>,
+) -> eyre::Result<(
+    Option<tokio::sync::oneshot::Sender<()>>,
+    Option<JoinHandle<()>>,
+)> {
+    let (Some(rpc_url), Some(token_messenger_str), Some(destination_token_str)) = (
+        config.cctp_evm_rpc_url.as_deref(),
+        config.cctp_token_messenger_address.as_deref(),
+        config.cctp_destination_token_address.as_deref(),
+    ) else {
+        return Ok((None, None));
+    };
+    let token_messenger_address: Address = token_messenger_str.parse().map_err(|err| {
+        eyre::eyre!(
+            "mock cctp indexer: invalid TokenMessengerV2 address {token_messenger_str}: {err}"
+        )
+    })?;
+    let destination_token_address: Address = destination_token_str.parse().map_err(|err| {
+        eyre::eyre!(
+            "mock cctp indexer: invalid destination token address {destination_token_str}: {err}"
+        )
+    })?;
+    let provider: DynProvider = ProviderBuilder::new().connect(rpc_url).await?.erased();
+    let chain_id = provider.get_chain_id().await?;
+    let source_domain = cctp_domain_for_chain_id(chain_id).unwrap_or(6);
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::spawn(run_cctp_burn_indexer(
+        provider,
+        token_messenger_address,
+        destination_token_address,
+        source_domain,
         state,
         shutdown_rx,
     ));
@@ -1868,6 +2102,76 @@ async fn run_across_deposit_indexer(
             };
             let key = (chain_id, record.deposit_id.to_string());
             state.across_deposits.lock().await.insert(key, record);
+        }
+        last_scanned = head;
+    }
+}
+
+async fn run_cctp_burn_indexer(
+    provider: DynProvider,
+    token_messenger_address: Address,
+    destination_token_address: Address,
+    source_domain: u32,
+    state: Arc<MockIntegratorState>,
+    mut shutdown: tokio::sync::oneshot::Receiver<()>,
+) {
+    let signature: B256 = DepositForBurn::SIGNATURE_HASH;
+    let poll = Duration::from_millis(100);
+    let mut last_scanned: u64 = provider.get_block_number().await.unwrap_or(0);
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => return,
+            _ = tokio::time::sleep(poll) => {}
+        }
+        let head = match provider.get_block_number().await {
+            Ok(head) => head,
+            Err(err) => {
+                tracing::warn!(%err, "mock cctp indexer: get_block_number failed");
+                continue;
+            }
+        };
+        if head <= last_scanned {
+            continue;
+        }
+        let filter = Filter::new()
+            .address(token_messenger_address)
+            .event_signature(signature)
+            .from_block(last_scanned + 1)
+            .to_block(head);
+        let logs = match provider.get_logs(&filter).await {
+            Ok(logs) => logs,
+            Err(err) => {
+                tracing::warn!(%err, "mock cctp indexer: get_logs failed");
+                continue;
+            }
+        };
+        for log in logs {
+            let decoded = match DepositForBurn::decode_log(&log.inner) {
+                Ok(event) => event,
+                Err(err) => {
+                    tracing::warn!(%err, "mock cctp indexer: decode DepositForBurn failed");
+                    continue;
+                }
+            };
+            let event = decoded.data;
+            let burn_tx_hash = log
+                .transaction_hash
+                .map(|h| format!("{h:#x}"))
+                .unwrap_or_default();
+            let record = MockCctpBurnRecord {
+                source_domain,
+                destination_domain: event.destinationDomain,
+                nonce: event.nonce,
+                burn_token: event.burnToken,
+                destination_token: destination_token_address,
+                depositor: event.depositor,
+                mint_recipient: bytes32_to_evm_address(event.mintRecipient),
+                amount: event.amount,
+                burn_tx_hash: burn_tx_hash.clone(),
+                block_number: log.block_number.unwrap_or_default(),
+                indexed_at: Utc::now(),
+            };
+            state.cctp_burns.lock().await.insert(burn_tx_hash, record);
         }
         last_scanned = head;
     }
@@ -1951,6 +2255,19 @@ async fn run_hyperliquid_bridge_indexer(
 fn raw_usdc_to_natural_f64(value: U256) -> Option<f64> {
     let raw: u128 = value.try_into().ok()?;
     Some(raw as f64 / 1_000_000.0)
+}
+
+fn cctp_domain_for_chain_id(chain_id: u64) -> Option<u32> {
+    match chain_id {
+        1 => Some(0),
+        42161 => Some(3),
+        8453 => Some(6),
+        _ => None,
+    }
+}
+
+fn bytes32_to_evm_address(value: FixedBytes<32>) -> Address {
+    Address::from_slice(&value.as_slice()[12..])
 }
 
 /// Handles `GET /gen/{src_chain}/{dst_chain}/{asset}/{dst_addr}` — HyperUnit's

@@ -1,6 +1,6 @@
 use crate::{
     models::{
-        empty_metadata, DepositVaultFundingHint, MarketOrderKind, OrderProviderOperationHint,
+        empty_metadata, DepositVaultFundingHint, OrderProviderOperationHint,
         ProviderExecutionPolicyState, ProviderOperationHintKind, ProviderPolicy,
         ProviderQuotePolicyState, VaultAction,
     },
@@ -69,7 +69,20 @@ pub struct MarketOrderQuoteRequest {
     pub to_asset: DepositAsset,
     pub recipient_address: String,
     #[serde(flatten)]
-    pub order_kind: MarketOrderKind,
+    pub order_kind: MarketOrderQuoteKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MarketOrderQuoteKind {
+    ExactIn {
+        amount_in: String,
+        slippage_bps: u64,
+    },
+    ExactOut {
+        amount_out: String,
+        slippage_bps: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

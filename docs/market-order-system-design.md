@@ -14,7 +14,7 @@ This document covers:
 - transition-path planning
 - execution and observation
 - retry and refund routing
-- extension points for new assets, venues, and transition kinds
+- extension points for new assets, venues, chains, and transition kinds
 
 It does not cover:
 
@@ -34,7 +34,7 @@ The system is split into five main layers:
 
 2. `ActionProviderRegistry`
    - concrete provider adapters
-   - quote / execute / observe implementations for Across, HyperUnit,
+   - quote / execute / observe implementations for Across, CCTP, HyperUnit,
      Hyperliquid Bridge, Hyperliquid spot, and Velora
 
 3. `OrderManager`
@@ -59,22 +59,26 @@ The system is split into five main layers:
 
 ## Current Venue Alignment
 
-Every venue should line up with the extension checklist below: provider id,
-capability or support model, provider trait implementation, registry wiring,
-provider-policy id, local mock surface, mock integration coverage, and live
-differential coverage.
+The exhaustive venue checklist lives in `docs/venue-addition-guide.md`. Every
+venue should line up with that guide: provider id, venue taxonomy, asset support
+model, transition kind, provider adapter, registry wiring, provider-policy id,
+planner/executor behavior, Sauron behavior if async, local mock surface, mock
+integration coverage, live differential coverage, observability, and operator
+disable/drain behavior.
 
 | Runtime id | Venue model | Asset support | Transition kind | Adapter trait | Current alignment |
 | --- | --- | --- | --- | --- | --- |
 | `across` | cross-chain bridge | runtime-enumerated allowlist | `AcrossBridge` | `BridgeProvider` | aligned: capability rows, HTTP registry wiring, policy id, mock `/swap/approval` + `/deposit/status`, mock execution tests, live Across transcript tests |
+| `cctp` | cross-chain USDC burn/mint bridge | static declared USDC domains | `CctpBridge` | `BridgeProvider` | aligned: capability rows, HTTP registry wiring, policy id, mock TokenMessengerV2 + Iris `/v2/messages` + MessageTransmitterV2, mock execution tests, live CCTP differential tests |
 | `unit` | cross-chain deposit/withdraw venue | static declared assets | `UnitDeposit`, `UnitWithdrawal` | `UnitProvider` | aligned: capability rows, HTTP registry wiring, policy id, mock `/gen` + `/operations`, async observation tests, live HyperUnit differential tests |
 | `hyperliquid_bridge` | cross-chain bridge into Hyperliquid | static declared USDC ingress | `HyperliquidBridgeDeposit` | `BridgeProvider` | aligned: capability row, HTTP registry wiring, policy id, mock Bridge2 indexer plus Hyperliquid balance observation, planner/executor tests, live bridge differential tests |
 | `hyperliquid` | mono-chain fixed-pair exchange | static declared spot assets | `HyperliquidTrade` | `ExchangeProvider` | aligned: capability rows, HTTP registry wiring, policy id, mock `/info` + `/exchange`, execution tests, live spot/order/cancel differential tests |
 | `velora` | mono-chain universal router | open-address quote check | `UniversalRouterSwap` | `ExchangeProvider` | aligned: runtime transition generation, HTTP registry wiring, policy id, mock `/prices` + `/transactions/:network`, arbitrary-token quote and local-settlement tests, live Velora quote/swap differential tests |
 
-Review rule: if a venue appears in `ProviderId`, it should have a row here and
-in `docs/provider-mock-parity.md`. If it moves funds through a real provider
-API, it should also have an ignored live differential test that records the real
+Review rule: if a venue appears in `ProviderId`, it must have a row here, a row
+in `docs/venue-addition-guide.md`, and a section in
+`docs/provider-mock-parity.md`. If it moves funds through a real provider API,
+it must also have an ignored live differential test that records the real
 provider transcript before we trust the mock shape.
 
 ## Quote System
@@ -88,14 +92,17 @@ Current shape:
 3. optionally compute route minimums
 4. enumerate transition paths from source asset to destination asset
 5. drop non-executable paths
-6. quote the remaining paths against the live provider adapters
-7. rank by quote result
-8. persist the selected quote
+6. probe the ranked paths to discover expected input/output
+7. derive `min_amount_out` or `max_amount_in` from user `slippage_bps`
+8. re-quote the chosen provider path with the derived hard bound
+9. persist the selected quote
 
 Important detail:
 
 - The persisted quote contains `path_id`, `transition_decl_ids`, and a
   transition-leg quote chain.
+- The request stores the user-facing `slippage_bps`; the persisted quote and
+  order store both that value and the derived hard amount bound.
 - The worker does not rediscover the route template later.
 - The quote is the source of truth for the forward execution path.
 
@@ -111,7 +118,8 @@ The quote model is optimized cross-chain from the start:
 2. ignore native-input EVM steps for paymaster reimbursement because the vault
    already holds the chain gas token
 3. estimate each non-native EVM step's paymaster debt in native gas
-4. normalize the debts into USD micro-units at quote time
+4. normalize the debts into USD micro-units at quote time using the worker's
+   latest pricing snapshot
 5. enumerate eligible settlement sites where the order holds priced assets
    under Rift custody, including EVM tokens and Hyperliquid spot balances
 6. choose the cheapest settlement site after collection gas and inventory
@@ -119,14 +127,23 @@ The quote model is optimized cross-chain from the start:
 7. retain the settlement asset before the provider action at that site
 8. expose the retained amount in `provider_quote.gas_reimbursement`
 
-For `Base USDC -> BTC`, the route has two EVM paymaster debts:
+For `Base USDC -> BTC`, the preferred route uses CCTP for the USDC chain hop
+when both source and destination USDC domains are registered. It has three EVM
+paymaster debts:
 
-- Base USDC vault calls Across
+- Base USDC vault calls CCTP `depositForBurn`
+- Arbitrum USDC vault calls CCTP `receiveMessage`
 - Arbitrum USDC vault calls the Hyperliquid bridge
 
+Route-cost refresh owns the pricing refresh loop. Each refresh asks configured
+EVM RPCs for `eth_gasPrice` on Ethereum, Base, and Arbitrum, and asks Coinbase's
+unauthenticated spot price API for ETH-USD, BTC-USD, and USDC-USD. If a refresh
+fails, the worker keeps using the previous pricing snapshot instead of replacing
+it with partial data.
+
 Because the route reaches Hyperliquid USDC before the spot trade, the optimizer
-should normally settle both debts by retaining Hyperliquid USDC before the
-trade. The quote therefore leaves the Across and Hyperliquid bridge inputs
+should normally settle these debts by retaining Hyperliquid USDC before the
+trade. The quote therefore leaves the CCTP and Hyperliquid bridge inputs
 alone, reduces the Hyperliquid trade input by the retained USDC amount, and
 carries a retention action on the Hyperliquid trade step. Base and Arbitrum
 still receive paymaster gas on their own chains, but reimbursement is accounted
@@ -195,17 +212,16 @@ Current worker pass shape:
 
 1. reconcile failed attempts that still need retry/refund decisions
 2. process provider hints
-3. poll waiting external provider operations
-4. recover terminal provider operations that were persisted before step
+3. recover terminal provider operations that were persisted before step
    settlement
-5. finalize completed orders that survived a crash before finalization
-6. finalize direct refunds
-7. plan refund attempts waiting in `refund_required`
-8. align vault state for manual refund cases
-9. materialize forward execution plans for funded orders
-10. execute ready orders
-11. finalize terminal internal custody vault lifecycle
-12. sweep released internal custody to paymasters when economic
+4. finalize completed orders that survived a crash before finalization
+5. finalize direct refunds
+6. plan refund attempts waiting in `refund_required`
+7. align vault state for manual refund cases
+8. materialize forward execution plans for funded orders
+9. execute ready orders
+10. finalize terminal internal custody vault lifecycle
+11. sweep released internal custody to paymasters when economic
 
 Execution is generic at the step level:
 
@@ -213,7 +229,8 @@ Execution is generic at the step level:
 - providers return execution intents
 - the custody executor performs chain actions
 - providers can derive observed state after submission
-- later polling and hints drive the provider operation to a terminal state
+- Sauron submits hints for possible progress, and the worker validates those
+  hints against provider or chain truth before moving the operation terminal
 
 ## Retry and Refund System
 
@@ -252,6 +269,11 @@ The system is much cleaner than the original route-template model, but it is
 not yet true one-touch extension. The actual touchpoints depend on what is
 being added.
 
+For full checklists, use:
+
+- `docs/venue-addition-guide.md` for venues and transition kinds
+- `docs/chain-addition-guide.md` for chains
+
 ### Case 1: Add a new chain-local asset that existing providers already support
 
 Required changes:
@@ -283,20 +305,24 @@ Examples:
 Required changes:
 
 1. add a provider identifier to `ProviderId`
-2. add provider capability rows in `builtin_provider_assets`
-3. implement the correct provider trait in `action_providers.rs`
+2. classify the provider's `ProviderVenueKind` and `AssetSupportModel`
+3. add provider capability rows in `builtin_provider_assets`
+4. implement the correct provider trait in `action_providers.rs`
    - `BridgeProvider`
    - `ExchangeProvider`
    - `UnitProvider`
-4. wire the provider into `ActionProviderRegistry`
-5. make sure provider-policy names match the runtime `id()`
-6. add a local mock service for the provider API surface the router consumes
+5. wire the provider into `ActionProviderRegistry` and router startup config
+6. make sure provider-policy names match the runtime `id()`
+7. update quote composition, route-cost ranking, route minimums, gas
+   reimbursement, planner materialization, executor dispatch, observation, and
+   refund support wherever the existing transition kind requires it
+8. add a local mock service for the provider API surface the router consumes
    - the mock must live in devnet or the existing mock-integrator harness
    - it should return provider-shaped quote and transaction/operation responses
    - when practical, it should materialize local settlement state enough for
      worker tests to advance, while clearly documenting what it does not
      simulate
-7. add mock coverage and live differential coverage
+9. add mock coverage, recovery coverage, and live differential coverage
 
 If the venue reuses an existing transition kind, the planner and refund
 materializer can usually remain unchanged.
@@ -312,16 +338,30 @@ Required changes:
 3. `required_roles_for_transition_kind`
 4. path quoting in `OrderManager`
 5. route-minimum computation in `RouteMinimumService`
-6. forward step materialization in `MarketOrderRoutePlanner`
-7. runtime custody validation in planner/executor
-8. execution dispatch in `OrderExecutionManager`
-9. provider-operation observation and recovery
-10. refund quote composition in `OrderExecutionManager`
-11. refund step materialization in `OrderExecutionManager`
-12. local mock service, unit tests, integration tests, and live differential
+6. route-cost ranking and refresh handling in `RouteCostService`
+7. paymaster debt and retention handling in `gas_reimbursement.rs`
+8. DB enum constraints and model db-string parsing if new step or operation
+   values are needed
+9. forward step materialization in `MarketOrderRoutePlanner`
+10. runtime custody validation in planner/executor
+11. execution dispatch in `OrderExecutionManager`
+12. provider-operation observation and recovery
+13. refund quote composition in `OrderExecutionManager`
+14. refund step materialization in `OrderExecutionManager`
+15. Sauron watch or provider-operation handling if the transition is async
+16. local mock service, unit tests, integration tests, and live differential
     tests
 
 This is the main place where the current design is still multi-touch.
+
+### Case 4: Add a new chain
+
+Use `docs/chain-addition-guide.md`. The short version is that a chain addition
+must update primitive chain identity, router startup config, `ChainRegistry`,
+custody actions, address validation, Sauron detection, asset registry rows,
+provider capability rows, route-cost/gas pricing, paymaster behavior, mocks,
+live differentials, and operator documentation. A chain is not integrated just
+because its `ChainId` parses.
 
 ## What Is Clean Today
 

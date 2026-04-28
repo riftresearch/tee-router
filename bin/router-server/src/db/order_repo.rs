@@ -37,7 +37,8 @@ const ORDER_SELECT_COLUMNS: &str = r#"
     moa.amount_in AS market_order_amount_in,
     moa.min_amount_out AS market_order_min_amount_out,
     moa.amount_out AS market_order_amount_out,
-    moa.max_amount_in AS market_order_max_amount_in
+    moa.max_amount_in AS market_order_max_amount_in,
+    moa.slippage_bps AS market_order_slippage_bps
 "#;
 
 const QUOTE_SELECT_COLUMNS: &str = r#"
@@ -54,6 +55,7 @@ const QUOTE_SELECT_COLUMNS: &str = r#"
     amount_out,
     min_amount_out,
     max_amount_in,
+    slippage_bps,
     provider_quote,
     expires_at,
     created_at
@@ -215,13 +217,14 @@ impl OrderRepository {
                 amount_out,
                 min_amount_out,
                 max_amount_in,
+                slippage_bps,
                 provider_quote,
                 expires_at,
                 created_at
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8,
-                $9, $10, $11, $12, $13, $14, $15, $16
+                $9, $10, $11, $12, $13, $14, $15, $16, $17
             )
             "#,
         )
@@ -238,6 +241,11 @@ impl OrderRepository {
         .bind(&quote.amount_out)
         .bind(quote.min_amount_out.clone())
         .bind(quote.max_amount_in.clone())
+        .bind(
+            i64::try_from(quote.slippage_bps).map_err(|err| RouterServerError::Validation {
+                message: format!("quote slippage_bps does not fit i64: {err}"),
+            })?,
+        )
         .bind(quote.provider_quote.clone())
         .bind(quote.expires_at)
         .bind(quote.created_at)
@@ -312,10 +320,11 @@ impl OrderRepository {
                     min_amount_out,
                     amount_out,
                     max_amount_in,
+                    slippage_bps,
                     created_at,
                     updated_at
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                 "#,
             )
             .bind(order.id)
@@ -324,6 +333,11 @@ impl OrderRepository {
             .bind(market_action.min_amount_out)
             .bind(market_action.amount_out)
             .bind(market_action.max_amount_in)
+            .bind(i64::try_from(market_action.slippage_bps).map_err(|err| {
+                RouterServerError::Validation {
+                    message: format!("order slippage_bps does not fit i64: {err}"),
+                }
+            })?)
             .bind(order.created_at)
             .bind(order.updated_at)
             .execute(&mut *tx)
@@ -2589,9 +2603,16 @@ impl OrderRepository {
                         max_amount_in: required_action_amount(row, "market_order_max_amount_in")?,
                     },
                 };
+                let slippage_bps = u64::try_from(row.get::<i64, _>("market_order_slippage_bps"))
+                    .map_err(|err| RouterServerError::InvalidData {
+                        message: format!("invalid market order slippage_bps: {err}"),
+                    })?;
 
                 Ok(RouterOrderAction::MarketOrder(
-                    crate::models::MarketOrderAction { order_kind },
+                    crate::models::MarketOrderAction {
+                        order_kind,
+                        slippage_bps,
+                    },
                 ))
             }
         }
@@ -2633,6 +2654,11 @@ impl OrderRepository {
             amount_out: row.get("amount_out"),
             min_amount_out: row.get("min_amount_out"),
             max_amount_in: row.get("max_amount_in"),
+            slippage_bps: u64::try_from(row.get::<i64, _>("slippage_bps")).map_err(|err| {
+                RouterServerError::InvalidData {
+                    message: format!("invalid quote slippage_bps: {err}"),
+                }
+            })?,
             provider_quote: row.get("provider_quote"),
             expires_at: row.get("expires_at"),
             created_at: row.get("created_at"),
@@ -2925,6 +2951,7 @@ struct MarketOrderActionFields {
     min_amount_out: Option<String>,
     amount_out: Option<String>,
     max_amount_in: Option<String>,
+    slippage_bps: u64,
 }
 
 fn market_order_action_fields(
@@ -2941,6 +2968,7 @@ fn market_order_action_fields(
                 min_amount_out: Some(min_amount_out.clone()),
                 amount_out: None,
                 max_amount_in: None,
+                slippage_bps: action.slippage_bps,
             }),
             MarketOrderKind::ExactOut {
                 amount_out,
@@ -2951,6 +2979,7 @@ fn market_order_action_fields(
                 min_amount_out: None,
                 amount_out: Some(amount_out.clone()),
                 max_amount_in: Some(max_amount_in.clone()),
+                slippage_bps: action.slippage_bps,
             }),
         },
     }

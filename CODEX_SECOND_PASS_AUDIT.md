@@ -75,6 +75,13 @@ Recommended fix:
 
 Severity: medium.
 
+Status: resolved. Router-worker now refreshes route-cost pricing through the
+`market-pricing` crate, using Coinbase unauthenticated spot prices and
+configured EVM RPC `eth_gasPrice` calls. Paymaster reimbursement during quote
+composition uses the current `RouteCostService` pricing snapshot when available.
+
+Original finding:
+
 `PricingSnapshot::static_bootstrap` hard-codes ETH, BTC, stablecoin, and gas
 prices. `RouteCostService::new` captures one static snapshot at service
 construction with `expires_at: None`. Paymaster reimbursement also creates a

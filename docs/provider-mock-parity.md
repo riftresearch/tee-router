@@ -4,6 +4,12 @@ This note scopes the devnet provider mocks to the external API surface the
 router currently consumes. It is not a claim that the mocks are complete
 provider emulators.
 
+When adding a venue, use `docs/venue-addition-guide.md` first. The mock parity
+section for that venue must be added before the mock is considered trustworthy:
+it should name every provider endpoint/contract surface the router consumes,
+the local settlement side effects the mock materializes, and the production
+semantics it intentionally does not emulate.
+
 ## Across
 
 Covered by the mock:
@@ -29,6 +35,32 @@ Important semantic gaps:
 - Real status indexing has observable latency and more failure/refund/action
   states. The mock can now inject a deterministic latency and deterministic
   refund probability, but still does not emulate all action-level states.
+
+## CCTP
+
+Covered by the mock:
+
+- The devnet deploys mock TokenMessengerV2 and MessageTransmitterV2 contracts at
+  stable addresses so router provider policy can allowlist exact call targets.
+- `depositForBurn` pulls the source USDC from the custody vault and emits a
+  Circle-shaped burn event with the destination domain and mint recipient.
+- The mock integrator indexes burn events and serves Iris-shaped
+  `GET /v2/messages/:source_domain?transactionHash=...` responses.
+- `receiveMessage` decodes the mock message and mints the configured
+  destination USDC token to the burn's mint recipient. This gives local worker
+  tests a real ERC-20 balance change without emulating Circle attestation
+  cryptography.
+
+Important semantic gaps:
+
+- The mock does not verify Circle attestation signatures or finality proofs.
+- Real CCTP V2 standard transfers have source-chain finality latency; the mock
+  completes as soon as its burn indexer sees the event.
+- The mock currently covers the USDC domains and chain IDs registered in the
+  asset registry. Additional domains need explicit capability rows, mock token
+  setup, and live differential coverage.
+- Real Iris can expose pending, delayed, or failure states. The mock returns
+  `complete` once indexed and otherwise returns `404`.
 
 ## HyperUnit
 

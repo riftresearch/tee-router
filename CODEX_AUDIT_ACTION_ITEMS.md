@@ -58,12 +58,11 @@ Desired shape:
 ## 3. Unify route-cost and gas-reimbursement pricing inputs
 
 Status: complete. Route-cost refresh and paymaster reimbursement now share a
-`PricingSnapshot` service primitive for USD micro prices, gas price assumptions,
-bps math, and USD/raw amount conversions. Route-cost refresh summaries now carry
-the pricing source used for the run.
-
-Route-cost refresh and paymaster gas reimbursement both embed static USD/gas
-assumptions. These should share one pricing/cost snapshot source.
+`PricingSnapshot` service primitive for USD micro prices, bps math, and USD/raw
+amount conversions. Router-worker route-cost refresh updates that snapshot via
+the `market-pricing` crate, which pulls Coinbase unauthenticated spot prices and
+EVM `eth_gasPrice` values from the configured RPCs. Route-cost refresh summaries
+carry the pricing source used for the run.
 
 Target areas:
 - `bin/router-server/src/services/route_costs.rs`
@@ -71,7 +70,7 @@ Target areas:
 - worker route-cost refresh setup
 
 Desired shape:
-- shared pricing snapshot or injected pricing oracle
+- shared pricing snapshot plus injected pricing oracle
 - one representation for USD micro amounts
 - explicit freshness/source metadata
 

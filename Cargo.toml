@@ -15,6 +15,7 @@ members = [
     "crates/chains",
     "crates/hyperliquid-client",
     "crates/hyperunit-client",
+    "crates/market-pricing",
     "crates/otc-models",
     "crates/router-primitives",
     "crates/utc",
@@ -22,7 +23,7 @@ members = [
 
 [workspace.package]
 edition = "2021"
-version = "1.8.7"
+version = "0.1.0"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/riftresearch/tee-router"
 
@@ -32,6 +33,7 @@ router-primitives = { path = "crates/router-primitives" }
 chains = { path = "crates/chains" }
 hyperliquid-client = { path = "crates/hyperliquid-client" }
 hyperunit-client = { path = "crates/hyperunit-client" }
+market-pricing = { path = "crates/market-pricing" }
 blockchain-utils = { path = "crates/blockchain-utils" }
 devnet = { path = "crates/devnet" }
 evm-token-indexer-client = { path = "crates/evm-token-indexer-client" }

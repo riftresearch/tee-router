@@ -283,7 +283,9 @@ fn chain_label(chain: &ChainId) -> &'static str {
     match chain.as_str() {
         "bitcoin" => "bitcoin",
         "evm:1" => "evm:1",
+        "evm:42161" => "evm:42161",
         "evm:8453" => "evm:8453",
+        "hyperliquid" => "hyperliquid",
         _ => "unsupported",
     }
 }

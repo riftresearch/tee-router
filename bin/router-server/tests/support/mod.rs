@@ -78,6 +78,8 @@ fn is_retryable_rpc_error(error: &(dyn Error + 'static)) -> bool {
             || message.contains("timeout")
             || message.contains("timed out")
             || message.contains("temporarily unavailable")
+            || message.contains("temporary internal error")
+            || message.contains("unknown block")
             || message.contains("connection reset")
             || message.contains("connection closed")
             || message.contains("connection refused")

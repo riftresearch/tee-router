@@ -17,12 +17,21 @@ use alloy::{
 };
 
 use crate::{
-    across_spoke_pool_mock::MockSpokePool::MockSpokePoolInstance, get_new_temp_dir,
-    token_indexerd::TokenIndexerInstance, RiftDevnetCache,
+    across_spoke_pool_mock::MockSpokePool::MockSpokePoolInstance,
+    cctp_mock::{
+        MockCctpMessageTransmitterV2::MockCctpMessageTransmitterV2Instance,
+        MockCctpTokenMessengerV2::MockCctpTokenMessengerV2Instance,
+    },
+    get_new_temp_dir,
+    token_indexerd::TokenIndexerInstance,
+    RiftDevnetCache,
 };
 
 const MOCK_ERC20_ADDRESS: &str = "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf";
 const MOCK_ACROSS_SPOKE_POOL_ADDRESS: &str = "0xACE055C0C055D0C035E47055D05E7055055BACE0";
+pub const MOCK_CCTP_TOKEN_MESSENGER_V2_ADDRESS: &str = "0xcccccccccccccccccccccccccccccccccccc0001";
+pub const MOCK_CCTP_MESSAGE_TRANSMITTER_V2_ADDRESS: &str =
+    "0xcccccccccccccccccccccccccccccccccccc0002";
 
 /// Holds all Ethereum-related devnet state.
 pub struct EthDevnet {
@@ -37,6 +46,9 @@ pub struct EthDevnet {
     pub token_indexer: Option<TokenIndexerInstance>,
     pub eip7702_delegator_contract: EIP7702DelegatorInstance<DynProvider>,
     pub mock_across_spoke_pool_contract: MockSpokePoolInstance<DynProvider>,
+    pub mock_cctp_token_messenger_v2_contract: MockCctpTokenMessengerV2Instance<DynProvider>,
+    pub mock_cctp_message_transmitter_v2_contract:
+        MockCctpMessageTransmitterV2Instance<DynProvider>,
 }
 
 #[derive(Clone, Debug)]
@@ -81,8 +93,13 @@ impl EthDevnet {
         .map_err(|e| eyre!(e.to_string()))?
         .erased();
 
-        let (mock_erc20_contract, eip7702_delegator_contract, mock_across_spoke_pool_contract) =
-            deploy_contracts(funded_provider.clone(), devnet_cache.clone()).await?;
+        let (
+            mock_erc20_contract,
+            eip7702_delegator_contract,
+            mock_across_spoke_pool_contract,
+            mock_cctp_token_messenger_v2_contract,
+            mock_cctp_message_transmitter_v2_contract,
+        ) = deploy_contracts(funded_provider.clone(), devnet_cache.clone()).await?;
 
         let token_indexer = if let Some(database_url) = token_indexer_database_url {
             Some(
@@ -113,6 +130,8 @@ impl EthDevnet {
             token_indexer,
             eip7702_delegator_contract,
             mock_across_spoke_pool_contract,
+            mock_cctp_token_messenger_v2_contract,
+            mock_cctp_message_transmitter_v2_contract,
         };
 
         Ok(devnet)
@@ -210,6 +229,8 @@ async fn deploy_contracts(
     GenericEIP3009ERC20Instance<DynProvider>,
     EIP7702DelegatorInstance<DynProvider>,
     MockSpokePoolInstance<DynProvider>,
+    MockCctpTokenMessengerV2Instance<DynProvider>,
+    MockCctpMessageTransmitterV2Instance<DynProvider>,
 )> {
     let mock_spoke_pool_deployment = MockSpokePoolInstance::deploy(provider.clone()).await?;
     let mock_spoke_pool_deployed_bytecode = provider
@@ -227,6 +248,40 @@ async fn deploy_contracts(
         provider.clone(),
     );
 
+    let mock_cctp_token_messenger_deployment =
+        MockCctpTokenMessengerV2Instance::deploy(provider.clone()).await?;
+    let mock_cctp_token_messenger_deployed_bytecode = provider
+        .clone()
+        .get_code_at(*mock_cctp_token_messenger_deployment.address())
+        .await?;
+    provider
+        .anvil_set_code(
+            MOCK_CCTP_TOKEN_MESSENGER_V2_ADDRESS.parse().unwrap(),
+            mock_cctp_token_messenger_deployed_bytecode,
+        )
+        .await?;
+    let mock_cctp_token_messenger_v2_contract = MockCctpTokenMessengerV2Instance::new(
+        MOCK_CCTP_TOKEN_MESSENGER_V2_ADDRESS.parse().unwrap(),
+        provider.clone(),
+    );
+
+    let mock_cctp_message_transmitter_deployment =
+        MockCctpMessageTransmitterV2Instance::deploy(provider.clone()).await?;
+    let mock_cctp_message_transmitter_deployed_bytecode = provider
+        .clone()
+        .get_code_at(*mock_cctp_message_transmitter_deployment.address())
+        .await?;
+    provider
+        .anvil_set_code(
+            MOCK_CCTP_MESSAGE_TRANSMITTER_V2_ADDRESS.parse().unwrap(),
+            mock_cctp_message_transmitter_deployed_bytecode,
+        )
+        .await?;
+    let mock_cctp_message_transmitter_v2_contract = MockCctpMessageTransmitterV2Instance::new(
+        MOCK_CCTP_MESSAGE_TRANSMITTER_V2_ADDRESS.parse().unwrap(),
+        provider.clone(),
+    );
+
     if devnet_cache.is_some() {
         // no need to deploy, just create the instance from the cache
         let mock_erc20_contract =
@@ -239,6 +294,8 @@ async fn deploy_contracts(
             mock_erc20_contract,
             delegator_contract,
             mock_across_spoke_pool_contract,
+            mock_cctp_token_messenger_v2_contract,
+            mock_cctp_message_transmitter_v2_contract,
         ));
     }
 
@@ -274,6 +331,8 @@ async fn deploy_contracts(
         mock_erc20_contract,
         delegator_contract,
         mock_across_spoke_pool_contract,
+        mock_cctp_token_messenger_v2_contract,
+        mock_cctp_message_transmitter_v2_contract,
     ))
 }
 
@@ -294,20 +353,11 @@ async fn spawn_anvil(
     // Create or load anvil datafile
     let anvil_datadir = if devnet_cache.is_some() {
         let cache_start = Instant::now();
-        let datadir = Some(if chain_id == 8453 {
-            // Base chain
-            devnet_cache
-                .as_ref()
-                .unwrap()
-                .create_anvil_base_datadir()
-                .await?
-        } else {
-            // Ethereum or other chains
-            devnet_cache
-                .as_ref()
-                .unwrap()
-                .create_anvil_datadir()
-                .await?
+        let cache = devnet_cache.as_ref().unwrap();
+        let datadir = Some(match chain_id {
+            8453 => cache.create_anvil_base_datadir().await?,
+            42161 => cache.create_anvil_arbitrum_datadir().await?,
+            _ => cache.create_anvil_datadir().await?,
         });
         info!(
             "[Anvil] Created anvil datadir from cache in {:?}",

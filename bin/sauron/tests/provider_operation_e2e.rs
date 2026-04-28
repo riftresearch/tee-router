@@ -21,7 +21,6 @@ use bitcoincore_rpc_async::Auth;
 use chains::ChainRegistry;
 use devnet::{
     mock_integrators::{MockIntegratorConfig, MockIntegratorServer},
-    token_indexerd::TokenIndexerInstance,
     RiftDevnet,
 };
 use eip3009_erc20_contract::GenericEIP3009ERC20::GenericEIP3009ERC20Instance;
@@ -139,6 +138,12 @@ sol! {
 enum RuntimeRoute {
     BaseEthToBtc,
     BaseUsdcToBtc,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeIngressBridge {
+    Across,
+    Cctp,
 }
 
 #[derive(Clone, Copy)]
@@ -893,9 +898,9 @@ fn router_args(
         base_rpc_url: devnet.base.anvil.endpoint_url().to_string(),
         base_reference_token: chain_tokens.base_reference_token.to_string(),
         base_paymaster_private_key: Some(anvil_private_key(&devnet.base)),
-        arbitrum_rpc_url: devnet.base.anvil.endpoint_url().to_string(),
+        arbitrum_rpc_url: devnet.arbitrum.anvil.endpoint_url().to_string(),
         arbitrum_reference_token: chain_tokens.arbitrum_reference_token.to_string(),
-        arbitrum_paymaster_private_key: Some(anvil_private_key(&devnet.base)),
+        arbitrum_paymaster_private_key: Some(anvil_private_key(&devnet.arbitrum)),
         evm_paymaster_vault_gas_buffer_wei: "100000000000000".to_string(),
         evm_paymaster_vault_gas_target_wei: None,
         bitcoin_rpc_url: bitcoin_rpc_url(devnet),
@@ -915,6 +920,13 @@ fn router_args(
         across_api_url: Some(mocks.base_url().to_string()),
         across_api_key: Some("mock-across-api-key".to_string()),
         across_integrator_id: None,
+        cctp_api_url: Some(mocks.base_url().to_string()),
+        cctp_token_messenger_v2_address: Some(
+            devnet::evm_devnet::MOCK_CCTP_TOKEN_MESSENGER_V2_ADDRESS.to_string(),
+        ),
+        cctp_message_transmitter_v2_address: Some(
+            devnet::evm_devnet::MOCK_CCTP_MESSAGE_TRANSMITTER_V2_ADDRESS.to_string(),
+        ),
         hyperunit_api_url: Some(mocks.base_url().to_string()),
         hyperunit_proxy_url: None,
         hyperliquid_api_url: Some(mocks.base_url().to_string()),
@@ -937,6 +949,7 @@ fn router_args(
         worker_refund_poll_seconds: 1,
         worker_order_execution_poll_seconds: 1,
         worker_route_cost_refresh_seconds: 300,
+        coinbase_price_api_base_url: mocks.base_url().to_string(),
     }
 }
 
@@ -979,6 +992,9 @@ fn live_router_args(
         across_api_url: Some(live.across_api_url.clone()),
         across_api_key: Some(live.across_api_key.clone()),
         across_integrator_id: live.across_integrator_id.clone(),
+        cctp_api_url: None,
+        cctp_token_messenger_v2_address: None,
+        cctp_message_transmitter_v2_address: None,
         hyperunit_api_url: Some(live.hyperunit_api_url.clone()),
         hyperunit_proxy_url: live.hyperunit_proxy_url.clone(),
         hyperliquid_api_url: Some(live.hyperliquid_api_url.clone()),
@@ -1000,6 +1016,7 @@ fn live_router_args(
         worker_refund_poll_seconds: 5,
         worker_order_execution_poll_seconds: 1,
         worker_route_cost_refresh_seconds: 300,
+        coinbase_price_api_base_url: "https://api.coinbase.com".to_string(),
     }
 }
 
@@ -1033,7 +1050,7 @@ async fn spawn_sauron(
         base_rpc_url: devnet.base.anvil.endpoint_url().to_string(),
         base_token_indexer_url: token_indexer_urls.base,
         base_allowed_token: chain_tokens.base_reference_token.to_string(),
-        arbitrum_rpc_url: devnet.base.anvil.endpoint_url().to_string(),
+        arbitrum_rpc_url: devnet.arbitrum.anvil.endpoint_url().to_string(),
         arbitrum_token_indexer_url: token_indexer_urls.arbitrum,
         arbitrum_allowed_token: chain_tokens.arbitrum_reference_token.to_string(),
         sauron_reconcile_interval_seconds: 2,
@@ -1068,35 +1085,12 @@ fn token_indexer_urls_from_devnet(devnet: &RiftDevnet) -> RuntimeTokenIndexerUrl
             .token_indexer
             .as_ref()
             .map(|indexer| indexer.api_server_url.clone()),
-        arbitrum: None,
+        arbitrum: devnet
+            .arbitrum
+            .token_indexer
+            .as_ref()
+            .map(|indexer| indexer.api_server_url.clone()),
     }
-}
-
-async fn spawn_mock_arbitrum_token_indexer(
-    devnet: &RiftDevnet,
-    database_url: &str,
-    route: RuntimeRoute,
-) -> Option<TokenIndexerInstance> {
-    if !matches!(route, RuntimeRoute::BaseUsdcToBtc) {
-        return None;
-    }
-
-    let rpc_url = devnet.base.anvil.endpoint_url().to_string();
-    let ws_url = devnet.base.anvil.ws_endpoint_url().to_string();
-
-    Some(
-        TokenIndexerInstance::new(
-            false,
-            &rpc_url,
-            &ws_url,
-            false,
-            devnet.base.anvil.chain_id(),
-            database_url.to_string(),
-            None,
-        )
-        .await
-        .expect("spawn mock Arbitrum token indexer"),
-    )
 }
 
 async fn spawn_live_sauron(
@@ -1442,7 +1436,7 @@ fn raw_units_to_f64(amount: U256, decimals: u32) -> f64 {
     amount.to_string().parse::<f64>().expect("amount fits f64") / 10f64.powi(decimals as i32)
 }
 
-async fn fund_destination_execution_vault_from_across_native(
+async fn fund_destination_execution_vault_from_across(
     devnet: &RiftDevnet,
     db: &Database,
     order_id: Uuid,
@@ -1469,57 +1463,31 @@ async fn fund_destination_execution_vault_from_across_native(
         .and_then(serde_json::Value::as_str)
         .and_then(|amount| U256::from_str_radix(amount, 10).ok())
         .expect("across response should include expectedOutputAmount");
-    let balance = output_amount + U256::from(1_000_000_000_000_000_000_u128);
+    let gas_balance = U256::from(1_000_000_000_000_000_000_u128);
     let address = Address::from_str(&destination_vault.address)
         .expect("destination execution vault address should be EVM address");
-    match destination_vault.chain.as_str() {
-        "evm:1" => send_native(&devnet.ethereum, address, balance).await,
-        "evm:8453" => send_native(&devnet.base, address, balance).await,
+    let destination_devnet = match destination_vault.chain.as_str() {
+        "evm:1" => &devnet.ethereum,
+        "evm:8453" => &devnet.base,
+        "evm:42161" => &devnet.arbitrum,
         other => panic!("unsupported destination execution chain {other}"),
-    }
-}
+    };
 
-async fn fund_destination_execution_vault_from_across_usdc(
-    devnet: &RiftDevnet,
-    db: &Database,
-    order_id: Uuid,
-) {
-    let destination_vault = db
-        .orders()
-        .get_custody_vaults(order_id)
-        .await
-        .expect("load custody vaults")
-        .into_iter()
-        .find(|vault| vault.role == CustodyVaultRole::DestinationExecution)
-        .expect("across step should create destination execution custody vault");
-    assert_eq!(
-        destination_vault.chain.as_str(),
-        "evm:42161",
-        "base usdc route should land the destination execution vault on arbitrum"
-    );
-    let across_operation = db
-        .orders()
-        .get_provider_operations(order_id)
-        .await
-        .expect("load provider operations")
-        .into_iter()
-        .find(|operation| operation.operation_type == ProviderOperationType::AcrossBridge)
-        .expect("across operation should exist");
-    let output_amount = across_operation
-        .response
-        .get("expectedOutputAmount")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|amount| U256::from_str_radix(amount, 10).ok())
-        .expect("across response should include expectedOutputAmount");
-    let address = Address::from_str(&destination_vault.address)
-        .expect("destination execution vault address should be EVM address");
-    mint_erc20(
-        &devnet.base,
-        ARBITRUM_USDC_ADDRESS.parse().expect("valid arbitrum usdc"),
-        address,
-        output_amount,
-    )
-    .await;
+    match destination_vault.asset.as_ref().unwrap_or(&AssetId::Native) {
+        AssetId::Native => {
+            send_native(destination_devnet, address, output_amount + gas_balance).await;
+        }
+        AssetId::Reference(token_address) => {
+            send_native(destination_devnet, address, gas_balance).await;
+            mint_erc20(
+                destination_devnet,
+                token_address.parse().expect("destination token address"),
+                address,
+                output_amount,
+            )
+            .await;
+        }
+    }
 }
 
 async fn mint_erc20(
@@ -1604,7 +1572,7 @@ async fn prepare_route_chain_state(devnet: &RiftDevnet, route: RuntimeRoute) {
     )
     .await;
     install_mock_usdc_clone(
-        &devnet.base,
+        &devnet.arbitrum,
         ARBITRUM_USDC_ADDRESS
             .parse()
             .expect("valid arbitrum usdc address"),
@@ -1758,26 +1726,46 @@ fn live_route_amount_in(route: RuntimeRoute) -> String {
     }
 }
 
-fn assert_route_provider_id(route: RuntimeRoute, provider_id: &str) {
+fn assert_route_provider_id(route: RuntimeRoute, provider_id: &str) -> RuntimeIngressBridge {
     assert!(
         provider_id.starts_with("path:"),
         "provider id should describe the selected transition path: {provider_id}"
     );
-    let expected_fragments: &[&str] = match route {
-        RuntimeRoute::BaseEthToBtc => &[
-            "across_bridge:across",
-            "unit_deposit:unit",
-            "hyperliquid_trade:hyperliquid",
-            "unit_withdrawal:unit",
-            "exchange:hyperliquid",
-        ],
-        RuntimeRoute::BaseUsdcToBtc => &[
-            "across_bridge:across",
-            "hyperliquid_bridge_deposit:hyperliquid_bridge",
-            "hyperliquid_trade:hyperliquid",
-            "unit_withdrawal:unit",
-            "exchange:hyperliquid",
-        ],
+
+    let (ingress, expected_fragments): (RuntimeIngressBridge, &[&str]) = match route {
+        RuntimeRoute::BaseEthToBtc => (
+            RuntimeIngressBridge::Across,
+            &[
+                "across_bridge:across",
+                "unit_deposit:unit",
+                "hyperliquid_trade:hyperliquid",
+                "unit_withdrawal:unit",
+                "exchange:hyperliquid",
+            ],
+        ),
+        RuntimeRoute::BaseUsdcToBtc if provider_id.contains("cctp_bridge:cctp") => (
+            RuntimeIngressBridge::Cctp,
+            &[
+                "cctp_bridge:cctp",
+                "hyperliquid_bridge_deposit:hyperliquid_bridge",
+                "hyperliquid_trade:hyperliquid",
+                "unit_withdrawal:unit",
+                "exchange:hyperliquid",
+            ],
+        ),
+        RuntimeRoute::BaseUsdcToBtc if provider_id.contains("across_bridge:across") => (
+            RuntimeIngressBridge::Across,
+            &[
+                "across_bridge:across",
+                "hyperliquid_bridge_deposit:hyperliquid_bridge",
+                "hyperliquid_trade:hyperliquid",
+                "unit_withdrawal:unit",
+                "exchange:hyperliquid",
+            ],
+        ),
+        RuntimeRoute::BaseUsdcToBtc => {
+            panic!("Base USDC route should use Across or CCTP ingress into Arbitrum: {provider_id}")
+        }
     };
     for fragment in expected_fragments {
         assert!(
@@ -1785,6 +1773,7 @@ fn assert_route_provider_id(route: RuntimeRoute, provider_id: &str) {
             "provider id {provider_id} should contain {fragment}"
         );
     }
+    ingress
 }
 
 fn route_expected_funding_asset(route: RuntimeRoute) -> AssetId {
@@ -1821,8 +1810,13 @@ async fn spawn_runtime_mocks(devnet: &RiftDevnet, route: RuntimeRoute) -> MockIn
         .with_mainnet_hyperliquid(true);
     if matches!(route, RuntimeRoute::BaseUsdcToBtc) {
         config = config
+            .with_cctp_token_messenger_address(
+                devnet::evm_devnet::MOCK_CCTP_TOKEN_MESSENGER_V2_ADDRESS,
+            )
+            .with_cctp_evm_rpc_url(devnet.base.anvil.endpoint_url().to_string())
+            .with_cctp_destination_token_address(ARBITRUM_USDC_ADDRESS)
             .with_hyperliquid_bridge_address(MAINNET_HYPERLIQUID_BRIDGE_ADDRESS)
-            .with_hyperliquid_evm_rpc_url(devnet.base.anvil.endpoint_url().to_string())
+            .with_hyperliquid_evm_rpc_url(devnet.arbitrum.anvil.endpoint_url().to_string())
             .with_hyperliquid_usdc_token_address(ARBITRUM_USDC_ADDRESS);
     }
     MockIntegratorServer::spawn_with_config(config)
@@ -1875,7 +1869,7 @@ async fn submit_quote_request_custom(
             "recipient_address": recipient_address,
             "kind": "exact_in",
             "amount_in": amount_in,
-            "min_amount_out": "1"
+            "slippage_bps": 100
         }))
         .send()
         .await
@@ -2344,12 +2338,7 @@ async fn run_mock_runtime_route(route: RuntimeRoute) {
         .await
         .expect("devnet setup failed");
     prepare_route_chain_state(&devnet, route).await;
-    let _arbitrum_token_indexer =
-        spawn_mock_arbitrum_token_indexer(&devnet, &database_url, route).await;
-    let mut token_indexer_urls = token_indexer_urls_from_devnet(&devnet);
-    token_indexer_urls.arbitrum = _arbitrum_token_indexer
-        .as_ref()
-        .map(|indexer| indexer.api_server_url.clone());
+    let token_indexer_urls = token_indexer_urls_from_devnet(&devnet);
     let config_dir = tempfile::tempdir().expect("router config dir");
     let mocks = spawn_runtime_mocks(&devnet, route).await;
     let chain_tokens = route_chain_tokens(route);
@@ -2393,7 +2382,7 @@ async fn run_mock_runtime_route(route: RuntimeRoute) {
     .await;
     let client = reqwest::Client::new();
     let quote = submit_quote_request(&client, &router_base_url, route).await;
-    assert_route_provider_id(
+    let ingress = assert_route_provider_id(
         route,
         &quote
             .quote
@@ -2439,22 +2428,52 @@ async fn run_mock_runtime_route(route: RuntimeRoute) {
         .expect("funding vault after worker funding pass");
     assert_eq!(funded_vault.status, DepositVaultStatus::Executing);
 
-    let across_operation =
-        wait_for_operation(&db, order.order.id, ProviderOperationType::AcrossBridge).await;
-    assert_eq!(
-        across_operation.status,
-        ProviderOperationStatus::WaitingExternal
-    );
     match route {
         RuntimeRoute::BaseEthToBtc => {
-            fund_destination_execution_vault_from_across_native(&devnet, &db, order.order.id).await;
+            let across_operation =
+                wait_for_operation(&db, order.order.id, ProviderOperationType::AcrossBridge).await;
+            assert_eq!(
+                across_operation.status,
+                ProviderOperationStatus::WaitingExternal
+            );
+            fund_destination_execution_vault_from_across(&devnet, &db, order.order.id).await;
+            wait_for_operation_status(&db, across_operation.id, ProviderOperationStatus::Completed)
+                .await;
         }
-        RuntimeRoute::BaseUsdcToBtc => {
-            fund_destination_execution_vault_from_across_usdc(&devnet, &db, order.order.id).await;
-        }
+        RuntimeRoute::BaseUsdcToBtc => match ingress {
+            RuntimeIngressBridge::Cctp => {
+                let cctp_operation =
+                    wait_for_operation(&db, order.order.id, ProviderOperationType::CctpBridge)
+                        .await;
+                assert_eq!(
+                    cctp_operation.status,
+                    ProviderOperationStatus::WaitingExternal
+                );
+                wait_for_operation_status(
+                    &db,
+                    cctp_operation.id,
+                    ProviderOperationStatus::Completed,
+                )
+                .await;
+            }
+            RuntimeIngressBridge::Across => {
+                let across_operation =
+                    wait_for_operation(&db, order.order.id, ProviderOperationType::AcrossBridge)
+                        .await;
+                assert_eq!(
+                    across_operation.status,
+                    ProviderOperationStatus::WaitingExternal
+                );
+                fund_destination_execution_vault_from_across(&devnet, &db, order.order.id).await;
+                wait_for_operation_status(
+                    &db,
+                    across_operation.id,
+                    ProviderOperationStatus::Completed,
+                )
+                .await;
+            }
+        },
     }
-
-    wait_for_operation_status(&db, across_operation.id, ProviderOperationStatus::Completed).await;
 
     if matches!(route, RuntimeRoute::BaseEthToBtc) {
         let unit_deposit_operation =
@@ -2533,7 +2552,14 @@ async fn run_mock_runtime_route(route: RuntimeRoute) {
         "runtime flow should materialize the expected number of Hyperliquid trade legs"
     );
 
-    assert_eq!(mocks.across_deposits().await.len(), 1);
+    assert_eq!(
+        mocks.across_deposits().await.len(),
+        usize::from(matches!(ingress, RuntimeIngressBridge::Across))
+    );
+    assert_eq!(
+        mocks.cctp_burns().await.len(),
+        usize::from(matches!(ingress, RuntimeIngressBridge::Cctp))
+    );
     let ledger = mocks.ledger_snapshot().await;
     let deposit_ops: Vec<_> = ledger
         .unit_operations

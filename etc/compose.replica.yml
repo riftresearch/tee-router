@@ -3,8 +3,8 @@ configs:
     content: |
       foreground = yes
       debug = 5
-      
-      [phala-postgres]
+
+      [phala-router-postgres]
       client = yes
       accept = 0.0.0.0:5432
       connect = $${PHALA_DB_SNI}:443
@@ -16,167 +16,111 @@ configs:
       #!/usr/bin/env bash
       set -euo pipefail
 
-      echo "=== Logical Replication Setup ==="
-      echo "Waiting for databases to be ready..."
+      echo "=== Router v3 Logical Replica Setup ==="
 
-      # Environment variables with defaults
-      PRIMARY_HOST="$${PRIMARY_DB_HOST:-tee-otc-postgres}"
+      PRIMARY_HOST="$${PRIMARY_DB_HOST:-stunnel-v3}"
       PRIMARY_PORT="$${PRIMARY_DB_PORT:-5432}"
-      PRIMARY_DB="$${PRIMARY_DB_NAME:-otc_db}"
+      PRIMARY_DB="$${PRIMARY_DB_NAME:-router_db}"
       PRIMARY_USER="$${PRIMARY_DB_USER:-replicator}"
       PRIMARY_PASS="$${PRIMARY_DB_PASSWORD:?PRIMARY_DB_PASSWORD must be set}"
       PRIMARY_SSLMODE="$${PRIMARY_DB_SSLMODE:-prefer}"
+      PRIMARY_PUBLICATION="$${PRIMARY_PUBLICATION:-router_all_tables}"
 
-      REPLICA_HOST="$${REPLICA_DB_HOST:-postgres-replica}"
+      REPLICA_HOST="$${REPLICA_DB_HOST:-router-postgres-replica-v3}"
       REPLICA_PORT="$${REPLICA_DB_PORT:-5432}"
-      REPLICA_DB="$${REPLICA_DB_NAME:-otc_db}"
+      REPLICA_DB="$${REPLICA_DB_NAME:-router_db}"
       REPLICA_USER="$${REPLICA_DB_USER:-postgres}"
       REPLICA_PASS="$${REPLICA_DB_PASSWORD:?REPLICA_DB_PASSWORD must be set}"
       REPLICA_SSLMODE="$${REPLICA_DB_SSLMODE:-prefer}"
+      REPLICA_SUBSCRIPTION="$${REPLICA_SUBSCRIPTION:-router_subscription}"
 
-      # Build connection strings
       PRIMARY_CONN="postgresql://$${PRIMARY_USER}:$${PRIMARY_PASS}@$${PRIMARY_HOST}:$${PRIMARY_PORT}/$${PRIMARY_DB}?sslmode=$${PRIMARY_SSLMODE}"
-      REPLICA_CONN="postgresql://$${REPLICA_USER}:$${REPLICA_PASS}@$${REPLICA_HOST}:$${REPLICA_PORT}/postgres?sslmode=$${REPLICA_SSLMODE}"
+      REPLICA_ADMIN_CONN="postgresql://$${REPLICA_USER}:$${REPLICA_PASS}@$${REPLICA_HOST}:$${REPLICA_PORT}/postgres?sslmode=$${REPLICA_SSLMODE}"
 
-      # Wait for primary to be ready
-      echo "Checking primary database connection..."
-      echo "Attempting to connect to: $${PRIMARY_HOST}:$${PRIMARY_PORT}/$${PRIMARY_DB} (sslmode=$${PRIMARY_SSLMODE})"
-      RETRY_COUNT=0
+      echo "Waiting for Phala primary router database..."
+      attempt=0
       until psql "$${PRIMARY_CONN}" -c '\q' 2>/dev/null; do
-        RETRY_COUNT=$$((RETRY_COUNT + 1))
-        echo "[$${RETRY_COUNT}] Connection failed. Retrying in 2s..."
+        attempt=$$((attempt + 1))
+        echo "[$${attempt}] primary unavailable; retrying in 2s"
         sleep 2
       done
-      echo "✓ Primary database is ready"
+      echo "Primary is reachable"
 
-      # Wait for replica to be ready
-      echo "Checking replica database connection..."
-      echo "Attempting to connect to: $${REPLICA_HOST}:$${REPLICA_PORT}/postgres (sslmode=$${REPLICA_SSLMODE})"
-      until psql "$${REPLICA_CONN}" -c '\q' 2>/dev/null; do
-        echo "Waiting for replica database at $${REPLICA_HOST}:$${REPLICA_PORT}..."
+      echo "Waiting for Railway replica database..."
+      until psql "$${REPLICA_ADMIN_CONN}" -c '\q' 2>/dev/null; do
+        echo "replica unavailable; retrying in 2s"
         sleep 2
       done
-      echo "✓ Replica database is ready"
+      echo "Replica is reachable"
 
-      # Create database on replica if it doesn't exist
-      echo "Creating database on replica..."
-      psql "$${REPLICA_CONN}" <<-SQL
+      echo "Ensuring replica database exists"
+      psql "$${REPLICA_ADMIN_CONN}" <<-SQL
         SELECT 'CREATE DATABASE $${REPLICA_DB}'
         WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '$${REPLICA_DB}')\gexec
       SQL
-      echo "✓ Database exists on replica"
 
-      # Verify publication exists on primary (created by primary's init script)
-      echo "Checking publication on primary..."
-      PUB_EXISTS=$$(psql "$${PRIMARY_CONN}" -tAc "SELECT COUNT(*) FROM pg_publication WHERE pubname = 'otc_all_tables';")
-      
-      if [ "$${PUB_EXISTS}" -eq "1" ]; then
-        echo "✓ Publication 'otc_all_tables' exists on primary"
-      else
-        echo "ERROR: Publication 'otc_all_tables' not found on primary"
-        echo "Please ensure the primary database has been initialized with the publication"
-        echo "The primary's postgres-init.sh should create this automatically"
+      REPLICA_DB_CONN="postgresql://$${REPLICA_USER}:$${REPLICA_PASS}@$${REPLICA_HOST}:$${REPLICA_PORT}/$${REPLICA_DB}?sslmode=$${REPLICA_SSLMODE}"
+
+      echo "Checking primary publication"
+      PUB_EXISTS=$$(psql "$${PRIMARY_CONN}" -tAc "SELECT COUNT(*) FROM pg_publication WHERE pubname = '$${PRIMARY_PUBLICATION}';")
+      if [ "$${PUB_EXISTS}" -ne "1" ]; then
+        echo "ERROR: primary publication '$${PRIMARY_PUBLICATION}' was not found" >&2
         exit 1
       fi
 
-      # Copy schema from primary to replica
-      echo "Copying schema from primary to replica..."
-      
-      # Build replica DB connection string (not just postgres)
-      REPLICA_DB_CONN="postgresql://$${REPLICA_USER}:$${REPLICA_PASS}@$${REPLICA_HOST}:$${REPLICA_PORT}/$${REPLICA_DB}?sslmode=$${REPLICA_SSLMODE}"
-      
-      # Check if schema already exists (idempotent)
-      TABLES_EXIST=$$(psql "$${REPLICA_DB_CONN}" -tAc "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name IN ('swaps', 'quotes');")
+      echo "Copying or synchronizing primary schema"
+      TABLES_EXIST=$$(psql "$${REPLICA_DB_CONN}" -tAc "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name IN ('router_orders', 'deposit_vaults', 'market_order_quotes');")
 
-      if [ "$${TABLES_EXIST}" -eq "2" ]; then
-        echo "✓ Core tables exist on replica"
-        # Sync any missing tables from primary (e.g., _sqlx_migrations)
-        echo "Ensuring all tables from primary exist on replica..."
+      if [ "$${TABLES_EXIST}" -eq "3" ]; then
+        echo "Core router tables already exist; syncing any missing schema objects"
         pg_dump "$${PRIMARY_CONN}" --schema-only --no-owner --no-privileges | \
           psql "$${REPLICA_DB_CONN}" 2>&1 | grep -v "already exists" || true
-        echo "✓ Schema synchronized"
       else
-        echo "Copying full schema from primary..."
+        echo "Copying full primary schema"
         pg_dump "$${PRIMARY_CONN}" --schema-only --no-owner --no-privileges | \
           psql "$${REPLICA_DB_CONN}"
-        echo "✓ Schema copied from primary"
       fi
 
-      # Create subscription on replica (idempotent)
-      echo "Creating subscription on replica..."
-      CONNECTION_STRING="host=$${PRIMARY_HOST} port=$${PRIMARY_PORT} dbname=$${PRIMARY_DB} user=$${PRIMARY_USER} password=$${PRIMARY_PASS} sslmode=$${PRIMARY_SSLMODE}"
-
-      # Check if subscription already exists
-      SUB_EXISTS=$$(psql "$${REPLICA_DB_CONN}" -tAc "SELECT COUNT(*) FROM pg_subscription WHERE subname = 'otc_subscription';")
+      echo "Creating logical subscription if missing"
+      SUB_EXISTS=$$(psql "$${REPLICA_DB_CONN}" -tAc "SELECT COUNT(*) FROM pg_subscription WHERE subname = '$${REPLICA_SUBSCRIPTION}';")
 
       if [ "$${SUB_EXISTS}" -eq "0" ]; then
-        echo "Creating new subscription..."
-        
-        # Check if slot already exists on primary from a previous failed attempt
-        SLOT_EXISTS=$$(psql "$${PRIMARY_CONN}" -tAc "SELECT COUNT(*) FROM pg_replication_slots WHERE slot_name = 'otc_subscription';")
-        
+        SLOT_EXISTS=$$(psql "$${PRIMARY_CONN}" -tAc "SELECT COUNT(*) FROM pg_replication_slots WHERE slot_name = '$${REPLICA_SUBSCRIPTION}';")
         if [ "$${SLOT_EXISTS}" -eq "1" ]; then
-          echo "⚠ Orphaned replication slot detected on primary, cleaning up..."
-          psql "$${PRIMARY_CONN}" -c "SELECT pg_drop_replication_slot('otc_subscription');" || {
-            echo "ERROR: Failed to drop orphaned slot. It may be active. Check primary replication status."
-            exit 1
-          }
-          echo "✓ Orphaned slot removed"
+          echo "Dropping orphaned primary replication slot '$${REPLICA_SUBSCRIPTION}'"
+          psql "$${PRIMARY_CONN}" -c "SELECT pg_drop_replication_slot('$${REPLICA_SUBSCRIPTION}');"
         fi
-        
-        # Now create subscription with slot
-        if ! psql "$${REPLICA_DB_CONN}" <<-SQL; then
-          CREATE SUBSCRIPTION otc_subscription
+
+        CONNECTION_STRING="host=$${PRIMARY_HOST} port=$${PRIMARY_PORT} dbname=$${PRIMARY_DB} user=$${PRIMARY_USER} password=$${PRIMARY_PASS} sslmode=$${PRIMARY_SSLMODE}"
+        psql "$${REPLICA_DB_CONN}" <<-SQL
+          CREATE SUBSCRIPTION $${REPLICA_SUBSCRIPTION}
             CONNECTION '$${CONNECTION_STRING}'
-            PUBLICATION otc_all_tables
+            PUBLICATION $${PRIMARY_PUBLICATION}
             WITH (copy_data = true, create_slot = true);
       SQL
-          echo "ERROR: Failed to create subscription"
-          echo "If you see 'slot already exists', manually drop it on primary:"
-          echo "  SELECT pg_drop_replication_slot('otc_subscription');"
-          exit 1
-        fi
-        echo "✓ Subscription created"
+        echo "Subscription '$${REPLICA_SUBSCRIPTION}' created"
       else
-        echo "✓ Subscription 'otc_subscription' already exists"
-        
-        # Verify subscription is enabled and healthy
-        SUB_ENABLED=$$(psql "$${REPLICA_DB_CONN}" -tAc "SELECT subenabled FROM pg_subscription WHERE subname = 'otc_subscription';")
-        if [ "$${SUB_ENABLED}" = "t" ]; then
-          echo "✓ Subscription is enabled and active"
-        else
-          echo "⚠ WARNING: Subscription exists but is disabled"
-        fi
+        echo "Subscription '$${REPLICA_SUBSCRIPTION}' already exists"
       fi
 
-      # Verify replication status
-      echo ""
-      echo "=== Replication Status ==="
-      echo "Primary publication:"
-      psql "$${PRIMARY_CONN}" -c "SELECT * FROM pg_publication WHERE pubname = 'otc_all_tables';"
-
-      echo ""
-      echo "Replica subscription:"
-      psql "$${REPLICA_DB_CONN}" -c "SELECT subname, subenabled, subslotname FROM pg_subscription WHERE subname = 'otc_subscription';"
-
-      echo ""
-      echo "=== Setup Complete ==="
-      echo "Logical replication is now active!"
-      echo "Primary: $${PRIMARY_HOST}:$${PRIMARY_PORT}/$${PRIMARY_DB}"
-      echo "Replica: $${REPLICA_HOST}:$${REPLICA_PORT}/$${REPLICA_DB}"
+      echo "=== Replica Status ==="
+      psql "$${REPLICA_DB_CONN}" -c "SELECT subname, subenabled, subslotname FROM pg_subscription WHERE subname = '$${REPLICA_SUBSCRIPTION}';"
+      echo "Router v3 logical replica setup complete"
 
 services:
-  stunnel:
+  stunnel-v3:
     image: debian:bookworm-slim
-    container_name: tee-otc-stunnel
+    container_name: router-v3-stunnel
     environment:
-      PHALA_DB_SNI: ${PHALA_DB_SNI:?PHALA_DB_SNI must be set}
-    command: >
-      bash -c "apt-get update -qq && 
-      apt-get install -y -qq stunnel4 gettext-base netcat-openbsd &&
-      envsubst < /etc/stunnel/stunnel.conf.template > /etc/stunnel/stunnel.conf &&
-      cat /etc/stunnel/stunnel.conf &&
-      exec stunnel /etc/stunnel/stunnel.conf"
+      PHALA_DB_SNI: ${PHALA_DB_SNI:?set PHALA_DB_SNI}
+    command:
+      - /bin/bash
+      - -ec
+      - |
+        apt-get update -qq
+        apt-get install -y -qq stunnel4 gettext-base netcat-openbsd
+        envsubst < /etc/stunnel/stunnel.conf.template > /etc/stunnel/stunnel.conf
+        exec stunnel /etc/stunnel/stunnel.conf
     configs:
       - source: stunnel-conf
         target: /etc/stunnel/stunnel.conf.template
@@ -187,19 +131,20 @@ services:
       retries: 10
       start_period: 15s
     networks:
-      - replica-network
+      - router-replica-network
 
-  postgres-replica:
+  router-postgres-replica-v3:
     image: postgres:16-alpine
-    container_name: tee-otc-postgres-replica
+    container_name: router-postgres-replica-v3
+    restart: unless-stopped
     environment:
       POSTGRES_USER: ${REPLICA_DB_USER:-postgres}
-      POSTGRES_PASSWORD: ${REPLICA_DB_PASSWORD:?REPLICA_DB_PASSWORD must be set}
-      POSTGRES_DB: ${REPLICA_DB_NAME:-otc_db}
+      POSTGRES_PASSWORD: ${REPLICA_DB_PASSWORD:?set REPLICA_DB_PASSWORD}
+      POSTGRES_DB: ${REPLICA_DB_NAME:-router_db}
     ports:
-      - "5433:5432"
+      - "${REPLICA_DB_PUBLIC_PORT:-5433}:5432"
     volumes:
-      - otc_postgres_replica_data:/var/lib/postgresql/data
+      - router_postgres_replica_v3_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
       interval: 5s
@@ -207,28 +152,31 @@ services:
       retries: 10
       start_period: 10s
     networks:
-      - replica-network 
+      - router-replica-network
 
-  replica-setup:
-    image: postgres:16-alpine
-    container_name: tee-replica-setup
+  router-replica-setup-v3:
+    image: postgres:16
+    container_name: router-replica-setup-v3
     depends_on:
-      postgres-replica:
+      stunnel-v3:
+        condition: service_healthy
+      router-postgres-replica-v3:
         condition: service_healthy
     environment:
-      # Primary database connection
-      PRIMARY_DB_HOST: stunnel
+      PRIMARY_DB_HOST: stunnel-v3
       PRIMARY_DB_PORT: ${PRIMARY_DB_PORT:-5432}
-      PRIMARY_DB_NAME: ${PRIMARY_DB_NAME:-otc_db}
+      PRIMARY_DB_NAME: ${PRIMARY_DB_NAME:-router_db}
       PRIMARY_DB_USER: ${PRIMARY_DB_USER:-replicator}
-      PRIMARY_DB_PASSWORD: ${PRIMARY_DB_PASSWORD:?PRIMARY_DB_PASSWORD must be set}
-      
-      # Replica database connection
-      REPLICA_DB_HOST: postgres-replica
+      PRIMARY_DB_PASSWORD: ${PRIMARY_DB_PASSWORD:?set PRIMARY_DB_PASSWORD}
+      PRIMARY_DB_SSLMODE: ${PRIMARY_DB_SSLMODE:-prefer}
+      PRIMARY_PUBLICATION: ${PRIMARY_PUBLICATION:-router_all_tables}
+      REPLICA_DB_HOST: router-postgres-replica-v3
       REPLICA_DB_PORT: 5432
-      REPLICA_DB_NAME: ${REPLICA_DB_NAME:-otc_db}
+      REPLICA_DB_NAME: ${REPLICA_DB_NAME:-router_db}
       REPLICA_DB_USER: ${REPLICA_DB_USER:-postgres}
-      REPLICA_DB_PASSWORD: ${REPLICA_DB_PASSWORD:?REPLICA_DB_PASSWORD must be set}
+      REPLICA_DB_PASSWORD: ${REPLICA_DB_PASSWORD:?set REPLICA_DB_PASSWORD}
+      REPLICA_DB_SSLMODE: ${REPLICA_DB_SSLMODE:-prefer}
+      REPLICA_SUBSCRIPTION: ${REPLICA_SUBSCRIPTION:-router_subscription}
     configs:
       - source: replica-setup
         target: /setup.sh
@@ -236,11 +184,10 @@ services:
     command: ["/setup.sh"]
     restart: "no"
     networks:
-      - replica-network
+      - router-replica-network
 
 networks:
-  replica-network:
+  router-replica-network:
 
 volumes:
-  otc_postgres_replica_data:
-
+  router_postgres_replica_v3_data:

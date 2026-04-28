@@ -274,6 +274,24 @@ fn materialize_transition_steps(
                 })?);
                 step_index += 1;
             }
+            MarketOrderTransitionKind::CctpBridge => {
+                let leg = legs.take_one(&transition.id, transition.kind)?;
+                let cctp_steps = cctp_bridge_steps(CctpBridgeStepSpec {
+                    order,
+                    source_vault,
+                    transition,
+                    leg: &leg,
+                    source_role: input_custody_role_for_transition(
+                        &path.transitions,
+                        transition_index,
+                    ),
+                    is_final,
+                    step_index,
+                    planned_at,
+                })?;
+                step_index += i32::try_from(cctp_steps.len()).unwrap_or(0);
+                steps.extend(cctp_steps);
+            }
             MarketOrderTransitionKind::UnitDeposit => {
                 let leg = legs.take_one(&transition.id, transition.kind)?;
                 steps.push(unit_deposit_step(
@@ -1124,6 +1142,139 @@ fn across_bridge_step(
     }))
 }
 
+struct CctpBridgeStepSpec<'a> {
+    order: &'a RouterOrder,
+    source_vault: &'a DepositVault,
+    transition: &'a TransitionDecl,
+    leg: &'a QuoteLeg,
+    source_role: Option<CustodyVaultRole>,
+    is_final: bool,
+    step_index: i32,
+    planned_at: DateTime<Utc>,
+}
+
+fn cctp_bridge_steps(
+    spec: CctpBridgeStepSpec<'_>,
+) -> MarketOrderRoutePlanResult<Vec<OrderExecutionStep>> {
+    let CctpBridgeStepSpec {
+        order,
+        source_vault,
+        transition,
+        leg,
+        source_role,
+        is_final,
+        step_index,
+        planned_at,
+    } = spec;
+    let provider_id = leg_provider(leg, transition)?;
+    let provider = provider_id.as_str().to_string();
+    let amount_in = leg.amount_in.clone();
+    let amount_out = leg.amount_out.clone();
+    let max_fee = leg
+        .raw
+        .get("max_fee")
+        .and_then(Value::as_str)
+        .unwrap_or("0")
+        .to_string();
+    let source_role_string = source_role.map(|role| role.to_db_string().to_string());
+    let (source_custody_vault_id, source_custody_vault_address) = if source_role.is_none() {
+        (
+            json!(source_vault.id),
+            json!(source_vault.deposit_vault_address.clone()),
+        )
+    } else {
+        (Value::Null, Value::Null)
+    };
+    let recipient_address = if is_final {
+        json!(order.recipient_address)
+    } else {
+        Value::Null
+    };
+    let recipient_role = if is_final {
+        Value::Null
+    } else {
+        json!(CustodyVaultRole::DestinationExecution.to_db_string())
+    };
+
+    let burn = step(StepSpec {
+        order_id: order.id,
+        transition_decl_id: Some(transition.id.clone()),
+        step_index,
+        step_type: OrderExecutionStepType::CctpBurn,
+        provider: provider.clone(),
+        input_asset: Some(transition.input.asset.clone()),
+        output_asset: Some(transition.output.asset.clone()),
+        amount_in: Some(amount_in.clone()),
+        min_amount_out: None,
+        provider_ref: None,
+        idempotency_key: idempotency_key(order.id, &provider, step_index),
+        request: json!({
+            "order_id": order.id,
+            "transition_decl_id": transition.id,
+            "source_chain_id": transition.input.asset.chain.as_str(),
+            "destination_chain_id": transition.output.asset.chain.as_str(),
+            "input_asset": transition.input.asset.asset.as_str(),
+            "output_asset": transition.output.asset.asset.as_str(),
+            "amount": amount_in,
+            "recipient_address": recipient_address,
+            "recipient_custody_vault_id": null,
+            "recipient_custody_vault_role": recipient_role,
+            "source_custody_vault_id": source_custody_vault_id,
+            "source_custody_vault_address": source_custody_vault_address,
+            "source_custody_vault_role": source_role_string,
+            "max_fee": max_fee,
+        }),
+        details: json!({
+            "schema_version": 1,
+            "transition_kind": transition.kind.as_str(),
+            "source_custody_vault_role": source_role.map(CustodyVaultRole::to_db_string),
+            "source_custody_vault_status": if source_role.is_some() { json!("pending_derivation") } else { json!("bound") },
+            "recipient_custody_vault_role": if is_final { Value::Null } else { json!(CustodyVaultRole::DestinationExecution.to_db_string()) },
+            "recipient_custody_vault_status": if is_final { Value::Null } else { json!("pending_derivation") },
+            "receive_step_index": step_index + 1,
+        }),
+        planned_at,
+    });
+
+    let receive = step(StepSpec {
+        order_id: order.id,
+        transition_decl_id: Some(format!("{}:receive", transition.id)),
+        step_index: step_index + 1,
+        step_type: OrderExecutionStepType::CctpReceive,
+        provider,
+        input_asset: Some(transition.output.asset.clone()),
+        output_asset: Some(transition.output.asset.clone()),
+        amount_in: Some(amount_out.clone()),
+        min_amount_out: None,
+        provider_ref: None,
+        idempotency_key: idempotency_key(order.id, provider_id.as_str(), step_index + 1),
+        request: json!({
+            "order_id": order.id,
+            "burn_transition_decl_id": transition.id,
+            "destination_chain_id": transition.output.asset.chain.as_str(),
+            "output_asset": transition.output.asset.asset.as_str(),
+            "amount": amount_out,
+            "source_custody_vault_id": null,
+            "source_custody_vault_address": null,
+            "source_custody_vault_role": CustodyVaultRole::DestinationExecution.to_db_string(),
+            "recipient_address": if is_final { json!(order.recipient_address) } else { Value::Null },
+            "recipient_custody_vault_id": null,
+            "message": "",
+            "attestation": "",
+        }),
+        details: json!({
+            "schema_version": 1,
+            "transition_kind": transition.kind.as_str(),
+            "burn_step_index": step_index,
+            "source_custody_vault_role": CustodyVaultRole::DestinationExecution.to_db_string(),
+            "source_custody_vault_status": "pending_derivation",
+        }),
+        planned_at,
+    });
+
+    Ok(vec![burn, receive])
+}
+
 fn unit_deposit_step(
     order: &RouterOrder,
     source_vault: &DepositVault,
@@ -1233,6 +1384,42 @@ fn validate_intermediate_custody_plan(
             OrderExecutionStepType::AcrossBridge => require_request_role(
                 step,
                 "recipient_custody_vault_role",
+                &[CustodyVaultRole::DestinationExecution],
+            )?,
+            OrderExecutionStepType::CctpBurn => {
+                maybe_require_request_role(
+                    step,
+                    "source_custody_vault_role",
+                    &[CustodyVaultRole::DestinationExecution],
+                )?;
+                if step
+                    .request
+                    .get("recipient_custody_vault_role")
+                    .is_some_and(|value| !value.is_null())
+                {
+                    require_request_role(
+                        step,
+                        "recipient_custody_vault_role",
+                        &[CustodyVaultRole::DestinationExecution],
+                    )?;
+                } else if step
+                    .request
+                    .get("recipient_address")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+                {
+                    return Err(MarketOrderRoutePlanError::IntermediateCustodyInvariant {
+                        step_index: step.step_index,
+                        step_type: step.step_type.to_db_string(),
+                        reason:
+                            "cctp burn requires a destination execution recipient or final recipient address"
+                                .to_string(),
+                    });
+                }
+            }
+            OrderExecutionStepType::CctpReceive => require_request_role(
+                step,
+                "source_custody_vault_role",
                 &[CustodyVaultRole::DestinationExecution],
             )?,
             OrderExecutionStepType::UnitDeposit => require_request_role(
@@ -1497,6 +1684,7 @@ mod tests {
                     amount_in: "1000000000000000000".to_string(),
                     min_amount_out: "1".to_string(),
                 },
+                slippage_bps: 100,
             }),
             action_timeout_at: now + chrono::Duration::minutes(10),
             idempotency_key: None,
@@ -1534,6 +1722,7 @@ mod tests {
             amount_out: "999000000000000000".to_string(),
             min_amount_out: Some("1".to_string()),
             max_amount_in: None,
+            slippage_bps: 100,
             provider_quote: json!({
                 "path_id": path.id,
                 "transition_decl_ids": transition_ids,
@@ -1622,6 +1811,7 @@ mod tests {
                     amount_in: "1000000000000000000".to_string(),
                     min_amount_out: "900000000000000000".to_string(),
                 },
+                slippage_bps: 100,
             }),
             action_timeout_at: now + chrono::Duration::minutes(10),
             idempotency_key: None,
@@ -1699,6 +1889,7 @@ mod tests {
             amount_out: "950000000000000000".to_string(),
             min_amount_out: Some("900000000000000000".to_string()),
             max_amount_in: None,
+            slippage_bps: 526,
             provider_quote: json!({
                 "path_id": path.id,
                 "transition_decl_ids": transition_ids,
@@ -1740,6 +1931,162 @@ mod tests {
             step.request["price_route"]["tokenTransferProxy"],
             json!("0x9999999999999999999999999999999999999999")
         );
+    }
+
+    #[test]
+    fn planner_materializes_cctp_bridge_as_burn_then_receive_steps() {
+        let registry = Arc::new(AssetRegistry::default());
+        let source_asset = asset(
+            "evm:8453",
+            AssetId::reference("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
+        );
+        let destination_asset = asset(
+            "evm:42161",
+            AssetId::reference("0xaf88d065e77c8cc2239327c5edb3a432268e5831"),
+        );
+        let path = registry
+            .select_transition_paths(&source_asset, &destination_asset, 2)
+            .into_iter()
+            .find(|path| {
+                path.transitions.len() == 1
+                    && path.transitions[0].kind == MarketOrderTransitionKind::CctpBridge
+            })
+            .expect("direct CCTP path");
+        let transition = &path.transitions[0];
+        let now = Utc::now();
+        let order_id = Uuid::now_v7();
+        let source_vault_id = Uuid::now_v7();
+        let order = RouterOrder {
+            id: order_id,
+            order_type: RouterOrderType::MarketOrder,
+            status: RouterOrderStatus::Funded,
+            funding_vault_id: Some(source_vault_id),
+            source_asset: source_asset.clone(),
+            destination_asset: destination_asset.clone(),
+            recipient_address: "0x5555555555555555555555555555555555555555".to_string(),
+            refund_address: "0x6666666666666666666666666666666666666666".to_string(),
+            action: RouterOrderAction::MarketOrder(MarketOrderAction {
+                order_kind: MarketOrderKind::ExactIn {
+                    amount_in: "1000000".to_string(),
+                    min_amount_out: "990000".to_string(),
+                },
+                slippage_bps: 100,
+            }),
+            action_timeout_at: now + chrono::Duration::minutes(10),
+            idempotency_key: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let source_vault = DepositVault {
+            id: source_vault_id,
+            order_id: Some(order_id),
+            deposit_asset: source_asset.clone(),
+            action: VaultAction::Null,
+            metadata: json!({}),
+            deposit_vault_salt: [7; 32],
+            deposit_vault_address: "0x7777777777777777777777777777777777777777".to_string(),
+            recovery_address: "0x8888888888888888888888888888888888888888".to_string(),
+            cancellation_commitment: "0x".to_string(),
+            cancel_after: now + chrono::Duration::minutes(10),
+            status: DepositVaultStatus::Funded,
+            refund_requested_at: None,
+            refunded_at: None,
+            refund_tx_hash: None,
+            last_refund_error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let transition_ids = vec![transition.id.clone()];
+        let leg = json!({
+            "transition_decl_id": transition.id,
+            "transition_parent_decl_id": transition.id,
+            "transition_kind": transition.kind.as_str(),
+            "provider": "cctp",
+            "input_asset": {
+                "chain_id": source_asset.chain.as_str(),
+                "asset": source_asset.asset.as_str(),
+            },
+            "output_asset": {
+                "chain_id": destination_asset.chain.as_str(),
+                "asset": destination_asset.asset.as_str(),
+            },
+            "amount_in": "1000000",
+            "amount_out": "1000000",
+            "expires_at": (now + chrono::Duration::minutes(5)).to_rfc3339(),
+            "raw": {
+                "kind": "cctp_bridge",
+                "source_domain": 6,
+                "destination_domain": 3,
+                "max_fee": "0",
+            },
+        });
+        let quote = MarketOrderQuote {
+            id: Uuid::now_v7(),
+            order_id: Some(order_id),
+            source_asset: source_asset.clone(),
+            destination_asset: destination_asset.clone(),
+            recipient_address: order.recipient_address.clone(),
+            provider_id: "path:cctp".to_string(),
+            order_kind: MarketOrderKindType::ExactIn,
+            amount_in: "1000000".to_string(),
+            amount_out: "1000000".to_string(),
+            min_amount_out: Some("990000".to_string()),
+            max_amount_in: None,
+            slippage_bps: 100,
+            provider_quote: json!({
+                "path_id": path.id,
+                "transition_decl_ids": transition_ids,
+                "transitions": path.transitions,
+                "legs": [leg],
+                "gas_reimbursement": {
+                    "retention_actions": []
+                }
+            }),
+            expires_at: now + chrono::Duration::minutes(5),
+            created_at: now,
+        };
+
+        let plan = MarketOrderRoutePlanner::new(registry)
+            .plan(&order, &source_vault, &quote, now)
+            .expect("CCTP path should plan");
+
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(
+            plan.steps
+                .iter()
+                .map(|step| step.step_type)
+                .collect::<Vec<_>>(),
+            vec![
+                OrderExecutionStepType::CctpBurn,
+                OrderExecutionStepType::CctpReceive
+            ]
+        );
+        assert_eq!(
+            plan.steps[0].transition_decl_id,
+            Some(transition.id.clone())
+        );
+        assert_eq!(
+            plan.steps[1].transition_decl_id,
+            Some(format!("{}:receive", transition.id))
+        );
+        assert_eq!(
+            plan.steps[0].request["source_custody_vault_id"],
+            json!(source_vault_id)
+        );
+        assert_eq!(
+            plan.steps[0].request["recipient_address"],
+            json!(order.recipient_address)
+        );
+        assert_eq!(
+            plan.steps[1].request["burn_transition_decl_id"],
+            json!(transition.id)
+        );
+        assert_eq!(
+            plan.steps[1].request["source_custody_vault_role"],
+            json!("destination_execution")
+        );
+        assert_eq!(plan.steps[1].request["message"], json!(""));
+        assert_eq!(plan.steps[1].output_asset, Some(destination_asset));
     }
 
     #[test]

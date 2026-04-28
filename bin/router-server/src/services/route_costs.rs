@@ -13,10 +13,12 @@ use crate::{
 };
 use alloy::primitives::U256;
 use chrono::{DateTime, Utc};
+use market_pricing::MarketPricingOracle;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
+use tokio::sync::RwLock;
 use tokio::time::timeout;
-use tracing::debug;
+use tracing::{debug, warn};
 
 const DEFAULT_REFRESH_TTL: Duration = Duration::from_secs(600);
 const DEFAULT_AMOUNT_BUCKET: &str = "usd_1000";
@@ -82,7 +84,8 @@ pub struct RouteCostService {
     action_providers: Arc<ActionProviderRegistry>,
     asset_registry: Arc<AssetRegistry>,
     ttl: Duration,
-    pricing: PricingSnapshot,
+    pricing: Arc<RwLock<PricingSnapshot>>,
+    pricing_oracle: Option<Arc<MarketPricingOracle>>,
 }
 
 impl RouteCostService {
@@ -94,7 +97,8 @@ impl RouteCostService {
             action_providers,
             asset_registry,
             ttl: DEFAULT_REFRESH_TTL,
-            pricing: PricingSnapshot::static_bootstrap(Utc::now()),
+            pricing: Arc::new(RwLock::new(PricingSnapshot::static_bootstrap(Utc::now()))),
+            pricing_oracle: None,
         }
     }
 
@@ -106,8 +110,18 @@ impl RouteCostService {
 
     #[must_use]
     pub fn with_pricing(mut self, pricing: PricingSnapshot) -> Self {
-        self.pricing = pricing;
+        self.pricing = Arc::new(RwLock::new(pricing));
         self
+    }
+
+    #[must_use]
+    pub fn with_pricing_oracle(mut self, pricing_oracle: Arc<MarketPricingOracle>) -> Self {
+        self.pricing_oracle = Some(pricing_oracle);
+        self
+    }
+
+    pub async fn current_pricing_snapshot(&self) -> PricingSnapshot {
+        self.pricing.read().await.clone()
     }
 
     pub async fn refresh_anchor_costs(&self) -> RouterServerResult<RouteCostRefreshSummary> {
@@ -115,6 +129,7 @@ impl RouteCostService {
         let expires_at = now
             + chrono::Duration::from_std(self.ttl)
                 .unwrap_or_else(|_| chrono::Duration::seconds(600));
+        let pricing = self.refresh_pricing_snapshot().await;
         let transitions = self.asset_registry.transition_declarations();
         let mut snapshots = Vec::with_capacity(transitions.len());
         let mut provider_quotes_attempted = 0_usize;
@@ -122,7 +137,10 @@ impl RouteCostService {
         let mut provider_quotes_failed = 0_usize;
 
         for transition in &transitions {
-            let live_snapshot = match self.live_cost_snapshot(transition, now, expires_at).await {
+            let live_snapshot = match self
+                .live_cost_snapshot(transition, now, expires_at, &pricing)
+                .await
+            {
                 LiveCostSnapshotOutcome::NotAttempted => None,
                 LiveCostSnapshotOutcome::Succeeded(snapshot) => {
                     provider_quotes_attempted += 1;
@@ -142,7 +160,7 @@ impl RouteCostService {
                 }
             };
             snapshots.push(live_snapshot.unwrap_or_else(|| {
-                structural_cost_snapshot(transition, now, expires_at, &self.pricing)
+                structural_cost_snapshot(transition, now, expires_at, &pricing)
             }));
         }
         self.db.route_costs().upsert_many(&snapshots).await?;
@@ -153,7 +171,7 @@ impl RouteCostService {
             provider_quotes_attempted,
             provider_quotes_succeeded,
             provider_quotes_failed,
-            pricing_source: self.pricing.source.clone(),
+            pricing_source: pricing.source.clone(),
             refreshed_at: now,
         })
     }
@@ -172,23 +190,36 @@ impl RouteCostService {
             .map(|snapshot| (snapshot.transition_id.clone(), snapshot))
             .collect::<HashMap<_, _>>();
 
+        let pricing = self.current_pricing_snapshot().await;
         paths.sort_by(|left, right| {
-            let left_score = path_score(left, &by_transition_id);
-            let right_score = path_score(right, &by_transition_id);
-            (
-                left_score.missing_edges,
-                left_score.total_effective_cost_bps,
-                left_score.total_latency_ms,
+            compare_path_scores(
+                path_score_with_structural_fallback(left, &by_transition_id, &pricing),
                 left.transitions.len(),
+                path_score_with_structural_fallback(right, &by_transition_id, &pricing),
+                right.transitions.len(),
             )
-                .cmp(&(
-                    right_score.missing_edges,
-                    right_score.total_effective_cost_bps,
-                    right_score.total_latency_ms,
-                    right.transitions.len(),
-                ))
         });
         Ok(())
+    }
+
+    async fn refresh_pricing_snapshot(&self) -> PricingSnapshot {
+        let Some(pricing_oracle) = self.pricing_oracle.as_ref() else {
+            return self.current_pricing_snapshot().await;
+        };
+        match pricing_oracle.snapshot().await {
+            Ok(snapshot) => {
+                let pricing = PricingSnapshot::from_market(snapshot);
+                *self.pricing.write().await = pricing.clone();
+                pricing
+            }
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "market pricing refresh failed; using previous pricing snapshot"
+                );
+                self.current_pricing_snapshot().await
+            }
+        }
     }
 
     async fn live_cost_snapshot(
@@ -196,11 +227,13 @@ impl RouteCostService {
         transition: &TransitionDecl,
         refreshed_at: DateTime<Utc>,
         expires_at: DateTime<Utc>,
+        pricing: &PricingSnapshot,
     ) -> LiveCostSnapshotOutcome {
         match transition.kind {
             MarketOrderTransitionKind::AcrossBridge
+            | MarketOrderTransitionKind::CctpBridge
             | MarketOrderTransitionKind::HyperliquidBridgeDeposit => {
-                self.live_bridge_cost_snapshot(transition, refreshed_at, expires_at)
+                self.live_bridge_cost_snapshot(transition, refreshed_at, expires_at, pricing)
                     .await
             }
             MarketOrderTransitionKind::UnitDeposit
@@ -217,6 +250,7 @@ impl RouteCostService {
         transition: &TransitionDecl,
         refreshed_at: DateTime<Utc>,
         expires_at: DateTime<Utc>,
+        pricing: &PricingSnapshot,
     ) -> LiveCostSnapshotOutcome {
         let Some(bridge) = self.action_providers.bridge(transition.provider.as_str()) else {
             return LiveCostSnapshotOutcome::NotAttempted;
@@ -224,7 +258,7 @@ impl RouteCostService {
         let Some(amount_in) = sample_amount_for_asset(
             &transition.input.asset,
             self.asset_registry.as_ref(),
-            &self.pricing,
+            pricing,
         ) else {
             return LiveCostSnapshotOutcome::NotAttempted;
         };
@@ -256,8 +290,8 @@ impl RouteCostService {
                 ))
             }
         };
-        let estimate = structural_cost_estimate(transition, &self.pricing);
-        let estimated_fee_bps = match quote_loss_bps(amount_in, amount_out) {
+        let estimate = structural_cost_estimate(transition, pricing);
+        let quoted_fee_bps = match quote_loss_bps(amount_in, amount_out) {
             Some(fee_bps) => fee_bps,
             None => {
                 return LiveCostSnapshotOutcome::Failed(
@@ -265,6 +299,7 @@ impl RouteCostService {
                 )
             }
         };
+        let estimated_fee_bps = quoted_fee_bps.max(estimate.estimated_fee_bps);
 
         LiveCostSnapshotOutcome::Succeeded(Box::new(RouteCostSnapshot {
             transition_id: transition.id.clone(),
@@ -288,6 +323,18 @@ enum LiveCostSnapshotOutcome {
     NotAttempted,
     Succeeded(Box<RouteCostSnapshot>),
     Failed(String),
+}
+
+pub fn rank_transition_paths_structurally(paths: &mut [TransitionPath]) {
+    let pricing = PricingSnapshot::static_bootstrap(Utc::now());
+    paths.sort_by(|left, right| {
+        compare_path_scores(
+            structural_path_score(left, &pricing),
+            left.transitions.len(),
+            structural_path_score(right, &pricing),
+            right.transitions.len(),
+        )
+    });
 }
 
 #[must_use]
@@ -316,6 +363,64 @@ pub fn path_score(
         total_effective_cost_bps,
         total_latency_ms,
     }
+}
+
+fn path_score_with_structural_fallback(
+    path: &TransitionPath,
+    snapshots: &HashMap<String, RouteCostSnapshot>,
+    pricing: &PricingSnapshot,
+) -> RoutePathCostScore {
+    let mut total_effective_cost_bps = 0_u64;
+    let mut total_latency_ms = 0_u64;
+
+    for transition in &path.transitions {
+        if let Some(snapshot) = snapshots.get(&transition.id) {
+            total_effective_cost_bps =
+                total_effective_cost_bps.saturating_add(snapshot.effective_cost_bps());
+            total_latency_ms = total_latency_ms.saturating_add(snapshot.estimated_latency_ms);
+        } else {
+            let estimate = structural_cost_estimate(transition, pricing);
+            let gas_bps = div_ceil_u64(
+                estimate
+                    .estimated_gas_usd_micros
+                    .saturating_mul(BPS_DENOMINATOR),
+                DEFAULT_SAMPLE_AMOUNT_USD_MICROS,
+            );
+            total_effective_cost_bps = total_effective_cost_bps
+                .saturating_add(estimate.estimated_fee_bps.saturating_add(gas_bps));
+            total_latency_ms = total_latency_ms.saturating_add(estimate.estimated_latency_ms);
+        }
+    }
+
+    RoutePathCostScore {
+        missing_edges: 0,
+        total_effective_cost_bps,
+        total_latency_ms,
+    }
+}
+
+fn structural_path_score(path: &TransitionPath, pricing: &PricingSnapshot) -> RoutePathCostScore {
+    path_score_with_structural_fallback(path, &HashMap::new(), pricing)
+}
+
+fn compare_path_scores(
+    left_score: RoutePathCostScore,
+    left_len: usize,
+    right_score: RoutePathCostScore,
+    right_len: usize,
+) -> std::cmp::Ordering {
+    (
+        left_score.missing_edges,
+        left_score.total_effective_cost_bps,
+        left_score.total_latency_ms,
+        left_len,
+    )
+        .cmp(&(
+            right_score.missing_edges,
+            right_score.total_effective_cost_bps,
+            right_score.total_latency_ms,
+            right_len,
+        ))
 }
 
 fn structural_cost_snapshot(
@@ -357,9 +462,28 @@ fn structural_cost_estimate(
     match transition.kind {
         MarketOrderTransitionKind::AcrossBridge => StructuralCostEstimate {
             estimated_fee_bps: 6,
-            estimated_gas_usd_micros: 0,
+            estimated_gas_usd_micros: structural_gas_usd_micros(
+                pricing,
+                &transition.input.asset.chain,
+                450_000,
+            ),
             estimated_latency_ms: 120_000,
             quote_source: "static_across_anchor_seed",
+        },
+        MarketOrderTransitionKind::CctpBridge => StructuralCostEstimate {
+            estimated_fee_bps: 0,
+            estimated_gas_usd_micros: structural_gas_usd_micros(
+                pricing,
+                &transition.input.asset.chain,
+                300_000,
+            )
+            .saturating_add(structural_gas_usd_micros(
+                pricing,
+                &transition.output.asset.chain,
+                300_000,
+            )),
+            estimated_latency_ms: 60_000,
+            quote_source: "static_cctp_standard_seed",
         },
         MarketOrderTransitionKind::UnitDeposit | MarketOrderTransitionKind::UnitWithdrawal => {
             StructuralCostEstimate {
@@ -463,6 +587,7 @@ mod tests {
                 MarketOrderTransitionKind::UnitDeposit
                 | MarketOrderTransitionKind::UnitWithdrawal => ProviderId::Unit,
                 MarketOrderTransitionKind::AcrossBridge => ProviderId::Across,
+                MarketOrderTransitionKind::CctpBridge => ProviderId::Cctp,
             },
             input: AssetSlot {
                 asset: asset("evm:1"),
@@ -561,6 +686,97 @@ mod tests {
     }
 
     #[test]
+    fn structural_route_ranking_prefers_cctp_for_base_usdc_to_bitcoin() {
+        let registry = AssetRegistry::default();
+        let pricing = PricingSnapshot::static_bootstrap(Utc::now());
+        let base_usdc = DepositAsset {
+            chain: ChainId::parse("evm:8453").unwrap(),
+            asset: AssetId::reference("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
+        };
+        let btc = DepositAsset {
+            chain: ChainId::parse("bitcoin").unwrap(),
+            asset: AssetId::Native,
+        };
+        let paths = registry.select_transition_paths(&base_usdc, &btc, 5);
+        let cctp_path = paths
+            .iter()
+            .find(|path| {
+                path.transitions
+                    .iter()
+                    .any(|transition| transition.kind == MarketOrderTransitionKind::CctpBridge)
+            })
+            .expect("CCTP route should exist");
+        let across_path = paths
+            .iter()
+            .find(|path| {
+                path.transitions
+                    .iter()
+                    .any(|transition| transition.kind == MarketOrderTransitionKind::AcrossBridge)
+            })
+            .expect("Across route should exist");
+
+        assert!(
+            structural_path_score(cctp_path, &pricing).total_effective_cost_bps
+                < structural_path_score(across_path, &pricing).total_effective_cost_bps
+        );
+    }
+
+    #[test]
+    fn structural_usdc_bridge_costs_choose_cctp_for_l2_l2_and_across_for_eth_destination() {
+        let registry = AssetRegistry::default();
+        let pricing = PricingSnapshot::static_bootstrap(Utc::now());
+        let base_usdc = usdc("evm:8453", "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913");
+        let arbitrum_usdc = usdc("evm:42161", "0xaf88d065e77c8cc2239327c5edb3a432268e5831");
+        let ethereum_usdc = usdc("evm:1", "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
+
+        assert!(
+            direct_bridge_cost(
+                &registry,
+                &pricing,
+                &base_usdc,
+                &arbitrum_usdc,
+                MarketOrderTransitionKind::CctpBridge
+            ) < direct_bridge_cost(
+                &registry,
+                &pricing,
+                &base_usdc,
+                &arbitrum_usdc,
+                MarketOrderTransitionKind::AcrossBridge
+            )
+        );
+        assert!(
+            direct_bridge_cost(
+                &registry,
+                &pricing,
+                &arbitrum_usdc,
+                &ethereum_usdc,
+                MarketOrderTransitionKind::AcrossBridge
+            ) < direct_bridge_cost(
+                &registry,
+                &pricing,
+                &arbitrum_usdc,
+                &ethereum_usdc,
+                MarketOrderTransitionKind::CctpBridge
+            )
+        );
+        assert!(
+            direct_bridge_cost(
+                &registry,
+                &pricing,
+                &base_usdc,
+                &ethereum_usdc,
+                MarketOrderTransitionKind::AcrossBridge
+            ) < direct_bridge_cost(
+                &registry,
+                &pricing,
+                &base_usdc,
+                &ethereum_usdc,
+                MarketOrderTransitionKind::CctpBridge
+            )
+        );
+    }
+
+    #[test]
     fn sample_amount_uses_asset_decimals_and_reference_prices() {
         let registry = AssetRegistry::default();
         let pricing = PricingSnapshot::static_bootstrap(Utc::now());
@@ -581,6 +797,28 @@ mod tests {
             sample_amount_for_asset(&cbbtc, &registry, &pricing),
             Some(U256::from(1_000_000_u64))
         );
+    }
+
+    fn usdc(chain: &str, address: &str) -> DepositAsset {
+        DepositAsset {
+            chain: ChainId::parse(chain).unwrap(),
+            asset: AssetId::reference(address),
+        }
+    }
+
+    fn direct_bridge_cost(
+        registry: &AssetRegistry,
+        pricing: &PricingSnapshot,
+        source: &DepositAsset,
+        destination: &DepositAsset,
+        kind: MarketOrderTransitionKind,
+    ) -> u64 {
+        let path = registry
+            .select_transition_paths(source, destination, 1)
+            .into_iter()
+            .find(|path| path.transitions.len() == 1 && path.transitions[0].kind == kind)
+            .unwrap_or_else(|| panic!("missing direct {kind:?} path"));
+        structural_path_score(&path, pricing).total_effective_cost_bps
     }
 
     #[test]

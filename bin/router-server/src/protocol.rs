@@ -193,7 +193,6 @@ pub fn supported_chain_ids() -> Vec<ChainId> {
         ChainId::parse("evm:1").expect("valid router chain id"),
         ChainId::parse("evm:42161").expect("valid router chain id"),
         ChainId::parse("evm:8453").expect("valid router chain id"),
-        ChainId::parse("hyperliquid").expect("valid router chain id"),
     ]
 }
 
@@ -256,7 +255,7 @@ mod tests {
     #[test]
     fn maps_supported_router_chain_ids_to_backends() {
         let supported = supported_chain_ids();
-        assert_eq!(supported.len(), 5);
+        assert_eq!(supported.len(), 4);
         assert_eq!(
             backend_chain_for_id(&ChainId::parse("bitcoin").unwrap()),
             Some(ChainType::Bitcoin)
@@ -272,6 +271,17 @@ mod tests {
         assert_eq!(
             backend_chain_for_id(&ChainId::parse("evm:8453").unwrap()),
             Some(ChainType::Base)
+        );
+    }
+
+    #[test]
+    fn maps_internal_backend_chain_ids_without_public_exposure() {
+        let supported = supported_chain_ids();
+        assert!(
+            !supported
+                .iter()
+                .any(|chain| chain.as_str() == "hyperliquid"),
+            "hyperliquid should remain an internal backend chain, not a public start/end chain"
         );
         assert_eq!(
             backend_chain_for_id(&ChainId::parse("hyperliquid").unwrap()),

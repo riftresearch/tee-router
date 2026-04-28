@@ -31,6 +31,7 @@ impl CanonicalAsset {
 #[serde(rename_all = "snake_case")]
 pub enum ProviderId {
     Across,
+    Cctp,
     Unit,
     HyperliquidBridge,
     Hyperliquid,
@@ -41,6 +42,7 @@ impl ProviderId {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "across" => Some(Self::Across),
+            "cctp" => Some(Self::Cctp),
             "unit" => Some(Self::Unit),
             "hyperliquid_bridge" => Some(Self::HyperliquidBridge),
             "hyperliquid" => Some(Self::Hyperliquid),
@@ -53,6 +55,7 @@ impl ProviderId {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Across => "across",
+            Self::Cctp => "cctp",
             Self::Unit => "unit",
             Self::HyperliquidBridge => "hyperliquid_bridge",
             Self::Hyperliquid => "hyperliquid",
@@ -63,7 +66,9 @@ impl ProviderId {
     #[must_use]
     pub fn venue_kind(self) -> ProviderVenueKind {
         match self {
-            Self::Across | Self::Unit | Self::HyperliquidBridge => ProviderVenueKind::CrossChain,
+            Self::Across | Self::Cctp | Self::Unit | Self::HyperliquidBridge => {
+                ProviderVenueKind::CrossChain
+            }
             Self::Hyperliquid => ProviderVenueKind::MonoChain {
                 mono_chain_kind: MonoChainVenueKind::FixedPairExchange,
             },
@@ -77,7 +82,7 @@ impl ProviderId {
     pub fn asset_support_model(self) -> AssetSupportModel {
         match self {
             Self::Across => AssetSupportModel::RuntimeEnumerated,
-            Self::Unit | Self::HyperliquidBridge | Self::Hyperliquid => {
+            Self::Cctp | Self::Unit | Self::HyperliquidBridge | Self::Hyperliquid => {
                 AssetSupportModel::StaticDeclared
             }
             Self::Velora => AssetSupportModel::OpenAddressQuote,
@@ -185,6 +190,7 @@ pub enum MarketOrderNode {
 #[serde(rename_all = "snake_case")]
 pub enum MarketOrderTransitionKind {
     AcrossBridge,
+    CctpBridge,
     UnitDeposit,
     HyperliquidBridgeDeposit,
     HyperliquidTrade,
@@ -197,6 +203,7 @@ impl MarketOrderTransitionKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::AcrossBridge => "across_bridge",
+            Self::CctpBridge => "cctp_bridge",
             Self::UnitDeposit => "unit_deposit",
             Self::HyperliquidBridgeDeposit => "hyperliquid_bridge_deposit",
             Self::HyperliquidTrade => "hyperliquid_trade",
@@ -209,6 +216,7 @@ impl MarketOrderTransitionKind {
     pub fn route_edge_kind(self) -> RouteEdgeKind {
         match self {
             Self::AcrossBridge
+            | Self::CctpBridge
             | Self::UnitDeposit
             | Self::HyperliquidBridgeDeposit
             | Self::UnitWithdrawal => RouteEdgeKind::CrossChainTransfer,
@@ -421,6 +429,29 @@ impl AssetRegistry {
 
         for source in &self.chain_assets {
             let source_asset = source.deposit_asset();
+
+            if self.supports_provider_capability(
+                ProviderId::Cctp,
+                &source_asset,
+                ProviderAssetCapability::BridgeInput,
+            ) {
+                for destination in self.chain_assets.iter().filter(|candidate| {
+                    candidate.canonical == source.canonical
+                        && candidate.deposit_asset() != source_asset
+                        && self.supports_provider_capability(
+                            ProviderId::Cctp,
+                            &candidate.deposit_asset(),
+                            ProviderAssetCapability::BridgeOutput,
+                        )
+                }) {
+                    transitions.push(MarketOrderTransition {
+                        kind: MarketOrderTransitionKind::CctpBridge,
+                        provider: ProviderId::Cctp,
+                        from: MarketOrderNode::External(source_asset.clone()),
+                        to: MarketOrderNode::External(destination.deposit_asset()),
+                    });
+                }
+            }
 
             if self.supports_provider_capability(
                 ProviderId::Across,
@@ -865,7 +896,7 @@ fn required_roles_for_transition_kind(
     kind: MarketOrderTransitionKind,
 ) -> (RequiredCustodyRole, RequiredCustodyRole) {
     match kind {
-        MarketOrderTransitionKind::AcrossBridge => (
+        MarketOrderTransitionKind::AcrossBridge | MarketOrderTransitionKind::CctpBridge => (
             RequiredCustodyRole::SourceOrIntermediate,
             RequiredCustodyRole::IntermediateExecution,
         ),
@@ -914,6 +945,12 @@ fn builtin_chain_assets() -> Vec<ChainAsset> {
     vec![
         chain_asset(CanonicalAsset::Btc, "bitcoin", AssetId::Native, 8),
         chain_asset(CanonicalAsset::Eth, "evm:1", AssetId::Native, 18),
+        chain_asset(
+            CanonicalAsset::Usdc,
+            "evm:1",
+            AssetId::reference("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
+            6,
+        ),
         chain_asset(
             CanonicalAsset::Usdt,
             "evm:1",
@@ -1008,12 +1045,60 @@ fn builtin_provider_assets() -> Vec<ProviderAsset> {
             &[ProviderAssetCapability::UnitWithdrawal],
         ),
         provider_asset(
+            ProviderId::Cctp,
+            CanonicalAsset::Usdc,
+            "evm:1",
+            "0",
+            "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+            6,
+            &[
+                ProviderAssetCapability::BridgeInput,
+                ProviderAssetCapability::BridgeOutput,
+            ],
+        ),
+        provider_asset(
+            ProviderId::Cctp,
+            CanonicalAsset::Usdc,
+            "evm:42161",
+            "3",
+            "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+            6,
+            &[
+                ProviderAssetCapability::BridgeInput,
+                ProviderAssetCapability::BridgeOutput,
+            ],
+        ),
+        provider_asset(
+            ProviderId::Cctp,
+            CanonicalAsset::Usdc,
+            "evm:8453",
+            "6",
+            "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+            6,
+            &[
+                ProviderAssetCapability::BridgeInput,
+                ProviderAssetCapability::BridgeOutput,
+            ],
+        ),
+        provider_asset(
             ProviderId::Across,
             CanonicalAsset::Eth,
             "evm:1",
             "1",
             "native",
             18,
+            &[
+                ProviderAssetCapability::BridgeInput,
+                ProviderAssetCapability::BridgeOutput,
+            ],
+        ),
+        provider_asset(
+            ProviderId::Across,
+            CanonicalAsset::Usdc,
+            "evm:1",
+            "1",
+            "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+            6,
             &[
                 ProviderAssetCapability::BridgeInput,
                 ProviderAssetCapability::BridgeOutput,
@@ -1245,6 +1330,13 @@ mod tests {
             Some(CanonicalAsset::Eth)
         );
         assert_eq!(
+            registry.canonical_for(&asset(
+                "evm:1",
+                AssetId::reference("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
+            )),
+            Some(CanonicalAsset::Usdc)
+        );
+        assert_eq!(
             registry.canonical_for(&asset("bitcoin", AssetId::Native)),
             Some(CanonicalAsset::Btc)
         );
@@ -1295,6 +1387,7 @@ mod tests {
             ProviderId::Across.venue_kind(),
             ProviderVenueKind::CrossChain
         );
+        assert_eq!(ProviderId::Cctp.venue_kind(), ProviderVenueKind::CrossChain);
         assert_eq!(ProviderId::Unit.venue_kind(), ProviderVenueKind::CrossChain);
         assert_eq!(
             ProviderId::HyperliquidBridge.venue_kind(),
@@ -1321,6 +1414,10 @@ mod tests {
             AssetSupportModel::RuntimeEnumerated
         );
         assert_eq!(
+            ProviderId::Cctp.asset_support_model(),
+            AssetSupportModel::StaticDeclared
+        );
+        assert_eq!(
             ProviderId::Unit.asset_support_model(),
             AssetSupportModel::StaticDeclared
         );
@@ -1342,6 +1439,10 @@ mod tests {
     fn transition_kinds_expose_route_edge_semantics() {
         assert_eq!(
             MarketOrderTransitionKind::AcrossBridge.route_edge_kind(),
+            RouteEdgeKind::CrossChainTransfer
+        );
+        assert_eq!(
+            MarketOrderTransitionKind::CctpBridge.route_edge_kind(),
             RouteEdgeKind::CrossChainTransfer
         );
         assert_eq!(
@@ -1398,6 +1499,7 @@ mod tests {
                     assert!(transition.provider_venue_kind().is_mono_chain());
                 }
                 MarketOrderTransitionKind::AcrossBridge
+                | MarketOrderTransitionKind::CctpBridge
                 | MarketOrderTransitionKind::UnitDeposit
                 | MarketOrderTransitionKind::HyperliquidBridgeDeposit
                 | MarketOrderTransitionKind::UnitWithdrawal => {
@@ -1430,6 +1532,19 @@ mod tests {
             transition.kind == MarketOrderTransitionKind::AcrossBridge
                 && transition.from == MarketOrderNode::External(asset("evm:1", AssetId::Native))
                 && transition.to == MarketOrderNode::External(asset("evm:8453", AssetId::Native))
+        }));
+        assert!(transitions.iter().any(|transition| {
+            transition.kind == MarketOrderTransitionKind::CctpBridge
+                && transition.from
+                    == MarketOrderNode::External(asset(
+                        "evm:8453",
+                        AssetId::reference("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
+                    ))
+                && transition.to
+                    == MarketOrderNode::External(asset(
+                        "evm:42161",
+                        AssetId::reference("0xaf88d065e77c8cc2239327c5edb3a432268e5831"),
+                    ))
         }));
         assert!(transitions.iter().any(|transition| {
             transition.kind == MarketOrderTransitionKind::HyperliquidBridgeDeposit
@@ -1525,6 +1640,31 @@ mod tests {
             }) && path.transitions.last().is_some_and(|transition| {
                 transition.kind == MarketOrderTransitionKind::UnitWithdrawal
             })
+        }));
+    }
+
+    #[test]
+    fn base_usdc_can_route_to_bitcoin_through_cctp_and_hyperliquid() {
+        let registry = AssetRegistry::default();
+        let base_usdc = asset(
+            "evm:8453",
+            AssetId::reference("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
+        );
+        let btc = asset("bitcoin", AssetId::Native);
+
+        let paths = registry.select_transition_paths(&base_usdc, &btc, 5);
+
+        assert!(paths.iter().any(|path| {
+            path.transitions
+                .iter()
+                .map(|transition| transition.kind)
+                .collect::<Vec<_>>()
+                == vec![
+                    MarketOrderTransitionKind::CctpBridge,
+                    MarketOrderTransitionKind::HyperliquidBridgeDeposit,
+                    MarketOrderTransitionKind::HyperliquidTrade,
+                    MarketOrderTransitionKind::UnitWithdrawal,
+                ]
         }));
     }
 

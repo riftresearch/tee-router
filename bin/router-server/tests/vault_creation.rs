@@ -22,8 +22,8 @@ use eip3009_erc20_contract::GenericEIP3009ERC20::GenericEIP3009ERC20Instance;
 use router_primitives::ChainType;
 use router_server::{
     api::{
-        CreateOrderRequest, CreateVaultRequest, MarketOrderQuoteRequest, ProviderPolicyEnvelope,
-        ProviderPolicyListEnvelope,
+        CreateOrderRequest, CreateVaultRequest, MarketOrderQuoteKind, MarketOrderQuoteRequest,
+        ProviderPolicyEnvelope, ProviderPolicyListEnvelope,
     },
     app::{initialize_components, PaymasterMode, RouterComponents},
     config::Settings,
@@ -114,12 +114,20 @@ impl TestHarness {
         self.with_devnet(|devnet| devnet.base.anvil.endpoint_url())
     }
 
+    fn arbitrum_endpoint_url(&self) -> url::Url {
+        self.with_devnet(|devnet| devnet.arbitrum.anvil.endpoint_url())
+    }
+
     fn ethereum_ws_url(&self) -> String {
         self.with_devnet(|devnet| devnet.ethereum.anvil.ws_endpoint_url().to_string())
     }
 
     fn base_ws_url(&self) -> String {
         self.with_devnet(|devnet| devnet.base.anvil.ws_endpoint_url().to_string())
+    }
+
+    fn arbitrum_ws_url(&self) -> String {
+        self.with_devnet(|devnet| devnet.arbitrum.anvil.ws_endpoint_url().to_string())
     }
 
     fn ethereum_spoke_pool_address(&self) -> String {
@@ -136,6 +144,15 @@ impl TestHarness {
             format!(
                 "{:#x}",
                 devnet.base.mock_across_spoke_pool_contract.address()
+            )
+        })
+    }
+
+    fn arbitrum_spoke_pool_address(&self) -> String {
+        self.with_devnet(|devnet| {
+            format!(
+                "{:#x}",
+                devnet.arbitrum.mock_across_spoke_pool_contract.address()
             )
         })
     }
@@ -175,6 +192,10 @@ impl TestHarness {
 
     fn base_spawned_api_paymaster_private_key(&self) -> String {
         self.with_devnet(|devnet| anvil_spawned_api_paymaster_private_key(&devnet.base))
+    }
+
+    fn arbitrum_spawned_api_paymaster_private_key(&self) -> String {
+        self.with_devnet(|devnet| anvil_spawned_api_paymaster_private_key(&devnet.arbitrum))
     }
 
     async fn deal_bitcoin(
@@ -270,15 +291,16 @@ async fn harness() -> &'static TestHarness {
             .await
             .expect("base chain setup");
 
+            let arbitrum_rpc = devnet.arbitrum.anvil.endpoint();
             let arbitrum_chain = EvmChain::new_with_gas_sponsor(
-                &base_rpc,
+                &arbitrum_rpc,
                 MOCK_ERC20_ADDRESS,
                 ChainType::Arbitrum,
                 b"router-arbitrum-wallet",
                 2,
                 Duration::from_secs(2),
                 Some(EvmGasSponsorConfig {
-                    private_key: anvil_paymaster_private_key(&devnet.base),
+                    private_key: anvil_paymaster_private_key(&devnet.arbitrum),
                     vault_gas_buffer_wei: U256::from(EVM_PAYMASTER_VAULT_GAS_BUFFER_WEI),
                 }),
             )
@@ -493,9 +515,9 @@ fn test_router_args(
         base_rpc_url: harness.base_endpoint_url().to_string(),
         base_reference_token: MOCK_ERC20_ADDRESS.to_string(),
         base_paymaster_private_key: Some(harness.base_spawned_api_paymaster_private_key()),
-        arbitrum_rpc_url: harness.base_endpoint_url().to_string(),
+        arbitrum_rpc_url: harness.arbitrum_endpoint_url().to_string(),
         arbitrum_reference_token: MOCK_ERC20_ADDRESS.to_string(),
-        arbitrum_paymaster_private_key: Some(harness.base_spawned_api_paymaster_private_key()),
+        arbitrum_paymaster_private_key: Some(harness.arbitrum_spawned_api_paymaster_private_key()),
         evm_paymaster_vault_gas_buffer_wei: EVM_PAYMASTER_VAULT_GAS_BUFFER_WEI.to_string(),
         evm_paymaster_vault_gas_target_wei: None,
         bitcoin_rpc_url: harness.bitcoin_rpc_url(),
@@ -510,6 +532,9 @@ fn test_router_args(
         across_api_url: None,
         across_api_key: None,
         across_integrator_id: None,
+        cctp_api_url: None,
+        cctp_token_messenger_v2_address: None,
+        cctp_message_transmitter_v2_address: None,
         hyperunit_api_url: None,
         hyperunit_proxy_url: None,
         hyperliquid_api_url: None,
@@ -532,6 +557,7 @@ fn test_router_args(
         worker_refund_poll_seconds: 60,
         worker_order_execution_poll_seconds: 5,
         worker_route_cost_refresh_seconds: 300,
+        coinbase_price_api_base_url: "http://127.0.0.1:9".to_string(),
     }
 }
 
@@ -643,12 +669,13 @@ async fn mock_order_manager(
 /// real-path Across flow works end-to-end: the mock's `/swap/approval` response
 /// points at the harness's on-chain `MockSpokePool`, and the mock's indexer
 /// subscribes to that contract's `FundsDeposited` events on the harness's
-/// Anvil ws endpoint. The origin chain determines which of the two EVM devnets
-/// we wire: `"evm:8453"` → Base, `"evm:1"` → Ethereum.
+/// Anvil ws endpoint. The origin chain determines which EVM devnet we wire:
+/// `"evm:1"` → Ethereum, `"evm:8453"` → Base, `"evm:42161"` → Arbitrum.
 async fn spawn_harness_mocks(h: &TestHarness, origin_chain_id: &str) -> MockIntegratorServer {
     let (spoke_pool, ws_url) = match origin_chain_id {
         "evm:1" => (h.ethereum_spoke_pool_address(), h.ethereum_ws_url()),
         "evm:8453" => (h.base_spoke_pool_address(), h.base_ws_url()),
+        "evm:42161" => (h.arbitrum_spoke_pool_address(), h.arbitrum_ws_url()),
         other => panic!("spawn_harness_mocks: unsupported origin chain {other}"),
     };
     MockIntegratorServer::spawn_with_config(
@@ -1160,6 +1187,14 @@ async fn anvil_set_base_balance(h: &TestHarness, address: Address, amount: U256)
         .expect("anvil_set_balance on base");
 }
 
+async fn anvil_set_arbitrum_balance(h: &TestHarness, address: Address, amount: U256) {
+    let provider = ProviderBuilder::new().connect_http(h.arbitrum_endpoint_url());
+    provider
+        .anvil_set_balance(address, amount)
+        .await
+        .expect("anvil_set_balance on arbitrum");
+}
+
 async fn anvil_mint_erc20(h: &TestHarness, address: Address, amount: U256) {
     // Fresh random signer per call so parallel tests don't collide on nonces;
     // the mock ERC20's `mint` has no access control, so any funded EOA works.
@@ -1210,6 +1245,14 @@ async fn anvil_send_base_native(
     amount: U256,
 ) -> (String, u64) {
     anvil_send_native_on(h, h.base_endpoint_url(), recipient, amount).await
+}
+
+async fn anvil_send_arbitrum_native(
+    h: &TestHarness,
+    recipient: Address,
+    amount: U256,
+) -> (String, u64) {
+    anvil_send_native_on(h, h.arbitrum_endpoint_url(), recipient, amount).await
 }
 
 async fn anvil_send_native_on(
@@ -1337,9 +1380,9 @@ async fn funded_market_order_fixture_with_amount(
                 asset: AssetId::Native,
             },
             recipient_address: valid_evm_address(),
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: amount_in.to_string(),
-                min_amount_out: amount_in.to_string(),
+                slippage_bps: 100,
             },
         })
         .await
@@ -1371,6 +1414,7 @@ async fn funded_market_order_fixture_with_amount(
     match source_chain_id {
         "evm:1" => anvil_set_balance(h, vault_address, source_balance).await,
         "evm:8453" => anvil_set_base_balance(h, vault_address, source_balance).await,
+        "evm:42161" => anvil_set_arbitrum_balance(h, vault_address, source_balance).await,
         other => panic!("funded_market_order_fixture: unsupported source chain {other}"),
     }
     db.vaults()
@@ -1614,6 +1658,7 @@ async fn record_chain_detector_unit_deposit_hint(
     let (tx_hash, transfer_index) = match address.chain.as_str() {
         "evm:1" => anvil_send_ethereum_native(h, recipient, amount).await,
         "evm:8453" => anvil_send_base_native(h, recipient, amount).await,
+        "evm:42161" => anvil_send_arbitrum_native(h, recipient, amount).await,
         other => panic!(
             "record_chain_detector_unit_deposit_hint: unsupported chain {}",
             other
@@ -1734,6 +1779,7 @@ async fn fund_destination_execution_vault_from_across(db: &Database, order_id: U
     match destination_vault.chain.as_str() {
         "evm:1" => anvil_set_balance(h, address, balance).await,
         "evm:8453" => anvil_set_base_balance(h, address, balance).await,
+        "evm:42161" => anvil_set_arbitrum_balance(h, address, balance).await,
         other => panic!(
             "fund_destination_execution_vault_from_across: unsupported chain {}",
             other
@@ -1757,6 +1803,7 @@ async fn zero_source_deposit_vault_balance(db: &Database, order_id: Uuid, chain_
     match chain_id {
         "evm:1" => anvil_set_balance(h, address, U256::ZERO).await,
         "evm:8453" => anvil_set_base_balance(h, address, U256::ZERO).await,
+        "evm:42161" => anvil_set_arbitrum_balance(h, address, U256::ZERO).await,
         other => panic!("unsupported source chain for zeroing source deposit vault: {other}"),
     }
 }
@@ -1947,9 +1994,9 @@ async fn materialize_plan_failure_does_not_create_execution_attempt() {
                 asset: AssetId::Native,
             },
             recipient_address: valid_evm_address(),
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                min_amount_out: "1000".to_string(),
+                slippage_bps: 100,
             },
         })
         .await
@@ -2024,9 +2071,9 @@ async fn quote_market_order_persists_ephemeral_quote_without_order() {
                 asset: AssetId::Native,
             },
             recipient_address: valid_evm_address(),
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                min_amount_out: "1000".to_string(),
+                slippage_bps: 100,
             },
         })
         .await
@@ -2097,6 +2144,8 @@ async fn quote_market_order_persists_ephemeral_quote_without_order() {
         &stored_quote.provider_id,
         &["unit_deposit:unit", "unit_withdrawal:unit"],
     );
+    assert_eq!(stored_quote.slippage_bps, 100);
+    assert_eq!(stored_quote.min_amount_out.as_deref(), Some("990"));
     let public_quote = serde_json::to_value(
         response
             .quote
@@ -2116,6 +2165,7 @@ async fn quote_market_order_supports_velora_arbitrary_evm_start_and_end() {
     let dir = tempfile::tempdir().unwrap();
     let settings = Arc::new(test_settings(dir.path()));
     let action_providers = ActionProviderRegistry::http(
+        None,
         None,
         None,
         None,
@@ -2158,9 +2208,9 @@ async fn quote_market_order_supports_velora_arbitrary_evm_start_and_end() {
             from_asset: source_asset.clone(),
             to_asset: destination_asset.clone(),
             recipient_address: valid_evm_address(),
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000000000000000000".to_string(),
-                min_amount_out: "1".to_string(),
+                slippage_bps: 100,
             },
         })
         .await
@@ -2169,6 +2219,15 @@ async fn quote_market_order_supports_velora_arbitrary_evm_start_and_end() {
         .quote
         .as_market_order()
         .expect("market order quote");
+    let expected_min_out = ((U256::from_str_radix(&quote.amount_out, 10).unwrap()
+        * U256::from(9_900_u64))
+        / U256::from(10_000_u64))
+    .to_string();
+    assert_eq!(quote.slippage_bps, 100);
+    assert_eq!(
+        quote.min_amount_out.as_deref(),
+        Some(expected_min_out.as_str())
+    );
     let transitions = quote.provider_quote["transitions"]
         .as_array()
         .expect("serialized transitions");
@@ -2345,9 +2404,9 @@ async fn quote_market_order_exact_out_uses_exchange_provider_quote() {
                 asset: AssetId::Native,
             },
             recipient_address: valid_evm_address(),
-            order_kind: MarketOrderKind::ExactOut {
+            order_kind: MarketOrderQuoteKind::ExactOut {
                 amount_out: "1000".to_string(),
-                max_amount_in: "1500".to_string(),
+                slippage_bps: 100,
             },
         })
         .await
@@ -2362,6 +2421,8 @@ async fn quote_market_order_exact_out_uses_exchange_provider_quote() {
     assert!(market_quote.provider_id.contains("unit_withdrawal:unit"));
     assert_eq!(market_quote.order_kind, MarketOrderKindType::ExactOut);
     assert_eq!(market_quote.amount_in, "1000");
+    assert_eq!(market_quote.slippage_bps, 100);
+    assert_eq!(market_quote.max_amount_in.as_deref(), Some("1010"));
 }
 
 #[tokio::test]
@@ -2394,7 +2455,7 @@ async fn router_api_quote_and_order_flow_uses_production_component_initializatio
             "recipient_address": valid_evm_address(),
             "kind": "exact_in",
             "amount_in": "1000",
-            "min_amount_out": "1000"
+            "slippage_bps": 100
         }))
         .send()
         .await
@@ -2490,6 +2551,18 @@ async fn router_api_quote_and_order_flow_uses_production_component_initializatio
         Some(order.order.id)
     );
     assert_eq!(order.order.status, RouterOrderStatus::PendingFunding);
+    match &order.order.action {
+        RouterOrderAction::MarketOrder(action) => {
+            assert_eq!(action.slippage_bps, 100);
+            assert_eq!(
+                action.order_kind,
+                MarketOrderKind::ExactIn {
+                    amount_in: "1000".to_string(),
+                    min_amount_out: "990".to_string(),
+                }
+            );
+        }
+    }
     assert!(order.funding_vault.is_some());
     let funding_vault = order.funding_vault.as_ref().unwrap();
     assert_eq!(funding_vault.vault.order_id, Some(order.order.id));
@@ -2599,7 +2672,7 @@ async fn router_admin_provider_policy_drain_excludes_provider_from_new_quotes_im
         "recipient_address": valid_evm_address(),
         "kind": "exact_in",
         "amount_in": "1000",
-        "min_amount_out": "1000"
+        "slippage_bps": 100
     });
 
     let initial_quote = client
@@ -2707,7 +2780,7 @@ async fn router_api_and_worker_complete_mock_across_unit_flow_with_production_co
             "recipient_address": valid_evm_address(),
             "kind": "exact_in",
             "amount_in": "1000",
-            "min_amount_out": "1000"
+            "slippage_bps": 100
         }))
         .send()
         .await
@@ -2824,9 +2897,9 @@ async fn funding_pass_marks_order_vault_funded_after_detecting_evm_native_balanc
                 asset: AssetId::Native,
             },
             recipient_address: valid_evm_address(),
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                min_amount_out: "1000".to_string(),
+                slippage_bps: 100,
             },
         })
         .await
@@ -2885,9 +2958,9 @@ async fn funding_hints_validate_balance_once_and_mark_vault_funded() {
                 asset: AssetId::Native,
             },
             recipient_address: valid_evm_address(),
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                min_amount_out: "1000".to_string(),
+                slippage_bps: 100,
             },
         })
         .await
@@ -3064,7 +3137,7 @@ async fn route_minimum_service_computes_mock_base_usdc_to_btc_floor() {
     let hard_min = snapshot.hard_min_input_u256().unwrap();
     let operational_min = snapshot.operational_min_input_u256().unwrap();
 
-    assert!(snapshot.path.contains("across_bridge:across"));
+    assert!(snapshot.path.contains("cctp_bridge:cctp"));
     assert!(snapshot
         .path
         .contains("hyperliquid_bridge_deposit:hyperliquid_bridge"));
@@ -3095,9 +3168,9 @@ async fn quote_market_order_rejects_base_usdc_to_btc_below_operational_floor() {
                 asset: AssetId::Native,
             },
             recipient_address: valid_regtest_btc_address(),
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1".to_string(),
-                min_amount_out: "1".to_string(),
+                slippage_bps: 100,
             },
         })
         .await
@@ -3140,9 +3213,9 @@ async fn quote_market_order_allows_base_usdc_to_btc_at_operational_floor() {
             from_asset: source_asset,
             to_asset: destination_asset,
             recipient_address: valid_regtest_btc_address(),
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: snapshot.operational_min_input,
-                min_amount_out: "1".to_string(),
+                slippage_bps: 100,
             },
         })
         .await
@@ -3155,7 +3228,7 @@ async fn quote_market_order_allows_base_usdc_to_btc_at_operational_floor() {
             .expect("market order quote")
             .provider_id,
         &[
-            "across_bridge:across",
+            "cctp_bridge:cctp",
             "hyperliquid_bridge_deposit:hyperliquid_bridge",
             "hyperliquid_trade:hyperliquid",
             "unit_withdrawal:unit",
@@ -3183,9 +3256,9 @@ async fn quote_market_order_rejects_zero_amounts() {
                 asset: AssetId::Native,
             },
             recipient_address: valid_evm_address(),
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "0".to_string(),
-                min_amount_out: "1".to_string(),
+                slippage_bps: 100,
             },
         })
         .await
@@ -3214,9 +3287,9 @@ async fn create_vault_with_order_id_links_generic_order_to_vault() {
                 asset: AssetId::Native,
             },
             recipient_address: valid_evm_address(),
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                min_amount_out: "1000".to_string(),
+                slippage_bps: 100,
             },
         })
         .await
@@ -3853,9 +3926,9 @@ async fn order_executor_executes_provider_custody_action_intent() {
                 asset: AssetId::Native,
             },
             recipient_address: valid_evm_address(),
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: amount_in.to_string(),
-                min_amount_out: "1".to_string(),
+                slippage_bps: 100,
             },
         })
         .await
@@ -3942,9 +4015,9 @@ async fn provider_operations_store_protocol_addresses_outside_custody_vaults() {
                 asset: AssetId::Native,
             },
             recipient_address: valid_evm_address(),
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                min_amount_out: "1000".to_string(),
+                slippage_bps: 100,
             },
         })
         .await
@@ -4173,9 +4246,9 @@ async fn market_order_route_planner_uses_direct_unit_when_source_is_unit_ingress
                 asset: AssetId::Native,
             },
             recipient_address: valid_evm_address(),
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                min_amount_out: "1000".to_string(),
+                slippage_bps: 100,
             },
         })
         .await
@@ -4269,9 +4342,9 @@ async fn release_quote_after_vault_creation_failure_allows_order_retry() {
                 asset: AssetId::Native,
             },
             recipient_address: valid_evm_address(),
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                min_amount_out: "1000".to_string(),
+                slippage_bps: 100,
             },
         })
         .await
@@ -4390,6 +4463,7 @@ async fn expired_quote_cleanup_deletes_only_unassociated_quotes() {
                 amount_in: "1000".to_string(),
                 min_amount_out: "1000".to_string(),
             },
+            slippage_bps: 100,
         }),
         action_timeout_at: now + chrono::Duration::minutes(10),
         idempotency_key: None,
@@ -4449,6 +4523,7 @@ fn test_market_order_quote(
         amount_out: "1000".to_string(),
         min_amount_out: Some("1000".to_string()),
         max_amount_in: None,
+        slippage_bps: 100,
         provider_quote: json!({ "test": "quote_cleanup" }),
         expires_at,
         created_at: Utc::now(),
@@ -4475,9 +4550,9 @@ async fn market_order_route_planner_uses_across_only_when_unit_needs_ingress_bri
                 asset: AssetId::Native,
             },
             recipient_address: valid_evm_address(),
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                min_amount_out: "1000".to_string(),
+                slippage_bps: 100,
             },
         })
         .await
@@ -4604,9 +4679,9 @@ async fn market_order_route_planner_reserves_bitcoin_fee_for_unit_ingress() {
                 asset: AssetId::Native,
             },
             recipient_address: valid_evm_address(),
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000000".to_string(),
-                min_amount_out: "1".to_string(),
+                slippage_bps: 100,
             },
         })
         .await
@@ -4687,7 +4762,7 @@ async fn market_order_route_planner_reserves_bitcoin_fee_for_unit_ingress() {
 }
 
 #[tokio::test]
-async fn market_order_route_planner_supports_across_to_hyperliquid_bridge_path() {
+async fn market_order_route_planner_supports_cctp_to_hyperliquid_bridge_path() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
     let db = test_db().await;
@@ -4708,9 +4783,9 @@ async fn market_order_route_planner_supports_across_to_hyperliquid_bridge_path()
                 asset: AssetId::Native,
             },
             recipient_address: valid_regtest_btc_address(),
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "6000000".to_string(),
-                min_amount_out: "1".to_string(),
+                slippage_bps: 100,
             },
         })
         .await
@@ -4742,7 +4817,7 @@ async fn market_order_route_planner_supports_across_to_hyperliquid_bridge_path()
         gas_plan["policy"],
         json!("optimized_cross_chain_paymaster_v1")
     );
-    assert_eq!(gas_plan["debts"].as_array().unwrap().len(), 2);
+    assert_eq!(gas_plan["debts"].as_array().unwrap().len(), 3);
     assert_eq!(gas_plan["retention_actions"].as_array().unwrap().len(), 1);
     assert_eq!(
         gas_plan["retention_actions"][0]["settlement_chain_id"],
@@ -4782,6 +4857,13 @@ async fn market_order_route_planner_supports_across_to_hyperliquid_bridge_path()
     assert_eq!(
         plan.steps[1].output_asset,
         Some(DepositAsset {
+            chain: ChainId::parse("evm:42161").unwrap(),
+            asset: AssetId::Reference(arbitrum_usdc.clone()),
+        })
+    );
+    assert_eq!(
+        plan.steps[2].output_asset,
+        Some(DepositAsset {
             chain: ChainId::parse("hyperliquid").unwrap(),
             asset: AssetId::Native,
         })
@@ -4796,36 +4878,38 @@ async fn market_order_route_planner_supports_across_to_hyperliquid_bridge_path()
             .map(|step| step.step_type)
             .collect::<Vec<_>>(),
         vec![
-            OrderExecutionStepType::AcrossBridge,
+            OrderExecutionStepType::CctpBurn,
+            OrderExecutionStepType::CctpReceive,
             OrderExecutionStepType::HyperliquidBridgeDeposit,
             OrderExecutionStepType::HyperliquidTrade,
             OrderExecutionStepType::UnitWithdrawal,
         ]
     );
     assert_eq!(
-        plan.steps[1].request["source_custody_vault_role"],
+        plan.steps[2].request["source_custody_vault_role"],
         json!("destination_execution")
     );
     assert!(plan.steps[0].request.get("retention_actions").is_none());
     assert!(plan.steps[1].request.get("retention_actions").is_none());
+    assert!(plan.steps[2].request.get("retention_actions").is_none());
     assert_eq!(
-        plan.steps[2].request["prefund_from_withdrawable"],
+        plan.steps[3].request["prefund_from_withdrawable"],
         json!(true)
     );
     assert_eq!(
-        plan.steps[2].request["retention_actions"][0]["amount"],
+        plan.steps[3].request["retention_actions"][0]["amount"],
         gas_plan["retention_actions"][0]["amount"]
     );
     assert_eq!(
-        plan.steps[2].request["hyperliquid_custody_vault_role"],
+        plan.steps[3].request["hyperliquid_custody_vault_role"],
         json!("destination_execution")
     );
     assert_eq!(
-        plan.steps[2].request["hyperliquid_custody_vault_chain_id"],
+        plan.steps[3].request["hyperliquid_custody_vault_chain_id"],
         json!("evm:42161")
     );
     assert_eq!(
-        plan.steps[2].request["hyperliquid_custody_vault_asset_id"],
+        plan.steps[3].request["hyperliquid_custody_vault_asset_id"],
         json!(arbitrum_usdc)
     );
 }
@@ -4935,9 +5019,9 @@ async fn market_order_planning_pass_materializes_direct_unit_and_matches_mock_un
                 asset: AssetId::Native,
             },
             recipient_address: valid_evm_address(),
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                min_amount_out: "1000".to_string(),
+                slippage_bps: 100,
             },
         })
         .await
@@ -5000,7 +5084,7 @@ async fn market_order_planning_pass_materializes_direct_unit_and_matches_mock_un
 }
 
 #[tokio::test]
-async fn market_order_planning_pass_materializes_across_to_hyperliquid_bridge_and_hydrates_destination_execution_vault(
+async fn market_order_planning_pass_materializes_cctp_to_hyperliquid_bridge_and_hydrates_destination_execution_vault(
 ) {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -5023,9 +5107,9 @@ async fn market_order_planning_pass_materializes_across_to_hyperliquid_bridge_an
                 asset: AssetId::Native,
             },
             recipient_address: valid_regtest_btc_address(),
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "6000000".to_string(),
-                min_amount_out: "1".to_string(),
+                slippage_bps: 100,
             },
         })
         .await
@@ -5083,7 +5167,7 @@ async fn market_order_planning_pass_materializes_across_to_hyperliquid_bridge_an
         materialized[0].plan_kind,
         stored_quote.provider_quote["path_id"].as_str().unwrap()
     );
-    assert_eq!(materialized[0].inserted_steps, 4);
+    assert_eq!(materialized[0].inserted_steps, 5);
 
     let custody_vaults = db.orders().get_custody_vaults(order.id).await.unwrap();
     let destination_vault = custody_vaults
@@ -5109,25 +5193,48 @@ async fn market_order_planning_pass_materializes_across_to_hyperliquid_bridge_an
     assert_eq!(destination_vault.status, CustodyVaultStatus::Active);
 
     let steps = db.orders().get_execution_steps(order.id).await.unwrap();
-    let across_step = steps
+    let cctp_burn_step = steps
         .iter()
-        .find(|step| step.step_type == OrderExecutionStepType::AcrossBridge)
+        .find(|step| step.step_type == OrderExecutionStepType::CctpBurn)
         .unwrap();
-    let across_request: router_server::services::action_providers::AcrossExecuteStepRequest =
-        serde_json::from_value(across_step.request.clone()).unwrap();
-    assert_eq!(across_request.origin_chain_id, "evm:8453");
-    assert_eq!(across_request.destination_chain_id, "evm:42161");
-    assert!(across_step.request.get("retention_actions").is_none());
-    assert_eq!(across_step.amount_in.as_deref(), Some("6000000"));
+    let cctp_burn_request: router_server::services::action_providers::CctpBurnStepRequest =
+        serde_json::from_value(cctp_burn_step.request.clone()).unwrap();
+    assert_eq!(cctp_burn_request.source_chain_id, "evm:8453");
+    assert_eq!(cctp_burn_request.destination_chain_id, "evm:42161");
+    assert!(cctp_burn_step.request.get("retention_actions").is_none());
+    assert_eq!(cctp_burn_step.amount_in.as_deref(), Some("6000000"));
     assert_eq!(
-        across_step.request["recipient_custody_vault_role"],
+        cctp_burn_step.request["recipient_custody_vault_role"],
         json!("destination_execution")
     );
-    assert_eq!(across_request.recipient, destination_vault.address);
-    assert_eq!(across_request.refund_address, vault.deposit_vault_address);
     assert_eq!(
-        across_request.depositor_address,
-        vault.deposit_vault_address
+        cctp_burn_request.recipient_address,
+        destination_vault.address
+    );
+    assert_eq!(
+        cctp_burn_request.source_custody_vault_address.as_deref(),
+        Some(vault.deposit_vault_address.as_str())
+    );
+
+    let cctp_receive_step = steps
+        .iter()
+        .find(|step| step.step_type == OrderExecutionStepType::CctpReceive)
+        .unwrap();
+    let cctp_receive_request: router_server::services::action_providers::CctpReceiveStepRequest =
+        serde_json::from_value(cctp_receive_step.request.clone()).unwrap();
+    assert_eq!(
+        cctp_receive_request.burn_transition_decl_id,
+        cctp_burn_request.transition_decl_id
+    );
+    assert_eq!(cctp_receive_request.destination_chain_id, "evm:42161");
+    assert_eq!(cctp_receive_step.amount_in.as_deref(), Some("6000000"));
+    assert_eq!(
+        cctp_receive_request.source_custody_vault_address.as_deref(),
+        Some(destination_vault.address.as_str())
+    );
+    assert_eq!(
+        cctp_receive_request.source_custody_vault_id,
+        Some(destination_vault.id)
     );
 
     let hyperliquid_bridge_step = steps
@@ -5227,9 +5334,9 @@ async fn market_order_planning_pass_materializes_across_to_unit_and_matches_mock
                 asset: AssetId::Native,
             },
             recipient_address: valid_evm_address(),
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                min_amount_out: "1000".to_string(),
+                slippage_bps: 100,
             },
         })
         .await
@@ -5348,9 +5455,9 @@ async fn market_order_planning_hydrates_destination_execution_custody_vault() {
                 asset: AssetId::Native,
             },
             recipient_address: valid_evm_address(),
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                min_amount_out: "1000".to_string(),
+                slippage_bps: 100,
             },
         })
         .await
@@ -5489,9 +5596,9 @@ async fn order_executor_completes_mock_across_unit_hyperliquid_flow() {
                 asset: AssetId::Native,
             },
             recipient_address: valid_evm_address(),
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                min_amount_out: "1000".to_string(),
+                slippage_bps: 100,
             },
         })
         .await
@@ -5609,9 +5716,9 @@ async fn order_executor_completes_base_eth_to_btc_cross_token_flow() {
                 asset: AssetId::Native,
             },
             recipient_address: valid_regtest_btc_address(),
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: amount_in_wei.clone(),
-                min_amount_out: "1".to_string(),
+                slippage_bps: 100,
             },
         })
         .await
@@ -5730,9 +5837,9 @@ async fn order_executor_completes_btc_to_eth_unit_hyperliquid_flow() {
                 asset: AssetId::Native,
             },
             recipient_address: valid_evm_address(),
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: amount_in_sats.clone(),
-                min_amount_out: "1".to_string(),
+                slippage_bps: 100,
             },
         })
         .await
@@ -6929,9 +7036,9 @@ async fn order_executor_validates_chain_deposit_hint_before_next_step() {
                 asset: AssetId::Native,
             },
             recipient_address: valid_evm_address(),
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                min_amount_out: "1000".to_string(),
+                slippage_bps: 100,
             },
         })
         .await
@@ -7316,9 +7423,9 @@ async fn order_executor_retries_when_across_fails() {
                 asset: AssetId::Native,
             },
             recipient_address: valid_evm_address(),
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                min_amount_out: "1000".to_string(),
+                slippage_bps: 100,
             },
         })
         .await
@@ -8608,9 +8715,9 @@ async fn two_concurrent_worker_passes_drive_same_order_to_completion_exactly_onc
                 asset: AssetId::Native,
             },
             recipient_address: valid_evm_address(),
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                min_amount_out: "1000".to_string(),
+                slippage_bps: 100,
             },
         })
         .await
@@ -8743,9 +8850,9 @@ async fn two_concurrent_planning_passes_produce_single_destination_execution_vau
                 asset: AssetId::Native,
             },
             recipient_address: valid_evm_address(),
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                min_amount_out: "1000".to_string(),
+                slippage_bps: 100,
             },
         })
         .await
@@ -9794,9 +9901,9 @@ async fn vault_address_matches_deterministic_derivation_from_quote() {
                 asset: AssetId::Native,
             },
             recipient_address: valid_evm_address(),
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                min_amount_out: "1000".to_string(),
+                slippage_bps: 100,
             },
         })
         .await
@@ -9852,9 +9959,9 @@ async fn quote_envelope_never_exposes_deposit_address() {
                 asset: AssetId::Native,
             },
             recipient_address: valid_evm_address(),
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                min_amount_out: "1000".to_string(),
+                slippage_bps: 100,
             },
         })
         .await
