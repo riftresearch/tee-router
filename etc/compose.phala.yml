@@ -26,15 +26,12 @@ configs:
       host    all           all           127.0.0.1/32  scram-sha-256
       host    all           all           ::1/128       scram-sha-256
 
-      # Compose-network application traffic.
-      host    router_db     router_app    0.0.0.0/0     scram-sha-256
-      host    router_db     router_app    ::0/0         scram-sha-256
+      # Compose-network application traffic only.
+      host    router_db     router_app    172.30.0.0/16 scram-sha-256
 
-      # Logical replication traffic for the Railway replica path.
-      host    replication   replicator    0.0.0.0/0     scram-sha-256
-      host    replication   replicator    ::0/0         scram-sha-256
-      host    router_db     replicator    0.0.0.0/0     scram-sha-256
-      host    router_db     replicator    ::0/0         scram-sha-256
+      # Logical replication traffic through the public replication proxy only.
+      host    replication   replicator    172.31.0.0/16 scram-sha-256
+      host    router_db     replicator    172.31.0.0/16 scram-sha-256
 
   postgres-init:
     content: |
@@ -222,13 +219,30 @@ services:
       timeout: 5s
       retries: 10
       start_period: 20s
-    ports:
-      - "5432:5432"
     depends_on:
       pg-secret-generator:
         condition: service_completed_successfully
     networks:
       - router-network
+      - router-replication-network
+
+  postgres-replication-gateway:
+    image: alpine:3.22.1
+    container_name: router-postgres-replication-gateway
+    restart: unless-stopped
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        apk add --no-cache socat >/dev/null
+        exec socat TCP-LISTEN:5432,fork,reuseaddr TCP:postgres:5432
+    ports:
+      - "5432:5432"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - router-replication-network
 
   router-api:
     image: ghcr.io/riftresearch/tee-router:0.1.1
@@ -282,6 +296,15 @@ services:
 
 networks:
   router-network:
+    name: router-v3-private-network
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16
+  router-replication-network:
+    name: router-v3-replication-network
+    ipam:
+      config:
+        - subnet: 172.31.0.0/16
 
 volumes:
   router_postgres_data:

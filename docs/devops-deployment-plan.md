@@ -122,6 +122,10 @@ The old `etc/compose.phala.yml` already contains the pattern we want to adapt:
   replication path
 - the primary Postgres port is exposed as a literal Compose port so Phala can
   create the DB gateway endpoint for Railway replica setup
+- `pg_hba.conf` must not expose the router application DB user over the public
+  DB gateway; route public DB traffic through a dedicated replication proxy
+  network and keep that network limited to the read-only logical replication
+  user
 
 Required primary config:
 
@@ -143,6 +147,28 @@ The old names should be replaced with router-specific names where practical:
 - replication user: `replicator`
 - publication: `router_all_tables`
 - subscription: `router_subscription`
+
+The Phala compose stack should use separate fixed private subnets so Postgres
+can distinguish internal router API/worker traffic from public gateway traffic:
+
+```yaml
+networks:
+  router-network:
+    name: router-v3-private-network
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16
+  router-replication-network:
+    ipam:
+      config:
+        - subnet: 172.31.0.0/16
+```
+
+The public `5432` endpoint should not be published from the Postgres container
+itself. Publish it from a small TCP forwarding sidecar attached only to
+`router-replication-network`, then restrict `router_app` to
+`router-network` and `replicator` to `router-replication-network` in
+`pg_hba.conf`.
 
 ## Railway Read Replica
 
