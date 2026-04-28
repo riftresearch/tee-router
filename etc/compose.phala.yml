@@ -223,7 +223,7 @@ services:
       retries: 10
       start_period: 20s
     ports:
-      - "${POSTGRES_PUBLIC_PORT:-5432}:5432"
+      - "5432:5432"
     depends_on:
       pg-secret-generator:
         condition: service_completed_successfully
@@ -244,7 +244,7 @@ services:
         export DATABASE_URL="postgres://$${DB_USER}:$${DB_PASS}@postgres:5432/router_db"
         exec /usr/local/bin/router-api --host 0.0.0.0 --port "$${ROUTER_API_PORT:-4522}"
     ports:
-      - "${ROUTER_API_PUBLIC_PORT:-4522}:${ROUTER_API_PORT:-4522}"
+      - "4522:4522"
     volumes:
       - router_postgres_secrets:/run/postgres-secrets:ro
       - router_master_key:/run/router-secrets:ro

@@ -66,6 +66,18 @@ with `ROUTER_DETECTOR_API_KEY`.
 
 `router-worker` should not expose a public endpoint.
 
+Phala public endpoints are generated from literal Docker Compose `ports:`
+entries. Keep the externally reachable router API mapping literal:
+
+```yaml
+ports:
+  - "4522:4522"
+```
+
+Do not rely on environment-variable interpolation for Phala port declarations;
+the dashboard/API may fail to materialize public endpoints from interpolated
+port values.
+
 ## Container Image Strategy
 
 Build a public GHCR Docker image and push it from GitHub Actions.
@@ -108,6 +120,8 @@ The old `etc/compose.phala.yml` already contains the pattern we want to adapt:
 - publication is created for all router tables
 - `pg_hba.conf` allows the replication user to connect through the controlled
   replication path
+- the primary Postgres port is exposed as a literal Compose port so Phala can
+  create the DB gateway endpoint for Railway replica setup
 
 Required primary config:
 
@@ -162,6 +176,11 @@ by logical replication from the Phala primary.
 The new Phala DB endpoint shape is expected to match the old `PHALA_DB_SNI`
 model, but the exact new SNI value will not be known until the Phala stack is
 created.
+
+The `stunnel-v3` service lives on Railway, not inside the Phala compose stack.
+Phala exposes the primary Postgres TCP port and the gateway performs TLS
+termination before forwarding plaintext TCP to Postgres. Railway's `stunnel-v3`
+performs the client-side TLS-to-TCP conversion before `replica-setup` connects.
 
 ## Router Master Key
 
@@ -364,6 +383,9 @@ Router API and worker need the same core config:
    - router worker
    Use Phala-provided environment variables with `${VAR:?}` guards rather than
    hard-coded env values.
+   Exposed Phala service ports must be literal values, and existing CVMs must
+   be updated with Phala's `update_ports` API behavior when port mappings
+   change.
 4. Adapt primary Postgres config/init scripts from old `compose.phala.yml`.
 5. Adapt Railway replica setup from old `compose.replica.yml` into new v3
    services only.
