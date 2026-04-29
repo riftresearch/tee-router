@@ -208,6 +208,14 @@ Phala exposes the primary Postgres TCP port and the gateway performs TLS
 termination before forwarding plaintext TCP to Postgres. Railway's `stunnel-v3`
 performs the client-side TLS-to-TCP conversion before `replica-setup` connects.
 
+The repo contains Railway-specific helper images for this path:
+
+- `railway/router-replica-stunnel/` runs the client-side stunnel sidecar.
+- `railway/router-replica-setup/` runs the idempotent logical replica setup.
+
+Deploy these from the repo root so their Dockerfile `COPY` paths resolve
+against the repository layout.
+
 ## Router Master Key
 
 Router-derived vault addresses depend on a stable 64-byte router master key.

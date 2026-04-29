@@ -1,0 +1,9 @@
+foreground = yes
+debug = 5
+
+[phala-router-postgres]
+client = yes
+accept = :::${LISTEN_PORT}
+connect = ${PHALA_DB_SNI}:443
+sni = ${PHALA_DB_SNI}
+verifyChain = no
