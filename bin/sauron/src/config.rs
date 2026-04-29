@@ -1,7 +1,17 @@
 use std::{fs, path::PathBuf};
 
 use bitcoincore_rpc_async::Auth;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SauronReplicaEventSource {
+    /// Legacy mode: use replica-local LISTEN/NOTIFY trigger wiring.
+    Notify,
+    /// Physical-standby mode: consume a logical decoding slot on the standby.
+    Cdc,
+    /// No push/event source; rely only on the low-frequency reconcile loop.
+    Reconcile,
+}
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "sauron")]
@@ -14,6 +24,23 @@ pub struct SauronArgs {
     /// Replica database URL used for watch loading and notifications
     #[arg(long, env = "ROUTER_REPLICA_DATABASE_URL")]
     pub router_replica_database_url: String,
+
+    /// Writable Sauron state database URL.
+    ///
+    /// This stores detector cursors and CDC checkpoints. If omitted, Sauron
+    /// falls back to the router replica URL for backwards-compatible local
+    /// tests and the legacy writable logical-replica deployment.
+    #[arg(long, env = "SAURON_STATE_DATABASE_URL")]
+    pub sauron_state_database_url: Option<String>,
+
+    /// Source used to learn about router replica changes.
+    #[arg(
+        long,
+        env = "SAURON_REPLICA_EVENT_SOURCE",
+        value_enum,
+        default_value = "notify"
+    )]
+    pub sauron_replica_event_source: SauronReplicaEventSource,
 
     /// Replica database name, used for logging and operational clarity
     #[arg(
@@ -30,6 +57,22 @@ pub struct SauronArgs {
         default_value = "sauron_watch_set_changed"
     )]
     pub router_replica_notification_channel: String,
+
+    /// Logical decoding slot used when SAURON_REPLICA_EVENT_SOURCE=cdc.
+    #[arg(long, env = "SAURON_CDC_SLOT_NAME", default_value = "sauron_watch_cdc")]
+    pub sauron_cdc_slot_name: String,
+
+    /// Logical decoding plugin used when SAURON_REPLICA_EVENT_SOURCE=cdc.
+    #[arg(long, env = "SAURON_CDC_PLUGIN", default_value = "test_decoding")]
+    pub sauron_cdc_plugin: String,
+
+    /// Maximum logical-decoding rows to consume per CDC fetch.
+    #[arg(long, env = "SAURON_CDC_BATCH_SIZE", default_value_t = 1000)]
+    pub sauron_cdc_batch_size: i64,
+
+    /// CDC fetch interval when no changes are available.
+    #[arg(long, env = "SAURON_CDC_POLL_INTERVAL_MS", default_value_t = 1000)]
+    pub sauron_cdc_poll_interval_ms: u64,
 
     /// Base URL for the router server provider-operation hint route
     #[arg(long, env = "ROUTER_INTERNAL_BASE_URL")]

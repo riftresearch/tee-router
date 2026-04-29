@@ -415,7 +415,7 @@ async fn test_postgres() -> &'static TestPostgres {
                 };
             }
 
-            let image = GenericImage::new("postgres", "15-alpine")
+            let image = GenericImage::new("postgres", "18-alpine")
                 .with_exposed_port(POSTGRES_PORT.tcp())
                 .with_wait_for(WaitFor::message_on_stderr(
                     "database system is ready to accept connections",

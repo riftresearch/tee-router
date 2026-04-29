@@ -25,7 +25,7 @@ Run the router workspace tests with:
 cargo nextest run -p router-server
 ```
 
-For `cargo nextest`, the `vault_creation` integration target uses a setup script to start one shared `postgres:15-alpine` container and export `ROUTER_TEST_DATABASE_URL`. Direct `cargo test` runs still start a Postgres testcontainer from inside the test harness. To use an existing Postgres server instead, set `ROUTER_TEST_DATABASE_URL` to an admin database URL; the harness creates an isolated database per test.
+For `cargo nextest`, the `vault_creation` integration target uses a setup script to start one shared `postgres:18-alpine` container and export `ROUTER_TEST_DATABASE_URL`. Direct `cargo test` runs still start a Postgres testcontainer from inside the test harness. To use an existing Postgres server instead, set `ROUTER_TEST_DATABASE_URL` to an admin database URL; the harness creates an isolated database per test.
 
 ## EVM Vault Gas Sponsorship
 

@@ -29,7 +29,7 @@ configs:
       # Compose-network application traffic only.
       host    router_db     router_app    172.30.0.0/16 scram-sha-256
 
-      # Logical replication traffic through the public replication proxy only.
+      # Physical/logical replication traffic through the public replication proxy only.
       host    replication   replicator    172.31.0.0/16 scram-sha-256
       host    router_db     replicator    172.31.0.0/16 scram-sha-256
 
@@ -261,7 +261,7 @@ services:
       - router-network
 
   postgres:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     container_name: router-postgres-primary
     restart: unless-stopped
     environment:
@@ -272,7 +272,7 @@ services:
       REPLICA_USER: replicator
       REPLICA_PASSWORD: ${POSTGRES_REPLICA_PASSWORD:?set POSTGRES_REPLICA_PASSWORD}
     volumes:
-      - router_postgres_data:/var/lib/postgresql/data
+      - router_postgres_data:/var/lib/postgresql
       - router_postgres_secrets:/run/postgres-secrets:ro
     configs:
       - source: postgres-conf

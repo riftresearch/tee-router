@@ -19,4 +19,5 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 COPY --from=builder /app/target/release/sauron /app/
 COPY --from=builder /app/bin/sauron/migrations-replica /app/migrations-replica
+COPY --from=builder /app/bin/sauron/migrations-state /app/migrations-state
 CMD ["./sauron"]

@@ -1,4 +1,5 @@
 pub mod benchmarks;
+pub mod cdc;
 pub mod config;
 pub mod cursor;
 pub mod discovery;
@@ -7,6 +8,7 @@ pub mod provider_operations;
 pub mod replica_db;
 pub mod router_client;
 pub mod runtime;
+pub mod state_db;
 pub mod watch;
 
 pub use config::SauronArgs;

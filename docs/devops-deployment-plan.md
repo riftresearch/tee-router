@@ -22,8 +22,9 @@ using the same Docker image with different commands.
 
 Railway runs observer and supporting infrastructure:
 
-- `router-replica-db-v3`
-- `router-replica-setup-v3`
+- `router-replica-stunnel-v3`
+- `router-physical-standby-v3`
+- `sauron-state-db-v3`
 - `sauron-worker-v3`
 - `evm-token-indexer-ethereum-v3`
 - `evm-token-indexer-base-v3`
@@ -115,9 +116,11 @@ The old `etc/compose.phala.yml` already contains the pattern we want to adapt:
 
 - primary Postgres runs in the compose stack
 - app DB password is generated once into a persistent volume
-- Postgres is configured for logical replication
+- Postgres is configured with `wal_level = logical`
 - replication user is created during init
-- publication is created for all router tables
+- publication is created for all router tables while the old logical subscriber
+  exists
+- physical replication slots are allowed for the Railway standby
 - `pg_hba.conf` allows the replication user to connect through the controlled
   replication path
 - the primary Postgres port is exposed as a literal Compose port so Phala can
@@ -178,26 +181,21 @@ logical replication.
 
 The old `etc/compose.replica.yml` already contains the basic model:
 
-1. `stunnel` connects to the Phala DB SNI over `:443`.
-2. `postgres-replica` runs on Railway.
-3. `replica-setup` waits for both databases.
-4. `replica-setup` copies schema from primary with `pg_dump --schema-only`.
-5. `replica-setup` creates a logical subscription to the primary publication.
+1. `router-replica-stunnel-v3` connects to the Phala DB SNI over `:443`.
+2. `router-physical-standby-v3` runs on Railway from
+   `railway/router-physical-standby/`.
+3. The standby initializes itself with `pg_basebackup`.
+4. The standby uses a physical replication slot on the Phala primary.
+5. Sauron and the admin dashboard run heavy reads against the standby.
+6. Sauron consumes a logical decoding slot on the standby for watch-set events.
 
-For the router deployment, update the old replica setup script:
+Sauron connects to the Railway physical standby via
+`ROUTER_REPLICA_DATABASE_URL`.
 
-- use router database names
-- use router publication/subscription names
-- replace stale table checks such as `swaps` / `quotes` with current router
-  baseline tables
-- ensure setup is idempotent across restarts
-- preserve orphaned-slot cleanup behavior
-
-Sauron connects to the Railway replica via `ROUTER_REPLICA_DATABASE_URL`.
-
-The replica database must remain writable for Sauron-local tables such as
-backend cursors and Sauron replica migrations. Router-owned tables are populated
-by logical replication from the Phala primary.
+The physical standby is read-only. Sauron-local tables must live in
+`sauron-state-db-v3`, wired through `SAURON_STATE_DATABASE_URL`. This state DB
+stores detector cursors and CDC checkpoints only; router-owned schema and data
+derive from the primary through the physical standby.
 
 The new Phala DB endpoint shape is expected to match the old `PHALA_DB_SNI`
 model, but the exact new SNI value will not be known until the Phala stack is
@@ -211,7 +209,11 @@ performs the client-side TLS-to-TCP conversion before `replica-setup` connects.
 The repo contains Railway-specific helper images for this path:
 
 - `railway/router-replica-stunnel/` runs the client-side stunnel sidecar.
-- `railway/router-replica-setup/` runs the idempotent logical replica setup.
+- `railway/router-physical-standby/` runs the physical standby bootstrap and
+  Postgres process.
+
+`railway/router-replica-setup/` is the legacy logical-replica setup image and
+should only be kept while the old subscriber is still being retired.
 
 Deploy these from the repo root so their Dockerfile `COPY` paths resolve
 against the repository layout.
@@ -254,8 +256,11 @@ Sauron runs on Railway as `sauron-worker-v3`.
 Required inputs:
 
 - `ROUTER_REPLICA_DATABASE_URL` pointing at the Railway replica
+- `SAURON_STATE_DATABASE_URL` pointing at `sauron-state-db-v3`
+- `SAURON_REPLICA_EVENT_SOURCE=cdc`
+- `SAURON_CDC_SLOT_NAME=sauron_watch_cdc`
+- `SAURON_CDC_PLUGIN=test_decoding`
 - `ROUTER_REPLICA_DATABASE_NAME`
-- `ROUTER_REPLICA_NOTIFICATION_CHANNEL`
 - `ROUTER_INTERNAL_BASE_URL` pointing at the public Phala router API URL
 - `ROUTER_DETECTOR_API_KEY`
 - EVM RPC URLs
@@ -264,6 +269,11 @@ Required inputs:
 
 Sauron posts non-authoritative hints to the router API. Router-worker still
 validates provider and chain state before executing state transitions.
+
+Local tests may still use `SAURON_REPLICA_EVENT_SOURCE=notify` against a
+writable logical replica. Production physical-standby deployments should use
+`cdc`; do not run replica-local `LISTEN/NOTIFY` trigger migrations against the
+physical standby.
 
 ## EVM Token Indexers
 
@@ -467,10 +477,10 @@ the private collector can reach the endpoint through `*.railway.internal`.
    be updated with Phala's `update_ports` API behavior when port mappings
    change.
 4. Adapt primary Postgres config/init scripts from old `compose.phala.yml`.
-5. Adapt Railway replica setup from old `compose.replica.yml` into new v3
-   services only.
-6. Update replica schema checks for current router baseline tables.
-7. Configure `sauron-worker-v3` on Railway against the Railway replica.
+5. Deploy Railway `router-physical-standby-v3` and `sauron-state-db-v3`.
+6. Verify physical standby replay and logical decoding on the standby.
+7. Configure `sauron-worker-v3` on Railway against the physical standby and
+   state DB.
 8. Configure new Ponder token indexers on Railway with `-v3` service names.
 9. Publicly expose and lock down the existing HyperUnit SOCKS5 proxy, without
    `ALLOWED_IPS`.
@@ -479,7 +489,8 @@ the private collector can reach the endpoint through `*.railway.internal`.
     - Phala router API `/status`
     - primary DB migration
     - router-worker lease acquisition
-    - Railway replica subscription health
+    - Railway physical standby replay health
+    - Sauron CDC slot/checkpoint health
     - Sauron startup and watch sync
     - Ponder indexer health
     - Sauron hint submission to Phala router API

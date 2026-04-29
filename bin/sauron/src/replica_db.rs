@@ -6,8 +6,10 @@ use tracing::info;
 
 use crate::error::{ReplicaMigrationSnafu, Result};
 
-// These migrations target the logical subscriber / replica endpoint that Sauron
-// reads from. Keep replica-only objects, such as NOTIFY trigger wiring, here.
+// These migrations target the legacy writable logical subscriber endpoint that
+// Sauron reads from in LISTEN/NOTIFY mode. Do not run them against a physical
+// standby; physical standby mode consumes CDC and stores local state in the
+// Sauron state database instead.
 fn replica_migrations_dir() -> PathBuf {
     if let Some(path) = std::env::var_os("SAURON_REPLICA_MIGRATIONS_DIR") {
         return path.into();

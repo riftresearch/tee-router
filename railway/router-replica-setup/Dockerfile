@@ -1,4 +1,4 @@
-FROM postgres:16
+FROM postgres:18
 
 COPY railway/router-replica-setup/setup.sh /setup.sh
 

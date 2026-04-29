@@ -758,7 +758,7 @@ async fn test_postgres() -> TestPostgres {
         };
     }
 
-    let image = GenericImage::new("postgres", "15-alpine")
+    let image = GenericImage::new("postgres", "18-alpine")
         .with_exposed_port(POSTGRES_PORT.tcp())
         .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept connections",
@@ -1028,8 +1028,14 @@ async fn spawn_sauron(
     let args = SauronArgs {
         log_level: "warn".to_string(),
         router_replica_database_url: database_url.to_string(),
+        sauron_state_database_url: None,
+        sauron_replica_event_source: sauron::config::SauronReplicaEventSource::Notify,
         router_replica_database_name: "router_db".to_string(),
         router_replica_notification_channel: "sauron_watch_set_changed".to_string(),
+        sauron_cdc_slot_name: "sauron_watch_cdc".to_string(),
+        sauron_cdc_plugin: "test_decoding".to_string(),
+        sauron_cdc_batch_size: 1000,
+        sauron_cdc_poll_interval_ms: 1000,
         router_internal_base_url: router_base_url.to_string(),
         router_detector_api_key: "test-detector-secret".to_string(),
         electrum_http_server_url: devnet
@@ -1122,8 +1128,14 @@ fn live_sauron_args(
     SauronArgs {
         log_level: "info".to_string(),
         router_replica_database_url: database_url.to_string(),
+        sauron_state_database_url: None,
+        sauron_replica_event_source: sauron::config::SauronReplicaEventSource::Notify,
         router_replica_database_name: "router_db".to_string(),
         router_replica_notification_channel: "sauron_watch_set_changed".to_string(),
+        sauron_cdc_slot_name: "sauron_watch_cdc".to_string(),
+        sauron_cdc_plugin: "test_decoding".to_string(),
+        sauron_cdc_batch_size: 1000,
+        sauron_cdc_poll_interval_ms: 1000,
         router_internal_base_url: router_base_url.to_string(),
         router_detector_api_key: "test-detector-secret".to_string(),
         electrum_http_server_url: live.electrum_http_server_url.clone(),

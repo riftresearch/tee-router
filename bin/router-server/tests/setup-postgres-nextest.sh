@@ -13,7 +13,7 @@ fi
 
 run_id="${NEXTEST_RUN_ID:-manual-$$}"
 container_name="tee-router-nextest-postgres-${run_id//[^a-zA-Z0-9_.-]/-}"
-image="${ROUTER_TEST_POSTGRES_IMAGE:-postgres:15-alpine}"
+image="${ROUTER_TEST_POSTGRES_IMAGE:-postgres:18-alpine}"
 user="postgres"
 password="password"
 database="postgres"
