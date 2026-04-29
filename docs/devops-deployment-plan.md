@@ -22,7 +22,7 @@ using the same Docker image with different commands.
 
 Railway runs observer and supporting infrastructure:
 
-- `router-postgres-replica-v3`
+- `router-replica-db-v3`
 - `router-replica-setup-v3`
 - `sauron-worker-v3`
 - `evm-token-indexer-ethereum-v3`
