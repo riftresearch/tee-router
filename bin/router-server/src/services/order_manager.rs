@@ -351,12 +351,15 @@ impl OrderManager {
         }
 
         let now = Utc::now();
+        let order_id = Uuid::now_v7();
+        let workflow_trace = observability::current_workflow_trace_context()
+            .unwrap_or_else(|| fallback_workflow_trace_context(order_id));
         let refund_address = self.validate_and_normalize_refund_address(
             &quote.source_asset.chain,
             &request.refund_address,
         )?;
         let order = RouterOrder {
-            id: Uuid::now_v7(),
+            id: order_id,
             order_type: RouterOrderType::MarketOrder,
             status: RouterOrderStatus::Quoted,
             funding_vault_id: None,
@@ -370,6 +373,8 @@ impl OrderManager {
             }),
             action_timeout_at: now + MARKET_ORDER_ACTION_TIMEOUT,
             idempotency_key: normalize_idempotency_key(request.idempotency_key)?,
+            workflow_trace_id: workflow_trace.trace_id,
+            workflow_parent_span_id: workflow_trace.parent_span_id,
             created_at: now,
             updated_at: now,
         };
@@ -380,6 +385,7 @@ impl OrderManager {
             .create_market_order_from_quote(&order, quote.id)
             .await
             .map_err(MarketOrderError::database)?;
+        telemetry::record_order_workflow_event(&order, "order.created");
 
         Ok((order, quote))
     }
@@ -2149,6 +2155,19 @@ fn normalize_idempotency_key(value: Option<String>) -> MarketOrderResult<Option<
         });
     }
     Ok(Some(value))
+}
+
+fn fallback_workflow_trace_context(order_id: Uuid) -> observability::WorkflowTraceContext {
+    let trace_id = order_id.simple().to_string();
+    let mut parent_span_id = trace_id[16..32].to_string();
+    if parent_span_id == "0000000000000000" {
+        parent_span_id = "0000000000000001".to_string();
+    }
+
+    observability::WorkflowTraceContext {
+        trace_id,
+        parent_span_id,
+    }
 }
 
 fn is_better_quote(

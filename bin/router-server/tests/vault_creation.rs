@@ -23,7 +23,7 @@ use router_primitives::ChainType;
 use router_server::{
     api::{
         CreateOrderRequest, CreateVaultRequest, MarketOrderQuoteKind, MarketOrderQuoteRequest,
-        ProviderPolicyEnvelope, ProviderPolicyListEnvelope,
+        OrderFlowEnvelope, ProviderPolicyEnvelope, ProviderPolicyListEnvelope,
     },
     app::{initialize_components, PaymasterMode, RouterComponents},
     config::Settings,
@@ -592,6 +592,7 @@ async fn spawn_router_api_from_components_with_auth(
 ) -> (String, tokio::task::JoinHandle<()>) {
     let app = build_api_router(
         AppState {
+            db: components.db,
             vault_manager: components.vault_manager,
             order_manager: components.order_manager,
             order_execution_manager: components.order_execution_manager,
@@ -2437,6 +2438,7 @@ async fn router_api_quote_and_order_flow_uses_production_component_initializatio
     args.across_api_key = Some("mock-across-api-key".to_string());
     args.hyperunit_api_url = Some(mocks.base_url().to_string());
     args.hyperliquid_api_url = Some(mocks.base_url().to_string());
+    args.router_admin_api_key = Some("test-admin-key".to_string());
     let (base_url, api_task) = spawn_router_api(args).await;
     let client = reqwest::Client::new();
 
@@ -2578,6 +2580,41 @@ async fn router_api_quote_and_order_flow_uses_production_component_initializatio
         .unwrap();
     assert_eq!(fetched_order.order.id, order.order.id);
     assert!(fetched_order.funding_vault.is_some());
+
+    let unauthenticated_flow = client
+        .get(format!(
+            "{base_url}/internal/v1/orders/{}/flow",
+            order.order.id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        unauthenticated_flow.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+
+    let flow_response = client
+        .get(format!(
+            "{base_url}/internal/v1/orders/{}/flow",
+            order.order.id
+        ))
+        .bearer_auth("test-admin-key")
+        .send()
+        .await
+        .unwrap();
+    let status = flow_response.status();
+    let body = flow_response.text().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+    let flow: OrderFlowEnvelope = serde_json::from_str(&body).unwrap();
+    assert_eq!(flow.flow.order.id, order.order.id);
+    assert_eq!(flow.flow.trace.trace_id, order.order.workflow_trace_id);
+    assert_eq!(
+        flow.flow.trace.parent_span_id,
+        order.order.workflow_parent_span_id
+    );
+    assert_eq!(flow.flow.progress.total_steps, 0);
+    assert!(flow.flow.quote.is_some());
 
     api_task.abort();
 }
@@ -4449,8 +4486,9 @@ async fn expired_quote_cleanup_deletes_only_unassociated_quotes() {
         .await
         .unwrap();
 
+    let order_id = Uuid::now_v7();
     let order = RouterOrder {
-        id: Uuid::now_v7(),
+        id: order_id,
         order_type: RouterOrderType::MarketOrder,
         status: RouterOrderStatus::Quoted,
         funding_vault_id: None,
@@ -4467,6 +4505,8 @@ async fn expired_quote_cleanup_deletes_only_unassociated_quotes() {
         }),
         action_timeout_at: now + chrono::Duration::minutes(10),
         idempotency_key: None,
+        workflow_trace_id: order_id.simple().to_string(),
+        workflow_parent_span_id: "1111111111111111".to_string(),
         created_at: now,
         updated_at: now,
     };

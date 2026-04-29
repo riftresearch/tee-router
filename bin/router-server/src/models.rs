@@ -172,6 +172,8 @@ pub struct RouterOrder {
     pub action: RouterOrderAction,
     pub action_timeout_at: DateTime<Utc>,
     pub idempotency_key: Option<String>,
+    pub workflow_trace_id: String,
+    pub workflow_parent_span_id: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

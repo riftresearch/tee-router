@@ -31,6 +31,8 @@ const ORDER_SELECT_COLUMNS: &str = r#"
     ro.refund_address,
     ro.action_timeout_at,
     ro.idempotency_key,
+    ro.workflow_trace_id,
+    ro.workflow_parent_span_id,
     ro.created_at,
     ro.updated_at,
     moa.order_kind AS market_order_kind,
@@ -285,12 +287,14 @@ impl OrderRepository {
                     refund_address,
                     action_timeout_at,
                     idempotency_key,
+                    workflow_trace_id,
+                    workflow_parent_span_id,
                     created_at,
                     updated_at
                 )
                 VALUES (
                     $1, $2, $3, $4, $5, $6, $7, $8, $9,
-                    $10, $11, $12, $13, $14
+                    $10, $11, $12, $13, $14, $15, $16
                 )
                 "#,
             )
@@ -306,6 +310,8 @@ impl OrderRepository {
             .bind(&order.refund_address)
             .bind(order.action_timeout_at)
             .bind(order.idempotency_key.clone())
+            .bind(&order.workflow_trace_id)
+            .bind(&order.workflow_parent_span_id)
             .bind(order.created_at)
             .bind(order.updated_at)
             .execute(&mut *tx)
@@ -2570,6 +2576,8 @@ impl OrderRepository {
             action,
             action_timeout_at: row.get("action_timeout_at"),
             idempotency_key: row.get("idempotency_key"),
+            workflow_trace_id: row.get("workflow_trace_id"),
+            workflow_parent_span_id: row.get("workflow_parent_span_id"),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
         })

@@ -1096,6 +1096,7 @@ impl OrderExecutionManager {
                 .get(order.id)
                 .await
                 .map_err(|source| OrderExecutionError::Database { source })?;
+            telemetry::record_order_workflow_event(&order, "order.refund_required");
             let _ = self
                 .finalize_internal_custody_vaults_for_order(&order)
                 .await?;
@@ -1199,6 +1200,10 @@ impl OrderExecutionManager {
         let _ = self
             .finalize_internal_custody_vaults_for_order(&refreshed)
             .await?;
+        telemetry::record_order_workflow_event(
+            &refreshed,
+            "order.refund_manual_intervention_required",
+        );
         Ok(true)
     }
 
@@ -1206,16 +1211,26 @@ impl OrderExecutionManager {
         &self,
         hint: OrderProviderOperationHint,
     ) -> OrderExecutionResult<OrderProviderOperationHint> {
-        self.db
+        let operation = self
+            .db
             .orders()
             .get_provider_operation(hint.provider_operation_id)
             .await
             .map_err(|source| OrderExecutionError::Database { source })?;
-        self.db
+        let persisted = self
+            .db
             .orders()
             .create_provider_operation_hint(&hint)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })
+            .map_err(|source| OrderExecutionError::Database { source })?;
+        self.try_record_provider_operation_hint_workflow_event(
+            operation.order_id,
+            &persisted,
+            &operation,
+            "provider_operation.hint_recorded",
+        )
+        .await;
+        Ok(persisted)
     }
 
     /// Load a provider operation by id and dispatch it to the matching provider's
@@ -1486,6 +1501,13 @@ impl OrderExecutionManager {
             .get_provider_operation(hint.provider_operation_id)
             .await
             .map_err(|source| OrderExecutionError::Database { source })?;
+        self.try_record_provider_operation_hint_workflow_event(
+            operation.order_id,
+            hint,
+            &operation,
+            "provider_operation.hint_validation_started",
+        )
+        .await;
         match operation.status {
             ProviderOperationStatus::Completed
             | ProviderOperationStatus::Failed
@@ -1850,7 +1872,10 @@ impl OrderExecutionManager {
                 )
                 .await
             {
-                Ok(order) => order,
+                Ok(order) => {
+                    telemetry::record_order_workflow_event(&order, "order.funded");
+                    order
+                }
                 Err(RouterServerError::NotFound) => {
                     // Another worker won the PendingFunding→Funded CAS. Re-read
                     // and proceed iff the order is now in a plannable state.
@@ -1878,6 +1903,7 @@ impl OrderExecutionManager {
             .get_market_order_quote(order.id)
             .await
             .map_err(|source| OrderExecutionError::Database { source })?;
+        telemetry::record_order_workflow_event(&order, "order.execution_plan_started");
         let plan = self
             .market_order_planner
             .plan(&order, &vault, &quote, Utc::now())
@@ -1904,6 +1930,7 @@ impl OrderExecutionManager {
             .create_execution_steps_idempotent(&steps)
             .await
             .map_err(|source| OrderExecutionError::Database { source })?;
+        telemetry::record_order_workflow_event(&order, "order.execution_plan_materialized");
         let persisted_steps = self
             .db
             .orders()
@@ -3382,6 +3409,7 @@ impl OrderExecutionManager {
             {
                 Ok(order) => {
                     progressed = true;
+                    telemetry::record_order_workflow_event(&order, "order.executing");
                     order
                 }
                 Err(RouterServerError::NotFound) => return Ok(None),
@@ -3400,6 +3428,7 @@ impl OrderExecutionManager {
             {
                 Ok(order) => {
                     progressed = true;
+                    telemetry::record_order_workflow_event(&order, "order.refunding");
                     order
                 }
                 Err(RouterServerError::NotFound) => return Ok(None),
@@ -3507,7 +3536,10 @@ impl OrderExecutionManager {
             )
             .await
         {
-            Ok(_) => progressed = true,
+            Ok(completed) => {
+                progressed = true;
+                telemetry::record_order_workflow_event(&completed, "order.completed");
+            }
             Err(RouterServerError::NotFound) => {}
             Err(source) => return Err(OrderExecutionError::Database { source }),
         }
@@ -3576,6 +3608,7 @@ impl OrderExecutionManager {
         self.enforce_provider_execution_policy(step.provider.as_str(), "execution")
             .await?;
         let step_id = step.id;
+        let order = self.try_load_workflow_order(step.order_id).await;
         let running = match self
             .db
             .orders()
@@ -3596,10 +3629,17 @@ impl OrderExecutionManager {
             }
             Err(source) => return Err(OrderExecutionError::Database { source }),
         };
+        if let Some(order) = &order {
+            telemetry::record_execution_step_workflow_event(
+                order,
+                &running,
+                "execution_step.started",
+            );
+        }
         let completion = match self.execute_running_step(&running).await {
             Ok(completion) => completion,
             Err(err) => {
-                if let Err(mark_err) = self
+                match self
                     .db
                     .orders()
                     .fail_execution_step(
@@ -3611,17 +3651,28 @@ impl OrderExecutionManager {
                     )
                     .await
                 {
-                    // Mark-failed losing its CAS (status != 'running') is benign —
-                    // someone else drove the step to a terminal state. Any other
-                    // DB error is surfaced so operators see the step wedged in
-                    // Running rather than silently losing the original cause.
-                    if !matches!(mark_err, RouterServerError::NotFound) {
-                        warn!(
-                            %step_id,
-                            original_error = %err,
-                            mark_failed_error = %mark_err,
-                            "failed to mark step failed after execution error",
-                        );
+                    Ok(failed_step) => {
+                        if let Some(order) = &order {
+                            telemetry::record_execution_step_workflow_event(
+                                order,
+                                &failed_step,
+                                "execution_step.failed",
+                            );
+                        }
+                    }
+                    Err(mark_err) => {
+                        // Mark-failed losing its CAS (status != 'running') is benign —
+                        // someone else drove the step to a terminal state. Any other
+                        // DB error is surfaced so operators see the step wedged in
+                        // Running rather than silently losing the original cause.
+                        if !matches!(mark_err, RouterServerError::NotFound) {
+                            warn!(
+                                %step_id,
+                                original_error = %err,
+                                mark_failed_error = %mark_err,
+                                "failed to mark step failed after execution error",
+                            );
+                        }
                     }
                 }
                 self.maybe_inject_crash(OrderExecutionCrashPoint::AfterStepMarkedFailed);
@@ -3631,7 +3682,8 @@ impl OrderExecutionManager {
 
         match completion.outcome {
             RunningStepOutcome::Completed => {
-                self.db
+                let completed_step = self
+                    .db
                     .orders()
                     .complete_execution_step(
                         running.id,
@@ -3641,9 +3693,17 @@ impl OrderExecutionManager {
                     )
                     .await
                     .map_err(|source| OrderExecutionError::Database { source })?;
+                if let Some(order) = &order {
+                    telemetry::record_execution_step_workflow_event(
+                        order,
+                        &completed_step,
+                        "execution_step.completed",
+                    );
+                }
             }
             RunningStepOutcome::Waiting => {
-                self.db
+                let waiting_step = self
+                    .db
                     .orders()
                     .wait_execution_step(
                         running.id,
@@ -3653,6 +3713,13 @@ impl OrderExecutionManager {
                     )
                     .await
                     .map_err(|source| OrderExecutionError::Database { source })?;
+                if let Some(order) = &order {
+                    telemetry::record_execution_step_workflow_event(
+                        order,
+                        &waiting_step,
+                        "execution_step.waiting_external",
+                    );
+                }
             }
         }
         self.maybe_inject_crash(OrderExecutionCrashPoint::AfterExecutionStepStatusPersisted);
@@ -4418,6 +4485,12 @@ impl OrderExecutionManager {
                 })
                 .await
                 .map_err(|source| OrderExecutionError::Database { source })?;
+            self.try_record_provider_operation_workflow_event(
+                step.order_id,
+                operation_id,
+                "provider_operation.persisted",
+            )
+            .await;
             Some(operation_id)
         } else {
             None
@@ -4484,6 +4557,11 @@ impl OrderExecutionManager {
         let order = self
             .settle_order_after_provider_status_update(&operation)
             .await?;
+        telemetry::record_provider_operation_workflow_event(
+            &order,
+            &operation,
+            "provider_operation.status_updated",
+        );
 
         Ok(ProviderOperationStatusUpdateOutcome {
             operation,
@@ -4494,6 +4572,58 @@ impl OrderExecutionManager {
 
     fn maybe_inject_crash(&self, point: OrderExecutionCrashPoint) {
         self.crash_injector.trigger(point);
+    }
+
+    async fn try_load_workflow_order(&self, order_id: Uuid) -> Option<RouterOrder> {
+        match self.db.orders().get(order_id).await {
+            Ok(order) => Some(order),
+            Err(source) => {
+                warn!(
+                    %order_id,
+                    error = %source,
+                    "failed to load order for workflow telemetry",
+                );
+                None
+            }
+        }
+    }
+
+    async fn try_record_provider_operation_workflow_event(
+        &self,
+        order_id: Uuid,
+        operation_id: Uuid,
+        event: &'static str,
+    ) {
+        let Some(order) = self.try_load_workflow_order(order_id).await else {
+            return;
+        };
+        let operation = match self.db.orders().get_provider_operation(operation_id).await {
+            Ok(operation) => operation,
+            Err(source) => {
+                warn!(
+                    %order_id,
+                    %operation_id,
+                    error = %source,
+                    "failed to load provider operation for workflow telemetry",
+                );
+                return;
+            }
+        };
+        telemetry::record_provider_operation_workflow_event(&order, &operation, event);
+    }
+
+    async fn try_record_provider_operation_hint_workflow_event(
+        &self,
+        order_id: Uuid,
+        hint: &OrderProviderOperationHint,
+        operation: &OrderProviderOperation,
+        event: &'static str,
+    ) {
+        if let Some(order) = self.try_load_workflow_order(order_id).await {
+            telemetry::record_provider_operation_hint_workflow_event(
+                &order, hint, operation, event,
+            );
+        }
     }
 
     async fn load_status_update_provider_operation(
@@ -4713,6 +4843,14 @@ impl OrderExecutionManager {
             .transition_status(order.id, from_status, to_status, Utc::now())
             .await
             .map_err(|source| OrderExecutionError::Database { source })?;
+        telemetry::record_order_workflow_event(
+            &order,
+            match to_status {
+                RouterOrderStatus::Completed => "order.completed",
+                RouterOrderStatus::Refunded => "order.refunded",
+                _ => "order.terminal",
+            },
+        );
         match self
             .db
             .orders()
@@ -4777,6 +4915,7 @@ impl OrderExecutionManager {
         let _ = self
             .finalize_internal_custody_vaults_for_order(&order)
             .await?;
+        telemetry::record_order_workflow_event(&order, "order.refunded");
         Ok(true)
     }
 
@@ -7749,6 +7888,8 @@ mod tests {
             }),
             action_timeout_at: Utc::now() + chrono::Duration::hours(1),
             idempotency_key: None,
+            workflow_trace_id: order_id.simple().to_string(),
+            workflow_parent_span_id: "1111111111111111".to_string(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

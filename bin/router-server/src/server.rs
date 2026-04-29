@@ -1,11 +1,11 @@
 use crate::{
     api::{
         CreateOrderCancellationRequest, CreateOrderRequest, CreateQuoteRequest, CreateVaultRequest,
-        DetectorHintEnvelope, DetectorHintRequest, DetectorHintTarget,
-        ProviderOperationHintEnvelope, ProviderOperationHintRequest,
-        ProviderOperationObserveRequest, ProviderPolicyEnvelope, ProviderPolicyListEnvelope,
-        QuoteRequestType, UpdateProviderPolicyRequest, VaultFundingHintEnvelope,
-        VaultFundingHintRequest,
+        DetectorHintEnvelope, DetectorHintRequest, DetectorHintTarget, OrderFlow,
+        OrderFlowEnvelope, OrderFlowProgress, OrderFlowTrace, ProviderOperationHintEnvelope,
+        ProviderOperationHintRequest, ProviderOperationObserveRequest, ProviderPolicyEnvelope,
+        ProviderPolicyListEnvelope, QuoteRequestType, UpdateProviderPolicyRequest,
+        VaultFundingHintEnvelope, VaultFundingHintRequest,
     },
     app::{initialize_components, PaymasterMode, RouterComponents},
     error::{RouterServerError, RouterServerResult},
@@ -87,6 +87,7 @@ impl AdminApiAuth {
 
 #[derive(Clone)]
 pub struct AppState {
+    pub db: crate::db::Database,
     pub vault_manager: Arc<VaultManager>,
     pub order_manager: Arc<OrderManager>,
     pub order_execution_manager: Arc<OrderExecutionManager>,
@@ -106,6 +107,7 @@ pub async fn run_api(args: RouterServerArgs) -> Result<()> {
 async fn serve_api(args: RouterServerArgs, components: RouterComponents) -> Result<()> {
     let addr = SocketAddr::from((args.host, args.port));
     let state = AppState {
+        db: components.db,
         vault_manager: components.vault_manager,
         order_manager: components.order_manager,
         order_execution_manager: components.order_execution_manager,
@@ -160,6 +162,7 @@ pub fn build_api_router(state: AppState, cors_domain: Option<String>) -> Router 
             "/internal/v1/provider-policies/:provider",
             put(update_provider_policy),
         )
+        .route("/internal/v1/orders/:id/flow", get(get_order_flow))
         .route("/api/v1/chains/:chain/tip", get(get_chain_tip))
         .with_state(state)
         .layer(
@@ -322,6 +325,7 @@ async fn create_order(
         }
     };
     let order = state.order_manager.get_order(order.id).await?;
+    crate::telemetry::record_order_workflow_event(&order, "order.funding_vault_created");
     let response = order_response(state.clone(), order, Some(vault)).await?;
     Ok((StatusCode::CREATED, Json(response)))
 }
@@ -469,6 +473,16 @@ async fn record_vault_funding_hint_inner(
             updated_at: now,
         })
         .await?;
+    if let Ok(vault) = state.db.vaults().get(id).await {
+        if let Some(order_id) = vault.order_id {
+            if let Ok(order) = state.db.orders().get(order_id).await {
+                crate::telemetry::record_order_workflow_event(
+                    &order,
+                    "funding_vault.hint_recorded",
+                );
+            }
+        }
+    }
     Ok(hint)
 }
 
@@ -520,6 +534,42 @@ async fn update_provider_policy(
         )
         .await?;
     Ok(Json(ProviderPolicyEnvelope { policy }))
+}
+
+async fn get_order_flow(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> RouterServerResult<Json<OrderFlowEnvelope>> {
+    authorize_admin_api_request(&state, &headers)?;
+    let order = state.db.orders().get(id).await?;
+    let quote = match state.db.orders().get_market_order_quote(id).await {
+        Ok(quote) => Some(quote),
+        Err(RouterServerError::NotFound) => None,
+        Err(err) => return Err(err),
+    };
+    let attempts = state.db.orders().get_execution_attempts(id).await?;
+    let steps = state.db.orders().get_execution_steps(id).await?;
+    let provider_operations = state.db.orders().get_provider_operations(id).await?;
+    let custody_vaults = state.db.orders().get_custody_vaults(id).await?;
+    let progress = OrderFlowProgress::from_parts(&order, &steps, &provider_operations);
+    let trace = OrderFlowTrace {
+        trace_id: order.workflow_trace_id.clone(),
+        parent_span_id: order.workflow_parent_span_id.clone(),
+    };
+
+    Ok(Json(OrderFlowEnvelope {
+        flow: OrderFlow {
+            order,
+            trace,
+            progress,
+            quote,
+            attempts,
+            steps,
+            provider_operations,
+            custody_vaults,
+        },
+    }))
 }
 
 fn authorize_internal_api_request(state: &AppState, headers: &HeaderMap) -> RouterServerResult<()> {

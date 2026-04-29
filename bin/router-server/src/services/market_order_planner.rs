@@ -1688,6 +1688,8 @@ mod tests {
             }),
             action_timeout_at: now + chrono::Duration::minutes(10),
             idempotency_key: None,
+            workflow_trace_id: order_id.simple().to_string(),
+            workflow_parent_span_id: "1111111111111111".to_string(),
             created_at: now,
             updated_at: now,
         };
@@ -1815,6 +1817,8 @@ mod tests {
             }),
             action_timeout_at: now + chrono::Duration::minutes(10),
             idempotency_key: None,
+            workflow_trace_id: order_id.simple().to_string(),
+            workflow_parent_span_id: "1111111111111111".to_string(),
             created_at: now,
             updated_at: now,
         };
@@ -1974,6 +1978,8 @@ mod tests {
             }),
             action_timeout_at: now + chrono::Duration::minutes(10),
             idempotency_key: None,
+            workflow_trace_id: order_id.simple().to_string(),
+            workflow_parent_span_id: "1111111111111111".to_string(),
             created_at: now,
             updated_at: now,
         };

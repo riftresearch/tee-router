@@ -4,7 +4,13 @@ use std::{
 };
 
 use metrics_exporter_prometheus::PrometheusBuilder;
-use opentelemetry::{global, trace::TracerProvider as _, KeyValue};
+use opentelemetry::{
+    global,
+    trace::{
+        SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState, TracerProvider as _,
+    },
+    Context, KeyValue,
+};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::{Protocol, WithExportConfig};
 use opentelemetry_sdk::{
@@ -13,6 +19,7 @@ use opentelemetry_sdk::{
     Resource,
 };
 use tracing_opentelemetry::OpenTelemetryLayer;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tracing_subscriber::registry::LookupSpan;
 
 const METRICS_BIND_ADDR_ENV: &str = "METRICS_BIND_ADDR";
@@ -23,6 +30,78 @@ const RAILWAY_PRIVATE_DOMAIN_ENV: &str = "RAILWAY_PRIVATE_DOMAIN";
 const OTLP_ENDPOINT_ENV: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
 const OTLP_TRACES_ENDPOINT_ENV: &str = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT";
 const OTLP_LOGS_ENDPOINT_ENV: &str = "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowTraceContext {
+    pub trace_id: String,
+    pub parent_span_id: String,
+}
+
+impl WorkflowTraceContext {
+    pub fn new(trace_id: impl Into<String>, parent_span_id: impl Into<String>) -> Option<Self> {
+        let trace_id = trace_id.into();
+        let parent_span_id = parent_span_id.into();
+        if parse_trace_ids(&trace_id, &parent_span_id).is_some() {
+            Some(Self {
+                trace_id,
+                parent_span_id,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+pub fn current_workflow_trace_context() -> Option<WorkflowTraceContext> {
+    let context = tracing::Span::current().context();
+    let span_context = context.span().span_context().clone();
+    if !span_context.is_valid() {
+        return None;
+    }
+
+    Some(WorkflowTraceContext {
+        trace_id: span_context.trace_id().to_string(),
+        parent_span_id: span_context.span_id().to_string(),
+    })
+}
+
+pub fn set_workflow_parent(span: &tracing::Span, context: &WorkflowTraceContext) -> bool {
+    let Some((trace_id, parent_span_id)) =
+        parse_trace_ids(&context.trace_id, &context.parent_span_id)
+    else {
+        return false;
+    };
+    let span_context = SpanContext::new(
+        trace_id,
+        parent_span_id,
+        TraceFlags::SAMPLED,
+        true,
+        TraceState::NONE,
+    );
+    span.set_parent(Context::new().with_remote_span_context(span_context))
+        .is_ok()
+}
+
+fn parse_trace_ids(trace_id: &str, span_id: &str) -> Option<(TraceId, SpanId)> {
+    if trace_id.len() != 32 || span_id.len() != 16 {
+        return None;
+    }
+    if !is_lower_hex(trace_id) || !is_lower_hex(span_id) {
+        return None;
+    }
+    let trace_id = TraceId::from_hex(trace_id).ok()?;
+    let span_id = SpanId::from_hex(span_id).ok()?;
+    if trace_id == TraceId::INVALID || span_id == SpanId::INVALID {
+        return None;
+    }
+    Some((trace_id, span_id))
+}
+
+fn is_lower_hex(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
 
 pub struct OtlpTelemetry {
     tracer_provider: Option<SdkTracerProvider>,
@@ -279,5 +358,21 @@ mod tests {
         let addr = SocketAddr::from(([127, 0, 0, 1], 9102));
 
         assert_eq!(normalize_metrics_bind_addr_for_runtime(addr, true), addr);
+    }
+
+    #[test]
+    fn validates_workflow_trace_context_hex_ids() {
+        assert!(
+            WorkflowTraceContext::new("11111111111111111111111111111111", "2222222222222222")
+                .is_some()
+        );
+        assert!(
+            WorkflowTraceContext::new("00000000000000000000000000000000", "2222222222222222")
+                .is_none()
+        );
+        assert!(
+            WorkflowTraceContext::new("11111111111111111111111111111111", "0000000000000000")
+                .is_none()
+        );
     }
 }
