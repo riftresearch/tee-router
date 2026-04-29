@@ -964,7 +964,7 @@ checksum = "b0674a1ddeecb70197781e945de4b3b8ffb61fa939a5597bcf48503737663100"
 
 [[package]]
 name = "api-key-gen"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "argon2",
  "blockchain-utils",
@@ -1917,7 +1917,7 @@ dependencies = [
 
 [[package]]
 name = "blockchain-utils"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "alloy",
  "async-trait",
@@ -2123,7 +2123,7 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "chainalysis-address-screener"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "reqwest",
  "serde",
@@ -2135,7 +2135,7 @@ dependencies = [
 
 [[package]]
 name = "chains"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "alloy",
  "async-trait",
@@ -2728,7 +2728,7 @@ dependencies = [
 
 [[package]]
 name = "devnet"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "alloy",
  "axum 0.7.9",
@@ -2765,7 +2765,7 @@ dependencies = [
 
 [[package]]
 name = "devnet-cli"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "blockchain-utils",
  "clap",
@@ -2882,14 +2882,14 @@ dependencies = [
 
 [[package]]
 name = "eip3009-erc20-contract"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "alloy",
 ]
 
 [[package]]
 name = "eip7702-delegator-contract"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "alloy",
 ]
@@ -3024,7 +3024,7 @@ dependencies = [
 
 [[package]]
 name = "evm-token-indexer-client"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "alloy",
  "reqwest",
@@ -3687,7 +3687,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.1",
  "tokio",
  "tower-service",
  "tracing",
@@ -3695,7 +3695,7 @@ dependencies = [
 
 [[package]]
 name = "hyperliquid-client"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "alloy",
  "reqwest",
@@ -3725,7 +3725,7 @@ dependencies = [
 
 [[package]]
 name = "hyperunit-client"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "alloy",
  "hyperliquid-client",
@@ -4211,7 +4211,7 @@ dependencies = [
 
 [[package]]
 name = "market-pricing"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "reqwest",
@@ -4285,6 +4285,41 @@ checksum = "3045b4193fbdc5b5681f32f11070da9be3609f189a79f3390706d42587f46bb5"
 dependencies = [
  "ahash",
  "portable-atomic",
+]
+
+[[package]]
+name = "metrics-exporter-prometheus"
+version = "0.15.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4f0c8427b39666bf970460908b213ec09b3b350f20c0c2eabcbba51704a08e6"
+dependencies = [
+ "base64 0.22.1",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "indexmap 2.11.1",
+ "ipnet",
+ "metrics",
+ "metrics-util",
+ "quanta",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "metrics-util"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4259040465c955f9f2f1a4a8a16dc46726169bca0f88e8fb2dbeced487c3e828"
+dependencies = [
+ "crossbeam-epoch",
+ "crossbeam-utils",
+ "hashbrown 0.14.5",
+ "metrics",
+ "num_cpus",
+ "quanta",
+ "sketches-ddsketch",
 ]
 
 [[package]]
@@ -4540,6 +4575,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "observability"
+version = "0.1.2"
+dependencies = [
+ "metrics-exporter-prometheus",
+ "opentelemetry",
+ "opentelemetry-appender-tracing",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4564,6 +4613,91 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d05e27ee213611ffe7d6348b942e8f942b37114c00cc03cec254295a4a17852e"
 
 [[package]]
+name = "opentelemetry"
+version = "0.31.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b84bcd6ae87133e903af7ef497404dda70c60d0ea14895fc8a5e6722754fc2a0"
+dependencies = [
+ "futures-core",
+ "futures-sink",
+ "js-sys",
+ "pin-project-lite",
+ "thiserror 2.0.16",
+]
+
+[[package]]
+name = "opentelemetry-appender-tracing"
+version = "0.31.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef6a1ac5ca3accf562b8c306fa8483c85f4390f768185ab775f242f7fe8fdcc2"
+dependencies = [
+ "opentelemetry",
+ "tracing",
+ "tracing-core",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "opentelemetry-http"
+version = "0.31.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7a6d09a73194e6b66df7c8f1b680f156d916a1a942abf2de06823dd02b7855d"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "http 1.3.1",
+ "opentelemetry",
+ "reqwest",
+]
+
+[[package]]
+name = "opentelemetry-otlp"
+version = "0.31.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f69cd6acbb9af919df949cd1ec9e5e7fdc2ef15d234b6b795aaa525cc02f71f"
+dependencies = [
+ "http 1.3.1",
+ "opentelemetry",
+ "opentelemetry-http",
+ "opentelemetry-proto",
+ "opentelemetry_sdk",
+ "prost 0.14.1",
+ "reqwest",
+ "thiserror 2.0.16",
+]
+
+[[package]]
+name = "opentelemetry-proto"
+version = "0.31.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7175df06de5eaee9909d4805a3d07e28bb752c34cab57fa9cff549da596b30f"
+dependencies = [
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "prost 0.14.1",
+ "tonic 0.14.5",
+ "tonic-prost",
+]
+
+[[package]]
+name = "opentelemetry_sdk"
+version = "0.31.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e14ae4f5991976fd48df6d843de219ca6d31b01daaab2dad5af2badeded372bd"
+dependencies = [
+ "futures-channel",
+ "futures-executor",
+ "futures-util",
+ "opentelemetry",
+ "percent-encoding",
+ "rand 0.9.2",
+ "thiserror 2.0.16",
+ "tokio",
+ "tokio-stream",
+]
+
+[[package]]
 name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4571,7 +4705,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "otc-models"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "alloy",
  "chrono",
@@ -4997,6 +5131,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "quanta"
+version = "0.12.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3ab5a9d756f0d97bdc89019bd2e4ea098cf9cde50ee7564dde6b81ccc8f06c7"
+dependencies = [
+ "crossbeam-utils",
+ "libc",
+ "once_cell",
+ "raw-cpuid",
+ "wasi 0.11.1+wasi-snapshot-preview1",
+ "web-sys",
+ "winapi",
+]
+
+[[package]]
 name = "quick-error"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5015,7 +5164,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.32",
- "socket2 0.5.10",
+ "socket2 0.6.1",
  "thiserror 2.0.16",
  "tokio",
  "tracing",
@@ -5052,7 +5201,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.1",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -5103,7 +5252,7 @@ dependencies = [
 
 [[package]]
 name = "rand-wallet"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "alloy",
  "bitcoin",
@@ -5159,6 +5308,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "513962919efc330f829edb2535844d1b912b0fbe2ca165d613e4e8788bb05a5a"
 dependencies = [
  "rand_core 0.9.3",
+]
+
+[[package]]
+name = "raw-cpuid"
+version = "11.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "498cd0dc59d73224351ee52a95fee0f1a617a2eae0e7d9d720cc622c73a54186"
+dependencies = [
+ "bitflags 2.9.4",
 ]
 
 [[package]]
@@ -5272,6 +5430,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",
@@ -5365,7 +5524,7 @@ dependencies = [
 
 [[package]]
 name = "router-primitives"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "alloy",
  "argon2",
@@ -5378,7 +5537,7 @@ dependencies = [
 
 [[package]]
 name = "router-server"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "alloy",
  "async-trait",
@@ -5398,6 +5557,7 @@ dependencies = [
  "hyperunit-client",
  "market-pricing",
  "metrics",
+ "observability",
  "reqwest",
  "router-primitives",
  "secrecy",
@@ -5634,7 +5794,7 @@ dependencies = [
 
 [[package]]
 name = "sauron"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "alloy",
  "async-trait",
@@ -5651,6 +5811,7 @@ dependencies = [
  "esplora-client",
  "evm-token-indexer-client",
  "metrics",
+ "observability",
  "reqwest",
  "router-primitives",
  "router-server",
@@ -6056,6 +6217,12 @@ dependencies = [
  "thiserror 2.0.16",
  "time",
 ]
+
+[[package]]
+name = "sketches-ddsketch"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85636c14b73d81f541e525f585c0a2109e6744e1565b5c1668e31c70c10ed65c"
 
 [[package]]
 name = "slab"
@@ -6801,6 +6968,7 @@ dependencies = [
  "tower 0.5.2",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -6829,9 +6997,9 @@ dependencies = [
 
 [[package]]
 name = "tracing"
-version = "0.1.41"
+version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "784e0ac535deb450455cbfa28a6f0df145ea1bb7ae51b821cf5e7927fdcfbdd0"
+checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
  "log",
  "pin-project-lite",
@@ -6841,9 +7009,9 @@ dependencies = [
 
 [[package]]
 name = "tracing-attributes"
-version = "0.1.30"
+version = "0.1.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81383ab64e72a7a8b8e13130c49e3dab29def6d0c7d76a03087b3cf71c5c6903"
+checksum = "7490cfa5ec963746568740651ac6781f701c9c5ea257c58e057f3ba8cf69e8da"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6852,9 +7020,9 @@ dependencies = [
 
 [[package]]
 name = "tracing-core"
-version = "0.1.34"
+version = "0.1.36"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9d12581f227e93f094d3af2ae690a574abb8a2b9b7a96e7cfe9647b2b617678"
+checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
  "valuable",
@@ -6893,6 +7061,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracing-opentelemetry"
+version = "0.32.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ac28f2d093c6c477eaa76b23525478f38de514fa9aeb1285738d4b97a9552fc"
+dependencies = [
+ "js-sys",
+ "opentelemetry",
+ "smallvec",
+ "tracing",
+ "tracing-core",
+ "tracing-log",
+ "tracing-subscriber",
+ "web-time",
+]
+
+[[package]]
 name = "tracing-serde"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6904,9 +7088,9 @@ dependencies = [
 
 [[package]]
 name = "tracing-subscriber"
-version = "0.3.20"
+version = "0.3.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2054a14f5307d601f88daf0553e1cbf472acc4f2c51afab632431cdcd72124d5"
+checksum = "cb7f578e5945fb242538965c2d0b04418d38ec25c79d160cd279bf0731c8d319"
 dependencies = [
  "matchers",
  "nu-ansi-term",
@@ -7085,7 +7269,7 @@ checksum = "daf8dba3b7eb870caf1ddeed7bc9d2a049f3cfdfae7cb521b087cc33ae4c49da"
 
 [[package]]
 name = "utc"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "mock_instant",

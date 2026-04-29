@@ -85,6 +85,9 @@ pub enum Error {
 
     #[snafu(display("A discovery backend task terminated unexpectedly"))]
     DiscoveryTaskJoin { source: tokio::task::JoinError },
+
+    #[snafu(display("Failed to initialize observability: {message}"))]
+    Observability { message: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

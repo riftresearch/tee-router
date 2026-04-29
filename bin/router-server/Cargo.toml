@@ -21,6 +21,7 @@ hyperliquid-client = { workspace = true }
 hyperunit-client = { workspace = true }
 market-pricing = { workspace = true }
 router-primitives = { workspace = true }
+observability = { workspace = true }
 
 tokio = { workspace = true }
 serde = { workspace = true }

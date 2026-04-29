@@ -34,8 +34,11 @@ use axum::{
 use chains::ChainRegistry;
 use snafu::ResultExt;
 use std::{net::SocketAddr, sync::Arc, time::Instant};
-use tower_http::cors::{AllowOrigin, CorsLayer};
-use tracing::{info, warn};
+use tower_http::{
+    cors::{AllowOrigin, CorsLayer},
+    trace::{DefaultMakeSpan, TraceLayer},
+};
+use tracing::{info, warn, Level};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -159,6 +162,13 @@ pub fn build_api_router(state: AppState, cors_domain: Option<String>) -> Router 
         )
         .route("/api/v1/chains/:chain/tip", get(get_chain_tip))
         .with_state(state)
+        .layer(
+            TraceLayer::new_for_http().make_span_with(
+                DefaultMakeSpan::new()
+                    .level(Level::INFO)
+                    .include_headers(false),
+            ),
+        )
         .layer(middleware::from_fn(track_http_metrics));
 
     if let Some(cors_domain_pattern) = cors_domain {

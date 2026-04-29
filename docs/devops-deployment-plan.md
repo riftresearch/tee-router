@@ -404,6 +404,52 @@ Router API and worker need the same core config:
 - `ROUTER_ADMIN_API_KEY`
 - `COINBASE_PRICE_API_BASE_URL`
 
+## Observability
+
+Better Stack is the alpha observability backend. The source is:
+
+- source name: `tee-router-alpha`
+- source ID: `2403167`
+- platform: `open_telemetry`
+- table: `tee_router_alpha`
+- ingest endpoint: `https://s2403167.us-east-9.betterstackdata.com`
+
+Do not commit the Better Stack source token. It must be supplied as
+`BETTERSTACK_SOURCE_TOKEN` in deployment-local secret storage such as
+`.env.phala.prod` or Railway service variables.
+
+The Phala stack runs an OpenTelemetry Collector sidecar. The collector receives
+OTLP on private ports `4317`/`4318`, scrapes router-specific private metrics
+from:
+
+- `router-api:9100`
+- `router-worker:9101`
+
+and forwards metrics, logs, and traces to Better Stack. The current Rust
+application path exports tee-router custom metrics through the existing
+`metrics` crate via `metrics-exporter-prometheus`; the Prometheus endpoint is
+private and is only an internal receiver for the OpenTelemetry Collector. This
+does not deploy or depend on a Prometheus server.
+
+`router-api` and `router-worker` also emit tracing events/spans to the Phala
+collector when `OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318` is set.
+The shared Rust observability helper derives `/v1/traces` and `/v1/logs` from
+that base endpoint.
+
+Sauron should get the same pattern on Railway:
+
+- set `METRICS_BIND_ADDR=0.0.0.0:9102` on `sauron-worker-v3`
+- set `OTEL_EXPORTER_OTLP_ENDPOINT=http://betterstack-otel-collector-v3.railway.internal:4318`
+  on `sauron-worker-v3`
+- run a Railway collector service that scrapes Sauron over Railway private
+  networking and exports to the same Better Stack source
+- deploy the collector from `railway/betterstack-otel-collector/Dockerfile`
+
+Railway private networking can require IPv6 wildcard listeners. The Rust
+observability helper keeps the operator-facing `METRICS_BIND_ADDR=0.0.0.0:9102`
+setting but binds it as `[::]:9102` when Railway runtime metadata is present, so
+the private collector can reach the endpoint through `*.railway.internal`.
+
 ## Implementation Checklist
 
 1. Add router Dockerfile that builds `router-api` and `router-worker`.

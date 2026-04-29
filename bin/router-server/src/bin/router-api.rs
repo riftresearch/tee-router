@@ -8,6 +8,12 @@ use router_server::{
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = RouterServerArgs::parse();
-    let background_tasks = init_tracing(&args, "router-api");
-    run_until_shutdown("router-api", run_api(args), background_tasks).await
+    let (background_tasks, otlp_telemetry) = init_tracing(&args, "router-api")?;
+    run_until_shutdown(
+        "router-api",
+        run_api(args),
+        background_tasks,
+        otlp_telemetry,
+    )
+    .await
 }

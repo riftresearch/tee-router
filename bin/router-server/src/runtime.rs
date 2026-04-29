@@ -10,8 +10,18 @@ pub type BackgroundTaskResult = std::result::Result<(), String>;
 pub fn init_tracing(
     args: &RouterServerArgs,
     service_name: &'static str,
-) -> JoinSet<BackgroundTaskResult> {
+) -> Result<(JoinSet<BackgroundTaskResult>, observability::OtlpTelemetry)> {
     let mut background_tasks = JoinSet::new();
+    let otlp_telemetry =
+        observability::init_otlp_from_env(service_name).map_err(|err| Error::Generic {
+            source: Whatever::without_source(err),
+        })?;
+    let otlp_trace_layer = otlp_telemetry
+        .trace_layer(service_name)
+        .map(|layer| layer.with_filter(EnvFilter::new(&args.log_level)));
+    let otlp_log_layer = otlp_telemetry
+        .log_layer()
+        .map(|layer| layer.with_filter(EnvFilter::new(&args.log_level)));
 
     let fmt_env_filter = EnvFilter::new(&args.log_level);
     let fmt_layer = tracing_subscriber::fmt::layer()
@@ -30,6 +40,8 @@ pub fn init_tracing(
                     Ok((loki_layer, task)) => {
                         let filtered_loki_layer = loki_layer.with_filter(loki_env_filter);
                         tracing_subscriber::registry()
+                            .with(otlp_trace_layer)
+                            .with(otlp_log_layer)
                             .with(fmt_layer)
                             .with(filtered_loki_layer)
                             .init();
@@ -46,40 +58,64 @@ pub fn init_tracing(
                             "Failed to initialize Loki layer: {}, continuing without Loki",
                             err
                         );
-                        tracing_subscriber::registry().with(fmt_layer).init();
+                        tracing_subscriber::registry()
+                            .with(otlp_trace_layer)
+                            .with(otlp_log_layer)
+                            .with(fmt_layer)
+                            .init();
                         false
                     }
                 }
             }
             Err(err) => {
                 eprintln!("Invalid LOKI_URL: {}, continuing without Loki", err);
-                tracing_subscriber::registry().with(fmt_layer).init();
+                tracing_subscriber::registry()
+                    .with(otlp_trace_layer)
+                    .with(otlp_log_layer)
+                    .with(fmt_layer)
+                    .init();
                 false
             }
         }
     } else {
-        tracing_subscriber::registry().with(fmt_layer).init();
+        tracing_subscriber::registry()
+            .with(otlp_trace_layer)
+            .with(otlp_log_layer)
+            .with(fmt_layer)
+            .init();
         false
     };
 
     if !loki_task {
         tracing::info!("Loki logging not configured (set LOKI_URL to enable)");
     }
+    if otlp_telemetry.is_enabled() {
+        tracing::info!("OpenTelemetry OTLP logs/traces enabled");
+    } else {
+        tracing::info!("OpenTelemetry OTLP logs/traces not configured");
+    }
 
-    background_tasks
+    observability::init_prometheus_metrics_from_env(service_name).map_err(|err| {
+        Error::Generic {
+            source: Whatever::without_source(err),
+        }
+    })?;
+
+    Ok((background_tasks, otlp_telemetry))
 }
 
 pub async fn run_until_shutdown<F>(
     service_name: &'static str,
     service: F,
     mut background_tasks: JoinSet<BackgroundTaskResult>,
+    otlp_telemetry: observability::OtlpTelemetry,
 ) -> Result<()>
 where
     F: Future<Output = Result<()>>,
 {
     tokio::pin!(service);
 
-    tokio::select! {
+    let result = tokio::select! {
         result = &mut service => result,
         _ = shutdown_signal() => {
             tracing::info!("Shutdown signal received; stopping {}", service_name);
@@ -107,5 +143,8 @@ where
                 }),
             }
         }
-    }
+    };
+
+    otlp_telemetry.shutdown();
+    result
 }
