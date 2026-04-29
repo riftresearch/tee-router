@@ -1889,7 +1889,6 @@ async fn submit_order_request(
         .json(&json!({
             "quote_id": quote_id,
             "refund_address": valid_evm_address(),
-            "cancellation_commitment": dummy_commitment(),
             "metadata": {
                 "test": route_order_metadata(route)
             }

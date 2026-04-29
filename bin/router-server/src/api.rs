@@ -48,10 +48,10 @@ pub struct CreateQuoteRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateOrderRequest {
     pub quote_id: Uuid,
     pub refund_address: String,
-    pub cancellation_commitment: String,
     #[serde(default)]
     pub cancel_after: Option<DateTime<Utc>>,
     #[serde(default)]

@@ -1066,8 +1066,15 @@ fn parse_positive_u256(field: &'static str, value: &str) -> VaultResult<U256> {
     Ok(amount)
 }
 
-fn compute_cancellation_commitment(secret_bytes: &[u8; 32]) -> [u8; 32] {
+pub(crate) fn compute_cancellation_commitment(secret_bytes: &[u8; 32]) -> [u8; 32] {
     keccak256([CANCELLATION_COMMITMENT_DOMAIN, secret_bytes].concat()).into()
+}
+
+pub(crate) fn compute_cancellation_commitment_hex(secret_bytes: &[u8; 32]) -> String {
+    format!(
+        "0x{}",
+        alloy::hex::encode(compute_cancellation_commitment(secret_bytes))
+    )
 }
 
 fn normalize_hex_32(value: &str) -> Result<String, String> {

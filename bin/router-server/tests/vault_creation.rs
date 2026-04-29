@@ -1322,7 +1322,6 @@ async fn create_test_order_from_quote_with_refund(
         .create_order_from_quote(CreateOrderRequest {
             quote_id,
             refund_address,
-            cancellation_commitment: dummy_commitment(),
             cancel_after: None,
             idempotency_key: None,
             metadata: json!({}),
@@ -2520,7 +2519,6 @@ async fn router_api_quote_and_order_flow_uses_production_component_initializatio
         .json(&json!({
             "quote_id": quote.quote.as_market_order().expect("market order quote").id,
             "refund_address": valid_evm_address(),
-            "cancellation_commitment": dummy_commitment(),
             "metadata": {
                 "test": "production_component_initialization"
             }
@@ -2532,6 +2530,7 @@ async fn router_api_quote_and_order_flow_uses_production_component_initializatio
     let body = order_response.text().await.unwrap();
     assert_eq!(status, reqwest::StatusCode::CREATED, "{body}");
     let order: RouterOrderEnvelope = serde_json::from_str(&body).unwrap();
+    assert!(order.cancellation_secret.is_some());
     assert_eq!(
         order
             .quote
@@ -2844,7 +2843,6 @@ async fn router_api_and_worker_complete_mock_across_unit_flow_with_production_co
         .json(&json!({
             "quote_id": quote.quote.as_market_order().expect("market order quote").id,
             "refund_address": valid_evm_address(),
-            "cancellation_commitment": dummy_commitment(),
             "metadata": {
                 "test": "api_worker_mock_across_unit"
             }
@@ -2856,6 +2854,7 @@ async fn router_api_and_worker_complete_mock_across_unit_flow_with_production_co
     let body = order_response.text().await.unwrap();
     assert_eq!(status, reqwest::StatusCode::CREATED, "{body}");
     let order: RouterOrderEnvelope = serde_json::from_str(&body).unwrap();
+    assert!(order.cancellation_secret.is_some());
     let funding_vault = order
         .funding_vault
         .as_ref()
@@ -4395,7 +4394,6 @@ async fn release_quote_after_vault_creation_failure_allows_order_retry() {
         .create_order_from_quote(CreateOrderRequest {
             quote_id,
             refund_address: valid_evm_address(),
-            cancellation_commitment: dummy_commitment(),
             cancel_after: None,
             idempotency_key: None,
             metadata: json!({}),
@@ -4406,7 +4404,6 @@ async fn release_quote_after_vault_creation_failure_allows_order_retry() {
         .create_order_from_quote(CreateOrderRequest {
             quote_id,
             refund_address: valid_evm_address(),
-            cancellation_commitment: dummy_commitment(),
             cancel_after: None,
             idempotency_key: None,
             metadata: json!({}),
@@ -4433,7 +4430,6 @@ async fn release_quote_after_vault_creation_failure_allows_order_retry() {
         .create_order_from_quote(CreateOrderRequest {
             quote_id,
             refund_address: valid_evm_address(),
-            cancellation_commitment: dummy_commitment(),
             cancel_after: None,
             idempotency_key: None,
             metadata: json!({}),
