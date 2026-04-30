@@ -12,7 +12,6 @@ Environment:
   SOURCE_MODE                Optional. "image" (default) or "repo".
   PROXY_PORT                 Optional. Defaults to 1080.
   RAILWAY_REGION_FLAG        Optional. Defaults to europe-west4.
-  ALLOWED_DEST_FQDN          Optional. Defaults to ^api\.hyperunit\.xyz$
   REQUIRE_AUTH               Optional. Defaults to true.
   ALLOWED_IPS                Optional. Comma-separated client IP allowlist.
 
@@ -42,7 +41,6 @@ SERVICE_NAME="${SERVICE_NAME:-hyperunit-socks5}"
 SOURCE_MODE="${SOURCE_MODE:-image}"
 PROXY_PORT="${PROXY_PORT:-1080}"
 RAILWAY_REGION_FLAG="${RAILWAY_REGION_FLAG:-europe-west4}"
-ALLOWED_DEST_FQDN="${ALLOWED_DEST_FQDN:-^api\\.hyperunit\\.xyz$}"
 REQUIRE_AUTH="${REQUIRE_AUTH:-true}"
 
 railway_config_file() {
@@ -195,7 +193,6 @@ var_args=(
   "PROXY_USER=$PROXY_USER"
   "PROXY_PASSWORD=$PROXY_PASSWORD"
   "PROXY_PORT=$PROXY_PORT"
-  "ALLOWED_DEST_FQDN=$ALLOWED_DEST_FQDN"
 )
 
 if [[ -n "${ALLOWED_IPS:-}" ]]; then
@@ -215,6 +212,6 @@ Recommended router configuration:
 Notes:
   - This is an internal SOCKS5 proxy URL. Do not use socks5h.
   - The service was pinned to Railway region flag: ${RAILWAY_REGION_FLAG}
-  - The proxy is locked to destinations matching: ${ALLOWED_DEST_FQDN}
+  - The proxy relies on SOCKS5 username/password auth; do not run it unauthenticated.
   - Add a public Railway domain only if you explicitly need external ingress.
 EOF

@@ -112,7 +112,6 @@ Keep:
 
 ```env
 REQUIRE_AUTH=true
-ALLOWED_DEST_FQDN=^api\.hyperunit\.xyz$
 ```
 
 Set a fresh random:
@@ -123,6 +122,8 @@ PROXY_PASSWORD=<generated secret>
 ```
 
 Do not configure `ALLOWED_IPS` for now.
+Do not configure destination FQDN allowlisting; SOCKS5 username/password auth is
+the proxy access boundary.
 
 Phala `router-worker` should use:
 

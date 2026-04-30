@@ -8,7 +8,6 @@ Default behavior:
 - pins the service to Railway Europe West using CLI region flag `europe-west4`
 - requires SOCKS5 authentication
 - binds the proxy to port `1080`
-- only allows outbound destinations matching `^api\.hyperunit\.xyz$`
 - assumes the router will reach it over Railway internal networking
 
 Why this shape:
@@ -16,6 +15,8 @@ Why this shape:
 - the router now accepts `HYPERUNIT_PROXY_URL`
 - we explicitly reject `socks5h://`; use `socks5://`
 - HyperUnit is the only provider that should use this proxy
+- the proxy does not use a destination FQDN allowlist; SOCKS5 username/password
+  auth is the access boundary
 - Railway's Europe deployment region is EU West Metal in Amsterdam
 
 ## Create the service

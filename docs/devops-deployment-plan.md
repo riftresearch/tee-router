@@ -332,9 +332,10 @@ Requirements:
 - Railway TCP proxy reachable from Phala
 - username/password auth
 - long random password
-- destination allowlist restricted to `api.hyperunit.xyz`
 - no unauthenticated open-proxy behavior
 - no `ALLOWED_IPS` restriction for now
+- no destination FQDN allowlisting; SOCKS5 username/password auth is the proxy
+  access boundary
 - generate a fresh random proxy password during deployment and store it only as
   Railway/Phala secret material
 
