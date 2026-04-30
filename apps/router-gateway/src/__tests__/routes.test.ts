@@ -34,11 +34,19 @@ describe('router gateway routes', () => {
     expect(response.status).toBe(200)
     expect(body.openapi).toBe('3.1.0')
     expect(body.paths['/health']).toBeDefined()
-    expect(body.paths['/health/dependencies']).toBeDefined()
+    expect(body.paths['/providers']).toBeDefined()
+    expect(body.paths['/health/dependencies']).toBeUndefined()
     expect(body.paths['/status']).toBeUndefined()
     expect(body.paths['/quote']).toBeDefined()
     expect(body.paths['/order/market']).toBeDefined()
     expect(body.paths['/order/{orderId}/cancel']).toBeDefined()
+    expect(Object.keys(body.paths)).toEqual([
+      '/quote',
+      '/order/market',
+      '/order/{orderId}/cancel',
+      '/health',
+      '/providers'
+    ])
     expect(body.servers).toEqual([
       {
         url: 'http://localhost:3000',
@@ -110,7 +118,7 @@ describe('router gateway routes', () => {
     await monitor.refresh()
 
     const app = createApp(config, { dependencyHealthMonitor: monitor })
-    const response = await app.request('/health/dependencies')
+    const response = await app.request('/providers')
     const body = await response.json()
 
     expect(response.status).toBe(200)
@@ -128,6 +136,9 @@ describe('router gateway routes', () => {
     ])
     expect(body.dependencies[0].url).toBeUndefined()
     expect(calls[0]?.path).toBe('/api/v1/provider-health')
+
+    const oldResponse = await app.request('/health/dependencies')
+    expect(oldResponse.status).toBe(404)
   })
 
   test('serves fully permissive CORS headers', async () => {

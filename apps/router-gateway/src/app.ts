@@ -36,16 +36,16 @@ export function createApp(
     })
   )
 
-  app.openapi(healthRoute, createHealthHandler())
-  app.openapi(
-    dependencyHealthRoute,
-    createDependencyHealthHandler(dependencyHealthMonitor)
-  )
   // zod-openapi currently narrows handler return types to success responses.
   // These handlers also return the error responses declared on each route.
   app.openapi(quoteRoute, createQuoteHandler(config, deps) as never)
   app.openapi(orderMarketRoute, createOrderMarketHandler(config, deps) as never)
   app.openapi(orderCancelRoute, createOrderCancelHandler(config, deps) as never)
+  app.openapi(healthRoute, createHealthHandler())
+  app.openapi(
+    dependencyHealthRoute,
+    createDependencyHealthHandler(dependencyHealthMonitor)
+  )
 
   app.doc31('/openapi.json', {
     openapi: '3.1.0',

@@ -39,7 +39,7 @@
           "POST /order/market",
           "POST /order/{orderId}/cancel",
           "GET /health",
-          "GET /health/dependencies"
+          "GET /providers"
         ]
       }
     ]

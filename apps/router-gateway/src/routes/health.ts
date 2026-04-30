@@ -44,14 +44,14 @@ export const healthRoute = createRoute({
 
 export const dependencyHealthRoute = createRoute({
   method: 'get',
-  path: '/health/dependencies',
+  path: '/providers',
   tags: ['System'],
-  summary: 'Get dependency health status',
+  summary: 'Get provider reachability status',
   description:
-    'Returns cached health checks for upstream APIs monitored by the gateway.',
+    'Returns cached provider reachability checks from the router worker.',
   responses: {
     200: {
-      description: 'Cached dependency health check response',
+      description: 'Cached provider reachability response',
       content: {
         'application/json': {
           schema: DependencyHealthResponseSchema
