@@ -5,6 +5,7 @@ target/
 # Node/JS (if present)
 node_modules/
 **/node_modules/
+**/.next/
 .pnpm-store/
 .npm/
 
