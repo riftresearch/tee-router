@@ -1,0 +1,73 @@
+---
+title: "How Market Orders Work"
+---
+
+Rift runs a Bitcoin node and EVM light client (helios) inside a TDX enclave to escrow and release BTC and cbBTC upon verification of a receipt of funds.  
+
+Since security is enforced by hardware rather than staking, Rift has best-in-class capital efficiency for Market Makers and users.
+
+---
+
+### ERC20 → BTC Swap Flow
+
+#### Step 1: User requests quote
+
+This quote combines routing the starting asset through an on-chain pool to cbBTC, and Rift market makers quoting a cbBTC↔BTC exchange rate.
+
+![Step 1: Request Quote](/images/erc20-btc-1.png)
+
+#### Step 2: User requests a deposit vault on Ethereum
+
+After the user accepts the quote, the TEE creates a one-time-use deposit vault on Ethereum. The private key for this vault is only revealed to the market maker after they send the exact amount of BTC to the user's wallet and 2 Bitcoin blocks have been confirmed.
+
+![Step 2: TEE Creates Wallet](/images/erc20-btc-2.png)
+
+#### Step 3: User sends asset to deposit vault
+
+The user's ERC20s are swapped to cbBTC in a dex swap and sent to the deposit vault.
+
+![Step 3: User Sends Asset](/images/erc20-btc-3.png)
+
+#### Step 4: Market Maker sends BTC to user
+
+After **4 confirmation blocks on Ethereum**, the market maker sends BTC to the user.
+
+> If the MM doesn't send BTC within 24 hours, the user can withdraw their funds from the TEE.
+
+![Step 4: MM Sends BTC](/images/erc20-btc-4.png)
+
+#### Step 5: TEE reveals private key to Market Maker
+
+After **2 confirmation blocks on Bitcoin**, the TEE reveals the deposit vault private key to the market maker.
+
+![Step 5: TEE Reveals Key](/images/erc20-btc-5.png)
+
+---
+
+### BTC → ERC20 Swap Flow
+
+BTC→ERC20 swaps work similarly, with the order of actions reversed:
+
+#### Step 1: User requests a deposit vault on Bitcoin and swapper TEE address
+
+![Step 1: Request Vault](/images/btc-erc20-1.png)
+
+#### Step 2: User sends BTC to deposit vault
+
+The payout address of the deposit vault is set as the swapper wallet address on the second TEE.
+
+![Step 2: Send BTC](/images/btc-erc20-2.png)
+
+#### Step 3: Market Maker sends cbBTC to the swapper TEE
+
+After 2 confirmation blocks on Bitcoin, the market maker sends cbBTC into the swapper's wallet on the second TEE, which swaps it into the target ERC20 and send it to the user.
+
+![Step 3: Send cbBTC](/images/btc-erc20-3.png)
+
+In the case of BTC->cbBTC swaps, the MM sends cbBTC directly to the user's wallet instead of a post swap hook in the swapper TEE.
+
+#### Step 4: TEE reveals private key to Market Maker
+
+After 4 confirmation blocks on Ethereum, the TEE reveals the deposit vault private key to the market maker to claim the Bitcoin.
+
+![Step 4: Reveal Key](/images/btc-erc20-4.png)

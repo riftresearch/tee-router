@@ -1,0 +1,71 @@
+---
+title: "How Limit Orders Work"
+---
+
+Limit orders allow users to set a target price for their swap. The order executes automatically when the market reaches the specified price.
+
+---
+
+### ERC20 → BTC Swap Flow
+
+#### Step 1: User signs intent to swap ERC20 → cbBTC via DEX
+
+The user signs an intent to swap their ERC20 tokens to cbBTC through a DEX.
+
+![Step 1: Sign Intent](/images/limit/erc20-btc-1.png)
+
+#### Step 2: Limit price is hit, ERC20 swapped and cbBTC sent to TEE
+
+Once the limit price is reached, the ERC20 is swapped to cbBTC and sent to the TEE to be swapped for BTC.
+
+![Step 2: Limit Price Hit](/images/limit/erc20-btc-2.png)
+
+#### Step 3: BTC sent to user, cbBTC unlocked to MM
+
+BTC is sent to the user. After **2 Bitcoin confirmation blocks**, the cbBTC is unlocked to the market maker.
+
+![Step 3: BTC Sent](/images/limit/erc20-btc-3.png)
+
+---
+
+### BTC → ERC20 Swap Flow
+
+#### Step 1: User sends BTC to TEE
+
+The user sends BTC to the TEE. Upon **2 Bitcoin confirmation blocks**, it is swapped into cbBTC.
+
+![Step 1: Send BTC](/images/limit/btc-erc20-1.png)
+
+#### Step 2: Limit price is hit, TEE swaps cbBTC → ERC20
+
+Once the limit price is reached, the TEE swaps cbBTC to the target ERC20 via a DEX and sends it to the user.
+
+![Step 2: Limit Price Hit](/images/limit/btc-erc20-2.png)
+
+---
+
+### Limit Order Nuances
+
+#### How long until orders are active?
+
+- **ERC20 → BTC orders** are active as soon as the signed intent reaches solver broadcasting service (currently CoWSwap, a few seconds)
+- **BTC → ERC20 orders** are active after 2 Bitcoin confirmation blocks (~20-40 minutes)
+
+#### Cost of creating and cancelling orders
+
+Since orders are created by on-chain transfers, they are not free to create and cancel. Users pre-pay the starting chain's network fee so funds can be sent back to them in case of cancellation.
+
+#### How to cancel an order?
+
+Orders are cancelled with the EVM wallet associated with the order (even if this is the recipient address).
+
+1. Call `/order/<id>/cancel/prepare` to get EIP-712 data to sign
+2. Call `/order/<id>/cancel` with the signed data
+
+#### Expiry
+
+Orders can be set to last up to 1 year. If swapping from BTC → ERC20, it is recommended to set a minimum duration of 1 hour since the order will take 20-40 minutes on average to become active. When an order expires, the user is refunded.
+
+#### Triggers (stop loss / stop entry)
+
+Coming soon!

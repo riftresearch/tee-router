@@ -62,3 +62,4 @@ rift-api/
 # Reference-only checkouts (not part of the build)
 .reference/
 .worktrees/
+incoming

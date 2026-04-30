@@ -1,0 +1,78 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "Rift Documentation",
+  "js": "/scripts/custom.js",
+  "colors": {
+    "primary": "#fe8f21",
+    "light": "#fe8f21",
+    "dark": "#fe8f21"
+  },
+  "favicon": "/images/favicon.ico",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "openapi": {
+          "source": "https://router-gateway-production.up.railway.app/openapi.json",
+          "directory": "api"
+        },
+        "groups": [
+          {
+            "group": "Introduction",
+            "pages": [
+              "introduction/what-is-rift",
+              "introduction/how-market-orders-work",
+              "introduction/how-limit-orders-work",
+              "introduction/security-model"
+            ]
+          },
+          {
+            "group": "TypeScript SDK",
+            "pages": [
+              "sdk/quickstart"
+            ]
+          }
+        ],
+        "pages": [
+          "POST /quote",
+          "POST /order/market",
+          "POST /order/{orderId}/cancel",
+          "GET /health",
+          "GET /health/dependencies"
+        ]
+      }
+    ]
+  },
+  "logo": {
+    "light": "/images/light.svg",
+    "dark": "/images/dark.svg"
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "Support",
+        "href": "https://t.me/basedcrypto"
+      }
+    ],
+    "primary": {
+      "type": "button",
+      "label": "Launch App",
+      "href": "https://app.rift.trade"
+    }
+  },
+  "footer": {
+    "socials": {
+      "x": "https://x.com/riftdex",
+      "github": "https://github.com/riftresearch"
+    }
+  },
+  "api": {
+    "playground": {
+      "display": "interactive"
+    },
+    "examples": {
+      "prefill": true
+    }
+  }
+}
