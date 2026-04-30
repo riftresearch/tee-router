@@ -49,3 +49,9 @@ Only verified Google sessions for these emails are authorized:
 - `tristan@rift.trade`
 
 Authorization is enforced server-side on every dashboard API and SSE route.
+
+## Railway
+
+Use `railway/admin-dashboard/Dockerfile` for the Railway service build. The
+service should expose port `3000` and set `BETTER_AUTH_URL` plus
+`ADMIN_DASHBOARD_WEB_ORIGIN` to the public dashboard origin.
