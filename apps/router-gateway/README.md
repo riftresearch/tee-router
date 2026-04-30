@@ -66,8 +66,7 @@ Railway service settings:
 
 ```txt
 Root directory: /
-Build command: bun install --frozen-lockfile
-Start command: bun run router-gateway:start
+Dockerfile path: railway/router-gateway/Dockerfile
 Healthcheck path: /status
 ```
 
@@ -89,8 +88,11 @@ Generate the cancellation encryption key with:
 openssl rand -hex 32
 ```
 
-Run the gateway database migration as a one-off Railway command after variables
-are configured and before accepting gateway-managed cancellation traffic:
+The gateway runs pending database migrations automatically on startup before it
+binds its HTTP port. Startup migrations use a Postgres advisory transaction lock
+so concurrent replicas do not race.
+
+The manual migration command is still available as an operational escape hatch:
 
 ```sh
 bun run router-gateway:migrate
