@@ -12,7 +12,6 @@ COPY apps/admin-dashboard ./apps/admin-dashboard
 
 ENV NODE_ENV=production
 ENV HOST=0.0.0.0
-ENV ADMIN_DASHBOARD_API_PORT=3000
 
 EXPOSE 3000
 
