@@ -1,28 +1,28 @@
-export type CancellationAuthMode = 'gateway_managed_token'
+export type RefundMode = 'evmSignature' | 'token'
 
-export type StoredManagedCancellation = {
+export type StoredRefundAuthorization = {
   routerOrderId: string
-  authMode: CancellationAuthMode
-  authPolicy: Record<string, unknown>
+  refundMode: RefundMode
+  refundAuthorizer: string | null
   encryptedCancellationSecret: string
-  gatewayTokenHash: string
+  refundTokenHash?: string
   cancellationRequestedAt?: string
   createdAt: string
   updatedAt: string
 }
 
-export type SaveManagedCancellationInput = {
+export type SaveRefundAuthorizationInput = {
   routerOrderId: string
-  authMode: CancellationAuthMode
-  authPolicy: Record<string, unknown>
+  refundMode: RefundMode
+  refundAuthorizer: string | null
   encryptedCancellationSecret: string
-  gatewayTokenHash: string
+  refundTokenHash?: string
 }
 
-export interface CancellationStore {
-  saveManagedCancellation(input: SaveManagedCancellationInput): Promise<void>
-  findManagedCancellation(
+export interface RefundAuthorizationStore {
+  saveRefundAuthorization(input: SaveRefundAuthorizationInput): Promise<void>
+  findRefundAuthorization(
     routerOrderId: string
-  ): Promise<StoredManagedCancellation | undefined>
+  ): Promise<StoredRefundAuthorization | undefined>
   markCancellationRequested(routerOrderId: string): Promise<void>
 }

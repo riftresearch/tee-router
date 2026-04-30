@@ -5,15 +5,15 @@ import type { GatewayConfig } from '../config'
 import { GatewayValidationError, normalizeError } from '../errors'
 import { marketQuoteFromEnvelope, presentOrderEnvelope } from '../presenters'
 import {
-  cancellationServiceFor,
+  refundAuthorizationServiceFor,
   routerClientFor,
   type GatewayDeps
 } from './deps'
 import {
   AmountFormatSchema,
-  CancellationOwnershipSchema,
   ErrorResponses,
-  OrderResponseSchema
+  OrderResponseSchema,
+  RefundModeSchema
 } from './schemas'
 
 export const OrderMarketRequestSchema = z
@@ -25,10 +25,29 @@ export const OrderMarketRequestSchema = z
     integrator: z.string().min(1).optional(),
     idempotencyKey: z.string().min(1).optional(),
     cancelAfter: z.string().datetime().optional(),
-    cancellation: CancellationOwnershipSchema.optional(),
+    refundMode: RefundModeSchema.optional(),
+    refundAuthorizer: z.string().min(1).nullable(),
     amountFormat: AmountFormatSchema.optional()
   })
   .strict()
+  .superRefine((value, ctx) => {
+    const refundMode = value.refundMode ?? 'evmSignature'
+    if (refundMode === 'evmSignature' && !value.refundAuthorizer) {
+      ctx.addIssue({
+        code: 'custom',
+        message: 'refundAuthorizer is required when refundMode is evmSignature',
+        path: ['refundAuthorizer']
+      })
+    }
+
+    if (refundMode === 'token' && value.refundAuthorizer !== null) {
+      ctx.addIssue({
+        code: 'custom',
+        message: 'refundAuthorizer must be null when refundMode is token',
+        path: ['refundAuthorizer']
+      })
+    }
+  })
   .openapi('OrderMarketRequest')
 
 export const orderMarketRoute = createRoute({
@@ -61,20 +80,29 @@ export const orderMarketRoute = createRoute({
 
 export const OrderCancelRequestSchema = z
   .object({
-    cancellationSecret: z.string().min(1).optional(),
-    cancellationToken: z.string().min(1).optional(),
+    refundToken: z.string().min(1).optional(),
+    refundSignature: z.string().regex(/^0x[a-fA-F0-9]+$/).optional(),
+    refundSignatureDeadline: z.number().int().positive().optional(),
     amountFormat: AmountFormatSchema.optional()
   })
   .strict()
   .superRefine((value, ctx) => {
-    const credentials = [value.cancellationSecret, value.cancellationToken].filter(
-      (credential) => credential !== undefined
-    )
+    const hasToken = value.refundToken !== undefined
+    const hasSignature = value.refundSignature !== undefined
+    const credentials = [hasToken, hasSignature].filter(Boolean)
     if (credentials.length !== 1) {
       ctx.addIssue({
         code: 'custom',
-        message: 'exactly one of cancellationSecret or cancellationToken is required',
-        path: ['cancellationSecret']
+        message: 'exactly one of refundToken or refundSignature is required',
+        path: ['refundToken']
+      })
+    }
+
+    if (hasSignature && value.refundSignatureDeadline === undefined) {
+      ctx.addIssue({
+        code: 'custom',
+        message: 'refundSignatureDeadline is required with refundSignature',
+        path: ['refundSignatureDeadline']
       })
     }
   })
@@ -84,7 +112,7 @@ export const orderCancelRoute = createRoute({
   method: 'post',
   path: '/order/{orderId}/cancel',
   tags: ['Orders'],
-  summary: 'Cancel an order with a cancellation secret',
+  summary: 'Cancel an order with its configured refund authorization',
   request: {
     params: z.object({
       orderId: z.string().uuid()
@@ -119,7 +147,7 @@ export function createOrderMarketHandler(
     try {
       const request = c.req.valid('json')
       const amountFormat: AmountFormat = request.amountFormat ?? 'readable'
-      const cancellationMode = request.cancellation?.mode ?? 'user_secret'
+      const refundMode = request.refundMode ?? 'evmSignature'
       const routerClient = routerClientFor(config, deps)
       const quoteEnvelope = await routerClient.getQuote(request.quoteId)
       const quote = marketQuoteFromEnvelope(quoteEnvelope)
@@ -157,37 +185,27 @@ export function createOrderMarketHandler(
       })
       const response = presentOrderEnvelope(envelope, amountFormat)
 
-      if (cancellationMode === 'gateway_managed_token') {
-        if (!envelope.cancellation_secret) {
-          throw new GatewayValidationError(
-            'router order response is missing cancellationSecret'
-          )
-        }
-
-        const cancellationToken = await cancellationServiceFor(
-          config,
-          deps
-        ).createGatewayManagedToken({
-          routerOrderId: envelope.order.id,
-          cancellationSecret: envelope.cancellation_secret,
-          authPolicy: { mode: 'gateway_managed_token' }
-        })
-
-        delete response.cancellationSecret
-        return c.json(
-          {
-            ...response,
-            cancellationMode,
-            cancellationToken
-          },
-          201
+      if (!envelope.cancellation_secret) {
+        throw new GatewayValidationError(
+          'router order response is missing cancellationSecret'
         )
       }
 
+      const refundAuthorization = await refundAuthorizationServiceFor(
+        config,
+        deps
+      ).createRefundAuthorization({
+        routerOrderId: envelope.order.id,
+        cancellationSecret: envelope.cancellation_secret,
+        refundMode,
+        refundAuthorizer: request.refundAuthorizer ?? null
+      })
+
+      delete response.cancellationSecret
       return c.json(
         {
           ...response,
-          cancellationMode
+          ...refundAuthorization
         },
         201
       )
@@ -206,17 +224,20 @@ export function createOrderCancelHandler(
     try {
       const request = c.req.valid('json')
       const amountFormat: AmountFormat = request.amountFormat ?? 'readable'
-      const cancellationSecret =
-        request.cancellationSecret ??
-        (await cancellationServiceFor(
-          config,
-          deps
-        ).resolveTokenCancellationSecret(
-          c.req.valid('param').orderId,
-          request.cancellationToken as string
-        ))
+      const orderId = c.req.valid('param').orderId
+      const refundAuthorizationService = refundAuthorizationServiceFor(config, deps)
+      const cancellationSecret = request.refundToken
+        ? await refundAuthorizationService.resolveTokenCancellationSecret(
+            orderId,
+            request.refundToken
+          )
+        : await refundAuthorizationService.resolveEvmSignatureCancellationSecret({
+            routerOrderId: orderId,
+            refundSignature: request.refundSignature as string,
+            refundSignatureDeadline: request.refundSignatureDeadline as number
+          })
       const envelope = await routerClientFor(config, deps).cancelOrder(
-        c.req.valid('param').orderId,
+        orderId,
         {
           cancellation_secret: cancellationSecret
         }

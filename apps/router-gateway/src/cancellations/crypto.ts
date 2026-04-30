@@ -12,7 +12,7 @@ const ENCRYPTION_VERSION = 'v1'
 const KEY_BYTES = 32
 const IV_BYTES = 12
 
-export class CancellationSecretBox {
+export class RouterCancellationSecretBox {
   constructor(private readonly key: Buffer) {
     if (key.byteLength !== KEY_BYTES) {
       throw new GatewayConfigurationError(
@@ -21,8 +21,8 @@ export class CancellationSecretBox {
     }
   }
 
-  static fromKeyMaterial(value: string): CancellationSecretBox {
-    return new CancellationSecretBox(decodeKeyMaterial(value))
+  static fromKeyMaterial(value: string): RouterCancellationSecretBox {
+    return new RouterCancellationSecretBox(decodeKeyMaterial(value))
   }
 
   encrypt(plaintext: string): string {
@@ -62,19 +62,19 @@ export class CancellationSecretBox {
   }
 }
 
-export function generateGatewayCancellationToken(): string {
+export function generateRefundToken(): string {
   return `rgt_${randomBytes(32).toString('base64url')}`
 }
 
-export function hashGatewayCancellationToken(token: string): string {
+export function hashRefundToken(token: string): string {
   return createHash('sha256').update(token, 'utf8').digest('hex')
 }
 
-export function verifyGatewayCancellationToken(
+export function verifyRefundToken(
   token: string,
   expectedHash: string
 ): boolean {
-  const actual = Buffer.from(hashGatewayCancellationToken(token), 'hex')
+  const actual = Buffer.from(hashRefundToken(token), 'hex')
   const expected = Buffer.from(expectedHash, 'hex')
   if (actual.byteLength !== expected.byteLength) return false
 

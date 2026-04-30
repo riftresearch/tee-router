@@ -5,6 +5,11 @@ export const AmountFormatSchema = z
   .default('readable')
   .openapi('AmountFormat')
 
+export const RefundModeSchema = z
+  .enum(['evmSignature', 'token'])
+  .default('evmSignature')
+  .openapi('RefundMode')
+
 export const ErrorResponseSchema = z
   .object({
     error: z.object({
@@ -46,11 +51,9 @@ export const OrderResponseSchema = z
     maxIn: z.string().optional(),
     maxSlippage: z.string(),
     amountFormat: AmountFormatSchema,
-    cancellationMode: z
-      .enum(['user_secret', 'gateway_managed_token'])
-      .optional(),
-    cancellationSecret: z.string().optional(),
-    cancellationToken: z.string().optional()
+    refundMode: RefundModeSchema.optional(),
+    refundAuthorizer: z.string().nullable().optional(),
+    refundToken: z.string().optional()
   })
   .openapi('OrderResponse')
 
@@ -96,14 +99,3 @@ export const ErrorResponses = {
     }
   }
 } as const
-
-export const CancellationOwnershipSchema = z
-  .discriminatedUnion('mode', [
-    z.object({
-      mode: z.literal('user_secret')
-    }),
-    z.object({
-      mode: z.literal('gateway_managed_token')
-    })
-  ])
-  .openapi('CancellationOwnership')

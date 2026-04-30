@@ -1,12 +1,12 @@
 import type { GatewayConfig } from '../config'
 import { GatewayConfigurationError } from '../errors'
 import { RouterClient, type FetchLike } from '../internal/router-client'
-import { CancellationSecretBox } from '../cancellations/crypto'
-import { BunSqlCancellationStore } from '../cancellations/postgres-store'
-import { CancellationService } from '../cancellations/service'
+import { RouterCancellationSecretBox } from '../cancellations/crypto'
+import { BunSqlRefundAuthorizationStore } from '../cancellations/postgres-store'
+import { RefundAuthorizationService } from '../cancellations/service'
 
 export type GatewayDeps = {
-  cancellationService?: CancellationService
+  refundAuthorizationService?: RefundAuthorizationService
   fetch?: FetchLike
   routerClient?: RouterClient
 }
@@ -28,11 +28,11 @@ export function routerClientFor(
   })
 }
 
-export function cancellationServiceFor(
+export function refundAuthorizationServiceFor(
   config: GatewayConfig,
   deps: GatewayDeps = {}
-): CancellationService {
-  if (deps.cancellationService) return deps.cancellationService
+): RefundAuthorizationService {
+  if (deps.refundAuthorizationService) return deps.refundAuthorizationService
 
   if (!config.gatewayDatabaseUrl) {
     throw new GatewayConfigurationError('ROUTER_GATEWAY_DATABASE_URL is not configured')
@@ -44,8 +44,8 @@ export function cancellationServiceFor(
     )
   }
 
-  return new CancellationService(
-    new BunSqlCancellationStore(new Bun.SQL(config.gatewayDatabaseUrl)),
-    CancellationSecretBox.fromKeyMaterial(config.cancellationSecretKey)
+  return new RefundAuthorizationService(
+    new BunSqlRefundAuthorizationStore(new Bun.SQL(config.gatewayDatabaseUrl)),
+    RouterCancellationSecretBox.fromKeyMaterial(config.cancellationSecretKey)
   )
 }
