@@ -118,7 +118,7 @@ describe('router gateway routes', () => {
     expect(body.dependencies).toHaveLength(1)
     expect(body.dependencies[0]).toMatchObject({
       name: 'hyperliquid',
-      status: 'ok',
+      status: 'reachable',
       httpStatus: 200
     })
     expect(body.dependencies[0].url).toBeUndefined()

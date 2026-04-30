@@ -24,7 +24,6 @@ use chains::{
 };
 use market_pricing::{MarketPricingOracle, MarketPricingOracleConfig};
 use router_primitives::ChainType;
-use serde_json::json;
 use snafu::ResultExt;
 use std::{sync::Arc, time::Duration};
 use tracing::warn;
@@ -181,7 +180,7 @@ fn provider_health_probes(args: &RouterServerArgs) -> Result<Vec<ProviderHealthP
     {
         let probe = ProviderHealthProbe::get(
             ProviderId::Across.as_str(),
-            format!("{base_url}/deposit/status"),
+            synthetic_provider_status_url(&base_url),
         )
         .with_bearer_token(required_across_api_key(args.across_api_key.as_deref())?);
         probes.push(probe);
@@ -191,37 +190,33 @@ fn provider_health_probes(args: &RouterServerArgs) -> Result<Vec<ProviderHealthP
         .unwrap_or_else(|| CCTP_IRIS_DEFAULT_BASE_URL_FOR_CONFIG.to_string());
     probes.push(ProviderHealthProbe::get(
         ProviderId::Cctp.as_str(),
-        format!(
-            "{cctp_base_url}/v2/messages/0?transactionHash=0x0000000000000000000000000000000000000000000000000000000000000000"
-        ),
+        synthetic_provider_status_url(&cctp_base_url),
     ));
 
     if let Some(base_url) =
         normalize_optional_url(args.hyperunit_api_url.as_deref(), "HyperUnit API URL")?
     {
-        let health_url = format!(
-            "{base_url}/gen/ethereum/hyperliquid/eth/0x0000000000000000000000000000000000000000"
-        );
         probes.push(
-            ProviderHealthProbe::get(ProviderId::Unit.as_str(), health_url).with_proxy_url(
-                normalize_optional_string(args.hyperunit_proxy_url.as_deref()),
-            ),
+            ProviderHealthProbe::get(
+                ProviderId::Unit.as_str(),
+                synthetic_provider_status_url(&base_url),
+            )
+            .with_proxy_url(normalize_optional_string(
+                args.hyperunit_proxy_url.as_deref(),
+            )),
         );
     }
 
     if let Some(base_url) =
         normalize_optional_url(args.hyperliquid_api_url.as_deref(), "Hyperliquid API URL")?
     {
-        let health_body = json!({ "type": "spotMeta" });
-        probes.push(ProviderHealthProbe::post_json(
+        probes.push(ProviderHealthProbe::get(
             ProviderId::Hyperliquid.as_str(),
-            format!("{base_url}/info"),
-            health_body.clone(),
+            synthetic_provider_status_url(&base_url),
         ));
-        probes.push(ProviderHealthProbe::post_json(
+        probes.push(ProviderHealthProbe::get(
             ProviderId::HyperliquidBridge.as_str(),
-            format!("{base_url}/info"),
-            health_body,
+            synthetic_provider_status_url(&base_url),
         ));
     }
 
@@ -230,11 +225,15 @@ fn provider_health_probes(args: &RouterServerArgs) -> Result<Vec<ProviderHealthP
     {
         probes.push(ProviderHealthProbe::get(
             ProviderId::Velora.as_str(),
-            format!("{base_url}/prices"),
+            synthetic_provider_status_url(&base_url),
         ));
     }
 
     Ok(probes)
+}
+
+fn synthetic_provider_status_url(base_url: &str) -> String {
+    format!("{base_url}/status")
 }
 
 fn initialize_route_costs(
@@ -671,6 +670,36 @@ mod tests {
         assert_eq!(
             required_across_api_key(Some("  test-across-key  ")).unwrap(),
             "test-across-key"
+        );
+    }
+
+    #[test]
+    fn provider_health_probes_use_synthetic_status_paths() {
+        let mut args = base_args();
+        args.across_api_url = Some("https://across.example".to_string());
+        args.across_api_key = Some("across-key".to_string());
+        args.cctp_api_url = Some("https://iris.example".to_string());
+        args.hyperunit_api_url = Some("https://unit.example".to_string());
+        args.hyperunit_proxy_url = Some("socks5://router:secret@proxy.example:1080".to_string());
+        args.hyperliquid_api_url = Some("https://hyperliquid.example".to_string());
+        args.velora_api_url = Some("https://velora.example".to_string());
+
+        let probes = provider_health_probes(&args).unwrap();
+        let urls: Vec<(&str, &str)> = probes
+            .iter()
+            .map(|probe| (probe.provider(), probe.url()))
+            .collect();
+
+        assert_eq!(
+            urls,
+            vec![
+                ("across", "https://across.example/status"),
+                ("cctp", "https://iris.example/status"),
+                ("unit", "https://unit.example/status"),
+                ("hyperliquid", "https://hyperliquid.example/status"),
+                ("hyperliquid_bridge", "https://hyperliquid.example/status"),
+                ("velora", "https://velora.example/status"),
+            ]
         );
     }
 

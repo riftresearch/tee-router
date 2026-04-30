@@ -158,7 +158,7 @@ x-router-environment: &router-environment
   - RUST_LOG=${RUST_LOG:-info}
   - DEPLOYMENT_ENVIRONMENT=${DEPLOYMENT_ENVIRONMENT:-alpha}
   - SERVICE_NAMESPACE=tee-router
-  - SERVICE_VERSION=${SERVICE_VERSION:-0.1.7}
+  - SERVICE_VERSION=${SERVICE_VERSION:-0.1.8}
   - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
   - DB_MAX_CONNECTIONS=${DB_MAX_CONNECTIONS:-32}
   - DB_MIN_CONNECTIONS=${DB_MIN_CONNECTIONS:-4}
@@ -319,7 +319,7 @@ services:
       - router-replication-network
 
   router-api:
-    image: ghcr.io/riftresearch/tee-router:0.1.7
+    image: ghcr.io/riftresearch/tee-router:0.1.8
     container_name: router-api
     restart: unless-stopped
     environment: *router-environment
@@ -348,7 +348,7 @@ services:
       - router-network
 
   router-worker:
-    image: ghcr.io/riftresearch/tee-router:0.1.7
+    image: ghcr.io/riftresearch/tee-router:0.1.8
     container_name: router-worker
     restart: unless-stopped
     environment: *router-environment

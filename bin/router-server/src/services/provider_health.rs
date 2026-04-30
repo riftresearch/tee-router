@@ -341,10 +341,20 @@ impl ProviderHealthProbe {
         let body = response.text().await.unwrap_or_default();
         Ok((status, body))
     }
+
+    #[cfg(test)]
+    pub(crate) fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    #[cfg(test)]
+    pub(crate) fn url(&self) -> &str {
+        &self.url
+    }
 }
 
 fn provider_http_status_reachable(status: StatusCode) -> bool {
-    status.is_success() || matches!(status.as_u16(), 400 | 404)
+    status.as_u16() < 500
 }
 
 fn truncate_error_body(body: &str) -> String {
@@ -361,12 +371,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn provider_http_status_reachable_treats_validation_errors_as_reachable() {
+    fn provider_http_status_reachable_treats_non_server_errors_as_reachable() {
         assert!(provider_http_status_reachable(StatusCode::OK));
+        assert!(provider_http_status_reachable(StatusCode::FOUND));
         assert!(provider_http_status_reachable(StatusCode::BAD_REQUEST));
         assert!(provider_http_status_reachable(StatusCode::NOT_FOUND));
-        assert!(!provider_http_status_reachable(StatusCode::UNAUTHORIZED));
-        assert!(!provider_http_status_reachable(
+        assert!(provider_http_status_reachable(StatusCode::UNAUTHORIZED));
+        assert!(provider_http_status_reachable(
             StatusCode::TOO_MANY_REQUESTS
         ));
         assert!(!provider_http_status_reachable(

@@ -1,7 +1,7 @@
 import type { GatewayConfig, HealthTargetConfig } from './config'
 import type { FetchLike } from './internal/router-client'
 
-export type DependencyHealthStatus = 'ok' | 'down' | 'unknown'
+export type DependencyHealthStatus = 'reachable' | 'unreachable' | 'unknown'
 
 export type DependencyHealthState = {
   name: string
@@ -67,7 +67,9 @@ export class DependencyHealthMonitor {
     )
 
     return {
-      status: dependencies.some((dependency) => dependency.status === 'down')
+      status: dependencies.some(
+        (dependency) => dependency.status === 'unreachable'
+      )
         ? 'degraded'
         : 'ok',
       timestamp: now.toISOString(),
@@ -111,7 +113,7 @@ export class DependencyHealthMonitor {
 
       this.states.set(target.name, {
         name: target.name,
-        status: response.ok ? 'ok' : 'down',
+        status: response.ok ? 'reachable' : 'unreachable',
         checkedAt: new Date().toISOString(),
         latencyMs,
         httpStatus: response.status,
@@ -120,7 +122,7 @@ export class DependencyHealthMonitor {
     } catch (error) {
       this.states.set(target.name, {
         name: target.name,
-        status: 'down',
+        status: 'unreachable',
         checkedAt: new Date().toISOString(),
         latencyMs: Date.now() - startedAt,
         error: error instanceof Error ? error.message : 'dependency check failed'
@@ -147,10 +149,10 @@ export class DependencyHealthMonitor {
       if (!isRecord(provider) || typeof provider.provider !== 'string') continue
       const status =
         provider.status === 'down'
-          ? 'down'
+          ? 'unreachable'
           : provider.status === 'unknown'
             ? 'unknown'
-            : 'ok'
+            : 'reachable'
       this.states.set(provider.provider, {
         name: provider.provider,
         status,

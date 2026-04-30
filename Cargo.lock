@@ -964,7 +964,7 @@ checksum = "b0674a1ddeecb70197781e945de4b3b8ffb61fa939a5597bcf48503737663100"
 
 [[package]]
 name = "api-key-gen"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "argon2",
  "blockchain-utils",
@@ -1917,7 +1917,7 @@ dependencies = [
 
 [[package]]
 name = "blockchain-utils"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "alloy",
  "async-trait",
@@ -2123,7 +2123,7 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "chainalysis-address-screener"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "reqwest",
  "serde",
@@ -2135,7 +2135,7 @@ dependencies = [
 
 [[package]]
 name = "chains"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "alloy",
  "async-trait",
@@ -2728,7 +2728,7 @@ dependencies = [
 
 [[package]]
 name = "devnet"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "alloy",
  "axum 0.7.9",
@@ -2765,7 +2765,7 @@ dependencies = [
 
 [[package]]
 name = "devnet-cli"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "blockchain-utils",
  "clap",
@@ -2882,14 +2882,14 @@ dependencies = [
 
 [[package]]
 name = "eip3009-erc20-contract"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "alloy",
 ]
 
 [[package]]
 name = "eip7702-delegator-contract"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "alloy",
 ]
@@ -3024,7 +3024,7 @@ dependencies = [
 
 [[package]]
 name = "evm-token-indexer-client"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "alloy",
  "reqwest",
@@ -3695,7 +3695,7 @@ dependencies = [
 
 [[package]]
 name = "hyperliquid-client"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "alloy",
  "reqwest",
@@ -3725,7 +3725,7 @@ dependencies = [
 
 [[package]]
 name = "hyperunit-client"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "alloy",
  "hyperliquid-client",
@@ -4211,7 +4211,7 @@ dependencies = [
 
 [[package]]
 name = "market-pricing"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "chrono",
  "reqwest",
@@ -4576,7 +4576,7 @@ dependencies = [
 
 [[package]]
 name = "observability"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "metrics-exporter-prometheus",
  "opentelemetry",
@@ -4705,7 +4705,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "otc-models"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "alloy",
  "chrono",
@@ -5252,7 +5252,7 @@ dependencies = [
 
 [[package]]
 name = "rand-wallet"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "alloy",
  "bitcoin",
@@ -5524,7 +5524,7 @@ dependencies = [
 
 [[package]]
 name = "router-primitives"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "alloy",
  "argon2",
@@ -5537,7 +5537,7 @@ dependencies = [
 
 [[package]]
 name = "router-server"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "alloy",
  "async-trait",
@@ -5794,7 +5794,7 @@ dependencies = [
 
 [[package]]
 name = "sauron"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "alloy",
  "async-trait",
@@ -7269,7 +7269,7 @@ checksum = "daf8dba3b7eb870caf1ddeed7bc9d2a049f3cfdfae7cb521b087cc33ae4c49da"
 
 [[package]]
 name = "utc"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "chrono",
  "mock_instant",

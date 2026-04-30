@@ -17,7 +17,7 @@ export const DependencyHealthResponseSchema = z
     dependencies: z.array(
       z.object({
         name: z.string(),
-        status: z.enum(['ok', 'down', 'unknown']),
+        status: z.enum(['reachable', 'unreachable', 'unknown']),
         checkedAt: z.string().datetime().optional(),
         latencyMs: z.number().int().nonnegative().optional(),
         httpStatus: z.number().int().positive().optional(),
