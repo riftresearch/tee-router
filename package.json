@@ -7,6 +7,10 @@
     "packages/*"
   ],
   "scripts": {
+    "admin-dashboard:build": "bun --filter @rift/admin-dashboard build",
+    "admin-dashboard:dev": "bun --filter @rift/admin-dashboard dev",
+    "admin-dashboard:start": "bun --filter @rift/admin-dashboard start",
+    "admin-dashboard:typecheck": "bun --filter @rift/admin-dashboard typecheck",
     "explorer:dev": "bun --filter @rift/explorer dev",
     "explorer:build": "bun --filter @rift/explorer build",
     "explorer:start": "bun --filter @rift/explorer start",
