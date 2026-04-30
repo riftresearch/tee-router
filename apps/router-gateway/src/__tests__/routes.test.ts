@@ -82,15 +82,30 @@ describe('router gateway routes', () => {
       healthTargets: [
         {
           name: 'router-api',
-          url: 'http://router.internal/status',
+          url: 'http://router.internal/api/v1/provider-health',
           method: 'GET' as const,
-          timeoutMs: 1_000
+          timeoutMs: 1_000,
+          response: 'routerProviderHealth' as const
         }
       ]
     }
     const monitor = createDependencyHealthMonitor(
       config,
-      mockFetch(calls, async () => Response.json({ status: 'ok' }))
+      mockFetch(calls, async () =>
+        Response.json({
+          status: 'ok',
+          timestamp: '2026-04-30T16:46:58.105Z',
+          providers: [
+            {
+              provider: 'hyperliquid',
+              status: 'ok',
+              checked_at: '2026-04-30T16:46:58.105Z',
+              latency_ms: 20,
+              http_status: 200
+            }
+          ]
+        })
+      )
     )
     await monitor.refresh()
 
@@ -102,12 +117,12 @@ describe('router gateway routes', () => {
     expect(body.status).toBe('ok')
     expect(body.dependencies).toHaveLength(1)
     expect(body.dependencies[0]).toMatchObject({
-      name: 'router-api',
+      name: 'hyperliquid',
       status: 'ok',
       httpStatus: 200
     })
     expect(body.dependencies[0].url).toBeUndefined()
-    expect(calls[0]?.path).toBe('/status')
+    expect(calls[0]?.path).toBe('/api/v1/provider-health')
   })
 
   test('serves fully permissive CORS headers', async () => {

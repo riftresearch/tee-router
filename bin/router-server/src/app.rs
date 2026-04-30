@@ -9,6 +9,7 @@ use crate::{
         },
         AcrossHttpProviderConfig, ActionProviderRegistry, AddressScreeningService,
         CctpHttpProviderConfig, CustodyActionExecutor, OrderExecutionManager, OrderManager,
+        ProviderHealthPoller, ProviderHealthProbe, ProviderHealthService, ProviderId,
         ProviderPolicyService, RouteCostService, RouteMinimumService, VaultManager,
         VeloraHttpProviderConfig,
     },
@@ -23,6 +24,7 @@ use chains::{
 };
 use market_pricing::{MarketPricingOracle, MarketPricingOracleConfig};
 use router_primitives::ChainType;
+use serde_json::json;
 use snafu::ResultExt;
 use std::{sync::Arc, time::Duration};
 use tracing::warn;
@@ -42,6 +44,8 @@ pub struct RouterComponents {
     pub order_manager: Arc<OrderManager>,
     pub order_execution_manager: Arc<OrderExecutionManager>,
     pub provider_policies: Arc<ProviderPolicyService>,
+    pub provider_health: Arc<ProviderHealthService>,
+    pub provider_health_poller: Arc<ProviderHealthPoller>,
     pub route_costs: Arc<RouteCostService>,
     pub address_screener: Option<Arc<AddressScreeningService>>,
 }
@@ -92,6 +96,12 @@ pub async fn initialize_components_with_action_providers(
     let chain_registry = Arc::new(initialize_chain_registry(args, paymaster_mode).await?);
     let paymasters = paymaster_registry(args)?;
     let provider_policies = Arc::new(ProviderPolicyService::new(db.clone()));
+    let provider_health = Arc::new(ProviderHealthService::new(db.clone()));
+    let provider_health_poller = Arc::new(initialize_provider_health_poller(
+        args,
+        provider_health.clone(),
+        worker_id.as_deref().unwrap_or("router-api"),
+    )?);
     let route_costs = Arc::new(initialize_route_costs(
         args,
         db.clone(),
@@ -108,7 +118,8 @@ pub async fn initialize_components_with_action_providers(
         )
         .with_route_minimums(Some(route_minimums))
         .with_route_costs(Some(route_costs.clone()))
-        .with_provider_policies(Some(provider_policies.clone())),
+        .with_provider_policies(Some(provider_policies.clone()))
+        .with_provider_health(Some(provider_health.clone())),
     );
     let custody_action_executor = Arc::new(
         CustodyActionExecutor::new(db.clone(), settings.clone(), chain_registry.clone())
@@ -141,9 +152,87 @@ pub async fn initialize_components_with_action_providers(
         order_manager,
         order_execution_manager,
         provider_policies,
+        provider_health,
+        provider_health_poller,
         route_costs,
         address_screener,
     })
+}
+
+fn initialize_provider_health_poller(
+    args: &RouterServerArgs,
+    provider_health: Arc<ProviderHealthService>,
+    updated_by: &str,
+) -> Result<ProviderHealthPoller> {
+    ProviderHealthPoller::new(
+        provider_health,
+        provider_health_probes(args)?,
+        updated_by.to_string(),
+        Duration::from_secs(args.provider_health_timeout_seconds),
+    )
+    .map_err(|source| crate::Error::DatabaseInit { source })
+}
+
+fn provider_health_probes(args: &RouterServerArgs) -> Result<Vec<ProviderHealthProbe>> {
+    let mut probes = Vec::new();
+
+    if let Some(base_url) =
+        normalize_optional_url(args.across_api_url.as_deref(), "Across API URL")?
+    {
+        let probe = ProviderHealthProbe::get(
+            ProviderId::Across.as_str(),
+            format!("{base_url}/deposit/status"),
+        )
+        .with_bearer_token(required_across_api_key(args.across_api_key.as_deref())?);
+        probes.push(probe);
+    }
+
+    let cctp_base_url = normalize_optional_url(args.cctp_api_url.as_deref(), "CCTP API URL")?
+        .unwrap_or_else(|| CCTP_IRIS_DEFAULT_BASE_URL_FOR_CONFIG.to_string());
+    probes.push(ProviderHealthProbe::get(
+        ProviderId::Cctp.as_str(),
+        format!(
+            "{cctp_base_url}/v2/messages/0?transactionHash=0x0000000000000000000000000000000000000000000000000000000000000000"
+        ),
+    ));
+
+    if let Some(base_url) =
+        normalize_optional_url(args.hyperunit_api_url.as_deref(), "HyperUnit API URL")?
+    {
+        probes.push(ProviderHealthProbe::get(
+            ProviderId::Unit.as_str(),
+            format!(
+                "{base_url}/gen/ethereum/hyperliquid/eth/0x0000000000000000000000000000000000000000"
+            ),
+        ));
+    }
+
+    if let Some(base_url) =
+        normalize_optional_url(args.hyperliquid_api_url.as_deref(), "Hyperliquid API URL")?
+    {
+        let health_body = json!({ "type": "spotMeta" });
+        probes.push(ProviderHealthProbe::post_json(
+            ProviderId::Hyperliquid.as_str(),
+            format!("{base_url}/info"),
+            health_body.clone(),
+        ));
+        probes.push(ProviderHealthProbe::post_json(
+            ProviderId::HyperliquidBridge.as_str(),
+            format!("{base_url}/info"),
+            health_body,
+        ));
+    }
+
+    if let Some(base_url) =
+        normalize_optional_url(args.velora_api_url.as_deref(), "Velora API URL")?
+    {
+        probes.push(ProviderHealthProbe::get(
+            ProviderId::Velora.as_str(),
+            format!("{base_url}/prices"),
+        ));
+    }
+
+    Ok(probes)
 }
 
 fn initialize_route_costs(
@@ -563,6 +652,8 @@ mod tests {
             worker_refund_poll_seconds: 60,
             worker_order_execution_poll_seconds: 5,
             worker_route_cost_refresh_seconds: 300,
+            worker_provider_health_poll_seconds: 120,
+            provider_health_timeout_seconds: 10,
             coinbase_price_api_base_url: "https://api.coinbase.com".to_string(),
         }
     }

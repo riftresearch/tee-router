@@ -3,6 +3,7 @@ export type HealthTargetConfig = {
   url: string
   method: 'GET' | 'HEAD'
   timeoutMs: number
+  response: 'generic' | 'routerProviderHealth'
 }
 
 export type GatewayConfig = {
@@ -121,9 +122,10 @@ function defaultHealthTargets(input: {
       ? [
           {
             name: 'router-api',
-            url: `${input.routerInternalBaseUrl}/status`,
+            url: `${input.routerInternalBaseUrl}/api/v1/provider-health`,
             method: 'GET' as const,
-            timeoutMs: input.timeoutMs
+            timeoutMs: input.timeoutMs,
+            response: 'routerProviderHealth' as const
           }
         ]
       : []),
@@ -133,7 +135,8 @@ function defaultHealthTargets(input: {
             name: 'router-query-api',
             url: `${input.routerQueryApiBaseUrl}/status`,
             method: 'GET' as const,
-            timeoutMs: input.timeoutMs
+            timeoutMs: input.timeoutMs,
+            response: 'generic' as const
           }
         ]
       : [])
@@ -190,7 +193,8 @@ function parseHealthTarget(
     name,
     url,
     method,
-    timeoutMs
+    timeoutMs,
+    response: 'generic'
   }
 }
 

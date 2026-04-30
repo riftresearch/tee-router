@@ -302,6 +302,22 @@ pub struct RouterServerArgs {
     )]
     pub worker_route_cost_refresh_seconds: u64,
 
+    /// Active router-worker provider health poll interval, in seconds
+    #[arg(
+        long,
+        env = "ROUTER_WORKER_PROVIDER_HEALTH_POLL_SECONDS",
+        default_value = "120"
+    )]
+    pub worker_provider_health_poll_seconds: u64,
+
+    /// Timeout for individual provider health probes, in seconds
+    #[arg(
+        long,
+        env = "ROUTER_PROVIDER_HEALTH_TIMEOUT_SECONDS",
+        default_value = "10"
+    )]
+    pub provider_health_timeout_seconds: u64,
+
     /// Coinbase unauthenticated price API base URL used by route-cost pricing refresh
     #[arg(
         long,

@@ -9,6 +9,7 @@ pub mod market_order_planner;
 pub mod order_executor;
 pub mod order_manager;
 pub mod pricing;
+pub mod provider_health;
 pub mod provider_policy;
 pub mod quote_legs;
 pub mod route_costs;
@@ -38,6 +39,10 @@ pub use order_executor::{
 };
 pub use order_manager::OrderManager;
 pub use pricing::PricingSnapshot;
+pub use provider_health::{
+    ProviderHealthPollSummary, ProviderHealthPoller, ProviderHealthProbe, ProviderHealthService,
+    ProviderHealthSnapshot,
+};
 pub use provider_policy::{ProviderPolicyService, ProviderPolicySnapshot};
 pub use route_costs::{RouteCostRefreshSummary, RouteCostService, RouteCostSnapshot};
 pub use route_minimums::{RouteMinimumError, RouteMinimumService, RouteMinimumSnapshot};

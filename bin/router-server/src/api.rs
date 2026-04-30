@@ -3,8 +3,8 @@ use crate::{
         empty_metadata, CustodyVault, DepositVaultFundingHint, MarketOrderQuote,
         OrderExecutionAttempt, OrderExecutionStep, OrderExecutionStepStatus,
         OrderProviderOperation, OrderProviderOperationHint, ProviderExecutionPolicyState,
-        ProviderOperationHintKind, ProviderPolicy, ProviderQuotePolicyState, RouterOrder,
-        RouterOrderStatus, VaultAction,
+        ProviderHealthCheck, ProviderHealthSummaryStatus, ProviderOperationHintKind,
+        ProviderPolicy, ProviderQuotePolicyState, RouterOrder, RouterOrderStatus, VaultAction,
     },
     protocol::DepositAsset,
 };
@@ -173,6 +173,13 @@ pub struct ProviderPolicyEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderPolicyListEnvelope {
     pub policies: Vec<ProviderPolicy>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderHealthEnvelope {
+    pub status: ProviderHealthSummaryStatus,
+    pub timestamp: DateTime<Utc>,
+    pub providers: Vec<ProviderHealthCheck>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

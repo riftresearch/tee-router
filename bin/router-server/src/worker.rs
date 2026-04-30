@@ -5,7 +5,8 @@ use crate::{
     services::{
         order_executor::OrderWorkerPassSummary,
         vault_manager::{FundingHintPassSummary, RefundPassSummary},
-        OrderExecutionManager, RouteCostRefreshSummary, RouteCostService, VaultManager,
+        OrderExecutionManager, ProviderHealthPollSummary, ProviderHealthPoller,
+        RouteCostRefreshSummary, RouteCostService, VaultManager,
     },
     telemetry, Error, Result, RouterServerArgs,
 };
@@ -42,6 +43,7 @@ pub struct RouterWorkerConfig {
     pub lease_renew_interval: Duration,
     pub standby_poll_interval: Duration,
     pub route_cost_refresh_interval: Duration,
+    pub provider_health_poll_interval: Duration,
 }
 
 impl RouterWorkerConfig {
@@ -58,6 +60,14 @@ impl RouterWorkerConfig {
         ensure_positive_seconds(
             "worker route-cost refresh seconds",
             args.worker_route_cost_refresh_seconds,
+        )?;
+        ensure_positive_seconds(
+            "worker provider-health poll seconds",
+            args.worker_provider_health_poll_seconds,
+        )?;
+        ensure_positive_seconds(
+            "provider health timeout seconds",
+            args.provider_health_timeout_seconds,
         )?;
         if args.worker_lease_renew_seconds >= args.worker_lease_seconds {
             return Err(invalid_worker_config(
@@ -85,6 +95,9 @@ impl RouterWorkerConfig {
             standby_poll_interval: Duration::from_secs(args.worker_standby_poll_seconds),
             route_cost_refresh_interval: Duration::from_secs(
                 args.worker_route_cost_refresh_seconds,
+            ),
+            provider_health_poll_interval: Duration::from_secs(
+                args.worker_provider_health_poll_seconds,
             ),
         })
     }
@@ -152,6 +165,7 @@ struct VaultWorkOutcome {
 type VaultTaskResult = std::result::Result<VaultWorkOutcome, String>;
 type OrderTaskResult = std::result::Result<OrderWorkerPassSummary, String>;
 type RouteCostTaskResult = std::result::Result<RouteCostRefreshSummary, String>;
+type ProviderHealthTaskResult = std::result::Result<ProviderHealthPollSummary, String>;
 type QuoteCleanupTaskResult = std::result::Result<u64, String>;
 
 pub async fn run_worker(args: RouterServerArgs) -> Result<()> {
@@ -173,6 +187,7 @@ pub async fn run_worker(args: RouterServerArgs) -> Result<()> {
         components.vault_manager,
         components.order_execution_manager,
         components.route_costs,
+        components.provider_health_poller,
         config,
     )
     .await
@@ -186,6 +201,7 @@ pub async fn run_worker_loop(
     vault_manager: Arc<VaultManager>,
     order_execution_manager: Arc<OrderExecutionManager>,
     route_costs: Arc<RouteCostService>,
+    provider_health_poller: Arc<ProviderHealthPoller>,
     config: RouterWorkerConfig,
 ) -> BackgroundTaskResult {
     let lease_repo = db.worker_leases();
@@ -194,6 +210,8 @@ pub async fn run_worker_loop(
     lease_renew_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut route_cost_refresh_interval = interval(config.route_cost_refresh_interval);
     route_cost_refresh_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut provider_health_poll_interval = interval(config.provider_health_poll_interval);
+    provider_health_poll_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut quote_cleanup_interval = interval(QUOTE_CLEANUP_INTERVAL);
     quote_cleanup_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut worker_listener = PgListener::connect(&config.database_url)
@@ -214,10 +232,12 @@ pub async fn run_worker_loop(
     let mut vault_tasks: JoinSet<VaultTaskResult> = JoinSet::new();
     let mut order_execution_tasks: JoinSet<OrderTaskResult> = JoinSet::new();
     let mut route_cost_tasks: JoinSet<RouteCostTaskResult> = JoinSet::new();
+    let mut provider_health_tasks: JoinSet<ProviderHealthTaskResult> = JoinSet::new();
     let mut quote_cleanup_tasks: JoinSet<QuoteCleanupTaskResult> = JoinSet::new();
     let mut order_wake_queue = OrderWakeQueue::default();
     let mut pending_vault_wakeup = false;
     let mut pending_route_cost_refresh = false;
+    let mut pending_provider_health_poll = false;
     let mut pending_quote_cleanup = false;
     let mut next_refund_due_at: Option<DateTime<Utc>> = None;
 
@@ -236,6 +256,7 @@ pub async fn run_worker_loop(
                     active_lease = Some(lease);
                     lease_renew_interval.reset();
                     route_cost_refresh_interval.reset();
+                    provider_health_poll_interval.reset();
                     quote_cleanup_interval.reset();
                     order_wake_queue.enqueue_global();
                     spawn_order_execution_work_if_idle(
@@ -254,6 +275,12 @@ pub async fn run_worker_loop(
                         &mut route_cost_tasks,
                         route_costs.clone(),
                         &mut pending_route_cost_refresh,
+                    );
+                    pending_provider_health_poll = true;
+                    spawn_provider_health_poll_if_idle(
+                        &mut provider_health_tasks,
+                        provider_health_poller.clone(),
+                        &mut pending_provider_health_poll,
                     );
                     pending_quote_cleanup = true;
                     spawn_quote_cleanup_if_idle(
@@ -297,10 +324,12 @@ pub async fn run_worker_loop(
                         abort_vault_tasks(&mut vault_tasks).await;
                         abort_order_execution_tasks(&mut order_execution_tasks).await;
                         abort_route_cost_tasks(&mut route_cost_tasks).await;
+                        abort_provider_health_tasks(&mut provider_health_tasks).await;
                         abort_quote_cleanup_tasks(&mut quote_cleanup_tasks).await;
                         order_wake_queue = OrderWakeQueue::default();
                         pending_vault_wakeup = false;
                         pending_route_cost_refresh = false;
+                        pending_provider_health_poll = false;
                         pending_quote_cleanup = false;
                         next_refund_due_at = None;
                     }
@@ -325,6 +354,14 @@ pub async fn run_worker_loop(
                     &mut route_cost_tasks,
                     route_costs.clone(),
                     &mut pending_route_cost_refresh,
+                );
+            }
+            _ = provider_health_poll_interval.tick(), if provider_health_tasks.is_empty() => {
+                pending_provider_health_poll = true;
+                spawn_provider_health_poll_if_idle(
+                    &mut provider_health_tasks,
+                    provider_health_poller.clone(),
+                    &mut pending_provider_health_poll,
                 );
             }
             _ = quote_cleanup_interval.tick(), if quote_cleanup_tasks.is_empty() => {
@@ -410,6 +447,20 @@ pub async fn run_worker_loop(
                     &mut route_cost_tasks,
                     route_costs.clone(),
                     &mut pending_route_cost_refresh,
+                );
+            }
+            provider_health_result = provider_health_tasks.join_next(), if !provider_health_tasks.is_empty() => {
+                let summary = handle_provider_health_task_result(provider_health_result)?;
+                info!(
+                    checked = summary.checked,
+                    healthy = summary.healthy,
+                    down = summary.down,
+                    "Router worker refreshed provider health"
+                );
+                spawn_provider_health_poll_if_idle(
+                    &mut provider_health_tasks,
+                    provider_health_poller.clone(),
+                    &mut pending_provider_health_poll,
                 );
             }
             quote_cleanup_result = quote_cleanup_tasks.join_next(), if !quote_cleanup_tasks.is_empty() => {
@@ -511,6 +562,17 @@ fn spawn_route_cost_refresh_if_idle(
     }
 }
 
+fn spawn_provider_health_poll_if_idle(
+    provider_health_tasks: &mut JoinSet<ProviderHealthTaskResult>,
+    provider_health_poller: Arc<ProviderHealthPoller>,
+    pending_provider_health_poll: &mut bool,
+) {
+    if provider_health_tasks.is_empty() && *pending_provider_health_poll {
+        *pending_provider_health_poll = false;
+        provider_health_tasks.spawn(run_provider_health_poll(provider_health_poller));
+    }
+}
+
 fn spawn_quote_cleanup_if_idle(
     quote_cleanup_tasks: &mut JoinSet<QuoteCleanupTaskResult>,
     db: Database,
@@ -591,6 +653,18 @@ async fn run_route_cost_refresh(route_costs: Arc<RouteCostService>) -> RouteCost
     Ok(summary)
 }
 
+async fn run_provider_health_poll(
+    provider_health_poller: Arc<ProviderHealthPoller>,
+) -> ProviderHealthTaskResult {
+    let started = Instant::now();
+    let summary = provider_health_poller
+        .poll_once()
+        .await
+        .map_err(|err| err.to_string())?;
+    telemetry::record_worker_tick("provider_health", started.elapsed());
+    Ok(summary)
+}
+
 async fn run_quote_cleanup(db: Database) -> QuoteCleanupTaskResult {
     let started = Instant::now();
     let deleted = db
@@ -641,6 +715,19 @@ fn handle_route_cost_task_result(
     }
 }
 
+fn handle_provider_health_task_result(
+    result: Option<std::result::Result<ProviderHealthTaskResult, JoinError>>,
+) -> std::result::Result<ProviderHealthPollSummary, String> {
+    match result {
+        Some(Ok(Ok(summary))) => Ok(summary),
+        Some(Ok(Err(error))) => Err(format!("provider health poll failed: {error}")),
+        Some(Err(error)) => Err(format!(
+            "provider health poll panicked or was cancelled: {error}"
+        )),
+        None => Err("provider health task set terminated unexpectedly".to_string()),
+    }
+}
+
 fn handle_quote_cleanup_task_result(
     result: Option<std::result::Result<QuoteCleanupTaskResult, JoinError>>,
 ) -> std::result::Result<u64, String> {
@@ -665,6 +752,13 @@ async fn abort_order_execution_tasks(order_execution_tasks: &mut JoinSet<OrderTa
 async fn abort_route_cost_tasks(route_cost_tasks: &mut JoinSet<RouteCostTaskResult>) {
     route_cost_tasks.abort_all();
     while route_cost_tasks.join_next().await.is_some() {}
+}
+
+async fn abort_provider_health_tasks(
+    provider_health_tasks: &mut JoinSet<ProviderHealthTaskResult>,
+) {
+    provider_health_tasks.abort_all();
+    while provider_health_tasks.join_next().await.is_some() {}
 }
 
 async fn abort_quote_cleanup_tasks(quote_cleanup_tasks: &mut JoinSet<QuoteCleanupTaskResult>) {

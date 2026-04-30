@@ -62,14 +62,9 @@ export class DependencyHealthMonitor {
   }
 
   snapshot(now = new Date()): DependencyHealthSnapshot {
-    const dependencies = this.targets.map((target) => {
-      return (
-        this.states.get(target.name) ?? {
-          name: target.name,
-          status: 'unknown' as const
-        }
-      )
-    })
+    const dependencies = [...this.states.values()].sort((left, right) =>
+      left.name.localeCompare(right.name)
+    )
 
     return {
       status: dependencies.some((dependency) => dependency.status === 'down')
@@ -105,7 +100,14 @@ export class DependencyHealthMonitor {
         signal: controller.signal
       })
       const latencyMs = Date.now() - startedAt
-      await response.arrayBuffer().catch(() => undefined)
+      const responseBody = await response.text().catch(() => '')
+      if (
+        response.ok &&
+        target.response === 'routerProviderHealth' &&
+        this.applyRouterProviderHealth(target, responseBody)
+      ) {
+        return
+      }
 
       this.states.set(target.name, {
         name: target.name,
@@ -127,6 +129,52 @@ export class DependencyHealthMonitor {
       clearTimeout(timeout)
     }
   }
+
+  private applyRouterProviderHealth(
+    target: HealthTargetConfig,
+    body: string
+  ): boolean {
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(body)
+    } catch {
+      return false
+    }
+    if (!isRecord(parsed) || !Array.isArray(parsed.providers)) return false
+
+    this.states.delete(target.name)
+    for (const provider of parsed.providers) {
+      if (!isRecord(provider) || typeof provider.provider !== 'string') continue
+      const status =
+        provider.status === 'down'
+          ? 'down'
+          : provider.status === 'unknown'
+            ? 'unknown'
+            : 'ok'
+      this.states.set(provider.provider, {
+        name: provider.provider,
+        status,
+        ...(typeof provider.checked_at === 'string'
+          ? { checkedAt: provider.checked_at }
+          : {}),
+        ...(typeof provider.latency_ms === 'number'
+          ? { latencyMs: provider.latency_ms }
+          : {}),
+        ...(typeof provider.http_status === 'number'
+          ? { httpStatus: provider.http_status }
+          : {}),
+        ...(typeof provider.error === 'string' ? { error: provider.error } : {})
+      })
+    }
+
+    if (parsed.providers.length === 0) {
+      this.states.set(target.name, {
+        name: target.name,
+        status: 'unknown'
+      })
+    }
+    return true
+  }
 }
 
 export function createDependencyHealthMonitor(
@@ -138,4 +186,8 @@ export function createDependencyHealthMonitor(
     pollIntervalMs: config.healthPollIntervalMs,
     fetch: fetcher
   })
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
 }

@@ -322,6 +322,76 @@ impl ProviderPolicy {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum ProviderHealthStatus {
+    Ok,
+    Down,
+    Unknown,
+}
+
+impl ProviderHealthStatus {
+    #[must_use]
+    pub fn to_db_string(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Down => "down",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn from_db_string(value: &str) -> Option<Self> {
+        match value {
+            "ok" => Some(Self::Ok),
+            "down" => Some(Self::Down),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn allows_new_routes(self) -> bool {
+        !matches!(self, Self::Down)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderHealthCheck {
+    pub provider: String,
+    pub status: ProviderHealthStatus,
+    pub checked_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub updated_by: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderHealthSummaryStatus {
+    Ok,
+    Degraded,
+}
+
+impl ProviderHealthSummaryStatus {
+    #[must_use]
+    pub fn from_checks(checks: &[ProviderHealthCheck]) -> Self {
+        if checks
+            .iter()
+            .any(|check| matches!(check.status, ProviderHealthStatus::Down))
+        {
+            Self::Degraded
+        } else {
+            Self::Ok
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum CustodyVaultRole {
     SourceDeposit,
     DestinationExecution,

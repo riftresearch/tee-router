@@ -1,7 +1,7 @@
 use crate::{
     api::{
         CreateOrderCancellationRequest, CreateOrderRequest, CreateQuoteRequest, CreateVaultRequest,
-        DetectorHintEnvelope, DetectorHintRequest, DetectorHintTarget,
+        DetectorHintEnvelope, DetectorHintRequest, DetectorHintTarget, ProviderHealthEnvelope,
         ProviderOperationHintEnvelope, ProviderOperationHintRequest,
         ProviderOperationObserveRequest, ProviderPolicyEnvelope, ProviderPolicyListEnvelope,
         QuoteRequestType, UpdateProviderPolicyRequest, VaultFundingHintEnvelope,
@@ -18,8 +18,8 @@ use crate::{
     services::{
         action_providers::ProviderOperationObservation,
         vault_manager::compute_cancellation_commitment_hex, AddressScreeningPurpose,
-        AddressScreeningService, OrderExecutionManager, OrderManager, ProviderPolicyService,
-        VaultManager,
+        AddressScreeningService, OrderExecutionManager, OrderManager, ProviderHealthService,
+        ProviderPolicyService, VaultManager,
     },
     Result, RouterServerArgs,
 };
@@ -33,6 +33,7 @@ use axum::{
     Json, Router,
 };
 use chains::ChainRegistry;
+use chrono::Utc;
 use snafu::ResultExt;
 use std::{net::SocketAddr, sync::Arc, time::Instant};
 use tower_http::{
@@ -92,6 +93,7 @@ pub struct AppState {
     pub vault_manager: Arc<VaultManager>,
     pub order_manager: Arc<OrderManager>,
     pub order_execution_manager: Arc<OrderExecutionManager>,
+    pub provider_health: Arc<ProviderHealthService>,
     pub provider_policies: Arc<ProviderPolicyService>,
     pub address_screener: Option<Arc<AddressScreeningService>>,
     pub chain_registry: Arc<ChainRegistry>,
@@ -112,6 +114,7 @@ async fn serve_api(args: RouterServerArgs, components: RouterComponents) -> Resu
         vault_manager: components.vault_manager,
         order_manager: components.order_manager,
         order_execution_manager: components.order_execution_manager,
+        provider_health: components.provider_health,
         provider_policies: components.provider_policies,
         address_screener: components.address_screener,
         chain_registry: components.chain_registry,
@@ -138,6 +141,7 @@ pub fn build_api_router(state: AppState, cors_domain: Option<String>) -> Router 
         .route("/api/v1/quotes/:id", get(get_quote))
         .route("/api/v1/orders", post(create_order))
         .route("/api/v1/orders/:id", get(get_order))
+        .route("/api/v1/provider-health", get(get_provider_health))
         .route(
             "/api/v1/orders/:id/cancellations",
             post(create_order_cancellation),
@@ -527,6 +531,17 @@ async fn list_provider_policies(
     authorize_admin_api_request(&state, &headers)?;
     let policies = state.provider_policies.list().await?;
     Ok(Json(ProviderPolicyListEnvelope { policies }))
+}
+
+async fn get_provider_health(
+    State(state): State<AppState>,
+) -> RouterServerResult<Json<ProviderHealthEnvelope>> {
+    let providers = state.provider_health.list().await?;
+    Ok(Json(ProviderHealthEnvelope {
+        status: crate::models::ProviderHealthSummaryStatus::from_checks(&providers),
+        timestamp: Utc::now(),
+        providers,
+    }))
 }
 
 async fn update_provider_policy(

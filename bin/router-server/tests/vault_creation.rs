@@ -557,6 +557,8 @@ fn test_router_args(
         worker_refund_poll_seconds: 60,
         worker_order_execution_poll_seconds: 5,
         worker_route_cost_refresh_seconds: 300,
+        worker_provider_health_poll_seconds: 120,
+        provider_health_timeout_seconds: 10,
         coinbase_price_api_base_url: "http://127.0.0.1:9".to_string(),
     }
 }
@@ -596,6 +598,7 @@ async fn spawn_router_api_from_components_with_auth(
             vault_manager: components.vault_manager,
             order_manager: components.order_manager,
             order_execution_manager: components.order_execution_manager,
+            provider_health: components.provider_health,
             provider_policies: components.provider_policies,
             address_screener: components.address_screener,
             chain_registry: components.chain_registry,

@@ -40,7 +40,8 @@ bun run router-gateway:typecheck
 
 The gateway automatically monitors configured router upstreams:
 
-- `ROUTER_INTERNAL_BASE_URL/status` as `router-api`
+- `ROUTER_INTERNAL_BASE_URL/api/v1/provider-health` as the provider health
+  source from router-api
 - `ROUTER_QUERY_API_BASE_URL/status` as `router-query-api`, when configured
 
 ## Routes

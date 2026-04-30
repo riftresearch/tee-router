@@ -1,10 +1,12 @@
 pub mod order_repo;
+pub mod provider_health_repo;
 pub mod provider_policy_repo;
 pub mod route_cost_repo;
 pub mod vault_repo;
 pub mod worker_lease_repo;
 
 pub use order_repo::OrderRepository;
+pub use provider_health_repo::ProviderHealthRepository;
 pub use provider_policy_repo::ProviderPolicyRepository;
 pub use route_cost_repo::RouteCostRepository;
 pub use vault_repo::VaultRepository;
@@ -74,6 +76,11 @@ impl Database {
     #[must_use]
     pub fn provider_policies(&self) -> ProviderPolicyRepository {
         ProviderPolicyRepository::new(self.pool.clone())
+    }
+
+    #[must_use]
+    pub fn provider_health(&self) -> ProviderHealthRepository {
+        ProviderHealthRepository::new(self.pool.clone())
     }
 
     #[must_use]

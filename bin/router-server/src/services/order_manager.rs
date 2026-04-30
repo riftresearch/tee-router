@@ -22,6 +22,7 @@ use crate::{
             optimized_paymaster_reimbursement_plan_with_pricing, transition_retention_amount,
             GasReimbursementError, GasReimbursementPlan,
         },
+        provider_health::ProviderHealthService,
         provider_policy::ProviderPolicyService,
         quote_legs::{QuoteLeg, QuoteLegAsset, QuoteLegSpec},
         route_costs::{rank_transition_paths_structurally, RouteCostService},
@@ -156,6 +157,7 @@ struct ComposeTransitionPathQuoteRequest<'a> {
     source_depositor_address: &'a str,
     path: &'a TransitionPath,
     provider_policy_snapshot: Option<&'a crate::services::ProviderPolicySnapshot>,
+    provider_health_snapshot: Option<&'a crate::services::ProviderHealthSnapshot>,
     unit: Option<&'a dyn UnitProvider>,
     exchange: Option<&'a dyn ExchangeProvider>,
 }
@@ -169,6 +171,7 @@ pub struct OrderManager {
     route_minimums: Option<Arc<RouteMinimumService>>,
     route_costs: Option<Arc<RouteCostService>>,
     provider_policies: Option<Arc<ProviderPolicyService>>,
+    provider_health: Option<Arc<ProviderHealthService>>,
 }
 
 impl OrderManager {
@@ -199,6 +202,7 @@ impl OrderManager {
             route_minimums: None,
             route_costs: None,
             provider_policies: None,
+            provider_health: None,
         }
     }
 
@@ -220,6 +224,15 @@ impl OrderManager {
         provider_policies: Option<Arc<ProviderPolicyService>>,
     ) -> Self {
         self.provider_policies = provider_policies;
+        self
+    }
+
+    #[must_use]
+    pub fn with_provider_health(
+        mut self,
+        provider_health: Option<Arc<ProviderHealthService>>,
+    ) -> Self {
+        self.provider_health = provider_health;
         self
     }
 
@@ -481,6 +494,16 @@ impl OrderManager {
         } else {
             None
         };
+        let provider_health_snapshot = if let Some(service) = self.provider_health.as_ref() {
+            Some(
+                service
+                    .snapshot()
+                    .await
+                    .map_err(MarketOrderError::database)?,
+            )
+        } else {
+            None
+        };
 
         let mut last_error: Option<MarketOrderError> = None;
         for path in paths {
@@ -494,6 +517,7 @@ impl OrderManager {
                     source_depositor_address,
                     &path,
                     provider_policy_snapshot.as_ref(),
+                    provider_health_snapshot.as_ref(),
                 )
                 .await;
             let quote = match candidate {
@@ -588,6 +612,7 @@ impl OrderManager {
         source_depositor_address: &str,
         path: &TransitionPath,
         provider_policy_snapshot: Option<&crate::services::ProviderPolicySnapshot>,
+        provider_health_snapshot: Option<&crate::services::ProviderHealthSnapshot>,
     ) -> MarketOrderResult<Option<ComposedMarketOrderQuote>> {
         let requires_unit = path.transitions.iter().any(|transition| {
             matches!(
@@ -608,8 +633,11 @@ impl OrderManager {
                 .units()
                 .iter()
                 .filter(|unit| {
-                    provider_allowed_for_new_routes(provider_policy_snapshot, unit.id())
-                        && unit_path_compatible(unit.as_ref(), path)
+                    provider_allowed_for_new_routes(
+                        provider_policy_snapshot,
+                        provider_health_snapshot,
+                        unit.id(),
+                    ) && unit_path_compatible(unit.as_ref(), path)
                 })
                 .cloned()
                 .map(Some)
@@ -626,8 +654,11 @@ impl OrderManager {
                 .exchanges()
                 .iter()
                 .filter(|exchange| {
-                    provider_allowed_for_new_routes(provider_policy_snapshot, exchange.id())
-                        && exchange_path_compatible(exchange.id(), path)
+                    provider_allowed_for_new_routes(
+                        provider_policy_snapshot,
+                        provider_health_snapshot,
+                        exchange.id(),
+                    ) && exchange_path_compatible(exchange.id(), path)
                 })
                 .cloned()
                 .map(Some)
@@ -652,6 +683,7 @@ impl OrderManager {
                         source_depositor_address,
                         path,
                         provider_policy_snapshot,
+                        provider_health_snapshot,
                         unit: unit.as_deref(),
                         exchange: exchange.as_deref(),
                     })
@@ -681,6 +713,7 @@ impl OrderManager {
                         source_depositor_address,
                         path,
                         provider_policy_snapshot,
+                        provider_health_snapshot,
                         unit: unit.as_deref(),
                         exchange: exchange.as_deref(),
                     })
@@ -716,6 +749,7 @@ impl OrderManager {
             source_depositor_address,
             path,
             provider_policy_snapshot,
+            provider_health_snapshot,
             unit,
             exchange,
         } = spec;
@@ -751,8 +785,11 @@ impl OrderManager {
                         | MarketOrderTransitionKind::CctpBridge
                         | MarketOrderTransitionKind::HyperliquidBridgeDeposit => {
                             let bridge_id = transition.provider.as_str();
-                            if !provider_allowed_for_new_routes(provider_policy_snapshot, bridge_id)
-                            {
+                            if !provider_allowed_for_new_routes(
+                                provider_policy_snapshot,
+                                provider_health_snapshot,
+                                bridge_id,
+                            ) {
                                 return Ok(None);
                             }
                             let bridge =
@@ -1101,8 +1138,11 @@ impl OrderManager {
                         | MarketOrderTransitionKind::CctpBridge
                         | MarketOrderTransitionKind::HyperliquidBridgeDeposit => {
                             let bridge_id = transition.provider.as_str();
-                            if !provider_allowed_for_new_routes(provider_policy_snapshot, bridge_id)
-                            {
+                            if !provider_allowed_for_new_routes(
+                                provider_policy_snapshot,
+                                provider_health_snapshot,
+                                bridge_id,
+                            ) {
                                 return Ok(None);
                             }
                             let bridge =
@@ -1563,22 +1603,30 @@ impl OrderManager {
 
 fn provider_allowed_for_new_routes(
     snapshot: Option<&crate::services::ProviderPolicySnapshot>,
+    health: Option<&crate::services::ProviderHealthSnapshot>,
     provider: &str,
 ) -> bool {
-    let Some(snapshot) = snapshot else {
-        return true;
-    };
-    let policy = snapshot.policy(provider);
-    if policy.allows_new_routes() {
-        return true;
+    if let Some(snapshot) = snapshot {
+        let policy = snapshot.policy(provider);
+        if !policy.allows_new_routes() {
+            let reason = if policy.reason.is_empty() {
+                "provider_policy".to_string()
+            } else {
+                policy.reason.clone()
+            };
+            telemetry::record_provider_quote_blocked(provider, &reason);
+            return false;
+        }
     }
-    let reason = if policy.reason.is_empty() {
-        "provider_policy".to_string()
-    } else {
-        policy.reason.clone()
-    };
-    telemetry::record_provider_quote_blocked(provider, &reason);
-    false
+
+    if let Some(health) = health {
+        if !health.allows_new_routes(provider) {
+            telemetry::record_provider_quote_blocked(provider, "provider_health_down");
+            return false;
+        }
+    }
+
+    true
 }
 
 fn is_executable_transition_path(registry: &AssetRegistry, path: &TransitionPath) -> bool {
