@@ -14,6 +14,7 @@ import type {
   StoredRefundAuthorization
 } from '../cancellations/store'
 import type { GatewayConfig } from '../config'
+import { createDependencyHealthMonitor } from '../health'
 import type { FetchLike } from '../internal/router-client'
 
 const QUOTE_ID = '00000000-0000-4000-8000-000000000001'
@@ -32,6 +33,9 @@ describe('router gateway routes', () => {
 
     expect(response.status).toBe(200)
     expect(body.openapi).toBe('3.1.0')
+    expect(body.paths['/health']).toBeDefined()
+    expect(body.paths['/health/dependencies']).toBeDefined()
+    expect(body.paths['/status']).toBeUndefined()
     expect(body.paths['/quote']).toBeDefined()
     expect(body.paths['/order/market']).toBeDefined()
     expect(body.paths['/order/{orderId}/cancel']).toBeDefined()
@@ -60,9 +64,55 @@ describe('router gateway routes', () => {
     ])
   })
 
+  test('serves the public health check shape', async () => {
+    const app = createApp(testConfig())
+    const response = await app.request('/health')
+    const body = await response.json()
+
+    expect(response.status).toBe(200)
+    expect(Object.keys(body).sort()).toEqual(['status', 'timestamp'])
+    expect(body.status).toBe('ok')
+    expect(new Date(body.timestamp).toISOString()).toBe(body.timestamp)
+  })
+
+  test('serves cached dependency health without exposing target URLs', async () => {
+    const calls: RecordedCall[] = []
+    const config = {
+      ...testConfig(),
+      healthTargets: [
+        {
+          name: 'router-api',
+          url: 'http://router.internal/status',
+          method: 'GET' as const,
+          timeoutMs: 1_000
+        }
+      ]
+    }
+    const monitor = createDependencyHealthMonitor(
+      config,
+      mockFetch(calls, async () => Response.json({ status: 'ok' }))
+    )
+    await monitor.refresh()
+
+    const app = createApp(config, { dependencyHealthMonitor: monitor })
+    const response = await app.request('/health/dependencies')
+    const body = await response.json()
+
+    expect(response.status).toBe(200)
+    expect(body.status).toBe('ok')
+    expect(body.dependencies).toHaveLength(1)
+    expect(body.dependencies[0]).toMatchObject({
+      name: 'router-api',
+      status: 'ok',
+      httpStatus: 200
+    })
+    expect(body.dependencies[0].url).toBeUndefined()
+    expect(calls[0]?.path).toBe('/status')
+  })
+
   test('serves fully permissive CORS headers', async () => {
     const app = createApp(testConfig())
-    const response = await app.request('/status', {
+    const response = await app.request('/health', {
       headers: {
         origin: 'https://example.com'
       }
@@ -376,6 +426,9 @@ function testConfig(): GatewayConfig {
     port: 3000,
     routerInternalBaseUrl: 'http://router.internal',
     requestTimeoutMs: 1_000,
+    healthTargets: [],
+    healthPollIntervalMs: 30_000,
+    healthTargetTimeoutMs: 1_000,
     version: 'test'
   }
 }

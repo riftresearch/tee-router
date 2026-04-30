@@ -1,6 +1,7 @@
 import { createApp } from './app'
 import { loadConfig } from './config'
 import { migrateGatewayDatabase } from './database/migrations'
+import { createDependencyHealthMonitor } from './health'
 
 const config = loadConfig()
 
@@ -19,7 +20,10 @@ if (config.gatewayDatabaseUrl) {
   )
 }
 
-const app = createApp(config)
+const dependencyHealthMonitor = createDependencyHealthMonitor(config)
+dependencyHealthMonitor.start()
+
+const app = createApp(config, { dependencyHealthMonitor })
 
 Bun.serve({
   hostname: config.host,

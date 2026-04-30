@@ -4,11 +4,13 @@ import { RouterClient, type FetchLike } from '../internal/router-client'
 import { RouterCancellationSecretBox } from '../cancellations/crypto'
 import { BunSqlRefundAuthorizationStore } from '../cancellations/postgres-store'
 import { RefundAuthorizationService } from '../cancellations/service'
+import type { DependencyHealthMonitor } from '../health'
 
 export type GatewayDeps = {
   refundAuthorizationService?: RefundAuthorizationService
   fetch?: FetchLike
   routerClient?: RouterClient
+  dependencyHealthMonitor?: DependencyHealthMonitor
 }
 
 export function routerClientFor(

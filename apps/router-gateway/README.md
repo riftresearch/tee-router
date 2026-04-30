@@ -30,10 +30,23 @@ bun run router-gateway:typecheck
   used to encrypt stored router cancellation secrets.
 - `ROUTER_GATEWAY_REQUEST_TIMEOUT_MS`: upstream request timeout. Defaults to
   `30000`.
+- `ROUTER_GATEWAY_HEALTH_TARGETS`: optional JSON array of extra dependency
+  health checks: `[{"name":"service","url":"https://service/health"}]`.
+  Targets support optional `method` (`GET` or `HEAD`) and `timeoutMs`.
+- `ROUTER_GATEWAY_HEALTH_POLL_INTERVAL_MS`: dependency health poll interval.
+  Defaults to `30000`.
+- `ROUTER_GATEWAY_HEALTH_TARGET_TIMEOUT_MS`: default timeout per dependency
+  health target. Defaults to `5000`.
+
+The gateway automatically monitors configured router upstreams:
+
+- `ROUTER_INTERNAL_BASE_URL/status` as `router-api`
+- `ROUTER_QUERY_API_BASE_URL/status` as `router-query-api`, when configured
 
 ## Routes
 
-- `GET /status`
+- `GET /health`
+- `GET /health/dependencies`
 - `POST /quote`
 - `POST /order/market`
 - `POST /order/{orderId}/cancel`
@@ -72,7 +85,7 @@ Railway service settings:
 ```txt
 Root directory: /
 Dockerfile path: railway/router-gateway/Dockerfile
-Healthcheck path: /status
+Healthcheck path: /health
 ```
 
 Required Railway variables:
@@ -107,7 +120,8 @@ bun run router-gateway:migrate
 Post-deploy checks:
 
 ```sh
-curl https://<gateway-domain>/status
+curl https://<gateway-domain>/health
+curl https://<gateway-domain>/health/dependencies
 curl https://<gateway-domain>/openapi.json
 ```
 

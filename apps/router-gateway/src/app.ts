@@ -9,14 +9,22 @@ import {
   orderMarketRoute
 } from './routes/order'
 import { type GatewayDeps } from './routes/deps'
+import { createDependencyHealthMonitor } from './health'
+import {
+  createDependencyHealthHandler,
+  createHealthHandler,
+  dependencyHealthRoute,
+  healthRoute
+} from './routes/health'
 import { createQuoteHandler, quoteRoute } from './routes/quote'
-import { createStatusHandler, statusRoute } from './routes/status'
 
 export function createApp(
   config: GatewayConfig = loadConfig(),
   deps: GatewayDeps = {}
 ) {
   const app = new OpenAPIHono()
+  const dependencyHealthMonitor =
+    deps.dependencyHealthMonitor ?? createDependencyHealthMonitor(config, deps.fetch)
 
   app.use(
     '*',
@@ -28,7 +36,11 @@ export function createApp(
     })
   )
 
-  app.openapi(statusRoute, createStatusHandler(config))
+  app.openapi(healthRoute, createHealthHandler())
+  app.openapi(
+    dependencyHealthRoute,
+    createDependencyHealthHandler(dependencyHealthMonitor)
+  )
   // zod-openapi currently narrows handler return types to success responses.
   // These handlers also return the error responses declared on each route.
   app.openapi(quoteRoute, createQuoteHandler(config, deps) as never)
