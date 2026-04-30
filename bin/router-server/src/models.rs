@@ -228,6 +228,8 @@ pub struct RouterOrderEnvelope {
     pub order: RouterOrder,
     pub quote: RouterOrderQuote,
     pub funding_vault: Option<DepositVaultEnvelope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancellation_secret: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

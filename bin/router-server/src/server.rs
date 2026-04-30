@@ -16,7 +16,8 @@ use crate::{
     },
     protocol::{backend_chain_for_id, supported_chain_ids, ChainId},
     services::{
-        action_providers::ProviderOperationObservation, AddressScreeningPurpose,
+        action_providers::ProviderOperationObservation,
+        vault_manager::compute_cancellation_commitment_hex, AddressScreeningPurpose,
         AddressScreeningService, OrderExecutionManager, OrderManager, ProviderPolicyService,
         VaultManager,
     },
@@ -276,6 +277,7 @@ async fn create_order(
     State(state): State<AppState>,
     Json(request): Json<CreateOrderRequest>,
 ) -> RouterServerResult<(StatusCode, Json<RouterOrderEnvelope>)> {
+    let cancellation = generate_order_cancellation_material()?;
     let quote_for_screening = state.order_manager.get_quote(request.quote_id).await?;
     screen_user_address(
         &state,
@@ -301,7 +303,7 @@ async fn create_order(
         deposit_asset: order.source_asset.clone(),
         action: VaultAction::Null,
         recovery_address: request.refund_address,
-        cancellation_commitment: request.cancellation_commitment,
+        cancellation_commitment: cancellation.commitment,
         cancel_after: request.cancel_after,
         metadata: request.metadata,
     };
@@ -326,7 +328,8 @@ async fn create_order(
     };
     let order = state.order_manager.get_order(order.id).await?;
     crate::telemetry::record_order_workflow_event(&order, "order.funding_vault_created");
-    let response = order_response(state.clone(), order, Some(vault)).await?;
+    let mut response = order_response(state.clone(), order, Some(vault)).await?;
+    response.cancellation_secret = cancellation.secret;
     Ok((StatusCode::CREATED, Json(response)))
 }
 
@@ -364,6 +367,23 @@ async fn create_order_cancellation(
     let order = state.order_manager.mark_order_refunding(&order).await?;
     let response = order_response(state, order, Some(vault)).await?;
     Ok(Json(response))
+}
+
+struct OrderCancellationMaterial {
+    commitment: String,
+    secret: Option<String>,
+}
+
+fn generate_order_cancellation_material() -> RouterServerResult<OrderCancellationMaterial> {
+    let mut secret_bytes = [0_u8; 32];
+    getrandom::getrandom(&mut secret_bytes).map_err(|source| RouterServerError::Internal {
+        message: format!("failed to generate cancellation secret: {source}"),
+    })?;
+
+    Ok(OrderCancellationMaterial {
+        commitment: compute_cancellation_commitment_hex(&secret_bytes),
+        secret: Some(format!("0x{}", alloy::hex::encode(secret_bytes))),
+    })
 }
 
 async fn record_provider_operation_hint(
@@ -736,6 +756,7 @@ async fn order_response(
         order,
         quote: quote.into(),
         funding_vault,
+        cancellation_secret: None,
     })
 }
 
@@ -743,6 +764,41 @@ async fn order_response(
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+
+    #[test]
+    fn generated_cancellation_material_returns_secret_and_matching_commitment() {
+        let material =
+            generate_order_cancellation_material().expect("generated cancellation material");
+        let secret = material
+            .secret
+            .as_ref()
+            .expect("generated secret should be returned");
+        let secret_bytes: [u8; 32] =
+            alloy::hex::decode(secret.strip_prefix("0x").unwrap_or(secret))
+                .expect("hex secret")
+                .try_into()
+                .expect("32-byte secret");
+
+        assert_eq!(secret.len(), 66);
+        assert_eq!(
+            material.commitment,
+            compute_cancellation_commitment_hex(&secret_bytes)
+        );
+    }
+
+    #[test]
+    fn create_order_request_rejects_cancellation_commitment() {
+        let request = serde_json::json!({
+            "quote_id": Uuid::now_v7(),
+            "refund_address": "refund-address",
+            "cancellation_commitment": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        });
+
+        let error = serde_json::from_value::<CreateOrderRequest>(request)
+            .expect_err("cancellation_commitment should not be accepted");
+
+        assert!(error.to_string().contains("unknown field"));
+    }
 
     #[test]
     fn internal_api_auth_accepts_matching_bearer_header() {
