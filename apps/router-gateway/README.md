@@ -46,10 +46,13 @@ the long-term public API aims to make quotes addressless.
 
 `POST /order/market` supports:
 
-- `cancellation.mode = "user_secret"`: returns the router cancellation secret
-  directly.
-- `cancellation.mode = "gateway_managed_token"`: stores the router cancellation
-  secret encrypted in gateway Postgres and returns a gateway cancellation token.
+- `refundMode = "evmSignature"`: default mode. `refundAuthorizer` must be the
+  EVM address allowed to cancel/refund the order with an EIP-712 signature.
+- `refundMode = "token"`: `refundAuthorizer` must be `null`. The gateway stores
+  the router cancellation secret encrypted in Postgres and returns an opaque
+  `refundToken`.
+
+The public gateway API never returns the raw router cancellation secret.
 
 ## Railway Deployment
 

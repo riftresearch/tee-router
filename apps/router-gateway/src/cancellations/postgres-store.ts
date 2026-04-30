@@ -1,61 +1,62 @@
 import type {
-  CancellationStore,
-  SaveManagedCancellationInput,
-  StoredManagedCancellation
+  RefundAuthorizationStore,
+  RefundMode,
+  SaveRefundAuthorizationInput,
+  StoredRefundAuthorization
 } from './store'
 
-type GatewayCancellationRow = {
+type GatewayRefundAuthorizationRow = {
   router_order_id: string
-  auth_mode: 'gateway_managed_token'
-  auth_policy: Record<string, unknown> | string
+  refund_mode: RefundMode
+  refund_authorizer: string | null
   encrypted_cancellation_secret: string
-  gateway_token_hash: string
+  refund_token_hash: string | null
   cancellation_requested_at: Date | string | null
   created_at: Date | string
   updated_at: Date | string
 }
 
-export class BunSqlCancellationStore implements CancellationStore {
+export class BunSqlRefundAuthorizationStore implements RefundAuthorizationStore {
   constructor(private readonly sql: Bun.SQL) {}
 
-  async saveManagedCancellation(input: SaveManagedCancellationInput): Promise<void> {
+  async saveRefundAuthorization(input: SaveRefundAuthorizationInput): Promise<void> {
     await this.sql`
-      insert into gateway_managed_cancellations (
+      insert into gateway_refund_authorizations (
         router_order_id,
-        auth_mode,
-        auth_policy,
+        refund_mode,
+        refund_authorizer,
         encrypted_cancellation_secret,
-        gateway_token_hash
+        refund_token_hash
       ) values (
         ${input.routerOrderId},
-        ${input.authMode},
-        ${JSON.stringify(input.authPolicy)}::jsonb,
+        ${input.refundMode},
+        ${input.refundAuthorizer},
         ${input.encryptedCancellationSecret},
-        ${input.gatewayTokenHash}
+        ${input.refundTokenHash ?? null}
       )
       on conflict (router_order_id) do update set
-        auth_mode = excluded.auth_mode,
-        auth_policy = excluded.auth_policy,
+        refund_mode = excluded.refund_mode,
+        refund_authorizer = excluded.refund_authorizer,
         encrypted_cancellation_secret = excluded.encrypted_cancellation_secret,
-        gateway_token_hash = excluded.gateway_token_hash,
+        refund_token_hash = excluded.refund_token_hash,
         updated_at = now()
     `
   }
 
-  async findManagedCancellation(
+  async findRefundAuthorization(
     routerOrderId: string
-  ): Promise<StoredManagedCancellation | undefined> {
-    const rows = await this.sql<GatewayCancellationRow[]>`
+  ): Promise<StoredRefundAuthorization | undefined> {
+    const rows = await this.sql<GatewayRefundAuthorizationRow[]>`
       select
         router_order_id,
-        auth_mode,
-        auth_policy,
+        refund_mode,
+        refund_authorizer,
         encrypted_cancellation_secret,
-        gateway_token_hash,
+        refund_token_hash,
         cancellation_requested_at,
         created_at,
         updated_at
-      from gateway_managed_cancellations
+      from gateway_refund_authorizations
       where router_order_id = ${routerOrderId}
       limit 1
     `
@@ -67,7 +68,7 @@ export class BunSqlCancellationStore implements CancellationStore {
 
   async markCancellationRequested(routerOrderId: string): Promise<void> {
     await this.sql`
-      update gateway_managed_cancellations
+      update gateway_refund_authorizations
       set
         cancellation_requested_at = now(),
         updated_at = now()
@@ -76,16 +77,13 @@ export class BunSqlCancellationStore implements CancellationStore {
   }
 }
 
-function mapRow(row: GatewayCancellationRow): StoredManagedCancellation {
+function mapRow(row: GatewayRefundAuthorizationRow): StoredRefundAuthorization {
   return {
     routerOrderId: row.router_order_id,
-    authMode: row.auth_mode,
-    authPolicy:
-      typeof row.auth_policy === 'string'
-        ? (JSON.parse(row.auth_policy) as Record<string, unknown>)
-        : row.auth_policy,
+    refundMode: row.refund_mode,
+    refundAuthorizer: row.refund_authorizer,
     encryptedCancellationSecret: row.encrypted_cancellation_secret,
-    gatewayTokenHash: row.gateway_token_hash,
+    ...(row.refund_token_hash ? { refundTokenHash: row.refund_token_hash } : {}),
     ...(row.cancellation_requested_at
       ? { cancellationRequestedAt: toIso(row.cancellation_requested_at) }
       : {}),

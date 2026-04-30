@@ -1,12 +1,17 @@
 import { describe, expect, test } from 'bun:test'
+import { privateKeyToAccount } from 'viem/accounts'
 
 import { createApp } from '../app'
-import { CancellationSecretBox } from '../cancellations/crypto'
-import { CancellationService } from '../cancellations/service'
+import { RouterCancellationSecretBox } from '../cancellations/crypto'
+import {
+  REFUND_EIP712_DOMAIN,
+  REFUND_EIP712_TYPES,
+  RefundAuthorizationService
+} from '../cancellations/service'
 import type {
-  CancellationStore,
-  SaveManagedCancellationInput,
-  StoredManagedCancellation
+  RefundAuthorizationStore,
+  SaveRefundAuthorizationInput,
+  StoredRefundAuthorization
 } from '../cancellations/store'
 import type { GatewayConfig } from '../config'
 import type { FetchLike } from '../internal/router-client'
@@ -15,6 +20,9 @@ const QUOTE_ID = '00000000-0000-4000-8000-000000000001'
 const ORDER_ID = '00000000-0000-4000-8000-000000000002'
 const TO_ADDRESS = '0x1111111111111111111111111111111111111111'
 const FROM_ADDRESS = 'bc1qexample000000000000000000000000000000'
+const REFUND_ACCOUNT = privateKeyToAccount(
+  '0x1000000000000000000000000000000000000000000000000000000000000001'
+)
 
 describe('router gateway routes', () => {
   test('serves OpenAPI 3.1 from the live route registry', async () => {
@@ -99,7 +107,9 @@ describe('router gateway routes', () => {
 
   test('creates a market order and defaults refundAddress to fromAddress', async () => {
     const calls: RecordedCall[] = []
+    const store = new InMemoryRefundAuthorizationStore()
     const app = createApp(testConfig(), {
+      refundAuthorizationService: testRefundAuthorizationService(store),
       fetch: mockFetch(calls, async (path) => {
         if (path === `/api/v1/quotes/${QUOTE_ID}`) {
           return Response.json(internalQuote())
@@ -120,6 +130,7 @@ describe('router gateway routes', () => {
         quoteId: QUOTE_ID,
         fromAddress: FROM_ADDRESS,
         toAddress: TO_ADDRESS,
+        refundAuthorizer: REFUND_ACCOUNT.address,
         integrator: 'partner-a'
       })
     })
@@ -144,18 +155,21 @@ describe('router gateway routes', () => {
       orderAddress: 'bc1qorderaddress0000000000000000000000000',
       amountToSend: '1.25',
       quoteId: QUOTE_ID,
-      cancellationSecret: '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+      refundMode: 'evmSignature',
+      refundAuthorizer: REFUND_ACCOUNT.address
     })
+    expect(body.cancellationSecret).toBeUndefined()
+
+    const stored = await store.findRefundAuthorization(ORDER_ID)
+    expect(stored?.refundMode).toBe('evmSignature')
+    expect(stored?.refundAuthorizer).toBe(REFUND_ACCOUNT.address)
   })
 
-  test('stores cancellation secrets and returns a gateway token in managed mode', async () => {
+  test('stores cancellation secrets and returns a refund token in token mode', async () => {
     const calls: RecordedCall[] = []
-    const store = new InMemoryCancellationStore()
+    const store = new InMemoryRefundAuthorizationStore()
     const app = createApp(testConfig(), {
-      cancellationService: new CancellationService(
-        store,
-        new CancellationSecretBox(Buffer.alloc(32, 7))
-      ),
+      refundAuthorizationService: testRefundAuthorizationService(store),
       fetch: mockFetch(calls, async (path) => {
         if (path === `/api/v1/quotes/${QUOTE_ID}`) {
           return Response.json(internalQuote())
@@ -180,19 +194,19 @@ describe('router gateway routes', () => {
         quoteId: QUOTE_ID,
         fromAddress: FROM_ADDRESS,
         toAddress: TO_ADDRESS,
-        cancellation: {
-          mode: 'gateway_managed_token'
-        }
+        refundMode: 'token',
+        refundAuthorizer: null
       })
     })
     const orderBody = await orderResponse.json()
 
     expect(orderResponse.status).toBe(201)
-    expect(orderBody.cancellationMode).toBe('gateway_managed_token')
-    expect(orderBody.cancellationToken.startsWith('rgt_')).toBe(true)
+    expect(orderBody.refundMode).toBe('token')
+    expect(orderBody.refundAuthorizer).toBeNull()
+    expect(orderBody.refundToken.startsWith('rgt_')).toBe(true)
     expect(orderBody.cancellationSecret).toBeUndefined()
 
-    const stored = await store.findManagedCancellation(ORDER_ID)
+    const stored = await store.findRefundAuthorization(ORDER_ID)
     expect(stored?.encryptedCancellationSecret.startsWith('v1:')).toBe(true)
     expect(stored?.encryptedCancellationSecret).not.toContain(
       '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
@@ -202,7 +216,7 @@ describe('router gateway routes', () => {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        cancellationToken: orderBody.cancellationToken
+        refundToken: orderBody.refundToken
       })
     })
 
@@ -211,13 +225,25 @@ describe('router gateway routes', () => {
       cancellation_secret:
         '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
     })
-    expect((await store.findManagedCancellation(ORDER_ID))?.cancellationRequestedAt).toBeDefined()
+    expect(
+      (await store.findRefundAuthorization(ORDER_ID))?.cancellationRequestedAt
+    ).toBeDefined()
   })
 
-  test('forwards direct cancellation secrets to the internal router API', async () => {
+  test('verifies EIP-712 refund signatures before forwarding cancellation', async () => {
     const calls: RecordedCall[] = []
+    const store = new InMemoryRefundAuthorizationStore()
     const app = createApp(testConfig(), {
+      refundAuthorizationService: testRefundAuthorizationService(store),
       fetch: mockFetch(calls, async (path) => {
+        if (path === `/api/v1/quotes/${QUOTE_ID}`) {
+          return Response.json(internalQuote())
+        }
+
+        if (path === '/api/v1/orders') {
+          return Response.json(internalOrder(), { status: 201 })
+        }
+
         if (path === `/api/v1/orders/${ORDER_ID}/cancellations`) {
           return Response.json(internalOrder({ status: 'refunding' }))
         }
@@ -226,19 +252,43 @@ describe('router gateway routes', () => {
       })
     })
 
+    const orderResponse = await app.request('/order/market', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        quoteId: QUOTE_ID,
+        fromAddress: FROM_ADDRESS,
+        toAddress: TO_ADDRESS,
+        refundMode: 'evmSignature',
+        refundAuthorizer: REFUND_ACCOUNT.address
+      })
+    })
+    expect(orderResponse.status).toBe(201)
+
+    const refundSignatureDeadline = Math.floor(Date.now() / 1000) + 600
+    const refundSignature = await REFUND_ACCOUNT.signTypedData({
+      domain: REFUND_EIP712_DOMAIN,
+      types: REFUND_EIP712_TYPES,
+      primaryType: 'CancelOrder',
+      message: {
+        orderId: ORDER_ID,
+        deadline: BigInt(refundSignatureDeadline)
+      }
+    })
+
     const response = await app.request(`/order/${ORDER_ID}/cancel`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        cancellationSecret:
-          '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+        refundSignature,
+        refundSignatureDeadline
       })
     })
 
     expect(response.status).toBe(200)
-    expect(calls[0]?.method).toBe('POST')
-    expect(calls[0]?.path).toBe(`/api/v1/orders/${ORDER_ID}/cancellations`)
-    expect(calls[0]?.body).toEqual({
+    expect(calls.at(-1)?.method).toBe('POST')
+    expect(calls.at(-1)?.path).toBe(`/api/v1/orders/${ORDER_ID}/cancellations`)
+    expect(calls.at(-1)?.body).toEqual({
       cancellation_secret:
         '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
     })
@@ -254,25 +304,25 @@ type RecordedCall = {
   body?: unknown
 }
 
-class InMemoryCancellationStore implements CancellationStore {
-  private readonly records = new Map<string, StoredManagedCancellation>()
+class InMemoryRefundAuthorizationStore implements RefundAuthorizationStore {
+  private readonly records = new Map<string, StoredRefundAuthorization>()
 
-  async saveManagedCancellation(input: SaveManagedCancellationInput): Promise<void> {
+  async saveRefundAuthorization(input: SaveRefundAuthorizationInput): Promise<void> {
     const now = new Date().toISOString()
     this.records.set(input.routerOrderId, {
       routerOrderId: input.routerOrderId,
-      authMode: input.authMode,
-      authPolicy: input.authPolicy,
+      refundMode: input.refundMode,
+      refundAuthorizer: input.refundAuthorizer,
       encryptedCancellationSecret: input.encryptedCancellationSecret,
-      gatewayTokenHash: input.gatewayTokenHash,
+      ...(input.refundTokenHash ? { refundTokenHash: input.refundTokenHash } : {}),
       createdAt: now,
       updatedAt: now
     })
   }
 
-  async findManagedCancellation(
+  async findRefundAuthorization(
     routerOrderId: string
-  ): Promise<StoredManagedCancellation | undefined> {
+  ): Promise<StoredRefundAuthorization | undefined> {
     return this.records.get(routerOrderId)
   }
 
@@ -286,6 +336,15 @@ class InMemoryCancellationStore implements CancellationStore {
       updatedAt: new Date().toISOString()
     })
   }
+}
+
+function testRefundAuthorizationService(
+  store: RefundAuthorizationStore
+): RefundAuthorizationService {
+  return new RefundAuthorizationService(
+    store,
+    new RouterCancellationSecretBox(Buffer.alloc(32, 7))
+  )
 }
 
 function testConfig(): GatewayConfig {
