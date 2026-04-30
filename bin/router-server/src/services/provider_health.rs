@@ -286,10 +286,10 @@ impl ProviderHealthProbe {
                 self.provider
             ),
         })?;
-        if !matches!(parsed.scheme(), "socks5" | "socks5h") {
+        if parsed.scheme() != "socks5" {
             return Err(RouterServerError::InvalidData {
                 message: format!(
-                    "unsupported provider health proxy scheme for {}; expected socks5 or socks5h",
+                    "unsupported provider health proxy scheme for {}; expected socks5",
                     self.provider
                 ),
             });

@@ -20,7 +20,7 @@ pub enum HyperUnitClientError {
         source: url::ParseError,
     },
     #[snafu(display(
-        "unsupported HyperUnit proxy scheme {scheme:?} for {proxy_url}; expected socks5 or socks5h"
+        "unsupported HyperUnit proxy scheme {scheme:?} for {proxy_url}; expected socks5"
     ))]
     UnsupportedProxyScheme { proxy_url: String, scheme: String },
     #[snafu(display("failed to configure HyperUnit proxy {proxy_url}: {source}"))]
@@ -457,7 +457,7 @@ fn normalize_proxy_url(proxy_url: Option<String>) -> HyperUnitResult<Option<Stri
         source,
     })?;
     match parsed.scheme() {
-        "socks5" | "socks5h" => Ok(Some(trimmed.to_string())),
+        "socks5" => Ok(Some(trimmed.to_string())),
         scheme => Err(HyperUnitClientError::UnsupportedProxyScheme {
             proxy_url: trimmed.to_string(),
             scheme: scheme.to_string(),
@@ -819,13 +819,6 @@ mod tests {
         )
         .expect("proxy client");
         assert_eq!(client.base_url(), "https://api.hyperunit.xyz");
-
-        let client = HyperUnitClient::new_with_proxy_url(
-            "https://api.hyperunit.xyz///",
-            Some("socks5h://127.0.0.1:1080".to_string()),
-        )
-        .expect("remote DNS proxy client");
-        assert_eq!(client.base_url(), "https://api.hyperunit.xyz");
     }
 
     #[test]
@@ -848,6 +841,19 @@ mod tests {
             Some("http://127.0.0.1:8080".to_string()),
         )
         .expect_err("non-socks proxy must fail");
+        assert!(matches!(
+            error,
+            HyperUnitClientError::UnsupportedProxyScheme { .. }
+        ));
+    }
+
+    #[test]
+    fn client_with_proxy_rejects_socks5h_scheme() {
+        let error = HyperUnitClient::new_with_proxy_url(
+            "https://api.hyperunit.xyz",
+            Some("socks5h://127.0.0.1:1080".to_string()),
+        )
+        .expect_err("socks5h proxy must fail");
         assert!(matches!(
             error,
             HyperUnitClientError::UnsupportedProxyScheme { .. }
