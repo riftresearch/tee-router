@@ -23,6 +23,8 @@ bun run router-gateway:typecheck
 - `HOST`: public gateway listen host. Defaults to `0.0.0.0`.
 - `ROUTER_INTERNAL_BASE_URL`: upstream Rust router API base URL.
 - `ROUTER_QUERY_API_BASE_URL`: optional internal query/status API base URL.
+- `ROUTER_GATEWAY_PUBLIC_BASE_URL`: optional public gateway base URL emitted in
+  `/openapi.json` `servers`. Defaults to `http://localhost:<PORT>`.
 - `ROUTER_GATEWAY_DATABASE_URL`: gateway-owned Postgres database URL.
 - `ROUTER_GATEWAY_CANCELLATION_SECRET_KEY`: 32-byte hex or base64url AES key
   used to encrypt stored router cancellation secrets.
@@ -78,6 +80,7 @@ Required Railway variables:
 ```sh
 HOST=0.0.0.0
 ROUTER_INTERNAL_BASE_URL=https://<internal-router-api-base-url>
+ROUTER_GATEWAY_PUBLIC_BASE_URL=https://<gateway-domain>
 ROUTER_GATEWAY_DATABASE_URL=postgres://<gateway-postgres-url>
 ROUTER_GATEWAY_CANCELLATION_SECRET_KEY=<64-char-hex-or-base64url-32-byte-key>
 ROUTER_GATEWAY_REQUEST_TIMEOUT_MS=30000

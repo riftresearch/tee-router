@@ -35,6 +35,29 @@ describe('router gateway routes', () => {
     expect(body.paths['/quote']).toBeDefined()
     expect(body.paths['/order/market']).toBeDefined()
     expect(body.paths['/order/{orderId}/cancel']).toBeDefined()
+    expect(body.servers).toEqual([
+      {
+        url: 'http://localhost:3000',
+        description: 'Local development'
+      }
+    ])
+  })
+
+  test('serves the configured public base URL in OpenAPI servers', async () => {
+    const app = createApp({
+      ...testConfig(),
+      publicBaseUrl: 'https://router-gateway.example.com'
+    })
+    const response = await app.request('/openapi.json')
+    const body = await response.json()
+
+    expect(response.status).toBe(200)
+    expect(body.servers).toEqual([
+      {
+        url: 'https://router-gateway.example.com',
+        description: 'Production'
+      }
+    ])
   })
 
   test('serves fully permissive CORS headers', async () => {

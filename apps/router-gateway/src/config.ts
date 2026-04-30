@@ -3,6 +3,7 @@ export type GatewayConfig = {
   port: number
   routerInternalBaseUrl?: string
   routerQueryApiBaseUrl?: string
+  publicBaseUrl?: string
   gatewayDatabaseUrl?: string
   cancellationSecretKey?: string
   requestTimeoutMs: number
@@ -21,6 +22,7 @@ export function loadConfig(env: Env = Bun.env as Env): GatewayConfig {
     port: parsePort(env.PORT),
     routerInternalBaseUrl: normalizeOptionalUrl(env.ROUTER_INTERNAL_BASE_URL),
     routerQueryApiBaseUrl: normalizeOptionalUrl(env.ROUTER_QUERY_API_BASE_URL),
+    publicBaseUrl: normalizeOptionalUrl(env.ROUTER_GATEWAY_PUBLIC_BASE_URL),
     gatewayDatabaseUrl: normalizeOptionalUrl(env.ROUTER_GATEWAY_DATABASE_URL),
     cancellationSecretKey: normalizeOptionalSecret(
       env.ROUTER_GATEWAY_CANCELLATION_SECRET_KEY

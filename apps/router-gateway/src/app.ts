@@ -45,8 +45,8 @@ export function createApp(
     },
     servers: [
       {
-        url: `http://localhost:${config.port}`,
-        description: 'Local development'
+        url: config.publicBaseUrl ?? `http://localhost:${config.port}`,
+        description: config.publicBaseUrl ? 'Production' : 'Local development'
       }
     ]
   })
