@@ -199,12 +199,14 @@ fn provider_health_probes(args: &RouterServerArgs) -> Result<Vec<ProviderHealthP
     if let Some(base_url) =
         normalize_optional_url(args.hyperunit_api_url.as_deref(), "HyperUnit API URL")?
     {
-        probes.push(ProviderHealthProbe::get(
-            ProviderId::Unit.as_str(),
-            format!(
-                "{base_url}/gen/ethereum/hyperliquid/eth/0x0000000000000000000000000000000000000000"
+        let health_url = format!(
+            "{base_url}/gen/ethereum/hyperliquid/eth/0x0000000000000000000000000000000000000000"
+        );
+        probes.push(
+            ProviderHealthProbe::get(ProviderId::Unit.as_str(), health_url).with_proxy_url(
+                normalize_optional_string(args.hyperunit_proxy_url.as_deref()),
             ),
-        ));
+        );
     }
 
     if let Some(base_url) =

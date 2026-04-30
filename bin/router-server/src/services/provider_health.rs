@@ -6,7 +6,7 @@ use crate::{
 use chrono::Utc;
 use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE},
-    Client, Method, StatusCode,
+    Client, Method, Proxy, StatusCode,
 };
 use serde_json::Value;
 use std::{collections::HashMap, sync::Arc, time::Duration, time::Instant};
@@ -123,6 +123,10 @@ impl ProviderHealthPoller {
                 message: format!("failed to build provider health HTTP client: {err}"),
             }
         })?;
+        let probes = probes
+            .into_iter()
+            .map(|probe| probe.prepare(timeout))
+            .collect::<RouterServerResult<Vec<_>>>()?;
         Ok(Self {
             client,
             health,
@@ -213,13 +217,15 @@ impl ProviderHealthPoller {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ProviderHealthProbe {
     provider: String,
     method: Method,
     url: String,
     headers: Vec<(String, String)>,
     json_body: Option<Value>,
+    proxy_url: Option<String>,
+    proxy_client: Option<Client>,
 }
 
 impl ProviderHealthProbe {
@@ -231,6 +237,8 @@ impl ProviderHealthProbe {
             url: url.into(),
             headers: Vec::new(),
             json_body: None,
+            proxy_url: None,
+            proxy_client: None,
         }
     }
 
@@ -246,6 +254,8 @@ impl ProviderHealthProbe {
             url: url.into(),
             headers: Vec::new(),
             json_body: Some(json_body),
+            proxy_url: None,
+            proxy_client: None,
         }
     }
 
@@ -258,7 +268,56 @@ impl ProviderHealthProbe {
         self
     }
 
+    #[must_use]
+    pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
+        self.proxy_url = proxy_url
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self
+    }
+
+    fn prepare(mut self, timeout: Duration) -> RouterServerResult<Self> {
+        let Some(proxy_url) = self.proxy_url.as_deref() else {
+            return Ok(self);
+        };
+        let parsed = url::Url::parse(proxy_url).map_err(|err| RouterServerError::InvalidData {
+            message: format!(
+                "invalid provider health proxy URL for {}: {err}",
+                self.provider
+            ),
+        })?;
+        if parsed.scheme() != "socks5" {
+            return Err(RouterServerError::InvalidData {
+                message: format!(
+                    "unsupported provider health proxy scheme for {}; expected socks5",
+                    self.provider
+                ),
+            });
+        }
+        let proxy = Proxy::all(proxy_url).map_err(|err| RouterServerError::InvalidData {
+            message: format!(
+                "failed to configure provider health proxy for {}: {err}",
+                self.provider
+            ),
+        })?;
+        self.proxy_client = Some(
+            Client::builder()
+                .timeout(timeout)
+                .use_rustls_tls()
+                .proxy(proxy)
+                .build()
+                .map_err(|err| RouterServerError::InvalidData {
+                    message: format!(
+                        "failed to build proxied provider health HTTP client for {}: {err}",
+                        self.provider
+                    ),
+                })?,
+        );
+        Ok(self)
+    }
+
     async fn send(&self, client: &Client) -> reqwest::Result<(StatusCode, String)> {
+        let client = self.proxy_client.as_ref().unwrap_or(client);
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
         for (name, value) in &self.headers {
