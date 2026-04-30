@@ -7,9 +7,6 @@ export type DependencyHealthState = {
   name: string
   status: DependencyHealthStatus
   checkedAt?: string
-  latencyMs?: number
-  httpStatus?: number
-  error?: string
 }
 
 export type DependencyHealthSnapshot = {
@@ -91,7 +88,6 @@ export class DependencyHealthMonitor {
   private async check(target: HealthTargetConfig): Promise<void> {
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), target.timeoutMs)
-    const startedAt = Date.now()
 
     try {
       const response = await this.fetcher(target.url, {
@@ -101,7 +97,6 @@ export class DependencyHealthMonitor {
         },
         signal: controller.signal
       })
-      const latencyMs = Date.now() - startedAt
       const responseBody = await response.text().catch(() => '')
       if (
         response.ok &&
@@ -114,18 +109,14 @@ export class DependencyHealthMonitor {
       this.states.set(target.name, {
         name: target.name,
         status: response.ok ? 'reachable' : 'unreachable',
-        checkedAt: new Date().toISOString(),
-        latencyMs,
-        httpStatus: response.status,
-        ...(response.ok ? {} : { error: `HTTP ${response.status}` })
+        checkedAt: new Date().toISOString()
       })
     } catch (error) {
+      void error
       this.states.set(target.name, {
         name: target.name,
         status: 'unreachable',
-        checkedAt: new Date().toISOString(),
-        latencyMs: Date.now() - startedAt,
-        error: error instanceof Error ? error.message : 'dependency check failed'
+        checkedAt: new Date().toISOString()
       })
     } finally {
       clearTimeout(timeout)
@@ -158,14 +149,7 @@ export class DependencyHealthMonitor {
         status,
         ...(typeof provider.checked_at === 'string'
           ? { checkedAt: provider.checked_at }
-          : {}),
-        ...(typeof provider.latency_ms === 'number'
-          ? { latencyMs: provider.latency_ms }
-          : {}),
-        ...(typeof provider.http_status === 'number'
-          ? { httpStatus: provider.http_status }
-          : {}),
-        ...(typeof provider.error === 'string' ? { error: provider.error } : {})
+          : {})
       })
     }
 

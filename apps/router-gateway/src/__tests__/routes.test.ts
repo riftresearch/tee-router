@@ -119,8 +119,13 @@ describe('router gateway routes', () => {
     expect(body.dependencies[0]).toMatchObject({
       name: 'hyperliquid',
       status: 'reachable',
-      httpStatus: 200
+      checkedAt: '2026-04-30T16:46:58.105Z'
     })
+    expect(Object.keys(body.dependencies[0]).sort()).toEqual([
+      'checkedAt',
+      'name',
+      'status'
+    ])
     expect(body.dependencies[0].url).toBeUndefined()
     expect(calls[0]?.path).toBe('/api/v1/provider-health')
   })
