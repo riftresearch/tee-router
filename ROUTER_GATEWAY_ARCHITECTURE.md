@@ -51,6 +51,13 @@ camelCase in the TypeScript/OpenAPI surface.
 Quote requests should not require `fromAddress` or `toAddress`; those belong to
 order creation.
 
+Implementation note: the current Rust router quote API still requires
+`recipient_address` at quote time because provider quotes can bind the final
+recipient. The initial gateway implementation therefore accepts a temporary
+`toAddress` field on `POST /quote` and forwards it as `recipient_address`.
+Removing that field requires a Rust router contract change, not just a gateway
+mapping change.
+
 ### Numeric Values
 
 Numerical values should be strings only. Do not accept JavaScript numbers for
@@ -299,6 +306,11 @@ able to recover it later to call the internal router cancellation endpoint.
 Hashing alone is insufficient for gateway-managed cancellation because the raw
 secret is required by the Rust router API.
 
+Initial implementation note: `gateway_managed_token` is the first managed mode.
+The gateway stores the Rust router cancellation secret encrypted in its own
+Postgres table, stores only a hash of the gateway cancellation token, and later
+decrypts the router secret only after token verification succeeds.
+
 ### Gateway-Managed Cancellation Flow
 
 For a later cancellation request:
@@ -326,20 +338,20 @@ The desired shape is:
 
 1. Router primary database remains owned by the Rust router deployment.
 2. Railway-hosted replica continues to mirror router state.
-3. A small internal Rust read API can run near the replica on Railway.
-4. The TypeScript gateway calls that internal read API for status/analytics.
+3. A small internal Rust query API can run near the replica on Railway.
+4. The TypeScript gateway calls that internal query API for status/analytics.
 5. The gateway does not issue SQL directly for router status reads.
 
 This avoids putting high-volume status traffic on the TEE while also avoiding
 hidden query divergence in TypeScript.
 
-## Shared Rust Read API
+## Shared Rust Query API
 
 To avoid divergence, the status query and response formatting should live in a
 shared Rust module used by both:
 
 - the existing Rust `router-api` inside the TEE
-- an optional Railway-hosted internal Rust read service pointed at the replica
+- an optional Railway-hosted internal Rust query service pointed at the replica
 
 The same request should return the same response whether the gateway calls:
 
@@ -350,11 +362,17 @@ The TypeScript gateway should see both as interchangeable upstream APIs. Its
 configuration can choose the preferred status upstream:
 
 - `ROUTER_INTERNAL_BASE_URL` for write/proxy calls to the TEE router API
-- `ROUTER_READ_API_BASE_URL` for read/status/analytics calls to the Railway read
+- `ROUTER_QUERY_API_BASE_URL` for query/status/analytics calls to the Railway query
   service
 
-The read service should own SQL. The gateway should not duplicate SQL that also
+The query service should own SQL. The gateway should not duplicate SQL that also
 exists in Rust.
+
+Initial implementation note: the shared Rust order-flow query logic now lives in
+`bin/router-server/src/query_api.rs`. The existing TEE router API delegates its
+internal order-flow endpoint to that module, and the `router-query-api` binary
+serves the same response shape from a configured database URL so it can point at
+the Railway replica.
 
 ## Open Questions
 
@@ -365,7 +383,7 @@ exists in Rust.
 - Encryption key management for stored cancellation secrets.
 - Whether gateway-managed cancellation storage should be its own database or a
   schema in an existing gateway Postgres instance.
-- Whether the Rust read API should be a new binary in `bin/router-server` or a
+- Whether the Rust query API should be a new binary in `bin/router-server` or a
   separate Rust package.
-- Whether the gateway should fall back to the TEE router API if the Railway read
+- Whether the gateway should fall back to the TEE router API if the Railway query
   service is unavailable.

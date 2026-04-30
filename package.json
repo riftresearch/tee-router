@@ -8,7 +8,9 @@
   ],
   "scripts": {
     "router-gateway:dev": "bun --filter @rift/router-gateway dev",
+    "router-gateway:migrate": "bun --filter @rift/router-gateway migrate",
     "router-gateway:start": "bun --filter @rift/router-gateway start",
+    "router-gateway:test": "bun --filter @rift/router-gateway test",
     "router-gateway:typecheck": "bun --filter @rift/router-gateway typecheck"
   },
   "devDependencies": {

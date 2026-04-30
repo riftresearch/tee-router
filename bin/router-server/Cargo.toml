@@ -13,6 +13,10 @@ path = "src/bin/router-api.rs"
 name = "router-worker"
 path = "src/bin/router-worker.rs"
 
+[[bin]]
+name = "router-query-api"
+path = "src/bin/router-query-api.rs"
+
 [dependencies]
 blockchain-utils = { workspace = true }
 chains = { workspace = true }

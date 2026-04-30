@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "bun --watch src/server.ts",
+    "migrate": "bun scripts/migrate.ts",
     "start": "bun src/server.ts",
+    "test": "bun test",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

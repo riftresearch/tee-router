@@ -11,6 +11,7 @@ pub mod db;
 pub mod error;
 pub mod models;
 pub mod protocol;
+pub mod query_api;
 pub mod runtime;
 pub mod server;
 pub mod services;

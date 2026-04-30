@@ -10,7 +10,9 @@ export const StatusResponseSchema = z
     version: z.string(),
     upstream: z.object({
       configured: z.boolean(),
-      baseUrl: z.string().optional()
+      baseUrl: z.string().optional(),
+      queryApiConfigured: z.boolean(),
+      queryApiBaseUrl: z.string().optional()
     })
   })
   .openapi('StatusResponse')
@@ -45,6 +47,10 @@ export function createStatusHandler(
           configured: Boolean(config.routerInternalBaseUrl),
           ...(config.routerInternalBaseUrl
             ? { baseUrl: config.routerInternalBaseUrl }
+            : {}),
+          queryApiConfigured: Boolean(config.routerQueryApiBaseUrl),
+          ...(config.routerQueryApiBaseUrl
+            ? { queryApiBaseUrl: config.routerQueryApiBaseUrl }
             : {})
         }
       },

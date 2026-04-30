@@ -1,11 +1,11 @@
 use crate::{
     api::{
         CreateOrderCancellationRequest, CreateOrderRequest, CreateQuoteRequest, CreateVaultRequest,
-        DetectorHintEnvelope, DetectorHintRequest, DetectorHintTarget, OrderFlow,
-        OrderFlowEnvelope, OrderFlowProgress, OrderFlowTrace, ProviderOperationHintEnvelope,
-        ProviderOperationHintRequest, ProviderOperationObserveRequest, ProviderPolicyEnvelope,
-        ProviderPolicyListEnvelope, QuoteRequestType, UpdateProviderPolicyRequest,
-        VaultFundingHintEnvelope, VaultFundingHintRequest,
+        DetectorHintEnvelope, DetectorHintRequest, DetectorHintTarget,
+        ProviderOperationHintEnvelope, ProviderOperationHintRequest,
+        ProviderOperationObserveRequest, ProviderPolicyEnvelope, ProviderPolicyListEnvelope,
+        QuoteRequestType, UpdateProviderPolicyRequest, VaultFundingHintEnvelope,
+        VaultFundingHintRequest,
     },
     app::{initialize_components, PaymasterMode, RouterComponents},
     error::{RouterServerError, RouterServerResult},
@@ -560,36 +560,9 @@ async fn get_order_flow(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<Uuid>,
-) -> RouterServerResult<Json<OrderFlowEnvelope>> {
+) -> RouterServerResult<Json<crate::api::OrderFlowEnvelope>> {
     authorize_admin_api_request(&state, &headers)?;
-    let order = state.db.orders().get(id).await?;
-    let quote = match state.db.orders().get_market_order_quote(id).await {
-        Ok(quote) => Some(quote),
-        Err(RouterServerError::NotFound) => None,
-        Err(err) => return Err(err),
-    };
-    let attempts = state.db.orders().get_execution_attempts(id).await?;
-    let steps = state.db.orders().get_execution_steps(id).await?;
-    let provider_operations = state.db.orders().get_provider_operations(id).await?;
-    let custody_vaults = state.db.orders().get_custody_vaults(id).await?;
-    let progress = OrderFlowProgress::from_parts(&order, &steps, &provider_operations);
-    let trace = OrderFlowTrace {
-        trace_id: order.workflow_trace_id.clone(),
-        parent_span_id: order.workflow_parent_span_id.clone(),
-    };
-
-    Ok(Json(OrderFlowEnvelope {
-        flow: OrderFlow {
-            order,
-            trace,
-            progress,
-            quote,
-            attempts,
-            steps,
-            provider_operations,
-            custody_vaults,
-        },
-    }))
+    Ok(Json(crate::query_api::get_order_flow(&state.db, id).await?))
 }
 
 fn authorize_internal_api_request(state: &AppState, headers: &HeaderMap) -> RouterServerResult<()> {
