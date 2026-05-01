@@ -22,15 +22,24 @@
             "group": "Introduction",
             "pages": [
               "introduction/what-is-rift",
-              "introduction/how-market-orders-work",
-              "introduction/how-limit-orders-work",
-              "introduction/security-model"
+              "introduction/multichain-smart-contracts"
             ]
           },
           {
-            "group": "TypeScript SDK",
+            "group": "Use Cases",
             "pages": [
-              "sdk/quickstart"
+              "use-cases/market-orders",
+              "use-cases/limit-orders",
+              "use-cases/otc",
+              "use-cases/vaults"
+            ]
+          },
+          {
+            "group": "Security Model",
+            "pages": [
+              "security-model/core-dependencies",
+              "security-model/cloud-infrastructure",
+              "security-model/key-management"
             ]
           }
         ],

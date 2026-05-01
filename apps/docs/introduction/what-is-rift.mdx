@@ -2,38 +2,34 @@
 title: "What is Rift?"
 ---
 
-**Rift** is a non custodial Bitcoin trading protocol with best-in-class rates and security for market and limit orders.
+Rift is a multichain trading protocol with zero added fees.
 
-Unlike other cross-chain protocols that rely on multi-sigs or staking for security, Rift uses cloud TEEs to enforce protocol rules for escrow and release of funds. This means Rift has:
+Unlike other protocols that are secured by multisigs or staking, Rift uses a new primitive (multichain smart contracts) to automatically move funds between chains based on pre defined rules.
 
-- **The best rates for users** — Deep liquidity and the best rates on popular routes like cbBTC↔BTC, ETH↔BTC, and USDC↔BTC. Fees start at 8 bips.
-- **Self-custody cross-chain swaps** — Users stay in full control of their funds. It's impossible for Rift to freeze or steal user funds.
-- **Minimal attack surface** — There is no validator set to corrupt or smart contracts to exploit.
-- **100% open source protocol code** — Anyone can audit our [protocol code](https://github.com/riftresearch/tee-otc) to verify how it works.
+This unlocks 3 key benefits:
 
----
+- **Non custodial** - Funds are controlled by smart contracts (protocol nodes running in cloud TEEs), and can be withdrawn at any time. Rift cannot steal or freeze user funds.
+- **Largest size** - Trade 100m+ since Rift aggregates liquidity across different execution providers.
+- **Lowest price** - Get the verifiably lowest rate across every execution venue. No added fees.
 
-## Supported Assets
+Rift's protocol code is 100% open source for anyone to verify, audit, or contribute to.
 
-| From                          | To                              |
-| ----------------------------- | ------------------------------- |
-| ERC20s on Ethereum/Base | BTC                             |
-| BTC                           | ERC20s on Ethereum/Base |
-| ERC20s on Ethereum/Base | ERC20s on Ethereum/Base (same chain only for now)|
+## Supported assets
 
----
+| Chain | Assets |
+| --- | --- |
+| Bitcoin | BTC |
+| Ethereum | ETH + All ERC20s |
+| Arbitrum | ETH + All ERC20s |
+| Base | ETH + All ERC20s |
 
-## Get Started
+## Supported protocols
 
-Want to dive deeper into the technical details? Check out the [protocol architecture](/introduction/how-market-orders-work).
-
-Ready to integrate Rift? Explore the [SDK](/sdk/quickstart) and [API](/api-endpoints/quote) to get started.
-
----
-
-## Links
-
-- [Contact Us](https://t.me/basedcrypto)
-- [Twitter](https://twitter.com/riftdex)
-- [GitHub](https://github.com/riftresearch)
-- [App](https://app.rift.trade)
+| Protocol | Execution |
+| --- | --- |
+| Rift | OTC |
+| Hyperliquid | Orderbook |
+| Across | Intent + solver |
+| CCTP | Mint + burn |
+| Paraswap | AMM |
+| Unit | Lock + mint |
