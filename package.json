@@ -7,6 +7,11 @@
     "packages/*"
   ],
   "scripts": {
+    "explorer:dev": "bun --filter @rift/explorer dev",
+    "explorer:build": "bun --filter @rift/explorer build",
+    "explorer:start": "bun --filter @rift/explorer start",
+    "explorer:lint": "bun --filter @rift/explorer lint",
+    "explorer:typecheck": "bun --filter @rift/explorer typecheck",
     "router-gateway:dev": "bun --filter @rift/router-gateway dev",
     "router-gateway:migrate": "bun --filter @rift/router-gateway migrate",
     "router-gateway:start": "bun --filter @rift/router-gateway start",
