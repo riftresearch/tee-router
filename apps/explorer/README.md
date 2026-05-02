@@ -13,7 +13,7 @@ Open http://localhost:3000.
 By default, Explorer reads order info from:
 
 ```text
-https://router-gateway-production.up.railway.app
+https://api.rift.trade
 ```
 
 Override it locally with `NEXT_PUBLIC_RIFT_API_URL` when needed.

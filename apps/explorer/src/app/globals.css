@@ -87,8 +87,9 @@ input:focus {
 }
 
 .glass-card {
-  background: rgba(39, 39, 39, 0.35);
-  border: 1px solid var(--border-color);
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
+  background: rgba(34, 37, 48, 0.58);
+  border: 1px solid rgba(118, 126, 142, 0.46);
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.22);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
 }

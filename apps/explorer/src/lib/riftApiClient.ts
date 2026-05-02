@@ -1,125 +1,104 @@
 export type U256 = string;
 
-export type SwapStatus =
-  | "waiting_for_deposit"
-  | "deposit_confirming"
-  | "initiating_payout"
-  | "confirming_payout"
-  | "swap_complete"
-  | "refunding_user"
-  | "failed";
+export type Chain =
+  | { kind: "BITCOIN" }
+  | { kind: "EVM"; chainId: number }
+  | { kind: string; [key: string]: unknown };
 
-export type UserDepositStatus = {
-  tx_hash: string;
-  amount: U256;
-  deposit_detected_at: string;
-  confirmations: number;
-  last_checked: string;
-  confirmed_at?: string;
+export type Token =
+  | { kind: "NATIVE"; decimals: number }
+  | { kind: "TOKEN"; address: string; decimals: number }
+  | { kind: string; decimals?: number; [key: string]: unknown };
+
+export type Currency = {
+  chain: Chain;
+  token: Token;
 };
 
-export type SettlementStatus = {
-  tx_hash: string;
-  broadcast_at: string;
-  confirmations: number;
-  completed_at?: string;
+export type TeeStatus = {
+  status: string;
 };
 
-export type LatestRefund = {
-  tx_hash: string;
-  broadcast_at: string;
-  confirmations: number;
-  confirmed_at?: string;
+export type RawOtcJson = {
+  status?: string;
+  metadata?: {
+    start_asset?: string;
+    end_asset?: string;
+    integrator_name?: string;
+  };
+  userDepositStatus?: unknown;
+  settlementStatus?: unknown;
+  latestRefund?: unknown;
+  createdAt?: string;
+  updatedAt?: string;
+  failureReason?: string | null;
 };
 
-export type SwapRates = {
-  liquidity_fee_bps: number;
-  protocol_fee_bps: number;
-  network_fee_sats: number;
-};
-
-export type SwapFees = {
-  liquidity_fee: U256;
-  protocol_fee: U256;
-  network_fee: U256;
-};
-
-export type LotCurrency = {
-  chain: "bitcoin" | "ethereum" | "base" | "solana";
-  token: { type: "Native" } | { type: "Address"; data: string };
-  decimals: number;
-};
-
-export type Lot = {
-  currency: LotCurrency;
-  amount: U256;
-};
-
-export type SwapQuote = {
-  id: string;
-  market_maker_id: string;
-  from: Lot;
-  to: Lot;
-  rates: SwapRates;
-  fees: SwapFees;
-  min_input: U256;
-  max_input: U256;
-  affiliate?: string;
-  expires_at: string;
-  created_at: string;
-};
-
-type MaybeEmpty<T> = T | Record<string, never>;
-
-export type Swap = {
-  id: string;
-  market_maker_id: string;
-  quote: SwapQuote;
-  metadata: MaybeEmpty<{ start_asset?: string }>;
-  deposit_vault_salt: string;
-  deposit_vault_address: string;
-  mm_nonce: string;
-  user_destination_address: string;
-  refund_address: string;
-  status: SwapStatus;
-  user_deposit_status?: MaybeEmpty<UserDepositStatus>;
-  settlement_status?: MaybeEmpty<SettlementStatus>;
-  latest_refund?: MaybeEmpty<LatestRefund>;
-  failure_reason?: string | null;
-  failure_at?: string | null;
-  created_at: string;
-  updated_at: string;
+export type Order = {
+  orderId: string;
+  routeType: string;
+  provider: string | null;
+  path: string[];
+  status: string;
+  senderAddress: string | null;
+  destinationAddress: string | null;
+  refundAddress: string | null;
+  otcSwapId: string | null;
+  swapperSwapId: string | null;
+  cowOrderUid: string | null;
+  sellCurrency: Currency;
+  buyCurrency: Currency;
+  quoteMode: string;
+  quotedSellAmount: U256;
+  quotedBuyAmount: U256;
+  quotedMinimumBuyAmount: U256;
+  quotedMaximumSellAmount: U256 | null;
+  executedSellAmount: U256 | null;
+  executedBuyAmount: U256 | null;
+  executedFeeAmount: U256 | null;
+  depositTxHash: string | null;
+  payoutTxHash: string | null;
+  refundTxHash: string | null;
+  rawRouterJson?: unknown;
+  rawExternalDEXOrderJson?: unknown;
+  rawOtcJson?: RawOtcJson | null;
+  rawSwapperJson?: unknown;
+  createdAt: string;
+  updatedAt: string;
+  lastSourceUpdateAt: string;
+  terminalAt: string | null;
+  orderType: string | null;
+  externalDexStatus: unknown;
+  teeOtcStatus: TeeStatus | null;
+  teeSwapperStatus: TeeStatus | null;
 };
 
 export type ErrorResponse = {
-  error: string;
+  error?: string;
+  message?: string;
 };
 
 export type Result<T, E = ErrorResponse> =
   | { ok: true; data: T }
   | { ok: false; error: E; status: number };
 
-export function hasData<T extends object>(
-  obj: T | Record<string, never> | undefined
-): obj is T {
-  return obj !== undefined && Object.keys(obj).length > 0;
-}
-
 const RIFT_API_URL =
-  process.env.NEXT_PUBLIC_RIFT_API_URL ??
-  "https://router-gateway-production.up.railway.app";
+  process.env.NEXT_PUBLIC_RIFT_API_URL ?? "https://api.rift.trade";
 
-export async function getSwap(swapId: string): Promise<Result<Swap>> {
+export async function getOrder(orderId: string): Promise<Result<Order>> {
   try {
-    const response = await fetch(`${RIFT_API_URL}/order/${swapId}`, {
+    const response = await fetch(`${RIFT_API_URL}/order/${orderId}`, {
       method: "GET",
       headers: { "Content-Type": "application/json" },
     });
 
-    const data = await response.json();
+    const contentType = response.headers.get("content-type") ?? "";
+    const data = contentType.includes("application/json")
+      ? await response.json()
+      : { error: await response.text() };
 
     if (response.ok) {
-      return { ok: true, data: data as Swap };
+      return { ok: true, data: data as Order };
     }
 
     return {
