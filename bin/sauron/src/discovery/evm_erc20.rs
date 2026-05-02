@@ -26,7 +26,9 @@ use tracing::warn;
 
 use crate::{
     config::SauronArgs,
-    discovery::{BlockCursor, BlockScan, DetectedDeposit, DiscoveryBackend},
+    discovery::{
+        BlockCursor, BlockScan, DepositConfirmationState, DetectedDeposit, DiscoveryBackend,
+    },
     error::{EvmRpcSnafu, EvmTokenIndexerSnafu, Result},
     watch::{SharedWatchEntry, WatchEntry},
 };
@@ -38,6 +40,7 @@ sol! {
 
 const EVM_REORG_RESCAN_DEPTH: u64 = 32;
 const EVM_MAX_LOG_SCAN_BLOCK_SPAN: u64 = 128;
+const EVM_REQUIRED_CONFIRMATION_BLOCKS: u64 = 1;
 const EVM_RPC_MAX_ATTEMPTS: usize = 5;
 const EVM_RPC_RETRY_BASE_DELAY_MILLIS: u64 = 250;
 const EVM_RPC_RETRY_MAX_DELAY_MILLIS: u64 = 5_000;
@@ -269,7 +272,10 @@ impl EvmErc20DiscoveryBackend {
             .collect()
     }
 
-    async fn drain_indexer_candidates(&self) -> Result<Vec<DetectedDeposit>> {
+    async fn drain_indexer_candidates(
+        &self,
+        confirmed_tip_height: u64,
+    ) -> Result<Vec<DetectedDeposit>> {
         let Some(token_indexer) = &self.token_indexer else {
             return Ok(Vec::new());
         };
@@ -285,7 +291,19 @@ impl EvmErc20DiscoveryBackend {
 
         candidates
             .into_iter()
-            .filter_map(|candidate| self.detected_from_indexer_candidate(candidate).transpose())
+            .filter_map(
+                |candidate| match self.detected_from_indexer_candidate(candidate) {
+                    Ok(Some(detected))
+                        if detected
+                            .block_height
+                            .is_some_and(|height| height <= confirmed_tip_height) =>
+                    {
+                        Some(Ok(detected))
+                    }
+                    Ok(Some(_)) | Ok(None) => None,
+                    Err(error) => Some(Err(error)),
+                },
+            )
             .collect()
     }
 
@@ -328,6 +346,15 @@ impl EvmErc20DiscoveryBackend {
             }
         })?;
 
+        let block_height = candidate.block_number.parse::<u64>().map_err(|error| {
+            crate::error::Error::InvalidWatchRow {
+                message: format!(
+                    "{} candidate {} had invalid block_number {}: {}",
+                    self.name, candidate.id, candidate.block_number, error
+                ),
+            }
+        })?;
+
         Ok(Some(DetectedDeposit {
             watch_target,
             watch_id,
@@ -337,6 +364,9 @@ impl EvmErc20DiscoveryBackend {
             tx_hash: candidate.transaction_hash.to_string(),
             transfer_index: candidate.transfer_index,
             amount,
+            confirmation_state: DepositConfirmationState::Confirmed,
+            block_height: Some(block_height),
+            block_hash: Some(candidate.block_hash.to_string()),
             observed_at: Utc::now(),
             indexer_candidate_id: Some(candidate.id),
         }))
@@ -454,6 +484,7 @@ impl EvmErc20DiscoveryBackend {
                 chain: self.chain_type.to_db_string().to_string(),
                 message: format!("missing full block while scanning native transfers at {height}"),
             })?;
+        let block_hash = alloy::hex::encode(block.hash());
         let mut detections = Vec::new();
 
         for transaction in block.into_transactions_vec() {
@@ -495,6 +526,9 @@ impl EvmErc20DiscoveryBackend {
                     tx_hash: transaction.tx_hash().to_string(),
                     transfer_index,
                     amount,
+                    confirmation_state: DepositConfirmationState::Confirmed,
+                    block_height: Some(height),
+                    block_hash: Some(block_hash.clone()),
                     observed_at: Utc::now(),
                     indexer_candidate_id: None,
                 });
@@ -547,7 +581,11 @@ impl DiscoveryBackend for EvmErc20DiscoveryBackend {
         from_exclusive: &BlockCursor,
         watches: &[SharedWatchEntry],
     ) -> Result<BlockScan> {
-        let mut detections = self.drain_indexer_candidates().await?;
+        let current_cursor = self.current_tip_cursor().await?;
+        let current_height = current_cursor.height;
+        let current_hash = current_cursor.hash.clone();
+        let confirmed_height = confirmed_tip_height(current_height);
+        let mut detections = self.drain_indexer_candidates(confirmed_height).await?;
         let erc20_watches = self.erc20_watch_map(watches);
         let native_addresses = self.native_address_map(watches);
 
@@ -558,19 +596,16 @@ impl DiscoveryBackend for EvmErc20DiscoveryBackend {
             });
         }
 
-        let current_cursor = self.current_tip_cursor().await?;
-        let current_height = current_cursor.height;
-        let current_hash = current_cursor.hash.clone();
-
         let should_scan_erc20_with_rpc = self.token_indexer.is_none();
         if ((erc20_watches.is_empty() || !should_scan_erc20_with_rpc)
             && native_addresses.is_empty())
-            || current_height <= from_exclusive.height
+            || confirmed_height <= from_exclusive.height
         {
             return Ok(BlockScan {
                 new_cursor: BlockCursor {
-                    height: current_height,
-                    hash: current_hash,
+                    height: confirmed_height,
+                    hash: confirmed_tip_hash(current_height, confirmed_height, &current_hash, self)
+                        .await?,
                 },
                 detections,
             });
@@ -611,7 +646,7 @@ impl DiscoveryBackend for EvmErc20DiscoveryBackend {
         }
 
         let scan_from_height = from_exclusive.height.saturating_add(1);
-        let scan_to_height = next_scan_to_height(from_exclusive.height, current_height);
+        let scan_to_height = next_scan_to_height(from_exclusive.height, confirmed_height);
         let scan_to_hash = if scan_to_height == current_height {
             current_hash.clone()
         } else {
@@ -678,6 +713,9 @@ impl DiscoveryBackend for EvmErc20DiscoveryBackend {
                             tx_hash: transaction_hash.to_string(),
                             transfer_index,
                             amount: decoded.inner.data.value,
+                            confirmation_state: DepositConfirmationState::Confirmed,
+                            block_height: decoded.block_number,
+                            block_hash: decoded.block_hash.map(|hash| alloy::hex::encode(hash)),
                             observed_at: Utc::now(),
                             indexer_candidate_id: None,
                         });
@@ -733,6 +771,32 @@ impl DiscoveryBackend for EvmErc20DiscoveryBackend {
 
 fn next_scan_to_height(from_exclusive_height: u64, current_height: u64) -> u64 {
     current_height.min(from_exclusive_height.saturating_add(EVM_MAX_LOG_SCAN_BLOCK_SPAN))
+}
+
+fn confirmed_tip_height(current_height: u64) -> u64 {
+    current_height.saturating_sub(EVM_REQUIRED_CONFIRMATION_BLOCKS)
+}
+
+async fn confirmed_tip_hash(
+    current_height: u64,
+    confirmed_height: u64,
+    current_hash: &str,
+    backend: &EvmErc20DiscoveryBackend,
+) -> Result<String> {
+    if confirmed_height == 0 {
+        return Ok(String::new());
+    }
+    if confirmed_height == current_height {
+        return Ok(current_hash.to_string());
+    }
+    backend.block_hash_at(confirmed_height).await?.ok_or_else(|| {
+        crate::error::Error::ChainInit {
+            chain: backend.chain_type.to_db_string().to_string(),
+            message: format!(
+                "missing block hash while advancing confirmed discovery cursor at height {confirmed_height}"
+            ),
+        }
+    })
 }
 
 fn timestamp_seconds(timestamp: chrono::DateTime<Utc>) -> i64 {
@@ -800,7 +864,12 @@ mod tests {
 
     use crate::watch::{WatchEntry, WatchTarget};
 
-    use super::{next_scan_to_height, EvmErc20DiscoveryBackend, EVM_MAX_LOG_SCAN_BLOCK_SPAN};
+    use crate::discovery::DepositConfirmationState;
+
+    use super::{
+        confirmed_tip_height, next_scan_to_height, EvmErc20DiscoveryBackend,
+        EVM_MAX_LOG_SCAN_BLOCK_SPAN,
+    };
 
     #[test]
     fn caps_scan_window_to_max_span() {
@@ -813,6 +882,13 @@ mod tests {
     #[test]
     fn uses_tip_when_backlog_fits_in_one_window() {
         assert_eq!(next_scan_to_height(10, 42), 42);
+    }
+
+    #[test]
+    fn confirmed_tip_requires_one_child_block() {
+        assert_eq!(confirmed_tip_height(0), 0);
+        assert_eq!(confirmed_tip_height(1), 0);
+        assert_eq!(confirmed_tip_height(42), 41);
     }
 
     #[test]
@@ -945,6 +1021,15 @@ mod tests {
         assert_eq!(detected.transfer_index, 7);
         assert_eq!(detected.amount, U256::from(42_u64));
         assert_eq!(
+            detected.confirmation_state,
+            DepositConfirmationState::Confirmed
+        );
+        assert_eq!(detected.block_height, Some(100));
+        assert_eq!(
+            detected.block_hash.as_deref(),
+            Some("0x3333333333333333333333333333333333333333333333333333333333333333")
+        );
+        assert_eq!(
             detected.indexer_candidate_id.as_deref(),
             Some("candidate-1")
         );
@@ -972,6 +1057,7 @@ mod tests {
         Arc::new(WatchEntry {
             watch_target: WatchTarget::FundingVault,
             watch_id: Uuid::new_v4(),
+            order_id: Uuid::new_v4(),
             source_chain: ChainType::Base,
             source_token: token,
             address: address.to_string(),

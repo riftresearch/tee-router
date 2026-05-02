@@ -23,11 +23,12 @@ export function routerClientFor(
     throw new GatewayConfigurationError('ROUTER_INTERNAL_BASE_URL is not configured')
   }
 
-  return new RouterClient({
+  deps.routerClient = new RouterClient({
     baseUrl: config.routerInternalBaseUrl,
     fetch: deps.fetch,
     timeoutMs: config.requestTimeoutMs
   })
+  return deps.routerClient
 }
 
 export function refundAuthorizationServiceFor(
@@ -46,8 +47,9 @@ export function refundAuthorizationServiceFor(
     )
   }
 
-  return new RefundAuthorizationService(
+  deps.refundAuthorizationService = new RefundAuthorizationService(
     new BunSqlRefundAuthorizationStore(new Bun.SQL(config.gatewayDatabaseUrl)),
     RouterCancellationSecretBox.fromKeyMaterial(config.cancellationSecretKey)
   )
+  return deps.refundAuthorizationService
 }

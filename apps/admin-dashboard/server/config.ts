@@ -5,6 +5,7 @@ export const ALLOWED_ADMIN_EMAILS = [
 ] as const
 
 export type AdminDashboardConfig = {
+  production: boolean
   host: string
   port: number
   webOrigin: string
@@ -18,7 +19,9 @@ export type AdminDashboardConfig = {
   betterAuthSecret: string
   secureCookies: boolean
   orderLimit: number
-  orderPollIntervalMs: number
+  cdcSlotName: string
+  cdcPublicationName: string
+  cdcMessagePrefix: string
   serveStatic: boolean
   version: string
   missingAuthConfig: string[]
@@ -28,8 +31,10 @@ type Env = Record<string, string | undefined>
 
 const DEFAULT_API_PORT = 3000
 const DEFAULT_WEB_ORIGIN = 'http://localhost:5173'
-const DEFAULT_ORDER_LIMIT = 200
-const DEFAULT_ORDER_POLL_INTERVAL_MS = 2_000
+const DEFAULT_ORDER_LIMIT = 100
+const DEFAULT_CDC_SLOT_NAME = 'admin_dashboard_orders_cdc'
+const DEFAULT_CDC_PUBLICATION_NAME = 'router_cdc_publication'
+const DEFAULT_CDC_MESSAGE_PREFIX = 'rift.router.change'
 const DEV_AUTH_SECRET = 'rift-admin-dashboard-development-secret-change-me'
 
 export function loadConfig(env: Env = Bun.env as Env): AdminDashboardConfig {
@@ -38,7 +43,11 @@ export function loadConfig(env: Env = Bun.env as Env): AdminDashboardConfig {
     DEFAULT_API_PORT,
     'ADMIN_DASHBOARD_API_PORT'
   )
-  const isProduction = env.NODE_ENV === 'production'
+  const production = parseBooleanFlag(
+    env.ADMIN_DASHBOARD_PRODUCTION,
+    env.NODE_ENV === 'production',
+    'ADMIN_DASHBOARD_PRODUCTION'
+  )
   const authBaseUrl = normalizeUrl(
     env.BETTER_AUTH_URL ??
       env.ADMIN_DASHBOARD_AUTH_BASE_URL ??
@@ -47,7 +56,7 @@ export function loadConfig(env: Env = Bun.env as Env): AdminDashboardConfig {
   )
   const webOrigin = normalizeOrigin(
     env.ADMIN_DASHBOARD_WEB_ORIGIN ??
-      (isProduction ? originFromUrl(authBaseUrl) : DEFAULT_WEB_ORIGIN),
+      (production ? originFromUrl(authBaseUrl) : DEFAULT_WEB_ORIGIN),
     'ADMIN_DASHBOARD_WEB_ORIGIN'
   )
   const trustedOrigins = unique([
@@ -57,7 +66,7 @@ export function loadConfig(env: Env = Bun.env as Env): AdminDashboardConfig {
   ])
   const betterAuthSecret =
     normalizeOptionalSecret(env.BETTER_AUTH_SECRET ?? env.AUTH_SECRET) ??
-    (isProduction ? '' : DEV_AUTH_SECRET)
+    (production ? '' : DEV_AUTH_SECRET)
 
   const authDatabaseUrl = normalizeOptionalSecret(
     env.ADMIN_DASHBOARD_AUTH_DATABASE_URL
@@ -65,14 +74,17 @@ export function loadConfig(env: Env = Bun.env as Env): AdminDashboardConfig {
   const googleClientId = normalizeOptionalSecret(env.GOOGLE_CLIENT_ID)
   const googleClientSecret = normalizeOptionalSecret(env.GOOGLE_CLIENT_SECRET)
 
-  const missingAuthConfig = [
-    authDatabaseUrl ? undefined : 'ADMIN_DASHBOARD_AUTH_DATABASE_URL',
-    googleClientId ? undefined : 'GOOGLE_CLIENT_ID',
-    googleClientSecret ? undefined : 'GOOGLE_CLIENT_SECRET',
-    betterAuthSecret ? undefined : 'BETTER_AUTH_SECRET'
-  ].filter((value): value is string => Boolean(value))
+  const missingAuthConfig = production
+    ? [
+        authDatabaseUrl ? undefined : 'ADMIN_DASHBOARD_AUTH_DATABASE_URL',
+        googleClientId ? undefined : 'GOOGLE_CLIENT_ID',
+        googleClientSecret ? undefined : 'GOOGLE_CLIENT_SECRET',
+        betterAuthSecret ? undefined : 'BETTER_AUTH_SECRET'
+      ].filter((value): value is string => Boolean(value))
+    : []
 
   return {
+    production,
     host: env.HOST ?? '0.0.0.0',
     port,
     webOrigin,
@@ -92,11 +104,15 @@ export function loadConfig(env: Env = Bun.env as Env): AdminDashboardConfig {
       DEFAULT_ORDER_LIMIT,
       'ADMIN_DASHBOARD_ORDER_LIMIT'
     ),
-    orderPollIntervalMs: parsePositiveInteger(
-      env.ADMIN_DASHBOARD_ORDER_POLL_INTERVAL_MS,
-      DEFAULT_ORDER_POLL_INTERVAL_MS,
-      'ADMIN_DASHBOARD_ORDER_POLL_INTERVAL_MS'
-    ),
+    cdcSlotName:
+      normalizeOptionalSecret(env.ADMIN_DASHBOARD_CDC_SLOT_NAME) ??
+      DEFAULT_CDC_SLOT_NAME,
+    cdcPublicationName:
+      normalizeOptionalSecret(env.ROUTER_CDC_PUBLICATION_NAME) ??
+      DEFAULT_CDC_PUBLICATION_NAME,
+    cdcMessagePrefix:
+      normalizeOptionalSecret(env.ROUTER_CDC_MESSAGE_PREFIX) ??
+      DEFAULT_CDC_MESSAGE_PREFIX,
     serveStatic: env.ADMIN_DASHBOARD_SERVE_STATIC !== 'false',
     version: env.npm_package_version ?? '0.1.0',
     missingAuthConfig
@@ -137,6 +153,18 @@ function parsePositiveInteger(
     throw new Error(`Invalid ${name}: ${value}`)
   }
   return parsed
+}
+
+function parseBooleanFlag(
+  value: string | undefined,
+  defaultValue: boolean,
+  name: string
+): boolean {
+  if (value === undefined) return defaultValue
+  const normalized = value.trim().toLowerCase()
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true
+  if (['0', 'false', 'no', 'off'].includes(normalized)) return false
+  throw new Error(`Invalid ${name}: ${value}`)
 }
 
 function normalizeOptionalSecret(value: string | undefined): string | undefined {

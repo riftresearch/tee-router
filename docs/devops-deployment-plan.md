@@ -259,7 +259,8 @@ Required inputs:
 - `SAURON_STATE_DATABASE_URL` pointing at `sauron-state-db-v3`
 - `SAURON_REPLICA_EVENT_SOURCE=cdc`
 - `SAURON_CDC_SLOT_NAME=sauron_watch_cdc`
-- `SAURON_CDC_PLUGIN=test_decoding`
+- `ROUTER_CDC_PUBLICATION_NAME=router_cdc_publication`
+- `ROUTER_CDC_MESSAGE_PREFIX=rift.router.change`
 - `ROUTER_REPLICA_DATABASE_NAME`
 - `ROUTER_INTERNAL_BASE_URL` pointing at the public Phala router API URL
 - `ROUTER_DETECTOR_API_KEY`
@@ -270,10 +271,10 @@ Required inputs:
 Sauron posts non-authoritative hints to the router API. Router-worker still
 validates provider and chain state before executing state transitions.
 
-Local tests may still use `SAURON_REPLICA_EVENT_SOURCE=notify` against a
-writable logical replica. Production physical-standby deployments should use
-`cdc`; do not run replica-local `LISTEN/NOTIFY` trigger migrations against the
-physical standby.
+Sauron consumes router changes through `START_REPLICATION ... LOGICAL` using
+the `pgoutput` plugin with logical messages enabled. Router migrations install
+the `pg_logical_emit_message` triggers and `router_cdc_publication`; no
+replica-local `LISTEN/NOTIFY` trigger migrations are used.
 
 ## EVM Token Indexers
 

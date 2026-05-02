@@ -5,7 +5,7 @@ use crate::{
         CustodyVaultVisibility, LimitOrderAction, LimitOrderQuote, LimitOrderResidualPolicy,
         MarketOrderKind, MarketOrderKindType, MarketOrderQuote, OrderExecutionAttempt,
         OrderExecutionAttemptKind, OrderExecutionAttemptStatus, OrderExecutionStep,
-        OrderExecutionStepStatus, OrderExecutionStepType, OrderProviderAddress,
+        OrderExecutionLeg, OrderExecutionStepStatus, OrderExecutionStepType, OrderProviderAddress,
         OrderProviderOperation, OrderProviderOperationHint, ProviderAddressRole,
         ProviderOperationHintKind, ProviderOperationHintStatus, ProviderOperationStatus,
         ProviderOperationType, RouterOrder, RouterOrderAction, RouterOrderQuote, RouterOrderStatus,
@@ -64,6 +64,7 @@ const QUOTE_SELECT_COLUMNS: &str = r#"
     max_amount_in,
     slippage_bps,
     provider_quote,
+    usd_valuation_json,
     expires_at,
     created_at
 "#;
@@ -169,6 +170,7 @@ const EXECUTION_STEP_SELECT_COLUMNS: &str = r#"
     id,
     order_id,
     execution_attempt_id,
+    execution_leg_id,
     transition_decl_id,
     step_index,
     step_type,
@@ -191,8 +193,61 @@ const EXECUTION_STEP_SELECT_COLUMNS: &str = r#"
     request_json,
     response_json,
     error_json,
+    usd_valuation_json,
     created_at,
     updated_at
+"#;
+
+const EXECUTION_LEG_SELECT_COLUMNS: &str = r#"
+    id,
+    order_id,
+    execution_attempt_id,
+    transition_decl_id,
+    leg_index,
+    leg_type,
+    provider,
+    status,
+    input_chain_id,
+    input_asset_id,
+    output_chain_id,
+    output_asset_id,
+    amount_in,
+    expected_amount_out,
+    min_amount_out,
+    actual_amount_in,
+    actual_amount_out,
+    started_at,
+    completed_at,
+    details_json,
+    usd_valuation_json,
+    created_at,
+    updated_at
+"#;
+
+const EXECUTION_LEG_RETURNING_COLUMNS: &str = r#"
+    leg.id,
+    leg.order_id,
+    leg.execution_attempt_id,
+    leg.transition_decl_id,
+    leg.leg_index,
+    leg.leg_type,
+    leg.provider,
+    leg.status,
+    leg.input_chain_id,
+    leg.input_asset_id,
+    leg.output_chain_id,
+    leg.output_asset_id,
+    leg.amount_in,
+    leg.expected_amount_out,
+    leg.min_amount_out,
+    leg.actual_amount_in,
+    leg.actual_amount_out,
+    leg.started_at,
+    leg.completed_at,
+    leg.details_json,
+    leg.usd_valuation_json,
+    leg.created_at,
+    leg.updated_at
 "#;
 
 const EXECUTION_ATTEMPT_SELECT_COLUMNS: &str = r#"
@@ -243,12 +298,13 @@ impl OrderRepository {
                 max_amount_in,
                 slippage_bps,
                 provider_quote,
+                usd_valuation_json,
                 expires_at,
                 created_at
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8,
-                $9, $10, $11, $12, $13, $14, $15, $16, $17
+                $9, $10, $11, $12, $13, $14, $15, $16, $17, $18
             )
             "#,
         )
@@ -271,6 +327,7 @@ impl OrderRepository {
             })?,
         )
         .bind(quote.provider_quote.clone())
+        .bind(quote.usd_valuation.clone())
         .bind(quote.expires_at)
         .bind(quote.created_at)
         .execute(&self.pool)
@@ -1758,18 +1815,18 @@ impl OrderRepository {
                 updated_at
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-            ON CONFLICT (provider, provider_ref) WHERE provider_ref IS NOT NULL
+            ON CONFLICT (execution_step_id) WHERE execution_step_id IS NOT NULL
             DO UPDATE SET
                 order_id = EXCLUDED.order_id,
                 execution_attempt_id = EXCLUDED.execution_attempt_id,
-                execution_step_id = EXCLUDED.execution_step_id,
+                provider = EXCLUDED.provider,
                 operation_type = EXCLUDED.operation_type,
+                provider_ref = EXCLUDED.provider_ref,
                 status = EXCLUDED.status,
                 request_json = EXCLUDED.request_json,
                 response_json = EXCLUDED.response_json,
                 observed_state_json = EXCLUDED.observed_state_json,
                 updated_at = EXCLUDED.updated_at
-            WHERE order_provider_operations.order_id = EXCLUDED.order_id
             RETURNING id
             "#,
         )
@@ -1906,6 +1963,8 @@ impl OrderRepository {
             FROM order_provider_operations
             WHERE provider = $1
               AND provider_ref = $2
+            ORDER BY updated_at DESC, created_at DESC, id DESC
+            LIMIT 1
             "#
         ))
         .bind(provider)
@@ -1984,7 +2043,42 @@ impl OrderRepository {
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             ON CONFLICT (source, idempotency_key) WHERE idempotency_key IS NOT NULL
             DO UPDATE SET
-                updated_at = order_provider_operation_hints.updated_at
+                evidence_json = CASE
+                    WHEN order_provider_operation_hints.source = 'sauron_provider_operation'
+                         AND order_provider_operation_hints.status IN ('processed', 'ignored', 'failed')
+                    THEN EXCLUDED.evidence_json
+                    ELSE order_provider_operation_hints.evidence_json
+                END,
+                status = CASE
+                    WHEN order_provider_operation_hints.source = 'sauron_provider_operation'
+                         AND order_provider_operation_hints.status IN ('processed', 'ignored', 'failed')
+                    THEN EXCLUDED.status
+                    ELSE order_provider_operation_hints.status
+                END,
+                error_json = CASE
+                    WHEN order_provider_operation_hints.source = 'sauron_provider_operation'
+                         AND order_provider_operation_hints.status IN ('processed', 'ignored', 'failed')
+                    THEN '{{}}'::jsonb
+                    ELSE order_provider_operation_hints.error_json
+                END,
+                claimed_at = CASE
+                    WHEN order_provider_operation_hints.source = 'sauron_provider_operation'
+                         AND order_provider_operation_hints.status IN ('processed', 'ignored', 'failed')
+                    THEN NULL
+                    ELSE order_provider_operation_hints.claimed_at
+                END,
+                processed_at = CASE
+                    WHEN order_provider_operation_hints.source = 'sauron_provider_operation'
+                         AND order_provider_operation_hints.status IN ('processed', 'ignored', 'failed')
+                    THEN NULL
+                    ELSE order_provider_operation_hints.processed_at
+                END,
+                updated_at = CASE
+                    WHEN order_provider_operation_hints.source = 'sauron_provider_operation'
+                         AND order_provider_operation_hints.status IN ('processed', 'ignored', 'failed')
+                    THEN EXCLUDED.updated_at
+                    ELSE order_provider_operation_hints.updated_at
+                END
             RETURNING {PROVIDER_OPERATION_HINT_SELECT_COLUMNS}
             "#
         ))
@@ -2275,6 +2369,126 @@ impl OrderRepository {
             .collect()
     }
 
+    pub async fn create_execution_legs_idempotent(
+        &self,
+        legs: &[OrderExecutionLeg],
+    ) -> RouterServerResult<u64> {
+        let started = Instant::now();
+        let result = async {
+            let mut tx = self.pool.begin().await?;
+            let mut inserted = 0_u64;
+
+            for leg in legs {
+                let query = if leg.execution_attempt_id.is_some() {
+                    r#"
+                    INSERT INTO order_execution_legs (
+                        id,
+                        order_id,
+                        execution_attempt_id,
+                        transition_decl_id,
+                        leg_index,
+                        leg_type,
+                        provider,
+                        status,
+                        input_chain_id,
+                        input_asset_id,
+                        output_chain_id,
+                        output_asset_id,
+                        amount_in,
+                        expected_amount_out,
+                        min_amount_out,
+                        actual_amount_in,
+                        actual_amount_out,
+                        started_at,
+                        completed_at,
+                        details_json,
+                        usd_valuation_json,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (
+                        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                        $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23
+                    )
+                    ON CONFLICT (execution_attempt_id, leg_index)
+                    WHERE execution_attempt_id IS NOT NULL DO NOTHING
+                    "#
+                } else {
+                    r#"
+                    INSERT INTO order_execution_legs (
+                        id,
+                        order_id,
+                        execution_attempt_id,
+                        transition_decl_id,
+                        leg_index,
+                        leg_type,
+                        provider,
+                        status,
+                        input_chain_id,
+                        input_asset_id,
+                        output_chain_id,
+                        output_asset_id,
+                        amount_in,
+                        expected_amount_out,
+                        min_amount_out,
+                        actual_amount_in,
+                        actual_amount_out,
+                        started_at,
+                        completed_at,
+                        details_json,
+                        usd_valuation_json,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (
+                        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                        $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23
+                    )
+                    ON CONFLICT (order_id, leg_index)
+                    WHERE execution_attempt_id IS NULL DO NOTHING
+                    "#
+                };
+                let result = sqlx_core::query::query(query)
+                    .bind(leg.id)
+                    .bind(leg.order_id)
+                    .bind(leg.execution_attempt_id)
+                    .bind(leg.transition_decl_id.clone())
+                    .bind(leg.leg_index)
+                    .bind(&leg.leg_type)
+                    .bind(&leg.provider)
+                    .bind(leg.status.to_db_string())
+                    .bind(leg.input_asset.chain.as_str())
+                    .bind(leg.input_asset.asset.as_str())
+                    .bind(leg.output_asset.chain.as_str())
+                    .bind(leg.output_asset.asset.as_str())
+                    .bind(&leg.amount_in)
+                    .bind(&leg.expected_amount_out)
+                    .bind(leg.min_amount_out.clone())
+                    .bind(leg.actual_amount_in.clone())
+                    .bind(leg.actual_amount_out.clone())
+                    .bind(leg.started_at)
+                    .bind(leg.completed_at)
+                    .bind(leg.details.clone())
+                    .bind(leg.usd_valuation.clone())
+                    .bind(leg.created_at)
+                    .bind(leg.updated_at)
+                    .execute(&mut *tx)
+                    .await?;
+                inserted += result.rows_affected();
+            }
+
+            tx.commit().await?;
+            Ok::<u64, RouterServerError>(inserted)
+        }
+        .await;
+        telemetry::record_db_query(
+            "order.create_execution_legs_idempotent",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        result
+    }
+
     pub async fn create_execution_step(&self, step: &OrderExecutionStep) -> RouterServerResult<()> {
         let started = Instant::now();
         let result = sqlx_core::query::query(
@@ -2283,6 +2497,7 @@ impl OrderRepository {
                 id,
                 order_id,
                 execution_attempt_id,
+                execution_leg_id,
                 transition_decl_id,
                 step_index,
                 step_type,
@@ -2305,19 +2520,21 @@ impl OrderRepository {
                 request_json,
                 response_json,
                 error_json,
+                usd_valuation_json,
                 created_at,
                 updated_at
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                $13, $14, $15, $16, $17, $18, $19, $20, $21,
-                $22, $23, $24, $25, $26, $27
+                $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
+                $23, $24, $25, $26, $27, $28, $29
             )
             "#,
         )
         .bind(step.id)
         .bind(step.order_id)
         .bind(step.execution_attempt_id)
+        .bind(step.execution_leg_id)
         .bind(step.transition_decl_id.clone())
         .bind(step.step_index)
         .bind(step.step_type.to_db_string())
@@ -2340,6 +2557,7 @@ impl OrderRepository {
         .bind(step.request.clone())
         .bind(step.response.clone())
         .bind(step.error.clone())
+        .bind(step.usd_valuation.clone())
         .bind(step.created_at)
         .bind(step.updated_at)
         .execute(&self.pool)
@@ -2369,6 +2587,7 @@ impl OrderRepository {
                         id,
                         order_id,
                         execution_attempt_id,
+                        execution_leg_id,
                         transition_decl_id,
                         step_index,
                         step_type,
@@ -2391,13 +2610,14 @@ impl OrderRepository {
                         request_json,
                         response_json,
                         error_json,
+                        usd_valuation_json,
                         created_at,
                         updated_at
                     )
                     VALUES (
                         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                        $13, $14, $15, $16, $17, $18, $19, $20, $21,
-                        $22, $23, $24, $25, $26, $27
+                        $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
+                        $23, $24, $25, $26, $27, $28, $29
                     )
                     ON CONFLICT (execution_attempt_id, step_index)
                     WHERE execution_attempt_id IS NOT NULL DO NOTHING
@@ -2408,6 +2628,7 @@ impl OrderRepository {
                         id,
                         order_id,
                         execution_attempt_id,
+                        execution_leg_id,
                         transition_decl_id,
                         step_index,
                         step_type,
@@ -2430,13 +2651,14 @@ impl OrderRepository {
                         request_json,
                         response_json,
                         error_json,
+                        usd_valuation_json,
                         created_at,
                         updated_at
                     )
                     VALUES (
                         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                        $13, $14, $15, $16, $17, $18, $19, $20, $21,
-                        $22, $23, $24, $25, $26, $27
+                        $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
+                        $23, $24, $25, $26, $27, $28, $29
                     )
                     ON CONFLICT (order_id, step_index)
                     WHERE execution_attempt_id IS NULL DO NOTHING
@@ -2446,6 +2668,7 @@ impl OrderRepository {
                     .bind(step.id)
                     .bind(step.order_id)
                     .bind(step.execution_attempt_id)
+                    .bind(step.execution_leg_id)
                     .bind(step.transition_decl_id.clone())
                     .bind(step.step_index)
                     .bind(step.step_type.to_db_string())
@@ -2468,6 +2691,7 @@ impl OrderRepository {
                     .bind(step.request.clone())
                     .bind(step.response.clone())
                     .bind(step.error.clone())
+                    .bind(step.usd_valuation.clone())
                     .bind(step.created_at)
                     .bind(step.updated_at)
                     .execute(&mut *tx)
@@ -2515,6 +2739,34 @@ impl OrderRepository {
             .collect()
     }
 
+    pub async fn get_execution_legs_for_attempt(
+        &self,
+        execution_attempt_id: Uuid,
+    ) -> RouterServerResult<Vec<OrderExecutionLeg>> {
+        let started = Instant::now();
+        let result = sqlx_core::query::query(&format!(
+            r#"
+            SELECT {EXECUTION_LEG_SELECT_COLUMNS}
+            FROM order_execution_legs
+            WHERE execution_attempt_id = $1
+            ORDER BY leg_index ASC, created_at ASC, id ASC
+            "#
+        ))
+        .bind(execution_attempt_id)
+        .fetch_all(&self.pool)
+        .await;
+        telemetry::record_db_query(
+            "order.get_execution_legs_for_attempt",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        let rows = result?;
+
+        rows.iter()
+            .map(|row| self.map_execution_leg_row(row))
+            .collect()
+    }
+
     pub async fn get_execution_steps(
         &self,
         order_id: Uuid,
@@ -2554,6 +2806,45 @@ impl OrderRepository {
             .collect()
     }
 
+    pub async fn get_execution_legs(
+        &self,
+        order_id: Uuid,
+    ) -> RouterServerResult<Vec<OrderExecutionLeg>> {
+        let started = Instant::now();
+        let result = sqlx_core::query::query(&format!(
+            r#"
+            SELECT {EXECUTION_LEG_SELECT_COLUMNS}
+            FROM order_execution_legs
+            WHERE order_id = $1
+            ORDER BY
+                COALESCE(
+                    (
+                        SELECT attempt_index
+                        FROM order_execution_attempts attempts
+                        WHERE attempts.id = order_execution_legs.execution_attempt_id
+                    ),
+                    0
+                ) ASC,
+                leg_index ASC,
+                created_at ASC,
+                id ASC
+            "#
+        ))
+        .bind(order_id)
+        .fetch_all(&self.pool)
+        .await;
+        telemetry::record_db_query(
+            "order.get_execution_legs",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        let rows = result?;
+
+        rows.iter()
+            .map(|row| self.map_execution_leg_row(row))
+            .collect()
+    }
+
     pub async fn get_execution_step(&self, id: Uuid) -> RouterServerResult<OrderExecutionStep> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
@@ -2574,6 +2865,116 @@ impl OrderRepository {
         let row = result?;
 
         self.map_execution_step_row(&row)
+    }
+
+    pub async fn refresh_execution_leg_from_actions(
+        &self,
+        execution_leg_id: Uuid,
+    ) -> RouterServerResult<Option<OrderExecutionLeg>> {
+        let started = Instant::now();
+        let result = sqlx_core::query::query(&format!(
+            r#"
+            WITH action_summary AS (
+                SELECT
+                    COUNT(*) AS total_actions,
+                    BOOL_OR(status = 'failed') AS has_failed,
+                    BOOL_OR(status = 'cancelled') AS has_cancelled,
+                    BOOL_OR(status = 'running') AS has_running,
+                    BOOL_OR(status = 'waiting') AS has_waiting,
+                    BOOL_OR(status = 'ready') AS has_ready,
+                    COUNT(*) FILTER (WHERE status IN ('completed', 'skipped')) AS terminal_success_actions,
+                    MIN(started_at) FILTER (WHERE started_at IS NOT NULL) AS first_started_at,
+                    MAX(completed_at) FILTER (WHERE completed_at IS NOT NULL) AS last_completed_at
+                FROM order_execution_steps
+                WHERE execution_leg_id = $1
+            ),
+            last_success_action AS (
+                SELECT
+                    response_json
+                FROM order_execution_steps
+                WHERE execution_leg_id = $1
+                  AND status IN ('completed', 'skipped')
+                ORDER BY step_index DESC, updated_at DESC, id DESC
+                LIMIT 1
+            ),
+            rolled_up AS (
+                SELECT
+                    CASE
+                        WHEN action_summary.has_failed THEN 'failed'
+                        WHEN action_summary.has_cancelled THEN 'cancelled'
+                        WHEN action_summary.total_actions > 0
+                             AND action_summary.terminal_success_actions = action_summary.total_actions
+                            THEN 'completed'
+                        WHEN action_summary.has_running THEN 'running'
+                        WHEN action_summary.has_waiting THEN 'waiting'
+                        WHEN action_summary.has_ready THEN 'ready'
+                        ELSE 'planned'
+                    END AS status,
+                    action_summary.total_actions > 0
+                        AND action_summary.terminal_success_actions = action_summary.total_actions
+                        AS completed,
+                    action_summary.first_started_at,
+                    action_summary.last_completed_at,
+                    last_success_action.response_json
+                FROM action_summary
+                LEFT JOIN last_success_action ON true
+            )
+            UPDATE order_execution_legs leg
+            SET
+                status = rolled_up.status,
+                started_at = COALESCE(leg.started_at, rolled_up.first_started_at),
+                completed_at = CASE
+                    WHEN rolled_up.status IN ('completed', 'failed', 'cancelled')
+                        THEN COALESCE(leg.completed_at, rolled_up.last_completed_at, now())
+                    ELSE NULL
+                END,
+                actual_amount_in = CASE
+                    WHEN rolled_up.completed THEN leg.amount_in
+                    ELSE NULL
+                END,
+                actual_amount_out = CASE
+                    WHEN rolled_up.completed THEN COALESCE(
+                        rolled_up.response_json->>'amount_out',
+                        rolled_up.response_json->>'amountOut',
+                        rolled_up.response_json #>> '{{response,amount_out}}',
+                        rolled_up.response_json #>> '{{response,amountOut}}',
+                        rolled_up.response_json #>> '{{response,expectedOutputAmount}}',
+                        rolled_up.response_json->>'expectedOutputAmount',
+                        rolled_up.response_json->>'output_amount',
+                        rolled_up.response_json->>'outputAmount',
+                        leg.expected_amount_out
+                    )
+                    ELSE NULL
+                END,
+                updated_at = now()
+            FROM rolled_up
+            WHERE leg.id = $1
+            RETURNING {EXECUTION_LEG_RETURNING_COLUMNS}
+            "#
+        ))
+        .bind(execution_leg_id)
+        .fetch_optional(&self.pool)
+        .await;
+        telemetry::record_db_query(
+            "order.refresh_execution_leg_from_actions",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        let row = result?;
+
+        row.map(|row| self.map_execution_leg_row(&row)).transpose()
+    }
+
+    async fn refresh_execution_leg_for_step(
+        &self,
+        step: &OrderExecutionStep,
+    ) -> RouterServerResult<()> {
+        if let Some(execution_leg_id) = step.execution_leg_id {
+            let _ = self
+                .refresh_execution_leg_from_actions(execution_leg_id)
+                .await?;
+        }
+        Ok(())
     }
 
     pub async fn skip_execution_steps_after_index(
@@ -2611,9 +3012,21 @@ impl OrderRepository {
         );
         let rows = result?;
 
-        rows.iter()
+        let steps = rows
+            .iter()
             .map(|row| self.map_execution_step_row(row))
-            .collect()
+            .collect::<RouterServerResult<Vec<_>>>()?;
+        let mut refreshed_leg_ids = std::collections::BTreeSet::new();
+        for step in &steps {
+            if let Some(execution_leg_id) = step.execution_leg_id {
+                if refreshed_leg_ids.insert(execution_leg_id) {
+                    let _ = self
+                        .refresh_execution_leg_from_actions(execution_leg_id)
+                        .await?;
+                }
+            }
+        }
+        Ok(steps)
     }
 
     pub async fn transition_execution_step_status(
@@ -2648,7 +3061,9 @@ impl OrderRepository {
         );
         let row = result?;
 
-        self.map_execution_step_row(&row)
+        let step = self.map_execution_step_row(&row)?;
+        self.refresh_execution_leg_for_step(&step).await?;
+        Ok(step)
     }
 
     pub async fn complete_execution_step(
@@ -2656,6 +3071,7 @@ impl OrderRepository {
         id: Uuid,
         response: serde_json::Value,
         tx_hash: Option<String>,
+        usd_valuation: serde_json::Value,
         completed_at: DateTime<Utc>,
     ) -> RouterServerResult<OrderExecutionStep> {
         let started = Instant::now();
@@ -2666,8 +3082,9 @@ impl OrderRepository {
                 status = 'completed',
                 response_json = $2,
                 tx_hash = COALESCE($3, tx_hash),
-                completed_at = $4,
-                updated_at = $4
+                usd_valuation_json = $4,
+                completed_at = $5,
+                updated_at = $5
             WHERE id = $1
               AND status = 'running'
             RETURNING {EXECUTION_STEP_SELECT_COLUMNS}
@@ -2676,6 +3093,7 @@ impl OrderRepository {
         .bind(id)
         .bind(response)
         .bind(tx_hash)
+        .bind(usd_valuation)
         .bind(completed_at)
         .fetch_one(&self.pool)
         .await;
@@ -2686,7 +3104,48 @@ impl OrderRepository {
         );
         let row = result?;
 
-        self.map_execution_step_row(&row)
+        let step = self.map_execution_step_row(&row)?;
+        self.refresh_execution_leg_for_step(&step).await?;
+        Ok(step)
+    }
+
+    pub async fn complete_wait_for_deposit_step_for_order(
+        &self,
+        order_id: Uuid,
+        response: serde_json::Value,
+        completed_at: DateTime<Utc>,
+    ) -> RouterServerResult<Option<OrderExecutionStep>> {
+        let started = Instant::now();
+        let result = sqlx_core::query::query(&format!(
+            r#"
+            UPDATE order_execution_steps
+            SET
+                status = 'completed',
+                response_json = CASE
+                    WHEN response_json = '{{}}'::jsonb THEN $2
+                    ELSE response_json
+                END,
+                completed_at = COALESCE(completed_at, $3),
+                updated_at = $3
+            WHERE order_id = $1
+              AND step_type = 'wait_for_deposit'
+              AND status = 'waiting'
+            RETURNING {EXECUTION_STEP_SELECT_COLUMNS}
+            "#
+        ))
+        .bind(order_id)
+        .bind(response)
+        .bind(completed_at)
+        .fetch_optional(&self.pool)
+        .await;
+        telemetry::record_db_query(
+            "order.complete_wait_for_deposit_step_for_order",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        let row = result?;
+
+        row.map(|row| self.map_execution_step_row(&row)).transpose()
     }
 
     pub async fn wait_execution_step(
@@ -2724,7 +3183,9 @@ impl OrderRepository {
         );
         let row = result?;
 
-        self.map_execution_step_row(&row)
+        let step = self.map_execution_step_row(&row)?;
+        self.refresh_execution_leg_for_step(&step).await?;
+        Ok(step)
     }
 
     pub async fn complete_observed_execution_step(
@@ -2732,6 +3193,7 @@ impl OrderRepository {
         id: Uuid,
         response: serde_json::Value,
         tx_hash: Option<String>,
+        usd_valuation: serde_json::Value,
         completed_at: DateTime<Utc>,
     ) -> RouterServerResult<OrderExecutionStep> {
         let started = Instant::now();
@@ -2742,8 +3204,9 @@ impl OrderRepository {
                 status = 'completed',
                 response_json = $2,
                 tx_hash = COALESCE($3, tx_hash),
-                completed_at = $4,
-                updated_at = $4
+                usd_valuation_json = $4,
+                completed_at = $5,
+                updated_at = $5
             WHERE id = $1
               AND status IN ('running', 'waiting')
             RETURNING {EXECUTION_STEP_SELECT_COLUMNS}
@@ -2752,6 +3215,7 @@ impl OrderRepository {
         .bind(id)
         .bind(response)
         .bind(tx_hash)
+        .bind(usd_valuation)
         .bind(completed_at)
         .fetch_one(&self.pool)
         .await;
@@ -2762,7 +3226,9 @@ impl OrderRepository {
         );
         let row = result?;
 
-        self.map_execution_step_row(&row)
+        let step = self.map_execution_step_row(&row)?;
+        self.refresh_execution_leg_for_step(&step).await?;
+        Ok(step)
     }
 
     pub async fn fail_execution_step(
@@ -2797,7 +3263,9 @@ impl OrderRepository {
         );
         let row = result?;
 
-        self.map_execution_step_row(&row)
+        let step = self.map_execution_step_row(&row)?;
+        self.refresh_execution_leg_for_step(&step).await?;
+        Ok(step)
     }
 
     pub async fn fail_observed_execution_step(
@@ -2832,7 +3300,9 @@ impl OrderRepository {
         );
         let row = result?;
 
-        self.map_execution_step_row(&row)
+        let step = self.map_execution_step_row(&row)?;
+        self.refresh_execution_leg_for_step(&step).await?;
+        Ok(step)
     }
 
     fn map_order_row(&self, row: &sqlx_postgres::PgRow) -> RouterServerResult<RouterOrder> {
@@ -2988,6 +3458,7 @@ impl OrderRepository {
                 }
             })?,
             provider_quote: row.get("provider_quote"),
+            usd_valuation: row.get("usd_valuation_json"),
             expires_at: row.get("expires_at"),
             created_at: row.get("created_at"),
         })
@@ -3219,6 +3690,7 @@ impl OrderRepository {
             id: row.get("id"),
             order_id: row.get("order_id"),
             execution_attempt_id: row.get("execution_attempt_id"),
+            execution_leg_id: row.get("execution_leg_id"),
             transition_decl_id: row.get("transition_decl_id"),
             step_index: row.get("step_index"),
             step_type,
@@ -3247,6 +3719,53 @@ impl OrderRepository {
             request: row.get("request_json"),
             response: row.get("response_json"),
             error: row.get("error_json"),
+            usd_valuation: row.get("usd_valuation_json"),
+            created_at: row.get("created_at"),
+            updated_at: row.get("updated_at"),
+        })
+    }
+
+    fn map_execution_leg_row(
+        &self,
+        row: &sqlx_postgres::PgRow,
+    ) -> RouterServerResult<OrderExecutionLeg> {
+        let status = row.get::<String, _>("status");
+        let status = OrderExecutionStepStatus::from_db_string(&status).ok_or_else(|| {
+            RouterServerError::InvalidData {
+                message: format!("unsupported order execution leg status: {status}"),
+            }
+        })?;
+        let input_chain = parse_chain_id(row.get::<String, _>("input_chain_id"), "leg input")?;
+        let input_asset = parse_asset_id(row.get::<String, _>("input_asset_id"), "leg input")?;
+        let output_chain = parse_chain_id(row.get::<String, _>("output_chain_id"), "leg output")?;
+        let output_asset = parse_asset_id(row.get::<String, _>("output_asset_id"), "leg output")?;
+
+        Ok(OrderExecutionLeg {
+            id: row.get("id"),
+            order_id: row.get("order_id"),
+            execution_attempt_id: row.get("execution_attempt_id"),
+            transition_decl_id: row.get("transition_decl_id"),
+            leg_index: row.get("leg_index"),
+            leg_type: row.get("leg_type"),
+            provider: row.get("provider"),
+            status,
+            input_asset: DepositAsset {
+                chain: input_chain,
+                asset: input_asset,
+            },
+            output_asset: DepositAsset {
+                chain: output_chain,
+                asset: output_asset,
+            },
+            amount_in: row.get("amount_in"),
+            expected_amount_out: row.get("expected_amount_out"),
+            min_amount_out: row.get("min_amount_out"),
+            actual_amount_in: row.get("actual_amount_in"),
+            actual_amount_out: row.get("actual_amount_out"),
+            started_at: row.get("started_at"),
+            completed_at: row.get("completed_at"),
+            details: row.get("details_json"),
+            usd_valuation: row.get("usd_valuation_json"),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
         })

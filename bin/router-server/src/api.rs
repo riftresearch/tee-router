@@ -471,6 +471,7 @@ mod tests {
             id: step_id,
             order_id,
             execution_attempt_id: None,
+            execution_leg_id: None,
             transition_decl_id: None,
             step_index,
             step_type: crate::models::OrderExecutionStepType::AcrossBridge,
@@ -491,6 +492,7 @@ mod tests {
             request: json!({}),
             response: json!({}),
             error: json!({}),
+            usd_valuation: json!({}),
             created_at: now,
             updated_at: now,
         }

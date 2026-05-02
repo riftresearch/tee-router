@@ -271,7 +271,10 @@ fn settlement_candidates(
                 )
                 .map(|entry| entry.provider_asset.clone());
             (provider_asset.is_some(), U256::ZERO, provider_asset)
-        } else if is_evm_chain(&asset.chain) && !asset.asset.is_native() {
+        } else if is_evm_chain(&asset.chain)
+            && !asset.asset.is_native()
+            && is_supported_settlement_canonical(chain_asset.canonical)
+        {
             (
                 true,
                 pricing.wei_to_usd_micro(estimate_erc20_collection_cost_wei(&asset.chain, pricing)),
@@ -335,6 +338,13 @@ fn estimate_erc20_collection_cost_wei(chain: &ChainId, pricing: &PricingSnapshot
     U256::from(65_000_u64).saturating_mul(pricing.chain_gas_price_wei(chain))
 }
 
+fn is_supported_settlement_canonical(canonical: CanonicalAsset) -> bool {
+    matches!(
+        canonical,
+        CanonicalAsset::Usdc | CanonicalAsset::Usdt | CanonicalAsset::Eth
+    )
+}
+
 fn usd_micro_to_asset_raw(
     usd_micro: U256,
     asset: &DepositAsset,
@@ -365,7 +375,12 @@ fn is_evm_chain(chain: &ChainId) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::AssetId;
+    use crate::{
+        protocol::AssetId,
+        services::asset_registry::{
+            AssetSlot, MarketOrderNode, RequiredCustodyRole, TransitionDecl,
+        },
+    };
 
     fn asset(chain: &str, asset: AssetId) -> DepositAsset {
         DepositAsset {
@@ -443,5 +458,75 @@ mod tests {
 
         assert!(plan.debts.is_empty());
         assert!(plan.retention_actions.is_empty());
+    }
+
+    #[test]
+    fn unsupported_erc20_assets_are_not_gas_settlement_candidates() {
+        let registry = AssetRegistry::default();
+        let base_cbbtc = asset(
+            "evm:8453",
+            AssetId::reference("0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf"),
+        );
+        let base_usdc = asset(
+            "evm:8453",
+            AssetId::reference("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
+        );
+        let arbitrum_usdc = asset(
+            "evm:42161",
+            AssetId::reference("0xaf88d065e77c8cc2239327c5edb3a432268e5831"),
+        );
+        let path = TransitionPath {
+            id: "test-path".to_string(),
+            transitions: vec![
+                transition(
+                    "test-swap",
+                    MarketOrderTransitionKind::UniversalRouterSwap,
+                    ProviderId::Velora,
+                    base_cbbtc,
+                    base_usdc.clone(),
+                ),
+                transition(
+                    "test-bridge",
+                    MarketOrderTransitionKind::CctpBridge,
+                    ProviderId::Cctp,
+                    base_usdc,
+                    arbitrum_usdc,
+                ),
+            ],
+        };
+
+        let plan = optimized_paymaster_reimbursement_plan(&registry, &path).unwrap();
+
+        assert_eq!(plan.retention_actions.len(), 1);
+        assert_eq!(plan.retention_actions[0].settlement_chain_id, "evm:8453");
+        assert_eq!(
+            plan.retention_actions[0].settlement_asset_id,
+            "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+        );
+    }
+
+    fn transition(
+        id: &str,
+        kind: MarketOrderTransitionKind,
+        provider: ProviderId,
+        input: DepositAsset,
+        output: DepositAsset,
+    ) -> TransitionDecl {
+        TransitionDecl {
+            id: id.to_string(),
+            kind,
+            provider,
+            input: slot(input.clone()),
+            output: slot(output.clone()),
+            from: MarketOrderNode::External(input),
+            to: MarketOrderNode::External(output),
+        }
+    }
+
+    fn slot(asset: DepositAsset) -> AssetSlot {
+        AssetSlot {
+            asset,
+            required_custody_role: RequiredCustodyRole::SourceOrIntermediate,
+        }
     }
 }

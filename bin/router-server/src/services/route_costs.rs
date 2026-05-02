@@ -8,6 +8,7 @@ use crate::{
         asset_registry::{
             AssetRegistry, MarketOrderTransitionKind, TransitionDecl, TransitionPath,
         },
+        pricing::STATIC_BOOTSTRAP_PRICING_SOURCE,
         pricing::{div_ceil_u64, PricingSnapshot, BPS_DENOMINATOR},
     },
 };
@@ -122,6 +123,21 @@ impl RouteCostService {
 
     pub async fn current_pricing_snapshot(&self) -> PricingSnapshot {
         self.pricing.read().await.clone()
+    }
+
+    pub async fn current_or_refresh_pricing_snapshot(&self) -> PricingSnapshot {
+        let now = Utc::now();
+        let current = self.current_pricing_snapshot().await;
+        let fresh = current.source != STATIC_BOOTSTRAP_PRICING_SOURCE
+            && now
+                .signed_duration_since(current.captured_at)
+                .to_std()
+                .is_ok_and(|age| age < self.ttl);
+        if fresh {
+            current
+        } else {
+            self.refresh_pricing_snapshot().await
+        }
     }
 
     pub async fn refresh_anchor_costs(&self) -> RouterServerResult<RouteCostRefreshSummary> {

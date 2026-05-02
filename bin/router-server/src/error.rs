@@ -34,6 +34,9 @@ pub enum RouterServerError {
     #[snafu(display("No route found: {}", message))]
     NoRoute { message: String },
 
+    #[snafu(display("Not ready: {}", message))]
+    NotReady { message: String },
+
     #[snafu(display("Internal server error: {}", message))]
     Internal { message: String },
 }
@@ -61,6 +64,7 @@ impl IntoResponse for RouterServerError {
             Self::Forbidden { .. } => StatusCode::FORBIDDEN,
             Self::Validation { .. } => StatusCode::BAD_REQUEST,
             Self::NoRoute { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::NotReady { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::InvalidData { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::DatabaseQuery { .. } | Self::Migration { .. } | Self::Internal { .. } => {
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -135,6 +139,7 @@ impl From<crate::services::vault_manager::VaultError> for RouterServerError {
             VaultError::InvalidFundingAmount { field, reason } => Self::Validation {
                 message: format!("Invalid funding amount {field}: {reason}"),
             },
+            VaultError::FundingHintNotReady { reason } => Self::NotReady { message: reason },
             VaultError::FundingCheck { message } => Self::Internal { message },
             VaultError::Random { source } => Self::Internal {
                 message: source.to_string(),

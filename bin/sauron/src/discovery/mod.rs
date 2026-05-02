@@ -47,6 +47,21 @@ pub struct DiscoveryContext {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DepositConfirmationState {
+    Mempool,
+    Confirmed,
+}
+
+impl DepositConfirmationState {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Mempool => "mempool",
+            Self::Confirmed => "confirmed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DetectedDeposit {
     pub watch_target: WatchTarget,
     pub watch_id: Uuid,
@@ -56,6 +71,9 @@ pub struct DetectedDeposit {
     pub tx_hash: String,
     pub transfer_index: u64,
     pub amount: U256,
+    pub confirmation_state: DepositConfirmationState,
+    pub block_height: Option<u64>,
+    pub block_hash: Option<String>,
     pub observed_at: DateTime<Utc>,
     pub indexer_candidate_id: Option<String>,
 }
@@ -412,6 +430,12 @@ impl IndexedLookupBackfillState {
         false
     }
 
+    fn retry_unresolved(&mut self, watch_id: Uuid, version: DateTime<Utc>) {
+        if self.completed_versions.get(&watch_id) == Some(&version) {
+            self.completed_versions.remove(&watch_id);
+        }
+    }
+
     fn queue_len(&self) -> usize {
         self.queue.len()
     }
@@ -593,7 +617,7 @@ async fn drain_indexed_lookup_tasks(
                     );
                 }
             }
-            Ok(None) => {}
+            Ok(None) => backfill_state.retry_unresolved(watch_id, version),
             Err(error) => {
                 warn!(
                     backend = backend_name,
@@ -680,15 +704,20 @@ async fn submit_detected_deposit(
         "address": detected.address,
         "tx_hash": detected.tx_hash,
         "transfer_index": detected.transfer_index,
+        "vout": detected.transfer_index,
         "amount": detected.amount.to_string(),
+        "confirmation_state": detected.confirmation_state.as_str(),
+        "block_height": detected.block_height,
+        "block_hash": detected.block_hash,
         "observed_at": detected.observed_at,
     });
     let idempotency_key = Some(format!(
-        "sauron:{backend_name}:{}:{}:{}:{}",
+        "sauron:{backend_name}:{}:{}:{}:{}:{}",
         detected.watch_target.as_str(),
         detected.watch_id,
         detected.tx_hash,
-        detected.transfer_index
+        detected.transfer_index,
+        detected.confirmation_state.as_str()
     ));
 
     let target = match detected.watch_target {
@@ -860,7 +889,7 @@ fn submission_retry_jitter_millis(detected: &DetectedDeposit, attempts: u32) -> 
 #[cfg(test)]
 mod tests {
     use super::{
-        should_retry_submission, submission_retry_delay, DetectedDeposit,
+        should_retry_submission, submission_retry_delay, DepositConfirmationState, DetectedDeposit,
         IndexedLookupBackfillState, SUBMISSION_RETRY_BASE_DELAY, SUBMISSION_RETRY_MAX_DELAY,
     };
     use crate::error::Error;
@@ -913,6 +942,9 @@ mod tests {
             tx_hash: "deadbeef".to_string(),
             transfer_index: 0,
             amount: U256::from(1_u64),
+            confirmation_state: DepositConfirmationState::Mempool,
+            block_height: None,
+            block_hash: None,
             observed_at: Utc::now(),
             indexer_candidate_id: None,
         }
@@ -934,6 +966,7 @@ mod tests {
         Arc::new(WatchEntry {
             watch_target: WatchTarget::ProviderOperation,
             watch_id,
+            order_id: watch_id,
             source_chain: ChainType::Bitcoin,
             source_token: TokenIdentifier::Native,
             address: "btc-address".to_string(),
@@ -1008,6 +1041,28 @@ mod tests {
         ));
 
         state.requeue_pending_submissions(&watches, [watch_id]);
+        assert_eq!(state.queue_len(), 1);
+    }
+
+    #[test]
+    fn backfill_state_retries_unresolved_active_lookup() {
+        let watch_id = Uuid::now_v7();
+        let updated_at = Utc::now();
+        let mut state = IndexedLookupBackfillState::default();
+        let watches = HashMap::from([(watch_id, watch_entry(watch_id, updated_at))]);
+
+        state.sync_snapshot(&watches);
+        let ready = state.take_ready(&watches, 1);
+        assert_eq!(ready.len(), 1);
+        assert!(state.finish(
+            watch_id,
+            updated_at,
+            &HashMap::from([(watch_id, updated_at)]),
+        ));
+
+        state.retry_unresolved(watch_id, updated_at);
+        state.sync_snapshot(&watches);
+
         assert_eq!(state.queue_len(), 1);
     }
 }

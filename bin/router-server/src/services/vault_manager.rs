@@ -65,6 +65,9 @@ pub enum VaultError {
     #[snafu(display("Funding check failed: {}", message))]
     FundingCheck { message: String },
 
+    #[snafu(display("Funding hint is not observable yet: {}", reason))]
+    FundingHintNotReady { reason: String },
+
     #[snafu(display("Failed to generate vault salt: {}", source))]
     Random { source: Box<getrandom::Error> },
 
@@ -362,11 +365,14 @@ impl VaultManager {
         &self,
         hint: DepositVaultFundingHint,
     ) -> VaultResult<DepositVaultFundingHint> {
-        self.db
+        let vault = self
+            .db
             .vaults()
             .get(hint.vault_id)
             .await
             .map_err(VaultError::database)?;
+        self.ensure_full_amount_hint_is_observable(&vault, &hint)
+            .await?;
         self.db
             .vaults()
             .create_funding_hint(&hint)
@@ -464,7 +470,11 @@ impl VaultManager {
             }
         }
 
-        if !self.is_vault_funded(&vault).await? {
+        let required_amount = self.required_funding_amount(&vault).await?;
+        if !self
+            .is_vault_funded_by_hint(&vault, hint, required_amount)
+            .await?
+        {
             return Ok(FundingHintDisposition::Ignored {
                 reason: "vault balance is still below required funding amount".to_string(),
             });
@@ -783,6 +793,15 @@ impl VaultManager {
 
     async fn is_vault_funded(&self, vault: &DepositVault) -> VaultResult<bool> {
         let required_amount = self.required_funding_amount(vault).await?;
+        self.is_vault_funded_for_amount(vault, required_amount)
+            .await
+    }
+
+    async fn is_vault_funded_for_amount(
+        &self,
+        vault: &DepositVault,
+        required_amount: U256,
+    ) -> VaultResult<bool> {
         let backend_chain = backend_chain_for_id(&vault.deposit_asset.chain).ok_or(
             VaultError::ChainNotSupported {
                 chain: vault.deposit_asset.chain.clone(),
@@ -835,6 +854,110 @@ impl VaultManager {
             }
         };
         Ok(funded)
+    }
+
+    async fn ensure_full_amount_hint_is_observable(
+        &self,
+        vault: &DepositVault,
+        hint: &DepositVaultFundingHint,
+    ) -> VaultResult<()> {
+        if vault.status != DepositVaultStatus::PendingFunding {
+            return Ok(());
+        }
+        let required_amount = self.required_funding_amount(vault).await?;
+        if !funding_hint_observed_amount(hint)
+            .is_some_and(|observed_amount| observed_amount >= required_amount)
+        {
+            return Ok(());
+        }
+        if self
+            .is_vault_funded_by_hint(vault, hint, required_amount)
+            .await?
+        {
+            return Ok(());
+        }
+        Err(VaultError::FundingHintNotReady {
+            reason: "full-amount funding hint is not visible to router chain backend yet"
+                .to_string(),
+        })
+    }
+
+    async fn is_vault_funded_by_hint(
+        &self,
+        vault: &DepositVault,
+        hint: &DepositVaultFundingHint,
+        required_amount: U256,
+    ) -> VaultResult<bool> {
+        let backend_chain = backend_chain_for_id(&vault.deposit_asset.chain).ok_or(
+            VaultError::ChainNotSupported {
+                chain: vault.deposit_asset.chain.clone(),
+            },
+        )?;
+        if backend_chain == ChainType::Bitcoin
+            && funding_hint_confirmation_state(hint).as_deref() == Some("mempool")
+        {
+            return self
+                .is_bitcoin_mempool_hint_spendable(vault, hint, required_amount)
+                .await;
+        }
+        self.is_vault_funded_for_amount(vault, required_amount)
+            .await
+    }
+
+    async fn is_bitcoin_mempool_hint_spendable(
+        &self,
+        vault: &DepositVault,
+        hint: &DepositVaultFundingHint,
+        required_amount: U256,
+    ) -> VaultResult<bool> {
+        let observed_amount = match funding_hint_observed_amount(hint) {
+            Some(amount) if amount >= required_amount => amount,
+            _ => return Ok(false),
+        };
+        if observed_amount > U256::from(u64::MAX) {
+            return Err(VaultError::FundingCheck {
+                message: "bitcoin funding hint amount exceeds satoshi range".to_string(),
+            });
+        }
+        let tx_hash = funding_hint_tx_hash(hint).ok_or_else(|| VaultError::FundingCheck {
+            message: "bitcoin mempool funding hint missing tx_hash".to_string(),
+        })?;
+        let vout = funding_hint_vout(hint).ok_or_else(|| VaultError::FundingCheck {
+            message: "bitcoin mempool funding hint missing vout".to_string(),
+        })?;
+
+        let backend_chain = backend_chain_for_id(&vault.deposit_asset.chain).ok_or(
+            VaultError::ChainNotSupported {
+                chain: vault.deposit_asset.chain.clone(),
+            },
+        )?;
+        let chain =
+            self.chain_registry
+                .get(&backend_chain)
+                .ok_or(VaultError::ChainNotSupported {
+                    chain: vault.deposit_asset.chain.clone(),
+                })?;
+        let deposit_wallet = chain
+            .derive_wallet(&self.settings.master_key_bytes(), &vault.deposit_vault_salt)
+            .map_err(VaultError::wallet_derivation)?;
+        let bitcoin_chain = self.chain_registry.get_bitcoin(&backend_chain).ok_or(
+            VaultError::ChainNotSupported {
+                chain: vault.deposit_asset.chain.clone(),
+            },
+        )?;
+
+        bitcoin_chain
+            .can_spend_outpoint_now(
+                deposit_wallet.private_key(),
+                &vault.recovery_address,
+                &tx_hash,
+                vout,
+                observed_amount.to::<u64>(),
+            )
+            .await
+            .map_err(|source| VaultError::FundingCheck {
+                message: format!("failed to test bitcoin mempool spendability: {source}"),
+            })
     }
 
     async fn required_funding_amount(&self, vault: &DepositVault) -> VaultResult<U256> {
@@ -1076,6 +1199,35 @@ fn parse_positive_u256(field: &'static str, value: &str) -> VaultResult<U256> {
     Ok(amount)
 }
 
+fn funding_hint_observed_amount(hint: &DepositVaultFundingHint) -> Option<U256> {
+    hint.evidence
+        .get("amount")
+        .and_then(|value| value.as_str())
+        .and_then(|value| U256::from_str_radix(value, 10).ok())
+}
+
+fn funding_hint_confirmation_state(hint: &DepositVaultFundingHint) -> Option<String> {
+    hint.evidence
+        .get("confirmation_state")
+        .and_then(|value| value.as_str())
+        .map(str::to_ascii_lowercase)
+}
+
+fn funding_hint_tx_hash(hint: &DepositVaultFundingHint) -> Option<String> {
+    hint.evidence
+        .get("tx_hash")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
+fn funding_hint_vout(hint: &DepositVaultFundingHint) -> Option<u32> {
+    hint.evidence
+        .get("vout")
+        .or_else(|| hint.evidence.get("transfer_index"))
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u32::try_from(value).ok())
+}
+
 pub(crate) fn compute_cancellation_commitment(secret_bytes: &[u8; 32]) -> [u8; 32] {
     keccak256([CANCELLATION_COMMITMENT_DOMAIN, secret_bytes].concat()).into()
 }
@@ -1181,5 +1333,49 @@ mod tests {
         assert!(VaultManager::validate_metadata(&serde_json::json!(42)).is_err());
         assert!(VaultManager::validate_metadata(&serde_json::json!(null)).is_err());
         assert!(VaultManager::validate_metadata(&serde_json::json!(true)).is_err());
+    }
+
+    #[test]
+    fn funding_hint_vout_accepts_vout_or_transfer_index() {
+        let mut hint = DepositVaultFundingHint {
+            id: Uuid::now_v7(),
+            vault_id: Uuid::now_v7(),
+            source: "sauron".to_string(),
+            hint_kind: crate::models::ProviderOperationHintKind::PossibleProgress,
+            evidence: serde_json::json!({ "vout": 7 }),
+            status: ProviderOperationHintStatus::Pending,
+            idempotency_key: None,
+            error: serde_json::json!({}),
+            claimed_at: None,
+            processed_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        assert_eq!(funding_hint_vout(&hint), Some(7));
+
+        hint.evidence = serde_json::json!({ "transfer_index": 8 });
+        assert_eq!(funding_hint_vout(&hint), Some(8));
+    }
+
+    #[test]
+    fn funding_hint_confirmation_state_is_normalized() {
+        let hint = DepositVaultFundingHint {
+            id: Uuid::now_v7(),
+            vault_id: Uuid::now_v7(),
+            source: "sauron".to_string(),
+            hint_kind: crate::models::ProviderOperationHintKind::PossibleProgress,
+            evidence: serde_json::json!({ "confirmation_state": "Mempool" }),
+            status: ProviderOperationHintStatus::Pending,
+            idempotency_key: None,
+            error: serde_json::json!({}),
+            claimed_at: None,
+            processed_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        assert_eq!(
+            funding_hint_confirmation_state(&hint).as_deref(),
+            Some("mempool")
+        );
     }
 }

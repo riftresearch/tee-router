@@ -765,7 +765,16 @@ async fn test_postgres() -> TestPostgres {
         ))
         .with_env_var("POSTGRES_USER", POSTGRES_USER)
         .with_env_var("POSTGRES_PASSWORD", POSTGRES_PASSWORD)
-        .with_env_var("POSTGRES_DB", POSTGRES_DATABASE);
+        .with_env_var("POSTGRES_DB", POSTGRES_DATABASE)
+        .with_cmd([
+            "postgres",
+            "-c",
+            "wal_level=logical",
+            "-c",
+            "max_wal_senders=10",
+            "-c",
+            "max_replication_slots=10",
+        ]);
 
     let container = image.start().await.unwrap_or_else(|err| {
         panic!(
@@ -1033,13 +1042,13 @@ async fn spawn_sauron(
         log_level: "warn".to_string(),
         router_replica_database_url: database_url.to_string(),
         sauron_state_database_url: None,
-        sauron_replica_event_source: sauron::config::SauronReplicaEventSource::Notify,
+        sauron_replica_event_source: sauron::config::SauronReplicaEventSource::Cdc,
         router_replica_database_name: "router_db".to_string(),
-        router_replica_notification_channel: "sauron_watch_set_changed".to_string(),
         sauron_cdc_slot_name: "sauron_watch_cdc".to_string(),
-        sauron_cdc_plugin: "test_decoding".to_string(),
-        sauron_cdc_batch_size: 1000,
-        sauron_cdc_poll_interval_ms: 1000,
+        router_cdc_publication_name: "router_cdc_publication".to_string(),
+        router_cdc_message_prefix: "rift.router.change".to_string(),
+        sauron_cdc_status_interval_ms: 1000,
+        sauron_cdc_idle_wakeup_interval_ms: 10_000,
         router_internal_base_url: router_base_url.to_string(),
         router_detector_api_key: "test-detector-secret".to_string(),
         electrum_http_server_url: devnet
@@ -1133,13 +1142,13 @@ fn live_sauron_args(
         log_level: "info".to_string(),
         router_replica_database_url: database_url.to_string(),
         sauron_state_database_url: None,
-        sauron_replica_event_source: sauron::config::SauronReplicaEventSource::Notify,
+        sauron_replica_event_source: sauron::config::SauronReplicaEventSource::Cdc,
         router_replica_database_name: "router_db".to_string(),
-        router_replica_notification_channel: "sauron_watch_set_changed".to_string(),
         sauron_cdc_slot_name: "sauron_watch_cdc".to_string(),
-        sauron_cdc_plugin: "test_decoding".to_string(),
-        sauron_cdc_batch_size: 1000,
-        sauron_cdc_poll_interval_ms: 1000,
+        router_cdc_publication_name: "router_cdc_publication".to_string(),
+        router_cdc_message_prefix: "rift.router.change".to_string(),
+        sauron_cdc_status_interval_ms: 1000,
+        sauron_cdc_idle_wakeup_interval_ms: 10_000,
         router_internal_base_url: router_base_url.to_string(),
         router_detector_api_key: "test-detector-secret".to_string(),
         electrum_http_server_url: live.electrum_http_server_url.clone(),
@@ -1615,6 +1624,14 @@ async fn send_native(devnet: &devnet::EthDevnet, recipient: Address, amount: U25
     assert!(receipt.status(), "native transfer reverted");
 }
 
+async fn mine_evm_confirmation_block(devnet: &devnet::EthDevnet) {
+    let provider = ProviderBuilder::new().connect_http(devnet.anvil.endpoint_url());
+    provider
+        .anvil_mine(Some(1), None)
+        .await
+        .expect("mine evm confirmation block");
+}
+
 async fn send_live_native(
     rpc_url: &str,
     private_key: &str,
@@ -1936,6 +1953,7 @@ async fn fund_source_vault(devnet: &RiftDevnet, route: RuntimeRoute, vault_addre
             .await;
         }
     }
+    mine_evm_confirmation_block(&devnet.base).await;
 }
 
 async fn fund_live_source_vault(

@@ -3,8 +3,34 @@ export type AssetRef = {
   assetId: string
 }
 
+export type UsdAmountValuation = {
+  raw: string
+  asset: AssetRef
+  canonical: string
+  decimals: number
+  unitUsdMicro: string
+  amountUsdMicro: string
+}
+
+export type UsdValuation = {
+  schemaVersion: number
+  pricing?: {
+    source: string
+    capturedAt: string
+    expiresAt?: string | null
+  }
+  amounts?: Record<string, UsdAmountValuation | undefined>
+  legs?: Array<{
+    index: number
+    transitionDeclId?: string
+    amounts?: Record<string, UsdAmountValuation | undefined>
+  }>
+}
+
 export type OrderExecutionStep = {
   id: string
+  executionLegId?: string
+  transitionDeclId?: string
   stepIndex: number
   stepType: string
   provider: string
@@ -23,6 +49,29 @@ export type OrderExecutionStep = {
   request: unknown
   response: unknown
   error: unknown
+  usdValuation?: UsdValuation
+}
+
+export type OrderExecutionLeg = {
+  id: string
+  transitionDeclId?: string
+  legIndex: number
+  legType: string
+  provider: string
+  status: string
+  input: AssetRef
+  output: AssetRef
+  amountIn: string
+  expectedAmountOut: string
+  minAmountOut?: string
+  actualAmountIn?: string
+  actualAmountOut?: string
+  startedAt?: string
+  completedAt?: string
+  createdAt: string
+  updatedAt: string
+  details: unknown
+  usdValuation?: UsdValuation
 }
 
 export type ProviderOperation = {
@@ -46,6 +95,12 @@ export type OrderProgress = {
   activeStage?: string
 }
 
+export type OrderMetrics = {
+  total: number
+  active: number
+  needsAttention: number
+}
+
 export type OrderFirehoseRow = {
   id: string
   orderType: string
@@ -67,8 +122,10 @@ export type OrderFirehoseRow = {
   quoteProviderId?: string
   quoteExpiresAt?: string
   providerQuote?: unknown
+  quoteUsdValuation?: UsdValuation
   workflowTraceId?: string
   workflowParentSpanId?: string
+  executionLegs: OrderExecutionLeg[]
   executionSteps: OrderExecutionStep[]
   providerOperations: ProviderOperation[]
   progress: OrderProgress
@@ -89,19 +146,27 @@ export type MeResponse = {
   allowedEmails: string[]
   routerAdminKeyConfigured?: boolean
   missingAuthConfig?: string[]
+  authMode?: 'google' | 'development_bypass'
 }
 
 export type OrdersResponse = {
   orders: OrderFirehoseRow[]
+  nextCursor?: string
+  total: number
+  metrics: OrderMetrics
   sort: 'created_at_desc'
 }
 
 export type SnapshotEvent = {
   orders: OrderFirehoseRow[]
+  total?: number
+  metrics?: OrderMetrics
   sort: 'created_at_desc'
 }
 
 export type UpsertEvent = {
   order: OrderFirehoseRow
+  total?: number
+  metrics?: OrderMetrics
   sort: 'created_at_desc'
 }

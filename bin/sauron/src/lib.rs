@@ -5,7 +5,6 @@ pub mod cursor;
 pub mod discovery;
 pub mod error;
 pub mod provider_operations;
-pub mod replica_db;
 pub mod router_client;
 pub mod runtime;
 pub mod state_db;

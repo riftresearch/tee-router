@@ -34,7 +34,9 @@ use zeromq::{Socket, SocketRecv, ZmqMessage};
 
 use crate::{
     config::SauronArgs,
-    discovery::{BlockCursor, BlockScan, DetectedDeposit, DiscoveryBackend},
+    discovery::{
+        BlockCursor, BlockScan, DepositConfirmationState, DetectedDeposit, DiscoveryBackend,
+    },
     error::{BitcoinEsploraSnafu, BitcoinRpcSnafu, Result},
     watch::{SharedWatchEntry, WatchEntry},
 };
@@ -344,6 +346,13 @@ impl DiscoveryBackend for BitcoinDiscoveryBackend {
                 tx_hash: utxo.txid.to_string(),
                 transfer_index: utxo.vout as u64,
                 amount,
+                confirmation_state: if utxo.status.confirmed {
+                    DepositConfirmationState::Confirmed
+                } else {
+                    DepositConfirmationState::Mempool
+                },
+                block_height: utxo.status.block_height.map(u64::from),
+                block_hash: utxo.status.block_hash.map(|hash| hash.to_string()),
                 observed_at: Utc::now(),
                 indexer_candidate_id: None,
             };
@@ -426,6 +435,8 @@ impl DiscoveryBackend for BitcoinDiscoveryBackend {
             detections.extend(match_transaction_against_scripts(
                 &txs_from_block(block),
                 &scripts,
+                height,
+                &block_hash.to_string(),
             ));
         }
 
@@ -446,11 +457,20 @@ fn txs_from_block(block: Block) -> Vec<Transaction> {
 fn match_transaction_against_scripts(
     transactions: &[Transaction],
     scripts: &HashMap<ScriptBuf, Vec<SharedWatchEntry>>,
+    block_height: u64,
+    block_hash: &str,
 ) -> Vec<DetectedDeposit> {
     let mut detections = Vec::new();
 
     for tx in transactions {
-        detections.extend(match_single_transaction(tx, scripts, Utc::now()));
+        detections.extend(match_single_transaction(
+            tx,
+            scripts,
+            Utc::now(),
+            DepositConfirmationState::Confirmed,
+            Some(block_height),
+            Some(block_hash.to_string()),
+        ));
     }
 
     detections
@@ -460,6 +480,9 @@ fn match_single_transaction(
     tx: &Transaction,
     scripts: &HashMap<ScriptBuf, Vec<SharedWatchEntry>>,
     observed_at: chrono::DateTime<chrono::Utc>,
+    confirmation_state: DepositConfirmationState,
+    block_height: Option<u64>,
+    block_hash: Option<String>,
 ) -> Vec<DetectedDeposit> {
     let tx_hash = tx.compute_txid().to_string();
     let mut detections = Vec::new();
@@ -484,6 +507,9 @@ fn match_single_transaction(
                 tx_hash: tx_hash.clone(),
                 transfer_index: vout as u64,
                 amount,
+                confirmation_state: confirmation_state.clone(),
+                block_height,
+                block_hash: block_hash.clone(),
                 observed_at,
                 indexer_candidate_id: None,
             });
@@ -633,10 +659,10 @@ impl BitcoinMempoolSupport {
         let mut previous = self.rawtx_message_sequence.lock().await;
         if let Some(last_sequence) = *previous {
             if sequence != last_sequence.wrapping_add(1) {
-                warn!(
+                info!(
                     last_sequence,
                     current_sequence = sequence,
-                    "Bitcoin rawtx ZMQ sequence gap detected"
+                    "Bitcoin rawtx ZMQ sequence advanced non-contiguously; requesting RPC mempool resync"
                 );
                 self.request_resync();
             }
@@ -648,10 +674,10 @@ impl BitcoinMempoolSupport {
         let mut previous = self.mempool_sequence.lock().await;
         if let Some(last_sequence) = *previous {
             if sequence != last_sequence.saturating_add(1) {
-                warn!(
+                info!(
                     last_sequence,
                     current_sequence = sequence,
-                    "Bitcoin mempool sequence gap detected"
+                    "Bitcoin mempool sequence advanced non-contiguously; requesting RPC mempool resync"
                 );
                 self.request_resync();
             }
@@ -666,35 +692,8 @@ impl BitcoinMempoolSupport {
         }
     }
 
-    async fn queue_detections_for_transaction(&self, tx: &Transaction) {
-        self.mempool_transactions
-            .lock()
-            .await
-            .insert(tx.compute_txid(), tx.clone());
-
-        let scripts = self.watches_by_script.read().await;
-        if scripts.is_empty() {
-            return;
-        }
-
-        let detections = match_single_transaction(tx, &scripts, Utc::now());
-        drop(scripts);
-
-        if detections.is_empty() {
-            return;
-        }
-
-        let txid = tx.compute_txid();
-        if !self.matched_txids.lock().await.insert(txid) {
-            return;
-        }
-
-        for detected in detections {
-            if self.detection_tx.send(detected).is_err() {
-                warn!("Bitcoin mempool detection queue closed unexpectedly");
-                break;
-            }
-        }
+    async fn observe_rawtx_transaction(&self, _tx: &Transaction) {
+        self.request_resync();
     }
 
     async fn queue_detections_from_snapshot(&self) {
@@ -718,7 +717,14 @@ impl BitcoinMempoolSupport {
         let mut matched_txids = self.matched_txids.lock().await;
 
         for tx in transactions {
-            let matches = match_single_transaction(&tx, &scripts, Utc::now());
+            let matches = match_single_transaction(
+                &tx,
+                &scripts,
+                Utc::now(),
+                DepositConfirmationState::Mempool,
+                None,
+                None,
+            );
             if matches.is_empty() {
                 continue;
             }
@@ -872,7 +878,7 @@ async fn handle_rawtx_message(
 
     let tx = deserialize::<Transaction>(&frames[1])
         .map_err(|error| format!("failed to deserialize rawtx payload: {error}"))?;
-    support.queue_detections_for_transaction(&tx).await;
+    support.observe_rawtx_transaction(&tx).await;
     Ok(())
 }
 
@@ -1076,5 +1082,129 @@ mod tests {
             .expect("three-frame sequence message should parse");
 
         assert_eq!(*support.mempool_sequence.lock().await, Some(43));
+    }
+
+    #[tokio::test]
+    async fn rawtx_observation_defers_detection_until_rpc_snapshot() {
+        let support = test_support();
+        let secret_key = bitcoin::secp256k1::SecretKey::from_slice(&[1_u8; 32]).unwrap();
+        let private_key = bitcoin::PrivateKey::new(secret_key, bitcoin::Network::Regtest);
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let address = Address::p2wpkh(
+            &bitcoin::CompressedPublicKey::from_private_key(&secp, &private_key).unwrap(),
+            bitcoin::Network::Regtest,
+        );
+        let watch = Arc::new(WatchEntry {
+            watch_target: crate::watch::WatchTarget::FundingVault,
+            watch_id: uuid::Uuid::now_v7(),
+            order_id: uuid::Uuid::now_v7(),
+            source_chain: ChainType::Bitcoin,
+            source_token: TokenIdentifier::Native,
+            address: address.to_string(),
+            min_amount: alloy::primitives::U256::from(1_u64),
+            max_amount: alloy::primitives::U256::from(100_000_u64),
+            required_amount: alloy::primitives::U256::from(42_u64),
+            deposit_deadline: Utc::now() + chrono::Duration::minutes(5),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+        support
+            .replace_watches(HashMap::from([(
+                address.script_pubkey(),
+                vec![watch.clone()],
+            )]))
+            .await;
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: Vec::new(),
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(42),
+                script_pubkey: address.script_pubkey(),
+            }],
+        };
+
+        support.observe_rawtx_transaction(&tx).await;
+
+        assert!(support.take_resync_request());
+        assert!(matches!(
+            support.detection_rx.lock().await.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        support
+            .mempool_transactions
+            .lock()
+            .await
+            .insert(tx.compute_txid(), tx);
+        support.queue_detections_from_snapshot().await;
+
+        let detected = support
+            .detection_rx
+            .lock()
+            .await
+            .try_recv()
+            .expect("snapshot should queue detection");
+        assert_eq!(detected.watch_id, watch.watch_id);
+        assert_eq!(
+            detected.confirmation_state,
+            DepositConfirmationState::Mempool
+        );
+    }
+
+    #[test]
+    fn match_single_transaction_marks_mempool_outpoint() {
+        let secret_key = bitcoin::secp256k1::SecretKey::from_slice(&[1_u8; 32]).unwrap();
+        let private_key = bitcoin::PrivateKey::new(secret_key, bitcoin::Network::Regtest);
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let address = Address::p2wpkh(
+            &bitcoin::CompressedPublicKey::from_private_key(&secp, &private_key).unwrap(),
+            bitcoin::Network::Regtest,
+        );
+        let watch = Arc::new(WatchEntry {
+            watch_target: crate::watch::WatchTarget::FundingVault,
+            watch_id: uuid::Uuid::now_v7(),
+            order_id: uuid::Uuid::now_v7(),
+            source_chain: ChainType::Bitcoin,
+            source_token: TokenIdentifier::Native,
+            address: address.to_string(),
+            min_amount: alloy::primitives::U256::from(1_u64),
+            max_amount: alloy::primitives::U256::from(100_000_u64),
+            required_amount: alloy::primitives::U256::from(42_u64),
+            deposit_deadline: Utc::now() + chrono::Duration::minutes(5),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+        let mut scripts = HashMap::new();
+        scripts.insert(address.script_pubkey(), vec![watch.clone()]);
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: Vec::new(),
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(42),
+                script_pubkey: address.script_pubkey(),
+            }],
+        };
+
+        let detected = match_single_transaction(
+            &tx,
+            &scripts,
+            Utc::now(),
+            DepositConfirmationState::Mempool,
+            None,
+            None,
+        );
+
+        assert_eq!(detected.len(), 1);
+        assert_eq!(detected[0].watch_id, watch.watch_id);
+        assert_eq!(detected[0].transfer_index, 0);
+        assert_eq!(detected[0].amount, alloy::primitives::U256::from(42_u64));
+        assert_eq!(
+            detected[0].confirmation_state,
+            DepositConfirmationState::Mempool
+        );
+        assert_eq!(detected[0].block_height, None);
+        assert_eq!(detected[0].block_hash, None);
     }
 }

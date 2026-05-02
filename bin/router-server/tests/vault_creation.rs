@@ -3,7 +3,7 @@ use alloy::primitives::{keccak256, Address, Bytes, U256};
 use alloy::providers::{ext::AnvilApi, Provider, ProviderBuilder};
 use alloy::rpc::types::TransactionRequest;
 use bitcoin::Amount;
-use bitcoincore_rpc_async::Auth;
+use bitcoincore_rpc_async::{Auth, RpcApi};
 use chains::{
     bitcoin::BitcoinChain,
     evm::{EvmChain, EvmGasSponsorConfig},
@@ -53,11 +53,12 @@ use router_server::{
         deposit_address::derive_deposit_address_for_quote,
         market_order_planner::MarketOrderRoutePlanner,
         order_manager::{MarketOrderError, OrderManager},
+        vault_manager::{VaultError, VaultManager},
         ActionProviderRegistry, AssetRegistry, ChainCall, CustodyAction, CustodyActionExecutor,
         CustodyActionRequest, EvmCall, OrderExecutionCrashInjector, OrderExecutionCrashPoint,
         OrderExecutionManager, ProviderAddressIntent, ProviderExecutionIntent,
         ProviderExecutionState, ProviderOperationIntent, ProviderOperationStatusUpdate,
-        RouteCostService, RouteMinimumService, VaultManager, VeloraHttpProviderConfig,
+        RouteCostService, RouteMinimumService, VeloraHttpProviderConfig,
     },
     RouterServerArgs,
 };
@@ -3283,13 +3284,17 @@ async fn funding_hints_validate_balance_once_and_mark_vault_funded() {
         .unwrap();
 
     let now = Utc::now();
-    vault_manager
+    let early_error = vault_manager
         .record_funding_hint(DepositVaultFundingHint {
             id: Uuid::now_v7(),
             vault_id: vault.id,
             source: "sauron".to_string(),
             hint_kind: ProviderOperationHintKind::PossibleProgress,
-            evidence: json!({ "tx_hash": "0xearly" }),
+            evidence: json!({
+                "tx_hash": "0xearly",
+                "amount": "1000",
+                "confirmation_state": "confirmed"
+            }),
             status: ProviderOperationHintStatus::Pending,
             idempotency_key: Some("early".to_string()),
             error: json!({}),
@@ -3299,12 +3304,16 @@ async fn funding_hints_validate_balance_once_and_mark_vault_funded() {
             updated_at: now,
         })
         .await
-        .unwrap();
+        .unwrap_err();
+    assert!(matches!(
+        early_error,
+        VaultError::FundingHintNotReady { .. }
+    ));
     let early_summary = vault_manager
         .process_funding_hints_detailed(10)
         .await
         .unwrap();
-    assert_eq!(early_summary.processed, 1);
+    assert_eq!(early_summary.processed, 0);
     assert!(early_summary.funded_order_ids.is_empty());
     assert_eq!(
         vault_manager.get_vault(vault.id).await.unwrap().status,
@@ -3321,7 +3330,11 @@ async fn funding_hints_validate_balance_once_and_mark_vault_funded() {
             vault_id: vault.id,
             source: "sauron".to_string(),
             hint_kind: ProviderOperationHintKind::PossibleProgress,
-            evidence: json!({ "tx_hash": "0xfunded" }),
+            evidence: json!({
+                "tx_hash": "0xfunded",
+                "amount": "1000",
+                "confirmation_state": "confirmed"
+            }),
             status: ProviderOperationHintStatus::Pending,
             idempotency_key: Some("funded".to_string()),
             error: json!({}),
@@ -4024,6 +4037,70 @@ async fn custody_action_executor_transfers_bitcoin_native_from_router_vault() {
 }
 
 #[tokio::test]
+async fn custody_action_executor_transfers_bitcoin_native_from_mempool_funding() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = harness().await;
+    let (vm, db) = test_vault_manager_with_db(dir.path()).await;
+    let settings = Arc::new(test_settings(dir.path()));
+    let vault = vm
+        .create_vault(CreateVaultRequest {
+            order_id: None,
+            deposit_asset: DepositAsset {
+                chain: ChainId::parse("bitcoin").unwrap(),
+                asset: AssetId::Native,
+            },
+            action: VaultAction::Null,
+            recovery_address: valid_regtest_btc_address(),
+            cancellation_commitment: dummy_commitment(),
+            cancel_after: None,
+            metadata: json!({}),
+        })
+        .await
+        .unwrap();
+    let vault_address = bitcoin::Address::from_str(&vault.deposit_vault_address)
+        .expect("valid vault btc address")
+        .assume_checked();
+    let bitcoin_devnet = h.with_devnet(|devnet| devnet.bitcoin.clone());
+    bitcoin_devnet
+        .rpc_client
+        .send_to_address(&vault_address, Amount::from_sat(100_000))
+        .await
+        .expect("submit mempool bitcoin funding");
+
+    let recipient_address = valid_regtest_btc_address();
+    let bitcoin_chain = h.chain_registry.get_bitcoin(&ChainType::Bitcoin).unwrap();
+    let recipient_before = bitcoin_chain
+        .address_balance_sats(&recipient_address)
+        .await
+        .unwrap();
+
+    let executor = CustodyActionExecutor::new(db, settings, h.chain_registry.clone());
+    let receipt = executor
+        .execute(CustodyActionRequest {
+            custody_vault_id: vault.id,
+            action: CustodyAction::Transfer {
+                to_address: recipient_address.clone(),
+                amount: "50000".to_string(),
+            },
+        })
+        .await
+        .unwrap();
+
+    assert!(!receipt.tx_hash.is_empty());
+    h.mine_bitcoin_blocks(1)
+        .await
+        .expect("mine mempool funding and transfer");
+    h.wait_for_esplora_sync(Duration::from_secs(30))
+        .await
+        .expect("esplora sync after mempool transfer");
+    let recipient_after = bitcoin_chain
+        .address_balance_sats(&recipient_address)
+        .await
+        .unwrap();
+    assert_eq!(recipient_after.saturating_sub(recipient_before), 50_000);
+}
+
+#[tokio::test]
 async fn worker_pass_sweeps_released_internal_evm_native_custody_to_paymaster() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -4376,6 +4453,7 @@ async fn provider_operations_store_protocol_addresses_outside_custody_vaults() {
         id: Uuid::now_v7(),
         order_id: order.id,
         execution_attempt_id: Some(execution_attempt.id),
+        execution_leg_id: None,
         transition_decl_id: None,
         step_index: 1,
         step_type: OrderExecutionStepType::AcrossBridge,
@@ -4412,6 +4490,7 @@ async fn provider_operations_store_protocol_addresses_outside_custody_vaults() {
         }),
         response: json!({}),
         error: json!({}),
+        usd_valuation: json!({}),
         created_at: now,
         updated_at: now,
     };
@@ -4592,6 +4671,12 @@ async fn market_order_route_planner_uses_direct_unit_when_source_is_unit_ingress
 
     let inserted = db
         .orders()
+        .create_execution_legs_idempotent(&plan.legs)
+        .await
+        .unwrap();
+    assert_eq!(inserted, plan.legs.len() as u64);
+    let inserted = db
+        .orders()
         .create_execution_steps_idempotent(&plan.steps)
         .await
         .unwrap();
@@ -4602,9 +4687,27 @@ async fn market_order_route_planner_uses_direct_unit_when_source_is_unit_ingress
         .await
         .unwrap();
     assert_eq!(duplicate_inserted, 0);
+    let duplicate_inserted = db
+        .orders()
+        .create_execution_legs_idempotent(&plan.legs)
+        .await
+        .unwrap();
+    assert_eq!(duplicate_inserted, 0);
 
     let steps = db.orders().get_execution_steps(order.id).await.unwrap();
     assert_eq!(steps.len(), 1 + plan.steps.len());
+    let legs = db.orders().get_execution_legs(order.id).await.unwrap();
+    assert_eq!(legs.len(), plan.legs.len());
+    assert_eq!(legs[0].leg_type, "unit_deposit");
+    assert_eq!(legs[1].leg_type, "unit_withdrawal");
+    for step in steps.iter().skip(1) {
+        assert!(
+            step.execution_leg_id
+                .is_some_and(|leg_id| legs.iter().any(|leg| leg.id == leg_id)),
+            "execution step {} was not linked to a persisted execution leg",
+            step.id
+        );
+    }
     assert_eq!(steps[1].step_type, OrderExecutionStepType::UnitDeposit);
     assert_eq!(steps[1].details["transition_kind"], json!("unit_deposit"));
     assert_eq!(
@@ -4831,6 +4934,7 @@ fn test_market_order_quote(
         max_amount_in: None,
         slippage_bps: 100,
         provider_quote: json!({ "test": "quote_cleanup" }),
+        usd_valuation: json!({}),
         expires_at,
         created_at: Utc::now(),
     }
@@ -4919,7 +5023,13 @@ async fn market_order_route_planner_uses_across_only_when_unit_needs_ingress_bri
             asset: AssetId::Native,
         })
     );
-    assert_eq!(plan.steps[1].output_asset, None);
+    assert_eq!(
+        plan.steps[1].output_asset,
+        Some(DepositAsset {
+            chain: ChainId::parse("evm:1").unwrap(),
+            asset: AssetId::Native,
+        })
+    );
     assert_eq!(
         plan.steps[2].output_asset,
         Some(DepositAsset {
@@ -4944,6 +5054,10 @@ async fn market_order_route_planner_uses_across_only_when_unit_needs_ingress_bri
         json!(vault.id)
     );
 
+    db.orders()
+        .create_execution_legs_idempotent(&plan.legs)
+        .await
+        .unwrap();
     db.orders()
         .create_execution_steps_idempotent(&plan.steps)
         .await
@@ -5118,6 +5232,16 @@ async fn market_order_route_planner_supports_cctp_to_hyperliquid_bridge_path() {
         .unwrap();
     let order = db.orders().get(order.id).await.unwrap();
     let stored_quote = db.orders().get_market_order_quote(order.id).await.unwrap();
+    let quote_legs = stored_quote.provider_quote["legs"].as_array().unwrap();
+    assert_eq!(quote_legs[0]["execution_step_type"], json!("cctp_burn"));
+    assert_eq!(quote_legs[1]["execution_step_type"], json!("cctp_receive"));
+    assert_eq!(
+        quote_legs[1]["transition_decl_id"],
+        json!(format!(
+            "{}:receive",
+            quote_legs[0]["transition_parent_decl_id"].as_str().unwrap()
+        ))
+    );
     let gas_plan = &stored_quote.provider_quote["gas_reimbursement"];
     assert_eq!(
         gas_plan["policy"],
@@ -6674,6 +6798,7 @@ async fn order_executor_rejects_tampered_nonfinal_intermediate_custody_route() {
         id: Uuid::now_v7(),
         order_id: fixture.order_id,
         execution_attempt_id: Some(execution_attempt.id),
+        execution_leg_id: None,
         transition_decl_id: None,
         step_index: 1,
         step_type: OrderExecutionStepType::AcrossBridge,
@@ -6698,6 +6823,7 @@ async fn order_executor_rejects_tampered_nonfinal_intermediate_custody_route() {
         }),
         response: json!({}),
         error: json!({}),
+        usd_valuation: json!({}),
         created_at: now,
         updated_at: now,
     };
@@ -6705,6 +6831,7 @@ async fn order_executor_rejects_tampered_nonfinal_intermediate_custody_route() {
         id: Uuid::now_v7(),
         order_id: fixture.order_id,
         execution_attempt_id: Some(execution_attempt.id),
+        execution_leg_id: None,
         transition_decl_id: None,
         step_index: 2,
         step_type: OrderExecutionStepType::UnitWithdrawal,
@@ -6729,6 +6856,7 @@ async fn order_executor_rejects_tampered_nonfinal_intermediate_custody_route() {
         }),
         response: json!({}),
         error: json!({}),
+        usd_valuation: json!({}),
         created_at: now,
         updated_at: now,
     };
@@ -7594,6 +7722,7 @@ async fn order_executor_processes_provider_operation_status_hints() {
             id: Uuid::now_v7(),
             order_id: fixture.order_id,
             execution_attempt_id: Some(execution_attempt.id),
+            execution_leg_id: None,
             transition_decl_id: None,
             step_index: 20 + index as i32,
             step_type,
@@ -7618,6 +7747,7 @@ async fn order_executor_processes_provider_operation_status_hints() {
             }),
             response: json!({}),
             error: json!({}),
+            usd_valuation: json!({}),
             created_at: now,
             updated_at: now,
         };
@@ -9811,6 +9941,7 @@ async fn worker_restart_after_provider_operation_status_persist_crash_recovers_t
         id: Uuid::now_v7(),
         order_id: fixture.order_id,
         execution_attempt_id: Some(execution_attempt.id),
+        execution_leg_id: None,
         transition_decl_id: None,
         step_index: 1,
         step_type: OrderExecutionStepType::AcrossBridge,
@@ -9831,6 +9962,7 @@ async fn worker_restart_after_provider_operation_status_persist_crash_recovers_t
         request: json!({ "source": "crash_recovery_test" }),
         response: json!({}),
         error: json!({}),
+        usd_valuation: json!({}),
         created_at: now,
         updated_at: now,
     };
@@ -9986,6 +10118,7 @@ async fn worker_restart_after_provider_step_settlement_crash_finalizes_order() {
         id: Uuid::now_v7(),
         order_id: fixture.order_id,
         execution_attempt_id: Some(execution_attempt.id),
+        execution_leg_id: None,
         transition_decl_id: None,
         step_index: 1,
         step_type: OrderExecutionStepType::AcrossBridge,
@@ -10006,6 +10139,7 @@ async fn worker_restart_after_provider_step_settlement_crash_finalizes_order() {
         request: json!({ "source": "crash_recovery_test" }),
         response: json!({}),
         error: json!({}),
+        usd_valuation: json!({}),
         created_at: now,
         updated_at: now,
     };

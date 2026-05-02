@@ -2018,6 +2018,15 @@ impl BridgeProvider for HyperliquidBridgeProvider {
             } else {
                 ProviderOperationStatus::WaitingExternal
             };
+            let response = if status == ProviderOperationStatus::Completed {
+                Some(hyperliquid_bridge_deposit_completion_response(
+                    &request,
+                    &state,
+                    observed_withdrawable_raw,
+                )?)
+            } else {
+                None
+            };
 
             Ok(Some(ProviderOperationObservation {
                 status,
@@ -2027,7 +2036,7 @@ impl BridgeProvider for HyperliquidBridgeProvider {
                     "observed_withdrawable_raw": observed_withdrawable_raw.to_string(),
                     "expected_withdrawable_raw": expected_withdrawable_raw.to_string(),
                 }),
-                response: None,
+                response,
                 tx_hash: request
                     .observed_state
                     .get("deposit_tx_hash")
@@ -2037,6 +2046,62 @@ impl BridgeProvider for HyperliquidBridgeProvider {
             }))
         })
     }
+}
+
+fn hyperliquid_bridge_deposit_completion_response(
+    request: &ProviderOperationObservationRequest,
+    state: &ClearinghouseState,
+    observed_withdrawable_raw: U256,
+) -> ProviderResult<Value> {
+    let amount = request
+        .request
+        .get("amount")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "hyperliquid bridge observe: request missing amount".to_string())?;
+    let amount_raw = U256::from_str_radix(amount, 10)
+        .map_err(|err| format!("hyperliquid bridge observe: invalid amount: {err}"))?;
+    let before_withdrawable_raw = request
+        .request
+        .get("before_withdrawable_raw")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            "hyperliquid bridge observe: request missing before_withdrawable_raw".to_string()
+        })
+        .and_then(|raw| {
+            U256::from_str_radix(raw, 10).map_err(|err| {
+                format!("hyperliquid bridge observe: invalid before_withdrawable_raw: {err}")
+            })
+        })?;
+    let expected_withdrawable_raw = request
+        .request
+        .get("expected_withdrawable_raw")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            "hyperliquid bridge observe: request missing expected_withdrawable_raw".to_string()
+        })
+        .and_then(|raw| {
+            U256::from_str_radix(raw, 10).map_err(|err| {
+                format!("hyperliquid bridge observe: invalid expected_withdrawable_raw: {err}")
+            })
+        })?;
+    let observed_delta_raw = observed_withdrawable_raw.saturating_sub(before_withdrawable_raw);
+    let before_clearinghouse_state = request
+        .response
+        .get("before_clearinghouse_state")
+        .cloned()
+        .unwrap_or(Value::Null);
+
+    Ok(json!({
+        "kind": "hyperliquid_bridge_deposit",
+        "amount_in": amount_raw.to_string(),
+        "amount_out": amount_raw.to_string(),
+        "before_withdrawable_raw": before_withdrawable_raw.to_string(),
+        "expected_withdrawable_raw": expected_withdrawable_raw.to_string(),
+        "observed_withdrawable_raw": observed_withdrawable_raw.to_string(),
+        "observed_withdrawable_delta_raw": observed_delta_raw.to_string(),
+        "before_clearinghouse_state": before_clearinghouse_state,
+        "clearinghouse_state": state,
+    }))
 }
 
 #[derive(Clone)]
@@ -3867,6 +3932,7 @@ impl ExchangeProvider for HyperliquidProvider {
 
             let base_sz = compute_base_sz(
                 is_buy,
+                &step.order_kind,
                 &step.amount_in,
                 input_decimals,
                 &step.amount_out,
@@ -4451,7 +4517,15 @@ fn simulate_leg(
                     "hyperliquid quote: book walk yielded {amount_out_natural} < min_amount_out {min_out_natural}"
                 ));
             }
-            let amount_out_wire = natural_to_wire(amount_out_natural, output_decimals)?;
+            let amount_out_wire = if is_buy {
+                quantized_base_natural_to_wire(
+                    amount_out_natural,
+                    output_decimals,
+                    base_sz_decimals,
+                )?
+            } else {
+                natural_to_wire(amount_out_natural, output_decimals)?
+            };
             Ok((amount_in.clone(), amount_out_wire))
         }
         MarketOrderKind::ExactOut {
@@ -4467,7 +4541,11 @@ fn simulate_leg(
                     "hyperliquid quote: book walk requires {amount_in_natural} > max_amount_in {max_in_natural}"
                 ));
             }
-            let amount_in_wire = natural_to_wire(amount_in_natural, input_decimals)?;
+            let amount_in_wire = if is_buy {
+                natural_to_wire(amount_in_natural, input_decimals)?
+            } else {
+                quantized_base_natural_to_wire(amount_in_natural, input_decimals, base_sz_decimals)?
+            };
             Ok((amount_in_wire, amount_out.clone()))
         }
     }
@@ -4482,7 +4560,14 @@ fn walk_book_exact_in(
     side: &[L2Level],
     base_sz_decimals: u8,
 ) -> ProviderResult<(f64, f64)> {
-    let mut input_remaining = input_natural;
+    let executable_input = if is_buy {
+        input_natural
+    } else {
+        // HL encodes sell size as base `sz`; dust beyond `sz_decimals` is not
+        // submitted, so the quote cannot count proceeds from that dust.
+        round_to_decimals(input_natural, usize::from(base_sz_decimals))?
+    };
+    let mut input_remaining = executable_input;
     let mut output_total = 0.0_f64;
     for level in side {
         if input_remaining <= 0.0 {
@@ -4506,7 +4591,7 @@ fn walk_book_exact_in(
         input_remaining -= input_spent;
         output_total += output_gained;
     }
-    if input_remaining > book_walk_tolerance(input_natural) {
+    if input_remaining > book_walk_tolerance(executable_input) {
         return Err(format!(
             "hyperliquid quote: book side could not absorb remaining input {input_remaining}"
         ));
@@ -4517,7 +4602,7 @@ fn walk_book_exact_in(
     } else {
         output_total
     };
-    Ok((input_natural, output_total))
+    Ok((executable_input, output_total))
 }
 
 /// Walk a book side until exactly `target_output_natural` is obtained, and
@@ -4529,9 +4614,9 @@ fn walk_book_exact_out(
     base_sz_decimals: u8,
 ) -> ProviderResult<(f64, f64)> {
     let target = if is_buy {
-        // Buying base: quantise target to HL's `sz_decimals` upfront so the
-        // walk's input maps cleanly to an integer wire amount later.
-        round_to_decimals(target_output_natural, usize::from(base_sz_decimals))?
+        // Buying base: round up to an executable `sz` so the submitted order
+        // produces at least the requested exact-out amount.
+        ceil_to_decimals(target_output_natural, usize::from(base_sz_decimals))?
     } else {
         target_output_natural
     };
@@ -4564,6 +4649,13 @@ fn walk_book_exact_out(
             "hyperliquid quote: book side could not produce remaining output {output_remaining}"
         ));
     }
+    let input_total = if is_buy {
+        input_total
+    } else {
+        // Selling base for exact quote output requires rounding the submitted
+        // base `sz` up; otherwise the wire order can under-fill the target.
+        ceil_to_decimals(input_total, usize::from(base_sz_decimals))?
+    };
     Ok((input_total, target))
 }
 
@@ -4594,6 +4686,16 @@ fn natural_to_wire(value: f64, decimals: u8) -> ProviderResult<String> {
         ));
     }
     Ok(format!("{}", scaled.trunc() as u128))
+}
+
+fn quantized_base_natural_to_wire(
+    value: f64,
+    wire_decimals: u8,
+    base_sz_decimals: u8,
+) -> ProviderResult<String> {
+    let quantized = round_to_decimals(value, usize::from(base_sz_decimals))?;
+    let natural = format_decimal_string(quantized, usize::from(base_sz_decimals));
+    parse_decimal_to_raw_units_floor(&natural, wire_decimals).map(|raw| raw.to_string())
 }
 
 /// Build the per-leg descriptor the planner reads to emit a
@@ -4665,6 +4767,7 @@ fn classify_hl_leg(
 /// rounded to the base's `sz_decimals`.
 fn compute_base_sz(
     is_buy: bool,
+    order_kind: &str,
     amount_in_wire: &str,
     input_decimals: u8,
     amount_out_wire: &str,
@@ -4677,8 +4780,17 @@ fn compute_base_sz(
         (amount_in_wire, input_decimals)
     };
     let natural = wire_to_f64(wire, decimals)?;
-    round_to_decimals(natural, usize::from(base_sz_decimals))
-        .map(|val| format_decimal_string(val, usize::from(base_sz_decimals)))
+    let rounded = match order_kind {
+        "exact_in" => round_to_decimals(natural, usize::from(base_sz_decimals)),
+        "exact_out" => ceil_to_decimals(natural, usize::from(base_sz_decimals)),
+        other => Err(format!(
+            "hyperliquid trade: unknown order_kind {other:?} computing base sz"
+        )),
+    }?;
+    Ok(format_decimal_string(
+        rounded,
+        usize::from(base_sz_decimals),
+    ))
 }
 
 struct LimitPxInput<'a> {
@@ -4790,6 +4902,16 @@ fn round_to_decimals(value: f64, decimals: usize) -> ProviderResult<f64> {
     }
     let factor = 10_f64.powi(decimals as i32);
     Ok((value * factor).trunc() / factor)
+}
+
+fn ceil_to_decimals(value: f64, decimals: usize) -> ProviderResult<f64> {
+    if !value.is_finite() || value < 0.0 {
+        return Err(format!(
+            "hyperliquid trade: non-finite or negative amount {value}"
+        ));
+    }
+    let factor = 10_f64.powi(decimals as i32);
+    Ok((value * factor).ceil() / factor)
 }
 
 /// Format a positive f64 as a decimal string with at most `decimals` digits
@@ -4908,21 +5030,23 @@ mod hyperliquid_math_tests {
     use super::{
         cctp_quote_amounts, classify_hl_leg, compute_base_sz, compute_limit_px, decimal_bps_string,
         encode_erc20_approve, format_hl_spot_price, hl_leg_descriptor,
-        observed_unit_operation_fingerprints, parse_decimal_bps_to_micros,
-        parse_decimal_to_raw_units_floor, seen_operation_fingerprints_from_request,
-        unit_operation_provider_status, unit_withdrawal_minimum_raw, velora_slippage_bps,
-        wire_to_f64, BridgeProvider, BridgeQuoteRequest, CctpQuoteAmounts,
-        HyperliquidBridgeProvider, HyperliquidCallNetwork, LimitPxInput,
-        HYPERLIQUID_BRIDGE_WITHDRAW_FEE_RAW,
+        hyperliquid_bridge_deposit_completion_response, observed_unit_operation_fingerprints,
+        parse_decimal_bps_to_micros, parse_decimal_to_raw_units_floor,
+        seen_operation_fingerprints_from_request, simulate_leg, unit_operation_provider_status,
+        unit_withdrawal_minimum_raw, velora_slippage_bps, wire_to_f64, BridgeProvider,
+        BridgeQuoteRequest, CctpQuoteAmounts, HyperliquidBridgeProvider, HyperliquidCallNetwork,
+        LimitPxInput, ProviderOperationObservationRequest, HYPERLIQUID_BRIDGE_WITHDRAW_FEE_RAW,
     };
     use crate::{
-        models::{MarketOrderKind, ProviderOperationStatus},
+        models::{MarketOrderKind, ProviderOperationStatus, ProviderOperationType},
         protocol::{AssetId, ChainId, DepositAsset},
         services::AssetRegistry,
     };
     use alloy::primitives::U256;
+    use hyperliquid_client::info::{ClearinghouseState, L2BookSnapshot, L2Level};
     use serde_json::json;
     use std::sync::Arc;
+    use uuid::Uuid;
 
     #[test]
     fn classify_hl_leg_sell_base_for_usdc() {
@@ -5037,6 +5161,63 @@ mod hyperliquid_math_tests {
         assert!(wire_to_f64("1.5", 8).is_err());
         assert!(wire_to_f64("", 8).is_err());
         assert!(wire_to_f64("-1", 8).is_err());
+    }
+
+    fn single_level_book(px: &str, sz: &str) -> L2BookSnapshot {
+        L2BookSnapshot {
+            coin: "UBTC/USDC".to_string(),
+            levels: vec![
+                vec![L2Level {
+                    n: 1,
+                    px: px.to_string(),
+                    sz: sz.to_string(),
+                }],
+                vec![L2Level {
+                    n: 1,
+                    px: px.to_string(),
+                    sz: sz.to_string(),
+                }],
+            ],
+            time: 0,
+        }
+    }
+
+    #[test]
+    fn simulate_hl_exact_in_sell_counts_only_executable_base_size() {
+        let book = single_level_book("60000", "100");
+        let (_, amount_out) = simulate_leg(
+            false,
+            8,
+            6,
+            5,
+            &MarketOrderKind::ExactIn {
+                amount_in: "120930796".to_string(),
+                min_amount_out: "1".to_string(),
+            },
+            &book,
+        )
+        .unwrap();
+
+        assert_eq!(amount_out, "72558000000");
+    }
+
+    #[test]
+    fn simulate_hl_exact_in_buy_serializes_quantized_base_without_f64_wei_dust() {
+        let book = single_level_book("3000.5", "100");
+        let (_, amount_out) = simulate_leg(
+            true,
+            6,
+            18,
+            4,
+            &MarketOrderKind::ExactIn {
+                amount_in: "98577278".to_string(),
+                min_amount_out: "1".to_string(),
+            },
+            &book,
+        )
+        .unwrap();
+
+        assert_eq!(amount_out, "32800000000000000");
     }
 
     #[test]
@@ -5184,17 +5365,74 @@ mod hyperliquid_math_tests {
     }
 
     #[test]
+    fn hyperliquid_bridge_completion_response_sets_actual_amount_out() {
+        let request = ProviderOperationObservationRequest {
+            operation_id: Uuid::nil(),
+            operation_type: ProviderOperationType::HyperliquidBridgeDeposit,
+            provider_ref: Some("0x1111111111111111111111111111111111111111".to_string()),
+            request: json!({
+                "amount": "7500000",
+                "before_withdrawable_raw": "10000000",
+                "expected_withdrawable_raw": "17500000",
+            }),
+            response: json!({
+                "before_clearinghouse_state": {
+                    "withdrawable": "10.0",
+                }
+            }),
+            observed_state: json!({}),
+            hint_evidence: json!({}),
+        };
+        let state = ClearinghouseState {
+            withdrawable: "17.5".to_string(),
+            ..ClearinghouseState::default()
+        };
+
+        let response = hyperliquid_bridge_deposit_completion_response(
+            &request,
+            &state,
+            U256::from(17_500_000_u64),
+        )
+        .unwrap();
+
+        assert_eq!(response["amount_in"], json!("7500000"));
+        assert_eq!(response["amount_out"], json!("7500000"));
+        assert_eq!(response["before_withdrawable_raw"], json!("10000000"));
+        assert_eq!(response["expected_withdrawable_raw"], json!("17500000"));
+        assert_eq!(response["observed_withdrawable_raw"], json!("17500000"));
+        assert_eq!(
+            response["observed_withdrawable_delta_raw"],
+            json!("7500000")
+        );
+    }
+
+    #[test]
     fn compute_base_sz_sell_uses_amount_in_truncated() {
         // amount_in = 0.12345678 UBTC wire, sz_decimals = 5 → "0.12345"
-        let sz = compute_base_sz(false, "12345678", 8, "6000000000", 8, 5).unwrap();
+        let sz = compute_base_sz(false, "exact_in", "12345678", 8, "6000000000", 8, 5).unwrap();
         assert_eq!(sz, "0.12345");
     }
 
     #[test]
     fn compute_base_sz_buy_uses_amount_out_truncated() {
         // amount_out = 1.50000009 UBTC wire (decimals 8), sz_decimals = 5 → "1.5"
-        let sz = compute_base_sz(true, "75000000000", 8, "150000009", 8, 5).unwrap();
+        let sz = compute_base_sz(true, "exact_in", "75000000000", 8, "150000009", 8, 5).unwrap();
         assert_eq!(sz, "1.5");
+    }
+
+    #[test]
+    fn compute_base_sz_exact_out_buy_rounds_up_to_executable_size() {
+        let sz = compute_base_sz(
+            true,
+            "exact_out",
+            "203000000",
+            6,
+            "67599999999999992",
+            18,
+            4,
+        )
+        .unwrap();
+        assert_eq!(sz, "0.0676");
     }
 
     #[test]

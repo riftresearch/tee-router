@@ -1,0 +1,26 @@
+[package]
+name = "router-integration-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+devnet = { workspace = true }
+eip3009-erc20-contract = { workspace = true }
+router-server = { path = "../bin/router-server" }
+sauron = { path = "../bin/sauron" }
+
+alloy = { workspace = true }
+bitcoin = { workspace = true }
+bitcoincore-rpc-async = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+sqlx-core = { workspace = true }
+sqlx-postgres = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+testcontainers = "0.27.2"

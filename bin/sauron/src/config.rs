@@ -5,12 +5,8 @@ use clap::{Parser, ValueEnum};
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SauronReplicaEventSource {
-    /// Legacy mode: use replica-local LISTEN/NOTIFY trigger wiring.
-    Notify,
-    /// Physical-standby mode: consume a logical decoding slot on the standby.
+    /// Consume a logical replication stream from the router replica.
     Cdc,
-    /// No push/event source; rely only on the low-frequency reconcile loop.
-    Reconcile,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -28,8 +24,8 @@ pub struct SauronArgs {
     /// Writable Sauron state database URL.
     ///
     /// This stores detector cursors and CDC checkpoints. If omitted, Sauron
-    /// falls back to the router replica URL for backwards-compatible local
-    /// tests and the legacy writable logical-replica deployment.
+    /// falls back to the router replica URL for local test deployments where
+    /// the router database is writable.
     #[arg(long, env = "SAURON_STATE_DATABASE_URL")]
     pub sauron_state_database_url: Option<String>,
 
@@ -38,7 +34,7 @@ pub struct SauronArgs {
         long,
         env = "SAURON_REPLICA_EVENT_SOURCE",
         value_enum,
-        default_value = "notify"
+        default_value = "cdc"
     )]
     pub sauron_replica_event_source: SauronReplicaEventSource,
 
@@ -50,29 +46,37 @@ pub struct SauronArgs {
     )]
     pub router_replica_database_name: String,
 
-    /// Notification channel used for watch-set invalidation
-    #[arg(
-        long,
-        env = "ROUTER_REPLICA_NOTIFICATION_CHANNEL",
-        default_value = "sauron_watch_set_changed"
-    )]
-    pub router_replica_notification_channel: String,
-
     /// Logical decoding slot used when SAURON_REPLICA_EVENT_SOURCE=cdc.
     #[arg(long, env = "SAURON_CDC_SLOT_NAME", default_value = "sauron_watch_cdc")]
     pub sauron_cdc_slot_name: String,
 
-    /// Logical decoding plugin used when SAURON_REPLICA_EVENT_SOURCE=cdc.
-    #[arg(long, env = "SAURON_CDC_PLUGIN", default_value = "test_decoding")]
-    pub sauron_cdc_plugin: String,
+    /// Publication used by the pgoutput logical replication stream.
+    #[arg(
+        long,
+        env = "ROUTER_CDC_PUBLICATION_NAME",
+        default_value = "router_cdc_publication"
+    )]
+    pub router_cdc_publication_name: String,
 
-    /// Maximum logical-decoding rows to consume per CDC fetch.
-    #[arg(long, env = "SAURON_CDC_BATCH_SIZE", default_value_t = 1000)]
-    pub sauron_cdc_batch_size: i64,
+    /// Message prefix emitted through pg_logical_emit_message by router DB triggers.
+    #[arg(
+        long,
+        env = "ROUTER_CDC_MESSAGE_PREFIX",
+        default_value = "rift.router.change"
+    )]
+    pub router_cdc_message_prefix: String,
 
-    /// CDC fetch interval when no changes are available.
-    #[arg(long, env = "SAURON_CDC_POLL_INTERVAL_MS", default_value_t = 1000)]
-    pub sauron_cdc_poll_interval_ms: u64,
+    /// Interval for replication status updates to Postgres.
+    #[arg(long, env = "SAURON_CDC_STATUS_INTERVAL_MS", default_value_t = 1000)]
+    pub sauron_cdc_status_interval_ms: u64,
+
+    /// Idle replication read wakeup interval, used only to send keepalive feedback.
+    #[arg(
+        long,
+        env = "SAURON_CDC_IDLE_WAKEUP_INTERVAL_MS",
+        default_value_t = 10_000
+    )]
+    pub sauron_cdc_idle_wakeup_interval_ms: u64,
 
     /// Base URL for the router server provider-operation hint route
     #[arg(long, env = "ROUTER_INTERNAL_BASE_URL")]

@@ -7,6 +7,8 @@ export type AssetRef = {
 
 export type OrderExecutionStep = {
   id: string
+  executionLegId?: string
+  transitionDeclId?: string
   stepIndex: number
   stepType: string
   provider: string
@@ -25,6 +27,29 @@ export type OrderExecutionStep = {
   request: unknown
   response: unknown
   error: unknown
+  usdValuation?: unknown
+}
+
+export type OrderExecutionLeg = {
+  id: string
+  transitionDeclId?: string
+  legIndex: number
+  legType: string
+  provider: string
+  status: string
+  input: AssetRef
+  output: AssetRef
+  amountIn: string
+  expectedAmountOut: string
+  minAmountOut?: string
+  actualAmountIn?: string
+  actualAmountOut?: string
+  startedAt?: string
+  completedAt?: string
+  createdAt: string
+  updatedAt: string
+  details: unknown
+  usdValuation?: unknown
 }
 
 export type ProviderOperation = {
@@ -48,6 +73,12 @@ export type OrderProgress = {
   activeStage?: string
 }
 
+export type OrderMetrics = {
+  total: number
+  active: number
+  needsAttention: number
+}
+
 export type OrderFirehoseRow = {
   id: string
   orderType: string
@@ -69,11 +100,18 @@ export type OrderFirehoseRow = {
   quoteProviderId?: string
   quoteExpiresAt?: string
   providerQuote?: unknown
+  quoteUsdValuation?: unknown
   workflowTraceId?: string
   workflowParentSpanId?: string
+  executionLegs: OrderExecutionLeg[]
   executionSteps: OrderExecutionStep[]
   providerOperations: ProviderOperation[]
   progress: OrderProgress
+}
+
+export type OrderPageCursor = {
+  createdAt: string
+  id: string
 }
 
 type OrderFirehoseDbRow = {
@@ -101,17 +139,35 @@ type OrderFirehoseDbRow = {
   slippage_bps: string | number | null
   quote_expires_at: Date | string | null
   provider_quote: unknown
+  quote_usd_valuation: unknown
+  execution_legs: unknown
   execution_steps: unknown
   provider_operations: unknown
 }
 
-const ORDER_FIREHOSE_SQL = `
-WITH selected_orders AS (
+const ORDER_FIREHOSE_SQL = orderRowsSql(`
   SELECT
     ro.*
   FROM public.router_orders ro
+  WHERE (
+    $2::timestamptz IS NULL
+    OR (ro.created_at, ro.id) < ($2::timestamptz, $3::uuid)
+  )
   ORDER BY ro.created_at DESC, ro.id DESC
   LIMIT $1
+`)
+
+const ORDER_BY_ID_SQL = orderRowsSql(`
+  SELECT
+    ro.*
+  FROM public.router_orders ro
+  WHERE ro.id = $1::uuid
+`)
+
+function orderRowsSql(selectedOrdersSql: string): string {
+  return `
+WITH selected_orders AS (
+${selectedOrdersSql.trimEnd()}
 ),
 latest_quotes AS (
   SELECT DISTINCT ON (moq.order_id)
@@ -145,6 +201,8 @@ SELECT
   COALESCE(moq.slippage_bps, moa.slippage_bps) AS slippage_bps,
   moq.expires_at AS quote_expires_at,
   moq.provider_quote,
+  moq.usd_valuation_json AS quote_usd_valuation,
+  COALESCE(legs.execution_legs, '[]'::jsonb) AS execution_legs,
   COALESCE(steps.execution_steps, '[]'::jsonb) AS execution_steps,
   COALESCE(ops.provider_operations, '[]'::jsonb) AS provider_operations
 FROM selected_orders ro
@@ -153,7 +211,37 @@ LEFT JOIN public.market_order_actions moa ON moa.order_id = ro.id
 LEFT JOIN LATERAL (
   SELECT jsonb_agg(
     jsonb_build_object(
+      'id', l.id::text,
+      'transitionDeclId', l.transition_decl_id,
+      'legIndex', l.leg_index,
+      'legType', l.leg_type,
+      'provider', l.provider,
+      'status', l.status,
+      'input', jsonb_build_object('chainId', l.input_chain_id, 'assetId', l.input_asset_id),
+      'output', jsonb_build_object('chainId', l.output_chain_id, 'assetId', l.output_asset_id),
+      'amountIn', l.amount_in,
+      'expectedAmountOut', l.expected_amount_out,
+      'minAmountOut', l.min_amount_out,
+      'actualAmountIn', l.actual_amount_in,
+      'actualAmountOut', l.actual_amount_out,
+      'startedAt', l.started_at,
+      'completedAt', l.completed_at,
+      'createdAt', l.created_at,
+      'updatedAt', l.updated_at,
+      'details', l.details_json,
+      'usdValuation', l.usd_valuation_json
+    )
+    ORDER BY l.leg_index ASC, l.created_at ASC, l.id ASC
+  ) AS execution_legs
+  FROM public.order_execution_legs l
+  WHERE l.order_id = ro.id
+) legs ON true
+LEFT JOIN LATERAL (
+  SELECT jsonb_agg(
+    jsonb_build_object(
       'id', s.id::text,
+      'executionLegId', s.execution_leg_id::text,
+      'transitionDeclId', s.transition_decl_id,
       'stepIndex', s.step_index,
       'stepType', s.step_type,
       'provider', s.provider,
@@ -177,7 +265,8 @@ LEFT JOIN LATERAL (
       'details', s.details_json,
       'request', s.request_json,
       'response', s.response_json,
-      'error', s.error_json
+      'error', s.error_json,
+      'usdValuation', s.usd_valuation_json
     )
     ORDER BY s.step_index ASC, s.created_at ASC, s.id ASC
   ) AS execution_steps
@@ -206,23 +295,74 @@ LEFT JOIN LATERAL (
 ) ops ON true
 ORDER BY ro.created_at DESC, ro.id DESC
 `
+}
 
 export async function fetchOrderFirehose(
   pool: Pool,
-  limit: number
+  limit: number,
+  cursor?: OrderPageCursor
 ): Promise<OrderFirehoseRow[]> {
-  const result = await pool.query<OrderFirehoseDbRow>(ORDER_FIREHOSE_SQL, [limit])
+  const result = await pool.query<OrderFirehoseDbRow>(ORDER_FIREHOSE_SQL, [
+    limit,
+    cursor?.createdAt ?? null,
+    cursor?.id ?? null
+  ])
   return result.rows.map(mapOrderRow)
 }
 
-export function orderFingerprint(order: OrderFirehoseRow): string {
-  return JSON.stringify(order)
+export async function fetchOrderCount(pool: Pool): Promise<number> {
+  const result = await pool.query<{ total: string }>(
+    'SELECT COUNT(*)::text AS total FROM public.router_orders'
+  )
+  return Number(result.rows[0]?.total ?? 0)
+}
+
+export async function fetchOrderMetrics(pool: Pool): Promise<OrderMetrics> {
+  const result = await pool.query<{
+    total: string
+    active: string
+    needs_attention: string
+  }>(`
+    SELECT
+      COUNT(*)::text AS total,
+      COUNT(*) FILTER (
+        WHERE status IN (
+          'pending_funding',
+          'funded',
+          'executing',
+          'refund_required',
+          'refunding'
+        )
+      )::text AS active,
+      COUNT(*) FILTER (
+        WHERE status IN (
+          'failed',
+          'expired',
+          'refund_manual_intervention_required'
+        )
+      )::text AS needs_attention
+    FROM public.router_orders
+  `)
+
+  const row = result.rows[0]
+  return {
+    total: Number(row?.total ?? 0),
+    active: Number(row?.active ?? 0),
+    needsAttention: Number(row?.needs_attention ?? 0)
+  }
+}
+
+export async function fetchOrderById(
+  pool: Pool,
+  id: string
+): Promise<OrderFirehoseRow | undefined> {
+  const result = await pool.query<OrderFirehoseDbRow>(ORDER_BY_ID_SQL, [id])
+  return result.rows[0] ? mapOrderRow(result.rows[0]) : undefined
 }
 
 function mapOrderRow(row: OrderFirehoseDbRow): OrderFirehoseRow {
-  const executionSteps = normalizeJsonArray<OrderExecutionStep>(
-    row.execution_steps
-  )
+  const executionLegs = normalizeJsonArray<OrderExecutionLeg>(row.execution_legs)
+  const executionSteps = normalizeJsonArray<OrderExecutionStep>(row.execution_steps)
   const providerOperations = normalizeJsonArray<ProviderOperation>(
     row.provider_operations
   )
@@ -259,11 +399,17 @@ function mapOrderRow(row: OrderFirehoseDbRow): OrderFirehoseRow {
       ? toIso(row.quote_expires_at)
       : undefined,
     providerQuote: row.provider_quote ?? undefined,
+    quoteUsdValuation: row.quote_usd_valuation ?? undefined,
     workflowTraceId: row.workflow_trace_id ?? undefined,
     workflowParentSpanId: row.workflow_parent_span_id ?? undefined,
+    executionLegs,
     executionSteps,
     providerOperations,
-    progress: summarizeProgress(executionSteps, providerOperations)
+    progress: summarizeProgress(
+      row.provider_quote,
+      executionLegs,
+      providerOperations
+    )
   }
 }
 
@@ -283,34 +429,138 @@ function toIso(value: Date | string): string {
 }
 
 function summarizeProgress(
-  steps: OrderExecutionStep[],
+  providerQuote: unknown,
+  legs: OrderExecutionLeg[],
   operations: ProviderOperation[]
 ): OrderProgress {
+  const plannedStages = extractPlannedStages(providerQuote)
+  const operationStages = operations.map((operation) => ({
+    transitionDeclId: undefined,
+    transitionMatchIds: [],
+    label: `${humanize(operation.provider)} ${humanize(operation.operationType)}`,
+    status: operation.status
+  }))
+  const actualStages = legs.map((leg) => ({
+    transitionDeclId: leg.transitionDeclId,
+    transitionMatchIds: leg.transitionDeclId ? [leg.transitionDeclId] : [],
+    label: `${humanize(leg.provider)} ${humanize(leg.legType)}`,
+    status: leg.status
+  }))
   const stages =
-    steps.length > 0
-      ? steps.map((step) => ({
-          label: `${humanize(step.provider)} ${humanize(step.stepType)}`,
-          status: step.status
-        }))
-      : operations.map((operation) => ({
-          label: `${humanize(operation.provider)} ${humanize(operation.operationType)}`,
-          status: operation.status
-        }))
+    actualStages.length > 0
+      ? actualStages
+      : plannedStages.length > 0
+      ? plannedStages.map((planned) => {
+          return {
+            ...planned,
+            status: 'planned'
+          }
+        })
+      : operationStages
 
   const completedStages = stages.filter((stage) =>
     isCompletedStatus(stage.status)
   ).length
-  const failedStages = stages.filter((stage) => isFailedStatus(stage.status)).length
+  const failedStages = stages.filter((stage) =>
+    isFailedStatus(stage.status)
+  ).length
   const activeStage = stages.find((stage) => !isTerminalStatus(stage.status))
 
   return {
     totalStages: stages.length,
-    completedStages,
-    failedStages,
+    completedStages: Math.min(completedStages, stages.length),
+    failedStages: Math.min(failedStages, stages.length),
     activeStage: activeStage
-      ? `${activeStage.label} / ${humanize(activeStage.status)}`
+      ? `${stageLabel(activeStage)} / ${humanize(activeStage.status)}`
       : undefined
   }
+}
+
+function latestStepsByStage(steps: OrderExecutionStep[]): OrderExecutionStep[] {
+  const byStage = new Map<string, OrderExecutionStep>()
+  for (const step of steps) {
+    byStage.set(step.transitionDeclId ?? step.id, step)
+  }
+  return [...byStage.values()].sort(
+    (left, right) =>
+      left.stepIndex - right.stepIndex ||
+      left.createdAt.localeCompare(right.createdAt) ||
+      left.id.localeCompare(right.id)
+  )
+}
+
+type ProgressStage = {
+  transitionDeclId?: string
+  transitionMatchIds: string[]
+  label: string
+  status: string
+}
+
+function latestMatchingStep(
+  steps: OrderExecutionStep[],
+  matchIds: string[]
+): OrderExecutionStep | undefined {
+  if (matchIds.length === 0) return undefined
+
+  let latestExact: OrderExecutionStep | undefined
+  let latestPrefix: OrderExecutionStep | undefined
+  for (const step of steps) {
+    const stepId = step.transitionDeclId
+    if (!stepId) continue
+    if (matchIds.includes(stepId)) {
+      latestExact = step
+    } else if (matchIds.some((matchId) => stepId.startsWith(`${matchId}:`))) {
+      latestPrefix = step
+    }
+  }
+
+  return latestExact ?? latestPrefix
+}
+
+function extractPlannedStages(providerQuote: unknown): ProgressStage[] {
+  const quote = asRecord(providerQuote)
+  const legs = Array.isArray(quote?.legs) ? quote.legs : []
+  const stages: ProgressStage[] = []
+  for (const leg of legs) {
+    const record = asRecord(leg)
+    if (!record) continue
+    const provider = stringField(record.provider)
+    const transitionKind = stringField(record.transition_kind)
+    const executionStepType = stringField(record.execution_step_type)
+    const transitionDeclId = stringField(record.transition_decl_id)
+    const transitionParentDeclId = stringField(record.transition_parent_decl_id)
+    if (!provider || !transitionKind) continue
+    const transitionMatchIds = uniqueStrings([
+      transitionDeclId,
+      transitionParentDeclId
+    ])
+    stages.push({
+      ...(transitionDeclId ? { transitionDeclId } : {}),
+      transitionMatchIds,
+      label: `${humanize(provider)} ${humanize(executionStepType ?? transitionKind)}`,
+      status: 'planned'
+    })
+  }
+  return stages
+}
+
+function uniqueStrings(values: (string | undefined)[]): string[] {
+  return [...new Set(values.filter((value): value is string => Boolean(value)))]
+}
+
+function stageLabel(stage: ProgressStage | OrderExecutionStep): string {
+  if ('label' in stage) return stage.label
+  return `${humanize(stage.provider)} ${humanize(stage.stepType)}`
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object'
+    ? (value as Record<string, unknown>)
+    : undefined
+}
+
+function stringField(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined
 }
 
 function isCompletedStatus(status: string): boolean {

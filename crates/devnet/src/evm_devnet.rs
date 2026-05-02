@@ -12,7 +12,7 @@ use tracing::info;
 
 use alloy::{
     node_bindings::{Anvil, AnvilInstance},
-    primitives::{Address, U256},
+    primitives::{Address, Bytes, U256},
     providers::{ext::AnvilApi, DynProvider, Provider},
 };
 
@@ -23,12 +23,22 @@ use crate::{
         MockCctpTokenMessengerV2::MockCctpTokenMessengerV2Instance,
     },
     get_new_temp_dir,
+    manifest::DEVNET_ETHEREUM_RPC_PORT,
     token_indexerd::TokenIndexerInstance,
     RiftDevnetCache,
 };
 
-const MOCK_ERC20_ADDRESS: &str = "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf";
-const MOCK_ACROSS_SPOKE_POOL_ADDRESS: &str = "0xACE055C0C055D0C035E47055D05E7055055BACE0";
+pub const MOCK_ERC20_ADDRESS: &str = "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf";
+pub const MOCK_ACROSS_SPOKE_POOL_ADDRESS: &str = "0xACE055C0C055D0C035E47055D05E7055055BACE0";
+pub const ETHEREUM_USDC_ADDRESS: &str = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+pub const ETHEREUM_USDT_ADDRESS: &str = "0xdac17f958d2ee523a2206206994597c13d831ec7";
+pub const ETHEREUM_CBBTC_ADDRESS: &str = "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf";
+pub const ARBITRUM_USDC_ADDRESS: &str = "0xaf88d065e77c8cc2239327C5EDb3A432268e5831";
+pub const ARBITRUM_USDT_ADDRESS: &str = "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9";
+pub const ARBITRUM_CBBTC_ADDRESS: &str = "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf";
+pub const BASE_USDC_ADDRESS: &str = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+pub const BASE_USDT_ADDRESS: &str = "0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2";
+pub const BASE_CBBTC_ADDRESS: &str = "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf";
 pub const MOCK_CCTP_TOKEN_MESSENGER_V2_ADDRESS: &str = "0xcccccccccccccccccccccccccccccccccccc0001";
 pub const MOCK_CCTP_MESSAGE_TRANSMITTER_V2_ADDRESS: &str =
     "0xcccccccccccccccccccccccccccccccccccc0002";
@@ -99,7 +109,7 @@ impl EthDevnet {
             mock_across_spoke_pool_contract,
             mock_cctp_token_messenger_v2_contract,
             mock_cctp_message_transmitter_v2_contract,
-        ) = deploy_contracts(funded_provider.clone(), devnet_cache.clone()).await?;
+        ) = deploy_contracts(funded_provider.clone(), devnet_cache.clone(), chain_id).await?;
 
         let token_indexer = if let Some(database_url) = token_indexer_database_url {
             Some(
@@ -146,8 +156,18 @@ impl EthDevnet {
     }
 
     pub async fn mint_mock_erc20(&self, address: Address, amount: U256) -> Result<String> {
-        let receipt = self
-            .mock_erc20_contract
+        self.mint_erc20(MOCK_ERC20_ADDRESS.parse()?, address, amount)
+            .await
+    }
+
+    pub async fn mint_erc20(
+        &self,
+        token: Address,
+        address: Address,
+        amount: U256,
+    ) -> Result<String> {
+        let token_contract = GenericEIP3009ERC20Instance::new(token, self.funded_provider.clone());
+        let receipt = token_contract
             .mint(address, amount)
             .send()
             .await?
@@ -225,6 +245,7 @@ pub struct ForkConfig {
 async fn deploy_contracts(
     provider: DynProvider,
     devnet_cache: Option<Arc<RiftDevnetCache>>,
+    chain_id: u64,
 ) -> Result<(
     GenericEIP3009ERC20Instance<DynProvider>,
     EIP7702DelegatorInstance<DynProvider>,
@@ -283,6 +304,18 @@ async fn deploy_contracts(
     );
 
     if devnet_cache.is_some() {
+        let mock_erc20_bytecode =
+            ensure_mock_erc20_code_at_anchor(provider.clone(), MOCK_ERC20_ADDRESS.parse().unwrap())
+                .await?;
+        install_mock_erc20_code_at_known_assets(provider.clone(), chain_id, mock_erc20_bytecode)
+            .await?;
+        provider
+            .anvil_set_code(
+                EIP7702_DELEGATOR_CROSSCHAIN_ADDRESS.parse().unwrap(),
+                EIP7702_DELEGATOR_BYTECODE.parse().unwrap(),
+            )
+            .await?;
+
         // no need to deploy, just create the instance from the cache
         let mock_erc20_contract =
             GenericEIP3009ERC20Instance::new(MOCK_ERC20_ADDRESS.parse().unwrap(), provider.clone());
@@ -311,6 +344,12 @@ async fn deploy_contracts(
             mock_erc20_deployed_bytecode.clone(),
         )
         .await?;
+    install_mock_erc20_code_at_known_assets(
+        provider.clone(),
+        chain_id,
+        mock_erc20_deployed_bytecode,
+    )
+    .await?;
 
     let mock_erc20_contract =
         GenericEIP3009ERC20Instance::new(MOCK_ERC20_ADDRESS.parse().unwrap(), provider.clone());
@@ -334,6 +373,48 @@ async fn deploy_contracts(
         mock_cctp_token_messenger_v2_contract,
         mock_cctp_message_transmitter_v2_contract,
     ))
+}
+
+async fn ensure_mock_erc20_code_at_anchor(provider: DynProvider, anchor: Address) -> Result<Bytes> {
+    let cached_bytecode = provider.clone().get_code_at(anchor).await?;
+    if !cached_bytecode.is_empty() {
+        return Ok(cached_bytecode);
+    }
+
+    let deployment = GenericEIP3009ERC20Instance::deploy(provider.clone()).await?;
+    let bytecode = provider.clone().get_code_at(*deployment.address()).await?;
+    provider.anvil_set_code(anchor, bytecode.clone()).await?;
+    Ok(bytecode)
+}
+
+async fn install_mock_erc20_code_at_known_assets(
+    provider: DynProvider,
+    chain_id: u64,
+    bytecode: Bytes,
+) -> Result<()> {
+    for address in known_mock_erc20_addresses_for_chain(chain_id) {
+        provider
+            .anvil_set_code(address.parse().unwrap(), bytecode.clone())
+            .await?;
+    }
+    Ok(())
+}
+
+fn known_mock_erc20_addresses_for_chain(chain_id: u64) -> &'static [&'static str] {
+    match chain_id {
+        1 => &[
+            ETHEREUM_USDC_ADDRESS,
+            ETHEREUM_USDT_ADDRESS,
+            ETHEREUM_CBBTC_ADDRESS,
+        ],
+        8453 => &[BASE_USDC_ADDRESS, BASE_USDT_ADDRESS, BASE_CBBTC_ADDRESS],
+        42161 => &[
+            ARBITRUM_USDC_ADDRESS,
+            ARBITRUM_USDT_ADDRESS,
+            ARBITRUM_CBBTC_ADDRESS,
+        ],
+        _ => &[],
+    }
 }
 
 /// Spawns Anvil in a blocking task.
@@ -384,7 +465,6 @@ async fn spawn_anvil(
             .arg("--host")
             .arg("0.0.0.0")
             .chain_id(chain_id)
-            .block_time(1)
             // .arg("--steps-tracing")
             .arg("--cache-path")
             .arg(anvil_cache_pathbuf.to_string_lossy().to_string())
@@ -404,8 +484,7 @@ async fn spawn_anvil(
 
         match mode {
             Mode::Fork(fork_config) => {
-                // Use provided port or default to 50101 for fork mode
-                anvil = anvil.port(port.unwrap_or(50101_u16));
+                anvil = anvil.port(port.unwrap_or(DEVNET_ETHEREUM_RPC_PORT));
                 anvil = anvil.fork(fork_config.url);
                 if let Some(block_number) = fork_config.block_number {
                     anvil = anvil.fork_block_number(block_number);
@@ -413,8 +492,7 @@ async fn spawn_anvil(
             }
             Mode::Local => {
                 if interactive {
-                    // Use provided port or default to 50101 for interactive mode
-                    anvil = anvil.port(port.unwrap_or(50101_u16));
+                    anvil = anvil.port(port.unwrap_or(DEVNET_ETHEREUM_RPC_PORT));
                 } else if let Some(p) = port {
                     // Use provided port for non-interactive mode if specified
                     anvil = anvil.port(p);
@@ -451,4 +529,16 @@ async fn spawn_anvil(
         anvil_dump_path,
         anvil_cache_path,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn known_mock_erc20_addresses_include_router_anchor_assets() {
+        assert!(known_mock_erc20_addresses_for_chain(1).contains(&ETHEREUM_CBBTC_ADDRESS));
+        assert!(known_mock_erc20_addresses_for_chain(8453).contains(&BASE_CBBTC_ADDRESS));
+        assert!(known_mock_erc20_addresses_for_chain(42161).contains(&ARBITRUM_CBBTC_ADDRESS));
+    }
 }

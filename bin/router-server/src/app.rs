@@ -132,6 +132,7 @@ pub async fn initialize_components_with_action_providers(
             custody_action_executor,
             chain_registry.clone(),
         )
+        .with_route_costs(Some(route_costs.clone()))
         .with_provider_policies(Some(provider_policies.clone())),
     );
     let vault_manager = Arc::new(match worker_id {

@@ -11,6 +11,8 @@ if (migrationResult.status === 'migrated') {
   )
 } else if (migrationResult.status === 'unchanged') {
   console.log('better-auth schema is up to date')
+} else if (migrationResult.reason === 'development_auth_bypass') {
+  console.log('better-auth migrations skipped; development auth bypass is enabled')
 } else {
   console.warn(
     `better-auth migrations skipped missing=${migrationResult.missing.join(',')}`

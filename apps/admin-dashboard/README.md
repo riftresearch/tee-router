@@ -7,6 +7,7 @@ the router admin key, and read-only replica access. The browser never receives
 ## Required Runtime Variables
 
 ```env
+ADMIN_DASHBOARD_PRODUCTION=true
 ADMIN_DASHBOARD_AUTH_DATABASE_URL=postgres://...
 ADMIN_DASHBOARD_REPLICA_DATABASE_URL=postgres://...
 BETTER_AUTH_SECRET=...
@@ -14,13 +15,24 @@ BETTER_AUTH_URL=https://admin.example.com
 GOOGLE_CLIENT_ID=...
 GOOGLE_CLIENT_SECRET=...
 ROUTER_ADMIN_API_KEY=...
+ADMIN_DASHBOARD_CDC_SLOT_NAME=admin_dashboard_orders_cdc
+ROUTER_CDC_PUBLICATION_NAME=router_cdc_publication
+ROUTER_CDC_MESSAGE_PREFIX=rift.router.change
 ```
 
 `ADMIN_DASHBOARD_REPLICA_DATABASE_URL` may be replaced with
 `ROUTER_REPLICA_DATABASE_URL`. Do not point either value at the Phala primary.
 
 The auth database must be writable because Better Auth stores users, sessions,
-OAuth state, and PKCE there. The replica database should be read-only.
+OAuth state, and PKCE there. The replica database is read by normal queries and
+by one `pgoutput` logical replication stream. Router migrations install the
+`pg_logical_emit_message` triggers and publication that drive the SSE firehose.
+
+`ADMIN_DASHBOARD_PRODUCTION` defaults to `true` when `NODE_ENV=production`.
+Set it to `false` only for local development or deterministic compose stacks.
+In non-production mode the backend bypasses Google sign-in and returns a local
+admin session server-side; production still requires a verified Google account
+from the allowlist.
 
 ## Local Development
 

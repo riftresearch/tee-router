@@ -34,6 +34,10 @@ export type DashboardAuthRuntime = {
 export function createDashboardAuth(
   config: AdminDashboardConfig
 ): DashboardAuthRuntime | null {
+  if (!config.production) {
+    return null
+  }
+
   if (
     !config.authDatabaseUrl ||
     !config.googleClientId ||

@@ -228,6 +228,7 @@ pub struct MarketOrderQuote {
     pub max_amount_in: Option<String>,
     pub slippage_bps: u64,
     pub provider_quote: Value,
+    pub usd_valuation: Value,
     pub expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
 }
@@ -1057,6 +1058,7 @@ pub struct OrderExecutionStep {
     pub id: Uuid,
     pub order_id: Uuid,
     pub execution_attempt_id: Option<Uuid>,
+    pub execution_leg_id: Option<Uuid>,
     pub transition_decl_id: Option<String>,
     pub step_index: i32,
     pub step_type: OrderExecutionStepType,
@@ -1077,6 +1079,32 @@ pub struct OrderExecutionStep {
     pub request: Value,
     pub response: Value,
     pub error: Value,
+    pub usd_valuation: Value,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OrderExecutionLeg {
+    pub id: Uuid,
+    pub order_id: Uuid,
+    pub execution_attempt_id: Option<Uuid>,
+    pub transition_decl_id: Option<String>,
+    pub leg_index: i32,
+    pub leg_type: String,
+    pub provider: String,
+    pub status: OrderExecutionStepStatus,
+    pub input_asset: DepositAsset,
+    pub output_asset: DepositAsset,
+    pub amount_in: String,
+    pub expected_amount_out: String,
+    pub min_amount_out: Option<String>,
+    pub actual_amount_in: Option<String>,
+    pub actual_amount_out: Option<String>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub details: Value,
+    pub usd_valuation: Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

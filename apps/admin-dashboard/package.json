@@ -16,6 +16,7 @@
     "hono": "^4.12.16",
     "lucide-react": "^1.14.0",
     "pg": "^8.20.0",
+    "pg-logical-replication": "^2.4.0",
     "react": "^19.2.5",
     "react-dom": "^19.2.5"
   },

@@ -4,20 +4,20 @@ use alloy::primitives::U256;
 use chrono::{DateTime, Months, Utc};
 use metrics::{counter, gauge, histogram};
 use router_primitives::{normalize_evm_address, ChainType, TokenIdentifier};
-use serde::Deserialize;
 use snafu::ResultExt;
 use sqlx_core::row::Row;
-use sqlx_postgres::{PgNotification, PgPool};
+use sqlx_postgres::PgPool;
 use tokio::sync::RwLock;
 use tracing::info;
 use uuid::Uuid;
 
-use crate::error::{NotificationPayloadSnafu, ReplicaDatabaseQuerySnafu, Result};
+use crate::error::{ReplicaDatabaseQuerySnafu, Result};
 
 const FULL_WATCH_QUERY: &str = r#"
 SELECT
   'provider_operation' AS watch_target,
   opo.id::text AS watch_id,
+  opo.order_id::text AS order_id,
   opa.chain_id AS chain_id,
   opa.asset_id AS asset_id,
   opa.address AS address,
@@ -39,6 +39,7 @@ UNION ALL
 SELECT
   'funding_vault' AS watch_target,
   dv.id::text AS watch_id,
+  cv.order_id::text AS order_id,
   cv.chain_id AS chain_id,
   cv.asset_id AS asset_id,
   cv.address AS address,
@@ -71,6 +72,7 @@ const TARGETED_WATCH_QUERY: &str = r#"
 SELECT
   'provider_operation' AS watch_target,
   opo.id::text AS watch_id,
+  opo.order_id::text AS order_id,
   opa.chain_id AS chain_id,
   opa.asset_id AS asset_id,
   opa.address AS address,
@@ -93,6 +95,7 @@ UNION ALL
 SELECT
   'funding_vault' AS watch_target,
   dv.id::text AS watch_id,
+  cv.order_id::text AS order_id,
   cv.chain_id AS chain_id,
   cv.asset_id AS asset_id,
   cv.address AS address,
@@ -117,6 +120,62 @@ FROM public.deposit_vaults dv
 JOIN public.custody_vaults cv ON cv.id = dv.id
 LEFT JOIN public.market_order_quotes moq ON moq.order_id = cv.order_id
 WHERE dv.id = $1::uuid
+  AND dv.status = 'pending_funding'
+  AND dv.created_at >= $2
+"#;
+
+const ORDER_WATCH_QUERY: &str = r#"
+SELECT
+  'provider_operation' AS watch_target,
+  opo.id::text AS watch_id,
+  opo.order_id::text AS order_id,
+  opa.chain_id AS chain_id,
+  opa.asset_id AS asset_id,
+  opa.address AS address,
+  COALESCE(opo.request_json->>'expected_amount', oes.amount_in, '1') AS min_amount,
+  '115792089237316195423570985008687907853269984665640564039457584007913129639935' AS max_amount,
+  COALESCE(opo.request_json->>'expected_amount', oes.amount_in, '1') AS required_amount,
+  COALESCE(opa.expires_at, ro.action_timeout_at, opa.created_at + INTERVAL '15 months') AS deposit_deadline,
+  opa.created_at AS created_at,
+  GREATEST(opa.updated_at, opo.updated_at) AS updated_at
+FROM public.order_provider_addresses opa
+JOIN public.order_provider_operations opo ON opo.id = opa.provider_operation_id
+JOIN public.router_orders ro ON ro.id = opo.order_id
+LEFT JOIN public.order_execution_steps oes ON oes.id = opo.execution_step_id
+WHERE opo.order_id = $1::uuid
+  AND opa.role = 'unit_deposit'
+  AND opo.operation_type = 'unit_deposit'
+  AND opo.status IN ('submitted', 'waiting_external')
+  AND opa.created_at >= $2
+UNION ALL
+SELECT
+  'funding_vault' AS watch_target,
+  dv.id::text AS watch_id,
+  cv.order_id::text AS order_id,
+  cv.chain_id AS chain_id,
+  cv.asset_id AS asset_id,
+  cv.address AS address,
+  '1' AS min_amount,
+  '115792089237316195423570985008687907853269984665640564039457584007913129639935' AS max_amount,
+  COALESCE(
+    moq.amount_in,
+    CASE
+      WHEN dv.action->>'type' = 'market_order'
+        AND dv.action->'payload'->>'kind' = 'exact_in'
+        THEN dv.action->'payload'->>'amount_in'
+      WHEN dv.action->>'type' = 'market_order'
+        AND dv.action->'payload'->>'kind' = 'exact_out'
+        THEN dv.action->'payload'->>'max_amount_in'
+      ELSE '1'
+    END
+  ) AS required_amount,
+  dv.cancel_after AS deposit_deadline,
+  dv.created_at AS created_at,
+  GREATEST(dv.updated_at, cv.updated_at) AS updated_at
+FROM public.deposit_vaults dv
+JOIN public.custody_vaults cv ON cv.id = dv.id
+LEFT JOIN public.market_order_quotes moq ON moq.order_id = cv.order_id
+WHERE cv.order_id = $1::uuid
   AND dv.status = 'pending_funding'
   AND dv.created_at >= $2
 "#;
@@ -159,6 +218,7 @@ impl WatchTarget {
 pub struct WatchEntry {
     pub watch_target: WatchTarget,
     pub watch_id: Uuid,
+    pub order_id: Uuid,
     pub source_chain: ChainType,
     pub source_token: TokenIdentifier,
     pub address: String,
@@ -181,6 +241,7 @@ pub struct WatchStore {
 struct WatchState {
     by_watch_id: HashMap<Uuid, SharedWatchEntry>,
     by_chain: HashMap<ChainType, HashMap<Uuid, SharedWatchEntry>>,
+    by_order: HashMap<Uuid, HashMap<Uuid, SharedWatchEntry>>,
 }
 
 impl WatchStore {
@@ -188,6 +249,7 @@ impl WatchStore {
         let mut state = self.inner.write().await;
         let mut by_watch_id = HashMap::with_capacity(entries.len());
         let mut by_chain: HashMap<ChainType, HashMap<Uuid, SharedWatchEntry>> = HashMap::new();
+        let mut by_order: HashMap<Uuid, HashMap<Uuid, SharedWatchEntry>> = HashMap::new();
 
         for entry in entries {
             let entry = Arc::new(entry);
@@ -195,11 +257,16 @@ impl WatchStore {
                 .entry(entry.source_chain)
                 .or_default()
                 .insert(entry.watch_id, entry.clone());
+            by_order
+                .entry(entry.order_id)
+                .or_default()
+                .insert(entry.watch_id, entry.clone());
             by_watch_id.insert(entry.watch_id, entry);
         }
 
         state.by_watch_id = by_watch_id;
         state.by_chain = by_chain;
+        state.by_order = by_order;
         gauge!(SAURON_WATCH_COUNT_METRIC).set(state.by_watch_id.len() as f64);
     }
 
@@ -213,7 +280,41 @@ impl WatchStore {
             .entry(entry.source_chain)
             .or_default()
             .insert(entry.watch_id, entry.clone());
+        state
+            .by_order
+            .entry(entry.order_id)
+            .or_default()
+            .insert(entry.watch_id, entry.clone());
         state.by_watch_id.insert(entry.watch_id, entry);
+        gauge!(SAURON_WATCH_COUNT_METRIC).set(state.by_watch_id.len() as f64);
+    }
+
+    pub async fn replace_order(&self, order_id: Uuid, entries: Vec<WatchEntry>) {
+        let mut state = self.inner.write().await;
+        let existing_watch_ids = state
+            .by_order
+            .remove(&order_id)
+            .map(|entries| entries.keys().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        for watch_id in existing_watch_ids {
+            remove_entry(&mut state, watch_id);
+        }
+
+        for entry in entries {
+            let entry = Arc::new(entry);
+            state
+                .by_chain
+                .entry(entry.source_chain)
+                .or_default()
+                .insert(entry.watch_id, entry.clone());
+            state
+                .by_order
+                .entry(entry.order_id)
+                .or_default()
+                .insert(entry.watch_id, entry.clone());
+            state.by_watch_id.insert(entry.watch_id, entry);
+        }
         gauge!(SAURON_WATCH_COUNT_METRIC).set(state.by_watch_id.len() as f64);
     }
 
@@ -314,17 +415,17 @@ impl WatchRepository {
 
         row.map(parse_watch_row).transpose()
     }
-}
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WatchChangeNotification {
-    pub watch_id: Uuid,
-}
+    pub async fn load_order_watches(&self, order_id: Uuid) -> Result<Vec<WatchEntry>> {
+        let cutoff_time = deposit_vault_watch_cutoff();
+        let rows = sqlx_core::query::query(ORDER_WATCH_QUERY)
+            .bind(order_id)
+            .bind(cutoff_time)
+            .fetch_all(&self.pool)
+            .await
+            .context(ReplicaDatabaseQuerySnafu)?;
 
-impl WatchChangeNotification {
-    pub fn parse(notification: &PgNotification) -> Result<Self> {
-        serde_json::from_str(notification.payload()).context(NotificationPayloadSnafu)
+        rows.into_iter().map(parse_watch_row).collect()
     }
 }
 
@@ -350,6 +451,13 @@ fn remove_entry(state: &mut WatchState, watch_id: Uuid) {
             state.by_chain.remove(&previous.source_chain);
         }
     }
+
+    if let Some(order_entries) = state.by_order.get_mut(&previous.order_id) {
+        order_entries.remove(&watch_id);
+        if order_entries.is_empty() {
+            state.by_order.remove(&previous.order_id);
+        }
+    }
 }
 
 fn is_watch_active(watch: &WatchEntry, now: DateTime<Utc>) -> bool {
@@ -365,6 +473,15 @@ fn parse_watch_row(row: sqlx_postgres::PgRow) -> Result<WatchEntry> {
     let watch_id =
         Uuid::parse_str(&watch_id_raw).map_err(|_| crate::error::Error::InvalidWatchRow {
             message: format!("watch_id {watch_id_raw} was not a valid UUID"),
+        })?;
+    let order_id_raw =
+        row.try_get::<String, _>("order_id")
+            .map_err(|_| crate::error::Error::InvalidWatchRow {
+                message: format!("watch {watch_id} missing order_id"),
+            })?;
+    let order_id =
+        Uuid::parse_str(&order_id_raw).map_err(|_| crate::error::Error::InvalidWatchRow {
+            message: format!("watch {watch_id} order_id {order_id_raw} was not a valid UUID"),
         })?;
     let watch_target_raw: String =
         row.try_get("watch_target")
@@ -436,6 +553,7 @@ fn parse_watch_row(row: sqlx_postgres::PgRow) -> Result<WatchEntry> {
     Ok(WatchEntry {
         watch_target,
         watch_id,
+        order_id,
         source_chain,
         source_token: source_token.normalize(),
         address,
@@ -527,6 +645,7 @@ mod tests {
         WatchEntry {
             watch_target: WatchTarget::ProviderOperation,
             watch_id,
+            order_id: watch_id,
             source_chain,
             source_token: match source_chain {
                 ChainType::Bitcoin => TokenIdentifier::Native,

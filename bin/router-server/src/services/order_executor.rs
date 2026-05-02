@@ -5,10 +5,11 @@ use crate::{
         CustodyVault, CustodyVaultControlType, CustodyVaultRole, CustodyVaultStatus,
         CustodyVaultVisibility, DepositVault, DepositVaultStatus, MarketOrderKind,
         OrderExecutionAttempt, OrderExecutionAttemptKind, OrderExecutionAttemptStatus,
-        OrderExecutionStep, OrderExecutionStepStatus, OrderExecutionStepType, OrderProviderAddress,
-        OrderProviderOperation, OrderProviderOperationHint, ProviderAddressRole,
-        ProviderOperationHintKind, ProviderOperationHintStatus, ProviderOperationStatus,
-        ProviderOperationType, RouterOrder, RouterOrderQuote, RouterOrderStatus,
+        OrderExecutionLeg, OrderExecutionStep, OrderExecutionStepStatus, OrderExecutionStepType,
+        OrderProviderAddress, OrderProviderOperation, OrderProviderOperationHint,
+        ProviderAddressRole, ProviderOperationHintKind, ProviderOperationHintStatus,
+        ProviderOperationStatus, ProviderOperationType, RouterOrder, RouterOrderQuote,
+        RouterOrderStatus,
     },
     protocol::{backend_chain_for_id, AssetId, ChainId, DepositAsset},
     services::{
@@ -30,7 +31,14 @@ use crate::{
         },
         market_order_planner::{MarketOrderRoutePlanError, MarketOrderRoutePlanner},
         provider_policy::ProviderPolicyService,
-        quote_legs::{QuoteLeg, QuoteLegAsset, QuoteLegSpec},
+        quote_legs::{
+            execution_step_type_for_transition_kind, QuoteLeg, QuoteLegAsset, QuoteLegSpec,
+        },
+        route_costs::RouteCostService,
+        usd_valuation::{
+            empty_usd_valuation, execution_leg_usd_valuation, execution_step_usd_valuation,
+            pricing_has_live_usd_values,
+        },
     },
     telemetry,
 };
@@ -289,6 +297,7 @@ pub struct OrderExecutionManager {
     action_providers: Arc<ActionProviderRegistry>,
     custody_action_executor: Option<Arc<CustodyActionExecutor>>,
     chain_registry: Option<Arc<ChainRegistry>>,
+    route_costs: Option<Arc<RouteCostService>>,
     provider_policies: Option<Arc<ProviderPolicyService>>,
     crash_injector: Arc<dyn OrderExecutionCrashInjector>,
 }
@@ -311,6 +320,7 @@ impl OrderExecutionManager {
             action_providers,
             custody_action_executor: None,
             chain_registry: None,
+            route_costs: None,
             provider_policies: None,
             crash_injector: Arc::new(NoopOrderExecutionCrashInjector),
         }
@@ -329,6 +339,7 @@ impl OrderExecutionManager {
             action_providers,
             custody_action_executor: None,
             chain_registry: Some(chain_registry),
+            route_costs: None,
             provider_policies: None,
             crash_injector: Arc::new(NoopOrderExecutionCrashInjector),
         }
@@ -348,9 +359,16 @@ impl OrderExecutionManager {
             action_providers,
             custody_action_executor: Some(custody_action_executor),
             chain_registry: Some(chain_registry),
+            route_costs: None,
             provider_policies: None,
             crash_injector: Arc::new(NoopOrderExecutionCrashInjector),
         }
+    }
+
+    #[must_use]
+    pub fn with_route_costs(mut self, route_costs: Option<Arc<RouteCostService>>) -> Self {
+        self.route_costs = route_costs;
+        self
     }
 
     #[must_use]
@@ -1903,6 +1921,7 @@ impl OrderExecutionManager {
                 return Err(OrderExecutionError::OrderNotReady { order_id });
             }
         };
+        self.complete_wait_for_deposit_step(&order).await?;
         let quote = self
             .db
             .orders()
@@ -1923,10 +1942,27 @@ impl OrderExecutionManager {
         let plan_kind = plan.path_id.clone();
         self.enforce_route_provider_policy(&plan.steps, "planning")
             .await?;
+        let mut legs = plan.legs;
         let mut steps = self.hydrate_planned_steps(order.id, plan.steps).await?;
         if self.custody_action_executor.is_some() {
             self.validate_materialized_intermediate_custody(order.id, &steps)
                 .await?;
+        }
+        let usd_pricing = self.usd_pricing_snapshot().await;
+        for leg in &mut legs {
+            leg.usd_valuation = execution_leg_usd_valuation(
+                self.action_providers.asset_registry().as_ref(),
+                usd_pricing.as_ref(),
+                leg,
+            );
+        }
+        for step in &mut steps {
+            step.usd_valuation = execution_step_usd_valuation(
+                self.action_providers.asset_registry().as_ref(),
+                usd_pricing.as_ref(),
+                step,
+                None,
+            );
         }
         let execution_attempt = self.ensure_primary_execution_attempt(order.id).await?;
         self.bind_steps_to_attempt(
@@ -1935,7 +1971,13 @@ impl OrderExecutionManager {
             execution_attempt.id,
             &mut steps,
         );
+        self.bind_legs_to_attempt(execution_attempt.id, &mut legs);
         let planned_steps = steps.len();
+        self.db
+            .orders()
+            .create_execution_legs_idempotent(&legs)
+            .await
+            .map_err(|source| OrderExecutionError::Database { source })?;
         let inserted_steps = self
             .db
             .orders()
@@ -1989,6 +2031,43 @@ impl OrderExecutionManager {
             planned_steps,
             inserted_steps,
         })
+    }
+
+    async fn complete_wait_for_deposit_step(
+        &self,
+        order: &RouterOrder,
+    ) -> OrderExecutionResult<()> {
+        match self
+            .db
+            .orders()
+            .complete_wait_for_deposit_step_for_order(
+                order.id,
+                json!({ "reason": "funding_vault_funded" }),
+                Utc::now(),
+            )
+            .await
+        {
+            Ok(Some(step)) => {
+                telemetry::record_execution_step_workflow_event(
+                    order,
+                    &step,
+                    "execution_step.completed",
+                );
+            }
+            Ok(None) => {}
+            Err(source) => return Err(OrderExecutionError::Database { source }),
+        }
+
+        Ok(())
+    }
+
+    async fn usd_pricing_snapshot(&self) -> Option<crate::services::PricingSnapshot> {
+        let pricing = self
+            .route_costs
+            .as_ref()?
+            .current_or_refresh_pricing_snapshot()
+            .await;
+        pricing_has_live_usd_values(&pricing).then_some(pricing)
     }
 
     async fn materialize_refund_plan_for_order(
@@ -2783,6 +2862,12 @@ impl OrderExecutionManager {
         }
     }
 
+    fn bind_legs_to_attempt(&self, execution_attempt_id: Uuid, legs: &mut [OrderExecutionLeg]) {
+        for leg in legs {
+            leg.execution_attempt_id = Some(execution_attempt_id);
+        }
+    }
+
     async fn hydrate_planned_steps(
         &self,
         order_id: Uuid,
@@ -2986,6 +3071,70 @@ impl OrderExecutionManager {
             if json_string_equals(
                 &step.request,
                 "hyperliquid_custody_vault_role",
+                CustodyVaultRole::SourceDeposit.to_db_string(),
+            ) {
+                let chain_id = step
+                    .request
+                    .get("hyperliquid_custody_vault_chain_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| OrderExecutionError::ProviderRequestFailed {
+                        provider: step.provider.clone(),
+                        message: "source deposit hyperliquid signer missing chain id".to_string(),
+                    })?;
+                let asset_id = step
+                    .request
+                    .get("hyperliquid_custody_vault_asset_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| OrderExecutionError::ProviderRequestFailed {
+                        provider: step.provider.clone(),
+                        message: "source deposit hyperliquid signer missing asset id".to_string(),
+                    })?;
+                let signer_asset = DepositAsset {
+                    chain: ChainId::parse(chain_id).map_err(|err| {
+                        OrderExecutionError::ProviderRequestFailed {
+                            provider: step.provider.clone(),
+                            message: format!(
+                                "invalid source deposit hyperliquid signer chain id: {err}"
+                            ),
+                        }
+                    })?,
+                    asset: AssetId::parse(asset_id).map_err(|err| {
+                        OrderExecutionError::ProviderRequestFailed {
+                            provider: step.provider.clone(),
+                            message: format!(
+                                "invalid source deposit hyperliquid signer asset id: {err}"
+                            ),
+                        }
+                    })?,
+                };
+                let vault = self
+                    .source_deposit_vault(order_id, &signer_asset, &step.provider)
+                    .await?;
+                set_json_value(
+                    &mut step.request,
+                    "hyperliquid_custody_vault_id",
+                    json!(vault.id),
+                );
+                set_json_value(
+                    &mut step.request,
+                    "hyperliquid_custody_vault_address",
+                    json!(vault.address),
+                );
+                set_json_value(
+                    &mut step.details,
+                    "hyperliquid_custody_vault_id",
+                    json!(vault.id),
+                );
+                set_json_value(
+                    &mut step.details,
+                    "hyperliquid_custody_vault_address",
+                    json!(vault.address),
+                );
+            }
+
+            if json_string_equals(
+                &step.request,
+                "hyperliquid_custody_vault_role",
                 CustodyVaultRole::DestinationExecution.to_db_string(),
             ) {
                 let chain_id = step
@@ -3095,6 +3244,34 @@ impl OrderExecutionManager {
         }
 
         Ok(hydrated)
+    }
+
+    async fn source_deposit_vault(
+        &self,
+        order_id: Uuid,
+        asset: &DepositAsset,
+        provider: &str,
+    ) -> OrderExecutionResult<CustodyVault> {
+        self.db
+            .orders()
+            .get_custody_vaults(order_id)
+            .await
+            .map_err(|source| OrderExecutionError::Database { source })?
+            .into_iter()
+            .find(|vault| {
+                vault.role == CustodyVaultRole::SourceDeposit
+                    && vault.chain == asset.chain
+                    && vault.asset.as_ref() == Some(&asset.asset)
+                    && vault.status != CustodyVaultStatus::Failed
+            })
+            .ok_or_else(|| OrderExecutionError::ProviderRequestFailed {
+                provider: provider.to_string(),
+                message: format!(
+                    "order {order_id} is missing source deposit custody for {} {}",
+                    asset.chain.as_str(),
+                    asset.asset.as_str()
+                ),
+            })
     }
 
     async fn ensure_destination_execution_vault(
@@ -3695,6 +3872,14 @@ impl OrderExecutionManager {
 
         match completion.outcome {
             RunningStepOutcome::Completed => {
+                let completed_at = Utc::now();
+                let usd_pricing = self.usd_pricing_snapshot().await;
+                let usd_valuation = execution_step_usd_valuation(
+                    self.action_providers.asset_registry().as_ref(),
+                    usd_pricing.as_ref(),
+                    &running,
+                    Some(&completion.response),
+                );
                 let completed_step = self
                     .db
                     .orders()
@@ -3702,7 +3887,8 @@ impl OrderExecutionManager {
                         running.id,
                         completion.response,
                         completion.tx_hash,
-                        Utc::now(),
+                        usd_valuation,
+                        completed_at,
                     )
                     .await
                     .map_err(|source| OrderExecutionError::Database { source })?;
@@ -4757,10 +4943,24 @@ impl OrderExecutionManager {
                         "observed_state": observed_state,
                     })
                 });
+                let completed_at = Utc::now();
+                let usd_pricing = self.usd_pricing_snapshot().await;
+                let usd_valuation = execution_step_usd_valuation(
+                    self.action_providers.asset_registry().as_ref(),
+                    usd_pricing.as_ref(),
+                    &step,
+                    Some(&response),
+                );
                 let step = self
                     .db
                     .orders()
-                    .complete_observed_execution_step(step.id, response, tx_hash, Utc::now())
+                    .complete_observed_execution_step(
+                        step.id,
+                        response,
+                        tx_hash,
+                        usd_valuation,
+                        completed_at,
+                    )
                     .await
                     .map_err(|source| OrderExecutionError::Database { source })?;
                 Ok(Some(step))
@@ -5159,6 +5359,7 @@ fn refund_transfer_step(
         id: Uuid::now_v7(),
         order_id: order.id,
         execution_attempt_id: None,
+        execution_leg_id: None,
         transition_decl_id: None,
         step_index,
         step_type: OrderExecutionStepType::Refund,
@@ -5189,6 +5390,7 @@ fn refund_transfer_step(
         }),
         response: json!({}),
         error: json!({}),
+        usd_valuation: empty_usd_valuation(),
         created_at: planned_at,
         updated_at: planned_at,
     }
@@ -5642,6 +5844,7 @@ fn refund_exchange_quote_transition_legs(
                 transition_decl_id: transition_decl_id.to_string(),
                 transition_parent_decl_id: transition_decl_id.to_string(),
                 transition_kind,
+                execution_step_type: execution_step_type_for_transition_kind(transition_kind),
                 provider,
                 input_asset,
                 output_asset,
@@ -5694,6 +5897,9 @@ fn refund_exchange_quote_transition_legs(
                         transition_decl_id: format!("{transition_decl_id}:leg:{index}"),
                         transition_parent_decl_id: transition_decl_id.to_string(),
                         transition_kind,
+                        execution_step_type: execution_step_type_for_transition_kind(
+                            transition_kind,
+                        ),
                         provider,
                         input_asset,
                         output_asset,
@@ -5882,6 +6088,7 @@ fn refund_planned_step(spec: RefundPlannedStepSpec) -> OrderExecutionStep {
         id: Uuid::now_v7(),
         order_id: spec.order_id,
         execution_attempt_id: None,
+        execution_leg_id: None,
         transition_decl_id: spec.transition_decl_id,
         step_index: spec.step_index,
         step_type: spec.step_type,
@@ -5902,6 +6109,7 @@ fn refund_planned_step(spec: RefundPlannedStepSpec) -> OrderExecutionStep {
         details: spec.details,
         response: json!({}),
         error: json!({}),
+        usd_valuation: empty_usd_valuation(),
         created_at: spec.planned_at,
         updated_at: spec.planned_at,
     }
@@ -6887,7 +7095,7 @@ fn validate_materialized_intermediate_custody_step(
             )?;
         }
         OrderExecutionStepType::HyperliquidBridgeDeposit => {
-            validate_bound_internal_vault(
+            maybe_validate_bound_internal_vault(
                 order_id,
                 step,
                 "source_custody_vault_role",
@@ -6931,6 +7139,7 @@ fn validate_materialized_intermediate_custody_step(
                 "hyperliquid_custody_vault_id",
                 Some("hyperliquid_custody_vault_address"),
                 &[
+                    CustodyVaultRole::SourceDeposit,
                     CustodyVaultRole::DestinationExecution,
                     CustodyVaultRole::HyperliquidSpot,
                 ],
@@ -6978,6 +7187,7 @@ fn validate_materialized_intermediate_custody_step(
                 "hyperliquid_custody_vault_id",
                 Some("hyperliquid_custody_vault_address"),
                 &[
+                    CustodyVaultRole::SourceDeposit,
                     CustodyVaultRole::DestinationExecution,
                     CustodyVaultRole::HyperliquidSpot,
                 ],
@@ -7064,7 +7274,9 @@ fn validate_bound_internal_vault(
             ),
         });
     }
-    if vault.visibility != CustodyVaultVisibility::Internal {
+    if vault.visibility != CustodyVaultVisibility::Internal
+        && vault.role != CustodyVaultRole::SourceDeposit
+    {
         return Err(OrderExecutionError::IntermediateCustodyInvariant {
             step_id: step.id,
             reason: format!(
@@ -8147,6 +8359,7 @@ mod tests {
             id: Uuid::now_v7(),
             order_id,
             execution_attempt_id: None,
+            execution_leg_id: None,
             transition_decl_id: None,
             step_index,
             step_type,
@@ -8167,6 +8380,7 @@ mod tests {
             request,
             response: json!({}),
             error: json!({}),
+            usd_valuation: empty_usd_valuation(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

@@ -17,8 +17,14 @@ export async function fetchMe(): Promise<MeResponse> {
   return (await response.json()) as MeResponse
 }
 
-export async function fetchOrders(limit = 200): Promise<OrdersResponse> {
-  const response = await fetch(`/api/orders?limit=${limit}`, {
+export async function fetchOrders(
+  limit = 100,
+  cursor?: string
+): Promise<OrdersResponse> {
+  const params = new URLSearchParams({ limit: String(limit) })
+  if (cursor) params.set('cursor', cursor)
+
+  const response = await fetch(`/api/orders?${params.toString()}`, {
     credentials: 'include'
   })
 

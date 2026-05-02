@@ -9,11 +9,6 @@ pub enum Error {
     #[snafu(display("Failed to connect to Sauron state database"))]
     StateDatabaseConnection { source: sqlx_core::Error },
 
-    #[snafu(display("Failed to apply replica migrations"))]
-    ReplicaMigration {
-        source: sqlx_core::migrate::MigrateError,
-    },
-
     #[snafu(display("Failed to apply Sauron state migrations"))]
     StateMigration {
         source: sqlx_core::migrate::MigrateError,
@@ -25,26 +20,19 @@ pub enum Error {
     #[snafu(display("Sauron state database query failed"))]
     StateDatabaseQuery { source: sqlx_core::Error },
 
-    #[snafu(display("Failed to initialize Postgres notification listener"))]
-    ReplicaListenerConnection { source: sqlx_core::Error },
-
-    #[snafu(display("Failed to subscribe to Postgres notification channel {channel}"))]
-    ReplicaListen {
-        source: sqlx_core::Error,
-        channel: String,
+    #[snafu(display("Postgres CDC stream failed"))]
+    CdcStream {
+        source: pgwire_replication::PgWireError,
     },
 
-    #[snafu(display("Failed to receive Postgres notification"))]
-    ReplicaNotificationReceive { source: sqlx_core::Error },
+    #[snafu(display("Failed to parse Postgres CDC payload: {source}"))]
+    CdcPayload { source: serde_json::Error },
 
     #[snafu(display("Replica watch row was invalid: {message}"))]
     InvalidWatchRow { message: String },
 
     #[snafu(display("Replica cursor row was invalid: {message}"))]
     InvalidCursorRow { message: String },
-
-    #[snafu(display("Failed to parse replica notification payload: {source}"))]
-    NotificationPayload { source: serde_json::Error },
 
     #[snafu(display("Sauron configuration is invalid: {message}"))]
     InvalidConfiguration { message: String },

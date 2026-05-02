@@ -16,6 +16,10 @@ use corepc_node::Node as BitcoinRegtest;
 use electrsd::ElectrsD;
 use esplora_client::AsyncClient as EsploraClient;
 
+use crate::manifest::{
+    DEVNET_BITCOIN_RPC_PORT, DEVNET_BITCOIN_ZMQ_RAWTX_PORT, DEVNET_BITCOIN_ZMQ_SEQUENCE_PORT,
+    DEVNET_ESPLORA_PORT,
+};
 use crate::{get_new_temp_dir, Result, RiftDevnetCache};
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -69,10 +73,23 @@ impl BitcoinDevnet {
         conf.wallet = None;
         conf.view_stdout = false;
 
-        let zmq_rawtx_port = reserve_local_port()?;
-        let zmq_sequence_port = reserve_local_port()?;
-        let zmq_rawtx_endpoint = format!("tcp://127.0.0.1:{zmq_rawtx_port}");
-        let zmq_sequence_endpoint = format!("tcp://127.0.0.1:{zmq_sequence_port}");
+        let zmq_rawtx_port = if fixed_esplora_url {
+            DEVNET_BITCOIN_ZMQ_RAWTX_PORT
+        } else {
+            reserve_local_port()?
+        };
+        let zmq_sequence_port = if fixed_esplora_url {
+            DEVNET_BITCOIN_ZMQ_SEQUENCE_PORT
+        } else {
+            reserve_local_port()?
+        };
+        let zmq_host = if fixed_esplora_url {
+            "0.0.0.0"
+        } else {
+            "127.0.0.1"
+        };
+        let zmq_rawtx_endpoint = format!("tcp://{zmq_host}:{zmq_rawtx_port}");
+        let zmq_sequence_endpoint = format!("tcp://{zmq_host}:{zmq_sequence_port}");
         conf.args.push(Box::leak(
             format!("-zmqpubrawtx={zmq_rawtx_endpoint}").into_boxed_str(),
         ));
@@ -81,8 +98,11 @@ impl BitcoinDevnet {
         ));
 
         if fixed_esplora_url {
-            conf.bind = Some(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 50100_u16));
-            conf.args.push("-rpcauth=bitcoind:cccd5d7fd36e55c1b8576b8077dc1b83$60b5676a09f8518dcb4574838fb86f37700cd690d99bd2fdc2ea2bf2ab80ead6");
+            conf.bind = Some(SocketAddrV4::new(
+                Ipv4Addr::new(0, 0, 0, 0),
+                DEVNET_BITCOIN_RPC_PORT,
+            ));
+            conf.args.push("-rpcauth=devnet:0000000000000000$1c2adc9a0ce5b43c95b2a95a9bd228157af4a1770d99ecf835b95c50fcda27e4");
             conf.args.push("-rpcbind=0.0.0.0");
             conf.args.push("-rpcallowip=0.0.0.0/0");
             // bump so we can concurrently spend many utxos
@@ -101,8 +121,10 @@ impl BitcoinDevnet {
         conf.staticdir = Some(bitcoin_datadir.path().to_path_buf());
         conf.tmpdir = None;
 
+        let bitcoind_exe = corepc_node::exe_path()
+            .map_err(|e| eyre::eyre!("Failed to get bitcoind executable path: {}", e))?;
         let bitcoin_regtest = Arc::new(
-            tokio::task::spawn_blocking(move || BitcoinRegtest::from_downloaded_with_conf(&conf))
+            tokio::task::spawn_blocking(move || BitcoinRegtest::with_conf(bitcoind_exe, &conf))
                 .await
                 .map_err(|e| eyre::eyre!("Failed to spawn blocking task: {}", e))?
                 .map_err(|e| eyre::eyre!(e))?,
@@ -375,7 +397,9 @@ impl BitcoinDevnet {
             // false to prevent the default http server from starting
             conf.http_enabled = false;
             conf.args.push("--http-addr");
-            conf.args.push("0.0.0.0:50103");
+            conf.args.push(Box::leak(
+                format!("0.0.0.0:{DEVNET_ESPLORA_PORT}").into_boxed_str(),
+            ));
         } else {
             conf.http_enabled = true;
         }
@@ -407,7 +431,7 @@ impl BitcoinDevnet {
         let _client_creation_start = Instant::now();
         let (esplora_client, esplora_url) = if using_esplora {
             let esplora_url = if fixed_esplora_url {
-                "0.0.0.0:50103".to_string()
+                format!("0.0.0.0:{DEVNET_ESPLORA_PORT}")
             } else {
                 electrsd
                     .as_ref()

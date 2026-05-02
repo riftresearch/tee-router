@@ -403,6 +403,7 @@ fn vault_error_kind(error: &VaultError) -> &'static str {
         VaultError::InvalidOrderBinding { .. } => "invalid_order_binding",
         VaultError::InvalidFundingAmount { .. } => "invalid_funding_amount",
         VaultError::FundingCheck { .. } => "funding_check",
+        VaultError::FundingHintNotReady { .. } => "funding_hint_not_ready",
         VaultError::Random { .. } => "random",
         VaultError::WalletDerivation { .. } => "wallet_derivation",
         VaultError::DepositAddress { .. } => "deposit_address",

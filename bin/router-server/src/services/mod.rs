@@ -14,6 +14,7 @@ pub mod provider_policy;
 pub mod quote_legs;
 pub mod route_costs;
 pub mod route_minimums;
+pub mod usd_valuation;
 pub mod vault_manager;
 
 pub use action_providers::{

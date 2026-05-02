@@ -8,6 +8,7 @@ use router_primitives::ChainType;
 
 pub const USD_MICRO: u64 = 1_000_000;
 pub const BPS_DENOMINATOR: u64 = 10_000;
+pub const STATIC_BOOTSTRAP_PRICING_SOURCE: &str = "static_bootstrap_pricing_v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PricingSnapshot {
@@ -26,7 +27,7 @@ impl PricingSnapshot {
     #[must_use]
     pub fn static_bootstrap(captured_at: DateTime<Utc>) -> Self {
         Self {
-            source: "static_bootstrap_pricing_v1".to_string(),
+            source: STATIC_BOOTSTRAP_PRICING_SOURCE.to_string(),
             captured_at,
             expires_at: None,
             stable_usd_micro: USD_MICRO,

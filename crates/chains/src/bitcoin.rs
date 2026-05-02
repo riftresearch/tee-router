@@ -18,10 +18,31 @@ use reqwest::Url;
 use router_primitives::{
     ChainType, ConfirmedTxStatus, Currency, PendingTxStatus, TokenIdentifier, TxStatus, Wallet,
 };
+use serde::Deserialize;
 use snafu::location;
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 use tracing::{debug, info};
+
+#[derive(Debug, Deserialize)]
+struct TestMempoolAcceptResult {
+    allowed: bool,
+}
+
+#[derive(Clone)]
+struct BitcoinSpendableOutput {
+    txid: bitcoin::Txid,
+    vout: u32,
+    full_tx: Transaction,
+    output: bitcoin::TxOut,
+}
+
+impl BitcoinSpendableOutput {
+    fn value_sats(&self) -> u64 {
+        self.output.value.to_sat()
+    }
+}
 
 struct ReqwestRpcTransport {
     url: Url,
@@ -288,6 +309,334 @@ impl BitcoinChain {
         Ok(txid.to_string())
     }
 
+    pub async fn can_spend_outpoint_now(
+        &self,
+        private_key: &str,
+        recipient_address: &str,
+        tx_hash: &str,
+        vout: u32,
+        expected_amount_sats: u64,
+    ) -> Result<bool> {
+        let private_key =
+            PrivateKey::from_wif(private_key).map_err(|e| crate::Error::DumpToAddress {
+                message: format!("Invalid signer private key: {e}"),
+            })?;
+        let recipient_address = Address::from_str(recipient_address)?.assume_checked();
+        let txid = bitcoin::Txid::from_str(tx_hash).map_err(|e| {
+            crate::Error::TransactionDeserializationFailed {
+                context: format!("Failed to parse bitcoin txid {tx_hash}: {e}"),
+                loc: location!(),
+            }
+        })?;
+
+        let tx_out = self
+            .rpc_client
+            .get_tx_out(&txid, vout, Some(true))
+            .await
+            .map_err(|e| crate::Error::BitcoinRpcError {
+                source: e,
+                loc: location!(),
+            })?;
+        if tx_out.is_none() {
+            return Ok(false);
+        }
+
+        let full_tx = self.raw_transaction(&txid).await?;
+        let output = full_tx.output.get(vout as usize).cloned().ok_or_else(|| {
+            crate::Error::DumpToAddress {
+                message: format!("Transaction {txid} missing vout {vout}"),
+            }
+        })?;
+        if output.value.to_sat() != expected_amount_sats {
+            return Ok(false);
+        }
+
+        let secp = Secp256k1::new();
+        let sender_address = Address::p2wpkh(
+            &CompressedPublicKey::from_private_key(&secp, &private_key).unwrap(),
+            self.network,
+        );
+        if output.script_pubkey != sender_address.script_pubkey() {
+            return Ok(false);
+        }
+
+        let fee_sats = self.estimate_p2wpkh_transfer_fee_sats(1, 1).await?;
+        if expected_amount_sats <= fee_sats {
+            return Ok(false);
+        }
+
+        let raw_tx = self.build_signed_p2wpkh_sweep_from_outputs(
+            private_key,
+            recipient_address,
+            vec![BitcoinSpendableOutput {
+                txid,
+                vout,
+                full_tx,
+                output,
+            }],
+            fee_sats,
+        )?;
+        let raw_tx_hex = raw_tx;
+        let accepted = self
+            .rpc_client
+            .call::<Vec<TestMempoolAcceptResult>>(
+                "testmempoolaccept",
+                &[serde_json::json!([raw_tx_hex])],
+            )
+            .await
+            .map_err(|e| crate::Error::BitcoinRpcError {
+                source: e,
+                loc: location!(),
+            })?;
+
+        Ok(accepted.first().is_some_and(|result| result.allowed))
+    }
+
+    async fn raw_transaction(&self, txid: &bitcoin::Txid) -> Result<Transaction> {
+        let tx_hex = self
+            .rpc_client
+            .get_raw_transaction_hex(txid, None)
+            .await
+            .map_err(|e| crate::Error::DumpToAddress {
+                message: format!("Failed to fetch raw transaction for {txid}: {e}"),
+            })?;
+
+        let tx_bytes = alloy::hex::decode(&tx_hex).map_err(|e| crate::Error::DumpToAddress {
+            message: format!("Failed to decode raw transaction hex for {txid}: {e}"),
+        })?;
+
+        bitcoin::consensus::deserialize::<Transaction>(&tx_bytes).map_err(|e| {
+            crate::Error::DumpToAddress {
+                message: format!("Failed to deserialize raw transaction for {txid}: {e}"),
+            }
+        })
+    }
+
+    async fn spendable_outputs_from_esplora(
+        &self,
+        address: &Address,
+    ) -> Result<Vec<BitcoinSpendableOutput>> {
+        let started = Instant::now();
+        let result = self
+            .untrusted_esplora_client
+            .get_address_utxo(address)
+            .await
+            .map_err(|e| crate::Error::EsploraClientError {
+                source: e,
+                loc: location!(),
+            });
+        record_bitcoin_rpc_request(
+            "esplora_get_address_utxo",
+            result.is_ok(),
+            started.elapsed(),
+        );
+
+        let script_pubkey = address.script_pubkey();
+        let mut outputs = Vec::new();
+        for utxo in result? {
+            let full_tx = self.raw_transaction(&utxo.txid).await?;
+            let output = full_tx
+                .output
+                .get(utxo.vout as usize)
+                .cloned()
+                .ok_or_else(|| crate::Error::DumpToAddress {
+                    message: format!(
+                        "Transaction {} missing vout {} for foreign UTXO",
+                        utxo.txid, utxo.vout
+                    ),
+                })?;
+            if output.script_pubkey != script_pubkey {
+                debug!(
+                    txid = %utxo.txid,
+                    vout = utxo.vout,
+                    address = %address,
+                    "Skipping Esplora UTXO whose output script does not match the wallet address"
+                );
+                continue;
+            }
+            outputs.push(BitcoinSpendableOutput {
+                txid: utxo.txid,
+                vout: utxo.vout,
+                full_tx,
+                output,
+            });
+        }
+        Ok(outputs)
+    }
+
+    async fn mempool_outputs_for_address(
+        &self,
+        address: &Address,
+        seen: &mut HashSet<OutPoint>,
+    ) -> Result<Vec<BitcoinSpendableOutput>> {
+        let txids =
+            self.rpc_client
+                .get_raw_mempool()
+                .await
+                .map_err(|e| crate::Error::BitcoinRpcError {
+                    source: e,
+                    loc: location!(),
+                })?;
+        if txids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let script_pubkey = address.script_pubkey();
+        let mut outputs = Vec::new();
+        for txid in txids {
+            let full_tx = match self.raw_transaction(&txid).await {
+                Ok(tx) => tx,
+                Err(err) => {
+                    debug!(
+                        txid = %txid,
+                        error = %err,
+                        "Skipping mempool transaction whose raw body could not be loaded"
+                    );
+                    continue;
+                }
+            };
+            for (vout_index, output) in full_tx.output.iter().enumerate() {
+                if output.script_pubkey != script_pubkey {
+                    continue;
+                }
+                let vout = u32::try_from(vout_index).map_err(|_| crate::Error::DumpToAddress {
+                    message: format!("Bitcoin transaction {txid} has vout index above u32"),
+                })?;
+                let outpoint = OutPoint::new(txid, vout);
+                if !seen.insert(outpoint) {
+                    continue;
+                }
+                let still_unspent = self
+                    .rpc_client
+                    .get_tx_out(&txid, vout, Some(true))
+                    .await
+                    .map_err(|e| crate::Error::BitcoinRpcError {
+                        source: e,
+                        loc: location!(),
+                    })?
+                    .is_some();
+                if !still_unspent {
+                    continue;
+                }
+                outputs.push(BitcoinSpendableOutput {
+                    txid,
+                    vout,
+                    full_tx: full_tx.clone(),
+                    output: output.clone(),
+                });
+            }
+        }
+        Ok(outputs)
+    }
+
+    async fn spendable_outputs_for_address(
+        &self,
+        address: &Address,
+        minimum_sats: u64,
+    ) -> Result<Vec<BitcoinSpendableOutput>> {
+        let mut outputs = self.spendable_outputs_from_esplora(address).await?;
+        let mut seen: HashSet<OutPoint> = outputs
+            .iter()
+            .map(|output| OutPoint::new(output.txid, output.vout))
+            .collect();
+        let total = outputs
+            .iter()
+            .map(BitcoinSpendableOutput::value_sats)
+            .sum::<u64>();
+        if total >= minimum_sats {
+            return Ok(outputs);
+        }
+
+        outputs.extend(self.mempool_outputs_for_address(address, &mut seen).await?);
+        Ok(outputs)
+    }
+
+    fn build_signed_p2wpkh_sweep_from_outputs(
+        &self,
+        private_key: PrivateKey,
+        recipient_address: Address,
+        utxos: Vec<BitcoinSpendableOutput>,
+        fee_sats: u64,
+    ) -> Result<String> {
+        let total_in = utxos
+            .iter()
+            .try_fold(0_u64, |total, output| {
+                total.checked_add(output.value_sats())
+            })
+            .ok_or_else(|| crate::Error::DumpToAddress {
+                message: "Bitcoin sweep input amount overflow".to_string(),
+            })?;
+        if total_in <= fee_sats {
+            return Err(crate::Error::DumpToAddress {
+                message: format!(
+                    "Insufficient balance: inputs {total_in} sats, fee {fee_sats} sats"
+                ),
+            });
+        }
+
+        let descriptor = format!("wpkh({})", private_key.to_wif());
+        let mut temp_wallet = BdkWallet::create_with_params(
+            CreateParams::new_single(descriptor).network(self.network),
+        )
+        .map_err(|e| crate::Error::DumpToAddress {
+            message: format!("Failed to create temp wallet: {e}"),
+        })?;
+
+        let mut tx_builder = temp_wallet.build_tx();
+        tx_builder.manually_selected_only();
+        tx_builder.ordering(TxOrdering::Untouched);
+        tx_builder.add_recipient(
+            recipient_address.script_pubkey(),
+            Amount::from_sat(total_in - fee_sats),
+        );
+        tx_builder.fee_absolute(Amount::from_sat(fee_sats));
+
+        for utxo in utxos {
+            let psbt_input = bdk_wallet::bitcoin::psbt::Input {
+                witness_utxo: Some(utxo.output),
+                non_witness_utxo: Some(utxo.full_tx),
+                ..Default::default()
+            };
+            let satisfaction_weight = bdk_wallet::bitcoin::Weight::from_wu(108);
+
+            tx_builder
+                .add_foreign_utxo(
+                    OutPoint::new(utxo.txid, utxo.vout),
+                    psbt_input,
+                    satisfaction_weight,
+                )
+                .map_err(|e| crate::Error::DumpToAddress {
+                    message: format!(
+                        "Failed to add foreign UTXO {}:{}: {e}",
+                        utxo.txid, utxo.vout
+                    ),
+                })?;
+        }
+
+        let mut psbt = tx_builder
+            .finish()
+            .map_err(|e| crate::Error::DumpToAddress {
+                message: format!("Failed to build transaction: {e}"),
+            })?;
+
+        let finalized = temp_wallet
+            .sign(&mut psbt, SignOptions::default())
+            .map_err(|e| crate::Error::DumpToAddress {
+                message: format!("Failed to sign PSBT: {e}"),
+            })?;
+
+        if !finalized {
+            return Err(crate::Error::DumpToAddress {
+                message: "PSBT not fully finalized after signing".to_string(),
+            });
+        }
+
+        let tx = psbt.extract_tx().map_err(|e| crate::Error::DumpToAddress {
+            message: format!("Failed to extract transaction: {e}"),
+        })?;
+        Ok(hex::encode(bitcoin::consensus::serialize(&tx)))
+    }
+
     pub async fn transfer_native_amount(
         &self,
         private_key: &str,
@@ -313,32 +662,20 @@ impl BitcoinChain {
             self.network,
         );
 
-        let started = Instant::now();
-        let result = self
-            .untrusted_esplora_client
-            .get_address_utxo(&sender_address)
-            .await
-            .map_err(|e| crate::Error::EsploraClientError {
-                source: e,
-                loc: location!(),
-            });
-        record_bitcoin_rpc_request(
-            "esplora_get_address_utxo",
-            result.is_ok(),
-            started.elapsed(),
-        );
-        let utxos = result?;
+        let mut utxos = self
+            .spendable_outputs_for_address(&sender_address, amount_sats)
+            .await?;
         if utxos.is_empty() {
             return Err(crate::Error::DumpToAddress {
                 message: "No UTXOs found".to_string(),
             });
         }
 
-        let total_in: u64 = utxos.iter().map(|utxo| utxo.value).sum();
-        let fee_sats = self
+        let mut total_in: u64 = utxos.iter().map(BitcoinSpendableOutput::value_sats).sum();
+        let mut fee_sats = self
             .estimate_p2wpkh_transfer_fee_sats(utxos.len(), 2)
             .await?;
-        let required_sats =
+        let mut required_sats =
             amount_sats
                 .checked_add(fee_sats)
                 .ok_or_else(|| crate::Error::DumpToAddress {
@@ -346,6 +683,23 @@ impl BitcoinChain {
                         "Insufficient balance: amount {amount_sats} plus fee {fee_sats} overflows"
                     ),
                 })?;
+        if total_in < required_sats {
+            utxos = self
+                .spendable_outputs_for_address(&sender_address, required_sats)
+                .await?;
+            total_in = utxos.iter().map(BitcoinSpendableOutput::value_sats).sum();
+            fee_sats = self
+                .estimate_p2wpkh_transfer_fee_sats(utxos.len(), 2)
+                .await?;
+            required_sats =
+                amount_sats
+                    .checked_add(fee_sats)
+                    .ok_or_else(|| crate::Error::DumpToAddress {
+                        message: format!(
+                        "Insufficient balance: amount {amount_sats} plus fee {fee_sats} overflows"
+                    ),
+                    })?;
+        }
         if total_in < required_sats {
             return Err(crate::Error::InsufficientBalance {
                 required: U256::from(required_sats),
@@ -371,46 +725,9 @@ impl BitcoinChain {
         tx_builder.fee_absolute(Amount::from_sat(fee_sats));
 
         for utxo in utxos {
-            let tx_hex = self
-                .rpc_client
-                .get_raw_transaction_hex(&utxo.txid, None)
-                .await
-                .map_err(|e| crate::Error::DumpToAddress {
-                    message: format!("Failed to fetch raw transaction for {}: {e}", utxo.txid),
-                })?;
-
-            let tx_bytes =
-                alloy::hex::decode(&tx_hex).map_err(|e| crate::Error::DumpToAddress {
-                    message: format!(
-                        "Failed to decode raw transaction hex for {}: {e}",
-                        utxo.txid
-                    ),
-                })?;
-
-            let full_tx =
-                bitcoin::consensus::deserialize::<Transaction>(&tx_bytes).map_err(|e| {
-                    crate::Error::DumpToAddress {
-                        message: format!(
-                            "Failed to deserialize raw transaction for {}: {e}",
-                            utxo.txid
-                        ),
-                    }
-                })?;
-
-            let output = full_tx
-                .output
-                .get(utxo.vout as usize)
-                .cloned()
-                .ok_or_else(|| crate::Error::DumpToAddress {
-                    message: format!(
-                        "Transaction {} missing vout {} for foreign UTXO",
-                        utxo.txid, utxo.vout
-                    ),
-                })?;
-
             let psbt_input = bdk_wallet::bitcoin::psbt::Input {
-                witness_utxo: Some(output),
-                non_witness_utxo: Some(full_tx.clone()),
+                witness_utxo: Some(utxo.output),
+                non_witness_utxo: Some(utxo.full_tx),
                 ..Default::default()
             };
 
@@ -573,34 +890,28 @@ impl ChainOperations for BitcoinChain {
             self.network,
         );
 
-        let started = Instant::now();
-        let result = self
-            .untrusted_esplora_client
-            .get_address_utxo(&sender_address)
-            .await
-            .map_err(|e| crate::Error::EsploraClientError {
-                source: e,
-                loc: location!(),
-            });
-        record_bitcoin_rpc_request(
-            "esplora_get_address_utxo",
-            result.is_ok(),
-            started.elapsed(),
-        );
-        let utxos = result?;
+        let fee_sats = u256_to_u64_sats("fee", fee)?;
+        let minimum_sats = fee_sats.saturating_add(1);
+        let utxos = self
+            .spendable_outputs_for_address(&sender_address, minimum_sats)
+            .await?;
         if utxos.is_empty() {
             return Err(crate::Error::DumpToAddress {
                 message: "No UTXOs found".to_string(),
             });
         }
-        if utxos.iter().map(|utxo| utxo.value).sum::<u64>() < fee.to::<u64>() {
+        if utxos
+            .iter()
+            .map(BitcoinSpendableOutput::value_sats)
+            .sum::<u64>()
+            < fee_sats
+        {
             return Err(crate::Error::DumpToAddress {
                 message: "Insufficient balance to cover fee".to_string(),
             });
         }
         // Calculate totals
-        let total_in: u64 = utxos.iter().map(|u| u.value).sum();
-        let fee_sats: u64 = fee.to::<u64>();
+        let total_in: u64 = utxos.iter().map(BitcoinSpendableOutput::value_sats).sum();
         if total_in <= fee_sats {
             return Err(crate::Error::DumpToAddress {
                 message: format!(
@@ -632,46 +943,9 @@ impl ChainOperations for BitcoinChain {
 
         // Add inputs as foreign UTXOs with full PSBT metadata for reliability
         for utxo in utxos {
-            let tx_hex = self
-                .rpc_client
-                .get_raw_transaction_hex(&utxo.txid, None)
-                .await
-                .map_err(|e| crate::Error::DumpToAddress {
-                    message: format!("Failed to fetch raw transaction for {}: {e}", utxo.txid),
-                })?;
-
-            let tx_bytes =
-                alloy::hex::decode(&tx_hex).map_err(|e| crate::Error::DumpToAddress {
-                    message: format!(
-                        "Failed to decode raw transaction hex for {}: {e}",
-                        utxo.txid
-                    ),
-                })?;
-
-            let full_tx =
-                bitcoin::consensus::deserialize::<Transaction>(&tx_bytes).map_err(|e| {
-                    crate::Error::DumpToAddress {
-                        message: format!(
-                            "Failed to deserialize raw transaction for {}: {e}",
-                            utxo.txid
-                        ),
-                    }
-                })?;
-
-            let output = full_tx
-                .output
-                .get(utxo.vout as usize)
-                .cloned()
-                .ok_or_else(|| crate::Error::DumpToAddress {
-                    message: format!(
-                        "Transaction {} missing vout {} for foreign UTXO",
-                        utxo.txid, utxo.vout
-                    ),
-                })?;
-
             let psbt_input = bdk_wallet::bitcoin::psbt::Input {
-                witness_utxo: Some(output),
-                non_witness_utxo: Some(full_tx.clone()),
+                witness_utxo: Some(utxo.output),
+                non_witness_utxo: Some(utxo.full_tx),
                 ..Default::default()
             };
 
