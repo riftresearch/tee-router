@@ -49,7 +49,7 @@ use uuid::Uuid;
 const BASE_USDC_ADDRESS: &str = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
 const ETHEREUM_USDC_ADDRESS: &str = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
 const ARBITRUM_USDC_ADDRESS: &str = "0xaf88d065e77c8cc2239327c5edb3a432268e5831";
-const MAINNET_HYPERLIQUID_BRIDGE_ADDRESS: &str = "0x2df1c51e09aecf9cacb7bc98cb1742757f163df7";
+const TESTNET_HYPERLIQUID_BRIDGE_ADDRESS: &str = "0x08cfc1b6b2dcf36a1480b99353a354aa8ac56f89";
 const POSTGRES_PORT: u16 = 5432;
 const POSTGRES_USER: &str = "postgres";
 const POSTGRES_PASSWORD: &str = "password";
@@ -94,6 +94,16 @@ struct RouteCase {
     from: RouteAsset,
     to: RouteAsset,
     amount_in: &'static str,
+    expected_provider_fragments: &'static [&'static str],
+}
+
+#[derive(Clone, Copy)]
+struct LimitRouteCase {
+    name: &'static str,
+    from: RouteAsset,
+    to: RouteAsset,
+    input_amount: &'static str,
+    output_amount: &'static str,
     expected_provider_fragments: &'static [&'static str],
 }
 
@@ -145,7 +155,47 @@ const ROUTE_CASES: &[RouteCase] = &[
         from: RouteAsset::token("evm:8453", BASE_USDC_ADDRESS),
         to: RouteAsset::native("evm:1"),
         amount_in: "60000000",
-        expected_provider_fragments: &["across_bridge:across", "unit_withdrawal:unit"],
+        expected_provider_fragments: &[
+            "cctp_bridge:cctp",
+            "hyperliquid_bridge_deposit:hyperliquid_bridge",
+            "hyperliquid_trade:hyperliquid",
+            "unit_withdrawal:unit",
+        ],
+    },
+];
+
+const LIMIT_ROUTE_CASES: &[LimitRouteCase] = &[
+    LimitRouteCase {
+        name: "base_usdc_to_bitcoin_limit",
+        from: RouteAsset::token("evm:8453", BASE_USDC_ADDRESS),
+        to: RouteAsset::native("bitcoin"),
+        input_amount: "100000000",
+        output_amount: "160000",
+        expected_provider_fragments: &["hyperliquid_trade:hyperliquid", "unit_withdrawal:unit"],
+    },
+    LimitRouteCase {
+        name: "bitcoin_to_arbitrum_usdc_limit",
+        from: RouteAsset::native("bitcoin"),
+        to: RouteAsset::token("evm:42161", ARBITRUM_USDC_ADDRESS),
+        input_amount: "200000",
+        output_amount: "100000000",
+        expected_provider_fragments: &["unit_deposit:unit", "hyperliquid_trade:hyperliquid"],
+    },
+    LimitRouteCase {
+        name: "ethereum_eth_to_base_usdc_limit",
+        from: RouteAsset::native("evm:1"),
+        to: RouteAsset::token("evm:8453", BASE_USDC_ADDRESS),
+        input_amount: "50000000000000000",
+        output_amount: "125000000",
+        expected_provider_fragments: &["unit_deposit:unit", "hyperliquid_trade:hyperliquid"],
+    },
+    LimitRouteCase {
+        name: "base_usdc_to_ethereum_eth_limit",
+        from: RouteAsset::token("evm:8453", BASE_USDC_ADDRESS),
+        to: RouteAsset::native("evm:1"),
+        input_amount: "150000000",
+        output_amount: "40000000000000000",
+        expected_provider_fragments: &["hyperliquid_trade:hyperliquid", "unit_withdrawal:unit"],
     },
 ];
 
@@ -163,17 +213,92 @@ struct TestPostgres {
 }
 
 struct RuntimeTask {
-    handle: JoinHandle<()>,
+    handle: Option<JoinHandle<()>>,
+}
+
+struct RouterRuntimeHarness {
+    client: reqwest::Client,
+    router_base_url: String,
+    devnet: RiftDevnet,
+    mocks: MockIntegratorServer,
+    _postgres: TestPostgres,
+    _config_dir: tempfile::TempDir,
+    _api_task: RuntimeTask,
+    _worker_task: RuntimeTask,
+    _sauron_task: RuntimeTask,
 }
 
 impl Drop for RuntimeTask {
     fn drop(&mut self) {
-        self.handle.abort();
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+impl RuntimeTask {
+    fn new(handle: JoinHandle<()>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.handle
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
+    }
+
+    async fn abort_and_join(&mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        handle.abort();
+        let _ = handle.await;
+    }
+}
+
+impl RouterRuntimeHarness {
+    async fn shutdown(mut self) {
+        self._sauron_task.abort_and_join().await;
+        self._worker_task.abort_and_join().await;
+        self._api_task.abort_and_join().await;
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn router_api_worker_sauron_complete_mock_route_matrix() {
+    let runtime = spawn_mock_router_runtime().await;
+    for route_case in ROUTE_CASES {
+        run_route_case(
+            &runtime.client,
+            &runtime.router_base_url,
+            &runtime.devnet,
+            &runtime.mocks,
+            *route_case,
+        )
+        .await;
+    }
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn router_api_worker_sauron_complete_mock_limit_order_matrix() {
+    let runtime = spawn_mock_router_runtime().await;
+    for route_case in LIMIT_ROUTE_CASES {
+        run_limit_route_case(
+            &runtime.client,
+            &runtime.router_base_url,
+            &runtime.devnet,
+            &runtime.mocks,
+            *route_case,
+        )
+        .await;
+    }
+    runtime.shutdown().await;
+}
+
+async fn spawn_mock_router_runtime() -> RouterRuntimeHarness {
     let postgres = test_postgres().await;
     let database_url = create_test_database(&postgres.admin_database_url).await;
     let (devnet, _) = RiftDevnet::builder()
@@ -210,9 +335,16 @@ async fn router_api_worker_sauron_complete_mock_route_matrix() {
     let _worker_task = spawn_router_worker(args.clone()).await;
     let _sauron_task = spawn_sauron(&devnet, &database_url, &router_base_url).await;
 
-    let client = reqwest::Client::new();
-    for route_case in ROUTE_CASES {
-        run_route_case(&client, &router_base_url, &devnet, &mocks, *route_case).await;
+    RouterRuntimeHarness {
+        client: reqwest::Client::new(),
+        router_base_url,
+        devnet,
+        mocks,
+        _postgres: postgres,
+        _config_dir: config_dir,
+        _api_task,
+        _worker_task,
+        _sauron_task,
     }
 }
 
@@ -231,7 +363,16 @@ async fn test_postgres() -> TestPostgres {
         ))
         .with_env_var("POSTGRES_USER", POSTGRES_USER)
         .with_env_var("POSTGRES_PASSWORD", POSTGRES_PASSWORD)
-        .with_env_var("POSTGRES_DB", POSTGRES_DATABASE);
+        .with_env_var("POSTGRES_DB", POSTGRES_DATABASE)
+        .with_cmd([
+            "postgres",
+            "-c",
+            "wal_level=logical",
+            "-c",
+            "max_wal_senders=10",
+            "-c",
+            "max_replication_slots=10",
+        ]);
 
     let container = image.start().await.unwrap_or_else(|err| {
         panic!(
@@ -297,7 +438,7 @@ async fn spawn_router_api(mut args: RouterServerArgs) -> (String, RuntimeTask) {
     })
     .await;
 
-    (base_url, RuntimeTask { handle })
+    (base_url, RuntimeTask::new(handle))
 }
 
 async fn spawn_router_worker(args: RouterServerArgs) -> RuntimeTask {
@@ -307,8 +448,9 @@ async fn spawn_router_worker(args: RouterServerArgs) -> RuntimeTask {
             .expect("router worker should keep running until test aborts");
     });
     tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(!handle.is_finished(), "router worker exited during startup");
-    RuntimeTask { handle }
+    let task = RuntimeTask::new(handle);
+    assert!(!task.is_finished(), "router worker exited during startup");
+    task
 }
 
 async fn reserve_local_port() -> u16 {
@@ -329,13 +471,13 @@ async fn spawn_sauron(
         log_level: "warn".to_string(),
         router_replica_database_url: database_url.to_string(),
         sauron_state_database_url: None,
-        sauron_replica_event_source: sauron::config::SauronReplicaEventSource::Notify,
+        sauron_replica_event_source: sauron::config::SauronReplicaEventSource::Cdc,
         router_replica_database_name: "router_db".to_string(),
-        router_replica_notification_channel: "sauron_watch_set_changed".to_string(),
         sauron_cdc_slot_name: "sauron_watch_cdc".to_string(),
-        sauron_cdc_plugin: "test_decoding".to_string(),
-        sauron_cdc_batch_size: 1000,
-        sauron_cdc_poll_interval_ms: 1000,
+        router_cdc_publication_name: "router_cdc_publication".to_string(),
+        router_cdc_message_prefix: "rift.router.change".to_string(),
+        sauron_cdc_status_interval_ms: 1000,
+        sauron_cdc_idle_wakeup_interval_ms: 10_000,
         router_internal_base_url: router_base_url.to_string(),
         router_detector_api_key: ROUTER_DETECTOR_API_KEY.to_string(),
         electrum_http_server_url: devnet
@@ -380,8 +522,9 @@ async fn spawn_sauron(
             .expect("Sauron should keep running until test aborts");
     });
     tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(!handle.is_finished(), "Sauron exited during startup");
-    RuntimeTask { handle }
+    let task = RuntimeTask::new(handle);
+    assert!(!task.is_finished(), "Sauron exited during startup");
+    task
 }
 
 fn router_args(
@@ -446,7 +589,7 @@ fn router_args(
         hyperliquid_paymaster_private_key: Some(test_hyperliquid_paymaster_private_key()),
         router_detector_api_key: Some(ROUTER_DETECTOR_API_KEY.to_string()),
         router_admin_api_key: Some(ROUTER_ADMIN_API_KEY.to_string()),
-        hyperliquid_network: HyperliquidCallNetwork::Mainnet,
+        hyperliquid_network: HyperliquidCallNetwork::Testnet,
         hyperliquid_order_timeout_ms: 30_000,
         worker_id: Some(format!("router-runtime-e2e-{}", Uuid::now_v7())),
         worker_lease_name: Some(format!("router-runtime-e2e-{}", Uuid::now_v7())),
@@ -456,6 +599,8 @@ fn router_args(
         worker_refund_poll_seconds: 1,
         worker_order_execution_poll_seconds: 1,
         worker_route_cost_refresh_seconds: 300,
+        worker_provider_health_poll_seconds: 120,
+        provider_health_timeout_seconds: 10,
         coinbase_price_api_base_url: mocks.base_url().to_string(),
     }
 }
@@ -492,13 +637,28 @@ async fn spawn_runtime_mocks(devnet: &RiftDevnet) -> MockIntegratorServer {
         )
         .with_across_auth(ACROSS_API_KEY, ACROSS_INTEGRATOR_ID)
         .with_across_status_latency(Duration::from_secs(2))
-        .with_cctp_token_messenger_address(devnet::evm_devnet::MOCK_CCTP_TOKEN_MESSENGER_V2_ADDRESS)
-        .with_cctp_evm_rpc_url(devnet.base.anvil.endpoint_url().to_string())
-        .with_cctp_destination_token_address(ETHEREUM_USDC_ADDRESS)
-        .with_hyperliquid_bridge_address(MAINNET_HYPERLIQUID_BRIDGE_ADDRESS)
+        .with_cctp_chain(
+            devnet.ethereum.anvil.chain_id(),
+            devnet::evm_devnet::MOCK_CCTP_TOKEN_MESSENGER_V2_ADDRESS,
+            devnet.ethereum.anvil.endpoint_url().to_string(),
+        )
+        .with_cctp_chain(
+            devnet.base.anvil.chain_id(),
+            devnet::evm_devnet::MOCK_CCTP_TOKEN_MESSENGER_V2_ADDRESS,
+            devnet.base.anvil.endpoint_url().to_string(),
+        )
+        .with_cctp_chain(
+            devnet.arbitrum.anvil.chain_id(),
+            devnet::evm_devnet::MOCK_CCTP_TOKEN_MESSENGER_V2_ADDRESS,
+            devnet.arbitrum.anvil.endpoint_url().to_string(),
+        )
+        .with_cctp_destination_token(devnet.ethereum.anvil.chain_id(), ETHEREUM_USDC_ADDRESS)
+        .with_cctp_destination_token(devnet.base.anvil.chain_id(), BASE_USDC_ADDRESS)
+        .with_cctp_destination_token(devnet.arbitrum.anvil.chain_id(), ARBITRUM_USDC_ADDRESS)
+        .with_hyperliquid_bridge_address(TESTNET_HYPERLIQUID_BRIDGE_ADDRESS)
         .with_hyperliquid_evm_rpc_url(devnet.arbitrum.anvil.endpoint_url().to_string())
         .with_hyperliquid_usdc_token_address(ARBITRUM_USDC_ADDRESS)
-        .with_mainnet_hyperliquid(true);
+        .with_mainnet_hyperliquid(false);
     MockIntegratorServer::spawn_with_config(config)
         .await
         .expect("spawn mock integrators")
@@ -539,6 +699,51 @@ async fn run_route_case(
     );
 }
 
+async fn run_limit_route_case(
+    client: &reqwest::Client,
+    router_base_url: &str,
+    devnet: &RiftDevnet,
+    mocks: &MockIntegratorServer,
+    route_case: LimitRouteCase,
+) {
+    eprintln!(
+        "running router runtime limit route case {}",
+        route_case.name
+    );
+    let quote = submit_limit_quote(client, router_base_url, route_case).await;
+    let limit_quote = quote.quote.as_limit_order().expect("limit order quote");
+    assert_provider_fragments_for(
+        route_case.name,
+        route_case.from,
+        route_case.to,
+        route_case.expected_provider_fragments,
+        &limit_quote.provider_id,
+    );
+    assert_limit_quote_has_hyperliquid_limit_leg(route_case.name, &limit_quote.provider_quote);
+    let quote_id = limit_quote.id;
+    let amount_in = limit_quote.input_amount.clone();
+
+    let order = submit_limit_order(client, router_base_url, quote_id, route_case).await;
+    assert_eq!(order.order.status, RouterOrderStatus::PendingFunding);
+    let funding_vault = order
+        .funding_vault
+        .as_ref()
+        .expect("limit order should include funding vault")
+        .vault
+        .clone();
+    assert_limit_funding_vault_matches(route_case, &funding_vault);
+    fund_source_vault(devnet, &funding_vault, &amount_in).await;
+
+    let completed =
+        drive_order_to_completion(client, router_base_url, devnet, mocks, order.order.id).await;
+    assert_eq!(
+        completed.order.status,
+        RouterOrderStatus::Completed,
+        "limit route case {} should complete",
+        route_case.name
+    );
+}
+
 async fn submit_exact_in_quote(
     client: &reqwest::Client,
     router_base_url: &str,
@@ -562,6 +767,30 @@ async fn submit_exact_in_quote(
     let body = response.text().await.expect("quote body");
     assert_eq!(status, reqwest::StatusCode::CREATED, "{body}");
     serde_json::from_str(&body).expect("quote response")
+}
+
+async fn submit_limit_quote(
+    client: &reqwest::Client,
+    router_base_url: &str,
+    route_case: LimitRouteCase,
+) -> RouterOrderQuoteEnvelope {
+    let response = client
+        .post(format!("{router_base_url}/api/v1/quotes"))
+        .json(&json!({
+            "type": "limit_order",
+            "from_asset": route_case.from.to_json(),
+            "to_asset": route_case.to.to_json(),
+            "recipient_address": recipient_address_for(route_case.to),
+            "input_amount": route_case.input_amount,
+            "output_amount": route_case.output_amount
+        }))
+        .send()
+        .await
+        .expect("limit quote request");
+    let status = response.status();
+    let body = response.text().await.expect("limit quote body");
+    assert_eq!(status, reqwest::StatusCode::CREATED, "{body}");
+    serde_json::from_str(&body).expect("limit quote response")
 }
 
 async fn submit_order(
@@ -588,16 +817,55 @@ async fn submit_order(
     serde_json::from_str(&body).expect("order response")
 }
 
+async fn submit_limit_order(
+    client: &reqwest::Client,
+    router_base_url: &str,
+    quote_id: Uuid,
+    route_case: LimitRouteCase,
+) -> RouterOrderEnvelope {
+    let response = client
+        .post(format!("{router_base_url}/api/v1/orders"))
+        .json(&json!({
+            "quote_id": quote_id,
+            "refund_address": refund_address_for(route_case.from),
+            "metadata": {
+                "test": route_case.name
+            }
+        }))
+        .send()
+        .await
+        .expect("limit order request");
+    let status = response.status();
+    let body = response.text().await.expect("limit order body");
+    assert_eq!(status, reqwest::StatusCode::CREATED, "{body}");
+    serde_json::from_str(&body).expect("limit order response")
+}
+
 fn assert_provider_fragments(route_case: RouteCase, provider_id: &str) {
-    for fragment in route_case.expected_provider_fragments {
+    assert_provider_fragments_for(
+        route_case.name,
+        route_case.from,
+        route_case.to,
+        route_case.expected_provider_fragments,
+        provider_id,
+    );
+}
+
+fn assert_provider_fragments_for(
+    name: &str,
+    from: RouteAsset,
+    to: RouteAsset,
+    expected_provider_fragments: &[&str],
+    provider_id: &str,
+) {
+    for fragment in expected_provider_fragments {
         assert!(
             provider_id.contains(fragment),
-            "route case {} expected provider id to contain {fragment:?}; provider id was {provider_id}",
-            route_case.name
+            "route case {name} expected provider id to contain {fragment:?}; provider id was {provider_id}"
         );
     }
 
-    if route_case.from.chain != route_case.to.chain {
+    if from.chain != to.chain {
         let has_cross_chain_leg = [
             "across_bridge:across",
             "cctp_bridge:cctp",
@@ -609,10 +877,27 @@ fn assert_provider_fragments(route_case: RouteCase, provider_id: &str) {
         .any(|fragment| provider_id.contains(fragment));
         assert!(
             has_cross_chain_leg,
-            "route case {} is cross-chain but provider id did not contain a cross-chain leg: {provider_id}",
-            route_case.name
+            "route case {name} is cross-chain but provider id did not contain a cross-chain leg: {provider_id}"
         );
     }
+}
+
+fn assert_limit_quote_has_hyperliquid_limit_leg(name: &str, provider_quote: &Value) {
+    let has_limit_leg = provider_quote
+        .get("legs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|leg| {
+            leg.get("raw")
+                .and_then(|raw| raw.get("kind"))
+                .and_then(Value::as_str)
+                == Some("hyperliquid_limit_order")
+        });
+    assert!(
+        has_limit_leg,
+        "limit route case {name} should materialize a Hyperliquid limit-order quote leg: {provider_quote}"
+    );
 }
 
 fn assert_funding_vault_matches(route_case: RouteCase, vault: &DepositVault) {
@@ -626,6 +911,21 @@ fn assert_funding_vault_matches(route_case: RouteCase, vault: &DepositVault) {
         vault.deposit_asset.asset.as_str().to_ascii_lowercase(),
         route_case.from.asset.to_ascii_lowercase(),
         "route case {} funding vault should use source asset",
+        route_case.name
+    );
+}
+
+fn assert_limit_funding_vault_matches(route_case: LimitRouteCase, vault: &DepositVault) {
+    assert_eq!(
+        vault.deposit_asset.chain.to_string(),
+        route_case.from.chain,
+        "limit route case {} funding vault should use source chain",
+        route_case.name
+    );
+    assert_eq!(
+        vault.deposit_asset.asset.as_str().to_ascii_lowercase(),
+        route_case.from.asset.to_ascii_lowercase(),
+        "limit route case {} funding vault should use source asset",
         route_case.name
     );
 }
@@ -849,6 +1149,7 @@ async fn fund_destination_execution_vault_from_across(
             .await;
         }
     }
+    mine_evm_confirmation_block(destination_devnet).await;
 }
 
 async fn get_order_flow(
@@ -937,6 +1238,7 @@ async fn fund_source_vault(devnet: &RiftDevnet, vault: &DepositVault, amount_in:
             .expect("funding vault token should be an EVM address");
         transfer_user_erc20_to_vault(evm_devnet, token_address, vault_address, amount).await;
     }
+    mine_evm_confirmation_block(evm_devnet).await;
 }
 
 async fn send_bitcoin(devnet: &RiftDevnet, address: &str, amount_sats: u64) {
@@ -971,6 +1273,14 @@ async fn send_native(devnet: &devnet::EthDevnet, recipient: Address, amount: U25
         .await
         .expect("native transfer receipt");
     assert!(receipt.status(), "native transfer reverted");
+}
+
+async fn mine_evm_confirmation_block(devnet: &devnet::EthDevnet) {
+    let provider = ProviderBuilder::new().connect_http(devnet.anvil.endpoint_url());
+    provider
+        .anvil_mine(Some(1), None)
+        .await
+        .expect("mine EVM confirmation block");
 }
 
 fn evm_devnet_for_chain<'a>(devnet: &'a RiftDevnet, chain: &str) -> &'a devnet::EthDevnet {

@@ -460,6 +460,7 @@ struct MockIntegratorState {
     across_chains: BTreeMap<u64, MockAcrossChainConfig>,
     hyperliquid_bridge_address: Option<String>,
     hyperliquid_evm_rpc_url: Option<String>,
+    hyperliquid_usdc_token_address: Option<String>,
     unit_generate_address_requests: Mutex<Vec<MockUnitGenerateAddressRequest>>,
     /// Tracked by `protocol_address` — the fresh mock address returned from
     /// `/gen` that acts as either the deposit source or the withdrawal spotSend
@@ -1000,6 +1001,7 @@ impl MockIntegratorState {
             across_chains: config.across_chains.clone(),
             hyperliquid_bridge_address: config.hyperliquid_bridge_address.clone(),
             hyperliquid_evm_rpc_url: config.hyperliquid_evm_rpc_url.clone(),
+            hyperliquid_usdc_token_address: config.hyperliquid_usdc_token_address.clone(),
             unit_generate_address_requests: Mutex::default(),
             unit_operations: Mutex::default(),
             unit_protocol_private_keys: Mutex::default(),
@@ -1247,16 +1249,14 @@ async fn mock_velora_quote_amounts(
     query: &MockVeloraPricesQuery,
     amount: u128,
 ) -> Result<(u128, u128), String> {
-    let src_symbol = mock_velora_token_symbol(&query.src_token)
-        .ok_or_else(|| format!("unsupported src token {}", query.src_token))?;
-    let dest_symbol = mock_velora_token_symbol(&query.dest_token)
-        .ok_or_else(|| format!("unsupported dest token {}", query.dest_token))?;
+    let src_symbol = mock_velora_token_symbol(&query.src_token);
+    let dest_symbol = mock_velora_token_symbol(&query.dest_token);
     let prices = state.velora_usd_prices.lock().await;
     let src_price = *prices
-        .get(src_symbol)
+        .get(src_symbol.as_str())
         .ok_or_else(|| format!("missing USD price for {src_symbol}"))?;
     let dest_price = *prices
-        .get(dest_symbol)
+        .get(dest_symbol.as_str())
         .ok_or_else(|| format!("missing USD price for {dest_symbol}"))?;
 
     match query.side.as_str() {
@@ -1288,32 +1288,34 @@ fn default_velora_usd_prices() -> BTreeMap<String, u128> {
     BTreeMap::from([
         ("ETH".to_string(), DEFAULT_ETH_USD_MICRO),
         ("BTC".to_string(), DEFAULT_BTC_USD_MICRO),
+        ("MOCK".to_string(), DEFAULT_USD_STABLE_USD_MICRO),
         ("USDC".to_string(), DEFAULT_USD_STABLE_USD_MICRO),
         ("USDT".to_string(), DEFAULT_USD_STABLE_USD_MICRO),
     ])
 }
 
-fn mock_velora_token_symbol(token: &str) -> Option<&'static str> {
+fn mock_velora_token_symbol(token: &str) -> String {
     let token = token.to_ascii_lowercase();
     match token.as_str() {
-        VELORA_NATIVE_TOKEN => Some("ETH"),
+        VELORA_NATIVE_TOKEN => "ETH",
         // WETH
         "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
         | "0x4200000000000000000000000000000000000006"
-        | "0x82af49447d8a07e3bd95bd0d56f35241523fbab1" => Some("ETH"),
+        | "0x82af49447d8a07e3bd95bd0d56f35241523fbab1" => "ETH",
         // USDC
         "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
         | "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
-        | "0xaf88d065e77c8cc2239327c5edb3a432268e5831" => Some("USDC"),
+        | "0xaf88d065e77c8cc2239327c5edb3a432268e5831" => "USDC",
         // USDT
         "0xdac17f958d2ee523a2206206994597c13d831ec7"
         | "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2"
-        | "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9" => Some("USDT"),
+        | "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9" => "USDT",
         // WBTC / cbBTC
         "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599"
-        | "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf" => Some("BTC"),
-        _ => None,
+        | "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf" => "BTC",
+        _ => "MOCK",
     }
+    .to_string()
 }
 
 fn convert_raw_amount_floor(
@@ -4133,6 +4135,9 @@ fn schedule_mock_hyperliquid_withdrawal_release(
     let Some(bridge_address) = state.hyperliquid_bridge_address.clone() else {
         return;
     };
+    let Some(usdc_token_address) = state.hyperliquid_usdc_token_address.clone() else {
+        return;
+    };
     let latency = state.hyperliquid_withdrawal_latency;
     tokio::spawn(async move {
         if latency > Duration::ZERO {
@@ -4141,6 +4146,7 @@ fn schedule_mock_hyperliquid_withdrawal_release(
         if let Err(err) = send_mock_hyperliquid_withdrawal_release(
             &rpc_url,
             &bridge_address,
+            &usdc_token_address,
             destination,
             payout_raw,
         )
@@ -4154,14 +4160,26 @@ fn schedule_mock_hyperliquid_withdrawal_release(
 async fn send_mock_hyperliquid_withdrawal_release(
     rpc_url: &str,
     bridge_address: &str,
+    usdc_token_address: &str,
     destination: Address,
     payout_raw: u64,
 ) -> Result<(), String> {
-    let rpc_url: Url = rpc_url
+    let rpc_endpoint = rpc_url;
+    let rpc_url: Url = rpc_endpoint
         .parse()
-        .map_err(|err| format!("invalid hyperliquid EVM RPC URL {rpc_url:?}: {err}"))?;
+        .map_err(|err| format!("invalid hyperliquid EVM RPC URL {rpc_endpoint:?}: {err}"))?;
     let bridge_address = Address::from_str(bridge_address)
         .map_err(|err| format!("invalid hyperliquid bridge address {bridge_address:?}: {err}"))?;
+    let usdc_token_address = Address::from_str(usdc_token_address).map_err(|err| {
+        format!("invalid hyperliquid USDC token address {usdc_token_address:?}: {err}")
+    })?;
+    mock_mint_erc20_on_anvil(
+        rpc_endpoint,
+        usdc_token_address,
+        bridge_address,
+        U256::from(payout_raw),
+    )
+    .await?;
     let provider = ProviderBuilder::new().connect_http(rpc_url);
     let sender = provider
         .get_accounts()
@@ -5691,6 +5709,28 @@ mod tests {
 
         assert_eq!(body["priceRoute"]["srcAmount"], "60000000");
         assert_eq!(body["priceRoute"]["destAmount"], "20000000000000000");
+    }
+
+    #[tokio::test]
+    async fn mock_velora_prices_unknown_erc20_with_deterministic_mock_price() {
+        let server = MockIntegratorServer::spawn()
+            .await
+            .expect("spawn mock integrator");
+        let url = format!(
+            "{}/prices?srcToken=0x3333333333333333333333333333333333333333&destToken=0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48&srcDecimals=18&destDecimals=6&amount=1000000000000000000&side=SELL&network=1",
+            server.base_url()
+        );
+        let body: Value = reqwest::get(&url)
+            .await
+            .expect("http get")
+            .error_for_status()
+            .expect("200 ok")
+            .json()
+            .await
+            .expect("json body");
+
+        assert_eq!(body["priceRoute"]["srcAmount"], "1000000000000000000");
+        assert_eq!(body["priceRoute"]["destAmount"], "1000000");
     }
 
     /// The mock `GET /swap/approval` returns a `swapTx` whose calldata must

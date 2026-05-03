@@ -45,10 +45,10 @@ use router_server::{
     server::{build_api_router, AdminApiAuth, AppState, InternalApiAuth},
     services::{
         action_providers::{
-            BridgeExecutionRequest, BridgeProvider, BridgeQuote, BridgeQuoteRequest,
-            ExchangeExecutionRequest, ExchangeProvider, ExchangeQuote, ExchangeQuoteRequest,
-            ProviderFuture, UnitDepositStepRequest, UnitProvider, UnitWithdrawalStepRequest,
-            VeloraProvider,
+            AcrossHttpProviderConfig, BridgeExecutionRequest, BridgeProvider, BridgeQuote,
+            BridgeQuoteRequest, CctpHttpProviderConfig, ExchangeExecutionRequest, ExchangeProvider,
+            ExchangeQuote, ExchangeQuoteRequest, ProviderFuture, UnitDepositStepRequest,
+            UnitProvider, UnitWithdrawalStepRequest, VeloraProvider,
         },
         deposit_address::derive_deposit_address_for_quote,
         market_order_planner::MarketOrderRoutePlanner,
@@ -2279,6 +2279,157 @@ async fn quote_market_order_supports_velora_arbitrary_evm_start_and_end() {
 }
 
 #[tokio::test]
+async fn quote_market_order_bitcoin_to_base_usdc_keeps_configured_provider_path_before_top_k() {
+    let h = harness().await;
+    let mocks = MockIntegratorServer::spawn().await.unwrap();
+    let db = test_db().await;
+    let dir = tempfile::tempdir().unwrap();
+    let settings = Arc::new(test_settings(dir.path()));
+    let base_url = mocks.base_url().to_string();
+    let action_providers = ActionProviderRegistry::http(
+        Some(AcrossHttpProviderConfig::new(
+            base_url.clone(),
+            "router-test-across",
+        )),
+        Some(CctpHttpProviderConfig::mock(base_url.clone())),
+        Some(base_url.clone()),
+        None,
+        Some(base_url.clone()),
+        Some(VeloraHttpProviderConfig::new(base_url)),
+        router_server::services::custody_action_executor::HyperliquidCallNetwork::Testnet,
+    )
+    .expect("mock runtime providers");
+    let order_manager = OrderManager::with_action_providers(
+        db,
+        settings,
+        h.chain_registry.clone(),
+        Arc::new(action_providers),
+    );
+
+    let response = order_manager
+        .quote_market_order(MarketOrderQuoteRequest {
+            from_asset: DepositAsset {
+                chain: ChainId::parse("bitcoin").unwrap(),
+                asset: AssetId::Native,
+            },
+            to_asset: DepositAsset {
+                chain: ChainId::parse("evm:8453").unwrap(),
+                asset: AssetId::reference("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
+            },
+            recipient_address: valid_evm_address(),
+            order_kind: MarketOrderQuoteKind::ExactIn {
+                amount_in: "10000000".to_string(),
+                slippage_bps: 100,
+            },
+        })
+        .await
+        .unwrap();
+    let quote = response
+        .quote
+        .as_market_order()
+        .expect("market order quote");
+    assert_path_provider_id(
+        &quote.provider_id,
+        &["unit_deposit:unit", "universal_router_swap:velora"],
+    );
+}
+
+#[tokio::test]
+async fn quote_market_order_exact_in_reports_net_output_after_unit_withdrawal_retention() {
+    let h = harness().await;
+    let mocks = MockIntegratorServer::spawn().await.unwrap();
+    let db = test_db().await;
+    let dir = tempfile::tempdir().unwrap();
+    let settings = Arc::new(test_settings(dir.path()));
+    let base_url = mocks.base_url().to_string();
+    let action_providers = ActionProviderRegistry::http(
+        Some(AcrossHttpProviderConfig::new(
+            base_url.clone(),
+            "router-test-across",
+        )),
+        Some(CctpHttpProviderConfig::mock(base_url.clone())),
+        Some(base_url.clone()),
+        None,
+        Some(base_url.clone()),
+        Some(VeloraHttpProviderConfig::new(base_url)),
+        router_server::services::custody_action_executor::HyperliquidCallNetwork::Testnet,
+    )
+    .expect("mock runtime providers");
+    let order_manager = OrderManager::with_action_providers(
+        db,
+        settings,
+        h.chain_registry.clone(),
+        Arc::new(action_providers),
+    );
+
+    let response = order_manager
+        .quote_market_order(MarketOrderQuoteRequest {
+            from_asset: DepositAsset {
+                chain: ChainId::parse("evm:8453").unwrap(),
+                asset: AssetId::reference("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
+            },
+            to_asset: DepositAsset {
+                chain: ChainId::parse("evm:1").unwrap(),
+                asset: AssetId::Native,
+            },
+            recipient_address: valid_evm_address(),
+            order_kind: MarketOrderQuoteKind::ExactIn {
+                amount_in: "60000000".to_string(),
+                slippage_bps: 100,
+            },
+        })
+        .await
+        .unwrap();
+    let quote = response
+        .quote
+        .as_market_order()
+        .expect("market order quote");
+    assert_path_provider_id(
+        &quote.provider_id,
+        &[
+            "cctp_bridge:cctp",
+            "hyperliquid_bridge_deposit:hyperliquid_bridge",
+            "hyperliquid_trade:hyperliquid",
+            "unit_withdrawal:unit",
+        ],
+    );
+
+    let legs = quote.provider_quote["legs"].as_array().expect("quote legs");
+    let trade_leg = legs
+        .iter()
+        .find(|leg| leg["transition_kind"] == json!("hyperliquid_trade"))
+        .expect("hyperliquid trade leg");
+    let withdrawal_leg = legs
+        .iter()
+        .find(|leg| leg["transition_kind"] == json!("unit_withdrawal"))
+        .expect("unit withdrawal leg");
+    let trade_output =
+        U256::from_str_radix(trade_leg["amount_out"].as_str().expect("trade output"), 10).unwrap();
+    let withdrawal_output = U256::from_str_radix(
+        withdrawal_leg["amount_out"]
+            .as_str()
+            .expect("withdrawal output"),
+        10,
+    )
+    .unwrap();
+    let quote_output = U256::from_str_radix(&quote.amount_out, 10).unwrap();
+    let quote_min_output =
+        U256::from_str_radix(quote.min_amount_out.as_deref().expect("min output"), 10).unwrap();
+
+    assert!(withdrawal_output < trade_output);
+    assert_eq!(quote_output, withdrawal_output);
+    assert!(quote_min_output <= quote_output);
+    assert_eq!(
+        withdrawal_leg["amount_in"].as_str(),
+        Some(quote.amount_out.as_str())
+    );
+    assert_eq!(
+        quote.provider_quote["gas_reimbursement"]["retention_actions"][0]["transition_decl_id"],
+        withdrawal_leg["transition_parent_decl_id"]
+    );
+}
+
+#[tokio::test]
 async fn mock_velora_transaction_mints_output_token_on_local_evm() {
     let h = harness().await;
     let mocks = spawn_harness_mocks(h, "evm:8453").await;
@@ -2475,17 +2626,30 @@ async fn quote_limit_order_base_usdc_to_bitcoin_materializes_hyperliquid_limit_s
         quote.provider_quote.get("kind").and_then(Value::as_str),
         Some("limit_order_route")
     );
-    assert!(quote
+    let quote_legs = quote
         .provider_quote
         .get("legs")
         .and_then(Value::as_array)
-        .expect("legs")
+        .expect("legs");
+    let limit_leg = quote_legs
         .iter()
-        .any(|leg| leg
-            .get("raw")
-            .and_then(|raw| raw.get("kind"))
-            .and_then(Value::as_str)
-            == Some("hyperliquid_limit_order")));
+        .find(|leg| {
+            leg.get("raw")
+                .and_then(|raw| raw.get("kind"))
+                .and_then(Value::as_str)
+                == Some("hyperliquid_limit_order")
+        })
+        .expect("hyperliquid limit quote leg");
+    assert_eq!(
+        limit_leg.get("amount_out").and_then(Value::as_str),
+        Some("100000"),
+        "limit-order quote must not add input-asset paymaster retention to the output asset"
+    );
+    assert!(quote_legs.iter().any(|leg| leg
+        .get("raw")
+        .and_then(|raw| raw.get("kind"))
+        .and_then(Value::as_str)
+        == Some("hyperliquid_limit_order")));
 
     let order = create_test_order_from_quote(&order_manager, quote.id).await;
     let vault = vault_manager
@@ -2540,6 +2704,86 @@ async fn quote_limit_order_base_usdc_to_bitcoin_materializes_hyperliquid_limit_s
             .get("residual_policy")
             .and_then(Value::as_str),
         Some("refund")
+    );
+}
+
+#[tokio::test]
+async fn quote_limit_order_base_usdc_to_eth_includes_downstream_ueth_retention() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = harness().await;
+    let db = test_db().await;
+    let mocks = MockIntegratorServer::spawn().await.unwrap();
+    let settings = Arc::new(test_settings(dir.path()));
+    let action_providers = Arc::new(ActionProviderRegistry::mock_http(mocks.base_url()));
+    let order_manager = OrderManager::with_action_providers(
+        db,
+        settings,
+        h.chain_registry.clone(),
+        action_providers,
+    );
+
+    let requested_output = "40000000000000000";
+    let response = order_manager
+        .quote_limit_order(LimitOrderQuoteRequest {
+            from_asset: DepositAsset {
+                chain: ChainId::parse("evm:8453").unwrap(),
+                asset: AssetId::reference("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
+            },
+            to_asset: DepositAsset {
+                chain: ChainId::parse("evm:1").unwrap(),
+                asset: AssetId::Native,
+            },
+            recipient_address: valid_evm_address(),
+            input_amount: "150000000".to_string(),
+            output_amount: requested_output.to_string(),
+        })
+        .await
+        .unwrap();
+    let quote = response.quote.as_limit_order().expect("limit order quote");
+    assert_eq!(quote.output_amount, requested_output);
+
+    let retained_ueth = quote.provider_quote["gas_reimbursement"]["retention_actions"]
+        .as_array()
+        .expect("retention actions")
+        .iter()
+        .find(|action| {
+            action["transition_decl_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("unit_withdrawal:unit:hyperliquid:UETH"))
+        })
+        .expect("unit withdrawal UETH retention")["amount"]
+        .as_str()
+        .expect("retention amount");
+    let expected_limit_output = U256::from_str_radix(requested_output, 10)
+        .unwrap()
+        .saturating_add(U256::from_str_radix(retained_ueth, 10).unwrap())
+        .to_string();
+
+    let legs = quote.provider_quote["legs"].as_array().expect("legs");
+    let limit_leg = legs
+        .iter()
+        .find(|leg| {
+            leg["raw"]["kind"].as_str() == Some("hyperliquid_limit_order")
+                && leg["output_asset"]["asset"].as_str() == Some("UETH")
+        })
+        .expect("UETH hyperliquid limit leg");
+    assert_eq!(
+        limit_leg["amount_out"].as_str(),
+        Some(expected_limit_output.as_str())
+    );
+    assert_eq!(
+        quote.provider_quote["limit_order"]["output_amount"].as_str(),
+        Some(expected_limit_output.as_str())
+    );
+
+    let withdrawal_leg = legs
+        .iter()
+        .find(|leg| leg["transition_kind"].as_str() == Some("unit_withdrawal"))
+        .expect("unit withdrawal leg");
+    assert_eq!(withdrawal_leg["amount_in"].as_str(), Some(requested_output));
+    assert_eq!(
+        withdrawal_leg["amount_out"].as_str(),
+        Some(requested_output)
     );
 }
 

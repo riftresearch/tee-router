@@ -176,6 +176,7 @@ struct ComposeTransitionPathQuoteRequest<'a> {
     quote_id: Uuid,
     source_depositor_address: &'a str,
     path: &'a TransitionPath,
+    gas_reimbursement_plan: Option<&'a GasReimbursementPlan>,
     provider_policy_snapshot: Option<&'a crate::services::ProviderPolicySnapshot>,
     provider_health_snapshot: Option<&'a crate::services::ProviderHealthSnapshot>,
     unit: Option<&'a dyn UnitProvider>,
@@ -641,6 +642,7 @@ impl OrderManager {
             MAX_PATH_DEPTH,
         );
         paths.retain(|path| is_executable_transition_path(self.asset_registry.as_ref(), path));
+        paths.retain(|path| path_has_configured_provider_set(self.action_providers.as_ref(), path));
         prefer_same_chain_evm_paths(request, &mut paths);
         if paths.is_empty() {
             return Err(MarketOrderError::NoRoute {
@@ -763,6 +765,7 @@ impl OrderManager {
             )
             .is_some()
         });
+        paths.retain(|path| path_has_configured_provider_set(self.action_providers.as_ref(), path));
         paths.retain(|path| {
             path.transitions
                 .iter()
@@ -973,6 +976,7 @@ impl OrderManager {
                     quote_id,
                     source_depositor_address,
                     path: &prefix,
+                    gas_reimbursement_plan: Some(&gas_reimbursement_plan),
                     provider_policy_snapshot,
                     provider_health_snapshot,
                     unit,
@@ -1027,6 +1031,7 @@ impl OrderManager {
                     quote_id,
                     source_depositor_address,
                     path: &suffix,
+                    gas_reimbursement_plan: Some(&gas_reimbursement_plan),
                     provider_policy_snapshot,
                     provider_health_snapshot,
                     unit,
@@ -1041,12 +1046,6 @@ impl OrderManager {
                 quote_legs_from_provider_quote(&quote.provider_quote)?,
             )
         };
-        let limit_output_amount = add_transition_retention(
-            &gas_reimbursement_plan,
-            &limit_transition.id,
-            &limit_output_amount,
-        )?;
-
         validate_positive_amount("limit_order.input_amount", &limit_input_amount)?;
         validate_positive_amount("limit_order.output_amount", &limit_output_amount)?;
 
@@ -1194,18 +1193,23 @@ impl OrderManager {
             return Ok(None);
         }
 
-        let has_compatible_exchange = if requires_exchange {
-            self.action_providers.exchanges().iter().any(|exchange| {
+        let has_required_exchanges = !requires_exchange
+            || path.transitions.iter().all(|transition| {
+                if !matches!(
+                    transition.kind,
+                    MarketOrderTransitionKind::HyperliquidTrade
+                        | MarketOrderTransitionKind::UniversalRouterSwap
+                ) {
+                    return true;
+                }
+                let exchange_id = transition.provider.as_str();
                 provider_allowed_for_new_routes(
                     provider_policy_snapshot,
                     provider_health_snapshot,
-                    exchange.id(),
-                ) && exchange_path_compatible(exchange.id(), path)
-            })
-        } else {
-            true
-        };
-        if !has_compatible_exchange {
+                    exchange_id,
+                ) && self.action_providers.exchange(exchange_id).is_some()
+            });
+        if !has_required_exchanges {
             return Ok(None);
         }
 
@@ -1220,6 +1224,7 @@ impl OrderManager {
                     quote_id,
                     source_depositor_address,
                     path,
+                    gas_reimbursement_plan: None,
                     provider_policy_snapshot,
                     provider_health_snapshot,
                     unit: unit.as_deref(),
@@ -1249,6 +1254,7 @@ impl OrderManager {
                     quote_id,
                     source_depositor_address,
                     path,
+                    gas_reimbursement_plan: None,
                     provider_policy_snapshot,
                     provider_health_snapshot,
                     unit: unit.as_deref(),
@@ -1283,23 +1289,28 @@ impl OrderManager {
             quote_id,
             source_depositor_address,
             path,
+            gas_reimbursement_plan,
             provider_policy_snapshot,
             provider_health_snapshot,
             unit,
         } = spec;
         let mut expires_at = Utc::now() + ChronoDuration::minutes(10);
         let mut legs_per_transition: Vec<Vec<QuoteLeg>> = vec![Vec::new(); path.transitions.len()];
-        let gas_reimbursement_plan = if let Some(route_costs) = self.route_costs.as_ref() {
-            let pricing = route_costs.current_pricing_snapshot().await;
-            optimized_paymaster_reimbursement_plan_with_pricing(
-                self.asset_registry.as_ref(),
-                path,
-                &pricing,
-            )
+        let gas_reimbursement_plan = if let Some(plan) = gas_reimbursement_plan {
+            plan.clone()
         } else {
-            optimized_paymaster_reimbursement_plan(self.asset_registry.as_ref(), path)
-        }
-        .map_err(MarketOrderError::gas_reimbursement)?;
+            if let Some(route_costs) = self.route_costs.as_ref() {
+                let pricing = route_costs.current_pricing_snapshot().await;
+                optimized_paymaster_reimbursement_plan_with_pricing(
+                    self.asset_registry.as_ref(),
+                    path,
+                    &pricing,
+                )
+            } else {
+                optimized_paymaster_reimbursement_plan(self.asset_registry.as_ref(), path)
+            }
+            .map_err(MarketOrderError::gas_reimbursement)?
+        };
 
         match order_kind {
             MarketOrderKind::ExactIn {
@@ -1522,6 +1533,7 @@ impl OrderManager {
                                     "recipient_address": recipient_address,
                                 }),
                             }));
+                            cursor_amount = provider_amount_in;
                         }
                     }
                 }
@@ -2311,15 +2323,31 @@ fn unit_path_compatible(unit: &dyn UnitProvider, path: &TransitionPath) -> bool 
         })
 }
 
-fn exchange_path_compatible(exchange_id: &str, path: &TransitionPath) -> bool {
+fn path_has_configured_provider_set(
+    action_providers: &ActionProviderRegistry,
+    path: &TransitionPath,
+) -> bool {
     path.transitions
         .iter()
         .all(|transition| match transition.kind {
+            MarketOrderTransitionKind::UnitDeposit => action_providers
+                .units()
+                .iter()
+                .any(|unit| unit.supports_deposit(&transition.input.asset)),
+            MarketOrderTransitionKind::UnitWithdrawal => action_providers
+                .units()
+                .iter()
+                .any(|unit| unit.supports_withdrawal(&transition.output.asset)),
             MarketOrderTransitionKind::HyperliquidTrade
-            | MarketOrderTransitionKind::UniversalRouterSwap => {
-                transition.provider.as_str() == exchange_id
-            }
-            _ => true,
+            | MarketOrderTransitionKind::UniversalRouterSwap => action_providers
+                .exchange(transition.provider.as_str())
+                .is_some(),
+            MarketOrderTransitionKind::AcrossBridge
+            | MarketOrderTransitionKind::CctpBridge
+            | MarketOrderTransitionKind::HyperliquidBridgeDeposit
+            | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => action_providers
+                .bridge(transition.provider.as_str())
+                .is_some(),
         })
 }
 

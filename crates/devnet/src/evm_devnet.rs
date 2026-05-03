@@ -7,6 +7,9 @@ use eip7702_delegator_contract::{
     EIP7702_DELEGATOR_CROSSCHAIN_ADDRESS,
 };
 use eyre::{eyre, Result};
+use hyperliquid_client::{
+    bridge::bridge_address as hyperliquid_bridge_address, client::Network as HyperliquidNetwork,
+};
 use tokio::time::Instant;
 use tracing::info;
 
@@ -23,6 +26,7 @@ use crate::{
         MockCctpTokenMessengerV2::MockCctpTokenMessengerV2Instance,
     },
     get_new_temp_dir,
+    hyperliquid_bridge_mock::MockHyperliquidBridge2::MockHyperliquidBridge2Instance,
     manifest::DEVNET_ETHEREUM_RPC_PORT,
     token_indexerd::TokenIndexerInstance,
     RiftDevnetCache,
@@ -309,6 +313,7 @@ async fn deploy_contracts(
                 .await?;
         install_mock_erc20_code_at_known_assets(provider.clone(), chain_id, mock_erc20_bytecode)
             .await?;
+        install_mock_hyperliquid_bridge_code(provider.clone(), chain_id).await?;
         provider
             .anvil_set_code(
                 EIP7702_DELEGATOR_CROSSCHAIN_ADDRESS.parse().unwrap(),
@@ -350,6 +355,7 @@ async fn deploy_contracts(
         mock_erc20_deployed_bytecode,
     )
     .await?;
+    install_mock_hyperliquid_bridge_code(provider.clone(), chain_id).await?;
 
     let mock_erc20_contract =
         GenericEIP3009ERC20Instance::new(MOCK_ERC20_ADDRESS.parse().unwrap(), provider.clone());
@@ -385,6 +391,26 @@ async fn ensure_mock_erc20_code_at_anchor(provider: DynProvider, anchor: Address
     let bytecode = provider.clone().get_code_at(*deployment.address()).await?;
     provider.anvil_set_code(anchor, bytecode.clone()).await?;
     Ok(bytecode)
+}
+
+async fn install_mock_hyperliquid_bridge_code(provider: DynProvider, chain_id: u64) -> Result<()> {
+    if chain_id != 42161 {
+        return Ok(());
+    }
+
+    let deployment = MockHyperliquidBridge2Instance::deploy(
+        provider.clone(),
+        ARBITRUM_USDC_ADDRESS.parse().unwrap(),
+    )
+    .await?;
+    let bytecode = provider.clone().get_code_at(*deployment.address()).await?;
+    provider
+        .anvil_set_code(
+            hyperliquid_bridge_address(HyperliquidNetwork::Testnet),
+            bytecode,
+        )
+        .await?;
+    Ok(())
 }
 
 async fn install_mock_erc20_code_at_known_assets(

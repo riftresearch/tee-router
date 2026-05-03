@@ -11,8 +11,15 @@ devnet +args:
     #!/usr/bin/env bash
     set -euo pipefail
     args=( {{args}} )
+    if [[ "${#args[@]}" -eq 0 ]]; then
+      args=(ps)
+    fi
     if [[ "${args[0]}" == "up-d" ]]; then
       args=(up -d "${args[@]:1}")
+    fi
+    if [[ "${args[0]}" == "up" ]]; then
+      {{local_full_compose}} stop admin-dashboard sauron >/dev/null 2>&1 || true
+      {{local_full_compose}} rm -f router-replica-setup >/dev/null 2>&1 || true
     fi
     {{local_full_compose}} "${args[@]}"
 

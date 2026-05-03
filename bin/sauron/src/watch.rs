@@ -47,6 +47,7 @@ SELECT
   '115792089237316195423570985008687907853269984665640564039457584007913129639935' AS max_amount,
   COALESCE(
     moq.amount_in,
+    loq.input_amount,
     CASE
       WHEN dv.action->>'type' = 'market_order'
         AND dv.action->'payload'->>'kind' = 'exact_in'
@@ -54,6 +55,8 @@ SELECT
       WHEN dv.action->>'type' = 'market_order'
         AND dv.action->'payload'->>'kind' = 'exact_out'
         THEN dv.action->'payload'->>'max_amount_in'
+      WHEN dv.action->>'type' = 'limit_order'
+        THEN dv.action->'payload'->>'input_amount'
       ELSE '1'
     END
   ) AS required_amount,
@@ -63,6 +66,7 @@ SELECT
 FROM public.deposit_vaults dv
 JOIN public.custody_vaults cv ON cv.id = dv.id
 LEFT JOIN public.market_order_quotes moq ON moq.order_id = cv.order_id
+LEFT JOIN public.limit_order_quotes loq ON loq.order_id = cv.order_id
 WHERE dv.status = 'pending_funding'
   AND dv.created_at >= $1
 ORDER BY updated_at ASC, watch_id ASC
@@ -103,6 +107,7 @@ SELECT
   '115792089237316195423570985008687907853269984665640564039457584007913129639935' AS max_amount,
   COALESCE(
     moq.amount_in,
+    loq.input_amount,
     CASE
       WHEN dv.action->>'type' = 'market_order'
         AND dv.action->'payload'->>'kind' = 'exact_in'
@@ -110,6 +115,8 @@ SELECT
       WHEN dv.action->>'type' = 'market_order'
         AND dv.action->'payload'->>'kind' = 'exact_out'
         THEN dv.action->'payload'->>'max_amount_in'
+      WHEN dv.action->>'type' = 'limit_order'
+        THEN dv.action->'payload'->>'input_amount'
       ELSE '1'
     END
   ) AS required_amount,
@@ -119,6 +126,7 @@ SELECT
 FROM public.deposit_vaults dv
 JOIN public.custody_vaults cv ON cv.id = dv.id
 LEFT JOIN public.market_order_quotes moq ON moq.order_id = cv.order_id
+LEFT JOIN public.limit_order_quotes loq ON loq.order_id = cv.order_id
 WHERE dv.id = $1::uuid
   AND dv.status = 'pending_funding'
   AND dv.created_at >= $2
@@ -159,6 +167,7 @@ SELECT
   '115792089237316195423570985008687907853269984665640564039457584007913129639935' AS max_amount,
   COALESCE(
     moq.amount_in,
+    loq.input_amount,
     CASE
       WHEN dv.action->>'type' = 'market_order'
         AND dv.action->'payload'->>'kind' = 'exact_in'
@@ -166,6 +175,8 @@ SELECT
       WHEN dv.action->>'type' = 'market_order'
         AND dv.action->'payload'->>'kind' = 'exact_out'
         THEN dv.action->'payload'->>'max_amount_in'
+      WHEN dv.action->>'type' = 'limit_order'
+        THEN dv.action->'payload'->>'input_amount'
       ELSE '1'
     END
   ) AS required_amount,
@@ -175,6 +186,7 @@ SELECT
 FROM public.deposit_vaults dv
 JOIN public.custody_vaults cv ON cv.id = dv.id
 LEFT JOIN public.market_order_quotes moq ON moq.order_id = cv.order_id
+LEFT JOIN public.limit_order_quotes loq ON loq.order_id = cv.order_id
 WHERE cv.order_id = $1::uuid
   AND dv.status = 'pending_funding'
   AND dv.created_at >= $2

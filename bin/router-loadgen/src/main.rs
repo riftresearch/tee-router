@@ -152,6 +152,38 @@ const RANDOM_LIMIT_ROUTES: &[RandomLimitRoute] = &[
         LimitAsset::Btc,
         LimitAsset::Usdc,
     ),
+    RandomLimitRoute::new(
+        "Ethereum.ETH",
+        "Base.USDC",
+        RandomAddressKind::Evm,
+        RandomAddressKind::Evm,
+        LimitAsset::Eth,
+        LimitAsset::Usdc,
+    ),
+    RandomLimitRoute::new(
+        "Ethereum.ETH",
+        "Arbitrum.USDC",
+        RandomAddressKind::Evm,
+        RandomAddressKind::Evm,
+        LimitAsset::Eth,
+        LimitAsset::Usdc,
+    ),
+    RandomLimitRoute::new(
+        "Base.USDC",
+        "Ethereum.ETH",
+        RandomAddressKind::Evm,
+        RandomAddressKind::Evm,
+        LimitAsset::Usdc,
+        LimitAsset::Eth,
+    ),
+    RandomLimitRoute::new(
+        "Arbitrum.USDC",
+        "Ethereum.ETH",
+        RandomAddressKind::Evm,
+        RandomAddressKind::Evm,
+        LimitAsset::Usdc,
+        LimitAsset::Eth,
+    ),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +252,7 @@ enum RandomAddressKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LimitAsset {
     Btc,
+    Eth,
     Usdc,
 }
 
@@ -1131,9 +1164,11 @@ fn marketable_limit_amounts(
 ) -> Result<(String, String)> {
     let input = asset_amount_for_notional(route.input_asset, notional_usdc_raw)?;
     let fair_output = asset_amount_for_notional(route.output_asset, notional_usdc_raw)?;
+    // Keep random limit orders deliberately marketable after the router adds
+    // downstream gas-retention amounts to the venue leg. Resting-order tests
+    // should use explicit amounts instead of random loadgen mode.
     let output = fair_output
-        .saturating_mul(U256::from(4_u64))
-        .checked_div(U256::from(5_u64))
+        .checked_div(U256::from(2_u64))
         .ok_or_else(|| eyre!("failed to compute limit output amount"))?;
     if input.is_zero() || output.is_zero() {
         return Err(eyre!("random limit amounts resolved to zero"));
@@ -1148,6 +1183,10 @@ fn asset_amount_for_notional(asset: LimitAsset, usdc_raw: u64) -> Result<U256> {
             .checked_mul(U256::from(100_u64))
             .and_then(|value| value.checked_div(U256::from(60_000_u64)))
             .ok_or_else(|| eyre!("failed to compute BTC notional amount"))?,
+        LimitAsset::Eth => U256::from(usdc_raw)
+            .checked_mul(U256::from(1_000_000_000_000_u64))
+            .and_then(|value| value.checked_div(U256::from(3_000_u64)))
+            .ok_or_else(|| eyre!("failed to compute ETH notional amount"))?,
     };
     Ok(amount)
 }
@@ -1253,4 +1292,27 @@ fn parse_key_value(raw: &str) -> Result<(String, String), String> {
         return Err("expected non-empty KEY=VALUE".to_string());
     }
     Ok((key.to_string(), value.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn random_limit_amounts_are_aggressively_marketable() {
+        let route = RandomLimitRoute::new(
+            "Bitcoin.BTC",
+            "Ethereum.USDC",
+            RandomAddressKind::Bitcoin,
+            RandomAddressKind::Evm,
+            LimitAsset::Btc,
+            LimitAsset::Usdc,
+        );
+
+        let (from_amount, to_amount) =
+            marketable_limit_amounts(route, 120_000_000).expect("limit amounts");
+
+        assert_eq!(from_amount, "200000");
+        assert_eq!(to_amount, "60000000");
+    }
 }

@@ -664,6 +664,8 @@ fn exact_out_cap_for_asset(asset: &DepositAsset) -> &'static str {
         ("bitcoin", AssetId::Native) => "10000000000000",
         ("evm:1" | "evm:8453", AssetId::Native) => "1000000000000000000000",
         ("hyperliquid", AssetId::Native) => "1000000000000000",
+        ("hyperliquid", AssetId::Reference(symbol)) if symbol == "UETH" => "1000000000000000000000",
+        ("hyperliquid", AssetId::Reference(symbol)) if symbol == "UBTC" => "10000000000000",
         (_, AssetId::Reference(_)) => "1000000000000000",
         _ => "1000000000000000",
     }
@@ -674,4 +676,29 @@ fn parse_u256(field: &'static str, raw: &str) -> RouteMinimumResult<U256> {
         field,
         raw: raw.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::ChainId;
+
+    fn asset(chain: &str, asset: AssetId) -> DepositAsset {
+        DepositAsset {
+            chain: ChainId::parse(chain).unwrap(),
+            asset,
+        }
+    }
+
+    #[test]
+    fn exact_out_cap_uses_hyperliquid_venue_asset_decimals() {
+        assert_eq!(
+            exact_out_cap_for_asset(&asset("hyperliquid", AssetId::reference("UETH"))),
+            "1000000000000000000000"
+        );
+        assert_eq!(
+            exact_out_cap_for_asset(&asset("hyperliquid", AssetId::reference("UBTC"))),
+            "10000000000000"
+        );
+    }
 }

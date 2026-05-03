@@ -197,6 +197,46 @@ pub struct ProviderOperationStatusUpdateOutcome {
     pub order: RouterOrder,
 }
 
+#[derive(Debug, Clone)]
+struct ProviderOperationDestinationReadiness {
+    address: String,
+    asset: DepositAsset,
+    min_amount_out: U256,
+    baseline_balance: Option<U256>,
+    current_balance: Option<U256>,
+}
+
+impl ProviderOperationDestinationReadiness {
+    fn credited_amount(&self) -> Option<U256> {
+        let current = self.current_balance?;
+        Some(match self.baseline_balance {
+            Some(baseline) => current.saturating_sub(baseline),
+            None => current,
+        })
+    }
+
+    fn is_ready(&self) -> bool {
+        self.credited_amount()
+            .map(|credited| credited >= self.min_amount_out)
+            .unwrap_or(false)
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "address": self.address,
+            "asset": {
+                "chain": self.asset.chain.as_str(),
+                "asset": self.asset.asset.as_str(),
+            },
+            "min_amount_out": self.min_amount_out.to_string(),
+            "baseline_balance": self.baseline_balance.map(|value| value.to_string()),
+            "current_balance": self.current_balance.map(|value| value.to_string()),
+            "credited_amount": self.credited_amount().map(|value| value.to_string()),
+            "ready": self.is_ready(),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderExecutionCrashPoint {
     AfterStepMarkedFailed,
@@ -4785,9 +4825,11 @@ impl OrderExecutionManager {
 
     pub async fn apply_provider_operation_status_update(
         &self,
-        update: ProviderOperationStatusUpdate,
+        mut update: ProviderOperationStatusUpdate,
     ) -> OrderExecutionResult<ProviderOperationStatusUpdateOutcome> {
         let existing = self.load_status_update_provider_operation(&update).await?;
+        self.normalize_provider_operation_status_update(&existing, &mut update)
+            .await?;
         let observed_state = json_object_or_wrapped(update.observed_state.clone());
         let response = update.response.clone().map(json_object_or_wrapped);
         let operation = self
@@ -4921,6 +4963,94 @@ impl OrderExecutionManager {
         }
 
         Ok(operation)
+    }
+
+    async fn normalize_provider_operation_status_update(
+        &self,
+        operation: &OrderProviderOperation,
+        update: &mut ProviderOperationStatusUpdate,
+    ) -> OrderExecutionResult<()> {
+        if operation.operation_type != ProviderOperationType::HyperliquidBridgeWithdrawal
+            || update.status != ProviderOperationStatus::Completed
+        {
+            return Ok(());
+        }
+
+        let readiness = self
+            .provider_operation_destination_readiness(operation)
+            .await?;
+        let mut observed_state = json_object_or_wrapped(update.observed_state.clone());
+        set_json_value(
+            &mut observed_state,
+            "router_destination_output_check",
+            readiness.to_json(),
+        );
+        update.observed_state = observed_state;
+
+        if readiness.is_ready() {
+            let response = update
+                .response
+                .clone()
+                .unwrap_or_else(|| operation.response.clone());
+            update.response = Some(response_with_destination_balance(response, &readiness));
+            return Ok(());
+        }
+
+        update.status = ProviderOperationStatus::WaitingExternal;
+        update.response = None;
+        update.tx_hash = None;
+        update.error = None;
+        Ok(())
+    }
+
+    async fn provider_operation_destination_readiness(
+        &self,
+        operation: &OrderProviderOperation,
+    ) -> OrderExecutionResult<ProviderOperationDestinationReadiness> {
+        let step_id = operation.execution_step_id.ok_or_else(|| {
+            OrderExecutionError::ProviderRequestFailed {
+                provider: operation.provider.clone(),
+                message: "hyperliquid bridge withdrawal operation is missing execution_step_id"
+                    .to_string(),
+            }
+        })?;
+        let step = self
+            .db
+            .orders()
+            .get_execution_step(step_id)
+            .await
+            .map_err(|source| OrderExecutionError::Database { source })?;
+        let asset = step.output_asset.clone().ok_or_else(|| {
+            OrderExecutionError::ProviderRequestFailed {
+                provider: operation.provider.clone(),
+                message: format!(
+                    "hyperliquid bridge withdrawal step {} is missing output_asset",
+                    step.id
+                ),
+            }
+        })?;
+        let min_amount_out =
+            step_min_amount_out_raw(&step, &operation.provider)?.ok_or_else(|| {
+                OrderExecutionError::ProviderRequestFailed {
+                    provider: operation.provider.clone(),
+                    message: format!(
+                        "hyperliquid bridge withdrawal step {} is missing min_amount_out",
+                        step.id
+                    ),
+                }
+            })?;
+        let address = provider_operation_destination_address(operation, &step)?;
+        let baseline_balance =
+            destination_balance_observation_before(&operation.response, &asset, &address);
+        let current_balance = self.observed_balance_for_asset(&asset, &address).await?;
+
+        Ok(ProviderOperationDestinationReadiness {
+            address,
+            asset,
+            min_amount_out,
+            baseline_balance,
+            current_balance,
+        })
     }
 
     async fn apply_provider_status_update_to_step(
@@ -7395,6 +7525,183 @@ fn uuid_from_json_field(value: &Value, key: &str) -> Option<Uuid> {
         .and_then(|raw| Uuid::parse_str(raw).ok())
 }
 
+fn provider_operation_destination_address(
+    operation: &OrderProviderOperation,
+    step: &OrderExecutionStep,
+) -> OrderExecutionResult<String> {
+    destination_balance_observation_address(&operation.response)
+        .or_else(|| {
+            operation
+                .request
+                .get("recipient_address")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(ToString::to_string)
+        })
+        .or_else(|| {
+            step.request
+                .get("recipient_address")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(ToString::to_string)
+        })
+        .ok_or_else(|| OrderExecutionError::ProviderRequestFailed {
+            provider: operation.provider.clone(),
+            message: format!(
+                "hyperliquid bridge withdrawal operation {} is missing recipient_address",
+                operation.id
+            ),
+        })
+}
+
+fn destination_balance_observation_address(response: &Value) -> Option<String> {
+    destination_balance_observation_probe(response)
+        .and_then(|probe| probe.get("address"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string)
+}
+
+fn destination_balance_observation_before(
+    response: &Value,
+    asset: &DepositAsset,
+    address: &str,
+) -> Option<U256> {
+    destination_balance_observation_probe(response)
+        .filter(|probe| {
+            probe
+                .get("address")
+                .and_then(Value::as_str)
+                .map(|observed| observed.eq_ignore_ascii_case(address))
+                .unwrap_or(false)
+        })
+        .filter(|probe| {
+            balance_observation_probe_asset(probe)
+                .as_ref()
+                .map(|observed| observed == asset)
+                .unwrap_or(false)
+        })
+        .and_then(|probe| u256_from_json_string(probe, "before"))
+}
+
+fn destination_balance_observation_probe(response: &Value) -> Option<&Value> {
+    response
+        .get("balance_observation")
+        .and_then(|value| value.get("probes"))
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|probe| probe.get("role").and_then(Value::as_str) == Some("destination"))
+}
+
+fn balance_observation_probe_asset(probe: &Value) -> Option<DepositAsset> {
+    let asset = probe.get("asset")?;
+    Some(DepositAsset {
+        chain: ChainId::parse(asset.get("chain").and_then(Value::as_str)?).ok()?,
+        asset: AssetId::parse(asset.get("asset").and_then(Value::as_str)?).ok()?,
+    })
+}
+
+fn u256_from_json_string(value: &Value, key: &str) -> Option<U256> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .and_then(|raw| U256::from_str(raw).ok())
+}
+
+fn response_with_destination_balance(
+    mut response: Value,
+    readiness: &ProviderOperationDestinationReadiness,
+) -> Value {
+    let Some(probes) = response
+        .get_mut("balance_observation")
+        .and_then(|value| value.get_mut("probes"))
+        .and_then(Value::as_array_mut)
+    else {
+        return response;
+    };
+
+    let credit_delta = destination_credit_delta_for_response(readiness);
+    let mut updated_probe = false;
+    for probe in probes.iter_mut() {
+        if probe.get("role").and_then(Value::as_str) != Some("destination") {
+            continue;
+        }
+        let Some(probe_asset) = balance_observation_probe_asset(probe) else {
+            continue;
+        };
+        if probe_asset != readiness.asset {
+            continue;
+        }
+        let Some(probe_address) = probe.get("address").and_then(Value::as_str) else {
+            continue;
+        };
+        if !probe_address.eq_ignore_ascii_case(&readiness.address) {
+            continue;
+        }
+
+        updated_probe = true;
+        set_json_value(
+            probe,
+            "before",
+            readiness
+                .baseline_balance
+                .map(|value| json!(value.to_string()))
+                .unwrap_or(Value::Null),
+        );
+        set_json_value(
+            probe,
+            "after",
+            readiness
+                .current_balance
+                .map(|value| json!(value.to_string()))
+                .unwrap_or(Value::Null),
+        );
+        set_json_value(
+            probe,
+            "credit_delta",
+            credit_delta
+                .map(|value| json!(value.to_string()))
+                .unwrap_or(Value::Null),
+        );
+        set_json_value(
+            probe,
+            "observable",
+            json!(readiness.baseline_balance.is_some() && readiness.current_balance.is_some()),
+        );
+    }
+
+    if !updated_probe {
+        probes.push(json!({
+            "role": "destination",
+            "vault_id": null,
+            "address": &readiness.address,
+            "asset": {
+                "chain": readiness.asset.chain.as_str(),
+                "asset": readiness.asset.asset.as_str(),
+            },
+            "observable": readiness.baseline_balance.is_some() && readiness.current_balance.is_some(),
+            "before": readiness.baseline_balance.map(|value| value.to_string()),
+            "after": readiness.current_balance.map(|value| value.to_string()),
+            "credit_delta": credit_delta.map(|value| value.to_string()),
+            "debit_delta": null,
+        }));
+    }
+
+    response
+}
+
+fn destination_credit_delta_for_response(
+    readiness: &ProviderOperationDestinationReadiness,
+) -> Option<U256> {
+    if readiness.baseline_balance.is_some() {
+        return readiness.credited_amount();
+    }
+    if readiness.is_ready() {
+        return Some(readiness.min_amount_out);
+    }
+    readiness.credited_amount()
+}
+
 fn step_min_amount_out_raw(
     step: &OrderExecutionStep,
     provider: &str,
@@ -7947,7 +8254,11 @@ fn bump_hyperliquid_prefund_amount(
     provider: &str,
 ) -> OrderExecutionResult<()> {
     let CustodyAction::Call(ChainCall::Hyperliquid(HyperliquidCall {
-        payload: HyperliquidCallPayload::UsdClassTransfer { amount, .. },
+        payload:
+            HyperliquidCallPayload::UsdClassTransfer {
+                amount,
+                to_perp: false,
+            },
         ..
     })) = action
     else {
@@ -8453,6 +8764,22 @@ mod tests {
         }
     }
 
+    fn test_hyperliquid_action(payload: HyperliquidCallPayload) -> CustodyAction {
+        CustodyAction::Call(ChainCall::Hyperliquid(HyperliquidCall {
+            target_base_url: "http://hyperliquid.test".to_string(),
+            network: HyperliquidCallNetwork::Testnet,
+            vault_address: None,
+            payload,
+        }))
+    }
+
+    fn hyperliquid_payload(action: &PreparedCustodyAction) -> &HyperliquidCallPayload {
+        let CustodyAction::Call(ChainCall::Hyperliquid(call)) = &action.action else {
+            panic!("expected hyperliquid custody action");
+        };
+        &call.payload
+    }
+
     #[test]
     fn runtime_custody_validator_accepts_supported_across_to_unit_route() {
         let order_id = Uuid::now_v7();
@@ -8521,6 +8848,89 @@ mod tests {
             )
             .expect("supported route should validate");
         }
+    }
+
+    #[test]
+    fn hyperliquid_retention_does_not_bump_spot_to_perp_withdrawal_prefund() {
+        let prepared = prepare_custody_actions_with_retention(
+            vec![
+                test_hyperliquid_action(HyperliquidCallPayload::UsdClassTransfer {
+                    amount: "189.35072".to_string(),
+                    to_perp: true,
+                }),
+                test_hyperliquid_action(HyperliquidCallPayload::Withdraw3 {
+                    destination: "0x1111111111111111111111111111111111111111".to_string(),
+                    amount: "189.35072".to_string(),
+                }),
+            ],
+            vec![PlannedRetentionAction::HyperliquidSpotSend {
+                destination: "0x2222222222222222222222222222222222222222".to_string(),
+                token: "USDC".to_string(),
+                raw_amount: U256::from(30_214_125_u64),
+                decimals: 6,
+            }],
+            "hyperliquid_bridge",
+        )
+        .expect("prepare actions");
+
+        assert_eq!(prepared.provider_action_count, 2);
+        assert_eq!(prepared.actions.len(), 3);
+        assert!(prepared.actions[0].provider_action);
+        assert!(!prepared.actions[1].provider_action);
+        assert!(prepared.actions[2].provider_action);
+        assert_eq!(
+            hyperliquid_payload(&prepared.actions[0]),
+            &HyperliquidCallPayload::UsdClassTransfer {
+                amount: "189.35072".to_string(),
+                to_perp: true,
+            }
+        );
+        assert_eq!(
+            hyperliquid_payload(&prepared.actions[1]),
+            &HyperliquidCallPayload::SpotSend {
+                destination: "0x2222222222222222222222222222222222222222".to_string(),
+                token: "USDC".to_string(),
+                amount: "30.214125".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn hyperliquid_retention_bumps_perp_to_spot_trade_prefund() {
+        let prepared = prepare_custody_actions_with_retention(
+            vec![test_hyperliquid_action(
+                HyperliquidCallPayload::UsdClassTransfer {
+                    amount: "189.35072".to_string(),
+                    to_perp: false,
+                },
+            )],
+            vec![PlannedRetentionAction::HyperliquidSpotSend {
+                destination: "0x2222222222222222222222222222222222222222".to_string(),
+                token: "USDC".to_string(),
+                raw_amount: U256::from(30_214_125_u64),
+                decimals: 6,
+            }],
+            "hyperliquid",
+        )
+        .expect("prepare actions");
+
+        assert_eq!(prepared.provider_action_count, 1);
+        assert_eq!(prepared.actions.len(), 2);
+        assert_eq!(
+            hyperliquid_payload(&prepared.actions[0]),
+            &HyperliquidCallPayload::UsdClassTransfer {
+                amount: "219.564845".to_string(),
+                to_perp: false,
+            }
+        );
+        assert_eq!(
+            hyperliquid_payload(&prepared.actions[1]),
+            &HyperliquidCallPayload::SpotSend {
+                destination: "0x2222222222222222222222222222222222222222".to_string(),
+                token: "USDC".to_string(),
+                amount: "30.214125".to_string(),
+            }
+        );
     }
 
     #[test]

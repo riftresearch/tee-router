@@ -46,23 +46,25 @@ configs:
         fi
       fi
 
-      psql -v ON_ERROR_STOP=1 "$${REPLICA_ADMIN_CONN}" <<-SQL
-        SELECT pg_terminate_backend(active_pid)
-        FROM pg_catalog.pg_replication_slots
-        WHERE database = 'router_db'
-          AND active_pid IS NOT NULL;
-      SQL
+      for attempt in $$(seq 1 20); do
+        psql -v ON_ERROR_STOP=1 "$${REPLICA_ADMIN_CONN}" \
+          -c "SELECT pg_terminate_backend(active_pid) FROM pg_catalog.pg_replication_slots WHERE database = 'router_db' AND active_pid IS NOT NULL;" \
+          -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_catalog.pg_replication_slots WHERE database = 'router_db' AND active_pid IS NULL;"
 
-      sleep 1
+        REMAINING_SLOTS=$$(psql "$${REPLICA_ADMIN_CONN}" -tAc "SELECT COUNT(*) FROM pg_catalog.pg_replication_slots WHERE database = 'router_db';")
+        if [ "$${REMAINING_SLOTS}" -eq "0" ]; then
+          break
+        fi
+        if [ "$${attempt}" -eq "20" ]; then
+          echo "timed out waiting for local replica replication slots to close" >&2
+          exit 3
+        fi
+        sleep 0.2
+      done
 
-      psql -v ON_ERROR_STOP=1 "$${REPLICA_ADMIN_CONN}" <<-SQL
-        SELECT pg_drop_replication_slot(slot_name)
-        FROM pg_catalog.pg_replication_slots
-        WHERE database = 'router_db';
-
-        DROP DATABASE IF EXISTS router_db WITH (FORCE);
-        CREATE DATABASE router_db;
-      SQL
+      psql -v ON_ERROR_STOP=1 "$${REPLICA_ADMIN_CONN}" \
+        -c "DROP DATABASE IF EXISTS router_db WITH (FORCE);" \
+        -c "CREATE DATABASE router_db;"
 
       psql "$${PRIMARY_ADMIN_CONN}" -c "SELECT pg_terminate_backend(active_pid) FROM pg_catalog.pg_replication_slots WHERE slot_name = 'router_local_subscription' AND active_pid IS NOT NULL;"
       SLOT_EXISTS=$$(psql "$${PRIMARY_ADMIN_CONN}" -tAc "SELECT COUNT(*) FROM pg_replication_slots WHERE slot_name = 'router_local_subscription';")
@@ -76,12 +78,7 @@ configs:
       ROUTER_CDC_TABLES="public.router_orders, public.market_order_quotes, public.market_order_actions, public.order_execution_legs, public.order_execution_steps, public.order_provider_operations, public.order_provider_addresses, public.deposit_vaults, public.custody_vaults"
       psql "$${REPLICA_DB_CONN}" -c "CREATE PUBLICATION router_cdc_publication FOR TABLE $${ROUTER_CDC_TABLES};"
 
-      psql "$${REPLICA_DB_CONN}" <<-SQL
-        CREATE SUBSCRIPTION router_local_subscription
-          CONNECTION 'host=router-postgres port=5432 dbname=router_db user=replicator password=replicator sslmode=disable'
-          PUBLICATION router_all_tables
-          WITH (copy_data = true, create_slot = true);
-      SQL
+      psql "$${REPLICA_DB_CONN}" -c "CREATE SUBSCRIPTION router_local_subscription CONNECTION 'host=router-postgres port=5432 dbname=router_db user=replicator password=replicator sslmode=disable' PUBLICATION router_all_tables WITH (copy_data = true, create_slot = true);"
 
       echo "local router replica is ready"
 

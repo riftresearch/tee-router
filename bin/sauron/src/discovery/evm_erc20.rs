@@ -17,7 +17,9 @@ use alloy::{
 };
 use async_trait::async_trait;
 use chrono::Utc;
-use evm_token_indexer_client::{DepositCandidate, TokenIndexerClient, TokenIndexerWatch};
+use evm_token_indexer_client::{
+    DepositCandidate, TokenIndexerClient, TokenIndexerWatch, TransferEvent,
+};
 use metrics::{counter, histogram};
 use router_primitives::{ChainType, TokenIdentifier};
 use snafu::ResultExt;
@@ -41,6 +43,7 @@ sol! {
 const EVM_REORG_RESCAN_DEPTH: u64 = 32;
 const EVM_MAX_LOG_SCAN_BLOCK_SPAN: u64 = 128;
 const EVM_REQUIRED_CONFIRMATION_BLOCKS: u64 = 1;
+const EVM_INDEXED_LOOKUP_RPC_BACKFILL_BLOCKS: u64 = 256;
 const EVM_RPC_MAX_ATTEMPTS: usize = 5;
 const EVM_RPC_RETRY_BASE_DELAY_MILLIS: u64 = 250;
 const EVM_RPC_RETRY_MAX_DELAY_MILLIS: u64 = 5_000;
@@ -372,6 +375,148 @@ impl EvmErc20DiscoveryBackend {
         }))
     }
 
+    fn detected_from_indexer_transfer(
+        &self,
+        watch: &WatchEntry,
+        token_address: Address,
+        deposit_address: Address,
+        confirmed_tip_height: u64,
+        transfer: TransferEvent,
+    ) -> Result<Option<DetectedDeposit>> {
+        if transfer.to != deposit_address {
+            return Ok(None);
+        }
+        if transfer.token_address != Some(token_address) {
+            return Ok(None);
+        }
+        let Some(transfer_index) = transfer.log_index else {
+            return Ok(None);
+        };
+        let amount = U256::from_str_radix(&transfer.amount, 10).map_err(|error| {
+            crate::error::Error::InvalidWatchRow {
+                message: format!(
+                    "{} indexed transfer {} had invalid amount {}: {}",
+                    self.name, transfer.id, transfer.amount, error
+                ),
+            }
+        })?;
+        if amount < watch.min_amount || amount > watch.max_amount {
+            return Ok(None);
+        }
+        let block_height = transfer.block_number.parse::<u64>().map_err(|error| {
+            crate::error::Error::InvalidWatchRow {
+                message: format!(
+                    "{} indexed transfer {} had invalid block_number {}: {}",
+                    self.name, transfer.id, transfer.block_number, error
+                ),
+            }
+        })?;
+        if block_height > confirmed_tip_height {
+            return Ok(None);
+        }
+
+        Ok(Some(DetectedDeposit {
+            watch_target: watch.watch_target,
+            watch_id: watch.watch_id,
+            source_chain: self.chain_type,
+            source_token: watch.source_token.clone(),
+            address: watch.address.clone(),
+            tx_hash: transfer.transaction_hash.to_string(),
+            transfer_index,
+            amount,
+            confirmation_state: DepositConfirmationState::Confirmed,
+            block_height: Some(block_height),
+            block_hash: Some(transfer.block_hash.to_string()),
+            observed_at: Utc::now(),
+            indexer_candidate_id: None,
+        }))
+    }
+
+    async fn rpc_indexed_lookup_erc20_transfer(
+        &self,
+        watch: &WatchEntry,
+        token_address: Address,
+        confirmed_tip_height: u64,
+    ) -> Result<Option<DetectedDeposit>> {
+        if confirmed_tip_height == 0 {
+            return Ok(None);
+        }
+        let recipient = match Address::from_str(&watch.address) {
+            Ok(address) => address,
+            Err(error) => {
+                warn!(
+                    backend = self.name,
+                    watch_id = %watch.watch_id,
+                    address = %watch.address,
+                    %error,
+                    "Skipping invalid EVM watch address during RPC indexed lookup"
+                );
+                return Ok(None);
+            }
+        };
+        let from_height = confirmed_tip_height
+            .saturating_sub(EVM_INDEXED_LOOKUP_RPC_BACKFILL_BLOCKS)
+            .max(1);
+        let filter = Filter::new()
+            .address(token_address)
+            .event_signature(self.transfer_signature)
+            .from_block(from_height)
+            .to_block(confirmed_tip_height);
+        let logs = self
+            .rpc_call("eth_getLogs", || self.provider.get_logs(&filter))
+            .await
+            .map_err(|source| crate::error::Error::EvmLogScan {
+                from_height,
+                to_height: confirmed_tip_height,
+                source,
+            })?;
+
+        let mut best = None;
+        for log in logs {
+            if log.removed {
+                continue;
+            }
+            let Ok(decoded) = log.log_decode::<Transfer>() else {
+                continue;
+            };
+            if decoded.address() != token_address || decoded.inner.data.to != recipient {
+                continue;
+            }
+            let Some(transaction_hash) = decoded.transaction_hash else {
+                continue;
+            };
+            let Some(transfer_index) = decoded.log_index else {
+                continue;
+            };
+            if decoded.inner.data.value < watch.min_amount
+                || decoded.inner.data.value > watch.max_amount
+            {
+                continue;
+            }
+
+            let detected = DetectedDeposit {
+                watch_target: watch.watch_target,
+                watch_id: watch.watch_id,
+                source_chain: self.chain_type,
+                source_token: watch.source_token.clone(),
+                address: watch.address.clone(),
+                tx_hash: transaction_hash.to_string(),
+                transfer_index,
+                amount: decoded.inner.data.value,
+                confirmation_state: DepositConfirmationState::Confirmed,
+                block_height: decoded.block_number,
+                block_hash: decoded.block_hash.map(|hash| alloy::hex::encode(hash)),
+                observed_at: Utc::now(),
+                indexer_candidate_id: None,
+            };
+            if should_replace_detected(best.as_ref(), &detected) {
+                best = Some(detected);
+            }
+        }
+
+        Ok(best)
+    }
+
     async fn rpc_call<T, F, Fut>(
         &self,
         method: &'static str,
@@ -568,8 +713,61 @@ impl DiscoveryBackend for EvmErc20DiscoveryBackend {
         Ok(())
     }
 
-    async fn indexed_lookup(&self, _watch: &WatchEntry) -> Result<Option<DetectedDeposit>> {
-        Ok(None)
+    async fn indexed_lookup(&self, watch: &WatchEntry) -> Result<Option<DetectedDeposit>> {
+        let Some(token_address) = self.watch_erc20_token_address(watch) else {
+            return Ok(None);
+        };
+        let deposit_address = match Address::from_str(&watch.address) {
+            Ok(address) => address,
+            Err(error) => {
+                warn!(
+                    backend = self.name,
+                    watch_id = %watch.watch_id,
+                    address = %watch.address,
+                    %error,
+                    "Skipping invalid EVM watch address during indexed lookup"
+                );
+                return Ok(None);
+            }
+        };
+        let confirmed_tip_height = confirmed_tip_height(self.current_tip_cursor().await?.height);
+
+        let mut best = None;
+        if let Some(token_indexer) = &self.token_indexer {
+            let response = token_indexer
+                .get_transfers_to(
+                    deposit_address,
+                    Some(token_address),
+                    Some(1),
+                    Some(watch.min_amount),
+                )
+                .await
+                .context(EvmTokenIndexerSnafu)?;
+
+            for transfer in response.transfers {
+                let Some(detected) = self.detected_from_indexer_transfer(
+                    watch,
+                    token_address,
+                    deposit_address,
+                    confirmed_tip_height,
+                    transfer,
+                )?
+                else {
+                    continue;
+                };
+                if should_replace_detected(best.as_ref(), &detected) {
+                    best = Some(detected);
+                }
+            }
+        }
+
+        if best.is_none() {
+            best = self
+                .rpc_indexed_lookup_erc20_transfer(watch, token_address, confirmed_tip_height)
+                .await?;
+        }
+
+        Ok(best)
     }
 
     async fn current_cursor(&self) -> Result<BlockCursor> {
@@ -803,6 +1001,27 @@ fn timestamp_seconds(timestamp: chrono::DateTime<Utc>) -> i64 {
     timestamp.timestamp().max(0)
 }
 
+fn should_replace_detected(
+    existing: Option<&DetectedDeposit>,
+    candidate: &DetectedDeposit,
+) -> bool {
+    let candidate_order = (
+        candidate.block_height.unwrap_or(u64::MAX),
+        candidate.transfer_index,
+        candidate.tx_hash.as_str(),
+    );
+    existing
+        .map(|existing| {
+            candidate_order
+                < (
+                    existing.block_height.unwrap_or(u64::MAX),
+                    existing.transfer_index,
+                    existing.tx_hash.as_str(),
+                )
+        })
+        .unwrap_or(true)
+}
+
 fn evm_rpc_error_is_retryable(error: &EvmRpcError) -> bool {
     match error {
         RpcError::Transport(kind) => evm_transport_error_is_retryable(kind),
@@ -858,7 +1077,7 @@ mod tests {
         providers::{Provider, ProviderBuilder},
     };
     use chrono::{Duration, Utc};
-    use evm_token_indexer_client::DepositCandidate;
+    use evm_token_indexer_client::{DepositCandidate, TransferEvent};
     use router_primitives::{ChainType, TokenIdentifier};
     use uuid::Uuid;
 
@@ -1033,6 +1252,96 @@ mod tests {
             detected.indexer_candidate_id.as_deref(),
             Some("candidate-1")
         );
+    }
+
+    #[test]
+    fn maps_confirmed_indexer_transfer_to_detected_deposit() {
+        let backend = test_backend();
+        let token = address!("1111111111111111111111111111111111111111");
+        let recipient = address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let tx_hash = b256!("2222222222222222222222222222222222222222222222222222222222222222");
+        let watch = watch_entry(TokenIdentifier::address(token.to_string()), recipient);
+        let transfer = TransferEvent {
+            id: "transfer-1".to_string(),
+            amount: "42".to_string(),
+            timestamp: 1_700_000_000,
+            from: address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            to: recipient,
+            token_address: Some(token),
+            transaction_hash: tx_hash,
+            block_number: "100".to_string(),
+            block_hash: b256!("3333333333333333333333333333333333333333333333333333333333333333"),
+            log_index: Some(7),
+        };
+
+        let detected = backend
+            .detected_from_indexer_transfer(&watch, token, recipient, 100, transfer)
+            .expect("transfer should parse")
+            .expect("transfer should map");
+
+        assert_eq!(detected.watch_id, watch.watch_id);
+        assert_eq!(detected.watch_target, WatchTarget::FundingVault);
+        assert_eq!(detected.source_chain, ChainType::Base);
+        assert_eq!(
+            detected.source_token,
+            TokenIdentifier::address(token.to_string())
+        );
+        assert_eq!(detected.address, recipient.to_string());
+        assert_eq!(detected.tx_hash, tx_hash.to_string());
+        assert_eq!(detected.transfer_index, 7);
+        assert_eq!(detected.amount, U256::from(42_u64));
+        assert_eq!(detected.block_height, Some(100));
+        assert_eq!(
+            detected.block_hash.as_deref(),
+            Some("0x3333333333333333333333333333333333333333333333333333333333333333")
+        );
+        assert!(detected.indexer_candidate_id.is_none());
+    }
+
+    #[test]
+    fn indexed_transfer_mapper_requires_confirmed_matching_token_and_amount() {
+        let backend = test_backend();
+        let token = address!("1111111111111111111111111111111111111111");
+        let recipient = address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let watch = watch_entry(TokenIdentifier::address(token.to_string()), recipient);
+        let transfer = TransferEvent {
+            id: "transfer-1".to_string(),
+            amount: "42".to_string(),
+            timestamp: 1_700_000_000,
+            from: address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            to: recipient,
+            token_address: Some(address!("2222222222222222222222222222222222222222")),
+            transaction_hash: b256!(
+                "3333333333333333333333333333333333333333333333333333333333333333"
+            ),
+            block_number: "100".to_string(),
+            block_hash: b256!("4444444444444444444444444444444444444444444444444444444444444444"),
+            log_index: Some(7),
+        };
+
+        assert!(backend
+            .detected_from_indexer_transfer(&watch, token, recipient, 100, transfer.clone())
+            .expect("transfer should parse")
+            .is_none());
+
+        let unconfirmed = TransferEvent {
+            token_address: Some(token),
+            ..transfer.clone()
+        };
+        assert!(backend
+            .detected_from_indexer_transfer(&watch, token, recipient, 99, unconfirmed)
+            .expect("transfer should parse")
+            .is_none());
+
+        let too_large = TransferEvent {
+            token_address: Some(token),
+            amount: "1001".to_string(),
+            ..transfer
+        };
+        assert!(backend
+            .detected_from_indexer_transfer(&watch, token, recipient, 100, too_large)
+            .expect("transfer should parse")
+            .is_none());
     }
 
     fn test_backend() -> EvmErc20DiscoveryBackend {

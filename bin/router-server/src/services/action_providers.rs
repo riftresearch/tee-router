@@ -1969,7 +1969,7 @@ impl BridgeProvider for HyperliquidBridgeProvider {
                     observed_state: Some(json!({
                         "withdraw_tx_hash": receipt.tx_hash,
                     })),
-                    status: Some(ProviderOperationStatus::Completed),
+                    status: Some(ProviderOperationStatus::WaitingExternal),
                     ..ProviderExecutionStatePatch::default()
                 });
             }
@@ -1992,7 +1992,9 @@ impl BridgeProvider for HyperliquidBridgeProvider {
                 return Ok(Some(ProviderOperationObservation {
                     status: ProviderOperationStatus::Completed,
                     provider_ref: request.provider_ref.clone(),
-                    observed_state: request.observed_state.clone(),
+                    observed_state: json!({
+                        "withdraw_tx_hash": request.provider_ref.clone(),
+                    }),
                     response: Some(request.response.clone()),
                     tx_hash: request.provider_ref.clone(),
                     error: None,
