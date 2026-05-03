@@ -28,6 +28,17 @@ export type OrderExecutionStep = {
   response: unknown
   error: unknown
   usdValuation?: unknown
+  actionAddresses?: OrderExecutionActionAddresses
+}
+
+export type OrderExecutionAddress = {
+  address: string
+  chainId?: string
+}
+
+export type OrderExecutionActionAddresses = {
+  sender?: OrderExecutionAddress
+  recipient?: OrderExecutionAddress
 }
 
 export type OrderExecutionLeg = {
@@ -266,11 +277,113 @@ LEFT JOIN LATERAL (
       'request', s.request_json,
       'response', s.response_json,
       'error', s.error_json,
-      'usdValuation', s.usd_valuation_json
+      'usdValuation', s.usd_valuation_json,
+      'actionAddresses', jsonb_strip_nulls(jsonb_build_object(
+        'sender', CASE
+          WHEN sender_addr.address IS NULL THEN NULL
+          ELSE jsonb_strip_nulls(jsonb_build_object(
+            'address', sender_addr.address,
+            'chainId', sender_addr.chain_id
+          ))
+        END,
+        'recipient', CASE
+          WHEN recipient_addr.address IS NULL THEN NULL
+          ELSE jsonb_strip_nulls(jsonb_build_object(
+            'address', recipient_addr.address,
+            'chainId', recipient_addr.chain_id
+          ))
+        END
+      ))
     )
     ORDER BY s.step_index ASC, s.created_at ASC, s.id ASC
   ) AS execution_steps
   FROM public.order_execution_steps s
+  LEFT JOIN LATERAL (
+    SELECT cv.address, cv.chain_id
+    FROM public.custody_vaults cv
+    WHERE cv.id::text = COALESCE(
+      NULLIF(s.request_json->>'source_custody_vault_id', ''),
+      NULLIF(s.details_json->>'source_custody_vault_id', ''),
+      NULLIF(s.request_json->>'depositor_custody_vault_id', ''),
+      NULLIF(s.details_json->>'depositor_custody_vault_id', ''),
+      NULLIF(s.request_json->>'hyperliquid_custody_vault_id', ''),
+      NULLIF(s.details_json->>'hyperliquid_custody_vault_id', '')
+    )
+    LIMIT 1
+  ) sender_vault ON true
+  LEFT JOIN LATERAL (
+    SELECT cv.address, cv.chain_id
+    FROM public.custody_vaults cv
+    WHERE cv.id::text = COALESCE(
+      NULLIF(s.request_json->>'recipient_custody_vault_id', ''),
+      NULLIF(s.details_json->>'recipient_custody_vault_id', ''),
+      NULLIF(s.request_json->>'destination_custody_vault_id', ''),
+      NULLIF(s.details_json->>'destination_custody_vault_id', ''),
+      NULLIF(s.details_json->>'custody_vault_id', ''),
+      NULLIF(s.details_json->>'vault_id', '')
+    )
+    LIMIT 1
+  ) recipient_vault ON true
+  LEFT JOIN LATERAL (
+    SELECT
+      COALESCE(
+        sender_vault.address,
+        NULLIF(s.request_json->>'source_custody_vault_address', ''),
+        NULLIF(s.details_json->>'source_custody_vault_address', ''),
+        NULLIF(s.request_json->>'depositor_custody_vault_address', ''),
+        NULLIF(s.details_json->>'depositor_custody_vault_address', ''),
+        NULLIF(s.request_json->>'hyperliquid_custody_vault_address', ''),
+        NULLIF(s.details_json->>'hyperliquid_custody_vault_address', ''),
+        NULLIF(s.response_json #>> '{provider_context,user}', ''),
+        NULLIF(s.response_json #>> '{observed_state,provider_observed_state,sourceAddress}', '')
+      ) AS address,
+      CASE
+        WHEN s.step_type IN ('hyperliquid_trade', 'unit_withdrawal') THEN 'hyperliquid'
+        ELSE COALESCE(
+          sender_vault.chain_id,
+          NULLIF(s.request_json->>'source_chain_id', ''),
+          NULLIF(s.request_json->>'src_chain_id', ''),
+          NULLIF(s.request_json->>'input_chain_id', ''),
+          s.input_chain_id
+        )
+      END AS chain_id
+  ) sender_addr ON true
+  LEFT JOIN LATERAL (
+    SELECT
+      COALESCE(
+        recipient_vault.address,
+        NULLIF(s.request_json->>'recipient_custody_vault_address', ''),
+        NULLIF(s.details_json->>'recipient_custody_vault_address', ''),
+        NULLIF(s.request_json->>'destination_custody_vault_address', ''),
+        NULLIF(s.details_json->>'destination_custody_vault_address', ''),
+        NULLIF(s.request_json->>'recipient_address', ''),
+        NULLIF(s.details_json->>'recipient_address', ''),
+        NULLIF(s.response_json #>> '{observed_state,provider_observed_state,destinationAddress}', ''),
+        NULLIF(s.response_json #>> '{observed_state,provider_observed_state,protocolAddress}', ''),
+        NULLIF(s.response_json->>'provider_ref', ''),
+        NULLIF(s.provider_ref, ''),
+        CASE
+          WHEN s.step_type = 'hyperliquid_bridge_deposit' THEN sender_addr.address
+          ELSE NULL
+        END,
+        CASE
+          WHEN s.step_type = 'hyperliquid_trade' THEN sender_addr.address
+          ELSE NULL
+        END
+      ) AS address,
+      CASE
+        WHEN s.step_type = 'unit_deposit' THEN COALESCE(s.input_chain_id, NULLIF(s.request_json->>'src_chain_id', ''))
+        WHEN s.step_type = 'hyperliquid_bridge_deposit' THEN 'hyperliquid'
+        WHEN s.step_type = 'hyperliquid_trade' THEN COALESCE(s.output_chain_id, 'hyperliquid')
+        ELSE COALESCE(
+          recipient_vault.chain_id,
+          NULLIF(s.request_json->>'dst_chain_id', ''),
+          NULLIF(s.request_json->>'destination_chain_id', ''),
+          NULLIF(s.request_json->>'output_chain_id', ''),
+          s.output_chain_id
+        )
+      END AS chain_id
+  ) recipient_addr ON true
   WHERE s.order_id = ro.id
 ) steps ON true
 LEFT JOIN LATERAL (

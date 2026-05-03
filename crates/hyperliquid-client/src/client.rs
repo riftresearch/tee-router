@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 
 use alloy::{
-    primitives::{Address, Signature},
+    primitives::{Address, Signature, B256},
     signers::local::PrivateKeySigner,
 };
 use reqwest::Client;
@@ -394,7 +394,8 @@ impl HyperliquidExchangeClient {
             nonce: timestamp,
             vault_address: self.vault_address,
         };
-        self.post_exchange(&envelope).await
+        let response = self.post_exchange(&envelope).await?;
+        Ok(attach_exchange_hash(response, connection_id))
     }
 
     async fn post_exchange(&self, payload: &ExchangePayload) -> Result<serde_json::Value, Error> {
@@ -402,6 +403,15 @@ impl HyperliquidExchangeClient {
         let text = self.http.post_raw("/exchange", &body).await?;
         serde_json::from_str(&text).map_err(|source| Error::Json { source })
     }
+}
+
+fn attach_exchange_hash(mut response: serde_json::Value, connection_id: B256) -> serde_json::Value {
+    if let Some(object) = response.as_object_mut() {
+        object
+            .entry("hash")
+            .or_insert_with(|| serde_json::Value::String(format!("{connection_id:#x}")));
+    }
+    response
 }
 
 /// Small helper for Hyperliquid Bridge2 deposit construction. No wallet is
@@ -723,5 +733,22 @@ mod tests {
         let client = HyperliquidBridgeClient::new(from, Network::Testnet);
         assert_eq!(client.from(), from);
         assert_eq!(client.bridge_address(), bridge::TESTNET_BRIDGE2_ADDRESS);
+    }
+
+    #[test]
+    fn attach_exchange_hash_adds_explorer_hash_without_touching_response() {
+        let connection_id = B256::repeat_byte(0x12);
+        let response = serde_json::json!({
+            "status": "ok",
+            "response": {
+                "type": "order"
+            }
+        });
+
+        let response = attach_exchange_hash(response, connection_id);
+
+        assert_eq!(response["status"], "ok");
+        assert_eq!(response["response"]["type"], "order");
+        assert_eq!(response["hash"], format!("{connection_id:#x}"));
     }
 }

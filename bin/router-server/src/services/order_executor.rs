@@ -994,6 +994,21 @@ impl OrderExecutionManager {
             .create_execution_steps_idempotent(&retry_steps)
             .await
             .map_err(|source| OrderExecutionError::Database { source })?;
+
+        let mut refreshed_leg_ids = std::collections::BTreeSet::new();
+        for step in &retry_steps {
+            if let Some(execution_leg_id) = step.execution_leg_id {
+                if refreshed_leg_ids.insert(execution_leg_id) {
+                    let _ = self
+                        .db
+                        .orders()
+                        .refresh_execution_leg_from_actions(execution_leg_id)
+                        .await
+                        .map_err(|source| OrderExecutionError::Database { source })?;
+                }
+            }
+        }
+
         let _ = self
             .db
             .orders()
@@ -6883,6 +6898,8 @@ fn refund_transition_unit_withdrawal_step(
         provider_ref: None,
         request: json!({
             "order_id": order.id,
+            "input_chain_id": transition.input.asset.chain.as_str(),
+            "input_asset": transition.input.asset.asset.as_str(),
             "dst_chain_id": transition.output.asset.chain.as_str(),
             "asset_id": transition.output.asset.asset.as_str(),
             "amount": amount_out,

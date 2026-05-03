@@ -50,6 +50,17 @@ export type OrderExecutionStep = {
   response: unknown
   error: unknown
   usdValuation?: UsdValuation
+  actionAddresses?: OrderExecutionActionAddresses
+}
+
+export type OrderExecutionAddress = {
+  address: string
+  chainId?: string
+}
+
+export type OrderExecutionActionAddresses = {
+  sender?: OrderExecutionAddress
+  recipient?: OrderExecutionAddress
 }
 
 export type OrderExecutionLeg = {

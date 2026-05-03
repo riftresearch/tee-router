@@ -27,6 +27,7 @@ use hyperliquid_client::{
     client::Network as HyperliquidApiNetwork,
     info::{
         ClearinghouseState, L2BookSnapshot, L2Level, OrderStatusResponse, SpotClearinghouseState,
+        UserFill,
     },
     meta::{SpotMeta, TokenInfo, SPOT_ASSET_INDEX_OFFSET},
     HttpClient as HyperliquidHttpClient,
@@ -1365,12 +1366,20 @@ impl UnitProvider for HyperUnitProvider {
                 chain: dst_chain_id.clone(),
                 asset: dest_asset_id,
             };
+            let input_chain_id = ChainId::parse(&step.input_chain_id)
+                .map_err(|err| format!("invalid input_chain_id: {err}"))?;
+            let input_asset_id = AssetId::parse(&step.input_asset)
+                .map_err(|err| format!("invalid input_asset: {err}"))?;
+            let hyperliquid_asset = DepositAsset {
+                chain: input_chain_id,
+                asset: input_asset_id,
+            };
 
             let dst_unit_chain = self.resolve_unit_chain(&dst_chain_id)?;
             let unit_asset = self
                 .resolve_unit_asset(&destination_asset, ProviderAssetCapability::UnitWithdrawal)?;
             let (hl_symbol, hl_decimals) = self.resolve_hl_spot_token(
-                &destination_asset,
+                &hyperliquid_asset,
                 ProviderAssetCapability::ExchangeInput,
             )?;
             let hl_token = self
@@ -2789,6 +2798,8 @@ impl UnitDepositStepRequest {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct UnitWithdrawalStepRequest {
     pub order_id: Uuid,
+    pub input_chain_id: String,
+    pub input_asset: String,
     pub dst_chain_id: String,
     pub asset_id: String,
     pub amount: String,
@@ -4158,7 +4169,12 @@ impl ExchangeProvider for HyperliquidProvider {
                         | "vaultWithdrawalCanceled" => ProviderOperationStatus::Failed,
                         _ => ProviderOperationStatus::WaitingExternal,
                     };
-                    (mapped, Some(format!("hl:oid:{oid}")))
+                    let tx_hash = if envelope_status == "filled" {
+                        self.hyperliquid_fill_hash_for_oid(user, oid).await?
+                    } else {
+                        None
+                    };
+                    (mapped, tx_hash)
                 }
             };
 
@@ -4171,6 +4187,29 @@ impl ExchangeProvider for HyperliquidProvider {
                 error: None,
             }))
         })
+    }
+}
+
+impl HyperliquidProvider {
+    async fn hyperliquid_fill_hash_for_oid(
+        &self,
+        user: Address,
+        oid: u64,
+    ) -> ProviderResult<Option<String>> {
+        let req = json!({
+            "type": "userFills",
+            "user": format!("{user:?}"),
+        });
+        let fills: Vec<UserFill> = self
+            .http
+            .post_json("/info", &req)
+            .await
+            .map_err(|err| format!("hyperliquid /info userFills: {err}"))?;
+
+        Ok(fills
+            .into_iter()
+            .find(|fill| fill.oid == oid && !fill.hash.is_empty())
+            .map(|fill| fill.hash))
     }
 }
 

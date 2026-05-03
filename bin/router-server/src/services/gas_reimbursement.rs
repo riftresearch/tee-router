@@ -270,7 +270,12 @@ fn settlement_candidates(
                     ProviderAssetCapability::ExchangeInput,
                 )
                 .map(|entry| entry.provider_asset.clone());
-            (provider_asset.is_some(), U256::ZERO, provider_asset)
+            (
+                provider_asset.is_some()
+                    && is_supported_settlement_canonical(chain_asset.canonical),
+                U256::ZERO,
+                provider_asset,
+            )
         } else if is_evm_chain(&asset.chain)
             && !asset.asset.is_native()
             && is_supported_settlement_canonical(chain_asset.canonical)

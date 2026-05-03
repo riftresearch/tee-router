@@ -183,10 +183,9 @@ pub struct CustodyActionRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CustodyActionReceipt {
     pub custody_vault_id: Uuid,
-    /// On-chain tx hash for EVM / Bitcoin / etc. For Hyperliquid — which has
-    /// no on-chain receipt — this is a synthetic handle derived from the HL
-    /// response (order id, withdraw nonce, …) so upstream code that indexes
-    /// receipts by tx_hash keeps working.
+    /// On-chain tx hash for EVM / Bitcoin / etc. For Hyperliquid this is the
+    /// L1 action hash when the client can derive it, otherwise a synthetic
+    /// fallback derived from the HL response.
     pub tx_hash: String,
     /// EVM logs emitted by the transaction, when the action produced them.
     /// Non-EVM-call actions (transfers, non-EVM chains) leave this empty.
@@ -1125,10 +1124,11 @@ fn parse_u256(field: &'static str, value: &str) -> CustodyActionResult<U256> {
 }
 
 /// Sign and submit a Hyperliquid action using the custody vault's derived EVM
-/// key. Returns `(tx_hash, response_body)` — HL has no on-chain tx, so
-/// `tx_hash` is a synthetic handle (first order id / withdraw nonce) that
-/// upstream indexers use as a primary key. The full response is forwarded so
-/// the provider's `post_execute` can derive richer observed state.
+/// key. Returns `(tx_hash, response_body)`. HL order actions expose a local
+/// action hash through the client response; when absent, we use a synthetic
+/// fallback so upstream receipt indexing still has a stable handle. The full
+/// response is forwarded so the provider's `post_execute` can derive richer
+/// observed state.
 async fn execute_hyperliquid_call(
     call: &HyperliquidCall,
     private_key: &str,
@@ -1234,10 +1234,14 @@ fn hyperliquid_action_error(response: &Value) -> Option<String> {
         .find_map(|status| status.get("error").map(Value::to_string))
 }
 
-/// HL's `/exchange` replies with a JSON envelope; we pick a stable string out
-/// of it to seed `CustodyActionReceipt::tx_hash`. Prefer order-ids / nonces
-/// over random uuids so that replayed ingest produces the same key.
+/// HL's `/exchange` replies with a JSON envelope; our client annotates L1
+/// action responses with the Hyperliquid action hash. Prefer that real
+/// explorer hash, then fall back to stable synthetic handles.
 fn synthesize_hyperliquid_tx_hash(payload: &HyperliquidCallPayload, response: &Value) -> String {
+    if let Some(hash) = response.get("hash").and_then(Value::as_str) {
+        return hash.to_string();
+    }
+
     // `{"status":"ok","response":{"type":"order","data":{"statuses":[{"resting":{"oid":123}}]}}}`
     if let Some(statuses) = response
         .pointer("/response/data/statuses")

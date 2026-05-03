@@ -1,5 +1,6 @@
 import {
   Activity,
+  ArrowRight,
   ChevronDown,
   ChevronRight,
   Check,
@@ -24,7 +25,6 @@ import type {
   OrderExecutionStep,
   OrderFirehoseRow,
   OrderMetrics,
-  ProviderOperation,
   UsdAmountValuation,
   UsdValuation
 } from './types'
@@ -34,12 +34,24 @@ type StreamState = 'idle' | 'connecting' | 'live' | 'closed' | 'error'
 const ORDER_LIMIT = 100
 const SHOW_USD_VALUES = true
 const WAIT_FOR_DEPOSIT_STEP_TYPE = 'wait_for_deposit'
+const ACTIVE_STEP_STATUSES = new Set(['ready', 'running', 'waiting', 'submitted'])
+const FAILED_STEP_STATUSES = new Set(['failed', 'cancelled'])
 const CHAIN_DISPLAY_NAMES: Record<string, string> = {
   bitcoin: 'Bitcoin',
   'evm:1': 'Ethereum',
   'evm:42161': 'Arbitrum',
   'evm:8453': 'Base',
   hyperliquid: 'Hyperliquid'
+}
+
+const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
+  across: 'Across',
+  cctp: 'CCTP',
+  hyperliquid: 'Hyperliquid',
+  internal: 'Funding',
+  unit: 'Unit',
+  universal_router: 'Uniswap',
+  velora: 'Velora'
 }
 
 const EVM_EXPLORER_BASE_URLS: Record<string, string> = {
@@ -70,7 +82,9 @@ const ASSET_DISPLAY_NAMES: Record<string, string> = {
   'evm:8453|0x833589fcd6edb6e08f4c7c32d4f71b54bda02913': 'USDC',
   'evm:8453|0xfde4c96c8593536e31f229ea8f37b2ada2699bb2': 'USDT',
   'evm:8453|0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf': 'cbBTC',
-  'hyperliquid|native': 'USDC'
+  'hyperliquid|native': 'USDC',
+  'hyperliquid|ubtc': 'BTC',
+  'hyperliquid|ueth': 'ETH'
 }
 
 const ASSET_DECIMALS: Record<string, number> = {
@@ -87,7 +101,9 @@ const ASSET_DECIMALS: Record<string, number> = {
   'evm:8453|0x833589fcd6edb6e08f4c7c32d4f71b54bda02913': 6,
   'evm:8453|0xfde4c96c8593536e31f229ea8f37b2ada2699bb2': 6,
   'evm:8453|0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf': 8,
-  'hyperliquid|native': 6
+  'hyperliquid|native': 6,
+  'hyperliquid|ubtc': 8,
+  'hyperliquid|ueth': 18
 }
 
 export function App() {
@@ -141,7 +157,7 @@ export function App() {
 
   const copyOrderId = useCallback(async (orderId: string) => {
     try {
-      await navigator.clipboard.writeText(orderId)
+      await copyTextToClipboard(orderId)
       setCopiedOrderId(orderId)
       if (copiedOrderTimeoutRef.current) {
         window.clearTimeout(copiedOrderTimeoutRef.current)
@@ -323,14 +339,9 @@ export function App() {
             value={metrics?.needsAttention ?? 0}
             tone={metrics?.needsAttention ? 'danger' : 'neutral'}
           />
-          <Metric
-            icon={<ShieldCheck size={18} />}
-            label="Admin Key"
-            value={Boolean(me.routerAdminKeyConfigured) ? 'Set' : 'Missing'}
-            tone={Boolean(me.routerAdminKeyConfigured) ? 'success' : 'warning'}
-          />
         </section>
 
+        {!me.routerAdminKeyConfigured ? <SystemDownToast /> : null}
         {error ? <div className="notice error">{error}</div> : null}
 
         <section className="orders-surface" aria-label="Orders">
@@ -495,6 +506,18 @@ function ConfigPanel({ missing }: { missing: string[] }) {
         </div>
       </section>
     </main>
+  )
+}
+
+function SystemDownToast() {
+  return (
+    <div className="system-toast" role="alert">
+      <CircleAlert size={17} />
+      <div>
+        <strong>System down</strong>
+        <span>Router admin API key is not configured.</span>
+      </div>
+    </div>
   )
 }
 
@@ -689,7 +712,7 @@ function CopyableOrderId({
         onCopy()
       }}
     >
-      <code className="mono compact-id">{shortId(orderId)}</code>
+      <code className="mono compact-id">{shortOrderId(orderId)}</code>
       <Icon size={14} />
     </button>
   )
@@ -813,6 +836,7 @@ function ExecutedCell({ order }: { order: OrderFirehoseRow }) {
 
 function ProgressCell({ order }: { order: OrderFirehoseRow }) {
   const progress = order.progress
+  const activeVenue = progressVenueLabel(order)
   const tone =
     progress.failedStages > 0
       ? 'danger'
@@ -837,7 +861,7 @@ function ProgressCell({ order }: { order: OrderFirehoseRow }) {
           ? 'No stages'
           : `${progress.completedStages}/${progress.totalStages}`}
       </span>
-      {progress.activeStage ? <em>{progress.activeStage}</em> : null}
+      {activeVenue ? <em>{activeVenue}</em> : null}
     </div>
   )
 }
@@ -845,230 +869,410 @@ function ProgressCell({ order }: { order: OrderFirehoseRow }) {
 function OrderDetails({ order }: { order: OrderFirehoseRow }) {
   return (
     <div className="details-grid">
-      <QuoteFlowPanel order={order} />
-      <ExecutionStatusPanel order={order} />
+      <OrderTimelinePanel order={order} />
       <OrderMetadataPanel order={order} />
     </div>
   )
 }
 
-function QuoteFlowPanel({ order }: { order: OrderFirehoseRow }) {
-  const legs = quoteFlowLegs(order)
+type TimelineLeg = {
+  key: string
+  index: number
+  provider: string
+  kind: string
+  status: string
+  inputAsset?: AssetRef
+  outputAsset?: AssetRef
+  quotedInput?: string
+  quotedOutput?: string
+  executedInput?: string
+  executedOutput?: string
+  quotedInputUsd?: UsdAmountValuation
+  quotedOutputUsd?: UsdAmountValuation
+  executedInputUsd?: UsdAmountValuation
+  executedOutputUsd?: UsdAmountValuation
+  minAmountOut?: string
+  maxAmountIn?: string
+  updatedAt?: string
+  steps: OrderExecutionStep[]
+  references: TimelineReference[]
+}
+
+type TimelineReference = {
+  key: string
+  label: string
+  value: string
+  chainId?: string
+  kind: 'address' | 'tx' | 'auto'
+}
+
+function OrderTimelinePanel({ order }: { order: OrderFirehoseRow }) {
+  const legs = timelineLegs(order)
 
   return (
-    <div className="detail-block">
-      <h3>Quoted Flow</h3>
-      <div className="flow-list">
-        <FundingFlowCard order={order} amountLabel="required" />
+    <div className="detail-block timeline-block">
+      <div className="timeline-header">
+        <div>
+          <h3>Order Timeline</h3>
+          <p>{chainDisplayName(order.source.chainId)} to {chainDisplayName(order.destination.chainId)}</p>
+        </div>
+        <StatusPill status={order.status} />
+      </div>
+      <div className="timeline-list">
+        <FundingTimelineItem order={order} />
         {legs.length === 0 ? (
-          <div className="empty-detail">No quote legs</div>
+          <div className="timeline-empty">No route legs materialized</div>
         ) : (
-          legs.map((leg) => (
-            <FlowCard
-              key={leg.key}
-              index={leg.index}
-              title={humanize(leg.provider)}
-              subtitle={humanize(leg.kind)}
-              inputAsset={leg.inputAsset}
-              outputAsset={leg.outputAsset}
-              inputAmount={leg.amountIn}
-              outputAmount={leg.amountOut}
-              inputUsdValuation={leg.inputUsdValuation}
-              outputUsdValuation={leg.outputUsdValuation}
-              outputLabel="quoted out"
-              footer={
-                <>
-                  {leg.minAmountOut ? (
-                    <span>min {formatAmount(leg.minAmountOut, leg.outputAsset)}</span>
-                  ) : null}
-                  {leg.maxAmountIn ? (
-                    <span>max {formatAmount(leg.maxAmountIn, leg.inputAsset)}</span>
-                  ) : null}
-                </>
-              }
-            />
-          ))
+          legs.map((leg) => <TimelineLegItem key={leg.key} leg={leg} />)
         )}
       </div>
     </div>
   )
 }
 
-function ExecutionStatusPanel({ order }: { order: OrderFirehoseRow }) {
-  const executionLegs = order.executionLegs ?? []
-  return (
-    <div className="detail-block">
-      <h3>Execution Status</h3>
-      <div className="flow-list">
-        <FundingFlowCard order={order} amountLabel="deposit" showRuntimeState />
-        {executionLegs.length === 0 ? (
-          <div className="empty-detail">No execution legs</div>
-        ) : (
-          executionLegs.map((leg) => {
-            const completed = leg.status === 'completed' || Boolean(leg.completedAt)
-            return (
-              <FlowCard
-                key={leg.id}
-                index={leg.legIndex}
-                title={humanize(leg.provider)}
-                subtitle={humanize(leg.legType)}
-                status={leg.status}
-                inputAsset={leg.input}
-                outputAsset={leg.output}
-                inputAmount={completed ? leg.actualAmountIn ?? leg.amountIn : leg.amountIn}
-                outputAmount={completed ? leg.actualAmountOut : leg.expectedAmountOut}
-                inputUsdValuation={
-                  leg.usdValuation?.amounts?.actualInput ??
-                  leg.usdValuation?.amounts?.plannedInput
-                }
-                outputUsdValuation={
-                  completed
-                    ? leg.usdValuation?.amounts?.actualOutput ??
-                      leg.usdValuation?.amounts?.plannedMinOutput
-                    : leg.usdValuation?.amounts?.plannedMinOutput
-                }
-                outputLabel={completed ? 'actual out' : 'expected out'}
-                meta={
-                  <>
-                    <time dateTime={leg.updatedAt}>{formatDate(leg.updatedAt)}</time>
-                  </>
-                }
-              />
-            )
-          })
-        )}
-      </div>
-    </div>
-  )
-}
-
-function FundingFlowCard({
-  order,
-  amountLabel,
-  showRuntimeState = false
-}: {
-  order: OrderFirehoseRow
-  amountLabel: string
-  showRuntimeState?: boolean
-}) {
+function FundingTimelineItem({ order }: { order: OrderFirehoseRow }) {
   const fundingDeposit = fundingDepositFlow(order)
   const waitStep = order.executionSteps.find((step) => step.stepType === 'wait_for_deposit')
+  const completed = waitStep?.status === 'completed'
 
   return (
-    <FlowCard
-      variant="root"
-      title="Funding"
-      subtitle="Source Deposit"
-      status={showRuntimeState ? (waitStep?.status ?? order.status) : undefined}
-      inputLabel={amountLabel}
-      inputAsset={fundingDeposit.asset}
-      inputAmount={fundingDeposit.amount}
-      inputUsdValuation={fundingDeposit.usdValuation}
-      meta={
-        showRuntimeState ? (
-          <time dateTime={waitStep?.updatedAt ?? order.updatedAt}>
-            {formatDate(waitStep?.updatedAt ?? order.updatedAt)}
-          </time>
-        ) : undefined
-      }
-    />
-  )
-}
-
-function FlowCard({
-  index,
-  variant,
-  title,
-  subtitle,
-  status,
-  inputAsset,
-  outputAsset,
-  inputAmount,
-  outputAmount,
-  inputUsdValuation,
-  outputUsdValuation,
-  inputLabel,
-  outputLabel,
-  meta,
-  footer
-}: {
-  index?: number
-  variant?: 'root'
-  title: string
-  subtitle: string
-  status?: string
-  inputAsset?: { chainId: string; assetId: string }
-  outputAsset?: { chainId: string; assetId: string }
-  inputAmount?: string
-  outputAmount?: string
-  inputUsdValuation?: UsdAmountValuation
-  outputUsdValuation?: UsdAmountValuation
-  inputLabel?: string
-  outputLabel?: string
-  meta?: React.ReactNode
-  footer?: React.ReactNode
-}) {
-  const hasOutput = Boolean(outputAsset || outputAmount || outputUsdValuation)
-  const detail = meta ?? footer
-  return (
-    <div className={`flow-card ${variant === 'root' ? 'root' : ''}`}>
-      <div className="flow-card-top">
-        {index === undefined ? null : <span className="step-index">#{index}</span>}
-        <div>
-          <strong>{title}</strong>
-          <span>{subtitle}</span>
-        </div>
-        {status ? (
-          <StatusPill status={status} />
-        ) : (
-          <span className="status-pill empty" aria-hidden="true">
-            Completed
-          </span>
-        )}
+    <div className="timeline-item root">
+      <div className="timeline-rail">
+        <span className="timeline-dot root" />
       </div>
-      <div className={`flow-amounts ${hasOutput ? '' : 'single'}`}>
-        <AmountColumn
-          label={inputLabel ?? 'in'}
-          amount={inputAmount}
-          asset={inputAsset}
-          usdValuation={inputUsdValuation}
-        />
-        {hasOutput ? (
-          <>
-            <span className="flow-arrow">to</span>
-            <AmountColumn
-              label={outputLabel ?? 'out'}
-              amount={outputAmount}
-              asset={outputAsset}
-              usdValuation={outputUsdValuation}
-            />
-          </>
+      <div className="timeline-card root">
+        <div className="timeline-card-header">
+          <div>
+            <strong>Funding</strong>
+            <span>Source deposit</span>
+          </div>
+          <StatusPill status={waitStep?.status ?? 'planned'} />
+        </div>
+        <div className="timeline-compare single">
+          <TimelineAmountGroup
+            title="Required"
+            input={{
+              label: 'deposit',
+              amount: fundingDeposit.amount,
+              asset: fundingDeposit.asset,
+              usdValuation: fundingDeposit.usdValuation
+            }}
+          />
+          <TimelineAmountGroup
+            title="Observed"
+            muted={!completed}
+            input={
+              completed
+                ? {
+                    label: 'deposit',
+                    amount: fundingDeposit.amount,
+                    asset: fundingDeposit.asset,
+                    usdValuation: fundingDeposit.usdValuation
+                  }
+                : undefined
+            }
+            placeholder={completed ? undefined : 'Not funded yet'}
+          />
+        </div>
+        {waitStep ? (
+          <div className="timeline-funding-addresses">
+            <TimelineAction step={waitStep} />
+          </div>
         ) : null}
       </div>
-      <div className={`flow-meta ${detail ? '' : 'empty'}`}>{detail}</div>
     </div>
   )
 }
 
-function AmountColumn({
+function TimelineLegItem({ leg }: { leg: TimelineLeg }) {
+  const outputDelta = amountDelta(leg.quotedOutput, leg.executedOutput)
+  const inputDelta = amountDelta(leg.quotedInput, leg.executedInput)
+  const primaryDelta = outputDelta ?? inputDelta
+
+  return (
+    <div className="timeline-item">
+      <div className="timeline-rail">
+        <span className="timeline-dot">#{leg.index}</span>
+      </div>
+      <div className="timeline-card">
+        <div className="timeline-card-header">
+          <div>
+            <strong>{humanize(leg.provider)}</strong>
+            <span>{humanize(leg.kind)}</span>
+          </div>
+          <StatusPill status={leg.status} />
+        </div>
+        <div className="timeline-route">
+          {leg.inputAsset ? <AssetLabel asset={leg.inputAsset} /> : <em>unknown input</em>}
+          <span>to</span>
+          {leg.outputAsset ? <AssetLabel asset={leg.outputAsset} /> : <em>unknown output</em>}
+        </div>
+        <div className="timeline-compare">
+          <TimelineAmountGroup
+            title="Quoted"
+            input={{
+              label: 'in',
+              amount: leg.quotedInput,
+              asset: leg.inputAsset,
+              usdValuation: leg.quotedInputUsd
+            }}
+            output={{
+              label: 'out',
+              amount: leg.quotedOutput,
+              asset: leg.outputAsset,
+              usdValuation: leg.quotedOutputUsd
+            }}
+          />
+          <TimelineAmountGroup
+            title="Executed"
+            muted={!leg.executedInput && !leg.executedOutput}
+            input={
+              leg.executedInput
+                ? {
+                    label: 'in',
+                    amount: leg.executedInput,
+                    asset: leg.inputAsset,
+                    usdValuation: leg.executedInputUsd
+                  }
+                : undefined
+            }
+            output={
+              leg.executedOutput
+                ? {
+                    label: 'out',
+                    amount: leg.executedOutput,
+                    asset: leg.outputAsset,
+                    usdValuation: leg.executedOutputUsd
+                  }
+                : undefined
+            }
+            placeholder={leg.executedInput || leg.executedOutput ? undefined : 'Not executed yet'}
+          />
+        </div>
+        <div className="timeline-card-footer">
+          <div className="timeline-card-summary">
+            {primaryDelta ? <DeltaPill delta={primaryDelta} /> : null}
+            <TimelineGuardrails leg={leg} />
+          </div>
+          <TimelineActions steps={leg.steps} />
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function TimelineAmountGroup({
+  title,
+  input,
+  output,
+  muted = false,
+  placeholder
+}: {
+  title: string
+  input?: AmountPairSide
+  output?: AmountPairSide
+  muted?: boolean
+  placeholder?: string
+}) {
+  return (
+    <div className={`timeline-amount-group ${muted ? 'muted' : ''}`}>
+      <h4>{title}</h4>
+      {placeholder ? <div className="timeline-placeholder">{placeholder}</div> : null}
+      {input ? <TimelineAmountRow side={input} /> : null}
+      {output ? <TimelineAmountRow side={output} /> : null}
+    </div>
+  )
+}
+
+function TimelineAmountRow({ side }: { side: AmountPairSide }) {
+  return (
+    <div className="timeline-amount-row">
+      <span>{side.label}</span>
+      <code title={rawAmountTitle(side.amount, side.asset)}>
+        {formatAmount(side.amount, side.asset)}
+      </code>
+      {side.asset ? <AssetLabel asset={side.asset} /> : <em>unknown asset</em>}
+      <UsdValue valuation={side.usdValuation} />
+    </div>
+  )
+}
+
+function TimelineGuardrails({ leg }: { leg: TimelineLeg }) {
+  const guardrails = [
+    leg.minAmountOut && leg.outputAsset
+      ? {
+          label: 'min out',
+          amount: leg.minAmountOut,
+          asset: leg.outputAsset
+        }
+      : undefined,
+    leg.maxAmountIn && leg.inputAsset
+      ? {
+          label: 'max in',
+          amount: leg.maxAmountIn,
+          asset: leg.inputAsset
+        }
+      : undefined
+  ].filter((guardrail): guardrail is { label: string; amount: string; asset: AssetRef } =>
+    Boolean(guardrail)
+  )
+
+  if (guardrails.length === 0) return null
+
+  return (
+    <div className="timeline-guardrails">
+      {guardrails.map((guardrail) => (
+        <span key={guardrail.label}>
+          {guardrail.label} <code title={rawAmountTitle(guardrail.amount, guardrail.asset)}>
+            {formatAmount(guardrail.amount, guardrail.asset)}
+          </code>
+        </span>
+      ))}
+    </div>
+  )
+}
+
+function TimelineActions({ steps }: { steps: OrderExecutionStep[] }) {
+  const visibleSteps = steps.filter((step) => !isWaitForDepositStep(step))
+  if (visibleSteps.length === 0) return <span className="timeline-actions empty">No actions</span>
+
+  return (
+    <div className="timeline-actions">
+      {visibleSteps.map((step) => <TimelineAction key={step.id} step={step} />)}
+    </div>
+  )
+}
+
+function TimelineAction({ step }: { step: OrderExecutionStep }) {
+  const addresses = stepActionAddresses(step)
+
+  return (
+    <div className="timeline-action">
+      <TimelineActionIdentifier step={step} />
+      <div className="timeline-action-flow">
+        <TimelineActionEndpoint label="sender" address={addresses.sender} />
+        <ArrowRight className="timeline-action-arrow" size={14} aria-hidden="true" />
+        <TimelineActionEndpoint label="recipient" address={addresses.recipient} />
+      </div>
+    </div>
+  )
+}
+
+function TimelineActionIdentifier({ step }: { step: OrderExecutionStep }) {
+  if (step.txHash || isWaitForDepositStep(step)) {
+    return (
+      <span className="timeline-action-identifier">
+        <span>tx</span>
+        {step.txHash ? (
+          <TimelineLinkedValue
+            chainId={stepTransactionChain(step)}
+            value={step.txHash}
+            kind="auto"
+          />
+        ) : (
+          <span className="timeline-inline-value missing">unknown</span>
+        )}
+      </span>
+    )
+  }
+
+  const venueId = stepVenueIdentifier(step)
+  return (
+    <span className="timeline-action-identifier">
+      <span>venue id</span>
+      {venueId ? (
+        <TimelineLinkedValue
+          chainId={stepTransactionChain(step)}
+          value={venueId}
+          kind="auto"
+        />
+      ) : (
+        <span className="timeline-inline-value missing">not created</span>
+      )}
+    </span>
+  )
+}
+
+function TimelineActionEndpoint({
   label,
-  amount,
-  asset,
-  usdValuation
+  address
 }: {
   label: string
-  amount?: string
-  asset?: { chainId: string; assetId: string }
-  usdValuation?: UsdAmountValuation
+  address?: { address: string; chainId?: string }
 }) {
-  const formattedAmount = formatAmount(amount, asset)
   return (
-    <div className="amount-column">
+    <span className="timeline-action-endpoint">
       <span>{label}</span>
-      <code title={rawAmountTitle(amount, asset)}>{formattedAmount}</code>
-      <UsdValue valuation={usdValuation} />
-      {asset ? <AssetLabel asset={asset} /> : <em>unknown asset</em>}
+      {address?.address ? (
+        <TimelineLinkedValue
+          chainId={address.chainId}
+          value={address.address}
+          kind="address"
+        />
+      ) : (
+        <span className="timeline-inline-value missing">unknown</span>
+      )}
+    </span>
+  )
+}
+
+function TimelineLinkedValue({
+  chainId,
+  value,
+  kind
+}: {
+  chainId?: string
+  value: string
+  kind: 'address' | 'tx' | 'auto'
+}) {
+  const url = explorerUrl(chainId, value, kind)
+  const label = shortId(value)
+  if (!url) {
+    return (
+      <span className="timeline-inline-value" title={value}>
+        {label}
+      </span>
+    )
+  }
+
+  return (
+    <a
+      className="timeline-inline-value"
+      href={url}
+      title={value}
+      target="_blank"
+      rel="noreferrer"
+      onClick={(event) => event.stopPropagation()}
+    >
+      {label}
+    </a>
+  )
+}
+
+function TimelineReferences({ references }: { references: TimelineReference[] }) {
+  if (references.length === 0) return null
+
+  return (
+    <div className="timeline-references">
+      {references.map((reference) => (
+        <span key={reference.key} className="timeline-reference">
+          <span>{reference.label}</span>
+          <ExplorerValue
+            chainId={reference.chainId}
+            value={reference.value}
+            kind={reference.kind}
+          />
+        </span>
+      ))}
     </div>
+  )
+}
+
+function DeltaPill({ delta }: { delta: AmountDelta }) {
+  return (
+    <span className={`delta-pill ${delta.tone}`}>
+      {delta.label}
+    </span>
   )
 }
 
@@ -1299,6 +1503,388 @@ function quoteFlowLegs(order: OrderFirehoseRow): QuoteFlowLeg[] {
   })
 }
 
+function timelineLegs(order: OrderFirehoseRow): TimelineLeg[] {
+  const stepsByLegId = new Map<string, OrderExecutionStep[]>()
+  for (const step of order.executionSteps) {
+    if (!step.executionLegId) continue
+    const existing = stepsByLegId.get(step.executionLegId) ?? []
+    existing.push(step)
+    stepsByLegId.set(step.executionLegId, existing)
+  }
+
+  if (order.executionLegs.length > 0) {
+    return [...order.executionLegs]
+      .sort(
+        (left, right) =>
+          left.legIndex - right.legIndex ||
+          left.createdAt.localeCompare(right.createdAt) ||
+          left.id.localeCompare(right.id)
+      )
+      .map((leg) => {
+        const steps = stepsByLegId.get(leg.id) ?? []
+        const quoteValuation = quoteUsdValuationForExecutionLeg(order, leg)
+        const executedInput = leg.actualAmountIn ?? (leg.status === 'completed' ? leg.amountIn : undefined)
+        const executedOutput = leg.actualAmountOut
+        return {
+          key: leg.id,
+          index: leg.legIndex,
+          provider: leg.provider,
+          kind: leg.legType,
+          status: leg.status,
+          inputAsset: leg.input,
+          outputAsset: leg.output,
+          quotedInput: leg.amountIn,
+          quotedOutput: leg.expectedAmountOut,
+          executedInput,
+          executedOutput,
+          quotedInputUsd:
+            valuationForAmount(leg.amountIn, leg.input, leg.usdValuation, ['plannedInput']) ??
+            valuationForAmount(leg.amountIn, leg.input, quoteValuation, ['input']),
+          quotedOutputUsd:
+            valuationForAmount(leg.expectedAmountOut, leg.output, leg.usdValuation, [
+              'plannedOutput',
+              'plannedMinOutput'
+            ]) ??
+            valuationForAmount(leg.expectedAmountOut, leg.output, quoteValuation, [
+              'output',
+              'minOutput'
+            ]),
+          executedInputUsd: executedInput
+            ? valuationForAmount(executedInput, leg.input, leg.usdValuation, [
+                'actualInput',
+                'plannedInput'
+              ]) ?? valuationForAmount(executedInput, leg.input, quoteValuation, ['input'])
+            : undefined,
+          executedOutputUsd: executedOutput
+            ? valuationForAmount(executedOutput, leg.output, leg.usdValuation, [
+                'actualOutput',
+                'plannedOutput',
+                'plannedMinOutput'
+              ]) ??
+              valuationForAmount(executedOutput, leg.output, quoteValuation, [
+                'output',
+                'minOutput'
+              ])
+            : undefined,
+          minAmountOut: leg.minAmountOut,
+          updatedAt: leg.updatedAt,
+          steps,
+          references: timelineReferences(leg.input, leg.output, steps)
+        }
+      })
+  }
+
+  return quoteFlowLegs(order).map((leg) => ({
+    key: leg.key,
+    index: leg.index,
+    provider: leg.provider,
+    kind: leg.kind,
+    status: 'planned',
+    inputAsset: leg.inputAsset,
+    outputAsset: leg.outputAsset,
+    quotedInput: leg.amountIn,
+    quotedOutput: leg.amountOut,
+    quotedInputUsd: leg.inputUsdValuation,
+    quotedOutputUsd: leg.outputUsdValuation,
+    minAmountOut: leg.minAmountOut,
+    maxAmountIn: leg.maxAmountIn,
+    steps: [],
+    references: []
+  }))
+}
+
+function quoteUsdValuationForExecutionLeg(
+  order: OrderFirehoseRow,
+  leg: OrderExecutionLeg
+): UsdValuation | undefined {
+  const quoteUsdValuation = order.quoteUsdValuation
+  const quoteLegs = quoteUsdValuation?.legs
+  if (!quoteUsdValuation || !quoteLegs || quoteLegs.length === 0) return undefined
+
+  const details = asRecord(leg.details)
+  const transitionIds = asArray(details?.quote_leg_transition_decl_ids).filter(
+    (value): value is string => typeof value === 'string'
+  )
+
+  const matchedLegs =
+    transitionIds.length > 0
+      ? transitionIds
+          .map((transitionId) =>
+            quoteLegs.find((quoteLeg) => quoteLeg.transitionDeclId === transitionId)
+          )
+          .filter((quoteLeg): quoteLeg is QuoteFlowLegUsdValuation => Boolean(quoteLeg))
+      : [
+          quoteLegs.find((quoteLeg) => quoteLeg.transitionDeclId === leg.transitionDeclId) ??
+            quoteLegs.find((quoteLeg) => quoteLeg.index === leg.legIndex)
+        ].filter((quoteLeg): quoteLeg is QuoteFlowLegUsdValuation => Boolean(quoteLeg))
+
+  const first = matchedLegs[0]
+  const last = matchedLegs[matchedLegs.length - 1]
+  if (!first && !last) return undefined
+
+  return {
+    schemaVersion: quoteUsdValuation.schemaVersion,
+    pricing: quoteUsdValuation.pricing,
+    amounts: {
+      input: first?.amounts?.input,
+      output: last?.amounts?.output,
+      minOutput: last?.amounts?.minOutput,
+      maxInput: first?.amounts?.maxInput
+    }
+  }
+}
+
+type TimelineReferenceField = {
+  key: string
+  label: string
+  side: 'input' | 'output' | 'auto' | 'hyperliquid'
+}
+
+const TIMELINE_REFERENCE_FIELDS: TimelineReferenceField[] = [
+  { key: 'source_custody_vault_address', label: 'Source vault', side: 'input' },
+  { key: 'destination_custody_vault_address', label: 'Destination vault', side: 'output' },
+  { key: 'recipient_custody_vault_address', label: 'Recipient vault', side: 'output' },
+  { key: 'depositor_custody_vault_address', label: 'Depositor vault', side: 'input' },
+  { key: 'depositor_address', label: 'Depositor', side: 'input' },
+  { key: 'recipient_address', label: 'Recipient', side: 'output' },
+  { key: 'refund_custody_vault_address', label: 'Refund vault', side: 'input' },
+  { key: 'revert_custody_vault_address', label: 'Revert vault', side: 'input' },
+  { key: 'refund_address', label: 'Refund', side: 'input' },
+  { key: 'release_sweep_target_address', label: 'Paymaster', side: 'auto' },
+  { key: 'paymaster_address', label: 'Paymaster', side: 'auto' },
+  { key: 'hyperliquid_custody_vault_address', label: 'Hyperliquid vault', side: 'hyperliquid' }
+]
+
+function timelineReferences(
+  inputAsset: AssetRef | undefined,
+  outputAsset: AssetRef | undefined,
+  steps: OrderExecutionStep[]
+): TimelineReference[] {
+  const references: TimelineReference[] = []
+  const seen = new Set<string>()
+
+  for (const step of steps) {
+    for (const record of [
+      asRecord(step.request),
+      asRecord(step.response),
+      asRecord(step.details)
+    ]) {
+      if (!record) continue
+
+      for (const field of TIMELINE_REFERENCE_FIELDS) {
+        const value = stringField(record, field.key)
+        if (!value || !isReferenceLike(value)) continue
+
+        const label = timelineReferenceLabel(field, record)
+        const key = `${label}:${value.toLowerCase()}`
+        if (seen.has(key)) continue
+
+        references.push({
+          key,
+          label,
+          value,
+          chainId: timelineReferenceChain(field, value, inputAsset, outputAsset, step),
+          kind: 'auto'
+        })
+        seen.add(key)
+      }
+    }
+  }
+
+  return references.slice(0, 8)
+}
+
+function timelineReferenceLabel(field: TimelineReferenceField, record: JsonRecord) {
+  if (
+    field.key === 'recipient_address' &&
+    stringField(record, 'recipient_role') === 'paymaster_wallet'
+  ) {
+    return 'Paymaster'
+  }
+  if (
+    field.key === 'recipient_address' &&
+    stringField(record, 'recipient_custody_vault_role') === 'paymaster_wallet'
+  ) {
+    return 'Paymaster'
+  }
+  return field.label
+}
+
+function timelineReferenceChain(
+  field: TimelineReferenceField,
+  value: string,
+  inputAsset: AssetRef | undefined,
+  outputAsset: AssetRef | undefined,
+  step: OrderExecutionStep
+) {
+  if (field.side === 'hyperliquid') return 'hyperliquid'
+
+  const preferred =
+    field.side === 'output'
+      ? outputAsset?.chainId ?? step.output?.chainId
+      : inputAsset?.chainId ?? step.input?.chainId
+  const alternate =
+    field.side === 'output'
+      ? inputAsset?.chainId ?? step.input?.chainId
+      : outputAsset?.chainId ?? step.output?.chainId
+
+  if (isEvmAddress(value)) {
+    return preferred?.startsWith('evm:')
+      ? preferred
+      : alternate?.startsWith('evm:')
+        ? alternate
+        : preferred
+  }
+  if (preferred === 'bitcoin' || alternate === 'bitcoin') return 'bitcoin'
+  return preferred ?? alternate
+}
+
+function isReferenceLike(value: string) {
+  return (
+    isEvmAddress(value) ||
+    isBitcoinTxHash(value) ||
+    value.toLowerCase().startsWith('bc1') ||
+    /^[13][a-km-zA-HJ-NP-Z1-9]{25,34}$/.test(value)
+  )
+}
+
+function stepActionAddresses(step: OrderExecutionStep) {
+  const sender =
+    normalizeStepAddress(step.actionAddresses?.sender) ??
+    stepAddressFromFields(step, 'sender')
+  const recipient =
+    normalizeStepAddress(step.actionAddresses?.recipient) ??
+    stepAddressFromFields(step, 'recipient') ??
+    (step.stepType === 'hyperliquid_trade' ? sender : undefined)
+
+  return { sender, recipient }
+}
+
+function stepVenueIdentifier(step: OrderExecutionStep) {
+  return (
+    step.providerRef ??
+    stringField(asRecord(step.response), 'provider_ref') ??
+    nestedStringField(step.response, 'providerRef') ??
+    nestedStringField(step.response, 'operationId')
+  )
+}
+
+function normalizeStepAddress(
+  address: { address: string; chainId?: string } | undefined
+) {
+  if (!address?.address) return undefined
+  return address
+}
+
+function stepAddressFromFields(
+  step: OrderExecutionStep,
+  side: 'sender' | 'recipient'
+) {
+  const records = [
+    asRecord(step.request),
+    asRecord(step.response),
+    asRecord(step.details)
+  ]
+  const keys =
+    side === 'sender'
+      ? [
+          'source_custody_vault_address',
+          'depositor_custody_vault_address',
+          'depositor_address',
+          'hyperliquid_custody_vault_address',
+          'sourceAddress'
+        ]
+      : [
+          'recipient_custody_vault_address',
+          'destination_custody_vault_address',
+          'recipient_address',
+          'protocolAddress',
+          'provider_ref',
+          'destinationAddress'
+        ]
+
+  for (const record of records) {
+    for (const key of keys) {
+      const value = stringField(record, key) ?? nestedStringField(record, key)
+      if (value && isReferenceLike(value)) {
+        return {
+          address: value,
+          chainId: stepAddressChain(step, side, value)
+        }
+      }
+    }
+  }
+
+  return undefined
+}
+
+function nestedStringField(value: unknown, key: string): string | undefined {
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = nestedStringField(item, key)
+      if (found) return found
+    }
+    return undefined
+  }
+
+  const record = asRecord(value)
+  if (!record) return undefined
+  const direct = stringField(record, key)
+  if (direct) return direct
+
+  for (const child of Object.values(record)) {
+    const found = nestedStringField(child, key)
+    if (found) return found
+  }
+  return undefined
+}
+
+function stepAddressChain(
+  step: OrderExecutionStep,
+  side: 'sender' | 'recipient',
+  value: string
+) {
+  if (step.stepType === 'unit_deposit' && side === 'recipient') {
+    return step.input?.chainId ?? step.output?.chainId
+  }
+  if (step.stepType === 'hyperliquid_trade') return 'hyperliquid'
+  if (isEvmAddress(value)) {
+    return side === 'recipient'
+      ? step.output?.chainId ?? step.input?.chainId
+      : step.input?.chainId ?? step.output?.chainId
+  }
+  if (value.toLowerCase().startsWith('bc1') || /^[13][a-km-zA-HJ-NP-Z1-9]{25,34}$/.test(value)) {
+    return 'bitcoin'
+  }
+  return side === 'recipient'
+    ? step.output?.chainId ?? step.input?.chainId
+    : step.input?.chainId ?? step.output?.chainId
+}
+
+type AmountDelta = {
+  label: string
+  tone: 'positive' | 'negative' | 'neutral'
+}
+
+function amountDelta(quoted: string | undefined, executed: string | undefined): AmountDelta | undefined {
+  if (!quoted || !executed || !/^\d+$/.test(quoted) || !/^\d+$/.test(executed)) {
+    return undefined
+  }
+  const quotedRaw = BigInt(quoted)
+  if (quotedRaw === 0n) return undefined
+  const executedRaw = BigInt(executed)
+  const deltaBps = ((executedRaw - quotedRaw) * 10000n) / quotedRaw
+  const tone = deltaBps > 0n ? 'positive' : deltaBps < 0n ? 'negative' : 'neutral'
+  const sign = deltaBps > 0n ? '+' : deltaBps < 0n ? '-' : ''
+  const absolute = deltaBps < 0n ? -deltaBps : deltaBps
+  const whole = absolute / 100n
+  const fraction = String(absolute % 100n).padStart(2, '0')
+  return {
+    label: `${sign}${whole}.${fraction}% vs quote`,
+    tone
+  }
+}
+
 type ExecutedAmount = {
   amount: string
   asset: AssetRef
@@ -1430,35 +2016,6 @@ function sameAsset(left: AssetRef, right: AssetRef) {
   )
 }
 
-function primaryOperationForStep(order: OrderFirehoseRow, stepId: string) {
-  return findLastOperation(
-    order.providerOperations,
-    (operation) => operation.executionStepId === stepId
-  )
-}
-
-function findLastOperation(
-  operations: ProviderOperation[],
-  predicate: (operation: ProviderOperation) => boolean
-) {
-  for (let index = operations.length - 1; index >= 0; index -= 1) {
-    if (predicate(operations[index])) return operations[index]
-  }
-  return undefined
-}
-
-function executionOutputAmount(
-  step: OrderExecutionStep,
-  operation: ProviderOperation | undefined
-) {
-  return (
-    stringField(asRecord(step.response), 'amount_out') ??
-    stringField(asRecord(step.response), 'amountOut') ??
-    operationAmount(operation, 'output') ??
-    step.minAmountOut
-  )
-}
-
 function stepTransactionChain(step: OrderExecutionStep) {
   if (['across_bridge', 'cctp_receive', 'unit_withdrawal'].includes(step.stepType)) {
     return step.output?.chainId ?? step.input?.chainId
@@ -1468,73 +2025,6 @@ function stepTransactionChain(step: OrderExecutionStep) {
 
 function isWaitForDepositStep(step: OrderExecutionStep) {
   return step.stepType === WAIT_FOR_DEPOSIT_STEP_TYPE
-}
-
-function operationAmount(
-  operation: ProviderOperation | undefined,
-  side: 'input' | 'output'
-) {
-  if (!operation) return undefined
-  const request = asRecord(operation.request)
-  const response = asRecord(operation.response)
-  if (side === 'input') {
-    return (
-      stringField(request, 'amount_in') ??
-      stringField(request, 'amountIn') ??
-      stringField(request, 'inputAmount') ??
-      stringField(request, 'srcAmount') ??
-      stringField(response, 'inputAmount') ??
-      stringField(response, 'srcAmount')
-    )
-  }
-  return (
-    stringField(request, 'amount_out') ??
-    stringField(request, 'amountOut') ??
-    stringField(request, 'expectedOutputAmount') ??
-    stringField(response, 'amount_out') ??
-    stringField(response, 'amountOut') ??
-    stringField(response, 'expectedOutputAmount') ??
-    stringField(response, 'minOutputAmount') ??
-    stringField(response, 'destAmount')
-  )
-}
-
-function operationAsset(
-  operation: ProviderOperation | undefined,
-  side: 'input' | 'output'
-) {
-  if (!operation) return undefined
-  const request = asRecord(operation.request)
-  const response = asRecord(operation.response)
-  if (side === 'input') {
-    return (
-      assetRef(request?.input_asset) ??
-      assetRef(request?.inputAsset) ??
-      bridgeNativeAsset(request, 'origin') ??
-      assetFromTokenFields(request, 'src')
-    )
-  }
-  return (
-    assetRef(request?.output_asset) ??
-    assetRef(request?.outputAsset) ??
-    assetRef(response?.output_asset) ??
-    assetRef(response?.outputAsset) ??
-    bridgeNativeAsset(request, 'destination') ??
-    assetFromTokenFields(request, 'dest')
-  )
-}
-
-function bridgeNativeAsset(record: JsonRecord | undefined, side: 'origin' | 'destination') {
-  const chainId = stringField(record, `${side}_chain_id`)
-  return chainId ? { chainId: `evm:${chainId}`, assetId: 'native' } : undefined
-}
-
-function assetFromTokenFields(record: JsonRecord | undefined, prefix: 'src' | 'dest') {
-  if (!record) return undefined
-  const token = stringField(record, `${prefix}Token`)
-  const network = stringField(record, 'network')
-  if (!token || !network) return undefined
-  return { chainId: `evm:${network}`, assetId: token }
 }
 
 function assetRef(value: unknown): AssetRef | undefined {
@@ -1597,6 +2087,16 @@ function explorerUrl(
     }
     if (kind === 'address' || kind === 'auto') {
       return `https://mempool.space/address/${normalizedValue}`
+    }
+    return undefined
+  }
+
+  if (normalizedChainId === 'hyperliquid') {
+    if (kind === 'tx' || (kind === 'auto' && isEvmTxHash(normalizedValue))) {
+      return `https://app.hyperliquid.xyz/explorer/tx/${normalizedValue}`
+    }
+    if (kind === 'address' || (kind === 'auto' && isEvmAddress(normalizedValue))) {
+      return `https://app.hyperliquid.xyz/explorer/address/${normalizedValue}`
     }
     return undefined
   }
@@ -1732,6 +2232,11 @@ function shortId(value: string) {
   return `${value.slice(0, 8)}...${value.slice(-6)}`
 }
 
+function shortOrderId(value: string) {
+  if (value.length <= 10) return value
+  return `${value.slice(0, 4)}...${value.slice(-4)}`
+}
+
 function statusTone(status: string) {
   if (['completed', 'processed', 'skipped'].includes(status)) return 'success'
   if (
@@ -1751,6 +2256,49 @@ function statusTone(status: string) {
   return 'waiting'
 }
 
+function progressVenueLabel(order: OrderFirehoseRow) {
+  const progress = order.progress
+  if (progress.totalStages === 0) return undefined
+  if (progress.completedStages === progress.totalStages && progress.failedStages === 0) {
+    return undefined
+  }
+
+  const failedLeg = progress.failedStages
+    ? order.executionLegs.find((leg) => FAILED_STEP_STATUSES.has(leg.status))
+    : undefined
+  if (failedLeg) return providerDisplayName(failedLeg.provider)
+
+  const activeLeg =
+    order.executionLegs.find((leg) => ACTIVE_STEP_STATUSES.has(leg.status)) ??
+    order.executionLegs.find((leg) => leg.status === 'planned')
+  if (activeLeg) return providerDisplayName(activeLeg.provider)
+
+  const activeStep =
+    order.executionSteps.find(
+      (step) => !isWaitForDepositStep(step) && ACTIVE_STEP_STATUSES.has(step.status)
+    ) ??
+    order.executionSteps.find(
+      (step) => !isWaitForDepositStep(step) && FAILED_STEP_STATUSES.has(step.status)
+    ) ??
+    order.executionSteps.find((step) => !isWaitForDepositStep(step) && step.status === 'planned')
+  if (activeStep) return providerDisplayName(activeStep.provider)
+
+  const waitStep = order.executionSteps.find(isWaitForDepositStep)
+  if (waitStep && ACTIVE_STEP_STATUSES.has(waitStep.status)) return 'Funding deposit'
+
+  return progress.activeStage ? cleanProgressStage(progress.activeStage) : undefined
+}
+
+function cleanProgressStage(stage: string) {
+  const [venue] = stage.split(/[/:,]/)
+  return venue ? providerDisplayName(venue.trim()) : undefined
+}
+
+function providerDisplayName(provider: string) {
+  const normalized = provider.trim().toLowerCase()
+  return PROVIDER_DISPLAY_NAMES[normalized] ?? humanize(normalized)
+}
+
 function humanize(value: string) {
   return value
     .split('_')
@@ -1761,6 +2309,33 @@ function humanize(value: string) {
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : 'Unexpected dashboard error'
+}
+
+async function copyTextToClipboard(value: string) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(value)
+      return
+    } catch {
+      // Use the DOM fallback below when clipboard permissions are unavailable.
+    }
+  }
+
+  const textarea = document.createElement('textarea')
+  textarea.value = value
+  textarea.setAttribute('readonly', '')
+  textarea.style.position = 'fixed'
+  textarea.style.left = '-9999px'
+  textarea.style.top = '0'
+  document.body.appendChild(textarea)
+  textarea.select()
+
+  try {
+    const copied = document.execCommand('copy')
+    if (!copied) throw new Error('clipboard copy was rejected')
+  } finally {
+    document.body.removeChild(textarea)
+  }
 }
 
 async function signOut() {

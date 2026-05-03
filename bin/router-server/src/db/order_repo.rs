@@ -2882,7 +2882,8 @@ impl OrderRepository {
                     BOOL_OR(status = 'running') AS has_running,
                     BOOL_OR(status = 'waiting') AS has_waiting,
                     BOOL_OR(status = 'ready') AS has_ready,
-                    COUNT(*) FILTER (WHERE status IN ('completed', 'skipped')) AS terminal_success_actions,
+                    COUNT(*) FILTER (WHERE status = 'completed') AS completed_actions,
+                    COUNT(*) FILTER (WHERE status IN ('completed', 'skipped')) AS terminal_actions,
                     MIN(started_at) FILTER (WHERE started_at IS NOT NULL) AS first_started_at,
                     MAX(completed_at) FILTER (WHERE completed_at IS NOT NULL) AS last_completed_at
                 FROM order_execution_steps
@@ -2903,15 +2904,18 @@ impl OrderRepository {
                         WHEN action_summary.has_failed THEN 'failed'
                         WHEN action_summary.has_cancelled THEN 'cancelled'
                         WHEN action_summary.total_actions > 0
-                             AND action_summary.terminal_success_actions = action_summary.total_actions
+                             AND action_summary.completed_actions = action_summary.total_actions
                             THEN 'completed'
+                        WHEN action_summary.total_actions > 0
+                             AND action_summary.terminal_actions = action_summary.total_actions
+                            THEN 'skipped'
                         WHEN action_summary.has_running THEN 'running'
                         WHEN action_summary.has_waiting THEN 'waiting'
                         WHEN action_summary.has_ready THEN 'ready'
                         ELSE 'planned'
                     END AS status,
                     action_summary.total_actions > 0
-                        AND action_summary.terminal_success_actions = action_summary.total_actions
+                        AND action_summary.completed_actions = action_summary.total_actions
                         AS completed,
                     action_summary.first_started_at,
                     action_summary.last_completed_at,
