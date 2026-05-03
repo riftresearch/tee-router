@@ -59,7 +59,7 @@ export const quoteRoute = createRoute({
   method: 'post',
   path: '/quote',
   tags: ['Quotes'],
-  summary: 'Create a market quote',
+  summary: 'Create a quote for a market order',
   request: {
     body: {
       required: true,

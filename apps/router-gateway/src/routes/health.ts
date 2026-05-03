@@ -27,12 +27,12 @@ export const DependencyHealthResponseSchema = z
 export const healthRoute = createRoute({
   method: 'get',
   path: '/health',
-  tags: ['System'],
-  summary: 'Get system online status',
-  description: 'Returns the health status of the API.',
+  tags: ['Status'],
+  summary: 'Get Rift online status',
+  description: 'Returns the online status of the Rift API.',
   responses: {
     200: {
-      description: 'Health check response',
+      description: 'Rift online status response',
       content: {
         'application/json': {
           schema: HealthResponseSchema
@@ -45,13 +45,13 @@ export const healthRoute = createRoute({
 export const dependencyHealthRoute = createRoute({
   method: 'get',
   path: '/providers',
-  tags: ['System'],
-  summary: 'Get provider reachability status',
+  tags: ['Status'],
+  summary: 'Get execution provider online status',
   description:
-    'Returns cached provider reachability checks from the router worker.',
+    'Returns cached execution provider online checks from the router worker.',
   responses: {
     200: {
-      description: 'Cached provider reachability response',
+      description: 'Cached execution provider online status response',
       content: {
         'application/json': {
           schema: DependencyHealthResponseSchema

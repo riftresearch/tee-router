@@ -112,7 +112,7 @@ export const orderCancelRoute = createRoute({
   method: 'post',
   path: '/order/{orderId}/cancel',
   tags: ['Orders'],
-  summary: 'Cancel an order with its configured refund authorization',
+  summary: 'Cancel an order via specified authentication',
   request: {
     params: z.object({
       orderId: z.string().uuid()
