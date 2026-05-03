@@ -2,3 +2,31 @@
 title: "Multichain smart contracts"
 ---
 
+Multichain smart contracts provide an execution environment for money to move automatically through protocols across different chains. That can mean native transfers on networks like Bitcoin or Ethereum, or calls into DeFi protocols. For example, imagine a multichain contract that accepts Bitcoin. The contract can bridge the BTC to Hyperliquid through Unit, execute a BTC/USDC spot trade on Hyperliquid, bridge the USDC out to Arbitrum through the native bridge, bridge that USDC to Ethereum through CCTP, trade the USDC for PEPE on Uniswap, and send the PEPE to the user's wallet.
+
+Under the hood, protocol nodes run Dstack to interface with TDX enclaves running docker images (the "contract" code) in Google data centers. The explicit tradeoff in this design is trusting the hardware provider and data center operator not to execute a hardware attack at the data center to extract keys. If you are willing to trust that this hardware behaves as expected, the result is a smart contract that can call any blockchain protocol and any API on the internet.
+
+## Universal interface
+
+The magical user experience comes from a universal interface: every smart contract is just a wallet that you send funds to.
+
+```ts
+interface Contract {
+  send // sender address
+  receive // receiving address
+  code // code that runs
+  change // state change on the send and receive chains
+  signers // signers who control upgrades to the contract
+  timelock // time before approved upgrade goes live
+}
+```
+
+Since chaining multiple protocol calls together is enforced by hardware, Rift can aggregate routes that involve synchronous operations across multiple chains and execution environments. To execute a market order, you send the asset you want to trade, and Rift finds the best execution across all integrated venues.
+
+Other routers cannot do this because they do not have a concept of system state across chains. A multichain smart contract can save state, such as a limit order to be executed at a venue at a specific price, and then operate on any code to make this happen, such as performing an order through a protocol's API. More generally, a contract can call any API on the internet and verify the response came from the domain's SSL certificate.
+
+## Operational security benefits
+
+A single entry point for any contract, sending money to an address, is useful for safety of funds because manually signing transaction calldata is hazardous. In practice, users and teams often blind sign complex calldata, making it easy to accidentally sign malicious payloads. Payments to contracts make specifying intent clearer because you do not send funds without thinking, and make complex behaviors more secure because chained signing of transactions and orchestration of actions is handled for you. You simply receive funds at an address on the other side.
+
+Additionally, financially important code evolves over time. Immutability is impractical. Instead, a trusted group of signers must agree to code upgrades, and their upgrades are gated by timelocks. Blockchains are actually about making trust explicit, not eliminating it. Specifying the parties that have control of the code of this contract is ideal. Rift maintains hardware keys in addition to the deployment partner to make deployments more resilient. Refunds of all user funds can be triggered by any single admin key during the timelock window.
