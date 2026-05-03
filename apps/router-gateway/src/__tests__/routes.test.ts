@@ -21,6 +21,7 @@ const QUOTE_ID = '00000000-0000-4000-8000-000000000001'
 const ORDER_ID = '00000000-0000-4000-8000-000000000002'
 const TO_ADDRESS = '0x1111111111111111111111111111111111111111'
 const FROM_ADDRESS = 'bc1qexample000000000000000000000000000000'
+const BTC_ADDRESS = 'bc1qlimit0000000000000000000000000000000'
 const REFUND_ACCOUNT = privateKeyToAccount(
   '0x1000000000000000000000000000000000000000000000000000000000000001'
 )
@@ -206,6 +207,62 @@ describe('router gateway routes', () => {
       minOut: '99',
       maxSlippage: '1.5',
       amountFormat: 'readable'
+    })
+  })
+
+  test('translates a raw limit quote request to the internal router API', async () => {
+    const calls: RecordedCall[] = []
+    const app = createApp(testConfig(), {
+      fetch: mockFetch(calls, async (path) => {
+        if (path === '/api/v1/quotes') {
+          return Response.json(internalLimitQuote(), { status: 201 })
+        }
+
+        return Response.json({ message: 'not found' }, { status: 404 })
+      })
+    })
+
+    const response = await app.request('/quote', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        orderType: 'limit_order',
+        from: 'Base.USDC',
+        to: 'Bitcoin.BTC',
+        toAddress: BTC_ADDRESS,
+        fromAmount: '100000000',
+        toAmount: '100000',
+        maxSlippage: '100',
+        amountFormat: 'raw'
+      })
+    })
+
+    expect(response.status).toBe(201)
+    expect(calls[0]?.body).toEqual({
+      type: 'limit_order',
+      from_asset: {
+        chain: 'evm:8453',
+        asset: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913'
+      },
+      to_asset: {
+        chain: 'bitcoin',
+        asset: 'native'
+      },
+      recipient_address: BTC_ADDRESS,
+      input_amount: '100000000',
+      output_amount: '100000'
+    })
+
+    const body = await response.json()
+    expect(body).toMatchObject({
+      quoteId: QUOTE_ID,
+      orderType: 'limit_order',
+      from: 'Base.USDC',
+      to: 'Bitcoin.BTC',
+      expectedOut: '100000',
+      maxIn: '100000000',
+      maxSlippage: '0',
+      amountFormat: 'raw'
     })
   })
 
@@ -505,6 +562,34 @@ function internalQuote() {
         min_amount_out: '99000000',
         max_amount_in: null,
         slippage_bps: 150,
+        provider_quote: {},
+        expires_at: '2026-04-30T12:00:00Z',
+        created_at: '2026-04-30T11:59:00Z'
+      }
+    }
+  }
+}
+
+function internalLimitQuote() {
+  return {
+    quote: {
+      type: 'limit_order',
+      payload: {
+        id: QUOTE_ID,
+        order_id: null,
+        source_asset: {
+          chain: 'evm:8453',
+          asset: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913'
+        },
+        destination_asset: {
+          chain: 'bitcoin',
+          asset: 'native'
+        },
+        recipient_address: BTC_ADDRESS,
+        provider_id: 'hyperliquid',
+        input_amount: '100000000',
+        output_amount: '100000',
+        residual_policy: 'refund',
         provider_quote: {},
         expires_at: '2026-04-30T12:00:00Z',
         created_at: '2026-04-30T11:59:00Z'

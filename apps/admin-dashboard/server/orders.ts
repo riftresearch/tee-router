@@ -90,6 +90,8 @@ export type OrderMetrics = {
   needsAttention: number
 }
 
+export type OrderTypeFilter = 'market_order' | 'limit_order'
+
 export type OrderFirehoseRow = {
   id: string
   orderType: string
@@ -164,6 +166,7 @@ const ORDER_FIREHOSE_SQL = orderRowsSql(`
     $2::timestamptz IS NULL
     OR (ro.created_at, ro.id) < ($2::timestamptz, $3::uuid)
   )
+    AND ($4::text IS NULL OR ro.order_type = $4::text)
   ORDER BY ro.created_at DESC, ro.id DESC
   LIMIT $1
 `)
@@ -186,6 +189,13 @@ latest_quotes AS (
   FROM public.market_order_quotes moq
   WHERE moq.order_id IN (SELECT id FROM selected_orders)
   ORDER BY moq.order_id, moq.created_at DESC, moq.id DESC
+),
+latest_limit_quotes AS (
+  SELECT DISTINCT ON (loq.order_id)
+    loq.*
+  FROM public.limit_order_quotes loq
+  WHERE loq.order_id IN (SELECT id FROM selected_orders)
+  ORDER BY loq.order_id, loq.created_at DESC, loq.id DESC
 )
 SELECT
   ro.id::text,
@@ -202,23 +212,28 @@ SELECT
   ro.action_timeout_at,
   ro.workflow_trace_id,
   ro.workflow_parent_span_id,
-  moq.id::text AS quote_id,
-  moq.provider_id AS quote_provider_id,
-  COALESCE(moq.order_kind, moa.order_kind) AS order_kind,
-  COALESCE(moq.amount_in, moa.amount_in) AS quoted_amount_in,
-  COALESCE(moq.amount_out, moa.amount_out) AS quoted_amount_out,
+  COALESCE(moq.id, loq.id)::text AS quote_id,
+  COALESCE(moq.provider_id, loq.provider_id) AS quote_provider_id,
+  CASE
+    WHEN ro.order_type = 'limit_order' THEN 'limit'
+    ELSE COALESCE(moq.order_kind, moa.order_kind)
+  END AS order_kind,
+  COALESCE(moq.amount_in, moa.amount_in, loq.input_amount, loa.input_amount) AS quoted_amount_in,
+  COALESCE(moq.amount_out, moa.amount_out, loq.output_amount, loa.output_amount) AS quoted_amount_out,
   COALESCE(moq.min_amount_out, moa.min_amount_out) AS min_amount_out,
   COALESCE(moq.max_amount_in, moa.max_amount_in) AS max_amount_in,
   COALESCE(moq.slippage_bps, moa.slippage_bps) AS slippage_bps,
-  moq.expires_at AS quote_expires_at,
-  moq.provider_quote,
-  moq.usd_valuation_json AS quote_usd_valuation,
+  COALESCE(moq.expires_at, loq.expires_at) AS quote_expires_at,
+  COALESCE(moq.provider_quote, loq.provider_quote) AS provider_quote,
+  COALESCE(moq.usd_valuation_json, '{}'::jsonb) AS quote_usd_valuation,
   COALESCE(legs.execution_legs, '[]'::jsonb) AS execution_legs,
   COALESCE(steps.execution_steps, '[]'::jsonb) AS execution_steps,
   COALESCE(ops.provider_operations, '[]'::jsonb) AS provider_operations
 FROM selected_orders ro
 LEFT JOIN latest_quotes moq ON moq.order_id = ro.id
+LEFT JOIN latest_limit_quotes loq ON loq.order_id = ro.id
 LEFT JOIN public.market_order_actions moa ON moa.order_id = ro.id
+LEFT JOIN public.limit_order_actions loa ON loa.order_id = ro.id
 LEFT JOIN LATERAL (
   SELECT jsonb_agg(
     jsonb_build_object(
@@ -413,12 +428,14 @@ ORDER BY ro.created_at DESC, ro.id DESC
 export async function fetchOrderFirehose(
   pool: Pool,
   limit: number,
-  cursor?: OrderPageCursor
+  cursor?: OrderPageCursor,
+  orderType?: OrderTypeFilter
 ): Promise<OrderFirehoseRow[]> {
   const result = await pool.query<OrderFirehoseDbRow>(ORDER_FIREHOSE_SQL, [
     limit,
     cursor?.createdAt ?? null,
-    cursor?.id ?? null
+    cursor?.id ?? null,
+    orderType ?? null
   ])
   return result.rows.map(mapOrderRow)
 }

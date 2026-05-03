@@ -1,6 +1,7 @@
 import type {
   MeResponse,
   OrdersResponse,
+  OrderTypeFilter,
   SnapshotEvent,
   UpsertEvent
 } from './types'
@@ -19,10 +20,12 @@ export async function fetchMe(): Promise<MeResponse> {
 
 export async function fetchOrders(
   limit = 100,
-  cursor?: string
+  cursor?: string,
+  orderType?: OrderTypeFilter
 ): Promise<OrdersResponse> {
   const params = new URLSearchParams({ limit: String(limit) })
   if (cursor) params.set('cursor', cursor)
+  if (orderType) params.set('orderType', orderType)
 
   const response = await fetch(`/api/orders?${params.toString()}`, {
     credentials: 'include'

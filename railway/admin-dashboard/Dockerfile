@@ -4,6 +4,7 @@ WORKDIR /app
 
 COPY package.json bun.lock tsconfig.base.json ./
 COPY apps/admin-dashboard/package.json ./apps/admin-dashboard/package.json
+COPY apps/explorer/package.json ./apps/explorer/package.json
 COPY apps/router-gateway/package.json ./apps/router-gateway/package.json
 
 RUN bun install --frozen-lockfile

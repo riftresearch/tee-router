@@ -32,10 +32,15 @@ export type InternalOrderEnvelope = {
   cancellation_secret?: string
 }
 
-export type InternalRouterOrderQuote = {
-  type: 'market_order'
-  payload: InternalMarketOrderQuote
-}
+export type InternalRouterOrderQuote =
+  | {
+      type: 'market_order'
+      payload: InternalMarketOrderQuote
+    }
+  | {
+      type: 'limit_order'
+      payload: InternalLimitOrderQuote
+    }
 
 export type InternalMarketOrderQuote = {
   id: string
@@ -54,23 +59,46 @@ export type InternalMarketOrderQuote = {
   created_at: string
 }
 
-export type CreateQuoteRequest = {
-  type: 'market_order'
-  from_asset: InternalDepositAsset
-  to_asset: InternalDepositAsset
+export type InternalLimitOrderQuote = {
+  id: string
+  order_id?: string | null
+  source_asset: InternalDepositAsset
+  destination_asset: InternalDepositAsset
   recipient_address: string
-} & (
+  provider_id: string
+  input_amount: string
+  output_amount: string
+  residual_policy: 'refund'
+  expires_at: string
+  created_at: string
+}
+
+export type CreateQuoteRequest =
+  | ({
+      type: 'market_order'
+      from_asset: InternalDepositAsset
+      to_asset: InternalDepositAsset
+      recipient_address: string
+    } & (
+      | {
+          kind: 'exact_in'
+          amount_in: string
+          slippage_bps: number
+        }
+      | {
+          kind: 'exact_out'
+          amount_out: string
+          slippage_bps: number
+        }
+    ))
   | {
-      kind: 'exact_in'
-      amount_in: string
-      slippage_bps: number
+      type: 'limit_order'
+      from_asset: InternalDepositAsset
+      to_asset: InternalDepositAsset
+      recipient_address: string
+      input_amount: string
+      output_amount: string
     }
-  | {
-      kind: 'exact_out'
-      amount_out: string
-      slippage_bps: number
-    }
-)
 
 export type CreateOrderRequest = {
   quote_id: string

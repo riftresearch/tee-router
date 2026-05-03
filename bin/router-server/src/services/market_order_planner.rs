@@ -150,18 +150,21 @@ impl MarketOrderRoutePlanner {
             max_amount_in: None,
             slippage_bps: 0,
             provider_quote: quote.provider_quote.clone(),
+            usd_valuation: json!({}),
             expires_at: quote.expires_at,
             created_at: quote.created_at,
         };
         let path = self.resolve_quoted_transition_path(order, &materialization_quote)?;
-        let steps = materialize_transition_steps(
+        let materialized = materialize_transition_steps(
             order,
             source_vault,
             &materialization_quote,
             &path,
             planned_at,
         )?;
-        validate_intermediate_custody_plan(&steps)?;
+        validate_leg_materialization(&materialized.legs)?;
+        validate_step_materialization(&materialized.steps)?;
+        validate_intermediate_custody_plan(&materialized.steps)?;
 
         Ok(MarketOrderRoutePlan {
             path_id: path.path_id,
@@ -170,7 +173,8 @@ impl MarketOrderRoutePlanner {
                 .iter()
                 .map(|transition| transition.id.clone())
                 .collect(),
-            steps,
+            legs: materialized.legs,
+            steps: materialized.steps,
         })
     }
 
@@ -505,12 +509,9 @@ fn materialize_transition_steps(
             }
             MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
                 let leg = legs.take_one(&transition.id, transition.kind)?;
-                let custody = hyperliquid_custody_for_withdrawal(
-                    &path.transitions,
-                    transition_index,
-                    bridge_signer_asset.as_ref(),
-                )?;
-                steps.push(hyperliquid_bridge_withdrawal_step(
+                let custody =
+                    hyperliquid_custody_for_withdrawal(&path.transitions, transition_index)?;
+                let transition_steps = vec![hyperliquid_bridge_withdrawal_step(
                     HyperliquidBridgeWithdrawalStepSpec {
                         order,
                         quote,
@@ -521,7 +522,21 @@ fn materialize_transition_steps(
                         step_index,
                         planned_at,
                     },
-                )?);
+                )?];
+                push_execution_leg(
+                    &mut execution_legs,
+                    &mut steps,
+                    ExecutionLegMaterializationSpec {
+                        order,
+                        quote,
+                        transition,
+                        quote_legs: &[leg],
+                        transition_steps,
+                        leg_index,
+                        planned_at,
+                    },
+                )?;
+                leg_index += 1;
                 step_index += 1;
             }
             MarketOrderTransitionKind::HyperliquidTrade => {
@@ -579,7 +594,6 @@ fn materialize_transition_steps(
                             planned_at,
                         })?
                     };
-                    steps.push(materialized_step.clone());
                     transition_steps.push(materialized_step);
                     step_index += 1;
                 }
@@ -2069,6 +2083,7 @@ fn hyperliquid_bridge_withdrawal_step(
         }),
         planned_at,
     }))
+}
 
 fn validate_step_materialization(steps: &[OrderExecutionStep]) -> MarketOrderRoutePlanResult<()> {
     for step in steps {

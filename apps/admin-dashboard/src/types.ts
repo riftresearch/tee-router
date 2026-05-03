@@ -142,6 +142,8 @@ export type OrderFirehoseRow = {
   progress: OrderProgress
 }
 
+export type OrderTypeFilter = 'market_order' | 'limit_order'
+
 export type CurrentUser = {
   id: string
   name: string

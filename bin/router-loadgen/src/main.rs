@@ -103,6 +103,57 @@ const RANDOM_ROUTES: &[RandomRoute] = &[
     ),
 ];
 
+const RANDOM_LIMIT_ROUTES: &[RandomLimitRoute] = &[
+    RandomLimitRoute::new(
+        "Ethereum.USDC",
+        "Bitcoin.BTC",
+        RandomAddressKind::Evm,
+        RandomAddressKind::Bitcoin,
+        LimitAsset::Usdc,
+        LimitAsset::Btc,
+    ),
+    RandomLimitRoute::new(
+        "Base.USDC",
+        "Bitcoin.BTC",
+        RandomAddressKind::Evm,
+        RandomAddressKind::Bitcoin,
+        LimitAsset::Usdc,
+        LimitAsset::Btc,
+    ),
+    RandomLimitRoute::new(
+        "Arbitrum.USDC",
+        "Bitcoin.BTC",
+        RandomAddressKind::Evm,
+        RandomAddressKind::Bitcoin,
+        LimitAsset::Usdc,
+        LimitAsset::Btc,
+    ),
+    RandomLimitRoute::new(
+        "Bitcoin.BTC",
+        "Ethereum.USDC",
+        RandomAddressKind::Bitcoin,
+        RandomAddressKind::Evm,
+        LimitAsset::Btc,
+        LimitAsset::Usdc,
+    ),
+    RandomLimitRoute::new(
+        "Bitcoin.BTC",
+        "Base.USDC",
+        RandomAddressKind::Bitcoin,
+        RandomAddressKind::Evm,
+        LimitAsset::Btc,
+        LimitAsset::Usdc,
+    ),
+    RandomLimitRoute::new(
+        "Bitcoin.BTC",
+        "Arbitrum.USDC",
+        RandomAddressKind::Bitcoin,
+        RandomAddressKind::Evm,
+        LimitAsset::Btc,
+        LimitAsset::Usdc,
+    ),
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RandomRoute {
     from: &'static str,
@@ -131,9 +182,45 @@ impl RandomRoute {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RandomLimitRoute {
+    from: &'static str,
+    to: &'static str,
+    source_kind: RandomAddressKind,
+    destination_kind: RandomAddressKind,
+    input_asset: LimitAsset,
+    output_asset: LimitAsset,
+}
+
+impl RandomLimitRoute {
+    const fn new(
+        from: &'static str,
+        to: &'static str,
+        source_kind: RandomAddressKind,
+        destination_kind: RandomAddressKind,
+        input_asset: LimitAsset,
+        output_asset: LimitAsset,
+    ) -> Self {
+        Self {
+            from,
+            to,
+            source_kind,
+            destination_kind,
+            input_asset,
+            output_asset,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RandomAddressKind {
     Bitcoin,
     Evm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LimitAsset {
+    Btc,
+    Usdc,
 }
 
 #[derive(Parser)]
@@ -234,6 +321,10 @@ struct QuoteInput {
     )]
     gateway_url: String,
 
+    /// Order type to create.
+    #[arg(long, value_enum, default_value_t = OrderType::Market)]
+    order_type: OrderType,
+
     /// Source asset, e.g. Base.USDC or evm:8453.0x....
     #[arg(long)]
     from: Option<String>,
@@ -270,6 +361,7 @@ struct QuoteInput {
 
 #[derive(Debug, Clone)]
 struct ResolvedQuoteInput {
+    order_type: OrderType,
     from: String,
     to: String,
     to_address: String,
@@ -278,6 +370,21 @@ struct ResolvedQuoteInput {
     max_slippage: String,
     amount_format: AmountFormat,
     from_address: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum OrderType {
+    Market,
+    Limit,
+}
+
+impl OrderType {
+    fn as_gateway_str(self) -> &'static str {
+        match self {
+            Self::Market => "market_order",
+            Self::Limit => "limit_order",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -334,6 +441,7 @@ struct RandomContext {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct QuoteRequest<'a> {
+    order_type: &'static str,
     from: &'a str,
     to: &'a str,
     to_address: &'a str,
@@ -349,6 +457,8 @@ struct QuoteRequest<'a> {
 #[serde(rename_all = "camelCase")]
 struct QuoteResponse {
     quote_id: String,
+    #[serde(default)]
+    order_type: Option<String>,
     from: String,
     to: String,
     expiry: String,
@@ -384,6 +494,8 @@ struct OrderResponse {
     order_address: String,
     amount_to_send: String,
     quote_id: String,
+    #[serde(default)]
+    order_type: Option<String>,
     from: String,
     to: String,
     status: String,
@@ -571,7 +683,8 @@ async fn create_order_and_maybe_fund(
     funding_mode: FundingMode,
 ) -> Result<LoadgenResult> {
     let task_label = format!(
-        "task {index} {} -> {} from_amount={} to_amount={}",
+        "task {index} {:?} {} -> {} from_amount={} to_amount={}",
+        quote_input.order_type,
         quote_input.from,
         quote_input.to,
         quote_input.from_amount.as_deref().unwrap_or("-"),
@@ -606,6 +719,7 @@ async fn create_quote(
 ) -> Result<QuoteResponse> {
     let url = runtime.gateway_url.join("quote")?;
     let request = QuoteRequest {
+        order_type: input.order_type.as_gateway_str(),
         from: &input.from,
         to: &input.to,
         to_address: &input.to_address,
@@ -865,6 +979,7 @@ fn validate_create_and_fund_command(command: &CreateAndFundCommand) -> Result<()
 
 fn resolve_static_quote_input(input: &QuoteInput) -> Result<ResolvedQuoteInput> {
     Ok(ResolvedQuoteInput {
+        order_type: input.order_type,
         from: input
             .from
             .clone()
@@ -885,10 +1000,18 @@ fn resolve_static_quote_input(input: &QuoteInput) -> Result<ResolvedQuoteInput> 
 fn validate_resolved_quote_input(input: &ResolvedQuoteInput) -> Result<()> {
     let amount_count =
         usize::from(input.from_amount.is_some()) + usize::from(input.to_amount.is_some());
-    if amount_count != 1 {
-        return Err(eyre!(
-            "exactly one of --from-amount or --to-amount is required"
-        ));
+    match input.order_type {
+        OrderType::Market if amount_count != 1 => {
+            return Err(eyre!(
+                "exactly one of --from-amount or --to-amount is required for market orders"
+            ));
+        }
+        OrderType::Limit if amount_count != 2 => {
+            return Err(eyre!(
+                "--from-amount and --to-amount are required for limit orders"
+            ));
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -900,6 +1023,10 @@ fn quote_input_for_task(
 ) -> Result<ResolvedQuoteInput> {
     if !command.random {
         return resolve_static_quote_input(&command.quote);
+    }
+
+    if command.quote.order_type == OrderType::Limit {
+        return random_limit_quote_input(command, random_context, rng);
     }
 
     let route = RANDOM_ROUTES
@@ -935,6 +1062,7 @@ fn quote_input_for_task(
     };
 
     Ok(ResolvedQuoteInput {
+        order_type: OrderType::Market,
         from: route.from.to_string(),
         to: route.to.to_string(),
         to_address,
@@ -944,6 +1072,84 @@ fn quote_input_for_task(
         amount_format: AmountFormat::Raw,
         from_address,
     })
+}
+
+fn random_limit_quote_input(
+    command: &CreateAndFundCommand,
+    random_context: &RandomContext,
+    rng: &mut StdRng,
+) -> Result<ResolvedQuoteInput> {
+    let route = RANDOM_LIMIT_ROUTES
+        .choose(rng)
+        .expect("random limit route list is non-empty")
+        .to_owned();
+    let notional_usdc_raw =
+        rng.gen_range(command.random_min_raw_amount..=command.random_max_raw_amount);
+    let (from_amount, to_amount) = marketable_limit_amounts(route, notional_usdc_raw)?;
+    let bitcoin_address = random_context.bitcoin_address.as_deref();
+    let to_address = if route.destination_kind == RandomAddressKind::Bitcoin {
+        bitcoin_address
+            .ok_or_else(|| {
+                eyre!(
+                    "random Bitcoin destination selected but no --bitcoin-address or devnet manifest demo Bitcoin address is available"
+                )
+            })?
+            .to_string()
+    } else {
+        command.quote.to_address.clone()
+    };
+    let from_address = if route.source_kind == RandomAddressKind::Bitcoin {
+        Some(
+            bitcoin_address
+                .ok_or_else(|| {
+                    eyre!(
+                        "random Bitcoin source selected but no --bitcoin-address or devnet manifest demo Bitcoin address is available"
+                    )
+                })?
+                .to_string(),
+        )
+    } else {
+        command.quote.from_address.clone()
+    };
+
+    Ok(ResolvedQuoteInput {
+        order_type: OrderType::Limit,
+        from: route.from.to_string(),
+        to: route.to.to_string(),
+        to_address,
+        from_amount: Some(from_amount),
+        to_amount: Some(to_amount),
+        max_slippage: command.quote.max_slippage.clone(),
+        amount_format: AmountFormat::Raw,
+        from_address,
+    })
+}
+
+fn marketable_limit_amounts(
+    route: RandomLimitRoute,
+    notional_usdc_raw: u64,
+) -> Result<(String, String)> {
+    let input = asset_amount_for_notional(route.input_asset, notional_usdc_raw)?;
+    let fair_output = asset_amount_for_notional(route.output_asset, notional_usdc_raw)?;
+    let output = fair_output
+        .saturating_mul(U256::from(4_u64))
+        .checked_div(U256::from(5_u64))
+        .ok_or_else(|| eyre!("failed to compute limit output amount"))?;
+    if input.is_zero() || output.is_zero() {
+        return Err(eyre!("random limit amounts resolved to zero"));
+    }
+    Ok((input.to_string(), output.to_string()))
+}
+
+fn asset_amount_for_notional(asset: LimitAsset, usdc_raw: u64) -> Result<U256> {
+    let amount = match asset {
+        LimitAsset::Usdc => U256::from(usdc_raw),
+        LimitAsset::Btc => U256::from(usdc_raw)
+            .checked_mul(U256::from(100_u64))
+            .and_then(|value| value.checked_div(U256::from(60_000_u64)))
+            .ok_or_else(|| eyre!("failed to compute BTC notional amount"))?,
+    };
+    Ok(amount)
 }
 
 fn evm_private_key_for_task(

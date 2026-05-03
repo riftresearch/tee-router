@@ -134,6 +134,9 @@ pub fn execution_step_type_for_transition_kind(
         MarketOrderTransitionKind::HyperliquidBridgeDeposit => {
             OrderExecutionStepType::HyperliquidBridgeDeposit
         }
+        MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
+            OrderExecutionStepType::HyperliquidBridgeWithdrawal
+        }
         MarketOrderTransitionKind::HyperliquidTrade => OrderExecutionStepType::HyperliquidTrade,
         MarketOrderTransitionKind::UniversalRouterSwap => {
             OrderExecutionStepType::UniversalRouterSwap

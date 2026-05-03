@@ -17,7 +17,8 @@ import {
   fetchOrderFirehose,
   fetchOrderMetrics,
   type OrderFirehoseRow,
-  type OrderPageCursor
+  type OrderPageCursor,
+  type OrderTypeFilter
 } from './orders'
 
 type AppBindings = {
@@ -172,10 +173,12 @@ export function createApp(
     }
 
     const limit = parseLimit(c.req.query('limit'), config.orderLimit)
+    const orderType = parseOrderType(c.req.query('orderType'))
+    if (orderType instanceof Response) return orderType
     const cursor = parseOrderCursor(c.req.query('cursor'))
     if (cursor instanceof Response) return cursor
 
-    const page = await fetchOrderPage(replicaRuntime, limit, cursor)
+    const page = await fetchOrderPage(replicaRuntime, limit, cursor, orderType)
     return c.json({
       orders: page.orders,
       nextCursor: page.nextCursor,
@@ -194,10 +197,13 @@ export function createApp(
     }
 
     const limit = parseLimit(c.req.query('limit'), config.orderLimit)
+    const orderType = parseOrderType(c.req.query('orderType'))
+    if (orderType instanceof Response) return orderType
     return createOrderEventStream(
       c.req.raw.signal,
       replicaRuntime,
       limit,
+      orderType,
       orderCdcBroker
     )
   })
@@ -260,10 +266,11 @@ function parseLimit(value: string | undefined, defaultLimit: number): number {
 async function fetchOrderPage(
   replicaRuntime: ReplicaDatabaseRuntime,
   limit: number,
-  cursor: OrderPageCursor | undefined
+  cursor: OrderPageCursor | undefined,
+  orderType: OrderTypeFilter | undefined
 ) {
   const [ordersWithLookahead, metrics] = await Promise.all([
-    fetchOrderFirehose(replicaRuntime.pool, limit + 1, cursor),
+    fetchOrderFirehose(replicaRuntime.pool, limit + 1, cursor, orderType),
     fetchOrderMetrics(replicaRuntime.pool)
   ])
   const orders = ordersWithLookahead.slice(0, limit)
@@ -289,6 +296,12 @@ function parseOrderCursor(value: string | undefined): OrderPageCursor | undefine
   } catch (_error) {
     return Response.json({ error: 'invalid_cursor' }, { status: 400 })
   }
+}
+
+function parseOrderType(value: string | undefined): OrderTypeFilter | undefined | Response {
+  if (!value) return undefined
+  if (value === 'market_order' || value === 'limit_order') return value
+  return Response.json({ error: 'invalid_order_type' }, { status: 400 })
 }
 
 function encodeOrderCursor(order: OrderFirehoseRow | undefined): string | undefined {
@@ -328,6 +341,7 @@ function createOrderEventStream(
   signal: AbortSignal,
   replicaRuntime: ReplicaDatabaseRuntime,
   limit: number,
+  orderType: OrderTypeFilter | undefined,
   orderCdcBroker: OrderCdcBroker | null
 ): Response {
   const encoder = new TextEncoder()
@@ -368,6 +382,7 @@ function createOrderEventStream(
           const pending: OrderCdcUpsert[] = []
           let snapshotSent = false
           unsubscribe = orderCdcBroker?.subscribe((event) => {
+            if (orderType && event.order.orderType !== orderType) return
             if (!snapshotSent) {
               pending.push(event)
               return
@@ -376,7 +391,7 @@ function createOrderEventStream(
           })
 
           const [initialOrders, initialMetrics] = await Promise.all([
-            fetchOrderFirehose(replicaRuntime.pool, limit),
+            fetchOrderFirehose(replicaRuntime.pool, limit, undefined, orderType),
             fetchOrderMetrics(replicaRuntime.pool)
           ])
           write('snapshot', {

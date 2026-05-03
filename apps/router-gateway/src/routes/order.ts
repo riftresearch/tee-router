@@ -3,7 +3,7 @@ import { createRoute, z } from '@hono/zod-openapi'
 import type { AmountFormat } from '../assets'
 import type { GatewayConfig } from '../config'
 import { GatewayValidationError, normalizeError } from '../errors'
-import { marketQuoteFromEnvelope, presentOrderEnvelope } from '../presenters'
+import { presentOrderEnvelope, routerQuoteFromEnvelope } from '../presenters'
 import {
   refundAuthorizationServiceFor,
   routerClientFor,
@@ -54,7 +54,7 @@ export const orderMarketRoute = createRoute({
   method: 'post',
   path: '/order/market',
   tags: ['Orders'],
-  summary: 'Create a market order from a quote',
+  summary: 'Create an order from a quote',
   request: {
     body: {
       required: true,
@@ -67,7 +67,7 @@ export const orderMarketRoute = createRoute({
   },
   responses: {
     201: {
-      description: 'Market order created by the internal router API.',
+      description: 'Order created by the internal router API.',
       content: {
         'application/json': {
           schema: OrderResponseSchema
@@ -150,7 +150,7 @@ export function createOrderMarketHandler(
       const refundMode = request.refundMode ?? 'evmSignature'
       const routerClient = routerClientFor(config, deps)
       const quoteEnvelope = await routerClient.getQuote(request.quoteId)
-      const quote = marketQuoteFromEnvelope(quoteEnvelope)
+      const quote = routerQuoteFromEnvelope(quoteEnvelope)
 
       if (
         !addressesMatch(

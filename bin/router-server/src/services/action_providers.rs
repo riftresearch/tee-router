@@ -3348,22 +3348,23 @@ impl HyperliquidProvider {
             format!("hyperliquid limit order: invalid vault_address {vault_address}: {err}")
         })?;
 
+        let (order_kind, min_amount_out, max_amount_in) = if is_buy {
+            ("exact_out", None, Some(step.amount_in.as_str()))
+        } else {
+            ("exact_in", Some(step.amount_out.as_str()), None)
+        };
         let (wire_asset, _pair_name, base_meta, _quote_meta) = self
             .resolve_spot_pair(&base_symbol, HL_QUOTE_SYMBOL)
             .await?;
         let base_sz = compute_base_sz(
             is_buy,
+            order_kind,
             &step.amount_in,
             input_decimals,
             &step.amount_out,
             output_decimals,
             base_meta.sz_decimals,
         )?;
-        let (order_kind, min_amount_out, max_amount_in) = if is_buy {
-            ("exact_out", None, Some(step.amount_in.as_str()))
-        } else {
-            ("exact_in", Some(step.amount_out.as_str()), None)
-        };
         let limit_px = compute_limit_px(LimitPxInput {
             is_buy,
             order_kind,

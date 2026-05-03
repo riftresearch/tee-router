@@ -6,6 +6,7 @@ import {
 } from './assets'
 import { GatewayValidationError } from './errors'
 import type {
+  InternalLimitOrderQuote,
   InternalMarketOrderQuote,
   InternalOrderEnvelope,
   InternalQuoteEnvelope
@@ -13,6 +14,7 @@ import type {
 
 export type PublicQuoteResponse = {
   quoteId: string
+  orderType: 'market_order' | 'limit_order'
   from: string
   to: string
   expiry: string
@@ -36,16 +38,19 @@ export function presentQuoteEnvelope(
   envelope: InternalQuoteEnvelope,
   amountFormat: AmountFormat
 ): PublicQuoteResponse {
-  return presentQuote(marketQuoteFromEnvelope(envelope), amountFormat)
+  return presentQuote(routerQuoteFromEnvelope(envelope), amountFormat)
 }
 
 export function presentOrderEnvelope(
   envelope: InternalOrderEnvelope,
   amountFormat: AmountFormat
 ): PublicOrderResponse {
-  const quote = marketQuoteFromEnvelope({ quote: envelope.quote })
+  const quote = routerQuoteFromEnvelope({ quote: envelope.quote })
   const source = assetIdentifierFromInternal(quote.source_asset)
-  const amountToSendRaw = quote.max_amount_in ?? quote.amount_in
+  const amountToSendRaw =
+    envelope.quote.type === 'market_order'
+      ? envelope.quote.payload.max_amount_in ?? envelope.quote.payload.amount_in
+      : envelope.quote.payload.input_amount
   const orderAddress = envelope.funding_vault?.vault.deposit_vault_address
 
   if (!orderAddress) {
@@ -74,12 +79,32 @@ export function marketQuoteFromEnvelope(
   return envelope.quote.payload
 }
 
+export function routerQuoteFromEnvelope(
+  envelope: InternalQuoteEnvelope
+): InternalMarketOrderQuote | InternalLimitOrderQuote {
+  return envelope.quote.payload
+}
+
 function presentQuote(
-  quote: InternalMarketOrderQuote,
+  quote: InternalMarketOrderQuote | InternalLimitOrderQuote,
   amountFormat: AmountFormat
 ): PublicQuoteResponse {
   const source = assetIdentifierFromInternal(quote.source_asset)
   const destination = assetIdentifierFromInternal(quote.destination_asset)
+  if ('input_amount' in quote) {
+    return {
+      quoteId: quote.id,
+      orderType: 'limit_order',
+      from: source.id,
+      to: destination.id,
+      expiry: quote.expires_at,
+      expectedOut: formatAmount(quote.output_amount, destination, amountFormat),
+      maxIn: formatAmount(quote.input_amount, source, amountFormat),
+      maxSlippage: formatSlippage(0, amountFormat),
+      amountFormat
+    }
+  }
+
   const minOut =
     quote.min_amount_out === null || quote.min_amount_out === undefined
       ? undefined
@@ -91,6 +116,7 @@ function presentQuote(
 
   return {
     quoteId: quote.id,
+    orderType: 'market_order',
     from: source.id,
     to: destination.id,
     expiry: quote.expires_at,

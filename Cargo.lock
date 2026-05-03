@@ -5598,7 +5598,7 @@ dependencies = [
 
 [[package]]
 name = "router-integration-tests"
-version = "0.1.3"
+version = "0.1.8"
 dependencies = [
  "alloy",
  "bitcoin",
@@ -5620,7 +5620,7 @@ dependencies = [
 
 [[package]]
 name = "router-loadgen"
-version = "0.1.3"
+version = "0.1.8"
 dependencies = [
  "alloy",
  "bitcoin",

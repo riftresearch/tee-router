@@ -23,6 +23,7 @@ export const ErrorResponseSchema = z
 export const QuoteResponseSchema = z
   .object({
     quoteId: z.string(),
+    orderType: z.enum(['market_order', 'limit_order']),
     from: z.string(),
     to: z.string(),
     expiry: z.string(),
@@ -41,6 +42,7 @@ export const OrderResponseSchema = z
     orderAddress: z.string(),
     amountToSend: z.string(),
     quoteId: z.string(),
+    orderType: z.enum(['market_order', 'limit_order']),
     from: z.string(),
     to: z.string(),
     status: z.string(),

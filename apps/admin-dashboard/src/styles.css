@@ -223,6 +223,13 @@ code,
   border-bottom: 1px solid rgba(140, 153, 145, 0.14);
 }
 
+.table-toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
 .table-toolbar h2 {
   font-size: 18px;
 }
@@ -238,6 +245,38 @@ code,
   max-width: 100%;
   min-width: 0;
   overflow-x: hidden;
+}
+
+.order-tabs {
+  display: inline-flex;
+  flex: 0 0 auto;
+  gap: 3px;
+  padding: 3px;
+  border: 1px solid rgba(140, 153, 145, 0.18);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.order-tabs button {
+  min-height: 30px;
+  padding: 0 11px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #9aa6a0;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.order-tabs button:hover {
+  color: #d5ede1;
+}
+
+.order-tabs button.active {
+  background: rgba(128, 231, 185, 0.13);
+  color: #9ff3ca;
 }
 
 .pagination-sentinel {

@@ -7,9 +7,9 @@ use crate::{
     error::RouterServerError,
     models::{
         LimitOrderAction, LimitOrderQuote, LimitOrderResidualPolicy, MarketOrderAction,
-        MarketOrderKind, MarketOrderKindType, MarketOrderQuote, RouterOrder, RouterOrderAction,
-        RouterOrderQuote, RouterOrderQuoteEnvelope, RouterOrderStatus, RouterOrderType,
-        OrderExecutionStepType,
+        MarketOrderKind, MarketOrderKindType, MarketOrderQuote, OrderExecutionStepType,
+        RouterOrder, RouterOrderAction, RouterOrderQuote, RouterOrderQuoteEnvelope,
+        RouterOrderStatus, RouterOrderType,
     },
     protocol::{backend_chain_for_id, AssetId, ChainId, DepositAsset},
     services::{
@@ -976,7 +976,6 @@ impl OrderManager {
                     provider_policy_snapshot,
                     provider_health_snapshot,
                     unit,
-                    exchange: Some(exchange),
                 })
                 .await?;
             let Some(quote) = quote else {
@@ -1031,7 +1030,6 @@ impl OrderManager {
                     provider_policy_snapshot,
                     provider_health_snapshot,
                     unit,
-                    exchange: Some(exchange),
                 })
                 .await?;
             let Some(quote) = quote else {
@@ -1069,11 +1067,8 @@ impl OrderManager {
         }));
         legs.extend(suffix_legs);
 
-        let provider_id = composed_provider_id(
-            path,
-            unit.map(|provider| provider.id()),
-            Some(exchange.id()),
-        );
+        let provider_id =
+            composed_provider_id(path, unit.map(|provider| provider.id()), &[exchange.id()]);
         let mut provider_quote = transition_path_quote_blob(path, &legs, &gas_reimbursement_plan);
         if let Some(obj) = provider_quote.as_object_mut() {
             obj.insert("kind".to_string(), json!("limit_order_route"));
@@ -1171,6 +1166,13 @@ impl OrderManager {
                 MarketOrderTransitionKind::UnitDeposit | MarketOrderTransitionKind::UnitWithdrawal
             )
         });
+        let requires_exchange = path.transitions.iter().any(|transition| {
+            matches!(
+                transition.kind,
+                MarketOrderTransitionKind::HyperliquidTrade
+                    | MarketOrderTransitionKind::UniversalRouterSwap
+            )
+        });
         let unit_candidates: Vec<Option<Arc<dyn UnitProvider>>> = if requires_unit {
             self.action_providers
                 .units()
@@ -1192,86 +1194,76 @@ impl OrderManager {
             return Ok(None);
         }
 
-        let exchange_candidates: Vec<Option<Arc<dyn ExchangeProvider>>> = if requires_exchange {
-            self.action_providers
-                .exchanges()
-                .iter()
-                .filter(|exchange| {
-                    provider_allowed_for_new_routes(
-                        provider_policy_snapshot,
-                        provider_health_snapshot,
-                        exchange.id(),
-                    ) && exchange_path_compatible(exchange.id(), path)
-                })
-                .cloned()
-                .map(Some)
-                .collect()
+        let has_compatible_exchange = if requires_exchange {
+            self.action_providers.exchanges().iter().any(|exchange| {
+                provider_allowed_for_new_routes(
+                    provider_policy_snapshot,
+                    provider_health_snapshot,
+                    exchange.id(),
+                ) && exchange_path_compatible(exchange.id(), path)
+            })
         } else {
-            vec![None]
+            true
         };
-        if exchange_candidates.is_empty() {
+        if !has_compatible_exchange {
             return Ok(None);
         }
 
         let mut best_for_path: Option<ComposedMarketOrderQuote> = None;
         let mut last_error: Option<MarketOrderError> = None;
         for unit in &unit_candidates {
-            for exchange in &exchange_candidates {
-                let probe_order_kind = request.order_kind.probe_order_kind();
-                let probe_quote = self
-                    .compose_transition_path_quote(ComposeTransitionPathQuoteRequest {
-                        request,
-                        order_kind: &probe_order_kind,
-                        quote_id,
-                        source_depositor_address,
-                        path,
-                        provider_policy_snapshot,
-                        provider_health_snapshot,
-                        unit: unit.as_deref(),
-                        exchange: exchange.as_deref(),
-                    })
-                    .await;
-                let probe_quote = match probe_quote {
-                    Ok(Some(quote)) => quote,
-                    Ok(None) => continue,
-                    Err(err) => {
-                        warn!(path_id = %path.id, error = %err, "transition-path probe quote failed");
-                        last_error = Some(err);
-                        continue;
-                    }
-                };
+            let probe_order_kind = request.order_kind.probe_order_kind();
+            let probe_quote = self
+                .compose_transition_path_quote(ComposeTransitionPathQuoteRequest {
+                    request,
+                    order_kind: &probe_order_kind,
+                    quote_id,
+                    source_depositor_address,
+                    path,
+                    provider_policy_snapshot,
+                    provider_health_snapshot,
+                    unit: unit.as_deref(),
+                })
+                .await;
+            let probe_quote = match probe_quote {
+                Ok(Some(quote)) => quote,
+                Ok(None) => continue,
+                Err(err) => {
+                    warn!(path_id = %path.id, error = %err, "transition-path probe quote failed");
+                    last_error = Some(err);
+                    continue;
+                }
+            };
 
-                let bounded_order_kind = match request.order_kind.bounded_order_kind(&probe_quote) {
-                    Ok(order_kind) => order_kind,
-                    Err(err) => {
-                        last_error = Some(err);
-                        continue;
-                    }
-                };
-                let quote = self
-                    .compose_transition_path_quote(ComposeTransitionPathQuoteRequest {
-                        request,
-                        order_kind: &bounded_order_kind,
-                        quote_id,
-                        source_depositor_address,
-                        path,
-                        provider_policy_snapshot,
-                        provider_health_snapshot,
-                        unit: unit.as_deref(),
-                        exchange: exchange.as_deref(),
-                    })
-                    .await;
-                let quote = match quote {
-                    Ok(Some(quote)) => quote,
-                    Ok(None) => continue,
-                    Err(err) => {
-                        warn!(path_id = %path.id, error = %err, "transition-path bounded quote failed");
-                        last_error = Some(err);
-                        continue;
-                    }
-                };
-                best_for_path = choose_better_quote(request, quote, best_for_path);
-            }
+            let bounded_order_kind = match request.order_kind.bounded_order_kind(&probe_quote) {
+                Ok(order_kind) => order_kind,
+                Err(err) => {
+                    last_error = Some(err);
+                    continue;
+                }
+            };
+            let quote = self
+                .compose_transition_path_quote(ComposeTransitionPathQuoteRequest {
+                    request,
+                    order_kind: &bounded_order_kind,
+                    quote_id,
+                    source_depositor_address,
+                    path,
+                    provider_policy_snapshot,
+                    provider_health_snapshot,
+                    unit: unit.as_deref(),
+                })
+                .await;
+            let quote = match quote {
+                Ok(Some(quote)) => quote,
+                Ok(None) => continue,
+                Err(err) => {
+                    warn!(path_id = %path.id, error = %err, "transition-path bounded quote failed");
+                    last_error = Some(err);
+                    continue;
+                }
+            };
+            best_for_path = choose_better_quote(request, quote, best_for_path);
         }
 
         match (best_for_path, last_error) {
@@ -1406,8 +1398,11 @@ impl OrderManager {
                             }));
                         }
                         MarketOrderTransitionKind::HyperliquidTrade => {
-                            let Some(exchange) =
-                                self.exchange_for_transition(provider_policy_snapshot, transition)?
+                            let Some(exchange) = self.exchange_for_transition(
+                                provider_policy_snapshot,
+                                provider_health_snapshot,
+                                transition,
+                            )?
                             else {
                                 return Ok(None);
                             };
@@ -1454,8 +1449,11 @@ impl OrderManager {
                             )?;
                         }
                         MarketOrderTransitionKind::UniversalRouterSwap => {
-                            let Some(exchange) =
-                                self.exchange_for_transition(provider_policy_snapshot, transition)?
+                            let Some(exchange) = self.exchange_for_transition(
+                                provider_policy_snapshot,
+                                provider_health_snapshot,
+                                transition,
+                            )?
                             else {
                                 return Ok(None);
                             };
@@ -1578,8 +1576,11 @@ impl OrderManager {
                             }));
                         }
                         MarketOrderTransitionKind::HyperliquidTrade => {
-                            let Some(exchange) =
-                                self.exchange_for_transition(provider_policy_snapshot, transition)?
+                            let Some(exchange) = self.exchange_for_transition(
+                                provider_policy_snapshot,
+                                provider_health_snapshot,
+                                transition,
+                            )?
                             else {
                                 return Ok(None);
                             };
@@ -1627,8 +1628,11 @@ impl OrderManager {
                             )?;
                         }
                         MarketOrderTransitionKind::UniversalRouterSwap => {
-                            let Some(exchange) =
-                                self.exchange_for_transition(provider_policy_snapshot, transition)?
+                            let Some(exchange) = self.exchange_for_transition(
+                                provider_policy_snapshot,
+                                provider_health_snapshot,
+                                transition,
+                            )?
                             else {
                                 return Ok(None);
                             };
@@ -1796,10 +1800,15 @@ impl OrderManager {
     fn exchange_for_transition(
         &self,
         provider_policy_snapshot: Option<&crate::services::ProviderPolicySnapshot>,
+        provider_health_snapshot: Option<&crate::services::ProviderHealthSnapshot>,
         transition: &TransitionDecl,
     ) -> MarketOrderResult<Option<Arc<dyn ExchangeProvider>>> {
         let exchange_id = transition.provider.as_str();
-        if !provider_allowed_for_new_routes(provider_policy_snapshot, exchange_id) {
+        if !provider_allowed_for_new_routes(
+            provider_policy_snapshot,
+            provider_health_snapshot,
+            exchange_id,
+        ) {
             return Ok(None);
         }
         self.action_providers
@@ -2297,6 +2306,18 @@ fn unit_path_compatible(unit: &dyn UnitProvider, path: &TransitionPath) -> bool 
             }
             MarketOrderTransitionKind::UnitWithdrawal => {
                 unit.supports_withdrawal(&transition.output.asset)
+            }
+            _ => true,
+        })
+}
+
+fn exchange_path_compatible(exchange_id: &str, path: &TransitionPath) -> bool {
+    path.transitions
+        .iter()
+        .all(|transition| match transition.kind {
+            MarketOrderTransitionKind::HyperliquidTrade
+            | MarketOrderTransitionKind::UniversalRouterSwap => {
+                transition.provider.as_str() == exchange_id
             }
             _ => true,
         })

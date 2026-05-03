@@ -17,11 +17,12 @@ devnet +args:
     {{local_full_compose}} "${args[@]}"
 
 # Run random router loadgen inside the local full compose stack
-compose-router-loadgen count='100' concurrency='8' rps='5' min_raw_amount='100000000' max_raw_amount='250000000':
+compose-router-loadgen count='100' concurrency='8' rps='5' min_raw_amount='100000000' max_raw_amount='250000000' order_type='market':
     {{local_full_compose}} \
       --profile tools \
-      run --rm router-loadgen create-and-fund \
+      run --build --rm router-loadgen create-and-fund \
       --random \
+      --order-type {{order_type}} \
       --random-min-raw-amount {{min_raw_amount}} \
       --random-max-raw-amount {{max_raw_amount}} \
       --amount-format raw \
@@ -41,10 +42,11 @@ compose-router-loadgen-build:
     {{local_full_compose}} --profile tools build router-loadgen
 
 # Run random router loadgen from the host cargo binary
-router-loadgen count='100' concurrency='8' rps='5' min_raw_amount='100000000' max_raw_amount='250000000':
+router-loadgen count='100' concurrency='8' rps='5' min_raw_amount='100000000' max_raw_amount='250000000' order_type='market':
     cargo run --release -p router-loadgen -- create-and-fund \
       --gateway-url http://localhost:3001 \
       --random \
+      --order-type {{order_type}} \
       --random-min-raw-amount {{min_raw_amount}} \
       --random-max-raw-amount {{max_raw_amount}} \
       --amount-format raw \

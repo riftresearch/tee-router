@@ -25,6 +25,7 @@ import type {
   OrderExecutionStep,
   OrderFirehoseRow,
   OrderMetrics,
+  OrderTypeFilter,
   UsdAmountValuation,
   UsdValuation
 } from './types'
@@ -36,6 +37,10 @@ const SHOW_USD_VALUES = true
 const WAIT_FOR_DEPOSIT_STEP_TYPE = 'wait_for_deposit'
 const ACTIVE_STEP_STATUSES = new Set(['ready', 'running', 'waiting', 'submitted'])
 const FAILED_STEP_STATUSES = new Set(['failed', 'cancelled'])
+const ORDER_TABS: Array<{ type: OrderTypeFilter; label: string }> = [
+  { type: 'market_order', label: 'Market Orders' },
+  { type: 'limit_order', label: 'Limit Orders' }
+]
 const CHAIN_DISPLAY_NAMES: Record<string, string> = {
   bitcoin: 'Bitcoin',
   'evm:1': 'Ethereum',
@@ -109,6 +114,7 @@ const ASSET_DECIMALS: Record<string, number> = {
 export function App() {
   const [me, setMe] = useState<MeResponse | null>(null)
   const [orders, setOrders] = useState<OrderFirehoseRow[]>([])
+  const [orderTab, setOrderTab] = useState<OrderTypeFilter>('market_order')
   const [nextCursor, setNextCursor] = useState<string | undefined>()
   const [metrics, setMetrics] = useState<OrderMetrics | null>(null)
   const [expandedOrderId, setExpandedOrderId] = useState<string | null>(null)
@@ -132,11 +138,11 @@ export function App() {
   }, [])
 
   const loadOrders = useCallback(async () => {
-    const response = await fetchOrders(ORDER_LIMIT)
+    const response = await fetchOrders(ORDER_LIMIT, undefined, orderTab)
     setOrders(sortOrders(response.orders))
     setNextCursor(response.nextCursor)
     setMetrics(response.metrics)
-  }, [])
+  }, [orderTab])
 
   const loadMoreOrders = useCallback(async () => {
     if (!nextCursor || loadingMore) return
@@ -144,7 +150,7 @@ export function App() {
     setLoadingMore(true)
     setError(null)
     try {
-      const response = await fetchOrders(ORDER_LIMIT, nextCursor)
+      const response = await fetchOrders(ORDER_LIMIT, nextCursor, orderTab)
       setOrders((current) => mergeOrders(current, response.orders))
       setNextCursor(response.nextCursor)
       setMetrics(response.metrics)
@@ -153,7 +159,7 @@ export function App() {
     } finally {
       setLoadingMore(false)
     }
-  }, [loadingMore, nextCursor])
+  }, [loadingMore, nextCursor, orderTab])
 
   const copyOrderId = useCallback(async (orderId: string) => {
     try {
@@ -196,10 +202,7 @@ export function App() {
 
     const load = async () => {
       try {
-        const session = await loadSession()
-        if (!cancelled && session.authorized) {
-          await loadOrders()
-        }
+        await loadSession()
       } catch (loadError) {
         if (!cancelled) {
           setError(errorMessage(loadError))
@@ -214,13 +217,41 @@ export function App() {
     return () => {
       cancelled = true
     }
-  }, [loadOrders, loadSession])
+  }, [loadSession])
+
+  useEffect(() => {
+    if (!me?.authorized) return
+    let cancelled = false
+
+    setOrders([])
+    setNextCursor(undefined)
+    setExpandedOrderId(null)
+    setLoadingMore(false)
+    setError(null)
+
+    const load = async () => {
+      try {
+        await loadOrders()
+      } catch (loadError) {
+        if (!cancelled) setError(errorMessage(loadError))
+      }
+    }
+
+    void load()
+    return () => {
+      cancelled = true
+    }
+  }, [loadOrders, me?.authorized])
 
   useEffect(() => {
     if (!me?.authorized) return
 
     setStreamState('connecting')
-    const source = new EventSource(`/api/orders/events?limit=${ORDER_LIMIT}`, {
+    const params = new URLSearchParams({
+      limit: String(ORDER_LIMIT),
+      orderType: orderTab
+    })
+    const source = new EventSource(`/api/orders/events?${params.toString()}`, {
       withCredentials: true
     })
 
@@ -247,7 +278,7 @@ export function App() {
       source.close()
       setStreamState('closed')
     }
-  }, [markOrderFlashed, me?.authorized])
+  }, [markOrderFlashed, me?.authorized, orderTab])
 
   useEffect(() => {
     return () => {
@@ -350,7 +381,10 @@ export function App() {
               <h2>Orders</h2>
               <p>created_at DESC</p>
             </div>
-            <StreamBadge state={streamState} />
+            <div className="table-toolbar-actions">
+              <OrderTabs active={orderTab} onChange={setOrderTab} />
+              <StreamBadge state={streamState} />
+            </div>
           </div>
 
           <div className="table-scroll">
@@ -556,6 +590,31 @@ function UserMenu({
       >
         <LogOut size={17} />
       </button>
+    </div>
+  )
+}
+
+function OrderTabs({
+  active,
+  onChange
+}: {
+  active: OrderTypeFilter
+  onChange: (type: OrderTypeFilter) => void
+}) {
+  return (
+    <div className="order-tabs" role="tablist" aria-label="Order type">
+      {ORDER_TABS.map((tab) => (
+        <button
+          key={tab.type}
+          type="button"
+          role="tab"
+          aria-selected={active === tab.type}
+          className={active === tab.type ? 'active' : undefined}
+          onClick={() => onChange(tab.type)}
+        >
+          {tab.label}
+        </button>
+      ))}
     </div>
   )
 }
@@ -2172,7 +2231,10 @@ function formatDate(value: string) {
 
 function formatKind(kind: string | undefined) {
   if (!kind) return 'Unknown'
-  return kind === 'exact_in' ? 'Exact In' : kind === 'exact_out' ? 'Exact Out' : humanize(kind)
+  if (kind === 'exact_in') return 'Exact In'
+  if (kind === 'exact_out') return 'Exact Out'
+  if (kind === 'limit') return 'Limit'
+  return humanize(kind)
 }
 
 function formatAmount(value: string | undefined, asset?: AssetRef) {
