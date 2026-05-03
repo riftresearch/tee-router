@@ -363,7 +363,7 @@
         "tags": [
           "Quotes"
         ],
-        "summary": "Create a market quote",
+        "summary": "Create a quote for a market order",
         "requestBody": {
           "required": true,
           "content": {
@@ -523,7 +523,7 @@
         "tags": [
           "Orders"
         ],
-        "summary": "Cancel an order with its configured refund authorization",
+        "summary": "Cancel an order via specified authentication",
         "parameters": [
           {
             "schema": {
@@ -612,13 +612,13 @@
     "/health": {
       "get": {
         "tags": [
-          "System"
+          "Status"
         ],
-        "summary": "Get system online status",
-        "description": "Returns the health status of the API.",
+        "summary": "Get Rift online status",
+        "description": "Returns the online status of the Rift API.",
         "responses": {
           "200": {
-            "description": "Health check response",
+            "description": "Rift online status response",
             "content": {
               "application/json": {
                 "schema": {
@@ -633,13 +633,13 @@
     "/providers": {
       "get": {
         "tags": [
-          "System"
+          "Status"
         ],
-        "summary": "Get provider reachability status",
-        "description": "Returns cached provider reachability checks from the router worker.",
+        "summary": "Get execution provider online status",
+        "description": "Returns cached execution provider online checks from the router worker.",
         "responses": {
           "200": {
-            "description": "Cached provider reachability response",
+            "description": "Cached execution provider online status response",
             "content": {
               "application/json": {
                 "schema": {

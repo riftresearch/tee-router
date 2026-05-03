@@ -14,41 +14,29 @@
       {
         "tab": "Documentation",
         "openapi": {
-          "source": "https://router-gateway-production.up.railway.app/openapi.json",
+          "source": "/openapi.json",
           "directory": "api"
         },
         "groups": [
           {
-            "group": "Introduction",
+            "group": "Overview",
             "pages": [
               "introduction/what-is-rift",
-              "introduction/multichain-smart-contracts"
+              "introduction/multichain-smart-contracts",
+              "use-cases",
+              "security-model"
             ]
           },
           {
-            "group": "Use Cases",
+            "group": "API Endpoints",
             "pages": [
-              "use-cases/market-orders",
-              "use-cases/limit-orders",
-              "use-cases/otc",
-              "use-cases/vaults"
-            ]
-          },
-          {
-            "group": "Security Model",
-            "pages": [
-              "security-model/core-dependencies",
-              "security-model/cloud-infrastructure",
-              "security-model/key-management"
+              "POST /quote",
+              "POST /order/market",
+              "POST /order/{orderId}/cancel",
+              "GET /health",
+              "GET /providers"
             ]
           }
-        ],
-        "pages": [
-          "POST /quote",
-          "POST /order/market",
-          "POST /order/{orderId}/cancel",
-          "GET /health",
-          "GET /providers"
         ]
       }
     ]
@@ -58,16 +46,11 @@
     "dark": "/images/dark.svg"
   },
   "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "https://t.me/basedcrypto"
-      }
-    ],
+    "links": [],
     "primary": {
       "type": "button",
-      "label": "Launch App",
-      "href": "https://app.rift.trade"
+      "label": "Chat with team",
+      "href": "https://t.me/@samee_rift"
     }
   },
   "footer": {
