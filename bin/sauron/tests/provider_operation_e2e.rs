@@ -947,6 +947,8 @@ fn router_args(
         worker_refund_poll_seconds: 1,
         worker_order_execution_poll_seconds: 1,
         worker_route_cost_refresh_seconds: 300,
+        worker_provider_health_poll_seconds: 120,
+        provider_health_timeout_seconds: 10,
         coinbase_price_api_base_url: mocks.base_url().to_string(),
     }
 }
@@ -1014,6 +1016,8 @@ fn live_router_args(
         worker_refund_poll_seconds: 5,
         worker_order_execution_poll_seconds: 1,
         worker_route_cost_refresh_seconds: 300,
+        worker_provider_health_poll_seconds: 120,
+        provider_health_timeout_seconds: 10,
         coinbase_price_api_base_url: "https://api.coinbase.com".to_string(),
     }
 }
@@ -1967,10 +1971,6 @@ async fn fund_live_source_vault(
     }
 }
 
-fn dummy_commitment() -> String {
-    format!("0x{}", alloy::hex::encode([0xaa; 32]))
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sauron_runtime_drives_router_worker_through_mock_base_eth_btc_progress() {
     run_mock_runtime_route(RuntimeRoute::BaseEthToBtc).await;
@@ -2182,6 +2182,7 @@ async fn run_live_runtime_route(route: RuntimeRoute) {
                 worker_components.vault_manager,
                 worker_components.order_execution_manager,
                 worker_components.route_costs,
+                worker_components.provider_health_poller,
                 worker_config,
             )
             .await
@@ -2375,6 +2376,7 @@ async fn run_mock_runtime_route(route: RuntimeRoute) {
                 worker_components.vault_manager,
                 worker_components.order_execution_manager,
                 worker_components.route_costs,
+                worker_components.provider_health_poller,
                 worker_config,
             )
             .await

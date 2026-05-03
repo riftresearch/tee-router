@@ -8,7 +8,7 @@ use crate::{
         OrderExecutionStep, OrderExecutionStepStatus, OrderExecutionStepType, OrderProviderAddress,
         OrderProviderOperation, OrderProviderOperationHint, ProviderAddressRole,
         ProviderOperationHintKind, ProviderOperationHintStatus, ProviderOperationStatus,
-        ProviderOperationType, RouterOrder, RouterOrderStatus,
+        ProviderOperationType, RouterOrder, RouterOrderQuote, RouterOrderStatus,
     },
     protocol::{backend_chain_for_id, AssetId, ChainId, DepositAsset},
     services::{
@@ -1262,7 +1262,8 @@ impl OrderExecutionManager {
         match operation.operation_type {
             ProviderOperationType::AcrossBridge
             | ProviderOperationType::CctpBridge
-            | ProviderOperationType::HyperliquidBridgeDeposit => {
+            | ProviderOperationType::HyperliquidBridgeDeposit
+            | ProviderOperationType::HyperliquidBridgeWithdrawal => {
                 let provider = self
                     .action_providers
                     .bridge(&operation.provider)
@@ -1295,6 +1296,7 @@ impl OrderExecutionManager {
                     })
             }
             ProviderOperationType::HyperliquidTrade
+            | ProviderOperationType::HyperliquidLimitOrder
             | ProviderOperationType::UniversalRouterSwap => {
                 let provider = self
                     .action_providers
@@ -1550,8 +1552,10 @@ impl OrderExecutionManager {
             ProviderOperationType::AcrossBridge
             | ProviderOperationType::CctpBridge
             | ProviderOperationType::HyperliquidBridgeDeposit
+            | ProviderOperationType::HyperliquidBridgeWithdrawal
             | ProviderOperationType::UnitWithdrawal
             | ProviderOperationType::HyperliquidTrade
+            | ProviderOperationType::HyperliquidLimitOrder
             | ProviderOperationType::UniversalRouterSwap => Some(&PROVIDER_STATUS_VERIFIER),
         }
     }
@@ -1707,7 +1711,8 @@ impl OrderExecutionManager {
         let observation = match operation.operation_type {
             ProviderOperationType::AcrossBridge
             | ProviderOperationType::CctpBridge
-            | ProviderOperationType::HyperliquidBridgeDeposit => {
+            | ProviderOperationType::HyperliquidBridgeDeposit
+            | ProviderOperationType::HyperliquidBridgeWithdrawal => {
                 let provider = self
                     .action_providers
                     .bridge(&operation.provider)
@@ -1740,6 +1745,7 @@ impl OrderExecutionManager {
                     })?
             }
             ProviderOperationType::HyperliquidTrade
+            | ProviderOperationType::HyperliquidLimitOrder
             | ProviderOperationType::UniversalRouterSwap => {
                 let provider = self
                     .action_providers
@@ -1900,14 +1906,20 @@ impl OrderExecutionManager {
         let quote = self
             .db
             .orders()
-            .get_market_order_quote(order.id)
+            .get_router_order_quote(order.id)
             .await
             .map_err(|source| OrderExecutionError::Database { source })?;
         telemetry::record_order_workflow_event(&order, "order.execution_plan_started");
-        let plan = self
-            .market_order_planner
-            .plan(&order, &vault, &quote, Utc::now())
-            .map_err(|source| OrderExecutionError::RoutePlan { source })?;
+        let plan = match &quote {
+            RouterOrderQuote::MarketOrder(quote) => self
+                .market_order_planner
+                .plan(&order, &vault, quote, Utc::now())
+                .map_err(|source| OrderExecutionError::RoutePlan { source })?,
+            RouterOrderQuote::LimitOrder(quote) => self
+                .market_order_planner
+                .plan_limit_order(&order, &vault, quote, Utc::now())
+                .map_err(|source| OrderExecutionError::RoutePlan { source })?,
+        };
         let plan_kind = plan.path_id.clone();
         self.enforce_route_provider_policy(&plan.steps, "planning")
             .await?;
@@ -2486,7 +2498,8 @@ impl OrderExecutionManager {
             match transition.kind {
                 MarketOrderTransitionKind::AcrossBridge
                 | MarketOrderTransitionKind::CctpBridge
-                | MarketOrderTransitionKind::HyperliquidBridgeDeposit => {
+                | MarketOrderTransitionKind::HyperliquidBridgeDeposit
+                | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
                     let bridge_id = transition.provider.as_str();
                     let bridge = self.action_providers.bridge(bridge_id).ok_or_else(|| {
                         OrderExecutionError::ProviderRequestFailed {
@@ -3873,6 +3886,29 @@ impl OrderExecutionManager {
                 })?;
                 self.prepare_provider_completion(running, intent).await
             }
+            OrderExecutionStepType::HyperliquidBridgeWithdrawal => {
+                let request = BridgeExecutionRequest::hyperliquid_bridge_withdrawal_from_value(
+                    &running.request,
+                )
+                .map_err(|message| OrderExecutionError::ProviderRequestFailed {
+                    provider: running.provider.clone(),
+                    message,
+                })?;
+                let provider =
+                    self.action_providers
+                        .bridge(&running.provider)
+                        .ok_or_else(|| OrderExecutionError::ProviderRequestFailed {
+                            provider: running.provider.clone(),
+                            message: "bridge provider is not configured".to_string(),
+                        })?;
+                let intent = provider.execute_bridge(&request).await.map_err(|message| {
+                    OrderExecutionError::ProviderRequestFailed {
+                        provider: running.provider.clone(),
+                        message,
+                    }
+                })?;
+                self.prepare_provider_completion(running, intent).await
+            }
             OrderExecutionStepType::UnitDeposit => {
                 let request =
                     UnitDepositStepRequest::from_value(&running.request).map_err(|message| {
@@ -3924,6 +3960,28 @@ impl OrderExecutionManager {
             OrderExecutionStepType::HyperliquidTrade => {
                 let request =
                     ExchangeExecutionRequest::hyperliquid_trade_from_value(&running.request)
+                        .map_err(|message| OrderExecutionError::ProviderRequestFailed {
+                            provider: running.provider.clone(),
+                            message,
+                        })?;
+                let provider = self
+                    .action_providers
+                    .exchange(&running.provider)
+                    .ok_or_else(|| OrderExecutionError::ProviderRequestFailed {
+                        provider: running.provider.clone(),
+                        message: "exchange provider is not configured".to_string(),
+                    })?;
+                let intent = provider.execute_trade(&request).await.map_err(|message| {
+                    OrderExecutionError::ProviderRequestFailed {
+                        provider: running.provider.clone(),
+                        message,
+                    }
+                })?;
+                self.prepare_provider_completion(running, intent).await
+            }
+            OrderExecutionStepType::HyperliquidLimitOrder => {
+                let request =
+                    ExchangeExecutionRequest::hyperliquid_limit_order_from_value(&running.request)
                         .map_err(|message| OrderExecutionError::ProviderRequestFailed {
                             provider: running.provider.clone(),
                             message,
@@ -5274,6 +5332,18 @@ fn materialize_refund_transition_steps(
                 )?);
                 step_index += 1;
             }
+            MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
+                let leg = legs.take_one(&transition.id, transition.kind)?;
+                let custody = refund_hyperliquid_binding(
+                    position,
+                    &quoted_path.path.transitions,
+                    transition_index,
+                )?;
+                steps.push(refund_transition_hyperliquid_bridge_withdrawal_step(
+                    order, transition, &leg, &custody, is_final, step_index, planned_at,
+                )?);
+                step_index += 1;
+            }
             MarketOrderTransitionKind::HyperliquidTrade => {
                 let transition_legs = legs.take_all(&transition.id);
                 if transition_legs.is_empty() {
@@ -6188,6 +6258,101 @@ fn refund_transition_hyperliquid_bridge_deposit_step(
     }))
 }
 
+fn refund_transition_hyperliquid_bridge_withdrawal_step(
+    order: &RouterOrder,
+    transition: &TransitionDecl,
+    leg: &QuoteLeg,
+    custody: &RefundHyperliquidBinding,
+    is_final: bool,
+    step_index: i32,
+    planned_at: chrono::DateTime<Utc>,
+) -> OrderExecutionResult<OrderExecutionStep> {
+    let provider = refund_leg_provider(leg, transition)?.as_str().to_string();
+    let amount_in = leg.amount_in.clone();
+    let amount_out = leg.amount_out.clone();
+    let (vault_id, vault_address, vault_role, vault_chain_id, vault_asset_id) = match custody {
+        RefundHyperliquidBinding::Explicit {
+            vault_id,
+            address,
+            role,
+            asset,
+        } => (
+            json!(vault_id),
+            json!(address),
+            json!(role.to_db_string()),
+            json!(asset.as_ref().map(|asset| asset.chain.as_str())),
+            json!(asset.as_ref().map(|asset| asset.asset.as_str())),
+        ),
+        RefundHyperliquidBinding::DerivedSpot => (
+            Value::Null,
+            Value::Null,
+            json!(CustodyVaultRole::HyperliquidSpot.to_db_string()),
+            Value::Null,
+            Value::Null,
+        ),
+        RefundHyperliquidBinding::DerivedDestinationExecution { asset } => (
+            Value::Null,
+            Value::Null,
+            json!(CustodyVaultRole::DestinationExecution.to_db_string()),
+            json!(asset.chain.as_str()),
+            json!(asset.asset.as_str()),
+        ),
+    };
+    let transfer_from_spot = match custody {
+        RefundHyperliquidBinding::Explicit { role, .. } => {
+            *role == CustodyVaultRole::HyperliquidSpot
+        }
+        RefundHyperliquidBinding::DerivedSpot => true,
+        RefundHyperliquidBinding::DerivedDestinationExecution { .. } => false,
+    };
+
+    Ok(refund_planned_step(RefundPlannedStepSpec {
+        order_id: order.id,
+        transition_decl_id: Some(transition.id.clone()),
+        step_index,
+        step_type: OrderExecutionStepType::HyperliquidBridgeWithdrawal,
+        provider,
+        input_asset: Some(transition.input.asset.clone()),
+        output_asset: Some(transition.output.asset.clone()),
+        amount_in: Some(amount_in.clone()),
+        min_amount_out: Some(amount_out),
+        provider_ref: None,
+        request: json!({
+            "order_id": order.id,
+            "destination_chain_id": transition.output.asset.chain.as_str(),
+            "output_asset": transition.output.asset.asset.as_str(),
+            "amount": amount_in,
+            "recipient_address": if is_final { json!(order.refund_address) } else { Value::Null },
+            "recipient_custody_vault_role": if is_final { Value::Null } else { json!(CustodyVaultRole::DestinationExecution.to_db_string()) },
+            "recipient_custody_vault_id": null,
+            "transfer_from_spot": transfer_from_spot,
+            "hyperliquid_custody_vault_role": vault_role,
+            "hyperliquid_custody_vault_id": vault_id,
+            "hyperliquid_custody_vault_address": vault_address,
+            "hyperliquid_custody_vault_chain_id": vault_chain_id,
+            "hyperliquid_custody_vault_asset_id": vault_asset_id,
+        }),
+        details: json!({
+            "schema_version": 1,
+            "transition_kind": transition.kind.as_str(),
+            "refund_kind": "transition_path",
+            "recipient_address": if is_final { json!(order.refund_address) } else { Value::Null },
+            "recipient_custody_vault_role": if is_final { Value::Null } else { json!(CustodyVaultRole::DestinationExecution.to_db_string()) },
+            "recipient_custody_vault_status": if is_final { Value::Null } else { json!("pending_derivation") },
+            "hyperliquid_custody_vault_role": match custody {
+                RefundHyperliquidBinding::Explicit { role, .. } => json!(role.to_db_string()),
+                RefundHyperliquidBinding::DerivedSpot => json!(CustodyVaultRole::HyperliquidSpot.to_db_string()),
+                RefundHyperliquidBinding::DerivedDestinationExecution { .. } => json!(CustodyVaultRole::DestinationExecution.to_db_string()),
+            },
+            "hyperliquid_custody_vault_status": match custody {
+                RefundHyperliquidBinding::Explicit { .. } => json!("bound"),
+                _ => json!("pending_derivation"),
+            },
+        }),
+        planned_at,
+    }))
+}
+
 struct RefundHyperliquidTradeStepSpec<'a> {
     order: &'a RouterOrder,
     transition: &'a TransitionDecl,
@@ -6732,7 +6897,33 @@ fn validate_materialized_intermediate_custody_step(
                 vaults_by_id,
             )?;
         }
-        OrderExecutionStepType::HyperliquidTrade => {
+        OrderExecutionStepType::HyperliquidBridgeWithdrawal => {
+            if !is_final {
+                validate_bound_internal_vault(
+                    order_id,
+                    step,
+                    "recipient_custody_vault_role",
+                    "recipient_custody_vault_id",
+                    Some("recipient_address"),
+                    &[CustodyVaultRole::DestinationExecution],
+                    vaults_by_id,
+                )?;
+            }
+            validate_bound_internal_vault(
+                order_id,
+                step,
+                "hyperliquid_custody_vault_role",
+                "hyperliquid_custody_vault_id",
+                Some("hyperliquid_custody_vault_address"),
+                &[
+                    CustodyVaultRole::DestinationExecution,
+                    CustodyVaultRole::HyperliquidSpot,
+                ],
+                vaults_by_id,
+            )?;
+        }
+        OrderExecutionStepType::HyperliquidTrade
+        | OrderExecutionStepType::HyperliquidLimitOrder => {
             validate_bound_internal_vault(
                 order_id,
                 step,

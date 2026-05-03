@@ -137,6 +137,7 @@ pub enum BridgeExecutionRequest {
     CctpBurn(CctpBurnStepRequest),
     CctpReceive(CctpReceiveStepRequest),
     HyperliquidBridgeDeposit(HyperliquidBridgeDepositStepRequest),
+    HyperliquidBridgeWithdrawal(HyperliquidBridgeWithdrawalStepRequest),
 }
 
 impl BridgeExecutionRequest {
@@ -157,6 +158,11 @@ impl BridgeExecutionRequest {
             .map(Self::HyperliquidBridgeDeposit)
     }
 
+    pub fn hyperliquid_bridge_withdrawal_from_value(value: &Value) -> ProviderResult<Self> {
+        decode_step_request(value, "hyperliquid bridge withdrawal step request")
+            .map(Self::HyperliquidBridgeWithdrawal)
+    }
+
     #[must_use]
     pub fn kind(&self) -> &'static str {
         match self {
@@ -164,6 +170,7 @@ impl BridgeExecutionRequest {
             Self::CctpBurn(_) => "cctp_burn",
             Self::CctpReceive(_) => "cctp_receive",
             Self::HyperliquidBridgeDeposit(_) => "hyperliquid_bridge_deposit",
+            Self::HyperliquidBridgeWithdrawal(_) => "hyperliquid_bridge_withdrawal",
         }
     }
 }
@@ -198,12 +205,18 @@ pub struct ExchangeQuote {
 #[serde(tag = "kind", content = "request", rename_all = "snake_case")]
 pub enum ExchangeExecutionRequest {
     HyperliquidTrade(HyperliquidTradeStepRequest),
+    HyperliquidLimitOrder(HyperliquidLimitOrderStepRequest),
     UniversalRouterSwap(UniversalRouterSwapStepRequest),
 }
 
 impl ExchangeExecutionRequest {
     pub fn hyperliquid_trade_from_value(value: &Value) -> ProviderResult<Self> {
         decode_step_request(value, "hyperliquid trade step request").map(Self::HyperliquidTrade)
+    }
+
+    pub fn hyperliquid_limit_order_from_value(value: &Value) -> ProviderResult<Self> {
+        decode_step_request(value, "hyperliquid limit-order step request")
+            .map(Self::HyperliquidLimitOrder)
     }
 
     pub fn universal_router_swap_from_value(value: &Value) -> ProviderResult<Self> {
@@ -215,6 +228,7 @@ impl ExchangeExecutionRequest {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::HyperliquidTrade(_) => "hyperliquid_trade",
+            Self::HyperliquidLimitOrder(_) => "hyperliquid_limit_order",
             Self::UniversalRouterSwap(_) => "universal_router_swap",
         }
     }
@@ -1622,7 +1636,10 @@ pub struct HyperliquidBridgeProvider {
     network: HyperliquidCallNetwork,
     asset_registry: Arc<AssetRegistry>,
     http: HyperliquidHttpClient,
+    target_base_url: String,
 }
+
+const HYPERLIQUID_BRIDGE_WITHDRAW_FEE_RAW: u64 = 1_000_000;
 
 impl HyperliquidBridgeProvider {
     #[must_use]
@@ -1637,6 +1654,7 @@ impl HyperliquidBridgeProvider {
             network,
             asset_registry,
             http,
+            target_base_url,
         }
     }
 
@@ -1656,6 +1674,22 @@ impl HyperliquidBridgeProvider {
             })
     }
 
+    fn resolve_bridge_output(&self, asset: &DepositAsset) -> ProviderResult<u8> {
+        self.asset_registry
+            .provider_asset(
+                ProviderId::HyperliquidBridge,
+                asset,
+                ProviderAssetCapability::BridgeOutput,
+            )
+            .map(|entry| entry.decimals)
+            .ok_or_else(|| {
+                format!(
+                    "hyperliquid bridge does not register {} on {} as a bridge output",
+                    asset.asset, asset.chain
+                )
+            })
+    }
+
     async fn clearinghouse_state(&self, user: &str) -> ProviderResult<ClearinghouseState> {
         let req = json!({
             "type": "clearinghouseState",
@@ -1665,6 +1699,83 @@ impl HyperliquidBridgeProvider {
             .post_json("/info", &req)
             .await
             .map_err(|err| format!("hyperliquid bridge /info clearinghouseState: {err}"))
+    }
+
+    async fn execute_withdrawal(
+        &self,
+        step: &HyperliquidBridgeWithdrawalStepRequest,
+    ) -> ProviderResult<ProviderExecutionIntent> {
+        let destination_chain = ChainId::parse(&step.destination_chain_id)
+            .map_err(|err| format!("invalid destination_chain_id: {err}"))?;
+        let output_asset_id = AssetId::parse(&step.output_asset)
+            .map_err(|err| format!("invalid output_asset: {err}"))?;
+        let destination_asset = DepositAsset {
+            chain: destination_chain,
+            asset: output_asset_id,
+        };
+        let decimals = self.resolve_bridge_output(&destination_asset)?;
+        let source_custody_vault_id = step.hyperliquid_custody_vault_id.ok_or_else(|| {
+            "hyperliquid bridge withdrawal: hyperliquid_custody_vault_id must be hydrated"
+                .to_string()
+        })?;
+        let destination = Address::from_str(&step.recipient_address)
+            .map_err(|err| format!("invalid hyperliquid withdrawal recipient: {err}"))?;
+        let amount = format_hyperliquid_amount(&step.amount, decimals)?;
+        let mut actions = Vec::new();
+        if step.transfer_from_spot {
+            actions.push(CustodyAction::Call(ChainCall::Hyperliquid(
+                HyperliquidCall {
+                    target_base_url: self.target_base_url.clone(),
+                    network: self.network,
+                    vault_address: None,
+                    payload: HyperliquidCallPayload::UsdClassTransfer {
+                        amount: amount.clone(),
+                        to_perp: true,
+                    },
+                },
+            )));
+        }
+        actions.push(CustodyAction::Call(ChainCall::Hyperliquid(
+            HyperliquidCall {
+                target_base_url: self.target_base_url.clone(),
+                network: self.network,
+                vault_address: None,
+                payload: HyperliquidCallPayload::Withdraw3 {
+                    destination: format!("{destination:#x}"),
+                    amount: amount.clone(),
+                },
+            },
+        )));
+        let operation_request = json!({
+            "destination_chain_id": step.destination_chain_id,
+            "output_asset": step.output_asset,
+            "amount": step.amount,
+            "amount_decimal": amount,
+            "recipient_address": format!("{destination:#x}"),
+            "hyperliquid_custody_vault_id": source_custody_vault_id,
+            "transfer_from_spot": step.transfer_from_spot,
+            "withdraw_fee_raw": HYPERLIQUID_BRIDGE_WITHDRAW_FEE_RAW.to_string(),
+            "target_base_url": self.target_base_url,
+            "network": self.network,
+        });
+        Ok(ProviderExecutionIntent::CustodyActions {
+            custody_vault_id: source_custody_vault_id,
+            actions,
+            provider_context: json!({
+                "kind": "hyperliquid_bridge_withdrawal",
+            }),
+            state: ProviderExecutionState {
+                operation: Some(ProviderOperationIntent {
+                    operation_type: ProviderOperationType::HyperliquidBridgeWithdrawal,
+                    status: ProviderOperationStatus::Submitted,
+                    provider_ref: None,
+                    request: Some(operation_request),
+                    response: None,
+                    observed_state: None,
+                }),
+                addresses: vec![],
+            },
+        })
     }
 }
 
@@ -1678,40 +1789,71 @@ impl BridgeProvider for HyperliquidBridgeProvider {
         request: BridgeQuoteRequest,
     ) -> ProviderFuture<'a, Option<BridgeQuote>> {
         Box::pin(async move {
-            if request.destination_asset.chain.as_str() != "hyperliquid"
-                || !request.destination_asset.asset.is_native()
-            {
+            let is_deposit = request.destination_asset.chain.as_str() == "hyperliquid"
+                && request.destination_asset.asset.is_native()
+                && self
+                    .asset_registry
+                    .canonical_assets_match(&request.source_asset, &request.destination_asset)
+                && self.resolve_bridge_input(&request.source_asset).is_ok();
+            let is_withdrawal = request.source_asset.chain.as_str() == "hyperliquid"
+                && request.source_asset.asset.is_native()
+                && self
+                    .asset_registry
+                    .canonical_assets_match(&request.source_asset, &request.destination_asset)
+                && self
+                    .resolve_bridge_output(&request.destination_asset)
+                    .is_ok();
+            if !is_deposit && !is_withdrawal {
                 return Ok(None);
             }
-            if !self
-                .asset_registry
-                .canonical_assets_match(&request.source_asset, &request.destination_asset)
-            {
-                return Ok(None);
-            }
-            let _decimals = match self.resolve_bridge_input(&request.source_asset) {
-                Ok(decimals) => decimals,
-                Err(_) => return Ok(None),
-            };
 
-            let amount = match &request.order_kind {
-                MarketOrderKind::ExactIn { amount_in, .. } => amount_in.clone(),
-                MarketOrderKind::ExactOut { amount_out, .. } => amount_out.clone(),
+            let (amount_in, amount_out) = match &request.order_kind {
+                MarketOrderKind::ExactIn { amount_in, .. } => {
+                    let amount_raw = U256::from_str_radix(amount_in, 10)
+                        .map_err(|err| format!("invalid amount: {err}"))?;
+                    if is_withdrawal {
+                        let fee = U256::from(HYPERLIQUID_BRIDGE_WITHDRAW_FEE_RAW);
+                        if amount_raw <= fee {
+                            return Ok(None);
+                        }
+                        (
+                            amount_in.clone(),
+                            amount_raw.saturating_sub(fee).to_string(),
+                        )
+                    } else {
+                        (amount_in.clone(), amount_in.clone())
+                    }
+                }
+                MarketOrderKind::ExactOut { amount_out, .. } => {
+                    let amount_raw = U256::from_str_radix(amount_out, 10)
+                        .map_err(|err| format!("invalid amount: {err}"))?;
+                    if is_withdrawal {
+                        (
+                            amount_raw
+                                .saturating_add(U256::from(HYPERLIQUID_BRIDGE_WITHDRAW_FEE_RAW))
+                                .to_string(),
+                            amount_out.clone(),
+                        )
+                    } else {
+                        (amount_out.clone(), amount_out.clone())
+                    }
+                }
             };
-            let amount_raw = U256::from_str_radix(&amount, 10)
+            let amount_in_raw = U256::from_str_radix(&amount_in, 10)
                 .map_err(|err| format!("invalid amount: {err}"))?;
-            if amount_raw < minimum_bridge_deposit() {
+            if is_deposit && amount_in_raw < minimum_bridge_deposit() {
                 return Ok(None);
             }
 
             Ok(Some(BridgeQuote {
                 provider_id: self.id().to_string(),
-                amount_in: amount.clone(),
-                amount_out: amount.clone(),
+                amount_in,
+                amount_out,
                 provider_quote: json!({
-                    "kind": "hyperliquid_native_bridge",
+                    "kind": if is_deposit { "hyperliquid_native_bridge" } else { "hyperliquid_bridge_withdrawal" },
                     "bridge_address": format!("{:#x}", hyperliquid_bridge_address(hyperliquid_api_network(self.network))),
                     "minimum_amount": minimum_bridge_deposit().to_string(),
+                    "withdraw_fee_raw": if is_withdrawal { json!(HYPERLIQUID_BRIDGE_WITHDRAW_FEE_RAW.to_string()) } else { Value::Null },
                 }),
                 expires_at: Utc::now() + chrono::Duration::seconds(30),
             }))
@@ -1723,6 +1865,9 @@ impl BridgeProvider for HyperliquidBridgeProvider {
         request: &'a BridgeExecutionRequest,
     ) -> ProviderFuture<'a, ProviderExecutionIntent> {
         Box::pin(async move {
+            if let BridgeExecutionRequest::HyperliquidBridgeWithdrawal(step) = request {
+                return self.execute_withdrawal(step).await;
+            }
             let BridgeExecutionRequest::HyperliquidBridgeDeposit(step) = request else {
                 return Err(format!(
                     "hyperliquid bridge cannot execute bridge request kind {}",
@@ -1800,13 +1945,25 @@ impl BridgeProvider for HyperliquidBridgeProvider {
 
     fn post_execute<'a>(
         &'a self,
-        _provider_context: &'a Value,
+        provider_context: &'a Value,
         receipts: &'a [CustodyActionReceipt],
     ) -> ProviderFuture<'a, ProviderExecutionStatePatch> {
         Box::pin(async move {
             let receipt = receipts.last().ok_or_else(|| {
                 "hyperliquid bridge post_execute: no custody action receipts".to_string()
             })?;
+            if provider_context.get("kind").and_then(Value::as_str)
+                == Some("hyperliquid_bridge_withdrawal")
+            {
+                return Ok(ProviderExecutionStatePatch {
+                    provider_ref: Some(receipt.tx_hash.clone()),
+                    observed_state: Some(json!({
+                        "withdraw_tx_hash": receipt.tx_hash,
+                    })),
+                    status: Some(ProviderOperationStatus::Completed),
+                    ..ProviderExecutionStatePatch::default()
+                });
+            }
             Ok(ProviderExecutionStatePatch {
                 observed_state: Some(json!({
                     "deposit_tx_hash": receipt.tx_hash,
@@ -1822,6 +1979,16 @@ impl BridgeProvider for HyperliquidBridgeProvider {
         request: ProviderOperationObservationRequest,
     ) -> ProviderFuture<'a, Option<ProviderOperationObservation>> {
         Box::pin(async move {
+            if request.operation_type == ProviderOperationType::HyperliquidBridgeWithdrawal {
+                return Ok(Some(ProviderOperationObservation {
+                    status: ProviderOperationStatus::Completed,
+                    provider_ref: request.provider_ref.clone(),
+                    observed_state: request.observed_state.clone(),
+                    response: Some(request.response.clone()),
+                    tx_hash: request.provider_ref.clone(),
+                    error: None,
+                }));
+            }
             if request.operation_type != ProviderOperationType::HyperliquidBridgeDeposit {
                 return Ok(None);
             }
@@ -2587,6 +2754,21 @@ pub struct HyperliquidBridgeDepositStepRequest {
     pub source_custody_vault_address: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HyperliquidBridgeWithdrawalStepRequest {
+    pub order_id: Uuid,
+    pub destination_chain_id: String,
+    pub output_asset: String,
+    pub amount: String,
+    pub recipient_address: String,
+    #[serde(default)]
+    pub transfer_from_spot: bool,
+    #[serde(default)]
+    pub hyperliquid_custody_vault_id: Option<Uuid>,
+    #[serde(default)]
+    pub hyperliquid_custody_vault_address: Option<String>,
+}
+
 /// Convert a base-unit amount string (satoshis / wei / …) into the decimal
 /// string Hyperliquid expects for user-action payloads. The HL SDK spec is
 /// pinned in `hyperliquid-client::signature` — amount is `"1"`, `"0.5"`,
@@ -3051,6 +3233,144 @@ impl HyperliquidProvider {
             expires_at: Utc::now() + chrono::Duration::minutes(10),
         })
     }
+
+    async fn execute_limit_order(
+        &self,
+        step: &HyperliquidLimitOrderStepRequest,
+    ) -> ProviderResult<ProviderExecutionIntent> {
+        let input_asset = DepositAsset {
+            chain: ChainId::parse(&step.input_asset.chain_id)
+                .map_err(|err| format!("invalid input_asset chain: {err}"))?,
+            asset: AssetId::parse(&step.input_asset.asset)
+                .map_err(|err| format!("invalid input_asset asset: {err}"))?,
+        };
+        let output_asset = DepositAsset {
+            chain: ChainId::parse(&step.output_asset.chain_id)
+                .map_err(|err| format!("invalid output_asset chain: {err}"))?,
+            asset: AssetId::parse(&step.output_asset.asset)
+                .map_err(|err| format!("invalid output_asset asset: {err}"))?,
+        };
+
+        let (input_token, input_decimals) =
+            self.resolve_hl_entry(&input_asset, ProviderAssetCapability::ExchangeInput)?;
+        let (output_token, output_decimals) =
+            self.resolve_hl_entry(&output_asset, ProviderAssetCapability::ExchangeOutput)?;
+        let (base_symbol, _base_decimals, is_buy) =
+            classify_hl_leg(&input_token, input_decimals, &output_token, output_decimals)?;
+
+        let vault_id = step.hyperliquid_custody_vault_id.ok_or_else(|| {
+            "hyperliquid limit order: hyperliquid_custody_vault_id must be hydrated".to_string()
+        })?;
+        let vault_address = step
+            .hyperliquid_custody_vault_address
+            .clone()
+            .ok_or_else(|| {
+                "hyperliquid limit order: hyperliquid_custody_vault_address must be hydrated"
+                    .to_string()
+            })?;
+        Address::from_str(&vault_address).map_err(|err| {
+            format!("hyperliquid limit order: invalid vault_address {vault_address}: {err}")
+        })?;
+
+        let (wire_asset, _pair_name, base_meta, _quote_meta) = self
+            .resolve_spot_pair(&base_symbol, HL_QUOTE_SYMBOL)
+            .await?;
+        let base_sz = compute_base_sz(
+            is_buy,
+            &step.amount_in,
+            input_decimals,
+            &step.amount_out,
+            output_decimals,
+            base_meta.sz_decimals,
+        )?;
+        let (order_kind, min_amount_out, max_amount_in) = if is_buy {
+            ("exact_out", None, Some(step.amount_in.as_str()))
+        } else {
+            ("exact_in", Some(step.amount_out.as_str()), None)
+        };
+        let limit_px = compute_limit_px(LimitPxInput {
+            is_buy,
+            order_kind,
+            amount_in_wire: &step.amount_in,
+            input_decimals,
+            amount_out_wire: &step.amount_out,
+            output_decimals,
+            min_amount_out_wire: min_amount_out,
+            max_amount_in_wire: max_amount_in,
+            base_sz_decimals: base_meta.sz_decimals,
+        })?;
+
+        let order = OrderRequest {
+            asset: wire_asset,
+            is_buy,
+            limit_px: limit_px.clone(),
+            sz: base_sz.clone(),
+            reduce_only: false,
+            order_type: Order::Limit(Limit {
+                tif: Tif::Gtc.as_wire().to_string(),
+            }),
+            cloid: None,
+        };
+        let action = HyperliquidActions::Order(BulkOrder {
+            orders: vec![order],
+            grouping: "na".to_string(),
+        });
+        let mut actions = Vec::new();
+        if step.prefund_from_withdrawable {
+            let transfer_amount = format_hyperliquid_amount(&step.amount_in, input_decimals)?;
+            actions.push(CustodyAction::Call(ChainCall::Hyperliquid(
+                HyperliquidCall {
+                    target_base_url: self.target_base_url.clone(),
+                    network: self.network,
+                    vault_address: None,
+                    payload: HyperliquidCallPayload::UsdClassTransfer {
+                        amount: transfer_amount,
+                        to_perp: false,
+                    },
+                },
+            )));
+        }
+        actions.push(CustodyAction::Call(ChainCall::Hyperliquid(
+            HyperliquidCall {
+                target_base_url: self.target_base_url.clone(),
+                network: self.network,
+                vault_address: None,
+                payload: HyperliquidCallPayload::L1Action { action },
+            },
+        )));
+
+        let operation_request = json!({
+            "pair": format!("{base_symbol}/{HL_QUOTE_SYMBOL}"),
+            "asset_index": wire_asset,
+            "is_buy": is_buy,
+            "sz": base_sz,
+            "limit_px": limit_px,
+            "tif": Tif::Gtc.as_wire(),
+            "user": vault_address,
+            "hyperliquid_custody_vault_id": vault_id,
+            "prefund_from_withdrawable": step.prefund_from_withdrawable,
+            "target_base_url": self.target_base_url.clone(),
+            "network": self.network,
+            "residual_policy": step.residual_policy,
+        });
+
+        Ok(ProviderExecutionIntent::CustodyActions {
+            custody_vault_id: vault_id,
+            actions,
+            provider_context: operation_request.clone(),
+            state: ProviderExecutionState {
+                operation: Some(ProviderOperationIntent {
+                    operation_type: ProviderOperationType::HyperliquidLimitOrder,
+                    status: ProviderOperationStatus::Submitted,
+                    provider_ref: None,
+                    request: Some(operation_request),
+                    response: None,
+                    observed_state: None,
+                }),
+                addresses: vec![],
+            },
+        })
+    }
 }
 
 fn rustls_http_client() -> reqwest::Client {
@@ -3461,6 +3781,9 @@ impl ExchangeProvider for HyperliquidProvider {
         request: &'a ExchangeExecutionRequest,
     ) -> ProviderFuture<'a, ProviderExecutionIntent> {
         Box::pin(async move {
+            if let ExchangeExecutionRequest::HyperliquidLimitOrder(step) = request {
+                return self.execute_limit_order(step).await;
+            }
             let ExchangeExecutionRequest::HyperliquidTrade(step) = request else {
                 return Err(format!(
                     "hyperliquid cannot execute exchange request kind {}",
@@ -3803,6 +4126,28 @@ pub struct HyperliquidTradeStepRequest {
     pub min_amount_out: Option<String>,
     #[serde(default)]
     pub max_amount_in: Option<String>,
+    pub input_asset: HyperliquidTradeAssetRef,
+    pub output_asset: HyperliquidTradeAssetRef,
+    #[serde(default)]
+    pub prefund_from_withdrawable: bool,
+    #[serde(default)]
+    pub hyperliquid_custody_vault_id: Option<Uuid>,
+    #[serde(default)]
+    pub hyperliquid_custody_vault_address: Option<String>,
+}
+
+/// Step-request schema for a real resting Hyperliquid spot limit order. Unlike
+/// `HyperliquidTrade`, this is not a marketable slippage-bounded order: the
+/// router derives the HL `limit_px` from `amount_in` and `amount_out`, submits
+/// it as GTC, and observes it until filled/cancelled.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HyperliquidLimitOrderStepRequest {
+    pub order_id: Uuid,
+    pub quote_id: Uuid,
+    pub amount_in: String,
+    pub amount_out: String,
+    #[serde(default)]
+    pub residual_policy: Option<String>,
     pub input_asset: HyperliquidTradeAssetRef,
     pub output_asset: HyperliquidTradeAssetRef,
     #[serde(default)]
@@ -4566,14 +4911,18 @@ mod hyperliquid_math_tests {
         observed_unit_operation_fingerprints, parse_decimal_bps_to_micros,
         parse_decimal_to_raw_units_floor, seen_operation_fingerprints_from_request,
         unit_operation_provider_status, unit_withdrawal_minimum_raw, velora_slippage_bps,
-        wire_to_f64, CctpQuoteAmounts, LimitPxInput,
+        wire_to_f64, BridgeProvider, BridgeQuoteRequest, CctpQuoteAmounts,
+        HyperliquidBridgeProvider, HyperliquidCallNetwork, LimitPxInput,
+        HYPERLIQUID_BRIDGE_WITHDRAW_FEE_RAW,
     };
     use crate::{
         models::{MarketOrderKind, ProviderOperationStatus},
         protocol::{AssetId, ChainId, DepositAsset},
+        services::AssetRegistry,
     };
     use alloy::primitives::U256;
     use serde_json::json;
+    use std::sync::Arc;
 
     #[test]
     fn classify_hl_leg_sell_base_for_usdc() {
@@ -4703,6 +5052,83 @@ mod hyperliquid_math_tests {
             asset: AssetId::Native,
         };
         assert_eq!(unit_withdrawal_minimum_raw(&btc).to_string(), "30000");
+    }
+
+    #[tokio::test]
+    async fn hyperliquid_bridge_withdrawal_quote_deducts_fee_exact_in() {
+        let provider = HyperliquidBridgeProvider::new(
+            "http://localhost:1",
+            HyperliquidCallNetwork::Testnet,
+            Arc::new(AssetRegistry::default()),
+        );
+        let quote = provider
+            .quote_bridge(BridgeQuoteRequest {
+                source_asset: DepositAsset {
+                    chain: ChainId::parse("hyperliquid").unwrap(),
+                    asset: AssetId::Native,
+                },
+                destination_asset: DepositAsset {
+                    chain: ChainId::parse("evm:42161").unwrap(),
+                    asset: AssetId::reference("0xaf88d065e77c8cc2239327c5edb3a432268e5831"),
+                },
+                order_kind: MarketOrderKind::ExactIn {
+                    amount_in: "101000000".to_string(),
+                    min_amount_out: "1".to_string(),
+                },
+                recipient_address: "0x0000000000000000000000000000000000000001".to_string(),
+                depositor_address: "0x0000000000000000000000000000000000000002".to_string(),
+                partial_fills_enabled: false,
+            })
+            .await
+            .unwrap()
+            .expect("quote");
+
+        assert_eq!(
+            HYPERLIQUID_BRIDGE_WITHDRAW_FEE_RAW, 1_000_000,
+            "test documents the current HL USDC withdrawal fee model"
+        );
+        assert_eq!(quote.amount_in, "101000000");
+        assert_eq!(quote.amount_out, "100000000");
+        assert_eq!(
+            quote
+                .provider_quote
+                .get("kind")
+                .and_then(|value| value.as_str()),
+            Some("hyperliquid_bridge_withdrawal")
+        );
+    }
+
+    #[tokio::test]
+    async fn hyperliquid_bridge_withdrawal_quote_grosses_up_exact_out() {
+        let provider = HyperliquidBridgeProvider::new(
+            "http://localhost:1",
+            HyperliquidCallNetwork::Testnet,
+            Arc::new(AssetRegistry::default()),
+        );
+        let quote = provider
+            .quote_bridge(BridgeQuoteRequest {
+                source_asset: DepositAsset {
+                    chain: ChainId::parse("hyperliquid").unwrap(),
+                    asset: AssetId::Native,
+                },
+                destination_asset: DepositAsset {
+                    chain: ChainId::parse("evm:42161").unwrap(),
+                    asset: AssetId::reference("0xaf88d065e77c8cc2239327c5edb3a432268e5831"),
+                },
+                order_kind: MarketOrderKind::ExactOut {
+                    amount_out: "100000000".to_string(),
+                    max_amount_in: U256::MAX.to_string(),
+                },
+                recipient_address: "0x0000000000000000000000000000000000000001".to_string(),
+                depositor_address: "0x0000000000000000000000000000000000000002".to_string(),
+                partial_fills_enabled: false,
+            })
+            .await
+            .unwrap()
+            .expect("quote");
+
+        assert_eq!(quote.amount_in, "101000000");
+        assert_eq!(quote.amount_out, "100000000");
     }
 
     #[test]

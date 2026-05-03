@@ -22,8 +22,9 @@ use eip3009_erc20_contract::GenericEIP3009ERC20::GenericEIP3009ERC20Instance;
 use router_primitives::ChainType;
 use router_server::{
     api::{
-        CreateOrderRequest, CreateVaultRequest, MarketOrderQuoteKind, MarketOrderQuoteRequest,
-        OrderFlowEnvelope, ProviderPolicyEnvelope, ProviderPolicyListEnvelope,
+        CreateOrderRequest, CreateVaultRequest, LimitOrderQuoteRequest, MarketOrderQuoteKind,
+        MarketOrderQuoteRequest, OrderFlowEnvelope, ProviderPolicyEnvelope,
+        ProviderPolicyListEnvelope,
     },
     app::{initialize_components, PaymasterMode, RouterComponents},
     config::Settings,
@@ -2429,6 +2430,265 @@ async fn quote_market_order_exact_out_uses_exchange_provider_quote() {
 }
 
 #[tokio::test]
+async fn quote_limit_order_base_usdc_to_bitcoin_materializes_hyperliquid_limit_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = harness().await;
+    let db = test_db().await;
+    let mocks = MockIntegratorServer::spawn().await.unwrap();
+    let settings = Arc::new(test_settings(dir.path()));
+    let action_providers = Arc::new(ActionProviderRegistry::mock_http(mocks.base_url()));
+    let order_manager = OrderManager::with_action_providers(
+        db.clone(),
+        settings.clone(),
+        h.chain_registry.clone(),
+        action_providers.clone(),
+    );
+    let vault_manager = VaultManager::new(db.clone(), settings.clone(), h.chain_registry.clone());
+    let source_asset = DepositAsset {
+        chain: ChainId::parse("evm:8453").unwrap(),
+        asset: AssetId::reference("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
+    };
+    let destination_asset = DepositAsset {
+        chain: ChainId::parse("bitcoin").unwrap(),
+        asset: AssetId::Native,
+    };
+
+    let response = order_manager
+        .quote_limit_order(LimitOrderQuoteRequest {
+            from_asset: source_asset.clone(),
+            to_asset: destination_asset,
+            recipient_address: valid_regtest_btc_address(),
+            input_amount: "100000000".to_string(),
+            output_amount: "100000".to_string(),
+        })
+        .await
+        .unwrap();
+    let quote = response
+        .quote
+        .as_limit_order()
+        .expect("limit order quote")
+        .clone();
+    assert_eq!(quote.input_amount, "100000000");
+    assert_eq!(quote.output_amount, "100000");
+    assert_eq!(
+        quote.provider_quote.get("kind").and_then(Value::as_str),
+        Some("limit_order_route")
+    );
+    assert!(quote
+        .provider_quote
+        .get("legs")
+        .and_then(Value::as_array)
+        .expect("legs")
+        .iter()
+        .any(|leg| leg
+            .get("raw")
+            .and_then(|raw| raw.get("kind"))
+            .and_then(Value::as_str)
+            == Some("hyperliquid_limit_order")));
+
+    let order = create_test_order_from_quote(&order_manager, quote.id).await;
+    let vault = vault_manager
+        .create_vault(CreateVaultRequest {
+            order_id: Some(order.id),
+            deposit_asset: source_asset,
+            action: VaultAction::Null,
+            recovery_address: valid_evm_address(),
+            cancellation_commitment: dummy_commitment(),
+            cancel_after: None,
+            metadata: json!({}),
+        })
+        .await
+        .unwrap();
+    db.vaults()
+        .transition_status(
+            vault.id,
+            DepositVaultStatus::PendingFunding,
+            DepositVaultStatus::Funded,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+
+    let custody_action_executor = Arc::new(CustodyActionExecutor::new(
+        db.clone(),
+        settings,
+        h.chain_registry.clone(),
+    ));
+    let execution_manager = OrderExecutionManager::with_dependencies(
+        db.clone(),
+        action_providers,
+        custody_action_executor,
+        h.chain_registry.clone(),
+    );
+    execution_manager
+        .materialize_plan_for_order(order.id)
+        .await
+        .unwrap();
+    let steps = db.orders().get_execution_steps(order.id).await.unwrap();
+    assert!(steps
+        .iter()
+        .any(|step| step.step_type == OrderExecutionStepType::HyperliquidLimitOrder));
+    let limit_step = steps
+        .iter()
+        .find(|step| step.step_type == OrderExecutionStepType::HyperliquidLimitOrder)
+        .expect("limit step");
+    assert_eq!(limit_step.provider, "hyperliquid");
+    assert_eq!(
+        limit_step
+            .request
+            .get("residual_policy")
+            .and_then(Value::as_str),
+        Some("refund")
+    );
+}
+
+#[tokio::test]
+async fn quote_limit_order_bitcoin_to_arbitrum_usdc_materializes_hyperliquid_withdrawal() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = harness().await;
+    let db = test_db().await;
+    let mocks = MockIntegratorServer::spawn().await.unwrap();
+    let settings = Arc::new(test_settings(dir.path()));
+    let action_providers = Arc::new(ActionProviderRegistry::mock_http(mocks.base_url()));
+    let order_manager = OrderManager::with_action_providers(
+        db.clone(),
+        settings.clone(),
+        h.chain_registry.clone(),
+        action_providers.clone(),
+    );
+    let vault_manager = VaultManager::new(db.clone(), settings.clone(), h.chain_registry.clone());
+    let source_asset = DepositAsset {
+        chain: ChainId::parse("bitcoin").unwrap(),
+        asset: AssetId::Native,
+    };
+    let destination_asset = DepositAsset {
+        chain: ChainId::parse("evm:42161").unwrap(),
+        asset: AssetId::reference("0xaf88d065e77c8cc2239327c5edb3a432268e5831"),
+    };
+
+    let response = order_manager
+        .quote_limit_order(LimitOrderQuoteRequest {
+            from_asset: source_asset.clone(),
+            to_asset: destination_asset,
+            recipient_address: valid_evm_address(),
+            input_amount: "100000".to_string(),
+            output_amount: "100000000".to_string(),
+        })
+        .await
+        .unwrap();
+    let quote = response
+        .quote
+        .as_limit_order()
+        .expect("limit order quote")
+        .clone();
+    let legs = quote
+        .provider_quote
+        .get("legs")
+        .and_then(Value::as_array)
+        .expect("legs");
+    assert!(legs.iter().any(|leg| {
+        leg.get("raw")
+            .and_then(|raw| raw.get("kind"))
+            .and_then(Value::as_str)
+            == Some("hyperliquid_limit_order")
+    }));
+    let withdrawal_leg = legs
+        .iter()
+        .find(|leg| {
+            leg.get("raw")
+                .and_then(|raw| raw.get("kind"))
+                .and_then(Value::as_str)
+                == Some("hyperliquid_bridge_withdrawal")
+        })
+        .expect("hyperliquid bridge withdrawal leg");
+    assert_eq!(
+        withdrawal_leg.get("amount_in").and_then(Value::as_str),
+        Some("101000000")
+    );
+    assert_eq!(
+        withdrawal_leg.get("amount_out").and_then(Value::as_str),
+        Some("100000000")
+    );
+
+    let order = create_test_order_from_quote_with_refund(
+        &order_manager,
+        quote.id,
+        valid_regtest_btc_address(),
+    )
+    .await;
+    let vault = vault_manager
+        .create_vault(CreateVaultRequest {
+            order_id: Some(order.id),
+            deposit_asset: source_asset,
+            action: VaultAction::Null,
+            recovery_address: valid_regtest_btc_address(),
+            cancellation_commitment: dummy_commitment(),
+            cancel_after: None,
+            metadata: json!({}),
+        })
+        .await
+        .unwrap();
+    db.vaults()
+        .transition_status(
+            vault.id,
+            DepositVaultStatus::PendingFunding,
+            DepositVaultStatus::Funded,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+
+    let custody_action_executor = Arc::new(CustodyActionExecutor::new(
+        db.clone(),
+        settings,
+        h.chain_registry.clone(),
+    ));
+    let execution_manager = OrderExecutionManager::with_dependencies(
+        db.clone(),
+        action_providers,
+        custody_action_executor,
+        h.chain_registry.clone(),
+    );
+    execution_manager
+        .materialize_plan_for_order(order.id)
+        .await
+        .unwrap();
+    let steps = db.orders().get_execution_steps(order.id).await.unwrap();
+    assert!(steps
+        .iter()
+        .all(|step| step.step_type != OrderExecutionStepType::UniversalRouterSwap));
+    assert!(steps
+        .iter()
+        .any(|step| step.step_type == OrderExecutionStepType::HyperliquidLimitOrder));
+    let withdrawal_step = steps
+        .iter()
+        .find(|step| step.step_type == OrderExecutionStepType::HyperliquidBridgeWithdrawal)
+        .expect("hyperliquid withdrawal step");
+    assert_eq!(withdrawal_step.provider, "hyperliquid_bridge");
+    assert_eq!(
+        withdrawal_step
+            .request
+            .get("amount")
+            .and_then(Value::as_str),
+        Some("101000000")
+    );
+    assert_eq!(
+        withdrawal_step
+            .request
+            .get("transfer_from_spot")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        withdrawal_step
+            .request
+            .get("recipient_address")
+            .and_then(Value::as_str),
+        Some(order.recipient_address.as_str())
+    );
+}
+
+#[tokio::test]
 async fn router_api_quote_and_order_flow_uses_production_component_initialization() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -2566,6 +2826,7 @@ async fn router_api_quote_and_order_flow_uses_production_component_initializatio
                 }
             );
         }
+        RouterOrderAction::LimitOrder(_) => panic!("expected market order action"),
     }
     assert!(order.funding_vault.is_some());
     let funding_vault = order.funding_vault.as_ref().unwrap();
@@ -4414,10 +4675,10 @@ async fn release_quote_after_vault_creation_failure_allows_order_retry() {
         .await
         .unwrap();
     assert_eq!(resumed_order.id, order.id);
-    assert_eq!(resumed_quote.id, linked_quote.id);
+    assert_eq!(resumed_quote.id(), linked_quote.id());
 
     order_manager
-        .release_quote_after_vault_creation_failure(order.id, linked_quote.id)
+        .release_quote_after_vault_creation_failure(order.id, linked_quote.id())
         .await
         .unwrap();
 
@@ -4439,7 +4700,13 @@ async fn release_quote_after_vault_creation_failure_allows_order_retry() {
         })
         .await
         .unwrap();
-    assert_eq!(retry_quote.order_id, Some(retry_order.id));
+    assert_eq!(
+        retry_quote
+            .as_market_order()
+            .expect("market order quote")
+            .order_id,
+        Some(retry_order.id)
+    );
     assert_ne!(retry_order.id, order.id);
 }
 

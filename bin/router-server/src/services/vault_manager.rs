@@ -5,7 +5,7 @@ use crate::{
     error::RouterServerError,
     models::{
         DepositVault, DepositVaultFundingHint, DepositVaultStatus, ProviderOperationHintStatus,
-        RouterOrderStatus, VaultAction,
+        RouterOrderQuote, RouterOrderStatus, VaultAction,
     },
     protocol::{backend_chain_for_id, AssetId, ChainId, DepositAsset},
     services::deposit_address::{derive_deposit_address_for_quote, DepositAddressError},
@@ -842,10 +842,17 @@ impl VaultManager {
             let quote = self
                 .db
                 .orders()
-                .get_market_order_quote(order_id)
+                .get_router_order_quote(order_id)
                 .await
                 .map_err(VaultError::database)?;
-            return parse_positive_u256("quote.amount_in", &quote.amount_in);
+            return match quote {
+                RouterOrderQuote::MarketOrder(quote) => {
+                    parse_positive_u256("quote.amount_in", &quote.amount_in)
+                }
+                RouterOrderQuote::LimitOrder(quote) => {
+                    parse_positive_u256("quote.input_amount", &quote.input_amount)
+                }
+            };
         }
 
         match &vault.action {
@@ -858,6 +865,9 @@ impl VaultManager {
                     parse_positive_u256("max_amount_in", max_amount_in)
                 }
             },
+            VaultAction::LimitOrder(action) => {
+                parse_positive_u256("limit_order.input_amount", &action.input_amount)
+            }
         }
     }
 
@@ -941,13 +951,13 @@ impl VaultManager {
         let quote = self
             .db
             .orders()
-            .get_market_order_quote(order_id)
+            .get_router_order_quote(order_id)
             .await
             .map_err(VaultError::database)?;
 
         Ok(OrderBinding {
             action: expected_action,
-            quote_id: quote.id,
+            quote_id: quote.id(),
         })
     }
 

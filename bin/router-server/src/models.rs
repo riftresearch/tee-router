@@ -14,12 +14,14 @@ pub enum VaultAction {
     #[default]
     Null,
     MarketOrder(MarketOrderAction),
+    LimitOrder(LimitOrderAction),
 }
 
 impl From<RouterOrderAction> for VaultAction {
     fn from(value: RouterOrderAction) -> Self {
         match value {
             RouterOrderAction::MarketOrder(action) => Self::MarketOrder(action),
+            RouterOrderAction::LimitOrder(action) => Self::LimitOrder(action),
         }
     }
 }
@@ -28,6 +30,7 @@ impl From<RouterOrderAction> for VaultAction {
 #[serde(rename_all = "snake_case")]
 pub enum RouterOrderType {
     MarketOrder,
+    LimitOrder,
 }
 
 impl RouterOrderType {
@@ -35,12 +38,14 @@ impl RouterOrderType {
     pub fn to_db_string(self) -> &'static str {
         match self {
             Self::MarketOrder => "market_order",
+            Self::LimitOrder => "limit_order",
         }
     }
 
     pub fn from_db_string(value: &str) -> Option<Self> {
         match value {
             "market_order" => Some(Self::MarketOrder),
+            "limit_order" => Some(Self::LimitOrder),
             _ => None,
         }
     }
@@ -102,6 +107,7 @@ impl RouterOrderStatus {
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum RouterOrderAction {
     MarketOrder(MarketOrderAction),
+    LimitOrder(LimitOrderAction),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -159,6 +165,35 @@ impl MarketOrderKind {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LimitOrderAction {
+    pub input_amount: String,
+    pub output_amount: String,
+    pub residual_policy: LimitOrderResidualPolicy,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LimitOrderResidualPolicy {
+    Refund,
+}
+
+impl LimitOrderResidualPolicy {
+    #[must_use]
+    pub fn to_db_string(self) -> &'static str {
+        match self {
+            Self::Refund => "refund",
+        }
+    }
+
+    pub fn from_db_string(value: &str) -> Option<Self> {
+        match value {
+            "refund" => Some(Self::Refund),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RouterOrder {
     pub id: Uuid,
@@ -198,16 +233,74 @@ pub struct MarketOrderQuote {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LimitOrderQuote {
+    pub id: Uuid,
+    pub order_id: Option<Uuid>,
+    pub source_asset: DepositAsset,
+    pub destination_asset: DepositAsset,
+    pub recipient_address: String,
+    pub provider_id: String,
+    pub input_amount: String,
+    pub output_amount: String,
+    pub residual_policy: LimitOrderResidualPolicy,
+    pub provider_quote: Value,
+    pub expires_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum RouterOrderQuote {
     MarketOrder(MarketOrderQuote),
+    LimitOrder(LimitOrderQuote),
 }
 
 impl RouterOrderQuote {
     #[must_use]
+    pub fn id(&self) -> Uuid {
+        match self {
+            Self::MarketOrder(quote) => quote.id,
+            Self::LimitOrder(quote) => quote.id,
+        }
+    }
+
+    #[must_use]
+    pub fn source_asset(&self) -> &DepositAsset {
+        match self {
+            Self::MarketOrder(quote) => &quote.source_asset,
+            Self::LimitOrder(quote) => &quote.source_asset,
+        }
+    }
+
+    #[must_use]
+    pub fn destination_asset(&self) -> &DepositAsset {
+        match self {
+            Self::MarketOrder(quote) => &quote.destination_asset,
+            Self::LimitOrder(quote) => &quote.destination_asset,
+        }
+    }
+
+    #[must_use]
+    pub fn recipient_address(&self) -> &str {
+        match self {
+            Self::MarketOrder(quote) => &quote.recipient_address,
+            Self::LimitOrder(quote) => &quote.recipient_address,
+        }
+    }
+
+    #[must_use]
     pub fn as_market_order(&self) -> Option<&MarketOrderQuote> {
         match self {
             Self::MarketOrder(quote) => Some(quote),
+            Self::LimitOrder(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn as_limit_order(&self) -> Option<&LimitOrderQuote> {
+        match self {
+            Self::LimitOrder(quote) => Some(quote),
+            Self::MarketOrder(_) => None,
         }
     }
 }
@@ -215,6 +308,12 @@ impl RouterOrderQuote {
 impl From<MarketOrderQuote> for RouterOrderQuote {
     fn from(quote: MarketOrderQuote) -> Self {
         Self::MarketOrder(quote)
+    }
+}
+
+impl From<LimitOrderQuote> for RouterOrderQuote {
+    fn from(quote: LimitOrderQuote) -> Self {
+        Self::LimitOrder(quote)
     }
 }
 
@@ -541,9 +640,11 @@ pub enum ProviderOperationType {
     AcrossBridge,
     CctpBridge,
     HyperliquidBridgeDeposit,
+    HyperliquidBridgeWithdrawal,
     UnitDeposit,
     UnitWithdrawal,
     HyperliquidTrade,
+    HyperliquidLimitOrder,
     UniversalRouterSwap,
 }
 
@@ -554,9 +655,11 @@ impl ProviderOperationType {
             Self::AcrossBridge => "across_bridge",
             Self::CctpBridge => "cctp_bridge",
             Self::HyperliquidBridgeDeposit => "hyperliquid_bridge_deposit",
+            Self::HyperliquidBridgeWithdrawal => "hyperliquid_bridge_withdrawal",
             Self::UnitDeposit => "unit_deposit",
             Self::UnitWithdrawal => "unit_withdrawal",
             Self::HyperliquidTrade => "hyperliquid_trade",
+            Self::HyperliquidLimitOrder => "hyperliquid_limit_order",
             Self::UniversalRouterSwap => "universal_router_swap",
         }
     }
@@ -566,9 +669,11 @@ impl ProviderOperationType {
             "across_bridge" => Some(Self::AcrossBridge),
             "cctp_bridge" => Some(Self::CctpBridge),
             "hyperliquid_bridge_deposit" => Some(Self::HyperliquidBridgeDeposit),
+            "hyperliquid_bridge_withdrawal" => Some(Self::HyperliquidBridgeWithdrawal),
             "unit_deposit" => Some(Self::UnitDeposit),
             "unit_withdrawal" => Some(Self::UnitWithdrawal),
             "hyperliquid_trade" => Some(Self::HyperliquidTrade),
+            "hyperliquid_limit_order" => Some(Self::HyperliquidLimitOrder),
             "universal_router_swap" => Some(Self::UniversalRouterSwap),
             _ => None,
         }
@@ -857,9 +962,11 @@ pub enum OrderExecutionStepType {
     CctpBurn,
     CctpReceive,
     HyperliquidBridgeDeposit,
+    HyperliquidBridgeWithdrawal,
     UnitDeposit,
     UnitWithdrawal,
     HyperliquidTrade,
+    HyperliquidLimitOrder,
     UniversalRouterSwap,
     Refund,
 }
@@ -873,9 +980,11 @@ impl OrderExecutionStepType {
             Self::CctpBurn => "cctp_burn",
             Self::CctpReceive => "cctp_receive",
             Self::HyperliquidBridgeDeposit => "hyperliquid_bridge_deposit",
+            Self::HyperliquidBridgeWithdrawal => "hyperliquid_bridge_withdrawal",
             Self::UnitDeposit => "unit_deposit",
             Self::UnitWithdrawal => "unit_withdrawal",
             Self::HyperliquidTrade => "hyperliquid_trade",
+            Self::HyperliquidLimitOrder => "hyperliquid_limit_order",
             Self::UniversalRouterSwap => "universal_router_swap",
             Self::Refund => "refund",
         }
@@ -888,9 +997,11 @@ impl OrderExecutionStepType {
             "cctp_burn" => Some(Self::CctpBurn),
             "cctp_receive" => Some(Self::CctpReceive),
             "hyperliquid_bridge_deposit" => Some(Self::HyperliquidBridgeDeposit),
+            "hyperliquid_bridge_withdrawal" => Some(Self::HyperliquidBridgeWithdrawal),
             "unit_deposit" => Some(Self::UnitDeposit),
             "unit_withdrawal" => Some(Self::UnitWithdrawal),
             "hyperliquid_trade" => Some(Self::HyperliquidTrade),
+            "hyperliquid_limit_order" => Some(Self::HyperliquidLimitOrder),
             "universal_router_swap" => Some(Self::UniversalRouterSwap),
             "refund" => Some(Self::Refund),
             _ => None,

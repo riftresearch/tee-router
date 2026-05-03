@@ -4,8 +4,7 @@ use crate::{
         DetectorHintEnvelope, DetectorHintRequest, DetectorHintTarget, ProviderHealthEnvelope,
         ProviderOperationHintEnvelope, ProviderOperationHintRequest,
         ProviderOperationObserveRequest, ProviderPolicyEnvelope, ProviderPolicyListEnvelope,
-        QuoteRequestType, UpdateProviderPolicyRequest, VaultFundingHintEnvelope,
-        VaultFundingHintRequest,
+        UpdateProviderPolicyRequest, VaultFundingHintEnvelope, VaultFundingHintRequest,
     },
     app::{initialize_components, PaymasterMode, RouterComponents},
     error::{RouterServerError, RouterServerResult},
@@ -249,19 +248,26 @@ async fn create_quote(
     State(state): State<AppState>,
     Json(request): Json<CreateQuoteRequest>,
 ) -> RouterServerResult<(StatusCode, Json<RouterOrderQuoteEnvelope>)> {
-    screen_user_address(
-        &state,
-        AddressScreeningPurpose::Recipient,
-        &request.market_order.to_asset.chain,
-        &request.market_order.recipient_address,
-    )
-    .await?;
-    let envelope = match request.quote_type {
-        QuoteRequestType::MarketOrder => {
-            state
-                .order_manager
-                .quote_market_order(request.market_order)
-                .await?
+    let envelope = match request {
+        CreateQuoteRequest::MarketOrder(market_order) => {
+            screen_user_address(
+                &state,
+                AddressScreeningPurpose::Recipient,
+                &market_order.to_asset.chain,
+                &market_order.recipient_address,
+            )
+            .await?;
+            state.order_manager.quote_market_order(market_order).await?
+        }
+        CreateQuoteRequest::LimitOrder(limit_order) => {
+            screen_user_address(
+                &state,
+                AddressScreeningPurpose::Recipient,
+                &limit_order.to_asset.chain,
+                &limit_order.recipient_address,
+            )
+            .await?;
+            state.order_manager.quote_limit_order(limit_order).await?
         }
     };
     Ok((StatusCode::CREATED, Json(envelope)))
@@ -286,14 +292,14 @@ async fn create_order(
     screen_user_address(
         &state,
         AddressScreeningPurpose::Recipient,
-        &quote_for_screening.destination_asset.chain,
-        &quote_for_screening.recipient_address,
+        &quote_for_screening.destination_asset().chain,
+        quote_for_screening.recipient_address(),
     )
     .await?;
     screen_user_address(
         &state,
         AddressScreeningPurpose::Refund,
-        &quote_for_screening.source_asset.chain,
+        &quote_for_screening.source_asset().chain,
         &request.refund_address,
     )
     .await?;
@@ -317,12 +323,12 @@ async fn create_order(
             crate::telemetry::record_vault_create_failed(&order.source_asset, &err);
             if let Err(rollback_err) = state
                 .order_manager
-                .release_quote_after_vault_creation_failure(order.id, quote.id)
+                .release_quote_after_vault_creation_failure(order.id, quote.id())
                 .await
             {
                 warn!(
                     order_id = %order.id,
-                    quote_id = %quote.id,
+                    quote_id = %quote.id(),
                     error = %rollback_err,
                     "Failed to release quote after vault creation failure"
                 );

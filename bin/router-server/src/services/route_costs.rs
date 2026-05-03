@@ -232,7 +232,8 @@ impl RouteCostService {
         match transition.kind {
             MarketOrderTransitionKind::AcrossBridge
             | MarketOrderTransitionKind::CctpBridge
-            | MarketOrderTransitionKind::HyperliquidBridgeDeposit => {
+            | MarketOrderTransitionKind::HyperliquidBridgeDeposit
+            | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
                 self.live_bridge_cost_snapshot(transition, refreshed_at, expires_at, pricing)
                     .await
             }
@@ -493,7 +494,8 @@ fn structural_cost_estimate(
                 quote_source: "static_unit_anchor_seed",
             }
         }
-        MarketOrderTransitionKind::HyperliquidBridgeDeposit => StructuralCostEstimate {
+        MarketOrderTransitionKind::HyperliquidBridgeDeposit
+        | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => StructuralCostEstimate {
             estimated_fee_bps: 0,
             estimated_gas_usd_micros: 0,
             estimated_latency_ms: 30_000,
@@ -581,7 +583,8 @@ mod tests {
             provider: match kind {
                 MarketOrderTransitionKind::HyperliquidTrade => ProviderId::Hyperliquid,
                 MarketOrderTransitionKind::UniversalRouterSwap => ProviderId::Velora,
-                MarketOrderTransitionKind::HyperliquidBridgeDeposit => {
+                MarketOrderTransitionKind::HyperliquidBridgeDeposit
+                | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
                     ProviderId::HyperliquidBridge
                 }
                 MarketOrderTransitionKind::UnitDeposit

@@ -193,6 +193,7 @@ pub enum MarketOrderTransitionKind {
     CctpBridge,
     UnitDeposit,
     HyperliquidBridgeDeposit,
+    HyperliquidBridgeWithdrawal,
     HyperliquidTrade,
     UniversalRouterSwap,
     UnitWithdrawal,
@@ -206,6 +207,7 @@ impl MarketOrderTransitionKind {
             Self::CctpBridge => "cctp_bridge",
             Self::UnitDeposit => "unit_deposit",
             Self::HyperliquidBridgeDeposit => "hyperliquid_bridge_deposit",
+            Self::HyperliquidBridgeWithdrawal => "hyperliquid_bridge_withdrawal",
             Self::HyperliquidTrade => "hyperliquid_trade",
             Self::UniversalRouterSwap => "universal_router_swap",
             Self::UnitWithdrawal => "unit_withdrawal",
@@ -219,6 +221,7 @@ impl MarketOrderTransitionKind {
             | Self::CctpBridge
             | Self::UnitDeposit
             | Self::HyperliquidBridgeDeposit
+            | Self::HyperliquidBridgeWithdrawal
             | Self::UnitWithdrawal => RouteEdgeKind::CrossChainTransfer,
             Self::HyperliquidTrade => RouteEdgeKind::FixedPairSwap,
             Self::UniversalRouterSwap => RouteEdgeKind::UniversalRouterSwap,
@@ -501,6 +504,20 @@ impl AssetRegistry {
                     provider: ProviderId::HyperliquidBridge,
                     from: MarketOrderNode::External(source_asset.clone()),
                     to: hyperliquid_venue(source.canonical),
+                });
+            }
+
+            if self.supports_provider_capability(
+                ProviderId::HyperliquidBridge,
+                &source_asset,
+                ProviderAssetCapability::BridgeOutput,
+            ) && self.has_hyperliquid_venue(source.canonical)
+            {
+                transitions.push(MarketOrderTransition {
+                    kind: MarketOrderTransitionKind::HyperliquidBridgeWithdrawal,
+                    provider: ProviderId::HyperliquidBridge,
+                    from: hyperliquid_venue(source.canonical),
+                    to: MarketOrderNode::External(source_asset.clone()),
                 });
             }
 
@@ -908,6 +925,10 @@ fn required_roles_for_transition_kind(
             RequiredCustodyRole::IntermediateExecution,
             RequiredCustodyRole::IntermediateExecution,
         ),
+        MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => (
+            RequiredCustodyRole::HyperliquidSpot,
+            RequiredCustodyRole::IntermediateExecution,
+        ),
         MarketOrderTransitionKind::HyperliquidTrade => (
             RequiredCustodyRole::IntermediateExecution,
             RequiredCustodyRole::IntermediateExecution,
@@ -1219,7 +1240,10 @@ fn builtin_provider_assets() -> Vec<ProviderAsset> {
             "42161",
             "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
             6,
-            &[ProviderAssetCapability::BridgeInput],
+            &[
+                ProviderAssetCapability::BridgeInput,
+                ProviderAssetCapability::BridgeOutput,
+            ],
         ),
         provider_asset(
             ProviderId::Hyperliquid,
@@ -1454,6 +1478,10 @@ mod tests {
             RouteEdgeKind::CrossChainTransfer
         );
         assert_eq!(
+            MarketOrderTransitionKind::HyperliquidBridgeWithdrawal.route_edge_kind(),
+            RouteEdgeKind::CrossChainTransfer
+        );
+        assert_eq!(
             MarketOrderTransitionKind::UnitWithdrawal.route_edge_kind(),
             RouteEdgeKind::CrossChainTransfer
         );
@@ -1502,6 +1530,7 @@ mod tests {
                 | MarketOrderTransitionKind::CctpBridge
                 | MarketOrderTransitionKind::UnitDeposit
                 | MarketOrderTransitionKind::HyperliquidBridgeDeposit
+                | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal
                 | MarketOrderTransitionKind::UnitWithdrawal => {
                     assert_eq!(
                         transition.route_edge_kind(),

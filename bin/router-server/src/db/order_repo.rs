@@ -2,12 +2,14 @@ use crate::{
     error::{RouterServerError, RouterServerResult},
     models::{
         CustodyVault, CustodyVaultControlType, CustodyVaultRole, CustodyVaultStatus,
-        CustodyVaultVisibility, MarketOrderKind, MarketOrderKindType, MarketOrderQuote,
-        OrderExecutionAttempt, OrderExecutionAttemptKind, OrderExecutionAttemptStatus,
-        OrderExecutionStep, OrderExecutionStepStatus, OrderExecutionStepType, OrderProviderAddress,
+        CustodyVaultVisibility, LimitOrderAction, LimitOrderQuote, LimitOrderResidualPolicy,
+        MarketOrderKind, MarketOrderKindType, MarketOrderQuote, OrderExecutionAttempt,
+        OrderExecutionAttemptKind, OrderExecutionAttemptStatus, OrderExecutionStep,
+        OrderExecutionStepStatus, OrderExecutionStepType, OrderProviderAddress,
         OrderProviderOperation, OrderProviderOperationHint, ProviderAddressRole,
         ProviderOperationHintKind, ProviderOperationHintStatus, ProviderOperationStatus,
-        ProviderOperationType, RouterOrder, RouterOrderAction, RouterOrderStatus, RouterOrderType,
+        ProviderOperationType, RouterOrder, RouterOrderAction, RouterOrderQuote, RouterOrderStatus,
+        RouterOrderType,
     },
     protocol::{AssetId, ChainId, DepositAsset},
     telemetry,
@@ -40,7 +42,10 @@ const ORDER_SELECT_COLUMNS: &str = r#"
     moa.min_amount_out AS market_order_min_amount_out,
     moa.amount_out AS market_order_amount_out,
     moa.max_amount_in AS market_order_max_amount_in,
-    moa.slippage_bps AS market_order_slippage_bps
+    moa.slippage_bps AS market_order_slippage_bps,
+    loa.input_amount AS limit_order_input_amount,
+    loa.output_amount AS limit_order_output_amount,
+    loa.residual_policy AS limit_order_residual_policy
 "#;
 
 const QUOTE_SELECT_COLUMNS: &str = r#"
@@ -58,6 +63,23 @@ const QUOTE_SELECT_COLUMNS: &str = r#"
     min_amount_out,
     max_amount_in,
     slippage_bps,
+    provider_quote,
+    expires_at,
+    created_at
+"#;
+
+const LIMIT_QUOTE_SELECT_COLUMNS: &str = r#"
+    id,
+    order_id,
+    source_chain_id,
+    source_asset_id,
+    destination_chain_id,
+    destination_asset_id,
+    recipient_address,
+    provider_id,
+    input_amount,
+    output_amount,
+    residual_policy,
     provider_quote,
     expires_at,
     created_at
@@ -262,6 +284,60 @@ impl OrderRepository {
         Ok(())
     }
 
+    pub async fn create_limit_order_quote(
+        &self,
+        quote: &LimitOrderQuote,
+    ) -> RouterServerResult<()> {
+        let started = Instant::now();
+        let result = sqlx_core::query::query(
+            r#"
+            INSERT INTO limit_order_quotes (
+                id,
+                order_id,
+                source_chain_id,
+                source_asset_id,
+                destination_chain_id,
+                destination_asset_id,
+                recipient_address,
+                provider_id,
+                input_amount,
+                output_amount,
+                residual_policy,
+                provider_quote,
+                expires_at,
+                created_at
+            )
+            VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8,
+                $9, $10, $11, $12, $13, $14
+            )
+            "#,
+        )
+        .bind(quote.id)
+        .bind(quote.order_id)
+        .bind(quote.source_asset.chain.as_str())
+        .bind(quote.source_asset.asset.as_str())
+        .bind(quote.destination_asset.chain.as_str())
+        .bind(quote.destination_asset.asset.as_str())
+        .bind(&quote.recipient_address)
+        .bind(&quote.provider_id)
+        .bind(&quote.input_amount)
+        .bind(&quote.output_amount)
+        .bind(quote.residual_policy.to_db_string())
+        .bind(quote.provider_quote.clone())
+        .bind(quote.expires_at)
+        .bind(quote.created_at)
+        .execute(&self.pool)
+        .await;
+        telemetry::record_db_query(
+            "order.create_limit_order_quote",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        result?;
+        Ok(())
+    }
+
     pub async fn create_market_order_from_quote(
         &self,
         order: &RouterOrder,
@@ -379,6 +455,113 @@ impl OrderRepository {
         result
     }
 
+    pub async fn create_limit_order_from_quote(
+        &self,
+        order: &RouterOrder,
+        quote_id: Uuid,
+    ) -> RouterServerResult<LimitOrderQuote> {
+        let started = Instant::now();
+        let result = async {
+            let mut tx = self.pool.begin().await?;
+            let limit_action = limit_order_action_fields(&order.action)?;
+
+            sqlx_core::query::query(
+                r#"
+                INSERT INTO router_orders (
+                    id,
+                    order_type,
+                    status,
+                    funding_vault_id,
+                    source_chain_id,
+                    source_asset_id,
+                    destination_chain_id,
+                    destination_asset_id,
+                    recipient_address,
+                    refund_address,
+                    action_timeout_at,
+                    idempotency_key,
+                    workflow_trace_id,
+                    workflow_parent_span_id,
+                    created_at,
+                    updated_at
+                )
+                VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9,
+                    $10, $11, $12, $13, $14, $15, $16
+                )
+                "#,
+            )
+            .bind(order.id)
+            .bind(order.order_type.to_db_string())
+            .bind(order.status.to_db_string())
+            .bind(order.funding_vault_id)
+            .bind(order.source_asset.chain.as_str())
+            .bind(order.source_asset.asset.as_str())
+            .bind(order.destination_asset.chain.as_str())
+            .bind(order.destination_asset.asset.as_str())
+            .bind(&order.recipient_address)
+            .bind(&order.refund_address)
+            .bind(order.action_timeout_at)
+            .bind(order.idempotency_key.clone())
+            .bind(&order.workflow_trace_id)
+            .bind(&order.workflow_parent_span_id)
+            .bind(order.created_at)
+            .bind(order.updated_at)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx_core::query::query(
+                r#"
+                INSERT INTO limit_order_actions (
+                    order_id,
+                    input_amount,
+                    output_amount,
+                    residual_policy,
+                    created_at,
+                    updated_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6)
+                "#,
+            )
+            .bind(order.id)
+            .bind(limit_action.input_amount)
+            .bind(limit_action.output_amount)
+            .bind(limit_action.residual_policy.to_db_string())
+            .bind(order.created_at)
+            .bind(order.updated_at)
+            .execute(&mut *tx)
+            .await?;
+
+            let row = sqlx_core::query::query(&format!(
+                r#"
+                UPDATE limit_order_quotes
+                SET order_id = $2
+                WHERE id = $1
+                  AND order_id IS NULL
+                RETURNING {LIMIT_QUOTE_SELECT_COLUMNS}
+                "#
+            ))
+            .bind(quote_id)
+            .bind(order.id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(RouterServerError::Validation {
+                message: format!("quote {quote_id} is no longer orderable"),
+            })?;
+
+            let quote = self.map_limit_quote_row(&row)?;
+            tx.commit().await?;
+            Ok::<LimitOrderQuote, RouterServerError>(quote)
+        }
+        .await;
+        telemetry::record_db_query(
+            "order.create_limit_order_from_quote",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        result
+    }
+
     pub async fn release_quote_and_delete_quoted_order(
         &self,
         order_id: Uuid,
@@ -388,9 +571,22 @@ impl OrderRepository {
         let result = async {
             let mut tx = self.pool.begin().await?;
 
-            let released_quote = sqlx_core::query::query(
+            let released_market_quote = sqlx_core::query::query(
                 r#"
                 UPDATE market_order_quotes
+                SET order_id = NULL
+                WHERE id = $1
+                  AND order_id = $2
+                "#,
+            )
+            .bind(quote_id)
+            .bind(order_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            let released_limit_quote = sqlx_core::query::query(
+                r#"
+                UPDATE limit_order_quotes
                 SET order_id = NULL
                 WHERE id = $1
                   AND order_id = $2
@@ -416,7 +612,7 @@ impl OrderRepository {
             .await?
             .rows_affected();
 
-            if released_quote != 1 || deleted_order != 1 {
+            if released_market_quote + released_limit_quote != 1 || deleted_order != 1 {
                 return Err(RouterServerError::Validation {
                     message: format!(
                         "order {order_id} could not be rolled back for quote {quote_id}"
@@ -443,6 +639,7 @@ impl OrderRepository {
             SELECT {ORDER_SELECT_COLUMNS}
             FROM router_orders ro
             LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
+            LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
             WHERE ro.id = $1
             "#
         ))
@@ -477,6 +674,7 @@ impl OrderRepository {
             SELECT {ORDER_SELECT_COLUMNS}
             FROM updated ro
             LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
+            LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
             "#
         ))
         .bind(id)
@@ -501,8 +699,9 @@ impl OrderRepository {
             SELECT {ORDER_SELECT_COLUMNS}
             FROM router_orders ro
             LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
+            LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
             JOIN deposit_vaults dv ON dv.id = ro.funding_vault_id
-            WHERE ro.order_type = 'market_order'
+            WHERE ro.order_type IN ('market_order', 'limit_order')
               AND ro.status IN ('pending_funding', 'funded')
               AND dv.status = 'funded'
               AND NOT EXISTS (
@@ -569,12 +768,13 @@ impl OrderRepository {
             SELECT DISTINCT {ORDER_SELECT_COLUMNS}
             FROM router_orders ro
             LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
+            LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
             JOIN order_execution_attempts oea
               ON oea.order_id = ro.id
              AND oea.status = 'active'
             JOIN order_execution_steps oes
               ON oes.execution_attempt_id = oea.id
-            WHERE ro.order_type = 'market_order'
+            WHERE ro.order_type IN ('market_order', 'limit_order')
               AND ro.status IN ('funded', 'executing', 'refund_required', 'refunding')
               AND oes.step_index > 0
               AND oes.status IN ('planned', 'ready')
@@ -613,10 +813,11 @@ impl OrderRepository {
             SELECT DISTINCT {ORDER_SELECT_COLUMNS}
             FROM router_orders ro
             LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
+            LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
             JOIN order_execution_attempts oea
               ON oea.order_id = ro.id
              AND oea.status = 'active'
-            WHERE ro.order_type = 'market_order'
+            WHERE ro.order_type IN ('market_order', 'limit_order')
               AND ro.status IN ('executing', 'refunding')
               AND EXISTS (
                   SELECT 1
@@ -690,6 +891,75 @@ impl OrderRepository {
         self.map_quote_row(&row)
     }
 
+    pub async fn get_limit_order_quote(
+        &self,
+        order_id: Uuid,
+    ) -> RouterServerResult<LimitOrderQuote> {
+        let started = Instant::now();
+        let result = sqlx_core::query::query(&format!(
+            "SELECT {LIMIT_QUOTE_SELECT_COLUMNS} FROM limit_order_quotes WHERE order_id = $1"
+        ))
+        .bind(order_id)
+        .fetch_one(&self.pool)
+        .await;
+        telemetry::record_db_query(
+            "order.get_limit_order_quote",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        let row = result?;
+
+        self.map_limit_quote_row(&row)
+    }
+
+    pub async fn get_limit_order_quote_by_id(
+        &self,
+        quote_id: Uuid,
+    ) -> RouterServerResult<LimitOrderQuote> {
+        let started = Instant::now();
+        let result = sqlx_core::query::query(&format!(
+            "SELECT {LIMIT_QUOTE_SELECT_COLUMNS} FROM limit_order_quotes WHERE id = $1"
+        ))
+        .bind(quote_id)
+        .fetch_one(&self.pool)
+        .await;
+        telemetry::record_db_query(
+            "order.get_limit_order_quote_by_id",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        let row = result?;
+
+        self.map_limit_quote_row(&row)
+    }
+
+    pub async fn get_router_order_quote_by_id(
+        &self,
+        quote_id: Uuid,
+    ) -> RouterServerResult<RouterOrderQuote> {
+        match self.get_market_order_quote_by_id(quote_id).await {
+            Ok(quote) => Ok(quote.into()),
+            Err(RouterServerError::NotFound) => self
+                .get_limit_order_quote_by_id(quote_id)
+                .await
+                .map(Into::into),
+            Err(err) => Err(err),
+        }
+    }
+
+    pub async fn get_router_order_quote(
+        &self,
+        order_id: Uuid,
+    ) -> RouterServerResult<RouterOrderQuote> {
+        match self.get_market_order_quote(order_id).await {
+            Ok(quote) => Ok(quote.into()),
+            Err(RouterServerError::NotFound) => {
+                self.get_limit_order_quote(order_id).await.map(Into::into)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     pub async fn delete_expired_unassociated_market_order_quotes(
         &self,
         now: DateTime<Utc>,
@@ -711,6 +981,32 @@ impl OrderRepository {
             started.elapsed(),
         );
         Ok(result?.rows_affected())
+    }
+
+    pub async fn delete_expired_unassociated_router_order_quotes(
+        &self,
+        now: DateTime<Utc>,
+    ) -> RouterServerResult<u64> {
+        let deleted_market = self
+            .delete_expired_unassociated_market_order_quotes(now)
+            .await?;
+        let started = Instant::now();
+        let result = sqlx_core::query::query(
+            r#"
+            DELETE FROM limit_order_quotes
+            WHERE order_id IS NULL
+              AND expires_at <= $1
+            "#,
+        )
+        .bind(now)
+        .execute(&self.pool)
+        .await;
+        telemetry::record_db_query(
+            "order.delete_expired_unassociated_limit_order_quotes",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        Ok(deleted_market + result?.rows_affected())
     }
 
     pub async fn create_execution_attempt(
@@ -994,6 +1290,7 @@ impl OrderRepository {
             SELECT {ORDER_SELECT_COLUMNS}
             FROM router_orders ro
             LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
+            LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
             JOIN order_execution_attempts oea
               ON oea.order_id = ro.id
             WHERE ro.status = 'refund_required'
@@ -1032,6 +1329,7 @@ impl OrderRepository {
             SELECT DISTINCT {ORDER_SELECT_COLUMNS}
             FROM router_orders ro
             LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
+            LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
             JOIN deposit_vaults dv ON dv.id = ro.funding_vault_id
             JOIN order_execution_attempts oea
               ON oea.order_id = ro.id
@@ -1072,6 +1370,7 @@ impl OrderRepository {
             SELECT DISTINCT {ORDER_SELECT_COLUMNS}
             FROM router_orders ro
             LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
+            LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
             JOIN deposit_vaults dv ON dv.id = ro.funding_vault_id
             WHERE ro.status = 'refund_manual_intervention_required'
               AND dv.status IN ('refund_required', 'refunding')
@@ -1102,6 +1401,7 @@ impl OrderRepository {
             SELECT {ORDER_SELECT_COLUMNS}
             FROM router_orders ro
             LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
+            LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
             WHERE ro.status IN ('funded', 'executing', 'refunding')
               AND (
                     EXISTS (
@@ -1320,6 +1620,7 @@ impl OrderRepository {
             SELECT {ORDER_SELECT_COLUMNS}
             FROM router_orders ro
             LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
+            LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
             WHERE ro.status IN (
                 'completed',
                 'refund_required',
@@ -2623,6 +2924,25 @@ impl OrderRepository {
                     },
                 ))
             }
+            RouterOrderType::LimitOrder => {
+                let residual_policy = row
+                    .get::<Option<String>, _>("limit_order_residual_policy")
+                    .ok_or_else(|| RouterServerError::InvalidData {
+                        message: "limit order row is missing limit_order_actions".to_string(),
+                    })?;
+                let residual_policy = LimitOrderResidualPolicy::from_db_string(&residual_policy)
+                    .ok_or_else(|| RouterServerError::InvalidData {
+                        message: format!(
+                            "unsupported limit order residual policy: {residual_policy}"
+                        ),
+                    })?;
+
+                Ok(RouterOrderAction::LimitOrder(LimitOrderAction {
+                    input_amount: required_action_amount(row, "limit_order_input_amount")?,
+                    output_amount: required_action_amount(row, "limit_order_output_amount")?,
+                    residual_policy,
+                }))
+            }
         }
     }
 
@@ -2667,6 +2987,48 @@ impl OrderRepository {
                     message: format!("invalid quote slippage_bps: {err}"),
                 }
             })?,
+            provider_quote: row.get("provider_quote"),
+            expires_at: row.get("expires_at"),
+            created_at: row.get("created_at"),
+        })
+    }
+
+    fn map_limit_quote_row(
+        &self,
+        row: &sqlx_postgres::PgRow,
+    ) -> RouterServerResult<LimitOrderQuote> {
+        let source_chain = parse_chain_id(row.get::<String, _>("source_chain_id"), "quote source")?;
+        let source_asset = parse_asset_id(row.get::<String, _>("source_asset_id"), "quote source")?;
+        let destination_chain = parse_chain_id(
+            row.get::<String, _>("destination_chain_id"),
+            "quote destination",
+        )?;
+        let destination_asset = parse_asset_id(
+            row.get::<String, _>("destination_asset_id"),
+            "quote destination",
+        )?;
+        let residual_policy = row.get::<String, _>("residual_policy");
+        let residual_policy = LimitOrderResidualPolicy::from_db_string(&residual_policy)
+            .ok_or_else(|| RouterServerError::InvalidData {
+                message: format!("unsupported limit quote residual policy: {residual_policy}"),
+            })?;
+
+        Ok(LimitOrderQuote {
+            id: row.get("id"),
+            order_id: row.get("order_id"),
+            source_asset: DepositAsset {
+                chain: source_chain,
+                asset: source_asset,
+            },
+            destination_asset: DepositAsset {
+                chain: destination_chain,
+                asset: destination_asset,
+            },
+            recipient_address: row.get("recipient_address"),
+            provider_id: row.get("provider_id"),
+            input_amount: row.get("input_amount"),
+            output_amount: row.get("output_amount"),
+            residual_policy,
             provider_quote: row.get("provider_quote"),
             expires_at: row.get("expires_at"),
             created_at: row.get("created_at"),
@@ -2990,6 +3352,18 @@ fn market_order_action_fields(
                 slippage_bps: action.slippage_bps,
             }),
         },
+        RouterOrderAction::LimitOrder(_) => Err(RouterServerError::InvalidData {
+            message: "expected market order action".to_string(),
+        }),
+    }
+}
+
+fn limit_order_action_fields(action: &RouterOrderAction) -> RouterServerResult<LimitOrderAction> {
+    match action {
+        RouterOrderAction::LimitOrder(action) => Ok(action.clone()),
+        RouterOrderAction::MarketOrder(_) => Err(RouterServerError::InvalidData {
+            message: "expected limit order action".to_string(),
+        }),
     }
 }
 
@@ -2999,6 +3373,6 @@ fn required_action_amount(
 ) -> RouterServerResult<String> {
     row.get::<Option<String>, _>(column)
         .ok_or_else(|| RouterServerError::InvalidData {
-            message: format!("market order action is missing required {column}"),
+            message: format!("order action is missing required {column}"),
         })
 }

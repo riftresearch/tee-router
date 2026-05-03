@@ -1,11 +1,14 @@
 use crate::{
-    api::{CreateOrderRequest, MarketOrderQuoteKind, MarketOrderQuoteRequest},
+    api::{
+        CreateOrderRequest, LimitOrderQuoteRequest, MarketOrderQuoteKind, MarketOrderQuoteRequest,
+    },
     config::Settings,
     db::Database,
     error::RouterServerError,
     models::{
-        MarketOrderAction, MarketOrderKind, MarketOrderKindType, MarketOrderQuote, RouterOrder,
-        RouterOrderAction, RouterOrderQuoteEnvelope, RouterOrderStatus, RouterOrderType,
+        LimitOrderAction, LimitOrderQuote, LimitOrderResidualPolicy, MarketOrderAction,
+        MarketOrderKind, MarketOrderKindType, MarketOrderQuote, RouterOrder, RouterOrderAction,
+        RouterOrderQuote, RouterOrderQuoteEnvelope, RouterOrderStatus, RouterOrderType,
     },
     protocol::{backend_chain_for_id, AssetId, ChainId, DepositAsset},
     services::{
@@ -14,7 +17,8 @@ use crate::{
             ExchangeProvider, ExchangeQuote, ExchangeQuoteRequest, UnitProvider,
         },
         asset_registry::{
-            AssetRegistry, MarketOrderTransitionKind, ProviderId, TransitionDecl, TransitionPath,
+            AssetRegistry, CanonicalAsset, MarketOrderNode, MarketOrderTransitionKind, ProviderId,
+            TransitionDecl, TransitionPath,
         },
         deposit_address::{derive_deposit_address_for_quote, DepositAddressError},
         gas_reimbursement::{
@@ -44,6 +48,10 @@ use tracing::warn;
 use uuid::Uuid;
 
 const MARKET_ORDER_ACTION_TIMEOUT: ChronoDuration = ChronoDuration::minutes(10);
+// V1 limit orders have no user-facing expiry. The legacy order row requires a
+// timestamp, so use a long internal sentinel instead of market-order timeout
+// semantics.
+const LIMIT_ORDER_ACTION_TIMEOUT: ChronoDuration = ChronoDuration::days(3650);
 const MARKET_ORDER_PROVIDER_TIMEOUT: Duration = Duration::from_secs(10);
 const HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW: u64 = 1_000_000;
 const BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_INPUTS: usize = 2;
@@ -146,6 +154,13 @@ struct ComposedMarketOrderQuote {
     pub amount_out: String,
     pub min_amount_out: Option<String>,
     pub max_amount_in: Option<String>,
+    pub provider_quote: Value,
+    pub expires_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+struct ComposedLimitOrderQuote {
+    pub provider_id: String,
     pub provider_quote: Value,
     pub expires_at: chrono::DateTime<Utc>,
 }
@@ -302,10 +317,53 @@ impl OrderManager {
         })
     }
 
-    pub async fn get_quote(&self, quote_id: Uuid) -> MarketOrderResult<MarketOrderQuote> {
+    pub async fn quote_limit_order(
+        &self,
+        request: LimitOrderQuoteRequest,
+    ) -> MarketOrderResult<RouterOrderQuoteEnvelope> {
+        let normalized_request = self.validate_and_normalize_limit_order_request(request)?;
+        let quote_id = Uuid::now_v7();
+        let (depositor_address, _) = derive_deposit_address_for_quote(
+            self.chain_registry.as_ref(),
+            &self.settings.master_key_bytes(),
+            quote_id,
+            &normalized_request.source_asset.chain,
+        )
+        .map_err(MarketOrderError::deposit_address)?;
+        let provider_quote = self
+            .best_limit_order_quote(&normalized_request, quote_id, &depositor_address)
+            .await?;
+        let now = Utc::now();
+        let quote = LimitOrderQuote {
+            id: quote_id,
+            order_id: None,
+            source_asset: normalized_request.source_asset,
+            destination_asset: normalized_request.destination_asset,
+            recipient_address: normalized_request.recipient_address,
+            provider_id: provider_quote.provider_id,
+            input_amount: normalized_request.input_amount,
+            output_amount: normalized_request.output_amount,
+            residual_policy: LimitOrderResidualPolicy::Refund,
+            provider_quote: provider_quote.provider_quote,
+            expires_at: provider_quote.expires_at,
+            created_at: now,
+        };
+
         self.db
             .orders()
-            .get_market_order_quote_by_id(quote_id)
+            .create_limit_order_quote(&quote)
+            .await
+            .map_err(MarketOrderError::database)?;
+
+        Ok(RouterOrderQuoteEnvelope {
+            quote: quote.into(),
+        })
+    }
+
+    pub async fn get_quote(&self, quote_id: Uuid) -> MarketOrderResult<RouterOrderQuote> {
+        self.db
+            .orders()
+            .get_router_order_quote_by_id(quote_id)
             .await
             .map_err(MarketOrderError::database)
     }
@@ -318,10 +376,10 @@ impl OrderManager {
             .map_err(MarketOrderError::database)
     }
 
-    pub async fn get_quote_for_order(&self, order_id: Uuid) -> MarketOrderResult<MarketOrderQuote> {
+    pub async fn get_quote_for_order(&self, order_id: Uuid) -> MarketOrderResult<RouterOrderQuote> {
         self.db
             .orders()
-            .get_market_order_quote(order_id)
+            .get_router_order_quote(order_id)
             .await
             .map_err(MarketOrderError::database)
     }
@@ -354,15 +412,42 @@ impl OrderManager {
     pub async fn create_order_from_quote(
         &self,
         request: CreateOrderRequest,
-    ) -> MarketOrderResult<(RouterOrder, MarketOrderQuote)> {
+    ) -> MarketOrderResult<(RouterOrder, RouterOrderQuote)> {
         let quote = self.get_quote(request.quote_id).await?;
-        if quote.order_id.is_some() {
-            return self.resume_unvaulted_order_from_quote(request, quote).await;
+        match quote {
+            RouterOrderQuote::MarketOrder(quote) => {
+                if quote.order_id.is_some() {
+                    let (order, quote) = self
+                        .resume_unvaulted_market_order_from_quote(request, quote)
+                        .await?;
+                    return Ok((order, quote.into()));
+                }
+                self.create_market_order_from_orderable_quote(request, quote)
+                    .await
+                    .map(|(order, quote)| (order, quote.into()))
+            }
+            RouterOrderQuote::LimitOrder(quote) => {
+                if quote.order_id.is_some() {
+                    let (order, quote) = self
+                        .resume_unvaulted_limit_order_from_quote(request, quote)
+                        .await?;
+                    return Ok((order, quote.into()));
+                }
+                self.create_limit_order_from_orderable_quote(request, quote)
+                    .await
+                    .map(|(order, quote)| (order, quote.into()))
+            }
         }
+    }
+
+    async fn create_market_order_from_orderable_quote(
+        &self,
+        request: CreateOrderRequest,
+        quote: MarketOrderQuote,
+    ) -> MarketOrderResult<(RouterOrder, MarketOrderQuote)> {
         if quote.expires_at <= Utc::now() {
             return Err(MarketOrderError::QuoteExpired);
         }
-
         let now = Utc::now();
         let order_id = Uuid::now_v7();
         let workflow_trace = observability::current_workflow_trace_context()
@@ -403,11 +488,90 @@ impl OrderManager {
         Ok((order, quote))
     }
 
-    async fn resume_unvaulted_order_from_quote(
+    async fn create_limit_order_from_orderable_quote(
+        &self,
+        request: CreateOrderRequest,
+        quote: LimitOrderQuote,
+    ) -> MarketOrderResult<(RouterOrder, LimitOrderQuote)> {
+        if quote.expires_at <= Utc::now() {
+            return Err(MarketOrderError::QuoteExpired);
+        }
+        let now = Utc::now();
+        let order_id = Uuid::now_v7();
+        let workflow_trace = observability::current_workflow_trace_context()
+            .unwrap_or_else(|| fallback_workflow_trace_context(order_id));
+        let refund_address = self.validate_and_normalize_refund_address(
+            &quote.source_asset.chain,
+            &request.refund_address,
+        )?;
+        let order = RouterOrder {
+            id: order_id,
+            order_type: RouterOrderType::LimitOrder,
+            status: RouterOrderStatus::Quoted,
+            funding_vault_id: None,
+            source_asset: quote.source_asset.clone(),
+            destination_asset: quote.destination_asset.clone(),
+            recipient_address: quote.recipient_address.clone(),
+            refund_address,
+            action: RouterOrderAction::LimitOrder(LimitOrderAction {
+                input_amount: quote.input_amount.clone(),
+                output_amount: quote.output_amount.clone(),
+                residual_policy: quote.residual_policy,
+            }),
+            action_timeout_at: now + LIMIT_ORDER_ACTION_TIMEOUT,
+            idempotency_key: normalize_idempotency_key(request.idempotency_key)?,
+            workflow_trace_id: workflow_trace.trace_id,
+            workflow_parent_span_id: workflow_trace.parent_span_id,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let quote = self
+            .db
+            .orders()
+            .create_limit_order_from_quote(&order, quote.id)
+            .await
+            .map_err(MarketOrderError::database)?;
+        telemetry::record_order_workflow_event(&order, "order.created");
+
+        Ok((order, quote))
+    }
+
+    async fn resume_unvaulted_market_order_from_quote(
         &self,
         request: CreateOrderRequest,
         quote: MarketOrderQuote,
     ) -> MarketOrderResult<(RouterOrder, MarketOrderQuote)> {
+        let order_id = quote
+            .order_id
+            .ok_or(MarketOrderError::QuoteAlreadyOrdered)?;
+        let order = self
+            .db
+            .orders()
+            .get(order_id)
+            .await
+            .map_err(MarketOrderError::database)?;
+        let requested_idempotency_key = normalize_idempotency_key(request.idempotency_key)?;
+        let requested_refund_address = self.validate_and_normalize_refund_address(
+            &order.source_asset.chain,
+            &request.refund_address,
+        )?;
+        if order.status == RouterOrderStatus::Quoted
+            && order.funding_vault_id.is_none()
+            && order.idempotency_key == requested_idempotency_key
+            && order.refund_address == requested_refund_address
+        {
+            return Ok((order, quote));
+        }
+
+        Err(MarketOrderError::QuoteAlreadyOrdered)
+    }
+
+    async fn resume_unvaulted_limit_order_from_quote(
+        &self,
+        request: CreateOrderRequest,
+        quote: LimitOrderQuote,
+    ) -> MarketOrderResult<(RouterOrder, LimitOrderQuote)> {
         let order_id = quote
             .order_id
             .ok_or(MarketOrderError::QuoteAlreadyOrdered)?;
@@ -543,6 +707,375 @@ impl OrderManager {
                     .to_string(),
             }),
         }
+    }
+
+    async fn best_limit_order_quote(
+        &self,
+        request: &NormalizedLimitOrderQuoteRequest,
+        quote_id: Uuid,
+        source_depositor_address: &str,
+    ) -> MarketOrderResult<ComposedLimitOrderQuote> {
+        const MAX_PATH_DEPTH: usize = 5;
+        const TOP_K_PATHS: usize = 8;
+
+        let source_canonical = self
+            .asset_registry
+            .canonical_for(&request.source_asset)
+            .ok_or_else(|| MarketOrderError::NoRoute {
+                reason: "limit-order source asset is not registered".to_string(),
+            })?;
+        let destination_canonical = self
+            .asset_registry
+            .canonical_for(&request.destination_asset)
+            .ok_or_else(|| MarketOrderError::NoRoute {
+                reason: "limit-order destination asset is not registered".to_string(),
+            })?;
+
+        let mut paths = self.asset_registry.select_transition_paths(
+            &request.source_asset,
+            &request.destination_asset,
+            MAX_PATH_DEPTH,
+        );
+        paths.retain(|path| {
+            limit_order_transition_index(
+                self.asset_registry.as_ref(),
+                path,
+                source_canonical,
+                destination_canonical,
+            )
+            .is_some()
+        });
+        paths.retain(|path| {
+            path.transitions
+                .iter()
+                .all(|transition| transition.kind != MarketOrderTransitionKind::UniversalRouterSwap)
+        });
+        if paths.is_empty() {
+            return Err(MarketOrderError::NoRoute {
+                reason: format!(
+                    "no V1 limit-order route from {} {} to {} {}; V1 supports BTC/USDC and ETH/USDC routes without universal-router hops",
+                    request.source_asset.chain,
+                    request.source_asset.asset,
+                    request.destination_asset.chain,
+                    request.destination_asset.asset
+                ),
+            });
+        }
+        if let Some(route_costs) = self.route_costs.as_ref() {
+            if let Err(err) = route_costs.rank_transition_paths(&mut paths).await {
+                warn!(
+                    error = %err,
+                    "limit-order route-cost ranking failed; falling back to structural ordering"
+                );
+                rank_transition_paths_structurally(&mut paths);
+            }
+        } else {
+            rank_transition_paths_structurally(&mut paths);
+        }
+        paths.truncate(TOP_K_PATHS);
+
+        let provider_policy_snapshot = if let Some(service) = self.provider_policies.as_ref() {
+            Some(
+                service
+                    .snapshot()
+                    .await
+                    .map_err(MarketOrderError::database)?,
+            )
+        } else {
+            None
+        };
+        let provider_health_snapshot = if let Some(service) = self.provider_health.as_ref() {
+            Some(
+                service
+                    .snapshot()
+                    .await
+                    .map_err(MarketOrderError::database)?,
+            )
+        } else {
+            None
+        };
+
+        let exchange_candidates: Vec<Arc<dyn ExchangeProvider>> = self
+            .action_providers
+            .exchanges()
+            .iter()
+            .filter(|exchange| {
+                exchange.id() == ProviderId::Hyperliquid.as_str()
+                    && provider_allowed_for_new_routes(
+                        provider_policy_snapshot.as_ref(),
+                        provider_health_snapshot.as_ref(),
+                        exchange.id(),
+                    )
+            })
+            .cloned()
+            .collect();
+        if exchange_candidates.is_empty() {
+            return Err(MarketOrderError::NoRoute {
+                reason: "hyperliquid exchange provider is not configured for limit orders"
+                    .to_string(),
+            });
+        }
+
+        let requires_unit = paths.iter().any(|path| {
+            path.transitions.iter().any(|transition| {
+                matches!(
+                    transition.kind,
+                    MarketOrderTransitionKind::UnitDeposit
+                        | MarketOrderTransitionKind::UnitWithdrawal
+                )
+            })
+        });
+        let unit_candidates: Vec<Option<Arc<dyn UnitProvider>>> = if requires_unit {
+            self.action_providers
+                .units()
+                .iter()
+                .filter(|unit| {
+                    provider_allowed_for_new_routes(
+                        provider_policy_snapshot.as_ref(),
+                        provider_health_snapshot.as_ref(),
+                        unit.id(),
+                    )
+                })
+                .cloned()
+                .map(Some)
+                .collect()
+        } else {
+            vec![None]
+        };
+        if unit_candidates.is_empty() {
+            return Err(MarketOrderError::NoRoute {
+                reason: "unit provider is required but not configured for limit-order route"
+                    .to_string(),
+            });
+        }
+
+        let mut last_error: Option<MarketOrderError> = None;
+        for path in paths {
+            let limit_index = limit_order_transition_index(
+                self.asset_registry.as_ref(),
+                &path,
+                source_canonical,
+                destination_canonical,
+            )
+            .expect("path was retained with a limit-order transition");
+            for unit in &unit_candidates {
+                for exchange in &exchange_candidates {
+                    let candidate = self
+                        .compose_limit_transition_path_quote(
+                            request,
+                            quote_id,
+                            source_depositor_address,
+                            &path,
+                            limit_index,
+                            provider_policy_snapshot.as_ref(),
+                            provider_health_snapshot.as_ref(),
+                            unit.as_deref(),
+                            exchange.as_ref(),
+                        )
+                        .await;
+                    match candidate {
+                        Ok(Some(quote)) => return Ok(quote),
+                        Ok(None) => {}
+                        Err(err) => {
+                            warn!(
+                                path_id = %path.id,
+                                error = %err,
+                                "limit-order transition-path quote failed"
+                            );
+                            last_error = Some(err);
+                        }
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| MarketOrderError::NoRoute {
+            reason: "no executable V1 limit-order path satisfied the requested constraints"
+                .to_string(),
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn compose_limit_transition_path_quote(
+        &self,
+        request: &NormalizedLimitOrderQuoteRequest,
+        quote_id: Uuid,
+        source_depositor_address: &str,
+        path: &TransitionPath,
+        limit_index: usize,
+        provider_policy_snapshot: Option<&crate::services::ProviderPolicySnapshot>,
+        provider_health_snapshot: Option<&crate::services::ProviderHealthSnapshot>,
+        unit: Option<&dyn UnitProvider>,
+        exchange: &dyn ExchangeProvider,
+    ) -> MarketOrderResult<Option<ComposedLimitOrderQuote>> {
+        let limit_transition = &path.transitions[limit_index];
+        let gas_reimbursement_plan = if let Some(route_costs) = self.route_costs.as_ref() {
+            let pricing = route_costs.current_pricing_snapshot().await;
+            optimized_paymaster_reimbursement_plan_with_pricing(
+                self.asset_registry.as_ref(),
+                path,
+                &pricing,
+            )
+        } else {
+            optimized_paymaster_reimbursement_plan(self.asset_registry.as_ref(), path)
+        }
+        .map_err(MarketOrderError::gas_reimbursement)?;
+
+        let mut expires_at = Utc::now() + ChronoDuration::minutes(10);
+        let prefix = TransitionPath {
+            id: transition_path_id(&path.transitions[..limit_index]),
+            transitions: path.transitions[..limit_index].to_vec(),
+        };
+        let suffix = TransitionPath {
+            id: transition_path_id(&path.transitions[limit_index + 1..]),
+            transitions: path.transitions[limit_index + 1..].to_vec(),
+        };
+
+        let (mut limit_input_amount, mut legs) = if prefix.transitions.is_empty() {
+            (request.input_amount.clone(), Vec::new())
+        } else {
+            let prefix_request = NormalizedMarketOrderQuoteRequest {
+                source_asset: request.source_asset.clone(),
+                destination_asset: limit_transition.input.asset.clone(),
+                recipient_address: self
+                    .quote_address_for_chain(quote_id, &limit_transition.input.asset.chain)?,
+                order_kind: MarketOrderQuoteKind::ExactIn {
+                    amount_in: request.input_amount.clone(),
+                    slippage_bps: 0,
+                },
+            };
+            let prefix_order_kind = MarketOrderKind::ExactIn {
+                amount_in: request.input_amount.clone(),
+                min_amount_out: "1".to_string(),
+            };
+            let quote = self
+                .compose_transition_path_quote(ComposeTransitionPathQuoteRequest {
+                    request: &prefix_request,
+                    order_kind: &prefix_order_kind,
+                    quote_id,
+                    source_depositor_address,
+                    path: &prefix,
+                    provider_policy_snapshot,
+                    provider_health_snapshot,
+                    unit,
+                    exchange: Some(exchange),
+                })
+                .await?;
+            let Some(quote) = quote else {
+                return Ok(None);
+            };
+            expires_at = expires_at.min(quote.expires_at);
+            (
+                quote.amount_out,
+                quote_legs_from_provider_quote(&quote.provider_quote)?,
+            )
+        };
+
+        limit_input_amount = apply_transition_retention(
+            &gas_reimbursement_plan,
+            &limit_transition.id,
+            "limit_order.input_amount",
+            &limit_input_amount,
+        )?;
+        if limit_index > 0
+            && path.transitions[limit_index - 1].kind
+                == MarketOrderTransitionKind::HyperliquidBridgeDeposit
+        {
+            limit_input_amount = reserve_hyperliquid_spot_send_quote_gas(
+                "limit_order.input_amount",
+                &limit_input_amount,
+            )?;
+        }
+
+        let (limit_output_amount, suffix_legs) = if suffix.transitions.is_empty() {
+            (request.output_amount.clone(), Vec::new())
+        } else {
+            let suffix_request = NormalizedMarketOrderQuoteRequest {
+                source_asset: limit_transition.output.asset.clone(),
+                destination_asset: request.destination_asset.clone(),
+                recipient_address: request.recipient_address.clone(),
+                order_kind: MarketOrderQuoteKind::ExactOut {
+                    amount_out: request.output_amount.clone(),
+                    slippage_bps: 0,
+                },
+            };
+            let suffix_order_kind = MarketOrderKind::ExactOut {
+                amount_out: request.output_amount.clone(),
+                max_amount_in: U256::MAX.to_string(),
+            };
+            let quote = self
+                .compose_transition_path_quote(ComposeTransitionPathQuoteRequest {
+                    request: &suffix_request,
+                    order_kind: &suffix_order_kind,
+                    quote_id,
+                    source_depositor_address,
+                    path: &suffix,
+                    provider_policy_snapshot,
+                    provider_health_snapshot,
+                    unit,
+                    exchange: Some(exchange),
+                })
+                .await?;
+            let Some(quote) = quote else {
+                return Ok(None);
+            };
+            expires_at = expires_at.min(quote.expires_at);
+            (
+                quote.amount_in,
+                quote_legs_from_provider_quote(&quote.provider_quote)?,
+            )
+        };
+        let limit_output_amount = add_transition_retention(
+            &gas_reimbursement_plan,
+            &limit_transition.id,
+            &limit_output_amount,
+        )?;
+
+        validate_positive_amount("limit_order.input_amount", &limit_input_amount)?;
+        validate_positive_amount("limit_order.output_amount", &limit_output_amount)?;
+
+        legs.push(transition_leg(QuoteLegSpec {
+            transition_decl_id: &limit_transition.id,
+            transition_kind: limit_transition.kind,
+            provider: limit_transition.provider,
+            input_asset: &limit_transition.input.asset,
+            output_asset: &limit_transition.output.asset,
+            amount_in: &limit_input_amount,
+            amount_out: &limit_output_amount,
+            expires_at,
+            raw: json!({
+                "schema_version": 1,
+                "kind": "hyperliquid_limit_order",
+                "residual_policy": LimitOrderResidualPolicy::Refund,
+            }),
+        }));
+        legs.extend(suffix_legs);
+
+        let provider_id = composed_provider_id(
+            path,
+            unit.map(|provider| provider.id()),
+            Some(exchange.id()),
+        );
+        let mut provider_quote = transition_path_quote_blob(path, &legs, &gas_reimbursement_plan);
+        if let Some(obj) = provider_quote.as_object_mut() {
+            obj.insert("kind".to_string(), json!("limit_order_route"));
+            obj.insert(
+                "limit_order".to_string(),
+                json!({
+                    "schema_version": 1,
+                    "limit_transition_decl_id": limit_transition.id,
+                    "input_amount": limit_input_amount,
+                    "output_amount": limit_output_amount,
+                    "residual_policy": LimitOrderResidualPolicy::Refund,
+                }),
+            );
+        }
+
+        Ok(Some(ComposedLimitOrderQuote {
+            provider_id,
+            provider_quote,
+            expires_at,
+        }))
     }
 
     async fn validate_route_minimum(
@@ -783,7 +1316,8 @@ impl OrderManager {
                     match transition.kind {
                         MarketOrderTransitionKind::AcrossBridge
                         | MarketOrderTransitionKind::CctpBridge
-                        | MarketOrderTransitionKind::HyperliquidBridgeDeposit => {
+                        | MarketOrderTransitionKind::HyperliquidBridgeDeposit
+                        | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
                             let bridge_id = transition.provider.as_str();
                             if !provider_allowed_for_new_routes(
                                 provider_policy_snapshot,
@@ -1136,7 +1670,8 @@ impl OrderManager {
                         }
                         MarketOrderTransitionKind::AcrossBridge
                         | MarketOrderTransitionKind::CctpBridge
-                        | MarketOrderTransitionKind::HyperliquidBridgeDeposit => {
+                        | MarketOrderTransitionKind::HyperliquidBridgeDeposit
+                        | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
                             let bridge_id = transition.provider.as_str();
                             if !provider_allowed_for_new_routes(
                                 provider_policy_snapshot,
@@ -1281,7 +1816,9 @@ impl OrderManager {
     ) -> MarketOrderResult<String> {
         if matches!(
             transition.kind,
-            MarketOrderTransitionKind::AcrossBridge | MarketOrderTransitionKind::CctpBridge
+            MarketOrderTransitionKind::AcrossBridge
+                | MarketOrderTransitionKind::CctpBridge
+                | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal
         ) && index + 1 == path.transitions.len()
         {
             Ok(request.recipient_address.clone())
@@ -1392,6 +1929,48 @@ impl OrderManager {
             destination_asset,
             recipient_address,
             order_kind: request.order_kind,
+        })
+    }
+
+    fn validate_and_normalize_limit_order_request(
+        &self,
+        request: LimitOrderQuoteRequest,
+    ) -> MarketOrderResult<NormalizedLimitOrderQuoteRequest> {
+        validate_positive_amount("input_amount", &request.input_amount)?;
+        validate_positive_amount("output_amount", &request.output_amount)?;
+        let source_asset = self.validate_and_normalize_asset(&request.from_asset)?;
+        let destination_asset = self.validate_and_normalize_asset(&request.to_asset)?;
+        let source_canonical = self
+            .asset_registry
+            .canonical_for(&source_asset)
+            .ok_or_else(|| MarketOrderError::NoRoute {
+                reason: "V1 limit orders require a router-declared source asset".to_string(),
+            })?;
+        let destination_canonical = self
+            .asset_registry
+            .canonical_for(&destination_asset)
+            .ok_or_else(|| MarketOrderError::NoRoute {
+                reason: "V1 limit orders require a router-declared destination asset".to_string(),
+            })?;
+        if !v1_limit_order_pair_supported(source_canonical, destination_canonical) {
+            return Err(MarketOrderError::NoRoute {
+                reason: format!(
+                    "V1 limit orders support only BTC/USDC and ETH/USDC pairs, got {}/{}",
+                    source_canonical.as_str(),
+                    destination_canonical.as_str()
+                ),
+            });
+        }
+        let recipient_address = self.validate_and_normalize_recipient_address(
+            &destination_asset.chain,
+            &request.recipient_address,
+        )?;
+        Ok(NormalizedLimitOrderQuoteRequest {
+            source_asset,
+            destination_asset,
+            recipient_address,
+            input_amount: request.input_amount,
+            output_amount: request.output_amount,
         })
     }
 
@@ -1837,6 +2416,80 @@ fn transition_path_quote_blob(
     })
 }
 
+fn transition_path_id(transitions: &[TransitionDecl]) -> String {
+    transitions
+        .iter()
+        .map(|transition| transition.id.as_str())
+        .collect::<Vec<_>>()
+        .join(">")
+}
+
+fn quote_legs_from_provider_quote(provider_quote: &Value) -> MarketOrderResult<Vec<QuoteLeg>> {
+    provider_quote
+        .get("legs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|value| {
+            serde_json::from_value(value.clone()).map_err(|err| MarketOrderError::NoRoute {
+                reason: format!("quoted transition leg is invalid: {err}"),
+            })
+        })
+        .collect()
+}
+
+fn v1_limit_order_pair_supported(source: CanonicalAsset, destination: CanonicalAsset) -> bool {
+    matches!(
+        (source, destination),
+        (CanonicalAsset::Usdc, CanonicalAsset::Btc)
+            | (CanonicalAsset::Btc, CanonicalAsset::Usdc)
+            | (CanonicalAsset::Usdc, CanonicalAsset::Eth)
+            | (CanonicalAsset::Eth, CanonicalAsset::Usdc)
+    )
+}
+
+fn limit_order_transition_index(
+    registry: &AssetRegistry,
+    path: &TransitionPath,
+    source_canonical: CanonicalAsset,
+    destination_canonical: CanonicalAsset,
+) -> Option<usize> {
+    let mut matching_index = None;
+    for (index, transition) in path.transitions.iter().enumerate() {
+        if transition.kind == MarketOrderTransitionKind::UniversalRouterSwap {
+            return None;
+        }
+        if transition.kind != MarketOrderTransitionKind::HyperliquidTrade {
+            continue;
+        }
+        if transition.from
+            != (MarketOrderNode::Venue {
+                provider: ProviderId::Hyperliquid,
+                canonical: source_canonical,
+            })
+            || transition.to
+                != (MarketOrderNode::Venue {
+                    provider: ProviderId::Hyperliquid,
+                    canonical: destination_canonical,
+                })
+        {
+            return None;
+        }
+        let input_canonical = registry.canonical_for(&transition.input.asset)?;
+        let output_canonical = registry.canonical_for(&transition.output.asset)?;
+        if input_canonical != source_canonical || output_canonical != destination_canonical {
+            return None;
+        }
+        if !v1_limit_order_pair_supported(input_canonical, output_canonical) {
+            return None;
+        }
+        if matching_index.replace(index).is_some() {
+            return None;
+        }
+    }
+    matching_index
+}
+
 fn bitcoin_fee_reserve_quote(fee_reserve: U256) -> Value {
     json!({
         "source_fee_reserve": {
@@ -2003,6 +2656,15 @@ struct NormalizedMarketOrderQuoteRequest {
     destination_asset: DepositAsset,
     recipient_address: String,
     order_kind: MarketOrderQuoteKind,
+}
+
+#[derive(Debug, Clone)]
+struct NormalizedLimitOrderQuoteRequest {
+    source_asset: DepositAsset,
+    destination_asset: DepositAsset,
+    recipient_address: String,
+    input_amount: String,
+    output_amount: String,
 }
 
 impl MarketOrderQuoteKind {

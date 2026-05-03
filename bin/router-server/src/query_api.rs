@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 pub async fn get_order_flow(db: &Database, id: Uuid) -> RouterServerResult<OrderFlowEnvelope> {
     let order = db.orders().get(id).await?;
-    let quote = match db.orders().get_market_order_quote(id).await {
+    let quote = match db.orders().get_router_order_quote(id).await {
         Ok(quote) => Some(quote),
         Err(RouterServerError::NotFound) => None,
         Err(err) => return Err(err),

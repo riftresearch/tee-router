@@ -669,7 +669,7 @@ async fn run_quote_cleanup(db: Database) -> QuoteCleanupTaskResult {
     let started = Instant::now();
     let deleted = db
         .orders()
-        .delete_expired_unassociated_market_order_quotes(Utc::now())
+        .delete_expired_unassociated_router_order_quotes(Utc::now())
         .await
         .map_err(|err| err.to_string())?;
     telemetry::record_worker_tick("quote_cleanup", started.elapsed());

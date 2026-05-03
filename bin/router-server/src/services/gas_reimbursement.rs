@@ -322,9 +322,9 @@ fn estimate_paymaster_native_cost_wei(
         MarketOrderTransitionKind::HyperliquidBridgeDeposit => 180_000_u64,
         MarketOrderTransitionKind::UnitDeposit => 140_000_u64,
         MarketOrderTransitionKind::UniversalRouterSwap => 360_000_u64,
-        MarketOrderTransitionKind::HyperliquidTrade | MarketOrderTransitionKind::UnitWithdrawal => {
-            0_u64
-        }
+        MarketOrderTransitionKind::HyperliquidBridgeWithdrawal
+        | MarketOrderTransitionKind::HyperliquidTrade
+        | MarketOrderTransitionKind::UnitWithdrawal => 0_u64,
     };
     let top_up_gas_units = 21_000_u64;
     U256::from(action_gas_units.saturating_add(top_up_gas_units))

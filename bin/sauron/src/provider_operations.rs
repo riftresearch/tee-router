@@ -25,7 +25,7 @@ SELECT
   observed_state_json,
   updated_at
 FROM public.order_provider_operations
-WHERE operation_type IN ('across_bridge', 'cctp_bridge', 'hyperliquid_bridge_deposit', 'unit_deposit', 'unit_withdrawal', 'hyperliquid_trade')
+WHERE operation_type IN ('across_bridge', 'cctp_bridge', 'hyperliquid_bridge_deposit', 'hyperliquid_bridge_withdrawal', 'unit_deposit', 'unit_withdrawal', 'hyperliquid_trade', 'hyperliquid_limit_order')
   AND status IN ('submitted', 'waiting_external')
 ORDER BY updated_at ASC, id ASC
 "#;
@@ -43,7 +43,7 @@ SELECT
   updated_at
 FROM public.order_provider_operations
 WHERE id = $1::uuid
-  AND operation_type IN ('across_bridge', 'cctp_bridge', 'hyperliquid_bridge_deposit', 'unit_deposit', 'unit_withdrawal', 'hyperliquid_trade')
+  AND operation_type IN ('across_bridge', 'cctp_bridge', 'hyperliquid_bridge_deposit', 'hyperliquid_bridge_withdrawal', 'unit_deposit', 'unit_withdrawal', 'hyperliquid_trade', 'hyperliquid_limit_order')
   AND status IN ('submitted', 'waiting_external')
 "#;
 

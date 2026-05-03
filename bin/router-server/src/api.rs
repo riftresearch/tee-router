@@ -1,10 +1,10 @@
 use crate::{
     models::{
-        empty_metadata, CustodyVault, DepositVaultFundingHint, MarketOrderQuote,
-        OrderExecutionAttempt, OrderExecutionStep, OrderExecutionStepStatus,
-        OrderProviderOperation, OrderProviderOperationHint, ProviderExecutionPolicyState,
-        ProviderHealthCheck, ProviderHealthSummaryStatus, ProviderOperationHintKind,
-        ProviderPolicy, ProviderQuotePolicyState, RouterOrder, RouterOrderStatus, VaultAction,
+        empty_metadata, CustodyVault, DepositVaultFundingHint, OrderExecutionAttempt,
+        OrderExecutionStep, OrderExecutionStepStatus, OrderProviderOperation,
+        OrderProviderOperationHint, ProviderExecutionPolicyState, ProviderHealthCheck,
+        ProviderHealthSummaryStatus, ProviderOperationHintKind, ProviderPolicy,
+        ProviderQuotePolicyState, RouterOrder, RouterOrderQuote, RouterOrderStatus, VaultAction,
     },
     protocol::DepositAsset,
 };
@@ -33,18 +33,11 @@ pub struct CancelVaultRequest {
     pub cancellation_secret: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum QuoteRequestType {
-    MarketOrder,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreateQuoteRequest {
-    #[serde(rename = "type")]
-    pub quote_type: QuoteRequestType,
-    #[serde(flatten)]
-    pub market_order: MarketOrderQuoteRequest,
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CreateQuoteRequest {
+    MarketOrder(MarketOrderQuoteRequest),
+    LimitOrder(LimitOrderQuoteRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,6 +65,15 @@ pub struct MarketOrderQuoteRequest {
     pub recipient_address: String,
     #[serde(flatten)]
     pub order_kind: MarketOrderQuoteKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LimitOrderQuoteRequest {
+    pub from_asset: DepositAsset,
+    pub to_asset: DepositAsset,
+    pub recipient_address: String,
+    pub input_amount: String,
+    pub output_amount: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -192,7 +194,7 @@ pub struct OrderFlow {
     pub order: RouterOrder,
     pub trace: OrderFlowTrace,
     pub progress: OrderFlowProgress,
-    pub quote: Option<MarketOrderQuote>,
+    pub quote: Option<RouterOrderQuote>,
     pub attempts: Vec<OrderExecutionAttempt>,
     pub steps: Vec<OrderExecutionStep>,
     pub provider_operations: Vec<OrderProviderOperation>,
@@ -326,6 +328,51 @@ mod tests {
     };
     use chrono::Utc;
     use serde_json::json;
+
+    #[test]
+    fn create_quote_request_deserializes_market_order_shape() {
+        let request: CreateQuoteRequest = serde_json::from_value(json!({
+            "type": "market_order",
+            "from_asset": {"chain": "evm:8453", "asset": "native"},
+            "to_asset": {"chain": "bitcoin", "asset": "native"},
+            "recipient_address": "bc1qrecipient0000000000000000000000000000000",
+            "kind": "exact_in",
+            "amount_in": "1000",
+            "slippage_bps": 100
+        }))
+        .expect("market order request");
+
+        let CreateQuoteRequest::MarketOrder(request) = request else {
+            panic!("expected market order request");
+        };
+        assert_eq!(request.from_asset.chain.as_str(), "evm:8453");
+        assert_eq!(request.to_asset.chain.as_str(), "bitcoin");
+        assert!(matches!(
+            request.order_kind,
+            MarketOrderQuoteKind::ExactIn { .. }
+        ));
+    }
+
+    #[test]
+    fn create_quote_request_deserializes_limit_order_shape() {
+        let request: CreateQuoteRequest = serde_json::from_value(json!({
+            "type": "limit_order",
+            "from_asset": {"chain": "evm:8453", "asset": "native"},
+            "to_asset": {"chain": "bitcoin", "asset": "native"},
+            "recipient_address": "bc1qrecipient0000000000000000000000000000000",
+            "input_amount": "100000000000",
+            "output_amount": "100000000"
+        }))
+        .expect("limit order request");
+
+        let CreateQuoteRequest::LimitOrder(request) = request else {
+            panic!("expected limit order request");
+        };
+        assert_eq!(request.from_asset.chain.as_str(), "evm:8453");
+        assert_eq!(request.to_asset.chain.as_str(), "bitcoin");
+        assert_eq!(request.input_amount, "100000000000");
+        assert_eq!(request.output_amount, "100000000");
+    }
 
     #[test]
     fn order_flow_progress_counts_steps_and_current_provider_operation() {
