@@ -45,7 +45,7 @@ export const OrderMarketRequestSchema = z
       example: 'bc1qrefund0000000000000000000000000000000'
     }),
     refundMode: RefundModeSchema.optional(),
-    refundAuthorizer: z.string().min(1).nullable().openapi({
+    refundAuthorizer: z.string().min(1).nullable().optional().openapi({
       example: '0x2222222222222222222222222222222222222222'
     }),
     integrator: z.string().min(1).optional().openapi({
@@ -123,12 +123,18 @@ export const OrderLimitRequestSchema = z
       example: '0x1111111111111111111111111111111111111111'
     }),
     fromAmount: z.string().min(1).optional().openapi({
+      description:
+        'Source amount. Provide exactly two of fromAmount, toAmount, and price; Rift computes the omitted value from the other two.',
       example: '10'
     }),
     toAmount: z.string().min(1).optional().openapi({
+      description:
+        'Destination amount. Provide exactly two of fromAmount, toAmount, and price; Rift computes the omitted value from the other two.',
       example: '1000000'
     }),
     price: z.string().min(1).optional().openapi({
+      description:
+        'Readable destination asset amount per one readable source asset. For Bitcoin.BTC to Ethereum.USDC, "100000" means 100,000 USDC per 1 BTC. Provide exactly two of fromAmount, toAmount, and price; Rift computes the omitted value from the other two.',
       example: '100000'
     }),
     expiration: z.string().datetime().optional().openapi({
@@ -138,7 +144,7 @@ export const OrderLimitRequestSchema = z
       example: 'bc1qrefund0000000000000000000000000000000'
     }),
     refundMode: RefundModeSchema.optional(),
-    refundAuthorizer: z.string().min(1).nullable().openapi({
+    refundAuthorizer: z.string().min(1).nullable().optional().openapi({
       example: '0x2222222222222222222222222222222222222222'
     }),
     integrator: z.string().min(1).optional().openapi({
@@ -178,7 +184,10 @@ export const OrderLimitRequestSchema = z
       })
     }
   })
-  .openapi('OrderLimitRequest')
+  .openapi('OrderLimitRequest', {
+    description:
+      'Limit orders require exactly two of fromAmount, toAmount, and price. Price is a readable destination-per-source ratio; for example, Bitcoin.BTC to Ethereum.USDC with price "100000" means 100,000 USDC per 1 BTC. amountFormat applies to fromAmount and toAmount, not to price.'
+  })
 
 export const orderLimitRoute = createRoute({
   method: 'post',

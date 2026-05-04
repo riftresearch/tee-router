@@ -301,8 +301,7 @@
         "required": [
           "quoteId",
           "fromAddress",
-          "toAddress",
-          "refundAuthorizer"
+          "toAddress"
         ],
         "additionalProperties": false
       },
@@ -404,16 +403,19 @@
           "fromAmount": {
             "type": "string",
             "minLength": 1,
+            "description": "Source amount. Provide exactly two of fromAmount, toAmount, and price; Rift computes the omitted value from the other two.",
             "example": "10"
           },
           "toAmount": {
             "type": "string",
             "minLength": 1,
+            "description": "Destination amount. Provide exactly two of fromAmount, toAmount, and price; Rift computes the omitted value from the other two.",
             "example": "1000000"
           },
           "price": {
             "type": "string",
             "minLength": 1,
+            "description": "Readable destination asset amount per one readable source asset. For Bitcoin.BTC to Ethereum.USDC, \"100000\" means 100,000 USDC per 1 BTC. Provide exactly two of fromAmount, toAmount, and price; Rift computes the omitted value from the other two.",
             "example": "100000"
           },
           "expiration": {
@@ -452,10 +454,10 @@
           "from",
           "to",
           "fromAddress",
-          "toAddress",
-          "refundAuthorizer"
+          "toAddress"
         ],
-        "additionalProperties": false
+        "additionalProperties": false,
+        "description": "Limit orders require exactly two of fromAmount, toAmount, and price. Price is a readable destination-per-source ratio; for example, Bitcoin.BTC to Ethereum.USDC with price \"100000\" means 100,000 USDC per 1 BTC. amountFormat applies to fromAmount and toAmount, not to price."
       },
       "OrderCancellationResponse": {
         "anyOf": [
