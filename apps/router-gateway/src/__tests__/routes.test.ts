@@ -50,6 +50,51 @@ describe('router gateway routes', () => {
       '/health',
       '/providers'
     ])
+    expect(Object.keys(body.components.schemas.QuoteRequest.properties)).toEqual([
+      'from',
+      'to',
+      'amountFormat',
+      'toAddress',
+      'fromAmount',
+      'toAmount',
+      'maxSlippage'
+    ])
+    expect(
+      Object.keys(body.components.schemas.OrderMarketRequest.properties)
+    ).toEqual([
+      'quoteId',
+      'amountFormat',
+      'fromAddress',
+      'toAddress',
+      'refundAddress',
+      'refundMode',
+      'refundAuthorizer',
+      'integrator',
+      'idempotencyKey',
+      'cancelAfter'
+    ])
+    expect(Object.keys(body.components.schemas.OrderLimitRequest.properties)).toEqual([
+      'from',
+      'to',
+      'amountFormat',
+      'fromAddress',
+      'toAddress',
+      'fromAmount',
+      'toAmount',
+      'price',
+      'expiration',
+      'refundAddress',
+      'refundMode',
+      'refundAuthorizer',
+      'integrator',
+      'idempotencyKey'
+    ])
+    expect(
+      body.components.schemas.OrderLimitRequest.properties.refundAuthorizer.example
+    ).toBe('0x2222222222222222222222222222222222222222')
+    expect(body.components.schemas.HealthResponse.properties.status.example).toBe(
+      'ok'
+    )
     expect(body.servers).toEqual([
       {
         url: 'http://localhost:3000',

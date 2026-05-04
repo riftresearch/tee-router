@@ -5,20 +5,34 @@ import type { DependencyHealthMonitor } from '../health'
 
 export const HealthResponseSchema = z
   .object({
-    status: z.literal('ok'),
-    timestamp: z.string().datetime()
+    status: z.literal('ok').openapi({
+      example: 'ok'
+    }),
+    timestamp: z.string().datetime().openapi({
+      example: '2026-05-04T12:00:00.000Z'
+    })
   })
   .openapi('HealthResponse')
 
 export const DependencyHealthResponseSchema = z
   .object({
-    status: z.enum(['ok', 'degraded']),
-    timestamp: z.string().datetime(),
+    status: z.enum(['ok', 'degraded']).openapi({
+      example: 'ok'
+    }),
+    timestamp: z.string().datetime().openapi({
+      example: '2026-05-04T12:00:00.000Z'
+    }),
     dependencies: z.array(
       z.object({
-        name: z.string(),
-        status: z.enum(['reachable', 'unreachable', 'unknown']),
-        checkedAt: z.string().datetime().optional()
+        name: z.string().openapi({
+          example: 'hyperliquid'
+        }),
+        status: z.enum(['reachable', 'unreachable', 'unknown']).openapi({
+          example: 'reachable'
+        }),
+        checkedAt: z.string().datetime().optional().openapi({
+          example: '2026-05-04T12:00:00.000Z'
+        })
       })
     )
   })

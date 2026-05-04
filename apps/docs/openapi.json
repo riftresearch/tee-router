@@ -17,31 +17,40 @@
         "type": "object",
         "properties": {
           "quoteId": {
-            "type": "string"
+            "type": "string",
+            "example": "00000000-0000-4000-8000-000000000001"
           },
           "from": {
-            "type": "string"
+            "type": "string",
+            "example": "Bitcoin.BTC"
           },
           "to": {
-            "type": "string"
+            "type": "string",
+            "example": "Ethereum.USDC"
           },
           "expiry": {
-            "type": "string"
+            "type": "string",
+            "example": "2026-05-04T12:10:00Z"
           },
           "expectedOut": {
-            "type": "string"
+            "type": "string",
+            "example": "100000"
           },
           "expectedSlippage": {
-            "type": "string"
+            "type": "string",
+            "example": "0.2"
           },
           "minOut": {
-            "type": "string"
+            "type": "string",
+            "example": "99000"
           },
           "maxIn": {
-            "type": "string"
+            "type": "string",
+            "example": "10.1"
           },
           "maxSlippage": {
-            "type": "string"
+            "type": "string",
+            "example": "1.5"
           },
           "amountFormat": {
             "$ref": "#/components/schemas/AmountFormat"
@@ -62,7 +71,8 @@
           "readable",
           "raw"
         ],
-        "default": "readable"
+        "default": "readable",
+        "example": "readable"
       },
       "ErrorResponse": {
         "type": "object",
@@ -71,12 +81,18 @@
             "type": "object",
             "properties": {
               "code": {
-                "type": "string"
+                "type": "string",
+                "example": "invalid_request"
               },
               "message": {
-                "type": "string"
+                "type": "string",
+                "example": "Invalid gateway request."
               },
-              "details": {}
+              "details": {
+                "example": {
+                  "field": "fromAmount"
+                }
+              }
             },
             "required": [
               "code",
@@ -101,6 +117,9 @@
             "minLength": 1,
             "example": "Ethereum.USDC"
           },
+          "amountFormat": {
+            "$ref": "#/components/schemas/AmountFormat"
+          },
           "toAddress": {
             "type": "string",
             "minLength": 1,
@@ -121,9 +140,6 @@
             "type": "string",
             "minLength": 1,
             "example": "1.5"
-          },
-          "amountFormat": {
-            "$ref": "#/components/schemas/AmountFormat"
           }
         },
         "required": [
@@ -138,43 +154,56 @@
         "type": "object",
         "properties": {
           "orderId": {
-            "type": "string"
+            "type": "string",
+            "example": "00000000-0000-4000-8000-000000000002"
           },
           "orderAddress": {
-            "type": "string"
+            "type": "string",
+            "example": "bc1qorderaddress0000000000000000000000000"
           },
           "amountToSend": {
-            "type": "string"
+            "type": "string",
+            "example": "10"
           },
           "quoteId": {
-            "type": "string"
+            "type": "string",
+            "example": "00000000-0000-4000-8000-000000000001"
           },
           "from": {
-            "type": "string"
+            "type": "string",
+            "example": "Bitcoin.BTC"
           },
           "to": {
-            "type": "string"
+            "type": "string",
+            "example": "Ethereum.USDC"
           },
           "status": {
-            "type": "string"
+            "type": "string",
+            "example": "quoted"
           },
           "expiry": {
-            "type": "string"
+            "type": "string",
+            "example": "2026-05-04T12:10:00Z"
           },
           "expectedOut": {
-            "type": "string"
+            "type": "string",
+            "example": "100000"
           },
           "expectedSlippage": {
-            "type": "string"
+            "type": "string",
+            "example": "0.2"
           },
           "minOut": {
-            "type": "string"
+            "type": "string",
+            "example": "99000"
           },
           "maxIn": {
-            "type": "string"
+            "type": "string",
+            "example": "10.1"
           },
           "maxSlippage": {
-            "type": "string"
+            "type": "string",
+            "example": "1.5"
           },
           "amountFormat": {
             "$ref": "#/components/schemas/AmountFormat"
@@ -186,10 +215,12 @@
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "example": "0x2222222222222222222222222222222222222222"
           },
           "refundToken": {
-            "type": "string"
+            "type": "string",
+            "example": "rgt_abcdefghijklmnopqrstuvwxyz"
           }
         },
         "required": [
@@ -211,38 +242,34 @@
           "evmSignature",
           "token"
         ],
-        "default": "evmSignature"
+        "default": "evmSignature",
+        "example": "evmSignature"
       },
       "OrderMarketRequest": {
         "type": "object",
         "properties": {
           "quoteId": {
             "type": "string",
-            "format": "uuid"
+            "format": "uuid",
+            "example": "00000000-0000-4000-8000-000000000001"
+          },
+          "amountFormat": {
+            "$ref": "#/components/schemas/AmountFormat"
           },
           "fromAddress": {
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "example": "bc1qexample000000000000000000000000000000"
           },
           "toAddress": {
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "example": "0x1111111111111111111111111111111111111111"
           },
           "refundAddress": {
             "type": "string",
-            "minLength": 1
-          },
-          "integrator": {
-            "type": "string",
-            "minLength": 1
-          },
-          "idempotencyKey": {
-            "type": "string",
-            "minLength": 1
-          },
-          "cancelAfter": {
-            "type": "string",
-            "format": "date-time"
+            "minLength": 1,
+            "example": "bc1qrefund0000000000000000000000000000000"
           },
           "refundMode": {
             "$ref": "#/components/schemas/RefundMode"
@@ -252,10 +279,23 @@
               "string",
               "null"
             ],
-            "minLength": 1
+            "minLength": 1,
+            "example": "0x2222222222222222222222222222222222222222"
           },
-          "amountFormat": {
-            "$ref": "#/components/schemas/AmountFormat"
+          "integrator": {
+            "type": "string",
+            "minLength": 1,
+            "example": "partner-a"
+          },
+          "idempotencyKey": {
+            "type": "string",
+            "minLength": 1,
+            "example": "partner-a-market-order-0001"
+          },
+          "cancelAfter": {
+            "type": "string",
+            "format": "date-time",
+            "example": "2026-05-04T13:00:00Z"
           }
         },
         "required": [
@@ -270,31 +310,40 @@
         "type": "object",
         "properties": {
           "orderId": {
-            "type": "string"
+            "type": "string",
+            "example": "00000000-0000-4000-8000-000000000002"
           },
           "orderAddress": {
-            "type": "string"
+            "type": "string",
+            "example": "bc1qorderaddress0000000000000000000000000"
           },
           "amountToSend": {
-            "type": "string"
+            "type": "string",
+            "example": "10"
           },
           "quoteId": {
-            "type": "string"
+            "type": "string",
+            "example": "00000000-0000-4000-8000-000000000003"
           },
           "from": {
-            "type": "string"
+            "type": "string",
+            "example": "Bitcoin.BTC"
           },
           "to": {
-            "type": "string"
+            "type": "string",
+            "example": "Ethereum.USDC"
           },
           "status": {
-            "type": "string"
+            "type": "string",
+            "example": "quoted"
           },
           "expiry": {
-            "type": "string"
+            "type": "string",
+            "example": "2026-05-04T12:10:00Z"
           },
           "minOut": {
-            "type": "string"
+            "type": "string",
+            "example": "100000"
           },
           "amountFormat": {
             "$ref": "#/components/schemas/AmountFormat"
@@ -306,10 +355,12 @@
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "example": "0x2222222222222222222222222222222222222222"
           },
           "refundToken": {
-            "type": "string"
+            "type": "string",
+            "example": "rgt_abcdefghijklmnopqrstuvwxyz"
           }
         },
         "required": [
@@ -329,47 +380,51 @@
         "properties": {
           "from": {
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "example": "Bitcoin.BTC"
           },
           "to": {
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "example": "Ethereum.USDC"
+          },
+          "amountFormat": {
+            "$ref": "#/components/schemas/AmountFormat"
           },
           "fromAddress": {
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "example": "bc1qexample000000000000000000000000000000"
           },
           "toAddress": {
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "example": "0x1111111111111111111111111111111111111111"
           },
           "fromAmount": {
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "example": "10"
           },
           "toAmount": {
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "example": "1000000"
           },
           "price": {
             "type": "string",
-            "minLength": 1
-          },
-          "refundAddress": {
-            "type": "string",
-            "minLength": 1
-          },
-          "integrator": {
-            "type": "string",
-            "minLength": 1
-          },
-          "idempotencyKey": {
-            "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "example": "100000"
           },
           "expiration": {
             "type": "string",
-            "format": "date-time"
+            "format": "date-time",
+            "example": "2026-05-04T13:00:00Z"
+          },
+          "refundAddress": {
+            "type": "string",
+            "minLength": 1,
+            "example": "bc1qrefund0000000000000000000000000000000"
           },
           "refundMode": {
             "$ref": "#/components/schemas/RefundMode"
@@ -379,10 +434,18 @@
               "string",
               "null"
             ],
-            "minLength": 1
+            "minLength": 1,
+            "example": "0x2222222222222222222222222222222222222222"
           },
-          "amountFormat": {
-            "$ref": "#/components/schemas/AmountFormat"
+          "integrator": {
+            "type": "string",
+            "minLength": 1,
+            "example": "partner-a"
+          },
+          "idempotencyKey": {
+            "type": "string",
+            "minLength": 1,
+            "example": "partner-a-limit-order-0001"
           }
         },
         "required": [
@@ -407,20 +470,23 @@
       "OrderCancelRequest": {
         "type": "object",
         "properties": {
+          "amountFormat": {
+            "$ref": "#/components/schemas/AmountFormat"
+          },
           "refundToken": {
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "example": "rgt_abcdefghijklmnopqrstuvwxyz"
           },
           "refundSignature": {
             "type": "string",
-            "pattern": "^0x[a-fA-F0-9]+$"
+            "pattern": "^0x[a-fA-F0-9]+$",
+            "example": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
           },
           "refundSignatureDeadline": {
             "type": "integer",
-            "exclusiveMinimum": 0
-          },
-          "amountFormat": {
-            "$ref": "#/components/schemas/AmountFormat"
+            "exclusiveMinimum": 0,
+            "example": 1777899600
           }
         },
         "additionalProperties": false
@@ -432,11 +498,13 @@
             "type": "string",
             "enum": [
               "ok"
-            ]
+            ],
+            "example": "ok"
           },
           "timestamp": {
             "type": "string",
-            "format": "date-time"
+            "format": "date-time",
+            "example": "2026-05-04T12:00:00.000Z"
           }
         },
         "required": [
@@ -452,11 +520,13 @@
             "enum": [
               "ok",
               "degraded"
-            ]
+            ],
+            "example": "ok"
           },
           "timestamp": {
             "type": "string",
-            "format": "date-time"
+            "format": "date-time",
+            "example": "2026-05-04T12:00:00.000Z"
           },
           "dependencies": {
             "type": "array",
@@ -464,7 +534,8 @@
               "type": "object",
               "properties": {
                 "name": {
-                  "type": "string"
+                  "type": "string",
+                  "example": "hyperliquid"
                 },
                 "status": {
                   "type": "string",
@@ -472,11 +543,13 @@
                     "reachable",
                     "unreachable",
                     "unknown"
-                  ]
+                  ],
+                  "example": "reachable"
                 },
                 "checkedAt": {
                   "type": "string",
-                  "format": "date-time"
+                  "format": "date-time",
+                  "example": "2026-05-04T12:00:00.000Z"
                 }
               },
               "required": [
@@ -746,7 +819,8 @@
           {
             "schema": {
               "type": "string",
-              "format": "uuid"
+              "format": "uuid",
+              "example": "00000000-0000-4000-8000-000000000002"
             },
             "required": true,
             "name": "orderId",

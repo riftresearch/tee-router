@@ -24,6 +24,7 @@ export const QuoteRequestSchema = z
     to: z.string().min(1).openapi({
       example: 'Ethereum.USDC'
     }),
+    amountFormat: AmountFormatSchema.optional(),
     toAddress: z.string().min(1).openapi({
       description:
         'Current Rust router quote bridge field. The upstream router requires a recipient address at quote time.',
@@ -37,8 +38,7 @@ export const QuoteRequestSchema = z
     }),
     maxSlippage: z.string().min(1).openapi({
       example: '1.5'
-    }),
-    amountFormat: AmountFormatSchema.optional()
+    })
   })
   .strict()
   .superRefine((value, ctx) => {

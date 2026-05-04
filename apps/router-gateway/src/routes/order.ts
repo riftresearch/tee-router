@@ -31,16 +31,32 @@ import {
 
 export const OrderMarketRequestSchema = z
   .object({
-    quoteId: z.string().uuid(),
-    fromAddress: z.string().min(1),
-    toAddress: z.string().min(1),
-    refundAddress: z.string().min(1).optional(),
-    integrator: z.string().min(1).optional(),
-    idempotencyKey: z.string().min(1).optional(),
-    cancelAfter: z.string().datetime().optional(),
+    quoteId: z.string().uuid().openapi({
+      example: '00000000-0000-4000-8000-000000000001'
+    }),
+    amountFormat: AmountFormatSchema.optional(),
+    fromAddress: z.string().min(1).openapi({
+      example: 'bc1qexample000000000000000000000000000000'
+    }),
+    toAddress: z.string().min(1).openapi({
+      example: '0x1111111111111111111111111111111111111111'
+    }),
+    refundAddress: z.string().min(1).optional().openapi({
+      example: 'bc1qrefund0000000000000000000000000000000'
+    }),
     refundMode: RefundModeSchema.optional(),
-    refundAuthorizer: z.string().min(1).nullable(),
-    amountFormat: AmountFormatSchema.optional()
+    refundAuthorizer: z.string().min(1).nullable().openapi({
+      example: '0x2222222222222222222222222222222222222222'
+    }),
+    integrator: z.string().min(1).optional().openapi({
+      example: 'partner-a'
+    }),
+    idempotencyKey: z.string().min(1).optional().openapi({
+      example: 'partner-a-market-order-0001'
+    }),
+    cancelAfter: z.string().datetime().optional().openapi({
+      example: '2026-05-04T13:00:00Z'
+    })
   })
   .strict()
   .superRefine((value, ctx) => {
@@ -93,20 +109,44 @@ export const orderMarketRoute = createRoute({
 
 export const OrderLimitRequestSchema = z
   .object({
-    from: z.string().min(1),
-    to: z.string().min(1),
-    fromAddress: z.string().min(1),
-    toAddress: z.string().min(1),
-    fromAmount: z.string().min(1).optional(),
-    toAmount: z.string().min(1).optional(),
-    price: z.string().min(1).optional(),
-    refundAddress: z.string().min(1).optional(),
-    integrator: z.string().min(1).optional(),
-    idempotencyKey: z.string().min(1).optional(),
-    expiration: z.string().datetime().optional(),
+    from: z.string().min(1).openapi({
+      example: 'Bitcoin.BTC'
+    }),
+    to: z.string().min(1).openapi({
+      example: 'Ethereum.USDC'
+    }),
+    amountFormat: AmountFormatSchema.optional(),
+    fromAddress: z.string().min(1).openapi({
+      example: 'bc1qexample000000000000000000000000000000'
+    }),
+    toAddress: z.string().min(1).openapi({
+      example: '0x1111111111111111111111111111111111111111'
+    }),
+    fromAmount: z.string().min(1).optional().openapi({
+      example: '10'
+    }),
+    toAmount: z.string().min(1).optional().openapi({
+      example: '1000000'
+    }),
+    price: z.string().min(1).optional().openapi({
+      example: '100000'
+    }),
+    expiration: z.string().datetime().optional().openapi({
+      example: '2026-05-04T13:00:00Z'
+    }),
+    refundAddress: z.string().min(1).optional().openapi({
+      example: 'bc1qrefund0000000000000000000000000000000'
+    }),
     refundMode: RefundModeSchema.optional(),
-    refundAuthorizer: z.string().min(1).nullable(),
-    amountFormat: AmountFormatSchema.optional()
+    refundAuthorizer: z.string().min(1).nullable().openapi({
+      example: '0x2222222222222222222222222222222222222222'
+    }),
+    integrator: z.string().min(1).optional().openapi({
+      example: 'partner-a'
+    }),
+    idempotencyKey: z.string().min(1).optional().openapi({
+      example: 'partner-a-limit-order-0001'
+    })
   })
   .strict()
   .superRefine((value, ctx) => {
@@ -170,10 +210,16 @@ export const orderLimitRoute = createRoute({
 
 export const OrderCancelRequestSchema = z
   .object({
-    refundToken: z.string().min(1).optional(),
-    refundSignature: z.string().regex(/^0x[a-fA-F0-9]+$/).optional(),
-    refundSignatureDeadline: z.number().int().positive().optional(),
-    amountFormat: AmountFormatSchema.optional()
+    amountFormat: AmountFormatSchema.optional(),
+    refundToken: z.string().min(1).optional().openapi({
+      example: 'rgt_abcdefghijklmnopqrstuvwxyz'
+    }),
+    refundSignature: z.string().regex(/^0x[a-fA-F0-9]+$/).optional().openapi({
+      example: '0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd'
+    }),
+    refundSignatureDeadline: z.number().int().positive().optional().openapi({
+      example: 1777899600
+    })
   })
   .strict()
   .superRefine((value, ctx) => {
@@ -205,7 +251,9 @@ export const orderCancelRoute = createRoute({
   summary: 'Cancel an order via specified authentication',
   request: {
     params: z.object({
-      orderId: z.string().uuid()
+      orderId: z.string().uuid().openapi({
+        example: '00000000-0000-4000-8000-000000000002'
+      })
     }),
     body: {
       required: true,
