@@ -57,6 +57,28 @@ export const OrderResponseSchema = z
   })
   .openapi('OrderResponse')
 
+export const LimitOrderResponseSchema = z
+  .object({
+    orderId: z.string(),
+    orderAddress: z.string(),
+    amountToSend: z.string(),
+    quoteId: z.string(),
+    from: z.string(),
+    to: z.string(),
+    status: z.string(),
+    expiry: z.string(),
+    minOut: z.string(),
+    amountFormat: AmountFormatSchema,
+    refundMode: RefundModeSchema.optional(),
+    refundAuthorizer: z.string().nullable().optional(),
+    refundToken: z.string().optional()
+  })
+  .openapi('LimitOrderResponse')
+
+export const OrderCancellationResponseSchema = z
+  .union([OrderResponseSchema, LimitOrderResponseSchema])
+  .openapi('OrderCancellationResponse')
+
 export const ErrorResponses = {
   400: {
     description: 'Invalid gateway request.',

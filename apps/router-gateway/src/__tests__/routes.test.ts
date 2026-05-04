@@ -19,6 +19,7 @@ import type { FetchLike } from '../internal/router-client'
 
 const QUOTE_ID = '00000000-0000-4000-8000-000000000001'
 const ORDER_ID = '00000000-0000-4000-8000-000000000002'
+const LIMIT_QUOTE_ID = '00000000-0000-4000-8000-000000000003'
 const TO_ADDRESS = '0x1111111111111111111111111111111111111111'
 const FROM_ADDRESS = 'bc1qexample000000000000000000000000000000'
 const REFUND_ACCOUNT = privateKeyToAccount(
@@ -39,10 +40,12 @@ describe('router gateway routes', () => {
     expect(body.paths['/status']).toBeUndefined()
     expect(body.paths['/quote']).toBeDefined()
     expect(body.paths['/order/market']).toBeDefined()
+    expect(body.paths['/order/limit']).toBeDefined()
     expect(body.paths['/order/{orderId}/cancel']).toBeDefined()
     expect(Object.keys(body.paths)).toEqual([
       '/quote',
       '/order/market',
+      '/order/limit',
       '/order/{orderId}/cancel',
       '/health',
       '/providers'
@@ -269,6 +272,193 @@ describe('router gateway routes', () => {
     expect(stored?.refundAuthorizer).toBe(REFUND_ACCOUNT.address)
   })
 
+  test('creates a limit order with explicit input and output amounts', async () => {
+    const calls: RecordedCall[] = []
+    const store = new InMemoryRefundAuthorizationStore()
+    const app = createApp(testConfig(), {
+      refundAuthorizationService: testRefundAuthorizationService(store),
+      fetch: mockFetch(calls, async (path) => {
+        if (path === '/api/v1/quotes') {
+          return Response.json(internalLimitQuote(), { status: 201 })
+        }
+
+        if (path === '/api/v1/orders') {
+          return Response.json(internalLimitOrder(), { status: 201 })
+        }
+
+        return Response.json({ message: 'not found' }, { status: 404 })
+      })
+    })
+
+    const response = await app.request('/order/limit', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        from: 'Bitcoin.BTC',
+        to: 'Ethereum.USDC',
+        fromAddress: FROM_ADDRESS,
+        toAddress: TO_ADDRESS,
+        fromAmount: '1.25',
+        toAmount: '100000',
+        expiration: '2026-05-01T12:00:00Z',
+        refundAuthorizer: REFUND_ACCOUNT.address,
+        integrator: 'partner-a'
+      })
+    })
+
+    expect(response.status).toBe(201)
+    expect(calls[0]?.method).toBe('POST')
+    expect(calls[0]?.path).toBe('/api/v1/quotes')
+    expect(calls[0]?.body).toEqual({
+      type: 'limit_order',
+      from_asset: {
+        chain: 'bitcoin',
+        asset: 'native'
+      },
+      to_asset: {
+        chain: 'evm:1',
+        asset: '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48'
+      },
+      recipient_address: TO_ADDRESS,
+      input_amount: '125000000',
+      output_amount: '100000000000'
+    })
+    expect(calls[1]?.body).toEqual({
+      quote_id: LIMIT_QUOTE_ID,
+      refund_address: FROM_ADDRESS,
+      cancel_after: '2026-05-01T12:00:00Z',
+      metadata: {
+        integrator: 'partner-a',
+        from_address: FROM_ADDRESS,
+        to_address: TO_ADDRESS,
+        gateway: 'router-gateway',
+        order_type: 'limit_order'
+      }
+    })
+
+    const body = await response.json()
+    expect(body).toMatchObject({
+      orderId: ORDER_ID,
+      orderAddress: 'bc1qorderaddress0000000000000000000000000',
+      amountToSend: '1.25',
+      quoteId: LIMIT_QUOTE_ID,
+      from: 'Bitcoin.BTC',
+      to: 'Ethereum.USDC',
+      minOut: '100000',
+      refundMode: 'evmSignature',
+      refundAuthorizer: REFUND_ACCOUNT.address
+    })
+    expect(body.maxSlippage).toBeUndefined()
+    expect(body.expectedOut).toBeUndefined()
+    expect(body.cancellationSecret).toBeUndefined()
+  })
+
+  test('creates a limit order by deriving output from a readable price', async () => {
+    const calls: RecordedCall[] = []
+    const app = createApp(testConfig(), {
+      refundAuthorizationService: testRefundAuthorizationService(
+        new InMemoryRefundAuthorizationStore()
+      ),
+      fetch: mockFetch(calls, async (path) => {
+        if (path === '/api/v1/quotes') {
+          return Response.json(internalLimitQuote(), { status: 201 })
+        }
+
+        if (path === '/api/v1/orders') {
+          return Response.json(internalLimitOrder(), { status: 201 })
+        }
+
+        return Response.json({ message: 'not found' }, { status: 404 })
+      })
+    })
+
+    const response = await app.request('/order/limit', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        from: 'Bitcoin.BTC',
+        to: 'Ethereum.USDC',
+        fromAddress: FROM_ADDRESS,
+        toAddress: TO_ADDRESS,
+        fromAmount: '2',
+        price: '100000',
+        refundAuthorizer: REFUND_ACCOUNT.address
+      })
+    })
+
+    expect(response.status).toBe(201)
+    expect(calls[0]?.body).toMatchObject({
+      input_amount: '200000000',
+      output_amount: '200000000000'
+    })
+  })
+
+  test('creates a limit order by deriving input from a readable price', async () => {
+    const calls: RecordedCall[] = []
+    const app = createApp(testConfig(), {
+      refundAuthorizationService: testRefundAuthorizationService(
+        new InMemoryRefundAuthorizationStore()
+      ),
+      fetch: mockFetch(calls, async (path) => {
+        if (path === '/api/v1/quotes') {
+          return Response.json(internalLimitQuote(), { status: 201 })
+        }
+
+        if (path === '/api/v1/orders') {
+          return Response.json(internalLimitOrder(), { status: 201 })
+        }
+
+        return Response.json({ message: 'not found' }, { status: 404 })
+      })
+    })
+
+    const response = await app.request('/order/limit', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        from: 'Bitcoin.BTC',
+        to: 'Ethereum.USDC',
+        fromAddress: FROM_ADDRESS,
+        toAddress: TO_ADDRESS,
+        toAmount: '200000',
+        price: '100000',
+        refundAuthorizer: REFUND_ACCOUNT.address
+      })
+    })
+
+    expect(response.status).toBe(201)
+    expect(calls[0]?.body).toMatchObject({
+      input_amount: '200000000',
+      output_amount: '200000000000'
+    })
+  })
+
+  test('rejects numeric limit order amounts before calling the router API', async () => {
+    const calls: RecordedCall[] = []
+    const app = createApp(testConfig(), {
+      fetch: mockFetch(calls, async () =>
+        Response.json({ message: 'unexpected' }, { status: 500 })
+      )
+    })
+
+    const response = await app.request('/order/limit', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        from: 'Bitcoin.BTC',
+        to: 'Ethereum.USDC',
+        fromAddress: FROM_ADDRESS,
+        toAddress: TO_ADDRESS,
+        fromAmount: 1.25,
+        toAmount: '100000',
+        refundAuthorizer: REFUND_ACCOUNT.address
+      })
+    })
+
+    expect(response.status).toBe(400)
+    expect(calls).toHaveLength(0)
+  })
+
   test('stores cancellation secrets and returns a refund token in token mode', async () => {
     const calls: RecordedCall[] = []
     const store = new InMemoryRefundAuthorizationStore()
@@ -332,6 +522,64 @@ describe('router gateway routes', () => {
     expect(
       (await store.findRefundAuthorization(ORDER_ID))?.cancellationRequestedAt
     ).toBeDefined()
+  })
+
+  test('cancels token-authorized limit orders with the limit response shape', async () => {
+    const calls: RecordedCall[] = []
+    const store = new InMemoryRefundAuthorizationStore()
+    const app = createApp(testConfig(), {
+      refundAuthorizationService: testRefundAuthorizationService(store),
+      fetch: mockFetch(calls, async (path) => {
+        if (path === '/api/v1/quotes') {
+          return Response.json(internalLimitQuote(), { status: 201 })
+        }
+
+        if (path === '/api/v1/orders') {
+          return Response.json(internalLimitOrder(), { status: 201 })
+        }
+
+        if (path === `/api/v1/orders/${ORDER_ID}/cancellations`) {
+          return Response.json(internalLimitOrder({ status: 'refunding' }))
+        }
+
+        return Response.json({ message: 'not found' }, { status: 404 })
+      })
+    })
+
+    const orderResponse = await app.request('/order/limit', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        from: 'Bitcoin.BTC',
+        to: 'Ethereum.USDC',
+        fromAddress: FROM_ADDRESS,
+        toAddress: TO_ADDRESS,
+        fromAmount: '1.25',
+        toAmount: '100000',
+        refundMode: 'token',
+        refundAuthorizer: null
+      })
+    })
+    const orderBody = await orderResponse.json()
+
+    const cancelResponse = await app.request(`/order/${ORDER_ID}/cancel`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        refundToken: orderBody.refundToken
+      })
+    })
+    const cancelBody = await cancelResponse.json()
+
+    expect(cancelResponse.status).toBe(200)
+    expect(cancelBody).toMatchObject({
+      orderId: ORDER_ID,
+      status: 'refunding',
+      quoteId: LIMIT_QUOTE_ID,
+      minOut: '100000'
+    })
+    expect(cancelBody.expectedOut).toBeUndefined()
+    expect(cancelBody.maxSlippage).toBeUndefined()
   })
 
   test('verifies EIP-712 refund signatures before forwarding cancellation', async () => {
@@ -513,6 +761,34 @@ function internalQuote() {
   }
 }
 
+function internalLimitQuote() {
+  return {
+    quote: {
+      type: 'limit_order',
+      payload: {
+        id: LIMIT_QUOTE_ID,
+        order_id: null,
+        source_asset: {
+          chain: 'bitcoin',
+          asset: 'native'
+        },
+        destination_asset: {
+          chain: 'evm:1',
+          asset: '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48'
+        },
+        recipient_address: TO_ADDRESS,
+        provider_id: 'hyperliquid',
+        input_amount: '125000000',
+        output_amount: '100000000000',
+        residual_policy: 'refund',
+        provider_quote: {},
+        expires_at: '2026-04-30T12:00:00Z',
+        created_at: '2026-04-30T11:59:00Z'
+      }
+    }
+  }
+}
+
 function internalOrder(overrides: { status?: string } = {}) {
   return {
     order: {
@@ -530,6 +806,33 @@ function internalOrder(overrides: { status?: string } = {}) {
       refund_address: FROM_ADDRESS
     },
     quote: internalQuote().quote,
+    funding_vault: {
+      vault: {
+        deposit_vault_address: 'bc1qorderaddress0000000000000000000000000'
+      }
+    },
+    cancellation_secret:
+      '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+  }
+}
+
+function internalLimitOrder(overrides: { status?: string } = {}) {
+  return {
+    order: {
+      id: ORDER_ID,
+      status: overrides.status ?? 'quoted',
+      source_asset: {
+        chain: 'bitcoin',
+        asset: 'native'
+      },
+      destination_asset: {
+        chain: 'evm:1',
+        asset: '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48'
+      },
+      recipient_address: TO_ADDRESS,
+      refund_address: FROM_ADDRESS
+    },
+    quote: internalLimitQuote().quote,
     funding_vault: {
       vault: {
         deposit_vault_address: 'bc1qorderaddress0000000000000000000000000'

@@ -1,9 +1,20 @@
 import { createRoute, z } from '@hono/zod-openapi'
 
-import type { AmountFormat } from '../assets'
+import {
+  parseAmount,
+  resolveAssetIdentifier,
+  type AmountFormat,
+  type ResolvedAsset
+} from '../assets'
 import type { GatewayConfig } from '../config'
 import { GatewayValidationError, normalizeError } from '../errors'
-import { marketQuoteFromEnvelope, presentOrderEnvelope } from '../presenters'
+import {
+  limitQuoteFromEnvelope,
+  marketQuoteFromEnvelope,
+  presentAnyOrderEnvelope,
+  presentLimitOrderEnvelope,
+  presentOrderEnvelope
+} from '../presenters'
 import {
   refundAuthorizationServiceFor,
   routerClientFor,
@@ -12,6 +23,8 @@ import {
 import {
   AmountFormatSchema,
   ErrorResponses,
+  LimitOrderResponseSchema,
+  OrderCancellationResponseSchema,
   OrderResponseSchema,
   RefundModeSchema
 } from './schemas'
@@ -78,6 +91,83 @@ export const orderMarketRoute = createRoute({
   }
 })
 
+export const OrderLimitRequestSchema = z
+  .object({
+    from: z.string().min(1),
+    to: z.string().min(1),
+    fromAddress: z.string().min(1),
+    toAddress: z.string().min(1),
+    fromAmount: z.string().min(1).optional(),
+    toAmount: z.string().min(1).optional(),
+    price: z.string().min(1).optional(),
+    refundAddress: z.string().min(1).optional(),
+    integrator: z.string().min(1).optional(),
+    idempotencyKey: z.string().min(1).optional(),
+    expiration: z.string().datetime().optional(),
+    refundMode: RefundModeSchema.optional(),
+    refundAuthorizer: z.string().min(1).nullable(),
+    amountFormat: AmountFormatSchema.optional()
+  })
+  .strict()
+  .superRefine((value, ctx) => {
+    const amountTerms = [value.fromAmount, value.toAmount, value.price].filter(
+      (term) => term !== undefined
+    )
+    if (amountTerms.length !== 2) {
+      ctx.addIssue({
+        code: 'custom',
+        message: 'exactly two of fromAmount, toAmount, and price are required',
+        path: ['fromAmount']
+      })
+    }
+
+    const refundMode = value.refundMode ?? 'evmSignature'
+    if (refundMode === 'evmSignature' && !value.refundAuthorizer) {
+      ctx.addIssue({
+        code: 'custom',
+        message: 'refundAuthorizer is required when refundMode is evmSignature',
+        path: ['refundAuthorizer']
+      })
+    }
+
+    if (refundMode === 'token' && value.refundAuthorizer !== null) {
+      ctx.addIssue({
+        code: 'custom',
+        message: 'refundAuthorizer must be null when refundMode is token',
+        path: ['refundAuthorizer']
+      })
+    }
+  })
+  .openapi('OrderLimitRequest')
+
+export const orderLimitRoute = createRoute({
+  method: 'post',
+  path: '/order/limit',
+  tags: ['Orders'],
+  summary: 'Create a limit order',
+  request: {
+    body: {
+      required: true,
+      content: {
+        'application/json': {
+          schema: OrderLimitRequestSchema
+        }
+      }
+    }
+  },
+  responses: {
+    201: {
+      description: 'Limit order created by the internal router API.',
+      content: {
+        'application/json': {
+          schema: LimitOrderResponseSchema
+        }
+      }
+    },
+    ...ErrorResponses
+  }
+})
+
 export const OrderCancelRequestSchema = z
   .object({
     refundToken: z.string().min(1).optional(),
@@ -131,7 +221,7 @@ export const orderCancelRoute = createRoute({
       description: 'Order cancellation accepted by the internal router API.',
       content: {
         'application/json': {
-          schema: OrderResponseSchema
+          schema: OrderCancellationResponseSchema
         }
       }
     },
@@ -216,6 +306,85 @@ export function createOrderMarketHandler(
   }
 }
 
+export function createOrderLimitHandler(
+  config: GatewayConfig,
+  deps: GatewayDeps = {}
+) {
+  return async (c: any) => {
+    try {
+      const request = c.req.valid('json')
+      const amountFormat: AmountFormat = request.amountFormat ?? 'readable'
+      const refundMode = request.refundMode ?? 'evmSignature'
+      const fromAsset = resolveAssetIdentifier(request.from)
+      const toAsset = resolveAssetIdentifier(request.to)
+      const { inputAmount, outputAmount } = limitOrderAmounts({
+        fromAmount: request.fromAmount,
+        toAmount: request.toAmount,
+        price: request.price,
+        fromAsset,
+        toAsset,
+        amountFormat
+      })
+
+      const routerClient = routerClientFor(config, deps)
+      const quoteEnvelope = await routerClient.createQuote({
+        type: 'limit_order',
+        from_asset: fromAsset.internal,
+        to_asset: toAsset.internal,
+        recipient_address: request.toAddress,
+        input_amount: inputAmount,
+        output_amount: outputAmount
+      })
+
+      const quoteId = limitQuoteFromEnvelope(quoteEnvelope).id
+      const envelope = await routerClient.createOrder({
+        quote_id: quoteId,
+        refund_address: request.refundAddress ?? request.fromAddress,
+        ...(request.expiration ? { cancel_after: request.expiration } : {}),
+        ...(request.idempotencyKey
+          ? { idempotency_key: request.idempotencyKey }
+          : {}),
+        metadata: {
+          ...(request.integrator ? { integrator: request.integrator } : {}),
+          from_address: request.fromAddress,
+          to_address: request.toAddress,
+          gateway: 'router-gateway',
+          order_type: 'limit_order'
+        }
+      })
+      const response = presentLimitOrderEnvelope(envelope, amountFormat)
+
+      if (!envelope.cancellation_secret) {
+        throw new GatewayValidationError(
+          'router order response is missing cancellationSecret'
+        )
+      }
+
+      const refundAuthorization = await refundAuthorizationServiceFor(
+        config,
+        deps
+      ).createRefundAuthorization({
+        routerOrderId: envelope.order.id,
+        cancellationSecret: envelope.cancellation_secret,
+        refundMode,
+        refundAuthorizer: request.refundAuthorizer ?? null
+      })
+
+      delete response.cancellationSecret
+      return c.json(
+        {
+          ...response,
+          ...refundAuthorization
+        },
+        201
+      )
+    } catch (error) {
+      const normalized = normalizeError(error)
+      return c.json(normalized.body, normalized.status)
+    }
+  }
+}
+
 export function createOrderCancelHandler(
   config: GatewayConfig,
   deps: GatewayDeps = {}
@@ -243,11 +412,172 @@ export function createOrderCancelHandler(
         }
       )
 
-      return c.json(presentOrderEnvelope(envelope, amountFormat), 200)
+      return c.json(presentAnyOrderEnvelope(envelope, amountFormat), 200)
     } catch (error) {
       const normalized = normalizeError(error)
       return c.json(normalized.body, normalized.status)
     }
+  }
+}
+
+type LimitOrderAmountInput = {
+  fromAmount?: string
+  toAmount?: string
+  price?: string
+  fromAsset: ResolvedAsset
+  toAsset: ResolvedAsset
+  amountFormat: AmountFormat
+}
+
+function limitOrderAmounts(input: LimitOrderAmountInput): {
+  inputAmount: string
+  outputAmount: string
+} {
+  if (input.fromAmount !== undefined && input.toAmount !== undefined) {
+    return {
+      inputAmount: parseAmount(
+        input.fromAmount,
+        input.fromAsset,
+        input.amountFormat,
+        'fromAmount'
+      ),
+      outputAmount: parseAmount(
+        input.toAmount,
+        input.toAsset,
+        input.amountFormat,
+        'toAmount'
+      )
+    }
+  }
+
+  if (input.fromAmount !== undefined && input.price !== undefined) {
+    const inputAmount = parseAmount(
+      input.fromAmount,
+      input.fromAsset,
+      input.amountFormat,
+      'fromAmount'
+    )
+    return {
+      inputAmount,
+      outputAmount: rawOutputFromReadablePrice(
+        inputAmount,
+        input.fromAsset,
+        input.toAsset,
+        input.price
+      )
+    }
+  }
+
+  if (input.toAmount !== undefined && input.price !== undefined) {
+    const outputAmount = parseAmount(
+      input.toAmount,
+      input.toAsset,
+      input.amountFormat,
+      'toAmount'
+    )
+    return {
+      inputAmount: rawInputFromReadablePrice(
+        outputAmount,
+        input.fromAsset,
+        input.toAsset,
+        input.price
+      ),
+      outputAmount
+    }
+  }
+
+  throw new GatewayValidationError('unsupported limit order amount shape')
+}
+
+const DECIMAL_STRING_PATTERN = /^[0-9]+(?:\.[0-9]+)?$/
+
+function rawOutputFromReadablePrice(
+  inputAmount: string,
+  fromAsset: ResolvedAsset,
+  toAsset: ResolvedAsset,
+  price: string
+): string {
+  const fromDecimals = knownDecimals(fromAsset, 'price')
+  const toDecimals = knownDecimals(toAsset, 'price')
+  const decimal = parsePositiveDecimal(price, 'price')
+  const numerator =
+    BigInt(inputAmount) * decimal.integer * pow10(toDecimals)
+  const denominator = pow10(fromDecimals + decimal.scale)
+  const raw = numerator / denominator
+  assertPositive(raw, 'price')
+  return raw.toString()
+}
+
+function rawInputFromReadablePrice(
+  outputAmount: string,
+  fromAsset: ResolvedAsset,
+  toAsset: ResolvedAsset,
+  price: string
+): string {
+  const fromDecimals = knownDecimals(fromAsset, 'price')
+  const toDecimals = knownDecimals(toAsset, 'price')
+  const decimal = parsePositiveDecimal(price, 'price')
+  const numerator =
+    BigInt(outputAmount) * pow10(fromDecimals + decimal.scale)
+  const denominator = decimal.integer * pow10(toDecimals)
+  const raw = ceilDiv(numerator, denominator)
+  assertPositive(raw, 'price')
+  return raw.toString()
+}
+
+function parsePositiveDecimal(value: string, field: string): {
+  integer: bigint
+  scale: number
+} {
+  if (!DECIMAL_STRING_PATTERN.test(value)) {
+    throw new GatewayValidationError(
+      `${field} must be a decimal string without separators`,
+      { field }
+    )
+  }
+
+  const [whole, fractional = ''] = value.split('.')
+  if (fractional.length > 18 || value.length > 128) {
+    throw new GatewayValidationError(
+      `${field} supports at most 18 decimal places and 128 characters`,
+      { field }
+    )
+  }
+
+  const integer = BigInt(`${whole}${fractional}`.replace(/^0+(?=\d)/, ''))
+  if (integer <= 0n) {
+    throw new GatewayValidationError(`${field} must be greater than zero`, {
+      field
+    })
+  }
+
+  return {
+    integer,
+    scale: fractional.length
+  }
+}
+
+function knownDecimals(asset: ResolvedAsset, field: string): number {
+  if (asset.decimals !== undefined) return asset.decimals
+  throw new GatewayValidationError(
+    `${field} conversion requires known decimals for ${asset.id}; provide fromAmount and toAmount with amountFormat raw`,
+    { field, asset: asset.id }
+  )
+}
+
+function pow10(exponent: number): bigint {
+  return 10n ** BigInt(exponent)
+}
+
+function ceilDiv(numerator: bigint, denominator: bigint): bigint {
+  return (numerator + denominator - 1n) / denominator
+}
+
+function assertPositive(value: bigint, field: string) {
+  if (value <= 0n) {
+    throw new GatewayValidationError(`${field} resolves to a zero-sized amount`, {
+      field
+    })
   }
 }
 

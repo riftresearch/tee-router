@@ -47,9 +47,10 @@ The gateway automatically monitors configured router upstreams:
 ## Routes
 
 - `GET /health`
-- `GET /health/dependencies`
+- `GET /providers`
 - `POST /quote`
 - `POST /order/market`
+- `POST /order/limit`
 - `POST /order/{orderId}/cancel`
 - `GET /openapi.json`
 
@@ -69,6 +70,11 @@ the long-term public API aims to make quotes addressless.
   `refundToken`.
 
 The public gateway API never returns the raw router cancellation secret.
+
+`POST /order/limit` creates the internal limit quote and router order in one
+request. It supports exactly two of `fromAmount`, `toAmount`, and `price`.
+`price` is interpreted as destination readable units per one source readable
+unit, while `amountFormat` controls only `fromAmount` and `toAmount`.
 
 ## Railway Deployment
 
@@ -122,7 +128,7 @@ Post-deploy checks:
 
 ```sh
 curl https://<gateway-domain>/health
-curl https://<gateway-domain>/health/dependencies
+curl https://<gateway-domain>/providers
 curl https://<gateway-domain>/openapi.json
 ```
 

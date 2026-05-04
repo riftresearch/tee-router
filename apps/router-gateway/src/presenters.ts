@@ -6,6 +6,7 @@ import {
 } from './assets'
 import { GatewayValidationError } from './errors'
 import type {
+  InternalLimitOrderQuote,
   InternalMarketOrderQuote,
   InternalOrderEnvelope,
   InternalQuoteEnvelope
@@ -29,6 +30,20 @@ export type PublicOrderResponse = PublicQuoteResponse & {
   orderAddress: string
   amountToSend: string
   status: string
+  cancellationSecret?: string
+}
+
+export type PublicLimitOrderResponse = {
+  orderId: string
+  orderAddress: string
+  amountToSend: string
+  quoteId: string
+  from: string
+  to: string
+  status: string
+  expiry: string
+  minOut: string
+  amountFormat: AmountFormat
   cancellationSecret?: string
 }
 
@@ -64,10 +79,61 @@ export function presentOrderEnvelope(
   }
 }
 
+export function presentAnyOrderEnvelope(
+  envelope: InternalOrderEnvelope,
+  amountFormat: AmountFormat
+): PublicOrderResponse | PublicLimitOrderResponse {
+  if (envelope.quote.type === 'limit_order') {
+    return presentLimitOrderEnvelope(envelope, amountFormat)
+  }
+
+  return presentOrderEnvelope(envelope, amountFormat)
+}
+
+export function presentLimitOrderEnvelope(
+  envelope: InternalOrderEnvelope,
+  amountFormat: AmountFormat
+): PublicLimitOrderResponse {
+  const quote = limitQuoteFromEnvelope({ quote: envelope.quote })
+  const source = assetIdentifierFromInternal(quote.source_asset)
+  const destination = assetIdentifierFromInternal(quote.destination_asset)
+  const orderAddress = envelope.funding_vault?.vault.deposit_vault_address
+
+  if (!orderAddress) {
+    throw new GatewayValidationError('router order response is missing funding vault address')
+  }
+
+  return {
+    orderId: envelope.order.id,
+    orderAddress,
+    amountToSend: formatAmount(quote.input_amount, source, amountFormat),
+    quoteId: quote.id,
+    from: source.id,
+    to: destination.id,
+    status: envelope.order.status,
+    expiry: quote.expires_at,
+    minOut: formatAmount(quote.output_amount, destination, amountFormat),
+    amountFormat,
+    ...(envelope.cancellation_secret
+      ? { cancellationSecret: envelope.cancellation_secret }
+      : {})
+  }
+}
+
 export function marketQuoteFromEnvelope(
   envelope: InternalQuoteEnvelope
 ): InternalMarketOrderQuote {
   if (envelope.quote.type !== 'market_order') {
+    throw new GatewayValidationError('router returned an unsupported quote type')
+  }
+
+  return envelope.quote.payload
+}
+
+export function limitQuoteFromEnvelope(
+  envelope: InternalQuoteEnvelope
+): InternalLimitOrderQuote {
+  if (envelope.quote.type !== 'limit_order') {
     throw new GatewayValidationError('router returned an unsupported quote type')
   }
 

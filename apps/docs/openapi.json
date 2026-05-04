@@ -266,6 +266,144 @@
         ],
         "additionalProperties": false
       },
+      "LimitOrderResponse": {
+        "type": "object",
+        "properties": {
+          "orderId": {
+            "type": "string"
+          },
+          "orderAddress": {
+            "type": "string"
+          },
+          "amountToSend": {
+            "type": "string"
+          },
+          "quoteId": {
+            "type": "string"
+          },
+          "from": {
+            "type": "string"
+          },
+          "to": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "expiry": {
+            "type": "string"
+          },
+          "minOut": {
+            "type": "string"
+          },
+          "amountFormat": {
+            "$ref": "#/components/schemas/AmountFormat"
+          },
+          "refundMode": {
+            "$ref": "#/components/schemas/RefundMode"
+          },
+          "refundAuthorizer": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "refundToken": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "orderId",
+          "orderAddress",
+          "amountToSend",
+          "quoteId",
+          "from",
+          "to",
+          "status",
+          "expiry",
+          "minOut"
+        ]
+      },
+      "OrderLimitRequest": {
+        "type": "object",
+        "properties": {
+          "from": {
+            "type": "string",
+            "minLength": 1
+          },
+          "to": {
+            "type": "string",
+            "minLength": 1
+          },
+          "fromAddress": {
+            "type": "string",
+            "minLength": 1
+          },
+          "toAddress": {
+            "type": "string",
+            "minLength": 1
+          },
+          "fromAmount": {
+            "type": "string",
+            "minLength": 1
+          },
+          "toAmount": {
+            "type": "string",
+            "minLength": 1
+          },
+          "price": {
+            "type": "string",
+            "minLength": 1
+          },
+          "refundAddress": {
+            "type": "string",
+            "minLength": 1
+          },
+          "integrator": {
+            "type": "string",
+            "minLength": 1
+          },
+          "idempotencyKey": {
+            "type": "string",
+            "minLength": 1
+          },
+          "expiration": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "refundMode": {
+            "$ref": "#/components/schemas/RefundMode"
+          },
+          "refundAuthorizer": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1
+          },
+          "amountFormat": {
+            "$ref": "#/components/schemas/AmountFormat"
+          }
+        },
+        "required": [
+          "from",
+          "to",
+          "fromAddress",
+          "toAddress",
+          "refundAuthorizer"
+        ],
+        "additionalProperties": false
+      },
+      "OrderCancellationResponse": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/OrderResponse"
+          },
+          {
+            "$ref": "#/components/schemas/LimitOrderResponse"
+          }
+        ]
+      },
       "OrderCancelRequest": {
         "type": "object",
         "properties": {
@@ -518,6 +656,86 @@
         }
       }
     },
+    "/order/limit": {
+      "post": {
+        "tags": [
+          "Orders"
+        ],
+        "summary": "Create a limit order",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OrderLimitRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Limit order created by the internal router API.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LimitOrderResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid gateway request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Gateway authentication failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected gateway error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Internal router API error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Gateway is not configured for this operation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/order/{orderId}/cancel": {
       "post": {
         "tags": [
@@ -551,7 +769,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/OrderResponse"
+                  "$ref": "#/components/schemas/OrderCancellationResponse"
                 }
               }
             }

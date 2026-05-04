@@ -4,8 +4,10 @@ import { cors } from 'hono/cors'
 import { type GatewayConfig, loadConfig } from './config'
 import {
   createOrderCancelHandler,
+  createOrderLimitHandler,
   createOrderMarketHandler,
   orderCancelRoute,
+  orderLimitRoute,
   orderMarketRoute
 } from './routes/order'
 import { type GatewayDeps } from './routes/deps'
@@ -40,6 +42,7 @@ export function createApp(
   // These handlers also return the error responses declared on each route.
   app.openapi(quoteRoute, createQuoteHandler(config, deps) as never)
   app.openapi(orderMarketRoute, createOrderMarketHandler(config, deps) as never)
+  app.openapi(orderLimitRoute, createOrderLimitHandler(config, deps) as never)
   app.openapi(orderCancelRoute, createOrderCancelHandler(config, deps) as never)
   app.openapi(healthRoute, createHealthHandler())
   app.openapi(
