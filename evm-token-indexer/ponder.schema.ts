@@ -70,6 +70,7 @@ export const detectedDepositCandidate = onchainTable(
     watchTarget: t.text().notNull(),
     chainId: t.integer().notNull(),
     tokenAddress: t.hex().notNull(),
+    fromAddress: t.hex().notNull(),
     depositAddress: t.hex().notNull(),
     amount: t.bigint().notNull(),
     requiredAmount: t.bigint().notNull(),

@@ -1209,7 +1209,11 @@ function TimelineAction({ step }: { step: OrderExecutionStep }) {
     <div className="timeline-action">
       <TimelineActionIdentifier step={step} />
       <div className="timeline-action-flow">
-        <TimelineActionEndpoint label="sender" address={addresses.sender} />
+        <TimelineActionEndpoint
+          label="sender"
+          address={addresses.sender}
+          addresses={addresses.senders}
+        />
         <ArrowRight className="timeline-action-arrow" size={14} aria-hidden="true" />
         <TimelineActionEndpoint label="recipient" address={addresses.recipient} />
       </div>
@@ -1254,20 +1258,30 @@ function TimelineActionIdentifier({ step }: { step: OrderExecutionStep }) {
 
 function TimelineActionEndpoint({
   label,
-  address
+  address,
+  addresses
 }: {
   label: string
   address?: { address: string; chainId?: string }
+  addresses?: Array<{ address: string; chainId?: string }>
 }) {
+  const visibleAddress = addresses?.[0] ?? address
+  const extraCount = Math.max((addresses?.length ?? 0) - 1, 0)
+
   return (
     <span className="timeline-action-endpoint">
       <span>{label}</span>
-      {address?.address ? (
-        <TimelineLinkedValue
-          chainId={address.chainId}
-          value={address.address}
-          kind="address"
-        />
+      {visibleAddress?.address ? (
+        <span className="timeline-action-address-group">
+          <TimelineLinkedValue
+            chainId={visibleAddress.chainId}
+            value={visibleAddress.address}
+            kind="address"
+          />
+          {extraCount > 0 ? (
+            <span className="timeline-inline-value">+{extraCount}</span>
+          ) : null}
+        </span>
       ) : (
         <span className="timeline-inline-value missing">unknown</span>
       )}
@@ -1808,15 +1822,21 @@ function isReferenceLike(value: string) {
 }
 
 function stepActionAddresses(step: OrderExecutionStep) {
+  const senders = normalizeStepAddresses(step.actionAddresses?.senders)
   const sender =
     normalizeStepAddress(step.actionAddresses?.sender) ??
+    senders[0] ??
     stepAddressFromFields(step, 'sender')
   const recipient =
     normalizeStepAddress(step.actionAddresses?.recipient) ??
     stepAddressFromFields(step, 'recipient') ??
     (step.stepType === 'hyperliquid_trade' ? sender : undefined)
 
-  return { sender, recipient }
+  return {
+    sender,
+    senders: senders.length > 0 ? senders : sender ? [sender] : [],
+    recipient
+  }
 }
 
 function stepVenueIdentifier(step: OrderExecutionStep) {
@@ -1835,6 +1855,12 @@ function normalizeStepAddress(
   return address
 }
 
+function normalizeStepAddresses(
+  addresses: Array<{ address: string; chainId?: string }> | undefined
+) {
+  return (addresses ?? []).filter((address) => Boolean(address.address))
+}
+
 function stepAddressFromFields(
   step: OrderExecutionStep,
   side: 'sender' | 'recipient'
@@ -1850,6 +1876,7 @@ function stepAddressFromFields(
           'source_custody_vault_address',
           'depositor_custody_vault_address',
           'depositor_address',
+          'sender_address',
           'hyperliquid_custody_vault_address',
           'sourceAddress'
         ]

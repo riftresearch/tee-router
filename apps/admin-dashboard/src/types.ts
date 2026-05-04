@@ -60,6 +60,7 @@ export type OrderExecutionAddress = {
 
 export type OrderExecutionActionAddresses = {
   sender?: OrderExecutionAddress
+  senders?: OrderExecutionAddress[]
   recipient?: OrderExecutionAddress
 }
 

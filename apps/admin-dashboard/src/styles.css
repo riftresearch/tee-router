@@ -1007,6 +1007,14 @@ code,
   stroke-width: 2.4;
 }
 
+.timeline-action-address-group {
+  display: inline-flex;
+  max-width: 190px;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
 .timeline-inline-value {
   display: inline-flex;
   max-width: 142px;

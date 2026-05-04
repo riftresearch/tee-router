@@ -3117,6 +3117,7 @@ impl OrderRepository {
         &self,
         order_id: Uuid,
         response: serde_json::Value,
+        tx_hash: Option<String>,
         completed_at: DateTime<Utc>,
     ) -> RouterServerResult<Option<OrderExecutionStep>> {
         let started = Instant::now();
@@ -3129,8 +3130,9 @@ impl OrderRepository {
                     WHEN response_json = '{{}}'::jsonb THEN $2
                     ELSE response_json
                 END,
-                completed_at = COALESCE(completed_at, $3),
-                updated_at = $3
+                tx_hash = COALESCE($3, tx_hash),
+                completed_at = COALESCE(completed_at, $4),
+                updated_at = $4
             WHERE order_id = $1
               AND step_type = 'wait_for_deposit'
               AND status = 'waiting'
@@ -3139,6 +3141,7 @@ impl OrderRepository {
         ))
         .bind(order_id)
         .bind(response)
+        .bind(tx_hash)
         .bind(completed_at)
         .fetch_optional(&self.pool)
         .await;

@@ -2,9 +2,9 @@ use crate::{
     error::{RouterServerError, RouterServerResult},
     models::{
         CustodyVaultControlType, CustodyVaultRole, CustodyVaultStatus, CustodyVaultVisibility,
-        DepositVault, DepositVaultFundingHint, DepositVaultStatus, OrderExecutionStepStatus,
-        OrderExecutionStepType, ProviderOperationHintKind, ProviderOperationHintStatus,
-        VaultAction,
+        DepositVault, DepositVaultFundingHint, DepositVaultFundingObservation, DepositVaultStatus,
+        OrderExecutionStepStatus, OrderExecutionStepType, ProviderOperationHintKind,
+        ProviderOperationHintStatus, VaultAction,
     },
     protocol::{AssetId, ChainId, DepositAsset},
     telemetry,
@@ -33,6 +33,15 @@ const SELECT_COLUMNS: &str = r#"
     dv.refunded_at,
     dv.refund_tx_hash,
     dv.last_refund_error,
+    dv.funding_tx_hash,
+    dv.funding_sender_address,
+    dv.funding_sender_addresses,
+    dv.funding_recipient_address,
+    dv.funding_transfer_index,
+    dv.funding_observed_amount,
+    dv.funding_confirmation_state,
+    dv.funding_observed_at,
+    dv.funding_evidence_json,
     dv.created_at,
     dv.updated_at
 "#;
@@ -177,12 +186,22 @@ impl VaultRepository {
                     refunded_at,
                     refund_tx_hash,
                     last_refund_error,
+                    funding_tx_hash,
+                    funding_sender_address,
+                    funding_sender_addresses,
+                    funding_recipient_address,
+                    funding_transfer_index,
+                    funding_observed_amount,
+                    funding_confirmation_state,
+                    funding_observed_at,
+                    funding_evidence_json,
                     created_at,
                     updated_at
                 )
                 VALUES (
                     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                    $11, $12, $13
+                    $11, $12, $13, $14, $15, $16, $17, $18, $19,
+                    $20, $21, $22
                 )
                 "#,
             )
@@ -197,6 +216,61 @@ impl VaultRepository {
             .bind(vault.refunded_at)
             .bind(vault.refund_tx_hash.clone())
             .bind(vault.last_refund_error.clone())
+            .bind(
+                vault
+                    .funding_observation
+                    .as_ref()
+                    .and_then(|observation| observation.tx_hash.clone()),
+            )
+            .bind(
+                vault
+                    .funding_observation
+                    .as_ref()
+                    .and_then(|observation| observation.sender_address.clone()),
+            )
+            .bind(json!(vault
+                .funding_observation
+                .as_ref()
+                .map(|observation| observation.sender_addresses.clone())
+                .unwrap_or_default()))
+            .bind(
+                vault
+                    .funding_observation
+                    .as_ref()
+                    .and_then(|observation| observation.recipient_address.clone()),
+            )
+            .bind(
+                vault
+                    .funding_observation
+                    .as_ref()
+                    .and_then(|observation| observation.transfer_index)
+                    .map(|index| index as i64),
+            )
+            .bind(
+                vault
+                    .funding_observation
+                    .as_ref()
+                    .and_then(|observation| observation.observed_amount.clone()),
+            )
+            .bind(
+                vault
+                    .funding_observation
+                    .as_ref()
+                    .and_then(|observation| observation.confirmation_state.clone()),
+            )
+            .bind(
+                vault
+                    .funding_observation
+                    .as_ref()
+                    .and_then(|observation| observation.observed_at),
+            )
+            .bind(
+                vault
+                    .funding_observation
+                    .as_ref()
+                    .map(|observation| observation.evidence.clone())
+                    .unwrap_or_else(|| json!({})),
+            )
             .bind(vault.created_at)
             .bind(vault.updated_at)
             .execute(&mut *tx)
@@ -329,6 +403,61 @@ impl VaultRepository {
         .fetch_one(&self.pool)
         .await;
         telemetry::record_db_query("vault.transition_status", result.is_ok(), started.elapsed());
+        let row = result?;
+
+        self.map_row(&row)
+    }
+
+    pub async fn mark_funded_with_observation(
+        &self,
+        id: Uuid,
+        observation: &DepositVaultFundingObservation,
+        updated_at: DateTime<Utc>,
+    ) -> RouterServerResult<DepositVault> {
+        let started = Instant::now();
+        let result = sqlx_core::query::query(&format!(
+            r#"
+            WITH updated AS (
+            UPDATE deposit_vaults
+            SET
+                status = 'funded',
+                funding_tx_hash = $2,
+                funding_sender_address = $3,
+                funding_sender_addresses = $4,
+                funding_recipient_address = $5,
+                funding_transfer_index = $6,
+                funding_observed_amount = $7,
+                funding_confirmation_state = $8,
+                funding_observed_at = $9,
+                funding_evidence_json = $10,
+                updated_at = $11
+            WHERE id = $1
+              AND status = 'pending_funding'
+            RETURNING *
+            )
+            SELECT {SELECT_COLUMNS}
+            FROM updated dv
+            JOIN custody_vaults cv ON cv.id = dv.id
+            "#
+        ))
+        .bind(id)
+        .bind(observation.tx_hash.clone())
+        .bind(observation.sender_address.clone())
+        .bind(json!(observation.sender_addresses.clone()))
+        .bind(observation.recipient_address.clone())
+        .bind(observation.transfer_index.map(|index| index as i64))
+        .bind(observation.observed_amount.clone())
+        .bind(observation.confirmation_state.clone())
+        .bind(observation.observed_at)
+        .bind(observation.evidence.clone())
+        .bind(updated_at)
+        .fetch_one(&self.pool)
+        .await;
+        telemetry::record_db_query(
+            "vault.mark_funded_with_observation",
+            result.is_ok(),
+            started.elapsed(),
+        );
         let row = result?;
 
         self.map_row(&row)
@@ -901,6 +1030,46 @@ impl VaultRepository {
                     message: "cancellation_commitment must be 32 bytes".to_string(),
                 })?;
 
+        let funding_sender_addresses_json: serde_json::Value = row.get("funding_sender_addresses");
+        let funding_sender_addresses = serde_json::from_value::<Vec<String>>(
+            funding_sender_addresses_json.clone(),
+        )
+        .map_err(|err| RouterServerError::InvalidData {
+            message: format!("invalid funding sender addresses payload: {err}"),
+        })?;
+        let funding_evidence: serde_json::Value = row.get("funding_evidence_json");
+        let funding_observation = {
+            let tx_hash = row.get::<Option<String>, _>("funding_tx_hash");
+            let sender_address = row.get::<Option<String>, _>("funding_sender_address");
+            let recipient_address = row.get::<Option<String>, _>("funding_recipient_address");
+            let transfer_index = row
+                .get::<Option<i64>, _>("funding_transfer_index")
+                .map(|index| index as u64);
+            let observed_amount = row.get::<Option<String>, _>("funding_observed_amount");
+            let confirmation_state = row.get::<Option<String>, _>("funding_confirmation_state");
+            let observed_at = row.get::<Option<DateTime<Utc>>, _>("funding_observed_at");
+            if tx_hash.is_some()
+                || sender_address.is_some()
+                || !funding_sender_addresses.is_empty()
+                || recipient_address.is_some()
+                || observed_amount.is_some()
+            {
+                Some(DepositVaultFundingObservation {
+                    tx_hash,
+                    sender_address,
+                    sender_addresses: funding_sender_addresses,
+                    recipient_address,
+                    transfer_index,
+                    observed_amount,
+                    confirmation_state,
+                    observed_at,
+                    evidence: funding_evidence,
+                })
+            } else {
+                None
+            }
+        };
+
         Ok(DepositVault {
             id: row.get("id"),
             order_id: row.get("order_id"),
@@ -920,6 +1089,7 @@ impl VaultRepository {
             refunded_at: row.get("refunded_at"),
             refund_tx_hash: row.get("refund_tx_hash"),
             last_refund_error: row.get("last_refund_error"),
+            funding_observation,
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
         })

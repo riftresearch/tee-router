@@ -301,6 +301,7 @@ LEFT JOIN LATERAL (
             'chainId', sender_addr.chain_id
           ))
         END,
+        'senders', sender_addresses.addresses,
         'recipient', CASE
           WHEN recipient_addr.address IS NULL THEN NULL
           ELSE jsonb_strip_nulls(jsonb_build_object(
@@ -349,6 +350,9 @@ LEFT JOIN LATERAL (
         NULLIF(s.details_json->>'depositor_custody_vault_address', ''),
         NULLIF(s.request_json->>'hyperliquid_custody_vault_address', ''),
         NULLIF(s.details_json->>'hyperliquid_custody_vault_address', ''),
+        NULLIF(s.response_json->>'sender_address', ''),
+        NULLIF(s.request_json->>'sender_address', ''),
+        NULLIF(s.details_json->>'sender_address', ''),
         NULLIF(s.response_json #>> '{provider_context,user}', ''),
         NULLIF(s.response_json #>> '{observed_state,provider_observed_state,sourceAddress}', '')
       ) AS address,
@@ -364,6 +368,22 @@ LEFT JOIN LATERAL (
       END AS chain_id
   ) sender_addr ON true
   LEFT JOIN LATERAL (
+    SELECT COALESCE(
+      jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
+        'address', sender_address,
+        'chainId', sender_addr.chain_id
+      ))) FILTER (WHERE sender_address IS NOT NULL AND sender_address <> ''),
+      '[]'::jsonb
+    ) AS addresses
+    FROM jsonb_array_elements_text(
+      CASE
+        WHEN jsonb_typeof(s.response_json->'sender_addresses') = 'array'
+          THEN s.response_json->'sender_addresses'
+        ELSE '[]'::jsonb
+      END
+    ) sender_address
+  ) sender_addresses ON true
+  LEFT JOIN LATERAL (
     SELECT
       COALESCE(
         recipient_vault.address,
@@ -371,6 +391,7 @@ LEFT JOIN LATERAL (
         NULLIF(s.details_json->>'recipient_custody_vault_address', ''),
         NULLIF(s.request_json->>'destination_custody_vault_address', ''),
         NULLIF(s.details_json->>'destination_custody_vault_address', ''),
+        NULLIF(s.response_json->>'recipient_address', ''),
         NULLIF(s.request_json->>'recipient_address', ''),
         NULLIF(s.details_json->>'recipient_address', ''),
         NULLIF(s.response_json #>> '{observed_state,provider_observed_state,destinationAddress}', ''),

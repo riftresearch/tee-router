@@ -97,6 +97,7 @@ pub struct DepositCandidate {
     pub watch_target: String,
     pub chain_id: u64,
     pub token_address: Address,
+    pub from_address: Address,
     pub deposit_address: Address,
     pub amount: String,
     pub required_amount: String,

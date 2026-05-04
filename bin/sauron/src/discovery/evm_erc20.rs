@@ -364,6 +364,7 @@ impl EvmErc20DiscoveryBackend {
             source_chain: self.chain_type,
             source_token: TokenIdentifier::address(candidate.token_address.to_string()),
             address: candidate.deposit_address.to_string(),
+            sender_addresses: vec![candidate.from_address.to_string()],
             tx_hash: candidate.transaction_hash.to_string(),
             transfer_index: candidate.transfer_index,
             amount,
@@ -421,6 +422,7 @@ impl EvmErc20DiscoveryBackend {
             source_chain: self.chain_type,
             source_token: watch.source_token.clone(),
             address: watch.address.clone(),
+            sender_addresses: vec![transfer.from.to_string()],
             tx_hash: transfer.transaction_hash.to_string(),
             transfer_index,
             amount,
@@ -500,6 +502,7 @@ impl EvmErc20DiscoveryBackend {
                 source_chain: self.chain_type,
                 source_token: watch.source_token.clone(),
                 address: watch.address.clone(),
+                sender_addresses: vec![decoded.inner.data.from.to_string()],
                 tx_hash: transaction_hash.to_string(),
                 transfer_index,
                 amount: decoded.inner.data.value,
@@ -668,6 +671,7 @@ impl EvmErc20DiscoveryBackend {
                     source_chain: self.chain_type,
                     source_token: TokenIdentifier::Native,
                     address: watch.address.clone(),
+                    sender_addresses: vec![transaction.from().to_string()],
                     tx_hash: transaction.tx_hash().to_string(),
                     transfer_index,
                     amount,
@@ -908,6 +912,7 @@ impl DiscoveryBackend for EvmErc20DiscoveryBackend {
                             source_chain: self.chain_type,
                             source_token: watch.source_token.clone(),
                             address: watch.address.clone(),
+                            sender_addresses: vec![decoded.inner.data.from.to_string()],
                             tx_hash: transaction_hash.to_string(),
                             transfer_index,
                             amount: decoded.inner.data.value,
@@ -1208,6 +1213,7 @@ mod tests {
             watch_target: "funding_vault".to_string(),
             chain_id: 8453,
             token_address: token,
+            from_address: address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
             deposit_address: recipient,
             amount: "42".to_string(),
             required_amount: "42".to_string(),
@@ -1236,6 +1242,10 @@ mod tests {
             TokenIdentifier::address(token.to_string())
         );
         assert_eq!(detected.address, recipient.to_string());
+        assert_eq!(
+            detected.sender_addresses,
+            vec![address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").to_string()]
+        );
         assert_eq!(detected.tx_hash, tx_hash.to_string());
         assert_eq!(detected.transfer_index, 7);
         assert_eq!(detected.amount, U256::from(42_u64));
@@ -1287,6 +1297,10 @@ mod tests {
             TokenIdentifier::address(token.to_string())
         );
         assert_eq!(detected.address, recipient.to_string());
+        assert_eq!(
+            detected.sender_addresses,
+            vec![address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").to_string()]
+        );
         assert_eq!(detected.tx_hash, tx_hash.to_string());
         assert_eq!(detected.transfer_index, 7);
         assert_eq!(detected.amount, U256::from(42_u64));

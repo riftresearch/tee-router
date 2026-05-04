@@ -231,6 +231,53 @@ impl BitcoinDiscoveryBackend {
         detections
     }
 
+    async fn enrich_sender_addresses(&self, detections: &mut [DetectedDeposit]) {
+        for detected in detections {
+            if !detected.sender_addresses.is_empty() {
+                continue;
+            }
+
+            match self
+                .sender_addresses_for_transaction(&detected.tx_hash, &detected.address)
+                .await
+            {
+                Ok(sender_addresses) => detected.sender_addresses = sender_addresses,
+                Err(error) => {
+                    warn!(
+                        tx_hash = %detected.tx_hash,
+                        watch_id = %detected.watch_id,
+                        %error,
+                        "Bitcoin sender-address enrichment failed"
+                    );
+                }
+            }
+        }
+    }
+
+    async fn sender_addresses_for_transaction(
+        &self,
+        tx_hash: &str,
+        recipient_address: &str,
+    ) -> Result<Vec<String>> {
+        let txid =
+            Txid::from_str(tx_hash).map_err(|error| crate::error::Error::InvalidWatchRow {
+                message: format!("invalid Bitcoin transaction hash {tx_hash}: {error}"),
+            })?;
+        let Some(tx) = self
+            .esplora_client
+            .get_tx_info(&txid)
+            .await
+            .context(BitcoinEsploraSnafu)?
+        else {
+            return Ok(Vec::new());
+        };
+
+        Ok(sender_addresses_from_esplora_tx(
+            &tx,
+            bitcoin_network_for_address(recipient_address),
+        ))
+    }
+
     async fn drain_mempool_detections(
         &self,
         watches: &[SharedWatchEntry],
@@ -343,6 +390,7 @@ impl DiscoveryBackend for BitcoinDiscoveryBackend {
                 source_chain: ChainType::Bitcoin,
                 source_token: TokenIdentifier::Native,
                 address: watch.address.clone(),
+                sender_addresses: Vec::new(),
                 tx_hash: utxo.txid.to_string(),
                 transfer_index: utxo.vout as u64,
                 amount,
@@ -365,7 +413,12 @@ impl DiscoveryBackend for BitcoinDiscoveryBackend {
             }
         }
 
-        Ok(best_match.map(|(candidate, _)| candidate))
+        let Some((mut candidate, _)) = best_match else {
+            return Ok(None);
+        };
+        self.enrich_sender_addresses(std::slice::from_mut(&mut candidate))
+            .await;
+        Ok(Some(candidate))
     }
 
     async fn current_cursor(&self) -> Result<BlockCursor> {
@@ -388,6 +441,7 @@ impl DiscoveryBackend for BitcoinDiscoveryBackend {
         let mut detections = self.drain_mempool_detections(watches, current_height).await;
 
         if watches.is_empty() || current_height <= from_exclusive.height {
+            self.enrich_sender_addresses(&mut detections).await;
             return Ok(BlockScan {
                 new_cursor: BlockCursor {
                     height: current_height,
@@ -415,6 +469,7 @@ impl DiscoveryBackend for BitcoinDiscoveryBackend {
                     rewind_height,
                     "Bitcoin discovery cursor reorg detected; rewinding cursor"
                 );
+                self.enrich_sender_addresses(&mut detections).await;
                 return Ok(BlockScan {
                     new_cursor: BlockCursor {
                         height: rewind_height,
@@ -440,6 +495,7 @@ impl DiscoveryBackend for BitcoinDiscoveryBackend {
             ));
         }
 
+        self.enrich_sender_addresses(&mut detections).await;
         Ok(BlockScan {
             new_cursor: BlockCursor {
                 height: current_height,
@@ -504,6 +560,7 @@ fn match_single_transaction(
                 source_chain: ChainType::Bitcoin,
                 source_token: TokenIdentifier::Native,
                 address: watch.address.clone(),
+                sender_addresses: Vec::new(),
                 tx_hash: tx_hash.clone(),
                 transfer_index: vout as u64,
                 amount,
@@ -517,6 +574,40 @@ fn match_single_transaction(
     }
 
     detections
+}
+
+fn sender_addresses_from_esplora_tx(
+    tx: &esplora_client::api::Tx,
+    network: bitcoin::Network,
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut addresses = Vec::new();
+
+    for input in &tx.vin {
+        let Some(prevout) = input.prevout.as_ref() else {
+            continue;
+        };
+        let Ok(address) = Address::from_script(&prevout.scriptpubkey, network) else {
+            continue;
+        };
+        let address = address.to_string();
+        if seen.insert(address.clone()) {
+            addresses.push(address);
+        }
+    }
+
+    addresses
+}
+
+fn bitcoin_network_for_address(address: &str) -> bitcoin::Network {
+    let normalized = address.to_ascii_lowercase();
+    if normalized.starts_with("bc1") || normalized.starts_with('1') || normalized.starts_with('3') {
+        bitcoin::Network::Bitcoin
+    } else if normalized.starts_with("bcrt") {
+        bitcoin::Network::Regtest
+    } else {
+        bitcoin::Network::Testnet
+    }
 }
 
 struct BitcoinMempoolSupport {
@@ -1206,5 +1297,90 @@ mod tests {
         );
         assert_eq!(detected[0].block_height, None);
         assert_eq!(detected[0].block_hash, None);
+    }
+
+    #[test]
+    fn esplora_sender_extraction_keeps_all_unique_input_addresses() {
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let private_key_a = bitcoin::PrivateKey::new(
+            bitcoin::secp256k1::SecretKey::from_slice(&[2_u8; 32]).unwrap(),
+            bitcoin::Network::Regtest,
+        );
+        let private_key_b = bitcoin::PrivateKey::new(
+            bitcoin::secp256k1::SecretKey::from_slice(&[3_u8; 32]).unwrap(),
+            bitcoin::Network::Regtest,
+        );
+        let address_a = Address::p2wpkh(
+            &bitcoin::CompressedPublicKey::from_private_key(&secp, &private_key_a).unwrap(),
+            bitcoin::Network::Regtest,
+        );
+        let address_b = Address::p2wpkh(
+            &bitcoin::CompressedPublicKey::from_private_key(&secp, &private_key_b).unwrap(),
+            bitcoin::Network::Regtest,
+        );
+        let previous_txid =
+            Txid::from_str("1111111111111111111111111111111111111111111111111111111111111111")
+                .unwrap();
+        let txid =
+            Txid::from_str("2222222222222222222222222222222222222222222222222222222222222222")
+                .unwrap();
+        let tx = esplora_client::api::Tx {
+            txid,
+            version: 2,
+            locktime: 0,
+            vin: vec![
+                esplora_client::api::Vin {
+                    txid: previous_txid,
+                    vout: 0,
+                    prevout: Some(esplora_client::api::PrevOut {
+                        value: 100,
+                        scriptpubkey: address_a.script_pubkey(),
+                    }),
+                    scriptsig: ScriptBuf::new(),
+                    witness: Vec::new(),
+                    sequence: 0xffff_fffd,
+                    is_coinbase: false,
+                },
+                esplora_client::api::Vin {
+                    txid: previous_txid,
+                    vout: 1,
+                    prevout: Some(esplora_client::api::PrevOut {
+                        value: 200,
+                        scriptpubkey: address_b.script_pubkey(),
+                    }),
+                    scriptsig: ScriptBuf::new(),
+                    witness: Vec::new(),
+                    sequence: 0xffff_fffd,
+                    is_coinbase: false,
+                },
+                esplora_client::api::Vin {
+                    txid: previous_txid,
+                    vout: 2,
+                    prevout: Some(esplora_client::api::PrevOut {
+                        value: 300,
+                        scriptpubkey: address_a.script_pubkey(),
+                    }),
+                    scriptsig: ScriptBuf::new(),
+                    witness: Vec::new(),
+                    sequence: 0xffff_fffd,
+                    is_coinbase: false,
+                },
+            ],
+            vout: Vec::new(),
+            size: 0,
+            weight: 0,
+            status: esplora_client::api::TxStatus {
+                confirmed: false,
+                block_height: None,
+                block_hash: None,
+                block_time: None,
+            },
+            fee: 0,
+        };
+
+        assert_eq!(
+            sender_addresses_from_esplora_tx(&tx, bitcoin::Network::Regtest),
+            vec![address_a.to_string(), address_b.to_string()]
+        );
     }
 }

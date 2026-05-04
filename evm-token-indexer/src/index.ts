@@ -73,6 +73,7 @@ ponder.on("erc20:Transfer", async ({ event, context }) => {
       watch_target,
       chain_id,
       token_address,
+      from_address,
       deposit_address,
       amount,
       required_amount,
@@ -91,30 +92,32 @@ ponder.on("erc20:Transfer", async ({ event, context }) => {
       w.watch_target,
       $1 AS chain_id,
       $3 AS token_address,
-      $4 AS deposit_address,
-      $5::numeric AS amount,
+      $4 AS from_address,
+      $5 AS deposit_address,
+      $6::numeric AS amount,
       w.required_amount,
-      $6 AS transaction_hash,
-      $7 AS transfer_index,
-      $8::numeric AS block_number,
-      $9 AS block_hash,
-      $10::numeric AS block_timestamp,
+      $7 AS transaction_hash,
+      $8 AS transfer_index,
+      $9::numeric AS block_number,
+      $10 AS block_hash,
+      $11::numeric AS block_timestamp,
       'pending' AS status,
       0 AS attempt_count,
-      $11::numeric AS created_at
+      $12::numeric AS created_at
     FROM ${activeWatchTable} w
     WHERE w.chain_id = $1
       AND w.token_address = $3
-      AND w.deposit_address = $4
-      AND $5::numeric >= w.min_amount
-      AND $5::numeric <= w.max_amount
-      AND $10::numeric <= w.expires_at
+      AND w.deposit_address = $5
+      AND $6::numeric >= w.min_amount
+      AND $6::numeric <= w.max_amount
+      AND $11::numeric <= w.expires_at
     ON CONFLICT (id) DO NOTHING
     `,
     [
       chainId,
       event.id,
       tokenAddress,
+      fromAddress,
       toAddress,
       amount.toString(),
       transactionHash,

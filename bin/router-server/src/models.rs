@@ -1170,8 +1170,22 @@ pub struct DepositVault {
     pub refunded_at: Option<DateTime<Utc>>,
     pub refund_tx_hash: Option<String>,
     pub last_refund_error: Option<String>,
+    pub funding_observation: Option<DepositVaultFundingObservation>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DepositVaultFundingObservation {
+    pub tx_hash: Option<String>,
+    pub sender_address: Option<String>,
+    pub sender_addresses: Vec<String>,
+    pub recipient_address: Option<String>,
+    pub transfer_index: Option<u64>,
+    pub observed_amount: Option<String>,
+    pub confirmation_state: Option<String>,
+    pub observed_at: Option<DateTime<Utc>>,
+    pub evidence: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

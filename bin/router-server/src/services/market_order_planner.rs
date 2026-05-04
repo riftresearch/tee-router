@@ -2532,6 +2532,7 @@ mod tests {
             refunded_at: None,
             refund_tx_hash: None,
             last_refund_error: None,
+            funding_observation: None,
             created_at: now,
             updated_at: now,
         };
@@ -2663,6 +2664,7 @@ mod tests {
             refunded_at: None,
             refund_tx_hash: None,
             last_refund_error: None,
+            funding_observation: None,
             created_at: now,
             updated_at: now,
         };
@@ -2827,6 +2829,7 @@ mod tests {
             refunded_at: None,
             refund_tx_hash: None,
             last_refund_error: None,
+            funding_observation: None,
             created_at: now,
             updated_at: now,
         };

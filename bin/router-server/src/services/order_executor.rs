@@ -2092,12 +2092,40 @@ impl OrderExecutionManager {
         &self,
         order: &RouterOrder,
     ) -> OrderExecutionResult<()> {
+        let funding_observation = if let Some(funding_vault_id) = order.funding_vault_id {
+            self.db
+                .vaults()
+                .get(funding_vault_id)
+                .await
+                .map_err(|source| OrderExecutionError::Database { source })?
+                .funding_observation
+        } else {
+            None
+        };
+        let response = match funding_observation.as_ref() {
+            Some(observation) => json!({
+                "reason": "funding_vault_funded",
+                "tx_hash": observation.tx_hash.clone(),
+                "sender_address": observation.sender_address.clone(),
+                "sender_addresses": observation.sender_addresses.clone(),
+                "recipient_address": observation.recipient_address.clone(),
+                "transfer_index": observation.transfer_index,
+                "vout": observation.transfer_index,
+                "amount": observation.observed_amount.clone(),
+                "confirmation_state": observation.confirmation_state.clone(),
+                "observed_at": observation.observed_at,
+            }),
+            None => json!({ "reason": "funding_vault_funded" }),
+        };
         match self
             .db
             .orders()
             .complete_wait_for_deposit_step_for_order(
                 order.id,
-                json!({ "reason": "funding_vault_funded" }),
+                response,
+                funding_observation
+                    .as_ref()
+                    .and_then(|observation| observation.tx_hash.clone()),
                 Utc::now(),
             )
             .await

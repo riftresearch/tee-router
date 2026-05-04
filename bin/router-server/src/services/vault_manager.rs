@@ -4,8 +4,8 @@ use crate::{
     db::Database,
     error::RouterServerError,
     models::{
-        DepositVault, DepositVaultFundingHint, DepositVaultStatus, ProviderOperationHintStatus,
-        RouterOrderQuote, RouterOrderStatus, VaultAction,
+        DepositVault, DepositVaultFundingHint, DepositVaultFundingObservation, DepositVaultStatus,
+        ProviderOperationHintStatus, RouterOrderQuote, RouterOrderStatus, VaultAction,
     },
     protocol::{backend_chain_for_id, AssetId, ChainId, DepositAsset},
     services::deposit_address::{derive_deposit_address_for_quote, DepositAddressError},
@@ -14,11 +14,11 @@ use crate::{
 use alloy::primitives::{keccak256, U256};
 use blockchain_utils::MempoolEsploraFeeExt;
 use chains::ChainRegistry;
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use router_primitives::{ChainType, TokenIdentifier};
-use serde_json::json;
+use serde_json::{json, Value};
 use snafu::Snafu;
-use std::{sync::Arc, time::Instant};
+use std::{collections::HashSet, sync::Arc, time::Instant};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -243,6 +243,7 @@ impl VaultManager {
             refunded_at: None,
             refund_tx_hash: None,
             last_refund_error: None,
+            funding_observation: None,
             created_at: now,
             updated_at: now,
         };
@@ -480,15 +481,11 @@ impl VaultManager {
             });
         }
 
+        let observation = funding_observation_from_hint(&vault, hint);
         let funded_vault = match self
             .db
             .vaults()
-            .transition_status(
-                vault.id,
-                DepositVaultStatus::PendingFunding,
-                DepositVaultStatus::Funded,
-                Utc::now(),
-            )
+            .mark_funded_with_observation(vault.id, &observation, Utc::now())
             .await
         {
             Ok(funded_vault) => funded_vault,
@@ -1168,6 +1165,71 @@ impl VaultManager {
     }
 }
 
+fn funding_observation_from_hint(
+    vault: &DepositVault,
+    hint: &DepositVaultFundingHint,
+) -> DepositVaultFundingObservation {
+    let evidence = hint.evidence.clone();
+    let sender_addresses = funding_sender_addresses(&evidence);
+    let sender_address =
+        string_field(&evidence, "sender_address").or_else(|| sender_addresses.first().cloned());
+    DepositVaultFundingObservation {
+        tx_hash: string_field(&evidence, "tx_hash"),
+        sender_address,
+        sender_addresses,
+        recipient_address: string_field(&evidence, "recipient_address")
+            .or_else(|| string_field(&evidence, "address"))
+            .or_else(|| Some(vault.deposit_vault_address.clone())),
+        transfer_index: u64_field(&evidence, "transfer_index")
+            .or_else(|| u64_field(&evidence, "vout")),
+        observed_amount: string_field(&evidence, "amount"),
+        confirmation_state: string_field(&evidence, "confirmation_state"),
+        observed_at: string_field(&evidence, "observed_at")
+            .and_then(|value| DateTime::parse_from_rfc3339(&value).ok())
+            .map(|value| value.with_timezone(&Utc)),
+        evidence,
+    }
+}
+
+fn funding_sender_addresses(evidence: &Value) -> Vec<String> {
+    let mut addresses = evidence
+        .get("sender_addresses")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if addresses.is_empty() {
+        if let Some(sender) = string_field(evidence, "sender_address") {
+            addresses.push(sender);
+        }
+    }
+    let mut seen = HashSet::new();
+    addresses
+        .into_iter()
+        .filter(|address| seen.insert(address.clone()))
+        .collect()
+}
+
+fn string_field(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn u64_field(value: &Value, key: &str) -> Option<u64> {
+    value.get(key).and_then(Value::as_u64)
+}
+
 fn token_identifier(asset_id: &AssetId) -> TokenIdentifier {
     match asset_id {
         AssetId::Native => TokenIdentifier::Native,
@@ -1377,5 +1439,70 @@ mod tests {
             funding_hint_confirmation_state(&hint).as_deref(),
             Some("mempool")
         );
+    }
+
+    #[test]
+    fn funding_observation_from_hint_preserves_all_sender_addresses() {
+        let now = Utc::now();
+        let vault = DepositVault {
+            id: Uuid::now_v7(),
+            order_id: Some(Uuid::now_v7()),
+            deposit_asset: DepositAsset {
+                chain: ChainId::parse("bitcoin").unwrap(),
+                asset: AssetId::parse("native").unwrap(),
+            },
+            action: VaultAction::Null,
+            metadata: serde_json::json!({}),
+            deposit_vault_salt: [7; 32],
+            deposit_vault_address: "bcrt1qrecipient".to_string(),
+            recovery_address: "bcrt1qrecovery".to_string(),
+            cancellation_commitment:
+                "0x1111111111111111111111111111111111111111111111111111111111111111".to_string(),
+            cancel_after: now + Duration::minutes(10),
+            status: DepositVaultStatus::PendingFunding,
+            refund_requested_at: None,
+            refunded_at: None,
+            refund_tx_hash: None,
+            last_refund_error: None,
+            funding_observation: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let hint = DepositVaultFundingHint {
+            id: Uuid::now_v7(),
+            vault_id: vault.id,
+            source: "sauron".to_string(),
+            hint_kind: crate::models::ProviderOperationHintKind::PossibleProgress,
+            evidence: serde_json::json!({
+                "tx_hash": "abc123",
+                "sender_address": "sender-a",
+                "sender_addresses": ["sender-a", "sender-b"],
+                "recipient_address": "bcrt1qrecipient",
+                "vout": 2,
+                "amount": "42",
+                "confirmation_state": "mempool",
+                "observed_at": now.to_rfc3339(),
+            }),
+            status: ProviderOperationHintStatus::Pending,
+            idempotency_key: None,
+            error: serde_json::json!({}),
+            claimed_at: None,
+            processed_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let observation = funding_observation_from_hint(&vault, &hint);
+
+        assert_eq!(observation.tx_hash.as_deref(), Some("abc123"));
+        assert_eq!(observation.sender_address.as_deref(), Some("sender-a"));
+        assert_eq!(observation.sender_addresses, vec!["sender-a", "sender-b"]);
+        assert_eq!(
+            observation.recipient_address.as_deref(),
+            Some("bcrt1qrecipient")
+        );
+        assert_eq!(observation.transfer_index, Some(2));
+        assert_eq!(observation.observed_amount.as_deref(), Some("42"));
+        assert_eq!(observation.confirmation_state.as_deref(), Some("mempool"));
     }
 }
