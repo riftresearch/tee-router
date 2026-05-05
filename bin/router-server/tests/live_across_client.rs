@@ -111,7 +111,7 @@ fn live_client() -> TestResult<AcrossClient> {
     Ok(AcrossClient::new(
         env::var(ACROSS_BASE_URL).unwrap_or_else(|_| "https://app.across.to/api".into()),
         required_env(ACROSS_API_KEY)?,
-    ))
+    )?)
 }
 
 fn live_swap_request() -> TestResult<AcrossSwapApprovalRequest> {

@@ -1,6 +1,6 @@
 import {
   assetIdentifierFromInternal,
-  formatAmount,
+  formatPositiveAmount,
   formatSlippage,
   type AmountFormat
 } from './assets'
@@ -31,7 +31,6 @@ export type PublicOrderResponse = PublicQuoteResponse & {
   orderAddress: string
   amountToSend: string
   status: string
-  cancellationSecret?: string
 }
 
 export function presentQuoteEnvelope(
@@ -61,11 +60,8 @@ export function presentOrderEnvelope(
     ...presentQuote(quote, amountFormat),
     orderId: envelope.order.id,
     orderAddress,
-    amountToSend: formatAmount(amountToSendRaw, source, amountFormat),
-    status: envelope.order.status,
-    ...(envelope.cancellation_secret
-      ? { cancellationSecret: envelope.cancellation_secret }
-      : {})
+    amountToSend: formatPositiveAmount(amountToSendRaw, source, amountFormat),
+    status: envelope.order.status
   }
 }
 
@@ -98,8 +94,12 @@ function presentQuote(
       from: source.id,
       to: destination.id,
       expiry: quote.expires_at,
-      expectedOut: formatAmount(quote.output_amount, destination, amountFormat),
-      maxIn: formatAmount(quote.input_amount, source, amountFormat),
+      expectedOut: formatPositiveAmount(
+        quote.output_amount,
+        destination,
+        amountFormat
+      ),
+      maxIn: formatPositiveAmount(quote.input_amount, source, amountFormat),
       maxSlippage: formatSlippage(0, amountFormat),
       amountFormat
     }
@@ -108,11 +108,11 @@ function presentQuote(
   const minOut =
     quote.min_amount_out === null || quote.min_amount_out === undefined
       ? undefined
-      : formatAmount(quote.min_amount_out, destination, amountFormat)
+      : formatPositiveAmount(quote.min_amount_out, destination, amountFormat)
   const maxIn =
     quote.max_amount_in === null || quote.max_amount_in === undefined
       ? undefined
-      : formatAmount(quote.max_amount_in, source, amountFormat)
+      : formatPositiveAmount(quote.max_amount_in, source, amountFormat)
 
   return {
     quoteId: quote.id,
@@ -120,7 +120,7 @@ function presentQuote(
     from: source.id,
     to: destination.id,
     expiry: quote.expires_at,
-    expectedOut: formatAmount(quote.amount_out, destination, amountFormat),
+    expectedOut: formatPositiveAmount(quote.amount_out, destination, amountFormat),
     ...(minOut === undefined ? {} : { minOut }),
     ...(maxIn === undefined ? {} : { maxIn }),
     maxSlippage: formatSlippage(quote.slippage_bps, amountFormat),

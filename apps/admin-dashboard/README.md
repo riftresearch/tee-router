@@ -34,6 +34,11 @@ In non-production mode the backend bypasses Google sign-in and returns a local
 admin session server-side; production still requires a verified Google account
 from the allowlist.
 
+Local non-production auth bypass binds to `127.0.0.1` by default. If a
+deterministic compose stack needs to bind `HOST=0.0.0.0`, it must also set
+`ADMIN_DASHBOARD_ALLOW_INSECURE_DEV_AUTH_BYPASS=true` so the unauthenticated
+development surface is explicit.
+
 ## Local Development
 
 ```sh

@@ -75,8 +75,7 @@ configs:
       pg_dump "$${PRIMARY_CONN}" --schema-only --no-owner --no-privileges --no-publications --no-subscriptions | \
         psql "$${REPLICA_DB_CONN}"
 
-      ROUTER_CDC_TABLES="public.router_orders, public.market_order_quotes, public.market_order_actions, public.order_execution_legs, public.order_execution_steps, public.order_provider_operations, public.order_provider_addresses, public.deposit_vaults, public.custody_vaults"
-      psql "$${REPLICA_DB_CONN}" -c "CREATE PUBLICATION router_cdc_publication FOR TABLE $${ROUTER_CDC_TABLES};"
+      psql "$${REPLICA_DB_CONN}" -c "CREATE PUBLICATION router_cdc_publication;"
 
       psql "$${REPLICA_DB_CONN}" -c "CREATE SUBSCRIPTION router_local_subscription CONNECTION 'host=router-postgres port=5432 dbname=router_db user=replicator password=replicator sslmode=disable' PUBLICATION router_all_tables WITH (copy_data = true, create_slot = true);"
 
@@ -154,6 +153,8 @@ services:
       - "16"
       - --token-indexer-database-url
       - postgres://postgres:postgres@token-indexer-db:5432/token_indexer
+    environment:
+      EVM_TOKEN_INDEXER_API_KEY: local-token-indexer-api-key-000000000
     depends_on:
       token-indexer-db:
         condition: service_healthy
@@ -200,15 +201,13 @@ services:
       BITCOIN_RPC_AUTH: devnet:devnet
       ELECTRUM_HTTP_SERVER_URL: http://devnet:50110
       BITCOIN_NETWORK: regtest
-      ETHEREUM_ALLOWED_TOKEN: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
-      BASE_ALLOWED_TOKEN: "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
-      ARBITRUM_ALLOWED_TOKEN: "0xaf88d065e77c8cc2239327C5EDb3A432268e5831"
       ETHEREUM_PAYMASTER_PRIVATE_KEY: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
       BASE_PAYMASTER_PRIVATE_KEY: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
       ARBITRUM_PAYMASTER_PRIVATE_KEY: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
       HYPERLIQUID_PAYMASTER_PRIVATE_KEY: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-      ROUTER_DETECTOR_API_KEY: devnet-detector-key
-      ROUTER_ADMIN_API_KEY: devnet-admin-key
+      ROUTER_DETECTOR_API_KEY: devnet-detector-key-000000000000
+      ROUTER_GATEWAY_API_KEY: devnet-gateway-key-0000000000000000
+      ROUTER_ADMIN_API_KEY: devnet-admin-key-0000000000000000
       ACROSS_API_URL: http://devnet:50107
       ACROSS_API_KEY: devnet-across
       ACROSS_INTEGRATOR_ID: rift-devnet
@@ -322,7 +321,7 @@ services:
       ROUTER_CDC_MESSAGE_PREFIX: rift.router.change
       SAURON_BITCOIN_SCAN_INTERVAL_SECONDS: 2
       ROUTER_INTERNAL_BASE_URL: http://router-api:4522
-      ROUTER_DETECTOR_API_KEY: devnet-detector-key
+      ROUTER_DETECTOR_API_KEY: devnet-detector-key-000000000000
       ELECTRUM_HTTP_SERVER_URL: http://devnet:50110
       BITCOIN_RPC_URL: http://devnet:50100
       BITCOIN_RPC_AUTH: devnet:devnet
@@ -334,6 +333,7 @@ services:
       ETHEREUM_TOKEN_INDEXER_URL: http://devnet:50104
       BASE_TOKEN_INDEXER_URL: http://devnet:50105
       ARBITRUM_TOKEN_INDEXER_URL: http://devnet:50106
+      TOKEN_INDEXER_API_KEY: local-token-indexer-api-key-000000000
 
   router-gateway-db:
     image: postgres:16-alpine
@@ -362,8 +362,11 @@ services:
       HOST: 0.0.0.0
       PORT: 3000
       ROUTER_INTERNAL_BASE_URL: http://router-api:4522
+      ROUTER_GATEWAY_API_KEY: devnet-gateway-key-0000000000000000
+      ROUTER_GATEWAY_PUBLIC_BASE_URL: http://localhost:3001
       ROUTER_GATEWAY_DATABASE_URL: postgres://postgres:postgres@router-gateway-db:5432/router_gateway
       ROUTER_GATEWAY_CANCELLATION_SECRET_KEY: "2222222222222222222222222222222222222222222222222222222222222222"
+      ROUTER_GATEWAY_BITCOIN_ADDRESS_NETWORKS: regtest
     ports:
       - "3001:3000"
     healthcheck:
@@ -386,6 +389,22 @@ services:
       timeout: 5s
       retries: 20
 
+  admin-dashboard-analytics-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: admin_dashboard_analytics
+    volumes:
+      - router_local_admin_analytics_db:/var/lib/postgresql/data
+    ports:
+      - "55434:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d admin_dashboard_analytics"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
   admin-dashboard:
     build:
       context: ..
@@ -395,20 +414,24 @@ services:
         condition: service_completed_successfully
       admin-dashboard-auth-db:
         condition: service_healthy
+      admin-dashboard-analytics-db:
+        condition: service_healthy
     environment:
       NODE_ENV: production
       ADMIN_DASHBOARD_PRODUCTION: "false"
+      ADMIN_DASHBOARD_ALLOW_INSECURE_DEV_AUTH_BYPASS: "true"
       HOST: 0.0.0.0
       PORT: 3000
       BETTER_AUTH_URL: http://localhost:3000
       ADMIN_DASHBOARD_WEB_ORIGIN: http://localhost:3000
       ADMIN_DASHBOARD_AUTH_DATABASE_URL: postgres://postgres:postgres@admin-dashboard-auth-db:5432/admin_dashboard_auth
       ADMIN_DASHBOARD_REPLICA_DATABASE_URL: postgres://postgres:postgres@router-postgres-replica:5432/router_db
+      ADMIN_DASHBOARD_ANALYTICS_DATABASE_URL: postgres://postgres:postgres@admin-dashboard-analytics-db:5432/admin_dashboard_analytics
       ADMIN_DASHBOARD_CDC_SLOT_NAME: admin_dashboard_orders_cdc
       ROUTER_CDC_PUBLICATION_NAME: router_cdc_publication
       ROUTER_CDC_MESSAGE_PREFIX: rift.router.change
-      ROUTER_ADMIN_API_KEY: devnet-admin-key
-      BETTER_AUTH_SECRET: local-admin-dashboard-secret
+      ROUTER_ADMIN_API_KEY: devnet-admin-key-0000000000000000
+      BETTER_AUTH_SECRET: local-admin-dashboard-secret-000000
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
     ports:
@@ -458,3 +481,4 @@ volumes:
   router_local_sauron_state_db:
   router_local_gateway_db:
   router_local_admin_auth_db:
+  router_local_admin_analytics_db:

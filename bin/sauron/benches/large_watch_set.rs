@@ -16,7 +16,10 @@ use sauron::{
 
 fn bench_watch_store_replace_all(c: &mut Criterion) {
     let mut group = c.benchmark_group("sauron_watch_store_replace_all");
-    let runtime = benchmark_runtime();
+    let Ok(runtime) = benchmark_runtime() else {
+        group.finish();
+        return;
+    };
 
     for size in LARGE_WATCH_SET_SIZES {
         let entries = make_mixed_watch_entries(size);
@@ -40,7 +43,10 @@ fn bench_watch_store_replace_all(c: &mut Criterion) {
 
 fn bench_watch_store_snapshot_for_chain(c: &mut Criterion) {
     let mut group = c.benchmark_group("sauron_watch_store_snapshot_for_chain");
-    let runtime = benchmark_runtime();
+    let Ok(runtime) = benchmark_runtime() else {
+        group.finish();
+        return;
+    };
 
     for size in LARGE_WATCH_SET_SIZES {
         let store = runtime.block_on(populate_watch_store(make_mixed_watch_entries(size)));

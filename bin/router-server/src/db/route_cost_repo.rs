@@ -76,6 +76,7 @@ impl RouteCostRepository {
                     quote_source = EXCLUDED.quote_source,
                     refreshed_at = EXCLUDED.refreshed_at,
                     expires_at = EXCLUDED.expires_at
+                WHERE router_route_cost_snapshots.refreshed_at <= EXCLUDED.refreshed_at
                 "#,
             )
             .bind(&snapshot.transition_id)

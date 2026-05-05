@@ -1,8 +1,9 @@
 import { createApp } from './app'
 import { runAuthMigrations } from './auth-migrations'
-import { loadConfig } from './config'
+import { loadConfig, validateRuntimeConfig } from './config'
 
 const config = loadConfig()
+validateRuntimeConfig(config)
 
 const migrationResult = await runAuthMigrations(config)
 if (migrationResult.status === 'migrated') {

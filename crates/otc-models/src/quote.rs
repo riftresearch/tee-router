@@ -107,12 +107,12 @@ fn normalize_value(v: Value) -> Value {
     match v {
         Value::Object(map) => {
             // Gather keys, sort, then reinsert in order (insertion order is preserved by serde_json::Map)
-            let mut keys: Vec<_> = map.keys().cloned().collect();
-            keys.sort_unstable();
-            let mut out = Map::with_capacity(map.len());
-            for k in keys {
-                let child = map.get(&k).expect("key must exist");
-                out.insert(k, normalize_value(child.clone()));
+            let capacity = map.len();
+            let mut entries: Vec<_> = map.into_iter().collect();
+            entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            let mut out = Map::with_capacity(capacity);
+            for (k, child) in entries {
+                out.insert(k, normalize_value(child));
             }
             Value::Object(out)
         }
@@ -124,7 +124,7 @@ fn normalize_value(v: Value) -> Value {
 }
 
 impl Quote {
-    pub fn hash(&self) -> [u8; 32] {
+    pub fn hash(&self) -> serde_json::Result<[u8; 32]> {
         // Create a normalized version of the quote with microsecond-precision timestamps
         // to ensure consistent hashing across database round-trips (PostgreSQL uses microseconds)
         let normalized = Quote {
@@ -132,7 +132,7 @@ impl Quote {
             created_at: normalize_datetime_to_micros(self.created_at),
             ..self.clone()
         };
-        keccak256(to_canonical_json(&normalized).unwrap().as_bytes()).into()
+        Ok(keccak256(to_canonical_json(&normalized)?.as_bytes()).into())
     }
 
     /// Checks if the given input amount is within the allowed bounds.
@@ -144,6 +144,5 @@ impl Quote {
 /// Normalize a DateTime to microsecond precision to match PostgreSQL TIMESTAMPTZ precision.
 /// This ensures consistent hashing across database round-trips.
 fn normalize_datetime_to_micros(dt: DateTime<Utc>) -> DateTime<Utc> {
-    DateTime::from_timestamp_micros(dt.timestamp_micros())
-        .expect("timestamp should be in valid range")
+    DateTime::from_timestamp_micros(dt.timestamp_micros()).unwrap_or(dt)
 }

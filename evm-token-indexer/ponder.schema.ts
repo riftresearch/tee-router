@@ -90,6 +90,8 @@ export const detectedDepositCandidate = onchainTable(
       table.status,
       table.chainId,
       table.blockNumber,
+      table.transferIndex,
+      table.id,
     ),
     watchIdx: index("detected_deposit_candidate_watch_idx").on(table.watchId),
   }),

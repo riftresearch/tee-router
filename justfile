@@ -23,6 +23,24 @@ devnet +args:
     fi
     {{local_full_compose}} "${args[@]}"
 
+# Short alias for local full docker compose commands.
+# Examples: just dc up -d, just dc down -v, just dc ps
+dc +args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    args=( {{args}} )
+    if [[ "${#args[@]}" -eq 0 ]]; then
+      args=(ps)
+    fi
+    if [[ "${args[0]}" == "up-d" ]]; then
+      args=(up -d "${args[@]:1}")
+    fi
+    if [[ "${args[0]}" == "up" ]]; then
+      {{local_full_compose}} stop admin-dashboard sauron >/dev/null 2>&1 || true
+      {{local_full_compose}} rm -f router-replica-setup >/dev/null 2>&1 || true
+    fi
+    {{local_full_compose}} "${args[@]}"
+
 # Run random router loadgen inside the local full compose stack
 compose-router-loadgen count='100' concurrency='8' rps='5' min_raw_amount='100000000' max_raw_amount='250000000' order_type='market':
     {{local_full_compose}} \

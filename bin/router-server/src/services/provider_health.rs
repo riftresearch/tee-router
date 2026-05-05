@@ -13,6 +13,10 @@ use std::{collections::HashMap, sync::Arc, time::Duration, time::Instant};
 use tokio::sync::RwLock;
 use tracing::warn;
 
+use super::http_body::read_limited_response_text;
+
+const MAX_PROVIDER_HEALTH_RESPONSE_BODY_BYTES: usize = 64 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct ProviderHealthSnapshot {
     checks: HashMap<String, ProviderHealthCheck>,
@@ -118,11 +122,13 @@ impl ProviderHealthPoller {
         updated_by: impl Into<String>,
         timeout: Duration,
     ) -> RouterServerResult<Self> {
-        let client = Client::builder().timeout(timeout).build().map_err(|err| {
-            RouterServerError::InvalidData {
+        let client = Client::builder()
+            .use_rustls_tls()
+            .timeout(timeout)
+            .build()
+            .map_err(|err| RouterServerError::InvalidData {
                 message: format!("failed to build provider health HTTP client: {err}"),
-            }
-        })?;
+            })?;
         let probes = probes
             .into_iter()
             .map(|probe| probe.prepare(timeout))
@@ -338,7 +344,16 @@ impl ProviderHealthProbe {
 
         let response = request.send().await?;
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body =
+            read_limited_response_text(response, MAX_PROVIDER_HEALTH_RESPONSE_BODY_BYTES).await?;
+        let body = if body.truncated {
+            format!(
+                "<response body exceeded {} bytes>",
+                MAX_PROVIDER_HEALTH_RESPONSE_BODY_BYTES
+            )
+        } else {
+            body.text
+        };
         Ok((status, body))
     }
 
@@ -362,7 +377,13 @@ fn truncate_error_body(body: &str) -> String {
     if body.len() <= MAX {
         body.to_string()
     } else {
-        format!("{}...", &body[..MAX])
+        let end = body
+            .char_indices()
+            .map(|(index, _)| index)
+            .take_while(|index| *index <= MAX)
+            .last()
+            .unwrap_or(0);
+        format!("{}...", &body[..end])
     }
 }
 
@@ -383,5 +404,16 @@ mod tests {
         assert!(!provider_http_status_reachable(
             StatusCode::INTERNAL_SERVER_ERROR
         ));
+    }
+
+    #[test]
+    fn truncate_error_body_does_not_split_utf8_codepoints() {
+        let body = format!("{}{}", "a".repeat(255), "é response details");
+
+        let truncated = truncate_error_body(&body);
+
+        assert!(truncated.ends_with("..."));
+        assert!(truncated.len() <= 259);
+        assert!(!truncated.contains('�'));
     }
 }

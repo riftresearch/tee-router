@@ -5,7 +5,9 @@ export type StoredRefundAuthorization = {
   refundMode: RefundMode
   refundAuthorizer: string | null
   encryptedCancellationSecret: string
+  cancellationSecretHash: string
   refundTokenHash?: string
+  encryptedRefundToken?: string
   cancellationRequestedAt?: string
   createdAt: string
   updatedAt: string
@@ -16,13 +18,33 @@ export type SaveRefundAuthorizationInput = {
   refundMode: RefundMode
   refundAuthorizer: string | null
   encryptedCancellationSecret: string
+  cancellationSecretHash: string
   refundTokenHash?: string
+  encryptedRefundToken?: string
 }
 
+export type ClaimRefundAuthorizationExpectation = SaveRefundAuthorizationInput
+
 export interface RefundAuthorizationStore {
-  saveRefundAuthorization(input: SaveRefundAuthorizationInput): Promise<void>
+  saveRefundAuthorization(
+    input: SaveRefundAuthorizationInput,
+    claimTimeoutMs: number
+  ): Promise<StoredRefundAuthorization | undefined>
   findRefundAuthorization(
     routerOrderId: string
   ): Promise<StoredRefundAuthorization | undefined>
-  markCancellationRequested(routerOrderId: string): Promise<void>
+  claimCancellationAttempt(
+    routerOrderId: string,
+    claimId: string,
+    claimTimeoutMs: number,
+    expected: ClaimRefundAuthorizationExpectation
+  ): Promise<boolean>
+  releaseCancellationAttempt(
+    routerOrderId: string,
+    claimId: string
+  ): Promise<void>
+  markCancellationRequested(
+    routerOrderId: string,
+    claimId: string
+  ): Promise<boolean>
 }

@@ -319,6 +319,8 @@ Sauron should use Railway-reachable URLs:
 - `ETHEREUM_TOKEN_INDEXER_URL`
 - `BASE_TOKEN_INDEXER_URL`
 - `ARBITRUM_TOKEN_INDEXER_URL`
+- `TOKEN_INDEXER_API_KEY`, matching each indexer's
+  `EVM_TOKEN_INDEXER_API_KEY`
 
 Because Sauron is also on Railway, these can use Railway private networking
 where possible.

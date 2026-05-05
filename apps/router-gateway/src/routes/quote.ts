@@ -1,6 +1,7 @@
 import { createRoute, z } from '@hono/zod-openapi'
 
 import {
+  assertAddressMatchesChain,
   parseAmount,
   parseSlippageBps,
   resolveAssetIdentifier,
@@ -12,19 +13,23 @@ import { presentQuoteEnvelope } from '../presenters'
 import { routerClientFor, type GatewayDeps } from './deps'
 import {
   AmountFormatSchema,
+  AddressSchema,
+  AmountStringSchema,
+  AssetIdentifierSchema,
   ErrorResponses,
-  QuoteResponseSchema
+  QuoteResponseSchema,
+  SlippageStringSchema
 } from './schemas'
 
 export const QuoteRequestSchema = z
   .object({
-    from: z.string().min(1).openapi({
+    from: AssetIdentifierSchema.openapi({
       example: 'Bitcoin.BTC'
     }),
-    to: z.string().min(1).openapi({
+    to: AssetIdentifierSchema.openapi({
       example: 'Ethereum.USDC'
     }),
-    toAddress: z.string().min(1).openapi({
+    toAddress: AddressSchema.openapi({
       description:
         'Current Rust router quote bridge field. The upstream router requires a recipient address at quote time.',
       example: '0x1111111111111111111111111111111111111111'
@@ -36,13 +41,13 @@ export const QuoteRequestSchema = z
         description: 'Order type. Defaults to market_order.',
         example: 'market_order'
       }),
-    fromAmount: z.string().min(1).optional().openapi({
+    fromAmount: AmountStringSchema.optional().openapi({
       example: '10'
     }),
-    toAmount: z.string().min(1).optional().openapi({
+    toAmount: AmountStringSchema.optional().openapi({
       example: '100000'
     }),
-    maxSlippage: z.string().min(1).openapi({
+    maxSlippage: SlippageStringSchema.optional().openapi({
       example: '1.5'
     }),
     amountFormat: AmountFormatSchema.optional()
@@ -58,6 +63,13 @@ export const QuoteRequestSchema = z
         code: 'custom',
         message: 'exactly one of fromAmount or toAmount is required',
         path: ['fromAmount']
+      })
+    }
+    if (orderType === 'market_order' && value.maxSlippage === undefined) {
+      ctx.addIssue({
+        code: 'custom',
+        message: 'maxSlippage is required for market orders',
+        path: ['maxSlippage']
       })
     }
     if (
@@ -112,6 +124,12 @@ export function createQuoteHandler(
       const source = resolveAssetIdentifier(request.from)
       const destination = resolveAssetIdentifier(request.to)
       const orderType = normalizeOrderType(request.orderType)
+      assertAddressMatchesChain(
+        destination.internal.chain,
+        request.toAddress,
+        'toAddress',
+        { bitcoinAddressNetworks: config.bitcoinAddressNetworks }
+      )
 
       if (orderType === 'limit_order') {
         const envelope = await routerClientFor(config, deps).createQuote({
@@ -136,7 +154,7 @@ export function createQuoteHandler(
         return c.json(presentQuoteEnvelope(envelope, amountFormat), 201)
       }
 
-      const slippageBps = parseSlippageBps(request.maxSlippage, amountFormat)
+      const slippageBps = parseSlippageBps(request.maxSlippage as string, amountFormat)
       const orderKind =
         request.fromAmount !== undefined
           ? {

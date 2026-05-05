@@ -3,7 +3,10 @@ import { GatewayConfigurationError } from '../errors'
 import { RouterClient, type FetchLike } from '../internal/router-client'
 import { RouterCancellationSecretBox } from '../cancellations/crypto'
 import { BunSqlRefundAuthorizationStore } from '../cancellations/postgres-store'
-import { RefundAuthorizationService } from '../cancellations/service'
+import {
+  DEFAULT_CANCELLATION_CLAIM_TIMEOUT_MS,
+  RefundAuthorizationService
+} from '../cancellations/service'
 import type { DependencyHealthMonitor } from '../health'
 
 export type GatewayDeps = {
@@ -25,6 +28,7 @@ export function routerClientFor(
 
   deps.routerClient = new RouterClient({
     baseUrl: config.routerInternalBaseUrl,
+    apiKey: config.routerInternalApiKey,
     fetch: deps.fetch,
     timeoutMs: config.requestTimeoutMs
   })
@@ -49,7 +53,18 @@ export function refundAuthorizationServiceFor(
 
   deps.refundAuthorizationService = new RefundAuthorizationService(
     new BunSqlRefundAuthorizationStore(new Bun.SQL(config.gatewayDatabaseUrl)),
-    RouterCancellationSecretBox.fromKeyMaterial(config.cancellationSecretKey)
+    RouterCancellationSecretBox.fromKeyMaterial(config.cancellationSecretKey),
+    {
+      cancellationClaimTimeoutMs: cancellationClaimTimeoutMsForRequestTimeout(
+        config.requestTimeoutMs
+      ),
+      publicBaseUrl: config.publicBaseUrl
+    }
   )
   return deps.refundAuthorizationService
+}
+
+function cancellationClaimTimeoutMsForRequestTimeout(requestTimeoutMs: number) {
+  const timeoutWithSlack = requestTimeoutMs + 60_000
+  return Math.max(DEFAULT_CANCELLATION_CLAIM_TIMEOUT_MS, timeoutWithSlack)
 }

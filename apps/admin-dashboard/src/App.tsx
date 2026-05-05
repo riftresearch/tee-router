@@ -1,6 +1,7 @@
 import {
   Activity,
   ArrowRight,
+  BarChart3,
   ChevronDown,
   ChevronRight,
   Check,
@@ -10,30 +11,46 @@ import {
   LogIn,
   LogOut,
   RefreshCw,
+  Search,
   ShieldCheck,
   Wifi,
-  WifiOff
+  WifiOff,
+  X
 } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 
-import { fetchMe, fetchOrders, parseSnapshotEvent, parseUpsertEvent } from './api'
+import {
+  fetchMe,
+  fetchOrderById,
+  fetchOrders,
+  fetchVolumeAnalytics,
+  parseMetricsEvent,
+  parseRemoveEvent,
+  parseSnapshotEvent,
+  parseUpsertEvent
+} from './api'
 import { authClient } from './auth-client'
 import type {
   AssetRef,
   MeResponse,
+  OrderLifecycleFilter,
   OrderExecutionLeg,
   OrderExecutionStep,
   OrderFirehoseRow,
   OrderMetrics,
   OrderTypeFilter,
   UsdAmountValuation,
-  UsdValuation
+  UsdValuation,
+  VolumeAnalyticsResponse,
+  VolumeBucketSize,
+  VolumeOrderTypeFilter
 } from './types'
 
 type StreamState = 'idle' | 'connecting' | 'live' | 'closed' | 'error'
 
 const ORDER_LIMIT = 100
 const SHOW_USD_VALUES = true
+const MAX_VOLUME_CHART_BUCKETS = 1500
 const WAIT_FOR_DEPOSIT_STEP_TYPE = 'wait_for_deposit'
 const ACTIVE_STEP_STATUSES = new Set(['ready', 'running', 'waiting', 'submitted'])
 const FAILED_STEP_STATUSES = new Set(['failed', 'cancelled'])
@@ -41,6 +58,21 @@ const ORDER_TABS: Array<{ type: OrderTypeFilter; label: string }> = [
   { type: 'market_order', label: 'Market Orders' },
   { type: 'limit_order', label: 'Limit Orders' }
 ]
+const ORDER_FILTERS: Array<{ value: OrderLifecycleFilter; label: string }> = [
+  { value: 'firehose', label: 'Firehose' },
+  { value: 'in_progress', label: 'In Progress' },
+  { value: 'failed', label: 'Failed' },
+  { value: 'refunded', label: 'Refunded' },
+  { value: 'manual_refund', label: 'Manual Refund' }
+]
+const VOLUME_WINDOWS = [
+  { value: '24h', label: '24H' },
+  { value: '7d', label: '7D' },
+  { value: '30d', label: '30D' },
+  { value: '90d', label: '90D' },
+  { value: 'custom', label: 'Custom' }
+] as const
+type VolumeWindow = (typeof VOLUME_WINDOWS)[number]['value']
 const CHAIN_DISPLAY_NAMES: Record<string, string> = {
   bitcoin: 'Bitcoin',
   'evm:1': 'Ethereum',
@@ -115,18 +147,44 @@ export function App() {
   const [me, setMe] = useState<MeResponse | null>(null)
   const [orders, setOrders] = useState<OrderFirehoseRow[]>([])
   const [orderTab, setOrderTab] = useState<OrderTypeFilter>('market_order')
+  const [orderFilter, setOrderFilter] =
+    useState<OrderLifecycleFilter>('firehose')
+  const [searchInput, setSearchInput] = useState('')
+  const [searchedOrder, setSearchedOrder] = useState<OrderFirehoseRow | null>(
+    null
+  )
   const [nextCursor, setNextCursor] = useState<string | undefined>()
   const [metrics, setMetrics] = useState<OrderMetrics | null>(null)
+  const [volumeAnalytics, setVolumeAnalytics] =
+    useState<VolumeAnalyticsResponse | null>(null)
+  const [volumeWindow, setVolumeWindow] = useState<VolumeWindow>('24h')
+  const [customVolumeFrom, setCustomVolumeFrom] = useState(() =>
+    datetimeLocalValue(hoursAgo(24))
+  )
+  const [customVolumeTo, setCustomVolumeTo] = useState(() =>
+    datetimeLocalValue(new Date())
+  )
+  const [volumeBucketSize, setVolumeBucketSize] =
+    useState<VolumeBucketSize>('hour')
+  const [volumeOrderType, setVolumeOrderType] =
+    useState<VolumeOrderTypeFilter>('all')
   const [expandedOrderId, setExpandedOrderId] = useState<string | null>(null)
+  const [detailLoadingOrderIds, setDetailLoadingOrderIds] = useState<Set<string>>(
+    () => new Set()
+  )
   const [copiedOrderId, setCopiedOrderId] = useState<string | null>(null)
   const [flashingOrderIds, setFlashingOrderIds] = useState<Set<string>>(
     () => new Set()
   )
   const [streamState, setStreamState] = useState<StreamState>('idle')
+  const [streamRefreshKey, setStreamRefreshKey] = useState(0)
   const [loading, setLoading] = useState(true)
   const [loadingMore, setLoadingMore] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const loadMoreRef = useRef<HTMLDivElement | null>(null)
+  const expandedOrderIdRef = useRef<string | null>(null)
+  const loadOrderDetailsRef = useRef<(orderId: string) => void>(() => undefined)
+  const loadVolumeAnalyticsRef = useRef<() => Promise<void>>(async () => undefined)
   const copiedOrderTimeoutRef = useRef<number | undefined>(undefined)
   const rowFlashTimeoutsRef = useRef<Map<string, number>>(new Map())
 
@@ -137,29 +195,121 @@ export function App() {
     return session
   }, [])
 
-  const loadOrders = useCallback(async () => {
-    const response = await fetchOrders(ORDER_LIMIT, undefined, orderTab)
-    setOrders(sortOrders(response.orders))
-    setNextCursor(response.nextCursor)
-    setMetrics(response.metrics)
-  }, [orderTab])
+  const loadVolumeAnalytics = useCallback(async () => {
+    const range = volumeDateRange(volumeWindow, customVolumeFrom, customVolumeTo)
+    const response = await fetchVolumeAnalytics({
+      bucketSize: volumeBucketSize,
+      orderType: volumeOrderType,
+      from: range.from.toISOString(),
+      to: range.to.toISOString()
+    })
+    setVolumeAnalytics(response)
+  }, [customVolumeFrom, customVolumeTo, volumeBucketSize, volumeOrderType, volumeWindow])
 
   const loadMoreOrders = useCallback(async () => {
-    if (!nextCursor || loadingMore) return
+    if (!nextCursor || loadingMore || searchedOrder) return
 
     setLoadingMore(true)
     setError(null)
     try {
-      const response = await fetchOrders(ORDER_LIMIT, nextCursor, orderTab)
+      const response = await fetchOrders(
+        ORDER_LIMIT,
+        nextCursor,
+        orderTab,
+        orderFilter,
+        false
+      )
       setOrders((current) => mergeOrders(current, response.orders))
       setNextCursor(response.nextCursor)
-      setMetrics(response.metrics)
+      if (response.metrics) setMetrics(response.metrics)
     } catch (loadError) {
       setError(errorMessage(loadError))
     } finally {
       setLoadingMore(false)
     }
-  }, [loadingMore, nextCursor, orderTab])
+  }, [loadingMore, nextCursor, orderFilter, orderTab, searchedOrder])
+
+  const searchOrder = useCallback(async () => {
+    const orderId = searchInput.trim()
+    if (!orderId) {
+      setSearchedOrder(null)
+      return
+    }
+    if (!isUuid(orderId)) {
+      setError('Enter a full order UUID')
+      return
+    }
+
+    setError(null)
+    const response = await fetchOrderById(orderId)
+    setSearchedOrder(response.order)
+    if (
+      response.order.orderType === 'market_order' ||
+      response.order.orderType === 'limit_order'
+    ) {
+      setOrderTab(response.order.orderType)
+    }
+    setExpandedOrderId(response.order.id)
+  }, [searchInput])
+
+  const clearSearch = useCallback(() => {
+    setSearchInput('')
+    setSearchedOrder(null)
+    setExpandedOrderId(null)
+  }, [])
+
+  const loadOrderDetails = useCallback(async (orderId: string) => {
+    setDetailLoadingOrderIds((current) => {
+      const next = new Set(current)
+      next.add(orderId)
+      return next
+    })
+    try {
+      const response = await fetchOrderById(orderId)
+      setOrders((current) => upsertOrder(current, response.order))
+      setSearchedOrder((current) =>
+        current?.id === orderId ? response.order : current
+      )
+    } catch (loadError) {
+      setError(errorMessage(loadError))
+    } finally {
+      setDetailLoadingOrderIds((current) => {
+        const next = new Set(current)
+        next.delete(orderId)
+        return next
+      })
+    }
+  }, [])
+
+  const toggleOrderExpansion = useCallback(
+    (order: OrderFirehoseRow) => {
+      setExpandedOrderId((current) => (current === order.id ? null : order.id))
+      if (expandedOrderId !== order.id && order.detailLevel !== 'full') {
+        void loadOrderDetails(order.id)
+      }
+    },
+    [expandedOrderId, loadOrderDetails]
+  )
+
+  const changeOrderTab = useCallback(
+    (type: OrderTypeFilter) => {
+      setOrderTab(type)
+      clearSearch()
+    },
+    [clearSearch]
+  )
+
+  const changeOrderFilter = useCallback(
+    (filter: OrderLifecycleFilter) => {
+      setOrderFilter(filter)
+      clearSearch()
+    },
+    [clearSearch]
+  )
+
+  const refreshOrderStream = useCallback(() => {
+    setStreamRefreshKey((current) => current + 1)
+  }, [])
 
   const copyOrderId = useCallback(async (orderId: string) => {
     try {
@@ -198,6 +348,20 @@ export function App() {
   }, [])
 
   useEffect(() => {
+    expandedOrderIdRef.current = expandedOrderId
+  }, [expandedOrderId])
+
+  useEffect(() => {
+    loadOrderDetailsRef.current = (orderId: string) => {
+      void loadOrderDetails(orderId)
+    }
+  }, [loadOrderDetails])
+
+  useEffect(() => {
+    loadVolumeAnalyticsRef.current = loadVolumeAnalytics
+  }, [loadVolumeAnalytics])
+
+  useEffect(() => {
     let cancelled = false
 
     const load = async () => {
@@ -219,56 +383,130 @@ export function App() {
     }
   }, [loadSession])
 
-  useEffect(() => {
-    if (!me?.authorized) return
-    let cancelled = false
-
-    setOrders([])
-    setNextCursor(undefined)
-    setExpandedOrderId(null)
-    setLoadingMore(false)
-    setError(null)
+ useEffect(() => {
+   if (!me?.authorized || !me.analyticsConfigured) return
+   let cancelled = false
 
     const load = async () => {
       try {
-        await loadOrders()
+        const range = volumeDateRange(volumeWindow, customVolumeFrom, customVolumeTo)
+        const response = await fetchVolumeAnalytics({
+          bucketSize: volumeBucketSize,
+          orderType: volumeOrderType,
+          from: range.from.toISOString(),
+          to: range.to.toISOString()
+        })
+        if (!cancelled) setVolumeAnalytics(response)
       } catch (loadError) {
         if (!cancelled) setError(errorMessage(loadError))
       }
     }
 
-    void load()
-    return () => {
-      cancelled = true
-    }
-  }, [loadOrders, me?.authorized])
+   void load()
+   return () => {
+     cancelled = true
+   }
+ }, [
+    customVolumeFrom,
+    customVolumeTo,
+    me?.analyticsConfigured,
+    me?.authorized,
+    volumeBucketSize,
+    volumeOrderType,
+    volumeWindow
+  ])
 
   useEffect(() => {
     if (!me?.authorized) return
 
     setStreamState('connecting')
+    setOrders([])
+    setNextCursor(undefined)
+    setExpandedOrderId(null)
+    setLoadingMore(false)
+    setError(null)
     const params = new URLSearchParams({
       limit: String(ORDER_LIMIT),
       orderType: orderTab
     })
+    if (orderFilter !== 'firehose') params.set('filter', orderFilter)
     const source = new EventSource(`/api/orders/events?${params.toString()}`, {
       withCredentials: true
     })
+    const rejectStreamEvent = (streamError: unknown) => {
+      console.error('admin dashboard order stream event rejected', streamError)
+      setStreamState('error')
+      setError(errorMessage(streamError))
+      source.close()
+    }
 
     source.addEventListener('open', () => setStreamState('live'))
     source.addEventListener('snapshot', (event) => {
-      const snapshot = parseSnapshotEvent(event as MessageEvent<string>)
-      setOrders((current) => mergeOrders(current, snapshot.orders))
-      if (snapshot.metrics) setMetrics(snapshot.metrics)
-      setStreamState('live')
+      try {
+        const snapshot = parseSnapshotEvent(event as MessageEvent<string>)
+        setOrders(sortOrders(snapshot.orders))
+        setNextCursor(snapshot.nextCursor)
+        if (snapshot.metrics) setMetrics(snapshot.metrics)
+        setStreamState('live')
+      } catch (streamError) {
+        rejectStreamEvent(streamError)
+      }
     })
     source.addEventListener('upsert', (event) => {
-      const { order, metrics: nextMetrics } = parseUpsertEvent(
-        event as MessageEvent<string>
-      )
-      setOrders((current) => upsertOrder(current, order))
-      if (nextMetrics) setMetrics(nextMetrics)
-      markOrderFlashed(order.id)
+      try {
+        const { order, metrics: nextMetrics, analyticsChanged } = parseUpsertEvent(
+          event as MessageEvent<string>
+        )
+        setOrders((current) => upsertVisibleOrder(current, order))
+        setSearchedOrder((current) => (current?.id === order.id ? order : current))
+        if (nextMetrics) setMetrics(nextMetrics)
+        markOrderFlashed(order.id)
+        if (expandedOrderIdRef.current === order.id && order.detailLevel !== 'full') {
+          loadOrderDetailsRef.current(order.id)
+        }
+        if (
+          (analyticsChanged || order.status === 'completed') &&
+          me.analyticsConfigured
+        ) {
+          void loadVolumeAnalyticsRef
+            .current()
+            .catch((loadError) => setError(errorMessage(loadError)))
+        }
+      } catch (streamError) {
+        rejectStreamEvent(streamError)
+      }
+    })
+    source.addEventListener('remove', (event) => {
+      try {
+        const { id, metrics: nextMetrics, analyticsChanged } = parseRemoveEvent(
+          event as MessageEvent<string>
+        )
+        setOrders((current) => current.filter((order) => order.id !== id))
+        setSearchedOrder((current) => (current?.id === id ? null : current))
+        if (nextMetrics) setMetrics(nextMetrics)
+        if (analyticsChanged && me.analyticsConfigured) {
+          void loadVolumeAnalyticsRef
+            .current()
+            .catch((loadError) => setError(errorMessage(loadError)))
+        }
+      } catch (streamError) {
+        rejectStreamEvent(streamError)
+      }
+    })
+    source.addEventListener('metrics', (event) => {
+      try {
+        const { metrics: nextMetrics, analyticsChanged } = parseMetricsEvent(
+          event as MessageEvent<string>
+        )
+        if (nextMetrics) setMetrics(nextMetrics)
+        if (analyticsChanged && me.analyticsConfigured) {
+          void loadVolumeAnalyticsRef
+            .current()
+            .catch((loadError) => setError(errorMessage(loadError)))
+        }
+      } catch (streamError) {
+        rejectStreamEvent(streamError)
+      }
     })
     source.addEventListener('error', () => {
       setStreamState(source.readyState === EventSource.CLOSED ? 'closed' : 'error')
@@ -278,7 +516,14 @@ export function App() {
       source.close()
       setStreamState('closed')
     }
-  }, [markOrderFlashed, me?.authorized, orderTab])
+  }, [
+    markOrderFlashed,
+    me?.analyticsConfigured,
+    me?.authorized,
+    orderFilter,
+    orderTab,
+    streamRefreshKey
+  ])
 
   useEffect(() => {
     return () => {
@@ -342,17 +587,35 @@ export function App() {
     )
   }
 
+  const displayedOrders = searchedOrder ? [searchedOrder] : orders
+
   return (
     <Shell
       right={
         <UserMenu
           me={me}
           streamState={streamState}
-          onRefresh={() => void loadOrders()}
+          onRefresh={refreshOrderStream}
         />
       }
     >
       <main className="dashboard">
+        {me.analyticsConfigured ? (
+          <VolumePanel
+            analytics={volumeAnalytics}
+            window={volumeWindow}
+            bucketSize={volumeBucketSize}
+            orderType={volumeOrderType}
+            customFrom={customVolumeFrom}
+            customTo={customVolumeTo}
+            onWindowChange={setVolumeWindow}
+            onCustomFromChange={setCustomVolumeFrom}
+            onCustomToChange={setCustomVolumeTo}
+            onBucketSizeChange={setVolumeBucketSize}
+            onOrderTypeChange={setVolumeOrderType}
+          />
+        ) : null}
+
         <section className="metrics" aria-label="Order metrics">
           <Metric
             icon={<Activity size={18} />}
@@ -382,9 +645,20 @@ export function App() {
               <p>created_at DESC</p>
             </div>
             <div className="table-toolbar-actions">
-              <OrderTabs active={orderTab} onChange={setOrderTab} />
+              <OrderTabs active={orderTab} onChange={changeOrderTab} />
               <StreamBadge state={streamState} />
             </div>
+          </div>
+
+          <div className="table-controls">
+            <OrderSearch
+              value={searchInput}
+              active={Boolean(searchedOrder)}
+              onChange={setSearchInput}
+              onSearch={searchOrder}
+              onClear={clearSearch}
+            />
+            <OrderFilterButtons active={orderFilter} onChange={changeOrderFilter} />
           </div>
 
           <div className="table-scroll">
@@ -395,33 +669,30 @@ export function App() {
                   <th>Created</th>
                   <th>Order</th>
                   <th>Route</th>
-                  <th>Kind</th>
+                  <th>{orderTab === 'limit_order' ? 'Limit State' : 'Kind'}</th>
                   <th>Quote</th>
                   <th>Executed</th>
-                  <th>Status</th>
+                  <th>{orderTab === 'limit_order' ? 'Backend Status' : 'Status'}</th>
                   <th>Venue Progress</th>
                 </tr>
               </thead>
               <tbody>
-                {orders.length === 0 ? (
+                {displayedOrders.length === 0 ? (
                   <tr>
                     <td className="empty" colSpan={9}>
                       No orders found
                     </td>
                   </tr>
                 ) : (
-                  orders.map((order) => (
+                  displayedOrders.map((order) => (
                     <OrderRows
                       key={order.id}
                       order={order}
                       expanded={expandedOrderId === order.id}
+                      loadingDetails={detailLoadingOrderIds.has(order.id)}
                       flashing={flashingOrderIds.has(order.id)}
                       copied={copiedOrderId === order.id}
-                      onToggle={() =>
-                        setExpandedOrderId((current) =>
-                          current === order.id ? null : order.id
-                        )
-                      }
+                      onToggle={() => toggleOrderExpansion(order)}
                       onCopyOrderId={() => void copyOrderId(order.id)}
                     />
                   ))
@@ -430,14 +701,16 @@ export function App() {
             </table>
           </div>
           <div ref={loadMoreRef} className="pagination-sentinel">
-            {loadingMore ? (
+            {searchedOrder ? (
+              <span>Search result</span>
+            ) : loadingMore ? (
               <>
                 <RefreshCw size={15} className="spin" />
                 <span>Loading older orders</span>
               </>
             ) : nextCursor ? (
               <span>Older orders available</span>
-            ) : orders.length > 0 ? (
+            ) : displayedOrders.length > 0 ? (
               <span>End of orders</span>
             ) : null}
           </div>
@@ -619,6 +892,259 @@ function OrderTabs({
   )
 }
 
+function OrderSearch({
+  value,
+  active,
+  onChange,
+  onSearch,
+  onClear
+}: {
+  value: string
+  active: boolean
+  onChange: (value: string) => void
+  onSearch: () => void
+  onClear: () => void
+}) {
+  return (
+    <form
+      className={`order-search ${active ? 'active' : ''}`}
+      onSubmit={(event) => {
+        event.preventDefault()
+        void onSearch()
+      }}
+    >
+      <Search size={15} />
+      <input
+        value={value}
+        placeholder="Search order ID"
+        spellCheck={false}
+        onChange={(event) => onChange(event.target.value)}
+      />
+      {value || active ? (
+        <button type="button" className="search-clear" onClick={onClear} aria-label="Clear search">
+          <X size={14} />
+        </button>
+      ) : null}
+      <button type="submit">Search</button>
+    </form>
+  )
+}
+
+function OrderFilterButtons({
+  active,
+  onChange
+}: {
+  active: OrderLifecycleFilter
+  onChange: (filter: OrderLifecycleFilter) => void
+}) {
+  return (
+    <div className="filter-buttons" aria-label="Order filters">
+      {ORDER_FILTERS.map((filter) => (
+        <button
+          key={filter.value}
+          type="button"
+          className={active === filter.value ? 'active' : undefined}
+          onClick={() => onChange(filter.value)}
+        >
+          {filter.label}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+function VolumePanel({
+  analytics,
+  window,
+  bucketSize,
+  orderType,
+  customFrom,
+  customTo,
+  onWindowChange,
+  onCustomFromChange,
+  onCustomToChange,
+  onBucketSizeChange,
+  onOrderTypeChange
+}: {
+  analytics: VolumeAnalyticsResponse | null
+  window: VolumeWindow
+  bucketSize: VolumeBucketSize
+  orderType: VolumeOrderTypeFilter
+  customFrom: string
+  customTo: string
+  onWindowChange: (value: VolumeWindow) => void
+  onCustomFromChange: (value: string) => void
+  onCustomToChange: (value: string) => void
+  onBucketSizeChange: (value: VolumeBucketSize) => void
+  onOrderTypeChange: (value: VolumeOrderTypeFilter) => void
+}) {
+  const points = analytics?.buckets ?? []
+  const totalUsdMicro = points.reduce(
+    (sum, bucket) => sum + BigInt(bucket.volumeUsdMicro),
+    0n
+  )
+
+  return (
+    <section className="volume-panel" aria-label="Completed volume">
+      <div className="volume-header">
+        <div>
+          <span className="section-kicker">
+            <BarChart3 size={15} />
+            Completed Volume
+          </span>
+          <strong>{formatUsdMicro(totalUsdMicro.toString())}</strong>
+        </div>
+        <div className="volume-controls">
+          <SegmentedControl
+            label="Window"
+            value={window}
+            options={VOLUME_WINDOWS}
+            onChange={onWindowChange}
+          />
+          {window === 'custom' ? (
+            <div className="custom-volume-window">
+              <input
+                type="datetime-local"
+                value={customFrom}
+                onChange={(event) => onCustomFromChange(event.target.value)}
+                aria-label="Volume from"
+              />
+              <span>to</span>
+              <input
+                type="datetime-local"
+                value={customTo}
+                onChange={(event) => onCustomToChange(event.target.value)}
+                aria-label="Volume to"
+              />
+            </div>
+          ) : null}
+          <select
+            value={bucketSize}
+            onChange={(event) =>
+              onBucketSizeChange(event.target.value as VolumeBucketSize)
+            }
+            aria-label="Volume bucket size"
+          >
+            <option value="minute">Minute</option>
+            <option value="hour">Hour</option>
+            <option value="day">Day</option>
+          </select>
+          <select
+            value={orderType}
+            onChange={(event) =>
+              onOrderTypeChange(event.target.value as VolumeOrderTypeFilter)
+            }
+            aria-label="Volume order type"
+          >
+            <option value="all">All Orders</option>
+            <option value="market_order">Market</option>
+            <option value="limit_order">Limit</option>
+          </select>
+        </div>
+      </div>
+      <VolumeChart analytics={analytics} />
+    </section>
+  )
+}
+
+function SegmentedControl<T extends string>({
+  label,
+  value,
+  options,
+  onChange
+}: {
+  label: string
+  value: T
+  options: ReadonlyArray<{ value: T; label: string }>
+  onChange: (value: T) => void
+}) {
+  return (
+    <div className="segmented-control" aria-label={label}>
+      {options.map((option) => (
+        <button
+          key={option.value}
+          type="button"
+          className={value === option.value ? 'active' : undefined}
+          onClick={() => onChange(option.value)}
+        >
+          {option.label}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+function VolumeChart({
+  analytics
+}: {
+  analytics: VolumeAnalyticsResponse | null
+}) {
+  if (!analytics) {
+    return <div className="volume-empty">Loading volume buckets</div>
+  }
+
+  const buckets = normalizedVolumeBuckets(analytics)
+  if (buckets.length === 0) {
+    return <div className="volume-empty">No completed volume in this window</div>
+  }
+
+  const width = 720
+  const height = 176
+  const padding = { top: 18, right: 18, bottom: 24, left: 48 }
+  const chartWidth = width - padding.left - padding.right
+  const chartHeight = height - padding.top - padding.bottom
+  const maxVolumeUsdMicro = buckets.reduce(
+    (max, bucket) =>
+      bucket.volumeUsdMicro > max ? bucket.volumeUsdMicro : max,
+    0n
+  )
+  const maxVolume = maxVolumeUsdMicro > 0n ? maxVolumeUsdMicro : 1n
+  const barGap = 3
+  const barWidth = Math.max(chartWidth / buckets.length - barGap, 1)
+
+  return (
+    <div className="volume-chart-wrap">
+      <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Volume chart">
+        <line
+          x1={padding.left}
+          y1={height - padding.bottom}
+          x2={width - padding.right}
+          y2={height - padding.bottom}
+          className="volume-axis"
+        />
+        <text x={padding.left} y={14} className="volume-axis-label">
+          {formatUsdMicro(maxVolume.toString())}
+        </text>
+        {buckets.map((bucket, index) => {
+          const barHeight = volumeBarHeight(
+            bucket.volumeUsdMicro,
+            maxVolume,
+            chartHeight
+          )
+          const x = padding.left + index * (barWidth + barGap)
+          const y = height - padding.bottom - barHeight
+          return (
+            <rect
+              key={bucket.bucketStart}
+              className="volume-bar"
+              x={x}
+              y={y}
+              width={barWidth}
+              height={barHeight}
+              rx={3}
+            >
+              <title>
+                {formatDate(bucket.bucketStart)} ·{' '}
+                {formatUsdMicro(bucket.volumeUsdMicro.toString())}
+              </title>
+            </rect>
+          )
+        })}
+      </svg>
+    </div>
+  )
+}
+
 function Metric({
   icon,
   label,
@@ -647,6 +1173,7 @@ function Metric({
 function OrderRows({
   order,
   expanded,
+  loadingDetails,
   flashing,
   copied,
   onToggle,
@@ -654,6 +1181,7 @@ function OrderRows({
 }: {
   order: OrderFirehoseRow
   expanded: boolean
+  loadingDetails: boolean
   flashing: boolean
   copied: boolean
   onToggle: () => void
@@ -688,7 +1216,11 @@ function OrderRows({
           <RouteCell order={order} />
         </td>
         <td>
-          <span className="kind-pill">{formatKind(order.orderKind)}</span>
+          {order.orderType === 'limit_order' ? (
+            <LimitStateCell order={order} />
+          ) : (
+            <span className="kind-pill">{formatKind(order.orderKind)}</span>
+          )}
         </td>
         <td>
           <QuoteCell order={order} />
@@ -706,11 +1238,36 @@ function OrderRows({
       {expanded ? (
         <tr className="details-row">
           <td colSpan={9}>
-            <OrderDetails order={order} />
+            {loadingDetails ? <DetailsLoading /> : <OrderDetails order={order} />}
           </td>
         </tr>
       ) : null}
     </>
+  )
+}
+
+function DetailsLoading() {
+  return (
+    <div className="details-loading">
+      <RefreshCw size={16} className="spin" />
+      <span>Loading order details</span>
+    </div>
+  )
+}
+
+function LimitStateCell({ order }: { order: OrderFirehoseRow }) {
+  const limitStatus = order.limitStatus
+  if (!limitStatus) {
+    return <span className="kind-pill">{formatKind(order.orderKind)}</span>
+  }
+
+  return (
+    <div className="limit-state">
+      <span className={`limit-state-pill ${limitStatus.tone}`}>
+        {limitStatus.label}
+      </span>
+      {limitStatus.detail ? <em>{limitStatus.detail}</em> : null}
+    </div>
   )
 }
 
@@ -739,7 +1296,7 @@ function AssetLabel({ asset }: { asset: AssetRef }) {
         <a
           href={addressUrl}
           target="_blank"
-          rel="noreferrer"
+          rel="noopener noreferrer"
           onClick={(event) => event.stopPropagation()}
         >
           {assetCode}
@@ -798,7 +1355,7 @@ function ExplorerValue({
       href={url}
       title={value}
       target="_blank"
-      rel="noreferrer"
+      rel="noopener noreferrer"
       onClick={(event) => event.stopPropagation()}
     >
       <code>{label}</code>
@@ -1314,7 +1871,7 @@ function TimelineLinkedValue({
       href={url}
       title={value}
       target="_blank"
-      rel="noreferrer"
+      rel="noopener noreferrer"
       onClick={(event) => event.stopPropagation()}
     >
       {label}
@@ -1576,7 +2133,7 @@ function quoteFlowLegs(order: OrderFirehoseRow): QuoteFlowLeg[] {
   })
 }
 
-function timelineLegs(order: OrderFirehoseRow): TimelineLeg[] {
+export function timelineLegs(order: OrderFirehoseRow): TimelineLeg[] {
   const stepsByLegId = new Map<string, OrderExecutionStep[]>()
   for (const step of order.executionSteps) {
     if (!step.executionLegId) continue
@@ -1596,7 +2153,7 @@ function timelineLegs(order: OrderFirehoseRow): TimelineLeg[] {
       .map((leg) => {
         const steps = stepsByLegId.get(leg.id) ?? []
         const quoteValuation = quoteUsdValuationForExecutionLeg(order, leg)
-        const executedInput = leg.actualAmountIn ?? (leg.status === 'completed' ? leg.amountIn : undefined)
+        const executedInput = leg.actualAmountIn
         const executedOutput = leg.actualAmountOut
         return {
           key: leg.id,
@@ -1623,21 +2180,22 @@ function timelineLegs(order: OrderFirehoseRow): TimelineLeg[] {
               'minOutput'
             ]),
           executedInputUsd: executedInput
-            ? valuationForAmount(executedInput, leg.input, leg.usdValuation, [
-                'actualInput',
-                'plannedInput'
-              ]) ?? valuationForAmount(executedInput, leg.input, quoteValuation, ['input'])
+            ? valuationForAmount(
+                executedInput,
+                leg.input,
+                leg.usdValuation,
+                ['actualInput'],
+                { allowDerived: false }
+              )
             : undefined,
           executedOutputUsd: executedOutput
-            ? valuationForAmount(executedOutput, leg.output, leg.usdValuation, [
-                'actualOutput',
-                'plannedOutput',
-                'plannedMinOutput'
-              ]) ??
-              valuationForAmount(executedOutput, leg.output, quoteValuation, [
-                'output',
-                'minOutput'
-              ])
+            ? valuationForAmount(
+                executedOutput,
+                leg.output,
+                leg.usdValuation,
+                ['actualOutput'],
+                { allowDerived: false }
+              )
             : undefined,
           minAmountOut: leg.minAmountOut,
           updatedAt: leg.updatedAt,
@@ -1816,8 +2374,7 @@ function isReferenceLike(value: string) {
   return (
     isEvmAddress(value) ||
     isBitcoinTxHash(value) ||
-    value.toLowerCase().startsWith('bc1') ||
-    /^[13][a-km-zA-HJ-NP-Z1-9]{25,34}$/.test(value)
+    isBitcoinAddressLike(value)
   )
 }
 
@@ -1939,7 +2496,7 @@ function stepAddressChain(
       ? step.output?.chainId ?? step.input?.chainId
       : step.input?.chainId ?? step.output?.chainId
   }
-  if (value.toLowerCase().startsWith('bc1') || /^[13][a-km-zA-HJ-NP-Z1-9]{25,34}$/.test(value)) {
+  if (isBitcoinAddressLike(value)) {
     return 'bitcoin'
   }
   return side === 'recipient'
@@ -1986,7 +2543,7 @@ type ExecutedAmounts =
       placeholder: string
     }
 
-function executedAmounts(order: OrderFirehoseRow): ExecutedAmounts {
+export function executedAmounts(order: OrderFirehoseRow): ExecutedAmounts {
   if (order.status !== 'completed') {
     return {
       placeholder: order.executionLegs.length === 0 ? 'Not created yet' : 'Not done yet'
@@ -2007,7 +2564,7 @@ function executedAmounts(order: OrderFirehoseRow): ExecutedAmounts {
 
   const inputAsset = firstLeg.input
   const outputAsset = lastLeg.output
-  const inputAmount = firstLeg.actualAmountIn ?? firstLeg.amountIn
+  const inputAmount = firstLeg.actualAmountIn
   const outputAmount = lastLeg.actualAmountOut
 
   if (!inputAsset || !outputAsset || !inputAmount || !outputAmount) {
@@ -2019,25 +2576,25 @@ function executedAmounts(order: OrderFirehoseRow): ExecutedAmounts {
       amount: inputAmount,
       asset: inputAsset,
       usdValuation:
-        valuationForAmount(inputAmount, inputAsset, firstLeg.usdValuation, [
-          'actualInput',
-          'plannedInput'
-        ]) ??
-        valuationForAmount(inputAmount, inputAsset, order.quoteUsdValuation, ['input'])
+        valuationForAmount(
+          inputAmount,
+          inputAsset,
+          firstLeg.usdValuation,
+          ['actualInput'],
+          { allowDerived: false }
+        )
     },
     output: {
       amount: outputAmount,
       asset: outputAsset,
       usdValuation:
-        valuationForAmount(outputAmount, outputAsset, lastLeg.usdValuation, [
-          'actualOutput',
-          'plannedOutput',
-          'plannedMinOutput'
-        ]) ??
-        valuationForAmount(outputAmount, outputAsset, order.quoteUsdValuation, [
-          'output',
-          'minOutput'
-        ])
+        valuationForAmount(
+          outputAmount,
+          outputAsset,
+          lastLeg.usdValuation,
+          ['actualOutput'],
+          { allowDerived: false }
+        )
     }
   }
 }
@@ -2046,13 +2603,19 @@ function valuationForAmount(
   amount: string,
   asset: AssetRef,
   valuation: UsdValuation | undefined,
-  preferredKeys: string[]
+  preferredKeys: string[],
+  options: { allowDerived?: boolean } = {}
 ): UsdAmountValuation | undefined {
   const amounts = valuation?.amounts
   if (!amounts) return undefined
   const preferred = preferredKeys
     .map((key) => amounts[key])
     .filter((candidate): candidate is UsdAmountValuation => Boolean(candidate))
+  if (options.allowDerived === false) {
+    return preferred.find(
+      (candidate) => candidate.raw === amount && sameAsset(candidate.asset, asset)
+    )
+  }
   const candidates = [
     ...preferred,
     ...Object.values(amounts).filter(
@@ -2214,12 +2777,38 @@ function isBitcoinTxHash(value: string) {
   return /^[0-9a-fA-F]{64}$/.test(value)
 }
 
+function isBitcoinAddressLike(value: string) {
+  const normalized = value.toLowerCase()
+  return (
+    normalized.startsWith('bc1') ||
+    normalized.startsWith('tb1') ||
+    normalized.startsWith('bcrt1') ||
+    /^[123mn2][a-km-zA-HJ-NP-Z1-9]{25,34}$/.test(value)
+  )
+}
+
+function isUuid(value: string) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+    value
+  )
+}
+
 function sortOrders(nextOrders: OrderFirehoseRow[]) {
   return [...nextOrders].sort(compareOrdersByCreatedAt)
 }
 
 function upsertOrder(current: OrderFirehoseRow[], order: OrderFirehoseRow) {
   return mergeOrders(current, [order])
+}
+
+function upsertVisibleOrder(current: OrderFirehoseRow[], order: OrderFirehoseRow) {
+  const existing = current.find((candidate) => candidate.id === order.id)
+  if (existing || current.length === 0) return upsertOrder(current, order)
+
+  const oldestVisible = current[current.length - 1]
+  if (compareOrdersByCreatedAt(order, oldestVisible) > 0) return current
+
+  return upsertOrder(current, order)
 }
 
 function mergeOrders(current: OrderFirehoseRow[], incoming: OrderFirehoseRow[]) {
@@ -2236,9 +2825,26 @@ function preferredOrder(
   incoming: OrderFirehoseRow
 ) {
   if (!existing) return incoming
-  return Date.parse(incoming.updatedAt) >= Date.parse(existing.updatedAt)
-    ? incoming
-    : existing
+  const incomingUpdatedAt = Date.parse(incoming.updatedAt)
+  const existingUpdatedAt = Date.parse(existing.updatedAt)
+  if (incomingUpdatedAt < existingUpdatedAt) {
+    return existing
+  }
+  if (
+    existing.detailLevel === 'full' &&
+    incoming.detailLevel !== 'full' &&
+    incomingUpdatedAt === existingUpdatedAt
+  ) {
+    return {
+      ...incoming,
+      detailLevel: 'full' as const,
+      providerQuote: existing.providerQuote,
+      executionLegs: existing.executionLegs,
+      executionSteps: existing.executionSteps,
+      providerOperations: existing.providerOperations
+    }
+  }
+  return incoming
 }
 
 function compareOrdersByCreatedAt(a: OrderFirehoseRow, b: OrderFirehoseRow) {
@@ -2316,6 +2922,138 @@ function formatWholeNumber(value: string) {
   return value.replace(/\B(?=(\d{3})+(?!\d))/g, ',')
 }
 
+export function normalizedVolumeBuckets(analytics: VolumeAnalyticsResponse) {
+  const bucketsByStart = new Map(
+    analytics.buckets.map((bucket) => [bucket.bucketStart, bucket])
+  )
+  const starts = bucketStarts(
+    new Date(analytics.from),
+    new Date(analytics.to),
+    analytics.bucketSize,
+    MAX_VOLUME_CHART_BUCKETS
+  )
+
+  const buckets = starts
+    ? starts.map((bucketStart) => {
+        const key = bucketStart.toISOString()
+        const bucket = bucketsByStart.get(key)
+        return {
+          bucketStart: key,
+          volumeUsdMicro: bucket ? BigInt(bucket.volumeUsdMicro) : 0n,
+          orderCount: bucket?.orderCount ?? 0
+        }
+      })
+    : analytics.buckets
+        .map((bucket) => ({
+          bucketStart: bucket.bucketStart,
+          volumeUsdMicro: BigInt(bucket.volumeUsdMicro),
+          orderCount: bucket.orderCount
+        }))
+        .sort((left, right) => left.bucketStart.localeCompare(right.bucketStart))
+
+  return downsampleVolumeBuckets(buckets, MAX_VOLUME_CHART_BUCKETS)
+}
+
+function bucketStarts(
+  from: Date,
+  to: Date,
+  bucketSize: VolumeBucketSize,
+  maxBuckets: number
+) {
+  const starts: Date[] = []
+  const cursor = alignDateToBucket(from, bucketSize)
+  while (cursor < to) {
+    if (starts.length >= maxBuckets) return undefined
+    starts.push(new Date(cursor))
+    if (bucketSize === 'minute') cursor.setUTCMinutes(cursor.getUTCMinutes() + 1)
+    if (bucketSize === 'hour') cursor.setUTCHours(cursor.getUTCHours() + 1)
+    if (bucketSize === 'day') cursor.setUTCDate(cursor.getUTCDate() + 1)
+  }
+  return starts
+}
+
+function downsampleVolumeBuckets(
+  buckets: Array<{
+    bucketStart: string
+    volumeUsdMicro: bigint
+    orderCount: number
+  }>,
+  maxBuckets: number
+) {
+  if (buckets.length <= maxBuckets) return buckets
+
+  const chunkSize = Math.ceil(buckets.length / maxBuckets)
+  const downsampled: Array<{
+    bucketStart: string
+    volumeUsdMicro: bigint
+    orderCount: number
+  }> = []
+  for (let index = 0; index < buckets.length; index += chunkSize) {
+    const chunk = buckets.slice(index, index + chunkSize)
+    downsampled.push({
+      bucketStart: chunk[0].bucketStart,
+      volumeUsdMicro: chunk.reduce(
+        (sum, bucket) => sum + bucket.volumeUsdMicro,
+        0n
+      ),
+      orderCount: chunk.reduce((sum, bucket) => sum + bucket.orderCount, 0)
+    })
+  }
+  return downsampled
+}
+
+export function volumeBarHeight(
+  volumeUsdMicro: bigint,
+  maxVolumeUsdMicro: bigint,
+  chartHeight: number
+) {
+  if (volumeUsdMicro <= 0n || maxVolumeUsdMicro <= 0n) return 0
+  const scale = 10_000n
+  const scaledRatio = (volumeUsdMicro * scale) / maxVolumeUsdMicro
+  return (Number(scaledRatio) / Number(scale)) * chartHeight
+}
+
+function alignDateToBucket(value: Date, bucketSize: VolumeBucketSize) {
+  const aligned = new Date(value)
+  aligned.setUTCSeconds(0, 0)
+  if (bucketSize === 'hour' || bucketSize === 'day') aligned.setUTCMinutes(0)
+  if (bucketSize === 'day') aligned.setUTCHours(0)
+  return aligned
+}
+
+function volumeDateRange(
+  window: VolumeWindow,
+  customFrom?: string,
+  customTo?: string
+) {
+  if (window === 'custom') {
+    const from = customFrom ? new Date(customFrom) : hoursAgo(24)
+    const to = customTo ? new Date(customTo) : new Date()
+    if (Number.isFinite(from.getTime()) && Number.isFinite(to.getTime()) && from < to) {
+      return { from, to }
+    }
+  }
+
+  const to = new Date()
+  const from = new Date(to)
+  if (window === '24h') from.setUTCHours(from.getUTCHours() - 24)
+  if (window === '7d') from.setUTCDate(from.getUTCDate() - 7)
+  if (window === '30d') from.setUTCDate(from.getUTCDate() - 30)
+  if (window === '90d') from.setUTCDate(from.getUTCDate() - 90)
+  return { from, to }
+}
+
+function hoursAgo(hours: number) {
+  const date = new Date()
+  date.setHours(date.getHours() - hours)
+  return date
+}
+
+function datetimeLocalValue(value: Date) {
+  const offsetMs = value.getTimezoneOffset() * 60_000
+  return new Date(value.getTime() - offsetMs).toISOString().slice(0, 16)
+}
+
 function shortId(value: string) {
   if (value.length <= 14) return value
   return `${value.slice(0, 8)}...${value.slice(-6)}`
@@ -2334,6 +3072,7 @@ function statusTone(status: string) {
       'expired',
       'cancelled',
       'refund_required',
+      'manual_intervention_required',
       'refund_manual_intervention_required'
     ].includes(status)
   ) {

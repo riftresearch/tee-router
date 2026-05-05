@@ -1,7 +1,10 @@
 import { OpenAPIHono } from '@hono/zod-openapi'
+import { bodyLimit } from 'hono/body-limit'
 import { cors } from 'hono/cors'
+import { HTTPException } from 'hono/http-exception'
 
 import { type GatewayConfig, loadConfig } from './config'
+import { errorBody } from './errors'
 import {
   createOrderCancelHandler,
   createOrderMarketHandler,
@@ -17,14 +20,46 @@ import {
   healthRoute
 } from './routes/health'
 import { createQuoteHandler, quoteRoute } from './routes/quote'
+import { logError } from './internal/logging'
+
+export const MAX_GATEWAY_JSON_BODY_BYTES = 16 * 1024
 
 export function createApp(
   config: GatewayConfig = loadConfig(),
   deps: GatewayDeps = {}
 ) {
-  const app = new OpenAPIHono()
+  const app = new OpenAPIHono({
+    defaultHook: (result, c) => {
+      if (result.success) return
+
+      const issues = result.error.issues.map((issue) => ({
+        path: issue.path.map(String).join('.'),
+        message: issue.message
+      }))
+      return c.json(
+        errorBody(
+          'VALIDATION_ERROR',
+          issues[0]?.message ?? 'Invalid gateway request',
+          {
+            target: result.target,
+            issues
+          }
+        ),
+        400
+      )
+    }
+  })
   const dependencyHealthMonitor =
     deps.dependencyHealthMonitor ?? createDependencyHealthMonitor(config, deps.fetch)
+
+  app.onError((error, c) => {
+    if (error instanceof HTTPException && error.status === 400) {
+      return c.json(errorBody('VALIDATION_ERROR', error.message), 400)
+    }
+
+    logError('router gateway uncaught request error', error)
+    return c.json(errorBody('BAD_GATEWAY', 'Unexpected gateway error'), 500)
+  })
 
   app.use(
     '*',
@@ -33,6 +68,20 @@ export function createApp(
       allowMethods: ['GET', 'POST', 'OPTIONS'],
       allowHeaders: ['*'],
       exposeHeaders: ['*']
+    })
+  )
+  app.use(
+    '*',
+    bodyLimit({
+      maxSize: MAX_GATEWAY_JSON_BODY_BYTES,
+      onError: (c) =>
+        c.json(
+          errorBody(
+            'PAYLOAD_TOO_LARGE',
+            `request body must be at most ${MAX_GATEWAY_JSON_BODY_BYTES} bytes`
+          ),
+          413
+        )
     })
   )
 

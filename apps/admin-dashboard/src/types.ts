@@ -107,6 +107,22 @@ export type OrderProgress = {
   activeStage?: string
 }
 
+export type LimitOrderStatus = {
+  phase:
+    | 'awaiting_funding'
+    | 'preparing'
+    | 'on_book'
+    | 'filled'
+    | 'completed'
+    | 'refunded'
+    | 'manual_refund'
+    | 'failed'
+    | 'expired'
+  label: string
+  detail?: string
+  tone: 'neutral' | 'success' | 'warning' | 'danger'
+}
+
 export type OrderMetrics = {
   total: number
   active: number
@@ -115,10 +131,12 @@ export type OrderMetrics = {
 
 export type OrderFirehoseRow = {
   id: string
+  detailLevel: 'summary' | 'full'
   orderType: string
   status: string
   createdAt: string
   updatedAt: string
+  fundingTxHash?: string
   source: AssetRef
   destination: AssetRef
   recipientAddress: string
@@ -141,9 +159,34 @@ export type OrderFirehoseRow = {
   executionSteps: OrderExecutionStep[]
   providerOperations: ProviderOperation[]
   progress: OrderProgress
+  limitStatus?: LimitOrderStatus
 }
 
 export type OrderTypeFilter = 'market_order' | 'limit_order'
+export type OrderLifecycleFilter =
+  | 'firehose'
+  | 'in_progress'
+  | 'failed'
+  | 'refunded'
+  | 'manual_refund'
+export type VolumeBucketSize = 'minute' | 'hour' | 'day'
+export type VolumeOrderTypeFilter = 'all' | OrderTypeFilter
+
+export type VolumeBucket = {
+  bucketStart: string
+  bucketSize: VolumeBucketSize
+  orderType: VolumeOrderTypeFilter
+  volumeUsdMicro: string
+  orderCount: number
+}
+
+export type VolumeAnalyticsResponse = {
+  bucketSize: VolumeBucketSize
+  orderType: VolumeOrderTypeFilter
+  from: string
+  to: string
+  buckets: VolumeBucket[]
+}
 
 export type CurrentUser = {
   id: string
@@ -159,6 +202,7 @@ export type MeResponse = {
   user: CurrentUser | null
   allowedEmails: string[]
   routerAdminKeyConfigured?: boolean
+  analyticsConfigured?: boolean
   missingAuthConfig?: string[]
   authMode?: 'google' | 'development_bypass'
 }
@@ -166,13 +210,18 @@ export type MeResponse = {
 export type OrdersResponse = {
   orders: OrderFirehoseRow[]
   nextCursor?: string
-  total: number
-  metrics: OrderMetrics
+  total?: number
+  metrics?: OrderMetrics
   sort: 'created_at_desc'
+}
+
+export type OrderLookupResponse = {
+  order: OrderFirehoseRow
 }
 
 export type SnapshotEvent = {
   orders: OrderFirehoseRow[]
+  nextCursor?: string
   total?: number
   metrics?: OrderMetrics
   sort: 'created_at_desc'
@@ -182,5 +231,21 @@ export type UpsertEvent = {
   order: OrderFirehoseRow
   total?: number
   metrics?: OrderMetrics
+  analyticsChanged?: boolean
   sort: 'created_at_desc'
+}
+
+export type RemoveEvent = {
+  id: string
+  total?: number
+  metrics?: OrderMetrics
+  analyticsChanged?: boolean
+  sort?: 'created_at_desc'
+}
+
+export type MetricsEvent = {
+  total?: number
+  metrics?: OrderMetrics
+  analyticsChanged?: boolean
+  sort?: 'created_at_desc'
 }

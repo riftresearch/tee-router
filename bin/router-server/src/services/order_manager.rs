@@ -24,7 +24,7 @@ use crate::{
         deposit_address::{derive_deposit_address_for_quote, DepositAddressError},
         gas_reimbursement::{
             optimized_paymaster_reimbursement_plan,
-            optimized_paymaster_reimbursement_plan_with_pricing, transition_retention_amount,
+            optimized_paymaster_reimbursement_plan_with_pricing, try_transition_retention_amount,
             GasReimbursementError, GasReimbursementPlan,
         },
         provider_health::ProviderHealthService,
@@ -34,7 +34,7 @@ use crate::{
         },
         route_costs::{rank_transition_paths_structurally, RouteCostService},
         route_minimums::{RouteMinimumError, RouteMinimumService},
-        usd_valuation::{empty_usd_valuation, pricing_has_live_usd_values, quote_usd_valuation},
+        usd_valuation::{empty_usd_valuation, limit_quote_usd_valuation, quote_usd_valuation},
     },
     telemetry,
 };
@@ -63,6 +63,7 @@ const BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_OUTPUTS: usize = 2;
 const BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_BPS: u64 = 12_500;
 const BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_FALLBACK_SATS: u64 = 25_000;
 const PROBE_MAX_AMOUNT_IN: &str = "340282366920938463463374607431768211455";
+const MAX_U256_DECIMAL_DIGITS: usize = 78;
 
 #[derive(Debug, Snafu)]
 pub enum MarketOrderError {
@@ -166,6 +167,8 @@ struct ComposedMarketOrderQuote {
 #[derive(Debug, Clone)]
 struct ComposedLimitOrderQuote {
     pub provider_id: String,
+    pub input_amount: String,
+    pub output_amount: String,
     pub provider_quote: Value,
     pub expires_at: chrono::DateTime<Utc>,
 }
@@ -180,6 +183,18 @@ struct ComposeTransitionPathQuoteRequest<'a> {
     provider_policy_snapshot: Option<&'a crate::services::ProviderPolicySnapshot>,
     provider_health_snapshot: Option<&'a crate::services::ProviderHealthSnapshot>,
     unit: Option<&'a dyn UnitProvider>,
+}
+
+struct ComposeLimitTransitionPathQuoteRequest<'a> {
+    request: &'a NormalizedLimitOrderQuoteRequest,
+    quote_id: Uuid,
+    source_depositor_address: &'a str,
+    path: &'a TransitionPath,
+    limit_index: usize,
+    provider_policy_snapshot: Option<&'a crate::services::ProviderPolicySnapshot>,
+    provider_health_snapshot: Option<&'a crate::services::ProviderHealthSnapshot>,
+    unit: Option<&'a dyn UnitProvider>,
+    exchange: &'a dyn ExchangeProvider,
 }
 
 pub struct OrderManager {
@@ -343,20 +358,24 @@ impl OrderManager {
             .best_limit_order_quote(&normalized_request, quote_id, &depositor_address)
             .await?;
         let now = Utc::now();
-        let quote = LimitOrderQuote {
+        let mut quote = LimitOrderQuote {
             id: quote_id,
             order_id: None,
             source_asset: normalized_request.source_asset,
             destination_asset: normalized_request.destination_asset,
             recipient_address: normalized_request.recipient_address,
             provider_id: provider_quote.provider_id,
-            input_amount: normalized_request.input_amount,
-            output_amount: normalized_request.output_amount,
+            input_amount: provider_quote.input_amount,
+            output_amount: provider_quote.output_amount,
             residual_policy: LimitOrderResidualPolicy::Refund,
             provider_quote: provider_quote.provider_quote,
+            usd_valuation: empty_usd_valuation(),
             expires_at: provider_quote.expires_at,
             created_at: now,
         };
+        let usd_pricing = self.usd_pricing_snapshot().await;
+        quote.usd_valuation =
+            limit_quote_usd_valuation(&self.asset_registry, usd_pricing.as_ref(), &quote);
 
         self.db
             .orders()
@@ -370,12 +389,10 @@ impl OrderManager {
     }
 
     async fn usd_pricing_snapshot(&self) -> Option<crate::services::PricingSnapshot> {
-        let pricing = self
-            .route_costs
+        self.route_costs
             .as_ref()?
-            .current_or_refresh_pricing_snapshot()
-            .await;
-        pricing_has_live_usd_values(&pricing).then_some(pricing)
+            .current_or_refresh_live_pricing_snapshot()
+            .await
     }
 
     pub async fn get_quote(&self, quote_id: Uuid) -> MarketOrderResult<RouterOrderQuote> {
@@ -409,6 +426,7 @@ impl OrderManager {
         match order.status {
             RouterOrderStatus::Refunding
             | RouterOrderStatus::Refunded
+            | RouterOrderStatus::ManualInterventionRequired
             | RouterOrderStatus::RefundManualInterventionRequired => Ok(order.clone()),
             RouterOrderStatus::PendingFunding
             | RouterOrderStatus::Funded
@@ -435,9 +453,8 @@ impl OrderManager {
         match quote {
             RouterOrderQuote::MarketOrder(quote) => {
                 if quote.order_id.is_some() {
-                    let (order, quote) = self
-                        .resume_unvaulted_market_order_from_quote(request, quote)
-                        .await?;
+                    let (order, quote) =
+                        self.resume_market_order_from_quote(request, quote).await?;
                     return Ok((order, quote.into()));
                 }
                 self.create_market_order_from_orderable_quote(request, quote)
@@ -446,9 +463,7 @@ impl OrderManager {
             }
             RouterOrderQuote::LimitOrder(quote) => {
                 if quote.order_id.is_some() {
-                    let (order, quote) = self
-                        .resume_unvaulted_limit_order_from_quote(request, quote)
-                        .await?;
+                    let (order, quote) = self.resume_limit_order_from_quote(request, quote).await?;
                     return Ok((order, quote.into()));
                 }
                 self.create_limit_order_from_orderable_quote(request, quote)
@@ -487,20 +502,28 @@ impl OrderManager {
                 order_kind: market_order_kind_from_quote(&quote)?,
                 slippage_bps: quote.slippage_bps,
             }),
-            action_timeout_at: now + MARKET_ORDER_ACTION_TIMEOUT,
-            idempotency_key: normalize_idempotency_key(request.idempotency_key)?,
+            action_timeout_at: (now + MARKET_ORDER_ACTION_TIMEOUT).min(quote.expires_at),
+            idempotency_key: normalize_idempotency_key(request.idempotency_key.clone())?,
             workflow_trace_id: workflow_trace.trace_id,
             workflow_parent_span_id: workflow_trace.parent_span_id,
             created_at: now,
             updated_at: now,
         };
 
-        let quote = self
+        let result = self
             .db
             .orders()
             .create_market_order_from_quote(&order, quote.id)
-            .await
-            .map_err(MarketOrderError::database)?;
+            .await;
+        let quote = match result {
+            Ok(quote) => quote,
+            Err(RouterServerError::Conflict { .. }) => {
+                return self
+                    .resume_market_order_after_create_conflict(request, quote.id)
+                    .await;
+            }
+            Err(err) => return Err(MarketOrderError::database(err)),
+        };
         telemetry::record_order_workflow_event(&order, "order.created");
 
         Ok((order, quote))
@@ -537,25 +560,33 @@ impl OrderManager {
                 residual_policy: quote.residual_policy,
             }),
             action_timeout_at: now + LIMIT_ORDER_ACTION_TIMEOUT,
-            idempotency_key: normalize_idempotency_key(request.idempotency_key)?,
+            idempotency_key: normalize_idempotency_key(request.idempotency_key.clone())?,
             workflow_trace_id: workflow_trace.trace_id,
             workflow_parent_span_id: workflow_trace.parent_span_id,
             created_at: now,
             updated_at: now,
         };
 
-        let quote = self
+        let result = self
             .db
             .orders()
             .create_limit_order_from_quote(&order, quote.id)
-            .await
-            .map_err(MarketOrderError::database)?;
+            .await;
+        let quote = match result {
+            Ok(quote) => quote,
+            Err(RouterServerError::Conflict { .. }) => {
+                return self
+                    .resume_limit_order_after_create_conflict(request, quote.id)
+                    .await;
+            }
+            Err(err) => return Err(MarketOrderError::database(err)),
+        };
         telemetry::record_order_workflow_event(&order, "order.created");
 
         Ok((order, quote))
     }
 
-    async fn resume_unvaulted_market_order_from_quote(
+    async fn resume_market_order_from_quote(
         &self,
         request: CreateOrderRequest,
         quote: MarketOrderQuote,
@@ -574,9 +605,7 @@ impl OrderManager {
             &order.source_asset.chain,
             &request.refund_address,
         )?;
-        if order.status == RouterOrderStatus::Quoted
-            && order.funding_vault_id.is_none()
-            && order.idempotency_key == requested_idempotency_key
+        if order.idempotency_key == requested_idempotency_key
             && order.refund_address == requested_refund_address
         {
             return Ok((order, quote));
@@ -585,7 +614,27 @@ impl OrderManager {
         Err(MarketOrderError::QuoteAlreadyOrdered)
     }
 
-    async fn resume_unvaulted_limit_order_from_quote(
+    async fn resume_market_order_after_create_conflict(
+        &self,
+        request: CreateOrderRequest,
+        quote_id: Uuid,
+    ) -> MarketOrderResult<(RouterOrder, MarketOrderQuote)> {
+        let quote = self
+            .db
+            .orders()
+            .get_market_order_quote_by_id(quote_id)
+            .await
+            .map_err(MarketOrderError::database)?;
+        if quote.order_id.is_some() {
+            return self.resume_market_order_from_quote(request, quote).await;
+        }
+        if quote.expires_at <= Utc::now() {
+            return Err(MarketOrderError::QuoteExpired);
+        }
+        Err(MarketOrderError::QuoteAlreadyOrdered)
+    }
+
+    async fn resume_limit_order_from_quote(
         &self,
         request: CreateOrderRequest,
         quote: LimitOrderQuote,
@@ -604,14 +653,32 @@ impl OrderManager {
             &order.source_asset.chain,
             &request.refund_address,
         )?;
-        if order.status == RouterOrderStatus::Quoted
-            && order.funding_vault_id.is_none()
-            && order.idempotency_key == requested_idempotency_key
+        if order.idempotency_key == requested_idempotency_key
             && order.refund_address == requested_refund_address
         {
             return Ok((order, quote));
         }
 
+        Err(MarketOrderError::QuoteAlreadyOrdered)
+    }
+
+    async fn resume_limit_order_after_create_conflict(
+        &self,
+        request: CreateOrderRequest,
+        quote_id: Uuid,
+    ) -> MarketOrderResult<(RouterOrder, LimitOrderQuote)> {
+        let quote = self
+            .db
+            .orders()
+            .get_limit_order_quote_by_id(quote_id)
+            .await
+            .map_err(MarketOrderError::database)?;
+        if quote.order_id.is_some() {
+            return self.resume_limit_order_from_quote(request, quote).await;
+        }
+        if quote.expires_at <= Utc::now() {
+            return Err(MarketOrderError::QuoteExpired);
+        }
         Err(MarketOrderError::QuoteAlreadyOrdered)
     }
 
@@ -878,20 +945,29 @@ impl OrderManager {
                 source_canonical,
                 destination_canonical,
             )
-            .expect("path was retained with a limit-order transition");
+            .ok_or_else(|| MarketOrderError::NoRoute {
+                reason: format!(
+                    "retained path {} has no limit-order transition for {} -> {}",
+                    path.id,
+                    source_canonical.as_str(),
+                    destination_canonical.as_str()
+                ),
+            })?;
             for unit in &unit_candidates {
                 for exchange in &exchange_candidates {
                     let candidate = self
                         .compose_limit_transition_path_quote(
-                            request,
-                            quote_id,
-                            source_depositor_address,
-                            &path,
-                            limit_index,
-                            provider_policy_snapshot.as_ref(),
-                            provider_health_snapshot.as_ref(),
-                            unit.as_deref(),
-                            exchange.as_ref(),
+                            ComposeLimitTransitionPathQuoteRequest {
+                                request,
+                                quote_id,
+                                source_depositor_address,
+                                path: &path,
+                                limit_index,
+                                provider_policy_snapshot: provider_policy_snapshot.as_ref(),
+                                provider_health_snapshot: provider_health_snapshot.as_ref(),
+                                unit: unit.as_deref(),
+                                exchange: exchange.as_ref(),
+                            },
                         )
                         .await;
                     match candidate {
@@ -916,22 +992,28 @@ impl OrderManager {
         }))
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn compose_limit_transition_path_quote(
         &self,
-        request: &NormalizedLimitOrderQuoteRequest,
-        quote_id: Uuid,
-        source_depositor_address: &str,
-        path: &TransitionPath,
-        limit_index: usize,
-        provider_policy_snapshot: Option<&crate::services::ProviderPolicySnapshot>,
-        provider_health_snapshot: Option<&crate::services::ProviderHealthSnapshot>,
-        unit: Option<&dyn UnitProvider>,
-        exchange: &dyn ExchangeProvider,
+        spec: ComposeLimitTransitionPathQuoteRequest<'_>,
     ) -> MarketOrderResult<Option<ComposedLimitOrderQuote>> {
+        let ComposeLimitTransitionPathQuoteRequest {
+            request,
+            quote_id,
+            source_depositor_address,
+            path,
+            limit_index,
+            provider_policy_snapshot,
+            provider_health_snapshot,
+            unit,
+            exchange,
+        } = spec;
         let limit_transition = &path.transitions[limit_index];
         let gas_reimbursement_plan = if let Some(route_costs) = self.route_costs.as_ref() {
-            let pricing = route_costs.current_pricing_snapshot().await;
+            let pricing = route_costs
+                .current_or_refresh_live_pricing_snapshot()
+                .await
+                .ok_or(GasReimbursementError::PricingUnavailable)
+                .map_err(MarketOrderError::gas_reimbursement)?;
             optimized_paymaster_reimbursement_plan_with_pricing(
                 self.asset_registry.as_ref(),
                 path,
@@ -939,8 +1021,12 @@ impl OrderManager {
             )
         } else {
             optimized_paymaster_reimbursement_plan(self.asset_registry.as_ref(), path)
-        }
-        .map_err(MarketOrderError::gas_reimbursement)?;
+        };
+        let Some(gas_reimbursement_plan) =
+            gas_reimbursement_plan_or_path_ineligible(gas_reimbursement_plan)?
+        else {
+            return Ok(None);
+        };
 
         let mut expires_at = Utc::now() + ChronoDuration::minutes(10);
         let prefix = TransitionPath {
@@ -951,62 +1037,6 @@ impl OrderManager {
             id: transition_path_id(&path.transitions[limit_index + 1..]),
             transitions: path.transitions[limit_index + 1..].to_vec(),
         };
-
-        let (mut limit_input_amount, mut legs) = if prefix.transitions.is_empty() {
-            (request.input_amount.clone(), Vec::new())
-        } else {
-            let prefix_request = NormalizedMarketOrderQuoteRequest {
-                source_asset: request.source_asset.clone(),
-                destination_asset: limit_transition.input.asset.clone(),
-                recipient_address: self
-                    .quote_address_for_chain(quote_id, &limit_transition.input.asset.chain)?,
-                order_kind: MarketOrderQuoteKind::ExactIn {
-                    amount_in: request.input_amount.clone(),
-                    slippage_bps: 0,
-                },
-            };
-            let prefix_order_kind = MarketOrderKind::ExactIn {
-                amount_in: request.input_amount.clone(),
-                min_amount_out: "1".to_string(),
-            };
-            let quote = self
-                .compose_transition_path_quote(ComposeTransitionPathQuoteRequest {
-                    request: &prefix_request,
-                    order_kind: &prefix_order_kind,
-                    quote_id,
-                    source_depositor_address,
-                    path: &prefix,
-                    gas_reimbursement_plan: Some(&gas_reimbursement_plan),
-                    provider_policy_snapshot,
-                    provider_health_snapshot,
-                    unit,
-                })
-                .await?;
-            let Some(quote) = quote else {
-                return Ok(None);
-            };
-            expires_at = expires_at.min(quote.expires_at);
-            (
-                quote.amount_out,
-                quote_legs_from_provider_quote(&quote.provider_quote)?,
-            )
-        };
-
-        limit_input_amount = apply_transition_retention(
-            &gas_reimbursement_plan,
-            &limit_transition.id,
-            "limit_order.input_amount",
-            &limit_input_amount,
-        )?;
-        if limit_index > 0
-            && path.transitions[limit_index - 1].kind
-                == MarketOrderTransitionKind::HyperliquidBridgeDeposit
-        {
-            limit_input_amount = reserve_hyperliquid_spot_send_quote_gas(
-                "limit_order.input_amount",
-                &limit_input_amount,
-            )?;
-        }
 
         let (limit_output_amount, suffix_legs) = if suffix.transitions.is_empty() {
             (request.output_amount.clone(), Vec::new())
@@ -1031,6 +1061,63 @@ impl OrderManager {
                     quote_id,
                     source_depositor_address,
                     path: &suffix,
+                    gas_reimbursement_plan: Some(&gas_reimbursement_plan),
+                    provider_policy_snapshot,
+                    provider_health_snapshot,
+                    unit,
+                })
+                .await?;
+            let Some(quote) = quote else {
+                return Ok(None);
+            };
+            expires_at = expires_at.min(quote.expires_at);
+            (
+                quote.amount_in,
+                quote_legs_from_provider_quote(&quote.provider_quote)?,
+            )
+        };
+
+        let limit_input_amount = request.input_amount.clone();
+        let mut required_limit_input_amount = add_transition_retention(
+            &gas_reimbursement_plan,
+            &limit_transition.id,
+            "limit_order.required_input_amount",
+            &limit_input_amount,
+        )?;
+        if limit_index > 0
+            && path.transitions[limit_index - 1].kind
+                == MarketOrderTransitionKind::HyperliquidBridgeDeposit
+        {
+            required_limit_input_amount = add_hyperliquid_spot_send_quote_gas_reserve(
+                "limit_order.required_input_amount",
+                &required_limit_input_amount,
+            )?;
+        }
+
+        let (quote_input_amount, mut legs) = if prefix.transitions.is_empty() {
+            (required_limit_input_amount.clone(), Vec::new())
+        } else {
+            let prefix_request = NormalizedMarketOrderQuoteRequest {
+                source_asset: request.source_asset.clone(),
+                destination_asset: limit_transition.input.asset.clone(),
+                recipient_address: self
+                    .quote_address_for_chain(quote_id, &limit_transition.input.asset.chain)?,
+                order_kind: MarketOrderQuoteKind::ExactOut {
+                    amount_out: required_limit_input_amount.clone(),
+                    slippage_bps: 0,
+                },
+            };
+            let prefix_order_kind = MarketOrderKind::ExactOut {
+                amount_out: required_limit_input_amount,
+                max_amount_in: U256::MAX.to_string(),
+            };
+            let quote = self
+                .compose_transition_path_quote(ComposeTransitionPathQuoteRequest {
+                    request: &prefix_request,
+                    order_kind: &prefix_order_kind,
+                    quote_id,
+                    source_depositor_address,
+                    path: &prefix,
                     gas_reimbursement_plan: Some(&gas_reimbursement_plan),
                     provider_policy_snapshot,
                     provider_health_snapshot,
@@ -1085,6 +1172,8 @@ impl OrderManager {
 
         Ok(Some(ComposedLimitOrderQuote {
             provider_id,
+            input_amount: quote_input_amount,
+            output_amount: request.output_amount.clone(),
             provider_quote,
             expires_at,
         }))
@@ -1114,7 +1203,19 @@ impl OrderManager {
         .await
         {
             Ok(Ok(snapshot)) => snapshot,
-            Ok(Err(RouteMinimumError::Unsupported { .. })) => return Ok(()),
+            Ok(Err(RouteMinimumError::Unsupported { reason })) => {
+                if route_has_configured_universal_router_path(
+                    self.asset_registry.as_ref(),
+                    self.action_providers.as_ref(),
+                    &request.source_asset,
+                    &request.destination_asset,
+                ) {
+                    return Err(MarketOrderError::RouteMinimum {
+                        reason: format!("universal-router route minimum unsupported: {reason}"),
+                    });
+                }
+                return Ok(());
+            }
             Ok(Err(err)) => {
                 return Err(MarketOrderError::RouteMinimum {
                     reason: err.to_string(),
@@ -1299,8 +1400,12 @@ impl OrderManager {
         let gas_reimbursement_plan = if let Some(plan) = gas_reimbursement_plan {
             plan.clone()
         } else {
-            if let Some(route_costs) = self.route_costs.as_ref() {
-                let pricing = route_costs.current_pricing_snapshot().await;
+            let planned = if let Some(route_costs) = self.route_costs.as_ref() {
+                let pricing = route_costs
+                    .current_or_refresh_live_pricing_snapshot()
+                    .await
+                    .ok_or(GasReimbursementError::PricingUnavailable)
+                    .map_err(MarketOrderError::gas_reimbursement)?;
                 optimized_paymaster_reimbursement_plan_with_pricing(
                     self.asset_registry.as_ref(),
                     path,
@@ -1308,8 +1413,11 @@ impl OrderManager {
                 )
             } else {
                 optimized_paymaster_reimbursement_plan(self.asset_registry.as_ref(), path)
-            }
-            .map_err(MarketOrderError::gas_reimbursement)?
+            };
+            let Some(plan) = gas_reimbursement_plan_or_path_ineligible(planned)? else {
+                return Ok(None);
+            };
+            plan
         };
 
         match order_kind {
@@ -1782,6 +1890,7 @@ impl OrderManager {
                     required_output = add_transition_retention(
                         &gas_reimbursement_plan,
                         &transition.id,
+                        "amount_in",
                         &required_output,
                     )?;
                 }
@@ -2227,7 +2336,7 @@ impl OrderManager {
                 BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_FALLBACK_SATS
             }
         };
-        let reserved_fee = apply_bps_u64(estimated_fee, BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_BPS)
+        let reserved_fee = apply_bps_u64(estimated_fee, BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_BPS)?
             .max(BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_FALLBACK_SATS);
         Ok(Some(U256::from(reserved_fee)))
     }
@@ -2348,6 +2457,24 @@ fn path_has_configured_provider_set(
             | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => action_providers
                 .bridge(transition.provider.as_str())
                 .is_some(),
+        })
+}
+
+fn route_has_configured_universal_router_path(
+    registry: &AssetRegistry,
+    action_providers: &ActionProviderRegistry,
+    source_asset: &DepositAsset,
+    destination_asset: &DepositAsset,
+) -> bool {
+    registry
+        .select_transition_paths(source_asset, destination_asset, 5)
+        .into_iter()
+        .filter(|path| is_executable_transition_path(registry, path))
+        .filter(|path| path_has_configured_provider_set(action_providers, path))
+        .any(|path| {
+            path.transitions
+                .iter()
+                .any(|transition| transition.kind == MarketOrderTransitionKind::UniversalRouterSwap)
         })
 }
 
@@ -2525,16 +2652,8 @@ fn exchange_quote_transition_legs(
                         provider,
                         input_asset,
                         output_asset,
-                        amount_in: leg
-                            .get("amount_in")
-                            .and_then(Value::as_str)
-                            .unwrap_or(&quote.amount_in)
-                            .to_string(),
-                        amount_out: leg
-                            .get("amount_out")
-                            .and_then(Value::as_str)
-                            .unwrap_or(&quote.amount_out)
-                            .to_string(),
+                        amount_in: required_quote_leg_amount(leg, "amount_in")?,
+                        amount_out: required_quote_leg_amount(leg, "amount_out")?,
                         expires_at: quote.expires_at,
                         raw: leg.clone(),
                     })
@@ -2546,6 +2665,20 @@ fn exchange_quote_transition_legs(
             reason: format!("unsupported exchange quote kind in transition path: {other:?}"),
         }),
     }
+}
+
+fn required_quote_leg_amount(leg: &Value, field: &'static str) -> MarketOrderResult<String> {
+    let Some(amount) = leg.get(field).and_then(Value::as_str) else {
+        return Err(MarketOrderError::NoRoute {
+            reason: format!("hyperliquid cross-token leg missing {field}"),
+        });
+    };
+    if amount.is_empty() {
+        return Err(MarketOrderError::NoRoute {
+            reason: format!("hyperliquid cross-token leg has empty {field}"),
+        });
+    }
+    Ok(amount.to_string())
 }
 
 fn flatten_transition_legs(legs_per_transition: Vec<Vec<QuoteLeg>>) -> Vec<QuoteLeg> {
@@ -2614,6 +2747,23 @@ fn transition_path_quote_blob(
         "legs": legs,
         "gas_reimbursement": gas_reimbursement_plan,
     })
+}
+
+fn gas_reimbursement_plan_or_path_ineligible(
+    result: Result<GasReimbursementPlan, GasReimbursementError>,
+) -> MarketOrderResult<Option<GasReimbursementPlan>> {
+    match result {
+        Ok(plan) => Ok(Some(plan)),
+        Err(
+            GasReimbursementError::NoSettlementSite { .. }
+            | GasReimbursementError::UnsupportedSettlementAsset { .. },
+        ) => Ok(None),
+        Err(
+            err @ (GasReimbursementError::PricingUnavailable
+            | GasReimbursementError::InvalidPlanAmount { .. }
+            | GasReimbursementError::NumericOverflow { .. }),
+        ) => Err(MarketOrderError::gas_reimbursement(err)),
+    }
 }
 
 fn transition_path_id(transitions: &[TransitionDecl]) -> String {
@@ -2721,16 +2871,40 @@ fn subtract_bitcoin_fee_reserve(
             ),
         });
     }
-    Ok(gross.saturating_sub(fee_reserve).to_string())
+    gross
+        .checked_sub(fee_reserve)
+        .ok_or_else(|| MarketOrderError::InvalidAmount {
+            field,
+            reason: format!(
+                "amount minus bitcoin miner fee reserve underflowed for transition {transition_id}"
+            ),
+        })
+        .map(|amount| amount.to_string())
 }
 
 fn add_bitcoin_fee_reserve(amount: &str, fee_reserve: U256) -> MarketOrderResult<String> {
     let amount = parse_amount("amount_in", amount)?;
-    Ok(amount.saturating_add(fee_reserve).to_string())
+    amount
+        .checked_add(fee_reserve)
+        .ok_or_else(|| MarketOrderError::InvalidAmount {
+            field: "amount_in",
+            reason: "amount plus bitcoin miner fee reserve overflowed".to_string(),
+        })
+        .map(|amount| amount.to_string())
 }
 
-fn apply_bps_u64(value: u64, bps: u64) -> u64 {
-    value.saturating_mul(bps).div_ceil(10_000)
+fn apply_bps_u64(value: u64, bps: u64) -> MarketOrderResult<u64> {
+    let numerator = u128::from(value)
+        .checked_mul(u128::from(bps))
+        .and_then(|value| value.checked_add(9_999))
+        .ok_or_else(|| MarketOrderError::InvalidAmount {
+            field: "bps",
+            reason: "basis point multiplication overflowed".to_string(),
+        })?;
+    u64::try_from(numerator / 10_000).map_err(|_| MarketOrderError::InvalidAmount {
+        field: "bps",
+        reason: "basis point result overflowed u64".to_string(),
+    })
 }
 
 fn apply_transition_retention(
@@ -2740,7 +2914,11 @@ fn apply_transition_retention(
     gross_amount: &str,
 ) -> MarketOrderResult<String> {
     let gross = parse_amount(field, gross_amount)?;
-    let retention = transition_retention_amount(plan, transition_id);
+    let retention = try_transition_retention_amount(plan, transition_id).map_err(|source| {
+        MarketOrderError::GasReimbursement {
+            source: Box::new(source),
+        }
+    })?;
     if retention == U256::ZERO {
         return Ok(gross_amount.to_string());
     }
@@ -2753,18 +2931,38 @@ fn apply_transition_retention(
             ),
         });
     }
-    Ok(gross.saturating_sub(retention).to_string())
+    gross
+        .checked_sub(retention)
+        .ok_or_else(|| MarketOrderError::InvalidAmount {
+            field,
+            reason: format!(
+                "amount minus paymaster gas retention underflowed for transition {transition_id}"
+            ),
+        })
+        .map(|amount| amount.to_string())
 }
 
 fn add_transition_retention(
     plan: &GasReimbursementPlan,
     transition_id: &str,
+    field: &'static str,
     amount: &str,
 ) -> MarketOrderResult<String> {
-    let amount = parse_amount("amount_in", amount)?;
-    Ok(amount
-        .saturating_add(transition_retention_amount(plan, transition_id))
-        .to_string())
+    let amount = parse_amount(field, amount)?;
+    let retention = try_transition_retention_amount(plan, transition_id).map_err(|source| {
+        MarketOrderError::GasReimbursement {
+            source: Box::new(source),
+        }
+    })?;
+    amount
+        .checked_add(retention)
+        .ok_or_else(|| MarketOrderError::InvalidAmount {
+            field,
+            reason: format!(
+                "amount plus paymaster gas retention overflowed for transition {transition_id}"
+            ),
+        })
+        .map(|amount| amount.to_string())
 }
 
 fn practical_max_input_for_asset(_asset: &DepositAsset) -> String {
@@ -2825,7 +3023,14 @@ fn reserve_hyperliquid_spot_send_quote_gas(
             ),
         });
     }
-    Ok(amount.saturating_sub(reserve).to_string())
+    amount
+        .checked_sub(reserve)
+        .ok_or_else(|| MarketOrderError::InvalidAmount {
+            field,
+            reason: "amount minus Hyperliquid spot token transfer gas reserve underflowed"
+                .to_string(),
+        })
+        .map(|amount| amount.to_string())
 }
 
 fn add_hyperliquid_spot_send_quote_gas_reserve(
@@ -2833,9 +3038,14 @@ fn add_hyperliquid_spot_send_quote_gas_reserve(
     value: &str,
 ) -> MarketOrderResult<String> {
     let amount = parse_amount(field, value)?;
-    Ok(amount
-        .saturating_add(U256::from(HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW))
-        .to_string())
+    amount
+        .checked_add(U256::from(HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW))
+        .ok_or_else(|| MarketOrderError::InvalidAmount {
+            field,
+            reason: "amount plus Hyperliquid spot token transfer gas reserve overflowed"
+                .to_string(),
+        })
+        .map(|amount| amount.to_string())
 }
 
 fn choose_better_quote(
@@ -2991,8 +3201,15 @@ fn apply_slippage_floor(
 ) -> MarketOrderResult<String> {
     validate_slippage_bps(slippage_bps)?;
     let expected = parse_amount(field, expected_amount)?;
-    let multiplier = U256::from(10_000_u64.saturating_sub(slippage_bps));
-    let bounded = expected.saturating_mul(multiplier) / U256::from(10_000_u64);
+    let multiplier = U256::from(10_000_u64 - slippage_bps);
+    let bounded =
+        expected
+            .checked_mul(multiplier)
+            .ok_or_else(|| MarketOrderError::InvalidAmount {
+                field,
+                reason: "slippage-adjusted amount overflowed".to_string(),
+            })?
+            / U256::from(10_000_u64);
     Ok(if bounded.is_zero() && !expected.is_zero() {
         U256::from(1_u64)
     } else {
@@ -3008,15 +3225,42 @@ fn apply_slippage_ceiling(
 ) -> MarketOrderResult<String> {
     validate_slippage_bps(slippage_bps)?;
     let expected = parse_amount(field, expected_amount)?;
-    let numerator = expected.saturating_mul(U256::from(10_000_u64.saturating_add(slippage_bps)));
-    Ok(div_ceil_u256(numerator, U256::from(10_000_u64)).to_string())
+    let numerator = expected
+        .checked_mul(U256::from(10_000_u64 + slippage_bps))
+        .ok_or_else(|| MarketOrderError::InvalidAmount {
+            field,
+            reason: "slippage-adjusted amount overflowed".to_string(),
+        })?;
+    Ok(div_ceil_u256(field, numerator, U256::from(10_000_u64))?.to_string())
 }
 
-fn div_ceil_u256(numerator: U256, denominator: U256) -> U256 {
-    if numerator.is_zero() {
-        return U256::ZERO;
+fn div_ceil_u256(
+    field: &'static str,
+    numerator: U256,
+    denominator: U256,
+) -> MarketOrderResult<U256> {
+    if denominator.is_zero() {
+        return Err(MarketOrderError::InvalidAmount {
+            field,
+            reason: "division denominator must be greater than zero".to_string(),
+        });
     }
-    numerator.saturating_add(denominator.saturating_sub(U256::from(1_u64))) / denominator
+    if numerator.is_zero() {
+        return Ok(U256::ZERO);
+    }
+    let adjusted = numerator.checked_sub(U256::from(1_u64)).ok_or_else(|| {
+        MarketOrderError::InvalidAmount {
+            field,
+            reason: "ceiling division numerator underflowed".to_string(),
+        }
+    })?;
+    adjusted
+        .checked_div(denominator)
+        .and_then(|quotient| quotient.checked_add(U256::from(1_u64)))
+        .ok_or_else(|| MarketOrderError::InvalidAmount {
+            field,
+            reason: "ceiling division overflowed".to_string(),
+        })
 }
 
 fn validate_positive_amount(field: &'static str, value: &str) -> MarketOrderResult<()> {
@@ -3043,6 +3287,12 @@ fn parse_amount(field: &'static str, value: &str) -> MarketOrderResult<U256> {
             reason: "amount must be a base-unit decimal integer".to_string(),
         });
     }
+    if value.len() > MAX_U256_DECIMAL_DIGITS {
+        return Err(MarketOrderError::InvalidAmount {
+            field,
+            reason: format!("amount cannot exceed {MAX_U256_DECIMAL_DIGITS} decimal digits"),
+        });
+    }
     U256::from_str_radix(value, 10).map_err(|err| MarketOrderError::InvalidAmount {
         field,
         reason: err.to_string(),
@@ -3064,7 +3314,21 @@ fn normalize_idempotency_key(value: Option<String>) -> MarketOrderResult<Option<
             reason: "key cannot exceed 128 bytes".to_string(),
         });
     }
+    if !is_protocol_token(&value) {
+        return Err(MarketOrderError::InvalidIdempotencyKey {
+            reason: "key may only contain letters, numbers, '.', '_', ':', and '-'".to_string(),
+        });
+    }
     Ok(Some(value))
+}
+
+fn is_protocol_token(value: &str) -> bool {
+    value.bytes().all(|byte| {
+        matches!(
+            byte,
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'_' | b':' | b'-'
+        )
+    })
 }
 
 fn fallback_workflow_trace_context(order_id: Uuid) -> observability::WorkflowTraceContext {
@@ -3143,5 +3407,181 @@ mod tests {
         assert_eq!(max_amount_in, PROBE_MAX_AMOUNT_IN);
         assert!(max_amount_in.parse::<u128>().is_ok());
         assert_ne!(max_amount_in, U256::MAX.to_string());
+    }
+
+    #[test]
+    fn amount_parser_rejects_oversized_decimal_strings_before_u256_parse() {
+        let error = parse_amount("amount_in", &"9".repeat(MAX_U256_DECIMAL_DIGITS + 1))
+            .expect_err("oversized amount should fail");
+
+        assert!(matches!(
+            error,
+            MarketOrderError::InvalidAmount {
+                field: "amount_in",
+                ..
+            }
+        ));
+        assert!(error
+            .to_string()
+            .contains("amount cannot exceed 78 decimal digits"));
+    }
+
+    #[test]
+    fn slippage_bounds_reject_overflow_instead_of_saturating() {
+        let floor_error = apply_slippage_floor("amount_in", &U256::MAX.to_string(), 1)
+            .expect_err("floor overflow should fail");
+        let ceiling_error = apply_slippage_ceiling("amount_out", &U256::MAX.to_string(), 1)
+            .expect_err("ceiling overflow should fail");
+
+        assert!(floor_error
+            .to_string()
+            .contains("slippage-adjusted amount overflowed"));
+        assert!(ceiling_error
+            .to_string()
+            .contains("slippage-adjusted amount overflowed"));
+    }
+
+    #[test]
+    fn reserve_additions_reject_overflow_instead_of_saturating() {
+        let plan = GasReimbursementPlan {
+            schema_version: 1,
+            policy: "test".to_string(),
+            quote_safety_multiplier_bps: 10_000,
+            debts: vec![],
+            retention_actions: vec![crate::services::gas_reimbursement::GasRetentionAction {
+                id: "retention-1".to_string(),
+                transition_decl_id: "transition-1".to_string(),
+                settlement_chain_id: "evm:1".to_string(),
+                settlement_asset_id: "native".to_string(),
+                settlement_decimals: 18,
+                settlement_provider_asset: None,
+                amount: "1".to_string(),
+                estimated_usd_micro: "1".to_string(),
+                recipient_role: "paymaster_wallet".to_string(),
+                timing: "before_provider_action".to_string(),
+                debt_ids: vec![],
+            }],
+        };
+
+        assert!(add_bitcoin_fee_reserve(&U256::MAX.to_string(), U256::from(1_u64)).is_err());
+        assert!(add_transition_retention(
+            &plan,
+            "transition-1",
+            "amount_in",
+            &U256::MAX.to_string()
+        )
+        .is_err());
+        assert!(
+            add_hyperliquid_spot_send_quote_gas_reserve("amount_in", &U256::MAX.to_string())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn bps_u64_multiplier_rejects_overflow_instead_of_saturating() {
+        assert_eq!(apply_bps_u64(10_000, 12_500).unwrap(), 12_500);
+
+        let error = apply_bps_u64(u64::MAX, 12_500).unwrap_err();
+        assert!(error.to_string().contains("overflowed u64"));
+    }
+
+    #[test]
+    fn cross_token_quote_legs_require_explicit_amounts() {
+        let quote = ExchangeQuote {
+            provider_id: "hyperliquid".to_string(),
+            amount_in: "100".to_string(),
+            amount_out: "50".to_string(),
+            min_amount_out: None,
+            max_amount_in: None,
+            provider_quote: json!({
+                "kind": "spot_cross_token",
+                "legs": [{
+                    "input_asset": { "chain_id": "hyperliquid", "asset": "native" },
+                    "output_asset": { "chain_id": "hyperliquid", "asset": "UBTC" },
+                    "amount_in": "100"
+                }]
+            }),
+            expires_at: Utc::now(),
+        };
+
+        let error = exchange_quote_transition_legs(
+            "transition-1",
+            MarketOrderTransitionKind::HyperliquidTrade,
+            ProviderId::Hyperliquid,
+            &quote,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("missing amount_out"), "{error}");
+    }
+
+    #[test]
+    fn div_ceil_u256_handles_max_numerator_without_overflow() {
+        let expected = (U256::MAX / U256::from(2_u64)) + U256::from(1_u64);
+        assert_eq!(
+            div_ceil_u256("amount", U256::MAX, U256::from(2_u64)).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn div_ceil_u256_rejects_zero_denominator() {
+        let error = div_ceil_u256("amount", U256::from(1_u64), U256::ZERO).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("division denominator must be greater than zero"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn gas_reimbursement_path_ineligibility_is_not_a_quote_error() {
+        let no_site = gas_reimbursement_plan_or_path_ineligible(Err(
+            GasReimbursementError::NoSettlementSite {
+                debt_ids: vec!["paymaster-gas:0".to_string()],
+            },
+        ))
+        .unwrap();
+        assert!(no_site.is_none());
+
+        let unsupported = gas_reimbursement_plan_or_path_ineligible(Err(
+            GasReimbursementError::UnsupportedSettlementAsset {
+                asset: DepositAsset {
+                    chain: ChainId::parse("hyperliquid").unwrap(),
+                    asset: AssetId::reference("UBTC"),
+                },
+            },
+        ))
+        .unwrap();
+        assert!(unsupported.is_none());
+
+        let pricing = gas_reimbursement_plan_or_path_ineligible(Err(
+            GasReimbursementError::PricingUnavailable,
+        ));
+        assert!(matches!(
+            pricing,
+            Err(MarketOrderError::GasReimbursement { .. })
+        ));
+    }
+
+    #[test]
+    fn order_service_idempotency_keys_are_trimmed_bounded_and_token_shaped() {
+        assert_eq!(
+            normalize_idempotency_key(Some("  order:abc_123.456-789  ".to_string())).unwrap(),
+            Some("order:abc_123.456-789".to_string())
+        );
+        assert!(matches!(
+            normalize_idempotency_key(Some("  ".to_string())),
+            Err(MarketOrderError::InvalidIdempotencyKey { .. })
+        ));
+        assert!(matches!(
+            normalize_idempotency_key(Some("order key/with/slashes".to_string())),
+            Err(MarketOrderError::InvalidIdempotencyKey { .. })
+        ));
+        assert!(matches!(
+            normalize_idempotency_key(Some("a".repeat(129))),
+            Err(MarketOrderError::InvalidIdempotencyKey { .. })
+        ));
     }
 }

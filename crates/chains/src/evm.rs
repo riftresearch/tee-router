@@ -16,6 +16,7 @@ use router_primitives::{
 };
 use snafu::location;
 use std::{
+    fmt,
     future::Future,
     str::FromStr,
     sync::Mutex,
@@ -39,6 +40,7 @@ const EVM_RECEIPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const EVM_RECEIPT_TIMEOUT: Duration = Duration::from_secs(300);
 const EVM_RPC_RETRY_ATTEMPTS: usize = 6;
 const EVM_RPC_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(500);
+const EVM_CALL_ESTIMATE_GAS_CAP: u64 = 1_000_000;
 const WEI_PER_GWEI: f64 = 1_000_000_000.0;
 
 pub struct EvmChain {
@@ -52,10 +54,19 @@ pub struct EvmChain {
     gas_sponsor: Option<EvmGasSponsor>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct EvmGasSponsorConfig {
     pub private_key: String,
     pub vault_gas_buffer_wei: U256,
+}
+
+impl fmt::Debug for EvmGasSponsorConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EvmGasSponsorConfig")
+            .field("private_key", &"<redacted>")
+            .field("vault_gas_buffer_wei", &self.vault_gas_buffer_wei)
+            .finish()
+    }
 }
 
 struct EvmGasSponsor {
@@ -265,7 +276,7 @@ impl EvmChain {
             source: e,
             loc: location!(),
         })?;
-        let max_fee_per_gas = max_fee_per_gas_with_headroom(fee_estimate.max_fee_per_gas);
+        let max_fee_per_gas = max_fee_per_gas_with_headroom(fee_estimate.max_fee_per_gas)?;
         let transaction_request = TransactionRequest::default()
             .with_from(sender)
             .with_to(token_address)
@@ -487,22 +498,24 @@ impl EvmChain {
                         source: e,
                         loc: location!(),
                     })?;
-                let reserved_fee = U256::from(gas_limit).saturating_mul(U256::from(
-                    max_fee_per_gas_with_headroom(fee_estimate.max_fee_per_gas),
-                ));
+                let max_fee_per_gas = max_fee_per_gas_with_headroom(fee_estimate.max_fee_per_gas)?;
+                let reserved_fee =
+                    checked_gas_fee(gas_limit, max_fee_per_gas, "native dump gas reservation")?;
                 if native_balance <= reserved_fee {
                     return Err(crate::Error::DumpToAddress {
                         message: "Insufficient native balance to cover refund gas".to_string(),
                     });
                 }
+                let dump_value =
+                    checked_u256_sub(native_balance, reserved_fee, "native dump transfer value")?;
 
                 let transaction_request = TransactionRequest::default()
                     .with_from(sender_address)
                     .with_to(recipient_address)
-                    .with_value(native_balance.saturating_sub(reserved_fee))
+                    .with_value(dump_value)
                     .with_nonce(self.pending_nonce(sender_address).await?)
                     .with_gas_limit(gas_limit)
-                    .with_max_fee_per_gas(fee_estimate.max_fee_per_gas)
+                    .with_max_fee_per_gas(max_fee_per_gas)
                     .with_max_priority_fee_per_gas(fee_estimate.max_priority_fee_per_gas);
 
                 let pending_tx = wallet_provider
@@ -607,9 +620,14 @@ impl EvmChain {
             source: e,
             loc: location!(),
         })?;
-        let max_fee_per_gas = max_fee_per_gas_with_headroom(fee_estimate.max_fee_per_gas);
-        let reserved_fee = U256::from(gas_limit).saturating_mul(U256::from(max_fee_per_gas));
-        let required_balance = amount.saturating_add(reserved_fee);
+        let max_fee_per_gas = max_fee_per_gas_with_headroom(fee_estimate.max_fee_per_gas)?;
+        let reserved_fee = checked_gas_fee(
+            gas_limit,
+            max_fee_per_gas,
+            "native transfer gas reservation",
+        )?;
+        let required_balance =
+            checked_u256_add(amount, reserved_fee, "native transfer required balance")?;
         let _native_balance = if native_balance < required_balance {
             self.wait_for_native_balance_at_least(
                 sender_address,
@@ -688,8 +706,8 @@ impl EvmChain {
             source: e,
             loc: location!(),
         })?;
-        let max_fee_per_gas = max_fee_per_gas_with_headroom(fee_estimate.max_fee_per_gas);
-        Ok(U256::from(gas_limit).saturating_mul(U256::from(max_fee_per_gas)))
+        let max_fee_per_gas = max_fee_per_gas_with_headroom(fee_estimate.max_fee_per_gas)?;
+        checked_gas_fee(gas_limit, max_fee_per_gas, "native transfer fee estimate")
     }
 
     pub async fn transfer_erc20_amount(
@@ -787,15 +805,15 @@ impl EvmChain {
             .with_from(sender_address)
             .with_to(to_address)
             .with_value(value)
+            .with_gas_limit(EVM_CALL_ESTIMATE_GAS_CAP)
             .with_input(calldata.clone());
-        let gas_limit = retry_evm_rpc(self.chain_type, "estimate_gas", || async {
-            self.provider.estimate_gas(estimate_request.clone()).await
-        })
-        .await
-        .map_err(|e| crate::Error::EVMRpcError {
-            source: e,
-            loc: location!(),
-        })?;
+        let gas_limit = estimate_evm_gas_or_cap(
+            &self.provider,
+            self.chain_type,
+            estimate_request,
+            "evm_call",
+        )
+        .await?;
         let fee_estimate = retry_evm_rpc(self.chain_type, "estimate_eip1559_fees", || async {
             self.provider.estimate_eip1559_fees().await
         })
@@ -804,9 +822,9 @@ impl EvmChain {
             source: e,
             loc: location!(),
         })?;
-        let max_fee_per_gas = max_fee_per_gas_with_headroom(fee_estimate.max_fee_per_gas);
-        let reserved_fee = U256::from(gas_limit).saturating_mul(U256::from(max_fee_per_gas));
-        let required_balance = value.saturating_add(reserved_fee);
+        let max_fee_per_gas = max_fee_per_gas_with_headroom(fee_estimate.max_fee_per_gas)?;
+        let reserved_fee = checked_gas_fee(gas_limit, max_fee_per_gas, "EVM call gas reservation")?;
+        let required_balance = checked_u256_add(value, reserved_fee, "EVM call required balance")?;
         let _native_balance = if native_balance < required_balance {
             self.wait_for_native_balance_at_least(
                 sender_address,
@@ -1399,17 +1417,15 @@ impl EvmPaymasterActor {
             .with_from(vault_address)
             .with_to(target_address)
             .with_value(value)
+            .with_gas_limit(EVM_CALL_ESTIMATE_GAS_CAP)
             .with_input(calldata);
-        let action_gas_limit = retry_evm_rpc(self.chain_type, "estimate_gas", || async {
-            self.provider
-                .estimate_gas(action_estimate_request.clone())
-                .await
-        })
-        .await
-        .map_err(|e| crate::Error::EVMRpcError {
-            source: e,
-            loc: location!(),
-        })?;
+        let action_gas_limit = estimate_evm_gas_or_cap(
+            &self.provider,
+            self.chain_type,
+            action_estimate_request,
+            operation,
+        )
+        .await?;
         record_paymaster_gas_estimate(self.chain_type, operation, action_gas_limit);
         let fee_estimate = retry_evm_rpc(self.chain_type, "estimate_eip1559_fees", || async {
             self.provider.estimate_eip1559_fees().await
@@ -1419,12 +1435,22 @@ impl EvmPaymasterActor {
             source: e,
             loc: location!(),
         })?;
-        let action_max_fee_per_gas = max_fee_per_gas_with_headroom(fee_estimate.max_fee_per_gas);
-        let required_vault_balance = value
-            .saturating_add(
-                U256::from(action_gas_limit).saturating_mul(U256::from(action_max_fee_per_gas)),
-            )
-            .saturating_add(self.vault_gas_buffer_wei);
+        let action_max_fee_per_gas = max_fee_per_gas_with_headroom(fee_estimate.max_fee_per_gas)?;
+        let action_reserved_fee = checked_gas_fee(
+            action_gas_limit,
+            action_max_fee_per_gas,
+            "paymaster action gas reservation",
+        )?;
+        let required_vault_balance = checked_u256_add(
+            value,
+            action_reserved_fee,
+            "paymaster vault required balance",
+        )?;
+        let required_vault_balance = checked_u256_add(
+            required_vault_balance,
+            self.vault_gas_buffer_wei,
+            "paymaster vault gas buffer",
+        )?;
 
         let current_balance = retry_evm_rpc(self.chain_type, "get_balance", || async {
             self.provider.get_balance(vault_address).await
@@ -1447,7 +1473,11 @@ impl EvmPaymasterActor {
             return Ok(None);
         }
 
-        let top_up_amount = required_vault_balance.saturating_sub(current_balance);
+        let top_up_amount = checked_u256_sub(
+            required_vault_balance,
+            current_balance,
+            "paymaster vault top-up amount",
+        )?;
         let sponsor_balance = retry_evm_rpc(self.chain_type, "get_balance", || async {
             self.provider.get_balance(self.sponsor_address).await
         })
@@ -1479,9 +1509,17 @@ impl EvmPaymasterActor {
             source: e,
             loc: location!(),
         })?;
-        let max_fee_per_gas = max_fee_per_gas_with_headroom(fee_estimate.max_fee_per_gas);
-        let reserved_fee = U256::from(gas_limit).saturating_mul(U256::from(max_fee_per_gas));
-        let required_balance = top_up_amount.saturating_add(reserved_fee);
+        let max_fee_per_gas = max_fee_per_gas_with_headroom(fee_estimate.max_fee_per_gas)?;
+        let reserved_fee = checked_gas_fee(
+            gas_limit,
+            max_fee_per_gas,
+            "paymaster top-up gas reservation",
+        )?;
+        let required_balance = checked_u256_add(
+            top_up_amount,
+            reserved_fee,
+            "paymaster sponsor required balance",
+        )?;
         if sponsor_balance < required_balance {
             record_paymaster_funding_failed(self.chain_type, "insufficient_balance");
             return Err(crate::Error::InsufficientBalance {
@@ -1571,7 +1609,8 @@ where
     E: std::fmt::Display,
 {
     let mut delay = EVM_RPC_RETRY_INITIAL_DELAY;
-    for attempt in 1..=EVM_RPC_RETRY_ATTEMPTS {
+    let mut attempt = 1;
+    loop {
         match op().await {
             Ok(value) => return Ok(value),
             Err(err) if attempt < EVM_RPC_RETRY_ATTEMPTS && is_retryable_evm_rpc_error(&err) => {
@@ -1588,6 +1627,7 @@ where
                 );
                 sleep(delay).await;
                 delay = delay.saturating_mul(2);
+                attempt += 1;
             }
             Err(err) => {
                 let error_kind = classify_evm_rpc_error(&err);
@@ -1603,7 +1643,40 @@ where
             }
         }
     }
-    unreachable!("retry loop always returns before exhausting attempts")
+}
+
+async fn estimate_evm_gas_or_cap(
+    provider: &DynProvider,
+    chain_type: ChainType,
+    request: TransactionRequest,
+    operation: &'static str,
+) -> Result<u64> {
+    match retry_evm_rpc(chain_type, "estimate_gas", || async {
+        provider.estimate_gas(request.clone()).await
+    })
+    .await
+    {
+        Ok(gas_limit) => Ok(gas_limit),
+        Err(err) if is_balance_bound_estimate_error(&err) => {
+            warn!(
+                chain = %chain_type.to_db_string(),
+                operation,
+                gas_cap = EVM_CALL_ESTIMATE_GAS_CAP,
+                error = %err,
+                "falling back to capped EVM gas estimate after balance-bound simulation failure"
+            );
+            Ok(EVM_CALL_ESTIMATE_GAS_CAP)
+        }
+        Err(err) => Err(crate::Error::EVMRpcError {
+            source: err,
+            loc: location!(),
+        }),
+    }
+}
+
+fn is_balance_bound_estimate_error<E: std::fmt::Display>(err: &E) -> bool {
+    let message = err.to_string().to_ascii_lowercase();
+    message.contains("insufficient funds") || message.contains("insufficient balance")
 }
 
 fn is_retryable_evm_rpc_error<E: std::fmt::Display>(err: &E) -> bool {
@@ -1719,7 +1792,7 @@ impl EvmChain {
         if !transaction_receipt.status() {
             return Ok(UserDepositCandidateStatus::TransferNotFound);
         }
-        if transaction_receipt.transaction_index.unwrap_or(0) != transfer_index {
+        if !evm_transfer_index_matches(transaction_receipt.transaction_index, transfer_index)? {
             return Ok(UserDepositCandidateStatus::TransferNotFound);
         }
 
@@ -1753,8 +1826,10 @@ impl EvmChain {
                     source: e,
                     loc: location!(),
                 })?;
-        let confirmations =
-            current_block_height.saturating_sub(transaction_receipt.block_number.unwrap());
+        let Some(inclusion_height) = transaction_receipt.block_number else {
+            return Ok(UserDepositCandidateStatus::TxNotFound);
+        };
+        let confirmations = evm_confirmation_count(current_block_height, inclusion_height)?;
 
         Ok(UserDepositCandidateStatus::Verified(VerifiedUserDeposit {
             amount,
@@ -1815,39 +1890,39 @@ impl ChainOperations for EvmChain {
         let tx_hash_parsed = tx_hash.parse().map_err(|_| crate::Error::Serialization {
             message: "Invalid transaction hash".to_string(),
         })?;
-        let receipt = self
-            .provider
-            .get_transaction_receipt(tx_hash_parsed)
-            .await
-            .map_err(|e| crate::Error::EVMRpcError {
-                source: e,
-                loc: location!(),
-            })?;
-        let current_block_height =
-            self.provider
-                .get_block_number()
-                .await
-                .map_err(|e| crate::Error::EVMRpcError {
-                    source: e,
-                    loc: location!(),
-                })?;
+        let receipt = retry_evm_rpc(self.chain_type, "get_transaction_receipt", || async {
+            self.provider.get_transaction_receipt(tx_hash_parsed).await
+        })
+        .await
+        .map_err(|e| crate::Error::EVMRpcError {
+            source: e,
+            loc: location!(),
+        })?;
+        let current_block_height = retry_evm_rpc(self.chain_type, "get_block_number", || async {
+            self.provider.get_block_number().await
+        })
+        .await
+        .map_err(|e| crate::Error::EVMRpcError {
+            source: e,
+            loc: location!(),
+        })?;
 
         if let Some(receipt) = receipt {
-            return Ok(TxStatus::Confirmed(ConfirmedTxStatus {
-                confirmations: current_block_height - receipt.block_number.unwrap(),
-                current_height: current_block_height,
-                inclusion_height: receipt.block_number.unwrap(),
-            }));
+            return evm_tx_status_from_receipt_fields(
+                receipt.status(),
+                receipt.block_number,
+                current_block_height,
+            );
         }
 
-        let pending_tx = self
-            .provider
-            .get_transaction_by_hash(tx_hash_parsed)
-            .await
-            .map_err(|e| crate::Error::EVMRpcError {
-                source: e,
-                loc: location!(),
-            })?;
+        let pending_tx = retry_evm_rpc(self.chain_type, "get_transaction_by_hash", || async {
+            self.provider.get_transaction_by_hash(tx_hash_parsed).await
+        })
+        .await
+        .map_err(|e| crate::Error::EVMRpcError {
+            source: e,
+            loc: location!(),
+        })?;
 
         if pending_tx.is_some() {
             Ok(TxStatus::Pending(PendingTxStatus {
@@ -1877,9 +1952,8 @@ impl ChainOperations for EvmChain {
                 .await;
         }
 
-        let token_address = match &currency.token {
-            TokenIdentifier::Address(address) => address,
-            TokenIdentifier::Native => unreachable!("native deposits are handled above"),
+        let TokenIdentifier::Address(token_address) = &currency.token else {
+            return Ok(UserDepositCandidateStatus::TransferNotFound);
         };
         let token_address =
             Address::from_str(token_address).map_err(|_| crate::Error::Serialization {
@@ -1941,7 +2015,10 @@ impl ChainOperations for EvmChain {
                     source: e,
                     loc: location!(),
                 })?;
-        let confirmations = current_block_height - transaction_receipt.block_number.unwrap();
+        let Some(inclusion_height) = transaction_receipt.block_number else {
+            return Ok(UserDepositCandidateStatus::TxNotFound);
+        };
+        let confirmations = evm_confirmation_count(current_block_height, inclusion_height)?;
 
         Ok(UserDepositCandidateStatus::Verified(VerifiedUserDeposit {
             amount: transfer_log.inner.data.value,
@@ -2035,17 +2112,20 @@ impl ChainOperations for EvmChain {
     }
 
     async fn get_best_hash(&self) -> Result<String> {
-        Ok(hex::encode(
-            self.provider
-                .get_block_by_number(alloy::eips::BlockNumberOrTag::Latest)
-                .await
-                .map_err(|e| crate::Error::EVMRpcError {
-                    source: e,
-                    loc: location!(),
-                })?
-                .unwrap()
-                .hash(),
-        ))
+        let Some(block) = self
+            .provider
+            .get_block_by_number(alloy::eips::BlockNumberOrTag::Latest)
+            .await
+            .map_err(|e| crate::Error::EVMRpcError {
+                source: e,
+                loc: location!(),
+            })?
+        else {
+            return Err(crate::Error::Serialization {
+                message: "latest EVM block missing from RPC response".to_string(),
+            });
+        };
+        Ok(hex::encode(block.hash()))
     }
 }
 
@@ -2059,8 +2139,29 @@ fn extract_all_transfers_from_transaction_receipt(
         .collect()
 }
 
-fn max_fee_per_gas_with_headroom(max_fee_per_gas: u128) -> u128 {
-    max_fee_per_gas.saturating_mul(11).div_ceil(10)
+fn max_fee_per_gas_with_headroom(max_fee_per_gas: u128) -> Result<u128> {
+    max_fee_per_gas
+        .checked_mul(11)
+        .map(|value| value.div_ceil(10))
+        .ok_or(crate::Error::NumericOverflow {
+            context: "EVM max fee per gas headroom",
+        })
+}
+
+fn checked_gas_fee(gas_limit: u64, max_fee_per_gas: u128, context: &'static str) -> Result<U256> {
+    U256::from(gas_limit)
+        .checked_mul(U256::from(max_fee_per_gas))
+        .ok_or(crate::Error::NumericOverflow { context })
+}
+
+fn checked_u256_add(left: U256, right: U256, context: &'static str) -> Result<U256> {
+    left.checked_add(right)
+        .ok_or(crate::Error::NumericOverflow { context })
+}
+
+fn checked_u256_sub(left: U256, right: U256, context: &'static str) -> Result<U256> {
+    left.checked_sub(right)
+        .ok_or(crate::Error::NumericOverflow { context })
 }
 
 fn ensure_evm_receipt_success(tx_hash: TxHash, succeeded: bool) -> Result<()> {
@@ -2070,6 +2171,46 @@ fn ensure_evm_receipt_success(tx_hash: TxHash, succeeded: bool) -> Result<()> {
         Err(crate::Error::TransactionReverted {
             tx_hash: tx_hash.to_string(),
         })
+    }
+}
+
+fn evm_transfer_index_matches(observed: Option<u64>, expected: u64) -> Result<bool> {
+    let Some(observed) = observed else {
+        return Err(crate::Error::TransactionDeserializationFailed {
+            context: "EVM transaction receipt missing transaction index".to_string(),
+            loc: location!(),
+        });
+    };
+    Ok(observed == expected)
+}
+
+fn evm_confirmation_count(current_block_height: u64, inclusion_height: u64) -> Result<u64> {
+    current_block_height
+        .checked_sub(inclusion_height)
+        .ok_or(crate::Error::NumericOverflow {
+            context: "evm confirmation count",
+        })
+}
+
+fn evm_tx_status_from_receipt_fields(
+    succeeded: bool,
+    inclusion_height: Option<u64>,
+    current_block_height: u64,
+) -> Result<TxStatus> {
+    let Some(inclusion_height) = inclusion_height else {
+        return Ok(TxStatus::Pending(PendingTxStatus {
+            current_height: current_block_height,
+        }));
+    };
+    let confirmed = ConfirmedTxStatus {
+        confirmations: evm_confirmation_count(current_block_height, inclusion_height)?,
+        current_height: current_block_height,
+        inclusion_height,
+    };
+    if succeeded {
+        Ok(TxStatus::Confirmed(confirmed))
+    } else {
+        Ok(TxStatus::Failed(confirmed))
     }
 }
 
@@ -2092,5 +2233,104 @@ mod tests {
     #[test]
     fn successful_evm_receipt_is_ok() {
         assert!(ensure_evm_receipt_success(TxHash::repeat_byte(0x22), true).is_ok());
+    }
+
+    #[test]
+    fn max_fee_per_gas_headroom_uses_checked_ceiling_math() {
+        assert_eq!(max_fee_per_gas_with_headroom(0).unwrap(), 0);
+        assert_eq!(max_fee_per_gas_with_headroom(1).unwrap(), 2);
+        assert_eq!(max_fee_per_gas_with_headroom(10).unwrap(), 11);
+    }
+
+    #[test]
+    fn max_fee_per_gas_headroom_rejects_overflow() {
+        let error = max_fee_per_gas_with_headroom(u128::MAX).unwrap_err();
+
+        assert!(
+            matches!(error, crate::Error::NumericOverflow { context } if context == "EVM max fee per gas headroom")
+        );
+    }
+
+    #[test]
+    fn gas_sponsor_config_debug_redacts_private_key() {
+        let config = EvmGasSponsorConfig {
+            private_key: "0x59c6995e998f97a5a0044976f7ad0a7df4976fbe66f6cc18ff3c16f18a6b9e3f"
+                .to_string(),
+            vault_gas_buffer_wei: U256::from(10),
+        };
+
+        let rendered = format!("{config:?}");
+        assert!(rendered.contains("private_key"));
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains("59c6995e"));
+        assert!(rendered.contains("vault_gas_buffer_wei"));
+    }
+
+    #[test]
+    fn u256_balance_arithmetic_rejects_overflow_and_underflow() {
+        assert!(matches!(
+            checked_u256_add(U256::MAX, U256::from(1), "test add").unwrap_err(),
+            crate::Error::NumericOverflow { context } if context == "test add"
+        ));
+        assert!(matches!(
+            checked_u256_sub(U256::ZERO, U256::from(1), "test sub").unwrap_err(),
+            crate::Error::NumericOverflow { context } if context == "test sub"
+        ));
+    }
+
+    #[test]
+    fn missing_evm_transfer_index_is_not_treated_as_zero() {
+        let error = evm_transfer_index_matches(None, 0).unwrap_err();
+
+        assert!(
+            error.to_string().contains("missing transaction index"),
+            "{error}"
+        );
+        assert!(evm_transfer_index_matches(Some(0), 0).unwrap());
+        assert!(!evm_transfer_index_matches(Some(1), 0).unwrap());
+    }
+
+    #[test]
+    fn reverted_evm_tx_status_is_failed_not_confirmed() {
+        assert_eq!(
+            evm_tx_status_from_receipt_fields(false, Some(10), 12).unwrap(),
+            TxStatus::Failed(ConfirmedTxStatus {
+                confirmations: 2,
+                current_height: 12,
+                inclusion_height: 10,
+            })
+        );
+    }
+
+    #[test]
+    fn successful_evm_tx_status_is_confirmed() {
+        assert_eq!(
+            evm_tx_status_from_receipt_fields(true, Some(10), 12).unwrap(),
+            TxStatus::Confirmed(ConfirmedTxStatus {
+                confirmations: 2,
+                current_height: 12,
+                inclusion_height: 10,
+            })
+        );
+    }
+
+    #[test]
+    fn receipt_without_block_height_is_pending() {
+        assert_eq!(
+            evm_tx_status_from_receipt_fields(true, None, 12).unwrap(),
+            TxStatus::Pending(PendingTxStatus { current_height: 12 })
+        );
+    }
+
+    #[test]
+    fn evm_confirmation_count_rejects_receipts_above_current_head() {
+        assert_eq!(evm_confirmation_count(12, 12).unwrap(), 0);
+        let error = evm_confirmation_count(11, 12).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::Error::NumericOverflow { context }
+                if context == "evm confirmation count"
+        ));
+        assert!(evm_tx_status_from_receipt_fields(true, Some(12), 11).is_err());
     }
 }

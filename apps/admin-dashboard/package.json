@@ -9,6 +9,7 @@
     "dev:web": "vite",
     "start": "bun server/server.ts",
     "build": "vite build",
+    "test": "bun test",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

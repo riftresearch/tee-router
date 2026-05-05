@@ -1,7 +1,12 @@
-use std::{fs, path::PathBuf};
+use std::{fmt, fs, path::PathBuf};
 
 use bitcoincore_rpc_async::Auth;
 use clap::{Parser, ValueEnum};
+
+use crate::cdc::{ROUTER_CDC_MESSAGE_PREFIX, ROUTER_CDC_PUBLICATION_NAME};
+
+pub const MIN_ROUTER_DETECTOR_API_KEY_LEN: usize = 32;
+pub const MIN_TOKEN_INDEXER_API_KEY_LEN: usize = 32;
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SauronReplicaEventSource {
@@ -9,7 +14,7 @@ pub enum SauronReplicaEventSource {
     Cdc,
 }
 
-#[derive(Parser, Debug, Clone)]
+#[derive(Parser, Clone)]
 #[command(name = "sauron")]
 #[command(about = "Replica-backed provider-operation observer for tee-router")]
 pub struct SauronArgs {
@@ -23,11 +28,10 @@ pub struct SauronArgs {
 
     /// Writable Sauron state database URL.
     ///
-    /// This stores detector cursors and CDC checkpoints. If omitted, Sauron
-    /// falls back to the router replica URL for local test deployments where
-    /// the router database is writable.
+    /// This stores detector cursors and CDC checkpoints. It must be writable and
+    /// must not point at a physical router standby.
     #[arg(long, env = "SAURON_STATE_DATABASE_URL")]
-    pub sauron_state_database_url: Option<String>,
+    pub sauron_state_database_url: String,
 
     /// Source used to learn about router replica changes.
     #[arg(
@@ -54,7 +58,7 @@ pub struct SauronArgs {
     #[arg(
         long,
         env = "ROUTER_CDC_PUBLICATION_NAME",
-        default_value = "router_cdc_publication"
+        default_value_t = ROUTER_CDC_PUBLICATION_NAME.to_string()
     )]
     pub router_cdc_publication_name: String,
 
@@ -62,7 +66,7 @@ pub struct SauronArgs {
     #[arg(
         long,
         env = "ROUTER_CDC_MESSAGE_PREFIX",
-        default_value = "rift.router.change"
+        default_value_t = ROUTER_CDC_MESSAGE_PREFIX.to_string()
     )]
     pub router_cdc_message_prefix: String,
 
@@ -114,15 +118,6 @@ pub struct SauronArgs {
     #[arg(long, env = "ETHEREUM_TOKEN_INDEXER_URL")]
     pub ethereum_token_indexer_url: Option<String>,
 
-    /// Legacy Ethereum token address kept for backwards-compatible deployment config.
-    /// ERC-20 detection now follows the active watch set instead of this single token.
-    #[arg(
-        long,
-        env = "ETHEREUM_ALLOWED_TOKEN",
-        default_value = "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf"
-    )]
-    pub ethereum_allowed_token: String,
-
     /// Base RPC URL
     #[arg(long, env = "BASE_RPC_URL")]
     pub base_rpc_url: String,
@@ -130,15 +125,6 @@ pub struct SauronArgs {
     /// Base Token Indexer URL
     #[arg(long, env = "BASE_TOKEN_INDEXER_URL")]
     pub base_token_indexer_url: Option<String>,
-
-    /// Legacy Base token address kept for backwards-compatible deployment config.
-    /// ERC-20 detection now follows the active watch set instead of this single token.
-    #[arg(
-        long,
-        env = "BASE_ALLOWED_TOKEN",
-        default_value = "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf"
-    )]
-    pub base_allowed_token: String,
 
     /// Arbitrum RPC URL
     #[arg(long, env = "ARBITRUM_RPC_URL")]
@@ -148,14 +134,9 @@ pub struct SauronArgs {
     #[arg(long, env = "ARBITRUM_TOKEN_INDEXER_URL")]
     pub arbitrum_token_indexer_url: Option<String>,
 
-    /// Legacy Arbitrum token address kept for backwards-compatible deployment config.
-    /// ERC-20 detection now follows the active watch set instead of this single token.
-    #[arg(
-        long,
-        env = "ARBITRUM_ALLOWED_TOKEN",
-        default_value = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
-    )]
-    pub arbitrum_allowed_token: String,
+    /// Bearer key shared by configured EVM token-indexer APIs
+    #[arg(long, env = "TOKEN_INDEXER_API_KEY")]
+    pub token_indexer_api_key: Option<String>,
 
     /// Low-frequency full watch-set reconcile interval
     #[arg(
@@ -190,6 +171,94 @@ pub struct SauronArgs {
     pub sauron_evm_indexed_lookup_concurrency: usize,
 }
 
+impl fmt::Debug for SauronArgs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SauronArgs")
+            .field("log_level", &self.log_level)
+            .field("router_replica_database_url", &"<redacted>")
+            .field("sauron_state_database_url", &"<redacted>")
+            .field(
+                "sauron_replica_event_source",
+                &self.sauron_replica_event_source,
+            )
+            .field(
+                "router_replica_database_name",
+                &self.router_replica_database_name,
+            )
+            .field("sauron_cdc_slot_name", &self.sauron_cdc_slot_name)
+            .field(
+                "router_cdc_publication_name",
+                &self.router_cdc_publication_name,
+            )
+            .field("router_cdc_message_prefix", &self.router_cdc_message_prefix)
+            .field(
+                "sauron_cdc_status_interval_ms",
+                &self.sauron_cdc_status_interval_ms,
+            )
+            .field(
+                "sauron_cdc_idle_wakeup_interval_ms",
+                &self.sauron_cdc_idle_wakeup_interval_ms,
+            )
+            .field("router_internal_base_url", &"<redacted>")
+            .field("router_detector_api_key", &"<redacted>")
+            .field("electrum_http_server_url", &"<redacted>")
+            .field("bitcoin_rpc_url", &"<redacted>")
+            .field("bitcoin_rpc_auth", &"<redacted>")
+            .field("bitcoin_zmq_rawtx_endpoint", &"<redacted>")
+            .field("bitcoin_zmq_sequence_endpoint", &"<redacted>")
+            .field("ethereum_mainnet_rpc_url", &"<redacted>")
+            .field(
+                "ethereum_token_indexer_url",
+                &self
+                    .ethereum_token_indexer_url
+                    .as_ref()
+                    .map(|_| "<redacted>"),
+            )
+            .field("base_rpc_url", &"<redacted>")
+            .field(
+                "base_token_indexer_url",
+                &self.base_token_indexer_url.as_ref().map(|_| "<redacted>"),
+            )
+            .field("arbitrum_rpc_url", &"<redacted>")
+            .field(
+                "arbitrum_token_indexer_url",
+                &self
+                    .arbitrum_token_indexer_url
+                    .as_ref()
+                    .map(|_| "<redacted>"),
+            )
+            .field(
+                "token_indexer_api_key",
+                &self.token_indexer_api_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "sauron_reconcile_interval_seconds",
+                &self.sauron_reconcile_interval_seconds,
+            )
+            .field(
+                "sauron_bitcoin_scan_interval_seconds",
+                &self.sauron_bitcoin_scan_interval_seconds,
+            )
+            .field(
+                "sauron_bitcoin_indexed_lookup_concurrency",
+                &self.sauron_bitcoin_indexed_lookup_concurrency,
+            )
+            .field(
+                "sauron_evm_indexed_lookup_concurrency",
+                &self.sauron_evm_indexed_lookup_concurrency,
+            )
+            .finish()
+    }
+}
+
+pub fn normalize_router_detector_api_key(value: &str) -> Option<&str> {
+    let value = value.trim();
+    if value.len() < MIN_ROUTER_DETECTOR_API_KEY_LEN {
+        return None;
+    }
+    Some(value)
+}
+
 fn parse_auth(s: &str) -> Result<Auth, String> {
     if s.eq_ignore_ascii_case("none") {
         Ok(Auth::None)
@@ -200,5 +269,72 @@ fn parse_auth(s: &str) -> Result<Auth, String> {
         let user = split.next().ok_or("Invalid auth string")?;
         let password = split.next().ok_or("Invalid auth string")?;
         Ok(Auth::UserPass(user.to_string(), password.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sauron_args_debug_redacts_secret_configuration() {
+        let args = SauronArgs {
+            log_level: "debug".to_string(),
+            router_replica_database_url: "postgres://replicator:db-secret@db/router".to_string(),
+            sauron_state_database_url: "postgres://sauron:state-secret@db/sauron".to_string(),
+            sauron_replica_event_source: SauronReplicaEventSource::Cdc,
+            router_replica_database_name: "router_db".to_string(),
+            sauron_cdc_slot_name: "sauron_slot".to_string(),
+            router_cdc_publication_name: "router_publication".to_string(),
+            router_cdc_message_prefix: "rift.router.change".to_string(),
+            sauron_cdc_status_interval_ms: 1_000,
+            sauron_cdc_idle_wakeup_interval_ms: 10_000,
+            router_internal_base_url: "https://router.internal/api-key-path".to_string(),
+            router_detector_api_key: "detector-secret-00000000000000000000".to_string(),
+            electrum_http_server_url: "https://electrum.example/token-secret".to_string(),
+            bitcoin_rpc_url: "http://bitcoin-rpc.example/rpc-secret".to_string(),
+            bitcoin_rpc_auth: Auth::UserPass(
+                "bitcoin-user".to_string(),
+                "bitcoin-pass".to_string(),
+            ),
+            bitcoin_zmq_rawtx_endpoint: "tcp://bitcoin-zmq-secret:28332".to_string(),
+            bitcoin_zmq_sequence_endpoint: "tcp://bitcoin-zmq-secret:28333".to_string(),
+            ethereum_mainnet_rpc_url: "https://eth.example/rpc-secret".to_string(),
+            ethereum_token_indexer_url: Some(
+                "https://eth-indexer.example/token-secret".to_string(),
+            ),
+            base_rpc_url: "https://base.example/rpc-secret".to_string(),
+            base_token_indexer_url: Some("https://base-indexer.example/token-secret".to_string()),
+            arbitrum_rpc_url: "https://arb.example/rpc-secret".to_string(),
+            arbitrum_token_indexer_url: Some(
+                "https://arb-indexer.example/token-secret".to_string(),
+            ),
+            token_indexer_api_key: Some("token-indexer-api-key-secret".to_string()),
+            sauron_reconcile_interval_seconds: 3600,
+            sauron_bitcoin_scan_interval_seconds: 15,
+            sauron_bitcoin_indexed_lookup_concurrency: 32,
+            sauron_evm_indexed_lookup_concurrency: 8,
+        };
+
+        let rendered = format!("{args:?}");
+        assert!(rendered.contains("SauronArgs"));
+        assert!(rendered.contains("<redacted>"));
+        for secret in [
+            "db-secret",
+            "state-secret",
+            "detector-secret",
+            "api-key-path",
+            "token-secret",
+            "token-indexer-api-key-secret",
+            "rpc-secret",
+            "bitcoin-user",
+            "bitcoin-pass",
+            "bitcoin-zmq-secret",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "debug output leaked {secret}: {rendered}"
+            );
+        }
     }
 }

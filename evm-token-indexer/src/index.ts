@@ -2,7 +2,6 @@ import { ponder } from "ponder:registry";
 import { erc20TransferRaw } from "ponder:schema";
 import pg from "pg";
 
-const chainId = Number(process.env.PONDER_CHAIN_ID);
 const schemaName = process.env.DATABASE_SCHEMA ?? process.env.PONDER_SCHEMA;
 const databaseUrl = process.env.DATABASE_URL;
 
@@ -14,10 +13,39 @@ if (!databaseUrl) {
   throw new Error("DATABASE_URL must be set for candidate materialization");
 }
 
+const parsePositiveInteger = (
+  value: string | undefined,
+  name: string,
+  defaultValue: number | undefined,
+  max: number,
+) => {
+  const raw = value ?? defaultValue?.toString();
+  if (raw === undefined || !/^\d+$/.test(raw)) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0 || parsed > max) {
+    throw new Error(`${name} must be a positive integer <= ${max}`);
+  }
+  return parsed;
+};
+
+const validatedChainId = parsePositiveInteger(
+  process.env.PONDER_CHAIN_ID,
+  "PONDER_CHAIN_ID",
+  undefined,
+  Number.MAX_SAFE_INTEGER,
+);
+
 const pool = new pg.Pool({
   connectionString: databaseUrl,
   application_name: "evm-token-indexer-indexing",
-  max: Number(process.env.EVM_TOKEN_INDEXER_INDEXING_POOL_SIZE ?? 5),
+  max: parsePositiveInteger(
+    process.env.EVM_TOKEN_INDEXER_INDEXING_POOL_SIZE,
+    "EVM_TOKEN_INDEXER_INDEXING_POOL_SIZE",
+    5,
+    100,
+  ),
 });
 
 const normalizeAddress = (address: string) =>
@@ -52,7 +80,7 @@ ponder.on("erc20:Transfer", async ({ event, context }) => {
     .insert(erc20TransferRaw)
     .values({
       id: event.id,
-      chainId,
+      chainId: validatedChainId,
       tokenAddress,
       fromAddress,
       toAddress,
@@ -110,11 +138,12 @@ ponder.on("erc20:Transfer", async ({ event, context }) => {
       AND w.deposit_address = $5
       AND $6::numeric >= w.min_amount
       AND $6::numeric <= w.max_amount
+      AND $11::numeric >= w.created_at
       AND $11::numeric <= w.expires_at
     ON CONFLICT (id) DO NOTHING
     `,
     [
-      chainId,
+      validatedChainId,
       event.id,
       tokenAddress,
       fromAddress,

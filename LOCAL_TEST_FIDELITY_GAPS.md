@@ -10,10 +10,13 @@ need production-shape end-to-end coverage.
 
 ### Across Destination Fulfillment Is Manually Credited
 
-The local Across mock observes/indexes the source-chain deposit and reports the
-provider operation as filled, but it does not actually fulfill the destination
-chain. Happy-path tests manually fund the destination execution vault after the
-provider completion hint.
+Status: resolved for production-shaped local happy paths.
+
+The local Across mock now observes/indexes the source-chain deposit and only
+reports the provider operation as filled after it has sent or minted the
+expected output asset to the destination-chain recipient. In multi-chain mock
+mode, missing destination-chain RPC configuration keeps the deposit pending
+instead of returning a synthetic fill.
 
 Representative locations:
 
@@ -21,15 +24,23 @@ Representative locations:
 - `bin/sauron/tests/provider_operation_e2e.rs`
 - `crates/devnet/src/mock_integrators.rs`
 
-Target shape:
+Implemented shape:
 
 - The mock Across relayer should observe the source deposit.
 - It should send/mint the expected output asset to the destination execution
   vault on the destination chain.
 - Happy-path E2E tests should remove manual
   `fund_destination_execution_vault_from_across` style helpers.
+- Direct destination-vault funding remains only in explicitly named recovery
+  fixtures that fabricate completed provider operation state in the database.
 
 ### Unit / HyperUnit Lifecycle Is Test-Driven
+
+Status: resolved for production-shaped local happy paths. The shared
+router-server and Sauron happy paths now use the mock Unit EVM/Bitcoin deposit
+indexers for UnitDeposit completion, and the mock Hyperliquid `spotSend` hook
+for UnitWithdrawal completion. Direct Unit lifecycle helpers remain for focused
+fixture and failure-state tests.
 
 The Unit mock exposes helpers that directly complete, fail, or seed operations.
 Many tests use these helpers to move operations forward. Production Unit behavior
@@ -44,12 +55,21 @@ Representative locations:
 
 Target shape:
 
-- The Unit mock should observe actual source transfers where feasible.
-- Operation state should progress from observed transfer state.
+- The Unit mock should observe actual source transfers where feasible. This is
+  now true for UnitDeposit in the router-server and Sauron happy paths that use
+  the shared mock-integrator harness.
+- Operation state should progress from observed transfer state. UnitWithdrawal
+  now advances from the actual mock Hyperliquid `spotSend` into the generated
+  Unit protocol address.
 - Direct `complete_unit_operation` calls should be reserved for focused unit
   tests, not production-shape happy-path E2E tests.
 
 ### Hyperliquid Spot Balances Are Manually Credited After Unit Deposits
+
+Status: resolved for production-shaped local happy paths. UnitDeposit
+completion now credits the mock Hyperliquid spot ledger from the observed source
+transfer for ETH/BTC Unit ingress routes. Focused tests still use direct ledger
+crediting for synthetic or failure-state setup.
 
 Several tests directly credit mock Hyperliquid spot balances after Unit deposit
 completion. This can mask bugs in deposited amount detection, fees, Unit credit
@@ -71,25 +91,45 @@ Target shape:
 
 ### Provider And Detector Hints Are Often Inserted Directly
 
+Status: resolved for production-shaped local happy paths. Router-worker tests
+still use direct hint insertion to isolate worker behavior, but the Sauron
+runtime E2Es now assert that route-progress hints for the completed mock routes
+come only from Sauron sources.
+
 Many router-worker tests insert provider or detector hints directly. That is
 valid for targeted worker validation tests, but those tests do not prove that
 Sauron produced the hint from observed chain/provider state.
 
-Target shape:
+Representative production-shape coverage:
+
+- `sauron_runtime_drives_router_worker_through_mock_base_eth_btc_progress`
+- `sauron_runtime_drives_router_worker_through_mock_base_usdc_btc_progress`
+
+Implemented shape:
 
 - Keep direct hint insertion for focused worker tests.
-- Add or preserve separate production-shape E2E tests where Sauron is the only
-  component that emits hints.
-- Name helpers/tests clearly so state-injection tests are not confused for full
-  system tests.
+- The Sauron runtime E2Es assert all provider-operation hints for the tested
+  orders come from `sauron` or
+  `sauron_provider_operation_observation`, and at least one is processed.
+- Direct helper-sourced hints remain scoped to worker-fixture tests.
 
 ### Deposit Detection Is Sometimes Bypassed By Direct DB State Transitions
+
+Status: resolved for production-shaped local happy paths. The Sauron runtime
+E2Es now fund the source vault on-chain and assert a processed `sauron`
+funding hint exists for the funding vault. Direct DB vault transitions remain
+only in lower-level repository/service and worker-fixture tests.
 
 Some tests fund a vault on-chain and then directly transition the DB row to
 `Funded` or `Executing`. Bitcoin source-vault tests currently include this
 pattern. That bypasses the production detector path.
 
-Target shape:
+Representative production-shape coverage:
+
+- `sauron_runtime_drives_router_worker_through_mock_base_eth_btc_progress`
+- `sauron_runtime_drives_router_worker_through_mock_base_usdc_btc_progress`
+
+Implemented shape:
 
 - Production-shape E2E tests should require Sauron/deposit detection to mark
   vaults funded.
@@ -99,11 +139,21 @@ Target shape:
 
 ### Paymaster And Gas Funding Can Be Masked By Direct Native Balance Padding
 
+Status: resolved for production-shaped local happy paths. The Sauron runtime
+E2Es now start source vaults without native gas padding, fund only the quoted
+input amount, and assert the Base paymaster spends native gas to top up the
+source vault before the first EVM provider action.
+
 Some tests give execution vaults native gas directly with Anvil balance mutation
 or helper sends. That can hide failures in paymaster top-up calculation,
 runtime reimbursement accounting, and per-leg gas funding.
 
-Target shape:
+Representative production-shape coverage:
+
+- `sauron_runtime_drives_router_worker_through_mock_base_eth_btc_progress`
+- `sauron_runtime_drives_router_worker_through_mock_base_usdc_btc_progress`
+
+Implemented shape:
 
 - Full-route tests should assert which vaults were topped up by the paymaster.
 - E2E route tests should avoid direct native balance padding except when testing
@@ -111,30 +161,47 @@ Target shape:
 
 ### Velora Mock Mints Output Instead Of Simulating Swap Semantics
 
-The Velora mock validates calldata plumbing by returning executable calldata
-that mints output tokens. It does not model liquidity, price impact, allowance
-use, `transferFrom`, input debit, realistic revert causes, or partial execution
-constraints.
+Status: resolved for configured local devnet and shared test-harness routes.
+The Velora mock now requires a per-network `MockVeloraSwap` contract address.
+The mock quote endpoint returns that contract as the token-transfer proxy and
+execution target, and `/transactions` returns calldata that spends the source
+asset through native `msg.value` or ERC20 `transferFrom` before creating output
+from the mock reserve/mint path. Missing swap-contract configuration now fails
+instead of silently falling back to a mint-only transaction.
 
-Target shape:
+Representative production-shape coverage:
 
-- Keep this mock for calldata/executor integration.
-- Add at least one stricter local route test that proves input token spend and
-  output token receipt accounting.
+- `mock_velora_transaction_spends_input_and_mints_output_on_local_evm`
+- `mock_velora_prices_sell_eth_to_usdc_uses_prices_and_decimals`
+- `mock_velora_prices_buy_usdc_with_eth_uses_prices_and_decimals`
+- `mock_velora_prices_sell_usdc_to_eth_uses_prices_and_decimals`
+- `mock_velora_prices_unknown_erc20_with_deterministic_mock_price`
+
+Remaining shape:
+
+- Keep this mock focused on local calldata/executor integration.
 - Keep live differential tests as the source of truth for Velora quote/execution
-  semantics.
+  semantics, price impact, production liquidity, and real revert causes.
 
 ### CCTP Mock Compresses Attestation And Finality
 
-The local CCTP path is closer to production than most mocks because it burns and
-mints through local contracts. Remaining differences are that Circle attestation,
-Iris pending/failure behavior, and finality delays are compressed or synthetic.
+Status: improved. The local CCTP path still uses mock contracts for burn/mint,
+but mock Iris can now return delayed pending attestations and explicit failed
+attestation messages instead of always completing immediately. Router CCTP
+observation now treats failed Iris statuses as terminal provider-operation
+failures instead of leaving them pending forever.
 
-Target shape:
+Representative coverage:
 
-- Preserve the current burn/mint mock.
-- Add pending, failure, and delayed-attestation modes if CCTP route reliability
-  becomes a release gate.
+- `mock_cctp_messages_honor_attestation_latency`
+- `mock_cctp_messages_can_return_failed_attestation`
+- `cctp_failed_iris_statuses_are_terminal_failures`
+
+Remaining shape:
+
+- Preserve the current burn/mint mock for deterministic local execution.
+- Live differential tests remain the source of truth for Circle signature,
+  attestation, and production finality semantics.
 
 ### Hyperliquid Exchange Mock Is A Small Synthetic Market
 
@@ -151,25 +218,35 @@ Target shape:
 
 ### Hyperliquid Bridge Mock Compresses Confirmation And Failure Behavior
 
-The Hyperliquid bridge mock observes local EVM deposits and credits the mock
-clearinghouse, but confirmations, latency, replay protection, and failure modes
-are simplified.
+Status: improved for router-local timing/failure coverage. The Hyperliquid
+bridge mock observes local EVM deposits and credits the mock clearinghouse only
+after configurable deposit latency, and can deterministically fail valid bridge
+credits for retry/refund tests.
 
-Target shape:
+Remaining boundary:
 
-- Add delayed and failed bridge-credit modes if bridge timing becomes material
-  to retry/refund behavior.
+- Live differential tests are still needed for production bridge confirmation
+  depth and replay-protection semantics.
 
 ### Chainalysis / Address Screening Is Not Exercised Locally
 
-Local configs generally disable Chainalysis/address screening. That means local
-integration tests do not prove that screening is enforced before quote/order
-creation.
+Status: resolved for router API quote/order admission paths. The shared mock
+integrator server now exposes a Chainalysis-compatible
+`/api/risk/v2/entities/:address` endpoint, and the router API test harness can
+configure per-address Low/Medium/High/Severe/Unknown risk or HTTP-provider
+errors.
 
-Target shape:
+Representative production-shape coverage:
 
-- Add a mock address-screening service.
-- Cover allow, block, and provider-error behavior in router API tests.
+- `router_api_address_screening_covers_allow_block_and_provider_error`
+
+Implemented shape:
+
+- Quote creation screens recipient addresses before route planning.
+- Order creation screens the quote recipient again and screens the refund
+  address before creating the order/funding vault.
+- Blocked screening responses map to `403 Forbidden`.
+- Chainalysis/provider errors map to `500 Internal Server Error` and fail closed.
 
 ## Lower Priority
 
@@ -188,12 +265,19 @@ Target shape:
 
 ### Worker Passes Are Often Driven Directly
 
-Many tests call worker passes directly rather than running long-lived router API,
-router worker, and Sauron processes. That is fine for deterministic unit and
-integration tests, but it is not daemon-level E2E coverage.
+Status: resolved for production-shaped smoke coverage. The Sauron runtime E2Es
+spawn a router API, the long-lived router worker loop, Sauron, a real test
+Postgres database, and local devnet services together. Those smoke paths create
+orders through the API, fund vaults on-chain, require Sauron-submitted hints,
+and wait for the worker loop to drive orders to completion.
 
-Target shape:
+Representative coverage:
 
-- Keep direct worker-pass tests for small state-machine coverage.
-- Ensure at least one production-shape smoke path runs the actual long-lived
-  processes together.
+- `sauron_runtime_drives_router_worker_through_mock_base_eth_btc_progress`
+- `sauron_runtime_drives_router_worker_through_mock_base_usdc_btc_progress`
+
+Remaining shape:
+
+- Keep direct worker-pass tests for deterministic state-machine coverage.
+- Keep the runtime smoke paths focused and expensive, not the default shape for
+  every edge-case assertion.

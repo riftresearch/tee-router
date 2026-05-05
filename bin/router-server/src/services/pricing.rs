@@ -80,10 +80,10 @@ impl PricingSnapshot {
     }
 
     #[must_use]
-    pub fn wei_to_usd_micro(&self, wei: U256) -> U256 {
-        div_ceil(
-            wei.saturating_mul(U256::from(self.eth_usd_micro)),
-            pow10(18),
+    pub fn checked_wei_to_usd_micro(&self, wei: U256) -> Option<U256> {
+        div_ceil_checked(
+            wei.checked_mul(U256::from(self.eth_usd_micro))?,
+            checked_pow10(18)?,
         )
     }
 
@@ -95,10 +95,10 @@ impl PricingSnapshot {
         decimals: u8,
     ) -> Option<U256> {
         let asset_usd_micro = U256::from(self.canonical_asset_usd_micro(canonical)?);
-        Some(div_ceil(
-            usd_micro.saturating_mul(pow10(decimals)),
+        div_ceil_checked(
+            usd_micro.checked_mul(checked_pow10(decimals)?)?,
             asset_usd_micro,
-        ))
+        )
     }
 
     #[must_use]
@@ -109,43 +109,39 @@ impl PricingSnapshot {
         decimals: u8,
     ) -> Option<U256> {
         let asset_usd_micro = U256::from(self.canonical_asset_usd_micro(canonical)?);
-        Some(U256::from(sample_amount_usd_micros).saturating_mul(pow10(decimals)) / asset_usd_micro)
+        Some(
+            U256::from(sample_amount_usd_micros).checked_mul(checked_pow10(decimals)?)?
+                / asset_usd_micro,
+        )
     }
 }
 
 #[must_use]
-pub fn apply_bps_multiplier(amount: U256, multiplier_bps: u64) -> U256 {
-    div_ceil(
-        amount.saturating_mul(U256::from(multiplier_bps)),
+pub fn apply_bps_multiplier(amount: U256, multiplier_bps: u64) -> Option<U256> {
+    div_ceil_checked(
+        amount.checked_mul(U256::from(multiplier_bps))?,
         U256::from(BPS_DENOMINATOR),
     )
 }
 
 #[must_use]
-pub fn pow10(decimals: u8) -> U256 {
+pub fn checked_pow10(decimals: u8) -> Option<U256> {
     let mut value = U256::from(1_u64);
     for _ in 0..decimals {
-        value = value.saturating_mul(U256::from(10_u64));
+        value = value.checked_mul(U256::from(10_u64))?;
     }
-    value
+    Some(value)
 }
 
 #[must_use]
-pub fn div_ceil(numerator: U256, denominator: U256) -> U256 {
+pub fn div_ceil_checked(numerator: U256, denominator: U256) -> Option<U256> {
+    if denominator == U256::ZERO {
+        return None;
+    }
     if numerator == U256::ZERO {
-        return U256::ZERO;
+        return Some(U256::ZERO);
     }
-    numerator.saturating_add(denominator.saturating_sub(U256::from(1_u64))) / denominator
-}
-
-#[must_use]
-pub fn div_ceil_u64(numerator: u64, denominator: u64) -> u64 {
-    if denominator == 0 {
-        return u64::MAX;
-    }
-    numerator
-        .saturating_add(denominator.saturating_sub(1))
-        .saturating_div(denominator)
+    Some((numerator - U256::from(1_u64)) / denominator + U256::from(1_u64))
 }
 
 #[cfg(test)]
@@ -167,5 +163,25 @@ mod tests {
             pricing.canonical_asset_usd_micro(CanonicalAsset::Btc),
             Some(100_000 * USD_MICRO)
         );
+    }
+
+    #[test]
+    fn pricing_raw_conversions_reject_overflow() {
+        let pricing = PricingSnapshot::static_bootstrap(Utc::now());
+
+        assert_eq!(
+            pricing.usd_micro_to_asset_raw(U256::MAX, CanonicalAsset::Btc, 18),
+            None
+        );
+        assert_eq!(
+            pricing.sample_amount_raw(u64::MAX, CanonicalAsset::Btc, u8::MAX),
+            None
+        );
+        assert_eq!(
+            pricing.usd_micro_to_asset_raw(U256::from(1_u64), CanonicalAsset::Btc, u8::MAX),
+            None
+        );
+        assert_eq!(pricing.checked_wei_to_usd_micro(U256::MAX), None);
+        assert_eq!(apply_bps_multiplier(U256::MAX, 2), None);
     }
 }

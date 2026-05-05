@@ -24,8 +24,10 @@ const DEFAULT_MULTICALL_HANDLER: &str = "0x0F7Ae28dE1C8532170AD4ee566B5801485c13
 const RPC_RETRY_ATTEMPTS: usize = 6;
 const RECEIPT_POLL_ATTEMPTS: usize = 120;
 const RECEIPT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const LIVE_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const LIVE_HTTP_MAX_RESPONSE_BODY_BYTES: usize = 256 * 1024;
 
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 #[command(about = "Submit a live Across bridge transaction and wait for fill")]
 struct Args {
     #[arg(
@@ -191,9 +193,10 @@ async fn main() -> CliResult<()> {
         );
     }
 
-    let private_key = args
-        .private_key
-        .unwrap_or_else(|| read_private_key_from_env().expect("missing live private key env"));
+    let private_key = match args.private_key {
+        Some(private_key) => private_key,
+        None => read_private_key_from_env()?,
+    };
     let signer = private_key.parse::<PrivateKeySigner>()?;
     let depositor = signer.address();
     let native_output_recipient = args
@@ -325,7 +328,7 @@ async fn fetch_swap_approval(
     message: Option<String>,
 ) -> CliResult<AcrossSwapApprovalResponse> {
     let endpoint = build_endpoint(base_url, "/swap/approval")?;
-    let client = reqwest::Client::new();
+    let client = live_http_client()?;
     let response = if let Some(actions) = actions {
         client
             .post(endpoint)
@@ -387,7 +390,7 @@ async fn fetch_deposit_status_by_tx_ref(
     deposit_txn_ref: &str,
 ) -> CliResult<AcrossDepositStatusResponse> {
     let endpoint = build_endpoint(base_url, "/deposit/status")?;
-    let response = reqwest::Client::new()
+    let response = live_http_client()?
         .get(endpoint)
         .query(&[("depositTxnRef", deposit_txn_ref)])
         .bearer_auth(api_key)
@@ -396,15 +399,43 @@ async fn fetch_deposit_status_by_tx_ref(
     parse_json_response(response).await
 }
 
+fn live_http_client() -> CliResult<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .use_rustls_tls()
+        .timeout(LIVE_HTTP_TIMEOUT)
+        .build()?)
+}
+
 async fn parse_json_response<T: for<'de> Deserialize<'de>>(
     response: reqwest::Response,
 ) -> CliResult<T> {
     let status = response.status();
-    let body = response.text().await?;
+    let body = read_limited_response_text(response, LIVE_HTTP_MAX_RESPONSE_BODY_BYTES).await?;
     if !status.is_success() {
         return Err(format!("HTTP {}: {}", status.as_u16(), body).into());
     }
     Ok(serde_json::from_str(&body)?)
+}
+
+async fn read_limited_response_text(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> CliResult<String> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if !append_limited_body_chunk(&mut body, chunk.as_ref(), max_bytes) {
+            return Err(format!("response body exceeded {max_bytes} bytes").into());
+        }
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+fn append_limited_body_chunk(body: &mut Vec<u8>, chunk: &[u8], max_bytes: usize) -> bool {
+    if body.len().saturating_add(chunk.len()) > max_bytes {
+        return false;
+    }
+    body.extend_from_slice(chunk);
+    true
 }
 
 async fn send_provider_transaction<P>(
@@ -485,7 +516,8 @@ where
     Fut: Future<Output = CliResult<T>>,
 {
     let mut delay = Duration::from_millis(500);
-    for attempt in 1..=RPC_RETRY_ATTEMPTS {
+    let mut attempt = 1;
+    loop {
         match op().await {
             Ok(value) => return Ok(value),
             Err(err) if attempt < RPC_RETRY_ATTEMPTS && is_retryable_rpc_error(err.as_ref()) => {
@@ -495,11 +527,11 @@ where
                 );
                 tokio::time::sleep(delay).await;
                 delay = delay.saturating_mul(2);
+                attempt += 1;
             }
             Err(err) => return Err(err),
         }
     }
-    unreachable!("retry loop always returns")
 }
 
 async fn wait_for_successful_receipt<P>(provider: &P, tx_hash: B256, label: &str) -> CliResult<()>

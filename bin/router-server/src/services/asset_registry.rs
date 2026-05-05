@@ -677,7 +677,9 @@ impl AssetRegistry {
 
         if let (Some(source), Some(destination)) = (start_external, goal_external) {
             if self.can_runtime_velora_edge(source, destination) {
-                transitions.push(self.velora_runtime_transition(source, destination));
+                if let Some(transition) = self.velora_runtime_transition(source, destination) {
+                    transitions.push(transition);
+                }
             }
         }
 
@@ -685,7 +687,9 @@ impl AssetRegistry {
             if is_evm_external_asset(source) {
                 for anchor in self.velora_runtime_anchor_assets_on_chain(&source.chain) {
                     if self.can_runtime_velora_edge(source, &anchor) {
-                        transitions.push(self.velora_runtime_transition(source, &anchor));
+                        if let Some(transition) = self.velora_runtime_transition(source, &anchor) {
+                            transitions.push(transition);
+                        }
                     }
                 }
             }
@@ -695,7 +699,11 @@ impl AssetRegistry {
             if is_evm_external_asset(destination) {
                 for anchor in self.velora_runtime_anchor_assets_on_chain(&destination.chain) {
                     if self.can_runtime_velora_edge(&anchor, destination) {
-                        transitions.push(self.velora_runtime_transition(&anchor, destination));
+                        if let Some(transition) =
+                            self.velora_runtime_transition(&anchor, destination)
+                        {
+                            transitions.push(transition);
+                        }
                     }
                 }
             }
@@ -727,14 +735,13 @@ impl AssetRegistry {
         &self,
         source: &DepositAsset,
         destination: &DepositAsset,
-    ) -> TransitionDecl {
+    ) -> Option<TransitionDecl> {
         self.transition_decl_from_edge(MarketOrderTransition {
             kind: MarketOrderTransitionKind::UniversalRouterSwap,
             provider: ProviderId::Velora,
             from: MarketOrderNode::External(source.clone()),
             to: MarketOrderNode::External(destination.clone()),
         })
-        .expect("external runtime Velora transition assets should always resolve")
     }
 
     #[must_use]
@@ -1305,7 +1312,7 @@ fn chain_asset(
 ) -> ChainAsset {
     ChainAsset {
         canonical,
-        chain: ChainId::parse(chain).expect("builtin chain id must be valid"),
+        chain: ChainId::from_trusted_static(chain),
         asset,
         decimals,
     }
@@ -1323,7 +1330,7 @@ fn provider_asset(
     ProviderAsset {
         provider,
         canonical,
-        chain: ChainId::parse(chain).expect("builtin provider chain id must be valid"),
+        chain: ChainId::from_trusted_static(chain),
         provider_chain: provider_chain.to_string(),
         provider_asset: provider_asset.to_string(),
         decimals,

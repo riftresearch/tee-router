@@ -8,7 +8,7 @@ use snafu::ResultExt;
 use sqlx_core::row::Row;
 use sqlx_postgres::PgPool;
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::error::{ReplicaDatabaseQuerySnafu, Result};
@@ -25,7 +25,7 @@ SELECT
   observed_state_json,
   updated_at
 FROM public.order_provider_operations
-WHERE operation_type IN ('across_bridge', 'cctp_bridge', 'hyperliquid_bridge_deposit', 'hyperliquid_bridge_withdrawal', 'unit_deposit', 'unit_withdrawal', 'hyperliquid_trade', 'hyperliquid_limit_order')
+WHERE operation_type IN ('across_bridge', 'cctp_bridge', 'hyperliquid_bridge_deposit', 'hyperliquid_bridge_withdrawal', 'unit_deposit', 'unit_withdrawal', 'hyperliquid_trade', 'hyperliquid_limit_order', 'universal_router_swap')
   AND status IN ('submitted', 'waiting_external')
 ORDER BY updated_at ASC, id ASC
 "#;
@@ -43,7 +43,7 @@ SELECT
   updated_at
 FROM public.order_provider_operations
 WHERE id = $1::uuid
-  AND operation_type IN ('across_bridge', 'cctp_bridge', 'hyperliquid_bridge_deposit', 'hyperliquid_bridge_withdrawal', 'unit_deposit', 'unit_withdrawal', 'hyperliquid_trade', 'hyperliquid_limit_order')
+  AND operation_type IN ('across_bridge', 'cctp_bridge', 'hyperliquid_bridge_deposit', 'hyperliquid_bridge_withdrawal', 'unit_deposit', 'unit_withdrawal', 'hyperliquid_trade', 'hyperliquid_limit_order', 'universal_router_swap')
   AND status IN ('submitted', 'waiting_external')
 "#;
 
@@ -71,43 +71,155 @@ pub type SharedProviderOperationWatchEntry = Arc<ProviderOperationWatchEntry>;
 
 #[derive(Debug, Default, Clone)]
 pub struct ProviderOperationWatchStore {
-    inner: Arc<RwLock<HashMap<Uuid, SharedProviderOperationWatchEntry>>>,
+    inner: Arc<RwLock<ProviderOperationWatchState>>,
+}
+
+#[derive(Debug, Default)]
+struct ProviderOperationWatchState {
+    revision: u64,
+    entries: HashMap<Uuid, SharedProviderOperationWatchEntry>,
+    removed_operation_versions: HashMap<Uuid, DateTime<Utc>>,
 }
 
 impl ProviderOperationWatchStore {
     pub async fn replace_all(&self, entries: Vec<ProviderOperationWatchEntry>) {
-        let entries = entries
-            .into_iter()
-            .map(|entry| (entry.operation_id, Arc::new(entry)))
-            .collect::<HashMap<_, _>>();
         let mut state = self.inner.write().await;
-        *state = entries;
-        gauge!(SAURON_PROVIDER_OPERATION_WATCH_COUNT_METRIC).set(state.len() as f64);
+        replace_provider_operation_entries(&mut state, entries);
+        gauge!(SAURON_PROVIDER_OPERATION_WATCH_COUNT_METRIC).set(state.entries.len() as f64);
+    }
+
+    pub async fn replace_all_if_revision(
+        &self,
+        entries: Vec<ProviderOperationWatchEntry>,
+        expected_revision: u64,
+    ) -> bool {
+        let mut state = self.inner.write().await;
+        if state.revision != expected_revision {
+            return false;
+        }
+        replace_provider_operation_entries(&mut state, entries);
+        gauge!(SAURON_PROVIDER_OPERATION_WATCH_COUNT_METRIC).set(state.entries.len() as f64);
+        true
+    }
+
+    pub async fn revision(&self) -> u64 {
+        self.inner.read().await.revision
     }
 
     pub async fn upsert(&self, entry: ProviderOperationWatchEntry) {
         let mut state = self.inner.write().await;
-        state.insert(entry.operation_id, Arc::new(entry));
-        gauge!(SAURON_PROVIDER_OPERATION_WATCH_COUNT_METRIC).set(state.len() as f64);
+        upsert_provider_operation_entry_if_fresh(&mut state, entry);
+        gauge!(SAURON_PROVIDER_OPERATION_WATCH_COUNT_METRIC).set(state.entries.len() as f64);
+    }
+
+    pub async fn remove_with_source(
+        &self,
+        operation_id: Uuid,
+        source_updated_at: Option<DateTime<Utc>>,
+    ) {
+        let mut state = self.inner.write().await;
+        remove_provider_operation_entry_if_not_newer(
+            &mut state,
+            operation_id,
+            source_updated_at.unwrap_or_else(utc::now),
+        );
+        gauge!(SAURON_PROVIDER_OPERATION_WATCH_COUNT_METRIC).set(state.entries.len() as f64);
     }
 
     pub async fn remove(&self, operation_id: Uuid) {
         let mut state = self.inner.write().await;
-        state.remove(&operation_id);
-        gauge!(SAURON_PROVIDER_OPERATION_WATCH_COUNT_METRIC).set(state.len() as f64);
+        state.entries.remove(&operation_id);
+        bump_revision(&mut state);
+        gauge!(SAURON_PROVIDER_OPERATION_WATCH_COUNT_METRIC).set(state.entries.len() as f64);
     }
 
     pub async fn len(&self) -> usize {
-        self.inner.read().await.len()
+        self.inner.read().await.entries.len()
     }
 
     pub async fn is_empty(&self) -> bool {
-        self.inner.read().await.is_empty()
+        self.inner.read().await.entries.is_empty()
+    }
+
+    #[cfg(test)]
+    async fn removed_operation_version_count(&self) -> usize {
+        self.inner.read().await.removed_operation_versions.len()
     }
 
     pub async fn snapshot(&self) -> Vec<SharedProviderOperationWatchEntry> {
-        self.inner.read().await.values().cloned().collect()
+        self.inner.read().await.entries.values().cloned().collect()
     }
+}
+
+fn replace_provider_operation_entries(
+    state: &mut ProviderOperationWatchState,
+    entries: Vec<ProviderOperationWatchEntry>,
+) {
+    let previous_removed_operation_versions = std::mem::take(&mut state.removed_operation_versions);
+    let mut retained_removed_operation_versions = HashMap::new();
+    let entries = entries
+        .into_iter()
+        .filter_map(|entry| {
+            if let Some(removed_at) = previous_removed_operation_versions.get(&entry.operation_id) {
+                if *removed_at >= entry.updated_at {
+                    retained_removed_operation_versions.insert(entry.operation_id, *removed_at);
+                    return None;
+                }
+            }
+            Some((entry.operation_id, Arc::new(entry)))
+        })
+        .collect::<HashMap<_, _>>();
+    state.entries = entries;
+    state.removed_operation_versions = retained_removed_operation_versions;
+    bump_revision(state);
+}
+
+fn bump_revision(state: &mut ProviderOperationWatchState) {
+    state.revision = state.revision.wrapping_add(1);
+}
+
+fn upsert_provider_operation_entry_if_fresh(
+    state: &mut ProviderOperationWatchState,
+    entry: ProviderOperationWatchEntry,
+) {
+    if let Some(existing) = state.entries.get(&entry.operation_id) {
+        if existing.updated_at > entry.updated_at {
+            return;
+        }
+    }
+    if let Some(removed_at) = state.removed_operation_versions.get(&entry.operation_id) {
+        if *removed_at >= entry.updated_at {
+            return;
+        }
+    }
+
+    state.removed_operation_versions.remove(&entry.operation_id);
+    state.entries.insert(entry.operation_id, Arc::new(entry));
+    bump_revision(state);
+}
+
+fn remove_provider_operation_entry_if_not_newer(
+    state: &mut ProviderOperationWatchState,
+    operation_id: Uuid,
+    removed_at: DateTime<Utc>,
+) {
+    if let Some(existing) = state.entries.get(&operation_id) {
+        if existing.updated_at > removed_at {
+            return;
+        }
+    }
+
+    state.entries.remove(&operation_id);
+    state
+        .removed_operation_versions
+        .entry(operation_id)
+        .and_modify(|existing| {
+            if *existing < removed_at {
+                *existing = removed_at;
+            }
+        })
+        .or_insert(removed_at);
+    bump_revision(state);
 }
 
 #[derive(Debug, Clone)]
@@ -154,15 +266,25 @@ pub async fn full_provider_operation_reconcile(
     repository: &ProviderOperationWatchRepository,
 ) -> Result<()> {
     let started = std::time::Instant::now();
+    let expected_revision = store.revision().await;
     let watches = repository.load_all().await?;
     let watch_count = watches.len();
-    store.replace_all(watches).await;
+    let applied = store
+        .replace_all_if_revision(watches, expected_revision)
+        .await;
     histogram!(SAURON_PROVIDER_OPERATION_RECONCILE_DURATION_SECONDS)
         .record(started.elapsed().as_secs_f64());
-    info!(
-        watch_count,
-        "Reconciled active Sauron provider-operation watch set from replica"
-    );
+    if applied {
+        info!(
+            watch_count,
+            "Reconciled active Sauron provider-operation watch set from replica"
+        );
+    } else {
+        warn!(
+            watch_count,
+            "Skipped stale Sauron provider-operation reconcile because CDC updated the watch set"
+        );
+    }
     Ok(())
 }
 
@@ -242,6 +364,7 @@ fn parse_provider_operation_row(row: sqlx_postgres::PgRow) -> Result<ProviderOpe
 #[cfg(test)]
 mod tests {
     use super::{ProviderOperationWatchEntry, ProviderOperationWatchStore};
+    use chrono::Duration;
     use router_server::models::{ProviderOperationStatus, ProviderOperationType};
     use serde_json::json;
     use uuid::Uuid;
@@ -276,5 +399,122 @@ mod tests {
         let remaining = store.snapshot().await;
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].operation_id, second_id);
+    }
+
+    #[tokio::test]
+    async fn upsert_ignores_older_provider_operation_versions() {
+        let store = ProviderOperationWatchStore::default();
+        let operation_id = Uuid::now_v7();
+        let now = utc::now();
+        let mut current = watch(operation_id);
+        current.provider_ref = Some("current".to_string());
+        current.updated_at = now;
+        let mut stale = watch(operation_id);
+        stale.provider_ref = Some("stale".to_string());
+        stale.updated_at = now - Duration::seconds(1);
+
+        store.upsert(current).await;
+        store.upsert(stale).await;
+
+        let snapshot = store.snapshot().await;
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].provider_ref.as_deref(), Some("current"));
+    }
+
+    #[tokio::test]
+    async fn source_remove_does_not_delete_newer_provider_operation() {
+        let store = ProviderOperationWatchStore::default();
+        let operation_id = Uuid::now_v7();
+        let now = utc::now();
+        let mut current = watch(operation_id);
+        current.updated_at = now + Duration::seconds(1);
+
+        store.upsert(current).await;
+        store.remove_with_source(operation_id, Some(now)).await;
+
+        assert_eq!(store.len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn source_remove_blocks_stale_provider_operation_reinsertion() {
+        let store = ProviderOperationWatchStore::default();
+        let operation_id = Uuid::now_v7();
+        let now = utc::now();
+        let mut stale = watch(operation_id);
+        stale.updated_at = now - Duration::seconds(1);
+
+        store.remove_with_source(operation_id, Some(now)).await;
+        store.upsert(stale).await;
+
+        assert_eq!(store.len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn source_remove_blocks_stale_full_reconcile_reinsertion() {
+        let store = ProviderOperationWatchStore::default();
+        let operation_id = Uuid::now_v7();
+        let now = utc::now();
+        let mut stale = watch(operation_id);
+        stale.updated_at = now - Duration::seconds(1);
+
+        store.remove_with_source(operation_id, Some(now)).await;
+        let snapshot_revision = store.revision().await;
+        let applied = store
+            .replace_all_if_revision(vec![stale], snapshot_revision)
+            .await;
+
+        assert!(applied);
+        assert_eq!(store.len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn full_reconcile_prunes_tombstones_for_absent_provider_operations() {
+        let store = ProviderOperationWatchStore::default();
+        let operation_id = Uuid::now_v7();
+        let now = utc::now();
+
+        store.remove_with_source(operation_id, Some(now)).await;
+        assert_eq!(store.removed_operation_version_count().await, 1);
+
+        let snapshot_revision = store.revision().await;
+        let applied = store
+            .replace_all_if_revision(Vec::new(), snapshot_revision)
+            .await;
+
+        assert!(applied);
+        assert_eq!(store.removed_operation_version_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn conditional_replace_all_skips_stale_reconcile_snapshots() {
+        let store = ProviderOperationWatchStore::default();
+        let first_id = Uuid::now_v7();
+        let second_id = Uuid::now_v7();
+        let snapshot_revision = store.revision().await;
+
+        store.upsert(watch(first_id)).await;
+        let applied = store
+            .replace_all_if_revision(vec![watch(second_id)], snapshot_revision)
+            .await;
+
+        assert!(!applied);
+        let snapshot = store.snapshot().await;
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].operation_id, first_id);
+    }
+
+    #[tokio::test]
+    async fn remove_of_missing_operation_blocks_stale_reconcile_reinsertion() {
+        let store = ProviderOperationWatchStore::default();
+        let operation_id = Uuid::now_v7();
+        let snapshot_revision = store.revision().await;
+
+        store.remove(operation_id).await;
+        let applied = store
+            .replace_all_if_revision(vec![watch(operation_id)], snapshot_revision)
+            .await;
+
+        assert!(!applied);
+        assert_eq!(store.len().await, 0);
     }
 }

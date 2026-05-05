@@ -177,8 +177,8 @@ unsafe impl GlobalAlloc for TrackingAllocator {
     }
 }
 
-fn main() {
-    let runtime = benchmark_runtime();
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = benchmark_runtime()?;
     let mut rows = Vec::new();
 
     for size in LARGE_WATCH_SET_SIZES {
@@ -198,6 +198,7 @@ fn main() {
     }
 
     print_rows(&rows);
+    Ok(())
 }
 
 fn measure_replace_all(size: usize, runtime: &tokio::runtime::Runtime) -> ScenarioRow {

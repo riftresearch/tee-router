@@ -48,8 +48,7 @@ pub struct TokenInfo {
 impl SpotMeta {
     /// Build a lookup from both the short pair name (`"@0"`) and the
     /// "{base}/{quote}" form (`"UBTC/USDC"`) onto the wire asset id.
-    #[must_use]
-    pub fn coin_to_asset_map(&self) -> HashMap<String, u32> {
+    pub fn coin_to_asset_map(&self) -> Result<HashMap<String, u32>, String> {
         let index_to_name: HashMap<usize, &str> = self
             .tokens
             .iter()
@@ -58,7 +57,12 @@ impl SpotMeta {
 
         let mut map = HashMap::with_capacity(self.universe.len() * 2);
         for pair in &self.universe {
-            let spot_ind = SPOT_ASSET_INDEX_OFFSET + pair.index as u32;
+            let spot_ind = spot_wire_asset_index(pair.index).ok_or_else(|| {
+                format!(
+                    "spot pair {} index {} does not fit Hyperliquid wire asset id",
+                    pair.name, pair.index
+                )
+            })?;
             map.insert(pair.name.clone(), spot_ind);
 
             let Some(base_name) = index_to_name.get(&pair.tokens[0]) else {
@@ -69,7 +73,7 @@ impl SpotMeta {
             };
             map.insert(format!("{base_name}/{quote_name}"), spot_ind);
         }
-        map
+        Ok(map)
     }
 
     /// Look up the base token's [`TokenInfo`] for a pair by its canonical
@@ -111,6 +115,11 @@ impl SpotMeta {
             .iter()
             .find(|p| p.tokens[0] == base.index && p.tokens[1] == quote.index)
     }
+}
+
+pub fn spot_wire_asset_index(pair_index: usize) -> Option<u32> {
+    let pair_index = u32::try_from(pair_index).ok()?;
+    SPOT_ASSET_INDEX_OFFSET.checked_add(pair_index)
 }
 
 #[cfg(test)]
@@ -164,11 +173,23 @@ mod tests {
 
     #[test]
     fn coin_to_asset_indexes_both_name_forms() {
-        let map = sample_meta().coin_to_asset_map();
+        let map = sample_meta()
+            .coin_to_asset_map()
+            .expect("sample spotMeta should be valid");
         assert_eq!(map.get("@140"), Some(&10_140));
         assert_eq!(map.get("UBTC/USDC"), Some(&10_140));
         assert_eq!(map.get("@141"), Some(&10_141));
         assert_eq!(map.get("UETH/USDC"), Some(&10_141));
+    }
+
+    #[test]
+    fn spot_wire_asset_index_rejects_overflowing_pair_indexes() {
+        assert_eq!(spot_wire_asset_index(140), Some(10_140));
+        assert_eq!(spot_wire_asset_index(usize::MAX), None);
+        assert_eq!(
+            spot_wire_asset_index(usize::try_from(u32::MAX).unwrap()),
+            None
+        );
     }
 
     #[test]

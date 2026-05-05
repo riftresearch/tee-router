@@ -68,7 +68,7 @@ async fn live_hyperliquid_eth_btc_quote_probe() -> TestResult<()> {
         HyperliquidCallNetwork::Mainnet,
         Arc::new(AssetRegistry::default()),
         30_000,
-    );
+    )?;
 
     let quote = provider
         .quote_trade(ExchangeQuoteRequest {

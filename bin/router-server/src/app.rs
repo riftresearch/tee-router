@@ -7,11 +7,11 @@ use crate::{
             bitcoin_address_from_private_key, evm_address_from_private_key,
             HyperliquidRuntimeConfig, PaymasterRegistry,
         },
-        AcrossHttpProviderConfig, ActionProviderRegistry, AddressScreeningService,
-        CctpHttpProviderConfig, CustodyActionExecutor, OrderExecutionManager, OrderManager,
-        ProviderHealthPoller, ProviderHealthProbe, ProviderHealthService, ProviderId,
-        ProviderPolicyService, RouteCostService, RouteMinimumService, VaultManager,
-        VeloraHttpProviderConfig,
+        AcrossHttpProviderConfig, ActionProviderHttpOptions, ActionProviderRegistry,
+        AddressScreeningService, CctpHttpProviderConfig, CustodyActionExecutor,
+        OrderExecutionManager, OrderManager, ProviderHealthPoller, ProviderHealthProbe,
+        ProviderHealthService, ProviderId, ProviderPolicyService, RouteCostService,
+        RouteMinimumService, VaultManager, VeloraHttpProviderConfig,
     },
     Result, RouterServerArgs,
 };
@@ -393,16 +393,22 @@ fn initialize_action_providers(args: &RouterServerArgs) -> Result<ActionProvider
             normalize_optional_string(args.cctp_message_transmitter_v2_address.as_deref()),
         ),
     );
-    let registry = ActionProviderRegistry::http_with_options_and_hyperliquid_timeout(
+    let registry = ActionProviderRegistry::http_from_options(ActionProviderHttpOptions {
         across,
         cctp,
-        normalize_optional_url(args.hyperunit_api_url.as_deref(), "HyperUnit API URL")?,
-        normalize_optional_string(args.hyperunit_proxy_url.as_deref()),
-        normalize_optional_url(args.hyperliquid_api_url.as_deref(), "Hyperliquid API URL")?,
+        hyperunit_base_url: normalize_optional_url(
+            args.hyperunit_api_url.as_deref(),
+            "HyperUnit API URL",
+        )?,
+        hyperunit_proxy_url: normalize_optional_string(args.hyperunit_proxy_url.as_deref()),
+        hyperliquid_base_url: normalize_optional_url(
+            args.hyperliquid_api_url.as_deref(),
+            "Hyperliquid API URL",
+        )?,
         velora,
-        args.hyperliquid_network,
-        args.hyperliquid_order_timeout_ms,
-    )
+        hyperliquid_network: args.hyperliquid_network,
+        hyperliquid_order_timeout_ms: args.hyperliquid_order_timeout_ms,
+    })
     .map_err(invalid_config)?;
     if registry.is_empty() {
         warn!(
@@ -442,14 +448,28 @@ fn normalize_optional_url(value: Option<&str>, name: &str) -> Result<Option<Stri
             message: format!("invalid {name}: {err}"),
         },
     })?;
-    match parsed.scheme() {
-        "http" | "https" => Ok(Some(parsed.as_str().trim_end_matches('/').to_string())),
-        scheme => Err(crate::Error::DatabaseInit {
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err(crate::Error::DatabaseInit {
             source: RouterServerError::InvalidData {
-                message: format!("invalid {name}: unsupported scheme {scheme}"),
+                message: format!("invalid {name}: unsupported scheme {}", parsed.scheme()),
             },
-        }),
+        });
     }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(crate::Error::DatabaseInit {
+            source: RouterServerError::InvalidData {
+                message: format!("invalid {name}: credentials are not allowed"),
+            },
+        });
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(crate::Error::DatabaseInit {
+            source: RouterServerError::InvalidData {
+                message: format!("invalid {name}: query strings and fragments are not allowed"),
+            },
+        });
+    }
+    Ok(Some(parsed.as_str().trim_end_matches('/').to_string()))
 }
 
 fn normalize_optional_string(value: Option<&str>) -> Option<String> {
@@ -642,6 +662,7 @@ mod tests {
             hyperliquid_vault_address: None,
             hyperliquid_paymaster_private_key: None,
             router_detector_api_key: None,
+            router_gateway_api_key: None,
             router_admin_api_key: None,
             hyperliquid_network:
                 crate::services::custody_action_executor::HyperliquidCallNetwork::Mainnet,
@@ -702,6 +723,25 @@ mod tests {
                 ("velora", "https://velora.example/status"),
             ]
         );
+    }
+
+    #[test]
+    fn optional_url_config_rejects_non_canonical_urls() {
+        for value in [
+            "https://user:pass@provider.example",
+            "https://provider.example?token=secret",
+            "https://provider.example#fragment",
+        ] {
+            let error = match normalize_optional_url(Some(value), "Provider URL") {
+                Ok(_) => panic!("non-canonical URL must fail"),
+                Err(error) => error,
+            };
+            let message = error.to_string();
+            assert!(!message.contains("user"));
+            assert!(!message.contains("pass"));
+            assert!(!message.contains("token"));
+            assert!(!message.contains("secret"));
+        }
     }
 
     #[test]

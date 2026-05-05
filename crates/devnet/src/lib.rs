@@ -8,6 +8,7 @@ pub mod hyperliquid_bridge_mock;
 pub mod manifest;
 pub mod mock_integrators;
 pub mod token_indexerd;
+pub mod velora_mock;
 
 pub use bitcoin_devnet::BitcoinDevnet;
 use blockchain_utils::P2WPKHBitcoinWallet;
@@ -26,15 +27,16 @@ use evm_devnet::{
     MOCK_CCTP_TOKEN_MESSENGER_V2_ADDRESS, MOCK_ERC20_ADDRESS,
 };
 use std::{
-    fs, io,
+    fmt, fs, io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
 };
 use tempfile::NamedTempFile;
 use tokio::task::JoinSet;
-use tokio::time::Instant;
+use tokio::time::{Duration, Instant, MissedTickBehavior};
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use bitcoincore_rpc_async::RpcApi;
 use hyperliquid_client::{
@@ -44,7 +46,7 @@ use hyperliquid_client::{
 use alloy::{
     network::EthereumWallet,
     primitives::{keccak256, Address},
-    providers::Provider,
+    providers::{ext::AnvilApi, Provider},
     signers::local::LocalSigner,
 };
 
@@ -53,6 +55,7 @@ use alloy::{
 use crate::evm_devnet::Mode;
 
 const _LOG_CHUNK_SIZE: u64 = 10000;
+const EVM_CONFIRMATION_MINING_INTERVAL: Duration = Duration::from_secs(1);
 
 pub struct RiftDevnetCache {
     pub cache_dir: PathBuf,
@@ -66,6 +69,7 @@ const ANVIL_DATADIR_NAME: &str = "anvil-datadir";
 const ANVIL_BASE_DATADIR_NAME: &str = "anvil-base-datadir";
 const ANVIL_ARBITRUM_DATADIR_NAME: &str = "anvil-arbitrum-datadir";
 const TEMP_DIR_NAME: &str = "tmp";
+const TOKEN_INDEXER_API_KEY_MIN_LENGTH: usize = 32;
 const TEMP_ENTRY_PREFIX: &str = "rift-devnet-p";
 const ERROR_MESSAGE: &str = "Cache must be populated before utilizing it,";
 
@@ -106,6 +110,24 @@ fn devnet_temp_root_path() -> Result<PathBuf> {
 
 fn current_process_temp_entry_prefix() -> String {
     format!("{TEMP_ENTRY_PREFIX}{}-", std::process::id())
+}
+
+fn token_indexer_api_key() -> Result<String> {
+    if let Ok(value) = std::env::var("EVM_TOKEN_INDEXER_API_KEY") {
+        let trimmed = value.trim();
+        if trimmed.len() < TOKEN_INDEXER_API_KEY_MIN_LENGTH {
+            return Err(eyre::eyre!(
+                "EVM_TOKEN_INDEXER_API_KEY must be at least {TOKEN_INDEXER_API_KEY_MIN_LENGTH} characters"
+            )
+            .into());
+        }
+        return Ok(trimmed.to_string());
+    }
+
+    Ok(format!(
+        "devnet-token-indexer-{}",
+        Uuid::now_v7().as_simple()
+    ))
 }
 
 pub fn cleanup_current_process_temp_dirs() -> Result<usize> {
@@ -190,7 +212,12 @@ fn remove_temp_entry(path: &Path) -> io::Result<()> {
 
 #[cfg(unix)]
 fn process_is_running(pid: u32) -> bool {
-    let status = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: `kill(pid, 0)` performs permission/existence checks only. It
+    // does not send a signal, dereference pointers, or mutate Rust memory.
+    let status = unsafe { libc::kill(pid, 0) };
     status == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
@@ -199,21 +226,14 @@ fn process_is_running(_pid: u32) -> bool {
     true
 }
 
-impl Default for RiftDevnetCache {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl RiftDevnetCache {
-    #[must_use]
-    pub fn new() -> Self {
-        let cache_dir = devnet_cache_root().expect("Failed to find user cache directory");
+    pub fn new() -> Result<Self> {
+        let cache_dir = devnet_cache_root()?;
         let populated = Self::cache_is_populated(&cache_dir);
-        Self {
+        Ok(Self {
             cache_dir,
             populated,
-        }
+        })
     }
 
     fn cache_is_populated(cache_dir: &Path) -> bool {
@@ -570,6 +590,29 @@ mod tests {
         assert!(other_pid_dir.exists());
         assert!(legacy_dir.exists());
     }
+
+    #[test]
+    fn multichain_account_debug_redacts_private_material() {
+        let account = MultichainAccount::new(123).expect("multichain account");
+
+        let debug = format!("{account:?}");
+
+        assert!(debug.contains("MultichainAccount"));
+        assert!(debug.contains("secret_bytes: \"<redacted>\""));
+        assert!(debug.contains("bitcoin_mnemonic: \"<redacted>\""));
+        assert!(debug.contains(&format!("{:#x}", account.ethereum_address)));
+        assert!(debug.contains(&account.bitcoin_wallet.address.to_string()));
+        assert!(!debug.contains(&alloy::hex::encode(account.secret_bytes)));
+        assert!(!debug.contains(&account.bitcoin_mnemonic.to_string()));
+        assert!(!debug.contains(&account.bitcoin_wallet.private_key.to_wif()));
+        assert!(!debug.contains(
+            &account
+                .bitcoin_wallet
+                .secret_key
+                .display_secret()
+                .to_string()
+        ));
+    }
 }
 
 #[derive(Debug, snafu::Snafu)]
@@ -730,7 +773,7 @@ impl RiftDevnetBuilder {
         if self.interactive {
             Ok(self.build_internal(None).await?)
         } else {
-            let cache = Arc::new(RiftDevnetCache::new());
+            let cache = Arc::new(RiftDevnetCache::new()?);
 
             if cache.populated {
                 tracing::info!("Cache directory exists, loading devnet from cache...");
@@ -818,6 +861,11 @@ impl RiftDevnetBuilder {
         } else {
             Mode::Local
         };
+        let token_indexer_api_key = if self.token_indexer_database_url.is_some() {
+            Some(token_indexer_api_key()?)
+        } else {
+            None
+        };
 
         // 5) Ethereum side (chain ID 31337, default port)
         let ethereum_start = Instant::now();
@@ -826,6 +874,7 @@ impl RiftDevnetBuilder {
             deploy_mode.clone(),
             devnet_cache.clone(),
             self.token_indexer_database_url.clone(),
+            token_indexer_api_key.clone(),
             self.interactive,
             1, // Ethereum chain ID
             if self.interactive {
@@ -854,6 +903,7 @@ impl RiftDevnetBuilder {
             deploy_mode.clone(),
             devnet_cache.clone(), // Use cache for Base
             self.token_indexer_database_url.clone(),
+            token_indexer_api_key.clone(),
             self.interactive,
             8453, // Base chain ID
             if self.interactive {
@@ -882,6 +932,7 @@ impl RiftDevnetBuilder {
             deploy_mode,
             devnet_cache.clone(),
             self.token_indexer_database_url.clone(),
+            token_indexer_api_key,
             self.interactive,
             42161, // Arbitrum chain ID
             if self.interactive {
@@ -904,7 +955,9 @@ impl RiftDevnetBuilder {
         );
 
         let loadgen_evm_accounts =
-            deterministic_loadgen_evm_accounts(self.loadgen_evm_account_count);
+            deterministic_loadgen_evm_accounts(self.loadgen_evm_account_count).map_err(
+                |error| eyre::eyre!("[devnet builder] Failed to derive loadgen accounts: {error}"),
+            )?;
         let mut funded_evm_addresses = self.funded_evm_addresses.clone();
         funded_evm_addresses.extend(
             loadgen_evm_accounts
@@ -1072,12 +1125,22 @@ impl RiftDevnetBuilder {
             None
         };
 
+        let ethereum_devnet = Arc::new(ethereum_devnet);
+        let base_devnet = Arc::new(base_devnet);
+        let arbitrum_devnet = Arc::new(arbitrum_devnet);
+
+        if self.interactive {
+            spawn_evm_confirmation_miner("Ethereum", ethereum_devnet.clone(), &mut join_set);
+            spawn_evm_confirmation_miner("Base", base_devnet.clone(), &mut join_set);
+            spawn_evm_confirmation_miner("Arbitrum", arbitrum_devnet.clone(), &mut join_set);
+        }
+
         // 11) Create the devnet
         let devnet = crate::RiftDevnet {
             bitcoin: Arc::new(bitcoin_devnet),
-            ethereum: Arc::new(ethereum_devnet),
-            base: Arc::new(base_devnet),
-            arbitrum: Arc::new(arbitrum_devnet),
+            ethereum: ethereum_devnet,
+            base: base_devnet,
+            arbitrum: arbitrum_devnet,
             loadgen_evm_accounts,
             mock_integrators,
             join_set,
@@ -1140,21 +1203,28 @@ impl RiftDevnetBuilder {
             .with_cctp_destination_token(ethereum_devnet.anvil.chain_id(), ETHEREUM_USDC_ADDRESS)
             .with_cctp_destination_token(base_devnet.anvil.chain_id(), BASE_USDC_ADDRESS)
             .with_cctp_destination_token(arbitrum_devnet.anvil.chain_id(), ARBITRUM_USDC_ADDRESS)
-            .with_velora_evm_rpc_url(
+            .with_velora_swap_contract_address(
                 ethereum_devnet.anvil.chain_id(),
-                ethereum_devnet.anvil.endpoint(),
+                format!("{:#x}", ethereum_devnet.mock_velora_swap_contract.address()),
             )
-            .with_velora_evm_rpc_url(base_devnet.anvil.chain_id(), base_devnet.anvil.endpoint())
-            .with_velora_evm_rpc_url(
+            .with_velora_swap_contract_address(
+                base_devnet.anvil.chain_id(),
+                format!("{:#x}", base_devnet.mock_velora_swap_contract.address()),
+            )
+            .with_velora_swap_contract_address(
                 arbitrum_devnet.anvil.chain_id(),
-                arbitrum_devnet.anvil.endpoint(),
+                format!("{:#x}", arbitrum_devnet.mock_velora_swap_contract.address()),
             )
             .with_unit_evm_rpc_url(
                 hyperunit_client::UnitChain::Ethereum,
                 ethereum_devnet.anvil.endpoint(),
             )
+            .with_unit_evm_rpc_url(
+                hyperunit_client::UnitChain::Base,
+                base_devnet.anvil.endpoint(),
+            )
             .with_unit_bitcoin_rpc(
-                bitcoin_devnet.rpc_url_with_cookie.clone(),
+                bitcoin_devnet.rpc_url.clone(),
                 bitcoin_devnet.cookie.clone(),
             )
             .with_hyperliquid_bridge_address(format!(
@@ -1183,7 +1253,7 @@ impl RiftDevnetBuilder {
     ) -> Result<()> {
         let setup_start = Instant::now();
 
-        let demo_account = MultichainAccount::new(DEVNET_DEMO_ACCOUNT_SALT);
+        let demo_account = MultichainAccount::new(DEVNET_DEMO_ACCOUNT_SALT)?;
 
         let funding_start = Instant::now();
         info!("[Interactive Setup] Funding demo_account with ETH...");
@@ -1201,7 +1271,7 @@ impl RiftDevnetBuilder {
                 )
             })?;
 
-        let funding_amount = bitcoin::Amount::from_btc(1000.0).unwrap().to_sat();
+        let funding_amount = 1000_u64 * 100_000_000;
 
         // Fund demo_account with the mock ERC-20 on Ethereum
         let _tx_hash = ethereum_devnet
@@ -1366,16 +1436,18 @@ impl RiftDevnetBuilder {
             "Arbitrum Chain ID:          {}",
             arbitrum_devnet.anvil.chain_id()
         );
+        println!("Bitcoin RPC URL:            {}", bitcoin_devnet.rpc_url);
         println!(
-            "Bitcoin RPC URL:            {}",
-            bitcoin_devnet.rpc_url_with_cookie
+            "Bitcoin RPC Cookie File:    {}",
+            bitcoin_devnet.cookie.display()
         );
 
         if using_esplora {
-            println!(
-                "Esplora API URL:            {}",
-                bitcoin_devnet.esplora_url.as_ref().unwrap()
-            );
+            if let Some(esplora_url) = bitcoin_devnet.esplora_url.as_ref() {
+                println!("Esplora API URL:            {esplora_url}");
+            } else {
+                warn!("Esplora was requested, but no Esplora URL is available");
+            }
         }
 
         if let Some(eth_indexer) = &ethereum_devnet.token_indexer {
@@ -1406,10 +1478,33 @@ impl RiftDevnetBuilder {
         }
 
         println!("Anvil Auto-mining:          On demand");
+        println!(
+            "Anvil Confirmation Mining:  Every {} second",
+            EVM_CONFIRMATION_MINING_INTERVAL.as_secs()
+        );
         println!("---RIFT DEVNET---");
 
         Ok(())
     }
+}
+
+fn spawn_evm_confirmation_miner(
+    chain_name: &'static str,
+    devnet: Arc<EthDevnet>,
+    join_set: &mut JoinSet<Result<()>>,
+) {
+    let provider = devnet.funded_provider.clone();
+    join_set.spawn(async move {
+        let mut interval = tokio::time::interval(EVM_CONFIRMATION_MINING_INTERVAL);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        loop {
+            interval.tick().await;
+            if let Err(error) = provider.anvil_mine(Some(1), None).await {
+                warn!(chain = chain_name, %error, "EVM confirmation miner failed to mine block");
+            }
+        }
+    });
 }
 
 async fn mint_default_local_tokens(
@@ -1433,7 +1528,6 @@ async fn mint_default_local_tokens(
 }
 
 /// Holds the components of a multichain account including secret bytes and wallets.
-#[derive(Debug)]
 pub struct MultichainAccount {
     /// The raw secret bytes used to derive wallets
     pub secret_bytes: [u8; 32],
@@ -1447,56 +1541,56 @@ pub struct MultichainAccount {
     pub bitcoin_wallet: P2WPKHBitcoinWallet,
 }
 
+impl fmt::Debug for MultichainAccount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MultichainAccount")
+            .field("secret_bytes", &"<redacted>")
+            .field("bitcoin_mnemonic", &"<redacted>")
+            .field("ethereum_address", &self.ethereum_address)
+            .field("bitcoin_address", &self.bitcoin_wallet.address)
+            .finish()
+    }
+}
+
 impl MultichainAccount {
     /// Creates a new multichain account from the given derivation salt
-    #[must_use]
-    pub fn new(derivation_salt: u32) -> Self {
-        let secret_bytes: [u8; 32] = keccak256(derivation_salt.to_le_bytes()).into();
-
-        let ethereum_wallet =
-            EthereumWallet::new(LocalSigner::from_bytes(&secret_bytes.into()).unwrap());
-
-        let ethereum_address = ethereum_wallet.default_signer().address();
-
-        let bitcoin_mnemonic = bip39::Mnemonic::from_entropy(&secret_bytes).unwrap();
-
-        let bitcoin_wallet = P2WPKHBitcoinWallet::from_mnemonic(
-            &bitcoin_mnemonic.to_string(),
-            None,
-            ::bitcoin::Network::Regtest,
-            None,
-        );
-
-        Self {
-            secret_bytes,
-            ethereum_wallet,
-            ethereum_address,
-            bitcoin_mnemonic,
-            bitcoin_wallet: bitcoin_wallet.unwrap(),
-        }
+    pub fn new(derivation_salt: u32) -> Result<Self> {
+        Self::with_network(derivation_salt, ::bitcoin::Network::Regtest)
     }
 
     /// Creates a new multichain account with the Bitcoin network explicitly specified
-    #[must_use]
-    pub fn with_network(derivation_salt: u32, network: ::bitcoin::Network) -> Self {
+    pub fn with_network(derivation_salt: u32, network: ::bitcoin::Network) -> Result<Self> {
         let secret_bytes: [u8; 32] = keccak256(derivation_salt.to_le_bytes()).into();
 
-        let ethereum_wallet =
-            EthereumWallet::new(LocalSigner::from_bytes(&secret_bytes.into()).unwrap());
+        let signer = LocalSigner::from_bytes(&secret_bytes.into()).map_err(|error| {
+            eyre::eyre!(
+                "failed to derive deterministic EVM signer for salt {derivation_salt}: {error}"
+            )
+        })?;
+        let ethereum_wallet = EthereumWallet::new(signer);
 
         let ethereum_address = ethereum_wallet.default_signer().address();
 
-        let bitcoin_mnemonic = bip39::Mnemonic::from_entropy(&secret_bytes).unwrap();
+        let bitcoin_mnemonic = bip39::Mnemonic::from_entropy(&secret_bytes).map_err(|error| {
+            eyre::eyre!(
+                "failed to derive deterministic Bitcoin mnemonic for salt {derivation_salt}: {error}"
+            )
+        })?;
 
         let bitcoin_wallet =
-            P2WPKHBitcoinWallet::from_mnemonic(&bitcoin_mnemonic.to_string(), None, network, None);
+            P2WPKHBitcoinWallet::from_mnemonic(&bitcoin_mnemonic.to_string(), None, network, None)
+                .map_err(|error| {
+                    eyre::eyre!(
+                "failed to derive deterministic Bitcoin wallet for salt {derivation_salt}: {error}"
+            )
+                })?;
 
-        Self {
+        Ok(Self {
             secret_bytes,
             bitcoin_mnemonic,
             ethereum_wallet,
             ethereum_address,
-            bitcoin_wallet: bitcoin_wallet.unwrap(),
-        }
+            bitcoin_wallet,
+        })
     }
 }

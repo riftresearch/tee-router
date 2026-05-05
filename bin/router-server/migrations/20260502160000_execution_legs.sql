@@ -85,44 +85,55 @@ DECLARE
     event_order_id uuid;
     event_watch_id uuid;
     event_provider_operation_id uuid;
+    event_order_updated_at timestamptz;
+    event_updated_at timestamptz;
     payload jsonb;
 BEGIN
     CASE TG_TABLE_NAME
         WHEN 'router_orders' THEN
             record_id := COALESCE(NEW.id, OLD.id);
             event_order_id := record_id;
+            event_order_updated_at := COALESCE(NEW.updated_at, OLD.updated_at);
+            event_updated_at := COALESCE(NEW.updated_at, OLD.updated_at);
 
         WHEN 'market_order_quotes' THEN
             record_id := COALESCE(NEW.id, OLD.id);
             event_order_id := COALESCE(NEW.order_id, OLD.order_id);
+            event_updated_at := COALESCE(NEW.created_at, OLD.created_at);
 
         WHEN 'market_order_actions' THEN
             event_order_id := COALESCE(NEW.order_id, OLD.order_id);
             record_id := event_order_id;
+            event_updated_at := COALESCE(NEW.updated_at, OLD.updated_at);
 
         WHEN 'order_execution_legs' THEN
             record_id := COALESCE(NEW.id, OLD.id);
             event_order_id := COALESCE(NEW.order_id, OLD.order_id);
+            event_updated_at := COALESCE(NEW.updated_at, OLD.updated_at);
 
         WHEN 'order_execution_steps' THEN
             record_id := COALESCE(NEW.id, OLD.id);
             event_order_id := COALESCE(NEW.order_id, OLD.order_id);
+            event_updated_at := COALESCE(NEW.updated_at, OLD.updated_at);
 
         WHEN 'order_provider_operations' THEN
             record_id := COALESCE(NEW.id, OLD.id);
             event_order_id := COALESCE(NEW.order_id, OLD.order_id);
             event_watch_id := record_id;
             event_provider_operation_id := record_id;
+            event_updated_at := COALESCE(NEW.updated_at, OLD.updated_at);
 
         WHEN 'order_provider_addresses' THEN
             record_id := COALESCE(NEW.id, OLD.id);
             event_order_id := COALESCE(NEW.order_id, OLD.order_id);
             event_provider_operation_id := COALESCE(NEW.provider_operation_id, OLD.provider_operation_id);
             event_watch_id := event_provider_operation_id;
+            event_updated_at := COALESCE(NEW.updated_at, OLD.updated_at);
 
         WHEN 'deposit_vaults' THEN
             record_id := COALESCE(NEW.id, OLD.id);
             event_watch_id := record_id;
+            event_updated_at := COALESCE(NEW.updated_at, OLD.updated_at);
             SELECT cv.order_id
             INTO event_order_id
             FROM public.custody_vaults cv
@@ -132,6 +143,7 @@ BEGIN
             record_id := COALESCE(NEW.id, OLD.id);
             event_order_id := COALESCE(NEW.order_id, OLD.order_id);
             event_watch_id := record_id;
+            event_updated_at := COALESCE(NEW.updated_at, OLD.updated_at);
 
         ELSE
             IF TG_OP = 'DELETE' THEN
@@ -147,6 +159,8 @@ BEGIN
         'op', TG_OP,
         'id', record_id,
         'orderId', event_order_id,
+        'orderUpdatedAt', event_order_updated_at,
+        'eventUpdatedAt', event_updated_at,
         'watchId', event_watch_id,
         'providerOperationId', event_provider_operation_id
     );
@@ -170,23 +184,9 @@ AFTER INSERT OR UPDATE OR DELETE ON public.order_execution_legs
 FOR EACH ROW EXECUTE FUNCTION public.router_emit_cdc_message();
 ALTER TABLE public.order_execution_legs ENABLE ALWAYS TRIGGER router_cdc_message_order_execution_legs;
 
-DO $$
-BEGIN
-    IF EXISTS (
-        SELECT 1
-        FROM pg_catalog.pg_publication
-        WHERE pubname = 'router_cdc_publication'
-    ) THEN
-        ALTER PUBLICATION router_cdc_publication SET TABLE
-            public.router_orders,
-            public.market_order_quotes,
-            public.market_order_actions,
-            public.order_execution_legs,
-            public.order_execution_steps,
-            public.order_provider_operations,
-            public.order_provider_addresses,
-            public.deposit_vaults,
-            public.custody_vaults;
-    END IF;
-END;
-$$;
+DROP PUBLICATION IF EXISTS router_cdc_publication;
+
+CREATE PUBLICATION router_cdc_publication;
+
+COMMENT ON PUBLICATION router_cdc_publication IS
+    'Message-only CDC publication. Router triggers emit compact pg_logical_emit_message payloads; consumers do not need row-level pgoutput relation changes.';

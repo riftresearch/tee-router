@@ -25,6 +25,9 @@ pub enum RouterServerError {
     #[snafu(display("Validation error: {}", message))]
     Validation { message: String },
 
+    #[snafu(display("Conflict: {}", message))]
+    Conflict { message: String },
+
     #[snafu(display("Unauthorized: {}", message))]
     Unauthorized { message: String },
 
@@ -58,27 +61,53 @@ impl From<sqlx_core::migrate::MigrateError> for RouterServerError {
 
 impl IntoResponse for RouterServerError {
     fn into_response(self) -> Response {
-        let status = match self {
+        let status = self.status_code();
+        if status.is_server_error() {
+            tracing::error!(error = %self, "router API request failed");
+        }
+
+        let body = Json(json!({
+            "error": {
+                "code": status.as_u16(),
+                "message": self.public_message(),
+            }
+        }));
+
+        (status, body).into_response()
+    }
+}
+
+impl RouterServerError {
+    fn status_code(&self) -> StatusCode {
+        match self {
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::Unauthorized { .. } => StatusCode::UNAUTHORIZED,
             Self::Forbidden { .. } => StatusCode::FORBIDDEN,
             Self::Validation { .. } => StatusCode::BAD_REQUEST,
+            Self::Conflict { .. } => StatusCode::CONFLICT,
             Self::NoRoute { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             Self::NotReady { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::InvalidData { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::DatabaseQuery { .. } | Self::Migration { .. } | Self::Internal { .. } => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
-        };
+        }
+    }
 
-        let body = Json(json!({
-            "error": {
-                "code": status.as_u16(),
-                "message": self.to_string(),
-            }
-        }));
-
-        (status, body).into_response()
+    fn public_message(&self) -> String {
+        match self {
+            Self::DatabaseQuery { .. }
+            | Self::InvalidData { .. }
+            | Self::Migration { .. }
+            | Self::Internal { .. } => "Internal server error".to_string(),
+            Self::Unauthorized { .. } => "Unauthorized".to_string(),
+            Self::Forbidden { .. } => "Forbidden".to_string(),
+            Self::NotFound
+            | Self::Validation { .. }
+            | Self::Conflict { .. }
+            | Self::NoRoute { .. }
+            | Self::NotReady { .. } => self.to_string(),
+        }
     }
 }
 
@@ -139,6 +168,7 @@ impl From<crate::services::vault_manager::VaultError> for RouterServerError {
             VaultError::InvalidFundingAmount { field, reason } => Self::Validation {
                 message: format!("Invalid funding amount {field}: {reason}"),
             },
+            VaultError::InvalidFundingHint { reason } => Self::Validation { message: reason },
             VaultError::FundingHintNotReady { reason } => Self::NotReady { message: reason },
             VaultError::FundingCheck { message } => Self::Internal { message },
             VaultError::Random { source } => Self::Internal {
@@ -215,5 +245,50 @@ impl From<crate::services::order_manager::MarketOrderError> for RouterServerErro
                 message: source.to_string(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    #[tokio::test]
+    async fn server_errors_do_not_expose_internal_details() {
+        let response = RouterServerError::DatabaseQuery {
+            source: sqlx_core::Error::Protocol(
+                "private relation router_orders_private failed".to_string(),
+            ),
+        }
+        .into_response();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"]["message"], "Internal server error");
+        assert!(!body.to_string().contains("router_orders_private"));
+    }
+
+    #[test]
+    fn validation_errors_remain_actionable() {
+        let error = RouterServerError::Validation {
+            message: "bad input".to_string(),
+        };
+
+        assert_eq!(error.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(error.public_message(), "Validation error: bad input");
+    }
+
+    #[test]
+    fn auth_errors_do_not_expose_configuration_state() {
+        let error = RouterServerError::Unauthorized {
+            message: "detector API key is not configured".to_string(),
+        };
+
+        assert_eq!(error.status_code(), StatusCode::UNAUTHORIZED);
+        assert_eq!(error.public_message(), "Unauthorized");
     }
 }

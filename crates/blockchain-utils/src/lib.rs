@@ -3,6 +3,7 @@ mod bitcoin_wallet;
 mod transfer_auth_helper;
 pub use alloy_ext::*;
 pub use bitcoin_wallet::*;
+use tracing::error;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 pub use transfer_auth_helper::*;
 
@@ -15,10 +16,10 @@ where
     match result {
         Some(Ok(thread_result)) => match thread_result {
             Ok(_) => Err("Background thread completed unexpectedly".into()),
-            Err(e) => Err(format!("Background thread panicked: {e}").into()),
+            Err(e) => Err(format!("Background thread returned error: {e}").into()),
         },
         Some(Err(e)) => Err(format!("Join set failed: {e}").into()),
-        None => Err("Join set panicked with no result".into()),
+        None => Err("Join set ended with no result".into()),
     }
 }
 
@@ -53,21 +54,41 @@ pub async fn shutdown_signal() {
     {
         use tokio::signal::unix::{signal, SignalKind};
 
-        let mut sigterm =
-            signal(SignalKind::terminate()).expect("failed to install handler for SIGTERM");
-        let mut sigint =
-            signal(SignalKind::interrupt()).expect("failed to install handler for SIGINT");
-
-        tokio::select! {
-            _ = sigterm.recv() => {},
-            _ = sigint.recv() => {},
+        match (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+        ) {
+            (Ok(mut sigterm), Ok(mut sigint)) => {
+                tokio::select! {
+                    _ = sigterm.recv() => {},
+                    _ = sigint.recv() => {},
+                }
+            }
+            (Ok(mut sigterm), Err(err)) => {
+                error!(error = %err, "failed to install SIGINT handler; waiting for SIGTERM only");
+                let _ = sigterm.recv().await;
+            }
+            (Err(err), Ok(mut sigint)) => {
+                error!(error = %err, "failed to install SIGTERM handler; waiting for SIGINT only");
+                let _ = sigint.recv().await;
+            }
+            (Err(term_err), Err(int_err)) => {
+                error!(
+                    sigterm_error = %term_err,
+                    sigint_error = %int_err,
+                    "failed to install unix signal handlers; falling back to Ctrl+C"
+                );
+                if let Err(err) = tokio::signal::ctrl_c().await {
+                    error!(error = %err, "failed to wait for Ctrl+C shutdown signal");
+                }
+            }
         }
     }
 
     #[cfg(not(unix))]
     {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            error!(error = %err, "failed to wait for Ctrl+C shutdown signal");
+        }
     }
 }

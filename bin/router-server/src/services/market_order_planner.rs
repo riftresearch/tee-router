@@ -6,7 +6,8 @@ use crate::{
     },
     protocol::DepositAsset,
     services::asset_registry::{
-        AssetRegistry, MarketOrderTransitionKind, ProviderId, RequiredCustodyRole, TransitionDecl,
+        AssetRegistry, MarketOrderNode, MarketOrderTransitionKind, ProviderId, RequiredCustodyRole,
+        TransitionDecl,
     },
     services::quote_legs::QuoteLeg,
 };
@@ -24,9 +25,15 @@ pub enum MarketOrderRoutePlanError {
     #[snafu(display("limit order route planning requires a limit-order action"))]
     NonLimitOrderAction,
 
-    #[snafu(display("quote {} does not belong to order {}", quote_order_id, order_id))]
+    #[snafu(display(
+        "quote {} does not belong to order {}",
+        quote_order_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "missing order id".to_string()),
+        order_id
+    ))]
     QuoteOrderMismatch {
-        quote_order_id: Uuid,
+        quote_order_id: Option<Uuid>,
         order_id: Uuid,
     },
 
@@ -189,7 +196,7 @@ impl MarketOrderRoutePlanner {
         }
         if quote.order_id != Some(order.id) {
             return Err(MarketOrderRoutePlanError::QuoteOrderMismatch {
-                quote_order_id: quote.order_id.unwrap_or_default(),
+                quote_order_id: quote.order_id,
                 order_id: order.id,
             });
         }
@@ -223,7 +230,7 @@ impl MarketOrderRoutePlanner {
         }
         if quote.order_id != Some(order.id) {
             return Err(MarketOrderRoutePlanError::QuoteOrderMismatch {
-                quote_order_id: quote.order_id.unwrap_or_default(),
+                quote_order_id: quote.order_id,
                 order_id: order.id,
             });
         }
@@ -260,8 +267,25 @@ impl MarketOrderRoutePlanner {
                     .to_string(),
             })?
             .iter()
-            .filter_map(|value| value.as_str().map(ToString::to_string))
-            .collect();
+            .enumerate()
+            .map(|(index, value)| {
+                let id = value.as_str().ok_or_else(|| {
+                    MarketOrderRoutePlanError::UnsupportedRoute {
+                        reason: format!(
+                            "market order quote provider_quote.transition_decl_ids[{index}] must be a string"
+                        ),
+                    }
+                })?;
+                if id.is_empty() {
+                    return Err(MarketOrderRoutePlanError::UnsupportedRoute {
+                        reason: format!(
+                            "market order quote provider_quote.transition_decl_ids[{index}] must be non-empty"
+                        ),
+                    });
+                }
+                Ok(id.to_string())
+            })
+            .collect::<Result<_, _>>()?;
         if transition_ids.is_empty() {
             return Err(MarketOrderRoutePlanError::UnsupportedRoute {
                 reason: "market order quote contains no transition declarations".to_string(),
@@ -301,6 +325,7 @@ impl MarketOrderRoutePlanner {
                 })
             })
             .collect::<Result<_, _>>()?;
+        validate_quoted_transition_path_shape(order, &transitions)?;
 
         let first =
             transitions
@@ -396,10 +421,10 @@ fn materialize_transition_steps(
                     },
                 )?;
                 leg_index += 1;
-                step_index += 1;
+                advance_step_index(&mut step_index, 1)?;
             }
             MarketOrderTransitionKind::CctpBridge => {
-                let mut cctp_legs = legs.take_all(&transition.id);
+                let mut cctp_legs = legs.take_all(&transition.id, transition.kind)?;
                 let burn_leg = take_execution_leg(
                     &mut cctp_legs,
                     &transition.id,
@@ -451,7 +476,7 @@ fn materialize_transition_steps(
                     },
                 )?;
                 leg_index += 1;
-                step_index += i32::try_from(cctp_step_count).unwrap_or(0);
+                advance_step_index(&mut step_index, cctp_step_count)?;
             }
             MarketOrderTransitionKind::UnitDeposit => {
                 let leg = legs.take_one(&transition.id, transition.kind)?;
@@ -478,7 +503,7 @@ fn materialize_transition_steps(
                     },
                 )?;
                 leg_index += 1;
-                step_index += 1;
+                advance_step_index(&mut step_index, 1)?;
             }
             MarketOrderTransitionKind::HyperliquidBridgeDeposit => {
                 let leg = legs.take_one(&transition.id, transition.kind)?;
@@ -505,7 +530,7 @@ fn materialize_transition_steps(
                     },
                 )?;
                 leg_index += 1;
-                step_index += 1;
+                advance_step_index(&mut step_index, 1)?;
             }
             MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
                 let leg = legs.take_one(&transition.id, transition.kind)?;
@@ -537,10 +562,10 @@ fn materialize_transition_steps(
                     },
                 )?;
                 leg_index += 1;
-                step_index += 1;
+                advance_step_index(&mut step_index, 1)?;
             }
             MarketOrderTransitionKind::HyperliquidTrade => {
-                let transition_legs = legs.take_all(&transition.id);
+                let transition_legs = legs.take_all(&transition.id, transition.kind)?;
                 if transition_legs.is_empty() {
                     return Err(MarketOrderRoutePlanError::UnsupportedRoute {
                         reason: format!(
@@ -595,7 +620,7 @@ fn materialize_transition_steps(
                         })?
                     };
                     transition_steps.push(materialized_step);
-                    step_index += 1;
+                    advance_step_index(&mut step_index, 1)?;
                 }
                 push_execution_leg(
                     &mut execution_legs,
@@ -643,7 +668,7 @@ fn materialize_transition_steps(
                     },
                 )?;
                 leg_index += 1;
-                step_index += 1;
+                advance_step_index(&mut step_index, 1)?;
             }
             MarketOrderTransitionKind::UnitWithdrawal => {
                 let leg = legs.take_one(&transition.id, transition.kind)?;
@@ -674,16 +699,94 @@ fn materialize_transition_steps(
                     },
                 )?;
                 leg_index += 1;
-                step_index += 1;
+                advance_step_index(&mut step_index, 1)?;
             }
         }
     }
 
+    legs.finish()?;
     attach_quote_gas_plan_to_steps(&mut steps, quote);
     Ok(MaterializedRoutePlan {
         legs: execution_legs,
         steps,
     })
+}
+
+fn advance_step_index(step_index: &mut i32, increment: usize) -> MarketOrderRoutePlanResult<()> {
+    let increment =
+        i32::try_from(increment).map_err(|_| MarketOrderRoutePlanError::UnsupportedRoute {
+            reason: format!("execution step increment {increment} exceeds i32"),
+        })?;
+    *step_index = step_index.checked_add(increment).ok_or_else(|| {
+        MarketOrderRoutePlanError::UnsupportedRoute {
+            reason: "execution step index overflowed".to_string(),
+        }
+    })?;
+    Ok(())
+}
+
+fn validate_quoted_transition_path_shape(
+    order: &RouterOrder,
+    transitions: &[TransitionDecl],
+) -> MarketOrderRoutePlanResult<()> {
+    let Some(first) = transitions.first() else {
+        return Err(MarketOrderRoutePlanError::UnsupportedRoute {
+            reason: "quoted transition path is empty".to_string(),
+        });
+    };
+    let Some(last) = transitions.last() else {
+        return Err(MarketOrderRoutePlanError::UnsupportedRoute {
+            reason: "quoted transition path is empty".to_string(),
+        });
+    };
+
+    let expected_start = MarketOrderNode::External(order.source_asset.clone());
+    if first.from != expected_start {
+        return Err(MarketOrderRoutePlanError::UnsupportedRoute {
+            reason: format!(
+                "quoted transition path starts from node {:?} instead of {:?}",
+                first.from, expected_start
+            ),
+        });
+    }
+
+    let expected_goal = MarketOrderNode::External(order.destination_asset.clone());
+    if last.to != expected_goal {
+        return Err(MarketOrderRoutePlanError::UnsupportedRoute {
+            reason: format!(
+                "quoted transition path ends at node {:?} instead of {:?}",
+                last.to, expected_goal
+            ),
+        });
+    }
+
+    for pair in transitions.windows(2) {
+        let previous = &pair[0];
+        let next = &pair[1];
+        if previous.to != next.from {
+            return Err(MarketOrderRoutePlanError::UnsupportedRoute {
+                reason: format!(
+                    "quoted transition path is disconnected between {} and {}",
+                    previous.id, next.id
+                ),
+            });
+        }
+        if previous.output.asset != next.input.asset {
+            return Err(MarketOrderRoutePlanError::UnsupportedRoute {
+                reason: format!(
+                    "quoted transition path asset flow is disconnected between {} ({} {}) and {} ({} {})",
+                    previous.id,
+                    previous.output.asset.chain,
+                    previous.output.asset.asset,
+                    next.id,
+                    next.input.asset.chain,
+                    next.input.asset.asset
+                ),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 struct MaterializedRoutePlan {
@@ -740,7 +843,15 @@ fn execution_leg_from_quote_legs(
                 transition.kind.as_str()
             ),
         })?;
-    let last = quote_legs.last().expect("non-empty quote legs");
+    let last = quote_legs
+        .last()
+        .ok_or_else(|| MarketOrderRoutePlanError::UnsupportedRoute {
+            reason: format!(
+                "transition {} ({}) has no quoted legs to materialize",
+                transition.id,
+                transition.kind.as_str()
+            ),
+        })?;
     let input_asset = first.input_deposit_asset().map_err(|reason| {
         MarketOrderRoutePlanError::UnsupportedRoute {
             reason: format!(
@@ -972,16 +1083,22 @@ struct QuoteLegIndex {
 impl QuoteLegIndex {
     fn from_quote(quote: &MarketOrderQuote) -> MarketOrderRoutePlanResult<Self> {
         let mut by_transition_id: HashMap<String, Vec<QuoteLeg>> = HashMap::new();
-        for leg in quote
+        let legs = quote
             .provider_quote
             .get("legs")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
+            .ok_or_else(|| MarketOrderRoutePlanError::UnsupportedRoute {
+                reason: "market order quote is missing provider_quote.legs".to_string(),
+            })?
+            .as_array()
+            .ok_or_else(|| MarketOrderRoutePlanError::UnsupportedRoute {
+                reason: "market order quote provider_quote.legs must be an array".to_string(),
+            })?;
+        for (index, leg) in legs.iter().enumerate() {
             let leg: QuoteLeg = serde_json::from_value(leg.clone()).map_err(|err| {
                 MarketOrderRoutePlanError::UnsupportedRoute {
-                    reason: format!("quoted leg is invalid for typed route materialization: {err}"),
+                    reason: format!(
+                        "quoted leg {index} is invalid for typed route materialization: {err}"
+                    ),
                 }
             })?;
             let transition_id = leg.parent_transition_id().to_string();
@@ -995,7 +1112,7 @@ impl QuoteLegIndex {
         transition_id: &str,
         kind: MarketOrderTransitionKind,
     ) -> MarketOrderRoutePlanResult<QuoteLeg> {
-        let mut legs = self.take_all(transition_id);
+        let mut legs = self.take_all(transition_id, kind)?;
         if legs.len() != 1 {
             return Err(MarketOrderRoutePlanError::UnsupportedRoute {
                 reason: format!(
@@ -1008,10 +1125,43 @@ impl QuoteLegIndex {
         Ok(legs.remove(0))
     }
 
-    fn take_all(&mut self, transition_id: &str) -> Vec<QuoteLeg> {
-        self.by_transition_id
+    fn take_all(
+        &mut self,
+        transition_id: &str,
+        kind: MarketOrderTransitionKind,
+    ) -> MarketOrderRoutePlanResult<Vec<QuoteLeg>> {
+        let legs = self
+            .by_transition_id
             .remove(transition_id)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        for leg in &legs {
+            if leg.transition_kind != kind {
+                return Err(MarketOrderRoutePlanError::UnsupportedRoute {
+                    reason: format!(
+                        "quoted leg {} declares kind {} but transition {} is {}",
+                        leg.transition_decl_id,
+                        leg.transition_kind.as_str(),
+                        transition_id,
+                        kind.as_str()
+                    ),
+                });
+            }
+        }
+        Ok(legs)
+    }
+
+    fn finish(self) -> MarketOrderRoutePlanResult<()> {
+        if self.by_transition_id.is_empty() {
+            return Ok(());
+        }
+        let mut transition_ids = self.by_transition_id.into_keys().collect::<Vec<_>>();
+        transition_ids.sort();
+        Err(MarketOrderRoutePlanError::UnsupportedRoute {
+            reason: format!(
+                "market order quote contains unconsumed legs for transition(s): {}",
+                transition_ids.join(", ")
+            ),
+        })
     }
 }
 
@@ -1788,7 +1938,12 @@ fn cctp_bridge_steps(
         .raw
         .get("max_fee")
         .and_then(Value::as_str)
-        .unwrap_or("0")
+        .ok_or_else(|| MarketOrderRoutePlanError::UnsupportedRoute {
+            reason: format!(
+                "CCTP burn leg {} missing raw.max_fee",
+                burn_leg.transition_decl_id
+            ),
+        })?
         .to_string();
     let source_role_string = source_role.map(|role| role.to_db_string().to_string());
     let (source_custody_vault_id, source_custody_vault_address) = if source_role.is_none() {
@@ -2310,6 +2465,7 @@ mod tests {
         VaultAction,
     };
     use crate::protocol::{AssetId, ChainId};
+    use crate::services::asset_registry::AssetSlot;
 
     fn planned_step(
         step_index: i32,
@@ -2376,6 +2532,320 @@ mod tests {
                 step.step_type.to_db_string()
             );
         }
+    }
+
+    #[test]
+    fn quote_order_mismatch_preserves_missing_quote_order_id() {
+        let order_id = Uuid::now_v7();
+        let error = MarketOrderRoutePlanError::QuoteOrderMismatch {
+            quote_order_id: None,
+            order_id,
+        };
+
+        let message = error.to_string();
+        assert!(message.contains("missing order id"), "{message}");
+        assert!(!message.contains(&Uuid::nil().to_string()), "{message}");
+    }
+
+    #[test]
+    fn advance_step_index_rejects_overflow() {
+        let mut step_index = i32::MAX;
+
+        let error = advance_step_index(&mut step_index, 1)
+            .expect_err("overflowed step indexes must reject");
+
+        assert_eq!(step_index, i32::MAX);
+        assert!(matches!(
+            error,
+            MarketOrderRoutePlanError::UnsupportedRoute { reason }
+                if reason.contains("overflowed")
+        ));
+    }
+
+    #[test]
+    fn advance_step_index_rejects_increment_that_exceeds_i32() {
+        let mut step_index = 1;
+        let increment = usize::try_from(i32::MAX).expect("i32::MAX fits usize") + 1;
+
+        let error = advance_step_index(&mut step_index, increment)
+            .expect_err("overlarge step increments must reject");
+
+        assert_eq!(step_index, 1);
+        assert!(matches!(
+            error,
+            MarketOrderRoutePlanError::UnsupportedRoute { reason }
+                if reason.contains("exceeds i32")
+        ));
+    }
+
+    fn quote_leg_value(
+        transition_id: &str,
+        transition_parent_id: &str,
+        transition_kind: MarketOrderTransitionKind,
+        execution_step_type: OrderExecutionStepType,
+        provider: ProviderId,
+        input_asset: &DepositAsset,
+        output_asset: &DepositAsset,
+    ) -> Value {
+        json!({
+            "transition_decl_id": transition_id,
+            "transition_parent_decl_id": transition_parent_id,
+            "transition_kind": transition_kind.as_str(),
+            "execution_step_type": execution_step_type.to_db_string(),
+            "provider": provider.as_str(),
+            "input_asset": {
+                "chain_id": input_asset.chain.as_str(),
+                "asset": input_asset.asset.as_str(),
+            },
+            "output_asset": {
+                "chain_id": output_asset.chain.as_str(),
+                "asset": output_asset.asset.as_str(),
+            },
+            "amount_in": "1000",
+            "amount_out": "990",
+            "expires_at": (Utc::now() + chrono::Duration::minutes(5)).to_rfc3339(),
+            "raw": {
+                "kind": execution_step_type.to_db_string()
+            },
+        })
+    }
+
+    fn quote_with_legs(legs: Vec<Value>) -> MarketOrderQuote {
+        let now = Utc::now();
+        let source_asset = asset("evm:8453", AssetId::Native);
+        let destination_asset = asset("evm:1", AssetId::Native);
+        MarketOrderQuote {
+            id: Uuid::now_v7(),
+            order_id: Some(Uuid::now_v7()),
+            source_asset,
+            destination_asset,
+            recipient_address: "0x5555555555555555555555555555555555555555".to_string(),
+            provider_id: "path:test".to_string(),
+            order_kind: MarketOrderKindType::ExactIn,
+            amount_in: "1000".to_string(),
+            amount_out: "990".to_string(),
+            min_amount_out: Some("980".to_string()),
+            max_amount_in: None,
+            slippage_bps: 100,
+            provider_quote: json!({ "legs": legs }),
+            usd_valuation: json!({}),
+            expires_at: now + chrono::Duration::minutes(5),
+            created_at: now,
+        }
+    }
+
+    fn funded_market_order(
+        source_asset: DepositAsset,
+        destination_asset: DepositAsset,
+    ) -> RouterOrder {
+        let now = Utc::now();
+        let order_id = Uuid::now_v7();
+        RouterOrder {
+            id: order_id,
+            order_type: RouterOrderType::MarketOrder,
+            status: RouterOrderStatus::Funded,
+            funding_vault_id: Some(Uuid::now_v7()),
+            source_asset,
+            destination_asset,
+            recipient_address: "0x5555555555555555555555555555555555555555".to_string(),
+            refund_address: "0x6666666666666666666666666666666666666666".to_string(),
+            action: RouterOrderAction::MarketOrder(MarketOrderAction {
+                order_kind: MarketOrderKind::ExactIn {
+                    amount_in: "1000".to_string(),
+                    min_amount_out: "900".to_string(),
+                },
+                slippage_bps: 100,
+            }),
+            action_timeout_at: now + chrono::Duration::minutes(10),
+            idempotency_key: None,
+            workflow_trace_id: order_id.simple().to_string(),
+            workflow_parent_span_id: "1111111111111111".to_string(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn quote_leg_index_rejects_transition_kind_mismatch() {
+        let source_asset = asset("evm:8453", AssetId::Native);
+        let destination_asset = asset("evm:1", AssetId::Native);
+        let quote = quote_with_legs(vec![quote_leg_value(
+            "bridge:1",
+            "bridge:1",
+            MarketOrderTransitionKind::UnitDeposit,
+            OrderExecutionStepType::UnitDeposit,
+            ProviderId::Across,
+            &source_asset,
+            &destination_asset,
+        )]);
+        let mut index = QuoteLegIndex::from_quote(&quote).expect("quote legs should decode");
+
+        let err = index
+            .take_one("bridge:1", MarketOrderTransitionKind::AcrossBridge)
+            .expect_err("wrong transition kind must reject");
+
+        assert!(matches!(
+            err,
+            MarketOrderRoutePlanError::UnsupportedRoute { reason }
+                if reason.contains("declares kind unit_deposit")
+        ));
+    }
+
+    #[test]
+    fn quote_leg_index_rejects_unconsumed_quoted_legs() {
+        let source_asset = asset("evm:8453", AssetId::Native);
+        let destination_asset = asset("evm:1", AssetId::Native);
+        let quote = quote_with_legs(vec![
+            quote_leg_value(
+                "bridge:1",
+                "bridge:1",
+                MarketOrderTransitionKind::AcrossBridge,
+                OrderExecutionStepType::AcrossBridge,
+                ProviderId::Across,
+                &source_asset,
+                &destination_asset,
+            ),
+            quote_leg_value(
+                "unexpected:1",
+                "unexpected:1",
+                MarketOrderTransitionKind::AcrossBridge,
+                OrderExecutionStepType::AcrossBridge,
+                ProviderId::Across,
+                &source_asset,
+                &destination_asset,
+            ),
+        ]);
+        let mut index = QuoteLegIndex::from_quote(&quote).expect("quote legs should decode");
+
+        let _leg = index
+            .take_one("bridge:1", MarketOrderTransitionKind::AcrossBridge)
+            .expect("expected leg should be consumed");
+        let err = index.finish().expect_err("unconsumed leg must reject");
+
+        assert!(matches!(
+            err,
+            MarketOrderRoutePlanError::UnsupportedRoute { reason }
+                if reason.contains("unexpected:1")
+        ));
+    }
+
+    #[test]
+    fn quote_leg_index_rejects_malformed_legs_container() {
+        let mut quote = quote_with_legs(vec![]);
+        quote.provider_quote = json!({ "legs": { "not": "an array" } });
+
+        let err = QuoteLegIndex::from_quote(&quote)
+            .expect_err("malformed provider_quote.legs must reject");
+
+        assert!(matches!(
+            err,
+            MarketOrderRoutePlanError::UnsupportedRoute { reason }
+                if reason.contains("provider_quote.legs must be an array")
+        ));
+    }
+
+    #[test]
+    fn quoted_transition_path_shape_rejects_disconnected_serialized_transitions() {
+        let source_asset = asset("evm:8453", AssetId::Native);
+        let intermediate_asset = asset("evm:42161", AssetId::Native);
+        let destination_asset = asset("evm:1", AssetId::Native);
+        let order = funded_market_order(source_asset.clone(), destination_asset.clone());
+        let transitions = vec![
+            TransitionDecl {
+                id: "first".to_string(),
+                kind: MarketOrderTransitionKind::AcrossBridge,
+                provider: ProviderId::Across,
+                input: AssetSlot {
+                    asset: source_asset.clone(),
+                    required_custody_role: RequiredCustodyRole::SourceOrIntermediate,
+                },
+                output: AssetSlot {
+                    asset: intermediate_asset.clone(),
+                    required_custody_role: RequiredCustodyRole::IntermediateExecution,
+                },
+                from: MarketOrderNode::External(source_asset.clone()),
+                to: MarketOrderNode::External(intermediate_asset.clone()),
+            },
+            TransitionDecl {
+                id: "second".to_string(),
+                kind: MarketOrderTransitionKind::AcrossBridge,
+                provider: ProviderId::Across,
+                input: AssetSlot {
+                    asset: intermediate_asset,
+                    required_custody_role: RequiredCustodyRole::IntermediateExecution,
+                },
+                output: AssetSlot {
+                    asset: destination_asset.clone(),
+                    required_custody_role: RequiredCustodyRole::DestinationPayout,
+                },
+                from: MarketOrderNode::External(source_asset),
+                to: MarketOrderNode::External(destination_asset),
+            },
+        ];
+
+        let err = validate_quoted_transition_path_shape(&order, &transitions)
+            .expect_err("disconnected serialized transition path must reject");
+
+        assert!(matches!(
+            err,
+            MarketOrderRoutePlanError::UnsupportedRoute { reason }
+                if reason.contains("disconnected between first and second")
+        ));
+    }
+
+    #[test]
+    fn quoted_transition_path_rejects_malformed_transition_decl_ids() {
+        let source_asset = asset("evm:8453", AssetId::Native);
+        let destination_asset = asset("evm:1", AssetId::Native);
+        let order = funded_market_order(source_asset.clone(), destination_asset.clone());
+        let transition = TransitionDecl {
+            id: "single:bridge".to_string(),
+            kind: MarketOrderTransitionKind::AcrossBridge,
+            provider: ProviderId::Across,
+            input: AssetSlot {
+                asset: source_asset.clone(),
+                required_custody_role: RequiredCustodyRole::SourceOrIntermediate,
+            },
+            output: AssetSlot {
+                asset: destination_asset.clone(),
+                required_custody_role: RequiredCustodyRole::DestinationPayout,
+            },
+            from: MarketOrderNode::External(source_asset.clone()),
+            to: MarketOrderNode::External(destination_asset.clone()),
+        };
+        let now = Utc::now();
+        let quote = MarketOrderQuote {
+            id: Uuid::now_v7(),
+            order_id: Some(order.id),
+            source_asset,
+            destination_asset,
+            recipient_address: order.recipient_address.clone(),
+            provider_id: "path:malformed-transition-ids".to_string(),
+            order_kind: MarketOrderKindType::ExactIn,
+            amount_in: "1000".to_string(),
+            amount_out: "990".to_string(),
+            min_amount_out: Some("980".to_string()),
+            max_amount_in: None,
+            slippage_bps: 100,
+            provider_quote: json!({
+                "transition_decl_ids": ["single:bridge", 7],
+                "transitions": [transition],
+                "legs": []
+            }),
+            usd_valuation: json!({}),
+            expires_at: now + chrono::Duration::minutes(5),
+            created_at: now,
+        };
+
+        let err = MarketOrderRoutePlanner::default()
+            .resolve_quoted_transition_path(&order, &quote)
+            .expect_err("malformed transition declaration ids must reject");
+
+        assert!(matches!(
+            err,
+            MarketOrderRoutePlanError::UnsupportedRoute { reason }
+                if reason.contains("transition_decl_ids[1] must be a string")
+        ));
     }
 
     #[test]
@@ -2913,7 +3383,7 @@ mod tests {
             created_at: now,
         };
 
-        let plan = MarketOrderRoutePlanner::new(registry)
+        let plan = MarketOrderRoutePlanner::new(registry.clone())
             .plan(&order, &source_vault, &quote, now)
             .expect("CCTP path should plan");
 
@@ -2977,6 +3447,16 @@ mod tests {
         );
         assert_eq!(plan.steps[1].request["message"], json!(""));
         assert_eq!(plan.steps[1].output_asset, Some(destination_asset));
+
+        let mut missing_fee_quote = quote.clone();
+        missing_fee_quote.provider_quote["legs"][0]["raw"]
+            .as_object_mut()
+            .expect("raw object")
+            .remove("max_fee");
+        let err = MarketOrderRoutePlanner::new(registry)
+            .plan(&order, &source_vault, &missing_fee_quote, now)
+            .expect_err("missing CCTP max_fee must reject");
+        assert!(err.to_string().contains("missing raw.max_fee"), "{err}");
     }
 
     #[test]

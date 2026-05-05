@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::fmt;
 
 use crate::{
     evm_devnet::{
@@ -8,7 +9,7 @@ use crate::{
         MOCK_CCTP_MESSAGE_TRANSMITTER_V2_ADDRESS, MOCK_CCTP_TOKEN_MESSENGER_V2_ADDRESS,
         MOCK_ERC20_ADDRESS,
     },
-    MultichainAccount, RiftDevnet,
+    MultichainAccount, Result, RiftDevnet,
 };
 
 pub const DEVNET_DEMO_ACCOUNT_SALT: u32 = 110_101;
@@ -39,7 +40,7 @@ pub struct DevnetManifest {
     pub contracts: DevnetContracts,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct DevnetAccounts {
     pub demo_evm_address: String,
     pub demo_evm_private_key: String,
@@ -50,10 +51,33 @@ pub struct DevnetAccounts {
     pub loadgen_evm_accounts: Vec<DevnetEvmAccount>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+impl fmt::Debug for DevnetAccounts {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DevnetAccounts")
+            .field("demo_evm_address", &self.demo_evm_address)
+            .field("demo_evm_private_key", &"redacted")
+            .field("demo_bitcoin_address", &self.demo_bitcoin_address)
+            .field("demo_bitcoin_descriptor", &"redacted")
+            .field("anvil_default_private_key", &"redacted")
+            .field("anvil_default_address", &self.anvil_default_address)
+            .field("loadgen_evm_accounts", &self.loadgen_evm_accounts)
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize)]
 pub struct DevnetEvmAccount {
     pub address: String,
     pub private_key: String,
+}
+
+impl fmt::Debug for DevnetEvmAccount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DevnetEvmAccount")
+            .field("address", &self.address)
+            .field("private_key", &"redacted")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -100,10 +124,9 @@ pub struct DevnetContracts {
 }
 
 impl DevnetManifest {
-    #[must_use]
-    pub fn from_devnet(devnet: &RiftDevnet) -> Self {
-        let demo = MultichainAccount::new(DEVNET_DEMO_ACCOUNT_SALT);
-        Self {
+    pub fn from_devnet(devnet: &RiftDevnet) -> Result<Self> {
+        let demo = MultichainAccount::new(DEVNET_DEMO_ACCOUNT_SALT)?;
+        Ok(Self {
             version: 1,
             deterministic: true,
             accounts: DevnetAccounts {
@@ -187,21 +210,21 @@ impl DevnetManifest {
                 mock_cctp_message_transmitter_v2: MOCK_CCTP_MESSAGE_TRANSMITTER_V2_ADDRESS
                     .to_string(),
             },
-        }
+        })
     }
 }
 
-#[must_use]
-pub fn deterministic_loadgen_evm_accounts(count: usize) -> Vec<DevnetEvmAccount> {
+pub fn deterministic_loadgen_evm_accounts(count: usize) -> Result<Vec<DevnetEvmAccount>> {
     (0..count)
         .map(|index| {
-            let account = MultichainAccount::new(
-                DEVNET_LOADGEN_ACCOUNT_SALT_START + u32::try_from(index).unwrap_or(u32::MAX),
-            );
-            DevnetEvmAccount {
+            let index = u32::try_from(index).map_err(|error| {
+                eyre::eyre!("loadgen account index {index} exceeds u32 salt space: {error}")
+            })?;
+            let account = MultichainAccount::new(DEVNET_LOADGEN_ACCOUNT_SALT_START + index)?;
+            Ok(DevnetEvmAccount {
                 address: format!("{:#x}", account.ethereum_address),
                 private_key: format!("0x{}", alloy::hex::encode(account.secret_bytes)),
-            }
+            })
         })
         .collect()
 }
@@ -220,4 +243,68 @@ fn evm_chain(id: &str, name: &str, chain_id: u64, port: u16) -> DevnetChain {
 
 fn token_indexer_url(enabled: bool, port: u16) -> Option<String> {
     enabled.then(|| format!("http://devnet:{port}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn devnet_accounts_debug_redacts_private_material() {
+        let accounts = DevnetAccounts {
+            demo_evm_address: "0x1111111111111111111111111111111111111111".to_string(),
+            demo_evm_private_key:
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            demo_bitcoin_address: "bcrt1q2pfqp8a574jxyszmk0h5rxf02wwkpaf4hd8009".to_string(),
+            demo_bitcoin_descriptor: "wpkh(secret-descriptor)".to_string(),
+            anvil_default_private_key:
+                "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            anvil_default_address: "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_string(),
+            loadgen_evm_accounts: vec![DevnetEvmAccount {
+                address: "0x2222222222222222222222222222222222222222".to_string(),
+                private_key: "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                    .to_string(),
+            }],
+        };
+
+        let rendered = format!("{accounts:?}");
+
+        assert!(!rendered.contains("aaaaaaaa"));
+        assert!(!rendered.contains("secret-descriptor"));
+        assert!(!rendered.contains("bbbbbbbb"));
+        assert!(!rendered.contains("cccccccc"));
+        assert!(rendered.contains("redacted"));
+        assert!(rendered.contains("1111111111111111111111111111111111111111"));
+        assert!(rendered.contains("2222222222222222222222222222222222222222"));
+    }
+
+    #[test]
+    fn devnet_accounts_serialization_still_exports_loadgen_keys() {
+        let accounts = DevnetAccounts {
+            demo_evm_address: "0x1111111111111111111111111111111111111111".to_string(),
+            demo_evm_private_key:
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            demo_bitcoin_address: "bcrt1q2pfqp8a574jxyszmk0h5rxf02wwkpaf4hd8009".to_string(),
+            demo_bitcoin_descriptor: "wpkh(local-devnet-descriptor)".to_string(),
+            anvil_default_private_key:
+                "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            anvil_default_address: "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_string(),
+            loadgen_evm_accounts: vec![DevnetEvmAccount {
+                address: "0x2222222222222222222222222222222222222222".to_string(),
+                private_key: "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                    .to_string(),
+            }],
+        };
+
+        let serialized = serde_json::to_value(&accounts).expect("serialize");
+
+        assert_eq!(
+            serialized["demo_evm_private_key"],
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            serialized["loadgen_evm_accounts"][0]["private_key"],
+            "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        );
+    }
 }

@@ -11,7 +11,7 @@ type CliResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 const LIVE_TEST_PRIVATE_KEY: &str = "LIVE_TEST_PRIVATE_KEY";
 const HYPERLIQUID_PRIVATE_KEY: &str = "HYPERLIQUID_LIVE_PRIVATE_KEY";
 
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 #[command(about = "Sell a live Hyperliquid spot balance using a marketable IOC limit order")]
 struct Args {
     #[arg(

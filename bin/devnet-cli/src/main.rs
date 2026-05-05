@@ -130,7 +130,8 @@ async fn run_server(
         "[Devnet Server] Total startup time: {:?}",
         server_start.elapsed()
     );
-    let manifest = DevnetManifest::from_devnet(&devnet);
+    let manifest =
+        DevnetManifest::from_devnet(&devnet).whatever_context("Failed to build devnet manifest")?;
     devnet
         .join_set
         .spawn(run_manifest_server(manifest, manifest_port));
@@ -140,7 +141,9 @@ async fn run_server(
             info!("[Devnet Server] Shutdown signal received; shutting down...");
         }
         res = devnet.join_set.join_next() => {
-            handle_background_thread_result(res).unwrap();
+            handle_background_thread_result(res)
+                .map_err(|error| std::io::Error::other(error.to_string()))
+                .whatever_context("Devnet background task failed")?;
         }
     }
 
@@ -197,7 +200,7 @@ async fn run_cache() -> Result<(), Whatever> {
     info!("[Devnet Cache] Creating cached devnet...");
 
     // Create cache instance and save the devnet
-    let cache = RiftDevnetCache::new();
+    let cache = RiftDevnetCache::new().whatever_context("Failed to initialize devnet cache")?;
 
     // clear the cache directory then save
     tokio::fs::remove_dir_all(&cache.cache_dir).await.ok();

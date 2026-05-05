@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, env, path::PathBuf, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap, env, fmt, future::Future, path::PathBuf, str::FromStr, sync::Arc,
+    time::Duration,
+};
 
 use alloy::{
     network::{EthereumWallet, TransactionBuilder},
@@ -17,6 +20,10 @@ use serde::{Deserialize, Serialize};
 use tokio::{sync::Semaphore, task::JoinSet, time::Instant};
 use uuid::Uuid;
 
+const MAX_LOADGEN_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
+const LOADGEN_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const LOADGEN_CHAIN_FUNDING_TIMEOUT: Duration = Duration::from_secs(90);
+
 sol! {
     interface IERC20 {
         function transfer(address recipient, uint256 amount) external returns (bool);
@@ -29,6 +36,8 @@ const RANDOM_ROUTES: &[RandomRoute] = &[
         "Base.USDC",
         RandomAddressKind::Evm,
         RandomAddressKind::Evm,
+        LimitAsset::Usdc,
+        LimitAsset::Usdc,
         true,
     ),
     RandomRoute::new(
@@ -36,6 +45,8 @@ const RANDOM_ROUTES: &[RandomRoute] = &[
         "Arbitrum.USDC",
         RandomAddressKind::Evm,
         RandomAddressKind::Evm,
+        LimitAsset::Usdc,
+        LimitAsset::Usdc,
         true,
     ),
     RandomRoute::new(
@@ -43,6 +54,8 @@ const RANDOM_ROUTES: &[RandomRoute] = &[
         "Ethereum.USDC",
         RandomAddressKind::Evm,
         RandomAddressKind::Evm,
+        LimitAsset::Usdc,
+        LimitAsset::Usdc,
         true,
     ),
     RandomRoute::new(
@@ -50,6 +63,8 @@ const RANDOM_ROUTES: &[RandomRoute] = &[
         "Arbitrum.USDC",
         RandomAddressKind::Evm,
         RandomAddressKind::Evm,
+        LimitAsset::Usdc,
+        LimitAsset::Usdc,
         true,
     ),
     RandomRoute::new(
@@ -57,6 +72,8 @@ const RANDOM_ROUTES: &[RandomRoute] = &[
         "Ethereum.USDC",
         RandomAddressKind::Evm,
         RandomAddressKind::Evm,
+        LimitAsset::Usdc,
+        LimitAsset::Usdc,
         true,
     ),
     RandomRoute::new(
@@ -64,13 +81,26 @@ const RANDOM_ROUTES: &[RandomRoute] = &[
         "Base.USDC",
         RandomAddressKind::Evm,
         RandomAddressKind::Evm,
+        LimitAsset::Usdc,
+        LimitAsset::Usdc,
         true,
+    ),
+    RandomRoute::new(
+        "Ethereum.ETH",
+        "Bitcoin.BTC",
+        RandomAddressKind::Evm,
+        RandomAddressKind::Bitcoin,
+        LimitAsset::Eth,
+        LimitAsset::Btc,
+        false,
     ),
     RandomRoute::new(
         "Ethereum.USDC",
         "Bitcoin.BTC",
         RandomAddressKind::Evm,
         RandomAddressKind::Bitcoin,
+        LimitAsset::Usdc,
+        LimitAsset::Btc,
         false,
     ),
     RandomRoute::new(
@@ -78,6 +108,8 @@ const RANDOM_ROUTES: &[RandomRoute] = &[
         "Bitcoin.BTC",
         RandomAddressKind::Evm,
         RandomAddressKind::Bitcoin,
+        LimitAsset::Usdc,
+        LimitAsset::Btc,
         false,
     ),
     RandomRoute::new(
@@ -85,6 +117,8 @@ const RANDOM_ROUTES: &[RandomRoute] = &[
         "Bitcoin.BTC",
         RandomAddressKind::Evm,
         RandomAddressKind::Bitcoin,
+        LimitAsset::Usdc,
+        LimitAsset::Btc,
         false,
     ),
     RandomRoute::new(
@@ -92,6 +126,17 @@ const RANDOM_ROUTES: &[RandomRoute] = &[
         "Ethereum.ETH",
         RandomAddressKind::Bitcoin,
         RandomAddressKind::Evm,
+        LimitAsset::Btc,
+        LimitAsset::Eth,
+        false,
+    ),
+    RandomRoute::new(
+        "Bitcoin.BTC",
+        "Base.USDC",
+        RandomAddressKind::Bitcoin,
+        RandomAddressKind::Evm,
+        LimitAsset::Btc,
+        LimitAsset::Usdc,
         false,
     ),
     RandomRoute::new(
@@ -99,6 +144,44 @@ const RANDOM_ROUTES: &[RandomRoute] = &[
         "Base.ETH",
         RandomAddressKind::Bitcoin,
         RandomAddressKind::Evm,
+        LimitAsset::Btc,
+        LimitAsset::Eth,
+        false,
+    ),
+    RandomRoute::new(
+        "Base.ETH",
+        "Base.USDC",
+        RandomAddressKind::Evm,
+        RandomAddressKind::Evm,
+        LimitAsset::Eth,
+        LimitAsset::Usdc,
+        true,
+    ),
+    RandomRoute::new(
+        "Base.USDC",
+        "Base.ETH",
+        RandomAddressKind::Evm,
+        RandomAddressKind::Evm,
+        LimitAsset::Usdc,
+        LimitAsset::Eth,
+        true,
+    ),
+    RandomRoute::new(
+        "Base.ETH",
+        "Ethereum.USDC",
+        RandomAddressKind::Evm,
+        RandomAddressKind::Evm,
+        LimitAsset::Eth,
+        LimitAsset::Usdc,
+        false,
+    ),
+    RandomRoute::new(
+        "Base.USDC",
+        "Ethereum.ETH",
+        RandomAddressKind::Evm,
+        RandomAddressKind::Evm,
+        LimitAsset::Usdc,
+        LimitAsset::Eth,
         false,
     ),
 ];
@@ -192,6 +275,8 @@ struct RandomRoute {
     to: &'static str,
     source_kind: RandomAddressKind,
     destination_kind: RandomAddressKind,
+    input_asset: LimitAsset,
+    output_asset: LimitAsset,
     allow_exact_out: bool,
 }
 
@@ -201,6 +286,8 @@ impl RandomRoute {
         to: &'static str,
         source_kind: RandomAddressKind,
         destination_kind: RandomAddressKind,
+        input_asset: LimitAsset,
+        output_asset: LimitAsset,
         allow_exact_out: bool,
     ) -> Self {
         Self {
@@ -208,6 +295,8 @@ impl RandomRoute {
             to,
             source_kind,
             destination_kind,
+            input_asset,
+            output_asset,
             allow_exact_out,
         }
     }
@@ -268,6 +357,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Create one quote through the router gateway.
     Quote(QuoteCommand),
@@ -448,16 +538,34 @@ struct RuntimeConfig {
     gateway_url: Url,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct EvmFundingConfig {
     rpcs: BTreeMap<String, String>,
     private_keys: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+impl fmt::Debug for EvmFundingConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EvmFundingConfig")
+            .field("rpcs", &self.rpcs)
+            .field("private_keys", &redacted_vec(self.private_keys.len()))
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 struct BitcoinFundingConfig {
     rpc_url: Option<String>,
     rpc_auth: String,
+}
+
+impl fmt::Debug for BitcoinFundingConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BitcoinFundingConfig")
+            .field("rpc_url", &self.rpc_url)
+            .field("rpc_auth", &"redacted")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -546,8 +654,6 @@ struct OrderResponse {
     refund_mode: Option<String>,
     #[serde(default)]
     refund_authorizer: Option<String>,
-    #[serde(default)]
-    refund_token: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -572,9 +678,21 @@ struct DevnetManifestAccounts {
     loadgen_evm_accounts: Vec<DevnetManifestEvmAccount>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct DevnetManifestEvmAccount {
     private_key: String,
+}
+
+impl fmt::Debug for DevnetManifestEvmAccount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DevnetManifestEvmAccount")
+            .field("private_key", &"redacted")
+            .finish()
+    }
+}
+
+fn redacted_vec(len: usize) -> Vec<&'static str> {
+    vec!["redacted"; len]
 }
 
 #[tokio::main]
@@ -792,7 +910,9 @@ where
 {
     let response = http.post(url.clone()).json(body).send().await?;
     let status = response.status();
-    let bytes = response.bytes().await?;
+    let bytes = read_limited_response_body(response, MAX_LOADGEN_RESPONSE_BODY_BYTES)
+        .await
+        .wrap_err_with(|| format!("failed to read gateway response from {url}"))?;
     if !status.is_success() {
         let body = String::from_utf8_lossy(&bytes);
         return Err(eyre!(
@@ -800,6 +920,43 @@ where
         ));
     }
     serde_json::from_slice(&bytes).wrap_err("failed to decode gateway response")
+}
+
+async fn get_json<R>(http: &Client, url: Url) -> Result<R>
+where
+    R: for<'de> Deserialize<'de>,
+{
+    let response = http.get(url.clone()).send().await?;
+    let status = response.status();
+    let bytes = read_limited_response_body(response, MAX_LOADGEN_RESPONSE_BODY_BYTES)
+        .await
+        .wrap_err_with(|| format!("failed to read HTTP response from {url}"))?;
+    if !status.is_success() {
+        let body = String::from_utf8_lossy(&bytes);
+        return Err(eyre!("HTTP request to {url} failed with {status}: {body}"));
+    }
+    serde_json::from_slice(&bytes).wrap_err("failed to decode HTTP response")
+}
+
+async fn read_limited_response_body(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if !append_limited_body_chunk(&mut body, chunk.as_ref(), max_bytes) {
+            return Err(eyre!("gateway response body exceeded {max_bytes} bytes"));
+        }
+    }
+    Ok(body)
+}
+
+fn append_limited_body_chunk(body: &mut Vec<u8>, chunk: &[u8], max_bytes: usize) -> bool {
+    if body.len().saturating_add(chunk.len()) > max_bytes {
+        return false;
+    }
+    body.extend_from_slice(chunk);
+    true
 }
 
 async fn fund_order(
@@ -828,12 +985,15 @@ async fn fund_order(
         let private_key = evm_private_key
             .or_else(|| funding.evm.private_keys.first().map(String::as_str))
             .ok_or_else(|| eyre!("missing --evm-private-key for EVM funding"))?;
-        return fund_evm_asset(
-            rpc_url,
-            private_key,
-            &source.asset,
-            &order.order_address,
-            amount,
+        return with_funding_timeout(
+            format!("EVM funding on {}", source.chain_id),
+            fund_evm_asset(
+                rpc_url,
+                private_key,
+                &source.asset,
+                &order.order_address,
+                amount,
+            ),
         )
         .await;
     }
@@ -843,15 +1003,27 @@ async fn fund_order(
             return Err(eyre!("Bitcoin funding only supports native BTC"));
         }
         let sats = u64::try_from(amount).map_err(|_| eyre!("Bitcoin amount exceeds u64 sats"))?;
-        return fund_bitcoin(
-            &funding.bitcoin,
-            &order.order_address,
-            bitcoin::Amount::from_sat(sats),
+        return with_funding_timeout(
+            "Bitcoin funding",
+            fund_bitcoin(
+                &funding.bitcoin,
+                &order.order_address,
+                bitcoin::Amount::from_sat(sats),
+            ),
         )
         .await;
     }
 
     Err(eyre!("funding for {} is not supported", source.chain_id))
+}
+
+async fn with_funding_timeout<T>(
+    operation: impl std::fmt::Display,
+    future: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::time::timeout(LOADGEN_CHAIN_FUNDING_TIMEOUT, future)
+        .await
+        .map_err(|_| eyre!("{operation} timed out after {LOADGEN_CHAIN_FUNDING_TIMEOUT:?}"))?
 }
 
 async fn fund_evm_asset(
@@ -922,7 +1094,10 @@ async fn fund_bitcoin(
 fn runtime_config(input: &QuoteInput) -> Result<RuntimeConfig> {
     let gateway_url = normalize_base_url(&input.gateway_url)?;
     Ok(RuntimeConfig {
-        http: Client::builder().use_rustls_tls().build()?,
+        http: Client::builder()
+            .use_rustls_tls()
+            .timeout(LOADGEN_HTTP_TIMEOUT)
+            .build()?,
         gateway_url,
     })
 }
@@ -935,16 +1110,10 @@ async fn load_devnet_manifest(
         return Ok(None);
     };
 
-    let manifest = http
-        .get(manifest_url)
-        .send()
+    let manifest_url = Url::parse(manifest_url).wrap_err("invalid devnet manifest URL")?;
+    let manifest = get_json(http, manifest_url)
         .await
-        .wrap_err("failed to fetch devnet manifest")?
-        .error_for_status()
-        .wrap_err("devnet manifest request failed")?
-        .json()
-        .await
-        .wrap_err("failed to decode devnet manifest")?;
+        .wrap_err("failed to load devnet manifest")?;
     Ok(Some(manifest))
 }
 
@@ -1064,43 +1233,27 @@ fn quote_input_for_task(
 
     let route = RANDOM_ROUTES
         .choose(rng)
-        .expect("random route list is non-empty")
+        .ok_or_else(|| eyre!("random route list is empty"))?
         .to_owned();
-    let amount = rng.gen_range(command.random_min_raw_amount..=command.random_max_raw_amount);
+    let notional_usdc_raw =
+        rng.gen_range(command.random_min_raw_amount..=command.random_max_raw_amount);
     let exact_out = route.allow_exact_out && rng.gen_bool(0.5);
-    let bitcoin_address = random_context.bitcoin_address.as_deref();
-    let to_address = if route.destination_kind == RandomAddressKind::Bitcoin {
-        bitcoin_address
-            .ok_or_else(|| {
-                eyre!(
-                    "random Bitcoin destination selected but no --bitcoin-address or devnet manifest demo Bitcoin address is available"
-                )
-            })?
-            .to_string()
-    } else {
-        command.quote.to_address.clone()
-    };
-    let from_address = if route.source_kind == RandomAddressKind::Bitcoin {
-        Some(
-            bitcoin_address
-                .ok_or_else(|| {
-                    eyre!(
-                        "random Bitcoin source selected but no --bitcoin-address or devnet manifest demo Bitcoin address is available"
-                    )
-                })?
-                .to_string(),
-        )
-    } else {
-        command.quote.from_address.clone()
-    };
+    let amount = market_random_amount(route, notional_usdc_raw, exact_out)?;
+    let (to_address, from_address) = random_route_addresses(
+        route.source_kind,
+        route.destination_kind,
+        &command.quote.to_address,
+        command.quote.from_address.as_deref(),
+        random_context.bitcoin_address.as_deref(),
+    )?;
 
     Ok(ResolvedQuoteInput {
         order_type: OrderType::Market,
         from: route.from.to_string(),
         to: route.to.to_string(),
         to_address,
-        from_amount: (!exact_out).then(|| amount.to_string()),
-        to_amount: exact_out.then(|| amount.to_string()),
+        from_amount: (!exact_out).then(|| amount.clone()),
+        to_amount: exact_out.then_some(amount),
         max_slippage: command.quote.max_slippage.clone(),
         amount_format: AmountFormat::Raw,
         from_address,
@@ -1114,36 +1267,18 @@ fn random_limit_quote_input(
 ) -> Result<ResolvedQuoteInput> {
     let route = RANDOM_LIMIT_ROUTES
         .choose(rng)
-        .expect("random limit route list is non-empty")
+        .ok_or_else(|| eyre!("random limit route list is empty"))?
         .to_owned();
     let notional_usdc_raw =
         rng.gen_range(command.random_min_raw_amount..=command.random_max_raw_amount);
     let (from_amount, to_amount) = marketable_limit_amounts(route, notional_usdc_raw)?;
-    let bitcoin_address = random_context.bitcoin_address.as_deref();
-    let to_address = if route.destination_kind == RandomAddressKind::Bitcoin {
-        bitcoin_address
-            .ok_or_else(|| {
-                eyre!(
-                    "random Bitcoin destination selected but no --bitcoin-address or devnet manifest demo Bitcoin address is available"
-                )
-            })?
-            .to_string()
-    } else {
-        command.quote.to_address.clone()
-    };
-    let from_address = if route.source_kind == RandomAddressKind::Bitcoin {
-        Some(
-            bitcoin_address
-                .ok_or_else(|| {
-                    eyre!(
-                        "random Bitcoin source selected but no --bitcoin-address or devnet manifest demo Bitcoin address is available"
-                    )
-                })?
-                .to_string(),
-        )
-    } else {
-        command.quote.from_address.clone()
-    };
+    let (to_address, from_address) = random_route_addresses(
+        route.source_kind,
+        route.destination_kind,
+        &command.quote.to_address,
+        command.quote.from_address.as_deref(),
+        random_context.bitcoin_address.as_deref(),
+    )?;
 
     Ok(ResolvedQuoteInput {
         order_type: OrderType::Limit,
@@ -1174,6 +1309,58 @@ fn marketable_limit_amounts(
         return Err(eyre!("random limit amounts resolved to zero"));
     }
     Ok((input.to_string(), output.to_string()))
+}
+
+fn random_route_addresses(
+    source_kind: RandomAddressKind,
+    destination_kind: RandomAddressKind,
+    fallback_to_address: &str,
+    fallback_from_address: Option<&str>,
+    bitcoin_address: Option<&str>,
+) -> Result<(String, Option<String>)> {
+    let to_address = if destination_kind == RandomAddressKind::Bitcoin {
+        bitcoin_address
+            .ok_or_else(|| {
+                eyre!(
+                    "random Bitcoin destination selected but no --bitcoin-address or devnet manifest demo Bitcoin address is available"
+                )
+            })?
+            .to_string()
+    } else {
+        fallback_to_address.to_string()
+    };
+    let from_address = if source_kind == RandomAddressKind::Bitcoin {
+        Some(
+            bitcoin_address
+                .ok_or_else(|| {
+                    eyre!(
+                        "random Bitcoin source selected but no --bitcoin-address or devnet manifest demo Bitcoin address is available"
+                    )
+                })?
+                .to_string(),
+        )
+    } else {
+        fallback_from_address.map(ToOwned::to_owned)
+    };
+
+    Ok((to_address, from_address))
+}
+
+fn market_random_amount(
+    route: RandomRoute,
+    notional_usdc_raw: u64,
+    exact_out: bool,
+) -> Result<String> {
+    let asset = if exact_out {
+        route.output_asset
+    } else {
+        route.input_asset
+    };
+    let amount = asset_amount_for_notional(asset, notional_usdc_raw)?;
+    if amount.is_zero() {
+        return Err(eyre!("random market amount resolved to zero"));
+    }
+    Ok(amount.to_string())
 }
 
 fn asset_amount_for_notional(asset: LimitAsset, usdc_raw: u64) -> Result<U256> {
@@ -1299,7 +1486,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn random_limit_amounts_are_aggressively_marketable() {
+    fn random_limit_amounts_are_aggressively_marketable() -> Result<()> {
         let route = RandomLimitRoute::new(
             "Bitcoin.BTC",
             "Ethereum.USDC",
@@ -1309,10 +1496,184 @@ mod tests {
             LimitAsset::Usdc,
         );
 
-        let (from_amount, to_amount) =
-            marketable_limit_amounts(route, 120_000_000).expect("limit amounts");
+        let (from_amount, to_amount) = marketable_limit_amounts(route, 120_000_000)?;
 
         assert_eq!(from_amount, "200000");
         assert_eq!(to_amount, "60000000");
+        Ok(())
+    }
+
+    #[test]
+    fn random_market_amounts_scale_by_selected_asset() -> Result<()> {
+        let route = RandomRoute::new(
+            "Ethereum.ETH",
+            "Bitcoin.BTC",
+            RandomAddressKind::Evm,
+            RandomAddressKind::Bitcoin,
+            LimitAsset::Eth,
+            LimitAsset::Btc,
+            false,
+        );
+
+        assert_eq!(
+            market_random_amount(route, 120_000_000, false)?,
+            "40000000000000000"
+        );
+        assert_eq!(market_random_amount(route, 120_000_000, true)?, "200000");
+        Ok(())
+    }
+
+    #[test]
+    fn random_route_addresses_use_bitcoin_address_for_bitcoin_destinations() -> Result<()> {
+        let (to_address, from_address) = random_route_addresses(
+            RandomAddressKind::Evm,
+            RandomAddressKind::Bitcoin,
+            "0x1111111111111111111111111111111111111111",
+            Some("0x2222222222222222222222222222222222222222"),
+            Some("bcrt1q2pfqp8a574jxyszmk0h5rxf02wwkpaf4hd8009"),
+        )?;
+
+        assert_eq!(to_address, "bcrt1q2pfqp8a574jxyszmk0h5rxf02wwkpaf4hd8009");
+        assert_eq!(
+            from_address.as_deref(),
+            Some("0x2222222222222222222222222222222222222222")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn random_route_addresses_use_bitcoin_address_for_bitcoin_sources() -> Result<()> {
+        let (to_address, from_address) = random_route_addresses(
+            RandomAddressKind::Bitcoin,
+            RandomAddressKind::Evm,
+            "0x1111111111111111111111111111111111111111",
+            None,
+            Some("bcrt1q2pfqp8a574jxyszmk0h5rxf02wwkpaf4hd8009"),
+        )?;
+
+        assert_eq!(to_address, "0x1111111111111111111111111111111111111111");
+        assert_eq!(
+            from_address.as_deref(),
+            Some("bcrt1q2pfqp8a574jxyszmk0h5rxf02wwkpaf4hd8009")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn random_route_addresses_require_bitcoin_address_for_bitcoin_routes() {
+        let destination_error = random_route_addresses(
+            RandomAddressKind::Evm,
+            RandomAddressKind::Bitcoin,
+            "0x1111111111111111111111111111111111111111",
+            None,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(destination_error.contains("random Bitcoin destination selected"));
+
+        let source_error = random_route_addresses(
+            RandomAddressKind::Bitcoin,
+            RandomAddressKind::Evm,
+            "0x1111111111111111111111111111111111111111",
+            None,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(source_error.contains("random Bitcoin source selected"));
+    }
+
+    #[test]
+    fn append_limited_body_chunk_rejects_chunks_past_the_limit_without_mutating() {
+        let mut body = b"abcd".to_vec();
+
+        assert!(!append_limited_body_chunk(&mut body, b"ef", 5));
+        assert_eq!(body, b"abcd");
+    }
+
+    #[test]
+    fn append_limited_body_chunk_accepts_chunks_at_the_limit() {
+        let mut body = b"abcd".to_vec();
+
+        assert!(append_limited_body_chunk(&mut body, b"ef", 6));
+        assert_eq!(body, b"abcdef");
+    }
+
+    #[test]
+    fn order_response_serialization_redacts_refund_token() -> Result<()> {
+        let order: OrderResponse = serde_json::from_value(serde_json::json!({
+            "orderId": "019df1c4-8d87-7c20-89a4-e76883e94a0f",
+            "orderAddress": "0x1111111111111111111111111111111111111111",
+            "amountToSend": "1000",
+            "quoteId": "019df1c4-8d87-7c20-89a4-e76883e94a10",
+            "orderType": "market_order",
+            "from": "Base.USDC",
+            "to": "Ethereum.USDC",
+            "status": "pending_funding",
+            "expiry": "2026-05-05T00:00:00Z",
+            "expectedOut": "990",
+            "minOut": "980",
+            "maxSlippage": "100",
+            "amountFormat": "raw",
+            "refundMode": "token",
+            "refundToken": "secret-cancellation-token"
+        }))?;
+        let serialized = serde_json::to_value(&order)?;
+
+        assert!(serialized.get("refundToken").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn funding_config_debug_redacts_loaded_secrets() {
+        let config = FundingConfig {
+            evm: EvmFundingConfig {
+                rpcs: BTreeMap::from([(
+                    "evm:8453".to_string(),
+                    "http://localhost:50102".to_string(),
+                )]),
+                private_keys: vec![
+                    "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_string(),
+                    "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        .to_string(),
+                ],
+            },
+            bitcoin: BitcoinFundingConfig {
+                rpc_url: Some("http://localhost:18443".to_string()),
+                rpc_auth: "rpc-user:rpc-password".to_string(),
+            },
+        };
+
+        let rendered = format!("{config:?}");
+
+        assert!(!rendered.contains("aaaaaaaa"));
+        assert!(!rendered.contains("bbbbbbbb"));
+        assert!(!rendered.contains("rpc-user"));
+        assert!(!rendered.contains("rpc-password"));
+        assert!(rendered.contains("redacted"));
+    }
+
+    #[test]
+    fn devnet_manifest_debug_redacts_private_keys() {
+        let manifest = DevnetManifestResponse {
+            accounts: DevnetManifestAccounts {
+                demo_bitcoin_address: Some(
+                    "bcrt1q2pfqp8a574jxyszmk0h5rxf02wwkpaf4hd8009".to_string(),
+                ),
+                loadgen_evm_accounts: vec![DevnetManifestEvmAccount {
+                    private_key:
+                        "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                            .to_string(),
+                }],
+            },
+        };
+
+        let rendered = format!("{manifest:?}");
+
+        assert!(!rendered.contains("cccccccc"));
+        assert!(rendered.contains("redacted"));
+        assert!(rendered.contains("bcrt1q2pfqp8a574jxyszmk0h5rxf02wwkpaf4hd8009"));
     }
 }

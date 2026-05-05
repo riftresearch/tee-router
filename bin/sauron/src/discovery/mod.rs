@@ -14,12 +14,18 @@ use metrics::{gauge, histogram};
 use reqwest::StatusCode;
 use router_primitives::{ChainType, TokenIdentifier};
 use router_server::{
-    api::{DetectorHintEnvelope, DetectorHintRequest, DetectorHintTarget},
-    models::ProviderOperationHintKind,
+    api::{
+        DetectorHintEnvelope, DetectorHintRequest, DetectorHintTarget, MAX_HINT_IDEMPOTENCY_KEY_LEN,
+    },
+    models::{ProviderOperationHintKind, SAURON_DETECTOR_HINT_SOURCE},
 };
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use snafu::ResultExt;
-use tokio::{task::JoinSet, time::MissedTickBehavior};
+use tokio::{
+    task::JoinSet,
+    time::{timeout, MissedTickBehavior},
+};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -38,6 +44,9 @@ const SAURON_BLOCK_SCAN_DETECTIONS: &str = "sauron_block_scan_detections";
 const SUBMISSION_RETRY_BASE_DELAY: Duration = Duration::from_secs(5);
 const SUBMISSION_RETRY_MAX_DELAY: Duration = Duration::from_secs(5 * 60);
 const SUBMISSION_RETRY_JITTER_MAX_MILLIS: u64 = 1_000;
+const INDEXED_LOOKUP_TIMEOUT: Duration = Duration::from_secs(30);
+const INDEXED_LOOKUP_UNRESOLVED_RETRY_DELAY: Duration = Duration::from_secs(30);
+const MAX_PENDING_DISCOVERY_SUBMISSIONS: usize = 10_000;
 
 #[derive(Clone)]
 pub struct DiscoveryContext {
@@ -46,7 +55,7 @@ pub struct DiscoveryContext {
     pub router_client: RouterClient,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DepositConfirmationState {
     Mempool,
     Confirmed,
@@ -96,6 +105,21 @@ struct PendingSubmission {
     detected: DetectedDeposit,
     attempts: u32,
     next_attempt_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DeferredIndexedLookup {
+    version: DateTime<Utc>,
+    ready_at: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DetectedDepositKey {
+    watch_target: WatchTarget,
+    watch_id: Uuid,
+    tx_hash: String,
+    transfer_index: u64,
+    confirmation_state: DepositConfirmationState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,8 +189,8 @@ async fn run_backend_loop(
 ) -> Result<()> {
     let mut indexed_lookup_tasks = JoinSet::new();
     let mut indexed_lookup_backfill = IndexedLookupBackfillState::default();
-    let mut reported_candidates = HashMap::new();
-    let mut pending_submissions = HashMap::new();
+    let mut reported_candidates: HashMap<DetectedDepositKey, DetectedDeposit> = HashMap::new();
+    let mut pending_submissions: HashMap<DetectedDepositKey, PendingSubmission> = HashMap::new();
     let mut cursor = initial_cursor(backend.as_ref(), &context).await?;
 
     let mut ticker = tokio::time::interval(backend.poll_interval());
@@ -197,8 +221,9 @@ async fn run_backend_loop(
             .copied()
             .collect::<HashSet<_>>();
 
-        reported_candidates.retain(|watch_id, _| active_watch_ids.contains(watch_id));
-        pending_submissions.retain(|watch_id, _| active_watch_ids.contains(watch_id));
+        reported_candidates.retain(|key, _| active_watch_ids.contains(&key.watch_id));
+        pending_submissions.retain(|key, _| active_watch_ids.contains(&key.watch_id));
+        validate_pending_submission_backlog(&pending_submissions)?;
         indexed_lookup_backfill.retain_active(&active_watch_ids);
 
         drain_indexed_lookup_tasks(
@@ -206,11 +231,12 @@ async fn run_backend_loop(
             &current_watch_versions,
             &mut indexed_lookup_backfill,
             &context,
-            backend.name(),
+            backend.as_ref(),
             &mut pending_submissions,
             &mut reported_candidates,
         )
         .await?;
+        validate_pending_submission_backlog(&pending_submissions)?;
 
         retry_pending_submissions(
             &context,
@@ -219,10 +245,15 @@ async fn run_backend_loop(
             &mut reported_candidates,
         )
         .await;
+        validate_pending_submission_backlog(&pending_submissions)?;
 
         indexed_lookup_backfill.sync_snapshot(&backend_watch_map);
-        indexed_lookup_backfill
-            .requeue_pending_submissions(&backend_watch_map, pending_submissions.keys().copied());
+        indexed_lookup_backfill.requeue_pending_submissions(
+            &backend_watch_map,
+            pending_submissions
+                .values()
+                .map(|submission| submission.detected.watch_id),
+        );
         spawn_indexed_lookup_tasks(
             backend.clone(),
             &backend_watch_map,
@@ -254,23 +285,34 @@ async fn run_backend_loop(
                     "backend" => backend.name().to_string(),
                 )
                 .record(scan_started.elapsed().as_secs_f64());
-                cursor = scan.new_cursor;
-                context.cursors.save(backend.name(), &cursor).await?;
                 gauge!(
                     SAURON_BLOCK_SCAN_DETECTIONS,
                     "backend" => backend.name().to_string(),
                 )
                 .set(scan.detections.len() as f64);
-                for detected in scan.detections {
+                let new_cursor = scan.new_cursor;
+                for detected in &scan.detections {
                     let outcome = report_detected_deposit(
                         &context,
                         backend.name(),
-                        &detected,
+                        detected,
                         &mut pending_submissions,
                         &mut reported_candidates,
                     )
                     .await;
-                    handle_submission_outcome(backend.as_ref(), &detected, outcome).await;
+                    handle_submission_outcome(backend.as_ref(), detected, outcome).await;
+                    validate_pending_submission_backlog(&pending_submissions)?;
+                }
+                if scan_has_pending_ephemeral_submissions(&scan.detections, &pending_submissions) {
+                    warn!(
+                        backend = backend.name(),
+                        height = new_cursor.height,
+                        hash = %new_cursor.hash,
+                        "Keeping Sauron discovery cursor behind scan result until retryable deposit hints are accepted"
+                    );
+                } else {
+                    cursor = new_cursor;
+                    context.cursors.save(backend.name(), &cursor).await?;
                 }
             }
             Err(error) => {
@@ -292,11 +334,12 @@ async fn run_backend_loop(
             &current_watch_versions,
             &mut indexed_lookup_backfill,
             &context,
-            backend.name(),
+            backend.as_ref(),
             &mut pending_submissions,
             &mut reported_candidates,
         )
         .await?;
+        validate_pending_submission_backlog(&pending_submissions)?;
     }
 }
 
@@ -333,6 +376,7 @@ struct IndexedLookupBackfillState {
     completed_versions: HashMap<Uuid, DateTime<Utc>>,
     queued_versions: HashMap<Uuid, DateTime<Utc>>,
     inflight_versions: HashMap<Uuid, DateTime<Utc>>,
+    deferred_versions: HashMap<Uuid, DeferredIndexedLookup>,
     queue: VecDeque<(Uuid, DateTime<Utc>)>,
 }
 
@@ -344,11 +388,17 @@ impl IndexedLookupBackfillState {
             .retain(|watch_id, _| active_watch_ids.contains(watch_id));
         self.inflight_versions
             .retain(|watch_id, _| active_watch_ids.contains(watch_id));
+        self.deferred_versions
+            .retain(|watch_id, _| active_watch_ids.contains(watch_id));
         self.queue
             .retain(|(watch_id, _)| active_watch_ids.contains(watch_id));
     }
 
     fn sync_snapshot(&mut self, watches: &HashMap<Uuid, SharedWatchEntry>) {
+        self.sync_snapshot_at(watches, Instant::now());
+    }
+
+    fn sync_snapshot_at(&mut self, watches: &HashMap<Uuid, SharedWatchEntry>, now: Instant) {
         for (watch_id, watch) in watches {
             let version = watch.updated_at;
 
@@ -357,6 +407,13 @@ impl IndexedLookupBackfillState {
                 || self.inflight_versions.get(watch_id) == Some(&version)
             {
                 continue;
+            }
+
+            if let Some(deferred) = self.deferred_versions.get(watch_id) {
+                if deferred.version == version && deferred.ready_at > now {
+                    continue;
+                }
+                self.deferred_versions.remove(watch_id);
             }
 
             self.queue.push_back((*watch_id, version));
@@ -422,6 +479,7 @@ impl IndexedLookupBackfillState {
         current_watch_versions: &HashMap<Uuid, DateTime<Utc>>,
     ) -> bool {
         self.inflight_versions.remove(&watch_id);
+        self.deferred_versions.remove(&watch_id);
 
         if current_watch_versions.get(&watch_id) == Some(&version) {
             self.completed_versions.insert(watch_id, version);
@@ -432,9 +490,19 @@ impl IndexedLookupBackfillState {
     }
 
     fn retry_unresolved(&mut self, watch_id: Uuid, version: DateTime<Utc>) {
+        self.retry_unresolved_at(
+            watch_id,
+            version,
+            Instant::now() + INDEXED_LOOKUP_UNRESOLVED_RETRY_DELAY,
+        );
+    }
+
+    fn retry_unresolved_at(&mut self, watch_id: Uuid, version: DateTime<Utc>, ready_at: Instant) {
         if self.completed_versions.get(&watch_id) == Some(&version) {
             self.completed_versions.remove(&watch_id);
         }
+        self.deferred_versions
+            .insert(watch_id, DeferredIndexedLookup { version, ready_at });
     }
 
     fn queue_len(&self) -> usize {
@@ -555,21 +623,41 @@ fn spawn_indexed_lookup_tasks(
 
     for (watch, version) in ready {
         let backend = backend.clone();
-        tasks.spawn(async move {
-            let watch_id = watch.watch_id;
-            let started = Instant::now();
-            let result = backend.indexed_lookup(watch.as_ref()).await;
-            histogram!(
-                SAURON_INDEXED_LOOKUP_DURATION_SECONDS,
-                "backend" => backend.name().to_string(),
-            )
-            .record(started.elapsed().as_secs_f64());
-            IndexedLookupTaskResult {
-                watch_id,
-                version,
-                lookup_result: result,
-            }
-        });
+        tasks.spawn(run_indexed_lookup_task(
+            backend,
+            watch,
+            version,
+            INDEXED_LOOKUP_TIMEOUT,
+        ));
+    }
+}
+
+async fn run_indexed_lookup_task(
+    backend: Arc<dyn DiscoveryBackend>,
+    watch: SharedWatchEntry,
+    version: DateTime<Utc>,
+    timeout_duration: Duration,
+) -> IndexedLookupTaskResult {
+    let watch_id = watch.watch_id;
+    let backend_name = backend.name();
+    let started = Instant::now();
+    let result = match timeout(timeout_duration, backend.indexed_lookup(watch.as_ref())).await {
+        Ok(result) => result,
+        Err(_) => Err(Error::IndexedLookupTimeout {
+            backend: backend_name.to_string(),
+            watch_id: watch_id.to_string(),
+            timeout_secs: timeout_duration.as_secs(),
+        }),
+    };
+    histogram!(
+        SAURON_INDEXED_LOOKUP_DURATION_SECONDS,
+        "backend" => backend_name.to_string(),
+    )
+    .record(started.elapsed().as_secs_f64());
+    IndexedLookupTaskResult {
+        watch_id,
+        version,
+        lookup_result: result,
     }
 }
 
@@ -584,10 +672,11 @@ async fn drain_indexed_lookup_tasks(
     current_watch_versions: &HashMap<Uuid, DateTime<Utc>>,
     backfill_state: &mut IndexedLookupBackfillState,
     context: &DiscoveryContext,
-    backend_name: &str,
-    pending_submissions: &mut HashMap<Uuid, PendingSubmission>,
-    reported_candidates: &mut HashMap<Uuid, DetectedDeposit>,
+    backend: &dyn DiscoveryBackend,
+    pending_submissions: &mut HashMap<DetectedDepositKey, PendingSubmission>,
+    reported_candidates: &mut HashMap<DetectedDepositKey, DetectedDeposit>,
 ) -> Result<()> {
+    let backend_name = backend.name();
     while let Some(join_result) = tasks.try_join_next() {
         let IndexedLookupTaskResult {
             watch_id,
@@ -609,14 +698,7 @@ async fn drain_indexed_lookup_tasks(
                     reported_candidates,
                 )
                 .await;
-                if detected.indexer_candidate_id.is_some() {
-                    warn!(
-                        backend = backend_name,
-                        candidate_id = ?detected.indexer_candidate_id,
-                        outcome = ?outcome,
-                        "Indexed lookup returned a durable indexer candidate but cannot acknowledge it from this path"
-                    );
-                }
+                handle_submission_outcome(backend, &detected, outcome).await;
             }
             Ok(None) => backfill_state.retry_unresolved(watch_id, version),
             Err(error) => {
@@ -624,8 +706,9 @@ async fn drain_indexed_lookup_tasks(
                     backend = backend_name,
                     watch_id = %watch_id,
                     %error,
-                    "Indexed lookup failed for active watch"
+                    "Indexed lookup failed for active watch; retrying"
                 );
+                backfill_state.retry_unresolved(watch_id, version);
             }
         }
     }
@@ -637,18 +720,19 @@ async fn report_detected_deposit(
     context: &DiscoveryContext,
     backend_name: &str,
     detected: &DetectedDeposit,
-    pending_submissions: &mut HashMap<Uuid, PendingSubmission>,
-    reported_candidates: &mut HashMap<Uuid, DetectedDeposit>,
+    pending_submissions: &mut HashMap<DetectedDepositKey, PendingSubmission>,
+    reported_candidates: &mut HashMap<DetectedDepositKey, DetectedDeposit>,
 ) -> SubmissionOutcome {
+    let key = detected_deposit_key(detected);
     if reported_candidates
-        .get(&detected.watch_id)
+        .get(&key)
         .is_some_and(|existing| existing == detected)
     {
         return SubmissionOutcome::AlreadyTracked;
     }
 
     if pending_submissions
-        .get(&detected.watch_id)
+        .get(&key)
         .is_some_and(|pending| pending.detected == *detected)
     {
         return SubmissionOutcome::AlreadyTracked;
@@ -667,8 +751,8 @@ async fn report_detected_deposit(
 async fn retry_pending_submissions(
     context: &DiscoveryContext,
     backend_name: &str,
-    pending_submissions: &mut HashMap<Uuid, PendingSubmission>,
-    reported_candidates: &mut HashMap<Uuid, DetectedDeposit>,
+    pending_submissions: &mut HashMap<DetectedDepositKey, PendingSubmission>,
+    reported_candidates: &mut HashMap<DetectedDepositKey, DetectedDeposit>,
 ) {
     let now = Instant::now();
     let pending = pending_submissions
@@ -693,9 +777,10 @@ async fn submit_detected_deposit(
     context: &DiscoveryContext,
     backend_name: &str,
     detected: &DetectedDeposit,
-    pending_submissions: &mut HashMap<Uuid, PendingSubmission>,
-    reported_candidates: &mut HashMap<Uuid, DetectedDeposit>,
+    pending_submissions: &mut HashMap<DetectedDepositKey, PendingSubmission>,
+    reported_candidates: &mut HashMap<DetectedDepositKey, DetectedDeposit>,
 ) -> SubmissionOutcome {
+    let key = detected_deposit_key(detected);
     let evidence = json!({
         "source": "sauron",
         "backend": backend_name,
@@ -715,13 +800,9 @@ async fn submit_detected_deposit(
         "block_hash": detected.block_hash,
         "observed_at": detected.observed_at,
     });
-    let idempotency_key = Some(format!(
-        "sauron:{backend_name}:{}:{}:{}:{}:{}",
-        detected.watch_target.as_str(),
-        detected.watch_id,
-        detected.tx_hash,
-        detected.transfer_index,
-        detected.confirmation_state.as_str()
+    let idempotency_key = Some(detected_deposit_hint_idempotency_key(
+        backend_name,
+        detected,
     ));
 
     let target = match detected.watch_target {
@@ -736,7 +817,7 @@ async fn submit_detected_deposit(
         .router_client
         .submit_detector_hint(&DetectorHintRequest {
             target,
-            source: "sauron".to_string(),
+            source: SAURON_DETECTOR_HINT_SOURCE.to_string(),
             hint_kind: ProviderOperationHintKind::PossibleProgress,
             evidence,
             idempotency_key,
@@ -755,8 +836,8 @@ async fn submit_detected_deposit(
                 transfer_index = detected.transfer_index,
                 "Discovery backend submitted funding/progress hint"
             );
-            pending_submissions.remove(&detected.watch_id);
-            reported_candidates.insert(detected.watch_id, detected.clone());
+            pending_submissions.remove(&key);
+            reported_candidates.insert(key, detected.clone());
             SubmissionOutcome::Submitted
         }
         Err(error) => {
@@ -774,11 +855,11 @@ async fn submit_detected_deposit(
                 }
                 let now = Instant::now();
                 let attempts = pending_submissions
-                    .get(&detected.watch_id)
+                    .get(&key)
                     .map_or(1, |pending| pending.attempts.saturating_add(1));
                 let retry_delay = submission_retry_delay(detected, attempts);
                 pending_submissions.insert(
-                    detected.watch_id,
+                    key,
                     PendingSubmission {
                         detected: detected.clone(),
                         attempts,
@@ -796,7 +877,7 @@ async fn submit_detected_deposit(
                 );
                 SubmissionOutcome::RetryableFailure(error.to_string())
             } else {
-                pending_submissions.remove(&detected.watch_id);
+                pending_submissions.remove(&key);
                 warn!(
                     backend = backend_name,
                     watch_id = %detected.watch_id,
@@ -808,6 +889,56 @@ async fn submit_detected_deposit(
             }
         }
     }
+}
+
+fn detected_deposit_key(detected: &DetectedDeposit) -> DetectedDepositKey {
+    DetectedDepositKey {
+        watch_target: detected.watch_target,
+        watch_id: detected.watch_id,
+        tx_hash: detected.tx_hash.clone(),
+        transfer_index: detected.transfer_index,
+        confirmation_state: detected.confirmation_state,
+    }
+}
+
+fn detected_deposit_hint_idempotency_key(backend_name: &str, detected: &DetectedDeposit) -> String {
+    let material = format!(
+        "{backend_name}:{}:{}:{}:{}:{}",
+        detected.watch_target.as_str(),
+        detected.watch_id,
+        detected.tx_hash,
+        detected.transfer_index,
+        detected.confirmation_state.as_str()
+    );
+    let digest = Sha256::digest(material.as_bytes());
+    let idempotency_key = format!(
+        "sauron:deposit:{}:{}",
+        detected.watch_id,
+        alloy::hex::encode(digest)
+    );
+    debug_assert!(idempotency_key.len() <= MAX_HINT_IDEMPOTENCY_KEY_LEN);
+    idempotency_key
+}
+
+fn scan_has_pending_ephemeral_submissions(
+    detections: &[DetectedDeposit],
+    pending_submissions: &HashMap<DetectedDepositKey, PendingSubmission>,
+) -> bool {
+    detections.iter().any(|detected| {
+        detected.indexer_candidate_id.is_none()
+            && pending_submissions.contains_key(&detected_deposit_key(detected))
+    })
+}
+
+fn validate_pending_submission_backlog(
+    pending_submissions: &HashMap<DetectedDepositKey, PendingSubmission>,
+) -> Result<()> {
+    if pending_submissions.len() > MAX_PENDING_DISCOVERY_SUBMISSIONS {
+        return Err(Error::DiscoveryPendingSubmissionsTooLarge {
+            max_pending: MAX_PENDING_DISCOVERY_SUBMISSIONS,
+        });
+    }
+    Ok(())
 }
 
 async fn handle_submission_outcome(
@@ -893,16 +1024,25 @@ fn submission_retry_jitter_millis(detected: &DetectedDeposit, attempts: u32) -> 
 #[cfg(test)]
 mod tests {
     use super::{
-        should_retry_submission, submission_retry_delay, DepositConfirmationState, DetectedDeposit,
-        IndexedLookupBackfillState, SUBMISSION_RETRY_BASE_DELAY, SUBMISSION_RETRY_MAX_DELAY,
+        detected_deposit_hint_idempotency_key, detected_deposit_key, run_indexed_lookup_task,
+        scan_has_pending_ephemeral_submissions, should_retry_submission, submission_retry_delay,
+        validate_pending_submission_backlog, BlockCursor, BlockScan, DepositConfirmationState,
+        DetectedDeposit, DiscoveryBackend, IndexedLookupBackfillState, PendingSubmission,
+        INDEXED_LOOKUP_UNRESOLVED_RETRY_DELAY, MAX_HINT_IDEMPOTENCY_KEY_LEN,
+        MAX_PENDING_DISCOVERY_SUBMISSIONS, SUBMISSION_RETRY_BASE_DELAY, SUBMISSION_RETRY_MAX_DELAY,
     };
     use crate::error::Error;
     use crate::watch::{WatchEntry, WatchTarget};
     use alloy::primitives::U256;
+    use async_trait::async_trait;
     use chrono::{Duration, Utc};
     use reqwest::StatusCode;
     use router_primitives::{ChainType, TokenIdentifier};
-    use std::{collections::HashMap, sync::Arc};
+    use std::{
+        collections::HashMap,
+        sync::Arc,
+        time::{Duration as StdDuration, Instant},
+    };
     use uuid::Uuid;
 
     #[test]
@@ -956,6 +1096,50 @@ mod tests {
     }
 
     #[test]
+    fn detected_deposit_key_preserves_distinct_transfers_for_same_watch() {
+        let watch_id = Uuid::now_v7();
+        let mut first = detected_deposit();
+        first.watch_id = watch_id;
+        first.tx_hash = "first".to_string();
+        first.transfer_index = 0;
+
+        let mut second = first.clone();
+        second.tx_hash = "second".to_string();
+
+        let mut third = first.clone();
+        third.transfer_index = 1;
+
+        let mut fourth = first.clone();
+        fourth.watch_target = WatchTarget::FundingVault;
+
+        let mut keyed = HashMap::new();
+        keyed.insert(detected_deposit_key(&first), first);
+        keyed.insert(detected_deposit_key(&second), second);
+        keyed.insert(detected_deposit_key(&third), third);
+        keyed.insert(detected_deposit_key(&fourth), fourth);
+
+        assert_eq!(keyed.len(), 4);
+    }
+
+    #[test]
+    fn detected_deposit_hint_idempotency_key_is_bounded_token_text() {
+        let mut detected = detected_deposit();
+        detected.watch_id = Uuid::now_v7();
+        detected.tx_hash = "0x".to_string() + &"a".repeat(64);
+        detected.transfer_index = u64::MAX;
+        detected.confirmation_state = DepositConfirmationState::Confirmed;
+
+        let key = detected_deposit_hint_idempotency_key("evm_erc20_base", &detected);
+
+        assert!(key.len() <= MAX_HINT_IDEMPOTENCY_KEY_LEN);
+        assert!(key.bytes().all(|byte| matches!(
+            byte,
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'_' | b':' | b'-'
+        )));
+        assert!(key.starts_with(&format!("sauron:deposit:{}:", detected.watch_id)));
+    }
+
+    #[test]
     fn submission_retry_delay_grows_with_attempts_and_is_capped() {
         let detected = detected_deposit();
         let first = submission_retry_delay(&detected, 1);
@@ -965,6 +1149,58 @@ mod tests {
         assert!(first >= SUBMISSION_RETRY_BASE_DELAY);
         assert!(second > first);
         assert!(capped <= SUBMISSION_RETRY_MAX_DELAY + Duration::seconds(1).to_std().unwrap());
+    }
+
+    #[test]
+    fn pending_ephemeral_scan_detections_block_cursor_advancement() {
+        let detected = detected_deposit();
+        let key = detected_deposit_key(&detected);
+        let pending = HashMap::from([(
+            key,
+            PendingSubmission {
+                detected: detected.clone(),
+                attempts: 1,
+                next_attempt_at: Instant::now(),
+            },
+        )]);
+
+        assert!(scan_has_pending_ephemeral_submissions(
+            std::slice::from_ref(&detected),
+            &pending
+        ));
+
+        let mut durable = detected;
+        durable.indexer_candidate_id = Some("candidate-1".to_string());
+        assert!(!scan_has_pending_ephemeral_submissions(
+            &[durable],
+            &pending
+        ));
+    }
+
+    #[test]
+    fn pending_submission_backlog_rejects_overflow() {
+        let mut pending = HashMap::new();
+        for index in 0..=MAX_PENDING_DISCOVERY_SUBMISSIONS {
+            let mut detected = detected_deposit();
+            detected.tx_hash = format!("tx-{index}");
+            pending.insert(
+                detected_deposit_key(&detected),
+                PendingSubmission {
+                    detected,
+                    attempts: 1,
+                    next_attempt_at: Instant::now(),
+                },
+            );
+        }
+
+        let error =
+            validate_pending_submission_backlog(&pending).expect_err("backlog must overflow");
+
+        assert!(matches!(
+            error,
+            Error::DiscoveryPendingSubmissionsTooLarge { max_pending }
+                if max_pending == MAX_PENDING_DISCOVERY_SUBMISSIONS
+        ));
     }
 
     fn watch_entry(watch_id: Uuid, updated_at: chrono::DateTime<Utc>) -> Arc<WatchEntry> {
@@ -982,6 +1218,53 @@ mod tests {
             created_at: Utc::now(),
             updated_at,
         })
+    }
+
+    struct HangingIndexedLookupBackend;
+
+    #[async_trait]
+    impl DiscoveryBackend for HangingIndexedLookupBackend {
+        fn name(&self) -> &'static str {
+            "hanging_test"
+        }
+
+        fn chain(&self) -> ChainType {
+            ChainType::Bitcoin
+        }
+
+        fn poll_interval(&self) -> StdDuration {
+            StdDuration::from_secs(1)
+        }
+
+        fn indexed_lookup_concurrency(&self) -> usize {
+            1
+        }
+
+        async fn indexed_lookup(
+            &self,
+            _watch: &WatchEntry,
+        ) -> crate::error::Result<Option<DetectedDeposit>> {
+            tokio::time::sleep(StdDuration::from_secs(60)).await;
+            Ok(None)
+        }
+
+        async fn current_cursor(&self) -> crate::error::Result<BlockCursor> {
+            Ok(BlockCursor {
+                height: 0,
+                hash: "test".to_string(),
+            })
+        }
+
+        async fn scan_new_blocks(
+            &self,
+            from_exclusive: &BlockCursor,
+            _watches: &[Arc<WatchEntry>],
+        ) -> crate::error::Result<BlockScan> {
+            Ok(BlockScan {
+                new_cursor: from_exclusive.clone(),
+                detections: Vec::new(),
+            })
+        }
     }
 
     #[test]
@@ -1029,6 +1312,27 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn indexed_lookup_task_times_out_and_releases_slot() {
+        let watch_id = Uuid::now_v7();
+        let updated_at = Utc::now();
+        let watch = watch_entry(watch_id, updated_at);
+        let result = run_indexed_lookup_task(
+            Arc::new(HangingIndexedLookupBackend),
+            watch,
+            updated_at,
+            StdDuration::from_millis(1),
+        )
+        .await;
+
+        assert_eq!(result.watch_id, watch_id);
+        assert_eq!(result.version, updated_at);
+        assert!(matches!(
+            result.lookup_result,
+            Err(Error::IndexedLookupTimeout { .. })
+        ));
+    }
+
     #[test]
     fn backfill_state_requeues_pending_submission_for_same_version() {
         let watch_id = Uuid::now_v7();
@@ -1050,9 +1354,10 @@ mod tests {
     }
 
     #[test]
-    fn backfill_state_retries_unresolved_active_lookup() {
+    fn backfill_state_defers_unresolved_active_lookup_retry() {
         let watch_id = Uuid::now_v7();
         let updated_at = Utc::now();
+        let now = Instant::now();
         let mut state = IndexedLookupBackfillState::default();
         let watches = HashMap::from([(watch_id, watch_entry(watch_id, updated_at))]);
 
@@ -1065,8 +1370,18 @@ mod tests {
             &HashMap::from([(watch_id, updated_at)]),
         ));
 
-        state.retry_unresolved(watch_id, updated_at);
-        state.sync_snapshot(&watches);
+        state.retry_unresolved_at(
+            watch_id,
+            updated_at,
+            now + INDEXED_LOOKUP_UNRESOLVED_RETRY_DELAY,
+        );
+        state.sync_snapshot_at(&watches, now);
+        assert_eq!(state.queue_len(), 0);
+
+        state.sync_snapshot_at(
+            &watches,
+            now + INDEXED_LOOKUP_UNRESOLVED_RETRY_DELAY + StdDuration::from_secs(1),
+        );
 
         assert_eq!(state.queue_len(), 1);
     }

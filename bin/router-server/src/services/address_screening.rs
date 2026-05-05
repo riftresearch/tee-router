@@ -44,6 +44,7 @@ pub enum AddressScreeningError {
 }
 
 pub type AddressScreeningResult<T> = Result<T, AddressScreeningError>;
+const MAX_ADDRESS_SCREENING_REASON_CHARS: usize = 256;
 
 #[derive(Clone)]
 pub struct AddressScreeningService {
@@ -83,11 +84,7 @@ impl AddressScreeningService {
                 chain: chain.clone(),
                 address: address.to_string(),
                 risk: risk_label(&response.risk),
-                reason_suffix: response
-                    .risk_reason
-                    .filter(|reason| !reason.trim().is_empty())
-                    .map(|reason| format!(", reason={reason}"))
-                    .unwrap_or_default(),
+                reason_suffix: risk_reason_suffix(response.risk_reason),
             });
         }
 
@@ -112,6 +109,26 @@ fn risk_label(risk: &RiskLevel) -> &'static str {
     }
 }
 
+fn risk_reason_suffix(reason: Option<String>) -> String {
+    let Some(reason) = reason.map(|reason| reason.trim().to_string()) else {
+        return String::new();
+    };
+    if reason.is_empty() {
+        return String::new();
+    }
+
+    let mut chars = reason.chars();
+    let bounded: String = chars
+        .by_ref()
+        .take(MAX_ADDRESS_SCREENING_REASON_CHARS)
+        .collect();
+    if chars.next().is_some() {
+        format!(", reason={bounded}...")
+    } else {
+        format!(", reason={bounded}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,5 +144,28 @@ mod tests {
     fn allows_low_and_medium_risk() {
         assert!(!address_risk_is_blocked(&RiskLevel::Low));
         assert!(!address_risk_is_blocked(&RiskLevel::Medium));
+    }
+
+    #[test]
+    fn risk_reason_suffix_is_trimmed_and_bounded_without_splitting_utf8() {
+        assert_eq!(risk_reason_suffix(None), "");
+        assert_eq!(risk_reason_suffix(Some("  ".to_string())), "");
+        assert_eq!(
+            risk_reason_suffix(Some("  sanctions exposure  ".to_string())),
+            ", reason=sanctions exposure"
+        );
+
+        let reason = "é".repeat(MAX_ADDRESS_SCREENING_REASON_CHARS + 1);
+        let suffix = risk_reason_suffix(Some(reason));
+
+        assert!(suffix.ends_with("..."));
+        assert_eq!(
+            suffix
+                .trim_start_matches(", reason=")
+                .trim_end_matches("...")
+                .chars()
+                .count(),
+            MAX_ADDRESS_SCREENING_REASON_CHARS
+        );
     }
 }

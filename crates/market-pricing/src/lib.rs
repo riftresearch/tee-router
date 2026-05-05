@@ -12,6 +12,8 @@ pub type MarketPricingResult<T> = Result<T, MarketPricingError>;
 pub const USD_MICRO: u64 = 1_000_000;
 const PRICING_RETRY_ATTEMPTS: usize = 4;
 const PRICING_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(250);
+const MARKET_PRICING_MAX_RESPONSE_BODY_BYTES: usize = 256 * 1024;
+const MARKET_PRICING_MAX_ERROR_PREVIEW_CHARS: usize = 4 * 1024;
 
 #[derive(Debug, Snafu)]
 pub enum MarketPricingError {
@@ -20,6 +22,8 @@ pub enum MarketPricingError {
         url: String,
         source: url::ParseError,
     },
+    #[snafu(display("invalid URL {url}: {reason}"))]
+    InvalidUrlFormat { url: String, reason: String },
     #[snafu(display("failed to join base URL {base_url} with path {path}: {source}"))]
     UrlJoin {
         base_url: String,
@@ -34,6 +38,8 @@ pub enum MarketPricingError {
         status: StatusCode,
         body: String,
     },
+    #[snafu(display("response body from {url} exceeded {max_bytes} bytes"))]
+    ResponseBodyTooLarge { url: String, max_bytes: usize },
     #[snafu(display("invalid JSON body from {url}: {source}; body={body}"))]
     InvalidJson {
         url: String,
@@ -44,6 +50,8 @@ pub enum MarketPricingError {
     UnexpectedCurrency { product_id: String },
     #[snafu(display("invalid decimal USD value {raw:?}: {reason}"))]
     InvalidDecimal { raw: String, reason: String },
+    #[snafu(display("non-positive market price for {price_source}: {value}"))]
+    NonPositivePrice { price_source: String, value: u64 },
     #[snafu(display("invalid RPC response from {url}: {reason}; body={body}"))]
     InvalidRpc {
         url: String,
@@ -104,10 +112,10 @@ impl MarketPricingOracleConfig {
         base_rpc_url: impl AsRef<str>,
     ) -> MarketPricingResult<Self> {
         Ok(Self {
-            coinbase_api_base_url: parse_url(coinbase_api_base_url.as_ref())?,
-            ethereum_rpc_url: parse_url(ethereum_rpc_url.as_ref())?,
-            arbitrum_rpc_url: parse_url(arbitrum_rpc_url.as_ref())?,
-            base_rpc_url: parse_url(base_rpc_url.as_ref())?,
+            coinbase_api_base_url: parse_http_url(coinbase_api_base_url.as_ref())?,
+            ethereum_rpc_url: parse_http_url(ethereum_rpc_url.as_ref())?,
+            arbitrum_rpc_url: parse_http_url(arbitrum_rpc_url.as_ref())?,
+            base_rpc_url: parse_http_url(base_rpc_url.as_ref())?,
             timeout: Duration::from_secs(10),
         })
     }
@@ -137,16 +145,21 @@ impl MarketPricingOracle {
 
     pub async fn snapshot(&self) -> MarketPricingResult<MarketPricingSnapshot> {
         let captured_at = Utc::now();
-        let eth_usd_micro = self.coinbase_spot_usd_micro("ETH-USD").await?;
-        let btc_usd_micro = self.coinbase_spot_usd_micro("BTC-USD").await?;
-        let stable_usd_micro = self.coinbase_spot_usd_micro("USDC-USD").await?;
-        let ethereum_gas_price_wei = self
-            .evm_gas_price_wei(&self.config.ethereum_rpc_url)
-            .await?;
-        let arbitrum_gas_price_wei = self
-            .evm_gas_price_wei(&self.config.arbitrum_rpc_url)
-            .await?;
-        let base_gas_price_wei = self.evm_gas_price_wei(&self.config.base_rpc_url).await?;
+        let (
+            eth_usd_micro,
+            btc_usd_micro,
+            stable_usd_micro,
+            ethereum_gas_price_wei,
+            arbitrum_gas_price_wei,
+            base_gas_price_wei,
+        ) = tokio::try_join!(
+            self.coinbase_spot_usd_micro("ETH-USD"),
+            self.coinbase_spot_usd_micro("BTC-USD"),
+            self.coinbase_spot_usd_micro("USDC-USD"),
+            self.evm_gas_price_wei(&self.config.ethereum_rpc_url),
+            self.evm_gas_price_wei(&self.config.arbitrum_rpc_url),
+            self.evm_gas_price_wei(&self.config.base_rpc_url),
+        )?;
 
         Ok(MarketPricingSnapshot {
             source: "coinbase_spot_plus_rpc_eth_gas_price_v1".to_string(),
@@ -163,17 +176,18 @@ impl MarketPricingOracle {
 
     async fn coinbase_spot_usd_micro(&self, product_id: &str) -> MarketPricingResult<u64> {
         let mut delay = PRICING_RETRY_INITIAL_DELAY;
-        for attempt in 1..=PRICING_RETRY_ATTEMPTS {
+        let mut attempt = 1;
+        loop {
             match self.coinbase_spot_usd_micro_once(product_id).await {
                 Ok(value) => return Ok(value),
                 Err(error) if attempt < PRICING_RETRY_ATTEMPTS && error.is_retryable() => {
                     sleep(delay).await;
                     delay = delay.saturating_mul(2);
+                    attempt += 1;
                 }
                 Err(error) => return Err(error),
             }
         }
-        unreachable!("pricing retry loop returns before exhausting attempts")
     }
 
     async fn coinbase_spot_usd_micro_once(&self, product_id: &str) -> MarketPricingResult<u64> {
@@ -185,22 +199,25 @@ impl MarketPricingOracle {
                 product_id: product_id.to_string(),
             });
         }
-        parse_usd_micro(&response.data.amount)
+        let value = parse_usd_micro(&response.data.amount)?;
+        ensure_positive_price(&format!("coinbase {product_id}"), value)?;
+        Ok(value)
     }
 
     async fn evm_gas_price_wei(&self, rpc_url: &Url) -> MarketPricingResult<u64> {
         let mut delay = PRICING_RETRY_INITIAL_DELAY;
-        for attempt in 1..=PRICING_RETRY_ATTEMPTS {
+        let mut attempt = 1;
+        loop {
             match self.evm_gas_price_wei_once(rpc_url).await {
                 Ok(value) => return Ok(value),
                 Err(error) if attempt < PRICING_RETRY_ATTEMPTS && error.is_retryable() => {
                     sleep(delay).await;
                     delay = delay.saturating_mul(2);
+                    attempt += 1;
                 }
                 Err(error) => return Err(error),
             }
         }
-        unreachable!("pricing retry loop returns before exhausting attempts")
     }
 
     async fn evm_gas_price_wei_once(&self, rpc_url: &Url) -> MarketPricingResult<u64> {
@@ -216,29 +233,31 @@ impl MarketPricingOracle {
             .json(&body)
             .send()
             .await
-            .map_err(|source| MarketPricingError::Http { source })?;
+            .map_err(|source| MarketPricingError::Http {
+                source: source.without_url(),
+            })?;
+        let sanitized_rpc_url = sanitized_parsed_url_for_error(rpc_url);
         let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|source| MarketPricingError::Http { source })?;
+        let body =
+            read_limited_response_text(response, MARKET_PRICING_MAX_RESPONSE_BODY_BYTES, rpc_url)
+                .await?;
         if !status.is_success() {
             return Err(MarketPricingError::HttpStatus {
-                url: rpc_url.to_string(),
+                url: sanitized_rpc_url,
                 status,
-                body,
+                body: error_text_preview(&body),
             });
         }
         let value: JsonRpcResponse =
             serde_json::from_str(&body).map_err(|source| MarketPricingError::InvalidJson {
-                url: rpc_url.to_string(),
+                url: sanitized_rpc_url.clone(),
                 source,
-                body: body.clone(),
+                body: error_text_preview(&body),
             })?;
         if let Some(error) = value.error {
             return Err(MarketPricingError::RpcError {
-                url: rpc_url.to_string(),
-                error: error.to_string(),
+                url: sanitized_rpc_url,
+                error: error_text_preview(&error.to_string()),
             });
         }
         let result = value
@@ -246,16 +265,18 @@ impl MarketPricingOracle {
             .and_then(|value| value.as_str().map(str::to_string));
         let Some(result) = result else {
             return Err(MarketPricingError::InvalidRpc {
-                url: rpc_url.to_string(),
+                url: sanitized_rpc_url.clone(),
                 reason: "missing string result".to_string(),
-                body,
+                body: error_text_preview(&body),
             });
         };
-        parse_hex_u64(&result).map_err(|reason| MarketPricingError::InvalidRpc {
-            url: rpc_url.to_string(),
+        let value = parse_hex_u64(&result).map_err(|reason| MarketPricingError::InvalidRpc {
+            url: sanitized_rpc_url.clone(),
             reason,
-            body,
-        })
+            body: error_text_preview(&body),
+        })?;
+        ensure_positive_price(&format!("rpc gas price {sanitized_rpc_url}"), value)?;
+        Ok(value)
     }
 }
 
@@ -280,42 +301,146 @@ async fn get_json<T>(http: &reqwest::Client, url: Url) -> MarketPricingResult<T>
 where
     T: for<'de> Deserialize<'de>,
 {
-    let response = http
-        .get(url.clone())
-        .send()
-        .await
-        .map_err(|source| MarketPricingError::Http { source })?;
+    let response =
+        http.get(url.clone())
+            .send()
+            .await
+            .map_err(|source| MarketPricingError::Http {
+                source: source.without_url(),
+            })?;
+    let sanitized_url = sanitized_parsed_url_for_error(&url);
     let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|source| MarketPricingError::Http { source })?;
+    let body =
+        read_limited_response_text(response, MARKET_PRICING_MAX_RESPONSE_BODY_BYTES, &url).await?;
     if !status.is_success() {
         return Err(MarketPricingError::HttpStatus {
-            url: url.to_string(),
+            url: sanitized_url,
             status,
-            body,
+            body: error_text_preview(&body),
         });
     }
     serde_json::from_str(&body).map_err(|source| MarketPricingError::InvalidJson {
-        url: url.to_string(),
+        url: sanitized_url,
         source,
-        body,
+        body: error_text_preview(&body),
     })
 }
 
-fn parse_url(raw: &str) -> MarketPricingResult<Url> {
-    raw.parse()
+async fn read_limited_response_text(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+    url: &Url,
+) -> MarketPricingResult<String> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|source| MarketPricingError::Http {
+            source: source.without_url(),
+        })?
+    {
+        if !append_limited_body_chunk(&mut body, chunk.as_ref(), max_bytes) {
+            return Err(MarketPricingError::ResponseBodyTooLarge {
+                url: sanitized_parsed_url_for_error(url),
+                max_bytes,
+            });
+        }
+    }
+
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+fn append_limited_body_chunk(body: &mut Vec<u8>, chunk: &[u8], max_bytes: usize) -> bool {
+    if body.len().saturating_add(chunk.len()) > max_bytes {
+        return false;
+    }
+    body.extend_from_slice(chunk);
+    true
+}
+
+fn error_text_preview(value: &str) -> String {
+    let mut end = 0;
+    let mut count = 0;
+    for (index, ch) in value.char_indices() {
+        if count == MARKET_PRICING_MAX_ERROR_PREVIEW_CHARS {
+            return format!(
+                "{}...<truncated {} chars>",
+                &value[..end],
+                value[index..].chars().count()
+            );
+        }
+        end = index + ch.len_utf8();
+        count += 1;
+    }
+    value.to_string()
+}
+
+fn parse_http_url(raw: &str) -> MarketPricingResult<Url> {
+    let url: Url = raw
+        .parse()
         .map_err(|source| MarketPricingError::InvalidUrl {
-            url: raw.to_string(),
+            url: sanitize_url_for_error(raw),
             source,
-        })
+        })?;
+    match url.scheme() {
+        "http" | "https" => {}
+        scheme => {
+            return Err(MarketPricingError::InvalidUrlFormat {
+                url: sanitize_url_for_error(raw),
+                reason: format!("expected http or https scheme, got {scheme:?}"),
+            });
+        }
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(MarketPricingError::InvalidUrlFormat {
+            url: sanitized_parsed_url_for_error(&url),
+            reason: "URL credentials are not allowed".to_string(),
+        });
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(MarketPricingError::InvalidUrlFormat {
+            url: sanitized_parsed_url_for_error(&url),
+            reason: "query strings and fragments are not allowed".to_string(),
+        });
+    }
+    Ok(url)
+}
+
+fn sanitize_url_for_error(raw: &str) -> String {
+    match raw.parse::<Url>() {
+        Ok(url) => sanitized_parsed_url_for_error(&url),
+        Err(_) => sanitize_unparsed_url_for_error(raw),
+    }
+}
+
+fn sanitized_parsed_url_for_error(url: &Url) -> String {
+    let host = url.host_str().unwrap_or("<missing-host>");
+    let mut sanitized = format!("{}://{}", url.scheme(), host);
+    if let Some(port) = url.port() {
+        sanitized.push(':');
+        sanitized.push_str(&port.to_string());
+    }
+    if url.path() != "/" {
+        sanitized.push_str("/<redacted-path>");
+    }
+    if url.query().is_some() {
+        sanitized.push_str("?<redacted-query>");
+    }
+    if url.fragment().is_some() {
+        sanitized.push_str("#<redacted-fragment>");
+    }
+    sanitized
+}
+
+fn sanitize_unparsed_url_for_error(raw: &str) -> String {
+    let _ = raw;
+    "<invalid url>".to_string()
 }
 
 fn join_url(base: &Url, path: &str) -> MarketPricingResult<Url> {
     base.join(path)
         .map_err(|source| MarketPricingError::UrlJoin {
-            base_url: base.to_string(),
+            base_url: sanitized_parsed_url_for_error(base),
             path: path.to_string(),
             source,
         })
@@ -327,6 +452,16 @@ fn parse_hex_u64(raw: &str) -> Result<u64, String> {
         .or_else(|| raw.strip_prefix("0X"))
         .unwrap_or(raw);
     u64::from_str_radix(trimmed, 16).map_err(|err| format!("invalid hex u64 {raw:?}: {err}"))
+}
+
+fn ensure_positive_price(source: &str, value: u64) -> MarketPricingResult<()> {
+    if value == 0 {
+        return Err(MarketPricingError::NonPositivePrice {
+            price_source: source.to_string(),
+            value,
+        });
+    }
+    Ok(())
 }
 
 pub fn parse_usd_micro(raw: &str) -> MarketPricingResult<u64> {
@@ -354,14 +489,15 @@ pub fn parse_usd_micro(raw: &str) -> MarketPricingResult<u64> {
     if fractional.chars().skip(6).any(|ch| ch != '0') {
         fractional_micro = fractional_micro.saturating_add(1);
     }
-    Ok(whole
-        .saturating_mul(USD_MICRO)
-        .saturating_add(fractional_micro))
+    whole
+        .checked_mul(USD_MICRO)
+        .and_then(|whole_micro| whole_micro.checked_add(fractional_micro))
+        .ok_or_else(|| invalid_decimal(raw, "USD value overflowed u64 micro-units"))
 }
 
 fn invalid_decimal(raw: &str, reason: &str) -> MarketPricingError {
     MarketPricingError::InvalidDecimal {
-        raw: raw.to_string(),
+        raw: error_text_preview(raw),
         reason: reason.to_string(),
     }
 }
@@ -384,8 +520,179 @@ mod tests {
     }
 
     #[test]
+    fn parse_usd_micro_rounding_can_carry_to_next_unit() {
+        assert_eq!(parse_usd_micro("0.9999991").unwrap(), USD_MICRO);
+    }
+
+    #[test]
+    fn parse_usd_micro_rejects_overflow() {
+        let error = parse_usd_micro("18446744073710").unwrap_err();
+        assert!(matches!(error, MarketPricingError::InvalidDecimal { .. }));
+        assert!(
+            error.to_string().contains("overflowed u64"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn parse_hex_u64_decodes_rpc_hex() {
         assert_eq!(parse_hex_u64("0x77359400").unwrap(), 2_000_000_000);
+    }
+
+    #[test]
+    fn oracle_config_rejects_non_http_and_credentialed_urls() {
+        let error = MarketPricingOracleConfig::new(
+            "file:///tmp/coinbase.json",
+            "https://eth.example.com",
+            "https://arb.example.com",
+            "https://base.example.com",
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("expected http or https"),
+            "unexpected error: {error}"
+        );
+
+        let error = MarketPricingOracleConfig::new(
+            "https://api.coinbase.com",
+            "https://user:pass@eth.example.com",
+            "https://arb.example.com",
+            "https://base.example.com",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("URL credentials are not allowed"),
+            "unexpected error: {error}"
+        );
+        let rendered = error.to_string();
+        assert!(!rendered.contains("user"), "leaked username: {rendered}");
+        assert!(!rendered.contains("pass"), "leaked password: {rendered}");
+    }
+
+    #[test]
+    fn oracle_config_rejects_query_and_fragment_urls() {
+        let error = MarketPricingOracleConfig::new(
+            "https://api.coinbase.com?token=secret",
+            "https://eth.example.com",
+            "https://arb.example.com",
+            "https://base.example.com",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("query strings and fragments are not allowed"),
+            "unexpected error: {error}"
+        );
+        let rendered = error.to_string();
+        assert!(!rendered.contains("token"), "leaked query key: {rendered}");
+        assert!(
+            !rendered.contains("secret"),
+            "leaked query value: {rendered}"
+        );
+    }
+
+    #[test]
+    fn url_error_sanitization_redacts_unparsed_secret_material() {
+        let sanitized = sanitize_unparsed_url_for_error("not a URL with secret-token");
+
+        assert_eq!(sanitized, "<invalid url>");
+        assert!(
+            !sanitized.contains("secret-token"),
+            "leaked invalid URL material: {sanitized}"
+        );
+    }
+
+    #[test]
+    fn url_error_sanitization_redacts_parsed_path_query_and_fragment() {
+        let sanitized = sanitize_url_for_error(
+            "https://user:pass@example.com/path-secret?token=query-secret#fragment-secret",
+        );
+
+        assert_eq!(
+            sanitized,
+            "https://example.com/<redacted-path>?<redacted-query>#<redacted-fragment>"
+        );
+        assert!(!sanitized.contains("user"), "leaked username: {sanitized}");
+        assert!(!sanitized.contains("pass"), "leaked password: {sanitized}");
+        assert!(
+            !sanitized.contains("path-secret"),
+            "leaked path material: {sanitized}"
+        );
+        assert!(
+            !sanitized.contains("query-secret"),
+            "leaked query value: {sanitized}"
+        );
+        assert!(
+            !sanitized.contains("fragment-secret"),
+            "leaked fragment value: {sanitized}"
+        );
+    }
+
+    #[test]
+    fn market_prices_must_be_positive() {
+        let error = ensure_positive_price("coinbase ETH-USD", 0).unwrap_err();
+        assert!(matches!(error, MarketPricingError::NonPositivePrice { .. }));
+        ensure_positive_price("coinbase ETH-USD", 1).unwrap();
+    }
+
+    #[test]
+    fn append_limited_body_chunk_rejects_chunks_past_the_limit_without_mutating() {
+        let mut body = b"abcd".to_vec();
+
+        assert!(!append_limited_body_chunk(&mut body, b"ef", 5));
+        assert_eq!(body, b"abcd");
+    }
+
+    #[test]
+    fn append_limited_body_chunk_accepts_chunks_at_the_limit() {
+        let mut body = b"abcd".to_vec();
+
+        assert!(append_limited_body_chunk(&mut body, b"ef", 6));
+        assert_eq!(body, b"abcdef");
+    }
+
+    #[test]
+    fn error_text_preview_truncates_large_values() {
+        let value = "a".repeat(MARKET_PRICING_MAX_ERROR_PREVIEW_CHARS + 7);
+
+        let preview = error_text_preview(&value);
+
+        assert_eq!(
+            preview.len(),
+            MARKET_PRICING_MAX_ERROR_PREVIEW_CHARS + "...<truncated 7 chars>".len()
+        );
+        assert!(preview.ends_with("...<truncated 7 chars>"));
+    }
+
+    #[test]
+    fn error_text_preview_does_not_split_utf8_codepoints() {
+        let value = format!(
+            "{}{}",
+            "a".repeat(MARKET_PRICING_MAX_ERROR_PREVIEW_CHARS - 1),
+            "é".repeat(3)
+        );
+
+        let preview = error_text_preview(&value);
+
+        assert!(preview.starts_with(&format!(
+            "{}é",
+            "a".repeat(MARKET_PRICING_MAX_ERROR_PREVIEW_CHARS - 1)
+        )));
+        assert!(preview.ends_with("...<truncated 2 chars>"));
+    }
+
+    #[test]
+    fn invalid_decimal_error_truncates_untrusted_raw_value() {
+        let raw = "9".repeat(MARKET_PRICING_MAX_ERROR_PREVIEW_CHARS + 1);
+
+        let error = parse_usd_micro(&raw).unwrap_err();
+        let rendered = error.to_string();
+
+        assert!(rendered.contains("<truncated 1 chars>"));
+        assert!(!rendered.contains(&raw));
     }
 
     #[tokio::test]

@@ -1,9 +1,10 @@
 import { createApp } from './app'
-import { loadConfig } from './config'
+import { loadConfig, validateGatewayRuntimeConfig } from './config'
 import { migrateGatewayDatabase } from './database/migrations'
 import { createDependencyHealthMonitor } from './health'
 
 const config = loadConfig()
+validateGatewayRuntimeConfig(config)
 
 if (config.gatewayDatabaseUrl) {
   const result = await migrateGatewayDatabase(config.gatewayDatabaseUrl)
@@ -14,10 +15,6 @@ if (config.gatewayDatabaseUrl) {
     .filter(Boolean)
     .join(' ')
   console.log(`router-gateway migrations complete${summary ? ` ${summary}` : ''}`)
-} else {
-  console.warn(
-    'ROUTER_GATEWAY_DATABASE_URL is not configured; skipping router-gateway migrations'
-  )
 }
 
 const dependencyHealthMonitor = createDependencyHealthMonitor(config)

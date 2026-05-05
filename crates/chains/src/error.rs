@@ -64,6 +64,9 @@ pub enum Error {
     #[snafu(display("Insufficient balance: required {required}, available {available}"))]
     InsufficientBalance { required: U256, available: U256 },
 
+    #[snafu(display("Numeric overflow while calculating {context}"))]
+    NumericOverflow { context: &'static str },
+
     #[snafu(display("Chain not supported: {chain}"))]
     ChainNotSupported { chain: String },
 

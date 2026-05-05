@@ -5,6 +5,7 @@ pub mod asset_registry;
 pub mod custody_action_executor;
 pub mod deposit_address;
 pub mod gas_reimbursement;
+pub(crate) mod http_body;
 pub mod market_order_planner;
 pub mod order_executor;
 pub mod order_manager;
@@ -18,8 +19,8 @@ pub mod usd_valuation;
 pub mod vault_manager;
 
 pub use action_providers::{
-    AcrossHttpProviderConfig, ActionProviderRegistry, CctpHttpProviderConfig,
-    ProviderAddressIntent, ProviderExecutionIntent, ProviderExecutionState,
+    AcrossHttpProviderConfig, ActionProviderHttpOptions, ActionProviderRegistry,
+    CctpHttpProviderConfig, ProviderAddressIntent, ProviderExecutionIntent, ProviderExecutionState,
     ProviderOperationIntent, ProviderOperationObservation, ProviderOperationObservationRequest,
     VeloraHttpProviderConfig,
 };
@@ -35,8 +36,8 @@ pub use custody_action_executor::{
 pub use gas_reimbursement::{GasReimbursementPlan, GasRetentionAction};
 pub use market_order_planner::MarketOrderRoutePlanner;
 pub use order_executor::{
-    OrderExecutionCrashInjector, OrderExecutionCrashPoint, OrderExecutionManager,
-    ProviderOperationStatusUpdate, ProviderOperationStatusUpdateOutcome,
+    OrderExecutionCrashInjector, OrderExecutionCrashPoint, OrderExecutionError,
+    OrderExecutionManager, ProviderOperationStatusUpdate, ProviderOperationStatusUpdateOutcome,
 };
 pub use order_manager::OrderManager;
 pub use pricing::PricingSnapshot;

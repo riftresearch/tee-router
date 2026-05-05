@@ -9,12 +9,18 @@ The indexer is chain-agnostic at runtime:
 - `PONDER_CONTRACT_START_BLOCK` selects the first block to index.
 - `DATABASE_URL` selects the Postgres database.
 - `DATABASE_SCHEMA` or `PONDER_SCHEMA` selects the Ponder schema used by the write API.
+- `EVM_TOKEN_INDEXER_API_KEY` is the bearer key required by all API routes.
+  Local-only unauthenticated runs must set
+  `EVM_TOKEN_INDEXER_ALLOW_UNAUTHENTICATED=true` explicitly. This escape hatch
+  is rejected when `NODE_ENV=production` or `RAILWAY_ENVIRONMENT=production`.
 
 The app indexes addressless ERC-20 `Transfer` logs. It stores raw rolling transfer
 rows, mirrors Sauron's active deposit watches, and materializes durable deposit
 candidates for Sauron to submit as router hints.
 
 ## API
+
+All API routes require `Authorization: Bearer $EVM_TOKEN_INDEXER_API_KEY`.
 
 - `PUT /watches` replaces the active ERC-20 watch mirror for this chain and
   materializes matching candidates.
@@ -24,7 +30,9 @@ candidates for Sauron to submit as router hints.
 - `POST /candidates/:id/mark-submitted` marks a candidate delivered after the
   router accepts the hint.
 - `POST /candidates/:id/release` records a retryable submission failure.
+- `POST /candidates/:id/discard` marks a malformed candidate discarded so it
+  cannot permanently block the pending candidate page.
 - `POST /maintenance/prune-raw` deletes raw transfer rows older than the
   configured retention window. Candidates are retained separately.
-- `GET /transfers/to/:address?token=0x...&amount=...` is a diagnostic transfer
-  lookup over the raw table.
+- `GET /transfers/to/:address?token=0x...&amount=...&limit=50` is a diagnostic
+  latest-transfer lookup over the raw table.

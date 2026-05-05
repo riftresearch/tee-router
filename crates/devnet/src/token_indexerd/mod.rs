@@ -22,12 +22,15 @@ const BIND_HOST: &str = "0.0.0.0";
 const LOCAL_HEALTH_HOST: &str = "127.0.0.1";
 const INDEXER_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const INDEXER_STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const INDEXER_HEALTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const PIPE_LOG_LIMIT_BYTES: usize = 32 * 1024;
+const TOKEN_INDEXER_API_KEY_MIN_LENGTH: usize = 32;
 
 pub struct TokenIndexerInstance {
     // Handle to the spawned pnpm dev process
     pub child: Child,
     pub api_server_url: String,
+    pub api_key: String,
     stdout: Arc<Mutex<String>>,
     stderr: Arc<Mutex<String>>,
     stdout_task: Option<JoinHandle<()>>,
@@ -42,6 +45,7 @@ impl TokenIndexerInstance {
         pipe_output: bool,
         chain_id: u64,
         database_url: String,
+        api_key: String,
         interactive_port: Option<u16>,
     ) -> std::io::Result<Self> {
         let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
@@ -52,15 +56,11 @@ impl TokenIndexerInstance {
         let ponder_port = if interactive {
             interactive_port.unwrap_or(50104_u16)
         } else {
-            let listener = TcpListener::bind((LOCAL_HEALTH_HOST, 0))
-                .await
-                .expect("Should be able to bind to port");
+            let listener = TcpListener::bind((LOCAL_HEALTH_HOST, 0)).await?;
 
-            listener
-                .local_addr()
-                .expect("Should have a local address")
-                .port()
+            listener.local_addr()?.port()
         };
+        validate_token_indexer_api_key(&api_key)?;
 
         // uuid for the schema
         let schema_uuid = Uuid::now_v7();
@@ -85,15 +85,21 @@ impl TokenIndexerInstance {
         .env("PONDER_CONTRACT_START_BLOCK", "0")
         .env("DATABASE_SCHEMA", schema_uuid.to_string())
         .env("PONDER_SCHEMA", schema_uuid.to_string())
+        .env("EVM_TOKEN_INDEXER_API_KEY", &api_key)
         .env("PONDER_LOG_LEVEL", "trace");
 
         // Set the child process to be the leader of its own process group
         // This prevents killing the parent test process when we clean up
         #[cfg(unix)]
+        // SAFETY: `pre_exec` runs in the child process immediately before
+        // exec. The closure only calls async-signal-safe `setpgid` and
+        // constructs an OS error if that syscall fails.
         unsafe {
             cmd.pre_exec(|| {
                 // setpgid(0, 0) makes this process the leader of a new process group
-                libc::setpgid(0, 0);
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 Ok(())
             });
         }
@@ -104,7 +110,7 @@ impl TokenIndexerInstance {
             cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         }
 
-        let mut child = cmd.spawn().expect("Failed to spawn token indexer process");
+        let mut child = cmd.spawn()?;
         let stdout = Arc::new(Mutex::new(String::new()));
         let stderr = Arc::new(Mutex::new(String::new()));
         let stdout_task = if pipe_output {
@@ -130,6 +136,7 @@ impl TokenIndexerInstance {
         let mut instance = Self {
             child,
             api_server_url,
+            api_key,
             stdout,
             stderr,
             stdout_task,
@@ -156,7 +163,10 @@ impl TokenIndexerInstance {
     }
 
     async fn wait_until_ready(&mut self) -> std::io::Result<()> {
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(INDEXER_HEALTH_REQUEST_TIMEOUT)
+            .build()
+            .map_err(std::io::Error::other)?;
         let health_url = self.api_server_url.replace(BIND_HOST, LOCAL_HEALTH_HOST) + "/health";
         let start = std::time::Instant::now();
 
@@ -242,13 +252,20 @@ impl Drop for TokenIndexerInstance {
 
 impl TokenIndexerInstance {
     fn kill_process_tree(&self, pid: u32) {
-        let pgid = unsafe { libc::getpgid(pid as i32) };
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return;
+        };
+        // SAFETY: `getpgid` reads process metadata for a pid owned by this
+        // instance. It does not dereference Rust memory or alias data.
+        let pgid = unsafe { libc::getpgid(pid) };
 
         if pgid >= 0 {
             // Send SIGTERM to entire process group
             // This is safe because the child process was spawned with its own process group
             // via setpgid(0, 0), so this will only kill the child and its descendants,
             // not the parent test process
+            // SAFETY: `pgid` came from `getpgid` above. Negating it targets the
+            // child process group intentionally created by `setpgid(0, 0)`.
             unsafe {
                 libc::kill(-pgid, libc::SIGTERM);
             }
@@ -281,4 +298,16 @@ fn resolve_token_indexer_dir(manifest_dir: &Path) -> PathBuf {
     }
 
     package_dir_without_node_modules.unwrap_or_else(|| PathBuf::from("evm-token-indexer"))
+}
+
+fn validate_token_indexer_api_key(api_key: &str) -> std::io::Result<()> {
+    if api_key.trim().len() < TOKEN_INDEXER_API_KEY_MIN_LENGTH {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "token indexer API key must be at least {TOKEN_INDEXER_API_KEY_MIN_LENGTH} characters"
+            ),
+        ));
+    }
+    Ok(())
 }

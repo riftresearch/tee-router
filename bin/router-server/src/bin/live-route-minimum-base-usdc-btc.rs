@@ -216,11 +216,11 @@ async fn probe_route(
     recipient_address: &str,
     amount_in_raw: u64,
 ) -> CliResult<ProbeResult> {
-    let source_asset = deposit_asset("evm:8453", AssetId::Reference(BASE_USDC.to_string()));
+    let source_asset = deposit_asset("evm:8453", AssetId::Reference(BASE_USDC.to_string()))?;
     let unit_ingress_asset =
-        deposit_asset("evm:42161", AssetId::Reference(ARBITRUM_USDC.to_string()));
-    let exchange_input_asset = deposit_asset("hyperliquid", AssetId::Native);
-    let destination_asset = deposit_asset("bitcoin", AssetId::Native);
+        deposit_asset("evm:42161", AssetId::Reference(ARBITRUM_USDC.to_string()))?;
+    let exchange_input_asset = deposit_asset("hyperliquid", AssetId::Native)?;
+    let destination_asset = deposit_asset("bitcoin", AssetId::Native)?;
     let amount_in = amount_in_raw.to_string();
 
     let Some(across_quote) = across
@@ -336,11 +336,11 @@ async fn read_base_usdc_balance(rpc_url: &str, private_key: &str) -> CliResult<u
     Ok(balance.to::<u64>())
 }
 
-fn deposit_asset(chain: &str, asset: AssetId) -> DepositAsset {
-    DepositAsset {
-        chain: ChainId::parse(chain).expect("valid static chain"),
+fn deposit_asset(chain: &str, asset: AssetId) -> CliResult<DepositAsset> {
+    Ok(DepositAsset {
+        chain: ChainId::parse(chain)?,
         asset,
-    }
+    })
 }
 
 fn env_var_required(key: &str) -> CliResult<String> {

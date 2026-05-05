@@ -16,6 +16,11 @@ use uuid::Uuid;
 const POSTGRES_PORT: u16 = 5432;
 const ROUTER_CDC_MIGRATION: &str =
     include_str!("../../router-server/migrations/20260502120000_router_cdc_logical_messages.sql");
+const ROUTER_CDC_DELETE_SAFE_MIGRATION: &str =
+    include_str!("../../router-server/migrations/20260504183000_router_cdc_delete_safe.sql");
+const ROUTER_CDC_MESSAGE_ONLY_PUBLICATION_MIGRATION: &str = include_str!(
+    "../../router-server/migrations/20260504190000_router_cdc_message_only_publication.sql"
+);
 
 #[tokio::test]
 async fn streams_router_logical_messages_from_pgoutput_slot() {
@@ -54,6 +59,22 @@ async fn streams_router_logical_messages_from_pgoutput_slot() {
         .execute(&pool)
         .await
         .expect("install router CDC migration");
+    sqlx_core::raw_sql::raw_sql(ROUTER_CDC_DELETE_SAFE_MIGRATION)
+        .execute(&pool)
+        .await
+        .expect("install latest router CDC trigger migration");
+    sqlx_core::raw_sql::raw_sql(ROUTER_CDC_MESSAGE_ONLY_PUBLICATION_MIGRATION)
+        .execute(&pool)
+        .await
+        .expect("install message-only CDC publication migration");
+
+    let publication_table_count: i64 = sqlx_core::query_scalar::query_scalar(
+        "SELECT COUNT(*) FROM pg_catalog.pg_publication_tables WHERE pubname = 'router_cdc_publication'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count CDC publication tables");
+    assert_eq!(publication_table_count, 0);
 
     let slot_name = format!("sauron_smoke_{}", Uuid::now_v7().simple());
     let repository = RouterCdcRepository::new(
@@ -85,17 +106,23 @@ async fn streams_router_logical_messages_from_pgoutput_slot() {
         .await
         .expect("insert router order");
 
-    let message = tokio::time::timeout(Duration::from_secs(10), async {
+    let (message, raw_xlog_events) = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut message = None;
+        let mut raw_xlog_events = 0usize;
         loop {
             match recv_stream_event(&mut client).await.expect("stream event") {
                 Some(ReplicationEvent::Message {
                     prefix, content, ..
                 }) if prefix == ROUTER_CDC_MESSAGE_PREFIX => {
-                    break parse_router_cdc_message(&content).expect("parse CDC payload");
+                    message = Some(parse_router_cdc_message(&content).expect("parse CDC payload"));
                 }
                 Some(ReplicationEvent::Commit { end_lsn, .. }) => {
                     client.update_applied_lsn(end_lsn);
+                    if let Some(message) = message {
+                        break (message, raw_xlog_events);
+                    }
                 }
+                Some(ReplicationEvent::XLogData { .. }) => raw_xlog_events += 1,
                 Some(_) => {}
                 None => panic!("replication stream ended"),
             }
@@ -107,18 +134,19 @@ async fn streams_router_logical_messages_from_pgoutput_slot() {
     assert_eq!(message.table, "router_orders");
     assert_eq!(message.op, "INSERT");
     assert_eq!(message.order_id, Some(order_id));
+    assert_eq!(raw_xlog_events, 0);
 }
 
 async fn install_minimal_router_schema(pool: &sqlx_postgres::PgPool) {
     for statement in [
-        "CREATE TABLE public.router_orders (id uuid PRIMARY KEY)",
-        "CREATE TABLE public.market_order_quotes (id uuid PRIMARY KEY, order_id uuid)",
-        "CREATE TABLE public.market_order_actions (order_id uuid PRIMARY KEY)",
-        "CREATE TABLE public.order_execution_steps (id uuid PRIMARY KEY, order_id uuid)",
-        "CREATE TABLE public.order_provider_operations (id uuid PRIMARY KEY, order_id uuid)",
-        "CREATE TABLE public.order_provider_addresses (id uuid PRIMARY KEY, order_id uuid, provider_operation_id uuid)",
-        "CREATE TABLE public.deposit_vaults (id uuid PRIMARY KEY)",
-        "CREATE TABLE public.custody_vaults (id uuid PRIMARY KEY, order_id uuid)",
+        "CREATE TABLE public.router_orders (id uuid PRIMARY KEY, updated_at timestamptz NOT NULL DEFAULT now())",
+        "CREATE TABLE public.market_order_quotes (id uuid PRIMARY KEY, order_id uuid, created_at timestamptz NOT NULL DEFAULT now())",
+        "CREATE TABLE public.market_order_actions (order_id uuid PRIMARY KEY, updated_at timestamptz NOT NULL DEFAULT now())",
+        "CREATE TABLE public.order_execution_steps (id uuid PRIMARY KEY, order_id uuid, updated_at timestamptz NOT NULL DEFAULT now())",
+        "CREATE TABLE public.order_provider_operations (id uuid PRIMARY KEY, order_id uuid, updated_at timestamptz NOT NULL DEFAULT now())",
+        "CREATE TABLE public.order_provider_addresses (id uuid PRIMARY KEY, order_id uuid, provider_operation_id uuid, updated_at timestamptz NOT NULL DEFAULT now())",
+        "CREATE TABLE public.deposit_vaults (id uuid PRIMARY KEY, updated_at timestamptz NOT NULL DEFAULT now())",
+        "CREATE TABLE public.custody_vaults (id uuid PRIMARY KEY, order_id uuid, updated_at timestamptz NOT NULL DEFAULT now())",
     ] {
         sqlx_core::query::query(statement)
             .execute(pool)

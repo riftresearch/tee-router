@@ -237,6 +237,12 @@ pub struct RouterServerArgs {
     #[arg(long, env = "ROUTER_DETECTOR_API_KEY")]
     pub router_detector_api_key: Option<String>,
 
+    /// Bearer API key accepted from the public router gateway for quote/order
+    /// endpoints. Required when router-api binds a non-loopback host because
+    /// create-order responses contain raw cancellation secrets.
+    #[arg(long, env = "ROUTER_GATEWAY_API_KEY")]
+    pub router_gateway_api_key: Option<String>,
+
     /// Bearer API key accepted on internal admin endpoints such as provider
     /// policy updates
     #[arg(long, env = "ROUTER_ADMIN_API_KEY")]
@@ -282,11 +288,15 @@ pub struct RouterServerArgs {
     #[arg(long, env = "ROUTER_WORKER_STANDBY_POLL_SECONDS", default_value = "5")]
     pub worker_standby_poll_seconds: u64,
 
-    /// Deprecated: refund work is event/timer driven; retained for CLI compatibility
+    /// Vault work safety-sweep interval. LISTEN/NOTIFY drives normal funding and
+    /// refund wakeups, but this periodic pass recovers missed wakeups and stale
+    /// claimed funding hints.
     #[arg(long, env = "ROUTER_WORKER_REFUND_POLL_SECONDS", default_value = "60")]
     pub worker_refund_poll_seconds: u64,
 
-    /// Deprecated: order execution is wakeup driven; retained for CLI compatibility
+    /// Order execution safety-sweep interval. LISTEN/NOTIFY drives normal
+    /// low-latency wakeups, but this periodic pass recovers missed wakeups and
+    /// retryable execution errors.
     #[arg(
         long,
         env = "ROUTER_WORKER_ORDER_EXECUTION_POLL_SECONDS",

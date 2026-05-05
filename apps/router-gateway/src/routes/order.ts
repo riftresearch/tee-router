@@ -1,32 +1,44 @@
 import { createRoute, z } from '@hono/zod-openapi'
 
-import type { AmountFormat } from '../assets'
+import { assertAddressMatchesChain, type AmountFormat } from '../assets'
 import type { GatewayConfig } from '../config'
-import { GatewayValidationError, normalizeError } from '../errors'
+import {
+  GatewayConflictError,
+  GatewayValidationError,
+  UpstreamHttpError,
+  normalizeError
+} from '../errors'
 import { presentOrderEnvelope, routerQuoteFromEnvelope } from '../presenters'
 import {
   refundAuthorizationServiceFor,
   routerClientFor,
   type GatewayDeps
 } from './deps'
+import { logError } from '../internal/logging'
 import {
+  AddressSchema,
   AmountFormatSchema,
+  DateTimeSchema,
+  EvmSignatureSchema,
   ErrorResponses,
+  IdempotencyKeySchema,
+  IntegratorSchema,
   OrderResponseSchema,
+  RefundTokenSchema,
   RefundModeSchema
 } from './schemas'
 
 export const OrderMarketRequestSchema = z
   .object({
     quoteId: z.string().uuid(),
-    fromAddress: z.string().min(1),
-    toAddress: z.string().min(1),
-    refundAddress: z.string().min(1).optional(),
-    integrator: z.string().min(1).optional(),
-    idempotencyKey: z.string().min(1).optional(),
-    cancelAfter: z.string().datetime().optional(),
+    fromAddress: AddressSchema,
+    toAddress: AddressSchema,
+    refundAddress: AddressSchema.optional(),
+    integrator: IntegratorSchema.optional(),
+    idempotencyKey: IdempotencyKeySchema,
+    cancelAfter: DateTimeSchema.optional(),
     refundMode: RefundModeSchema.optional(),
-    refundAuthorizer: z.string().min(1).nullable(),
+    refundAuthorizer: AddressSchema.nullable(),
     amountFormat: AmountFormatSchema.optional()
   })
   .strict()
@@ -80,9 +92,9 @@ export const orderMarketRoute = createRoute({
 
 export const OrderCancelRequestSchema = z
   .object({
-    refundToken: z.string().min(1).optional(),
-    refundSignature: z.string().regex(/^0x[a-fA-F0-9]+$/).optional(),
-    refundSignatureDeadline: z.number().int().positive().optional(),
+    refundToken: RefundTokenSchema.optional(),
+    refundSignature: EvmSignatureSchema.optional(),
+    refundSignatureDeadline: z.number().int().positive().safe().optional(),
     amountFormat: AmountFormatSchema.optional()
   })
   .strict()
@@ -151,6 +163,24 @@ export function createOrderMarketHandler(
       const routerClient = routerClientFor(config, deps)
       const quoteEnvelope = await routerClient.getQuote(request.quoteId)
       const quote = routerQuoteFromEnvelope(quoteEnvelope)
+      assertAddressMatchesChain(
+        quote.source_asset.chain,
+        request.fromAddress,
+        'fromAddress',
+        { bitcoinAddressNetworks: config.bitcoinAddressNetworks }
+      )
+      assertAddressMatchesChain(
+        quote.source_asset.chain,
+        request.refundAddress ?? request.fromAddress,
+        'refundAddress',
+        { bitcoinAddressNetworks: config.bitcoinAddressNetworks }
+      )
+      assertAddressMatchesChain(
+        quote.destination_asset.chain,
+        request.toAddress,
+        'toAddress',
+        { bitcoinAddressNetworks: config.bitcoinAddressNetworks }
+      )
 
       if (
         !addressesMatch(
@@ -173,9 +203,7 @@ export function createOrderMarketHandler(
         quote_id: request.quoteId,
         refund_address: request.refundAddress ?? request.fromAddress,
         ...(request.cancelAfter ? { cancel_after: request.cancelAfter } : {}),
-        ...(request.idempotencyKey
-          ? { idempotency_key: request.idempotencyKey }
-          : {}),
+        idempotency_key: request.idempotencyKey,
         metadata: {
           ...(request.integrator ? { integrator: request.integrator } : {}),
           from_address: request.fromAddress,
@@ -183,25 +211,49 @@ export function createOrderMarketHandler(
           gateway: 'router-gateway'
         }
       })
-      const response = presentOrderEnvelope(envelope, amountFormat)
 
       if (!envelope.cancellation_secret) {
-        throw new GatewayValidationError(
-          'router order response is missing cancellationSecret'
+        throw new UpstreamHttpError(
+          502,
+          'internal router API returned order response without cancellation secret',
+          undefined
         )
       }
 
-      const refundAuthorization = await refundAuthorizationServiceFor(
-        config,
-        deps
-      ).createRefundAuthorization({
-        routerOrderId: envelope.order.id,
-        cancellationSecret: envelope.cancellation_secret,
-        refundMode,
-        refundAuthorizer: request.refundAuthorizer ?? null
-      })
+      let response!: ReturnType<typeof presentOrderEnvelope>
+      try {
+        response = presentOrderEnvelope(envelope, amountFormat)
+      } catch (presentationError) {
+        await cancelUnpersistedGatewayOrder(
+          routerClient,
+          envelope.order.id,
+          envelope.cancellation_secret
+        )
+        throw malformedOrderPresentationError(presentationError)
+      }
 
-      delete response.cancellationSecret
+      let refundAuthorization
+      try {
+        refundAuthorization = await refundAuthorizationServiceFor(
+          config,
+          deps
+        ).createRefundAuthorization({
+          routerOrderId: envelope.order.id,
+          cancellationSecret: envelope.cancellation_secret,
+          refundMode,
+          refundAuthorizer: request.refundAuthorizer ?? null
+        })
+      } catch (authorizationError) {
+        if (!(authorizationError instanceof GatewayConflictError)) {
+          await cancelUnpersistedGatewayOrder(
+            routerClient,
+            envelope.order.id,
+            envelope.cancellation_secret
+          )
+        }
+        throw authorizationError
+      }
+
       return c.json(
         {
           ...response,
@@ -226,7 +278,7 @@ export function createOrderCancelHandler(
       const amountFormat: AmountFormat = request.amountFormat ?? 'readable'
       const orderId = c.req.valid('param').orderId
       const refundAuthorizationService = refundAuthorizationServiceFor(config, deps)
-      const cancellationSecret = request.refundToken
+      const cancellationAuthorization = request.refundToken
         ? await refundAuthorizationService.resolveTokenCancellationSecret(
             orderId,
             request.refundToken
@@ -236,14 +288,35 @@ export function createOrderCancelHandler(
             refundSignature: request.refundSignature as string,
             refundSignatureDeadline: request.refundSignatureDeadline as number
           })
-      const envelope = await routerClientFor(config, deps).cancelOrder(
+      let envelope
+      try {
+        envelope = await routerClientFor(config, deps).cancelOrder(orderId, {
+          cancellation_secret: cancellationAuthorization.cancellationSecret
+        })
+      } catch (error) {
+        await refundAuthorizationService
+          .releaseCancellationAttempt(orderId, cancellationAuthorization.claimId)
+          .catch((releaseError) => {
+            logError(
+              'router gateway failed to release cancellation authorization claim',
+              releaseError
+            )
+          })
+        throw error
+      }
+      await refundAuthorizationService.markCancellationForwarded(
         orderId,
-        {
-          cancellation_secret: cancellationSecret
-        }
+        cancellationAuthorization.claimId
       )
 
-      return c.json(presentOrderEnvelope(envelope, amountFormat), 200)
+      let response!: ReturnType<typeof presentOrderEnvelope>
+      try {
+        response = presentOrderEnvelope(envelope, amountFormat)
+      } catch (presentationError) {
+        throw malformedOrderPresentationError(presentationError)
+      }
+
+      return c.json(response, 200)
     } catch (error) {
       const normalized = normalizeError(error)
       return c.json(normalized.body, normalized.status)
@@ -257,4 +330,35 @@ function addressesMatch(chainId: string, left: string, right: string): boolean {
   }
 
   return left === right
+}
+
+async function cancelUnpersistedGatewayOrder(
+  routerClient: ReturnType<typeof routerClientFor>,
+  orderId: string,
+  cancellationSecret: string
+) {
+  try {
+    await routerClient.cancelOrder(orderId, {
+      cancellation_secret: cancellationSecret
+    })
+  } catch (cleanupError) {
+    logError(
+      'router gateway failed to cancel order after refund authorization persistence failed',
+      cleanupError
+    )
+    throw new Error(
+      'failed to persist refund authorization and failed to cancel newly-created order'
+    )
+  }
+}
+
+function malformedOrderPresentationError(error: unknown) {
+  if (error instanceof GatewayValidationError) {
+    return new UpstreamHttpError(
+      502,
+      'internal router API returned malformed order response',
+      { malformed: true, reason: error.message }
+    )
+  }
+  return error
 }

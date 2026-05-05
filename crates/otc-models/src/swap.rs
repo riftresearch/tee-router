@@ -530,13 +530,8 @@ impl Swap {
         match &self.mm_deposit_status {
             None => {
                 // Status is WaitingMMDepositInitiated - MM never initiated deposit
-                let user_deposit = self
-                    .user_deposit_status
-                    .as_ref()
-                    .expect("User deposit must exist if we reached WaitingMMDepositInitiated");
-                let user_deposit_confirmed_at = user_deposit.confirmed_at.expect(
-                    "User deposit must be confirmed if we are in WaitingMMDepositInitiated",
-                );
+                let user_deposit = self.user_deposit_status.as_ref()?;
+                let user_deposit_confirmed_at = user_deposit.confirmed_at?;
                 let now = utc::now();
                 let diff = now - user_deposit_confirmed_at;
                 if diff > MM_NEVER_DEPOSITS_TIMEOUT {

@@ -57,8 +57,8 @@ fn test_datetime_precision_affects_hash() {
     quote2.expires_at = restored_datetime;
     quote2.created_at = restored_datetime;
 
-    let hash1 = quote1.hash();
-    let hash2 = quote2.hash();
+    let hash1 = quote1.hash().expect("quote 1 should hash");
+    let hash2 = quote2.hash().expect("quote 2 should hash");
 
     println!("\nQuote 1 hash: {:?}", hash1);
     println!("Quote 2 hash: {:?}", hash2);

@@ -3,6 +3,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{fmt, str::FromStr};
 
 const EVM_CHAIN_PREFIX: &str = "evm:";
+const MAX_CHAIN_ID_LEN: usize = 64;
+const MAX_ASSET_ID_LEN: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ChainId(String);
@@ -12,6 +14,9 @@ impl ChainId {
         let raw = value.as_ref().trim();
         if raw.is_empty() {
             return Err("chain id cannot be empty".to_string());
+        }
+        if raw.len() > MAX_CHAIN_ID_LEN {
+            return Err(format!("chain id cannot exceed {MAX_CHAIN_ID_LEN} bytes"));
         }
 
         if let Some(chain_id) = raw.strip_prefix(EVM_CHAIN_PREFIX) {
@@ -46,6 +51,11 @@ impl ChainId {
         }
 
         Ok(Self(raw.to_string()))
+    }
+
+    #[must_use]
+    pub(crate) fn from_trusted_static(value: &'static str) -> Self {
+        Self(value.to_string())
     }
 
     #[must_use]
@@ -105,6 +115,9 @@ impl AssetId {
         let raw = value.as_ref().trim();
         if raw.is_empty() {
             return Err("asset id cannot be empty".to_string());
+        }
+        if raw.len() > MAX_ASSET_ID_LEN {
+            return Err(format!("asset id cannot exceed {MAX_ASSET_ID_LEN} bytes"));
         }
         if raw.eq_ignore_ascii_case("native") {
             return Ok(Self::Native);
@@ -189,10 +202,10 @@ impl DepositAsset {
 #[must_use]
 pub fn supported_chain_ids() -> Vec<ChainId> {
     vec![
-        ChainId::parse("bitcoin").expect("valid router chain id"),
-        ChainId::parse("evm:1").expect("valid router chain id"),
-        ChainId::parse("evm:42161").expect("valid router chain id"),
-        ChainId::parse("evm:8453").expect("valid router chain id"),
+        ChainId::from_trusted_static("bitcoin"),
+        ChainId::from_trusted_static("evm:1"),
+        ChainId::from_trusted_static("evm:42161"),
+        ChainId::from_trusted_static("evm:8453"),
     ]
 }
 
@@ -224,6 +237,12 @@ mod tests {
     fn rejects_invalid_non_evm_chain_ids() {
         assert!(ChainId::parse("Bitcoin").is_err());
         assert!(ChainId::parse("bitcoin/mainnet").is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_protocol_identifiers() {
+        assert!(ChainId::parse("a".repeat(65)).is_err());
+        assert!(AssetId::parse("a".repeat(129)).is_err());
     }
 
     #[test]

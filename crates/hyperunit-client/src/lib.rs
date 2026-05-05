@@ -1,10 +1,12 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::Snafu;
-use std::{collections::BTreeSet, fmt};
+use std::{collections::BTreeSet, fmt, time::Duration};
 use url::Url;
 
 pub type HyperUnitResult<T> = Result<T, HyperUnitClientError>;
+const HYPERUNIT_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+const HYPERUNIT_MAX_RESPONSE_BODY_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Snafu)]
 pub enum HyperUnitClientError {
@@ -14,6 +16,15 @@ pub enum HyperUnitClientError {
         path: String,
         source: url::ParseError,
     },
+    #[snafu(display("invalid HyperUnit base URL {base_url}: {source}"))]
+    InvalidBaseUrl {
+        base_url: String,
+        source: url::ParseError,
+    },
+    #[snafu(display("unsupported HyperUnit base URL {base_url}: {reason}"))]
+    UnsupportedBaseUrl { base_url: String, reason: String },
+    #[snafu(display("invalid HyperUnit path segment {field}={value:?}"))]
+    InvalidPathSegment { field: &'static str, value: String },
     #[snafu(display("invalid HyperUnit proxy URL {proxy_url}: {source}"))]
     InvalidProxyUrl {
         proxy_url: String,
@@ -34,6 +45,8 @@ pub enum HyperUnitClientError {
     Http { source: reqwest::Error },
     #[snafu(display("HyperUnit returned HTTP {status}: {body}"))]
     HttpStatus { status: u16, body: String },
+    #[snafu(display("HyperUnit response body exceeded {max_bytes} bytes"))]
+    ResponseBodyTooLarge { max_bytes: usize },
     #[snafu(display("HyperUnit returned an invalid JSON body: {source}; body={body}"))]
     InvalidBody {
         source: serde_json::Error,
@@ -43,7 +56,9 @@ pub enum HyperUnitClientError {
 
 impl From<reqwest::Error> for HyperUnitClientError {
     fn from(source: reqwest::Error) -> Self {
-        Self::Http { source }
+        Self::Http {
+            source: source.without_url(),
+        }
     }
 }
 
@@ -137,15 +152,14 @@ pub struct UnitGenerateAddressRequest {
 }
 
 impl UnitGenerateAddressRequest {
-    #[must_use]
-    pub fn into_path(&self) -> String {
-        format!(
+    pub fn into_path(&self) -> HyperUnitResult<String> {
+        Ok(format!(
             "/gen/{src}/{dst}/{asset}/{dst_addr}",
             src = self.src_chain.as_wire_str(),
             dst = self.dst_chain.as_wire_str(),
             asset = self.asset.as_wire_str(),
-            dst_addr = sanitize_path_segment(&self.dst_addr),
-        )
+            dst_addr = validated_path_segment("dst_addr", &self.dst_addr)?,
+        ))
     }
 }
 
@@ -153,8 +167,8 @@ impl UnitGenerateAddressRequest {
 ///
 /// `signatures` is kept as a free-form JSON value because HyperUnit may add or
 /// rename guardian node keys (currently `field-node`, `hl-node`/`unit-node`,
-/// `node-1`) without warning. Callers that need to verify the guardian
-/// signatures can parse it themselves; the router trusts the TLS cert for now.
+/// `node-1`) without warning. Callers enforce the quorum and verification
+/// policy that is appropriate for their deployment.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UnitGenerateAddressResponse {
     pub address: String,
@@ -171,12 +185,11 @@ pub struct UnitOperationsRequest {
 }
 
 impl UnitOperationsRequest {
-    #[must_use]
-    pub fn into_path(&self) -> String {
-        format!(
+    pub fn into_path(&self) -> HyperUnitResult<String> {
+        Ok(format!(
             "/operations/{address}",
-            address = sanitize_path_segment(&self.address)
-        )
+            address = validated_path_segment("address", &self.address)?
+        ))
     }
 }
 
@@ -361,22 +374,24 @@ impl UnitOperationState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HyperUnitClient {
     http: reqwest::Client,
     base_url: String,
 }
 
+impl fmt::Debug for HyperUnitClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HyperUnitClient")
+            .field("http", &"<reqwest client>")
+            .field("base_url", &redacted_url_for_debug(&self.base_url))
+            .finish()
+    }
+}
+
 impl HyperUnitClient {
-    #[must_use]
-    pub fn new(base_url: impl Into<String>) -> Self {
-        Self {
-            http: reqwest::Client::builder()
-                .use_rustls_tls()
-                .build()
-                .expect("hyperunit rustls client should build"),
-            base_url: normalize_base_url(base_url),
-        }
+    pub fn new(base_url: impl Into<String>) -> HyperUnitResult<Self> {
+        Self::new_with_proxy_url(base_url, None)
     }
 
     pub fn new_with_proxy_url(
@@ -384,14 +399,17 @@ impl HyperUnitClient {
         proxy_url: Option<String>,
     ) -> HyperUnitResult<Self> {
         let base_url = normalize_base_url(base_url);
+        validate_base_url(&base_url)?;
         // Pin this client to Rustls + the vendored Mozilla root set from
         // `webpki-roots` so proxy and direct connections share one
         // deterministic trust boundary instead of inheriting host OS CAs.
-        let mut builder = reqwest::Client::builder().use_rustls_tls();
+        let mut builder = reqwest::Client::builder()
+            .use_rustls_tls()
+            .timeout(HYPERUNIT_HTTP_TIMEOUT);
         if let Some(proxy_url) = normalize_proxy_url(proxy_url)? {
             let proxy = reqwest::Proxy::all(&proxy_url).map_err(|source| {
                 HyperUnitClientError::ProxyConfiguration {
-                    proxy_url: proxy_url.clone(),
+                    proxy_url: sanitize_url_for_error(&proxy_url),
                     source,
                 }
             })?;
@@ -412,7 +430,7 @@ impl HyperUnitClient {
         &self,
         request: UnitGenerateAddressRequest,
     ) -> HyperUnitResult<UnitGenerateAddressResponse> {
-        let path = request.into_path();
+        let path = request.into_path()?;
         self.get_json(&path).await
     }
 
@@ -420,7 +438,7 @@ impl HyperUnitClient {
         &self,
         request: UnitOperationsRequest,
     ) -> HyperUnitResult<UnitOperationsResponse> {
-        let path = request.into_path();
+        let path = request.into_path()?;
         self.get_json(&path).await
     }
 
@@ -428,7 +446,13 @@ impl HyperUnitClient {
         let endpoint = build_endpoint(&self.base_url, path)?;
         let response = self.http.get(endpoint).send().await?;
         let status = response.status();
-        let body = response.text().await?;
+        let body = read_limited_response_text(response, HYPERUNIT_MAX_RESPONSE_BODY_BYTES).await?;
+        if body.truncated {
+            return Err(HyperUnitClientError::ResponseBodyTooLarge {
+                max_bytes: HYPERUNIT_MAX_RESPONSE_BODY_BYTES,
+            });
+        }
+        let body = body.text;
         if !status.is_success() {
             return Err(HyperUnitClientError::HttpStatus {
                 status: status.as_u16(),
@@ -440,8 +464,97 @@ impl HyperUnitClient {
     }
 }
 
+struct LimitedResponseBody {
+    text: String,
+    truncated: bool,
+}
+
+async fn read_limited_response_text(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<LimitedResponseBody, reqwest::Error> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if !append_limited_body_chunk(&mut body, chunk.as_ref(), max_bytes) {
+            return Ok(LimitedResponseBody {
+                text: String::new(),
+                truncated: true,
+            });
+        }
+    }
+
+    Ok(LimitedResponseBody {
+        text: String::from_utf8_lossy(&body).into_owned(),
+        truncated: false,
+    })
+}
+
+fn append_limited_body_chunk(body: &mut Vec<u8>, chunk: &[u8], max_bytes: usize) -> bool {
+    if body.len().saturating_add(chunk.len()) > max_bytes {
+        return false;
+    }
+    body.extend_from_slice(chunk);
+    true
+}
+
 fn normalize_base_url(base_url: impl Into<String>) -> String {
     base_url.into().trim_end_matches('/').to_string()
+}
+
+fn validate_base_url(base_url: &str) -> HyperUnitResult<()> {
+    let parsed = Url::parse(base_url).map_err(|source| HyperUnitClientError::InvalidBaseUrl {
+        base_url: sanitize_url_for_error(base_url),
+        source,
+    })?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        scheme => {
+            return Err(HyperUnitClientError::UnsupportedBaseUrl {
+                base_url: sanitize_url_for_error(base_url),
+                reason: format!("expected http or https scheme, got {scheme:?}"),
+            });
+        }
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(HyperUnitClientError::UnsupportedBaseUrl {
+            base_url: sanitize_url_for_error(base_url),
+            reason: "credentials are not allowed".to_string(),
+        });
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(HyperUnitClientError::UnsupportedBaseUrl {
+            base_url: sanitize_url_for_error(base_url),
+            reason: "query strings and fragments are not allowed".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn sanitize_url_for_error(value: &str) -> String {
+    redacted_url_for_debug(value.trim())
+}
+
+fn redacted_url_for_debug(value: &str) -> String {
+    let Ok(parsed) = Url::parse(value) else {
+        return "<invalid url>".to_string();
+    };
+
+    let host = parsed.host_str().unwrap_or("<missing-host>");
+    let mut redacted = format!("{}://{}", parsed.scheme(), host);
+    if let Some(port) = parsed.port() {
+        redacted.push(':');
+        redacted.push_str(&port.to_string());
+    }
+    if parsed.path() != "/" {
+        redacted.push_str("/<redacted-path>");
+    }
+    if parsed.query().is_some() {
+        redacted.push_str("?<redacted-query>");
+    }
+    if parsed.fragment().is_some() {
+        redacted.push_str("#<redacted-fragment>");
+    }
+    redacted
 }
 
 fn normalize_proxy_url(proxy_url: Option<String>) -> HyperUnitResult<Option<String>> {
@@ -453,13 +566,13 @@ fn normalize_proxy_url(proxy_url: Option<String>) -> HyperUnitResult<Option<Stri
         return Ok(None);
     }
     let parsed = Url::parse(trimmed).map_err(|source| HyperUnitClientError::InvalidProxyUrl {
-        proxy_url: trimmed.to_string(),
+        proxy_url: sanitize_url_for_error(trimmed),
         source,
     })?;
     match parsed.scheme() {
         "socks5" => Ok(Some(trimmed.to_string())),
         scheme => Err(HyperUnitClientError::UnsupportedProxyScheme {
-            proxy_url: trimmed.to_string(),
+            proxy_url: sanitize_url_for_error(trimmed),
             scheme: scheme.to_string(),
         }),
     }
@@ -467,21 +580,29 @@ fn normalize_proxy_url(proxy_url: Option<String>) -> HyperUnitResult<Option<Stri
 
 fn build_endpoint(base_url: &str, path: &str) -> HyperUnitResult<Url> {
     Url::parse(&format!("{base_url}{path}")).map_err(|source| HyperUnitClientError::InvalidUrl {
-        base_url: base_url.to_string(),
+        base_url: sanitize_url_for_error(base_url),
         path: path.to_string(),
         source,
     })
 }
 
-/// Strip characters that would break a path segment (slashes, whitespace).
+/// Validate address-like values before placing them in a path segment.
 ///
-/// Addresses are hex / bech32 strings so this is a lightweight guard; malicious
-/// input never reaches the router because `dst_addr` is always derived from
-/// validated upstream data, but defense-in-depth is cheap here.
-fn sanitize_path_segment(raw: &str) -> String {
-    raw.chars()
-        .filter(|c| !c.is_whitespace() && *c != '/' && *c != '?' && *c != '#')
-        .collect()
+/// HyperUnit path parameters are EVM hex addresses or Bitcoin bech32 strings.
+/// Rejecting unexpected bytes is preferable to silently transforming an address
+/// into a different value.
+fn validated_path_segment<'a>(field: &'static str, raw: &'a str) -> HyperUnitResult<&'a str> {
+    if raw.is_empty()
+        || !raw
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '~' | '-' | ':'))
+    {
+        return Err(HyperUnitClientError::InvalidPathSegment {
+            field,
+            value: raw.to_string(),
+        });
+    }
+    Ok(raw)
 }
 
 #[cfg(test)]
@@ -498,7 +619,7 @@ mod tests {
             dst_addr: "0xabcDEF1234567890AbCdef1234567890aBCDef12".to_string(),
         };
         assert_eq!(
-            request.into_path(),
+            request.into_path().expect("valid path"),
             "/gen/ethereum/hyperliquid/eth/0xabcDEF1234567890AbCdef1234567890aBCDef12"
         );
     }
@@ -512,23 +633,26 @@ mod tests {
             dst_addr: "0x1111111111111111111111111111111111111111".to_string(),
         };
         assert_eq!(
-            request.into_path(),
+            request.into_path().expect("valid path"),
             "/gen/bitcoin/hyperliquid/btc/0x1111111111111111111111111111111111111111"
         );
     }
 
     #[test]
-    fn generate_address_request_strips_path_breakers() {
+    fn generate_address_request_rejects_path_breakers() {
         let request = UnitGenerateAddressRequest {
             src_chain: UnitChain::Ethereum,
             dst_chain: UnitChain::Hyperliquid,
             asset: UnitAsset::Eth,
             dst_addr: "0xabc /def#frag?q=1\n".to_string(),
         };
-        assert_eq!(
+        assert!(matches!(
             request.into_path(),
-            "/gen/ethereum/hyperliquid/eth/0xabcdeffragq=1"
-        );
+            Err(HyperUnitClientError::InvalidPathSegment {
+                field: "dst_addr",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -537,7 +661,7 @@ mod tests {
             address: "tb1pwv4p3sgpy8g323mxsa5z4dnm0qnzlqcxk70gwdqvrmaf92psselsxcwf75".to_string(),
         };
         assert_eq!(
-            request.into_path(),
+            request.into_path().expect("valid path"),
             "/operations/tb1pwv4p3sgpy8g323mxsa5z4dnm0qnzlqcxk70gwdqvrmaf92psselsxcwf75"
         );
     }
@@ -804,10 +928,12 @@ mod tests {
 
     #[test]
     fn client_normalizes_trailing_slash() {
-        let client = HyperUnitClient::new("https://api.hyperunit.xyz/");
+        let client =
+            HyperUnitClient::new("https://api.hyperunit.xyz/").expect("direct client should build");
         assert_eq!(client.base_url(), "https://api.hyperunit.xyz");
 
-        let client = HyperUnitClient::new("https://api.hyperunit.xyz///");
+        let client = HyperUnitClient::new("https://api.hyperunit.xyz///")
+            .expect("direct client should build");
         assert_eq!(client.base_url(), "https://api.hyperunit.xyz");
     }
 
@@ -822,6 +948,60 @@ mod tests {
     }
 
     #[test]
+    fn client_debug_redacts_base_url_path_and_omits_http_internals() {
+        let client =
+            HyperUnitClient::new("https://api.hyperunit.xyz/provider-token").expect("client");
+
+        let debug = format!("{client:?}");
+
+        assert!(debug.contains("HyperUnitClient"));
+        assert!(debug.contains("http: \"<reqwest client>\""));
+        assert!(debug.contains("<redacted-path>"));
+        assert!(!debug.contains("provider-token"));
+    }
+
+    #[test]
+    fn client_url_errors_redact_path_query_fragment_and_invalid_values() {
+        let sanitized = sanitize_url_for_error(
+            "https://user:pass@api.hyperunit.xyz/provider-path-secret?token=query-secret#fragment-secret",
+        );
+
+        assert_eq!(
+            sanitized,
+            "https://api.hyperunit.xyz/<redacted-path>?<redacted-query>#<redacted-fragment>"
+        );
+        assert!(!sanitized.contains("user"));
+        assert!(!sanitized.contains("pass"));
+        assert!(!sanitized.contains("provider-path-secret"));
+        assert!(!sanitized.contains("query-secret"));
+        assert!(!sanitized.contains("fragment-secret"));
+
+        let invalid = sanitize_url_for_error("not a url with secret-token");
+        assert_eq!(invalid, "<invalid url>");
+        assert!(!invalid.contains("secret-token"));
+    }
+
+    #[test]
+    fn client_rejects_and_redacts_non_canonical_base_urls() {
+        for base_url in [
+            "https://user:pass@api.hyperunit.xyz",
+            "https://api.hyperunit.xyz?token=secret",
+            "https://api.hyperunit.xyz#secret",
+        ] {
+            let error = HyperUnitClient::new(base_url).expect_err("base URL must fail");
+            let rendered = error.to_string();
+            assert!(matches!(
+                error,
+                HyperUnitClientError::UnsupportedBaseUrl { .. }
+            ));
+            assert!(!rendered.contains("user"));
+            assert!(!rendered.contains("pass"));
+            assert!(!rendered.contains("token"));
+            assert!(!rendered.contains("secret"));
+        }
+    }
+
+    #[test]
     fn client_with_proxy_rejects_invalid_proxy_url() {
         let error = HyperUnitClient::new_with_proxy_url(
             "https://api.hyperunit.xyz",
@@ -832,6 +1012,26 @@ mod tests {
             error,
             HyperUnitClientError::InvalidProxyUrl { .. }
         ));
+    }
+
+    #[test]
+    fn client_with_proxy_errors_redact_proxy_credentials() {
+        let error = HyperUnitClient::new_with_proxy_url(
+            "https://api.hyperunit.xyz",
+            Some("http://user:proxy-secret@127.0.0.1:8080?token=secret".to_string()),
+        )
+        .expect_err("unsupported proxy scheme must fail");
+        let rendered = error.to_string();
+
+        assert!(matches!(
+            error,
+            HyperUnitClientError::UnsupportedProxyScheme { .. }
+        ));
+        assert!(!rendered.contains("user"));
+        assert!(!rendered.contains("proxy-secret"));
+        assert!(!rendered.contains("token"));
+        assert!(!rendered.contains("secret"));
+        assert!(rendered.contains("redacted"));
     }
 
     #[test]
@@ -857,6 +1057,48 @@ mod tests {
         assert!(matches!(
             error,
             HyperUnitClientError::UnsupportedProxyScheme { .. }
+        ));
+    }
+
+    #[test]
+    fn client_rejects_base_url_with_query_or_fragment() {
+        let error = HyperUnitClient::new("https://api.hyperunit.xyz?token=oops")
+            .expect_err("query in base url must fail");
+        assert!(matches!(
+            error,
+            HyperUnitClientError::UnsupportedBaseUrl { .. }
+        ));
+
+        let error = HyperUnitClient::new("https://api.hyperunit.xyz#frag")
+            .expect_err("fragment in base url must fail");
+        assert!(matches!(
+            error,
+            HyperUnitClientError::UnsupportedBaseUrl { .. }
+        ));
+    }
+
+    #[test]
+    fn append_limited_body_chunk_rejects_chunks_past_the_limit_without_mutating() {
+        let mut body = b"abcd".to_vec();
+
+        assert!(!append_limited_body_chunk(&mut body, b"ef", 5));
+        assert_eq!(body, b"abcd");
+    }
+
+    #[test]
+    fn append_limited_body_chunk_accepts_chunks_at_the_limit() {
+        let mut body = b"abcd".to_vec();
+
+        assert!(append_limited_body_chunk(&mut body, b"ef", 6));
+        assert_eq!(body, b"abcdef");
+    }
+
+    #[test]
+    fn client_rejects_non_http_base_url() {
+        let error = HyperUnitClient::new("file:///tmp/unit").expect_err("file base url must fail");
+        assert!(matches!(
+            error,
+            HyperUnitClientError::UnsupportedBaseUrl { .. }
         ));
     }
 }

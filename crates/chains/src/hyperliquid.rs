@@ -1,5 +1,5 @@
 use crate::traits::UserDepositCandidateStatus;
-use crate::{key_derivation, ChainOperations, Result};
+use crate::{key_derivation, ChainOperations, Error, Result};
 use alloy::hex;
 use alloy::primitives::{Address, U256};
 use alloy::signers::local::PrivateKeySigner;
@@ -89,8 +89,12 @@ impl ChainOperations for HyperliquidChain {
         Ok(UserDepositCandidateStatus::TxNotFound)
     }
 
-    async fn get_tx_status(&self, _tx_hash: &str) -> Result<TxStatus> {
-        unimplemented!("HyperliquidChain::get_tx_status — wired in phase 4.3")
+    async fn get_tx_status(&self, tx_hash: &str) -> Result<TxStatus> {
+        Err(Error::ChainNotSupported {
+            chain: format!(
+                "hyperliquid transaction status is provider-backed; no chain tx status for {tx_hash}"
+            ),
+        })
     }
 
     async fn dump_to_address(
@@ -100,7 +104,10 @@ impl ChainOperations for HyperliquidChain {
         _recipient_address: &str,
         _fee: U256,
     ) -> Result<String> {
-        unimplemented!("HyperliquidChain::dump_to_address — HL sweeps go through the provider")
+        Err(Error::DumpToAddress {
+            message: "hyperliquid balances must be moved through Hyperliquid provider operations"
+                .to_string(),
+        })
     }
 
     fn validate_address(&self, address: &str) -> bool {
@@ -116,11 +123,15 @@ impl ChainOperations for HyperliquidChain {
     }
 
     async fn get_block_height(&self) -> Result<u64> {
-        unimplemented!("HyperliquidChain::get_block_height — wired in phase 4.3")
+        Err(Error::ChainNotSupported {
+            chain: "hyperliquid has no router chain-tip endpoint".to_string(),
+        })
     }
 
     async fn get_best_hash(&self) -> Result<String> {
-        unimplemented!("HyperliquidChain::get_best_hash — wired in phase 4.3")
+        Err(Error::ChainNotSupported {
+            chain: "hyperliquid has no router chain-tip hash".to_string(),
+        })
     }
 }
 
@@ -213,6 +224,35 @@ mod tests {
             .await
             .expect("call");
         assert!(matches!(status, UserDepositCandidateStatus::TxNotFound));
+    }
+
+    #[tokio::test]
+    async fn provider_backed_chain_methods_return_errors_instead_of_panicking() {
+        let chain = make_chain();
+
+        assert!(matches!(
+            chain.get_tx_status("hl:oid:1").await,
+            Err(Error::ChainNotSupported { .. })
+        ));
+        assert!(matches!(
+            chain
+                .dump_to_address(
+                    &TokenIdentifier::Native,
+                    "0x00",
+                    "0x742d35cc6634c0532925a3b844bc9e7595f0beb7",
+                    U256::ZERO,
+                )
+                .await,
+            Err(Error::DumpToAddress { .. })
+        ));
+        assert!(matches!(
+            chain.get_block_height().await,
+            Err(Error::ChainNotSupported { .. })
+        ));
+        assert!(matches!(
+            chain.get_best_hash().await,
+            Err(Error::ChainNotSupported { .. })
+        ));
     }
 
     #[test]

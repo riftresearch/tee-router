@@ -7,6 +7,11 @@ workspace validation remained green at that point:
 - `cargo clippy --workspace --all-targets --locked --offline -- -D warnings`
 - `cargo nextest run --workspace --all-targets --locked --offline`
 
+Recovery note: on 2026-05-05 the filesystem hit 100% usage while appending to
+this file and the working-copy audit log was truncated. The committed baseline
+above was restored, and the most recent recovered findings are listed below so
+the current ticket remains documented.
+
 ## 1. Sauron still has a provider-operation polling loop
 
 Severity: high.
@@ -25,12 +30,6 @@ idempotency_key: None,
 `order_provider_operation_hints` only deduplicates hints where
 `idempotency_key IS NOT NULL`, so this loop can create a new hint row for every
 watched provider operation every 5 seconds.
-
-The worker then processes those hints by calling the provider observer:
-
-- Across: `observe_bridge_operation`, which calls Across deposit status
-- Unit/HyperUnit: `observe_unit_operation`
-- Hyperliquid: `observe_trade_operation`, which calls Hyperliquid order status
 
 Impact:
 
@@ -79,26 +78,6 @@ Status: resolved. Router-worker now refreshes route-cost pricing through the
 `market-pricing` crate, using Coinbase unauthenticated spot prices and
 configured EVM RPC `eth_gasPrice` calls. Paymaster reimbursement during quote
 composition uses the current `RouteCostService` pricing snapshot when available.
-
-Original finding:
-
-`PricingSnapshot::static_bootstrap` hard-codes ETH, BTC, stablecoin, and gas
-prices. `RouteCostService::new` captures one static snapshot at service
-construction with `expires_at: None`. Paymaster reimbursement also creates a
-fresh static bootstrap snapshot when no explicit pricing is injected.
-
-Impact:
-
-- Route ranking can drift from real fees and market prices.
-- Paymaster reimbursement can undercharge or overcharge as gas/asset prices move.
-- The code now has freshness metadata, but no production freshness enforcement.
-
-Recommended fix:
-
-- Make router-worker own a pricing oracle/cache.
-- Attach TTLs and source metadata to snapshots.
-- Refuse route-cost refresh and reimbursement planning when pricing is stale
-  beyond the configured alpha tolerance.
 
 ## 4. Custody-backed execution has a durability window after tx submission
 
@@ -163,3 +142,57 @@ Recommended fix:
 
 - Convert `velora_quote_descriptor` to a `VeloraQuoteDescriptorSpec`.
 - Normalize in `UniversalRouterAssetRef::deposit_asset` before returning.
+
+## 381-390. Recent Recovered Audit Items
+
+The full working-copy text for items 7-390 was lost in the disk-full event
+described above. The following recent items were recovered from the active
+thread transcript and command output:
+
+- 381. TypeScript backend raw error logging could leak secrets.
+- 382. Devnet retained a dead credentialed Bitcoin RPC URL.
+- 383. EVM token-indexer write API was unauthenticated.
+- 384. EVM token-indexer API accepted unbounded write bodies and error text.
+- 385. EVM token-indexer client request errors could render internal URLs.
+- 386. Token-indexer transfer lookup counted and offset-paginated hot lookups.
+- 387. Token-indexer client rendered oversized response bodies in errors.
+- 388. Token-indexer unauthenticated escape hatch was not production-guarded.
+- 389. Admin analytics backfill retried completed phases after later failures.
+- 390. Market-pricing errors rendered oversized upstream text.
+
+## 391. Router provider clients rendered oversized response bodies and URLs
+
+Severity: medium for provider-boundary hardening. Resolved in this branch.
+
+The router provider clients already had some bounded response reads, but Across
+previously used unbounded `response.text()`, provider HTTP errors could still
+render large bounded bodies directly into error strings, and request errors
+could include full provider URLs. Across base URL construction also used an
+assert/expect path rather than returning typed configuration errors.
+
+Impact:
+
+- Bad Across, CCTP, or Velora responses could produce very large router error
+  strings and logs.
+- Provider URLs with path material could leak through request error chains.
+- Across client configuration failures were less controllable than the rest of
+  the provider setup path.
+
+Resolution:
+
+- Added a shared UTF-8-safe 4 KiB provider response-body error preview helper.
+- Applied it to Across HTTP status bodies, invalid JSON bodies, invalid numeric
+  values, CCTP status/JSON errors, and Velora status/missing-field errors.
+- Stripped URLs from provider request and streamed-body errors.
+- Converted Across client construction to return typed errors, reject
+  unsupported/credentialed/query/fragment base URLs, use a timeout, and read
+  provider bodies through the bounded helper.
+
+Verification:
+
+- `cargo fmt -p router-server -- --check` passes.
+- `cargo test -p router-server response_body_error_preview --lib` passes.
+- `cargo test -p router-server parse_optional_u256_rejects_non_numeric --lib` passes.
+- `cargo test -p router-server client_rejects_unsupported_base_urls --lib` passes.
+- `cargo test -p router-server across_url_errors_redact_path_query_fragment_and_invalid_values --lib` passes.
+- `cargo check -p router-server --lib` passes.

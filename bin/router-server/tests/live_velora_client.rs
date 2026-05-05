@@ -88,7 +88,7 @@ async fn live_velora_base_eth_usdc_quote_transcript() -> TestResult<()> {
         .unwrap_or_else(PrivateKeySigner::random);
     let user = wallet.address();
     let amount_in = configured_amount_in()?;
-    let provider = live_velora_provider();
+    let provider = live_velora_provider()?;
     let quote = quote_base_eth_to_usdc(&provider, user, amount_in, "1".to_string()).await?;
     let raw_price_route = fetch_raw_price_route(user, amount_in).await?;
 
@@ -154,7 +154,7 @@ async fn live_velora_base_eth_to_usdc_swap_transcript_spends_funds() -> TestResu
     }
     let before_usdc = base_usdc_balance(&provider, user).await?;
 
-    let velora = live_velora_provider();
+    let velora = live_velora_provider()?;
     let loose_quote = quote_base_eth_to_usdc(&velora, user, amount_in, "1".to_string()).await?;
     let min_amount_out = apply_slippage_bps(&loose_quote.amount_out, slippage_bps)?;
     let quote = quote_base_eth_to_usdc(&velora, user, amount_in, min_amount_out).await?;
@@ -211,8 +211,11 @@ async fn live_velora_base_eth_to_usdc_swap_transcript_spends_funds() -> TestResu
     Ok(())
 }
 
-fn live_velora_provider() -> VeloraProvider {
-    VeloraProvider::new(live_velora_base_url(), env_var_any(&[VELORA_PARTNER]))
+fn live_velora_provider() -> TestResult<VeloraProvider> {
+    Ok(VeloraProvider::new(
+        live_velora_base_url(),
+        env_var_any(&[VELORA_PARTNER]),
+    )?)
 }
 
 async fn quote_base_eth_to_usdc(

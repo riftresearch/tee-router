@@ -1,4 +1,5 @@
 import type { GatewayConfig, HealthTargetConfig } from './config'
+import { readLimitedResponseText } from './internal/http-body'
 import type { FetchLike } from './internal/router-client'
 
 export type DependencyHealthStatus = 'reachable' | 'unreachable' | 'unknown'
@@ -21,11 +22,14 @@ type DependencyHealthMonitorOptions = {
   fetch?: FetchLike
 }
 
+const MAX_HEALTH_RESPONSE_BODY_BYTES = 256 * 1024
+
 export class DependencyHealthMonitor {
   private readonly targets: HealthTargetConfig[]
   private readonly pollIntervalMs: number
   private readonly fetcher: FetchLike
   private readonly states = new Map<string, DependencyHealthState>()
+  private readonly expandedProviderNamesByTarget = new Map<string, Set<string>>()
   private timer: ReturnType<typeof setInterval> | undefined
   private inFlight = false
 
@@ -93,27 +97,32 @@ export class DependencyHealthMonitor {
       const response = await this.fetcher(target.url, {
         method: target.method,
         headers: {
-          accept: 'application/json'
+          accept: 'application/json',
+          ...(target.headers ?? {})
         },
         signal: controller.signal
       })
-      const responseBody = await response.text().catch(() => '')
+      const responseBody = await readLimitedResponseText(
+        response,
+        MAX_HEALTH_RESPONSE_BODY_BYTES
+      )
       if (
         response.ok &&
+        !responseBody.truncated &&
         target.response === 'routerProviderHealth' &&
-        this.applyRouterProviderHealth(target, responseBody)
+        this.applyRouterProviderHealth(target, responseBody.text)
       ) {
         return
       }
 
-      this.states.set(target.name, {
+      this.setTargetState(target, {
         name: target.name,
         status: response.ok ? 'reachable' : 'unreachable',
         checkedAt: new Date().toISOString()
       })
     } catch (error) {
       void error
-      this.states.set(target.name, {
+      this.setTargetState(target, {
         name: target.name,
         status: 'unreachable',
         checkedAt: new Date().toISOString()
@@ -135,15 +144,13 @@ export class DependencyHealthMonitor {
     }
     if (!isRecord(parsed) || !Array.isArray(parsed.providers)) return false
 
+    this.clearExpandedProviderStates(target)
     this.states.delete(target.name)
+    const providerNames = new Set<string>()
     for (const provider of parsed.providers) {
       if (!isRecord(provider) || typeof provider.provider !== 'string') continue
-      const status =
-        provider.status === 'down'
-          ? 'unreachable'
-          : provider.status === 'unknown'
-            ? 'unknown'
-            : 'reachable'
+      const status = routerProviderStatusToDependencyStatus(provider.status)
+      providerNames.add(provider.provider)
       this.states.set(provider.provider, {
         name: provider.provider,
         status,
@@ -153,13 +160,33 @@ export class DependencyHealthMonitor {
       })
     }
 
-    if (parsed.providers.length === 0) {
+    if (providerNames.size > 0) {
+      this.expandedProviderNamesByTarget.set(target.name, providerNames)
+    } else {
+      this.expandedProviderNamesByTarget.delete(target.name)
       this.states.set(target.name, {
         name: target.name,
         status: 'unknown'
       })
     }
     return true
+  }
+
+  private setTargetState(
+    target: HealthTargetConfig,
+    state: DependencyHealthState
+  ) {
+    this.clearExpandedProviderStates(target)
+    this.states.set(target.name, state)
+  }
+
+  private clearExpandedProviderStates(target: HealthTargetConfig) {
+    const providerNames = this.expandedProviderNamesByTarget.get(target.name)
+    if (!providerNames) return
+    for (const providerName of providerNames) {
+      this.states.delete(providerName)
+    }
+    this.expandedProviderNamesByTarget.delete(target.name)
   }
 }
 
@@ -176,4 +203,12 @@ export function createDependencyHealthMonitor(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
+}
+
+function routerProviderStatusToDependencyStatus(
+  status: unknown
+): DependencyHealthStatus {
+  if (status === 'ok') return 'reachable'
+  if (status === 'down') return 'unreachable'
+  return 'unknown'
 }

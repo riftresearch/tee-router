@@ -2155,6 +2155,7 @@ dependencies = [
  "snafu",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -3066,7 +3067,9 @@ dependencies = [
  "alloy",
  "reqwest",
  "serde",
+ "serde_json",
  "snafu",
+ "tokio",
  "tracing",
  "url",
 ]
@@ -5605,6 +5608,7 @@ dependencies = [
  "bitcoincore-rpc-async",
  "devnet",
  "eip3009-erc20-contract",
+ "hyperunit-client",
  "reqwest",
  "router-server",
  "sauron",
@@ -5667,6 +5671,7 @@ dependencies = [
  "devnet",
  "eip3009-erc20-contract",
  "getrandom 0.2.16",
+ "hkdf",
  "hyperliquid-client",
  "hyperunit-client",
  "market-pricing",
@@ -5677,6 +5682,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "sha2",
  "snafu",
  "sqlx-core",
  "sqlx-postgres",
@@ -5926,6 +5932,7 @@ dependencies = [
  "eip3009-erc20-contract",
  "esplora-client",
  "evm-token-indexer-client",
+ "hyperunit-client",
  "metrics",
  "observability",
  "percent-encoding",
@@ -5935,6 +5942,7 @@ dependencies = [
  "router-server",
  "serde",
  "serde_json",
+ "sha2",
  "snafu",
  "sqlx-core",
  "sqlx-postgres",

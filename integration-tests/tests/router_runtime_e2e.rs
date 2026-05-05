@@ -55,8 +55,8 @@ const POSTGRES_USER: &str = "postgres";
 const POSTGRES_PASSWORD: &str = "password";
 const POSTGRES_DATABASE: &str = "postgres";
 const ROUTER_TEST_DATABASE_URL_ENV: &str = "ROUTER_TEST_DATABASE_URL";
-const ROUTER_DETECTOR_API_KEY: &str = "router-e2e-detector-secret";
-const ROUTER_ADMIN_API_KEY: &str = "router-e2e-admin-secret";
+const ROUTER_DETECTOR_API_KEY: &str = "router-e2e-detector-secret-000000";
+const ROUTER_ADMIN_API_KEY: &str = "router-e2e-admin-secret-00000000";
 const ACROSS_API_KEY: &str = "router-e2e-across-secret";
 const ACROSS_INTEGRATOR_ID: &str = "router-e2e";
 const EVM_NATIVE_GAS_BUFFER_WEI: u128 = 1_000_000_000_000_000_000;
@@ -112,7 +112,7 @@ const ROUTE_CASES: &[RouteCase] = &[
         name: "eth_to_bitcoin",
         from: RouteAsset::native("evm:1"),
         to: RouteAsset::native("bitcoin"),
-        amount_in: "30000000000000000",
+        amount_in: "60000000000000000",
         expected_provider_fragments: &["unit_deposit:unit", "unit_withdrawal:unit"],
     },
     RouteCase {
@@ -133,7 +133,7 @@ const ROUTE_CASES: &[RouteCase] = &[
         name: "eth_to_usdc_single_chain",
         from: RouteAsset::native("evm:8453"),
         to: RouteAsset::token("evm:8453", BASE_USDC_ADDRESS),
-        amount_in: "30000000000000000",
+        amount_in: "60000000000000000",
         expected_provider_fragments: &["universal_router_swap:velora"],
     },
     RouteCase {
@@ -147,7 +147,7 @@ const ROUTE_CASES: &[RouteCase] = &[
         name: "eth_to_usdc_cross_chain",
         from: RouteAsset::native("evm:8453"),
         to: RouteAsset::token("evm:1", ETHEREUM_USDC_ADDRESS),
-        amount_in: "30000000000000000",
+        amount_in: "60000000000000000",
         expected_provider_fragments: &["across_bridge:across", "universal_router_swap:velora"],
     },
     RouteCase {
@@ -467,10 +467,20 @@ async fn spawn_sauron(
     database_url: &str,
     router_base_url: &str,
 ) -> RuntimeTask {
+    let token_indexer_api_key = [
+        devnet.ethereum.token_indexer.as_ref(),
+        devnet.base.token_indexer.as_ref(),
+        devnet.arbitrum.token_indexer.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|indexer| indexer.api_key.clone())
+    .next();
+
     let args = SauronArgs {
         log_level: "warn".to_string(),
         router_replica_database_url: database_url.to_string(),
-        sauron_state_database_url: None,
+        sauron_state_database_url: database_url.to_string(),
         sauron_replica_event_source: sauron::config::SauronReplicaEventSource::Cdc,
         router_replica_database_name: "router_db".to_string(),
         sauron_cdc_slot_name: "sauron_watch_cdc".to_string(),
@@ -496,21 +506,19 @@ async fn spawn_sauron(
             .token_indexer
             .as_ref()
             .map(|indexer| indexer.api_server_url.clone()),
-        ethereum_allowed_token: ETHEREUM_USDC_ADDRESS.to_string(),
         base_rpc_url: devnet.base.anvil.endpoint_url().to_string(),
         base_token_indexer_url: devnet
             .base
             .token_indexer
             .as_ref()
             .map(|indexer| indexer.api_server_url.clone()),
-        base_allowed_token: BASE_USDC_ADDRESS.to_string(),
         arbitrum_rpc_url: devnet.arbitrum.anvil.endpoint_url().to_string(),
         arbitrum_token_indexer_url: devnet
             .arbitrum
             .token_indexer
             .as_ref()
             .map(|indexer| indexer.api_server_url.clone()),
-        arbitrum_allowed_token: ARBITRUM_USDC_ADDRESS.to_string(),
+        token_indexer_api_key,
         sauron_reconcile_interval_seconds: 1,
         sauron_bitcoin_scan_interval_seconds: 1,
         sauron_bitcoin_indexed_lookup_concurrency: 1,
@@ -588,6 +596,7 @@ fn router_args(
         hyperliquid_vault_address: None,
         hyperliquid_paymaster_private_key: Some(test_hyperliquid_paymaster_private_key()),
         router_detector_api_key: Some(ROUTER_DETECTOR_API_KEY.to_string()),
+        router_gateway_api_key: None,
         router_admin_api_key: Some(ROUTER_ADMIN_API_KEY.to_string()),
         hyperliquid_network: HyperliquidCallNetwork::Testnet,
         hyperliquid_order_timeout_ms: 30_000,
@@ -655,6 +664,26 @@ async fn spawn_runtime_mocks(devnet: &RiftDevnet) -> MockIntegratorServer {
         .with_cctp_destination_token(devnet.ethereum.anvil.chain_id(), ETHEREUM_USDC_ADDRESS)
         .with_cctp_destination_token(devnet.base.anvil.chain_id(), BASE_USDC_ADDRESS)
         .with_cctp_destination_token(devnet.arbitrum.anvil.chain_id(), ARBITRUM_USDC_ADDRESS)
+        .with_unit_evm_rpc_url(
+            hyperunit_client::UnitChain::Ethereum,
+            devnet.ethereum.anvil.endpoint_url().to_string(),
+        )
+        .with_unit_evm_rpc_url(
+            hyperunit_client::UnitChain::Base,
+            devnet.base.anvil.endpoint_url().to_string(),
+        )
+        .with_velora_swap_contract_address(
+            devnet.ethereum.anvil.chain_id(),
+            format!("{:#x}", devnet.ethereum.mock_velora_swap_contract.address()),
+        )
+        .with_velora_swap_contract_address(
+            devnet.base.anvil.chain_id(),
+            format!("{:#x}", devnet.base.mock_velora_swap_contract.address()),
+        )
+        .with_velora_swap_contract_address(
+            devnet.arbitrum.anvil.chain_id(),
+            format!("{:#x}", devnet.arbitrum.mock_velora_swap_contract.address()),
+        )
         .with_hyperliquid_bridge_address(TESTNET_HYPERLIQUID_BRIDGE_ADDRESS)
         .with_hyperliquid_evm_rpc_url(devnet.arbitrum.anvil.endpoint_url().to_string())
         .with_hyperliquid_usdc_token_address(ARBITRUM_USDC_ADDRESS)
@@ -1018,11 +1047,12 @@ async fn drive_order_to_completion(
                 }
                 ProviderOperationType::UnitWithdrawal if operation.provider_ref.is_some() => {
                     mocks
-                        .complete_unit_operation(
+                        .complete_unit_operation_with_source_amount(
                             operation
                                 .provider_ref
                                 .as_deref()
                                 .expect("unit withdrawal provider ref"),
+                            unit_operation_amount(operation).to_string(),
                         )
                         .await
                         .expect("complete mock Unit withdrawal operation");
@@ -1055,60 +1085,24 @@ async fn complete_unit_deposit(mocks: &MockIntegratorServer, operation: &OrderPr
         .provider_ref
         .as_deref()
         .expect("unit deposit provider ref");
-    let deposit_coin = hl_deposit_coin_for_operation(operation);
-    let deposit_decimals = match deposit_coin.as_str() {
-        "UBTC" => 8,
-        "UETH" => 18,
-        other => panic!("unsupported UnitDeposit coin for mock HL credit: {other:?}"),
-    };
     let amount = unit_deposit_amount(operation);
-    let hl_vault_address = hl_destination_for_unit_deposit(operation);
     mocks
-        .credit_hyperliquid_balance(
-            hl_vault_address,
-            &deposit_coin,
-            raw_units_to_f64(amount, deposit_decimals),
-        )
-        .await;
-    mocks
-        .complete_unit_operation(provider_ref)
+        .complete_unit_operation_with_source_amount(provider_ref, amount.to_string())
         .await
         .expect("complete mock Unit deposit operation");
 }
 
 fn unit_deposit_amount(operation: &OrderProviderOperation) -> U256 {
+    unit_operation_amount(operation)
+}
+
+fn unit_operation_amount(operation: &OrderProviderOperation) -> U256 {
     operation
         .request
         .get("amount")
         .and_then(Value::as_str)
         .and_then(|amount| U256::from_str_radix(amount, 10).ok())
         .expect("UnitDeposit operation request should include amount")
-}
-
-fn hl_deposit_coin_for_operation(operation: &OrderProviderOperation) -> String {
-    let asset = operation
-        .request
-        .get("asset")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    match asset {
-        "btc" => "UBTC".to_string(),
-        "eth" => "UETH".to_string(),
-        other => panic!("unsupported UnitDeposit asset for HL credit: {other:?}"),
-    }
-}
-
-fn hl_destination_for_unit_deposit(operation: &OrderProviderOperation) -> Address {
-    let destination = operation
-        .request
-        .get("dst_addr")
-        .and_then(Value::as_str)
-        .expect("UnitDeposit operation request should include dst_addr");
-    Address::from_str(destination).expect("UnitDeposit dst_addr should be an EVM address")
-}
-
-fn raw_units_to_f64(amount: U256, decimals: u32) -> f64 {
-    amount.to_string().parse::<f64>().expect("amount fits f64") / 10f64.powi(decimals as i32)
 }
 
 async fn fund_destination_execution_vault_from_across(

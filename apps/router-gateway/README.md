@@ -22,12 +22,17 @@ bun run router-gateway:typecheck
 - `PORT`: public gateway listen port. Defaults to `3000`.
 - `HOST`: public gateway listen host. Defaults to `0.0.0.0`.
 - `ROUTER_INTERNAL_BASE_URL`: upstream Rust router API base URL.
+- `ROUTER_GATEWAY_API_KEY`: shared bearer secret sent to the upstream router
+  API for quote, order, cancellation, and provider-health requests. Must match
+  the router-api `ROUTER_GATEWAY_API_KEY`.
 - `ROUTER_QUERY_API_BASE_URL`: optional internal query/status API base URL.
-- `ROUTER_GATEWAY_PUBLIC_BASE_URL`: optional public gateway base URL emitted in
-  `/openapi.json` `servers`. Defaults to `http://localhost:<PORT>`.
+- `ROUTER_GATEWAY_PUBLIC_BASE_URL`: public gateway base URL emitted in
+  `/openapi.json` `servers` and used to domain-separate EIP-712 refund
+  cancellation signatures.
 - `ROUTER_GATEWAY_DATABASE_URL`: gateway-owned Postgres database URL.
 - `ROUTER_GATEWAY_CANCELLATION_SECRET_KEY`: 32-byte hex or base64url AES key
-  used to encrypt stored router cancellation secrets.
+  used to encrypt stored router cancellation secrets. Ciphertexts are
+  AES-256-GCM authenticated and bound to the router order ID.
 - `ROUTER_GATEWAY_REQUEST_TIMEOUT_MS`: upstream request timeout. Defaults to
   `30000`.
 - `ROUTER_GATEWAY_HEALTH_TARGETS`: optional JSON array of extra dependency
@@ -37,6 +42,17 @@ bun run router-gateway:typecheck
   Defaults to `30000`.
 - `ROUTER_GATEWAY_HEALTH_TARGET_TIMEOUT_MS`: default timeout per dependency
   health target. Defaults to `5000`.
+- `ROUTER_GATEWAY_BITCOIN_ADDRESS_NETWORKS`: comma-separated accepted Bitcoin
+  address networks: `mainnet`, `testnet`, and/or `regtest`. Defaults to
+  `mainnet`.
+
+When `HOST` is not loopback, the gateway refuses to start unless
+`ROUTER_INTERNAL_BASE_URL`, `ROUTER_GATEWAY_API_KEY`,
+`ROUTER_GATEWAY_DATABASE_URL`, `ROUTER_GATEWAY_PUBLIC_BASE_URL`, and a valid
+32-byte `ROUTER_GATEWAY_CANCELLATION_SECRET_KEY` are configured. This keeps the
+public order routes from serving in a partial runtime state, prevents accidental
+direct exposure of router-api cancellation secrets, and prevents refund
+cancellation signatures from replaying across gateway deployments.
 
 The gateway automatically monitors configured router upstreams:
 
@@ -62,11 +78,15 @@ the long-term public API aims to make quotes addressless.
 
 `POST /order/market` supports:
 
+- `idempotencyKey`: required, 16-128 bytes. Treat it as a private create/retry
+  capability for the quote; retries without the same key are rejected before the
+  router can return an existing order.
 - `refundMode = "evmSignature"`: default mode. `refundAuthorizer` must be the
-  EVM address allowed to cancel/refund the order with an EIP-712 signature.
+  EVM address allowed to cancel/refund the order with an EIP-712 signature. The
+  signature deadline must be within 10 minutes of the gateway's current time.
 - `refundMode = "token"`: `refundAuthorizer` must be `null`. The gateway stores
-  the router cancellation secret encrypted in Postgres and returns an opaque
-  `refundToken`.
+  the router cancellation secret encrypted in Postgres with authentication bound
+  to the router order ID and returns an opaque `refundToken`.
 
 The public gateway API never returns the raw router cancellation secret.
 
@@ -94,10 +114,12 @@ Required Railway variables:
 ```sh
 HOST=0.0.0.0
 ROUTER_INTERNAL_BASE_URL=https://<internal-router-api-base-url>
+ROUTER_GATEWAY_API_KEY=<shared-gateway-to-router-bearer-key>
 ROUTER_GATEWAY_PUBLIC_BASE_URL=https://<gateway-domain>
 ROUTER_GATEWAY_DATABASE_URL=postgres://<gateway-postgres-url>
 ROUTER_GATEWAY_CANCELLATION_SECRET_KEY=<64-char-hex-or-base64url-32-byte-key>
 ROUTER_GATEWAY_REQUEST_TIMEOUT_MS=30000
+ROUTER_GATEWAY_BITCOIN_ADDRESS_NETWORKS=mainnet
 ```
 
 Railway provides `PORT`; do not hard-code it unless Railway is not injecting one.
@@ -153,7 +175,7 @@ Required Railway variables:
 
 ```sh
 DATABASE_URL=postgres://<router-replica-postgres-url>
-ROUTER_QUERY_API_KEY=<private-bearer-token>
+ROUTER_QUERY_API_KEY=<private-bearer-token-at-least-32-chars>
 ```
 
 When the gateway route is added, configure the gateway with:
@@ -161,3 +183,6 @@ When the gateway route is added, configure the gateway with:
 ```sh
 ROUTER_QUERY_API_BASE_URL=https://<router-query-api-private-url>
 ```
+
+`router-query-api` refuses to bind a non-loopback host without a configured
+`ROUTER_QUERY_API_KEY` of at least 32 characters.

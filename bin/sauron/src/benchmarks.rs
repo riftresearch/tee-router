@@ -12,11 +12,10 @@ pub const LARGE_WATCH_SET_SIZES: [usize; 2] = [10_000, 50_000];
 pub const DEFAULT_BITCOIN_INDEXED_LOOKUP_CONCURRENCY: usize = 32;
 pub const DEFAULT_EVM_INDEXED_LOOKUP_CONCURRENCY: usize = 8;
 
-pub fn benchmark_runtime() -> Runtime {
+pub fn benchmark_runtime() -> std::io::Result<Runtime> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .expect("benchmark runtime should build")
 }
 
 pub fn make_mixed_watch_entries(count: usize) -> Vec<WatchEntry> {

@@ -28,6 +28,15 @@ pub enum Error {
     #[snafu(display("Failed to parse Postgres CDC payload: {source}"))]
     CdcPayload { source: serde_json::Error },
 
+    #[snafu(display("Postgres CDC payload exceeded {max_bytes} bytes"))]
+    CdcPayloadTooLarge { max_bytes: usize },
+
+    #[snafu(display("Postgres CDC payload was invalid: {message}"))]
+    InvalidCdcPayload { message: String },
+
+    #[snafu(display("Postgres CDC pending refresh batch exceeded {max_ids} ids"))]
+    CdcPendingBatchTooLarge { max_ids: usize },
+
     #[snafu(display("Replica watch row was invalid: {message}"))]
     InvalidWatchRow { message: String },
 
@@ -73,6 +82,15 @@ pub enum Error {
     #[snafu(display("ROUTER request failed"))]
     RouterRequest { source: reqwest::Error },
 
+    #[snafu(display("ROUTER response body exceeded {max_bytes} bytes"))]
+    RouterResponseBodyTooLarge { max_bytes: usize },
+
+    #[snafu(display("ROUTER returned an invalid JSON body: {source}; body={body}"))]
+    RouterResponseJson {
+        source: serde_json::Error,
+        body: String,
+    },
+
     #[snafu(display("ROUTER rejected provider-operation hint with status {status}: {body}"))]
     RouterRejected {
         status: reqwest::StatusCode,
@@ -87,6 +105,20 @@ pub enum Error {
 
     #[snafu(display("A discovery backend task terminated unexpectedly"))]
     DiscoveryTaskJoin { source: tokio::task::JoinError },
+
+    #[snafu(display(
+        "Discovery backend {backend} indexed lookup for watch {watch_id} timed out after {timeout_secs}s"
+    ))]
+    IndexedLookupTimeout {
+        backend: String,
+        watch_id: String,
+        timeout_secs: u64,
+    },
+
+    #[snafu(display(
+        "Discovery backend pending submission backlog exceeded {max_pending} deposits"
+    ))]
+    DiscoveryPendingSubmissionsTooLarge { max_pending: usize },
 
     #[snafu(display("Failed to initialize observability: {message}"))]
     Observability { message: String },

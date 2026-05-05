@@ -2,6 +2,7 @@ use crate::protocol::{AssetId, ChainId, DepositAsset};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::fmt;
 use uuid::Uuid;
 
 pub fn empty_metadata() -> Value {
@@ -62,6 +63,7 @@ pub enum RouterOrderStatus {
     RefundRequired,
     Refunding,
     Refunded,
+    ManualInterventionRequired,
     RefundManualInterventionRequired,
     Failed,
     Expired,
@@ -79,6 +81,7 @@ impl RouterOrderStatus {
             Self::RefundRequired => "refund_required",
             Self::Refunding => "refunding",
             Self::Refunded => "refunded",
+            Self::ManualInterventionRequired => "manual_intervention_required",
             Self::RefundManualInterventionRequired => "refund_manual_intervention_required",
             Self::Failed => "failed",
             Self::Expired => "expired",
@@ -95,6 +98,7 @@ impl RouterOrderStatus {
             "refund_required" => Some(Self::RefundRequired),
             "refunding" => Some(Self::Refunding),
             "refunded" => Some(Self::Refunded),
+            "manual_intervention_required" => Some(Self::ManualInterventionRequired),
             "refund_manual_intervention_required" => Some(Self::RefundManualInterventionRequired),
             "failed" => Some(Self::Failed),
             "expired" => Some(Self::Expired),
@@ -245,6 +249,7 @@ pub struct LimitOrderQuote {
     pub output_amount: String,
     pub residual_policy: LimitOrderResidualPolicy,
     pub provider_quote: Value,
+    pub usd_valuation: Value,
     pub expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
 }
@@ -323,13 +328,27 @@ pub struct RouterOrderQuoteEnvelope {
     pub quote: RouterOrderQuote,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RouterOrderEnvelope {
     pub order: RouterOrder,
     pub quote: RouterOrderQuote,
     pub funding_vault: Option<DepositVaultEnvelope>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancellation_secret: Option<String>,
+}
+
+impl fmt::Debug for RouterOrderEnvelope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RouterOrderEnvelope")
+            .field("order", &self.order)
+            .field("quote", &self.quote)
+            .field("funding_vault", &self.funding_vault)
+            .field(
+                "cancellation_secret",
+                &self.cancellation_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -921,6 +940,10 @@ pub struct OrderProviderOperationHint {
     pub updated_at: DateTime<Utc>,
 }
 
+pub const PROVIDER_OPERATION_OBSERVATION_HINT_SOURCE: &str =
+    "sauron_provider_operation_observation";
+pub const SAURON_DETECTOR_HINT_SOURCE: &str = "sauron";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DepositVaultFundingHint {
     pub id: Uuid,
@@ -1119,6 +1142,7 @@ pub enum DepositVaultStatus {
     RefundRequired,
     Refunding,
     Refunded,
+    ManualInterventionRequired,
     RefundManualInterventionRequired,
 }
 
@@ -1133,6 +1157,7 @@ impl DepositVaultStatus {
             Self::RefundRequired => "refund_required",
             Self::Refunding => "refunding",
             Self::Refunded => "refunded",
+            Self::ManualInterventionRequired => "manual_intervention_required",
             Self::RefundManualInterventionRequired => "refund_manual_intervention_required",
         }
     }
@@ -1146,6 +1171,7 @@ impl DepositVaultStatus {
             "refund_required" => Some(Self::RefundRequired),
             "refunding" => Some(Self::Refunding),
             "refunded" => Some(Self::Refunded),
+            "manual_intervention_required" => Some(Self::ManualInterventionRequired),
             "refund_manual_intervention_required" => Some(Self::RefundManualInterventionRequired),
             _ => None,
         }

@@ -85,12 +85,14 @@ PONDER_DISABLE_CACHE=false
 PONDER_LOG_LEVEL=info
 PONDER_PORT=4001
 PORT=4001
+EVM_TOKEN_INDEXER_API_KEY=<shared token indexer bearer key>
 EVM_TOKEN_INDEXER_RAW_RETENTION_SECONDS=2592000
 ```
 
 Set both `PONDER_PORT` and Railway's `PORT`. Ponder listens on Railway's
 injected `PORT` even when the Docker command passes `--port`, and Sauron expects
 the indexers to be reachable over Railway private networking on `4001`.
+Set the same secret value on `sauron-worker-v3` as `TOKEN_INDEXER_API_KEY`.
 
 Suggested schemas:
 
