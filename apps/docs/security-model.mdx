@@ -4,12 +4,32 @@ title: "Security Model"
 
 ## Core Dependencies
 
-Reputable, multi vendor risk.
+The security model of multichain smart contracts is fundamentally different from a standard single chain smart contract in an execution environment like Ethereum. In Ethereum, or other proof-of-stake blockchains, security comes from node operators staking capital that is slashed via social consensus if they violate protocol rules. The idea is that a malicious actor will lose more money via slashing of their ETH than they could theoretically gain by the attack. While this provides permissionlessness for the network, because anyone who has enough ETH can be a validator, it comes at a large cost: idle capital. In the case of Ethereum, there are billions of dollars sitting with the sole purpose of being used as collateral in case the protocol rules are broken. This is a very inefficient use of capital, and one of the core reasons why centralized systems are still better at pricing assets.
+
+Rather than allowing anyone to stake on any hardware, Rift leverages trusted execution environments (TEEs), which are specialized hardware running in a data center that enforce execution of specific code and do not allow anyone without physical machine access to read confidential data they operate on. This is extremely powerful because it eliminates the need for staking. There is no capital needed to enforce protocol rules. Instead, it introduces explicit trust vectors on the hardware manufacturer of the TEE and the data center where the node is running. This is an explicit tradeoff made to optimize for capital efficiency and multichain composability over permissionless, software-only nodes. Onchain actions are verified via a 2/3 majority across RPC providers Alchemy, Quicknode, and Moralis running inside the TEE.
+
+In addition to the infrastructure stack risk, there is integrated protocol risk. As an example, if there was an active limit order placed through a Rift contract on Hyperliquid, and Hyperliquid was hacked, funds from this transaction would be lost. Essentially, by using a multichain contract you are inheriting all protocol dependency risk in the path of your operation, in the same way that a user would inherit risk from a Morpho vault if an Ethereum contract they deposited into utilized it.
+
+Finally, there is also risk in the underlying Rust protocol code. Whether written by the team or an open source dependency, all of this human-written code is additional implementation risk for the entire system's security, in the same way that on Ethereum you are inheriting the full software supply chain risk, including smart contract code, compiler, and execution client.
 
 ## Cloud Infrastructure
 
-High availability.
+So where is the hardware actually running? Rift runs our production environment in Google data centers (GCP). We utilize Intel TDX via Dstack. Any one of these three components failing could mean the loss or extraction of private keys from the instance. You must assume that the hardware manufacturer, in this case Intel, does not get enclave attestation keys compromised or have a critical vulnerability, and the cloud provider, GCP, is not actively tampering with the hardware and is ensuring physical security of its data centers.
 
-## Key Management
+Assuming this, anyone can verify the machine is running the contract code we claim it is by comparing the attestation hash of the system image with the protocol code on our GitHub. If the hashes match, you have received a verification from the hardware that this is the code that is running.
 
-Configurable multisig.
+Outside of a critical vulnerability, minimizing downtime is a crucial property of smart contracts. We do this with replicas running across different regions in GCP. An expanded discussion on improving resilience across correctness and availability is discussed in future improvements.
+
+## Contract Upgrades + Key Management
+
+Contract upgrades are gated by a smart contract on Ethereum and a timelock. The contract has the hash of the system image that should run in the TEE. For an upgrade to be accepted, the hash stored in the contract must be updated to match the new proposed image. This operation is gated by a multisig, which is currently hardware keys managed by the Rift team.
+
+This set can be customized for deployment partners, so the deployment partner also maintains hardware keys that must sign off on upgrades. Once the hash is upgraded, there is a 7 day timelock on this upgrade going live into production. This is also configurable by a deployment partner. In the unlikely case of a malicious upgrade being deployed due to the majority of hardware signers being compromised, users would still have ample time to withdraw funds. As long as there remained one non-compromised hardware signer, they could also call an emergency refund operation for all users.
+
+## Future Improvements
+
+The core failure modes of the system are vendor based: either a compromise of the TEE hardware, a compromise of the data center, or extended outages across all nodes. The way we can reduce dependency on infrastructure providers, namely Google and Intel initially, is by going multi-cloud and multi-hardware.
+
+AWS offers programmable enclaves, Nitro, and Azure offers AMD SEV-SNP. The ideal architecture would use 2/3 of the major architecture types running on the 3 major cloud providers. This would greatly decrease risk of a compromise, as 2/3 of these architectures and data centers would need to be compromised simultaneously to perform an attack. Additionally, the chance of a liveness failure is greatly reduced, empirically to near zero, as all instances at 2 major cloud providers would need to simultaneously go down.
+
+A theoretical future upgrade on top of this would be to choose your own cloud provider and hardware configuration. For example, if you are based in China and do not want to use an American cloud provider, there could be a custom deployment utilizing other reputable cloud providers that are using reputable hardware execution environments.
