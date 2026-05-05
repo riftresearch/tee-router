@@ -21,8 +21,8 @@
           {
             "group": "Overview",
             "pages": [
-              "introduction/what-is-rift",
-              "introduction/multichain-smart-contracts",
+              "what-is-rift",
+              "multichain-smart-contracts",
               "use-cases",
               "security-model"
             ]
