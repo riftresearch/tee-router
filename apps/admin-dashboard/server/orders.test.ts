@@ -42,6 +42,56 @@ test('fetchOrderFirehose keeps firehose scans free of lifecycle OR predicates', 
   expect(capturedSql).not.toContain('refund_manual_intervention_required')
 })
 
+test('fetchOrderFirehose derives summary progress from provider quote without exposing full quote', async () => {
+  let capturedSql = ''
+  const pool = {
+    query: async (sql: string) => {
+      capturedSql = sql
+      return {
+        rows: [
+          orderRow({
+            status: 'pending_funding',
+            provider_quote: {
+              legs: [
+                {
+                  provider: 'cctp',
+                  transition_kind: 'cctp_bridge',
+                  execution_step_type: 'cctp_bridge',
+                  transition_decl_id: 'bridge-1'
+                },
+                {
+                  provider: 'unit',
+                  transition_kind: 'unit_withdrawal',
+                  execution_step_type: 'unit_withdrawal',
+                  transition_decl_id: 'withdrawal-1'
+                }
+              ]
+            },
+            execution_legs: [],
+            provider_operations: []
+          })
+        ]
+      }
+    }
+  } as unknown as Pool
+
+  const [order] = await fetchOrderFirehose(pool, 10)
+
+  expect(capturedSql).toContain(
+    'COALESCE(moq.provider_quote, loq.provider_quote) AS provider_quote'
+  )
+  expect(capturedSql).not.toContain('NULL::jsonb AS provider_quote')
+  expect(order.detailLevel).toBe('summary')
+  expect(order.providerQuote).toBeUndefined()
+  expect(order.executionLegs).toEqual([])
+  expect(order.progress).toMatchObject({
+    totalStages: 2,
+    completedStages: 0,
+    failedStages: 0,
+    activeStage: 'Cctp Cctp Bridge / Planned'
+  })
+})
+
 test('fetchOrderFirehose rejects malformed JSON aggregate strings', async () => {
   const pool = {
     query: async () => {

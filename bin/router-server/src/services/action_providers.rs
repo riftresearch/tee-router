@@ -3015,6 +3015,7 @@ impl CctpProvider {
             provider_context: json!({
                 "kind": "cctp_receive",
                 "burn_transition_decl_id": step.burn_transition_decl_id,
+                "amount": step.amount,
                 "message_transmitter_v2": format!("{:#x}", self.message_transmitter_v2_address),
             }),
             state: ProviderExecutionState::default(),

@@ -4884,6 +4884,28 @@ impl OrderExecutionManager {
             .observed_state
             .get("provider_observed_state")
             .unwrap_or(&operation.observed_state);
+        if let Some(decoded_amount) = cctp_state
+            .get("decoded_message_body")
+            .and_then(|body| body.get("amount"))
+            .and_then(Value::as_str)
+        {
+            let planned_amount = running
+                .request
+                .get("amount")
+                .and_then(Value::as_str)
+                .ok_or_else(|| OrderExecutionError::ProviderRequestFailed {
+                    provider: running.provider.clone(),
+                    message: "cctp receive step missing amount".to_string(),
+                })?;
+            if decoded_amount != planned_amount {
+                return Err(OrderExecutionError::ProviderRequestFailed {
+                    provider: running.provider.clone(),
+                    message: format!(
+                        "cctp receive amount {planned_amount} does not match attested burn amount {decoded_amount}"
+                    ),
+                });
+            }
+        }
         let message = cctp_state
             .get("message")
             .and_then(Value::as_str)
@@ -5834,6 +5856,31 @@ impl OrderExecutionManager {
                 .filter(|step| step.step_index > 0)
                 .all(|step| step.status == OrderExecutionStepStatus::Completed);
         if !all_execution_steps_completed {
+            return Ok(order);
+        }
+        let mut refreshed_leg_ids = std::collections::BTreeSet::new();
+        for step in steps.iter().filter(|step| step.step_index > 0) {
+            if let Some(execution_leg_id) = step.execution_leg_id {
+                if refreshed_leg_ids.insert(execution_leg_id) {
+                    self.db
+                        .orders()
+                        .refresh_execution_leg_from_actions(execution_leg_id)
+                        .await
+                        .map_err(|source| OrderExecutionError::Database { source })?;
+                }
+            }
+        }
+        let execution_legs = self
+            .db
+            .orders()
+            .get_execution_legs_for_attempt(active_attempt.id)
+            .await
+            .map_err(|source| OrderExecutionError::Database { source })?;
+        let all_execution_legs_completed = !execution_legs.is_empty()
+            && execution_legs
+                .iter()
+                .all(|leg| leg.status == OrderExecutionStepStatus::Completed);
+        if !all_execution_legs_completed {
             return Ok(order);
         }
 

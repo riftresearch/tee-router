@@ -390,7 +390,7 @@ SELECT
   COALESCE(moq.max_amount_in, moa.max_amount_in) AS max_amount_in,
   COALESCE(moq.slippage_bps, moa.slippage_bps) AS slippage_bps,
   COALESCE(moq.expires_at, loq.expires_at) AS quote_expires_at,
-  NULL::jsonb AS provider_quote,
+  COALESCE(moq.provider_quote, loq.provider_quote) AS provider_quote,
   COALESCE(moq.usd_valuation_json, loq.usd_valuation_json, '{}'::jsonb) AS quote_usd_valuation,
   COALESCE(legs.execution_legs, '[]'::jsonb) AS execution_legs,
   '[]'::jsonb AS execution_steps,

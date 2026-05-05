@@ -565,6 +565,55 @@ async fn create_test_execution_leg_for_step(spec: TestExecutionLegForStep<'_>) -
     leg.id
 }
 
+async fn create_executing_market_test_order(
+    db: &Database,
+    now: chrono::DateTime<Utc>,
+) -> RouterOrder {
+    let source_asset = DepositAsset {
+        chain: ChainId::parse("evm:1").unwrap(),
+        asset: AssetId::Native,
+    };
+    let destination_asset = DepositAsset {
+        chain: ChainId::parse("evm:8453").unwrap(),
+        asset: AssetId::Native,
+    };
+    let quote = test_market_order_quote(
+        source_asset.clone(),
+        destination_asset.clone(),
+        now + chrono::Duration::minutes(5),
+    );
+    db.orders().create_market_order_quote(&quote).await.unwrap();
+    let order_id = Uuid::now_v7();
+    let order = RouterOrder {
+        id: order_id,
+        order_type: RouterOrderType::MarketOrder,
+        status: RouterOrderStatus::Executing,
+        funding_vault_id: None,
+        source_asset,
+        destination_asset,
+        recipient_address: valid_evm_address(),
+        refund_address: valid_evm_address(),
+        action: RouterOrderAction::MarketOrder(MarketOrderAction {
+            order_kind: MarketOrderKind::ExactIn {
+                amount_in: "1000".to_string(),
+                min_amount_out: "1000".to_string(),
+            },
+            slippage_bps: 100,
+        }),
+        action_timeout_at: now + chrono::Duration::minutes(10),
+        idempotency_key: None,
+        workflow_trace_id: order_id.simple().to_string(),
+        workflow_parent_span_id: "1111111111111111".to_string(),
+        created_at: now,
+        updated_at: now,
+    };
+    db.orders()
+        .create_market_order_from_quote(&order, quote.id)
+        .await
+        .unwrap();
+    order
+}
+
 fn write_test_master_key(config_dir: &std::path::Path) -> std::path::PathBuf {
     let path = config_dir.join("router-server-master-key.hex");
     if !path.exists() {
@@ -8736,6 +8785,349 @@ async fn execution_leg_rollup_uses_unit_deposit_source_amount_as_output_evidence
     assert_eq!(refreshed.status, OrderExecutionStepStatus::Completed);
     assert_eq!(refreshed.actual_amount_in.as_deref(), Some("1000"));
     assert_eq!(refreshed.actual_amount_out.as_deref(), Some("1000"));
+}
+
+#[tokio::test]
+async fn execution_leg_rollup_uses_cctp_receive_source_credit_as_bridge_output() {
+    let db = test_db().await;
+    let now = Utc::now();
+    let order = create_executing_market_test_order(&db, now).await;
+    let attempt = OrderExecutionAttempt {
+        id: Uuid::now_v7(),
+        order_id: order.id,
+        attempt_index: 1,
+        attempt_kind: OrderExecutionAttemptKind::PrimaryExecution,
+        status: OrderExecutionAttemptStatus::Active,
+        trigger_step_id: None,
+        trigger_provider_operation_id: None,
+        failure_reason: json!({}),
+        input_custody_snapshot: json!({}),
+        created_at: now,
+        updated_at: now,
+    };
+    db.orders()
+        .create_execution_attempt(&attempt)
+        .await
+        .unwrap();
+
+    let leg = OrderExecutionLeg {
+        id: Uuid::now_v7(),
+        order_id: order.id,
+        execution_attempt_id: Some(attempt.id),
+        transition_decl_id: Some("cctp-bridge-test".to_string()),
+        leg_index: 0,
+        leg_type: "cctp_bridge".to_string(),
+        provider: "cctp".to_string(),
+        status: OrderExecutionStepStatus::Planned,
+        input_asset: order.source_asset.clone(),
+        output_asset: order.destination_asset.clone(),
+        amount_in: "1000".to_string(),
+        expected_amount_out: "1000".to_string(),
+        min_amount_out: None,
+        actual_amount_in: None,
+        actual_amount_out: None,
+        started_at: None,
+        completed_at: None,
+        details: json!({}),
+        usd_valuation: json!({}),
+        created_at: now,
+        updated_at: now,
+    };
+    db.orders()
+        .create_execution_legs_idempotent(std::slice::from_ref(&leg))
+        .await
+        .unwrap();
+
+    let burn_step = OrderExecutionStep {
+        id: Uuid::now_v7(),
+        order_id: order.id,
+        execution_attempt_id: Some(attempt.id),
+        execution_leg_id: Some(leg.id),
+        transition_decl_id: Some("cctp-bridge-test".to_string()),
+        step_index: 1,
+        step_type: OrderExecutionStepType::CctpBurn,
+        provider: "cctp".to_string(),
+        status: OrderExecutionStepStatus::Completed,
+        input_asset: Some(order.source_asset.clone()),
+        output_asset: Some(order.destination_asset.clone()),
+        amount_in: Some("1000".to_string()),
+        min_amount_out: None,
+        tx_hash: Some(
+            "0x4444444444444444444444444444444444444444444444444444444444444444".to_string(),
+        ),
+        provider_ref: Some("cctp-burn-ref".to_string()),
+        idempotency_key: Some("cctp-burn-step".to_string()),
+        attempt_count: 1,
+        next_attempt_at: None,
+        started_at: Some(now),
+        completed_at: Some(now),
+        details: json!({}),
+        request: json!({ "amount": "1000" }),
+        response: json!({
+            "balance_observation": {
+                "probes": [
+                    {
+                        "role": "source",
+                        "debit_delta": "1000"
+                    }
+                ]
+            }
+        }),
+        error: json!({}),
+        usd_valuation: json!({}),
+        created_at: now,
+        updated_at: now,
+    };
+    let receive_step = OrderExecutionStep {
+        id: Uuid::now_v7(),
+        order_id: order.id,
+        execution_attempt_id: Some(attempt.id),
+        execution_leg_id: Some(leg.id),
+        transition_decl_id: Some("cctp-bridge-test:receive".to_string()),
+        step_index: 2,
+        step_type: OrderExecutionStepType::CctpReceive,
+        provider: "cctp".to_string(),
+        status: OrderExecutionStepStatus::Completed,
+        input_asset: Some(order.destination_asset.clone()),
+        output_asset: Some(order.destination_asset.clone()),
+        amount_in: Some("1000".to_string()),
+        min_amount_out: None,
+        tx_hash: Some(
+            "0x5555555555555555555555555555555555555555555555555555555555555555".to_string(),
+        ),
+        provider_ref: Some("cctp-receive-ref".to_string()),
+        idempotency_key: Some("cctp-receive-step".to_string()),
+        attempt_count: 1,
+        next_attempt_at: None,
+        started_at: Some(now),
+        completed_at: Some(now),
+        details: json!({}),
+        request: json!({ "amount": "1000" }),
+        response: json!({
+            "kind": "custody_action",
+            "provider_context": {
+                "kind": "cctp_receive",
+                "amount": "1000"
+            },
+            "balance_observation": {
+                "probes": [
+                    {
+                        "role": "source",
+                        "credit_delta": "1000"
+                    }
+                ]
+            }
+        }),
+        error: json!({}),
+        usd_valuation: json!({}),
+        created_at: now,
+        updated_at: now,
+    };
+    db.orders()
+        .create_execution_steps_idempotent(&[burn_step, receive_step])
+        .await
+        .unwrap();
+
+    let refreshed = db
+        .orders()
+        .refresh_execution_leg_from_actions(leg.id)
+        .await
+        .unwrap()
+        .expect("refreshed leg");
+    assert_eq!(refreshed.status, OrderExecutionStepStatus::Completed);
+    assert_eq!(refreshed.actual_amount_in.as_deref(), Some("1000"));
+    assert_eq!(refreshed.actual_amount_out.as_deref(), Some("1000"));
+}
+
+#[tokio::test]
+async fn completion_finalization_candidates_include_stale_execution_legs_for_rollup_recovery() {
+    let db = test_db().await;
+    let now = Utc::now();
+    let order = create_executing_market_test_order(&db, now).await;
+    let attempt = OrderExecutionAttempt {
+        id: Uuid::now_v7(),
+        order_id: order.id,
+        attempt_index: 1,
+        attempt_kind: OrderExecutionAttemptKind::PrimaryExecution,
+        status: OrderExecutionAttemptStatus::Active,
+        trigger_step_id: None,
+        trigger_provider_operation_id: None,
+        failure_reason: json!({}),
+        input_custody_snapshot: json!({}),
+        created_at: now,
+        updated_at: now,
+    };
+    db.orders()
+        .create_execution_attempt(&attempt)
+        .await
+        .unwrap();
+    let leg_id = create_test_execution_leg_for_step(TestExecutionLegForStep {
+        db: &db,
+        order_id: order.id,
+        execution_attempt_id: Some(attempt.id),
+        step_index: 1,
+        step_type: OrderExecutionStepType::UniversalRouterSwap,
+        provider: "velora",
+        input_asset: None,
+        output_asset: None,
+        amount_in: Some("1000"),
+        min_amount_out: Some("990"),
+        now,
+    })
+    .await;
+    let step = OrderExecutionStep {
+        id: Uuid::now_v7(),
+        order_id: order.id,
+        execution_attempt_id: Some(attempt.id),
+        execution_leg_id: Some(leg_id),
+        transition_decl_id: Some("test:velora:universal_router_swap".to_string()),
+        step_index: 1,
+        step_type: OrderExecutionStepType::UniversalRouterSwap,
+        provider: "velora".to_string(),
+        status: OrderExecutionStepStatus::Completed,
+        input_asset: Some(order.source_asset.clone()),
+        output_asset: Some(order.destination_asset.clone()),
+        amount_in: Some("1000".to_string()),
+        min_amount_out: None,
+        tx_hash: Some(
+            "0x6666666666666666666666666666666666666666666666666666666666666666".to_string(),
+        ),
+        provider_ref: Some("velora-step-ref".to_string()),
+        idempotency_key: Some("velora-step".to_string()),
+        attempt_count: 1,
+        next_attempt_at: None,
+        started_at: Some(now),
+        completed_at: Some(now),
+        details: json!({}),
+        request: json!({ "amount_in": "1000", "amount_out": "990" }),
+        response: json!({ "amount_in": "1000", "amount_out": "990" }),
+        error: json!({}),
+        usd_valuation: json!({}),
+        created_at: now,
+        updated_at: now,
+    };
+    db.orders()
+        .create_execution_steps_idempotent(&[step])
+        .await
+        .unwrap();
+
+    let candidates = db
+        .orders()
+        .find_executing_orders_pending_completion_finalization(10)
+        .await
+        .unwrap();
+    assert!(
+        candidates.iter().any(|candidate| candidate.id == order.id),
+        "completed-step orders with stale legs must still be candidates so finalization can refresh leg rollups"
+    );
+
+    db.orders()
+        .refresh_execution_leg_from_actions(leg_id)
+        .await
+        .unwrap()
+        .expect("refreshed leg");
+    let candidates = db
+        .orders()
+        .find_executing_orders_pending_completion_finalization(10)
+        .await
+        .unwrap();
+    assert!(
+        candidates.iter().any(|candidate| candidate.id == order.id),
+        "order becomes finalizable once the execution leg rollup is completed"
+    );
+}
+
+#[tokio::test]
+async fn completed_order_finalization_does_not_complete_when_leg_rollup_lacks_amount_evidence() {
+    let db = test_db().await;
+    let now = Utc::now();
+    let order = create_executing_market_test_order(&db, now).await;
+    let attempt = OrderExecutionAttempt {
+        id: Uuid::now_v7(),
+        order_id: order.id,
+        attempt_index: 1,
+        attempt_kind: OrderExecutionAttemptKind::PrimaryExecution,
+        status: OrderExecutionAttemptStatus::Active,
+        trigger_step_id: None,
+        trigger_provider_operation_id: None,
+        failure_reason: json!({}),
+        input_custody_snapshot: json!({}),
+        created_at: now,
+        updated_at: now,
+    };
+    db.orders()
+        .create_execution_attempt(&attempt)
+        .await
+        .unwrap();
+    let leg_id = create_test_execution_leg_for_step(TestExecutionLegForStep {
+        db: &db,
+        order_id: order.id,
+        execution_attempt_id: Some(attempt.id),
+        step_index: 1,
+        step_type: OrderExecutionStepType::UniversalRouterSwap,
+        provider: "velora",
+        input_asset: None,
+        output_asset: None,
+        amount_in: Some("1000"),
+        min_amount_out: Some("990"),
+        now,
+    })
+    .await;
+    let step = OrderExecutionStep {
+        id: Uuid::now_v7(),
+        order_id: order.id,
+        execution_attempt_id: Some(attempt.id),
+        execution_leg_id: Some(leg_id),
+        transition_decl_id: Some("test:velora:universal_router_swap".to_string()),
+        step_index: 1,
+        step_type: OrderExecutionStepType::UniversalRouterSwap,
+        provider: "velora".to_string(),
+        status: OrderExecutionStepStatus::Completed,
+        input_asset: Some(order.source_asset.clone()),
+        output_asset: Some(order.destination_asset.clone()),
+        amount_in: Some("1000".to_string()),
+        min_amount_out: None,
+        tx_hash: Some(
+            "0x7777777777777777777777777777777777777777777777777777777777777777".to_string(),
+        ),
+        provider_ref: Some("missing-amount-evidence-ref".to_string()),
+        idempotency_key: Some("missing-amount-evidence-step".to_string()),
+        attempt_count: 1,
+        next_attempt_at: None,
+        started_at: Some(now),
+        completed_at: Some(now),
+        details: json!({}),
+        request: json!({}),
+        response: json!({ "kind": "completed_without_amount_evidence" }),
+        error: json!({}),
+        usd_valuation: json!({}),
+        created_at: now,
+        updated_at: now,
+    };
+    db.orders()
+        .create_execution_steps_idempotent(&[step])
+        .await
+        .unwrap();
+
+    let execution_manager = OrderExecutionManager::new(db.clone());
+    execution_manager.process_worker_pass(10).await.unwrap();
+
+    let refreshed_order = db.orders().get(order.id).await.unwrap();
+    assert_eq!(refreshed_order.status, RouterOrderStatus::Executing);
+    let refreshed_attempt = db.orders().get_execution_attempt(attempt.id).await.unwrap();
+    assert_eq!(
+        refreshed_attempt.status,
+        OrderExecutionAttemptStatus::Active
+    );
+    let refreshed_leg = db
+        .orders()
+        .get_execution_legs_for_attempt(attempt.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|leg| leg.id == leg_id)
+        .expect("test leg");
+    assert_ne!(refreshed_leg.status, OrderExecutionStepStatus::Completed);
 }
 
 #[tokio::test]

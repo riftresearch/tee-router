@@ -3301,6 +3301,7 @@ impl OrderRepository {
             first_success_action AS (
                 SELECT
                     response_json,
+                    request_json,
                     amount_in
                 FROM current_actions
                 WHERE status IN ('completed', 'skipped')
@@ -3310,6 +3311,8 @@ impl OrderRepository {
             last_success_action AS (
                 SELECT
                     response_json,
+                    request_json,
+                    amount_in,
                     min_amount_out
                 FROM current_actions
                 WHERE status IN ('completed', 'skipped')
@@ -3339,8 +3342,11 @@ impl OrderRepository {
                     action_summary.last_completed_at,
                     (SELECT execution_attempt_id FROM latest_attempt) AS latest_execution_attempt_id,
                     first_success_action.response_json AS first_response_json,
+                    first_success_action.request_json AS first_request_json,
                     first_success_action.amount_in AS first_amount_in,
                     last_success_action.response_json AS last_response_json,
+                    last_success_action.request_json AS last_request_json,
+                    last_success_action.amount_in AS last_amount_in,
                     last_success_action.min_amount_out AS last_min_amount_out
                 FROM action_summary
                 LEFT JOIN first_success_action ON true
@@ -3394,6 +3400,16 @@ impl OrderRepository {
                         rolled_up.first_response_json #>> '{{response,amountIn}}',
                         rolled_up.first_response_json #>> '{{response,input_amount}}',
                         rolled_up.first_response_json #>> '{{response,inputAmount}}',
+                        rolled_up.first_response_json #>> '{{provider_context,amount_in}}',
+                        rolled_up.first_response_json #>> '{{provider_context,amountIn}}',
+                        rolled_up.first_response_json #>> '{{provider_context,input_amount}}',
+                        rolled_up.first_response_json #>> '{{provider_context,inputAmount}}',
+                        rolled_up.first_response_json #>> '{{provider_context,amount}}',
+                        rolled_up.first_request_json->>'amount_in',
+                        rolled_up.first_request_json->>'amountIn',
+                        rolled_up.first_request_json->>'input_amount',
+                        rolled_up.first_request_json->>'inputAmount',
+                        rolled_up.first_request_json->>'amount',
                         rolled_up.first_amount_in,
                         rolled_up.first_response_json #>> '{{observed_state,amount_in}}',
                         rolled_up.first_response_json #>> '{{observed_state,amountIn}}',
@@ -3430,14 +3446,47 @@ impl OrderRepository {
                               AND (probe.value->>'credit_delta')::numeric > 0
                             LIMIT 1
                         ),
+                        CASE
+                            WHEN leg.leg_type = 'cctp_bridge' THEN (
+                                SELECT probe.value->>'credit_delta'
+                                FROM jsonb_array_elements(
+                                    CASE
+                                        WHEN jsonb_typeof(rolled_up.last_response_json #> '{{balance_observation,probes}}') = 'array'
+                                            THEN rolled_up.last_response_json #> '{{balance_observation,probes}}'
+                                        ELSE '[]'::jsonb
+                                    END
+                                ) AS probe(value)
+                                WHERE probe.value->>'role' = 'source'
+                                  AND probe.value->>'credit_delta' ~ '^[0-9]+$'
+                                  AND (probe.value->>'credit_delta')::numeric > 0
+                                LIMIT 1
+                            )
+                        END,
                         rolled_up.last_response_json->>'amount_out',
                         rolled_up.last_response_json->>'amountOut',
                         rolled_up.last_response_json->>'output_amount',
                         rolled_up.last_response_json->>'outputAmount',
+                        rolled_up.last_response_json->>'expectedOutputAmount',
+                        rolled_up.last_response_json->>'minOutputAmount',
                         rolled_up.last_response_json #>> '{{response,amount_out}}',
                         rolled_up.last_response_json #>> '{{response,amountOut}}',
                         rolled_up.last_response_json #>> '{{response,output_amount}}',
                         rolled_up.last_response_json #>> '{{response,outputAmount}}',
+                        rolled_up.last_response_json #>> '{{response,expectedOutputAmount}}',
+                        rolled_up.last_response_json #>> '{{response,minOutputAmount}}',
+                        rolled_up.last_response_json #>> '{{provider_context,amount_out}}',
+                        rolled_up.last_response_json #>> '{{provider_context,amountOut}}',
+                        rolled_up.last_response_json #>> '{{provider_context,output_amount}}',
+                        rolled_up.last_response_json #>> '{{provider_context,outputAmount}}',
+                        rolled_up.last_request_json->>'amount_out',
+                        rolled_up.last_request_json->>'amountOut',
+                        rolled_up.last_request_json->>'output_amount',
+                        rolled_up.last_request_json->>'outputAmount',
+                        CASE
+                            WHEN leg.leg_type = 'cctp_bridge'
+                                THEN rolled_up.last_request_json->>'amount'
+                        END,
+                        rolled_up.last_request_json #>> '{{price_route,destAmount}}',
                         rolled_up.last_min_amount_out,
                         CASE
                             WHEN leg.leg_type = 'unit_deposit'
@@ -3464,14 +3513,21 @@ impl OrderRepository {
                         rolled_up.last_response_json #>> '{{observed_state,previous_observed_state,amountOut}}',
                         rolled_up.last_response_json #>> '{{observed_state,previous_observed_state,output_amount}}',
                         rolled_up.last_response_json #>> '{{observed_state,previous_observed_state,outputAmount}}',
+                        rolled_up.last_response_json #>> '{{observed_state,previous_observed_state,previous_observed_state,output_amount}}',
+                        rolled_up.last_response_json #>> '{{observed_state,previous_observed_state,previous_observed_state,outputAmount}}',
                         rolled_up.last_response_json #>> '{{observed_state,previous_observed_state,destination_amount}}',
                         rolled_up.last_response_json #>> '{{observed_state,previous_observed_state,destinationAmount}}',
                         rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,amount_out}}',
                         rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,amountOut}}',
                         rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,output_amount}}',
                         rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,outputAmount}}',
+                        rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,decoded_message_body,amount}}',
                         rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,destination_amount}}',
-                        rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,destinationAmount}}'
+                        rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,destinationAmount}}',
+                        CASE
+                            WHEN leg.leg_type = 'cctp_bridge'
+                                THEN rolled_up.last_amount_in
+                        END
                     )
                     ELSE NULL
                 END,
