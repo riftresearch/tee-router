@@ -1,4 +1,5 @@
 use crate::{
+    models::OrderExecutionStepType,
     protocol::{AssetId, ChainId, DepositAsset},
     services::asset_registry::{MarketOrderTransitionKind, ProviderId},
 };
@@ -55,6 +56,7 @@ pub struct QuoteLeg {
     pub transition_decl_id: String,
     pub transition_parent_decl_id: String,
     pub transition_kind: MarketOrderTransitionKind,
+    pub execution_step_type: OrderExecutionStepType,
     pub provider: ProviderId,
     pub input_asset: QuoteLegAsset,
     pub output_asset: QuoteLegAsset,
@@ -84,6 +86,7 @@ impl QuoteLeg {
             transition_parent_decl_id: transition_decl_id.clone(),
             transition_decl_id,
             transition_kind: spec.transition_kind,
+            execution_step_type: execution_step_type_for_transition_kind(spec.transition_kind),
             provider: spec.provider,
             input_asset: QuoteLegAsset::from_deposit_asset(spec.input_asset),
             output_asset: QuoteLegAsset::from_deposit_asset(spec.output_asset),
@@ -101,6 +104,12 @@ impl QuoteLeg {
     }
 
     #[must_use]
+    pub fn with_execution_step_type(mut self, execution_step_type: OrderExecutionStepType) -> Self {
+        self.execution_step_type = execution_step_type;
+        self
+    }
+
+    #[must_use]
     pub fn parent_transition_id(&self) -> &str {
         &self.transition_parent_decl_id
     }
@@ -111,5 +120,27 @@ impl QuoteLeg {
 
     pub fn output_deposit_asset(&self) -> Result<DepositAsset, String> {
         self.output_asset.deposit_asset()
+    }
+}
+
+#[must_use]
+pub fn execution_step_type_for_transition_kind(
+    transition_kind: MarketOrderTransitionKind,
+) -> OrderExecutionStepType {
+    match transition_kind {
+        MarketOrderTransitionKind::AcrossBridge => OrderExecutionStepType::AcrossBridge,
+        MarketOrderTransitionKind::CctpBridge => OrderExecutionStepType::CctpBurn,
+        MarketOrderTransitionKind::UnitDeposit => OrderExecutionStepType::UnitDeposit,
+        MarketOrderTransitionKind::HyperliquidBridgeDeposit => {
+            OrderExecutionStepType::HyperliquidBridgeDeposit
+        }
+        MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
+            OrderExecutionStepType::HyperliquidBridgeWithdrawal
+        }
+        MarketOrderTransitionKind::HyperliquidTrade => OrderExecutionStepType::HyperliquidTrade,
+        MarketOrderTransitionKind::UniversalRouterSwap => {
+            OrderExecutionStepType::UniversalRouterSwap
+        }
+        MarketOrderTransitionKind::UnitWithdrawal => OrderExecutionStepType::UnitWithdrawal,
     }
 }

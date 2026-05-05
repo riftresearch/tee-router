@@ -27,7 +27,7 @@ sol! {
     }
 }
 
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 #[command(about = "Read ETH, USDC, cbBTC, and WETH balances for a Base wallet")]
 struct Args {
     #[arg(long, env = "BASE_RPC_URL")]
@@ -161,7 +161,8 @@ where
     Fut: Future<Output = CliResult<T>>,
 {
     let mut delay = Duration::from_millis(500);
-    for attempt in 1..=RPC_RETRY_ATTEMPTS {
+    let mut attempt = 1;
+    loop {
         match op().await {
             Ok(value) => return Ok(value),
             Err(err) if attempt < RPC_RETRY_ATTEMPTS && is_retryable_rpc_error(err.as_ref()) => {
@@ -170,11 +171,11 @@ where
                 );
                 tokio::time::sleep(delay).await;
                 delay = delay.saturating_mul(2);
+                attempt += 1;
             }
             Err(err) => return Err(err),
         }
     }
-    unreachable!("retry loop always returns before exhausting attempts")
 }
 
 fn is_retryable_rpc_error(err: &(dyn Error + 'static)) -> bool {

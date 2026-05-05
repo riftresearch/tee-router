@@ -38,8 +38,10 @@ const DEFAULT_DEPOSIT_AMOUNT_WEI: &str = "10000000000000000";
 const RPC_RETRY_ATTEMPTS: usize = 6;
 const RECEIPT_POLL_ATTEMPTS: usize = 120;
 const RECEIPT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const LIVE_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const LIVE_HTTP_MAX_RESPONSE_BODY_BYTES: usize = 256 * 1024;
 
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 #[command(
     about = "Probe whether a deterministic fresh Hyperliquid address can be initialized implicitly by a live HyperUnit ETH deposit"
 )]
@@ -122,7 +124,10 @@ async fn main() -> CliResult<()> {
     }
 
     let unit = live_unit_client(&args.hyperunit_api_url, args.hyperunit_proxy_url.clone())?;
-    let hl_http = reqwest::Client::builder().use_rustls_tls().build()?;
+    let hl_http = reqwest::Client::builder()
+        .use_rustls_tls()
+        .timeout(LIVE_HTTP_TIMEOUT)
+        .build()?;
 
     let user_role_before = hyperliquid_info(
         &hl_http,
@@ -287,12 +292,33 @@ async fn hyperliquid_info(
         .send()
         .await?;
     let status = response.status();
-    let body = response.text().await?;
+    let body = read_limited_response_text(response, LIVE_HTTP_MAX_RESPONSE_BODY_BYTES).await?;
     if !status.is_success() {
         return Err(format!("hyperliquid /info returned HTTP {status}: {body}").into());
     }
     serde_json::from_str(&body)
         .map_err(|err| format!("invalid hyperliquid /info JSON: {err}; body={body}").into())
+}
+
+async fn read_limited_response_text(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> CliResult<String> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if !append_limited_body_chunk(&mut body, chunk.as_ref(), max_bytes) {
+            return Err(format!("response body exceeded {max_bytes} bytes").into());
+        }
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+fn append_limited_body_chunk(body: &mut Vec<u8>, chunk: &[u8], max_bytes: usize) -> bool {
+    if body.len().saturating_add(chunk.len()) > max_bytes {
+        return false;
+    }
+    body.extend_from_slice(chunk);
+    true
 }
 
 async fn wait_for_unit_terminal_operation(

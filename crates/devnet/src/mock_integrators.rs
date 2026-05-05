@@ -2,8 +2,9 @@ use alloy::{
     hex,
     network::TransactionBuilder,
     primitives::{Address, Bytes, FixedBytes, B256, U256},
-    providers::{DynProvider, Provider, ProviderBuilder},
+    providers::{ext::AnvilApi, DynProvider, Provider, ProviderBuilder},
     rpc::types::{Filter, TransactionRequest},
+    signers::local::PrivateKeySigner,
     sol,
     sol_types::{SolCall, SolEvent, SolValue},
 };
@@ -14,10 +15,12 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use bitcoincore_rpc_async::{Auth as BitcoinRpcAuth, Client as BitcoinRpcClient, RpcApi};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use hyperliquid_client::{
-    recover_l1_signer, recover_typed_signer, Actions, SpotMeta, SpotSend, UsdClassTransfer,
-    Withdraw3, MINIMUM_BRIDGE_DEPOSIT_USDC, SPOT_ASSET_INDEX_OFFSET,
+    recover_l1_signer, recover_typed_signer, spot_wire_asset_index, Actions, SpotAssetMeta,
+    SpotMeta, SpotSend, TokenInfo, UsdClassTransfer, Withdraw3, MINIMUM_BRIDGE_DEPOSIT_USDC,
+    SPOT_ASSET_INDEX_OFFSET,
 };
 use hyperunit_client::{
     UnitAsset, UnitChain, UnitGenerateAddressResponse, UnitOperation, UnitOperationsResponse,
@@ -27,7 +30,9 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    net::SocketAddr,
+    fmt,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::PathBuf,
     str::FromStr,
     sync::Arc,
     time::Duration,
@@ -40,6 +45,7 @@ use crate::{
     across_spoke_pool_mock::MockSpokePool::{depositCall, FundsDeposited},
     cctp_mock::MockCctpTokenMessengerV2::DepositForBurn,
     hyperliquid_bridge_mock::MockHyperliquidBridge2,
+    velora_mock::MockVeloraSwap,
 };
 
 sol! {
@@ -59,6 +65,12 @@ sol! {
         function mint(address recipient, uint256 amount) external;
     }
 }
+
+const VELORA_NATIVE_TOKEN: &str = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+const USD_MICRO: u128 = 1_000_000;
+const DEFAULT_ETH_USD_MICRO: u128 = 3_000 * USD_MICRO;
+const DEFAULT_BTC_USD_MICRO: u128 = 100_000 * USD_MICRO;
+const DEFAULT_USD_STABLE_USD_MICRO: u128 = USD_MICRO;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MockAssetRef {
@@ -129,8 +141,65 @@ pub struct MockIntegratorLedgerSnapshot {
     pub hyperliquid_exchange_submissions: Vec<Value>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
+pub struct MockAcrossChainConfig {
+    pub spoke_pool_address: String,
+    pub evm_rpc_url: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct MockCctpChainConfig {
+    pub token_messenger_address: String,
+    pub evm_rpc_url: String,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedMockAcrossChainConfig {
+    spoke_pool_address: String,
+    evm_rpc_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MockAddressRiskLevel {
+    Low,
+    Medium,
+    High,
+    Severe,
+    Unknown,
+}
+
+impl MockAddressRiskLevel {
+    fn chainalysis_label(self) -> &'static str {
+        match self {
+            Self::Low => "Low",
+            Self::Medium => "Medium",
+            Self::High => "High",
+            Self::Severe => "Severe",
+            Self::Unknown => "Unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum MockAddressScreeningRule {
+    Risk {
+        risk: MockAddressRiskLevel,
+        reason: Option<String>,
+    },
+    HttpError {
+        status: u16,
+        body: String,
+    },
+}
+
+#[derive(Debug, Clone)]
 pub struct MockIntegratorConfig {
+    /// TCP address the mock HTTP server should bind.
+    pub bind_addr: SocketAddr,
+    /// Optional URL used in the returned server handle instead of deriving one
+    /// from the bound socket. This is useful when binding 0.0.0.0 but
+    /// advertising localhost or a Docker Compose service name.
+    pub advertised_base_url: Option<String>,
     /// Address of the mock SpokePool contract deployed to the test Anvil.
     /// When set, the mock GET `/swap/approval` handler encodes a real
     /// `deposit(...)` call targeting this address (matching real Across
@@ -141,6 +210,10 @@ pub struct MockIntegratorConfig {
     /// polls `FundsDeposited` logs and serves them via `GET /deposit/status`
     /// in the same shape as the real Across API.
     pub across_evm_rpc_url: Option<String>,
+    /// Per-origin-chain Across mock configuration. The real Across API routes
+    /// approval simulation and deposit indexing by origin chain; the mock must
+    /// do the same once local tests span multiple EVM chains.
+    pub across_chains: BTreeMap<u64, MockAcrossChainConfig>,
     /// Whether Hyperliquid L1 actions must be signed under the mainnet
     /// source-byte ("a") vs testnet ("b"). Defaults to testnet so tests
     /// default to the non-mainnet signing path the router uses in devnet.
@@ -164,6 +237,21 @@ pub struct MockIntegratorConfig {
     /// ERC20 token address used as "native Arbitrum USDC" for the mock
     /// Hyperliquid bridge.
     pub hyperliquid_usdc_token_address: Option<String>,
+    /// Artificial delay between observing a native Hyperliquid USDC bridge
+    /// deposit on the EVM chain and crediting the mock Hyperliquid
+    /// clearinghouse ledger.
+    pub hyperliquid_bridge_deposit_latency: Duration,
+    /// Deterministic probability that an otherwise valid native Hyperliquid
+    /// USDC bridge deposit never credits the mock clearinghouse ledger, in
+    /// basis points.
+    pub hyperliquid_bridge_deposit_failure_probability_bps: u16,
+    /// EVM RPC URLs used to detect native Unit deposits into generated
+    /// protocol addresses.
+    pub unit_evm_rpc_urls: BTreeMap<String, String>,
+    /// Bitcoin Core RPC URL and cookie used to detect mempool/confirmed Unit
+    /// deposits into generated protocol addresses.
+    pub unit_bitcoin_rpc_url: Option<String>,
+    pub unit_bitcoin_cookie_path: Option<PathBuf>,
     /// Address of the mock CCTP TokenMessengerV2 contract deployed to the
     /// source EVM test chain. When set with `cctp_evm_rpc_url`, the mock Iris
     /// endpoint indexes burn events from this contract.
@@ -173,6 +261,24 @@ pub struct MockIntegratorConfig {
     /// Token address that mock CCTP receiveMessage should mint on the
     /// destination chain.
     pub cctp_destination_token_address: Option<String>,
+    /// Per-source-chain CCTP mock configuration. Real Iris indexes burns by
+    /// source domain, so local multi-chain tests need one indexer per source
+    /// EVM chain.
+    pub cctp_chains: BTreeMap<u64, MockCctpChainConfig>,
+    /// Destination token address keyed by CCTP destination domain.
+    pub cctp_destination_token_addresses: BTreeMap<u32, String>,
+    /// Artificial delay between indexing a burn and returning a completed Iris
+    /// attestation.
+    pub cctp_attestation_latency: Duration,
+    /// When set, every indexed CCTP burn returns a failed Iris message.
+    pub cctp_attestation_failure_reason: Option<String>,
+    /// Chainalysis-compatible local address-screening responses keyed by
+    /// normalized address. Addresses absent from this map default to Low risk.
+    pub address_screening_rules: BTreeMap<String, MockAddressScreeningRule>,
+    /// Per-network deployed MockVeloraSwap contract addresses. The mock Velora
+    /// quote/transaction path requires this so execution always spends input and
+    /// creates output on-chain.
+    pub velora_swap_contract_addresses: BTreeMap<u64, String>,
     /// Artificial delay before the mock Bridge2 releases the net `withdraw3`
     /// payout onto the EVM chain. Defaults to zero.
     pub hyperliquid_withdrawal_latency: Duration,
@@ -189,7 +295,56 @@ pub struct MockIntegratorConfig {
     pub across_refund_probability_bps: u16,
 }
 
+impl Default for MockIntegratorConfig {
+    fn default() -> Self {
+        Self {
+            bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            advertised_base_url: None,
+            across_spoke_pool_address: None,
+            across_evm_rpc_url: None,
+            across_chains: BTreeMap::new(),
+            mainnet_hyperliquid: false,
+            across_api_key: None,
+            across_integrator_id: None,
+            hyperliquid_bridge_address: None,
+            hyperliquid_evm_rpc_url: None,
+            hyperliquid_usdc_token_address: None,
+            hyperliquid_bridge_deposit_latency: Duration::ZERO,
+            hyperliquid_bridge_deposit_failure_probability_bps: 0,
+            unit_evm_rpc_urls: BTreeMap::new(),
+            unit_bitcoin_rpc_url: None,
+            unit_bitcoin_cookie_path: None,
+            cctp_token_messenger_address: None,
+            cctp_evm_rpc_url: None,
+            cctp_destination_token_address: None,
+            cctp_chains: BTreeMap::new(),
+            cctp_destination_token_addresses: BTreeMap::new(),
+            cctp_attestation_latency: Duration::ZERO,
+            cctp_attestation_failure_reason: None,
+            address_screening_rules: BTreeMap::new(),
+            velora_swap_contract_addresses: BTreeMap::new(),
+            hyperliquid_withdrawal_latency: Duration::ZERO,
+            across_quote_fee_bps: 0,
+            across_quote_jitter_bps: 0,
+            across_status_latency: Duration::ZERO,
+            across_refund_probability_bps: 0,
+        }
+    }
+}
+
 impl MockIntegratorConfig {
+    #[must_use]
+    pub fn with_bind_addr(mut self, bind_addr: SocketAddr) -> Self {
+        self.bind_addr = bind_addr;
+        self
+    }
+
+    #[must_use]
+    pub fn with_advertised_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.advertised_base_url = Some(base_url.into());
+        self
+    }
+
     #[must_use]
     pub fn with_across_spoke_pool_address(mut self, address: impl Into<String>) -> Self {
         self.across_spoke_pool_address = Some(address.into());
@@ -199,6 +354,23 @@ impl MockIntegratorConfig {
     #[must_use]
     pub fn with_across_evm_rpc_url(mut self, url: impl Into<String>) -> Self {
         self.across_evm_rpc_url = Some(url.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_across_chain(
+        mut self,
+        origin_chain_id: u64,
+        spoke_pool_address: impl Into<String>,
+        evm_rpc_url: impl Into<String>,
+    ) -> Self {
+        self.across_chains.insert(
+            origin_chain_id,
+            MockAcrossChainConfig {
+                spoke_pool_address: spoke_pool_address.into(),
+                evm_rpc_url: evm_rpc_url.into(),
+            },
+        );
         self
     }
 
@@ -238,6 +410,39 @@ impl MockIntegratorConfig {
     }
 
     #[must_use]
+    pub fn with_hyperliquid_bridge_deposit_latency(mut self, latency: Duration) -> Self {
+        self.hyperliquid_bridge_deposit_latency = latency;
+        self
+    }
+
+    #[must_use]
+    pub fn with_hyperliquid_bridge_deposit_failure_probability_bps(
+        mut self,
+        probability_bps: u16,
+    ) -> Self {
+        self.hyperliquid_bridge_deposit_failure_probability_bps = probability_bps.min(10_000);
+        self
+    }
+
+    #[must_use]
+    pub fn with_unit_evm_rpc_url(mut self, chain: UnitChain, url: impl Into<String>) -> Self {
+        self.unit_evm_rpc_urls
+            .insert(chain.as_wire_str().to_string(), url.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_unit_bitcoin_rpc(
+        mut self,
+        url: impl Into<String>,
+        cookie_path: impl Into<PathBuf>,
+    ) -> Self {
+        self.unit_bitcoin_rpc_url = Some(url.into());
+        self.unit_bitcoin_cookie_path = Some(cookie_path.into());
+        self
+    }
+
+    #[must_use]
     pub fn with_cctp_token_messenger_address(mut self, address: impl Into<String>) -> Self {
         self.cctp_token_messenger_address = Some(address.into());
         self
@@ -252,6 +457,93 @@ impl MockIntegratorConfig {
     #[must_use]
     pub fn with_cctp_destination_token_address(mut self, address: impl Into<String>) -> Self {
         self.cctp_destination_token_address = Some(address.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_cctp_chain(
+        mut self,
+        source_chain_id: u64,
+        token_messenger_address: impl Into<String>,
+        evm_rpc_url: impl Into<String>,
+    ) -> Self {
+        self.cctp_chains.insert(
+            source_chain_id,
+            MockCctpChainConfig {
+                token_messenger_address: token_messenger_address.into(),
+                evm_rpc_url: evm_rpc_url.into(),
+            },
+        );
+        self
+    }
+
+    #[must_use]
+    pub fn with_cctp_destination_token(
+        mut self,
+        destination_chain_id: u64,
+        token_address: impl Into<String>,
+    ) -> Self {
+        if let Some(domain) = cctp_domain_for_chain_id(destination_chain_id) {
+            self.cctp_destination_token_addresses
+                .insert(domain, token_address.into());
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn with_cctp_attestation_latency(mut self, latency: Duration) -> Self {
+        self.cctp_attestation_latency = latency;
+        self
+    }
+
+    #[must_use]
+    pub fn with_cctp_attestation_failure(mut self, reason: impl Into<String>) -> Self {
+        self.cctp_attestation_failure_reason = Some(reason.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_address_screening_risk(
+        mut self,
+        address: impl AsRef<str>,
+        risk: MockAddressRiskLevel,
+        reason: Option<impl Into<String>>,
+    ) -> Self {
+        self.address_screening_rules.insert(
+            normalize_mock_screening_address(address.as_ref()),
+            MockAddressScreeningRule::Risk {
+                risk,
+                reason: reason.map(Into::into),
+            },
+        );
+        self
+    }
+
+    #[must_use]
+    pub fn with_address_screening_error(
+        mut self,
+        address: impl AsRef<str>,
+        status: u16,
+        body: impl Into<String>,
+    ) -> Self {
+        self.address_screening_rules.insert(
+            normalize_mock_screening_address(address.as_ref()),
+            MockAddressScreeningRule::HttpError {
+                status,
+                body: body.into(),
+            },
+        );
+        self
+    }
+
+    #[must_use]
+    pub fn with_velora_swap_contract_address(
+        mut self,
+        chain_id: u64,
+        address: impl Into<String>,
+    ) -> Self {
+        self.velora_swap_contract_addresses
+            .insert(chain_id, address.into());
         self
     }
 
@@ -289,23 +581,34 @@ impl MockIntegratorConfig {
 struct MockIntegratorState {
     across_spoke_pool_address: Option<String>,
     across_evm_rpc_url: Option<String>,
+    across_chains: BTreeMap<u64, MockAcrossChainConfig>,
     hyperliquid_bridge_address: Option<String>,
     hyperliquid_evm_rpc_url: Option<String>,
+    hyperliquid_usdc_token_address: Option<String>,
+    hyperliquid_bridge_deposit_latency: Duration,
+    hyperliquid_bridge_deposit_failure_probability_bps: u16,
     unit_generate_address_requests: Mutex<Vec<MockUnitGenerateAddressRequest>>,
-    /// Tracked by `protocol_address` — the mock address returned from `/gen`
-    /// that both the deposit source and the withdrawal spotSend target.
-    ///
-    /// Real HyperUnit reuses protocol addresses and returns historical
-    /// operations for that address, so the mock keeps a per-address history
-    /// instead of only the latest row.
+    /// Tracked by `protocol_address` — the fresh mock address returned from
+    /// `/gen` that acts as either the deposit source or the withdrawal spotSend
+    /// target. Destination-address queries can still return operation history
+    /// across many generated protocol addresses.
     unit_operations: Mutex<BTreeMap<String, Vec<MockUnitOperationEntry>>>,
+    unit_protocol_private_keys: Mutex<BTreeMap<String, MockUnitProtocolKey>>,
+    unit_evm_rpc_urls: BTreeMap<String, String>,
     ledger: Mutex<MockIntegratorLedger>,
     across_deposits: Mutex<BTreeMap<AcrossDepositKey, MockAcrossDepositRecord>>,
+    across_destination_credit_tx_hashes: Mutex<BTreeMap<AcrossDepositKey, String>>,
     cctp_burns: Mutex<BTreeMap<String, MockCctpBurnRecord>>,
+    cctp_attestation_latency: Duration,
+    cctp_attestation_failure_reason: Option<String>,
     hyperliquid_exchange_submissions: Mutex<Vec<Value>>,
     hyperliquid: Mutex<HyperliquidMockState>,
+    velora_usd_prices: Mutex<BTreeMap<String, u128>>,
+    address_screening_rules: BTreeMap<String, MockAddressScreeningRule>,
+    velora_swap_contract_addresses: BTreeMap<u64, String>,
     next_across_swap_approval_error: Mutex<Option<String>>,
     next_unit_generate_address_error: Mutex<Option<String>>,
+    next_unit_withdrawal_completion_error: Mutex<Option<String>>,
     next_hyperliquid_exchange_error: Mutex<Option<String>>,
     mainnet_hyperliquid: bool,
     across_api_key: Option<String>,
@@ -465,17 +768,32 @@ struct MockUnitOperationEntry {
     operation: UnitOperation,
 }
 
+#[derive(Clone)]
+struct MockUnitProtocolKey {
+    private_key: String,
+}
+
+impl fmt::Debug for MockUnitProtocolKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MockUnitProtocolKey")
+            .field("private_key", &"redacted")
+            .finish()
+    }
+}
+
 pub struct MockIntegratorServer {
     base_url: String,
     state: Arc<MockIntegratorState>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     handle: JoinHandle<()>,
-    across_indexer_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
-    across_indexer_handle: Option<JoinHandle<()>>,
+    across_indexer_shutdowns: Vec<tokio::sync::oneshot::Sender<()>>,
+    across_indexer_handles: Vec<JoinHandle<()>>,
     hyperliquid_indexer_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     hyperliquid_indexer_handle: Option<JoinHandle<()>>,
-    cctp_indexer_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
-    cctp_indexer_handle: Option<JoinHandle<()>>,
+    unit_deposit_indexer_shutdowns: Vec<tokio::sync::oneshot::Sender<()>>,
+    unit_deposit_indexer_handles: Vec<JoinHandle<()>>,
+    cctp_indexer_shutdowns: Vec<tokio::sync::oneshot::Sender<()>>,
+    cctp_indexer_handles: Vec<JoinHandle<()>>,
 }
 
 impl MockIntegratorServer {
@@ -484,21 +802,27 @@ impl MockIntegratorServer {
     }
 
     pub async fn spawn_with_config(config: MockIntegratorConfig) -> eyre::Result<Self> {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let listener = TcpListener::bind(config.bind_addr).await?;
         let addr = listener.local_addr()?;
         let state = Arc::new(MockIntegratorState::new(&config));
 
-        let (across_indexer_shutdown, across_indexer_handle) =
+        let (across_indexer_shutdowns, across_indexer_handles) =
             maybe_spawn_across_deposit_indexer(&config, state.clone()).await?;
         let (hyperliquid_indexer_shutdown, hyperliquid_indexer_handle) =
             maybe_spawn_hyperliquid_bridge_indexer(&config, state.clone()).await?;
-        let (cctp_indexer_shutdown, cctp_indexer_handle) =
+        let (unit_deposit_indexer_shutdowns, unit_deposit_indexer_handles) =
+            maybe_spawn_unit_deposit_indexers(&config, state.clone()).await?;
+        let (cctp_indexer_shutdowns, cctp_indexer_handles) =
             maybe_spawn_cctp_burn_indexer(&config, state.clone()).await?;
 
         let app = Router::new()
             .route("/swap/approval", get(mock_across_real_swap_approval))
             .route("/deposit/status", get(mock_across_deposit_status))
             .route("/prices", get(mock_velora_prices))
+            .route(
+                "/api/risk/v2/entities/:address",
+                get(mock_chainalysis_address_risk),
+            )
             .route(
                 "/v2/prices/:currency_pair/spot",
                 get(mock_coinbase_spot_price),
@@ -530,16 +854,18 @@ impl MockIntegratorServer {
         });
 
         Ok(Self {
-            base_url: base_url(addr),
+            base_url: config.advertised_base_url.unwrap_or_else(|| base_url(addr)),
             state,
             shutdown: Some(shutdown_tx),
             handle,
-            across_indexer_shutdown,
-            across_indexer_handle,
+            across_indexer_shutdowns,
+            across_indexer_handles,
             hyperliquid_indexer_shutdown,
             hyperliquid_indexer_handle,
-            cctp_indexer_shutdown,
-            cctp_indexer_handle,
+            unit_deposit_indexer_shutdowns,
+            unit_deposit_indexer_handles,
+            cctp_indexer_shutdowns,
+            cctp_indexer_handles,
         })
     }
 
@@ -566,6 +892,15 @@ impl MockIntegratorServer {
 
     pub async fn unit_operations(&self) -> Vec<MockUnitOperationRecord> {
         snapshot_unit_operations(&*self.state.unit_operations.lock().await)
+    }
+
+    pub async fn unit_protocol_private_key(&self, protocol_address: &str) -> Option<String> {
+        self.state
+            .unit_protocol_private_keys
+            .lock()
+            .await
+            .get(protocol_address)
+            .map(|key| key.private_key.clone())
     }
 
     pub async fn ledger_snapshot(&self) -> MockIntegratorLedgerSnapshot {
@@ -599,6 +934,14 @@ impl MockIntegratorServer {
         *self.state.next_unit_generate_address_error.lock().await = Some(error.into());
     }
 
+    pub async fn fail_next_unit_withdrawal_completion(&self, error: impl Into<String>) {
+        *self
+            .state
+            .next_unit_withdrawal_completion_error
+            .lock()
+            .await = Some(error.into());
+    }
+
     pub async fn fail_next_hyperliquid_exchange(&self, error: impl Into<String>) {
         *self.state.next_hyperliquid_exchange_error.lock().await = Some(error.into());
     }
@@ -608,6 +951,22 @@ impl MockIntegratorServer {
     /// or a withdrawal (tokens paid out to `dst_addr` after the spotSend).
     pub async fn complete_unit_operation(&self, protocol_address: &str) -> Result<(), String> {
         complete_mock_unit_operation(&self.state, protocol_address).await
+    }
+
+    pub async fn complete_unit_operation_with_source_amount(
+        &self,
+        protocol_address: &str,
+        source_amount: impl Into<String>,
+    ) -> Result<(), String> {
+        complete_mock_unit_operation_with_observation(
+            &self.state,
+            protocol_address,
+            Some(UnitOperationObservation {
+                source_amount: source_amount.into(),
+                source_tx_hash: None,
+            }),
+        )
+        .await
     }
 
     /// Move a tracked unit operation into terminal `failure`.
@@ -789,6 +1148,16 @@ impl MockIntegratorServer {
     pub async fn hyperliquid_rate(&self, base: &str, quote: &str) -> Option<f64> {
         self.state.hyperliquid.lock().await.rate_for(base, quote)
     }
+
+    /// Install (or overwrite) the mock Velora USD price in micro-dollars per
+    /// whole token. Defaults are ETH=$3,000, BTC=$100,000, USDC=$1, USDT=$1.
+    pub async fn set_velora_usd_price_micro(&self, symbol: &str, usd_micro: u128) {
+        self.state
+            .velora_usd_prices
+            .lock()
+            .await
+            .insert(symbol.to_ascii_uppercase(), usd_micro);
+    }
 }
 
 impl MockIntegratorState {
@@ -796,17 +1165,32 @@ impl MockIntegratorState {
         Self {
             across_spoke_pool_address: config.across_spoke_pool_address.clone(),
             across_evm_rpc_url: config.across_evm_rpc_url.clone(),
+            across_chains: config.across_chains.clone(),
             hyperliquid_bridge_address: config.hyperliquid_bridge_address.clone(),
             hyperliquid_evm_rpc_url: config.hyperliquid_evm_rpc_url.clone(),
+            hyperliquid_usdc_token_address: config.hyperliquid_usdc_token_address.clone(),
+            hyperliquid_bridge_deposit_latency: config.hyperliquid_bridge_deposit_latency,
+            hyperliquid_bridge_deposit_failure_probability_bps: config
+                .hyperliquid_bridge_deposit_failure_probability_bps
+                .min(10_000),
             unit_generate_address_requests: Mutex::default(),
             unit_operations: Mutex::default(),
+            unit_protocol_private_keys: Mutex::default(),
+            unit_evm_rpc_urls: config.unit_evm_rpc_urls.clone(),
             ledger: Mutex::default(),
             across_deposits: Mutex::default(),
+            across_destination_credit_tx_hashes: Mutex::default(),
             cctp_burns: Mutex::default(),
+            cctp_attestation_latency: config.cctp_attestation_latency,
+            cctp_attestation_failure_reason: config.cctp_attestation_failure_reason.clone(),
             hyperliquid_exchange_submissions: Mutex::default(),
             hyperliquid: Mutex::new(HyperliquidMockState::new()),
+            velora_usd_prices: Mutex::new(default_velora_usd_prices()),
+            address_screening_rules: config.address_screening_rules.clone(),
+            velora_swap_contract_addresses: config.velora_swap_contract_addresses.clone(),
             next_across_swap_approval_error: Mutex::default(),
             next_unit_generate_address_error: Mutex::default(),
+            next_unit_withdrawal_completion_error: Mutex::default(),
             next_hyperliquid_exchange_error: Mutex::default(),
             mainnet_hyperliquid: config.mainnet_hyperliquid,
             across_api_key: config.across_api_key.clone(),
@@ -818,6 +1202,34 @@ impl MockIntegratorState {
             across_refund_probability_bps: config.across_refund_probability_bps.min(10_000),
         }
     }
+
+    fn across_chain_config(&self, origin_chain_id: u64) -> Option<ResolvedMockAcrossChainConfig> {
+        self.across_chains
+            .get(&origin_chain_id)
+            .map(|config| ResolvedMockAcrossChainConfig {
+                spoke_pool_address: config.spoke_pool_address.clone(),
+                evm_rpc_url: Some(config.evm_rpc_url.clone()),
+            })
+            .or_else(|| {
+                Some(ResolvedMockAcrossChainConfig {
+                    spoke_pool_address: self.across_spoke_pool_address.clone()?,
+                    evm_rpc_url: self.across_evm_rpc_url.clone(),
+                })
+            })
+    }
+
+    fn across_chain_rpc_url(&self, chain_id: u64) -> Option<String> {
+        self.across_chains
+            .get(&chain_id)
+            .map(|config| config.evm_rpc_url.clone())
+            .or_else(|| {
+                if self.across_chains.is_empty() {
+                    self.across_evm_rpc_url.clone()
+                } else {
+                    None
+                }
+            })
+    }
 }
 
 impl Drop for MockIntegratorServer {
@@ -825,23 +1237,29 @@ impl Drop for MockIntegratorServer {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
-        if let Some(shutdown) = self.across_indexer_shutdown.take() {
+        for shutdown in self.across_indexer_shutdowns.drain(..) {
             let _ = shutdown.send(());
         }
         if let Some(shutdown) = self.hyperliquid_indexer_shutdown.take() {
             let _ = shutdown.send(());
         }
-        if let Some(shutdown) = self.cctp_indexer_shutdown.take() {
+        for shutdown in self.unit_deposit_indexer_shutdowns.drain(..) {
+            let _ = shutdown.send(());
+        }
+        for shutdown in self.cctp_indexer_shutdowns.drain(..) {
             let _ = shutdown.send(());
         }
         self.handle.abort();
-        if let Some(handle) = self.across_indexer_handle.take() {
+        for handle in self.across_indexer_handles.drain(..) {
             handle.abort();
         }
         if let Some(handle) = self.hyperliquid_indexer_handle.take() {
             handle.abort();
         }
-        if let Some(handle) = self.cctp_indexer_handle.take() {
+        for handle in self.unit_deposit_indexer_handles.drain(..) {
+            handle.abort();
+        }
+        for handle in self.cctp_indexer_handles.drain(..) {
             handle.abort();
         }
     }
@@ -960,7 +1378,53 @@ struct MockVeloraPricesQuery {
     partner: Option<String>,
 }
 
-async fn mock_velora_prices(Query(query): Query<MockVeloraPricesQuery>) -> impl IntoResponse {
+async fn mock_chainalysis_address_risk(
+    State(state): State<Arc<MockIntegratorState>>,
+    Path(address): Path<String>,
+) -> axum::response::Response {
+    let normalized = normalize_mock_screening_address(&address);
+    match state.address_screening_rules.get(&normalized) {
+        Some(MockAddressScreeningRule::HttpError { status, body }) => {
+            let status = StatusCode::from_u16(*status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            (status, body.clone()).into_response()
+        }
+        Some(MockAddressScreeningRule::Risk { risk, reason }) => Json(json!({
+            "address": address,
+            "risk": risk.chainalysis_label(),
+            "cluster": null,
+            "riskReason": reason,
+            "addressType": "PRIVATE_WALLET",
+            "addressIdentifications": [],
+            "exposures": [],
+            "triggers": [],
+            "status": "COMPLETE",
+            "poolMetadata": null,
+        }))
+        .into_response(),
+        None => Json(json!({
+            "address": address,
+            "risk": MockAddressRiskLevel::Low.chainalysis_label(),
+            "cluster": null,
+            "riskReason": null,
+            "addressType": "PRIVATE_WALLET",
+            "addressIdentifications": [],
+            "exposures": [],
+            "triggers": [],
+            "status": "COMPLETE",
+            "poolMetadata": null,
+        }))
+        .into_response(),
+    }
+}
+
+fn normalize_mock_screening_address(address: &str) -> String {
+    address.trim().to_ascii_lowercase()
+}
+
+async fn mock_velora_prices(
+    State(state): State<Arc<MockIntegratorState>>,
+    Query(query): Query<MockVeloraPricesQuery>,
+) -> impl IntoResponse {
     let amount = match parse_amount("amount", &query.amount) {
         Ok(amount) => amount,
         Err(error) => {
@@ -974,19 +1438,31 @@ async fn mock_velora_prices(Query(query): Query<MockVeloraPricesQuery>) -> impl 
                 .into_response();
         }
     };
-    let (src_amount, dest_amount) = match query.side.as_str() {
-        "SELL" => (amount, amount),
-        "BUY" => (amount, amount),
-        other => {
+    let (src_amount, dest_amount) = match mock_velora_quote_amounts(&state, &query, amount).await {
+        Ok(amounts) => amounts,
+        Err(error) => {
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 Json(json!({
-                    "error": "unsupported_side",
-                    "message": format!("unsupported side: {other}"),
+                    "error": "unsupported_pair",
+                    "message": error,
                 })),
             )
                 .into_response();
         }
+    };
+    let Some(swap_contract) = state.velora_swap_contract_addresses.get(&query.network) else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": "unsupported_network",
+                "message": format!(
+                    "missing mock Velora swap contract for network {}",
+                    query.network
+                ),
+            })),
+        )
+            .into_response();
     };
 
     Json(json!({
@@ -998,55 +1474,317 @@ async fn mock_velora_prices(Query(query): Query<MockVeloraPricesQuery>) -> impl 
             "destDecimals": query.dest_decimals,
             "srcAmount": src_amount.to_string(),
             "destAmount": dest_amount.to_string(),
-            "tokenTransferProxy": "0x0000000000000000000000000000000000000001",
-            "contractAddress": "0x0000000000000000000000000000000000000002",
+            "tokenTransferProxy": swap_contract,
+            "contractAddress": swap_contract,
             "bestRoute": [],
         }
     }))
     .into_response()
 }
 
+async fn mock_velora_quote_amounts(
+    state: &MockIntegratorState,
+    query: &MockVeloraPricesQuery,
+    amount: u128,
+) -> Result<(u128, u128), String> {
+    let src_symbol = mock_velora_token_symbol(&query.src_token);
+    let dest_symbol = mock_velora_token_symbol(&query.dest_token);
+    let prices = state.velora_usd_prices.lock().await;
+    let src_price = *prices
+        .get(src_symbol.as_str())
+        .ok_or_else(|| format!("missing USD price for {src_symbol}"))?;
+    let dest_price = *prices
+        .get(dest_symbol.as_str())
+        .ok_or_else(|| format!("missing USD price for {dest_symbol}"))?;
+
+    match query.side.as_str() {
+        "SELL" => Ok((
+            amount,
+            convert_raw_amount_floor(
+                amount,
+                src_price,
+                query.src_decimals,
+                dest_price,
+                query.dest_decimals,
+            )?,
+        )),
+        "BUY" => Ok((
+            convert_raw_amount_ceil(
+                amount,
+                dest_price,
+                query.dest_decimals,
+                src_price,
+                query.src_decimals,
+            )?,
+            amount,
+        )),
+        other => Err(format!("unsupported side: {other}")),
+    }
+}
+
+fn default_velora_usd_prices() -> BTreeMap<String, u128> {
+    BTreeMap::from([
+        ("ETH".to_string(), DEFAULT_ETH_USD_MICRO),
+        ("BTC".to_string(), DEFAULT_BTC_USD_MICRO),
+        ("MOCK".to_string(), DEFAULT_USD_STABLE_USD_MICRO),
+        ("USDC".to_string(), DEFAULT_USD_STABLE_USD_MICRO),
+        ("USDT".to_string(), DEFAULT_USD_STABLE_USD_MICRO),
+    ])
+}
+
+fn mock_velora_token_symbol(token: &str) -> String {
+    let token = token.to_ascii_lowercase();
+    match token.as_str() {
+        VELORA_NATIVE_TOKEN => "ETH",
+        // WETH
+        "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
+        | "0x4200000000000000000000000000000000000006"
+        | "0x82af49447d8a07e3bd95bd0d56f35241523fbab1" => "ETH",
+        // USDC
+        "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+        | "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+        | "0xaf88d065e77c8cc2239327c5edb3a432268e5831" => "USDC",
+        // USDT
+        "0xdac17f958d2ee523a2206206994597c13d831ec7"
+        | "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2"
+        | "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9" => "USDT",
+        // WBTC / cbBTC
+        "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599"
+        | "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf" => "BTC",
+        _ => "MOCK",
+    }
+    .to_string()
+}
+
+fn convert_raw_amount_floor(
+    amount: u128,
+    src_price_usd_micro: u128,
+    src_decimals: u8,
+    dest_price_usd_micro: u128,
+    dest_decimals: u8,
+) -> Result<u128, String> {
+    let numerator = checked_mul3(
+        amount,
+        src_price_usd_micro,
+        pow10_u128(dest_decimals)?,
+        "velora quote numerator overflow",
+    )?;
+    let denominator = checked_mul(
+        dest_price_usd_micro,
+        pow10_u128(src_decimals)?,
+        "velora quote denominator overflow",
+    )?;
+    if denominator == 0 {
+        return Err("velora quote denominator is zero".to_string());
+    }
+    Ok(numerator / denominator)
+}
+
+fn convert_raw_amount_ceil(
+    amount: u128,
+    src_price_usd_micro: u128,
+    src_decimals: u8,
+    dest_price_usd_micro: u128,
+    dest_decimals: u8,
+) -> Result<u128, String> {
+    let numerator = checked_mul3(
+        amount,
+        src_price_usd_micro,
+        pow10_u128(dest_decimals)?,
+        "velora quote numerator overflow",
+    )?;
+    let denominator = checked_mul(
+        dest_price_usd_micro,
+        pow10_u128(src_decimals)?,
+        "velora quote denominator overflow",
+    )?;
+    if denominator == 0 {
+        return Err("velora quote denominator is zero".to_string());
+    }
+    Ok(numerator / denominator + u128::from(numerator % denominator != 0))
+}
+
+fn checked_mul(a: u128, b: u128, message: &str) -> Result<u128, String> {
+    a.checked_mul(b).ok_or_else(|| message.to_string())
+}
+
+fn checked_mul3(a: u128, b: u128, c: u128, message: &str) -> Result<u128, String> {
+    checked_mul(checked_mul(a, b, message)?, c, message)
+}
+
+fn pow10_u128(decimals: u8) -> Result<u128, String> {
+    10u128
+        .checked_pow(u32::from(decimals))
+        .ok_or_else(|| format!("unsupported decimal scale {decimals}"))
+}
+
 async fn mock_velora_transaction(
+    State(state): State<Arc<MockIntegratorState>>,
     Path(network): Path<u64>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    let dest_token = body
-        .get("destToken")
-        .and_then(Value::as_str)
-        .unwrap_or("0x0000000000000000000000000000000000000002");
-    let receiver = body
+    let src_token = match mock_velora_required_string(&body, "srcToken") {
+        Ok(value) => value,
+        Err(error) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "error": "invalid_request",
+                    "message": error,
+                })),
+            )
+                .into_response();
+        }
+    };
+    let dest_token = match mock_velora_required_string(&body, "destToken") {
+        Ok(value) => value,
+        Err(error) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "error": "invalid_request",
+                    "message": error,
+                })),
+            )
+                .into_response();
+        }
+    };
+    let receiver = match body
         .get("receiver")
         .and_then(Value::as_str)
         .or_else(|| body.get("userAddress").and_then(Value::as_str))
-        .unwrap_or("0x0000000000000000000000000000000000000000");
-    let dest_amount = body
-        .get("priceRoute")
-        .and_then(|value| value.get("destAmount"))
-        .and_then(|value| mock_velora_u128(value).ok())
-        .unwrap_or_default();
-    let (to, data) = match (Address::from_str(dest_token), Address::from_str(receiver)) {
-        (Ok(dest_token), Ok(receiver)) if dest_token != Address::ZERO => {
-            let call = IMockMintableERC20::mintCall {
-                recipient: receiver,
-                amount: U256::from(dest_amount),
-            };
-            (
-                format!("{dest_token:#x}"),
-                format!("0x{}", hex::encode(call.abi_encode())),
+    {
+        Some(value) => value,
+        None => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "error": "invalid_request",
+                    "message": "missing receiver or userAddress",
+                })),
             )
+                .into_response();
         }
-        _ => (
-            "0x0000000000000000000000000000000000000002".to_string(),
-            "0x".to_string(),
-        ),
+    };
+    let src_amount = match mock_velora_price_route_amount(&body, "srcAmount") {
+        Ok(amount) => amount,
+        Err(error) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "error": "invalid_price_route",
+                    "message": error,
+                })),
+            )
+                .into_response();
+        }
+    };
+    let dest_amount = match mock_velora_price_route_amount(&body, "destAmount") {
+        Ok(amount) => amount,
+        Err(error) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "error": "invalid_price_route",
+                    "message": error,
+                })),
+            )
+                .into_response();
+        }
+    };
+    let Some(swap_contract) = state.velora_swap_contract_addresses.get(&network) else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": "unsupported_network",
+                "message": format!("missing mock Velora swap contract for network {network}"),
+            })),
+        )
+            .into_response();
+    };
+    let src_token = match mock_velora_evm_token_address(src_token) {
+        Ok(address) => address,
+        Err(error) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "error": "invalid_src_token",
+                    "message": error.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+    let dest_token = match mock_velora_evm_token_address(dest_token) {
+        Ok(address) => address,
+        Err(error) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "error": "invalid_dest_token",
+                    "message": error.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+    let receiver = match Address::from_str(receiver) {
+        Ok(address) => address,
+        Err(error) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "error": "invalid_receiver",
+                    "message": error.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+    let value = if src_token == Address::ZERO {
+        src_amount.to_string()
+    } else {
+        "0".to_string()
+    };
+    let call = MockVeloraSwap::swapCall {
+        srcToken: src_token,
+        destToken: dest_token,
+        recipient: receiver,
+        srcAmount: U256::from(src_amount),
+        destAmount: U256::from(dest_amount),
     };
     Json(json!({
         "network": network,
-        "to": to,
-        "data": data,
-        "value": "0",
+        "to": swap_contract,
+        "data": format!("0x{}", hex::encode(call.abi_encode())),
+        "value": value,
         "request": body,
     }))
+    .into_response()
+}
+
+fn mock_velora_required_string<'a>(body: &'a Value, name: &str) -> Result<&'a str, String> {
+    body.get(name)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("missing {name}"))
+}
+
+fn mock_velora_evm_token_address(token: &str) -> Result<Address, <Address as FromStr>::Err> {
+    if token.eq_ignore_ascii_case(VELORA_NATIVE_TOKEN) {
+        Ok(Address::ZERO)
+    } else {
+        Address::from_str(token)
+    }
+}
+
+fn mock_velora_price_route_amount(body: &Value, name: &str) -> Result<u128, String> {
+    let price_route = body
+        .get("priceRoute")
+        .ok_or_else(|| "missing priceRoute".to_string())?;
+    let value = price_route
+        .get(name)
+        .ok_or_else(|| format!("missing priceRoute.{name}"))?;
+    mock_velora_u128(value)
 }
 
 fn mock_velora_u128(value: &Value) -> Result<u128, String> {
@@ -1065,7 +1803,8 @@ async fn mock_across_real_swap_approval(
     headers: HeaderMap,
     Query(query): Query<MockAcrossRealSwapApprovalQuery>,
 ) -> impl IntoResponse {
-    if let Err(response) = validate_across_request(&state, &headers, query.integrator_id.as_deref())
+    if let Err(response) =
+        validate_across_request(&state, &headers, query.integrator_id.as_deref(), true)
     {
         return *response;
     }
@@ -1102,23 +1841,29 @@ async fn mock_across_real_swap_approval(
             );
         }
     }
-    let Some(spoke_pool_address_str) = state.across_spoke_pool_address.as_ref() else {
+    let Some(origin_config) = state.across_chain_config(query.origin_chain_id) else {
         return mock_across_error_response(
             StatusCode::FAILED_DEPENDENCY,
             "configuration_error",
             "missing_spoke_pool",
-            "mock Across: across_spoke_pool_address is not configured",
+            format!(
+                "mock Across: origin chain {} is not configured",
+                query.origin_chain_id
+            ),
             None,
         );
     };
-    let spoke_pool_address = match Address::from_str(spoke_pool_address_str) {
+    let spoke_pool_address = match Address::from_str(&origin_config.spoke_pool_address) {
         Ok(addr) => addr,
         Err(err) => {
             return mock_across_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "configuration_error",
                 "invalid_spoke_pool",
-                format!("mock Across: invalid spoke_pool_address: {err}"),
+                format!(
+                    "mock Across: invalid spoke_pool_address for origin chain {}: {err}",
+                    query.origin_chain_id
+                ),
                 None,
             );
         }
@@ -1172,7 +1917,18 @@ async fn mock_across_real_swap_approval(
         }
     };
 
-    let quote_amounts = mock_across_quote_amounts(&state, &query, amount);
+    let quote_amounts = match mock_across_quote_amounts(&state, &query, amount) {
+        Ok(amounts) => amounts,
+        Err(error) => {
+            return mock_across_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "validation_error",
+                "unsupported_trade_type",
+                error,
+                Some("tradeType"),
+            );
+        }
+    };
     let input_amount_u256 = U256::from(quote_amounts.input_amount);
     let output_amount_u256 = U256::from(quote_amounts.output_amount);
     let now_secs = Utc::now().timestamp();
@@ -1195,16 +1951,58 @@ async fn mock_across_real_swap_approval(
     };
     let deposit_calldata = format!("0x{}", hex::encode(deposit_call.abi_encode()));
 
-    let allowance = if input_token_addr == Address::ZERO {
-        None
-    } else {
-        mock_across_allowance(&state, input_token_addr, depositor_addr, spoke_pool_address).await
+    let allowance = match (
+        input_token_addr == Address::ZERO,
+        origin_config.evm_rpc_url.as_deref(),
+    ) {
+        (true, _) | (false, None) => None,
+        (false, Some(rpc_url)) => {
+            match mock_across_allowance(
+                rpc_url,
+                input_token_addr,
+                depositor_addr,
+                spoke_pool_address,
+                query.origin_chain_id,
+            )
+            .await
+            {
+                Ok(allowance) => Some(allowance),
+                Err(error) => {
+                    return mock_across_error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "bad_gateway",
+                        "mock_across_rpc_error",
+                        error,
+                        Some("inputToken"),
+                    );
+                }
+            }
+        }
     };
     let needs_approval =
         input_token_addr != Address::ZERO && allowance.unwrap_or_default() < input_amount_u256;
-    let balance = mock_across_balance(&state, input_token_addr, depositor_addr)
+    let balance = match origin_config.evm_rpc_url.as_deref() {
+        Some(rpc_url) => match mock_across_balance(
+            rpc_url,
+            input_token_addr,
+            depositor_addr,
+            query.origin_chain_id,
+        )
         .await
-        .unwrap_or(input_amount_u256);
+        {
+            Ok(balance) => balance,
+            Err(error) => {
+                return mock_across_error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "bad_gateway",
+                    "mock_across_rpc_error",
+                    error,
+                    Some("inputToken"),
+                );
+            }
+        },
+        None => input_amount_u256,
+    };
 
     let (approval_txns, swap_value) = if input_token_addr == Address::ZERO {
         (None, Some(input_amount_u256.to_string()))
@@ -1248,9 +2046,21 @@ async fn mock_across_real_swap_approval(
     let output_token_meta =
         mock_across_token_metadata(output_token_addr, query.destination_chain_id);
     let refund_token_meta = input_token_meta.clone();
-    let fee_amount = quote_amounts
+    let fee_amount = match quote_amounts
         .input_amount
-        .saturating_sub(quote_amounts.expected_output_amount);
+        .checked_sub(quote_amounts.expected_output_amount)
+    {
+        Some(fee_amount) => fee_amount,
+        None => {
+            return mock_across_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "validation_error",
+                "invalid_quote_amounts",
+                "mock Across quote output exceeds input".to_string(),
+                Some("amount"),
+            );
+        }
+    };
     let response = MockAcrossRealSwapApprovalResponse {
         approval_txns,
         swap_tx,
@@ -1292,59 +2102,60 @@ async fn mock_across_real_swap_approval(
 }
 
 async fn mock_across_allowance(
-    state: &MockIntegratorState,
+    rpc_url: &str,
     token: Address,
     owner: Address,
     spender: Address,
-) -> Option<U256> {
-    let rpc_url = state.across_evm_rpc_url.as_deref()?;
+    origin_chain_id: u64,
+) -> Result<U256, String> {
     let provider = match ProviderBuilder::new().connect(rpc_url).await {
         Ok(provider) => provider,
         Err(err) => {
-            tracing::warn!(%err, "mock across swap approval: failed to connect RPC for allowance check");
-            return None;
+            return Err(format!(
+                "failed to connect origin chain {origin_chain_id} RPC for allowance check at {rpc_url}: {err}"
+            ));
         }
     };
     let token = IERC20::new(token, provider);
     match token.allowance(owner, spender).call().await {
-        Ok(allowance) => Some(allowance),
-        Err(err) => {
-            tracing::warn!(%err, "mock across swap approval: allowance check failed");
-            None
-        }
+        Ok(allowance) => Ok(allowance),
+        Err(err) => Err(format!(
+            "allowance check failed on origin chain {origin_chain_id} RPC {rpc_url} for token {:#x}, owner {owner:#x}, spender {spender:#x}: {err}",
+            token.address()
+        )),
     }
 }
 
 async fn mock_across_balance(
-    state: &MockIntegratorState,
+    rpc_url: &str,
     token: Address,
     owner: Address,
-) -> Option<U256> {
-    let rpc_url = state.across_evm_rpc_url.as_deref()?;
+    origin_chain_id: u64,
+) -> Result<U256, String> {
     let provider = match ProviderBuilder::new().connect(rpc_url).await {
         Ok(provider) => provider,
         Err(err) => {
-            tracing::warn!(%err, "mock across swap approval: failed to connect RPC for balance check");
-            return None;
+            return Err(format!(
+                "failed to connect origin chain {origin_chain_id} RPC for balance check at {rpc_url}: {err}"
+            ));
         }
     };
 
     if token == Address::ZERO {
         match provider.get_balance(owner).await {
-            Ok(balance) => Some(balance),
-            Err(err) => {
-                tracing::warn!(%err, "mock across swap approval: native balance check failed");
-                None
-            }
+            Ok(balance) => Ok(balance),
+            Err(err) => Err(format!(
+                "native balance check failed on origin chain {origin_chain_id} RPC {rpc_url} for owner {owner:#x}: {err}"
+            )),
         }
     } else {
         let token = IERC20::new(token, provider);
         match token.balanceOf(owner).call().await {
-            Ok(balance) => Some(balance),
-            Err(err) => {
-                tracing::warn!(%err, "mock across swap approval: token balance check failed");
-                None
-            }
+            Ok(balance) => Ok(balance),
+            Err(err) => Err(format!(
+                "token balance check failed on origin chain {origin_chain_id} RPC {rpc_url} for token {:#x}, owner {owner:#x}: {err}",
+                token.address()
+            )),
         }
     }
 }
@@ -1396,6 +2207,7 @@ fn mock_across_steps(
     input_token: &Value,
     output_token: &Value,
 ) -> Value {
+    let fee_components = mock_across_fee_components(fee_amount);
     let mut steps = serde_json::Map::new();
     steps.insert(
         "bridge".to_string(),
@@ -1411,21 +2223,18 @@ fn mock_across_steps(
                 "token": input_token,
                 "details": {
                     "destinationGas": {
-                        "amount": fee_amount.saturating_sub(140).to_string(),
-                        "pct": mock_across_fee_pct_string(input_amount, fee_amount.saturating_sub(140)),
+                        "amount": fee_components.destination_gas.to_string(),
+                        "pct": mock_across_fee_pct_string(input_amount, fee_components.destination_gas),
                         "token": input_token,
                     },
                     "lp": {
-                        "amount": fee_amount.min(40).to_string(),
-                        "pct": mock_across_fee_pct_string(input_amount, fee_amount.min(40)),
+                        "amount": fee_components.lp.to_string(),
+                        "pct": mock_across_fee_pct_string(input_amount, fee_components.lp),
                         "token": input_token,
                     },
                     "relayerCapital": {
-                        "amount": fee_amount.saturating_sub(fee_amount.saturating_sub(100)).to_string(),
-                        "pct": mock_across_fee_pct_string(
-                            input_amount,
-                            fee_amount.saturating_sub(fee_amount.saturating_sub(100)),
-                        ),
+                        "amount": fee_components.relayer_capital.to_string(),
+                        "pct": mock_across_fee_pct_string(input_amount, fee_components.relayer_capital),
                         "token": input_token,
                     },
                     "type": "across",
@@ -1445,9 +2254,7 @@ fn mock_across_fee_breakdown(
 ) -> Value {
     let fee_pct = mock_across_fee_pct_string(input_amount, fee_amount);
     let origin_gas_token = mock_across_token_metadata(Address::ZERO, origin_chain_id);
-    let destination_gas_amount = fee_amount.saturating_sub(140);
-    let lp_amount = fee_amount.min(40);
-    let relayer_capital_amount = fee_amount.saturating_sub(destination_gas_amount + lp_amount);
+    let fee_components = mock_across_fee_components(fee_amount);
     json!({
         "originGas": {
             "amount": "0",
@@ -1473,21 +2280,21 @@ fn mock_across_fee_breakdown(
                     "token": input_token,
                     "details": {
                         "destinationGas": {
-                            "amount": destination_gas_amount.to_string(),
+                            "amount": fee_components.destination_gas.to_string(),
                             "amountUsd": "0.0",
-                            "pct": mock_across_fee_pct_string(input_amount, destination_gas_amount),
+                            "pct": mock_across_fee_pct_string(input_amount, fee_components.destination_gas),
                             "token": input_token,
                         },
                         "lp": {
-                            "amount": lp_amount.to_string(),
+                            "amount": fee_components.lp.to_string(),
                             "amountUsd": "0.0",
-                            "pct": mock_across_fee_pct_string(input_amount, lp_amount),
+                            "pct": mock_across_fee_pct_string(input_amount, fee_components.lp),
                             "token": input_token,
                         },
                         "relayerCapital": {
-                            "amount": relayer_capital_amount.to_string(),
+                            "amount": fee_components.relayer_capital.to_string(),
                             "amountUsd": "0.0",
-                            "pct": mock_across_fee_pct_string(input_amount, relayer_capital_amount),
+                            "pct": mock_across_fee_pct_string(input_amount, fee_components.relayer_capital),
                             "token": input_token,
                         },
                         "type": "across",
@@ -1521,21 +2328,21 @@ fn mock_across_fee_breakdown(
                     "token": input_token,
                     "details": {
                         "destinationGas": {
-                            "amount": destination_gas_amount.to_string(),
+                            "amount": fee_components.destination_gas.to_string(),
                             "amountUsd": "0.0",
-                            "pct": mock_across_fee_pct_string(input_amount, destination_gas_amount),
+                            "pct": mock_across_fee_pct_string(input_amount, fee_components.destination_gas),
                             "token": input_token,
                         },
                         "lp": {
-                            "amount": lp_amount.to_string(),
+                            "amount": fee_components.lp.to_string(),
                             "amountUsd": "0.0",
-                            "pct": mock_across_fee_pct_string(input_amount, lp_amount),
+                            "pct": mock_across_fee_pct_string(input_amount, fee_components.lp),
                             "token": input_token,
                         },
                         "relayerCapital": {
-                            "amount": relayer_capital_amount.to_string(),
+                            "amount": fee_components.relayer_capital.to_string(),
                             "amountUsd": "0.0",
-                            "pct": mock_across_fee_pct_string(input_amount, relayer_capital_amount),
+                            "pct": mock_across_fee_pct_string(input_amount, fee_components.relayer_capital),
                             "token": input_token,
                         },
                         "type": "across",
@@ -1553,11 +2360,32 @@ fn mock_across_fee_breakdown(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MockAcrossFeeComponents {
+    destination_gas: u128,
+    lp: u128,
+    relayer_capital: u128,
+}
+
+fn mock_across_fee_components(fee_amount: u128) -> MockAcrossFeeComponents {
+    let lp = fee_amount.min(40);
+    let remaining_after_lp = fee_amount - lp;
+    let relayer_capital = remaining_after_lp.min(100);
+    let destination_gas = remaining_after_lp - relayer_capital;
+    MockAcrossFeeComponents {
+        destination_gas,
+        lp,
+        relayer_capital,
+    }
+}
+
 fn mock_across_fee_pct_string(input_amount: u128, fee_amount: u128) -> String {
     if input_amount == 0 {
         return "0".to_string();
     }
-    ((fee_amount.saturating_mul(1_000_000_000_000_000_000_u128)) / input_amount).to_string()
+    ((U256::from(fee_amount) * U256::from(1_000_000_000_000_000_000_u128))
+        / U256::from(input_amount))
+    .to_string()
 }
 
 fn mock_across_token_metadata(address: Address, chain_id: u64) -> Value {
@@ -1569,7 +2397,8 @@ fn mock_across_token_metadata(address: Address, chain_id: u64) -> Value {
             "symbol": "ETH",
         }),
         "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
-        | "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48" => json!({
+        | "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+        | "0xaf88d065e77c8cc2239327c5edb3a432268e5831" => json!({
             "address": format!("{address:#x}"),
             "chainId": chain_id,
             "decimals": 6,
@@ -1599,11 +2428,11 @@ fn mock_across_quote_amounts(
     state: &MockIntegratorState,
     query: &MockAcrossRealSwapApprovalQuery,
     amount: u128,
-) -> MockAcrossQuoteAmounts {
+) -> Result<MockAcrossQuoteAmounts, String> {
     let fee_bps = mock_across_quote_fee_bps(state, query);
-    match query.trade_type.as_str() {
+    let amounts = match query.trade_type.as_str() {
         "exactInput" => {
-            let output = apply_mock_across_discount(amount, fee_bps);
+            let output = apply_mock_across_discount(amount, fee_bps)?;
             MockAcrossQuoteAmounts {
                 input_amount: amount,
                 max_input_amount: amount,
@@ -1613,7 +2442,7 @@ fn mock_across_quote_amounts(
             }
         }
         "minOutput" | "exactOutput" => {
-            let input = gross_up_mock_across_input(amount, fee_bps);
+            let input = gross_up_mock_across_input(amount, fee_bps)?;
             MockAcrossQuoteAmounts {
                 input_amount: input,
                 max_input_amount: input,
@@ -1622,8 +2451,9 @@ fn mock_across_quote_amounts(
                 output_amount: amount,
             }
         }
-        _ => unreachable!("trade type was already validated"),
-    }
+        other => return Err(format!("unsupported tradeType: {other}")),
+    };
+    Ok(amounts)
 }
 
 fn mock_across_quote_fee_bps(
@@ -1646,14 +2476,25 @@ fn mock_across_quote_fee_bps(
     base.saturating_add(jitter).min(9_999)
 }
 
-fn apply_mock_across_discount(amount: u128, fee_bps: u16) -> u128 {
-    let keep_bps = 10_000_u128.saturating_sub(u128::from(fee_bps));
-    amount.saturating_mul(keep_bps) / 10_000_u128
+fn apply_mock_across_discount(amount: u128, fee_bps: u16) -> Result<u128, String> {
+    let keep_bps = 10_000_u128
+        .checked_sub(u128::from(fee_bps))
+        .ok_or_else(|| "mock Across fee bps exceed 100%".to_string())?;
+    amount
+        .checked_mul(keep_bps)
+        .map(|value| value / 10_000_u128)
+        .ok_or_else(|| "mock Across exact-input quote amount overflow".to_string())
 }
 
-fn gross_up_mock_across_input(amount: u128, fee_bps: u16) -> u128 {
-    let keep_bps = 10_000_u128.saturating_sub(u128::from(fee_bps)).max(1);
-    amount.saturating_mul(10_000_u128).div_ceil(keep_bps)
+fn gross_up_mock_across_input(amount: u128, fee_bps: u16) -> Result<u128, String> {
+    let keep_bps = 10_000_u128
+        .checked_sub(u128::from(fee_bps))
+        .ok_or_else(|| "mock Across fee bps exceed 100%".to_string())?
+        .max(1);
+    amount
+        .checked_mul(10_000_u128)
+        .map(|value| value.div_ceil(keep_bps))
+        .ok_or_else(|| "mock Across exact-output quote amount overflow".to_string())
 }
 
 fn mock_across_should_refund(
@@ -1667,6 +2508,11 @@ fn mock_across_should_refund(
         ),
         9_999,
     ) < state.across_refund_probability_bps
+}
+
+fn mock_across_destination_chain_id(destination_chain_id: U256) -> Result<u64, String> {
+    u64::try_from(destination_chain_id)
+        .map_err(|err| format!("invalid destination chain id: {err}"))
 }
 
 fn deterministic_bps(seed: &str, max_bps: u16) -> u16 {
@@ -1724,26 +2570,31 @@ async fn mock_across_deposit_status(
     headers: HeaderMap,
     Query(query): Query<MockAcrossDepositStatusQuery>,
 ) -> impl IntoResponse {
-    if let Err(response) = validate_across_request(&state, &headers, None) {
+    if let Err(response) = validate_across_request(&state, &headers, None, false) {
         return *response;
     }
-    let deposits = state.across_deposits.lock().await;
-    let record = if let (Some(origin_chain_id), Some(deposit_id)) =
-        (query.origin_chain_id, query.deposit_id.as_deref())
-    {
-        deposits.get(&(origin_chain_id, deposit_id.to_string()))
-    } else if let Some(deposit_txn_ref) = query.deposit_txn_ref.as_deref() {
-        deposits
-            .values()
-            .find(|record| record.deposit_tx_hash.eq_ignore_ascii_case(deposit_txn_ref))
-    } else {
-        return mock_across_error_response(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "validation_error",
-            "missing_deposit_lookup",
-            "deposit/status requires depositTxnRef or originChainId + depositId",
-            None,
-        );
+    let record = {
+        let deposits = state.across_deposits.lock().await;
+        if let (Some(origin_chain_id), Some(deposit_id)) =
+            (query.origin_chain_id, query.deposit_id.as_deref())
+        {
+            deposits
+                .get(&(origin_chain_id, deposit_id.to_string()))
+                .cloned()
+        } else if let Some(deposit_txn_ref) = query.deposit_txn_ref.as_deref() {
+            deposits
+                .values()
+                .find(|record| record.deposit_tx_hash.eq_ignore_ascii_case(deposit_txn_ref))
+                .cloned()
+        } else {
+            return mock_across_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "validation_error",
+                "missing_deposit_lookup",
+                "deposit/status requires depositTxnRef or originChainId + depositId",
+                None,
+            );
+        }
     };
     let Some(record) = record else {
         if query.deposit_txn_ref.is_some() {
@@ -1769,6 +2620,18 @@ async fn mock_across_deposit_status(
         })
         .into_response();
     };
+    let destination_chain_id = match mock_across_destination_chain_id(record.destination_chain_id) {
+        Ok(destination_chain_id) => destination_chain_id,
+        Err(err) => {
+            return mock_across_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid_deposit_record",
+                "invalid_destination_chain_id",
+                err,
+                None,
+            );
+        }
+    };
     if Utc::now()
         .signed_duration_since(record.indexed_at)
         .to_std()
@@ -1778,9 +2641,7 @@ async fn mock_across_deposit_status(
         return Json(MockAcrossDepositStatusResponse {
             status: "pending".to_string(),
             origin_chain_id: Some(record.origin_chain_id),
-            destination_chain_id: Some(
-                u64::try_from(record.destination_chain_id).unwrap_or_default(),
-            ),
+            destination_chain_id: Some(destination_chain_id),
             deposit_id: Some(record.deposit_id.to_string()),
             deposit_txn_ref: Some(record.deposit_tx_hash.clone()),
             fill_txn_ref: None,
@@ -1791,7 +2652,7 @@ async fn mock_across_deposit_status(
         .into_response();
     }
 
-    let should_refund = mock_across_should_refund(&state, record);
+    let should_refund = mock_across_should_refund(&state, &record);
     let (status, fill_txn_ref, deposit_refund_txn_ref) = if should_refund {
         (
             "refunded".to_string(),
@@ -1799,16 +2660,25 @@ async fn mock_across_deposit_status(
             Some(format!("0x{}", "de".repeat(32))),
         )
     } else {
-        (
-            "filled".to_string(),
-            Some(format!("0x{}", "fa".repeat(32))),
-            None,
-        )
+        let key = (record.origin_chain_id, record.deposit_id.to_string());
+        match ensure_mock_across_destination_credit(&state, key, &record).await {
+            Ok(fill_txn_ref) => ("filled".to_string(), Some(fill_txn_ref), None),
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    origin_chain_id = record.origin_chain_id,
+                    destination_chain_id = %record.destination_chain_id,
+                    deposit_id = %record.deposit_id,
+                    "mock Across destination credit failed; keeping deposit pending"
+                );
+                ("pending".to_string(), None, None)
+            }
+        }
     };
     Json(MockAcrossDepositStatusResponse {
         status,
         origin_chain_id: Some(record.origin_chain_id),
-        destination_chain_id: Some(u64::try_from(record.destination_chain_id).unwrap_or_default()),
+        destination_chain_id: Some(destination_chain_id),
         deposit_id: Some(record.deposit_id.to_string()),
         deposit_txn_ref: Some(record.deposit_tx_hash.clone()),
         fill_txn_ref,
@@ -1817,6 +2687,141 @@ async fn mock_across_deposit_status(
         pagination: Some(mock_across_pagination()),
     })
     .into_response()
+}
+
+async fn ensure_mock_across_destination_credit(
+    state: &Arc<MockIntegratorState>,
+    key: AcrossDepositKey,
+    record: &MockAcrossDepositRecord,
+) -> Result<String, String> {
+    const PENDING_CREDIT: &str = "__pending__";
+
+    {
+        let mut credits = state.across_destination_credit_tx_hashes.lock().await;
+        match credits.get(&key).map(String::as_str) {
+            Some(PENDING_CREDIT) => {
+                return Err("destination credit is still being applied".to_string());
+            }
+            Some(tx_hash) => return Ok(tx_hash.to_string()),
+            None => {
+                credits.insert(key.clone(), PENDING_CREDIT.to_string());
+            }
+        }
+    }
+
+    let credit_result = mock_across_credit_destination(state, record).await;
+    let mut credits = state.across_destination_credit_tx_hashes.lock().await;
+    match credit_result {
+        Ok(tx_hash) => {
+            credits.insert(key, tx_hash.clone());
+            Ok(tx_hash)
+        }
+        Err(err) => {
+            credits.remove(&key);
+            Err(err)
+        }
+    }
+}
+
+async fn mock_across_credit_destination(
+    state: &MockIntegratorState,
+    record: &MockAcrossDepositRecord,
+) -> Result<String, String> {
+    if record.output_amount.is_zero() {
+        return Ok(mock_across_pending_fill_tx_ref(record));
+    }
+    let destination_chain_id = mock_across_destination_chain_id(record.destination_chain_id)?;
+    let Some(rpc_url) = state.across_chain_rpc_url(destination_chain_id) else {
+        return Err(format!(
+            "mock Across destination chain {destination_chain_id} has no RPC configured"
+        ));
+    };
+    let recipient = bytes32_to_evm_address(record.recipient);
+    let output_token = bytes32_to_evm_address(record.output_token);
+    if output_token == Address::ZERO {
+        mock_credit_native_on_anvil(&rpc_url, recipient, record.output_amount).await?;
+        return Ok(mock_across_pending_fill_tx_ref(record));
+    }
+    mock_mint_erc20_on_anvil(&rpc_url, output_token, recipient, record.output_amount).await
+}
+
+async fn mock_credit_native_on_anvil(
+    rpc_url: &str,
+    recipient: Address,
+    amount: U256,
+) -> Result<(), String> {
+    let provider = ProviderBuilder::new()
+        .connect(rpc_url)
+        .await
+        .map_err(|err| err.to_string())?;
+    let current = provider
+        .get_balance(recipient)
+        .await
+        .map_err(|err| err.to_string())?;
+    let next = checked_native_credit_balance(current, amount)?;
+    provider
+        .anvil_set_balance(recipient, next)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+fn checked_native_credit_balance(current: U256, amount: U256) -> Result<U256, String> {
+    current
+        .checked_add(amount)
+        .ok_or_else(|| "mock native destination credit balance overflow".to_string())
+}
+
+async fn mock_mint_erc20_on_anvil(
+    rpc_url: &str,
+    token: Address,
+    recipient: Address,
+    amount: U256,
+) -> Result<String, String> {
+    let provider = ProviderBuilder::new()
+        .connect(rpc_url)
+        .await
+        .map_err(|err| err.to_string())?;
+    let code = provider
+        .get_code_at(token)
+        .await
+        .map_err(|err| err.to_string())?;
+    if code.is_empty() {
+        return Err(format!("destination token {token:#x} is not deployed"));
+    }
+    let sender = provider
+        .get_accounts()
+        .await
+        .map_err(|err| format!("get_accounts failed: {err}"))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "destination ERC20 mint requires one unlocked account".to_string())?;
+    let calldata = Bytes::from(IMockMintableERC20::mintCall { recipient, amount }.abi_encode());
+    let tx = TransactionRequest::default()
+        .with_from(sender)
+        .with_to(token)
+        .with_input(calldata);
+    let receipt = provider
+        .send_transaction(tx)
+        .await
+        .map_err(|err| format!("mint send_transaction failed: {err}"))?
+        .get_receipt()
+        .await
+        .map_err(|err| format!("mint receipt failed: {err}"))?;
+    if !receipt.status() {
+        return Err(format!(
+            "destination token mint transaction failed: {:#x}",
+            receipt.transaction_hash
+        ));
+    }
+    Ok(format!("{:#x}", receipt.transaction_hash))
+}
+
+fn mock_across_pending_fill_tx_ref(record: &MockAcrossDepositRecord) -> String {
+    let digest = Sha256::digest(format!(
+        "mock-across-fill:{}:{}:{}",
+        record.origin_chain_id, record.destination_chain_id, record.deposit_id
+    ));
+    format!("0x{}", hex::encode(digest))
 }
 
 fn mock_across_pagination() -> Value {
@@ -1867,21 +2872,61 @@ async fn mock_cctp_messages(
         record.amount,
     )
         .abi_encode();
+    let message_hex = format!("0x{}", hex::encode(message));
+    let decoded_message_body = json!({
+        "burnToken": format!("{:#x}", record.burn_token),
+        "mintRecipient": format!("{:#x}", record.mint_recipient),
+        "amount": record.amount.to_string(),
+        "messageSender": format!("{:#x}", record.depositor)
+    });
+    if let Some(reason) = state.cctp_attestation_failure_reason.as_deref() {
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "messages": [{
+                    "message": message_hex,
+                    "attestation": null,
+                    "eventNonce": record.nonce.to_string(),
+                    "cctpVersion": 2,
+                    "status": "failed",
+                    "error": reason,
+                    "decodedMessageBody": decoded_message_body
+                }]
+            })),
+        )
+            .into_response();
+    }
+    let attestation_ready = state.cctp_attestation_latency.is_zero()
+        || Utc::now()
+            .signed_duration_since(record.indexed_at)
+            .to_std()
+            .is_ok_and(|age| age >= state.cctp_attestation_latency);
+    if !attestation_ready {
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "messages": [{
+                    "message": message_hex,
+                    "attestation": null,
+                    "eventNonce": record.nonce.to_string(),
+                    "cctpVersion": 2,
+                    "status": "pending_confirmations",
+                    "decodedMessageBody": decoded_message_body
+                }]
+            })),
+        )
+            .into_response();
+    }
     (
         StatusCode::OK,
         Json(json!({
             "messages": [{
-                "message": format!("0x{}", hex::encode(message)),
+                "message": message_hex,
                 "attestation": format!("0x{}", "11".repeat(65)),
                 "eventNonce": record.nonce.to_string(),
                 "cctpVersion": 2,
                 "status": "complete",
-                "decodedMessageBody": {
-                    "burnToken": format!("{:#x}", record.burn_token),
-                    "mintRecipient": format!("{:#x}", record.mint_recipient),
-                    "amount": record.amount.to_string(),
-                    "messageSender": format!("{:#x}", record.depositor)
-                }
+                "decodedMessageBody": decoded_message_body
             }]
         })),
     )
@@ -1936,31 +2981,53 @@ async fn mock_coinbase_spot_price(Path(currency_pair): Path<String>) -> impl Int
 async fn maybe_spawn_across_deposit_indexer(
     config: &MockIntegratorConfig,
     state: Arc<MockIntegratorState>,
-) -> eyre::Result<(
-    Option<tokio::sync::oneshot::Sender<()>>,
-    Option<JoinHandle<()>>,
-)> {
-    let (Some(rpc_url), Some(spoke_pool_str)) = (
-        config.across_evm_rpc_url.as_deref(),
-        config.across_spoke_pool_address.as_deref(),
-    ) else {
-        return Ok((None, None));
-    };
-    let spoke_pool_address: Address = spoke_pool_str.parse().map_err(|err| {
-        eyre::eyre!("mock across indexer: invalid spoke pool address {spoke_pool_str}: {err}")
-    })?;
-    let provider: DynProvider = ProviderBuilder::new().connect(rpc_url).await?.erased();
-    let chain_id = provider.get_chain_id().await?;
+) -> eyre::Result<(Vec<tokio::sync::oneshot::Sender<()>>, Vec<JoinHandle<()>>)> {
+    let mut chain_configs = config.across_chains.values().cloned().collect::<Vec<_>>();
+    if let (Some(spoke_pool_address), Some(evm_rpc_url)) = (
+        config.across_spoke_pool_address.clone(),
+        config.across_evm_rpc_url.clone(),
+    ) {
+        chain_configs.push(MockAcrossChainConfig {
+            spoke_pool_address,
+            evm_rpc_url,
+        });
+    }
+    if chain_configs.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
 
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    let handle = tokio::spawn(run_across_deposit_indexer(
-        provider,
-        spoke_pool_address,
-        chain_id,
-        state,
-        shutdown_rx,
-    ));
-    Ok((Some(shutdown_tx), Some(handle)))
+    let mut shutdowns = Vec::with_capacity(chain_configs.len());
+    let mut handles = Vec::with_capacity(chain_configs.len());
+    let mut seen_chain_ids = BTreeSet::new();
+    for chain_config in chain_configs {
+        let spoke_pool_address: Address =
+            chain_config.spoke_pool_address.parse().map_err(|err| {
+                eyre::eyre!(
+                    "mock across indexer: invalid spoke pool address {}: {err}",
+                    chain_config.spoke_pool_address
+                )
+            })?;
+        let provider: DynProvider = ProviderBuilder::new()
+            .connect(&chain_config.evm_rpc_url)
+            .await?
+            .erased();
+        let chain_id = provider.get_chain_id().await?;
+        if !seen_chain_ids.insert(chain_id) {
+            continue;
+        }
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(run_across_deposit_indexer(
+            provider,
+            spoke_pool_address,
+            chain_id,
+            state.clone(),
+            shutdown_rx,
+        ));
+        shutdowns.push(shutdown_tx);
+        handles.push(handle);
+    }
+    Ok((shutdowns, handles))
 }
 
 async fn maybe_spawn_hyperliquid_bridge_indexer(
@@ -1996,44 +3063,139 @@ async fn maybe_spawn_hyperliquid_bridge_indexer(
     Ok((Some(shutdown_tx), Some(handle)))
 }
 
+async fn maybe_spawn_unit_deposit_indexers(
+    config: &MockIntegratorConfig,
+    state: Arc<MockIntegratorState>,
+) -> eyre::Result<(Vec<tokio::sync::oneshot::Sender<()>>, Vec<JoinHandle<()>>)> {
+    let mut shutdowns = Vec::new();
+    let mut handles = Vec::new();
+
+    for (chain, rpc_url) in &config.unit_evm_rpc_urls {
+        let Some(unit_chain) = UnitChain::parse(chain) else {
+            tracing::warn!(chain, "mock Unit EVM indexer: unsupported Unit chain");
+            continue;
+        };
+        let provider: DynProvider = ProviderBuilder::new().connect(rpc_url).await?.erased();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(run_unit_evm_deposit_indexer(
+            provider,
+            unit_chain,
+            state.clone(),
+            shutdown_rx,
+        ));
+        shutdowns.push(shutdown_tx);
+        handles.push(handle);
+    }
+
+    if let (Some(rpc_url), Some(cookie_path)) = (
+        config.unit_bitcoin_rpc_url.clone(),
+        config.unit_bitcoin_cookie_path.clone(),
+    ) {
+        let client = BitcoinRpcClient::new(rpc_url, BitcoinRpcAuth::CookieFile(cookie_path))
+            .await
+            .map_err(|err| {
+                eyre::eyre!("mock Unit bitcoin indexer: RPC client init failed: {err}")
+            })?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(run_unit_bitcoin_deposit_indexer(client, state, shutdown_rx));
+        shutdowns.push(shutdown_tx);
+        handles.push(handle);
+    }
+
+    Ok((shutdowns, handles))
+}
+
 async fn maybe_spawn_cctp_burn_indexer(
     config: &MockIntegratorConfig,
     state: Arc<MockIntegratorState>,
-) -> eyre::Result<(
-    Option<tokio::sync::oneshot::Sender<()>>,
-    Option<JoinHandle<()>>,
-)> {
-    let (Some(rpc_url), Some(token_messenger_str), Some(destination_token_str)) = (
-        config.cctp_evm_rpc_url.as_deref(),
-        config.cctp_token_messenger_address.as_deref(),
-        config.cctp_destination_token_address.as_deref(),
-    ) else {
-        return Ok((None, None));
-    };
-    let token_messenger_address: Address = token_messenger_str.parse().map_err(|err| {
-        eyre::eyre!(
-            "mock cctp indexer: invalid TokenMessengerV2 address {token_messenger_str}: {err}"
-        )
-    })?;
-    let destination_token_address: Address = destination_token_str.parse().map_err(|err| {
-        eyre::eyre!(
-            "mock cctp indexer: invalid destination token address {destination_token_str}: {err}"
-        )
-    })?;
-    let provider: DynProvider = ProviderBuilder::new().connect(rpc_url).await?.erased();
-    let chain_id = provider.get_chain_id().await?;
-    let source_domain = cctp_domain_for_chain_id(chain_id).unwrap_or(6);
+) -> eyre::Result<(Vec<tokio::sync::oneshot::Sender<()>>, Vec<JoinHandle<()>>)> {
+    let mut destination_tokens = BTreeMap::<u32, Address>::new();
+    for (domain, token_str) in &config.cctp_destination_token_addresses {
+        let token = token_str.parse().map_err(|err| {
+            eyre::eyre!("mock cctp indexer: invalid destination token address {token_str}: {err}")
+        })?;
+        destination_tokens.insert(*domain, token);
+    }
 
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    let handle = tokio::spawn(run_cctp_burn_indexer(
-        provider,
-        token_messenger_address,
-        destination_token_address,
-        source_domain,
-        state,
-        shutdown_rx,
-    ));
-    Ok((Some(shutdown_tx), Some(handle)))
+    if let Some(destination_token_str) = config.cctp_destination_token_address.as_deref() {
+        let destination_token = destination_token_str.parse().map_err(|err| {
+            eyre::eyre!(
+                "mock cctp indexer: invalid legacy destination token address {destination_token_str}: {err}"
+            )
+        })?;
+        for domain in [0_u32, 3, 6] {
+            destination_tokens
+                .entry(domain)
+                .or_insert(destination_token);
+        }
+    }
+
+    if destination_tokens.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let mut source_chains = config.cctp_chains.clone();
+    if source_chains.is_empty() {
+        if let (Some(rpc_url), Some(token_messenger_address)) = (
+            config.cctp_evm_rpc_url.clone(),
+            config.cctp_token_messenger_address.clone(),
+        ) {
+            source_chains.insert(
+                0,
+                MockCctpChainConfig {
+                    token_messenger_address,
+                    evm_rpc_url: rpc_url,
+                },
+            );
+        }
+    }
+
+    let mut shutdowns = Vec::new();
+    let mut handles = Vec::new();
+    for (configured_chain_id, chain_config) in source_chains {
+        let token_messenger_address: Address = chain_config
+            .token_messenger_address
+            .parse()
+            .map_err(|err| {
+                eyre::eyre!(
+                    "mock cctp indexer: invalid TokenMessengerV2 address {}: {err}",
+                    chain_config.token_messenger_address
+                )
+            })?;
+        let provider: DynProvider = ProviderBuilder::new()
+            .connect(&chain_config.evm_rpc_url)
+            .await?
+            .erased();
+        let chain_id = provider.get_chain_id().await?;
+        let source_domain = cctp_domain_for_chain_id(chain_id).ok_or_else(|| {
+            eyre::eyre!("mock cctp indexer: unsupported source chain id {chain_id}")
+        })?;
+        if configured_chain_id != 0 && configured_chain_id != chain_id {
+            tracing::warn!(
+                configured_chain_id,
+                rpc_chain_id = chain_id,
+                "mock cctp indexer source chain id differs from RPC chain id"
+            );
+        }
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(run_cctp_burn_indexer(
+            provider,
+            token_messenger_address,
+            destination_tokens.clone(),
+            source_domain,
+            state.clone(),
+            shutdown_rx,
+        ));
+        shutdowns.push(shutdown_tx);
+        handles.push(handle);
+    }
+
+    Ok((shutdowns, handles))
+}
+
+fn mock_evm_indexer_initial_last_scanned() -> u64 {
+    0
 }
 
 async fn run_across_deposit_indexer(
@@ -2045,7 +3207,7 @@ async fn run_across_deposit_indexer(
 ) {
     let signature: B256 = FundsDeposited::SIGNATURE_HASH;
     let poll = Duration::from_millis(100);
-    let mut last_scanned: u64 = provider.get_block_number().await.unwrap_or(0);
+    let mut last_scanned: u64 = mock_evm_indexer_initial_last_scanned();
     loop {
         tokio::select! {
             _ = &mut shutdown => return,
@@ -2082,6 +3244,14 @@ async fn run_across_deposit_indexer(
                 }
             };
             let event = decoded.data;
+            let Some(deposit_tx_hash) = log.transaction_hash.map(|h| format!("{h:#x}")) else {
+                tracing::warn!("mock across indexer: FundsDeposited log missing transaction hash");
+                continue;
+            };
+            let Some(block_number) = log.block_number else {
+                tracing::warn!("mock across indexer: FundsDeposited log missing block number");
+                continue;
+            };
             let record = MockAcrossDepositRecord {
                 origin_chain_id: chain_id,
                 destination_chain_id: event.destinationChainId,
@@ -2093,11 +3263,8 @@ async fn run_across_deposit_indexer(
                 input_amount: event.inputAmount,
                 output_amount: event.outputAmount,
                 fill_deadline: event.fillDeadline,
-                deposit_tx_hash: log
-                    .transaction_hash
-                    .map(|h| format!("{h:#x}"))
-                    .unwrap_or_default(),
-                block_number: log.block_number.unwrap_or_default(),
+                deposit_tx_hash,
+                block_number,
                 indexed_at: Utc::now(),
             };
             let key = (chain_id, record.deposit_id.to_string());
@@ -2110,14 +3277,14 @@ async fn run_across_deposit_indexer(
 async fn run_cctp_burn_indexer(
     provider: DynProvider,
     token_messenger_address: Address,
-    destination_token_address: Address,
+    destination_token_addresses: BTreeMap<u32, Address>,
     source_domain: u32,
     state: Arc<MockIntegratorState>,
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
 ) {
     let signature: B256 = DepositForBurn::SIGNATURE_HASH;
     let poll = Duration::from_millis(100);
-    let mut last_scanned: u64 = provider.get_block_number().await.unwrap_or(0);
+    let mut last_scanned: u64 = mock_evm_indexer_initial_last_scanned();
     loop {
         tokio::select! {
             _ = &mut shutdown => return,
@@ -2154,10 +3321,25 @@ async fn run_cctp_burn_indexer(
                 }
             };
             let event = decoded.data;
-            let burn_tx_hash = log
-                .transaction_hash
-                .map(|h| format!("{h:#x}"))
-                .unwrap_or_default();
+            let Some(destination_token_address) = destination_token_addresses
+                .get(&event.destinationDomain)
+                .copied()
+            else {
+                tracing::warn!(
+                    source_domain,
+                    destination_domain = event.destinationDomain,
+                    "mock cctp indexer: no destination token configured for burn"
+                );
+                continue;
+            };
+            let Some(burn_tx_hash) = log.transaction_hash.map(|h| format!("{h:#x}")) else {
+                tracing::warn!("mock cctp indexer: DepositForBurn log missing transaction hash");
+                continue;
+            };
+            let Some(block_number) = log.block_number else {
+                tracing::warn!("mock cctp indexer: DepositForBurn log missing block number");
+                continue;
+            };
             let record = MockCctpBurnRecord {
                 source_domain,
                 destination_domain: event.destinationDomain,
@@ -2168,7 +3350,7 @@ async fn run_cctp_burn_indexer(
                 mint_recipient: bytes32_to_evm_address(event.mintRecipient),
                 amount: event.amount,
                 burn_tx_hash: burn_tx_hash.clone(),
-                block_number: log.block_number.unwrap_or_default(),
+                block_number,
                 indexed_at: Utc::now(),
             };
             state.cctp_burns.lock().await.insert(burn_tx_hash, record);
@@ -2186,7 +3368,7 @@ async fn run_hyperliquid_bridge_indexer(
 ) {
     let signature: B256 = IERC20::Transfer::SIGNATURE_HASH;
     let poll = Duration::from_millis(100);
-    let mut last_scanned: u64 = provider.get_block_number().await.unwrap_or(0);
+    let mut last_scanned: u64 = mock_evm_indexer_initial_last_scanned();
     loop {
         tokio::select! {
             _ = &mut shutdown => return,
@@ -2242,14 +3424,334 @@ async fn run_hyperliquid_bridge_indexer(
                 );
                 continue;
             };
-            state
-                .hyperliquid
-                .lock()
-                .await
-                .credit_clearinghouse(event.from, "USDC", amount);
+            let Some(tx_hash) = log.transaction_hash.map(|hash| format!("{hash:#x}")) else {
+                tracing::warn!(
+                    from = %event.from,
+                    amount = %event.value,
+                    "mock hyperliquid bridge indexer: Transfer log missing transaction hash"
+                );
+                continue;
+            };
+            if mock_hyperliquid_bridge_deposit_should_fail(
+                &state,
+                event.from,
+                event.value,
+                &tx_hash,
+            ) {
+                tracing::warn!(
+                    from = %event.from,
+                    amount = %event.value,
+                    tx_hash,
+                    "mock hyperliquid bridge indexer: configured deposit failure"
+                );
+                continue;
+            }
+            if state.hyperliquid_bridge_deposit_latency > Duration::ZERO {
+                schedule_mock_hyperliquid_bridge_deposit_credit(
+                    &state, event.from, amount, tx_hash,
+                );
+            } else {
+                credit_mock_hyperliquid_bridge_deposit(&state, event.from, amount, &tx_hash).await;
+            }
         }
         last_scanned = head;
     }
+}
+
+fn mock_hyperliquid_bridge_deposit_should_fail(
+    state: &MockIntegratorState,
+    user: Address,
+    amount_raw: U256,
+    tx_hash: &str,
+) -> bool {
+    let probability_bps = state.hyperliquid_bridge_deposit_failure_probability_bps;
+    deterministic_bps(
+        &format!("hyperliquid-bridge-deposit:{user}:{tx_hash}:{amount_raw}"),
+        9_999,
+    ) < probability_bps
+}
+
+fn schedule_mock_hyperliquid_bridge_deposit_credit(
+    state: &Arc<MockIntegratorState>,
+    user: Address,
+    amount: f64,
+    tx_hash: String,
+) {
+    let state = Arc::clone(state);
+    let latency = state.hyperliquid_bridge_deposit_latency;
+    tokio::spawn(async move {
+        tokio::time::sleep(latency).await;
+        credit_mock_hyperliquid_bridge_deposit(&state, user, amount, &tx_hash).await;
+    });
+}
+
+async fn credit_mock_hyperliquid_bridge_deposit(
+    state: &Arc<MockIntegratorState>,
+    user: Address,
+    amount: f64,
+    tx_hash: &str,
+) {
+    state
+        .hyperliquid
+        .lock()
+        .await
+        .credit_clearinghouse(user, "USDC", amount);
+    tracing::debug!(
+        %user,
+        amount,
+        tx_hash,
+        "mock hyperliquid bridge indexer: credited clearinghouse deposit"
+    );
+}
+
+#[derive(Debug, Clone)]
+struct UnitDepositWatch {
+    protocol_address: String,
+    min_amount_raw: Option<U256>,
+}
+
+async fn run_unit_evm_deposit_indexer(
+    provider: DynProvider,
+    unit_chain: UnitChain,
+    state: Arc<MockIntegratorState>,
+    mut shutdown: tokio::sync::oneshot::Receiver<()>,
+) {
+    let poll = Duration::from_millis(100);
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => return,
+            _ = tokio::time::sleep(poll) => {}
+        }
+
+        let watches = active_unit_deposit_watches(&state, unit_chain).await;
+        for watch in watches {
+            let Ok(address) = Address::from_str(&watch.protocol_address) else {
+                continue;
+            };
+            let balance = match provider.get_balance(address).await {
+                Ok(balance) => balance,
+                Err(err) => {
+                    tracing::warn!(
+                        %err,
+                        unit_chain = %unit_chain,
+                        protocol_address = %watch.protocol_address,
+                        "mock Unit EVM deposit indexer: balance lookup failed"
+                    );
+                    continue;
+                }
+            };
+            if balance.is_zero() || watch.min_amount_raw.is_some_and(|amount| balance < amount) {
+                continue;
+            }
+            if let Err(err) = complete_mock_unit_operation_with_observation(
+                &state,
+                &watch.protocol_address,
+                Some(UnitOperationObservation {
+                    source_amount: balance.to_string(),
+                    source_tx_hash: None,
+                }),
+            )
+            .await
+            {
+                tracing::warn!(
+                    %err,
+                    unit_chain = %unit_chain,
+                    protocol_address = %watch.protocol_address,
+                    "mock Unit EVM deposit indexer: completing operation failed"
+                );
+            }
+        }
+    }
+}
+
+async fn run_unit_bitcoin_deposit_indexer(
+    client: BitcoinRpcClient,
+    state: Arc<MockIntegratorState>,
+    mut shutdown: tokio::sync::oneshot::Receiver<()>,
+) {
+    let poll = Duration::from_millis(100);
+    let mut last_scanned_block = match client.get_block_count().await {
+        Ok(height) => height,
+        Err(err) => {
+            tracing::warn!(%err, "mock Unit bitcoin deposit indexer: getblockcount failed");
+            0
+        }
+    };
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => return,
+            _ = tokio::time::sleep(poll) => {}
+        }
+
+        let watches = active_unit_deposit_watches(&state, UnitChain::Bitcoin).await;
+        if watches.is_empty() {
+            continue;
+        }
+        scan_unit_bitcoin_mempool(&client, &state, &watches).await;
+
+        let head = match client.get_block_count().await {
+            Ok(head) => head,
+            Err(err) => {
+                tracing::warn!(%err, "mock Unit bitcoin deposit indexer: getblockcount failed");
+                continue;
+            }
+        };
+        if head <= last_scanned_block {
+            continue;
+        }
+
+        for height in last_scanned_block.saturating_add(1)..=head {
+            let block_hash = match client.get_block_hash(height).await {
+                Ok(block_hash) => block_hash,
+                Err(err) => {
+                    tracing::warn!(%err, height, "mock Unit bitcoin deposit indexer: getblockhash failed");
+                    continue;
+                }
+            };
+            let block = match client.get_block(&block_hash).await {
+                Ok(block) => block,
+                Err(err) => {
+                    tracing::warn!(%err, %block_hash, height, "mock Unit bitcoin deposit indexer: getblock failed");
+                    continue;
+                }
+            };
+            for tx in block.txdata {
+                let txid = tx.compute_txid();
+                process_unit_bitcoin_transaction_outputs(
+                    &state,
+                    &watches,
+                    &txid.to_string(),
+                    tx.output.into_iter().enumerate(),
+                )
+                .await;
+            }
+        }
+        last_scanned_block = head;
+    }
+}
+
+async fn scan_unit_bitcoin_mempool(
+    client: &BitcoinRpcClient,
+    state: &Arc<MockIntegratorState>,
+    watches: &[UnitDepositWatch],
+) {
+    let mempool = match client.get_raw_mempool().await {
+        Ok(mempool) => mempool,
+        Err(err) => {
+            tracing::warn!(%err, "mock Unit bitcoin deposit indexer: getrawmempool failed");
+            return;
+        }
+    };
+    for txid in mempool {
+        let tx = match client.get_raw_transaction_verbose(&txid).await {
+            Ok(tx) => tx,
+            Err(err) => {
+                tracing::warn!(%err, %txid, "mock Unit bitcoin deposit indexer: getrawtransaction failed");
+                continue;
+            }
+        };
+        let outputs: Vec<_> = tx
+            .outputs
+            .iter()
+            .enumerate()
+            .filter_map(|(vout, output)| match output.to_output() {
+                Ok(output) => Some((vout, output)),
+                Err(err) => {
+                    tracing::warn!(
+                        %err,
+                        %txid,
+                        vout,
+                        "mock Unit bitcoin deposit indexer: decode output failed"
+                    );
+                    None
+                }
+            })
+            .collect();
+        process_unit_bitcoin_transaction_outputs(state, watches, &txid.to_string(), outputs).await;
+    }
+}
+
+async fn process_unit_bitcoin_transaction_outputs<I>(
+    state: &Arc<MockIntegratorState>,
+    watches: &[UnitDepositWatch],
+    txid: &str,
+    outputs: I,
+) where
+    I: IntoIterator<Item = (usize, bitcoin::TxOut)>,
+{
+    for (vout, output) in outputs {
+        for watch in watches {
+            let Some(script_pubkey) =
+                bitcoin_script_pubkey_for_regtest_address(&watch.protocol_address)
+            else {
+                continue;
+            };
+            if output.script_pubkey != script_pubkey {
+                continue;
+            }
+            let amount_sats = output.value.to_sat();
+            if amount_sats == 0
+                || watch
+                    .min_amount_raw
+                    .is_some_and(|amount| U256::from(amount_sats) < amount)
+            {
+                continue;
+            }
+            let source_tx_hash = format!("{txid}:{vout}");
+            if let Err(err) = complete_mock_unit_operation_with_observation(
+                state,
+                &watch.protocol_address,
+                Some(UnitOperationObservation {
+                    source_amount: amount_sats.to_string(),
+                    source_tx_hash: Some(source_tx_hash),
+                }),
+            )
+            .await
+            {
+                tracing::warn!(
+                    %err,
+                    protocol_address = %watch.protocol_address,
+                    "mock Unit bitcoin deposit indexer: completing operation failed"
+                );
+            }
+        }
+    }
+}
+
+async fn active_unit_deposit_watches(
+    state: &Arc<MockIntegratorState>,
+    src_chain: UnitChain,
+) -> Vec<UnitDepositWatch> {
+    let operations = state.unit_operations.lock().await;
+    operations
+        .values()
+        .flat_map(|entries| entries.iter())
+        .filter(|entry| {
+            entry.kind == MockUnitOperationKind::Deposit
+                && entry.src_chain == src_chain
+                && !matches!(entry.operation.state.as_deref(), Some("done" | "failure"))
+        })
+        .filter_map(|entry| {
+            let protocol_address = entry.operation.protocol_address.clone()?;
+            let min_amount_raw = entry
+                .operation
+                .source_amount
+                .as_deref()
+                .and_then(|raw| U256::from_str_radix(raw, 10).ok());
+            Some(UnitDepositWatch {
+                protocol_address,
+                min_amount_raw,
+            })
+        })
+        .collect()
+}
+
+fn bitcoin_script_pubkey_for_regtest_address(address: &str) -> Option<bitcoin::ScriptBuf> {
+    bitcoin::Address::from_str(address)
+        .ok()?
+        .require_network(bitcoin::Network::Regtest)
+        .ok()
+        .map(|address| address.script_pubkey())
 }
 
 fn raw_usdc_to_natural_f64(value: U256) -> Option<f64> {
@@ -2275,11 +3777,10 @@ fn bytes32_to_evm_address(value: FixedBytes<32>) -> Address {
 /// `hyperunit_client::UnitGenerateAddressResponse` byte-for-byte so production
 /// and test code paths use the same parse logic.
 ///
-/// The mock derives the protocol address deterministically from the path
-/// parameters (sha256-based) so tests can predict what address the router will
-/// observe. It also records the generated operation in the state's
-/// `unit_operations` map, seeded at `sourceTxDiscovered` — tests advance the
-/// state via `complete_unit_operation` / `fail_unit_operation`.
+/// The mock allocates a fresh protocol address and private key per request,
+/// then records the generated operation in the state's `unit_operations` map,
+/// seeded at `sourceTxDiscovered` — tests advance the state via
+/// `complete_unit_operation` / `fail_unit_operation`.
 async fn mock_unit_gen(
     State(state): State<Arc<MockIntegratorState>>,
     Path((src_chain, dst_chain, asset, dst_addr)): Path<(String, String, String, String)>,
@@ -2336,7 +3837,16 @@ async fn mock_unit_gen(
         );
     };
 
-    let protocol_address = derive_mock_protocol_address(&src_chain, &dst_chain, &asset, &dst_addr);
+    let protocol_address = loop {
+        let protocol_wallet = fresh_mock_protocol_wallet(src, dst);
+        let mut private_keys = state.unit_protocol_private_keys.lock().await;
+        if private_keys.contains_key(&protocol_wallet.address) {
+            continue;
+        }
+        let protocol_address = protocol_wallet.address;
+        private_keys.insert(protocol_address.clone(), protocol_wallet.key);
+        break protocol_address;
+    };
     {
         let mut operations = state.unit_operations.lock().await;
         operations
@@ -2489,17 +3999,37 @@ async fn mock_hyperliquid_info(
     let mut hl = state.hyperliquid.lock().await;
     hl.run_due_scheduled_cancels();
     match kind {
-        "spotMeta" => Json(hl.spot_meta_value()).into_response(),
+        "spotMeta" => match hl.spot_meta_value() {
+            Ok(value) => Json(value).into_response(),
+            Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, error),
+        },
         "l2Book" => {
-            let coin = request
-                .get("coin")
-                .and_then(Value::as_str)
-                .unwrap_or("UBTC/USDC");
+            let Some(coin) = request.get("coin").and_then(Value::as_str) else {
+                return error_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "l2Book requires a `coin` field",
+                );
+            };
             Json(hl.l2_book_snapshot(coin)).into_response()
         }
         "orderStatus" => {
-            let oid = request.get("oid").and_then(Value::as_u64).unwrap_or(0);
-            Json(hl.order_status_snapshot(oid)).into_response()
+            let Some(user) = request
+                .get("user")
+                .and_then(Value::as_str)
+                .and_then(parse_user_address)
+            else {
+                return error_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "orderStatus requires a 0x-prefixed `user` field",
+                );
+            };
+            let Some(oid) = request.get("oid").and_then(Value::as_u64) else {
+                return error_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "orderStatus requires a numeric `oid` field",
+                );
+            };
+            Json(hl.order_status_snapshot(user, oid)).into_response()
         }
         "spotClearinghouseState" => {
             let Some(user) = request
@@ -2763,7 +4293,7 @@ async fn handle_spot_send(
     {
         let mut hl = state.hyperliquid.lock().await;
         let available = hl.available_spot(signer, &token_symbol);
-        if available + HYPERLIQUID_AMOUNT_EPSILON < amount {
+        if !hyperliquid_has_sufficient_amount(available, amount) {
             return error_response(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 format!("spotSend: {signer:?} has {available} {token_symbol}, needs {amount}"),
@@ -2779,6 +4309,11 @@ async fn handle_spot_send(
     // destination matches a tracked unit operation advances it into the first
     // post-discovery state a real withdrawal would expose after Hyperliquid
     // observes the source transfer.
+    let source_tx_hash = match nonce {
+        Some(nonce) => format!("{signer:#x}:{nonce}"),
+        None => format!("{signer:#x}:0"),
+    };
+    let mut unit_withdrawal_to_complete = None;
     {
         let mut operations = state.unit_operations.lock().await;
         if let Some(entry) = operations
@@ -2792,14 +4327,40 @@ async fn handle_spot_send(
             entry.operation.source_address = Some(format!("{signer:#x}"));
             entry.operation.source_amount = Some(payload.amount.clone());
             if entry.operation.source_tx_hash.is_none() {
-                entry.operation.source_tx_hash = Some(match nonce {
-                    Some(nonce) => format!("{signer:#x}:{nonce}"),
-                    None => format!("{signer:#x}:0"),
-                });
+                entry.operation.source_tx_hash = Some(source_tx_hash.clone());
             }
             if entry.operation.operation_id.is_none() {
                 entry.operation.operation_id = entry.operation.source_tx_hash.clone();
             }
+            if matches!(entry.kind, MockUnitOperationKind::Withdrawal) {
+                unit_withdrawal_to_complete = Some(payload.destination.clone());
+            }
+        }
+    }
+    if let Some(protocol_address) = unit_withdrawal_to_complete {
+        let completion_result = if let Some(error) = state
+            .next_unit_withdrawal_completion_error
+            .lock()
+            .await
+            .take()
+        {
+            fail_mock_unit_operation(state, &protocol_address, error).await
+        } else {
+            complete_mock_unit_operation_with_observation(
+                state,
+                &protocol_address,
+                Some(UnitOperationObservation {
+                    source_amount: payload.amount.clone(),
+                    source_tx_hash: Some(source_tx_hash),
+                }),
+            )
+            .await
+        };
+        if let Err(err) = completion_result {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("mock unit withdrawal completion failed: {err}"),
+            );
         }
     }
 
@@ -2887,7 +4448,7 @@ async fn handle_usd_class_transfer(
     } else {
         hl.clearinghouse_total(user, "USDC")
     };
-    if available + HYPERLIQUID_AMOUNT_EPSILON < amount {
+    if !hyperliquid_has_sufficient_amount(available, amount) {
         let source = if to_perp { "spot" } else { "clearinghouse" };
         return error_response(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -2977,7 +4538,7 @@ async fn handle_withdraw3(
     {
         let mut hl = state.hyperliquid.lock().await;
         let available = hl.clearinghouse_total(user, "USDC");
-        if available + HYPERLIQUID_AMOUNT_EPSILON < gross_amount {
+        if !hyperliquid_has_sufficient_amount(available, gross_amount) {
             return error_response(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 format!(
@@ -3001,7 +4562,42 @@ async fn handle_withdraw3(
 
 /// Size difference below this threshold is treated as "zero remaining" —
 /// guards against f64 drift when partial fills consume a level exactly.
-const HYPERLIQUID_AMOUNT_EPSILON: f64 = 1e-12;
+const HYPERLIQUID_AMOUNT_EPSILON: f64 = 1e-6;
+const HYPERLIQUID_RELATIVE_AMOUNT_EPSILON: f64 = 1e-12;
+const HYPERLIQUID_PRICE_TOLERANCE_BPS: f64 = 1.0;
+
+fn hyperliquid_amount_epsilon(amount: f64) -> f64 {
+    HYPERLIQUID_AMOUNT_EPSILON.max(amount.abs() * HYPERLIQUID_RELATIVE_AMOUNT_EPSILON)
+}
+
+fn hyperliquid_has_sufficient_amount(available: f64, required: f64) -> bool {
+    available + hyperliquid_amount_epsilon(required) >= required
+}
+
+fn hyperliquid_is_effectively_zero(amount: f64) -> bool {
+    amount <= hyperliquid_amount_epsilon(amount)
+}
+
+fn hyperliquid_price_epsilon(price: f64) -> f64 {
+    HYPERLIQUID_AMOUNT_EPSILON.max(price.abs() * HYPERLIQUID_PRICE_TOLERANCE_BPS / 10_000.0)
+}
+
+fn hyperliquid_order_crosses(is_buy: bool, limit_px: f64, rate: f64) -> bool {
+    let tolerance = hyperliquid_price_epsilon(rate);
+    if is_buy {
+        limit_px + tolerance >= rate
+    } else {
+        limit_px <= rate + tolerance
+    }
+}
+
+fn hyperliquid_execution_px(is_buy: bool, limit_px: f64, rate: f64) -> f64 {
+    if is_buy {
+        limit_px.min(rate)
+    } else {
+        limit_px.max(rate)
+    }
+}
 const HYPERLIQUID_BRIDGE_WITHDRAW_FEE_RAW: u64 = 1_000_000;
 
 fn parse_user_address(value: &str) -> Option<Address> {
@@ -3064,6 +4660,9 @@ fn schedule_mock_hyperliquid_withdrawal_release(
     let Some(bridge_address) = state.hyperliquid_bridge_address.clone() else {
         return;
     };
+    let Some(usdc_token_address) = state.hyperliquid_usdc_token_address.clone() else {
+        return;
+    };
     let latency = state.hyperliquid_withdrawal_latency;
     tokio::spawn(async move {
         if latency > Duration::ZERO {
@@ -3072,6 +4671,7 @@ fn schedule_mock_hyperliquid_withdrawal_release(
         if let Err(err) = send_mock_hyperliquid_withdrawal_release(
             &rpc_url,
             &bridge_address,
+            &usdc_token_address,
             destination,
             payout_raw,
         )
@@ -3085,14 +4685,29 @@ fn schedule_mock_hyperliquid_withdrawal_release(
 async fn send_mock_hyperliquid_withdrawal_release(
     rpc_url: &str,
     bridge_address: &str,
+    usdc_token_address: &str,
     destination: Address,
     payout_raw: u64,
 ) -> Result<(), String> {
-    let rpc_url: Url = rpc_url
-        .parse()
-        .map_err(|err| format!("invalid hyperliquid EVM RPC URL {rpc_url:?}: {err}"))?;
+    let rpc_endpoint = rpc_url;
+    let rpc_url: Url = rpc_endpoint.parse().map_err(|err| {
+        format!(
+            "invalid hyperliquid EVM RPC URL {}: {err}",
+            sanitize_url_for_error(rpc_endpoint)
+        )
+    })?;
     let bridge_address = Address::from_str(bridge_address)
         .map_err(|err| format!("invalid hyperliquid bridge address {bridge_address:?}: {err}"))?;
+    let usdc_token_address = Address::from_str(usdc_token_address).map_err(|err| {
+        format!("invalid hyperliquid USDC token address {usdc_token_address:?}: {err}")
+    })?;
+    mock_mint_erc20_on_anvil(
+        rpc_endpoint,
+        usdc_token_address,
+        bridge_address,
+        U256::from(payout_raw),
+    )
+    .await?;
     let provider = ProviderBuilder::new().connect_http(rpc_url);
     let sender = provider
         .get_accounts()
@@ -3130,6 +4745,29 @@ async fn send_mock_hyperliquid_withdrawal_release(
             receipt.transaction_hash
         ))
     }
+}
+
+fn sanitize_url_for_error(value: &str) -> String {
+    let Ok(parsed) = Url::parse(value.trim()) else {
+        return "<invalid url>".to_string();
+    };
+
+    let host = parsed.host_str().unwrap_or("<missing-host>");
+    let mut redacted = format!("{}://{}", parsed.scheme(), host);
+    if let Some(port) = parsed.port() {
+        redacted.push(':');
+        redacted.push_str(&port.to_string());
+    }
+    if parsed.path() != "/" {
+        redacted.push_str("/<redacted-path>");
+    }
+    if parsed.query().is_some() {
+        redacted.push_str("?<redacted-query>");
+    }
+    if parsed.fragment().is_some() {
+        redacted.push_str("#<redacted-fragment>");
+    }
+    redacted
 }
 
 fn parse_signature(value: Option<&Value>) -> Result<alloy::primitives::Signature, String> {
@@ -3204,11 +4842,7 @@ fn place_orders_on_mock(
                 });
             };
 
-            let crosses = if order.is_buy {
-                limit_px + HYPERLIQUID_AMOUNT_EPSILON >= rate
-            } else {
-                limit_px <= rate + HYPERLIQUID_AMOUNT_EPSILON
-            };
+            let crosses = hyperliquid_order_crosses(order.is_buy, limit_px, rate);
 
             if tif == "Alo" && crosses {
                 return json!({
@@ -3243,7 +4877,7 @@ fn place_orders_on_mock(
                 };
                 let reserve_amount = if order.is_buy { sz * limit_px } else { sz };
                 let available = hl.available_spot(user, &reserve_coin);
-                if available + HYPERLIQUID_AMOUNT_EPSILON < reserve_amount {
+                if !hyperliquid_has_sufficient_amount(available, reserve_amount) {
                     return json!({
                         "error": format!(
                             "insufficient {reserve_coin} balance: have {available}, need {reserve_amount}",
@@ -3303,7 +4937,7 @@ fn place_orders_on_mock(
             };
             let remaining_sz = (sz - fill_sz).max(0.0);
 
-            if fill_sz <= HYPERLIQUID_AMOUNT_EPSILON {
+            if hyperliquid_is_effectively_zero(fill_sz) {
                 if tif == "Ioc" {
                     return json!({
                         "error": format!(
@@ -3325,17 +4959,18 @@ fn place_orders_on_mock(
             } else {
                 base_coin.clone()
             };
+            let execution_px = hyperliquid_execution_px(order.is_buy, limit_px, rate);
             let reserve_amount = if order.is_buy {
                 if tif == "Gtc" {
-                    (fill_sz * rate) + (remaining_sz * limit_px)
+                    (fill_sz * execution_px) + (remaining_sz * limit_px)
                 } else {
-                    fill_sz * rate
+                    fill_sz * execution_px
                 }
             } else {
                 sz
             };
             let available = hl.available_spot(user, &reserve_coin);
-            if available + HYPERLIQUID_AMOUNT_EPSILON < reserve_amount {
+            if !hyperliquid_has_sufficient_amount(available, reserve_amount) {
                 return json!({
                     "error": format!(
                         "insufficient {reserve_coin} balance: have {available}, need {reserve_amount}",
@@ -3346,7 +4981,7 @@ fn place_orders_on_mock(
             let (debit_coin, debit_amount, credit_coin, credit_amount) = if order.is_buy {
                 (
                     quote_coin.clone(),
-                    fill_sz * rate,
+                    fill_sz * execution_px,
                     base_coin.clone(),
                     fill_sz,
                 )
@@ -3355,7 +4990,7 @@ fn place_orders_on_mock(
                     base_coin.clone(),
                     fill_sz,
                     quote_coin.clone(),
-                    fill_sz * rate,
+                    fill_sz * execution_px,
                 )
             };
 
@@ -3368,7 +5003,7 @@ fn place_orders_on_mock(
                 tid,
                 coin: resolution.pair_name.clone(),
                 is_buy: order.is_buy,
-                px: rate,
+                px: execution_px,
                 sz: fill_sz,
                 time: timestamp,
                 fee: 0.0,
@@ -3380,7 +5015,7 @@ fn place_orders_on_mock(
             };
             hl.fills.entry(user).or_default().insert(0, fill);
 
-            if tif == "Gtc" && remaining_sz > HYPERLIQUID_AMOUNT_EPSILON {
+            if tif == "Gtc" && !hyperliquid_is_effectively_zero(remaining_sz) {
                 let mut resting = submitted;
                 resting.sz = remaining_sz;
                 hl.open_orders.insert(oid, resting);
@@ -3392,7 +5027,7 @@ fn place_orders_on_mock(
             }
 
             let mut terminal_order = submitted;
-            if remaining_sz > HYPERLIQUID_AMOUNT_EPSILON {
+            if !hyperliquid_is_effectively_zero(remaining_sz) {
                 terminal_order.sz = remaining_sz;
             }
             hl.terminal_orders.insert(
@@ -3407,7 +5042,7 @@ fn place_orders_on_mock(
             json!({
                 "filled": {
                     "totalSz": format_hl_amount(fill_sz),
-                    "avgPx": format_hl_amount(rate),
+                    "avgPx": format_hl_amount(execution_px),
                     "oid": oid,
                 }
             })
@@ -3459,53 +5094,118 @@ fn format_hl_amount(value: f64) -> String {
     hyperliquid_client::float_to_wire(value)
 }
 
+fn format_hl_token_amount(value: f64, decimals: u8) -> String {
+    if decimals <= hyperliquid_client::wire::WIRE_DECIMALS {
+        return format_hl_amount(value);
+    }
+    let scale = 10_f64.powi(i32::from(decimals));
+    let tolerance = (value.abs() * 1e-15).max(32.0 / scale);
+    for precision in 0..=usize::from(hyperliquid_client::wire::WIRE_DECIMALS) {
+        let precision_scale = 10_f64.powi(i32::try_from(precision).unwrap_or_default());
+        let rounded = (value * precision_scale).round() / precision_scale;
+        if (rounded - value).abs() <= tolerance {
+            return trim_decimal_string(&format!("{rounded:.precision$}"));
+        }
+    }
+
+    let scaled = value * scale;
+    let rounded = scaled.round();
+    let raw_tolerance = (scaled.abs() * f64::EPSILON * 8.0).max(1e-6);
+    let raw = if (scaled - rounded).abs() <= raw_tolerance {
+        rounded
+    } else {
+        scaled.ceil()
+    }
+    .max(0.0) as u128;
+    format_raw_decimal(raw, decimals)
+}
+
+fn hyperliquid_token_amount_is_visible(value: f64, decimals: u8) -> bool {
+    if value <= 0.0 {
+        return false;
+    }
+    if decimals <= hyperliquid_client::wire::WIRE_DECIMALS {
+        return !hyperliquid_is_effectively_zero(value);
+    }
+    let raw_units = value * 10_f64.powi(i32::from(decimals));
+    raw_units >= 0.5
+}
+
+fn format_raw_decimal(raw: u128, decimals: u8) -> String {
+    let decimals = usize::from(decimals);
+    if decimals == 0 {
+        return raw.to_string();
+    }
+    let digits = raw.to_string();
+    let padded = if digits.len() <= decimals {
+        format!("{:0>width$}", digits, width = decimals + 1)
+    } else {
+        digits
+    };
+    let split_at = padded.len() - decimals;
+    let (whole, frac) = padded.split_at(split_at);
+    trim_decimal_string(&format!("{whole}.{frac}"))
+}
+
+fn trim_decimal_string(value: &str) -> String {
+    if value.contains('.') {
+        let trimmed = value.trim_end_matches('0').trim_end_matches('.');
+        if trimmed.is_empty() {
+            "0".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    } else {
+        value.to_string()
+    }
+}
+
 /// Default spot meta served by the mock's `/info { type: "spotMeta" }`. Same
 /// token universe the live devnet uses: USDC + UBTC + UETH, with the two
 /// canonical pairs at indices 140 / 141.
 fn default_hyperliquid_spot_meta() -> SpotMeta {
-    serde_json::from_value(json!({
-        "tokens": [
-            {
-                "name": "USDC",
-                "szDecimals": 8,
-                "weiDecimals": 8,
-                "index": 0,
-                "tokenId": "0x6d1e7cde53ba9467b783cb7c530ce054",
-                "isCanonical": true
+    SpotMeta {
+        tokens: vec![
+            TokenInfo {
+                name: "USDC".to_string(),
+                sz_decimals: 8,
+                wei_decimals: 8,
+                index: 0,
+                token_id: Some("0x6d1e7cde53ba9467b783cb7c530ce054".to_string()),
+                is_canonical: true,
             },
-            {
-                "name": "UBTC",
-                "szDecimals": 5,
-                "weiDecimals": 8,
-                "index": 1,
-                "tokenId": "0x11111111111111111111111111111111",
-                "isCanonical": true
+            TokenInfo {
+                name: "UBTC".to_string(),
+                sz_decimals: 5,
+                wei_decimals: 8,
+                index: 1,
+                token_id: Some("0x11111111111111111111111111111111".to_string()),
+                is_canonical: true,
             },
-            {
-                "name": "UETH",
-                "szDecimals": 4,
-                "weiDecimals": 18,
-                "index": 2,
-                "tokenId": "0x22222222222222222222222222222222",
-                "isCanonical": true
-            }
+            TokenInfo {
+                name: "UETH".to_string(),
+                sz_decimals: 4,
+                wei_decimals: 18,
+                index: 2,
+                token_id: Some("0x22222222222222222222222222222222".to_string()),
+                is_canonical: true,
+            },
         ],
-        "universe": [
-            {
-                "tokens": [1, 0],
-                "name": "@140",
-                "index": 140,
-                "isCanonical": true
+        universe: vec![
+            SpotAssetMeta {
+                tokens: [1, 0],
+                name: "@140".to_string(),
+                index: 140,
+                is_canonical: true,
             },
-            {
-                "tokens": [2, 0],
-                "name": "@141",
-                "index": 141,
-                "isCanonical": true
-            }
-        ]
-    }))
-    .expect("default spot meta fixture is valid")
+            SpotAssetMeta {
+                tokens: [2, 0],
+                name: "@141".to_string(),
+                index: 141,
+                is_canonical: true,
+            },
+        ],
+    }
 }
 
 struct AssetResolution {
@@ -3537,13 +5237,12 @@ impl HyperliquidMockState {
         state
     }
 
-    fn spot_meta_value(&self) -> Value {
-        serde_json::to_value(
-            self.spot_meta
-                .as_ref()
-                .expect("spot meta initialized in `new`"),
-        )
-        .expect("spot meta serializes")
+    fn spot_meta_value(&self) -> Result<Value, String> {
+        let Some(spot_meta) = self.spot_meta.as_ref() else {
+            return Err("mock Hyperliquid spot meta is not initialized".to_string());
+        };
+        serde_json::to_value(spot_meta)
+            .map_err(|error| format!("mock Hyperliquid spot meta failed to serialize: {error}"))
     }
 
     fn allocate_oid(&mut self) -> u64 {
@@ -3584,7 +5283,7 @@ impl HyperliquidMockState {
             .entry(coin.to_string())
             .or_insert(0.0);
         *entry -= amount;
-        if *entry < HYPERLIQUID_AMOUNT_EPSILON {
+        if hyperliquid_is_effectively_zero(*entry) {
             *entry = 0.0;
         }
     }
@@ -3597,7 +5296,7 @@ impl HyperliquidMockState {
             .entry(coin.to_string())
             .or_insert(0.0);
         *entry -= amount;
-        if *entry < HYPERLIQUID_AMOUNT_EPSILON {
+        if hyperliquid_is_effectively_zero(*entry) {
             *entry = 0.0;
         }
     }
@@ -3687,11 +5386,11 @@ impl HyperliquidMockState {
 
     fn resolve_asset(&self, asset: u32) -> Option<AssetResolution> {
         let meta = self.spot_meta.as_ref()?;
-        let pair_index = asset.checked_sub(SPOT_ASSET_INDEX_OFFSET)?;
+        asset.checked_sub(SPOT_ASSET_INDEX_OFFSET)?;
         let pair = meta
             .universe
             .iter()
-            .find(|p| p.index as u32 == pair_index)?;
+            .find(|p| spot_wire_asset_index(p.index) == Some(asset))?;
         let base = meta.tokens.iter().find(|t| t.index == pair.tokens[0])?;
         let quote = meta.tokens.iter().find(|t| t.index == pair.tokens[1])?;
         Some(AssetResolution {
@@ -3765,13 +5464,21 @@ impl HyperliquidMockState {
         })
     }
 
-    fn order_status_snapshot(&self, oid: u64) -> Value {
-        if let Some(open) = self.open_orders.get(&oid) {
+    fn order_status_snapshot(&self, user: Address, oid: u64) -> Value {
+        if let Some(open) = self
+            .open_orders
+            .get(&oid)
+            .filter(|order| order.user == user)
+        {
             json!({
                 "status": "order",
                 "order": self.order_info_envelope(open, "open", open.timestamp),
             })
-        } else if let Some(terminal) = self.terminal_orders.get(&oid) {
+        } else if let Some(terminal) = self
+            .terminal_orders
+            .get(&oid)
+            .filter(|terminal| terminal.order.user == user)
+        {
             json!({
                 "status": "order",
                 "order": self.order_info_envelope(
@@ -3817,23 +5524,23 @@ impl HyperliquidMockState {
         let holds = self.spot_holds_for(user);
         let balances: Vec<Value> = totals
             .iter()
-            .filter(|(coin, total)| {
-                **total > HYPERLIQUID_AMOUNT_EPSILON
-                    || holds.get(*coin).copied().unwrap_or_default() > HYPERLIQUID_AMOUNT_EPSILON
-            })
-            .map(|(coin, total)| {
-                let token_index = meta
-                    .tokens
-                    .iter()
-                    .find(|t| &t.name == coin)
-                    .map_or(0u64, |t| t.index as u64);
+            .filter_map(|(coin, total)| {
+                let token = meta.tokens.iter().find(|t| &t.name == coin);
+                let token_index = token.map_or(0u64, |t| t.index as u64);
+                let token_decimals =
+                    token.map_or(hyperliquid_client::wire::WIRE_DECIMALS, |t| t.wei_decimals);
                 let hold = holds.get(coin).copied().unwrap_or_default();
-                json!({
+                if !hyperliquid_token_amount_is_visible(*total, token_decimals)
+                    && !hyperliquid_token_amount_is_visible(hold, token_decimals)
+                {
+                    return None;
+                }
+                Some(json!({
                     "coin": coin,
                     "token": token_index,
-                    "hold": format_hl_amount(hold),
-                    "total": format_hl_amount(*total),
-                })
+                    "hold": format_hl_token_amount(hold, token_decimals),
+                    "total": format_hl_token_amount(*total, token_decimals),
+                }))
             })
             .collect();
         json!({ "balances": balances })
@@ -3921,11 +5628,7 @@ impl HyperliquidMockState {
                 if resolution.base_symbol != base || resolution.quote_symbol != quote {
                     return None;
                 }
-                let crosses = if order.is_buy {
-                    order.limit_px + HYPERLIQUID_AMOUNT_EPSILON >= rate
-                } else {
-                    order.limit_px <= rate + HYPERLIQUID_AMOUNT_EPSILON
-                };
+                let crosses = hyperliquid_order_crosses(order.is_buy, order.limit_px, rate);
                 crosses.then_some(*oid)
             })
             .collect();
@@ -3943,15 +5646,16 @@ impl HyperliquidMockState {
                 &mut remaining_bid_depth
             };
             let fill_sz = order.sz.min((*side_depth).max(0.0));
-            if fill_sz <= HYPERLIQUID_AMOUNT_EPSILON {
+            if hyperliquid_is_effectively_zero(fill_sz) {
                 self.open_orders.insert(order.oid, order);
                 continue;
             }
 
+            let execution_px = hyperliquid_execution_px(order.is_buy, order.limit_px, rate);
             let (debit_coin, debit_amount, credit_coin, credit_amount) = if order.is_buy {
                 (
                     resolution.quote_symbol.clone(),
-                    fill_sz * rate,
+                    fill_sz * execution_px,
                     resolution.base_symbol.clone(),
                     fill_sz,
                 )
@@ -3960,11 +5664,13 @@ impl HyperliquidMockState {
                     resolution.base_symbol.clone(),
                     fill_sz,
                     resolution.quote_symbol.clone(),
-                    fill_sz * rate,
+                    fill_sz * execution_px,
                 )
             };
-            if self.spot_total(order.user, &debit_coin) + HYPERLIQUID_AMOUNT_EPSILON < debit_amount
-            {
+            if !hyperliquid_has_sufficient_amount(
+                self.spot_total(order.user, &debit_coin),
+                debit_amount,
+            ) {
                 self.terminal_orders.insert(
                     order.oid,
                     TerminalOrder {
@@ -3989,7 +5695,7 @@ impl HyperliquidMockState {
                     tid,
                     coin: resolution.pair_name.clone(),
                     is_buy: order.is_buy,
-                    px: rate,
+                    px: execution_px,
                     sz: fill_sz,
                     time: timestamp,
                     fee: 0.0,
@@ -4001,7 +5707,7 @@ impl HyperliquidMockState {
                 },
             );
             order.sz = (order.sz - fill_sz).max(0.0);
-            if order.sz <= HYPERLIQUID_AMOUNT_EPSILON {
+            if hyperliquid_is_effectively_zero(order.sz) {
                 self.terminal_orders.insert(
                     order.oid,
                     TerminalOrder {
@@ -4071,7 +5777,27 @@ async fn complete_mock_unit_operation(
     state: &Arc<MockIntegratorState>,
     protocol_address: &str,
 ) -> Result<(), String> {
-    let maybe_deposit_credit = {
+    complete_mock_unit_operation_with_observation(state, protocol_address, None).await
+}
+
+struct UnitOperationObservation {
+    source_amount: String,
+    source_tx_hash: Option<String>,
+}
+
+struct MockUnitEvmWithdrawalRelease {
+    protocol_address: String,
+    dst_chain: UnitChain,
+    dst_addr: String,
+    amount: String,
+}
+
+async fn complete_mock_unit_operation_with_observation(
+    state: &Arc<MockIntegratorState>,
+    protocol_address: &str,
+    observation: Option<UnitOperationObservation>,
+) -> Result<(), String> {
+    let (maybe_deposit_credit, maybe_evm_withdrawal_release) = {
         let mut operations = state.unit_operations.lock().await;
         let entries = operations
             .get_mut(protocol_address)
@@ -4111,6 +5837,17 @@ async fn complete_mock_unit_operation(
             .operation
             .state_next_attempt_at
             .get_or_insert_with(|| Utc::now().to_rfc3339());
+        if let Some(observation) = observation {
+            entry.operation.source_amount = Some(observation.source_amount);
+            if let Some(source_tx_hash) = observation.source_tx_hash {
+                entry.operation.source_tx_hash = Some(source_tx_hash);
+            }
+        }
+        if entry.operation.source_amount.is_none() {
+            return Err(format!(
+                "mock unit operation {protocol_address} cannot complete without source_amount evidence"
+            ));
+        }
         if entry.operation.source_address.is_none()
             && matches!(entry.kind, MockUnitOperationKind::Deposit)
         {
@@ -4129,38 +5866,186 @@ async fn complete_mock_unit_operation(
         if entry.operation.destination_fee_amount.is_none()
             || entry.operation.sweep_fee_amount.is_none()
         {
-            let (destination_fee_amount, sweep_fee_amount) = default_mock_unit_fee_amounts(entry);
+            let (destination_fee_amount, sweep_fee_amount) = default_mock_unit_fee_amounts();
             entry.operation.destination_fee_amount = Some(destination_fee_amount);
             entry.operation.sweep_fee_amount = Some(sweep_fee_amount);
         }
         entry.operation.source_tx_confirmations = None;
         entry.operation.destination_tx_confirmations = Some(10);
-        match entry.kind {
+        let maybe_deposit_credit = match entry.kind {
             MockUnitOperationKind::Deposit if matches!(entry.dst_chain, UnitChain::Hyperliquid) => {
-                let Some(user) = Address::from_str(&entry.dst_addr).ok() else {
-                    return Ok(());
-                };
+                let user = Address::from_str(&entry.dst_addr).map_err(|err| {
+                    format!(
+                        "mock unit operation {protocol_address} has invalid Hyperliquid destination {}: {err}",
+                        entry.dst_addr
+                    )
+                })?;
                 let coin = hyperliquid_coin_for_unit_asset(entry.asset);
                 let net_amount = net_hyperunit_credit_amount(
                     entry.asset,
-                    entry.operation.source_amount.as_deref(),
+                    entry
+                        .operation
+                        .source_amount
+                        .as_deref()
+                        .expect("source_amount checked above"),
                     entry.operation.destination_fee_amount.as_deref(),
                     entry.operation.sweep_fee_amount.as_deref(),
-                );
+                )?;
                 Some((user, coin, net_amount))
             }
             _ => None,
-        }
+        };
+        let maybe_evm_withdrawal_release = match entry.kind {
+            MockUnitOperationKind::Withdrawal
+                if matches!(entry.dst_chain, UnitChain::Ethereum | UnitChain::Base)
+                    && matches!(entry.asset, UnitAsset::Eth) =>
+            {
+                let amount = entry.operation.source_amount.clone().ok_or_else(|| {
+                    format!(
+                        "mock unit operation {protocol_address} cannot release withdrawal without source_amount evidence"
+                    )
+                })?;
+                Some(MockUnitEvmWithdrawalRelease {
+                    protocol_address: protocol_address.to_string(),
+                    dst_chain: entry.dst_chain,
+                    dst_addr: entry.dst_addr.clone(),
+                    amount,
+                })
+            }
+            _ => None,
+        };
+        (maybe_deposit_credit, maybe_evm_withdrawal_release)
     };
 
     if let Some((user, coin, amount)) = maybe_deposit_credit {
-        if amount > HYPERLIQUID_AMOUNT_EPSILON {
+        if amount > 0.0 {
             let mut hl = state.hyperliquid.lock().await;
             hl.credit_spot(user, coin, amount);
         }
     }
+    if let Some(release) = maybe_evm_withdrawal_release {
+        let tx_hash = match send_mock_unit_evm_withdrawal_release(state, &release).await {
+            Ok(tx_hash) => tx_hash,
+            Err(error) => {
+                mark_mock_unit_operation_failed(state, &release.protocol_address).await;
+                return Err(error);
+            }
+        };
+        let mut operations = state.unit_operations.lock().await;
+        if let Some(entry) = operations
+            .get_mut(&release.protocol_address)
+            .and_then(|entries| entries.last_mut())
+        {
+            entry.operation.destination_tx_hash = Some(tx_hash);
+        }
+    }
 
     Ok(())
+}
+
+async fn mark_mock_unit_operation_failed(state: &Arc<MockIntegratorState>, protocol_address: &str) {
+    let mut operations = state.unit_operations.lock().await;
+    if let Some(entry) = operations
+        .get_mut(protocol_address)
+        .and_then(|entries| entries.last_mut())
+    {
+        entry.visible = true;
+        entry.operation.state = Some("failure".to_string());
+        entry.operation.destination_tx_hash = None;
+        entry.operation.state_updated_at = Some(Utc::now().to_rfc3339());
+        entry.operation.state_next_attempt_at = None;
+    }
+}
+
+async fn send_mock_unit_evm_withdrawal_release(
+    state: &Arc<MockIntegratorState>,
+    release: &MockUnitEvmWithdrawalRelease,
+) -> Result<String, String> {
+    let Some(rpc_url) = state
+        .unit_evm_rpc_urls
+        .get(release.dst_chain.as_wire_str())
+        .cloned()
+    else {
+        return Err(format!(
+            "mock Unit withdrawal release has no EVM RPC URL for {}",
+            release.dst_chain
+        ));
+    };
+    let destination = Address::from_str(&release.dst_addr).map_err(|err| {
+        format!(
+            "mock Unit withdrawal release destination {:?} is invalid: {err}",
+            release.dst_addr
+        )
+    })?;
+    let amount = parse_unit_decimal_amount_to_raw(&release.amount, 18)?;
+    if amount == U256::ZERO {
+        return Err(format!(
+            "mock Unit withdrawal release amount {:?} is zero",
+            release.amount
+        ));
+    }
+
+    let provider: DynProvider = ProviderBuilder::new()
+        .connect(&rpc_url)
+        .await
+        .map_err(|err| format!("mock Unit withdrawal release connect failed: {err}"))?
+        .erased();
+    let sender = provider
+        .get_accounts()
+        .await
+        .map_err(|err| format!("mock Unit withdrawal release get_accounts failed: {err}"))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "mock Unit withdrawal release requires one unlocked account".to_string())?;
+    let tx = TransactionRequest::default()
+        .with_from(sender)
+        .with_to(destination)
+        .with_value(amount);
+    let pending = provider
+        .send_transaction(tx)
+        .await
+        .map_err(|err| format!("mock Unit withdrawal release send_transaction failed: {err}"))?;
+    let tx_hash = *pending.tx_hash();
+    let receipt = pending
+        .get_receipt()
+        .await
+        .map_err(|err| format!("mock Unit withdrawal release receipt failed: {err}"))?;
+    if receipt.status() {
+        Ok(tx_hash.to_string())
+    } else {
+        Err(format!(
+            "mock Unit withdrawal release transaction {tx_hash:#x} reverted"
+        ))
+    }
+}
+
+fn parse_unit_decimal_amount_to_raw(value: &str, decimals: u8) -> Result<U256, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("mock Unit amount is empty".to_string());
+    }
+    let (whole, fractional) = value.split_once('.').unwrap_or((value, ""));
+    if whole.is_empty() || !whole.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err(format!("mock Unit amount {value:?} has invalid whole part"));
+    }
+    if !fractional.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err(format!(
+            "mock Unit amount {value:?} has invalid fractional part"
+        ));
+    }
+    let decimals = usize::from(decimals);
+    if fractional.len() > decimals {
+        return Err(format!(
+            "mock Unit amount {value:?} has more than {decimals} decimal places"
+        ));
+    }
+
+    let mut digits = String::with_capacity(whole.len() + decimals);
+    digits.push_str(whole);
+    digits.push_str(fractional);
+    digits.extend(std::iter::repeat_n('0', decimals - fractional.len()));
+    U256::from_str_radix(&digits, 10)
+        .map_err(|err| format!("mock Unit amount {value:?} does not fit U256: {err}"))
 }
 
 fn default_mock_unit_source_tx_hash(entry: &MockUnitOperationEntry) -> String {
@@ -4212,59 +6097,49 @@ fn mock_unit_operation_entropy(entry: &MockUnitOperationEntry) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-fn default_mock_unit_fee_amounts(entry: &MockUnitOperationEntry) -> (String, String) {
-    let source_amount = entry
-        .operation
-        .source_amount
-        .as_deref()
-        .and_then(|raw| raw.parse::<f64>().ok())
-        .unwrap_or_default();
-    if source_amount <= 0.0 {
-        return ("0".to_string(), "0".to_string());
-    }
-
-    match (entry.kind, entry.asset) {
-        (MockUnitOperationKind::Deposit, UnitAsset::Eth) => (
-            trim_float_string(source_amount * 0.049_758_464_122_074_1),
-            trim_float_string(source_amount * 0.014_217_524_924_4),
-        ),
-        (MockUnitOperationKind::Deposit, UnitAsset::Btc) => (
-            trim_float_string(source_amount * 0.005),
-            trim_float_string(source_amount * 0.001),
-        ),
-        (MockUnitOperationKind::Deposit, _) => (
-            trim_float_string(source_amount * 0.005),
-            trim_float_string(source_amount * 0.001),
-        ),
-        (MockUnitOperationKind::Withdrawal, _) => ("0".to_string(), "0".to_string()),
-    }
+fn default_mock_unit_fee_amounts() -> (String, String) {
+    ("0".to_string(), "0".to_string())
 }
 
 fn net_hyperunit_credit_amount(
     asset: UnitAsset,
-    source_amount: Option<&str>,
+    source_amount: &str,
     destination_fee_amount: Option<&str>,
     sweep_fee_amount: Option<&str>,
-) -> f64 {
+) -> Result<f64, String> {
     let decimals = match asset {
         UnitAsset::Btc => 8,
         UnitAsset::Eth => 18,
         _ => 18,
     };
-    let source_amount = parse_scaled_decimal(source_amount, decimals);
-    let destination_fee_amount = parse_scaled_decimal(destination_fee_amount, decimals);
-    let sweep_fee_amount = parse_scaled_decimal(sweep_fee_amount, decimals);
-    (source_amount - destination_fee_amount - sweep_fee_amount).max(0.0)
+    let source_amount = parse_required_scaled_decimal(source_amount, decimals, "source_amount")?;
+    let destination_fee_amount =
+        parse_optional_scaled_decimal(destination_fee_amount, decimals, "destination_fee_amount")?;
+    let sweep_fee_amount =
+        parse_optional_scaled_decimal(sweep_fee_amount, decimals, "sweep_fee_amount")?;
+    Ok((source_amount - destination_fee_amount - sweep_fee_amount).max(0.0))
 }
 
-fn parse_scaled_decimal(value: Option<&str>, decimals: u32) -> f64 {
+fn parse_optional_scaled_decimal(
+    value: Option<&str>,
+    decimals: u32,
+    field: &'static str,
+) -> Result<f64, String> {
     let Some(value) = value else {
-        return 0.0;
+        return Ok(0.0);
     };
-    let Ok(raw) = value.parse::<f64>() else {
-        return 0.0;
-    };
-    raw / 10f64.powi(decimals as i32)
+    parse_required_scaled_decimal(value, decimals, field)
+}
+
+fn parse_required_scaled_decimal(
+    value: &str,
+    decimals: u32,
+    field: &'static str,
+) -> Result<f64, String> {
+    let raw = value
+        .parse::<f64>()
+        .map_err(|err| format!("mock Unit {field} {value:?} is not numeric: {err}"))?;
+    Ok(raw / 10f64.powi(decimals as i32))
 }
 
 fn hyperliquid_coin_for_unit_asset(asset: UnitAsset) -> &'static str {
@@ -4272,21 +6147,6 @@ fn hyperliquid_coin_for_unit_asset(asset: UnitAsset) -> &'static str {
         UnitAsset::Btc => "UBTC",
         UnitAsset::Eth => "UETH",
         _ => "UETH",
-    }
-}
-
-fn trim_float_string(value: f64) -> String {
-    let mut rendered = format!("{value:.18}");
-    while rendered.contains('.') && rendered.ends_with('0') {
-        rendered.pop();
-    }
-    if rendered.ends_with('.') {
-        rendered.pop();
-    }
-    if rendered.is_empty() {
-        "0".to_string()
-    } else {
-        rendered
     }
 }
 
@@ -4348,47 +6208,53 @@ fn latest_active_unit_operation_mut(
         .find(|entry| !entry.operation.classified_state().is_terminal())
 }
 
-/// Deterministic "protocol address" the mock returns from `/gen`. The real
-/// HyperUnit service returns a fresh random address per request; for tests the
-/// same `(src, dst, asset, dst_addr)` tuple must resolve to the same mock
-/// address so assertions can match up input and observed state.
-fn derive_mock_protocol_address(
-    src_chain: &str,
-    dst_chain: &str,
-    asset: &str,
-    dst_addr: &str,
-) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(src_chain.as_bytes());
-    hasher.update(b"|");
-    hasher.update(dst_chain.as_bytes());
-    hasher.update(b"|");
-    hasher.update(asset.as_bytes());
-    hasher.update(b"|");
-    hasher.update(dst_addr.as_bytes());
-    let digest: [u8; 32] = hasher.finalize().into();
-    if src_chain == UnitChain::Bitcoin.as_wire_str()
-        && dst_chain == UnitChain::Hyperliquid.as_wire_str()
-    {
-        return derive_mock_regtest_bitcoin_address(digest);
-    }
-    format!("0x{}", hex::encode(&digest[..20]))
+struct MockUnitProtocolWallet {
+    address: String,
+    key: MockUnitProtocolKey,
 }
 
-fn derive_mock_regtest_bitcoin_address(seed: [u8; 32]) -> String {
-    let secp = bitcoin::secp256k1::Secp256k1::new();
-    let mut secret = seed;
-    for tweak in 0..=u8::MAX {
-        secret[31] = seed[31].wrapping_add(tweak);
-        if let Ok(secret_key) = bitcoin::secp256k1::SecretKey::from_slice(&secret) {
-            let private_key = bitcoin::PrivateKey::new(secret_key, bitcoin::Network::Regtest);
-            let public_key = bitcoin::CompressedPublicKey::from_private_key(&secp, &private_key)
-                .expect("secret key should derive a compressed public key");
-            return bitcoin::Address::p2wpkh(&public_key, bitcoin::Network::Regtest).to_string();
-        }
+/// Fresh mock protocol address returned from `/gen`. Bitcoin deposits receive
+/// a regtest BTC address; all other Unit flows use an EVM/Hyperliquid address.
+fn fresh_mock_protocol_wallet(
+    src_chain: UnitChain,
+    dst_chain: UnitChain,
+) -> MockUnitProtocolWallet {
+    if src_chain == UnitChain::Bitcoin && dst_chain == UnitChain::Hyperliquid {
+        return fresh_mock_regtest_bitcoin_wallet();
     }
-    "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string()
+
+    let signer = PrivateKeySigner::random();
+    MockUnitProtocolWallet {
+        address: format!("{:#x}", signer.address()),
+        key: MockUnitProtocolKey {
+            private_key: format!("0x{}", hex::encode(signer.to_bytes())),
+        },
+    }
+}
+
+fn fresh_mock_regtest_bitcoin_wallet() -> MockUnitProtocolWallet {
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let mut rng = bitcoin::key::rand::thread_rng();
+    loop {
+        let secret_key = bitcoin::secp256k1::SecretKey::new(&mut rng);
+        let private_key = bitcoin::PrivateKey::new(secret_key, bitcoin::Network::Regtest);
+        let public_key = match bitcoin::CompressedPublicKey::from_private_key(&secp, &private_key) {
+            Ok(public_key) => public_key,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "generated mock Unit Bitcoin private key without compressed public key"
+                );
+                continue;
+            }
+        };
+        return MockUnitProtocolWallet {
+            address: bitcoin::Address::p2wpkh(&public_key, bitcoin::Network::Regtest).to_string(),
+            key: MockUnitProtocolKey {
+                private_key: private_key.to_wif(),
+            },
+        };
+    }
 }
 
 fn base_url(addr: SocketAddr) -> String {
@@ -4428,6 +6294,7 @@ fn validate_across_request(
     state: &MockIntegratorState,
     headers: &HeaderMap,
     integrator_id: Option<&str>,
+    require_integrator_id: bool,
 ) -> Result<(), Box<axum::response::Response>> {
     if let Some(expected_api_key) = state.across_api_key.as_deref() {
         let expected = format!("Bearer {expected_api_key}");
@@ -4445,15 +6312,17 @@ fn validate_across_request(
         }
     }
 
-    if let Some(expected_integrator_id) = state.across_integrator_id.as_deref() {
-        if integrator_id != Some(expected_integrator_id) {
-            return Err(Box::new(mock_across_error_response(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "validation_error",
-                "invalid_integrator_id",
-                "integratorId is required",
-                Some("integratorId"),
-            )));
+    if require_integrator_id {
+        if let Some(expected_integrator_id) = state.across_integrator_id.as_deref() {
+            if integrator_id != Some(expected_integrator_id) {
+                return Err(Box::new(mock_across_error_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "validation_error",
+                    "invalid_integrator_id",
+                    "integratorId is required",
+                    Some("integratorId"),
+                )));
+            }
         }
     }
 
@@ -4494,8 +6363,374 @@ fn error_response(status: StatusCode, error: impl Into<String>) -> axum::respons
 mod tests {
     use super::*;
     use alloy::sol_types::SolCall;
+    use axum::{body::to_bytes, response::IntoResponse};
     use blockchain_utils::create_websocket_wallet_provider;
     use eip3009_erc20_contract::GenericEIP3009ERC20::GenericEIP3009ERC20Instance;
+
+    #[test]
+    fn mock_evm_log_indexers_backfill_existing_chain_history() {
+        assert_eq!(mock_evm_indexer_initial_last_scanned(), 0);
+    }
+
+    #[test]
+    fn unit_protocol_key_debug_redacts_private_key() {
+        let key = MockUnitProtocolKey {
+            private_key: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_string(),
+        };
+
+        let rendered = format!("{key:?}");
+
+        assert!(!rendered.contains("aaaaaaaa"));
+        assert!(rendered.contains("redacted"));
+    }
+
+    #[test]
+    fn mock_integrator_url_errors_redact_secret_material() {
+        let redacted = sanitize_url_for_error(
+            "https://rpc-user:rpc-pass@rpc.example/v2/path-secret?api_key=query-secret#fragment-secret",
+        );
+
+        assert_eq!(
+            redacted,
+            "https://rpc.example/<redacted-path>?<redacted-query>#<redacted-fragment>"
+        );
+        assert!(!redacted.contains("rpc-user"));
+        assert!(!redacted.contains("rpc-pass"));
+        assert!(!redacted.contains("path-secret"));
+        assert!(!redacted.contains("query-secret"));
+        assert!(!redacted.contains("fragment-secret"));
+
+        let invalid = sanitize_url_for_error("not a url with secret-token");
+        assert_eq!(invalid, "<invalid url>");
+        assert!(!invalid.contains("secret-token"));
+    }
+
+    #[test]
+    fn spot_clearinghouse_snapshot_preserves_token_wei_decimals() {
+        let mut state = HyperliquidMockState::new();
+        let user = Address::repeat_byte(0x66);
+        state.credit_spot(user, "UETH", 0.044810844333333334);
+
+        let snapshot = state.spot_clearinghouse_snapshot(user);
+        let total = snapshot["balances"][0]["total"]
+            .as_str()
+            .expect("ueth total");
+
+        assert_ne!(total, "0.04481084");
+        assert!(
+            total.starts_with("0.0448108443333333"),
+            "unexpected UETH balance precision: {total}"
+        );
+    }
+
+    #[test]
+    fn mock_across_quote_math_rejects_overflow() {
+        assert_eq!(apply_mock_across_discount(1_000, 100).unwrap(), 990);
+        assert_eq!(gross_up_mock_across_input(990, 100).unwrap(), 1_000);
+
+        assert!(apply_mock_across_discount(u128::MAX, 100).is_err());
+        assert!(gross_up_mock_across_input(u128::MAX, 100).is_err());
+
+        let pct = mock_across_fee_pct_string(1, u128::MAX);
+        assert_eq!(
+            pct,
+            (U256::from(u128::MAX) * U256::from(1_000_000_000_000_000_000_u128)).to_string()
+        );
+    }
+
+    #[test]
+    fn mock_across_fee_components_sum_to_total_without_saturation() {
+        for fee_amount in [0, 1, 39, 40, 41, 100, 140, 141, 1_000, u128::MAX] {
+            let components = mock_across_fee_components(fee_amount);
+            assert_eq!(
+                components.destination_gas + components.lp + components.relayer_capital,
+                fee_amount
+            );
+        }
+
+        assert_eq!(
+            mock_across_fee_components(39),
+            MockAcrossFeeComponents {
+                destination_gas: 0,
+                lp: 39,
+                relayer_capital: 0
+            }
+        );
+        assert_eq!(
+            mock_across_fee_components(141),
+            MockAcrossFeeComponents {
+                destination_gas: 1,
+                lp: 40,
+                relayer_capital: 100
+            }
+        );
+    }
+
+    #[test]
+    fn mock_across_destination_chain_id_rejects_unrepresentable_values() {
+        assert_eq!(
+            mock_across_destination_chain_id(U256::from(u64::MAX)).unwrap(),
+            u64::MAX
+        );
+        assert!(
+            mock_across_destination_chain_id(U256::from(u64::MAX) + U256::from(1_u64)).is_err()
+        );
+    }
+
+    #[test]
+    fn mock_native_destination_credit_rejects_balance_overflow() {
+        assert_eq!(
+            checked_native_credit_balance(U256::from(40_u64), U256::from(2_u64)).unwrap(),
+            U256::from(42_u64)
+        );
+        assert!(checked_native_credit_balance(U256::MAX, U256::from(1_u64)).is_err());
+    }
+
+    #[test]
+    fn spot_clearinghouse_snapshot_exposes_high_precision_token_dust() {
+        let mut state = HyperliquidMockState::new();
+        let user = Address::repeat_byte(0x66);
+        state.credit_spot(user, "UETH", 1e-15);
+
+        let snapshot = state.spot_clearinghouse_snapshot(user);
+        let total = snapshot["balances"][0]["total"]
+            .as_str()
+            .expect("ueth total");
+
+        assert_eq!(total, "0.000000000000001");
+    }
+
+    #[test]
+    fn spot_balance_formatting_rounds_float_dust_up_to_token_precision() {
+        assert_eq!(format_hl_token_amount(0.068_2, 18), "0.0682");
+    }
+
+    #[test]
+    fn hyperliquid_mock_resolve_asset_rejects_wrapped_pair_indexes() {
+        let Ok(overflow_index) = usize::try_from(u64::from(u32::MAX) + 1 + 140) else {
+            return;
+        };
+        let mut state = HyperliquidMockState::new();
+        state.spot_meta.as_mut().expect("spot meta").universe = vec![SpotAssetMeta {
+            tokens: [1, 0],
+            name: "@overflow".to_string(),
+            index: overflow_index,
+            is_canonical: false,
+        }];
+
+        assert!(state.resolve_asset(10_140).is_none());
+    }
+
+    async fn spawn_mock_velora_server() -> MockIntegratorServer {
+        MockIntegratorServer::spawn_with_config(
+            MockIntegratorConfig::default()
+                .with_velora_swap_contract_address(1, "0x0000000000000000000000000000000000000002"),
+        )
+        .await
+        .expect("spawn mock integrator")
+    }
+
+    #[tokio::test]
+    async fn mock_cctp_messages_honor_attestation_latency() {
+        let state = Arc::new(MockIntegratorState::new(
+            &MockIntegratorConfig::default().with_cctp_attestation_latency(Duration::from_secs(60)),
+        ));
+        state
+            .cctp_burns
+            .lock()
+            .await
+            .insert("0xburn".to_string(), mock_cctp_burn_record(Utc::now()));
+
+        let pending = mock_cctp_message_body(state.clone(), "0xburn").await;
+        assert_eq!(pending["messages"][0]["status"], "pending_confirmations");
+        assert!(pending["messages"][0]["attestation"].is_null());
+
+        state.cctp_burns.lock().await.insert(
+            "0xburn".to_string(),
+            mock_cctp_burn_record(Utc::now() - ChronoDuration::seconds(61)),
+        );
+        let complete = mock_cctp_message_body(state, "0xburn").await;
+        assert_eq!(complete["messages"][0]["status"], "complete");
+        assert!(complete["messages"][0]["attestation"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("0x")));
+    }
+
+    #[tokio::test]
+    async fn mock_cctp_messages_can_return_failed_attestation() {
+        let state = Arc::new(MockIntegratorState::new(
+            &MockIntegratorConfig::default().with_cctp_attestation_failure("iris rejected burn"),
+        ));
+        state
+            .cctp_burns
+            .lock()
+            .await
+            .insert("0xburn".to_string(), mock_cctp_burn_record(Utc::now()));
+
+        let failed = mock_cctp_message_body(state, "0xburn").await;
+        assert_eq!(failed["messages"][0]["status"], "failed");
+        assert_eq!(failed["messages"][0]["error"], "iris rejected burn");
+        assert!(failed["messages"][0]["attestation"].is_null());
+    }
+
+    #[tokio::test]
+    async fn mock_velora_prices_sell_eth_to_usdc_uses_prices_and_decimals() {
+        let server = spawn_mock_velora_server().await;
+        let url = format!(
+            "{}/prices?srcToken={}&destToken=0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48&srcDecimals=18&destDecimals=6&amount=1000000000000000000&side=SELL&network=1",
+            server.base_url(),
+            VELORA_NATIVE_TOKEN
+        );
+        let body: Value = reqwest::get(&url)
+            .await
+            .expect("http get")
+            .error_for_status()
+            .expect("200 ok")
+            .json()
+            .await
+            .expect("json body");
+
+        assert_eq!(body["priceRoute"]["srcAmount"], "1000000000000000000");
+        assert_eq!(body["priceRoute"]["destAmount"], "3000000000");
+    }
+
+    #[tokio::test]
+    async fn mock_velora_prices_buy_usdc_with_eth_uses_prices_and_decimals() {
+        let server = spawn_mock_velora_server().await;
+        let url = format!(
+            "{}/prices?srcToken={}&destToken=0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48&srcDecimals=18&destDecimals=6&amount=3000000000&side=BUY&network=1",
+            server.base_url(),
+            VELORA_NATIVE_TOKEN
+        );
+        let body: Value = reqwest::get(&url)
+            .await
+            .expect("http get")
+            .error_for_status()
+            .expect("200 ok")
+            .json()
+            .await
+            .expect("json body");
+
+        assert_eq!(body["priceRoute"]["srcAmount"], "1000000000000000000");
+        assert_eq!(body["priceRoute"]["destAmount"], "3000000000");
+    }
+
+    #[tokio::test]
+    async fn mock_velora_prices_sell_usdc_to_eth_uses_prices_and_decimals() {
+        let server = spawn_mock_velora_server().await;
+        let url = format!(
+            "{}/prices?srcToken=0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48&destToken={}&srcDecimals=6&destDecimals=18&amount=60000000&side=SELL&network=1",
+            server.base_url(),
+            VELORA_NATIVE_TOKEN
+        );
+        let body: Value = reqwest::get(&url)
+            .await
+            .expect("http get")
+            .error_for_status()
+            .expect("200 ok")
+            .json()
+            .await
+            .expect("json body");
+
+        assert_eq!(body["priceRoute"]["srcAmount"], "60000000");
+        assert_eq!(body["priceRoute"]["destAmount"], "20000000000000000");
+    }
+
+    #[tokio::test]
+    async fn mock_velora_prices_unknown_erc20_with_deterministic_mock_price() {
+        let server = spawn_mock_velora_server().await;
+        let url = format!(
+            "{}/prices?srcToken=0x3333333333333333333333333333333333333333&destToken=0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48&srcDecimals=18&destDecimals=6&amount=1000000000000000000&side=SELL&network=1",
+            server.base_url()
+        );
+        let body: Value = reqwest::get(&url)
+            .await
+            .expect("http get")
+            .error_for_status()
+            .expect("200 ok")
+            .json()
+            .await
+            .expect("json body");
+
+        assert_eq!(body["priceRoute"]["srcAmount"], "1000000000000000000");
+        assert_eq!(body["priceRoute"]["destAmount"], "1000000");
+    }
+
+    #[tokio::test]
+    async fn mock_velora_transaction_rejects_missing_required_fields() {
+        let server = spawn_mock_velora_server().await;
+        let base_body = json!({
+            "srcToken": VELORA_NATIVE_TOKEN,
+            "destToken": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+            "receiver": "0x1111111111111111111111111111111111111111",
+            "priceRoute": {
+                "srcAmount": "1000000000000000000",
+                "destAmount": "3000000000"
+            }
+        });
+        let cases = [
+            ("srcToken", "missing srcToken"),
+            ("destToken", "missing destToken"),
+            ("receiver", "missing receiver or userAddress"),
+        ];
+
+        for (field, expected_message) in cases {
+            let mut body = base_body.clone();
+            body.as_object_mut().expect("object body").remove(field);
+            let response = reqwest::Client::new()
+                .post(format!("{}/transactions/1", server.base_url()))
+                .json(&body)
+                .send()
+                .await
+                .expect("http");
+
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let error: Value = response.json().await.expect("error body");
+            assert_eq!(error["error"], "invalid_request");
+            assert_eq!(error["message"], expected_message);
+        }
+    }
+
+    async fn mock_cctp_message_body(state: Arc<MockIntegratorState>, tx_hash: &str) -> Value {
+        let response = mock_cctp_messages(
+            State(state),
+            Path(0),
+            Query(MockCctpMessagesQuery {
+                transaction_hash: Some(tx_hash.to_string()),
+                nonce: None,
+            }),
+        )
+        .await
+        .into_response();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+        serde_json::from_slice(&bytes).expect("cctp message json")
+    }
+
+    fn mock_cctp_burn_record(indexed_at: DateTime<Utc>) -> MockCctpBurnRecord {
+        MockCctpBurnRecord {
+            source_domain: 0,
+            destination_domain: 3,
+            nonce: 7,
+            burn_token: Address::repeat_byte(0x11),
+            destination_token: Address::repeat_byte(0x22),
+            depositor: Address::repeat_byte(0x33),
+            mint_recipient: Address::repeat_byte(0x44),
+            amount: U256::from(1_000_000_u64),
+            burn_tx_hash: "0xburn".to_string(),
+            block_number: 42,
+            indexed_at,
+        }
+    }
 
     /// The mock `GET /swap/approval` returns a `swapTx` whose calldata must
     /// decode back to a real `deposit(...)` call with the exact args derived
@@ -4703,6 +6938,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mock_deposit_status_requires_auth_but_not_integrator_id() {
+        let server = MockIntegratorServer::spawn_with_config(
+            MockIntegratorConfig::default().with_across_auth("test-key", "rift-test"),
+        )
+        .await
+        .expect("spawn mock integrator");
+        let url = format!(
+            "{}/deposit/status?originChainId=1&depositId=0",
+            server.base_url()
+        );
+        let client = reqwest::Client::new();
+
+        let unauth = client.get(&url).send().await.expect("unauth request");
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+        let ok: Value = client
+            .get(&url)
+            .bearer_auth("test-key")
+            .send()
+            .await
+            .expect("authenticated request")
+            .error_for_status()
+            .expect("200")
+            .json()
+            .await
+            .expect("json");
+        assert_eq!(ok["status"].as_str(), Some("pending"));
+    }
+
+    #[tokio::test]
     async fn mock_swap_approval_supports_min_output_with_deterministic_fee() {
         let spoke_pool = "0xACE055C0C055D0C035E47055D05E7055055BACE0";
         let native_zero = "0x0000000000000000000000000000000000000000";
@@ -4814,6 +7079,148 @@ mod tests {
             Some(amount.to_string()).as_deref()
         );
         assert!(body["steps"].get("approve").is_none());
+    }
+
+    #[tokio::test]
+    async fn mock_swap_approval_uses_origin_chain_rpc_for_erc20_checks() {
+        use alloy::node_bindings::Anvil;
+
+        let fallback_anvil = Anvil::new()
+            .chain_id(31_337)
+            .block_time(1)
+            .try_spawn()
+            .expect("fallback anvil spawn");
+        let origin_anvil = Anvil::new()
+            .chain_id(84_530)
+            .block_time(1)
+            .try_spawn()
+            .expect("origin anvil spawn");
+
+        let origin_ws_url = origin_anvil.ws_endpoint_url().to_string();
+        let private_key: [u8; 32] = origin_anvil.keys()[0].clone().to_bytes().into();
+        let provider = create_websocket_wallet_provider(&origin_ws_url, private_key)
+            .await
+            .expect("origin ws wallet provider");
+        let provider: DynProvider = provider.erased();
+
+        let token = GenericEIP3009ERC20Instance::deploy(provider.clone())
+            .await
+            .expect("deploy token");
+        let token_address = *token.address();
+        let depositor = origin_anvil.addresses()[0];
+        let recipient = origin_anvil.addresses()[1];
+        let origin_spoke_pool = Address::from_str("0xACE055C0C055D0C035E47055D05E7055055BACE0")
+            .expect("origin spoke pool");
+        let fallback_spoke_pool = Address::from_str("0x00000000000000000000000000000000000000aC")
+            .expect("fallback spoke pool");
+        let amount = U256::from(1_000_000_u64);
+
+        token
+            .mint(depositor, amount)
+            .send()
+            .await
+            .expect("mint send")
+            .get_receipt()
+            .await
+            .expect("mint receipt");
+        token
+            .approve(origin_spoke_pool, amount)
+            .send()
+            .await
+            .expect("approve send")
+            .get_receipt()
+            .await
+            .expect("approve receipt");
+
+        let server = MockIntegratorServer::spawn_with_config(
+            MockIntegratorConfig::default()
+                .with_across_spoke_pool_address(format!("{fallback_spoke_pool:#x}"))
+                .with_across_evm_rpc_url(fallback_anvil.ws_endpoint_url().to_string())
+                .with_across_chain(
+                    origin_anvil.chain_id(),
+                    format!("{origin_spoke_pool:#x}"),
+                    origin_ws_url,
+                ),
+        )
+        .await
+        .expect("spawn mock integrator");
+
+        let url = format!(
+            "{}/swap/approval?tradeType=exactInput&originChainId={}&destinationChainId=42161&inputToken={:#x}&outputToken={:#x}&amount={}&depositor={:#x}&recipient={:#x}",
+            server.base_url(),
+            origin_anvil.chain_id(),
+            token_address,
+            Address::ZERO,
+            amount,
+            depositor,
+            recipient,
+        );
+        let body: Value = reqwest::get(&url)
+            .await
+            .expect("http get")
+            .error_for_status()
+            .expect("200")
+            .json()
+            .await
+            .expect("json body");
+
+        assert_eq!(
+            body["swapTx"]["to"].as_str(),
+            Some(format!("{origin_spoke_pool:#x}").as_str())
+        );
+        assert!(
+            body.get("approvalTxns").is_none() || body["approvalTxns"].is_null(),
+            "origin-chain allowance should skip approvalTxns, got: {body}"
+        );
+        assert_eq!(
+            body["checks"]["allowance"]["actual"].as_str(),
+            Some(amount.to_string()).as_deref()
+        );
+        assert_eq!(
+            body["checks"]["allowance"]["spender"].as_str(),
+            Some(format!("{origin_spoke_pool:#x}").as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_swap_approval_fails_when_origin_rpc_cannot_read_erc20_checks() {
+        use alloy::node_bindings::Anvil;
+
+        let anvil = Anvil::new().block_time(1).try_spawn().expect("anvil spawn");
+        let spoke_pool =
+            Address::from_str("0xACE055C0C055D0C035E47055D05E7055055BACE0").expect("spoke pool");
+        let depositor = anvil.addresses()[0];
+        let recipient = anvil.addresses()[1];
+        let non_contract_token =
+            Address::from_str("0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf").expect("token address");
+
+        let server = MockIntegratorServer::spawn_with_config(
+            MockIntegratorConfig::default()
+                .with_across_spoke_pool_address(format!("{spoke_pool:#x}"))
+                .with_across_evm_rpc_url(anvil.ws_endpoint_url().to_string()),
+        )
+        .await
+        .expect("spawn mock integrator");
+
+        let url = format!(
+            "{}/swap/approval?tradeType=exactInput&originChainId={}&destinationChainId=42161&inputToken={non_contract_token:#x}&outputToken={:#x}&amount=1000000&depositor={depositor:#x}&recipient={recipient:#x}",
+            server.base_url(),
+            anvil.chain_id(),
+            Address::ZERO,
+        );
+        let response = reqwest::get(&url).await.expect("http get");
+        let status = response.status();
+        let body: Value = response.json().await.expect("json body");
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["code"].as_str(), Some("mock_across_rpc_error"));
+        assert_eq!(body["param"].as_str(), Some("inputToken"));
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("allowance check failed")),
+            "unexpected body: {body}"
+        );
     }
 
     /// Indexer-backed `GET /deposit/status` must report `"filled"` once the
@@ -4937,6 +7344,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deposit_status_mints_erc20_output_before_reporting_filled() {
+        use alloy::node_bindings::Anvil;
+
+        let anvil = Anvil::new().try_spawn().expect("anvil spawn");
+        let ws_url = anvil.ws_endpoint_url().to_string();
+        let private_key: [u8; 32] = anvil.keys()[0].clone().to_bytes().into();
+        let provider = create_websocket_wallet_provider(&ws_url, private_key)
+            .await
+            .expect("ws wallet provider");
+        let provider: DynProvider = provider.erased();
+        let token = GenericEIP3009ERC20Instance::deploy(provider.clone())
+            .await
+            .expect("deploy token");
+        let token_address = *token.address();
+        let recipient = anvil.addresses()[1];
+        let amount = U256::from(12_345_u64);
+        let destination_chain_id = 42161_u64;
+        let spoke_pool = Address::repeat_byte(0x44);
+
+        let server = MockIntegratorServer::spawn_with_config(
+            MockIntegratorConfig::default().with_across_chain(
+                destination_chain_id,
+                format!("{spoke_pool:#x}"),
+                anvil.endpoint(),
+            ),
+        )
+        .await
+        .expect("spawn mock integrator");
+
+        let record = MockAcrossDepositRecord {
+            origin_chain_id: 1,
+            destination_chain_id: U256::from(destination_chain_id),
+            deposit_id: U256::from(7_u64),
+            depositor: FixedBytes::<32>::ZERO,
+            recipient: address_to_bytes32(recipient),
+            input_token: FixedBytes::<32>::ZERO,
+            output_token: address_to_bytes32(token_address),
+            input_amount: amount,
+            output_amount: amount,
+            fill_deadline: u32::MAX,
+            deposit_tx_hash: format!("0x{}", "ab".repeat(32)),
+            block_number: 1,
+            indexed_at: Utc::now(),
+        };
+        server
+            .state
+            .across_deposits
+            .lock()
+            .await
+            .insert((1, "7".to_string()), record);
+
+        let status_url = format!(
+            "{}/deposit/status?originChainId=1&depositId=7",
+            server.base_url()
+        );
+        let body: Value = reqwest::get(&status_url)
+            .await
+            .expect("http")
+            .json()
+            .await
+            .expect("json body");
+        assert_eq!(body["status"], "filled");
+
+        let balance = token
+            .balanceOf(recipient)
+            .call()
+            .await
+            .expect("recipient balance");
+        assert_eq!(balance, amount);
+    }
+
+    #[tokio::test]
+    async fn deposit_status_stays_pending_when_destination_chain_is_not_configured() {
+        use alloy::node_bindings::Anvil;
+
+        let origin_anvil = Anvil::new().try_spawn().expect("origin anvil spawn");
+        let origin_chain_id = origin_anvil.chain_id();
+        let missing_destination_chain_id = 42161_u64;
+        let server = MockIntegratorServer::spawn_with_config(
+            MockIntegratorConfig::default().with_across_chain(
+                origin_chain_id,
+                format!("{:#x}", Address::repeat_byte(0x44)),
+                origin_anvil.endpoint(),
+            ),
+        )
+        .await
+        .expect("spawn mock integrator");
+
+        let record = MockAcrossDepositRecord {
+            origin_chain_id,
+            destination_chain_id: U256::from(missing_destination_chain_id),
+            deposit_id: U256::from(9_u64),
+            depositor: FixedBytes::<32>::ZERO,
+            recipient: address_to_bytes32(origin_anvil.addresses()[1]),
+            input_token: FixedBytes::<32>::ZERO,
+            output_token: FixedBytes::<32>::ZERO,
+            input_amount: U256::from(1_000_u64),
+            output_amount: U256::from(990_u64),
+            fill_deadline: u32::MAX,
+            deposit_tx_hash: format!("0x{}", "cd".repeat(32)),
+            block_number: 1,
+            indexed_at: Utc::now(),
+        };
+        server
+            .state
+            .across_deposits
+            .lock()
+            .await
+            .insert((origin_chain_id, "9".to_string()), record);
+
+        let status_url = format!(
+            "{}/deposit/status?originChainId={origin_chain_id}&depositId=9",
+            server.base_url()
+        );
+        let body: Value = reqwest::get(&status_url)
+            .await
+            .expect("http")
+            .json()
+            .await
+            .expect("json body");
+
+        assert_eq!(body["status"], "pending");
+        assert_eq!(body["originChainId"].as_u64(), Some(origin_chain_id));
+        assert_eq!(
+            body["destinationChainId"].as_u64(),
+            Some(missing_destination_chain_id)
+        );
+        assert!(body.get("fillTxnRef").is_none() || body["fillTxnRef"].is_null());
+    }
+
+    #[tokio::test]
     async fn deposit_status_by_tx_ref_returns_not_found_before_indexing() {
         let server = MockIntegratorServer::spawn().await.expect("spawn");
         let response = reqwest::get(format!(
@@ -5014,7 +7552,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unit_mock_reuses_protocol_address_and_preserves_history_shape() {
+    async fn unit_mock_generates_fresh_protocol_addresses_and_preserves_destination_history() {
         let server = MockIntegratorServer::spawn().await.expect("spawn");
         let destination = "0x33f65788aca48d733c2c2444ac9f79b18206aa92";
         let gen_url = format!(
@@ -5031,10 +7569,16 @@ mod tests {
             .json()
             .await
             .expect("first gen json");
-        server
-            .complete_unit_operation(&first.address)
-            .await
-            .expect("complete first op");
+        complete_mock_unit_operation_with_observation(
+            &server.state,
+            &first.address,
+            Some(UnitOperationObservation {
+                source_amount: "1000000000000000000".to_string(),
+                source_tx_hash: Some("0xunitfirst".to_string()),
+            }),
+        )
+        .await
+        .expect("complete first op");
 
         let second: UnitGenerateAddressResponse = reqwest::get(&gen_url)
             .await
@@ -5044,7 +7588,15 @@ mod tests {
             .json()
             .await
             .expect("second gen json");
-        assert_eq!(second.address.to_lowercase(), first.address.to_lowercase());
+        assert_ne!(second.address.to_lowercase(), first.address.to_lowercase());
+        assert!(server
+            .unit_protocol_private_key(&first.address)
+            .await
+            .is_some());
+        assert!(server
+            .unit_protocol_private_key(&second.address)
+            .await
+            .is_some());
 
         let by_protocol_before: UnitOperationsResponse = reqwest::get(format!(
             "{}/operations/{}",
@@ -5061,10 +7613,16 @@ mod tests {
         assert!(by_protocol_before.addresses.is_empty());
         assert_eq!(by_protocol_before.operations.len(), 1);
 
-        server
-            .complete_unit_operation(&first.address)
-            .await
-            .expect("complete second op");
+        complete_mock_unit_operation_with_observation(
+            &server.state,
+            &second.address,
+            Some(UnitOperationObservation {
+                source_amount: "2000000000000000000".to_string(),
+                source_tx_hash: Some("0xunitsecond".to_string()),
+            }),
+        )
+        .await
+        .expect("complete second op");
 
         let by_protocol_after: UnitOperationsResponse = reqwest::get(format!(
             "{}/operations/{}",
@@ -5079,19 +7637,11 @@ mod tests {
         .await
         .expect("protocol ops after json");
         assert!(by_protocol_after.addresses.is_empty());
-        assert_eq!(by_protocol_after.operations.len(), 2);
+        assert_eq!(by_protocol_after.operations.len(), 1);
         assert!(by_protocol_after
             .operations
             .iter()
             .all(|op| op.matches_protocol_address(&first.address)));
-        assert_ne!(
-            by_protocol_after.operations[0].source_tx_hash,
-            by_protocol_after.operations[1].source_tx_hash
-        );
-        assert_ne!(
-            by_protocol_after.operations[0].operation_id,
-            by_protocol_after.operations[1].operation_id
-        );
 
         let by_destination: UnitOperationsResponse =
             reqwest::get(format!("{}/operations/{}", server.base_url(), destination))
@@ -5102,12 +7652,220 @@ mod tests {
                 .json()
                 .await
                 .expect("destination ops json");
-        assert_eq!(by_destination.addresses.len(), 1);
+        assert_eq!(by_destination.addresses.len(), 2);
         assert_eq!(by_destination.operations.len(), 2);
-        assert_eq!(
-            by_destination.addresses[0]["address"].as_str(),
-            Some(first.address.as_str())
+        let addresses = by_destination
+            .addresses
+            .iter()
+            .filter_map(|entry| entry["address"].as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(addresses.contains(first.address.as_str()));
+        assert!(addresses.contains(second.address.as_str()));
+    }
+
+    #[tokio::test]
+    async fn unit_mock_refuses_completion_without_source_amount_evidence() {
+        let server = MockIntegratorServer::spawn().await.expect("spawn");
+        let destination = "0x33f65788aca48d733c2c2444ac9f79b18206aa92";
+        let generated: UnitGenerateAddressResponse = reqwest::get(format!(
+            "{}/gen/ethereum/hyperliquid/eth/{}",
+            server.base_url(),
+            destination
+        ))
+        .await
+        .expect("gen")
+        .error_for_status()
+        .expect("gen 200")
+        .json()
+        .await
+        .expect("gen json");
+
+        let error = server
+            .complete_unit_operation(&generated.address)
+            .await
+            .expect_err("completion without amount evidence must fail");
+        assert!(
+            error.contains("source_amount evidence"),
+            "unexpected error: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn unit_mock_eth_withdrawal_releases_native_funds_on_destination_chain() {
+        use alloy::node_bindings::Anvil;
+
+        let anvil = Anvil::new().try_spawn().expect("anvil spawn");
+        let recipient = Address::repeat_byte(0x77);
+        let server = MockIntegratorServer::spawn_with_config(
+            MockIntegratorConfig::default()
+                .with_unit_evm_rpc_url(UnitChain::Base, anvil.endpoint()),
+        )
+        .await
+        .expect("spawn mock integrator");
+        let generated: UnitGenerateAddressResponse = reqwest::get(format!(
+            "{}/gen/hyperliquid/base/eth/{recipient:#x}",
+            server.base_url()
+        ))
+        .await
+        .expect("gen request")
+        .error_for_status()
+        .expect("gen 200")
+        .json()
+        .await
+        .expect("gen json");
+
+        complete_mock_unit_operation_with_observation(
+            &server.state,
+            &generated.address,
+            Some(UnitOperationObservation {
+                source_amount: "1.25".to_string(),
+                source_tx_hash: Some("hl:oid:1".to_string()),
+            }),
+        )
+        .await
+        .expect("complete withdrawal");
+
+        let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+        let balance = provider
+            .get_balance(recipient)
+            .await
+            .expect("recipient balance");
+        assert_eq!(balance, U256::from(1_250_000_000_000_000_000_u128));
+
+        let operations: UnitOperationsResponse = reqwest::get(format!(
+            "{}/operations/{}",
+            server.base_url(),
+            generated.address
+        ))
+        .await
+        .expect("operations request")
+        .error_for_status()
+        .expect("operations 200")
+        .json()
+        .await
+        .expect("operations json");
+        let tx_hash = operations.operations[0]
+            .destination_tx_hash
+            .as_deref()
+            .expect("destination tx hash");
+        assert!(tx_hash.starts_with("0x"));
+    }
+
+    #[tokio::test]
+    async fn unit_mock_eth_withdrawal_marks_failure_when_release_cannot_broadcast() {
+        let recipient = Address::repeat_byte(0x88);
+        let server = MockIntegratorServer::spawn()
+            .await
+            .expect("spawn mock integrator");
+        let generated: UnitGenerateAddressResponse = reqwest::get(format!(
+            "{}/gen/hyperliquid/base/eth/{recipient:#x}",
+            server.base_url()
+        ))
+        .await
+        .expect("gen request")
+        .error_for_status()
+        .expect("gen 200")
+        .json()
+        .await
+        .expect("gen json");
+
+        let error = complete_mock_unit_operation_with_observation(
+            &server.state,
+            &generated.address,
+            Some(UnitOperationObservation {
+                source_amount: "1.25".to_string(),
+                source_tx_hash: Some("hl:oid:1".to_string()),
+            }),
+        )
+        .await
+        .expect_err("missing destination-chain RPC should fail release");
+        assert!(error.contains("no EVM RPC URL"), "{error}");
+
+        let operations: UnitOperationsResponse = reqwest::get(format!(
+            "{}/operations/{}",
+            server.base_url(),
+            generated.address
+        ))
+        .await
+        .expect("operations request")
+        .error_for_status()
+        .expect("operations 200")
+        .json()
+        .await
+        .expect("operations json");
+
+        assert_eq!(operations.operations.len(), 1);
+        assert_eq!(operations.operations[0].state.as_deref(), Some("failure"));
+        assert!(operations.operations[0].destination_tx_hash.is_none());
+    }
+
+    #[tokio::test]
+    async fn unit_bitcoin_indexer_completes_confirmed_block_outputs() {
+        let state = Arc::new(MockIntegratorState::new(&MockIntegratorConfig::default()));
+        let protocol_wallet =
+            fresh_mock_protocol_wallet(UnitChain::Bitcoin, UnitChain::Hyperliquid);
+        let protocol_address = protocol_wallet.address;
+        let destination = "0x33f65788aca48d733c2c2444ac9f79b18206aa92".to_string();
+        {
+            let mut operations = state.unit_operations.lock().await;
+            operations.insert(
+                protocol_address.clone(),
+                vec![MockUnitOperationEntry {
+                    kind: MockUnitOperationKind::Deposit,
+                    src_chain: UnitChain::Bitcoin,
+                    dst_chain: UnitChain::Hyperliquid,
+                    asset: UnitAsset::Btc,
+                    dst_addr: destination,
+                    visible: false,
+                    operation: UnitOperation {
+                        operation_id: None,
+                        op_created_at: Some(Utc::now().to_rfc3339()),
+                        protocol_address: Some(protocol_address.clone()),
+                        source_address: None,
+                        destination_address: None,
+                        source_chain: Some("bitcoin".to_string()),
+                        destination_chain: Some("hyperliquid".to_string()),
+                        source_amount: None,
+                        destination_fee_amount: None,
+                        sweep_fee_amount: None,
+                        state: Some("sourceTxDiscovered".to_string()),
+                        source_tx_hash: None,
+                        destination_tx_hash: None,
+                        source_tx_confirmations: None,
+                        destination_tx_confirmations: None,
+                        position_in_withdraw_queue: None,
+                        broadcast_at: None,
+                        asset: Some("btc".to_string()),
+                        state_started_at: Some(Utc::now().to_rfc3339()),
+                        state_updated_at: Some(Utc::now().to_rfc3339()),
+                        state_next_attempt_at: None,
+                    },
+                }],
+            );
+        }
+        let script_pubkey = bitcoin_script_pubkey_for_regtest_address(&protocol_address)
+            .expect("protocol address script pubkey");
+        let tx_out = bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(50_000),
+            script_pubkey,
+        };
+        let watches = vec![UnitDepositWatch {
+            protocol_address: protocol_address.clone(),
+            min_amount_raw: Some(U256::from(50_000)),
+        }];
+
+        process_unit_bitcoin_transaction_outputs(&state, &watches, "1234", vec![(2usize, tx_out)])
+            .await;
+
+        let operations = state.unit_operations.lock().await;
+        let entry = operations
+            .get(&protocol_address)
+            .and_then(|entries| entries.first())
+            .expect("unit operation");
+        assert!(entry.visible);
+        assert_eq!(entry.operation.state.as_deref(), Some("done"));
+        assert_eq!(entry.operation.source_amount.as_deref(), Some("50000"));
+        assert_eq!(entry.operation.source_tx_hash.as_deref(), Some("1234:2"));
     }
 
     #[tokio::test]
@@ -5178,7 +7936,9 @@ mod tests {
             .await
             .expect("deserialize SpotMeta");
 
-        let map = body.coin_to_asset_map();
+        let map = body
+            .coin_to_asset_map()
+            .expect("mock spotMeta should produce valid wire asset ids");
         assert_eq!(map.get("UBTC/USDC"), Some(&10_140));
         assert_eq!(map.get("@140"), Some(&10_140));
     }
@@ -5204,13 +7964,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hyperliquid_info_l2_book_rejects_missing_coin() {
+        let server = MockIntegratorServer::spawn().await.expect("spawn");
+        let response = reqwest::Client::new()
+            .post(format!("{}/info", server.base_url()))
+            .json(&json!({ "type": "l2Book" }))
+            .send()
+            .await
+            .expect("http");
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body: MockIntegratorErrorResponse = response.json().await.expect("error body");
+        assert_eq!(body.error, "l2Book requires a `coin` field");
+    }
+
+    #[tokio::test]
     async fn hyperliquid_info_order_status_matches_real_shape() {
         use hyperliquid_client::info::OrderStatusResponse;
 
         let server = MockIntegratorServer::spawn().await.expect("spawn");
         let body: OrderStatusResponse = reqwest::Client::new()
             .post(format!("{}/info", server.base_url()))
-            .json(&json!({ "type": "orderStatus", "user": "0x0", "oid": 42 }))
+            .json(&json!({
+                "type": "orderStatus",
+                "user": "0x0000000000000000000000000000000000000000",
+                "oid": 42
+            }))
             .send()
             .await
             .expect("http")
@@ -5220,6 +7999,42 @@ mod tests {
 
         assert_eq!(body.status, "unknownOid");
         assert!(body.order.is_none());
+    }
+
+    #[tokio::test]
+    async fn hyperliquid_info_order_status_rejects_missing_oid() {
+        let server = MockIntegratorServer::spawn().await.expect("spawn");
+        let response = reqwest::Client::new()
+            .post(format!("{}/info", server.base_url()))
+            .json(&json!({
+                "type": "orderStatus",
+                "user": "0x0000000000000000000000000000000000000000"
+            }))
+            .send()
+            .await
+            .expect("http");
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body: MockIntegratorErrorResponse = response.json().await.expect("error body");
+        assert_eq!(body.error, "orderStatus requires a numeric `oid` field");
+    }
+
+    #[tokio::test]
+    async fn hyperliquid_info_order_status_rejects_missing_user() {
+        let server = MockIntegratorServer::spawn().await.expect("spawn");
+        let response = reqwest::Client::new()
+            .post(format!("{}/info", server.base_url()))
+            .json(&json!({ "type": "orderStatus", "oid": 42 }))
+            .send()
+            .await
+            .expect("http");
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body: MockIntegratorErrorResponse = response.json().await.expect("error body");
+        assert_eq!(
+            body.error,
+            "orderStatus requires a 0x-prefixed `user` field"
+        );
     }
 
     #[tokio::test]
@@ -5345,6 +8160,59 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn client_order_status_is_scoped_to_order_user() {
+            let server = MockIntegratorServer::spawn().await.expect("spawn");
+            let mut client = new_client(server.base_url());
+            client.refresh_spot_meta().await.expect("spot meta");
+
+            let wallet = TEST_WALLET.parse::<PrivateKeySigner>().expect("wallet");
+            let user = wallet.address();
+            server
+                .credit_hyperliquid_balance(user, "USDC", 10_000.0)
+                .await;
+            server.set_hyperliquid_rate("UBTC", "USDC", 60_000.0).await;
+
+            let place = client
+                .place_orders(
+                    vec![OrderRequest {
+                        asset: client.asset_index("UBTC/USDC").expect("asset"),
+                        is_buy: true,
+                        limit_px: "60000".to_string(),
+                        sz: "0.1".to_string(),
+                        reduce_only: false,
+                        order_type: Order::Limit(Limit {
+                            tif: "Ioc".to_string(),
+                        }),
+                        cloid: None,
+                    }],
+                    "na",
+                )
+                .await
+                .expect("place orders");
+            let oid = place["response"]["data"]["statuses"][0]["filled"]["oid"]
+                .as_u64()
+                .expect("oid");
+            let other_user = Address::repeat_byte(0x77);
+
+            let response: hyperliquid_client::info::OrderStatusResponse = reqwest::Client::new()
+                .post(format!("{}/info", server.base_url()))
+                .json(&json!({
+                    "type": "orderStatus",
+                    "user": format!("{other_user:#x}"),
+                    "oid": oid
+                }))
+                .send()
+                .await
+                .expect("http")
+                .json()
+                .await
+                .expect("order status");
+
+            assert_eq!(response.status, "unknownOid");
+            assert!(response.order.is_none());
+        }
+
+        #[tokio::test]
         async fn client_place_orders_signs_and_mock_persists_submission() {
             let server = MockIntegratorServer::spawn().await.expect("spawn");
             let mut client = new_client(server.base_url());
@@ -5398,6 +8266,58 @@ mod tests {
             assert!(submitted["signature"]["r"].is_string());
             assert!(submitted["signature"]["s"].is_string());
             assert!(submitted["nonce"].is_u64());
+        }
+
+        #[test]
+        fn hyperliquid_amount_tolerance_accepts_large_decimal_dust() {
+            assert!(hyperliquid_has_sufficient_amount(
+                121_891.2,
+                121_891.20000000001
+            ));
+            assert!(hyperliquid_has_sufficient_amount(0.29999999998835847, 0.3));
+            assert!(hyperliquid_has_sufficient_amount(
+                214.799999,
+                214.79999999999998
+            ));
+            assert!(!hyperliquid_has_sufficient_amount(121_891.2, 121_891.3));
+        }
+
+        #[tokio::test]
+        async fn client_place_orders_fills_near_market_gtc_buy() {
+            let server = MockIntegratorServer::spawn().await.expect("spawn");
+            let mut client = new_client(server.base_url());
+            client.refresh_spot_meta().await.expect("spot meta");
+
+            let wallet = TEST_WALLET.parse::<PrivateKeySigner>().expect("wallet");
+            let user = wallet.address();
+            server
+                .credit_hyperliquid_balance(user, "USDC", 100_000.0)
+                .await;
+            server.set_hyperliquid_rate("UETH", "USDC", 3_000.0).await;
+
+            let resp = client
+                .place_orders(
+                    vec![OrderRequest {
+                        asset: client.asset_index("UETH/USDC").expect("asset"),
+                        is_buy: true,
+                        limit_px: "2999.9".to_string(),
+                        sz: "30.3148".to_string(),
+                        reduce_only: false,
+                        order_type: Order::Limit(Limit {
+                            tif: "Gtc".to_string(),
+                        }),
+                        cloid: None,
+                    }],
+                    "na",
+                )
+                .await
+                .expect("place orders");
+
+            assert_eq!(resp["status"], "ok");
+            let filled = &resp["response"]["data"]["statuses"][0]["filled"];
+            assert_eq!(filled["totalSz"], "30.3148");
+            assert_eq!(filled["avgPx"], "2999.9");
+            assert!((server.hyperliquid_balance_of(user, "UETH").await - 30.3148).abs() < 1e-9);
         }
 
         #[tokio::test]

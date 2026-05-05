@@ -1,9 +1,14 @@
+use axum::{routing::get, Json, Router};
 use blockchain_utils::{handle_background_thread_result, init_logger, shutdown_signal};
 use clap::{Parser, Subcommand};
 use devnet::bitcoin_devnet::MiningMode;
 use devnet::evm_devnet::ForkConfig;
-use devnet::{RiftDevnet, RiftDevnetCache};
+use devnet::{
+    DevnetManifest, RiftDevnet, RiftDevnetCache, DEVNET_DEFAULT_LOADGEN_EVM_ACCOUNT_COUNT,
+    DEVNET_MANIFEST_PORT,
+};
 use snafu::{ResultExt, Whatever};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -32,6 +37,14 @@ enum Commands {
 
         #[arg(env = "TOKEN_INDEXER_DATABASE_URL", short = 't', long)]
         token_indexer_database_url: Option<String>,
+
+        /// HTTP port for /status and /manifest.json
+        #[arg(long, default_value_t = DEVNET_MANIFEST_PORT)]
+        manifest_port: u16,
+
+        /// Number of deterministic EVM accounts to fund for router-loadgen.
+        #[arg(long, default_value_t = DEVNET_DEFAULT_LOADGEN_EVM_ACCOUNT_COUNT)]
+        loadgen_evm_key_count: usize,
     },
     /// Create and save a cached devnet for faster subsequent runs
     Cache,
@@ -50,12 +63,21 @@ async fn main() -> Result<(), Whatever> {
             fork_url,
             fork_block_number,
             token_indexer_database_url,
+            manifest_port,
+            loadgen_evm_key_count,
         } => {
             let fork_config = fork_url.map(|fork_url| ForkConfig {
                 url: fork_url,
                 block_number: fork_block_number,
             });
-            run_server(fund_address, fork_config, token_indexer_database_url).await
+            run_server(
+                fund_address,
+                fork_config,
+                token_indexer_database_url,
+                manifest_port,
+                loadgen_evm_key_count,
+            )
+            .await
         }
         Commands::Cache => run_cache().await,
     }
@@ -65,6 +87,8 @@ async fn run_server(
     fund_address: Vec<String>,
     fork_config: Option<ForkConfig>,
     token_indexer_database_url: Option<String>,
+    manifest_port: u16,
+    loadgen_evm_key_count: usize,
 ) -> Result<(), Whatever> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -78,7 +102,9 @@ async fn run_server(
     let mut devnet_builder = RiftDevnet::builder()
         .interactive(true)
         .using_esplora(true)
-        .bitcoin_mining_mode(MiningMode::Interval(5));
+        .using_mock_integrators(true)
+        .bitcoin_mining_mode(MiningMode::Interval(5))
+        .loadgen_evm_account_count(loadgen_evm_key_count);
 
     for address in fund_address {
         devnet_builder = devnet_builder.funded_evm_address(address);
@@ -104,17 +130,62 @@ async fn run_server(
         "[Devnet Server] Total startup time: {:?}",
         server_start.elapsed()
     );
+    let manifest =
+        DevnetManifest::from_devnet(&devnet).whatever_context("Failed to build devnet manifest")?;
+    devnet
+        .join_set
+        .spawn(run_manifest_server(manifest, manifest_port));
 
     tokio::select! {
         _ = shutdown_signal() => {
             info!("[Devnet Server] Shutdown signal received; shutting down...");
         }
         res = devnet.join_set.join_next() => {
-            handle_background_thread_result(res).unwrap();
+            handle_background_thread_result(res)
+                .map_err(|error| std::io::Error::other(error.to_string()))
+                .whatever_context("Devnet background task failed")?;
         }
     }
 
     drop(devnet);
+    Ok(())
+}
+
+async fn run_manifest_server(manifest: DevnetManifest, manifest_port: u16) -> devnet::Result<()> {
+    let status = serde_json::json!({
+        "status": "ok",
+        "deterministic": manifest.deterministic,
+        "manifest": "/manifest.json"
+    });
+    let app = Router::new()
+        .route(
+            "/status",
+            get({
+                let status = status.clone();
+                move || {
+                    let status = status.clone();
+                    async move { Json(status) }
+                }
+            }),
+        )
+        .route(
+            "/manifest.json",
+            get({
+                let manifest = manifest.clone();
+                move || {
+                    let manifest = manifest.clone();
+                    async move { Json(manifest) }
+                }
+            }),
+        );
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), manifest_port);
+    info!("[Devnet Server] Manifest API listening on http://{addr}");
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|error| eyre::eyre!("failed to bind devnet manifest API: {error}"))?;
+    axum::serve(listener, app)
+        .await
+        .map_err(|error| eyre::eyre!("devnet manifest API failed: {error}"))?;
     Ok(())
 }
 
@@ -129,7 +200,7 @@ async fn run_cache() -> Result<(), Whatever> {
     info!("[Devnet Cache] Creating cached devnet...");
 
     // Create cache instance and save the devnet
-    let cache = RiftDevnetCache::new();
+    let cache = RiftDevnetCache::new().whatever_context("Failed to initialize devnet cache")?;
 
     // clear the cache directory then save
     tokio::fs::remove_dir_all(&cache.cache_dir).await.ok();

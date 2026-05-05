@@ -9,11 +9,6 @@ pub enum Error {
     #[snafu(display("Failed to connect to Sauron state database"))]
     StateDatabaseConnection { source: sqlx_core::Error },
 
-    #[snafu(display("Failed to apply replica migrations"))]
-    ReplicaMigration {
-        source: sqlx_core::migrate::MigrateError,
-    },
-
     #[snafu(display("Failed to apply Sauron state migrations"))]
     StateMigration {
         source: sqlx_core::migrate::MigrateError,
@@ -25,26 +20,28 @@ pub enum Error {
     #[snafu(display("Sauron state database query failed"))]
     StateDatabaseQuery { source: sqlx_core::Error },
 
-    #[snafu(display("Failed to initialize Postgres notification listener"))]
-    ReplicaListenerConnection { source: sqlx_core::Error },
-
-    #[snafu(display("Failed to subscribe to Postgres notification channel {channel}"))]
-    ReplicaListen {
-        source: sqlx_core::Error,
-        channel: String,
+    #[snafu(display("Postgres CDC stream failed"))]
+    CdcStream {
+        source: pgwire_replication::PgWireError,
     },
 
-    #[snafu(display("Failed to receive Postgres notification"))]
-    ReplicaNotificationReceive { source: sqlx_core::Error },
+    #[snafu(display("Failed to parse Postgres CDC payload: {source}"))]
+    CdcPayload { source: serde_json::Error },
+
+    #[snafu(display("Postgres CDC payload exceeded {max_bytes} bytes"))]
+    CdcPayloadTooLarge { max_bytes: usize },
+
+    #[snafu(display("Postgres CDC payload was invalid: {message}"))]
+    InvalidCdcPayload { message: String },
+
+    #[snafu(display("Postgres CDC pending refresh batch exceeded {max_ids} ids"))]
+    CdcPendingBatchTooLarge { max_ids: usize },
 
     #[snafu(display("Replica watch row was invalid: {message}"))]
     InvalidWatchRow { message: String },
 
     #[snafu(display("Replica cursor row was invalid: {message}"))]
     InvalidCursorRow { message: String },
-
-    #[snafu(display("Failed to parse replica notification payload: {source}"))]
-    NotificationPayload { source: serde_json::Error },
 
     #[snafu(display("Sauron configuration is invalid: {message}"))]
     InvalidConfiguration { message: String },
@@ -85,6 +82,15 @@ pub enum Error {
     #[snafu(display("ROUTER request failed"))]
     RouterRequest { source: reqwest::Error },
 
+    #[snafu(display("ROUTER response body exceeded {max_bytes} bytes"))]
+    RouterResponseBodyTooLarge { max_bytes: usize },
+
+    #[snafu(display("ROUTER returned an invalid JSON body: {source}; body={body}"))]
+    RouterResponseJson {
+        source: serde_json::Error,
+        body: String,
+    },
+
     #[snafu(display("ROUTER rejected provider-operation hint with status {status}: {body}"))]
     RouterRejected {
         status: reqwest::StatusCode,
@@ -99,6 +105,20 @@ pub enum Error {
 
     #[snafu(display("A discovery backend task terminated unexpectedly"))]
     DiscoveryTaskJoin { source: tokio::task::JoinError },
+
+    #[snafu(display(
+        "Discovery backend {backend} indexed lookup for watch {watch_id} timed out after {timeout_secs}s"
+    ))]
+    IndexedLookupTimeout {
+        backend: String,
+        watch_id: String,
+        timeout_secs: u64,
+    },
+
+    #[snafu(display(
+        "Discovery backend pending submission backlog exceeded {max_pending} deposits"
+    ))]
+    DiscoveryPendingSubmissionsTooLarge { max_pending: usize },
 
     #[snafu(display("Failed to initialize observability: {message}"))]
     Observability { message: String },

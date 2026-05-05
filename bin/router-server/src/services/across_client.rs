@@ -2,10 +2,14 @@ use alloy::primitives::{Address, U256};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::Snafu;
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Duration};
 use url::Url;
 
+use super::http_body::{read_limited_response_text, response_body_error_preview};
+
 pub type AcrossResult<T> = Result<T, AcrossClientError>;
+const ACROSS_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+const ACROSS_MAX_RESPONSE_BODY_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Snafu)]
 pub enum AcrossClientError {
@@ -15,10 +19,17 @@ pub enum AcrossClientError {
         path: String,
         source: url::ParseError,
     },
+    #[snafu(display("invalid Across base URL {base_url}: {source}"))]
+    InvalidBaseUrl {
+        base_url: String,
+        source: url::ParseError,
+    },
     #[snafu(display("HTTP request to Across failed: {source}"))]
     Http { source: reqwest::Error },
     #[snafu(display("Across returned HTTP {status}: {body}"))]
     HttpStatus { status: u16, body: String },
+    #[snafu(display("Across response body exceeded {max_bytes} bytes"))]
+    ResponseBodyTooLarge { max_bytes: usize },
     #[snafu(display("Across returned an invalid JSON body: {source}; body={body}"))]
     InvalidBody {
         source: serde_json::Error,
@@ -26,11 +37,15 @@ pub enum AcrossClientError {
     },
     #[snafu(display("Across numeric field {field} could not be parsed: {raw}"))]
     InvalidNumeric { field: &'static str, raw: String },
+    #[snafu(display("Across HTTP client configuration failed: {message}"))]
+    ClientConfiguration { message: String },
 }
 
 impl From<reqwest::Error> for AcrossClientError {
     fn from(source: reqwest::Error) -> Self {
-        Self::Http { source }
+        Self::Http {
+            source: source.without_url(),
+        }
     }
 }
 
@@ -220,7 +235,7 @@ pub fn parse_optional_u256(
         }
         other => Err(AcrossClientError::InvalidNumeric {
             field,
-            raw: other.to_string(),
+            raw: response_body_error_preview(&other.to_string()),
         }),
     }
 }
@@ -233,12 +248,12 @@ fn parse_u256(field: &'static str, raw: &str) -> AcrossResult<U256> {
     {
         return U256::from_str_radix(hex, 16).map_err(|_| AcrossClientError::InvalidNumeric {
             field,
-            raw: raw.to_string(),
+            raw: response_body_error_preview(raw),
         });
     }
     U256::from_str_radix(trimmed, 10).map_err(|_| AcrossClientError::InvalidNumeric {
         field,
-        raw: raw.to_string(),
+        raw: response_body_error_preview(raw),
     })
 }
 
@@ -250,15 +265,19 @@ pub struct AcrossClient {
 }
 
 impl AcrossClient {
-    #[must_use]
-    pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
+    pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> AcrossResult<Self> {
         let api_key = api_key.into().trim().to_string();
-        assert!(!api_key.is_empty(), "Across API key must not be empty");
-        Self {
-            http: rustls_http_client(),
-            base_url: normalize_base_url(base_url),
-            api_key,
+        if api_key.is_empty() {
+            return Err(AcrossClientError::ClientConfiguration {
+                message: "Across API key must not be empty".to_string(),
+            });
         }
+        let base_url = normalize_base_url(base_url)?;
+        Ok(Self {
+            http: rustls_http_client()?,
+            base_url,
+            api_key,
+        })
     }
 
     #[must_use]
@@ -304,32 +323,94 @@ impl AcrossClient {
             .bearer_auth(&self.api_key);
         let response = builder.send().await?;
         let status = response.status();
-        let body = response.text().await?;
+        let body = read_limited_response_text(response, ACROSS_MAX_RESPONSE_BODY_BYTES).await?;
+        if body.truncated {
+            return Err(AcrossClientError::ResponseBodyTooLarge {
+                max_bytes: ACROSS_MAX_RESPONSE_BODY_BYTES,
+            });
+        }
+        let body = body.text;
         if !status.is_success() {
             return Err(AcrossClientError::HttpStatus {
                 status: status.as_u16(),
-                body,
+                body: response_body_error_preview(&body),
             });
         }
-        serde_json::from_str(&body)
-            .map_err(|source| AcrossClientError::InvalidBody { source, body })
+        serde_json::from_str(&body).map_err(|source| AcrossClientError::InvalidBody {
+            source,
+            body: response_body_error_preview(&body),
+        })
     }
 }
 
-fn rustls_http_client() -> reqwest::Client {
+fn rustls_http_client() -> AcrossResult<reqwest::Client> {
     reqwest::Client::builder()
         .use_rustls_tls()
+        .timeout(ACROSS_HTTP_TIMEOUT)
         .build()
-        .expect("failed to construct Across reqwest client with rustls")
+        .map_err(|err| AcrossClientError::ClientConfiguration {
+            message: err.to_string(),
+        })
 }
 
-fn normalize_base_url(base_url: impl Into<String>) -> String {
-    base_url.into().trim_end_matches('/').to_string()
+fn normalize_base_url(base_url: impl Into<String>) -> AcrossResult<String> {
+    let base_url = base_url.into().trim().trim_end_matches('/').to_string();
+    let sanitized_base_url = sanitize_url_for_error(&base_url);
+    let parsed = Url::parse(&base_url).map_err(|source| AcrossClientError::InvalidBaseUrl {
+        base_url: sanitized_base_url.clone(),
+        source,
+    })?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        scheme => {
+            return Err(AcrossClientError::ClientConfiguration {
+                message: format!(
+                    "Across base URL {sanitized_base_url:?} must use http or https, got {scheme:?}"
+                ),
+            });
+        }
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(AcrossClientError::ClientConfiguration {
+            message: format!("Across base URL {sanitized_base_url:?} must not include credentials"),
+        });
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(AcrossClientError::ClientConfiguration {
+            message: format!(
+                "Across base URL {sanitized_base_url:?} must not include a query string or fragment"
+            ),
+        });
+    }
+    Ok(base_url)
+}
+
+fn sanitize_url_for_error(value: &str) -> String {
+    let Ok(parsed) = Url::parse(value.trim()) else {
+        return "<invalid url>".to_string();
+    };
+
+    let host = parsed.host_str().unwrap_or("<missing-host>");
+    let mut redacted = format!("{}://{}", parsed.scheme(), host);
+    if let Some(port) = parsed.port() {
+        redacted.push(':');
+        redacted.push_str(&port.to_string());
+    }
+    if parsed.path() != "/" {
+        redacted.push_str("/<redacted-path>");
+    }
+    if parsed.query().is_some() {
+        redacted.push_str("?<redacted-query>");
+    }
+    if parsed.fragment().is_some() {
+        redacted.push_str("#<redacted-fragment>");
+    }
+    redacted
 }
 
 fn build_endpoint(base_url: &str, path: &str) -> AcrossResult<Url> {
     Url::parse(&format!("{base_url}{path}")).map_err(|source| AcrossClientError::InvalidUrl {
-        base_url: base_url.to_string(),
+        base_url: sanitize_url_for_error(base_url),
         path: path.to_string(),
         source,
     })
@@ -605,5 +686,50 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn client_rejects_unsupported_base_urls() {
+        assert!(matches!(
+            AcrossClient::new("file:///tmp/across", "key"),
+            Err(AcrossClientError::ClientConfiguration { .. })
+        ));
+
+        assert!(matches!(
+            AcrossClient::new("https://app.across.to?api_key=oops", "key"),
+            Err(AcrossClientError::ClientConfiguration { .. })
+        ));
+
+        let credentialed =
+            match AcrossClient::new("https://user:pass@app.across.to?token=secret", "key") {
+                Ok(_) => panic!("credentialed URL must fail"),
+                Err(error) => error,
+            };
+        let rendered = credentialed.to_string();
+        assert!(!rendered.contains("user"));
+        assert!(!rendered.contains("pass"));
+        assert!(!rendered.contains("token"));
+        assert!(!rendered.contains("secret"));
+    }
+
+    #[test]
+    fn across_url_errors_redact_path_query_fragment_and_invalid_values() {
+        let sanitized = sanitize_url_for_error(
+            "https://user:pass@app.across.to/provider-path-secret?token=query-secret#fragment-secret",
+        );
+
+        assert_eq!(
+            sanitized,
+            "https://app.across.to/<redacted-path>?<redacted-query>#<redacted-fragment>"
+        );
+        assert!(!sanitized.contains("user"));
+        assert!(!sanitized.contains("pass"));
+        assert!(!sanitized.contains("provider-path-secret"));
+        assert!(!sanitized.contains("query-secret"));
+        assert!(!sanitized.contains("fragment-secret"));
+
+        let invalid = sanitize_url_for_error("not a url with secret-token");
+        assert_eq!(invalid, "<invalid url>");
+        assert!(!invalid.contains("secret-token"));
     }
 }

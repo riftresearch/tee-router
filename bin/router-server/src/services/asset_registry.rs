@@ -677,7 +677,9 @@ impl AssetRegistry {
 
         if let (Some(source), Some(destination)) = (start_external, goal_external) {
             if self.can_runtime_velora_edge(source, destination) {
-                transitions.push(self.velora_runtime_transition(source, destination));
+                if let Some(transition) = self.velora_runtime_transition(source, destination) {
+                    transitions.push(transition);
+                }
             }
         }
 
@@ -685,7 +687,9 @@ impl AssetRegistry {
             if is_evm_external_asset(source) {
                 for anchor in self.velora_runtime_anchor_assets_on_chain(&source.chain) {
                     if self.can_runtime_velora_edge(source, &anchor) {
-                        transitions.push(self.velora_runtime_transition(source, &anchor));
+                        if let Some(transition) = self.velora_runtime_transition(source, &anchor) {
+                            transitions.push(transition);
+                        }
                     }
                 }
             }
@@ -695,7 +699,11 @@ impl AssetRegistry {
             if is_evm_external_asset(destination) {
                 for anchor in self.velora_runtime_anchor_assets_on_chain(&destination.chain) {
                     if self.can_runtime_velora_edge(&anchor, destination) {
-                        transitions.push(self.velora_runtime_transition(&anchor, destination));
+                        if let Some(transition) =
+                            self.velora_runtime_transition(&anchor, destination)
+                        {
+                            transitions.push(transition);
+                        }
                     }
                 }
             }
@@ -727,14 +735,13 @@ impl AssetRegistry {
         &self,
         source: &DepositAsset,
         destination: &DepositAsset,
-    ) -> TransitionDecl {
+    ) -> Option<TransitionDecl> {
         self.transition_decl_from_edge(MarketOrderTransition {
             kind: MarketOrderTransitionKind::UniversalRouterSwap,
             provider: ProviderId::Velora,
             from: MarketOrderNode::External(source.clone()),
             to: MarketOrderNode::External(destination.clone()),
         })
-        .expect("external runtime Velora transition assets should always resolve")
     }
 
     #[must_use]
@@ -1021,8 +1028,21 @@ fn builtin_chain_assets() -> Vec<ChainAsset> {
             AssetId::reference("0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf"),
             8,
         ),
-        // HL's native USDC; the only place USDC lives in router canonical
-        // routing today (it's the quote currency on every HL spot pair).
+        // Hyperliquid spot assets. These are venue balances, not public
+        // user-facing start/end assets; Unit deposits/withdrawals bridge
+        // between these venue assets and their external chain representations.
+        chain_asset(
+            CanonicalAsset::Btc,
+            "hyperliquid",
+            AssetId::reference("UBTC"),
+            8,
+        ),
+        chain_asset(
+            CanonicalAsset::Eth,
+            "hyperliquid",
+            AssetId::reference("UETH"),
+            18,
+        ),
         chain_asset(CanonicalAsset::Usdc, "hyperliquid", AssetId::Native, 6),
     ]
 }
@@ -1248,7 +1268,7 @@ fn builtin_provider_assets() -> Vec<ProviderAsset> {
         provider_asset(
             ProviderId::Hyperliquid,
             CanonicalAsset::Btc,
-            "bitcoin",
+            "hyperliquid",
             "hypercore",
             "UBTC",
             8,
@@ -1260,19 +1280,7 @@ fn builtin_provider_assets() -> Vec<ProviderAsset> {
         provider_asset(
             ProviderId::Hyperliquid,
             CanonicalAsset::Eth,
-            "evm:1",
-            "hypercore",
-            "UETH",
-            18,
-            &[
-                ProviderAssetCapability::ExchangeInput,
-                ProviderAssetCapability::ExchangeOutput,
-            ],
-        ),
-        provider_asset(
-            ProviderId::Hyperliquid,
-            CanonicalAsset::Eth,
-            "evm:8453",
+            "hyperliquid",
             "hypercore",
             "UETH",
             18,
@@ -1304,7 +1312,7 @@ fn chain_asset(
 ) -> ChainAsset {
     ChainAsset {
         canonical,
-        chain: ChainId::parse(chain).expect("builtin chain id must be valid"),
+        chain: ChainId::from_trusted_static(chain),
         asset,
         decimals,
     }
@@ -1322,7 +1330,7 @@ fn provider_asset(
     ProviderAsset {
         provider,
         canonical,
-        chain: ChainId::parse(chain).expect("builtin provider chain id must be valid"),
+        chain: ChainId::from_trusted_static(chain),
         provider_chain: provider_chain.to_string(),
         provider_asset: provider_asset.to_string(),
         decimals,
@@ -1365,6 +1373,14 @@ mod tests {
             Some(CanonicalAsset::Btc)
         );
         assert_eq!(
+            registry.canonical_for(&asset("hyperliquid", AssetId::reference("UBTC"))),
+            Some(CanonicalAsset::Btc)
+        );
+        assert_eq!(
+            registry.canonical_for(&asset("hyperliquid", AssetId::reference("UETH"))),
+            Some(CanonicalAsset::Eth)
+        );
+        assert_eq!(
             registry.canonical_for(&asset(
                 "evm:8453",
                 AssetId::reference("0xfde4c96c8593536e31f229ea8f37b2ada2699bb2"),
@@ -1397,7 +1413,7 @@ mod tests {
         let hyperliquid_btc = registry
             .provider_asset(
                 ProviderId::Hyperliquid,
-                &asset("bitcoin", AssetId::Native),
+                &asset("hyperliquid", AssetId::reference("UBTC")),
                 ProviderAssetCapability::ExchangeOutput,
             )
             .unwrap();
@@ -1613,6 +1629,26 @@ mod tests {
             transition.kind == MarketOrderTransitionKind::HyperliquidTrade
                 && transition.from == hyperliquid_venue(CanonicalAsset::Usdc)
                 && transition.to == hyperliquid_venue(CanonicalAsset::Btc)
+        }));
+    }
+
+    #[test]
+    fn transition_declarations_use_hyperliquid_venue_assets_inside_hyperliquid() {
+        let registry = AssetRegistry::default();
+        let declarations = registry.transition_declarations();
+        let hl_usdc = asset("hyperliquid", AssetId::Native);
+        let hl_eth = asset("hyperliquid", AssetId::reference("UETH"));
+        let base_eth = asset("evm:8453", AssetId::Native);
+
+        assert!(declarations.iter().any(|transition| {
+            transition.kind == MarketOrderTransitionKind::HyperliquidTrade
+                && transition.input.asset == hl_usdc
+                && transition.output.asset == hl_eth
+        }));
+        assert!(declarations.iter().any(|transition| {
+            transition.kind == MarketOrderTransitionKind::UnitWithdrawal
+                && transition.input.asset == hl_eth
+                && transition.output.asset == base_eth
         }));
     }
 

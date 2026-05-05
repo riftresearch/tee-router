@@ -52,4 +52,5 @@ pub enum TxStatus {
     NotFound,
     Pending(PendingTxStatus),
     Confirmed(ConfirmedTxStatus),
+    Failed(ConfirmedTxStatus),
 }

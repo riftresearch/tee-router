@@ -8,6 +8,8 @@ use serde::de::DeserializeOwned;
 
 use crate::error::Error;
 
+const MAX_HYPERLIQUID_RESPONSE_BODY_BYTES: usize = 256 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct HttpClient {
     client: Client,
@@ -39,10 +41,15 @@ impl HttpClient {
             .map_err(|source| Error::HttpRequest { source })?;
 
         let status = response.status();
-        let text = response
-            .text()
+        let body = read_limited_response_text(response, MAX_HYPERLIQUID_RESPONSE_BODY_BYTES)
             .await
             .map_err(|source| Error::HttpRequest { source })?;
+        if body.truncated {
+            return Err(Error::ResponseBodyTooLarge {
+                max_bytes: MAX_HYPERLIQUID_RESPONSE_BODY_BYTES,
+            });
+        }
+        let text = body.text;
 
         if status.is_success() {
             Ok(text)
@@ -63,5 +70,59 @@ impl HttpClient {
         let body = serde_json::to_string(body).map_err(|source| Error::Json { source })?;
         let text = self.post_raw(path, &body).await?;
         serde_json::from_str(&text).map_err(|source| Error::Json { source })
+    }
+}
+
+struct LimitedResponseBody {
+    text: String,
+    truncated: bool,
+}
+
+async fn read_limited_response_text(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<LimitedResponseBody, reqwest::Error> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if !append_limited_body_chunk(&mut body, chunk.as_ref(), max_bytes) {
+            return Ok(LimitedResponseBody {
+                text: String::new(),
+                truncated: true,
+            });
+        }
+    }
+
+    Ok(LimitedResponseBody {
+        text: String::from_utf8_lossy(&body).into_owned(),
+        truncated: false,
+    })
+}
+
+fn append_limited_body_chunk(body: &mut Vec<u8>, chunk: &[u8], max_bytes: usize) -> bool {
+    if body.len().saturating_add(chunk.len()) > max_bytes {
+        return false;
+    }
+    body.extend_from_slice(chunk);
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn append_limited_body_chunk_rejects_chunks_past_the_limit_without_mutating() {
+        let mut body = b"abcd".to_vec();
+
+        assert!(!append_limited_body_chunk(&mut body, b"ef", 5));
+        assert_eq!(body, b"abcd");
+    }
+
+    #[test]
+    fn append_limited_body_chunk_accepts_chunks_at_the_limit() {
+        let mut body = b"abcd".to_vec();
+
+        assert!(append_limited_body_chunk(&mut body, b"ef", 6));
+        assert_eq!(body, b"abcdef");
     }
 }

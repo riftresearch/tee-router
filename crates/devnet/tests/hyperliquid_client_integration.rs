@@ -60,6 +60,20 @@ async fn bridge_fixture(
     GenericEIP3009ERC20Instance<DynProvider>,
     Address,
 ) {
+    bridge_fixture_with_config(minted_usdc_raw, |config| config).await
+}
+
+async fn bridge_fixture_with_config(
+    minted_usdc_raw: U256,
+    configure: impl FnOnce(MockIntegratorConfig) -> MockIntegratorConfig,
+) -> (
+    AnvilInstance,
+    MockIntegratorServer,
+    HyperliquidClient,
+    Address,
+    GenericEIP3009ERC20Instance<DynProvider>,
+    Address,
+) {
     let anvil = Anvil::new().block_time(1).try_spawn().expect("anvil spawn");
     let rpc_url: Url = anvil.endpoint_url();
     let private_key: [u8; 32] = anvil.keys()[0].clone().to_bytes().into();
@@ -89,14 +103,13 @@ async fn bridge_fixture(
         .expect("deploy bridge");
     let bridge_address = *bridge.address();
 
-    let server = MockIntegratorServer::spawn_with_config(
-        MockIntegratorConfig::default()
-            .with_hyperliquid_bridge_address(format!("{bridge_address:#x}"))
-            .with_hyperliquid_evm_rpc_url(rpc_url.to_string())
-            .with_hyperliquid_usdc_token_address(format!("{:#x}", token.address())),
-    )
-    .await
-    .expect("spawn mock integrator");
+    let config = MockIntegratorConfig::default()
+        .with_hyperliquid_bridge_address(format!("{bridge_address:#x}"))
+        .with_hyperliquid_evm_rpc_url(rpc_url.to_string())
+        .with_hyperliquid_usdc_token_address(format!("{:#x}", token.address()));
+    let server = MockIntegratorServer::spawn_with_config(configure(config))
+        .await
+        .expect("spawn mock integrator");
 
     let wallet = format!("0x{}", hex::encode(private_key))
         .parse::<PrivateKeySigner>()
@@ -595,6 +608,74 @@ async fn native_bridge_deposit_transfer_credits_sender_withdrawable_usdc() {
         .expect("spot clearinghouse");
     assert!(parse_total(&spot, "USDC").abs() < 1e-9);
     assert!(server.hyperliquid_exchange_submissions().await.is_empty());
+}
+
+#[tokio::test]
+async fn native_bridge_deposit_credit_can_be_delayed_by_mock() {
+    let amount_raw = U256::from(6_000_000u64);
+    let (_anvil, server, client, user, token, bridge_address) =
+        bridge_fixture_with_config(amount_raw, |config| {
+            config.with_hyperliquid_bridge_deposit_latency(Duration::from_millis(750))
+        })
+        .await;
+
+    let deposit = client
+        .build_usdc_bridge_deposit_to(bridge_address, *token.address(), amount_raw)
+        .expect("build bridge deposit");
+    token
+        .transfer(deposit.bridge, amount_raw)
+        .send()
+        .await
+        .expect("send deposit tx")
+        .get_receipt()
+        .await
+        .expect("deposit receipt");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let early = server
+        .hyperliquid_clearinghouse_balance_of(user, "USDC")
+        .await;
+    assert!(
+        early.abs() < 1e-9,
+        "bridge deposit credited before configured latency: {early}"
+    );
+
+    let observed = wait_for_hyperliquid_clearinghouse_balance(&server, user, "USDC", 6.0).await;
+    assert!(
+        (observed - 6.0).abs() < 1e-9,
+        "observed withdrawable USDC balance {observed}"
+    );
+}
+
+#[tokio::test]
+async fn native_bridge_deposit_credit_can_fail_deterministically() {
+    let amount_raw = U256::from(6_000_000u64);
+    let (_anvil, server, client, user, token, bridge_address) =
+        bridge_fixture_with_config(amount_raw, |config| {
+            config.with_hyperliquid_bridge_deposit_failure_probability_bps(10_000)
+        })
+        .await;
+
+    let deposit = client
+        .build_usdc_bridge_deposit_to(bridge_address, *token.address(), amount_raw)
+        .expect("build bridge deposit");
+    token
+        .transfer(deposit.bridge, amount_raw)
+        .send()
+        .await
+        .expect("send deposit tx")
+        .get_receipt()
+        .await
+        .expect("deposit receipt");
+
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    let observed = server
+        .hyperliquid_clearinghouse_balance_of(user, "USDC")
+        .await;
+    assert!(
+        observed.abs() < 1e-9,
+        "configured failed bridge deposit credited unexpectedly: {observed}"
+    );
 }
 
 #[tokio::test]

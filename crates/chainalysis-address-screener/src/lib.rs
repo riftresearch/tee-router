@@ -4,7 +4,9 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
+use std::time::Duration;
 use tracing::{debug, instrument};
+use url::Url;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -17,26 +19,46 @@ pub enum Error {
     #[snafu(display("unexpected HTTP status {status}: {body}"))]
     HttpStatus { status: StatusCode, body: String },
 
+    #[snafu(display("response body exceeded {max_bytes} bytes"))]
+    ResponseBodyTooLarge { max_bytes: usize },
+
     #[snafu(display("failed to decode response body as JSON: {source}. Body: {body}"))]
     Decode {
         source: serde_json::Error,
         body: String,
     },
+
+    #[snafu(display("invalid Chainalysis host URL: {source}"))]
+    InvalidHost { source: url::ParseError },
+
+    #[snafu(display("unsupported Chainalysis host URL: {reason}"))]
+    UnsupportedHost { reason: String },
+
+    #[snafu(display("invalid Chainalysis host URL path base"))]
+    InvalidPathBase,
+
+    #[snafu(display("Chainalysis token must not be empty"))]
+    EmptyToken,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+const CHAINALYSIS_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+const CHAINALYSIS_MAX_RESPONSE_BODY_BYTES: usize = 256 * 1024;
 
 #[derive(Clone)]
 pub struct ChainalysisAddressScreener {
-    host: String,
+    host: Url,
     token: String,
     http: Client,
 }
 
 impl ChainalysisAddressScreener {
     pub fn new(host: impl Into<String>, token: impl Into<String>) -> Result<Self> {
-        let host = host.into().trim_end_matches('/').to_string();
-        let token = token.into();
+        let host = normalize_host_url(&host.into())?;
+        let token = token.into().trim().to_string();
+        if token.is_empty() {
+            return Err(Error::EmptyToken);
+        }
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -47,6 +69,7 @@ impl ChainalysisAddressScreener {
         let http = Client::builder()
             .default_headers(headers)
             .use_rustls_tls()
+            .timeout(CHAINALYSIS_HTTP_TIMEOUT)
             .build()
             .context(BuildClientSnafu)?;
 
@@ -55,7 +78,7 @@ impl ChainalysisAddressScreener {
 
     #[instrument(level = "debug", skip(self))]
     pub async fn get_address_risk(&self, address: &str) -> Result<AddressRiskResponse> {
-        let url = format!("{}/api/risk/v2/entities/{}", self.host, address);
+        let url = self.address_risk_url(address)?;
         debug!(%url, "fetching entity");
 
         let resp = self
@@ -67,7 +90,7 @@ impl ChainalysisAddressScreener {
             .context(RequestSnafu)?;
 
         let status = resp.status();
-        let bytes = resp.bytes().await.context(RequestSnafu)?;
+        let bytes = read_limited_response_body(resp, CHAINALYSIS_MAX_RESPONSE_BODY_BYTES).await?;
 
         if !status.is_success() {
             let body = String::from_utf8_lossy(&bytes).to_string();
@@ -79,6 +102,68 @@ impl ChainalysisAddressScreener {
             body: String::from_utf8_lossy(&bytes).to_string(),
         })
     }
+
+    fn address_risk_url(&self, address: &str) -> Result<Url> {
+        let mut url = self.host.clone();
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|()| Error::InvalidPathBase)?;
+        segments.pop_if_empty();
+        segments.extend(["api", "risk", "v2", "entities", address]);
+        drop(segments);
+        Ok(url)
+    }
+}
+
+fn normalize_host_url(host: &str) -> Result<Url> {
+    let mut parsed = Url::parse(host.trim()).map_err(|source| Error::InvalidHost { source })?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err(Error::UnsupportedHost {
+            reason: "expected http or https scheme".to_string(),
+        });
+    }
+    if parsed.host().is_none() {
+        return Err(Error::UnsupportedHost {
+            reason: "expected host".to_string(),
+        });
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(Error::UnsupportedHost {
+            reason: "credentials are not allowed".to_string(),
+        });
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(Error::UnsupportedHost {
+            reason: "query strings and fragments are not allowed".to_string(),
+        });
+    }
+    if !parsed.path().ends_with('/') {
+        let mut path = parsed.path().to_string();
+        path.push('/');
+        parsed.set_path(&path);
+    }
+    Ok(parsed)
+}
+
+async fn read_limited_response_body(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.context(RequestSnafu)? {
+        if !append_limited_body_chunk(&mut body, chunk.as_ref(), max_bytes) {
+            return Err(Error::ResponseBodyTooLarge { max_bytes });
+        }
+    }
+    Ok(body)
+}
+
+fn append_limited_body_chunk(body: &mut Vec<u8>, chunk: &[u8], max_bytes: usize) -> bool {
+    if body.len().saturating_add(chunk.len()) > max_bytes {
+        return false;
+    }
+    body.extend_from_slice(chunk);
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -188,6 +273,61 @@ mod tests {
         assert_eq!(parsed.risk, RiskLevel::Low);
         assert_eq!(parsed.address_type, AddressType::PrivateWallet);
         assert_eq!(parsed.status, Status::Complete);
+    }
+
+    #[test]
+    fn append_limited_body_chunk_rejects_chunks_past_the_limit_without_mutating() {
+        let mut body = b"abcd".to_vec();
+
+        assert!(!append_limited_body_chunk(&mut body, b"ef", 5));
+        assert_eq!(body, b"abcd");
+    }
+
+    #[test]
+    fn append_limited_body_chunk_accepts_chunks_at_the_limit() {
+        let mut body = b"abcd".to_vec();
+
+        assert!(append_limited_body_chunk(&mut body, b"ef", 6));
+        assert_eq!(body, b"abcdef");
+    }
+
+    #[test]
+    fn constructor_rejects_non_canonical_hosts_and_empty_tokens() {
+        for host in [
+            "ftp://api.chainalysis.com",
+            "https://user:pass@api.chainalysis.com",
+            "https://api.chainalysis.com?token=secret",
+            "https://api.chainalysis.com#fragment",
+        ] {
+            let error = match ChainalysisAddressScreener::new(host, "token") {
+                Ok(_) => panic!("host must fail"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                error,
+                Error::InvalidHost { .. } | Error::UnsupportedHost { .. }
+            ));
+        }
+
+        assert!(matches!(
+            ChainalysisAddressScreener::new("https://api.chainalysis.com", " "),
+            Err(Error::EmptyToken)
+        ));
+    }
+
+    #[test]
+    fn address_risk_url_preserves_host_prefix_and_escapes_address_path_segment() {
+        let screener =
+            ChainalysisAddressScreener::new("https://api.chainalysis.com/screening", "token")
+                .expect("client");
+        let url = screener
+            .address_risk_url("0xabc/def?x=1#frag")
+            .expect("risk url");
+
+        assert_eq!(
+            url.as_str(),
+            "https://api.chainalysis.com/screening/api/risk/v2/entities/0xabc%2Fdef%3Fx=1%23frag"
+        );
     }
 
     #[tokio::test]

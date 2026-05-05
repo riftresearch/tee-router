@@ -65,14 +65,14 @@ impl Swap {
             }
         );
 
-        ensure!(
-            self.user_deposit_status.is_some(),
-            MissingDataSnafu {
-                reason: "User deposit status not found",
-            }
-        );
+        let user_deposit =
+            self.user_deposit_status
+                .as_mut()
+                .ok_or_else(|| TransitionError::MissingData {
+                    reason: "User deposit status not found".to_string(),
+                })?;
 
-        self.user_deposit_status.as_mut().unwrap().confirmed_at = Some(utc::now());
+        user_deposit.confirmed_at = Some(utc::now());
         self.status = SwapStatus::WaitingMMDepositInitiated;
         self.updated_at = utc::now();
 

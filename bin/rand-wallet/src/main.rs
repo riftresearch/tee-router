@@ -33,8 +33,12 @@ fn main() {
     let network: Network = cli.network.into();
 
     // Bitcoin wallet
-    let btc_rand_bytes: [u8; 32] = StdRng::from_os_rng().random();
-    let btc_wallet = P2WPKHBitcoinWallet::from_secret_bytes(&btc_rand_bytes, network);
+    let btc_wallet = loop {
+        let btc_rand_bytes: [u8; 32] = StdRng::from_os_rng().random();
+        if let Ok(wallet) = P2WPKHBitcoinWallet::from_secret_bytes(&btc_rand_bytes, network) {
+            break wallet;
+        }
+    };
 
     println!("=== Bitcoin Wallet ===");
     println!("wif: {}", btc_wallet.private_key);
@@ -42,9 +46,12 @@ fn main() {
     println!("address: {}", btc_wallet.address);
 
     // EVM wallet
-    let evm_rand_bytes: [u8; 32] = StdRng::from_os_rng().random();
-    let evm_signer =
-        PrivateKeySigner::from_bytes(&evm_rand_bytes.into()).expect("valid private key bytes");
+    let (evm_rand_bytes, evm_signer) = loop {
+        let evm_rand_bytes: [u8; 32] = StdRng::from_os_rng().random();
+        if let Ok(signer) = PrivateKeySigner::from_bytes(&evm_rand_bytes.into()) {
+            break (evm_rand_bytes, signer);
+        }
+    };
 
     println!();
     println!("=== EVM Wallet ===");

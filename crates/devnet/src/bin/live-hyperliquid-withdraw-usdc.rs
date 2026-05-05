@@ -29,7 +29,7 @@ sol! {
     }
 }
 
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 #[command(about = "Withdraw live Hyperliquid USDC to an arbitrary Arbitrum address")]
 struct Args {
     #[arg(
@@ -196,10 +196,10 @@ async fn poll_withdrawable_balance(
         let state = client.clearinghouse_state(user).await?;
         let withdrawable = parse_decimal_balance(&state.withdrawable);
         let value = serde_json::to_value(&state)?;
-        last = Some(value);
         if withdrawable + 1e-9 >= minimum_expected_total {
-            return Ok(last.expect("set above"));
+            return Ok(value);
         }
+        last = Some(value);
         tokio::time::sleep(BALANCE_POLL_INTERVAL).await;
     }
     Err(format!("timed out waiting for withdrawable balance; last={last:#?}").into())
@@ -215,10 +215,10 @@ async fn poll_withdrawable_balance_at_most(
         let state = client.clearinghouse_state(user).await?;
         let withdrawable = parse_decimal_balance(&state.withdrawable);
         let value = serde_json::to_value(&state)?;
-        last = Some(value);
         if withdrawable <= maximum_expected_total + 1e-9 {
-            return Ok(last.expect("set above"));
+            return Ok(value);
         }
+        last = Some(value);
         tokio::time::sleep(BALANCE_POLL_INTERVAL).await;
     }
     Err(format!("timed out waiting for withdrawable balance to fall; last={last:#?}").into())

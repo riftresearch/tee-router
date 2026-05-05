@@ -292,7 +292,7 @@ async fn live_across_unit_hyperliquid_real_money_route() -> TestResult<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct LiveRouteConfig {
     source_rpc_url: Url,
     evm_private_key: String,
@@ -330,6 +330,76 @@ struct LiveRouteConfig {
     min_across_output_amount: U256,
     poll_interval: Duration,
     timeout: Duration,
+}
+
+impl fmt::Debug for LiveRouteConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LiveRouteConfig")
+            .field(
+                "source_rpc_url",
+                &redacted_url_for_debug(&self.source_rpc_url),
+            )
+            .field("evm_private_key", &"<redacted>")
+            .field("expected_evm_address", &self.expected_evm_address)
+            .field(
+                "across_api_url",
+                &redacted_url_for_debug(&self.across_api_url),
+            )
+            .field("across_api_key", &"<redacted>")
+            .field("across_integrator_id", &self.across_integrator_id)
+            .field("across_trade_type", &self.across_trade_type)
+            .field("across_origin_chain_id", &self.across_origin_chain_id)
+            .field(
+                "across_destination_chain_id",
+                &self.across_destination_chain_id,
+            )
+            .field("across_input_token", &self.across_input_token)
+            .field("across_output_token", &self.across_output_token)
+            .field("across_refund_on_origin", &self.across_refund_on_origin)
+            .field("across_slippage", &self.across_slippage)
+            .field("across_extra_query_count", &self.across_extra_query.len())
+            .field("allow_approval_txns", &self.allow_approval_txns)
+            .field("unit_api_url", &redacted_url_for_debug(&self.unit_api_url))
+            .field("unit_deposit_src_chain", &self.unit_deposit_src_chain)
+            .field("unit_deposit_asset", &self.unit_deposit_asset)
+            .field("unit_withdraw_dst_chain", &self.unit_withdraw_dst_chain)
+            .field("unit_withdraw_asset", &self.unit_withdraw_asset)
+            .field(
+                "hyperliquid_api_url",
+                &redacted_url_for_debug(&self.hyperliquid_api_url),
+            )
+            .field("hyperliquid_python", &self.hyperliquid_python)
+            .field("hyperliquid_private_key", &"<redacted>")
+            .field(
+                "hyperliquid_destination_address",
+                &self.hyperliquid_destination_address,
+            )
+            .field(
+                "hyperliquid_account_address",
+                &self.hyperliquid_account_address,
+            )
+            .field("hyperliquid_vault_address", &self.hyperliquid_vault_address)
+            .field("hyperliquid_trade_plan", &self.hyperliquid_trade_plan)
+            .field(
+                "hyperliquid_withdraw_token_symbol",
+                &self.hyperliquid_withdraw_token_symbol,
+            )
+            .field(
+                "hyperliquid_withdraw_amount",
+                &self.hyperliquid_withdraw_amount,
+            )
+            .field(
+                "withdraw_recipient_address",
+                &self.withdraw_recipient_address,
+            )
+            .field("refund_address", &self.refund_address)
+            .field("amount_in", &self.amount_in)
+            .field("max_amount_in", &self.max_amount_in)
+            .field("min_across_output_amount", &self.min_across_output_amount)
+            .field("poll_interval", &self.poll_interval)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 
 impl LiveRouteConfig {
@@ -505,6 +575,88 @@ impl LiveRouteConfig {
         self.hyperliquid_vault_address
             .unwrap_or(self.hyperliquid_destination_address)
     }
+}
+
+fn redacted_url_for_debug(url: &Url) -> String {
+    let host = url.host_str().unwrap_or("<missing-host>");
+    let mut redacted = format!("{}://{}", url.scheme(), host);
+    if let Some(port) = url.port() {
+        redacted.push(':');
+        redacted.push_str(&port.to_string());
+    }
+    if url.path() != "/" {
+        redacted.push_str("/<redacted-path>");
+    }
+    if url.query().is_some() {
+        redacted.push_str("?<redacted-query>");
+    }
+    redacted
+}
+
+#[test]
+fn live_route_config_debug_redacts_live_credentials() {
+    let evm_private_key = format!("0x{}", "11".repeat(32));
+    let hyperliquid_private_key = format!("0x{}", "22".repeat(32));
+    let mut across_extra_query = BTreeMap::new();
+    across_extra_query.insert("apiToken".to_string(), "extra-secret".to_string());
+
+    let config = LiveRouteConfig {
+        source_rpc_url: Url::parse(
+            "https://rpc-user:rpc-pass@rpc.example/private-token?api_key=query-secret",
+        )
+        .expect("source rpc url"),
+        evm_private_key: evm_private_key.clone(),
+        expected_evm_address: None,
+        across_api_url: Url::parse("https://across.example/api").expect("across api url"),
+        across_api_key: "across-secret".to_string(),
+        across_integrator_id: "integrator".to_string(),
+        across_trade_type: "exactInput".to_string(),
+        across_origin_chain_id: 1,
+        across_destination_chain_id: 8453,
+        across_input_token: Address::ZERO,
+        across_output_token: Address::ZERO,
+        across_refund_on_origin: true,
+        across_slippage: None,
+        across_extra_query,
+        allow_approval_txns: false,
+        unit_api_url: Url::parse("https://unit.example").expect("unit api url"),
+        unit_deposit_src_chain: "base".to_string(),
+        unit_deposit_asset: "usdc".to_string(),
+        unit_withdraw_dst_chain: "base".to_string(),
+        unit_withdraw_asset: "usdc".to_string(),
+        hyperliquid_api_url: Url::parse("https://hyper.example/private?token=hyper-url-secret")
+            .expect("hyperliquid api url"),
+        hyperliquid_python: "python3".to_string(),
+        hyperliquid_private_key: hyperliquid_private_key.clone(),
+        hyperliquid_destination_address: Address::ZERO,
+        hyperliquid_account_address: None,
+        hyperliquid_vault_address: None,
+        hyperliquid_trade_plan: json!({"asset": "ETH"}),
+        hyperliquid_withdraw_token_symbol: "USDC".to_string(),
+        hyperliquid_withdraw_amount: "1".to_string(),
+        withdraw_recipient_address: "recipient".to_string(),
+        refund_address: Address::ZERO,
+        amount_in: U256::from(1),
+        max_amount_in: U256::from(1),
+        min_across_output_amount: U256::from(1),
+        poll_interval: Duration::from_secs(1),
+        timeout: Duration::from_secs(1),
+    };
+
+    let debug = format!("{config:?}");
+
+    assert!(debug.contains("evm_private_key: \"<redacted>\""));
+    assert!(debug.contains("hyperliquid_private_key: \"<redacted>\""));
+    assert!(debug.contains("across_api_key: \"<redacted>\""));
+    assert!(!debug.contains(&evm_private_key));
+    assert!(!debug.contains(&hyperliquid_private_key));
+    assert!(!debug.contains("across-secret"));
+    assert!(!debug.contains("rpc-user"));
+    assert!(!debug.contains("rpc-pass"));
+    assert!(!debug.contains("private-token"));
+    assert!(!debug.contains("query-secret"));
+    assert!(!debug.contains("hyper-url-secret"));
+    assert!(!debug.contains("extra-secret"));
 }
 
 fn emit_live_route_recovery_artifact(label: &str, config: &LiveRouteConfig, value: Value) {

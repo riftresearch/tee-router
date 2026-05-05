@@ -12,11 +12,10 @@ pub const LARGE_WATCH_SET_SIZES: [usize; 2] = [10_000, 50_000];
 pub const DEFAULT_BITCOIN_INDEXED_LOOKUP_CONCURRENCY: usize = 32;
 pub const DEFAULT_EVM_INDEXED_LOOKUP_CONCURRENCY: usize = 8;
 
-pub fn benchmark_runtime() -> Runtime {
+pub fn benchmark_runtime() -> std::io::Result<Runtime> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .expect("benchmark runtime should build")
 }
 
 pub fn make_mixed_watch_entries(count: usize) -> Vec<WatchEntry> {
@@ -37,6 +36,7 @@ pub fn make_mixed_watch_entries(count: usize) -> Vec<WatchEntry> {
             WatchEntry {
                 watch_target: WatchTarget::ProviderOperation,
                 watch_id: Uuid::from_u128((index + 1) as u128),
+                order_id: Uuid::from_u128((index + 1) as u128),
                 source_chain,
                 source_token,
                 address,
@@ -66,6 +66,7 @@ pub fn make_single_chain_shared_watch_entries(
             Arc::new(WatchEntry {
                 watch_target: WatchTarget::ProviderOperation,
                 watch_id: Uuid::from_u128((index + 1) as u128),
+                order_id: Uuid::from_u128((index + 1) as u128),
                 source_chain: chain,
                 source_token: source_token.clone(),
                 address,

@@ -35,6 +35,8 @@ pub use info::{
     BasicOrderInfo, ClearinghouseState, L2BookSnapshot, L2Level, MarginSummary, OpenOrder,
     OrderInfoEnvelope, OrderStatusResponse, SpotBalance, SpotClearinghouseState, UserFill,
 };
-pub use meta::{SpotAssetMeta, SpotMeta, TokenInfo, SPOT_ASSET_INDEX_OFFSET};
+pub use meta::{
+    spot_wire_asset_index, SpotAssetMeta, SpotMeta, TokenInfo, SPOT_ASSET_INDEX_OFFSET,
+};
 pub use signature::{recover_l1_signer, recover_typed_signer, sign_l1_action, sign_typed_data};
 pub use wire::float_to_wire;

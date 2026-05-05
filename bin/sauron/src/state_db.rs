@@ -21,13 +21,9 @@ fn state_migrations_dir() -> PathBuf {
 
 pub async fn migrate_state(pool: &PgPool) -> Result<()> {
     info!("Running Sauron state migrations...");
-    let mut migrator = Migrator::new(state_migrations_dir())
+    let migrator = Migrator::new(state_migrations_dir())
         .await
         .context(StateMigrationSnafu)?;
-
-    // In legacy local/test deployments this can be the same database as the
-    // router schema, whose `_sqlx_migrations` already contains router versions.
-    migrator.ignore_missing = true;
     migrator.run(pool).await.context(StateMigrationSnafu)?;
     info!("Sauron state migrations complete");
     Ok(())

@@ -9,7 +9,7 @@ use crate::{
     protocol::{backend_chain_for_id, AssetId, ChainId},
 };
 use alloy::{
-    primitives::{Address, Bytes, U256},
+    primitives::{keccak256, Address, Bytes, U256},
     signers::local::PrivateKeySigner,
 };
 use bitcoin::secp256k1::Secp256k1;
@@ -23,7 +23,7 @@ use router_primitives::ChainType;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use snafu::Snafu;
-use std::{collections::HashMap, str::FromStr, sync::Arc};
+use std::{collections::HashMap, fmt, str::FromStr, sync::Arc};
 use uuid::Uuid;
 
 #[derive(Debug, Snafu)]
@@ -64,6 +64,9 @@ pub enum CustodyActionError {
     #[snafu(display("invalid calldata: {}", reason))]
     InvalidCalldata { reason: String },
 
+    #[snafu(display("serialization failed: {}", reason))]
+    Serialization { reason: String },
+
     #[snafu(display("failed to generate custody vault derivation salt: {}", source))]
     Random { source: getrandom::Error },
 
@@ -90,6 +93,12 @@ pub enum CustodyActionError {
 
     #[snafu(display("hyperliquid action failed: {}", reason))]
     HyperliquidAction { reason: String },
+
+    #[snafu(display("invalid hyperliquid timestamp for {}: {}", context, reason))]
+    InvalidHyperliquidTimestamp {
+        context: &'static str,
+        reason: String,
+    },
 }
 
 pub type CustodyActionResult<T> = Result<T, CustodyActionError>;
@@ -183,10 +192,9 @@ pub struct CustodyActionRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CustodyActionReceipt {
     pub custody_vault_id: Uuid,
-    /// On-chain tx hash for EVM / Bitcoin / etc. For Hyperliquid — which has
-    /// no on-chain receipt — this is a synthetic handle derived from the HL
-    /// response (order id, withdraw nonce, …) so upstream code that indexes
-    /// receipts by tx_hash keeps working.
+    /// On-chain tx hash for EVM / Bitcoin / etc. For Hyperliquid this is the
+    /// L1 action hash when the client can derive it, otherwise a synthetic
+    /// fallback derived from the HL response.
     pub tx_hash: String,
     /// EVM logs emitted by the transaction, when the action produced them.
     /// Non-EVM-call actions (transfers, non-EVM chains) leave this empty.
@@ -207,12 +215,23 @@ pub struct CustodyActionExecutor {
     paymasters: PaymasterRegistry,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct HyperliquidExecutionConfig {
     signer_private_key: String,
     signer_address: Address,
     account_address: Option<Address>,
     vault_address: Option<Address>,
+}
+
+impl fmt::Debug for HyperliquidExecutionConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HyperliquidExecutionConfig")
+            .field("signer_private_key", &"redacted")
+            .field("signer_address", &self.signer_address)
+            .field("account_address", &self.account_address)
+            .field("vault_address", &self.vault_address)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -759,7 +778,7 @@ impl CustodyActionExecutor {
                     });
                 }
 
-                let sweep_amount = balance.saturating_sub(reserved_fee);
+                let sweep_amount = checked_release_sweep_amount(balance, reserved_fee)?;
                 let tx_hash = chain
                     .transfer_native_amount(wallet.private_key(), paymaster_address, sweep_amount)
                     .await
@@ -893,6 +912,7 @@ impl CustodyActionExecutor {
             });
         }
 
+        let sweep_amount_sats = checked_release_sweep_sats(balance_sats, fee_sats)?;
         let raw_tx = chain
             .dump_to_address(
                 &router_primitives::TokenIdentifier::Native,
@@ -913,7 +933,7 @@ impl CustodyActionExecutor {
                 "release_sweep_attempted_at": attempted_at,
                 "release_sweep_target_address": paymaster_address,
                 "release_sweep_asset_id": asset.as_str(),
-                "release_sweep_amount": balance_sats.saturating_sub(fee_sats).to_string(),
+                "release_sweep_amount": sweep_amount_sats.to_string(),
                 "release_sweep_reserved_fee": fee_sats.to_string(),
                 "release_sweep_tx_hash": tx_hash,
             }),
@@ -1008,7 +1028,7 @@ impl CustodyActionExecutor {
             let token = info
                 .spot_token_wire(&balance.coin)
                 .map_err(|source| CustodyActionError::Hyperliquid { source })?;
-            let time_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+            let time_ms = current_hyperliquid_nonce_time_ms("release sweep spot_send")?;
             let response = client
                 .spot_send(
                     paymaster_address.to_string(),
@@ -1079,6 +1099,20 @@ fn decimal_string_positive(value: &str) -> bool {
     value.chars().any(|ch| ch.is_ascii_digit() && ch != '0')
 }
 
+fn current_hyperliquid_nonce_time_ms(context: &'static str) -> CustodyActionResult<u64> {
+    hyperliquid_nonce_time_ms_from_timestamp(chrono::Utc::now().timestamp_millis(), context)
+}
+
+fn hyperliquid_nonce_time_ms_from_timestamp(
+    timestamp_millis: i64,
+    context: &'static str,
+) -> CustodyActionResult<u64> {
+    u64::try_from(timestamp_millis).map_err(|_| CustodyActionError::InvalidHyperliquidTimestamp {
+        context,
+        reason: "system clock is before Unix epoch".to_string(),
+    })
+}
+
 pub fn evm_address_from_private_key(private_key: &str) -> CustodyActionResult<String> {
     let signer = private_key
         .trim_start_matches("0x")
@@ -1125,10 +1159,11 @@ fn parse_u256(field: &'static str, value: &str) -> CustodyActionResult<U256> {
 }
 
 /// Sign and submit a Hyperliquid action using the custody vault's derived EVM
-/// key. Returns `(tx_hash, response_body)` — HL has no on-chain tx, so
-/// `tx_hash` is a synthetic handle (first order id / withdraw nonce) that
-/// upstream indexers use as a primary key. The full response is forwarded so
-/// the provider's `post_execute` can derive richer observed state.
+/// key. Returns `(tx_hash, response_body)`. HL order actions expose a local
+/// action hash through the client response; when absent, we use a synthetic
+/// fallback so upstream receipt indexing still has a stable handle. The full
+/// response is forwarded so the provider's `post_execute` can derive richer
+/// observed state.
 async fn execute_hyperliquid_call(
     call: &HyperliquidCall,
     private_key: &str,
@@ -1175,7 +1210,7 @@ async fn execute_hyperliquid_call(
                 .map_err(|source| CustodyActionError::Hyperliquid { source })?,
         },
         HyperliquidCallPayload::UsdClassTransfer { amount, to_perp } => {
-            let time_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+            let time_ms = current_hyperliquid_nonce_time_ms("usd_class_transfer")?;
             client
                 .usd_class_transfer(amount.clone(), *to_perp, time_ms)
                 .await
@@ -1185,7 +1220,7 @@ async fn execute_hyperliquid_call(
             destination,
             amount,
         } => {
-            let time_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+            let time_ms = current_hyperliquid_nonce_time_ms("withdraw3")?;
             client
                 .withdraw_to_bridge(destination.clone(), amount.clone(), time_ms)
                 .await
@@ -1196,7 +1231,7 @@ async fn execute_hyperliquid_call(
             token,
             amount,
         } => {
-            let time_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+            let time_ms = current_hyperliquid_nonce_time_ms("spot_send")?;
             client
                 .spot_send(destination.clone(), token.clone(), amount.clone(), time_ms)
                 .await
@@ -1208,22 +1243,26 @@ async fn execute_hyperliquid_call(
         return Err(CustodyActionError::HyperliquidAction { reason });
     }
 
-    let tx_hash = synthesize_hyperliquid_tx_hash(&call.payload, &response);
+    let tx_hash = synthesize_hyperliquid_tx_hash(&call.payload, &response)?;
     Ok((tx_hash, response))
 }
 
 fn hyperliquid_action_error(response: &Value) -> Option<String> {
-    if response
-        .get("status")
-        .and_then(Value::as_str)
-        .is_some_and(|status| status.eq_ignore_ascii_case("err"))
-    {
-        return Some(
-            response
-                .get("response")
-                .map(Value::to_string)
-                .unwrap_or_else(|| response.to_string()),
-        );
+    match response.get("status").and_then(Value::as_str) {
+        Some(status) if status.eq_ignore_ascii_case("ok") => {}
+        Some(_) => {
+            return Some(
+                response
+                    .get("response")
+                    .map(Value::to_string)
+                    .unwrap_or_else(|| response.to_string()),
+            );
+        }
+        None => {
+            return Some(format!(
+                "hyperliquid action response missing status: {response}"
+            ));
+        }
     }
 
     let statuses = response
@@ -1234,10 +1273,18 @@ fn hyperliquid_action_error(response: &Value) -> Option<String> {
         .find_map(|status| status.get("error").map(Value::to_string))
 }
 
-/// HL's `/exchange` replies with a JSON envelope; we pick a stable string out
-/// of it to seed `CustodyActionReceipt::tx_hash`. Prefer order-ids / nonces
-/// over random uuids so that replayed ingest produces the same key.
-fn synthesize_hyperliquid_tx_hash(payload: &HyperliquidCallPayload, response: &Value) -> String {
+/// HL's `/exchange` replies with a JSON envelope; our client annotates L1
+/// action responses with the Hyperliquid action hash. Prefer that real
+/// explorer hash, then fall back to a stable hash-shaped handle derived from
+/// the payload and response.
+fn synthesize_hyperliquid_tx_hash(
+    payload: &HyperliquidCallPayload,
+    response: &Value,
+) -> CustodyActionResult<String> {
+    if let Some(hash) = response.get("hash").and_then(Value::as_str) {
+        return Ok(hash.to_string());
+    }
+
     // `{"status":"ok","response":{"type":"order","data":{"statuses":[{"resting":{"oid":123}}]}}}`
     if let Some(statuses) = response
         .pointer("/response/data/statuses")
@@ -1249,20 +1296,67 @@ fn synthesize_hyperliquid_tx_hash(payload: &HyperliquidCallPayload, response: &V
                 .or_else(|| status.pointer("/filled/oid"))
                 .and_then(Value::as_u64)
             {
-                return format!("hl:oid:{oid}");
+                return synthetic_hyperliquid_response_hash(
+                    payload,
+                    response,
+                    &format!("oid:{oid}"),
+                );
             }
         }
     }
 
     match payload {
-        HyperliquidCallPayload::UsdClassTransfer { .. } => "hl:usdclasstransfer".to_string(),
-        HyperliquidCallPayload::Withdraw3 { .. } => "hl:withdraw3".to_string(),
-        HyperliquidCallPayload::SpotSend { .. } => "hl:spotsend".to_string(),
+        HyperliquidCallPayload::UsdClassTransfer { .. } => {
+            synthetic_hyperliquid_response_hash(payload, response, "usd_class_transfer")
+        }
+        HyperliquidCallPayload::Withdraw3 { .. } => {
+            synthetic_hyperliquid_response_hash(payload, response, "withdraw3")
+        }
+        HyperliquidCallPayload::SpotSend { .. } => {
+            synthetic_hyperliquid_response_hash(payload, response, "spot_send")
+        }
         HyperliquidCallPayload::L1Action { action } => match action {
-            HyperliquidActions::ScheduleCancel(_) => "hl:schedulecancel".to_string(),
-            HyperliquidActions::Order(_) | HyperliquidActions::Cancel(_) => "hl:action".to_string(),
+            HyperliquidActions::ScheduleCancel(_) => {
+                synthetic_hyperliquid_response_hash(payload, response, "schedule_cancel")
+            }
+            HyperliquidActions::Order(_) => {
+                synthetic_hyperliquid_response_hash(payload, response, "l1_order")
+            }
+            HyperliquidActions::Cancel(_) => {
+                synthetic_hyperliquid_response_hash(payload, response, "l1_cancel")
+            }
         },
     }
+}
+
+fn synthetic_hyperliquid_response_hash(
+    payload: &HyperliquidCallPayload,
+    response: &Value,
+    discriminator: &str,
+) -> CustodyActionResult<String> {
+    let payload_bytes =
+        serde_json::to_vec(payload).map_err(|error| CustodyActionError::Serialization {
+            reason: format!("hyperliquid payload could not be encoded: {error}"),
+        })?;
+    let response_bytes =
+        serde_json::to_vec(response).map_err(|error| CustodyActionError::Serialization {
+            reason: format!("hyperliquid response could not be encoded: {error}"),
+        })?;
+    let mut preimage = Vec::with_capacity(
+        b"rift-hyperliquid-response-v1".len()
+            + discriminator.len()
+            + payload_bytes.len()
+            + response_bytes.len()
+            + 4,
+    );
+    preimage.extend_from_slice(b"rift-hyperliquid-response-v1");
+    preimage.push(b'|');
+    preimage.extend_from_slice(discriminator.as_bytes());
+    preimage.push(b'|');
+    preimage.extend_from_slice(&payload_bytes);
+    preimage.push(b'|');
+    preimage.extend_from_slice(&response_bytes);
+    Ok(format!("{:#x}", keccak256(preimage)))
 }
 
 fn decode_calldata(value: &str) -> CustodyActionResult<Bytes> {
@@ -1277,4 +1371,202 @@ fn decode_calldata(value: &str) -> CustodyActionResult<Bytes> {
             reason: err.to_string(),
         })?;
     Ok(Bytes::from(bytes))
+}
+
+fn checked_release_sweep_amount(balance: U256, reserved_fee: U256) -> CustodyActionResult<U256> {
+    balance
+        .checked_sub(reserved_fee)
+        .ok_or_else(|| CustodyActionError::InvalidAmount {
+            field: "release_sweep_amount",
+            reason: "balance minus reserved fee underflowed".to_string(),
+        })
+}
+
+fn checked_release_sweep_sats(balance_sats: u64, fee_sats: u64) -> CustodyActionResult<u64> {
+    balance_sats
+        .checked_sub(fee_sats)
+        .ok_or_else(|| CustodyActionError::InvalidAmount {
+            field: "release_sweep_amount",
+            reason: "bitcoin balance minus reserved fee underflowed".to_string(),
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn withdraw_payload() -> HyperliquidCallPayload {
+        HyperliquidCallPayload::Withdraw3 {
+            destination: "0x1111111111111111111111111111111111111111".to_string(),
+            amount: "1.25".to_string(),
+        }
+    }
+
+    #[test]
+    fn hyperliquid_execution_config_debug_redacts_private_key() {
+        let private_key = "0x59c6995e998f97a5a0044966f094538b292b05a59f7807f5d8f6ab1234d1f001";
+        let config = HyperliquidExecutionConfig::new(
+            private_key,
+            Some(Address::repeat_byte(0x11)),
+            Some(Address::repeat_byte(0x22)),
+        )
+        .expect("valid config");
+
+        let rendered = format!("{config:?}");
+
+        assert!(!rendered.contains("59c6995e998f97a5a0044966f094538b"));
+        assert!(rendered.contains("redacted"));
+        assert!(rendered.contains("1111111111111111111111111111111111111111"));
+        assert!(rendered.contains("2222222222222222222222222222222222222222"));
+    }
+
+    #[test]
+    fn hyperliquid_tx_hash_prefers_exchange_action_hash() {
+        let response = json!({
+            "status": "ok",
+            "hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "response": { "type": "order" }
+        });
+
+        assert_eq!(
+            synthesize_hyperliquid_tx_hash(&withdraw_payload(), &response).unwrap(),
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+    }
+
+    #[test]
+    fn hyperliquid_tx_hash_fallback_is_hash_shaped_not_oid_handle() {
+        let response = json!({
+            "status": "ok",
+            "response": {
+                "type": "order",
+                "data": {
+                    "statuses": [{ "filled": { "oid": 1109 } }]
+                }
+            }
+        });
+
+        let tx_hash = synthesize_hyperliquid_tx_hash(&withdraw_payload(), &response).unwrap();
+
+        assert!(tx_hash.starts_with("0x"));
+        assert_eq!(tx_hash.len(), 66);
+        assert!(!tx_hash.starts_with("hl:oid:"));
+    }
+
+    #[test]
+    fn hyperliquid_tx_hash_fallback_changes_with_response_identity() {
+        let first = json!({
+            "status": "ok",
+            "response": {
+                "type": "order",
+                "data": {
+                    "statuses": [{ "filled": { "oid": 1109 } }]
+                }
+            }
+        });
+        let second = json!({
+            "status": "ok",
+            "response": {
+                "type": "order",
+                "data": {
+                    "statuses": [{ "filled": { "oid": 1110 } }]
+                }
+            }
+        });
+
+        assert_ne!(
+            synthesize_hyperliquid_tx_hash(&withdraw_payload(), &first).unwrap(),
+            synthesize_hyperliquid_tx_hash(&withdraw_payload(), &second).unwrap()
+        );
+    }
+
+    #[test]
+    fn hyperliquid_action_error_rejects_missing_status() {
+        let response = json!({
+            "response": {
+                "type": "order"
+            }
+        });
+
+        let error = hyperliquid_action_error(&response).expect("missing status");
+
+        assert!(error.contains("missing status"), "{error}");
+    }
+
+    #[test]
+    fn hyperliquid_action_error_rejects_non_ok_status() {
+        let response = json!({
+            "status": "error",
+            "response": "bad action"
+        });
+
+        let error = hyperliquid_action_error(&response).expect("non-ok status");
+
+        assert!(error.contains("bad action"), "{error}");
+    }
+
+    #[test]
+    fn hyperliquid_action_error_accepts_ok_without_status_errors() {
+        let response = json!({
+            "status": "ok",
+            "response": {
+                "type": "order",
+                "data": {
+                    "statuses": [{ "resting": { "oid": 1109 } }]
+                }
+            }
+        });
+
+        assert!(hyperliquid_action_error(&response).is_none());
+    }
+
+    #[test]
+    fn hyperliquid_action_error_rejects_status_entry_errors() {
+        let response = json!({
+            "status": "ok",
+            "response": {
+                "type": "order",
+                "data": {
+                    "statuses": [{ "error": "insufficient margin" }]
+                }
+            }
+        });
+
+        let error = hyperliquid_action_error(&response).expect("status entry error");
+
+        assert!(error.contains("insufficient margin"), "{error}");
+    }
+
+    #[test]
+    fn hyperliquid_nonce_time_rejects_pre_epoch_timestamp() {
+        let error = hyperliquid_nonce_time_ms_from_timestamp(-1, "test nonce")
+            .expect_err("negative timestamps must reject");
+
+        assert!(matches!(
+            error,
+            CustodyActionError::InvalidHyperliquidTimestamp { context, .. }
+                if context == "test nonce"
+        ));
+    }
+
+    #[test]
+    fn hyperliquid_nonce_time_accepts_unix_epoch_boundary() {
+        assert_eq!(
+            hyperliquid_nonce_time_ms_from_timestamp(0, "test nonce").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn release_sweep_amounts_reject_underflow() {
+        assert_eq!(
+            checked_release_sweep_amount(U256::from(10_u64), U256::from(3_u64))
+                .unwrap()
+                .to_string(),
+            "7"
+        );
+        assert!(checked_release_sweep_amount(U256::from(3_u64), U256::from(10_u64)).is_err());
+        assert_eq!(checked_release_sweep_sats(10, 3).unwrap(), 7);
+        assert!(checked_release_sweep_sats(3, 10).is_err());
+    }
 }

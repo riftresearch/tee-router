@@ -2,7 +2,6 @@ import { ponder } from "ponder:registry";
 import { erc20TransferRaw } from "ponder:schema";
 import pg from "pg";
 
-const chainId = Number(process.env.PONDER_CHAIN_ID);
 const schemaName = process.env.DATABASE_SCHEMA ?? process.env.PONDER_SCHEMA;
 const databaseUrl = process.env.DATABASE_URL;
 
@@ -14,10 +13,39 @@ if (!databaseUrl) {
   throw new Error("DATABASE_URL must be set for candidate materialization");
 }
 
+const parsePositiveInteger = (
+  value: string | undefined,
+  name: string,
+  defaultValue: number | undefined,
+  max: number,
+) => {
+  const raw = value ?? defaultValue?.toString();
+  if (raw === undefined || !/^\d+$/.test(raw)) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0 || parsed > max) {
+    throw new Error(`${name} must be a positive integer <= ${max}`);
+  }
+  return parsed;
+};
+
+const validatedChainId = parsePositiveInteger(
+  process.env.PONDER_CHAIN_ID,
+  "PONDER_CHAIN_ID",
+  undefined,
+  Number.MAX_SAFE_INTEGER,
+);
+
 const pool = new pg.Pool({
   connectionString: databaseUrl,
   application_name: "evm-token-indexer-indexing",
-  max: Number(process.env.EVM_TOKEN_INDEXER_INDEXING_POOL_SIZE ?? 5),
+  max: parsePositiveInteger(
+    process.env.EVM_TOKEN_INDEXER_INDEXING_POOL_SIZE,
+    "EVM_TOKEN_INDEXER_INDEXING_POOL_SIZE",
+    5,
+    100,
+  ),
 });
 
 const normalizeAddress = (address: string) =>
@@ -52,7 +80,7 @@ ponder.on("erc20:Transfer", async ({ event, context }) => {
     .insert(erc20TransferRaw)
     .values({
       id: event.id,
-      chainId,
+      chainId: validatedChainId,
       tokenAddress,
       fromAddress,
       toAddress,
@@ -73,6 +101,7 @@ ponder.on("erc20:Transfer", async ({ event, context }) => {
       watch_target,
       chain_id,
       token_address,
+      from_address,
       deposit_address,
       amount,
       required_amount,
@@ -91,30 +120,33 @@ ponder.on("erc20:Transfer", async ({ event, context }) => {
       w.watch_target,
       $1 AS chain_id,
       $3 AS token_address,
-      $4 AS deposit_address,
-      $5::numeric AS amount,
+      $4 AS from_address,
+      $5 AS deposit_address,
+      $6::numeric AS amount,
       w.required_amount,
-      $6 AS transaction_hash,
-      $7 AS transfer_index,
-      $8::numeric AS block_number,
-      $9 AS block_hash,
-      $10::numeric AS block_timestamp,
+      $7 AS transaction_hash,
+      $8 AS transfer_index,
+      $9::numeric AS block_number,
+      $10 AS block_hash,
+      $11::numeric AS block_timestamp,
       'pending' AS status,
       0 AS attempt_count,
-      $11::numeric AS created_at
+      $12::numeric AS created_at
     FROM ${activeWatchTable} w
     WHERE w.chain_id = $1
       AND w.token_address = $3
-      AND w.deposit_address = $4
-      AND $5::numeric >= w.min_amount
-      AND $5::numeric <= w.max_amount
-      AND $10::numeric <= w.expires_at
+      AND w.deposit_address = $5
+      AND $6::numeric >= w.min_amount
+      AND $6::numeric <= w.max_amount
+      AND $11::numeric >= w.created_at
+      AND $11::numeric <= w.expires_at
     ON CONFLICT (id) DO NOTHING
     `,
     [
-      chainId,
+      validatedChainId,
       event.id,
       tokenAddress,
+      fromAddress,
       toAddress,
       amount.toString(),
       transactionHash,

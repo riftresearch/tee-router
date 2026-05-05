@@ -4,8 +4,8 @@ use crate::{
     db::Database,
     error::RouterServerError,
     models::{
-        DepositVault, DepositVaultFundingHint, DepositVaultStatus, ProviderOperationHintStatus,
-        RouterOrderQuote, RouterOrderStatus, VaultAction,
+        DepositVault, DepositVaultFundingHint, DepositVaultFundingObservation, DepositVaultStatus,
+        ProviderOperationHintStatus, RouterOrderQuote, RouterOrderStatus, VaultAction,
     },
     protocol::{backend_chain_for_id, AssetId, ChainId, DepositAsset},
     services::deposit_address::{derive_deposit_address_for_quote, DepositAddressError},
@@ -14,20 +14,38 @@ use crate::{
 use alloy::primitives::{keccak256, U256};
 use blockchain_utils::MempoolEsploraFeeExt;
 use chains::ChainRegistry;
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
+use hkdf::Hkdf;
 use router_primitives::{ChainType, TokenIdentifier};
-use serde_json::json;
+use serde_json::{json, Value};
+use sha2::Sha256;
 use snafu::Snafu;
-use std::{sync::Arc, time::Instant};
-use tracing::{debug, info, warn};
+use std::{collections::HashSet, fmt, sync::Arc, time::Instant};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 const CANCELLATION_COMMITMENT_DOMAIN: &[u8] = b"router-server-cancel-v1";
+const ORDER_CANCELLATION_SECRET_DOMAIN: &[u8] = b"router-order-cancel-secret-v1";
 const DEFAULT_CANCEL_AFTER: Duration = Duration::hours(24);
-const FUNDING_PASS_LIMIT: i64 = 100;
 const REFUND_PASS_LIMIT: i64 = 100;
 const REFUND_LEASE_DURATION: Duration = Duration::minutes(5);
 const REFUND_RETRY_DELAY: Duration = Duration::seconds(30);
+const BITCOIN_REFUND_FEE_VBYTES: f64 = 125.0;
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct OrderCancellationMaterial {
+    pub commitment: String,
+    pub secret: String,
+}
+
+impl fmt::Debug for OrderCancellationMaterial {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OrderCancellationMaterial")
+            .field("commitment", &self.commitment)
+            .field("secret", &"<redacted>")
+            .finish()
+    }
+}
 
 #[derive(Debug, Snafu)]
 pub enum VaultError {
@@ -64,6 +82,12 @@ pub enum VaultError {
 
     #[snafu(display("Funding check failed: {}", message))]
     FundingCheck { message: String },
+
+    #[snafu(display("Funding hint is not observable yet: {}", reason))]
+    FundingHintNotReady { reason: String },
+
+    #[snafu(display("Invalid funding hint: {}", reason))]
+    InvalidFundingHint { reason: String },
 
     #[snafu(display("Failed to generate vault salt: {}", source))]
     Random { source: Box<getrandom::Error> },
@@ -114,6 +138,7 @@ struct OrderBinding {
 #[derive(Debug, Clone)]
 enum FundingHintDisposition {
     Funded { vault: Box<DepositVault> },
+    Observed { vault: Box<DepositVault> },
     Ignored { reason: String },
 }
 
@@ -240,6 +265,7 @@ impl VaultManager {
             refunded_at: None,
             refund_tx_hash: None,
             last_refund_error: None,
+            funding_observation: None,
             created_at: now,
             updated_at: now,
         };
@@ -274,6 +300,16 @@ impl VaultManager {
         self.db.vaults().get(id).await.map_err(VaultError::database)
     }
 
+    #[must_use]
+    pub fn order_cancellation_material(&self, quote_id: Uuid) -> OrderCancellationMaterial {
+        let secret_bytes =
+            derive_order_cancellation_secret(&self.settings.master_key_bytes(), quote_id);
+        OrderCancellationMaterial {
+            commitment: compute_cancellation_commitment_hex(&secret_bytes),
+            secret: format!("0x{}", alloy::hex::encode(secret_bytes)),
+        }
+    }
+
     pub async fn cancel_vault(
         &self,
         id: Uuid,
@@ -302,71 +338,18 @@ impl VaultManager {
         Ok(requested_vault)
     }
 
-    pub async fn process_funding_pass(&self) -> VaultResult<usize> {
-        let vaults = self
-            .db
-            .vaults()
-            .get_pending_funding(FUNDING_PASS_LIMIT)
-            .await
-            .map_err(VaultError::database)?;
-        let mut funded = 0_usize;
-
-        for vault in vaults {
-            match self.is_vault_funded(&vault).await {
-                Ok(true) => {
-                    let funded_vault = match self
-                        .db
-                        .vaults()
-                        .transition_status(
-                            vault.id,
-                            DepositVaultStatus::PendingFunding,
-                            DepositVaultStatus::Funded,
-                            Utc::now(),
-                        )
-                        .await
-                    {
-                        Ok(funded_vault) => funded_vault,
-                        Err(RouterServerError::NotFound) => {
-                            debug!(
-                                vault_id = %vault.id,
-                                "Vault funding transition was already claimed"
-                            );
-                            continue;
-                        }
-                        Err(source) => return Err(VaultError::database(source)),
-                    };
-                    telemetry::record_vault_transition(
-                        &funded_vault,
-                        DepositVaultStatus::PendingFunding,
-                        DepositVaultStatus::Funded,
-                    );
-                    info!(
-                        vault_id = %funded_vault.id,
-                        chain = %funded_vault.deposit_asset.chain,
-                        asset_kind = if funded_vault.deposit_asset.asset.is_native() { "native" } else { "reference" },
-                        "Router-server vault funding detected"
-                    );
-                    funded += 1;
-                }
-                Ok(false) => {}
-                Err(err) => {
-                    warn!(vault_id = %vault.id, error = %err, "Funding check failed");
-                }
-            }
-        }
-
-        Ok(funded)
-    }
-
     pub async fn record_funding_hint(
         &self,
         hint: DepositVaultFundingHint,
     ) -> VaultResult<DepositVaultFundingHint> {
-        self.db
+        let vault = self
+            .db
             .vaults()
             .get(hint.vault_id)
             .await
             .map_err(VaultError::database)?;
+        self.ensure_full_amount_hint_is_observable(&vault, &hint)
+            .await?;
         self.db
             .vaults()
             .create_funding_hint(&hint)
@@ -393,51 +376,91 @@ impl VaultManager {
         for hint in hints {
             match self.process_funding_hint(&hint).await {
                 Ok(FundingHintDisposition::Funded { vault }) => {
-                    self.db
-                        .vaults()
-                        .complete_funding_hint(
-                            hint.id,
+                    if self
+                        .complete_claimed_funding_hint(
+                            &hint,
                             ProviderOperationHintStatus::Processed,
                             json!({}),
-                            Utc::now(),
                         )
-                        .await
-                        .map_err(VaultError::database)?;
-                    summary.processed += 1;
+                        .await?
+                    {
+                        summary.processed += 1;
+                    }
                     if let Some(order_id) = vault.order_id {
                         summary.funded_order_ids.push(order_id);
                     }
                 }
+                Ok(FundingHintDisposition::Observed { vault }) => {
+                    if self
+                        .complete_claimed_funding_hint(
+                            &hint,
+                            ProviderOperationHintStatus::Processed,
+                            json!({}),
+                        )
+                        .await?
+                    {
+                        summary.processed += 1;
+                    }
+                    info!(
+                        vault_id = %vault.id,
+                        hint_id = %hint.id,
+                        status = %vault.status.to_db_string(),
+                        "Router worker recorded late funding observation"
+                    );
+                }
                 Ok(FundingHintDisposition::Ignored { reason }) => {
-                    self.db
-                        .vaults()
-                        .complete_funding_hint(
-                            hint.id,
+                    if self
+                        .complete_claimed_funding_hint(
+                            &hint,
                             ProviderOperationHintStatus::Ignored,
                             json!({ "reason": reason }),
-                            Utc::now(),
                         )
-                        .await
-                        .map_err(VaultError::database)?;
-                    summary.processed += 1;
+                        .await?
+                    {
+                        summary.processed += 1;
+                    }
                 }
                 Err(error) => {
-                    self.db
-                        .vaults()
-                        .complete_funding_hint(
-                            hint.id,
+                    if self
+                        .complete_claimed_funding_hint(
+                            &hint,
                             ProviderOperationHintStatus::Failed,
                             json!({ "error": error.to_string() }),
-                            Utc::now(),
                         )
-                        .await
-                        .map_err(VaultError::database)?;
-                    summary.processed += 1;
+                        .await?
+                    {
+                        summary.processed += 1;
+                    }
                 }
             }
         }
 
         Ok(summary)
+    }
+
+    async fn complete_claimed_funding_hint(
+        &self,
+        hint: &DepositVaultFundingHint,
+        status: ProviderOperationHintStatus,
+        error: Value,
+    ) -> VaultResult<bool> {
+        match self
+            .db
+            .vaults()
+            .complete_funding_hint(hint.id, hint.claimed_at, status, error, Utc::now())
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(RouterServerError::NotFound) => {
+                warn!(
+                    hint_id = %hint.id,
+                    claimed_at = ?hint.claimed_at,
+                    "Funding hint completion lost its processing lease; leaving current hint owner to finish it"
+                );
+                Ok(false)
+            }
+            Err(source) => Err(VaultError::database(source)),
+        }
     }
 
     async fn process_funding_hint(
@@ -450,11 +473,17 @@ impl VaultManager {
             .get(hint.vault_id)
             .await
             .map_err(VaultError::database)?;
-        match vault.status {
-            DepositVaultStatus::PendingFunding => {}
+        let should_refund_observed_deposit = match vault.status {
+            DepositVaultStatus::PendingFunding => false,
             DepositVaultStatus::Funded => {
                 return Ok(FundingHintDisposition::Ignored {
                     reason: "vault already funded".to_string(),
+                });
+            }
+            DepositVaultStatus::Refunding if vault.funding_observation.is_none() => true,
+            DepositVaultStatus::Refunding => {
+                return Ok(FundingHintDisposition::Ignored {
+                    reason: "refunding vault already has a funding observation".to_string(),
                 });
             }
             status => {
@@ -462,23 +491,43 @@ impl VaultManager {
                     reason: format!("vault status is {}", status.to_db_string()),
                 });
             }
-        }
+        };
 
-        if !self.is_vault_funded(&vault).await? {
+        let required_amount = self.required_funding_amount(&vault).await?;
+        if !self
+            .is_vault_funded_by_hint(&vault, hint, required_amount)
+            .await?
+        {
             return Ok(FundingHintDisposition::Ignored {
                 reason: "vault balance is still below required funding amount".to_string(),
+            });
+        }
+
+        let observation = funding_observation_from_hint(&vault, hint)?;
+        if should_refund_observed_deposit {
+            let observed_vault = match self
+                .db
+                .vaults()
+                .record_refunding_observation(vault.id, &observation, Utc::now())
+                .await
+            {
+                Ok(observed_vault) => observed_vault,
+                Err(RouterServerError::NotFound) => {
+                    return Ok(FundingHintDisposition::Ignored {
+                        reason: "refunding vault observation was already recorded".to_string(),
+                    });
+                }
+                Err(source) => return Err(VaultError::database(source)),
+            };
+            return Ok(FundingHintDisposition::Observed {
+                vault: Box::new(observed_vault),
             });
         }
 
         let funded_vault = match self
             .db
             .vaults()
-            .transition_status(
-                vault.id,
-                DepositVaultStatus::PendingFunding,
-                DepositVaultStatus::Funded,
-                Utc::now(),
-            )
+            .mark_funded_with_observation(vault.id, &observation, Utc::now())
             .await
         {
             Ok(funded_vault) => funded_vault,
@@ -512,12 +561,13 @@ impl VaultManager {
         let mut summary = RefundPassSummary::default();
 
         let timeout_pass_started = Instant::now();
+        let timeout_claimed_until = now + REFUND_LEASE_DURATION;
         match self
             .db
             .vaults()
             .claim_due_for_timeout(
                 now,
-                now + REFUND_LEASE_DURATION,
+                timeout_claimed_until,
                 &self.worker_id,
                 REFUND_PASS_LIMIT,
             )
@@ -531,7 +581,10 @@ impl VaultManager {
                 );
                 summary.timeout_claimed = vaults.len();
                 for vault in vaults {
-                    match self.attempt_refund(vault.clone()).await {
+                    match self
+                        .attempt_refund(vault.clone(), timeout_claimed_until)
+                        .await
+                    {
                         Ok(refunded_vault) => {
                             if refunded_vault.status == DepositVaultStatus::Refunded {
                                 if let Some(order_id) = refunded_vault.order_id {
@@ -552,13 +605,14 @@ impl VaultManager {
         }
 
         let retry_pass_started_at = Utc::now();
+        let retry_claimed_until = retry_pass_started_at + REFUND_LEASE_DURATION;
         let retry_pass_started = Instant::now();
         match self
             .db
             .vaults()
             .claim_refunding(
                 retry_pass_started_at,
-                retry_pass_started_at + REFUND_LEASE_DURATION,
+                retry_claimed_until,
                 &self.worker_id,
                 REFUND_PASS_LIMIT,
             )
@@ -569,7 +623,7 @@ impl VaultManager {
                 summary.retry_claimed = vaults.len();
                 for vault in vaults {
                     let vault_id = vault.id;
-                    match self.attempt_refund(vault).await {
+                    match self.attempt_refund(vault, retry_claimed_until).await {
                         Ok(refunded_vault) => {
                             if refunded_vault.status == DepositVaultStatus::Refunded {
                                 if let Some(order_id) = refunded_vault.order_id {
@@ -592,7 +646,11 @@ impl VaultManager {
         summary
     }
 
-    async fn attempt_refund(&self, vault: DepositVault) -> VaultResult<DepositVault> {
+    async fn attempt_refund(
+        &self,
+        vault: DepositVault,
+        claimed_until: DateTime<Utc>,
+    ) -> VaultResult<DepositVault> {
         let refund_started = Instant::now();
         if vault.status == DepositVaultStatus::Refunded {
             return Ok(vault);
@@ -643,12 +701,30 @@ impl VaultManager {
         match refund_result {
             Ok(tx_hash) => {
                 info!(vault_id = %vault.id, %tx_hash, "Router-server vault refunded");
-                let refunded_vault = self
+                let refunded_vault = match self
                     .db
                     .vaults()
-                    .mark_refunded(vault.id, Utc::now(), &tx_hash)
+                    .mark_refunded(
+                        vault.id,
+                        Utc::now(),
+                        &tx_hash,
+                        &self.worker_id,
+                        claimed_until,
+                    )
                     .await
-                    .map_err(VaultError::database)?;
+                {
+                    Ok(vault) => vault,
+                    Err(RouterServerError::NotFound) => {
+                        warn!(
+                            vault_id = %vault.id,
+                            worker_id = %self.worker_id,
+                            claimed_until = %claimed_until,
+                            "Refund success lost its processing lease; leaving current refund owner to finish it"
+                        );
+                        return Ok(vault);
+                    }
+                    Err(source) => return Err(VaultError::database(source)),
+                };
                 telemetry::record_refund_success(&refunded_vault, refund_started.elapsed());
                 telemetry::record_vault_transition(
                     &refunded_vault,
@@ -663,16 +739,31 @@ impl VaultManager {
                 warn!(vault_id = %vault.id, error = %message, "Router-server refund attempt did not complete");
                 telemetry::record_refund_failure(&vault, "chain_error", refund_started.elapsed());
                 let failed_at = Utc::now();
-                self.db
+                match self
+                    .db
                     .vaults()
                     .mark_refund_error(
                         vault.id,
                         failed_at,
                         failed_at + REFUND_RETRY_DELAY,
                         &message,
+                        &self.worker_id,
+                        claimed_until,
                     )
                     .await
-                    .map_err(VaultError::database)
+                {
+                    Ok(vault) => Ok(vault),
+                    Err(RouterServerError::NotFound) => {
+                        warn!(
+                            vault_id = %vault.id,
+                            worker_id = %self.worker_id,
+                            claimed_until = %claimed_until,
+                            "Refund failure lost its processing lease; leaving current refund owner to finish it"
+                        );
+                        Ok(vault)
+                    }
+                    Err(source) => Err(VaultError::database(source)),
+                }
             }
         }
     }
@@ -711,7 +802,7 @@ impl VaultManager {
             .get_mempool_fee_estimate_next_block()
             .await
             .map_err(|err| format!("Failed to query bitcoin fee estimate: {err}"))?;
-        let fee = (next_block_fee_rate * 125.0).ceil() as u64;
+        let fee = bitcoin_refund_fee_sats(next_block_fee_rate)?;
 
         let tx_data = chain
             .dump_to_address(
@@ -781,28 +872,27 @@ impl VaultManager {
             .map_err(|err| err.to_string())
     }
 
-    async fn is_vault_funded(&self, vault: &DepositVault) -> VaultResult<bool> {
-        let required_amount = self.required_funding_amount(vault).await?;
+    async fn vault_visible_balance(&self, vault: &DepositVault) -> VaultResult<U256> {
         let backend_chain = backend_chain_for_id(&vault.deposit_asset.chain).ok_or(
             VaultError::ChainNotSupported {
                 chain: vault.deposit_asset.chain.clone(),
             },
         )?;
-        let funded = match backend_chain {
+        match backend_chain {
             ChainType::Bitcoin => {
                 let bitcoin_chain = self.chain_registry.get_bitcoin(&backend_chain).ok_or(
                     VaultError::ChainNotSupported {
                         chain: vault.deposit_asset.chain.clone(),
                     },
                 )?;
-                U256::from(
+                Ok(U256::from(
                     bitcoin_chain
                         .address_balance_sats(&vault.deposit_vault_address)
                         .await
                         .map_err(|source| VaultError::FundingCheck {
                             message: format!("failed to query bitcoin funding balance: {source}"),
                         })?,
-                ) >= required_amount
+                ))
             }
             ChainType::Ethereum | ChainType::Arbitrum | ChainType::Base => {
                 let evm_chain = self.chain_registry.get_evm(&backend_chain).ok_or(
@@ -826,15 +916,121 @@ impl VaultManager {
                             message: format!("failed to query EVM token funding balance: {source}"),
                         })?,
                 };
-                balance >= required_amount
+                Ok(balance)
             }
-            ChainType::Hyperliquid => {
-                return Err(VaultError::ChainNotSupported {
-                    chain: vault.deposit_asset.chain.clone(),
-                });
+            ChainType::Hyperliquid => Err(VaultError::ChainNotSupported {
+                chain: vault.deposit_asset.chain.clone(),
+            }),
+        }
+    }
+
+    async fn ensure_full_amount_hint_is_observable(
+        &self,
+        vault: &DepositVault,
+        hint: &DepositVaultFundingHint,
+    ) -> VaultResult<()> {
+        if vault.status != DepositVaultStatus::PendingFunding {
+            return Ok(());
+        }
+        let required_amount = self.required_funding_amount(vault).await?;
+        if funding_hint_observed_amount(hint)?
+            .is_none_or(|observed_amount| observed_amount < required_amount)
+        {
+            return Ok(());
+        }
+        if self
+            .is_vault_funded_by_hint(vault, hint, required_amount)
+            .await?
+        {
+            return Ok(());
+        }
+        Err(VaultError::FundingHintNotReady {
+            reason: "full-amount funding hint is not visible to router chain backend yet"
+                .to_string(),
+        })
+    }
+
+    async fn is_vault_funded_by_hint(
+        &self,
+        vault: &DepositVault,
+        hint: &DepositVaultFundingHint,
+        required_amount: U256,
+    ) -> VaultResult<bool> {
+        let backend_chain = backend_chain_for_id(&vault.deposit_asset.chain).ok_or(
+            VaultError::ChainNotSupported {
+                chain: vault.deposit_asset.chain.clone(),
+            },
+        )?;
+        if backend_chain == ChainType::Bitcoin
+            && funding_hint_confirmation_state(hint).as_deref() == Some("mempool")
+        {
+            return self
+                .is_bitcoin_mempool_hint_spendable(vault, hint, required_amount)
+                .await;
+        }
+        let visible_balance = self.vault_visible_balance(vault).await?;
+        if let Some(observed_amount) = funding_hint_observed_amount(hint)? {
+            if visible_balance < observed_amount {
+                return Ok(false);
             }
+        }
+        Ok(visible_balance >= required_amount)
+    }
+
+    async fn is_bitcoin_mempool_hint_spendable(
+        &self,
+        vault: &DepositVault,
+        hint: &DepositVaultFundingHint,
+        required_amount: U256,
+    ) -> VaultResult<bool> {
+        let observed_amount = match funding_hint_observed_amount(hint)? {
+            Some(amount) if amount >= required_amount => amount,
+            _ => return Ok(false),
         };
-        Ok(funded)
+        if observed_amount > U256::from(u64::MAX) {
+            return Err(VaultError::FundingCheck {
+                message: "bitcoin funding hint amount exceeds satoshi range".to_string(),
+            });
+        }
+        let tx_hash = funding_hint_tx_hash(hint).ok_or_else(|| VaultError::FundingCheck {
+            message: "bitcoin mempool funding hint missing tx_hash".to_string(),
+        })?;
+        let vout = funding_hint_vout(hint)?.ok_or_else(|| VaultError::FundingCheck {
+            message: "bitcoin mempool funding hint missing vout".to_string(),
+        })?;
+
+        let backend_chain = backend_chain_for_id(&vault.deposit_asset.chain).ok_or(
+            VaultError::ChainNotSupported {
+                chain: vault.deposit_asset.chain.clone(),
+            },
+        )?;
+        let chain =
+            self.chain_registry
+                .get(&backend_chain)
+                .ok_or(VaultError::ChainNotSupported {
+                    chain: vault.deposit_asset.chain.clone(),
+                })?;
+        let deposit_wallet = chain
+            .derive_wallet(&self.settings.master_key_bytes(), &vault.deposit_vault_salt)
+            .map_err(VaultError::wallet_derivation)?;
+        let bitcoin_chain = self.chain_registry.get_bitcoin(&backend_chain).ok_or(
+            VaultError::ChainNotSupported {
+                chain: vault.deposit_asset.chain.clone(),
+            },
+        )?;
+
+        bitcoin_chain
+            .can_spend_outpoint_now(
+                deposit_wallet.private_key(),
+                &vault.recovery_address,
+                &tx_hash,
+                vout,
+                observed_amount.to::<u64>(),
+            )
+            .await
+            .map_err(|source| VaultError::FundingCheck {
+                message: format!("failed to test bitcoin mempool spendability: {source}"),
+            })
     }
 
     async fn required_funding_amount(&self, vault: &DepositVault) -> VaultResult<U256> {
@@ -1036,6 +1232,9 @@ impl VaultManager {
             DepositVaultStatus::Refunded => Err(VaultError::RefundNotAllowed {
                 reason: "refunded vaults cannot be cancelled".to_string(),
             }),
+            DepositVaultStatus::ManualInterventionRequired => Err(VaultError::RefundNotAllowed {
+                reason: "manual-intervention vaults cannot be cancelled".to_string(),
+            }),
             DepositVaultStatus::RefundManualInterventionRequired => {
                 Err(VaultError::RefundNotAllowed {
                     reason: "manual-refund vaults cannot be cancelled".to_string(),
@@ -1043,6 +1242,111 @@ impl VaultManager {
             }
         }
     }
+}
+
+fn funding_observation_from_hint(
+    vault: &DepositVault,
+    hint: &DepositVaultFundingHint,
+) -> VaultResult<DepositVaultFundingObservation> {
+    let evidence = hint.evidence.clone();
+    let sender_addresses = funding_sender_addresses(&evidence)?;
+    let sender_address = optional_string_field(&evidence, "sender_address")?
+        .or_else(|| sender_addresses.first().cloned());
+    let observed_amount = optional_decimal_u256_field(&evidence, "amount")?;
+    Ok(DepositVaultFundingObservation {
+        tx_hash: optional_string_field(&evidence, "tx_hash")?,
+        sender_address,
+        sender_addresses,
+        recipient_address: optional_string_field(&evidence, "recipient_address")?
+            .or(optional_string_field(&evidence, "address")?)
+            .or_else(|| Some(vault.deposit_vault_address.clone())),
+        transfer_index: optional_u64_field(&evidence, "transfer_index")?
+            .or(optional_u64_field(&evidence, "vout")?),
+        observed_amount: observed_amount.map(|amount| amount.to_string()),
+        confirmation_state: optional_string_field(&evidence, "confirmation_state")?,
+        observed_at: observed_at_from_hint(&evidence)?,
+        evidence,
+    })
+}
+
+fn funding_sender_addresses(evidence: &Value) -> VaultResult<Vec<String>> {
+    let mut addresses = Vec::new();
+    if let Some(value) = evidence.get("sender_addresses") {
+        let values = value
+            .as_array()
+            .ok_or_else(|| VaultError::InvalidFundingHint {
+                reason: "sender_addresses must be an array".to_string(),
+            })?;
+        for (index, value) in values.iter().enumerate() {
+            let address = value
+                .as_str()
+                .ok_or_else(|| VaultError::InvalidFundingHint {
+                    reason: format!("sender_addresses[{index}] must be a string"),
+                })?
+                .trim();
+            if address.is_empty() {
+                return Err(VaultError::InvalidFundingHint {
+                    reason: format!("sender_addresses[{index}] must be non-empty"),
+                });
+            }
+            addresses.push(address.to_owned());
+        }
+    }
+    if addresses.is_empty() {
+        if let Some(sender) = optional_string_field(evidence, "sender_address")? {
+            addresses.push(sender);
+        }
+    }
+    let mut seen = HashSet::new();
+    Ok(addresses
+        .into_iter()
+        .filter(|address| seen.insert(address.clone()))
+        .collect())
+}
+
+fn optional_string_field(value: &Value, key: &'static str) -> VaultResult<Option<String>> {
+    let Some(value) = value.get(key) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let string = value
+        .as_str()
+        .ok_or_else(|| VaultError::InvalidFundingHint {
+            reason: format!("{key} must be a string"),
+        })?;
+    let string = string.trim();
+    if string.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(string.to_owned()))
+}
+
+fn optional_u64_field(value: &Value, key: &'static str) -> VaultResult<Option<u64>> {
+    let Some(value) = value.get(key) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_u64()
+        .map(Some)
+        .ok_or_else(|| VaultError::InvalidFundingHint {
+            reason: format!("{key} must be an unsigned integer"),
+        })
+}
+
+fn observed_at_from_hint(evidence: &Value) -> VaultResult<Option<DateTime<Utc>>> {
+    let Some(value) = optional_string_field(evidence, "observed_at")? else {
+        return Ok(None);
+    };
+    DateTime::parse_from_rfc3339(&value)
+        .map(|value| Some(value.with_timezone(&Utc)))
+        .map_err(|err| VaultError::InvalidFundingHint {
+            reason: format!("observed_at must be RFC3339: {err}"),
+        })
 }
 
 fn token_identifier(asset_id: &AssetId) -> TokenIdentifier {
@@ -1076,6 +1380,88 @@ fn parse_positive_u256(field: &'static str, value: &str) -> VaultResult<U256> {
     Ok(amount)
 }
 
+fn funding_hint_observed_amount(hint: &DepositVaultFundingHint) -> VaultResult<Option<U256>> {
+    optional_decimal_u256_field(&hint.evidence, "amount")
+}
+
+fn optional_decimal_u256_field(value: &Value, key: &'static str) -> VaultResult<Option<U256>> {
+    let Some(raw) = value.get(key) else {
+        return Ok(None);
+    };
+    if raw.is_null() {
+        return Ok(None);
+    }
+    let Some(raw) = raw.as_str() else {
+        return Err(VaultError::InvalidFundingHint {
+            reason: format!("{key} must be a decimal string"),
+        });
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    U256::from_str_radix(raw, 10)
+        .map(Some)
+        .map_err(|err| VaultError::InvalidFundingHint {
+            reason: format!("{key} must be a valid decimal U256: {err}"),
+        })
+}
+
+fn funding_hint_confirmation_state(hint: &DepositVaultFundingHint) -> Option<String> {
+    hint.evidence
+        .get("confirmation_state")
+        .and_then(|value| value.as_str())
+        .map(str::to_ascii_lowercase)
+}
+
+fn funding_hint_tx_hash(hint: &DepositVaultFundingHint) -> Option<String> {
+    hint.evidence
+        .get("tx_hash")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
+fn funding_hint_vout(hint: &DepositVaultFundingHint) -> VaultResult<Option<u32>> {
+    let Some((key, value)) = hint
+        .evidence
+        .get("vout")
+        .map(|value| ("vout", value))
+        .or_else(|| {
+            hint.evidence
+                .get("transfer_index")
+                .map(|value| ("transfer_index", value))
+        })
+    else {
+        return Ok(None);
+    };
+    let value = value
+        .as_u64()
+        .ok_or_else(|| VaultError::InvalidFundingHint {
+            reason: format!("{key} must be a non-negative integer"),
+        })?;
+    u32::try_from(value)
+        .map(Some)
+        .map_err(|_err| VaultError::InvalidFundingHint {
+            reason: format!("{key} exceeds bitcoin vout u32 range"),
+        })
+}
+
+fn bitcoin_refund_fee_sats(next_block_fee_rate_sat_per_vb: f64) -> Result<u64, String> {
+    if !next_block_fee_rate_sat_per_vb.is_finite() || next_block_fee_rate_sat_per_vb <= 0.0 {
+        return Err(format!(
+            "bitcoin refund fee rate must be finite and positive: {next_block_fee_rate_sat_per_vb}"
+        ));
+    }
+
+    let fee = (next_block_fee_rate_sat_per_vb * BITCOIN_REFUND_FEE_VBYTES).ceil();
+    if !fee.is_finite() || fee >= u64::MAX as f64 {
+        return Err(format!(
+            "bitcoin refund fee exceeds u64 satoshi range: {fee}"
+        ));
+    }
+    Ok(fee as u64)
+}
+
 pub(crate) fn compute_cancellation_commitment(secret_bytes: &[u8; 32]) -> [u8; 32] {
     keccak256([CANCELLATION_COMMITMENT_DOMAIN, secret_bytes].concat()).into()
 }
@@ -1085,6 +1471,14 @@ pub(crate) fn compute_cancellation_commitment_hex(secret_bytes: &[u8; 32]) -> St
         "0x{}",
         alloy::hex::encode(compute_cancellation_commitment(secret_bytes))
     )
+}
+
+fn derive_order_cancellation_secret(master_key: &[u8; 64], quote_id: Uuid) -> [u8; 32] {
+    let hkdf = Hkdf::<Sha256>::new(Some(ORDER_CANCELLATION_SECRET_DOMAIN), master_key);
+    let mut secret = [0_u8; 32];
+    hkdf.expand(quote_id.as_bytes(), &mut secret)
+        .expect("router order cancellation secret length is valid for HKDF-SHA256");
+    secret
 }
 
 fn normalize_hex_32(value: &str) -> Result<String, String> {
@@ -1106,6 +1500,21 @@ mod tests {
 
     fn test_secret() -> [u8; 32] {
         [0xab; 32]
+    }
+
+    #[test]
+    fn order_cancellation_material_debug_redacts_secret() {
+        let material = OrderCancellationMaterial {
+            commitment: "0xcommitment".to_string(),
+            secret: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_string(),
+        };
+
+        let rendered = format!("{material:?}");
+        assert!(rendered.contains("0xcommitment"));
+        assert!(rendered.contains("secret"));
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains("aaaaaaaaaaaaaaaa"));
     }
 
     #[test]
@@ -1169,6 +1578,46 @@ mod tests {
     }
 
     #[test]
+    fn order_cancellation_secret_is_recoverable_by_quote_and_master_key() {
+        let master_key = [0x42_u8; 64];
+        let quote_id = Uuid::parse_str("019557a1-0000-7000-8000-000000000001").unwrap();
+        let secret = derive_order_cancellation_secret(&master_key, quote_id);
+
+        assert_eq!(
+            secret,
+            derive_order_cancellation_secret(&master_key, quote_id)
+        );
+        assert_ne!(
+            secret,
+            derive_order_cancellation_secret(
+                &master_key,
+                Uuid::parse_str("019557a1-0000-7000-8000-000000000002").unwrap()
+            )
+        );
+        assert_ne!(
+            secret,
+            derive_order_cancellation_secret(&[0x43_u8; 64], quote_id)
+        );
+    }
+
+    #[test]
+    fn order_cancellation_material_matches_commitment() {
+        let master_key = [0x42_u8; 64];
+        let quote_id = Uuid::parse_str("019557a1-0000-7000-8000-000000000001").unwrap();
+        let secret = derive_order_cancellation_secret(&master_key, quote_id);
+        let material = OrderCancellationMaterial {
+            commitment: compute_cancellation_commitment_hex(&secret),
+            secret: format!("0x{}", alloy::hex::encode(secret)),
+        };
+
+        assert_eq!(material.secret.len(), 66);
+        assert_eq!(
+            material.commitment,
+            compute_cancellation_commitment_hex(&secret)
+        );
+    }
+
+    #[test]
     fn validate_metadata_accepts_object() {
         assert!(VaultManager::validate_metadata(&serde_json::json!({})).is_ok());
         assert!(VaultManager::validate_metadata(&serde_json::json!({"key": "value"})).is_ok());
@@ -1181,5 +1630,323 @@ mod tests {
         assert!(VaultManager::validate_metadata(&serde_json::json!(42)).is_err());
         assert!(VaultManager::validate_metadata(&serde_json::json!(null)).is_err());
         assert!(VaultManager::validate_metadata(&serde_json::json!(true)).is_err());
+    }
+
+    #[test]
+    fn funding_hint_vout_accepts_vout_or_transfer_index() {
+        let mut hint = DepositVaultFundingHint {
+            id: Uuid::now_v7(),
+            vault_id: Uuid::now_v7(),
+            source: "sauron".to_string(),
+            hint_kind: crate::models::ProviderOperationHintKind::PossibleProgress,
+            evidence: serde_json::json!({ "vout": 7 }),
+            status: ProviderOperationHintStatus::Pending,
+            idempotency_key: None,
+            error: serde_json::json!({}),
+            claimed_at: None,
+            processed_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        assert_eq!(funding_hint_vout(&hint).unwrap(), Some(7));
+
+        hint.evidence = serde_json::json!({ "transfer_index": 8 });
+        assert_eq!(funding_hint_vout(&hint).unwrap(), Some(8));
+    }
+
+    #[test]
+    fn funding_hint_vout_rejects_malformed_or_overflowing_values() {
+        let mut hint = DepositVaultFundingHint {
+            id: Uuid::now_v7(),
+            vault_id: Uuid::now_v7(),
+            source: "sauron".to_string(),
+            hint_kind: crate::models::ProviderOperationHintKind::PossibleProgress,
+            evidence: serde_json::json!({ "vout": "7" }),
+            status: ProviderOperationHintStatus::Pending,
+            idempotency_key: None,
+            error: serde_json::json!({}),
+            claimed_at: None,
+            processed_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        assert!(matches!(
+            funding_hint_vout(&hint),
+            Err(VaultError::InvalidFundingHint { .. })
+        ));
+
+        hint.evidence = serde_json::json!({ "transfer_index": u64::from(u32::MAX) + 1 });
+        assert!(matches!(
+            funding_hint_vout(&hint),
+            Err(VaultError::InvalidFundingHint { .. })
+        ));
+    }
+
+    #[test]
+    fn funding_hint_confirmation_state_is_normalized() {
+        let hint = DepositVaultFundingHint {
+            id: Uuid::now_v7(),
+            vault_id: Uuid::now_v7(),
+            source: "sauron".to_string(),
+            hint_kind: crate::models::ProviderOperationHintKind::PossibleProgress,
+            evidence: serde_json::json!({ "confirmation_state": "Mempool" }),
+            status: ProviderOperationHintStatus::Pending,
+            idempotency_key: None,
+            error: serde_json::json!({}),
+            claimed_at: None,
+            processed_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        assert_eq!(
+            funding_hint_confirmation_state(&hint).as_deref(),
+            Some("mempool")
+        );
+    }
+
+    #[test]
+    fn bitcoin_refund_fee_sats_rejects_invalid_fee_rates() {
+        assert_eq!(bitcoin_refund_fee_sats(1.01).unwrap(), 127);
+        assert_eq!(bitcoin_refund_fee_sats(0.001).unwrap(), 1);
+
+        assert!(bitcoin_refund_fee_sats(0.0).is_err());
+        assert!(bitcoin_refund_fee_sats(-1.0).is_err());
+        assert!(bitcoin_refund_fee_sats(f64::NAN).is_err());
+        assert!(bitcoin_refund_fee_sats(f64::INFINITY).is_err());
+        assert!(
+            bitcoin_refund_fee_sats((u64::MAX as f64 / BITCOIN_REFUND_FEE_VBYTES) + 1.0).is_err()
+        );
+    }
+
+    #[test]
+    fn funding_observation_from_hint_preserves_all_sender_addresses() {
+        let now = Utc::now();
+        let vault = DepositVault {
+            id: Uuid::now_v7(),
+            order_id: Some(Uuid::now_v7()),
+            deposit_asset: DepositAsset {
+                chain: ChainId::parse("bitcoin").unwrap(),
+                asset: AssetId::parse("native").unwrap(),
+            },
+            action: VaultAction::Null,
+            metadata: serde_json::json!({}),
+            deposit_vault_salt: [7; 32],
+            deposit_vault_address: "bcrt1qrecipient".to_string(),
+            recovery_address: "bcrt1qrecovery".to_string(),
+            cancellation_commitment:
+                "0x1111111111111111111111111111111111111111111111111111111111111111".to_string(),
+            cancel_after: now + Duration::minutes(10),
+            status: DepositVaultStatus::PendingFunding,
+            refund_requested_at: None,
+            refunded_at: None,
+            refund_tx_hash: None,
+            last_refund_error: None,
+            funding_observation: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let hint = DepositVaultFundingHint {
+            id: Uuid::now_v7(),
+            vault_id: vault.id,
+            source: "sauron".to_string(),
+            hint_kind: crate::models::ProviderOperationHintKind::PossibleProgress,
+            evidence: serde_json::json!({
+                "tx_hash": "abc123",
+                "sender_address": "sender-a",
+                "sender_addresses": ["sender-a", "sender-b"],
+                "recipient_address": "bcrt1qrecipient",
+                "vout": 2,
+                "amount": "42",
+                "confirmation_state": "mempool",
+                "observed_at": now.to_rfc3339(),
+            }),
+            status: ProviderOperationHintStatus::Pending,
+            idempotency_key: None,
+            error: serde_json::json!({}),
+            claimed_at: None,
+            processed_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let observation = funding_observation_from_hint(&vault, &hint).unwrap();
+
+        assert_eq!(observation.tx_hash.as_deref(), Some("abc123"));
+        assert_eq!(observation.sender_address.as_deref(), Some("sender-a"));
+        assert_eq!(observation.sender_addresses, vec!["sender-a", "sender-b"]);
+        assert_eq!(
+            observation.recipient_address.as_deref(),
+            Some("bcrt1qrecipient")
+        );
+        assert_eq!(observation.transfer_index, Some(2));
+        assert_eq!(observation.observed_amount.as_deref(), Some("42"));
+        assert_eq!(observation.confirmation_state.as_deref(), Some("mempool"));
+    }
+
+    #[test]
+    fn funding_observation_from_hint_rejects_malformed_sender_addresses() {
+        let now = Utc::now();
+        let vault = DepositVault {
+            id: Uuid::now_v7(),
+            order_id: Some(Uuid::now_v7()),
+            deposit_asset: DepositAsset {
+                chain: ChainId::parse("bitcoin").unwrap(),
+                asset: AssetId::parse("native").unwrap(),
+            },
+            action: VaultAction::Null,
+            metadata: serde_json::json!({}),
+            deposit_vault_salt: [7; 32],
+            deposit_vault_address: "bcrt1qrecipient".to_string(),
+            recovery_address: "bcrt1qrecovery".to_string(),
+            cancellation_commitment:
+                "0x1111111111111111111111111111111111111111111111111111111111111111".to_string(),
+            cancel_after: now + Duration::minutes(10),
+            status: DepositVaultStatus::PendingFunding,
+            refund_requested_at: None,
+            refunded_at: None,
+            refund_tx_hash: None,
+            last_refund_error: None,
+            funding_observation: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let mut hint = DepositVaultFundingHint {
+            id: Uuid::now_v7(),
+            vault_id: vault.id,
+            source: "sauron".to_string(),
+            hint_kind: crate::models::ProviderOperationHintKind::PossibleProgress,
+            evidence: serde_json::json!({
+                "sender_addresses": ["sender-a", 7],
+            }),
+            status: ProviderOperationHintStatus::Pending,
+            idempotency_key: None,
+            error: serde_json::json!({}),
+            claimed_at: None,
+            processed_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        assert!(matches!(
+            funding_observation_from_hint(&vault, &hint),
+            Err(VaultError::InvalidFundingHint { reason })
+                if reason.contains("sender_addresses[1] must be a string")
+        ));
+
+        hint.evidence = serde_json::json!({ "tx_hash": 7 });
+        assert!(matches!(
+            funding_observation_from_hint(&vault, &hint),
+            Err(VaultError::InvalidFundingHint { reason })
+                if reason.contains("tx_hash must be a string")
+        ));
+
+        hint.evidence = serde_json::json!({ "vout": "2" });
+        assert!(matches!(
+            funding_observation_from_hint(&vault, &hint),
+            Err(VaultError::InvalidFundingHint { reason })
+                if reason.contains("vout must be an unsigned integer")
+        ));
+
+        hint.evidence = serde_json::json!({ "observed_at": 7 });
+        assert!(matches!(
+            funding_observation_from_hint(&vault, &hint),
+            Err(VaultError::InvalidFundingHint { reason })
+                if reason.contains("observed_at must be a string")
+        ));
+    }
+
+    #[test]
+    fn funding_observation_from_hint_rejects_invalid_observed_at() {
+        let now = Utc::now();
+        let vault = DepositVault {
+            id: Uuid::now_v7(),
+            order_id: Some(Uuid::now_v7()),
+            deposit_asset: DepositAsset {
+                chain: ChainId::parse("bitcoin").unwrap(),
+                asset: AssetId::parse("native").unwrap(),
+            },
+            action: VaultAction::Null,
+            metadata: serde_json::json!({}),
+            deposit_vault_salt: [7; 32],
+            deposit_vault_address: "bcrt1qrecipient".to_string(),
+            recovery_address: "bcrt1qrecovery".to_string(),
+            cancellation_commitment:
+                "0x1111111111111111111111111111111111111111111111111111111111111111".to_string(),
+            cancel_after: now + Duration::minutes(10),
+            status: DepositVaultStatus::PendingFunding,
+            refund_requested_at: None,
+            refunded_at: None,
+            refund_tx_hash: None,
+            last_refund_error: None,
+            funding_observation: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let hint = DepositVaultFundingHint {
+            id: Uuid::now_v7(),
+            vault_id: vault.id,
+            source: "sauron".to_string(),
+            hint_kind: crate::models::ProviderOperationHintKind::PossibleProgress,
+            evidence: serde_json::json!({
+                "observed_at": "definitely not a timestamp",
+            }),
+            status: ProviderOperationHintStatus::Pending,
+            idempotency_key: None,
+            error: serde_json::json!({}),
+            claimed_at: None,
+            processed_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        assert!(funding_observation_from_hint(&vault, &hint).is_err());
+    }
+
+    #[test]
+    fn funding_observation_from_hint_rejects_invalid_amount() {
+        let now = Utc::now();
+        let vault = DepositVault {
+            id: Uuid::now_v7(),
+            order_id: Some(Uuid::now_v7()),
+            deposit_asset: DepositAsset {
+                chain: ChainId::parse("bitcoin").unwrap(),
+                asset: AssetId::parse("native").unwrap(),
+            },
+            action: VaultAction::Null,
+            metadata: serde_json::json!({}),
+            deposit_vault_salt: [7; 32],
+            deposit_vault_address: "bcrt1qrecipient".to_string(),
+            recovery_address: "bcrt1qrecovery".to_string(),
+            cancellation_commitment:
+                "0x1111111111111111111111111111111111111111111111111111111111111111".to_string(),
+            cancel_after: now + Duration::minutes(10),
+            status: DepositVaultStatus::PendingFunding,
+            refund_requested_at: None,
+            refunded_at: None,
+            refund_tx_hash: None,
+            last_refund_error: None,
+            funding_observation: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let hint = DepositVaultFundingHint {
+            id: Uuid::now_v7(),
+            vault_id: vault.id,
+            source: "sauron".to_string(),
+            hint_kind: crate::models::ProviderOperationHintKind::PossibleProgress,
+            evidence: serde_json::json!({
+                "amount": "not-a-number",
+            }),
+            status: ProviderOperationHintStatus::Pending,
+            idempotency_key: None,
+            error: serde_json::json!({}),
+            claimed_at: None,
+            processed_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        assert!(funding_hint_observed_amount(&hint).is_err());
+        assert!(funding_observation_from_hint(&vault, &hint).is_err());
     }
 }

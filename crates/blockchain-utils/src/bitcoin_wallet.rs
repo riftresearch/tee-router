@@ -9,7 +9,7 @@ use bitcoin::{
 };
 use bitcoin_coin_selection::WeightedUtxo;
 use snafu::prelude::*;
-use std::str::FromStr;
+use std::{fmt, str::FromStr};
 
 // Constants for transaction weight calculations
 const _CHANGE_SPEND_W: Weight = Weight::from_wu(108); // Typical P2WPKH input weight
@@ -41,12 +41,23 @@ impl InputUtxo {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct P2WPKHBitcoinWallet {
     pub secret_key: SecretKey,
     pub private_key: PrivateKey,
     pub public_key: String,
     pub address: Address<NetworkChecked>,
+}
+
+impl fmt::Debug for P2WPKHBitcoinWallet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("P2WPKHBitcoinWallet")
+            .field("secret_key", &"<redacted>")
+            .field("private_key", &"<redacted>")
+            .field("public_key", &self.public_key)
+            .field("address", &self.address)
+            .finish()
+    }
 }
 
 // Define a proper error type for the wallet
@@ -84,18 +95,21 @@ impl P2WPKHBitcoinWallet {
         }
     }
 
-    #[must_use]
-    pub fn from_secret_bytes(secret_key: &[u8; 32], network: Network) -> Self {
-        let secret_key = SecretKey::from_slice(secret_key).unwrap();
+    pub fn from_secret_bytes(
+        secret_key: &[u8; 32],
+        network: Network,
+    ) -> Result<Self, BitcoinWalletError> {
+        let secret_key = SecretKey::from_slice(secret_key)
+            .map_err(|_| BitcoinWalletError::KeyDerivationFailed)?;
         let secp = Secp256k1::new();
         let pk = PrivateKey::new(secret_key, network);
         let public_key = PublicKey::from_private_key(&secp, &pk);
-        let _unlock_script = public_key.p2wpkh_script_code().unwrap().to_bytes();
         let address = Address::p2wpkh(
-            &CompressedPublicKey::from_private_key(&secp, &pk).unwrap(),
+            &CompressedPublicKey::from_private_key(&secp, &pk)
+                .map_err(|_| BitcoinWalletError::InvalidPublicKey)?,
             network,
         );
-        Self::new(secret_key, pk, public_key.to_string(), address)
+        Ok(Self::new(secret_key, pk, public_key.to_string(), address))
     }
 
     /// Creates a wallet from a BIP39 mnemonic phrase.
@@ -140,7 +154,8 @@ impl P2WPKHBitcoinWallet {
         let secp = Secp256k1::new();
         let public_key = PublicKey::from_private_key(&secp, &private_key);
         let address = Address::p2wpkh(
-            &CompressedPublicKey::from_private_key(&secp, &private_key).unwrap(),
+            &CompressedPublicKey::from_private_key(&secp, &private_key)
+                .map_err(|_| BitcoinWalletError::InvalidPublicKey)?,
             network,
         );
 
@@ -152,14 +167,13 @@ impl P2WPKHBitcoinWallet {
         ))
     }
 
-    #[must_use]
-    pub fn get_p2wpkh_script(&self) -> ScriptBuf {
-        let public_key = PublicKey::from_str(&self.public_key).expect("Invalid public key");
-        ScriptBuf::new_p2wpkh(
-            &public_key
-                .wpubkey_hash()
-                .expect("Invalid public key for P2WPKH"),
-        )
+    pub fn get_p2wpkh_script(&self) -> Result<ScriptBuf, BitcoinWalletError> {
+        let public_key = PublicKey::from_str(&self.public_key)
+            .map_err(|_| BitcoinWalletError::InvalidPublicKey)?;
+        let pubkey_hash = public_key
+            .wpubkey_hash()
+            .map_err(|_| BitcoinWalletError::InvalidPublicKey)?;
+        Ok(ScriptBuf::new_p2wpkh(&pubkey_hash))
     }
 
     pub fn descriptor(&self) -> String {
@@ -227,6 +241,23 @@ impl MempoolEsploraFeeExt for esplora_client::AsyncClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bitcoin_wallet_debug_redacts_private_key_material() {
+        let wallet =
+            P2WPKHBitcoinWallet::from_secret_bytes(&[0x42; 32], Network::Regtest).expect("wallet");
+        let private_key = wallet.private_key.to_string();
+        let secret_key = wallet.secret_key.display_secret().to_string();
+        let rendered = format!("{wallet:?}");
+
+        assert!(rendered.contains("secret_key"));
+        assert!(rendered.contains("private_key"));
+        assert!(rendered.contains("<redacted>"));
+        assert!(rendered.contains(&wallet.public_key));
+        assert!(rendered.contains(&wallet.address.to_string()));
+        assert!(!rendered.contains(&private_key));
+        assert!(!rendered.contains(&secret_key));
+    }
 
     #[test]
     fn test_fee_estimate_real_data_histogram() {

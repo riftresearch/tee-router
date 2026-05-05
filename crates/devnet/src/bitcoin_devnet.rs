@@ -16,7 +16,13 @@ use corepc_node::Node as BitcoinRegtest;
 use electrsd::ElectrsD;
 use esplora_client::AsyncClient as EsploraClient;
 
+use crate::manifest::{
+    DEVNET_BITCOIN_RPC_PORT, DEVNET_BITCOIN_ZMQ_RAWTX_PORT, DEVNET_BITCOIN_ZMQ_SEQUENCE_PORT,
+    DEVNET_ESPLORA_PORT,
+};
 use crate::{get_new_temp_dir, Result, RiftDevnetCache};
+
+const REGTEST_BLOCK_REWARD_SATS: u64 = 50 * 100_000_000;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub enum MiningMode {
@@ -31,7 +37,7 @@ pub struct BitcoinDevnet {
     pub miner_address: BitcoinAddress,
     pub cookie: PathBuf,
     pub datadir: PathBuf,
-    pub rpc_url_with_cookie: String,
+    pub rpc_url: String,
     pub zmq_rawtx_endpoint: String,
     pub zmq_sequence_endpoint: String,
     pub electrsd: Option<Arc<ElectrsD>>,
@@ -60,7 +66,7 @@ impl BitcoinDevnet {
         mining_mode: MiningMode,
         join_set: &mut JoinSet<Result<()>>,
         devnet_cache: Option<Arc<RiftDevnetCache>>,
-    ) -> Result<(Self, u32)> {
+    ) -> Result<(Self, u64)> {
         info!("Instantiating Bitcoin Regtest...");
         let wallet_name = "alice";
         let t = Instant::now();
@@ -69,10 +75,23 @@ impl BitcoinDevnet {
         conf.wallet = None;
         conf.view_stdout = false;
 
-        let zmq_rawtx_port = reserve_local_port()?;
-        let zmq_sequence_port = reserve_local_port()?;
-        let zmq_rawtx_endpoint = format!("tcp://127.0.0.1:{zmq_rawtx_port}");
-        let zmq_sequence_endpoint = format!("tcp://127.0.0.1:{zmq_sequence_port}");
+        let zmq_rawtx_port = if fixed_esplora_url {
+            DEVNET_BITCOIN_ZMQ_RAWTX_PORT
+        } else {
+            reserve_local_port()?
+        };
+        let zmq_sequence_port = if fixed_esplora_url {
+            DEVNET_BITCOIN_ZMQ_SEQUENCE_PORT
+        } else {
+            reserve_local_port()?
+        };
+        let zmq_host = if fixed_esplora_url {
+            "0.0.0.0"
+        } else {
+            "127.0.0.1"
+        };
+        let zmq_rawtx_endpoint = format!("tcp://{zmq_host}:{zmq_rawtx_port}");
+        let zmq_sequence_endpoint = format!("tcp://{zmq_host}:{zmq_sequence_port}");
         conf.args.push(Box::leak(
             format!("-zmqpubrawtx={zmq_rawtx_endpoint}").into_boxed_str(),
         ));
@@ -81,8 +100,11 @@ impl BitcoinDevnet {
         ));
 
         if fixed_esplora_url {
-            conf.bind = Some(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 50100_u16));
-            conf.args.push("-rpcauth=bitcoind:cccd5d7fd36e55c1b8576b8077dc1b83$60b5676a09f8518dcb4574838fb86f37700cd690d99bd2fdc2ea2bf2ab80ead6");
+            conf.bind = Some(SocketAddrV4::new(
+                Ipv4Addr::new(0, 0, 0, 0),
+                DEVNET_BITCOIN_RPC_PORT,
+            ));
+            conf.args.push("-rpcauth=devnet:0000000000000000$1c2adc9a0ce5b43c95b2a95a9bd228157af4a1770d99ecf835b95c50fcda27e4");
             conf.args.push("-rpcbind=0.0.0.0");
             conf.args.push("-rpcallowip=0.0.0.0/0");
             // bump so we can concurrently spend many utxos
@@ -101,8 +123,10 @@ impl BitcoinDevnet {
         conf.staticdir = Some(bitcoin_datadir.path().to_path_buf());
         conf.tmpdir = None;
 
+        let bitcoind_exe = corepc_node::exe_path()
+            .map_err(|e| eyre::eyre!("Failed to get bitcoind executable path: {}", e))?;
         let bitcoin_regtest = Arc::new(
-            tokio::task::spawn_blocking(move || BitcoinRegtest::from_downloaded_with_conf(&conf))
+            tokio::task::spawn_blocking(move || BitcoinRegtest::with_conf(bitcoind_exe, &conf))
                 .await
                 .map_err(|e| eyre::eyre!("Failed to spawn blocking task: {}", e))?
                 .map_err(|e| eyre::eyre!(e))?,
@@ -120,11 +144,9 @@ impl BitcoinDevnet {
         let cookie = bitcoin_regtest.params.cookie_file.clone();
 
         // Wait for cookie file to be created and readable
-        let mut cookie_str = String::new();
         for i in 0..20 {
             match tokio::fs::read_to_string(cookie.clone()).await {
-                Ok(content) => {
-                    cookie_str = content.trim().to_string(); // Trim any whitespace/newlines
+                Ok(_) => {
                     info!("Successfully read cookie file after {} attempts", i + 1);
                     break;
                 }
@@ -141,14 +163,6 @@ impl BitcoinDevnet {
                 }
             }
         }
-        // http://<user>:<password>@<host>:<port>/
-        // Initially connect without wallet specification
-        let rpc_url_with_cookie = format!(
-            "http://{}@{}:{}",
-            cookie_str,
-            bitcoin_regtest.params.rpc_socket.ip(),
-            bitcoin_regtest.params.rpc_socket.port()
-        );
         let rpc_url = format!(
             "http://{}:{}",
             bitcoin_regtest.params.rpc_socket.ip(),
@@ -304,10 +318,12 @@ impl BitcoinDevnet {
         if let MiningMode::Interval(interval) = mining_mode {
             join_set.spawn(async move {
                 loop {
-                    bitcoin_rpc_client_clone
+                    if let Err(error) = bitcoin_rpc_client_clone
                         .generate_to_address(1, &alice_address_clone)
                         .await
-                        .unwrap();
+                    {
+                        tracing::warn!(%error, "bitcoin interval miner failed to mine block");
+                    }
 
                     tokio::time::sleep(Duration::from_secs(interval)).await;
                 }
@@ -318,7 +334,7 @@ impl BitcoinDevnet {
             rpc_client: bitcoin_rpc_client.clone(),
             miner_address: alice_address,
             cookie,
-            rpc_url_with_cookie: rpc_url_with_cookie.clone(),
+            rpc_url,
             zmq_rawtx_endpoint,
             zmq_sequence_endpoint,
             funded_sats,
@@ -337,7 +353,7 @@ impl BitcoinDevnet {
             .get_blockchain_info()
             .await
             .map_err(|e| eyre::eyre!("Failed to get blockchain info: {}", e))?;
-        let current_height = blockchain_info.blocks as u32;
+        let current_height = bitcoin_core_height_to_u64(blockchain_info.blocks)?;
 
         Ok((devnet, current_height))
     }
@@ -375,7 +391,9 @@ impl BitcoinDevnet {
             // false to prevent the default http server from starting
             conf.http_enabled = false;
             conf.args.push("--http-addr");
-            conf.args.push("0.0.0.0:50103");
+            conf.args.push(Box::leak(
+                format!("0.0.0.0:{DEVNET_ESPLORA_PORT}").into_boxed_str(),
+            ));
         } else {
             conf.http_enabled = true;
         }
@@ -384,7 +402,7 @@ impl BitcoinDevnet {
         let electrsd = if using_esplora {
             info!("[Bitcoin Setup] Spawning electrsd (esplora)...");
             let exe_path = electrsd::exe_path()
-                .expect("Failed to get electrs executable path, maybe it's not installed?");
+                .map_err(|error| eyre::eyre!("failed to locate electrs executable: {error}"))?;
             let conf_clone = conf.clone();
             let regtest_clone = bitcoin_regtest.clone();
 
@@ -407,14 +425,15 @@ impl BitcoinDevnet {
         let _client_creation_start = Instant::now();
         let (esplora_client, esplora_url) = if using_esplora {
             let esplora_url = if fixed_esplora_url {
-                "0.0.0.0:50103".to_string()
+                format!("0.0.0.0:{DEVNET_ESPLORA_PORT}")
             } else {
-                electrsd
+                let electrsd = electrsd
                     .as_ref()
-                    .unwrap()
+                    .ok_or_else(|| eyre::eyre!("electrsd was not started for esplora setup"))?;
+                electrsd
                     .esplora_url
                     .clone()
-                    .expect("Failed to get electrsd esplora url")
+                    .ok_or_else(|| eyre::eyre!("electrsd did not provide an esplora URL"))?
             };
 
             // Ensure the URL has the proper scheme
@@ -427,8 +446,11 @@ impl BitcoinDevnet {
 
             (
                 Some(Arc::new(
-                    EsploraClient::from_builder(esplora_client::Builder::new(&full_url))
-                        .expect("Failed to create esplora client"),
+                    EsploraClient::from_builder(esplora_client::Builder::new(&full_url)).map_err(
+                        |error| {
+                            eyre::eyre!("failed to create esplora client for {full_url}: {error}")
+                        },
+                    )?,
                 )),
                 Some(full_url),
             )
@@ -438,11 +460,8 @@ impl BitcoinDevnet {
 
         if let Some(ref client) = esplora_client {
             let test_start = Instant::now();
-            let test_resp = client.get_fee_estimates().await;
-            if test_resp.is_err() {
-                return Err(
-                    eyre::eyre!("Electrs client failed {}", test_resp.err().unwrap()).into(),
-                );
+            if let Err(error) = client.get_fee_estimates().await {
+                return Err(eyre::eyre!("Electrs client failed {error}").into());
             }
             info!(
                 "[Bitcoin Setup] Esplora client test took {:?}",
@@ -477,9 +496,9 @@ impl BitcoinDevnet {
         let deal_start = Instant::now();
         info!("[Bitcoin] Dealing {} BTC to {}", amount.to_btc(), address);
 
-        let blocks_to_mine = (amount.to_btc() / 50.0).ceil() as usize;
+        let blocks_to_mine = bitcoin_blocks_to_mine_for_deal(*amount);
         let mine_start = Instant::now();
-        self.mine_blocks(blocks_to_mine as u64).await?;
+        self.mine_blocks(blocks_to_mine).await?;
         info!(
             "[Bitcoin] Mined {} blocks for funding in {:?}",
             blocks_to_mine,
@@ -516,15 +535,20 @@ impl BitcoinDevnet {
 
     pub async fn wait_for_esplora_sync(&self, timeout: Duration) -> Result<()> {
         let start_time = Instant::now();
+        let Some(esplora_client) = self.esplora_client.as_ref() else {
+            return Err(eyre::eyre!("cannot wait for esplora sync: esplora is not enabled").into());
+        };
         while start_time.elapsed() < timeout {
-            let height = self
-                .esplora_client
-                .as_ref()
-                .unwrap()
+            let height = esplora_client
                 .get_height()
                 .await
-                .unwrap();
-            if height == self.rpc_client.get_block_count().await.unwrap() as u32 {
+                .map_err(|error| eyre::eyre!("failed to fetch esplora height: {error}"))?;
+            let block_count = self
+                .rpc_client
+                .get_block_count()
+                .await
+                .map_err(|error| eyre::eyre!("failed to fetch bitcoin block count: {error}"))?;
+            if bitcoin_esplora_heights_match(height, block_count) {
                 return Ok(());
             }
 
@@ -533,6 +557,19 @@ impl BitcoinDevnet {
 
         Err(crate::DevnetError::EsploraSyncTimeout { timeout })
     }
+}
+
+fn bitcoin_blocks_to_mine_for_deal(amount: Amount) -> u64 {
+    amount.to_sat().div_ceil(REGTEST_BLOCK_REWARD_SATS)
+}
+
+fn bitcoin_core_height_to_u64(height: i64) -> Result<u64> {
+    u64::try_from(height)
+        .map_err(|_| eyre::eyre!("bitcoin core returned negative chain height {height}").into())
+}
+
+fn bitcoin_esplora_heights_match(esplora_height: u32, bitcoin_block_count: u64) -> bool {
+    u64::from(esplora_height) == bitcoin_block_count
 }
 
 fn reserve_local_port() -> Result<u16> {
@@ -544,4 +581,46 @@ fn reserve_local_port() -> Result<u16> {
         .port();
     drop(listener);
     Ok(port)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bitcoin_deal_block_count_uses_satoshi_integer_math() {
+        assert_eq!(bitcoin_blocks_to_mine_for_deal(Amount::from_sat(0)), 0);
+        assert_eq!(bitcoin_blocks_to_mine_for_deal(Amount::from_sat(1)), 1);
+        assert_eq!(
+            bitcoin_blocks_to_mine_for_deal(Amount::from_sat(REGTEST_BLOCK_REWARD_SATS)),
+            1
+        );
+        assert_eq!(
+            bitcoin_blocks_to_mine_for_deal(Amount::from_sat(REGTEST_BLOCK_REWARD_SATS + 1)),
+            2
+        );
+        assert_eq!(
+            bitcoin_blocks_to_mine_for_deal(Amount::from_sat(u64::MAX)),
+            u64::MAX.div_ceil(REGTEST_BLOCK_REWARD_SATS)
+        );
+    }
+
+    #[test]
+    fn bitcoin_esplora_height_match_does_not_wrap_core_height() {
+        assert!(bitcoin_esplora_heights_match(101, 101));
+        assert!(!bitcoin_esplora_heights_match(
+            101,
+            u64::from(u32::MAX) + 102
+        ));
+    }
+
+    #[test]
+    fn bitcoin_core_height_rejects_negative_values() {
+        assert_eq!(bitcoin_core_height_to_u64(0).unwrap(), 0);
+        assert_eq!(
+            bitcoin_core_height_to_u64(i64::MAX).unwrap(),
+            i64::MAX as u64
+        );
+        assert!(bitcoin_core_height_to_u64(-1).is_err());
+    }
 }

@@ -5,30 +5,48 @@ pub mod bitcoin_devnet;
 pub mod cctp_mock;
 pub mod evm_devnet;
 pub mod hyperliquid_bridge_mock;
+pub mod manifest;
 pub mod mock_integrators;
 pub mod token_indexerd;
+pub mod velora_mock;
 
 pub use bitcoin_devnet::BitcoinDevnet;
 use blockchain_utils::P2WPKHBitcoinWallet;
 pub use evm_devnet::EthDevnet;
+pub use manifest::{
+    deterministic_loadgen_evm_accounts, DevnetEvmAccount, DevnetManifest, DEVNET_ARBITRUM_RPC_PORT,
+    DEVNET_ARBITRUM_TOKEN_INDEXER_PORT, DEVNET_BASE_RPC_PORT, DEVNET_BASE_TOKEN_INDEXER_PORT,
+    DEVNET_DEFAULT_LOADGEN_EVM_ACCOUNT_COUNT, DEVNET_DEMO_ACCOUNT_SALT, DEVNET_ETHEREUM_RPC_PORT,
+    DEVNET_ETHEREUM_TOKEN_INDEXER_PORT, DEVNET_MANIFEST_PORT, DEVNET_MOCK_INTEGRATOR_PORT,
+};
 
-use evm_devnet::ForkConfig;
+use evm_devnet::{
+    ForkConfig, ARBITRUM_CBBTC_ADDRESS, ARBITRUM_USDC_ADDRESS, ARBITRUM_USDT_ADDRESS,
+    BASE_CBBTC_ADDRESS, BASE_USDC_ADDRESS, BASE_USDT_ADDRESS, ETHEREUM_CBBTC_ADDRESS,
+    ETHEREUM_USDC_ADDRESS, ETHEREUM_USDT_ADDRESS, MOCK_ACROSS_SPOKE_POOL_ADDRESS,
+    MOCK_CCTP_TOKEN_MESSENGER_V2_ADDRESS, MOCK_ERC20_ADDRESS,
+};
 use std::{
-    fs, io,
+    fmt, fs, io,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
 };
 use tempfile::NamedTempFile;
 use tokio::task::JoinSet;
-use tokio::time::Instant;
+use tokio::time::{Duration, Instant, MissedTickBehavior};
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use bitcoincore_rpc_async::RpcApi;
+use hyperliquid_client::{
+    bridge_address as hyperliquid_bridge_address, Network as HyperliquidNetwork,
+};
 
 use alloy::{
     network::EthereumWallet,
     primitives::{keccak256, Address},
-    providers::Provider,
+    providers::{ext::AnvilApi, Provider},
     signers::local::LocalSigner,
 };
 
@@ -37,6 +55,7 @@ use alloy::{
 use crate::evm_devnet::Mode;
 
 const _LOG_CHUNK_SIZE: u64 = 10000;
+const EVM_CONFIRMATION_MINING_INTERVAL: Duration = Duration::from_secs(1);
 
 pub struct RiftDevnetCache {
     pub cache_dir: PathBuf,
@@ -50,6 +69,7 @@ const ANVIL_DATADIR_NAME: &str = "anvil-datadir";
 const ANVIL_BASE_DATADIR_NAME: &str = "anvil-base-datadir";
 const ANVIL_ARBITRUM_DATADIR_NAME: &str = "anvil-arbitrum-datadir";
 const TEMP_DIR_NAME: &str = "tmp";
+const TOKEN_INDEXER_API_KEY_MIN_LENGTH: usize = 32;
 const TEMP_ENTRY_PREFIX: &str = "rift-devnet-p";
 const ERROR_MESSAGE: &str = "Cache must be populated before utilizing it,";
 
@@ -90,6 +110,24 @@ fn devnet_temp_root_path() -> Result<PathBuf> {
 
 fn current_process_temp_entry_prefix() -> String {
     format!("{TEMP_ENTRY_PREFIX}{}-", std::process::id())
+}
+
+fn token_indexer_api_key() -> Result<String> {
+    if let Ok(value) = std::env::var("EVM_TOKEN_INDEXER_API_KEY") {
+        let trimmed = value.trim();
+        if trimmed.len() < TOKEN_INDEXER_API_KEY_MIN_LENGTH {
+            return Err(eyre::eyre!(
+                "EVM_TOKEN_INDEXER_API_KEY must be at least {TOKEN_INDEXER_API_KEY_MIN_LENGTH} characters"
+            )
+            .into());
+        }
+        return Ok(trimmed.to_string());
+    }
+
+    Ok(format!(
+        "devnet-token-indexer-{}",
+        Uuid::now_v7().as_simple()
+    ))
 }
 
 pub fn cleanup_current_process_temp_dirs() -> Result<usize> {
@@ -174,7 +212,12 @@ fn remove_temp_entry(path: &Path) -> io::Result<()> {
 
 #[cfg(unix)]
 fn process_is_running(pid: u32) -> bool {
-    let status = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: `kill(pid, 0)` performs permission/existence checks only. It
+    // does not send a signal, dereference pointers, or mutate Rust memory.
+    let status = unsafe { libc::kill(pid, 0) };
     status == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
@@ -183,21 +226,14 @@ fn process_is_running(_pid: u32) -> bool {
     true
 }
 
-impl Default for RiftDevnetCache {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl RiftDevnetCache {
-    #[must_use]
-    pub fn new() -> Self {
-        let cache_dir = devnet_cache_root().expect("Failed to find user cache directory");
+    pub fn new() -> Result<Self> {
+        let cache_dir = devnet_cache_root()?;
         let populated = Self::cache_is_populated(&cache_dir);
-        Self {
+        Ok(Self {
             cache_dir,
             populated,
-        }
+        })
     }
 
     fn cache_is_populated(cache_dir: &Path) -> bool {
@@ -554,6 +590,29 @@ mod tests {
         assert!(other_pid_dir.exists());
         assert!(legacy_dir.exists());
     }
+
+    #[test]
+    fn multichain_account_debug_redacts_private_material() {
+        let account = MultichainAccount::new(123).expect("multichain account");
+
+        let debug = format!("{account:?}");
+
+        assert!(debug.contains("MultichainAccount"));
+        assert!(debug.contains("secret_bytes: \"<redacted>\""));
+        assert!(debug.contains("bitcoin_mnemonic: \"<redacted>\""));
+        assert!(debug.contains(&format!("{:#x}", account.ethereum_address)));
+        assert!(debug.contains(&account.bitcoin_wallet.address.to_string()));
+        assert!(!debug.contains(&alloy::hex::encode(account.secret_bytes)));
+        assert!(!debug.contains(&account.bitcoin_mnemonic.to_string()));
+        assert!(!debug.contains(&account.bitcoin_wallet.private_key.to_wif()));
+        assert!(!debug.contains(
+            &account
+                .bitcoin_wallet
+                .secret_key
+                .display_secret()
+                .to_string()
+        ));
+    }
 }
 
 #[derive(Debug, snafu::Snafu)]
@@ -580,11 +639,14 @@ pub type Result<T, E = DevnetError> = std::result::Result<T, E>;
 /// - an `EthDevnet` for Ethereum (chain ID 1)
 /// - an `EthDevnet` for Base (chain ID 8453, port 50102)
 /// - an `EthDevnet` for Arbitrum (chain ID 42161, port 50103)
+/// - provider mocks when running the interactive CLI server
 pub struct RiftDevnet {
     pub bitcoin: Arc<BitcoinDevnet>,
     pub ethereum: Arc<EthDevnet>,
     pub base: Arc<EthDevnet>,
     pub arbitrum: Arc<EthDevnet>,
+    pub loadgen_evm_accounts: Vec<DevnetEvmAccount>,
+    pub mock_integrators: Option<mock_integrators::MockIntegratorServer>,
     pub join_set: JoinSet<Result<()>>,
 }
 
@@ -608,8 +670,10 @@ pub struct RiftDevnetBuilder {
     funded_bitcoin_addreses: Vec<String>,
     fork_config: Option<ForkConfig>,
     using_esplora: bool,
+    using_mock_integrators: bool,
     token_indexer_database_url: Option<String>,
     bitcoin_mining_mode: crate::bitcoin_devnet::MiningMode,
+    loadgen_evm_account_count: usize,
 }
 
 impl RiftDevnetBuilder {
@@ -628,8 +692,10 @@ impl RiftDevnetBuilder {
             funded_bitcoin_addreses: vec![],
             fork_config: None,
             using_esplora: true,
+            using_mock_integrators: false,
             token_indexer_database_url: None,
             bitcoin_mining_mode: crate::bitcoin_devnet::MiningMode::default(),
+            loadgen_evm_account_count: 0,
         }
     }
 
@@ -647,6 +713,12 @@ impl RiftDevnetBuilder {
         self
     }
 
+    /// Start local provider mocks alongside the interactive devnet.
+    pub fn using_mock_integrators(mut self, value: bool) -> Self {
+        self.using_mock_integrators = value;
+        self
+    }
+
     /// Optionally fund a given EVM address with Ether and tokens.
     pub fn funded_evm_address<T: Into<String>>(mut self, address: T) -> Self {
         self.funded_evm_addresses.push(address.into());
@@ -661,6 +733,13 @@ impl RiftDevnetBuilder {
 
     pub fn bitcoin_mining_mode(mut self, mining_mode: crate::bitcoin_devnet::MiningMode) -> Self {
         self.bitcoin_mining_mode = mining_mode;
+        self
+    }
+
+    /// Allocate a deterministic pool of EVM keys for load generation and fund
+    /// them on every local EVM chain.
+    pub fn loadgen_evm_account_count(mut self, count: usize) -> Self {
+        self.loadgen_evm_account_count = count;
         self
     }
 
@@ -694,7 +773,7 @@ impl RiftDevnetBuilder {
         if self.interactive {
             Ok(self.build_internal(None).await?)
         } else {
-            let cache = Arc::new(RiftDevnetCache::new());
+            let cache = Arc::new(RiftDevnetCache::new()?);
 
             if cache.populated {
                 tracing::info!("Cache directory exists, loading devnet from cache...");
@@ -782,6 +861,11 @@ impl RiftDevnetBuilder {
         } else {
             Mode::Local
         };
+        let token_indexer_api_key = if self.token_indexer_database_url.is_some() {
+            Some(token_indexer_api_key()?)
+        } else {
+            None
+        };
 
         // 5) Ethereum side (chain ID 31337, default port)
         let ethereum_start = Instant::now();
@@ -790,10 +874,19 @@ impl RiftDevnetBuilder {
             deploy_mode.clone(),
             devnet_cache.clone(),
             self.token_indexer_database_url.clone(),
+            token_indexer_api_key.clone(),
             self.interactive,
             1, // Ethereum chain ID
-            if self.interactive { Some(50101) } else { None },
-            if self.interactive { Some(50104) } else { None }, // Ethereum token indexer port
+            if self.interactive {
+                Some(DEVNET_ETHEREUM_RPC_PORT)
+            } else {
+                None
+            },
+            if self.interactive {
+                Some(DEVNET_ETHEREUM_TOKEN_INDEXER_PORT)
+            } else {
+                None
+            },
         )
         .await
         .map_err(|e| eyre::eyre!("[devnet builder] Failed to setup Ethereum devnet: {}", e))?;
@@ -810,10 +903,19 @@ impl RiftDevnetBuilder {
             deploy_mode.clone(),
             devnet_cache.clone(), // Use cache for Base
             self.token_indexer_database_url.clone(),
+            token_indexer_api_key.clone(),
             self.interactive,
-            8453,                                              // Base chain ID
-            if self.interactive { Some(50102) } else { None }, // Base port
-            if self.interactive { Some(50105) } else { None }, // Base token indexer port
+            8453, // Base chain ID
+            if self.interactive {
+                Some(DEVNET_BASE_RPC_PORT)
+            } else {
+                None
+            },
+            if self.interactive {
+                Some(DEVNET_BASE_TOKEN_INDEXER_PORT)
+            } else {
+                None
+            },
         )
         .await
         .map_err(|e| eyre::eyre!("[devnet builder] Failed to setup Base devnet: {}", e))?;
@@ -830,10 +932,19 @@ impl RiftDevnetBuilder {
             deploy_mode,
             devnet_cache.clone(),
             self.token_indexer_database_url.clone(),
+            token_indexer_api_key,
             self.interactive,
-            42161,                                             // Arbitrum chain ID
-            if self.interactive { Some(50103) } else { None }, // Arbitrum port
-            if self.interactive { Some(50106) } else { None }, // Arbitrum token indexer port
+            42161, // Arbitrum chain ID
+            if self.interactive {
+                Some(DEVNET_ARBITRUM_RPC_PORT)
+            } else {
+                None
+            },
+            if self.interactive {
+                Some(DEVNET_ARBITRUM_TOKEN_INDEXER_PORT)
+            } else {
+                None
+            },
         )
         .await
         .map_err(|e| eyre::eyre!("[devnet builder] Failed to setup Arbitrum devnet: {}", e))?;
@@ -843,21 +954,34 @@ impl RiftDevnetBuilder {
             arbitrum_start.elapsed()
         );
 
-        // 9) Fund optional EVM address with Ether on all EVM chains
-        let funding_start = if self.funded_evm_addresses.is_empty() {
+        let loadgen_evm_accounts =
+            deterministic_loadgen_evm_accounts(self.loadgen_evm_account_count).map_err(
+                |error| eyre::eyre!("[devnet builder] Failed to derive loadgen accounts: {error}"),
+            )?;
+        let mut funded_evm_addresses = self.funded_evm_addresses.clone();
+        funded_evm_addresses.extend(
+            loadgen_evm_accounts
+                .iter()
+                .map(|account| account.address.clone()),
+        );
+
+        // 9) Fund optional EVM addresses with Ether and tokens on all EVM chains.
+        let funding_start = if funded_evm_addresses.is_empty() {
             None
         } else {
             info!(
                 "[Devnet Builder] Funding {} EVM addresses on Ethereum, Base, and Arbitrum...",
-                self.funded_evm_addresses.len()
+                funded_evm_addresses.len()
             );
             Some(Instant::now())
         };
-        for addr_str in self.funded_evm_addresses.clone() {
+        for addr_str in funded_evm_addresses {
             use alloy::primitives::Address;
             use std::str::FromStr;
             let address = Address::from_str(&addr_str)
                 .map_err(|e| eyre::eyre!("Failed to parse EVM address: {}", e))?;
+            let token_amount = alloy::primitives::U256::from_str("100000000000000")
+                .map_err(|e| eyre::eyre!("Failed to parse U256: {}", e))?;
 
             // ~10 ETH on Ethereum
             ethereum_devnet
@@ -934,6 +1058,43 @@ impl RiftDevnetBuilder {
                     )
                 })?;
             info!("[Devnet Builder] Arbitrum Balance of {addr_str} => {arbitrum_balance:?}");
+
+            mint_default_local_tokens(
+                &ethereum_devnet,
+                address,
+                &[
+                    MOCK_ERC20_ADDRESS,
+                    ETHEREUM_USDC_ADDRESS,
+                    ETHEREUM_USDT_ADDRESS,
+                    ETHEREUM_CBBTC_ADDRESS,
+                ],
+                token_amount,
+            )
+            .await?;
+            mint_default_local_tokens(
+                &base_devnet,
+                address,
+                &[
+                    MOCK_ERC20_ADDRESS,
+                    BASE_USDC_ADDRESS,
+                    BASE_USDT_ADDRESS,
+                    BASE_CBBTC_ADDRESS,
+                ],
+                token_amount,
+            )
+            .await?;
+            mint_default_local_tokens(
+                &arbitrum_devnet,
+                address,
+                &[
+                    MOCK_ERC20_ADDRESS,
+                    ARBITRUM_USDC_ADDRESS,
+                    ARBITRUM_USDT_ADDRESS,
+                    ARBITRUM_CBBTC_ADDRESS,
+                ],
+                token_amount,
+            )
+            .await?;
         }
         if let Some(start) = funding_start {
             info!("[Devnet Builder] Funded addresses in {:?}", start.elapsed());
@@ -950,12 +1111,38 @@ impl RiftDevnetBuilder {
             .await?;
         }
 
+        let mock_integrators = if self.using_mock_integrators {
+            Some(
+                self.setup_mock_integrators(
+                    &bitcoin_devnet,
+                    &ethereum_devnet,
+                    &base_devnet,
+                    &arbitrum_devnet,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+
+        let ethereum_devnet = Arc::new(ethereum_devnet);
+        let base_devnet = Arc::new(base_devnet);
+        let arbitrum_devnet = Arc::new(arbitrum_devnet);
+
+        if self.interactive {
+            spawn_evm_confirmation_miner("Ethereum", ethereum_devnet.clone(), &mut join_set);
+            spawn_evm_confirmation_miner("Base", base_devnet.clone(), &mut join_set);
+            spawn_evm_confirmation_miner("Arbitrum", arbitrum_devnet.clone(), &mut join_set);
+        }
+
         // 11) Create the devnet
         let devnet = crate::RiftDevnet {
             bitcoin: Arc::new(bitcoin_devnet),
-            ethereum: Arc::new(ethereum_devnet),
-            base: Arc::new(base_devnet),
-            arbitrum: Arc::new(arbitrum_devnet),
+            ethereum: ethereum_devnet,
+            base: base_devnet,
+            arbitrum: arbitrum_devnet,
+            loadgen_evm_accounts,
+            mock_integrators,
             join_set,
         };
         info!(
@@ -964,6 +1151,95 @@ impl RiftDevnetBuilder {
         );
 
         Ok((devnet, funding_sats))
+    }
+
+    async fn setup_mock_integrators(
+        &self,
+        bitcoin_devnet: &BitcoinDevnet,
+        ethereum_devnet: &EthDevnet,
+        base_devnet: &EthDevnet,
+        arbitrum_devnet: &EthDevnet,
+    ) -> Result<mock_integrators::MockIntegratorServer> {
+        let bind_addr = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            DEVNET_MOCK_INTEGRATOR_PORT,
+        );
+        let config = mock_integrators::MockIntegratorConfig::default()
+            .with_bind_addr(bind_addr)
+            .with_advertised_base_url(format!("http://127.0.0.1:{DEVNET_MOCK_INTEGRATOR_PORT}"))
+            .with_across_spoke_pool_address(MOCK_ACROSS_SPOKE_POOL_ADDRESS)
+            .with_across_evm_rpc_url(base_devnet.anvil.endpoint())
+            .with_across_chain(
+                ethereum_devnet.anvil.chain_id(),
+                MOCK_ACROSS_SPOKE_POOL_ADDRESS,
+                ethereum_devnet.anvil.endpoint(),
+            )
+            .with_across_chain(
+                base_devnet.anvil.chain_id(),
+                MOCK_ACROSS_SPOKE_POOL_ADDRESS,
+                base_devnet.anvil.endpoint(),
+            )
+            .with_across_chain(
+                arbitrum_devnet.anvil.chain_id(),
+                MOCK_ACROSS_SPOKE_POOL_ADDRESS,
+                arbitrum_devnet.anvil.endpoint(),
+            )
+            .with_across_auth("devnet-across", "rift-devnet")
+            .with_cctp_chain(
+                ethereum_devnet.anvil.chain_id(),
+                MOCK_CCTP_TOKEN_MESSENGER_V2_ADDRESS,
+                ethereum_devnet.anvil.endpoint(),
+            )
+            .with_cctp_chain(
+                base_devnet.anvil.chain_id(),
+                MOCK_CCTP_TOKEN_MESSENGER_V2_ADDRESS,
+                base_devnet.anvil.endpoint(),
+            )
+            .with_cctp_chain(
+                arbitrum_devnet.anvil.chain_id(),
+                MOCK_CCTP_TOKEN_MESSENGER_V2_ADDRESS,
+                arbitrum_devnet.anvil.endpoint(),
+            )
+            .with_cctp_destination_token(ethereum_devnet.anvil.chain_id(), ETHEREUM_USDC_ADDRESS)
+            .with_cctp_destination_token(base_devnet.anvil.chain_id(), BASE_USDC_ADDRESS)
+            .with_cctp_destination_token(arbitrum_devnet.anvil.chain_id(), ARBITRUM_USDC_ADDRESS)
+            .with_velora_swap_contract_address(
+                ethereum_devnet.anvil.chain_id(),
+                format!("{:#x}", ethereum_devnet.mock_velora_swap_contract.address()),
+            )
+            .with_velora_swap_contract_address(
+                base_devnet.anvil.chain_id(),
+                format!("{:#x}", base_devnet.mock_velora_swap_contract.address()),
+            )
+            .with_velora_swap_contract_address(
+                arbitrum_devnet.anvil.chain_id(),
+                format!("{:#x}", arbitrum_devnet.mock_velora_swap_contract.address()),
+            )
+            .with_unit_evm_rpc_url(
+                hyperunit_client::UnitChain::Ethereum,
+                ethereum_devnet.anvil.endpoint(),
+            )
+            .with_unit_evm_rpc_url(
+                hyperunit_client::UnitChain::Base,
+                base_devnet.anvil.endpoint(),
+            )
+            .with_unit_bitcoin_rpc(
+                bitcoin_devnet.rpc_url.clone(),
+                bitcoin_devnet.cookie.clone(),
+            )
+            .with_hyperliquid_bridge_address(format!(
+                "{:#x}",
+                hyperliquid_bridge_address(HyperliquidNetwork::Testnet)
+            ))
+            .with_hyperliquid_evm_rpc_url(arbitrum_devnet.anvil.endpoint())
+            .with_hyperliquid_usdc_token_address(ARBITRUM_USDC_ADDRESS);
+
+        mock_integrators::MockIntegratorServer::spawn_with_config(config)
+            .await
+            .map_err(|error| {
+                eyre::eyre!("[devnet builder] Failed to start mock integrators: {error}")
+            })
+            .map_err(Into::into)
     }
 
     /// Setup interactive mode with demo funding, auto-mining, and logging
@@ -977,7 +1253,7 @@ impl RiftDevnetBuilder {
     ) -> Result<()> {
         let setup_start = Instant::now();
 
-        let demo_account = MultichainAccount::new(110101);
+        let demo_account = MultichainAccount::new(DEVNET_DEMO_ACCOUNT_SALT)?;
 
         let funding_start = Instant::now();
         info!("[Interactive Setup] Funding demo_account with ETH...");
@@ -995,7 +1271,7 @@ impl RiftDevnetBuilder {
                 )
             })?;
 
-        let funding_amount = bitcoin::Amount::from_btc(1000.0).unwrap().to_sat();
+        let funding_amount = 1000_u64 * 100_000_000;
 
         // Fund demo_account with the mock ERC-20 on Ethereum
         let _tx_hash = ethereum_devnet
@@ -1004,6 +1280,17 @@ impl RiftDevnetBuilder {
                 alloy::primitives::U256::from(funding_amount),
             )
             .await?;
+        mint_default_local_tokens(
+            ethereum_devnet,
+            demo_account.ethereum_address,
+            &[
+                ETHEREUM_USDC_ADDRESS,
+                ETHEREUM_USDT_ADDRESS,
+                ETHEREUM_CBBTC_ADDRESS,
+            ],
+            alloy::primitives::U256::from(funding_amount),
+        )
+        .await?;
 
         // Fund demo_account with ETH on Base
         info!("[Interactive Setup] Funding demo_account with ETH on Base...");
@@ -1028,6 +1315,13 @@ impl RiftDevnetBuilder {
                 alloy::primitives::U256::from(funding_amount),
             )
             .await?;
+        mint_default_local_tokens(
+            base_devnet,
+            demo_account.ethereum_address,
+            &[BASE_USDC_ADDRESS, BASE_USDT_ADDRESS, BASE_CBBTC_ADDRESS],
+            alloy::primitives::U256::from(funding_amount),
+        )
+        .await?;
 
         // Fund demo_account with ETH on Arbitrum
         info!("[Interactive Setup] Funding demo_account with ETH on Arbitrum...");
@@ -1052,6 +1346,17 @@ impl RiftDevnetBuilder {
                 alloy::primitives::U256::from(funding_amount),
             )
             .await?;
+        mint_default_local_tokens(
+            arbitrum_devnet,
+            demo_account.ethereum_address,
+            &[
+                ARBITRUM_USDC_ADDRESS,
+                ARBITRUM_USDT_ADDRESS,
+                ARBITRUM_CBBTC_ADDRESS,
+            ],
+            alloy::primitives::U256::from(funding_amount),
+        )
+        .await?;
 
         // Fund demo_account with Bitcoin
         info!("[Interactive Setup] Funding demo_account with Bitcoin...");
@@ -1131,16 +1436,18 @@ impl RiftDevnetBuilder {
             "Arbitrum Chain ID:          {}",
             arbitrum_devnet.anvil.chain_id()
         );
+        println!("Bitcoin RPC URL:            {}", bitcoin_devnet.rpc_url);
         println!(
-            "Bitcoin RPC URL:            {}",
-            bitcoin_devnet.rpc_url_with_cookie
+            "Bitcoin RPC Cookie File:    {}",
+            bitcoin_devnet.cookie.display()
         );
 
         if using_esplora {
-            println!(
-                "Esplora API URL:            {}",
-                bitcoin_devnet.esplora_url.as_ref().unwrap()
-            );
+            if let Some(esplora_url) = bitcoin_devnet.esplora_url.as_ref() {
+                println!("Esplora API URL:            {esplora_url}");
+            } else {
+                warn!("Esplora was requested, but no Esplora URL is available");
+            }
         }
 
         if let Some(eth_indexer) = &ethereum_devnet.token_indexer {
@@ -1170,15 +1477,57 @@ impl RiftDevnetBuilder {
             }
         }
 
-        println!("Anvil Auto-mining:          Every 1 second");
+        println!("Anvil Auto-mining:          On demand");
+        println!(
+            "Anvil Confirmation Mining:  Every {} second",
+            EVM_CONFIRMATION_MINING_INTERVAL.as_secs()
+        );
         println!("---RIFT DEVNET---");
 
         Ok(())
     }
 }
 
+fn spawn_evm_confirmation_miner(
+    chain_name: &'static str,
+    devnet: Arc<EthDevnet>,
+    join_set: &mut JoinSet<Result<()>>,
+) {
+    let provider = devnet.funded_provider.clone();
+    join_set.spawn(async move {
+        let mut interval = tokio::time::interval(EVM_CONFIRMATION_MINING_INTERVAL);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        loop {
+            interval.tick().await;
+            if let Err(error) = provider.anvil_mine(Some(1), None).await {
+                warn!(chain = chain_name, %error, "EVM confirmation miner failed to mine block");
+            }
+        }
+    });
+}
+
+async fn mint_default_local_tokens(
+    devnet: &EthDevnet,
+    recipient: Address,
+    token_addresses: &[&str],
+    amount: alloy::primitives::U256,
+) -> Result<()> {
+    let mut minted = std::collections::BTreeSet::new();
+    for token in token_addresses {
+        let token_address = token
+            .parse()
+            .map_err(|error| eyre::eyre!("invalid local token address {token}: {error}"))?;
+        if !minted.insert(token_address) {
+            continue;
+        }
+        devnet.mint_erc20(token_address, recipient, amount).await?;
+    }
+
+    Ok(())
+}
+
 /// Holds the components of a multichain account including secret bytes and wallets.
-#[derive(Debug)]
 pub struct MultichainAccount {
     /// The raw secret bytes used to derive wallets
     pub secret_bytes: [u8; 32],
@@ -1192,56 +1541,56 @@ pub struct MultichainAccount {
     pub bitcoin_wallet: P2WPKHBitcoinWallet,
 }
 
+impl fmt::Debug for MultichainAccount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MultichainAccount")
+            .field("secret_bytes", &"<redacted>")
+            .field("bitcoin_mnemonic", &"<redacted>")
+            .field("ethereum_address", &self.ethereum_address)
+            .field("bitcoin_address", &self.bitcoin_wallet.address)
+            .finish()
+    }
+}
+
 impl MultichainAccount {
     /// Creates a new multichain account from the given derivation salt
-    #[must_use]
-    pub fn new(derivation_salt: u32) -> Self {
-        let secret_bytes: [u8; 32] = keccak256(derivation_salt.to_le_bytes()).into();
-
-        let ethereum_wallet =
-            EthereumWallet::new(LocalSigner::from_bytes(&secret_bytes.into()).unwrap());
-
-        let ethereum_address = ethereum_wallet.default_signer().address();
-
-        let bitcoin_mnemonic = bip39::Mnemonic::from_entropy(&secret_bytes).unwrap();
-
-        let bitcoin_wallet = P2WPKHBitcoinWallet::from_mnemonic(
-            &bitcoin_mnemonic.to_string(),
-            None,
-            ::bitcoin::Network::Regtest,
-            None,
-        );
-
-        Self {
-            secret_bytes,
-            ethereum_wallet,
-            ethereum_address,
-            bitcoin_mnemonic,
-            bitcoin_wallet: bitcoin_wallet.unwrap(),
-        }
+    pub fn new(derivation_salt: u32) -> Result<Self> {
+        Self::with_network(derivation_salt, ::bitcoin::Network::Regtest)
     }
 
     /// Creates a new multichain account with the Bitcoin network explicitly specified
-    #[must_use]
-    pub fn with_network(derivation_salt: u32, network: ::bitcoin::Network) -> Self {
+    pub fn with_network(derivation_salt: u32, network: ::bitcoin::Network) -> Result<Self> {
         let secret_bytes: [u8; 32] = keccak256(derivation_salt.to_le_bytes()).into();
 
-        let ethereum_wallet =
-            EthereumWallet::new(LocalSigner::from_bytes(&secret_bytes.into()).unwrap());
+        let signer = LocalSigner::from_bytes(&secret_bytes.into()).map_err(|error| {
+            eyre::eyre!(
+                "failed to derive deterministic EVM signer for salt {derivation_salt}: {error}"
+            )
+        })?;
+        let ethereum_wallet = EthereumWallet::new(signer);
 
         let ethereum_address = ethereum_wallet.default_signer().address();
 
-        let bitcoin_mnemonic = bip39::Mnemonic::from_entropy(&secret_bytes).unwrap();
+        let bitcoin_mnemonic = bip39::Mnemonic::from_entropy(&secret_bytes).map_err(|error| {
+            eyre::eyre!(
+                "failed to derive deterministic Bitcoin mnemonic for salt {derivation_salt}: {error}"
+            )
+        })?;
 
         let bitcoin_wallet =
-            P2WPKHBitcoinWallet::from_mnemonic(&bitcoin_mnemonic.to_string(), None, network, None);
+            P2WPKHBitcoinWallet::from_mnemonic(&bitcoin_mnemonic.to_string(), None, network, None)
+                .map_err(|error| {
+                    eyre::eyre!(
+                "failed to derive deterministic Bitcoin wallet for salt {derivation_salt}: {error}"
+            )
+                })?;
 
-        Self {
+        Ok(Self {
             secret_bytes,
             bitcoin_mnemonic,
             ethereum_wallet,
             ethereum_address,
-            bitcoin_wallet: bitcoin_wallet.unwrap(),
-        }
+            bitcoin_wallet,
+        })
     }
 }

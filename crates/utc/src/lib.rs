@@ -13,8 +13,9 @@ pub fn now() -> DateTime<Utc> {
     #[cfg(all(feature = "mock-time", not(test), not(debug_assertions)))]
     compile_error!("mock-time feature must not be enabled in production builds");
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time before Unix epoch");
-    DateTime::from_timestamp(now.as_secs() as i64, now.subsec_nanos()).unwrap()
+    let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return DateTime::from_timestamp(0, 0).unwrap_or(DateTime::<Utc>::MIN_UTC);
+    };
+    let seconds = i64::try_from(now.as_secs()).unwrap_or(i64::MAX);
+    DateTime::from_timestamp(seconds, now.subsec_nanos()).unwrap_or(DateTime::<Utc>::MAX_UTC)
 }

@@ -2,6 +2,7 @@ use crate::protocol::{AssetId, ChainId, DepositAsset};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::fmt;
 use uuid::Uuid;
 
 pub fn empty_metadata() -> Value {
@@ -62,6 +63,7 @@ pub enum RouterOrderStatus {
     RefundRequired,
     Refunding,
     Refunded,
+    ManualInterventionRequired,
     RefundManualInterventionRequired,
     Failed,
     Expired,
@@ -79,6 +81,7 @@ impl RouterOrderStatus {
             Self::RefundRequired => "refund_required",
             Self::Refunding => "refunding",
             Self::Refunded => "refunded",
+            Self::ManualInterventionRequired => "manual_intervention_required",
             Self::RefundManualInterventionRequired => "refund_manual_intervention_required",
             Self::Failed => "failed",
             Self::Expired => "expired",
@@ -95,6 +98,7 @@ impl RouterOrderStatus {
             "refund_required" => Some(Self::RefundRequired),
             "refunding" => Some(Self::Refunding),
             "refunded" => Some(Self::Refunded),
+            "manual_intervention_required" => Some(Self::ManualInterventionRequired),
             "refund_manual_intervention_required" => Some(Self::RefundManualInterventionRequired),
             "failed" => Some(Self::Failed),
             "expired" => Some(Self::Expired),
@@ -228,6 +232,7 @@ pub struct MarketOrderQuote {
     pub max_amount_in: Option<String>,
     pub slippage_bps: u64,
     pub provider_quote: Value,
+    pub usd_valuation: Value,
     pub expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
 }
@@ -244,6 +249,7 @@ pub struct LimitOrderQuote {
     pub output_amount: String,
     pub residual_policy: LimitOrderResidualPolicy,
     pub provider_quote: Value,
+    pub usd_valuation: Value,
     pub expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
 }
@@ -322,13 +328,27 @@ pub struct RouterOrderQuoteEnvelope {
     pub quote: RouterOrderQuote,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RouterOrderEnvelope {
     pub order: RouterOrder,
     pub quote: RouterOrderQuote,
     pub funding_vault: Option<DepositVaultEnvelope>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancellation_secret: Option<String>,
+}
+
+impl fmt::Debug for RouterOrderEnvelope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RouterOrderEnvelope")
+            .field("order", &self.order)
+            .field("quote", &self.quote)
+            .field("funding_vault", &self.funding_vault)
+            .field(
+                "cancellation_secret",
+                &self.cancellation_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -920,6 +940,10 @@ pub struct OrderProviderOperationHint {
     pub updated_at: DateTime<Utc>,
 }
 
+pub const PROVIDER_OPERATION_OBSERVATION_HINT_SOURCE: &str =
+    "sauron_provider_operation_observation";
+pub const SAURON_DETECTOR_HINT_SOURCE: &str = "sauron";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DepositVaultFundingHint {
     pub id: Uuid,
@@ -1057,6 +1081,7 @@ pub struct OrderExecutionStep {
     pub id: Uuid,
     pub order_id: Uuid,
     pub execution_attempt_id: Option<Uuid>,
+    pub execution_leg_id: Option<Uuid>,
     pub transition_decl_id: Option<String>,
     pub step_index: i32,
     pub step_type: OrderExecutionStepType,
@@ -1077,6 +1102,32 @@ pub struct OrderExecutionStep {
     pub request: Value,
     pub response: Value,
     pub error: Value,
+    pub usd_valuation: Value,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OrderExecutionLeg {
+    pub id: Uuid,
+    pub order_id: Uuid,
+    pub execution_attempt_id: Option<Uuid>,
+    pub transition_decl_id: Option<String>,
+    pub leg_index: i32,
+    pub leg_type: String,
+    pub provider: String,
+    pub status: OrderExecutionStepStatus,
+    pub input_asset: DepositAsset,
+    pub output_asset: DepositAsset,
+    pub amount_in: String,
+    pub expected_amount_out: String,
+    pub min_amount_out: Option<String>,
+    pub actual_amount_in: Option<String>,
+    pub actual_amount_out: Option<String>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub details: Value,
+    pub usd_valuation: Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -1091,6 +1142,7 @@ pub enum DepositVaultStatus {
     RefundRequired,
     Refunding,
     Refunded,
+    ManualInterventionRequired,
     RefundManualInterventionRequired,
 }
 
@@ -1105,6 +1157,7 @@ impl DepositVaultStatus {
             Self::RefundRequired => "refund_required",
             Self::Refunding => "refunding",
             Self::Refunded => "refunded",
+            Self::ManualInterventionRequired => "manual_intervention_required",
             Self::RefundManualInterventionRequired => "refund_manual_intervention_required",
         }
     }
@@ -1118,6 +1171,7 @@ impl DepositVaultStatus {
             "refund_required" => Some(Self::RefundRequired),
             "refunding" => Some(Self::Refunding),
             "refunded" => Some(Self::Refunded),
+            "manual_intervention_required" => Some(Self::ManualInterventionRequired),
             "refund_manual_intervention_required" => Some(Self::RefundManualInterventionRequired),
             _ => None,
         }
@@ -1142,8 +1196,22 @@ pub struct DepositVault {
     pub refunded_at: Option<DateTime<Utc>>,
     pub refund_tx_hash: Option<String>,
     pub last_refund_error: Option<String>,
+    pub funding_observation: Option<DepositVaultFundingObservation>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DepositVaultFundingObservation {
+    pub tx_hash: Option<String>,
+    pub sender_address: Option<String>,
+    pub sender_addresses: Vec<String>,
+    pub recipient_address: Option<String>,
+    pub transfer_index: Option<u64>,
+    pub observed_amount: Option<String>,
+    pub confirmation_state: Option<String>,
+    pub observed_at: Option<DateTime<Utc>>,
+    pub evidence: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

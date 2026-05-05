@@ -44,8 +44,8 @@ impl SwapRates {
 
     /// Total basis points (liquidity + protocol fees).
     #[inline]
-    pub fn total_bps(&self) -> u64 {
-        self.liquidity_fee_bps + self.protocol_fee_bps
+    pub fn total_bps(&self) -> Option<u64> {
+        self.liquidity_fee_bps.checked_add(self.protocol_fee_bps)
     }
 }
 
@@ -62,8 +62,8 @@ pub struct FeeBreakdown {
 impl FeeBreakdown {
     /// Total fees deducted (liquidity + protocol + network).
     #[inline]
-    pub fn total_fees(&self) -> u64 {
-        self.liquidity_fee + self.protocol_fee + self.network_fee
+    pub fn total_fees(&self) -> Option<u64> {
+        checked_sum3(self.liquidity_fee, self.protocol_fee, self.network_fee)
     }
 }
 
@@ -88,18 +88,12 @@ pub fn compute_fees(mode: SwapMode, rates: &SwapRates) -> Option<FeeBreakdown> {
 ///
 /// Returns `None` if the output would be below `MIN_VIABLE_OUTPUT_SATS`.
 pub fn compute_fees_exact_input(input: u64, rates: &SwapRates) -> Option<FeeBreakdown> {
-    let liquidity_fee = input
-        .saturating_mul(rates.liquidity_fee_bps)
-        .div_ceil(BPS_DENOM);
-    let protocol_fee = input
-        .saturating_mul(rates.protocol_fee_bps)
-        .div_ceil(BPS_DENOM);
+    let liquidity_fee = bps_fee(input, rates.liquidity_fee_bps)?;
+    let protocol_fee = bps_fee(input, rates.protocol_fee_bps)?;
     let network_fee = rates.network_fee_sats;
 
-    let total_fees = liquidity_fee
-        .saturating_add(protocol_fee)
-        .saturating_add(network_fee);
-    let output = input.saturating_sub(total_fees);
+    let total_fees = checked_sum3(liquidity_fee, protocol_fee, network_fee)?;
+    let output = input.checked_sub(total_fees)?;
 
     if output < MIN_VIABLE_OUTPUT_SATS {
         return None;
@@ -131,25 +125,16 @@ pub fn compute_fees_exact_output(desired_output: u64, rates: &SwapRates) -> Opti
         return None;
     }
 
-    let input = inverse_input_for_exact_output(desired_output, rates);
-    if input == u64::MAX {
-        return None;
-    }
+    let input = inverse_input_for_exact_output(desired_output, rates)?;
 
     // Compute pure bps-based fees (ceiling)
-    let liquidity_fee = input
-        .saturating_mul(rates.liquidity_fee_bps)
-        .div_ceil(BPS_DENOM);
-    let protocol_fee = input
-        .saturating_mul(rates.protocol_fee_bps)
-        .div_ceil(BPS_DENOM);
+    let liquidity_fee = bps_fee(input, rates.liquidity_fee_bps)?;
+    let protocol_fee = bps_fee(input, rates.protocol_fee_bps)?;
 
     // Compute what output would be with base network fee
     let base_network_fee = rates.network_fee_sats;
-    let tentative_output = input
-        .saturating_sub(liquidity_fee)
-        .saturating_sub(protocol_fee)
-        .saturating_sub(base_network_fee);
+    let total_base_fees = checked_sum3(liquidity_fee, protocol_fee, base_network_fee)?;
+    let tentative_output = input.checked_sub(total_base_fees)?;
 
     if tentative_output < desired_output {
         // Closed-form input was not enough (shouldn't happen with correct formula, but guard)
@@ -158,7 +143,7 @@ pub fn compute_fees_exact_output(desired_output: u64, rates: &SwapRates) -> Opti
 
     // Network fee absorbs the slack: bump it up to hit exact output
     let network_fee_adjustment = tentative_output - desired_output;
-    let network_fee = base_network_fee + network_fee_adjustment;
+    let network_fee = base_network_fee.checked_add(network_fee_adjustment)?;
 
     // Sanity check: network fee shouldn't drift too far from base
     // With the +2 margin in inverse calculation, adjustment is typically 0-5 sats
@@ -176,8 +161,8 @@ pub fn compute_fees_exact_output(desired_output: u64, rates: &SwapRates) -> Opti
 }
 
 /// Compute the protocol fee for a given amount using ceiling division.
-pub fn compute_protocol_fee(amount: u64, protocol_fee_bps: u64) -> u64 {
-    amount.saturating_mul(protocol_fee_bps).div_ceil(BPS_DENOM)
+pub fn compute_protocol_fee(amount: u64, protocol_fee_bps: u64) -> Option<u64> {
+    bps_fee(amount, protocol_fee_bps)
 }
 
 /// Compute the input required to produce exactly `desired_output` after all fees.
@@ -188,27 +173,27 @@ pub fn compute_protocol_fee(amount: u64, protocol_fee_bps: u64) -> u64 {
 /// The +2 margin accounts for ceiling rounding on both bps fees, ensuring
 /// the computed input is always sufficient.
 ///
-/// Returns `u64::MAX` if fees would exceed 100%.
-pub fn inverse_input_for_exact_output(desired_output: u64, rates: &SwapRates) -> u64 {
+/// Returns `None` if fees would exceed 100% or the required input does not fit
+/// in `u64`.
+pub fn inverse_input_for_exact_output(desired_output: u64, rates: &SwapRates) -> Option<u64> {
     if desired_output == 0 {
-        return 0;
+        return Some(0);
     }
 
-    let remaining_bps = BPS_DENOM.saturating_sub(rates.total_bps());
-    if remaining_bps == 0 {
-        return u64::MAX; // 100%+ fees, impossible
+    let total_bps = rates.total_bps()?;
+    if total_bps >= BPS_DENOM {
+        return None;
     }
+    let remaining_bps = BPS_DENOM - total_bps;
 
     // Add +2 margin to account for ceiling rounding on both liquidity and protocol fees
-    desired_output
-        .saturating_add(rates.network_fee_sats)
-        .saturating_mul(BPS_DENOM)
-        .div_ceil(remaining_bps)
-        .saturating_add(2)
+    let gross_output = u128::from(desired_output) + u128::from(rates.network_fee_sats);
+    let rounded = (gross_output * u128::from(BPS_DENOM)).div_ceil(u128::from(remaining_bps));
+    u64::try_from(rounded.checked_add(2)?).ok()
 }
 
-/// Alias for `inverse_input_for_exact_output` for backwards compatibility.
-pub fn inverse_compute_input(desired_output: u64, rates: &SwapRates) -> u64 {
+/// Alias for `inverse_input_for_exact_output`.
+pub fn inverse_compute_input(desired_output: u64, rates: &SwapRates) -> Option<u64> {
     inverse_input_for_exact_output(desired_output, rates)
 }
 
@@ -216,29 +201,38 @@ pub fn inverse_compute_input(desired_output: u64, rates: &SwapRates) -> u64 {
 ///
 /// Uses the exact output calculation plus a small margin to account for ceiling rounding
 /// when computing fees via `compute_fees()`.
-pub fn compute_min_viable_input(rates: &SwapRates) -> u64 {
+pub fn compute_min_viable_input(rates: &SwapRates) -> Option<u64> {
     // The exact output path gives us the theoretical minimum, but compute_fees uses
     // ceiling on both bps fees, so we add a small margin.
-    inverse_input_for_exact_output(MIN_VIABLE_OUTPUT_SATS, rates).saturating_add(2)
+    inverse_input_for_exact_output(MIN_VIABLE_OUTPUT_SATS, rates)?.checked_add(2)
 }
 
 /// Compute the maximum input that produces at most `max_output` after all fees.
 ///
 /// This finds the largest input where `compute_fees(input, rates).output <= max_output`.
-pub fn compute_max_input_for_output(max_output: u64, rates: &SwapRates) -> u64 {
+pub fn compute_max_input_for_output(max_output: u64, rates: &SwapRates) -> Option<u64> {
     if max_output == 0 {
-        return 0;
+        return Some(0);
     }
 
     // Use floor division to get the max input that doesn't exceed max_output
-    let after_network = max_output.saturating_add(rates.network_fee_sats);
-    let remaining_bps = BPS_DENOM.saturating_sub(rates.total_bps());
-
-    if remaining_bps == 0 {
-        return u64::MAX;
+    let total_bps = rates.total_bps()?;
+    if total_bps >= BPS_DENOM {
+        return None;
     }
+    let remaining_bps = BPS_DENOM - total_bps;
+    let after_network = u128::from(max_output) + u128::from(rates.network_fee_sats);
 
-    after_network.saturating_mul(BPS_DENOM) / remaining_bps
+    u64::try_from((after_network * u128::from(BPS_DENOM)) / u128::from(remaining_bps)).ok()
+}
+
+fn bps_fee(amount: u64, bps: u64) -> Option<u64> {
+    let fee = (u128::from(amount) * u128::from(bps)).div_ceil(u128::from(BPS_DENOM));
+    u64::try_from(fee).ok()
+}
+
+fn checked_sum3(left: u64, middle: u64, right: u64) -> Option<u64> {
+    left.checked_add(middle)?.checked_add(right)
 }
 
 #[cfg(test)]
@@ -419,23 +413,22 @@ mod tests {
 
     fn assert_breakdown_sane(bd: FeeBreakdown, rates: &SwapRates) {
         // Core accounting identity
+        let total_fees = bd.total_fees().expect("fee breakdown total should fit u64");
         assert_eq!(
             bd.input,
-            bd.output + bd.total_fees(),
+            bd.output
+                .checked_add(total_fees)
+                .expect("fee breakdown accounting sum should fit u64"),
             "accounting invariant violated: {:?} rates={:?}",
             bd,
             rates
         );
 
         // Fees match the implementation's definition (bps fees are pure ceil on input)
-        let expected_liq = bd
-            .input
-            .saturating_mul(rates.liquidity_fee_bps)
-            .div_ceil(BPS_DENOM);
-        let expected_proto = bd
-            .input
-            .saturating_mul(rates.protocol_fee_bps)
-            .div_ceil(BPS_DENOM);
+        let expected_liq =
+            bps_fee(bd.input, rates.liquidity_fee_bps).expect("expected liquidity fee");
+        let expected_proto =
+            bps_fee(bd.input, rates.protocol_fee_bps).expect("expected protocol fee");
 
         assert_eq!(
             bd.liquidity_fee, expected_liq,
@@ -474,7 +467,10 @@ mod tests {
     fn test_holistic_invariants_across_modes() {
         for rates in RATE_CONFIGS {
             // Fees >= 100% is nonsensical; skip (not present here, but safe)
-            if rates.total_bps() >= BPS_DENOM {
+            if rates
+                .total_bps()
+                .is_none_or(|total_bps| total_bps >= BPS_DENOM)
+            {
                 continue;
             }
 
@@ -531,7 +527,10 @@ mod tests {
     #[test]
     fn test_exact_out_to_exact_in_consistency() {
         for rates in RATE_CONFIGS {
-            if rates.total_bps() >= BPS_DENOM {
+            if rates
+                .total_bps()
+                .is_none_or(|total_bps| total_bps >= BPS_DENOM)
+            {
                 continue;
             }
 
@@ -587,9 +586,35 @@ mod tests {
     #[test]
     fn test_basic_sanity() {
         let rates = SwapRates::new(13, 10, 1000);
-        assert_eq!(rates.total_bps(), 23);
+        assert_eq!(rates.total_bps(), Some(23));
 
         assert!(compute_fees(SwapMode::ExactInput(1_500), &rates).is_none());
         assert!(compute_fees(SwapMode::ExactOutput(500), &rates).is_none());
+    }
+
+    #[test]
+    fn fee_math_rejects_overflow_and_impossible_rates() {
+        assert_eq!(SwapRates::new(u64::MAX, 1, 0).total_bps(), None);
+        assert_eq!(compute_protocol_fee(u64::MAX, u64::MAX), None);
+        assert!(compute_fees_exact_input(u64::MAX, &SwapRates::new(u64::MAX, 0, 0)).is_none());
+        assert!(compute_fees_exact_output(
+            MIN_VIABLE_OUTPUT_SATS,
+            &SwapRates::new(BPS_DENOM, 0, 0)
+        )
+        .is_none());
+        assert!(
+            inverse_input_for_exact_output(u64::MAX, &SwapRates::new(0, 0, u64::MAX)).is_none()
+        );
+        assert!(compute_min_viable_input(&SwapRates::new(BPS_DENOM, 0, 0)).is_none());
+        assert!(compute_max_input_for_output(u64::MAX, &SwapRates::new(0, 0, u64::MAX)).is_none());
+
+        let impossible_breakdown = FeeBreakdown {
+            input: u64::MAX,
+            liquidity_fee: u64::MAX,
+            protocol_fee: 1,
+            network_fee: 0,
+            output: 0,
+        };
+        assert_eq!(impossible_breakdown.total_fees(), None);
     }
 }

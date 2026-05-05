@@ -1,11 +1,15 @@
+import { logError } from './internal/logging'
+
 export type ErrorCode =
   | 'AUTHENTICATION_ERROR'
   | 'BAD_GATEWAY'
+  | 'CONFLICT'
   | 'CONFIGURATION_ERROR'
+  | 'PAYLOAD_TOO_LARGE'
   | 'UPSTREAM_ERROR'
   | 'VALIDATION_ERROR'
 
-export type GatewayErrorStatus = 400 | 401 | 500 | 502 | 503
+export type GatewayErrorStatus = 400 | 401 | 409 | 413 | 500 | 502 | 503 | 504
 
 export type GatewayErrorBody = {
   error: {
@@ -37,6 +41,11 @@ export class GatewayAuthenticationError extends Error {
   readonly code = 'AUTHENTICATION_ERROR' as const
 }
 
+export class GatewayConflictError extends Error {
+  readonly status = 409
+  readonly code = 'CONFLICT' as const
+}
+
 export class UpstreamHttpError extends Error {
   readonly code = 'UPSTREAM_ERROR' as const
 
@@ -49,6 +58,7 @@ export class UpstreamHttpError extends Error {
   }
 
   publicStatus(): GatewayErrorStatus {
+    if (this.upstreamStatus === 504) return 504
     return 502
   }
 }
@@ -92,19 +102,25 @@ export function normalizeError(error: unknown): {
     }
   }
 
+  if (error instanceof GatewayConflictError) {
+    return {
+      status: error.status,
+      body: errorBody(error.code, error.message)
+    }
+  }
+
   if (error instanceof UpstreamHttpError) {
     return {
       status: error.publicStatus(),
       body: errorBody(error.code, error.message, {
-        upstreamStatus: error.upstreamStatus,
-        upstreamBody: error.upstreamBody
+        upstreamStatus: error.upstreamStatus
       })
     }
   }
 
-  const message = error instanceof Error ? error.message : 'Unexpected error'
+  logError('router gateway request failed', error)
   return {
     status: 500,
-    body: errorBody('BAD_GATEWAY', message)
+    body: errorBody('BAD_GATEWAY', 'Unexpected gateway error')
   }
 }

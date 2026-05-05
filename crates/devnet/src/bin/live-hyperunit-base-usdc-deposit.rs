@@ -34,6 +34,8 @@ const BASE_USDC: Address = address!("833589fCD6eDb6E08f4c7C32D4f71b54bDA02913");
 const RPC_RETRY_ATTEMPTS: usize = 6;
 const RECEIPT_POLL_ATTEMPTS: usize = 120;
 const RECEIPT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const LIVE_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const LIVE_HTTP_MAX_RESPONSE_BODY_BYTES: usize = 256 * 1024;
 
 sol! {
     #[sol(rpc)]
@@ -43,7 +45,7 @@ sol! {
     }
 }
 
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 #[command(
     about = "Send Base USDC to a live HyperUnit deposit address and verify the Hyperliquid credit"
 )]
@@ -243,22 +245,46 @@ fn parse_hyperliquid_network(raw: &str) -> CliResult<Network> {
 }
 
 fn build_hyperunit_http(proxy_url: Option<String>) -> CliResult<reqwest::Client> {
-    let mut builder = reqwest::Client::builder().use_rustls_tls();
+    let mut builder = reqwest::Client::builder()
+        .use_rustls_tls()
+        .timeout(LIVE_HTTP_TIMEOUT);
     if let Some(proxy_url) = proxy_url
         .map(|raw| raw.trim().to_string())
         .filter(|raw| !raw.is_empty())
     {
-        let parsed = Url::parse(&proxy_url)?;
+        let parsed =
+            Url::parse(&proxy_url).map_err(|err| format!("invalid HyperUnit proxy URL: {err}"))?;
+        let sanitized_proxy_url = sanitize_url_for_error(&parsed);
         if parsed.scheme() != "socks5" {
             return Err(format!(
-                "unsupported HyperUnit proxy scheme {}; expected socks5",
-                parsed.scheme()
+                "unsupported HyperUnit proxy scheme {} for {}; expected socks5",
+                parsed.scheme(),
+                sanitized_proxy_url
             )
             .into());
         }
-        builder = builder.proxy(Proxy::all(&proxy_url)?);
+        builder = builder.proxy(Proxy::all(&proxy_url).map_err(|err| {
+            format!("failed to configure HyperUnit proxy {sanitized_proxy_url}: {err}")
+        })?);
     }
     Ok(builder.build()?)
+}
+
+fn sanitize_url_for_error(parsed: &Url) -> String {
+    let mut parsed = parsed.clone();
+    if !parsed.username().is_empty() {
+        let _ = parsed.set_username("redacted");
+    }
+    if parsed.password().is_some() {
+        let _ = parsed.set_password(Some("redacted"));
+    }
+    if parsed.query().is_some() {
+        parsed.set_query(Some("redacted"));
+    }
+    if parsed.fragment().is_some() {
+        parsed.set_fragment(Some("redacted"));
+    }
+    parsed.to_string()
 }
 
 async fn hyperunit_generate_address(
@@ -309,12 +335,33 @@ async fn get_json<T: serde::de::DeserializeOwned>(
 ) -> CliResult<T> {
     let response = http.get(url).send().await?;
     let status = response.status();
-    let body = response.text().await?;
+    let body = read_limited_response_text(response, LIVE_HTTP_MAX_RESPONSE_BODY_BYTES).await?;
     if !status.is_success() {
         return Err(format!("HTTP {status} for {url}: {body}").into());
     }
     serde_json::from_str(&body)
         .map_err(|err| format!("invalid JSON from {url}: {err}; body={body}").into())
+}
+
+async fn read_limited_response_text(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> CliResult<String> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if !append_limited_body_chunk(&mut body, chunk.as_ref(), max_bytes) {
+            return Err(format!("response body exceeded {max_bytes} bytes").into());
+        }
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+fn append_limited_body_chunk(body: &mut Vec<u8>, chunk: &[u8], max_bytes: usize) -> bool {
+    if body.len().saturating_add(chunk.len()) > max_bytes {
+        return false;
+    }
+    body.extend_from_slice(chunk);
+    true
 }
 
 async fn send_usdc_transfer<PRead, PWrite>(
@@ -564,7 +611,8 @@ where
     Fut: Future<Output = CliResult<T>>,
 {
     let mut delay = Duration::from_millis(500);
-    for attempt in 1..=RPC_RETRY_ATTEMPTS {
+    let mut attempt = 1;
+    loop {
         match op().await {
             Ok(value) => return Ok(value),
             Err(err) if attempt < RPC_RETRY_ATTEMPTS && is_retryable_rpc_error(err.as_ref()) => {
@@ -573,11 +621,11 @@ where
                 );
                 tokio::time::sleep(delay).await;
                 delay = delay.saturating_mul(2);
+                attempt += 1;
             }
             Err(err) => return Err(err),
         }
     }
-    unreachable!("retry loop always returns before exhausting attempts")
 }
 
 async fn wait_for_successful_receipt<P>(provider: &P, tx_hash: B256, label: &str) -> CliResult<()>
@@ -625,4 +673,38 @@ fn is_retryable_rpc_error(err: &(dyn Error + 'static)) -> bool {
         current = err.source();
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hyperunit_proxy_errors_redact_credentials() {
+        let error = build_hyperunit_http(Some(
+            "http://user:proxy-secret@127.0.0.1:8080?token=secret".to_string(),
+        ))
+        .expect_err("unsupported scheme");
+        let rendered = error.to_string();
+
+        assert!(!rendered.contains("user"));
+        assert!(!rendered.contains("proxy-secret"));
+        assert!(!rendered.contains("token"));
+        assert!(!rendered.contains("secret"));
+        assert!(rendered.contains("redacted"));
+    }
+
+    #[test]
+    fn invalid_hyperunit_proxy_errors_do_not_echo_raw_value() {
+        let error = build_hyperunit_http(Some(
+            "http://user:proxy-secret@[::1?token=secret".to_string(),
+        ))
+        .expect_err("invalid URL");
+        let rendered = error.to_string();
+
+        assert!(!rendered.contains("user"));
+        assert!(!rendered.contains("proxy-secret"));
+        assert!(!rendered.contains("token"));
+        assert!(!rendered.contains("secret"));
+    }
 }

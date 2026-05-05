@@ -53,26 +53,36 @@ impl ProviderHealthRepository {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
-            INSERT INTO provider_health_checks (
-                provider,
-                status,
-                checked_at,
-                latency_ms,
-                http_status,
-                error,
-                updated_by,
-                updated_at
+            WITH upserted AS (
+                INSERT INTO provider_health_checks (
+                    provider,
+                    status,
+                    checked_at,
+                    latency_ms,
+                    http_status,
+                    error,
+                    updated_by,
+                    updated_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                ON CONFLICT (provider) DO UPDATE
+                SET status = EXCLUDED.status,
+                    checked_at = EXCLUDED.checked_at,
+                    latency_ms = EXCLUDED.latency_ms,
+                    http_status = EXCLUDED.http_status,
+                    error = EXCLUDED.error,
+                    updated_by = EXCLUDED.updated_by,
+                    updated_at = EXCLUDED.updated_at
+                WHERE provider_health_checks.checked_at <= EXCLUDED.checked_at
+                RETURNING {PROVIDER_HEALTH_SELECT_COLUMNS}
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-            ON CONFLICT (provider) DO UPDATE
-            SET status = EXCLUDED.status,
-                checked_at = EXCLUDED.checked_at,
-                latency_ms = EXCLUDED.latency_ms,
-                http_status = EXCLUDED.http_status,
-                error = EXCLUDED.error,
-                updated_by = EXCLUDED.updated_by,
-                updated_at = EXCLUDED.updated_at
-            RETURNING {PROVIDER_HEALTH_SELECT_COLUMNS}
+            SELECT {PROVIDER_HEALTH_SELECT_COLUMNS}
+            FROM upserted
+            UNION ALL
+            SELECT {PROVIDER_HEALTH_SELECT_COLUMNS}
+            FROM provider_health_checks
+            WHERE provider = $1
+              AND NOT EXISTS (SELECT 1 FROM upserted)
             "#
         ))
         .bind(&check.provider)

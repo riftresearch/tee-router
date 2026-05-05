@@ -28,9 +28,9 @@ use router_server::{
     app::{initialize_components, PaymasterMode},
     db::Database,
     models::{
-        CustodyVaultControlType, CustodyVaultRole, DepositVaultStatus, OrderExecutionStepType,
-        OrderProviderOperation, ProviderAddressRole, ProviderOperationStatus,
-        ProviderOperationType, RouterOrderEnvelope, RouterOrderQuoteEnvelope, RouterOrderStatus,
+        CustodyVaultControlType, DepositVaultStatus, OrderExecutionStepType,
+        OrderProviderOperation, ProviderOperationStatus, ProviderOperationType,
+        RouterOrderEnvelope, RouterOrderQuoteEnvelope, RouterOrderStatus,
     },
     protocol::{backend_chain_for_id, AssetId, ChainId},
     server::run_api,
@@ -60,6 +60,7 @@ const POSTGRES_USER: &str = "postgres";
 const POSTGRES_PASSWORD: &str = "password";
 const POSTGRES_DATABASE: &str = "postgres";
 const ROUTER_TEST_DATABASE_URL_ENV: &str = "ROUTER_TEST_DATABASE_URL";
+const ROUTER_DETECTOR_API_KEY: &str = "test-detector-secret-000000000000";
 const LIVE_RUNTIME_RUN_FLAG: &str = "ROUTER_LIVE_RUNTIME_E2E";
 const LIVE_SPEND_CONFIRM_ENV: &str = "ROUTER_LIVE_CONFIRM_SPEND";
 const LIVE_SPEND_CONFIRM_VALUE: &str = "I_UNDERSTAND_THIS_SPENDS_REAL_FUNDS";
@@ -97,6 +98,7 @@ const ROUTER_LIVE_WITHDRAW_RECIPIENT_ADDRESS_ENV: &str = "ROUTER_LIVE_WITHDRAW_R
 const ETHEREUM_TOKEN_INDEXER_URL_ENV: &str = "ETHEREUM_TOKEN_INDEXER_URL";
 const BASE_TOKEN_INDEXER_URL_ENV: &str = "BASE_TOKEN_INDEXER_URL";
 const ARBITRUM_TOKEN_INDEXER_URL_ENV: &str = "ARBITRUM_TOKEN_INDEXER_URL";
+const TOKEN_INDEXER_API_KEY_ENV: &str = "TOKEN_INDEXER_API_KEY";
 const LIVE_BASE_ETH_AMOUNT_WEI_ENV: &str = "ROUTER_LIVE_BASE_ETH_TO_BTC_AMOUNT_WEI";
 const LIVE_BASE_USDC_AMOUNT_ENV: &str = "ROUTER_LIVE_BASE_USDC_TO_BTC_AMOUNT";
 const LIVE_RECOVERY_DIR_ENV: &str = "ROUTER_LIVE_RECOVERY_DIR";
@@ -104,7 +106,7 @@ const DEFAULT_LIVE_ACROSS_API_URL: &str = "https://app.across.to/api";
 const DEFAULT_LIVE_HYPERUNIT_API_URL: &str = "https://api.hyperunit.xyz";
 const DEFAULT_LIVE_HYPERLIQUID_API_URL: &str = "https://api.hyperliquid.xyz";
 const DEFAULT_LIVE_BASE_FUNDING_RPC_URL: &str = "https://mainnet.base.org";
-const DEFAULT_LIVE_BASE_ETH_AMOUNT_WEI: &str = "30000000000000000";
+const DEFAULT_LIVE_BASE_ETH_AMOUNT_WEI: &str = "60000000000000000";
 const DEFAULT_LIVE_BASE_USDC_AMOUNT: &str = "60000000";
 const LIVE_TERMINAL_TIMEOUT: Duration = Duration::from_secs(45 * 60);
 const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
@@ -157,6 +159,7 @@ struct RuntimeTokenIndexerUrls {
     ethereum: Option<String>,
     base: Option<String>,
     arbitrum: Option<String>,
+    api_key: Option<String>,
 }
 
 struct TestPostgres {
@@ -202,6 +205,7 @@ struct LiveRuntimeConfig {
     ethereum_token_indexer_url: Option<String>,
     base_token_indexer_url: Option<String>,
     arbitrum_token_indexer_url: Option<String>,
+    token_indexer_api_key: Option<String>,
 }
 
 impl LiveRuntimeConfig {
@@ -256,6 +260,7 @@ impl LiveRuntimeConfig {
             ethereum_token_indexer_url: env_var_optional(ETHEREUM_TOKEN_INDEXER_URL_ENV),
             base_token_indexer_url: env_var_optional(BASE_TOKEN_INDEXER_URL_ENV),
             arbitrum_token_indexer_url: env_var_optional(ARBITRUM_TOKEN_INDEXER_URL_ENV),
+            token_indexer_api_key: env_var_optional(TOKEN_INDEXER_API_KEY_ENV),
         }
     }
 }
@@ -765,7 +770,16 @@ async fn test_postgres() -> TestPostgres {
         ))
         .with_env_var("POSTGRES_USER", POSTGRES_USER)
         .with_env_var("POSTGRES_PASSWORD", POSTGRES_PASSWORD)
-        .with_env_var("POSTGRES_DB", POSTGRES_DATABASE);
+        .with_env_var("POSTGRES_DB", POSTGRES_DATABASE)
+        .with_cmd([
+            "postgres",
+            "-c",
+            "wal_level=logical",
+            "-c",
+            "max_wal_senders=10",
+            "-c",
+            "max_replication_slots=10",
+        ]);
 
     let container = image.start().await.unwrap_or_else(|err| {
         panic!(
@@ -934,7 +948,8 @@ fn router_args(
         hyperliquid_account_address: None,
         hyperliquid_vault_address: None,
         hyperliquid_paymaster_private_key: Some(test_hyperliquid_paymaster_private_key()),
-        router_detector_api_key: Some("test-detector-secret".to_string()),
+        router_detector_api_key: Some(ROUTER_DETECTOR_API_KEY.to_string()),
+        router_gateway_api_key: None,
         router_admin_api_key: None,
         hyperliquid_network:
             router_server::services::custody_action_executor::HyperliquidCallNetwork::Mainnet,
@@ -1004,7 +1019,8 @@ fn live_router_args(
         hyperliquid_account_address: live.hyperliquid_account_address.clone(),
         hyperliquid_vault_address: live.hyperliquid_vault_address.clone(),
         hyperliquid_paymaster_private_key: None,
-        router_detector_api_key: Some("test-detector-secret".to_string()),
+        router_detector_api_key: Some(ROUTER_DETECTOR_API_KEY.to_string()),
+        router_gateway_api_key: None,
         router_admin_api_key: None,
         hyperliquid_network: live.hyperliquid_network,
         hyperliquid_order_timeout_ms: 30_000,
@@ -1025,23 +1041,23 @@ fn live_router_args(
 async fn spawn_sauron(
     devnet: &RiftDevnet,
     database_url: &str,
+    state_database_url: &str,
     router_base_url: &str,
-    chain_tokens: RuntimeChainTokens,
     token_indexer_urls: RuntimeTokenIndexerUrls,
 ) -> RuntimeTask {
     let args = SauronArgs {
         log_level: "warn".to_string(),
         router_replica_database_url: database_url.to_string(),
-        sauron_state_database_url: None,
-        sauron_replica_event_source: sauron::config::SauronReplicaEventSource::Notify,
+        sauron_state_database_url: state_database_url.to_string(),
+        sauron_replica_event_source: sauron::config::SauronReplicaEventSource::Cdc,
         router_replica_database_name: "router_db".to_string(),
-        router_replica_notification_channel: "sauron_watch_set_changed".to_string(),
         sauron_cdc_slot_name: "sauron_watch_cdc".to_string(),
-        sauron_cdc_plugin: "test_decoding".to_string(),
-        sauron_cdc_batch_size: 1000,
-        sauron_cdc_poll_interval_ms: 1000,
+        router_cdc_publication_name: "router_cdc_publication".to_string(),
+        router_cdc_message_prefix: "rift.router.change".to_string(),
+        sauron_cdc_status_interval_ms: 1000,
+        sauron_cdc_idle_wakeup_interval_ms: 10_000,
         router_internal_base_url: router_base_url.to_string(),
-        router_detector_api_key: "test-detector-secret".to_string(),
+        router_detector_api_key: ROUTER_DETECTOR_API_KEY.to_string(),
         electrum_http_server_url: devnet
             .bitcoin
             .esplora_url
@@ -1054,13 +1070,11 @@ async fn spawn_sauron(
         bitcoin_zmq_sequence_endpoint: devnet.bitcoin.zmq_sequence_endpoint.clone(),
         ethereum_mainnet_rpc_url: devnet.ethereum.anvil.endpoint_url().to_string(),
         ethereum_token_indexer_url: token_indexer_urls.ethereum,
-        ethereum_allowed_token: chain_tokens.ethereum_reference_token.to_string(),
         base_rpc_url: devnet.base.anvil.endpoint_url().to_string(),
         base_token_indexer_url: token_indexer_urls.base,
-        base_allowed_token: chain_tokens.base_reference_token.to_string(),
         arbitrum_rpc_url: devnet.arbitrum.anvil.endpoint_url().to_string(),
         arbitrum_token_indexer_url: token_indexer_urls.arbitrum,
-        arbitrum_allowed_token: chain_tokens.arbitrum_reference_token.to_string(),
+        token_indexer_api_key: token_indexer_urls.api_key,
         sauron_reconcile_interval_seconds: 2,
         sauron_bitcoin_scan_interval_seconds: 60,
         sauron_bitcoin_indexed_lookup_concurrency: 1,
@@ -1098,16 +1112,25 @@ fn token_indexer_urls_from_devnet(devnet: &RiftDevnet) -> RuntimeTokenIndexerUrl
             .token_indexer
             .as_ref()
             .map(|indexer| indexer.api_server_url.clone()),
+        api_key: [
+            devnet.ethereum.token_indexer.as_ref(),
+            devnet.base.token_indexer.as_ref(),
+            devnet.arbitrum.token_indexer.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|indexer| indexer.api_key.clone())
+        .next(),
     }
 }
 
 async fn spawn_live_sauron(
     database_url: &str,
+    state_database_url: &str,
     router_base_url: &str,
-    chain_tokens: RuntimeChainTokens,
     live: &LiveRuntimeConfig,
 ) -> RuntimeTask {
-    let args = live_sauron_args(database_url, router_base_url, chain_tokens, live);
+    let args = live_sauron_args(database_url, state_database_url, router_base_url, live);
     let handle = tokio::spawn(async move {
         run_sauron(args)
             .await
@@ -1125,23 +1148,23 @@ async fn spawn_live_sauron(
 
 fn live_sauron_args(
     database_url: &str,
+    state_database_url: &str,
     router_base_url: &str,
-    chain_tokens: RuntimeChainTokens,
     live: &LiveRuntimeConfig,
 ) -> SauronArgs {
     SauronArgs {
         log_level: "info".to_string(),
         router_replica_database_url: database_url.to_string(),
-        sauron_state_database_url: None,
-        sauron_replica_event_source: sauron::config::SauronReplicaEventSource::Notify,
+        sauron_state_database_url: state_database_url.to_string(),
+        sauron_replica_event_source: sauron::config::SauronReplicaEventSource::Cdc,
         router_replica_database_name: "router_db".to_string(),
-        router_replica_notification_channel: "sauron_watch_set_changed".to_string(),
         sauron_cdc_slot_name: "sauron_watch_cdc".to_string(),
-        sauron_cdc_plugin: "test_decoding".to_string(),
-        sauron_cdc_batch_size: 1000,
-        sauron_cdc_poll_interval_ms: 1000,
+        router_cdc_publication_name: "router_cdc_publication".to_string(),
+        router_cdc_message_prefix: "rift.router.change".to_string(),
+        sauron_cdc_status_interval_ms: 1000,
+        sauron_cdc_idle_wakeup_interval_ms: 10_000,
         router_internal_base_url: router_base_url.to_string(),
-        router_detector_api_key: "test-detector-secret".to_string(),
+        router_detector_api_key: ROUTER_DETECTOR_API_KEY.to_string(),
         electrum_http_server_url: live.electrum_http_server_url.clone(),
         bitcoin_rpc_url: live.bitcoin_rpc_url.clone(),
         bitcoin_rpc_auth: live.bitcoin_rpc_auth.clone(),
@@ -1149,13 +1172,11 @@ fn live_sauron_args(
         bitcoin_zmq_sequence_endpoint: live.bitcoin_zmq_sequence_endpoint.clone(),
         ethereum_mainnet_rpc_url: live.ethereum_rpc_url.clone(),
         ethereum_token_indexer_url: live.ethereum_token_indexer_url.clone(),
-        ethereum_allowed_token: chain_tokens.ethereum_reference_token.to_string(),
         base_rpc_url: live.base_rpc_url.clone(),
         base_token_indexer_url: live.base_token_indexer_url.clone(),
-        base_allowed_token: chain_tokens.base_reference_token.to_string(),
         arbitrum_rpc_url: live.arbitrum_rpc_url.clone(),
         arbitrum_token_indexer_url: live.arbitrum_token_indexer_url.clone(),
-        arbitrum_allowed_token: chain_tokens.arbitrum_reference_token.to_string(),
+        token_indexer_api_key: live.token_indexer_api_key.clone(),
         sauron_reconcile_interval_seconds: 30,
         sauron_bitcoin_scan_interval_seconds: 15,
         sauron_bitcoin_indexed_lookup_concurrency: 1,
@@ -1385,125 +1406,6 @@ async fn wait_for_terminal_order_status(
     .await
 }
 
-fn provider_ref(operation: &OrderProviderOperation) -> &str {
-    operation
-        .provider_ref
-        .as_deref()
-        .expect("provider operation should include provider_ref")
-}
-
-async fn unit_deposit_address(db: &Database, operation_id: Uuid) -> Address {
-    let address = db
-        .orders()
-        .get_provider_addresses_by_operation(operation_id)
-        .await
-        .expect("load provider addresses")
-        .into_iter()
-        .find(|address| address.role == ProviderAddressRole::UnitDeposit)
-        .expect("unit deposit address should exist");
-    Address::from_str(&address.address).expect("unit deposit address should be EVM address")
-}
-
-async fn unit_deposit_expected_amount(db: &Database, operation: &OrderProviderOperation) -> U256 {
-    let amount = if let Some(amount) = operation
-        .request
-        .get("expected_amount")
-        .and_then(Value::as_str)
-    {
-        amount.to_string()
-    } else if let Some(step_id) = operation.execution_step_id {
-        db.orders()
-            .get_execution_step(step_id)
-            .await
-            .expect("load unit deposit execution step")
-            .amount_in
-            .unwrap_or_else(|| "1000".to_string())
-    } else {
-        "1000".to_string()
-    };
-    U256::from_str_radix(&amount, 10).expect("unit deposit expected amount should parse")
-}
-
-fn hl_deposit_coin_for_operation(operation: &OrderProviderOperation) -> String {
-    let asset = operation
-        .request
-        .get("asset")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    match asset {
-        "btc" => "UBTC".to_string(),
-        "eth" => "UETH".to_string(),
-        other => panic!("unsupported UnitDeposit asset for HL credit: {other:?}"),
-    }
-}
-
-fn hl_destination_for_unit_deposit(operation: &OrderProviderOperation) -> Address {
-    let destination = operation
-        .request
-        .get("dst_addr")
-        .and_then(Value::as_str)
-        .expect("UnitDeposit operation request should include dst_addr");
-    Address::from_str(destination).expect("UnitDeposit dst_addr should be an EVM address")
-}
-
-fn raw_units_to_f64(amount: U256, decimals: u32) -> f64 {
-    amount.to_string().parse::<f64>().expect("amount fits f64") / 10f64.powi(decimals as i32)
-}
-
-async fn fund_destination_execution_vault_from_across(
-    devnet: &RiftDevnet,
-    db: &Database,
-    order_id: Uuid,
-) {
-    let destination_vault = db
-        .orders()
-        .get_custody_vaults(order_id)
-        .await
-        .expect("load custody vaults")
-        .into_iter()
-        .find(|vault| vault.role == CustodyVaultRole::DestinationExecution)
-        .expect("across step should create destination execution custody vault");
-    let across_operation = db
-        .orders()
-        .get_provider_operations(order_id)
-        .await
-        .expect("load provider operations")
-        .into_iter()
-        .find(|operation| operation.operation_type == ProviderOperationType::AcrossBridge)
-        .expect("across operation should exist");
-    let output_amount = across_operation
-        .response
-        .get("expectedOutputAmount")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|amount| U256::from_str_radix(amount, 10).ok())
-        .expect("across response should include expectedOutputAmount");
-    let gas_balance = U256::from(1_000_000_000_000_000_000_u128);
-    let address = Address::from_str(&destination_vault.address)
-        .expect("destination execution vault address should be EVM address");
-    let destination_devnet = match destination_vault.chain.as_str() {
-        "evm:1" => &devnet.ethereum,
-        "evm:8453" => &devnet.base,
-        "evm:42161" => &devnet.arbitrum,
-        other => panic!("unsupported destination execution chain {other}"),
-    };
-
-    match destination_vault.asset.as_ref().unwrap_or(&AssetId::Native) {
-        AssetId::Native => {
-            send_native(destination_devnet, address, output_amount + gas_balance).await;
-        }
-        AssetId::Reference(token_address) => {
-            send_native(destination_devnet, address, gas_balance).await;
-            mint_erc20(
-                destination_devnet,
-                token_address.parse().expect("destination token address"),
-                address,
-                output_amount,
-            )
-            .await;
-        }
-    }
-}
-
 async fn mint_erc20(
     devnet: &devnet::EthDevnet,
     token_address: Address,
@@ -1615,6 +1517,14 @@ async fn send_native(devnet: &devnet::EthDevnet, recipient: Address, amount: U25
     assert!(receipt.status(), "native transfer reverted");
 }
 
+async fn mine_evm_confirmation_block(devnet: &devnet::EthDevnet) {
+    let provider = ProviderBuilder::new().connect_http(devnet.anvil.endpoint_url());
+    provider
+        .anvil_mine(Some(1), None)
+        .await
+        .expect("mine evm confirmation block");
+}
+
 async fn send_live_native(
     rpc_url: &str,
     private_key: &str,
@@ -1704,6 +1614,13 @@ fn anvil_private_key(devnet: &devnet::EthDevnet) -> String {
     )
 }
 
+fn evm_address_from_private_key(private_key: &str) -> Address {
+    private_key
+        .parse::<PrivateKeySigner>()
+        .expect("valid EVM private key")
+        .address()
+}
+
 fn test_hyperliquid_paymaster_private_key() -> String {
     "0x59c6995e998f97a5a0044976f7ad0a7df4976fbe66f6cc18ff3c16f18a6b9e3f".to_string()
 }
@@ -1726,7 +1643,7 @@ fn valid_regtest_btc_address() -> String {
 
 fn route_amount_in(route: RuntimeRoute) -> &'static str {
     match route {
-        RuntimeRoute::BaseEthToBtc => "30000000000000000",
+        RuntimeRoute::BaseEthToBtc => "60000000000000000",
         RuntimeRoute::BaseUsdcToBtc => "60000000",
     }
 }
@@ -1812,14 +1729,35 @@ fn route_expected_hl_trade_steps(route: RuntimeRoute) -> usize {
 }
 
 async fn spawn_runtime_mocks(devnet: &RiftDevnet, route: RuntimeRoute) -> MockIntegratorServer {
-    let base_spoke_pool = format!(
-        "{:#x}",
-        devnet.base.mock_across_spoke_pool_contract.address()
-    );
-    let base_ws_url = devnet.base.anvil.ws_endpoint_url().to_string();
     let mut config = MockIntegratorConfig::default()
-        .with_across_spoke_pool_address(base_spoke_pool)
-        .with_across_evm_rpc_url(base_ws_url)
+        .with_across_chain(
+            1,
+            format!(
+                "{:#x}",
+                devnet.ethereum.mock_across_spoke_pool_contract.address()
+            ),
+            devnet.ethereum.anvil.ws_endpoint_url().to_string(),
+        )
+        .with_across_chain(
+            8453,
+            format!(
+                "{:#x}",
+                devnet.base.mock_across_spoke_pool_contract.address()
+            ),
+            devnet.base.anvil.ws_endpoint_url().to_string(),
+        )
+        .with_across_chain(
+            42161,
+            format!(
+                "{:#x}",
+                devnet.arbitrum.mock_across_spoke_pool_contract.address()
+            ),
+            devnet.arbitrum.anvil.ws_endpoint_url().to_string(),
+        )
+        .with_unit_evm_rpc_url(
+            hyperunit_client::UnitChain::Ethereum,
+            devnet.ethereum.anvil.endpoint(),
+        )
         .with_across_status_latency(Duration::from_secs(2))
         .with_mainnet_hyperliquid(true);
     if matches!(route, RuntimeRoute::BaseUsdcToBtc) {
@@ -1921,8 +1859,7 @@ async fn submit_order_request(
 async fn fund_source_vault(devnet: &RiftDevnet, route: RuntimeRoute, vault_address: Address) {
     match route {
         RuntimeRoute::BaseEthToBtc => {
-            let source_balance = U256::from_str_radix(route_amount_in(route), 10).unwrap()
-                + U256::from(1_000_000_000_000_000_000_u128);
+            let source_balance = U256::from_str_radix(route_amount_in(route), 10).unwrap();
             send_native(&devnet.base, vault_address, source_balance).await;
         }
         RuntimeRoute::BaseUsdcToBtc => {
@@ -1936,6 +1873,16 @@ async fn fund_source_vault(devnet: &RiftDevnet, route: RuntimeRoute, vault_addre
             .await;
         }
     }
+    mine_evm_confirmation_block(&devnet.base).await;
+}
+
+async fn base_native_balance(devnet: &RiftDevnet, address: Address) -> U256 {
+    devnet
+        .base
+        .funded_provider
+        .get_balance(address)
+        .await
+        .expect("read base native balance")
 }
 
 async fn fund_live_source_vault(
@@ -2043,8 +1990,8 @@ async fn live_sauron_evm_backend_cursor_contract() {
     let live = LiveRuntimeConfig::from_env();
     let args = live_sauron_args(
         "postgres://unused",
+        "postgres://unused-state",
         "http://127.0.0.1:9",
-        live_route_chain_tokens(RuntimeRoute::BaseEthToBtc),
         &live,
     );
 
@@ -2093,8 +2040,8 @@ async fn live_sauron_evm_backend_cursor_concurrency_contract() {
     let live = LiveRuntimeConfig::from_env();
     let args = live_sauron_args(
         "postgres://unused",
+        "postgres://unused-state",
         "http://127.0.0.1:9",
-        live_route_chain_tokens(RuntimeRoute::BaseEthToBtc),
         &live,
     );
 
@@ -2161,6 +2108,7 @@ async fn run_live_runtime_route(route: RuntimeRoute) {
 
     let postgres = test_postgres().await;
     let database_url = create_test_database(&postgres.admin_database_url).await;
+    let state_database_url = create_test_database(&postgres.admin_database_url).await;
     let config_dir = tempfile::tempdir().expect("router live config dir");
     let chain_tokens = live_route_chain_tokens(route);
     let args = live_router_args(config_dir.path(), database_url.clone(), chain_tokens, &live);
@@ -2189,7 +2137,8 @@ async fn run_live_runtime_route(route: RuntimeRoute) {
             .expect("live router worker loop should keep running until test aborts");
         }),
     };
-    let _sauron = spawn_live_sauron(&database_url, &router_base_url, chain_tokens, &live).await;
+    let _sauron =
+        spawn_live_sauron(&database_url, &state_database_url, &router_base_url, &live).await;
     let client = reqwest::Client::new();
 
     let amount_in = live_route_amount_in(route);
@@ -2341,6 +2290,7 @@ async fn run_live_runtime_route(route: RuntimeRoute) {
 async fn run_mock_runtime_route(route: RuntimeRoute) {
     let postgres = test_postgres().await;
     let database_url = create_test_database(&postgres.admin_database_url).await;
+    let state_database_url = create_test_database(&postgres.admin_database_url).await;
     let (devnet, _) = RiftDevnet::builder()
         .using_esplora(true)
         .using_token_indexer(database_url.clone())
@@ -2386,8 +2336,8 @@ async fn run_mock_runtime_route(route: RuntimeRoute) {
     let _sauron = spawn_sauron(
         &devnet,
         &database_url,
+        &state_database_url,
         &router_base_url,
-        chain_tokens,
         token_indexer_urls,
     )
     .await;
@@ -2430,7 +2380,28 @@ async fn run_mock_runtime_route(route: RuntimeRoute) {
 
     let funding_vault_address = Address::from_str(&funding_vault.deposit_vault_address)
         .expect("funding vault should be an EVM address");
+    assert_eq!(
+        base_native_balance(&devnet, funding_vault_address).await,
+        U256::ZERO,
+        "fresh source vault should not start with direct native gas padding"
+    );
     fund_source_vault(&devnet, route, funding_vault_address).await;
+    let funded_source_vault_native = base_native_balance(&devnet, funding_vault_address).await;
+    match route {
+        RuntimeRoute::BaseEthToBtc => assert_eq!(
+            funded_source_vault_native,
+            U256::from_str_radix(route_amount_in(route), 10).unwrap(),
+            "native source route should deposit only the quoted input; gas must come from the paymaster"
+        ),
+        RuntimeRoute::BaseUsdcToBtc => assert_eq!(
+            funded_source_vault_native,
+            U256::ZERO,
+            "ERC-20 source route should not receive native gas before worker execution"
+        ),
+    }
+    let base_paymaster_address = evm_address_from_private_key(&anvil_private_key(&devnet.base));
+    let base_paymaster_before_execution =
+        base_native_balance(&devnet, base_paymaster_address).await;
     wait_for_order_status(&db, order.order.id, RouterOrderStatus::Executing).await;
     let funded_vault = db
         .vaults()
@@ -2443,11 +2414,7 @@ async fn run_mock_runtime_route(route: RuntimeRoute) {
         RuntimeRoute::BaseEthToBtc => {
             let across_operation =
                 wait_for_operation(&db, order.order.id, ProviderOperationType::AcrossBridge).await;
-            assert_eq!(
-                across_operation.status,
-                ProviderOperationStatus::WaitingExternal
-            );
-            fund_destination_execution_vault_from_across(&devnet, &db, order.order.id).await;
+            assert_async_provider_operation_started(&across_operation);
             wait_for_operation_status(&db, across_operation.id, ProviderOperationStatus::Completed)
                 .await;
         }
@@ -2456,10 +2423,7 @@ async fn run_mock_runtime_route(route: RuntimeRoute) {
                 let cctp_operation =
                     wait_for_operation(&db, order.order.id, ProviderOperationType::CctpBridge)
                         .await;
-                assert_eq!(
-                    cctp_operation.status,
-                    ProviderOperationStatus::WaitingExternal
-                );
+                assert_async_provider_operation_started(&cctp_operation);
                 wait_for_operation_status(
                     &db,
                     cctp_operation.id,
@@ -2471,11 +2435,7 @@ async fn run_mock_runtime_route(route: RuntimeRoute) {
                 let across_operation =
                     wait_for_operation(&db, order.order.id, ProviderOperationType::AcrossBridge)
                         .await;
-                assert_eq!(
-                    across_operation.status,
-                    ProviderOperationStatus::WaitingExternal
-                );
-                fund_destination_execution_vault_from_across(&devnet, &db, order.order.id).await;
+                assert_async_provider_operation_started(&across_operation);
                 wait_for_operation_status(
                     &db,
                     across_operation.id,
@@ -2485,31 +2445,17 @@ async fn run_mock_runtime_route(route: RuntimeRoute) {
             }
         },
     }
+    assert_source_vault_received_paymaster_gas(
+        &devnet,
+        funding_vault_address,
+        base_paymaster_address,
+        base_paymaster_before_execution,
+    )
+    .await;
 
     if matches!(route, RuntimeRoute::BaseEthToBtc) {
         let unit_deposit_operation =
             wait_for_operation(&db, order.order.id, ProviderOperationType::UnitDeposit).await;
-        let unit_address = unit_deposit_address(&db, unit_deposit_operation.id).await;
-        let hl_vault_address = hl_destination_for_unit_deposit(&unit_deposit_operation);
-        let deposit_coin = hl_deposit_coin_for_operation(&unit_deposit_operation);
-        let unit_deposit_amount = unit_deposit_expected_amount(&db, &unit_deposit_operation).await;
-        let deposit_decimals = match deposit_coin.as_str() {
-            "UBTC" => 8,
-            "UETH" => 18,
-            other => panic!("unsupported UnitDeposit coin for mock HL credit: {other:?}"),
-        };
-        mocks
-            .credit_hyperliquid_balance(
-                hl_vault_address,
-                &deposit_coin,
-                raw_units_to_f64(unit_deposit_amount, deposit_decimals),
-            )
-            .await;
-        send_native(&devnet.ethereum, unit_address, unit_deposit_amount).await;
-        mocks
-            .complete_unit_operation(provider_ref(&unit_deposit_operation))
-            .await
-            .expect("complete mock Unit deposit operation");
         wait_for_operation_status(
             &db,
             unit_deposit_operation.id,
@@ -2529,10 +2475,6 @@ async fn run_mock_runtime_route(route: RuntimeRoute) {
 
     let unit_withdrawal_operation =
         wait_for_operation(&db, order.order.id, ProviderOperationType::UnitWithdrawal).await;
-    mocks
-        .complete_unit_operation(provider_ref(&unit_withdrawal_operation))
-        .await
-        .expect("complete mock Unit withdrawal operation");
     wait_for_operation_status(
         &db,
         unit_withdrawal_operation.id,
@@ -2547,6 +2489,7 @@ async fn run_mock_runtime_route(route: RuntimeRoute) {
         .await
         .expect("completed funding vault");
     assert_eq!(completed_vault.status, DepositVaultStatus::Completed);
+    assert_runtime_hints_were_sauron_driven(&database_url, order.order.id, funding_vault.id).await;
 
     let steps = db
         .orders()
@@ -2597,4 +2540,159 @@ async fn run_mock_runtime_route(route: RuntimeRoute) {
         usize::from(matches!(route, RuntimeRoute::BaseEthToBtc))
     );
     assert_eq!(withdrawal_ops.len(), 1);
+}
+
+async fn assert_source_vault_received_paymaster_gas(
+    devnet: &RiftDevnet,
+    funding_vault_address: Address,
+    paymaster_address: Address,
+    paymaster_before_execution: U256,
+) {
+    let source_vault_native = base_native_balance(devnet, funding_vault_address).await;
+    assert!(
+        source_vault_native > U256::ZERO,
+        "source vault should retain paymaster-provided native gas after the first EVM action"
+    );
+
+    let paymaster_after_execution = base_native_balance(devnet, paymaster_address).await;
+    assert!(
+        paymaster_after_execution < paymaster_before_execution,
+        "base paymaster balance should decrease when it tops up the source vault"
+    );
+}
+
+async fn assert_runtime_hints_were_sauron_driven(
+    database_url: &str,
+    order_id: Uuid,
+    funding_vault_id: Uuid,
+) {
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .min_connections(0)
+        .connect(database_url)
+        .await
+        .expect("connect to runtime route database for hint assertions");
+
+    let funding_hint_count = sqlx_core::query_scalar::query_scalar::<_, i64>(
+        r#"
+            SELECT COUNT(*)::bigint
+            FROM deposit_vault_funding_hints
+            WHERE vault_id = $1
+            "#,
+    )
+    .bind(funding_vault_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count funding hints");
+    assert!(
+        funding_hint_count > 0,
+        "runtime route should require Sauron to submit at least one funding hint"
+    );
+
+    let non_sauron_funding_hints = sqlx_core::query_scalar::query_scalar::<_, i64>(
+        r#"
+            SELECT COUNT(*)::bigint
+            FROM deposit_vault_funding_hints
+            WHERE vault_id = $1
+              AND source <> 'sauron'
+            "#,
+    )
+    .bind(funding_vault_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count non-Sauron funding hints");
+    assert_eq!(
+        non_sauron_funding_hints, 0,
+        "production-shaped runtime route should not insert funding hints from test helpers"
+    );
+
+    let processed_funding_hints = sqlx_core::query_scalar::query_scalar::<_, i64>(
+        r#"
+            SELECT COUNT(*)::bigint
+            FROM deposit_vault_funding_hints
+            WHERE vault_id = $1
+              AND source = 'sauron'
+              AND status = 'processed'
+            "#,
+    )
+    .bind(funding_vault_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count processed Sauron funding hints");
+    assert!(
+        processed_funding_hints > 0,
+        "runtime route should process the Sauron funding hint that advances the source vault"
+    );
+
+    let provider_hint_count = sqlx_core::query_scalar::query_scalar::<_, i64>(
+        r#"
+            SELECT COUNT(*)::bigint
+            FROM order_provider_operation_hints hints
+            JOIN order_provider_operations operations
+              ON operations.id = hints.provider_operation_id
+            WHERE operations.order_id = $1
+            "#,
+    )
+    .bind(order_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count provider operation hints");
+    assert!(
+        provider_hint_count > 0,
+        "runtime route should require Sauron to submit provider-operation hints"
+    );
+
+    let non_sauron_provider_hints = sqlx_core::query_scalar::query_scalar::<_, i64>(
+        r#"
+            SELECT COUNT(*)::bigint
+            FROM order_provider_operation_hints hints
+            JOIN order_provider_operations operations
+              ON operations.id = hints.provider_operation_id
+            WHERE operations.order_id = $1
+              AND hints.source NOT IN (
+                'sauron',
+                'sauron_provider_operation_observation'
+              )
+            "#,
+    )
+    .bind(order_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count non-Sauron provider operation hints");
+    assert_eq!(
+        non_sauron_provider_hints, 0,
+        "production-shaped runtime route should not insert provider-operation hints from test helpers"
+    );
+
+    let processed_provider_hints = sqlx_core::query_scalar::query_scalar::<_, i64>(
+        r#"
+            SELECT COUNT(*)::bigint
+            FROM order_provider_operation_hints hints
+            JOIN order_provider_operations operations
+              ON operations.id = hints.provider_operation_id
+            WHERE operations.order_id = $1
+              AND hints.status = 'processed'
+            "#,
+    )
+    .bind(order_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count processed provider operation hints");
+    assert!(
+        processed_provider_hints > 0,
+        "runtime route should process provider-operation hints emitted from Sauron"
+    );
+}
+
+fn assert_async_provider_operation_started(operation: &OrderProviderOperation) {
+    assert!(
+        matches!(
+            operation.status,
+            ProviderOperationStatus::Submitted
+                | ProviderOperationStatus::WaitingExternal
+                | ProviderOperationStatus::Completed
+        ),
+        "async provider operation should be submitted or externally observable, got {:?}",
+        operation.status
+    );
 }

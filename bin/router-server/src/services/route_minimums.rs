@@ -6,7 +6,9 @@ use crate::{
             ActionProviderRegistry, BridgeProvider, BridgeQuoteRequest, ExchangeProvider,
             ExchangeQuoteRequest, UnitProvider,
         },
-        asset_registry::{MarketOrderTransitionKind, TransitionPath},
+        asset_registry::{
+            AssetRegistry, CanonicalAsset, MarketOrderTransitionKind, TransitionPath,
+        },
     },
 };
 use alloy::primitives::U256;
@@ -21,6 +23,7 @@ const DEFAULT_TTL: Duration = Duration::from_secs(60);
 const OPERATIONAL_MULTIPLIER: u64 = 2;
 const UNIT_BTC_MINIMUM_SATS: u64 = 30_000;
 const UNIT_ETH_MINIMUM_WEI: u128 = 7_000_000_000_000_000;
+const STABLECOIN_MINIMUM_RAW: u64 = 1_000_000;
 const HYPERLIQUID_BRIDGE_MINIMUM_USDC: u64 = 5_000_000;
 const HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW: u64 = 1_000_000;
 const MAX_PATH_DEPTH: usize = 5;
@@ -40,6 +43,9 @@ pub enum RouteMinimumError {
 
     #[snafu(display("route minimum amount field {} was invalid: {}", field, raw))]
     InvalidAmount { field: &'static str, raw: String },
+
+    #[snafu(display("route minimum numeric overflow while computing {}", context))]
+    NumericOverflow { context: &'static str },
 }
 
 pub type RouteMinimumResult<T> = Result<T, RouteMinimumError>;
@@ -176,7 +182,10 @@ impl RouteMinimumService {
         recipient_address: &str,
         depositor_address: &str,
     ) -> RouteMinimumResult<RouteMinimumSnapshot> {
-        let output_floor = route_output_floor(destination_asset)?;
+        let output_floor = route_output_floor(
+            self.action_providers.asset_registry().as_ref(),
+            destination_asset,
+        )?;
         let mut paths = self
             .action_providers
             .asset_registry()
@@ -237,9 +246,11 @@ impl RouteMinimumService {
             }
         };
 
-        let operational_min_input = best
-            .hard_min_input
-            .saturating_mul(U256::from(self.operational_multiplier));
+        let operational_min_input = checked_mul_amount(
+            best.hard_min_input,
+            U256::from(self.operational_multiplier),
+            "operational input minimum",
+        )?;
         let now = Utc::now();
         let expires_at = now
             + chrono::Duration::from_std(self.ttl)
@@ -269,14 +280,6 @@ impl RouteMinimumService {
                 MarketOrderTransitionKind::UnitDeposit | MarketOrderTransitionKind::UnitWithdrawal
             )
         });
-        let requires_exchange = path.transitions.iter().any(|transition| {
-            matches!(
-                transition.kind,
-                MarketOrderTransitionKind::HyperliquidTrade
-                    | MarketOrderTransitionKind::UniversalRouterSwap
-            )
-        });
-
         let unit_candidates: Vec<Option<Arc<dyn UnitProvider>>> = if requires_unit {
             self.action_providers
                 .units()
@@ -292,47 +295,29 @@ impl RouteMinimumService {
             return Ok(None);
         }
 
-        let exchange_candidates: Vec<Option<Arc<dyn ExchangeProvider>>> = if requires_exchange {
-            self.action_providers
-                .exchanges()
-                .iter()
-                .filter(|exchange| exchange_path_compatible(exchange.id(), path))
-                .cloned()
-                .map(Some)
-                .collect()
-        } else {
-            vec![None]
-        };
-        if exchange_candidates.is_empty() {
-            return Ok(None);
-        }
-
         let mut best: Option<ComputedRouteMinimum> = None;
         let mut last_error: Option<RouteMinimumError> = None;
         for unit in &unit_candidates {
-            for exchange in &exchange_candidates {
-                match self
-                    .compose_transition_path_floor(
-                        path,
-                        output_floor,
-                        recipient_address,
-                        depositor_address,
-                        unit.as_deref(),
-                        exchange.as_deref(),
-                    )
-                    .await
-                {
-                    Ok(candidate) => {
-                        if best
-                            .as_ref()
-                            .map(|current| candidate.hard_min_input < current.hard_min_input)
-                            .unwrap_or(true)
-                        {
-                            best = Some(candidate);
-                        }
+            match self
+                .compose_transition_path_floor(
+                    path,
+                    output_floor,
+                    recipient_address,
+                    depositor_address,
+                    unit.as_deref(),
+                )
+                .await
+            {
+                Ok(candidate) => {
+                    if best
+                        .as_ref()
+                        .map(|current| candidate.hard_min_input < current.hard_min_input)
+                        .unwrap_or(true)
+                    {
+                        best = Some(candidate);
                     }
-                    Err(err) => last_error = Some(err),
                 }
+                Err(err) => last_error = Some(err),
             }
         }
 
@@ -350,7 +335,6 @@ impl RouteMinimumService {
         recipient_address: &str,
         depositor_address: &str,
         unit: Option<&dyn UnitProvider>,
-        exchange: Option<&dyn ExchangeProvider>,
     ) -> RouteMinimumResult<ComputedRouteMinimum> {
         let mut required_output = output_floor.to_string();
         let mut observed_legs = Vec::with_capacity(path.transitions.len());
@@ -376,13 +360,13 @@ impl RouteMinimumService {
                     }));
                 }
                 MarketOrderTransitionKind::HyperliquidTrade => {
-                    let exchange = exchange.ok_or_else(|| RouteMinimumError::Unsupported {
-                        reason: "exchange provider is required for hyperliquid trade".to_string(),
-                    })?;
+                    let exchange = self.exchange(transition.provider.as_str())?;
                     let exchange_quote = quote_exchange_exact_out(
-                        exchange,
+                        exchange.as_ref(),
                         &transition.input.asset,
                         &transition.output.asset,
+                        self.asset_decimals(&transition.input.asset),
+                        self.asset_decimals(&transition.output.asset),
                         &parse_u256("required_output", &required_output)?,
                         recipient_address,
                     )
@@ -403,18 +387,53 @@ impl RouteMinimumService {
                         && path.transitions[index - 1].kind
                             == MarketOrderTransitionKind::HyperliquidBridgeDeposit
                     {
-                        next_required = next_required.saturating_add(U256::from(
-                            HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW,
-                        ));
+                        next_required = checked_add_amount(
+                            next_required,
+                            U256::from(HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW),
+                            "hyperliquid spot-send gas reserve",
+                        )?;
                     }
                     required_output = next_required.to_string();
                 }
                 MarketOrderTransitionKind::UniversalRouterSwap => {
-                    return Err(RouteMinimumError::Unsupported {
-                        reason:
-                            "universal router route minimums require live token decimals and are computed at quote time"
-                                .to_string(),
-                    });
+                    let exchange = self.exchange(transition.provider.as_str())?;
+                    let input_decimals =
+                        self.asset_decimals(&transition.input.asset)
+                            .ok_or_else(|| RouteMinimumError::Unsupported {
+                                reason: format!(
+                                    "universal router route minimums require known input decimals for {} {}",
+                                    transition.input.asset.chain, transition.input.asset.asset
+                                ),
+                            })?;
+                    let output_decimals =
+                        self.asset_decimals(&transition.output.asset)
+                            .ok_or_else(|| RouteMinimumError::Unsupported {
+                                reason: format!(
+                                    "universal router route minimums require known output decimals for {} {}",
+                                    transition.output.asset.chain, transition.output.asset.asset
+                                ),
+                            })?;
+                    let exchange_quote = quote_exchange_exact_out(
+                        exchange.as_ref(),
+                        &transition.input.asset,
+                        &transition.output.asset,
+                        Some(input_decimals),
+                        Some(output_decimals),
+                        &parse_u256("required_output", &required_output)?,
+                        recipient_address,
+                    )
+                    .await?;
+                    observed_legs.push(transition_floor_leg_json(TransitionFloorLegSpec {
+                        transition_decl_id: &transition.id,
+                        transition_kind: transition.kind,
+                        provider: exchange.id(),
+                        input_asset: &transition.input.asset,
+                        output_asset: &transition.output.asset,
+                        amount_in: &exchange_quote.amount_in,
+                        amount_out: &exchange_quote.amount_out,
+                        raw: exchange_quote.provider_quote,
+                    }));
+                    required_output = exchange_quote.amount_in;
                 }
                 MarketOrderTransitionKind::AcrossBridge
                 | MarketOrderTransitionKind::CctpBridge
@@ -487,6 +506,21 @@ impl RouteMinimumService {
                 reason: format!("bridge provider {id:?} is not configured"),
             })
     }
+
+    fn exchange(&self, id: &str) -> RouteMinimumResult<Arc<dyn ExchangeProvider>> {
+        self.action_providers
+            .exchange(id)
+            .ok_or_else(|| RouteMinimumError::Unsupported {
+                reason: format!("exchange provider {id:?} is not configured"),
+            })
+    }
+
+    fn asset_decimals(&self, asset: &DepositAsset) -> Option<u8> {
+        self.action_providers
+            .asset_registry()
+            .chain_asset(asset)
+            .map(|entry| entry.decimals)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -500,6 +534,8 @@ async fn quote_exchange_exact_out(
     exchange: &dyn ExchangeProvider,
     input_asset: &DepositAsset,
     output_asset: &DepositAsset,
+    input_decimals: Option<u8>,
+    output_decimals: Option<u8>,
     amount_out: &U256,
     recipient_address: &str,
 ) -> RouteMinimumResult<crate::services::action_providers::ExchangeQuote> {
@@ -507,8 +543,8 @@ async fn quote_exchange_exact_out(
         .quote_trade(ExchangeQuoteRequest {
             input_asset: input_asset.clone(),
             output_asset: output_asset.clone(),
-            input_decimals: None,
-            output_decimals: None,
+            input_decimals,
+            output_decimals,
             order_kind: MarketOrderKind::ExactOut {
                 amount_out: amount_out.to_string(),
                 max_amount_in: exact_out_cap_for_asset(input_asset).to_string(),
@@ -570,16 +606,21 @@ async fn quote_bridge_exact_out(
         })
 }
 
-fn route_output_floor(destination_asset: &DepositAsset) -> RouteMinimumResult<U256> {
-    if destination_asset.chain.as_str() == "bitcoin" && destination_asset.asset.is_native() {
-        return Ok(U256::from(UNIT_BTC_MINIMUM_SATS));
+fn route_output_floor(
+    registry: &AssetRegistry,
+    destination_asset: &DepositAsset,
+) -> RouteMinimumResult<U256> {
+    match registry.canonical_for(destination_asset) {
+        Some(CanonicalAsset::Btc | CanonicalAsset::Cbbtc) => Ok(U256::from(UNIT_BTC_MINIMUM_SATS)),
+        Some(CanonicalAsset::Eth) => Ok(U256::from(UNIT_ETH_MINIMUM_WEI)),
+        Some(CanonicalAsset::Usdc | CanonicalAsset::Usdt) => Ok(U256::from(STABLECOIN_MINIMUM_RAW)),
+        Some(CanonicalAsset::Hype) | None => Err(RouteMinimumError::Unsupported {
+            reason: format!(
+                "no route output floor for {} {}",
+                destination_asset.chain, destination_asset.asset
+            ),
+        }),
     }
-    Err(RouteMinimumError::Unsupported {
-        reason: format!(
-            "no route output floor for {} {}",
-            destination_asset.chain, destination_asset.asset
-        ),
-    })
 }
 
 fn is_executable_transition_path(path: &TransitionPath) -> bool {
@@ -604,18 +645,6 @@ fn unit_path_compatible(unit: &dyn UnitProvider, path: &TransitionPath) -> bool 
             }
             MarketOrderTransitionKind::UnitWithdrawal => {
                 unit.supports_withdrawal(&transition.output.asset)
-            }
-            _ => true,
-        })
-}
-
-fn exchange_path_compatible(exchange_id: &str, path: &TransitionPath) -> bool {
-    path.transitions
-        .iter()
-        .all(|transition| match transition.kind {
-            MarketOrderTransitionKind::HyperliquidTrade
-            | MarketOrderTransitionKind::UniversalRouterSwap => {
-                transition.provider.as_str() == exchange_id
             }
             _ => true,
         })
@@ -654,7 +683,7 @@ fn transition_floor_leg_json(spec: TransitionFloorLegSpec<'_>) -> Value {
 fn unit_minimum_for_asset(asset: &DepositAsset) -> U256 {
     match (asset.chain.as_str(), &asset.asset) {
         ("bitcoin", AssetId::Native) => U256::from(UNIT_BTC_MINIMUM_SATS),
-        ("evm:1", AssetId::Native) => U256::from(UNIT_ETH_MINIMUM_WEI),
+        ("evm:1" | "evm:8453", AssetId::Native) => U256::from(UNIT_ETH_MINIMUM_WEI),
         _ => U256::ZERO,
     }
 }
@@ -664,9 +693,21 @@ fn exact_out_cap_for_asset(asset: &DepositAsset) -> &'static str {
         ("bitcoin", AssetId::Native) => "10000000000000",
         ("evm:1" | "evm:8453", AssetId::Native) => "1000000000000000000000",
         ("hyperliquid", AssetId::Native) => "1000000000000000",
+        ("hyperliquid", AssetId::Reference(symbol)) if symbol == "UETH" => "1000000000000000000000",
+        ("hyperliquid", AssetId::Reference(symbol)) if symbol == "UBTC" => "10000000000000",
         (_, AssetId::Reference(_)) => "1000000000000000",
         _ => "1000000000000000",
     }
+}
+
+fn checked_add_amount(left: U256, right: U256, context: &'static str) -> RouteMinimumResult<U256> {
+    left.checked_add(right)
+        .ok_or(RouteMinimumError::NumericOverflow { context })
+}
+
+fn checked_mul_amount(left: U256, right: U256, context: &'static str) -> RouteMinimumResult<U256> {
+    left.checked_mul(right)
+        .ok_or(RouteMinimumError::NumericOverflow { context })
 }
 
 fn parse_u256(field: &'static str, raw: &str) -> RouteMinimumResult<U256> {
@@ -674,4 +715,81 @@ fn parse_u256(field: &'static str, raw: &str) -> RouteMinimumResult<U256> {
         field,
         raw: raw.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::ChainId;
+
+    fn asset(chain: &str, asset: AssetId) -> DepositAsset {
+        DepositAsset {
+            chain: ChainId::parse(chain).unwrap(),
+            asset,
+        }
+    }
+
+    #[test]
+    fn exact_out_cap_uses_hyperliquid_venue_asset_decimals() {
+        assert_eq!(
+            exact_out_cap_for_asset(&asset("hyperliquid", AssetId::reference("UETH"))),
+            "1000000000000000000000"
+        );
+        assert_eq!(
+            exact_out_cap_for_asset(&asset("hyperliquid", AssetId::reference("UBTC"))),
+            "10000000000000"
+        );
+    }
+
+    #[test]
+    fn route_output_floor_supports_unit_native_assets() {
+        assert_eq!(
+            route_output_floor(
+                &AssetRegistry::default(),
+                &asset("bitcoin", AssetId::Native)
+            )
+            .unwrap(),
+            U256::from(UNIT_BTC_MINIMUM_SATS)
+        );
+        assert_eq!(
+            route_output_floor(&AssetRegistry::default(), &asset("evm:1", AssetId::Native))
+                .unwrap(),
+            U256::from(UNIT_ETH_MINIMUM_WEI)
+        );
+        assert_eq!(
+            route_output_floor(
+                &AssetRegistry::default(),
+                &asset("evm:8453", AssetId::Native)
+            )
+            .unwrap(),
+            U256::from(UNIT_ETH_MINIMUM_WEI)
+        );
+        assert_eq!(
+            route_output_floor(
+                &AssetRegistry::default(),
+                &asset(
+                    "evm:8453",
+                    AssetId::reference("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913")
+                )
+            )
+            .unwrap(),
+            U256::from(STABLECOIN_MINIMUM_RAW)
+        );
+    }
+
+    #[test]
+    fn route_minimum_amount_math_rejects_overflow() {
+        assert!(matches!(
+            checked_add_amount(
+                U256::MAX,
+                U256::from(1_u64),
+                "hyperliquid spot-send gas reserve"
+            ),
+            Err(RouteMinimumError::NumericOverflow { .. })
+        ));
+        assert!(matches!(
+            checked_mul_amount(U256::MAX, U256::from(2_u64), "operational input minimum"),
+            Err(RouteMinimumError::NumericOverflow { .. })
+        ));
+    }
 }

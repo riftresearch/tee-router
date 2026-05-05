@@ -3,9 +3,11 @@ resolver = "2"
 members = [
     "bin/api-key-gen",
     "bin/devnet-cli",
+    "bin/router-loadgen",
     "bin/rand-wallet",
     "bin/router-server",
     "bin/sauron",
+    "integration-tests",
     "crates/blockchain-utils",
     "crates/chainalysis-address-screener",
     "crates/devnet",
@@ -87,6 +89,8 @@ sqlx-core = { version = "=0.8.6", default-features = false, features = ["_rt-tok
 sqlx-postgres = { version = "=0.8.6", default-features = false, features = ["uuid", "chrono", "migrate", "json"] }
 bdk_wallet = "2.0.0"
 metrics = "0.23.1"
+pgwire-replication = "0.3.1"
+percent-encoding = "2.3"
 metrics-exporter-prometheus = { version = "0.15.3", default-features = false, features = ["http-listener"] }
 opentelemetry = { version = "0.31.0", default-features = false, features = ["trace", "logs"] }
 opentelemetry-appender-tracing = { version = "0.31.1", default-features = false, features = ["experimental_use_tracing_span_context"] }

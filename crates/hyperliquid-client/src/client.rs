@@ -7,10 +7,10 @@
 //! [`HyperliquidClient`] remains as a compatibility wrapper that composes the
 //! narrower clients and delegates to them.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt, time::Duration};
 
 use alloy::{
-    primitives::{Address, Signature},
+    primitives::{Address, Signature, B256},
     signers::local::PrivateKeySigner,
 };
 use reqwest::Client;
@@ -32,6 +32,8 @@ use crate::{
     meta::SpotMeta,
     signature::{sign_l1_action, sign_typed_data},
 };
+
+const HYPERLIQUID_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Mainnet / testnet routing affects both the L1 signing "source" byte AND
 /// which `hyperliquidChain` string user actions stamp. Bundled here so
@@ -106,7 +108,9 @@ impl HyperliquidInfoClient {
     /// called at least once before [`Self::asset_index`].
     pub async fn refresh_spot_meta(&mut self) -> Result<SpotMeta, Error> {
         let meta = self.fetch_spot_meta().await?;
-        self.coin_to_asset = meta.coin_to_asset_map();
+        self.coin_to_asset = meta
+            .coin_to_asset_map()
+            .map_err(|message| Error::InvalidSpotMeta { message })?;
         self.spot_meta = Some(meta.clone());
         Ok(meta)
     }
@@ -203,12 +207,23 @@ impl HyperliquidInfoClient {
 }
 
 /// Wallet-bound Hyperliquid `/exchange` client for provider-native actions.
-#[derive(Debug)]
 pub struct HyperliquidExchangeClient {
     http: HttpClient,
     wallet: PrivateKeySigner,
     vault_address: Option<Address>,
     network: Network,
+}
+
+impl fmt::Debug for HyperliquidExchangeClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HyperliquidExchangeClient")
+            .field("http", &self.http)
+            .field("wallet", &"redacted")
+            .field("wallet_address", &self.wallet.address())
+            .field("vault_address", &self.vault_address)
+            .field("network", &self.network)
+            .finish()
+    }
 }
 
 impl HyperliquidExchangeClient {
@@ -385,7 +400,7 @@ impl HyperliquidExchangeClient {
     }
 
     async fn post_l1_action(&self, action: &Actions) -> Result<serde_json::Value, Error> {
-        let timestamp = nonce_ms();
+        let timestamp = nonce_ms()?;
         let connection_id = action.hash(timestamp, self.vault_address)?;
         let signature = sign_l1_action(&self.wallet, connection_id, self.network.is_mainnet())?;
         let envelope = ExchangePayload {
@@ -394,7 +409,8 @@ impl HyperliquidExchangeClient {
             nonce: timestamp,
             vault_address: self.vault_address,
         };
-        self.post_exchange(&envelope).await
+        let response = self.post_exchange(&envelope).await?;
+        Ok(attach_exchange_hash(response, connection_id))
     }
 
     async fn post_exchange(&self, payload: &ExchangePayload) -> Result<serde_json::Value, Error> {
@@ -402,6 +418,15 @@ impl HyperliquidExchangeClient {
         let text = self.http.post_raw("/exchange", &body).await?;
         serde_json::from_str(&text).map_err(|source| Error::Json { source })
     }
+}
+
+fn attach_exchange_hash(mut response: serde_json::Value, connection_id: B256) -> serde_json::Value {
+    if let Some(object) = response.as_object_mut() {
+        object
+            .entry("hash")
+            .or_insert_with(|| serde_json::Value::String(format!("{connection_id:#x}")));
+    }
+    response
 }
 
 /// Small helper for Hyperliquid Bridge2 deposit construction. No wallet is
@@ -662,17 +687,49 @@ where
 }
 
 fn build_http(base_url: &str) -> Result<HttpClient, Error> {
-    let parsed = Url::parse(base_url).map_err(|source| Error::InvalidBaseUrl { source })?;
-    let normalized = parsed.as_str().trim_end_matches('/').to_string();
+    let normalized = normalize_base_url(base_url)?;
     let client = Client::builder()
         .use_rustls_tls()
+        .timeout(HYPERLIQUID_HTTP_TIMEOUT)
         .build()
         .map_err(|source| Error::HttpRequest { source })?;
     Ok(HttpClient::new(client, normalized))
 }
 
-fn nonce_ms() -> u64 {
-    utc::now().timestamp_millis().max(0) as u64
+fn normalize_base_url(base_url: &str) -> Result<String, Error> {
+    let parsed = Url::parse(base_url.trim()).map_err(|source| Error::InvalidBaseUrl { source })?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err(Error::UnsupportedBaseUrl {
+            reason: "expected http or https scheme".to_string(),
+        });
+    }
+    if parsed.host().is_none() {
+        return Err(Error::UnsupportedBaseUrl {
+            reason: "expected host".to_string(),
+        });
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(Error::UnsupportedBaseUrl {
+            reason: "credentials are not allowed".to_string(),
+        });
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(Error::UnsupportedBaseUrl {
+            reason: "query strings and fragments are not allowed".to_string(),
+        });
+    }
+    Ok(parsed.as_str().trim_end_matches('/').to_string())
+}
+
+fn nonce_ms() -> Result<u64, Error> {
+    nonce_ms_from_timestamp(utc::now().timestamp_millis())
+}
+
+fn nonce_ms_from_timestamp(timestamp_millis: i64) -> Result<u64, Error> {
+    u64::try_from(timestamp_millis).map_err(|_| Error::InvalidTimestamp {
+        context: "hyperliquid nonce",
+        message: "system clock is before Unix epoch".to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -690,9 +747,54 @@ mod tests {
     }
 
     #[test]
+    fn exchange_client_debug_redacts_wallet_private_key() {
+        let private_key = "0x59c6995e998f97a5a0044966f094538b292b05a59f7807f5d8f6ab1234d1f001";
+        let wallet = private_key
+            .parse::<PrivateKeySigner>()
+            .expect("private key");
+        let wallet_address = wallet.address();
+        let client = HyperliquidExchangeClient::new(
+            "http://localhost:3000",
+            wallet,
+            Some(Address::repeat_byte(0x22)),
+            Network::Testnet,
+        )
+        .expect("client");
+
+        let rendered = format!("{client:?}");
+
+        assert!(!rendered.contains("59c6995e998f97a5a0044966f094538b"));
+        assert!(rendered.contains("redacted"));
+        assert!(rendered.contains(&format!("{wallet_address:?}")));
+        assert!(rendered.contains("2222222222222222222222222222222222222222"));
+    }
+
+    #[test]
     fn info_construction_rejects_bad_urls() {
         let err = HyperliquidInfoClient::new("not a url").unwrap_err();
         assert!(matches!(err, Error::InvalidBaseUrl { .. }));
+    }
+
+    #[test]
+    fn construction_rejects_non_canonical_urls() {
+        for base_url in [
+            "ftp://api.hyperliquid.xyz",
+            "https://user:pass@api.hyperliquid.xyz",
+            "https://api.hyperliquid.xyz?token=secret",
+            "https://api.hyperliquid.xyz#fragment",
+        ] {
+            let err = HyperliquidInfoClient::new(base_url).unwrap_err();
+            assert!(matches!(err, Error::UnsupportedBaseUrl { .. }));
+        }
+    }
+
+    #[test]
+    fn nonce_ms_rejects_pre_epoch_timestamp() {
+        assert_eq!(nonce_ms_from_timestamp(0).unwrap(), 0);
+        assert!(matches!(
+            nonce_ms_from_timestamp(-1).unwrap_err(),
+            Error::InvalidTimestamp { context, .. } if context == "hyperliquid nonce"
+        ));
     }
 
     #[test]
@@ -723,5 +825,22 @@ mod tests {
         let client = HyperliquidBridgeClient::new(from, Network::Testnet);
         assert_eq!(client.from(), from);
         assert_eq!(client.bridge_address(), bridge::TESTNET_BRIDGE2_ADDRESS);
+    }
+
+    #[test]
+    fn attach_exchange_hash_adds_explorer_hash_without_touching_response() {
+        let connection_id = B256::repeat_byte(0x12);
+        let response = serde_json::json!({
+            "status": "ok",
+            "response": {
+                "type": "order"
+            }
+        });
+
+        let response = attach_exchange_hash(response, connection_id);
+
+        assert_eq!(response["status"], "ok");
+        assert_eq!(response["response"]["type"], "order");
+        assert_eq!(response["hash"], format!("{connection_id:#x}"));
     }
 }

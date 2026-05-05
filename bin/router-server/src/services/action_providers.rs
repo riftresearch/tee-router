@@ -7,19 +7,22 @@ use crate::{
             parse_optional_u256, AcrossClient, AcrossClientError, AcrossDepositStatusRequest,
             AcrossSwapApprovalRequest, AcrossTransaction,
         },
-        asset_registry::{AssetRegistry, ProviderAssetCapability, ProviderId},
+        asset_registry::{AssetRegistry, ProviderAsset, ProviderAssetCapability, ProviderId},
         custody_action_executor::{
             ChainCall, CustodyAction, CustodyActionReceipt, EvmCall, HyperliquidCall,
             HyperliquidCallNetwork, HyperliquidCallPayload,
         },
+        http_body::{read_limited_response_text, response_body_error_preview},
+        pricing::checked_pow10,
     },
 };
 use alloy::{
     hex,
-    primitives::{Address, Bytes, FixedBytes, U256},
+    primitives::{Address, Bytes, FixedBytes, U256, U512},
     sol,
     sol_types::{SolCall, SolEvent},
 };
+use bitcoin::Address as BitcoinAddress;
 use chrono::{DateTime, TimeZone, Utc};
 use hyperliquid_client::{
     actions::{Actions as HyperliquidActions, BulkOrder, Limit, Order, OrderRequest, Tif},
@@ -27,25 +30,29 @@ use hyperliquid_client::{
     client::Network as HyperliquidApiNetwork,
     info::{
         ClearinghouseState, L2BookSnapshot, L2Level, OrderStatusResponse, SpotClearinghouseState,
+        UserFill,
     },
-    meta::{SpotMeta, TokenInfo, SPOT_ASSET_INDEX_OFFSET},
+    meta::{spot_wire_asset_index, SpotMeta, TokenInfo},
     HttpClient as HyperliquidHttpClient,
 };
 use hyperunit_client::{
-    HyperUnitClient, UnitAsset, UnitChain, UnitGenerateAddressRequest, UnitOperation,
-    UnitOperationState, UnitOperationsRequest,
+    HyperUnitClient, UnitAsset, UnitChain, UnitGenerateAddressRequest, UnitGenerateAddressResponse,
+    UnitOperation, UnitOperationState, UnitOperationsRequest,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fmt,
     future::Future,
     pin::Pin,
     str::FromStr,
     sync::Arc,
+    time::Duration,
 };
 use tokio::sync::OnceCell;
+use url::Url;
 use uuid::Uuid;
 
 const ACROSS_INTEGRATOR_ID: &str = "rift-router";
@@ -54,6 +61,9 @@ const VELORA_DEFAULT_PARTNER: &str = "rift-router";
 const VELORA_NATIVE_TOKEN: &str = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 const VELORA_API_VERSION: &str = "6.2";
 const VELORA_DEFAULT_SLIPPAGE_BPS: u64 = 100;
+const VELORA_MAX_RESPONSE_BODY_BYTES: usize = 256 * 1024;
+const CCTP_MAX_RESPONSE_BODY_BYTES: usize = 256 * 1024;
+const PROVIDER_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const CCTP_TOKEN_MESSENGER_V2_ADDRESS: &str = "0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d";
 const CCTP_MESSAGE_TRANSMITTER_V2_ADDRESS: &str = "0x81D40F21F12A8F0E3252Bccb954D722d4c464B64";
 const MOCK_CCTP_TOKEN_MESSENGER_V2_ADDRESS: &str = "0xcccccccccccccccccccccccccccccccccccc0001";
@@ -469,24 +479,104 @@ pub struct ActionProviderRegistry {
     exchanges: Vec<Arc<dyn ExchangeProvider>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AcrossHttpProviderConfig {
     pub base_url: String,
     pub api_key: String,
     pub integrator_id: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CctpHttpProviderConfig {
     pub base_url: String,
     pub token_messenger_v2_address: String,
     pub message_transmitter_v2_address: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct VeloraHttpProviderConfig {
     pub base_url: String,
     pub partner: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct ActionProviderHttpOptions {
+    pub across: Option<AcrossHttpProviderConfig>,
+    pub cctp: Option<CctpHttpProviderConfig>,
+    pub hyperunit_base_url: Option<String>,
+    pub hyperunit_proxy_url: Option<String>,
+    pub hyperliquid_base_url: Option<String>,
+    pub velora: Option<VeloraHttpProviderConfig>,
+    pub hyperliquid_network: HyperliquidCallNetwork,
+    pub hyperliquid_order_timeout_ms: u64,
+}
+
+impl fmt::Debug for AcrossHttpProviderConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AcrossHttpProviderConfig")
+            .field("base_url", &redacted_url_for_debug(&self.base_url))
+            .field("api_key", &"<redacted>")
+            .field("integrator_id", &self.integrator_id)
+            .finish()
+    }
+}
+
+impl fmt::Debug for CctpHttpProviderConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CctpHttpProviderConfig")
+            .field("base_url", &redacted_url_for_debug(&self.base_url))
+            .field(
+                "token_messenger_v2_address",
+                &self.token_messenger_v2_address,
+            )
+            .field(
+                "message_transmitter_v2_address",
+                &self.message_transmitter_v2_address,
+            )
+            .finish()
+    }
+}
+
+impl fmt::Debug for VeloraHttpProviderConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VeloraHttpProviderConfig")
+            .field("base_url", &redacted_url_for_debug(&self.base_url))
+            .field("partner", &self.partner)
+            .finish()
+    }
+}
+
+impl fmt::Debug for ActionProviderHttpOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ActionProviderHttpOptions")
+            .field("across", &self.across)
+            .field("cctp", &self.cctp)
+            .field(
+                "hyperunit_base_url",
+                &self
+                    .hyperunit_base_url
+                    .as_deref()
+                    .map(redacted_url_for_debug),
+            )
+            .field(
+                "hyperunit_proxy_url",
+                &self.hyperunit_proxy_url.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "hyperliquid_base_url",
+                &self
+                    .hyperliquid_base_url
+                    .as_deref()
+                    .map(redacted_url_for_debug),
+            )
+            .field("velora", &self.velora)
+            .field("hyperliquid_network", &self.hyperliquid_network)
+            .field(
+                "hyperliquid_order_timeout_ms",
+                &self.hyperliquid_order_timeout_ms,
+            )
+            .finish()
+    }
 }
 
 impl VeloraHttpProviderConfig {
@@ -509,7 +599,6 @@ impl AcrossHttpProviderConfig {
     #[must_use]
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
         let api_key = api_key.into().trim().to_string();
-        assert!(!api_key.is_empty(), "Across API key must not be empty");
         Self {
             base_url: base_url.into(),
             api_key,
@@ -590,6 +679,10 @@ impl ActionProviderRegistry {
     }
 
     #[must_use]
+    #[allow(
+        clippy::expect_used,
+        reason = "mock_http is an integration-test fixture constructor; invalid mock URLs should fail the test immediately"
+    )]
     pub fn mock_http(base_url: impl Into<String>) -> Self {
         let base_url = base_url.into();
         Self::http_with_options(
@@ -636,7 +729,7 @@ impl ActionProviderRegistry {
         velora: Option<VeloraHttpProviderConfig>,
         hyperliquid_network: HyperliquidCallNetwork,
     ) -> Result<Self, String> {
-        Self::http_with_options_and_hyperliquid_timeout(
+        Self::http_from_options(ActionProviderHttpOptions {
             across,
             cctp,
             hyperunit_base_url,
@@ -644,24 +737,25 @@ impl ActionProviderRegistry {
             hyperliquid_base_url,
             velora,
             hyperliquid_network,
-            DEFAULT_HYPERLIQUID_ORDER_TIMEOUT_MS,
-        )
+            hyperliquid_order_timeout_ms: DEFAULT_HYPERLIQUID_ORDER_TIMEOUT_MS,
+        })
     }
 
-    pub fn http_with_options_and_hyperliquid_timeout(
-        across: Option<AcrossHttpProviderConfig>,
-        cctp: Option<CctpHttpProviderConfig>,
-        hyperunit_base_url: Option<String>,
-        hyperunit_proxy_url: Option<String>,
-        hyperliquid_base_url: Option<String>,
-        velora: Option<VeloraHttpProviderConfig>,
-        hyperliquid_network: HyperliquidCallNetwork,
-        hyperliquid_order_timeout_ms: u64,
-    ) -> Result<Self, String> {
+    pub fn http_from_options(options: ActionProviderHttpOptions) -> Result<Self, String> {
+        let ActionProviderHttpOptions {
+            across,
+            cctp,
+            hyperunit_base_url,
+            hyperunit_proxy_url,
+            hyperliquid_base_url,
+            velora,
+            hyperliquid_network,
+            hyperliquid_order_timeout_ms,
+        } = options;
         let asset_registry = Arc::new(AssetRegistry::default());
         let mut bridges = Vec::<Arc<dyn BridgeProvider>>::new();
         if let Some(config) = across {
-            let mut provider = AcrossProvider::new(config.base_url, config.api_key);
+            let mut provider = AcrossProvider::new(config.base_url, config.api_key)?;
             if let Some(integrator_id) = config.integrator_id {
                 provider = provider.with_integrator_id(integrator_id);
             }
@@ -680,16 +774,20 @@ impl ActionProviderRegistry {
                 base_url,
                 hyperliquid_network,
                 asset_registry.clone(),
-            )));
+            )?));
         }
         let hyperliquid_target_base_url = hyperliquid_base_url.clone();
         let units = hyperunit_base_url
             .map(|base_url| {
+                let hyperliquid_base_url = hyperliquid_target_base_url.clone().ok_or_else(|| {
+                    "hyperunit provider requires hyperliquid_base_url for Hyperliquid spot metadata"
+                        .to_string()
+                })?;
                 HyperUnitProvider::new(
                     base_url,
                     hyperunit_proxy_url.clone(),
                     asset_registry.clone(),
-                    hyperliquid_target_base_url.clone().unwrap_or_default(),
+                    hyperliquid_base_url,
                     hyperliquid_network,
                 )
                 .map(|provider| Arc::new(provider) as Arc<dyn UnitProvider>)
@@ -698,20 +796,21 @@ impl ActionProviderRegistry {
             .collect::<Result<Vec<_>, _>>()?;
         let mut exchanges: Vec<Arc<dyn ExchangeProvider>> = hyperliquid_base_url
             .map(|base_url| {
-                Arc::new(HyperliquidProvider::new(
+                HyperliquidProvider::new(
                     base_url,
                     hyperliquid_network,
                     asset_registry.clone(),
                     hyperliquid_order_timeout_ms,
-                )) as Arc<dyn ExchangeProvider>
+                )
+                .map(|provider| Arc::new(provider) as Arc<dyn ExchangeProvider>)
             })
             .into_iter()
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
         if let Some(config) = velora {
             exchanges.push(Arc::new(VeloraProvider::new(
                 config.base_url,
                 config.partner,
-            )));
+            )?));
         }
         Ok(Self::with_asset_registry(
             asset_registry,
@@ -775,12 +874,13 @@ pub struct AcrossProvider {
 }
 
 impl AcrossProvider {
-    #[must_use]
-    pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
-        Self {
-            client: AcrossClient::new(normalize_base_url(base_url), api_key),
+    pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Result<Self, String> {
+        let base_url = normalize_base_url(base_url)?;
+        Ok(Self {
+            client: AcrossClient::new(base_url, api_key)
+                .map_err(|err| format!("across client configuration failed: {err}"))?,
             integrator_id: ACROSS_INTEGRATOR_ID.to_string(),
-        }
+        })
     }
 
     #[must_use]
@@ -801,7 +901,7 @@ impl BridgeProvider for AcrossProvider {
     ) -> ProviderFuture<'a, Option<BridgeQuote>> {
         Box::pin(async move {
             let Some(across_request) =
-                build_across_swap_approval_request(&request, &self.integrator_id)
+                build_across_swap_approval_request(&request, &self.integrator_id)?
             else {
                 return Ok(None);
             };
@@ -914,10 +1014,14 @@ impl BridgeProvider for AcrossProvider {
             let mut actions: Vec<CustodyAction> = Vec::new();
             if let Some(approvals) = &response.approval_txns {
                 for approval in approvals {
-                    actions.push(across_tx_to_action(approval)?);
+                    actions.push(across_tx_to_action(
+                        approval,
+                        origin_chain_id,
+                        "approvalTxns",
+                    )?);
                 }
             }
-            actions.push(across_tx_to_action(&swap_tx)?);
+            actions.push(across_tx_to_action(&swap_tx, origin_chain_id, "swapTx")?);
 
             let response_json = serde_json::to_value(&response).map_err(|err| err.to_string())?;
             let operation_request = json!({
@@ -1065,7 +1169,24 @@ pub struct AcrossExecuteStepRequest {
     pub depositor_custody_vault_id: Uuid,
 }
 
-fn across_tx_to_action(tx: &AcrossTransaction) -> ProviderResult<CustodyAction> {
+fn across_tx_to_action(
+    tx: &AcrossTransaction,
+    expected_chain_id: u64,
+    response_field: &'static str,
+) -> ProviderResult<CustodyAction> {
+    match tx.chain_id {
+        Some(chain_id) if chain_id == expected_chain_id => {}
+        Some(chain_id) => {
+            return Err(format!(
+                "across {response_field} chainId {chain_id} does not match origin chain {expected_chain_id}"
+            ));
+        }
+        None => {
+            return Err(format!(
+                "across {response_field} response missing chainId; refusing to execute unscoped transaction"
+            ));
+        }
+    }
     let value = parse_optional_u256("value", &tx.value)
         .map_err(|err| format!("invalid across tx value: {err}"))?
         .unwrap_or(U256::ZERO);
@@ -1085,27 +1206,215 @@ fn map_deposit_status(raw: &str) -> ProviderOperationStatus {
     }
 }
 
+#[cfg(test)]
+mod across_action_tests {
+    use super::*;
+
+    fn across_tx(chain_id: Option<u64>) -> AcrossTransaction {
+        AcrossTransaction {
+            chain_id,
+            to: "0x1111111111111111111111111111111111111111".to_string(),
+            data: "0x".to_string(),
+            value: None,
+            gas: None,
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+        }
+    }
+
+    #[test]
+    fn across_tx_to_action_requires_matching_chain_id() {
+        let error =
+            across_tx_to_action(&across_tx(Some(8453)), 1, "swapTx").expect_err("wrong chain");
+
+        assert!(
+            error.contains("does not match origin chain"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn across_tx_to_action_rejects_missing_chain_id() {
+        let error =
+            across_tx_to_action(&across_tx(None), 1, "swapTx").expect_err("missing chain id");
+
+        assert!(
+            error.contains("missing chainId"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn across_tx_to_action_accepts_matching_chain_id() {
+        let action =
+            across_tx_to_action(&across_tx(Some(1)), 1, "swapTx").expect("matching chain id");
+
+        assert!(matches!(action, CustodyAction::Call(ChainCall::Evm(_))));
+    }
+}
+
+#[cfg(test)]
+mod velora_price_route_tests {
+    use super::*;
+
+    fn valid_price_route() -> Value {
+        json!({
+            "network": 8453,
+            "srcToken": "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "destToken": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+            "srcDecimals": 18,
+            "destDecimals": 6,
+            "srcAmount": "1000000000000000000",
+            "destAmount": "2500000000",
+            "tokenTransferProxy": "0x1111111111111111111111111111111111111111",
+        })
+    }
+
+    fn expectations<'a>(price_route: &'a Value) -> VeloraPriceRouteExpectations<'a> {
+        VeloraPriceRouteExpectations {
+            price_route,
+            network: 8453,
+            src_token: VELORA_NATIVE_TOKEN,
+            dest_token: "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+            src_decimals: 18,
+            dest_decimals: 6,
+            amount_in: "1000000000000000000",
+            amount_out: "2500000000",
+        }
+    }
+
+    fn native_base_asset() -> DepositAsset {
+        DepositAsset {
+            chain: ChainId::parse("evm:8453").unwrap(),
+            asset: AssetId::Native,
+        }
+    }
+
+    fn base_erc20_asset() -> DepositAsset {
+        DepositAsset {
+            chain: ChainId::parse("evm:8453").unwrap(),
+            asset: AssetId::reference("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
+        }
+    }
+
+    #[test]
+    fn velora_price_route_validation_accepts_matching_route() {
+        let price_route = valid_price_route();
+
+        validate_velora_price_route(expectations(&price_route)).expect("matching route");
+    }
+
+    #[test]
+    fn velora_price_route_validation_rejects_wrong_network() {
+        let mut price_route = valid_price_route();
+        set_json_value(&mut price_route, "network", json!(42161));
+
+        let error =
+            validate_velora_price_route(expectations(&price_route)).expect_err("wrong network");
+
+        assert!(error.contains("network"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn velora_price_route_validation_rejects_wrong_amount() {
+        let mut price_route = valid_price_route();
+        set_json_value(&mut price_route, "srcAmount", json!("1"));
+
+        let error =
+            validate_velora_price_route(expectations(&price_route)).expect_err("wrong amount");
+
+        assert!(error.contains("srcAmount"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn velora_transaction_value_requires_native_value_for_native_input() {
+        let transaction = json!({
+            "to": "0x1111111111111111111111111111111111111111",
+            "data": "0x",
+        });
+        let error = velora_transaction_value(&native_base_asset(), &transaction)
+            .expect_err("native input must carry value");
+
+        assert!(error.contains("missing value"), "unexpected error: {error}");
+
+        let transaction = json!({
+            "value": "0",
+        });
+        let error = velora_transaction_value(&native_base_asset(), &transaction)
+            .expect_err("native input value must be positive");
+
+        assert!(error.contains("zero value"), "unexpected error: {error}");
+
+        let transaction = json!({
+            "value": "1000000000000000000",
+        });
+        assert_eq!(
+            velora_transaction_value(&native_base_asset(), &transaction).unwrap(),
+            U256::from(1_000_000_000_000_000_000_u128)
+        );
+    }
+
+    #[test]
+    fn velora_transaction_value_rejects_native_value_for_erc20_input() {
+        let no_value = json!({});
+        assert_eq!(
+            velora_transaction_value(&base_erc20_asset(), &no_value).unwrap(),
+            U256::ZERO
+        );
+
+        let zero_value = json!({
+            "value": "0",
+        });
+        assert_eq!(
+            velora_transaction_value(&base_erc20_asset(), &zero_value).unwrap(),
+            U256::ZERO
+        );
+
+        let unexpected_value = json!({
+            "value": "1",
+        });
+        let error = velora_transaction_value(&base_erc20_asset(), &unexpected_value)
+            .expect_err("ERC-20 input must not request native value");
+
+        assert!(
+            error.contains("unexpected native value"),
+            "unexpected error: {error}"
+        );
+    }
+}
+
 fn build_across_swap_approval_request(
     request: &BridgeQuoteRequest,
     integrator_id: &str,
-) -> Option<AcrossSwapApprovalRequest> {
-    let origin_chain_id = request.source_asset.chain.evm_chain_id()?;
-    let destination_chain_id = request.destination_asset.chain.evm_chain_id()?;
-    let input_token = evm_token_address(&request.source_asset.asset)?;
-    let output_token = evm_token_address(&request.destination_asset.asset)?;
-    let depositor = Address::from_str(&request.depositor_address).ok()?;
+) -> ProviderResult<Option<AcrossSwapApprovalRequest>> {
+    let Some(origin_chain_id) = request.source_asset.chain.evm_chain_id() else {
+        return Ok(None);
+    };
+    let Some(destination_chain_id) = request.destination_asset.chain.evm_chain_id() else {
+        return Ok(None);
+    };
+    let Some(input_token) = evm_token_address(&request.source_asset.asset) else {
+        return Ok(None);
+    };
+    let Some(output_token) = evm_token_address(&request.destination_asset.asset) else {
+        return Ok(None);
+    };
+    let depositor = Address::from_str(&request.depositor_address)
+        .map_err(|err| format!("across quote: invalid depositor_address: {err}"))?;
     let refund_address = depositor;
     let (trade_type, amount) = match &request.order_kind {
         MarketOrderKind::ExactIn { amount_in, .. } => (
             "exactInput".to_string(),
-            U256::from_str_radix(amount_in, 10).ok()?,
+            U256::from_str_radix(amount_in, 10)
+                .map_err(|err| format!("across quote: invalid amount_in {amount_in}: {err}"))?,
         ),
         MarketOrderKind::ExactOut { amount_out, .. } => (
             "exactOutput".to_string(),
-            U256::from_str_radix(amount_out, 10).ok()?,
+            U256::from_str_radix(amount_out, 10)
+                .map_err(|err| format!("across quote: invalid amount_out {amount_out}: {err}"))?,
         ),
     };
-    Some(AcrossSwapApprovalRequest {
+    Ok(Some(AcrossSwapApprovalRequest {
         trade_type,
         origin_chain_id,
         destination_chain_id,
@@ -1120,7 +1429,7 @@ fn build_across_swap_approval_request(
         integrator_id: integrator_id.to_string(),
         slippage: None,
         extra_query: BTreeMap::new(),
-    })
+    }))
 }
 
 fn evm_token_address(asset: &AssetId) -> Option<Address> {
@@ -1154,9 +1463,9 @@ impl HyperUnitProvider {
         hyperliquid_base_url: impl Into<String>,
         hyperliquid_network: HyperliquidCallNetwork,
     ) -> Result<Self, String> {
-        let hyperliquid_base_url = normalize_base_url(hyperliquid_base_url);
+        let hyperliquid_base_url = normalize_base_url(hyperliquid_base_url)?;
         let hyperliquid_http =
-            HyperliquidHttpClient::new(rustls_http_client(), hyperliquid_base_url.clone());
+            HyperliquidHttpClient::new(rustls_http_client()?, hyperliquid_base_url.clone());
         let client = HyperUnitClient::new_with_proxy_url(base_url, proxy_url)
             .map_err(|err| format!("hyperunit client configuration failed: {err}"))?;
         Ok(Self {
@@ -1307,7 +1616,8 @@ impl UnitProvider for HyperUnitProvider {
                 .await
                 .map_err(|err| format!("hyperunit /gen failed: {err}"))?;
 
-            let protocol_address = gen_response.address.clone();
+            let protocol_address =
+                validated_unit_generate_address(&gen_response, src_unit_chain, "deposit")?;
             let gen_response_json = serde_json::to_value(&gen_response)
                 .map_err(|err| format!("serialize hyperunit /gen response: {err}"))?;
 
@@ -1365,12 +1675,20 @@ impl UnitProvider for HyperUnitProvider {
                 chain: dst_chain_id.clone(),
                 asset: dest_asset_id,
             };
+            let input_chain_id = ChainId::parse(&step.input_chain_id)
+                .map_err(|err| format!("invalid input_chain_id: {err}"))?;
+            let input_asset_id = AssetId::parse(&step.input_asset)
+                .map_err(|err| format!("invalid input_asset: {err}"))?;
+            let hyperliquid_asset = DepositAsset {
+                chain: input_chain_id,
+                asset: input_asset_id,
+            };
 
             let dst_unit_chain = self.resolve_unit_chain(&dst_chain_id)?;
             let unit_asset = self
                 .resolve_unit_asset(&destination_asset, ProviderAssetCapability::UnitWithdrawal)?;
             let (hl_symbol, hl_decimals) = self.resolve_hl_spot_token(
-                &destination_asset,
+                &hyperliquid_asset,
                 ProviderAssetCapability::ExchangeInput,
             )?;
             let hl_token = self
@@ -1416,7 +1734,11 @@ impl UnitProvider for HyperUnitProvider {
                 .await
                 .map_err(|err| format!("hyperunit /gen failed: {err}"))?;
 
-            let protocol_address = gen_response.address.clone();
+            let protocol_address = validated_unit_generate_address(
+                &gen_response,
+                UnitChain::Hyperliquid,
+                "withdrawal",
+            )?;
             let gen_response_json = serde_json::to_value(&gen_response)
                 .map_err(|err| format!("serialize hyperunit /gen response: {err}"))?;
             let operations_before_by_protocol = self
@@ -1545,11 +1867,11 @@ impl UnitProvider for HyperUnitProvider {
                 .await
                 .map_err(|err| format!("hyperunit /operations failed: {err}"))?;
 
+            let seen_operation_fingerprints =
+                seen_operation_fingerprints_from_request(&request.request)?;
             let matched = response.operations.iter().find(|op| {
                 op.matches_protocol_address(protocol_address)
-                    && !op.has_seen_fingerprint(&seen_operation_fingerprints_from_request(
-                        &request.request,
-                    ))
+                    && !op.has_seen_fingerprint(&seen_operation_fingerprints)
             });
 
             let Some(op) = matched else {
@@ -1600,6 +1922,83 @@ fn observed_unit_operation_fingerprints(
         .collect()
 }
 
+fn validated_unit_generate_address(
+    response: &UnitGenerateAddressResponse,
+    chain: UnitChain,
+    context: &'static str,
+) -> ProviderResult<String> {
+    match response.status.as_deref() {
+        Some("OK") => {}
+        Some(status) => {
+            return Err(format!(
+                "hyperunit {context}: /gen returned non-OK status {status:?}"
+            ));
+        }
+        None => {
+            return Err(format!("hyperunit {context}: /gen response missing status"));
+        }
+    }
+    validate_unit_generate_address_signatures(response, context)?;
+
+    let address = response.address.trim();
+    if address != response.address {
+        return Err(format!(
+            "hyperunit {context}: /gen returned address with surrounding whitespace"
+        ));
+    }
+    validate_unit_protocol_address(chain, address, context)?;
+    Ok(address.to_string())
+}
+
+fn validate_unit_generate_address_signatures(
+    response: &UnitGenerateAddressResponse,
+    context: &'static str,
+) -> ProviderResult<()> {
+    let Some(signatures) = response.signatures.as_object() else {
+        return Err(format!(
+            "hyperunit {context}: /gen response missing guardian signatures"
+        ));
+    };
+    let mut nonempty_signatures = 0;
+    for (guardian, value) in signatures {
+        let signature = value.as_str().ok_or_else(|| {
+            format!("hyperunit {context}: /gen guardian signature {guardian:?} must be a string")
+        })?;
+        if signature.trim().is_empty() {
+            return Err(format!(
+                "hyperunit {context}: /gen guardian signature {guardian:?} must be non-empty"
+            ));
+        }
+        nonempty_signatures += 1;
+    }
+    if nonempty_signatures < 2 {
+        return Err(format!(
+            "hyperunit {context}: /gen response has insufficient guardian signatures"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_unit_protocol_address(
+    chain: UnitChain,
+    address: &str,
+    context: &'static str,
+) -> ProviderResult<()> {
+    match chain {
+        UnitChain::Bitcoin => BitcoinAddress::from_str(address)
+            .map(|_| ())
+            .map_err(|err| format!("hyperunit {context}: invalid bitcoin protocol address: {err}")),
+        UnitChain::Ethereum | UnitChain::Base | UnitChain::Hyperliquid => {
+            Address::from_str(address)
+                .map(|_| ())
+                .map_err(|err| format!("hyperunit {context}: invalid EVM protocol address: {err}"))
+        }
+        _ => Err(format!(
+            "hyperunit {context}: unsupported protocol address chain {chain}"
+        )),
+    }
+}
+
 fn unit_operation_provider_status(op: &UnitOperation) -> ProviderOperationStatus {
     match op.classified_state() {
         UnitOperationState::Done => ProviderOperationStatus::Completed,
@@ -1620,15 +2019,26 @@ fn unit_operation_has_destination_tx(op: &UnitOperation) -> bool {
         .is_some_and(|tx_hash| !tx_hash.trim().is_empty())
 }
 
-fn seen_operation_fingerprints_from_request(request: &Value) -> BTreeSet<String> {
-    request
-        .get("seen_operation_fingerprints")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(str::to_string)
-        .collect()
+fn seen_operation_fingerprints_from_request(request: &Value) -> ProviderResult<BTreeSet<String>> {
+    let Some(value) = request.get("seen_operation_fingerprints") else {
+        return Ok(BTreeSet::new());
+    };
+    let values = value.as_array().ok_or_else(|| {
+        "hyperunit observe: seen_operation_fingerprints must be an array".to_string()
+    })?;
+    let mut fingerprints = BTreeSet::new();
+    for (index, value) in values.iter().enumerate() {
+        let fingerprint = value.as_str().ok_or_else(|| {
+            format!("hyperunit observe: seen_operation_fingerprints[{index}] must be a string")
+        })?;
+        if fingerprint.trim().is_empty() {
+            return Err(format!(
+                "hyperunit observe: seen_operation_fingerprints[{index}] must be non-empty"
+            ));
+        }
+        fingerprints.insert(fingerprint.to_string());
+    }
+    Ok(fingerprints)
 }
 
 #[derive(Clone)]
@@ -1642,20 +2052,19 @@ pub struct HyperliquidBridgeProvider {
 const HYPERLIQUID_BRIDGE_WITHDRAW_FEE_RAW: u64 = 1_000_000;
 
 impl HyperliquidBridgeProvider {
-    #[must_use]
     pub fn new(
         base_url: impl Into<String>,
         network: HyperliquidCallNetwork,
         asset_registry: Arc<AssetRegistry>,
-    ) -> Self {
-        let target_base_url = normalize_base_url(base_url);
-        let http = HyperliquidHttpClient::new(rustls_http_client(), target_base_url.clone());
-        Self {
+    ) -> Result<Self, String> {
+        let target_base_url = normalize_base_url(base_url)?;
+        let http = HyperliquidHttpClient::new(rustls_http_client()?, target_base_url.clone());
+        Ok(Self {
             network,
             asset_registry,
             http,
             target_base_url,
-        }
+        })
     }
 
     fn resolve_bridge_input(&self, asset: &DepositAsset) -> ProviderResult<u8> {
@@ -1816,10 +2225,10 @@ impl BridgeProvider for HyperliquidBridgeProvider {
                         if amount_raw <= fee {
                             return Ok(None);
                         }
-                        (
-                            amount_in.clone(),
-                            amount_raw.saturating_sub(fee).to_string(),
-                        )
+                        let amount_out = amount_raw.checked_sub(fee).ok_or_else(|| {
+                            "hyperliquid bridge withdrawal fee exceeded input".to_string()
+                        })?;
+                        (amount_in.clone(), amount_out.to_string())
                     } else {
                         (amount_in.clone(), amount_in.clone())
                     }
@@ -1828,12 +2237,13 @@ impl BridgeProvider for HyperliquidBridgeProvider {
                     let amount_raw = U256::from_str_radix(amount_out, 10)
                         .map_err(|err| format!("invalid amount: {err}"))?;
                     if is_withdrawal {
-                        (
-                            amount_raw
-                                .saturating_add(U256::from(HYPERLIQUID_BRIDGE_WITHDRAW_FEE_RAW))
-                                .to_string(),
-                            amount_out.clone(),
-                        )
+                        let amount_in = amount_raw
+                            .checked_add(U256::from(HYPERLIQUID_BRIDGE_WITHDRAW_FEE_RAW))
+                            .ok_or_else(|| {
+                                "hyperliquid bridge withdrawal amount plus fee overflowed"
+                                    .to_string()
+                            })?;
+                        (amount_in.to_string(), amount_out.clone())
                     } else {
                         (amount_out.clone(), amount_out.clone())
                     }
@@ -1902,7 +2312,9 @@ impl BridgeProvider for HyperliquidBridgeProvider {
             let before_state = self.clearinghouse_state(&hyperliquid_user).await?;
             let before_withdrawable_raw =
                 parse_decimal_to_raw_units(&before_state.withdrawable, decimals)?;
-            let expected_withdrawable_raw = before_withdrawable_raw + amount_raw;
+            let expected_withdrawable_raw = before_withdrawable_raw
+                .checked_add(amount_raw)
+                .ok_or_else(|| "hyperliquid bridge expected withdrawable overflowed".to_string())?;
             let bridge_address = format!(
                 "{:#x}",
                 hyperliquid_bridge_address(hyperliquid_api_network(self.network))
@@ -1960,7 +2372,7 @@ impl BridgeProvider for HyperliquidBridgeProvider {
                     observed_state: Some(json!({
                         "withdraw_tx_hash": receipt.tx_hash,
                     })),
-                    status: Some(ProviderOperationStatus::Completed),
+                    status: Some(ProviderOperationStatus::WaitingExternal),
                     ..ProviderExecutionStatePatch::default()
                 });
             }
@@ -1983,7 +2395,9 @@ impl BridgeProvider for HyperliquidBridgeProvider {
                 return Ok(Some(ProviderOperationObservation {
                     status: ProviderOperationStatus::Completed,
                     provider_ref: request.provider_ref.clone(),
-                    observed_state: request.observed_state.clone(),
+                    observed_state: json!({
+                        "withdraw_tx_hash": request.provider_ref.clone(),
+                    }),
                     response: Some(request.response.clone()),
                     tx_hash: request.provider_ref.clone(),
                     error: None,
@@ -2018,6 +2432,15 @@ impl BridgeProvider for HyperliquidBridgeProvider {
             } else {
                 ProviderOperationStatus::WaitingExternal
             };
+            let response = if status == ProviderOperationStatus::Completed {
+                Some(hyperliquid_bridge_deposit_completion_response(
+                    &request,
+                    &state,
+                    observed_withdrawable_raw,
+                )?)
+            } else {
+                None
+            };
 
             Ok(Some(ProviderOperationObservation {
                 status,
@@ -2027,7 +2450,7 @@ impl BridgeProvider for HyperliquidBridgeProvider {
                     "observed_withdrawable_raw": observed_withdrawable_raw.to_string(),
                     "expected_withdrawable_raw": expected_withdrawable_raw.to_string(),
                 }),
-                response: None,
+                response,
                 tx_hash: request
                     .observed_state
                     .get("deposit_tx_hash")
@@ -2037,6 +2460,66 @@ impl BridgeProvider for HyperliquidBridgeProvider {
             }))
         })
     }
+}
+
+fn hyperliquid_bridge_deposit_completion_response(
+    request: &ProviderOperationObservationRequest,
+    state: &ClearinghouseState,
+    observed_withdrawable_raw: U256,
+) -> ProviderResult<Value> {
+    let amount = request
+        .request
+        .get("amount")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "hyperliquid bridge observe: request missing amount".to_string())?;
+    let amount_raw = U256::from_str_radix(amount, 10)
+        .map_err(|err| format!("hyperliquid bridge observe: invalid amount: {err}"))?;
+    let before_withdrawable_raw = request
+        .request
+        .get("before_withdrawable_raw")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            "hyperliquid bridge observe: request missing before_withdrawable_raw".to_string()
+        })
+        .and_then(|raw| {
+            U256::from_str_radix(raw, 10).map_err(|err| {
+                format!("hyperliquid bridge observe: invalid before_withdrawable_raw: {err}")
+            })
+        })?;
+    let expected_withdrawable_raw = request
+        .request
+        .get("expected_withdrawable_raw")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            "hyperliquid bridge observe: request missing expected_withdrawable_raw".to_string()
+        })
+        .and_then(|raw| {
+            U256::from_str_radix(raw, 10).map_err(|err| {
+                format!("hyperliquid bridge observe: invalid expected_withdrawable_raw: {err}")
+            })
+        })?;
+    let observed_delta_raw = observed_withdrawable_raw
+        .checked_sub(before_withdrawable_raw)
+        .ok_or_else(|| {
+            "hyperliquid bridge observe: observed withdrawable went backwards".to_string()
+        })?;
+    let before_clearinghouse_state = request
+        .response
+        .get("before_clearinghouse_state")
+        .cloned()
+        .unwrap_or(Value::Null);
+
+    Ok(json!({
+        "kind": "hyperliquid_bridge_deposit",
+        "amount_in": amount_raw.to_string(),
+        "amount_out": amount_raw.to_string(),
+        "before_withdrawable_raw": before_withdrawable_raw.to_string(),
+        "expected_withdrawable_raw": expected_withdrawable_raw.to_string(),
+        "observed_withdrawable_raw": observed_withdrawable_raw.to_string(),
+        "observed_withdrawable_delta_raw": observed_delta_raw.to_string(),
+        "before_clearinghouse_state": before_clearinghouse_state,
+        "clearinghouse_state": state,
+    }))
 }
 
 #[derive(Clone)]
@@ -2061,8 +2544,8 @@ impl CctpProvider {
             Address::from_str(message_transmitter_v2_address.as_ref())
                 .map_err(|err| format!("invalid CCTP MessageTransmitterV2 address: {err}"))?;
         Ok(Self {
-            base_url: normalize_base_url(base_url),
-            http: rustls_http_client(),
+            base_url: normalize_base_url(base_url)?,
+            http: rustls_http_client()?,
             asset_registry,
             token_messenger_v2_address,
             message_transmitter_v2_address,
@@ -2073,39 +2556,45 @@ impl CctpProvider {
         &self,
         source: &DepositAsset,
         destination: &DepositAsset,
-    ) -> Option<CctpBridgeAssets> {
+    ) -> ProviderResult<Option<CctpBridgeAssets>> {
         if source == destination {
-            return None;
+            return Ok(None);
         }
         if source.chain.evm_chain_id().is_none() || destination.chain.evm_chain_id().is_none() {
-            return None;
+            return Ok(None);
         }
         if !self
             .asset_registry
             .canonical_assets_match(source, destination)
         {
-            return None;
+            return Ok(None);
         }
-        let input = self.asset_registry.provider_asset(
+        let Some(input) = self.asset_registry.provider_asset(
             ProviderId::Cctp,
             source,
             ProviderAssetCapability::BridgeInput,
-        )?;
-        let output = self.asset_registry.provider_asset(
+        ) else {
+            return Ok(None);
+        };
+        let Some(output) = self.asset_registry.provider_asset(
             ProviderId::Cctp,
             destination,
             ProviderAssetCapability::BridgeOutput,
-        )?;
-        let source_domain = input.provider_chain.parse::<u32>().ok()?;
-        let destination_domain = output.provider_chain.parse::<u32>().ok()?;
-        let burn_token = Address::from_str(&input.provider_asset).ok()?;
-        let destination_token = Address::from_str(&output.provider_asset).ok()?;
-        Some(CctpBridgeAssets {
+        ) else {
+            return Ok(None);
+        };
+        let source_domain = cctp_provider_domain(input, ProviderAssetCapability::BridgeInput)?;
+        let destination_domain =
+            cctp_provider_domain(output, ProviderAssetCapability::BridgeOutput)?;
+        let burn_token = cctp_provider_address(input, ProviderAssetCapability::BridgeInput)?;
+        let destination_token =
+            cctp_provider_address(output, ProviderAssetCapability::BridgeOutput)?;
+        Ok(Some(CctpBridgeAssets {
             source_domain,
             destination_domain,
             burn_token,
             destination_token,
-        })
+        }))
     }
 
     async fn fetch_messages(
@@ -2120,23 +2609,32 @@ impl CctpProvider {
             .query(&[("transactionHash", tx_hash)])
             .send()
             .await
-            .map_err(|err| format!("cctp messages request failed: {err}"))?;
+            .map_err(|err| format!("cctp messages request failed: {}", err.without_url()))?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
         let status = response.status();
-        let body = response
-            .text()
+        let body = read_limited_response_text(response, CCTP_MAX_RESPONSE_BODY_BYTES)
             .await
             .map_err(|err| format!("cctp messages response body failed: {err}"))?;
-        if !status.is_success() {
+        if body.truncated {
             return Err(format!(
-                "cctp messages request failed with {status}: {body}"
+                "cctp messages response body exceeded {CCTP_MAX_RESPONSE_BODY_BYTES} bytes"
             ));
         }
-        serde_json::from_str(&body)
-            .map(Some)
-            .map_err(|err| format!("cctp messages response was not JSON: {err}; body={body}"))
+        let body = body.text;
+        if !status.is_success() {
+            return Err(format!(
+                "cctp messages request failed with {status}: {}",
+                response_body_error_preview(&body)
+            ));
+        }
+        serde_json::from_str(&body).map(Some).map_err(|err| {
+            format!(
+                "cctp messages response was not JSON: {err}; body={}",
+                response_body_error_preview(&body)
+            )
+        })
     }
 
     async fn fetch_burn_fees(
@@ -2153,19 +2651,29 @@ impl CctpProvider {
             .get(&url)
             .send()
             .await
-            .map_err(|err| format!("cctp burn fees request failed: {err}"))?;
+            .map_err(|err| format!("cctp burn fees request failed: {}", err.without_url()))?;
         let status = response.status();
-        let body = response
-            .text()
+        let body = read_limited_response_text(response, CCTP_MAX_RESPONSE_BODY_BYTES)
             .await
             .map_err(|err| format!("cctp burn fees response body failed: {err}"))?;
-        if !status.is_success() {
+        if body.truncated {
             return Err(format!(
-                "cctp burn fees request failed with {status}: {body}"
+                "cctp burn fees response body exceeded {CCTP_MAX_RESPONSE_BODY_BYTES} bytes"
             ));
         }
-        serde_json::from_str(&body)
-            .map_err(|err| format!("cctp burn fees response was not JSON: {err}; body={body}"))
+        let body = body.text;
+        if !status.is_success() {
+            return Err(format!(
+                "cctp burn fees request failed with {status}: {}",
+                response_body_error_preview(&body)
+            ));
+        }
+        serde_json::from_str(&body).map_err(|err| {
+            format!(
+                "cctp burn fees response was not JSON: {err}; body={}",
+                response_body_error_preview(&body)
+            )
+        })
     }
 
     async fn standard_burn_fee_bps_micros(
@@ -2200,7 +2708,7 @@ impl BridgeProvider for CctpProvider {
     ) -> ProviderFuture<'a, Option<BridgeQuote>> {
         Box::pin(async move {
             let Some(assets) =
-                self.resolve_bridge_assets(&request.source_asset, &request.destination_asset)
+                self.resolve_bridge_assets(&request.source_asset, &request.destination_asset)?
             else {
                 return Ok(None);
             };
@@ -2279,12 +2787,7 @@ impl BridgeProvider for CctpProvider {
             if request.operation_type != ProviderOperationType::CctpBridge {
                 return Ok(None);
             }
-            let source_domain = request
-                .request
-                .get("source_domain")
-                .and_then(Value::as_u64)
-                .and_then(|value| u32::try_from(value).ok())
-                .ok_or_else(|| "cctp observe: request missing source_domain".to_string())?;
+            let source_domain = cctp_source_domain_from_request(&request.request)?;
             let burn_tx_hash = request
                 .provider_ref
                 .as_deref()
@@ -2321,6 +2824,32 @@ impl BridgeProvider for CctpProvider {
                         .as_deref()
                         .is_some_and(|value| !value.is_empty())
             });
+            let failed = messages_response
+                .messages
+                .iter()
+                .find(|message| cctp_message_status_is_failed(&message.status));
+            if let Some(message) = failed {
+                return Ok(Some(ProviderOperationObservation {
+                    status: ProviderOperationStatus::Failed,
+                    provider_ref: Some(burn_tx_hash.to_string()),
+                    observed_state: json!({
+                        "burn_tx_hash": burn_tx_hash,
+                        "attestation_status": message.status,
+                        "message": message.message,
+                        "attestation": message.attestation,
+                        "event_nonce": message.event_nonce,
+                        "decoded_message_body": message.decoded_message_body,
+                    }),
+                    response: Some(serde_json::to_value(&messages_response).map_err(|err| {
+                        format!("cctp observe: serialize messages response: {err}")
+                    })?),
+                    tx_hash: Some(burn_tx_hash.to_string()),
+                    error: Some(json!({
+                        "status": message.status,
+                        "error": message.error,
+                    })),
+                }));
+            }
             if let Some(message) = complete {
                 return Ok(Some(ProviderOperationObservation {
                     status: ProviderOperationStatus::Completed,
@@ -2362,6 +2891,16 @@ impl BridgeProvider for CctpProvider {
     }
 }
 
+fn cctp_source_domain_from_request(request: &Value) -> ProviderResult<u32> {
+    let Some(value) = request.get("source_domain") else {
+        return Err("cctp observe: request missing source_domain".to_string());
+    };
+    let value = value
+        .as_u64()
+        .ok_or_else(|| "cctp observe: source_domain must be an unsigned integer".to_string())?;
+    u32::try_from(value).map_err(|_| "cctp observe: source_domain exceeds u32 maximum".to_string())
+}
+
 impl CctpProvider {
     async fn execute_burn(
         &self,
@@ -2380,7 +2919,7 @@ impl CctpProvider {
                 .map_err(|err| format!("invalid cctp output_asset: {err}"))?,
         };
         let assets = self
-            .resolve_bridge_assets(&source_asset, &destination_asset)
+            .resolve_bridge_assets(&source_asset, &destination_asset)?
             .ok_or_else(|| "cctp bridge assets are not registered".to_string())?;
         let source_custody_vault_id = step
             .source_custody_vault_id
@@ -2389,7 +2928,7 @@ impl CctpProvider {
             .map_err(|err| format!("invalid cctp recipient_address: {err}"))?;
         let amount = U256::from_str_radix(&step.amount, 10)
             .map_err(|err| format!("invalid cctp amount {}: {err}", step.amount))?;
-        let max_fee_raw = step.max_fee.as_deref().unwrap_or("0");
+        let max_fee_raw = step.max_fee.as_str();
         let max_fee = U256::from_str_radix(max_fee_raw, 10)
             .map_err(|err| format!("invalid cctp max_fee {max_fee_raw}: {err}"))?;
 
@@ -2491,9 +3030,32 @@ struct CctpBridgeAssets {
     destination_token: Address,
 }
 
+fn cctp_provider_domain(
+    entry: &ProviderAsset,
+    capability: ProviderAssetCapability,
+) -> ProviderResult<u32> {
+    entry.provider_chain.parse::<u32>().map_err(|err| {
+        format!(
+            "invalid CCTP provider chain {:?} for {} {} {:?}: {err}",
+            entry.provider_chain, entry.chain, entry.provider_asset, capability
+        )
+    })
+}
+
+fn cctp_provider_address(
+    entry: &ProviderAsset,
+    capability: ProviderAssetCapability,
+) -> ProviderResult<Address> {
+    Address::from_str(&entry.provider_asset).map_err(|err| {
+        format!(
+            "invalid CCTP provider asset {:?} for {} {:?}: {err}",
+            entry.provider_asset, entry.chain, capability
+        )
+    })
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct CctpMessagesResponse {
-    #[serde(default)]
     messages: Vec<CctpMessageEntry>,
 }
 
@@ -2516,10 +3078,18 @@ struct CctpMessageEntry {
     event_nonce: Option<String>,
     #[serde(default)]
     cctp_version: Option<u64>,
-    #[serde(default)]
     status: String,
     #[serde(default)]
     decoded_message_body: Option<Value>,
+    #[serde(default)]
+    error: Option<Value>,
+}
+
+fn cctp_message_status_is_failed(status: &str) -> bool {
+    matches!(
+        status.to_ascii_lowercase().as_str(),
+        "failed" | "failure" | "error"
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2545,13 +3115,16 @@ fn cctp_quote_amounts(
             if amount_in.is_zero() {
                 return Ok(None);
             }
-            let max_fee = cctp_fee_amount(amount_in, fee_bps_micros);
+            let max_fee = cctp_fee_amount(amount_in, fee_bps_micros)?;
             if max_fee >= amount_in {
                 return Ok(None);
             }
+            let amount_out = amount_in
+                .checked_sub(max_fee)
+                .ok_or_else(|| "cctp exact-in fee exceeded amount after validation".to_string())?;
             Ok(Some(CctpQuoteAmounts {
                 amount_in,
-                amount_out: amount_in.saturating_sub(max_fee),
+                amount_out,
                 max_fee,
             }))
         }
@@ -2561,10 +3134,17 @@ fn cctp_quote_amounts(
             if amount_out.is_zero() {
                 return Ok(None);
             }
-            let gross_denominator = denominator.saturating_sub(fee);
-            let amount_in =
-                div_ceil_u256(amount_out.saturating_mul(denominator), gross_denominator);
-            let max_fee = amount_in.saturating_sub(amount_out);
+            let gross_denominator = denominator
+                .checked_sub(fee)
+                .ok_or_else(|| "cctp fee denominator underflowed".to_string())?;
+            let amount_in = div_ceil_u512_to_u256(
+                U512::from(amount_out) * U512::from(denominator),
+                U512::from(gross_denominator),
+                "cctp exact-out gross-up",
+            )?;
+            let max_fee = amount_in.checked_sub(amount_out).ok_or_else(|| {
+                "cctp exact-out gross-up returned less than requested output".to_string()
+            })?;
             Ok(Some(CctpQuoteAmounts {
                 amount_in,
                 amount_out,
@@ -2574,18 +3154,40 @@ fn cctp_quote_amounts(
     }
 }
 
-fn cctp_fee_amount(amount: U256, fee_bps_micros: u128) -> U256 {
-    div_ceil_u256(
-        amount.saturating_mul(U256::from(fee_bps_micros)),
-        U256::from(10_000_000_000_u128),
+fn cctp_fee_amount(amount: U256, fee_bps_micros: u128) -> ProviderResult<U256> {
+    div_ceil_u512_to_u256(
+        U512::from(amount) * U512::from(fee_bps_micros),
+        U512::from(10_000_000_000_u128),
+        "cctp fee amount",
     )
 }
 
-fn div_ceil_u256(numerator: U256, denominator: U256) -> U256 {
-    if numerator.is_zero() {
-        return U256::ZERO;
+fn div_ceil_u512_to_u256(
+    numerator: U512,
+    denominator: U512,
+    context: &'static str,
+) -> ProviderResult<U256> {
+    div_ceil_u512(numerator, denominator, context).and_then(|value| {
+        if value > U512::from(U256::MAX) {
+            return Err(format!("{context} exceeded uint256"));
+        }
+        U256::from_str_radix(&value.to_string(), 10)
+            .map_err(|err| format!("{context} did not fit uint256: {err}"))
+    })
+}
+
+fn div_ceil_u512(
+    numerator: U512,
+    denominator: U512,
+    context: &'static str,
+) -> ProviderResult<U512> {
+    if denominator.is_zero() {
+        return Err(format!("{context} denominator was zero"));
     }
-    numerator.saturating_add(denominator.saturating_sub(U256::from(1_u64))) / denominator
+    if numerator.is_zero() {
+        return Ok(U512::ZERO);
+    }
+    Ok((numerator - U512::from(1_u64)) / denominator + U512::from(1_u64))
 }
 
 fn parse_decimal_bps_to_micros(raw: &str) -> ProviderResult<u128> {
@@ -2611,11 +3213,14 @@ fn parse_decimal_bps_to_micros(raw: &str) -> ProviderResult<u128> {
         .parse::<u128>()
         .map_err(|err| format!("invalid CCTP fee bps {raw:?}: {err}"))?;
     if fractional.chars().skip(6).any(|ch| ch != '0') {
-        fractional_micros = fractional_micros.saturating_add(1);
+        fractional_micros = fractional_micros
+            .checked_add(1)
+            .ok_or_else(|| format!("invalid CCTP fee bps {raw:?}: fractional overflow"))?;
     }
-    Ok(whole
-        .saturating_mul(1_000_000)
-        .saturating_add(fractional_micros))
+    whole
+        .checked_mul(1_000_000)
+        .and_then(|whole_micros| whole_micros.checked_add(fractional_micros))
+        .ok_or_else(|| format!("invalid CCTP fee bps {raw:?}: value overflowed"))
 }
 
 fn decimal_bps_string(fee_bps_micros: u128) -> String {
@@ -2660,8 +3265,7 @@ pub struct CctpBurnStepRequest {
     pub source_custody_vault_id: Option<Uuid>,
     #[serde(default)]
     pub source_custody_vault_address: Option<String>,
-    #[serde(default)]
-    pub max_fee: Option<String>,
+    pub max_fee: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -2724,6 +3328,8 @@ impl UnitDepositStepRequest {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct UnitWithdrawalStepRequest {
     pub order_id: Uuid,
+    pub input_chain_id: String,
+    pub input_asset: String,
     pub dst_chain_id: String,
     pub asset_id: String,
     pub amount: String,
@@ -2903,7 +3509,8 @@ impl EmptyStringFallback for String {
 ///
 /// Two execution paths:
 /// - **Same-token no-op** — input and output resolve to the same HL spot
-///   token (e.g. UBTC→UBTC). Emits `ProviderOnly` with a completed operation.
+///   token (e.g. UBTC→UBTC). Emits `ProviderOnly` without a provider operation:
+///   no Hyperliquid order or transaction exists to reference.
 /// - **Cross-token single-leg** — one side is USDC, the other is a non-USDC
 ///   HL spot token. Emits one `CustodyActions` intent carrying a single GTC
 ///   `{base}/USDC` order against the hydrated HL spot custody vault. The
@@ -2932,23 +3539,22 @@ const HL_SPOT_MAX_DECIMALS: i32 = 8;
 const DEFAULT_HYPERLIQUID_ORDER_TIMEOUT_MS: u64 = 30_000;
 
 impl HyperliquidProvider {
-    #[must_use]
     pub fn new(
         base_url: impl Into<String>,
         network: HyperliquidCallNetwork,
         asset_registry: Arc<AssetRegistry>,
         order_timeout_ms: u64,
-    ) -> Self {
-        let target_base_url = normalize_base_url(base_url);
-        let http = HyperliquidHttpClient::new(rustls_http_client(), target_base_url.clone());
-        Self {
+    ) -> Result<Self, String> {
+        let target_base_url = normalize_base_url(base_url)?;
+        let http = HyperliquidHttpClient::new(rustls_http_client()?, target_base_url.clone());
+        Ok(Self {
             network,
             asset_registry,
             http,
             target_base_url,
             order_timeout_ms,
             spot_meta: Arc::new(OnceCell::new()),
-        }
+        })
     }
 
     /// Resolve a router-side [`DepositAsset`] to its HL spot entry: token
@@ -3014,7 +3620,12 @@ impl HyperliquidProvider {
             .ok_or_else(|| {
                 format!("hyperliquid spotMeta missing pair {base_symbol}/{quote_symbol}")
             })?;
-        let wire_asset = SPOT_ASSET_INDEX_OFFSET + pair.index as u32;
+        let wire_asset = spot_wire_asset_index(pair.index).ok_or_else(|| {
+            format!(
+                "hyperliquid spotMeta pair {} index {} does not fit wire asset id",
+                pair.name, pair.index
+            )
+        })?;
         Ok((wire_asset, pair.name.clone(), base.clone(), quote.clone()))
     }
 
@@ -3099,12 +3710,17 @@ impl HyperliquidProvider {
         let buy_book = self.fetch_l2_book(&output_pair_name).await?;
 
         let usdc_asset = DepositAsset {
-            chain: ChainId::parse("hyperliquid").expect("static chain id"),
+            chain: ChainId::parse("hyperliquid")
+                .map_err(|err| format!("invalid internal hyperliquid chain id: {err}"))?,
             asset: AssetId::Native,
         };
         let (usdc_token, usdc_decimals) =
             self.resolve_hl_entry(&usdc_asset, ProviderAssetCapability::ExchangeInput)?;
-        debug_assert_eq!(usdc_token, HL_QUOTE_SYMBOL);
+        if usdc_token != HL_QUOTE_SYMBOL {
+            return Err(format!(
+                "hyperliquid registry mapped native USDC to {usdc_token}; expected {HL_QUOTE_SYMBOL}"
+            ));
+        }
 
         let (leg1_in, leg1_out, leg2_in, leg2_out) = match &request.order_kind {
             MarketOrderKind::ExactIn {
@@ -3272,22 +3888,23 @@ impl HyperliquidProvider {
             format!("hyperliquid limit order: invalid vault_address {vault_address}: {err}")
         })?;
 
+        let (order_kind, min_amount_out, max_amount_in) = if is_buy {
+            ("exact_out", None, Some(step.amount_in.as_str()))
+        } else {
+            ("exact_in", Some(step.amount_out.as_str()), None)
+        };
         let (wire_asset, _pair_name, base_meta, _quote_meta) = self
             .resolve_spot_pair(&base_symbol, HL_QUOTE_SYMBOL)
             .await?;
         let base_sz = compute_base_sz(
             is_buy,
+            order_kind,
             &step.amount_in,
             input_decimals,
             &step.amount_out,
             output_decimals,
             base_meta.sz_decimals,
         )?;
-        let (order_kind, min_amount_out, max_amount_in) = if is_buy {
-            ("exact_out", None, Some(step.amount_in.as_str()))
-        } else {
-            ("exact_in", Some(step.amount_out.as_str()), None)
-        };
         let limit_px = compute_limit_px(LimitPxInput {
             is_buy,
             order_kind,
@@ -3373,11 +3990,12 @@ impl HyperliquidProvider {
     }
 }
 
-fn rustls_http_client() -> reqwest::Client {
+fn rustls_http_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .use_rustls_tls()
+        .timeout(PROVIDER_HTTP_TIMEOUT)
         .build()
-        .expect("failed to construct reqwest client with rustls")
+        .map_err(|err| format!("failed to construct reqwest client: {err}"))
 }
 
 #[derive(Clone)]
@@ -3388,15 +4006,14 @@ pub struct VeloraProvider {
 }
 
 impl VeloraProvider {
-    #[must_use]
-    pub fn new(base_url: impl Into<String>, partner: Option<String>) -> Self {
-        Self {
-            base_url: normalize_base_url(base_url),
+    pub fn new(base_url: impl Into<String>, partner: Option<String>) -> Result<Self, String> {
+        Ok(Self {
+            base_url: normalize_base_url(base_url)?,
             partner: partner
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
-            http: rustls_http_client(),
-        }
+            http: rustls_http_client()?,
+        })
     }
 
     async fn fetch_price_route(
@@ -3441,22 +4058,33 @@ impl VeloraProvider {
             .query(&query)
             .send()
             .await
-            .map_err(|err| format!("velora price request failed: {err}"))?;
+            .map_err(|err| format!("velora price request failed: {}", err.without_url()))?;
         let status = response.status();
-        let body = response
-            .text()
+        let body = read_limited_response_text(response, VELORA_MAX_RESPONSE_BODY_BYTES)
             .await
             .map_err(|err| format!("velora price response body failed: {err}"))?;
+        if body.truncated {
+            return Err(format!(
+                "velora price response body exceeded {VELORA_MAX_RESPONSE_BODY_BYTES} bytes"
+            ));
+        }
+        let body = body.text;
         if !status.is_success() {
             if status.is_client_error() && velora_quote_error_is_no_route(&body) {
                 return Ok(None);
             }
-            return Err(format!("velora price request failed with {status}: {body}"));
+            return Err(format!(
+                "velora price request failed with {status}: {}",
+                response_body_error_preview(&body)
+            ));
         }
         let body: Value = serde_json::from_str(&body)
             .map_err(|err| format!("velora price response was not JSON: {err}"))?;
         let Some(price_route) = body.get("priceRoute").cloned() else {
-            return Err(format!("velora price response missing priceRoute: {body}"));
+            return Err(format!(
+                "velora price response missing priceRoute: {}",
+                response_body_error_preview(&body.to_string())
+            ));
         };
         Ok(Some(price_route))
     }
@@ -3475,6 +4103,16 @@ impl VeloraProvider {
             .ok_or_else(|| {
                 "velora universal router step missing source_custody_vault_address".to_string()
             })?;
+        validate_velora_price_route(VeloraPriceRouteExpectations {
+            price_route: &step.price_route,
+            network,
+            src_token,
+            dest_token,
+            src_decimals: step.input_decimals,
+            dest_decimals: step.output_decimals,
+            amount_in: &step.amount_in,
+            amount_out: &step.amount_out,
+        })?;
         let mut body = json!({
             "srcToken": src_token,
             "srcDecimals": step.input_decimals,
@@ -3503,15 +4141,21 @@ impl VeloraProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|err| format!("velora transaction request failed: {err}"))?;
+            .map_err(|err| format!("velora transaction request failed: {}", err.without_url()))?;
         let status = response.status();
-        let response_body = response
-            .text()
+        let response_body = read_limited_response_text(response, VELORA_MAX_RESPONSE_BODY_BYTES)
             .await
             .map_err(|err| format!("velora transaction response body failed: {err}"))?;
+        if response_body.truncated {
+            return Err(format!(
+                "velora transaction response body exceeded {VELORA_MAX_RESPONSE_BODY_BYTES} bytes"
+            ));
+        }
+        let response_body = response_body.text;
         if !status.is_success() {
             return Err(format!(
-                "velora transaction request failed with {status}: {response_body}"
+                "velora transaction request failed with {status}: {}",
+                response_body_error_preview(&response_body)
             ));
         }
         serde_json::from_str(&response_body)
@@ -3576,18 +4220,18 @@ impl ExchangeProvider for VeloraProvider {
                 amount_out: amount_out.clone(),
                 min_amount_out,
                 max_amount_in,
-                provider_quote: velora_quote_descriptor(
-                    &request,
+                provider_quote: velora_quote_descriptor(VeloraQuoteDescriptorSpec {
+                    request: &request,
                     network,
-                    &src_token,
-                    &dest_token,
+                    src_token: &src_token,
+                    dest_token: &dest_token,
                     src_decimals,
                     dest_decimals,
                     slippage_bps,
                     price_route,
-                    &amount_in,
-                    &amount_out,
-                ),
+                    amount_in: &amount_in,
+                    amount_out: &amount_out,
+                }),
                 expires_at: Utc::now() + chrono::Duration::minutes(5),
             }))
         })
@@ -3630,9 +4274,7 @@ impl ExchangeProvider for VeloraProvider {
                 .await?;
             let swap_to = velora_response_string(&transaction, "to")?;
             let swap_data = velora_response_string(&transaction, "data")?;
-            let swap_value = velora_response_optional_u256(&transaction, "value")?
-                .unwrap_or(U256::ZERO)
-                .to_string();
+            let swap_value = velora_transaction_value(&input_asset, &transaction)?.to_string();
 
             let mut actions = Vec::new();
             if let AssetId::Reference(token_address) = &input_asset.asset {
@@ -3818,26 +4460,7 @@ impl ExchangeProvider for HyperliquidProvider {
                         "amount_in": step.amount_in,
                         "amount_out": step.amount_out,
                     }),
-                    state: ProviderExecutionState {
-                        operation: Some(ProviderOperationIntent {
-                            operation_type: ProviderOperationType::HyperliquidTrade,
-                            status: ProviderOperationStatus::Completed,
-                            provider_ref: None,
-                            request: Some(json!({
-                                "mode": "no_op",
-                                "token": input_token,
-                                "order_kind": step.order_kind,
-                            })),
-                            response: Some(json!({ "kind": "no_op" })),
-                            observed_state: Some(json!({
-                                "kind": "no_op",
-                                "token": input_token,
-                                "amount_in": step.amount_in,
-                                "amount_out": step.amount_out,
-                            })),
-                        }),
-                        addresses: vec![],
-                    },
+                    state: ProviderExecutionState::default(),
                 });
             }
 
@@ -3867,6 +4490,7 @@ impl ExchangeProvider for HyperliquidProvider {
 
             let base_sz = compute_base_sz(
                 is_buy,
+                &step.order_kind,
                 &step.amount_in,
                 input_decimals,
                 &step.amount_out,
@@ -3900,8 +4524,9 @@ impl ExchangeProvider for HyperliquidProvider {
                 orders: vec![order],
                 grouping: "na".to_string(),
             });
-            let now_ms = Utc::now().timestamp_millis().max(0) as u64;
-            let timeout_at_ms = now_ms.saturating_add(self.order_timeout_ms);
+            let now_ms = current_unix_timestamp_millis_u64("hyperliquid trade")?;
+            let timeout_at_ms =
+                checked_timeout_at_ms(now_ms, self.order_timeout_ms, "hyperliquid trade")?;
             let mut actions = Vec::new();
             if step.prefund_from_withdrawable {
                 let transfer_amount = format_hyperliquid_amount(&step.amount_in, input_decimals)?;
@@ -4072,28 +4697,11 @@ impl ExchangeProvider for HyperliquidProvider {
             let observed_state = serde_json::to_value(&order_status).map_err(|err| {
                 format!("hyperliquid observe: serialize orderStatus response: {err}")
             })?;
-            let (status, tx_hash) = match order_status.status.as_str() {
-                // HL returns "order" when the oid is still live/resting.
-                "order" => (ProviderOperationStatus::WaitingExternal, None),
-                "unknownOid" => (ProviderOperationStatus::WaitingExternal, None),
-                _ => {
-                    let envelope_status = order_status
-                        .order
-                        .as_ref()
-                        .map(|env| env.status.as_str())
-                        .unwrap_or("");
-                    let mapped = match envelope_status {
-                        "filled" => ProviderOperationStatus::Completed,
-                        "canceled"
-                        | "scheduledCancel"
-                        | "marginCanceled"
-                        | "rejected"
-                        | "vaultWithdrawal"
-                        | "vaultWithdrawalCanceled" => ProviderOperationStatus::Failed,
-                        _ => ProviderOperationStatus::WaitingExternal,
-                    };
-                    (mapped, Some(format!("hl:oid:{oid}")))
-                }
+            let status = hyperliquid_order_status_provider_status(&order_status)?;
+            let tx_hash = if status == ProviderOperationStatus::Completed {
+                self.hyperliquid_fill_hash_for_oid(user, oid).await?
+            } else {
+                None
             };
 
             Ok(Some(ProviderOperationObservation {
@@ -4105,6 +4713,60 @@ impl ExchangeProvider for HyperliquidProvider {
                 error: None,
             }))
         })
+    }
+}
+
+fn hyperliquid_order_status_provider_status(
+    response: &OrderStatusResponse,
+) -> ProviderResult<ProviderOperationStatus> {
+    match response.status.as_str() {
+        "unknownOid" => Ok(ProviderOperationStatus::WaitingExternal),
+        "order" => {
+            let envelope = response.order.as_ref().ok_or_else(|| {
+                "hyperliquid observe: orderStatus status=order missing order envelope".to_string()
+            })?;
+            hyperliquid_order_lifecycle_status(&envelope.status)
+        }
+        status => hyperliquid_order_lifecycle_status(status),
+    }
+}
+
+fn hyperliquid_order_lifecycle_status(status: &str) -> ProviderResult<ProviderOperationStatus> {
+    match status {
+        "open" | "resting" => Ok(ProviderOperationStatus::WaitingExternal),
+        "filled" => Ok(ProviderOperationStatus::Completed),
+        "canceled"
+        | "scheduledCancel"
+        | "marginCanceled"
+        | "rejected"
+        | "vaultWithdrawal"
+        | "vaultWithdrawalCanceled" => Ok(ProviderOperationStatus::Failed),
+        other => Err(format!(
+            "hyperliquid observe: unsupported orderStatus lifecycle {other:?}"
+        )),
+    }
+}
+
+impl HyperliquidProvider {
+    async fn hyperliquid_fill_hash_for_oid(
+        &self,
+        user: Address,
+        oid: u64,
+    ) -> ProviderResult<Option<String>> {
+        let req = json!({
+            "type": "userFills",
+            "user": format!("{user:?}"),
+        });
+        let fills: Vec<UserFill> = self
+            .http
+            .post_json("/info", &req)
+            .await
+            .map_err(|err| format!("hyperliquid /info userFills: {err}"))?;
+
+        Ok(fills
+            .into_iter()
+            .find(|fill| fill.oid == oid && !fill.hash.is_empty())
+            .map(|fill| fill.hash))
     }
 }
 
@@ -4203,28 +4865,43 @@ pub struct UniversalRouterAssetRef {
 
 impl UniversalRouterAssetRef {
     pub fn deposit_asset(&self) -> ProviderResult<DepositAsset> {
-        Ok(DepositAsset {
+        DepositAsset {
             chain: ChainId::parse(&self.chain_id)
                 .map_err(|err| format!("invalid universal router asset chain: {err}"))?,
             asset: AssetId::parse(&self.asset)
                 .map_err(|err| format!("invalid universal router asset id: {err}"))?,
-        })
+        }
+        .normalized_asset_identity()
+        .map_err(|err| format!("invalid universal router asset identity: {err}"))
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn velora_quote_descriptor(
-    request: &ExchangeQuoteRequest,
+struct VeloraQuoteDescriptorSpec<'a> {
+    request: &'a ExchangeQuoteRequest,
     network: u64,
-    src_token: &str,
-    dest_token: &str,
+    src_token: &'a str,
+    dest_token: &'a str,
     src_decimals: u8,
     dest_decimals: u8,
     slippage_bps: u64,
     price_route: Value,
-    amount_in: &str,
-    amount_out: &str,
-) -> Value {
+    amount_in: &'a str,
+    amount_out: &'a str,
+}
+
+fn velora_quote_descriptor(spec: VeloraQuoteDescriptorSpec<'_>) -> Value {
+    let VeloraQuoteDescriptorSpec {
+        request,
+        network,
+        src_token,
+        dest_token,
+        src_decimals,
+        dest_decimals,
+        slippage_bps,
+        price_route,
+        amount_in,
+        amount_out,
+    } = spec;
     let (order_kind, min_amount_out, max_amount_in) = match &request.order_kind {
         MarketOrderKind::ExactIn { min_amount_out, .. } => {
             ("exact_in", Some(min_amount_out.clone()), None)
@@ -4284,10 +4961,29 @@ fn velora_response_string(response: &Value, field: &'static str) -> ProviderResu
     velora_value_string(response, field)
 }
 
+fn velora_price_route_u64(price_route: &Value, field: &'static str) -> ProviderResult<u64> {
+    velora_value_u64(price_route, field)
+}
+
 fn velora_value_string(value: &Value, field: &'static str) -> ProviderResult<String> {
     match value.get(field) {
         Some(Value::String(raw)) if !raw.trim().is_empty() => Ok(raw.clone()),
         Some(Value::Number(number)) => Ok(number.to_string()),
+        Some(other) => Err(format!(
+            "velora field {field} was not a string/number: {other}"
+        )),
+        None => Err(format!("velora response missing field {field}")),
+    }
+}
+
+fn velora_value_u64(value: &Value, field: &'static str) -> ProviderResult<u64> {
+    match value.get(field) {
+        Some(Value::String(raw)) if !raw.trim().is_empty() => raw
+            .parse::<u64>()
+            .map_err(|err| format!("velora field {field} was not a u64: {err}")),
+        Some(Value::Number(number)) => number
+            .as_u64()
+            .ok_or_else(|| format!("velora field {field} does not fit into u64")),
         Some(other) => Err(format!(
             "velora field {field} was not a string/number: {other}"
         )),
@@ -4311,6 +5007,113 @@ fn velora_response_optional_u256(
             "velora field {field} was not a string/number: {other}"
         )),
     }
+}
+
+fn velora_transaction_value(
+    input_asset: &DepositAsset,
+    transaction: &Value,
+) -> ProviderResult<U256> {
+    let value = velora_response_optional_u256(transaction, "value")?;
+    if input_asset.asset.is_native() {
+        let Some(value) = value else {
+            return Err("velora native-input transaction response missing value".to_string());
+        };
+        if value.is_zero() {
+            return Err("velora native-input transaction response had zero value".to_string());
+        }
+        return Ok(value);
+    }
+
+    let value = value.unwrap_or(U256::ZERO);
+    if !value.is_zero() {
+        return Err(format!(
+            "velora ERC-20-input transaction response requested unexpected native value {value}"
+        ));
+    }
+    Ok(value)
+}
+
+struct VeloraPriceRouteExpectations<'a> {
+    price_route: &'a Value,
+    network: u64,
+    src_token: &'a str,
+    dest_token: &'a str,
+    src_decimals: u8,
+    dest_decimals: u8,
+    amount_in: &'a str,
+    amount_out: &'a str,
+}
+
+fn validate_velora_price_route(expected: VeloraPriceRouteExpectations<'_>) -> ProviderResult<()> {
+    let VeloraPriceRouteExpectations {
+        price_route,
+        network,
+        src_token,
+        dest_token,
+        src_decimals,
+        dest_decimals,
+        amount_in,
+        amount_out,
+    } = expected;
+
+    let route_network = velora_price_route_u64(price_route, "network")?;
+    if route_network != network {
+        return Err(format!(
+            "velora priceRoute network {route_network} does not match execution network {network}"
+        ));
+    }
+
+    let route_src_token = velora_price_route_string(price_route, "srcToken")?;
+    if !route_src_token.eq_ignore_ascii_case(src_token) {
+        return Err(format!(
+            "velora priceRoute srcToken {route_src_token:?} does not match execution srcToken {src_token:?}"
+        ));
+    }
+
+    let route_dest_token = velora_price_route_string(price_route, "destToken")?;
+    if !route_dest_token.eq_ignore_ascii_case(dest_token) {
+        return Err(format!(
+            "velora priceRoute destToken {route_dest_token:?} does not match execution destToken {dest_token:?}"
+        ));
+    }
+
+    let route_src_decimals = velora_price_route_u64(price_route, "srcDecimals")?;
+    if route_src_decimals != u64::from(src_decimals) {
+        return Err(format!(
+            "velora priceRoute srcDecimals {route_src_decimals} does not match execution srcDecimals {src_decimals}"
+        ));
+    }
+
+    let route_dest_decimals = velora_price_route_u64(price_route, "destDecimals")?;
+    if route_dest_decimals != u64::from(dest_decimals) {
+        return Err(format!(
+            "velora priceRoute destDecimals {route_dest_decimals} does not match execution destDecimals {dest_decimals}"
+        ));
+    }
+
+    let route_amount_in = parse_u256_decimal_or_hex(
+        "velora priceRoute srcAmount",
+        &velora_price_route_string(price_route, "srcAmount")?,
+    )?;
+    let expected_amount_in = parse_u256_decimal_or_hex("velora execution amount_in", amount_in)?;
+    if route_amount_in != expected_amount_in {
+        return Err(format!(
+            "velora priceRoute srcAmount {route_amount_in} does not match execution amount_in {expected_amount_in}"
+        ));
+    }
+
+    let route_amount_out = parse_u256_decimal_or_hex(
+        "velora priceRoute destAmount",
+        &velora_price_route_string(price_route, "destAmount")?,
+    )?;
+    let expected_amount_out = parse_u256_decimal_or_hex("velora execution amount_out", amount_out)?;
+    if route_amount_out != expected_amount_out {
+        return Err(format!(
+            "velora priceRoute destAmount {route_amount_out} does not match execution amount_out {expected_amount_out}"
+        ));
+    }
+
+    Ok(())
 }
 
 fn parse_u256_decimal_or_hex(field: &'static str, value: &str) -> ProviderResult<U256> {
@@ -4351,12 +5154,7 @@ fn velora_slippage_bps(
             if min_out >= quoted_out {
                 return Ok(0);
             }
-            u256_to_capped_bps(
-                quoted_out
-                    .saturating_sub(min_out)
-                    .saturating_mul(U256::from(10_000_u64))
-                    / quoted_out,
-            )
+            ratio_to_capped_bps(quoted_out - min_out, quoted_out)
         }
         MarketOrderKind::ExactOut { max_amount_in, .. } => {
             let quoted_in = parse_u256_decimal_or_hex("velora amount_in", amount_in)?;
@@ -4367,18 +5165,17 @@ fn velora_slippage_bps(
             if max_in <= quoted_in {
                 return Ok(0);
             }
-            u256_to_capped_bps(
-                max_in
-                    .saturating_sub(quoted_in)
-                    .saturating_mul(U256::from(10_000_u64))
-                    / quoted_in,
-            )
+            ratio_to_capped_bps(max_in - quoted_in, quoted_in)
         }
     }
 }
 
-fn u256_to_capped_bps(value: U256) -> ProviderResult<u64> {
-    if value > U256::from(10_000_u64) {
+fn ratio_to_capped_bps(numerator: U256, denominator: U256) -> ProviderResult<u64> {
+    if denominator.is_zero() {
+        return Err("slippage bps denominator was zero".to_string());
+    }
+    let value = U512::from(numerator) * U512::from(10_000_u64) / U512::from(denominator);
+    if value > U512::from(10_000_u64) {
         return Ok(10_000);
     }
     value
@@ -4406,12 +5203,26 @@ fn matches_quote(token: &str) -> bool {
     token == HL_QUOTE_SYMBOL
 }
 
+fn current_unix_timestamp_millis_u64(context: &'static str) -> ProviderResult<u64> {
+    u64::try_from(Utc::now().timestamp_millis())
+        .map_err(|_| format!("{context}: system clock is before Unix epoch"))
+}
+
+fn checked_timeout_at_ms(
+    now_ms: u64,
+    timeout_ms: u64,
+    context: &'static str,
+) -> ProviderResult<u64> {
+    now_ms
+        .checked_add(timeout_ms)
+        .ok_or_else(|| format!("{context}: timeout_at_ms overflowed"))
+}
+
 /// Large USDC wire amount used as a practical sentinel `max_amount_in` when
 /// the outer request is `exact_out` and the intermediate leg's bound is set
 /// downstream rather than at simulation time.
 const PRACTICAL_USDC_MAX_WIRE_STR: &str = "1000000000000000";
-const HL_BOOK_WALK_ABSOLUTE_EPSILON: f64 = 1e-12;
-const HL_BOOK_WALK_RELATIVE_EPSILON: f64 = 1e-12;
+const HL_PRICE_DECIMALS: u8 = 8;
 
 /// Simulate filling a marketable slippage-bounded limit order against the
 /// current L2 book. Returns the pair of wire amounts `(amount_in, amount_out)`
@@ -4442,158 +5253,525 @@ fn simulate_leg(
             amount_in,
             min_amount_out,
         } => {
-            let input_natural = wire_to_f64(amount_in, input_decimals)?;
-            let (_, amount_out_natural) =
-                walk_book_exact_in(is_buy, input_natural, side, base_sz_decimals)?;
-            let min_out_natural = wire_to_f64(min_amount_out, output_decimals)?;
-            if amount_out_natural + f64::EPSILON < min_out_natural {
+            let input_raw = parse_wire_u256(amount_in)?;
+            let amount_out_raw = walk_book_exact_in(
+                is_buy,
+                input_raw,
+                input_decimals,
+                output_decimals,
+                side,
+                base_sz_decimals,
+            )?;
+            let min_out_raw = parse_wire_u256(min_amount_out)?;
+            if amount_out_raw < min_out_raw {
                 return Err(format!(
-                    "hyperliquid quote: book walk yielded {amount_out_natural} < min_amount_out {min_out_natural}"
+                    "hyperliquid quote: book walk yielded {amount_out_raw} < min_amount_out {min_out_raw}"
                 ));
             }
-            let amount_out_wire = natural_to_wire(amount_out_natural, output_decimals)?;
-            Ok((amount_in.clone(), amount_out_wire))
+            Ok((amount_in.clone(), amount_out_raw.to_string()))
         }
         MarketOrderKind::ExactOut {
             amount_out,
             max_amount_in,
         } => {
-            let output_natural = wire_to_f64(amount_out, output_decimals)?;
-            let (amount_in_natural, _) =
-                walk_book_exact_out(is_buy, output_natural, side, base_sz_decimals)?;
-            let max_in_natural = wire_to_f64(max_amount_in, input_decimals)?;
-            if amount_in_natural > max_in_natural + f64::EPSILON {
+            let output_raw = parse_wire_u256(amount_out)?;
+            let amount_in_raw = walk_book_exact_out(
+                is_buy,
+                output_raw,
+                input_decimals,
+                output_decimals,
+                side,
+                base_sz_decimals,
+            )?;
+            let max_in_raw = parse_wire_u256(max_amount_in)?;
+            if amount_in_raw > max_in_raw {
                 return Err(format!(
-                    "hyperliquid quote: book walk requires {amount_in_natural} > max_amount_in {max_in_natural}"
+                    "hyperliquid quote: book walk requires {amount_in_raw} > max_amount_in {max_in_raw}"
                 ));
             }
-            let amount_in_wire = natural_to_wire(amount_in_natural, input_decimals)?;
-            Ok((amount_in_wire, amount_out.clone()))
+            Ok((amount_in_raw.to_string(), amount_out.clone()))
         }
     }
 }
 
-/// Walk a book side spending exactly `input_natural` — USDC when `is_buy`,
-/// base otherwise — and return `(input_consumed, output_received)` in
-/// natural units. Output on the base side is quantised to `base_sz_decimals`.
+/// Walk a book side spending exactly `input_raw` - USDC when `is_buy`, base
+/// otherwise - and return the output amount in router wire units. Base-side
+/// executable amounts are quantized to `base_sz_decimals`.
 fn walk_book_exact_in(
     is_buy: bool,
-    input_natural: f64,
+    input_raw: U256,
+    input_decimals: u8,
+    output_decimals: u8,
     side: &[L2Level],
     base_sz_decimals: u8,
-) -> ProviderResult<(f64, f64)> {
-    let mut input_remaining = input_natural;
-    let mut output_total = 0.0_f64;
-    for level in side {
-        if input_remaining <= 0.0 {
-            break;
-        }
-        let px = parse_hl_decimal(&level.px, "px")?;
-        let sz = parse_hl_decimal(&level.sz, "sz")?;
-        if px <= 0.0 || sz <= 0.0 {
-            continue;
-        }
-        let (input_spent, output_gained) = if is_buy {
-            // Spending USDC to buy base: base gained = min(sz, usdc_remaining / px).
-            let base_from_usdc = input_remaining / px;
-            let base_taken = base_from_usdc.min(sz);
-            (base_taken * px, base_taken)
-        } else {
-            // Selling base for USDC: base spent = min(sz, base_remaining).
-            let base_taken = input_remaining.min(sz);
-            (base_taken, base_taken * px)
-        };
-        input_remaining -= input_spent;
-        output_total += output_gained;
-    }
-    if input_remaining > book_walk_tolerance(input_natural) {
-        return Err(format!(
-            "hyperliquid quote: book side could not absorb remaining input {input_remaining}"
-        ));
-    }
-    let output_total = if is_buy {
-        // Buying base: quantise the base received to HL's `sz_decimals`.
-        round_to_decimals(output_total, usize::from(base_sz_decimals))?
+) -> ProviderResult<U256> {
+    if is_buy {
+        walk_buy_exact_in(
+            input_raw,
+            input_decimals,
+            output_decimals,
+            side,
+            base_sz_decimals,
+        )
     } else {
-        output_total
-    };
-    Ok((input_natural, output_total))
+        walk_sell_exact_in(
+            input_raw,
+            input_decimals,
+            output_decimals,
+            side,
+            base_sz_decimals,
+        )
+    }
 }
 
-/// Walk a book side until exactly `target_output_natural` is obtained, and
-/// return `(input_required, output_received)` in natural units.
+/// Walk a book side until exactly `output_raw` is obtained, and return the input
+/// amount in router wire units.
 fn walk_book_exact_out(
     is_buy: bool,
-    target_output_natural: f64,
+    output_raw: U256,
+    input_decimals: u8,
+    output_decimals: u8,
     side: &[L2Level],
     base_sz_decimals: u8,
-) -> ProviderResult<(f64, f64)> {
-    let target = if is_buy {
-        // Buying base: quantise target to HL's `sz_decimals` upfront so the
-        // walk's input maps cleanly to an integer wire amount later.
-        round_to_decimals(target_output_natural, usize::from(base_sz_decimals))?
+) -> ProviderResult<U256> {
+    if is_buy {
+        walk_buy_exact_out(
+            output_raw,
+            input_decimals,
+            output_decimals,
+            side,
+            base_sz_decimals,
+        )
     } else {
-        target_output_natural
-    };
-    let mut output_remaining = target;
-    let mut input_total = 0.0_f64;
+        walk_sell_exact_out(
+            output_raw,
+            input_decimals,
+            output_decimals,
+            side,
+            base_sz_decimals,
+        )
+    }
+}
+
+fn walk_buy_exact_in(
+    usdc_input_raw: U256,
+    usdc_decimals: u8,
+    base_decimals: u8,
+    side: &[L2Level],
+    base_sz_decimals: u8,
+) -> ProviderResult<U256> {
+    let scales = BookWalkScales::new(base_decimals, usdc_decimals, base_sz_decimals)?;
+    let mut usdc_remaining = usdc_input_raw;
+    let mut base_total = U256::ZERO;
+    let mut exhausted_book = true;
+
     for level in side {
-        if output_remaining <= 0.0 {
+        if usdc_remaining.is_zero() {
+            exhausted_book = false;
             break;
         }
-        let px = parse_hl_decimal(&level.px, "px")?;
-        let sz = parse_hl_decimal(&level.sz, "sz")?;
-        if px <= 0.0 || sz <= 0.0 {
+        let Some(level) = parse_hl_book_level(level, base_decimals)? else {
+            continue;
+        };
+        let affordable = max_base_for_usdc_budget(usdc_remaining, level.price_raw, scales)?;
+        if affordable.is_zero() {
+            exhausted_book = false;
+            break;
+        }
+        let base_taken = affordable.min(level.base_size_raw);
+        let cost = base_to_usdc_raw_ceil(base_taken, level.price_raw, scales)?;
+        if cost > usdc_remaining {
+            return Err("hyperliquid quote: internal buy book walk overran input".to_string());
+        }
+
+        usdc_remaining -= cost;
+        base_total = checked_add_u256(
+            base_total,
+            base_taken,
+            "hyperliquid quote: accumulated base output overflowed",
+        )?;
+        if base_taken < level.base_size_raw {
+            exhausted_book = false;
+            break;
+        }
+    }
+
+    if exhausted_book && !usdc_remaining.is_zero() {
+        return Err(format!(
+            "hyperliquid quote: book side could not absorb remaining input {usdc_remaining}"
+        ));
+    }
+    Ok(floor_to_quantum(base_total, scales.base_quantum_raw))
+}
+
+fn walk_sell_exact_in(
+    base_input_raw: U256,
+    base_decimals: u8,
+    usdc_decimals: u8,
+    side: &[L2Level],
+    base_sz_decimals: u8,
+) -> ProviderResult<U256> {
+    let scales = BookWalkScales::new(base_decimals, usdc_decimals, base_sz_decimals)?;
+    let mut base_remaining = floor_to_quantum(base_input_raw, scales.base_quantum_raw);
+    let mut usdc_total = U256::ZERO;
+
+    for level in side {
+        if base_remaining.is_zero() {
+            break;
+        }
+        let Some(level) = parse_hl_book_level(level, base_decimals)? else {
+            continue;
+        };
+        let base_taken = base_remaining.min(level.base_size_raw);
+        let usdc_gained = base_to_usdc_raw_floor(base_taken, level.price_raw, scales)?;
+        usdc_total = checked_add_u256(
+            usdc_total,
+            usdc_gained,
+            "hyperliquid quote: accumulated USDC output overflowed",
+        )?;
+        base_remaining -= base_taken;
+    }
+
+    if !base_remaining.is_zero() {
+        return Err(format!(
+            "hyperliquid quote: book side could not absorb remaining input {base_remaining}"
+        ));
+    }
+    Ok(usdc_total)
+}
+
+fn walk_buy_exact_out(
+    base_output_raw: U256,
+    usdc_decimals: u8,
+    base_decimals: u8,
+    side: &[L2Level],
+    base_sz_decimals: u8,
+) -> ProviderResult<U256> {
+    let scales = BookWalkScales::new(base_decimals, usdc_decimals, base_sz_decimals)?;
+    let mut base_remaining = ceil_to_quantum(base_output_raw, scales.base_quantum_raw)?;
+    let mut usdc_total = U256::ZERO;
+
+    for level in side {
+        if base_remaining.is_zero() {
+            break;
+        }
+        let Some(level) = parse_hl_book_level(level, base_decimals)? else {
+            continue;
+        };
+        let base_taken = base_remaining.min(level.base_size_raw);
+        let usdc_spent = base_to_usdc_raw_ceil(base_taken, level.price_raw, scales)?;
+        usdc_total = checked_add_u256(
+            usdc_total,
+            usdc_spent,
+            "hyperliquid quote: accumulated USDC input overflowed",
+        )?;
+        base_remaining -= base_taken;
+    }
+
+    if !base_remaining.is_zero() {
+        return Err(format!(
+            "hyperliquid quote: book side could not produce remaining output {base_remaining}"
+        ));
+    }
+    Ok(usdc_total)
+}
+
+fn walk_sell_exact_out(
+    usdc_output_raw: U256,
+    base_decimals: u8,
+    usdc_decimals: u8,
+    side: &[L2Level],
+    base_sz_decimals: u8,
+) -> ProviderResult<U256> {
+    let scales = BookWalkScales::new(base_decimals, usdc_decimals, base_sz_decimals)?;
+    let mut usdc_remaining = usdc_output_raw;
+    let mut base_total = U256::ZERO;
+
+    for level in side {
+        if usdc_remaining.is_zero() {
+            break;
+        }
+        let Some(level) = parse_hl_book_level(level, base_decimals)? else {
+            continue;
+        };
+        let full_level_output =
+            base_to_usdc_raw_floor(level.base_size_raw, level.price_raw, scales)?;
+        if full_level_output.is_zero() {
             continue;
         }
-        let (output_gained, input_spent) = if is_buy {
-            // Buying base: output is base; each unit of base costs `px` USDC.
-            let base_taken = output_remaining.min(sz);
-            (base_taken, base_taken * px)
+        let base_taken = if full_level_output <= usdc_remaining {
+            usdc_remaining -= full_level_output;
+            level.base_size_raw
         } else {
-            // Selling base for USDC: each unit of base yields `px` USDC.
-            let base_for_usdc = output_remaining / px;
-            let base_taken = base_for_usdc.min(sz);
-            (base_taken * px, base_taken)
+            let base_needed = min_base_for_usdc_output(
+                usdc_remaining,
+                level.price_raw,
+                level.base_size_raw,
+                scales,
+            )?;
+            usdc_remaining = U256::ZERO;
+            base_needed
         };
-        output_remaining -= output_gained;
-        input_total += input_spent;
+        base_total = checked_add_u256(
+            base_total,
+            base_taken,
+            "hyperliquid quote: accumulated base input overflowed",
+        )?;
     }
-    if output_remaining > book_walk_tolerance(target) {
+
+    if !usdc_remaining.is_zero() {
         return Err(format!(
-            "hyperliquid quote: book side could not produce remaining output {output_remaining}"
+            "hyperliquid quote: book side could not produce remaining output {usdc_remaining}"
         ));
     }
-    Ok((input_total, target))
+    Ok(base_total)
 }
 
-fn book_walk_tolerance(amount: f64) -> f64 {
-    HL_BOOK_WALK_ABSOLUTE_EPSILON.max(amount.abs() * HL_BOOK_WALK_RELATIVE_EPSILON)
+#[derive(Debug, Clone, Copy)]
+struct BookWalkScales {
+    base_scale: U256,
+    usdc_scale: U256,
+    price_scale: U256,
+    base_quantum_raw: U256,
 }
 
-/// Parse an HL book level string (decimal notation, e.g. `"60000.0"`) into an
-/// `f64`. HL never uses scientific notation in `/info` responses.
-fn parse_hl_decimal(s: &str, field: &'static str) -> ProviderResult<f64> {
-    s.parse::<f64>()
-        .map_err(|err| format!("hyperliquid quote: invalid {field} {s:?}: {err}"))
-}
-
-/// Convert a natural-unit `f64` into a wire-unit integer string with the
-/// given decimal precision. Truncates toward zero at the wire boundary so the
-/// result is never larger than what HL's book walk actually realises.
-fn natural_to_wire(value: f64, decimals: u8) -> ProviderResult<String> {
-    if !value.is_finite() || value < 0.0 {
-        return Err(format!(
-            "hyperliquid quote: non-finite or negative natural amount {value}"
-        ));
+impl BookWalkScales {
+    fn new(base_decimals: u8, usdc_decimals: u8, base_sz_decimals: u8) -> ProviderResult<Self> {
+        let base_scale = checked_pow10(base_decimals).ok_or_else(|| {
+            format!("hyperliquid quote: base scale 10^{base_decimals} overflowed")
+        })?;
+        let usdc_scale = checked_pow10(usdc_decimals).ok_or_else(|| {
+            format!("hyperliquid quote: USDC scale 10^{usdc_decimals} overflowed")
+        })?;
+        let price_scale = checked_pow10(HL_PRICE_DECIMALS).ok_or_else(|| {
+            format!("hyperliquid quote: price scale 10^{HL_PRICE_DECIMALS} overflowed")
+        })?;
+        let base_quantum_raw = base_quantum_raw(base_decimals, base_sz_decimals)?;
+        Ok(Self {
+            base_scale,
+            usdc_scale,
+            price_scale,
+            base_quantum_raw,
+        })
     }
-    let scaled = value * 10_f64.powi(i32::from(decimals));
-    if !scaled.is_finite() {
-        return Err(format!(
-            "hyperliquid quote: amount {value} overflows wire unit scale"
-        ));
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ParsedBookLevel {
+    price_raw: U256,
+    base_size_raw: U256,
+}
+
+fn parse_hl_book_level(
+    level: &L2Level,
+    base_decimals: u8,
+) -> ProviderResult<Option<ParsedBookLevel>> {
+    let price_raw = parse_decimal_to_raw_units(&level.px, HL_PRICE_DECIMALS)
+        .map_err(|err| format!("hyperliquid quote: invalid px {:?}: {err}", level.px))?;
+    let base_size_raw = parse_decimal_to_raw_units(&level.sz, base_decimals)
+        .map_err(|err| format!("hyperliquid quote: invalid sz {:?}: {err}", level.sz))?;
+    if price_raw.is_zero() || base_size_raw.is_zero() {
+        return Ok(None);
     }
-    Ok(format!("{}", scaled.trunc() as u128))
+    Ok(Some(ParsedBookLevel {
+        price_raw,
+        base_size_raw,
+    }))
+}
+
+fn base_quantum_raw(base_decimals: u8, base_sz_decimals: u8) -> ProviderResult<U256> {
+    if base_decimals <= base_sz_decimals {
+        return Ok(U256::from(1_u64));
+    }
+    let scale_decimals = base_decimals - base_sz_decimals;
+    checked_pow10(scale_decimals).ok_or_else(|| {
+        format!("hyperliquid quote: base executable quantum 10^{scale_decimals} overflowed")
+    })
+}
+
+fn floor_to_quantum(value: U256, quantum: U256) -> U256 {
+    if quantum <= U256::from(1_u64) {
+        return value;
+    }
+    value / quantum * quantum
+}
+
+fn ceil_to_quantum(value: U256, quantum: U256) -> ProviderResult<U256> {
+    if value.is_zero() || quantum <= U256::from(1_u64) {
+        return Ok(value);
+    }
+    let quotient = value / quantum;
+    let remainder = value % quantum;
+    if remainder.is_zero() {
+        return Ok(value);
+    }
+    quotient
+        .checked_add(U256::from(1_u64))
+        .and_then(|rounded| rounded.checked_mul(quantum))
+        .ok_or_else(|| "hyperliquid quote: quantized base amount overflowed".to_string())
+}
+
+fn base_to_usdc_raw_floor(
+    base_raw: U256,
+    price_raw: U256,
+    scales: BookWalkScales,
+) -> ProviderResult<U256> {
+    scaled_ratio_floor(
+        base_raw,
+        price_raw,
+        scales.usdc_scale,
+        scales.base_scale,
+        scales.price_scale,
+        "hyperliquid quote: base-to-USDC floor conversion",
+    )
+}
+
+fn base_to_usdc_raw_ceil(
+    base_raw: U256,
+    price_raw: U256,
+    scales: BookWalkScales,
+) -> ProviderResult<U256> {
+    scaled_ratio_ceil(
+        base_raw,
+        price_raw,
+        scales.usdc_scale,
+        scales.base_scale,
+        scales.price_scale,
+        "hyperliquid quote: base-to-USDC ceil conversion",
+    )
+}
+
+fn usdc_to_base_raw_floor(
+    usdc_raw: U256,
+    price_raw: U256,
+    scales: BookWalkScales,
+) -> ProviderResult<U256> {
+    scaled_ratio_floor(
+        usdc_raw,
+        scales.base_scale,
+        scales.price_scale,
+        price_raw,
+        scales.usdc_scale,
+        "hyperliquid quote: USDC-to-base floor conversion",
+    )
+}
+
+fn max_base_for_usdc_budget(
+    usdc_budget_raw: U256,
+    price_raw: U256,
+    scales: BookWalkScales,
+) -> ProviderResult<U256> {
+    let mut low = U256::ZERO;
+    let mut high = usdc_to_base_raw_floor(usdc_budget_raw, price_raw, scales)?;
+    if high.is_zero() {
+        return Ok(U256::ZERO);
+    }
+    if base_to_usdc_raw_ceil(high, price_raw, scales)? <= usdc_budget_raw {
+        return Ok(high);
+    }
+    while low < high {
+        let mid = low + (high - low + U256::from(1_u64)) / U256::from(2_u64);
+        let cost = base_to_usdc_raw_ceil(mid, price_raw, scales)?;
+        if cost <= usdc_budget_raw {
+            low = mid;
+        } else {
+            high = mid - U256::from(1_u64);
+        }
+    }
+    Ok(low)
+}
+
+fn min_base_for_usdc_output(
+    usdc_target_raw: U256,
+    price_raw: U256,
+    max_base_raw: U256,
+    scales: BookWalkScales,
+) -> ProviderResult<U256> {
+    if usdc_target_raw.is_zero() {
+        return Ok(U256::ZERO);
+    }
+    let mut low = U256::from(1_u64);
+    let mut high = max_base_raw;
+    while low < high {
+        let mid = low + (high - low) / U256::from(2_u64);
+        let output = base_to_usdc_raw_floor(mid, price_raw, scales)?;
+        if output >= usdc_target_raw {
+            high = mid;
+        } else {
+            low = mid + U256::from(1_u64);
+        }
+    }
+    let quantized = ceil_to_quantum(low, scales.base_quantum_raw)?;
+    if quantized > max_base_raw {
+        return Err(
+            "hyperliquid quote: executable base quantum exceeds available book level".to_string(),
+        );
+    }
+    let output = base_to_usdc_raw_floor(quantized, price_raw, scales)?;
+    if output < usdc_target_raw {
+        return Err("hyperliquid quote: quantized base input underfills output".to_string());
+    }
+    Ok(quantized)
+}
+
+fn scaled_ratio_floor(
+    a: U256,
+    b: U256,
+    c: U256,
+    denominator_a: U256,
+    denominator_b: U256,
+    context: &'static str,
+) -> ProviderResult<U256> {
+    let numerator = checked_mul3_u512(a, b, c, context)?;
+    let denominator = checked_mul_u512(
+        U512::from(denominator_a),
+        U512::from(denominator_b),
+        context,
+    )?;
+    if denominator.is_zero() {
+        return Err(format!("{context} denominator was zero"));
+    }
+    u512_to_u256(numerator / denominator, context)
+}
+
+fn scaled_ratio_ceil(
+    a: U256,
+    b: U256,
+    c: U256,
+    denominator_a: U256,
+    denominator_b: U256,
+    context: &'static str,
+) -> ProviderResult<U256> {
+    let numerator = checked_mul3_u512(a, b, c, context)?;
+    let denominator = checked_mul_u512(
+        U512::from(denominator_a),
+        U512::from(denominator_b),
+        context,
+    )?;
+    let value = div_ceil_u512(numerator, denominator, context)?;
+    u512_to_u256(value, context)
+}
+
+fn checked_mul3_u512(a: U256, b: U256, c: U256, context: &'static str) -> ProviderResult<U512> {
+    let product = checked_mul_u512(U512::from(a), U512::from(b), context)?;
+    checked_mul_u512(product, U512::from(c), context)
+}
+
+fn checked_mul_u512(lhs: U512, rhs: U512, context: &'static str) -> ProviderResult<U512> {
+    lhs.checked_mul(rhs)
+        .ok_or_else(|| format!("{context} multiplication overflowed"))
+}
+
+fn checked_add_u256(lhs: U256, rhs: U256, context: &'static str) -> ProviderResult<U256> {
+    lhs.checked_add(rhs).ok_or_else(|| context.to_string())
+}
+
+fn u512_to_u256(value: U512, context: &'static str) -> ProviderResult<U256> {
+    if value > U512::from(U256::MAX) {
+        return Err(format!("{context} exceeded uint256"));
+    }
+    U256::from_str_radix(&value.to_string(), 10)
+        .map_err(|err| format!("{context} did not fit uint256: {err}"))
 }
 
 /// Build the per-leg descriptor the planner reads to emit a
@@ -4665,6 +5843,7 @@ fn classify_hl_leg(
 /// rounded to the base's `sz_decimals`.
 fn compute_base_sz(
     is_buy: bool,
+    order_kind: &str,
     amount_in_wire: &str,
     input_decimals: u8,
     amount_out_wire: &str,
@@ -4676,9 +5855,56 @@ fn compute_base_sz(
     } else {
         (amount_in_wire, input_decimals)
     };
-    let natural = wire_to_f64(wire, decimals)?;
-    round_to_decimals(natural, usize::from(base_sz_decimals))
-        .map(|val| format_decimal_string(val, usize::from(base_sz_decimals)))
+    let base_sz_wire = match order_kind {
+        "exact_in" => quantize_base_sz_wire(wire, decimals, base_sz_decimals, false),
+        "exact_out" => quantize_base_sz_wire(wire, decimals, base_sz_decimals, true),
+        other => Err(format!(
+            "hyperliquid trade: unknown order_kind {other:?} computing base sz"
+        )),
+    }?;
+    format_hyperliquid_amount(&base_sz_wire.to_string(), base_sz_decimals)
+}
+
+fn quantize_base_sz_wire(
+    wire: &str,
+    wire_decimals: u8,
+    base_sz_decimals: u8,
+    round_up: bool,
+) -> ProviderResult<U256> {
+    let trimmed = wire.trim();
+    if trimmed.is_empty() || !trimmed.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!(
+            "hyperliquid trade: wire amount must be a non-negative integer, got {wire:?}"
+        ));
+    }
+    let raw = U256::from_str_radix(trimmed, 10)
+        .map_err(|err| format!("hyperliquid trade: wire amount {wire:?} does not fit: {err}"))?;
+    match wire_decimals.cmp(&base_sz_decimals) {
+        std::cmp::Ordering::Equal => Ok(raw),
+        std::cmp::Ordering::Greater => {
+            let scale_decimals = wire_decimals - base_sz_decimals;
+            let scale = checked_pow10(scale_decimals).ok_or_else(|| {
+                format!("hyperliquid trade: base size scale 10^{scale_decimals} overflowed")
+            })?;
+            let quotient = raw / scale;
+            let remainder = raw % scale;
+            if round_up && !remainder.is_zero() {
+                quotient
+                    .checked_add(U256::from(1_u64))
+                    .ok_or_else(|| "hyperliquid trade: rounded base size overflowed".to_string())
+            } else {
+                Ok(quotient)
+            }
+        }
+        std::cmp::Ordering::Less => {
+            let scale_decimals = base_sz_decimals - wire_decimals;
+            let scale = checked_pow10(scale_decimals).ok_or_else(|| {
+                format!("hyperliquid trade: base size scale 10^{scale_decimals} overflowed")
+            })?;
+            raw.checked_mul(scale)
+                .ok_or_else(|| "hyperliquid trade: scaled base size overflowed".to_string())
+        }
+    }
 }
 
 struct LimitPxInput<'a> {
@@ -4751,54 +5977,128 @@ fn compute_limit_px(input: LimitPxInput<'_>) -> ProviderResult<String> {
         }
     };
 
-    let usdc_natural = wire_to_f64(usdc_wire, usdc_decimals)?;
-    let base_natural = wire_to_f64(base_wire, base_decimals)?;
-    if base_natural <= 0.0 {
-        return Err(format!(
-            "hyperliquid trade: non-positive base amount ({base_natural}) computing limit_px"
-        ));
-    }
-    let rate = usdc_natural / base_natural;
-    format_hl_spot_price(rate, base_sz_decimals, is_buy)
+    format_hl_spot_price_from_wire(
+        usdc_wire,
+        usdc_decimals,
+        base_wire,
+        base_decimals,
+        base_sz_decimals,
+        is_buy,
+    )
 }
 
-/// Parse a wire-unit amount (integer string) into a natural-unit f64.
-/// `decimals` is the number of decimals the asset wire amount carries —
-/// UBTC is 8, router-side Hyperliquid USDC is 6, and UETH is 18.
-fn wire_to_f64(wire: &str, decimals: u8) -> ProviderResult<f64> {
+fn parse_wire_u256(wire: &str) -> ProviderResult<U256> {
     let trimmed = wire.trim();
     if trimmed.is_empty() || !trimmed.chars().all(|c| c.is_ascii_digit()) {
         return Err(format!(
             "hyperliquid trade: wire amount must be a non-negative integer, got {wire:?}"
         ));
     }
-    let value: u128 = trimmed
-        .parse()
-        .map_err(|err| format!("hyperliquid trade: wire amount {wire:?} does not fit: {err}"))?;
-    // f64 loses precision past 2^53; wire amounts up to ~9e15 are exact, and
-    // HL spot amounts fit comfortably. Loss on the tail is below tick-size.
-    Ok(value as f64 / 10_f64.powi(i32::from(decimals)))
+    U256::from_str_radix(trimmed, 10)
+        .map_err(|err| format!("hyperliquid trade: wire amount {wire:?} does not fit: {err}"))
 }
 
-/// Truncate `value` toward zero to `decimals` decimal places (HL requires
-/// `sz` to be quantized to `sz_decimals`).
-fn round_to_decimals(value: f64, decimals: usize) -> ProviderResult<f64> {
-    if !value.is_finite() || value < 0.0 {
+fn format_hl_spot_price_from_wire(
+    usdc_wire: &str,
+    usdc_decimals: u8,
+    base_wire: &str,
+    base_decimals: u8,
+    base_sz_decimals: u8,
+    is_buy: bool,
+) -> ProviderResult<String> {
+    let usdc = parse_wire_u256(usdc_wire)?;
+    let base = parse_wire_u256(base_wire)?;
+    if base.is_zero() {
+        return Err("hyperliquid trade: base amount is zero computing limit_px".to_string());
+    }
+
+    let numerator = U512::from(usdc)
+        .checked_mul(pow10_u512(usize::from(base_decimals))?)
+        .ok_or_else(|| "hyperliquid trade: limit price numerator overflowed".to_string())?;
+    let denominator = U512::from(base)
+        .checked_mul(pow10_u512(usize::from(usdc_decimals))?)
+        .ok_or_else(|| "hyperliquid trade: limit price denominator overflowed".to_string())?;
+    if denominator.is_zero() {
+        return Err("hyperliquid trade: limit price denominator is zero".to_string());
+    }
+
+    let magnitude = rational_decimal_magnitude(numerator, denominator)?;
+    let max_decimals = hl_spot_price_max_decimals(base_sz_decimals)?;
+    let sig_fig_decimals = (HL_SPOT_PRICE_SIG_FIGS - 1 - magnitude).max(0) as usize;
+    let allowed_decimals = sig_fig_decimals.min(max_decimals);
+    let scale = pow10_u512(allowed_decimals)?;
+    let scaled_numerator = numerator
+        .checked_mul(scale)
+        .ok_or_else(|| "hyperliquid trade: scaled limit price overflowed".to_string())?;
+    let quotient = scaled_numerator / denominator;
+    let remainder = scaled_numerator % denominator;
+    let quantized = if is_buy || remainder.is_zero() {
+        quotient
+    } else {
+        quotient
+            .checked_add(U512::from(1_u64))
+            .ok_or_else(|| "hyperliquid trade: rounded limit price overflowed".to_string())?
+    };
+    if quantized.is_zero() {
         return Err(format!(
-            "hyperliquid trade: non-finite or negative amount {value}"
+            "hyperliquid trade: limit price quantized to zero at {allowed_decimals} decimals"
         ));
     }
-    let factor = 10_f64.powi(decimals as i32);
-    Ok((value * factor).trunc() / factor)
+    format_hyperliquid_amount(&quantized.to_string(), allowed_decimals as u8)
+}
+
+fn rational_decimal_magnitude(numerator: U512, denominator: U512) -> ProviderResult<i32> {
+    if numerator.is_zero() || denominator.is_zero() {
+        return Err("hyperliquid trade: cannot compute magnitude for zero rational".to_string());
+    }
+    let mut magnitude = numerator.to_string().len() as i32 - denominator.to_string().len() as i32;
+    if magnitude >= 0 {
+        let scale = pow10_u512(magnitude as usize)?;
+        let threshold = denominator.checked_mul(scale);
+        if threshold.is_none_or(|value| numerator < value) {
+            magnitude -= 1;
+        }
+    } else {
+        let scale = pow10_u512((-magnitude) as usize)?;
+        if numerator
+            .checked_mul(scale)
+            .is_some_and(|scaled| scaled < denominator)
+        {
+            magnitude -= 1;
+        }
+    }
+    Ok(magnitude)
+}
+
+fn pow10_u512(decimals: usize) -> ProviderResult<U512> {
+    let mut value = U512::from(1_u64);
+    for _ in 0..decimals {
+        value = value
+            .checked_mul(U512::from(10_u64))
+            .ok_or_else(|| format!("hyperliquid trade: 10^{decimals} overflowed"))?;
+    }
+    Ok(value)
+}
+
+fn hl_spot_price_max_decimals(base_sz_decimals: u8) -> ProviderResult<usize> {
+    let base_sz_decimals = i32::from(base_sz_decimals);
+    if base_sz_decimals > HL_SPOT_MAX_DECIMALS {
+        return Err(format!(
+            "hyperliquid trade: base sz_decimals {base_sz_decimals} exceeds max spot decimal places {HL_SPOT_MAX_DECIMALS}"
+        ));
+    }
+    Ok((HL_SPOT_MAX_DECIMALS - base_sz_decimals) as usize)
 }
 
 /// Format a positive f64 as a decimal string with at most `decimals` digits
 /// after the point, trimming trailing zeros. HL rejects values like "0.00".
+#[cfg(test)]
 fn format_decimal_string(value: f64, decimals: usize) -> String {
     let formatted = format!("{value:.*}", decimals);
     trim_decimal_string(&formatted)
 }
 
+#[cfg(test)]
 fn trim_decimal_string(s: &str) -> String {
     if s.contains('.') {
         let trimmed = s.trim_end_matches('0').trim_end_matches('.');
@@ -4816,14 +6116,14 @@ fn trim_decimal_string(s: &str) -> String {
 /// `HL_SPOT_MAX_DECIMALS - base_sz_decimals` decimal places. Rounds down for
 /// buys (limit_px ≤ user max) and up for sells (limit_px ≥ user min) so the
 /// submitted limit order never violates the user's slippage bound.
+#[cfg(test)]
 fn format_hl_spot_price(rate: f64, base_sz_decimals: u8, is_buy: bool) -> ProviderResult<String> {
     if !rate.is_finite() || rate <= 0.0 {
         return Err(format!(
             "hyperliquid trade: non-positive or non-finite rate {rate}"
         ));
     }
-    let max_decimals =
-        (HL_SPOT_MAX_DECIMALS.saturating_sub(i32::from(base_sz_decimals))).max(0) as usize;
+    let max_decimals = hl_spot_price_max_decimals(base_sz_decimals)?;
     let magnitude = rate.log10().floor() as i32;
     let sig_fig_decimals = (HL_SPOT_PRICE_SIG_FIGS - 1 - magnitude).max(0) as usize;
     let allowed_decimals = sig_fig_decimals.min(max_decimals);
@@ -4884,8 +6184,73 @@ fn hyperliquid_no_op_quote(
     }
 }
 
-fn normalize_base_url(base_url: impl Into<String>) -> String {
-    base_url.into().trim_end_matches('/').to_string()
+fn normalize_base_url(base_url: impl Into<String>) -> Result<String, String> {
+    let base_url = base_url.into().trim().trim_end_matches('/').to_string();
+    let sanitized_base_url = sanitize_url_for_error(&base_url);
+    let parsed = Url::parse(&base_url)
+        .map_err(|err| format!("provider base URL {sanitized_base_url:?} is invalid: {err}"))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        scheme => {
+            return Err(format!(
+                "provider base URL {sanitized_base_url:?} must use http or https, got {scheme:?}"
+            ));
+        }
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(format!(
+            "provider base URL {sanitized_base_url:?} must not include credentials"
+        ));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(format!(
+            "provider base URL {sanitized_base_url:?} must not include a query string or fragment"
+        ));
+    }
+    Ok(base_url)
+}
+
+fn sanitize_url_for_error(value: &str) -> String {
+    if let Ok(mut parsed) = Url::parse(value.trim()) {
+        if !parsed.username().is_empty() {
+            let _ = parsed.set_username("redacted");
+        }
+        if parsed.password().is_some() {
+            let _ = parsed.set_password(Some("redacted"));
+        }
+        if parsed.query().is_some() {
+            parsed.set_query(Some("redacted"));
+        }
+        if parsed.fragment().is_some() {
+            parsed.set_fragment(Some("redacted"));
+        }
+        parsed.to_string()
+    } else {
+        value.chars().take(128).collect()
+    }
+}
+
+fn redacted_url_for_debug(value: &str) -> String {
+    let Ok(parsed) = Url::parse(value.trim()) else {
+        return "<invalid url>".to_string();
+    };
+
+    let host = parsed.host_str().unwrap_or("<missing-host>");
+    let mut redacted = format!("{}://{}", parsed.scheme(), host);
+    if let Some(port) = parsed.port() {
+        redacted.push(':');
+        redacted.push_str(&port.to_string());
+    }
+    if parsed.path() != "/" {
+        redacted.push_str("/<redacted-path>");
+    }
+    if parsed.query().is_some() {
+        redacted.push_str("?<redacted-query>");
+    }
+    if parsed.fragment().is_some() {
+        redacted.push_str("#<redacted-fragment>");
+    }
+    redacted
 }
 
 fn hyperliquid_api_network(network: HyperliquidCallNetwork) -> HyperliquidApiNetwork {
@@ -4898,7 +6263,7 @@ fn hyperliquid_api_network(network: HyperliquidCallNetwork) -> HyperliquidApiNet
 #[must_use]
 pub fn ethereum_native_asset() -> DepositAsset {
     DepositAsset {
-        chain: ChainId::parse("evm:1").expect("hardcoded ethereum chain id must be valid"),
+        chain: ChainId::from_trusted_static("evm:1"),
         asset: AssetId::Native,
     }
 }
@@ -4906,23 +6271,141 @@ pub fn ethereum_native_asset() -> DepositAsset {
 #[cfg(test)]
 mod hyperliquid_math_tests {
     use super::{
-        cctp_quote_amounts, classify_hl_leg, compute_base_sz, compute_limit_px, decimal_bps_string,
-        encode_erc20_approve, format_hl_spot_price, hl_leg_descriptor,
+        build_across_swap_approval_request, cctp_message_status_is_failed, cctp_provider_address,
+        cctp_provider_domain, cctp_quote_amounts, cctp_source_domain_from_request,
+        checked_timeout_at_ms, classify_hl_leg, compute_base_sz, compute_limit_px,
+        decimal_bps_string, encode_erc20_approve, format_hl_spot_price, hl_leg_descriptor,
+        hyperliquid_bridge_deposit_completion_response, hyperliquid_order_status_provider_status,
         observed_unit_operation_fingerprints, parse_decimal_bps_to_micros,
-        parse_decimal_to_raw_units_floor, seen_operation_fingerprints_from_request,
-        unit_operation_provider_status, unit_withdrawal_minimum_raw, velora_slippage_bps,
-        wire_to_f64, BridgeProvider, BridgeQuoteRequest, CctpQuoteAmounts,
-        HyperliquidBridgeProvider, HyperliquidCallNetwork, LimitPxInput,
-        HYPERLIQUID_BRIDGE_WITHDRAW_FEE_RAW,
+        parse_decimal_to_raw_units_floor, seen_operation_fingerprints_from_request, simulate_leg,
+        unit_operation_provider_status, unit_withdrawal_minimum_raw,
+        validated_unit_generate_address, velora_slippage_bps, AcrossHttpProviderConfig,
+        ActionProviderHttpOptions, ActionProviderRegistry, BridgeExecutionRequest, BridgeProvider,
+        BridgeQuoteRequest, CctpHttpProviderConfig, CctpMessagesResponse, CctpQuoteAmounts,
+        ExchangeExecutionRequest, ExchangeProvider, HyperliquidBridgeProvider,
+        HyperliquidCallNetwork, HyperliquidProvider, HyperliquidTradeAssetRef,
+        HyperliquidTradeStepRequest, LimitPxInput, ProviderExecutionIntent,
+        ProviderOperationObservationRequest, UniversalRouterAssetRef, VeloraHttpProviderConfig,
+        VeloraProvider, DEFAULT_HYPERLIQUID_ORDER_TIMEOUT_MS, HYPERLIQUID_BRIDGE_WITHDRAW_FEE_RAW,
     };
     use crate::{
-        models::{MarketOrderKind, ProviderOperationStatus},
+        models::{MarketOrderKind, ProviderOperationStatus, ProviderOperationType},
         protocol::{AssetId, ChainId, DepositAsset},
-        services::AssetRegistry,
+        services::{
+            AssetRegistry, CanonicalAsset, ProviderAsset, ProviderAssetCapability, ProviderId,
+        },
     };
     use alloy::primitives::U256;
+    use hyperliquid_client::info::{ClearinghouseState, L2BookSnapshot, L2Level};
+    use hyperunit_client::{UnitChain, UnitGenerateAddressResponse};
     use serde_json::json;
     use std::sync::Arc;
+    use uuid::Uuid;
+
+    #[test]
+    fn universal_router_asset_ref_normalizes_evm_token_addresses() {
+        let asset = UniversalRouterAssetRef {
+            chain_id: "evm:1".to_string(),
+            asset: "0xA0B86991C6218B36C1D19D4A2E9EB0CE3606EB48".to_string(),
+        }
+        .deposit_asset()
+        .unwrap();
+
+        assert_eq!(asset.chain.as_str(), "evm:1");
+        assert_eq!(
+            asset.asset.as_str(),
+            "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+        );
+    }
+
+    #[test]
+    fn cctp_provider_domain_rejects_malformed_registry_chain() {
+        let entry = cctp_provider_asset(
+            "circle-mainnet",
+            "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+        );
+
+        let error = cctp_provider_domain(&entry, ProviderAssetCapability::BridgeInput)
+            .expect_err("malformed CCTP domain should fail");
+
+        assert!(error.contains("invalid CCTP provider chain"), "{error}");
+        assert!(error.contains("circle-mainnet"), "{error}");
+    }
+
+    #[test]
+    fn cctp_provider_address_rejects_malformed_registry_asset() {
+        let entry = cctp_provider_asset("0", "usdc");
+
+        let error = cctp_provider_address(&entry, ProviderAssetCapability::BridgeInput)
+            .expect_err("malformed CCTP token should fail");
+
+        assert!(error.contains("invalid CCTP provider asset"), "{error}");
+        assert!(error.contains("usdc"), "{error}");
+    }
+
+    #[test]
+    fn cctp_source_domain_request_rejects_malformed_values() {
+        let error = cctp_source_domain_from_request(&json!({ "source_domain": "0" }))
+            .expect_err("string source_domain must reject");
+        assert!(
+            error.contains("source_domain must be an unsigned integer"),
+            "{error}"
+        );
+
+        let error =
+            cctp_source_domain_from_request(&json!({ "source_domain": u64::from(u32::MAX) + 1 }))
+                .expect_err("overflowing source_domain must reject");
+        assert!(
+            error.contains("source_domain exceeds u32 maximum"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn cctp_messages_response_requires_messages_and_status() {
+        let missing_messages = serde_json::from_value::<CctpMessagesResponse>(json!({}))
+            .expect_err("messages field must be required");
+        assert!(
+            missing_messages
+                .to_string()
+                .contains("missing field `messages`"),
+            "{missing_messages}"
+        );
+
+        let missing_status = serde_json::from_value::<CctpMessagesResponse>(json!({
+            "messages": [
+                {
+                    "message": "0x01",
+                    "attestation": "0x02"
+                }
+            ]
+        }))
+        .expect_err("message status must be required");
+        assert!(
+            missing_status
+                .to_string()
+                .contains("missing field `status`"),
+            "{missing_status}"
+        );
+
+        let empty_messages = serde_json::from_value::<CctpMessagesResponse>(json!({
+            "messages": []
+        }))
+        .expect("empty messages array is a valid pending response");
+        assert!(empty_messages.messages.is_empty());
+    }
+
+    fn cctp_provider_asset(provider_chain: &str, provider_asset: &str) -> ProviderAsset {
+        ProviderAsset {
+            provider: ProviderId::Cctp,
+            canonical: CanonicalAsset::Usdc,
+            chain: ChainId::parse("evm:1").expect("chain"),
+            provider_chain: provider_chain.to_string(),
+            provider_asset: provider_asset.to_string(),
+            decimals: 6,
+            capabilities: vec![ProviderAssetCapability::BridgeInput],
+        }
+    }
 
     #[test]
     fn classify_hl_leg_sell_base_for_usdc() {
@@ -4948,6 +6431,208 @@ mod hyperliquid_math_tests {
     #[test]
     fn classify_hl_leg_rejects_usdc_to_usdc() {
         assert!(classify_hl_leg("USDC", 8, "USDC", 8).is_err());
+    }
+
+    #[test]
+    fn hyperliquid_order_status_reads_nested_lifecycle_status() {
+        assert_eq!(
+            hyperliquid_order_status_provider_status(&order_status_response("order", Some("open")))
+                .unwrap(),
+            ProviderOperationStatus::WaitingExternal
+        );
+        assert_eq!(
+            hyperliquid_order_status_provider_status(&order_status_response(
+                "order",
+                Some("filled")
+            ))
+            .unwrap(),
+            ProviderOperationStatus::Completed
+        );
+        assert_eq!(
+            hyperliquid_order_status_provider_status(&order_status_response(
+                "order",
+                Some("scheduledCancel")
+            ))
+            .unwrap(),
+            ProviderOperationStatus::Failed
+        );
+        assert_eq!(
+            hyperliquid_order_status_provider_status(&order_status_response("unknownOid", None))
+                .unwrap(),
+            ProviderOperationStatus::WaitingExternal
+        );
+
+        let missing_envelope =
+            hyperliquid_order_status_provider_status(&order_status_response("order", None))
+                .expect_err("status=order without envelope must reject");
+        assert!(
+            missing_envelope.contains("missing order envelope"),
+            "{missing_envelope}"
+        );
+
+        let unknown_status = hyperliquid_order_status_provider_status(&order_status_response(
+            "order",
+            Some("mystery"),
+        ))
+        .expect_err("unknown nested status must reject");
+        assert!(
+            unknown_status.contains("unsupported orderStatus lifecycle"),
+            "{unknown_status}"
+        );
+    }
+
+    fn order_status_response(
+        status: &str,
+        envelope_status: Option<&str>,
+    ) -> hyperliquid_client::info::OrderStatusResponse {
+        let order = envelope_status.map(|status| {
+            json!({
+                "order": {
+                    "coin": "UBTC/USDC",
+                    "side": "B",
+                    "limitPx": "1",
+                    "sz": "1",
+                    "oid": 7,
+                    "timestamp": 0
+                },
+                "status": status,
+                "statusTimestamp": 0
+            })
+        });
+        serde_json::from_value(json!({
+            "status": status,
+            "order": order,
+        }))
+        .expect("order status fixture")
+    }
+
+    #[test]
+    fn provider_constructors_reject_unsupported_base_urls() {
+        assert!(VeloraProvider::new("https://api.velora.xyz?token=oops", None).is_err());
+        let rendered =
+            match VeloraProvider::new("https://user:pass@api.velora.xyz?token=secret", None) {
+                Ok(_) => panic!("credentialed provider base URL must fail"),
+                Err(error) => error,
+            };
+        assert!(!rendered.contains("user"));
+        assert!(!rendered.contains("pass"));
+        assert!(!rendered.contains("token"));
+        assert!(!rendered.contains("secret"));
+        assert!(HyperliquidProvider::new(
+            "file:///tmp/hyperliquid",
+            HyperliquidCallNetwork::Mainnet,
+            Arc::new(AssetRegistry::default()),
+            1_000,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn provider_http_config_debug_redacts_secrets() {
+        let config = AcrossHttpProviderConfig::new(
+            "https://user:pass@across.example/provider-path-secret?api_key=query-secret",
+            "across-secret-token-0000000000000000",
+        )
+        .with_integrator_id(Some("integrator".to_string()));
+        let rendered = format!("{config:?}");
+
+        assert!(rendered.contains("api_key"));
+        assert!(rendered.contains("<redacted>"));
+        assert!(rendered.contains("<redacted-path>"));
+        assert!(rendered.contains("<redacted-query>"));
+        assert!(!rendered.contains("across-secret-token"));
+        assert!(!rendered.contains("user"));
+        assert!(!rendered.contains("pass"));
+        assert!(!rendered.contains("provider-path-secret"));
+        assert!(!rendered.contains("query-secret"));
+
+        let options = ActionProviderHttpOptions {
+            across: Some(config),
+            cctp: Some(CctpHttpProviderConfig::new(
+                "https://cctp.example/cctp-path-secret",
+            )),
+            hyperunit_base_url: Some("https://unit.example/unit-path-secret".to_string()),
+            hyperunit_proxy_url: Some("socks5://user:proxy-secret@proxy.example:1080".to_string()),
+            hyperliquid_base_url: Some("https://hyperliquid.example/hyper-path-secret".to_string()),
+            velora: Some(VeloraHttpProviderConfig::new(
+                "not a url containing velora-secret",
+            )),
+            hyperliquid_network: HyperliquidCallNetwork::Mainnet,
+            hyperliquid_order_timeout_ms: DEFAULT_HYPERLIQUID_ORDER_TIMEOUT_MS,
+        };
+        let rendered = format!("{options:?}");
+
+        assert!(rendered.contains("hyperunit_proxy_url"));
+        assert!(rendered.contains("<redacted>"));
+        assert!(rendered.contains("<invalid url>"));
+        assert!(!rendered.contains("proxy-secret"));
+        assert!(!rendered.contains("across-secret-token"));
+        assert!(!rendered.contains("cctp-path-secret"));
+        assert!(!rendered.contains("unit-path-secret"));
+        assert!(!rendered.contains("hyper-path-secret"));
+        assert!(!rendered.contains("velora-secret"));
+    }
+
+    #[test]
+    fn hyperunit_http_config_requires_hyperliquid_base_url() {
+        let error = match ActionProviderRegistry::http_with_options(
+            None,
+            None,
+            Some("http://hyperunit.local".to_string()),
+            None,
+            None,
+            None,
+            HyperliquidCallNetwork::Testnet,
+        ) {
+            Ok(_) => panic!("hyperunit must not be configured without Hyperliquid"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.contains("requires hyperliquid_base_url"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hyperliquid_same_token_trade_is_operationless_provider_only_no_op() {
+        let provider = HyperliquidProvider::new(
+            "http://localhost:1",
+            HyperliquidCallNetwork::Testnet,
+            Arc::new(AssetRegistry::default()),
+            1_000,
+        )
+        .expect("hyperliquid provider should build");
+        let request = ExchangeExecutionRequest::HyperliquidTrade(HyperliquidTradeStepRequest {
+            order_id: Uuid::now_v7(),
+            quote_id: Uuid::now_v7(),
+            order_kind: "exact_in".to_string(),
+            amount_in: "1000000".to_string(),
+            amount_out: "1000000".to_string(),
+            min_amount_out: Some("990000".to_string()),
+            max_amount_in: None,
+            input_asset: HyperliquidTradeAssetRef {
+                chain_id: "hyperliquid".to_string(),
+                asset: "native".to_string(),
+            },
+            output_asset: HyperliquidTradeAssetRef {
+                chain_id: "hyperliquid".to_string(),
+                asset: "native".to_string(),
+            },
+            prefund_from_withdrawable: false,
+            hyperliquid_custody_vault_id: None,
+            hyperliquid_custody_vault_address: None,
+        });
+
+        let intent = provider.execute_trade(&request).await.unwrap();
+        let ProviderExecutionIntent::ProviderOnly { response, state } = intent else {
+            panic!("same-token Hyperliquid trade should be a provider-only no-op");
+        };
+        assert_eq!(response["mode"], json!("no_op"));
+        assert!(
+            state.operation.is_none(),
+            "no-op must not persist a provider operation because there is no external HL ref"
+        );
     }
 
     #[test]
@@ -4977,6 +6662,31 @@ mod hyperliquid_math_tests {
     }
 
     #[test]
+    fn velora_slippage_bps_handles_huge_amounts_without_overflow() {
+        let quoted_out = U256::MAX;
+        let min_out = quoted_out / U256::from(2_u64);
+        let exact_in = MarketOrderKind::ExactIn {
+            amount_in: "1".to_string(),
+            min_amount_out: min_out.to_string(),
+        };
+        assert_eq!(
+            velora_slippage_bps(&exact_in, "1", &quoted_out.to_string()).unwrap(),
+            5000
+        );
+
+        let quoted_in = U256::MAX / U256::from(2_u64);
+        let max_in = quoted_in + quoted_in / U256::from(10_u64);
+        let exact_out = MarketOrderKind::ExactOut {
+            amount_out: "1".to_string(),
+            max_amount_in: max_in.to_string(),
+        };
+        assert_eq!(
+            velora_slippage_bps(&exact_out, &quoted_in.to_string(), "1").unwrap(),
+            999
+        );
+    }
+
+    #[test]
     fn velora_approval_calldata_targets_erc20_approve() {
         let calldata =
             encode_erc20_approve("0x9999999999999999999999999999999999999999", "12345").unwrap();
@@ -4990,6 +6700,11 @@ mod hyperliquid_math_tests {
         let fee = parse_decimal_bps_to_micros("1.3").unwrap();
         assert_eq!(fee, 1_300_000);
         assert_eq!(decimal_bps_string(fee), "1.3");
+    }
+
+    #[test]
+    fn cctp_decimal_fee_parser_rejects_overflow() {
+        assert!(parse_decimal_bps_to_micros(&format!("{}.1", u128::MAX)).is_err());
     }
 
     #[test]
@@ -5027,16 +6742,164 @@ mod hyperliquid_math_tests {
     }
 
     #[test]
-    fn wire_to_f64_converts_ubtc_wire() {
-        let value = wire_to_f64("100000000", 8).unwrap();
-        assert!((value - 1.0).abs() < 1e-12);
+    fn cctp_quote_math_uses_wide_intermediates_and_rejects_true_overflow() {
+        let fee_free = MarketOrderKind::ExactOut {
+            amount_out: U256::MAX.to_string(),
+            max_amount_in: U256::MAX.to_string(),
+        };
+        assert_eq!(
+            cctp_quote_amounts(&fee_free, 0).unwrap(),
+            Some(CctpQuoteAmounts {
+                amount_in: U256::MAX,
+                amount_out: U256::MAX,
+                max_fee: U256::ZERO,
+            })
+        );
+
+        let fee_bearing = MarketOrderKind::ExactOut {
+            amount_out: U256::MAX.to_string(),
+            max_amount_in: U256::MAX.to_string(),
+        };
+        assert!(cctp_quote_amounts(&fee_bearing, 1).is_err());
     }
 
     #[test]
-    fn wire_to_f64_rejects_non_integer() {
-        assert!(wire_to_f64("1.5", 8).is_err());
-        assert!(wire_to_f64("", 8).is_err());
-        assert!(wire_to_f64("-1", 8).is_err());
+    fn cctp_failed_iris_statuses_are_terminal_failures() {
+        for status in ["failed", "failure", "error", "FAILED"] {
+            assert!(cctp_message_status_is_failed(status));
+        }
+        for status in ["complete", "pending", "pending_confirmations"] {
+            assert!(!cctp_message_status_is_failed(status));
+        }
+    }
+
+    #[test]
+    fn cctp_burn_request_requires_max_fee() {
+        let mut request = json!({
+            "order_id": Uuid::now_v7(),
+            "transition_decl_id": "cctp:burn:0",
+            "source_chain_id": "evm:8453",
+            "destination_chain_id": "evm:1",
+            "input_asset": "evm:token:0x833589fcd6edb6e08f4c7c32d4f71b54bdA02913",
+            "output_asset": "evm:token:0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+            "amount": "1000000",
+            "recipient_address": "0x1111111111111111111111111111111111111111",
+            "max_fee": "130"
+        });
+
+        BridgeExecutionRequest::cctp_burn_from_value(&request)
+            .expect("well-formed CCTP burn request should decode");
+        request
+            .as_object_mut()
+            .expect("request fixture is an object")
+            .remove("max_fee");
+
+        let error = BridgeExecutionRequest::cctp_burn_from_value(&request)
+            .expect_err("missing CCTP max_fee must reject at request boundary");
+        assert!(error.contains("max_fee"), "{error}");
+    }
+
+    #[test]
+    fn hyperliquid_timeout_at_ms_rejects_overflow() {
+        let error =
+            checked_timeout_at_ms(u64::MAX, 1, "test").expect_err("timeout overflow must reject");
+
+        assert!(error.contains("timeout_at_ms overflowed"), "{error}");
+    }
+
+    fn single_level_book(px: &str, sz: &str) -> L2BookSnapshot {
+        L2BookSnapshot {
+            coin: "UBTC/USDC".to_string(),
+            levels: vec![
+                vec![L2Level {
+                    n: 1,
+                    px: px.to_string(),
+                    sz: sz.to_string(),
+                }],
+                vec![L2Level {
+                    n: 1,
+                    px: px.to_string(),
+                    sz: sz.to_string(),
+                }],
+            ],
+            time: 0,
+        }
+    }
+
+    #[test]
+    fn simulate_hl_exact_in_sell_counts_only_executable_base_size() {
+        let book = single_level_book("60000", "100");
+        let (_, amount_out) = simulate_leg(
+            false,
+            8,
+            6,
+            5,
+            &MarketOrderKind::ExactIn {
+                amount_in: "120930796".to_string(),
+                min_amount_out: "1".to_string(),
+            },
+            &book,
+        )
+        .unwrap();
+
+        assert_eq!(amount_out, "72558000000");
+    }
+
+    #[test]
+    fn simulate_hl_exact_in_buy_serializes_quantized_base_without_f64_wei_dust() {
+        let book = single_level_book("3000.5", "100");
+        let (_, amount_out) = simulate_leg(
+            true,
+            6,
+            18,
+            4,
+            &MarketOrderKind::ExactIn {
+                amount_in: "98577278".to_string(),
+                min_amount_out: "1".to_string(),
+            },
+            &book,
+        )
+        .unwrap();
+
+        assert_eq!(amount_out, "32800000000000000");
+    }
+
+    #[test]
+    fn simulate_hl_exact_out_buy_rounds_input_up_to_wire_units() {
+        let book = single_level_book("3", "1");
+        let (amount_in, _) = simulate_leg(
+            true,
+            6,
+            8,
+            8,
+            &MarketOrderKind::ExactOut {
+                amount_out: "1".to_string(),
+                max_amount_in: "1".to_string(),
+            },
+            &book,
+        )
+        .unwrap();
+
+        assert_eq!(amount_in, "1");
+    }
+
+    #[test]
+    fn simulate_hl_exact_out_sell_rounds_base_input_to_executable_size() {
+        let book = single_level_book("60000", "100");
+        let (amount_in, _) = simulate_leg(
+            false,
+            8,
+            6,
+            5,
+            &MarketOrderKind::ExactOut {
+                amount_out: "1000000".to_string(),
+                max_amount_in: "2000".to_string(),
+            },
+            &book,
+        )
+        .unwrap();
+
+        assert_eq!(amount_in, "2000");
     }
 
     #[test]
@@ -5054,13 +6917,71 @@ mod hyperliquid_math_tests {
         assert_eq!(unit_withdrawal_minimum_raw(&btc).to_string(), "30000");
     }
 
+    fn across_quote_request() -> BridgeQuoteRequest {
+        BridgeQuoteRequest {
+            source_asset: DepositAsset {
+                chain: ChainId::parse("evm:1").unwrap(),
+                asset: AssetId::reference("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
+            },
+            destination_asset: DepositAsset {
+                chain: ChainId::parse("evm:8453").unwrap(),
+                asset: AssetId::reference("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
+            },
+            order_kind: MarketOrderKind::ExactIn {
+                amount_in: "1000000".to_string(),
+                min_amount_out: "990000".to_string(),
+            },
+            recipient_address: "0x1111111111111111111111111111111111111111".to_string(),
+            depositor_address: "0x2222222222222222222222222222222222222222".to_string(),
+            partial_fills_enabled: false,
+        }
+    }
+
+    #[test]
+    fn across_quote_request_rejects_malformed_amount_and_depositor() {
+        let mut malformed_amount = across_quote_request();
+        malformed_amount.order_kind = MarketOrderKind::ExactIn {
+            amount_in: "not-raw".to_string(),
+            min_amount_out: "990000".to_string(),
+        };
+        let error = build_across_swap_approval_request(&malformed_amount, "rift")
+            .expect_err("malformed amount must be rejected");
+        assert!(
+            error.contains("invalid amount_in"),
+            "unexpected error: {error}"
+        );
+
+        let mut malformed_depositor = across_quote_request();
+        malformed_depositor.depositor_address = "not-an-address".to_string();
+        let error = build_across_swap_approval_request(&malformed_depositor, "rift")
+            .expect_err("malformed depositor must be rejected");
+        assert!(
+            error.contains("invalid depositor_address"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn across_quote_request_returns_none_for_unsupported_route() {
+        let mut unsupported = across_quote_request();
+        unsupported.source_asset = DepositAsset {
+            chain: ChainId::parse("bitcoin").unwrap(),
+            asset: AssetId::Native,
+        };
+
+        assert!(build_across_swap_approval_request(&unsupported, "rift")
+            .expect("unsupported route is not malformed")
+            .is_none());
+    }
+
     #[tokio::test]
     async fn hyperliquid_bridge_withdrawal_quote_deducts_fee_exact_in() {
         let provider = HyperliquidBridgeProvider::new(
             "http://localhost:1",
             HyperliquidCallNetwork::Testnet,
             Arc::new(AssetRegistry::default()),
-        );
+        )
+        .expect("hyperliquid bridge provider should build");
         let quote = provider
             .quote_bridge(BridgeQuoteRequest {
                 source_asset: DepositAsset {
@@ -5104,7 +7025,8 @@ mod hyperliquid_math_tests {
             "http://localhost:1",
             HyperliquidCallNetwork::Testnet,
             Arc::new(AssetRegistry::default()),
-        );
+        )
+        .expect("hyperliquid bridge provider should build");
         let quote = provider
             .quote_bridge(BridgeQuoteRequest {
                 source_asset: DepositAsset {
@@ -5129,6 +7051,37 @@ mod hyperliquid_math_tests {
 
         assert_eq!(quote.amount_in, "101000000");
         assert_eq!(quote.amount_out, "100000000");
+    }
+
+    #[tokio::test]
+    async fn hyperliquid_bridge_withdrawal_quote_rejects_fee_overflow() {
+        let provider = HyperliquidBridgeProvider::new(
+            "http://localhost:1",
+            HyperliquidCallNetwork::Testnet,
+            Arc::new(AssetRegistry::default()),
+        )
+        .expect("hyperliquid bridge provider should build");
+        let result = provider
+            .quote_bridge(BridgeQuoteRequest {
+                source_asset: DepositAsset {
+                    chain: ChainId::parse("hyperliquid").unwrap(),
+                    asset: AssetId::Native,
+                },
+                destination_asset: DepositAsset {
+                    chain: ChainId::parse("evm:42161").unwrap(),
+                    asset: AssetId::reference("0xaf88d065e77c8cc2239327c5edb3a432268e5831"),
+                },
+                order_kind: MarketOrderKind::ExactOut {
+                    amount_out: U256::MAX.to_string(),
+                    max_amount_in: U256::MAX.to_string(),
+                },
+                recipient_address: "0x0000000000000000000000000000000000000001".to_string(),
+                depositor_address: "0x0000000000000000000000000000000000000002".to_string(),
+                partial_fills_enabled: false,
+            })
+            .await;
+
+        assert!(result.is_err());
     }
 
     #[test]
@@ -5184,17 +7137,115 @@ mod hyperliquid_math_tests {
     }
 
     #[test]
+    fn hyperliquid_bridge_completion_response_sets_actual_amount_out() {
+        let request = ProviderOperationObservationRequest {
+            operation_id: Uuid::nil(),
+            operation_type: ProviderOperationType::HyperliquidBridgeDeposit,
+            provider_ref: Some("0x1111111111111111111111111111111111111111".to_string()),
+            request: json!({
+                "amount": "7500000",
+                "before_withdrawable_raw": "10000000",
+                "expected_withdrawable_raw": "17500000",
+            }),
+            response: json!({
+                "before_clearinghouse_state": {
+                    "withdrawable": "10.0",
+                }
+            }),
+            observed_state: json!({}),
+            hint_evidence: json!({}),
+        };
+        let state = ClearinghouseState {
+            withdrawable: "17.5".to_string(),
+            ..ClearinghouseState::default()
+        };
+
+        let response = hyperliquid_bridge_deposit_completion_response(
+            &request,
+            &state,
+            U256::from(17_500_000_u64),
+        )
+        .unwrap();
+
+        assert_eq!(response["amount_in"], json!("7500000"));
+        assert_eq!(response["amount_out"], json!("7500000"));
+        assert_eq!(response["before_withdrawable_raw"], json!("10000000"));
+        assert_eq!(response["expected_withdrawable_raw"], json!("17500000"));
+        assert_eq!(response["observed_withdrawable_raw"], json!("17500000"));
+        assert_eq!(
+            response["observed_withdrawable_delta_raw"],
+            json!("7500000")
+        );
+    }
+
+    #[test]
+    fn hyperliquid_bridge_completion_rejects_backwards_withdrawable_delta() {
+        let request = ProviderOperationObservationRequest {
+            operation_id: Uuid::nil(),
+            operation_type: ProviderOperationType::HyperliquidBridgeDeposit,
+            provider_ref: Some("0x1111111111111111111111111111111111111111".to_string()),
+            request: json!({
+                "amount": "7500000",
+                "before_withdrawable_raw": "10000000",
+                "expected_withdrawable_raw": "17500000",
+            }),
+            response: json!({}),
+            observed_state: json!({}),
+            hint_evidence: json!({}),
+        };
+        let state = ClearinghouseState::default();
+
+        assert!(hyperliquid_bridge_deposit_completion_response(
+            &request,
+            &state,
+            U256::from(9_999_999_u64),
+        )
+        .is_err());
+    }
+
+    #[test]
     fn compute_base_sz_sell_uses_amount_in_truncated() {
         // amount_in = 0.12345678 UBTC wire, sz_decimals = 5 → "0.12345"
-        let sz = compute_base_sz(false, "12345678", 8, "6000000000", 8, 5).unwrap();
+        let sz = compute_base_sz(false, "exact_in", "12345678", 8, "6000000000", 8, 5).unwrap();
         assert_eq!(sz, "0.12345");
     }
 
     #[test]
     fn compute_base_sz_buy_uses_amount_out_truncated() {
         // amount_out = 1.50000009 UBTC wire (decimals 8), sz_decimals = 5 → "1.5"
-        let sz = compute_base_sz(true, "75000000000", 8, "150000009", 8, 5).unwrap();
+        let sz = compute_base_sz(true, "exact_in", "75000000000", 8, "150000009", 8, 5).unwrap();
         assert_eq!(sz, "1.5");
+    }
+
+    #[test]
+    fn compute_base_sz_exact_out_buy_rounds_up_to_executable_size() {
+        let sz = compute_base_sz(
+            true,
+            "exact_out",
+            "203000000",
+            6,
+            "67599999999999992",
+            18,
+            4,
+        )
+        .unwrap();
+        assert_eq!(sz, "0.0676");
+    }
+
+    #[test]
+    fn compute_base_sz_truncates_large_wei_without_float_rounding() {
+        let sz = compute_base_sz(
+            true,
+            "exact_in",
+            "100000000",
+            6,
+            "999999999999999999",
+            18,
+            4,
+        )
+        .unwrap();
+
+        assert_eq!(sz, "0.9999");
     }
 
     #[test]
@@ -5231,6 +7282,55 @@ mod hyperliquid_math_tests {
         })
         .unwrap();
         assert_eq!(px, "66666");
+    }
+
+    #[test]
+    fn compute_limit_px_uses_exact_integer_rational_for_large_wei_amounts() {
+        let buy_px = compute_limit_px(LimitPxInput {
+            is_buy: true,
+            order_kind: "exact_in",
+            amount_in_wire: "99999999",
+            input_decimals: 6,
+            amount_out_wire: "999999999999999999",
+            output_decimals: 18,
+            min_amount_out_wire: Some("999999999999999999"),
+            max_amount_in_wire: None,
+            base_sz_decimals: 4,
+        })
+        .unwrap();
+        let sell_px = compute_limit_px(LimitPxInput {
+            is_buy: false,
+            order_kind: "exact_in",
+            amount_in_wire: "999999999999999999",
+            input_decimals: 18,
+            amount_out_wire: "99999999",
+            output_decimals: 6,
+            min_amount_out_wire: Some("99999999"),
+            max_amount_in_wire: None,
+            base_sz_decimals: 4,
+        })
+        .unwrap();
+
+        assert_eq!(buy_px, "99.999");
+        assert_eq!(sell_px, "100");
+    }
+
+    #[test]
+    fn hyperliquid_price_formatting_rejects_invalid_size_decimals() {
+        let error = compute_limit_px(LimitPxInput {
+            is_buy: true,
+            order_kind: "exact_in",
+            amount_in_wire: "100000000",
+            input_decimals: 6,
+            amount_out_wire: "100000000",
+            output_decimals: 8,
+            min_amount_out_wire: Some("100000000"),
+            max_amount_in_wire: None,
+            base_sz_decimals: 9,
+        })
+        .expect_err("invalid Hyperliquid sz_decimals must reject");
+
+        assert!(error.contains("sz_decimals"), "{error}");
     }
 
     #[test]
@@ -5345,6 +7445,131 @@ mod hyperliquid_math_tests {
     }
 
     #[test]
+    fn unit_generate_address_validation_requires_ok_status() {
+        let response = UnitGenerateAddressResponse {
+            address: "0x1111111111111111111111111111111111111111".to_string(),
+            status: Some("ERROR".to_string()),
+            signatures: json!({
+                "field-node": "sig-a",
+                "unit-node": "sig-b"
+            }),
+        };
+
+        let error =
+            validated_unit_generate_address(&response, UnitChain::Ethereum, "test").unwrap_err();
+        assert!(error.contains("non-OK status"), "{error}");
+    }
+
+    #[test]
+    fn unit_generate_address_validation_rejects_missing_status() {
+        let response = UnitGenerateAddressResponse {
+            address: "0x1111111111111111111111111111111111111111".to_string(),
+            status: None,
+            signatures: json!({
+                "field-node": "sig-a",
+                "unit-node": "sig-b"
+            }),
+        };
+
+        let error =
+            validated_unit_generate_address(&response, UnitChain::Ethereum, "test").unwrap_err();
+        assert!(error.contains("missing status"), "{error}");
+    }
+
+    #[test]
+    fn unit_generate_address_validation_checks_protocol_chain_shape() {
+        let response = UnitGenerateAddressResponse {
+            address: "0x1111111111111111111111111111111111111111".to_string(),
+            status: Some("OK".to_string()),
+            signatures: json!({
+                "field-node": "sig-a",
+                "unit-node": "sig-b"
+            }),
+        };
+
+        assert!(validated_unit_generate_address(&response, UnitChain::Ethereum, "test").is_ok());
+        let error =
+            validated_unit_generate_address(&response, UnitChain::Bitcoin, "test").unwrap_err();
+        assert!(
+            error.contains("invalid bitcoin protocol address"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn unit_generate_address_validation_accepts_bitcoin_protocol_address() {
+        let response = UnitGenerateAddressResponse {
+            address: "bcrt1q2pfqp8a574jxyszmk0h5rxf02wwkpaf4hd8009".to_string(),
+            status: Some("OK".to_string()),
+            signatures: json!({
+                "field-node": "sig-a",
+                "unit-node": "sig-b"
+            }),
+        };
+
+        assert!(validated_unit_generate_address(&response, UnitChain::Bitcoin, "test").is_ok());
+    }
+
+    #[test]
+    fn unit_generate_address_validation_requires_guardian_signature_quorum() {
+        let response = UnitGenerateAddressResponse {
+            address: "0x1111111111111111111111111111111111111111".to_string(),
+            status: Some("OK".to_string()),
+            signatures: json!({
+                "field-node": "sig-a"
+            }),
+        };
+
+        let error =
+            validated_unit_generate_address(&response, UnitChain::Ethereum, "test").unwrap_err();
+        assert!(
+            error.contains("insufficient guardian signatures"),
+            "{error}"
+        );
+
+        let response = UnitGenerateAddressResponse {
+            signatures: serde_json::Value::Null,
+            ..response
+        };
+        let error =
+            validated_unit_generate_address(&response, UnitChain::Ethereum, "test").unwrap_err();
+        assert!(error.contains("missing guardian signatures"), "{error}");
+    }
+
+    #[test]
+    fn unit_generate_address_validation_rejects_malformed_guardian_signatures() {
+        let response = UnitGenerateAddressResponse {
+            address: "0x1111111111111111111111111111111111111111".to_string(),
+            status: Some("OK".to_string()),
+            signatures: json!({
+                "field-node": "sig-a",
+                "unit-node": 7
+            }),
+        };
+
+        let error =
+            validated_unit_generate_address(&response, UnitChain::Ethereum, "test").unwrap_err();
+        assert!(
+            error.contains("guardian signature \"unit-node\" must be a string"),
+            "{error}"
+        );
+
+        let response = UnitGenerateAddressResponse {
+            signatures: json!({
+                "field-node": "sig-a",
+                "unit-node": " "
+            }),
+            ..response
+        };
+        let error =
+            validated_unit_generate_address(&response, UnitChain::Ethereum, "test").unwrap_err();
+        assert!(
+            error.contains("guardian signature \"unit-node\" must be non-empty"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn unit_operation_status_completes_queued_with_destination_tx_hash() {
         let op = hyperunit_client::UnitOperation {
             state: Some("queuedForWithdraw".to_string()),
@@ -5383,10 +7608,29 @@ mod hyperliquid_math_tests {
             ]
         });
 
-        let fingerprints = seen_operation_fingerprints_from_request(&request);
+        let fingerprints =
+            seen_operation_fingerprints_from_request(&request).expect("fingerprints parse");
 
         assert!(fingerprints.contains("operationId:old-op"));
         assert!(fingerprints.contains("sourceTxHash:0xabc:0"));
+    }
+
+    #[test]
+    fn seen_operation_fingerprints_from_request_rejects_malformed_entries() {
+        let request = json!({
+            "seen_operation_fingerprints": [
+                "operationId:old-op",
+                7
+            ]
+        });
+
+        let error = seen_operation_fingerprints_from_request(&request)
+            .expect_err("malformed fingerprint entries must reject");
+
+        assert!(
+            error.contains("seen_operation_fingerprints[1] must be a string"),
+            "unexpected error: {error}"
+        );
     }
 
     fn empty_unit_operation() -> hyperunit_client::UnitOperation {

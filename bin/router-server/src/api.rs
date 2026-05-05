@@ -11,9 +11,13 @@ use crate::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::fmt;
 use uuid::Uuid;
 
+pub const MAX_HINT_IDEMPOTENCY_KEY_LEN: usize = 128;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateVaultRequest {
     #[serde(default)]
     pub order_id: Option<Uuid>,
@@ -28,9 +32,18 @@ pub struct CreateVaultRequest {
     pub metadata: Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CancelVaultRequest {
     pub cancellation_secret: String,
+}
+
+impl fmt::Debug for CancelVaultRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CancelVaultRequest")
+            .field("cancellation_secret", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,9 +66,18 @@ pub struct CreateOrderRequest {
     pub metadata: Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateOrderCancellationRequest {
     pub cancellation_secret: String,
+}
+
+impl fmt::Debug for CreateOrderCancellationRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CreateOrderCancellationRequest")
+            .field("cancellation_secret", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +90,7 @@ pub struct MarketOrderQuoteRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LimitOrderQuoteRequest {
     pub from_asset: DepositAsset,
     pub to_asset: DepositAsset,
@@ -78,6 +101,7 @@ pub struct LimitOrderQuoteRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub enum MarketOrderQuoteKind {
     ExactIn {
         amount_in: String,
@@ -90,6 +114,7 @@ pub enum MarketOrderQuoteKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderOperationHintRequest {
     pub provider_operation_id: Uuid,
     #[serde(default = "default_hint_source")]
@@ -108,6 +133,7 @@ pub struct ProviderOperationHintEnvelope {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VaultFundingHintRequest {
     #[serde(default = "default_hint_source")]
     pub source: String,
@@ -125,6 +151,7 @@ pub struct VaultFundingHintEnvelope {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DetectorHintRequest {
     pub target: DetectorHintTarget,
     #[serde(default = "default_hint_source")]
@@ -139,6 +166,7 @@ pub struct DetectorHintRequest {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub enum DetectorHintTarget {
     ProviderOperation { id: Uuid },
     FundingVault { id: Uuid },
@@ -152,12 +180,14 @@ pub enum DetectorHintEnvelope {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderOperationObserveRequest {
     #[serde(default = "empty_metadata")]
     pub hint_evidence: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateProviderPolicyRequest {
     pub quote_state: ProviderQuotePolicyState,
     pub execution_state: ProviderExecutionPolicyState,
@@ -277,6 +307,7 @@ impl OrderFlowProgress {
             order.status,
             RouterOrderStatus::Completed
                 | RouterOrderStatus::Refunded
+                | RouterOrderStatus::ManualInterventionRequired
                 | RouterOrderStatus::RefundManualInterventionRequired
                 | RouterOrderStatus::Failed
                 | RouterOrderStatus::Expired
@@ -286,8 +317,7 @@ impl OrderFlowProgress {
         } else if total_steps == 0 {
             0
         } else {
-            let pct = completed_steps.saturating_mul(100) / total_steps;
-            u8::try_from(pct.min(100)).unwrap_or(100)
+            percent_complete_from_counts(completed_steps, total_steps)
         };
 
         Self {
@@ -308,6 +338,14 @@ impl OrderFlowProgress {
     }
 }
 
+fn percent_complete_from_counts(completed_steps: usize, total_steps: usize) -> u8 {
+    if total_steps == 0 {
+        return 0;
+    }
+    let percent = ((completed_steps as u128) * 100) / (total_steps as u128);
+    percent.min(100) as u8
+}
+
 fn default_hint_source() -> String {
     "unknown".to_string()
 }
@@ -321,13 +359,71 @@ mod tests {
     use super::*;
     use crate::{
         models::{
-            MarketOrderAction, MarketOrderKind, ProviderOperationStatus, ProviderOperationType,
-            RouterOrderAction, RouterOrderType,
+            MarketOrderAction, MarketOrderKind, MarketOrderKindType, MarketOrderQuote,
+            ProviderOperationStatus, ProviderOperationType, RouterOrderAction, RouterOrderEnvelope,
+            RouterOrderQuote, RouterOrderType,
         },
         protocol::{AssetId, ChainId},
     };
     use chrono::Utc;
     use serde_json::json;
+
+    #[test]
+    fn cancellation_request_debug_redacts_secret_values() {
+        let secret = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        let cancel_vault = CancelVaultRequest {
+            cancellation_secret: secret.to_string(),
+        };
+        let rendered = format!("{cancel_vault:?}");
+        assert!(rendered.contains("cancellation_secret"));
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains(secret));
+
+        let cancel_order = CreateOrderCancellationRequest {
+            cancellation_secret: secret.to_string(),
+        };
+        let rendered = format!("{cancel_order:?}");
+        assert!(rendered.contains("cancellation_secret"));
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains(secret));
+    }
+
+    #[test]
+    fn order_envelope_debug_redacts_cancellation_secret() {
+        let order_id = Uuid::now_v7();
+        let order = test_order(order_id, RouterOrderStatus::PendingFunding);
+        let quote = RouterOrderQuote::MarketOrder(MarketOrderQuote {
+            id: Uuid::now_v7(),
+            order_id: Some(order_id),
+            source_asset: order.source_asset.clone(),
+            destination_asset: order.destination_asset.clone(),
+            recipient_address: order.recipient_address.clone(),
+            provider_id: "test".to_string(),
+            order_kind: MarketOrderKindType::ExactIn,
+            amount_in: "1000".to_string(),
+            amount_out: "900".to_string(),
+            min_amount_out: Some("891".to_string()),
+            max_amount_in: None,
+            slippage_bps: 100,
+            provider_quote: json!({}),
+            usd_valuation: json!({}),
+            expires_at: order.action_timeout_at,
+            created_at: order.created_at,
+        });
+        let secret = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let envelope = RouterOrderEnvelope {
+            order,
+            quote,
+            funding_vault: None,
+            cancellation_secret: Some(secret.to_string()),
+        };
+
+        let rendered = format!("{envelope:?}");
+        assert!(rendered.contains("cancellation_secret"));
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains(secret));
+    }
 
     #[test]
     fn create_quote_request_deserializes_market_order_shape() {
@@ -375,6 +471,83 @@ mod tests {
     }
 
     #[test]
+    fn limit_order_quote_request_rejects_unknown_fields() {
+        let error = serde_json::from_value::<CreateQuoteRequest>(json!({
+            "type": "limit_order",
+            "from_asset": {"chain": "evm:8453", "asset": "native"},
+            "to_asset": {"chain": "bitcoin", "asset": "native"},
+            "recipient_address": "bc1qrecipient0000000000000000000000000000000",
+            "input_amount": "100000000000",
+            "output_amount": "100000000",
+            "ignored": true
+        }))
+        .expect_err("limit order quotes should reject unknown fields");
+
+        assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn market_order_quote_kind_rejects_unknown_fields() {
+        let error = serde_json::from_value::<MarketOrderQuoteKind>(json!({
+            "kind": "exact_in",
+            "amount_in": "1000",
+            "amount_out": "2000",
+            "slippage_bps": 100
+        }))
+        .expect_err("market order kind should reject irrelevant fields");
+
+        assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn market_order_quote_request_rejects_unknown_outer_fields() {
+        let error = serde_json::from_value::<CreateQuoteRequest>(json!({
+            "type": "market_order",
+            "from_asset": {"chain": "evm:8453", "asset": "native"},
+            "to_asset": {"chain": "bitcoin", "asset": "native"},
+            "recipient_address": "bc1qrecipient0000000000000000000000000000000",
+            "kind": "exact_in",
+            "amount_in": "1000",
+            "slippage_bps": 100,
+            "ignored": true
+        }))
+        .expect_err("market order quotes should reject unknown fields");
+
+        assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn internal_hint_request_rejects_unknown_fields() {
+        let error = serde_json::from_value::<ProviderOperationHintRequest>(json!({
+            "provider_operation_id": Uuid::now_v7(),
+            "source": "sauron",
+            "hint_kind": "possible_progress",
+            "evidence": {},
+            "ignored": true
+        }))
+        .expect_err("hint requests should reject unknown fields");
+
+        assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn detector_hint_target_rejects_unknown_fields() {
+        let error = serde_json::from_value::<DetectorHintRequest>(json!({
+            "target": {
+                "kind": "provider_operation",
+                "id": Uuid::now_v7(),
+                "ignored": true
+            },
+            "source": "sauron",
+            "hint_kind": "possible_progress",
+            "evidence": {}
+        }))
+        .expect_err("detector hint targets should reject unknown fields");
+
+        assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
     fn order_flow_progress_counts_steps_and_current_provider_operation() {
         let order_id = Uuid::now_v7();
         let step_1_id = Uuid::now_v7();
@@ -416,6 +589,14 @@ mod tests {
 
         assert!(progress.terminal);
         assert_eq!(progress.percent_complete, 100);
+    }
+
+    #[test]
+    fn percent_complete_uses_wide_math_and_clamps_overcomplete_counts() {
+        assert_eq!(percent_complete_from_counts(usize::MAX, 1), 100);
+        assert_eq!(percent_complete_from_counts(usize::MAX / 2, usize::MAX), 49);
+        assert_eq!(percent_complete_from_counts(0, usize::MAX), 0);
+        assert_eq!(percent_complete_from_counts(1, 0), 0);
     }
 
     fn test_order(order_id: Uuid, status: RouterOrderStatus) -> RouterOrder {
@@ -471,6 +652,7 @@ mod tests {
             id: step_id,
             order_id,
             execution_attempt_id: None,
+            execution_leg_id: None,
             transition_decl_id: None,
             step_index,
             step_type: crate::models::OrderExecutionStepType::AcrossBridge,
@@ -491,6 +673,7 @@ mod tests {
             request: json!({}),
             response: json!({}),
             error: json!({}),
+            usd_valuation: json!({}),
             created_at: now,
             updated_at: now,
         }

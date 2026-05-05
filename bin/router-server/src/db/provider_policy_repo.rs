@@ -47,22 +47,32 @@ impl ProviderPolicyRepository {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
-            INSERT INTO provider_policies (
-                provider,
-                quote_state,
-                execution_state,
-                reason,
-                updated_by,
-                updated_at
+            WITH upserted AS (
+                INSERT INTO provider_policies (
+                    provider,
+                    quote_state,
+                    execution_state,
+                    reason,
+                    updated_by,
+                    updated_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (provider) DO UPDATE
+                SET quote_state = EXCLUDED.quote_state,
+                    execution_state = EXCLUDED.execution_state,
+                    reason = EXCLUDED.reason,
+                    updated_by = EXCLUDED.updated_by,
+                    updated_at = EXCLUDED.updated_at
+                WHERE provider_policies.updated_at <= EXCLUDED.updated_at
+                RETURNING {PROVIDER_POLICY_SELECT_COLUMNS}
             )
-            VALUES ($1, $2, $3, $4, $5, $6)
-            ON CONFLICT (provider) DO UPDATE
-            SET quote_state = EXCLUDED.quote_state,
-                execution_state = EXCLUDED.execution_state,
-                reason = EXCLUDED.reason,
-                updated_by = EXCLUDED.updated_by,
-                updated_at = EXCLUDED.updated_at
-            RETURNING {PROVIDER_POLICY_SELECT_COLUMNS}
+            SELECT {PROVIDER_POLICY_SELECT_COLUMNS}
+            FROM upserted
+            UNION ALL
+            SELECT {PROVIDER_POLICY_SELECT_COLUMNS}
+            FROM provider_policies
+            WHERE provider = $1
+              AND NOT EXISTS (SELECT 1 FROM upserted)
             "#
         ))
         .bind(&policy.provider)

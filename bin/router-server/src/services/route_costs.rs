@@ -1,22 +1,23 @@
 use crate::{
     db::Database,
-    error::RouterServerResult,
+    error::{RouterServerError, RouterServerResult},
     models::MarketOrderKind,
     protocol::DepositAsset,
     services::{
         action_providers::{ActionProviderRegistry, BridgeQuoteRequest},
         asset_registry::{
-            AssetRegistry, MarketOrderTransitionKind, TransitionDecl, TransitionPath,
+            AssetRegistry, ChainAsset, MarketOrderTransitionKind, TransitionDecl, TransitionPath,
         },
-        pricing::{div_ceil_u64, PricingSnapshot, BPS_DENOMINATOR},
+        pricing::{checked_pow10, STATIC_BOOTSTRAP_PRICING_SOURCE},
+        pricing::{PricingSnapshot, BPS_DENOMINATOR},
     },
 };
-use alloy::primitives::U256;
+use alloy::primitives::{U256, U512};
 use chrono::{DateTime, Utc};
 use market_pricing::MarketPricingOracle;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
@@ -52,11 +53,10 @@ impl RouteCostSnapshot {
 
     #[must_use]
     pub fn effective_cost_bps(&self) -> u64 {
-        self.estimated_fee_bps.saturating_add(div_ceil_u64(
-            self.estimated_gas_usd_micros
-                .saturating_mul(BPS_DENOMINATOR),
-            self.sample_amount_usd_micros,
-        ))
+        capped_add_u64(
+            self.estimated_fee_bps,
+            gas_cost_bps(self.estimated_gas_usd_micros, self.sample_amount_usd_micros),
+        )
     }
 }
 
@@ -85,6 +85,7 @@ pub struct RouteCostService {
     asset_registry: Arc<AssetRegistry>,
     ttl: Duration,
     pricing: Arc<RwLock<PricingSnapshot>>,
+    pricing_refresh: Arc<Mutex<()>>,
     pricing_oracle: Option<Arc<MarketPricingOracle>>,
 }
 
@@ -98,6 +99,7 @@ impl RouteCostService {
             asset_registry,
             ttl: DEFAULT_REFRESH_TTL,
             pricing: Arc::new(RwLock::new(PricingSnapshot::static_bootstrap(Utc::now()))),
+            pricing_refresh: Arc::new(Mutex::new(())),
             pricing_oracle: None,
         }
     }
@@ -124,12 +126,34 @@ impl RouteCostService {
         self.pricing.read().await.clone()
     }
 
+    pub async fn current_or_refresh_pricing_snapshot(&self) -> PricingSnapshot {
+        let now = Utc::now();
+        let current = self.current_pricing_snapshot().await;
+        if pricing_snapshot_is_fresh(&current, now, self.ttl) {
+            current
+        } else {
+            let _guard = self.pricing_refresh.lock().await;
+            let now = Utc::now();
+            let current = self.current_pricing_snapshot().await;
+            if pricing_snapshot_is_fresh(&current, now, self.ttl) {
+                return current;
+            }
+            self.refresh_pricing_snapshot().await
+        }
+    }
+
+    pub async fn current_or_refresh_live_pricing_snapshot(&self) -> Option<PricingSnapshot> {
+        let pricing = self.current_or_refresh_pricing_snapshot().await;
+        pricing_snapshot_is_fresh(&pricing, Utc::now(), self.ttl).then_some(pricing)
+    }
+
     pub async fn refresh_anchor_costs(&self) -> RouterServerResult<RouteCostRefreshSummary> {
         let now = Utc::now();
         let expires_at = now
             + chrono::Duration::from_std(self.ttl)
                 .unwrap_or_else(|_| chrono::Duration::seconds(600));
         let pricing = self.refresh_pricing_snapshot().await;
+        require_live_pricing_for_route_cost_refresh(&pricing, Utc::now(), self.ttl)?;
         let transitions = self.asset_registry.transition_declarations();
         let mut snapshots = Vec::with_capacity(transitions.len());
         let mut provider_quotes_attempted = 0_usize;
@@ -190,7 +214,7 @@ impl RouteCostService {
             .map(|snapshot| (snapshot.transition_id.clone(), snapshot))
             .collect::<HashMap<_, _>>();
 
-        let pricing = self.current_pricing_snapshot().await;
+        let pricing = self.current_or_refresh_pricing_snapshot().await;
         paths.sort_by(|left, right| {
             compare_path_scores(
                 path_score_with_structural_fallback(left, &by_transition_id, &pricing),
@@ -256,11 +280,13 @@ impl RouteCostService {
         let Some(bridge) = self.action_providers.bridge(transition.provider.as_str()) else {
             return LiveCostSnapshotOutcome::NotAttempted;
         };
-        let Some(amount_in) = sample_amount_for_asset(
-            &transition.input.asset,
-            self.asset_registry.as_ref(),
-            pricing,
-        ) else {
+        let Some(input_asset) = self.asset_registry.chain_asset(&transition.input.asset) else {
+            return LiveCostSnapshotOutcome::NotAttempted;
+        };
+        let Some(output_asset) = self.asset_registry.chain_asset(&transition.output.asset) else {
+            return LiveCostSnapshotOutcome::NotAttempted;
+        };
+        let Some(amount_in) = sample_amount_for_chain_asset(input_asset, pricing) else {
             return LiveCostSnapshotOutcome::NotAttempted;
         };
 
@@ -292,14 +318,15 @@ impl RouteCostService {
             }
         };
         let estimate = structural_cost_estimate(transition, pricing);
-        let quoted_fee_bps = match quote_loss_bps(amount_in, amount_out) {
-            Some(fee_bps) => fee_bps,
-            None => {
-                return LiveCostSnapshotOutcome::Failed(
-                    "could not convert provider loss to bps".to_string(),
-                )
-            }
-        };
+        let quoted_fee_bps =
+            match quote_value_loss_bps(amount_in, input_asset, amount_out, output_asset, pricing) {
+                Some(fee_bps) => fee_bps,
+                None => {
+                    return LiveCostSnapshotOutcome::Failed(
+                        "could not convert provider value loss to bps".to_string(),
+                    )
+                }
+            };
         let estimated_fee_bps = quoted_fee_bps.max(estimate.estimated_fee_bps);
 
         LiveCostSnapshotOutcome::Succeeded(Box::new(RouteCostSnapshot {
@@ -326,6 +353,36 @@ enum LiveCostSnapshotOutcome {
     Failed(String),
 }
 
+fn pricing_snapshot_is_fresh(
+    snapshot: &PricingSnapshot,
+    now: DateTime<Utc>,
+    ttl: Duration,
+) -> bool {
+    snapshot.source != STATIC_BOOTSTRAP_PRICING_SOURCE
+        && snapshot.is_fresh(now)
+        && now
+            .signed_duration_since(snapshot.captured_at)
+            .to_std()
+            .is_ok_and(|age| age < ttl)
+}
+
+fn require_live_pricing_for_route_cost_refresh(
+    snapshot: &PricingSnapshot,
+    now: DateTime<Utc>,
+    ttl: Duration,
+) -> RouterServerResult<()> {
+    if pricing_snapshot_is_fresh(snapshot, now, ttl) {
+        return Ok(());
+    }
+
+    Err(RouterServerError::NotReady {
+        message: format!(
+            "live market pricing is unavailable or stale; refusing to refresh route costs from {}",
+            snapshot.source
+        ),
+    })
+}
+
 pub fn rank_transition_paths_structurally(paths: &mut [TransitionPath]) {
     let pricing = PricingSnapshot::static_bootstrap(Utc::now());
     paths.sort_by(|left, right| {
@@ -350,12 +407,12 @@ pub fn path_score(
     for transition in &path.transitions {
         if let Some(snapshot) = snapshots.get(&transition.id) {
             total_effective_cost_bps =
-                total_effective_cost_bps.saturating_add(snapshot.effective_cost_bps());
-            total_latency_ms = total_latency_ms.saturating_add(snapshot.estimated_latency_ms);
+                capped_add_u64(total_effective_cost_bps, snapshot.effective_cost_bps());
+            total_latency_ms = capped_add_u64(total_latency_ms, snapshot.estimated_latency_ms);
         } else {
             missing_edges = missing_edges.saturating_add(1);
-            total_effective_cost_bps = total_effective_cost_bps.saturating_add(u64::MAX / 4);
-            total_latency_ms = total_latency_ms.saturating_add(u64::MAX / 4);
+            total_effective_cost_bps = capped_add_u64(total_effective_cost_bps, u64::MAX / 4);
+            total_latency_ms = capped_add_u64(total_latency_ms, u64::MAX / 4);
         }
     }
 
@@ -377,19 +434,19 @@ fn path_score_with_structural_fallback(
     for transition in &path.transitions {
         if let Some(snapshot) = snapshots.get(&transition.id) {
             total_effective_cost_bps =
-                total_effective_cost_bps.saturating_add(snapshot.effective_cost_bps());
-            total_latency_ms = total_latency_ms.saturating_add(snapshot.estimated_latency_ms);
+                capped_add_u64(total_effective_cost_bps, snapshot.effective_cost_bps());
+            total_latency_ms = capped_add_u64(total_latency_ms, snapshot.estimated_latency_ms);
         } else {
             let estimate = structural_cost_estimate(transition, pricing);
-            let gas_bps = div_ceil_u64(
-                estimate
-                    .estimated_gas_usd_micros
-                    .saturating_mul(BPS_DENOMINATOR),
+            let gas_bps = gas_cost_bps(
+                estimate.estimated_gas_usd_micros,
                 DEFAULT_SAMPLE_AMOUNT_USD_MICROS,
             );
-            total_effective_cost_bps = total_effective_cost_bps
-                .saturating_add(estimate.estimated_fee_bps.saturating_add(gas_bps));
-            total_latency_ms = total_latency_ms.saturating_add(estimate.estimated_latency_ms);
+            total_effective_cost_bps = capped_add_u64(
+                total_effective_cost_bps,
+                capped_add_u64(estimate.estimated_fee_bps, gas_bps),
+            );
+            total_latency_ms = capped_add_u64(total_latency_ms, estimate.estimated_latency_ms);
         }
     }
 
@@ -473,16 +530,10 @@ fn structural_cost_estimate(
         },
         MarketOrderTransitionKind::CctpBridge => StructuralCostEstimate {
             estimated_fee_bps: 0,
-            estimated_gas_usd_micros: structural_gas_usd_micros(
-                pricing,
-                &transition.input.asset.chain,
-                300_000,
-            )
-            .saturating_add(structural_gas_usd_micros(
-                pricing,
-                &transition.output.asset.chain,
-                300_000,
-            )),
+            estimated_gas_usd_micros: capped_add_u64(
+                structural_gas_usd_micros(pricing, &transition.input.asset.chain, 300_000),
+                structural_gas_usd_micros(pricing, &transition.output.asset.chain, 300_000),
+            ),
             estimated_latency_ms: 60_000,
             quote_source: "static_cctp_standard_seed",
         },
@@ -520,12 +571,20 @@ fn structural_cost_estimate(
     }
 }
 
+#[cfg(test)]
 fn sample_amount_for_asset(
     asset: &DepositAsset,
     registry: &AssetRegistry,
     pricing: &PricingSnapshot,
 ) -> Option<U256> {
     let chain_asset = registry.chain_asset(asset)?;
+    sample_amount_for_chain_asset(chain_asset, pricing)
+}
+
+fn sample_amount_for_chain_asset(
+    chain_asset: &ChainAsset,
+    pricing: &PricingSnapshot,
+) -> Option<U256> {
     pricing
         .sample_amount_raw(
             DEFAULT_SAMPLE_AMOUNT_USD_MICROS,
@@ -541,24 +600,75 @@ fn structural_gas_usd_micros(
     gas_units: u64,
 ) -> u64 {
     pricing
-        .wei_to_usd_micro(U256::from(gas_units).saturating_mul(pricing.chain_gas_price_wei(chain)))
-        .try_into()
+        .checked_wei_to_usd_micro(
+            U256::from(gas_units)
+                .checked_mul(pricing.chain_gas_price_wei(chain))
+                .unwrap_or(U256::MAX),
+        )
+        .and_then(|value| value.try_into().ok())
         .unwrap_or(u64::MAX)
 }
 
-fn quote_loss_bps(amount_in: U256, amount_out: U256) -> Option<u64> {
-    if amount_in.is_zero() {
+fn quote_value_loss_bps(
+    amount_in: U256,
+    input_asset: &ChainAsset,
+    amount_out: U256,
+    output_asset: &ChainAsset,
+    pricing: &PricingSnapshot,
+) -> Option<u64> {
+    let input_usd_micro = raw_amount_usd_micros(amount_in, input_asset, pricing)?;
+    let output_usd_micro = raw_amount_usd_micros(amount_out, output_asset, pricing)?;
+    loss_bps(input_usd_micro, output_usd_micro)
+}
+
+fn raw_amount_usd_micros(
+    raw_amount: U256,
+    chain_asset: &ChainAsset,
+    pricing: &PricingSnapshot,
+) -> Option<U256> {
+    let asset_usd_micro = U256::from(pricing.canonical_asset_usd_micro(chain_asset.canonical)?);
+    Some(raw_amount.checked_mul(asset_usd_micro)? / checked_pow10(chain_asset.decimals)?)
+}
+
+fn loss_bps(value_in: U256, value_out: U256) -> Option<u64> {
+    if value_in.is_zero() {
         return None;
     }
-    if amount_out >= amount_in {
+    if value_out >= value_in {
         return Some(0);
     }
-    let loss = amount_in.saturating_sub(amount_out);
-    let bps = loss
-        .saturating_mul(U256::from(BPS_DENOMINATOR))
-        .saturating_add(amount_in.saturating_sub(U256::from(1_u64)))
-        / amount_in;
-    u64::try_from(bps).ok()
+    let loss = value_in.checked_sub(value_out)?;
+    div_ceil_u512_to_u64(
+        U512::from(loss) * U512::from(BPS_DENOMINATOR),
+        U512::from(value_in),
+    )
+    .map(|bps| bps.min(BPS_DENOMINATOR))
+}
+
+fn gas_cost_bps(gas_usd_micros: u64, sample_amount_usd_micros: u64) -> u64 {
+    div_ceil_u512_to_u64(
+        U512::from(gas_usd_micros) * U512::from(BPS_DENOMINATOR),
+        U512::from(sample_amount_usd_micros),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+fn div_ceil_u512_to_u64(numerator: U512, denominator: U512) -> Option<u64> {
+    if denominator.is_zero() {
+        return None;
+    }
+    if numerator.is_zero() {
+        return Some(0);
+    }
+    let value = (numerator - U512::from(1_u64)) / denominator + U512::from(1_u64);
+    if value > U512::from(u64::MAX) {
+        return Some(u64::MAX);
+    }
+    value.to_string().parse::<u64>().ok()
+}
+
+fn capped_add_u64(left: u64, right: u64) -> u64 {
+    left.saturating_add(right)
 }
 
 #[cfg(test)]
@@ -631,6 +741,27 @@ mod tests {
         };
 
         assert_eq!(snapshot.effective_cost_bps(), 15);
+    }
+
+    #[test]
+    fn effective_cost_caps_overflowing_gas_bps_explicitly() {
+        let snapshot = RouteCostSnapshot {
+            transition_id: "edge".to_string(),
+            amount_bucket: DEFAULT_AMOUNT_BUCKET.to_string(),
+            provider: "test".to_string(),
+            edge_kind: "fixed_pair_swap".to_string(),
+            source_asset: asset("evm:1"),
+            destination_asset: asset("evm:8453"),
+            estimated_fee_bps: 5,
+            estimated_gas_usd_micros: u64::MAX,
+            estimated_latency_ms: 1,
+            sample_amount_usd_micros: 1,
+            quote_source: "test".to_string(),
+            refreshed_at: Utc::now(),
+            expires_at: Utc::now(),
+        };
+
+        assert_eq!(snapshot.effective_cost_bps(), u64::MAX);
     }
 
     #[test]
@@ -802,6 +933,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pricing_freshness_rejects_static_stale_and_expired_snapshots() {
+        let now = Utc::now();
+        let ttl = Duration::from_secs(600);
+        let mut market = PricingSnapshot::static_bootstrap(now);
+        market.source = "test_market_pricing".to_string();
+
+        assert!(pricing_snapshot_is_fresh(&market, now, ttl));
+        assert!(!pricing_snapshot_is_fresh(
+            &PricingSnapshot::static_bootstrap(now),
+            now,
+            ttl
+        ));
+
+        let mut stale = market.clone();
+        stale.captured_at = now - chrono::Duration::seconds(601);
+        assert!(!pricing_snapshot_is_fresh(&stale, now, ttl));
+
+        let mut expired = market;
+        expired.expires_at = Some(now - chrono::Duration::seconds(1));
+        assert!(!pricing_snapshot_is_fresh(&expired, now, ttl));
+    }
+
+    #[test]
+    fn route_cost_refresh_requires_live_fresh_pricing() {
+        let now = Utc::now();
+        let ttl = Duration::from_secs(600);
+        let mut live = PricingSnapshot::static_bootstrap(now);
+        live.source = "test_market_pricing".to_string();
+
+        require_live_pricing_for_route_cost_refresh(&live, now, ttl).unwrap();
+
+        let static_pricing = PricingSnapshot::static_bootstrap(now);
+        let error =
+            require_live_pricing_for_route_cost_refresh(&static_pricing, now, ttl).unwrap_err();
+        assert!(matches!(error, RouterServerError::NotReady { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to refresh route costs"),
+            "unexpected error: {error}"
+        );
+
+        let mut stale = live;
+        stale.captured_at = now - chrono::Duration::seconds(601);
+        assert!(require_live_pricing_for_route_cost_refresh(&stale, now, ttl).is_err());
+    }
+
     fn usdc(chain: &str, address: &str) -> DepositAsset {
         DepositAsset {
             chain: ChainId::parse(chain).unwrap(),
@@ -825,13 +1004,72 @@ mod tests {
     }
 
     #[test]
-    fn quote_loss_bps_rounds_loss_up() {
+    fn quote_value_loss_bps_normalizes_decimals_and_prices() {
+        let registry = AssetRegistry::default();
+        let pricing = PricingSnapshot::static_bootstrap(Utc::now());
+        let eth = registry.chain_asset(&asset("evm:1")).unwrap();
+        let usdc = registry
+            .chain_asset(&usdc("evm:1", "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"))
+            .unwrap();
+
         assert_eq!(
-            quote_loss_bps(U256::from(1_000_000_u64), U256::from(999_001_u64)),
+            quote_value_loss_bps(
+                U256::from(1_000_000_000_000_000_000_u128),
+                eth,
+                U256::from(2_970_000_000_u64),
+                usdc,
+                &pricing,
+            ),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn quote_value_loss_bps_rejects_overflowing_value_conversion() {
+        let registry = AssetRegistry::default();
+        let pricing = PricingSnapshot::static_bootstrap(Utc::now());
+        let btc = registry
+            .chain_asset(&DepositAsset {
+                chain: ChainId::parse("bitcoin").unwrap(),
+                asset: AssetId::Native,
+            })
+            .unwrap();
+
+        assert_eq!(
+            quote_value_loss_bps(U256::MAX, btc, U256::from(1_u64), btc, &pricing),
+            None
+        );
+    }
+
+    #[test]
+    fn raw_amount_usd_micros_rejects_unrepresentable_decimals() {
+        let registry = AssetRegistry::default();
+        let pricing = PricingSnapshot::static_bootstrap(Utc::now());
+        let mut eth = registry.chain_asset(&asset("evm:1")).unwrap().clone();
+        eth.decimals = u8::MAX;
+
+        assert_eq!(
+            raw_amount_usd_micros(U256::from(1_u64), &eth, &pricing),
+            None
+        );
+    }
+
+    #[test]
+    fn loss_bps_handles_values_that_overflow_u256_intermediate_products() {
+        let value_in = U256::MAX;
+        let value_out = value_in - value_in / U256::from(2_u64);
+
+        assert_eq!(loss_bps(value_in, value_out), Some(5_000));
+    }
+
+    #[test]
+    fn loss_bps_rounds_loss_up() {
+        assert_eq!(
+            loss_bps(U256::from(1_000_000_u64), U256::from(999_001_u64)),
             Some(10)
         );
         assert_eq!(
-            quote_loss_bps(U256::from(1_000_000_u64), U256::from(1_000_001_u64)),
+            loss_bps(U256::from(1_000_000_u64), U256::from(1_000_001_u64)),
             Some(0)
         );
     }

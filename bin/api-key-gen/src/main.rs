@@ -22,6 +22,9 @@ pub enum Error {
 
     #[snafu(display("Invalid input: {}", message))]
     InvalidInput { message: String },
+
+    #[snafu(display("Logger initialization failed: {}", message))]
+    Logger { message: String },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -97,8 +100,11 @@ fn generate_command(tag: String) -> Result<()> {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    init_logger(&args.log_level, None::<console_subscriber::ConsoleLayer>)
-        .expect("Logger should initialize");
+    init_logger(&args.log_level, None::<console_subscriber::ConsoleLayer>).map_err(|error| {
+        Error::Logger {
+            message: error.to_string(),
+        }
+    })?;
 
     match args.command {
         Command::Generate { tag } => generate_command(tag),

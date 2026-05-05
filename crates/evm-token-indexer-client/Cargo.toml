@@ -11,4 +11,8 @@ tracing = { workspace = true }
 snafu = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 url = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

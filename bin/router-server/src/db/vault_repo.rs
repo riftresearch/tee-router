@@ -2,9 +2,9 @@ use crate::{
     error::{RouterServerError, RouterServerResult},
     models::{
         CustodyVaultControlType, CustodyVaultRole, CustodyVaultStatus, CustodyVaultVisibility,
-        DepositVault, DepositVaultFundingHint, DepositVaultStatus, OrderExecutionStepStatus,
-        OrderExecutionStepType, ProviderOperationHintKind, ProviderOperationHintStatus,
-        VaultAction,
+        DepositVault, DepositVaultFundingHint, DepositVaultFundingObservation, DepositVaultStatus,
+        OrderExecutionStepStatus, OrderExecutionStepType, ProviderOperationHintKind,
+        ProviderOperationHintStatus, VaultAction, SAURON_DETECTOR_HINT_SOURCE,
     },
     protocol::{AssetId, ChainId, DepositAsset},
     telemetry,
@@ -33,6 +33,15 @@ const SELECT_COLUMNS: &str = r#"
     dv.refunded_at,
     dv.refund_tx_hash,
     dv.last_refund_error,
+    dv.funding_tx_hash,
+    dv.funding_sender_address,
+    dv.funding_sender_addresses,
+    dv.funding_recipient_address,
+    dv.funding_transfer_index,
+    dv.funding_observed_amount,
+    dv.funding_confirmation_state,
+    dv.funding_observed_at,
+    dv.funding_evidence_json,
     dv.created_at,
     dv.updated_at
 "#;
@@ -111,6 +120,8 @@ impl VaultRepository {
                 message: format!("failed to encode vault action: {err}"),
             })?;
         let cancellation_commitment = decode_hex_32(&vault.cancellation_commitment)?;
+        let funding_transfer_index =
+            db_transfer_index_from_observation(vault.funding_observation.as_ref())?;
 
         let started = Instant::now();
         let result = async {
@@ -177,12 +188,22 @@ impl VaultRepository {
                     refunded_at,
                     refund_tx_hash,
                     last_refund_error,
+                    funding_tx_hash,
+                    funding_sender_address,
+                    funding_sender_addresses,
+                    funding_recipient_address,
+                    funding_transfer_index,
+                    funding_observed_amount,
+                    funding_confirmation_state,
+                    funding_observed_at,
+                    funding_evidence_json,
                     created_at,
                     updated_at
                 )
                 VALUES (
                     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                    $11, $12, $13
+                    $11, $12, $13, $14, $15, $16, $17, $18, $19,
+                    $20, $21, $22
                 )
                 "#,
             )
@@ -197,6 +218,55 @@ impl VaultRepository {
             .bind(vault.refunded_at)
             .bind(vault.refund_tx_hash.clone())
             .bind(vault.last_refund_error.clone())
+            .bind(
+                vault
+                    .funding_observation
+                    .as_ref()
+                    .and_then(|observation| observation.tx_hash.clone()),
+            )
+            .bind(
+                vault
+                    .funding_observation
+                    .as_ref()
+                    .and_then(|observation| observation.sender_address.clone()),
+            )
+            .bind(json!(vault
+                .funding_observation
+                .as_ref()
+                .map(|observation| observation.sender_addresses.clone())
+                .unwrap_or_default()))
+            .bind(
+                vault
+                    .funding_observation
+                    .as_ref()
+                    .and_then(|observation| observation.recipient_address.clone()),
+            )
+            .bind(funding_transfer_index)
+            .bind(
+                vault
+                    .funding_observation
+                    .as_ref()
+                    .and_then(|observation| observation.observed_amount.clone()),
+            )
+            .bind(
+                vault
+                    .funding_observation
+                    .as_ref()
+                    .and_then(|observation| observation.confirmation_state.clone()),
+            )
+            .bind(
+                vault
+                    .funding_observation
+                    .as_ref()
+                    .and_then(|observation| observation.observed_at),
+            )
+            .bind(
+                vault
+                    .funding_observation
+                    .as_ref()
+                    .map(|observation| observation.evidence.clone())
+                    .unwrap_or_else(|| json!({})),
+            )
             .bind(vault.created_at)
             .bind(vault.updated_at)
             .execute(&mut *tx)
@@ -334,28 +404,116 @@ impl VaultRepository {
         self.map_row(&row)
     }
 
-    pub async fn get_pending_funding(&self, limit: i64) -> RouterServerResult<Vec<DepositVault>> {
+    pub async fn mark_funded_with_observation(
+        &self,
+        id: Uuid,
+        observation: &DepositVaultFundingObservation,
+        updated_at: DateTime<Utc>,
+    ) -> RouterServerResult<DepositVault> {
+        let funding_transfer_index = db_transfer_index_from_observation(Some(observation))?;
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
+            WITH updated AS (
+            UPDATE deposit_vaults
+            SET
+                status = 'funded',
+                funding_tx_hash = $2,
+                funding_sender_address = $3,
+                funding_sender_addresses = $4,
+                funding_recipient_address = $5,
+                funding_transfer_index = $6,
+                funding_observed_amount = $7,
+                funding_confirmation_state = $8,
+                funding_observed_at = $9,
+                funding_evidence_json = $10,
+                updated_at = $11
+            WHERE id = $1
+              AND status = 'pending_funding'
+            RETURNING *
+            )
             SELECT {SELECT_COLUMNS}
-            FROM {SELECT_FROM}
-            WHERE dv.status = 'pending_funding'
-            ORDER BY dv.updated_at ASC, dv.id ASC
-            LIMIT $1
+            FROM updated dv
+            JOIN custody_vaults cv ON cv.id = dv.id
             "#
         ))
-        .bind(limit)
-        .fetch_all(&self.pool)
+        .bind(id)
+        .bind(observation.tx_hash.clone())
+        .bind(observation.sender_address.clone())
+        .bind(json!(observation.sender_addresses.clone()))
+        .bind(observation.recipient_address.clone())
+        .bind(funding_transfer_index)
+        .bind(observation.observed_amount.clone())
+        .bind(observation.confirmation_state.clone())
+        .bind(observation.observed_at)
+        .bind(observation.evidence.clone())
+        .bind(updated_at)
+        .fetch_one(&self.pool)
         .await;
         telemetry::record_db_query(
-            "vault.get_pending_funding",
+            "vault.mark_funded_with_observation",
             result.is_ok(),
             started.elapsed(),
         );
-        let rows = result?;
+        let row = result?;
 
-        rows.iter().map(|row| self.map_row(row)).collect()
+        self.map_row(&row)
+    }
+
+    pub async fn record_refunding_observation(
+        &self,
+        id: Uuid,
+        observation: &DepositVaultFundingObservation,
+        updated_at: DateTime<Utc>,
+    ) -> RouterServerResult<DepositVault> {
+        let funding_transfer_index = db_transfer_index_from_observation(Some(observation))?;
+        let started = Instant::now();
+        let result = sqlx_core::query::query(&format!(
+            r#"
+            WITH updated AS (
+            UPDATE deposit_vaults
+            SET
+                funding_tx_hash = $2,
+                funding_sender_address = $3,
+                funding_sender_addresses = $4,
+                funding_recipient_address = $5,
+                funding_transfer_index = $6,
+                funding_observed_amount = $7,
+                funding_confirmation_state = $8,
+                funding_observed_at = $9,
+                funding_evidence_json = $10,
+                updated_at = $11
+            WHERE id = $1
+              AND status = 'refunding'
+              AND funding_evidence_json = '{{}}'::jsonb
+            RETURNING *
+            )
+            SELECT {SELECT_COLUMNS}
+            FROM updated dv
+            JOIN custody_vaults cv ON cv.id = dv.id
+            "#
+        ))
+        .bind(id)
+        .bind(observation.tx_hash.clone())
+        .bind(observation.sender_address.clone())
+        .bind(json!(observation.sender_addresses.clone()))
+        .bind(observation.recipient_address.clone())
+        .bind(funding_transfer_index)
+        .bind(observation.observed_amount.clone())
+        .bind(observation.confirmation_state.clone())
+        .bind(observation.observed_at)
+        .bind(observation.evidence.clone())
+        .bind(updated_at)
+        .fetch_one(&self.pool)
+        .await;
+        telemetry::record_db_query(
+            "vault.record_refunding_observation",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        let row = result?;
+
+        self.map_row(&row)
     }
 
     pub async fn create_funding_hint(
@@ -365,25 +523,45 @@ impl VaultRepository {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
-            INSERT INTO deposit_vault_funding_hints (
-                id,
-                vault_id,
-                source,
-                hint_kind,
-                evidence_json,
-                status,
-                idempotency_key,
-                error_json,
-                claimed_at,
-                processed_at,
-                created_at,
-                updated_at
+            WITH upserted AS (
+                INSERT INTO deposit_vault_funding_hints (
+                    id,
+                    vault_id,
+                    source,
+                    hint_kind,
+                    evidence_json,
+                    status,
+                    idempotency_key,
+                    error_json,
+                    claimed_at,
+                    processed_at,
+                    created_at,
+                    updated_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                ON CONFLICT (source, idempotency_key) WHERE idempotency_key IS NOT NULL
+                DO UPDATE SET
+                    vault_id = EXCLUDED.vault_id,
+                    hint_kind = EXCLUDED.hint_kind,
+                    evidence_json = EXCLUDED.evidence_json,
+                    status = EXCLUDED.status,
+                    error_json = EXCLUDED.error_json,
+                    claimed_at = NULL,
+                    processed_at = NULL,
+                    updated_at = EXCLUDED.updated_at
+                WHERE deposit_vault_funding_hints.source = $13
+                  AND deposit_vault_funding_hints.status IN ('failed', 'ignored')
+                RETURNING {FUNDING_HINT_SELECT_COLUMNS}
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-            ON CONFLICT (source, idempotency_key) WHERE idempotency_key IS NOT NULL
-            DO UPDATE SET
-                updated_at = deposit_vault_funding_hints.updated_at
-            RETURNING {FUNDING_HINT_SELECT_COLUMNS}
+            SELECT {FUNDING_HINT_SELECT_COLUMNS}
+            FROM upserted
+            UNION ALL
+            SELECT {FUNDING_HINT_RETURNING_COLUMNS}
+            FROM deposit_vault_funding_hints hints
+            WHERE hints.source = $3
+              AND hints.idempotency_key = $7
+              AND NOT EXISTS (SELECT 1 FROM upserted)
+            LIMIT 1
             "#
         ))
         .bind(hint.id)
@@ -398,6 +576,7 @@ impl VaultRepository {
         .bind(hint.processed_at)
         .bind(hint.created_at)
         .bind(hint.updated_at)
+        .bind(SAURON_DETECTOR_HINT_SOURCE)
         .fetch_one(&self.pool)
         .await;
         telemetry::record_db_query(
@@ -431,14 +610,32 @@ impl VaultRepository {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
-            WITH candidates AS (
-                SELECT id
+            WITH pending_candidates AS (
+                SELECT id, created_at
                 FROM deposit_vault_funding_hints
                 WHERE status = 'pending'
-                   OR (status = 'processing' AND claimed_at < $2 - INTERVAL '5 minutes')
                 ORDER BY created_at ASC, id ASC
                 LIMIT $1
                 FOR UPDATE SKIP LOCKED
+            ),
+            processing_candidates AS (
+                SELECT id, created_at
+                FROM deposit_vault_funding_hints
+                WHERE status = 'processing'
+                  AND claimed_at < $2 - INTERVAL '5 minutes'
+                ORDER BY claimed_at ASC, created_at ASC, id ASC
+                LIMIT $1
+                FOR UPDATE SKIP LOCKED
+            ),
+            candidates AS (
+                SELECT id
+                FROM (
+                    SELECT id, created_at FROM pending_candidates
+                    UNION ALL
+                    SELECT id, created_at FROM processing_candidates
+                ) claimable
+                ORDER BY created_at ASC, id ASC
+                LIMIT $1
             )
             UPDATE deposit_vault_funding_hints hints
             SET
@@ -469,6 +666,7 @@ impl VaultRepository {
     pub async fn complete_funding_hint(
         &self,
         id: Uuid,
+        claimed_at: Option<DateTime<Utc>>,
         status: ProviderOperationHintStatus,
         error: serde_json::Value,
         now: DateTime<Utc>,
@@ -483,6 +681,8 @@ impl VaultRepository {
                 processed_at = $4,
                 updated_at = $4
             WHERE id = $1
+              AND status = 'processing'
+              AND claimed_at IS NOT DISTINCT FROM $5::timestamptz
             RETURNING {FUNDING_HINT_SELECT_COLUMNS}
             "#
         ))
@@ -490,6 +690,7 @@ impl VaultRepository {
         .bind(status.to_db_string())
         .bind(error)
         .bind(now)
+        .bind(claimed_at)
         .fetch_one(&self.pool)
         .await;
         telemetry::record_db_query(
@@ -621,7 +822,7 @@ impl VaultRepository {
                 SELECT id
                 FROM deposit_vaults
                 WHERE cancel_after <= $1
-                  AND status IN ('pending_funding', 'funded')
+                  AND status = 'funded'
                 ORDER BY cancel_after ASC
                 LIMIT $4
                 FOR UPDATE SKIP LOCKED
@@ -721,7 +922,7 @@ impl VaultRepository {
             FROM (
                 SELECT cancel_after AS due_at
                 FROM deposit_vaults
-                WHERE status IN ('pending_funding', 'funded')
+                WHERE status = 'funded'
 
                 UNION ALL
 
@@ -752,6 +953,8 @@ impl VaultRepository {
         id: Uuid,
         refunded_at: DateTime<Utc>,
         refund_tx_hash: &str,
+        claimed_by: &str,
+        claimed_until: DateTime<Utc>,
     ) -> RouterServerResult<DepositVault> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
@@ -769,6 +972,8 @@ impl VaultRepository {
                 updated_at = $2
             WHERE id = $1
               AND status = 'refunding'
+              AND refund_claimed_by = $4
+              AND refund_claimed_until IS NOT DISTINCT FROM $5::timestamptz
             RETURNING *
             )
             SELECT {SELECT_COLUMNS}
@@ -779,6 +984,8 @@ impl VaultRepository {
         .bind(id)
         .bind(refunded_at)
         .bind(refund_tx_hash)
+        .bind(claimed_by)
+        .bind(claimed_until)
         .fetch_one(&self.pool)
         .await;
         telemetry::record_db_query("vault.mark_refunded", result.is_ok(), started.elapsed());
@@ -793,6 +1000,8 @@ impl VaultRepository {
         updated_at: DateTime<Utc>,
         next_attempt_at: DateTime<Utc>,
         last_refund_error: &str,
+        claimed_by: &str,
+        claimed_until: DateTime<Utc>,
     ) -> RouterServerResult<DepositVault> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
@@ -808,6 +1017,8 @@ impl VaultRepository {
                 updated_at = $2
             WHERE id = $1
               AND status = 'refunding'
+              AND refund_claimed_by = $5
+              AND refund_claimed_until IS NOT DISTINCT FROM $6::timestamptz
             RETURNING *
             )
             SELECT {SELECT_COLUMNS}
@@ -819,6 +1030,8 @@ impl VaultRepository {
         .bind(updated_at)
         .bind(last_refund_error)
         .bind(next_attempt_at)
+        .bind(claimed_by)
+        .bind(claimed_until)
         .fetch_one(&self.pool)
         .await;
         telemetry::record_db_query("vault.mark_refund_error", result.is_ok(), started.elapsed());
@@ -901,6 +1114,44 @@ impl VaultRepository {
                     message: "cancellation_commitment must be 32 bytes".to_string(),
                 })?;
 
+        let funding_sender_addresses_json: serde_json::Value = row.get("funding_sender_addresses");
+        let funding_sender_addresses = serde_json::from_value::<Vec<String>>(
+            funding_sender_addresses_json.clone(),
+        )
+        .map_err(|err| RouterServerError::InvalidData {
+            message: format!("invalid funding sender addresses payload: {err}"),
+        })?;
+        let funding_evidence: serde_json::Value = row.get("funding_evidence_json");
+        let funding_observation = {
+            let tx_hash = row.get::<Option<String>, _>("funding_tx_hash");
+            let sender_address = row.get::<Option<String>, _>("funding_sender_address");
+            let recipient_address = row.get::<Option<String>, _>("funding_recipient_address");
+            let transfer_index = transfer_index_from_db(row.get("funding_transfer_index"))?;
+            let observed_amount = row.get::<Option<String>, _>("funding_observed_amount");
+            let confirmation_state = row.get::<Option<String>, _>("funding_confirmation_state");
+            let observed_at = row.get::<Option<DateTime<Utc>>, _>("funding_observed_at");
+            if tx_hash.is_some()
+                || sender_address.is_some()
+                || !funding_sender_addresses.is_empty()
+                || recipient_address.is_some()
+                || observed_amount.is_some()
+            {
+                Some(DepositVaultFundingObservation {
+                    tx_hash,
+                    sender_address,
+                    sender_addresses: funding_sender_addresses,
+                    recipient_address,
+                    transfer_index,
+                    observed_amount,
+                    confirmation_state,
+                    observed_at,
+                    evidence: funding_evidence,
+                })
+            } else {
+                None
+            }
+        };
+
         Ok(DepositVault {
             id: row.get("id"),
             order_id: row.get("order_id"),
@@ -920,6 +1171,7 @@ impl VaultRepository {
             refunded_at: row.get("refunded_at"),
             refund_tx_hash: row.get("refund_tx_hash"),
             last_refund_error: row.get("last_refund_error"),
+            funding_observation,
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
         })
@@ -935,4 +1187,53 @@ fn decode_hex_32(value: &str) -> RouterServerResult<[u8; 32]> {
     bytes.try_into().map_err(|_| RouterServerError::Validation {
         message: "expected 32-byte hex value".to_string(),
     })
+}
+
+fn db_transfer_index_from_observation(
+    observation: Option<&DepositVaultFundingObservation>,
+) -> RouterServerResult<Option<i64>> {
+    observation
+        .and_then(|observation| observation.transfer_index)
+        .map(db_transfer_index_from_u64)
+        .transpose()
+}
+
+fn db_transfer_index_from_u64(index: u64) -> RouterServerResult<i64> {
+    i64::try_from(index).map_err(|_| RouterServerError::InvalidData {
+        message: format!("funding transfer index {index} exceeds Postgres bigint range"),
+    })
+}
+
+fn transfer_index_from_db(index: Option<i64>) -> RouterServerResult<Option<u64>> {
+    index
+        .map(|index| {
+            u64::try_from(index).map_err(|_| RouterServerError::InvalidData {
+                message: format!("funding transfer index {index} is negative"),
+            })
+        })
+        .transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn db_transfer_index_rejects_values_above_signed_bigint() {
+        assert_eq!(
+            db_transfer_index_from_u64(i64::MAX as u64).unwrap(),
+            i64::MAX
+        );
+        assert!(db_transfer_index_from_u64(i64::MAX as u64 + 1).is_err());
+    }
+
+    #[test]
+    fn transfer_index_from_db_rejects_negative_values() {
+        assert_eq!(transfer_index_from_db(Some(0)).unwrap(), Some(0));
+        assert_eq!(
+            transfer_index_from_db(Some(i64::MAX)).unwrap(),
+            Some(i64::MAX as u64)
+        );
+        assert!(transfer_index_from_db(Some(-1)).is_err());
+    }
 }
