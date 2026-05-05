@@ -4612,7 +4612,7 @@ impl ExchangeProvider for HyperliquidProvider {
                     .and_then(Value::as_u64)
                     .ok_or_else(|| "hyperliquid post_execute: filled missing oid".to_string())?;
                 return Ok(ProviderExecutionStatePatch {
-                    provider_ref: Some(oid.to_string()),
+                    provider_ref: Some(receipt.tx_hash.clone()),
                     observed_state: Some(json!({
                         "kind": "filled",
                         "oid": oid,
@@ -4631,7 +4631,7 @@ impl ExchangeProvider for HyperliquidProvider {
                     .and_then(Value::as_u64)
                     .ok_or_else(|| "hyperliquid post_execute: resting missing oid".to_string())?;
                 return Ok(ProviderExecutionStatePatch {
-                    provider_ref: Some(oid.to_string()),
+                    provider_ref: Some(receipt.tx_hash.clone()),
                     observed_state: Some(json!({
                         "kind": "resting",
                         "oid": oid,
@@ -4669,9 +4669,7 @@ impl ExchangeProvider for HyperliquidProvider {
             let Some(provider_ref) = request.provider_ref.as_deref() else {
                 return Ok(None);
             };
-            let oid: u64 = provider_ref
-                .parse()
-                .map_err(|err| format!("hyperliquid observe: invalid oid {provider_ref}: {err}"))?;
+            let oid = hyperliquid_order_oid_from_observation_request(&request)?;
             let user_str = request
                 .request
                 .get("user")
@@ -4714,6 +4712,31 @@ impl ExchangeProvider for HyperliquidProvider {
             }))
         })
     }
+}
+
+fn hyperliquid_order_oid_from_observation_request(
+    request: &ProviderOperationObservationRequest,
+) -> ProviderResult<u64> {
+    if let Some(oid) = hyperliquid_order_oid_from_observed_state(&request.observed_state) {
+        return Ok(oid);
+    }
+    if let Some(provider_ref) = request.provider_ref.as_deref() {
+        if let Ok(oid) = provider_ref.parse::<u64>() {
+            return Ok(oid);
+        }
+    }
+    Err("hyperliquid observe: operation is missing oid in observed_state".to_string())
+}
+
+fn hyperliquid_order_oid_from_observed_state(value: &Value) -> Option<u64> {
+    [
+        "/oid",
+        "/provider_observed_state/order/order/oid",
+        "/previous_observed_state/oid",
+        "/previous_observed_state/provider_observed_state/order/order/oid",
+    ]
+    .iter()
+    .find_map(|pointer| value.pointer(pointer).and_then(Value::as_u64))
 }
 
 fn hyperliquid_order_status_provider_status(
@@ -6275,7 +6298,8 @@ mod hyperliquid_math_tests {
         cctp_provider_domain, cctp_quote_amounts, cctp_source_domain_from_request,
         checked_timeout_at_ms, classify_hl_leg, compute_base_sz, compute_limit_px,
         decimal_bps_string, encode_erc20_approve, format_hl_spot_price, hl_leg_descriptor,
-        hyperliquid_bridge_deposit_completion_response, hyperliquid_order_status_provider_status,
+        hyperliquid_bridge_deposit_completion_response,
+        hyperliquid_order_oid_from_observation_request, hyperliquid_order_status_provider_status,
         observed_unit_operation_fingerprints, parse_decimal_bps_to_micros,
         parse_decimal_to_raw_units_floor, seen_operation_fingerprints_from_request, simulate_leg,
         unit_operation_provider_status, unit_withdrawal_minimum_raw,
@@ -6292,7 +6316,8 @@ mod hyperliquid_math_tests {
         models::{MarketOrderKind, ProviderOperationStatus, ProviderOperationType},
         protocol::{AssetId, ChainId, DepositAsset},
         services::{
-            AssetRegistry, CanonicalAsset, ProviderAsset, ProviderAssetCapability, ProviderId,
+            custody_action_executor::CustodyActionReceipt, AssetRegistry, CanonicalAsset,
+            ProviderAsset, ProviderAssetCapability, ProviderId,
         },
     };
     use alloy::primitives::U256;
@@ -6478,6 +6503,90 @@ mod hyperliquid_math_tests {
         assert!(
             unknown_status.contains("unsupported orderStatus lifecycle"),
             "{unknown_status}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hyperliquid_post_execute_uses_action_hash_as_provider_ref() {
+        let provider = HyperliquidProvider::new(
+            "http://localhost:1",
+            HyperliquidCallNetwork::Testnet,
+            Arc::new(AssetRegistry::default()),
+            1_000,
+        )
+        .expect("hyperliquid provider should build");
+        let tx_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let receipt = CustodyActionReceipt {
+            custody_vault_id: Uuid::now_v7(),
+            tx_hash: tx_hash.to_string(),
+            logs: vec![],
+            response: Some(json!({
+                "status": "ok",
+                "response": {
+                    "type": "order",
+                    "data": {
+                        "statuses": [
+                            {
+                                "filled": {
+                                    "oid": 1109,
+                                    "totalSz": "1",
+                                    "avgPx": "100"
+                                }
+                            }
+                        ]
+                    }
+                }
+            })),
+        };
+
+        let patch = provider
+            .post_execute(&json!({}), &[receipt])
+            .await
+            .expect("hyperliquid post_execute succeeds");
+
+        assert_eq!(patch.provider_ref.as_deref(), Some(tx_hash));
+        assert_eq!(patch.status, Some(ProviderOperationStatus::Completed));
+        assert_eq!(
+            patch
+                .observed_state
+                .as_ref()
+                .and_then(|state| state.get("oid"))
+                .and_then(serde_json::Value::as_u64),
+            Some(1109)
+        );
+    }
+
+    #[test]
+    fn hyperliquid_observation_reads_oid_from_observed_state_not_provider_ref() {
+        let tx_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let request = ProviderOperationObservationRequest {
+            operation_id: Uuid::now_v7(),
+            operation_type: ProviderOperationType::HyperliquidLimitOrder,
+            provider_ref: Some(tx_hash.to_string()),
+            request: json!({}),
+            response: json!({}),
+            observed_state: json!({
+                "source": "router_worker_provider_observation",
+                "provider_observed_state": {
+                    "status": "order",
+                    "order": {
+                        "order": {
+                            "oid": 1109
+                        }
+                    }
+                },
+                "previous_observed_state": {
+                    "kind": "resting",
+                    "oid": 1109,
+                    "tx_hash": tx_hash
+                }
+            }),
+            hint_evidence: json!({}),
+        };
+
+        assert_eq!(
+            hyperliquid_order_oid_from_observation_request(&request).unwrap(),
+            1109
         );
     }
 

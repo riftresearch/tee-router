@@ -1749,20 +1749,7 @@ impl OrderExecutionManager {
                     message: format!("invalid hyperliquid timeout cancel asset index: {err}"),
                 })
             })?;
-        let oid = operation
-            .provider_ref
-            .as_deref()
-            .ok_or_else(|| OrderExecutionError::ProviderRequestFailed {
-                provider: operation.provider.clone(),
-                message: "hyperliquid timeout cancel missing provider ref".to_string(),
-            })
-            .and_then(|raw| {
-                raw.parse::<u64>()
-                    .map_err(|err| OrderExecutionError::ProviderRequestFailed {
-                        provider: operation.provider.clone(),
-                        message: format!("invalid hyperliquid timeout cancel oid: {err}"),
-                    })
-            })?;
+        let oid = hyperliquid_operation_oid(operation)?;
         let cancel_action = CustodyAction::Call(ChainCall::Hyperliquid(HyperliquidCall {
             target_base_url: target_base_url.to_string(),
             network,
@@ -8993,6 +8980,32 @@ fn internal_custody_terminal_status(
     }
 }
 
+fn hyperliquid_operation_oid(operation: &OrderProviderOperation) -> OrderExecutionResult<u64> {
+    if let Some(oid) = hyperliquid_operation_oid_from_observed_state(&operation.observed_state) {
+        return Ok(oid);
+    }
+    if let Some(provider_ref) = operation.provider_ref.as_deref() {
+        if let Ok(oid) = provider_ref.parse::<u64>() {
+            return Ok(oid);
+        }
+    }
+    Err(OrderExecutionError::ProviderRequestFailed {
+        provider: operation.provider.clone(),
+        message: "hyperliquid operation is missing oid in observed_state".to_string(),
+    })
+}
+
+fn hyperliquid_operation_oid_from_observed_state(value: &Value) -> Option<u64> {
+    [
+        "/oid",
+        "/provider_observed_state/order/order/oid",
+        "/previous_observed_state/oid",
+        "/previous_observed_state/provider_observed_state/order/order/oid",
+    ]
+    .iter()
+    .find_map(|pointer| value.pointer(pointer).and_then(Value::as_u64))
+}
+
 fn provider_status_observation_update(
     operation: &OrderProviderOperation,
     hint: &OrderProviderOperationHint,
@@ -10440,6 +10453,49 @@ mod tests {
             persisted_provider_operation_tx_hash(&operation).as_deref(),
             Some("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         );
+    }
+
+    #[test]
+    fn hyperliquid_operation_oid_reads_observed_state_when_provider_ref_is_hash() {
+        let mut operation = test_order_provider_operation(
+            json!({}),
+            json!({
+                "kind": "resting",
+                "oid": 1109,
+                "tx_hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }),
+        );
+        operation.provider_ref =
+            Some("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string());
+
+        assert_eq!(hyperliquid_operation_oid(&operation).unwrap(), 1109);
+    }
+
+    #[test]
+    fn hyperliquid_operation_oid_reads_wrapped_provider_observation_state() {
+        let mut operation = test_order_provider_operation(
+            json!({}),
+            json!({
+                "source": "router_worker_provider_observation",
+                "provider_observed_state": {
+                    "status": "order",
+                    "order": {
+                        "order": {
+                            "oid": 2201
+                        }
+                    }
+                },
+                "previous_observed_state": {
+                    "kind": "resting",
+                    "oid": 1109,
+                    "tx_hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }
+            }),
+        );
+        operation.provider_ref =
+            Some("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string());
+
+        assert_eq!(hyperliquid_operation_oid(&operation).unwrap(), 2201);
     }
 
     #[test]

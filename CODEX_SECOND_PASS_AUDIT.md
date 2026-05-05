@@ -12,63 +12,45 @@ this file and the working-copy audit log was truncated. The committed baseline
 above was restored, and the most recent recovered findings are listed below so
 the current ticket remains documented.
 
-## 1. Sauron still has a provider-operation polling loop
+## 1. Sauron provider-operation hints are observation-backed and idempotent
 
-Severity: high.
+Severity: high. Status: resolved.
 
-`bin/sauron/src/runtime.rs` starts `run_provider_operation_hint_loop` with a
-hard-coded 5 second interval. That loop snapshots every active provider
-operation and submits a `PossibleProgress` provider-operation hint to the router
-API.
+The recovered note referred to a removed `run_provider_operation_hint_loop`.
+Current Sauron keeps a CDC-fed active provider-operation watch set, asks the
+router/provider observe proxy for a concrete `ProviderOperationObservation`,
+fingerprints that observation, and submits `PossibleProgress` only when the
+fingerprint changes or the bounded resubmission interval expires.
 
-The hint does not contain an idempotency key:
+The submitted hint now carries a deterministic idempotency key:
 
 ```rust
-idempotency_key: None,
+idempotency_key: Some(provider_operation_observation_hint_idempotency_key(
+    operation_id,
+    &fingerprint,
+)),
 ```
 
-`order_provider_operation_hints` only deduplicates hints where
-`idempotency_key IS NOT NULL`, so this loop can create a new hint row for every
-watched provider operation every 5 seconds.
+Verification:
 
-Impact:
+- `cargo test -p sauron provider_operation_observation --lib` passes.
 
-- This reintroduces router-side provider polling by proxy.
-- Provider/API load scales with active provider operations.
-- Hint table growth also scales with operation count and time.
-- This violates the intended model where Sauron should observe provider state
-  itself and only notify the router after a real state transition or concrete
-  evidence.
+## 2. Universal-router routes are covered by route-minimum policy
 
-Recommended fix:
+Severity: medium. Status: resolved.
 
-- Remove `run_provider_operation_hint_loop`.
-- Move provider-state observation into Sauron/provider observer code that shares
-  the same provider verification logic as the worker.
-- Have Sauron submit hints only when it has observed concrete progress.
-- Use deterministic idempotency keys for any resync/replay path.
+`route_minimums.rs` now computes exact-out route floors through
+`MarketOrderTransitionKind::UniversalRouterSwap`, including explicit input and
+output decimals. `order_manager.rs` now treats an unsupported minimum for a
+configured universal-router path as a hard quote error instead of silently
+passing it.
 
-## 2. Universal-router routes bypass the route-minimum gate
+Verification:
 
-Severity: medium.
-
-`route_minimums.rs` returns `RouteMinimumError::Unsupported` for
-`MarketOrderTransitionKind::UniversalRouterSwap`, and `order_manager.rs` treats
-that unsupported result as success during quote validation.
-
-Impact:
-
-- Arbitrary-token routes involving Velora skip the router-level minimum-size
-  guard.
-- Dust/unprofitable routes can proceed if the provider returns a quote.
-- The system now depends on quote/provider behavior rather than a router policy
-  floor for the arbitrary-asset path.
-
-Recommended fix:
-
-- Add quote-time minimum support for universal-router legs, or
-- use conservative per-chain/per-anchor operational floors, or
-- block unsupported minimum paths except for explicitly safe cases.
+- `cargo test -p router-server route_minimum_service --test vault_creation`
+  passes.
+- `cargo test -p router-server quote_market_order_rejects_universal_router_route_without_minimum_policy --test vault_creation`
+  passes.
 
 ## 3. Route costs and reimbursements still use static pricing forever
 
@@ -79,69 +61,41 @@ Status: resolved. Router-worker now refreshes route-cost pricing through the
 configured EVM RPC `eth_gasPrice` calls. Paymaster reimbursement during quote
 composition uses the current `RouteCostService` pricing snapshot when available.
 
-## 4. Custody-backed execution has a durability window after tx submission
+## 4. Custody-backed execution persists receipt checkpoints
 
-Severity: medium.
+Severity: medium. Status: resolved.
 
-In `prepare_provider_completion`, custody actions are submitted on-chain before
-provider state is persisted. The code then captures balances, runs provider
-`post_execute`, enforces output minimums, and only then calls
-`persist_provider_state`.
+`prepare_provider_completion` now writes a provider receipt checkpoint
+immediately after each custody receipt is returned. Balance checks,
+`post_execute`, and output-minimum enforcement happen after durable receipt
+evidence exists. The worker has a crash injection point at
+`AfterProviderReceiptPersisted`.
 
-Impact:
+Verification:
 
-- A crash after transaction submission but before persistence can lose the tx
-  hash/provider operation state.
-- A fallible post-transaction balance check can mark the step failed even though
-  the external transaction already committed.
-- Existing crash injection points cover later state transitions, but not the
-  immediate "receipt obtained but provider state not durably recorded" window.
+- `cargo test -p router-server provider_receipt_checkpoint_forces_submitted_status_and_keeps_receipt --lib`
+  passes.
+- `cargo test -p router-server worker_restart_after_provider_receipt_checkpoint_recovers_waiting_step --test vault_creation`
+  passes.
 
-Recommended fix:
+## 5. Hyperliquid generic chain operations return typed errors
 
-- Persist submitted receipt/operation evidence immediately after every custody
-  receipt is returned.
-- Run balance/post-execute/minimum checks after durable evidence exists.
-- Add a crash-injection test between receipt return and provider-state
-  settlement.
+Severity: medium-low. Status: resolved.
 
-## 5. Hyperliquid chain operations can still panic if called generically
+`crates/chains/src/hyperliquid.rs` returns explicit unsupported-operation errors
+for generic block/status/sweep methods instead of panicking.
 
-Severity: medium-low.
+## 6. Universal-router asset and Velora descriptor hygiene
 
-`crates/chains/src/hyperliquid.rs` still uses `unimplemented!` for
-`get_tx_status`, `dump_to_address`, `get_block_height`, and `get_best_hash`.
-The router app registers `HyperliquidChain`, and generic router surfaces call
-chain methods such as `get_best_hash`.
+Severity: low. Status: resolved.
 
-Impact:
+`velora_quote_descriptor` now accepts a named `VeloraQuoteDescriptorSpec`, and
+`UniversalRouterAssetRef::deposit_asset` normalizes EVM token identities before
+returning the `DepositAsset`.
 
-- A generic chain-tip call for Hyperliquid can panic the request path.
-- Any future generic refund/sweep/status path that accidentally uses
-  `ChainOperations` for Hyperliquid will crash instead of returning a typed
-  unsupported error.
+Verification:
 
-Recommended fix:
-
-- Replace `unimplemented!` with explicit typed errors for unsupported operations.
-- Avoid registering Hyperliquid for generic chain endpoints that assume block
-  semantics, or make those endpoints reject `hyperliquid` before dispatch.
-
-## 6. Remaining small abstraction hygiene items
-
-Severity: low.
-
-- `velora_quote_descriptor` still has a non-generated
-  `#[allow(clippy::too_many_arguments)]`; this should become a named request
-  struct.
-- `UniversalRouterAssetRef::deposit_asset` parses `ChainId`/`AssetId` but does
-  not normalize the resulting `DepositAsset`. Other ingress paths normalize EVM
-  token identities, so this boundary is inconsistent.
-
-Recommended fix:
-
-- Convert `velora_quote_descriptor` to a `VeloraQuoteDescriptorSpec`.
-- Normalize in `UniversalRouterAssetRef::deposit_asset` before returning.
+- `cargo test -p router-server universal_router_asset_ref --lib` passes.
 
 ## 381-390. Recent Recovered Audit Items
 
@@ -196,3 +150,29 @@ Verification:
 - `cargo test -p router-server client_rejects_unsupported_base_urls --lib` passes.
 - `cargo test -p router-server across_url_errors_redact_path_query_fragment_and_invalid_values --lib` passes.
 - `cargo check -p router-server --lib` passes.
+
+## 392. Limit-order idempotency had weaker race coverage than market orders
+
+Severity: medium. Resolved in this branch.
+
+The global `router_orders(idempotency_key)` unique index was intentionally
+removed so public client keys are scoped to a specific quote instead of
+globally blocking reuse across independent quotes. Market orders already had
+coverage for this model, including a same-quote concurrent create race.
+Limit orders use the same quote-row serialization pattern, but did not have the
+same regression coverage.
+
+Resolution:
+
+- Added a limit-order test proving the same idempotency key may create orders
+  for two different quotes.
+- Added a 16-way concurrent create test proving same-quote limit-order retries
+  all resume the single linked order instead of creating duplicates or
+  surfacing false conflicts.
+
+Verification:
+
+- `cargo test -p router-server limit_order_idempotency --test vault_creation`
+  passes.
+- `cargo test -p router-server concurrent_create --test vault_creation`
+  passes.

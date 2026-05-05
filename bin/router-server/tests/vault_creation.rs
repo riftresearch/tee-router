@@ -2941,6 +2941,163 @@ async fn concurrent_create_order_requests_resume_same_quote_idempotently() {
 }
 
 #[tokio::test]
+async fn create_limit_order_idempotency_keys_are_scoped_to_their_quote() {
+    let mocks = MockIntegratorServer::spawn().await.unwrap();
+    let (order_manager, _db) = test_order_manager(Arc::new(ActionProviderRegistry::mock_http(
+        mocks.base_url(),
+    )))
+    .await;
+    let idempotency_key = "same-public-limit-client-key";
+    let source_asset = DepositAsset {
+        chain: ChainId::parse("evm:8453").unwrap(),
+        asset: AssetId::reference("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
+    };
+    let destination_asset = DepositAsset {
+        chain: ChainId::parse("bitcoin").unwrap(),
+        asset: AssetId::Native,
+    };
+
+    let first_quote = order_manager
+        .quote_limit_order(LimitOrderQuoteRequest {
+            from_asset: source_asset.clone(),
+            to_asset: destination_asset.clone(),
+            recipient_address: valid_regtest_btc_address(),
+            input_amount: "100000000".to_string(),
+            output_amount: "100000".to_string(),
+        })
+        .await
+        .unwrap()
+        .quote
+        .as_limit_order()
+        .expect("limit order quote")
+        .clone();
+
+    let second_quote = order_manager
+        .quote_limit_order(LimitOrderQuoteRequest {
+            from_asset: source_asset,
+            to_asset: destination_asset,
+            recipient_address: valid_regtest_btc_address(),
+            input_amount: "200000000".to_string(),
+            output_amount: "200000".to_string(),
+        })
+        .await
+        .unwrap()
+        .quote
+        .as_limit_order()
+        .expect("limit order quote")
+        .clone();
+
+    let first_order = order_manager
+        .create_order_from_quote(CreateOrderRequest {
+            quote_id: first_quote.id,
+            refund_address: valid_evm_address(),
+            cancel_after: None,
+            idempotency_key: Some(idempotency_key.to_string()),
+            metadata: json!({}),
+        })
+        .await
+        .unwrap()
+        .0;
+
+    let second_order = order_manager
+        .create_order_from_quote(CreateOrderRequest {
+            quote_id: second_quote.id,
+            refund_address: valid_evm_address(),
+            cancel_after: None,
+            idempotency_key: Some(idempotency_key.to_string()),
+            metadata: json!({}),
+        })
+        .await
+        .unwrap()
+        .0;
+
+    assert_ne!(first_order.id, second_order.id);
+    assert_eq!(
+        first_order.idempotency_key.as_deref(),
+        Some(idempotency_key)
+    );
+    assert_eq!(
+        second_order.idempotency_key.as_deref(),
+        Some(idempotency_key)
+    );
+}
+
+#[tokio::test]
+async fn concurrent_create_limit_order_requests_resume_same_quote_idempotently() {
+    let mocks = MockIntegratorServer::spawn().await.unwrap();
+    let (order_manager, db) = test_order_manager(Arc::new(ActionProviderRegistry::mock_http(
+        mocks.base_url(),
+    )))
+    .await;
+    let order_manager = Arc::new(order_manager);
+    let refund_address = valid_evm_address();
+    let quote = order_manager
+        .quote_limit_order(LimitOrderQuoteRequest {
+            from_asset: DepositAsset {
+                chain: ChainId::parse("evm:8453").unwrap(),
+                asset: AssetId::reference("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
+            },
+            to_asset: DepositAsset {
+                chain: ChainId::parse("bitcoin").unwrap(),
+                asset: AssetId::Native,
+            },
+            recipient_address: valid_regtest_btc_address(),
+            input_amount: "100000000".to_string(),
+            output_amount: "100000".to_string(),
+        })
+        .await
+        .unwrap()
+        .quote
+        .as_limit_order()
+        .expect("limit order quote")
+        .clone();
+    let request = CreateOrderRequest {
+        quote_id: quote.id,
+        refund_address,
+        cancel_after: None,
+        idempotency_key: Some("concurrent-create-limit-order-race".to_string()),
+        metadata: json!({}),
+    };
+    const ATTEMPTS: usize = 16;
+    let barrier = Arc::new(tokio::sync::Barrier::new(ATTEMPTS));
+    let mut tasks = Vec::with_capacity(ATTEMPTS);
+
+    for _ in 0..ATTEMPTS {
+        let order_manager = order_manager.clone();
+        let request = request.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            order_manager
+                .create_order_from_quote(request)
+                .await
+                .map(|(order, quote)| (order.id, quote.id()))
+        }));
+    }
+
+    let mut results = Vec::with_capacity(ATTEMPTS);
+    for task in tasks {
+        results.push(
+            task.await
+                .expect("task joins")
+                .expect("limit order create resumes"),
+        );
+    }
+    let first = results[0];
+    assert!(
+        results.iter().all(|result| *result == first),
+        "all concurrent limit order retries should observe the same order and quote"
+    );
+
+    let linked_quote = db
+        .orders()
+        .get_limit_order_quote_by_id(quote.id)
+        .await
+        .unwrap();
+    assert_eq!(linked_quote.order_id, Some(first.0));
+}
+
+#[tokio::test]
 async fn quote_market_order_supports_velora_arbitrary_evm_start_and_end() {
     let h = harness().await;
     let mocks = spawn_harness_mocks(h, "evm:8453").await;
