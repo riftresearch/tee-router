@@ -604,18 +604,36 @@ test('fetchOrderPage falls back to replica metrics when analytics metrics fail',
   }
 })
 
-test('parseAnalyticsRange rejects oversized bucket windows', async () => {
-  const accepted = parseAnalyticsRange(
-    '2026-05-01T00:00:00.000Z',
-    '2026-05-08T00:00:00.000Z',
-    'minute'
-  )
-  expect(accepted).not.toBeInstanceOf(Response)
+test('parseAnalyticsRange accepts every fixed dashboard window and bucket size', () => {
+  const to = new Date('2026-05-05T00:00:00.000Z')
+  const windows = [
+    { amount: 6, unit: 'hour' },
+    { amount: 1, unit: 'day' },
+    { amount: 7, unit: 'day' },
+    { amount: 30, unit: 'day' },
+    { amount: 90, unit: 'day' }
+  ] as const
+  const bucketSizes = ['five_minute', 'hour', 'day'] as const
 
+  for (const window of windows) {
+    const from = new Date(to)
+    if (window.unit === 'hour') from.setUTCHours(from.getUTCHours() - window.amount)
+    else if (window.amount === 1) from.setUTCHours(from.getUTCHours() - 24)
+    else from.setUTCDate(from.getUTCDate() - window.amount)
+
+    for (const bucketSize of bucketSizes) {
+      expect(
+        parseAnalyticsRange(from.toISOString(), to.toISOString(), bucketSize)
+      ).not.toBeInstanceOf(Response)
+    }
+  }
+})
+
+test('parseAnalyticsRange rejects oversized bucket windows', async () => {
   const rejected = parseAnalyticsRange(
     '2026-05-01T00:00:00.000Z',
-    '2026-06-01T00:00:00.000Z',
-    'minute'
+    '2027-08-01T00:01:00.000Z',
+    'five_minute'
   )
   expect(rejected).toBeInstanceOf(Response)
   expect((rejected as Response).status).toBe(400)

@@ -85,3 +85,23 @@ router-loadgen count='100' concurrency='8' rps='5' min_raw_amount='100000000' ma
       --devnet-manifest-url http://localhost:50108/manifest.json \
       --bitcoin-rpc-url http://localhost:50100/wallet/alice \
       --bitcoin-rpc-auth devnet:devnet
+
+# Run random router loadgen from the host cargo binary
+router-loadgen-limit count='100' concurrency='8' rps='5' min_raw_amount='100000000' max_raw_amount='250000000' order_type='limit':
+    cargo run --release -p router-loadgen -- create-and-fund \
+      --gateway-url http://localhost:3001 \
+      --random \
+      --order-type {{order_type}} \
+      --random-min-raw-amount {{min_raw_amount}} \
+      --random-max-raw-amount {{max_raw_amount}} \
+      --amount-format raw \
+      --to-address 0x1111111111111111111111111111111111111111 \
+      --count {{count}} \
+      --concurrency {{concurrency}} \
+      --rps {{rps}} \
+      --evm-rpc evm:1=http://localhost:50101 \
+      --evm-rpc evm:8453=http://localhost:50102 \
+      --evm-rpc evm:42161=http://localhost:50103 \
+      --devnet-manifest-url http://localhost:50108/manifest.json \
+      --bitcoin-rpc-url http://localhost:50100/wallet/alice \
+      --bitcoin-rpc-auth devnet:devnet

@@ -155,8 +155,7 @@ code,
   gap: 8px;
 }
 
-.volume-controls select,
-.custom-volume-window input {
+.volume-controls select {
   min-height: 32px;
   border: 1px solid rgba(140, 153, 145, 0.18);
   border-radius: 8px;
@@ -165,24 +164,6 @@ code,
   font: inherit;
   font-size: 12px;
   font-weight: 800;
-}
-
-.custom-volume-window {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-}
-
-.custom-volume-window span {
-  color: #77817b;
-  font-size: 11px;
-  font-weight: 900;
-  text-transform: uppercase;
-}
-
-.custom-volume-window input {
-  width: 168px;
-  padding: 0 8px;
 }
 
 .segmented-control {
@@ -222,30 +203,75 @@ code,
 .volume-chart-wrap svg {
   display: block;
   width: 100%;
-  height: 190px;
+  height: 238px;
 }
 
 .volume-axis {
   stroke: rgba(140, 153, 145, 0.2);
 }
 
-.volume-axis-label {
+.volume-grid {
+  stroke: rgba(140, 153, 145, 0.08);
+}
+
+.volume-y-label,
+.volume-x-label {
   fill: #7f8b85;
-  font-size: 11px;
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.volume-bucket {
+  outline: none;
+}
+
+.volume-hit-area {
+  fill: transparent;
+  cursor: crosshair;
 }
 
 .volume-bar {
   fill: #80e7b9;
   opacity: 0.82;
+  pointer-events: none;
 }
 
-.volume-bar:hover {
+.volume-bucket:hover .volume-bar,
+.volume-bucket:focus .volume-bar {
   opacity: 1;
+}
+
+.volume-tooltip {
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 80ms ease-out;
+}
+
+.volume-bucket:hover .volume-tooltip,
+.volume-bucket:focus .volume-tooltip {
+  opacity: 1;
+}
+
+.volume-tooltip rect {
+  fill: #f2f4ef;
+  stroke: rgba(7, 10, 10, 0.2);
+}
+
+.volume-tooltip-value {
+  fill: #0d0f10;
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.volume-tooltip-meta {
+  fill: #57615b;
+  font-size: 10px;
+  font-weight: 800;
 }
 
 .volume-empty {
   display: grid;
-  min-height: 190px;
+  min-height: 238px;
   place-items: center;
   border: 1px dashed rgba(140, 153, 145, 0.16);
   border-radius: 8px;

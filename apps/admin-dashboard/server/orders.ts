@@ -245,8 +245,11 @@ const COMPLETED_ORDERS_FOR_ANALYTICS_SQL = `
     ro.id::text,
     ro.order_type,
     ro.status,
-    ro.created_at,
-    GREATEST(ro.updated_at, COALESCE(legs.updated_at, ro.updated_at)) AS updated_at,
+    to_char(ro.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at,
+    to_char(
+      GREATEST(ro.updated_at, COALESCE(legs.updated_at, ro.updated_at)) AT TIME ZONE 'UTC',
+      'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+    ) AS updated_at,
     COALESCE(legs.execution_legs, '[]'::jsonb) AS execution_legs
   FROM public.router_orders ro
   LEFT JOIN LATERAL (
@@ -294,7 +297,7 @@ const COMPLETED_ORDERS_FOR_ANALYTICS_SQL = `
 
 const COMPLETED_ORDER_ANALYTICS_UPPER_BOUND_SQL = `
   SELECT
-    ro.created_at,
+    to_char(ro.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at,
     ro.id::text
   FROM public.router_orders ro
   WHERE ro.status = 'completed'
@@ -306,8 +309,8 @@ const ORDER_STATUS_FOR_ANALYTICS_SQL = `
   SELECT
     ro.id::text,
     ro.status,
-    ro.created_at,
-    ro.updated_at
+    to_char(ro.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at,
+    to_char(ro.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at
   FROM public.router_orders ro
   WHERE (
       $2::timestamptz IS NULL
@@ -323,7 +326,7 @@ const ORDER_STATUS_FOR_ANALYTICS_SQL = `
 
 const ORDER_STATUS_ANALYTICS_UPPER_BOUND_SQL = `
   SELECT
-    ro.created_at,
+    to_char(ro.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at,
     ro.id::text
   FROM public.router_orders ro
   ORDER BY ro.created_at DESC, ro.id DESC
@@ -928,7 +931,6 @@ export async function fetchOrderMetrics(pool: Pool): Promise<OrderMetrics> {
       COUNT(*) FILTER (
         WHERE status IN (
           'failed',
-          'expired',
           'manual_intervention_required',
           'refund_manual_intervention_required'
         )
@@ -1015,7 +1017,7 @@ export async function fetchCompletedOrderAnalyticsUpperBound(
   const row = result.rows[0]
   if (!row) return undefined
   return {
-    createdAt: toIso(row.created_at),
+    createdAt: toAnalyticsCursorIso(row.created_at),
     id: row.id
   }
 }
@@ -1041,8 +1043,8 @@ export async function fetchOrderStatusesForAnalytics(
   return result.rows.map((row) => ({
     id: row.id,
     status: row.status,
-    createdAt: toIso(row.created_at),
-    updatedAt: toIso(row.updated_at)
+    createdAt: toAnalyticsCursorIso(row.created_at),
+    updatedAt: toAnalyticsCursorIso(row.updated_at)
   }))
 }
 
@@ -1055,7 +1057,7 @@ export async function fetchOrderStatusAnalyticsUpperBound(
   const row = result.rows[0]
   if (!row) return undefined
   return {
-    createdAt: toIso(row.created_at),
+    createdAt: toAnalyticsCursorIso(row.created_at),
     id: row.id
   }
 }
@@ -1134,8 +1136,8 @@ function mapOrderAnalyticsRow(row: OrderAnalyticsDbRow): OrderAnalyticsRow {
     id: row.id,
     orderType: row.order_type,
     status: row.status,
-    createdAt: toIso(row.created_at),
-    updatedAt: toIso(row.updated_at),
+    createdAt: toAnalyticsCursorIso(row.created_at),
+    updatedAt: toAnalyticsCursorIso(row.updated_at),
     executionLegs: normalizeJsonArray<OrderExecutionLeg>(
       row.execution_legs,
       'execution_legs'
@@ -1170,7 +1172,6 @@ export function orderMatchesLifecycleFilter(
   }
   return [
     'failed',
-    'expired',
     'refund_required',
     'refunding',
     'manual_intervention_required',
@@ -1310,6 +1311,11 @@ function normalizeJsonArray<T>(value: unknown, field: string): T[] {
 function toIso(value: Date | string): string {
   if (value instanceof Date) return value.toISOString()
   return new Date(value).toISOString()
+}
+
+function toAnalyticsCursorIso(value: Date | string): string {
+  if (value instanceof Date) return value.toISOString()
+  return value
 }
 
 function summarizeProgress(

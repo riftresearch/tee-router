@@ -3300,7 +3300,8 @@ impl OrderRepository {
             ),
             first_success_action AS (
                 SELECT
-                    response_json
+                    response_json,
+                    amount_in
                 FROM current_actions
                 WHERE status IN ('completed', 'skipped')
                 ORDER BY step_index ASC, updated_at ASC, id ASC
@@ -3308,7 +3309,8 @@ impl OrderRepository {
             ),
             last_success_action AS (
                 SELECT
-                    response_json
+                    response_json,
+                    min_amount_out
                 FROM current_actions
                 WHERE status IN ('completed', 'skipped')
                 ORDER BY step_index DESC, updated_at DESC, id DESC
@@ -3337,7 +3339,9 @@ impl OrderRepository {
                     action_summary.last_completed_at,
                     (SELECT execution_attempt_id FROM latest_attempt) AS latest_execution_attempt_id,
                     first_success_action.response_json AS first_response_json,
-                    last_success_action.response_json AS last_response_json
+                    first_success_action.amount_in AS first_amount_in,
+                    last_success_action.response_json AS last_response_json,
+                    last_success_action.min_amount_out AS last_min_amount_out
                 FROM action_summary
                 LEFT JOIN first_success_action ON true
                 LEFT JOIN last_success_action ON true
@@ -3357,6 +3361,17 @@ impl OrderRepository {
                 END,
                 actual_amount_in = CASE
                     WHEN rolled_up.completed THEN COALESCE(
+                        CASE
+                            WHEN leg.leg_type = 'unit_deposit'
+                             AND (rolled_up.first_response_json #>> '{{observed_state,provider_observed_state,source_amount}}') ~ '^[0-9]+$'
+                                THEN rolled_up.first_response_json #>> '{{observed_state,provider_observed_state,source_amount}}'
+                            WHEN leg.leg_type = 'unit_deposit'
+                             AND (rolled_up.first_response_json #>> '{{observed_state,provider_observed_state,sourceAmount}}') ~ '^[0-9]+$'
+                                THEN rolled_up.first_response_json #>> '{{observed_state,provider_observed_state,sourceAmount}}'
+                            WHEN leg.leg_type = 'unit_deposit'
+                             AND (rolled_up.first_response_json->>'amount') ~ '^[0-9]+$'
+                                THEN rolled_up.first_response_json->>'amount'
+                        END,
                         (
                             SELECT probe.value->>'debit_delta'
                             FROM jsonb_array_elements(
@@ -3379,6 +3394,7 @@ impl OrderRepository {
                         rolled_up.first_response_json #>> '{{response,amountIn}}',
                         rolled_up.first_response_json #>> '{{response,input_amount}}',
                         rolled_up.first_response_json #>> '{{response,inputAmount}}',
+                        rolled_up.first_amount_in,
                         rolled_up.first_response_json #>> '{{observed_state,amount_in}}',
                         rolled_up.first_response_json #>> '{{observed_state,amountIn}}',
                         rolled_up.first_response_json #>> '{{observed_state,input_amount}}',
@@ -3422,6 +3438,24 @@ impl OrderRepository {
                         rolled_up.last_response_json #>> '{{response,amountOut}}',
                         rolled_up.last_response_json #>> '{{response,output_amount}}',
                         rolled_up.last_response_json #>> '{{response,outputAmount}}',
+                        rolled_up.last_min_amount_out,
+                        CASE
+                            WHEN leg.leg_type = 'unit_deposit'
+                             AND (rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,destination_amount}}') ~ '^[0-9]+$'
+                                THEN rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,destination_amount}}'
+                            WHEN leg.leg_type = 'unit_deposit'
+                             AND (rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,destinationAmount}}') ~ '^[0-9]+$'
+                                THEN rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,destinationAmount}}'
+                            WHEN leg.leg_type = 'unit_deposit'
+                             AND (rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,source_amount}}') ~ '^[0-9]+$'
+                                THEN rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,source_amount}}'
+                            WHEN leg.leg_type = 'unit_deposit'
+                             AND (rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,sourceAmount}}') ~ '^[0-9]+$'
+                                THEN rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,sourceAmount}}'
+                            WHEN leg.leg_type = 'unit_deposit'
+                             AND (rolled_up.last_response_json->>'amount') ~ '^[0-9]+$'
+                                THEN rolled_up.last_response_json->>'amount'
+                        END,
                         rolled_up.last_response_json #>> '{{observed_state,amount_out}}',
                         rolled_up.last_response_json #>> '{{observed_state,amountOut}}',
                         rolled_up.last_response_json #>> '{{observed_state,output_amount}}',

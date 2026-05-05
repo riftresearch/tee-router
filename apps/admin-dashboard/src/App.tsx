@@ -54,6 +54,7 @@ const MAX_VOLUME_CHART_BUCKETS = 1500
 const WAIT_FOR_DEPOSIT_STEP_TYPE = 'wait_for_deposit'
 const ACTIVE_STEP_STATUSES = new Set(['ready', 'running', 'waiting', 'submitted'])
 const FAILED_STEP_STATUSES = new Set(['failed', 'cancelled'])
+const TERMINAL_STEP_STATUSES = new Set(['completed', 'failed', 'skipped', 'cancelled'])
 const ORDER_TABS: Array<{ type: OrderTypeFilter; label: string }> = [
   { type: 'market_order', label: 'Market Orders' },
   { type: 'limit_order', label: 'Limit Orders' }
@@ -66,11 +67,11 @@ const ORDER_FILTERS: Array<{ value: OrderLifecycleFilter; label: string }> = [
   { value: 'manual_refund', label: 'Manual Refund' }
 ]
 const VOLUME_WINDOWS = [
+  { value: '6h', label: '6H' },
   { value: '24h', label: '24H' },
   { value: '7d', label: '7D' },
   { value: '30d', label: '30D' },
-  { value: '90d', label: '90D' },
-  { value: 'custom', label: 'Custom' }
+  { value: '90d', label: '90D' }
 ] as const
 type VolumeWindow = (typeof VOLUME_WINDOWS)[number]['value']
 const CHAIN_DISPLAY_NAMES: Record<string, string> = {
@@ -158,12 +159,6 @@ export function App() {
   const [volumeAnalytics, setVolumeAnalytics] =
     useState<VolumeAnalyticsResponse | null>(null)
   const [volumeWindow, setVolumeWindow] = useState<VolumeWindow>('24h')
-  const [customVolumeFrom, setCustomVolumeFrom] = useState(() =>
-    datetimeLocalValue(hoursAgo(24))
-  )
-  const [customVolumeTo, setCustomVolumeTo] = useState(() =>
-    datetimeLocalValue(new Date())
-  )
   const [volumeBucketSize, setVolumeBucketSize] =
     useState<VolumeBucketSize>('hour')
   const [volumeOrderType, setVolumeOrderType] =
@@ -196,7 +191,7 @@ export function App() {
   }, [])
 
   const loadVolumeAnalytics = useCallback(async () => {
-    const range = volumeDateRange(volumeWindow, customVolumeFrom, customVolumeTo)
+    const range = volumeDateRange(volumeWindow)
     const response = await fetchVolumeAnalytics({
       bucketSize: volumeBucketSize,
       orderType: volumeOrderType,
@@ -204,7 +199,7 @@ export function App() {
       to: range.to.toISOString()
     })
     setVolumeAnalytics(response)
-  }, [customVolumeFrom, customVolumeTo, volumeBucketSize, volumeOrderType, volumeWindow])
+  }, [volumeBucketSize, volumeOrderType, volumeWindow])
 
   const loadMoreOrders = useCallback(async () => {
     if (!nextCursor || loadingMore || searchedOrder) return
@@ -389,7 +384,7 @@ export function App() {
 
     const load = async () => {
       try {
-        const range = volumeDateRange(volumeWindow, customVolumeFrom, customVolumeTo)
+        const range = volumeDateRange(volumeWindow)
         const response = await fetchVolumeAnalytics({
           bucketSize: volumeBucketSize,
           orderType: volumeOrderType,
@@ -407,8 +402,6 @@ export function App() {
      cancelled = true
    }
  }, [
-    customVolumeFrom,
-    customVolumeTo,
     me?.analyticsConfigured,
     me?.authorized,
     volumeBucketSize,
@@ -444,10 +437,18 @@ export function App() {
     source.addEventListener('snapshot', (event) => {
       try {
         const snapshot = parseSnapshotEvent(event as MessageEvent<string>)
-        setOrders(sortOrders(snapshot.orders))
+        setOrders((current) => mergeSnapshotOrders(current, snapshot.orders))
         setNextCursor(snapshot.nextCursor)
         if (snapshot.metrics) setMetrics(snapshot.metrics)
         setStreamState('live')
+        if (expandedOrderIdRef.current) {
+          const expandedSummary = snapshot.orders.find(
+            (order) => order.id === expandedOrderIdRef.current
+          )
+          if (expandedSummary && expandedSummary.detailLevel !== 'full') {
+            loadOrderDetailsRef.current(expandedSummary.id)
+          }
+        }
       } catch (streamError) {
         rejectStreamEvent(streamError)
       }
@@ -606,11 +607,7 @@ export function App() {
             window={volumeWindow}
             bucketSize={volumeBucketSize}
             orderType={volumeOrderType}
-            customFrom={customVolumeFrom}
-            customTo={customVolumeTo}
             onWindowChange={setVolumeWindow}
-            onCustomFromChange={setCustomVolumeFrom}
-            onCustomToChange={setCustomVolumeTo}
             onBucketSizeChange={setVolumeBucketSize}
             onOrderTypeChange={setVolumeOrderType}
           />
@@ -769,7 +766,6 @@ function LoginPanel() {
           <ShieldCheck size={30} />
         </div>
         <h2>Rift Admin</h2>
-        <p>cliff@rift.trade, samee@rift.trade, tristan@rift.trade</p>
         <button className="primary-button" onClick={() => void signIn()}>
           {signingIn ? <RefreshCw size={18} className="spin" /> : <LogIn size={18} />}
           Google Sign-In
@@ -958,11 +954,7 @@ function VolumePanel({
   window,
   bucketSize,
   orderType,
-  customFrom,
-  customTo,
   onWindowChange,
-  onCustomFromChange,
-  onCustomToChange,
   onBucketSizeChange,
   onOrderTypeChange
 }: {
@@ -970,11 +962,7 @@ function VolumePanel({
   window: VolumeWindow
   bucketSize: VolumeBucketSize
   orderType: VolumeOrderTypeFilter
-  customFrom: string
-  customTo: string
   onWindowChange: (value: VolumeWindow) => void
-  onCustomFromChange: (value: string) => void
-  onCustomToChange: (value: string) => void
   onBucketSizeChange: (value: VolumeBucketSize) => void
   onOrderTypeChange: (value: VolumeOrderTypeFilter) => void
 }) {
@@ -1001,23 +989,6 @@ function VolumePanel({
             options={VOLUME_WINDOWS}
             onChange={onWindowChange}
           />
-          {window === 'custom' ? (
-            <div className="custom-volume-window">
-              <input
-                type="datetime-local"
-                value={customFrom}
-                onChange={(event) => onCustomFromChange(event.target.value)}
-                aria-label="Volume from"
-              />
-              <span>to</span>
-              <input
-                type="datetime-local"
-                value={customTo}
-                onChange={(event) => onCustomToChange(event.target.value)}
-                aria-label="Volume to"
-              />
-            </div>
-          ) : null}
           <select
             value={bucketSize}
             onChange={(event) =>
@@ -1025,7 +996,7 @@ function VolumePanel({
             }
             aria-label="Volume bucket size"
           >
-            <option value="minute">Minute</option>
+            <option value="five_minute">5 Minute</option>
             <option value="hour">Hour</option>
             <option value="day">Day</option>
           </select>
@@ -1089,8 +1060,8 @@ function VolumeChart({
   }
 
   const width = 720
-  const height = 176
-  const padding = { top: 18, right: 18, bottom: 24, left: 48 }
+  const height = 220
+  const padding = { top: 22, right: 20, bottom: 46, left: 74 }
   const chartWidth = width - padding.left - padding.right
   const chartHeight = height - padding.top - padding.bottom
   const maxVolumeUsdMicro = buckets.reduce(
@@ -1099,12 +1070,41 @@ function VolumeChart({
     0n
   )
   const maxVolume = maxVolumeUsdMicro > 0n ? maxVolumeUsdMicro : 1n
-  const barGap = 3
-  const barWidth = Math.max(chartWidth / buckets.length - barGap, 1)
+  const slotWidth = chartWidth / buckets.length
+  const barGap = buckets.length > 180 ? 1 : 3
+  const barWidth = Math.max(slotWidth - barGap, 1)
+  const yTicks = volumeYAxisTicks(maxVolume, 4)
+  const xTicks = volumeXAxisTicks(buckets, 6)
 
   return (
     <div className="volume-chart-wrap">
       <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Volume chart">
+        {yTicks.map((tick) => {
+          const y =
+            height -
+            padding.bottom -
+            volumeBarHeight(tick.value, maxVolume, chartHeight)
+          return (
+            <g key={tick.key}>
+              <line
+                x1={padding.left}
+                y1={y}
+                x2={width - padding.right}
+                y2={y}
+                className="volume-grid"
+              />
+              <text
+                x={padding.left - 10}
+                y={y}
+                className="volume-y-label"
+                textAnchor="end"
+                dominantBaseline="middle"
+              >
+                {formatUsdMicro(tick.value.toString())}
+              </text>
+            </g>
+          )
+        })}
         <line
           x1={padding.left}
           y1={height - padding.bottom}
@@ -1112,32 +1112,102 @@ function VolumeChart({
           y2={height - padding.bottom}
           className="volume-axis"
         />
-        <text x={padding.left} y={14} className="volume-axis-label">
-          {formatUsdMicro(maxVolume.toString())}
-        </text>
+        <line
+          x1={padding.left}
+          y1={padding.top}
+          x2={padding.left}
+          y2={height - padding.bottom}
+          className="volume-axis"
+        />
+        {xTicks.map((tick) => {
+          const x = padding.left + tick.index * slotWidth + slotWidth / 2
+          const textAnchor =
+            tick.index === 0
+              ? 'start'
+              : tick.index === buckets.length - 1
+                ? 'end'
+                : 'middle'
+          return (
+            <g key={tick.bucket.bucketStart}>
+              <line
+                x1={x}
+                y1={height - padding.bottom}
+                x2={x}
+                y2={height - padding.bottom + 5}
+                className="volume-axis"
+              />
+              <text
+                x={x}
+                y={height - 22}
+                className="volume-x-label"
+                textAnchor={textAnchor}
+              >
+                {formatVolumeAxisDate(tick.bucket.bucketStart, analytics.bucketSize)}
+              </text>
+            </g>
+          )
+        })}
         {buckets.map((bucket, index) => {
           const barHeight = volumeBarHeight(
             bucket.volumeUsdMicro,
             maxVolume,
             chartHeight
           )
-          const x = padding.left + index * (barWidth + barGap)
+          const slotX = padding.left + index * slotWidth
+          const x = slotX + Math.max((slotWidth - barWidth) / 2, 0)
           const y = height - padding.bottom - barHeight
+          const tooltip = volumeTooltipLayout(
+            x + barWidth / 2,
+            y,
+            padding,
+            width
+          )
+          const label = `${formatDate(bucket.bucketStart)}, ${formatUsdMicro(
+            bucket.volumeUsdMicro.toString()
+          )}, ${formatCount(bucket.orderCount)} orders`
           return (
-            <rect
+            <g
               key={bucket.bucketStart}
-              className="volume-bar"
-              x={x}
-              y={y}
-              width={barWidth}
-              height={barHeight}
-              rx={3}
+              className="volume-bucket"
+              tabIndex={0}
+              aria-label={label}
             >
-              <title>
-                {formatDate(bucket.bucketStart)} ·{' '}
-                {formatUsdMicro(bucket.volumeUsdMicro.toString())}
-              </title>
-            </rect>
+              <rect
+                className="volume-hit-area"
+                x={slotX}
+                y={padding.top}
+                width={slotWidth}
+                height={chartHeight}
+              />
+              <rect
+                className="volume-bar"
+                x={x}
+                y={y}
+                width={barWidth}
+                height={barHeight}
+                rx={3}
+              />
+              <g
+                className="volume-tooltip"
+                transform={`translate(${tooltip.x} ${tooltip.y})`}
+              >
+                <rect width={tooltip.width} height={tooltip.height} rx={6} />
+                <text x={10} y={17} className="volume-tooltip-value">
+                  {formatUsdMicro(bucket.volumeUsdMicro.toString())}
+                </text>
+                <text x={10} y={33} className="volume-tooltip-meta">
+                  {formatDate(bucket.bucketStart)}
+                </text>
+                <text
+                  x={tooltip.width - 10}
+                  y={33}
+                  className="volume-tooltip-meta"
+                  textAnchor="end"
+                >
+                  {formatCount(bucket.orderCount)}
+                </text>
+              </g>
+            </g>
           )
         })}
       </svg>
@@ -1662,7 +1732,11 @@ function TimelineLegItem({ leg }: { leg: TimelineLeg }) {
                   }
                 : undefined
             }
-            placeholder={leg.executedInput || leg.executedOutput ? undefined : 'Not executed yet'}
+            placeholder={
+              leg.executedInput || leg.executedOutput
+                ? undefined
+                : timelineExecutionPlaceholder(leg)
+            }
           />
         </div>
         <div className="timeline-card-footer">
@@ -1711,6 +1785,14 @@ function TimelineAmountRow({ side }: { side: AmountPairSide }) {
       <UsdValue valuation={side.usdValuation} />
     </div>
   )
+}
+
+export function timelineExecutionPlaceholder(leg: TimelineLeg) {
+  const hasSubmittedTx = leg.steps.some(
+    (step) => Boolean(step.txHash) && !TERMINAL_STEP_STATUSES.has(step.status)
+  )
+  if (hasSubmittedTx) return 'Transaction submitted, awaiting settlement'
+  return 'Not executed yet'
 }
 
 function TimelineGuardrails({ leg }: { leg: TimelineLeg }) {
@@ -2820,6 +2902,16 @@ function mergeOrders(current: OrderFirehoseRow[], incoming: OrderFirehoseRow[]) 
   return sortOrders([...byId.values()])
 }
 
+export function mergeSnapshotOrders(
+  current: OrderFirehoseRow[],
+  snapshot: OrderFirehoseRow[]
+) {
+  const currentById = new Map(current.map((order) => [order.id, order]))
+  return sortOrders(
+    snapshot.map((order) => preferredOrder(currentById.get(order.id), order))
+  )
+}
+
 function preferredOrder(
   existing: OrderFirehoseRow | undefined,
   incoming: OrderFirehoseRow
@@ -2832,14 +2924,12 @@ function preferredOrder(
   }
   if (
     existing.detailLevel === 'full' &&
-    incoming.detailLevel !== 'full' &&
-    incomingUpdatedAt === existingUpdatedAt
+    incoming.detailLevel !== 'full'
   ) {
     return {
       ...incoming,
       detailLevel: 'full' as const,
       providerQuote: existing.providerQuote,
-      executionLegs: existing.executionLegs,
       executionSteps: existing.executionSteps,
       providerOperations: existing.providerOperations
     }
@@ -2929,12 +3019,10 @@ export function normalizedVolumeBuckets(analytics: VolumeAnalyticsResponse) {
   const starts = bucketStarts(
     new Date(analytics.from),
     new Date(analytics.to),
-    analytics.bucketSize,
-    MAX_VOLUME_CHART_BUCKETS
+    analytics.bucketSize
   )
 
-  const buckets = starts
-    ? starts.map((bucketStart) => {
+  const buckets = starts.map((bucketStart) => {
         const key = bucketStart.toISOString()
         const bucket = bucketsByStart.get(key)
         return {
@@ -2943,13 +3031,6 @@ export function normalizedVolumeBuckets(analytics: VolumeAnalyticsResponse) {
           orderCount: bucket?.orderCount ?? 0
         }
       })
-    : analytics.buckets
-        .map((bucket) => ({
-          bucketStart: bucket.bucketStart,
-          volumeUsdMicro: BigInt(bucket.volumeUsdMicro),
-          orderCount: bucket.orderCount
-        }))
-        .sort((left, right) => left.bucketStart.localeCompare(right.bucketStart))
 
   return downsampleVolumeBuckets(buckets, MAX_VOLUME_CHART_BUCKETS)
 }
@@ -2957,15 +3038,13 @@ export function normalizedVolumeBuckets(analytics: VolumeAnalyticsResponse) {
 function bucketStarts(
   from: Date,
   to: Date,
-  bucketSize: VolumeBucketSize,
-  maxBuckets: number
+  bucketSize: VolumeBucketSize
 ) {
   const starts: Date[] = []
-  const cursor = alignDateToBucket(from, bucketSize)
+    const cursor = alignDateToBucket(from, bucketSize)
   while (cursor < to) {
-    if (starts.length >= maxBuckets) return undefined
     starts.push(new Date(cursor))
-    if (bucketSize === 'minute') cursor.setUTCMinutes(cursor.getUTCMinutes() + 1)
+    if (bucketSize === 'five_minute') cursor.setUTCMinutes(cursor.getUTCMinutes() + 5)
     if (bucketSize === 'hour') cursor.setUTCHours(cursor.getUTCHours() + 1)
     if (bucketSize === 'day') cursor.setUTCDate(cursor.getUTCDate() + 1)
   }
@@ -3013,45 +3092,88 @@ export function volumeBarHeight(
   return (Number(scaledRatio) / Number(scale)) * chartHeight
 }
 
+export function volumeYAxisTicks(maxVolumeUsdMicro: bigint, segments: number) {
+  const safeSegments = Math.max(1, Math.floor(segments))
+  const ticks: Array<{ key: string; value: bigint }> = []
+  for (let index = 0; index <= safeSegments; index += 1) {
+    const value = (maxVolumeUsdMicro * BigInt(index)) / BigInt(safeSegments)
+    ticks.push({ key: `${index}-${value.toString()}`, value })
+  }
+  return ticks
+}
+
+export function volumeXAxisTicks<T extends { bucketStart: string }>(
+  buckets: T[],
+  maxTicks: number
+) {
+  if (buckets.length === 0) return []
+  const tickCount = Math.min(Math.max(2, Math.floor(maxTicks)), buckets.length)
+  if (tickCount === 1) return [{ index: 0, bucket: buckets[0] }]
+
+  const indexes = new Set<number>()
+  for (let tick = 0; tick < tickCount; tick += 1) {
+    indexes.add(Math.round((tick * (buckets.length - 1)) / (tickCount - 1)))
+  }
+  return [...indexes]
+    .sort((left, right) => left - right)
+    .map((index) => ({ index, bucket: buckets[index] }))
+}
+
+function volumeTooltipLayout(
+  anchorX: number,
+  anchorY: number,
+  padding: { top: number; right: number; bottom: number; left: number },
+  chartWidth: number
+) {
+  const width = 156
+  const height = 44
+  return {
+    width,
+    height,
+    x: clampNumber(anchorX - width / 2, padding.left, chartWidth - padding.right - width),
+    y: Math.max(padding.top, anchorY - height - 8)
+  }
+}
+
+function formatVolumeAxisDate(value: string, bucketSize: VolumeBucketSize) {
+  const date = new Date(value)
+  if (bucketSize === 'day') {
+    return new Intl.DateTimeFormat(undefined, {
+      month: 'short',
+      day: '2-digit'
+    }).format(date)
+  }
+  return new Intl.DateTimeFormat(undefined, {
+    month: 'short',
+    day: '2-digit',
+    hour: '2-digit'
+  }).format(date)
+}
+
+function clampNumber(value: number, min: number, max: number) {
+  return Math.min(Math.max(value, min), max)
+}
+
 function alignDateToBucket(value: Date, bucketSize: VolumeBucketSize) {
   const aligned = new Date(value)
   aligned.setUTCSeconds(0, 0)
+  if (bucketSize === 'five_minute') {
+    aligned.setUTCMinutes(Math.floor(aligned.getUTCMinutes() / 5) * 5)
+  }
   if (bucketSize === 'hour' || bucketSize === 'day') aligned.setUTCMinutes(0)
   if (bucketSize === 'day') aligned.setUTCHours(0)
   return aligned
 }
 
-function volumeDateRange(
-  window: VolumeWindow,
-  customFrom?: string,
-  customTo?: string
-) {
-  if (window === 'custom') {
-    const from = customFrom ? new Date(customFrom) : hoursAgo(24)
-    const to = customTo ? new Date(customTo) : new Date()
-    if (Number.isFinite(from.getTime()) && Number.isFinite(to.getTime()) && from < to) {
-      return { from, to }
-    }
-  }
-
-  const to = new Date()
+export function volumeDateRange(window: VolumeWindow, now = new Date()) {
+  const to = new Date(now)
   const from = new Date(to)
+  if (window === '6h') from.setUTCHours(from.getUTCHours() - 6)
   if (window === '24h') from.setUTCHours(from.getUTCHours() - 24)
   if (window === '7d') from.setUTCDate(from.getUTCDate() - 7)
   if (window === '30d') from.setUTCDate(from.getUTCDate() - 30)
   if (window === '90d') from.setUTCDate(from.getUTCDate() - 90)
   return { from, to }
-}
-
-function hoursAgo(hours: number) {
-  const date = new Date()
-  date.setHours(date.getHours() - hours)
-  return date
-}
-
-function datetimeLocalValue(value: Date) {
-  const offsetMs = value.getTimezoneOffset() * 60_000
-  return new Date(value.getTime() - offsetMs).toISOString().slice(0, 16)
 }
 
 function shortId(value: string) {
@@ -3084,7 +3206,7 @@ function statusTone(status: string) {
   return 'waiting'
 }
 
-function progressVenueLabel(order: OrderFirehoseRow) {
+export function progressVenueLabel(order: OrderFirehoseRow) {
   const progress = order.progress
   if (progress.totalStages === 0) return undefined
   if (progress.completedStages === progress.totalStages && progress.failedStages === 0) {
@@ -3110,9 +3232,6 @@ function progressVenueLabel(order: OrderFirehoseRow) {
     ) ??
     order.executionSteps.find((step) => !isWaitForDepositStep(step) && step.status === 'planned')
   if (activeStep) return providerDisplayName(activeStep.provider)
-
-  const waitStep = order.executionSteps.find(isWaitForDepositStep)
-  if (waitStep && ACTIVE_STEP_STATUSES.has(waitStep.status)) return 'Funding deposit'
 
   return progress.activeStage ? cleanProgressStage(progress.activeStage) : undefined
 }

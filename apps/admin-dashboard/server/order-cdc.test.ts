@@ -696,6 +696,59 @@ test('OrderCdcBroker requests snapshot backfill for CDC payloads with invalid id
   }
 })
 
+test('OrderCdcBroker accepts legacy CDC payloads without updated timestamps', async () => {
+  const orderId = '019df1c4-8d87-7c20-89a4-e76883e94a0f'
+  const broker = new OrderCdcBroker({} as Pool, testConfig)
+  let backfillRequests = 0
+  broker.subscribeSnapshotBackfillRequired(() => {
+    backfillRequests += 1
+  })
+  const brokerInternals = broker as unknown as {
+    pendingOrderIds: Set<string>
+    pendingAckLsn: string | undefined
+    pendingSnapshotBackfillRequired: boolean
+    flushTimer: ReturnType<typeof setTimeout> | undefined
+    service: FakeReplicationService
+    handleReplicationMessage: (lsn: string, message: unknown) => Promise<void>
+    flushPendingOrders: () => Promise<void>
+  }
+  let acknowledgedLsn: string | undefined
+  brokerInternals.service = {
+    acknowledge: async (lsn: string) => {
+      acknowledgedLsn = lsn
+      return true
+    },
+    destroy: async () => undefined
+  }
+
+  try {
+    await brokerInternals.handleReplicationMessage(
+      '0/42',
+      routerCdcMessage({
+        table: 'order_execution_legs',
+        op: 'UPDATE',
+        id: '019df1c4-a8ac-7731-b596-a24603580d4f',
+        orderId,
+        watchId: null,
+        providerOperationId: null
+      })
+    )
+    if (brokerInternals.flushTimer) clearTimeout(brokerInternals.flushTimer)
+
+    expect(brokerInternals.pendingOrderIds.has(orderId)).toBe(true)
+    expect(brokerInternals.pendingSnapshotBackfillRequired).toBe(false)
+
+    await brokerInternals.flushPendingOrders()
+
+    expect(brokerInternals.pendingOrderIds.size).toBe(0)
+    expect(brokerInternals.pendingAckLsn).toBeUndefined()
+    expect(backfillRequests).toBe(0)
+    expect(acknowledgedLsn).toBe('0/42')
+  } finally {
+    await broker.close()
+  }
+})
+
 test('OrderCdcBroker requests snapshot backfill for CDC payloads with null required identity fields', async () => {
   const orderId = '019df1c4-8d87-7c20-89a4-e76883e94a0f'
   const stepId = '019df1c4-a8ac-7731-b596-a24603580d4f'

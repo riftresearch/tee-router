@@ -293,7 +293,7 @@ function isVolumeBucket(value: unknown): boolean {
 }
 
 function isVolumeBucketSize(value: unknown): value is VolumeBucketSize {
-  return value === 'minute' || value === 'hour' || value === 'day'
+  return value === 'five_minute' || value === 'hour' || value === 'day'
 }
 
 function isVolumeOrderType(value: unknown): value is VolumeOrderTypeFilter {

@@ -4,6 +4,7 @@ import { readLimitedResponseText } from './http-body'
 const MAX_UPSTREAM_SUCCESS_BODY_BYTES = 1024 * 1024
 const MAX_UPSTREAM_ERROR_BODY_BYTES = 64 * 1024
 const MAX_INTERNAL_ID_LENGTH = 128
+const MAX_INTERNAL_PROVIDER_ID_LENGTH = 2048
 const MAX_INTERNAL_STATUS_LENGTH = 64
 const MAX_INTERNAL_ASSET_FIELD_LENGTH = 128
 const MAX_INTERNAL_ADDRESS_LENGTH = 128
@@ -315,7 +316,7 @@ function isMarketQuote(
     isDepositAsset(value.source_asset) &&
     isDepositAsset(value.destination_asset) &&
     isBoundedString(value.recipient_address, MAX_INTERNAL_ADDRESS_LENGTH) &&
-    isBoundedString(value.provider_id, MAX_INTERNAL_ID_LENGTH) &&
+    isBoundedString(value.provider_id, MAX_INTERNAL_PROVIDER_ID_LENGTH) &&
     (value.order_kind === 'exact_in' || value.order_kind === 'exact_out') &&
     amount(value.amount_in) &&
     amount(value.amount_out) &&
@@ -339,7 +340,7 @@ function isLimitQuote(
     isDepositAsset(value.source_asset) &&
     isDepositAsset(value.destination_asset) &&
     isBoundedString(value.recipient_address, MAX_INTERNAL_ADDRESS_LENGTH) &&
-    isBoundedString(value.provider_id, MAX_INTERNAL_ID_LENGTH) &&
+    isBoundedString(value.provider_id, MAX_INTERNAL_PROVIDER_ID_LENGTH) &&
     amount(value.input_amount) &&
     amount(value.output_amount) &&
     value.residual_policy === 'refund' &&

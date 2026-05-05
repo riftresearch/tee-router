@@ -169,7 +169,7 @@ export type OrderLifecycleFilter =
   | 'failed'
   | 'refunded'
   | 'manual_refund'
-export type VolumeBucketSize = 'minute' | 'hour' | 'day'
+export type VolumeBucketSize = 'five_minute' | 'hour' | 'day'
 export type VolumeOrderTypeFilter = 'all' | OrderTypeFilter
 
 export type VolumeBucket = {

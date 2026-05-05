@@ -4320,12 +4320,19 @@ async fn handle_spot_send(
             .get_mut(&payload.destination)
             .and_then(|entries| latest_active_unit_operation_mut(entries))
         {
+            let source_amount = match parse_unit_decimal_amount_to_raw(
+                &payload.amount,
+                unit_asset_decimals(entry.asset),
+            ) {
+                Ok(amount) => amount.to_string(),
+                Err(err) => return error_response(StatusCode::BAD_REQUEST, err),
+            };
             entry.visible = true;
             entry.operation.state = Some("waitForSrcTxFinalization".to_string());
             entry.operation.state_started_at = Some(Utc::now().to_rfc3339());
             entry.operation.state_updated_at = Some(Utc::now().to_rfc3339());
             entry.operation.source_address = Some(format!("{signer:#x}"));
-            entry.operation.source_amount = Some(payload.amount.clone());
+            entry.operation.source_amount = Some(source_amount.clone());
             if entry.operation.source_tx_hash.is_none() {
                 entry.operation.source_tx_hash = Some(source_tx_hash.clone());
             }
@@ -4333,11 +4340,11 @@ async fn handle_spot_send(
                 entry.operation.operation_id = entry.operation.source_tx_hash.clone();
             }
             if matches!(entry.kind, MockUnitOperationKind::Withdrawal) {
-                unit_withdrawal_to_complete = Some(payload.destination.clone());
+                unit_withdrawal_to_complete = Some((payload.destination.clone(), source_amount));
             }
         }
     }
-    if let Some(protocol_address) = unit_withdrawal_to_complete {
+    if let Some((protocol_address, source_amount)) = unit_withdrawal_to_complete {
         let completion_result = if let Some(error) = state
             .next_unit_withdrawal_completion_error
             .lock()
@@ -4350,7 +4357,7 @@ async fn handle_spot_send(
                 state,
                 &protocol_address,
                 Some(UnitOperationObservation {
-                    source_amount: payload.amount.clone(),
+                    source_amount,
                     source_tx_hash: Some(source_tx_hash),
                 }),
             )
@@ -5977,7 +5984,7 @@ async fn send_mock_unit_evm_withdrawal_release(
             release.dst_addr
         )
     })?;
-    let amount = parse_unit_decimal_amount_to_raw(&release.amount, 18)?;
+    let amount = parse_unit_raw_amount(&release.amount)?;
     if amount == U256::ZERO {
         return Err(format!(
             "mock Unit withdrawal release amount {:?} is zero",
@@ -6046,6 +6053,18 @@ fn parse_unit_decimal_amount_to_raw(value: &str, decimals: u8) -> Result<U256, S
     digits.extend(std::iter::repeat_n('0', decimals - fractional.len()));
     U256::from_str_radix(&digits, 10)
         .map_err(|err| format!("mock Unit amount {value:?} does not fit U256: {err}"))
+}
+
+fn parse_unit_raw_amount(value: &str) -> Result<U256, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("mock Unit raw amount is empty".to_string());
+    }
+    if !value.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err(format!("mock Unit raw amount {value:?} is not digits"));
+    }
+    U256::from_str_radix(value, 10)
+        .map_err(|err| format!("mock Unit raw amount {value:?} does not fit U256: {err}"))
 }
 
 fn default_mock_unit_source_tx_hash(entry: &MockUnitOperationEntry) -> String {
@@ -6118,6 +6137,14 @@ fn net_hyperunit_credit_amount(
     let sweep_fee_amount =
         parse_optional_scaled_decimal(sweep_fee_amount, decimals, "sweep_fee_amount")?;
     Ok((source_amount - destination_fee_amount - sweep_fee_amount).max(0.0))
+}
+
+fn unit_asset_decimals(asset: UnitAsset) -> u8 {
+    match asset {
+        UnitAsset::Btc => 8,
+        UnitAsset::Eth => 18,
+        _ => 18,
+    }
 }
 
 fn parse_optional_scaled_decimal(
@@ -7718,7 +7745,7 @@ mod tests {
             &server.state,
             &generated.address,
             Some(UnitOperationObservation {
-                source_amount: "1.25".to_string(),
+                source_amount: "1250000000000000000".to_string(),
                 source_tx_hash: Some("hl:oid:1".to_string()),
             }),
         )
@@ -7773,7 +7800,7 @@ mod tests {
             &server.state,
             &generated.address,
             Some(UnitOperationObservation {
-                source_amount: "1.25".to_string(),
+                source_amount: "1250000000000000000".to_string(),
                 source_tx_hash: Some("hl:oid:1".to_string()),
             }),
         )

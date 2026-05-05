@@ -8454,7 +8454,7 @@ async fn execution_leg_rollup_ignores_superseded_failed_retry_actions() {
 }
 
 #[tokio::test]
-async fn execution_leg_rollup_ignores_zero_balance_deltas_when_provider_amounts_exist() {
+async fn execution_leg_rollup_uses_step_amount_when_provider_source_amount_is_decimal() {
     let h = harness().await;
     let db = test_db().await;
     let (order_manager, _mocks) = mock_order_manager(db.clone(), h.chain_registry.clone()).await;
@@ -8565,7 +8565,7 @@ async fn execution_leg_rollup_ignores_zero_balance_deltas_when_provider_amounts_
             "amount_out": "990",
             "observed_state": {
                 "provider_observed_state": {
-                    "sourceAmount": "1000"
+                    "sourceAmount": "0.00001000"
                 }
             },
             "balance_observation": {
@@ -8600,6 +8600,142 @@ async fn execution_leg_rollup_ignores_zero_balance_deltas_when_provider_amounts_
     assert_eq!(refreshed.status, OrderExecutionStepStatus::Completed);
     assert_eq!(refreshed.actual_amount_in.as_deref(), Some("1000"));
     assert_eq!(refreshed.actual_amount_out.as_deref(), Some("990"));
+}
+
+#[tokio::test]
+async fn execution_leg_rollup_uses_unit_deposit_source_amount_as_output_evidence() {
+    let h = harness().await;
+    let db = test_db().await;
+    let (order_manager, _mocks) = mock_order_manager(db.clone(), h.chain_registry.clone()).await;
+
+    let quote = order_manager
+        .quote_market_order(MarketOrderQuoteRequest {
+            from_asset: DepositAsset {
+                chain: ChainId::parse("evm:1").unwrap(),
+                asset: AssetId::Native,
+            },
+            to_asset: DepositAsset {
+                chain: ChainId::parse("evm:8453").unwrap(),
+                asset: AssetId::Native,
+            },
+            recipient_address: valid_evm_address(),
+            order_kind: MarketOrderQuoteKind::ExactIn {
+                amount_in: "1000".to_string(),
+                slippage_bps: 100,
+            },
+        })
+        .await
+        .unwrap();
+    let order = create_test_order_from_quote(
+        &order_manager,
+        quote
+            .quote
+            .as_market_order()
+            .expect("market order quote")
+            .id,
+    )
+    .await;
+    let now = Utc::now();
+    let attempt = OrderExecutionAttempt {
+        id: Uuid::now_v7(),
+        order_id: order.id,
+        attempt_index: 1,
+        attempt_kind: OrderExecutionAttemptKind::PrimaryExecution,
+        status: OrderExecutionAttemptStatus::Active,
+        trigger_step_id: None,
+        trigger_provider_operation_id: None,
+        failure_reason: json!({}),
+        input_custody_snapshot: json!({}),
+        created_at: now,
+        updated_at: now,
+    };
+    db.orders()
+        .create_execution_attempt(&attempt)
+        .await
+        .unwrap();
+
+    let leg = OrderExecutionLeg {
+        id: Uuid::now_v7(),
+        order_id: order.id,
+        execution_attempt_id: Some(attempt.id),
+        transition_decl_id: Some("unit-deposit-source-amount-leg".to_string()),
+        leg_index: 0,
+        leg_type: "unit_deposit".to_string(),
+        provider: "unit".to_string(),
+        status: OrderExecutionStepStatus::Planned,
+        input_asset: order.source_asset.clone(),
+        output_asset: DepositAsset {
+            chain: ChainId::parse("hyperliquid").unwrap(),
+            asset: AssetId::reference("UETH"),
+        },
+        amount_in: "1000".to_string(),
+        expected_amount_out: "1000".to_string(),
+        min_amount_out: None,
+        actual_amount_in: None,
+        actual_amount_out: None,
+        started_at: None,
+        completed_at: None,
+        details: json!({}),
+        usd_valuation: json!({}),
+        created_at: now,
+        updated_at: now,
+    };
+    db.orders()
+        .create_execution_legs_idempotent(std::slice::from_ref(&leg))
+        .await
+        .unwrap();
+
+    let step = OrderExecutionStep {
+        id: Uuid::now_v7(),
+        order_id: order.id,
+        execution_attempt_id: Some(attempt.id),
+        execution_leg_id: Some(leg.id),
+        transition_decl_id: leg.transition_decl_id.clone(),
+        step_index: 1,
+        step_type: OrderExecutionStepType::UnitDeposit,
+        provider: "unit".to_string(),
+        status: OrderExecutionStepStatus::Completed,
+        input_asset: Some(order.source_asset.clone()),
+        output_asset: Some(leg.output_asset.clone()),
+        amount_in: Some("1000".to_string()),
+        min_amount_out: None,
+        tx_hash: Some(
+            "0x3333333333333333333333333333333333333333333333333333333333333333".to_string(),
+        ),
+        provider_ref: Some("unit-provider-ref".to_string()),
+        idempotency_key: Some("unit-provider-ref-source-amount".to_string()),
+        attempt_count: 1,
+        next_attempt_at: None,
+        started_at: Some(now),
+        completed_at: Some(now),
+        details: json!({}),
+        request: json!({}),
+        response: json!({
+            "observed_state": {
+                "provider_observed_state": {
+                    "sourceAmount": "1000"
+                }
+            }
+        }),
+        error: json!({}),
+        usd_valuation: json!({}),
+        created_at: now,
+        updated_at: now,
+    };
+    db.orders()
+        .create_execution_steps_idempotent(&[step])
+        .await
+        .unwrap();
+
+    let refreshed = db
+        .orders()
+        .refresh_execution_leg_from_actions(leg.id)
+        .await
+        .unwrap()
+        .expect("refreshed leg");
+    assert_eq!(refreshed.status, OrderExecutionStepStatus::Completed);
+    assert_eq!(refreshed.actual_amount_in.as_deref(), Some("1000"));
+    assert_eq!(refreshed.actual_amount_out.as_deref(), Some("1000"));
 }
 
 #[tokio::test]

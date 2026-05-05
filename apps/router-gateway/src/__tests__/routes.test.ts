@@ -498,6 +498,65 @@ describe('router gateway routes', () => {
     expect(body.error.details).toEqual({ upstreamStatus: 502 })
   })
 
+  test('accepts long routed upstream provider ids', async () => {
+    const calls: RecordedCall[] = []
+    const app = createApp(testConfig(), {
+      fetch: mockFetch(calls, async () => {
+        const quote = internalQuote()
+        quote.quote.payload.provider_id =
+          'path:' + 'universal_router_swap:velora:evm:8453:native->evm:8453:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913|'.repeat(8)
+        return Response.json(quote)
+      })
+    })
+
+    const response = await app.request('/quote', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        from: 'Bitcoin.BTC',
+        to: 'Ethereum.USDC',
+        toAddress: TO_ADDRESS,
+        fromAmount: '1',
+        maxSlippage: '1',
+        amountFormat: 'readable'
+      })
+    })
+    const body = await response.json()
+
+    expect(response.status).toBe(201)
+    expect(body.quoteId).toBe(QUOTE_ID)
+  })
+
+  test('accepts long routed upstream provider ids for limit quotes', async () => {
+    const calls: RecordedCall[] = []
+    const app = createApp(testConfig(), {
+      fetch: mockFetch(calls, async () => {
+        const quote = internalLimitQuote()
+        quote.quote.payload.provider_id =
+          'path:' + 'unit_deposit:unit:bitcoin:native->hyperliquid:UBTC|hyperliquid_trade:hyperliquid|'.repeat(8)
+        return Response.json(quote, { status: 201 })
+      })
+    })
+
+    const response = await app.request('/quote', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        from: 'Bitcoin.BTC',
+        to: 'Ethereum.USDC',
+        toAddress: TO_ADDRESS,
+        fromAmount: '1',
+        toAmount: '1000',
+        orderType: 'limit',
+        amountFormat: 'readable'
+      })
+    })
+    const body = await response.json()
+
+    expect(response.status).toBe(201)
+    expect(body.quoteId).toBe(LIMIT_QUOTE_ID)
+  })
+
   test('rejects zero upstream quote amounts as controlled upstream errors', async () => {
     const calls: RecordedCall[] = []
     const app = createApp(testConfig(), {

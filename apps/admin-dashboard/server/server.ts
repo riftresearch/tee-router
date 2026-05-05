@@ -25,6 +25,7 @@ const runtime = createApp(config)
 const server = Bun.serve({
   hostname: config.host,
   port: config.port,
+  idleTimeout: 255,
   fetch: runtime.app.fetch
 })
 
