@@ -841,6 +841,12 @@ code,
   color: #f7d58c;
 }
 
+.status-pill.neutral {
+  border-color: rgba(140, 153, 145, 0.18);
+  background: rgba(255, 255, 255, 0.035);
+  color: #d7ded8;
+}
+
 .quote-cell {
   display: grid;
   gap: 4px;

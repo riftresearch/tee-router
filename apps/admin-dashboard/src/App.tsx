@@ -55,6 +55,69 @@ const WAIT_FOR_DEPOSIT_STEP_TYPE = 'wait_for_deposit'
 const ACTIVE_STEP_STATUSES = new Set(['ready', 'running', 'waiting', 'submitted'])
 const FAILED_STEP_STATUSES = new Set(['failed', 'cancelled'])
 const TERMINAL_STEP_STATUSES = new Set(['completed', 'failed', 'skipped', 'cancelled'])
+type StatusTone = 'success' | 'danger' | 'active' | 'waiting' | 'neutral'
+type StatusDisplay = {
+  label: string
+  tone: StatusTone
+  title?: string
+}
+const ORDER_STATUS_DISPLAY: Record<string, StatusDisplay> = {
+  quoted: {
+    label: 'Quoted',
+    tone: 'waiting',
+    title: 'Order exists from a quote; funding vault is not attached'
+  },
+  pending_funding: {
+    label: 'Pending Funding',
+    tone: 'waiting',
+    title: 'Funding vault exists and is waiting for deposit'
+  },
+  funded: {
+    label: 'Funded',
+    tone: 'active',
+    title: 'Deposit was observed; execution has not started'
+  },
+  executing: {
+    label: 'Executing',
+    tone: 'active',
+    title: 'Venue execution is in progress'
+  },
+  completed: {
+    label: 'Completed',
+    tone: 'success',
+    title: 'Execution finished successfully'
+  },
+  refund_required: {
+    label: 'Refund Required',
+    tone: 'danger',
+    title: 'Execution cannot complete; automated refund recovery is queued'
+  },
+  refunding: {
+    label: 'Refunding',
+    tone: 'active',
+    title: 'Automated refund recovery is running'
+  },
+  refunded: {
+    label: 'Refunded',
+    tone: 'neutral',
+    title: 'Refund finished'
+  },
+  manual_intervention_required: {
+    label: 'Manual Intervention',
+    tone: 'danger',
+    title: 'Execution state needs operator inspection'
+  },
+  refund_manual_intervention_required: {
+    label: 'Manual Refund',
+    tone: 'danger',
+    title: 'Refund recovery needs operator action'
+  },
+  expired: {
+    label: 'Expired',
+    tone: 'danger',
+    title: 'Funding deadline passed before valid funding was observed'
+  }
+}
 const ORDER_TABS: Array<{ type: OrderTypeFilter; label: string }> = [
   { type: 'market_order', label: 'Market Orders' },
   { type: 'limit_order', label: 'Limit Orders' }
@@ -2077,7 +2140,12 @@ function StreamBadge({
 }
 
 function StatusPill({ status }: { status: string }) {
-  return <span className={`status-pill ${statusTone(status)}`}>{humanize(status)}</span>
+  const display = statusDisplay(status)
+  return (
+    <span className={`status-pill ${display.tone}`} title={display.title ?? status}>
+      {display.label}
+    </span>
+  )
 }
 
 type QuoteFlowLegUsdValuation = NonNullable<UsdValuation['legs']>[number]
@@ -3186,7 +3254,16 @@ function shortOrderId(value: string) {
   return `${value.slice(0, 4)}...${value.slice(-4)}`
 }
 
-function statusTone(status: string) {
+export function statusDisplay(status: string): StatusDisplay {
+  return (
+    ORDER_STATUS_DISPLAY[status] ?? {
+      label: humanize(status),
+      tone: statusTone(status)
+    }
+  )
+}
+
+function statusTone(status: string): StatusTone {
   if (['completed', 'processed', 'skipped'].includes(status)) return 'success'
   if (
     [

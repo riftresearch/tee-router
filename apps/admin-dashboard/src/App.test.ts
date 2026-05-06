@@ -85,6 +85,27 @@ test('volume chart normalizes every fixed window and bucket size', async () => {
   }
 })
 
+test('order status display names every recovery and intervention state', async () => {
+  const { statusDisplay } = await appHelpers()
+
+  expect(statusDisplay('refund_required')).toMatchObject({
+    label: 'Refund Required',
+    tone: 'danger'
+  })
+  expect(statusDisplay('refunding')).toMatchObject({
+    label: 'Refunding',
+    tone: 'active'
+  })
+  expect(statusDisplay('manual_intervention_required')).toMatchObject({
+    label: 'Manual Intervention',
+    tone: 'danger'
+  })
+  expect(statusDisplay('refund_manual_intervention_required')).toMatchObject({
+    label: 'Manual Refund',
+    tone: 'danger'
+  })
+})
+
 test('execution timeline does not synthesize actual input from planned input', async () => {
   const { executedAmounts, timelineLegs } = await appHelpers()
   const order = completedOrder({
