@@ -3645,6 +3645,38 @@ impl OrderRepository {
         row.map(|row| self.map_execution_leg_row(&row)).transpose()
     }
 
+    pub async fn update_execution_leg_usd_valuation(
+        &self,
+        id: Uuid,
+        usd_valuation: serde_json::Value,
+        updated_at: DateTime<Utc>,
+    ) -> RouterServerResult<OrderExecutionLeg> {
+        let started = Instant::now();
+        let result = sqlx_core::query::query(&format!(
+            r#"
+            UPDATE order_execution_legs
+            SET
+                usd_valuation_json = $2,
+                updated_at = $3
+            WHERE id = $1
+            RETURNING {EXECUTION_LEG_RETURNING_COLUMNS}
+            "#
+        ))
+        .bind(id)
+        .bind(usd_valuation)
+        .bind(updated_at)
+        .fetch_one(&self.pool)
+        .await;
+        telemetry::record_db_query(
+            "order.update_execution_leg_usd_valuation",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        let row = result?;
+
+        self.map_execution_leg_row(&row)
+    }
+
     async fn refresh_execution_leg_for_step(
         &self,
         step: &OrderExecutionStep,

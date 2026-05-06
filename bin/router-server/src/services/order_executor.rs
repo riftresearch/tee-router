@@ -31,6 +31,7 @@ use crate::{
         },
         gas_reimbursement::parse_positive_retention_amount,
         market_order_planner::{MarketOrderRoutePlanError, MarketOrderRoutePlanner},
+        pricing::PricingSnapshot,
         provider_policy::ProviderPolicyService,
         quote_legs::{
             execution_step_type_for_transition_kind, QuoteLeg, QuoteLegAsset, QuoteLegSpec,
@@ -1359,16 +1360,17 @@ impl OrderExecutionManager {
             .await
             .map_err(|source| OrderExecutionError::Database { source })?;
 
+        let usd_pricing = self.usd_pricing_snapshot().await;
         let mut refreshed_leg_ids = std::collections::BTreeSet::new();
         for step in &retry_steps {
             if let Some(execution_leg_id) = step.execution_leg_id {
                 if refreshed_leg_ids.insert(execution_leg_id) {
                     let _ = self
-                        .db
-                        .orders()
-                        .refresh_execution_leg_from_actions(execution_leg_id)
-                        .await
-                        .map_err(|source| OrderExecutionError::Database { source })?;
+                        .refresh_execution_leg_rollup_and_usd_valuation(
+                            execution_leg_id,
+                            usd_pricing.as_ref(),
+                        )
+                        .await?;
                 }
             }
         }
@@ -2499,6 +2501,37 @@ impl OrderExecutionManager {
             .as_ref()?
             .current_or_refresh_live_pricing_snapshot()
             .await
+    }
+
+    async fn refresh_execution_leg_rollup_and_usd_valuation(
+        &self,
+        execution_leg_id: Uuid,
+        usd_pricing: Option<&PricingSnapshot>,
+    ) -> OrderExecutionResult<Option<OrderExecutionLeg>> {
+        let Some(leg) = self
+            .db
+            .orders()
+            .refresh_execution_leg_from_actions(execution_leg_id)
+            .await
+            .map_err(|source| OrderExecutionError::Database { source })?
+        else {
+            return Ok(None);
+        };
+        let Some(usd_pricing) = usd_pricing else {
+            return Ok(Some(leg));
+        };
+        let usd_valuation = execution_leg_usd_valuation(
+            self.action_providers.asset_registry().as_ref(),
+            Some(usd_pricing),
+            &leg,
+        );
+        let leg = self
+            .db
+            .orders()
+            .update_execution_leg_usd_valuation(leg.id, usd_valuation, Utc::now())
+            .await
+            .map_err(|source| OrderExecutionError::Database { source })?;
+        Ok(Some(leg))
     }
 
     async fn materialize_refund_plan_for_order(
@@ -4567,6 +4600,14 @@ impl OrderExecutionManager {
                     )
                     .await
                     .map_err(|source| OrderExecutionError::Database { source })?;
+                if let Some(execution_leg_id) = completed_step.execution_leg_id {
+                    let _ = self
+                        .refresh_execution_leg_rollup_and_usd_valuation(
+                            execution_leg_id,
+                            usd_pricing.as_ref(),
+                        )
+                        .await?;
+                }
                 if let Some(order) = &order {
                     telemetry::record_execution_step_workflow_event(
                         order,
@@ -5811,6 +5852,14 @@ impl OrderExecutionManager {
                     )
                     .await
                     .map_err(|source| OrderExecutionError::Database { source })?;
+                if let Some(execution_leg_id) = step.execution_leg_id {
+                    let _ = self
+                        .refresh_execution_leg_rollup_and_usd_valuation(
+                            execution_leg_id,
+                            usd_pricing.as_ref(),
+                        )
+                        .await?;
+                }
                 Ok(Some(step))
             }
             ProviderOperationStatus::Failed | ProviderOperationStatus::Expired => {
@@ -5899,15 +5948,17 @@ impl OrderExecutionManager {
         if !all_execution_steps_completed {
             return Ok(order);
         }
+        let usd_pricing = self.usd_pricing_snapshot().await;
         let mut refreshed_leg_ids = std::collections::BTreeSet::new();
         for step in steps.iter().filter(|step| step.step_index > 0) {
             if let Some(execution_leg_id) = step.execution_leg_id {
                 if refreshed_leg_ids.insert(execution_leg_id) {
-                    self.db
-                        .orders()
-                        .refresh_execution_leg_from_actions(execution_leg_id)
-                        .await
-                        .map_err(|source| OrderExecutionError::Database { source })?;
+                    let _ = self
+                        .refresh_execution_leg_rollup_and_usd_valuation(
+                            execution_leg_id,
+                            usd_pricing.as_ref(),
+                        )
+                        .await?;
                 }
             }
         }
