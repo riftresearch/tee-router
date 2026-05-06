@@ -111,7 +111,6 @@ const ACTIVE_ORDER_STATUSES = new Set([
   'refunding'
 ])
 const NEEDS_ATTENTION_ORDER_STATUSES = new Set([
-  'expired',
   'refund_required',
   'refunding',
   'manual_intervention_required',

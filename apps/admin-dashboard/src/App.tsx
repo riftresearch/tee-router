@@ -126,8 +126,8 @@ const ORDER_FILTERS: Array<{ value: OrderLifecycleFilter; label: string }> = [
   { value: 'firehose', label: 'Firehose' },
   { value: 'in_progress', label: 'In Progress' },
   { value: 'needs_attention', label: 'Needs Attention' },
-  { value: 'refunded', label: 'Refunded' },
-  { value: 'manual_refund', label: 'Manual Refund' }
+  { value: 'expired', label: 'Expired' },
+  { value: 'refunded', label: 'Refunded' }
 ]
 const VOLUME_WINDOWS = [
   { value: '6h', label: '6H' },

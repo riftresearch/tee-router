@@ -18,11 +18,30 @@ test('fetchOrderFirehose emits explicit lifecycle predicates for indexed tabs', 
 
   expect(capturedValues).toEqual([50, null, null, 'market_order'])
   expect(capturedSql).toContain('ro.order_type = $4::text')
-  expect(capturedSql).toContain("ro.status IN (\n        'expired'")
+  expect(capturedSql).toContain("ro.status IN (\n        'refund_required'")
+  expect(capturedSql).not.toContain("'expired'")
   expect(capturedSql).toContain("'manual_intervention_required'")
   expect(capturedSql).not.toContain("ro.status IN (\n        'failed'")
   expect(capturedSql).not.toContain('$5::text')
   expect(capturedSql).not.toContain("OR $5::text = 'needs_attention'")
+})
+
+test('fetchOrderFirehose emits dedicated expired lifecycle predicate', async () => {
+  let capturedSql = ''
+  let capturedValues: unknown[] = []
+  const pool = {
+    query: async (sql: string, values: unknown[]) => {
+      capturedSql = sql
+      capturedValues = values
+      return { rows: [orderRow()] }
+    }
+  } as unknown as Pool
+
+  await fetchOrderFirehose(pool, 50, undefined, 'market_order', 'expired')
+
+  expect(capturedValues).toEqual([50, null, null, 'market_order'])
+  expect(capturedSql).toContain("ro.status = 'expired'")
+  expect(capturedSql).not.toContain("'refund_required'")
 })
 
 test('fetchOrderFirehose keeps firehose scans free of lifecycle OR predicates', async () => {
@@ -152,6 +171,32 @@ test('fetchOrderMetrics rejects unsafe count values', async () => {
   await expect(fetchOrderMetrics(pool)).rejects.toThrow(
     'order metric total exceeds JavaScript safe integer range'
   )
+})
+
+test('fetchOrderMetrics excludes expired orders from needs-attention counts', async () => {
+  let capturedSql = ''
+  const pool = {
+    query: async (sql: string) => {
+      capturedSql = sql
+      return {
+        rows: [
+          {
+            total: '0',
+            active: '0',
+            needs_attention: '0'
+          }
+        ]
+      }
+    }
+  } as unknown as Pool
+
+  await expect(fetchOrderMetrics(pool)).resolves.toEqual({
+    total: 0,
+    active: 0,
+    needsAttention: 0
+  })
+  expect(capturedSql).toContain("WHERE status IN (\n          'refund_required'")
+  expect(capturedSql).not.toContain("'expired'")
 })
 
 test('fetchOrderMetrics rejects oversized count strings before numeric coercion', async () => {

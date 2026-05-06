@@ -98,8 +98,8 @@ export type OrderLifecycleFilter =
   | 'firehose'
   | 'in_progress'
   | 'needs_attention'
+  | 'expired'
   | 'refunded'
-  | 'manual_refund'
 
 export type OrderFirehoseRow = {
   id: string
@@ -891,7 +891,6 @@ function orderLifecycleSqlPredicate(
   if (lifecycleFilter === 'needs_attention') {
     return `
       ro.status IN (
-        'expired',
         'refund_required',
         'refunding',
         'manual_intervention_required',
@@ -899,10 +898,8 @@ function orderLifecycleSqlPredicate(
       )
     `
   }
+  if (lifecycleFilter === 'expired') return `ro.status = 'expired'`
   if (lifecycleFilter === 'refunded') return `ro.status = 'refunded'`
-  if (lifecycleFilter === 'manual_refund') {
-    return `ro.status = 'refund_manual_intervention_required'`
-  }
   return assertNeverOrderLifecycleFilter(lifecycleFilter)
 }
 
@@ -929,7 +926,6 @@ export async function fetchOrderMetrics(pool: Pool): Promise<OrderMetrics> {
       )::text AS active,
       COUNT(*) FILTER (
         WHERE status IN (
-          'expired',
           'refund_required',
           'refunding',
           'manual_intervention_required',
@@ -1166,12 +1162,9 @@ export function orderMatchesLifecycleFilter(
         ))
     )
   }
+  if (filter === 'expired') return order.status === 'expired'
   if (filter === 'refunded') return order.status === 'refunded'
-  if (filter === 'manual_refund') {
-    return order.status === 'refund_manual_intervention_required'
-  }
   return [
-    'expired',
     'refund_required',
     'refunding',
     'manual_intervention_required',

@@ -704,7 +704,7 @@ test('lifecycle filters keep refunded orders out of the needs-attention tab', ()
   ).toBe(true)
 })
 
-test('lifecycle filters treat generic manual intervention as needs-attention but not manual refund', () => {
+test('lifecycle filters treat manual intervention as needs-attention', () => {
   const manualInterventionOrder = order({
     id: '019df446-096f-7290-bf84-dc9dac9dd8ad',
     status: 'manual_intervention_required'
@@ -716,9 +716,19 @@ test('lifecycle filters treat generic manual intervention as needs-attention but
   expect(
     orderMatchesLifecycleFilter(manualInterventionOrder, 'in_progress')
   ).toBe(false)
+})
+
+test('lifecycle filters keep expired orders in the dedicated expired tab', () => {
+  const expiredOrder = order({
+    id: '019df446-096f-7290-bf84-dc9dac9dd8ae',
+    status: 'expired'
+  })
+
   expect(
-    orderMatchesLifecycleFilter(manualInterventionOrder, 'manual_refund')
+    orderMatchesLifecycleFilter(expiredOrder, 'needs_attention')
   ).toBe(false)
+  expect(orderMatchesLifecycleFilter(expiredOrder, 'expired')).toBe(true)
+  expect(orderMatchesLifecycleFilter(expiredOrder, 'in_progress')).toBe(false)
 })
 
 async function readUntil(response: Response, expected: string) {

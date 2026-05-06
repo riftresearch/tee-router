@@ -168,8 +168,8 @@ export type OrderLifecycleFilter =
   | 'firehose'
   | 'in_progress'
   | 'needs_attention'
+  | 'expired'
   | 'refunded'
-  | 'manual_refund'
 export type VolumeBucketSize = 'five_minute' | 'hour' | 'day'
 export type VolumeOrderTypeFilter = 'all' | OrderTypeFilter
 
