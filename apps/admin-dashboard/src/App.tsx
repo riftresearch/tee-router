@@ -52,6 +52,7 @@ const ORDER_LIMIT = 100
 const SHOW_USD_VALUES = true
 const MAX_VOLUME_CHART_BUCKETS = 1500
 const WAIT_FOR_DEPOSIT_STEP_TYPE = 'wait_for_deposit'
+const AWAITING_FUNDING_PROGRESS_LABEL = 'Awaiting Funding'
 const ACTIVE_STEP_STATUSES = new Set(['ready', 'running', 'waiting', 'submitted'])
 const FAILED_STEP_STATUSES = new Set(['failed', 'cancelled'])
 const TERMINAL_STEP_STATUSES = new Set(['completed', 'failed', 'skipped', 'cancelled'])
@@ -3212,6 +3213,7 @@ export function progressVenueLabel(order: OrderFirehoseRow) {
   if (progress.completedStages === progress.totalStages && progress.failedStages === 0) {
     return undefined
   }
+  if (isAwaitingFunding(order)) return AWAITING_FUNDING_PROGRESS_LABEL
 
   const failedLeg = progress.failedStages
     ? order.executionLegs.find((leg) => FAILED_STEP_STATUSES.has(leg.status))
@@ -3234,6 +3236,15 @@ export function progressVenueLabel(order: OrderFirehoseRow) {
   if (activeStep) return providerDisplayName(activeStep.provider)
 
   return progress.activeStage ? cleanProgressStage(progress.activeStage) : undefined
+}
+
+function isAwaitingFunding(order: OrderFirehoseRow) {
+  if (order.fundingTxHash) return false
+  const waitStep = order.executionSteps.find(isWaitForDepositStep)
+  if (waitStep) {
+    return !waitStep.txHash && !TERMINAL_STEP_STATUSES.has(waitStep.status)
+  }
+  return order.status === 'pending_funding'
 }
 
 function cleanProgressStage(stage: string) {

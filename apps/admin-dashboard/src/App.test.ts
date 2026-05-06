@@ -122,7 +122,7 @@ test('executed USD values require actual valuation entries', async () => {
   expect(executed.output.usdValuation?.raw).toBe('89')
 })
 
-test('venue progress label ignores active funding deposit steps', async () => {
+test('venue progress label shows awaiting funding for active funding deposit steps', async () => {
   const { progressVenueLabel } = await appHelpers()
   const now = '2026-05-05T00:00:00.000Z'
   const fundingStep: OrderExecutionStep = {
@@ -150,7 +150,42 @@ test('venue progress label ignores active funding deposit steps', async () => {
     }
   }
 
-  expect(progressVenueLabel(order)).toBeUndefined()
+  expect(progressVenueLabel(order)).toBe('Awaiting Funding')
+})
+
+test('venue progress label shows awaiting funding before first planned venue', async () => {
+  const { progressVenueLabel } = await appHelpers()
+  const order: OrderFirehoseRow = {
+    ...completedOrder({}),
+    status: 'pending_funding',
+    executionLegs: [],
+    progress: {
+      totalStages: 2,
+      completedStages: 0,
+      failedStages: 0,
+      activeStage: 'Cctp / Planned'
+    }
+  }
+
+  expect(progressVenueLabel(order)).toBe('Awaiting Funding')
+})
+
+test('venue progress label shows venue after funding is observed', async () => {
+  const { progressVenueLabel } = await appHelpers()
+  const order: OrderFirehoseRow = {
+    ...completedOrder({}),
+    status: 'executing',
+    fundingTxHash: '0xabc',
+    executionLegs: [],
+    progress: {
+      totalStages: 2,
+      completedStages: 0,
+      failedStages: 0,
+      activeStage: 'Cctp / Planned'
+    }
+  }
+
+  expect(progressVenueLabel(order)).toBe('CCTP')
 })
 
 test('venue progress label strips provider action text from active stage', async () => {
