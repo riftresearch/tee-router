@@ -88,7 +88,7 @@ test('fetchOrderFirehose derives summary progress from provider quote without ex
     totalStages: 2,
     completedStages: 0,
     failedStages: 0,
-    activeStage: 'Cctp Cctp Bridge / Planned'
+    activeStage: 'Cctp / Planned'
   })
 })
 

@@ -1327,13 +1327,13 @@ function summarizeProgress(
   const operationStages = operations.map((operation) => ({
     transitionDeclId: undefined,
     transitionMatchIds: [],
-    label: `${humanize(operation.provider)} ${humanize(operation.operationType)}`,
+    label: humanize(operation.provider),
     status: operation.status
   }))
   const actualStages = legs.map((leg) => ({
     transitionDeclId: leg.transitionDeclId,
     transitionMatchIds: leg.transitionDeclId ? [leg.transitionDeclId] : [],
-    label: `${humanize(leg.provider)} ${humanize(leg.legType)}`,
+    label: humanize(leg.provider),
     status: leg.status
   }))
   const stages =
@@ -1427,7 +1427,7 @@ function extractPlannedStages(providerQuote: unknown): ProgressStage[] {
     stages.push({
       ...(transitionDeclId ? { transitionDeclId } : {}),
       transitionMatchIds,
-      label: `${humanize(provider)} ${humanize(executionStepType ?? transitionKind)}`,
+      label: humanize(provider),
       status: 'planned'
     })
   }
@@ -1440,7 +1440,7 @@ function uniqueStrings(values: (string | undefined)[]): string[] {
 
 function stageLabel(stage: ProgressStage | OrderExecutionStep): string {
   if ('label' in stage) return stage.label
-  return `${humanize(stage.provider)} ${humanize(stage.stepType)}`
+  return humanize(stage.provider)
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

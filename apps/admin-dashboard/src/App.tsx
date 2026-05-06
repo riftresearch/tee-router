@@ -3242,8 +3242,27 @@ function cleanProgressStage(stage: string) {
 }
 
 function providerDisplayName(provider: string) {
-  const normalized = provider.trim().toLowerCase()
-  return PROVIDER_DISPLAY_NAMES[normalized] ?? humanize(normalized)
+  const normalized = providerKey(provider)
+  return (
+    PROVIDER_DISPLAY_NAMES[normalized] ??
+    knownProviderPrefix(normalized) ??
+    humanize(normalized)
+  )
+}
+
+function knownProviderPrefix(normalized: string) {
+  const provider = Object.keys(PROVIDER_DISPLAY_NAMES).find(
+    (key) => normalized.startsWith(`${key}_`)
+  )
+  return provider ? PROVIDER_DISPLAY_NAMES[provider] : undefined
+}
+
+function providerKey(provider: string) {
+  return provider
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
 }
 
 function humanize(value: string) {

@@ -153,6 +153,23 @@ test('venue progress label ignores active funding deposit steps', async () => {
   expect(progressVenueLabel(order)).toBeUndefined()
 })
 
+test('venue progress label strips provider action text from active stage', async () => {
+  const { progressVenueLabel } = await appHelpers()
+  const order: OrderFirehoseRow = {
+    ...completedOrder({}),
+    status: 'executing',
+    executionLegs: [],
+    progress: {
+      totalStages: 2,
+      completedStages: 0,
+      failedStages: 0,
+      activeStage: 'Cctp Cctp Burn / Waiting'
+    }
+  }
+
+  expect(progressVenueLabel(order)).toBe('CCTP')
+})
+
 test('SSE snapshots preserve expanded full-row execution details', async () => {
   const { mergeSnapshotOrders } = await appHelpers()
   const now = '2026-05-05T00:00:00.000Z'
