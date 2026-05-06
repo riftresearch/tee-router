@@ -329,7 +329,11 @@ test('order SSE forwards analytics change hints even when updated status is not 
       queueMicrotask(() => {
         void next({
           kind: 'upsert',
-          order: order({ id: orderId, status: 'failed', orderType: 'market_order' }),
+          order: order({
+            id: orderId,
+            status: 'manual_intervention_required',
+            orderType: 'market_order'
+          }),
           total: 7,
           metrics: {
             total: 7,
@@ -670,14 +674,14 @@ test('parseAnalyticsRange rejects non-canonical timestamp strings', async () => 
   })
 })
 
-test('lifecycle filters keep refunded orders out of the failed tab', () => {
+test('lifecycle filters keep refunded orders out of the needs-attention tab', () => {
   expect(
     orderMatchesLifecycleFilter(
       order({
         id: '019df446-096f-7290-bf84-dc9dac9dd8ab',
         status: 'refunded'
       }),
-      'failed'
+      'needs_attention'
     )
   ).toBe(false)
   expect(
@@ -695,7 +699,7 @@ test('lifecycle filters keep refunded orders out of the failed tab', () => {
         id: '019df446-096f-7290-bf84-dc9dac9dd8ac',
         status: 'refund_required'
       }),
-      'failed'
+      'needs_attention'
     )
   ).toBe(true)
 })
@@ -707,7 +711,7 @@ test('lifecycle filters treat generic manual intervention as needs-attention but
   })
 
   expect(
-    orderMatchesLifecycleFilter(manualInterventionOrder, 'failed')
+    orderMatchesLifecycleFilter(manualInterventionOrder, 'needs_attention')
   ).toBe(true)
   expect(
     orderMatchesLifecycleFilter(manualInterventionOrder, 'in_progress')

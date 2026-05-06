@@ -62,7 +62,7 @@ const ORDER_TABS: Array<{ type: OrderTypeFilter; label: string }> = [
 const ORDER_FILTERS: Array<{ value: OrderLifecycleFilter; label: string }> = [
   { value: 'firehose', label: 'Firehose' },
   { value: 'in_progress', label: 'In Progress' },
-  { value: 'failed', label: 'Failed' },
+  { value: 'needs_attention', label: 'Needs Attention' },
   { value: 'refunded', label: 'Refunded' },
   { value: 'manual_refund', label: 'Manual Refund' }
 ]

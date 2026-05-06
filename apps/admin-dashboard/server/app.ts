@@ -540,9 +540,10 @@ function parseOrderLifecycleFilter(
   value: string | undefined
 ): OrderLifecycleFilter | undefined | Response {
   if (!value || value === 'firehose') return undefined
+  if (value === 'failed') return 'needs_attention'
   if (
     value === 'in_progress' ||
-    value === 'failed' ||
+    value === 'needs_attention' ||
     value === 'refunded' ||
     value === 'manual_refund'
   ) {

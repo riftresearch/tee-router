@@ -14,13 +14,15 @@ test('fetchOrderFirehose emits explicit lifecycle predicates for indexed tabs', 
     }
   } as unknown as Pool
 
-  await fetchOrderFirehose(pool, 50, undefined, 'market_order', 'failed')
+  await fetchOrderFirehose(pool, 50, undefined, 'market_order', 'needs_attention')
 
   expect(capturedValues).toEqual([50, null, null, 'market_order'])
   expect(capturedSql).toContain('ro.order_type = $4::text')
-  expect(capturedSql).toContain("ro.status IN (\n        'failed'")
+  expect(capturedSql).toContain("ro.status IN (\n        'expired'")
+  expect(capturedSql).toContain("'manual_intervention_required'")
+  expect(capturedSql).not.toContain("ro.status IN (\n        'failed'")
   expect(capturedSql).not.toContain('$5::text')
-  expect(capturedSql).not.toContain("OR $5::text = 'failed'")
+  expect(capturedSql).not.toContain("OR $5::text = 'needs_attention'")
 })
 
 test('fetchOrderFirehose keeps firehose scans free of lifecycle OR predicates', async () => {

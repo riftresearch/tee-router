@@ -1116,7 +1116,6 @@ impl OrderExecutionManager {
                 | RouterOrderStatus::Refunded
                 | RouterOrderStatus::ManualInterventionRequired
                 | RouterOrderStatus::RefundManualInterventionRequired
-                | RouterOrderStatus::Failed
                 | RouterOrderStatus::Expired
         ) {
             return Ok(false);
@@ -4089,7 +4088,6 @@ impl OrderExecutionManager {
             | RouterOrderStatus::Refunded
             | RouterOrderStatus::ManualInterventionRequired
             | RouterOrderStatus::RefundManualInterventionRequired
-            | RouterOrderStatus::Failed
             | RouterOrderStatus::Expired => return Ok(None),
             RouterOrderStatus::Quoted | RouterOrderStatus::PendingFunding => {
                 return Err(OrderExecutionError::OrderNotReady { order_id });
@@ -4165,7 +4163,6 @@ impl OrderExecutionManager {
             | RouterOrderStatus::Refunded
             | RouterOrderStatus::ManualInterventionRequired
             | RouterOrderStatus::RefundManualInterventionRequired
-            | RouterOrderStatus::Failed
             | RouterOrderStatus::Expired => return Ok(None),
         };
         match order.status {
@@ -4494,7 +4491,6 @@ impl OrderExecutionManager {
             | RouterOrderStatus::Refunded
             | RouterOrderStatus::ManualInterventionRequired
             | RouterOrderStatus::RefundManualInterventionRequired
-            | RouterOrderStatus::Failed
             | RouterOrderStatus::Expired => false,
         }
     }
@@ -9186,7 +9182,6 @@ fn internal_custody_terminal_status(
             CustodyVaultStatus::Failed,
             "order_refund_manual_intervention_required",
         )),
-        RouterOrderStatus::Failed => Some((CustodyVaultStatus::Failed, "order_failed")),
         RouterOrderStatus::Expired => Some((CustodyVaultStatus::Failed, "order_expired")),
         RouterOrderStatus::Quoted
         | RouterOrderStatus::PendingFunding

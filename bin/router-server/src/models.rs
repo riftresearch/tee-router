@@ -65,7 +65,6 @@ pub enum RouterOrderStatus {
     Refunded,
     ManualInterventionRequired,
     RefundManualInterventionRequired,
-    Failed,
     Expired,
 }
 
@@ -83,7 +82,6 @@ impl RouterOrderStatus {
             Self::Refunded => "refunded",
             Self::ManualInterventionRequired => "manual_intervention_required",
             Self::RefundManualInterventionRequired => "refund_manual_intervention_required",
-            Self::Failed => "failed",
             Self::Expired => "expired",
         }
     }
@@ -100,7 +98,6 @@ impl RouterOrderStatus {
             "refunded" => Some(Self::Refunded),
             "manual_intervention_required" => Some(Self::ManualInterventionRequired),
             "refund_manual_intervention_required" => Some(Self::RefundManualInterventionRequired),
-            "failed" => Some(Self::Failed),
             "expired" => Some(Self::Expired),
             _ => None,
         }

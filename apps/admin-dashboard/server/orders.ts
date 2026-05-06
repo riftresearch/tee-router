@@ -97,7 +97,7 @@ export type OrderTypeFilter = 'market_order' | 'limit_order'
 export type OrderLifecycleFilter =
   | 'firehose'
   | 'in_progress'
-  | 'failed'
+  | 'needs_attention'
   | 'refunded'
   | 'manual_refund'
 
@@ -147,6 +147,7 @@ export type LimitOrderStatus = {
     | 'filled'
     | 'completed'
     | 'refunded'
+    | 'manual_intervention'
     | 'manual_refund'
     | 'failed'
     | 'expired'
@@ -872,7 +873,6 @@ function orderLifecycleSqlPredicate(
       ro.status NOT IN (
         'completed',
         'refunded',
-        'failed',
         'expired',
         'manual_intervention_required',
         'refund_manual_intervention_required'
@@ -888,10 +888,9 @@ function orderLifecycleSqlPredicate(
       )
     `
   }
-  if (lifecycleFilter === 'failed') {
+  if (lifecycleFilter === 'needs_attention') {
     return `
       ro.status IN (
-        'failed',
         'expired',
         'refund_required',
         'refunding',
@@ -930,7 +929,9 @@ export async function fetchOrderMetrics(pool: Pool): Promise<OrderMetrics> {
       )::text AS active,
       COUNT(*) FILTER (
         WHERE status IN (
-          'failed',
+          'expired',
+          'refund_required',
+          'refunding',
           'manual_intervention_required',
           'refund_manual_intervention_required'
         )
@@ -1155,7 +1156,6 @@ export function orderMatchesLifecycleFilter(
       ![
         'completed',
         'refunded',
-        'failed',
         'expired',
         'manual_intervention_required',
         'refund_manual_intervention_required'
@@ -1171,7 +1171,7 @@ export function orderMatchesLifecycleFilter(
     return order.status === 'refund_manual_intervention_required'
   }
   return [
-    'failed',
+    'expired',
     'refund_required',
     'refunding',
     'manual_intervention_required',
@@ -1208,7 +1208,7 @@ function summarizeLimitOrderStatus(
       phase:
         orderStatus === 'refund_manual_intervention_required'
           ? 'manual_refund'
-          : 'failed',
+          : 'manual_intervention',
       label:
         orderStatus === 'refund_manual_intervention_required'
           ? 'Manual Refund'
@@ -1217,10 +1217,10 @@ function summarizeLimitOrderStatus(
       tone: 'danger'
     }
   }
-  if (orderStatus === 'failed' || orderStatus === 'refund_required') {
+  if (orderStatus === 'refund_required') {
     return {
-      phase: 'failed',
-      label: orderStatus === 'refund_required' ? 'Refund Required' : 'Failed',
+      phase: 'manual_intervention',
+      label: 'Refund Required',
       detail: 'Execution did not finish cleanly',
       tone: 'danger'
     }

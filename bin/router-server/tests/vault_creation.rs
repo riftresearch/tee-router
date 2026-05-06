@@ -1925,7 +1925,6 @@ async fn drive_across_order_to_completion(
             RouterOrderStatus::Completed
                 | RouterOrderStatus::Refunding
                 | RouterOrderStatus::Refunded
-                | RouterOrderStatus::Failed
         ) {
             if !matches!(order.status, RouterOrderStatus::Completed) {
                 dump_order_state(db, order_id).await;
@@ -2394,12 +2393,18 @@ async fn test_database_harness_runs_migrations() {
             definition.contains("manual_intervention_required"),
             "migration constraint {constraint} on {table} must allow generic manual intervention: {definition}"
         );
+        if table == "router_orders" {
+            assert!(
+                !definition.contains("'failed'::text"),
+                "router order lifecycle must not allow an order-level failed state: {definition}"
+            );
+        }
     }
 
     for index in [
         "idx_router_orders_type_completed_created_at_id_desc",
         "idx_router_orders_type_in_progress_created_at_id_desc",
-        "idx_router_orders_type_failed_created_at_id_desc",
+        "idx_router_orders_type_needs_attention_created_at_id_desc",
         "idx_router_orders_type_refunded_created_at_id_desc",
         "idx_router_orders_type_manual_refund_created_at_id_desc",
         "idx_router_orders_worker_status_updated",
@@ -11415,7 +11420,6 @@ async fn drive_cross_token_across_order_to_completion(
             RouterOrderStatus::Completed
                 | RouterOrderStatus::Refunding
                 | RouterOrderStatus::Refunded
-                | RouterOrderStatus::Failed
         ) {
             if !matches!(order.status, RouterOrderStatus::Completed) {
                 dump_order_state(db, order_id).await;
@@ -11484,7 +11488,6 @@ async fn drive_limit_eth_to_arbitrum_usdc_order_to_completion(
             RouterOrderStatus::Completed
                 | RouterOrderStatus::Refunding
                 | RouterOrderStatus::Refunded
-                | RouterOrderStatus::Failed
         ) {
             if !matches!(order.status, RouterOrderStatus::Completed) {
                 dump_order_state(db, order_id).await;
@@ -11613,7 +11616,6 @@ async fn drive_unit_ingress_order_to_completion(
             RouterOrderStatus::Completed
                 | RouterOrderStatus::Refunding
                 | RouterOrderStatus::Refunded
-                | RouterOrderStatus::Failed
         ) {
             if !matches!(order.status, RouterOrderStatus::Completed) {
                 dump_order_state(db, order_id).await;

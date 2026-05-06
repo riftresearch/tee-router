@@ -309,7 +309,6 @@ impl OrderFlowProgress {
                 | RouterOrderStatus::Refunded
                 | RouterOrderStatus::ManualInterventionRequired
                 | RouterOrderStatus::RefundManualInterventionRequired
-                | RouterOrderStatus::Failed
                 | RouterOrderStatus::Expired
         );
         let percent_complete = if terminal && order.status == RouterOrderStatus::Completed {
