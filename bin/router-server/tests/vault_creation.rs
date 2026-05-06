@@ -68,6 +68,7 @@ use router_server::{
 };
 use serde_json::{json, Value};
 use sqlx_core::connection::Connection;
+use sqlx_core::row::Row;
 use sqlx_postgres::{PgConnectOptions, PgConnection};
 use std::{
     net::IpAddr,
@@ -5401,11 +5402,12 @@ async fn worker_marks_on_time_refunded_source_vault_order_refunded() {
         .execute(&mut conn)
         .await
         .unwrap();
+    let funding_tx_hash = format!("{:#x}", keccak256(b"refunded-before-expiry"));
     db.vaults()
         .mark_funded_with_observation(
             vault.id,
             &DepositVaultFundingObservation {
-                tx_hash: Some(format!("{:#x}", keccak256(b"refunded-before-expiry"))),
+                tx_hash: Some(funding_tx_hash.clone()),
                 sender_address: Some(valid_evm_address()),
                 sender_addresses: vec![valid_evm_address()],
                 recipient_address: Some(vault.deposit_vault_address.clone()),
@@ -5470,6 +5472,29 @@ async fn worker_marks_on_time_refunded_source_vault_order_refunded() {
         refund_attempt.status,
         OrderExecutionAttemptStatus::Completed
     );
+    let wait_step = sqlx_core::query::query(
+        r#"
+        SELECT status, tx_hash, response_json
+        FROM order_execution_steps
+        WHERE order_id = $1
+          AND step_type = 'wait_for_deposit'
+        "#,
+    )
+    .bind(order.id)
+    .fetch_one(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(
+        wait_step.try_get::<String, _>("status").unwrap(),
+        "completed"
+    );
+    assert_eq!(
+        wait_step.try_get::<Option<String>, _>("tx_hash").unwrap(),
+        Some(funding_tx_hash)
+    );
+    let response = wait_step.try_get::<Value, _>("response_json").unwrap();
+    assert_eq!(response["reason"], "funding_vault_funded");
+    assert_eq!(response["amount"], "1000");
 }
 
 #[tokio::test]
@@ -5571,6 +5596,25 @@ async fn late_deposit_after_order_expiry_is_observed_and_refunded_without_execut
             .and_then(|observation| observation.observed_amount.as_deref()),
         Some(TEST_NATIVE_ORDER_AMOUNT_WEI)
     );
+    let wait_step = sqlx_core::query::query(
+        r#"
+        SELECT status, response_json
+        FROM order_execution_steps
+        WHERE order_id = $1
+          AND step_type = 'wait_for_deposit'
+        "#,
+    )
+    .bind(order.id)
+    .fetch_one(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(
+        wait_step.try_get::<String, _>("status").unwrap(),
+        "completed"
+    );
+    let response = wait_step.try_get::<Value, _>("response_json").unwrap();
+    assert_eq!(response["reason"], "funding_vault_funded");
+    assert_eq!(response["amount"], TEST_NATIVE_ORDER_AMOUNT_WEI);
 
     let summary = execution_manager
         .process_order_ids(&[order.id])

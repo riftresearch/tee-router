@@ -6142,6 +6142,8 @@ impl OrderExecutionManager {
             }
         }
 
+        self.complete_wait_for_deposit_step(&order).await?;
+
         let refunding_order = if order.status == RouterOrderStatus::Refunding {
             order
         } else {

@@ -431,6 +431,35 @@ impl VaultRepository {
             WHERE id = $1
               AND status = 'pending_funding'
             RETURNING *
+            ),
+            completed_wait_step AS (
+            UPDATE order_execution_steps step
+            SET
+                status = 'completed',
+                response_json = CASE
+                    WHEN step.response_json = '{{}}'::jsonb THEN jsonb_strip_nulls(jsonb_build_object(
+                        'reason', 'funding_vault_funded',
+                        'tx_hash', $2,
+                        'sender_address', $3,
+                        'sender_addresses', $4::jsonb,
+                        'recipient_address', $5,
+                        'transfer_index', $6,
+                        'vout', $6,
+                        'amount', $7,
+                        'confirmation_state', $8,
+                        'observed_at', $9
+                    ))
+                    ELSE step.response_json
+                END,
+                tx_hash = COALESCE($2, step.tx_hash),
+                completed_at = COALESCE(step.completed_at, $9, $11),
+                updated_at = $11
+            FROM updated
+            JOIN custody_vaults cv ON cv.id = updated.id
+            WHERE step.order_id = cv.order_id
+              AND step.step_type = 'wait_for_deposit'
+              AND step.status = 'waiting'
+            RETURNING step.id
             )
             SELECT {SELECT_COLUMNS}
             FROM updated dv
@@ -487,6 +516,35 @@ impl VaultRepository {
               AND status = 'refunding'
               AND funding_evidence_json = '{{}}'::jsonb
             RETURNING *
+            ),
+            completed_wait_step AS (
+            UPDATE order_execution_steps step
+            SET
+                status = 'completed',
+                response_json = CASE
+                    WHEN step.response_json = '{{}}'::jsonb THEN jsonb_strip_nulls(jsonb_build_object(
+                        'reason', 'funding_vault_funded',
+                        'tx_hash', $2,
+                        'sender_address', $3,
+                        'sender_addresses', $4::jsonb,
+                        'recipient_address', $5,
+                        'transfer_index', $6,
+                        'vout', $6,
+                        'amount', $7,
+                        'confirmation_state', $8,
+                        'observed_at', $9
+                    ))
+                    ELSE step.response_json
+                END,
+                tx_hash = COALESCE($2, step.tx_hash),
+                completed_at = COALESCE(step.completed_at, $9, $11),
+                updated_at = $11
+            FROM updated
+            JOIN custody_vaults cv ON cv.id = updated.id
+            WHERE step.order_id = cv.order_id
+              AND step.step_type = 'wait_for_deposit'
+              AND step.status = 'waiting'
+            RETURNING step.id
             )
             SELECT {SELECT_COLUMNS}
             FROM updated dv
