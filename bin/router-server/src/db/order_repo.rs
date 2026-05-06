@@ -760,14 +760,24 @@ impl OrderRepository {
         let result = sqlx_core::query::query(&format!(
             r#"
             WITH updated AS (
-                UPDATE router_orders
+                UPDATE router_orders ro
                 SET
                     status = 'expired',
                     updated_at = $2
-                WHERE id = $1
-                  AND status IN ('quoted', 'pending_funding')
-                  AND action_timeout_at <= $2
-                RETURNING *
+                WHERE ro.id = $1
+                  AND ro.status IN ('quoted', 'pending_funding')
+                  AND ro.action_timeout_at <= $2
+                  AND (
+                      ro.funding_vault_id IS NULL
+                      OR EXISTS (
+                          SELECT 1
+                          FROM deposit_vaults funding_vault
+                          WHERE funding_vault.id = ro.funding_vault_id
+                            AND funding_vault.status = 'pending_funding'
+                            AND funding_vault.funding_observed_amount IS NULL
+                      )
+                  )
+                RETURNING ro.*
             )
             SELECT {ORDER_SELECT_COLUMNS}
             FROM updated ro
@@ -798,11 +808,21 @@ impl OrderRepository {
         let result = sqlx_core::query::query(&format!(
             r#"
             WITH candidates AS (
-                SELECT id
-                FROM router_orders
-                WHERE status IN ('quoted', 'pending_funding')
-                  AND action_timeout_at <= $1
-                ORDER BY action_timeout_at ASC, id ASC
+                SELECT ro.id
+                FROM router_orders ro
+                WHERE ro.status IN ('quoted', 'pending_funding')
+                  AND ro.action_timeout_at <= $1
+                  AND (
+                      ro.funding_vault_id IS NULL
+                      OR EXISTS (
+                          SELECT 1
+                          FROM deposit_vaults funding_vault
+                          WHERE funding_vault.id = ro.funding_vault_id
+                            AND funding_vault.status = 'pending_funding'
+                            AND funding_vault.funding_observed_amount IS NULL
+                      )
+                  )
+                ORDER BY ro.action_timeout_at ASC, ro.id ASC
                 LIMIT $2
                 FOR UPDATE SKIP LOCKED
             ),
@@ -833,6 +853,81 @@ impl OrderRepository {
         let rows = result?;
 
         rows.iter().map(|row| self.map_order_row(row)).collect()
+    }
+
+    pub async fn find_unstarted_orders_with_refunded_funding_vault(
+        &self,
+        limit: i64,
+    ) -> RouterServerResult<Vec<RouterOrder>> {
+        let started = Instant::now();
+        let result = sqlx_core::query::query(&format!(
+            r#"
+            SELECT {ORDER_SELECT_COLUMNS}
+            FROM router_orders ro
+            LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
+            LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
+            JOIN deposit_vaults dv ON dv.id = ro.funding_vault_id
+            WHERE (
+                ro.status IN (
+                    'pending_funding',
+                    'funded',
+                    'refund_required',
+                    'refunding'
+                )
+                OR (
+                    ro.status = 'expired'
+                    AND dv.funding_observed_at IS NOT NULL
+                    AND dv.funding_observed_at <= ro.action_timeout_at
+                )
+              )
+              AND dv.status = 'refunded'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM order_execution_steps oes
+                  WHERE oes.order_id = ro.id
+                    AND oes.step_index > 0
+              )
+            ORDER BY ro.updated_at ASC, ro.id ASC
+            LIMIT $1
+            "#
+        ))
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await;
+        telemetry::record_db_query(
+            "order.find_unstarted_orders_with_refunded_funding_vault",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        let rows = result?;
+
+        rows.iter().map(|row| self.map_order_row(row)).collect()
+    }
+
+    pub async fn has_execution_steps_after_deposit(
+        &self,
+        order_id: Uuid,
+    ) -> RouterServerResult<bool> {
+        let started = Instant::now();
+        let result = sqlx_core::query_scalar::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM order_execution_steps
+                WHERE order_id = $1
+                  AND step_index > 0
+            )
+            "#,
+        )
+        .bind(order_id)
+        .fetch_one(&self.pool)
+        .await;
+        telemetry::record_db_query(
+            "order.has_execution_steps_after_deposit",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        Ok(result?)
     }
 
     pub async fn get_market_orders_needing_execution_plan(

@@ -459,6 +459,9 @@ impl OrderExecutionManager {
             .await?;
         let direct_refund_finalizations =
             self.process_direct_refund_finalization_pass(limit).await?;
+        let refunded_funding_vault_finalizations = self
+            .process_refunded_funding_vault_finalization_pass(limit)
+            .await?;
         let refund_plans = self.process_refund_planning_pass(limit).await?;
         let manual_refund_alignments = self
             .process_manual_refund_vault_alignment_pass(limit)
@@ -499,6 +502,7 @@ impl OrderExecutionManager {
                 + stale_running_step_recoveries
                 + completed_order_finalizations
                 + direct_refund_finalizations
+                + refunded_funding_vault_finalizations
                 + refund_plans
                 + manual_refund_alignments
                 + terminal_custody_finalizations
@@ -544,6 +548,14 @@ impl OrderExecutionManager {
             .get(order_id)
             .await
             .map_err(|source| OrderExecutionError::Database { source })?;
+
+        if self
+            .finalize_refunded_funding_vault_for_unstarted_order(order.clone())
+            .await?
+        {
+            summary.maintenance_tasks += 1;
+            return Ok(summary);
+        }
 
         if self
             .finalize_direct_refund_if_complete(order.clone())
@@ -945,6 +957,35 @@ impl OrderExecutionManager {
                     warn!(
                         error = %err,
                         "direct-refund finalization recovery failed in worker pass",
+                    );
+                }
+            }
+        }
+        Ok(finalized)
+    }
+
+    async fn process_refunded_funding_vault_finalization_pass(
+        &self,
+        limit: i64,
+    ) -> OrderExecutionResult<usize> {
+        let orders = self
+            .db
+            .orders()
+            .find_unstarted_orders_with_refunded_funding_vault(limit)
+            .await
+            .map_err(|source| OrderExecutionError::Database { source })?;
+        let mut finalized = 0usize;
+        for order in orders {
+            match self
+                .finalize_refunded_funding_vault_for_unstarted_order(order)
+                .await
+            {
+                Ok(true) => finalized += 1,
+                Ok(false) => {}
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        "refunded funding-vault finalization failed in worker pass",
                     );
                 }
             }
@@ -6052,6 +6093,80 @@ impl OrderExecutionManager {
             telemetry::record_order_workflow_event(&order, "order.refunded");
         }
         Ok(true)
+    }
+
+    async fn finalize_refunded_funding_vault_for_unstarted_order(
+        &self,
+        order: RouterOrder,
+    ) -> OrderExecutionResult<bool> {
+        let eligible_status = matches!(
+            order.status,
+            RouterOrderStatus::PendingFunding
+                | RouterOrderStatus::Funded
+                | RouterOrderStatus::RefundRequired
+                | RouterOrderStatus::Refunding
+        ) || order.status == RouterOrderStatus::Expired;
+        if !eligible_status {
+            return Ok(false);
+        }
+        if self
+            .db
+            .orders()
+            .has_execution_steps_after_deposit(order.id)
+            .await
+            .map_err(|source| OrderExecutionError::Database { source })?
+        {
+            return Ok(false);
+        }
+
+        let Some(funding_vault_id) = order.funding_vault_id else {
+            return Ok(false);
+        };
+        let vault = self
+            .db
+            .vaults()
+            .get(funding_vault_id)
+            .await
+            .map_err(|source| OrderExecutionError::Database { source })?;
+        if vault.status != DepositVaultStatus::Refunded {
+            return Ok(false);
+        }
+        if order.status == RouterOrderStatus::Expired {
+            let funded_on_time = vault
+                .funding_observation
+                .as_ref()
+                .and_then(|observation| observation.observed_at)
+                .is_some_and(|observed_at| observed_at <= order.action_timeout_at);
+            if !funded_on_time {
+                return Ok(false);
+            }
+        }
+
+        let refunding_order = if order.status == RouterOrderStatus::Refunding {
+            order
+        } else {
+            let transition = self
+                .transition_order_status_idempotent(
+                    order.id,
+                    order.status,
+                    RouterOrderStatus::Refunding,
+                    Utc::now(),
+                )
+                .await?;
+            if transition.changed {
+                telemetry::record_order_workflow_event(&transition.order, "order.refunding");
+            }
+            transition.order
+        };
+
+        let _ = self
+            .ensure_direct_refund_attempt_for_order(
+                &refunding_order,
+                "refunded_source_vault_reconciliation",
+            )
+            .await?;
+        self.finalize_direct_refund_if_complete(refunding_order)
+            .await
     }
 
     async fn process_terminal_internal_custody_vaults(

@@ -32,10 +32,11 @@ use router_server::{
     error::RouterServerError,
     models::{
         CustodyVault, CustodyVaultControlType, CustodyVaultRole, CustodyVaultStatus,
-        CustodyVaultVisibility, DepositVaultFundingHint, DepositVaultStatus, MarketOrderAction,
-        MarketOrderKind, MarketOrderKindType, MarketOrderQuote, OrderExecutionAttempt,
-        OrderExecutionAttemptKind, OrderExecutionAttemptStatus, OrderExecutionLeg,
-        OrderExecutionStep, OrderExecutionStepStatus, OrderExecutionStepType, OrderProviderAddress,
+        CustodyVaultVisibility, DepositVaultFundingHint, DepositVaultFundingObservation,
+        DepositVaultStatus, MarketOrderAction, MarketOrderKind, MarketOrderKindType,
+        MarketOrderQuote, OrderExecutionAttempt, OrderExecutionAttemptKind,
+        OrderExecutionAttemptStatus, OrderExecutionLeg, OrderExecutionStep,
+        OrderExecutionStepStatus, OrderExecutionStepType, OrderProviderAddress,
         OrderProviderOperation, OrderProviderOperationHint, ProviderAddressRole,
         ProviderExecutionPolicyState, ProviderHealthCheck, ProviderHealthStatus,
         ProviderOperationHintKind, ProviderOperationHintStatus, ProviderOperationStatus,
@@ -5257,6 +5258,218 @@ async fn worker_expires_unfunded_order_without_claiming_empty_vault_refund() {
     assert_eq!(refund_summary.retry_claimed, 0);
     let pending_vault = db.vaults().get(vault.id).await.unwrap();
     assert_eq!(pending_vault.status, DepositVaultStatus::PendingFunding);
+}
+
+#[tokio::test]
+async fn unfunded_expiry_skips_order_when_funding_vault_already_funded() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = harness().await;
+    let postgres = test_postgres().await;
+    let database_url = create_test_database(&postgres.admin_database_url).await;
+    let db = Database::connect(&database_url, 5, 1).await.unwrap();
+    let settings = Arc::new(test_settings(dir.path()));
+    let (order_manager, _mocks) = mock_order_manager(db.clone(), h.chain_registry.clone()).await;
+    let vault_manager = VaultManager::new(db.clone(), settings, h.chain_registry.clone());
+    let quote = order_manager
+        .quote_market_order(MarketOrderQuoteRequest {
+            from_asset: DepositAsset {
+                chain: ChainId::parse("evm:1").unwrap(),
+                asset: AssetId::Native,
+            },
+            to_asset: DepositAsset {
+                chain: ChainId::parse("evm:8453").unwrap(),
+                asset: AssetId::Native,
+            },
+            recipient_address: valid_evm_address(),
+            order_kind: MarketOrderQuoteKind::ExactIn {
+                amount_in: "1000".to_string(),
+                slippage_bps: 100,
+            },
+        })
+        .await
+        .unwrap();
+    let order = create_test_order_from_quote(
+        &order_manager,
+        quote
+            .quote
+            .as_market_order()
+            .expect("market order quote")
+            .id,
+    )
+    .await;
+    let vault = vault_manager
+        .create_vault(CreateVaultRequest {
+            order_id: Some(order.id),
+            ..evm_native_request()
+        })
+        .await
+        .unwrap();
+    let expired_at = Utc::now() - chrono::Duration::seconds(1);
+    let mut conn = PgConnection::connect(&database_url).await.unwrap();
+    sqlx_core::query::query("UPDATE router_orders SET action_timeout_at = $1 WHERE id = $2")
+        .bind(expired_at)
+        .bind(order.id)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    db.vaults()
+        .mark_funded_with_observation(
+            vault.id,
+            &DepositVaultFundingObservation {
+                tx_hash: Some(format!("{:#x}", keccak256(b"funded-before-expiry"))),
+                sender_address: Some(valid_evm_address()),
+                sender_addresses: vec![valid_evm_address()],
+                recipient_address: Some(vault.deposit_vault_address.clone()),
+                transfer_index: Some(0),
+                observed_amount: Some("1000".to_string()),
+                confirmation_state: Some("confirmed".to_string()),
+                observed_at: Some(expired_at - chrono::Duration::seconds(1)),
+                evidence: json!({ "source": "test" }),
+            },
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+
+    let expired = db
+        .orders()
+        .expire_unfunded_order(order.id, Utc::now())
+        .await
+        .unwrap();
+    assert!(expired.is_none());
+    let expired_batch = db
+        .orders()
+        .expire_unfunded_orders(Utc::now(), 10)
+        .await
+        .unwrap();
+    assert!(expired_batch.is_empty());
+    assert_eq!(
+        db.orders().get(order.id).await.unwrap().status,
+        RouterOrderStatus::PendingFunding
+    );
+}
+
+#[tokio::test]
+async fn worker_marks_on_time_refunded_source_vault_order_refunded() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = harness().await;
+    let postgres = test_postgres().await;
+    let database_url = create_test_database(&postgres.admin_database_url).await;
+    let db = Database::connect(&database_url, 5, 1).await.unwrap();
+    let settings = Arc::new(test_settings(dir.path()));
+    let (order_manager, _mocks) = mock_order_manager(db.clone(), h.chain_registry.clone()).await;
+    let vault_manager = VaultManager::new(db.clone(), settings, h.chain_registry.clone());
+    let quote = order_manager
+        .quote_market_order(MarketOrderQuoteRequest {
+            from_asset: DepositAsset {
+                chain: ChainId::parse("evm:1").unwrap(),
+                asset: AssetId::Native,
+            },
+            to_asset: DepositAsset {
+                chain: ChainId::parse("evm:8453").unwrap(),
+                asset: AssetId::Native,
+            },
+            recipient_address: valid_evm_address(),
+            order_kind: MarketOrderQuoteKind::ExactIn {
+                amount_in: "1000".to_string(),
+                slippage_bps: 100,
+            },
+        })
+        .await
+        .unwrap();
+    let order = create_test_order_from_quote(
+        &order_manager,
+        quote
+            .quote
+            .as_market_order()
+            .expect("market order quote")
+            .id,
+    )
+    .await;
+    let vault = vault_manager
+        .create_vault(CreateVaultRequest {
+            order_id: Some(order.id),
+            ..evm_native_request()
+        })
+        .await
+        .unwrap();
+    let expired_at = Utc::now() - chrono::Duration::seconds(1);
+    let mut conn = PgConnection::connect(&database_url).await.unwrap();
+    sqlx_core::query::query("UPDATE router_orders SET action_timeout_at = $1 WHERE id = $2")
+        .bind(expired_at)
+        .bind(order.id)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    db.vaults()
+        .mark_funded_with_observation(
+            vault.id,
+            &DepositVaultFundingObservation {
+                tx_hash: Some(format!("{:#x}", keccak256(b"refunded-before-expiry"))),
+                sender_address: Some(valid_evm_address()),
+                sender_addresses: vec![valid_evm_address()],
+                recipient_address: Some(vault.deposit_vault_address.clone()),
+                transfer_index: Some(0),
+                observed_amount: Some("1000".to_string()),
+                confirmation_state: Some("confirmed".to_string()),
+                observed_at: Some(expired_at - chrono::Duration::seconds(1)),
+                evidence: json!({ "source": "test" }),
+            },
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    db.vaults()
+        .request_refund(vault.id, Utc::now())
+        .await
+        .unwrap();
+    let refund_claimed_until = Utc::now() + chrono::Duration::seconds(30);
+    db.vaults()
+        .claim_refund(
+            vault.id,
+            Utc::now(),
+            refund_claimed_until,
+            "test-refund-worker",
+        )
+        .await
+        .unwrap()
+        .expect("claim refund");
+    db.vaults()
+        .mark_refunded(
+            vault.id,
+            Utc::now(),
+            "0xrefund",
+            "test-refund-worker",
+            refund_claimed_until,
+        )
+        .await
+        .unwrap();
+    sqlx_core::query::query("UPDATE router_orders SET status = 'expired' WHERE id = $1")
+        .bind(order.id)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    let execution_manager = OrderExecutionManager::new(db.clone());
+    let summary = execution_manager
+        .process_order_ids(&[order.id])
+        .await
+        .unwrap();
+
+    assert_eq!(summary.maintenance_tasks, 1);
+    assert_eq!(
+        db.orders().get(order.id).await.unwrap().status,
+        RouterOrderStatus::Refunded
+    );
+    let attempts = db.orders().get_execution_attempts(order.id).await.unwrap();
+    let refund_attempt = attempts
+        .iter()
+        .find(|attempt| attempt.attempt_kind == OrderExecutionAttemptKind::RefundRecovery)
+        .expect("refund recovery attempt");
+    assert_eq!(
+        refund_attempt.status,
+        OrderExecutionAttemptStatus::Completed
+    );
 }
 
 #[tokio::test]
