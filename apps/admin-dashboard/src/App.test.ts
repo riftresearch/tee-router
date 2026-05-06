@@ -122,7 +122,7 @@ test('executed USD values require actual valuation entries', async () => {
   expect(executed.output.usdValuation?.raw).toBe('89')
 })
 
-test('venue progress label shows awaiting funding for active funding deposit steps', async () => {
+test('venue progress label stays empty for active funding deposit steps', async () => {
   const { progressVenueLabel } = await appHelpers()
   const now = '2026-05-05T00:00:00.000Z'
   const fundingStep: OrderExecutionStep = {
@@ -150,10 +150,10 @@ test('venue progress label shows awaiting funding for active funding deposit ste
     }
   }
 
-  expect(progressVenueLabel(order)).toBe('Awaiting Funding')
+  expect(progressVenueLabel(order)).toBeUndefined()
 })
 
-test('venue progress label shows awaiting funding before first planned venue', async () => {
+test('venue progress label stays empty before first planned venue', async () => {
   const { progressVenueLabel } = await appHelpers()
   const order: OrderFirehoseRow = {
     ...completedOrder({}),
@@ -167,21 +167,39 @@ test('venue progress label shows awaiting funding before first planned venue', a
     }
   }
 
-  expect(progressVenueLabel(order)).toBe('Awaiting Funding')
+  expect(progressVenueLabel(order)).toBeUndefined()
 })
 
-test('venue progress label shows venue after funding is observed', async () => {
+test('venue progress label stays empty for planned refund venue', async () => {
   const { progressVenueLabel } = await appHelpers()
   const order: OrderFirehoseRow = {
     ...completedOrder({}),
-    status: 'executing',
-    fundingTxHash: '0xabc',
+    status: 'refunding',
     executionLegs: [],
     progress: {
       totalStages: 2,
       completedStages: 0,
       failedStages: 0,
-      activeStage: 'Cctp / Planned'
+      activeStage: 'Unit / Planned'
+    }
+  }
+
+  expect(progressVenueLabel(order)).toBeUndefined()
+})
+
+test('venue progress label shows venue for active venue execution', async () => {
+  const { progressVenueLabel } = await appHelpers()
+  const order: OrderFirehoseRow = {
+    ...completedOrder({
+      provider: 'cctp',
+      status: 'running'
+    }),
+    status: 'executing',
+    progress: {
+      totalStages: 2,
+      completedStages: 0,
+      failedStages: 0,
+      activeStage: 'Cctp / Running'
     }
   }
 

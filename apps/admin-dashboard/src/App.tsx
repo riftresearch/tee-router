@@ -52,7 +52,6 @@ const ORDER_LIMIT = 100
 const SHOW_USD_VALUES = true
 const MAX_VOLUME_CHART_BUCKETS = 1500
 const WAIT_FOR_DEPOSIT_STEP_TYPE = 'wait_for_deposit'
-const AWAITING_FUNDING_PROGRESS_LABEL = 'Awaiting Funding'
 const ACTIVE_STEP_STATUSES = new Set(['ready', 'running', 'waiting', 'submitted'])
 const FAILED_STEP_STATUSES = new Set(['failed', 'cancelled'])
 const TERMINAL_STEP_STATUSES = new Set(['completed', 'failed', 'skipped', 'cancelled'])
@@ -3213,16 +3212,15 @@ export function progressVenueLabel(order: OrderFirehoseRow) {
   if (progress.completedStages === progress.totalStages && progress.failedStages === 0) {
     return undefined
   }
-  if (isAwaitingFunding(order)) return AWAITING_FUNDING_PROGRESS_LABEL
 
   const failedLeg = progress.failedStages
     ? order.executionLegs.find((leg) => FAILED_STEP_STATUSES.has(leg.status))
     : undefined
   if (failedLeg) return providerDisplayName(failedLeg.provider)
 
-  const activeLeg =
-    order.executionLegs.find((leg) => ACTIVE_STEP_STATUSES.has(leg.status)) ??
-    order.executionLegs.find((leg) => leg.status === 'planned')
+  const activeLeg = order.executionLegs.find((leg) =>
+    ACTIVE_STEP_STATUSES.has(leg.status)
+  )
   if (activeLeg) return providerDisplayName(activeLeg.provider)
 
   const activeStep =
@@ -3231,24 +3229,24 @@ export function progressVenueLabel(order: OrderFirehoseRow) {
     ) ??
     order.executionSteps.find(
       (step) => !isWaitForDepositStep(step) && FAILED_STEP_STATUSES.has(step.status)
-    ) ??
-    order.executionSteps.find((step) => !isWaitForDepositStep(step) && step.status === 'planned')
+    )
   if (activeStep) return providerDisplayName(activeStep.provider)
 
-  return progress.activeStage ? cleanProgressStage(progress.activeStage) : undefined
+  return progress.activeStage ? activeProgressStageVenue(progress.activeStage) : undefined
 }
 
-function isAwaitingFunding(order: OrderFirehoseRow) {
-  if (order.fundingTxHash) return false
-  const waitStep = order.executionSteps.find(isWaitForDepositStep)
-  if (waitStep) {
-    return !waitStep.txHash && !TERMINAL_STEP_STATUSES.has(waitStep.status)
+function activeProgressStageVenue(stage: string) {
+  const [venue, status] = stage.split('/')
+  const normalizedStatus = status ? providerKey(status) : undefined
+  if (!normalizedStatus) return undefined
+  if (
+    !ACTIVE_STEP_STATUSES.has(normalizedStatus) &&
+    !FAILED_STEP_STATUSES.has(normalizedStatus) &&
+    normalizedStatus !== 'waiting_external' &&
+    normalizedStatus !== 'executing'
+  ) {
+    return undefined
   }
-  return order.status === 'pending_funding'
-}
-
-function cleanProgressStage(stage: string) {
-  const [venue] = stage.split(/[/:,]/)
   return venue ? providerDisplayName(venue.trim()) : undefined
 }
 
