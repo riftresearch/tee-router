@@ -9295,6 +9295,44 @@ async fn completion_finalization_candidates_include_stale_execution_legs_for_rol
 }
 
 #[tokio::test]
+async fn execution_leg_usd_valuation_update_returns_updated_leg() {
+    let db = test_db().await;
+    let now = Utc::now();
+    let order = create_executing_market_test_order(&db, now).await;
+    let leg_id = create_test_execution_leg_for_step(TestExecutionLegForStep {
+        db: &db,
+        order_id: order.id,
+        execution_attempt_id: None,
+        step_index: 1,
+        step_type: OrderExecutionStepType::UniversalRouterSwap,
+        provider: "velora",
+        input_asset: None,
+        output_asset: None,
+        amount_in: Some("1000"),
+        min_amount_out: Some("990"),
+        now,
+    })
+    .await;
+    let usd_valuation = json!({
+        "amount_in_usd": "12.34",
+        "amount_out_usd": "12.30"
+    });
+
+    let updated = db
+        .orders()
+        .update_execution_leg_usd_valuation(
+            leg_id,
+            usd_valuation.clone(),
+            now + chrono::Duration::seconds(1),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(updated.id, leg_id);
+    assert_eq!(updated.usd_valuation, usd_valuation);
+}
+
+#[tokio::test]
 async fn completed_order_finalization_does_not_complete_when_leg_rollup_lacks_amount_evidence() {
     let db = test_db().await;
     let now = Utc::now();

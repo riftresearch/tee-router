@@ -3654,7 +3654,7 @@ impl OrderRepository {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
-            UPDATE order_execution_legs
+            UPDATE order_execution_legs leg
             SET
                 usd_valuation_json = $2,
                 updated_at = $3
