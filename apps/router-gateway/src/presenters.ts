@@ -22,8 +22,17 @@ export type PublicQuoteResponse = {
   expectedSlippage?: string
   minOut?: string
   maxIn?: string
-  maxSlippage: string
+  maxSlippage?: string
+  fees?: PublicQuoteFee[]
   amountFormat: AmountFormat
+}
+
+export type PublicQuoteFee = {
+  kind: string
+  label: string
+  asset: string
+  amount: string
+  amountRaw: string
 }
 
 export type PublicOrderResponse = PublicQuoteResponse & {
@@ -188,7 +197,52 @@ function presentQuote(
     expectedOut: formatPositiveAmount(quote.amount_out, destination, amountFormat),
     ...(minOut === undefined ? {} : { minOut }),
     ...(maxIn === undefined ? {} : { maxIn }),
-    maxSlippage: formatSlippage(quote.slippage_bps, amountFormat),
+    ...(quote.slippage_bps === null || quote.slippage_bps === undefined
+      ? {}
+      : { maxSlippage: formatSlippage(quote.slippage_bps, amountFormat) }),
+    ...quoteFees(quote.provider_quote, amountFormat),
     amountFormat
   }
+}
+
+function quoteFees(
+  providerQuote: unknown,
+  amountFormat: AmountFormat
+): { fees?: PublicQuoteFee[] } {
+  const fees: PublicQuoteFee[] = []
+  const quote = isRecord(providerQuote) ? providerQuote : undefined
+  const legs = Array.isArray(quote?.legs) ? quote.legs : []
+  for (const leg of legs) {
+    if (!isRecord(leg)) continue
+    const raw = isRecord(leg.raw) ? leg.raw : undefined
+    const activationFee = isRecord(raw?.hyperliquid_core_activation_fee)
+      ? raw.hyperliquid_core_activation_fee
+      : undefined
+    if (!activationFee) continue
+    const amountRaw =
+      typeof activationFee.amount_raw === 'string'
+        ? activationFee.amount_raw
+        : undefined
+    const amountDecimal =
+      typeof activationFee.amount_decimal === 'string'
+        ? activationFee.amount_decimal
+        : undefined
+    const quoteAsset =
+      typeof activationFee.quote_asset === 'string'
+        ? activationFee.quote_asset
+        : 'USDC'
+    if (!amountRaw || !amountDecimal) continue
+    fees.push({
+      kind: 'hyperliquid_core_activation_fee',
+      label: 'Hyperliquid activation fee',
+      asset: `Hyperliquid.${quoteAsset}`,
+      amount: amountFormat === 'raw' ? amountRaw : amountDecimal,
+      amountRaw
+    })
+  }
+  return fees.length === 0 ? {} : { fees }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }

@@ -28,7 +28,6 @@ import { logError } from '../internal/logging'
 import {
   AddressSchema,
   AmountFormatSchema,
-  DateTimeSchema,
   EvmSignatureSchema,
   ErrorResponses,
   AssetIdentifierSchema,
@@ -49,7 +48,6 @@ export const OrderMarketRequestSchema = z
     refundAddress: AddressSchema.optional(),
     integrator: IntegratorSchema.optional(),
     idempotencyKey: IdempotencyKeySchema,
-    cancelAfter: DateTimeSchema.optional(),
     refundMode: RefundModeSchema.optional(),
     refundAuthorizer: AddressSchema.nullable(),
     amountFormat: AmountFormatSchema.optional()
@@ -132,9 +130,6 @@ export const OrderLimitRequestSchema = z
       description:
         'Readable destination asset amount per one readable source asset. For Bitcoin.BTC to Ethereum.USDC, "100000" means 100,000 USDC per 1 BTC. Provide exactly two of fromAmount, toAmount, and price; Rift computes the omitted value from the other two.',
       example: '100000'
-    }),
-    expiration: DateTimeSchema.optional().openapi({
-      example: '2026-05-04T13:00:00Z'
     }),
     refundAddress: AddressSchema.optional().openapi({
       example: 'bc1qrefund0000000000000000000000000000000'
@@ -327,7 +322,6 @@ export function createOrderMarketHandler(
       const envelope = await routerClient.createOrder({
         quote_id: request.quoteId,
         refund_address: request.refundAddress ?? request.fromAddress,
-        ...(request.cancelAfter ? { cancel_after: request.cancelAfter } : {}),
         idempotency_key: request.idempotencyKey,
         metadata: {
           ...(request.integrator ? { integrator: request.integrator } : {}),
@@ -445,7 +439,6 @@ export function createOrderLimitHandler(
       const envelope = await routerClient.createOrder({
         quote_id: quoteId,
         refund_address: request.refundAddress ?? request.fromAddress,
-        ...(request.expiration ? { cancel_after: request.expiration } : {}),
         idempotency_key: request.idempotencyKey,
         metadata: {
           ...(request.integrator ? { integrator: request.integrator } : {}),

@@ -6,7 +6,7 @@ use bitcoin::Amount;
 use bitcoincore_rpc_async::{Auth, RpcApi};
 use chains::{
     bitcoin::BitcoinChain,
-    evm::{EvmChain, EvmGasSponsorConfig},
+    evm::{EvmBroadcastPolicy, EvmChain, EvmGasSponsorConfig},
     hyperliquid::HyperliquidChain,
     ChainRegistry,
 };
@@ -60,7 +60,7 @@ use router_server::{
         vault_manager::{VaultError, VaultManager},
         ActionProviderRegistry, AssetRegistry, ChainCall, CustodyAction, CustodyActionExecutor,
         CustodyActionRequest, EvmCall, OrderExecutionCrashInjector, OrderExecutionCrashPoint,
-        OrderExecutionManager, ProviderAddressIntent, ProviderExecutionIntent,
+        OrderExecutionManager, PricingSnapshot, ProviderAddressIntent, ProviderExecutionIntent,
         ProviderExecutionState, ProviderOperationIntent, ProviderOperationStatusUpdate,
         RouteCostService, RouteCostSnapshot, RouteMinimumService, VeloraHttpProviderConfig,
     },
@@ -555,6 +555,7 @@ async fn create_test_execution_leg_for_step(spec: TestExecutionLegForStep<'_>) -
         actual_amount_out: None,
         started_at: None,
         completed_at: None,
+        provider_quote_expires_at: None,
         details: json!({ "source": "test_fixture" }),
         usd_valuation: json!({}),
         created_at: now,
@@ -598,9 +599,9 @@ async fn create_executing_market_test_order(
         action: RouterOrderAction::MarketOrder(MarketOrderAction {
             order_kind: MarketOrderKind::ExactIn {
                 amount_in: "1000".to_string(),
-                min_amount_out: "1000".to_string(),
+                min_amount_out: Some("1000".to_string()),
             },
-            slippage_bps: 100,
+            slippage_bps: Some(100),
         }),
         action_timeout_at: now + chrono::Duration::minutes(10),
         idempotency_key: None,
@@ -1069,18 +1070,30 @@ impl UnitProvider for CustodyIntentUnitProvider {
                 "unit deposit request is missing source_custody_vault_id".to_string()
             })?;
             let amount = request.amount.clone();
+            let provider_ref = format!("custody-intent-unit-deposit-{amount}");
 
             Ok(ProviderExecutionIntent::CustodyAction {
                 custody_vault_id,
                 action: CustodyAction::Transfer {
                     to_address: self.deposit_sink.clone(),
-                    amount,
+                    amount: amount.clone(),
                 },
                 provider_context: json!({
                     "mock_provider": "custody-intent-unit",
-                    "operation": "deposit"
+                    "operation": "deposit",
+                    "amount_out": amount,
                 }),
-                state: Default::default(),
+                state: ProviderExecutionState {
+                    operation: Some(ProviderOperationIntent {
+                        operation_type: ProviderOperationType::UnitDeposit,
+                        status: ProviderOperationStatus::Completed,
+                        provider_ref: Some(provider_ref),
+                        request: None,
+                        response: None,
+                        observed_state: Some(json!({ "amount": amount })),
+                    }),
+                    addresses: Vec::new(),
+                },
             })
         })
     }
@@ -1094,6 +1107,8 @@ impl UnitProvider for CustodyIntentUnitProvider {
                 response: json!({
                     "mock_provider": "custody-intent-unit",
                     "operation": "withdrawal",
+                    "amount_in": request.amount,
+                    "amount_out": request.amount,
                     "request": request
                 }),
                 state: Default::default(),
@@ -1304,11 +1319,11 @@ impl ExchangeProvider for ProviderOnlyExchangeProvider {
                 MarketOrderKind::ExactIn {
                     amount_in,
                     min_amount_out,
-                } => (amount_in.clone(), amount_in, Some(min_amount_out), None),
+                } => (amount_in.clone(), amount_in, min_amount_out, None),
                 MarketOrderKind::ExactOut {
                     amount_out,
                     max_amount_in,
-                } => (amount_out.clone(), amount_out, None, Some(max_amount_in)),
+                } => (amount_out.clone(), amount_out, None, max_amount_in),
             };
             Ok(Some(ExchangeQuote {
                 provider_id: "hyperliquid".to_string(),
@@ -1577,7 +1592,6 @@ async fn create_test_order_from_quote_with_refund(
         .create_order_from_quote(CreateOrderRequest {
             quote_id,
             refund_address,
-            cancel_after: None,
             idempotency_key: None,
             metadata: json!({}),
         })
@@ -1708,7 +1722,7 @@ async fn funded_market_order_fixture_with_amount_and_unit_indexers(
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: amount_in.to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -2601,7 +2615,7 @@ async fn materialize_plan_failure_does_not_create_execution_attempt() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -2745,7 +2759,7 @@ async fn quote_market_order_persists_ephemeral_quote_without_order() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -2816,7 +2830,7 @@ async fn quote_market_order_persists_ephemeral_quote_without_order() {
         &stored_quote.provider_id,
         &["unit_deposit:unit", "unit_withdrawal:unit"],
     );
-    assert_eq!(stored_quote.slippage_bps, 100);
+    assert_eq!(stored_quote.slippage_bps, Some(100));
     assert_eq!(stored_quote.min_amount_out.as_deref(), Some("990"));
     let public_quote = serde_json::to_value(
         response
@@ -2851,7 +2865,7 @@ async fn create_order_idempotency_keys_are_scoped_to_their_quote() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -2874,7 +2888,7 @@ async fn create_order_idempotency_keys_are_scoped_to_their_quote() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "2000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -2888,7 +2902,6 @@ async fn create_order_idempotency_keys_are_scoped_to_their_quote() {
         .create_order_from_quote(CreateOrderRequest {
             quote_id: first_quote.id,
             refund_address: valid_evm_address(),
-            cancel_after: None,
             idempotency_key: Some(idempotency_key.to_string()),
             metadata: json!({}),
         })
@@ -2900,7 +2913,6 @@ async fn create_order_idempotency_keys_are_scoped_to_their_quote() {
         .create_order_from_quote(CreateOrderRequest {
             quote_id: second_quote.id,
             refund_address: valid_evm_address(),
-            cancel_after: None,
             idempotency_key: Some(idempotency_key.to_string()),
             metadata: json!({}),
         })
@@ -2941,7 +2953,7 @@ async fn concurrent_create_order_requests_resume_same_quote_idempotently() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -2953,7 +2965,6 @@ async fn concurrent_create_order_requests_resume_same_quote_idempotently() {
     let request = CreateOrderRequest {
         quote_id: quote.id,
         refund_address,
-        cancel_after: None,
         idempotency_key: Some("concurrent-create-order-race".to_string()),
         metadata: json!({}),
     };
@@ -3047,7 +3058,6 @@ async fn create_limit_order_idempotency_keys_are_scoped_to_their_quote() {
         .create_order_from_quote(CreateOrderRequest {
             quote_id: first_quote.id,
             refund_address: valid_evm_address(),
-            cancel_after: None,
             idempotency_key: Some(idempotency_key.to_string()),
             metadata: json!({}),
         })
@@ -3059,7 +3069,6 @@ async fn create_limit_order_idempotency_keys_are_scoped_to_their_quote() {
         .create_order_from_quote(CreateOrderRequest {
             quote_id: second_quote.id,
             refund_address: valid_evm_address(),
-            cancel_after: None,
             idempotency_key: Some(idempotency_key.to_string()),
             metadata: json!({}),
         })
@@ -3110,7 +3119,6 @@ async fn concurrent_create_limit_order_requests_resume_same_quote_idempotently()
     let request = CreateOrderRequest {
         quote_id: quote.id,
         refund_address,
-        cancel_after: None,
         idempotency_key: Some("concurrent-create-limit-order-race".to_string()),
         metadata: json!({}),
     };
@@ -3206,7 +3214,7 @@ async fn quote_market_order_supports_velora_arbitrary_evm_start_and_end() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000000000000000000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -3219,7 +3227,7 @@ async fn quote_market_order_supports_velora_arbitrary_evm_start_and_end() {
         * U256::from(9_900_u64))
         / U256::from(10_000_u64))
     .to_string();
-    assert_eq!(quote.slippage_bps, 100);
+    assert_eq!(quote.slippage_bps, Some(100));
     assert_eq!(
         quote.min_amount_out.as_deref(),
         Some(expected_min_out.as_str())
@@ -3309,7 +3317,7 @@ async fn quote_market_order_rejects_universal_router_route_without_minimum_polic
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000000000000000000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -3362,7 +3370,7 @@ async fn quote_market_order_bitcoin_to_base_usdc_keeps_configured_provider_path_
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "10000000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -3418,7 +3426,7 @@ async fn quote_market_order_exact_in_reports_net_output_after_unit_withdrawal_re
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "60000000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -3517,7 +3525,7 @@ async fn mock_velora_transaction_spends_input_and_mints_output_on_local_evm() {
             output_decimals: Some(6),
             order_kind: MarketOrderKind::ExactIn {
                 amount_in: amount_in.clone(),
-                min_amount_out: "1".to_string(),
+                min_amount_out: Some("1".to_string()),
             },
             sender_address: Some(format!("{source_address:#x}")),
             recipient_address: format!("{source_address:#x}"),
@@ -3582,10 +3590,16 @@ async fn mock_velora_transaction_spends_input_and_mints_output_on_local_evm() {
     };
     assert_eq!(actions.len(), 2);
 
-    for action in actions {
+    for (index, action) in actions.into_iter().enumerate() {
         let CustodyAction::Call(ChainCall::Evm(call)) = action else {
             panic!("mock Velora action should be an EVM call");
         };
+        let expected_policy = if index == 1 {
+            EvmBroadcastPolicy::FlashbotsIfEthereum
+        } else {
+            EvmBroadcastPolicy::Standard
+        };
+        assert_eq!(call.broadcast_policy, expected_policy);
         let tx = TransactionRequest::default()
             .with_to(Address::from_str(&call.to_address).unwrap())
             .with_value(U256::from_str_radix(&call.value, 10).unwrap())
@@ -3652,7 +3666,7 @@ async fn quote_market_order_exact_out_uses_exchange_provider_quote() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactOut {
                 amount_out: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -3667,7 +3681,7 @@ async fn quote_market_order_exact_out_uses_exchange_provider_quote() {
     assert!(market_quote.provider_id.contains("unit_withdrawal:unit"));
     assert_eq!(market_quote.order_kind, MarketOrderKindType::ExactOut);
     assert_eq!(market_quote.amount_in, "1000");
-    assert_eq!(market_quote.slippage_bps, 100);
+    assert_eq!(market_quote.slippage_bps, Some(100));
     assert_eq!(market_quote.max_amount_in.as_deref(), Some("1010"));
 }
 
@@ -4168,12 +4182,12 @@ async fn router_api_quote_and_order_flow_uses_production_component_initializatio
     assert_eq!(order.order.status, RouterOrderStatus::PendingFunding);
     match &order.order.action {
         RouterOrderAction::MarketOrder(action) => {
-            assert_eq!(action.slippage_bps, 100);
+            assert_eq!(action.slippage_bps, Some(100));
             assert_eq!(
                 action.order_kind,
                 MarketOrderKind::ExactIn {
                     amount_in: TEST_NATIVE_ORDER_AMOUNT_WEI.to_string(),
-                    min_amount_out: TEST_NATIVE_ORDER_MIN_OUT_WEI.to_string(),
+                    min_amount_out: Some(TEST_NATIVE_ORDER_MIN_OUT_WEI.to_string()),
                 }
             );
         }
@@ -4328,8 +4342,7 @@ async fn router_api_address_screening_covers_allow_block_and_provider_error() {
     let status = blocked_quote_response.status();
     let body = blocked_quote_response.text().await.unwrap();
     assert_eq!(status, reqwest::StatusCode::FORBIDDEN, "{body}");
-    assert!(body.contains("risk=high"), "{body}");
-    assert!(body.contains("sanctions exposure"), "{body}");
+    assert!(body.contains("Forbidden"), "{body}");
 
     let provider_error_response = client
         .post(format!("{base_url}/api/v1/quotes"))
@@ -4340,8 +4353,7 @@ async fn router_api_address_screening_covers_allow_block_and_provider_error() {
     let status = provider_error_response.status();
     let body = provider_error_response.text().await.unwrap();
     assert_eq!(status, reqwest::StatusCode::INTERNAL_SERVER_ERROR, "{body}");
-    assert!(body.contains("address screening request failed"), "{body}");
-    assert!(body.contains("503"), "{body}");
+    assert!(body.contains("Internal server error"), "{body}");
 
     let refund_block_response = client
         .post(format!("{base_url}/api/v1/orders"))
@@ -4360,9 +4372,7 @@ async fn router_api_address_screening_covers_allow_block_and_provider_error() {
     let status = refund_block_response.status();
     let body = refund_block_response.text().await.unwrap();
     assert_eq!(status, reqwest::StatusCode::FORBIDDEN, "{body}");
-    assert!(body.contains("refund"), "{body}");
-    assert!(body.contains("risk=severe"), "{body}");
-    assert!(body.contains("stolen funds"), "{body}");
+    assert!(body.contains("Forbidden"), "{body}");
 
     api_task.abort();
 }
@@ -4775,18 +4785,23 @@ async fn router_api_and_worker_complete_mock_across_unit_flow_with_production_co
     assert_eq!(status, reqwest::StatusCode::CREATED, "{body}");
     let order: RouterOrderEnvelope = serde_json::from_str(&body).unwrap();
     assert!(order.cancellation_secret.is_some());
+    let market_quote = quote.quote.as_market_order().expect("market order quote");
+    assert_ne!(
+        order.order.action_timeout_at.timestamp_micros(),
+        market_quote.expires_at.timestamp_micros(),
+        "order timeout must not inherit quote expiry"
+    );
+    assert!(order.order.action_timeout_at >= order.order.created_at + chrono::Duration::minutes(9));
     let funding_vault = order
         .funding_vault
         .as_ref()
         .expect("order should include a funding vault")
         .vault
         .clone();
-    let quote_expires_at = quote
-        .quote
-        .as_market_order()
-        .expect("market order quote")
-        .expires_at;
-    assert!(funding_vault.cancel_after <= quote_expires_at);
+    assert!(
+        funding_vault.cancel_after > order.order.action_timeout_at + chrono::Duration::hours(12),
+        "funding vault timeout must use the vault lifecycle, not quote/order expiry"
+    );
     let vault_address =
         Address::from_str(&funding_vault.deposit_vault_address).expect("valid base vault address");
     let source_balance = U256::from_str_radix(TEST_NATIVE_ORDER_AMOUNT_WEI, 10)
@@ -4865,7 +4880,7 @@ async fn funding_hints_validate_balance_once_and_mark_vault_funded() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -5065,7 +5080,7 @@ async fn funding_hint_records_observation_for_refunding_late_deposit() {
 }
 
 #[tokio::test]
-async fn expired_funded_quote_requests_refund_before_execution_materialization() {
+async fn expired_funded_quote_still_materializes_execution_plan() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
     let postgres = test_postgres().await;
@@ -5095,7 +5110,7 @@ async fn expired_funded_quote_requests_refund_before_execution_materialization()
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -5129,7 +5144,7 @@ async fn expired_funded_quote_requests_refund_before_execution_materialization()
         &vault_manager,
         vault.id,
         "1000",
-        &format!("expired-quote-funding-{}", vault.id),
+        &format!("stale-quote-funding-{}", vault.id),
     )
     .await;
 
@@ -5153,51 +5168,166 @@ async fn expired_funded_quote_requests_refund_before_execution_materialization()
         custody_action_executor,
         h.chain_registry.clone(),
     );
-    let error = execution_manager
+    let materialized = execution_manager
         .materialize_plan_for_order(order.id)
         .await
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        router_server::services::OrderExecutionError::OrderNotReady { .. }
-    ));
+        .expect("stale quote must not make a funded order refundable");
     let order = db.orders().get(order.id).await.unwrap();
     let vault = db.vaults().get(vault.id).await.unwrap();
-    assert_eq!(order.status, RouterOrderStatus::Refunding);
-    assert_eq!(vault.status, DepositVaultStatus::Refunding);
+    assert_eq!(order.status, RouterOrderStatus::Funded);
+    assert_eq!(vault.status, DepositVaultStatus::Funded);
+    assert!(materialized.planned_steps > 0);
     let attempts = db.orders().get_execution_attempts(order.id).await.unwrap();
-    let refund_attempt = attempts
+    assert!(attempts
         .iter()
-        .find(|attempt| attempt.attempt_kind == OrderExecutionAttemptKind::RefundRecovery)
-        .expect("direct source-vault refund attempt should be recorded");
-    assert_eq!(refund_attempt.status, OrderExecutionAttemptStatus::Active);
-
-    let refund_summary = vault_manager.process_refund_pass().await;
-    assert_eq!(refund_summary.refunded_order_ids, vec![order.id]);
-    let process_summary = execution_manager
-        .process_order_ids(&[order.id])
-        .await
-        .unwrap();
-    assert_eq!(process_summary.maintenance_tasks, 1);
-    assert_eq!(
-        db.orders().get(order.id).await.unwrap().status,
-        RouterOrderStatus::Refunded
-    );
-    assert_eq!(
-        db.orders()
-            .get_execution_attempts(order.id)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|attempt| attempt.id == refund_attempt.id)
-            .expect("direct refund attempt")
-            .status,
-        OrderExecutionAttemptStatus::Completed
-    );
+        .all(|attempt| attempt.attempt_kind != OrderExecutionAttemptKind::RefundRecovery));
 }
 
 #[tokio::test]
-async fn worker_expires_unfunded_order_without_claiming_empty_vault_refund() {
+async fn stale_unstarted_provider_quote_refreshes_remaining_execution_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = harness().await;
+    let postgres = test_postgres().await;
+    let database_url = create_test_database(&postgres.admin_database_url).await;
+    let db = Database::connect(&database_url, 5, 1).await.unwrap();
+    let mocks = spawn_harness_mocks(h, "evm:8453").await;
+    let settings = Arc::new(test_settings(dir.path()));
+    let action_providers = Arc::new(ActionProviderRegistry::mock_http(mocks.base_url()));
+    let order_manager = OrderManager::with_action_providers(
+        db.clone(),
+        settings.clone(),
+        h.chain_registry.clone(),
+        action_providers.clone(),
+    );
+    let vault_manager = VaultManager::new(db.clone(), settings.clone(), h.chain_registry.clone());
+    let source_asset = DepositAsset {
+        chain: ChainId::parse("evm:8453").unwrap(),
+        asset: AssetId::Native,
+    };
+    let quote = order_manager
+        .quote_market_order(MarketOrderQuoteRequest {
+            from_asset: source_asset.clone(),
+            to_asset: DepositAsset {
+                chain: ChainId::parse("evm:1").unwrap(),
+                asset: AssetId::Native,
+            },
+            recipient_address: valid_evm_address(),
+            order_kind: MarketOrderQuoteKind::ExactIn {
+                amount_in: "1000".to_string(),
+                slippage_bps: Some(100),
+            },
+        })
+        .await
+        .unwrap();
+    let order = create_test_order_from_quote(
+        &order_manager,
+        quote
+            .quote
+            .as_market_order()
+            .expect("market order quote")
+            .id,
+    )
+    .await;
+    let vault = vault_manager
+        .create_vault(CreateVaultRequest {
+            order_id: Some(order.id),
+            deposit_asset: source_asset,
+            ..evm_native_request()
+        })
+        .await
+        .unwrap();
+    let vault_address =
+        Address::from_str(&vault.deposit_vault_address).expect("valid vault evm address");
+    anvil_set_base_balance(
+        h,
+        vault_address,
+        U256::from(1000) + U256::from(TEST_NATIVE_ORDER_GAS_PAD_WEI),
+    )
+    .await;
+    record_confirmed_sauron_funding_hint(
+        &vault_manager,
+        vault.id,
+        "1000",
+        &format!("stale-leg-refresh-funding-{}", vault.id),
+    )
+    .await;
+
+    let custody_action_executor = Arc::new(CustodyActionExecutor::new(
+        db.clone(),
+        settings,
+        h.chain_registry.clone(),
+    ));
+    let execution_manager = OrderExecutionManager::with_dependencies(
+        db.clone(),
+        action_providers,
+        custody_action_executor,
+        h.chain_registry.clone(),
+    );
+    execution_manager
+        .materialize_plan_for_order(order.id)
+        .await
+        .unwrap();
+    let attempts = db.orders().get_execution_attempts(order.id).await.unwrap();
+    assert_eq!(attempts.len(), 1);
+    let primary_attempt = attempts[0].clone();
+    let primary_legs = db
+        .orders()
+        .get_execution_legs_for_attempt(primary_attempt.id)
+        .await
+        .unwrap();
+    let first_leg = primary_legs.first().expect("primary attempt leg");
+    let expired_at = Utc::now() - chrono::Duration::seconds(1);
+    let mut conn = PgConnection::connect(&database_url).await.unwrap();
+    sqlx_core::query::query(
+        "UPDATE order_execution_legs SET provider_quote_expires_at = $1 WHERE id = $2",
+    )
+    .bind(expired_at)
+    .bind(first_leg.id)
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    execution_manager.process_worker_pass(10).await.unwrap();
+    let attempts = db.orders().get_execution_attempts(order.id).await.unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].status, OrderExecutionAttemptStatus::Superseded);
+    assert_eq!(attempts[1].status, OrderExecutionAttemptStatus::Active);
+    assert_eq!(
+        attempts[1].attempt_kind,
+        OrderExecutionAttemptKind::RefreshedExecution
+    );
+    let old_steps = db
+        .orders()
+        .get_execution_steps_for_attempt(attempts[0].id)
+        .await
+        .unwrap();
+    assert!(old_steps
+        .iter()
+        .filter(|step| step.step_index > 0)
+        .all(|step| step.status == OrderExecutionStepStatus::Superseded));
+    let refreshed_legs = db
+        .orders()
+        .get_execution_legs_for_attempt(attempts[1].id)
+        .await
+        .unwrap();
+    let old_leg_ids = primary_legs
+        .iter()
+        .map(|leg| leg.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(refreshed_legs
+        .iter()
+        .all(|leg| !old_leg_ids.contains(&leg.id)));
+    assert!(refreshed_legs
+        .iter()
+        .all(|leg| leg.provider_quote_expires_at.is_some()));
+
+    drive_across_order_to_completion(&execution_manager, &mocks, &db, order.id).await;
+    let order = db.orders().get(order.id).await.unwrap();
+    assert_eq!(order.status, RouterOrderStatus::Completed);
+}
+
+#[tokio::test]
+async fn worker_does_not_expire_unfunded_order() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
     let postgres = test_postgres().await;
@@ -5219,7 +5349,7 @@ async fn worker_expires_unfunded_order_without_claiming_empty_vault_refund() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -5253,9 +5383,9 @@ async fn worker_expires_unfunded_order_without_claiming_empty_vault_refund() {
         .process_order_ids(&[order.id])
         .await
         .unwrap();
-    assert_eq!(summary.maintenance_tasks, 1);
-    let expired_order = db.orders().get(order.id).await.unwrap();
-    assert_eq!(expired_order.status, RouterOrderStatus::Expired);
+    assert_eq!(summary.maintenance_tasks, 0);
+    let pending_order = db.orders().get(order.id).await.unwrap();
+    assert_eq!(pending_order.status, RouterOrderStatus::PendingFunding);
     let pending_vault = db.vaults().get(vault.id).await.unwrap();
     assert_eq!(pending_vault.status, DepositVaultStatus::PendingFunding);
 
@@ -5289,7 +5419,7 @@ async fn unfunded_expiry_skips_order_when_funding_vault_already_funded() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -5353,6 +5483,13 @@ async fn unfunded_expiry_skips_order_when_funding_vault_already_funded() {
         db.orders().get(order.id).await.unwrap().status,
         RouterOrderStatus::PendingFunding
     );
+
+    let refund_summary = vault_manager.process_refund_pass().await;
+    assert_eq!(refund_summary.timeout_claimed, 0);
+    assert_eq!(
+        db.vaults().get(vault.id).await.unwrap().status,
+        DepositVaultStatus::Funded
+    );
 }
 
 #[tokio::test]
@@ -5378,7 +5515,7 @@ async fn worker_marks_on_time_refunded_source_vault_order_refunded() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -5503,7 +5640,7 @@ async fn worker_marks_on_time_refunded_source_vault_order_refunded() {
 }
 
 #[tokio::test]
-async fn late_deposit_after_order_expiry_is_observed_and_refunded_without_execution() {
+async fn late_deposit_after_cancel_after_does_not_expire_order() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
     let postgres = test_postgres().await;
@@ -5525,7 +5662,7 @@ async fn late_deposit_after_order_expiry_is_observed_and_refunded_without_execut
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: TEST_NATIVE_ORDER_AMOUNT_WEI.to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -5566,10 +5703,10 @@ async fn late_deposit_after_order_expiry_is_observed_and_refunded_without_execut
         .process_order_ids(&[order.id])
         .await
         .unwrap();
-    assert_eq!(summary.maintenance_tasks, 1);
+    assert_eq!(summary.maintenance_tasks, 0);
     assert_eq!(
         db.orders().get(order.id).await.unwrap().status,
-        RouterOrderStatus::Expired
+        RouterOrderStatus::PendingFunding
     );
     assert_eq!(
         db.vaults().get(vault.id).await.unwrap().status,
@@ -5601,59 +5738,9 @@ async fn late_deposit_after_order_expiry_is_observed_and_refunded_without_execut
             .and_then(|observation| observation.observed_amount.as_deref()),
         Some(TEST_NATIVE_ORDER_AMOUNT_WEI)
     );
-    let wait_step = sqlx_core::query::query(
-        r#"
-        SELECT status, response_json
-        FROM order_execution_steps
-        WHERE order_id = $1
-          AND step_type = 'wait_for_deposit'
-        "#,
-    )
-    .bind(order.id)
-    .fetch_one(&mut conn)
-    .await
-    .unwrap();
-    assert_eq!(
-        wait_step.try_get::<String, _>("status").unwrap(),
-        "completed"
-    );
-    let response = wait_step.try_get::<Value, _>("response_json").unwrap();
-    assert_eq!(response["reason"], "funding_vault_funded");
-    assert_eq!(response["amount"], TEST_NATIVE_ORDER_AMOUNT_WEI);
-
-    let summary = execution_manager
-        .process_order_ids(&[order.id])
-        .await
-        .unwrap();
-    assert_eq!(summary.planned_orders, 0);
-    assert_eq!(summary.executed_orders, 0);
     assert_eq!(
         db.orders().get(order.id).await.unwrap().status,
-        RouterOrderStatus::Expired
-    );
-    let pre_refund_vault = db.vaults().get(vault.id).await.unwrap();
-    assert_eq!(pre_refund_vault.status, DepositVaultStatus::Funded);
-    assert!(
-        pre_refund_vault.cancel_after <= Utc::now(),
-        "late-funded vault should be timeout-claimable: cancel_after={}",
-        pre_refund_vault.cancel_after
-    );
-
-    let refund_summary = vault_manager.process_refund_pass().await;
-    assert_eq!(refund_summary.timeout_claimed, 1);
-    assert_eq!(refund_summary.retry_claimed, 0);
-    assert_eq!(refund_summary.refunded_order_ids, vec![order.id]);
-    let refunded_vault = db.vaults().get(vault.id).await.unwrap();
-    assert_eq!(
-        refunded_vault.status,
-        DepositVaultStatus::Refunded,
-        "last refund error: {:?}",
-        refunded_vault.last_refund_error
-    );
-    assert!(refunded_vault.refund_tx_hash.is_some());
-    assert_eq!(
-        db.orders().get(order.id).await.unwrap().status,
-        RouterOrderStatus::Expired
+        RouterOrderStatus::PendingFunding
     );
 }
 
@@ -5678,7 +5765,7 @@ async fn execute_materialized_order_does_not_advance_refunding_funding_vault() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -5763,7 +5850,7 @@ async fn refunding_order_with_refund_steps_does_not_use_direct_refund_finalizer(
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -6224,9 +6311,9 @@ async fn sauron_provider_operation_retry_reopens_failed_but_not_processed_same_k
         action: RouterOrderAction::MarketOrder(MarketOrderAction {
             order_kind: MarketOrderKind::ExactIn {
                 amount_in: "1000".to_string(),
-                min_amount_out: "1000".to_string(),
+                min_amount_out: Some("1000".to_string()),
             },
-            slippage_bps: 100,
+            slippage_bps: Some(100),
         }),
         action_timeout_at: now + chrono::Duration::minutes(10),
         idempotency_key: None,
@@ -6492,9 +6579,9 @@ async fn provider_operation_terminal_status_is_monotonic_against_stale_writes() 
         action: RouterOrderAction::MarketOrder(MarketOrderAction {
             order_kind: MarketOrderKind::ExactIn {
                 amount_in: "1000".to_string(),
-                min_amount_out: "1000".to_string(),
+                min_amount_out: Some("1000".to_string()),
             },
-            slippage_bps: 100,
+            slippage_bps: Some(100),
         }),
         action_timeout_at: now + chrono::Duration::minutes(10),
         idempotency_key: None,
@@ -6673,7 +6760,8 @@ async fn route_cost_refresh_persists_anchor_snapshots() {
         vec![],
         vec![],
     ));
-    let service = RouteCostService::new(db.clone(), action_providers);
+    let service =
+        RouteCostService::new(db.clone(), action_providers).with_pricing(fresh_test_pricing());
     let summary = service.refresh_anchor_costs().await.unwrap();
     let snapshots = db
         .route_costs()
@@ -6704,6 +6792,14 @@ async fn route_cost_refresh_persists_anchor_snapshots() {
     assert!(snapshots
         .iter()
         .all(|snapshot| snapshot.effective_cost_bps() < u64::MAX));
+}
+
+fn fresh_test_pricing() -> PricingSnapshot {
+    let now = Utc::now();
+    let mut pricing = PricingSnapshot::static_bootstrap(now);
+    pricing.source = "test_market_pricing".to_string();
+    pricing.expires_at = Some(now + chrono::Duration::minutes(10));
+    pricing
 }
 
 #[tokio::test]
@@ -6803,7 +6899,8 @@ async fn route_cost_refresh_samples_configured_bridge_providers() {
     let service = RouteCostService::new(
         db.clone(),
         Arc::new(ActionProviderRegistry::mock_http(mocks.base_url())),
-    );
+    )
+    .with_pricing(fresh_test_pricing());
 
     let summary = service.refresh_anchor_costs().await.unwrap();
     let snapshots = db
@@ -7033,7 +7130,7 @@ async fn quote_market_order_rejects_base_usdc_to_btc_below_operational_floor() {
             recipient_address: valid_regtest_btc_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -7078,7 +7175,7 @@ async fn quote_market_order_allows_base_usdc_to_btc_at_operational_floor() {
             recipient_address: valid_regtest_btc_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: snapshot.operational_min_input,
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -7133,7 +7230,7 @@ async fn quote_market_order_allows_btc_to_eth_at_operational_floor() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: snapshot.operational_min_input,
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -7175,7 +7272,7 @@ async fn quote_market_order_rejects_zero_amounts() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "0".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -7206,7 +7303,7 @@ async fn create_vault_with_order_id_links_generic_order_to_vault() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -7539,6 +7636,7 @@ async fn custody_action_executor_executes_evm_call_with_paymaster_gas() {
                 to_address: MOCK_ERC20_ADDRESS.to_string(),
                 value: "0".to_string(),
                 calldata: format!("0x{}", alloy::hex::encode(calldata.as_ref())),
+                broadcast_policy: Default::default(),
             })),
         })
         .await
@@ -7909,7 +8007,7 @@ async fn order_executor_executes_provider_custody_action_intent() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: amount_in.to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -7955,9 +8053,14 @@ async fn order_executor_executes_provider_custody_action_intent() {
         h.chain_registry.clone(),
     );
     let summary = execution_manager.process_worker_pass(10).await.unwrap();
+    for _ in 0..4 {
+        if db.orders().get(order.id).await.unwrap().status == RouterOrderStatus::Completed {
+            break;
+        }
+        execution_manager.process_worker_pass(10).await.unwrap();
+    }
 
     assert_eq!(summary.planned_orders, 1);
-    assert_eq!(summary.executed_orders, 1);
     let sink_after = provider.get_balance(deposit_sink).await.unwrap();
     assert_eq!(sink_after.saturating_sub(sink_before), amount_in);
     let order = db.orders().get(order.id).await.unwrap();
@@ -7997,7 +8100,7 @@ async fn provider_operations_store_protocol_addresses_outside_custody_vaults() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -8253,9 +8356,9 @@ async fn provider_addresses_are_scoped_to_execution_step_not_order_address() {
         action: RouterOrderAction::MarketOrder(MarketOrderAction {
             order_kind: MarketOrderKind::ExactIn {
                 amount_in: "1000".to_string(),
-                min_amount_out: "1000".to_string(),
+                min_amount_out: Some("1000".to_string()),
             },
-            slippage_bps: 100,
+            slippage_bps: Some(100),
         }),
         action_timeout_at: now + chrono::Duration::minutes(10),
         idempotency_key: None,
@@ -8440,7 +8543,7 @@ async fn market_order_route_planner_uses_direct_unit_when_source_is_unit_ingress
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -8576,7 +8679,7 @@ async fn execution_leg_rollup_ignores_superseded_failed_retry_actions() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -8644,6 +8747,7 @@ async fn execution_leg_rollup_ignores_superseded_failed_retry_actions() {
         actual_amount_out: None,
         started_at: Some(now),
         completed_at: Some(now),
+        provider_quote_expires_at: None,
         details: json!({}),
         usd_valuation: json!({}),
         created_at: now,
@@ -8783,7 +8887,7 @@ async fn execution_leg_rollup_uses_step_amount_when_provider_source_amount_is_de
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -8837,6 +8941,7 @@ async fn execution_leg_rollup_uses_step_amount_when_provider_source_amount_is_de
         actual_amount_out: None,
         started_at: None,
         completed_at: None,
+        provider_quote_expires_at: None,
         details: json!({}),
         usd_valuation: json!({}),
         created_at: now,
@@ -8932,7 +9037,7 @@ async fn execution_leg_rollup_uses_unit_deposit_source_amount_as_output_evidence
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -8986,6 +9091,7 @@ async fn execution_leg_rollup_uses_unit_deposit_source_amount_as_output_evidence
         actual_amount_out: None,
         started_at: None,
         completed_at: None,
+        provider_quote_expires_at: None,
         details: json!({}),
         usd_valuation: json!({}),
         created_at: now,
@@ -9090,6 +9196,7 @@ async fn execution_leg_rollup_uses_cctp_receive_source_credit_as_bridge_output()
         actual_amount_out: None,
         started_at: None,
         completed_at: None,
+        provider_quote_expires_at: None,
         details: json!({}),
         usd_valuation: json!({}),
         created_at: now,
@@ -9449,7 +9556,7 @@ async fn execution_leg_rollup_rejects_completed_leg_without_actual_amount_eviden
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -9503,6 +9610,7 @@ async fn execution_leg_rollup_rejects_completed_leg_without_actual_amount_eviden
         actual_amount_out: None,
         started_at: None,
         completed_at: None,
+        provider_quote_expires_at: None,
         details: json!({}),
         usd_valuation: json!({}),
         created_at: now,
@@ -9581,7 +9689,7 @@ async fn release_quote_after_vault_creation_failure_allows_order_retry() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -9595,7 +9703,6 @@ async fn release_quote_after_vault_creation_failure_allows_order_retry() {
         .create_order_from_quote(CreateOrderRequest {
             quote_id,
             refund_address: valid_evm_address(),
-            cancel_after: None,
             idempotency_key: None,
             metadata: json!({}),
         })
@@ -9605,7 +9712,6 @@ async fn release_quote_after_vault_creation_failure_allows_order_retry() {
         .create_order_from_quote(CreateOrderRequest {
             quote_id,
             refund_address: valid_evm_address(),
-            cancel_after: None,
             idempotency_key: None,
             metadata: json!({}),
         })
@@ -9631,7 +9737,6 @@ async fn release_quote_after_vault_creation_failure_allows_order_retry() {
         .create_order_from_quote(CreateOrderRequest {
             quote_id,
             refund_address: valid_evm_address(),
-            cancel_after: None,
             idempotency_key: None,
             metadata: json!({}),
         })
@@ -9673,7 +9778,7 @@ async fn create_order_from_quote_resumes_after_funding_vault_attached() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -9686,7 +9791,6 @@ async fn create_order_from_quote_resumes_after_funding_vault_attached() {
     let request = CreateOrderRequest {
         quote_id,
         refund_address,
-        cancel_after: None,
         idempotency_key: Some("retry-after-vault-attach".to_string()),
         metadata: json!({}),
     };
@@ -9720,7 +9824,9 @@ async fn create_order_from_quote_resumes_after_funding_vault_attached() {
 
 #[tokio::test]
 async fn expired_quote_cleanup_deletes_only_unassociated_quotes() {
-    let db = test_db().await;
+    let postgres = test_postgres().await;
+    let database_url = create_test_database(&postgres.admin_database_url).await;
+    let db = Database::connect(&database_url, 5, 1).await.unwrap();
     let now = Utc::now();
     let source_asset = DepositAsset {
         chain: ChainId::parse("evm:1").unwrap(),
@@ -9739,7 +9845,7 @@ async fn expired_quote_cleanup_deletes_only_unassociated_quotes() {
     let expired_associated = test_market_order_quote(
         source_asset.clone(),
         destination_asset.clone(),
-        now - chrono::Duration::minutes(5),
+        now + chrono::Duration::minutes(5),
     );
     let unexpired_unassociated = test_market_order_quote(
         source_asset.clone(),
@@ -9773,9 +9879,9 @@ async fn expired_quote_cleanup_deletes_only_unassociated_quotes() {
         action: RouterOrderAction::MarketOrder(MarketOrderAction {
             order_kind: MarketOrderKind::ExactIn {
                 amount_in: "1000".to_string(),
-                min_amount_out: "1000".to_string(),
+                min_amount_out: Some("1000".to_string()),
             },
-            slippage_bps: 100,
+            slippage_bps: Some(100),
         }),
         action_timeout_at: now + chrono::Duration::minutes(10),
         idempotency_key: None,
@@ -9786,6 +9892,13 @@ async fn expired_quote_cleanup_deletes_only_unassociated_quotes() {
     };
     db.orders()
         .create_market_order_from_quote(&order, expired_associated.id)
+        .await
+        .unwrap();
+    let mut conn = PgConnection::connect(&database_url).await.unwrap();
+    sqlx_core::query::query("UPDATE market_order_quotes SET expires_at = $1 WHERE order_id = $2")
+        .bind(now - chrono::Duration::minutes(5))
+        .bind(order.id)
+        .execute(&mut conn)
         .await
         .unwrap();
 
@@ -9837,7 +9950,7 @@ fn test_market_order_quote(
         amount_out: "1000".to_string(),
         min_amount_out: Some("1000".to_string()),
         max_amount_in: None,
-        slippage_bps: 100,
+        slippage_bps: Some(100),
         provider_quote: json!({ "test": "quote_cleanup" }),
         usd_valuation: json!({}),
         expires_at,
@@ -9867,7 +9980,7 @@ async fn market_order_route_planner_uses_across_only_when_unit_needs_ingress_bri
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -10013,7 +10126,7 @@ async fn market_order_route_planner_reserves_bitcoin_fee_for_unit_ingress() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -10117,7 +10230,7 @@ async fn market_order_route_planner_supports_cctp_to_hyperliquid_bridge_path() {
             recipient_address: valid_regtest_btc_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "6000000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -10293,7 +10406,7 @@ async fn provider_quotes_support_across_to_hyperliquid_bridge_path_under_mocks()
             destination_asset: arbitrum_usdc.clone(),
             order_kind: MarketOrderKind::ExactIn {
                 amount_in: "6000000".to_string(),
-                min_amount_out: "1".to_string(),
+                min_amount_out: Some("1".to_string()),
             },
             recipient_address: valid_evm_address(),
             depositor_address: valid_evm_address(),
@@ -10310,7 +10423,7 @@ async fn provider_quotes_support_across_to_hyperliquid_bridge_path_under_mocks()
             destination_asset: hyperliquid_usdc.clone(),
             order_kind: MarketOrderKind::ExactIn {
                 amount_in: across_quote.amount_out.clone(),
-                min_amount_out: across_quote.amount_out.clone(),
+                min_amount_out: Some(across_quote.amount_out.clone()),
             },
             recipient_address: valid_evm_address(),
             depositor_address: valid_evm_address(),
@@ -10329,7 +10442,7 @@ async fn provider_quotes_support_across_to_hyperliquid_bridge_path_under_mocks()
             output_decimals: None,
             order_kind: MarketOrderKind::ExactIn {
                 amount_in: hyperliquid_bridge_quote.amount_out.clone(),
-                min_amount_out: "1".to_string(),
+                min_amount_out: Some("1".to_string()),
             },
             sender_address: None,
             recipient_address: valid_regtest_btc_address(),
@@ -10367,7 +10480,7 @@ async fn market_order_planning_pass_materializes_direct_unit_and_matches_mock_un
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -10455,7 +10568,7 @@ async fn market_order_planning_pass_materializes_cctp_to_hyperliquid_bridge_and_
             recipient_address: valid_regtest_btc_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "6000000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -10682,7 +10795,7 @@ async fn market_order_planning_pass_materializes_across_to_unit_and_matches_mock
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -10803,7 +10916,7 @@ async fn market_order_planning_hydrates_destination_execution_custody_vault() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -10944,7 +11057,7 @@ async fn order_executor_completes_mock_across_unit_hyperliquid_flow() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -11064,7 +11177,7 @@ async fn order_executor_completes_base_eth_to_btc_cross_token_flow() {
             recipient_address: valid_regtest_btc_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: amount_in_wei.clone(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -11283,7 +11396,7 @@ async fn order_executor_completes_btc_to_eth_unit_hyperliquid_flow() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: amount_in_sats.clone(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -12574,7 +12687,7 @@ async fn order_executor_validates_chain_deposit_hint_before_next_step() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -12977,7 +13090,7 @@ async fn order_executor_retries_when_across_fails() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -13057,6 +13170,14 @@ async fn order_executor_retries_when_across_fails() {
         .error
         .to_string()
         .contains("mock across unavailable"));
+    assert!(
+        steps
+            .iter()
+            .filter(|step| step.execution_attempt_id == Some(attempts[0].id)
+                && step.step_index > across_step.step_index)
+            .all(|step| step.status == OrderExecutionStepStatus::Superseded),
+        "unexecuted failed-attempt steps should be marked superseded before retry"
+    );
     let retry_steps = db
         .orders()
         .get_execution_steps_for_attempt(attempts[1].id)
@@ -13068,6 +13189,33 @@ async fn order_executor_retries_when_across_fails() {
         OrderExecutionStepType::AcrossBridge
     );
     assert_eq!(retry_steps[0].status, OrderExecutionStepStatus::Planned);
+    let failed_legs = db
+        .orders()
+        .get_execution_legs_for_attempt(attempts[0].id)
+        .await
+        .unwrap();
+    let retry_legs = db
+        .orders()
+        .get_execution_legs_for_attempt(attempts[1].id)
+        .await
+        .unwrap();
+    let failed_leg_ids = failed_legs
+        .iter()
+        .map(|leg| leg.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    let retry_leg_ids = retry_legs
+        .iter()
+        .map(|leg| leg.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(!retry_leg_ids.is_empty());
+    assert!(
+        retry_leg_ids.is_disjoint(&failed_leg_ids),
+        "retry execution legs must preserve failed-attempt leg history instead of reusing leg ids"
+    );
+    assert!(retry_steps.iter().all(|step| {
+        step.execution_leg_id
+            .is_some_and(|leg_id| retry_leg_ids.contains(&leg_id))
+    }));
 }
 
 #[tokio::test]
@@ -14580,7 +14728,7 @@ async fn two_concurrent_worker_passes_drive_same_order_to_completion_exactly_onc
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -14715,7 +14863,7 @@ async fn two_concurrent_planning_passes_produce_single_destination_execution_vau
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -16347,7 +16495,7 @@ async fn vault_address_matches_deterministic_derivation_from_quote() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -16405,7 +16553,7 @@ async fn quote_envelope_never_exposes_deposit_address() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await

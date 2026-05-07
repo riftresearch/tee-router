@@ -57,7 +57,11 @@ const MARKET_ORDER_ACTION_TIMEOUT: ChronoDuration = ChronoDuration::minutes(10);
 // semantics.
 const LIMIT_ORDER_ACTION_TIMEOUT: ChronoDuration = ChronoDuration::days(3650);
 const MARKET_ORDER_PROVIDER_TIMEOUT: Duration = Duration::from_secs(10);
+// HyperCore charges one quote token when the destination HyperCore account is
+// not yet activated. Unit withdrawal protocol addresses are often fresh, so
+// quote paths that end with Hyperliquid -> Unit need to leave 1 USDC available.
 const HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW: u64 = 1_000_000;
+const HYPERLIQUID_CORE_ACTIVATION_FEE_RAW: u64 = HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW;
 const BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_INPUTS: usize = 2;
 const BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_OUTPUTS: usize = 2;
 const BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_BPS: u64 = 12_500;
@@ -499,10 +503,10 @@ impl OrderManager {
             recipient_address: quote.recipient_address.clone(),
             refund_address,
             action: RouterOrderAction::MarketOrder(MarketOrderAction {
-                order_kind: market_order_kind_from_quote(&quote)?,
+                order_kind: market_order_kind_from_quote(&quote),
                 slippage_bps: quote.slippage_bps,
             }),
-            action_timeout_at: (now + MARKET_ORDER_ACTION_TIMEOUT).min(quote.expires_at),
+            action_timeout_at: now + MARKET_ORDER_ACTION_TIMEOUT,
             idempotency_key: normalize_idempotency_key(request.idempotency_key.clone())?,
             workflow_trace_id: workflow_trace.trace_id,
             workflow_parent_span_id: workflow_trace.parent_span_id,
@@ -1047,12 +1051,12 @@ impl OrderManager {
                 recipient_address: request.recipient_address.clone(),
                 order_kind: MarketOrderQuoteKind::ExactOut {
                     amount_out: request.output_amount.clone(),
-                    slippage_bps: 0,
+                    slippage_bps: Some(0),
                 },
             };
             let suffix_order_kind = MarketOrderKind::ExactOut {
                 amount_out: request.output_amount.clone(),
-                max_amount_in: U256::MAX.to_string(),
+                max_amount_in: Some(U256::MAX.to_string()),
             };
             let quote = self
                 .compose_transition_path_quote(ComposeTransitionPathQuoteRequest {
@@ -1104,12 +1108,12 @@ impl OrderManager {
                     .quote_address_for_chain(quote_id, &limit_transition.input.asset.chain)?,
                 order_kind: MarketOrderQuoteKind::ExactOut {
                     amount_out: required_limit_input_amount.clone(),
-                    slippage_bps: 0,
+                    slippage_bps: Some(0),
                 },
             };
             let prefix_order_kind = MarketOrderKind::ExactOut {
                 amount_out: required_limit_input_amount,
-                max_amount_in: U256::MAX.to_string(),
+                max_amount_in: Some(U256::MAX.to_string()),
             };
             let quote = self
                 .compose_transition_path_quote(ComposeTransitionPathQuoteRequest {
@@ -1461,7 +1465,7 @@ impl OrderManager {
                                     destination_asset: transition.output.asset.clone(),
                                     order_kind: MarketOrderKind::ExactIn {
                                         amount_in: provider_amount_in.clone(),
-                                        min_amount_out: "1".to_string(),
+                                        min_amount_out: Some("1".to_string()),
                                     },
                                     recipient_address: self.bridge_quote_recipient_address(
                                         request, quote_id, path, index, transition,
@@ -1637,9 +1641,7 @@ impl OrderManager {
                                 amount_in: &provider_amount_in,
                                 amount_out: &provider_amount_in,
                                 expires_at,
-                                raw: json!({
-                                    "recipient_address": recipient_address,
-                                }),
+                                raw: unit_withdrawal_quote_raw(&recipient_address),
                             }));
                             cursor_amount = provider_amount_in;
                         }
@@ -1656,7 +1658,7 @@ impl OrderManager {
                     provider_id,
                     amount_in: amount_in.clone(),
                     amount_out: cursor_amount,
-                    min_amount_out: Some(min_amount_out.clone()),
+                    min_amount_out: min_amount_out.clone(),
                     max_amount_in: None,
                     provider_quote: transition_path_quote_blob(
                         path,
@@ -1690,9 +1692,7 @@ impl OrderManager {
                                 amount_in: &required_output,
                                 amount_out: &required_output,
                                 expires_at,
-                                raw: json!({
-                                    "recipient_address": recipient_address,
-                                }),
+                                raw: unit_withdrawal_quote_raw(&recipient_address),
                             }));
                         }
                         MarketOrderTransitionKind::HyperliquidTrade => {
@@ -1707,7 +1707,7 @@ impl OrderManager {
                             let max_in_cap = if index == 0 {
                                 max_amount_in.clone()
                             } else {
-                                practical_max_input_for_asset(&transition.input.asset)
+                                Some(practical_max_input_for_asset(&transition.input.asset))
                             };
                             let exchange_quote = quote_exchange(
                                 exchange.as_ref(),
@@ -1759,7 +1759,7 @@ impl OrderManager {
                             let max_in_cap = if index == 0 {
                                 max_amount_in.clone()
                             } else {
-                                practical_max_input_for_asset(&transition.input.asset)
+                                Some(practical_max_input_for_asset(&transition.input.asset))
                             };
                             let input_decimals = self
                                 .exchange_asset_decimals(&transition.input.asset)
@@ -1825,7 +1825,7 @@ impl OrderManager {
                             let max_input = if index == 0 {
                                 max_amount_in.clone()
                             } else {
-                                practical_max_input_for_asset(&transition.input.asset)
+                                Some(practical_max_input_for_asset(&transition.input.asset))
                             };
                             let bridge_quote = quote_bridge(
                                 bridge.as_ref(),
@@ -1906,7 +1906,7 @@ impl OrderManager {
                     amount_in: required_output,
                     amount_out: amount_out.clone(),
                     min_amount_out: None,
-                    max_amount_in: Some(max_amount_in.clone()),
+                    max_amount_in: max_amount_in.clone(),
                     provider_quote: transition_path_quote_blob(
                         path,
                         &legs,
@@ -2257,21 +2257,14 @@ impl OrderManager {
                         reason: "provider exact-in quote changed amount_in".to_string(),
                     });
                 }
-                let quoted_amount_out = parse_amount("amount_out", &quote.amount_out)?;
-                let requested_min_out = parse_amount(
-                    "min_amount_out",
-                    quote
-                        .min_amount_out
-                        .as_deref()
-                        .ok_or(MarketOrderError::InvalidAmount {
-                            field: "min_amount_out",
-                            reason: "exact-in quote is missing min_amount_out".to_string(),
-                        })?,
-                )?;
-                if quoted_amount_out < requested_min_out {
-                    return Err(MarketOrderError::NoRoute {
-                        reason: "provider exact-in quote is below min_amount_out".to_string(),
-                    });
+                if let Some(min_amount_out) = quote.min_amount_out.as_deref() {
+                    let quoted_amount_out = parse_amount("amount_out", &quote.amount_out)?;
+                    let requested_min_out = parse_amount("min_amount_out", min_amount_out)?;
+                    if quoted_amount_out < requested_min_out {
+                        return Err(MarketOrderError::NoRoute {
+                            reason: "provider exact-in quote is below min_amount_out".to_string(),
+                        });
+                    }
                 }
             }
             MarketOrderQuoteKind::ExactOut { amount_out, .. } => {
@@ -2280,21 +2273,14 @@ impl OrderManager {
                         reason: "provider exact-out quote changed amount_out".to_string(),
                     });
                 }
-                let quoted_amount_in = parse_amount("amount_in", &quote.amount_in)?;
-                let requested_max_in = parse_amount(
-                    "max_amount_in",
-                    quote
-                        .max_amount_in
-                        .as_deref()
-                        .ok_or(MarketOrderError::InvalidAmount {
-                            field: "max_amount_in",
-                            reason: "exact-out quote is missing max_amount_in".to_string(),
-                        })?,
-                )?;
-                if quoted_amount_in > requested_max_in {
-                    return Err(MarketOrderError::NoRoute {
-                        reason: "provider exact-out quote is above max_amount_in".to_string(),
-                    });
+                if let Some(max_amount_in) = quote.max_amount_in.as_deref() {
+                    let quoted_amount_in = parse_amount("amount_in", &quote.amount_in)?;
+                    let requested_max_in = parse_amount("max_amount_in", max_amount_in)?;
+                    if quoted_amount_in > requested_max_in {
+                        return Err(MarketOrderError::NoRoute {
+                            reason: "provider exact-out quote is above max_amount_in".to_string(),
+                        });
+                    }
                 }
             }
         }
@@ -2972,12 +2958,12 @@ fn practical_max_input_for_asset(_asset: &DepositAsset) -> String {
 fn transition_min_amount_out(
     path: &TransitionPath,
     index: usize,
-    final_min_amount_out: &str,
-) -> String {
+    final_min_amount_out: &Option<String>,
+) -> Option<String> {
     if index + 1 == path.transitions.len() {
-        final_min_amount_out.to_string()
+        final_min_amount_out.clone()
     } else {
-        "1".to_string()
+        Some("1".to_string())
     }
 }
 
@@ -3048,6 +3034,23 @@ fn add_hyperliquid_spot_send_quote_gas_reserve(
         .map(|amount| amount.to_string())
 }
 
+fn unit_withdrawal_quote_raw(recipient_address: &str) -> Value {
+    json!({
+        "recipient_address": recipient_address,
+        "hyperliquid_core_activation_fee": hyperliquid_core_activation_fee_quote_json(),
+    })
+}
+
+fn hyperliquid_core_activation_fee_quote_json() -> Value {
+    json!({
+        "kind": "first_transfer_to_new_hypercore_destination",
+        "quote_asset": "USDC",
+        "amount_raw": HYPERLIQUID_CORE_ACTIVATION_FEE_RAW.to_string(),
+        "amount_decimal": "1",
+        "source": "hyperliquid_activation_gas_fee",
+    })
+}
+
 fn choose_better_quote(
     request: &NormalizedMarketOrderQuoteRequest,
     candidate: ComposedMarketOrderQuote,
@@ -3087,7 +3090,7 @@ impl MarketOrderQuoteKind {
     }
 
     #[must_use]
-    fn slippage_bps(&self) -> u64 {
+    fn slippage_bps(&self) -> Option<u64> {
         match self {
             Self::ExactIn { slippage_bps, .. } | Self::ExactOut { slippage_bps, .. } => {
                 *slippage_bps
@@ -3099,11 +3102,11 @@ impl MarketOrderQuoteKind {
         match self {
             Self::ExactIn { amount_in, .. } => MarketOrderKind::ExactIn {
                 amount_in: amount_in.clone(),
-                min_amount_out: "1".to_string(),
+                min_amount_out: Some("1".to_string()),
             },
             Self::ExactOut { amount_out, .. } => MarketOrderKind::ExactOut {
                 amount_out: amount_out.clone(),
-                max_amount_in: PROBE_MAX_AMOUNT_IN.to_string(),
+                max_amount_in: Some(PROBE_MAX_AMOUNT_IN.to_string()),
             },
         }
     }
@@ -3118,48 +3121,37 @@ impl MarketOrderQuoteKind {
                 slippage_bps,
             } => Ok(MarketOrderKind::ExactIn {
                 amount_in: amount_in.clone(),
-                min_amount_out: apply_slippage_floor(
-                    "amount_out",
-                    &probe_quote.amount_out,
-                    *slippage_bps,
-                )?,
+                min_amount_out: slippage_bps
+                    .map(|slippage_bps| {
+                        apply_slippage_floor("amount_out", &probe_quote.amount_out, slippage_bps)
+                    })
+                    .transpose()?,
             }),
             Self::ExactOut {
                 amount_out,
                 slippage_bps,
             } => Ok(MarketOrderKind::ExactOut {
                 amount_out: amount_out.clone(),
-                max_amount_in: apply_slippage_ceiling(
-                    "amount_in",
-                    &probe_quote.amount_in,
-                    *slippage_bps,
-                )?,
+                max_amount_in: slippage_bps
+                    .map(|slippage_bps| {
+                        apply_slippage_ceiling("amount_in", &probe_quote.amount_in, slippage_bps)
+                    })
+                    .transpose()?,
             }),
         }
     }
 }
 
-fn market_order_kind_from_quote(quote: &MarketOrderQuote) -> MarketOrderResult<MarketOrderKind> {
+fn market_order_kind_from_quote(quote: &MarketOrderQuote) -> MarketOrderKind {
     match quote.order_kind {
-        MarketOrderKindType::ExactIn => Ok(MarketOrderKind::ExactIn {
+        MarketOrderKindType::ExactIn => MarketOrderKind::ExactIn {
             amount_in: quote.amount_in.clone(),
-            min_amount_out: quote.min_amount_out.clone().ok_or(
-                MarketOrderError::InvalidAmount {
-                    field: "min_amount_out",
-                    reason: "quote is missing min_amount_out".to_string(),
-                },
-            )?,
-        }),
-        MarketOrderKindType::ExactOut => Ok(MarketOrderKind::ExactOut {
+            min_amount_out: quote.min_amount_out.clone(),
+        },
+        MarketOrderKindType::ExactOut => MarketOrderKind::ExactOut {
             amount_out: quote.amount_out.clone(),
-            max_amount_in: quote
-                .max_amount_in
-                .clone()
-                .ok_or(MarketOrderError::InvalidAmount {
-                    field: "max_amount_in",
-                    reason: "quote is missing max_amount_in".to_string(),
-                })?,
-        }),
+            max_amount_in: quote.max_amount_in.clone(),
+        },
     }
 }
 
@@ -3170,14 +3162,18 @@ fn validate_market_order_quote_kind(order_kind: &MarketOrderQuoteKind) -> Market
             slippage_bps,
         } => {
             validate_positive_amount("amount_in", amount_in)?;
-            validate_slippage_bps(*slippage_bps)?;
+            if let Some(slippage_bps) = slippage_bps {
+                validate_slippage_bps(*slippage_bps)?;
+            }
         }
         MarketOrderQuoteKind::ExactOut {
             amount_out,
             slippage_bps,
         } => {
             validate_positive_amount("amount_out", amount_out)?;
-            validate_slippage_bps(*slippage_bps)?;
+            if let Some(slippage_bps) = slippage_bps {
+                validate_slippage_bps(*slippage_bps)?;
+            }
         }
     }
 
@@ -3396,7 +3392,7 @@ mod tests {
     fn exact_out_probe_uses_provider_parseable_max_input() {
         let probe = MarketOrderQuoteKind::ExactOut {
             amount_out: "1000".to_string(),
-            slippage_bps: 100,
+            slippage_bps: Some(100),
         }
         .probe_order_kind();
 
@@ -3404,6 +3400,7 @@ mod tests {
             panic!("exact-out quote request must produce exact-out probe");
         };
 
+        let max_amount_in = max_amount_in.expect("exact-out probe must have max input");
         assert_eq!(max_amount_in, PROBE_MAX_AMOUNT_IN);
         assert!(max_amount_in.parse::<u128>().is_ok());
         assert_ne!(max_amount_in, U256::MAX.to_string());
@@ -3439,6 +3436,47 @@ mod tests {
         assert!(ceiling_error
             .to_string()
             .contains("slippage-adjusted amount overflowed"));
+    }
+
+    #[test]
+    fn bounded_order_kind_keeps_slippage_bounds_optional() {
+        let probe_quote = ComposedMarketOrderQuote {
+            provider_id: "test-provider".to_string(),
+            amount_in: "1000".to_string(),
+            amount_out: "2000".to_string(),
+            min_amount_out: None,
+            max_amount_in: None,
+            provider_quote: json!({}),
+            expires_at: Utc::now(),
+        };
+
+        let exact_in = MarketOrderQuoteKind::ExactIn {
+            amount_in: "1000".to_string(),
+            slippage_bps: None,
+        }
+        .bounded_order_kind(&probe_quote)
+        .unwrap();
+        assert!(matches!(
+            exact_in,
+            MarketOrderKind::ExactIn {
+                min_amount_out: None,
+                ..
+            }
+        ));
+
+        let exact_out = MarketOrderQuoteKind::ExactOut {
+            amount_out: "2000".to_string(),
+            slippage_bps: None,
+        }
+        .bounded_order_kind(&probe_quote)
+        .unwrap();
+        assert!(matches!(
+            exact_out,
+            MarketOrderKind::ExactOut {
+                max_amount_in: None,
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -79,7 +79,6 @@ describe('router gateway routes', () => {
       'refundAddress',
       'integrator',
       'idempotencyKey',
-      'cancelAfter',
       'refundMode',
       'refundAuthorizer',
       'amountFormat'
@@ -93,7 +92,6 @@ describe('router gateway routes', () => {
       'fromAmount',
       'toAmount',
       'price',
-      'expiration',
       'refundAddress',
       'refundMode',
       'refundAuthorizer',
@@ -382,7 +380,6 @@ describe('router gateway routes', () => {
         from: 'Bitcoin.BTC',
         to: 'Ethereum.USDC',
         toAddress: TO_ADDRESS,
-        fromAmount: '1',
         amountFormat: 'readable'
       })
     })
@@ -390,13 +387,13 @@ describe('router gateway routes', () => {
 
     expect(response.status).toBe(400)
     expect(body.error.code).toBe('VALIDATION_ERROR')
-    expect(body.error.message).toBe('maxSlippage is required for market orders')
+    expect(body.error.message).toBe('exactly one of fromAmount or toAmount is required')
     expect(body.error.details).toEqual({
       target: 'json',
       issues: [
         {
-          path: 'maxSlippage',
-          message: 'maxSlippage is required for market orders'
+          path: 'fromAmount',
+          message: 'exactly one of fromAmount or toAmount is required'
         }
       ]
     })
@@ -644,7 +641,7 @@ describe('router gateway routes', () => {
     expect(calls).toHaveLength(0)
   })
 
-  test('rejects oversized market-order cancelAfter before routing upstream', async () => {
+  test('rejects market-order cancelAfter before routing upstream', async () => {
     const calls: RecordedCall[] = []
     const app = createApp(testConfig(), {
       fetch: mockFetch(calls, async () => Response.json({ message: 'unexpected' }))
@@ -659,7 +656,7 @@ describe('router gateway routes', () => {
         fromAddress: FROM_ADDRESS,
         toAddress: TO_ADDRESS,
         refundAuthorizer: REFUND_ACCOUNT.address,
-        cancelAfter: `${'2026-05-05T00:00:00.000Z'}${'0'.repeat(65)}`
+        cancelAfter: '2026-05-05T00:00:00.000Z'
       })
     })
 
@@ -833,10 +830,15 @@ describe('router gateway routes', () => {
     expect(calls).toHaveLength(0)
   })
 
-  test('requires maxSlippage for market quotes before routing upstream', async () => {
+  test('allows market quotes without maxSlippage', async () => {
     const calls: RecordedCall[] = []
     const app = createApp(testConfig(), {
-      fetch: mockFetch(calls, async () => Response.json({ message: 'unexpected' }))
+      fetch: mockFetch(calls, async () => {
+        const quote = internalQuote()
+        quote.quote.payload.min_amount_out = null as any
+        quote.quote.payload.slippage_bps = null as any
+        return Response.json(quote, { status: 201 })
+      })
     })
 
     const response = await app.request('/quote', {
@@ -852,9 +854,15 @@ describe('router gateway routes', () => {
     })
     const body = await response.json()
 
-    expect(response.status).toBe(400)
-    expect(body.error.message).toContain('maxSlippage is required for market orders')
-    expect(calls).toHaveLength(0)
+    expect(response.status).toBe(201)
+    expect(calls[0]?.body).toMatchObject({
+      type: 'market_order',
+      kind: 'exact_in',
+      amount_in: '100000000'
+    })
+    expect(calls[0]?.body).not.toHaveProperty('slippage_bps')
+    expect(body).not.toHaveProperty('maxSlippage')
+    expect(body).not.toHaveProperty('minOut')
   })
 
   test('rejects invalid EVM order refund addresses before creating orders', async () => {
@@ -1262,7 +1270,6 @@ describe('router gateway routes', () => {
   test('creates a market order and defaults refundAddress to fromAddress', async () => {
     const calls: RecordedCall[] = []
     const store = new InMemoryRefundAuthorizationStore()
-    const cancelAfter = '2026-05-05T00:05:00.000Z'
     const app = createApp(testConfig(), {
       refundAuthorizationService: testRefundAuthorizationService(store),
       fetch: mockFetch(calls, async (path) => {
@@ -1287,8 +1294,7 @@ describe('router gateway routes', () => {
         fromAddress: FROM_ADDRESS,
         toAddress: TO_ADDRESS,
         refundAuthorizer: REFUND_ACCOUNT.address,
-        integrator: 'partner-a',
-        cancelAfter
+        integrator: 'partner-a'
       })
     })
 
@@ -1298,7 +1304,6 @@ describe('router gateway routes', () => {
     expect(calls[1]?.body).toEqual({
       quote_id: QUOTE_ID,
       refund_address: FROM_ADDRESS,
-      cancel_after: cancelAfter,
       idempotency_key: IDEMPOTENCY_KEY,
       metadata: {
         integrator: 'partner-a',
@@ -1660,7 +1665,6 @@ describe('router gateway routes', () => {
         toAddress: TO_ADDRESS,
         fromAmount: '1.25',
         toAmount: '100000',
-        expiration: '2026-05-01T12:00:00Z',
         refundAuthorizer: REFUND_ACCOUNT.address,
         integrator: 'partner-a',
         idempotencyKey: IDEMPOTENCY_KEY
@@ -1687,7 +1691,6 @@ describe('router gateway routes', () => {
     expect(calls[1]?.body).toEqual({
       quote_id: LIMIT_QUOTE_ID,
       refund_address: FROM_ADDRESS,
-      cancel_after: '2026-05-01T12:00:00Z',
       idempotency_key: IDEMPOTENCY_KEY,
       metadata: {
         integrator: 'partner-a',

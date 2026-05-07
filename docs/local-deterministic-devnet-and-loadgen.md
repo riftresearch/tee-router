@@ -45,7 +45,8 @@ docker compose -f etc/compose.local-full.yml down
 - The load generator should support quote-only, order-only, create-and-fund,
   rate-limited, and concurrent order creation flows.
 - Funding behavior should be configurable so the dashboard can show
-  `pending_funding`, funded/executing, completed, failed, and delayed states.
+  `pending_funding`, funded/executing, completed, manual intervention, refund,
+  expired, and delayed states.
 - Forced provider outcomes belong in provider mock configuration/state, not in
   hidden devnet scenario commands.
 - The admin dashboard should read the replica and display router orders sorted

@@ -174,6 +174,18 @@ test('venue progress label stays empty for active funding deposit steps', async 
   expect(progressVenueLabel(order)).toBeUndefined()
 })
 
+test('venue progress count stays numeric when backend reports zero stages', async () => {
+  const { progressStageCountLabel } = await appHelpers()
+
+  expect(
+    progressStageCountLabel({
+      totalStages: 0,
+      completedStages: 0,
+      failedStages: 0
+    })
+  ).toBe('0/0')
+})
+
 test('venue progress label stays empty before first planned venue', async () => {
   const { progressVenueLabel } = await appHelpers()
   const order: OrderFirehoseRow = {

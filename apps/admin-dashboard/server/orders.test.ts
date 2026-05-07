@@ -113,6 +113,51 @@ test('fetchOrderFirehose derives summary progress from provider quote without ex
   })
 })
 
+test('fetchOrderFirehose preserves execution attempt ids on execution legs', async () => {
+  const now = new Date('2026-05-04T00:00:00.000Z')
+  const attemptId = '019e0000-0000-7000-8000-000000000001'
+  const pool = {
+    query: async () => {
+      return {
+        rows: [
+          orderRow({
+            execution_legs: [
+              {
+                id: 'leg-1',
+                executionAttemptId: attemptId,
+                transitionDeclId: 'transition-1',
+                legIndex: 0,
+                legType: 'cctp_bridge',
+                provider: 'cctp',
+                status: 'completed',
+                input: {
+                  chainId: 'evm:8453',
+                  assetId: 'usdc'
+                },
+                output: {
+                  chainId: 'evm:42161',
+                  assetId: 'usdc'
+                },
+                amountIn: '10000000',
+                expectedAmountOut: '10000000',
+                startedAt: now.toISOString(),
+                completedAt: now.toISOString(),
+                createdAt: now.toISOString(),
+                updatedAt: now.toISOString(),
+                details: {}
+              }
+            ]
+          })
+        ]
+      }
+    }
+  } as unknown as Pool
+
+  const [order] = await fetchOrderFirehose(pool, 10)
+
+  expect(order.executionLegs[0]?.executionAttemptId).toBe(attemptId)
+})
+
 test('fetchOrderFirehose rejects malformed JSON aggregate strings', async () => {
   const pool = {
     query: async () => {

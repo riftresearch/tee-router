@@ -38,6 +38,7 @@ import type {
   OrderExecutionStep,
   OrderFirehoseRow,
   OrderMetrics,
+  OrderProgress,
   OrderTypeFilter,
   UsdAmountValuation,
   UsdValuation,
@@ -54,7 +55,13 @@ const MAX_VOLUME_CHART_BUCKETS = 1500
 const WAIT_FOR_DEPOSIT_STEP_TYPE = 'wait_for_deposit'
 const ACTIVE_STEP_STATUSES = new Set(['ready', 'running', 'waiting', 'submitted'])
 const FAILED_STEP_STATUSES = new Set(['failed', 'cancelled'])
-const TERMINAL_STEP_STATUSES = new Set(['completed', 'failed', 'skipped', 'cancelled'])
+const TERMINAL_STEP_STATUSES = new Set([
+  'completed',
+  'failed',
+  'skipped',
+  'cancelled',
+  'superseded'
+])
 type StatusTone = 'success' | 'danger' | 'active' | 'waiting' | 'neutral'
 type StatusDisplay = {
   label: string
@@ -1605,14 +1612,14 @@ function ProgressCell({ order }: { order: OrderFirehoseRow }) {
           }}
         />
       </div>
-      <span>
-        {progress.totalStages === 0
-          ? 'No stages'
-          : `${progress.completedStages}/${progress.totalStages}`}
-      </span>
+      <span>{progressStageCountLabel(progress)}</span>
       {activeVenue ? <em>{activeVenue}</em> : null}
     </div>
   )
+}
+
+export function progressStageCountLabel(progress: OrderProgress) {
+  return `${progress.completedStages}/${progress.totalStages}`
 }
 
 function OrderDetails({ order }: { order: OrderFirehoseRow }) {
@@ -1626,6 +1633,7 @@ function OrderDetails({ order }: { order: OrderFirehoseRow }) {
 
 type TimelineLeg = {
   key: string
+  executionAttemptId?: string
   index: number
   provider: string
   kind: string
@@ -1804,6 +1812,11 @@ function TimelineLegItem({ leg }: { leg: TimelineLeg }) {
         </div>
         <div className="timeline-card-footer">
           <div className="timeline-card-summary">
+            {leg.executionAttemptId ? (
+              <span className="timeline-reference">
+                Attempt <code title={leg.executionAttemptId}>{shortId(leg.executionAttemptId)}</code>
+              </span>
+            ) : null}
             {primaryDelta ? <DeltaPill delta={primaryDelta} /> : null}
             <TimelineGuardrails leg={leg} />
           </div>
@@ -2112,6 +2125,8 @@ function OrderMetadataPanel({ order }: { order: OrderFirehoseRow }) {
         <dd>
           <code title={order.quoteId}>{order.quoteId ?? 'none'}</code>
         </dd>
+        <dt>Slippage</dt>
+        <dd>{formatSlippageBps(order.slippageBps)}</dd>
         <dt>Trace</dt>
         <dd>
           <code title={order.workflowTraceId}>{order.workflowTraceId ?? 'none'}</code>
@@ -2119,6 +2134,15 @@ function OrderMetadataPanel({ order }: { order: OrderFirehoseRow }) {
       </dl>
     </div>
   )
+}
+
+function formatSlippageBps(slippageBps: string | undefined) {
+  if (slippageBps === undefined) return 'none'
+  if (!/^\d+$/.test(slippageBps)) return slippageBps
+  const bps = BigInt(slippageBps)
+  const whole = bps / 100n
+  const fraction = (bps % 100n).toString().padStart(2, '0')
+  return `${whole}.${fraction}% (${slippageBps} bps)`
 }
 
 function StreamBadge({
@@ -2307,6 +2331,7 @@ export function timelineLegs(order: OrderFirehoseRow): TimelineLeg[] {
         const executedOutput = leg.actualAmountOut
         return {
           key: leg.id,
+          executionAttemptId: leg.executionAttemptId,
           index: leg.legIndex,
           provider: leg.provider,
           kind: leg.legType,
@@ -3265,6 +3290,7 @@ export function statusDisplay(status: string): StatusDisplay {
 
 function statusTone(status: string): StatusTone {
   if (['completed', 'processed', 'skipped'].includes(status)) return 'success'
+  if (status === 'superseded') return 'neutral'
   if (
     [
       'failed',

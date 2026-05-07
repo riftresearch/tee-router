@@ -1397,9 +1397,12 @@ async fn wait_for_terminal_order_status(
         matches!(
             order.status,
             RouterOrderStatus::Completed
-                | RouterOrderStatus::Failed
+                | RouterOrderStatus::Expired
+                | RouterOrderStatus::RefundRequired
                 | RouterOrderStatus::Refunding
                 | RouterOrderStatus::Refunded
+                | RouterOrderStatus::ManualInterventionRequired
+                | RouterOrderStatus::RefundManualInterventionRequired
         )
         .then_some(order.status)
     })

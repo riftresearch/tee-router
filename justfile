@@ -105,3 +105,10 @@ router-loadgen-limit count='100' concurrency='8' rps='5' min_raw_amount='1000000
       --devnet-manifest-url http://localhost:50108/manifest.json \
       --bitcoin-rpc-url http://localhost:50100/wallet/alice \
       --bitcoin-rpc-auth devnet:devnet
+
+# Inspect test-wallet balances across local EVM chains, Hyperliquid, and Bitcoin.
+# Examples:
+#   just wallet-balance --address 0x1111111111111111111111111111111111111111
+#   just wallet-balance --address bcrt1... --skip-evm --skip-hyperliquid
+wallet-balance +args:
+    cargo run -p devnet --bin wallet-balance -- {{args}}

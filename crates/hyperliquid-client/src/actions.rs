@@ -178,6 +178,55 @@ impl Eip712 for SpotSend {
     }
 }
 
+/// Generalized spot/perp asset transfer. This supersedes `spotSend` for
+/// unified-account users and is required for sending spot assets when account
+/// abstraction is active.
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SendAsset {
+    #[serde(
+        serialize_with = "serialize_chain_id_hex",
+        deserialize_with = "deserialize_chain_id"
+    )]
+    pub signature_chain_id: u64,
+    pub hyperliquid_chain: String,
+    pub destination: String,
+    pub source_dex: String,
+    pub destination_dex: String,
+    pub token: String,
+    pub amount: String,
+    pub from_sub_account: String,
+    pub nonce: u64,
+}
+
+impl Eip712 for SendAsset {
+    fn domain(&self) -> Eip712Domain {
+        eip712_domain! {
+            name: "HyperliquidSignTransaction",
+            version: "1",
+            chain_id: self.signature_chain_id,
+            verifying_contract: Address::ZERO,
+        }
+    }
+
+    fn struct_hash(&self) -> B256 {
+        let items = (
+            keccak256(
+                "HyperliquidTransaction:SendAsset(string hyperliquidChain,string destination,string sourceDex,string destinationDex,string token,string amount,string fromSubAccount,uint64 nonce)",
+            ),
+            keccak256(&self.hyperliquid_chain),
+            keccak256(&self.destination),
+            keccak256(&self.source_dex),
+            keccak256(&self.destination_dex),
+            keccak256(&self.token),
+            keccak256(&self.amount),
+            keccak256(&self.from_sub_account),
+            self.nonce,
+        );
+        keccak256(items.abi_encode())
+    }
+}
+
 /// Transfer USDC between the perp clearinghouse and spot wallet. Bridge
 /// deposits land in the perp clearinghouse first; spot trading requires
 /// moving funds into the spot class when the account is not unified.

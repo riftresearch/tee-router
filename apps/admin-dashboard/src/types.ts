@@ -66,6 +66,7 @@ export type OrderExecutionActionAddresses = {
 
 export type OrderExecutionLeg = {
   id: string
+  executionAttemptId?: string
   transitionDeclId?: string
   legIndex: number
   legType: string

@@ -295,7 +295,7 @@ impl RouteCostService {
             destination_asset: transition.output.asset.clone(),
             order_kind: MarketOrderKind::ExactIn {
                 amount_in: amount_in.to_string(),
-                min_amount_out: "1".to_string(),
+                min_amount_out: Some("1".to_string()),
             },
             recipient_address: DUMMY_EVM_RECIPIENT.to_string(),
             depositor_address: DUMMY_EVM_DEPOSITOR.to_string(),

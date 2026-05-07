@@ -152,6 +152,28 @@ test('/api/orders rejects pagination cursors with non-canonical timestamps', asy
   }
 })
 
+test('/api/orders rejects retired lifecycle filters', async () => {
+  const consoleError = console.error
+  console.error = () => undefined
+  const runtime = createApp(
+    testConfig({
+      replicaDatabaseUrl: 'postgres://postgres:postgres@127.0.0.1:1/postgres',
+      cdcSlotName: `admin_dashboard_orders_cdc_filter_test_${Date.now()}`
+    })
+  )
+
+  try {
+    for (const filter of ['failed', 'manual_refund']) {
+      const response = await runtime.app.request(`/api/orders?filter=${filter}`)
+      expect(response.status).toBe(400)
+      expect(await response.json()).toEqual({ error: 'invalid_order_filter' })
+    }
+  } finally {
+    console.error = consoleError
+    await runtime.close()
+  }
+})
+
 test('order SSE queues lifecycle-filter removes that race with the initial snapshot', async () => {
   const controller = new AbortController()
   const orderId = '019df1c4-8d87-7c20-89a4-e76883e94a0f'

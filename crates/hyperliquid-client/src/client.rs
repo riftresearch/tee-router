@@ -19,8 +19,8 @@ use url::Url;
 
 use crate::{
     actions::{
-        Actions, BulkCancel, BulkOrder, CancelRequest, OrderRequest, ScheduleCancel, SpotSend,
-        UsdClassTransfer, Withdraw3,
+        Actions, BulkCancel, BulkOrder, CancelRequest, OrderRequest, ScheduleCancel, SendAsset,
+        SpotSend, UsdClassTransfer, Withdraw3,
     },
     bridge::{self, BridgeDepositTx},
     error::Error,
@@ -336,6 +336,37 @@ impl HyperliquidExchangeClient {
             .await
     }
 
+    /// Generalized spot/perp asset transfer. For spot-token transfers between
+    /// Hyperliquid users, use `source_dex="spot"` and `destination_dex="spot"`.
+    /// This is the account-abstraction-compatible replacement for `spotSend`.
+    pub async fn send_asset(
+        &self,
+        destination: String,
+        source_dex: String,
+        destination_dex: String,
+        token: String,
+        amount: String,
+        time_ms: u64,
+    ) -> Result<serde_json::Value, Error> {
+        let payload = SendAsset {
+            signature_chain_id: self.network.signature_chain_id(),
+            hyperliquid_chain: self.network.hyperliquid_chain().to_string(),
+            destination,
+            source_dex,
+            destination_dex,
+            token,
+            amount,
+            from_sub_account: self
+                .vault_address
+                .map(|vault_address| format!("{vault_address:#x}"))
+                .unwrap_or_default(),
+            nonce: time_ms,
+        };
+        let signature = sign_typed_data(&payload, &self.wallet)?;
+        self.post_user_action(&payload, "sendAsset", signature, time_ms)
+            .await
+    }
+
     /// Move USDC between Hyperliquid's perp clearinghouse and spot wallet.
     /// `to_perp=false` moves withdrawable margin into spot; `to_perp=true`
     /// moves spot USDC back into the perp clearinghouse.
@@ -646,6 +677,27 @@ impl HyperliquidClient {
     ) -> Result<serde_json::Value, Error> {
         self.exchange
             .spot_send(destination, token, amount, time_ms)
+            .await
+    }
+
+    pub async fn send_asset(
+        &self,
+        destination: String,
+        source_dex: String,
+        destination_dex: String,
+        token: String,
+        amount: String,
+        time_ms: u64,
+    ) -> Result<serde_json::Value, Error> {
+        self.exchange
+            .send_asset(
+                destination,
+                source_dex,
+                destination_dex,
+                token,
+                amount,
+                time_ms,
+            )
             .await
     }
 

@@ -2,6 +2,7 @@ pub mod across_client;
 pub mod action_providers;
 pub mod address_screening;
 pub mod asset_registry;
+mod bitcoin_funding;
 pub mod custody_action_executor;
 pub mod deposit_address;
 pub mod gas_reimbursement;

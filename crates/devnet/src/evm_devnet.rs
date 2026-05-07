@@ -28,7 +28,7 @@ use crate::{
     get_new_temp_dir,
     hyperliquid_bridge_mock::MockHyperliquidBridge2::MockHyperliquidBridge2Instance,
     manifest::DEVNET_ETHEREUM_RPC_PORT,
-    token_indexerd::TokenIndexerInstance,
+    token_indexerd::{TokenIndexerConfig, TokenIndexerInstance},
     velora_mock::MockVeloraSwap::MockVeloraSwapInstance,
     RiftDevnetCache,
 };
@@ -74,18 +74,30 @@ pub enum Mode {
     Local,
 }
 
+pub struct EthDevnetSetup {
+    pub deploy_mode: Mode,
+    pub devnet_cache: Option<Arc<RiftDevnetCache>>,
+    pub token_indexer_database_url: Option<String>,
+    pub token_indexer_api_key: Option<String>,
+    pub interactive: bool,
+    pub chain_id: u64,
+    pub port: Option<u16>,
+    pub token_indexer_port: Option<u16>,
+}
+
 impl EthDevnet {
     /// Spawns Anvil, deploys the EVM contracts, returns `(Self, deployment_block_number)`.
-    pub async fn setup(
-        deploy_mode: Mode,
-        devnet_cache: Option<Arc<RiftDevnetCache>>,
-        token_indexer_database_url: Option<String>,
-        token_indexer_api_key: Option<String>,
-        interactive: bool,
-        chain_id: u64,
-        port: Option<u16>,
-        token_indexer_port: Option<u16>,
-    ) -> Result<Self> {
+    pub async fn setup(config: EthDevnetSetup) -> Result<Self> {
+        let EthDevnetSetup {
+            deploy_mode,
+            devnet_cache,
+            token_indexer_database_url,
+            token_indexer_api_key,
+            interactive,
+            chain_id,
+            port,
+            token_indexer_port,
+        } = config;
         let (anvil, anvil_datadir, anvil_dump_path, anvil_cache_path) = spawn_anvil(
             interactive,
             deploy_mode.clone(),
@@ -124,17 +136,19 @@ impl EthDevnet {
             let api_key = token_indexer_api_key.clone().ok_or_else(|| {
                 eyre!("token indexer API key is required when token indexer is enabled")
             })?;
+            let anvil_rpc_url = anvil.endpoint_url().to_string();
+            let anvil_ws_url = anvil.ws_endpoint_url().to_string();
             Some(
-                TokenIndexerInstance::new(
+                TokenIndexerInstance::new(TokenIndexerConfig {
                     interactive,
-                    anvil.endpoint_url().to_string().as_str(),
-                    anvil.ws_endpoint_url().to_string().as_str(),
-                    false,
-                    anvil.chain_id(),
+                    rpc_url: anvil_rpc_url.as_str(),
+                    ws_url: anvil_ws_url.as_str(),
+                    pipe_output: false,
+                    chain_id: anvil.chain_id(),
                     database_url,
                     api_key,
-                    token_indexer_port,
-                )
+                    interactive_port: token_indexer_port,
+                })
                 .await?,
             )
         } else {

@@ -229,7 +229,7 @@ async fn probe_route(
             destination_asset: unit_ingress_asset.clone(),
             order_kind: MarketOrderKind::ExactIn {
                 amount_in: amount_in.clone(),
-                min_amount_out: "1".to_string(),
+                min_amount_out: Some("1".to_string()),
             },
             recipient_address: format!("{source_address:#x}"),
             depositor_address: format!("{source_address:#x}"),
@@ -260,7 +260,7 @@ async fn probe_route(
             destination_asset: exchange_input_asset.clone(),
             order_kind: MarketOrderKind::ExactIn {
                 amount_in: across_quote.amount_out.clone(),
-                min_amount_out: across_quote.amount_out.clone(),
+                min_amount_out: Some(across_quote.amount_out.clone()),
             },
             recipient_address: format!("{source_address:#x}"),
             depositor_address: format!("{source_address:#x}"),
@@ -286,7 +286,7 @@ async fn probe_route(
             output_decimals: None,
             order_kind: MarketOrderKind::ExactIn {
                 amount_in: bridge_quote.amount_out.clone(),
-                min_amount_out: "1".to_string(),
+                min_amount_out: Some("1".to_string()),
             },
             sender_address: None,
             recipient_address: recipient_address.to_string(),

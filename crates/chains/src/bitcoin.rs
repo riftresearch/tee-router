@@ -277,142 +277,6 @@ fn checked_add_sats(left: u64, right: u64, context: &'static str) -> Result<u64>
         .ok_or(crate::Error::NumericOverflow { context })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn limited_body_chunk_rejects_oversized_append_without_mutating() {
-        let mut body = b"abcd".to_vec();
-
-        assert!(!append_limited_body_chunk(&mut body, b"ef", 5));
-        assert_eq!(body, b"abcd");
-    }
-
-    #[test]
-    fn limited_body_chunk_accepts_exact_limit() {
-        let mut body = b"abcd".to_vec();
-
-        assert!(append_limited_body_chunk(&mut body, b"ef", 6));
-        assert_eq!(body, b"abcdef");
-    }
-
-    #[test]
-    fn response_body_preview_marks_truncated_large_bodies() {
-        let body = vec![b'a'; BITCOIN_RPC_ERROR_BODY_PREVIEW_BYTES + 1];
-
-        let preview = response_body_preview(&body);
-
-        assert_eq!(
-            preview.len(),
-            BITCOIN_RPC_ERROR_BODY_PREVIEW_BYTES + "...<truncated>".len()
-        );
-        assert!(preview.ends_with("...<truncated>"));
-    }
-
-    #[test]
-    fn bitcoin_rpc_target_debug_redacts_url_credentials() {
-        let url = Url::parse(
-            "http://rpc-user:rpc-pass@bitcoin.example:18443/wallet/path-secret?token=query-secret#fragment-secret",
-        )
-        .expect("url");
-
-        let redacted = redacted_url_for_debug(&url);
-
-        assert_eq!(
-            redacted,
-            "http://bitcoin.example:18443/<redacted-path>?<redacted-query>#<redacted-fragment>"
-        );
-        assert!(!redacted.contains("rpc-user"));
-        assert!(!redacted.contains("rpc-pass"));
-        assert!(!redacted.contains("path-secret"));
-        assert!(!redacted.contains("query-secret"));
-        assert!(!redacted.contains("fragment-secret"));
-    }
-
-    #[test]
-    fn bitcoin_fee_estimate_rejects_overflow() {
-        let error = bitcoin_p2wpkh_transfer_fee_sats(u64::MAX, 1, 1).unwrap_err();
-
-        assert!(matches!(
-            error,
-            crate::Error::NumericOverflow { context } if context == "bitcoin fee sats"
-        ));
-    }
-
-    #[test]
-    fn bitcoin_satoshi_sum_rejects_overflow() {
-        let error = sum_sats([u64::MAX, 1], "test sats").unwrap_err();
-
-        assert!(matches!(
-            error,
-            crate::Error::NumericOverflow { context } if context == "test sats"
-        ));
-    }
-
-    #[test]
-    fn bitcoin_fee_rate_conversion_rejects_invalid_rpc_values() {
-        assert_eq!(fee_rate_btc_per_kb_to_sat_per_vb(0.00001).unwrap(), 1);
-        assert_eq!(fee_rate_btc_per_kb_to_sat_per_vb(0.00001001).unwrap(), 2);
-
-        assert!(fee_rate_btc_per_kb_to_sat_per_vb(0.0).is_err());
-        assert!(fee_rate_btc_per_kb_to_sat_per_vb(f64::NAN).is_err());
-        assert!(fee_rate_btc_per_kb_to_sat_per_vb(f64::INFINITY).is_err());
-    }
-
-    #[test]
-    fn bitcoin_inclusion_height_uses_checked_chain_length_math() {
-        assert_eq!(bitcoin_inclusion_height(100, 1).unwrap(), 100);
-        assert_eq!(bitcoin_inclusion_height(100, 101).unwrap(), 0);
-    }
-
-    #[test]
-    fn bitcoin_inclusion_height_rejects_impossible_confirmations() {
-        let error = bitcoin_inclusion_height(100, 102).unwrap_err();
-
-        assert!(matches!(
-            error,
-            crate::Error::NumericOverflow { context } if context == "bitcoin inclusion height"
-        ));
-    }
-
-    #[test]
-    fn bitcoin_output_index_rejects_values_outside_vout_range() {
-        assert_eq!(bitcoin_output_index(0), Some(0));
-        assert_eq!(
-            bitcoin_output_index(u64::from(u32::MAX)),
-            usize::try_from(u32::MAX).ok()
-        );
-        assert_eq!(bitcoin_output_index(u64::from(u32::MAX) + 1), None);
-    }
-
-    #[test]
-    fn checked_bitcoin_address_accepts_configured_network() {
-        let secret_key = SecretKey::from_slice(&[1_u8; 32]).expect("valid secret key");
-        let private_key = PrivateKey::new(secret_key, Network::Regtest);
-        let public_key = compressed_public_key_for(&private_key).expect("public key");
-        let address = Address::p2wpkh(&public_key, Network::Regtest).to_string();
-
-        assert!(parse_bitcoin_address_for_network(&address, Network::Regtest).is_ok());
-    }
-
-    #[test]
-    fn checked_bitcoin_address_rejects_wrong_network() {
-        let secret_key = SecretKey::from_slice(&[1_u8; 32]).expect("valid secret key");
-        let private_key = PrivateKey::new(secret_key, Network::Bitcoin);
-        let public_key = compressed_public_key_for(&private_key).expect("public key");
-        let address = Address::p2wpkh(&public_key, Network::Bitcoin).to_string();
-
-        let error =
-            parse_bitcoin_address_for_network(&address, Network::Regtest).expect_err("network");
-
-        assert!(
-            error.to_string().contains("Invalid address format"),
-            "{error}"
-        );
-    }
-}
-
 fn record_bitcoin_rpc_request(rpc_method: &'static str, success: bool, duration: Duration) {
     let status = if success { "success" } else { "error" };
     counter!(
@@ -726,6 +590,205 @@ impl BitcoinChain {
             })?;
 
         Ok(accepted.first().is_some_and(|result| result.allowed))
+    }
+
+    async fn spendable_output_from_outpoint(
+        &self,
+        sender_address: &Address,
+        tx_hash: &str,
+        vout: u32,
+        expected_amount_sats: u64,
+    ) -> Result<BitcoinSpendableOutput> {
+        let txid = bitcoin::Txid::from_str(tx_hash).map_err(|e| {
+            crate::Error::TransactionDeserializationFailed {
+                context: format!("Failed to parse bitcoin txid {tx_hash}: {e}"),
+                loc: location!(),
+            }
+        })?;
+        let tx_out = self
+            .rpc_client
+            .get_tx_out(&txid, vout, Some(true))
+            .await
+            .map_err(|e| crate::Error::BitcoinRpcError {
+                source: e,
+                loc: location!(),
+            })?;
+        if tx_out.is_none() {
+            return Err(crate::Error::DumpToAddress {
+                message: format!("Observed bitcoin outpoint {txid}:{vout} is not spendable"),
+            });
+        }
+
+        let full_tx = self.raw_transaction(&txid).await?;
+        let output_index =
+            bitcoin_output_index(u64::from(vout)).ok_or_else(|| crate::Error::DumpToAddress {
+                message: format!("Transaction {txid} missing vout {vout}"),
+            })?;
+        let output = full_tx.output.get(output_index).cloned().ok_or_else(|| {
+            crate::Error::DumpToAddress {
+                message: format!("Transaction {txid} missing vout {vout}"),
+            }
+        })?;
+        if output.value.to_sat() != expected_amount_sats {
+            return Err(crate::Error::DumpToAddress {
+                message: format!(
+                    "Observed bitcoin outpoint {txid}:{vout} amount {} did not match expected {expected_amount_sats}",
+                    output.value.to_sat()
+                ),
+            });
+        }
+        if output.script_pubkey != sender_address.script_pubkey() {
+            return Err(crate::Error::DumpToAddress {
+                message: format!(
+                    "Observed bitcoin outpoint {txid}:{vout} does not pay the signer address"
+                ),
+            });
+        }
+
+        Ok(BitcoinSpendableOutput {
+            txid,
+            vout,
+            full_tx,
+            output,
+        })
+    }
+
+    pub async fn transfer_native_amount_from_outpoint(
+        &self,
+        private_key: &str,
+        recipient_address: &str,
+        amount: U256,
+        tx_hash: &str,
+        vout: u32,
+        expected_amount_sats: u64,
+    ) -> Result<String> {
+        let amount_sats = u256_to_u64_sats("amount", amount)?;
+        if amount_sats == 0 {
+            return Err(crate::Error::DumpToAddress {
+                message: "amount must be positive".to_string(),
+            });
+        }
+
+        let private_key =
+            PrivateKey::from_wif(private_key).map_err(|e| crate::Error::DumpToAddress {
+                message: format!("Invalid signer private key: {e}"),
+            })?;
+        let recipient_address = parse_bitcoin_address_for_network(recipient_address, self.network)?;
+        let sender_address =
+            Address::p2wpkh(&compressed_public_key_for(&private_key)?, self.network);
+        let utxo = self
+            .spendable_output_from_outpoint(&sender_address, tx_hash, vout, expected_amount_sats)
+            .await?;
+
+        let total_in = utxo.value_sats();
+        let fee_sats = self.estimate_p2wpkh_transfer_fee_sats(1, 2).await?;
+        let required_sats =
+            amount_sats
+                .checked_add(fee_sats)
+                .ok_or_else(|| crate::Error::DumpToAddress {
+                    message: format!(
+                        "Insufficient balance: amount {amount_sats} plus fee {fee_sats} overflows"
+                    ),
+                })?;
+        if total_in < required_sats {
+            return Err(crate::Error::InsufficientBalance {
+                required: U256::from(required_sats),
+                available: U256::from(total_in),
+            });
+        }
+
+        let descriptor = format!("wpkh({})", private_key.to_wif());
+        let mut temp_wallet = BdkWallet::create_with_params(
+            CreateParams::new_single(descriptor).network(self.network),
+        )
+        .map_err(|e| crate::Error::DumpToAddress {
+            message: format!("Failed to create temp wallet: {e}"),
+        })?;
+
+        let mut tx_builder = temp_wallet.build_tx();
+        tx_builder.manually_selected_only();
+        tx_builder.ordering(TxOrdering::Untouched);
+        tx_builder.add_recipient(
+            recipient_address.script_pubkey(),
+            Amount::from_sat(amount_sats),
+        );
+        tx_builder.fee_absolute(Amount::from_sat(fee_sats));
+
+        let psbt_input = bdk_wallet::bitcoin::psbt::Input {
+            witness_utxo: Some(utxo.output.clone()),
+            non_witness_utxo: Some(utxo.full_tx.clone()),
+            ..Default::default()
+        };
+        let satisfaction_weight = bdk_wallet::bitcoin::Weight::from_wu(108);
+        tx_builder
+            .add_foreign_utxo(
+                OutPoint::new(utxo.txid, utxo.vout),
+                psbt_input,
+                satisfaction_weight,
+            )
+            .map_err(|e| crate::Error::DumpToAddress {
+                message: format!(
+                    "Failed to add foreign UTXO {}:{}: {e}",
+                    utxo.txid, utxo.vout
+                ),
+            })?;
+
+        let mut psbt = tx_builder
+            .finish()
+            .map_err(|e| crate::Error::DumpToAddress {
+                message: format!("Failed to build transaction: {e}"),
+            })?;
+        let finalized = temp_wallet
+            .sign(&mut psbt, SignOptions::default())
+            .map_err(|e| crate::Error::DumpToAddress {
+                message: format!("Failed to sign PSBT: {e}"),
+            })?;
+        if !finalized {
+            return Err(crate::Error::DumpToAddress {
+                message: "PSBT not fully finalized after signing".to_string(),
+            });
+        }
+
+        let tx = psbt.extract_tx().map_err(|e| crate::Error::DumpToAddress {
+            message: format!("Failed to extract transaction: {e}"),
+        })?;
+        let raw = bitcoin::consensus::serialize(&tx);
+        self.broadcast_signed_transaction(&hex::encode(raw)).await
+    }
+
+    pub async fn dump_to_address_from_outpoint(
+        &self,
+        token: &TokenIdentifier,
+        private_key: &str,
+        recipient_address: &str,
+        fee: U256,
+        tx_hash: &str,
+        vout: u32,
+        expected_amount_sats: u64,
+    ) -> Result<String> {
+        if token != &TokenIdentifier::Native {
+            return Err(crate::Error::DumpToAddress {
+                message: "Native token not supported".to_string(),
+            });
+        }
+        let private_key =
+            PrivateKey::from_wif(private_key).map_err(|e| crate::Error::DumpToAddress {
+                message: format!("Invalid signer private key: {e}"),
+            })?;
+        let recipient_address = parse_bitcoin_address_for_network(recipient_address, self.network)?;
+        let sender_address =
+            Address::p2wpkh(&compressed_public_key_for(&private_key)?, self.network);
+        let fee_sats = u256_to_u64_sats("fee", fee)?;
+        let utxo = self
+            .spendable_output_from_outpoint(&sender_address, tx_hash, vout, expected_amount_sats)
+            .await?;
+
+        self.build_signed_p2wpkh_sweep_from_outputs(
+            private_key,
+            recipient_address,
+            vec![utxo],
+            fee_sats,
+        )
     }
 
     async fn raw_transaction(&self, txid: &bitcoin::Txid) -> Result<Transaction> {
@@ -1439,5 +1502,141 @@ impl ChainOperations for BitcoinChain {
                 loc: location!(),
             })?
             .to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn limited_body_chunk_rejects_oversized_append_without_mutating() {
+        let mut body = b"abcd".to_vec();
+
+        assert!(!append_limited_body_chunk(&mut body, b"ef", 5));
+        assert_eq!(body, b"abcd");
+    }
+
+    #[test]
+    fn limited_body_chunk_accepts_exact_limit() {
+        let mut body = b"abcd".to_vec();
+
+        assert!(append_limited_body_chunk(&mut body, b"ef", 6));
+        assert_eq!(body, b"abcdef");
+    }
+
+    #[test]
+    fn response_body_preview_marks_truncated_large_bodies() {
+        let body = vec![b'a'; BITCOIN_RPC_ERROR_BODY_PREVIEW_BYTES + 1];
+
+        let preview = response_body_preview(&body);
+
+        assert_eq!(
+            preview.len(),
+            BITCOIN_RPC_ERROR_BODY_PREVIEW_BYTES + "...<truncated>".len()
+        );
+        assert!(preview.ends_with("...<truncated>"));
+    }
+
+    #[test]
+    fn bitcoin_rpc_target_debug_redacts_url_credentials() {
+        let url = Url::parse(
+            "http://rpc-user:rpc-pass@bitcoin.example:18443/wallet/path-secret?token=query-secret#fragment-secret",
+        )
+        .expect("url");
+
+        let redacted = redacted_url_for_debug(&url);
+
+        assert_eq!(
+            redacted,
+            "http://bitcoin.example:18443/<redacted-path>?<redacted-query>#<redacted-fragment>"
+        );
+        assert!(!redacted.contains("rpc-user"));
+        assert!(!redacted.contains("rpc-pass"));
+        assert!(!redacted.contains("path-secret"));
+        assert!(!redacted.contains("query-secret"));
+        assert!(!redacted.contains("fragment-secret"));
+    }
+
+    #[test]
+    fn bitcoin_fee_estimate_rejects_overflow() {
+        let error = bitcoin_p2wpkh_transfer_fee_sats(u64::MAX, 1, 1).unwrap_err();
+
+        assert!(matches!(
+            error,
+            crate::Error::NumericOverflow { context } if context == "bitcoin fee sats"
+        ));
+    }
+
+    #[test]
+    fn bitcoin_satoshi_sum_rejects_overflow() {
+        let error = sum_sats([u64::MAX, 1], "test sats").unwrap_err();
+
+        assert!(matches!(
+            error,
+            crate::Error::NumericOverflow { context } if context == "test sats"
+        ));
+    }
+
+    #[test]
+    fn bitcoin_fee_rate_conversion_rejects_invalid_rpc_values() {
+        assert_eq!(fee_rate_btc_per_kb_to_sat_per_vb(0.00001).unwrap(), 1);
+        assert_eq!(fee_rate_btc_per_kb_to_sat_per_vb(0.00001001).unwrap(), 2);
+
+        assert!(fee_rate_btc_per_kb_to_sat_per_vb(0.0).is_err());
+        assert!(fee_rate_btc_per_kb_to_sat_per_vb(f64::NAN).is_err());
+        assert!(fee_rate_btc_per_kb_to_sat_per_vb(f64::INFINITY).is_err());
+    }
+
+    #[test]
+    fn bitcoin_inclusion_height_uses_checked_chain_length_math() {
+        assert_eq!(bitcoin_inclusion_height(100, 1).unwrap(), 100);
+        assert_eq!(bitcoin_inclusion_height(100, 101).unwrap(), 0);
+    }
+
+    #[test]
+    fn bitcoin_inclusion_height_rejects_impossible_confirmations() {
+        let error = bitcoin_inclusion_height(100, 102).unwrap_err();
+
+        assert!(matches!(
+            error,
+            crate::Error::NumericOverflow { context } if context == "bitcoin inclusion height"
+        ));
+    }
+
+    #[test]
+    fn bitcoin_output_index_rejects_values_outside_vout_range() {
+        assert_eq!(bitcoin_output_index(0), Some(0));
+        assert_eq!(
+            bitcoin_output_index(u64::from(u32::MAX)),
+            usize::try_from(u32::MAX).ok()
+        );
+        assert_eq!(bitcoin_output_index(u64::from(u32::MAX) + 1), None);
+    }
+
+    #[test]
+    fn checked_bitcoin_address_accepts_configured_network() {
+        let secret_key = SecretKey::from_slice(&[1_u8; 32]).expect("valid secret key");
+        let private_key = PrivateKey::new(secret_key, Network::Regtest);
+        let public_key = compressed_public_key_for(&private_key).expect("public key");
+        let address = Address::p2wpkh(&public_key, Network::Regtest).to_string();
+
+        assert!(parse_bitcoin_address_for_network(&address, Network::Regtest).is_ok());
+    }
+
+    #[test]
+    fn checked_bitcoin_address_rejects_wrong_network() {
+        let secret_key = SecretKey::from_slice(&[1_u8; 32]).expect("valid secret key");
+        let private_key = PrivateKey::new(secret_key, Network::Bitcoin);
+        let public_key = compressed_public_key_for(&private_key).expect("public key");
+        let address = Address::p2wpkh(&public_key, Network::Bitcoin).to_string();
+
+        let error =
+            parse_bitcoin_address_for_network(&address, Network::Regtest).expect_err("network");
+
+        assert!(
+            error.to_string().contains("Invalid address format"),
+            "{error}"
+        );
     }
 }

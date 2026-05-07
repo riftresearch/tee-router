@@ -442,6 +442,10 @@ impl HyperUnitClient {
         self.get_json(&path).await
     }
 
+    pub async fn estimate_fees(&self) -> HyperUnitResult<Value> {
+        self.get_json("/v2/estimate-fees").await
+    }
+
     async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> HyperUnitResult<T> {
         let endpoint = build_endpoint(&self.base_url, path)?;
         let response = self.http.get(endpoint).send().await?;
@@ -635,6 +639,20 @@ mod tests {
         assert_eq!(
             request.into_path().expect("valid path"),
             "/gen/bitcoin/hyperliquid/btc/0x1111111111111111111111111111111111111111"
+        );
+    }
+
+    #[test]
+    fn generate_address_request_builds_path_for_hyperliquid_bitcoin_withdrawal() {
+        let request = UnitGenerateAddressRequest {
+            src_chain: UnitChain::Hyperliquid,
+            dst_chain: UnitChain::Bitcoin,
+            asset: UnitAsset::Btc,
+            dst_addr: "bc1qk4m6mpxulnlufegdh3w40kayhx9m722am38apn".to_string(),
+        };
+        assert_eq!(
+            request.into_path().expect("valid path"),
+            "/gen/hyperliquid/bitcoin/btc/bc1qk4m6mpxulnlufegdh3w40kayhx9m722am38apn"
         );
     }
 

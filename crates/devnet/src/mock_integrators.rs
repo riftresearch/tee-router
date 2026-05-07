@@ -18,9 +18,9 @@ use axum::{
 use bitcoincore_rpc_async::{Auth as BitcoinRpcAuth, Client as BitcoinRpcClient, RpcApi};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use hyperliquid_client::{
-    recover_l1_signer, recover_typed_signer, spot_wire_asset_index, Actions, SpotAssetMeta,
-    SpotMeta, SpotSend, TokenInfo, UsdClassTransfer, Withdraw3, MINIMUM_BRIDGE_DEPOSIT_USDC,
-    SPOT_ASSET_INDEX_OFFSET,
+    recover_l1_signer, recover_typed_signer, spot_wire_asset_index, Actions, SendAsset,
+    SpotAssetMeta, SpotMeta, SpotSend, TokenInfo, UsdClassTransfer, Withdraw3,
+    MINIMUM_BRIDGE_DEPOSIT_USDC, SPOT_ASSET_INDEX_OFFSET,
 };
 use hyperunit_client::{
     UnitAsset, UnitChain, UnitGenerateAddressResponse, UnitOperation, UnitOperationsResponse,
@@ -1474,6 +1474,7 @@ async fn mock_velora_prices(
             "destDecimals": query.dest_decimals,
             "srcAmount": src_amount.to_string(),
             "destAmount": dest_amount.to_string(),
+            "side": query.side,
             "tokenTransferProxy": swap_contract,
             "contractAddress": swap_contract,
             "bestRoute": [],
@@ -4125,6 +4126,7 @@ async fn mock_hyperliquid_exchange(
             handle_l1_action(&state, &request, &action_type).await
         }
         "spotSend" => handle_spot_send(&state, &request).await,
+        "sendAsset" => handle_send_asset(&state, &request).await,
         "usdClassTransfer" => handle_usd_class_transfer(&state, &request).await,
         "withdraw3" => handle_withdraw3(&state, &request).await,
         other => error_response(
@@ -4305,33 +4307,169 @@ async fn handle_spot_send(
         }
     }
 
-    // Keep the legacy HyperUnit-withdrawal lifecycle hook: a spotSend whose
-    // destination matches a tracked unit operation advances it into the first
-    // post-discovery state a real withdrawal would expose after Hyperliquid
-    // observes the source transfer.
     let source_tx_hash = match nonce {
         Some(nonce) => format!("{signer:#x}:{nonce}"),
         None => format!("{signer:#x}:0"),
     };
+    if let Err(response) = complete_unit_withdrawal_after_hyperliquid_transfer(
+        state,
+        &payload.destination,
+        format!("{signer:#x}"),
+        &payload.amount,
+        source_tx_hash,
+    )
+    .await
+    {
+        return response;
+    }
+
+    Json(json!({
+        "status": "ok",
+        "response": { "type": "default" }
+    }))
+    .into_response()
+}
+
+async fn handle_send_asset(
+    state: &Arc<MockIntegratorState>,
+    request: &Value,
+) -> axum::response::Response {
+    let Some(action_value) = request.get("action").cloned() else {
+        return error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "/exchange body is missing `action`",
+        );
+    };
+    let mut stripped = action_value.clone();
+    if let Some(map) = stripped.as_object_mut() {
+        map.remove("type");
+    }
+    let payload: SendAsset = match serde_json::from_value(stripped) {
+        Ok(p) => p,
+        Err(err) => {
+            return error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("failed to deserialize sendAsset: {err}"),
+            );
+        }
+    };
+    let signature = match parse_signature(request.get("signature")) {
+        Ok(sig) => sig,
+        Err(msg) => return error_response(StatusCode::UNPROCESSABLE_ENTITY, msg),
+    };
+    let signer = match recover_typed_signer(&payload, &signature) {
+        Ok(addr) => addr,
+        Err(err) => {
+            return error_response(
+                StatusCode::UNAUTHORIZED,
+                format!("sendAsset signature recovery failed: {err}"),
+            );
+        }
+    };
+    if payload.source_dex != "spot" || payload.destination_dex != "spot" {
+        return error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "mock sendAsset only supports spot->spot transfers, got {}->{}",
+                payload.source_dex, payload.destination_dex
+            ),
+        );
+    }
+    let source_user = if payload.from_sub_account.trim().is_empty() {
+        signer
+    } else {
+        match Address::from_str(&payload.from_sub_account) {
+            Ok(address) => address,
+            Err(err) => {
+                return error_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("sendAsset fromSubAccount is not an address: {err}"),
+                );
+            }
+        }
+    };
+    let token_symbol = payload
+        .token
+        .split(':')
+        .next()
+        .unwrap_or(&payload.token)
+        .to_string();
+    let amount = match payload.amount.parse::<f64>() {
+        Ok(v) if v > 0.0 => v,
+        _ => {
+            return error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!(
+                    "sendAsset amount must be a positive decimal, got {}",
+                    payload.amount
+                ),
+            );
+        }
+    };
+
+    {
+        let mut hl = state.hyperliquid.lock().await;
+        let available = hl.available_spot(source_user, &token_symbol);
+        if !hyperliquid_has_sufficient_amount(available, amount) {
+            return error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!(
+                    "sendAsset: {source_user:?} has {available} {token_symbol}, needs {amount}"
+                ),
+            );
+        }
+        hl.debit_spot_total(source_user, &token_symbol, amount);
+        if let Ok(dst) = Address::from_str(&payload.destination) {
+            hl.credit_spot(dst, &token_symbol, amount);
+        }
+    }
+
+    let source_tx_hash = format!("{source_user:#x}:{}", payload.nonce);
+    if let Err(response) = complete_unit_withdrawal_after_hyperliquid_transfer(
+        state,
+        &payload.destination,
+        format!("{source_user:#x}"),
+        &payload.amount,
+        source_tx_hash,
+    )
+    .await
+    {
+        return response;
+    }
+
+    Json(json!({
+        "status": "ok",
+        "response": { "type": "default" }
+    }))
+    .into_response()
+}
+
+async fn complete_unit_withdrawal_after_hyperliquid_transfer(
+    state: &Arc<MockIntegratorState>,
+    destination: &str,
+    source_address: String,
+    decimal_amount: &str,
+    source_tx_hash: String,
+) -> Result<(), axum::response::Response> {
     let mut unit_withdrawal_to_complete = None;
     {
         let mut operations = state.unit_operations.lock().await;
         if let Some(entry) = operations
-            .get_mut(&payload.destination)
+            .get_mut(destination)
             .and_then(|entries| latest_active_unit_operation_mut(entries))
         {
             let source_amount = match parse_unit_decimal_amount_to_raw(
-                &payload.amount,
+                decimal_amount,
                 unit_asset_decimals(entry.asset),
             ) {
                 Ok(amount) => amount.to_string(),
-                Err(err) => return error_response(StatusCode::BAD_REQUEST, err),
+                Err(err) => return Err(error_response(StatusCode::BAD_REQUEST, err)),
             };
             entry.visible = true;
             entry.operation.state = Some("waitForSrcTxFinalization".to_string());
             entry.operation.state_started_at = Some(Utc::now().to_rfc3339());
             entry.operation.state_updated_at = Some(Utc::now().to_rfc3339());
-            entry.operation.source_address = Some(format!("{signer:#x}"));
+            entry.operation.source_address = Some(source_address);
             entry.operation.source_amount = Some(source_amount.clone());
             if entry.operation.source_tx_hash.is_none() {
                 entry.operation.source_tx_hash = Some(source_tx_hash.clone());
@@ -4340,7 +4478,7 @@ async fn handle_spot_send(
                 entry.operation.operation_id = entry.operation.source_tx_hash.clone();
             }
             if matches!(entry.kind, MockUnitOperationKind::Withdrawal) {
-                unit_withdrawal_to_complete = Some((payload.destination.clone(), source_amount));
+                unit_withdrawal_to_complete = Some((destination.to_string(), source_amount));
             }
         }
     }
@@ -4364,18 +4502,13 @@ async fn handle_spot_send(
             .await
         };
         if let Err(err) = completion_result {
-            return error_response(
+            return Err(error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("mock unit withdrawal completion failed: {err}"),
-            );
+            ));
         }
     }
-
-    Json(json!({
-        "status": "ok",
-        "response": { "type": "default" }
-    }))
-    .into_response()
+    Ok(())
 }
 
 async fn handle_usd_class_transfer(
@@ -6620,6 +6753,7 @@ mod tests {
 
         assert_eq!(body["priceRoute"]["srcAmount"], "1000000000000000000");
         assert_eq!(body["priceRoute"]["destAmount"], "3000000000");
+        assert_eq!(body["priceRoute"]["side"], "SELL");
     }
 
     #[tokio::test]
@@ -6641,6 +6775,7 @@ mod tests {
 
         assert_eq!(body["priceRoute"]["srcAmount"], "1000000000000000000");
         assert_eq!(body["priceRoute"]["destAmount"], "3000000000");
+        assert_eq!(body["priceRoute"]["side"], "BUY");
     }
 
     #[tokio::test]
@@ -8427,6 +8562,51 @@ mod tests {
             assert_eq!(submitted["action"]["hyperliquidChain"], "Testnet");
             assert_eq!(submitted["action"]["signatureChainId"], "0x66eee");
             assert_eq!(submitted["nonce"], 1_700_000_000_000_u64);
+        }
+
+        #[tokio::test]
+        async fn client_send_asset_signs_and_moves_spot_balance() {
+            let server = MockIntegratorServer::spawn().await.expect("spawn");
+            let client = new_client(server.base_url());
+            let wallet = TEST_WALLET.parse::<PrivateKeySigner>().expect("wallet");
+            let user = wallet.address();
+            let destination = Address::repeat_byte(0x55);
+            server
+                .credit_hyperliquid_balance(user, "UBTC", 0.0004)
+                .await;
+
+            let resp = client
+                .send_asset(
+                    format!("{destination:#x}"),
+                    "spot".to_string(),
+                    "spot".to_string(),
+                    "UBTC:0x8f49bc64b02C5B7793D4fD4b74b9D643cF5e9059".to_string(),
+                    "0.0003".to_string(),
+                    1_700_000_000_000,
+                )
+                .await
+                .expect("send asset");
+
+            assert_eq!(resp["status"], "ok");
+            assert_eq!(resp["response"]["type"], "default");
+            assert!((server.hyperliquid_balance_of(user, "UBTC").await - 0.0001).abs() < 1e-12);
+            assert!(
+                (server.hyperliquid_balance_of(destination, "UBTC").await - 0.0003).abs() < 1e-12
+            );
+            let submissions = server.hyperliquid_exchange_submissions().await;
+            assert_eq!(submissions.len(), 1);
+            let submitted = &submissions[0];
+            assert_eq!(submitted["action"]["type"], "sendAsset");
+            assert_eq!(
+                submitted["action"]["destination"],
+                format!("{destination:#x}")
+            );
+            assert_eq!(submitted["action"]["sourceDex"], "spot");
+            assert_eq!(submitted["action"]["destinationDex"], "spot");
+            assert_eq!(submitted["action"]["amount"], "0.0003");
+            assert_eq!(submitted["action"]["nonce"], 1_700_000_000_000_u64);
+            assert_eq!(submitted["action"]["hyperliquidChain"], "Testnet");
+            assert_eq!(submitted["action"]["signatureChainId"], "0x66eee");
         }
 
         #[tokio::test]

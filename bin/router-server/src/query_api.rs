@@ -13,6 +13,7 @@ pub async fn get_order_flow(db: &Database, id: Uuid) -> RouterServerResult<Order
         Err(err) => return Err(err),
     };
     let attempts = db.orders().get_execution_attempts(id).await?;
+    let legs = db.orders().get_execution_legs(id).await?;
     let steps = db.orders().get_execution_steps(id).await?;
     let provider_operations = db.orders().get_provider_operations(id).await?;
     let custody_vaults = db.orders().get_custody_vaults(id).await?;
@@ -29,6 +30,7 @@ pub async fn get_order_flow(db: &Database, id: Uuid) -> RouterServerResult<Order
             progress,
             quote,
             attempts,
+            legs,
             steps,
             provider_operations,
             custody_vaults,

@@ -360,8 +360,7 @@ fn append_limited_body_chunk(body: &mut Vec<u8>, chunk: &[u8], max_bytes: usize)
 
 fn error_text_preview(value: &str) -> String {
     let mut end = 0;
-    let mut count = 0;
-    for (index, ch) in value.char_indices() {
+    for (count, (index, ch)) in value.char_indices().enumerate() {
         if count == MARKET_PRICING_MAX_ERROR_PREVIEW_CHARS {
             return format!(
                 "{}...<truncated {} chars>",
@@ -370,7 +369,6 @@ fn error_text_preview(value: &str) -> String {
             );
         }
         end = index + ch.len_utf8();
-        count += 1;
     }
     value.to_string()
 }

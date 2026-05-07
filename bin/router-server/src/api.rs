@@ -1,7 +1,7 @@
 use crate::{
     models::{
         empty_metadata, CustodyVault, DepositVaultFundingHint, OrderExecutionAttempt,
-        OrderExecutionStep, OrderExecutionStepStatus, OrderProviderOperation,
+        OrderExecutionLeg, OrderExecutionStep, OrderExecutionStepStatus, OrderProviderOperation,
         OrderProviderOperationHint, ProviderExecutionPolicyState, ProviderHealthCheck,
         ProviderHealthSummaryStatus, ProviderOperationHintKind, ProviderPolicy,
         ProviderQuotePolicyState, RouterOrder, RouterOrderQuote, RouterOrderStatus, VaultAction,
@@ -59,8 +59,6 @@ pub struct CreateOrderRequest {
     pub quote_id: Uuid,
     pub refund_address: String,
     #[serde(default)]
-    pub cancel_after: Option<DateTime<Utc>>,
-    #[serde(default)]
     pub idempotency_key: Option<String>,
     #[serde(default = "empty_metadata")]
     pub metadata: Value,
@@ -105,11 +103,13 @@ pub struct LimitOrderQuoteRequest {
 pub enum MarketOrderQuoteKind {
     ExactIn {
         amount_in: String,
-        slippage_bps: u64,
+        #[serde(default)]
+        slippage_bps: Option<u64>,
     },
     ExactOut {
         amount_out: String,
-        slippage_bps: u64,
+        #[serde(default)]
+        slippage_bps: Option<u64>,
     },
 }
 
@@ -226,6 +226,7 @@ pub struct OrderFlow {
     pub progress: OrderFlowProgress,
     pub quote: Option<RouterOrderQuote>,
     pub attempts: Vec<OrderExecutionAttempt>,
+    pub legs: Vec<OrderExecutionLeg>,
     pub steps: Vec<OrderExecutionStep>,
     pub provider_operations: Vec<OrderProviderOperation>,
     pub custody_vaults: Vec<CustodyVault>,
@@ -261,8 +262,12 @@ impl OrderFlowProgress {
         steps: &[OrderExecutionStep],
         provider_operations: &[OrderProviderOperation],
     ) -> Self {
-        let executable_steps: Vec<&OrderExecutionStep> =
-            steps.iter().filter(|step| step.step_index > 0).collect();
+        let executable_steps: Vec<&OrderExecutionStep> = steps
+            .iter()
+            .filter(|step| {
+                step.step_index > 0 && step.status != OrderExecutionStepStatus::Superseded
+            })
+            .collect();
         let total_steps = executable_steps.len();
         let completed_steps = executable_steps
             .iter()
@@ -404,10 +409,10 @@ mod tests {
             amount_out: "900".to_string(),
             min_amount_out: Some("891".to_string()),
             max_amount_in: None,
-            slippage_bps: 100,
+            slippage_bps: Some(100),
             provider_quote: json!({}),
             usd_valuation: json!({}),
-            expires_at: order.action_timeout_at,
+            expires_at: order.created_at + chrono::Duration::minutes(1),
             created_at: order.created_at,
         });
         let secret = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -618,9 +623,9 @@ mod tests {
             action: RouterOrderAction::MarketOrder(MarketOrderAction {
                 order_kind: MarketOrderKind::ExactIn {
                     amount_in: "1000".to_string(),
-                    min_amount_out: "1".to_string(),
+                    min_amount_out: Some("1".to_string()),
                 },
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             }),
             action_timeout_at: now,
             idempotency_key: None,

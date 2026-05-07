@@ -602,7 +602,7 @@ mod tests {
             amount_out: "100000".to_string(),
             min_amount_out: Some("99000".to_string()),
             max_amount_in: None,
-            slippage_bps: 100,
+            slippage_bps: Some(100),
             provider_quote: json!({ "legs": [{ "not": "a quote leg" }] }),
             usd_valuation: empty_usd_valuation(),
             expires_at: Utc::now(),

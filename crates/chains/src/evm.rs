@@ -14,6 +14,7 @@ use metrics::{counter, gauge, histogram};
 use router_primitives::{
     ChainType, ConfirmedTxStatus, Currency, Lot, PendingTxStatus, TokenIdentifier, TxStatus, Wallet,
 };
+use serde::{Deserialize, Serialize};
 use snafu::location;
 use std::{
     fmt,
@@ -42,6 +43,15 @@ const EVM_RPC_RETRY_ATTEMPTS: usize = 6;
 const EVM_RPC_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(500);
 const EVM_CALL_ESTIMATE_GAS_CAP: u64 = 1_000_000;
 const WEI_PER_GWEI: f64 = 1_000_000_000.0;
+const FLASHBOTS_ETHEREUM_RPC_URL: &str = "https://rpc.flashbots.net";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvmBroadcastPolicy {
+    #[default]
+    Standard,
+    FlashbotsIfEthereum,
+}
 
 pub struct EvmChain {
     provider: DynProvider,
@@ -776,6 +786,24 @@ impl EvmChain {
         value: U256,
         calldata: Bytes,
     ) -> Result<EvmCallOutcome> {
+        self.send_call_with_broadcast_policy(
+            private_key,
+            to_address,
+            value,
+            calldata,
+            EvmBroadcastPolicy::Standard,
+        )
+        .await
+    }
+
+    pub async fn send_call_with_broadcast_policy(
+        &self,
+        private_key: &str,
+        to_address: &str,
+        value: U256,
+        calldata: Bytes,
+        broadcast_policy: EvmBroadcastPolicy,
+    ) -> Result<EvmCallOutcome> {
         let sender_signer =
             LocalSigner::from_str(private_key).map_err(|_| crate::Error::DumpToAddress {
                 message: "Invalid private key".to_string(),
@@ -836,11 +864,11 @@ impl EvmChain {
             native_balance
         };
 
-        let url = self
-            .rpc_url
+        let broadcast_rpc_url = self.broadcast_rpc_url(broadcast_policy);
+        let url = broadcast_rpc_url
             .parse()
             .map_err(|_| crate::Error::Serialization {
-                message: "Invalid RPC URL".to_string(),
+                message: "Invalid EVM broadcast RPC URL".to_string(),
             })?;
         let wallet_provider = ProviderBuilder::new()
             .wallet(EthereumWallet::new(sender_signer))
@@ -864,13 +892,48 @@ impl EvmChain {
                 loc: location!(),
             })?;
         let tx_hash = *pending_tx.tx_hash();
-        let receipt = wait_for_evm_receipt(&wallet_provider, self.chain_type, tx_hash).await?;
+        let receipt = wait_for_evm_receipt(&self.provider, self.chain_type, tx_hash).await?;
 
         Ok(EvmCallOutcome {
             tx_hash: tx_hash.to_string(),
             logs: receipt.logs().to_vec(),
         })
     }
+
+    fn broadcast_rpc_url(&self, broadcast_policy: EvmBroadcastPolicy) -> &str {
+        select_broadcast_rpc_url(&self.rpc_url, self.chain_type, broadcast_policy)
+    }
+}
+
+fn select_broadcast_rpc_url(
+    rpc_url: &str,
+    chain_type: ChainType,
+    broadcast_policy: EvmBroadcastPolicy,
+) -> &str {
+    if matches!(broadcast_policy, EvmBroadcastPolicy::FlashbotsIfEthereum)
+        && chain_type == ChainType::Ethereum
+        && !is_local_evm_rpc_url(rpc_url)
+    {
+        FLASHBOTS_ETHEREUM_RPC_URL
+    } else {
+        rpc_url
+    }
+}
+
+fn is_local_evm_rpc_url(rpc_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(rpc_url) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.to_ascii_lowercase();
+    host == "localhost"
+        || host == "devnet"
+        || host == "host.docker.internal"
+        || host.starts_with("127.")
+        || host == "0.0.0.0"
+        || host == "::1"
 }
 
 /// Result of a custody-controlled EVM call. Includes the receipt's logs so that
@@ -2332,5 +2395,41 @@ mod tests {
                 if context == "evm confirmation count"
         ));
         assert!(evm_tx_status_from_receipt_fields(true, Some(12), 11).is_err());
+    }
+
+    #[test]
+    fn flashbots_policy_only_selects_flashbots_for_non_local_ethereum() {
+        assert_eq!(
+            select_broadcast_rpc_url(
+                "https://ethereum-mainnet.example",
+                ChainType::Ethereum,
+                EvmBroadcastPolicy::FlashbotsIfEthereum,
+            ),
+            FLASHBOTS_ETHEREUM_RPC_URL
+        );
+        assert_eq!(
+            select_broadcast_rpc_url(
+                "https://base-mainnet.example",
+                ChainType::Base,
+                EvmBroadcastPolicy::FlashbotsIfEthereum,
+            ),
+            "https://base-mainnet.example"
+        );
+        assert_eq!(
+            select_broadcast_rpc_url(
+                "http://localhost:50101",
+                ChainType::Ethereum,
+                EvmBroadcastPolicy::FlashbotsIfEthereum,
+            ),
+            "http://localhost:50101"
+        );
+        assert_eq!(
+            select_broadcast_rpc_url(
+                "https://ethereum-mainnet.example",
+                ChainType::Ethereum,
+                EvmBroadcastPolicy::Standard,
+            ),
+            "https://ethereum-mainnet.example"
+        );
     }
 }

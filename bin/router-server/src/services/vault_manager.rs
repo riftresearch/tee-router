@@ -1,3 +1,4 @@
+use super::bitcoin_funding::observed_bitcoin_outpoint;
 use crate::{
     api::CreateVaultRequest,
     config::Settings,
@@ -780,6 +781,28 @@ impl VaultManager {
                     .ok_or_else(|| "Bitcoin chain is not configured".to_string())?,
             )
             .ok_or_else(|| "Bitcoin chain is not configured".to_string())?;
+        if let Some(outpoint) = observed_bitcoin_outpoint(vault.funding_observation.as_ref())? {
+            let fee = bitcoin_chain
+                .estimate_p2wpkh_transfer_fee_sats(1, 1)
+                .await
+                .map_err(|err| err.to_string())?;
+            let tx_data = bitcoin_chain
+                .dump_to_address_from_outpoint(
+                    &token_identifier(&vault.deposit_asset.asset),
+                    private_key,
+                    &vault.recovery_address,
+                    U256::from(fee),
+                    &outpoint.tx_hash,
+                    outpoint.vout,
+                    outpoint.amount_sats,
+                )
+                .await
+                .map_err(|err| err.to_string())?;
+            return bitcoin_chain
+                .broadcast_signed_transaction(&tx_data)
+                .await
+                .map_err(|err| err.to_string());
+        }
         let balance = bitcoin_chain
             .address_balance_sats(&vault.deposit_vault_address)
             .await
@@ -1058,6 +1081,12 @@ impl VaultManager {
                     parse_positive_u256("amount_in", amount_in)
                 }
                 crate::models::MarketOrderKind::ExactOut { max_amount_in, .. } => {
+                    let Some(max_amount_in) = max_amount_in.as_deref() else {
+                        return Err(VaultError::InvalidOrderBinding {
+                            reason: "exact-out market order funding requires max_amount_in"
+                                .to_string(),
+                        });
+                    };
                     parse_positive_u256("max_amount_in", max_amount_in)
                 }
             },

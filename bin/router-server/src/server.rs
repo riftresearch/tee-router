@@ -444,15 +444,6 @@ async fn create_order(
         .order_manager
         .create_order_from_quote(request.clone())
         .await?;
-    let cancel_after = match &quote {
-        crate::models::RouterOrderQuote::MarketOrder(quote) => request
-            .cancel_after
-            .map(|requested_cancel_after| requested_cancel_after.min(quote.expires_at))
-            .unwrap_or(quote.expires_at),
-        crate::models::RouterOrderQuote::LimitOrder(_) => {
-            request.cancel_after.unwrap_or(order.action_timeout_at)
-        }
-    };
     if let Some(vault_id) = order.funding_vault_id {
         let vault = state.vault_manager.get_vault(vault_id).await?;
         ensure_recoverable_cancellation_secret(&vault, &cancellation.commitment)?;
@@ -467,7 +458,7 @@ async fn create_order(
         action: VaultAction::Null,
         recovery_address: request.refund_address,
         cancellation_commitment: cancellation.commitment,
-        cancel_after: Some(cancel_after),
+        cancel_after: None,
         metadata: request.metadata,
     };
     let vault = match state.vault_manager.create_vault(vault_request).await {
@@ -1188,11 +1179,24 @@ mod tests {
     }
 
     #[test]
+    fn create_order_request_rejects_cancel_after() {
+        let request = serde_json::json!({
+            "quote_id": Uuid::now_v7(),
+            "refund_address": "refund-address",
+            "cancel_after": "2026-05-06T00:00:00Z"
+        });
+
+        let error = serde_json::from_value::<CreateOrderRequest>(request)
+            .expect_err("cancel_after should not be accepted for router orders");
+
+        assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
     fn create_order_requires_idempotency_key() {
         let request = CreateOrderRequest {
             quote_id: Uuid::now_v7(),
             refund_address: "refund-address".to_string(),
-            cancel_after: None,
             idempotency_key: None,
             metadata: serde_json::json!({}),
         };
@@ -1208,7 +1212,6 @@ mod tests {
         let request = CreateOrderRequest {
             quote_id: Uuid::now_v7(),
             refund_address: "refund-address".to_string(),
-            cancel_after: None,
             idempotency_key: Some("short-key".to_string()),
             metadata: serde_json::json!({}),
         };
@@ -1225,7 +1228,6 @@ mod tests {
         let request = CreateOrderRequest {
             quote_id: Uuid::now_v7(),
             refund_address: "refund-address".to_string(),
-            cancel_after: None,
             idempotency_key: Some("market-order key/with/slashes".to_string()),
             metadata: serde_json::json!({}),
         };

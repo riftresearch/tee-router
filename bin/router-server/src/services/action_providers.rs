@@ -23,6 +23,7 @@ use alloy::{
     sol_types::{SolCall, SolEvent},
 };
 use bitcoin::Address as BitcoinAddress;
+use chains::evm::EvmBroadcastPolicy;
 use chrono::{DateTime, TimeZone, Utc};
 use hyperliquid_client::{
     actions::{Actions as HyperliquidActions, BulkOrder, Limit, Order, OrderRequest, Tif},
@@ -1194,6 +1195,7 @@ fn across_tx_to_action(
         to_address: tx.to.clone(),
         value: value.to_string(),
         calldata: tx.data.clone(),
+        broadcast_policy: Default::default(),
     })))
 }
 
@@ -1442,7 +1444,7 @@ fn evm_token_address(asset: &AssetId) -> Option<Address> {
 /// HyperUnit integration that uses the real `GET /gen` + `GET /operations`
 /// REST shape. Deposits emit a source-chain `Transfer` custody action to the
 /// guardian-returned `protocol_address`; withdrawals emit a Hyperliquid
-/// `SpotSend` out of the router's HL spot vault to the protocol address.
+/// `sendAsset` out of the router's HL spot vault to the protocol address.
 /// The `provider_ref` persisted on the operation is the `protocol_address`
 /// and also the polling key for `/operations`.
 #[derive(Clone)]
@@ -1454,6 +1456,8 @@ pub struct HyperUnitProvider {
     hyperliquid_spot_meta: Arc<OnceCell<SpotMeta>>,
     hyperliquid_network: HyperliquidCallNetwork,
 }
+
+const HYPERLIQUID_CORE_ACTIVATION_FEE_RAW: u64 = 1_000_000;
 
 impl HyperUnitProvider {
     pub fn new(
@@ -1809,8 +1813,10 @@ impl UnitProvider for HyperUnitProvider {
                 target_base_url: self.hyperliquid_base_url.clone(),
                 network: self.hyperliquid_network,
                 vault_address: None,
-                payload: HyperliquidCallPayload::SpotSend {
+                payload: HyperliquidCallPayload::SendAsset {
                     destination: protocol_address.clone(),
+                    source_dex: "spot".to_string(),
+                    destination_dex: "spot".to_string(),
                     token: hl_token,
                     amount: amount_decimal,
                 },
@@ -1827,6 +1833,13 @@ impl UnitProvider for HyperUnitProvider {
                 "spot_balance": spot_state,
                 "spot_available_raw": available_amount_raw.to_string(),
                 "minimum_amount_raw": minimum_amount_raw.to_string(),
+                "hyperliquid_core_activation_fee": {
+                    "kind": "first_transfer_to_new_hypercore_destination",
+                    "quote_asset": "USDC",
+                    "amount_raw": HYPERLIQUID_CORE_ACTIVATION_FEE_RAW.to_string(),
+                    "amount_decimal": "1",
+                    "source": "hyperliquid_activation_gas_fee",
+                },
                 "seen_operation_fingerprints": seen_operation_fingerprints.iter().cloned().collect::<Vec<_>>(),
             });
 
@@ -2939,6 +2952,7 @@ impl CctpProvider {
                 &format!("{:#x}", self.token_messenger_v2_address),
                 &step.amount,
             )?,
+            broadcast_policy: Default::default(),
         }));
         let call = ICircleTokenMessengerV2::depositForBurnCall {
             amount,
@@ -2953,6 +2967,7 @@ impl CctpProvider {
             to_address: format!("{:#x}", self.token_messenger_v2_address),
             value: "0".to_string(),
             calldata: format!("0x{}", hex::encode(call.abi_encode())),
+            broadcast_policy: Default::default(),
         }));
         let operation_request = json!({
             "transition_decl_id": step.transition_decl_id,
@@ -3011,6 +3026,7 @@ impl CctpProvider {
                 to_address: format!("{:#x}", self.message_transmitter_v2_address),
                 value: "0".to_string(),
                 calldata: format!("0x{}", hex::encode(call.abi_encode())),
+                broadcast_policy: Default::default(),
             })),
             provider_context: json!({
                 "kind": "cctp_receive",
@@ -3738,7 +3754,7 @@ impl HyperliquidProvider {
                         amount_in: amount_in.clone(),
                         // The intermediate slippage bound is enforced by the
                         // outer user bound on the final output.
-                        min_amount_out: "1".to_string(),
+                        min_amount_out: Some("1".to_string()),
                     },
                     &sell_book,
                 )?;
@@ -3773,7 +3789,7 @@ impl HyperliquidProvider {
                     output_base_meta.sz_decimals,
                     &MarketOrderKind::ExactOut {
                         amount_out: amount_out.clone(),
-                        max_amount_in: PRACTICAL_USDC_MAX_WIRE_STR.to_string(),
+                        max_amount_in: Some(PRACTICAL_USDC_MAX_WIRE_STR.to_string()),
                     },
                     &buy_book,
                 )?;
@@ -3801,11 +3817,11 @@ impl HyperliquidProvider {
         let leg1_kind = match &request.order_kind {
             MarketOrderKind::ExactIn { .. } => MarketOrderKind::ExactIn {
                 amount_in: leg1_in.clone(),
-                min_amount_out: "1".to_string(),
+                min_amount_out: Some("1".to_string()),
             },
             MarketOrderKind::ExactOut { .. } => MarketOrderKind::ExactOut {
                 amount_out: leg1_out.clone(),
-                max_amount_in: leg1_in.clone(),
+                max_amount_in: Some(leg1_in.clone()),
             },
         };
         let leg2_kind = match &request.order_kind {
@@ -3815,7 +3831,7 @@ impl HyperliquidProvider {
             },
             MarketOrderKind::ExactOut { amount_out, .. } => MarketOrderKind::ExactOut {
                 amount_out: amount_out.clone(),
-                max_amount_in: leg2_in.clone(),
+                max_amount_in: Some(leg2_in.clone()),
             },
         };
 
@@ -4123,14 +4139,15 @@ impl VeloraProvider {
             "userAddress": source_address,
             "receiver": step.recipient_address,
             "partner": self.partner.as_deref().unwrap_or(VELORA_DEFAULT_PARTNER),
-            "slippage": step.slippage_bps.unwrap_or(VELORA_DEFAULT_SLIPPAGE_BPS),
             "side": side,
         });
-        match side {
-            "SELL" => set_json_value(&mut body, "srcAmount", json!(step.amount_in)),
-            "BUY" => set_json_value(&mut body, "destAmount", json!(step.amount_out)),
-            other => return Err(format!("unsupported velora side {other:?}")),
-        }
+        set_velora_transaction_amount_constraints(
+            &mut body,
+            side,
+            &step.amount_in,
+            &step.amount_out,
+            step.slippage_bps,
+        )?;
 
         let url = format!(
             "{}/transactions/{network}?ignoreChecks=true&ignoreGasEstimate=true",
@@ -4287,12 +4304,14 @@ impl ExchangeProvider for VeloraProvider {
                     to_address: token_address.clone(),
                     value: "0".to_string(),
                     calldata: encode_erc20_approve(&spender, approve_amount)?,
+                    broadcast_policy: Default::default(),
                 })));
             }
             actions.push(CustodyAction::Call(ChainCall::Evm(EvmCall {
                 to_address: swap_to,
                 value: swap_value,
                 calldata: swap_data,
+                broadcast_policy: EvmBroadcastPolicy::FlashbotsIfEthereum,
             })));
 
             Ok(ProviderExecutionIntent::CustodyActions {
@@ -4907,7 +4926,7 @@ struct VeloraQuoteDescriptorSpec<'a> {
     dest_token: &'a str,
     src_decimals: u8,
     dest_decimals: u8,
-    slippage_bps: u64,
+    slippage_bps: Option<u64>,
     price_route: Value,
     amount_in: &'a str,
     amount_out: &'a str,
@@ -4928,10 +4947,10 @@ fn velora_quote_descriptor(spec: VeloraQuoteDescriptorSpec<'_>) -> Value {
     } = spec;
     let (order_kind, min_amount_out, max_amount_in) = match &request.order_kind {
         MarketOrderKind::ExactIn { min_amount_out, .. } => {
-            ("exact_in", Some(min_amount_out.clone()), None)
+            ("exact_in", min_amount_out.clone(), None)
         }
         MarketOrderKind::ExactOut { max_amount_in, .. } => {
-            ("exact_out", None, Some(max_amount_in.clone()))
+            ("exact_out", None, max_amount_in.clone())
         }
     };
     json!({
@@ -5167,31 +5186,59 @@ fn velora_slippage_bps(
     order_kind: &MarketOrderKind,
     amount_in: &str,
     amount_out: &str,
-) -> ProviderResult<u64> {
+) -> ProviderResult<Option<u64>> {
     match order_kind {
         MarketOrderKind::ExactIn { min_amount_out, .. } => {
+            let Some(min_amount_out) = min_amount_out.as_deref() else {
+                return Ok(Some(VELORA_DEFAULT_SLIPPAGE_BPS));
+            };
             let quoted_out = parse_u256_decimal_or_hex("velora amount_out", amount_out)?;
             if quoted_out.is_zero() {
                 return Err("velora quote returned zero amount_out".to_string());
             }
             let min_out = parse_u256_decimal_or_hex("velora min_amount_out", min_amount_out)?;
             if min_out >= quoted_out {
-                return Ok(0);
+                return Ok(Some(0));
             }
-            ratio_to_capped_bps(quoted_out - min_out, quoted_out)
+            ratio_to_capped_bps(quoted_out - min_out, quoted_out).map(Some)
         }
         MarketOrderKind::ExactOut { max_amount_in, .. } => {
+            let Some(max_amount_in) = max_amount_in.as_deref() else {
+                return Ok(Some(VELORA_DEFAULT_SLIPPAGE_BPS));
+            };
             let quoted_in = parse_u256_decimal_or_hex("velora amount_in", amount_in)?;
             if quoted_in.is_zero() {
                 return Err("velora quote returned zero amount_in".to_string());
             }
             let max_in = parse_u256_decimal_or_hex("velora max_amount_in", max_amount_in)?;
             if max_in <= quoted_in {
-                return Ok(0);
+                return Ok(Some(0));
             }
-            ratio_to_capped_bps(max_in - quoted_in, quoted_in)
+            ratio_to_capped_bps(max_in - quoted_in, quoted_in).map(Some)
         }
     }
+}
+
+fn set_velora_transaction_amount_constraints(
+    body: &mut Value,
+    side: &str,
+    amount_in: &str,
+    amount_out: &str,
+    slippage_bps: Option<u64>,
+) -> ProviderResult<()> {
+    let slippage_bps = slippage_bps.unwrap_or(VELORA_DEFAULT_SLIPPAGE_BPS);
+    match side {
+        "SELL" => {
+            set_json_value(body, "srcAmount", json!(amount_in));
+            set_json_value(body, "slippage", json!(slippage_bps));
+        }
+        "BUY" => {
+            set_json_value(body, "destAmount", json!(amount_out));
+            set_json_value(body, "slippage", json!(slippage_bps));
+        }
+        other => return Err(format!("unsupported velora side {other:?}")),
+    }
+    Ok(())
 }
 
 fn ratio_to_capped_bps(numerator: U256, denominator: U256) -> ProviderResult<u64> {
@@ -5286,11 +5333,13 @@ fn simulate_leg(
                 side,
                 base_sz_decimals,
             )?;
-            let min_out_raw = parse_wire_u256(min_amount_out)?;
-            if amount_out_raw < min_out_raw {
-                return Err(format!(
-                    "hyperliquid quote: book walk yielded {amount_out_raw} < min_amount_out {min_out_raw}"
-                ));
+            if let Some(min_amount_out) = min_amount_out {
+                let min_out_raw = parse_wire_u256(min_amount_out)?;
+                if amount_out_raw < min_out_raw {
+                    return Err(format!(
+                        "hyperliquid quote: book walk yielded {amount_out_raw} < min_amount_out {min_out_raw}"
+                    ));
+                }
             }
             Ok((amount_in.clone(), amount_out_raw.to_string()))
         }
@@ -5307,11 +5356,13 @@ fn simulate_leg(
                 side,
                 base_sz_decimals,
             )?;
-            let max_in_raw = parse_wire_u256(max_amount_in)?;
-            if amount_in_raw > max_in_raw {
-                return Err(format!(
-                    "hyperliquid quote: book walk requires {amount_in_raw} > max_amount_in {max_in_raw}"
-                ));
+            if let Some(max_amount_in) = max_amount_in {
+                let max_in_raw = parse_wire_u256(max_amount_in)?;
+                if amount_in_raw > max_in_raw {
+                    return Err(format!(
+                        "hyperliquid quote: book walk requires {amount_in_raw} > max_amount_in {max_in_raw}"
+                    ));
+                }
             }
             Ok((amount_in_raw.to_string(), amount_out.clone()))
         }
@@ -5835,8 +5886,8 @@ fn hl_leg_descriptor(
 
 fn slippage_bounds_from_request(order_kind: &MarketOrderKind) -> (Option<String>, Option<String>) {
     match order_kind {
-        MarketOrderKind::ExactIn { min_amount_out, .. } => (Some(min_amount_out.clone()), None),
-        MarketOrderKind::ExactOut { max_amount_in, .. } => (None, Some(max_amount_in.clone())),
+        MarketOrderKind::ExactIn { min_amount_out, .. } => (min_amount_out.clone(), None),
+        MarketOrderKind::ExactOut { max_amount_in, .. } => (None, max_amount_in.clone()),
     }
 }
 
@@ -6180,7 +6231,7 @@ fn hyperliquid_no_op_quote(
         } => (
             amount_in.clone(),
             amount_in.clone(),
-            Some(min_amount_out.clone()),
+            min_amount_out.clone(),
             None,
         ),
         MarketOrderKind::ExactOut {
@@ -6190,7 +6241,7 @@ fn hyperliquid_no_op_quote(
             amount_out.clone(),
             amount_out.clone(),
             None,
-            Some(max_amount_in.clone()),
+            max_amount_in.clone(),
         ),
     };
     ExchangeQuote {
@@ -6298,12 +6349,13 @@ mod hyperliquid_math_tests {
         build_across_swap_approval_request, cctp_message_status_is_failed, cctp_provider_address,
         cctp_provider_domain, cctp_quote_amounts, cctp_source_domain_from_request,
         checked_timeout_at_ms, classify_hl_leg, compute_base_sz, compute_limit_px,
-        decimal_bps_string, encode_erc20_approve, format_hl_spot_price, hl_leg_descriptor,
-        hyperliquid_bridge_deposit_completion_response,
+        decimal_bps_string, encode_erc20_approve, format_hl_spot_price, format_hyperliquid_amount,
+        hl_leg_descriptor, hyperliquid_bridge_deposit_completion_response,
         hyperliquid_order_oid_from_observation_request, hyperliquid_order_status_provider_status,
         observed_unit_operation_fingerprints, parse_decimal_bps_to_micros,
-        parse_decimal_to_raw_units_floor, seen_operation_fingerprints_from_request, simulate_leg,
-        unit_operation_provider_status, unit_withdrawal_minimum_raw,
+        parse_decimal_to_raw_units, parse_decimal_to_raw_units_floor,
+        seen_operation_fingerprints_from_request, set_velora_transaction_amount_constraints,
+        simulate_leg, unit_operation_provider_status, unit_withdrawal_minimum_raw,
         validated_unit_generate_address, velora_slippage_bps, AcrossHttpProviderConfig,
         ActionProviderHttpOptions, ActionProviderRegistry, BridgeExecutionRequest, BridgeProvider,
         BridgeQuoteRequest, CctpHttpProviderConfig, CctpMessagesResponse, CctpQuoteAmounts,
@@ -6312,6 +6364,7 @@ mod hyperliquid_math_tests {
         HyperliquidTradeStepRequest, LimitPxInput, ProviderExecutionIntent,
         ProviderOperationObservationRequest, UniversalRouterAssetRef, VeloraHttpProviderConfig,
         VeloraProvider, DEFAULT_HYPERLIQUID_ORDER_TIMEOUT_MS, HYPERLIQUID_BRIDGE_WITHDRAW_FEE_RAW,
+        VELORA_DEFAULT_SLIPPAGE_BPS,
     };
     use crate::{
         models::{MarketOrderKind, ProviderOperationStatus, ProviderOperationType},
@@ -6749,12 +6802,12 @@ mod hyperliquid_math_tests {
     fn velora_slippage_bps_exact_in_uses_requested_min_output() {
         let order_kind = MarketOrderKind::ExactIn {
             amount_in: "1000".to_string(),
-            min_amount_out: "950".to_string(),
+            min_amount_out: Some("950".to_string()),
         };
 
         assert_eq!(
             velora_slippage_bps(&order_kind, "1000", "1000").unwrap(),
-            500
+            Some(500)
         );
     }
 
@@ -6762,12 +6815,33 @@ mod hyperliquid_math_tests {
     fn velora_slippage_bps_exact_out_uses_requested_max_input() {
         let order_kind = MarketOrderKind::ExactOut {
             amount_out: "1000".to_string(),
-            max_amount_in: "1100".to_string(),
+            max_amount_in: Some("1100".to_string()),
         };
 
         assert_eq!(
             velora_slippage_bps(&order_kind, "1000", "1000").unwrap(),
-            1000
+            Some(1000)
+        );
+    }
+
+    #[test]
+    fn velora_slippage_bps_defaults_missing_user_bound_to_one_percent() {
+        let exact_in = MarketOrderKind::ExactIn {
+            amount_in: "1000".to_string(),
+            min_amount_out: None,
+        };
+        let exact_out = MarketOrderKind::ExactOut {
+            amount_out: "1000".to_string(),
+            max_amount_in: None,
+        };
+
+        assert_eq!(
+            velora_slippage_bps(&exact_in, "1000", "1000").unwrap(),
+            Some(VELORA_DEFAULT_SLIPPAGE_BPS)
+        );
+        assert_eq!(
+            velora_slippage_bps(&exact_out, "1000", "1000").unwrap(),
+            Some(VELORA_DEFAULT_SLIPPAGE_BPS)
         );
     }
 
@@ -6777,23 +6851,55 @@ mod hyperliquid_math_tests {
         let min_out = quoted_out / U256::from(2_u64);
         let exact_in = MarketOrderKind::ExactIn {
             amount_in: "1".to_string(),
-            min_amount_out: min_out.to_string(),
+            min_amount_out: Some(min_out.to_string()),
         };
         assert_eq!(
             velora_slippage_bps(&exact_in, "1", &quoted_out.to_string()).unwrap(),
-            5000
+            Some(5000)
         );
 
         let quoted_in = U256::MAX / U256::from(2_u64);
         let max_in = quoted_in + quoted_in / U256::from(10_u64);
         let exact_out = MarketOrderKind::ExactOut {
             amount_out: "1".to_string(),
-            max_amount_in: max_in.to_string(),
+            max_amount_in: Some(max_in.to_string()),
         };
         assert_eq!(
             velora_slippage_bps(&exact_out, &quoted_in.to_string(), "1").unwrap(),
-            999
+            Some(999)
         );
+    }
+
+    #[test]
+    fn velora_transaction_constraints_default_missing_slippage_to_one_percent() {
+        let mut sell = json!({});
+        set_velora_transaction_amount_constraints(&mut sell, "SELL", "1000", "950", None).unwrap();
+        assert_eq!(sell["srcAmount"], json!("1000"));
+        assert_eq!(sell["slippage"], json!(VELORA_DEFAULT_SLIPPAGE_BPS));
+        assert!(sell.get("destAmount").is_none());
+
+        let mut buy = json!({});
+        set_velora_transaction_amount_constraints(&mut buy, "BUY", "1100", "1000", None).unwrap();
+        assert_eq!(buy["destAmount"], json!("1000"));
+        assert_eq!(buy["slippage"], json!(VELORA_DEFAULT_SLIPPAGE_BPS));
+        assert!(buy.get("srcAmount").is_none());
+    }
+
+    #[test]
+    fn velora_transaction_constraints_use_slippage_when_user_bound_exists() {
+        let mut sell = json!({});
+        set_velora_transaction_amount_constraints(&mut sell, "SELL", "1000", "950", Some(500))
+            .unwrap();
+        assert_eq!(sell["srcAmount"], json!("1000"));
+        assert_eq!(sell["slippage"], json!(500));
+        assert!(sell.get("destAmount").is_none());
+
+        let mut buy = json!({});
+        set_velora_transaction_amount_constraints(&mut buy, "BUY", "1100", "1000", Some(1000))
+            .unwrap();
+        assert_eq!(buy["destAmount"], json!("1000"));
+        assert_eq!(buy["slippage"], json!(1000));
+        assert!(buy.get("srcAmount").is_none());
     }
 
     #[test]
@@ -6821,7 +6927,7 @@ mod hyperliquid_math_tests {
     fn cctp_exact_in_quote_deducts_circle_fee() {
         let order_kind = MarketOrderKind::ExactIn {
             amount_in: "1000000".to_string(),
-            min_amount_out: "1".to_string(),
+            min_amount_out: Some("1".to_string()),
         };
 
         assert_eq!(
@@ -6838,7 +6944,7 @@ mod hyperliquid_math_tests {
     fn cctp_exact_out_quote_grosses_up_circle_fee() {
         let order_kind = MarketOrderKind::ExactOut {
             amount_out: "999870".to_string(),
-            max_amount_in: "1000000".to_string(),
+            max_amount_in: Some("1000000".to_string()),
         };
 
         assert_eq!(
@@ -6855,7 +6961,7 @@ mod hyperliquid_math_tests {
     fn cctp_quote_math_uses_wide_intermediates_and_rejects_true_overflow() {
         let fee_free = MarketOrderKind::ExactOut {
             amount_out: U256::MAX.to_string(),
-            max_amount_in: U256::MAX.to_string(),
+            max_amount_in: Some(U256::MAX.to_string()),
         };
         assert_eq!(
             cctp_quote_amounts(&fee_free, 0).unwrap(),
@@ -6868,7 +6974,7 @@ mod hyperliquid_math_tests {
 
         let fee_bearing = MarketOrderKind::ExactOut {
             amount_out: U256::MAX.to_string(),
-            max_amount_in: U256::MAX.to_string(),
+            max_amount_in: Some(U256::MAX.to_string()),
         };
         assert!(cctp_quote_amounts(&fee_bearing, 1).is_err());
     }
@@ -6946,7 +7052,7 @@ mod hyperliquid_math_tests {
             5,
             &MarketOrderKind::ExactIn {
                 amount_in: "120930796".to_string(),
-                min_amount_out: "1".to_string(),
+                min_amount_out: Some("1".to_string()),
             },
             &book,
         )
@@ -6965,7 +7071,7 @@ mod hyperliquid_math_tests {
             4,
             &MarketOrderKind::ExactIn {
                 amount_in: "98577278".to_string(),
-                min_amount_out: "1".to_string(),
+                min_amount_out: Some("1".to_string()),
             },
             &book,
         )
@@ -6984,7 +7090,7 @@ mod hyperliquid_math_tests {
             8,
             &MarketOrderKind::ExactOut {
                 amount_out: "1".to_string(),
-                max_amount_in: "1".to_string(),
+                max_amount_in: Some("1".to_string()),
             },
             &book,
         )
@@ -7003,13 +7109,60 @@ mod hyperliquid_math_tests {
             5,
             &MarketOrderKind::ExactOut {
                 amount_out: "1000000".to_string(),
-                max_amount_in: "2000".to_string(),
+                max_amount_in: Some("2000".to_string()),
             },
             &book,
         )
         .unwrap();
 
         assert_eq!(amount_in, "2000");
+    }
+
+    #[test]
+    fn hyperliquid_action_amount_format_converts_router_raw_to_human_decimal() {
+        assert_eq!(format_hyperliquid_amount("100000000", 8).unwrap(), "1");
+        assert_eq!(
+            format_hyperliquid_amount("12345678", 8).unwrap(),
+            "0.12345678"
+        );
+        assert_eq!(
+            format_hyperliquid_amount("1000000000000000000", 18).unwrap(),
+            "1"
+        );
+        assert_eq!(
+            format_hyperliquid_amount("1", 18).unwrap(),
+            "0.000000000000000001"
+        );
+
+        let error = format_hyperliquid_amount("0.1", 8)
+            .expect_err("router raw amount strings must reject decimal points");
+        assert!(
+            error.contains("non-negative integer string"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn hyperliquid_balance_amount_format_expands_human_decimal_to_router_raw() {
+        assert_eq!(
+            parse_decimal_to_raw_units("1", 8).unwrap(),
+            U256::from(100_000_000_u64)
+        );
+        assert_eq!(
+            parse_decimal_to_raw_units("0.12345678", 8).unwrap(),
+            U256::from(12_345_678_u64)
+        );
+        assert_eq!(
+            parse_decimal_to_raw_units("0.000000000000000001", 18).unwrap(),
+            U256::from(1_u64)
+        );
+
+        let error = parse_decimal_to_raw_units("0.123456789", 8)
+            .expect_err("strict parser must reject precision beyond asset decimals");
+        assert!(
+            error.contains("more than 8 fractional digits"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -7039,7 +7192,7 @@ mod hyperliquid_math_tests {
             },
             order_kind: MarketOrderKind::ExactIn {
                 amount_in: "1000000".to_string(),
-                min_amount_out: "990000".to_string(),
+                min_amount_out: Some("990000".to_string()),
             },
             recipient_address: "0x1111111111111111111111111111111111111111".to_string(),
             depositor_address: "0x2222222222222222222222222222222222222222".to_string(),
@@ -7052,7 +7205,7 @@ mod hyperliquid_math_tests {
         let mut malformed_amount = across_quote_request();
         malformed_amount.order_kind = MarketOrderKind::ExactIn {
             amount_in: "not-raw".to_string(),
-            min_amount_out: "990000".to_string(),
+            min_amount_out: Some("990000".to_string()),
         };
         let error = build_across_swap_approval_request(&malformed_amount, "rift")
             .expect_err("malformed amount must be rejected");
@@ -7104,7 +7257,7 @@ mod hyperliquid_math_tests {
                 },
                 order_kind: MarketOrderKind::ExactIn {
                     amount_in: "101000000".to_string(),
-                    min_amount_out: "1".to_string(),
+                    min_amount_out: Some("1".to_string()),
                 },
                 recipient_address: "0x0000000000000000000000000000000000000001".to_string(),
                 depositor_address: "0x0000000000000000000000000000000000000002".to_string(),
@@ -7149,7 +7302,7 @@ mod hyperliquid_math_tests {
                 },
                 order_kind: MarketOrderKind::ExactOut {
                     amount_out: "100000000".to_string(),
-                    max_amount_in: U256::MAX.to_string(),
+                    max_amount_in: Some(U256::MAX.to_string()),
                 },
                 recipient_address: "0x0000000000000000000000000000000000000001".to_string(),
                 depositor_address: "0x0000000000000000000000000000000000000002".to_string(),
@@ -7183,7 +7336,7 @@ mod hyperliquid_math_tests {
                 },
                 order_kind: MarketOrderKind::ExactOut {
                     amount_out: U256::MAX.to_string(),
-                    max_amount_in: U256::MAX.to_string(),
+                    max_amount_in: Some(U256::MAX.to_string()),
                 },
                 recipient_address: "0x0000000000000000000000000000000000000001".to_string(),
                 depositor_address: "0x0000000000000000000000000000000000000002".to_string(),
@@ -7209,7 +7362,7 @@ mod hyperliquid_math_tests {
             &btc,
             &MarketOrderKind::ExactIn {
                 amount_in: "59984517".to_string(),
-                min_amount_out: "1".to_string(),
+                min_amount_out: Some("1".to_string()),
             },
             "59984517",
             "77000",
@@ -7235,7 +7388,7 @@ mod hyperliquid_math_tests {
             &btc,
             &MarketOrderKind::ExactOut {
                 amount_out: "77000".to_string(),
-                max_amount_in: "100000000".to_string(),
+                max_amount_in: Some("100000000".to_string()),
             },
             "59984517",
             "77000",

@@ -219,6 +219,7 @@ const EXECUTION_LEG_SELECT_COLUMNS: &str = r#"
     actual_amount_out,
     started_at,
     completed_at,
+    provider_quote_expires_at,
     details_json,
     usd_valuation_json,
     created_at,
@@ -245,6 +246,7 @@ const EXECUTION_LEG_RETURNING_COLUMNS: &str = r#"
     leg.actual_amount_out,
     leg.started_at,
     leg.completed_at,
+    leg.provider_quote_expires_at,
     leg.details_json,
     leg.usd_valuation_json,
     leg.created_at,
@@ -261,6 +263,8 @@ const EXECUTION_ATTEMPT_SELECT_COLUMNS: &str = r#"
     trigger_provider_operation_id,
     failure_reason_json,
     input_custody_snapshot_json,
+    superseded_by_attempt_id,
+    superseded_reason_json,
     created_at,
     updated_at
 "#;
@@ -322,11 +326,7 @@ impl OrderRepository {
         .bind(&quote.amount_out)
         .bind(quote.min_amount_out.clone())
         .bind(quote.max_amount_in.clone())
-        .bind(
-            i64::try_from(quote.slippage_bps).map_err(|err| RouterServerError::Validation {
-                message: format!("quote slippage_bps does not fit i64: {err}"),
-            })?,
-        )
+        .bind(optional_slippage_bps_i64(quote.slippage_bps, "quote")?)
         .bind(quote.provider_quote.clone())
         .bind(quote.usd_valuation.clone())
         .bind(quote.expires_at)
@@ -475,11 +475,10 @@ impl OrderRepository {
             .bind(market_action.min_amount_out)
             .bind(market_action.amount_out)
             .bind(market_action.max_amount_in)
-            .bind(i64::try_from(market_action.slippage_bps).map_err(|err| {
-                RouterServerError::Validation {
-                    message: format!("order slippage_bps does not fit i64: {err}"),
-                }
-            })?)
+            .bind(optional_slippage_bps_i64(
+                market_action.slippage_bps,
+                "order",
+            )?)
             .bind(order.created_at)
             .bind(order.updated_at)
             .execute(&mut *tx)
@@ -1019,6 +1018,7 @@ impl OrderRepository {
               AND ro.status IN ('funded', 'executing', 'refund_required', 'refunding')
               AND oes.step_index > 0
               AND oes.status IN ('planned', 'ready')
+              AND (oes.next_attempt_at IS NULL OR oes.next_attempt_at <= NOW())
               AND NOT EXISTS (
                   SELECT 1
                   FROM order_execution_steps prior
@@ -1267,10 +1267,12 @@ impl OrderRepository {
                 trigger_provider_operation_id,
                 failure_reason_json,
                 input_custody_snapshot_json,
+                superseded_by_attempt_id,
+                superseded_reason_json,
                 created_at,
                 updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             "#,
         )
         .bind(attempt.id)
@@ -1282,6 +1284,8 @@ impl OrderRepository {
         .bind(attempt.trigger_provider_operation_id)
         .bind(attempt.failure_reason.clone())
         .bind(attempt.input_custody_snapshot.clone())
+        .bind(Option::<Uuid>::None)
+        .bind(serde_json::json!({}))
         .bind(attempt.created_at)
         .bind(attempt.updated_at)
         .execute(&self.pool)
@@ -1293,6 +1297,96 @@ impl OrderRepository {
         );
         result?;
         Ok(())
+    }
+
+    pub async fn create_refreshed_execution_attempt(
+        &self,
+        active_attempt_id: Uuid,
+        refreshed_attempt: &OrderExecutionAttempt,
+        superseded_reason: serde_json::Value,
+        updated_at: DateTime<Utc>,
+    ) -> RouterServerResult<OrderExecutionAttempt> {
+        let started = Instant::now();
+        let result = async {
+            let mut tx = self.pool.begin().await?;
+            let superseded_row = sqlx_core::query::query(
+                r#"
+                UPDATE order_execution_attempts
+                SET
+                    status = 'superseded',
+                    superseded_reason_json = $2,
+                    updated_at = $3
+                WHERE id = $1
+                  AND status IN ('planning', 'active')
+                RETURNING id
+                "#,
+            )
+            .bind(active_attempt_id)
+            .bind(superseded_reason.clone())
+            .bind(updated_at)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if superseded_row.is_none() {
+                return Err(RouterServerError::NotFound);
+            }
+
+            let inserted = sqlx_core::query::query(&format!(
+                r#"
+                INSERT INTO order_execution_attempts (
+                    id,
+                    order_id,
+                    attempt_index,
+                    attempt_kind,
+                    status,
+                    trigger_step_id,
+                    trigger_provider_operation_id,
+                    failure_reason_json,
+                    input_custody_snapshot_json,
+                    superseded_by_attempt_id,
+                    superseded_reason_json,
+                    created_at,
+                    updated_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, '{{}}'::jsonb, $10, $11)
+                RETURNING {EXECUTION_ATTEMPT_SELECT_COLUMNS}
+                "#
+            ))
+            .bind(refreshed_attempt.id)
+            .bind(refreshed_attempt.order_id)
+            .bind(refreshed_attempt.attempt_index)
+            .bind(refreshed_attempt.attempt_kind.to_db_string())
+            .bind(refreshed_attempt.status.to_db_string())
+            .bind(refreshed_attempt.trigger_step_id)
+            .bind(refreshed_attempt.trigger_provider_operation_id)
+            .bind(refreshed_attempt.failure_reason.clone())
+            .bind(refreshed_attempt.input_custody_snapshot.clone())
+            .bind(refreshed_attempt.created_at)
+            .bind(refreshed_attempt.updated_at)
+            .fetch_one(&mut *tx)
+            .await?;
+
+            sqlx_core::query::query(
+                r#"
+                UPDATE order_execution_attempts
+                SET superseded_by_attempt_id = $2
+                WHERE id = $1
+                "#,
+            )
+            .bind(active_attempt_id)
+            .bind(refreshed_attempt.id)
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+            self.map_execution_attempt_row(&inserted)
+        }
+        .await;
+        telemetry::record_db_query(
+            "order.create_refreshed_execution_attempt",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        result
     }
 
     pub async fn get_execution_attempt(
@@ -2774,6 +2868,7 @@ impl OrderRepository {
                         actual_amount_out,
                         started_at,
                         completed_at,
+                        provider_quote_expires_at,
                         details_json,
                         usd_valuation_json,
                         created_at,
@@ -2781,7 +2876,7 @@ impl OrderRepository {
                     )
                     VALUES (
                         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                        $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23
+                        $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24
                     )
                     ON CONFLICT (execution_attempt_id, leg_index)
                     WHERE execution_attempt_id IS NOT NULL DO NOTHING
@@ -2808,6 +2903,7 @@ impl OrderRepository {
                         actual_amount_out,
                         started_at,
                         completed_at,
+                        provider_quote_expires_at,
                         details_json,
                         usd_valuation_json,
                         created_at,
@@ -2815,7 +2911,7 @@ impl OrderRepository {
                     )
                     VALUES (
                         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                        $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23
+                        $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24
                     )
                     ON CONFLICT (order_id, leg_index)
                     WHERE execution_attempt_id IS NULL DO NOTHING
@@ -2841,6 +2937,7 @@ impl OrderRepository {
                     .bind(leg.actual_amount_out.clone())
                     .bind(leg.started_at)
                     .bind(leg.completed_at)
+                    .bind(leg.provider_quote_expires_at)
                     .bind(leg.details.clone())
                     .bind(leg.usd_valuation.clone())
                     .bind(leg.created_at)
@@ -3384,11 +3481,12 @@ impl OrderRepository {
                     COUNT(*) AS total_actions,
                     BOOL_OR(status = 'failed') AS has_failed,
                     BOOL_OR(status = 'cancelled') AS has_cancelled,
+                    BOOL_OR(status = 'superseded') AS has_superseded,
                     BOOL_OR(status = 'running') AS has_running,
                     BOOL_OR(status = 'waiting') AS has_waiting,
                     BOOL_OR(status = 'ready') AS has_ready,
                     COUNT(*) FILTER (WHERE status = 'completed') AS completed_actions,
-                    COUNT(*) FILTER (WHERE status IN ('completed', 'skipped')) AS terminal_actions,
+                    COUNT(*) FILTER (WHERE status IN ('completed', 'skipped', 'superseded')) AS terminal_actions,
                     MIN(started_at) FILTER (WHERE started_at IS NOT NULL) AS first_started_at,
                     MAX(completed_at) FILTER (WHERE completed_at IS NOT NULL) AS last_completed_at
                 FROM current_actions
@@ -3422,6 +3520,10 @@ impl OrderRepository {
                         WHEN action_summary.total_actions > 0
                              AND action_summary.completed_actions = action_summary.total_actions
                             THEN 'completed'
+                        WHEN action_summary.total_actions > 0
+                             AND action_summary.terminal_actions = action_summary.total_actions
+                             AND action_summary.has_superseded
+                            THEN 'superseded'
                         WHEN action_summary.total_actions > 0
                              AND action_summary.terminal_actions = action_summary.total_actions
                             THEN 'skipped'
@@ -3689,7 +3791,7 @@ impl OrderRepository {
         Ok(())
     }
 
-    pub async fn skip_execution_steps_after_index(
+    pub async fn supersede_execution_steps_after_index(
         &self,
         execution_attempt_id: Uuid,
         after_step_index: i32,
@@ -3701,7 +3803,7 @@ impl OrderRepository {
             r#"
             UPDATE order_execution_steps
             SET
-                status = 'skipped',
+                status = 'superseded',
                 error_json = $3,
                 completed_at = COALESCE(completed_at, $4),
                 updated_at = $4
@@ -3718,7 +3820,7 @@ impl OrderRepository {
         .fetch_all(&self.pool)
         .await;
         telemetry::record_db_query(
-            "order.skip_execution_steps_after_index",
+            "order.supersede_execution_steps_after_index",
             result.is_ok(),
             started.elapsed(),
         );
@@ -3993,6 +4095,43 @@ impl OrderRepository {
         Ok(step)
     }
 
+    pub async fn fail_unstarted_execution_step(
+        &self,
+        id: Uuid,
+        error: serde_json::Value,
+        failed_at: DateTime<Utc>,
+    ) -> RouterServerResult<OrderExecutionStep> {
+        let started = Instant::now();
+        let result = sqlx_core::query::query(&format!(
+            r#"
+            UPDATE order_execution_steps
+            SET
+                status = 'failed',
+                error_json = $2,
+                completed_at = $3,
+                updated_at = $3
+            WHERE id = $1
+              AND status IN ('planned', 'ready')
+            RETURNING {EXECUTION_STEP_SELECT_COLUMNS}
+            "#
+        ))
+        .bind(id)
+        .bind(error)
+        .bind(failed_at)
+        .fetch_one(&self.pool)
+        .await;
+        telemetry::record_db_query(
+            "order.fail_unstarted_execution_step",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        let row = result?;
+
+        let step = self.map_execution_step_row(&row)?;
+        self.refresh_execution_leg_for_step(&step).await?;
+        Ok(step)
+    }
+
     pub async fn fail_observed_execution_step(
         &self,
         id: Uuid,
@@ -4100,17 +4239,21 @@ impl OrderRepository {
                 let order_kind = match order_kind {
                     MarketOrderKindType::ExactIn => MarketOrderKind::ExactIn {
                         amount_in: required_action_amount(row, "market_order_amount_in")?,
-                        min_amount_out: required_action_amount(row, "market_order_min_amount_out")?,
+                        min_amount_out: row.get("market_order_min_amount_out"),
                     },
                     MarketOrderKindType::ExactOut => MarketOrderKind::ExactOut {
                         amount_out: required_action_amount(row, "market_order_amount_out")?,
-                        max_amount_in: required_action_amount(row, "market_order_max_amount_in")?,
+                        max_amount_in: row.get("market_order_max_amount_in"),
                     },
                 };
-                let slippage_bps = u64::try_from(row.get::<i64, _>("market_order_slippage_bps"))
-                    .map_err(|err| RouterServerError::InvalidData {
-                        message: format!("invalid market order slippage_bps: {err}"),
-                    })?;
+                let slippage_bps = row
+                    .get::<Option<i64>, _>("market_order_slippage_bps")
+                    .map(|value| {
+                        u64::try_from(value).map_err(|err| RouterServerError::InvalidData {
+                            message: format!("invalid market order slippage_bps: {err}"),
+                        })
+                    })
+                    .transpose()?;
 
                 Ok(RouterOrderAction::MarketOrder(
                     crate::models::MarketOrderAction {
@@ -4177,11 +4320,14 @@ impl OrderRepository {
             amount_out: row.get("amount_out"),
             min_amount_out: row.get("min_amount_out"),
             max_amount_in: row.get("max_amount_in"),
-            slippage_bps: u64::try_from(row.get::<i64, _>("slippage_bps")).map_err(|err| {
-                RouterServerError::InvalidData {
-                    message: format!("invalid quote slippage_bps: {err}"),
-                }
-            })?,
+            slippage_bps: row
+                .get::<Option<i64>, _>("slippage_bps")
+                .map(|value| {
+                    u64::try_from(value).map_err(|err| RouterServerError::InvalidData {
+                        message: format!("invalid quote slippage_bps: {err}"),
+                    })
+                })
+                .transpose()?,
             provider_quote: row.get("provider_quote"),
             usd_valuation: row.get("usd_valuation_json"),
             expires_at: row.get("expires_at"),
@@ -4490,6 +4636,7 @@ impl OrderRepository {
             actual_amount_out: row.get("actual_amount_out"),
             started_at: row.get("started_at"),
             completed_at: row.get("completed_at"),
+            provider_quote_expires_at: row.get("provider_quote_expires_at"),
             details: row.get("details_json"),
             usd_valuation: row.get("usd_valuation_json"),
             created_at: row.get("created_at"),
@@ -4569,6 +4716,12 @@ fn ensure_execution_leg_plan_matches(
     if existing.min_amount_out != planned.min_amount_out {
         mismatches.push("min_amount_out");
     }
+    if !same_timestamptz_at_db_precision(
+        existing.provider_quote_expires_at,
+        planned.provider_quote_expires_at,
+    ) {
+        mismatches.push("provider_quote_expires_at");
+    }
     if existing.details != planned.details {
         mismatches.push("details");
     }
@@ -4585,6 +4738,17 @@ fn ensure_execution_leg_plan_matches(
             mismatches.join(", ")
         ),
     })
+}
+
+fn same_timestamptz_at_db_precision(
+    left: Option<DateTime<Utc>>,
+    right: Option<DateTime<Utc>>,
+) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left.timestamp_micros() == right.timestamp_micros(),
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 fn ensure_execution_step_plan_matches(
@@ -4687,7 +4851,7 @@ struct MarketOrderActionFields {
     min_amount_out: Option<String>,
     amount_out: Option<String>,
     max_amount_in: Option<String>,
-    slippage_bps: u64,
+    slippage_bps: Option<u64>,
 }
 
 fn market_order_action_fields(
@@ -4701,7 +4865,7 @@ fn market_order_action_fields(
             } => Ok(MarketOrderActionFields {
                 order_kind: MarketOrderKindType::ExactIn,
                 amount_in: Some(amount_in.clone()),
-                min_amount_out: Some(min_amount_out.clone()),
+                min_amount_out: min_amount_out.clone(),
                 amount_out: None,
                 max_amount_in: None,
                 slippage_bps: action.slippage_bps,
@@ -4714,7 +4878,7 @@ fn market_order_action_fields(
                 amount_in: None,
                 min_amount_out: None,
                 amount_out: Some(amount_out.clone()),
-                max_amount_in: Some(max_amount_in.clone()),
+                max_amount_in: max_amount_in.clone(),
                 slippage_bps: action.slippage_bps,
             }),
         },
@@ -4722,6 +4886,19 @@ fn market_order_action_fields(
             message: "expected market order action".to_string(),
         }),
     }
+}
+
+fn optional_slippage_bps_i64(
+    slippage_bps: Option<u64>,
+    owner: &str,
+) -> RouterServerResult<Option<i64>> {
+    slippage_bps
+        .map(|value| {
+            i64::try_from(value).map_err(|err| RouterServerError::Validation {
+                message: format!("{owner} slippage_bps does not fit i64: {err}"),
+            })
+        })
+        .transpose()
 }
 
 fn limit_order_action_fields(action: &RouterOrderAction) -> RouterServerResult<LimitOrderAction> {

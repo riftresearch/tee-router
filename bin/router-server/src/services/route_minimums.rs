@@ -25,7 +25,10 @@ const UNIT_BTC_MINIMUM_SATS: u64 = 30_000;
 const UNIT_ETH_MINIMUM_WEI: u128 = 7_000_000_000_000_000;
 const STABLECOIN_MINIMUM_RAW: u64 = 1_000_000;
 const HYPERLIQUID_BRIDGE_MINIMUM_USDC: u64 = 5_000_000;
+// Reserve the one-quote-token HyperCore activation fee for fresh Unit
+// withdrawal protocol addresses.
 const HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW: u64 = 1_000_000;
+const HYPERLIQUID_CORE_ACTIVATION_FEE_RAW: u64 = HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW;
 const MAX_PATH_DEPTH: usize = 5;
 const TOP_K_PATHS: usize = 8;
 
@@ -354,9 +357,7 @@ impl RouteMinimumService {
                         output_asset: &transition.output.asset,
                         amount_in: &required_output,
                         amount_out: &required_output,
-                        raw: json!({
-                            "recipient_address": recipient_address,
-                        }),
+                        raw: unit_withdrawal_floor_raw(recipient_address),
                     }));
                 }
                 MarketOrderTransitionKind::HyperliquidTrade => {
@@ -547,7 +548,7 @@ async fn quote_exchange_exact_out(
             output_decimals,
             order_kind: MarketOrderKind::ExactOut {
                 amount_out: amount_out.to_string(),
-                max_amount_in: exact_out_cap_for_asset(input_asset).to_string(),
+                max_amount_in: Some(exact_out_cap_for_asset(input_asset).to_string()),
             },
             sender_address: None,
             recipient_address: recipient_address.to_string(),
@@ -583,7 +584,7 @@ async fn quote_bridge_exact_out(
             destination_asset: destination_asset.clone(),
             order_kind: MarketOrderKind::ExactOut {
                 amount_out: amount_out.to_string(),
-                max_amount_in: exact_out_cap_for_asset(source_asset).to_string(),
+                max_amount_in: Some(exact_out_cap_for_asset(source_asset).to_string()),
             },
             recipient_address: recipient_address.to_string(),
             depositor_address: depositor_address.to_string(),
@@ -677,6 +678,23 @@ fn transition_floor_leg_json(spec: TransitionFloorLegSpec<'_>) -> Value {
         "amount_in": spec.amount_in,
         "amount_out": spec.amount_out,
         "raw": spec.raw,
+    })
+}
+
+fn unit_withdrawal_floor_raw(recipient_address: &str) -> Value {
+    json!({
+        "recipient_address": recipient_address,
+        "hyperliquid_core_activation_fee": hyperliquid_core_activation_fee_floor_json(),
+    })
+}
+
+fn hyperliquid_core_activation_fee_floor_json() -> Value {
+    json!({
+        "kind": "first_transfer_to_new_hypercore_destination",
+        "quote_asset": "USDC",
+        "amount_raw": HYPERLIQUID_CORE_ACTIVATION_FEE_RAW.to_string(),
+        "amount_decimal": "1",
+        "source": "hyperliquid_activation_gas_fee",
     })
 }
 

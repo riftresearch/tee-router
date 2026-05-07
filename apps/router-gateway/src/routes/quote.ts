@@ -65,13 +65,6 @@ export const QuoteRequestSchema = z
         path: ['fromAmount']
       })
     }
-    if (orderType === 'market_order' && value.maxSlippage === undefined) {
-      ctx.addIssue({
-        code: 'custom',
-        message: 'maxSlippage is required for market orders',
-        path: ['maxSlippage']
-      })
-    }
     if (
       orderType === 'limit_order' &&
       (value.fromAmount === undefined || value.toAmount === undefined)
@@ -154,7 +147,10 @@ export function createQuoteHandler(
         return c.json(presentQuoteEnvelope(envelope, amountFormat), 201)
       }
 
-      const slippageBps = parseSlippageBps(request.maxSlippage as string, amountFormat)
+      const slippageBps =
+        request.maxSlippage === undefined
+          ? undefined
+          : parseSlippageBps(request.maxSlippage, amountFormat)
       const orderKind =
         request.fromAmount !== undefined
           ? {
@@ -165,7 +161,7 @@ export function createQuoteHandler(
                 amountFormat,
                 'fromAmount'
               ),
-              slippage_bps: slippageBps
+              ...(slippageBps === undefined ? {} : { slippage_bps: slippageBps })
             }
           : {
               kind: 'exact_out' as const,
@@ -175,7 +171,7 @@ export function createQuoteHandler(
                 amountFormat,
                 'toAmount'
               ),
-              slippage_bps: slippageBps
+              ...(slippageBps === undefined ? {} : { slippage_bps: slippageBps })
             }
 
       const envelope = await routerClientFor(config, deps).createQuote({

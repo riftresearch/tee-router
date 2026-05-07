@@ -96,9 +96,30 @@ export const QuoteResponseSchema = z
     maxIn: z.string().optional().openapi({
       example: '10.1'
     }),
-    maxSlippage: z.string().openapi({
+    maxSlippage: z.string().optional().openapi({
       example: '1.5'
     }),
+    fees: z
+      .array(
+        z.object({
+          kind: z.string().openapi({
+            example: 'hyperliquid_core_activation_fee'
+          }),
+          label: z.string().openapi({
+            example: 'Hyperliquid activation fee'
+          }),
+          asset: z.string().openapi({
+            example: 'Hyperliquid.USDC'
+          }),
+          amount: z.string().openapi({
+            example: '1'
+          }),
+          amountRaw: z.string().openapi({
+            example: '1000000'
+          })
+        })
+      )
+      .optional(),
     amountFormat: AmountFormatSchema
   })
   .openapi('QuoteResponse')
@@ -144,9 +165,30 @@ export const OrderResponseSchema = z
     maxIn: z.string().optional().openapi({
       example: '10.1'
     }),
-    maxSlippage: z.string().openapi({
+    maxSlippage: z.string().optional().openapi({
       example: '1.5'
     }),
+    fees: z
+      .array(
+        z.object({
+          kind: z.string().openapi({
+            example: 'hyperliquid_core_activation_fee'
+          }),
+          label: z.string().openapi({
+            example: 'Hyperliquid activation fee'
+          }),
+          asset: z.string().openapi({
+            example: 'Hyperliquid.USDC'
+          }),
+          amount: z.string().openapi({
+            example: '1'
+          }),
+          amountRaw: z.string().openapi({
+            example: '1000000'
+          })
+        })
+      )
+      .optional(),
     amountFormat: AmountFormatSchema,
     refundMode: RefundModeSchema.optional(),
     refundAuthorizer: z.string().nullable().optional().openapi({

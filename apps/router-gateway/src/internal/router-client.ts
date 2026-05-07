@@ -69,7 +69,8 @@ export type InternalMarketOrderQuote = {
   amount_out: string
   min_amount_out?: string | null
   max_amount_in?: string | null
-  slippage_bps: number
+  slippage_bps?: number | null
+  provider_quote?: unknown
   expires_at: string
   created_at: string
 }
@@ -99,12 +100,12 @@ export type CreateQuoteRequest =
       | {
           kind: 'exact_in'
           amount_in: string
-          slippage_bps: number
+          slippage_bps?: number
         }
       | {
           kind: 'exact_out'
           amount_out: string
-          slippage_bps: number
+          slippage_bps?: number
         }
     ))
   | {
@@ -119,7 +120,6 @@ export type CreateQuoteRequest =
 export type CreateOrderRequest = {
   quote_id: string
   refund_address: string
-  cancel_after?: string
   idempotency_key: string
   metadata?: Record<string, unknown>
 }
@@ -322,7 +322,7 @@ function isMarketQuote(
     amount(value.amount_out) &&
     optionalAmount(value.min_amount_out) &&
     optionalAmount(value.max_amount_in) &&
-    isSlippageBps(value.slippage_bps) &&
+    optionalSlippageBps(value.slippage_bps) &&
     isBoundedString(value.expires_at, MAX_INTERNAL_DATETIME_LENGTH) &&
     isBoundedString(value.created_at, MAX_INTERNAL_DATETIME_LENGTH)
   )
@@ -391,6 +391,10 @@ function isSlippageBps(value: unknown): value is number {
     value >= 0 &&
     value <= 10_000
   )
+}
+
+function optionalSlippageBps(value: unknown): boolean {
+  return value === undefined || value === null || isSlippageBps(value)
 }
 
 async function readResponseBody(response: Response): Promise<unknown> {

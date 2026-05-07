@@ -877,11 +877,13 @@ impl VaultRepository {
         let result = sqlx_core::query::query(&format!(
             r#"
             WITH candidates AS (
-                SELECT id
-                FROM deposit_vaults
-                WHERE cancel_after <= $1
-                  AND status = 'funded'
-                ORDER BY cancel_after ASC
+                SELECT dv.id
+                FROM deposit_vaults dv
+                JOIN custody_vaults cv ON cv.id = dv.id
+                WHERE dv.cancel_after <= $1
+                  AND dv.status = 'funded'
+                  AND cv.order_id IS NULL
+                ORDER BY dv.cancel_after ASC
                 LIMIT $4
                 FOR UPDATE SKIP LOCKED
             ),
@@ -979,8 +981,10 @@ impl VaultRepository {
             SELECT MIN(due_at) AS due_at
             FROM (
                 SELECT cancel_after AS due_at
-                FROM deposit_vaults
-                WHERE status = 'funded'
+                FROM deposit_vaults dv
+                JOIN custody_vaults cv ON cv.id = dv.id
+                WHERE dv.status = 'funded'
+                  AND cv.order_id IS NULL
 
                 UNION ALL
 

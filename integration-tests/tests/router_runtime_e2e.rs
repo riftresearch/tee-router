@@ -995,10 +995,10 @@ fn is_terminal_order_status(status: RouterOrderStatus) -> bool {
     matches!(
         status,
         RouterOrderStatus::Completed
-            | RouterOrderStatus::Failed
             | RouterOrderStatus::Expired
             | RouterOrderStatus::RefundRequired
             | RouterOrderStatus::Refunded
+            | RouterOrderStatus::ManualInterventionRequired
             | RouterOrderStatus::RefundManualInterventionRequired
     )
 }

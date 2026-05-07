@@ -29,7 +29,7 @@ use url::Url;
 use uuid::Uuid;
 
 mod support;
-use support::{box_error, retry_rpc, wait_for_successful_receipt};
+use support::{assert_raw_amount_string, box_error, retry_rpc, wait_for_successful_receipt};
 
 type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -104,7 +104,7 @@ async fn live_cctp_base_usdc_to_arbitrum_usdc_quote_and_observer_transcript() ->
             destination_asset: arbitrum_usdc_asset(),
             order_kind: MarketOrderKind::ExactIn {
                 amount_in: amount.to_string(),
-                min_amount_out: "1".to_string(),
+                min_amount_out: Some("1".to_string()),
             },
             recipient_address: "0x0000000000000000000000000000000000000001".to_string(),
             depositor_address: "0x0000000000000000000000000000000000000002".to_string(),
@@ -117,6 +117,8 @@ async fn live_cctp_base_usdc_to_arbitrum_usdc_quote_and_observer_transcript() ->
     assert_eq!(quote.provider_id, "cctp");
     assert_eq!(quote.amount_in, amount.to_string());
     assert_eq!(quote.amount_out, amount.to_string());
+    assert_raw_amount_string("cctp quote amount_in", &quote.amount_in);
+    assert_raw_amount_string("cctp quote amount_out", &quote.amount_out);
     assert_eq!(quote.provider_quote["source_domain"], json!(BASE_DOMAIN));
     assert_eq!(
         quote.provider_quote["destination_domain"],

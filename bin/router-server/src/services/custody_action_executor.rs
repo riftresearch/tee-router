@@ -1,3 +1,4 @@
+use super::bitcoin_funding::{observed_bitcoin_outpoint, ObservedBitcoinOutpoint};
 use crate::{
     config::Settings,
     db::Database,
@@ -14,7 +15,7 @@ use alloy::{
 };
 use bitcoin::secp256k1::Secp256k1;
 use bitcoin::{CompressedPublicKey, PrivateKey};
-use chains::{ChainOperations, ChainRegistry};
+use chains::{evm::EvmBroadcastPolicy, ChainOperations, ChainRegistry};
 use hyperliquid_client::{
     actions::Actions as HyperliquidActions, client::Network as HyperliquidNetwork,
     HyperliquidExchangeClient, HyperliquidInfoClient,
@@ -45,6 +46,13 @@ pub enum CustodyActionError {
 
     #[snafu(display("custody vault {} is missing a derivation salt", vault_id))]
     MissingDerivationSalt { vault_id: Uuid },
+
+    #[snafu(display(
+        "custody vault {} has invalid bitcoin funding observation: {}",
+        vault_id,
+        reason
+    ))]
+    InvalidBitcoinFundingObservation { vault_id: Uuid, reason: String },
 
     #[snafu(display(
         "derived address {} does not match custody vault {} address {}",
@@ -122,6 +130,12 @@ pub struct EvmCall {
     pub to_address: String,
     pub value: String,
     pub calldata: String,
+    #[serde(default, skip_serializing_if = "is_default_evm_broadcast_policy")]
+    pub broadcast_policy: EvmBroadcastPolicy,
+}
+
+fn is_default_evm_broadcast_policy(policy: &EvmBroadcastPolicy) -> bool {
+    *policy == EvmBroadcastPolicy::Standard
 }
 
 /// Hyperliquid exchange action submitted by the custody executor. The vault's
@@ -160,7 +174,7 @@ impl From<HyperliquidCallNetwork> for HyperliquidNetwork {
 }
 
 /// Wire-shape payload variants. `L1Action` carries a fully-formed L1 action
-/// (Order, Cancel, …); user-type actions like Withdraw3 / SpotSend get their
+/// (Order, Cancel, …); user-type actions like Withdraw3 / sendAsset get their
 /// own variants because their signing domains and envelopes differ.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -178,6 +192,13 @@ pub enum HyperliquidCallPayload {
     },
     SpotSend {
         destination: String,
+        token: String,
+        amount: String,
+    },
+    SendAsset {
+        destination: String,
+        source_dex: String,
+        destination_dex: String,
         token: String,
         amount: String,
     },
@@ -455,10 +476,30 @@ impl CustodyActionExecutor {
                                     chain: vault.chain,
                                 });
                             };
-                            bitcoin_chain
-                                .transfer_native_amount(wallet.private_key(), &to_address, amount)
-                                .await
-                                .map_err(|source| CustodyActionError::Chain { source })?
+                            if let Some(outpoint) =
+                                self.observed_bitcoin_source_outpoint(&vault).await?
+                            {
+                                bitcoin_chain
+                                    .transfer_native_amount_from_outpoint(
+                                        wallet.private_key(),
+                                        &to_address,
+                                        amount,
+                                        &outpoint.tx_hash,
+                                        outpoint.vout,
+                                        outpoint.amount_sats,
+                                    )
+                                    .await
+                                    .map_err(|source| CustodyActionError::Chain { source })?
+                            } else {
+                                bitcoin_chain
+                                    .transfer_native_amount(
+                                        wallet.private_key(),
+                                        &to_address,
+                                        amount,
+                                    )
+                                    .await
+                                    .map_err(|source| CustodyActionError::Chain { source })?
+                            }
                         }
                         ChainType::Hyperliquid => {
                             return Err(CustodyActionError::UnsupportedAction {
@@ -516,7 +557,13 @@ impl CustodyActionExecutor {
                     .await
                     .map_err(|source| CustodyActionError::Chain { source })?;
                 let outcome = evm_chain
-                    .send_call(wallet.private_key(), &call.to_address, value, calldata)
+                    .send_call_with_broadcast_policy(
+                        wallet.private_key(),
+                        &call.to_address,
+                        value,
+                        calldata,
+                        call.broadcast_policy,
+                    )
                     .await
                     .map_err(|source| CustodyActionError::Chain { source })?;
                 (outcome.tx_hash, outcome.logs, None)
@@ -718,6 +765,27 @@ impl CustodyActionExecutor {
                 control_type: vault.control_type,
             }),
         }
+    }
+
+    async fn observed_bitcoin_source_outpoint(
+        &self,
+        vault: &CustodyVault,
+    ) -> CustodyActionResult<Option<ObservedBitcoinOutpoint>> {
+        if vault.role != CustodyVaultRole::SourceDeposit || vault.chain.as_str() != "bitcoin" {
+            return Ok(None);
+        }
+        let deposit_vault = self
+            .db
+            .vaults()
+            .get(vault.id)
+            .await
+            .map_err(|source| CustodyActionError::Database { source })?;
+        observed_bitcoin_outpoint(deposit_vault.funding_observation.as_ref()).map_err(|reason| {
+            CustodyActionError::InvalidBitcoinFundingObservation {
+                vault_id: vault.id,
+                reason,
+            }
+        })
     }
 
     async fn sweep_released_evm_vault(
@@ -1028,10 +1096,12 @@ impl CustodyActionExecutor {
             let token = info
                 .spot_token_wire(&balance.coin)
                 .map_err(|source| CustodyActionError::Hyperliquid { source })?;
-            let time_ms = current_hyperliquid_nonce_time_ms("release sweep spot_send")?;
+            let time_ms = current_hyperliquid_nonce_time_ms("release sweep send_asset")?;
             let response = client
-                .spot_send(
+                .send_asset(
                     paymaster_address.to_string(),
+                    "spot".to_string(),
+                    "spot".to_string(),
                     token.clone(),
                     balance.total.clone(),
                     time_ms,
@@ -1237,6 +1307,26 @@ async fn execute_hyperliquid_call(
                 .await
                 .map_err(|source| CustodyActionError::Hyperliquid { source })?
         }
+        HyperliquidCallPayload::SendAsset {
+            destination,
+            source_dex,
+            destination_dex,
+            token,
+            amount,
+        } => {
+            let time_ms = current_hyperliquid_nonce_time_ms("send_asset")?;
+            client
+                .send_asset(
+                    destination.clone(),
+                    source_dex.clone(),
+                    destination_dex.clone(),
+                    token.clone(),
+                    amount.clone(),
+                    time_ms,
+                )
+                .await
+                .map_err(|source| CustodyActionError::Hyperliquid { source })?
+        }
     };
 
     if let Some(reason) = hyperliquid_action_error(&response) {
@@ -1314,6 +1404,9 @@ fn synthesize_hyperliquid_tx_hash(
         }
         HyperliquidCallPayload::SpotSend { .. } => {
             synthetic_hyperliquid_response_hash(payload, response, "spot_send")
+        }
+        HyperliquidCallPayload::SendAsset { .. } => {
+            synthetic_hyperliquid_response_hash(payload, response, "send_asset")
         }
         HyperliquidCallPayload::L1Action { action } => match action {
             HyperliquidActions::ScheduleCancel(_) => {

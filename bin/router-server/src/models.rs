@@ -115,7 +115,7 @@ pub enum RouterOrderAction {
 pub struct MarketOrderAction {
     #[serde(flatten)]
     pub order_kind: MarketOrderKind,
-    pub slippage_bps: u64,
+    pub slippage_bps: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -123,11 +123,11 @@ pub struct MarketOrderAction {
 pub enum MarketOrderKind {
     ExactIn {
         amount_in: String,
-        min_amount_out: String,
+        min_amount_out: Option<String>,
     },
     ExactOut {
         amount_out: String,
-        max_amount_in: String,
+        max_amount_in: Option<String>,
     },
 }
 
@@ -227,7 +227,7 @@ pub struct MarketOrderQuote {
     pub amount_out: String,
     pub min_amount_out: Option<String>,
     pub max_amount_in: Option<String>,
-    pub slippage_bps: u64,
+    pub slippage_bps: Option<u64>,
     pub provider_quote: Value,
     pub usd_valuation: Value,
     pub expires_at: DateTime<Utc>,
@@ -829,6 +829,7 @@ impl ProviderAddressRole {
 pub enum OrderExecutionAttemptKind {
     PrimaryExecution,
     RetryExecution,
+    RefreshedExecution,
     RefundRecovery,
 }
 
@@ -838,6 +839,7 @@ impl OrderExecutionAttemptKind {
         match self {
             Self::PrimaryExecution => "primary_execution",
             Self::RetryExecution => "retry_execution",
+            Self::RefreshedExecution => "refreshed_execution",
             Self::RefundRecovery => "refund_recovery",
         }
     }
@@ -846,6 +848,7 @@ impl OrderExecutionAttemptKind {
         match value {
             "primary_execution" => Some(Self::PrimaryExecution),
             "retry_execution" => Some(Self::RetryExecution),
+            "refreshed_execution" => Some(Self::RefreshedExecution),
             "refund_recovery" => Some(Self::RefundRecovery),
             _ => None,
         }
@@ -861,6 +864,7 @@ pub enum OrderExecutionAttemptStatus {
     Failed,
     RefundRequired,
     ManualInterventionRequired,
+    Superseded,
 }
 
 impl OrderExecutionAttemptStatus {
@@ -873,6 +877,7 @@ impl OrderExecutionAttemptStatus {
             Self::Failed => "failed",
             Self::RefundRequired => "refund_required",
             Self::ManualInterventionRequired => "manual_intervention_required",
+            Self::Superseded => "superseded",
         }
     }
 
@@ -884,6 +889,7 @@ impl OrderExecutionAttemptStatus {
             "failed" => Some(Self::Failed),
             "refund_required" => Some(Self::RefundRequired),
             "manual_intervention_required" => Some(Self::ManualInterventionRequired),
+            "superseded" => Some(Self::Superseded),
             _ => None,
         }
     }
@@ -1041,6 +1047,7 @@ pub enum OrderExecutionStepStatus {
     Failed,
     Skipped,
     Cancelled,
+    Superseded,
 }
 
 impl OrderExecutionStepStatus {
@@ -1055,6 +1062,7 @@ impl OrderExecutionStepStatus {
             Self::Failed => "failed",
             Self::Skipped => "skipped",
             Self::Cancelled => "cancelled",
+            Self::Superseded => "superseded",
         }
     }
 
@@ -1068,6 +1076,7 @@ impl OrderExecutionStepStatus {
             "failed" => Some(Self::Failed),
             "skipped" => Some(Self::Skipped),
             "cancelled" => Some(Self::Cancelled),
+            "superseded" => Some(Self::Superseded),
             _ => None,
         }
     }
@@ -1123,6 +1132,7 @@ pub struct OrderExecutionLeg {
     pub actual_amount_out: Option<String>,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
+    pub provider_quote_expires_at: Option<DateTime<Utc>>,
     pub details: Value,
     pub usd_valuation: Value,
     pub created_at: DateTime<Utc>,

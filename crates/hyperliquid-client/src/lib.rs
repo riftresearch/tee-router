@@ -18,7 +18,7 @@ pub mod wire;
 
 pub use actions::{
     Actions, BulkCancel, BulkOrder, CancelRequest, Limit, Order, OrderRequest, ScheduleCancel,
-    SpotSend, Tif, UsdClassTransfer, Withdraw3,
+    SendAsset, SpotSend, Tif, UsdClassTransfer, Withdraw3,
 };
 pub use bridge::{
     bridge_address, build_bridge_deposit_tx, build_bridge_deposit_tx_to, minimum_bridge_deposit,

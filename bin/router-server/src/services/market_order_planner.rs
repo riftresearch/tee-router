@@ -84,6 +84,14 @@ pub struct MarketOrderRoutePlan {
     pub steps: Vec<OrderExecutionStep>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct MarketOrderPlanRemainingStart<'a> {
+    pub transition_decl_id: &'a str,
+    pub step_index: i32,
+    pub leg_index: i32,
+    pub planned_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone)]
 pub struct MarketOrderRoutePlanner {
     asset_registry: Arc<AssetRegistry>,
@@ -135,6 +143,64 @@ impl MarketOrderRoutePlanner {
         })
     }
 
+    pub fn plan_remaining(
+        &self,
+        order: &RouterOrder,
+        source_vault: &DepositVault,
+        quote: &MarketOrderQuote,
+        start: MarketOrderPlanRemainingStart<'_>,
+    ) -> MarketOrderRoutePlanResult<MarketOrderRoutePlan> {
+        self.validate_inputs(order, source_vault, quote)?;
+
+        let path = self.resolve_quoted_transition_path(order, quote)?;
+        let start_transition_index = path
+            .transitions
+            .iter()
+            .position(|transition| transition.id == start.transition_decl_id)
+            .ok_or_else(|| MarketOrderRoutePlanError::UnsupportedRoute {
+                reason: format!(
+                    "refreshed quote start transition {:?} is not in quoted path",
+                    start.transition_decl_id
+                ),
+            })?;
+        let materialized = materialize_transition_steps_range(
+            order,
+            source_vault,
+            quote,
+            &path,
+            TransitionMaterializationRange {
+                transition_index: start_transition_index,
+                step_index: start.step_index,
+                leg_index: start.leg_index,
+                planned_at: start.planned_at,
+            },
+        )?;
+        validate_leg_materialization(&materialized.legs)?;
+        validate_step_materialization(&materialized.steps)?;
+        validate_intermediate_custody_plan(&materialized.steps)?;
+
+        Ok(MarketOrderRoutePlan {
+            path_id: path.path_id,
+            transition_decl_ids: path
+                .transitions
+                .iter()
+                .map(|transition| transition.id.clone())
+                .collect(),
+            legs: materialized.legs,
+            steps: materialized.steps,
+        })
+    }
+
+    pub fn quoted_transition_path(
+        &self,
+        order: &RouterOrder,
+        quote: &MarketOrderQuote,
+    ) -> MarketOrderRoutePlanResult<Vec<TransitionDecl>> {
+        Ok(self
+            .resolve_quoted_transition_path(order, quote)?
+            .transitions)
+    }
+
     pub fn plan_limit_order(
         &self,
         order: &RouterOrder,
@@ -155,7 +221,7 @@ impl MarketOrderRoutePlanner {
             amount_out: quote.output_amount.clone(),
             min_amount_out: Some(quote.output_amount.clone()),
             max_amount_in: None,
-            slippage_bps: 0,
+            slippage_bps: Some(0),
             provider_quote: quote.provider_quote.clone(),
             usd_valuation: json!({}),
             expires_at: quote.expires_at,
@@ -382,13 +448,48 @@ fn materialize_transition_steps(
     path: &QuotedTransitionPath,
     planned_at: DateTime<Utc>,
 ) -> MarketOrderRoutePlanResult<MaterializedRoutePlan> {
+    materialize_transition_steps_range(
+        order,
+        source_vault,
+        quote,
+        path,
+        TransitionMaterializationRange {
+            transition_index: 0,
+            step_index: 1,
+            leg_index: 0,
+            planned_at,
+        },
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TransitionMaterializationRange {
+    transition_index: usize,
+    step_index: i32,
+    leg_index: i32,
+    planned_at: DateTime<Utc>,
+}
+
+fn materialize_transition_steps_range(
+    order: &RouterOrder,
+    source_vault: &DepositVault,
+    quote: &MarketOrderQuote,
+    path: &QuotedTransitionPath,
+    range: TransitionMaterializationRange,
+) -> MarketOrderRoutePlanResult<MaterializedRoutePlan> {
     let mut legs = QuoteLegIndex::from_quote(quote)?;
     let mut execution_legs = Vec::new();
     let mut steps = Vec::new();
-    let mut step_index = 1;
-    let mut leg_index = 0;
+    let mut step_index = range.step_index;
+    let mut leg_index = range.leg_index;
+    let planned_at = range.planned_at;
 
-    for (transition_index, transition) in path.transitions.iter().enumerate() {
+    for (transition_index, transition) in path
+        .transitions
+        .iter()
+        .enumerate()
+        .skip(range.transition_index)
+    {
         let is_final = transition_index + 1 == path.transitions.len();
         match transition.kind {
             MarketOrderTransitionKind::AcrossBridge => {
@@ -910,6 +1011,7 @@ fn execution_leg_from_quote_legs(
         actual_amount_out: None,
         started_at: None,
         completed_at: None,
+        provider_quote_expires_at: quote_legs.iter().map(|leg| leg.expires_at).min(),
         details: json!({
             "schema_version": 1,
             "transition_kind": transition.kind.as_str(),
@@ -1011,7 +1113,7 @@ fn unit_withdrawal_step(
         // `GET /gen` to obtain the protocol_address. The hydrator fills in
         // `hyperliquid_custody_vault_id`/`hyperliquid_custody_vault_address`
         // from the router's HL spot vault — that vault is what signs the
-        // spotSend custody action to the protocol_address.
+        // Hyperliquid sendAsset custody action to the protocol_address.
         request: json!({
             "order_id": order.id,
             "input_chain_id": input_asset.chain.as_str(),
@@ -2626,7 +2728,7 @@ mod tests {
             amount_out: "990".to_string(),
             min_amount_out: Some("980".to_string()),
             max_amount_in: None,
-            slippage_bps: 100,
+            slippage_bps: Some(100),
             provider_quote: json!({ "legs": legs }),
             usd_valuation: json!({}),
             expires_at: now + chrono::Duration::minutes(5),
@@ -2652,9 +2754,9 @@ mod tests {
             action: RouterOrderAction::MarketOrder(MarketOrderAction {
                 order_kind: MarketOrderKind::ExactIn {
                     amount_in: "1000".to_string(),
-                    min_amount_out: "900".to_string(),
+                    min_amount_out: Some("900".to_string()),
                 },
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             }),
             action_timeout_at: now + chrono::Duration::minutes(10),
             idempotency_key: None,
@@ -2826,7 +2928,7 @@ mod tests {
             amount_out: "990".to_string(),
             min_amount_out: Some("980".to_string()),
             max_amount_in: None,
-            slippage_bps: 100,
+            slippage_bps: Some(100),
             provider_quote: json!({
                 "transition_decl_ids": ["single:bridge", 7],
                 "transitions": [transition],
@@ -2975,9 +3077,9 @@ mod tests {
             action: RouterOrderAction::MarketOrder(MarketOrderAction {
                 order_kind: MarketOrderKind::ExactIn {
                     amount_in: "1000000000000000000".to_string(),
-                    min_amount_out: "1".to_string(),
+                    min_amount_out: Some("1".to_string()),
                 },
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             }),
             action_timeout_at: now + chrono::Duration::minutes(10),
             idempotency_key: None,
@@ -3018,7 +3120,7 @@ mod tests {
             amount_out: "999000000000000000".to_string(),
             min_amount_out: Some("1".to_string()),
             max_amount_in: None,
-            slippage_bps: 100,
+            slippage_bps: Some(100),
             provider_quote: json!({
                 "path_id": path.id,
                 "transition_decl_ids": transition_ids,
@@ -3107,9 +3209,9 @@ mod tests {
             action: RouterOrderAction::MarketOrder(MarketOrderAction {
                 order_kind: MarketOrderKind::ExactIn {
                     amount_in: "1000000000000000000".to_string(),
-                    min_amount_out: "900000000000000000".to_string(),
+                    min_amount_out: Some("900000000000000000".to_string()),
                 },
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             }),
             action_timeout_at: now + chrono::Duration::minutes(10),
             idempotency_key: None,
@@ -3191,7 +3293,7 @@ mod tests {
             amount_out: "950000000000000000".to_string(),
             min_amount_out: Some("900000000000000000".to_string()),
             max_amount_in: None,
-            slippage_bps: 526,
+            slippage_bps: Some(526),
             provider_quote: json!({
                 "path_id": path.id,
                 "transition_decl_ids": transition_ids,
@@ -3272,9 +3374,9 @@ mod tests {
             action: RouterOrderAction::MarketOrder(MarketOrderAction {
                 order_kind: MarketOrderKind::ExactIn {
                     amount_in: "1000000".to_string(),
-                    min_amount_out: "990000".to_string(),
+                    min_amount_out: Some("990000".to_string()),
                 },
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             }),
             action_timeout_at: now + chrono::Duration::minutes(10),
             idempotency_key: None,
@@ -3368,7 +3470,7 @@ mod tests {
             amount_out: "1000000".to_string(),
             min_amount_out: Some("990000".to_string()),
             max_amount_in: None,
-            slippage_bps: 100,
+            slippage_bps: Some(100),
             provider_quote: json!({
                 "path_id": path.id,
                 "transition_decl_ids": transition_ids,

@@ -22,7 +22,7 @@ use router_server::services::across_client::{
 use serde_json::{json, Value};
 
 mod support;
-use support::wait_for_successful_receipt;
+use support::{assert_raw_amount_string, wait_for_successful_receipt};
 
 type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -56,6 +56,8 @@ async fn live_across_swap_approval_transcript() -> TestResult<()> {
     let request = live_swap_request()?;
     let response = client.swap_approval(request.clone()).await?;
     let raw_response = fetch_raw_swap_approval(&client, &request).await?;
+    assert_across_response_amount_format(&response);
+    assert_across_raw_response_amount_format(&raw_response);
 
     emit_transcript(
         "across.swap_approval",
@@ -68,6 +70,35 @@ async fn live_across_swap_approval_transcript() -> TestResult<()> {
     );
 
     Ok(())
+}
+
+fn assert_across_response_amount_format(response: &AcrossSwapApprovalResponse) {
+    for (field, value) in [
+        ("inputAmount", response.input_amount.as_deref()),
+        ("maxInputAmount", response.max_input_amount.as_deref()),
+        (
+            "expectedOutputAmount",
+            response.expected_output_amount.as_deref(),
+        ),
+        ("minOutputAmount", response.min_output_amount.as_deref()),
+    ] {
+        if let Some(value) = value {
+            assert_raw_amount_string(&format!("Across response {field}"), value);
+        }
+    }
+}
+
+fn assert_across_raw_response_amount_format(response: &Value) {
+    for field in [
+        "inputAmount",
+        "maxInputAmount",
+        "expectedOutputAmount",
+        "minOutputAmount",
+    ] {
+        if let Some(value) = response.get(field).and_then(Value::as_str) {
+            assert_raw_amount_string(&format!("Across raw response {field}"), value);
+        }
+    }
 }
 
 #[tokio::test]

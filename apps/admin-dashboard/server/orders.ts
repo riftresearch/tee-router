@@ -46,6 +46,7 @@ export type OrderExecutionActionAddresses = {
 
 export type OrderExecutionLeg = {
   id: string
+  executionAttemptId?: string
   transitionDeclId?: string
   legIndex: number
   legType: string
@@ -258,6 +259,7 @@ const COMPLETED_ORDERS_FOR_ANALYTICS_SQL = `
       jsonb_agg(
         jsonb_build_object(
           'id', l.id::text,
+          'executionAttemptId', l.execution_attempt_id::text,
           'transitionDeclId', l.transition_decl_id,
           'legIndex', l.leg_index,
           'legType', l.leg_type,
@@ -412,34 +414,36 @@ LEFT JOIN latest_limit_quotes loq ON loq.order_id = ro.id
 LEFT JOIN public.market_order_actions moa ON moa.order_id = ro.id
 LEFT JOIN public.limit_order_actions loa ON loa.order_id = ro.id
 LEFT JOIN LATERAL (
-  SELECT jsonb_agg(
-    jsonb_build_object(
-      'id', l.id::text,
-      'transitionDeclId', l.transition_decl_id,
-      'legIndex', l.leg_index,
-      'legType', l.leg_type,
-      'provider', l.provider,
-      'status', l.status,
-      'input', jsonb_build_object('chainId', l.input_chain_id, 'assetId', l.input_asset_id),
-      'output', jsonb_build_object('chainId', l.output_chain_id, 'assetId', l.output_asset_id),
-      'amountIn', l.amount_in,
-      'expectedAmountOut', l.expected_amount_out,
-      'minAmountOut', l.min_amount_out,
-      'actualAmountIn', l.actual_amount_in,
-      'actualAmountOut', l.actual_amount_out,
-      'startedAt', l.started_at,
-      'completedAt', l.completed_at,
-      'createdAt', l.created_at,
-      'updatedAt', l.updated_at,
-      'details', '{}'::jsonb,
-      'usdValuation', l.usd_valuation_json
-    )
-    ORDER BY l.leg_index ASC, l.created_at ASC, l.id ASC
-	  ) AS execution_legs
-	    , MAX(l.updated_at) AS updated_at
-	  FROM public.order_execution_legs l
-	  WHERE l.order_id = ro.id
-	) legs ON true
+  SELECT
+    jsonb_agg(
+      jsonb_build_object(
+        'id', l.id::text,
+        'executionAttemptId', l.execution_attempt_id::text,
+        'transitionDeclId', l.transition_decl_id,
+        'legIndex', l.leg_index,
+        'legType', l.leg_type,
+        'provider', l.provider,
+        'status', l.status,
+        'input', jsonb_build_object('chainId', l.input_chain_id, 'assetId', l.input_asset_id),
+        'output', jsonb_build_object('chainId', l.output_chain_id, 'assetId', l.output_asset_id),
+        'amountIn', l.amount_in,
+        'expectedAmountOut', l.expected_amount_out,
+        'minAmountOut', l.min_amount_out,
+        'actualAmountIn', l.actual_amount_in,
+        'actualAmountOut', l.actual_amount_out,
+        'startedAt', l.started_at,
+        'completedAt', l.completed_at,
+        'createdAt', l.created_at,
+        'updatedAt', l.updated_at,
+        'details', '{}'::jsonb,
+        'usdValuation', l.usd_valuation_json
+      )
+      ORDER BY l.leg_index ASC, l.created_at ASC, l.id ASC
+    ) AS execution_legs,
+    MAX(l.updated_at) AS updated_at
+  FROM public.order_execution_legs l
+  WHERE l.order_id = ro.id
+) legs ON true
 LEFT JOIN LATERAL (
   SELECT jsonb_agg(
     jsonb_build_object(
@@ -544,34 +548,36 @@ LEFT JOIN latest_limit_quotes loq ON loq.order_id = ro.id
 LEFT JOIN public.market_order_actions moa ON moa.order_id = ro.id
 LEFT JOIN public.limit_order_actions loa ON loa.order_id = ro.id
 LEFT JOIN LATERAL (
-  SELECT jsonb_agg(
-    jsonb_build_object(
-      'id', l.id::text,
-      'transitionDeclId', l.transition_decl_id,
-      'legIndex', l.leg_index,
-      'legType', l.leg_type,
-      'provider', l.provider,
-      'status', l.status,
-      'input', jsonb_build_object('chainId', l.input_chain_id, 'assetId', l.input_asset_id),
-      'output', jsonb_build_object('chainId', l.output_chain_id, 'assetId', l.output_asset_id),
-      'amountIn', l.amount_in,
-      'expectedAmountOut', l.expected_amount_out,
-      'minAmountOut', l.min_amount_out,
-      'actualAmountIn', l.actual_amount_in,
-      'actualAmountOut', l.actual_amount_out,
-      'startedAt', l.started_at,
-      'completedAt', l.completed_at,
-      'createdAt', l.created_at,
-      'updatedAt', l.updated_at,
-      'details', l.details_json,
-      'usdValuation', l.usd_valuation_json
-    )
-    ORDER BY l.leg_index ASC, l.created_at ASC, l.id ASC
-	  ) AS execution_legs
-	    , MAX(l.updated_at) AS updated_at
-	  FROM public.order_execution_legs l
-	  WHERE l.order_id = ro.id
-	) legs ON true
+  SELECT
+    jsonb_agg(
+      jsonb_build_object(
+        'id', l.id::text,
+        'executionAttemptId', l.execution_attempt_id::text,
+        'transitionDeclId', l.transition_decl_id,
+        'legIndex', l.leg_index,
+        'legType', l.leg_type,
+        'provider', l.provider,
+        'status', l.status,
+        'input', jsonb_build_object('chainId', l.input_chain_id, 'assetId', l.input_asset_id),
+        'output', jsonb_build_object('chainId', l.output_chain_id, 'assetId', l.output_asset_id),
+        'amountIn', l.amount_in,
+        'expectedAmountOut', l.expected_amount_out,
+        'minAmountOut', l.min_amount_out,
+        'actualAmountIn', l.actual_amount_in,
+        'actualAmountOut', l.actual_amount_out,
+        'startedAt', l.started_at,
+        'completedAt', l.completed_at,
+        'createdAt', l.created_at,
+        'updatedAt', l.updated_at,
+        'details', l.details_json,
+        'usdValuation', l.usd_valuation_json
+      )
+      ORDER BY l.leg_index ASC, l.created_at ASC, l.id ASC
+    ) AS execution_legs,
+    MAX(l.updated_at) AS updated_at
+  FROM public.order_execution_legs l
+  WHERE l.order_id = ro.id
+) legs ON true
 LEFT JOIN LATERAL (
   SELECT jsonb_agg(
     jsonb_build_object(
@@ -1323,12 +1329,14 @@ function summarizeProgress(
     label: humanize(operation.provider),
     status: operation.status
   }))
-  const actualStages = legs.map((leg) => ({
-    transitionDeclId: leg.transitionDeclId,
-    transitionMatchIds: leg.transitionDeclId ? [leg.transitionDeclId] : [],
-    label: humanize(leg.provider),
-    status: leg.status
-  }))
+  const actualStages = legs
+    .filter((leg) => leg.status !== 'superseded')
+    .map((leg) => ({
+      transitionDeclId: leg.transitionDeclId,
+      transitionMatchIds: leg.transitionDeclId ? [leg.transitionDeclId] : [],
+      label: humanize(leg.provider),
+      status: leg.status
+    }))
   const stages =
     actualStages.length > 0
       ? actualStages
@@ -1461,7 +1469,7 @@ function isFailedStatus(status: string): boolean {
 }
 
 function isTerminalStatus(status: string): boolean {
-  return isCompletedStatus(status) || isFailedStatus(status)
+  return isCompletedStatus(status) || isFailedStatus(status) || status === 'superseded'
 }
 
 function humanize(value: string): string {
