@@ -65,7 +65,7 @@ test('volume chart axis ticks include readable bounds', async () => {
 test('volume chart normalizes every fixed window and bucket size', async () => {
   const { normalizedVolumeBuckets, volumeDateRange } = await appHelpers()
   const now = new Date('2026-05-05T00:00:00.000Z')
-  const windows = ['6h', '24h', '7d', '30d', '90d'] as const
+  const windows = ['1h', '6h', '24h', '7d', '30d', '90d'] as const
   const bucketSizes = ['five_minute', 'hour', 'day'] as const
 
   for (const window of windows) {

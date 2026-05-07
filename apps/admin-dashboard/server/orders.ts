@@ -86,6 +86,16 @@ export type OrderProgress = {
   completedStages: number
   failedStages: number
   activeStage?: string
+  stages?: OrderProgressStage[]
+}
+
+export type OrderProgressStage = {
+  label: string
+  status: string
+  input?: AssetRef
+  output?: AssetRef
+  txHash?: string
+  txChainId?: string
 }
 
 export type OrderMetrics = {
@@ -369,6 +379,7 @@ SELECT
 	    COALESCE(moa.updated_at, ro.updated_at),
 	    COALESCE(loa.updated_at, ro.updated_at),
 	    COALESCE(legs.updated_at, ro.updated_at),
+	    COALESCE(steps.updated_at, ro.updated_at),
 	    COALESCE(ops.updated_at, ro.updated_at)
 	  ) AS updated_at,
   COALESCE(funding_step.tx_hash, funding_vault.funding_tx_hash) AS funding_tx_hash,
@@ -396,7 +407,7 @@ SELECT
   COALESCE(moq.provider_quote, loq.provider_quote) AS provider_quote,
   COALESCE(moq.usd_valuation_json, loq.usd_valuation_json, '{}'::jsonb) AS quote_usd_valuation,
   COALESCE(legs.execution_legs, '[]'::jsonb) AS execution_legs,
-  '[]'::jsonb AS execution_steps,
+  COALESCE(steps.execution_steps, '[]'::jsonb) AS execution_steps,
   COALESCE(ops.provider_operations, '[]'::jsonb) AS provider_operations
 FROM selected_orders ro
 LEFT JOIN public.deposit_vaults funding_vault ON funding_vault.id = ro.funding_vault_id
@@ -444,6 +455,38 @@ LEFT JOIN LATERAL (
   FROM public.order_execution_legs l
   WHERE l.order_id = ro.id
 ) legs ON true
+LEFT JOIN LATERAL (
+  SELECT jsonb_agg(
+    jsonb_strip_nulls(jsonb_build_object(
+      'id', s.id::text,
+      'executionLegId', s.execution_leg_id::text,
+      'transitionDeclId', s.transition_decl_id,
+      'stepIndex', s.step_index,
+      'stepType', s.step_type,
+      'provider', s.provider,
+      'status', s.status,
+      'input', CASE
+        WHEN s.input_chain_id IS NULL OR s.input_asset_id IS NULL THEN NULL
+        ELSE jsonb_build_object('chainId', s.input_chain_id, 'assetId', s.input_asset_id)
+      END,
+      'output', CASE
+        WHEN s.output_chain_id IS NULL OR s.output_asset_id IS NULL THEN NULL
+        ELSE jsonb_build_object('chainId', s.output_chain_id, 'assetId', s.output_asset_id)
+      END,
+      'txHash', s.tx_hash,
+      'createdAt', s.created_at,
+      'updatedAt', s.updated_at,
+      'details', '{}'::jsonb,
+      'request', '{}'::jsonb,
+      'response', '{}'::jsonb,
+      'error', '{}'::jsonb
+    ))
+    ORDER BY s.step_index ASC, s.created_at ASC, s.id ASC
+  ) AS execution_steps,
+  MAX(s.updated_at) AS updated_at
+  FROM public.order_execution_steps s
+  WHERE s.order_id = ro.id
+) steps ON true
 LEFT JOIN LATERAL (
   SELECT jsonb_agg(
     jsonb_build_object(
@@ -1125,6 +1168,7 @@ function mapOrderRow(
     progress: summarizeProgress(
       row.provider_quote,
       executionLegs,
+      executionSteps,
       providerOperations
     ),
     limitStatus:
@@ -1320,6 +1364,7 @@ function toAnalyticsCursorIso(value: Date | string): string {
 function summarizeProgress(
   providerQuote: unknown,
   legs: OrderExecutionLeg[],
+  steps: OrderExecutionStep[],
   operations: ProviderOperation[]
 ): OrderProgress {
   const plannedStages = extractPlannedStages(providerQuote)
@@ -1327,7 +1372,11 @@ function summarizeProgress(
     transitionDeclId: undefined,
     transitionMatchIds: [],
     label: humanize(operation.provider),
-    status: operation.status
+    status: operation.status,
+    input: undefined,
+    output: undefined,
+    txHash: undefined,
+    txChainId: undefined
   }))
   const actualStages = legs
     .filter((leg) => leg.status !== 'superseded')
@@ -1335,16 +1384,23 @@ function summarizeProgress(
       transitionDeclId: leg.transitionDeclId,
       transitionMatchIds: leg.transitionDeclId ? [leg.transitionDeclId] : [],
       label: humanize(leg.provider),
-      status: leg.status
+      status: leg.status,
+      input: leg.input,
+      output: leg.output,
+      ...progressTxFields(latestStepForLeg(steps, leg))
     }))
   const stages =
     actualStages.length > 0
       ? actualStages
       : plannedStages.length > 0
       ? plannedStages.map((planned) => {
+          const matchedStep = latestMatchingStep(steps, planned.transitionMatchIds)
           return {
             ...planned,
-            status: 'planned'
+            status: matchedStep?.status ?? 'planned',
+            input: matchedStep?.input ?? planned.input,
+            output: matchedStep?.output ?? planned.output,
+            ...progressTxFields(matchedStep)
           }
         })
       : operationStages
@@ -1363,8 +1419,50 @@ function summarizeProgress(
     failedStages: Math.min(failedStages, stages.length),
     activeStage: activeStage
       ? `${stageLabel(activeStage)} / ${humanize(activeStage.status)}`
-      : undefined
+      : undefined,
+    stages: stages.map((stage) => ({
+      label: stageLabel(stage),
+      status: stage.status,
+      ...(stage.input ? { input: stage.input } : {}),
+      ...(stage.output ? { output: stage.output } : {}),
+      ...(stage.txHash ? { txHash: stage.txHash } : {}),
+      ...(stage.txChainId ? { txChainId: stage.txChainId } : {})
+    }))
   }
+}
+
+function latestStepForLeg(
+  steps: OrderExecutionStep[],
+  leg: OrderExecutionLeg
+): OrderExecutionStep | undefined {
+  const legSteps = steps.filter((step) => step.executionLegId === leg.id)
+  if (legSteps.length > 0) return latestStep(legSteps)
+  if (!leg.transitionDeclId) return undefined
+  return latestMatchingStep(steps, [leg.transitionDeclId])
+}
+
+function latestStep(steps: OrderExecutionStep[]): OrderExecutionStep | undefined {
+  return [...steps].sort(
+    (left, right) =>
+      right.stepIndex - left.stepIndex ||
+      right.updatedAt.localeCompare(left.updatedAt) ||
+      right.id.localeCompare(left.id)
+  )[0]
+}
+
+function progressTxFields(step: OrderExecutionStep | undefined) {
+  if (!step?.txHash) return {}
+  return {
+    txHash: step.txHash,
+    txChainId: stepTransactionChain(step)
+  }
+}
+
+function stepTransactionChain(step: OrderExecutionStep) {
+  if (['across_bridge', 'cctp_receive', 'unit_withdrawal'].includes(step.stepType)) {
+    return step.output?.chainId ?? step.input?.chainId
+  }
+  return step.input?.chainId ?? step.output?.chainId
 }
 
 function latestStepsByStage(steps: OrderExecutionStep[]): OrderExecutionStep[] {
@@ -1385,6 +1483,10 @@ type ProgressStage = {
   transitionMatchIds: string[]
   label: string
   status: string
+  input?: AssetRef
+  output?: AssetRef
+  txHash?: string
+  txChainId?: string
 }
 
 function latestMatchingStep(
@@ -1417,9 +1519,9 @@ function extractPlannedStages(providerQuote: unknown): ProgressStage[] {
     if (!record) continue
     const provider = stringField(record.provider)
     const transitionKind = stringField(record.transition_kind)
-    const executionStepType = stringField(record.execution_step_type)
     const transitionDeclId = stringField(record.transition_decl_id)
     const transitionParentDeclId = stringField(record.transition_parent_decl_id)
+    const raw = asRecord(record.raw)
     if (!provider || !transitionKind) continue
     const transitionMatchIds = uniqueStrings([
       transitionDeclId,
@@ -1429,10 +1531,28 @@ function extractPlannedStages(providerQuote: unknown): ProgressStage[] {
       ...(transitionDeclId ? { transitionDeclId } : {}),
       transitionMatchIds,
       label: humanize(provider),
-      status: 'planned'
+      status: 'planned',
+      input: assetRef(record.input_asset) ?? assetRef(raw?.input_asset),
+      output: assetRef(record.output_asset) ?? assetRef(raw?.output_asset)
     })
   }
   return stages
+}
+
+function assetRef(value: unknown): AssetRef | undefined {
+  const record = asRecord(value)
+  if (!record) return undefined
+  const chainId =
+    stringField(record.chainId) ??
+    stringField(record.chain_id) ??
+    stringField(record.chain)
+  const assetId =
+    stringField(record.assetId) ??
+    stringField(record.asset_id) ??
+    stringField(record.asset) ??
+    stringField(record.address) ??
+    stringField(record.token)
+  return chainId && assetId ? { chainId, assetId } : undefined
 }
 
 function uniqueStrings(values: (string | undefined)[]): string[] {

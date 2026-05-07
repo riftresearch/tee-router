@@ -2,8 +2,6 @@ import {
   Activity,
   ArrowRight,
   BarChart3,
-  ChevronDown,
-  ChevronRight,
   Check,
   CircleAlert,
   Clock3,
@@ -68,6 +66,12 @@ type StatusDisplay = {
   tone: StatusTone
   title?: string
 }
+type ProgressSegmentState = 'complete' | 'active' | 'failed' | 'pending'
+type ProgressSegment = {
+  index: number
+  label: string
+  state: ProgressSegmentState
+}
 const ORDER_STATUS_DISPLAY: Record<string, StatusDisplay> = {
   quoted: {
     label: 'Quoted',
@@ -130,13 +134,14 @@ const ORDER_TABS: Array<{ type: OrderTypeFilter; label: string }> = [
   { type: 'limit_order', label: 'Limit Orders' }
 ]
 const ORDER_FILTERS: Array<{ value: OrderLifecycleFilter; label: string }> = [
-  { value: 'firehose', label: 'Firehose' },
+  { value: 'firehose', label: 'All Orders' },
   { value: 'in_progress', label: 'In Progress' },
   { value: 'needs_attention', label: 'Needs Attention' },
   { value: 'expired', label: 'Expired' },
   { value: 'refunded', label: 'Refunded' }
 ]
 const VOLUME_WINDOWS = [
+  { value: '1h', label: '1H' },
   { value: '6h', label: '6H' },
   { value: '24h', label: '24H' },
   { value: '7d', label: '7D' },
@@ -707,46 +712,41 @@ export function App() {
 
         <section className="orders-surface" aria-label="Orders">
           <div className="table-toolbar">
-            <div>
-              <h2>Orders</h2>
-              <p>created_at DESC</p>
+            <div className="table-toolbar-left">
+              <OrderSearch
+                value={searchInput}
+                active={Boolean(searchedOrder)}
+                onChange={setSearchInput}
+                onSearch={searchOrder}
+                onClear={clearSearch}
+              />
             </div>
-            <div className="table-toolbar-actions">
+            <div className="table-toolbar-center">
               <OrderTabs active={orderTab} onChange={changeOrderTab} />
+            </div>
+            <div className="table-toolbar-right">
+              <OrderFilterButtons active={orderFilter} onChange={changeOrderFilter} />
               <StreamBadge state={streamState} />
             </div>
-          </div>
-
-          <div className="table-controls">
-            <OrderSearch
-              value={searchInput}
-              active={Boolean(searchedOrder)}
-              onChange={setSearchInput}
-              onSearch={searchOrder}
-              onClear={clearSearch}
-            />
-            <OrderFilterButtons active={orderFilter} onChange={changeOrderFilter} />
           </div>
 
           <div className="table-scroll">
             <table className="orders-table">
               <thead>
                 <tr>
-                  <th aria-label="Expand"></th>
+                  <th>Order ID</th>
                   <th>Created</th>
-                  <th>Order</th>
                   <th>Route</th>
-                  <th>{orderTab === 'limit_order' ? 'Limit State' : 'Kind'}</th>
                   <th>Quote</th>
                   <th>Executed</th>
+                  <th>{orderTab === 'limit_order' ? 'Limit State' : 'Kind'}</th>
                   <th>{orderTab === 'limit_order' ? 'Backend Status' : 'Status'}</th>
-                  <th>Venue Progress</th>
                 </tr>
               </thead>
               <tbody>
                 {displayedOrders.length === 0 ? (
                   <tr>
-                    <td className="empty" colSpan={9}>
+                    <td className="empty" colSpan={7}>
                       No orders found
                     </td>
                   </tr>
@@ -797,17 +797,38 @@ function Shell({
   return (
     <div className="app-shell">
       <header className="topbar">
-        <div className="brand">
-          <span className="brand-mark">R</span>
-          <div>
-            <h1>Rift Admin</h1>
-            <p>TEE Router</p>
-          </div>
+        <div className="topbar-inner">
+          <button
+            type="button"
+            className="brand brand-logo-button"
+            onClick={() => window.location.reload()}
+            aria-label="Reload Rift Admin"
+          >
+            <RiftWordmark />
+          </button>
+          {right}
         </div>
-        {right}
       </header>
       {children}
     </div>
+  )
+}
+
+function RiftWordmark() {
+  return (
+    <svg
+      width="110"
+      height="28"
+      viewBox="0 0 3190 674"
+      fill="none"
+      xmlns="http://www.w3.org/2000/svg"
+      aria-hidden="true"
+    >
+      <path
+        d="M362.16 0.509766L708.992 1.01953C764.583 1.01988 854.441 35.3784 899.254 66.0684C946.209 98.2244 976.303 137.703 991.728 187.377C998.545 209.335 999.065 270.158 992.616 291.358C977.097 342.374 948.466 381.798 903.368 414.254C880.445 430.753 849.028 447.137 821.983 456.698C811.159 460.525 802.305 464.051 802.305 464.535C802.324 465.034 855.943 511.837 921.476 568.554C987.014 625.277 1040.64 672.038 1040.65 672.471C1040.65 672.896 989.297 673.212 926.534 673.17L812.423 673.096L709.3 578.507L606.177 483.921H326.44L231.556 373.886H462.542C577.817 373.886 657.812 373.229 672.215 372.168C764.603 365.355 822.541 317.06 822.541 246.859C822.541 191.068 785.958 148.878 721.28 130.076C691.254 121.348 696.678 121.509 432.987 121.479L188.463 121.451V673.246H0.960938V58.8457C0.960938 26.3598 27.3199 0.0372334 59.8057 0.0830078L362.16 0.509766ZM1358.4 673.242H1171.9V0H1358.4V673.242ZM2215.9 134.838H1680.88V269.92H2094.76L1997.96 382.709H1680.88V673.242H1493.72V67.4189C1493.72 48.8748 1502.88 33.0017 1521.21 19.8008C1539.53 6.60022 1561.56 5.19057e-05 1587.3 0H2337.08L2215.9 134.838ZM3189.12 134.834H2869.77V673.242H2697.47V134.834H2363.92L2485.05 0H3189.12V134.834Z"
+        fill="#eeeeee"
+      />
+    </svg>
   )
 }
 
@@ -1120,6 +1141,28 @@ function VolumeChart({
 }: {
   analytics: VolumeAnalyticsResponse | null
 }) {
+  const chartRef = useRef<HTMLDivElement | null>(null)
+  const [measuredWidth, setMeasuredWidth] = useState(1100)
+
+  useEffect(() => {
+    const node = chartRef.current
+    if (!node) return
+
+    const updateWidth = (width: number) => {
+      setMeasuredWidth(Math.max(640, Math.round(width)))
+    }
+
+    updateWidth(node.getBoundingClientRect().width)
+    if (typeof ResizeObserver === 'undefined') return
+
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0]
+      if (entry) updateWidth(entry.contentRect.width)
+    })
+    observer.observe(node)
+    return () => observer.disconnect()
+  }, [analytics])
+
   if (!analytics) {
     return <div className="volume-empty">Loading volume buckets</div>
   }
@@ -1129,9 +1172,9 @@ function VolumeChart({
     return <div className="volume-empty">No completed volume in this window</div>
   }
 
-  const width = 720
-  const height = 220
-  const padding = { top: 22, right: 20, bottom: 46, left: 74 }
+  const width = measuredWidth
+  const height = 238
+  const padding = { top: 22, right: 94, bottom: 54, left: 24 }
   const chartWidth = width - padding.left - padding.right
   const chartHeight = height - padding.top - padding.bottom
   const maxVolumeUsdMicro = buckets.reduce(
@@ -1142,13 +1185,25 @@ function VolumeChart({
   const maxVolume = maxVolumeUsdMicro > 0n ? maxVolumeUsdMicro : 1n
   const slotWidth = chartWidth / buckets.length
   const barGap = buckets.length > 180 ? 1 : 3
-  const barWidth = Math.max(slotWidth - barGap, 1)
+  const barWidth = Math.min(Math.max(slotWidth - barGap, 2), 42)
+  const barRadius = Math.min(15, barWidth / 2)
   const yTicks = volumeYAxisTicks(maxVolume, 4)
-  const xTicks = volumeXAxisTicks(buckets, 6)
+  const xTicks = volumeXAxisTicks(
+    buckets,
+    volumeXAxisTickLimit(chartWidth, analytics.bucketSize)
+  )
 
   return (
-    <div className="volume-chart-wrap">
+    <div ref={chartRef} className="volume-chart-wrap">
       <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Volume chart">
+        <defs>
+          <linearGradient id="volume-bar-gradient" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="5%" stopColor="#ffb276" />
+            <stop offset="68%" stopColor="#e55a1c" />
+            <stop offset="89%" stopColor="#913d08" />
+            <stop offset="100%" stopColor="#76371a" />
+          </linearGradient>
+        </defs>
         {yTicks.map((tick) => {
           const y =
             height -
@@ -1164,10 +1219,10 @@ function VolumeChart({
                 className="volume-grid"
               />
               <text
-                x={padding.left - 10}
+                x={width - padding.right + 12}
                 y={y}
                 className="volume-y-label"
-                textAnchor="end"
+                textAnchor="start"
                 dominantBaseline="middle"
               >
                 {formatUsdMicro(tick.value.toString())}
@@ -1175,22 +1230,12 @@ function VolumeChart({
             </g>
           )
         })}
-        <line
-          x1={padding.left}
-          y1={height - padding.bottom}
-          x2={width - padding.right}
-          y2={height - padding.bottom}
-          className="volume-axis"
-        />
-        <line
-          x1={padding.left}
-          y1={padding.top}
-          x2={padding.left}
-          y2={height - padding.bottom}
-          className="volume-axis"
-        />
         {xTicks.map((tick) => {
           const x = padding.left + tick.index * slotWidth + slotWidth / 2
+          const labelLines = formatVolumeAxisDate(
+            tick.bucket.bucketStart,
+            analytics.bucketSize
+          )
           const textAnchor =
             tick.index === 0
               ? 'start'
@@ -1199,20 +1244,17 @@ function VolumeChart({
                 : 'middle'
           return (
             <g key={tick.bucket.bucketStart}>
-              <line
-                x1={x}
-                y1={height - padding.bottom}
-                x2={x}
-                y2={height - padding.bottom + 5}
-                className="volume-axis"
-              />
               <text
                 x={x}
-                y={height - 22}
+                y={height - 26}
                 className="volume-x-label"
                 textAnchor={textAnchor}
               >
-                {formatVolumeAxisDate(tick.bucket.bucketStart, analytics.bucketSize)}
+                {labelLines.map((line, lineIndex) => (
+                  <tspan key={line} x={x} dy={lineIndex === 0 ? 0 : 12}>
+                    {line}
+                  </tspan>
+                ))}
               </text>
             </g>
           )
@@ -1255,7 +1297,7 @@ function VolumeChart({
                 y={y}
                 width={barWidth}
                 height={barHeight}
-                rx={3}
+                rx={barRadius}
               />
               <g
                 className="volume-tooltip"
@@ -1331,21 +1373,6 @@ function OrderRows({
     <>
       <tr className={`order-row ${flashing ? 'flash' : ''}`} onClick={onToggle}>
         <td>
-          <button
-            className="expand-button"
-            aria-label={expanded ? 'Collapse order' : 'Expand order'}
-            onClick={(event) => {
-              event.stopPropagation()
-              onToggle()
-            }}
-          >
-            {expanded ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
-          </button>
-        </td>
-        <td>
-          <time dateTime={order.createdAt}>{formatDate(order.createdAt)}</time>
-        </td>
-        <td>
           <CopyableOrderId
             orderId={order.id}
             copied={copied}
@@ -1353,7 +1380,16 @@ function OrderRows({
           />
         </td>
         <td>
+          <time dateTime={order.createdAt}>{formatDate(order.createdAt)}</time>
+        </td>
+        <td>
           <RouteCell order={order} />
+        </td>
+        <td>
+          <QuoteCell order={order} />
+        </td>
+        <td>
+          <ExecutedCell order={order} />
         </td>
         <td>
           {order.orderType === 'limit_order' ? (
@@ -1363,21 +1399,17 @@ function OrderRows({
           )}
         </td>
         <td>
-          <QuoteCell order={order} />
-        </td>
-        <td>
-          <ExecutedCell order={order} />
-        </td>
-        <td>
           <StatusPill status={order.status} />
         </td>
-        <td>
-          <ProgressCell order={order} />
+      </tr>
+      <tr className="mini-timeline-row" onClick={onToggle}>
+        <td colSpan={7}>
+          <MiniOrderTimeline order={order} />
         </td>
       </tr>
       {expanded ? (
         <tr className="details-row">
-          <td colSpan={9}>
+          <td colSpan={7}>
             {loadingDetails ? <DetailsLoading /> : <OrderDetails order={order} />}
           </td>
         </tr>
@@ -1592,6 +1624,7 @@ function ExecutedCell({ order }: { order: OrderFirehoseRow }) {
 
 function ProgressCell({ order }: { order: OrderFirehoseRow }) {
   const progress = order.progress
+  const segments = progressSegments(order)
   const activeVenue = progressVenueLabel(order)
   const tone =
     progress.failedStages > 0
@@ -1602,15 +1635,18 @@ function ProgressCell({ order }: { order: OrderFirehoseRow }) {
 
   return (
     <div className="progress-cell">
-      <div className={`progress-bar ${tone}`}>
-        <span
-          style={{
-            width:
-              progress.totalStages === 0
-                ? '0%'
-                : `${Math.round((progress.completedStages / progress.totalStages) * 100)}%`
-          }}
-        />
+      <div className={`progress-segments ${tone}`}>
+        {segments.length === 0 ? (
+          <span className="progress-empty-track" />
+        ) : (
+          segments.map((segment) => (
+            <span
+              key={`${segment.index}-${segment.label}`}
+              className={`progress-segment ${segment.state}`}
+              title={segment.label}
+            />
+          ))
+        )}
       </div>
       <span>{progressStageCountLabel(progress)}</span>
       {activeVenue ? <em>{activeVenue}</em> : null}
@@ -1620,6 +1656,87 @@ function ProgressCell({ order }: { order: OrderFirehoseRow }) {
 
 export function progressStageCountLabel(progress: OrderProgress) {
   return `${progress.completedStages}/${progress.totalStages}`
+}
+
+function MiniOrderTimeline({ order }: { order: OrderFirehoseRow }) {
+  const legs = miniTimelineLegs(order)
+  if (legs.length === 0) {
+    return (
+      <div className="mini-timeline-shell">
+        <div className="mini-timeline-empty">No route materialized</div>
+        <ProgressCell order={order} />
+      </div>
+    )
+  }
+
+  return (
+    <div className="mini-timeline-shell">
+      <div className="mini-timeline" aria-label="Mini order timeline">
+        {legs.map((leg) => (
+          <MiniTimelineLegCard key={leg.key} leg={leg} />
+        ))}
+      </div>
+      <ProgressCell order={order} />
+    </div>
+  )
+}
+
+function MiniTimelineLegCard({ leg }: { leg: TimelineLeg }) {
+  const state = timelineState(leg.status)
+  const txStep = miniTimelineTx(leg)
+
+  return (
+    <div className={`mini-timeline-leg ${state}`} title={`${humanize(leg.provider)} ${humanize(leg.kind)}`}>
+      <div className="mini-timeline-leg-header">
+        <strong>{humanize(leg.provider)}</strong>
+        <span>{humanize(leg.kind)}</span>
+      </div>
+      <div className="mini-timeline-route">
+        <span>{miniAssetLabel(leg.inputAsset)}</span>
+        <ArrowRight size={12} aria-hidden="true" />
+        <span>{miniAssetLabel(leg.outputAsset)}</span>
+      </div>
+      <div className="mini-timeline-tx">
+        {txStep.txHash ? (
+          <TimelineLinkedValue
+            chainId={txStep.chainId}
+            value={txStep.txHash}
+            kind="tx"
+          />
+        ) : (
+          <span>{state === 'complete' ? 'No tx hash' : 'No tx yet'}</span>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function miniTimelineTx(leg: TimelineLeg) {
+  const step = [...leg.steps]
+    .reverse()
+    .find((step) => Boolean(step.txHash))
+  if (step?.txHash) {
+    return {
+      txHash: step.txHash,
+      chainId: stepTransactionChain(step)
+    }
+  }
+  return {
+    txHash: leg.txHash,
+    chainId: leg.txChainId
+  }
+}
+
+function miniTimelineLegs(order: OrderFirehoseRow): TimelineLeg[] {
+  const progressLegs = progressStageLegs(order)
+  if (progressLegs.length > 0) return progressLegs
+  return timelineLegs(order)
+}
+
+function miniAssetLabel(asset?: AssetRef) {
+  if (!asset) return 'Unknown'
+  const assetName = assetDisplayName(asset)
+  return `${chainDisplayName(asset.chainId)} ${assetName}`
 }
 
 function OrderDetails({ order }: { order: OrderFirehoseRow }) {
@@ -1651,6 +1768,8 @@ type TimelineLeg = {
   minAmountOut?: string
   maxAmountIn?: string
   updatedAt?: string
+  txHash?: string
+  txChainId?: string
   steps: OrderExecutionStep[]
   references: TimelineReference[]
 }
@@ -1691,13 +1810,14 @@ function FundingTimelineItem({ order }: { order: OrderFirehoseRow }) {
   const fundingDeposit = fundingDepositFlow(order)
   const waitStep = order.executionSteps.find((step) => step.stepType === 'wait_for_deposit')
   const completed = waitStep?.status === 'completed'
+  const state = timelineState(waitStep?.status ?? 'planned')
 
   return (
-    <div className="timeline-item root">
+    <div className={`timeline-item root ${state}`}>
       <div className="timeline-rail">
-        <span className="timeline-dot root" />
+        <span className={`timeline-dot root ${state}`} />
       </div>
-      <div className="timeline-card root">
+      <div className={`timeline-card root ${state}`}>
         <div className="timeline-card-header">
           <div>
             <strong>Funding</strong>
@@ -1745,13 +1865,14 @@ function TimelineLegItem({ leg }: { leg: TimelineLeg }) {
   const outputDelta = amountDelta(leg.quotedOutput, leg.executedOutput)
   const inputDelta = amountDelta(leg.quotedInput, leg.executedInput)
   const primaryDelta = outputDelta ?? inputDelta
+  const state = timelineState(leg.status)
 
   return (
-    <div className="timeline-item">
+    <div className={`timeline-item ${state}`}>
       <div className="timeline-rail">
-        <span className="timeline-dot">#{leg.index}</span>
+        <span className={`timeline-dot ${state}`}>#{leg.index}</span>
       </div>
-      <div className="timeline-card">
+      <div className={`timeline-card ${state}`}>
         <div className="timeline-card-header">
           <div>
             <strong>{humanize(leg.provider)}</strong>
@@ -2326,6 +2447,7 @@ export function timelineLegs(order: OrderFirehoseRow): TimelineLeg[] {
       )
       .map((leg) => {
         const steps = stepsByLegId.get(leg.id) ?? []
+        const progressStage = progressStageForLeg(order, leg)
         const quoteValuation = quoteUsdValuationForExecutionLeg(order, leg)
         const executedInput = leg.actualAmountIn
         const executedOutput = leg.actualAmountOut
@@ -2374,13 +2496,18 @@ export function timelineLegs(order: OrderFirehoseRow): TimelineLeg[] {
             : undefined,
           minAmountOut: leg.minAmountOut,
           updatedAt: leg.updatedAt,
+          txHash: progressStage?.txHash,
+          txChainId: progressStage?.txChainId,
           steps,
           references: timelineReferences(leg.input, leg.output, steps)
         }
       })
   }
 
-  return quoteFlowLegs(order).map((leg) => ({
+  const quoteLegs = quoteFlowLegs(order)
+  if (quoteLegs.length === 0) return progressStageLegs(order)
+
+  return quoteLegs.map((leg) => ({
     key: leg.key,
     index: leg.index,
     provider: leg.provider,
@@ -2397,6 +2524,48 @@ export function timelineLegs(order: OrderFirehoseRow): TimelineLeg[] {
     steps: [],
     references: []
   }))
+}
+
+function progressStageForLeg(order: OrderFirehoseRow, leg: OrderExecutionLeg) {
+  return order.progress.stages?.find(
+    (stage, index) =>
+      index === leg.legIndex ||
+      providerKey(stage.label) === providerKey(leg.provider)
+  )
+}
+
+function progressStageLegs(order: OrderFirehoseRow): TimelineLeg[] {
+  const stages = order.progress.stages
+  if (!stages || stages.length === 0) return []
+  const segments = progressSegments(order)
+  return stages.map((stage, index) => {
+    const segmentState = segments[index]?.state
+    const status = segmentStateToStageStatus(segmentState, stage.status)
+    return {
+      key: `${index}-${stage.label}`,
+      index,
+      provider: stage.label,
+      kind: 'stage',
+      status,
+      inputAsset: stage.input,
+      outputAsset: stage.output,
+      txHash: stage.txHash,
+      txChainId: stage.txChainId,
+      steps: [],
+      references: []
+    }
+  })
+}
+
+function segmentStateToStageStatus(
+  segmentState: 'complete' | 'active' | 'failed' | 'pending' | undefined,
+  fallback: string
+) {
+  if (segmentState === 'complete') return 'completed'
+  if (segmentState === 'active') return 'running'
+  if (segmentState === 'failed') return 'failed'
+  if (segmentState === 'pending') return 'planned'
+  return fallback
 }
 
 function quoteUsdValuationForExecutionLeg(
@@ -3212,6 +3381,11 @@ export function volumeXAxisTicks<T extends { bucketStart: string }>(
     .map((index) => ({ index, bucket: buckets[index] }))
 }
 
+function volumeXAxisTickLimit(chartWidth: number, bucketSize: VolumeBucketSize) {
+  const targetSpacing = bucketSize === 'day' ? 150 : 190
+  return clampNumber(Math.floor(chartWidth / targetSpacing), 2, 5)
+}
+
 function volumeTooltipLayout(
   anchorX: number,
   anchorY: number,
@@ -3231,16 +3405,21 @@ function volumeTooltipLayout(
 function formatVolumeAxisDate(value: string, bucketSize: VolumeBucketSize) {
   const date = new Date(value)
   if (bucketSize === 'day') {
-    return new Intl.DateTimeFormat(undefined, {
-      month: 'short',
-      day: '2-digit'
-    }).format(date)
+    return [
+      new Intl.DateTimeFormat(undefined, {
+        month: 'short',
+        day: '2-digit'
+      }).format(date)
+    ]
   }
-  return new Intl.DateTimeFormat(undefined, {
+  const dateLabel = new Intl.DateTimeFormat(undefined, {
     month: 'short',
-    day: '2-digit',
-    hour: '2-digit'
+    day: '2-digit'
   }).format(date)
+  const timeLabel = new Intl.DateTimeFormat(undefined, {
+    hour: 'numeric'
+  }).format(date)
+  return [dateLabel, timeLabel]
 }
 
 function clampNumber(value: number, min: number, max: number) {
@@ -3261,6 +3440,7 @@ function alignDateToBucket(value: Date, bucketSize: VolumeBucketSize) {
 export function volumeDateRange(window: VolumeWindow, now = new Date()) {
   const to = new Date(now)
   const from = new Date(to)
+  if (window === '1h') from.setUTCHours(from.getUTCHours() - 1)
   if (window === '6h') from.setUTCHours(from.getUTCHours() - 6)
   if (window === '24h') from.setUTCHours(from.getUTCHours() - 24)
   if (window === '7d') from.setUTCDate(from.getUTCDate() - 7)
@@ -3336,6 +3516,62 @@ export function progressVenueLabel(order: OrderFirehoseRow) {
   if (activeStep) return providerDisplayName(activeStep.provider)
 
   return progress.activeStage ? activeProgressStageVenue(progress.activeStage) : undefined
+}
+
+function progressSegments(order: OrderFirehoseRow): ProgressSegment[] {
+  const progress = order.progress
+  if (progress.totalStages === 0) return []
+
+  const completed = progress.completedStages
+  const failedIndex = progress.failedStages > 0 ? Math.max(completed, 0) : -1
+  const isComplete =
+    progress.failedStages === 0 &&
+    progress.totalStages > 0 &&
+    completed >= progress.totalStages
+  const labels = progressStageLabels(order)
+
+  return Array.from({ length: progress.totalStages }, (_, index) => {
+    const label = labels[index] ?? `Step ${index + 1}`
+    const state: ProgressSegmentState =
+      failedIndex === index
+        ? 'failed'
+        : isComplete || index < completed
+          ? 'complete'
+          : index === completed
+            ? 'active'
+            : 'pending'
+
+    return { index, label, state }
+  })
+}
+
+function progressStageLabels(order: OrderFirehoseRow) {
+  const legLabels = [...order.executionLegs]
+    .sort((left, right) => left.legIndex - right.legIndex)
+    .map((leg) => providerDisplayName(leg.provider))
+
+  if (legLabels.length > 0) return legLabels
+
+  const stepLabels = order.executionSteps
+    .filter((step) => !isWaitForDepositStep(step))
+    .sort((left, right) => left.stepIndex - right.stepIndex)
+    .map((step) => providerDisplayName(step.provider))
+
+  if (stepLabels.length > 0) return stepLabels
+
+  const activeVenue = progressVenueLabel(order)
+  return activeVenue ? [activeVenue] : []
+}
+
+function timelineState(status: string) {
+  if (['completed', 'settled', 'filled', 'processed', 'skipped'].includes(status)) {
+    return 'complete'
+  }
+  if (FAILED_STEP_STATUSES.has(status)) return 'failed'
+  if (ACTIVE_STEP_STATUSES.has(status) || ['funded', 'executing'].includes(status)) {
+    return 'active'
+  }
+  return 'pending'
 }
 
 function activeProgressStageVenue(stage: string) {

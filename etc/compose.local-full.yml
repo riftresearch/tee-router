@@ -141,6 +141,8 @@ services:
       retries: 20
 
   devnet:
+    # electrsd bundles a linux x86_64 electrs binary, so keep this image on amd64.
+    platform: linux/amd64
     build:
       context: ..
       dockerfile: etc/Dockerfile.devnet
