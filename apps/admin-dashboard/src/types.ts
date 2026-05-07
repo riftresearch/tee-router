@@ -105,6 +105,16 @@ export type OrderProgress = {
   completedStages: number
   failedStages: number
   activeStage?: string
+  stages?: OrderProgressStage[]
+}
+
+export type OrderProgressStage = {
+  label: string
+  status: string
+  input?: AssetRef
+  output?: AssetRef
+  txHash?: string
+  txChainId?: string
 }
 
 export type LimitOrderStatus = {
