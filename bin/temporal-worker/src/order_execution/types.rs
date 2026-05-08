@@ -25,35 +25,11 @@ pub struct OrderWorkflowOutput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LoadOrderInput {
-    pub order_id: WorkflowOrderId,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LoadedOrder {
-    pub order: RouterOrder,
-    pub plan: SingleStepExecutionPlan,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SingleStepExecutionPlan {
+pub struct ExecutionPlan {
     pub path_id: String,
     pub transition_decl_ids: Vec<String>,
-    pub leg: OrderExecutionLeg,
-    pub step: OrderExecutionStep,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PersistExecutionStartInput {
-    pub order_id: WorkflowOrderId,
-    pub plan: SingleStepExecutionPlan,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecutionStartPersisted {
-    pub order_id: WorkflowOrderId,
-    pub attempt_id: WorkflowAttemptId,
-    pub step_id: WorkflowStepId,
+    pub legs: Vec<OrderExecutionLeg>,
+    pub steps: Vec<OrderExecutionStep>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,18 +54,6 @@ pub struct StepExecuted {
 pub enum StepExecutionOutcome {
     Completed,
     Waiting,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PersistStepCompletionInput {
-    pub execution: StepExecuted,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StepCompletionPersisted {
-    pub order_id: WorkflowOrderId,
-    pub attempt_id: WorkflowAttemptId,
-    pub step_id: WorkflowStepId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,16 +163,26 @@ pub struct OrderExecutionState {
     pub phase: OrderWorkflowPhase,
     pub active_attempt_id: Option<WorkflowAttemptId>,
     pub active_step_id: Option<WorkflowStepId>,
+    pub order: RouterOrder,
+    pub plan: ExecutionPlan,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MaterializeExecutionAttemptInput {
     pub order_id: WorkflowOrderId,
+    pub plan: ExecutionPlan,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MaterializedExecutionAttempt {
     pub attempt_id: WorkflowAttemptId,
+    pub steps: Vec<WorkflowExecutionStep>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowExecutionStep {
+    pub step_id: WorkflowStepId,
+    pub step_index: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,28 +210,17 @@ pub struct PersistStepTerminalStatusInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistProviderReceiptInput {
-    pub order_id: WorkflowOrderId,
-    pub attempt_id: WorkflowAttemptId,
-    pub step_id: WorkflowStepId,
-    pub provider_operation_id: WorkflowProviderOperationId,
-    pub provider_ref: String,
+    pub execution: StepExecuted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistProviderOperationStatusInput {
-    pub order_id: WorkflowOrderId,
-    pub attempt_id: WorkflowAttemptId,
-    pub step_id: WorkflowStepId,
-    pub provider_operation_id: WorkflowProviderOperationId,
-    pub status: ProviderOperationStatus,
+    pub execution: StepExecuted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SettleProviderStepInput {
-    pub order_id: WorkflowOrderId,
-    pub attempt_id: WorkflowAttemptId,
-    pub step_id: WorkflowStepId,
-    pub provider_operation_id: WorkflowProviderOperationId,
+    pub execution: StepExecuted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -445,7 +408,7 @@ pub enum ProviderOperationStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PersistenceBoundary {
-    AfterStepMarkedReadyToFire,
+    AfterExecutionLegsPersisted,
     AfterStepMarkedFailed,
     AfterExecutionStepStatusPersisted,
     AfterProviderReceiptPersisted,

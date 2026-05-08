@@ -9,13 +9,15 @@ use uuid::Uuid;
 
 use super::activities::OrderActivities;
 use super::types::{
-    ExecuteStepInput, FundingVaultFundedSignal, LoadOrderInput, ManualInterventionReleaseSignal,
-    ManualRefundTriggerSignal, MarkOrderCompletedInput, OrderTerminalStatus,
-    OrderWorkflowDebugCursor, OrderWorkflowInput, OrderWorkflowOutput, OrderWorkflowPhase,
-    PersistExecutionStartInput, PersistStepCompletionInput, ProviderHintPollWorkflowInput,
-    ProviderHintPollWorkflowOutput, ProviderOperationHintSignal, QuoteRefreshWorkflowInput,
-    QuoteRefreshWorkflowOutput, RefundWorkflowInput, RefundWorkflowOutput,
-    StaleRunningStepWatchdogInput, StaleRunningStepWatchdogOutput, StepExecutionOutcome,
+    ExecuteStepInput, FundingVaultFundedSignal, LoadOrderExecutionStateInput,
+    ManualInterventionReleaseSignal, ManualRefundTriggerSignal, MarkOrderCompletedInput,
+    MaterializeExecutionAttemptInput, OrderTerminalStatus, OrderWorkflowDebugCursor,
+    OrderWorkflowInput, OrderWorkflowOutput, OrderWorkflowPhase,
+    PersistProviderOperationStatusInput, PersistProviderReceiptInput, PersistStepReadyToFireInput,
+    ProviderHintPollWorkflowInput, ProviderHintPollWorkflowOutput, ProviderOperationHintSignal,
+    QuoteRefreshWorkflowInput, QuoteRefreshWorkflowOutput, RefundWorkflowInput,
+    RefundWorkflowOutput, SettleProviderStepInput, StaleRunningStepWatchdogInput,
+    StaleRunningStepWatchdogOutput,
 };
 
 /// Root order execution workflow.
@@ -54,85 +56,109 @@ impl OrderWorkflow {
         let db_activity_options = db_activity_options();
         let execute_activity_options = execute_activity_options();
 
-        let loaded = ctx
+        let execution_state = ctx
             .start_activity(
-                OrderActivities::load_order,
-                LoadOrderInput {
+                OrderActivities::load_order_execution_state,
+                LoadOrderExecutionStateInput {
                     order_id: input.order_id,
                 },
                 db_activity_options.clone(),
             )
             .await?;
 
-        // TODO(PR4, brief §6 invariant 3; scar §6): start the stale-running-step watchdog child
+        // TODO(PR8, brief §6 invariant 3; scar §6): start the stale-running-step watchdog child
         // before provider execution and surface manual intervention after five minutes without a
         // checkpoint.
-        let execution_start = ctx
+        let execution_attempt = ctx
             .start_activity(
-                OrderActivities::persist_execution_start,
-                PersistExecutionStartInput {
+                OrderActivities::materialize_execution_attempt,
+                MaterializeExecutionAttemptInput {
                     order_id: input.order_id,
-                    plan: loaded.plan,
+                    plan: execution_state.plan,
                 },
                 db_activity_options.clone(),
             )
             .await?;
         ctx.state_mut(|state| {
             state.phase = OrderWorkflowPhase::Executing;
-            state.active_attempt_id = Some(execution_start.attempt_id);
-            state.active_step_id = Some(execution_start.step_id);
+            state.active_attempt_id = Some(execution_attempt.attempt_id);
         });
 
-        let executed = ctx
-            .start_activity(
-                OrderActivities::execute_step,
-                ExecuteStepInput {
-                    order_id: input.order_id,
-                    attempt_id: execution_start.attempt_id,
-                    step_id: execution_start.step_id,
-                },
-                execute_activity_options,
-            )
-            .await?;
-        if executed.outcome != StepExecutionOutcome::Completed {
-            return Err(anyhow::Error::from(std::io::Error::other(format!(
-                "PR3 OrderWorkflow only supports completed single-step execution, got {:?}",
-                executed.outcome
-            )))
-            .into());
+        for step in execution_attempt.steps {
+            ctx.state_mut(|state| {
+                state.active_step_id = Some(step.step_id);
+            });
+            let _ready = ctx
+                .start_activity(
+                    OrderActivities::persist_step_ready_to_fire,
+                    PersistStepReadyToFireInput {
+                        order_id: input.order_id,
+                        attempt_id: execution_attempt.attempt_id,
+                        step_id: step.step_id,
+                    },
+                    db_activity_options.clone(),
+                )
+                .await?;
+            let executed = ctx
+                .start_activity(
+                    OrderActivities::execute_step,
+                    ExecuteStepInput {
+                        order_id: input.order_id,
+                        attempt_id: execution_attempt.attempt_id,
+                        step_id: step.step_id,
+                    },
+                    execute_activity_options.clone(),
+                )
+                .await?;
+            let _receipt = ctx
+                .start_activity(
+                    OrderActivities::persist_provider_receipt,
+                    PersistProviderReceiptInput {
+                        execution: executed.clone(),
+                    },
+                    db_activity_options.clone(),
+                )
+                .await?;
+            let _provider_status = ctx
+                .start_activity(
+                    OrderActivities::persist_provider_operation_status,
+                    PersistProviderOperationStatusInput {
+                        execution: executed.clone(),
+                    },
+                    db_activity_options.clone(),
+                )
+                .await?;
+            let _settled = ctx
+                .start_activity(
+                    OrderActivities::settle_provider_step,
+                    SettleProviderStepInput {
+                        execution: executed,
+                    },
+                    db_activity_options.clone(),
+                )
+                .await?;
         }
-
-        let _step_completion = ctx
-            .start_activity(
-                OrderActivities::persist_step_completion,
-                PersistStepCompletionInput {
-                    execution: executed,
-                },
-                db_activity_options.clone(),
-            )
-            .await?;
 
         ctx.state_mut(|state| {
             state.phase = OrderWorkflowPhase::Finalizing;
+            state.active_step_id = None;
         });
         let _completed = ctx
             .start_activity(
                 OrderActivities::mark_order_completed,
                 MarkOrderCompletedInput {
                     order_id: input.order_id,
-                    attempt_id: execution_start.attempt_id,
+                    attempt_id: execution_attempt.attempt_id,
                 },
                 db_activity_options,
             )
             .await?;
 
-        // TODO(PR4, brief §6 invariant 1; scar §2): split this happy-path composite when adding
-        // retry/refund branches that need the remaining historical crash checkpoints.
-        // TODO(PR4, brief §6 invariant 2; scar §5): route refund failures to manual
+        // TODO(PR4b, brief §6 invariant 2; scar §5): route refund failures to manual
         // intervention, never to retry.
-        // TODO(PR4, brief §6 invariant 4; scar §8): start refund only after single-position
+        // TODO(PR6, brief §6 invariant 4; scar §8): start refund only after single-position
         // discovery succeeds.
-        // TODO(PR4, brief §6 invariant 5; scar §7): start quote refresh as a child workflow that
+        // TODO(PR5, brief §6 invariant 5; scar §7): start quote refresh as a child workflow that
         // creates its own attempt.
         // Child-workflow shape: RefundWorkflow, QuoteRefreshWorkflow,
         // StaleRunningStepWatchdogWorkflow, and ProviderHintPollWorkflow.
@@ -285,6 +311,6 @@ impl ProviderHintPollWorkflow {
         _ctx: &mut WorkflowContext<Self>,
         _input: ProviderHintPollWorkflowInput,
     ) -> WorkflowResult<ProviderHintPollWorkflowOutput> {
-        todo!("PR3: poll provider hints as signal fallback")
+        todo!("PR7: poll provider hints as signal fallback")
     }
 }
