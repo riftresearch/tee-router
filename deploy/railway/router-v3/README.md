@@ -8,8 +8,8 @@ called out here.
 
 Create new services with `-v3` suffix:
 
-- `router-postgres-replica-v3`
-- `router-replica-setup-v3`
+- `router-physical-standby-v3`
+- `sauron-state-db-v3`
 - `sauron-worker-v3`
 - `evm-token-indexer-ethereum-v3`
 - `evm-token-indexer-base-v3`
@@ -48,12 +48,12 @@ Do not commit credentialed `BITCOIN_RPC_AUTH` values.
 
 ## Railway Replica
 
-The replica should follow the legacy `etc/compose.replica.yml` model:
+The replica should follow the physical standby model:
 
 1. connect to Phala primary Postgres through `PHALA_DB_SNI`
-2. run a Railway Postgres service
-3. copy schema from the Phala primary
-4. create a logical subscription to `router_all_tables`
+2. initialize `router-physical-standby-v3` with `pg_basebackup`
+3. stream WAL through a physical replication slot
+4. point Sauron and the admin dashboard at the physical standby
 
 The exact new `PHALA_DB_SNI` value is not known until the Phala stack exists.
 

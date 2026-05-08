@@ -116,10 +116,10 @@ The old `etc/compose.phala.yml` already contains the pattern we want to adapt:
 
 - primary Postgres runs in the compose stack
 - app DB password is generated once into a persistent volume
-- Postgres is configured with `wal_level = logical`
-- replication user is created during init
-- publication is created for all router tables while the old logical subscriber
-  exists
+- Postgres is configured for physical streaming replication to Railway
+- `wal_level = logical` is retained only so CDC consumers can decode router
+  events from the physical standby
+- physical replication user is created during init
 - physical replication slots are allowed for the Railway standby
 - `pg_hba.conf` allows the replication user to connect through the controlled
   replication path
@@ -127,8 +127,7 @@ The old `etc/compose.phala.yml` already contains the pattern we want to adapt:
   create the DB gateway endpoint for Railway replica setup
 - `pg_hba.conf` must not expose the router application DB user over the public
   DB gateway; route public DB traffic through a dedicated replication proxy
-  network and keep that network limited to the read-only logical replication
-  user
+  network and keep that network limited to the physical replication user
 
 Required primary config:
 
@@ -138,8 +137,6 @@ password_encryption = 'scram-sha-256'
 wal_level = logical
 max_wal_senders = 10
 max_replication_slots = 10
-max_logical_replication_workers = 4
-max_sync_workers_per_subscription = 2
 hot_standby = on
 ```
 
@@ -148,8 +145,6 @@ The old names should be replaced with router-specific names where practical:
 - database: `router_db`
 - app user: `router_app`
 - replication user: `replicator`
-- publication: `router_all_tables`
-- subscription: `router_subscription`
 
 The Phala compose stack should use separate fixed private subnets so Postgres
 can distinguish internal router API/worker traffic from public gateway traffic:
@@ -176,10 +171,9 @@ itself. Publish it from a small TCP forwarding sidecar attached only to
 ## Railway Read Replica
 
 Sauron should not connect directly to the Phala primary database. Instead,
-Railway should run a read replica that subscribes to the Phala primary via
-logical replication.
+Railway should run a physical standby that streams WAL from the Phala primary.
 
-The old `etc/compose.replica.yml` already contains the basic model:
+`etc/compose.physical-replica.yml` contains the basic model:
 
 1. `router-replica-stunnel-v3` connects to the Phala DB SNI over `:443`.
 2. `router-physical-standby-v3` runs on Railway from
@@ -187,7 +181,7 @@ The old `etc/compose.replica.yml` already contains the basic model:
 3. The standby initializes itself with `pg_basebackup`.
 4. The standby uses a physical replication slot on the Phala primary.
 5. Sauron and the admin dashboard run heavy reads against the standby.
-6. Sauron consumes a logical decoding slot on the standby for watch-set events.
+6. Sauron consumes a CDC decoding slot on the standby for watch-set events.
 
 Sauron connects to the Railway physical standby via
 `ROUTER_REPLICA_DATABASE_URL`.
@@ -204,16 +198,14 @@ created.
 The `stunnel-v3` service lives on Railway, not inside the Phala compose stack.
 Phala exposes the primary Postgres TCP port and the gateway performs TLS
 termination before forwarding plaintext TCP to Postgres. Railway's `stunnel-v3`
-performs the client-side TLS-to-TCP conversion before `replica-setup` connects.
+performs the client-side TLS-to-TCP conversion before the physical standby
+connects.
 
 The repo contains Railway-specific helper images for this path:
 
 - `railway/router-replica-stunnel/` runs the client-side stunnel sidecar.
 - `railway/router-physical-standby/` runs the physical standby bootstrap and
   Postgres process.
-
-`railway/router-replica-setup/` is the legacy logical-replica setup image and
-should only be kept while the old subscriber is still being retired.
 
 Deploy these from the repo root so their Dockerfile `COPY` paths resolve
 against the repository layout.
@@ -271,10 +263,10 @@ Required inputs:
 Sauron posts non-authoritative hints to the router API. Router-worker still
 validates provider and chain state before executing state transitions.
 
-Sauron consumes router changes through `START_REPLICATION ... LOGICAL` using
-the `pgoutput` plugin with logical messages enabled. Router migrations install
+Sauron consumes router CDC events from the physical standby through the
+`pgoutput` plugin with emitted CDC messages enabled. Router migrations install
 the `pg_logical_emit_message` triggers and `router_cdc_publication`; no
-replica-local `LISTEN/NOTIFY` trigger migrations are used.
+replica-local trigger migrations are used.
 
 ## EVM Token Indexers
 
@@ -420,49 +412,42 @@ Router API and worker need the same core config:
 
 ## Observability
 
-Better Stack is the alpha observability backend. The source is:
-
-- source name: `tee-router-alpha`
-- source ID: `2403167`
-- platform: `open_telemetry`
-- table: `tee_router_alpha`
-- ingest endpoint: `https://s2403167.us-east-9.betterstackdata.com`
-
-Do not commit the Better Stack source token. It must be supplied as
-`BETTERSTACK_SOURCE_TOKEN` in deployment-local secret storage such as
-`.env.phala.prod` or Railway service variables.
-
-The Phala stack runs an OpenTelemetry Collector sidecar. The collector receives
-OTLP on private ports `4317`/`4318`, scrapes router-specific private metrics
-from:
+The router services expose Prometheus metrics directly. The production Phala
+stack keeps these endpoints private on the compose network:
 
 - `router-api:9100`
 - `router-worker:9101`
 
-and forwards metrics, logs, and traces to Better Stack. The current Rust
-application path exports tee-router custom metrics through the existing
-`metrics` crate via `metrics-exporter-prometheus`; the Prometheus endpoint is
-private and is only an internal receiver for the OpenTelemetry Collector. This
-does not deploy or depend on a Prometheus server.
+Local development uses the Alloy, VictoriaMetrics, Loki, Tempo, and Grafana
+compose overlay:
 
-`router-api` and `router-worker` also emit tracing events/spans to the Phala
-collector when `OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318` is set.
-The shared Rust observability helper derives `/v1/traces` and `/v1/logs` from
-that base endpoint.
+```sh
+docker compose \
+  -f etc/compose.local-full.yml \
+  -f etc/compose.local-observability.yml \
+  up -d
+```
 
-Sauron should get the same pattern on Railway:
+That overlay runs Alloy locally. Alloy scrapes:
 
-- set `METRICS_BIND_ADDR=0.0.0.0:9102` on `sauron-worker-v3`
-- set `OTEL_EXPORTER_OTLP_ENDPOINT=http://betterstack-otel-collector-v3.railway.internal:4318`
-  on `sauron-worker-v3`
-- run a Railway collector service that scrapes Sauron over Railway private
-  networking and exports to the same Better Stack source
-- deploy the collector from `railway/betterstack-otel-collector/Dockerfile`
+- `router-api:9100`
+- `router-worker:9101`
+- `sauron:9102`
+
+and forwards metrics to VictoriaMetrics. Router services also send OTLP
+logs/traces to Alloy, which forwards logs to Loki and traces to Tempo. Grafana
+is provisioned with all three datasources and the local dashboard at
+`http://localhost:3002/d/tee-router-local-overview/tee-router-local-overview`.
+
+OpenTelemetry export remains a generic runtime capability in the Rust
+observability helper. It is disabled unless `OTEL_EXPORTER_OTLP_ENDPOINT`,
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, or `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` is
+set by a deployment.
 
 Railway private networking can require IPv6 wildcard listeners. The Rust
 observability helper keeps the operator-facing `METRICS_BIND_ADDR=0.0.0.0:9102`
 setting but binds it as `[::]:9102` when Railway runtime metadata is present, so
-the private collector can reach the endpoint through `*.railway.internal`.
+private scrapers can reach the endpoint through `*.railway.internal`.
 
 ## Implementation Checklist
 
@@ -482,7 +467,7 @@ the private collector can reach the endpoint through `*.railway.internal`.
    change.
 4. Adapt primary Postgres config/init scripts from old `compose.phala.yml`.
 5. Deploy Railway `router-physical-standby-v3` and `sauron-state-db-v3`.
-6. Verify physical standby replay and logical decoding on the standby.
+6. Verify physical standby replay and CDC decoding on the standby.
 7. Configure `sauron-worker-v3` on Railway against the physical standby and
    state DB.
 8. Configure new Ponder token indexers on Railway with `-v3` service names.

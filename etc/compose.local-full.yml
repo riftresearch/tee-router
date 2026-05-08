@@ -1,85 +1,28 @@
 configs:
+  router-postgres-hba:
+    content: |
+      local all all trust
+      host all all 127.0.0.1/32 scram-sha-256
+      host all all ::1/128 scram-sha-256
+      host all all all scram-sha-256
+      host replication replicator all scram-sha-256
+
   router-postgres-init:
     content: |
       #!/bin/sh
       set -eu
 
       psql -v ON_ERROR_STOP=1 --username "$$POSTGRES_USER" --dbname "$$POSTGRES_DB" <<-SQL
-        CREATE ROLE replicator LOGIN REPLICATION PASSWORD 'replicator';
-        CREATE PUBLICATION router_all_tables FOR ALL TABLES;
-
-        GRANT USAGE ON SCHEMA public TO replicator;
-        GRANT SELECT ON ALL TABLES IN SCHEMA public TO replicator;
-        GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO replicator;
-        ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO replicator;
-        ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE ON SEQUENCES TO replicator;
+        DO \$\$
+        BEGIN
+          IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'replicator') THEN
+            CREATE ROLE replicator LOGIN REPLICATION PASSWORD 'replicator';
+          ELSE
+            ALTER ROLE replicator WITH LOGIN REPLICATION PASSWORD 'replicator';
+          END IF;
+        END
+        \$\$;
       SQL
-
-  local-replica-setup:
-    content: |
-      #!/usr/bin/env bash
-      set -euo pipefail
-
-      PRIMARY_CONN="postgresql://replicator:replicator@router-postgres:5432/router_db?sslmode=disable"
-      PRIMARY_ADMIN_CONN="postgresql://router_app:router_app@router-postgres:5432/router_db?sslmode=disable"
-      REPLICA_ADMIN_CONN="postgresql://postgres:postgres@router-postgres-replica:5432/postgres?sslmode=disable"
-      REPLICA_DB_CONN="postgresql://postgres:postgres@router-postgres-replica:5432/router_db?sslmode=disable"
-
-      until psql "$${PRIMARY_CONN}" -c '\q' 2>/dev/null; do
-        echo "waiting for local router primary"
-        sleep 2
-      done
-
-      until psql "$${REPLICA_ADMIN_CONN}" -c '\q' 2>/dev/null; do
-        echo "waiting for local router replica"
-        sleep 2
-      done
-
-      REPLICA_DB_EXISTS=$$(psql "$${REPLICA_ADMIN_CONN}" -tAc "SELECT COUNT(*) FROM pg_database WHERE datname = 'router_db';")
-      if [ "$${REPLICA_DB_EXISTS}" -eq "1" ]; then
-        SUB_EXISTS=$$(psql "$${REPLICA_DB_CONN}" -tAc "SELECT COUNT(*) FROM pg_subscription WHERE subname = 'router_local_subscription';")
-        if [ "$${SUB_EXISTS}" -eq "1" ]; then
-          psql -v ON_ERROR_STOP=1 "$${REPLICA_DB_CONN}" \
-            -c "ALTER SUBSCRIPTION router_local_subscription DISABLE;" \
-            -c "ALTER SUBSCRIPTION router_local_subscription SET (slot_name = NONE);" \
-            -c "DROP SUBSCRIPTION router_local_subscription;"
-        fi
-      fi
-
-      for attempt in $$(seq 1 20); do
-        psql -v ON_ERROR_STOP=1 "$${REPLICA_ADMIN_CONN}" \
-          -c "SELECT pg_terminate_backend(active_pid) FROM pg_catalog.pg_replication_slots WHERE database = 'router_db' AND active_pid IS NOT NULL;" \
-          -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_catalog.pg_replication_slots WHERE database = 'router_db' AND active_pid IS NULL;"
-
-        REMAINING_SLOTS=$$(psql "$${REPLICA_ADMIN_CONN}" -tAc "SELECT COUNT(*) FROM pg_catalog.pg_replication_slots WHERE database = 'router_db';")
-        if [ "$${REMAINING_SLOTS}" -eq "0" ]; then
-          break
-        fi
-        if [ "$${attempt}" -eq "20" ]; then
-          echo "timed out waiting for local replica replication slots to close" >&2
-          exit 3
-        fi
-        sleep 0.2
-      done
-
-      psql -v ON_ERROR_STOP=1 "$${REPLICA_ADMIN_CONN}" \
-        -c "DROP DATABASE IF EXISTS router_db WITH (FORCE);" \
-        -c "CREATE DATABASE router_db;"
-
-      psql "$${PRIMARY_ADMIN_CONN}" -c "SELECT pg_terminate_backend(active_pid) FROM pg_catalog.pg_replication_slots WHERE slot_name = 'router_local_subscription' AND active_pid IS NOT NULL;"
-      SLOT_EXISTS=$$(psql "$${PRIMARY_ADMIN_CONN}" -tAc "SELECT COUNT(*) FROM pg_replication_slots WHERE slot_name = 'router_local_subscription';")
-      if [ "$${SLOT_EXISTS}" -eq "1" ]; then
-        psql "$${PRIMARY_ADMIN_CONN}" -c "SELECT pg_drop_replication_slot('router_local_subscription');"
-      fi
-
-      pg_dump "$${PRIMARY_CONN}" --schema-only --no-owner --no-privileges --no-publications --no-subscriptions | \
-        psql "$${REPLICA_DB_CONN}"
-
-      psql "$${REPLICA_DB_CONN}" -c "CREATE PUBLICATION router_cdc_publication;"
-
-      psql "$${REPLICA_DB_CONN}" -c "CREATE SUBSCRIPTION router_local_subscription CONNECTION 'host=router-postgres port=5432 dbname=router_db user=replicator password=replicator sslmode=disable' PUBLICATION router_all_tables WITH (copy_data = true, create_slot = true);"
-
-      echo "local router replica is ready"
 
 services:
   router-master-key-init:
@@ -99,7 +42,7 @@ services:
     restart: "no"
 
   router-postgres:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     command:
       - postgres
       - -c
@@ -108,6 +51,24 @@ services:
       - max_wal_senders=10
       - -c
       - max_replication_slots=10
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
+      - -c
+      - synchronous_commit=on
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - effective_cache_size=1GB
+      - -c
+      - work_mem=16MB
+      - -c
+      - checkpoint_timeout=15min
+      - -c
+      - max_wal_size=2GB
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=200
     environment:
       POSTGRES_USER: router_app
       POSTGRES_PASSWORD: router_app
@@ -118,8 +79,10 @@ services:
       - source: router-postgres-init
         target: /docker-entrypoint-initdb.d/001-router-init.sh
         mode: 0755
+      - source: router-postgres-hba
+        target: /etc/postgresql/pg_hba.conf
     volumes:
-      - router_local_postgres:/var/lib/postgresql/data
+      - router_local_postgres_primary:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U router_app -d router_db"]
       interval: 5s
@@ -203,9 +166,11 @@ services:
       BITCOIN_RPC_AUTH: devnet:devnet
       ELECTRUM_HTTP_SERVER_URL: http://devnet:50110
       BITCOIN_NETWORK: regtest
-      ETHEREUM_PAYMASTER_PRIVATE_KEY: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-      BASE_PAYMASTER_PRIVATE_KEY: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-      ARBITRUM_PAYMASTER_PRIVATE_KEY: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+      # Anvil account #9. Keep router paymasters off account #0 because the
+      # devnet deployer, mocks, and loadgen helpers submit from account #0.
+      ETHEREUM_PAYMASTER_PRIVATE_KEY: "0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6"
+      BASE_PAYMASTER_PRIVATE_KEY: "0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6"
+      ARBITRUM_PAYMASTER_PRIVATE_KEY: "0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6"
       HYPERLIQUID_PAYMASTER_PRIVATE_KEY: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
       ROUTER_DETECTOR_API_KEY: devnet-detector-key-000000000000
       ROUTER_GATEWAY_API_KEY: devnet-gateway-key-0000000000000000
@@ -251,42 +216,32 @@ services:
       - router_local_master_key:/run/router-secrets:ro
 
   router-postgres-replica:
-    image: postgres:16-alpine
-    command:
-      - postgres
-      - -c
-      - wal_level=logical
-      - -c
-      - max_wal_senders=10
-      - -c
-      - max_replication_slots=10
+    build:
+      context: ../railway/router-physical-standby
+      dockerfile: Dockerfile
+    depends_on:
+      router-postgres:
+        condition: service_healthy
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: router_db
+      PRIMARY_DB_HOST: router-postgres
+      PRIMARY_DB_PORT: 5432
+      PRIMARY_DB_NAME: router_db
+      PRIMARY_DB_USER: replicator
+      PRIMARY_DB_PASSWORD: replicator
+      PRIMARY_DB_SSLMODE: disable
+      PRIMARY_REPLICATION_SLOT: router_local_physical_standby
+      STANDBY_APPLICATION_NAME: router-local-physical-standby
+      STANDBY_MAX_CONNECTIONS: 256
+      PGDATA: /var/lib/postgresql/18/docker
     ports:
       - "55433:5432"
     volumes:
-      - router_local_postgres_replica:/var/lib/postgresql/data
+      - router_local_physical_standby:/var/lib/postgresql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d router_db"]
+      test: ["CMD-SHELL", "pg_isready -U router_app -d router_db"]
       interval: 5s
       timeout: 5s
       retries: 20
-
-  router-replica-setup:
-    image: postgres:16
-    depends_on:
-      router-api:
-        condition: service_healthy
-      router-postgres-replica:
-        condition: service_healthy
-    configs:
-      - source: local-replica-setup
-        target: /setup.sh
-        mode: 0755
-    command: ["/setup.sh"]
-    restart: "no"
 
   sauron-state-db:
     image: postgres:16-alpine
@@ -307,15 +262,15 @@ services:
       context: ..
       dockerfile: etc/Dockerfile.sauron
     depends_on:
-      router-replica-setup:
-        condition: service_completed_successfully
+      router-postgres-replica:
+        condition: service_healthy
       sauron-state-db:
         condition: service_healthy
       devnet:
         condition: service_healthy
     environment:
       RUST_LOG: info
-      ROUTER_REPLICA_DATABASE_URL: postgres://postgres:postgres@router-postgres-replica:5432/router_db
+      ROUTER_REPLICA_DATABASE_URL: postgres://router_app:router_app@router-postgres-replica:5432/router_db
       SAURON_STATE_DATABASE_URL: postgres://postgres:postgres@sauron-state-db:5432/sauron_state
       SAURON_REPLICA_EVENT_SOURCE: cdc
       SAURON_CDC_SLOT_NAME: sauron_watch_cdc
@@ -412,8 +367,8 @@ services:
       context: ..
       dockerfile: railway/admin-dashboard/Dockerfile
     depends_on:
-      router-replica-setup:
-        condition: service_completed_successfully
+      router-postgres-replica:
+        condition: service_healthy
       admin-dashboard-auth-db:
         condition: service_healthy
       admin-dashboard-analytics-db:
@@ -427,7 +382,7 @@ services:
       BETTER_AUTH_URL: http://localhost:3000
       ADMIN_DASHBOARD_WEB_ORIGIN: http://localhost:3000
       ADMIN_DASHBOARD_AUTH_DATABASE_URL: postgres://postgres:postgres@admin-dashboard-auth-db:5432/admin_dashboard_auth
-      ADMIN_DASHBOARD_REPLICA_DATABASE_URL: postgres://postgres:postgres@router-postgres-replica:5432/router_db
+      ADMIN_DASHBOARD_REPLICA_DATABASE_URL: postgres://router_app:router_app@router-postgres-replica:5432/router_db
       ADMIN_DASHBOARD_ANALYTICS_DATABASE_URL: postgres://postgres:postgres@admin-dashboard-analytics-db:5432/admin_dashboard_analytics
       ADMIN_DASHBOARD_CDC_SLOT_NAME: admin_dashboard_orders_cdc
       ROUTER_CDC_PUBLICATION_NAME: router_cdc_publication
@@ -477,9 +432,9 @@ services:
 
 volumes:
   router_local_master_key:
-  router_local_postgres:
+  router_local_postgres_primary:
   router_local_token_indexer_db:
-  router_local_postgres_replica:
+  router_local_physical_standby:
   router_local_sauron_state_db:
   router_local_gateway_db:
   router_local_admin_auth_db:

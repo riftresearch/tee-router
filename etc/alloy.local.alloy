@@ -1,0 +1,93 @@
+logging {
+  level  = "info"
+  format = "logfmt"
+}
+
+prometheus.scrape "router" {
+  targets = [
+    {"__address__" = "router-api:9100", "job" = "router-api"},
+    {"__address__" = "router-worker:9101", "job" = "router-worker"},
+    {"__address__" = "sauron:9102", "job" = "sauron"},
+    {"__address__" = "tempo:3200", "job" = "tempo"},
+  ]
+
+  scrape_interval = "5s"
+  scrape_timeout  = "4s"
+  forward_to      = [prometheus.remote_write.victoriametrics.receiver]
+}
+
+prometheus.remote_write "victoriametrics" {
+  endpoint {
+    url = "http://victoriametrics:8428/api/v1/write"
+  }
+}
+
+otelcol.receiver.otlp "router" {
+  grpc {
+    endpoint = "0.0.0.0:4317"
+  }
+
+  http {
+    endpoint = "0.0.0.0:4318"
+  }
+
+  output {
+    logs    = [otelcol.processor.batch.router.input]
+    metrics = [otelcol.processor.batch.router.input]
+    traces  = [otelcol.processor.batch.router.input]
+  }
+}
+
+otelcol.processor.batch "router" {
+  output {
+    logs    = [otelcol.exporter.loki.router.input]
+    metrics = [otelcol.exporter.prometheus.router.input]
+    traces  = [otelcol.exporter.otlp.tempo.input]
+  }
+}
+
+otelcol.exporter.loki "router" {
+  forward_to = [loki.process.router.receiver]
+}
+
+loki.process "router" {
+  forward_to = [loki.write.local.receiver]
+
+  stage.json {
+    expressions = {
+      body     = "body",
+      severity = "severity",
+      order_id = "attributes.order_id",
+      error    = "attributes.error",
+    }
+  }
+
+  stage.template {
+    source   = "message"
+    template = "{{ .severity }} {{ .body }}{{ with .order_id }} order={{ . }}{{ end }}{{ with .error }} error={{ . }}{{ end }}"
+  }
+
+  stage.output {
+    source = "message"
+  }
+}
+
+loki.write "local" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}
+
+otelcol.exporter.prometheus "router" {
+  forward_to = [prometheus.remote_write.victoriametrics.receiver]
+}
+
+otelcol.exporter.otlp "tempo" {
+  client {
+    endpoint = "tempo:4317"
+
+    tls {
+      insecure = true
+    }
+  }
+}
