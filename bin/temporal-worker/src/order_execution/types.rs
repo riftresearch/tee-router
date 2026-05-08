@@ -180,6 +180,13 @@ pub struct MaterializedExecutionAttempt {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaterializeRetryAttemptInput {
+    pub order_id: WorkflowOrderId,
+    pub failed_attempt_id: WorkflowAttemptId,
+    pub failed_step_id: WorkflowStepId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowExecutionStep {
     pub step_id: WorkflowStepId,
     pub step_index: i32,
@@ -239,11 +246,14 @@ pub struct ClassifyStepFailureInput {
 pub struct WriteFailedAttemptSnapshotInput {
     pub order_id: WorkflowOrderId,
     pub attempt_id: WorkflowAttemptId,
+    pub failed_step_id: WorkflowStepId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FailedAttemptSnapshotWritten {
     pub attempt_id: WorkflowAttemptId,
+    pub attempt_index: i32,
+    pub failed_step_id: WorkflowStepId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -372,6 +382,7 @@ pub enum OrderWorkflowPhase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderTerminalStatus {
     Completed,
+    RefundRequired,
     Refunded,
     ManualInterventionRequired,
     RefundManualInterventionRequired,

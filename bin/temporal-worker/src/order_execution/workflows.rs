@@ -9,15 +9,17 @@ use uuid::Uuid;
 
 use super::activities::OrderActivities;
 use super::types::{
-    ExecuteStepInput, FundingVaultFundedSignal, LoadOrderExecutionStateInput,
-    ManualInterventionReleaseSignal, ManualRefundTriggerSignal, MarkOrderCompletedInput,
-    MaterializeExecutionAttemptInput, OrderTerminalStatus, OrderWorkflowDebugCursor,
+    ClassifyStepFailureInput, ExecuteStepInput, FinalizeOrderOrRefundInput,
+    FundingVaultFundedSignal, LoadOrderExecutionStateInput, ManualInterventionReleaseSignal,
+    ManualRefundTriggerSignal, MarkOrderCompletedInput, MaterializeExecutionAttemptInput,
+    MaterializeRetryAttemptInput, OrderTerminalStatus, OrderWorkflowDebugCursor,
     OrderWorkflowInput, OrderWorkflowOutput, OrderWorkflowPhase,
-    PersistProviderOperationStatusInput, PersistProviderReceiptInput, PersistStepReadyToFireInput,
-    ProviderHintPollWorkflowInput, ProviderHintPollWorkflowOutput, ProviderOperationHintSignal,
-    QuoteRefreshWorkflowInput, QuoteRefreshWorkflowOutput, RefundWorkflowInput,
-    RefundWorkflowOutput, SettleProviderStepInput, StaleRunningStepWatchdogInput,
-    StaleRunningStepWatchdogOutput,
+    PersistProviderOperationStatusInput, PersistProviderReceiptInput, PersistStepFailedInput,
+    PersistStepReadyToFireInput, ProviderHintPollWorkflowInput, ProviderHintPollWorkflowOutput,
+    ProviderOperationHintSignal, QuoteRefreshWorkflowInput, QuoteRefreshWorkflowOutput,
+    RefundWorkflowInput, RefundWorkflowOutput, SettleProviderStepInput,
+    StaleRunningStepWatchdogInput, StaleRunningStepWatchdogOutput, StepFailureDecision,
+    WriteFailedAttemptSnapshotInput,
 };
 
 /// Root order execution workflow.
@@ -69,7 +71,7 @@ impl OrderWorkflow {
         // TODO(PR8, brief §6 invariant 3; scar §6): start the stale-running-step watchdog child
         // before provider execution and surface manual intervention after five minutes without a
         // checkpoint.
-        let execution_attempt = ctx
+        let mut execution_attempt = ctx
             .start_activity(
                 OrderActivities::materialize_execution_attempt,
                 MaterializeExecutionAttemptInput {
@@ -84,59 +86,159 @@ impl OrderWorkflow {
             state.active_attempt_id = Some(execution_attempt.attempt_id);
         });
 
-        for step in execution_attempt.steps {
-            ctx.state_mut(|state| {
-                state.active_step_id = Some(step.step_id);
-            });
-            let _ready = ctx
-                .start_activity(
-                    OrderActivities::persist_step_ready_to_fire,
-                    PersistStepReadyToFireInput {
-                        order_id: input.order_id,
-                        attempt_id: execution_attempt.attempt_id,
-                        step_id: step.step_id,
-                    },
-                    db_activity_options.clone(),
-                )
-                .await?;
-            let executed = ctx
-                .start_activity(
-                    OrderActivities::execute_step,
-                    ExecuteStepInput {
-                        order_id: input.order_id,
-                        attempt_id: execution_attempt.attempt_id,
-                        step_id: step.step_id,
-                    },
-                    execute_activity_options.clone(),
-                )
-                .await?;
-            let _receipt = ctx
-                .start_activity(
-                    OrderActivities::persist_provider_receipt,
-                    PersistProviderReceiptInput {
-                        execution: executed.clone(),
-                    },
-                    db_activity_options.clone(),
-                )
-                .await?;
-            let _provider_status = ctx
-                .start_activity(
-                    OrderActivities::persist_provider_operation_status,
-                    PersistProviderOperationStatusInput {
-                        execution: executed.clone(),
-                    },
-                    db_activity_options.clone(),
-                )
-                .await?;
-            let _settled = ctx
-                .start_activity(
-                    OrderActivities::settle_provider_step,
-                    SettleProviderStepInput {
-                        execution: executed,
-                    },
-                    db_activity_options.clone(),
-                )
-                .await?;
+        'attempts: loop {
+            for step in execution_attempt.steps.clone() {
+                ctx.state_mut(|state| {
+                    state.active_step_id = Some(step.step_id);
+                });
+                let _ready = ctx
+                    .start_activity(
+                        OrderActivities::persist_step_ready_to_fire,
+                        PersistStepReadyToFireInput {
+                            order_id: input.order_id,
+                            attempt_id: execution_attempt.attempt_id,
+                            step_id: step.step_id,
+                        },
+                        db_activity_options.clone(),
+                    )
+                    .await?;
+                let executed = match ctx
+                    .start_activity(
+                        OrderActivities::execute_step,
+                        ExecuteStepInput {
+                            order_id: input.order_id,
+                            attempt_id: execution_attempt.attempt_id,
+                            step_id: step.step_id,
+                        },
+                        execute_activity_options.clone(),
+                    )
+                    .await
+                {
+                    Ok(executed) => executed,
+                    Err(source) => {
+                        let failure_reason = source.to_string();
+                        drop(source);
+                        let _failed = ctx
+                            .start_activity(
+                                OrderActivities::persist_step_failed,
+                                PersistStepFailedInput {
+                                    order_id: input.order_id,
+                                    attempt_id: execution_attempt.attempt_id,
+                                    step_id: step.step_id,
+                                    failure_reason,
+                                },
+                                db_activity_options.clone(),
+                            )
+                            .await?;
+                        let _snapshot = ctx
+                            .start_activity(
+                                OrderActivities::write_failed_attempt_snapshot,
+                                WriteFailedAttemptSnapshotInput {
+                                    order_id: input.order_id,
+                                    attempt_id: execution_attempt.attempt_id,
+                                    failed_step_id: step.step_id,
+                                },
+                                db_activity_options.clone(),
+                            )
+                            .await?;
+                        let decision = ctx
+                            .start_activity(
+                                OrderActivities::classify_step_failure,
+                                ClassifyStepFailureInput {
+                                    order_id: input.order_id,
+                                    attempt_id: execution_attempt.attempt_id,
+                                    failed_step_id: step.step_id,
+                                },
+                                db_activity_options.clone(),
+                            )
+                            .await?;
+
+                        match decision {
+                            StepFailureDecision::RetryNewAttempt => {
+                                execution_attempt = ctx
+                                    .start_activity(
+                                        OrderActivities::materialize_retry_attempt,
+                                        MaterializeRetryAttemptInput {
+                                            order_id: input.order_id,
+                                            failed_attempt_id: execution_attempt.attempt_id,
+                                            failed_step_id: step.step_id,
+                                        },
+                                        db_activity_options.clone(),
+                                    )
+                                    .await?;
+                                ctx.state_mut(|state| {
+                                    state.phase = OrderWorkflowPhase::Executing;
+                                    state.active_attempt_id = Some(execution_attempt.attempt_id);
+                                    state.active_step_id = None;
+                                });
+                                continue 'attempts;
+                            }
+                            StepFailureDecision::StartRefund => {
+                                ctx.state_mut(|state| {
+                                    state.phase = OrderWorkflowPhase::Finalizing;
+                                    state.active_step_id = None;
+                                });
+                                let finalized = ctx
+                                    .start_activity(
+                                        OrderActivities::finalize_order_or_refund,
+                                        FinalizeOrderOrRefundInput {
+                                            order_id: input.order_id,
+                                            terminal_status: OrderTerminalStatus::RefundRequired,
+                                        },
+                                        db_activity_options,
+                                    )
+                                    .await?;
+                                return Ok(OrderWorkflowOutput {
+                                    order_id: input.order_id,
+                                    terminal_status: finalized.terminal_status,
+                                });
+                            }
+                            StepFailureDecision::RefreshQuote => {
+                                return Err(anyhow::anyhow!(
+                                    "PR4b does not implement RefreshQuote for failed step {}",
+                                    step.step_id
+                                )
+                                .into());
+                            }
+                            StepFailureDecision::ManualIntervention => {
+                                return Err(anyhow::anyhow!(
+                                    "PR4b does not implement ManualIntervention for failed step {}",
+                                    step.step_id
+                                )
+                                .into());
+                            }
+                        }
+                    }
+                };
+                let _receipt = ctx
+                    .start_activity(
+                        OrderActivities::persist_provider_receipt,
+                        PersistProviderReceiptInput {
+                            execution: executed.clone(),
+                        },
+                        db_activity_options.clone(),
+                    )
+                    .await?;
+                let _provider_status = ctx
+                    .start_activity(
+                        OrderActivities::persist_provider_operation_status,
+                        PersistProviderOperationStatusInput {
+                            execution: executed.clone(),
+                        },
+                        db_activity_options.clone(),
+                    )
+                    .await?;
+                let _settled = ctx
+                    .start_activity(
+                        OrderActivities::settle_provider_step,
+                        SettleProviderStepInput {
+                            execution: executed,
+                        },
+                        db_activity_options.clone(),
+                    )
+                    .await?;
+            }
+            break;
         }
 
         ctx.state_mut(|state| {
@@ -154,8 +256,8 @@ impl OrderWorkflow {
             )
             .await?;
 
-        // TODO(PR4b, brief §6 invariant 2; scar §5): route refund failures to manual
-        // intervention, never to retry.
+        // TODO(PR6, brief §6 invariant 2; scar §5): route refund failures to manual
+        // intervention, never to primary-execution retry.
         // TODO(PR6, brief §6 invariant 4; scar §8): start refund only after single-position
         // discovery succeeds.
         // TODO(PR5, brief §6 invariant 5; scar §7): start quote refresh as a child workflow that
