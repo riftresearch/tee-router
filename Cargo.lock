@@ -2149,6 +2149,7 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 name = "chainalysis-address-screener"
 version = "0.1.8"
 dependencies = [
+ "metrics",
  "reqwest",
  "serde",
  "serde_json",
@@ -3018,11 +3019,11 @@ dependencies = [
 [[package]]
 name = "esplora-client"
 version = "0.12.1"
-source = "git+https://github.com/riftresearch/rust-esplora-client?rev=b749fb95e204c7d5f5c1fa83d499a8600d72a103#b749fb95e204c7d5f5c1fa83d499a8600d72a103"
 dependencies = [
  "bitcoin",
  "hex-conservative 0.2.1",
  "log",
+ "minreq",
  "reqwest",
  "serde",
  "tokio",
@@ -3065,6 +3066,7 @@ name = "evm-token-indexer-client"
 version = "0.1.8"
 dependencies = [
  "alloy",
+ "metrics",
  "reqwest",
  "serde",
  "serde_json",
@@ -3744,6 +3746,7 @@ name = "hyperliquid-client"
 version = "0.1.8"
 dependencies = [
  "alloy",
+ "metrics",
  "reqwest",
  "rmp-serde",
  "serde",
@@ -3775,6 +3778,7 @@ version = "0.1.8"
 dependencies = [
  "alloy",
  "hyperliquid-client",
+ "metrics",
  "reqwest",
  "serde",
  "serde_json",
@@ -4270,6 +4274,7 @@ name = "market-pricing"
 version = "0.1.8"
 dependencies = [
  "chrono",
+ "metrics",
  "reqwest",
  "serde",
  "serde_json",
@@ -4426,6 +4431,7 @@ version = "2.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05015102dad0f7d61691ca347e9d9d9006685a64aefb3d79eecf62665de2153d"
 dependencies = [
+ "base64 0.22.1",
  "rustls 0.21.12",
  "rustls-webpki 0.101.7",
  "serde",

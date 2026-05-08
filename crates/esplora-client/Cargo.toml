@@ -1,0 +1,47 @@
+[package]
+name = "esplora-client"
+version = "0.12.1"
+edition = "2021"
+authors = ["Alekos Filini <alekos.filini@gmail.com>"]
+license = "MIT"
+homepage = "https://github.com/bitcoindevkit/rust-esplora-client"
+repository = "https://github.com/bitcoindevkit/rust-esplora-client"
+documentation = "https://docs.rs/esplora-client/"
+description = "Bitcoin Esplora API client library. Supports plaintext, TLS and Onion servers. Blocking or async"
+keywords = ["bitcoin", "esplora"]
+readme = "README.md"
+rust-version = "1.63.0"
+
+[lib]
+name = "esplora_client"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+bitcoin = { version = "0.32", features = ["serde", "std"], default-features = false }
+hex = { version = "0.2", package = "hex-conservative" }
+log = "^0.4"
+minreq = { version = "2.11.0", default-features = false, features = ["json-using-serde"], optional = true }
+reqwest = { version = "0.12",  features = ["json"], default-features = false, optional = true }
+
+# default async runtime
+tokio = { version = "1", features = ["time"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1.20.1", features = ["full"] }
+
+[features]
+default = ["async", "async-https-rustls", "tokio"]
+blocking = ["minreq", "minreq/proxy"]
+blocking-https = ["blocking-https-rustls"]
+blocking-https-rustls = ["blocking", "minreq/https-rustls"]
+blocking-https-native = ["blocking-https-rustls"]
+blocking-https-bundled = ["blocking-https-rustls"]
+
+tokio = ["dep:tokio"]
+async = ["reqwest", "reqwest/socks", "tokio?/time"]
+async-https = ["async-https-rustls"]
+async-https-native = ["async-https-rustls"]
+async-https-rustls = ["async", "reqwest/rustls-tls"]
+async-https-rustls-manual-roots = ["async", "reqwest/rustls-tls-manual-roots"]
+external-tests = []

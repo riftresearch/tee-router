@@ -14,6 +14,7 @@ members = [
     "crates/eip3009-erc20-contract",
     "crates/eip7702-delegator-contract",
     "crates/evm-token-indexer-client",
+    "crates/esplora-client",
     "crates/chains",
     "crates/hyperliquid-client",
     "crates/hyperunit-client",
@@ -51,7 +52,7 @@ bitcoin = { version = "0.32.0", default-features = false, features = ["serde", "
 bitcoincore-rpc-async = { git = "https://github.com/riftresearch/rust-bitcoincore-rpc-async", rev = "c50734a50f2af2f8a9be3f03b98832dd04e788b1" }
 corepc-node = { version = "0.8.0", features = ["29_0", "download"] }
 electrsd = { git = "https://github.com/RCasatta/electrsd", rev = "bdc97e879bad82e13e69c74d898271db12224f44", features = ["corepc-node_29_0", "esplora_a33e97e1", "legacy"] }
-esplora-client = {git = "https://github.com/riftresearch/rust-esplora-client" , rev = "b749fb95e204c7d5f5c1fa83d499a8600d72a103", default-features = false, features = ["async", "tokio", "async-https-rustls"]}
+esplora-client = { path = "crates/esplora-client", default-features = false, features = ["async", "tokio", "async-https-rustls"]}
 
 alloy = { version = "1.0.23", default-features = false, features = ["std", "full", "node-bindings", "json-rpc", "eip712", "reqwest-rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -104,4 +105,3 @@ eyre = "0.6.12"
 
 [patch.crates-io]
 corepc-node = { git = "https://github.com/alpinevm/corepc", rev = "2b21b2bfeb4b4c8bc71fccba87d86054a648f242" }
-esplora-client = {git = "https://github.com/riftresearch/rust-esplora-client" , rev = "b749fb95e204c7d5f5c1fa83d499a8600d72a103"}
