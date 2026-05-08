@@ -17,7 +17,7 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use sqlx_core::row::Row;
-use sqlx_postgres::PgPool;
+use sqlx_postgres::{PgPool, Postgres};
 use std::{collections::HashMap, time::Instant};
 use uuid::Uuid;
 
@@ -1896,6 +1896,507 @@ impl OrderRepository {
         let step = self.map_execution_step_row(&row)?;
         self.refresh_execution_leg_for_step(&step).await?;
         Ok(step)
+    }
+
+    pub async fn persist_execution_step_failed(
+        &self,
+        order_id: Uuid,
+        attempt_id: Uuid,
+        step_id: Uuid,
+        error: serde_json::Value,
+        failed_at: DateTime<Utc>,
+    ) -> RouterCoreResult<OrderExecutionStep> {
+        let started = Instant::now();
+        let result = sqlx_core::query::query(&format!(
+            r#"
+            WITH failed AS (
+                UPDATE order_execution_steps
+                SET
+                    status = 'failed',
+                    error_json = $4,
+                    completed_at = COALESCE(completed_at, $5),
+                    updated_at = $5
+                WHERE id = $1
+                  AND order_id = $2
+                  AND execution_attempt_id = $3
+                  AND status = 'running'
+                RETURNING {EXECUTION_STEP_SELECT_COLUMNS}
+            )
+            SELECT {EXECUTION_STEP_SELECT_COLUMNS}
+            FROM failed
+            UNION ALL
+            SELECT {EXECUTION_STEP_SELECT_COLUMNS}
+            FROM order_execution_steps
+            WHERE id = $1
+              AND order_id = $2
+              AND execution_attempt_id = $3
+              AND status IN ('failed', 'superseded')
+              AND NOT EXISTS (SELECT 1 FROM failed)
+            LIMIT 1
+            "#
+        ))
+        .bind(step_id)
+        .bind(order_id)
+        .bind(attempt_id)
+        .bind(error)
+        .bind(failed_at)
+        .fetch_one(&self.pool)
+        .await;
+        telemetry::record_db_query(
+            "order.persist_execution_step_failed",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        let row = result?;
+        let step = self.map_execution_step_row(&row)?;
+        self.refresh_execution_leg_for_step(&step).await?;
+        Ok(step)
+    }
+
+    pub async fn create_retry_execution_attempt_from_failed_step(
+        &self,
+        order_id: Uuid,
+        failed_attempt_id: Uuid,
+        failed_step_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> RouterCoreResult<ExecutionAttemptMaterializationRecord> {
+        let started = Instant::now();
+        let result = async {
+            let mut tx = self.pool.begin().await?;
+
+            let order_row = sqlx_core::query::query(&format!(
+                r#"
+                SELECT {ORDER_SELECT_COLUMNS}
+                FROM router_orders ro
+                LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
+                LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
+                WHERE ro.id = $1
+                FOR UPDATE OF ro
+                "#
+            ))
+            .bind(order_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let order = self.map_order_row(&order_row)?;
+
+            let failed_attempt_row = sqlx_core::query::query(&format!(
+                r#"
+                SELECT {EXECUTION_ATTEMPT_SELECT_COLUMNS}
+                FROM order_execution_attempts
+                WHERE id = $1
+                FOR UPDATE
+                "#
+            ))
+            .bind(failed_attempt_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let failed_attempt = self.map_execution_attempt_row(&failed_attempt_row)?;
+            if failed_attempt.order_id != order_id {
+                return Err(RouterCoreError::Conflict {
+                    message: format!(
+                        "attempt {} does not belong to order {}",
+                        failed_attempt.id, order_id
+                    ),
+                });
+            }
+            if failed_attempt.status != OrderExecutionAttemptStatus::Failed {
+                return Err(RouterCoreError::Conflict {
+                    message: format!(
+                        "attempt {} cannot be retried from {}",
+                        failed_attempt.id,
+                        failed_attempt.status.to_db_string()
+                    ),
+                });
+            }
+
+            let failed_step_row = sqlx_core::query::query(&format!(
+                r#"
+                SELECT {EXECUTION_STEP_SELECT_COLUMNS}
+                FROM order_execution_steps
+                WHERE id = $1
+                FOR UPDATE
+                "#
+            ))
+            .bind(failed_step_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let failed_step = self.map_execution_step_row(&failed_step_row)?;
+            if failed_step.order_id != order_id
+                || failed_step.execution_attempt_id != Some(failed_attempt.id)
+            {
+                return Err(RouterCoreError::Conflict {
+                    message: format!(
+                        "step {} does not belong to order {} attempt {}",
+                        failed_step.id, order_id, failed_attempt.id
+                    ),
+                });
+            }
+
+            let retry_attempt_index = failed_attempt.attempt_index + 1;
+            if let Some(existing_retry_row) = sqlx_core::query::query(&format!(
+                r#"
+                SELECT {EXECUTION_ATTEMPT_SELECT_COLUMNS}
+                FROM order_execution_attempts
+                WHERE order_id = $1
+                  AND attempt_index = $2
+                ORDER BY created_at ASC, id ASC
+                LIMIT 1
+                FOR UPDATE
+                "#
+            ))
+            .bind(order_id)
+            .bind(retry_attempt_index)
+            .fetch_optional(&mut *tx)
+            .await?
+            {
+                let attempt = self.map_execution_attempt_row(&existing_retry_row)?;
+                let leg_rows = sqlx_core::query::query(&format!(
+                    r#"
+                    SELECT {EXECUTION_LEG_SELECT_COLUMNS}
+                    FROM order_execution_legs
+                    WHERE execution_attempt_id = $1
+                    ORDER BY leg_index ASC, created_at ASC, id ASC
+                    "#
+                ))
+                .bind(attempt.id)
+                .fetch_all(&mut *tx)
+                .await?;
+                let legs = leg_rows
+                    .iter()
+                    .map(|row| self.map_execution_leg_row(row))
+                    .collect::<RouterCoreResult<Vec<_>>>()?;
+                let step_rows = sqlx_core::query::query(&format!(
+                    r#"
+                    SELECT {EXECUTION_STEP_SELECT_COLUMNS}
+                    FROM order_execution_steps
+                    WHERE execution_attempt_id = $1
+                    ORDER BY step_index ASC, created_at ASC, id ASC
+                    "#
+                ))
+                .bind(attempt.id)
+                .fetch_all(&mut *tx)
+                .await?;
+                let steps = step_rows
+                    .iter()
+                    .map(|row| self.map_execution_step_row(row))
+                    .collect::<RouterCoreResult<Vec<_>>>()?;
+                tx.commit().await?;
+                return Ok::<ExecutionAttemptMaterializationRecord, RouterCoreError>(
+                    ExecutionAttemptMaterializationRecord {
+                        order,
+                        attempt,
+                        legs,
+                        steps,
+                    },
+                );
+            }
+
+            let retry_attempt = OrderExecutionAttempt {
+                id: Uuid::now_v7(),
+                order_id,
+                attempt_index: retry_attempt_index,
+                attempt_kind: OrderExecutionAttemptKind::PrimaryExecution,
+                status: OrderExecutionAttemptStatus::Active,
+                trigger_step_id: Some(failed_step.id),
+                trigger_provider_operation_id: failed_attempt.trigger_provider_operation_id,
+                failure_reason: serde_json::json!({
+                    "reason": "retry_after_failed_attempt",
+                    "failed_attempt_id": failed_attempt.id,
+                    "failed_attempt_index": failed_attempt.attempt_index,
+                    "failed_step_id": failed_step.id,
+                    "failed_step_type": failed_step.step_type.to_db_string(),
+                    "failed_step_error": &failed_step.error,
+                }),
+                input_custody_snapshot: failed_attempt.input_custody_snapshot.clone(),
+                created_at: now,
+                updated_at: now,
+            };
+            let retry_attempt_row = sqlx_core::query::query(&format!(
+                r#"
+                INSERT INTO order_execution_attempts (
+                    id,
+                    order_id,
+                    attempt_index,
+                    attempt_kind,
+                    status,
+                    trigger_step_id,
+                    trigger_provider_operation_id,
+                    failure_reason_json,
+                    input_custody_snapshot_json,
+                    superseded_by_attempt_id,
+                    superseded_reason_json,
+                    created_at,
+                    updated_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, '{{}}'::jsonb, $10, $11)
+                RETURNING {EXECUTION_ATTEMPT_SELECT_COLUMNS}
+                "#
+            ))
+            .bind(retry_attempt.id)
+            .bind(retry_attempt.order_id)
+            .bind(retry_attempt.attempt_index)
+            .bind(retry_attempt.attempt_kind.to_db_string())
+            .bind(retry_attempt.status.to_db_string())
+            .bind(retry_attempt.trigger_step_id)
+            .bind(retry_attempt.trigger_provider_operation_id)
+            .bind(retry_attempt.failure_reason.clone())
+            .bind(retry_attempt.input_custody_snapshot.clone())
+            .bind(retry_attempt.created_at)
+            .bind(retry_attempt.updated_at)
+            .fetch_one(&mut *tx)
+            .await?;
+            let retry_attempt = self.map_execution_attempt_row(&retry_attempt_row)?;
+
+            let retry_step_rows = sqlx_core::query::query(&format!(
+                r#"
+                SELECT {EXECUTION_STEP_SELECT_COLUMNS}
+                FROM order_execution_steps
+                WHERE execution_attempt_id = $1
+                  AND step_index >= $2
+                  AND status IN ('failed', 'planned', 'ready', 'waiting', 'running')
+                ORDER BY step_index ASC, created_at ASC, id ASC
+                "#
+            ))
+            .bind(failed_attempt.id)
+            .bind(failed_step.step_index)
+            .fetch_all(&mut *tx)
+            .await?;
+            let retry_source_steps = retry_step_rows
+                .iter()
+                .map(|row| self.map_execution_step_row(row))
+                .collect::<RouterCoreResult<Vec<_>>>()?;
+            if retry_source_steps.is_empty() {
+                return Err(RouterCoreError::InvalidData {
+                    message: format!(
+                        "attempt {} has no retryable steps from step_index {}",
+                        failed_attempt.id, failed_step.step_index
+                    ),
+                });
+            }
+
+            let referenced_leg_ids = retry_source_steps
+                .iter()
+                .filter_map(|step| step.execution_leg_id)
+                .collect::<std::collections::BTreeSet<_>>();
+            let failed_attempt_legs = if referenced_leg_ids.is_empty() {
+                Vec::new()
+            } else {
+                let leg_ids = referenced_leg_ids.iter().copied().collect::<Vec<_>>();
+                let rows = sqlx_core::query::query(&format!(
+                    r#"
+                    SELECT {EXECUTION_LEG_SELECT_COLUMNS}
+                    FROM order_execution_legs
+                    WHERE id = ANY($1)
+                    ORDER BY leg_index ASC, created_at ASC, id ASC
+                    "#
+                ))
+                .bind(leg_ids)
+                .fetch_all(&mut *tx)
+                .await?;
+                rows.iter()
+                    .map(|row| self.map_execution_leg_row(row))
+                    .collect::<RouterCoreResult<Vec<_>>>()?
+            };
+
+            let mut retry_leg_ids = HashMap::new();
+            let mut retry_legs = Vec::with_capacity(failed_attempt_legs.len());
+            for failed_leg in failed_attempt_legs {
+                let failed_leg_id = failed_leg.id;
+                let mut retry_leg = failed_leg;
+                retry_leg.id = Uuid::now_v7();
+                retry_leg.execution_attempt_id = Some(retry_attempt.id);
+                retry_leg.status = OrderExecutionStepStatus::Planned;
+                retry_leg.actual_amount_in = None;
+                retry_leg.actual_amount_out = None;
+                retry_leg.started_at = None;
+                retry_leg.completed_at = None;
+                retry_leg.created_at = now;
+                retry_leg.updated_at = now;
+                set_json_value(
+                    &mut retry_leg.details,
+                    "retry_attempt_from_attempt_id",
+                    serde_json::json!(failed_attempt.id),
+                );
+                set_json_value(
+                    &mut retry_leg.details,
+                    "retry_attempt_from_attempt_index",
+                    serde_json::json!(failed_attempt.attempt_index),
+                );
+                set_json_value(
+                    &mut retry_leg.details,
+                    "retry_attempt_trigger_step_id",
+                    serde_json::json!(failed_step.id),
+                );
+                set_json_value(
+                    &mut retry_leg.details,
+                    "retry_attempt_from_execution_leg_id",
+                    serde_json::json!(failed_leg_id),
+                );
+                retry_leg_ids.insert(failed_leg_id, retry_leg.id);
+                retry_legs.push(retry_leg);
+            }
+            if retry_leg_ids.len() != referenced_leg_ids.len() {
+                let missing = referenced_leg_ids
+                    .iter()
+                    .filter(|leg_id| !retry_leg_ids.contains_key(leg_id))
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(RouterCoreError::InvalidData {
+                    message: format!(
+                        "retry attempt {} could not clone execution legs from failed attempt {}: missing leg ids [{}]",
+                        retry_attempt.id, failed_attempt.id, missing
+                    ),
+                });
+            }
+
+            for leg in &retry_legs {
+                insert_execution_leg_tx(&mut tx, leg).await?;
+            }
+
+            let mut retry_steps = Vec::with_capacity(retry_source_steps.len());
+            for mut step in retry_source_steps {
+                step.id = Uuid::now_v7();
+                step.execution_attempt_id = Some(retry_attempt.id);
+                if let Some(execution_leg_id) = step.execution_leg_id {
+                    step.execution_leg_id = retry_leg_ids.get(&execution_leg_id).copied();
+                }
+                step.status = OrderExecutionStepStatus::Planned;
+                step.tx_hash = None;
+                step.provider_ref = None;
+                step.idempotency_key = Some(format!(
+                    "order:{order_id}:attempt:{retry_attempt_index}:{}:{}",
+                    step.provider, step.step_index
+                ));
+                step.attempt_count = 0;
+                step.next_attempt_at = None;
+                step.started_at = None;
+                step.completed_at = None;
+                step.response = serde_json::json!({});
+                step.error = serde_json::json!({});
+                step.created_at = now;
+                step.updated_at = now;
+                set_json_value(
+                    &mut step.details,
+                    "retry_attempt_from_attempt_id",
+                    serde_json::json!(failed_attempt.id),
+                );
+                set_json_value(
+                    &mut step.details,
+                    "retry_attempt_from_attempt_index",
+                    serde_json::json!(failed_attempt.attempt_index),
+                );
+                set_json_value(
+                    &mut step.details,
+                    "retry_attempt_trigger_step_id",
+                    serde_json::json!(failed_step.id),
+                );
+                insert_execution_step_tx(&mut tx, &step).await?;
+                retry_steps.push(step);
+            }
+
+            let superseded_reason = serde_json::json!({
+                "reason": "superseded_by_retry_attempt",
+                "retry_attempt_id": retry_attempt.id,
+                "retry_attempt_index": retry_attempt.attempt_index,
+            });
+            sqlx_core::query::query(
+                r#"
+                UPDATE order_execution_steps
+                SET
+                    status = 'superseded',
+                    error_json = $3,
+                    completed_at = COALESCE(completed_at, $4),
+                    updated_at = $4
+                WHERE execution_attempt_id = $1
+                  AND step_index >= $2
+                  AND status IN ('failed', 'planned', 'ready', 'waiting', 'running')
+                "#,
+            )
+            .bind(failed_attempt.id)
+            .bind(failed_step.step_index)
+            .bind(superseded_reason.clone())
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            sqlx_core::query::query(
+                r#"
+                UPDATE order_execution_attempts
+                SET
+                    superseded_by_attempt_id = $2,
+                    superseded_reason_json = $3,
+                    updated_at = $4
+                WHERE id = $1
+                "#,
+            )
+            .bind(failed_attempt.id)
+            .bind(retry_attempt.id)
+            .bind(superseded_reason)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+            Ok::<ExecutionAttemptMaterializationRecord, RouterCoreError>(
+                ExecutionAttemptMaterializationRecord {
+                    order,
+                    attempt: retry_attempt,
+                    legs: retry_legs,
+                    steps: retry_steps,
+                },
+            )
+        }
+        .await;
+        telemetry::record_db_query(
+            "order.create_retry_execution_attempt_from_failed_step",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        result
+    }
+
+    pub async fn mark_order_refund_required(
+        &self,
+        order_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> RouterCoreResult<RouterOrder> {
+        let started = Instant::now();
+        let result = sqlx_core::query::query(&format!(
+            r#"
+            WITH updated AS (
+                UPDATE router_orders
+                SET status = $2, updated_at = $3
+                WHERE id = $1
+                  AND status = $4
+                RETURNING *
+            )
+            SELECT {ORDER_SELECT_COLUMNS}
+            FROM updated ro
+            LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
+            LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
+            UNION ALL
+            SELECT {ORDER_SELECT_COLUMNS}
+            FROM router_orders ro
+            LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
+            LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
+            WHERE ro.id = $1
+              AND ro.status = $2
+            LIMIT 1
+            "#
+        ))
+        .bind(order_id)
+        .bind(RouterOrderStatus::RefundRequired.to_db_string())
+        .bind(now)
+        .bind(RouterOrderStatus::Executing.to_db_string())
+        .fetch_one(&self.pool)
+        .await;
+        telemetry::record_db_query(
+            "order.mark_order_refund_required",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        let row = result?;
+        self.map_order_row(&row)
     }
 
     pub async fn create_refreshed_execution_attempt(
@@ -5797,6 +6298,157 @@ impl OrderRepository {
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
         })
+    }
+}
+
+async fn insert_execution_leg_tx(
+    tx: &mut sqlx_core::transaction::Transaction<'_, Postgres>,
+    leg: &OrderExecutionLeg,
+) -> RouterCoreResult<()> {
+    sqlx_core::query::query(
+        r#"
+        INSERT INTO order_execution_legs (
+            id,
+            order_id,
+            execution_attempt_id,
+            transition_decl_id,
+            leg_index,
+            leg_type,
+            provider,
+            status,
+            input_chain_id,
+            input_asset_id,
+            output_chain_id,
+            output_asset_id,
+            amount_in,
+            expected_amount_out,
+            min_amount_out,
+            actual_amount_in,
+            actual_amount_out,
+            started_at,
+            completed_at,
+            provider_quote_expires_at,
+            details_json,
+            usd_valuation_json,
+            created_at,
+            updated_at
+        )
+        VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+            $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24
+        )
+        "#,
+    )
+    .bind(leg.id)
+    .bind(leg.order_id)
+    .bind(leg.execution_attempt_id)
+    .bind(leg.transition_decl_id.clone())
+    .bind(leg.leg_index)
+    .bind(&leg.leg_type)
+    .bind(&leg.provider)
+    .bind(leg.status.to_db_string())
+    .bind(leg.input_asset.chain.as_str())
+    .bind(leg.input_asset.asset.as_str())
+    .bind(leg.output_asset.chain.as_str())
+    .bind(leg.output_asset.asset.as_str())
+    .bind(&leg.amount_in)
+    .bind(&leg.expected_amount_out)
+    .bind(leg.min_amount_out.clone())
+    .bind(leg.actual_amount_in.clone())
+    .bind(leg.actual_amount_out.clone())
+    .bind(leg.started_at)
+    .bind(leg.completed_at)
+    .bind(leg.provider_quote_expires_at)
+    .bind(leg.details.clone())
+    .bind(leg.usd_valuation.clone())
+    .bind(leg.created_at)
+    .bind(leg.updated_at)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn insert_execution_step_tx(
+    tx: &mut sqlx_core::transaction::Transaction<'_, Postgres>,
+    step: &OrderExecutionStep,
+) -> RouterCoreResult<()> {
+    sqlx_core::query::query(
+        r#"
+        INSERT INTO order_execution_steps (
+            id,
+            order_id,
+            execution_attempt_id,
+            execution_leg_id,
+            transition_decl_id,
+            step_index,
+            step_type,
+            provider,
+            status,
+            input_chain_id,
+            input_asset_id,
+            output_chain_id,
+            output_asset_id,
+            amount_in,
+            min_amount_out,
+            tx_hash,
+            provider_ref,
+            idempotency_key,
+            attempt_count,
+            next_attempt_at,
+            started_at,
+            completed_at,
+            details_json,
+            request_json,
+            response_json,
+            error_json,
+            usd_valuation_json,
+            created_at,
+            updated_at
+        )
+        VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+            $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
+            $23, $24, $25, $26, $27, $28, $29
+        )
+        "#,
+    )
+    .bind(step.id)
+    .bind(step.order_id)
+    .bind(step.execution_attempt_id)
+    .bind(step.execution_leg_id)
+    .bind(step.transition_decl_id.clone())
+    .bind(step.step_index)
+    .bind(step.step_type.to_db_string())
+    .bind(&step.provider)
+    .bind(step.status.to_db_string())
+    .bind(step.input_asset.as_ref().map(|asset| asset.chain.as_str()))
+    .bind(step.input_asset.as_ref().map(|asset| asset.asset.as_str()))
+    .bind(step.output_asset.as_ref().map(|asset| asset.chain.as_str()))
+    .bind(step.output_asset.as_ref().map(|asset| asset.asset.as_str()))
+    .bind(step.amount_in.clone())
+    .bind(step.min_amount_out.clone())
+    .bind(step.tx_hash.clone())
+    .bind(step.provider_ref.clone())
+    .bind(step.idempotency_key.clone())
+    .bind(step.attempt_count)
+    .bind(step.next_attempt_at)
+    .bind(step.started_at)
+    .bind(step.completed_at)
+    .bind(step.details.clone())
+    .bind(step.request.clone())
+    .bind(step.response.clone())
+    .bind(step.error.clone())
+    .bind(step.usd_valuation.clone())
+    .bind(step.created_at)
+    .bind(step.updated_at)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+fn set_json_value(target: &mut serde_json::Value, key: &str, value: serde_json::Value) {
+    if let Some(object) = target.as_object_mut() {
+        object.insert(key.to_string(), value);
     }
 }
 

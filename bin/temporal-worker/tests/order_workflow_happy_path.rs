@@ -17,7 +17,10 @@ use eip3009_erc20_contract::GenericEIP3009ERC20::GenericEIP3009ERC20Instance;
 use router_core::{
     config::Settings,
     db::Database,
-    models::{DepositVaultStatus, RouterOrderQuote, RouterOrderStatus, VaultAction},
+    models::{
+        DepositVaultStatus, OrderExecutionAttemptKind, OrderExecutionAttemptStatus,
+        OrderExecutionStepStatus, RouterOrderQuote, RouterOrderStatus, VaultAction,
+    },
     protocol::{AssetId, ChainId, DepositAsset},
     services::{
         custody_action_executor::{CustodyActionExecutor, HyperliquidCallNetwork},
@@ -35,7 +38,9 @@ use sqlx_postgres::{PgConnectOptions, PgConnection};
 use temporal_worker::{
     order_execution::{
         activities::{OrderActivities, OrderActivityDeps},
-        build_worker, order_workflow_id, workflow_start_options,
+        build_worker, order_workflow_id,
+        types::{OrderTerminalStatus, OrderWorkflowInput, OrderWorkflowOutput},
+        workflow_start_options,
         workflows::OrderWorkflow,
         DEFAULT_TASK_QUEUE,
     },
@@ -57,14 +62,151 @@ const POSTGRES_PASSWORD: &str = "password";
 const POSTGRES_DATABASE: &str = "postgres";
 const ROUTER_TEST_DATABASE_URL_ENV: &str = "ROUTER_TEST_DATABASE_URL";
 const EVM_NATIVE_GAS_BUFFER_WEI: u128 = 1_000_000_000_000_000_000;
+const EXECUTE_STEP_TEMPORAL_ATTEMPTS: usize = 3;
 
 struct TestPostgres {
     admin_database_url: String,
     _container: Option<ContainerAsync<GenericImage>>,
 }
 
+struct WorkflowRun {
+    _postgres: TestPostgres,
+    db: Database,
+    order_id: Uuid,
+    output: OrderWorkflowOutput,
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn order_workflow_completes_funded_single_step_order() {
+    let run = run_order_workflow_with_velora_transaction_failures(0).await;
+
+    assert_eq!(run.output.terminal_status, OrderTerminalStatus::Completed);
+    let completed = run
+        .db
+        .orders()
+        .get(run.order_id)
+        .await
+        .expect("load completed order");
+    assert_eq!(completed.status, RouterOrderStatus::Completed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn order_workflow_retries_failed_step_then_completes() {
+    let run =
+        run_order_workflow_with_velora_transaction_failures(EXECUTE_STEP_TEMPORAL_ATTEMPTS).await;
+
+    assert_eq!(run.output.terminal_status, OrderTerminalStatus::Completed);
+    let completed = run
+        .db
+        .orders()
+        .get(run.order_id)
+        .await
+        .expect("load completed order");
+    assert_eq!(completed.status, RouterOrderStatus::Completed);
+
+    let attempts = run
+        .db
+        .orders()
+        .get_execution_attempts(run.order_id)
+        .await
+        .expect("load execution attempts");
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].attempt_index, 1);
+    assert_eq!(
+        attempts[0].attempt_kind,
+        OrderExecutionAttemptKind::PrimaryExecution
+    );
+    assert_eq!(attempts[0].status, OrderExecutionAttemptStatus::Failed);
+    assert_eq!(attempts[1].attempt_index, 2);
+    assert_eq!(
+        attempts[1].attempt_kind,
+        OrderExecutionAttemptKind::PrimaryExecution
+    );
+    assert_eq!(attempts[1].status, OrderExecutionAttemptStatus::Completed);
+
+    let first_attempt_steps = run
+        .db
+        .orders()
+        .get_execution_steps_for_attempt(attempts[0].id)
+        .await
+        .expect("load first attempt steps");
+    assert!(
+        first_attempt_steps
+            .iter()
+            .any(|step| step.status == OrderExecutionStepStatus::Superseded),
+        "first attempt failed suffix should be superseded"
+    );
+    let retry_attempt_steps = run
+        .db
+        .orders()
+        .get_execution_steps_for_attempt(attempts[1].id)
+        .await
+        .expect("load retry attempt steps");
+    assert!(
+        retry_attempt_steps
+            .iter()
+            .all(|step| step.status == OrderExecutionStepStatus::Completed),
+        "retry attempt should complete every cloned step"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn order_workflow_marks_refund_required_after_second_failed_attempt() {
+    let run =
+        run_order_workflow_with_velora_transaction_failures(EXECUTE_STEP_TEMPORAL_ATTEMPTS * 2)
+            .await;
+
+    assert_eq!(
+        run.output.terminal_status,
+        OrderTerminalStatus::RefundRequired
+    );
+    let refund_required = run
+        .db
+        .orders()
+        .get(run.order_id)
+        .await
+        .expect("load refund-required order");
+    assert_eq!(refund_required.status, RouterOrderStatus::RefundRequired);
+
+    let attempts = run
+        .db
+        .orders()
+        .get_execution_attempts(run.order_id)
+        .await
+        .expect("load execution attempts");
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].attempt_index, 1);
+    assert_eq!(attempts[0].status, OrderExecutionAttemptStatus::Failed);
+    assert_eq!(attempts[1].attempt_index, 2);
+    assert_eq!(attempts[1].status, OrderExecutionAttemptStatus::Failed);
+
+    let first_attempt_steps = run
+        .db
+        .orders()
+        .get_execution_steps_for_attempt(attempts[0].id)
+        .await
+        .expect("load first attempt steps");
+    assert!(
+        first_attempt_steps
+            .iter()
+            .any(|step| step.status == OrderExecutionStepStatus::Superseded),
+        "first attempt failed suffix should be superseded"
+    );
+    let second_attempt_steps = run
+        .db
+        .orders()
+        .get_execution_steps_for_attempt(attempts[1].id)
+        .await
+        .expect("load second attempt steps");
+    assert!(
+        second_attempt_steps
+            .iter()
+            .any(|step| step.status == OrderExecutionStepStatus::Failed),
+        "second attempt should retain the terminal failed step"
+    );
+}
+
+async fn run_order_workflow_with_velora_transaction_failures(failures: usize) -> WorkflowRun {
     ensure_temporal_up();
 
     let postgres = test_postgres().await;
@@ -83,7 +225,7 @@ async fn order_workflow_completes_funded_single_step_order() {
         BASE_USDC_ADDRESS.parse().expect("valid Base USDC address"),
     )
     .await;
-    let mocks = spawn_velora_mocks(&devnet).await;
+    let mocks = spawn_velora_mocks(&devnet, failures).await;
     let settings = Arc::new(test_settings());
     let chain_registry = Arc::new(test_chain_registry(&devnet).await);
     let action_providers = Arc::new(test_action_providers(&mocks));
@@ -110,7 +252,7 @@ async fn order_workflow_completes_funded_single_step_order() {
     let activity_deps = OrderActivityDeps::new(db.clone(), action_providers, custody_executor);
 
     let local = tokio::task::LocalSet::new();
-    local
+    let output = local
         .run_until(async move {
             let mut built = build_worker(
                 &connection,
@@ -130,22 +272,18 @@ async fn order_workflow_completes_funded_single_step_order() {
             let handle = client
                 .start_workflow(
                     OrderWorkflow::run,
-                    temporal_worker::order_execution::types::OrderWorkflowInput { order_id },
+                    OrderWorkflowInput { order_id },
                     workflow_start_options(&task_queue, &workflow_id),
                 )
                 .await
                 .expect("start OrderWorkflow");
-            let output: temporal_worker::order_execution::types::OrderWorkflowOutput = timeout(
+            let output: OrderWorkflowOutput = timeout(
                 Duration::from_secs(120),
                 handle.get_result(WorkflowGetResultOptions::default()),
             )
             .await
             .expect("OrderWorkflow timed out")
             .expect("OrderWorkflow result");
-            assert_eq!(
-                output.terminal_status,
-                temporal_worker::order_execution::types::OrderTerminalStatus::Completed
-            );
 
             shutdown_worker();
             timeout(Duration::from_secs(10), worker_task)
@@ -153,15 +291,16 @@ async fn order_workflow_completes_funded_single_step_order() {
                 .expect("worker shutdown timed out")
                 .expect("worker task join")
                 .expect("worker run");
+            output
         })
         .await;
 
-    let completed = db
-        .orders()
-        .get(order_id)
-        .await
-        .expect("load completed order");
-    assert_eq!(completed.status, RouterOrderStatus::Completed);
+    WorkflowRun {
+        _postgres: postgres,
+        db,
+        order_id,
+        output,
+    }
 }
 
 fn ensure_temporal_up() {
@@ -276,11 +415,16 @@ fn test_action_providers(mocks: &MockIntegratorServer) -> ActionProviderRegistry
     .expect("action providers")
 }
 
-async fn spawn_velora_mocks(devnet: &RiftDevnet) -> MockIntegratorServer {
-    let config = MockIntegratorConfig::default().with_velora_swap_contract_address(
-        devnet.base.anvil.chain_id(),
-        format!("{:#x}", devnet.base.mock_velora_swap_contract.address()),
-    );
+async fn spawn_velora_mocks(
+    devnet: &RiftDevnet,
+    transaction_failures: usize,
+) -> MockIntegratorServer {
+    let config = MockIntegratorConfig::default()
+        .with_velora_swap_contract_address(
+            devnet.base.anvil.chain_id(),
+            format!("{:#x}", devnet.base.mock_velora_swap_contract.address()),
+        )
+        .with_velora_transaction_fail_next_n(transaction_failures);
     MockIntegratorServer::spawn_with_config(config)
         .await
         .expect("spawn mock integrators")

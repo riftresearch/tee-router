@@ -8,8 +8,9 @@ use router_core::{
     db::{Database, ExecutionAttemptPlan, PersistStepCompletionRecord},
     error::{RouterCoreError, RouterCoreResult},
     models::{
-        OrderExecutionStep, OrderExecutionStepStatus, OrderExecutionStepType, OrderProviderAddress,
-        OrderProviderOperation, ProviderOperationStatus, RouterOrderQuote,
+        OrderExecutionAttemptStatus, OrderExecutionStep, OrderExecutionStepStatus,
+        OrderExecutionStepType, OrderProviderAddress, OrderProviderOperation,
+        ProviderOperationStatus, RouterOrder, RouterOrderQuote,
     },
     services::{
         action_providers::{
@@ -33,16 +34,19 @@ use super::types::{
     DispatchStepProviderActionInput, ExecuteStepInput, ExecutionPlan, FailedAttemptSnapshotWritten,
     FinalizeOrderOrRefundInput, FinalizedOrder, HyperliquidTradeCancelRecorded,
     LoadOrderExecutionStateInput, MarkOrderCompletedInput, MaterializeExecutionAttemptInput,
-    MaterializeRefreshedAttemptInput, MaterializeRefundPlanInput, MaterializedExecutionAttempt,
-    OrderCompleted, OrderExecutionState, OrderWorkflowPhase, PersistProviderOperationStatusInput,
-    PersistProviderReceiptInput, PersistStepFailedInput, PersistStepReadyToFireInput,
-    PersistStepTerminalStatusInput, PersistenceBoundary, PollProviderOperationHintsInput,
-    ProviderActionDispatchShape, ProviderOperationHintVerified, ProviderOperationHintsPolled,
-    RecoverAcrossOnchainLogInput, RefreshedAttemptMaterialized, RefreshedQuoteAttemptShape,
-    RefundPlanShape, SettleProviderStepInput, SingleRefundPosition, StepExecuted,
-    StepExecutionOutcome, StepFailureDecision, VerifyProviderOperationHintInput,
-    WorkflowExecutionStep, WriteFailedAttemptSnapshotInput,
+    MaterializeRefreshedAttemptInput, MaterializeRefundPlanInput, MaterializeRetryAttemptInput,
+    MaterializedExecutionAttempt, OrderCompleted, OrderExecutionState, OrderTerminalStatus,
+    OrderWorkflowPhase, PersistProviderOperationStatusInput, PersistProviderReceiptInput,
+    PersistStepFailedInput, PersistStepReadyToFireInput, PersistStepTerminalStatusInput,
+    PersistenceBoundary, PollProviderOperationHintsInput, ProviderActionDispatchShape,
+    ProviderOperationHintVerified, ProviderOperationHintsPolled, RecoverAcrossOnchainLogInput,
+    RefreshedAttemptMaterialized, RefreshedQuoteAttemptShape, RefundPlanShape,
+    SettleProviderStepInput, SingleRefundPosition, StepExecuted, StepExecutionOutcome,
+    StepFailureDecision, VerifyProviderOperationHintInput, WorkflowExecutionStep,
+    WriteFailedAttemptSnapshotInput,
 };
+
+const MAX_EXECUTION_ATTEMPTS: i32 = 2;
 
 #[derive(Clone)]
 pub struct OrderActivityDeps {
@@ -278,6 +282,46 @@ impl OrderActivities {
         })
     }
 
+    /// Scar tissue: §5 retry attempt creation and suffix supersession.
+    #[activity]
+    pub async fn materialize_retry_attempt(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: MaterializeRetryAttemptInput,
+    ) -> Result<MaterializedExecutionAttempt, ActivityError> {
+        let deps = self.deps()?;
+        let record = deps
+            .db
+            .orders()
+            .create_retry_execution_attempt_from_failed_step(
+                input.order_id,
+                input.failed_attempt_id,
+                input.failed_step_id,
+                Utc::now(),
+            )
+            .await
+            .map_err(activity_error_from_display)?;
+        tracing::info!(
+            order_id = %record.order.id,
+            attempt_id = %record.attempt.id,
+            failed_attempt_id = %input.failed_attempt_id,
+            failed_step_id = %input.failed_step_id,
+            event_name = "order.execution_retry_materialized",
+            "order.execution_retry_materialized"
+        );
+        Ok(MaterializedExecutionAttempt {
+            attempt_id: record.attempt.id,
+            steps: record
+                .steps
+                .into_iter()
+                .map(|step| WorkflowExecutionStep {
+                    step_id: step.id,
+                    step_index: step.step_index,
+                })
+                .collect(),
+        })
+    }
+
     /// Scar tissue: §2.1 `AfterExecutionLegsPersisted`.
     #[activity]
     pub async fn persist_step_ready_to_fire(
@@ -313,11 +357,33 @@ impl OrderActivities {
     /// Scar tissue: §2 boundary 2, `AfterStepMarkedFailed`.
     #[activity]
     pub async fn persist_step_failed(
+        self: Arc<Self>,
         _ctx: ActivityContext,
-        _input: PersistStepFailedInput,
+        input: PersistStepFailedInput,
     ) -> Result<BoundaryPersisted, ActivityError> {
-        // TODO(PR4b, brief §6 invariant 1; scar §2): keep this as its own activity call.
-        todo!("PR4b: persist boundary 2")
+        let deps = self.deps()?;
+        let step = deps
+            .db
+            .orders()
+            .persist_execution_step_failed(
+                input.order_id,
+                input.attempt_id,
+                input.step_id,
+                json!({ "error": input.failure_reason }),
+                Utc::now(),
+            )
+            .await
+            .map_err(activity_error_from_display)?;
+        tracing::info!(
+            order_id = %input.order_id,
+            attempt_id = %input.attempt_id,
+            step_id = %step.id,
+            event_name = "execution_step.failed",
+            "execution_step.failed"
+        );
+        Ok(BoundaryPersisted {
+            boundary: PersistenceBoundary::AfterStepMarkedFailed,
+        })
     }
 
     /// Scar tissue: §2 boundary 3, `AfterExecutionStepStatusPersisted`.
@@ -467,28 +533,154 @@ impl OrderActivities {
     /// Scar tissue: §5 retry/refund decision and §7 stale quote branch.
     #[activity]
     pub async fn classify_step_failure(
+        self: Arc<Self>,
         _ctx: ActivityContext,
-        _input: ClassifyStepFailureInput,
+        input: ClassifyStepFailureInput,
     ) -> Result<StepFailureDecision, ActivityError> {
-        todo!("PR4: classify failed step recovery path")
+        let deps = self.deps()?;
+        let attempt = deps
+            .db
+            .orders()
+            .get_execution_attempt(input.attempt_id)
+            .await
+            .map_err(activity_error_from_display)?;
+        if attempt.order_id != input.order_id {
+            return Err(activity_error(format!(
+                "attempt {} does not belong to order {}",
+                attempt.id, input.order_id
+            )));
+        }
+        let decision = if attempt.attempt_index < MAX_EXECUTION_ATTEMPTS {
+            StepFailureDecision::RetryNewAttempt
+        } else {
+            StepFailureDecision::StartRefund
+        };
+        tracing::info!(
+            order_id = %input.order_id,
+            attempt_id = %input.attempt_id,
+            failed_step_id = %input.failed_step_id,
+            attempt_index = attempt.attempt_index,
+            decision = ?decision,
+            event_name = "execution_step.failure_classified",
+            "execution_step.failure_classified"
+        );
+        Ok(decision)
     }
 
     /// Scar tissue: §15 failure snapshot.
     #[activity]
     pub async fn write_failed_attempt_snapshot(
+        self: Arc<Self>,
         _ctx: ActivityContext,
-        _input: WriteFailedAttemptSnapshotInput,
+        input: WriteFailedAttemptSnapshotInput,
     ) -> Result<FailedAttemptSnapshotWritten, ActivityError> {
-        todo!("PR4: write failed attempt snapshot")
+        let deps = self.deps()?;
+        let order = deps
+            .db
+            .orders()
+            .get(input.order_id)
+            .await
+            .map_err(activity_error_from_display)?;
+        let failed_step = deps
+            .db
+            .orders()
+            .get_execution_step(input.failed_step_id)
+            .await
+            .map_err(activity_error_from_display)?;
+        if failed_step.order_id != input.order_id
+            || failed_step.execution_attempt_id != Some(input.attempt_id)
+        {
+            return Err(activity_error(format!(
+                "step {} does not belong to order {} attempt {}",
+                failed_step.id, input.order_id, input.attempt_id
+            )));
+        }
+        let trigger_provider_operation_id = deps
+            .db
+            .orders()
+            .get_provider_operations(input.order_id)
+            .await
+            .map_err(activity_error_from_display)?
+            .into_iter()
+            .filter(|operation| operation.execution_step_id == Some(failed_step.id))
+            .map(|operation| (operation.created_at, operation.id))
+            .max_by_key(|(created_at, _)| *created_at)
+            .map(|(_, id)| id);
+        let snapshot = failed_attempt_snapshot(&order, &failed_step);
+        let failure_reason = json!({
+            "reason": "execution_step_failed",
+            "step_id": failed_step.id,
+            "step_type": failed_step.step_type.to_db_string(),
+            "step_error": &failed_step.error,
+        });
+        let attempt = match deps
+            .db
+            .orders()
+            .mark_execution_attempt_failed(
+                input.attempt_id,
+                Some(failed_step.id),
+                trigger_provider_operation_id,
+                failure_reason,
+                snapshot,
+                Utc::now(),
+            )
+            .await
+        {
+            Ok(attempt) => attempt,
+            Err(RouterCoreError::NotFound) => {
+                let attempt = deps
+                    .db
+                    .orders()
+                    .get_execution_attempt(input.attempt_id)
+                    .await
+                    .map_err(activity_error_from_display)?;
+                if attempt.status != OrderExecutionAttemptStatus::Failed {
+                    return Err(activity_error(format!(
+                        "attempt {} was not active or failed while writing failure snapshot",
+                        input.attempt_id
+                    )));
+                }
+                attempt
+            }
+            Err(source) => return Err(activity_error_from_display(source)),
+        };
+        Ok(FailedAttemptSnapshotWritten {
+            attempt_id: attempt.id,
+            attempt_index: attempt.attempt_index,
+            failed_step_id: failed_step.id,
+        })
     }
 
     /// Scar tissue: §16.3 order finalisation and custody lifecycle.
     #[activity]
     pub async fn finalize_order_or_refund(
+        self: Arc<Self>,
         _ctx: ActivityContext,
-        _input: FinalizeOrderOrRefundInput,
+        input: FinalizeOrderOrRefundInput,
     ) -> Result<FinalizedOrder, ActivityError> {
-        todo!("PR5: finalize order/refund terminal state")
+        let deps = self.deps()?;
+        match input.terminal_status {
+            OrderTerminalStatus::RefundRequired => {
+                let order = deps
+                    .db
+                    .orders()
+                    .mark_order_refund_required(input.order_id, Utc::now())
+                    .await
+                    .map_err(activity_error_from_display)?;
+                tracing::info!(
+                    order_id = %order.id,
+                    event_name = "order.refund_required",
+                    "order.refund_required"
+                );
+                Ok(FinalizedOrder {
+                    order_id: order.id,
+                    terminal_status: OrderTerminalStatus::RefundRequired,
+                })
+            }
+            terminal_status => Err(activity_error(format!(
+                "finalize_order_or_refund does not handle {terminal_status:?} in PR4b"
+            ))),
+        }
     }
 }
 
@@ -927,6 +1119,80 @@ fn apply_post_execute_patch(
 
 fn provider_not_configured(step: &OrderExecutionStep) -> ActivityError {
     activity_error(format!("{} provider is not configured", step.provider))
+}
+
+fn failed_attempt_snapshot(order: &RouterOrder, failed_step: &OrderExecutionStep) -> Value {
+    let source_kind = if failed_step.request.get("source_custody_vault_id").is_some() {
+        "external_custody"
+    } else if failed_step
+        .request
+        .get("hyperliquid_custody_vault_id")
+        .is_some()
+    {
+        "hyperliquid_custody"
+    } else {
+        "funding_vault"
+    };
+    let source_asset = failed_step
+        .input_asset
+        .clone()
+        .or_else(|| failed_step.output_asset.clone())
+        .map(|asset| {
+            json!({
+                "chain": asset.chain.as_str(),
+                "asset": asset.asset.as_str(),
+            })
+        })
+        .unwrap_or_else(|| {
+            json!({
+                "chain": order.source_asset.chain.as_str(),
+                "asset": order.source_asset.asset.as_str(),
+            })
+        });
+
+    json!({
+        "source_kind": source_kind,
+        "funding_vault_id": order.funding_vault_id,
+        "failed_step_id": failed_step.id,
+        "failed_step_index": failed_step.step_index,
+        "failed_step_type": failed_step.step_type.to_db_string(),
+        "amount_in": failed_step.amount_in,
+        "min_amount_out": failed_step.min_amount_out,
+        "source_asset": source_asset,
+        "source_custody_vault_id": failed_step.request.get("source_custody_vault_id").cloned(),
+        "source_custody_vault_role": failed_step.request.get("source_custody_vault_role").cloned(),
+        "source_custody_vault_address": failed_step
+            .request
+            .get("source_custody_vault_address")
+            .cloned(),
+        "hyperliquid_custody_vault_id": failed_step
+            .request
+            .get("hyperliquid_custody_vault_id")
+            .cloned(),
+        "hyperliquid_custody_vault_role": failed_step
+            .request
+            .get("hyperliquid_custody_vault_role")
+            .cloned(),
+        "hyperliquid_custody_vault_address": failed_step
+            .request
+            .get("hyperliquid_custody_vault_address")
+            .cloned(),
+        "recipient_custody_vault_id": failed_step
+            .request
+            .get("recipient_custody_vault_id")
+            .cloned(),
+        "recipient_custody_vault_role": failed_step
+            .request
+            .get("recipient_custody_vault_role")
+            .cloned(),
+        "recipient": failed_step.request.get("recipient").cloned(),
+        "revert_custody_vault_id": failed_step.request.get("revert_custody_vault_id").cloned(),
+        "revert_custody_vault_role": failed_step.request.get("revert_custody_vault_role").cloned(),
+        "revert_custody_vault_address": failed_step
+            .details
+            .get("revert_custody_vault_address")
+            .cloned(),
+    })
 }
 
 fn activity_error(message: impl ToString) -> ActivityError {
