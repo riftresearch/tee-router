@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test'
 import type { Pool } from 'pg'
 
-import { fetchOrderFirehose, fetchOrderMetrics } from './orders'
+import { fetchOrderById, fetchOrderFirehose, fetchOrderMetrics } from './orders'
 
 test('fetchOrderFirehose emits explicit lifecycle predicates for indexed tabs', async () => {
   let capturedSql = ''
@@ -113,6 +113,27 @@ test('fetchOrderFirehose derives summary progress from provider quote without ex
   })
 })
 
+test('fetchOrderFirehose keeps displayed quote terms anchored to the original order', async () => {
+  let capturedSql = ''
+  const pool = {
+    query: async (sql: string) => {
+      capturedSql = sql
+      return { rows: [orderRow()] }
+    }
+  } as unknown as Pool
+
+  await fetchOrderFirehose(pool, 10)
+
+  expect(capturedSql).toContain('initial_quotes AS')
+  expect(capturedSql).toContain('ORDER BY moq.order_id, moq.created_at ASC, moq.id ASC')
+  expect(capturedSql).toContain(
+    'COALESCE(moa.amount_in, moq.amount_in, loa.input_amount, loq.input_amount) AS quoted_amount_in'
+  )
+  expect(capturedSql).toContain(
+    'COALESCE(moa.amount_out, moq.amount_out, loa.output_amount, loq.output_amount) AS quoted_amount_out'
+  )
+})
+
 test('fetchOrderFirehose preserves execution attempt ids on execution legs', async () => {
   const now = new Date('2026-05-04T00:00:00.000Z')
   const attemptId = '019e0000-0000-7000-8000-000000000001'
@@ -156,6 +177,118 @@ test('fetchOrderFirehose preserves execution attempt ids on execution legs', asy
   const [order] = await fetchOrderFirehose(pool, 10)
 
   expect(order.executionLegs[0]?.executionAttemptId).toBe(attemptId)
+})
+
+test('fetchOrderFirehose keeps summary rows lightweight', async () => {
+  const now = new Date('2026-05-04T00:00:00.000Z')
+  const actualInput = usdAmount('10000000', 'evm:8453', 'usdc')
+  const actualOutput = usdAmount('10000000', 'evm:42161', 'usdc')
+  const pool = {
+    query: async () => {
+      return {
+        rows: [
+          orderRow({
+            quote_usd_valuation: {
+              schemaVersion: 1,
+              pricing: {
+                source: 'test',
+                capturedAt: now.toISOString()
+              },
+              amounts: {
+                input: actualInput,
+                output: actualOutput,
+                plannedInput: actualInput
+              },
+              legs: [{ index: 0, amounts: { input: actualInput } }]
+            },
+            execution_legs: [
+              executionLeg({
+                id: 'leg-1',
+                status: 'completed',
+                actualAmountIn: '10000000',
+                actualAmountOut: '10000000',
+                usdValuation: {
+                  schemaVersion: 1,
+                  amounts: {
+                    actualInput,
+                    actualOutput,
+                    plannedInput: actualInput
+                  },
+                  legs: [{ index: 0, amounts: { actualInput } }]
+                }
+              }),
+              executionLeg({
+                id: 'leg-2',
+                status: 'superseded',
+                createdAt: '2026-05-04T00:01:00.000Z',
+                updatedAt: '2026-05-04T00:01:00.000Z'
+              })
+            ]
+          })
+        ]
+      }
+    }
+  } as unknown as Pool
+
+  const [order] = await fetchOrderFirehose(pool, 10)
+  const quoteValuation = order.quoteUsdValuation as
+    | { amounts?: Record<string, unknown>; legs?: unknown[] }
+    | undefined
+  const legValuation = order.executionLegs[0]?.usdValuation as
+    | { amounts?: Record<string, unknown>; legs?: unknown[] }
+    | undefined
+
+  expect(order.detailLevel).toBe('summary')
+  expect(quoteValuation?.legs).toBeUndefined()
+  expect(Object.keys(quoteValuation?.amounts ?? {}).sort()).toEqual([
+    'input',
+    'output'
+  ])
+  expect(order.executionLegs.map((leg) => leg.id)).toEqual(['leg-1'])
+  expect(legValuation?.legs).toBeUndefined()
+  expect(Object.keys(legValuation?.amounts ?? {}).sort()).toEqual([
+    'actualInput',
+    'actualOutput'
+  ])
+})
+
+test('fetchOrderById preserves full order detail payloads', async () => {
+  const actualInput = usdAmount('10000000', 'evm:8453', 'usdc')
+  const providerQuote = { legs: [{ provider: 'cctp' }] }
+  const quoteUsdValuation = {
+    schemaVersion: 1,
+    amounts: {
+      input: actualInput
+    },
+    legs: [{ index: 0, amounts: { input: actualInput } }]
+  }
+  const pool = {
+    query: async () => {
+      return {
+        rows: [
+          orderRow({
+            provider_quote: providerQuote,
+            quote_usd_valuation: quoteUsdValuation,
+            execution_legs: [
+              executionLeg({
+                id: 'leg-1',
+                status: 'superseded',
+                usdValuation: quoteUsdValuation
+              })
+            ]
+          })
+        ]
+      }
+    }
+  } as unknown as Pool
+
+  const order = await fetchOrderById(pool, '019df446-096f-7290-bf84-dc9dac9dd8af')
+
+  expect(order?.detailLevel).toBe('full')
+  expect(order?.providerQuote).toEqual(providerQuote)
+  expect(order?.quoteUsdValuation).toEqual(quoteUsdValuation)
+  expect(order?.executionLegs).toHaveLength(1)
+  expect(order?.executionLegs[0]?.usdValuation).toEqual(quoteUsdValuation)
 })
 
 test('fetchOrderFirehose rejects malformed JSON aggregate strings', async () => {
@@ -297,5 +430,52 @@ function orderRow(overrides: Record<string, unknown> = {}) {
     provider_operations: [],
     funding_tx_hash: null,
     ...overrides
+  }
+}
+
+function executionLeg(overrides: Record<string, unknown> = {}) {
+  const now = '2026-05-04T00:00:00.000Z'
+  return {
+    id: 'leg-1',
+    executionAttemptId: '019e0000-0000-7000-8000-000000000001',
+    transitionDeclId: 'transition-1',
+    legIndex: 0,
+    legType: 'cctp_bridge',
+    provider: 'cctp',
+    status: 'completed',
+    input: {
+      chainId: 'evm:8453',
+      assetId: 'usdc'
+    },
+    output: {
+      chainId: 'evm:42161',
+      assetId: 'usdc'
+    },
+    amountIn: '10000000',
+    expectedAmountOut: '10000000',
+    minAmountOut: null,
+    actualAmountIn: null,
+    actualAmountOut: null,
+    startedAt: null,
+    completedAt: null,
+    createdAt: now,
+    updatedAt: now,
+    details: {},
+    usdValuation: null,
+    ...overrides
+  }
+}
+
+function usdAmount(raw: string, chainId: string, assetId: string) {
+  return {
+    raw,
+    asset: {
+      chainId,
+      assetId
+    },
+    decimals: 6,
+    canonical: 'usdc',
+    unitUsdMicro: '1000000',
+    amountUsdMicro: raw
   }
 }

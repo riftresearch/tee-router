@@ -194,7 +194,8 @@ router-loadgen create-and-fund \
   we need the same private-key-only mode for Bitcoin that EVM already has.
 - The direct devnet server allocates a deterministic local-only EVM key pool for
   loadgen and exposes it in `accounts.loadgen_evm_accounts` in the manifest.
-  Loadgen should consume that pool instead of the Anvil/paymaster key.
+  Loadgen should consume that pool instead of the Anvil default key or the
+  router paymaster key.
 - Local state coverage starts with `pending_funding` and funded orders. Provider
   failure/delay coverage should be added by extending the provider mock state
   controls, not by adding devnet scenario commands.

@@ -45,8 +45,8 @@ Options:
 
 The manifest includes `accounts.loadgen_evm_accounts`, a local-only pool of
 funded EVM addresses/private keys. These keys are distinct from the Anvil
-default/paymaster key and are funded with native gas plus local USDC/USDT on
-Ethereum, Base, and Arbitrum.
+default key and the router paymaster key, and are funded with native gas plus
+local USDC/USDT on Ethereum, Base, and Arbitrum.
 
 Example:
 ```bash

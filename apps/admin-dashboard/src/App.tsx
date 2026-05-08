@@ -46,10 +46,18 @@ import type {
 } from './types'
 
 type StreamState = 'idle' | 'connecting' | 'live' | 'closed' | 'error'
+type OrderListState = {
+  orders: OrderFirehoseRow[]
+  nextCursor?: string
+}
 
 const ORDER_LIMIT = 100
+const LIVE_ORDER_RETAINED_PAGES = 2
+export const LIVE_ORDER_RENDER_LIMIT = ORDER_LIMIT * LIVE_ORDER_RETAINED_PAGES
+const LIVE_ORDER_PRUNE_SCROLL_Y = 240
 const SHOW_USD_VALUES = true
 const MAX_VOLUME_CHART_BUCKETS = 1500
+const VOLUME_ANALYTICS_REFRESH_THROTTLE_MS = 2_000
 const WAIT_FOR_DEPOSIT_STEP_TYPE = 'wait_for_deposit'
 const ACTIVE_STEP_STATUSES = new Set(['ready', 'running', 'waiting', 'submitted'])
 const FAILED_STEP_STATUSES = new Set(['failed', 'cancelled'])
@@ -71,6 +79,19 @@ type ProgressSegment = {
   index: number
   label: string
   state: ProgressSegmentState
+}
+type TimerHandle = ReturnType<typeof window.setTimeout>
+type CoalescedAsyncRefresh = {
+  request: () => void
+  cancel: () => void
+}
+type CoalescedAsyncRefreshOptions = {
+  run: () => Promise<void>
+  onError: (error: unknown) => void
+  minIntervalMs?: number
+  now?: () => number
+  setTimer?: (callback: () => void, delayMs: number) => TimerHandle
+  clearTimer?: (handle: TimerHandle) => void
 }
 const ORDER_STATUS_DISPLAY: Record<string, StatusDisplay> = {
   quoted: {
@@ -221,7 +242,9 @@ const ASSET_DECIMALS: Record<string, number> = {
 
 export function App() {
   const [me, setMe] = useState<MeResponse | null>(null)
-  const [orders, setOrders] = useState<OrderFirehoseRow[]>([])
+  const [orderList, setOrderList] = useState<OrderListState>(() => ({
+    orders: []
+  }))
   const [orderTab, setOrderTab] = useState<OrderTypeFilter>('market_order')
   const [orderFilter, setOrderFilter] =
     useState<OrderLifecycleFilter>('firehose')
@@ -229,7 +252,6 @@ export function App() {
   const [searchedOrder, setSearchedOrder] = useState<OrderFirehoseRow | null>(
     null
   )
-  const [nextCursor, setNextCursor] = useState<string | undefined>()
   const [metrics, setMetrics] = useState<OrderMetrics | null>(null)
   const [volumeAnalytics, setVolumeAnalytics] =
     useState<VolumeAnalyticsResponse | null>(null)
@@ -249,14 +271,31 @@ export function App() {
   const [streamState, setStreamState] = useState<StreamState>('idle')
   const [streamRefreshKey, setStreamRefreshKey] = useState(0)
   const [loading, setLoading] = useState(true)
+  const [ordersLoading, setOrdersLoading] = useState(false)
   const [loadingMore, setLoadingMore] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const loadMoreRef = useRef<HTMLDivElement | null>(null)
   const expandedOrderIdRef = useRef<string | null>(null)
   const loadOrderDetailsRef = useRef<(orderId: string) => void>(() => undefined)
   const loadVolumeAnalyticsRef = useRef<() => Promise<void>>(async () => undefined)
+  const volumeRefreshSchedulerRef = useRef<CoalescedAsyncRefresh | undefined>(
+    undefined
+  )
   const copiedOrderTimeoutRef = useRef<number | undefined>(undefined)
   const rowFlashTimeoutsRef = useRef<Map<string, number>>(new Map())
+
+  const orders = orderList.orders
+  const nextCursor = orderList.nextCursor
+
+  const pruneLiveOrderList = useCallback((state: OrderListState): OrderListState => {
+    const nextOrders = state.orders
+    const pruned = liveOrderPruneResult(nextOrders, expandedOrderIdRef.current)
+    if (!pruned) return state
+    return {
+      orders: pruned.orders,
+      nextCursor: pruned.nextCursor
+    }
+  }, [])
 
   const loadSession = useCallback(async () => {
     setError(null)
@@ -289,8 +328,10 @@ export function App() {
         orderFilter,
         false
       )
-      setOrders((current) => mergeOrders(current, response.orders))
-      setNextCursor(response.nextCursor)
+      setOrderList((current) => ({
+        orders: mergeOrders(current.orders, response.orders),
+        nextCursor: response.nextCursor
+      }))
       if (response.metrics) setMetrics(response.metrics)
     } catch (loadError) {
       setError(errorMessage(loadError))
@@ -336,7 +377,10 @@ export function App() {
     })
     try {
       const response = await fetchOrderById(orderId)
-      setOrders((current) => upsertOrder(current, response.order))
+      setOrderList((current) => ({
+        ...current,
+        orders: upsertOrder(current.orders, response.order)
+      }))
       setSearchedOrder((current) =>
         current?.id === orderId ? response.order : current
       )
@@ -379,6 +423,10 @@ export function App() {
 
   const refreshOrderStream = useCallback(() => {
     setStreamRefreshKey((current) => current + 1)
+  }, [])
+
+  const requestVolumeAnalyticsRefresh = useCallback(() => {
+    volumeRefreshSchedulerRef.current?.request()
   }, [])
 
   const copyOrderId = useCallback(async (orderId: string) => {
@@ -430,6 +478,25 @@ export function App() {
   useEffect(() => {
     loadVolumeAnalyticsRef.current = loadVolumeAnalytics
   }, [loadVolumeAnalytics])
+
+  useEffect(() => {
+    volumeRefreshSchedulerRef.current?.cancel()
+    volumeRefreshSchedulerRef.current = undefined
+    if (!me?.authorized || !me.analyticsConfigured) return
+
+    const scheduler = createCoalescedAsyncRefresh({
+      run: () => loadVolumeAnalyticsRef.current(),
+      onError: (loadError) => setError(errorMessage(loadError))
+    })
+    volumeRefreshSchedulerRef.current = scheduler
+
+    return () => {
+      scheduler.cancel()
+      if (volumeRefreshSchedulerRef.current === scheduler) {
+        volumeRefreshSchedulerRef.current = undefined
+      }
+    }
+  }, [me?.analyticsConfigured, me?.authorized])
 
   useEffect(() => {
     let cancelled = false
@@ -487,15 +554,52 @@ export function App() {
   useEffect(() => {
     if (!me?.authorized) return
 
+    let cancelled = false
     setStreamState('connecting')
-    setOrders([])
-    setNextCursor(undefined)
+    setOrdersLoading(true)
+    setOrderList({ orders: [] })
     setExpandedOrderId(null)
     setLoadingMore(false)
     setError(null)
+
+    const loadInitialOrders = async () => {
+      try {
+        const response = await fetchOrders(
+          ORDER_LIMIT,
+          undefined,
+          orderTab,
+          orderFilter,
+          true
+        )
+        if (cancelled) return
+        setOrderList((current) =>
+          pruneLiveOrderList({
+            orders: mergeOrders(current.orders, response.orders),
+            nextCursor: response.nextCursor
+          })
+        )
+        if (response.metrics) setMetrics(response.metrics)
+        if (expandedOrderIdRef.current) {
+          const expandedSummary = response.orders.find(
+            (order) => order.id === expandedOrderIdRef.current
+          )
+          if (expandedSummary && expandedSummary.detailLevel !== 'full') {
+            loadOrderDetailsRef.current(expandedSummary.id)
+          }
+        }
+      } catch (loadError) {
+        if (!cancelled) setError(errorMessage(loadError))
+      } finally {
+        if (!cancelled) setOrdersLoading(false)
+      }
+    }
+
+    void loadInitialOrders()
+
     const params = new URLSearchParams({
       limit: String(ORDER_LIMIT),
-      orderType: orderTab
+      orderType: orderTab,
+      snapshot: 'false'
     })
     if (orderFilter !== 'firehose') params.set('filter', orderFilter)
     const source = new EventSource(`/api/orders/events?${params.toString()}`, {
@@ -512,8 +616,12 @@ export function App() {
     source.addEventListener('snapshot', (event) => {
       try {
         const snapshot = parseSnapshotEvent(event as MessageEvent<string>)
-        setOrders((current) => mergeSnapshotOrders(current, snapshot.orders))
-        setNextCursor(snapshot.nextCursor)
+        setOrderList((current) =>
+          pruneLiveOrderList({
+            orders: mergeSnapshotOrders(current.orders, snapshot.orders),
+            nextCursor: snapshot.nextCursor
+          })
+        )
         if (snapshot.metrics) setMetrics(snapshot.metrics)
         setStreamState('live')
         if (expandedOrderIdRef.current) {
@@ -533,7 +641,12 @@ export function App() {
         const { order, metrics: nextMetrics, analyticsChanged } = parseUpsertEvent(
           event as MessageEvent<string>
         )
-        setOrders((current) => upsertVisibleOrder(current, order))
+        setOrderList((current) =>
+          pruneLiveOrderList({
+            ...current,
+            orders: upsertVisibleOrder(current.orders, order)
+          })
+        )
         setSearchedOrder((current) => (current?.id === order.id ? order : current))
         if (nextMetrics) setMetrics(nextMetrics)
         markOrderFlashed(order.id)
@@ -544,9 +657,7 @@ export function App() {
           (analyticsChanged || order.status === 'completed') &&
           me.analyticsConfigured
         ) {
-          void loadVolumeAnalyticsRef
-            .current()
-            .catch((loadError) => setError(errorMessage(loadError)))
+          requestVolumeAnalyticsRefresh()
         }
       } catch (streamError) {
         rejectStreamEvent(streamError)
@@ -557,13 +668,14 @@ export function App() {
         const { id, metrics: nextMetrics, analyticsChanged } = parseRemoveEvent(
           event as MessageEvent<string>
         )
-        setOrders((current) => current.filter((order) => order.id !== id))
+        setOrderList((current) => ({
+          ...current,
+          orders: current.orders.filter((order) => order.id !== id)
+        }))
         setSearchedOrder((current) => (current?.id === id ? null : current))
         if (nextMetrics) setMetrics(nextMetrics)
         if (analyticsChanged && me.analyticsConfigured) {
-          void loadVolumeAnalyticsRef
-            .current()
-            .catch((loadError) => setError(errorMessage(loadError)))
+          requestVolumeAnalyticsRefresh()
         }
       } catch (streamError) {
         rejectStreamEvent(streamError)
@@ -576,9 +688,7 @@ export function App() {
         )
         if (nextMetrics) setMetrics(nextMetrics)
         if (analyticsChanged && me.analyticsConfigured) {
-          void loadVolumeAnalyticsRef
-            .current()
-            .catch((loadError) => setError(errorMessage(loadError)))
+          requestVolumeAnalyticsRefresh()
         }
       } catch (streamError) {
         rejectStreamEvent(streamError)
@@ -589,6 +699,7 @@ export function App() {
     })
 
     return () => {
+      cancelled = true
       source.close()
       setStreamState('closed')
     }
@@ -598,6 +709,8 @@ export function App() {
     me?.authorized,
     orderFilter,
     orderTab,
+    pruneLiveOrderList,
+    requestVolumeAnalyticsRefresh,
     streamRefreshKey
   ])
 
@@ -612,6 +725,28 @@ export function App() {
       rowFlashTimeoutsRef.current.clear()
     }
   }, [])
+
+  useEffect(() => {
+    if (!me?.authorized || typeof window === 'undefined') return
+
+    let animationFrame: number | undefined
+    const pruneIfPinned = () => {
+      if (!isLiveOrderPruningAllowed() || animationFrame !== undefined) return
+      animationFrame = window.requestAnimationFrame(() => {
+        animationFrame = undefined
+        setOrderList((current) => pruneLiveOrderList(current))
+      })
+    }
+
+    window.addEventListener('scroll', pruneIfPinned, { passive: true })
+    pruneIfPinned()
+    return () => {
+      window.removeEventListener('scroll', pruneIfPinned)
+      if (animationFrame !== undefined) {
+        window.cancelAnimationFrame(animationFrame)
+      }
+    }
+  }, [me?.authorized, pruneLiveOrderList])
 
   useEffect(() => {
     if (!me?.authorized || !nextCursor) return
@@ -744,7 +879,13 @@ export function App() {
                 </tr>
               </thead>
               <tbody>
-                {displayedOrders.length === 0 ? (
+                {ordersLoading && displayedOrders.length === 0 ? (
+                  <tr>
+                    <td className="empty" colSpan={7}>
+                      Loading orders
+                    </td>
+                  </tr>
+                ) : displayedOrders.length === 0 ? (
                   <tr>
                     <td className="empty" colSpan={7}>
                       No orders found
@@ -1369,6 +1510,8 @@ function OrderRows({
   onToggle: () => void
   onCopyOrderId: () => void
 }) {
+  const showVenueTimeline = shouldShowVenueProgress(order)
+
   return (
     <>
       <tr className={`order-row ${flashing ? 'flash' : ''}`} onClick={onToggle}>
@@ -1402,11 +1545,13 @@ function OrderRows({
           <StatusPill status={order.status} />
         </td>
       </tr>
-      <tr className="mini-timeline-row" onClick={onToggle}>
-        <td colSpan={7}>
-          <MiniOrderTimeline order={order} />
-        </td>
-      </tr>
+      {showVenueTimeline ? (
+        <tr className="mini-timeline-row" onClick={onToggle}>
+          <td colSpan={7}>
+            <MiniOrderTimeline order={order} />
+          </td>
+        </tr>
+      ) : null}
       {expanded ? (
         <tr className="details-row">
           <td colSpan={7}>
@@ -1774,6 +1919,11 @@ type TimelineLeg = {
   references: TimelineReference[]
 }
 
+type TimelineSupersededStats = {
+  hiddenLegs: number
+  attempts: number
+}
+
 type TimelineReference = {
   key: string
   label: string
@@ -1784,6 +1934,7 @@ type TimelineReference = {
 
 function OrderTimelinePanel({ order }: { order: OrderFirehoseRow }) {
   const legs = timelineLegs(order)
+  const superseded = timelineSupersededStats(order)
 
   return (
     <div className="detail-block timeline-block">
@@ -1792,7 +1943,10 @@ function OrderTimelinePanel({ order }: { order: OrderFirehoseRow }) {
           <h3>Order Timeline</h3>
           <p>{chainDisplayName(order.source.chainId)} to {chainDisplayName(order.destination.chainId)}</p>
         </div>
-        <StatusPill status={order.status} />
+        <div className="timeline-header-actions">
+          {superseded.hiddenLegs > 0 ? <SupersededTimelineBadge stats={superseded} /> : null}
+          <StatusPill status={order.status} />
+        </div>
       </div>
       <div className="timeline-list">
         <FundingTimelineItem order={order} />
@@ -1803,6 +1957,18 @@ function OrderTimelinePanel({ order }: { order: OrderFirehoseRow }) {
         )}
       </div>
     </div>
+  )
+}
+
+function SupersededTimelineBadge({ stats }: { stats: TimelineSupersededStats }) {
+  const refreshLabel = stats.attempts === 1 ? '1 refresh' : `${stats.attempts} refreshes`
+  const hiddenLabel = stats.hiddenLegs === 1 ? '1 hidden leg' : `${stats.hiddenLegs} hidden legs`
+
+  return (
+    <span className="timeline-superseded-badge" title="Superseded route history">
+      {stats.attempts > 0 ? `${refreshLabel}, ` : null}
+      {hiddenLabel}
+    </span>
   )
 }
 
@@ -2438,17 +2604,16 @@ export function timelineLegs(order: OrderFirehoseRow): TimelineLeg[] {
   }
 
   if (order.executionLegs.length > 0) {
-    return [...order.executionLegs]
-      .sort(
-        (left, right) =>
-          left.legIndex - right.legIndex ||
-          left.createdAt.localeCompare(right.createdAt) ||
-          left.id.localeCompare(right.id)
-      )
+    const sortedLegs = [...order.executionLegs].sort(compareExecutionLegs)
+    const quoteLegsByLogicalKey = originalQuoteLegsByLogicalKey(sortedLegs)
+
+    return sortedLegs
+      .filter((leg) => leg.status !== 'superseded')
       .map((leg) => {
         const steps = stepsByLegId.get(leg.id) ?? []
         const progressStage = progressStageForLeg(order, leg)
-        const quoteValuation = quoteUsdValuationForExecutionLeg(order, leg)
+        const quoteLeg = quoteLegsByLogicalKey.get(logicalExecutionLegKey(leg)) ?? leg
+        const quoteValuation = quoteUsdValuationForExecutionLeg(order, quoteLeg)
         const executedInput = leg.actualAmountIn
         const executedOutput = leg.actualAmountOut
         return {
@@ -2460,19 +2625,21 @@ export function timelineLegs(order: OrderFirehoseRow): TimelineLeg[] {
           status: leg.status,
           inputAsset: leg.input,
           outputAsset: leg.output,
-          quotedInput: leg.amountIn,
-          quotedOutput: leg.expectedAmountOut,
+          quotedInput: quoteLeg.amountIn,
+          quotedOutput: quoteLeg.expectedAmountOut,
           executedInput,
           executedOutput,
           quotedInputUsd:
-            valuationForAmount(leg.amountIn, leg.input, leg.usdValuation, ['plannedInput']) ??
-            valuationForAmount(leg.amountIn, leg.input, quoteValuation, ['input']),
+            valuationForAmount(quoteLeg.amountIn, quoteLeg.input, quoteLeg.usdValuation, [
+              'plannedInput'
+            ]) ??
+            valuationForAmount(quoteLeg.amountIn, quoteLeg.input, quoteValuation, ['input']),
           quotedOutputUsd:
-            valuationForAmount(leg.expectedAmountOut, leg.output, leg.usdValuation, [
+            valuationForAmount(quoteLeg.expectedAmountOut, quoteLeg.output, quoteLeg.usdValuation, [
               'plannedOutput',
               'plannedMinOutput'
             ]) ??
-            valuationForAmount(leg.expectedAmountOut, leg.output, quoteValuation, [
+            valuationForAmount(quoteLeg.expectedAmountOut, quoteLeg.output, quoteValuation, [
               'output',
               'minOutput'
             ]),
@@ -2494,7 +2661,7 @@ export function timelineLegs(order: OrderFirehoseRow): TimelineLeg[] {
                 { allowDerived: false }
               )
             : undefined,
-          minAmountOut: leg.minAmountOut,
+          minAmountOut: quoteLeg.minAmountOut,
           updatedAt: leg.updatedAt,
           txHash: progressStage?.txHash,
           txChainId: progressStage?.txChainId,
@@ -2524,6 +2691,56 @@ export function timelineLegs(order: OrderFirehoseRow): TimelineLeg[] {
     steps: [],
     references: []
   }))
+}
+
+export function timelineSupersededStats(order: OrderFirehoseRow): TimelineSupersededStats {
+  const supersededLegs = order.executionLegs.filter((leg) => leg.status === 'superseded')
+  const attempts = new Set(
+    supersededLegs
+      .map((leg) => leg.executionAttemptId)
+      .filter((attemptId): attemptId is string => Boolean(attemptId))
+  )
+
+  return {
+    hiddenLegs: supersededLegs.length,
+    attempts: attempts.size
+  }
+}
+
+function compareExecutionLegs(left: OrderExecutionLeg, right: OrderExecutionLeg) {
+  return (
+    left.legIndex - right.legIndex ||
+    left.createdAt.localeCompare(right.createdAt) ||
+    left.id.localeCompare(right.id)
+  )
+}
+
+function originalQuoteLegsByLogicalKey(legs: OrderExecutionLeg[]) {
+  const quoteLegs = new Map<string, OrderExecutionLeg>()
+  for (const leg of legs) {
+    const key = logicalExecutionLegKey(leg)
+    if (!quoteLegs.has(key)) {
+      quoteLegs.set(key, leg)
+    }
+  }
+  return quoteLegs
+}
+
+function logicalExecutionLegKey(leg: OrderExecutionLeg) {
+  return (
+    leg.transitionDeclId ??
+    [
+      leg.legIndex,
+      providerKey(leg.provider),
+      leg.legType,
+      assetKey(leg.input),
+      assetKey(leg.output)
+    ].join(':')
+  )
+}
+
+function assetKey(asset: AssetRef) {
+  return `${asset.chainId}:${asset.assetId}`
 }
 
 function progressStageForLeg(order: OrderFirehoseRow, leg: OrderExecutionLeg) {
@@ -3164,6 +3381,60 @@ function mergeOrders(current: OrderFirehoseRow[], incoming: OrderFirehoseRow[]) 
   return sortOrders([...byId.values()])
 }
 
+function liveOrderPruneResult(
+  orders: OrderFirehoseRow[],
+  retainOrderId?: string | null
+) {
+  if (!isLiveOrderPruningAllowed()) return undefined
+  const retained = retainLiveOrderWindow(orders, retainOrderId ?? undefined)
+  if (retained.length === orders.length) return undefined
+  return {
+    orders: retained,
+    nextCursor: liveOrderWindowCursor(retained)
+  }
+}
+
+export function retainLiveOrderWindow(
+  orders: OrderFirehoseRow[],
+  retainOrderId?: string
+) {
+  if (orders.length <= LIVE_ORDER_RENDER_LIMIT) return orders
+
+  const retained = orders.slice(0, LIVE_ORDER_RENDER_LIMIT)
+  if (!retainOrderId || retained.some((order) => order.id === retainOrderId)) {
+    return retained
+  }
+
+  const retainedOrder = orders.find((order) => order.id === retainOrderId)
+  return retainedOrder ? [...retained, retainedOrder] : retained
+}
+
+function liveOrderWindowCursor(orders: OrderFirehoseRow[]) {
+  const oldestContiguousOrder =
+    orders[Math.min(orders.length, LIVE_ORDER_RENDER_LIMIT) - 1]
+  return orderCursor(oldestContiguousOrder)
+}
+
+function orderCursor(order: OrderFirehoseRow | undefined) {
+  if (!order) return undefined
+  return toBase64Url(
+    JSON.stringify({
+      createdAt: order.createdAt,
+      id: order.id
+    })
+  )
+}
+
+function isLiveOrderPruningAllowed() {
+  if (typeof window === 'undefined') return true
+  const scrollY = typeof window.scrollY === 'number' ? window.scrollY : 0
+  return scrollY <= LIVE_ORDER_PRUNE_SCROLL_Y
+}
+
+function toBase64Url(value: string) {
+  return btoa(value).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/u, '')
+}
+
 export function mergeSnapshotOrders(
   current: OrderFirehoseRow[],
   snapshot: OrderFirehoseRow[]
@@ -3449,6 +3720,71 @@ export function volumeDateRange(window: VolumeWindow, now = new Date()) {
   return { from, to }
 }
 
+export function createCoalescedAsyncRefresh({
+  run,
+  onError,
+  minIntervalMs = VOLUME_ANALYTICS_REFRESH_THROTTLE_MS,
+  now = () => Date.now(),
+  setTimer = (callback, delayMs) => window.setTimeout(callback, delayMs),
+  clearTimer = (handle) => window.clearTimeout(handle)
+}: CoalescedAsyncRefreshOptions): CoalescedAsyncRefresh {
+  let timer: TimerHandle | undefined
+  let inFlight = false
+  let pending = false
+  let cancelled = false
+  let lastStartedAt = 0
+
+  const start = () => {
+    if (cancelled) return
+    timer = undefined
+    if (inFlight) {
+      pending = true
+      return
+    }
+
+    inFlight = true
+    pending = false
+    lastStartedAt = now()
+    run()
+      .catch(onError)
+      .finally(() => {
+        inFlight = false
+        if (pending && !cancelled) schedule()
+      })
+  }
+
+  const schedule = () => {
+    if (cancelled) return
+    if (timer !== undefined) {
+      pending = true
+      return
+    }
+
+    const elapsedMs = now() - lastStartedAt
+    const delayMs =
+      lastStartedAt === 0 ? 0 : Math.max(0, minIntervalMs - elapsedMs)
+    if (delayMs === 0) {
+      start()
+      return
+    }
+
+    pending = true
+    timer = setTimer(start, delayMs)
+  }
+
+  return {
+    request: schedule,
+    cancel: () => {
+      cancelled = true
+      pending = false
+      if (timer !== undefined) {
+        clearTimer(timer)
+        timer = undefined
+      }
+    }
+  }
+}
+
 function shortId(value: string) {
   if (value.length <= 14) return value
   return `${value.slice(0, 8)}...${value.slice(-6)}`
@@ -3491,6 +3827,7 @@ function statusTone(status: string): StatusTone {
 
 export function progressVenueLabel(order: OrderFirehoseRow) {
   const progress = order.progress
+  if (!shouldShowVenueProgress(order)) return undefined
   if (progress.totalStages === 0) return undefined
   if (progress.completedStages === progress.totalStages && progress.failedStages === 0) {
     return undefined
@@ -3518,8 +3855,37 @@ export function progressVenueLabel(order: OrderFirehoseRow) {
   return progress.activeStage ? activeProgressStageVenue(progress.activeStage) : undefined
 }
 
+export function shouldShowVenueProgress(order: OrderFirehoseRow) {
+  const progress = order.progress
+  if (progress.completedStages > 0 || progress.failedStages > 0) return true
+
+  const materializedLeg = order.executionLegs.some(
+    (leg) => leg.status !== 'planned' && leg.status !== 'superseded'
+  )
+  if (materializedLeg) return true
+
+  const materializedStep = order.executionSteps.some(
+    (step) =>
+      !isWaitForDepositStep(step) &&
+      step.status !== 'planned' &&
+      step.status !== 'superseded'
+  )
+  if (materializedStep) return true
+
+  const activeStageStatus = progress.activeStage
+    ? providerKey(progress.activeStage.split('/')[1] ?? '')
+    : undefined
+  if (activeStageStatus === 'waiting') return order.status === 'executing'
+  return Boolean(
+    activeStageStatus &&
+      activeStageStatus !== 'planned' &&
+      activeStageStatus !== 'waiting'
+  )
+}
+
 function progressSegments(order: OrderFirehoseRow): ProgressSegment[] {
   const progress = order.progress
+  if (!shouldShowVenueProgress(order)) return []
   if (progress.totalStages === 0) return []
 
   const completed = progress.completedStages

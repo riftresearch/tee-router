@@ -1,4 +1,4 @@
-local_full_compose := "docker compose --env-file .env.admin -p tee-router-local-full-test -f etc/compose.local-full.yml"
+local_full_compose := "docker compose --env-file .env.admin -p tee-router-local-full-test -f etc/compose.local-full.yml -f etc/compose.local-observability.yml"
 
 # Cache the local devnet
 cache-devnet:
@@ -10,6 +10,28 @@ cache-devnet:
 devnet +args:
     #!/usr/bin/env bash
     set -euo pipefail
+    has_compose_up_services() {
+      local skip_next=0
+      for arg in "$@"; do
+        if [[ "$skip_next" -eq 1 ]]; then
+          skip_next=0
+          continue
+        fi
+        case "$arg" in
+          --abort-on-container-exit|--always-recreate-deps|--attach-dependencies|--build|--detach|-d|--force-recreate|--menu|--no-attach|--no-build|--no-color|--no-deps|--no-log-prefix|--no-recreate|--no-start|--pull|--quiet-pull|--remove-orphans|--renew-anon-volumes|-V|--timestamps|--wait)
+            ;;
+          --attach|--exit-code-from|--scale|--timeout|-t|--wait-timeout)
+            skip_next=1
+            ;;
+          -*)
+            ;;
+          *)
+            return 0
+            ;;
+        esac
+      done
+      return 1
+    }
     args=( {{args}} )
     if [[ "${#args[@]}" -eq 0 ]]; then
       args=(ps)
@@ -17,9 +39,8 @@ devnet +args:
     if [[ "${args[0]}" == "up-d" ]]; then
       args=(up -d "${args[@]:1}")
     fi
-    if [[ "${args[0]}" == "up" ]]; then
+    if [[ "${args[0]}" == "up" ]] && ! has_compose_up_services "${args[@]:1}"; then
       {{local_full_compose}} stop admin-dashboard sauron >/dev/null 2>&1 || true
-      {{local_full_compose}} rm -f router-replica-setup >/dev/null 2>&1 || true
     fi
     {{local_full_compose}} "${args[@]}"
 
@@ -28,6 +49,28 @@ devnet +args:
 dc +args:
     #!/usr/bin/env bash
     set -euo pipefail
+    has_compose_up_services() {
+      local skip_next=0
+      for arg in "$@"; do
+        if [[ "$skip_next" -eq 1 ]]; then
+          skip_next=0
+          continue
+        fi
+        case "$arg" in
+          --abort-on-container-exit|--always-recreate-deps|--attach-dependencies|--build|--detach|-d|--force-recreate|--menu|--no-attach|--no-build|--no-color|--no-deps|--no-log-prefix|--no-recreate|--no-start|--pull|--quiet-pull|--remove-orphans|--renew-anon-volumes|-V|--timestamps|--wait)
+            ;;
+          --attach|--exit-code-from|--scale|--timeout|-t|--wait-timeout)
+            skip_next=1
+            ;;
+          -*)
+            ;;
+          *)
+            return 0
+            ;;
+        esac
+      done
+      return 1
+    }
     args=( {{args}} )
     if [[ "${#args[@]}" -eq 0 ]]; then
       args=(ps)
@@ -35,14 +78,13 @@ dc +args:
     if [[ "${args[0]}" == "up-d" ]]; then
       args=(up -d "${args[@]:1}")
     fi
-    if [[ "${args[0]}" == "up" ]]; then
+    if [[ "${args[0]}" == "up" ]] && ! has_compose_up_services "${args[@]:1}"; then
       {{local_full_compose}} stop admin-dashboard sauron >/dev/null 2>&1 || true
-      {{local_full_compose}} rm -f router-replica-setup >/dev/null 2>&1 || true
     fi
     {{local_full_compose}} "${args[@]}"
 
 # Run random router loadgen inside the local full compose stack
-compose-router-loadgen count='100' concurrency='8' rps='5' min_raw_amount='100000000' max_raw_amount='250000000' order_type='market':
+compose-router-loadgen count='100' concurrency='64' rps='5' min_raw_amount='100000000' max_raw_amount='250000000' order_type='market':
     {{local_full_compose}} \
       --profile tools \
       run --build --rm router-loadgen create-and-fund \
@@ -66,8 +108,19 @@ compose-router-loadgen count='100' concurrency='8' rps='5' min_raw_amount='10000
 compose-router-loadgen-build:
     {{local_full_compose}} --profile tools build router-loadgen
 
-# Run random router loadgen from the host cargo binary
-router-loadgen count='100' concurrency='8' rps='5' min_raw_amount='100000000' max_raw_amount='250000000' order_type='market':
+# Run random router loadgen from the host cargo binary.
+router-loadgen count='100' concurrency='64' rps='5' min_raw_amount='100000000' max_raw_amount='250000000' order_type='market':
+    just _router-loadgen-host {{count}} {{concurrency}} {{rps}} {{min_raw_amount}} {{max_raw_amount}} {{order_type}}
+
+# Run the high-volume random router loadgen profile from the host cargo binary.
+router-loadgen-fast count='10000' concurrency='64' rps='5' min_raw_amount='100000000' max_raw_amount='250000000' order_type='market':
+    just _router-loadgen-host {{count}} {{concurrency}} {{rps}} {{min_raw_amount}} {{max_raw_amount}} {{order_type}}
+
+# Run the slow random router loadgen profile from the host cargo binary.
+router-loadgen-slow count='600' concurrency='64' rps='0.1666666667' min_raw_amount='100000000' max_raw_amount='250000000' order_type='market':
+    just _router-loadgen-host {{count}} {{concurrency}} {{rps}} {{min_raw_amount}} {{max_raw_amount}} {{order_type}}
+
+_router-loadgen-host count concurrency rps min_raw_amount max_raw_amount order_type:
     cargo run --release -p router-loadgen -- create-and-fund \
       --gateway-url http://localhost:3001 \
       --random \
@@ -87,7 +140,7 @@ router-loadgen count='100' concurrency='8' rps='5' min_raw_amount='100000000' ma
       --bitcoin-rpc-auth devnet:devnet
 
 # Run random router loadgen from the host cargo binary
-router-loadgen-limit count='100' concurrency='8' rps='5' min_raw_amount='100000000' max_raw_amount='250000000' order_type='limit':
+router-loadgen-limit count='100' concurrency='64' rps='5' min_raw_amount='100000000' max_raw_amount='250000000' order_type='limit':
     cargo run --release -p router-loadgen -- create-and-fund \
       --gateway-url http://localhost:3001 \
       --random \

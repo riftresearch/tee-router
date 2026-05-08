@@ -351,19 +351,19 @@ function orderSummaryRowsSql(selectedOrdersSql: string): string {
 WITH selected_orders AS (
 ${selectedOrdersSql.trimEnd()}
 ),
-latest_quotes AS (
+initial_quotes AS (
   SELECT DISTINCT ON (moq.order_id)
     moq.*
   FROM public.market_order_quotes moq
   WHERE moq.order_id IN (SELECT id FROM selected_orders)
-  ORDER BY moq.order_id, moq.created_at DESC, moq.id DESC
+  ORDER BY moq.order_id, moq.created_at ASC, moq.id ASC
 ),
-latest_limit_quotes AS (
+initial_limit_quotes AS (
   SELECT DISTINCT ON (loq.order_id)
     loq.*
   FROM public.limit_order_quotes loq
   WHERE loq.order_id IN (SELECT id FROM selected_orders)
-  ORDER BY loq.order_id, loq.created_at DESC, loq.id DESC
+  ORDER BY loq.order_id, loq.created_at ASC, loq.id ASC
 )
 SELECT
   ro.id::text,
@@ -396,13 +396,13 @@ SELECT
   COALESCE(moq.provider_id, loq.provider_id) AS quote_provider_id,
   CASE
     WHEN ro.order_type = 'limit_order' THEN 'limit'
-    ELSE COALESCE(moq.order_kind, moa.order_kind)
+    ELSE COALESCE(moa.order_kind, moq.order_kind)
   END AS order_kind,
-  COALESCE(moq.amount_in, moa.amount_in, loq.input_amount, loa.input_amount) AS quoted_amount_in,
-  COALESCE(moq.amount_out, moa.amount_out, loq.output_amount, loa.output_amount) AS quoted_amount_out,
-  COALESCE(moq.min_amount_out, moa.min_amount_out) AS min_amount_out,
-  COALESCE(moq.max_amount_in, moa.max_amount_in) AS max_amount_in,
-  COALESCE(moq.slippage_bps, moa.slippage_bps) AS slippage_bps,
+  COALESCE(moa.amount_in, moq.amount_in, loa.input_amount, loq.input_amount) AS quoted_amount_in,
+  COALESCE(moa.amount_out, moq.amount_out, loa.output_amount, loq.output_amount) AS quoted_amount_out,
+  COALESCE(moa.min_amount_out, moq.min_amount_out) AS min_amount_out,
+  COALESCE(moa.max_amount_in, moq.max_amount_in) AS max_amount_in,
+  COALESCE(moa.slippage_bps, moq.slippage_bps) AS slippage_bps,
   COALESCE(moq.expires_at, loq.expires_at) AS quote_expires_at,
   COALESCE(moq.provider_quote, loq.provider_quote) AS provider_quote,
   COALESCE(moq.usd_valuation_json, loq.usd_valuation_json, '{}'::jsonb) AS quote_usd_valuation,
@@ -420,8 +420,8 @@ LEFT JOIN LATERAL (
   ORDER BY s.updated_at DESC, s.id DESC
   LIMIT 1
 ) funding_step ON true
-LEFT JOIN latest_quotes moq ON moq.order_id = ro.id
-LEFT JOIN latest_limit_quotes loq ON loq.order_id = ro.id
+LEFT JOIN initial_quotes moq ON moq.order_id = ro.id
+LEFT JOIN initial_limit_quotes loq ON loq.order_id = ro.id
 LEFT JOIN public.market_order_actions moa ON moa.order_id = ro.id
 LEFT JOIN public.limit_order_actions loa ON loa.order_id = ro.id
 LEFT JOIN LATERAL (
@@ -517,19 +517,19 @@ function orderRowsSql(selectedOrdersSql: string): string {
 WITH selected_orders AS (
 ${selectedOrdersSql.trimEnd()}
 ),
-latest_quotes AS (
+initial_quotes AS (
   SELECT DISTINCT ON (moq.order_id)
     moq.*
   FROM public.market_order_quotes moq
   WHERE moq.order_id IN (SELECT id FROM selected_orders)
-  ORDER BY moq.order_id, moq.created_at DESC, moq.id DESC
+  ORDER BY moq.order_id, moq.created_at ASC, moq.id ASC
 ),
-latest_limit_quotes AS (
+initial_limit_quotes AS (
   SELECT DISTINCT ON (loq.order_id)
     loq.*
   FROM public.limit_order_quotes loq
   WHERE loq.order_id IN (SELECT id FROM selected_orders)
-  ORDER BY loq.order_id, loq.created_at DESC, loq.id DESC
+  ORDER BY loq.order_id, loq.created_at ASC, loq.id ASC
 )
 SELECT
   ro.id::text,
@@ -562,13 +562,13 @@ SELECT
   COALESCE(moq.provider_id, loq.provider_id) AS quote_provider_id,
   CASE
     WHEN ro.order_type = 'limit_order' THEN 'limit'
-    ELSE COALESCE(moq.order_kind, moa.order_kind)
+    ELSE COALESCE(moa.order_kind, moq.order_kind)
   END AS order_kind,
-  COALESCE(moq.amount_in, moa.amount_in, loq.input_amount, loa.input_amount) AS quoted_amount_in,
-  COALESCE(moq.amount_out, moa.amount_out, loq.output_amount, loa.output_amount) AS quoted_amount_out,
-  COALESCE(moq.min_amount_out, moa.min_amount_out) AS min_amount_out,
-  COALESCE(moq.max_amount_in, moa.max_amount_in) AS max_amount_in,
-  COALESCE(moq.slippage_bps, moa.slippage_bps) AS slippage_bps,
+  COALESCE(moa.amount_in, moq.amount_in, loa.input_amount, loq.input_amount) AS quoted_amount_in,
+  COALESCE(moa.amount_out, moq.amount_out, loa.output_amount, loq.output_amount) AS quoted_amount_out,
+  COALESCE(moa.min_amount_out, moq.min_amount_out) AS min_amount_out,
+  COALESCE(moa.max_amount_in, moq.max_amount_in) AS max_amount_in,
+  COALESCE(moa.slippage_bps, moq.slippage_bps) AS slippage_bps,
   COALESCE(moq.expires_at, loq.expires_at) AS quote_expires_at,
   COALESCE(moq.provider_quote, loq.provider_quote) AS provider_quote,
   COALESCE(moq.usd_valuation_json, loq.usd_valuation_json, '{}'::jsonb) AS quote_usd_valuation,
@@ -586,8 +586,8 @@ LEFT JOIN LATERAL (
   ORDER BY s.updated_at DESC, s.id DESC
   LIMIT 1
 ) funding_step ON true
-LEFT JOIN latest_quotes moq ON moq.order_id = ro.id
-LEFT JOIN latest_limit_quotes loq ON loq.order_id = ro.id
+LEFT JOIN initial_quotes moq ON moq.order_id = ro.id
+LEFT JOIN initial_limit_quotes loq ON loq.order_id = ro.id
 LEFT JOIN public.market_order_actions moa ON moa.order_id = ro.id
 LEFT JOIN public.limit_order_actions loa ON loa.order_id = ro.id
 LEFT JOIN LATERAL (
@@ -1112,7 +1112,7 @@ function mapOrderRow(
   row: OrderFirehoseDbRow,
   detailLevel: 'summary' | 'full'
 ): OrderFirehoseRow {
-  const executionLegs = normalizeJsonArray<OrderExecutionLeg>(
+  const fullExecutionLegs = normalizeJsonArray<OrderExecutionLeg>(
     row.execution_legs,
     'execution_legs'
   )
@@ -1124,6 +1124,10 @@ function mapOrderRow(
     row.provider_operations,
     'provider_operations'
   )
+  const executionLegs =
+    detailLevel === 'full'
+      ? fullExecutionLegs
+      : summarizeExecutionLegsForList(fullExecutionLegs)
 
   return {
     id: row.id,
@@ -1159,7 +1163,15 @@ function mapOrderRow(
       ? toIso(row.quote_expires_at)
       : undefined,
     providerQuote: detailLevel === 'full' ? row.provider_quote ?? undefined : undefined,
-    quoteUsdValuation: row.quote_usd_valuation ?? undefined,
+    quoteUsdValuation:
+      detailLevel === 'full'
+        ? row.quote_usd_valuation ?? undefined
+        : summarizeUsdValuationForList(row.quote_usd_valuation, [
+            'input',
+            'output',
+            'minOutput',
+            'maxInput'
+          ]),
     workflowTraceId: row.workflow_trace_id ?? undefined,
     workflowParentSpanId: row.workflow_parent_span_id ?? undefined,
     executionLegs,
@@ -1167,7 +1179,7 @@ function mapOrderRow(
     providerOperations: detailLevel === 'full' ? providerOperations : [],
     progress: summarizeProgress(
       row.provider_quote,
-      executionLegs,
+      fullExecutionLegs,
       executionSteps,
       providerOperations
     ),
@@ -1176,6 +1188,66 @@ function mapOrderRow(
         ? summarizeLimitOrderStatus(row.status, executionSteps, providerOperations)
         : undefined
   }
+}
+
+function summarizeExecutionLegsForList(
+  legs: OrderExecutionLeg[]
+): OrderExecutionLeg[] {
+  return legs
+    .filter((leg) => leg.status !== 'superseded')
+    .map((leg) => ({
+      id: leg.id,
+      executionAttemptId: leg.executionAttemptId,
+      transitionDeclId: leg.transitionDeclId,
+      legIndex: leg.legIndex,
+      legType: leg.legType,
+      provider: leg.provider,
+      status: leg.status,
+      input: leg.input,
+      output: leg.output,
+      amountIn: leg.amountIn,
+      expectedAmountOut: leg.expectedAmountOut,
+      minAmountOut: leg.minAmountOut,
+      actualAmountIn: leg.actualAmountIn,
+      actualAmountOut: leg.actualAmountOut,
+      startedAt: leg.startedAt,
+      completedAt: leg.completedAt,
+      createdAt: leg.createdAt,
+      updatedAt: leg.updatedAt,
+      details: {},
+      usdValuation: summarizeUsdValuationForList(leg.usdValuation, [
+        'actualInput',
+        'actualOutput'
+      ])
+    }))
+}
+
+function summarizeUsdValuationForList(
+  valuation: unknown,
+  amountKeys: string[]
+): unknown {
+  const record = asRecord(valuation)
+  if (!record) return undefined
+  const amounts = asRecord(record.amounts)
+  const summarizedAmounts: Record<string, unknown> = {}
+  if (amounts) {
+    for (const key of amountKeys) {
+      if (amounts[key] !== undefined) summarizedAmounts[key] = amounts[key]
+    }
+  }
+
+  const summarized: Record<string, unknown> = {}
+  if (record.schemaVersion !== undefined) {
+    summarized.schemaVersion = record.schemaVersion
+  }
+  if (record.pricing !== undefined) {
+    summarized.pricing = record.pricing
+  }
+  if (Object.keys(summarizedAmounts).length > 0) {
+    summarized.amounts = summarizedAmounts
+  }
+
+  return Object.keys(summarized).length > 0 ? summarized : undefined
 }
 
 function mapOrderAnalyticsRow(row: OrderAnalyticsDbRow): OrderAnalyticsRow {

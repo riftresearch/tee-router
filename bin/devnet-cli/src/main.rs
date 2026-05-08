@@ -9,6 +9,7 @@ use devnet::{
 };
 use snafu::{ResultExt, Whatever};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use tokio::net::TcpListener;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -98,6 +99,7 @@ async fn run_server(
         .ok();
     let server_start = tokio::time::Instant::now();
     info!("[Devnet Server] Starting devnet server...");
+    let manifest_listener = bind_manifest_listener(manifest_port).await?;
 
     let mut devnet_builder = RiftDevnet::builder()
         .interactive(true)
@@ -134,7 +136,7 @@ async fn run_server(
         DevnetManifest::from_devnet(&devnet).whatever_context("Failed to build devnet manifest")?;
     devnet
         .join_set
-        .spawn(run_manifest_server(manifest, manifest_port));
+        .spawn(run_manifest_server(manifest, manifest_listener));
 
     tokio::select! {
         _ = shutdown_signal() => {
@@ -151,7 +153,20 @@ async fn run_server(
     Ok(())
 }
 
-async fn run_manifest_server(manifest: DevnetManifest, manifest_port: u16) -> devnet::Result<()> {
+async fn bind_manifest_listener(manifest_port: u16) -> Result<TcpListener, Whatever> {
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), manifest_port);
+    let listener = TcpListener::bind(addr)
+        .await
+        .map_err(|error| eyre::eyre!("failed to bind devnet manifest API: {error}"))
+        .whatever_context("Failed to reserve devnet manifest API port")?;
+    info!("[Devnet Server] Reserved manifest API listener on http://{addr}");
+    Ok(listener)
+}
+
+async fn run_manifest_server(
+    manifest: DevnetManifest,
+    listener: TcpListener,
+) -> devnet::Result<()> {
     let status = serde_json::json!({
         "status": "ok",
         "deterministic": manifest.deterministic,
@@ -178,11 +193,10 @@ async fn run_manifest_server(manifest: DevnetManifest, manifest_port: u16) -> de
                 }
             }),
         );
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), manifest_port);
+    let addr = listener
+        .local_addr()
+        .map_err(|error| eyre::eyre!("failed to read devnet manifest API address: {error}"))?;
     info!("[Devnet Server] Manifest API listening on http://{addr}");
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .map_err(|error| eyre::eyre!("failed to bind devnet manifest API: {error}"))?;
     axum::serve(listener, app)
         .await
         .map_err(|error| eyre::eyre!("devnet manifest API failed: {error}"))?;

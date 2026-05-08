@@ -85,6 +85,52 @@ test('volume chart normalizes every fixed window and bucket size', async () => {
   }
 })
 
+test('volume analytics refreshes are coalesced under live order bursts', async () => {
+  const { createCoalescedAsyncRefresh } = await appHelpers()
+  let now = 1000
+  let calls = 0
+  let nextHandle = 1
+  const timers = new Map<number, { delayMs: number; callback: () => void }>()
+  const scheduler = createCoalescedAsyncRefresh({
+    minIntervalMs: 2000,
+    now: () => now,
+    run: async () => {
+      calls += 1
+    },
+    onError: (error) => {
+      throw error
+    },
+    setTimer: (callback, delayMs) => {
+      const handle = nextHandle++
+      timers.set(handle, { delayMs, callback })
+      return handle
+    },
+    clearTimer: (handle) => {
+      timers.delete(handle)
+    }
+  })
+
+  scheduler.request()
+  scheduler.request()
+  scheduler.request()
+  await flushMicrotasks()
+
+  expect(calls).toBe(1)
+  expect([...timers.values()].map((timer) => timer.delayMs)).toEqual([2000])
+
+  scheduler.request()
+  expect(timers.size).toBe(1)
+
+  now = 3000
+  const timer = timers.get(1)
+  timers.delete(1)
+  timer?.callback()
+  await flushMicrotasks()
+
+  expect(calls).toBe(2)
+  expect(timers.size).toBe(0)
+})
+
 test('order status display names every recovery and intervention state', async () => {
   const { statusDisplay } = await appHelpers()
 
@@ -143,6 +189,67 @@ test('executed USD values require actual valuation entries', async () => {
   expect(executed.output.usdValuation?.raw).toBe('89')
 })
 
+test('execution timeline hides superseded legs while preserving original quoted amounts', async () => {
+  const { timelineLegs, timelineSupersededStats } = await appHelpers()
+  const now = '2026-05-05T00:00:00.000Z'
+  const supersededLeg: OrderExecutionLeg = {
+    id: 'leg-original',
+    executionAttemptId: 'attempt-original',
+    transitionDeclId: 'transition-1',
+    legIndex: 0,
+    legType: 'hyperliquid_trade',
+    provider: 'hyperliquid',
+    status: 'superseded',
+    input: USDC,
+    output: USDC,
+    amountIn: '100',
+    expectedAmountOut: '90',
+    minAmountOut: '88',
+    createdAt: now,
+    updatedAt: now,
+    details: {},
+    usdValuation: {
+      schemaVersion: 1,
+      amounts: {
+        plannedInput: valuation('100', USDC),
+        plannedOutput: valuation('90', USDC)
+      }
+    }
+  }
+  const refreshedLeg: OrderExecutionLeg = {
+    ...supersededLeg,
+    id: 'leg-refreshed',
+    executionAttemptId: 'attempt-refreshed',
+    status: 'completed',
+    amountIn: '105',
+    expectedAmountOut: '91',
+    minAmountOut: '89',
+    actualAmountIn: '105',
+    actualAmountOut: '91',
+    createdAt: '2026-05-05T00:01:00.000Z',
+    updatedAt: '2026-05-05T00:01:00.000Z'
+  }
+  const order: OrderFirehoseRow = {
+    ...completedOrder({}),
+    executionLegs: [supersededLeg, refreshedLeg]
+  }
+
+  const legs = timelineLegs(order)
+
+  expect(legs).toHaveLength(1)
+  expect(legs[0].key).toBe('leg-refreshed')
+  expect(legs[0].quotedInput).toBe('100')
+  expect(legs[0].quotedOutput).toBe('90')
+  expect(legs[0].minAmountOut).toBe('88')
+  expect(legs[0].executedInput).toBe('105')
+  expect(legs[0].executedOutput).toBe('91')
+  expect(legs[0].quotedInputUsd?.raw).toBe('100')
+  expect(timelineSupersededStats(order)).toEqual({
+    hiddenLegs: 1,
+    attempts: 1
+  })
+})
+
 test('venue progress label stays empty for active funding deposit steps', async () => {
   const { progressVenueLabel } = await appHelpers()
   const now = '2026-05-05T00:00:00.000Z'
@@ -187,7 +294,7 @@ test('venue progress count stays numeric when backend reports zero stages', asyn
 })
 
 test('venue progress label stays empty before first planned venue', async () => {
-  const { progressVenueLabel } = await appHelpers()
+  const { progressVenueLabel, shouldShowVenueProgress } = await appHelpers()
   const order: OrderFirehoseRow = {
     ...completedOrder({}),
     status: 'pending_funding',
@@ -201,10 +308,11 @@ test('venue progress label stays empty before first planned venue', async () => 
   }
 
   expect(progressVenueLabel(order)).toBeUndefined()
+  expect(shouldShowVenueProgress(order)).toBe(false)
 })
 
 test('venue progress label stays empty for planned refund venue', async () => {
-  const { progressVenueLabel } = await appHelpers()
+  const { progressVenueLabel, shouldShowVenueProgress } = await appHelpers()
   const order: OrderFirehoseRow = {
     ...completedOrder({}),
     status: 'refunding',
@@ -218,10 +326,11 @@ test('venue progress label stays empty for planned refund venue', async () => {
   }
 
   expect(progressVenueLabel(order)).toBeUndefined()
+  expect(shouldShowVenueProgress(order)).toBe(false)
 })
 
 test('venue progress label shows venue for active venue execution', async () => {
-  const { progressVenueLabel } = await appHelpers()
+  const { progressVenueLabel, shouldShowVenueProgress } = await appHelpers()
   const order: OrderFirehoseRow = {
     ...completedOrder({
       provider: 'cctp',
@@ -237,10 +346,11 @@ test('venue progress label shows venue for active venue execution', async () => 
   }
 
   expect(progressVenueLabel(order)).toBe('CCTP')
+  expect(shouldShowVenueProgress(order)).toBe(true)
 })
 
 test('venue progress label strips provider action text from active stage', async () => {
-  const { progressVenueLabel } = await appHelpers()
+  const { progressVenueLabel, shouldShowVenueProgress } = await appHelpers()
   const order: OrderFirehoseRow = {
     ...completedOrder({}),
     status: 'executing',
@@ -254,6 +364,7 @@ test('venue progress label strips provider action text from active stage', async
   }
 
   expect(progressVenueLabel(order)).toBe('CCTP')
+  expect(shouldShowVenueProgress(order)).toBe(true)
 })
 
 test('SSE snapshots preserve expanded full-row execution details', async () => {
@@ -290,6 +401,32 @@ test('SSE snapshots preserve expanded full-row execution details', async () => {
   expect(merged.detailLevel).toBe('full')
   expect(merged.updatedAt).toBe(summaryOrder.updatedAt)
   expect(merged.executionSteps).toEqual([fundingStep])
+})
+
+test('live order retention caps the rendered firehose window', async () => {
+  const { LIVE_ORDER_RENDER_LIMIT, retainLiveOrderWindow } = await appHelpers()
+  const orders = firehoseOrders(LIVE_ORDER_RENDER_LIMIT + 25)
+
+  const retained = retainLiveOrderWindow(orders)
+
+  expect(retained).toHaveLength(LIVE_ORDER_RENDER_LIMIT)
+  expect(retained.map((order) => order.id)).toEqual(
+    orders.slice(0, LIVE_ORDER_RENDER_LIMIT).map((order) => order.id)
+  )
+})
+
+test('live order retention preserves an expanded older order', async () => {
+  const { LIVE_ORDER_RENDER_LIMIT, retainLiveOrderWindow } = await appHelpers()
+  const orders = firehoseOrders(LIVE_ORDER_RENDER_LIMIT + 25)
+  const retainedOrder = orders[LIVE_ORDER_RENDER_LIMIT + 20]
+
+  const retained = retainLiveOrderWindow(orders, retainedOrder.id)
+
+  expect(retained).toHaveLength(LIVE_ORDER_RENDER_LIMIT + 1)
+  expect(retained.at(-1)?.id).toBe(retainedOrder.id)
+  expect(retained.slice(0, LIVE_ORDER_RENDER_LIMIT).map((order) => order.id)).toEqual(
+    orders.slice(0, LIVE_ORDER_RENDER_LIMIT).map((order) => order.id)
+  )
 })
 
 test('timeline execution placeholder distinguishes submitted external txs', async () => {
@@ -343,6 +480,11 @@ function appHelpers() {
   })
   appHelpersPromise ??= import('./App')
   return appHelpersPromise
+}
+
+async function flushMicrotasks() {
+  await Promise.resolve()
+  await Promise.resolve()
 }
 
 const USDC: AssetRef = {
@@ -402,4 +544,17 @@ function completedOrder(legOverrides: Partial<OrderExecutionLeg>): OrderFirehose
       failedStages: 0
     }
   }
+}
+
+function firehoseOrders(count: number): OrderFirehoseRow[] {
+  const base = Date.parse('2026-05-05T00:00:00.000Z')
+  return Array.from({ length: count }, (_, index) => {
+    const timestamp = new Date(base - index * 1000).toISOString()
+    return {
+      ...completedOrder({}),
+      id: `00000000-0000-0000-0000-${String(index).padStart(12, '0')}`,
+      createdAt: timestamp,
+      updatedAt: timestamp
+    }
+  })
 }
