@@ -1,0 +1,414 @@
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+pub type WorkflowOrderId = Uuid;
+pub type WorkflowAttemptId = Uuid;
+pub type WorkflowStepId = Uuid;
+pub type WorkflowVaultId = Uuid;
+pub type WorkflowProviderOperationId = Uuid;
+pub type WorkflowHintId = Uuid;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderWorkflowInput {
+    pub order_id: WorkflowOrderId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderWorkflowOutput {
+    pub order_id: WorkflowOrderId,
+    pub terminal_status: OrderTerminalStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefundWorkflowInput {
+    pub order_id: WorkflowOrderId,
+    pub parent_attempt_id: Option<WorkflowAttemptId>,
+    pub trigger: RefundTrigger,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefundWorkflowOutput {
+    pub order_id: WorkflowOrderId,
+    pub terminal_status: RefundTerminalStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuoteRefreshWorkflowInput {
+    pub order_id: WorkflowOrderId,
+    pub stale_attempt_id: WorkflowAttemptId,
+    pub failed_step_id: WorkflowStepId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuoteRefreshWorkflowOutput {
+    pub refreshed_attempt_id: WorkflowAttemptId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StaleRunningStepWatchdogInput {
+    pub order_id: WorkflowOrderId,
+    pub step_id: WorkflowStepId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StaleRunningStepWatchdogOutput {
+    pub manual_intervention_required: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderHintPollWorkflowInput {
+    pub order_id: WorkflowOrderId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderHintPollWorkflowOutput {
+    pub hints_claimed: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FundingVaultFundedSignal {
+    pub order_id: WorkflowOrderId,
+    pub vault_id: WorkflowVaultId,
+    pub observed_amount_raw: String,
+    pub source_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderOperationHintSignal {
+    pub order_id: WorkflowOrderId,
+    pub hint_id: WorkflowHintId,
+    pub provider_operation_id: Option<WorkflowProviderOperationId>,
+    pub provider: ProviderKind,
+    pub hint_kind: ProviderHintKind,
+    pub provider_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManualRefundTriggerSignal {
+    pub order_id: WorkflowOrderId,
+    pub operator_reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManualInterventionReleaseSignal {
+    pub order_id: WorkflowOrderId,
+    pub operator_reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderWorkflowDebugCursor {
+    pub order_id: WorkflowOrderId,
+    pub phase: OrderWorkflowPhase,
+    pub active_attempt_id: Option<WorkflowAttemptId>,
+    pub active_step_id: Option<WorkflowStepId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoadOrderExecutionStateInput {
+    pub order_id: WorkflowOrderId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderExecutionState {
+    pub order_id: WorkflowOrderId,
+    pub phase: OrderWorkflowPhase,
+    pub active_attempt_id: Option<WorkflowAttemptId>,
+    pub active_step_id: Option<WorkflowStepId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaterializeExecutionAttemptInput {
+    pub order_id: WorkflowOrderId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaterializedExecutionAttempt {
+    pub attempt_id: WorkflowAttemptId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistStepReadyToFireInput {
+    pub order_id: WorkflowOrderId,
+    pub attempt_id: WorkflowAttemptId,
+    pub step_id: WorkflowStepId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistStepFailedInput {
+    pub order_id: WorkflowOrderId,
+    pub attempt_id: WorkflowAttemptId,
+    pub step_id: WorkflowStepId,
+    pub failure_reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistStepTerminalStatusInput {
+    pub order_id: WorkflowOrderId,
+    pub attempt_id: WorkflowAttemptId,
+    pub step_id: WorkflowStepId,
+    pub terminal_status: StepTerminalSubStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistProviderReceiptInput {
+    pub order_id: WorkflowOrderId,
+    pub attempt_id: WorkflowAttemptId,
+    pub step_id: WorkflowStepId,
+    pub provider_operation_id: WorkflowProviderOperationId,
+    pub provider_ref: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistProviderOperationStatusInput {
+    pub order_id: WorkflowOrderId,
+    pub attempt_id: WorkflowAttemptId,
+    pub step_id: WorkflowStepId,
+    pub provider_operation_id: WorkflowProviderOperationId,
+    pub status: ProviderOperationStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SettleProviderStepInput {
+    pub order_id: WorkflowOrderId,
+    pub attempt_id: WorkflowAttemptId,
+    pub step_id: WorkflowStepId,
+    pub provider_operation_id: WorkflowProviderOperationId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoundaryPersisted {
+    pub boundary: PersistenceBoundary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClassifyStepFailureInput {
+    pub order_id: WorkflowOrderId,
+    pub attempt_id: WorkflowAttemptId,
+    pub failed_step_id: WorkflowStepId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WriteFailedAttemptSnapshotInput {
+    pub order_id: WorkflowOrderId,
+    pub attempt_id: WorkflowAttemptId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailedAttemptSnapshotWritten {
+    pub attempt_id: WorkflowAttemptId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FinalizeOrderOrRefundInput {
+    pub order_id: WorkflowOrderId,
+    pub terminal_status: OrderTerminalStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FinalizedOrder {
+    pub order_id: WorkflowOrderId,
+    pub terminal_status: OrderTerminalStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifyProviderOperationHintInput {
+    pub signal: ProviderOperationHintSignal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderOperationHintVerified {
+    pub provider_operation_id: WorkflowProviderOperationId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PollProviderOperationHintsInput {
+    pub order_id: WorkflowOrderId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderOperationHintsPolled {
+    pub hints_claimed: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoverAcrossOnchainLogInput {
+    pub order_id: WorkflowOrderId,
+    pub provider_operation_id: WorkflowProviderOperationId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcrossOnchainLogRecovered {
+    pub provider_operation_id: WorkflowProviderOperationId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelTimedOutHyperliquidTradeInput {
+    pub order_id: WorkflowOrderId,
+    pub provider_operation_id: WorkflowProviderOperationId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HyperliquidTradeCancelRecorded {
+    pub provider_operation_id: WorkflowProviderOperationId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoverSingleRefundPositionInput {
+    pub order_id: WorkflowOrderId,
+    pub failed_attempt_id: WorkflowAttemptId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SingleRefundPosition {
+    pub position_kind: RecoverablePositionKind,
+    pub owning_step_id: Option<WorkflowStepId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaterializeRefundPlanInput {
+    pub order_id: WorkflowOrderId,
+    pub position: SingleRefundPosition,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefundPlanShape {
+    pub refund_attempt_id: WorkflowAttemptId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComposeRefreshedQuoteAttemptInput {
+    pub order_id: WorkflowOrderId,
+    pub stale_attempt_id: WorkflowAttemptId,
+    pub failed_step_id: WorkflowStepId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefreshedQuoteAttemptShape {
+    pub next_attempt_id: WorkflowAttemptId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaterializeRefreshedAttemptInput {
+    pub order_id: WorkflowOrderId,
+    pub refreshed_attempt: RefreshedQuoteAttemptShape,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefreshedAttemptMaterialized {
+    pub attempt_id: WorkflowAttemptId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DispatchStepProviderActionInput {
+    pub order_id: WorkflowOrderId,
+    pub attempt_id: WorkflowAttemptId,
+    pub step_id: WorkflowStepId,
+    pub step_kind: ProviderStepKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderActionDispatchShape {
+    pub provider_operation_id: WorkflowProviderOperationId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OrderWorkflowPhase {
+    WaitingForFunding,
+    Executing,
+    RefreshingQuote,
+    Refunding,
+    WaitingForManualIntervention,
+    Finalizing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OrderTerminalStatus {
+    Completed,
+    Refunded,
+    ManualInterventionRequired,
+    RefundManualInterventionRequired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RefundTerminalStatus {
+    Refunded,
+    RefundManualInterventionRequired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RefundTrigger {
+    FailedAttempt,
+    ManualRefund,
+    VaultAlreadyRefunded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StepTerminalSubStatus {
+    Completed,
+    Waiting,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProviderOperationStatus {
+    Planned,
+    Submitted,
+    WaitingExternal,
+    Completed,
+    Failed,
+    Expired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PersistenceBoundary {
+    AfterStepMarkedReadyToFire,
+    AfterStepMarkedFailed,
+    AfterExecutionStepStatusPersisted,
+    AfterProviderReceiptPersisted,
+    AfterProviderOperationStatusPersisted,
+    AfterProviderStepSettlement,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StepFailureDecision {
+    RetryNewAttempt,
+    RefreshQuote,
+    StartRefund,
+    ManualIntervention,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProviderKind {
+    Bridge,
+    Unit,
+    Exchange,
+    CustodyActionExecutor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProviderHintKind {
+    CctpAttestation,
+    AcrossFill,
+    UnitDeposit,
+    ProviderObservation,
+    HyperliquidTrade,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecoverablePositionKind {
+    FundingVault,
+    ExternalCustody,
+    InternalCustody,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProviderStepKind {
+    Refund,
+    AcrossBridge,
+    CctpBridge,
+    HyperliquidBridgeDeposit,
+    HyperliquidBridgeWithdrawal,
+    UnitDeposit,
+    UnitWithdrawal,
+    HyperliquidTrade,
+    UniversalRouterSwap,
+}
