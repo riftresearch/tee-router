@@ -328,6 +328,54 @@ pub struct RouterServerArgs {
     )]
     pub provider_health_timeout_seconds: u64,
 
+    /// Provider-operation observation hints to claim per router-worker hint pass
+    #[arg(
+        long,
+        env = "ROUTER_WORKER_PROVIDER_OPERATION_HINT_PASS_LIMIT",
+        default_value = "500"
+    )]
+    pub worker_provider_operation_hint_pass_limit: u32,
+
+    /// Order maintenance rows to process per router-worker global pass
+    #[arg(
+        long,
+        env = "ROUTER_WORKER_ORDER_MAINTENANCE_PASS_LIMIT",
+        default_value = "100"
+    )]
+    pub worker_order_maintenance_pass_limit: u32,
+
+    /// Orders to plan per router-worker global planning pass
+    #[arg(
+        long,
+        env = "ROUTER_WORKER_ORDER_PLANNING_PASS_LIMIT",
+        default_value = "100"
+    )]
+    pub worker_order_planning_pass_limit: u32,
+
+    /// Ready orders to execute per router-worker global execution pass
+    #[arg(
+        long,
+        env = "ROUTER_WORKER_ORDER_EXECUTION_PASS_LIMIT",
+        default_value = "25"
+    )]
+    pub worker_order_execution_pass_limit: u32,
+
+    /// Ready orders to execute concurrently within each router-worker execution pass
+    #[arg(
+        long,
+        env = "ROUTER_WORKER_ORDER_EXECUTION_CONCURRENCY",
+        default_value = "64"
+    )]
+    pub worker_order_execution_concurrency: u32,
+
+    /// Vault funding hints to claim per router-worker vault pass
+    #[arg(
+        long,
+        env = "ROUTER_WORKER_VAULT_FUNDING_HINT_PASS_LIMIT",
+        default_value = "100"
+    )]
+    pub worker_vault_funding_hint_pass_limit: u32,
+
     /// Coinbase unauthenticated price API base URL used by route-cost pricing refresh
     #[arg(
         long,

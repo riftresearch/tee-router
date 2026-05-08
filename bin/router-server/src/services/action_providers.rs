@@ -15,6 +15,7 @@ use crate::{
         http_body::{read_limited_response_text, response_body_error_preview},
         pricing::checked_pow10,
     },
+    telemetry,
 };
 use alloy::{
     hex,
@@ -50,7 +51,7 @@ use std::{
     pin::Pin,
     str::FromStr,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::sync::OnceCell;
 use url::Url;
@@ -1624,10 +1625,13 @@ impl UnitProvider for HyperUnitProvider {
                 validated_unit_generate_address(&gen_response, src_unit_chain, "deposit")?;
             let gen_response_json = serde_json::to_value(&gen_response)
                 .map_err(|err| format!("serialize hyperunit /gen response: {err}"))?;
+            let bitcoin_fee_budget_sats =
+                unit_deposit_bitcoin_fee_budget(&source_asset, step.source_fee_reserve.as_ref())?;
 
             let action = CustodyAction::Transfer {
                 to_address: protocol_address.clone(),
                 amount: step.amount.clone(),
+                bitcoin_fee_budget_sats,
             };
 
             let operation_request = json!({
@@ -1637,6 +1641,7 @@ impl UnitProvider for HyperUnitProvider {
                 "asset": unit_asset.as_wire_str(),
                 "dst_addr": dst_addr,
                 "amount": step.amount,
+                "source_fee_reserve": &step.source_fee_reserve,
             });
 
             Ok(ProviderExecutionIntent::CustodyActions {
@@ -1752,16 +1757,8 @@ impl UnitProvider for HyperUnitProvider {
                 })
                 .await
                 .map_err(|err| format!("hyperunit /operations preflight failed: {err}"))?;
-            let operations_before_by_destination = self
-                .client
-                .operations(UnitOperationsRequest {
-                    address: dst_addr.clone(),
-                })
-                .await
-                .map_err(|err| format!("hyperunit /operations preflight failed: {err}"))?;
             let seen_operation_fingerprints = observed_unit_operation_fingerprints(
                 &operations_before_by_protocol.operations,
-                &operations_before_by_destination.operations,
                 &protocol_address,
             );
 
@@ -1924,12 +1921,10 @@ impl UnitProvider for HyperUnitProvider {
 
 fn observed_unit_operation_fingerprints(
     protocol_operations: &[hyperunit_client::UnitOperation],
-    destination_operations: &[hyperunit_client::UnitOperation],
     protocol_address: &str,
 ) -> BTreeSet<String> {
     protocol_operations
         .iter()
-        .chain(destination_operations.iter())
         .filter(|operation| operation.matches_protocol_address(protocol_address))
         .flat_map(|operation| operation.fingerprints())
         .collect()
@@ -2338,6 +2333,7 @@ impl BridgeProvider for HyperliquidBridgeProvider {
                 action: CustodyAction::Transfer {
                     to_address: bridge_address.clone(),
                     amount: step.amount.clone(),
+                    bitcoin_fee_budget_sats: None,
                 },
                 provider_context: json!({
                     "bridge_address": bridge_address,
@@ -2616,17 +2612,39 @@ impl CctpProvider {
         tx_hash: &str,
     ) -> ProviderResult<Option<CctpMessagesResponse>> {
         let url = format!("{}/v2/messages/{source_domain}", self.base_url);
-        let response = self
+        let started = Instant::now();
+        let response = match self
             .http
             .get(&url)
             .query(&[("transactionHash", tx_hash)])
             .send()
             .await
-            .map_err(|err| format!("cctp messages request failed: {}", err.without_url()))?;
+        {
+            Ok(response) => response,
+            Err(err) => {
+                telemetry::record_venue_transport_error(
+                    "cctp",
+                    "GET",
+                    "/v2/messages/:source_domain",
+                    started.elapsed(),
+                );
+                return Err(format!(
+                    "cctp messages request failed: {}",
+                    err.without_url()
+                ));
+            }
+        };
+        let status = response.status();
+        telemetry::record_venue_http_status(
+            "cctp",
+            "GET",
+            "/v2/messages/:source_domain",
+            status.as_u16(),
+            started.elapsed(),
+        );
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        let status = response.status();
         let body = read_limited_response_text(response, CCTP_MAX_RESPONSE_BODY_BYTES)
             .await
             .map_err(|err| format!("cctp messages response body failed: {err}"))?;
@@ -2659,13 +2677,30 @@ impl CctpProvider {
             "{}/v2/burn/USDC/fees/{source_domain}/{destination_domain}",
             self.base_url
         );
-        let response = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .map_err(|err| format!("cctp burn fees request failed: {}", err.without_url()))?;
+        let started = Instant::now();
+        let response = match self.http.get(&url).send().await {
+            Ok(response) => response,
+            Err(err) => {
+                telemetry::record_venue_transport_error(
+                    "cctp",
+                    "GET",
+                    "/v2/burn/USDC/fees/:source_domain/:destination_domain",
+                    started.elapsed(),
+                );
+                return Err(format!(
+                    "cctp burn fees request failed: {}",
+                    err.without_url()
+                ));
+            }
+        };
         let status = response.status();
+        telemetry::record_venue_http_status(
+            "cctp",
+            "GET",
+            "/v2/burn/USDC/fees/:source_domain/:destination_domain",
+            status.as_u16(),
+            started.elapsed(),
+        );
         let body = read_limited_response_text(response, CCTP_MAX_RESPONSE_BODY_BYTES)
             .await
             .map_err(|err| format!("cctp burn fees response body failed: {err}"))?;
@@ -2801,16 +2836,14 @@ impl BridgeProvider for CctpProvider {
                 return Ok(None);
             }
             let source_domain = cctp_source_domain_from_request(&request.request)?;
-            let burn_tx_hash = request
-                .provider_ref
-                .as_deref()
-                .or_else(|| {
-                    request
-                        .observed_state
-                        .get("burn_tx_hash")
-                        .and_then(Value::as_str)
-                })
-                .ok_or_else(|| "cctp observe: operation missing burn tx hash".to_string())?;
+            let Some(burn_tx_hash) = request.provider_ref.as_deref().or_else(|| {
+                request
+                    .observed_state
+                    .get("burn_tx_hash")
+                    .and_then(Value::as_str)
+            }) else {
+                return Ok(None);
+            };
 
             let Some(messages_response) = self.fetch_messages(source_domain, burn_tx_hash).await?
             else {
@@ -3331,6 +3364,8 @@ pub struct UnitDepositStepRequest {
     pub dst_chain_id: String,
     pub asset_id: String,
     pub amount: String,
+    #[serde(default)]
+    pub source_fee_reserve: Option<UnitDepositSourceFeeReserve>,
     pub source_custody_vault_id: Option<Uuid>,
     #[serde(default)]
     pub hyperliquid_custody_vault_address: Option<String>,
@@ -3340,6 +3375,56 @@ impl UnitDepositStepRequest {
     pub fn from_value(value: &Value) -> ProviderResult<Self> {
         decode_step_request(value, "unit deposit step request")
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct UnitDepositSourceFeeReserve {
+    pub kind: String,
+    pub chain_id: String,
+    pub asset: String,
+    pub amount: String,
+}
+
+fn unit_deposit_bitcoin_fee_budget(
+    source_asset: &DepositAsset,
+    reserve: Option<&UnitDepositSourceFeeReserve>,
+) -> ProviderResult<Option<String>> {
+    if source_asset.chain.as_str() != "bitcoin" || !source_asset.asset.is_native() {
+        return Ok(None);
+    }
+
+    let reserve = reserve.ok_or_else(|| {
+        "bitcoin Unit deposit requires source_fee_reserve for miner fee budgeting".to_string()
+    })?;
+    if reserve.kind != "bitcoin_miner_fee" {
+        return Err(format!(
+            "bitcoin Unit deposit source_fee_reserve kind must be bitcoin_miner_fee, got {:?}",
+            reserve.kind
+        ));
+    }
+    if reserve.chain_id != "bitcoin" {
+        return Err(format!(
+            "bitcoin Unit deposit source_fee_reserve chain_id must be bitcoin, got {:?}",
+            reserve.chain_id
+        ));
+    }
+    if reserve.asset != AssetId::Native.as_str() {
+        return Err(format!(
+            "bitcoin Unit deposit source_fee_reserve asset must be native, got {:?}",
+            reserve.asset
+        ));
+    }
+    let amount = U256::from_str_radix(&reserve.amount, 10).map_err(|err| {
+        format!(
+            "bitcoin Unit deposit source_fee_reserve amount {:?} is invalid: {err}",
+            reserve.amount
+        )
+    })?;
+    if amount.is_zero() {
+        return Err("bitcoin Unit deposit source_fee_reserve amount must be positive".to_string());
+    }
+
+    Ok(Some(reserve.amount.clone()))
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -3498,7 +3583,7 @@ fn parse_decimal_to_raw_units_floor(value: &str, decimals: u8) -> ProviderResult
         .map_err(|err| format!("invalid decimal amount {value:?}: {err}"))
 }
 
-fn unit_withdrawal_minimum_raw(asset: &DepositAsset) -> U256 {
+pub(crate) fn unit_withdrawal_minimum_raw(asset: &DepositAsset) -> U256 {
     if asset.chain.as_str() == "bitcoin" && matches!(asset.asset, AssetId::Native) {
         U256::from(30_000u64)
     } else {
@@ -3888,7 +3973,7 @@ impl HyperliquidProvider {
             self.resolve_hl_entry(&input_asset, ProviderAssetCapability::ExchangeInput)?;
         let (output_token, output_decimals) =
             self.resolve_hl_entry(&output_asset, ProviderAssetCapability::ExchangeOutput)?;
-        let (base_symbol, _base_decimals, is_buy) =
+        let (base_symbol, base_decimals, is_buy) =
             classify_hl_leg(&input_token, input_decimals, &output_token, output_decimals)?;
 
         let vault_id = step.hyperliquid_custody_vault_id.ok_or_else(|| {
@@ -3981,6 +4066,25 @@ impl HyperliquidProvider {
             "limit_px": limit_px,
             "tif": Tif::Gtc.as_wire(),
             "user": vault_address,
+            "input_asset": {
+                "chain_id": step.input_asset.chain_id,
+                "asset": step.input_asset.asset,
+            },
+            "output_asset": {
+                "chain_id": step.output_asset.chain_id,
+                "asset": step.output_asset.asset,
+            },
+            "input_token": input_token,
+            "output_token": output_token,
+            "base_token": base_symbol,
+            "quote_token": HL_QUOTE_SYMBOL,
+            "amount_in": step.amount_in,
+            "amount_out": step.amount_out,
+            "input_decimals": input_decimals,
+            "output_decimals": output_decimals,
+            "base_decimals": base_decimals,
+            "quote_decimals": if is_buy { input_decimals } else { output_decimals },
+            "base_sz_decimals": base_meta.sz_decimals,
             "hyperliquid_custody_vault_id": vault_id,
             "prefund_from_withdrawable": step.prefund_from_withdrawable,
             "target_base_url": self.target_base_url.clone(),
@@ -4069,14 +4173,30 @@ impl VeloraProvider {
         }
 
         let url = format!("{}/prices", self.base_url);
-        let response = self
-            .http
-            .get(&url)
-            .query(&query)
-            .send()
-            .await
-            .map_err(|err| format!("velora price request failed: {}", err.without_url()))?;
+        let started = Instant::now();
+        let response = match self.http.get(&url).query(&query).send().await {
+            Ok(response) => response,
+            Err(err) => {
+                telemetry::record_venue_transport_error(
+                    "velora",
+                    "GET",
+                    "/prices",
+                    started.elapsed(),
+                );
+                return Err(format!(
+                    "velora price request failed: {}",
+                    err.without_url()
+                ));
+            }
+        };
         let status = response.status();
+        telemetry::record_venue_http_status(
+            "velora",
+            "GET",
+            "/prices",
+            status.as_u16(),
+            started.elapsed(),
+        );
         let body = read_limited_response_text(response, VELORA_MAX_RESPONSE_BODY_BYTES)
             .await
             .map_err(|err| format!("velora price response body failed: {err}"))?;
@@ -4153,14 +4273,30 @@ impl VeloraProvider {
             "{}/transactions/{network}?ignoreChecks=true&ignoreGasEstimate=true",
             self.base_url
         );
-        let response = self
-            .http
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|err| format!("velora transaction request failed: {}", err.without_url()))?;
+        let started = Instant::now();
+        let response = match self.http.post(&url).json(&body).send().await {
+            Ok(response) => response,
+            Err(err) => {
+                telemetry::record_venue_transport_error(
+                    "velora",
+                    "POST",
+                    "/transactions/:network",
+                    started.elapsed(),
+                );
+                return Err(format!(
+                    "velora transaction request failed: {}",
+                    err.without_url()
+                ));
+            }
+        };
         let status = response.status();
+        telemetry::record_venue_http_status(
+            "velora",
+            "POST",
+            "/transactions/:network",
+            status.as_u16(),
+            started.elapsed(),
+        );
         let response_body = read_limited_response_text(response, VELORA_MAX_RESPONSE_BODY_BYTES)
             .await
             .map_err(|err| format!("velora transaction response body failed: {err}"))?;
@@ -4487,7 +4623,7 @@ impl ExchangeProvider for HyperliquidProvider {
             // Cross-token path: one side must be USDC (HL's only quote
             // currency); the other side is the base. The planner composes
             // non-USDC↔non-USDC routes as two sequential HL trade steps.
-            let (base_symbol, _base_decimals, is_buy) =
+            let (base_symbol, base_decimals, is_buy) =
                 classify_hl_leg(&input_token, input_decimals, &output_token, output_decimals)?;
 
             let vault_id = step.hyperliquid_custody_vault_id.ok_or_else(|| {
@@ -4578,6 +4714,25 @@ impl ExchangeProvider for HyperliquidProvider {
                 "limit_px": limit_px,
                 "tif": Tif::Gtc.as_wire(),
                 "user": vault_address,
+                "input_asset": {
+                    "chain_id": step.input_asset.chain_id,
+                    "asset": step.input_asset.asset,
+                },
+                "output_asset": {
+                    "chain_id": step.output_asset.chain_id,
+                    "asset": step.output_asset.asset,
+                },
+                "input_token": input_token,
+                "output_token": output_token,
+                "base_token": base_symbol,
+                "quote_token": HL_QUOTE_SYMBOL,
+                "amount_in": step.amount_in,
+                "amount_out": step.amount_out,
+                "input_decimals": input_decimals,
+                "output_decimals": output_decimals,
+                "base_decimals": base_decimals,
+                "quote_decimals": if is_buy { input_decimals } else { output_decimals },
+                "base_sz_decimals": base_meta.sz_decimals,
                 "timeout_at_ms": timeout_at_ms,
                 "order_timeout_ms": self.order_timeout_ms,
                 "hyperliquid_custody_vault_id": vault_id,
@@ -4607,7 +4762,7 @@ impl ExchangeProvider for HyperliquidProvider {
 
     fn post_execute<'a>(
         &'a self,
-        _provider_context: &'a Value,
+        provider_context: &'a Value,
         receipts: &'a [CustodyActionReceipt],
     ) -> ProviderFuture<'a, ProviderExecutionStatePatch> {
         Box::pin(async move {
@@ -4631,15 +4786,23 @@ impl ExchangeProvider for HyperliquidProvider {
                     .get("oid")
                     .and_then(Value::as_u64)
                     .ok_or_else(|| "hyperliquid post_execute: filled missing oid".to_string())?;
+                let mut observed_state = json!({
+                    "kind": "filled",
+                    "oid": oid,
+                    "total_sz": filled.get("totalSz").cloned().unwrap_or(Value::Null),
+                    "avg_px": filled.get("avgPx").cloned().unwrap_or(Value::Null),
+                    "tx_hash": &receipt.tx_hash,
+                });
+                if let Some(amounts) = hyperliquid_filled_actual_amounts(provider_context, filled)?
+                {
+                    observed_state["amount_in"] = json!(amounts.amount_in);
+                    observed_state["amount_out"] = json!(amounts.amount_out);
+                    observed_state["base_amount"] = json!(amounts.base_amount);
+                    observed_state["quote_amount"] = json!(amounts.quote_amount);
+                }
                 return Ok(ProviderExecutionStatePatch {
                     provider_ref: Some(receipt.tx_hash.clone()),
-                    observed_state: Some(json!({
-                        "kind": "filled",
-                        "oid": oid,
-                        "total_sz": filled.get("totalSz").cloned().unwrap_or(Value::Null),
-                        "avg_px": filled.get("avgPx").cloned().unwrap_or(Value::Null),
-                        "tx_hash": &receipt.tx_hash,
-                    })),
+                    observed_state: Some(observed_state),
                     response: None,
                     status: Some(ProviderOperationStatus::Completed),
                 });
@@ -5891,6 +6054,75 @@ fn slippage_bounds_from_request(order_kind: &MarketOrderKind) -> (Option<String>
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HyperliquidFilledActualAmounts {
+    amount_in: String,
+    amount_out: String,
+    base_amount: String,
+    quote_amount: String,
+}
+
+fn hyperliquid_filled_actual_amounts(
+    provider_context: &Value,
+    filled: &Value,
+) -> ProviderResult<Option<HyperliquidFilledActualAmounts>> {
+    let Some(is_buy) = provider_context.get("is_buy").and_then(Value::as_bool) else {
+        return Ok(None);
+    };
+    let Some(total_sz) = filled.get("totalSz").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let Some(avg_px) = filled.get("avgPx").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+
+    let base_decimals = json_u8_field(provider_context, "base_decimals", "hyperliquid fill")?;
+    let quote_decimals = json_u8_field(provider_context, "quote_decimals", "hyperliquid fill")?;
+    let base_sz_decimals = json_u8_field(provider_context, "base_sz_decimals", "hyperliquid fill")?;
+    let base_raw = parse_decimal_to_raw_units(total_sz, base_decimals)
+        .map_err(|err| format!("hyperliquid fill: invalid totalSz {total_sz:?}: {err}"))?;
+    let price_raw = parse_decimal_to_raw_units(avg_px, HL_PRICE_DECIMALS)
+        .map_err(|err| format!("hyperliquid fill: invalid avgPx {avg_px:?}: {err}"))?;
+    let scales = BookWalkScales::new(base_decimals, quote_decimals, base_sz_decimals)?;
+    let quote_raw = if is_buy {
+        base_to_usdc_raw_ceil(base_raw, price_raw, scales)?
+    } else {
+        base_to_usdc_raw_floor(base_raw, price_raw, scales)?
+    };
+
+    let base_amount = base_raw.to_string();
+    let quote_amount = quote_raw.to_string();
+    let (amount_in, amount_out) = if is_buy {
+        (quote_amount.clone(), base_amount.clone())
+    } else {
+        (base_amount.clone(), quote_amount.clone())
+    };
+
+    Ok(Some(HyperliquidFilledActualAmounts {
+        amount_in,
+        amount_out,
+        base_amount,
+        quote_amount,
+    }))
+}
+
+fn json_u8_field(value: &Value, key: &'static str, context: &'static str) -> ProviderResult<u8> {
+    let raw = value.get(key).ok_or_else(|| {
+        format!("{context}: provider_context missing required numeric field {key}")
+    })?;
+    let parsed = raw
+        .as_u64()
+        .or_else(|| raw.as_str().and_then(|value| value.parse::<u64>().ok()));
+    let Some(parsed) = parsed else {
+        return Err(format!(
+            "{context}: provider_context field {key} must be a u8-compatible integer"
+        ));
+    };
+    u8::try_from(parsed).map_err(|_| {
+        format!("{context}: provider_context field {key} value {parsed} does not fit u8")
+    })
+}
+
 /// Determine the base token + direction for a cross-token HL leg. One side
 /// must be USDC (the quote); the other becomes the base. Errors if neither
 /// side is USDC — cross-token legs must pass through USDC.
@@ -6351,15 +6583,15 @@ mod hyperliquid_math_tests {
         checked_timeout_at_ms, classify_hl_leg, compute_base_sz, compute_limit_px,
         decimal_bps_string, encode_erc20_approve, format_hl_spot_price, format_hyperliquid_amount,
         hl_leg_descriptor, hyperliquid_bridge_deposit_completion_response,
-        hyperliquid_order_oid_from_observation_request, hyperliquid_order_status_provider_status,
-        observed_unit_operation_fingerprints, parse_decimal_bps_to_micros,
-        parse_decimal_to_raw_units, parse_decimal_to_raw_units_floor,
+        hyperliquid_filled_actual_amounts, hyperliquid_order_oid_from_observation_request,
+        hyperliquid_order_status_provider_status, observed_unit_operation_fingerprints,
+        parse_decimal_bps_to_micros, parse_decimal_to_raw_units, parse_decimal_to_raw_units_floor,
         seen_operation_fingerprints_from_request, set_velora_transaction_amount_constraints,
         simulate_leg, unit_operation_provider_status, unit_withdrawal_minimum_raw,
         validated_unit_generate_address, velora_slippage_bps, AcrossHttpProviderConfig,
         ActionProviderHttpOptions, ActionProviderRegistry, BridgeExecutionRequest, BridgeProvider,
-        BridgeQuoteRequest, CctpHttpProviderConfig, CctpMessagesResponse, CctpQuoteAmounts,
-        ExchangeExecutionRequest, ExchangeProvider, HyperliquidBridgeProvider,
+        BridgeQuoteRequest, CctpHttpProviderConfig, CctpMessagesResponse, CctpProvider,
+        CctpQuoteAmounts, ExchangeExecutionRequest, ExchangeProvider, HyperliquidBridgeProvider,
         HyperliquidCallNetwork, HyperliquidProvider, HyperliquidTradeAssetRef,
         HyperliquidTradeStepRequest, LimitPxInput, ProviderExecutionIntent,
         ProviderOperationObservationRequest, UniversalRouterAssetRef, VeloraHttpProviderConfig,
@@ -6472,6 +6704,33 @@ mod hyperliquid_math_tests {
         }))
         .expect("empty messages array is a valid pending response");
         assert!(empty_messages.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cctp_observe_without_burn_tx_hash_waits_for_post_execute_state() {
+        let provider = CctpProvider::new(
+            "http://localhost:1",
+            "0xcccccccccccccccccccccccccccccccccccc0001",
+            "0xcccccccccccccccccccccccccccccccccccc0002",
+            Arc::new(AssetRegistry::default()),
+        )
+        .expect("CCTP provider fixture should build");
+        let request = ProviderOperationObservationRequest {
+            operation_id: Uuid::now_v7(),
+            operation_type: ProviderOperationType::CctpBridge,
+            provider_ref: None,
+            request: json!({ "source_domain": 0 }),
+            response: json!({}),
+            observed_state: json!({}),
+            hint_evidence: json!({}),
+        };
+
+        let observation = provider
+            .observe_bridge_operation(request)
+            .await
+            .expect("missing burn hash should be a retryable waiting state");
+
+        assert!(observation.is_none());
     }
 
     fn cctp_provider_asset(provider_chain: &str, provider_asset: &str) -> ProviderAsset {
@@ -6592,9 +6851,17 @@ mod hyperliquid_math_tests {
                 }
             })),
         };
+        let provider_context = json!({
+            "is_buy": false,
+            "input_decimals": 8,
+            "output_decimals": 6,
+            "base_decimals": 8,
+            "quote_decimals": 6,
+            "base_sz_decimals": 5,
+        });
 
         let patch = provider
-            .post_execute(&json!({}), &[receipt])
+            .post_execute(&provider_context, &[receipt])
             .await
             .expect("hyperliquid post_execute succeeds");
 
@@ -6607,6 +6874,22 @@ mod hyperliquid_math_tests {
                 .and_then(|state| state.get("oid"))
                 .and_then(serde_json::Value::as_u64),
             Some(1109)
+        );
+        assert_eq!(
+            patch
+                .observed_state
+                .as_ref()
+                .and_then(|state| state.get("amount_in"))
+                .and_then(serde_json::Value::as_str),
+            Some("100000000")
+        );
+        assert_eq!(
+            patch
+                .observed_state
+                .as_ref()
+                .and_then(|state| state.get("amount_out"))
+                .and_then(serde_json::Value::as_str),
+            Some("100000000")
         );
     }
 
@@ -7059,6 +7342,60 @@ mod hyperliquid_math_tests {
         .unwrap();
 
         assert_eq!(amount_out, "72558000000");
+    }
+
+    #[test]
+    fn hyperliquid_filled_amounts_sell_use_filled_size_not_planned_amount() {
+        let provider_context = json!({
+            "is_buy": false,
+            "amount_in": "283625",
+            "amount_out": "168600000",
+            "input_decimals": 8,
+            "output_decimals": 6,
+            "base_decimals": 8,
+            "quote_decimals": 6,
+            "base_sz_decimals": 5,
+        });
+        let filled = json!({
+            "totalSz": "0.00283",
+            "avgPx": "60000",
+        });
+
+        let amounts = hyperliquid_filled_actual_amounts(&provider_context, &filled)
+            .unwrap()
+            .expect("filled amount derivation should use context");
+
+        assert_eq!(amounts.amount_in, "283000");
+        assert_eq!(amounts.amount_out, "169800000");
+        assert_eq!(amounts.base_amount, "283000");
+        assert_eq!(amounts.quote_amount, "169800000");
+    }
+
+    #[test]
+    fn hyperliquid_filled_amounts_buy_report_quote_input_and_base_output() {
+        let provider_context = json!({
+            "is_buy": true,
+            "amount_in": "168600000",
+            "amount_out": "56200000000000000",
+            "input_decimals": 6,
+            "output_decimals": 18,
+            "base_decimals": 18,
+            "quote_decimals": 6,
+            "base_sz_decimals": 4,
+        });
+        let filled = json!({
+            "totalSz": "0.0562",
+            "avgPx": "3000",
+        });
+
+        let amounts = hyperliquid_filled_actual_amounts(&provider_context, &filled)
+            .unwrap()
+            .expect("filled amount derivation should use context");
+
+        assert_eq!(amounts.amount_in, "168600000");
+        assert_eq!(amounts.amount_out, "56200000000000000");
+        assert_eq!(amounts.base_amount, "56200000000000000");
+        assert_eq!(amounts.quote_amount, "168600000");
     }
 
     #[test]
@@ -7699,7 +8036,7 @@ mod hyperliquid_math_tests {
             ..matching.clone()
         };
 
-        let fingerprints = observed_unit_operation_fingerprints(&[matching], &[other], "0xproto");
+        let fingerprints = observed_unit_operation_fingerprints(&[matching, other], "0xproto");
 
         assert!(fingerprints.contains("operationId:op-1"));
         assert!(fingerprints.contains("sourceTxHash:0xabc:0"));

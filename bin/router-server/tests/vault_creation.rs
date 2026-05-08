@@ -695,6 +695,12 @@ fn test_router_args(
         worker_route_cost_refresh_seconds: 300,
         worker_provider_health_poll_seconds: 120,
         provider_health_timeout_seconds: 10,
+        worker_provider_operation_hint_pass_limit: 500,
+        worker_order_maintenance_pass_limit: 100,
+        worker_order_planning_pass_limit: 100,
+        worker_order_execution_pass_limit: 25,
+        worker_order_execution_concurrency: 64,
+        worker_vault_funding_hint_pass_limit: 100,
         coinbase_price_api_base_url: "http://127.0.0.1:9".to_string(),
     }
 }
@@ -1077,6 +1083,7 @@ impl UnitProvider for CustodyIntentUnitProvider {
                 action: CustodyAction::Transfer {
                     to_address: self.deposit_sink.clone(),
                     amount: amount.clone(),
+                    bitcoin_fee_budget_sats: None,
                 },
                 provider_context: json!({
                     "mock_provider": "custody-intent-unit",
@@ -2347,6 +2354,14 @@ async fn drive_unit_deposit_failures_to_refund_required(
     let vault = fixture.db.vaults().get(fixture.vault_id).await.unwrap();
     assert_eq!(order.status, RouterOrderStatus::RefundRequired);
     assert_eq!(vault.status, DepositVaultStatus::RefundRequired);
+    let internal_vaults = internal_custody_vaults_for_order(&fixture.db, fixture.order_id).await;
+    assert!(
+        !internal_vaults.is_empty(),
+        "refund-required orders should retain internal custody for automatic recovery"
+    );
+    assert!(internal_vaults
+        .iter()
+        .all(|vault| vault.status == CustodyVaultStatus::Active));
 
     execution_manager
 }
@@ -6667,26 +6682,76 @@ async fn provider_operation_terminal_status_is_monotonic_against_stale_writes() 
         .unwrap();
     assert!(running_step.started_at.is_some());
 
-    let terminal_operation = OrderProviderOperation {
+    let submitted_operation = OrderProviderOperation {
         id: Uuid::now_v7(),
         order_id,
         execution_attempt_id: Some(execution_attempt.id),
         execution_step_id: Some(step.id),
         provider: "across".to_string(),
         operation_type: ProviderOperationType::AcrossBridge,
-        provider_ref: Some("terminal-monotonic-provider-ref".to_string()),
-        status: ProviderOperationStatus::Completed,
-        request: json!({ "version": "terminal-request" }),
-        response: json!({ "version": "terminal-response" }),
-        observed_state: json!({ "version": "terminal-observed" }),
+        provider_ref: None,
+        status: ProviderOperationStatus::Submitted,
+        request: json!({ "version": "submitted-request" }),
+        response: json!({ "version": "submitted-response" }),
+        observed_state: json!({ "version": "submitted-observed" }),
         created_at: now,
         updated_at: now,
     };
     let operation_id = db
         .orders()
-        .upsert_provider_operation(&terminal_operation)
+        .upsert_provider_operation(&submitted_operation)
         .await
         .unwrap();
+    let after_submitted_upsert = db
+        .orders()
+        .get_provider_operation(operation_id)
+        .await
+        .unwrap();
+    let duplicate_submitted_operation = OrderProviderOperation {
+        id: Uuid::now_v7(),
+        updated_at: now + chrono::Duration::milliseconds(500),
+        ..submitted_operation.clone()
+    };
+    let duplicate_submitted_operation_id = db
+        .orders()
+        .upsert_provider_operation(&duplicate_submitted_operation)
+        .await
+        .unwrap();
+    assert_eq!(duplicate_submitted_operation_id, operation_id);
+    let after_duplicate_submitted_upsert = db
+        .orders()
+        .get_provider_operation(operation_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        after_duplicate_submitted_upsert.updated_at, after_submitted_upsert.updated_at,
+        "unchanged provider operation upsert should not churn updated_at"
+    );
+
+    let (terminal_operation, status_update_applied) = db
+        .orders()
+        .update_provider_operation_status(
+            operation_id,
+            ProviderOperationStatus::Completed,
+            Some("terminal-monotonic-provider-ref".to_string()),
+            json!({ "version": "terminal-observed" }),
+            Some(json!({ "version": "terminal-response" })),
+            now + chrono::Duration::seconds(1),
+        )
+        .await
+        .unwrap();
+    assert!(
+        status_update_applied,
+        "non-terminal provider operation should accept completion status update"
+    );
+    assert_eq!(
+        terminal_operation.status,
+        ProviderOperationStatus::Completed
+    );
+    assert_eq!(
+        terminal_operation.provider_ref.as_deref(),
+        Some("terminal-monotonic-provider-ref")
+    );
 
     let stale_operation = OrderProviderOperation {
         id: Uuid::now_v7(),
@@ -6727,6 +6792,7 @@ async fn provider_operation_terminal_status_is_monotonic_against_stale_writes() 
         .update_provider_operation_status(
             operation_id,
             ProviderOperationStatus::WaitingExternal,
+            None,
             json!({ "version": "stale-status-observed" }),
             Some(json!({ "version": "stale-status-response" })),
             now + chrono::Duration::seconds(2),
@@ -7396,6 +7462,7 @@ async fn custody_action_executor_transfers_evm_native_from_router_vault() {
             action: CustodyAction::Transfer {
                 to_address: recipient_address.clone(),
                 amount: transfer_amount.to_string(),
+                bitcoin_fee_budget_sats: None,
             },
         })
         .await
@@ -7471,6 +7538,7 @@ async fn custody_action_executor_transfers_evm_native_from_router_vault_with_pay
             action: CustodyAction::Transfer {
                 to_address: recipient_address.clone(),
                 amount: transfer_amount.to_string(),
+                bitcoin_fee_budget_sats: None,
             },
         })
         .await
@@ -7548,6 +7616,7 @@ async fn custody_action_executor_transfers_erc20_from_router_vault_with_paymaste
             action: CustodyAction::Transfer {
                 to_address: recipient_address.clone(),
                 amount: transfer_amount.to_string(),
+                bitcoin_fee_budget_sats: None,
             },
         })
         .await
@@ -7714,6 +7783,7 @@ async fn custody_action_executor_transfers_bitcoin_native_from_router_vault() {
             action: CustodyAction::Transfer {
                 to_address: recipient_address.clone(),
                 amount: "50000".to_string(),
+                bitcoin_fee_budget_sats: None,
             },
         })
         .await
@@ -7783,6 +7853,7 @@ async fn custody_action_executor_transfers_bitcoin_native_from_mempool_funding()
             action: CustodyAction::Transfer {
                 to_address: recipient_address.clone(),
                 amount: "50000".to_string(),
+                bitcoin_fee_budget_sats: None,
             },
         })
         .await
@@ -10175,7 +10246,19 @@ async fn market_order_route_planner_reserves_bitcoin_fee_for_unit_ingress() {
         .unwrap()
         .parse::<u128>()
         .unwrap();
-    assert!(reserve > 0);
+    let expected_reserve = h
+        .chain_registry
+        .get_bitcoin(&ChainType::Bitcoin)
+        .unwrap()
+        .estimate_p2wpkh_transfer_fee_sats(1, 2)
+        .await
+        .unwrap();
+    let expected_reserve = (u128::from(expected_reserve) * 12_500).div_ceil(10_000);
+    assert_eq!(reserve, expected_reserve);
+    assert_eq!(
+        unit_leg["raw"]["source_fee_reserve"]["reserve_bps"],
+        json!(12_500)
+    );
     assert_eq!(unit_amount + reserve, 1_000_000);
     assert_eq!(unit_leg["amount_out"], json!(unit_amount.to_string()));
 
@@ -10200,6 +10283,14 @@ async fn market_order_route_planner_reserves_bitcoin_fee_for_unit_ingress() {
         Some(unit_amount_string.as_str())
     );
     assert_eq!(plan.steps[0].request["amount"], json!(unit_amount_string));
+    assert_eq!(
+        plan.steps[0].request["source_fee_reserve"]["amount"],
+        json!(reserve.to_string())
+    );
+    assert_eq!(
+        plan.steps[0].request["source_fee_reserve"]["kind"],
+        json!("bitcoin_miner_fee")
+    );
     assert_eq!(
         plan.steps[0].request["source_custody_vault_id"],
         json!(vault.id)
@@ -13645,6 +13736,25 @@ async fn refund_required_order_materializes_and_completes_automatic_refund_route
     let _forward_execution_manager =
         drive_unit_deposit_failures_to_refund_required(&fixture, "mock unit deposit unavailable")
             .await;
+    let failed_internal_vaults = fixture
+        .db
+        .orders()
+        .finalize_internal_custody_vaults(
+            fixture.order_id,
+            CustodyVaultStatus::Failed,
+            json!({
+                "lifecycle_terminal_reason": "order_refund_required",
+                "lifecycle_order_status": "refund_required",
+                "source": "legacy_refund_required_finalization_fixture",
+            }),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !failed_internal_vaults.is_empty(),
+        "fixture should simulate legacy failed internal custody"
+    );
     zero_source_deposit_vault_balance(&fixture.db, fixture.order_id, "evm:8453").await;
     let h = harness().await;
     let refund_mocks = spawn_harness_mocks(h, "evm:1").await;
@@ -13685,6 +13795,14 @@ async fn refund_required_order_materializes_and_completes_automatic_refund_route
     assert_eq!(
         refund_steps[0].step_type,
         OrderExecutionStepType::AcrossBridge
+    );
+    let reactivated_internal_vaults =
+        internal_custody_vaults_for_order(&fixture.db, fixture.order_id).await;
+    assert!(
+        reactivated_internal_vaults
+            .iter()
+            .any(|vault| vault.metadata["lifecycle_reactivated_reason"] == json!("refund_recovery")),
+        "refund route hydration should reactivate legacy-failed custody vaults instead of creating duplicates"
     );
 
     let refund_operation = fixture

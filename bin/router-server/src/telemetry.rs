@@ -1,7 +1,7 @@
 use crate::{
     models::{
         DepositVault, DepositVaultStatus, OrderExecutionStep, OrderProviderOperation,
-        OrderProviderOperationHint, RouterOrder,
+        OrderProviderOperationHint, RouterOrder, RouterOrderStatus,
     },
     protocol::{AssetId, ChainId, DepositAsset},
     services::vault_manager::VaultError,
@@ -9,6 +9,14 @@ use crate::{
 use metrics::{counter, gauge, histogram};
 use std::time::Duration;
 use tracing::info;
+
+const IN_PROGRESS_ORDER_STATUSES: [RouterOrderStatus; 5] = [
+    RouterOrderStatus::PendingFunding,
+    RouterOrderStatus::Funded,
+    RouterOrderStatus::Executing,
+    RouterOrderStatus::RefundRequired,
+    RouterOrderStatus::Refunding,
+];
 
 pub fn record_http_response(route: &str, method: &str, status: u16, duration: Duration) {
     let status_class = status_class(status);
@@ -40,6 +48,50 @@ pub fn record_db_query(operation: &'static str, success: bool, duration: Duratio
         "tee_router_db_query_duration_seconds",
         "operation" => operation,
         "status" => status,
+    )
+    .record(duration.as_secs_f64());
+}
+
+pub fn record_venue_http_status(
+    venue: &'static str,
+    method: &'static str,
+    endpoint: &'static str,
+    status: u16,
+    duration: Duration,
+) {
+    record_venue_request(venue, method, endpoint, status_class(status), duration);
+}
+
+pub fn record_venue_transport_error(
+    venue: &'static str,
+    method: &'static str,
+    endpoint: &'static str,
+    duration: Duration,
+) {
+    record_venue_request(venue, method, endpoint, "transport_error", duration);
+}
+
+fn record_venue_request(
+    venue: &'static str,
+    method: &'static str,
+    endpoint: &'static str,
+    status_class: &'static str,
+    duration: Duration,
+) {
+    counter!(
+        "tee_router_venue_requests_total",
+        "venue" => venue,
+        "method" => method,
+        "endpoint" => endpoint,
+        "status_class" => status_class,
+    )
+    .increment(1);
+    histogram!(
+        "tee_router_venue_request_duration_seconds",
+        "venue" => venue,
+        "method" => method,
+        "endpoint" => endpoint,
+        "status_class" => status_class,
     )
     .record(duration.as_secs_f64());
 }
@@ -265,6 +317,67 @@ pub fn record_worker_tick(worker: &'static str, duration: Duration) {
         "worker" => worker,
     )
     .record(duration.as_secs_f64());
+}
+
+pub fn record_worker_order_pass_summary(
+    reconciled_failed_orders: usize,
+    processed_provider_hints: usize,
+    maintenance_tasks: usize,
+    planned_orders: usize,
+    executed_orders: usize,
+) {
+    record_worker_order_pass_stage("reconciled_failed_orders", reconciled_failed_orders);
+    record_worker_order_pass_stage("processed_provider_hints", processed_provider_hints);
+    record_worker_order_pass_stage("maintenance_tasks", maintenance_tasks);
+    record_worker_order_pass_stage("planned_orders", planned_orders);
+    record_worker_order_pass_stage("executed_orders", executed_orders);
+}
+
+fn record_worker_order_pass_stage(stage: &'static str, count: usize) {
+    gauge!(
+        "tee_router_worker_order_pass_last_rows",
+        "stage" => stage,
+    )
+    .set(count as f64);
+
+    if count > 0 {
+        counter!(
+            "tee_router_worker_order_pass_rows_total",
+            "stage" => stage,
+        )
+        .increment(count as u64);
+    }
+}
+
+pub fn record_order_in_progress_queue_depth(status_counts: &[(RouterOrderStatus, u64)]) {
+    let mut total = 0_u64;
+    for status in IN_PROGRESS_ORDER_STATUSES {
+        let count = status_counts
+            .iter()
+            .find_map(|(count_status, count)| (*count_status == status).then_some(*count))
+            .unwrap_or(0);
+        total = total.saturating_add(count);
+        gauge!(
+            "tee_router_order_in_progress_queue_depth",
+            "status" => status.to_db_string(),
+        )
+        .set(count as f64);
+    }
+
+    gauge!(
+        "tee_router_order_in_progress_queue_depth",
+        "status" => "all",
+    )
+    .set(total as f64);
+}
+
+pub fn record_worker_provider_operation_hint_pass(processed_hints: usize) {
+    gauge!("tee_router_worker_provider_operation_hint_pass_last_rows").set(processed_hints as f64);
+
+    if processed_hints > 0 {
+        counter!("tee_router_worker_provider_operation_hint_pass_rows_total")
+            .increment(processed_hints as u64);
+    }
 }
 
 pub fn record_worker_lease_event(event: &'static str, status: &'static str) {

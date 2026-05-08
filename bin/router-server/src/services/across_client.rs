@@ -2,10 +2,14 @@ use alloy::primitives::{Address, U256};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::Snafu;
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 use url::Url;
 
 use super::http_body::{read_limited_response_text, response_body_error_preview};
+use crate::telemetry;
 
 pub type AcrossResult<T> = Result<T, AcrossClientError>;
 const ACROSS_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -315,15 +319,35 @@ impl AcrossClient {
         path: &str,
         query: Vec<(String, String)>,
     ) -> AcrossResult<T> {
+        let endpoint_label = across_endpoint_label(path);
         let endpoint = build_endpoint(&self.base_url, path)?;
         let builder = self
             .http
             .get(endpoint)
             .query(&query)
             .bearer_auth(&self.api_key);
-        let response = builder.send().await?;
+        let started = Instant::now();
+        let response = match builder.send().await {
+            Ok(response) => response,
+            Err(err) => {
+                telemetry::record_venue_transport_error(
+                    "across",
+                    "GET",
+                    endpoint_label,
+                    started.elapsed(),
+                );
+                return Err(err.into());
+            }
+        };
         let status = response.status();
         let body = read_limited_response_text(response, ACROSS_MAX_RESPONSE_BODY_BYTES).await?;
+        telemetry::record_venue_http_status(
+            "across",
+            "GET",
+            endpoint_label,
+            status.as_u16(),
+            started.elapsed(),
+        );
         if body.truncated {
             return Err(AcrossClientError::ResponseBodyTooLarge {
                 max_bytes: ACROSS_MAX_RESPONSE_BODY_BYTES,
@@ -340,6 +364,14 @@ impl AcrossClient {
             source,
             body: response_body_error_preview(&body),
         })
+    }
+}
+
+fn across_endpoint_label(path: &str) -> &'static str {
+    match path {
+        "/swap/approval" => "/swap/approval",
+        "/deposit/status" => "/deposit/status",
+        _ => "unknown",
     }
 }
 

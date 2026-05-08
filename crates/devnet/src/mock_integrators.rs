@@ -596,6 +596,8 @@ struct MockIntegratorState {
     unit_protocol_private_keys: Mutex<BTreeMap<String, MockUnitProtocolKey>>,
     unit_evm_rpc_urls: BTreeMap<String, String>,
     ledger: Mutex<MockIntegratorLedger>,
+    evm_unlocked_account_tx_locks: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
+    evm_native_balance_credit_locks: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
     across_deposits: Mutex<BTreeMap<AcrossDepositKey, MockAcrossDepositRecord>>,
     across_destination_credit_tx_hashes: Mutex<BTreeMap<AcrossDepositKey, String>>,
     cctp_burns: Mutex<BTreeMap<String, MockCctpBurnRecord>>,
@@ -1178,6 +1180,8 @@ impl MockIntegratorState {
             unit_protocol_private_keys: Mutex::default(),
             unit_evm_rpc_urls: config.unit_evm_rpc_urls.clone(),
             ledger: Mutex::default(),
+            evm_unlocked_account_tx_locks: Mutex::default(),
+            evm_native_balance_credit_locks: Mutex::default(),
             across_deposits: Mutex::default(),
             across_destination_credit_tx_hashes: Mutex::default(),
             cctp_burns: Mutex::default(),
@@ -2740,13 +2744,21 @@ async fn mock_across_credit_destination(
     let recipient = bytes32_to_evm_address(record.recipient);
     let output_token = bytes32_to_evm_address(record.output_token);
     if output_token == Address::ZERO {
-        mock_credit_native_on_anvil(&rpc_url, recipient, record.output_amount).await?;
+        mock_credit_native_on_anvil(state, &rpc_url, recipient, record.output_amount).await?;
         return Ok(mock_across_pending_fill_tx_ref(record));
     }
-    mock_mint_erc20_on_anvil(&rpc_url, output_token, recipient, record.output_amount).await
+    mock_mint_erc20_on_anvil(
+        state,
+        &rpc_url,
+        output_token,
+        recipient,
+        record.output_amount,
+    )
+    .await
 }
 
 async fn mock_credit_native_on_anvil(
+    state: &MockIntegratorState,
     rpc_url: &str,
     recipient: Address,
     amount: U256,
@@ -2755,6 +2767,8 @@ async fn mock_credit_native_on_anvil(
         .connect(rpc_url)
         .await
         .map_err(|err| err.to_string())?;
+    let credit_lock = evm_native_balance_credit_lock(state, rpc_url, recipient).await;
+    let _credit_guard = credit_lock.lock().await;
     let current = provider
         .get_balance(recipient)
         .await
@@ -2766,6 +2780,18 @@ async fn mock_credit_native_on_anvil(
         .map_err(|err| err.to_string())
 }
 
+async fn evm_native_balance_credit_lock(
+    state: &MockIntegratorState,
+    rpc_url: &str,
+    recipient: Address,
+) -> Arc<Mutex<()>> {
+    let mut locks = state.evm_native_balance_credit_locks.lock().await;
+    locks
+        .entry(format!("{}|{recipient:#x}", rpc_url.trim()))
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
 fn checked_native_credit_balance(current: U256, amount: U256) -> Result<U256, String> {
     current
         .checked_add(amount)
@@ -2773,6 +2799,7 @@ fn checked_native_credit_balance(current: U256, amount: U256) -> Result<U256, St
 }
 
 async fn mock_mint_erc20_on_anvil(
+    state: &MockIntegratorState,
     rpc_url: &str,
     token: Address,
     recipient: Address,
@@ -2801,6 +2828,8 @@ async fn mock_mint_erc20_on_anvil(
         .with_from(sender)
         .with_to(token)
         .with_input(calldata);
+    let tx_lock = evm_unlocked_account_tx_lock(state, rpc_url).await;
+    let _tx_guard = tx_lock.lock().await;
     let receipt = provider
         .send_transaction(tx)
         .await
@@ -2815,6 +2844,17 @@ async fn mock_mint_erc20_on_anvil(
         ));
     }
     Ok(format!("{:#x}", receipt.transaction_hash))
+}
+
+async fn evm_unlocked_account_tx_lock(
+    state: &MockIntegratorState,
+    rpc_url: &str,
+) -> Arc<Mutex<()>> {
+    let mut locks = state.evm_unlocked_account_tx_locks.lock().await;
+    locks
+        .entry(rpc_url.trim().to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
 }
 
 fn mock_across_pending_fill_tx_ref(record: &MockAcrossDepositRecord) -> String {
@@ -4495,17 +4535,19 @@ async fn complete_unit_withdrawal_after_hyperliquid_transfer(
                 state,
                 &protocol_address,
                 Some(UnitOperationObservation {
-                    source_amount,
+                    source_amount: source_amount.clone(),
                     source_tx_hash: Some(source_tx_hash),
                 }),
             )
             .await
         };
         if let Err(err) = completion_result {
-            return Err(error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("mock unit withdrawal completion failed: {err}"),
-            ));
+            tracing::warn!(
+                %protocol_address,
+                %source_amount,
+                %err,
+                "mock Unit withdrawal completion failed after Hyperliquid source transfer; preserving accepted sendAsset response"
+            );
         }
     }
     Ok(())
@@ -4804,11 +4846,13 @@ fn schedule_mock_hyperliquid_withdrawal_release(
         return;
     };
     let latency = state.hyperliquid_withdrawal_latency;
+    let state = state.clone();
     tokio::spawn(async move {
         if latency > Duration::ZERO {
             tokio::time::sleep(latency).await;
         }
         if let Err(err) = send_mock_hyperliquid_withdrawal_release(
+            state,
             &rpc_url,
             &bridge_address,
             &usdc_token_address,
@@ -4823,6 +4867,7 @@ fn schedule_mock_hyperliquid_withdrawal_release(
 }
 
 async fn send_mock_hyperliquid_withdrawal_release(
+    state: Arc<MockIntegratorState>,
     rpc_url: &str,
     bridge_address: &str,
     usdc_token_address: &str,
@@ -4842,6 +4887,7 @@ async fn send_mock_hyperliquid_withdrawal_release(
         format!("invalid hyperliquid USDC token address {usdc_token_address:?}: {err}")
     })?;
     mock_mint_erc20_on_anvil(
+        &state,
         rpc_endpoint,
         usdc_token_address,
         bridge_address,
@@ -4869,6 +4915,8 @@ async fn send_mock_hyperliquid_withdrawal_release(
         .with_from(sender)
         .with_to(bridge_address)
         .with_input(calldata);
+    let tx_lock = evm_unlocked_account_tx_lock(&state, rpc_endpoint).await;
+    let _tx_guard = tx_lock.lock().await;
     let pending = provider
         .send_transaction(tx)
         .await
@@ -6125,38 +6173,24 @@ async fn send_mock_unit_evm_withdrawal_release(
         ));
     }
 
-    let provider: DynProvider = ProviderBuilder::new()
-        .connect(&rpc_url)
+    mock_credit_native_on_anvil(state, &rpc_url, destination, amount)
         .await
-        .map_err(|err| format!("mock Unit withdrawal release connect failed: {err}"))?
-        .erased();
-    let sender = provider
-        .get_accounts()
-        .await
-        .map_err(|err| format!("mock Unit withdrawal release get_accounts failed: {err}"))?
-        .into_iter()
-        .next()
-        .ok_or_else(|| "mock Unit withdrawal release requires one unlocked account".to_string())?;
-    let tx = TransactionRequest::default()
-        .with_from(sender)
-        .with_to(destination)
-        .with_value(amount);
-    let pending = provider
-        .send_transaction(tx)
-        .await
-        .map_err(|err| format!("mock Unit withdrawal release send_transaction failed: {err}"))?;
-    let tx_hash = *pending.tx_hash();
-    let receipt = pending
-        .get_receipt()
-        .await
-        .map_err(|err| format!("mock Unit withdrawal release receipt failed: {err}"))?;
-    if receipt.status() {
-        Ok(tx_hash.to_string())
-    } else {
-        Err(format!(
-            "mock Unit withdrawal release transaction {tx_hash:#x} reverted"
-        ))
-    }
+        .map_err(|err| format!("mock Unit withdrawal release native credit failed: {err}"))?;
+
+    Ok(mock_unit_evm_withdrawal_release_tx_hash(release))
+}
+
+fn mock_unit_evm_withdrawal_release_tx_hash(release: &MockUnitEvmWithdrawalRelease) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"mock-unit-evm-withdrawal-release|");
+    hasher.update(release.protocol_address.as_bytes());
+    hasher.update(b"|");
+    hasher.update(release.dst_chain.as_wire_str().as_bytes());
+    hasher.update(b"|");
+    hasher.update(release.dst_addr.as_bytes());
+    hasher.update(b"|");
+    hasher.update(release.amount.as_bytes());
+    format!("0x{}", hex::encode(hasher.finalize()))
 }
 
 fn parse_unit_decimal_amount_to_raw(value: &str, decimals: u8) -> Result<U256, String> {
@@ -6645,6 +6679,41 @@ mod tests {
             U256::from(42_u64)
         );
         assert!(checked_native_credit_balance(U256::MAX, U256::from(1_u64)).is_err());
+    }
+
+    #[tokio::test]
+    async fn evm_unlocked_account_tx_lock_is_scoped_by_rpc_url() {
+        let state = MockIntegratorState::new(&MockIntegratorConfig::default());
+
+        let first = evm_unlocked_account_tx_lock(&state, "http://localhost:50101").await;
+        let same = evm_unlocked_account_tx_lock(&state, " http://localhost:50101 ").await;
+        let other = evm_unlocked_account_tx_lock(&state, "http://localhost:50102").await;
+
+        assert!(Arc::ptr_eq(&first, &same));
+        assert!(!Arc::ptr_eq(&first, &other));
+    }
+
+    #[tokio::test]
+    async fn evm_native_balance_credit_lock_is_scoped_by_rpc_url_and_recipient() {
+        let state = MockIntegratorState::new(&MockIntegratorConfig::default());
+        let recipient = Address::repeat_byte(0x11);
+
+        let first =
+            evm_native_balance_credit_lock(&state, "http://localhost:50101", recipient).await;
+        let same =
+            evm_native_balance_credit_lock(&state, " http://localhost:50101 ", recipient).await;
+        let other_rpc =
+            evm_native_balance_credit_lock(&state, "http://localhost:50102", recipient).await;
+        let other_recipient = evm_native_balance_credit_lock(
+            &state,
+            "http://localhost:50101",
+            Address::repeat_byte(0x22),
+        )
+        .await;
+
+        assert!(Arc::ptr_eq(&first, &same));
+        assert!(!Arc::ptr_eq(&first, &other_rpc));
+        assert!(!Arc::ptr_eq(&first, &other_recipient));
     }
 
     #[test]
@@ -7876,6 +7945,13 @@ mod tests {
         .await
         .expect("gen json");
 
+        let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+        let unlocked_sender = anvil.addresses()[0];
+        provider
+            .anvil_set_balance(unlocked_sender, U256::ZERO)
+            .await
+            .expect("zero unlocked sender balance");
+
         complete_mock_unit_operation_with_observation(
             &server.state,
             &generated.address,
@@ -7887,12 +7963,16 @@ mod tests {
         .await
         .expect("complete withdrawal");
 
-        let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
         let balance = provider
             .get_balance(recipient)
             .await
             .expect("recipient balance");
         assert_eq!(balance, U256::from(1_250_000_000_000_000_000_u128));
+        let unlocked_balance = provider
+            .get_balance(unlocked_sender)
+            .await
+            .expect("unlocked sender balance");
+        assert_eq!(unlocked_balance, U256::ZERO);
 
         let operations: UnitOperationsResponse = reqwest::get(format!(
             "{}/operations/{}",
@@ -7911,10 +7991,11 @@ mod tests {
             .as_deref()
             .expect("destination tx hash");
         assert!(tx_hash.starts_with("0x"));
+        assert_eq!(tx_hash.len(), 66);
     }
 
     #[tokio::test]
-    async fn unit_mock_eth_withdrawal_marks_failure_when_release_cannot_broadcast() {
+    async fn unit_mock_eth_withdrawal_marks_failure_when_release_cannot_credit() {
         let recipient = Address::repeat_byte(0x88);
         let server = MockIntegratorServer::spawn()
             .await

@@ -3,7 +3,7 @@ use crate::{
     db::{worker_lease_repo::WorkerLease, Database},
     runtime::BackgroundTaskResult,
     services::{
-        order_executor::OrderWorkerPassSummary,
+        order_executor::{OrderWorkerPassLimits, OrderWorkerPassSummary},
         vault_manager::{FundingHintPassSummary, RefundPassSummary},
         OrderExecutionManager, ProviderHealthPollSummary, ProviderHealthPoller,
         RouteCostRefreshSummary, RouteCostService, VaultManager,
@@ -28,10 +28,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 const DEFAULT_WORKER_LEASE_NAME: &str = "global-router-worker";
-const ORDER_EXECUTION_PASS_LIMIT: i64 = 25;
-const ORDER_WAKE_BATCH_LIMIT: usize = 25;
 const ORDER_WAKE_QUEUE_MAX_IDS: usize = 10_000;
-const VAULT_FUNDING_HINT_PASS_LIMIT: i64 = 25;
 const PROVIDER_OPERATION_HINT_CHANNEL: &str = "router_provider_operation_hints";
 const VAULT_FUNDING_HINT_CHANNEL: &str = "router_vault_funding_hints";
 const VAULT_REFUND_WAKEUP_CHANNEL: &str = "router_vault_refund_wakeups";
@@ -51,6 +48,12 @@ pub struct RouterWorkerConfig {
     pub order_execution_poll_interval: Duration,
     pub route_cost_refresh_interval: Duration,
     pub provider_health_poll_interval: Duration,
+    pub provider_operation_hint_pass_limit: i64,
+    pub order_maintenance_pass_limit: i64,
+    pub order_planning_pass_limit: i64,
+    pub order_execution_pass_limit: i64,
+    pub order_execution_concurrency: usize,
+    pub vault_funding_hint_pass_limit: i64,
 }
 
 impl fmt::Debug for RouterWorkerConfig {
@@ -74,6 +77,27 @@ impl fmt::Debug for RouterWorkerConfig {
             .field(
                 "provider_health_poll_interval",
                 &self.provider_health_poll_interval,
+            )
+            .field(
+                "provider_operation_hint_pass_limit",
+                &self.provider_operation_hint_pass_limit,
+            )
+            .field(
+                "order_maintenance_pass_limit",
+                &self.order_maintenance_pass_limit,
+            )
+            .field("order_planning_pass_limit", &self.order_planning_pass_limit)
+            .field(
+                "order_execution_pass_limit",
+                &self.order_execution_pass_limit,
+            )
+            .field(
+                "order_execution_concurrency",
+                &self.order_execution_concurrency,
+            )
+            .field(
+                "vault_funding_hint_pass_limit",
+                &self.vault_funding_hint_pass_limit,
             )
             .finish()
     }
@@ -110,6 +134,30 @@ impl RouterWorkerConfig {
             "provider health timeout seconds",
             args.provider_health_timeout_seconds,
         )?;
+        ensure_positive_count(
+            "worker provider-operation hint pass limit",
+            args.worker_provider_operation_hint_pass_limit,
+        )?;
+        ensure_positive_count(
+            "worker order maintenance pass limit",
+            args.worker_order_maintenance_pass_limit,
+        )?;
+        ensure_positive_count(
+            "worker order planning pass limit",
+            args.worker_order_planning_pass_limit,
+        )?;
+        ensure_positive_count(
+            "worker order execution pass limit",
+            args.worker_order_execution_pass_limit,
+        )?;
+        ensure_positive_count(
+            "worker order execution concurrency",
+            args.worker_order_execution_concurrency,
+        )?;
+        ensure_positive_count(
+            "worker vault funding hint pass limit",
+            args.worker_vault_funding_hint_pass_limit,
+        )?;
         if args.worker_lease_renew_seconds >= args.worker_lease_seconds {
             return Err(invalid_worker_config(
                 "worker lease renew seconds must be less than worker lease seconds",
@@ -144,7 +192,24 @@ impl RouterWorkerConfig {
             provider_health_poll_interval: Duration::from_secs(
                 args.worker_provider_health_poll_seconds,
             ),
+            provider_operation_hint_pass_limit: i64::from(
+                args.worker_provider_operation_hint_pass_limit,
+            ),
+            order_maintenance_pass_limit: i64::from(args.worker_order_maintenance_pass_limit),
+            order_planning_pass_limit: i64::from(args.worker_order_planning_pass_limit),
+            order_execution_pass_limit: i64::from(args.worker_order_execution_pass_limit),
+            order_execution_concurrency: args.worker_order_execution_concurrency as usize,
+            vault_funding_hint_pass_limit: i64::from(args.worker_vault_funding_hint_pass_limit),
         })
+    }
+
+    fn order_pass_limits(&self) -> OrderWorkerPassLimits {
+        OrderWorkerPassLimits {
+            provider_operation_hints: 0,
+            maintenance: self.order_maintenance_pass_limit,
+            planning: self.order_planning_pass_limit,
+            execution: self.order_execution_pass_limit,
+        }
     }
 }
 
@@ -186,9 +251,17 @@ impl OrderWakeQueue {
         }
     }
 
-    fn take_batch(&mut self) -> Option<OrderWorkBatch> {
-        let mut order_ids = Vec::with_capacity(ORDER_WAKE_BATCH_LIMIT);
-        while order_ids.len() < ORDER_WAKE_BATCH_LIMIT {
+    fn take_batch(&mut self, batch_limit: usize) -> Option<OrderWorkBatch> {
+        let batch_limit = batch_limit.max(1);
+        if self.global {
+            self.global = false;
+            self.queued_order_ids.clear();
+            self.order_ids.clear();
+            return Some(OrderWorkBatch::Global);
+        }
+
+        let mut order_ids = Vec::with_capacity(batch_limit);
+        while order_ids.len() < batch_limit {
             let Some(order_id) = self.order_ids.pop_front() else {
                 break;
             };
@@ -197,12 +270,7 @@ impl OrderWakeQueue {
         }
 
         if order_ids.is_empty() {
-            if self.global {
-                self.global = false;
-                Some(OrderWorkBatch::Global)
-            } else {
-                None
-            }
+            None
         } else {
             Some(OrderWorkBatch::Orders(order_ids))
         }
@@ -217,6 +285,7 @@ struct VaultWorkOutcome {
 
 type VaultTaskResult = std::result::Result<VaultWorkOutcome, String>;
 type OrderTaskResult = std::result::Result<OrderWorkerPassSummary, String>;
+type ProviderOperationHintTaskResult = std::result::Result<usize, String>;
 type RouteCostTaskResult = std::result::Result<RouteCostRefreshSummary, String>;
 type ProviderHealthTaskResult = std::result::Result<ProviderHealthPollSummary, String>;
 type QuoteCleanupTaskResult = std::result::Result<u64, String>;
@@ -263,6 +332,8 @@ pub async fn run_worker_loop(
     lease_renew_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut vault_work_poll_interval = interval(config.vault_work_poll_interval);
     vault_work_poll_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut provider_operation_hint_poll_interval = interval(config.order_execution_poll_interval);
+    provider_operation_hint_poll_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut order_execution_poll_interval = interval(config.order_execution_poll_interval);
     order_execution_poll_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut route_cost_refresh_interval = interval(config.route_cost_refresh_interval);
@@ -274,11 +345,14 @@ pub async fn run_worker_loop(
     let mut worker_listener = Some(connect_worker_listener(&config.database_url).await?);
     let mut vault_tasks: JoinSet<VaultTaskResult> = JoinSet::new();
     let mut order_execution_tasks: JoinSet<OrderTaskResult> = JoinSet::new();
+    let mut provider_operation_hint_tasks: JoinSet<ProviderOperationHintTaskResult> =
+        JoinSet::new();
     let mut route_cost_tasks: JoinSet<RouteCostTaskResult> = JoinSet::new();
     let mut provider_health_tasks: JoinSet<ProviderHealthTaskResult> = JoinSet::new();
     let mut quote_cleanup_tasks: JoinSet<QuoteCleanupTaskResult> = JoinSet::new();
     let mut order_wake_queue = OrderWakeQueue::default();
     let mut pending_vault_wakeup = false;
+    let mut pending_provider_operation_hint_wakeup = false;
     let mut pending_route_cost_refresh = false;
     let mut pending_provider_health_poll = false;
     let mut pending_quote_cleanup = false;
@@ -299,6 +373,7 @@ pub async fn run_worker_loop(
                     active_lease = Some(lease);
                     lease_renew_interval.reset();
                     vault_work_poll_interval.reset();
+                    provider_operation_hint_poll_interval.reset();
                     order_execution_poll_interval.reset();
                     route_cost_refresh_interval.reset();
                     provider_health_poll_interval.reset();
@@ -308,12 +383,22 @@ pub async fn run_worker_loop(
                         &mut order_execution_tasks,
                         order_execution_manager.clone(),
                         &mut order_wake_queue,
+                        config.order_pass_limits(),
+                        config.order_execution_concurrency,
+                    );
+                    pending_provider_operation_hint_wakeup = true;
+                    spawn_provider_operation_hint_work_if_idle(
+                        &mut provider_operation_hint_tasks,
+                        order_execution_manager.clone(),
+                        &mut pending_provider_operation_hint_wakeup,
+                        config.provider_operation_hint_pass_limit,
                     );
                     pending_vault_wakeup = true;
                     spawn_vault_work_if_idle(
                         &mut vault_tasks,
                         vault_manager.clone(),
                         &mut pending_vault_wakeup,
+                        config.vault_funding_hint_pass_limit,
                     );
                     pending_route_cost_refresh = true;
                     spawn_route_cost_refresh_if_idle(
@@ -377,11 +462,13 @@ pub async fn run_worker_loop(
                         active_lease = None;
                         abort_vault_tasks(&mut vault_tasks).await;
                         abort_order_execution_tasks(&mut order_execution_tasks).await;
+                        abort_provider_operation_hint_tasks(&mut provider_operation_hint_tasks).await;
                         abort_route_cost_tasks(&mut route_cost_tasks).await;
                         abort_provider_health_tasks(&mut provider_health_tasks).await;
                         abort_quote_cleanup_tasks(&mut quote_cleanup_tasks).await;
                         order_wake_queue = OrderWakeQueue::default();
                         pending_vault_wakeup = false;
+                        pending_provider_operation_hint_wakeup = false;
                         pending_route_cost_refresh = false;
                         pending_provider_health_poll = false;
                         pending_quote_cleanup = false;
@@ -400,6 +487,7 @@ pub async fn run_worker_loop(
                     &mut vault_tasks,
                     vault_manager.clone(),
                     &mut pending_vault_wakeup,
+                    config.vault_funding_hint_pass_limit,
                 );
             }
             _ = vault_work_poll_interval.tick(), if vault_tasks.is_empty() => {
@@ -408,6 +496,7 @@ pub async fn run_worker_loop(
                     &mut vault_tasks,
                     vault_manager.clone(),
                     &mut pending_vault_wakeup,
+                    config.vault_funding_hint_pass_limit,
                 );
             }
             _ = route_cost_refresh_interval.tick(), if route_cost_tasks.is_empty() => {
@@ -418,12 +507,23 @@ pub async fn run_worker_loop(
                     &mut pending_route_cost_refresh,
                 );
             }
+            _ = provider_operation_hint_poll_interval.tick(), if provider_operation_hint_tasks.is_empty() => {
+                pending_provider_operation_hint_wakeup = true;
+                spawn_provider_operation_hint_work_if_idle(
+                    &mut provider_operation_hint_tasks,
+                    order_execution_manager.clone(),
+                    &mut pending_provider_operation_hint_wakeup,
+                    config.provider_operation_hint_pass_limit,
+                );
+            }
             _ = order_execution_poll_interval.tick(), if order_execution_tasks.is_empty() => {
                 order_wake_queue.enqueue_global();
                 spawn_order_execution_work_if_idle(
                     &mut order_execution_tasks,
                     order_execution_manager.clone(),
                     &mut order_wake_queue,
+                    config.order_pass_limits(),
+                    config.order_execution_concurrency,
                 );
             }
             _ = provider_health_poll_interval.tick(), if provider_health_tasks.is_empty() => {
@@ -452,11 +552,12 @@ pub async fn run_worker_loop(
                         );
                         match notification.channel() {
                             PROVIDER_OPERATION_HINT_CHANNEL => {
-                                order_wake_queue.enqueue_global();
-                                spawn_order_execution_work_if_idle(
-                                    &mut order_execution_tasks,
+                                pending_provider_operation_hint_wakeup = true;
+                                spawn_provider_operation_hint_work_if_idle(
+                                    &mut provider_operation_hint_tasks,
                                     order_execution_manager.clone(),
-                                    &mut order_wake_queue,
+                                    &mut pending_provider_operation_hint_wakeup,
+                                    config.provider_operation_hint_pass_limit,
                                 );
                             }
                             VAULT_FUNDING_HINT_CHANNEL | VAULT_REFUND_WAKEUP_CHANNEL => {
@@ -465,6 +566,7 @@ pub async fn run_worker_loop(
                                     &mut vault_tasks,
                                     vault_manager.clone(),
                                     &mut pending_vault_wakeup,
+                                    config.vault_funding_hint_pass_limit,
                                 );
                             }
                             _ => {}
@@ -500,12 +602,15 @@ pub async fn run_worker_loop(
                     &mut order_execution_tasks,
                     order_execution_manager.clone(),
                     &mut order_wake_queue,
+                    config.order_pass_limits(),
+                    config.order_execution_concurrency,
                 );
                 next_refund_due_at = refresh_next_refund_due_at(&db).await?;
                 spawn_vault_work_if_idle(
                     &mut vault_tasks,
                     vault_manager.clone(),
                     &mut pending_vault_wakeup,
+                    config.vault_funding_hint_pass_limit,
                 );
             }
             order_execution_result = order_execution_tasks.join_next(), if !order_execution_tasks.is_empty() => {
@@ -517,6 +622,29 @@ pub async fn run_worker_loop(
                     &mut order_execution_tasks,
                     order_execution_manager.clone(),
                     &mut order_wake_queue,
+                    config.order_pass_limits(),
+                    config.order_execution_concurrency,
+                );
+            }
+            provider_operation_hint_result = provider_operation_hint_tasks.join_next(), if !provider_operation_hint_tasks.is_empty() => {
+                let processed_provider_hints =
+                    handle_provider_operation_hint_task_result(provider_operation_hint_result)?;
+                if processed_provider_hints > 0 {
+                    pending_provider_operation_hint_wakeup = true;
+                    order_wake_queue.enqueue_global();
+                    spawn_order_execution_work_if_idle(
+                        &mut order_execution_tasks,
+                        order_execution_manager.clone(),
+                        &mut order_wake_queue,
+                        config.order_pass_limits(),
+                        config.order_execution_concurrency,
+                    );
+                }
+                spawn_provider_operation_hint_work_if_idle(
+                    &mut provider_operation_hint_tasks,
+                    order_execution_manager.clone(),
+                    &mut pending_provider_operation_hint_wakeup,
+                    config.provider_operation_hint_pass_limit,
                 );
             }
             route_cost_result = route_cost_tasks.join_next(), if !route_cost_tasks.is_empty() => {
@@ -644,10 +772,11 @@ fn spawn_vault_work_if_idle(
     vault_tasks: &mut JoinSet<VaultTaskResult>,
     vault_manager: Arc<VaultManager>,
     pending_vault_wakeup: &mut bool,
+    funding_hint_pass_limit: i64,
 ) {
     if vault_tasks.is_empty() && *pending_vault_wakeup {
         *pending_vault_wakeup = false;
-        vault_tasks.spawn(run_vault_work_pass(vault_manager));
+        vault_tasks.spawn(run_vault_work_pass(vault_manager, funding_hint_pass_limit));
     }
 }
 
@@ -655,14 +784,44 @@ fn spawn_order_execution_work_if_idle(
     order_execution_tasks: &mut JoinSet<OrderTaskResult>,
     order_execution_manager: Arc<OrderExecutionManager>,
     order_wake_queue: &mut OrderWakeQueue,
+    pass_limits: OrderWorkerPassLimits,
+    execution_concurrency: usize,
 ) {
     if order_execution_tasks.is_empty() {
-        if let Some(batch) = order_wake_queue.take_batch() {
+        if let Some(batch) = order_wake_queue.take_batch(order_wake_batch_limit(pass_limits)) {
             order_execution_tasks.spawn(run_order_execution_work_batch(
                 order_execution_manager,
                 batch,
+                pass_limits,
+                execution_concurrency,
             ));
         }
+    }
+}
+
+fn order_wake_batch_limit(pass_limits: OrderWorkerPassLimits) -> usize {
+    let limit = pass_limits
+        .maintenance
+        .max(pass_limits.planning)
+        .max(pass_limits.execution)
+        .max(1);
+    usize::try_from(limit)
+        .unwrap_or(ORDER_WAKE_QUEUE_MAX_IDS)
+        .min(ORDER_WAKE_QUEUE_MAX_IDS)
+}
+
+fn spawn_provider_operation_hint_work_if_idle(
+    provider_operation_hint_tasks: &mut JoinSet<ProviderOperationHintTaskResult>,
+    order_execution_manager: Arc<OrderExecutionManager>,
+    pending_provider_operation_hint_wakeup: &mut bool,
+    pass_limit: i64,
+) {
+    if provider_operation_hint_tasks.is_empty() && *pending_provider_operation_hint_wakeup {
+        *pending_provider_operation_hint_wakeup = false;
+        provider_operation_hint_tasks.spawn(run_provider_operation_hint_pass(
+            order_execution_manager,
+            pass_limit,
+        ));
     }
 }
 
@@ -699,10 +858,13 @@ fn spawn_quote_cleanup_if_idle(
     }
 }
 
-async fn run_vault_work_pass(vault_manager: Arc<VaultManager>) -> VaultTaskResult {
+async fn run_vault_work_pass(
+    vault_manager: Arc<VaultManager>,
+    funding_hint_pass_limit: i64,
+) -> VaultTaskResult {
     let started = Instant::now();
-    let funding_hints = vault_manager
-        .process_funding_hints_detailed(VAULT_FUNDING_HINT_PASS_LIMIT)
+    let mut funding_hints = vault_manager
+        .process_funding_hints_detailed(funding_hint_pass_limit)
         .await
         .map_err(|err| err.to_string())?;
     if funding_hints.processed > 0 {
@@ -711,6 +873,19 @@ async fn run_vault_work_pass(vault_manager: Arc<VaultManager>) -> VaultTaskResul
             funded_orders = funding_hints.funded_order_ids.len(),
             "Router worker processed vault funding hints"
         );
+    }
+    let balance_reconciled_order_ids = vault_manager
+        .reconcile_pending_funding_balances(funding_hint_pass_limit)
+        .await
+        .map_err(|err| err.to_string())?;
+    if !balance_reconciled_order_ids.is_empty() {
+        info!(
+            funded_orders = balance_reconciled_order_ids.len(),
+            "Router worker reconciled vault funding balances"
+        );
+        funding_hints
+            .funded_order_ids
+            .extend(balance_reconciled_order_ids);
     }
     let refunds = vault_manager.process_refund_pass().await;
     if refunds.timeout_claimed > 0 || refunds.retry_claimed > 0 {
@@ -731,16 +906,20 @@ async fn run_vault_work_pass(vault_manager: Arc<VaultManager>) -> VaultTaskResul
 async fn run_order_execution_work_batch(
     order_execution_manager: Arc<OrderExecutionManager>,
     batch: OrderWorkBatch,
+    pass_limits: OrderWorkerPassLimits,
+    execution_concurrency: usize,
 ) -> OrderTaskResult {
     let started = Instant::now();
     let summary = match batch {
         OrderWorkBatch::Global => {
             order_execution_manager
-                .process_worker_pass(ORDER_EXECUTION_PASS_LIMIT)
+                .process_worker_pass_with_limits_and_concurrency(pass_limits, execution_concurrency)
                 .await
         }
         OrderWorkBatch::Orders(order_ids) => {
-            order_execution_manager.process_order_ids(&order_ids).await
+            order_execution_manager
+                .process_order_ids_with_concurrency(&order_ids, execution_concurrency)
+                .await
         }
     }
     .map_err(|err| err.to_string())?;
@@ -754,8 +933,44 @@ async fn run_order_execution_work_batch(
             "Router worker processed orders"
         );
     }
+    telemetry::record_worker_order_pass_summary(
+        summary.reconciled_failed_orders,
+        summary.processed_provider_hints,
+        summary.maintenance_tasks,
+        summary.planned_orders,
+        summary.executed_orders,
+    );
+    if let Err(err) = order_execution_manager
+        .sample_order_in_progress_queue_depth()
+        .await
+    {
+        warn!(
+            error = %err,
+            "Router worker failed to sample in-progress order queue depth"
+        );
+    }
     telemetry::record_worker_tick("order_executor", started.elapsed());
     Ok(summary)
+}
+
+async fn run_provider_operation_hint_pass(
+    order_execution_manager: Arc<OrderExecutionManager>,
+    pass_limit: i64,
+) -> ProviderOperationHintTaskResult {
+    let started = Instant::now();
+    let processed_provider_hints = order_execution_manager
+        .process_provider_operation_hints(pass_limit)
+        .await
+        .map_err(|err| err.to_string())?;
+    if processed_provider_hints > 0 {
+        info!(
+            processed_provider_hints,
+            "Router worker processed provider-operation hints"
+        );
+    }
+    telemetry::record_worker_provider_operation_hint_pass(processed_provider_hints);
+    telemetry::record_worker_tick("provider_operation_hints", started.elapsed());
+    Ok(processed_provider_hints)
 }
 
 async fn run_route_cost_refresh(route_costs: Arc<RouteCostService>) -> RouteCostTaskResult {
@@ -817,6 +1032,19 @@ fn handle_order_execution_task_result(
     }
 }
 
+fn handle_provider_operation_hint_task_result(
+    result: Option<std::result::Result<ProviderOperationHintTaskResult, JoinError>>,
+) -> std::result::Result<usize, String> {
+    match result {
+        Some(Ok(Ok(processed))) => Ok(processed),
+        Some(Ok(Err(error))) => Err(format!("provider-operation hint pass failed: {error}")),
+        Some(Err(error)) => Err(format!(
+            "provider-operation hint pass panicked or was cancelled: {error}"
+        )),
+        None => Err("provider-operation hint task set terminated unexpectedly".to_string()),
+    }
+}
+
 fn handle_route_cost_task_result(
     result: Option<std::result::Result<RouteCostTaskResult, JoinError>>,
 ) -> std::result::Result<RouteCostRefreshSummary, String> {
@@ -862,6 +1090,13 @@ async fn abort_vault_tasks(vault_tasks: &mut JoinSet<VaultTaskResult>) {
 async fn abort_order_execution_tasks(order_execution_tasks: &mut JoinSet<OrderTaskResult>) {
     order_execution_tasks.abort_all();
     while order_execution_tasks.join_next().await.is_some() {}
+}
+
+async fn abort_provider_operation_hint_tasks(
+    provider_operation_hint_tasks: &mut JoinSet<ProviderOperationHintTaskResult>,
+) {
+    provider_operation_hint_tasks.abort_all();
+    while provider_operation_hint_tasks.join_next().await.is_some() {}
 }
 
 async fn abort_route_cost_tasks(route_cost_tasks: &mut JoinSet<RouteCostTaskResult>) {
@@ -912,6 +1147,15 @@ fn ensure_positive_seconds(name: &str, seconds: u64) -> Result<()> {
     Ok(())
 }
 
+fn ensure_positive_count(name: &str, count: u32) -> Result<()> {
+    if count == 0 {
+        return Err(invalid_worker_config(&format!(
+            "{name} must be greater than zero"
+        )));
+    }
+    Ok(())
+}
+
 fn normalize_worker_identifier(name: &str, value: &str) -> Result<String> {
     let value = value.trim();
     if value.is_empty() {
@@ -950,7 +1194,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn order_wake_queue_dedupes_order_ids_and_prioritizes_targeted_work() {
+    fn order_wake_queue_dedupes_order_ids_without_global_work() {
         let first = Uuid::now_v7();
         let second = Uuid::now_v7();
         let mut queue = OrderWakeQueue::default();
@@ -958,16 +1202,28 @@ mod tests {
         queue.enqueue_order(first);
         queue.enqueue_order(first);
         queue.enqueue_order(second);
-        queue.enqueue_global();
 
-        match queue.take_batch() {
+        match queue.take_batch(25) {
             Some(OrderWorkBatch::Orders(order_ids)) => {
                 assert_eq!(order_ids, vec![first, second]);
             }
             other => panic!("expected deduped order batch, got {other:?}"),
         }
-        assert!(matches!(queue.take_batch(), Some(OrderWorkBatch::Global)));
-        assert!(queue.take_batch().is_none());
+        assert!(queue.take_batch(25).is_none());
+    }
+
+    #[test]
+    fn order_wake_queue_global_work_supersedes_targeted_ids() {
+        let first = Uuid::now_v7();
+        let second = Uuid::now_v7();
+        let mut queue = OrderWakeQueue::default();
+
+        queue.enqueue_order(first);
+        queue.enqueue_order(second);
+        queue.enqueue_global();
+
+        assert!(matches!(queue.take_batch(25), Some(OrderWorkBatch::Global)));
+        assert!(queue.take_batch(25).is_none());
     }
 
     #[test]
@@ -995,6 +1251,12 @@ mod tests {
             order_execution_poll_interval: Duration::from_secs(5),
             route_cost_refresh_interval: Duration::from_secs(300),
             provider_health_poll_interval: Duration::from_secs(120),
+            provider_operation_hint_pass_limit: 500,
+            order_maintenance_pass_limit: 100,
+            order_planning_pass_limit: 100,
+            order_execution_pass_limit: 25,
+            order_execution_concurrency: 64,
+            vault_funding_hint_pass_limit: 100,
         };
 
         let rendered = format!("{config:?}");
@@ -1005,29 +1267,33 @@ mod tests {
     }
 
     #[test]
-    fn order_wake_queue_retains_global_work_while_draining_targeted_batches() {
+    fn order_wake_queue_prioritizes_global_work_over_targeted_batches() {
         let mut queue = OrderWakeQueue::default();
-        let order_ids = (0..(ORDER_WAKE_BATCH_LIMIT + 1))
+        let batch_limit = 4;
+        let order_ids = (0..(batch_limit + 1))
             .map(|_| Uuid::now_v7())
             .collect::<Vec<_>>();
 
         queue.enqueue_global();
         queue.enqueue_orders(order_ids.clone());
 
-        match queue.take_batch() {
-            Some(OrderWorkBatch::Orders(batch)) => {
-                assert_eq!(batch, order_ids[..ORDER_WAKE_BATCH_LIMIT]);
-            }
-            other => panic!("expected first targeted batch, got {other:?}"),
-        }
-        match queue.take_batch() {
-            Some(OrderWorkBatch::Orders(batch)) => {
-                assert_eq!(batch, order_ids[ORDER_WAKE_BATCH_LIMIT..]);
-            }
-            other => panic!("expected second targeted batch, got {other:?}"),
-        }
-        assert!(matches!(queue.take_batch(), Some(OrderWorkBatch::Global)));
-        assert!(queue.take_batch().is_none());
+        assert!(matches!(
+            queue.take_batch(batch_limit),
+            Some(OrderWorkBatch::Global)
+        ));
+        assert!(queue.take_batch(batch_limit).is_none());
+    }
+
+    #[test]
+    fn order_wake_batch_limit_tracks_configured_order_pass_limits() {
+        let limits = OrderWorkerPassLimits {
+            provider_operation_hints: 5000,
+            maintenance: 1000,
+            planning: 64,
+            execution: 256,
+        };
+
+        assert_eq!(order_wake_batch_limit(limits), 1000);
     }
 
     #[test]
@@ -1039,8 +1305,8 @@ mod tests {
         }
         queue.enqueue_order(Uuid::now_v7());
 
-        assert!(matches!(queue.take_batch(), Some(OrderWorkBatch::Global)));
-        assert!(queue.take_batch().is_none());
+        assert!(matches!(queue.take_batch(25), Some(OrderWorkBatch::Global)));
+        assert!(queue.take_batch(25).is_none());
     }
 
     #[test]

@@ -1382,6 +1382,7 @@ struct UnitDepositRequestSpec<'a> {
     unit_ingress_asset: &'a DepositAsset,
     unit_output_asset: &'a DepositAsset,
     expected_amount: String,
+    source_fee_reserve: Option<Value>,
     source_custody_vault_id: Option<Uuid>,
     source_custody_vault_role: Option<String>,
     revert_custody_vault_id: Option<Uuid>,
@@ -1403,6 +1404,7 @@ fn unit_deposit_request(spec: UnitDepositRequestSpec<'_>) -> serde_json::Value {
         "output_chain_id": spec.unit_output_asset.chain.as_str(),
         "output_asset": spec.unit_output_asset.asset.as_str(),
         "amount": spec.expected_amount,
+        "source_fee_reserve": spec.source_fee_reserve,
         "source_custody_vault_id": spec.source_custody_vault_id,
         "source_custody_vault_role": spec.source_custody_vault_role,
         "revert_custody_vault_id": spec.revert_custody_vault_id,
@@ -2184,6 +2186,7 @@ fn unit_deposit_step(
             unit_ingress_asset: &transition.input.asset,
             unit_output_asset: &output_asset,
             expected_amount,
+            source_fee_reserve: leg.raw.get("source_fee_reserve").cloned(),
             source_custody_vault_id: if source_role.is_none() {
                 Some(source_vault.id)
             } else {

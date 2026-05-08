@@ -1,3 +1,4 @@
+use super::bitcoin_funding::observed_bitcoin_outpoint;
 use crate::{
     db::Database,
     error::RouterServerError,
@@ -15,10 +16,10 @@ use crate::{
     protocol::{backend_chain_for_id, AssetId, ChainId, DepositAsset},
     services::{
         action_providers::{
-            ActionProviderRegistry, BridgeExecutionRequest, BridgeProvider, BridgeQuote,
-            BridgeQuoteRequest, ExchangeExecutionRequest, ExchangeProvider, ExchangeQuote,
-            ExchangeQuoteRequest, ProviderExecutionIntent, ProviderExecutionState,
-            ProviderExecutionStatePatch, ProviderOperationObservation,
+            unit_withdrawal_minimum_raw, ActionProviderRegistry, BridgeExecutionRequest,
+            BridgeProvider, BridgeQuote, BridgeQuoteRequest, ExchangeExecutionRequest,
+            ExchangeProvider, ExchangeQuote, ExchangeQuoteRequest, ProviderExecutionIntent,
+            ProviderExecutionState, ProviderExecutionStatePatch, ProviderOperationObservation,
             ProviderOperationObservationRequest, UnitDepositStepRequest, UnitProvider,
             UnitWithdrawalStepRequest,
         },
@@ -49,7 +50,12 @@ use crate::{
     },
     telemetry,
 };
-use alloy::primitives::U256;
+use alloy::{
+    primitives::{Address, FixedBytes, U256},
+    rpc::types::Filter,
+    sol,
+    sol_types::SolEvent,
+};
 use async_trait::async_trait;
 use chains::{ChainRegistry, UserDepositCandidateStatus};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -60,8 +66,33 @@ use router_primitives::{ChainType, Currency, TokenIdentifier};
 use serde_json::{json, Value};
 use snafu::Snafu;
 use std::{collections::HashMap, str::FromStr, sync::Arc};
-use tracing::warn;
+use tokio::task::JoinSet;
+use tracing::{debug, warn};
 use uuid::Uuid;
+
+sol! {
+    event FundsDeposited(
+        bytes32 inputToken,
+        bytes32 outputToken,
+        uint256 inputAmount,
+        uint256 outputAmount,
+        uint256 indexed destinationChainId,
+        uint256 indexed depositId,
+        uint32 quoteTimestamp,
+        uint32 fillDeadline,
+        uint32 exclusivityDeadline,
+        bytes32 indexed depositor,
+        bytes32 recipient,
+        bytes32 exclusiveRelayer,
+        bytes message
+    );
+}
+
+#[derive(Debug, Clone)]
+struct RecoveredAcrossDeposit {
+    deposit_id: String,
+    deposit_tx_hash: String,
+}
 
 #[derive(Debug, Snafu)]
 pub enum OrderExecutionError {
@@ -225,6 +256,26 @@ impl OrderWorkerPassSummary {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrderWorkerPassLimits {
+    pub provider_operation_hints: i64,
+    pub maintenance: i64,
+    pub planning: i64,
+    pub execution: i64,
+}
+
+impl OrderWorkerPassLimits {
+    #[must_use]
+    pub fn uniform(limit: i64) -> Self {
+        Self {
+            provider_operation_hints: limit,
+            maintenance: limit,
+            planning: limit,
+            execution: limit,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ProviderOperationStatusUpdate {
     pub provider_operation_id: Option<Uuid>,
@@ -337,8 +388,14 @@ struct RefundSourcePosition {
     amount: String,
 }
 
+enum RefundPlanCandidate {
+    FundingVault(RefundSourcePosition),
+    Materialized { plan: RefundMaterializedRoutePlan },
+}
+
 enum ProviderOperationHintVerification {
     StatusUpdate(ProviderOperationStatusUpdate),
+    Ignored { reason: String },
 }
 
 #[async_trait]
@@ -366,7 +423,9 @@ const REFUND_PROVIDER_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 const REFUND_HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW: u64 = 1_000_000;
 const STALE_RUNNING_STEP_RECOVERY_AFTER: ChronoDuration = ChronoDuration::minutes(5);
 const REFRESH_PROVIDER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const MAX_STALE_QUOTE_REFRESHES_PER_ORDER_EXECUTION: usize = 8;
 const REFRESH_HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW: u64 = 1_000_000;
+const REFRESH_BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_BPS: u64 = 12_500;
 const REFRESH_PROBE_MAX_AMOUNT_IN: &str = "340282366920938463463374607431768211455";
 
 #[async_trait]
@@ -492,56 +551,86 @@ impl OrderExecutionManager {
         self
     }
 
+    pub async fn sample_order_in_progress_queue_depth(&self) -> OrderExecutionResult<()> {
+        let counts = self
+            .db
+            .orders()
+            .count_in_progress_orders_by_status()
+            .await
+            .map_err(|source| OrderExecutionError::Database { source })?;
+        let status_counts = counts
+            .iter()
+            .map(|count| (count.status, count.order_count))
+            .collect::<Vec<_>>();
+        telemetry::record_order_in_progress_queue_depth(&status_counts);
+        Ok(())
+    }
+
     pub async fn process_worker_pass(
         &self,
         limit: i64,
     ) -> OrderExecutionResult<OrderWorkerPassSummary> {
-        let reconciled_failed_orders = self.reconcile_failed_orders(limit).await?;
-        let processed_provider_hints = self.process_provider_operation_hints(limit).await?;
+        self.process_worker_pass_with_limits(OrderWorkerPassLimits::uniform(limit))
+            .await
+    }
+
+    pub async fn process_worker_pass_with_limits(
+        &self,
+        limits: OrderWorkerPassLimits,
+    ) -> OrderExecutionResult<OrderWorkerPassSummary> {
+        self.process_worker_pass_with_limits_and_concurrency(limits, 1)
+            .await
+    }
+
+    pub async fn process_worker_pass_with_limits_and_concurrency(
+        &self,
+        limits: OrderWorkerPassLimits,
+        execution_concurrency: usize,
+    ) -> OrderExecutionResult<OrderWorkerPassSummary> {
+        let reconciled_failed_orders = self.reconcile_failed_orders(limits.maintenance).await?;
+        let processed_provider_hints = self
+            .process_provider_operation_hints(limits.provider_operation_hints)
+            .await?;
         let terminal_provider_recoveries = self
-            .process_terminal_provider_operation_recovery(limit)
+            .process_terminal_provider_operation_recovery(limits.maintenance)
             .await?;
-        let stale_running_step_recoveries = self.process_stale_running_step_recovery(limit).await?;
+        let stale_running_step_recoveries = self
+            .process_stale_running_step_recovery(limits.maintenance)
+            .await?;
         let completed_order_finalizations = self
-            .process_completed_orders_pending_finalization(limit)
+            .process_completed_orders_pending_finalization(limits.maintenance)
             .await?;
-        let direct_refund_finalizations =
-            self.process_direct_refund_finalization_pass(limit).await?;
+        let direct_refund_finalizations = self
+            .process_direct_refund_finalization_pass(limits.maintenance)
+            .await?;
         let refunded_funding_vault_finalizations = self
-            .process_refunded_funding_vault_finalization_pass(limit)
+            .process_refunded_funding_vault_finalization_pass(limits.maintenance)
             .await?;
-        let refund_plans = self.process_refund_planning_pass(limit).await?;
+        let refund_plans = self
+            .process_refund_planning_pass(limits.maintenance)
+            .await?;
+        let manual_refund_order_alignments = self
+            .process_manual_refund_order_alignment_pass(limits.maintenance)
+            .await?;
         let manual_refund_alignments = self
-            .process_manual_refund_vault_alignment_pass(limit)
+            .process_manual_refund_vault_alignment_pass(limits.maintenance)
             .await?;
-        let materialized = self.process_planning_pass(limit).await?;
+        let materialized = self.process_planning_pass(limits.planning).await?;
         let executable_orders = self
             .db
             .orders()
-            .get_market_orders_ready_for_execution(limit)
+            .get_market_orders_ready_for_execution(limits.execution)
             .await
             .map_err(|source| OrderExecutionError::Database { source })?;
-        let mut executed_orders = 0_usize;
-        for order in executable_orders {
-            match self.execute_materialized_order(order.id).await {
-                Ok(Some(_)) => executed_orders += 1,
-                Ok(None) => {
-                    // No-op: another worker drove this order (or it was already
-                    // terminal). Not counted as "executed" to avoid over-reporting
-                    // under concurrent worker passes.
-                }
-                Err(err) => {
-                    warn!(
-                        order_id = %order.id,
-                        error = %err,
-                        "order execution failed in worker pass",
-                    );
-                }
-            }
-        }
-        let terminal_custody_finalizations =
-            self.process_terminal_internal_custody_vaults(limit).await?;
-        let released_custody_sweeps = self.process_released_internal_custody_sweeps(limit).await?;
+        let executed_orders = self
+            .execute_ready_orders(executable_orders, execution_concurrency)
+            .await;
+        let terminal_custody_finalizations = self
+            .process_terminal_internal_custody_vaults(limits.maintenance)
+            .await?;
+        let released_custody_sweeps = self
+            .process_released_internal_custody_sweeps(limits.maintenance)
+            .await?;
 
         Ok(OrderWorkerPassSummary {
             reconciled_failed_orders,
@@ -552,6 +641,7 @@ impl OrderExecutionManager {
                 + direct_refund_finalizations
                 + refunded_funding_vault_finalizations
                 + refund_plans
+                + manual_refund_order_alignments
                 + manual_refund_alignments
                 + terminal_custody_finalizations
                 + released_custody_sweeps,
@@ -560,24 +650,131 @@ impl OrderExecutionManager {
         })
     }
 
+    async fn execute_ready_orders(
+        &self,
+        executable_orders: Vec<RouterOrder>,
+        execution_concurrency: usize,
+    ) -> usize {
+        let execution_concurrency = execution_concurrency.max(1);
+        let mut tasks = JoinSet::new();
+        let mut executed_orders = 0_usize;
+
+        for order in executable_orders {
+            while tasks.len() >= execution_concurrency {
+                executed_orders += Self::join_ready_order_execution(&mut tasks).await;
+            }
+
+            let manager = self.clone();
+            let order_id = order.id;
+            tasks.spawn(async move {
+                let result = manager
+                    .execute_materialized_order(order_id)
+                    .await
+                    .map(|outcome| outcome.is_some())
+                    .map_err(|err| err.to_string());
+                (order_id, result)
+            });
+        }
+
+        while !tasks.is_empty() {
+            executed_orders += Self::join_ready_order_execution(&mut tasks).await;
+        }
+
+        executed_orders
+    }
+
+    async fn join_ready_order_execution(
+        tasks: &mut JoinSet<(Uuid, std::result::Result<bool, String>)>,
+    ) -> usize {
+        let Some(result) = tasks.join_next().await else {
+            return 0;
+        };
+
+        match result {
+            Ok((_, Ok(true))) => 1,
+            Ok((_, Ok(false))) => 0,
+            Ok((order_id, Err(err))) => {
+                warn!(
+                    order_id = %order_id,
+                    error = %err,
+                    "order execution failed in worker pass",
+                );
+                0
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "order execution task failed in worker pass",
+                );
+                0
+            }
+        }
+    }
+
     pub async fn process_order_ids(
         &self,
         order_ids: &[Uuid],
     ) -> OrderExecutionResult<OrderWorkerPassSummary> {
+        self.process_order_ids_with_concurrency(order_ids, 1).await
+    }
+
+    pub async fn process_order_ids_with_concurrency(
+        &self,
+        order_ids: &[Uuid],
+        execution_concurrency: usize,
+    ) -> OrderExecutionResult<OrderWorkerPassSummary> {
+        let execution_concurrency = execution_concurrency.max(1);
+        let mut tasks = JoinSet::new();
         let mut summary = OrderWorkerPassSummary::default();
+
         for order_id in order_ids {
-            match self.process_order_work(*order_id).await {
-                Ok(order_summary) => summary.add(order_summary),
-                Err(err) => {
-                    warn!(
-                        order_id = %order_id,
-                        error = %err,
-                        "order-specific execution wakeup failed",
-                    );
-                }
+            while tasks.len() >= execution_concurrency {
+                summary.add(Self::join_order_work_task(&mut tasks).await);
+            }
+
+            let manager = self.clone();
+            let order_id = *order_id;
+            tasks.spawn(async move {
+                let result = manager
+                    .process_order_work(order_id)
+                    .await
+                    .map_err(|err| err.to_string());
+                (order_id, result)
+            });
+        }
+
+        while !tasks.is_empty() {
+            summary.add(Self::join_order_work_task(&mut tasks).await);
+        }
+
+        Ok(summary)
+    }
+
+    async fn join_order_work_task(
+        tasks: &mut JoinSet<(Uuid, std::result::Result<OrderWorkerPassSummary, String>)>,
+    ) -> OrderWorkerPassSummary {
+        let Some(result) = tasks.join_next().await else {
+            return OrderWorkerPassSummary::default();
+        };
+
+        match result {
+            Ok((_, Ok(summary))) => summary,
+            Ok((order_id, Err(err))) => {
+                warn!(
+                    order_id = %order_id,
+                    error = %err,
+                    "order-specific execution wakeup failed",
+                );
+                OrderWorkerPassSummary::default()
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "order-specific execution task failed",
+                );
+                OrderWorkerPassSummary::default()
             }
         }
-        Ok(summary)
     }
 
     async fn process_order_work(
@@ -1031,6 +1228,80 @@ impl OrderExecutionManager {
             }
         }
         Ok(planned)
+    }
+
+    async fn process_manual_refund_order_alignment_pass(
+        &self,
+        limit: i64,
+    ) -> OrderExecutionResult<usize> {
+        let orders = self
+            .db
+            .orders()
+            .find_orders_with_manual_refund_funding_vault(limit)
+            .await
+            .map_err(|source| OrderExecutionError::Database { source })?;
+        let mut aligned = 0usize;
+        for order in orders {
+            if self.align_order_for_manual_refund_vault(&order).await? {
+                aligned += 1;
+            }
+        }
+        Ok(aligned)
+    }
+
+    async fn align_order_for_manual_refund_vault(
+        &self,
+        order: &RouterOrder,
+    ) -> OrderExecutionResult<bool> {
+        if !matches!(
+            order.status,
+            RouterOrderStatus::RefundRequired | RouterOrderStatus::Refunding
+        ) {
+            return Ok(false);
+        }
+        let Some(funding_vault_id) = order.funding_vault_id else {
+            return Ok(false);
+        };
+        let funding_vault = self
+            .db
+            .vaults()
+            .get(funding_vault_id)
+            .await
+            .map_err(|source| OrderExecutionError::Database { source })?;
+        if funding_vault.status != DepositVaultStatus::RefundManualInterventionRequired {
+            return Ok(false);
+        }
+        let Some(attempt) = self
+            .db
+            .orders()
+            .get_active_execution_attempt(order.id)
+            .await
+            .map_err(|source| OrderExecutionError::Database { source })?
+            .or(self
+                .db
+                .orders()
+                .get_latest_execution_attempt(order.id)
+                .await
+                .map_err(|source| OrderExecutionError::Database { source })?)
+        else {
+            return Ok(false);
+        };
+        self.mark_order_refund_manual_intervention(
+            order,
+            attempt.id,
+            json!({
+                "reason": "funding_vault_refund_manual_intervention_required",
+                "funding_vault_id": funding_vault.id,
+                "funding_vault_last_refund_error": funding_vault.last_refund_error,
+            }),
+            json!({
+                "source_kind": "funding_vault",
+                "vault_id": funding_vault.id,
+                "vault_status": funding_vault.status.to_db_string(),
+                "last_refund_error": funding_vault.last_refund_error,
+            }),
+        )
+        .await
     }
 
     async fn process_manual_refund_vault_alignment_pass(
@@ -1744,6 +2015,26 @@ impl OrderExecutionManager {
             .get_provider_operation(operation_id)
             .await
             .map_err(|source| OrderExecutionError::Database { source })?;
+        if let Some(observation) = self
+            .recover_across_observation_from_checkpoint(&operation, hint_evidence.clone())
+            .await?
+        {
+            return Ok(Some(observation));
+        }
+        if operation.operation_type == ProviderOperationType::AcrossBridge
+            && !operation
+                .provider_ref
+                .as_deref()
+                .is_some_and(is_decimal_u256)
+        {
+            debug!(
+                operation_id = %operation.id,
+                order_id = %operation.order_id,
+                provider_ref = operation.provider_ref.as_deref().unwrap_or_default(),
+                "Across provider operation has no deposit-id provider_ref and no recoverable deposit log yet",
+            );
+            return Ok(None);
+        }
         let retry_hint_evidence = hint_evidence.clone();
         let request = ProviderOperationObservationRequest {
             operation_id: operation.id,
@@ -1833,6 +2124,225 @@ impl OrderExecutionManager {
         }
     }
 
+    async fn recover_across_observation_from_checkpoint(
+        &self,
+        operation: &OrderProviderOperation,
+        hint_evidence: Value,
+    ) -> OrderExecutionResult<Option<ProviderOperationObservation>> {
+        if operation.operation_type != ProviderOperationType::AcrossBridge
+            || operation
+                .provider_ref
+                .as_deref()
+                .is_some_and(is_decimal_u256)
+        {
+            return Ok(None);
+        }
+        if operation.response.get("kind").and_then(Value::as_str)
+            != Some("provider_receipt_checkpoint")
+        {
+            return Ok(None);
+        }
+
+        let Some(step_id) = operation.execution_step_id else {
+            return Ok(None);
+        };
+        let step = self
+            .db
+            .orders()
+            .get_execution_step(step_id)
+            .await
+            .map_err(|source| OrderExecutionError::Database { source })?;
+        let Some(chain_registry) = self.chain_registry.as_ref() else {
+            return Ok(None);
+        };
+        let Some(recovered) = self
+            .recover_across_deposit_from_origin_logs(operation, &step, chain_registry)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        let provider_name = operation.provider.clone();
+        let provider = self
+            .action_providers
+            .bridge(&operation.provider)
+            .ok_or_else(|| OrderExecutionError::ProviderRequestFailed {
+                provider: provider_name.clone(),
+                message: "bridge provider is not configured".to_string(),
+            })?;
+        let observation = provider
+            .observe_bridge_operation(ProviderOperationObservationRequest {
+                operation_id: operation.id,
+                operation_type: operation.operation_type,
+                provider_ref: Some(recovered.deposit_id.clone()),
+                request: operation.request.clone(),
+                response: operation.response.clone(),
+                observed_state: operation.observed_state.clone(),
+                hint_evidence,
+            })
+            .await
+            .map_err(|message| OrderExecutionError::ProviderRequestFailed {
+                provider: provider_name,
+                message,
+            })?;
+
+        Ok(observation.map(|mut observation| {
+            observation.provider_ref = Some(recovered.deposit_id);
+            let mut observed_state = json_object_or_wrapped(observation.observed_state);
+            set_json_value(
+                &mut observed_state,
+                "router_recovery",
+                json!({
+                    "kind": "across_deposit_log_recovery",
+                    "deposit_tx_hash": recovered.deposit_tx_hash,
+                    "source_provider_ref": operation.provider_ref,
+                }),
+            );
+            observation.observed_state = observed_state;
+            observation
+        }))
+    }
+
+    async fn recover_across_deposit_from_origin_logs(
+        &self,
+        operation: &OrderProviderOperation,
+        step: &OrderExecutionStep,
+        chain_registry: &ChainRegistry,
+    ) -> OrderExecutionResult<Option<RecoveredAcrossDeposit>> {
+        let provider_response = operation
+            .response
+            .get("provider_response")
+            .unwrap_or(&operation.response);
+        let swap_tx = provider_response.get("swapTx").ok_or_else(|| {
+            OrderExecutionError::ProviderRequestFailed {
+                provider: operation.provider.clone(),
+                message: "Across checkpoint recovery missing provider_response.swapTx".to_string(),
+            }
+        })?;
+        let spoke_pool_address = json_str_field(swap_tx, "to").ok_or_else(|| {
+            OrderExecutionError::ProviderRequestFailed {
+                provider: operation.provider.clone(),
+                message: "Across checkpoint recovery missing swapTx.to".to_string(),
+            }
+        })?;
+        let spoke_pool_address = Address::from_str(spoke_pool_address).map_err(|err| {
+            OrderExecutionError::ProviderRequestFailed {
+                provider: operation.provider.clone(),
+                message: format!("Across checkpoint recovery invalid swapTx.to: {err}"),
+            }
+        })?;
+
+        let origin_chain_id =
+            json_u64_field(&operation.request, "origin_chain_id").ok_or_else(|| {
+                OrderExecutionError::ProviderRequestFailed {
+                    provider: operation.provider.clone(),
+                    message: "Across checkpoint recovery missing origin_chain_id".to_string(),
+                }
+            })?;
+        let destination_chain_id = json_u64_field(&operation.request, "destination_chain_id")
+            .ok_or_else(|| OrderExecutionError::ProviderRequestFailed {
+                provider: operation.provider.clone(),
+                message: "Across checkpoint recovery missing destination_chain_id".to_string(),
+            })?;
+        let origin_chain = ChainId::parse(&format!("evm:{origin_chain_id}")).map_err(|err| {
+            OrderExecutionError::ProviderRequestFailed {
+                provider: operation.provider.clone(),
+                message: format!("Across checkpoint recovery invalid origin chain: {err}"),
+            }
+        })?;
+        let backend_chain = backend_chain_for_id(&origin_chain).ok_or_else(|| {
+            OrderExecutionError::ProviderRequestFailed {
+                provider: operation.provider.clone(),
+                message: format!(
+                    "Across checkpoint recovery unsupported origin chain {origin_chain}"
+                ),
+            }
+        })?;
+        let evm_chain = chain_registry.get_evm(&backend_chain).ok_or_else(|| {
+            OrderExecutionError::ProviderRequestFailed {
+                provider: operation.provider.clone(),
+                message: format!(
+                    "Across checkpoint recovery origin chain {origin_chain} is not configured"
+                ),
+            }
+        })?;
+
+        let input_token = recovery_request_address(&step.request, "input_asset", operation)?;
+        let output_token = recovery_request_address(&step.request, "output_asset", operation)?;
+        let depositor = recovery_request_address(&step.request, "depositor_address", operation)?;
+        let recipient = recovery_request_address(&step.request, "recipient", operation)?;
+        let amount = recovery_request_u256(&step.request, "amount", operation)?;
+        let expected_output = json_u256_string_field(provider_response, "expectedOutputAmount")
+            .or_else(|| json_u256_string_field(provider_response, "minOutputAmount"));
+
+        let Some(checkpoint_tx_hash) = persisted_provider_operation_tx_hash(operation) else {
+            return Ok(None);
+        };
+        let Some(checkpoint_receipt) = evm_chain
+            .transaction_receipt(&checkpoint_tx_hash)
+            .await
+            .map_err(|source| OrderExecutionError::ProviderRequestFailed {
+                provider: operation.provider.clone(),
+                message: format!(
+                    "Across checkpoint recovery could not load checkpoint receipt: {source}"
+                ),
+            })?
+        else {
+            return Ok(None);
+        };
+        let Some(from_block) = checkpoint_receipt.block_number else {
+            return Ok(None);
+        };
+
+        let logs = evm_chain
+            .logs(
+                &Filter::new()
+                    .address(spoke_pool_address)
+                    .event_signature(FundsDeposited::SIGNATURE_HASH)
+                    .from_block(from_block),
+            )
+            .await
+            .map_err(|source| OrderExecutionError::ProviderRequestFailed {
+                provider: operation.provider.clone(),
+                message: format!("Across checkpoint recovery log scan failed: {source}"),
+            })?;
+
+        let input_token = evm_address_to_bytes32(input_token);
+        let output_token = evm_address_to_bytes32(output_token);
+        let depositor = evm_address_to_bytes32(depositor);
+        let recipient = evm_address_to_bytes32(recipient);
+        let destination_chain_id = U256::from(destination_chain_id);
+
+        for log in logs {
+            let Ok(decoded) = FundsDeposited::decode_log(&log.inner) else {
+                continue;
+            };
+            let event = decoded.data;
+            if event.destinationChainId != destination_chain_id
+                || event.inputToken != input_token
+                || event.outputToken != output_token
+                || event.inputAmount != amount
+                || expected_output
+                    .as_ref()
+                    .is_some_and(|expected| event.outputAmount != *expected)
+                || event.depositor != depositor
+                || event.recipient != recipient
+            {
+                continue;
+            }
+            let Some(deposit_tx_hash) = log.transaction_hash.map(|hash| format!("{hash:#x}"))
+            else {
+                continue;
+            };
+            return Ok(Some(RecoveredAcrossDeposit {
+                deposit_id: event.depositId.to_string(),
+                deposit_tx_hash,
+            }));
+        }
+
+        Ok(None)
+    }
+
     async fn cancel_timed_out_hyperliquid_trade(
         &self,
         operation: &OrderProviderOperation,
@@ -1914,6 +2424,10 @@ impl OrderExecutionManager {
         &self,
         limit: i64,
     ) -> OrderExecutionResult<usize> {
+        if limit <= 0 {
+            return Ok(0);
+        }
+
         let hints = self
             .db
             .orders()
@@ -2048,6 +2562,9 @@ impl OrderExecutionManager {
             ProviderOperationHintVerification::StatusUpdate(update) => {
                 self.apply_provider_operation_status_update(update).await?;
                 Ok(HintDisposition::Processed)
+            }
+            ProviderOperationHintVerification::Ignored { reason } => {
+                Ok(HintDisposition::Ignored { reason })
             }
         }
     }
@@ -2285,22 +2802,15 @@ impl OrderExecutionManager {
                     operation.operation_type.to_db_string()
                 ),
             })?;
-        if let Some(expected) = operation.provider_ref.as_deref() {
-            let Some(observed) = observation.provider_ref.as_deref() else {
+        match verify_provider_observation_ref(hint, operation, &observation) {
+            ProviderObservationRefVerification::Matched => {}
+            ProviderObservationRefVerification::Ignored { reason } => {
+                return Ok(ProviderOperationHintVerification::Ignored { reason });
+            }
+            ProviderObservationRefVerification::Invalid { reason } => {
                 return Err(OrderExecutionError::InvalidProviderOperationHint {
                     hint_id: hint.id,
-                    reason: format!(
-                        "provider observation for {} did not include expected operation ref {expected}",
-                        operation.operation_type.to_db_string()
-                    ),
-                });
-            };
-            if expected != observed {
-                return Err(OrderExecutionError::InvalidProviderOperationHint {
-                    hint_id: hint.id,
-                    reason: format!(
-                        "provider observation ref {observed} does not match operation ref {expected}"
-                    ),
+                    reason,
                 });
             }
         }
@@ -2646,7 +3156,24 @@ impl OrderExecutionManager {
         }
 
         let positions = self.discover_refund_positions(&order).await?;
-        if positions.len() != 1 {
+        let positions_snapshot = refund_positions_snapshot(&positions);
+        let mut candidates = Vec::new();
+        for position in positions.clone() {
+            if matches!(position.handle, RefundSourceHandle::FundingVault(_)) {
+                candidates.push(RefundPlanCandidate::FundingVault(position));
+                continue;
+            }
+
+            let Some(plan) = self
+                .build_automatic_refund_plan(&order, &position, refund_attempt.id)
+                .await?
+            else {
+                continue;
+            };
+            candidates.push(RefundPlanCandidate::Materialized { plan });
+        }
+
+        if candidates.len() != 1 {
             return self
                 .mark_order_refund_manual_intervention(
                     &order,
@@ -2654,12 +3181,13 @@ impl OrderExecutionManager {
                     json!({
                         "reason": "refund_requires_single_recoverable_position",
                         "position_count": positions.len(),
+                        "recoverable_position_count": candidates.len(),
                     }),
-                    refund_positions_snapshot(&positions),
+                    positions_snapshot,
                 )
                 .await;
         }
-        let Some(position) = positions.into_iter().next() else {
+        let Some(candidate) = candidates.into_iter().next() else {
             return self
                 .mark_order_refund_manual_intervention(
                     &order,
@@ -2672,60 +3200,51 @@ impl OrderExecutionManager {
                 .await;
         };
 
-        if let RefundSourceHandle::FundingVault(vault) = &position.handle {
-            let _ = self
-                .db
-                .orders()
-                .transition_execution_attempt_status(
-                    refund_attempt.id,
-                    OrderExecutionAttemptStatus::RefundRequired,
-                    OrderExecutionAttemptStatus::Active,
-                    Utc::now(),
-                )
-                .await
-                .map_err(|source| OrderExecutionError::Database { source })?;
-            let _ = self
-                .db
-                .orders()
-                .transition_status(
-                    order.id,
-                    RouterOrderStatus::RefundRequired,
-                    RouterOrderStatus::Refunding,
-                    Utc::now(),
-                )
-                .await
-                .map_err(|source| OrderExecutionError::Database { source })?;
-            let _ = self
-                .db
-                .vaults()
-                .request_refund(vault.id, Utc::now())
-                .await
-                .map_err(|source| OrderExecutionError::Database { source })?;
-            return Ok(true);
-        }
-
-        let mut refund_plan = match self
-            .build_automatic_refund_plan(&order, &position, refund_attempt.id)
-            .await?
-        {
-            Some(plan) => plan,
-            None => {
-                return self
-                    .mark_order_refund_manual_intervention(
-                        &order,
+        let mut refund_plan = match candidate {
+            RefundPlanCandidate::FundingVault(position) => {
+                let RefundSourceHandle::FundingVault(vault) = &position.handle else {
+                    unreachable!("funding-vault refund candidate must hold a funding vault");
+                };
+                let _ = self
+                    .db
+                    .orders()
+                    .transition_execution_attempt_status(
                         refund_attempt.id,
-                        json!({
-                            "reason": "no_supported_automatic_refund_route",
-                            "source_asset": {
-                                "chain": position.asset.chain.as_str(),
-                                "asset": position.asset.asset.as_str(),
-                            },
-                        }),
-                        refund_positions_snapshot(std::slice::from_ref(&position)),
+                        OrderExecutionAttemptStatus::RefundRequired,
+                        OrderExecutionAttemptStatus::Active,
+                        Utc::now(),
                     )
-                    .await;
+                    .await
+                    .map_err(|source| OrderExecutionError::Database { source })?;
+                let _ = self
+                    .db
+                    .orders()
+                    .transition_status(
+                        order.id,
+                        RouterOrderStatus::RefundRequired,
+                        RouterOrderStatus::Refunding,
+                        Utc::now(),
+                    )
+                    .await
+                    .map_err(|source| OrderExecutionError::Database { source })?;
+                let _ = self
+                    .db
+                    .vaults()
+                    .request_refund(vault.id, Utc::now())
+                    .await
+                    .map_err(|source| OrderExecutionError::Database { source })?;
+                return Ok(true);
             }
+            RefundPlanCandidate::Materialized { plan } => plan,
         };
+
+        refund_plan.steps = self
+            .hydrate_planned_steps(order.id, refund_plan.steps)
+            .await?;
+        if self.custody_action_executor.is_some() {
+            self.validate_materialized_intermediate_custody(order.id, &refund_plan.steps)
+                .await?;
+        }
         let usd_pricing = self.usd_pricing_snapshot().await;
         for leg in &mut refund_plan.legs {
             leg.usd_valuation = execution_leg_usd_valuation(
@@ -2897,6 +3416,27 @@ impl OrderExecutionManager {
                         message: "bitcoin chain is not configured".to_string(),
                     }
                 })?;
+                if let Some(outpoint) = observed_bitcoin_outpoint(
+                    vault.funding_observation.as_ref(),
+                )
+                .map_err(|message| OrderExecutionError::ProviderRequestFailed {
+                    provider: "refund".to_string(),
+                    message,
+                })? {
+                    return Ok(chain
+                        .spendable_outpoint_value_sats(
+                            &vault.deposit_vault_address,
+                            &outpoint.tx_hash,
+                            outpoint.vout,
+                            outpoint.amount_sats,
+                        )
+                        .await
+                        .map_err(|source| OrderExecutionError::ProviderRequestFailed {
+                            provider: "refund".to_string(),
+                            message: source.to_string(),
+                        })?
+                        .to_string());
+                }
                 Ok(chain
                     .address_balance_sats(&vault.deposit_vault_address)
                     .await
@@ -3325,6 +3865,9 @@ impl OrderExecutionManager {
                         provider: "unit".to_string(),
                         message: "unit provider is required for refund unit_withdrawal".to_string(),
                     })?;
+                    if !refund_unit_withdrawal_amount_meets_minimum(transition, &cursor_amount)? {
+                        return Ok(None);
+                    }
                     legs_per_transition[index].push(refund_transition_leg(QuoteLegSpec {
                         transition_decl_id: &transition.id,
                         transition_kind: transition.kind,
@@ -3868,6 +4411,63 @@ impl OrderExecutionManager {
         Ok(hydrated)
     }
 
+    async fn hydrate_persisted_planned_steps(
+        &self,
+        order_id: Uuid,
+        steps: Vec<OrderExecutionStep>,
+    ) -> OrderExecutionResult<Vec<OrderExecutionStep>> {
+        if self.custody_action_executor.is_none() {
+            return Ok(steps);
+        }
+
+        let mut planned_indices = Vec::new();
+        let mut planned_steps = Vec::new();
+        for (index, step) in steps.iter().cloned().enumerate() {
+            if matches!(
+                step.status,
+                OrderExecutionStepStatus::Planned | OrderExecutionStepStatus::Ready
+            ) {
+                planned_indices.push(index);
+                planned_steps.push(step);
+            }
+        }
+        if planned_steps.is_empty() {
+            return Ok(steps);
+        }
+
+        let hydrated_planned_steps = self.hydrate_planned_steps(order_id, planned_steps).await?;
+        let mut persisted_steps = steps;
+        for (index, hydrated) in planned_indices.into_iter().zip(hydrated_planned_steps) {
+            let original = &persisted_steps[index];
+            if original.request == hydrated.request && original.details == hydrated.details {
+                continue;
+            }
+
+            match self
+                .db
+                .orders()
+                .materialize_execution_step_request(
+                    hydrated.id,
+                    original.status,
+                    hydrated.request.clone(),
+                    hydrated.details.clone(),
+                    Utc::now(),
+                )
+                .await
+            {
+                Ok(persisted) => persisted_steps[index] = persisted,
+                Err(RouterServerError::NotFound) => {
+                    // Another worker advanced the step between our read and
+                    // hydration. Re-read on the next worker pass rather than
+                    // executing stale in-memory materialization.
+                }
+                Err(source) => return Err(OrderExecutionError::Database { source }),
+            }
+        }
+
+        Ok(persisted_steps)
+    }
+
     async fn source_deposit_vault(
         &self,
         order_id: Uuid,
@@ -3907,7 +4507,15 @@ impl OrderExecutionManager {
                 && vault.asset.as_ref() == Some(&asset.asset)
                 && vault.role == CustodyVaultRole::DestinationExecution
         }) {
-            return Ok(vault.clone());
+            let vault = self
+                .reactivate_refund_custody_vault_if_needed(
+                    order_id,
+                    vault.clone(),
+                    "destination_execution_vault",
+                )
+                .await?;
+            *cache = Some(vault.clone());
+            return Ok(vault);
         }
 
         let find_existing = || async {
@@ -3921,11 +4529,17 @@ impl OrderExecutionManager {
                 vault.role == CustodyVaultRole::DestinationExecution
                     && vault.chain == asset.chain
                     && vault.asset.as_ref() == Some(&asset.asset)
-                    && vault.status != CustodyVaultStatus::Failed
             }))
         };
 
         if let Some(vault) = find_existing().await? {
+            let vault = self
+                .reactivate_refund_custody_vault_if_needed(
+                    order_id,
+                    vault,
+                    "destination_execution_vault",
+                )
+                .await?;
             *cache = Some(vault.clone());
             return Ok(vault);
         }
@@ -3951,8 +4565,11 @@ impl OrderExecutionManager {
                 source: RouterServerError::DatabaseQuery { source },
             }) if is_unique_violation(&source) => {
                 // Another worker raced and won the partial unique index on
-                // (order_id, role, chain_id, asset_id). Re-read the winner's vault.
-                find_existing().await?.ok_or_else(|| {
+                // (order_id, role, chain_id, asset_id), or a recoverable refund
+                // is reusing a vault failed by older lifecycle logic. Re-read
+                // and reactivate the existing vault when the order is in refund
+                // recovery.
+                let vault = find_existing().await?.ok_or_else(|| {
                     OrderExecutionError::ProviderRequestFailed {
                         provider: "destination_execution_vault".to_string(),
                         message: format!(
@@ -3961,12 +4578,68 @@ impl OrderExecutionManager {
                             asset.asset.as_str(),
                         ),
                     }
-                })?
+                })?;
+                self.reactivate_refund_custody_vault_if_needed(
+                    order_id,
+                    vault,
+                    "destination_execution_vault",
+                )
+                .await?
             }
             Err(source) => return Err(OrderExecutionError::CustodyAction { source }),
         };
         *cache = Some(vault.clone());
         Ok(vault)
+    }
+
+    async fn reactivate_refund_custody_vault_if_needed(
+        &self,
+        order_id: Uuid,
+        vault: CustodyVault,
+        provider: &str,
+    ) -> OrderExecutionResult<CustodyVault> {
+        if vault.status != CustodyVaultStatus::Failed {
+            return Ok(vault);
+        }
+
+        let order = self
+            .db
+            .orders()
+            .get(order_id)
+            .await
+            .map_err(|source| OrderExecutionError::Database { source })?;
+        if !matches!(
+            order.status,
+            RouterOrderStatus::RefundRequired | RouterOrderStatus::Refunding
+        ) {
+            return Err(OrderExecutionError::ProviderRequestFailed {
+                provider: provider.to_string(),
+                message: format!(
+                    "order {order_id} cannot use failed internal custody vault {} while status is {}",
+                    vault.id,
+                    order.status.to_db_string(),
+                ),
+            });
+        }
+
+        self.db
+            .orders()
+            .reactivate_internal_custody_vault(
+                vault.id,
+                json!({
+                    "lifecycle_reactivated_reason": "refund_recovery",
+                    "lifecycle_reactivated_from_status": vault.status.to_db_string(),
+                    "lifecycle_reactivated_from_reason": vault.metadata
+                        .get("lifecycle_terminal_reason")
+                        .and_then(Value::as_str),
+                    "lifecycle_reactivated_order_status": order.status.to_db_string(),
+                    "lifecycle_reactivated_by": "order_execution_manager",
+                    "lifecycle_reactivated_at": Utc::now().to_rfc3339(),
+                }),
+                Utc::now(),
+            )
+            .await
+            .map_err(|source| OrderExecutionError::Database { source })
     }
 
     async fn validate_materialized_intermediate_custody(
@@ -4090,7 +4763,15 @@ impl OrderExecutionManager {
             .as_ref()
             .filter(|vault| vault.role == CustodyVaultRole::HyperliquidSpot)
         {
-            return Ok(vault.clone());
+            let vault = self
+                .reactivate_refund_custody_vault_if_needed(
+                    order_id,
+                    vault.clone(),
+                    "hyperliquid_spot_vault",
+                )
+                .await?;
+            *cache = Some(vault.clone());
+            return Ok(vault);
         }
 
         let find_existing = || async {
@@ -4100,13 +4781,21 @@ impl OrderExecutionManager {
                 .get_custody_vaults(order_id)
                 .await
                 .map_err(|source| OrderExecutionError::Database { source })?;
-            Ok::<_, OrderExecutionError>(vaults.into_iter().find(|vault| {
-                vault.role == CustodyVaultRole::HyperliquidSpot
-                    && vault.status != CustodyVaultStatus::Failed
-            }))
+            Ok::<_, OrderExecutionError>(
+                vaults
+                    .into_iter()
+                    .find(|vault| vault.role == CustodyVaultRole::HyperliquidSpot),
+            )
         };
 
         if let Some(vault) = find_existing().await? {
+            let vault = self
+                .reactivate_refund_custody_vault_if_needed(
+                    order_id,
+                    vault,
+                    "hyperliquid_spot_vault",
+                )
+                .await?;
             *cache = Some(vault.clone());
             return Ok(vault);
         }
@@ -4136,14 +4825,22 @@ impl OrderExecutionManager {
             Ok(vault) => vault,
             Err(CustodyActionError::Database {
                 source: RouterServerError::DatabaseQuery { source },
-            }) if is_unique_violation(&source) => find_existing().await?.ok_or_else(|| {
-                OrderExecutionError::ProviderRequestFailed {
-                    provider: "hyperliquid_spot_vault".to_string(),
-                    message: format!(
-                        "custody vault unique violation for order {order_id} hyperliquid_spot but re-read returned none",
-                    ),
-                }
-            })?,
+            }) if is_unique_violation(&source) => {
+                let vault = find_existing().await?.ok_or_else(|| {
+                    OrderExecutionError::ProviderRequestFailed {
+                        provider: "hyperliquid_spot_vault".to_string(),
+                        message: format!(
+                            "custody vault unique violation for order {order_id} hyperliquid_spot but re-read returned none",
+                        ),
+                    }
+                })?;
+                self.reactivate_refund_custody_vault_if_needed(
+                    order_id,
+                    vault,
+                    "hyperliquid_spot_vault",
+                )
+                .await?
+            }
             Err(source) => return Err(OrderExecutionError::CustodyAction { source }),
         };
         *cache = Some(vault.clone());
@@ -4294,110 +4991,140 @@ impl OrderExecutionManager {
             _ => {}
         }
 
-        let mut completed_steps = 0_usize;
-        let execution_attempt = self
-            .db
-            .orders()
-            .get_active_execution_attempt(order.id)
-            .await
-            .map_err(|source| OrderExecutionError::Database { source })?
-            .ok_or(OrderExecutionError::OrderNotReady { order_id })?;
-        let steps = self
-            .db
-            .orders()
-            .get_execution_steps_for_attempt(execution_attempt.id)
-            .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
-        if !steps.iter().any(|step| step.step_index > 0) {
-            return Err(OrderExecutionError::OrderNotReady { order_id });
-        }
-        self.validate_materialized_intermediate_custody(order.id, &steps)
-            .await?;
-        for step in steps.iter().filter(|step| step.step_index > 0).cloned() {
-            match step.status {
-                OrderExecutionStepStatus::Completed => {
-                    completed_steps += 1;
-                    continue;
-                }
-                OrderExecutionStepStatus::Waiting | OrderExecutionStepStatus::Running => {
-                    return Ok(finalize_summary(
-                        advanced_execution_step,
-                        order.id,
-                        completed_steps,
-                    ));
-                }
-                OrderExecutionStepStatus::Planned | OrderExecutionStepStatus::Ready => {}
-                OrderExecutionStepStatus::Failed
-                | OrderExecutionStepStatus::Skipped
-                | OrderExecutionStepStatus::Cancelled
-                | OrderExecutionStepStatus::Superseded => {
-                    return Ok(finalize_summary(
-                        advanced_execution_step,
-                        order.id,
-                        completed_steps,
-                    ));
-                }
+        let mut stale_quote_refreshes = 0_usize;
+        'attempt_execution: loop {
+            let mut completed_steps = 0_usize;
+            let execution_attempt = self
+                .db
+                .orders()
+                .get_active_execution_attempt(order.id)
+                .await
+                .map_err(|source| OrderExecutionError::Database { source })?
+                .ok_or(OrderExecutionError::OrderNotReady { order_id })?;
+            let steps = self
+                .db
+                .orders()
+                .get_execution_steps_for_attempt(execution_attempt.id)
+                .await
+                .map_err(|source| OrderExecutionError::Database { source })?;
+            let steps = self
+                .hydrate_persisted_planned_steps(order.id, steps)
+                .await?;
+            if !steps.iter().any(|step| step.step_index > 0) {
+                return Err(OrderExecutionError::OrderNotReady { order_id });
             }
+            self.validate_materialized_intermediate_custody(order.id, &steps)
+                .await?;
 
-            match self
-                .refresh_stale_quote_before_step(&order, &vault, &execution_attempt, &steps, &step)
-                .await?
-            {
-                StaleQuoteRefreshOutcome::NotNeeded => {}
-                StaleQuoteRefreshOutcome::Refreshed | StaleQuoteRefreshOutcome::RefundRequired => {
-                    return Ok(finalize_summary(true, order.id, completed_steps));
-                }
-            }
-
-            match self.execute_step(step).await {
-                Ok(StepExecutionOutcome::Completed) => {
-                    advanced_execution_step = true;
-                    completed_steps += 1;
-                }
-                Ok(StepExecutionOutcome::Waiting) => {
-                    advanced_execution_step = true;
-                    return Ok(finalize_summary(
-                        advanced_execution_step,
-                        order.id,
-                        completed_steps,
-                    ));
-                }
-                Ok(StepExecutionOutcome::Skipped) => {
-                    return Ok(finalize_summary(
-                        advanced_execution_step,
-                        order.id,
-                        completed_steps,
-                    ));
-                }
-                Err(err) => {
-                    if let Err(reconcile_err) =
-                        self.process_failed_attempt_for_order(order.id).await
-                    {
-                        warn!(
-                            order_id = %order.id,
-                            original_error = %err,
-                            reconcile_error = %reconcile_err,
-                            "inline retry/refund decision failed after step error; backstop pass will retry",
-                        );
+            for step in steps.iter().filter(|step| step.step_index > 0).cloned() {
+                match step.status {
+                    OrderExecutionStepStatus::Completed => {
+                        completed_steps += 1;
+                        continue;
                     }
-                    return Err(err);
+                    OrderExecutionStepStatus::Waiting | OrderExecutionStepStatus::Running => {
+                        return Ok(finalize_summary(
+                            advanced_execution_step,
+                            order.id,
+                            completed_steps,
+                        ));
+                    }
+                    OrderExecutionStepStatus::Planned | OrderExecutionStepStatus::Ready => {}
+                    OrderExecutionStepStatus::Failed
+                    | OrderExecutionStepStatus::Skipped
+                    | OrderExecutionStepStatus::Cancelled
+                    | OrderExecutionStepStatus::Superseded => {
+                        return Ok(finalize_summary(
+                            advanced_execution_step,
+                            order.id,
+                            completed_steps,
+                        ));
+                    }
+                }
+
+                match self
+                    .refresh_stale_quote_before_step(
+                        &order,
+                        &vault,
+                        &execution_attempt,
+                        &steps,
+                        &step,
+                    )
+                    .await?
+                {
+                    StaleQuoteRefreshOutcome::NotNeeded => {}
+                    StaleQuoteRefreshOutcome::Refreshed => {
+                        advanced_execution_step = true;
+                        stale_quote_refreshes += 1;
+                        if stale_quote_refreshes >= MAX_STALE_QUOTE_REFRESHES_PER_ORDER_EXECUTION {
+                            warn!(
+                                order_id = %order.id,
+                                refreshes = stale_quote_refreshes,
+                                "stale quote refresh loop reached per-order execution pass limit",
+                            );
+                            return Ok(finalize_summary(
+                                advanced_execution_step,
+                                order.id,
+                                completed_steps,
+                            ));
+                        }
+                        continue 'attempt_execution;
+                    }
+                    StaleQuoteRefreshOutcome::RefundRequired => {
+                        return Ok(finalize_summary(true, order.id, completed_steps));
+                    }
+                }
+
+                match self.execute_step(step).await {
+                    Ok(StepExecutionOutcome::Completed) => {
+                        advanced_execution_step = true;
+                        completed_steps += 1;
+                    }
+                    Ok(StepExecutionOutcome::Waiting) => {
+                        advanced_execution_step = true;
+                        return Ok(finalize_summary(
+                            advanced_execution_step,
+                            order.id,
+                            completed_steps,
+                        ));
+                    }
+                    Ok(StepExecutionOutcome::Skipped) => {
+                        return Ok(finalize_summary(
+                            advanced_execution_step,
+                            order.id,
+                            completed_steps,
+                        ));
+                    }
+                    Err(err) => {
+                        if let Err(reconcile_err) =
+                            self.process_failed_attempt_for_order(order.id).await
+                        {
+                            warn!(
+                                order_id = %order.id,
+                                original_error = %err,
+                                reconcile_error = %reconcile_err,
+                                "inline retry/refund decision failed after step error; backstop pass will retry",
+                            );
+                        }
+                        return Err(err);
+                    }
                 }
             }
+
+            let order_id = order.id;
+            let finalized_order = self.finalize_order_if_complete(order).await?;
+            let advanced_execution_step = advanced_execution_step
+                || matches!(
+                    finalized_order.status,
+                    RouterOrderStatus::Completed | RouterOrderStatus::Refunded
+                );
+
+            return Ok(finalize_summary(
+                advanced_execution_step,
+                order_id,
+                completed_steps,
+            ));
         }
-
-        let order_id = order.id;
-        let finalized_order = self.finalize_order_if_complete(order).await?;
-        let advanced_execution_step = advanced_execution_step
-            || matches!(
-                finalized_order.status,
-                RouterOrderStatus::Completed | RouterOrderStatus::Refunded
-            );
-
-        Ok(finalize_summary(
-            advanced_execution_step,
-            order_id,
-            completed_steps,
-        ))
     }
 
     async fn refresh_stale_quote_before_step(
@@ -5717,8 +6444,19 @@ impl OrderExecutionManager {
                         usd_valuation,
                         completed_at,
                     )
-                    .await
-                    .map_err(|source| OrderExecutionError::Database { source })?;
+                    .await;
+                let completed_step = match completed_step {
+                    Ok(step) => step,
+                    Err(RouterServerError::NotFound) => {
+                        // Provider-observation recovery or another executor
+                        // can settle the step after this task has already run
+                        // the provider action. Losing that final Running →
+                        // Completed CAS is a benign race; the winner is
+                        // responsible for the persisted step state.
+                        return Ok(StepExecutionOutcome::Skipped);
+                    }
+                    Err(source) => return Err(OrderExecutionError::Database { source }),
+                };
                 if let Some(execution_leg_id) = completed_step.execution_leg_id {
                     let _ = self
                         .refresh_execution_leg_rollup_and_usd_valuation(
@@ -5745,8 +6483,17 @@ impl OrderExecutionManager {
                         completion.tx_hash,
                         Utc::now(),
                     )
-                    .await
-                    .map_err(|source| OrderExecutionError::Database { source })?;
+                    .await;
+                let waiting_step = match waiting_step {
+                    Ok(step) => step,
+                    Err(RouterServerError::NotFound) => {
+                        // Another worker changed the running step before this
+                        // task could persist Waiting. Treat it as a lost CAS,
+                        // not as a provider failure.
+                        return Ok(StepExecutionOutcome::Skipped);
+                    }
+                    Err(source) => return Err(OrderExecutionError::Database { source }),
+                };
                 if let Some(order) = &order {
                     telemetry::record_execution_step_workflow_event(
                         order,
@@ -5805,6 +6552,7 @@ impl OrderExecutionManager {
                         action: CustodyAction::Transfer {
                             to_address: recipient_address.to_string(),
                             amount: amount.to_string(),
+                            bitcoin_fee_budget_sats: None,
                         },
                     })
                     .await
@@ -6215,8 +6963,13 @@ impl OrderExecutionManager {
                 if outcome == RunningStepOutcome::Completed {
                     balance_observation.enforce_output_minimum(step, &step.provider)?;
                 }
+                let observed_state = state
+                    .operation
+                    .as_ref()
+                    .and_then(|operation| operation.observed_state.clone());
                 let provider_response = json!({
                     "provider_context": provider_context.clone(),
+                    "observed_state": observed_state.clone(),
                     "tx_hash": &receipt.tx_hash,
                     "balance_observation": balance_observation.to_json(),
                 });
@@ -6231,6 +6984,7 @@ impl OrderExecutionManager {
                         "retention_tx_hashes": retention_tx_hashes,
                         "action": action_for_response,
                         "provider_context": provider_context,
+                        "observed_state": observed_state,
                         "tx_hash": &receipt.tx_hash,
                         "balance_observation": balance_observation.to_json(),
                     }),
@@ -6346,8 +7100,13 @@ impl OrderExecutionManager {
                 if outcome == RunningStepOutcome::Completed {
                     balance_observation.enforce_output_minimum(step, &step.provider)?;
                 }
+                let observed_state = state
+                    .operation
+                    .as_ref()
+                    .and_then(|operation| operation.observed_state.clone());
                 let provider_response = json!({
                     "provider_context": provider_context.clone(),
+                    "observed_state": observed_state.clone(),
                     "tx_hashes": &tx_hashes,
                     "balance_observation": balance_observation.to_json(),
                 });
@@ -6362,6 +7121,7 @@ impl OrderExecutionManager {
                         "retention_tx_hashes": retention_tx_hashes,
                         "actions": actions_for_response,
                         "provider_context": provider_context,
+                        "observed_state": observed_state,
                         "tx_hashes": tx_hashes,
                         "balance_observation": balance_observation.to_json(),
                     }),
@@ -6592,6 +7352,7 @@ impl OrderExecutionManager {
                 custody_actions.push(PlannedRetentionAction::Transfer(CustodyAction::Transfer {
                     to_address,
                     amount: amount.to_string(),
+                    bitcoin_fee_budget_sats: None,
                 }));
             }
         }
@@ -6697,6 +7458,7 @@ impl OrderExecutionManager {
             .update_provider_operation_status(
                 existing.id,
                 update.status,
+                update.provider_ref.clone(),
                 observed_state.clone(),
                 response.clone(),
                 Utc::now(),
@@ -8271,6 +9033,15 @@ fn refund_position_quote_address(position: &RefundSourcePosition) -> OrderExecut
         RefundSourceHandle::ExternalCustody(vault) => vault.address.clone(),
         RefundSourceHandle::HyperliquidSpot { vault, .. } => vault.address.clone(),
     })
+}
+
+fn refund_unit_withdrawal_amount_meets_minimum(
+    transition: &TransitionDecl,
+    amount: &str,
+) -> OrderExecutionResult<bool> {
+    let minimum_amount = unit_withdrawal_minimum_raw(&transition.output.asset);
+    let amount = parse_refund_amount("refund.unit_withdrawal.amount", amount)?;
+    Ok(amount >= minimum_amount)
 }
 
 fn choose_better_refund_quote(
@@ -10289,15 +11060,73 @@ fn address_matches(left: &str, right: &str) -> bool {
     left.eq_ignore_ascii_case(right)
 }
 
+fn is_decimal_u256(value: &str) -> bool {
+    !value.is_empty() && U256::from_str_radix(value, 10).is_ok()
+}
+
+fn json_str_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(Value::as_str)
+}
+
+fn json_u64_field(value: &Value, key: &str) -> Option<u64> {
+    value.get(key).and_then(Value::as_u64).or_else(|| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(|raw| raw.parse::<u64>().ok())
+    })
+}
+
+fn json_u256_string_field(value: &Value, key: &str) -> Option<U256> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .and_then(|raw| U256::from_str_radix(raw, 10).ok())
+}
+
+fn recovery_request_address(
+    request: &Value,
+    key: &'static str,
+    operation: &OrderProviderOperation,
+) -> OrderExecutionResult<Address> {
+    let raw =
+        json_str_field(request, key).ok_or_else(|| OrderExecutionError::ProviderRequestFailed {
+            provider: operation.provider.clone(),
+            message: format!("Across checkpoint recovery missing request.{key}"),
+        })?;
+    Address::from_str(raw).map_err(|err| OrderExecutionError::ProviderRequestFailed {
+        provider: operation.provider.clone(),
+        message: format!("Across checkpoint recovery invalid request.{key}: {err}"),
+    })
+}
+
+fn recovery_request_u256(
+    request: &Value,
+    key: &'static str,
+    operation: &OrderProviderOperation,
+) -> OrderExecutionResult<U256> {
+    let raw =
+        json_str_field(request, key).ok_or_else(|| OrderExecutionError::ProviderRequestFailed {
+            provider: operation.provider.clone(),
+            message: format!("Across checkpoint recovery missing request.{key}"),
+        })?;
+    U256::from_str_radix(raw, 10).map_err(|err| OrderExecutionError::ProviderRequestFailed {
+        provider: operation.provider.clone(),
+        message: format!("Across checkpoint recovery invalid request.{key}: {err}"),
+    })
+}
+
+fn evm_address_to_bytes32(address: Address) -> FixedBytes<32> {
+    let mut bytes = [0_u8; 32];
+    bytes[12..].copy_from_slice(address.as_slice());
+    FixedBytes::from(bytes)
+}
+
 fn internal_custody_terminal_status(
     order_status: RouterOrderStatus,
 ) -> Option<(CustodyVaultStatus, &'static str)> {
     match order_status {
         RouterOrderStatus::Completed => Some((CustodyVaultStatus::Released, "order_completed")),
-        RouterOrderStatus::RefundRequired => {
-            Some((CustodyVaultStatus::Failed, "order_refund_required"))
-        }
-        RouterOrderStatus::Refunding => Some((CustodyVaultStatus::Failed, "order_refunding")),
         RouterOrderStatus::Refunded => Some((CustodyVaultStatus::Failed, "order_refunded")),
         RouterOrderStatus::ManualInterventionRequired => Some((
             CustodyVaultStatus::Failed,
@@ -10308,6 +11137,7 @@ fn internal_custody_terminal_status(
             "order_refund_manual_intervention_required",
         )),
         RouterOrderStatus::Expired => Some((CustodyVaultStatus::Failed, "order_expired")),
+        RouterOrderStatus::RefundRequired | RouterOrderStatus::Refunding => None,
         RouterOrderStatus::Quoted
         | RouterOrderStatus::PendingFunding
         | RouterOrderStatus::Funded
@@ -10349,6 +11179,18 @@ fn provider_status_observation_update(
     let observed_state = json_object_or_wrapped(observation.observed_state);
     let tx_hash = observation.tx_hash.clone();
     let error = observation.error.clone();
+    let response = observation.response.clone();
+    let provider_ref = observation
+        .provider_ref
+        .clone()
+        .or_else(|| operation.provider_ref.clone())
+        .or_else(|| tx_hash.clone())
+        .or_else(|| {
+            response
+                .as_ref()
+                .and_then(provider_operation_tx_hash_from_value)
+        })
+        .or_else(|| provider_operation_tx_hash_from_value(&observed_state));
     let mut persisted_observed_state = json!({
         "source": "router_worker_provider_observation",
         "hint_id": hint.id,
@@ -10369,13 +11211,10 @@ fn provider_status_observation_update(
     ProviderOperationStatusUpdate {
         provider_operation_id: Some(operation.id),
         provider: Some(operation.provider.clone()),
-        provider_ref: observation
-            .provider_ref
-            .clone()
-            .or_else(|| operation.provider_ref.clone()),
+        provider_ref,
         status: observation.status,
         observed_state: persisted_observed_state,
-        response: observation.response,
+        response,
         tx_hash,
         error,
     }
@@ -10461,6 +11300,109 @@ fn trusted_provider_observation_from_hint(
             hint_id: hint.id,
             reason: format!("provider_observation evidence was invalid: {err}"),
         })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProviderObservationRefVerification {
+    Matched,
+    Ignored { reason: String },
+    Invalid { reason: String },
+}
+
+fn verify_provider_observation_ref(
+    hint: &OrderProviderOperationHint,
+    operation: &OrderProviderOperation,
+    observation: &ProviderOperationObservation,
+) -> ProviderObservationRefVerification {
+    if let Some(reason) = incomplete_provider_receipt_checkpoint_reason(observation) {
+        return ProviderObservationRefVerification::Ignored { reason };
+    }
+
+    let Some(expected) = operation.provider_ref.as_deref() else {
+        return ProviderObservationRefVerification::Matched;
+    };
+
+    match observation.provider_ref.as_deref() {
+        Some(observed) if observed == expected => ProviderObservationRefVerification::Matched,
+        Some(observed) => {
+            if let Some(reason) = stale_provider_observation_snapshot_reason(hint, expected) {
+                ProviderObservationRefVerification::Ignored { reason }
+            } else {
+                ProviderObservationRefVerification::Invalid {
+                    reason: format!(
+                        "provider observation ref {observed} does not match operation ref {expected}"
+                    ),
+                }
+            }
+        }
+        None => {
+            if let Some(reason) = stale_provider_observation_snapshot_reason(hint, expected) {
+                ProviderObservationRefVerification::Ignored { reason }
+            } else {
+                ProviderObservationRefVerification::Invalid {
+                    reason: format!(
+                        "provider observation for {} did not include expected operation ref {expected}",
+                        operation.operation_type.to_db_string()
+                    ),
+                }
+            }
+        }
+    }
+}
+
+fn incomplete_provider_receipt_checkpoint_reason(
+    observation: &ProviderOperationObservation,
+) -> Option<String> {
+    let response = observation.response.as_ref()?;
+    let receipt = provider_receipt_checkpoint_receipt(response)?;
+    let submitted = receipt
+        .get("provider_actions_submitted")
+        .and_then(Value::as_u64)?;
+    let expected = receipt
+        .get("provider_actions_expected")
+        .and_then(Value::as_u64)?;
+    if submitted >= expected {
+        return None;
+    }
+
+    Some(format!(
+        "provider receipt checkpoint only submitted {submitted}/{expected} provider actions"
+    ))
+}
+
+fn provider_receipt_checkpoint_receipt(response: &Value) -> Option<&Value> {
+    match response.get("kind").and_then(Value::as_str) {
+        Some("provider_receipt_checkpoint") => response.get("receipt"),
+        Some("custody_actions_receipt") => Some(response),
+        _ => None,
+    }
+}
+
+fn stale_provider_observation_snapshot_reason(
+    hint: &OrderProviderOperationHint,
+    current_provider_ref: &str,
+) -> Option<String> {
+    if hint.source != PROVIDER_OPERATION_OBSERVATION_HINT_SOURCE
+        || hint.evidence.get("provider_observation").is_none()
+    {
+        return None;
+    }
+
+    match hint.evidence.get("provider_ref") {
+        Some(Value::String(snapshot_ref)) if snapshot_ref == current_provider_ref => None,
+        Some(Value::String(snapshot_ref)) => Some(format!(
+            "stale provider observation was collected for provider_ref {snapshot_ref}, current provider_ref is {current_provider_ref}"
+        )),
+        Some(Value::Null) => Some(format!(
+            "stale provider observation was collected before provider_ref {current_provider_ref} was assigned"
+        )),
+        Some(other) => Some(format!(
+            "stale provider observation carried invalid provider_ref snapshot {other}"
+        )),
+        None => Some(format!(
+            "stale provider observation did not carry provider_ref snapshot for current provider_ref {current_provider_ref}"
+        )),
+    }
 }
 
 fn persisted_provider_operation_tx_hash(operation: &OrderProviderOperation) -> Option<String> {
@@ -11276,6 +12218,7 @@ fn refresh_bitcoin_fee_reserve_quote(fee_reserve: U256) -> Value {
             "chain_id": "bitcoin",
             "asset": AssetId::Native.as_str(),
             "amount": fee_reserve.to_string(),
+            "reserve_bps": REFRESH_BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_BPS,
         }
     })
 }
@@ -11878,10 +12821,15 @@ fn provider_operation_ref_for_persist(
     step: &OrderExecutionStep,
     operation: &crate::services::action_providers::ProviderOperationIntent,
 ) -> OrderExecutionResult<Option<String>> {
-    let provider_ref = operation
-        .provider_ref
-        .clone()
-        .or_else(|| step.provider_ref.clone());
+    let provider_ref = operation.provider_ref.clone().or_else(|| {
+        if step.step_type == OrderExecutionStepType::AcrossBridge
+            && operation.operation_type == ProviderOperationType::AcrossBridge
+        {
+            None
+        } else {
+            step.provider_ref.clone()
+        }
+    });
     if operation.status == ProviderOperationStatus::Completed && provider_ref.is_none() {
         return Err(OrderExecutionError::ProviderRequestFailed {
             provider: step.provider.clone(),
@@ -12657,6 +13605,43 @@ mod tests {
     }
 
     #[test]
+    fn across_provider_operation_never_persists_quote_id_as_provider_ref() {
+        let mut step = test_step(
+            Uuid::now_v7(),
+            1,
+            OrderExecutionStepType::AcrossBridge,
+            json!({}),
+        );
+        step.provider_ref = Some("quote-019e0496-9b0d-73c1-877e-946465c37877".to_string());
+
+        let submitted = crate::services::action_providers::ProviderOperationIntent {
+            operation_type: ProviderOperationType::AcrossBridge,
+            status: ProviderOperationStatus::Submitted,
+            provider_ref: None,
+            request: None,
+            response: None,
+            observed_state: None,
+        };
+        assert_eq!(
+            provider_operation_ref_for_persist(&step, &submitted).unwrap(),
+            None
+        );
+
+        let completed_without_deposit_id =
+            crate::services::action_providers::ProviderOperationIntent {
+                status: ProviderOperationStatus::Completed,
+                ..submitted
+            };
+        let err = provider_operation_ref_for_persist(&step, &completed_without_deposit_id)
+            .expect_err("completed Across operation must use deposit id from post_execute");
+        assert!(matches!(
+            err,
+            OrderExecutionError::ProviderRequestFailed { message, .. }
+                if message.contains("completed provider operation is missing provider_ref")
+        ));
+    }
+
+    #[test]
     fn execution_time_ms_rejects_pre_epoch_timestamp() {
         let error = execution_time_ms_from_timestamp(-1, "hyperliquid")
             .expect_err("negative timestamps must reject");
@@ -12814,6 +13799,29 @@ mod tests {
             OrderExecutionError::ProviderRequestFailed { message, .. }
                 if message.contains("missing amount_out")
         ));
+    }
+
+    #[test]
+    fn refund_unit_withdrawal_minimum_rejects_btc_dust() {
+        let btc_withdrawal = test_transition(
+            "unit:hyperliquid:UBTC->bitcoin:native",
+            MarketOrderTransitionKind::UnitWithdrawal,
+            ProviderId::Unit,
+            test_asset("hyperliquid", AssetId::Reference("UBTC".to_string())),
+            test_asset("bitcoin", AssetId::Native),
+        );
+
+        assert!(!refund_unit_withdrawal_amount_meets_minimum(&btc_withdrawal, "625").unwrap());
+        assert!(refund_unit_withdrawal_amount_meets_minimum(&btc_withdrawal, "30000").unwrap());
+
+        let eth_withdrawal = test_transition(
+            "unit:hyperliquid:UETH->evm:8453:native",
+            MarketOrderTransitionKind::UnitWithdrawal,
+            ProviderId::Unit,
+            test_asset("hyperliquid", AssetId::Reference("UETH".to_string())),
+            test_asset("evm:8453", AssetId::Native),
+        );
+        assert!(refund_unit_withdrawal_amount_meets_minimum(&eth_withdrawal, "1").unwrap());
     }
 
     fn test_transition(
@@ -13091,6 +14099,107 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_provider_receipt_checkpoint_observation_is_ignored() {
+        let expected_ref = "0x2222222222222222222222222222222222222222222222222222222222222222";
+        let mut operation = test_order_provider_operation(json!({}), json!({}));
+        operation.operation_type = ProviderOperationType::UniversalRouterSwap;
+        operation.provider_ref = Some(expected_ref.to_string());
+        let hint = test_provider_operation_hint(
+            PROVIDER_OPERATION_OBSERVATION_HINT_SOURCE,
+            json!({
+                "provider_ref": null,
+                "provider_observation": true,
+            }),
+        );
+        let observation = ProviderOperationObservation {
+            status: ProviderOperationStatus::Completed,
+            provider_ref: None,
+            observed_state: json!({ "kind": "provider_receipt_checkpoint" }),
+            response: Some(json!({
+                "kind": "provider_receipt_checkpoint",
+                "receipt": {
+                    "kind": "custody_actions_receipt",
+                    "tx_hashes": [
+                        "0x1111111111111111111111111111111111111111111111111111111111111111"
+                    ],
+                    "latest_tx_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                    "provider_actions_submitted": 1,
+                    "provider_actions_expected": 2
+                }
+            })),
+            tx_hash: None,
+            error: None,
+        };
+
+        let result = verify_provider_observation_ref(&hint, &operation, &observation);
+
+        assert!(matches!(
+            result,
+            ProviderObservationRefVerification::Ignored { reason }
+                if reason.contains("only submitted 1/2")
+        ));
+    }
+
+    #[test]
+    fn stale_provider_observation_snapshot_is_ignored() {
+        let mut operation = test_order_provider_operation(json!({}), json!({}));
+        operation.provider_ref = Some("current-ref".to_string());
+        let hint = test_provider_operation_hint(
+            PROVIDER_OPERATION_OBSERVATION_HINT_SOURCE,
+            json!({
+                "provider_ref": "old-ref",
+                "provider_observation": true,
+            }),
+        );
+        let observation = ProviderOperationObservation {
+            status: ProviderOperationStatus::Completed,
+            provider_ref: Some("old-ref".to_string()),
+            observed_state: json!({ "kind": "filled" }),
+            response: None,
+            tx_hash: None,
+            error: None,
+        };
+
+        let result = verify_provider_observation_ref(&hint, &operation, &observation);
+
+        assert!(matches!(
+            result,
+            ProviderObservationRefVerification::Ignored { reason }
+                if reason.contains("stale provider observation")
+        ));
+    }
+
+    #[test]
+    fn current_provider_observation_missing_ref_is_invalid() {
+        let mut operation = test_order_provider_operation(json!({}), json!({}));
+        operation.operation_type = ProviderOperationType::UniversalRouterSwap;
+        operation.provider_ref = Some("current-ref".to_string());
+        let hint = test_provider_operation_hint(
+            PROVIDER_OPERATION_OBSERVATION_HINT_SOURCE,
+            json!({
+                "provider_ref": "current-ref",
+                "provider_observation": true,
+            }),
+        );
+        let observation = ProviderOperationObservation {
+            status: ProviderOperationStatus::Completed,
+            provider_ref: None,
+            observed_state: json!({ "kind": "velora_universal_router_swap" }),
+            response: None,
+            tx_hash: None,
+            error: None,
+        };
+
+        let result = verify_provider_observation_ref(&hint, &operation, &observation);
+
+        assert!(matches!(
+            result,
+            ProviderObservationRefVerification::Invalid { reason }
+                if reason.contains("did not include expected operation ref current-ref")
+        ));
+    }
+
+    #[test]
     fn provider_operation_tx_hash_reads_observed_state() {
         let operation = test_order_provider_operation(
             json!({}),
@@ -13182,6 +14291,37 @@ mod tests {
             persisted_provider_operation_tx_hash(&recovered_operation).as_deref(),
             Some(tx_hash)
         );
+    }
+
+    #[test]
+    fn provider_observation_update_derives_provider_ref_from_receipt_response() {
+        let mut operation = test_order_provider_operation(json!({}), json!({}));
+        operation.provider_ref = None;
+        let hint = test_provider_operation_hint(
+            PROVIDER_OPERATION_OBSERVATION_HINT_SOURCE,
+            json!({ "provider_observation": true }),
+        );
+        let tx_hash = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let update = provider_status_observation_update(
+            &operation,
+            &hint,
+            ProviderOperationObservation {
+                status: ProviderOperationStatus::Completed,
+                provider_ref: None,
+                observed_state: json!({ "kind": "provider_receipt_checkpoint" }),
+                response: Some(json!({
+                    "kind": "provider_receipt_checkpoint",
+                    "receipt": {
+                        "latest_tx_hash": tx_hash,
+                    },
+                })),
+                tx_hash: None,
+                error: None,
+            },
+        );
+
+        assert_eq!(update.provider_ref.as_deref(), Some(tx_hash));
     }
 
     #[test]

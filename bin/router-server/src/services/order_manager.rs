@@ -62,10 +62,9 @@ const MARKET_ORDER_PROVIDER_TIMEOUT: Duration = Duration::from_secs(10);
 // quote paths that end with Hyperliquid -> Unit need to leave 1 USDC available.
 const HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW: u64 = 1_000_000;
 const HYPERLIQUID_CORE_ACTIVATION_FEE_RAW: u64 = HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW;
-const BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_INPUTS: usize = 2;
+const BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_INPUTS: usize = 1;
 const BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_OUTPUTS: usize = 2;
 const BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_BPS: u64 = 12_500;
-const BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_FALLBACK_SATS: u64 = 25_000;
 const PROBE_MAX_AMOUNT_IN: &str = "340282366920938463463374607431768211455";
 const MAX_U256_DECIMAL_DIGITS: usize = 78;
 
@@ -2305,25 +2304,16 @@ impl OrderManager {
             .ok_or_else(|| MarketOrderError::NoRoute {
                 reason: "bitcoin chain is required to estimate Unit deposit miner fee".to_string(),
             })?;
-        let estimated_fee = match bitcoin_chain
+        let estimated_fee = bitcoin_chain
             .estimate_p2wpkh_transfer_fee_sats(
                 BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_INPUTS,
                 BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_OUTPUTS,
             )
             .await
-        {
-            Ok(estimated_fee) => estimated_fee,
-            Err(err) => {
-                warn!(
-                    error = %err,
-                    fallback_sats = BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_FALLBACK_SATS,
-                    "falling back to static bitcoin Unit deposit miner fee reserve"
-                );
-                BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_FALLBACK_SATS
-            }
-        };
-        let reserved_fee = apply_bps_u64(estimated_fee, BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_BPS)?
-            .max(BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_FALLBACK_SATS);
+            .map_err(|err| MarketOrderError::NoRoute {
+                reason: format!("failed to estimate bitcoin Unit deposit miner fee: {err}"),
+            })?;
+        let reserved_fee = apply_bps_u64(estimated_fee, BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_BPS)?;
         Ok(Some(U256::from(reserved_fee)))
     }
 }

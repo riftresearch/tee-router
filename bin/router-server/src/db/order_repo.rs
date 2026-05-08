@@ -269,6 +269,12 @@ const EXECUTION_ATTEMPT_SELECT_COLUMNS: &str = r#"
     updated_at
 "#;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrderStatusCount {
+    pub status: RouterOrderStatus,
+    pub order_count: u64,
+}
+
 #[derive(Clone)]
 pub struct OrderRepository {
     pool: PgPool,
@@ -711,6 +717,57 @@ impl OrderRepository {
         let row = result?;
 
         self.map_order_row(&row)
+    }
+
+    pub async fn count_in_progress_orders_by_status(
+        &self,
+    ) -> RouterServerResult<Vec<OrderStatusCount>> {
+        let started = Instant::now();
+        let result = sqlx_core::query::query(
+            r#"
+            SELECT status, COUNT(*)::bigint AS order_count
+            FROM router_orders
+            WHERE status IN (
+                'pending_funding',
+                'funded',
+                'executing',
+                'refund_required',
+                'refunding'
+            )
+            GROUP BY status
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await;
+        telemetry::record_db_query(
+            "order.count_in_progress_orders_by_status",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        let rows = result?;
+
+        rows.iter()
+            .map(|row| {
+                let status: String = row.try_get("status")?;
+                let status = RouterOrderStatus::from_db_string(&status).ok_or_else(|| {
+                    RouterServerError::InvalidData {
+                        message: format!("unknown order status: {status}"),
+                    }
+                })?;
+                let order_count: i64 = row.try_get("order_count")?;
+                let order_count =
+                    u64::try_from(order_count).map_err(|_| RouterServerError::InvalidData {
+                        message: format!(
+                            "negative order status count for {}",
+                            status.to_db_string()
+                        ),
+                    })?;
+                Ok(OrderStatusCount {
+                    status,
+                    order_count,
+                })
+            })
+            .collect()
     }
 
     pub async fn transition_status(
@@ -1729,6 +1786,37 @@ impl OrderRepository {
         rows.iter().map(|row| self.map_order_row(row)).collect()
     }
 
+    pub async fn find_orders_with_manual_refund_funding_vault(
+        &self,
+        limit: i64,
+    ) -> RouterServerResult<Vec<RouterOrder>> {
+        let started = Instant::now();
+        let result = sqlx_core::query::query(&format!(
+            r#"
+            SELECT DISTINCT {ORDER_SELECT_COLUMNS}
+            FROM router_orders ro
+            LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
+            LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
+            JOIN deposit_vaults dv ON dv.id = ro.funding_vault_id
+            WHERE ro.status IN ('refund_required', 'refunding')
+              AND dv.status = 'refund_manual_intervention_required'
+            ORDER BY ro.updated_at ASC, ro.id ASC
+            LIMIT $1
+            "#
+        ))
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await;
+        telemetry::record_db_query(
+            "order.find_orders_with_manual_refund_funding_vault",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        let rows = result?;
+
+        rows.iter().map(|row| self.map_order_row(row)).collect()
+    }
+
     pub async fn find_orders_pending_retry_or_refund_decision(
         &self,
         limit: i64,
@@ -1908,6 +1996,41 @@ impl OrderRepository {
         self.map_custody_vault_row(&row)
     }
 
+    pub async fn reactivate_internal_custody_vault(
+        &self,
+        vault_id: Uuid,
+        metadata_patch: serde_json::Value,
+        updated_at: DateTime<Utc>,
+    ) -> RouterServerResult<CustodyVault> {
+        let started = Instant::now();
+        let result = sqlx_core::query::query(&format!(
+            r#"
+            UPDATE custody_vaults
+            SET
+                status = 'active',
+                metadata_json = COALESCE(metadata_json, '{{}}'::jsonb) || $2::jsonb,
+                updated_at = $3
+            WHERE id = $1
+              AND visibility = 'internal'
+              AND status = 'failed'
+            RETURNING {CUSTODY_VAULT_SELECT_COLUMNS}
+            "#
+        ))
+        .bind(vault_id)
+        .bind(metadata_patch)
+        .bind(updated_at)
+        .fetch_one(&self.pool)
+        .await;
+        telemetry::record_db_query(
+            "order.reactivate_internal_custody_vault",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        let row = result?;
+
+        self.map_custody_vault_row(&row)
+    }
+
     pub async fn finalize_internal_custody_vaults(
         &self,
         order_id: Uuid,
@@ -1961,11 +2084,9 @@ impl OrderRepository {
             LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
             WHERE ro.status IN (
                 'completed',
-                'refund_required',
-                'refunding',
                 'refunded',
                 'manual_intervention_required',
-                'failed',
+                'refund_manual_intervention_required',
                 'expired'
             )
               AND EXISTS (
@@ -2081,75 +2202,55 @@ impl OrderRepository {
         let started = Instant::now();
         let result = sqlx_core::query_scalar::query_scalar(
             r#"
-            INSERT INTO order_provider_operations (
-                id,
-                order_id,
-                execution_attempt_id,
-                execution_step_id,
-                provider,
-                operation_type,
-                provider_ref,
-                status,
-                request_json,
-                response_json,
-                observed_state_json,
-                created_at,
-                updated_at
+            WITH upserted AS (
+                INSERT INTO order_provider_operations (
+                    id,
+                    order_id,
+                    execution_attempt_id,
+                    execution_step_id,
+                    provider,
+                    operation_type,
+                    provider_ref,
+                    status,
+                    request_json,
+                    response_json,
+                    observed_state_json,
+                    created_at,
+                    updated_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                ON CONFLICT (execution_step_id) WHERE execution_step_id IS NOT NULL
+                DO UPDATE SET
+                    order_id = EXCLUDED.order_id,
+                    execution_attempt_id = EXCLUDED.execution_attempt_id,
+                    provider = EXCLUDED.provider,
+                    operation_type = EXCLUDED.operation_type,
+                    provider_ref = EXCLUDED.provider_ref,
+                    status = EXCLUDED.status,
+                    request_json = EXCLUDED.request_json,
+                    response_json = EXCLUDED.response_json,
+                    observed_state_json = EXCLUDED.observed_state_json,
+                    updated_at = EXCLUDED.updated_at
+                WHERE order_provider_operations.status NOT IN ('completed', 'failed', 'expired')
+                  AND (
+                    order_provider_operations.order_id IS DISTINCT FROM EXCLUDED.order_id
+                    OR order_provider_operations.execution_attempt_id IS DISTINCT FROM EXCLUDED.execution_attempt_id
+                    OR order_provider_operations.provider IS DISTINCT FROM EXCLUDED.provider
+                    OR order_provider_operations.operation_type IS DISTINCT FROM EXCLUDED.operation_type
+                    OR order_provider_operations.provider_ref IS DISTINCT FROM EXCLUDED.provider_ref
+                    OR order_provider_operations.status IS DISTINCT FROM EXCLUDED.status
+                    OR order_provider_operations.request_json IS DISTINCT FROM EXCLUDED.request_json
+                    OR order_provider_operations.response_json IS DISTINCT FROM EXCLUDED.response_json
+                    OR order_provider_operations.observed_state_json IS DISTINCT FROM EXCLUDED.observed_state_json
+                  )
+                RETURNING id
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-            ON CONFLICT (execution_step_id) WHERE execution_step_id IS NOT NULL
-            DO UPDATE SET
-                order_id = CASE
-                    WHEN order_provider_operations.status IN ('completed', 'failed', 'expired')
-                    THEN order_provider_operations.order_id
-                    ELSE EXCLUDED.order_id
-                END,
-                execution_attempt_id = CASE
-                    WHEN order_provider_operations.status IN ('completed', 'failed', 'expired')
-                    THEN order_provider_operations.execution_attempt_id
-                    ELSE EXCLUDED.execution_attempt_id
-                END,
-                provider = CASE
-                    WHEN order_provider_operations.status IN ('completed', 'failed', 'expired')
-                    THEN order_provider_operations.provider
-                    ELSE EXCLUDED.provider
-                END,
-                operation_type = CASE
-                    WHEN order_provider_operations.status IN ('completed', 'failed', 'expired')
-                    THEN order_provider_operations.operation_type
-                    ELSE EXCLUDED.operation_type
-                END,
-                provider_ref = CASE
-                    WHEN order_provider_operations.status IN ('completed', 'failed', 'expired')
-                    THEN order_provider_operations.provider_ref
-                    ELSE EXCLUDED.provider_ref
-                END,
-                status = CASE
-                    WHEN order_provider_operations.status IN ('completed', 'failed', 'expired')
-                    THEN order_provider_operations.status
-                    ELSE EXCLUDED.status
-                END,
-                request_json = CASE
-                    WHEN order_provider_operations.status IN ('completed', 'failed', 'expired')
-                    THEN order_provider_operations.request_json
-                    ELSE EXCLUDED.request_json
-                END,
-                response_json = CASE
-                    WHEN order_provider_operations.status IN ('completed', 'failed', 'expired')
-                    THEN order_provider_operations.response_json
-                    ELSE EXCLUDED.response_json
-                END,
-                observed_state_json = CASE
-                    WHEN order_provider_operations.status IN ('completed', 'failed', 'expired')
-                    THEN order_provider_operations.observed_state_json
-                    ELSE EXCLUDED.observed_state_json
-                END,
-                updated_at = CASE
-                    WHEN order_provider_operations.status IN ('completed', 'failed', 'expired')
-                    THEN order_provider_operations.updated_at
-                    ELSE EXCLUDED.updated_at
-                END
-            RETURNING id
+            SELECT id FROM upserted
+            UNION ALL
+            SELECT id
+            FROM order_provider_operations
+            WHERE execution_step_id = $4
+            LIMIT 1
             "#,
         )
         .bind(operation.id)
@@ -2345,6 +2446,7 @@ impl OrderRepository {
         &self,
         id: Uuid,
         status: ProviderOperationStatus,
+        provider_ref: Option<String>,
         observed_state: serde_json::Value,
         response: Option<serde_json::Value>,
         updated_at: DateTime<Utc>,
@@ -2364,17 +2466,21 @@ impl OrderRepository {
                     WHEN existing.previous_status IN ('completed', 'failed', 'expired') THEN order_provider_operations.status
                     ELSE $2
                 END,
+                provider_ref = CASE
+                    WHEN existing.previous_status IN ('completed', 'failed', 'expired') THEN order_provider_operations.provider_ref
+                    ELSE COALESCE($3, order_provider_operations.provider_ref)
+                END,
                 observed_state_json = CASE
                     WHEN existing.previous_status IN ('completed', 'failed', 'expired') THEN order_provider_operations.observed_state_json
-                    ELSE $3
+                    ELSE $4
                 END,
                 response_json = CASE
                     WHEN existing.previous_status IN ('completed', 'failed', 'expired') THEN order_provider_operations.response_json
-                    ELSE COALESCE($4, response_json)
+                    ELSE COALESCE($5, response_json)
                 END,
                 updated_at = CASE
                     WHEN existing.previous_status IN ('completed', 'failed', 'expired') THEN order_provider_operations.updated_at
-                    ELSE $5
+                    ELSE $6
                 END
             FROM existing
             WHERE id = $1
@@ -2384,6 +2490,7 @@ impl OrderRepository {
         ))
         .bind(id)
         .bind(status.to_db_string())
+        .bind(provider_ref)
         .bind(observed_state)
         .bind(response)
         .bind(updated_at)
@@ -3313,6 +3420,44 @@ impl OrderRepository {
             .collect()
     }
 
+    pub async fn materialize_execution_step_request(
+        &self,
+        id: Uuid,
+        expected_status: OrderExecutionStepStatus,
+        request: serde_json::Value,
+        details: serde_json::Value,
+        updated_at: DateTime<Utc>,
+    ) -> RouterServerResult<OrderExecutionStep> {
+        let started = Instant::now();
+        let result = sqlx_core::query::query(&format!(
+            r#"
+            UPDATE order_execution_steps
+            SET
+                request_json = $2,
+                details_json = $3,
+                updated_at = $4
+            WHERE id = $1
+              AND status = $5
+            RETURNING {EXECUTION_STEP_SELECT_COLUMNS}
+            "#
+        ))
+        .bind(id)
+        .bind(request)
+        .bind(details)
+        .bind(updated_at)
+        .bind(expected_status.to_db_string())
+        .fetch_one(&self.pool)
+        .await;
+        telemetry::record_db_query(
+            "order.materialize_execution_step_request",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        let row = result?;
+
+        self.map_execution_step_row(&row)
+    }
+
     pub async fn get_execution_legs_for_attempt(
         &self,
         execution_attempt_id: Uuid,
@@ -3597,6 +3742,24 @@ impl OrderRepository {
                         rolled_up.first_response_json #>> '{{response,amountIn}}',
                         rolled_up.first_response_json #>> '{{response,input_amount}}',
                         rolled_up.first_response_json #>> '{{response,inputAmount}}',
+                        rolled_up.first_response_json #>> '{{observed_state,amount_in}}',
+                        rolled_up.first_response_json #>> '{{observed_state,amountIn}}',
+                        rolled_up.first_response_json #>> '{{observed_state,actual_amount_in}}',
+                        rolled_up.first_response_json #>> '{{observed_state,actualAmountIn}}',
+                        rolled_up.first_response_json #>> '{{observed_state,input_amount}}',
+                        rolled_up.first_response_json #>> '{{observed_state,inputAmount}}',
+                        rolled_up.first_response_json #>> '{{observed_state,previous_observed_state,amount_in}}',
+                        rolled_up.first_response_json #>> '{{observed_state,previous_observed_state,amountIn}}',
+                        rolled_up.first_response_json #>> '{{observed_state,previous_observed_state,actual_amount_in}}',
+                        rolled_up.first_response_json #>> '{{observed_state,previous_observed_state,actualAmountIn}}',
+                        rolled_up.first_response_json #>> '{{observed_state,previous_observed_state,input_amount}}',
+                        rolled_up.first_response_json #>> '{{observed_state,previous_observed_state,inputAmount}}',
+                        rolled_up.first_response_json #>> '{{observed_state,provider_observed_state,amount_in}}',
+                        rolled_up.first_response_json #>> '{{observed_state,provider_observed_state,amountIn}}',
+                        rolled_up.first_response_json #>> '{{observed_state,provider_observed_state,actual_amount_in}}',
+                        rolled_up.first_response_json #>> '{{observed_state,provider_observed_state,actualAmountIn}}',
+                        rolled_up.first_response_json #>> '{{observed_state,provider_observed_state,input_amount}}',
+                        rolled_up.first_response_json #>> '{{observed_state,provider_observed_state,inputAmount}}',
                         rolled_up.first_response_json #>> '{{provider_context,amount_in}}',
                         rolled_up.first_response_json #>> '{{provider_context,amountIn}}',
                         rolled_up.first_response_json #>> '{{provider_context,input_amount}}',
@@ -3671,6 +3834,24 @@ impl OrderRepository {
                         rolled_up.last_response_json #>> '{{response,outputAmount}}',
                         rolled_up.last_response_json #>> '{{response,expectedOutputAmount}}',
                         rolled_up.last_response_json #>> '{{response,minOutputAmount}}',
+                        rolled_up.last_response_json #>> '{{observed_state,amount_out}}',
+                        rolled_up.last_response_json #>> '{{observed_state,amountOut}}',
+                        rolled_up.last_response_json #>> '{{observed_state,actual_amount_out}}',
+                        rolled_up.last_response_json #>> '{{observed_state,actualAmountOut}}',
+                        rolled_up.last_response_json #>> '{{observed_state,output_amount}}',
+                        rolled_up.last_response_json #>> '{{observed_state,outputAmount}}',
+                        rolled_up.last_response_json #>> '{{observed_state,previous_observed_state,amount_out}}',
+                        rolled_up.last_response_json #>> '{{observed_state,previous_observed_state,amountOut}}',
+                        rolled_up.last_response_json #>> '{{observed_state,previous_observed_state,actual_amount_out}}',
+                        rolled_up.last_response_json #>> '{{observed_state,previous_observed_state,actualAmountOut}}',
+                        rolled_up.last_response_json #>> '{{observed_state,previous_observed_state,output_amount}}',
+                        rolled_up.last_response_json #>> '{{observed_state,previous_observed_state,outputAmount}}',
+                        rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,amount_out}}',
+                        rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,amountOut}}',
+                        rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,actual_amount_out}}',
+                        rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,actualAmountOut}}',
+                        rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,output_amount}}',
+                        rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,outputAmount}}',
                         rolled_up.last_response_json #>> '{{provider_context,amount_out}}',
                         rolled_up.last_response_json #>> '{{provider_context,amountOut}}',
                         rolled_up.last_response_json #>> '{{provider_context,output_amount}}',

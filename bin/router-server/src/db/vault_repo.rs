@@ -368,6 +368,34 @@ impl VaultRepository {
         self.map_row(&row)
     }
 
+    pub async fn find_pending_funding_without_observation(
+        &self,
+        limit: i64,
+    ) -> RouterServerResult<Vec<DepositVault>> {
+        let started = Instant::now();
+        let result = sqlx_core::query::query(&format!(
+            r#"
+            SELECT {SELECT_COLUMNS}
+            FROM {SELECT_FROM}
+            WHERE dv.status = 'pending_funding'
+              AND dv.funding_observed_amount IS NULL
+            ORDER BY dv.created_at ASC, dv.id ASC
+            LIMIT $1
+            "#
+        ))
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await;
+        telemetry::record_db_query(
+            "vault.find_pending_funding_without_observation",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        let rows = result?;
+
+        rows.iter().map(|row| self.map_row(row)).collect()
+    }
+
     pub async fn transition_status(
         &self,
         id: Uuid,
@@ -1097,6 +1125,54 @@ impl VaultRepository {
         .fetch_one(&self.pool)
         .await;
         telemetry::record_db_query("vault.mark_refund_error", result.is_ok(), started.elapsed());
+        let row = result?;
+
+        self.map_row(&row)
+    }
+
+    pub async fn mark_refund_manual_intervention_required(
+        &self,
+        id: Uuid,
+        updated_at: DateTime<Utc>,
+        last_refund_error: &str,
+        claimed_by: &str,
+        claimed_until: DateTime<Utc>,
+    ) -> RouterServerResult<DepositVault> {
+        let started = Instant::now();
+        let result = sqlx_core::query::query(&format!(
+            r#"
+            WITH updated AS (
+            UPDATE deposit_vaults
+            SET
+                status = 'refund_manual_intervention_required',
+                last_refund_error = $3,
+                refund_next_attempt_at = NULL,
+                refund_claimed_by = NULL,
+                refund_claimed_until = NULL,
+                updated_at = $2
+            WHERE id = $1
+              AND status = 'refunding'
+              AND refund_claimed_by = $4
+              AND refund_claimed_until IS NOT DISTINCT FROM $5::timestamptz
+            RETURNING *
+            )
+            SELECT {SELECT_COLUMNS}
+            FROM updated dv
+            JOIN custody_vaults cv ON cv.id = dv.id
+            "#
+        ))
+        .bind(id)
+        .bind(updated_at)
+        .bind(last_refund_error)
+        .bind(claimed_by)
+        .bind(claimed_until)
+        .fetch_one(&self.pool)
+        .await;
+        telemetry::record_db_query(
+            "vault.mark_refund_manual_intervention_required",
+            result.is_ok(),
+            started.elapsed(),
+        );
         let row = result?;
 
         self.map_row(&row)

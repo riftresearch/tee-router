@@ -114,7 +114,12 @@ pub type CustodyActionResult<T> = Result<T, CustodyActionError>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "params", rename_all = "snake_case")]
 pub enum CustodyAction {
-    Transfer { to_address: String, amount: String },
+    Transfer {
+        to_address: String,
+        amount: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bitcoin_fee_budget_sats: Option<String>,
+    },
     Call(ChainCall),
 }
 
@@ -437,8 +442,16 @@ impl CustodyActionExecutor {
         })?;
 
         let (tx_hash, logs, response) = match request.action {
-            CustodyAction::Transfer { to_address, amount } => {
+            CustodyAction::Transfer {
+                to_address,
+                amount,
+                bitcoin_fee_budget_sats,
+            } => {
                 let amount = parse_positive_u256("amount", &amount)?;
+                let bitcoin_fee_budget = bitcoin_fee_budget_sats
+                    .as_deref()
+                    .map(|value| parse_positive_u256("bitcoin_fee_budget_sats", value))
+                    .transpose()?;
                 let asset = vault.asset.as_ref().ok_or_else(|| {
                     CustodyActionError::MissingTransferAsset { vault_id: vault.id }
                 })?;
@@ -484,6 +497,7 @@ impl CustodyActionExecutor {
                                         wallet.private_key(),
                                         &to_address,
                                         amount,
+                                        bitcoin_fee_budget,
                                         &outpoint.tx_hash,
                                         outpoint.vout,
                                         outpoint.amount_sats,
@@ -496,6 +510,7 @@ impl CustodyActionExecutor {
                                         wallet.private_key(),
                                         &to_address,
                                         amount,
+                                        bitcoin_fee_budget,
                                     )
                                     .await
                                     .map_err(|source| CustodyActionError::Chain { source })?

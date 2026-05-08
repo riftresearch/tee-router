@@ -86,7 +86,7 @@ impl RouterServerError {
             Self::Validation { .. } => StatusCode::BAD_REQUEST,
             Self::Conflict { .. } => StatusCode::CONFLICT,
             Self::NoRoute { .. } => StatusCode::UNPROCESSABLE_ENTITY,
-            Self::NotReady { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            Self::NotReady { .. } => StatusCode::TOO_EARLY,
             Self::InvalidData { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::DatabaseQuery { .. } | Self::Migration { .. } | Self::Internal { .. } => {
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -280,6 +280,20 @@ mod tests {
 
         assert_eq!(error.status_code(), StatusCode::BAD_REQUEST);
         assert_eq!(error.public_message(), "Validation error: bad input");
+    }
+
+    #[test]
+    fn not_ready_is_retryable_without_being_a_server_error() {
+        let error = RouterServerError::NotReady {
+            message: "backend observation is still catching up".to_string(),
+        };
+
+        assert_eq!(error.status_code(), StatusCode::TOO_EARLY);
+        assert!(!error.status_code().is_server_error());
+        assert_eq!(
+            error.public_message(),
+            "Not ready: backend observation is still catching up"
+        );
     }
 
     #[test]
