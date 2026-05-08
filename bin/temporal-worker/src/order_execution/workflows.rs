@@ -1,41 +1,145 @@
-use temporalio_macros::{workflow, workflow_methods};
-use temporalio_sdk::{SyncWorkflowContext, WorkflowContext, WorkflowContextView, WorkflowResult};
+use std::time::Duration;
 
+use temporalio_common::protos::temporal::api::common::v1::RetryPolicy;
+use temporalio_macros::{workflow, workflow_methods};
+use temporalio_sdk::{
+    ActivityOptions, SyncWorkflowContext, WorkflowContext, WorkflowContextView, WorkflowResult,
+};
+use uuid::Uuid;
+
+use super::activities::OrderActivities;
 use super::types::{
-    FundingVaultFundedSignal, ManualInterventionReleaseSignal, ManualRefundTriggerSignal,
-    OrderWorkflowDebugCursor, OrderWorkflowInput, OrderWorkflowOutput,
-    ProviderHintPollWorkflowInput, ProviderHintPollWorkflowOutput, ProviderOperationHintSignal,
-    QuoteRefreshWorkflowInput, QuoteRefreshWorkflowOutput, RefundWorkflowInput,
-    RefundWorkflowOutput, StaleRunningStepWatchdogInput, StaleRunningStepWatchdogOutput,
+    ExecuteStepInput, FundingVaultFundedSignal, LoadOrderInput, ManualInterventionReleaseSignal,
+    ManualRefundTriggerSignal, MarkOrderCompletedInput, OrderTerminalStatus,
+    OrderWorkflowDebugCursor, OrderWorkflowInput, OrderWorkflowOutput, OrderWorkflowPhase,
+    PersistExecutionStartInput, PersistStepCompletionInput, ProviderHintPollWorkflowInput,
+    ProviderHintPollWorkflowOutput, ProviderOperationHintSignal, QuoteRefreshWorkflowInput,
+    QuoteRefreshWorkflowOutput, RefundWorkflowInput, RefundWorkflowOutput,
+    StaleRunningStepWatchdogInput, StaleRunningStepWatchdogOutput, StepExecutionOutcome,
 };
 
 /// Root order execution workflow.
 ///
 /// Scar tissue: §3 phase pass, §4 state alignment, and §14 benign CAS races.
 #[workflow]
-#[derive(Default)]
-pub struct OrderWorkflow;
+pub struct OrderWorkflow {
+    order_id: Option<Uuid>,
+    phase: OrderWorkflowPhase,
+    active_attempt_id: Option<Uuid>,
+    active_step_id: Option<Uuid>,
+}
+
+impl Default for OrderWorkflow {
+    fn default() -> Self {
+        Self {
+            order_id: None,
+            phase: OrderWorkflowPhase::WaitingForFunding,
+            active_attempt_id: None,
+            active_step_id: None,
+        }
+    }
+}
 
 #[workflow_methods]
 impl OrderWorkflow {
     #[run]
     pub async fn run(
-        _ctx: &mut WorkflowContext<Self>,
-        _input: OrderWorkflowInput,
+        ctx: &mut WorkflowContext<Self>,
+        input: OrderWorkflowInput,
     ) -> WorkflowResult<OrderWorkflowOutput> {
-        // TODO(PR3, brief §6 invariant 1; scar §2): call the six persistence boundaries as six
-        // distinct activities.
+        ctx.state_mut(|state| {
+            state.order_id = Some(input.order_id);
+            state.phase = OrderWorkflowPhase::WaitingForFunding;
+        });
+        let db_activity_options = db_activity_options();
+        let execute_activity_options = execute_activity_options();
+
+        let loaded = ctx
+            .start_activity(
+                OrderActivities::load_order,
+                LoadOrderInput {
+                    order_id: input.order_id,
+                },
+                db_activity_options.clone(),
+            )
+            .await?;
+
+        // TODO(PR4, brief §6 invariant 3; scar §6): start the stale-running-step watchdog child
+        // before provider execution and surface manual intervention after five minutes without a
+        // checkpoint.
+        let execution_start = ctx
+            .start_activity(
+                OrderActivities::persist_execution_start,
+                PersistExecutionStartInput {
+                    order_id: input.order_id,
+                    plan: loaded.plan,
+                },
+                db_activity_options.clone(),
+            )
+            .await?;
+        ctx.state_mut(|state| {
+            state.phase = OrderWorkflowPhase::Executing;
+            state.active_attempt_id = Some(execution_start.attempt_id);
+            state.active_step_id = Some(execution_start.step_id);
+        });
+
+        let executed = ctx
+            .start_activity(
+                OrderActivities::execute_step,
+                ExecuteStepInput {
+                    order_id: input.order_id,
+                    attempt_id: execution_start.attempt_id,
+                    step_id: execution_start.step_id,
+                },
+                execute_activity_options,
+            )
+            .await?;
+        if executed.outcome != StepExecutionOutcome::Completed {
+            return Err(anyhow::Error::from(std::io::Error::other(format!(
+                "PR3 OrderWorkflow only supports completed single-step execution, got {:?}",
+                executed.outcome
+            )))
+            .into());
+        }
+
+        let _step_completion = ctx
+            .start_activity(
+                OrderActivities::persist_step_completion,
+                PersistStepCompletionInput {
+                    execution: executed,
+                },
+                db_activity_options.clone(),
+            )
+            .await?;
+
+        ctx.state_mut(|state| {
+            state.phase = OrderWorkflowPhase::Finalizing;
+        });
+        let _completed = ctx
+            .start_activity(
+                OrderActivities::mark_order_completed,
+                MarkOrderCompletedInput {
+                    order_id: input.order_id,
+                    attempt_id: execution_start.attempt_id,
+                },
+                db_activity_options,
+            )
+            .await?;
+
+        // TODO(PR4, brief §6 invariant 1; scar §2): split this happy-path composite when adding
+        // retry/refund branches that need the remaining historical crash checkpoints.
         // TODO(PR4, brief §6 invariant 2; scar §5): route refund failures to manual
         // intervention, never to retry.
-        // TODO(PR4, brief §6 invariant 3; scar §6): start the stale-running-step watchdog child
-        // and surface manual intervention after five minutes without a checkpoint.
         // TODO(PR4, brief §6 invariant 4; scar §8): start refund only after single-position
         // discovery succeeds.
         // TODO(PR4, brief §6 invariant 5; scar §7): start quote refresh as a child workflow that
         // creates its own attempt.
         // Child-workflow shape: RefundWorkflow, QuoteRefreshWorkflow,
         // StaleRunningStepWatchdogWorkflow, and ProviderHintPollWorkflow.
-        todo!("PR3: orchestrate order execution workflow")
+        Ok(OrderWorkflowOutput {
+            order_id: input.order_id,
+            terminal_status: OrderTerminalStatus::Completed,
+        })
     }
 
     /// Scar tissue: §4 order/vault/step state alignment.
@@ -80,8 +184,31 @@ impl OrderWorkflow {
     /// state.
     #[query]
     pub fn debug_cursor(&self, _ctx: &WorkflowContextView) -> OrderWorkflowDebugCursor {
-        todo!("PR3: expose workflow debug cursor")
+        OrderWorkflowDebugCursor {
+            order_id: self.order_id.unwrap_or_else(Uuid::nil),
+            phase: self.phase,
+            active_attempt_id: self.active_attempt_id,
+            active_step_id: self.active_step_id,
+        }
     }
+}
+
+fn db_activity_options() -> ActivityOptions {
+    ActivityOptions::with_start_to_close_timeout(Duration::from_secs(30))
+        .retry_policy(RetryPolicy {
+            maximum_attempts: 5,
+            ..Default::default()
+        })
+        .build()
+}
+
+fn execute_activity_options() -> ActivityOptions {
+    ActivityOptions::with_start_to_close_timeout(Duration::from_secs(120))
+        .retry_policy(RetryPolicy {
+            maximum_attempts: 3,
+            ..Default::default()
+        })
+        .build()
 }
 
 /// Refund child workflow.

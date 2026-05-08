@@ -8,10 +8,12 @@ repository.workspace = true
 [dependencies]
 # Required by temporalio-macros 0.4.0 expansion; spike-owned errors still use snafu.
 anyhow = "1.0"
+chrono = { workspace = true }
 clap = { workspace = true }
 futures = "0.3"
 futures-util = "0.3"
 serde = { workspace = true }
+serde_json = { workspace = true }
 snafu = { workspace = true }
 router-core = { workspace = true }
 temporalio-client = { workspace = true }
@@ -24,3 +26,15 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+alloy = { workspace = true }
+chains = { workspace = true }
+devnet = { workspace = true }
+eip3009-erc20-contract = { workspace = true }
+router-primitives = { workspace = true }
+router-server = { path = "../router-server" }
+sqlx-core = { workspace = true }
+sqlx-postgres = { workspace = true }
+tempfile = { workspace = true }
+testcontainers = "0.27.2"
