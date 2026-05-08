@@ -3583,7 +3583,7 @@ fn parse_decimal_to_raw_units_floor(value: &str, decimals: u8) -> ProviderResult
         .map_err(|err| format!("invalid decimal amount {value:?}: {err}"))
 }
 
-pub(crate) fn unit_withdrawal_minimum_raw(asset: &DepositAsset) -> U256 {
+pub fn unit_withdrawal_minimum_raw(asset: &DepositAsset) -> U256 {
     if asset.chain.as_str() == "bitcoin" && matches!(asset.asset, AssetId::Native) {
         U256::from(30_000u64)
     } else {

@@ -16,7 +16,7 @@ use alloy::{
     sol,
     sol_types::SolCall,
 };
-use router_server::{
+use router_core::{
     models::{MarketOrderKind, ProviderOperationStatus, ProviderOperationType},
     protocol::{AssetId, ChainId, DepositAsset},
     services::action_providers::{
@@ -461,7 +461,7 @@ fn live_cctp_provider() -> TestResult<CctpProvider> {
         live_cctp_base_url()?.to_string(),
         format!("{TOKEN_MESSENGER_V2:#x}"),
         format!("{MESSAGE_TRANSMITTER_V2:#x}"),
-        std::sync::Arc::new(router_server::services::AssetRegistry::default()),
+        std::sync::Arc::new(router_core::services::AssetRegistry::default()),
     )
     .map_err(|error| format!("build CCTP provider: {error}").into())
 }

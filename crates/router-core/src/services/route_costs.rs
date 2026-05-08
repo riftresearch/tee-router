@@ -1,6 +1,6 @@
 use crate::{
     db::Database,
-    error::{RouterServerError, RouterServerResult},
+    error::{RouterCoreError, RouterCoreResult},
     models::MarketOrderKind,
     protocol::DepositAsset,
     services::{
@@ -147,7 +147,7 @@ impl RouteCostService {
         pricing_snapshot_is_fresh(&pricing, Utc::now(), self.ttl).then_some(pricing)
     }
 
-    pub async fn refresh_anchor_costs(&self) -> RouterServerResult<RouteCostRefreshSummary> {
+    pub async fn refresh_anchor_costs(&self) -> RouterCoreResult<RouteCostRefreshSummary> {
         let now = Utc::now();
         let expires_at = now
             + chrono::Duration::from_std(self.ttl)
@@ -203,7 +203,7 @@ impl RouteCostService {
     pub async fn rank_transition_paths(
         &self,
         paths: &mut [TransitionPath],
-    ) -> RouterServerResult<()> {
+    ) -> RouterCoreResult<()> {
         let snapshots = self
             .db
             .route_costs()
@@ -370,12 +370,12 @@ fn require_live_pricing_for_route_cost_refresh(
     snapshot: &PricingSnapshot,
     now: DateTime<Utc>,
     ttl: Duration,
-) -> RouterServerResult<()> {
+) -> RouterCoreResult<()> {
     if pricing_snapshot_is_fresh(snapshot, now, ttl) {
         return Ok(());
     }
 
-    Err(RouterServerError::NotReady {
+    Err(RouterCoreError::NotReady {
         message: format!(
             "live market pricing is unavailable or stale; refusing to refresh route costs from {}",
             snapshot.source
@@ -968,7 +968,7 @@ mod tests {
         let static_pricing = PricingSnapshot::static_bootstrap(now);
         let error =
             require_live_pricing_for_route_cost_refresh(&static_pricing, now, ttl).unwrap_err();
-        assert!(matches!(error, RouterServerError::NotReady { .. }));
+        assert!(matches!(error, RouterCoreError::NotReady { .. }));
         assert!(
             error
                 .to_string()

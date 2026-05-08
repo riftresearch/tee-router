@@ -1,19 +1,18 @@
-use crate::{
-    db::Database,
-    error::{RouterServerError, RouterServerResult},
-    models::{ProviderHealthCheck, ProviderHealthStatus},
-};
+use crate::error::{RouterServerError, RouterServerResult};
 use chrono::Utc;
 use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE},
     Client, Method, Proxy, StatusCode,
 };
+use router_core::{
+    db::Database,
+    models::{ProviderHealthCheck, ProviderHealthStatus},
+    services::http_body::read_limited_response_text,
+};
 use serde_json::Value;
 use std::{collections::HashMap, sync::Arc, time::Duration, time::Instant};
 use tokio::sync::RwLock;
 use tracing::warn;
-
-use super::http_body::read_limited_response_text;
 
 const MAX_PROVIDER_HEALTH_RESPONSE_BODY_BYTES: usize = 64 * 1024;
 
@@ -70,7 +69,12 @@ impl ProviderHealthService {
             }
         }
 
-        let checks = self.db.provider_health().list().await?;
+        let checks = self
+            .db
+            .provider_health()
+            .list()
+            .await
+            .map_err(RouterServerError::from)?;
         let snapshot = ProviderHealthSnapshot {
             checks: checks
                 .into_iter()
@@ -86,14 +90,23 @@ impl ProviderHealthService {
     }
 
     pub async fn list(&self) -> RouterServerResult<Vec<ProviderHealthCheck>> {
-        self.db.provider_health().list().await
+        self.db
+            .provider_health()
+            .list()
+            .await
+            .map_err(RouterServerError::from)
     }
 
     pub async fn upsert(
         &self,
         check: &ProviderHealthCheck,
     ) -> RouterServerResult<ProviderHealthCheck> {
-        let stored = self.db.provider_health().upsert(check).await?;
+        let stored = self
+            .db
+            .provider_health()
+            .upsert(check)
+            .await
+            .map_err(RouterServerError::from)?;
         let mut cache = self.cache.write().await;
         *cache = None;
         Ok(stored)

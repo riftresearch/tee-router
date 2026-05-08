@@ -59,6 +59,34 @@ impl From<sqlx_core::migrate::MigrateError> for RouterServerError {
     }
 }
 
+impl From<router_core::error::RouterCoreError> for RouterServerError {
+    fn from(err: router_core::error::RouterCoreError) -> Self {
+        match err {
+            router_core::error::RouterCoreError::DatabaseQuery { source } => {
+                Self::DatabaseQuery { source }
+            }
+            router_core::error::RouterCoreError::NotFound => Self::NotFound,
+            router_core::error::RouterCoreError::InvalidData { message } => {
+                Self::InvalidData { message }
+            }
+            router_core::error::RouterCoreError::Migration { source } => Self::Migration { source },
+            router_core::error::RouterCoreError::Validation { message } => {
+                Self::Validation { message }
+            }
+            router_core::error::RouterCoreError::Conflict { message } => Self::Conflict { message },
+            router_core::error::RouterCoreError::Unauthorized { message } => {
+                Self::Unauthorized { message }
+            }
+            router_core::error::RouterCoreError::Forbidden { message } => {
+                Self::Forbidden { message }
+            }
+            router_core::error::RouterCoreError::NoRoute { message } => Self::NoRoute { message },
+            router_core::error::RouterCoreError::NotReady { message } => Self::NotReady { message },
+            router_core::error::RouterCoreError::Internal { message } => Self::Internal { message },
+        }
+    }
+}
+
 impl IntoResponse for RouterServerError {
     fn into_response(self) -> Response {
         let status = self.status_code();

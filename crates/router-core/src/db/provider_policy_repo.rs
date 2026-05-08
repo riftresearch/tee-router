@@ -1,5 +1,5 @@
 use crate::{
-    error::{RouterServerError, RouterServerResult},
+    error::{RouterCoreError, RouterCoreResult},
     models::{ProviderExecutionPolicyState, ProviderPolicy, ProviderQuotePolicyState},
     telemetry,
 };
@@ -27,7 +27,7 @@ impl ProviderPolicyRepository {
         Self { pool }
     }
 
-    pub async fn list(&self) -> RouterServerResult<Vec<ProviderPolicy>> {
+    pub async fn list(&self) -> RouterCoreResult<Vec<ProviderPolicy>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -43,7 +43,7 @@ impl ProviderPolicyRepository {
         rows.iter().map(map_provider_policy_row).collect()
     }
 
-    pub async fn upsert(&self, policy: &ProviderPolicy) -> RouterServerResult<ProviderPolicy> {
+    pub async fn upsert(&self, policy: &ProviderPolicy) -> RouterCoreResult<ProviderPolicy> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -89,16 +89,16 @@ impl ProviderPolicyRepository {
     }
 }
 
-fn map_provider_policy_row(row: &sqlx_postgres::PgRow) -> RouterServerResult<ProviderPolicy> {
+fn map_provider_policy_row(row: &sqlx_postgres::PgRow) -> RouterCoreResult<ProviderPolicy> {
     let quote_state = row.get::<String, _>("quote_state");
     let quote_state = ProviderQuotePolicyState::from_db_string(&quote_state).ok_or_else(|| {
-        RouterServerError::InvalidData {
+        RouterCoreError::InvalidData {
             message: format!("unsupported provider quote_state: {quote_state}"),
         }
     })?;
     let execution_state = row.get::<String, _>("execution_state");
     let execution_state = ProviderExecutionPolicyState::from_db_string(&execution_state)
-        .ok_or_else(|| RouterServerError::InvalidData {
+        .ok_or_else(|| RouterCoreError::InvalidData {
             message: format!("unsupported provider execution_state: {execution_state}"),
         })?;
     Ok(ProviderPolicy {

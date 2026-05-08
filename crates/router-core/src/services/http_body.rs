@@ -1,11 +1,11 @@
-pub(crate) struct LimitedResponseBody {
-    pub(crate) text: String,
-    pub(crate) truncated: bool,
+pub struct LimitedResponseBody {
+    pub text: String,
+    pub truncated: bool,
 }
 
 const RESPONSE_BODY_ERROR_PREVIEW_CHARS: usize = 4 * 1024;
 
-pub(crate) async fn read_limited_response_text(
+pub async fn read_limited_response_text(
     mut response: reqwest::Response,
     max_bytes: usize,
 ) -> Result<LimitedResponseBody, reqwest::Error> {
@@ -37,7 +37,7 @@ fn append_limited_body_chunk(body: &mut Vec<u8>, chunk: &[u8], max_bytes: usize)
     true
 }
 
-pub(crate) fn response_body_error_preview(value: &str) -> String {
+pub fn response_body_error_preview(value: &str) -> String {
     let mut end = 0;
     for (count, (index, ch)) in value.char_indices().enumerate() {
         if count == RESPONSE_BODY_ERROR_PREVIEW_CHARS {

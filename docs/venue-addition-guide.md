@@ -134,7 +134,7 @@ Touchpoints:
 
 - `bin/router-server/src/models.rs`
 - `bin/router-server/src/db/order_repo.rs`
-- `bin/router-server/migrations/*.sql`
+- `crates/router-core/migrations/*.sql`
 - `docs/market-order-action-spec.md`
 
 Required work:

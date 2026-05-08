@@ -9,14 +9,7 @@ use crate::{
     },
     app::{initialize_components, PaymasterMode, RouterComponents},
     error::{RouterServerError, RouterServerResult},
-    models::{
-        DepositRequirements, DepositVault, DepositVaultEnvelope, DepositVaultFundingHint,
-        OrderProviderOperationHint, ProviderOperationHintStatus, RouterOrder, RouterOrderEnvelope,
-        RouterOrderQuoteEnvelope, StatusResponse, VaultAction,
-    },
-    protocol::{backend_chain_for_id, supported_chain_ids, ChainId},
     services::{
-        action_providers::ProviderOperationObservation, asset_registry::ProviderId,
         AddressScreeningPurpose, AddressScreeningService, OrderExecutionManager, OrderManager,
         ProviderHealthService, ProviderPolicyService, VaultManager,
     },
@@ -37,6 +30,15 @@ use axum::{
 };
 use chains::ChainRegistry;
 use chrono::Utc;
+use router_core::{
+    models::{
+        DepositRequirements, DepositVault, DepositVaultEnvelope, DepositVaultFundingHint,
+        OrderProviderOperationHint, ProviderOperationHintStatus, RouterOrder, RouterOrderEnvelope,
+        RouterOrderQuoteEnvelope, StatusResponse, VaultAction,
+    },
+    protocol::{backend_chain_for_id, supported_chain_ids, ChainId},
+    services::{action_providers::ProviderOperationObservation, asset_registry::ProviderId},
+};
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use snafu::{FromString, ResultExt, Whatever};
@@ -158,7 +160,7 @@ impl AdminApiAuth {
 
 #[derive(Clone)]
 pub struct AppState {
-    pub db: crate::db::Database,
+    pub db: router_core::db::Database,
     pub vault_manager: Arc<VaultManager>,
     pub order_manager: Arc<OrderManager>,
     pub order_execution_manager: Arc<OrderExecutionManager>,
@@ -733,7 +735,7 @@ async fn get_provider_health(
     authorize_gateway_api_request(&state, &headers)?;
     let providers = state.provider_health.list().await?;
     Ok(Json(ProviderHealthEnvelope {
-        status: crate::models::ProviderHealthSummaryStatus::from_checks(&providers),
+        status: router_core::models::ProviderHealthSummaryStatus::from_checks(&providers),
         timestamp: Utc::now(),
         providers,
     }))

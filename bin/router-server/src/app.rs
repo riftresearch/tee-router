@@ -1,17 +1,9 @@
 use crate::{
-    config::Settings,
-    db::Database,
     error::RouterServerError,
     services::{
-        custody_action_executor::{
-            bitcoin_address_from_private_key, evm_address_from_private_key,
-            HyperliquidRuntimeConfig, PaymasterRegistry,
-        },
-        AcrossHttpProviderConfig, ActionProviderHttpOptions, ActionProviderRegistry,
-        AddressScreeningService, CctpHttpProviderConfig, CustodyActionExecutor,
-        OrderExecutionManager, OrderManager, ProviderHealthPoller, ProviderHealthProbe,
-        ProviderHealthService, ProviderId, ProviderPolicyService, RouteCostService,
-        RouteMinimumService, VaultManager, VeloraHttpProviderConfig,
+        AddressScreeningService, OrderExecutionManager, OrderManager, ProviderHealthPoller,
+        ProviderHealthProbe, ProviderHealthService, ProviderPolicyService, RouteMinimumService,
+        VaultManager,
     },
     Result, RouterServerArgs,
 };
@@ -23,6 +15,22 @@ use chains::{
     ChainRegistry,
 };
 use market_pricing::{MarketPricingOracle, MarketPricingOracleConfig};
+use router_core::{
+    config::Settings,
+    db::Database,
+    services::{
+        action_providers::{
+            AcrossHttpProviderConfig, ActionProviderHttpOptions, ActionProviderRegistry,
+            CctpHttpProviderConfig, VeloraHttpProviderConfig,
+        },
+        asset_registry::ProviderId,
+        custody_action_executor::{
+            bitcoin_address_from_private_key, evm_address_from_private_key, CustodyActionExecutor,
+            HyperliquidRuntimeConfig, PaymasterRegistry,
+        },
+        route_costs::RouteCostService,
+    },
+};
 use router_primitives::ChainType;
 use snafu::ResultExt;
 use std::{sync::Arc, time::Duration};
@@ -88,6 +96,7 @@ pub async fn initialize_components_with_action_providers(
         args.db_min_connections,
     )
     .await
+    .map_err(RouterServerError::from)
     .context(crate::DatabaseInitSnafu)?;
 
     reject_shared_hyperliquid_execution_config(args)?;
@@ -665,7 +674,7 @@ mod tests {
             router_gateway_api_key: None,
             router_admin_api_key: None,
             hyperliquid_network:
-                crate::services::custody_action_executor::HyperliquidCallNetwork::Mainnet,
+                router_core::services::custody_action_executor::HyperliquidCallNetwork::Mainnet,
             hyperliquid_order_timeout_ms: 30_000,
             worker_id: None,
             worker_lease_name: Some("global-router-worker".to_string()),

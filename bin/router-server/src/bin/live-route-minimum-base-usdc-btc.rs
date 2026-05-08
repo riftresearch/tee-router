@@ -1,7 +1,7 @@
 use alloy::{
     primitives::Address, providers::ProviderBuilder, signers::local::PrivateKeySigner, sol,
 };
-use router_server::{
+use router_core::{
     models::MarketOrderKind,
     protocol::{AssetId, ChainId, DepositAsset},
     services::{

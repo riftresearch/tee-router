@@ -303,7 +303,7 @@ Touchpoints:
 - `bin/sauron/src/discovery/evm_erc20.rs`
 - `bin/sauron/src/discovery/bitcoin.rs`
 - new `bin/sauron/src/discovery/<chain>.rs` if needed
-- `bin/router-server/migrations/*router_cdc*.sql` if watch-trigger tables change
+- `crates/router-core/migrations/*router_cdc*.sql` if watch-trigger tables change
 
 Required work:
 
@@ -479,7 +479,7 @@ Completion criteria:
 
 Touchpoints:
 
-- `bin/router-server/migrations/*.sql`
+- `crates/router-core/migrations/*.sql`
 - `bin/router-server/src/db/*`
 - `bin/sauron/src/watch.rs`
 

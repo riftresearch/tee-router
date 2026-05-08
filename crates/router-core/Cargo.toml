@@ -1,0 +1,39 @@
+[package]
+name = "router-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+blockchain-utils = { workspace = true }
+chains = { workspace = true }
+hyperliquid-client = { workspace = true }
+hyperunit-client = { workspace = true }
+market-pricing = { workspace = true }
+observability = { workspace = true }
+router-primitives = { workspace = true }
+
+alloy = { workspace = true }
+async-trait = { workspace = true }
+bitcoin = { workspace = true }
+bitcoincore-rpc-async = { workspace = true }
+chrono = { workspace = true }
+getrandom = { workspace = true }
+metrics = { workspace = true }
+reqwest = { workspace = true, features = ["socks"] }
+secrecy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+snafu = { workspace = true }
+sqlx-core = { workspace = true }
+sqlx-postgres = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

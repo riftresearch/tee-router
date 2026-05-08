@@ -12,12 +12,10 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use metrics::{gauge, histogram};
 use reqwest::StatusCode;
+use router_core::models::{ProviderOperationHintKind, SAURON_DETECTOR_HINT_SOURCE};
 use router_primitives::{ChainType, TokenIdentifier};
-use router_server::{
-    api::{
-        DetectorHintEnvelope, DetectorHintRequest, DetectorHintTarget, MAX_HINT_IDEMPOTENCY_KEY_LEN,
-    },
-    models::{ProviderOperationHintKind, SAURON_DETECTOR_HINT_SOURCE},
+use router_server::api::{
+    DetectorHintEnvelope, DetectorHintRequest, DetectorHintTarget, MAX_HINT_IDEMPOTENCY_KEY_LEN,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};

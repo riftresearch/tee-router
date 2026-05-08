@@ -19,17 +19,10 @@ use devnet::{
     RiftDevnet,
 };
 use eip3009_erc20_contract::GenericEIP3009ERC20::GenericEIP3009ERC20Instance;
-use router_primitives::ChainType;
-use router_server::{
-    api::{
-        CreateOrderRequest, CreateVaultRequest, LimitOrderQuoteRequest, MarketOrderQuoteKind,
-        MarketOrderQuoteRequest, OrderFlowEnvelope, ProviderPolicyEnvelope,
-        ProviderPolicyListEnvelope,
-    },
-    app::{initialize_components, PaymasterMode, RouterComponents},
+use router_core::{
     config::Settings,
     db::Database,
-    error::RouterServerError,
+    error::RouterCoreError,
     models::{
         CustodyVault, CustodyVaultControlType, CustodyVaultRole, CustodyVaultStatus,
         CustodyVaultVisibility, DepositVaultFundingHint, DepositVaultFundingObservation,
@@ -46,7 +39,6 @@ use router_server::{
         SAURON_DETECTOR_HINT_SOURCE,
     },
     protocol::{AssetId, ChainId, DepositAsset},
-    server::{build_api_router, AdminApiAuth, AppState, GatewayApiAuth, InternalApiAuth},
     services::{
         action_providers::{
             AcrossHttpProviderConfig, BridgeExecutionRequest, BridgeProvider, BridgeQuote,
@@ -54,15 +46,32 @@ use router_server::{
             ExchangeQuote, ExchangeQuoteRequest, ProviderFuture, UnitDepositStepRequest,
             UnitProvider, UnitWithdrawalStepRequest, VeloraProvider,
         },
-        deposit_address::derive_deposit_address_for_quote,
+        asset_registry::AssetRegistry,
+        custody_action_executor::{
+            ChainCall, CustodyAction, CustodyActionExecutor, CustodyActionRequest, EvmCall,
+        },
         market_order_planner::MarketOrderRoutePlanner,
+        pricing::PricingSnapshot,
+        route_costs::{RouteCostService, RouteCostSnapshot},
+        ActionProviderRegistry, ProviderAddressIntent, ProviderExecutionIntent,
+        ProviderExecutionState, ProviderOperationIntent, VeloraHttpProviderConfig,
+    },
+};
+use router_primitives::ChainType;
+use router_server::{
+    api::{
+        CreateOrderRequest, CreateVaultRequest, LimitOrderQuoteRequest, MarketOrderQuoteKind,
+        MarketOrderQuoteRequest, OrderFlowEnvelope, ProviderPolicyEnvelope,
+        ProviderPolicyListEnvelope,
+    },
+    app::{initialize_components, PaymasterMode, RouterComponents},
+    server::{build_api_router, AdminApiAuth, AppState, GatewayApiAuth, InternalApiAuth},
+    services::{
+        deposit_address::derive_deposit_address_for_quote,
         order_manager::{MarketOrderError, OrderManager},
         vault_manager::{VaultError, VaultManager},
-        ActionProviderRegistry, AssetRegistry, ChainCall, CustodyAction, CustodyActionExecutor,
-        CustodyActionRequest, EvmCall, OrderExecutionCrashInjector, OrderExecutionCrashPoint,
-        OrderExecutionManager, PricingSnapshot, ProviderAddressIntent, ProviderExecutionIntent,
-        ProviderExecutionState, ProviderOperationIntent, ProviderOperationStatusUpdate,
-        RouteCostService, RouteCostSnapshot, RouteMinimumService, VeloraHttpProviderConfig,
+        OrderExecutionCrashInjector, OrderExecutionCrashPoint, OrderExecutionManager,
+        ProviderOperationStatusUpdate, RouteMinimumService,
     },
     RouterServerArgs,
 };
@@ -683,7 +692,7 @@ fn test_router_args(
         router_gateway_api_key: None,
         router_admin_api_key: None,
         hyperliquid_network:
-            router_server::services::custody_action_executor::HyperliquidCallNetwork::Mainnet,
+            router_core::services::custody_action_executor::HyperliquidCallNetwork::Mainnet,
         hyperliquid_order_timeout_ms: 30_000,
         worker_id: None,
         worker_lease_name: Some("global-router-worker".to_string()),
@@ -952,12 +961,12 @@ fn test_hyperliquid_paymaster_private_key() -> String {
 
 fn test_paymaster_registry(
     h: &TestHarness,
-) -> router_server::services::custody_action_executor::PaymasterRegistry {
-    let mut paymasters = router_server::services::custody_action_executor::PaymasterRegistry::new();
+) -> router_core::services::custody_action_executor::PaymasterRegistry {
+    let mut paymasters = router_core::services::custody_action_executor::PaymasterRegistry::new();
     let evm_address_from_private_key =
-        router_server::services::custody_action_executor::evm_address_from_private_key;
+        router_core::services::custody_action_executor::evm_address_from_private_key;
     let bitcoin_address_from_private_key =
-        router_server::services::custody_action_executor::bitcoin_address_from_private_key;
+        router_core::services::custody_action_executor::bitcoin_address_from_private_key;
 
     paymasters.register(
         ChainType::Ethereum,
@@ -1125,38 +1134,34 @@ impl UnitProvider for CustodyIntentUnitProvider {
 
     fn observe_unit_operation<'a>(
         &'a self,
-        request: router_server::services::ProviderOperationObservationRequest,
-    ) -> ProviderFuture<'a, Option<router_server::services::ProviderOperationObservation>> {
+        request: router_core::services::ProviderOperationObservationRequest,
+    ) -> ProviderFuture<'a, Option<router_core::services::ProviderOperationObservation>> {
         Box::pin(async move {
             let Some(tx_hash) = request.hint_evidence.get("tx_hash").and_then(Value::as_str) else {
-                return Ok(Some(
-                    router_server::services::ProviderOperationObservation {
-                        status: ProviderOperationStatus::WaitingExternal,
-                        provider_ref: request.provider_ref,
-                        observed_state: json!({
-                            "status": "waiting_for_chain_evidence",
-                            "hint_evidence": request.hint_evidence,
-                        }),
-                        response: None,
-                        tx_hash: None,
-                        error: None,
-                    },
-                ));
-            };
-
-            Ok(Some(
-                router_server::services::ProviderOperationObservation {
-                    status: ProviderOperationStatus::Completed,
+                return Ok(Some(router_core::services::ProviderOperationObservation {
+                    status: ProviderOperationStatus::WaitingExternal,
                     provider_ref: request.provider_ref,
                     observed_state: json!({
-                        "status": "done",
+                        "status": "waiting_for_chain_evidence",
                         "hint_evidence": request.hint_evidence,
                     }),
                     response: None,
-                    tx_hash: Some(tx_hash.to_string()),
+                    tx_hash: None,
                     error: None,
-                },
-            ))
+                }));
+            };
+
+            Ok(Some(router_core::services::ProviderOperationObservation {
+                status: ProviderOperationStatus::Completed,
+                provider_ref: request.provider_ref,
+                observed_state: json!({
+                    "status": "done",
+                    "hint_evidence": request.hint_evidence,
+                }),
+                response: None,
+                tx_hash: Some(tx_hash.to_string()),
+                error: None,
+            }))
         })
     }
 }
@@ -1236,38 +1241,34 @@ impl UnitProvider for ObservationUnitProvider {
 
     fn observe_unit_operation<'a>(
         &'a self,
-        request: router_server::services::ProviderOperationObservationRequest,
-    ) -> ProviderFuture<'a, Option<router_server::services::ProviderOperationObservation>> {
+        request: router_core::services::ProviderOperationObservationRequest,
+    ) -> ProviderFuture<'a, Option<router_core::services::ProviderOperationObservation>> {
         Box::pin(async move {
             let Some(tx_hash) = request.hint_evidence.get("tx_hash").and_then(Value::as_str) else {
-                return Ok(Some(
-                    router_server::services::ProviderOperationObservation {
-                        status: ProviderOperationStatus::WaitingExternal,
-                        provider_ref: request.provider_ref,
-                        observed_state: json!({
-                            "status": "waiting_for_chain_evidence",
-                            "hint_evidence": request.hint_evidence,
-                        }),
-                        response: None,
-                        tx_hash: None,
-                        error: None,
-                    },
-                ));
-            };
-
-            Ok(Some(
-                router_server::services::ProviderOperationObservation {
-                    status: ProviderOperationStatus::Completed,
+                return Ok(Some(router_core::services::ProviderOperationObservation {
+                    status: ProviderOperationStatus::WaitingExternal,
                     provider_ref: request.provider_ref,
                     observed_state: json!({
-                        "status": "done",
+                        "status": "waiting_for_chain_evidence",
                         "hint_evidence": request.hint_evidence,
                     }),
                     response: None,
-                    tx_hash: Some(tx_hash.to_string()),
+                    tx_hash: None,
                     error: None,
-                },
-            ))
+                }));
+            };
+
+            Ok(Some(router_core::services::ProviderOperationObservation {
+                status: ProviderOperationStatus::Completed,
+                provider_ref: request.provider_ref,
+                observed_state: json!({
+                    "status": "done",
+                    "hint_evidence": request.hint_evidence,
+                }),
+                response: None,
+                tx_hash: Some(tx_hash.to_string()),
+                error: None,
+            }))
         })
     }
 }
@@ -1586,7 +1587,7 @@ fn evm_native_request() -> CreateVaultRequest {
 async fn create_test_order_from_quote(
     order_manager: &OrderManager,
     quote_id: Uuid,
-) -> router_server::models::RouterOrder {
+) -> router_core::models::RouterOrder {
     create_test_order_from_quote_with_refund(order_manager, quote_id, valid_evm_address()).await
 }
 
@@ -1594,7 +1595,7 @@ async fn create_test_order_from_quote_with_refund(
     order_manager: &OrderManager,
     quote_id: Uuid,
     refund_address: String,
-) -> router_server::models::RouterOrder {
+) -> router_core::models::RouterOrder {
     let (order, _) = order_manager
         .create_order_from_quote(CreateOrderRequest {
             quote_id,
@@ -3190,7 +3191,7 @@ async fn quote_market_order_supports_velora_arbitrary_evm_start_and_end() {
         None,
         None,
         Some(VeloraHttpProviderConfig::new(mocks.base_url())),
-        router_server::services::custody_action_executor::HyperliquidCallNetwork::Mainnet,
+        router_core::services::custody_action_executor::HyperliquidCallNetwork::Mainnet,
     )
     .expect("velora-only action providers");
     let order_manager = OrderManager::with_action_providers(
@@ -3307,7 +3308,7 @@ async fn quote_market_order_rejects_universal_router_route_without_minimum_polic
             None,
             None,
             Some(VeloraHttpProviderConfig::new(mocks.base_url())),
-            router_server::services::custody_action_executor::HyperliquidCallNetwork::Mainnet,
+            router_core::services::custody_action_executor::HyperliquidCallNetwork::Mainnet,
         )
         .expect("velora-only action providers"),
     );
@@ -3362,7 +3363,7 @@ async fn quote_market_order_bitcoin_to_base_usdc_keeps_configured_provider_path_
         None,
         Some(base_url.clone()),
         Some(VeloraHttpProviderConfig::new(base_url)),
-        router_server::services::custody_action_executor::HyperliquidCallNetwork::Testnet,
+        router_core::services::custody_action_executor::HyperliquidCallNetwork::Testnet,
     )
     .expect("mock runtime providers");
     let order_manager = OrderManager::with_action_providers(
@@ -3418,7 +3419,7 @@ async fn quote_market_order_exact_in_reports_net_output_after_unit_withdrawal_re
         None,
         Some(base_url.clone()),
         Some(VeloraHttpProviderConfig::new(base_url)),
-        router_server::services::custody_action_executor::HyperliquidCallNetwork::Testnet,
+        router_core::services::custody_action_executor::HyperliquidCallNetwork::Testnet,
     )
     .expect("mock runtime providers");
     let order_manager = OrderManager::with_action_providers(
@@ -6276,10 +6277,7 @@ async fn funding_hint_completion_requires_current_processing_lease() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(
-        stale_completion,
-        router_server::error::RouterServerError::NotFound
-    ));
+    assert!(matches!(stale_completion, RouterCoreError::NotFound));
 
     let completed = db
         .vaults()
@@ -7142,7 +7140,7 @@ async fn route_minimum_service_computes_mock_btc_to_base_usdc_floor() {
             None,
             Some(base_url.clone()),
             Some(VeloraHttpProviderConfig::new(base_url)),
-            router_server::services::custody_action_executor::HyperliquidCallNetwork::Testnet,
+            router_core::services::custody_action_executor::HyperliquidCallNetwork::Testnet,
         )
         .expect("mock runtime providers"),
     ));
@@ -7913,11 +7911,11 @@ async fn worker_pass_sweeps_released_internal_evm_native_custody_to_paymaster() 
 
     let paymaster_private_key = h.ethereum_spawned_api_paymaster_private_key();
     let paymaster_address =
-        router_server::services::custody_action_executor::evm_address_from_private_key(
+        router_core::services::custody_action_executor::evm_address_from_private_key(
             &paymaster_private_key,
         )
         .expect("paymaster address");
-    let mut paymasters = router_server::services::custody_action_executor::PaymasterRegistry::new();
+    let mut paymasters = router_core::services::custody_action_executor::PaymasterRegistry::new();
     paymasters.register(ChainType::Ethereum, paymaster_address.clone());
 
     let ethereum_chain = h.chain_registry.get_evm(&ChainType::Ethereum).unwrap();
@@ -8003,11 +8001,11 @@ async fn worker_pass_does_not_sweep_failed_internal_custody() {
 
     let paymaster_private_key = h.ethereum_spawned_api_paymaster_private_key();
     let paymaster_address =
-        router_server::services::custody_action_executor::evm_address_from_private_key(
+        router_core::services::custody_action_executor::evm_address_from_private_key(
             &paymaster_private_key,
         )
         .expect("paymaster address");
-    let mut paymasters = router_server::services::custody_action_executor::PaymasterRegistry::new();
+    let mut paymasters = router_core::services::custody_action_executor::PaymasterRegistry::new();
     paymasters.register(ChainType::Ethereum, paymaster_address.clone());
 
     let ethereum_chain = h.chain_registry.get_evm(&ChainType::Ethereum).unwrap();
@@ -8687,7 +8685,7 @@ async fn market_order_route_planner_uses_direct_unit_when_source_is_unit_ingress
         .create_execution_steps_idempotent(&[drifted_step])
         .await
         .unwrap_err();
-    assert!(matches!(err, RouterServerError::InvalidData { .. }));
+    assert!(matches!(err, RouterCoreError::InvalidData { .. }));
     let mut drifted_leg = plan.legs[0].clone();
     drifted_leg.expected_amount_out = "1".to_string();
     let err = db
@@ -8695,7 +8693,7 @@ async fn market_order_route_planner_uses_direct_unit_when_source_is_unit_ingress
         .create_execution_legs_idempotent(&[drifted_leg])
         .await
         .unwrap_err();
-    assert!(matches!(err, RouterServerError::InvalidData { .. }));
+    assert!(matches!(err, RouterCoreError::InvalidData { .. }));
 
     let steps = db.orders().get_execution_steps(order.id).await.unwrap();
     assert_eq!(steps.len(), 1 + plan.steps.len());
@@ -10747,7 +10745,7 @@ async fn market_order_planning_pass_materializes_cctp_to_hyperliquid_bridge_and_
         .iter()
         .find(|step| step.step_type == OrderExecutionStepType::CctpBurn)
         .unwrap();
-    let cctp_burn_request: router_server::services::action_providers::CctpBurnStepRequest =
+    let cctp_burn_request: router_core::services::action_providers::CctpBurnStepRequest =
         serde_json::from_value(cctp_burn_step.request.clone()).unwrap();
     assert_eq!(cctp_burn_request.source_chain_id, "evm:8453");
     assert_eq!(cctp_burn_request.destination_chain_id, "evm:42161");
@@ -10770,7 +10768,7 @@ async fn market_order_planning_pass_materializes_cctp_to_hyperliquid_bridge_and_
         .iter()
         .find(|step| step.step_type == OrderExecutionStepType::CctpReceive)
         .unwrap();
-    let cctp_receive_request: router_server::services::action_providers::CctpReceiveStepRequest =
+    let cctp_receive_request: router_core::services::action_providers::CctpReceiveStepRequest =
         serde_json::from_value(cctp_receive_step.request.clone()).unwrap();
     assert_eq!(
         cctp_receive_request.burn_transition_decl_id,
@@ -10945,7 +10943,7 @@ async fn market_order_planning_pass_materializes_across_to_unit_and_matches_mock
         .iter()
         .find(|step| step.step_type == OrderExecutionStepType::AcrossBridge)
         .unwrap();
-    let across_request: router_server::services::action_providers::AcrossExecuteStepRequest =
+    let across_request: router_core::services::action_providers::AcrossExecuteStepRequest =
         serde_json::from_value(across_step.request.clone()).unwrap();
     assert_eq!(across_request.origin_chain_id, "evm:8453");
     assert_eq!(across_request.destination_chain_id, "evm:1");
@@ -11085,7 +11083,7 @@ async fn market_order_planning_hydrates_destination_execution_custody_vault() {
         .iter()
         .find(|step| step.step_type == OrderExecutionStepType::AcrossBridge)
         .unwrap();
-    let across_request: router_server::services::action_providers::AcrossExecuteStepRequest =
+    let across_request: router_core::services::action_providers::AcrossExecuteStepRequest =
         serde_json::from_value(across_step.request.clone()).unwrap();
     assert_eq!(across_request.recipient, destination_vault.address);
     assert_eq!(
@@ -14456,7 +14454,7 @@ async fn refund_error_completion_requires_current_processing_lease() {
         .await;
     assert!(matches!(
         stale_completion.expect_err("stale claim must not complete"),
-        RouterServerError::NotFound
+        RouterCoreError::NotFound
     ));
     assert_eq!(
         db.vaults()
@@ -14531,7 +14529,7 @@ async fn refund_success_completion_requires_current_processing_lease() {
         .await;
     assert!(matches!(
         stale_completion.expect_err("stale claim must not mark refunded"),
-        RouterServerError::NotFound
+        RouterCoreError::NotFound
     ));
     let after_stale = db
         .vaults()

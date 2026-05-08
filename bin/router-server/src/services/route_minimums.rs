@@ -1,4 +1,6 @@
-use crate::{
+use alloy::primitives::U256;
+use chrono::{DateTime, Utc};
+use router_core::{
     models::MarketOrderKind,
     protocol::{AssetId, DepositAsset},
     services::{
@@ -11,8 +13,6 @@ use crate::{
         },
     },
 };
-use alloy::primitives::U256;
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use snafu::Snafu;
@@ -539,7 +539,7 @@ async fn quote_exchange_exact_out(
     output_decimals: Option<u8>,
     amount_out: &U256,
     recipient_address: &str,
-) -> RouteMinimumResult<crate::services::action_providers::ExchangeQuote> {
+) -> RouteMinimumResult<router_core::services::action_providers::ExchangeQuote> {
     exchange
         .quote_trade(ExchangeQuoteRequest {
             input_asset: input_asset.clone(),
@@ -577,7 +577,7 @@ async fn quote_bridge_exact_out(
     amount_out: &U256,
     recipient_address: &str,
     depositor_address: &str,
-) -> RouteMinimumResult<crate::services::action_providers::BridgeQuote> {
+) -> RouteMinimumResult<router_core::services::action_providers::BridgeQuote> {
     bridge
         .quote_bridge(BridgeQuoteRequest {
             source_asset: source_asset.clone(),
@@ -738,7 +738,7 @@ fn parse_u256(field: &'static str, raw: &str) -> RouteMinimumResult<U256> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::ChainId;
+    use router_core::protocol::ChainId;
 
     fn asset(chain: &str, asset: AssetId) -> DepositAsset {
         DepositAsset {

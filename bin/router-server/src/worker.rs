@@ -1,16 +1,18 @@
 use crate::{
     app::{initialize_components, PaymasterMode},
-    db::{worker_lease_repo::WorkerLease, Database},
     runtime::BackgroundTaskResult,
     services::{
         order_executor::{OrderWorkerPassLimits, OrderWorkerPassSummary},
         vault_manager::{FundingHintPassSummary, RefundPassSummary},
-        OrderExecutionManager, ProviderHealthPollSummary, ProviderHealthPoller,
-        RouteCostRefreshSummary, RouteCostService, VaultManager,
+        OrderExecutionManager, ProviderHealthPollSummary, ProviderHealthPoller, VaultManager,
     },
     telemetry, Error, Result, RouterServerArgs,
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use router_core::{
+    db::{worker_lease_repo::WorkerLease, Database},
+    services::route_costs::{RouteCostRefreshSummary, RouteCostService},
+};
 use snafu::{FromString, Whatever};
 use sqlx_core::error::Error as SqlxError;
 use sqlx_postgres::{PgListener, PgNotification};
@@ -750,7 +752,7 @@ async fn recv_worker_notification(
 }
 
 async fn renew_worker_lease(
-    lease_repo: &crate::db::WorkerLeaseRepository,
+    lease_repo: &router_core::db::WorkerLeaseRepository,
     config: &RouterWorkerConfig,
     lease: &WorkerLease,
 ) -> crate::error::RouterServerResult<Option<WorkerLease>> {

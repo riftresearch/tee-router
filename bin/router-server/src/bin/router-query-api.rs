@@ -7,8 +7,8 @@ use axum::{
     Json, Router,
 };
 use clap::Parser;
+use router_core::db::Database;
 use router_server::{
-    db::Database,
     error::{RouterServerError, RouterServerResult},
     query_api, Error, Result,
 };
@@ -81,7 +81,9 @@ async fn run(args: RouterQueryApiArgs) -> Result<()> {
         args.db_min_connections,
     )
     .await
-    .map_err(|source| Error::DatabaseInit { source })?;
+    .map_err(|source| Error::DatabaseInit {
+        source: source.into(),
+    })?;
 
     let addr = SocketAddr::from((args.host, args.port));
     let app = Router::new()

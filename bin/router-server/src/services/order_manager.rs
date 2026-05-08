@@ -2,9 +2,22 @@ use crate::{
     api::{
         CreateOrderRequest, LimitOrderQuoteRequest, MarketOrderQuoteKind, MarketOrderQuoteRequest,
     },
+    error::RouterServerError,
+    services::{
+        deposit_address::{derive_deposit_address_for_quote, DepositAddressError},
+        provider_health::ProviderHealthService,
+        provider_policy::ProviderPolicyService,
+        route_minimums::{RouteMinimumError, RouteMinimumService},
+    },
+    telemetry,
+};
+use alloy::primitives::U256;
+use chains::ChainRegistry;
+use chrono::{Duration as ChronoDuration, Utc};
+use router_core::{
     config::Settings,
     db::Database,
-    error::RouterServerError,
+    error::RouterCoreError,
     models::{
         LimitOrderAction, LimitOrderQuote, LimitOrderResidualPolicy, MarketOrderAction,
         MarketOrderKind, MarketOrderKindType, MarketOrderQuote, OrderExecutionStepType,
@@ -21,26 +34,18 @@ use crate::{
             AssetRegistry, CanonicalAsset, MarketOrderNode, MarketOrderTransitionKind, ProviderId,
             TransitionDecl, TransitionPath,
         },
-        deposit_address::{derive_deposit_address_for_quote, DepositAddressError},
         gas_reimbursement::{
             optimized_paymaster_reimbursement_plan,
             optimized_paymaster_reimbursement_plan_with_pricing, try_transition_retention_amount,
             GasReimbursementError, GasReimbursementPlan,
         },
-        provider_health::ProviderHealthService,
-        provider_policy::ProviderPolicyService,
         quote_legs::{
             execution_step_type_for_transition_kind, QuoteLeg, QuoteLegAsset, QuoteLegSpec,
         },
         route_costs::{rank_transition_paths_structurally, RouteCostService},
-        route_minimums::{RouteMinimumError, RouteMinimumService},
         usd_valuation::{empty_usd_valuation, limit_quote_usd_valuation, quote_usd_valuation},
     },
-    telemetry,
 };
-use alloy::primitives::U256;
-use chains::ChainRegistry;
-use chrono::{Duration as ChronoDuration, Utc};
 use router_primitives::ChainType;
 use serde_json::{json, Value};
 use snafu::Snafu;
@@ -149,9 +154,9 @@ impl MarketOrderError {
         }
     }
 
-    fn database(source: RouterServerError) -> Self {
+    fn database(source: impl Into<RouterServerError>) -> Self {
         Self::Database {
-            source: Box::new(source),
+            source: Box::new(source.into()),
         }
     }
 }
@@ -391,7 +396,9 @@ impl OrderManager {
         })
     }
 
-    async fn usd_pricing_snapshot(&self) -> Option<crate::services::PricingSnapshot> {
+    async fn usd_pricing_snapshot(
+        &self,
+    ) -> Option<router_core::services::pricing::PricingSnapshot> {
         self.route_costs
             .as_ref()?
             .current_or_refresh_live_pricing_snapshot()
@@ -520,7 +527,7 @@ impl OrderManager {
             .await;
         let quote = match result {
             Ok(quote) => quote,
-            Err(RouterServerError::Conflict { .. }) => {
+            Err(RouterCoreError::Conflict { .. }) => {
                 return self
                     .resume_market_order_after_create_conflict(request, quote.id)
                     .await;
@@ -577,7 +584,7 @@ impl OrderManager {
             .await;
         let quote = match result {
             Ok(quote) => quote,
-            Err(RouterServerError::Conflict { .. }) => {
+            Err(RouterCoreError::Conflict { .. }) => {
                 return self
                     .resume_limit_order_after_create_conflict(request, quote.id)
                     .await;
@@ -3476,19 +3483,21 @@ mod tests {
             policy: "test".to_string(),
             quote_safety_multiplier_bps: 10_000,
             debts: vec![],
-            retention_actions: vec![crate::services::gas_reimbursement::GasRetentionAction {
-                id: "retention-1".to_string(),
-                transition_decl_id: "transition-1".to_string(),
-                settlement_chain_id: "evm:1".to_string(),
-                settlement_asset_id: "native".to_string(),
-                settlement_decimals: 18,
-                settlement_provider_asset: None,
-                amount: "1".to_string(),
-                estimated_usd_micro: "1".to_string(),
-                recipient_role: "paymaster_wallet".to_string(),
-                timing: "before_provider_action".to_string(),
-                debt_ids: vec![],
-            }],
+            retention_actions: vec![
+                router_core::services::gas_reimbursement::GasRetentionAction {
+                    id: "retention-1".to_string(),
+                    transition_decl_id: "transition-1".to_string(),
+                    settlement_chain_id: "evm:1".to_string(),
+                    settlement_asset_id: "native".to_string(),
+                    settlement_decimals: 18,
+                    settlement_provider_asset: None,
+                    amount: "1".to_string(),
+                    estimated_usd_micro: "1".to_string(),
+                    recipient_role: "paymaster_wallet".to_string(),
+                    timing: "before_provider_action".to_string(),
+                    debt_ids: vec![],
+                },
+            ],
         };
 
         assert!(add_bitcoin_fee_reserve(&U256::MAX.to_string(), U256::from(1_u64)).is_err());

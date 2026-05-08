@@ -1,5 +1,5 @@
 use crate::{
-    error::{RouterServerError, RouterServerResult},
+    error::{RouterCoreError, RouterCoreResult},
     models::{
         CustodyVault, CustodyVaultControlType, CustodyVaultRole, CustodyVaultStatus,
         CustodyVaultVisibility, LimitOrderAction, LimitOrderQuote, LimitOrderResidualPolicy,
@@ -289,7 +289,7 @@ impl OrderRepository {
     pub async fn create_market_order_quote(
         &self,
         quote: &MarketOrderQuote,
-    ) -> RouterServerResult<()> {
+    ) -> RouterCoreResult<()> {
         let started = Instant::now();
         let result = sqlx_core::query::query(
             r#"
@@ -348,10 +348,7 @@ impl OrderRepository {
         Ok(())
     }
 
-    pub async fn create_limit_order_quote(
-        &self,
-        quote: &LimitOrderQuote,
-    ) -> RouterServerResult<()> {
+    pub async fn create_limit_order_quote(&self, quote: &LimitOrderQuote) -> RouterCoreResult<()> {
         let started = Instant::now();
         let result = sqlx_core::query::query(
             r#"
@@ -408,7 +405,7 @@ impl OrderRepository {
         &self,
         order: &RouterOrder,
         quote_id: Uuid,
-    ) -> RouterServerResult<MarketOrderQuote> {
+    ) -> RouterCoreResult<MarketOrderQuote> {
         let started = Instant::now();
         let result = async {
             let mut tx = self.pool.begin().await?;
@@ -504,13 +501,13 @@ impl OrderRepository {
             .bind(order.id)
             .fetch_optional(&mut *tx)
             .await?
-            .ok_or(RouterServerError::Conflict {
+            .ok_or(RouterCoreError::Conflict {
                 message: format!("quote {quote_id} is no longer orderable"),
             })?;
 
             let quote = self.map_quote_row(&row)?;
             tx.commit().await?;
-            Ok::<MarketOrderQuote, RouterServerError>(quote)
+            Ok::<MarketOrderQuote, RouterCoreError>(quote)
         }
         .await;
         telemetry::record_db_query(
@@ -525,7 +522,7 @@ impl OrderRepository {
         &self,
         order: &RouterOrder,
         quote_id: Uuid,
-    ) -> RouterServerResult<LimitOrderQuote> {
+    ) -> RouterCoreResult<LimitOrderQuote> {
         let started = Instant::now();
         let result = async {
             let mut tx = self.pool.begin().await?;
@@ -612,13 +609,13 @@ impl OrderRepository {
             .bind(order.id)
             .fetch_optional(&mut *tx)
             .await?
-            .ok_or(RouterServerError::Conflict {
+            .ok_or(RouterCoreError::Conflict {
                 message: format!("quote {quote_id} is no longer orderable"),
             })?;
 
             let quote = self.map_limit_quote_row(&row)?;
             tx.commit().await?;
-            Ok::<LimitOrderQuote, RouterServerError>(quote)
+            Ok::<LimitOrderQuote, RouterCoreError>(quote)
         }
         .await;
         telemetry::record_db_query(
@@ -633,7 +630,7 @@ impl OrderRepository {
         &self,
         order_id: Uuid,
         quote_id: Uuid,
-    ) -> RouterServerResult<()> {
+    ) -> RouterCoreResult<()> {
         let started = Instant::now();
         let result = async {
             let mut tx = self.pool.begin().await?;
@@ -680,7 +677,7 @@ impl OrderRepository {
             .rows_affected();
 
             if released_market_quote + released_limit_quote != 1 || deleted_order != 1 {
-                return Err(RouterServerError::Validation {
+                return Err(RouterCoreError::Validation {
                     message: format!(
                         "order {order_id} could not be rolled back for quote {quote_id}"
                     ),
@@ -688,7 +685,7 @@ impl OrderRepository {
             }
 
             tx.commit().await?;
-            Ok::<(), RouterServerError>(())
+            Ok::<(), RouterCoreError>(())
         }
         .await;
         telemetry::record_db_query(
@@ -699,7 +696,7 @@ impl OrderRepository {
         result
     }
 
-    pub async fn get(&self, id: Uuid) -> RouterServerResult<RouterOrder> {
+    pub async fn get(&self, id: Uuid) -> RouterCoreResult<RouterOrder> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -721,7 +718,7 @@ impl OrderRepository {
 
     pub async fn count_in_progress_orders_by_status(
         &self,
-    ) -> RouterServerResult<Vec<OrderStatusCount>> {
+    ) -> RouterCoreResult<Vec<OrderStatusCount>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(
             r#"
@@ -750,13 +747,13 @@ impl OrderRepository {
             .map(|row| {
                 let status: String = row.try_get("status")?;
                 let status = RouterOrderStatus::from_db_string(&status).ok_or_else(|| {
-                    RouterServerError::InvalidData {
+                    RouterCoreError::InvalidData {
                         message: format!("unknown order status: {status}"),
                     }
                 })?;
                 let order_count: i64 = row.try_get("order_count")?;
                 let order_count =
-                    u64::try_from(order_count).map_err(|_| RouterServerError::InvalidData {
+                    u64::try_from(order_count).map_err(|_| RouterCoreError::InvalidData {
                         message: format!(
                             "negative order status count for {}",
                             status.to_db_string()
@@ -776,7 +773,7 @@ impl OrderRepository {
         from_status: RouterOrderStatus,
         to_status: RouterOrderStatus,
         updated_at: DateTime<Utc>,
-    ) -> RouterServerResult<RouterOrder> {
+    ) -> RouterCoreResult<RouterOrder> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -811,7 +808,7 @@ impl OrderRepository {
         &self,
         id: Uuid,
         now: DateTime<Utc>,
-    ) -> RouterServerResult<Option<RouterOrder>> {
+    ) -> RouterCoreResult<Option<RouterOrder>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -859,7 +856,7 @@ impl OrderRepository {
         &self,
         now: DateTime<Utc>,
         limit: i64,
-    ) -> RouterServerResult<Vec<RouterOrder>> {
+    ) -> RouterCoreResult<Vec<RouterOrder>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -914,7 +911,7 @@ impl OrderRepository {
     pub async fn find_unstarted_orders_with_refunded_funding_vault(
         &self,
         limit: i64,
-    ) -> RouterServerResult<Vec<RouterOrder>> {
+    ) -> RouterCoreResult<Vec<RouterOrder>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -963,7 +960,7 @@ impl OrderRepository {
     pub async fn has_execution_steps_after_deposit(
         &self,
         order_id: Uuid,
-    ) -> RouterServerResult<bool> {
+    ) -> RouterCoreResult<bool> {
         let started = Instant::now();
         let result = sqlx_core::query_scalar::query_scalar(
             r#"
@@ -989,7 +986,7 @@ impl OrderRepository {
     pub async fn get_market_orders_needing_execution_plan(
         &self,
         limit: i64,
-    ) -> RouterServerResult<Vec<RouterOrder>> {
+    ) -> RouterCoreResult<Vec<RouterOrder>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -1027,7 +1024,7 @@ impl OrderRepository {
     pub async fn find_orders_with_failed_steps(
         &self,
         limit: i64,
-    ) -> RouterServerResult<Vec<(Uuid, Option<Uuid>)>> {
+    ) -> RouterCoreResult<Vec<(Uuid, Option<Uuid>)>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(
             r#"
@@ -1058,7 +1055,7 @@ impl OrderRepository {
     pub async fn get_market_orders_ready_for_execution(
         &self,
         limit: i64,
-    ) -> RouterServerResult<Vec<RouterOrder>> {
+    ) -> RouterCoreResult<Vec<RouterOrder>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -1104,7 +1101,7 @@ impl OrderRepository {
     pub async fn find_executing_orders_pending_completion_finalization(
         &self,
         limit: i64,
-    ) -> RouterServerResult<Vec<RouterOrder>> {
+    ) -> RouterCoreResult<Vec<RouterOrder>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -1150,7 +1147,7 @@ impl OrderRepository {
     pub async fn get_market_order_quote(
         &self,
         order_id: Uuid,
-    ) -> RouterServerResult<MarketOrderQuote> {
+    ) -> RouterCoreResult<MarketOrderQuote> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             "SELECT {QUOTE_SELECT_COLUMNS} FROM market_order_quotes WHERE order_id = $1"
@@ -1171,7 +1168,7 @@ impl OrderRepository {
     pub async fn get_market_order_quote_by_id(
         &self,
         quote_id: Uuid,
-    ) -> RouterServerResult<MarketOrderQuote> {
+    ) -> RouterCoreResult<MarketOrderQuote> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             "SELECT {QUOTE_SELECT_COLUMNS} FROM market_order_quotes WHERE id = $1"
@@ -1189,10 +1186,7 @@ impl OrderRepository {
         self.map_quote_row(&row)
     }
 
-    pub async fn get_limit_order_quote(
-        &self,
-        order_id: Uuid,
-    ) -> RouterServerResult<LimitOrderQuote> {
+    pub async fn get_limit_order_quote(&self, order_id: Uuid) -> RouterCoreResult<LimitOrderQuote> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             "SELECT {LIMIT_QUOTE_SELECT_COLUMNS} FROM limit_order_quotes WHERE order_id = $1"
@@ -1213,7 +1207,7 @@ impl OrderRepository {
     pub async fn get_limit_order_quote_by_id(
         &self,
         quote_id: Uuid,
-    ) -> RouterServerResult<LimitOrderQuote> {
+    ) -> RouterCoreResult<LimitOrderQuote> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             "SELECT {LIMIT_QUOTE_SELECT_COLUMNS} FROM limit_order_quotes WHERE id = $1"
@@ -1234,10 +1228,10 @@ impl OrderRepository {
     pub async fn get_router_order_quote_by_id(
         &self,
         quote_id: Uuid,
-    ) -> RouterServerResult<RouterOrderQuote> {
+    ) -> RouterCoreResult<RouterOrderQuote> {
         match self.get_market_order_quote_by_id(quote_id).await {
             Ok(quote) => Ok(quote.into()),
-            Err(RouterServerError::NotFound) => self
+            Err(RouterCoreError::NotFound) => self
                 .get_limit_order_quote_by_id(quote_id)
                 .await
                 .map(Into::into),
@@ -1248,10 +1242,10 @@ impl OrderRepository {
     pub async fn get_router_order_quote(
         &self,
         order_id: Uuid,
-    ) -> RouterServerResult<RouterOrderQuote> {
+    ) -> RouterCoreResult<RouterOrderQuote> {
         match self.get_market_order_quote(order_id).await {
             Ok(quote) => Ok(quote.into()),
-            Err(RouterServerError::NotFound) => {
+            Err(RouterCoreError::NotFound) => {
                 self.get_limit_order_quote(order_id).await.map(Into::into)
             }
             Err(err) => Err(err),
@@ -1261,7 +1255,7 @@ impl OrderRepository {
     pub async fn delete_expired_unassociated_market_order_quotes(
         &self,
         now: DateTime<Utc>,
-    ) -> RouterServerResult<u64> {
+    ) -> RouterCoreResult<u64> {
         let started = Instant::now();
         let result = sqlx_core::query::query(
             r#"
@@ -1284,7 +1278,7 @@ impl OrderRepository {
     pub async fn delete_expired_unassociated_router_order_quotes(
         &self,
         now: DateTime<Utc>,
-    ) -> RouterServerResult<u64> {
+    ) -> RouterCoreResult<u64> {
         let deleted_market = self
             .delete_expired_unassociated_market_order_quotes(now)
             .await?;
@@ -1310,7 +1304,7 @@ impl OrderRepository {
     pub async fn create_execution_attempt(
         &self,
         attempt: &OrderExecutionAttempt,
-    ) -> RouterServerResult<()> {
+    ) -> RouterCoreResult<()> {
         let started = Instant::now();
         let result = sqlx_core::query::query(
             r#"
@@ -1362,7 +1356,7 @@ impl OrderRepository {
         refreshed_attempt: &OrderExecutionAttempt,
         superseded_reason: serde_json::Value,
         updated_at: DateTime<Utc>,
-    ) -> RouterServerResult<OrderExecutionAttempt> {
+    ) -> RouterCoreResult<OrderExecutionAttempt> {
         let started = Instant::now();
         let result = async {
             let mut tx = self.pool.begin().await?;
@@ -1384,7 +1378,7 @@ impl OrderRepository {
             .fetch_optional(&mut *tx)
             .await?;
             if superseded_row.is_none() {
-                return Err(RouterServerError::NotFound);
+                return Err(RouterCoreError::NotFound);
             }
 
             let inserted = sqlx_core::query::query(&format!(
@@ -1446,10 +1440,7 @@ impl OrderRepository {
         result
     }
 
-    pub async fn get_execution_attempt(
-        &self,
-        id: Uuid,
-    ) -> RouterServerResult<OrderExecutionAttempt> {
+    pub async fn get_execution_attempt(&self, id: Uuid) -> RouterCoreResult<OrderExecutionAttempt> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -1474,7 +1465,7 @@ impl OrderRepository {
     pub async fn get_execution_attempts(
         &self,
         order_id: Uuid,
-    ) -> RouterServerResult<Vec<OrderExecutionAttempt>> {
+    ) -> RouterCoreResult<Vec<OrderExecutionAttempt>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -1502,7 +1493,7 @@ impl OrderRepository {
     pub async fn get_latest_execution_attempt(
         &self,
         order_id: Uuid,
-    ) -> RouterServerResult<Option<OrderExecutionAttempt>> {
+    ) -> RouterCoreResult<Option<OrderExecutionAttempt>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -1530,7 +1521,7 @@ impl OrderRepository {
     pub async fn get_active_execution_attempt(
         &self,
         order_id: Uuid,
-    ) -> RouterServerResult<Option<OrderExecutionAttempt>> {
+    ) -> RouterCoreResult<Option<OrderExecutionAttempt>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -1562,7 +1553,7 @@ impl OrderRepository {
         from_status: OrderExecutionAttemptStatus,
         to_status: OrderExecutionAttemptStatus,
         updated_at: DateTime<Utc>,
-    ) -> RouterServerResult<OrderExecutionAttempt> {
+    ) -> RouterCoreResult<OrderExecutionAttempt> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -1599,7 +1590,7 @@ impl OrderRepository {
         failure_reason: serde_json::Value,
         input_custody_snapshot: serde_json::Value,
         updated_at: DateTime<Utc>,
-    ) -> RouterServerResult<OrderExecutionAttempt> {
+    ) -> RouterCoreResult<OrderExecutionAttempt> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -1640,7 +1631,7 @@ impl OrderRepository {
         failure_reason: serde_json::Value,
         input_custody_snapshot: serde_json::Value,
         updated_at: DateTime<Utc>,
-    ) -> RouterServerResult<OrderExecutionAttempt> {
+    ) -> RouterCoreResult<OrderExecutionAttempt> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -1675,7 +1666,7 @@ impl OrderRepository {
     pub async fn find_orders_pending_refund_planning(
         &self,
         limit: i64,
-    ) -> RouterServerResult<Vec<RouterOrder>> {
+    ) -> RouterCoreResult<Vec<RouterOrder>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -1714,7 +1705,7 @@ impl OrderRepository {
     pub async fn find_refunding_orders_pending_direct_refund_finalization(
         &self,
         limit: i64,
-    ) -> RouterServerResult<Vec<RouterOrder>> {
+    ) -> RouterCoreResult<Vec<RouterOrder>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -1758,7 +1749,7 @@ impl OrderRepository {
     pub async fn find_orders_pending_manual_refund_vault_alignment(
         &self,
         limit: i64,
-    ) -> RouterServerResult<Vec<RouterOrder>> {
+    ) -> RouterCoreResult<Vec<RouterOrder>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -1789,7 +1780,7 @@ impl OrderRepository {
     pub async fn find_orders_with_manual_refund_funding_vault(
         &self,
         limit: i64,
-    ) -> RouterServerResult<Vec<RouterOrder>> {
+    ) -> RouterCoreResult<Vec<RouterOrder>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -1820,7 +1811,7 @@ impl OrderRepository {
     pub async fn find_orders_pending_retry_or_refund_decision(
         &self,
         limit: i64,
-    ) -> RouterServerResult<Vec<RouterOrder>> {
+    ) -> RouterCoreResult<Vec<RouterOrder>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -1869,7 +1860,7 @@ impl OrderRepository {
         rows.iter().map(|row| self.map_order_row(row)).collect()
     }
 
-    pub async fn create_custody_vault(&self, vault: &CustodyVault) -> RouterServerResult<()> {
+    pub async fn create_custody_vault(&self, vault: &CustodyVault) -> RouterCoreResult<()> {
         let started = Instant::now();
         let derivation_salt = vault.derivation_salt.as_ref().map(|salt| &salt[..]);
         let result = sqlx_core::query::query(
@@ -1918,10 +1909,7 @@ impl OrderRepository {
         Ok(())
     }
 
-    pub async fn get_custody_vaults(
-        &self,
-        order_id: Uuid,
-    ) -> RouterServerResult<Vec<CustodyVault>> {
+    pub async fn get_custody_vaults(&self, order_id: Uuid) -> RouterCoreResult<Vec<CustodyVault>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -1946,7 +1934,7 @@ impl OrderRepository {
             .collect()
     }
 
-    pub async fn get_custody_vault(&self, id: Uuid) -> RouterServerResult<CustodyVault> {
+    pub async fn get_custody_vault(&self, id: Uuid) -> RouterCoreResult<CustodyVault> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -1969,7 +1957,7 @@ impl OrderRepository {
         vault_id: Uuid,
         metadata_patch: serde_json::Value,
         updated_at: DateTime<Utc>,
-    ) -> RouterServerResult<CustodyVault> {
+    ) -> RouterCoreResult<CustodyVault> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -2001,7 +1989,7 @@ impl OrderRepository {
         vault_id: Uuid,
         metadata_patch: serde_json::Value,
         updated_at: DateTime<Utc>,
-    ) -> RouterServerResult<CustodyVault> {
+    ) -> RouterCoreResult<CustodyVault> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -2037,7 +2025,7 @@ impl OrderRepository {
         status: CustodyVaultStatus,
         metadata_patch: serde_json::Value,
         updated_at: DateTime<Utc>,
-    ) -> RouterServerResult<Vec<CustodyVault>> {
+    ) -> RouterCoreResult<Vec<CustodyVault>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -2074,7 +2062,7 @@ impl OrderRepository {
     pub async fn get_terminal_orders_with_pending_internal_custody_finalization(
         &self,
         limit: i64,
-    ) -> RouterServerResult<Vec<RouterOrder>> {
+    ) -> RouterCoreResult<Vec<RouterOrder>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -2117,7 +2105,7 @@ impl OrderRepository {
     pub async fn get_released_internal_custody_vaults_pending_sweep(
         &self,
         limit: i64,
-    ) -> RouterServerResult<Vec<CustodyVault>> {
+    ) -> RouterCoreResult<Vec<CustodyVault>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -2149,7 +2137,7 @@ impl OrderRepository {
     pub async fn create_provider_operation(
         &self,
         operation: &OrderProviderOperation,
-    ) -> RouterServerResult<()> {
+    ) -> RouterCoreResult<()> {
         let started = Instant::now();
         let result = sqlx_core::query::query(
             r#"
@@ -2198,7 +2186,7 @@ impl OrderRepository {
     pub async fn upsert_provider_operation(
         &self,
         operation: &OrderProviderOperation,
-    ) -> RouterServerResult<Uuid> {
+    ) -> RouterCoreResult<Uuid> {
         let started = Instant::now();
         let result = sqlx_core::query_scalar::query_scalar(
             r#"
@@ -2279,7 +2267,7 @@ impl OrderRepository {
     pub async fn get_provider_operations(
         &self,
         order_id: Uuid,
-    ) -> RouterServerResult<Vec<OrderProviderOperation>> {
+    ) -> RouterCoreResult<Vec<OrderProviderOperation>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -2307,7 +2295,7 @@ impl OrderRepository {
     pub async fn get_provider_operation(
         &self,
         id: Uuid,
-    ) -> RouterServerResult<OrderProviderOperation> {
+    ) -> RouterCoreResult<OrderProviderOperation> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -2332,7 +2320,7 @@ impl OrderRepository {
     pub async fn find_terminal_provider_operations_pending_step_settlement(
         &self,
         limit: i64,
-    ) -> RouterServerResult<Vec<OrderProviderOperation>> {
+    ) -> RouterCoreResult<Vec<OrderProviderOperation>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(
             r#"
@@ -2378,7 +2366,7 @@ impl OrderRepository {
         &self,
         stale_before: DateTime<Utc>,
         limit: i64,
-    ) -> RouterServerResult<Vec<OrderExecutionStep>> {
+    ) -> RouterCoreResult<Vec<OrderExecutionStep>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(
             r#"
@@ -2450,7 +2438,7 @@ impl OrderRepository {
         observed_state: serde_json::Value,
         response: Option<serde_json::Value>,
         updated_at: DateTime<Utc>,
-    ) -> RouterServerResult<(OrderProviderOperation, bool)> {
+    ) -> RouterCoreResult<(OrderProviderOperation, bool)> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -2506,7 +2494,7 @@ impl OrderRepository {
         let operation = self.map_provider_operation_row(&row)?;
         let previous_status: String = row.get("previous_status");
         let previous_status = ProviderOperationStatus::from_db_string(&previous_status)
-            .ok_or_else(|| RouterServerError::InvalidData {
+            .ok_or_else(|| RouterCoreError::InvalidData {
                 message: format!(
                     "unknown provider operation status from database: {previous_status}"
                 ),
@@ -2525,7 +2513,7 @@ impl OrderRepository {
     pub async fn create_provider_operation_hint(
         &self,
         hint: &OrderProviderOperationHint,
-    ) -> RouterServerResult<OrderProviderOperationHint> {
+    ) -> RouterCoreResult<OrderProviderOperationHint> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -2611,7 +2599,7 @@ impl OrderRepository {
         &self,
         limit: i64,
         now: DateTime<Utc>,
-    ) -> RouterServerResult<Vec<OrderProviderOperationHint>> {
+    ) -> RouterCoreResult<Vec<OrderProviderOperationHint>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -2675,7 +2663,7 @@ impl OrderRepository {
         status: ProviderOperationHintStatus,
         error: serde_json::Value,
         now: DateTime<Utc>,
-    ) -> RouterServerResult<OrderProviderOperationHint> {
+    ) -> RouterCoreResult<OrderProviderOperationHint> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -2711,7 +2699,7 @@ impl OrderRepository {
     pub async fn create_provider_address(
         &self,
         address: &OrderProviderAddress,
-    ) -> RouterServerResult<()> {
+    ) -> RouterCoreResult<()> {
         let started = Instant::now();
         let result = sqlx_core::query::query(
             r#"
@@ -2762,7 +2750,7 @@ impl OrderRepository {
     pub async fn upsert_provider_address(
         &self,
         address: &OrderProviderAddress,
-    ) -> RouterServerResult<Uuid> {
+    ) -> RouterCoreResult<Uuid> {
         let started = Instant::now();
         let query = if address.execution_step_id.is_some() {
             r#"
@@ -2890,7 +2878,7 @@ impl OrderRepository {
     pub async fn get_provider_addresses_by_operation(
         &self,
         provider_operation_id: Uuid,
-    ) -> RouterServerResult<Vec<OrderProviderAddress>> {
+    ) -> RouterCoreResult<Vec<OrderProviderAddress>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -2918,7 +2906,7 @@ impl OrderRepository {
     pub async fn get_provider_addresses(
         &self,
         order_id: Uuid,
-    ) -> RouterServerResult<Vec<OrderProviderAddress>> {
+    ) -> RouterCoreResult<Vec<OrderProviderAddress>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -2946,7 +2934,7 @@ impl OrderRepository {
     pub async fn create_execution_legs_idempotent(
         &self,
         legs: &[OrderExecutionLeg],
-    ) -> RouterServerResult<u64> {
+    ) -> RouterCoreResult<u64> {
         let started = Instant::now();
         let result = async {
             let mut tx = self.pool.begin().await?;
@@ -3085,7 +3073,7 @@ impl OrderRepository {
                             .await?
                         };
                         let Some(existing_row) = existing_row else {
-                            return Err(RouterServerError::InvalidData {
+                            return Err(RouterCoreError::InvalidData {
                                 message: format!(
                                     "execution leg idempotency conflict did not return existing row for order {} leg_index {}",
                                     leg.order_id, leg.leg_index
@@ -3096,7 +3084,7 @@ impl OrderRepository {
                         ensure_execution_leg_plan_matches(&existing, leg)?;
                     }
                     rows => {
-                        return Err(RouterServerError::InvalidData {
+                        return Err(RouterCoreError::InvalidData {
                             message: format!(
                                 "execution leg insert affected unexpected row count {rows} for order {} leg_index {}",
                                 leg.order_id, leg.leg_index
@@ -3107,7 +3095,7 @@ impl OrderRepository {
             }
 
             tx.commit().await?;
-            Ok::<u64, RouterServerError>(inserted)
+            Ok::<u64, RouterCoreError>(inserted)
         }
         .await;
         telemetry::record_db_query(
@@ -3118,7 +3106,7 @@ impl OrderRepository {
         result
     }
 
-    pub async fn create_execution_step(&self, step: &OrderExecutionStep) -> RouterServerResult<()> {
+    pub async fn create_execution_step(&self, step: &OrderExecutionStep) -> RouterCoreResult<()> {
         let started = Instant::now();
         let result = sqlx_core::query::query(
             r#"
@@ -3203,7 +3191,7 @@ impl OrderRepository {
     pub async fn create_execution_steps_idempotent(
         &self,
         steps: &[OrderExecutionStep],
-    ) -> RouterServerResult<u64> {
+    ) -> RouterCoreResult<u64> {
         let started = Instant::now();
         let result = async {
             let mut tx = self.pool.begin().await?;
@@ -3359,7 +3347,7 @@ impl OrderRepository {
                             .await?
                         };
                         let Some(existing_row) = existing_row else {
-                            return Err(RouterServerError::InvalidData {
+                            return Err(RouterCoreError::InvalidData {
                                 message: format!(
                                     "execution step idempotency conflict did not return existing row for order {} step_index {}",
                                     step.order_id, step.step_index
@@ -3370,7 +3358,7 @@ impl OrderRepository {
                         ensure_execution_step_plan_matches(&existing, step)?;
                     }
                     rows => {
-                        return Err(RouterServerError::InvalidData {
+                        return Err(RouterCoreError::InvalidData {
                             message: format!(
                                 "execution step insert affected unexpected row count {rows} for order {} step_index {}",
                                 step.order_id, step.step_index
@@ -3381,7 +3369,7 @@ impl OrderRepository {
             }
 
             tx.commit().await?;
-            Ok::<u64, RouterServerError>(inserted)
+            Ok::<u64, RouterCoreError>(inserted)
         }
         .await;
         telemetry::record_db_query(
@@ -3395,7 +3383,7 @@ impl OrderRepository {
     pub async fn get_execution_steps_for_attempt(
         &self,
         execution_attempt_id: Uuid,
-    ) -> RouterServerResult<Vec<OrderExecutionStep>> {
+    ) -> RouterCoreResult<Vec<OrderExecutionStep>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -3427,7 +3415,7 @@ impl OrderRepository {
         request: serde_json::Value,
         details: serde_json::Value,
         updated_at: DateTime<Utc>,
-    ) -> RouterServerResult<OrderExecutionStep> {
+    ) -> RouterCoreResult<OrderExecutionStep> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -3461,7 +3449,7 @@ impl OrderRepository {
     pub async fn get_execution_legs_for_attempt(
         &self,
         execution_attempt_id: Uuid,
-    ) -> RouterServerResult<Vec<OrderExecutionLeg>> {
+    ) -> RouterCoreResult<Vec<OrderExecutionLeg>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -3489,7 +3477,7 @@ impl OrderRepository {
     pub async fn get_execution_steps(
         &self,
         order_id: Uuid,
-    ) -> RouterServerResult<Vec<OrderExecutionStep>> {
+    ) -> RouterCoreResult<Vec<OrderExecutionStep>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -3528,7 +3516,7 @@ impl OrderRepository {
     pub async fn get_execution_legs(
         &self,
         order_id: Uuid,
-    ) -> RouterServerResult<Vec<OrderExecutionLeg>> {
+    ) -> RouterCoreResult<Vec<OrderExecutionLeg>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -3564,7 +3552,7 @@ impl OrderRepository {
             .collect()
     }
 
-    pub async fn get_execution_step(&self, id: Uuid) -> RouterServerResult<OrderExecutionStep> {
+    pub async fn get_execution_step(&self, id: Uuid) -> RouterCoreResult<OrderExecutionStep> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -3589,7 +3577,7 @@ impl OrderRepository {
     pub async fn refresh_execution_leg_from_actions(
         &self,
         execution_leg_id: Uuid,
-    ) -> RouterServerResult<Option<OrderExecutionLeg>> {
+    ) -> RouterCoreResult<Option<OrderExecutionLeg>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -3933,7 +3921,7 @@ impl OrderRepository {
         id: Uuid,
         usd_valuation: serde_json::Value,
         updated_at: DateTime<Utc>,
-    ) -> RouterServerResult<OrderExecutionLeg> {
+    ) -> RouterCoreResult<OrderExecutionLeg> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -3963,7 +3951,7 @@ impl OrderRepository {
     async fn refresh_execution_leg_for_step(
         &self,
         step: &OrderExecutionStep,
-    ) -> RouterServerResult<()> {
+    ) -> RouterCoreResult<()> {
         if let Some(execution_leg_id) = step.execution_leg_id {
             let _ = self
                 .refresh_execution_leg_from_actions(execution_leg_id)
@@ -3978,7 +3966,7 @@ impl OrderRepository {
         after_step_index: i32,
         reason: serde_json::Value,
         updated_at: DateTime<Utc>,
-    ) -> RouterServerResult<Vec<OrderExecutionStep>> {
+    ) -> RouterCoreResult<Vec<OrderExecutionStep>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -4010,7 +3998,7 @@ impl OrderRepository {
         let steps = rows
             .iter()
             .map(|row| self.map_execution_step_row(row))
-            .collect::<RouterServerResult<Vec<_>>>()?;
+            .collect::<RouterCoreResult<Vec<_>>>()?;
         let mut refreshed_leg_ids = std::collections::BTreeSet::new();
         for step in &steps {
             if let Some(execution_leg_id) = step.execution_leg_id {
@@ -4030,7 +4018,7 @@ impl OrderRepository {
         from_status: OrderExecutionStepStatus,
         to_status: OrderExecutionStepStatus,
         updated_at: DateTime<Utc>,
-    ) -> RouterServerResult<OrderExecutionStep> {
+    ) -> RouterCoreResult<OrderExecutionStep> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -4072,7 +4060,7 @@ impl OrderRepository {
         tx_hash: Option<String>,
         usd_valuation: serde_json::Value,
         completed_at: DateTime<Utc>,
-    ) -> RouterServerResult<OrderExecutionStep> {
+    ) -> RouterCoreResult<OrderExecutionStep> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -4117,7 +4105,7 @@ impl OrderRepository {
         response: serde_json::Value,
         tx_hash: Option<String>,
         completed_at: DateTime<Utc>,
-    ) -> RouterServerResult<Option<OrderExecutionStep>> {
+    ) -> RouterCoreResult<Option<OrderExecutionStep>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -4159,7 +4147,7 @@ impl OrderRepository {
         response: serde_json::Value,
         tx_hash: Option<String>,
         updated_at: DateTime<Utc>,
-    ) -> RouterServerResult<OrderExecutionStep> {
+    ) -> RouterCoreResult<OrderExecutionStep> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -4200,7 +4188,7 @@ impl OrderRepository {
         tx_hash: Option<String>,
         usd_valuation: serde_json::Value,
         completed_at: DateTime<Utc>,
-    ) -> RouterServerResult<OrderExecutionStep> {
+    ) -> RouterCoreResult<OrderExecutionStep> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -4244,7 +4232,7 @@ impl OrderRepository {
         id: Uuid,
         error: serde_json::Value,
         failed_at: DateTime<Utc>,
-    ) -> RouterServerResult<OrderExecutionStep> {
+    ) -> RouterCoreResult<OrderExecutionStep> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -4281,7 +4269,7 @@ impl OrderRepository {
         id: Uuid,
         error: serde_json::Value,
         failed_at: DateTime<Utc>,
-    ) -> RouterServerResult<OrderExecutionStep> {
+    ) -> RouterCoreResult<OrderExecutionStep> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -4318,7 +4306,7 @@ impl OrderRepository {
         id: Uuid,
         error: serde_json::Value,
         failed_at: DateTime<Utc>,
-    ) -> RouterServerResult<OrderExecutionStep> {
+    ) -> RouterCoreResult<OrderExecutionStep> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -4350,17 +4338,17 @@ impl OrderRepository {
         Ok(step)
     }
 
-    fn map_order_row(&self, row: &sqlx_postgres::PgRow) -> RouterServerResult<RouterOrder> {
+    fn map_order_row(&self, row: &sqlx_postgres::PgRow) -> RouterCoreResult<RouterOrder> {
         let order_type = row.get::<String, _>("order_type");
         let order_type = RouterOrderType::from_db_string(&order_type).ok_or_else(|| {
-            RouterServerError::InvalidData {
+            RouterCoreError::InvalidData {
                 message: format!("unsupported router order type: {order_type}"),
             }
         })?;
 
         let status = row.get::<String, _>("status");
         let status = RouterOrderStatus::from_db_string(&status).ok_or_else(|| {
-            RouterServerError::InvalidData {
+            RouterCoreError::InvalidData {
                 message: format!("unsupported router order status: {status}"),
             }
         })?;
@@ -4403,17 +4391,17 @@ impl OrderRepository {
         &self,
         order_type: RouterOrderType,
         row: &sqlx_postgres::PgRow,
-    ) -> RouterServerResult<RouterOrderAction> {
+    ) -> RouterCoreResult<RouterOrderAction> {
         match order_type {
             RouterOrderType::MarketOrder => {
                 let order_kind = row
                     .get::<Option<String>, _>("market_order_kind")
-                    .ok_or_else(|| RouterServerError::InvalidData {
+                    .ok_or_else(|| RouterCoreError::InvalidData {
                         message: "market order row is missing market_order_actions".to_string(),
                     })?;
                 let order_kind =
                     MarketOrderKindType::from_db_string(&order_kind).ok_or_else(|| {
-                        RouterServerError::InvalidData {
+                        RouterCoreError::InvalidData {
                             message: format!("unsupported market order kind: {order_kind}"),
                         }
                     })?;
@@ -4430,7 +4418,7 @@ impl OrderRepository {
                 let slippage_bps = row
                     .get::<Option<i64>, _>("market_order_slippage_bps")
                     .map(|value| {
-                        u64::try_from(value).map_err(|err| RouterServerError::InvalidData {
+                        u64::try_from(value).map_err(|err| RouterCoreError::InvalidData {
                             message: format!("invalid market order slippage_bps: {err}"),
                         })
                     })
@@ -4446,11 +4434,11 @@ impl OrderRepository {
             RouterOrderType::LimitOrder => {
                 let residual_policy = row
                     .get::<Option<String>, _>("limit_order_residual_policy")
-                    .ok_or_else(|| RouterServerError::InvalidData {
+                    .ok_or_else(|| RouterCoreError::InvalidData {
                         message: "limit order row is missing limit_order_actions".to_string(),
                     })?;
                 let residual_policy = LimitOrderResidualPolicy::from_db_string(&residual_policy)
-                    .ok_or_else(|| RouterServerError::InvalidData {
+                    .ok_or_else(|| RouterCoreError::InvalidData {
                         message: format!(
                             "unsupported limit order residual policy: {residual_policy}"
                         ),
@@ -4465,10 +4453,10 @@ impl OrderRepository {
         }
     }
 
-    fn map_quote_row(&self, row: &sqlx_postgres::PgRow) -> RouterServerResult<MarketOrderQuote> {
+    fn map_quote_row(&self, row: &sqlx_postgres::PgRow) -> RouterCoreResult<MarketOrderQuote> {
         let order_kind = row.get::<String, _>("order_kind");
         let order_kind = MarketOrderKindType::from_db_string(&order_kind).ok_or_else(|| {
-            RouterServerError::InvalidData {
+            RouterCoreError::InvalidData {
                 message: format!("unsupported market order kind: {order_kind}"),
             }
         })?;
@@ -4504,7 +4492,7 @@ impl OrderRepository {
             slippage_bps: row
                 .get::<Option<i64>, _>("slippage_bps")
                 .map(|value| {
-                    u64::try_from(value).map_err(|err| RouterServerError::InvalidData {
+                    u64::try_from(value).map_err(|err| RouterCoreError::InvalidData {
                         message: format!("invalid quote slippage_bps: {err}"),
                     })
                 })
@@ -4516,10 +4504,7 @@ impl OrderRepository {
         })
     }
 
-    fn map_limit_quote_row(
-        &self,
-        row: &sqlx_postgres::PgRow,
-    ) -> RouterServerResult<LimitOrderQuote> {
+    fn map_limit_quote_row(&self, row: &sqlx_postgres::PgRow) -> RouterCoreResult<LimitOrderQuote> {
         let source_chain = parse_chain_id(row.get::<String, _>("source_chain_id"), "quote source")?;
         let source_asset = parse_asset_id(row.get::<String, _>("source_asset_id"), "quote source")?;
         let destination_chain = parse_chain_id(
@@ -4532,7 +4517,7 @@ impl OrderRepository {
         )?;
         let residual_policy = row.get::<String, _>("residual_policy");
         let residual_policy = LimitOrderResidualPolicy::from_db_string(&residual_policy)
-            .ok_or_else(|| RouterServerError::InvalidData {
+            .ok_or_else(|| RouterCoreError::InvalidData {
                 message: format!("unsupported limit quote residual policy: {residual_policy}"),
             })?;
 
@@ -4559,32 +4544,29 @@ impl OrderRepository {
         })
     }
 
-    fn map_custody_vault_row(
-        &self,
-        row: &sqlx_postgres::PgRow,
-    ) -> RouterServerResult<CustodyVault> {
+    fn map_custody_vault_row(&self, row: &sqlx_postgres::PgRow) -> RouterCoreResult<CustodyVault> {
         let role = row.get::<String, _>("role");
         let role = CustodyVaultRole::from_db_string(&role).ok_or_else(|| {
-            RouterServerError::InvalidData {
+            RouterCoreError::InvalidData {
                 message: format!("unsupported custody vault role: {role}"),
             }
         })?;
         let visibility = row.get::<String, _>("visibility");
         let visibility = CustodyVaultVisibility::from_db_string(&visibility).ok_or_else(|| {
-            RouterServerError::InvalidData {
+            RouterCoreError::InvalidData {
                 message: format!("unsupported custody vault visibility: {visibility}"),
             }
         })?;
         let control_type = row.get::<String, _>("control_type");
         let control_type =
             CustodyVaultControlType::from_db_string(&control_type).ok_or_else(|| {
-                RouterServerError::InvalidData {
+                RouterCoreError::InvalidData {
                     message: format!("unsupported custody vault control type: {control_type}"),
                 }
             })?;
         let status = row.get::<String, _>("status");
         let status = CustodyVaultStatus::from_db_string(&status).ok_or_else(|| {
-            RouterServerError::InvalidData {
+            RouterCoreError::InvalidData {
                 message: format!("unsupported custody vault status: {status}"),
             }
         })?;
@@ -4596,7 +4578,7 @@ impl OrderRepository {
         let derivation_salt = row
             .get::<Option<Vec<u8>>, _>("derivation_salt")
             .map(|salt| {
-                salt.try_into().map_err(|_| RouterServerError::InvalidData {
+                salt.try_into().map_err(|_| RouterCoreError::InvalidData {
                     message: "custody vault derivation_salt must be 32 bytes".to_string(),
                 })
             })
@@ -4623,17 +4605,17 @@ impl OrderRepository {
     fn map_provider_operation_row(
         &self,
         row: &sqlx_postgres::PgRow,
-    ) -> RouterServerResult<OrderProviderOperation> {
+    ) -> RouterCoreResult<OrderProviderOperation> {
         let operation_type = row.get::<String, _>("operation_type");
         let operation_type =
             ProviderOperationType::from_db_string(&operation_type).ok_or_else(|| {
-                RouterServerError::InvalidData {
+                RouterCoreError::InvalidData {
                     message: format!("unsupported provider operation type: {operation_type}"),
                 }
             })?;
         let status = row.get::<String, _>("status");
         let status = ProviderOperationStatus::from_db_string(&status).ok_or_else(|| {
-            RouterServerError::InvalidData {
+            RouterCoreError::InvalidData {
                 message: format!("unsupported provider operation status: {status}"),
             }
         })?;
@@ -4658,16 +4640,16 @@ impl OrderRepository {
     fn map_provider_operation_hint_row(
         &self,
         row: &sqlx_postgres::PgRow,
-    ) -> RouterServerResult<OrderProviderOperationHint> {
+    ) -> RouterCoreResult<OrderProviderOperationHint> {
         let hint_kind = row.get::<String, _>("hint_kind");
         let hint_kind = ProviderOperationHintKind::from_db_string(&hint_kind).ok_or_else(|| {
-            RouterServerError::InvalidData {
+            RouterCoreError::InvalidData {
                 message: format!("unsupported provider operation hint kind: {hint_kind}"),
             }
         })?;
         let status = row.get::<String, _>("status");
         let status = ProviderOperationHintStatus::from_db_string(&status).ok_or_else(|| {
-            RouterServerError::InvalidData {
+            RouterCoreError::InvalidData {
                 message: format!("unsupported provider operation hint status: {status}"),
             }
         })?;
@@ -4691,10 +4673,10 @@ impl OrderRepository {
     fn map_provider_address_row(
         &self,
         row: &sqlx_postgres::PgRow,
-    ) -> RouterServerResult<OrderProviderAddress> {
+    ) -> RouterCoreResult<OrderProviderAddress> {
         let role = row.get::<String, _>("role");
         let role = ProviderAddressRole::from_db_string(&role).ok_or_else(|| {
-            RouterServerError::InvalidData {
+            RouterCoreError::InvalidData {
                 message: format!("unsupported provider address role: {role}"),
             }
         })?;
@@ -4725,16 +4707,16 @@ impl OrderRepository {
     fn map_execution_step_row(
         &self,
         row: &sqlx_postgres::PgRow,
-    ) -> RouterServerResult<OrderExecutionStep> {
+    ) -> RouterCoreResult<OrderExecutionStep> {
         let step_type = row.get::<String, _>("step_type");
         let step_type = OrderExecutionStepType::from_db_string(&step_type).ok_or_else(|| {
-            RouterServerError::InvalidData {
+            RouterCoreError::InvalidData {
                 message: format!("unsupported order execution step type: {step_type}"),
             }
         })?;
         let status = row.get::<String, _>("status");
         let status = OrderExecutionStepStatus::from_db_string(&status).ok_or_else(|| {
-            RouterServerError::InvalidData {
+            RouterCoreError::InvalidData {
                 message: format!("unsupported order execution step status: {status}"),
             }
         })?;
@@ -4781,10 +4763,10 @@ impl OrderRepository {
     fn map_execution_leg_row(
         &self,
         row: &sqlx_postgres::PgRow,
-    ) -> RouterServerResult<OrderExecutionLeg> {
+    ) -> RouterCoreResult<OrderExecutionLeg> {
         let status = row.get::<String, _>("status");
         let status = OrderExecutionStepStatus::from_db_string(&status).ok_or_else(|| {
-            RouterServerError::InvalidData {
+            RouterCoreError::InvalidData {
                 message: format!("unsupported order execution leg status: {status}"),
             }
         })?;
@@ -4828,17 +4810,17 @@ impl OrderRepository {
     fn map_execution_attempt_row(
         &self,
         row: &sqlx_postgres::PgRow,
-    ) -> RouterServerResult<OrderExecutionAttempt> {
+    ) -> RouterCoreResult<OrderExecutionAttempt> {
         let attempt_kind = row.get::<String, _>("attempt_kind");
         let attempt_kind =
             OrderExecutionAttemptKind::from_db_string(&attempt_kind).ok_or_else(|| {
-                RouterServerError::InvalidData {
+                RouterCoreError::InvalidData {
                     message: format!("unsupported order execution attempt kind: {attempt_kind}"),
                 }
             })?;
         let status = row.get::<String, _>("status");
         let status = OrderExecutionAttemptStatus::from_db_string(&status).ok_or_else(|| {
-            RouterServerError::InvalidData {
+            RouterCoreError::InvalidData {
                 message: format!("unsupported order execution attempt status: {status}"),
             }
         })?;
@@ -4862,7 +4844,7 @@ impl OrderRepository {
 fn ensure_execution_leg_plan_matches(
     existing: &OrderExecutionLeg,
     planned: &OrderExecutionLeg,
-) -> RouterServerResult<()> {
+) -> RouterCoreResult<()> {
     let mut mismatches = Vec::new();
     if existing.order_id != planned.order_id {
         mismatches.push("order_id");
@@ -4911,7 +4893,7 @@ fn ensure_execution_leg_plan_matches(
         return Ok(());
     }
 
-    Err(RouterServerError::InvalidData {
+    Err(RouterCoreError::InvalidData {
         message: format!(
             "execution leg materialization drift for order {} leg_index {}: {}",
             planned.order_id,
@@ -4935,7 +4917,7 @@ fn same_timestamptz_at_db_precision(
 fn ensure_execution_step_plan_matches(
     existing: &OrderExecutionStep,
     planned: &OrderExecutionStep,
-) -> RouterServerResult<()> {
+) -> RouterCoreResult<()> {
     let mut mismatches = Vec::new();
     if existing.order_id != planned.order_id {
         mismatches.push("order_id");
@@ -4987,7 +4969,7 @@ fn ensure_execution_step_plan_matches(
         return Ok(());
     }
 
-    Err(RouterServerError::InvalidData {
+    Err(RouterCoreError::InvalidData {
         message: format!(
             "execution step materialization drift for order {} step_index {}: {}",
             planned.order_id,
@@ -4997,14 +4979,14 @@ fn ensure_execution_step_plan_matches(
     })
 }
 
-fn parse_chain_id(value: String, label: &str) -> RouterServerResult<ChainId> {
-    ChainId::parse(value).map_err(|err| RouterServerError::InvalidData {
+fn parse_chain_id(value: String, label: &str) -> RouterCoreResult<ChainId> {
+    ChainId::parse(value).map_err(|err| RouterCoreError::InvalidData {
         message: format!("unsupported {label} chain id: {err}"),
     })
 }
 
-fn parse_asset_id(value: String, label: &str) -> RouterServerResult<AssetId> {
-    AssetId::parse(value).map_err(|err| RouterServerError::InvalidData {
+fn parse_asset_id(value: String, label: &str) -> RouterCoreResult<AssetId> {
+    AssetId::parse(value).map_err(|err| RouterCoreError::InvalidData {
         message: format!("unsupported {label} asset id: {err}"),
     })
 }
@@ -5013,14 +4995,14 @@ fn parse_optional_deposit_asset(
     chain: Option<String>,
     asset: Option<String>,
     label: &str,
-) -> RouterServerResult<Option<DepositAsset>> {
+) -> RouterCoreResult<Option<DepositAsset>> {
     match (chain, asset) {
         (Some(chain), Some(asset)) => Ok(Some(DepositAsset {
             chain: parse_chain_id(chain, label)?,
             asset: parse_asset_id(asset, label)?,
         })),
         (None, None) => Ok(None),
-        _ => Err(RouterServerError::InvalidData {
+        _ => Err(RouterCoreError::InvalidData {
             message: format!("{label} execution asset is partially populated"),
         }),
     }
@@ -5037,7 +5019,7 @@ struct MarketOrderActionFields {
 
 fn market_order_action_fields(
     action: &RouterOrderAction,
-) -> RouterServerResult<MarketOrderActionFields> {
+) -> RouterCoreResult<MarketOrderActionFields> {
     match action {
         RouterOrderAction::MarketOrder(action) => match &action.order_kind {
             MarketOrderKind::ExactIn {
@@ -5063,7 +5045,7 @@ fn market_order_action_fields(
                 slippage_bps: action.slippage_bps,
             }),
         },
-        RouterOrderAction::LimitOrder(_) => Err(RouterServerError::InvalidData {
+        RouterOrderAction::LimitOrder(_) => Err(RouterCoreError::InvalidData {
             message: "expected market order action".to_string(),
         }),
     }
@@ -5072,20 +5054,20 @@ fn market_order_action_fields(
 fn optional_slippage_bps_i64(
     slippage_bps: Option<u64>,
     owner: &str,
-) -> RouterServerResult<Option<i64>> {
+) -> RouterCoreResult<Option<i64>> {
     slippage_bps
         .map(|value| {
-            i64::try_from(value).map_err(|err| RouterServerError::Validation {
+            i64::try_from(value).map_err(|err| RouterCoreError::Validation {
                 message: format!("{owner} slippage_bps does not fit i64: {err}"),
             })
         })
         .transpose()
 }
 
-fn limit_order_action_fields(action: &RouterOrderAction) -> RouterServerResult<LimitOrderAction> {
+fn limit_order_action_fields(action: &RouterOrderAction) -> RouterCoreResult<LimitOrderAction> {
     match action {
         RouterOrderAction::LimitOrder(action) => Ok(action.clone()),
-        RouterOrderAction::MarketOrder(_) => Err(RouterServerError::InvalidData {
+        RouterOrderAction::MarketOrder(_) => Err(RouterCoreError::InvalidData {
             message: "expected limit order action".to_string(),
         }),
     }
@@ -5094,9 +5076,9 @@ fn limit_order_action_fields(action: &RouterOrderAction) -> RouterServerResult<L
 fn required_action_amount(
     row: &sqlx_postgres::PgRow,
     column: &'static str,
-) -> RouterServerResult<String> {
+) -> RouterCoreResult<String> {
     row.get::<Option<String>, _>(column)
-        .ok_or_else(|| RouterServerError::InvalidData {
+        .ok_or_else(|| RouterCoreError::InvalidData {
             message: format!("order action is missing required {column}"),
         })
 }

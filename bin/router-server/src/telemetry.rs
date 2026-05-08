@@ -1,12 +1,12 @@
-use crate::{
+use crate::services::vault_manager::VaultError;
+use metrics::{counter, gauge, histogram};
+use router_core::{
     models::{
         DepositVault, DepositVaultStatus, OrderExecutionStep, OrderProviderOperation,
         OrderProviderOperationHint, RouterOrder, RouterOrderStatus,
     },
     protocol::{AssetId, ChainId, DepositAsset},
-    services::vault_manager::VaultError,
 };
-use metrics::{counter, gauge, histogram};
 use std::time::Duration;
 use tracing::info;
 

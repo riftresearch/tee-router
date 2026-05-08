@@ -2,12 +2,12 @@ use std::time::Duration;
 
 use metrics::histogram;
 use reqwest::StatusCode;
+use router_core::services::action_providers::ProviderOperationObservation;
 use router_server::api::{
     DetectorHintEnvelope, DetectorHintRequest, ProviderOperationHintEnvelope,
     ProviderOperationHintRequest, ProviderOperationObserveRequest, VaultFundingHintEnvelope,
     VaultFundingHintRequest,
 };
-use router_server::services::action_providers::ProviderOperationObservation;
 use snafu::ResultExt;
 use uuid::Uuid;
 

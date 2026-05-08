@@ -6,11 +6,7 @@ use snafu::{prelude::*, Whatever};
 
 pub mod api;
 pub mod app;
-pub mod config;
-pub mod db;
 pub mod error;
-pub mod models;
-pub mod protocol;
 pub mod query_api;
 pub mod runtime;
 pub mod server;
@@ -257,7 +253,7 @@ pub struct RouterServerArgs {
         default_value = "mainnet",
         value_parser = parse_hyperliquid_network,
     )]
-    pub hyperliquid_network: services::custody_action_executor::HyperliquidCallNetwork,
+    pub hyperliquid_network: router_core::services::custody_action_executor::HyperliquidCallNetwork,
 
     /// Timeout for Hyperliquid resting orders before the router arms the
     /// exchange-side dead-man switch to cancel them, in milliseconds.
@@ -397,8 +393,11 @@ impl RouterServerArgs {
 
 fn parse_hyperliquid_network(
     s: &str,
-) -> std::result::Result<services::custody_action_executor::HyperliquidCallNetwork, String> {
-    use services::custody_action_executor::HyperliquidCallNetwork;
+) -> std::result::Result<
+    router_core::services::custody_action_executor::HyperliquidCallNetwork,
+    String,
+> {
+    use router_core::services::custody_action_executor::HyperliquidCallNetwork;
     match s.to_ascii_lowercase().as_str() {
         "mainnet" => Ok(HyperliquidCallNetwork::Mainnet),
         "testnet" => Ok(HyperliquidCallNetwork::Testnet),

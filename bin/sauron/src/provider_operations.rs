@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use metrics::{gauge, histogram};
-use router_server::models::{ProviderOperationStatus, ProviderOperationType};
+use router_core::models::{ProviderOperationStatus, ProviderOperationType};
 use serde_json::Value;
 use snafu::ResultExt;
 use sqlx_core::row::Row;
@@ -365,7 +365,7 @@ fn parse_provider_operation_row(row: sqlx_postgres::PgRow) -> Result<ProviderOpe
 mod tests {
     use super::{ProviderOperationWatchEntry, ProviderOperationWatchStore};
     use chrono::Duration;
-    use router_server::models::{ProviderOperationStatus, ProviderOperationType};
+    use router_core::models::{ProviderOperationStatus, ProviderOperationType};
     use serde_json::json;
     use uuid::Uuid;
 

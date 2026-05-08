@@ -1,4 +1,4 @@
-use crate::{error::RouterServerResult, telemetry};
+use crate::{error::RouterCoreResult, telemetry};
 use chrono::{DateTime, Utc};
 use sqlx_core::row::Row;
 use sqlx_postgres::PgPool;
@@ -29,7 +29,7 @@ impl WorkerLeaseRepository {
         owner_id: &str,
         now: DateTime<Utc>,
         expires_at: DateTime<Utc>,
-    ) -> RouterServerResult<Option<WorkerLease>> {
+    ) -> RouterCoreResult<Option<WorkerLease>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(
             r#"
@@ -79,7 +79,7 @@ impl WorkerLeaseRepository {
         fencing_token: i64,
         now: DateTime<Utc>,
         expires_at: DateTime<Utc>,
-    ) -> RouterServerResult<Option<WorkerLease>> {
+    ) -> RouterCoreResult<Option<WorkerLease>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(
             r#"
@@ -112,7 +112,7 @@ impl WorkerLeaseRepository {
     }
 }
 
-fn map_worker_lease(row: sqlx_postgres::PgRow) -> RouterServerResult<WorkerLease> {
+fn map_worker_lease(row: sqlx_postgres::PgRow) -> RouterCoreResult<WorkerLease> {
     Ok(WorkerLease {
         lease_name: row.get("lease_name"),
         owner_id: row.get("owner_id"),

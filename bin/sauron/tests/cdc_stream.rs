@@ -14,12 +14,14 @@ use testcontainers::{
 use uuid::Uuid;
 
 const POSTGRES_PORT: u16 = 5432;
-const ROUTER_CDC_MIGRATION: &str =
-    include_str!("../../router-server/migrations/20260502120000_router_cdc_logical_messages.sql");
-const ROUTER_CDC_DELETE_SAFE_MIGRATION: &str =
-    include_str!("../../router-server/migrations/20260504183000_router_cdc_delete_safe.sql");
+const ROUTER_CDC_MIGRATION: &str = include_str!(
+    "../../../crates/router-core/migrations/20260502120000_router_cdc_logical_messages.sql"
+);
+const ROUTER_CDC_DELETE_SAFE_MIGRATION: &str = include_str!(
+    "../../../crates/router-core/migrations/20260504183000_router_cdc_delete_safe.sql"
+);
 const ROUTER_CDC_MESSAGE_ONLY_PUBLICATION_MIGRATION: &str = include_str!(
-    "../../router-server/migrations/20260504190000_router_cdc_message_only_publication.sql"
+    "../../../crates/router-core/migrations/20260504190000_router_cdc_message_only_publication.sql"
 );
 
 #[tokio::test]

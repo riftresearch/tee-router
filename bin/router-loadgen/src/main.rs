@@ -1685,6 +1685,7 @@ mod tests {
                     "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                         .to_string(),
                 ],
+                nonce_manager: EvmNonceManager::default(),
             },
             bitcoin: BitcoinFundingConfig {
                 rpc_url: Some("http://localhost:18443".to_string()),

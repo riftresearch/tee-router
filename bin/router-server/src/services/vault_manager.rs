@@ -1,14 +1,6 @@
-use super::bitcoin_funding::observed_bitcoin_outpoint;
 use crate::{
     api::CreateVaultRequest,
-    config::Settings,
-    db::Database,
     error::RouterServerError,
-    models::{
-        DepositVault, DepositVaultFundingHint, DepositVaultFundingObservation, DepositVaultStatus,
-        ProviderOperationHintStatus, RouterOrderQuote, RouterOrderStatus, VaultAction,
-    },
-    protocol::{backend_chain_for_id, AssetId, ChainId, DepositAsset},
     services::deposit_address::{derive_deposit_address_for_quote, DepositAddressError},
     telemetry,
 };
@@ -17,6 +9,17 @@ use blockchain_utils::MempoolEsploraFeeExt;
 use chains::ChainRegistry;
 use chrono::{DateTime, Duration, Utc};
 use hkdf::Hkdf;
+use router_core::{
+    config::Settings,
+    db::Database,
+    error::RouterCoreError,
+    models::{
+        DepositVault, DepositVaultFundingHint, DepositVaultFundingObservation, DepositVaultStatus,
+        ProviderOperationHintStatus, RouterOrderQuote, RouterOrderStatus, VaultAction,
+    },
+    protocol::{backend_chain_for_id, AssetId, ChainId, DepositAsset},
+    services::bitcoin_funding::observed_bitcoin_outpoint,
+};
 use router_primitives::{ChainType, TokenIdentifier};
 use serde_json::{json, Value};
 use sha2::Sha256;
@@ -124,9 +127,9 @@ impl VaultError {
         }
     }
 
-    fn database(source: RouterServerError) -> Self {
+    fn database(source: impl Into<RouterServerError>) -> Self {
         Self::Database {
-            source: Box::new(source),
+            source: Box::new(source.into()),
         }
     }
 }
@@ -469,7 +472,7 @@ impl VaultManager {
                 .await
             {
                 Ok(funded_vault) => funded_vault,
-                Err(RouterServerError::NotFound) => continue,
+                Err(RouterCoreError::NotFound) => continue,
                 Err(source) => return Err(VaultError::database(source)),
             };
             telemetry::record_vault_transition(
@@ -513,7 +516,7 @@ impl VaultManager {
             .await
         {
             Ok(_) => Ok(true),
-            Err(RouterServerError::NotFound) => {
+            Err(RouterCoreError::NotFound) => {
                 warn!(
                     hint_id = %hint.id,
                     claimed_at = ?hint.claimed_at,
@@ -574,7 +577,7 @@ impl VaultManager {
                 .await
             {
                 Ok(observed_vault) => observed_vault,
-                Err(RouterServerError::NotFound) => {
+                Err(RouterCoreError::NotFound) => {
                     return Ok(FundingHintDisposition::Ignored {
                         reason: "refunding vault observation was already recorded".to_string(),
                     });
@@ -593,7 +596,7 @@ impl VaultManager {
             .await
         {
             Ok(funded_vault) => funded_vault,
-            Err(RouterServerError::NotFound) => {
+            Err(RouterCoreError::NotFound) => {
                 return Ok(FundingHintDisposition::Ignored {
                     reason: "vault funding transition was already claimed".to_string(),
                 });
@@ -776,7 +779,7 @@ impl VaultManager {
                     .await
                 {
                     Ok(vault) => vault,
-                    Err(RouterServerError::NotFound) => {
+                    Err(RouterCoreError::NotFound) => {
                         warn!(
                             vault_id = %vault.id,
                             worker_id = %self.worker_id,
@@ -822,7 +825,7 @@ impl VaultManager {
                             );
                             return Ok(vault);
                         }
-                        Err(RouterServerError::NotFound) => {
+                        Err(RouterCoreError::NotFound) => {
                             warn!(
                                 vault_id = %vault.id,
                                 worker_id = %self.worker_id,
@@ -848,7 +851,7 @@ impl VaultManager {
                     .await
                 {
                     Ok(vault) => Ok(vault),
-                    Err(RouterServerError::NotFound) => {
+                    Err(RouterCoreError::NotFound) => {
                         warn!(
                             vault_id = %vault.id,
                             worker_id = %self.worker_id,
@@ -1171,10 +1174,10 @@ impl VaultManager {
         match &vault.action {
             VaultAction::Null => Ok(U256::from(1)),
             VaultAction::MarketOrder(action) => match &action.order_kind {
-                crate::models::MarketOrderKind::ExactIn { amount_in, .. } => {
+                router_core::models::MarketOrderKind::ExactIn { amount_in, .. } => {
                     parse_positive_u256("amount_in", amount_in)
                 }
-                crate::models::MarketOrderKind::ExactOut { max_amount_in, .. } => {
+                router_core::models::MarketOrderKind::ExactOut { max_amount_in, .. } => {
                     let Some(max_amount_in) = max_amount_in.as_deref() else {
                         return Err(VaultError::InvalidOrderBinding {
                             reason: "exact-out market order funding requires max_amount_in"
@@ -1512,9 +1515,9 @@ fn token_identifier(asset_id: &AssetId) -> TokenIdentifier {
     }
 }
 
-fn map_create_vault_error(source: RouterServerError) -> VaultError {
+fn map_create_vault_error(source: RouterCoreError) -> VaultError {
     match source {
-        RouterServerError::Validation { message } => {
+        RouterCoreError::Validation { message } => {
             VaultError::InvalidOrderBinding { reason: message }
         }
         source => VaultError::database(source),
@@ -1794,7 +1797,7 @@ mod tests {
             id: Uuid::now_v7(),
             vault_id: Uuid::now_v7(),
             source: "sauron".to_string(),
-            hint_kind: crate::models::ProviderOperationHintKind::PossibleProgress,
+            hint_kind: router_core::models::ProviderOperationHintKind::PossibleProgress,
             evidence: serde_json::json!({ "vout": 7 }),
             status: ProviderOperationHintStatus::Pending,
             idempotency_key: None,
@@ -1816,7 +1819,7 @@ mod tests {
             id: Uuid::now_v7(),
             vault_id: Uuid::now_v7(),
             source: "sauron".to_string(),
-            hint_kind: crate::models::ProviderOperationHintKind::PossibleProgress,
+            hint_kind: router_core::models::ProviderOperationHintKind::PossibleProgress,
             evidence: serde_json::json!({ "vout": "7" }),
             status: ProviderOperationHintStatus::Pending,
             idempotency_key: None,
@@ -1844,7 +1847,7 @@ mod tests {
             id: Uuid::now_v7(),
             vault_id: Uuid::now_v7(),
             source: "sauron".to_string(),
-            hint_kind: crate::models::ProviderOperationHintKind::PossibleProgress,
+            hint_kind: router_core::models::ProviderOperationHintKind::PossibleProgress,
             evidence: serde_json::json!({ "confirmation_state": "Mempool" }),
             status: ProviderOperationHintStatus::Pending,
             idempotency_key: None,
@@ -1905,7 +1908,7 @@ mod tests {
             id: Uuid::now_v7(),
             vault_id: vault.id,
             source: "sauron".to_string(),
-            hint_kind: crate::models::ProviderOperationHintKind::PossibleProgress,
+            hint_kind: router_core::models::ProviderOperationHintKind::PossibleProgress,
             evidence: serde_json::json!({
                 "tx_hash": "abc123",
                 "sender_address": "sender-a",
@@ -2015,7 +2018,7 @@ mod tests {
             id: Uuid::now_v7(),
             vault_id: vault.id,
             source: "sauron".to_string(),
-            hint_kind: crate::models::ProviderOperationHintKind::PossibleProgress,
+            hint_kind: router_core::models::ProviderOperationHintKind::PossibleProgress,
             evidence: serde_json::json!({
                 "sender_addresses": ["sender-a", 7],
             }),
@@ -2087,7 +2090,7 @@ mod tests {
             id: Uuid::now_v7(),
             vault_id: vault.id,
             source: "sauron".to_string(),
-            hint_kind: crate::models::ProviderOperationHintKind::PossibleProgress,
+            hint_kind: router_core::models::ProviderOperationHintKind::PossibleProgress,
             evidence: serde_json::json!({
                 "observed_at": "definitely not a timestamp",
             }),
@@ -2134,7 +2137,7 @@ mod tests {
             id: Uuid::now_v7(),
             vault_id: vault.id,
             source: "sauron".to_string(),
-            hint_kind: crate::models::ProviderOperationHintKind::PossibleProgress,
+            hint_kind: router_core::models::ProviderOperationHintKind::PossibleProgress,
             evidence: serde_json::json!({
                 "amount": "not-a-number",
             }),

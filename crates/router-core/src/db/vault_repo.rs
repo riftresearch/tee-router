@@ -1,5 +1,5 @@
 use crate::{
-    error::{RouterServerError, RouterServerResult},
+    error::{RouterCoreError, RouterCoreResult},
     models::{
         CustodyVaultControlType, CustodyVaultRole, CustodyVaultStatus, CustodyVaultVisibility,
         DepositVault, DepositVaultFundingHint, DepositVaultFundingObservation, DepositVaultStatus,
@@ -91,7 +91,7 @@ impl VaultRepository {
         Self { pool }
     }
 
-    pub async fn create(&self, vault: &DepositVault) -> RouterServerResult<()> {
+    pub async fn create(&self, vault: &DepositVault) -> RouterCoreResult<()> {
         self.create_internal(vault, None, "vault.create").await
     }
 
@@ -100,7 +100,7 @@ impl VaultRepository {
         vault: &DepositVault,
         order_id: Uuid,
         updated_at: DateTime<Utc>,
-    ) -> RouterServerResult<()> {
+    ) -> RouterCoreResult<()> {
         self.create_internal(
             vault,
             Some((order_id, updated_at)),
@@ -114,9 +114,9 @@ impl VaultRepository {
         vault: &DepositVault,
         order_attachment: Option<(Uuid, DateTime<Utc>)>,
         metric_name: &'static str,
-    ) -> RouterServerResult<()> {
+    ) -> RouterCoreResult<()> {
         let action =
-            serde_json::to_value(&vault.action).map_err(|err| RouterServerError::InvalidData {
+            serde_json::to_value(&vault.action).map_err(|err| RouterCoreError::InvalidData {
                 message: format!("failed to encode vault action: {err}"),
             })?;
         let cancellation_commitment = decode_hex_32(&vault.cancellation_commitment)?;
@@ -293,7 +293,7 @@ impl VaultRepository {
                 .await?;
 
                 if attached.is_none() {
-                    return Err(RouterServerError::Validation {
+                    return Err(RouterCoreError::Validation {
                         message: format!("order {order_id} is no longer attachable"),
                     });
                 }
@@ -345,7 +345,7 @@ impl VaultRepository {
             }
 
             tx.commit().await?;
-            Ok::<(), RouterServerError>(())
+            Ok::<(), RouterCoreError>(())
         }
         .await;
         telemetry::record_db_query(metric_name, result.is_ok(), started.elapsed());
@@ -354,7 +354,7 @@ impl VaultRepository {
         Ok(())
     }
 
-    pub async fn get(&self, id: Uuid) -> RouterServerResult<DepositVault> {
+    pub async fn get(&self, id: Uuid) -> RouterCoreResult<DepositVault> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             "SELECT {SELECT_COLUMNS} FROM {SELECT_FROM} WHERE dv.id = $1"
@@ -371,7 +371,7 @@ impl VaultRepository {
     pub async fn find_pending_funding_without_observation(
         &self,
         limit: i64,
-    ) -> RouterServerResult<Vec<DepositVault>> {
+    ) -> RouterCoreResult<Vec<DepositVault>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -402,7 +402,7 @@ impl VaultRepository {
         from_status: DepositVaultStatus,
         to_status: DepositVaultStatus,
         updated_at: DateTime<Utc>,
-    ) -> RouterServerResult<DepositVault> {
+    ) -> RouterCoreResult<DepositVault> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -437,7 +437,7 @@ impl VaultRepository {
         id: Uuid,
         observation: &DepositVaultFundingObservation,
         updated_at: DateTime<Utc>,
-    ) -> RouterServerResult<DepositVault> {
+    ) -> RouterCoreResult<DepositVault> {
         let funding_transfer_index = db_transfer_index_from_observation(Some(observation))?;
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
@@ -522,7 +522,7 @@ impl VaultRepository {
         id: Uuid,
         observation: &DepositVaultFundingObservation,
         updated_at: DateTime<Utc>,
-    ) -> RouterServerResult<DepositVault> {
+    ) -> RouterCoreResult<DepositVault> {
         let funding_transfer_index = db_transfer_index_from_observation(Some(observation))?;
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
@@ -605,7 +605,7 @@ impl VaultRepository {
     pub async fn create_funding_hint(
         &self,
         hint: &DepositVaultFundingHint,
-    ) -> RouterServerResult<DepositVaultFundingHint> {
+    ) -> RouterCoreResult<DepositVaultFundingHint> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -692,7 +692,7 @@ impl VaultRepository {
         &self,
         limit: i64,
         now: DateTime<Utc>,
-    ) -> RouterServerResult<Vec<DepositVaultFundingHint>> {
+    ) -> RouterCoreResult<Vec<DepositVaultFundingHint>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -756,7 +756,7 @@ impl VaultRepository {
         status: ProviderOperationHintStatus,
         error: serde_json::Value,
         now: DateTime<Utc>,
-    ) -> RouterServerResult<DepositVaultFundingHint> {
+    ) -> RouterCoreResult<DepositVaultFundingHint> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -793,7 +793,7 @@ impl VaultRepository {
         &self,
         id: Uuid,
         requested_at: DateTime<Utc>,
-    ) -> RouterServerResult<DepositVault> {
+    ) -> RouterCoreResult<DepositVault> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -856,7 +856,7 @@ impl VaultRepository {
         now: DateTime<Utc>,
         claimed_until: DateTime<Utc>,
         worker_id: &str,
-    ) -> RouterServerResult<Option<DepositVault>> {
+    ) -> RouterCoreResult<Option<DepositVault>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -900,7 +900,7 @@ impl VaultRepository {
         claimed_until: DateTime<Utc>,
         worker_id: &str,
         limit: i64,
-    ) -> RouterServerResult<Vec<DepositVault>> {
+    ) -> RouterCoreResult<Vec<DepositVault>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -957,7 +957,7 @@ impl VaultRepository {
         claimed_until: DateTime<Utc>,
         worker_id: &str,
         limit: i64,
-    ) -> RouterServerResult<Vec<DepositVault>> {
+    ) -> RouterCoreResult<Vec<DepositVault>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -1002,7 +1002,7 @@ impl VaultRepository {
     pub async fn next_refund_due_at(
         &self,
         now: DateTime<Utc>,
-    ) -> RouterServerResult<Option<DateTime<Utc>>> {
+    ) -> RouterCoreResult<Option<DateTime<Utc>>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(
             r#"
@@ -1045,7 +1045,7 @@ impl VaultRepository {
         refund_tx_hash: &str,
         claimed_by: &str,
         claimed_until: DateTime<Utc>,
-    ) -> RouterServerResult<DepositVault> {
+    ) -> RouterCoreResult<DepositVault> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -1092,7 +1092,7 @@ impl VaultRepository {
         last_refund_error: &str,
         claimed_by: &str,
         claimed_until: DateTime<Utc>,
-    ) -> RouterServerResult<DepositVault> {
+    ) -> RouterCoreResult<DepositVault> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -1137,7 +1137,7 @@ impl VaultRepository {
         last_refund_error: &str,
         claimed_by: &str,
         claimed_until: DateTime<Utc>,
-    ) -> RouterServerResult<DepositVault> {
+    ) -> RouterCoreResult<DepositVault> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -1181,16 +1181,16 @@ impl VaultRepository {
     fn map_funding_hint_row(
         &self,
         row: &sqlx_postgres::PgRow,
-    ) -> RouterServerResult<DepositVaultFundingHint> {
+    ) -> RouterCoreResult<DepositVaultFundingHint> {
         let hint_kind = row.get::<String, _>("hint_kind");
         let hint_kind = ProviderOperationHintKind::from_db_string(&hint_kind).ok_or_else(|| {
-            RouterServerError::InvalidData {
+            RouterCoreError::InvalidData {
                 message: format!("unsupported vault funding hint kind: {hint_kind}"),
             }
         })?;
         let status = row.get::<String, _>("status");
         let status = ProviderOperationHintStatus::from_db_string(&status).ok_or_else(|| {
-            RouterServerError::InvalidData {
+            RouterCoreError::InvalidData {
                 message: format!("unsupported vault funding hint status: {status}"),
             }
         })?;
@@ -1211,44 +1211,43 @@ impl VaultRepository {
         })
     }
 
-    fn map_row(&self, row: &sqlx_postgres::PgRow) -> RouterServerResult<DepositVault> {
+    fn map_row(&self, row: &sqlx_postgres::PgRow) -> RouterCoreResult<DepositVault> {
         let deposit_chain = row.get::<String, _>("deposit_chain_id");
         let deposit_chain =
-            ChainId::parse(deposit_chain).map_err(|err| RouterServerError::InvalidData {
+            ChainId::parse(deposit_chain).map_err(|err| RouterCoreError::InvalidData {
                 message: format!("unsupported deposit chain id: {err}"),
             })?;
 
         let deposit_asset = row.get::<String, _>("deposit_asset_id");
         let deposit_asset =
-            AssetId::parse(deposit_asset).map_err(|err| RouterServerError::InvalidData {
+            AssetId::parse(deposit_asset).map_err(|err| RouterCoreError::InvalidData {
                 message: format!("unsupported deposit asset id: {err}"),
             })?;
 
         let action: serde_json::Value = row.get("action");
         let action: VaultAction =
-            serde_json::from_value(action).map_err(|err| RouterServerError::InvalidData {
+            serde_json::from_value(action).map_err(|err| RouterCoreError::InvalidData {
                 message: format!("invalid action payload in database: {err}"),
             })?;
 
         let status = row.get::<String, _>("status");
         let status = DepositVaultStatus::from_db_string(&status).ok_or_else(|| {
-            RouterServerError::InvalidData {
+            RouterCoreError::InvalidData {
                 message: format!("unsupported vault status: {status}"),
             }
         })?;
 
         let salt = row.get::<Vec<u8>, _>("deposit_vault_salt");
         let deposit_vault_salt: [u8; 32] =
-            salt.try_into()
-                .map_err(|_| RouterServerError::InvalidData {
-                    message: "deposit_vault_salt must be 32 bytes".to_string(),
-                })?;
+            salt.try_into().map_err(|_| RouterCoreError::InvalidData {
+                message: "deposit_vault_salt must be 32 bytes".to_string(),
+            })?;
 
         let cancellation_commitment = row.get::<Vec<u8>, _>("cancellation_commitment");
         let cancellation_commitment: [u8; 32] =
             cancellation_commitment
                 .try_into()
-                .map_err(|_| RouterServerError::InvalidData {
+                .map_err(|_| RouterCoreError::InvalidData {
                     message: "cancellation_commitment must be 32 bytes".to_string(),
                 })?;
 
@@ -1256,7 +1255,7 @@ impl VaultRepository {
         let funding_sender_addresses = serde_json::from_value::<Vec<String>>(
             funding_sender_addresses_json.clone(),
         )
-        .map_err(|err| RouterServerError::InvalidData {
+        .map_err(|err| RouterCoreError::InvalidData {
             message: format!("invalid funding sender addresses payload: {err}"),
         })?;
         let funding_evidence: serde_json::Value = row.get("funding_evidence_json");
@@ -1316,36 +1315,36 @@ impl VaultRepository {
     }
 }
 
-fn decode_hex_32(value: &str) -> RouterServerResult<[u8; 32]> {
+fn decode_hex_32(value: &str) -> RouterCoreResult<[u8; 32]> {
     let stripped = value.strip_prefix("0x").unwrap_or(value);
-    let bytes = alloy::hex::decode(stripped).map_err(|err| RouterServerError::Validation {
+    let bytes = alloy::hex::decode(stripped).map_err(|err| RouterCoreError::Validation {
         message: format!("invalid 32-byte hex value: {err}"),
     })?;
 
-    bytes.try_into().map_err(|_| RouterServerError::Validation {
+    bytes.try_into().map_err(|_| RouterCoreError::Validation {
         message: "expected 32-byte hex value".to_string(),
     })
 }
 
 fn db_transfer_index_from_observation(
     observation: Option<&DepositVaultFundingObservation>,
-) -> RouterServerResult<Option<i64>> {
+) -> RouterCoreResult<Option<i64>> {
     observation
         .and_then(|observation| observation.transfer_index)
         .map(db_transfer_index_from_u64)
         .transpose()
 }
 
-fn db_transfer_index_from_u64(index: u64) -> RouterServerResult<i64> {
-    i64::try_from(index).map_err(|_| RouterServerError::InvalidData {
+fn db_transfer_index_from_u64(index: u64) -> RouterCoreResult<i64> {
+    i64::try_from(index).map_err(|_| RouterCoreError::InvalidData {
         message: format!("funding transfer index {index} exceeds Postgres bigint range"),
     })
 }
 
-fn transfer_index_from_db(index: Option<i64>) -> RouterServerResult<Option<u64>> {
+fn transfer_index_from_db(index: Option<i64>) -> RouterCoreResult<Option<u64>> {
     index
         .map(|index| {
-            u64::try_from(index).map_err(|_| RouterServerError::InvalidData {
+            u64::try_from(index).map_err(|_| RouterCoreError::InvalidData {
                 message: format!("funding transfer index {index} is negative"),
             })
         })

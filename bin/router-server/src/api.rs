@@ -1,4 +1,5 @@
-use crate::{
+use chrono::{DateTime, Utc};
+use router_core::{
     models::{
         empty_metadata, CustodyVault, DepositVaultFundingHint, OrderExecutionAttempt,
         OrderExecutionLeg, OrderExecutionStep, OrderExecutionStepStatus, OrderProviderOperation,
@@ -8,7 +9,6 @@ use crate::{
     },
     protocol::DepositAsset,
 };
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
@@ -361,7 +361,8 @@ fn default_hint_kind() -> ProviderOperationHintKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
+    use chrono::Utc;
+    use router_core::{
         models::{
             MarketOrderAction, MarketOrderKind, MarketOrderKindType, MarketOrderQuote,
             ProviderOperationStatus, ProviderOperationType, RouterOrderAction, RouterOrderEnvelope,
@@ -369,7 +370,6 @@ mod tests {
         },
         protocol::{AssetId, ChainId},
     };
-    use chrono::Utc;
     use serde_json::json;
 
     #[test]
@@ -659,7 +659,7 @@ mod tests {
             execution_leg_id: None,
             transition_decl_id: None,
             step_index,
-            step_type: crate::models::OrderExecutionStepType::AcrossBridge,
+            step_type: router_core::models::OrderExecutionStepType::AcrossBridge,
             provider: "across".to_string(),
             status,
             input_asset: None,

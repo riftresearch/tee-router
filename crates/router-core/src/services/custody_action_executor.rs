@@ -2,7 +2,7 @@ use super::bitcoin_funding::{observed_bitcoin_outpoint, ObservedBitcoinOutpoint}
 use crate::{
     config::Settings,
     db::Database,
-    error::RouterServerError,
+    error::RouterCoreError,
     models::{
         CustodyVault, CustodyVaultControlType, CustodyVaultRole, CustodyVaultStatus,
         CustodyVaultVisibility,
@@ -30,7 +30,7 @@ use uuid::Uuid;
 #[derive(Debug, Snafu)]
 pub enum CustodyActionError {
     #[snafu(display("Database error: {}", source))]
-    Database { source: RouterServerError },
+    Database { source: RouterCoreError },
 
     #[snafu(display("Chain not supported: {}", chain))]
     ChainNotSupported { chain: ChainId },

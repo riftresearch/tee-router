@@ -8,12 +8,12 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use pgwire_replication::ReplicationEvent;
-use router_server::{
-    api::{
-        ProviderOperationHintRequest, ProviderOperationObserveRequest, MAX_HINT_IDEMPOTENCY_KEY_LEN,
-    },
+use router_core::{
     models::{ProviderOperationHintKind, PROVIDER_OPERATION_OBSERVATION_HINT_SOURCE},
     services::action_providers::ProviderOperationObservation,
+};
+use router_server::api::{
+    ProviderOperationHintRequest, ProviderOperationObserveRequest, MAX_HINT_IDEMPOTENCY_KEY_LEN,
 };
 use sha2::{Digest, Sha256};
 use snafu::ResultExt;
@@ -469,7 +469,7 @@ fn merge_valid_router_cdc_message(content: &[u8], pending_plan: &mut CdcRefreshP
 #[cfg(test)]
 mod tests {
     use super::*;
-    use router_server::{
+    use router_core::{
         models::ProviderOperationStatus, services::action_providers::ProviderOperationObservation,
     };
 

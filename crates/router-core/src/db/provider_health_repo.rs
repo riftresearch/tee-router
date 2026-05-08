@@ -1,5 +1,5 @@
 use crate::{
-    error::{RouterServerError, RouterServerResult},
+    error::{RouterCoreError, RouterCoreResult},
     models::{ProviderHealthCheck, ProviderHealthStatus},
     telemetry,
 };
@@ -30,7 +30,7 @@ impl ProviderHealthRepository {
         Self { pool }
     }
 
-    pub async fn list(&self) -> RouterServerResult<Vec<ProviderHealthCheck>> {
+    pub async fn list(&self) -> RouterCoreResult<Vec<ProviderHealthCheck>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -49,7 +49,7 @@ impl ProviderHealthRepository {
     pub async fn upsert(
         &self,
         check: &ProviderHealthCheck,
-    ) -> RouterServerResult<ProviderHealthCheck> {
+    ) -> RouterCoreResult<ProviderHealthCheck> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -101,10 +101,10 @@ impl ProviderHealthRepository {
     }
 }
 
-fn map_provider_health_row(row: &sqlx_postgres::PgRow) -> RouterServerResult<ProviderHealthCheck> {
+fn map_provider_health_row(row: &sqlx_postgres::PgRow) -> RouterCoreResult<ProviderHealthCheck> {
     let status = row.get::<String, _>("status");
     let status = ProviderHealthStatus::from_db_string(&status).ok_or_else(|| {
-        RouterServerError::InvalidData {
+        RouterCoreError::InvalidData {
             message: format!("unsupported provider health status: {status}"),
         }
     })?;

@@ -2,13 +2,13 @@ use crate::models::DepositVaultFundingObservation;
 use alloy::primitives::U256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ObservedBitcoinOutpoint {
+pub struct ObservedBitcoinOutpoint {
     pub tx_hash: String,
     pub vout: u32,
     pub amount_sats: u64,
 }
 
-pub(crate) fn observed_bitcoin_outpoint(
+pub fn observed_bitcoin_outpoint(
     observation: Option<&DepositVaultFundingObservation>,
 ) -> Result<Option<ObservedBitcoinOutpoint>, String> {
     let Some(observation) = observation else {

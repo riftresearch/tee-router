@@ -1,7 +1,21 @@
-use super::bitcoin_funding::observed_bitcoin_outpoint;
 use crate::{
+    error::RouterServerError, services::provider_policy::ProviderPolicyService, telemetry,
+};
+use alloy::{
+    primitives::{Address, FixedBytes, U256},
+    rpc::types::Filter,
+    sol,
+    sol_types::SolEvent,
+};
+use async_trait::async_trait;
+use chains::{ChainRegistry, UserDepositCandidateStatus};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use hyperliquid_client::actions::{
+    Actions as HyperliquidActions, BulkCancel, CancelRequest as HyperliquidCancelRequest,
+};
+use router_core::{
     db::Database,
-    error::RouterServerError,
+    error::RouterCoreError,
     models::{
         CustodyVault, CustodyVaultControlType, CustodyVaultRole, CustodyVaultStatus,
         CustodyVaultVisibility, DepositVault, DepositVaultStatus, MarketOrderKind,
@@ -27,6 +41,7 @@ use crate::{
             CanonicalAsset, MarketOrderNode, MarketOrderTransitionKind, ProviderId, TransitionDecl,
             TransitionPath,
         },
+        bitcoin_funding::observed_bitcoin_outpoint,
         custody_action_executor::{
             ChainCall, CustodyAction, CustodyActionError, CustodyActionExecutor,
             CustodyActionReceipt, CustodyActionRequest, HyperliquidCall, HyperliquidCallNetwork,
@@ -39,7 +54,6 @@ use crate::{
             MarketOrderPlanRemainingStart, MarketOrderRoutePlanError, MarketOrderRoutePlanner,
         },
         pricing::PricingSnapshot,
-        provider_policy::ProviderPolicyService,
         quote_legs::{
             execution_step_type_for_transition_kind, QuoteLeg, QuoteLegAsset, QuoteLegSpec,
         },
@@ -48,19 +62,6 @@ use crate::{
             empty_usd_valuation, execution_leg_usd_valuation, execution_step_usd_valuation,
         },
     },
-    telemetry,
-};
-use alloy::{
-    primitives::{Address, FixedBytes, U256},
-    rpc::types::Filter,
-    sol,
-    sol_types::SolEvent,
-};
-use async_trait::async_trait;
-use chains::{ChainRegistry, UserDepositCandidateStatus};
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use hyperliquid_client::actions::{
-    Actions as HyperliquidActions, BulkCancel, CancelRequest as HyperliquidCancelRequest,
 };
 use router_primitives::{ChainType, Currency, TokenIdentifier};
 use serde_json::{json, Value};
@@ -557,7 +558,9 @@ impl OrderExecutionManager {
             .orders()
             .count_in_progress_orders_by_status()
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         let status_counts = counts
             .iter()
             .map(|count| (count.status, count.order_count))
@@ -621,7 +624,9 @@ impl OrderExecutionManager {
             .orders()
             .get_market_orders_ready_for_execution(limits.execution)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         let executed_orders = self
             .execute_ready_orders(executable_orders, execution_concurrency)
             .await;
@@ -782,12 +787,11 @@ impl OrderExecutionManager {
         order_id: Uuid,
     ) -> OrderExecutionResult<OrderWorkerPassSummary> {
         let mut summary = OrderWorkerPassSummary::default();
-        let order = self
-            .db
-            .orders()
-            .get(order_id)
-            .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+        let order = self.db.orders().get(order_id).await.map_err(|source| {
+            OrderExecutionError::Database {
+                source: source.into(),
+            }
+        })?;
 
         if self
             .finalize_refunded_funding_vault_for_unstarted_order(order.clone())
@@ -804,12 +808,11 @@ impl OrderExecutionManager {
             summary.maintenance_tasks += 1;
         }
 
-        let refreshed = self
-            .db
-            .orders()
-            .get(order_id)
-            .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+        let refreshed = self.db.orders().get(order_id).await.map_err(|source| {
+            OrderExecutionError::Database {
+                source: source.into(),
+            }
+        })?;
         if self.align_manual_refund_vault_for_order(&refreshed).await? {
             summary.maintenance_tasks += 1;
         }
@@ -832,12 +835,11 @@ impl OrderExecutionManager {
             Err(err) => return Err(err),
         }
 
-        let refreshed = self
-            .db
-            .orders()
-            .get(order_id)
-            .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+        let refreshed = self.db.orders().get(order_id).await.map_err(|source| {
+            OrderExecutionError::Database {
+                source: source.into(),
+            }
+        })?;
         summary.maintenance_tasks += self
             .finalize_internal_custody_vaults_for_order(&refreshed)
             .await?;
@@ -854,7 +856,9 @@ impl OrderExecutionManager {
             .orders()
             .find_terminal_provider_operations_pending_step_settlement(limit)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         let mut recovered = 0usize;
         for operation in operations {
             match self.recover_terminal_provider_operation(&operation).await {
@@ -899,7 +903,9 @@ impl OrderExecutionManager {
             .orders()
             .find_stale_running_execution_steps(stale_before, limit)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         let mut recovered = 0usize;
         for step in steps {
             match self.recover_stale_running_step(&step).await {
@@ -927,7 +933,9 @@ impl OrderExecutionManager {
             .orders()
             .get_provider_operations(step.order_id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         let step_operations: Vec<_> = operations
             .into_iter()
             .filter(|operation| operation.execution_step_id == Some(step.id))
@@ -969,8 +977,10 @@ impl OrderExecutionManager {
                 .await;
             return match waiting {
                 Ok(_) => Ok(true),
-                Err(RouterServerError::NotFound) => Ok(false),
-                Err(source) => Err(OrderExecutionError::Database { source }),
+                Err(RouterCoreError::NotFound) => Ok(false),
+                Err(source) => Err(OrderExecutionError::Database {
+                    source: source.into(),
+                }),
             };
         }
 
@@ -999,8 +1009,8 @@ impl OrderExecutionManager {
             .await
         {
             Ok(step) => step,
-            Err(RouterServerError::NotFound) => return Ok(false),
-            Err(source) => return Err(OrderExecutionError::Database { source }),
+            Err(RouterCoreError::NotFound) => return Ok(false),
+            Err(source) => return Err(OrderExecutionError::Database { source: source.into() }),
         };
 
         let order = self
@@ -1008,7 +1018,9 @@ impl OrderExecutionManager {
             .orders()
             .get(step.order_id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         let Some(attempt_id) = step.execution_attempt_id else {
             return Ok(true);
         };
@@ -1029,8 +1041,12 @@ impl OrderExecutionManager {
             .await
         {
             Ok(attempt) => attempt,
-            Err(RouterServerError::NotFound) => return Ok(false),
-            Err(source) => return Err(OrderExecutionError::Database { source }),
+            Err(RouterCoreError::NotFound) => return Ok(false),
+            Err(source) => {
+                return Err(OrderExecutionError::Database {
+                    source: source.into(),
+                })
+            }
         };
 
         let (order_target, vault_target) =
@@ -1081,13 +1097,18 @@ impl OrderExecutionManager {
                 .await
             {
                 Ok(order) => order,
-                Err(RouterServerError::NotFound) => self
-                    .db
-                    .orders()
-                    .get(order.id)
-                    .await
-                    .map_err(|source| OrderExecutionError::Database { source })?,
-                Err(source) => return Err(OrderExecutionError::Database { source }),
+                Err(RouterCoreError::NotFound) => {
+                    self.db.orders().get(order.id).await.map_err(|source| {
+                        OrderExecutionError::Database {
+                            source: source.into(),
+                        }
+                    })?
+                }
+                Err(source) => {
+                    return Err(OrderExecutionError::Database {
+                        source: source.into(),
+                    })
+                }
             },
             RouterOrderStatus::ManualInterventionRequired
             | RouterOrderStatus::RefundManualInterventionRequired => order,
@@ -1107,9 +1128,11 @@ impl OrderExecutionManager {
                             .transition_status(funding_vault_id, vault.status, vault_target, now)
                             .await
                         {
-                            Ok(_) | Err(RouterServerError::NotFound) => {}
+                            Ok(_) | Err(RouterCoreError::NotFound) => {}
                             Err(source) => {
-                                return Err(OrderExecutionError::Database { source });
+                                return Err(OrderExecutionError::Database {
+                                    source: source.into(),
+                                });
                             }
                         }
                     }
@@ -1117,8 +1140,12 @@ impl OrderExecutionManager {
                     | DepositVaultStatus::RefundManualInterventionRequired => {}
                     _ => {}
                 },
-                Err(RouterServerError::NotFound) => {}
-                Err(source) => return Err(OrderExecutionError::Database { source }),
+                Err(RouterCoreError::NotFound) => {}
+                Err(source) => {
+                    return Err(OrderExecutionError::Database {
+                        source: source.into(),
+                    })
+                }
             }
         }
 
@@ -1134,7 +1161,9 @@ impl OrderExecutionManager {
             .orders()
             .find_executing_orders_pending_completion_finalization(limit)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         let mut finalized = 0usize;
         for order in orders {
             match self.finalize_order_if_complete(order).await {
@@ -1160,7 +1189,9 @@ impl OrderExecutionManager {
             .orders()
             .find_refunding_orders_pending_direct_refund_finalization(limit)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         let mut finalized = 0usize;
         for order in orders {
             match self.finalize_direct_refund_if_complete(order).await {
@@ -1186,7 +1217,9 @@ impl OrderExecutionManager {
             .orders()
             .find_unstarted_orders_with_refunded_funding_vault(limit)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         let mut finalized = 0usize;
         for order in orders {
             match self
@@ -1212,7 +1245,9 @@ impl OrderExecutionManager {
             .orders()
             .find_orders_pending_refund_planning(limit)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         let mut planned = 0usize;
         for order in orders {
             match self.materialize_refund_plan_for_order(order.id).await {
@@ -1239,7 +1274,9 @@ impl OrderExecutionManager {
             .orders()
             .find_orders_with_manual_refund_funding_vault(limit)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         let mut aligned = 0usize;
         for order in orders {
             if self.align_order_for_manual_refund_vault(&order).await? {
@@ -1267,7 +1304,9 @@ impl OrderExecutionManager {
             .vaults()
             .get(funding_vault_id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         if funding_vault.status != DepositVaultStatus::RefundManualInterventionRequired {
             return Ok(false);
         }
@@ -1276,13 +1315,17 @@ impl OrderExecutionManager {
             .orders()
             .get_active_execution_attempt(order.id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?
             .or(self
                 .db
                 .orders()
                 .get_latest_execution_attempt(order.id)
                 .await
-                .map_err(|source| OrderExecutionError::Database { source })?)
+                .map_err(|source| OrderExecutionError::Database {
+                    source: source.into(),
+                })?)
         else {
             return Ok(false);
         };
@@ -1313,7 +1356,9 @@ impl OrderExecutionManager {
             .orders()
             .find_orders_pending_manual_refund_vault_alignment(limit)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         let mut aligned = 0usize;
         for order in orders {
             if self.align_manual_refund_vault_for_order(&order).await? {
@@ -1338,7 +1383,9 @@ impl OrderExecutionManager {
             .vaults()
             .get(funding_vault_id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         if !matches!(
             funding_vault.status,
             DepositVaultStatus::RefundRequired | DepositVaultStatus::Refunding
@@ -1354,7 +1401,9 @@ impl OrderExecutionManager {
                 Utc::now(),
             )
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         Ok(true)
     }
 
@@ -1370,7 +1419,9 @@ impl OrderExecutionManager {
             .orders()
             .find_orders_pending_retry_or_refund_decision(limit)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         let mut reconciled = 0_usize;
         for order in candidates {
             match self.process_failed_attempt_for_order(order.id).await {
@@ -1389,12 +1440,11 @@ impl OrderExecutionManager {
     }
 
     async fn process_failed_attempt_for_order(&self, order_id: Uuid) -> OrderExecutionResult<bool> {
-        let order = self
-            .db
-            .orders()
-            .get(order_id)
-            .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+        let order = self.db.orders().get(order_id).await.map_err(|source| {
+            OrderExecutionError::Database {
+                source: source.into(),
+            }
+        })?;
         if matches!(
             order.status,
             RouterOrderStatus::Completed
@@ -1413,7 +1463,9 @@ impl OrderExecutionManager {
             .orders()
             .get_execution_steps_for_attempt(latest_attempt.id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         let failed_step = steps
             .iter()
             .filter(|step| step.status == OrderExecutionStepStatus::Failed)
@@ -1431,7 +1483,9 @@ impl OrderExecutionManager {
             .orders()
             .get_provider_operations(order.id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?
             .into_iter()
             .filter(|operation| operation.execution_step_id == Some(failed_step.id))
             .map(|operation| (operation.created_at, operation.id))
@@ -1472,14 +1526,18 @@ impl OrderExecutionManager {
             .orders()
             .get_active_execution_attempt(order.id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?
         {
             let steps = self
                 .db
                 .orders()
                 .get_execution_steps_for_attempt(active_attempt.id)
                 .await
-                .map_err(|source| OrderExecutionError::Database { source })?;
+                .map_err(|source| OrderExecutionError::Database {
+                    source: source.into(),
+                })?;
             if let Some(failed_step) = steps
                 .iter()
                 .filter(|step| step.status == OrderExecutionStepStatus::Failed)
@@ -1491,7 +1549,9 @@ impl OrderExecutionManager {
                     .orders()
                     .get_provider_operations(order.id)
                     .await
-                    .map_err(|source| OrderExecutionError::Database { source })?
+                    .map_err(|source| OrderExecutionError::Database {
+                        source: source.into(),
+                    })?
                     .into_iter()
                     .filter(|operation| operation.execution_step_id == Some(failed_step.id))
                     .map(|operation| (operation.created_at, operation.id))
@@ -1514,7 +1574,9 @@ impl OrderExecutionManager {
                         Utc::now(),
                     )
                     .await
-                    .map_err(|source| OrderExecutionError::Database { source })?;
+                    .map_err(|source| OrderExecutionError::Database {
+                        source: source.into(),
+                    })?;
                 return Ok(failed_attempt);
             }
         }
@@ -1523,7 +1585,9 @@ impl OrderExecutionManager {
             .orders()
             .get_latest_execution_attempt(order.id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?
             .filter(|attempt| attempt.status == OrderExecutionAttemptStatus::Failed)
             .ok_or_else(|| OrderExecutionError::ProviderRequestFailed {
                 provider: "internal".to_string(),
@@ -1566,10 +1630,14 @@ impl OrderExecutionManager {
             .await
         {
             Ok(()) => {}
-            Err(RouterServerError::DatabaseQuery { source }) if is_unique_violation(&source) => {
+            Err(RouterCoreError::DatabaseQuery { source }) if is_unique_violation(&source) => {
                 return Ok(false);
             }
-            Err(source) => return Err(OrderExecutionError::Database { source }),
+            Err(source) => {
+                return Err(OrderExecutionError::Database {
+                    source: source.into(),
+                })
+            }
         }
 
         let _ = self
@@ -1586,7 +1654,9 @@ impl OrderExecutionManager {
                 now,
             )
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
 
         let mut retry_steps: Vec<OrderExecutionStep> = steps
             .iter()
@@ -1615,7 +1685,9 @@ impl OrderExecutionManager {
                 .orders()
                 .get_execution_legs_for_attempt(failed_attempt.id)
                 .await
-                .map_err(|source| OrderExecutionError::Database { source })?
+                .map_err(|source| OrderExecutionError::Database {
+                    source: source.into(),
+                })?
         };
         let usd_pricing = self.usd_pricing_snapshot().await;
         let mut retry_leg_ids = HashMap::new();
@@ -1682,7 +1754,9 @@ impl OrderExecutionManager {
             .orders()
             .create_execution_legs_idempotent(&retry_legs)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
 
         for step in &mut retry_steps {
             step.id = Uuid::now_v7();
@@ -1727,7 +1801,9 @@ impl OrderExecutionManager {
             .orders()
             .create_execution_steps_idempotent(&retry_steps)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
 
         let mut refreshed_leg_ids = std::collections::BTreeSet::new();
         for step in &retry_steps {
@@ -1753,7 +1829,9 @@ impl OrderExecutionManager {
                 now,
             )
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         Ok(true)
     }
 
@@ -1791,10 +1869,14 @@ impl OrderExecutionManager {
             .await
         {
             Ok(()) => {}
-            Err(RouterServerError::DatabaseQuery { source }) if is_unique_violation(&source) => {
+            Err(RouterCoreError::DatabaseQuery { source }) if is_unique_violation(&source) => {
                 return Ok(false);
             }
-            Err(source) => return Err(OrderExecutionError::Database { source }),
+            Err(source) => {
+                return Err(OrderExecutionError::Database {
+                    source: source.into(),
+                })
+            }
         }
 
         let order_transitioned = match self
@@ -1809,7 +1891,7 @@ impl OrderExecutionManager {
             .await
         {
             Ok(_) => true,
-            Err(RouterServerError::NotFound) => match self
+            Err(RouterCoreError::NotFound) => match self
                 .db
                 .orders()
                 .transition_status(
@@ -1821,10 +1903,18 @@ impl OrderExecutionManager {
                 .await
             {
                 Ok(_) => true,
-                Err(RouterServerError::NotFound) => false,
-                Err(source) => return Err(OrderExecutionError::Database { source }),
+                Err(RouterCoreError::NotFound) => false,
+                Err(source) => {
+                    return Err(OrderExecutionError::Database {
+                        source: source.into(),
+                    })
+                }
             },
-            Err(source) => return Err(OrderExecutionError::Database { source }),
+            Err(source) => {
+                return Err(OrderExecutionError::Database {
+                    source: source.into(),
+                })
+            }
         };
         if let Some(funding_vault_id) = order.funding_vault_id {
             match self
@@ -1838,8 +1928,12 @@ impl OrderExecutionManager {
                 )
                 .await
             {
-                Ok(_) | Err(RouterServerError::NotFound) => {}
-                Err(source) => return Err(OrderExecutionError::Database { source }),
+                Ok(_) | Err(RouterCoreError::NotFound) => {}
+                Err(source) => {
+                    return Err(OrderExecutionError::Database {
+                        source: source.into(),
+                    })
+                }
             }
             match self
                 .db
@@ -1852,17 +1946,20 @@ impl OrderExecutionManager {
                 )
                 .await
             {
-                Ok(_) | Err(RouterServerError::NotFound) => {}
-                Err(source) => return Err(OrderExecutionError::Database { source }),
+                Ok(_) | Err(RouterCoreError::NotFound) => {}
+                Err(source) => {
+                    return Err(OrderExecutionError::Database {
+                        source: source.into(),
+                    })
+                }
             }
         }
         if order_transitioned {
-            let order = self
-                .db
-                .orders()
-                .get(order.id)
-                .await
-                .map_err(|source| OrderExecutionError::Database { source })?;
+            let order = self.db.orders().get(order.id).await.map_err(|source| {
+                OrderExecutionError::Database {
+                    source: source.into(),
+                }
+            })?;
             telemetry::record_order_workflow_event(&order, "order.refund_required");
             let _ = self
                 .finalize_internal_custody_vaults_for_order(&order)
@@ -1913,16 +2010,19 @@ impl OrderExecutionManager {
             .await
         {
             Ok(_) => {}
-            Err(RouterServerError::NotFound) => return Ok(false),
-            Err(source) => return Err(OrderExecutionError::Database { source }),
+            Err(RouterCoreError::NotFound) => return Ok(false),
+            Err(source) => {
+                return Err(OrderExecutionError::Database {
+                    source: source.into(),
+                })
+            }
         }
 
-        let refreshed = self
-            .db
-            .orders()
-            .get(order.id)
-            .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+        let refreshed = self.db.orders().get(order.id).await.map_err(|source| {
+            OrderExecutionError::Database {
+                source: source.into(),
+            }
+        })?;
         let refreshed = match refreshed.status {
             RouterOrderStatus::RefundRequired | RouterOrderStatus::Refunding => self
                 .db
@@ -1934,7 +2034,9 @@ impl OrderExecutionManager {
                     now,
                 )
                 .await
-                .map_err(|source| OrderExecutionError::Database { source })?,
+                .map_err(|source| OrderExecutionError::Database {
+                    source: source.into(),
+                })?,
             RouterOrderStatus::RefundManualInterventionRequired => refreshed,
             _ => refreshed,
         };
@@ -1945,7 +2047,9 @@ impl OrderExecutionManager {
                 .vaults()
                 .get(funding_vault_id)
                 .await
-                .map_err(|source| OrderExecutionError::Database { source })?;
+                .map_err(|source| OrderExecutionError::Database {
+                    source: source.into(),
+                })?;
             match funding_vault.status {
                 DepositVaultStatus::RefundRequired | DepositVaultStatus::Refunding => {
                     let _ = self
@@ -1958,7 +2062,9 @@ impl OrderExecutionManager {
                             now,
                         )
                         .await
-                        .map_err(|source| OrderExecutionError::Database { source })?;
+                        .map_err(|source| OrderExecutionError::Database {
+                            source: source.into(),
+                        })?;
                 }
                 DepositVaultStatus::RefundManualInterventionRequired => {}
                 _ => {}
@@ -1983,13 +2089,17 @@ impl OrderExecutionManager {
             .orders()
             .get_provider_operation(hint.provider_operation_id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         let persisted = self
             .db
             .orders()
             .create_provider_operation_hint(&hint)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         self.try_record_provider_operation_hint_workflow_event(
             operation.order_id,
             &persisted,
@@ -2014,7 +2124,9 @@ impl OrderExecutionManager {
             .orders()
             .get_provider_operation(operation_id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         if let Some(observation) = self
             .recover_across_observation_from_checkpoint(&operation, hint_evidence.clone())
             .await?
@@ -2151,7 +2263,9 @@ impl OrderExecutionManager {
             .orders()
             .get_execution_step(step_id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         let Some(chain_registry) = self.chain_registry.as_ref() else {
             return Ok(None);
         };
@@ -2433,7 +2547,9 @@ impl OrderExecutionManager {
             .orders()
             .claim_pending_provider_operation_hints(limit, Utc::now())
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         let mut processed = 0_usize;
 
         for hint in hints {
@@ -2497,7 +2613,7 @@ impl OrderExecutionManager {
             .await
         {
             Ok(_) => Ok(true),
-            Err(RouterServerError::NotFound) => {
+            Err(RouterCoreError::NotFound) => {
                 warn!(
                     hint_id = %hint.id,
                     provider_operation_id = %hint.provider_operation_id,
@@ -2506,7 +2622,9 @@ impl OrderExecutionManager {
                 );
                 Ok(false)
             }
-            Err(source) => Err(OrderExecutionError::Database { source }),
+            Err(source) => Err(OrderExecutionError::Database {
+                source: source.into(),
+            }),
         }
     }
 
@@ -2525,7 +2643,9 @@ impl OrderExecutionManager {
             .orders()
             .get_provider_operation(hint.provider_operation_id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         self.try_record_provider_operation_hint_workflow_event(
             operation.order_id,
             hint,
@@ -2606,7 +2726,9 @@ impl OrderExecutionManager {
             .orders()
             .get_provider_addresses_by_operation(operation.id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         let Some(provider_address) = addresses.iter().find(|address| {
             address.role == ProviderAddressRole::UnitDeposit
                 && address_matches(&address.address, observed_address)
@@ -2627,13 +2749,11 @@ impl OrderExecutionManager {
         };
 
         let step = match operation.execution_step_id {
-            Some(step_id) => Some(
-                self.db
-                    .orders()
-                    .get_execution_step(step_id)
-                    .await
-                    .map_err(|source| OrderExecutionError::Database { source })?,
-            ),
+            Some(step_id) => Some(self.db.orders().get_execution_step(step_id).await.map_err(
+                |source| OrderExecutionError::Database {
+                    source: source.into(),
+                },
+            )?),
             None => None,
         };
         let expected_amount = expected_operation_amount(hint.id, operation, step.as_ref())?;
@@ -2829,7 +2949,9 @@ impl OrderExecutionManager {
             .orders()
             .get_market_orders_needing_execution_plan(limit)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
 
         let mut materialized = Vec::with_capacity(orders.len());
         for order in orders {
@@ -2871,12 +2993,11 @@ impl OrderExecutionManager {
         &self,
         order_id: Uuid,
     ) -> OrderExecutionResult<OrderPlanMaterialization> {
-        let order = self
-            .db
-            .orders()
-            .get(order_id)
-            .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+        let order = self.db.orders().get(order_id).await.map_err(|source| {
+            OrderExecutionError::Database {
+                source: source.into(),
+            }
+        })?;
         let funding_vault_id = order
             .funding_vault_id
             .ok_or(OrderExecutionError::MissingFundingVault { order_id: order.id })?;
@@ -2885,7 +3006,9 @@ impl OrderExecutionManager {
             .vaults()
             .get(funding_vault_id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         if vault.status != DepositVaultStatus::Funded {
             return Err(OrderExecutionError::FundingVaultNotFunded { vault_id: vault.id });
         }
@@ -2894,7 +3017,9 @@ impl OrderExecutionManager {
             .orders()
             .get_router_order_quote(order.id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         let order = match order.status {
             RouterOrderStatus::PendingFunding => match self
                 .db
@@ -2911,21 +3036,24 @@ impl OrderExecutionManager {
                     telemetry::record_order_workflow_event(&order, "order.funded");
                     order
                 }
-                Err(RouterServerError::NotFound) => {
+                Err(RouterCoreError::NotFound) => {
                     // Another worker won the PendingFunding→Funded CAS. Re-read
                     // and proceed iff the order is now in a plannable state.
-                    let refreshed = self
-                        .db
-                        .orders()
-                        .get(order_id)
-                        .await
-                        .map_err(|source| OrderExecutionError::Database { source })?;
+                    let refreshed = self.db.orders().get(order_id).await.map_err(|source| {
+                        OrderExecutionError::Database {
+                            source: source.into(),
+                        }
+                    })?;
                     match refreshed.status {
                         RouterOrderStatus::Funded => refreshed,
                         _ => return Err(OrderExecutionError::OrderNotReady { order_id }),
                     }
                 }
-                Err(source) => return Err(OrderExecutionError::Database { source }),
+                Err(source) => {
+                    return Err(OrderExecutionError::Database {
+                        source: source.into(),
+                    })
+                }
             },
             RouterOrderStatus::Funded => order,
             _ => {
@@ -2985,14 +3113,18 @@ impl OrderExecutionManager {
             .orders()
             .create_execution_steps_idempotent(&steps)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         telemetry::record_order_workflow_event(&order, "order.execution_plan_materialized");
         let persisted_steps = self
             .db
             .orders()
             .get_execution_steps_for_attempt(execution_attempt.id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         if persisted_steps.is_empty() {
             return Err(OrderExecutionError::ProviderRequestFailed {
                 provider: "internal".to_string(),
@@ -3015,15 +3147,21 @@ impl OrderExecutionManager {
                 .await
             {
                 Ok(_) => {}
-                Err(RouterServerError::NotFound) => {
+                Err(RouterCoreError::NotFound) => {
                     let _ = self
                         .db
                         .orders()
                         .get_execution_attempt(execution_attempt.id)
                         .await
-                        .map_err(|source| OrderExecutionError::Database { source })?;
+                        .map_err(|source| OrderExecutionError::Database {
+                            source: source.into(),
+                        })?;
                 }
-                Err(source) => return Err(OrderExecutionError::Database { source }),
+                Err(source) => {
+                    return Err(OrderExecutionError::Database {
+                        source: source.into(),
+                    })
+                }
             }
         }
 
@@ -3044,7 +3182,9 @@ impl OrderExecutionManager {
                 .vaults()
                 .get(funding_vault_id)
                 .await
-                .map_err(|source| OrderExecutionError::Database { source })?
+                .map_err(|source| OrderExecutionError::Database {
+                    source: source.into(),
+                })?
                 .funding_observation
         } else {
             None
@@ -3085,13 +3225,19 @@ impl OrderExecutionManager {
                 );
             }
             Ok(None) => {}
-            Err(source) => return Err(OrderExecutionError::Database { source }),
+            Err(source) => {
+                return Err(OrderExecutionError::Database {
+                    source: source.into(),
+                })
+            }
         }
 
         Ok(())
     }
 
-    async fn usd_pricing_snapshot(&self) -> Option<crate::services::PricingSnapshot> {
+    async fn usd_pricing_snapshot(
+        &self,
+    ) -> Option<router_core::services::pricing::PricingSnapshot> {
         self.route_costs
             .as_ref()?
             .current_or_refresh_live_pricing_snapshot()
@@ -3108,7 +3254,9 @@ impl OrderExecutionManager {
             .orders()
             .refresh_execution_leg_from_actions(execution_leg_id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?
         else {
             return Ok(None);
         };
@@ -3125,7 +3273,9 @@ impl OrderExecutionManager {
             .orders()
             .update_execution_leg_usd_valuation(leg.id, usd_valuation, Utc::now())
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         Ok(Some(leg))
     }
 
@@ -3133,12 +3283,11 @@ impl OrderExecutionManager {
         &self,
         order_id: Uuid,
     ) -> OrderExecutionResult<bool> {
-        let order = self
-            .db
-            .orders()
-            .get(order_id)
-            .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+        let order = self.db.orders().get(order_id).await.map_err(|source| {
+            OrderExecutionError::Database {
+                source: source.into(),
+            }
+        })?;
         if order.status != RouterOrderStatus::RefundRequired {
             return Ok(false);
         }
@@ -3147,7 +3296,9 @@ impl OrderExecutionManager {
             .orders()
             .get_latest_execution_attempt(order.id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?
             .ok_or(OrderExecutionError::OrderNotReady { order_id })?;
         if refund_attempt.attempt_kind != OrderExecutionAttemptKind::RefundRecovery
             || refund_attempt.status != OrderExecutionAttemptStatus::RefundRequired
@@ -3215,7 +3366,9 @@ impl OrderExecutionManager {
                         Utc::now(),
                     )
                     .await
-                    .map_err(|source| OrderExecutionError::Database { source })?;
+                    .map_err(|source| OrderExecutionError::Database {
+                        source: source.into(),
+                    })?;
                 let _ = self
                     .db
                     .orders()
@@ -3226,13 +3379,17 @@ impl OrderExecutionManager {
                         Utc::now(),
                     )
                     .await
-                    .map_err(|source| OrderExecutionError::Database { source })?;
+                    .map_err(|source| OrderExecutionError::Database {
+                        source: source.into(),
+                    })?;
                 let _ = self
                     .db
                     .vaults()
                     .request_refund(vault.id, Utc::now())
                     .await
-                    .map_err(|source| OrderExecutionError::Database { source })?;
+                    .map_err(|source| OrderExecutionError::Database {
+                        source: source.into(),
+                    })?;
                 return Ok(true);
             }
             RefundPlanCandidate::Materialized { plan } => plan,
@@ -3279,7 +3436,9 @@ impl OrderExecutionManager {
             .orders()
             .create_execution_steps_idempotent(&refund_plan.steps)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         let _ = self
             .db
             .orders()
@@ -3290,7 +3449,9 @@ impl OrderExecutionManager {
                 Utc::now(),
             )
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         Ok(true)
     }
 
@@ -3305,7 +3466,9 @@ impl OrderExecutionManager {
                 .vaults()
                 .get(funding_vault_id)
                 .await
-                .map_err(|source| OrderExecutionError::Database { source })?;
+                .map_err(|source| OrderExecutionError::Database {
+                    source: source.into(),
+                })?;
             let amount = self.deposit_vault_balance_raw(&vault).await?;
             if raw_amount_is_positive(&amount, "funding vault refund balance")? {
                 positions.push(RefundSourcePosition {
@@ -3321,7 +3484,9 @@ impl OrderExecutionManager {
             .orders()
             .get_custody_vaults(order.id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         for vault in custody_vaults {
             match vault.role {
                 CustodyVaultRole::SourceDeposit => continue,
@@ -3601,7 +3766,9 @@ impl OrderExecutionManager {
                 service
                     .snapshot()
                     .await
-                    .map_err(|source| OrderExecutionError::Database { source })?,
+                    .map_err(|source| OrderExecutionError::Database {
+                        source: source.into(),
+                    })?,
             )
         } else {
             None
@@ -3947,7 +4114,9 @@ impl OrderExecutionManager {
             .orders()
             .get_active_execution_attempt(order_id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?
         {
             return Ok(attempt);
         }
@@ -3969,12 +4138,12 @@ impl OrderExecutionManager {
         };
         match self.db.orders().create_execution_attempt(&attempt).await {
             Ok(()) => Ok(attempt),
-            Err(RouterServerError::DatabaseQuery { source }) if is_unique_violation(&source) => {
+            Err(RouterCoreError::DatabaseQuery { source }) if is_unique_violation(&source) => {
                 self.db
                     .orders()
                     .get_active_execution_attempt(order_id)
                     .await
-                    .map_err(|source| OrderExecutionError::Database { source })?
+                    .map_err(|source| OrderExecutionError::Database { source: source.into() })?
                     .ok_or_else(|| OrderExecutionError::ProviderRequestFailed {
                         provider: "internal".to_string(),
                         message: format!(
@@ -3982,7 +4151,7 @@ impl OrderExecutionManager {
                         ),
                     })
             }
-            Err(source) => Err(OrderExecutionError::Database { source }),
+            Err(source) => Err(OrderExecutionError::Database { source: source.into() }),
         }
     }
 
@@ -4021,14 +4190,18 @@ impl OrderExecutionManager {
             .orders()
             .create_execution_legs_idempotent(planned_legs)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         self.maybe_inject_crash(OrderExecutionCrashPoint::AfterExecutionLegsPersisted);
         let persisted_legs = self
             .db
             .orders()
             .get_execution_legs_for_attempt(execution_attempt_id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         rebind_steps_to_persisted_legs(planned_legs, &persisted_legs, steps)?;
         Ok(inserted)
     }
@@ -4456,12 +4629,16 @@ impl OrderExecutionManager {
                 .await
             {
                 Ok(persisted) => persisted_steps[index] = persisted,
-                Err(RouterServerError::NotFound) => {
+                Err(RouterCoreError::NotFound) => {
                     // Another worker advanced the step between our read and
                     // hydration. Re-read on the next worker pass rather than
                     // executing stale in-memory materialization.
                 }
-                Err(source) => return Err(OrderExecutionError::Database { source }),
+                Err(source) => {
+                    return Err(OrderExecutionError::Database {
+                        source: source.into(),
+                    })
+                }
             }
         }
 
@@ -4478,7 +4655,9 @@ impl OrderExecutionManager {
             .orders()
             .get_custody_vaults(order_id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?
             .into_iter()
             .find(|vault| {
                 vault.role == CustodyVaultRole::SourceDeposit
@@ -4524,7 +4703,9 @@ impl OrderExecutionManager {
                 .orders()
                 .get_custody_vaults(order_id)
                 .await
-                .map_err(|source| OrderExecutionError::Database { source })?;
+                .map_err(|source| OrderExecutionError::Database {
+                    source: source.into(),
+                })?;
             Ok::<_, OrderExecutionError>(vaults.into_iter().find(|vault| {
                 vault.role == CustodyVaultRole::DestinationExecution
                     && vault.chain == asset.chain
@@ -4562,7 +4743,7 @@ impl OrderExecutionManager {
         let vault = match create_result {
             Ok(vault) => vault,
             Err(CustodyActionError::Database {
-                source: RouterServerError::DatabaseQuery { source },
+                source: RouterCoreError::DatabaseQuery { source },
             }) if is_unique_violation(&source) => {
                 // Another worker raced and won the partial unique index on
                 // (order_id, role, chain_id, asset_id), or a recoverable refund
@@ -4602,12 +4783,11 @@ impl OrderExecutionManager {
             return Ok(vault);
         }
 
-        let order = self
-            .db
-            .orders()
-            .get(order_id)
-            .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+        let order = self.db.orders().get(order_id).await.map_err(|source| {
+            OrderExecutionError::Database {
+                source: source.into(),
+            }
+        })?;
         if !matches!(
             order.status,
             RouterOrderStatus::RefundRequired | RouterOrderStatus::Refunding
@@ -4639,7 +4819,9 @@ impl OrderExecutionManager {
                 Utc::now(),
             )
             .await
-            .map_err(|source| OrderExecutionError::Database { source })
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })
     }
 
     async fn validate_materialized_intermediate_custody(
@@ -4658,7 +4840,9 @@ impl OrderExecutionManager {
             .orders()
             .get_custody_vaults(order_id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         let vaults_by_id: HashMap<Uuid, &CustodyVault> =
             vaults.iter().map(|vault| (vault.id, vault)).collect();
 
@@ -4683,10 +4867,13 @@ impl OrderExecutionManager {
         let Some(service) = self.provider_policies.as_ref() else {
             return Ok(());
         };
-        let snapshot = service
-            .snapshot()
-            .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+        let snapshot =
+            service
+                .snapshot()
+                .await
+                .map_err(|source| OrderExecutionError::Database {
+                    source: source.into(),
+                })?;
         let mut seen = std::collections::BTreeSet::new();
         for step in steps.iter().filter(|step| step.step_index > 0) {
             if !seen.insert(step.provider.as_str()) {
@@ -4724,10 +4911,13 @@ impl OrderExecutionManager {
         let Some(service) = self.provider_policies.as_ref() else {
             return Ok(());
         };
-        let snapshot = service
-            .snapshot()
-            .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+        let snapshot =
+            service
+                .snapshot()
+                .await
+                .map_err(|source| OrderExecutionError::Database {
+                    source: source.into(),
+                })?;
         let policy = snapshot.policy(provider);
         if policy.execution_state.allows_new_execution() {
             return Ok(());
@@ -4780,7 +4970,9 @@ impl OrderExecutionManager {
                 .orders()
                 .get_custody_vaults(order_id)
                 .await
-                .map_err(|source| OrderExecutionError::Database { source })?;
+                .map_err(|source| OrderExecutionError::Database {
+                    source: source.into(),
+                })?;
             Ok::<_, OrderExecutionError>(
                 vaults
                     .into_iter()
@@ -4824,7 +5016,7 @@ impl OrderExecutionManager {
         let vault = match create_result {
             Ok(vault) => vault,
             Err(CustodyActionError::Database {
-                source: RouterServerError::DatabaseQuery { source },
+                source: RouterCoreError::DatabaseQuery { source },
             }) if is_unique_violation(&source) => {
                 let vault = find_existing().await?.ok_or_else(|| {
                     OrderExecutionError::ProviderRequestFailed {
@@ -4860,12 +5052,11 @@ impl OrderExecutionManager {
         order_id: Uuid,
     ) -> OrderExecutionResult<Option<OrderExecutionSummary>> {
         let mut advanced_execution_step = false;
-        let order = self
-            .db
-            .orders()
-            .get(order_id)
-            .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+        let order = self.db.orders().get(order_id).await.map_err(|source| {
+            OrderExecutionError::Database {
+                source: source.into(),
+            }
+        })?;
         match order.status {
             RouterOrderStatus::Completed
             | RouterOrderStatus::Refunded
@@ -4888,7 +5079,9 @@ impl OrderExecutionManager {
             .vaults()
             .get(funding_vault_id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         if !Self::funding_vault_state_allows_order_execution(order.status, vault.status) {
             warn!(
                 order_id = %order.id,
@@ -4916,8 +5109,12 @@ impl OrderExecutionManager {
                     telemetry::record_order_workflow_event(&order, "order.executing");
                     order
                 }
-                Err(RouterServerError::NotFound) => return Ok(None),
-                Err(source) => return Err(OrderExecutionError::Database { source }),
+                Err(RouterCoreError::NotFound) => return Ok(None),
+                Err(source) => {
+                    return Err(OrderExecutionError::Database {
+                        source: source.into(),
+                    })
+                }
             },
             RouterOrderStatus::RefundRequired => match self
                 .db
@@ -4934,8 +5131,12 @@ impl OrderExecutionManager {
                     telemetry::record_order_workflow_event(&order, "order.refunding");
                     order
                 }
-                Err(RouterServerError::NotFound) => return Ok(None),
-                Err(source) => return Err(OrderExecutionError::Database { source }),
+                Err(RouterCoreError::NotFound) => return Ok(None),
+                Err(source) => {
+                    return Err(OrderExecutionError::Database {
+                        source: source.into(),
+                    })
+                }
             },
             RouterOrderStatus::Executing => order,
             RouterOrderStatus::Refunding => order,
@@ -4961,8 +5162,12 @@ impl OrderExecutionManager {
                     )
                     .await
                 {
-                    Ok(_) | Err(RouterServerError::NotFound) => {}
-                    Err(source) => return Err(OrderExecutionError::Database { source }),
+                    Ok(_) | Err(RouterCoreError::NotFound) => {}
+                    Err(source) => {
+                        return Err(OrderExecutionError::Database {
+                            source: source.into(),
+                        })
+                    }
                 }
             }
             RouterOrderStatus::Refunding
@@ -4984,8 +5189,12 @@ impl OrderExecutionManager {
                     )
                     .await
                 {
-                    Ok(_) | Err(RouterServerError::NotFound) => {}
-                    Err(source) => return Err(OrderExecutionError::Database { source }),
+                    Ok(_) | Err(RouterCoreError::NotFound) => {}
+                    Err(source) => {
+                        return Err(OrderExecutionError::Database {
+                            source: source.into(),
+                        })
+                    }
                 }
             }
             _ => {}
@@ -4999,14 +5208,18 @@ impl OrderExecutionManager {
                 .orders()
                 .get_active_execution_attempt(order.id)
                 .await
-                .map_err(|source| OrderExecutionError::Database { source })?
+                .map_err(|source| OrderExecutionError::Database {
+                    source: source.into(),
+                })?
                 .ok_or(OrderExecutionError::OrderNotReady { order_id })?;
             let steps = self
                 .db
                 .orders()
                 .get_execution_steps_for_attempt(execution_attempt.id)
                 .await
-                .map_err(|source| OrderExecutionError::Database { source })?;
+                .map_err(|source| OrderExecutionError::Database {
+                    source: source.into(),
+                })?;
             let steps = self
                 .hydrate_persisted_planned_steps(order.id, steps)
                 .await?;
@@ -5149,7 +5362,9 @@ impl OrderExecutionManager {
             .orders()
             .get_execution_legs_for_attempt(active_attempt.id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         let Some(stale_leg) = active_attempt_legs
             .iter()
             .find(|leg| leg.id == execution_leg_id)
@@ -5173,8 +5388,9 @@ impl OrderExecutionManager {
             .orders()
             .get_router_order_quote(order.id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?
-        {
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })? {
             RouterOrderQuote::MarketOrder(quote) => quote,
             RouterOrderQuote::LimitOrder(_) => return Ok(StaleQuoteRefreshOutcome::NotNeeded),
         };
@@ -5206,13 +5422,17 @@ impl OrderExecutionManager {
             .orders()
             .get_execution_attempts(order.id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         let execution_history = self
             .db
             .orders()
             .get_execution_legs(order.id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         let available_amount = remaining_route_available_amount(
             &execution_history,
             &attempts,
@@ -5251,10 +5471,14 @@ impl OrderExecutionManager {
                     .await
                 {
                     Ok(failed_step) => failed_step,
-                    Err(RouterServerError::NotFound) => {
+                    Err(RouterCoreError::NotFound) => {
                         return Ok(StaleQuoteRefreshOutcome::NotNeeded);
                     }
-                    Err(source) => return Err(OrderExecutionError::Database { source }),
+                    Err(source) => {
+                        return Err(OrderExecutionError::Database {
+                            source: source.into(),
+                        })
+                    }
                 };
                 let failed_attempt = self
                     .db
@@ -5274,7 +5498,9 @@ impl OrderExecutionManager {
                         now,
                     )
                     .await
-                    .map_err(|source| OrderExecutionError::Database { source })?;
+                    .map_err(|source| OrderExecutionError::Database {
+                        source: source.into(),
+                    })?;
                 let _ = self
                     .mark_order_refund_required(order, &failed_attempt, &failed_step)
                     .await?;
@@ -5391,13 +5617,17 @@ impl OrderExecutionManager {
             .await
         {
             Ok(attempt) => attempt,
-            Err(RouterServerError::NotFound) => {
+            Err(RouterCoreError::NotFound) => {
                 return Ok(StaleQuoteRefreshOutcome::NotNeeded);
             }
-            Err(RouterServerError::DatabaseQuery { source }) if is_unique_violation(&source) => {
+            Err(RouterCoreError::DatabaseQuery { source }) if is_unique_violation(&source) => {
                 return Ok(StaleQuoteRefreshOutcome::NotNeeded);
             }
-            Err(source) => return Err(OrderExecutionError::Database { source }),
+            Err(source) => {
+                return Err(OrderExecutionError::Database {
+                    source: source.into(),
+                })
+            }
         };
 
         let _ = self
@@ -5415,7 +5645,9 @@ impl OrderExecutionManager {
                 now,
             )
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
 
         self.bind_steps_to_attempt(
             order.id,
@@ -5434,7 +5666,9 @@ impl OrderExecutionManager {
             .orders()
             .create_execution_steps_idempotent(&refreshed_steps)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         let _ = self
             .db
             .orders()
@@ -5445,7 +5679,9 @@ impl OrderExecutionManager {
                 Utc::now(),
             )
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
 
         Ok(StaleQuoteRefreshOutcome::Refreshed)
     }
@@ -5478,7 +5714,9 @@ impl OrderExecutionManager {
                 service
                     .snapshot()
                     .await
-                    .map_err(|source| OrderExecutionError::Database { source })?,
+                    .map_err(|source| OrderExecutionError::Database {
+                        source: source.into(),
+                    })?,
             )
         } else {
             None
@@ -6154,12 +6392,11 @@ impl OrderExecutionManager {
     }
 
     async fn request_refund_for_unstarted_order(&self, order_id: Uuid) -> OrderExecutionResult<()> {
-        let order = self
-            .db
-            .orders()
-            .get(order_id)
-            .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+        let order = self.db.orders().get(order_id).await.map_err(|source| {
+            OrderExecutionError::Database {
+                source: source.into(),
+            }
+        })?;
         if matches!(
             order.status,
             RouterOrderStatus::PendingFunding
@@ -6177,8 +6414,12 @@ impl OrderExecutionManager {
                 )
                 .await
             {
-                Ok(_) | Err(RouterServerError::NotFound) => {}
-                Err(source) => return Err(OrderExecutionError::Database { source }),
+                Ok(_) | Err(RouterCoreError::NotFound) => {}
+                Err(source) => {
+                    return Err(OrderExecutionError::Database {
+                        source: source.into(),
+                    })
+                }
             }
         }
         if let Some(funding_vault_id) = order.funding_vault_id {
@@ -6187,14 +6428,15 @@ impl OrderExecutionManager {
                 .vaults()
                 .request_refund(funding_vault_id, Utc::now())
                 .await
-                .map_err(|source| OrderExecutionError::Database { source })?;
+                .map_err(|source| OrderExecutionError::Database {
+                    source: source.into(),
+                })?;
         }
-        let refreshed = self
-            .db
-            .orders()
-            .get(order.id)
-            .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+        let refreshed = self.db.orders().get(order.id).await.map_err(|source| {
+            OrderExecutionError::Database {
+                source: source.into(),
+            }
+        })?;
         if refreshed.status == RouterOrderStatus::Refunding {
             let _ = self
                 .ensure_direct_refund_attempt_for_order(
@@ -6216,7 +6458,9 @@ impl OrderExecutionManager {
             .orders()
             .get_active_execution_attempt(order.id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?
         {
             return Ok(
                 (active_attempt.attempt_kind == OrderExecutionAttemptKind::RefundRecovery)
@@ -6229,7 +6473,9 @@ impl OrderExecutionManager {
             .orders()
             .get_latest_execution_attempt(order.id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?
             .map_or(1, |attempt| attempt.attempt_index + 1);
         let now = Utc::now();
         let refund_attempt = OrderExecutionAttempt {
@@ -6260,18 +6506,22 @@ impl OrderExecutionManager {
             .await
         {
             Ok(()) => Ok(Some(refund_attempt)),
-            Err(RouterServerError::DatabaseQuery { source }) if is_unique_violation(&source) => {
+            Err(RouterCoreError::DatabaseQuery { source }) if is_unique_violation(&source) => {
                 let active_attempt = self
                     .db
                     .orders()
                     .get_active_execution_attempt(order.id)
                     .await
-                    .map_err(|source| OrderExecutionError::Database { source })?;
+                    .map_err(|source| OrderExecutionError::Database {
+                        source: source.into(),
+                    })?;
                 Ok(active_attempt.filter(|attempt| {
                     attempt.attempt_kind == OrderExecutionAttemptKind::RefundRecovery
                 }))
             }
-            Err(source) => Err(OrderExecutionError::Database { source }),
+            Err(source) => Err(OrderExecutionError::Database {
+                source: source.into(),
+            }),
         }
     }
 
@@ -6292,23 +6542,26 @@ impl OrderExecutionManager {
                 order,
                 changed: true,
             }),
-            Err(source @ RouterServerError::NotFound) => {
-                let current = self
-                    .db
-                    .orders()
-                    .get(order_id)
-                    .await
-                    .map_err(|source| OrderExecutionError::Database { source })?;
+            Err(source @ RouterCoreError::NotFound) => {
+                let current = self.db.orders().get(order_id).await.map_err(|source| {
+                    OrderExecutionError::Database {
+                        source: source.into(),
+                    }
+                })?;
                 if current.status == to_status {
                     Ok(OrderStatusTransition {
                         order: current,
                         changed: false,
                     })
                 } else {
-                    Err(OrderExecutionError::Database { source })
+                    Err(OrderExecutionError::Database {
+                        source: source.into(),
+                    })
                 }
             }
-            Err(source) => Err(OrderExecutionError::Database { source }),
+            Err(source) => Err(OrderExecutionError::Database {
+                source: source.into(),
+            }),
         }
     }
 
@@ -6365,13 +6618,17 @@ impl OrderExecutionManager {
             .await
         {
             Ok(running) => running,
-            Err(RouterServerError::NotFound) => {
+            Err(RouterCoreError::NotFound) => {
                 // Another worker won the Ready/Planned → Running CAS. Bow out
                 // cleanly so the caller can return a no-op summary without
                 // misinterpreting this as a real failure.
                 return Ok(StepExecutionOutcome::Skipped);
             }
-            Err(source) => return Err(OrderExecutionError::Database { source }),
+            Err(source) => {
+                return Err(OrderExecutionError::Database {
+                    source: source.into(),
+                })
+            }
         };
         if let Some(order) = &order {
             telemetry::record_execution_step_workflow_event(
@@ -6409,7 +6666,7 @@ impl OrderExecutionManager {
                         // someone else drove the step to a terminal state. Any other
                         // DB error is surfaced so operators see the step wedged in
                         // Running rather than silently losing the original cause.
-                        if !matches!(mark_err, RouterServerError::NotFound) {
+                        if !matches!(mark_err, RouterCoreError::NotFound) {
                             warn!(
                                 %step_id,
                                 original_error = %err,
@@ -6447,7 +6704,7 @@ impl OrderExecutionManager {
                     .await;
                 let completed_step = match completed_step {
                     Ok(step) => step,
-                    Err(RouterServerError::NotFound) => {
+                    Err(RouterCoreError::NotFound) => {
                         // Provider-observation recovery or another executor
                         // can settle the step after this task has already run
                         // the provider action. Losing that final Running →
@@ -6455,7 +6712,11 @@ impl OrderExecutionManager {
                         // responsible for the persisted step state.
                         return Ok(StepExecutionOutcome::Skipped);
                     }
-                    Err(source) => return Err(OrderExecutionError::Database { source }),
+                    Err(source) => {
+                        return Err(OrderExecutionError::Database {
+                            source: source.into(),
+                        })
+                    }
                 };
                 if let Some(execution_leg_id) = completed_step.execution_leg_id {
                     let _ = self
@@ -6486,13 +6747,17 @@ impl OrderExecutionManager {
                     .await;
                 let waiting_step = match waiting_step {
                     Ok(step) => step,
-                    Err(RouterServerError::NotFound) => {
+                    Err(RouterCoreError::NotFound) => {
                         // Another worker changed the running step before this
                         // task could persist Waiting. Treat it as a lost CAS,
                         // not as a provider failure.
                         return Ok(StepExecutionOutcome::Skipped);
                     }
-                    Err(source) => return Err(OrderExecutionError::Database { source }),
+                    Err(source) => {
+                        return Err(OrderExecutionError::Database {
+                            source: source.into(),
+                        })
+                    }
                 };
                 if let Some(order) = &order {
                     telemetry::record_execution_step_workflow_event(
@@ -6812,7 +7077,9 @@ impl OrderExecutionManager {
             .orders()
             .get_provider_operations(running.order_id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         let Some(operation) = operations.into_iter().rev().find(|operation| {
             operation.operation_type == ProviderOperationType::CctpBridge
                 && operation.status == ProviderOperationStatus::Completed
@@ -7403,7 +7670,9 @@ impl OrderExecutionManager {
                     updated_at: now,
                 })
                 .await
-                .map_err(|source| OrderExecutionError::Database { source })?;
+                .map_err(|source| OrderExecutionError::Database {
+                    source: source.into(),
+                })?;
             self.try_record_provider_operation_workflow_event(
                 step.order_id,
                 operation_id,
@@ -7437,7 +7706,9 @@ impl OrderExecutionManager {
                     updated_at: now,
                 })
                 .await
-                .map_err(|source| OrderExecutionError::Database { source })?;
+                .map_err(|source| OrderExecutionError::Database {
+                    source: source.into(),
+                })?;
         }
 
         Ok(())
@@ -7464,7 +7735,9 @@ impl OrderExecutionManager {
                 Utc::now(),
             )
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         self.maybe_inject_crash(OrderExecutionCrashPoint::AfterProviderOperationStatusPersisted);
         let (step_observed_state, step_response, step_tx_hash, step_error) =
             if status_update_applied {
@@ -7576,7 +7849,9 @@ impl OrderExecutionManager {
             .orders()
             .get_provider_operation(id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
 
         if let Some(provider) = &update.provider {
             if provider != &operation.provider {
@@ -7644,7 +7919,9 @@ impl OrderExecutionManager {
             .orders()
             .get_execution_step(step_id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         let asset = step.output_asset.clone().ok_or_else(|| {
             OrderExecutionError::ProviderRequestFailed {
                 provider: operation.provider.clone(),
@@ -7694,7 +7971,9 @@ impl OrderExecutionManager {
             .orders()
             .get_execution_step(step_id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
 
         match operation.status {
             ProviderOperationStatus::Planned
@@ -7732,7 +8011,9 @@ impl OrderExecutionManager {
                         completed_at,
                     )
                     .await
-                    .map_err(|source| OrderExecutionError::Database { source })?;
+                    .map_err(|source| OrderExecutionError::Database {
+                        source: source.into(),
+                    })?;
                 if let Some(execution_leg_id) = step.execution_leg_id {
                     let _ = self
                         .refresh_execution_leg_rollup_and_usd_valuation(
@@ -7762,7 +8043,9 @@ impl OrderExecutionManager {
                     .orders()
                     .fail_observed_execution_step(step.id, error, Utc::now())
                     .await
-                    .map_err(|source| OrderExecutionError::Database { source })?;
+                    .map_err(|source| OrderExecutionError::Database {
+                        source: source.into(),
+                    })?;
                 Ok(Some(step))
             }
         }
@@ -7777,16 +8060,18 @@ impl OrderExecutionManager {
             .orders()
             .get(operation.order_id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
 
         match operation.status {
             ProviderOperationStatus::Failed | ProviderOperationStatus::Expired => {
                 let _ = self.process_failed_attempt_for_order(order.id).await?;
-                self.db
-                    .orders()
-                    .get(order.id)
-                    .await
-                    .map_err(|source| OrderExecutionError::Database { source })
+                self.db.orders().get(order.id).await.map_err(|source| {
+                    OrderExecutionError::Database {
+                        source: source.into(),
+                    }
+                })
             }
             ProviderOperationStatus::Completed => self.finalize_order_if_complete(order).await,
             ProviderOperationStatus::Planned
@@ -7810,7 +8095,9 @@ impl OrderExecutionManager {
             .orders()
             .get_active_execution_attempt(order.id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?
         else {
             return Ok(order);
         };
@@ -7819,7 +8106,9 @@ impl OrderExecutionManager {
             .orders()
             .get_execution_steps_for_attempt(active_attempt.id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         let has_execution_steps = steps.iter().any(|step| step.step_index > 0);
         let all_execution_steps_completed = has_execution_steps
             && steps
@@ -7848,7 +8137,9 @@ impl OrderExecutionManager {
             .orders()
             .get_execution_legs_for_attempt(active_attempt.id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         let all_execution_legs_completed = !execution_legs.is_empty()
             && execution_legs
                 .iter()
@@ -7886,18 +8177,26 @@ impl OrderExecutionManager {
                 .await
             {
                 Ok(_) => {}
-                Err(source @ RouterServerError::NotFound) => {
-                    let current = self
-                        .db
-                        .vaults()
-                        .get(funding_vault_id)
-                        .await
-                        .map_err(|source| OrderExecutionError::Database { source })?;
+                Err(source @ RouterCoreError::NotFound) => {
+                    let current =
+                        self.db
+                            .vaults()
+                            .get(funding_vault_id)
+                            .await
+                            .map_err(|source| OrderExecutionError::Database {
+                                source: source.into(),
+                            })?;
                     if current.status != to_vault_status {
-                        return Err(OrderExecutionError::Database { source });
+                        return Err(OrderExecutionError::Database {
+                            source: source.into(),
+                        });
                     }
                 }
-                Err(source) => return Err(OrderExecutionError::Database { source }),
+                Err(source) => {
+                    return Err(OrderExecutionError::Database {
+                        source: source.into(),
+                    })
+                }
             }
         }
         let order_transition = self
@@ -7925,8 +8224,12 @@ impl OrderExecutionManager {
             )
             .await
         {
-            Ok(_) | Err(RouterServerError::NotFound) => {}
-            Err(source) => return Err(OrderExecutionError::Database { source }),
+            Ok(_) | Err(RouterCoreError::NotFound) => {}
+            Err(source) => {
+                return Err(OrderExecutionError::Database {
+                    source: source.into(),
+                })
+            }
         }
         let _ = self
             .finalize_internal_custody_vaults_for_order(&order)
@@ -7946,8 +8249,9 @@ impl OrderExecutionManager {
             .orders()
             .get_active_execution_attempt(order.id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?
-        {
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })? {
             Some(active_attempt) => active_attempt,
             None => {
                 let Some(funding_vault_id) = order.funding_vault_id else {
@@ -7958,7 +8262,9 @@ impl OrderExecutionManager {
                     .vaults()
                     .get(funding_vault_id)
                     .await
-                    .map_err(|source| OrderExecutionError::Database { source })?;
+                    .map_err(|source| OrderExecutionError::Database {
+                        source: source.into(),
+                    })?;
                 if vault.status != DepositVaultStatus::Refunded {
                     return Ok(false);
                 }
@@ -7982,7 +8288,9 @@ impl OrderExecutionManager {
             .orders()
             .get_execution_steps_for_attempt(active_attempt.id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         if steps.iter().any(|step| step.step_index > 0) {
             return Ok(false);
         }
@@ -7994,7 +8302,9 @@ impl OrderExecutionManager {
             .vaults()
             .get(funding_vault_id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         if vault.status != DepositVaultStatus::Refunded {
             return Ok(false);
         }
@@ -8017,7 +8327,9 @@ impl OrderExecutionManager {
                 Utc::now(),
             )
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         let _ = self
             .finalize_internal_custody_vaults_for_order(&order)
             .await?;
@@ -8046,7 +8358,9 @@ impl OrderExecutionManager {
             .orders()
             .has_execution_steps_after_deposit(order.id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?
         {
             return Ok(false);
         }
@@ -8059,7 +8373,9 @@ impl OrderExecutionManager {
             .vaults()
             .get(funding_vault_id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         if vault.status != DepositVaultStatus::Refunded {
             return Ok(false);
         }
@@ -8112,7 +8428,9 @@ impl OrderExecutionManager {
             .orders()
             .get_terminal_orders_with_pending_internal_custody_finalization(limit)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         let mut finalized = 0usize;
         for order in orders {
             finalized += self
@@ -8134,7 +8452,9 @@ impl OrderExecutionManager {
             .orders()
             .get_released_internal_custody_vaults_pending_sweep(limit)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         let mut processed = 0usize;
         for vault in vaults {
             match custody_action_executor
@@ -8151,7 +8471,9 @@ impl OrderExecutionManager {
                             now,
                         )
                         .await
-                        .map_err(|source| OrderExecutionError::Database { source })?;
+                        .map_err(|source| OrderExecutionError::Database {
+                            source: source.into(),
+                        })?;
                     if matches!(
                         result,
                         ReleasedSweepResult::Swept { .. } | ReleasedSweepResult::Skipped { .. }
@@ -8197,7 +8519,9 @@ impl OrderExecutionManager {
                 finalized_at,
             )
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         Ok(finalized.len())
     }
 
@@ -9070,7 +9394,7 @@ fn parse_refund_amount(field: &'static str, value: &str) -> OrderExecutionResult
 async fn quote_refund_bridge(
     bridge: &dyn BridgeProvider,
     request: BridgeQuoteRequest,
-) -> OrderExecutionResult<Option<crate::services::action_providers::BridgeQuote>> {
+) -> OrderExecutionResult<Option<router_core::services::action_providers::BridgeQuote>> {
     tokio::time::timeout(REFUND_PROVIDER_TIMEOUT, bridge.quote_bridge(request))
         .await
         .map_err(|_| OrderExecutionError::ProviderRequestFailed {
@@ -9086,7 +9410,7 @@ async fn quote_refund_bridge(
 async fn quote_refund_exchange(
     exchange: &dyn ExchangeProvider,
     request: ExchangeQuoteRequest,
-) -> OrderExecutionResult<Option<crate::services::action_providers::ExchangeQuote>> {
+) -> OrderExecutionResult<Option<router_core::services::action_providers::ExchangeQuote>> {
     tokio::time::timeout(REFUND_PROVIDER_TIMEOUT, exchange.quote_trade(request))
         .await
         .map_err(|_| OrderExecutionError::ProviderRequestFailed {
@@ -9130,7 +9454,7 @@ fn refund_exchange_quote_transition_legs(
     transition_decl_id: &str,
     transition_kind: MarketOrderTransitionKind,
     provider: ProviderId,
-    quote: &crate::services::action_providers::ExchangeQuote,
+    quote: &router_core::services::action_providers::ExchangeQuote,
 ) -> OrderExecutionResult<Vec<QuoteLeg>> {
     let provider_name = provider.as_str();
     let kind = quote
@@ -12779,7 +13103,7 @@ fn decimal_string_to_raw(value: &str, decimals: u8) -> Result<U256, String> {
 
 fn provider_operation_outcome(
     step: &OrderExecutionStep,
-    operation: Option<&crate::services::action_providers::ProviderOperationIntent>,
+    operation: Option<&router_core::services::action_providers::ProviderOperationIntent>,
 ) -> OrderExecutionResult<RunningStepOutcome> {
     match operation.map(|operation| operation.status) {
         None if step.step_type == OrderExecutionStepType::CctpReceive => {
@@ -12809,7 +13133,7 @@ fn provider_operation_outcome(
 
 fn provider_only_outcome(
     step: &OrderExecutionStep,
-    operation: Option<&crate::services::action_providers::ProviderOperationIntent>,
+    operation: Option<&router_core::services::action_providers::ProviderOperationIntent>,
 ) -> OrderExecutionResult<RunningStepOutcome> {
     match operation {
         Some(operation) => provider_operation_outcome(step, Some(operation)),
@@ -12819,7 +13143,7 @@ fn provider_only_outcome(
 
 fn provider_operation_ref_for_persist(
     step: &OrderExecutionStep,
-    operation: &crate::services::action_providers::ProviderOperationIntent,
+    operation: &router_core::services::action_providers::ProviderOperationIntent,
 ) -> OrderExecutionResult<Option<String>> {
     let provider_ref = operation.provider_ref.clone().or_else(|| {
         if step.step_type == OrderExecutionStepType::AcrossBridge
@@ -13005,7 +13329,9 @@ impl StepBalanceProbe {
             .orders()
             .get_custody_vault(self.vault_id)
             .await
-            .map_err(|source| OrderExecutionError::Database { source })?;
+            .map_err(|source| OrderExecutionError::Database {
+                source: source.into(),
+            })?;
         if !custody_vault_balance_is_chain_observable(&vault, &self.asset) {
             return Ok((vault.address, None));
         }
@@ -13120,8 +13446,8 @@ impl From<OrderExecutionError> for RouterServerError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{MarketOrderAction, RouterOrderAction, RouterOrderType};
-    use crate::services::{AssetRegistry, ProviderOperationIntent};
+    use router_core::models::{MarketOrderAction, RouterOrderAction, RouterOrderType};
+    use router_core::services::{AssetRegistry, ProviderOperationIntent};
 
     fn test_asset(chain: &str, asset: AssetId) -> DepositAsset {
         DepositAsset {
@@ -13171,7 +13497,7 @@ mod tests {
             id: Uuid::now_v7(),
             order_id: Some(order_id),
             deposit_asset,
-            action: crate::models::VaultAction::Null,
+            action: router_core::models::VaultAction::Null,
             metadata: json!({}),
             deposit_vault_salt: [7; 32],
             deposit_vault_address: deposit_vault_address.to_string(),
@@ -13579,7 +13905,7 @@ mod tests {
             OrderExecutionStepType::HyperliquidTrade,
             json!({}),
         );
-        let operation = crate::services::action_providers::ProviderOperationIntent {
+        let operation = router_core::services::action_providers::ProviderOperationIntent {
             operation_type: ProviderOperationType::HyperliquidTrade,
             status: ProviderOperationStatus::Completed,
             provider_ref: None,
@@ -13614,7 +13940,7 @@ mod tests {
         );
         step.provider_ref = Some("quote-019e0496-9b0d-73c1-877e-946465c37877".to_string());
 
-        let submitted = crate::services::action_providers::ProviderOperationIntent {
+        let submitted = router_core::services::action_providers::ProviderOperationIntent {
             operation_type: ProviderOperationType::AcrossBridge,
             status: ProviderOperationStatus::Submitted,
             provider_ref: None,
@@ -13628,7 +13954,7 @@ mod tests {
         );
 
         let completed_without_deposit_id =
-            crate::services::action_providers::ProviderOperationIntent {
+            router_core::services::action_providers::ProviderOperationIntent {
                 status: ProviderOperationStatus::Completed,
                 ..submitted
             };
@@ -13769,7 +14095,7 @@ mod tests {
 
     #[test]
     fn refund_cross_token_quote_legs_require_explicit_amounts() {
-        let quote = crate::services::action_providers::ExchangeQuote {
+        let quote = router_core::services::action_providers::ExchangeQuote {
             provider_id: "hyperliquid".to_string(),
             amount_in: "100".to_string(),
             amount_out: "50".to_string(),
@@ -13831,15 +14157,15 @@ mod tests {
         input_asset: DepositAsset,
         output_asset: DepositAsset,
     ) -> TransitionDecl {
-        let input = crate::services::asset_registry::AssetSlot {
+        let input = router_core::services::asset_registry::AssetSlot {
             asset: input_asset.clone(),
             required_custody_role:
-                crate::services::asset_registry::RequiredCustodyRole::SourceOrIntermediate,
+                router_core::services::asset_registry::RequiredCustodyRole::SourceOrIntermediate,
         };
-        let output = crate::services::asset_registry::AssetSlot {
+        let output = router_core::services::asset_registry::AssetSlot {
             asset: output_asset.clone(),
             required_custody_role:
-                crate::services::asset_registry::RequiredCustodyRole::IntermediateExecution,
+                router_core::services::asset_registry::RequiredCustodyRole::IntermediateExecution,
         };
         TransitionDecl {
             id: id.to_string(),

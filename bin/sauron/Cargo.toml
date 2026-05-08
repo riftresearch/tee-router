@@ -20,6 +20,7 @@ bitcoincore-rpc-async = { workspace = true }
 esplora-client = { workspace = true }
 evm-token-indexer-client = { workspace = true }
 observability = { workspace = true }
+router-core = { workspace = true }
 router-primitives = { workspace = true }
 router-server = { path = "../router-server" }
 utc = { workspace = true }

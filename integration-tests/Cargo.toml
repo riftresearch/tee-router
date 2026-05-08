@@ -10,6 +10,7 @@ publish = false
 devnet = { workspace = true }
 eip3009-erc20-contract = { workspace = true }
 hyperunit-client = { workspace = true }
+router-core = { workspace = true }
 router-server = { path = "../bin/router-server" }
 sauron = { path = "../bin/sauron" }
 

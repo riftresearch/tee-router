@@ -12,7 +12,7 @@ pub use route_cost_repo::RouteCostRepository;
 pub use vault_repo::VaultRepository;
 pub use worker_lease_repo::WorkerLeaseRepository;
 
-use crate::error::RouterServerResult;
+use crate::error::RouterCoreResult;
 use sqlx_core::migrate::Migrator;
 use sqlx_postgres::{PgPool, PgPoolOptions};
 use std::{path::PathBuf, time::Duration};
@@ -28,9 +28,10 @@ fn migrations_dir() -> PathBuf {
         return path.into();
     }
 
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations");
-    if manifest_dir.is_dir() {
-        return manifest_dir;
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let crate_dir = manifest_dir.join("migrations");
+    if crate_dir.is_dir() {
+        return crate_dir;
     }
 
     PathBuf::from("migrations")
@@ -41,7 +42,7 @@ impl Database {
         database_url: &str,
         max_db_connections: u32,
         min_db_connections: u32,
-    ) -> RouterServerResult<Self> {
+    ) -> RouterCoreResult<Self> {
         info!("Connecting router-server database...");
 
         let pool = PgPoolOptions::new()
@@ -55,7 +56,7 @@ impl Database {
         Self::from_pool(pool).await
     }
 
-    pub async fn from_pool(pool: PgPool) -> RouterServerResult<Self> {
+    pub async fn from_pool(pool: PgPool) -> RouterCoreResult<Self> {
         info!("Running router-server migrations...");
         let migrator = Migrator::new(migrations_dir()).await?;
         migrator.run(&pool).await?;

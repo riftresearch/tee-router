@@ -24,8 +24,7 @@ use devnet::{
     RiftDevnet,
 };
 use eip3009_erc20_contract::GenericEIP3009ERC20::GenericEIP3009ERC20Instance;
-use router_server::{
-    app::{initialize_components, PaymasterMode},
+use router_core::{
     db::Database,
     models::{
         CustodyVaultControlType, DepositVaultStatus, OrderExecutionStepType,
@@ -33,6 +32,9 @@ use router_server::{
         RouterOrderEnvelope, RouterOrderQuoteEnvelope, RouterOrderStatus,
     },
     protocol::{backend_chain_for_id, AssetId, ChainId},
+};
+use router_server::{
+    app::{initialize_components, PaymasterMode},
     server::run_api,
     services::deposit_address::derive_deposit_salt_for_quote,
     worker::{run_worker_loop, RouterWorkerConfig},
@@ -194,7 +196,7 @@ struct LiveRuntimeConfig {
     hyperunit_api_url: String,
     hyperunit_proxy_url: Option<String>,
     hyperliquid_api_url: String,
-    hyperliquid_network: router_server::services::custody_action_executor::HyperliquidCallNetwork,
+    hyperliquid_network: router_core::services::custody_action_executor::HyperliquidCallNetwork,
     hyperliquid_execution_private_key: Option<String>,
     hyperliquid_account_address: Option<String>,
     hyperliquid_vault_address: Option<String>,
@@ -307,8 +309,8 @@ fn parse_auth_env(key: &str) -> Auth {
 
 fn parse_hyperliquid_network(
     raw: &str,
-) -> router_server::services::custody_action_executor::HyperliquidCallNetwork {
-    use router_server::services::custody_action_executor::HyperliquidCallNetwork;
+) -> router_core::services::custody_action_executor::HyperliquidCallNetwork {
+    use router_core::services::custody_action_executor::HyperliquidCallNetwork;
 
     match raw.trim().to_ascii_lowercase().as_str() {
         "mainnet" => HyperliquidCallNetwork::Mainnet,
@@ -952,7 +954,7 @@ fn router_args(
         router_gateway_api_key: None,
         router_admin_api_key: None,
         hyperliquid_network:
-            router_server::services::custody_action_executor::HyperliquidCallNetwork::Mainnet,
+            router_core::services::custody_action_executor::HyperliquidCallNetwork::Mainnet,
         hyperliquid_order_timeout_ms: 30_000,
         worker_id: Some(format!("router-worker-{}", Uuid::now_v7())),
         worker_lease_name: Some(format!("router-worker-e2e-{}", Uuid::now_v7())),
@@ -968,6 +970,7 @@ fn router_args(
         worker_order_maintenance_pass_limit: 100,
         worker_order_planning_pass_limit: 100,
         worker_order_execution_pass_limit: 25,
+        worker_order_execution_concurrency: 64,
         worker_vault_funding_hint_pass_limit: 100,
         coinbase_price_api_base_url: mocks.base_url().to_string(),
     }
@@ -1043,6 +1046,7 @@ fn live_router_args(
         worker_order_maintenance_pass_limit: 100,
         worker_order_planning_pass_limit: 100,
         worker_order_execution_pass_limit: 25,
+        worker_order_execution_concurrency: 64,
         worker_vault_funding_hint_pass_limit: 100,
         coinbase_price_api_base_url: "https://api.coinbase.com".to_string(),
     }

@@ -15,7 +15,7 @@ use alloy::{
     rpc::types::TransactionRequest,
     signers::local::PrivateKeySigner,
 };
-use router_server::services::across_client::{
+use router_core::services::across_client::{
     parse_optional_u256, AcrossClient, AcrossClientError, AcrossSwapApprovalRequest,
     AcrossSwapApprovalResponse, AcrossTransaction,
 };

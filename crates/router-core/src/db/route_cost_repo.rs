@@ -1,5 +1,5 @@
 use crate::{
-    error::{RouterServerError, RouterServerResult},
+    error::{RouterCoreError, RouterCoreResult},
     protocol::{AssetId, ChainId, DepositAsset},
     services::route_costs::RouteCostSnapshot,
     telemetry,
@@ -38,7 +38,7 @@ impl RouteCostRepository {
         Self { pool }
     }
 
-    pub async fn upsert_many(&self, snapshots: &[RouteCostSnapshot]) -> RouterServerResult<()> {
+    pub async fn upsert_many(&self, snapshots: &[RouteCostSnapshot]) -> RouterCoreResult<()> {
         let started = Instant::now();
         let mut tx = self.pool.begin().await?;
         for snapshot in snapshots {
@@ -119,7 +119,7 @@ impl RouteCostRepository {
         &self,
         amount_bucket: &str,
         now: DateTime<Utc>,
-    ) -> RouterServerResult<Vec<RouteCostSnapshot>> {
+    ) -> RouterCoreResult<Vec<RouteCostSnapshot>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
@@ -140,7 +140,7 @@ impl RouteCostRepository {
     }
 }
 
-fn map_route_cost_snapshot(row: &sqlx_postgres::PgRow) -> RouterServerResult<RouteCostSnapshot> {
+fn map_route_cost_snapshot(row: &sqlx_postgres::PgRow) -> RouterCoreResult<RouteCostSnapshot> {
     Ok(RouteCostSnapshot {
         transition_id: row.get("transition_id"),
         amount_bucket: row.get("amount_bucket"),
@@ -170,26 +170,26 @@ fn map_route_cost_snapshot(row: &sqlx_postgres::PgRow) -> RouterServerResult<Rou
     })
 }
 
-fn parse_chain(raw: String) -> RouterServerResult<ChainId> {
-    ChainId::parse(&raw).map_err(|reason| RouterServerError::InvalidData {
+fn parse_chain(raw: String) -> RouterCoreResult<ChainId> {
+    ChainId::parse(&raw).map_err(|reason| RouterCoreError::InvalidData {
         message: format!("invalid route cost chain {raw}: {reason}"),
     })
 }
 
-fn parse_asset(raw: String) -> RouterServerResult<AssetId> {
-    AssetId::parse(&raw).map_err(|reason| RouterServerError::InvalidData {
+fn parse_asset(raw: String) -> RouterCoreResult<AssetId> {
+    AssetId::parse(&raw).map_err(|reason| RouterCoreError::InvalidData {
         message: format!("invalid route cost asset {raw}: {reason}"),
     })
 }
 
-fn u64_to_i64(value: u64, field: &'static str) -> RouterServerResult<i64> {
-    i64::try_from(value).map_err(|_| RouterServerError::InvalidData {
+fn u64_to_i64(value: u64, field: &'static str) -> RouterCoreResult<i64> {
+    i64::try_from(value).map_err(|_| RouterCoreError::InvalidData {
         message: format!("{field} exceeds i64 range"),
     })
 }
 
-fn i64_to_u64(value: i64, field: &'static str) -> RouterServerResult<u64> {
-    u64::try_from(value).map_err(|_| RouterServerError::InvalidData {
+fn i64_to_u64(value: i64, field: &'static str) -> RouterCoreResult<u64> {
+    u64::try_from(value).map_err(|_| RouterCoreError::InvalidData {
         message: format!("{field} is negative"),
     })
 }

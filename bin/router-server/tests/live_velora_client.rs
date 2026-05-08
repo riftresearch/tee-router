@@ -15,7 +15,7 @@ use alloy::{
     signers::local::PrivateKeySigner,
     sol,
 };
-use router_server::{
+use router_core::{
     models::MarketOrderKind,
     protocol::{AssetId, ChainId, DepositAsset},
     services::{
@@ -23,7 +23,8 @@ use router_server::{
             ExchangeExecutionRequest, ExchangeProvider, ExchangeQuote, ExchangeQuoteRequest,
             VeloraProvider,
         },
-        ChainCall, CustodyAction, ProviderExecutionIntent,
+        custody_action_executor::{ChainCall, CustodyAction},
+        ProviderExecutionIntent,
     },
 };
 use serde_json::{json, Value};

@@ -20,7 +20,7 @@ use hyperunit_client::{
     HyperUnitClient, UnitAsset, UnitChain, UnitGenerateAddressRequest, UnitGenerateAddressResponse,
     UnitOperation, UnitOperationsRequest, UnitOperationsResponse,
 };
-use router_server::{
+use router_core::{
     models::MarketOrderKind,
     protocol::{AssetId, ChainId, DepositAsset},
     services::{

@@ -22,17 +22,16 @@ use devnet::{
     RiftDevnet,
 };
 use eip3009_erc20_contract::GenericEIP3009ERC20::GenericEIP3009ERC20Instance;
-use router_server::{
-    api::OrderFlowEnvelope,
+use router_core::{
     models::{
         CustodyVaultRole, DepositVault, OrderProviderOperation, ProviderOperationStatus,
         ProviderOperationType, RouterOrderEnvelope, RouterOrderQuoteEnvelope, RouterOrderStatus,
     },
     protocol::AssetId,
-    server::run_api,
     services::custody_action_executor::HyperliquidCallNetwork,
-    worker::run_worker,
-    RouterServerArgs,
+};
+use router_server::{
+    api::OrderFlowEnvelope, server::run_api, worker::run_worker, RouterServerArgs,
 };
 use sauron::{run as run_sauron, SauronArgs};
 use serde_json::{json, Value};
@@ -610,6 +609,12 @@ fn router_args(
         worker_route_cost_refresh_seconds: 300,
         worker_provider_health_poll_seconds: 120,
         provider_health_timeout_seconds: 10,
+        worker_provider_operation_hint_pass_limit: 500,
+        worker_order_maintenance_pass_limit: 100,
+        worker_order_planning_pass_limit: 100,
+        worker_order_execution_pass_limit: 25,
+        worker_order_execution_concurrency: 64,
+        worker_vault_funding_hint_pass_limit: 100,
         coinbase_price_api_base_url: mocks.base_url().to_string(),
     }
 }

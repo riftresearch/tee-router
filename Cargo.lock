@@ -6072,6 +6072,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "router-core"
+version = "0.1.8"
+dependencies = [
+ "alloy",
+ "async-trait",
+ "bitcoin",
+ "bitcoincore-rpc-async",
+ "blockchain-utils",
+ "chains",
+ "chrono",
+ "getrandom 0.2.16",
+ "hyperliquid-client",
+ "hyperunit-client",
+ "market-pricing",
+ "metrics",
+ "observability",
+ "reqwest",
+ "router-primitives",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "sha2",
+ "snafu",
+ "sqlx-core",
+ "sqlx-postgres",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "router-integration-tests"
 version = "0.1.8"
 dependencies = [
@@ -6082,6 +6116,7 @@ dependencies = [
  "eip3009-erc20-contract",
  "hyperunit-client",
  "reqwest",
+ "router-core",
  "router-server",
  "sauron",
  "serde_json",
@@ -6150,6 +6185,7 @@ dependencies = [
  "metrics",
  "observability",
  "reqwest",
+ "router-core",
  "router-primitives",
  "secrecy",
  "serde",
@@ -6410,6 +6446,7 @@ dependencies = [
  "percent-encoding",
  "pgwire-replication",
  "reqwest",
+ "router-core",
  "router-primitives",
  "router-server",
  "serde",
@@ -7181,6 +7218,7 @@ dependencies = [
  "clap",
  "futures",
  "futures-util",
+ "router-core",
  "serde",
  "snafu",
  "temporalio-client",

@@ -18,6 +18,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 COPY --from=builder /app/out/router-api /usr/local/bin/router-api
 COPY --from=builder /app/out/router-worker /usr/local/bin/router-worker
-COPY --from=builder /app/bin/router-server/migrations /app/migrations
+COPY --from=builder /app/crates/router-core/migrations /app/migrations
 ENV ROUTER_MIGRATIONS_DIR=/app/migrations
 CMD ["router-api", "--host", "0.0.0.0", "--port", "4522"]
