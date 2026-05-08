@@ -6,8 +6,8 @@ pub mod vault_repo;
 pub mod worker_lease_repo;
 
 pub use order_repo::{
-    CompletedSingleStepOrder, OrderRepository, PersistStepCompletionRecord,
-    SingleStepExecutionStartPlan, SingleStepExecutionStartRecord, StepCompletionRecord,
+    CompletedExecutionOrder, ExecutionAttemptMaterializationRecord, ExecutionAttemptPlan,
+    OrderRepository, PersistStepCompletionRecord, StepCompletionRecord,
 };
 pub use provider_health_repo::ProviderHealthRepository;
 pub use provider_policy_repo::ProviderPolicyRepository;

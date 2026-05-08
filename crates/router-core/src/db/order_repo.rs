@@ -18,7 +18,7 @@ use crate::{
 use chrono::{DateTime, Utc};
 use sqlx_core::row::Row;
 use sqlx_postgres::PgPool;
-use std::time::Instant;
+use std::{collections::HashMap, time::Instant};
 use uuid::Uuid;
 
 const ORDER_SELECT_COLUMNS: &str = r#"
@@ -277,17 +277,17 @@ pub struct OrderStatusCount {
 }
 
 #[derive(Debug, Clone)]
-pub struct SingleStepExecutionStartPlan {
-    pub leg: OrderExecutionLeg,
-    pub step: OrderExecutionStep,
+pub struct ExecutionAttemptPlan {
+    pub legs: Vec<OrderExecutionLeg>,
+    pub steps: Vec<OrderExecutionStep>,
 }
 
 #[derive(Debug, Clone)]
-pub struct SingleStepExecutionStartRecord {
+pub struct ExecutionAttemptMaterializationRecord {
     pub order: RouterOrder,
     pub attempt: OrderExecutionAttempt,
-    pub leg: OrderExecutionLeg,
-    pub step: OrderExecutionStep,
+    pub legs: Vec<OrderExecutionLeg>,
+    pub steps: Vec<OrderExecutionStep>,
 }
 
 #[derive(Debug, Clone)]
@@ -308,7 +308,7 @@ pub struct StepCompletionRecord {
 }
 
 #[derive(Debug, Clone)]
-pub struct CompletedSingleStepOrder {
+pub struct CompletedExecutionOrder {
     pub order: RouterOrder,
     pub attempt: OrderExecutionAttempt,
 }
@@ -1388,14 +1388,22 @@ impl OrderRepository {
         Ok(())
     }
 
-    pub async fn persist_single_step_execution_start(
+    pub async fn materialize_primary_execution_attempt(
         &self,
         order_id: Uuid,
-        plan: SingleStepExecutionStartPlan,
+        plan: ExecutionAttemptPlan,
         now: DateTime<Utc>,
-    ) -> RouterCoreResult<SingleStepExecutionStartRecord> {
+    ) -> RouterCoreResult<ExecutionAttemptMaterializationRecord> {
         let started = Instant::now();
         let result = async {
+            if plan.legs.is_empty() || plan.steps.is_empty() {
+                return Err(RouterCoreError::Validation {
+                    message: format!(
+                        "order {order_id} execution attempt requires at least one leg and step"
+                    ),
+                });
+            }
+
             let mut tx = self.pool.begin().await?;
 
             let order_row = sqlx_core::query::query(&format!(
@@ -1417,7 +1425,7 @@ impl OrderRepository {
                 status => {
                     return Err(RouterCoreError::Conflict {
                         message: format!(
-                            "order {} cannot start single-step execution from {}",
+                            "order {} cannot start execution from {}",
                             order.id,
                             status.to_db_string()
                         ),
@@ -1574,181 +1582,218 @@ impl OrderRepository {
                 self.map_execution_attempt_row(&row)?
             };
 
-            let mut leg = plan.leg;
-            leg.order_id = order_id;
-            leg.execution_attempt_id = Some(attempt.id);
-            leg.status = OrderExecutionStepStatus::Running;
-            leg.started_at = Some(now);
-            leg.updated_at = now;
-            let leg_row = sqlx_core::query::query(&format!(
-                r#"
-                WITH inserted AS (
-                    INSERT INTO order_execution_legs (
-                        id,
-                        order_id,
-                        execution_attempt_id,
-                        transition_decl_id,
-                        leg_index,
-                        leg_type,
-                        provider,
-                        status,
-                        input_chain_id,
-                        input_asset_id,
-                        output_chain_id,
-                        output_asset_id,
-                        amount_in,
-                        expected_amount_out,
-                        min_amount_out,
-                        actual_amount_in,
-                        actual_amount_out,
-                        started_at,
-                        completed_at,
-                        provider_quote_expires_at,
-                        details_json,
-                        usd_valuation_json,
-                        created_at,
-                        updated_at
+            let mut leg_id_by_planned_id = HashMap::new();
+            let mut materialized_legs = Vec::with_capacity(plan.legs.len());
+            for mut leg in plan.legs {
+                let planned_leg_id = leg.id;
+                leg.order_id = order_id;
+                leg.execution_attempt_id = Some(attempt.id);
+                leg.status = OrderExecutionStepStatus::Planned;
+                leg.started_at = None;
+                leg.completed_at = None;
+                leg.updated_at = now;
+                let leg_row = sqlx_core::query::query(&format!(
+                    r#"
+                    WITH inserted AS (
+                        INSERT INTO order_execution_legs (
+                            id,
+                            order_id,
+                            execution_attempt_id,
+                            transition_decl_id,
+                            leg_index,
+                            leg_type,
+                            provider,
+                            status,
+                            input_chain_id,
+                            input_asset_id,
+                            output_chain_id,
+                            output_asset_id,
+                            amount_in,
+                            expected_amount_out,
+                            min_amount_out,
+                            actual_amount_in,
+                            actual_amount_out,
+                            started_at,
+                            completed_at,
+                            provider_quote_expires_at,
+                            details_json,
+                            usd_valuation_json,
+                            created_at,
+                            updated_at
+                        )
+                        VALUES (
+                            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                            $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24
+                        )
+                        ON CONFLICT (execution_attempt_id, leg_index)
+                        WHERE execution_attempt_id IS NOT NULL DO NOTHING
+                        RETURNING {EXECUTION_LEG_SELECT_COLUMNS}
                     )
-                    VALUES (
-                        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                        $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24
-                    )
-                    ON CONFLICT (execution_attempt_id, leg_index)
-                    WHERE execution_attempt_id IS NOT NULL DO NOTHING
-                    RETURNING {EXECUTION_LEG_SELECT_COLUMNS}
-                )
-                SELECT {EXECUTION_LEG_SELECT_COLUMNS}
-                FROM inserted
-                UNION ALL
-                SELECT {EXECUTION_LEG_SELECT_COLUMNS}
-                FROM order_execution_legs
-                WHERE execution_attempt_id = $3
-                  AND leg_index = $5
-                LIMIT 1
-                "#
-            ))
-            .bind(leg.id)
-            .bind(leg.order_id)
-            .bind(leg.execution_attempt_id)
-            .bind(leg.transition_decl_id.clone())
-            .bind(leg.leg_index)
-            .bind(&leg.leg_type)
-            .bind(&leg.provider)
-            .bind(leg.status.to_db_string())
-            .bind(leg.input_asset.chain.as_str())
-            .bind(leg.input_asset.asset.as_str())
-            .bind(leg.output_asset.chain.as_str())
-            .bind(leg.output_asset.asset.as_str())
-            .bind(&leg.amount_in)
-            .bind(&leg.expected_amount_out)
-            .bind(leg.min_amount_out.clone())
-            .bind(leg.actual_amount_in.clone())
-            .bind(leg.actual_amount_out.clone())
-            .bind(leg.started_at)
-            .bind(leg.completed_at)
-            .bind(leg.provider_quote_expires_at)
-            .bind(leg.details.clone())
-            .bind(leg.usd_valuation.clone())
-            .bind(leg.created_at)
-            .bind(leg.updated_at)
-            .fetch_one(&mut *tx)
-            .await?;
-            let leg = self.map_execution_leg_row(&leg_row)?;
+                    SELECT {EXECUTION_LEG_SELECT_COLUMNS}
+                    FROM inserted
+                    UNION ALL
+                    SELECT {EXECUTION_LEG_SELECT_COLUMNS}
+                    FROM order_execution_legs
+                    WHERE execution_attempt_id = $3
+                      AND leg_index = $5
+                    LIMIT 1
+                    "#
+                ))
+                .bind(leg.id)
+                .bind(leg.order_id)
+                .bind(leg.execution_attempt_id)
+                .bind(leg.transition_decl_id.clone())
+                .bind(leg.leg_index)
+                .bind(&leg.leg_type)
+                .bind(&leg.provider)
+                .bind(leg.status.to_db_string())
+                .bind(leg.input_asset.chain.as_str())
+                .bind(leg.input_asset.asset.as_str())
+                .bind(leg.output_asset.chain.as_str())
+                .bind(leg.output_asset.asset.as_str())
+                .bind(&leg.amount_in)
+                .bind(&leg.expected_amount_out)
+                .bind(leg.min_amount_out.clone())
+                .bind(leg.actual_amount_in.clone())
+                .bind(leg.actual_amount_out.clone())
+                .bind(leg.started_at)
+                .bind(leg.completed_at)
+                .bind(leg.provider_quote_expires_at)
+                .bind(leg.details.clone())
+                .bind(leg.usd_valuation.clone())
+                .bind(leg.created_at)
+                .bind(leg.updated_at)
+                .fetch_one(&mut *tx)
+                .await?;
+                let materialized_leg = self.map_execution_leg_row(&leg_row)?;
+                ensure_execution_leg_plan_matches(&materialized_leg, &leg)?;
+                leg_id_by_planned_id.insert(planned_leg_id, materialized_leg.id);
+                materialized_legs.push(materialized_leg);
+            }
 
-            let mut step = plan.step;
-            step.order_id = order_id;
-            step.execution_attempt_id = Some(attempt.id);
-            step.execution_leg_id = Some(leg.id);
-            step.status = OrderExecutionStepStatus::Running;
-            step.idempotency_key = Some(format!("attempt:{}:step:{}", attempt.id, step.id));
-            step.attempt_count = step.attempt_count.saturating_add(1);
-            step.started_at = Some(now);
-            step.updated_at = now;
-            let step_row = sqlx_core::query::query(&format!(
-                r#"
-                WITH inserted AS (
-                    INSERT INTO order_execution_steps (
-                        id,
-                        order_id,
-                        execution_attempt_id,
-                        execution_leg_id,
-                        transition_decl_id,
-                        step_index,
-                        step_type,
-                        provider,
-                        status,
-                        input_chain_id,
-                        input_asset_id,
-                        output_chain_id,
-                        output_asset_id,
-                        amount_in,
-                        min_amount_out,
-                        tx_hash,
-                        provider_ref,
-                        idempotency_key,
-                        attempt_count,
-                        next_attempt_at,
-                        started_at,
-                        completed_at,
-                        details_json,
-                        request_json,
-                        response_json,
-                        error_json,
-                        usd_valuation_json,
-                        created_at,
-                        updated_at
+            let single_leg_id = if materialized_legs.len() == 1 {
+                Some(materialized_legs[0].id)
+            } else {
+                None
+            };
+            let mut materialized_steps = Vec::with_capacity(plan.steps.len());
+            for mut step in plan.steps {
+                let materialized_leg_id = match step.execution_leg_id {
+                    Some(planned_leg_id) => leg_id_by_planned_id
+                        .get(&planned_leg_id)
+                        .copied()
+                        .ok_or_else(|| RouterCoreError::InvalidData {
+                            message: format!(
+                                "order {order_id} step {} references unknown execution leg {}",
+                                step.step_index, planned_leg_id
+                            ),
+                        })?,
+                    None => single_leg_id.ok_or_else(|| RouterCoreError::InvalidData {
+                        message: format!(
+                            "order {order_id} step {} has no execution_leg_id in a multi-leg plan",
+                            step.step_index
+                        ),
+                    })?,
+                };
+                step.order_id = order_id;
+                step.execution_attempt_id = Some(attempt.id);
+                step.execution_leg_id = Some(materialized_leg_id);
+                step.status = OrderExecutionStepStatus::Planned;
+                step.idempotency_key = Some(format!("attempt:{}:step:{}", attempt.id, step.id));
+                step.attempt_count = 0;
+                step.started_at = None;
+                step.completed_at = None;
+                step.updated_at = now;
+                let step_row = sqlx_core::query::query(&format!(
+                    r#"
+                    WITH inserted AS (
+                        INSERT INTO order_execution_steps (
+                            id,
+                            order_id,
+                            execution_attempt_id,
+                            execution_leg_id,
+                            transition_decl_id,
+                            step_index,
+                            step_type,
+                            provider,
+                            status,
+                            input_chain_id,
+                            input_asset_id,
+                            output_chain_id,
+                            output_asset_id,
+                            amount_in,
+                            min_amount_out,
+                            tx_hash,
+                            provider_ref,
+                            idempotency_key,
+                            attempt_count,
+                            next_attempt_at,
+                            started_at,
+                            completed_at,
+                            details_json,
+                            request_json,
+                            response_json,
+                            error_json,
+                            usd_valuation_json,
+                            created_at,
+                            updated_at
+                        )
+                        VALUES (
+                            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                            $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
+                            $23, $24, $25, $26, $27, $28, $29
+                        )
+                        ON CONFLICT (execution_attempt_id, step_index)
+                        WHERE execution_attempt_id IS NOT NULL DO NOTHING
+                        RETURNING {EXECUTION_STEP_SELECT_COLUMNS}
                     )
-                    VALUES (
-                        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                        $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
-                        $23, $24, $25, $26, $27, $28, $29
-                    )
-                    ON CONFLICT (execution_attempt_id, step_index)
-                    WHERE execution_attempt_id IS NOT NULL DO NOTHING
-                    RETURNING {EXECUTION_STEP_SELECT_COLUMNS}
-                )
-                SELECT {EXECUTION_STEP_SELECT_COLUMNS}
-                FROM inserted
-                UNION ALL
-                SELECT {EXECUTION_STEP_SELECT_COLUMNS}
-                FROM order_execution_steps
-                WHERE execution_attempt_id = $3
-                  AND step_index = $6
-                LIMIT 1
-                "#
-            ))
-            .bind(step.id)
-            .bind(step.order_id)
-            .bind(step.execution_attempt_id)
-            .bind(step.execution_leg_id)
-            .bind(step.transition_decl_id.clone())
-            .bind(step.step_index)
-            .bind(step.step_type.to_db_string())
-            .bind(&step.provider)
-            .bind(step.status.to_db_string())
-            .bind(step.input_asset.as_ref().map(|asset| asset.chain.as_str()))
-            .bind(step.input_asset.as_ref().map(|asset| asset.asset.as_str()))
-            .bind(step.output_asset.as_ref().map(|asset| asset.chain.as_str()))
-            .bind(step.output_asset.as_ref().map(|asset| asset.asset.as_str()))
-            .bind(step.amount_in.clone())
-            .bind(step.min_amount_out.clone())
-            .bind(step.tx_hash.clone())
-            .bind(step.provider_ref.clone())
-            .bind(step.idempotency_key.clone())
-            .bind(step.attempt_count)
-            .bind(step.next_attempt_at)
-            .bind(step.started_at)
-            .bind(step.completed_at)
-            .bind(step.details.clone())
-            .bind(step.request.clone())
-            .bind(step.response.clone())
-            .bind(step.error.clone())
-            .bind(step.usd_valuation.clone())
-            .bind(step.created_at)
-            .bind(step.updated_at)
-            .fetch_one(&mut *tx)
-            .await?;
-            let step = self.map_execution_step_row(&step_row)?;
+                    SELECT {EXECUTION_STEP_SELECT_COLUMNS}
+                    FROM inserted
+                    UNION ALL
+                    SELECT {EXECUTION_STEP_SELECT_COLUMNS}
+                    FROM order_execution_steps
+                    WHERE execution_attempt_id = $3
+                      AND step_index = $6
+                    LIMIT 1
+                    "#
+                ))
+                .bind(step.id)
+                .bind(step.order_id)
+                .bind(step.execution_attempt_id)
+                .bind(step.execution_leg_id)
+                .bind(step.transition_decl_id.clone())
+                .bind(step.step_index)
+                .bind(step.step_type.to_db_string())
+                .bind(&step.provider)
+                .bind(step.status.to_db_string())
+                .bind(step.input_asset.as_ref().map(|asset| asset.chain.as_str()))
+                .bind(step.input_asset.as_ref().map(|asset| asset.asset.as_str()))
+                .bind(step.output_asset.as_ref().map(|asset| asset.chain.as_str()))
+                .bind(step.output_asset.as_ref().map(|asset| asset.asset.as_str()))
+                .bind(step.amount_in.clone())
+                .bind(step.min_amount_out.clone())
+                .bind(step.tx_hash.clone())
+                .bind(step.provider_ref.clone())
+                .bind(step.idempotency_key.clone())
+                .bind(step.attempt_count)
+                .bind(step.next_attempt_at)
+                .bind(step.started_at)
+                .bind(step.completed_at)
+                .bind(step.details.clone())
+                .bind(step.request.clone())
+                .bind(step.response.clone())
+                .bind(step.error.clone())
+                .bind(step.usd_valuation.clone())
+                .bind(step.created_at)
+                .bind(step.updated_at)
+                .fetch_one(&mut *tx)
+                .await?;
+                let materialized_step = self.map_execution_step_row(&step_row)?;
+                ensure_execution_step_plan_matches(&materialized_step, &step)?;
+                materialized_steps.push(materialized_step);
+            }
+            materialized_legs.sort_by_key(|leg| (leg.leg_index, leg.created_at, leg.id));
+            materialized_steps.sort_by_key(|step| (step.step_index, step.created_at, step.id));
 
             let order_row = sqlx_core::query::query(&format!(
                 r#"
@@ -1782,20 +1827,75 @@ impl OrderRepository {
             let order = self.map_order_row(&order_row)?;
 
             tx.commit().await?;
-            Ok::<SingleStepExecutionStartRecord, RouterCoreError>(SingleStepExecutionStartRecord {
-                order,
-                attempt,
-                leg,
-                step,
-            })
+            Ok::<ExecutionAttemptMaterializationRecord, RouterCoreError>(
+                ExecutionAttemptMaterializationRecord {
+                    order,
+                    attempt,
+                    legs: materialized_legs,
+                    steps: materialized_steps,
+                },
+            )
         }
         .await;
         telemetry::record_db_query(
-            "order.persist_single_step_execution_start",
+            "order.materialize_primary_execution_attempt",
             result.is_ok(),
             started.elapsed(),
         );
         result
+    }
+
+    pub async fn persist_execution_step_ready_to_fire(
+        &self,
+        order_id: Uuid,
+        attempt_id: Uuid,
+        step_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> RouterCoreResult<OrderExecutionStep> {
+        let started = Instant::now();
+        let result = sqlx_core::query::query(&format!(
+            r#"
+            WITH updated AS (
+                UPDATE order_execution_steps
+                SET
+                    status = 'running',
+                    attempt_count = attempt_count + 1,
+                    started_at = COALESCE(started_at, $4),
+                    updated_at = $4
+                WHERE id = $1
+                  AND order_id = $2
+                  AND execution_attempt_id = $3
+                  AND status IN ('planned', 'ready')
+                RETURNING {EXECUTION_STEP_SELECT_COLUMNS}
+            )
+            SELECT {EXECUTION_STEP_SELECT_COLUMNS}
+            FROM updated
+            UNION ALL
+            SELECT {EXECUTION_STEP_SELECT_COLUMNS}
+            FROM order_execution_steps
+            WHERE id = $1
+              AND order_id = $2
+              AND execution_attempt_id = $3
+              AND status IN ('running', 'waiting', 'completed')
+              AND NOT EXISTS (SELECT 1 FROM updated)
+            LIMIT 1
+            "#
+        ))
+        .bind(step_id)
+        .bind(order_id)
+        .bind(attempt_id)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await;
+        telemetry::record_db_query(
+            "order.persist_execution_step_ready_to_fire",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        let row = result?;
+        let step = self.map_execution_step_row(&row)?;
+        self.refresh_execution_leg_for_step(&step).await?;
+        Ok(step)
     }
 
     pub async fn create_refreshed_execution_attempt(
@@ -4547,7 +4647,7 @@ impl OrderRepository {
         Ok(step)
     }
 
-    pub async fn persist_single_step_completion(
+    pub async fn persist_execution_step_completion(
         &self,
         input: PersistStepCompletionRecord,
     ) -> RouterCoreResult<StepCompletionRecord> {
@@ -4813,19 +4913,19 @@ impl OrderRepository {
         }
         .await;
         telemetry::record_db_query(
-            "order.persist_single_step_completion",
+            "order.persist_execution_step_completion",
             result.is_ok(),
             started.elapsed(),
         );
         result
     }
 
-    pub async fn mark_single_step_order_completed(
+    pub async fn mark_execution_order_completed(
         &self,
         order_id: Uuid,
         attempt_id: Uuid,
         now: DateTime<Utc>,
-    ) -> RouterCoreResult<CompletedSingleStepOrder> {
+    ) -> RouterCoreResult<CompletedExecutionOrder> {
         let started = Instant::now();
         let result = async {
             let mut tx = self.pool.begin().await?;
@@ -4944,14 +5044,14 @@ impl OrderRepository {
             let attempt = self.map_execution_attempt_row(&attempt_row)?;
 
             tx.commit().await?;
-            Ok::<CompletedSingleStepOrder, RouterCoreError>(CompletedSingleStepOrder {
+            Ok::<CompletedExecutionOrder, RouterCoreError>(CompletedExecutionOrder {
                 order,
                 attempt,
             })
         }
         .await;
         telemetry::record_db_query(
-            "order.mark_single_step_order_completed",
+            "order.mark_execution_order_completed",
             result.is_ok(),
             started.elapsed(),
         );
@@ -5813,9 +5913,6 @@ fn ensure_execution_step_plan_matches(
     }
     if existing.provider_ref != planned.provider_ref {
         mismatches.push("provider_ref");
-    }
-    if existing.idempotency_key != planned.idempotency_key {
-        mismatches.push("idempotency_key");
     }
     if existing.details != planned.details {
         mismatches.push("details");

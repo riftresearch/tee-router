@@ -1,15 +1,15 @@
 #![allow(dead_code)]
 
-// Activity function constants are intentionally registered before PR3 workflow logic invokes them.
+// Activity function constants are registered before the later rewrite slices invoke them.
 use std::sync::Arc;
 
 use chrono::Utc;
 use router_core::{
-    db::{Database, PersistStepCompletionRecord, SingleStepExecutionStartPlan},
+    db::{Database, ExecutionAttemptPlan, PersistStepCompletionRecord},
     error::{RouterCoreError, RouterCoreResult},
     models::{
-        OrderExecutionStep, OrderExecutionStepType, OrderProviderAddress, OrderProviderOperation,
-        ProviderOperationStatus, RouterOrderQuote,
+        OrderExecutionStep, OrderExecutionStepStatus, OrderExecutionStepType, OrderProviderAddress,
+        OrderProviderOperation, ProviderOperationStatus, RouterOrderQuote,
     },
     services::{
         action_providers::{
@@ -30,19 +30,18 @@ use uuid::Uuid;
 use super::types::{
     AcrossOnchainLogRecovered, BoundaryPersisted, CancelTimedOutHyperliquidTradeInput,
     ClassifyStepFailureInput, ComposeRefreshedQuoteAttemptInput, DiscoverSingleRefundPositionInput,
-    DispatchStepProviderActionInput, ExecuteStepInput, ExecutionStartPersisted,
-    FailedAttemptSnapshotWritten, FinalizeOrderOrRefundInput, FinalizedOrder,
-    HyperliquidTradeCancelRecorded, LoadOrderExecutionStateInput, LoadOrderInput, LoadedOrder,
-    MarkOrderCompletedInput, MaterializeExecutionAttemptInput, MaterializeRefreshedAttemptInput,
-    MaterializeRefundPlanInput, MaterializedExecutionAttempt, OrderCompleted, OrderExecutionState,
-    PersistExecutionStartInput, PersistProviderOperationStatusInput, PersistProviderReceiptInput,
-    PersistStepCompletionInput, PersistStepFailedInput, PersistStepReadyToFireInput,
-    PersistStepTerminalStatusInput, PollProviderOperationHintsInput, ProviderActionDispatchShape,
-    ProviderOperationHintVerified, ProviderOperationHintsPolled, RecoverAcrossOnchainLogInput,
-    RefreshedAttemptMaterialized, RefreshedQuoteAttemptShape, RefundPlanShape,
-    SettleProviderStepInput, SingleRefundPosition, SingleStepExecutionPlan,
-    StepCompletionPersisted, StepExecuted, StepExecutionOutcome, StepFailureDecision,
-    VerifyProviderOperationHintInput, WriteFailedAttemptSnapshotInput,
+    DispatchStepProviderActionInput, ExecuteStepInput, ExecutionPlan, FailedAttemptSnapshotWritten,
+    FinalizeOrderOrRefundInput, FinalizedOrder, HyperliquidTradeCancelRecorded,
+    LoadOrderExecutionStateInput, MarkOrderCompletedInput, MaterializeExecutionAttemptInput,
+    MaterializeRefreshedAttemptInput, MaterializeRefundPlanInput, MaterializedExecutionAttempt,
+    OrderCompleted, OrderExecutionState, OrderWorkflowPhase, PersistProviderOperationStatusInput,
+    PersistProviderReceiptInput, PersistStepFailedInput, PersistStepReadyToFireInput,
+    PersistStepTerminalStatusInput, PersistenceBoundary, PollProviderOperationHintsInput,
+    ProviderActionDispatchShape, ProviderOperationHintVerified, ProviderOperationHintsPolled,
+    RecoverAcrossOnchainLogInput, RefreshedAttemptMaterialized, RefreshedQuoteAttemptShape,
+    RefundPlanShape, SettleProviderStepInput, SingleRefundPosition, StepExecuted,
+    StepExecutionOutcome, StepFailureDecision, VerifyProviderOperationHintInput,
+    WorkflowExecutionStep, WriteFailedAttemptSnapshotInput,
 };
 
 #[derive(Clone)]
@@ -92,13 +91,78 @@ impl OrderActivities {
 
 #[activities]
 impl OrderActivities {
-    /// Scar tissue: §3 phase pass and §4 order/vault/step state alignment.
+    /// Scar tissue: §13 step type dispatch provider trait family mapping.
     #[activity]
-    pub async fn load_order(
+    pub async fn execute_step(
         self: Arc<Self>,
         _ctx: ActivityContext,
-        input: LoadOrderInput,
-    ) -> Result<LoadedOrder, ActivityError> {
+        input: ExecuteStepInput,
+    ) -> Result<StepExecuted, ActivityError> {
+        let deps = self.deps()?;
+        let step = deps
+            .db
+            .orders()
+            .get_execution_step(input.step_id)
+            .await
+            .map_err(activity_error_from_display)?;
+        if step.order_id != input.order_id || step.execution_attempt_id != Some(input.attempt_id) {
+            return Err(activity_error(format!(
+                "step {} does not belong to order {} attempt {}",
+                step.id, input.order_id, input.attempt_id
+            )));
+        }
+        if step.status != OrderExecutionStepStatus::Running {
+            return Err(activity_error(format!(
+                "step {} must be running before provider execution, got {}",
+                step.id,
+                step.status.to_db_string()
+            )));
+        }
+        let completion = execute_running_step(&deps, &step).await?;
+        Ok(StepExecuted {
+            order_id: input.order_id,
+            attempt_id: input.attempt_id,
+            step_id: input.step_id,
+            response: completion.response,
+            tx_hash: completion.tx_hash,
+            provider_state: completion.provider_state,
+            outcome: completion.outcome,
+        })
+    }
+
+    /// Scar tissue: §16.3 order finalisation and custody lifecycle.
+    #[activity]
+    pub async fn mark_order_completed(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: MarkOrderCompletedInput,
+    ) -> Result<OrderCompleted, ActivityError> {
+        let deps = self.deps()?;
+        let completed = deps
+            .db
+            .orders()
+            .mark_execution_order_completed(input.order_id, input.attempt_id, Utc::now())
+            .await
+            .map_err(activity_error_from_display)?;
+        tracing::info!(
+            order_id = %completed.order.id,
+            attempt_id = %completed.attempt.id,
+            event_name = "order.completed",
+            "order.completed"
+        );
+        Ok(OrderCompleted {
+            order_id: completed.order.id,
+            attempt_id: completed.attempt.id,
+        })
+    }
+
+    /// Scar tissue: §3 phase pass and §4 order/vault/step state alignment.
+    #[activity]
+    pub async fn load_order_execution_state(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: LoadOrderExecutionStateInput,
+    ) -> Result<OrderExecutionState, ActivityError> {
         let deps = self.deps()?;
         let order = deps
             .db
@@ -135,9 +199,10 @@ impl OrderActivities {
                 .plan_limit_order(&order, &source_vault, &quote, planned_at)
                 .map_err(activity_error_from_display)?,
         };
-        if route.legs.len() != 1 || route.steps.len() != 1 {
+        if route.legs.is_empty() || route.steps.is_empty() {
             return Err(activity_error(format!(
-                "PR3 OrderWorkflow requires exactly one leg and one step, got {} legs and {} steps",
+                "order {} execution plan has {} legs and {} steps",
+                order.id,
                 route.legs.len(),
                 route.steps.len()
             )));
@@ -145,40 +210,43 @@ impl OrderActivities {
 
         tracing::info!(
             order_id = %order.id,
+            path_id = %route.path_id,
+            leg_count = route.legs.len(),
+            step_count = route.steps.len(),
             event_name = "order.execution_plan_started",
             "order.execution_plan_started"
         );
-        let leg = route.legs.into_iter().next().expect("len checked");
-        let step = route.steps.into_iter().next().expect("len checked");
-        Ok(LoadedOrder {
+        Ok(OrderExecutionState {
+            order_id: order.id,
+            phase: OrderWorkflowPhase::WaitingForFunding,
+            active_attempt_id: None,
+            active_step_id: None,
             order,
-            plan: SingleStepExecutionPlan {
+            plan: ExecutionPlan {
                 path_id: route.path_id,
                 transition_decl_ids: route.transition_decl_ids,
-                leg,
-                step,
+                legs: route.legs,
+                steps: route.steps,
             },
         })
     }
 
     /// Scar tissue: §2.1 `AfterExecutionLegsPersisted`, §3 phase 2, and §4 state alignment.
-    /// This happy-path composite composes brief §5 `materialise_plan` + `record_attempt` +
-    /// `transition_order_status(Funded→Executing)` for the single-step case.
     #[activity]
-    pub async fn persist_execution_start(
+    pub async fn materialize_execution_attempt(
         self: Arc<Self>,
         _ctx: ActivityContext,
-        input: PersistExecutionStartInput,
-    ) -> Result<ExecutionStartPersisted, ActivityError> {
+        input: MaterializeExecutionAttemptInput,
+    ) -> Result<MaterializedExecutionAttempt, ActivityError> {
         let deps = self.deps()?;
         let record = deps
             .db
             .orders()
-            .persist_single_step_execution_start(
+            .materialize_primary_execution_attempt(
                 input.order_id,
-                SingleStepExecutionStartPlan {
-                    leg: input.plan.leg,
-                    step: input.plan.step,
+                ExecutionAttemptPlan {
+                    legs: input.plan.legs,
+                    steps: input.plan.steps,
                 },
                 Utc::now(),
             )
@@ -187,8 +255,8 @@ impl OrderActivities {
         tracing::info!(
             order_id = %record.order.id,
             attempt_id = %record.attempt.id,
-            step_id = %record.step.id,
-            leg_id = %record.leg.id,
+            leg_count = record.legs.len(),
+            step_count = record.steps.len(),
             event_name = "order.execution_plan_materialized",
             "order.execution_plan_materialized"
         );
@@ -197,160 +265,49 @@ impl OrderActivities {
             event_name = "order.executing",
             "order.executing"
         );
+        Ok(MaterializedExecutionAttempt {
+            attempt_id: record.attempt.id,
+            steps: record
+                .steps
+                .into_iter()
+                .map(|step| WorkflowExecutionStep {
+                    step_id: step.id,
+                    step_index: step.step_index,
+                })
+                .collect(),
+        })
+    }
+
+    /// Scar tissue: §2.1 `AfterExecutionLegsPersisted`.
+    #[activity]
+    pub async fn persist_step_ready_to_fire(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: PersistStepReadyToFireInput,
+    ) -> Result<BoundaryPersisted, ActivityError> {
+        let deps = self.deps()?;
+        let step = deps
+            .db
+            .orders()
+            .persist_execution_step_ready_to_fire(
+                input.order_id,
+                input.attempt_id,
+                input.step_id,
+                Utc::now(),
+            )
+            .await
+            .map_err(activity_error_from_display)?;
         tracing::info!(
-            order_id = %record.order.id,
-            step_id = %record.step.id,
+            order_id = %input.order_id,
+            attempt_id = %input.attempt_id,
+            step_id = %step.id,
+            step_index = step.step_index,
             event_name = "execution_step.started",
             "execution_step.started"
         );
-        Ok(ExecutionStartPersisted {
-            order_id: record.order.id,
-            attempt_id: record.attempt.id,
-            step_id: record.step.id,
+        Ok(BoundaryPersisted {
+            boundary: PersistenceBoundary::AfterExecutionLegsPersisted,
         })
-    }
-
-    /// Scar tissue: §13 step type dispatch provider trait family mapping.
-    #[activity]
-    pub async fn execute_step(
-        self: Arc<Self>,
-        _ctx: ActivityContext,
-        input: ExecuteStepInput,
-    ) -> Result<StepExecuted, ActivityError> {
-        let deps = self.deps()?;
-        let step = deps
-            .db
-            .orders()
-            .get_execution_step(input.step_id)
-            .await
-            .map_err(activity_error_from_display)?;
-        if step.order_id != input.order_id || step.execution_attempt_id != Some(input.attempt_id) {
-            return Err(activity_error(format!(
-                "step {} does not belong to order {} attempt {}",
-                step.id, input.order_id, input.attempt_id
-            )));
-        }
-        let completion = execute_running_step(&deps, &step).await?;
-        Ok(StepExecuted {
-            order_id: input.order_id,
-            attempt_id: input.attempt_id,
-            step_id: input.step_id,
-            response: completion.response,
-            tx_hash: completion.tx_hash,
-            provider_state: completion.provider_state,
-            outcome: completion.outcome,
-        })
-    }
-
-    /// Scar tissue: §2.3 `AfterExecutionStepStatusPersisted`. For the PR3 single-step happy path
-    /// this absorbs §2.4 and §2.6 because provider receipt, provider terminal state, and step
-    /// completion commit in one Postgres transaction.
-    #[activity]
-    pub async fn persist_step_completion(
-        self: Arc<Self>,
-        _ctx: ActivityContext,
-        input: PersistStepCompletionInput,
-    ) -> Result<StepCompletionPersisted, ActivityError> {
-        let deps = self.deps()?;
-        let step = deps
-            .db
-            .orders()
-            .get_execution_step(input.execution.step_id)
-            .await
-            .map_err(activity_error_from_display)?;
-        let (operation, addresses) = provider_state_records(
-            &step,
-            &input.execution.provider_state,
-            &input.execution.response,
-        )
-        .map_err(activity_error_from_display)?;
-        let record = deps
-            .db
-            .orders()
-            .persist_single_step_completion(PersistStepCompletionRecord {
-                step_id: input.execution.step_id,
-                operation,
-                addresses,
-                response: input.execution.response,
-                tx_hash: input.execution.tx_hash,
-                usd_valuation: json!({}),
-                completed_at: Utc::now(),
-            })
-            .await
-            .map_err(activity_error_from_display)?;
-        if let Some(provider_operation_id) = record.provider_operation_id {
-            tracing::info!(
-                order_id = %input.execution.order_id,
-                provider_operation_id = %provider_operation_id,
-                event_name = "provider_operation.persisted",
-                "provider_operation.persisted"
-            );
-        }
-        tracing::info!(
-            order_id = %input.execution.order_id,
-            step_id = %record.step.id,
-            event_name = "execution_step.completed",
-            "execution_step.completed"
-        );
-        Ok(StepCompletionPersisted {
-            order_id: input.execution.order_id,
-            attempt_id: input.execution.attempt_id,
-            step_id: record.step.id,
-        })
-    }
-
-    /// Scar tissue: §16.3 order finalisation and custody lifecycle.
-    #[activity]
-    pub async fn mark_order_completed(
-        self: Arc<Self>,
-        _ctx: ActivityContext,
-        input: MarkOrderCompletedInput,
-    ) -> Result<OrderCompleted, ActivityError> {
-        let deps = self.deps()?;
-        let completed = deps
-            .db
-            .orders()
-            .mark_single_step_order_completed(input.order_id, input.attempt_id, Utc::now())
-            .await
-            .map_err(activity_error_from_display)?;
-        tracing::info!(
-            order_id = %completed.order.id,
-            attempt_id = %completed.attempt.id,
-            event_name = "order.completed",
-            "order.completed"
-        );
-        Ok(OrderCompleted {
-            order_id: completed.order.id,
-            attempt_id: completed.attempt.id,
-        })
-    }
-
-    /// Scar tissue: §3 phase pass and §4 order/vault/step state alignment.
-    #[activity]
-    pub async fn load_order_execution_state(
-        _ctx: ActivityContext,
-        _input: LoadOrderExecutionStateInput,
-    ) -> Result<OrderExecutionState, ActivityError> {
-        todo!("PR3: load canonical order execution state from Postgres")
-    }
-
-    /// Scar tissue: §3 phase 2 and §4 state alignment.
-    #[activity]
-    pub async fn materialize_execution_attempt(
-        _ctx: ActivityContext,
-        _input: MaterializeExecutionAttemptInput,
-    ) -> Result<MaterializedExecutionAttempt, ActivityError> {
-        todo!("PR3: materialize the execution attempt")
-    }
-
-    /// Scar tissue: §2 boundary 1, `AfterStepMarkedReadyToFire`.
-    #[activity]
-    pub async fn persist_step_ready_to_fire(
-        _ctx: ActivityContext,
-        _input: PersistStepReadyToFireInput,
-    ) -> Result<BoundaryPersisted, ActivityError> {
-        // TODO(PR3, brief §6 invariant 1; scar §2): keep this as its own activity call.
-        todo!("PR3: persist boundary 1")
     }
 
     /// Scar tissue: §2 boundary 2, `AfterStepMarkedFailed`.
@@ -359,8 +316,8 @@ impl OrderActivities {
         _ctx: ActivityContext,
         _input: PersistStepFailedInput,
     ) -> Result<BoundaryPersisted, ActivityError> {
-        // TODO(PR3, brief §6 invariant 1; scar §2): keep this as its own activity call.
-        todo!("PR3: persist boundary 2")
+        // TODO(PR4b, brief §6 invariant 1; scar §2): keep this as its own activity call.
+        todo!("PR4b: persist boundary 2")
     }
 
     /// Scar tissue: §2 boundary 3, `AfterExecutionStepStatusPersisted`.
@@ -369,38 +326,142 @@ impl OrderActivities {
         _ctx: ActivityContext,
         _input: PersistStepTerminalStatusInput,
     ) -> Result<BoundaryPersisted, ActivityError> {
-        // TODO(PR3, brief §6 invariant 1; scar §2): keep this as its own activity call.
-        todo!("PR3: persist boundary 3")
+        // TODO(PR4b, brief §6 invariant 1; scar §2): keep this as its own activity call.
+        todo!("PR4b: persist boundary 3")
     }
 
     /// Scar tissue: §2 boundary 4, `AfterProviderReceiptPersisted`.
     #[activity]
     pub async fn persist_provider_receipt(
+        self: Arc<Self>,
         _ctx: ActivityContext,
-        _input: PersistProviderReceiptInput,
+        input: PersistProviderReceiptInput,
     ) -> Result<BoundaryPersisted, ActivityError> {
-        // TODO(PR3, brief §6 invariant 1; scar §2): keep this as its own activity call.
-        todo!("PR3: persist boundary 4")
+        let deps = self.deps()?;
+        let step = deps
+            .db
+            .orders()
+            .get_execution_step(input.execution.step_id)
+            .await
+            .map_err(activity_error_from_display)?;
+        let (operation, mut addresses) = provider_state_records(
+            &step,
+            &input.execution.provider_state,
+            &input.execution.response,
+        )
+        .map_err(activity_error_from_display)?;
+        if let Some(mut operation) = operation {
+            operation.status = receipt_boundary_status(operation.status);
+            let provider_operation_id = deps
+                .db
+                .orders()
+                .upsert_provider_operation(&operation)
+                .await
+                .map_err(activity_error_from_display)?;
+            for address in &mut addresses {
+                address.provider_operation_id = Some(provider_operation_id);
+                deps.db
+                    .orders()
+                    .upsert_provider_address(address)
+                    .await
+                    .map_err(activity_error_from_display)?;
+            }
+            tracing::info!(
+                order_id = %input.execution.order_id,
+                provider_operation_id = %provider_operation_id,
+                event_name = "provider_operation.persisted",
+                "provider_operation.persisted"
+            );
+        }
+        Ok(BoundaryPersisted {
+            boundary: PersistenceBoundary::AfterProviderReceiptPersisted,
+        })
     }
 
     /// Scar tissue: §2 boundary 5, `AfterProviderOperationStatusPersisted`.
     #[activity]
     pub async fn persist_provider_operation_status(
+        self: Arc<Self>,
         _ctx: ActivityContext,
-        _input: PersistProviderOperationStatusInput,
+        input: PersistProviderOperationStatusInput,
     ) -> Result<BoundaryPersisted, ActivityError> {
-        // TODO(PR3, brief §6 invariant 1; scar §2): keep this as its own activity call.
-        todo!("PR3: persist boundary 5")
+        let deps = self.deps()?;
+        let step = deps
+            .db
+            .orders()
+            .get_execution_step(input.execution.step_id)
+            .await
+            .map_err(activity_error_from_display)?;
+        let (operation, _) = provider_state_records(
+            &step,
+            &input.execution.provider_state,
+            &input.execution.response,
+        )
+        .map_err(activity_error_from_display)?;
+        if let Some(operation) = operation {
+            let provider_operation_id = deps
+                .db
+                .orders()
+                .upsert_provider_operation(&operation)
+                .await
+                .map_err(activity_error_from_display)?;
+            let _ = deps
+                .db
+                .orders()
+                .update_provider_operation_status(
+                    provider_operation_id,
+                    operation.status,
+                    operation.provider_ref,
+                    operation.observed_state,
+                    Some(operation.response),
+                    Utc::now(),
+                )
+                .await
+                .map_err(activity_error_from_display)?;
+        }
+        Ok(BoundaryPersisted {
+            boundary: PersistenceBoundary::AfterProviderOperationStatusPersisted,
+        })
     }
 
     /// Scar tissue: §2 boundary 6, `AfterProviderStepSettlement`.
     #[activity]
     pub async fn settle_provider_step(
+        self: Arc<Self>,
         _ctx: ActivityContext,
-        _input: SettleProviderStepInput,
+        input: SettleProviderStepInput,
     ) -> Result<BoundaryPersisted, ActivityError> {
-        // TODO(PR3, brief §6 invariant 1; scar §2): keep this as its own activity call.
-        todo!("PR3: persist boundary 6")
+        if input.execution.outcome == StepExecutionOutcome::Waiting {
+            return Err(activity_error(format!(
+                "step {} is waiting for provider observation; PR7 adds the observation/recovery path",
+                input.execution.step_id
+            )));
+        }
+        let deps = self.deps()?;
+        let record = deps
+            .db
+            .orders()
+            .persist_execution_step_completion(PersistStepCompletionRecord {
+                step_id: input.execution.step_id,
+                operation: None,
+                addresses: Vec::new(),
+                response: input.execution.response,
+                tx_hash: input.execution.tx_hash,
+                usd_valuation: json!({}),
+                completed_at: Utc::now(),
+            })
+            .await
+            .map_err(activity_error_from_display)?;
+        tracing::info!(
+            order_id = %input.execution.order_id,
+            attempt_id = %input.execution.attempt_id,
+            step_id = %record.step.id,
+            event_name = "execution_step.completed",
+            "execution_step.completed"
+        );
+        Ok(BoundaryPersisted {
+            boundary: PersistenceBoundary::AfterProviderStepSettlement,
+        })
     }
 
     /// Scar tissue: §5 retry/refund decision and §7 stale quote branch.
@@ -465,7 +526,7 @@ async fn execute_running_step(
     let intent = match step.step_type {
         OrderExecutionStepType::WaitForDeposit | OrderExecutionStepType::Refund => {
             return Err(activity_error(format!(
-                "{} is not executable in PR3 OrderWorkflow",
+                "{} is not executable in PR4a OrderWorkflow",
                 step.step_type.to_db_string()
             )));
         }
@@ -796,6 +857,15 @@ fn provider_operation_outcome(
     }
 }
 
+fn receipt_boundary_status(status: ProviderOperationStatus) -> ProviderOperationStatus {
+    match status {
+        ProviderOperationStatus::Completed
+        | ProviderOperationStatus::Failed
+        | ProviderOperationStatus::Expired => ProviderOperationStatus::Submitted,
+        status => status,
+    }
+}
+
 fn provider_only_outcome(
     step: &OrderExecutionStep,
     operation: Option<&ProviderOperationIntent>,
@@ -927,7 +997,7 @@ impl ProviderObservationActivities {
         _ctx: ActivityContext,
         _input: VerifyProviderOperationHintInput,
     ) -> Result<ProviderOperationHintVerified, ActivityError> {
-        todo!("PR3: verify provider operation hint against provider API")
+        todo!("PR7: verify provider operation hint against provider API")
     }
 
     /// Scar tissue: §10 provider hint recovery. This is the polling half of the user-approved
@@ -937,7 +1007,7 @@ impl ProviderObservationActivities {
         _ctx: ActivityContext,
         _input: PollProviderOperationHintsInput,
     ) -> Result<ProviderOperationHintsPolled, ActivityError> {
-        todo!("PR3: poll provider hints as a fallback to signals")
+        todo!("PR7: poll provider hints as a fallback to signals")
     }
 
     /// Scar tissue: §11 Across on-chain log recovery.
@@ -969,6 +1039,6 @@ impl StepDispatchActivities {
         _ctx: ActivityContext,
         _input: DispatchStepProviderActionInput,
     ) -> Result<ProviderActionDispatchShape, ActivityError> {
-        todo!("PR3: dispatch provider action for the active step")
+        todo!("PR7: dispatch provider action for the active step")
     }
 }
