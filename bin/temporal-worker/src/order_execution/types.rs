@@ -1,4 +1,9 @@
+use router_core::{
+    models::{OrderExecutionLeg, OrderExecutionStep, RouterOrder},
+    services::ProviderExecutionState,
+};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use uuid::Uuid;
 
 pub type WorkflowOrderId = Uuid;
@@ -17,6 +22,86 @@ pub struct OrderWorkflowInput {
 pub struct OrderWorkflowOutput {
     pub order_id: WorkflowOrderId,
     pub terminal_status: OrderTerminalStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoadOrderInput {
+    pub order_id: WorkflowOrderId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoadedOrder {
+    pub order: RouterOrder,
+    pub plan: SingleStepExecutionPlan,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SingleStepExecutionPlan {
+    pub path_id: String,
+    pub transition_decl_ids: Vec<String>,
+    pub leg: OrderExecutionLeg,
+    pub step: OrderExecutionStep,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistExecutionStartInput {
+    pub order_id: WorkflowOrderId,
+    pub plan: SingleStepExecutionPlan,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionStartPersisted {
+    pub order_id: WorkflowOrderId,
+    pub attempt_id: WorkflowAttemptId,
+    pub step_id: WorkflowStepId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecuteStepInput {
+    pub order_id: WorkflowOrderId,
+    pub attempt_id: WorkflowAttemptId,
+    pub step_id: WorkflowStepId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StepExecuted {
+    pub order_id: WorkflowOrderId,
+    pub attempt_id: WorkflowAttemptId,
+    pub step_id: WorkflowStepId,
+    pub response: Value,
+    pub tx_hash: Option<String>,
+    pub provider_state: ProviderExecutionState,
+    pub outcome: StepExecutionOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StepExecutionOutcome {
+    Completed,
+    Waiting,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistStepCompletionInput {
+    pub execution: StepExecuted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StepCompletionPersisted {
+    pub order_id: WorkflowOrderId,
+    pub attempt_id: WorkflowAttemptId,
+    pub step_id: WorkflowStepId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarkOrderCompletedInput {
+    pub order_id: WorkflowOrderId,
+    pub attempt_id: WorkflowAttemptId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderCompleted {
+    pub order_id: WorkflowOrderId,
+    pub attempt_id: WorkflowAttemptId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

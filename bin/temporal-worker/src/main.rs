@@ -1,9 +1,9 @@
-mod order_execution;
-mod runtime;
-mod spike;
-
 use clap::{Parser, Subcommand};
-use runtime::{TemporalConnection, WorkerResult};
+use temporal_worker::{
+    order_execution,
+    runtime::{TemporalConnection, WorkerResult},
+    spike,
+};
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_TEMPORAL_ADDRESS: &str = "http://127.0.0.1:7233";
