@@ -4,7 +4,7 @@ use alloy::consensus::Transaction as _;
 use alloy::network::{EthereumWallet, TransactionBuilder};
 use alloy::primitives::{Address, Bytes, TxHash, U256};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
-use alloy::rpc::types::{Log as RpcLog, TransactionReceipt, TransactionRequest};
+use alloy::rpc::types::{Filter, Log as RpcLog, TransactionReceipt, TransactionRequest};
 use alloy::signers::local::{LocalSigner, PrivateKeySigner};
 use alloy::{hex, sol};
 use async_trait::async_trait;
@@ -234,6 +234,31 @@ impl EvmChain {
         .await
         .map_err(|e| crate::Error::DumpToAddress {
             message: format!("Failed to get token decimals: {e}"),
+        })
+    }
+
+    pub async fn transaction_receipt(&self, tx_hash: &str) -> Result<Option<TransactionReceipt>> {
+        let tx_hash = TxHash::from_str(tx_hash).map_err(|_| crate::Error::Serialization {
+            message: "Invalid transaction hash".to_string(),
+        })?;
+        retry_evm_rpc(self.chain_type, "get_transaction_receipt", || async {
+            self.provider.get_transaction_receipt(tx_hash).await
+        })
+        .await
+        .map_err(|e| crate::Error::EVMRpcError {
+            source: e,
+            loc: location!(),
+        })
+    }
+
+    pub async fn logs(&self, filter: &Filter) -> Result<Vec<RpcLog>> {
+        retry_evm_rpc(self.chain_type, "get_logs", || async {
+            self.provider.get_logs(filter).await
+        })
+        .await
+        .map_err(|e| crate::Error::EVMRpcError {
+            source: e,
+            loc: location!(),
         })
     }
 

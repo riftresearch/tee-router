@@ -251,6 +251,19 @@ fn bitcoin_p2wpkh_transfer_fee_sats(
         })
 }
 
+fn bitcoin_transfer_fee_sats(estimated_fee_sats: u64, fee_budget: Option<U256>) -> Result<u64> {
+    let Some(fee_budget) = fee_budget else {
+        return Ok(estimated_fee_sats);
+    };
+    let budget_sats = u256_to_u64_sats("bitcoin_fee_budget_sats", fee_budget)?;
+    if budget_sats == 0 {
+        return Err(crate::Error::DumpToAddress {
+            message: "bitcoin_fee_budget_sats must be positive".to_string(),
+        });
+    }
+    Ok(estimated_fee_sats.min(budget_sats))
+}
+
 fn fee_rate_btc_per_kb_to_sat_per_vb(fee_rate_btc_per_kb: f64) -> Result<u64> {
     if !fee_rate_btc_per_kb.is_finite() || fee_rate_btc_per_kb <= 0.0 {
         return Err(crate::Error::Serialization {
@@ -653,11 +666,34 @@ impl BitcoinChain {
         })
     }
 
+    pub async fn spendable_outpoint_value_sats(
+        &self,
+        sender_address: &str,
+        tx_hash: &str,
+        vout: u32,
+        expected_amount_sats: u64,
+    ) -> Result<u64> {
+        let sender_address = parse_bitcoin_address_for_network(sender_address, self.network)?;
+        match self
+            .spendable_output_from_outpoint(&sender_address, tx_hash, vout, expected_amount_sats)
+            .await
+        {
+            Ok(output) => Ok(output.output.value.to_sat()),
+            Err(crate::Error::DumpToAddress { message })
+                if message.contains(" is not spendable") =>
+            {
+                Ok(0)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     pub async fn transfer_native_amount_from_outpoint(
         &self,
         private_key: &str,
         recipient_address: &str,
         amount: U256,
+        fee_budget: Option<U256>,
         tx_hash: &str,
         vout: u32,
         expected_amount_sats: u64,
@@ -681,7 +717,10 @@ impl BitcoinChain {
             .await?;
 
         let total_in = utxo.value_sats();
-        let fee_sats = self.estimate_p2wpkh_transfer_fee_sats(1, 2).await?;
+        let fee_sats = bitcoin_transfer_fee_sats(
+            self.estimate_p2wpkh_transfer_fee_sats(1, 2).await?,
+            fee_budget,
+        )?;
         let required_sats =
             amount_sats
                 .checked_add(fee_sats)
@@ -1047,6 +1086,7 @@ impl BitcoinChain {
         private_key: &str,
         recipient_address: &str,
         amount: U256,
+        fee_budget: Option<U256>,
     ) -> Result<String> {
         let amount_sats = u256_to_u64_sats("amount", amount)?;
         if amount_sats == 0 {
@@ -1077,9 +1117,11 @@ impl BitcoinChain {
             utxos.iter().map(BitcoinSpendableOutput::value_sats),
             "bitcoin transfer input total",
         )?;
-        let mut fee_sats = self
-            .estimate_p2wpkh_transfer_fee_sats(utxos.len(), 2)
-            .await?;
+        let mut fee_sats = bitcoin_transfer_fee_sats(
+            self.estimate_p2wpkh_transfer_fee_sats(utxos.len(), 2)
+                .await?,
+            fee_budget,
+        )?;
         let mut required_sats =
             amount_sats
                 .checked_add(fee_sats)
@@ -1096,9 +1138,11 @@ impl BitcoinChain {
                 utxos.iter().map(BitcoinSpendableOutput::value_sats),
                 "bitcoin transfer input total",
             )?;
-            fee_sats = self
-                .estimate_p2wpkh_transfer_fee_sats(utxos.len(), 2)
-                .await?;
+            fee_sats = bitcoin_transfer_fee_sats(
+                self.estimate_p2wpkh_transfer_fee_sats(utxos.len(), 2)
+                    .await?,
+                fee_budget,
+            )?;
             required_sats =
                 amount_sats
                     .checked_add(fee_sats)
@@ -1566,6 +1610,26 @@ mod tests {
             error,
             crate::Error::NumericOverflow { context } if context == "bitcoin fee sats"
         ));
+    }
+
+    #[test]
+    fn bitcoin_transfer_fee_budget_caps_runtime_estimate() {
+        assert_eq!(bitcoin_transfer_fee_sats(1_551, None).unwrap(), 1_551);
+        assert_eq!(
+            bitcoin_transfer_fee_sats(1_551, Some(U256::from(1_410_u64))).unwrap(),
+            1_410
+        );
+        assert_eq!(
+            bitcoin_transfer_fee_sats(1_200, Some(U256::from(1_410_u64))).unwrap(),
+            1_200
+        );
+    }
+
+    #[test]
+    fn bitcoin_transfer_fee_budget_rejects_zero_budget() {
+        let error = bitcoin_transfer_fee_sats(1_200, Some(U256::ZERO)).unwrap_err();
+
+        assert!(matches!(error, crate::Error::DumpToAddress { .. }));
     }
 
     #[test]

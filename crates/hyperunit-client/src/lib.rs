@@ -1,7 +1,11 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::Snafu;
-use std::{collections::BTreeSet, fmt, time::Duration};
+use std::{
+    collections::BTreeSet,
+    fmt,
+    time::{Duration, Instant},
+};
 use url::Url;
 
 pub type HyperUnitResult<T> = Result<T, HyperUnitClientError>;
@@ -448,9 +452,26 @@ impl HyperUnitClient {
 
     async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> HyperUnitResult<T> {
         let endpoint = build_endpoint(&self.base_url, path)?;
-        let response = self.http.get(endpoint).send().await?;
+        let endpoint_label = hyperunit_endpoint_label(path);
+        let started = Instant::now();
+        let response = match self.http.get(endpoint).send().await {
+            Ok(response) => response,
+            Err(err) => {
+                record_venue_request("GET", endpoint_label, "transport_error", started.elapsed());
+                return Err(err.into());
+            }
+        };
         let status = response.status();
-        let body = read_limited_response_text(response, HYPERUNIT_MAX_RESPONSE_BODY_BYTES).await?;
+        let status_class = status_class(status.as_u16());
+        let body =
+            match read_limited_response_text(response, HYPERUNIT_MAX_RESPONSE_BODY_BYTES).await {
+                Ok(body) => body,
+                Err(err) => {
+                    record_venue_request("GET", endpoint_label, status_class, started.elapsed());
+                    return Err(err.into());
+                }
+            };
+        record_venue_request("GET", endpoint_label, status_class, started.elapsed());
         if body.truncated {
             return Err(HyperUnitClientError::ResponseBodyTooLarge {
                 max_bytes: HYPERUNIT_MAX_RESPONSE_BODY_BYTES,
@@ -465,6 +486,54 @@ impl HyperUnitClient {
         }
         serde_json::from_str(&body)
             .map_err(|source| HyperUnitClientError::InvalidBody { source, body })
+    }
+}
+
+fn record_venue_request(
+    method: &'static str,
+    endpoint: &'static str,
+    status_class: &'static str,
+    duration: Duration,
+) {
+    metrics::counter!(
+        "tee_router_venue_requests_total",
+        "venue" => "unit",
+        "method" => method,
+        "endpoint" => endpoint,
+        "status_class" => status_class,
+    )
+    .increment(1);
+    metrics::histogram!(
+        "tee_router_venue_request_duration_seconds",
+        "venue" => "unit",
+        "method" => method,
+        "endpoint" => endpoint,
+        "status_class" => status_class,
+    )
+    .record(duration.as_secs_f64());
+}
+
+fn hyperunit_endpoint_label(path: &str) -> &'static str {
+    if path.starts_with("/gen/") {
+        "/gen/:src/:dst/:asset/:dst_addr"
+    } else if path.starts_with("/operations/") {
+        "/operations/:address"
+    } else {
+        match path {
+            "/v2/estimate-fees" => "/v2/estimate-fees",
+            _ => "unknown",
+        }
+    }
+}
+
+fn status_class(status: u16) -> &'static str {
+    match status {
+        100..=199 => "1xx",
+        200..=299 => "2xx",
+        300..=399 => "3xx",
+        400..=499 => "4xx",
+        500..=599 => "5xx",
+        _ => "unknown",
     }
 }
 

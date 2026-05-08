@@ -26,7 +26,7 @@ use tokio::{
     task::JoinSet,
     time::{timeout, MissedTickBehavior},
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -304,7 +304,7 @@ async fn run_backend_loop(
                     validate_pending_submission_backlog(&pending_submissions)?;
                 }
                 if scan_has_pending_ephemeral_submissions(&scan.detections, &pending_submissions) {
-                    warn!(
+                    debug!(
                         backend = backend.name(),
                         height = new_cursor.height,
                         hash = %new_cursor.hash,
@@ -399,6 +399,9 @@ impl IndexedLookupBackfillState {
     }
 
     fn sync_snapshot_at(&mut self, watches: &HashMap<Uuid, SharedWatchEntry>, now: Instant) {
+        let mut fresh_candidates = Vec::new();
+        let mut retry_candidates = Vec::new();
+
         for (watch_id, watch) in watches {
             let version = watch.updated_at;
 
@@ -414,10 +417,26 @@ impl IndexedLookupBackfillState {
                     continue;
                 }
                 self.deferred_versions.remove(watch_id);
+                retry_candidates.push((*watch_id, version));
+                continue;
             }
 
-            self.queue.push_back((*watch_id, version));
-            self.queued_versions.insert(*watch_id, version);
+            fresh_candidates.push((watch.created_at, *watch_id, version));
+        }
+
+        fresh_candidates.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.as_bytes().cmp(right.1.as_bytes()))
+        });
+        for (_, watch_id, version) in fresh_candidates {
+            self.queue.push_front((watch_id, version));
+            self.queued_versions.insert(watch_id, version);
+        }
+
+        for (watch_id, version) in retry_candidates {
+            self.queue.push_back((watch_id, version));
+            self.queued_versions.insert(watch_id, version);
         }
     }
 
@@ -511,6 +530,11 @@ impl IndexedLookupBackfillState {
 
     fn inflight_len(&self) -> usize {
         self.inflight_versions.len()
+    }
+
+    #[cfg(test)]
+    fn queued_watch_ids(&self) -> Vec<Uuid> {
+        self.queue.iter().map(|(watch_id, _)| *watch_id).collect()
     }
 }
 
@@ -844,13 +868,23 @@ async fn submit_detected_deposit(
             if should_retry_submission(&error) {
                 if detected.indexer_candidate_id.is_some() {
                     let message = error.to_string();
-                    warn!(
-                        backend = backend_name,
-                        watch_id = %detected.watch_id,
-                        tx_hash = %detected.tx_hash,
-                        %error,
-                        "Discovery backend submit was retryable; durable candidate will be released"
-                    );
+                    if submission_retry_is_expected_catchup(&error) {
+                        debug!(
+                            backend = backend_name,
+                            watch_id = %detected.watch_id,
+                            tx_hash = %detected.tx_hash,
+                            %error,
+                            "Discovery backend submit was retryable; durable candidate will be released"
+                        );
+                    } else {
+                        warn!(
+                            backend = backend_name,
+                            watch_id = %detected.watch_id,
+                            tx_hash = %detected.tx_hash,
+                            %error,
+                            "Discovery backend submit was retryable; durable candidate will be released"
+                        );
+                    }
                     return SubmissionOutcome::RetryableFailure(message);
                 }
                 let now = Instant::now();
@@ -866,15 +900,27 @@ async fn submit_detected_deposit(
                         next_attempt_at: now + retry_delay,
                     },
                 );
-                warn!(
-                    backend = backend_name,
-                    watch_id = %detected.watch_id,
-                    tx_hash = %detected.tx_hash,
-                    attempts,
-                    retry_in_ms = retry_delay.as_millis(),
-                    %error,
-                    "Discovery backend submit was retryable; keeping candidate queued for retry"
-                );
+                if submission_retry_is_expected_catchup(&error) {
+                    debug!(
+                        backend = backend_name,
+                        watch_id = %detected.watch_id,
+                        tx_hash = %detected.tx_hash,
+                        attempts,
+                        retry_in_ms = retry_delay.as_millis(),
+                        %error,
+                        "Discovery backend submit was retryable; keeping candidate queued for retry"
+                    );
+                } else {
+                    warn!(
+                        backend = backend_name,
+                        watch_id = %detected.watch_id,
+                        tx_hash = %detected.tx_hash,
+                        attempts,
+                        retry_in_ms = retry_delay.as_millis(),
+                        %error,
+                        "Discovery backend submit was retryable; keeping candidate queued for retry"
+                    );
+                }
                 SubmissionOutcome::RetryableFailure(error.to_string())
             } else {
                 pending_submissions.remove(&key);
@@ -984,6 +1030,7 @@ fn should_retry_submission(error: &Error) -> bool {
                 || matches!(
                     *status,
                     StatusCode::REQUEST_TIMEOUT
+                        | StatusCode::TOO_EARLY
                         | StatusCode::TOO_MANY_REQUESTS
                         | StatusCode::BAD_GATEWAY
                         | StatusCode::SERVICE_UNAVAILABLE
@@ -992,6 +1039,16 @@ fn should_retry_submission(error: &Error) -> bool {
         }
         _ => false,
     }
+}
+
+fn submission_retry_is_expected_catchup(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::RouterRejected {
+            status: StatusCode::TOO_EARLY,
+            ..
+        }
+    )
 }
 
 fn submission_retry_delay(detected: &DetectedDeposit, attempts: u32) -> Duration {
@@ -1026,10 +1083,11 @@ mod tests {
     use super::{
         detected_deposit_hint_idempotency_key, detected_deposit_key, run_indexed_lookup_task,
         scan_has_pending_ephemeral_submissions, should_retry_submission, submission_retry_delay,
-        validate_pending_submission_backlog, BlockCursor, BlockScan, DepositConfirmationState,
-        DetectedDeposit, DiscoveryBackend, IndexedLookupBackfillState, PendingSubmission,
-        INDEXED_LOOKUP_UNRESOLVED_RETRY_DELAY, MAX_HINT_IDEMPOTENCY_KEY_LEN,
-        MAX_PENDING_DISCOVERY_SUBMISSIONS, SUBMISSION_RETRY_BASE_DELAY, SUBMISSION_RETRY_MAX_DELAY,
+        submission_retry_is_expected_catchup, validate_pending_submission_backlog, BlockCursor,
+        BlockScan, DepositConfirmationState, DetectedDeposit, DiscoveryBackend,
+        IndexedLookupBackfillState, PendingSubmission, INDEXED_LOOKUP_UNRESOLVED_RETRY_DELAY,
+        MAX_HINT_IDEMPOTENCY_KEY_LEN, MAX_PENDING_DISCOVERY_SUBMISSIONS,
+        SUBMISSION_RETRY_BASE_DELAY, SUBMISSION_RETRY_MAX_DELAY,
     };
     use crate::error::Error;
     use crate::watch::{WatchEntry, WatchTarget};
@@ -1074,6 +1132,17 @@ mod tests {
         };
 
         assert!(should_retry_submission(&error));
+    }
+
+    #[test]
+    fn retries_not_ready_rejection() {
+        let error = Error::RouterRejected {
+            status: StatusCode::TOO_EARLY,
+            body: r#"{"error":{"code":425,"message":"not ready yet"}}"#.to_string(),
+        };
+
+        assert!(should_retry_submission(&error));
+        assert!(submission_retry_is_expected_catchup(&error));
     }
 
     fn detected_deposit() -> DetectedDeposit {
@@ -1204,6 +1273,14 @@ mod tests {
     }
 
     fn watch_entry(watch_id: Uuid, updated_at: chrono::DateTime<Utc>) -> Arc<WatchEntry> {
+        watch_entry_created_at(watch_id, updated_at, Utc::now())
+    }
+
+    fn watch_entry_created_at(
+        watch_id: Uuid,
+        updated_at: chrono::DateTime<Utc>,
+        created_at: chrono::DateTime<Utc>,
+    ) -> Arc<WatchEntry> {
         Arc::new(WatchEntry {
             watch_target: WatchTarget::ProviderOperation,
             watch_id,
@@ -1215,7 +1292,7 @@ mod tests {
             max_amount: U256::from(10_u64),
             required_amount: U256::from(10_u64),
             deposit_deadline: Utc::now() + Duration::minutes(5),
-            created_at: Utc::now(),
+            created_at,
             updated_at,
         })
     }
@@ -1291,6 +1368,40 @@ mod tests {
         watches.insert(watch_id, watch_entry(watch_id, newer_updated_at));
         state.sync_snapshot(&watches);
         assert_eq!(state.queue_len(), 1);
+    }
+
+    #[test]
+    fn backfill_state_prioritizes_new_watches_over_unresolved_retries() {
+        let old_watch_id = Uuid::now_v7();
+        let new_watch_id = Uuid::now_v7();
+        let now = Utc::now();
+        let retry_ready_at = Instant::now();
+        let mut state = IndexedLookupBackfillState::default();
+        let old_watch = watch_entry_created_at(old_watch_id, now, now - Duration::minutes(10));
+        let old_watches = HashMap::from([(old_watch_id, old_watch)]);
+
+        state.sync_snapshot(&old_watches);
+        assert_eq!(state.take_ready(&old_watches, 1).len(), 1);
+        assert!(state.finish(old_watch_id, now, &HashMap::from([(old_watch_id, now)]),));
+        state.retry_unresolved_at(old_watch_id, now, retry_ready_at);
+
+        let new_watch = watch_entry_created_at(
+            new_watch_id,
+            now + Duration::seconds(1),
+            now + Duration::seconds(1),
+        );
+        let watches = HashMap::from([
+            (old_watch_id, old_watches[&old_watch_id].clone()),
+            (new_watch_id, new_watch),
+        ]);
+
+        state.sync_snapshot_at(&watches, retry_ready_at + StdDuration::from_secs(1));
+
+        assert_eq!(
+            state.queued_watch_ids(),
+            vec![new_watch_id, old_watch_id],
+            "fresh watches must not wait behind stale unresolved backfill retries"
+        );
     }
 
     #[test]

@@ -452,14 +452,14 @@ fn merge_valid_router_cdc_message(content: &[u8], pending_plan: &mut CdcRefreshP
                 schema = %message.schema,
                 table = %message.table,
                 op = %message.op,
-                "Ignoring unsupported Sauron CDC logical message"
+                "Ignoring unsupported Sauron CDC message"
             );
         }
         Err(error) => {
             pending_plan.collapse_to_full_reconcile();
             warn!(
                 error = %error,
-                "Malformed Sauron CDC logical message; requiring full reconcile for this commit"
+                "Malformed Sauron CDC message; requiring full reconcile for this commit"
             );
         }
     }
@@ -983,7 +983,7 @@ async fn refresh_from_cdc_plan(
         store
             .replace_order(order_id, watches, source_updated_at)
             .await;
-        info!(
+        debug!(
             order_id = %order_id,
             "Refreshed Sauron order watch set from CDC message batch"
         );
@@ -1096,11 +1096,11 @@ async fn refresh_watch(
     match repository.load_watch(watch_id).await? {
         Some(watch) => {
             store.upsert(watch).await;
-            info!(watch_id = %watch_id, "Refreshed Sauron chain-deposit watch from CDC message");
+            debug!(watch_id = %watch_id, "Refreshed Sauron chain-deposit watch from CDC message");
         }
         None => {
             store.remove_with_source(watch_id, source_updated_at).await;
-            info!(watch_id = %watch_id, "Removed Sauron chain-deposit watch from CDC message");
+            debug!(watch_id = %watch_id, "Removed Sauron chain-deposit watch from CDC message");
         }
     }
     Ok(())
@@ -1115,13 +1115,13 @@ async fn refresh_provider_operation(
     match repository.load_watch(operation_id).await? {
         Some(watch) => {
             store.upsert(watch).await;
-            info!(operation_id = %operation_id, "Refreshed Sauron provider-operation watch from CDC message");
+            debug!(operation_id = %operation_id, "Refreshed Sauron provider-operation watch from CDC message");
         }
         None => {
             store
                 .remove_with_source(operation_id, source_updated_at)
                 .await;
-            info!(operation_id = %operation_id, "Removed Sauron provider-operation watch from CDC message");
+            debug!(operation_id = %operation_id, "Removed Sauron provider-operation watch from CDC message");
         }
     }
     Ok(())

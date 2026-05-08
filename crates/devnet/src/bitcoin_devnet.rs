@@ -6,7 +6,7 @@ use bitcoincore_rpc_async::bitcoin::Txid;
 use bitcoincore_rpc_async::json::GetRawTransactionVerbose;
 use corepc_node::Conf;
 use tokio::task::JoinSet;
-use tokio::time::Instant;
+use tokio::time::{Instant, MissedTickBehavior};
 use tracing::info;
 
 use bitcoin::{Address as BitcoinAddress, Amount};
@@ -23,6 +23,9 @@ use crate::manifest::{
 use crate::{get_new_temp_dir, Result, RiftDevnetCache};
 
 const REGTEST_BLOCK_REWARD_SATS: u64 = 50 * 100_000_000;
+const ESPLORA_LIVENESS_INTERVAL: Duration = Duration::from_secs(5);
+const ESPLORA_LIVENESS_TIMEOUT: Duration = Duration::from_secs(2);
+const ESPLORA_LIVENESS_FAILURE_LIMIT: usize = 3;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub enum MiningMode {
@@ -371,9 +374,9 @@ impl BitcoinDevnet {
     )> {
         let esplora_start = Instant::now();
         let mut conf = electrsd::Conf::default();
-        // Disable stderr logging to avoid cluttering the console
-        // true can be useful for debugging
-        conf.view_stderr = false;
+        // Electrs is part of the devnet's critical path. Keep its stderr in
+        // the container logs so a process abort is diagnosable after the fact.
+        conf.view_stderr = true;
         conf.args.push("--cors");
         conf.args.push("*");
         conf.args.push("--utxos-limit");
@@ -468,6 +471,9 @@ impl BitcoinDevnet {
                 test_start.elapsed()
             );
         }
+        if let Some(url) = esplora_url.as_ref() {
+            spawn_esplora_liveness_guard(url.clone());
+        }
 
         if using_esplora {
             info!(
@@ -559,6 +565,72 @@ impl BitcoinDevnet {
     }
 }
 
+fn spawn_esplora_liveness_guard(esplora_url: String) {
+    tokio::spawn(async move {
+        let health_url = esplora_liveness_url(&esplora_url);
+        let client = match reqwest::Client::builder()
+            .timeout(ESPLORA_LIVENESS_TIMEOUT)
+            .build()
+        {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::error!(%error, "failed to build Esplora liveness client");
+                std::process::exit(70);
+            }
+        };
+        let mut ticker = tokio::time::interval(ESPLORA_LIVENESS_INTERVAL);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut consecutive_failures = 0usize;
+
+        loop {
+            ticker.tick().await;
+            match client.get(&health_url).send().await {
+                Ok(response) if response.status().is_success() => {
+                    consecutive_failures = 0;
+                }
+                Ok(response) => {
+                    consecutive_failures += 1;
+                    tracing::error!(
+                        status = %response.status(),
+                        consecutive_failures,
+                        failure_limit = ESPLORA_LIVENESS_FAILURE_LIMIT,
+                        url = %health_url,
+                        "Esplora liveness probe returned an unhealthy status"
+                    );
+                }
+                Err(error) => {
+                    consecutive_failures += 1;
+                    tracing::error!(
+                        %error,
+                        consecutive_failures,
+                        failure_limit = ESPLORA_LIVENESS_FAILURE_LIMIT,
+                        url = %health_url,
+                        "Esplora liveness probe failed"
+                    );
+                }
+            }
+
+            if consecutive_failures >= ESPLORA_LIVENESS_FAILURE_LIMIT {
+                tracing::error!(
+                    url = %health_url,
+                    consecutive_failures,
+                    "Esplora is a required devnet service; terminating devnet"
+                );
+                std::process::exit(70);
+            }
+        }
+    });
+}
+
+fn esplora_liveness_url(esplora_url: &str) -> String {
+    let base = esplora_url.trim_end_matches('/');
+    let base = base
+        .strip_prefix("http://0.0.0.0")
+        .map(|suffix| format!("http://127.0.0.1{suffix}"))
+        .unwrap_or_else(|| base.to_string());
+    format!("{base}/blocks/tip/height")
+}
+
 fn bitcoin_blocks_to_mine_for_deal(amount: Amount) -> u64 {
     amount.to_sat().div_ceil(REGTEST_BLOCK_REWARD_SATS)
 }
@@ -622,5 +694,17 @@ mod tests {
             i64::MAX as u64
         );
         assert!(bitcoin_core_height_to_u64(-1).is_err());
+    }
+
+    #[test]
+    fn esplora_liveness_url_targets_loopback_for_wildcard_bind() {
+        assert_eq!(
+            esplora_liveness_url("http://0.0.0.0:50110/"),
+            "http://127.0.0.1:50110/blocks/tip/height"
+        );
+        assert_eq!(
+            esplora_liveness_url("http://127.0.0.1:50110"),
+            "http://127.0.0.1:50110/blocks/tip/height"
+        );
     }
 }

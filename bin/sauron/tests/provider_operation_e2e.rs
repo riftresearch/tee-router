@@ -964,6 +964,11 @@ fn router_args(
         worker_route_cost_refresh_seconds: 300,
         worker_provider_health_poll_seconds: 120,
         provider_health_timeout_seconds: 10,
+        worker_provider_operation_hint_pass_limit: 500,
+        worker_order_maintenance_pass_limit: 100,
+        worker_order_planning_pass_limit: 100,
+        worker_order_execution_pass_limit: 25,
+        worker_vault_funding_hint_pass_limit: 100,
         coinbase_price_api_base_url: mocks.base_url().to_string(),
     }
 }
@@ -1034,6 +1039,11 @@ fn live_router_args(
         worker_route_cost_refresh_seconds: 300,
         worker_provider_health_poll_seconds: 120,
         provider_health_timeout_seconds: 10,
+        worker_provider_operation_hint_pass_limit: 500,
+        worker_order_maintenance_pass_limit: 100,
+        worker_order_planning_pass_limit: 100,
+        worker_order_execution_pass_limit: 25,
+        worker_vault_funding_hint_pass_limit: 100,
         coinbase_price_api_base_url: "https://api.coinbase.com".to_string(),
     }
 }

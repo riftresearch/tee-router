@@ -177,7 +177,9 @@ services:
     build:
       context: .
       dockerfile_inline: |
+        # syntax=docker/dockerfile:1.7
         FROM rust:1.75 AS builder
+        ENV RUSTUP_TOOLCHAIN=1.75.0-x86_64-unknown-linux-gnu
         WORKDIR /app
         RUN apt-get update && apt-get install -y --no-install-recommends \
             clang llvm-dev libclang-dev pkg-config cmake build-essential libssl-dev git ca-certificates \
@@ -188,13 +190,17 @@ services:
         RUN git checkout 811a9908b52d28a7f08303b775ae7aef8ceeee07
         # Optimize for host
         ENV RUSTFLAGS="-C target-cpu=native -C codegen-units=1"
-        RUN cargo build --release
+        RUN --mount=type=cache,id=tee-router-electrs-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+            --mount=type=cache,id=tee-router-electrs-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+            --mount=type=cache,id=tee-router-electrs-target,target=/app/electrs/target,sharing=locked \
+            cargo build --release \
+            && install -Dm0755 /app/electrs/target/release/electrs /app/out/electrs
 
         FROM debian:trixie
         RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
           && rm -rf /var/lib/apt/lists/*
         WORKDIR /app
-        COPY --from=builder /app/electrs/target/release/electrs /app/
+        COPY --from=builder /app/out/electrs /app/electrs
         EXPOSE 3000
         CMD ["./electrs"]
     command:

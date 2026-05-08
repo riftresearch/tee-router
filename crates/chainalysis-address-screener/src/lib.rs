@@ -4,7 +4,7 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, instrument};
 use url::Url;
 
@@ -81,15 +81,27 @@ impl ChainalysisAddressScreener {
         let url = self.address_risk_url(address)?;
         debug!(%url, "fetching entity");
 
-        let resp = self
-            .http
-            .get(url)
-            .header("Token", &self.token)
-            .send()
-            .await
-            .context(RequestSnafu)?;
+        let started = Instant::now();
+        let resp = match self.http.get(url).header("Token", &self.token).send().await {
+            Ok(resp) => resp,
+            Err(source) => {
+                record_upstream_request(
+                    "GET",
+                    "/api/risk/v2/entities/:address",
+                    "transport_error",
+                    started.elapsed(),
+                );
+                return Err(Error::Request { source });
+            }
+        };
 
         let status = resp.status();
+        record_upstream_request(
+            "GET",
+            "/api/risk/v2/entities/:address",
+            status_class(status),
+            started.elapsed(),
+        );
         let bytes = read_limited_response_body(resp, CHAINALYSIS_MAX_RESPONSE_BODY_BYTES).await?;
 
         if !status.is_success() {
@@ -112,6 +124,41 @@ impl ChainalysisAddressScreener {
         segments.extend(["api", "risk", "v2", "entities", address]);
         drop(segments);
         Ok(url)
+    }
+}
+
+fn record_upstream_request(
+    method: &'static str,
+    endpoint: &'static str,
+    status_class: &'static str,
+    duration: Duration,
+) {
+    metrics::counter!(
+        "tee_router_venue_requests_total",
+        "venue" => "chainalysis",
+        "method" => method,
+        "endpoint" => endpoint,
+        "status_class" => status_class,
+    )
+    .increment(1);
+    metrics::histogram!(
+        "tee_router_venue_request_duration_seconds",
+        "venue" => "chainalysis",
+        "method" => method,
+        "endpoint" => endpoint,
+        "status_class" => status_class,
+    )
+    .record(duration.as_secs_f64());
+}
+
+fn status_class(status: StatusCode) -> &'static str {
+    match status.as_u16() {
+        100..=199 => "1xx",
+        200..=299 => "2xx",
+        300..=399 => "3xx",
+        400..=499 => "4xx",
+        500..=599 => "5xx",
+        _ => "unknown",
     }
 }
 
