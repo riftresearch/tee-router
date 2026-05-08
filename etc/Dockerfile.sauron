@@ -1,22 +1,19 @@
-FROM rust:1.90.0-trixie AS chef
-RUN cargo install cargo-chef --locked
+# syntax=docker/dockerfile:1.7
+FROM rust:1.90.0-trixie AS builder
+ENV RUSTUP_TOOLCHAIN=1.90.0-x86_64-unknown-linux-gnu
 WORKDIR /app
-
-FROM chef AS planner
 COPY . .
-RUN cargo chef prepare --recipe-path recipe.json
-
-FROM chef AS builder
-COPY --from=planner /app/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json
-COPY . .
-RUN cargo build --release --bin sauron --exclude integration-tests --workspace
+RUN --mount=type=cache,id=tee-router-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=tee-router-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=tee-router-target,target=/app/target,sharing=locked \
+    cargo build --release --bin sauron --exclude integration-tests --workspace \
+    && install -Dm0755 /app/target/release/sauron /app/out/sauron
 
 FROM debian:trixie
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-COPY --from=builder /app/target/release/sauron /app/
+COPY --from=builder /app/out/sauron /app/sauron
 COPY --from=builder /app/bin/sauron/migrations-state /app/migrations-state
 CMD ["./sauron"]

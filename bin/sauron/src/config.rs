@@ -10,7 +10,7 @@ pub const MIN_TOKEN_INDEXER_API_KEY_LEN: usize = 32;
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SauronReplicaEventSource {
-    /// Consume a logical replication stream from the router replica.
+    /// Consume the router CDC stream from the router replica.
     Cdc,
 }
 
@@ -50,11 +50,11 @@ pub struct SauronArgs {
     )]
     pub router_replica_database_name: String,
 
-    /// Logical decoding slot used when SAURON_REPLICA_EVENT_SOURCE=cdc.
+    /// CDC decoding slot used when SAURON_REPLICA_EVENT_SOURCE=cdc.
     #[arg(long, env = "SAURON_CDC_SLOT_NAME", default_value = "sauron_watch_cdc")]
     pub sauron_cdc_slot_name: String,
 
-    /// Publication used by the pgoutput logical replication stream.
+    /// Publication used by the pgoutput CDC stream.
     #[arg(
         long,
         env = "ROUTER_CDC_PUBLICATION_NAME",
@@ -62,7 +62,7 @@ pub struct SauronArgs {
     )]
     pub router_cdc_publication_name: String,
 
-    /// Message prefix emitted through pg_logical_emit_message by router DB triggers.
+    /// Message prefix emitted by router DB CDC triggers.
     #[arg(
         long,
         env = "ROUTER_CDC_MESSAGE_PREFIX",

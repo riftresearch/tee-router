@@ -23,7 +23,7 @@ const ROUTER_CDC_MESSAGE_ONLY_PUBLICATION_MIGRATION: &str = include_str!(
 );
 
 #[tokio::test]
-async fn streams_router_logical_messages_from_pgoutput_slot() {
+async fn streams_router_cdc_messages_from_pgoutput_slot() {
     let image = GenericImage::new("postgres", "18-alpine")
         .with_exposed_port(POSTGRES_PORT.tcp())
         .with_wait_for(WaitFor::message_on_stderr(
@@ -129,7 +129,7 @@ async fn streams_router_logical_messages_from_pgoutput_slot() {
         }
     })
     .await
-    .expect("receive router CDC logical message");
+    .expect("receive router CDC message");
 
     assert_eq!(message.table, "router_orders");
     assert_eq!(message.op, "INSERT");

@@ -17,7 +17,7 @@ PRIMARY_DB_SSLMODE="${PRIMARY_DB_SSLMODE:-disable}"
 PRIMARY_REPLICATION_SLOT="${PRIMARY_REPLICATION_SLOT:-router_physical_standby_v3}"
 STANDBY_APPLICATION_NAME="${STANDBY_APPLICATION_NAME:-router-physical-standby-v3}"
 STANDBY_MAX_CONNECTIONS="${STANDBY_MAX_CONNECTIONS:-256}"
-PGDATA="${PGDATA:-/var/lib/postgresql/data}"
+PGDATA="${PGDATA:-/var/lib/postgresql/18/docker}"
 
 if [[ ! "${PRIMARY_REPLICATION_SLOT}" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]]; then
   echo "PRIMARY_REPLICATION_SLOT must be a valid Postgres identifier" >&2
