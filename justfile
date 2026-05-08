@@ -1,4 +1,5 @@
 local_full_compose := "docker compose --env-file .env.admin -p tee-router-local-full-test -f etc/compose.local-full.yml -f etc/compose.local-observability.yml"
+temporal_compose := "docker compose -p tee-router-temporal -f etc/compose.temporal.yml"
 
 # Cache the local devnet
 cache-devnet:
@@ -82,6 +83,42 @@ dc +args:
       {{local_full_compose}} stop admin-dashboard sauron >/dev/null 2>&1 || true
     fi
     {{local_full_compose}} "${args[@]}"
+
+# Pass through docker compose commands for the local Temporal stack.
+# Examples: just temporal up -d, just temporal down -v, just temporal ps
+temporal *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    args=( {{args}} )
+    if [[ "${#args[@]}" -eq 0 ]]; then
+      args=(ps)
+    fi
+    if [[ "${args[0]}" == "up-d" ]]; then
+      args=(up -d "${args[@]:1}")
+    fi
+    {{temporal_compose}} "${args[@]}"
+
+# Start the local Temporal stack.
+temporal-up:
+    {{temporal_compose}} up -d
+
+# Stop the local Temporal stack. Pass -v to remove Temporal state.
+temporal-down *args:
+    {{temporal_compose}} down {{args}}
+
+# Run the Rust SDK spike against the local Temporal stack.
+temporal-spike *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -z "${PROTOC:-}" && -x "$PWD/target/tools/protoc/bin/protoc" ]]; then
+      export PROTOC="$PWD/target/tools/protoc/bin/protoc"
+    fi
+    if [[ -z "${PROTOC:-}" ]] && ! command -v protoc >/dev/null 2>&1; then
+      echo "temporal-worker requires protoc; install protobuf-compiler or set PROTOC=/path/to/protoc" >&2
+      exit 1
+    fi
+    args=( {{args}} )
+    cargo run -p temporal-worker -- spike "${args[@]}"
 
 # Run random router loadgen inside the local full compose stack
 compose-router-loadgen count='100' concurrency='64' rps='5' min_raw_amount='100000000' max_raw_amount='250000000' order_type='market':

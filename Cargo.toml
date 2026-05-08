@@ -7,6 +7,7 @@ members = [
     "bin/rand-wallet",
     "bin/router-server",
     "bin/sauron",
+    "bin/temporal-worker",
     "integration-tests",
     "crates/blockchain-utils",
     "crates/chainalysis-address-screener",
@@ -63,6 +64,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-loki = { version = "0.2.6", default-features = false, features = ["compat-0-2-1", "rustls"] }
 snafu = { version = "0.8", features = ["std"] }
+temporalio-client = { version = "0.4.0", default-features = false }
+temporalio-common = { version = "0.4.0", default-features = false }
+temporalio-macros = "0.4.0"
+temporalio-sdk = { version = "0.4.0", default-features = false }
+temporalio-sdk-core = { version = "0.4.0", default-features = false }
 axum = { version = "0.7", features = ["ws"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 clap = { version = "4.5", features = ["derive", "env"] }
