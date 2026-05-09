@@ -2312,7 +2312,6 @@ async fn run_live_runtime_route(route: RuntimeRoute) {
         run_worker_loop(
             worker_components.db,
             worker_components.vault_manager,
-            worker_components.order_execution_manager,
             order_workflow_client,
             worker_components.route_costs,
             worker_components.provider_health_poller,
@@ -2522,7 +2521,6 @@ async fn run_mock_runtime_route(route: RuntimeRoute) {
         run_worker_loop(
             worker_components.db,
             worker_components.vault_manager,
-            worker_components.order_execution_manager,
             order_workflow_client,
             worker_components.route_costs,
             worker_components.provider_health_poller,

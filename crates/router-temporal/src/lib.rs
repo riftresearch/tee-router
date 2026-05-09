@@ -86,6 +86,12 @@ pub enum RouterTemporalError {
         run_id: Option<String>,
     },
 
+    #[snafu(display("workflow {workflow_id} is unavailable for signal: {message}"))]
+    WorkflowSignalUnavailable {
+        workflow_id: String,
+        message: String,
+    },
+
     #[snafu(display("failed to {action}"))]
     Temporal {
         action: &'static str,
@@ -177,13 +183,33 @@ impl OrderWorkflowClient {
         signal: ProviderOperationHintSignal,
     ) -> RouterTemporalResult<()> {
         let workflow_id = order_workflow_id(order_id);
+        self.signal_provider_hint_to_workflow(workflow_id, signal)
+            .await
+    }
+
+    pub async fn signal_refund_provider_hint(
+        &self,
+        order_id: Uuid,
+        parent_attempt_id: Uuid,
+        signal: ProviderOperationHintSignal,
+    ) -> RouterTemporalResult<()> {
+        let workflow_id = refund_workflow_id(order_id, parent_attempt_id);
+        self.signal_provider_hint_to_workflow(workflow_id, signal)
+            .await
+    }
+
+    async fn signal_provider_hint_to_workflow(
+        &self,
+        workflow_id: String,
+        signal: ProviderOperationHintSignal,
+    ) -> RouterTemporalResult<()> {
         let input = payloads(&signal);
         self.client
             .clone()
             .signal_workflow_execution(SignalWorkflowExecutionRequest {
                 namespace: self.namespace.clone(),
                 workflow_execution: Some(WorkflowExecution {
-                    workflow_id,
+                    workflow_id: workflow_id.clone(),
                     run_id: String::new(),
                 }),
                 signal_name: ORDER_WORKFLOW_PROVIDER_HINT_SIGNAL.to_owned(),
@@ -193,9 +219,17 @@ impl OrderWorkflowClient {
                 ..Default::default()
             })
             .await
-            .map_err(|source| RouterTemporalError::Temporal {
-                action: "signal OrderWorkflow provider-operation hint",
-                source: boxed(source),
+            .map_err(|source| match source.code() {
+                Code::NotFound | Code::FailedPrecondition => {
+                    RouterTemporalError::WorkflowSignalUnavailable {
+                        workflow_id: workflow_id.clone(),
+                        message: source.message().to_owned(),
+                    }
+                }
+                _ => RouterTemporalError::Temporal {
+                    action: "signal provider-operation hint workflow",
+                    source: boxed(source),
+                },
             })?;
         Ok(())
     }

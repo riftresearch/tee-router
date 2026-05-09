@@ -2,10 +2,9 @@ use crate::{
     api::{
         CreateOrderCancellationRequest, CreateOrderRequest, CreateQuoteRequest, CreateVaultRequest,
         DetectorHintEnvelope, DetectorHintRequest, DetectorHintTarget, ProviderHealthEnvelope,
-        ProviderOperationHintEnvelope, ProviderOperationHintRequest,
-        ProviderOperationObserveRequest, ProviderPolicyEnvelope, ProviderPolicyListEnvelope,
-        UpdateProviderPolicyRequest, VaultFundingHintEnvelope, VaultFundingHintRequest,
-        MAX_HINT_IDEMPOTENCY_KEY_LEN,
+        ProviderOperationHintEnvelope, ProviderOperationHintRequest, ProviderPolicyEnvelope,
+        ProviderPolicyListEnvelope, UpdateProviderPolicyRequest, VaultFundingHintEnvelope,
+        VaultFundingHintRequest, MAX_HINT_IDEMPOTENCY_KEY_LEN,
     },
     app::{initialize_components, PaymasterMode, RouterComponents},
     error::{RouterServerError, RouterServerResult},
@@ -33,11 +32,17 @@ use chrono::Utc;
 use router_core::{
     models::{
         DepositRequirements, DepositVault, DepositVaultEnvelope, DepositVaultFundingHint,
-        OrderProviderOperationHint, ProviderOperationHintStatus, RouterOrder, RouterOrderEnvelope,
-        RouterOrderQuoteEnvelope, StatusResponse, VaultAction,
+        OrderExecutionAttempt, OrderExecutionAttemptKind, OrderProviderOperation,
+        OrderProviderOperationHint, ProviderOperationHintStatus, ProviderOperationType,
+        RouterOrder, RouterOrderEnvelope, RouterOrderQuoteEnvelope, StatusResponse, VaultAction,
     },
     protocol::{backend_chain_for_id, supported_chain_ids, ChainId},
-    services::{action_providers::ProviderOperationObservation, asset_registry::ProviderId},
+    services::asset_registry::ProviderId,
+};
+use router_temporal::{
+    boxed as boxed_temporal_error, OrderWorkflowClient, ProviderHintKind, ProviderKind,
+    ProviderOperationHintEvidence, ProviderOperationHintSignal, RouterTemporalError,
+    TemporalConnection,
 };
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
@@ -168,6 +173,7 @@ pub struct AppState {
     pub provider_policies: Arc<ProviderPolicyService>,
     pub address_screener: Option<Arc<AddressScreeningService>>,
     pub chain_registry: Arc<ChainRegistry>,
+    pub order_workflow_client: Option<Arc<OrderWorkflowClient>>,
     pub internal_api_auth: Option<InternalApiAuth>,
     pub gateway_api_auth: Option<GatewayApiAuth>,
     pub admin_api_auth: Option<AdminApiAuth>,
@@ -182,6 +188,21 @@ pub async fn run_api(args: RouterServerArgs) -> Result<()> {
 
 async fn serve_api(args: RouterServerArgs, components: RouterComponents) -> Result<()> {
     let addr = SocketAddr::from((args.host, args.port));
+    let order_workflow_client = Arc::new(
+        OrderWorkflowClient::connect(
+            &TemporalConnection {
+                temporal_address: args.temporal_address.clone(),
+                namespace: args.temporal_namespace.clone(),
+            },
+            args.temporal_task_queue.clone(),
+        )
+        .await
+        .map_err(|source| Error::Generic {
+            source: Whatever::without_source(format!(
+                "failed to initialize Temporal order workflow client: {source}"
+            )),
+        })?,
+    );
     let state = AppState {
         db: components.db,
         vault_manager: components.vault_manager,
@@ -191,6 +212,7 @@ async fn serve_api(args: RouterServerArgs, components: RouterComponents) -> Resu
         provider_policies: components.provider_policies,
         address_screener: components.address_screener,
         chain_registry: components.chain_registry,
+        order_workflow_client: Some(order_workflow_client),
         internal_api_auth: InternalApiAuth::from_args(&args),
         gateway_api_auth: GatewayApiAuth::from_args(&args),
         admin_api_auth: AdminApiAuth::from_args(&args),
@@ -228,10 +250,6 @@ pub fn build_api_router(state: AppState, cors_domain: Option<String>) -> Router 
         .route(
             "/api/v1/vaults/:id/funding-hints",
             post(record_vault_funding_hint),
-        )
-        .route(
-            "/api/v1/provider-operations/:id/observe",
-            post(observe_provider_operation),
         )
         .route(
             "/internal/v1/provider-policies",
@@ -647,16 +665,30 @@ async fn record_provider_operation_hint_inner(
     state: AppState,
     request: ProviderOperationHintRequest,
 ) -> RouterServerResult<OrderProviderOperationHint> {
-    let now = chrono::Utc::now();
+    let order_workflow_client =
+        state
+            .order_workflow_client
+            .as_ref()
+            .ok_or_else(|| RouterServerError::NotReady {
+                message: "Temporal order workflow client is not configured".to_string(),
+            })?;
+    let evidence = normalize_hint_evidence(request.evidence)?;
+    let operation = state
+        .db
+        .orders()
+        .get_provider_operation(request.provider_operation_id)
+        .await?;
+    let now = Utc::now();
     let hint = state
-        .order_execution_manager
-        .record_provider_operation_hint(OrderProviderOperationHint {
+        .db
+        .orders()
+        .create_provider_operation_hint(&OrderProviderOperationHint {
             id: Uuid::now_v7(),
             provider_operation_id: request.provider_operation_id,
             source: normalize_hint_source(request.source)?,
             hint_kind: request.hint_kind,
-            evidence: normalize_hint_evidence(request.evidence)?,
-            status: ProviderOperationHintStatus::Pending,
+            evidence,
+            status: ProviderOperationHintStatus::Processing,
             idempotency_key: normalize_hint_idempotency_key(request.idempotency_key)?,
             error: serde_json::json!({}),
             claimed_at: None,
@@ -665,7 +697,253 @@ async fn record_provider_operation_hint_inner(
             updated_at: now,
         })
         .await?;
-    Ok(hint)
+    record_provider_operation_hint_event(
+        &state,
+        operation.order_id,
+        &hint,
+        &operation,
+        "provider_operation.hint_recorded",
+    )
+    .await;
+
+    if hint.status != ProviderOperationHintStatus::Processing {
+        return Ok(hint);
+    }
+
+    let attempt = load_provider_operation_attempt(&state, &operation).await?;
+    let signal = provider_operation_hint_signal(&operation, &hint)?;
+    match signal_provider_operation_hint(
+        order_workflow_client,
+        &attempt,
+        operation.order_id,
+        signal,
+    )
+    .await
+    {
+        Ok(()) => {
+            let completed = state
+                .db
+                .orders()
+                .complete_provider_operation_hint(
+                    hint.id,
+                    hint.claimed_at,
+                    ProviderOperationHintStatus::Processed,
+                    serde_json::json!({}),
+                    Utc::now(),
+                )
+                .await?;
+            record_provider_operation_hint_event(
+                &state,
+                operation.order_id,
+                &completed,
+                &operation,
+                "provider_operation.hint_signaled",
+            )
+            .await;
+            Ok(completed)
+        }
+        Err(RouterTemporalError::WorkflowSignalUnavailable {
+            workflow_id,
+            message,
+        }) => {
+            let ignored = state
+                .db
+                .orders()
+                .complete_provider_operation_hint(
+                    hint.id,
+                    hint.claimed_at,
+                    ProviderOperationHintStatus::Ignored,
+                    serde_json::json!({
+                        "reason": "workflow_unavailable",
+                        "workflow_id": workflow_id,
+                        "message": message,
+                    }),
+                    Utc::now(),
+                )
+                .await?;
+            record_provider_operation_hint_event(
+                &state,
+                operation.order_id,
+                &ignored,
+                &operation,
+                "provider_operation.hint_ignored_workflow_unavailable",
+            )
+            .await;
+            Ok(ignored)
+        }
+        Err(source) => {
+            let _ = state
+                .db
+                .orders()
+                .complete_provider_operation_hint(
+                    hint.id,
+                    hint.claimed_at,
+                    ProviderOperationHintStatus::Failed,
+                    serde_json::json!({
+                        "reason": "temporal_signal_failed",
+                        "error": source.to_string(),
+                    }),
+                    Utc::now(),
+                )
+                .await;
+            Err(RouterServerError::NotReady {
+                message: format!("failed to signal provider-operation hint workflow: {source}"),
+            })
+        }
+    }
+}
+
+async fn load_provider_operation_attempt(
+    state: &AppState,
+    operation: &OrderProviderOperation,
+) -> RouterServerResult<OrderExecutionAttempt> {
+    let Some(attempt_id) = operation.execution_attempt_id else {
+        return Err(RouterServerError::InvalidData {
+            message: format!(
+                "provider operation {} is not attached to an execution attempt",
+                operation.id
+            ),
+        });
+    };
+    Ok(state.db.orders().get_execution_attempt(attempt_id).await?)
+}
+
+fn provider_operation_hint_signal(
+    operation: &OrderProviderOperation,
+    hint: &OrderProviderOperationHint,
+) -> RouterServerResult<ProviderOperationHintSignal> {
+    let (provider, hint_kind) = provider_hint_shape_for_operation(operation.operation_type);
+    Ok(ProviderOperationHintSignal {
+        order_id: operation.order_id,
+        hint_id: hint.id,
+        provider_operation_id: Some(operation.id),
+        provider,
+        hint_kind,
+        provider_ref: operation.provider_ref.clone(),
+        evidence: provider_hint_evidence_for_signal(hint_kind, &hint.evidence)?,
+    })
+}
+
+fn provider_hint_shape_for_operation(
+    operation_type: ProviderOperationType,
+) -> (ProviderKind, ProviderHintKind) {
+    match operation_type {
+        ProviderOperationType::AcrossBridge => (ProviderKind::Bridge, ProviderHintKind::AcrossFill),
+        ProviderOperationType::CctpBridge => {
+            (ProviderKind::Bridge, ProviderHintKind::CctpAttestation)
+        }
+        ProviderOperationType::UnitDeposit => (ProviderKind::Unit, ProviderHintKind::UnitDeposit),
+        ProviderOperationType::HyperliquidTrade | ProviderOperationType::HyperliquidLimitOrder => {
+            (ProviderKind::Exchange, ProviderHintKind::HyperliquidTrade)
+        }
+        ProviderOperationType::UnitWithdrawal => {
+            (ProviderKind::Unit, ProviderHintKind::ProviderObservation)
+        }
+        ProviderOperationType::HyperliquidBridgeDeposit
+        | ProviderOperationType::HyperliquidBridgeWithdrawal => {
+            (ProviderKind::Bridge, ProviderHintKind::ProviderObservation)
+        }
+        ProviderOperationType::UniversalRouterSwap => (
+            ProviderKind::Exchange,
+            ProviderHintKind::ProviderObservation,
+        ),
+    }
+}
+
+fn provider_hint_evidence_for_signal(
+    hint_kind: ProviderHintKind,
+    evidence: &serde_json::Value,
+) -> RouterServerResult<Option<ProviderOperationHintEvidence>> {
+    let tx_hash = evidence
+        .get("tx_hash")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let address = evidence
+        .get("address")
+        .or_else(|| evidence.get("recipient_address"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let transfer_index = evidence
+        .get("transfer_index")
+        .or_else(|| evidence.get("vout"))
+        .and_then(json_u64_or_string);
+
+    match (tx_hash, address, transfer_index) {
+        (Some(tx_hash), Some(address), Some(transfer_index)) => {
+            let amount = evidence.get("amount").and_then(|value| match value {
+                serde_json::Value::String(value) => Some(value.clone()),
+                serde_json::Value::Number(value) => Some(value.to_string()),
+                _ => None,
+            });
+            Ok(Some(ProviderOperationHintEvidence {
+                tx_hash,
+                address,
+                transfer_index,
+                amount,
+            }))
+        }
+        (None, None, None) => Ok(None),
+        _ if hint_kind != ProviderHintKind::UnitDeposit => Ok(None),
+        _ => Err(RouterServerError::Validation {
+            message:
+                "UnitDeposit provider-operation hints require tx_hash, address, and transfer_index"
+                    .to_string(),
+        }),
+    }
+}
+
+fn json_u64_or_string(value: &serde_json::Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+}
+
+async fn signal_provider_operation_hint(
+    order_workflow_client: &OrderWorkflowClient,
+    attempt: &OrderExecutionAttempt,
+    order_id: Uuid,
+    signal: ProviderOperationHintSignal,
+) -> std::result::Result<(), RouterTemporalError> {
+    match attempt.attempt_kind {
+        OrderExecutionAttemptKind::PrimaryExecution
+        | OrderExecutionAttemptKind::RetryExecution
+        | OrderExecutionAttemptKind::RefreshedExecution => {
+            order_workflow_client
+                .signal_provider_hint(order_id, signal)
+                .await
+        }
+        OrderExecutionAttemptKind::RefundRecovery => {
+            let parent_attempt_id = attempt
+                .failure_reason
+                .get("failed_attempt_id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| value.parse::<Uuid>().ok())
+                .ok_or_else(|| RouterTemporalError::Temporal {
+                    action: "resolve RefundWorkflow parent attempt",
+                    source: boxed_temporal_error(format!(
+                        "RefundRecovery attempt {} is missing failure_reason.failed_attempt_id",
+                        attempt.id
+                    )),
+                })?;
+            order_workflow_client
+                .signal_refund_provider_hint(order_id, parent_attempt_id, signal)
+                .await
+        }
+    }
+}
+
+async fn record_provider_operation_hint_event(
+    state: &AppState,
+    order_id: Uuid,
+    hint: &OrderProviderOperationHint,
+    operation: &OrderProviderOperation,
+    event: &'static str,
+) {
+    if let Ok(order) = state.db.orders().get(order_id).await {
+        crate::telemetry::record_provider_operation_hint_workflow_event(
+            &order, hint, operation, event,
+        );
+    }
 }
 
 async fn record_vault_funding_hint_inner(
@@ -702,21 +980,6 @@ async fn record_vault_funding_hint_inner(
         }
     }
     Ok(hint)
-}
-
-async fn observe_provider_operation(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    RouterPath(id): RouterPath<Uuid>,
-    RouterJson(request): RouterJson<ProviderOperationObserveRequest>,
-) -> RouterServerResult<Json<Option<ProviderOperationObservation>>> {
-    authorize_internal_api_request(&state, &headers)?;
-    let hint_evidence = normalize_hint_evidence(request.hint_evidence)?;
-    let observation = state
-        .order_execution_manager
-        .observe_provider_operation(id, hint_evidence)
-        .await?;
-    Ok(Json(observation))
 }
 
 async fn list_provider_policies(

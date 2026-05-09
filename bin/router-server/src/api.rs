@@ -179,13 +179,6 @@ pub enum DetectorHintEnvelope {
     FundingVault { hint: DepositVaultFundingHint },
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderOperationObserveRequest {
-    #[serde(default = "empty_metadata")]
-    pub hint_evidence: Value,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateProviderPolicyRequest {

@@ -8,13 +8,8 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use pgwire_replication::ReplicationEvent;
-use router_core::{
-    models::{ProviderOperationHintKind, PROVIDER_OPERATION_OBSERVATION_HINT_SOURCE},
-    services::action_providers::ProviderOperationObservation,
-};
-use router_server::api::{
-    ProviderOperationHintRequest, ProviderOperationObserveRequest, MAX_HINT_IDEMPOTENCY_KEY_LEN,
-};
+use router_core::models::{ProviderOperationHintKind, PROVIDER_OPERATION_OBSERVATION_HINT_SOURCE};
+use router_server::api::{ProviderOperationHintRequest, MAX_HINT_IDEMPOTENCY_KEY_LEN};
 use sha2::{Digest, Sha256};
 use snafu::ResultExt;
 use sqlx_postgres::{PgPool, PgPoolOptions};
@@ -46,7 +41,7 @@ use crate::{
 
 const PROVIDER_OPERATION_OBSERVE_INTERVAL: Duration = Duration::from_secs(5);
 const PROVIDER_OPERATION_OBSERVE_CONCURRENCY: usize = 32;
-const PROVIDER_OPERATION_OBSERVE_TIMEOUT: Duration = Duration::from_secs(10);
+const PROVIDER_OPERATION_HINT_SUBMIT_TIMEOUT: Duration = Duration::from_secs(10);
 const PROVIDER_OPERATION_OBSERVATION_RESUBMIT_INTERVAL: Duration = Duration::from_secs(30);
 const CDC_RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(1);
 const CDC_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
@@ -469,9 +464,7 @@ fn merge_valid_router_cdc_message(content: &[u8], pending_plan: &mut CdcRefreshP
 #[cfg(test)]
 mod tests {
     use super::*;
-    use router_core::{
-        models::ProviderOperationStatus, services::action_providers::ProviderOperationObservation,
-    };
+    use router_core::models::{ProviderOperationStatus, ProviderOperationType};
 
     #[test]
     fn cdc_reconnect_delay_backs_off_and_caps() {
@@ -764,41 +757,47 @@ mod tests {
     }
 
     #[test]
-    fn provider_operation_observation_fingerprint_is_stable_and_status_sensitive() {
-        let waiting = ProviderOperationObservation {
+    fn provider_operation_hint_fingerprint_is_stable_and_status_sensitive() {
+        let waiting = ProviderOperationWatchEntry {
+            operation_id: uuid::Uuid::now_v7(),
+            provider: "velora".to_string(),
+            operation_type: ProviderOperationType::UniversalRouterSwap,
             status: ProviderOperationStatus::WaitingExternal,
             provider_ref: Some("provider-ref-1".to_string()),
+            request: serde_json::json!({ "amount_in": "100" }),
+            response: serde_json::json!({}),
             observed_state: serde_json::json!({ "state": "pending" }),
-            response: None,
-            tx_hash: None,
-            error: None,
+            updated_at: DateTime::parse_from_rfc3339("2026-05-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
         };
-        let completed = ProviderOperationObservation {
+        let completed = ProviderOperationWatchEntry {
             status: ProviderOperationStatus::Completed,
-            provider_ref: Some("provider-ref-1".to_string()),
+            response: serde_json::json!({ "amount_out": "100" }),
             observed_state: serde_json::json!({ "state": "filled" }),
-            response: Some(serde_json::json!({ "amount_out": "100" })),
-            tx_hash: Some("0xabc".to_string()),
-            error: None,
+            updated_at: DateTime::parse_from_rfc3339("2026-05-01T00:00:01Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            ..waiting.clone()
         };
 
-        let first = provider_operation_observation_fingerprint(&waiting)
-            .expect("fingerprint waiting observation");
-        let second = provider_operation_observation_fingerprint(&waiting)
-            .expect("fingerprint waiting observation again");
-        let third = provider_operation_observation_fingerprint(&completed)
-            .expect("fingerprint completed observation");
+        let first =
+            provider_operation_hint_fingerprint(&waiting).expect("fingerprint waiting operation");
+        let second = provider_operation_hint_fingerprint(&waiting)
+            .expect("fingerprint waiting operation again");
+        let third = provider_operation_hint_fingerprint(&completed)
+            .expect("fingerprint completed operation");
 
         assert_eq!(first, second);
         assert_ne!(first, third);
     }
 
     #[test]
-    fn provider_operation_observation_hint_idempotency_key_is_bounded_token_text() {
+    fn provider_operation_hint_idempotency_key_is_bounded_token_text() {
         let operation_id = uuid::Uuid::now_v7();
         let fingerprint = "a".repeat(64);
 
-        let key = provider_operation_observation_hint_idempotency_key(operation_id, &fingerprint);
+        let key = provider_operation_hint_idempotency_key(operation_id, &fingerprint);
 
         assert!(key.len() <= MAX_HINT_IDEMPOTENCY_KEY_LEN);
         assert!(key.bytes().all(|byte| matches!(
@@ -812,31 +811,29 @@ mod tests {
     }
 
     #[test]
-    fn provider_operation_observation_submission_is_throttled_not_suppressed_forever() {
+    fn provider_operation_hint_submission_is_throttled_not_suppressed_forever() {
         let now = Instant::now();
-        let recent = SubmittedProviderOperationObservation {
+        let recent = SubmittedProviderOperationHint {
             fingerprint: "same".to_string(),
             submitted_at: now - (PROVIDER_OPERATION_OBSERVATION_RESUBMIT_INTERVAL / 2),
         };
-        let stale = SubmittedProviderOperationObservation {
+        let stale = SubmittedProviderOperationHint {
             fingerprint: "same".to_string(),
             submitted_at: now - PROVIDER_OPERATION_OBSERVATION_RESUBMIT_INTERVAL,
         };
 
-        assert!(should_submit_provider_operation_observation(
-            None, "same", now
-        ));
-        assert!(!should_submit_provider_operation_observation(
+        assert!(should_submit_provider_operation_hint(None, "same", now));
+        assert!(!should_submit_provider_operation_hint(
             Some(&recent),
             "same",
             now
         ));
-        assert!(should_submit_provider_operation_observation(
+        assert!(should_submit_provider_operation_hint(
             Some(&recent),
             "changed",
             now
         ));
-        assert!(should_submit_provider_operation_observation(
+        assert!(should_submit_provider_operation_hint(
             Some(&stale),
             "same",
             now
@@ -856,6 +853,23 @@ mod tests {
         assert_eq!(plan.watch_ids.len(), 1);
         assert!(plan.watch_ids.contains_key(&watch_id));
         assert!(plan.provider_operation_ids.is_empty());
+    }
+
+    #[test]
+    fn cdc_refresh_plan_keeps_provider_operation_refreshes_targeted() {
+        let order_id = uuid::Uuid::now_v7();
+        let provider_operation_id = uuid::Uuid::now_v7();
+        let plan = cdc_refresh_plan([
+            test_provider_operation_cdc_message(order_id, provider_operation_id),
+            test_provider_operation_cdc_message(order_id, provider_operation_id),
+        ]);
+
+        assert!(plan.order_ids.is_empty());
+        assert!(plan.watch_ids.is_empty());
+        assert_eq!(plan.provider_operation_ids.len(), 1);
+        assert!(plan
+            .provider_operation_ids
+            .contains_key(&provider_operation_id));
     }
 
     #[test]
@@ -909,6 +923,20 @@ mod tests {
         unsupported.version = 2;
 
         let plan = cdc_refresh_plan([unsupported]);
+
+        assert!(plan.order_ids.is_empty());
+        assert!(plan.watch_ids.is_empty());
+        assert!(plan.provider_operation_ids.is_empty());
+    }
+
+    #[test]
+    fn cdc_refresh_plan_ignores_unrelated_tables() {
+        let order_id = uuid::Uuid::now_v7();
+        let message = RouterCdcMessage {
+            table: "unrelated_table".to_string(),
+            ..test_cdc_message(Some(order_id), None, None)
+        };
+        let plan = cdc_refresh_plan([message]);
 
         assert!(plan.order_ids.is_empty());
         assert!(plan.watch_ids.is_empty());
@@ -1145,10 +1173,8 @@ async fn run_provider_operation_observer_loop(
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     ticker.tick().await;
-    let mut last_observation_submissions: HashMap<
-        uuid::Uuid,
-        SubmittedProviderOperationObservation,
-    > = HashMap::new();
+    let mut last_hint_submissions: HashMap<uuid::Uuid, SubmittedProviderOperationHint> =
+        HashMap::new();
 
     loop {
         let operations = store.snapshot().await;
@@ -1156,13 +1182,12 @@ async fn run_provider_operation_observer_loop(
             .iter()
             .map(|operation| operation.operation_id)
             .collect::<HashSet<_>>();
-        last_observation_submissions
-            .retain(|operation_id, _| active_operation_ids.contains(operation_id));
+        last_hint_submissions.retain(|operation_id, _| active_operation_ids.contains(operation_id));
 
         observe_provider_operations(
             operations,
             router_client.clone(),
-            &mut last_observation_submissions,
+            &mut last_hint_submissions,
         )
         .await;
 
@@ -1173,11 +1198,11 @@ async fn run_provider_operation_observer_loop(
 #[derive(Debug)]
 struct ProviderOperationObserveOutcome {
     operation_id: uuid::Uuid,
-    submitted_observation: Option<SubmittedProviderOperationObservation>,
+    submitted_hint: Option<SubmittedProviderOperationHint>,
 }
 
 #[derive(Debug, Clone)]
-struct SubmittedProviderOperationObservation {
+struct SubmittedProviderOperationHint {
     fingerprint: String,
     submitted_at: Instant,
 }
@@ -1185,7 +1210,7 @@ struct SubmittedProviderOperationObservation {
 async fn observe_provider_operations(
     operations: Vec<SharedProviderOperationWatchEntry>,
     router_client: RouterClient,
-    last_observation_submissions: &mut HashMap<uuid::Uuid, SubmittedProviderOperationObservation>,
+    last_hint_submissions: &mut HashMap<uuid::Uuid, SubmittedProviderOperationHint>,
 ) {
     let mut operations = operations.into_iter();
     let mut tasks = tokio::task::JoinSet::new();
@@ -1196,9 +1221,7 @@ async fn observe_provider_operations(
                 break;
             };
             let router_client = router_client.clone();
-            let last_submission = last_observation_submissions
-                .get(&operation.operation_id)
-                .cloned();
+            let last_submission = last_hint_submissions.get(&operation.operation_id).cloned();
             tasks.spawn(async move {
                 observe_provider_operation_once(router_client, operation, last_submission).await
             });
@@ -1210,8 +1233,8 @@ async fn observe_provider_operations(
 
         match tasks.join_next().await {
             Some(Ok(outcome)) => {
-                if let Some(submission) = outcome.submitted_observation {
-                    last_observation_submissions.insert(outcome.operation_id, submission);
+                if let Some(submission) = outcome.submitted_hint {
+                    last_hint_submissions.insert(outcome.operation_id, submission);
                 }
             }
             Some(Err(error)) => {
@@ -1228,60 +1251,10 @@ async fn observe_provider_operations(
 async fn observe_provider_operation_once(
     router_client: RouterClient,
     operation: SharedProviderOperationWatchEntry,
-    last_submission: Option<SubmittedProviderOperationObservation>,
+    last_submission: Option<SubmittedProviderOperationHint>,
 ) -> ProviderOperationObserveOutcome {
-    let observe_request = ProviderOperationObserveRequest {
-        hint_evidence: provider_operation_observe_evidence(operation.as_ref()),
-    };
     let operation_id = operation.operation_id;
-    let observation = match timeout(
-        PROVIDER_OPERATION_OBSERVE_TIMEOUT,
-        router_client.observe_provider_operation(operation_id, &observe_request),
-    )
-    .await
-    {
-        Ok(Ok(Some(observation))) => observation,
-        Ok(Ok(None)) => {
-            debug!(
-                operation_id = %operation_id,
-                provider = %operation.provider,
-                operation_type = %operation.operation_type.to_db_string(),
-                "Provider-operation observe proxy returned no observation"
-            );
-            return ProviderOperationObserveOutcome {
-                operation_id,
-                submitted_observation: None,
-            };
-        }
-        Ok(Err(error)) => {
-            warn!(
-                operation_id = %operation_id,
-                provider = %operation.provider,
-                operation_type = %operation.operation_type.to_db_string(),
-                %error,
-                "Failed to observe provider operation through router proxy"
-            );
-            return ProviderOperationObserveOutcome {
-                operation_id,
-                submitted_observation: None,
-            };
-        }
-        Err(_) => {
-            warn!(
-                operation_id = %operation_id,
-                provider = %operation.provider,
-                operation_type = %operation.operation_type.to_db_string(),
-                timeout_ms = PROVIDER_OPERATION_OBSERVE_TIMEOUT.as_millis(),
-                "Timed out observing provider operation through router proxy"
-            );
-            return ProviderOperationObserveOutcome {
-                operation_id,
-                submitted_observation: None,
-            };
-        }
-    };
-
-    let fingerprint = match provider_operation_observation_fingerprint(&observation) {
+    let fingerprint = match provider_operation_hint_fingerprint(operation.as_ref()) {
         Ok(fingerprint) => fingerprint,
         Err(error) => {
             warn!(
@@ -1289,19 +1262,19 @@ async fn observe_provider_operation_once(
                 provider = %operation.provider,
                 operation_type = %operation.operation_type.to_db_string(),
                 %error,
-                "Failed to fingerprint provider-operation observation"
+                "Failed to fingerprint provider-operation hint"
             );
             return ProviderOperationObserveOutcome {
                 operation_id,
-                submitted_observation: None,
+                submitted_hint: None,
             };
         }
     };
     let now = Instant::now();
-    if !should_submit_provider_operation_observation(last_submission.as_ref(), &fingerprint, now) {
+    if !should_submit_provider_operation_hint(last_submission.as_ref(), &fingerprint, now) {
         return ProviderOperationObserveOutcome {
             operation_id,
-            submitted_observation: None,
+            submitted_hint: None,
         };
     }
 
@@ -1309,26 +1282,22 @@ async fn observe_provider_operation_once(
         provider_operation_id: operation_id,
         source: PROVIDER_OPERATION_OBSERVATION_HINT_SOURCE.to_string(),
         hint_kind: ProviderOperationHintKind::PossibleProgress,
-        evidence: provider_operation_observation_hint_evidence(
-            operation.as_ref(),
-            &observation,
-            &fingerprint,
-        ),
-        idempotency_key: Some(provider_operation_observation_hint_idempotency_key(
+        evidence: provider_operation_progress_hint_evidence(operation.as_ref(), &fingerprint),
+        idempotency_key: Some(provider_operation_hint_idempotency_key(
             operation_id,
             &fingerprint,
         )),
     };
 
     match timeout(
-        PROVIDER_OPERATION_OBSERVE_TIMEOUT,
+        PROVIDER_OPERATION_HINT_SUBMIT_TIMEOUT,
         router_client.submit_provider_operation_hint(&request),
     )
     .await
     {
         Ok(Ok(_)) => ProviderOperationObserveOutcome {
             operation_id,
-            submitted_observation: Some(SubmittedProviderOperationObservation {
+            submitted_hint: Some(SubmittedProviderOperationHint {
                 fingerprint,
                 submitted_at: Instant::now(),
             }),
@@ -1343,7 +1312,7 @@ async fn observe_provider_operation_once(
             );
             ProviderOperationObserveOutcome {
                 operation_id,
-                submitted_observation: None,
+                submitted_hint: None,
             }
         }
         Err(_) => {
@@ -1351,19 +1320,19 @@ async fn observe_provider_operation_once(
                 operation_id = %operation_id,
                 provider = %operation.provider,
                 operation_type = %operation.operation_type.to_db_string(),
-                timeout_ms = PROVIDER_OPERATION_OBSERVE_TIMEOUT.as_millis(),
+                timeout_ms = PROVIDER_OPERATION_HINT_SUBMIT_TIMEOUT.as_millis(),
                 "Timed out submitting provider-operation observation hint"
             );
             ProviderOperationObserveOutcome {
                 operation_id,
-                submitted_observation: None,
+                submitted_hint: None,
             }
         }
     }
 }
 
-fn should_submit_provider_operation_observation(
-    last_submission: Option<&SubmittedProviderOperationObservation>,
+fn should_submit_provider_operation_hint(
+    last_submission: Option<&SubmittedProviderOperationHint>,
     fingerprint: &str,
     now: Instant,
 ) -> bool {
@@ -1375,21 +1344,8 @@ fn should_submit_provider_operation_observation(
             >= PROVIDER_OPERATION_OBSERVATION_RESUBMIT_INTERVAL
 }
 
-fn provider_operation_observe_evidence(
+fn provider_operation_progress_hint_evidence(
     operation: &ProviderOperationWatchEntry,
-) -> serde_json::Value {
-    serde_json::json!({
-        "source": "sauron_provider_operation_observer",
-        "provider": &operation.provider,
-        "operation_type": operation.operation_type.to_db_string(),
-        "provider_ref": &operation.provider_ref,
-        "observed_at": chrono::Utc::now(),
-    })
-}
-
-fn provider_operation_observation_hint_evidence(
-    operation: &ProviderOperationWatchEntry,
-    observation: &ProviderOperationObservation,
     fingerprint: &str,
 ) -> serde_json::Value {
     serde_json::json!({
@@ -1397,24 +1353,31 @@ fn provider_operation_observation_hint_evidence(
         "provider": &operation.provider,
         "operation_type": operation.operation_type.to_db_string(),
         "provider_ref": &operation.provider_ref,
-        "observation_fingerprint": fingerprint,
-        "provider_observation": observation,
+        "operation_status": operation.status.to_db_string(),
+        "operation_updated_at": operation.updated_at,
+        "operation_fingerprint": fingerprint,
         "observed_at": chrono::Utc::now(),
     })
 }
 
-fn provider_operation_observation_fingerprint(
-    observation: &ProviderOperationObservation,
+fn provider_operation_hint_fingerprint(
+    operation: &ProviderOperationWatchEntry,
 ) -> std::result::Result<String, serde_json::Error> {
-    let bytes = serde_json::to_vec(observation)?;
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "provider": &operation.provider,
+        "operation_type": operation.operation_type.to_db_string(),
+        "provider_ref": &operation.provider_ref,
+        "status": operation.status.to_db_string(),
+        "request": &operation.request,
+        "response": &operation.response,
+        "observed_state": &operation.observed_state,
+        "updated_at": operation.updated_at,
+    }))?;
     let digest = Sha256::digest(bytes);
     Ok(alloy::hex::encode(digest))
 }
 
-fn provider_operation_observation_hint_idempotency_key(
-    operation_id: Uuid,
-    fingerprint: &str,
-) -> String {
+fn provider_operation_hint_idempotency_key(operation_id: Uuid, fingerprint: &str) -> String {
     let idempotency_key = format!("sauron:op-observe:{operation_id}:{fingerprint}");
     debug_assert!(idempotency_key.len() <= MAX_HINT_IDEMPOTENCY_KEY_LEN);
     idempotency_key
