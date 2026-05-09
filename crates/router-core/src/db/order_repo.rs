@@ -1915,6 +1915,107 @@ impl OrderRepository {
         Ok(step)
     }
 
+    pub async fn record_execution_step_provider_side_effect_checkpoint(
+        &self,
+        order_id: Uuid,
+        attempt_id: Uuid,
+        step_id: Uuid,
+        checkpoint: serde_json::Value,
+        now: DateTime<Utc>,
+    ) -> RouterCoreResult<OrderExecutionStep> {
+        let started = Instant::now();
+        let result = sqlx_core::query::query(&format!(
+            r#"
+            WITH updated AS (
+                UPDATE order_execution_steps
+                SET
+                    details_json = CASE
+                        WHEN details_json ? 'provider_side_effect_checkpoint'
+                            THEN details_json
+                        ELSE jsonb_set(
+                            details_json,
+                            '{{provider_side_effect_checkpoint}}',
+                            $4::jsonb,
+                            true
+                        )
+                    END,
+                    updated_at = CASE
+                        WHEN details_json ? 'provider_side_effect_checkpoint'
+                            THEN updated_at
+                        ELSE $5
+                    END
+                WHERE id = $1
+                  AND order_id = $2
+                  AND execution_attempt_id = $3
+                  AND status = 'running'
+                RETURNING {EXECUTION_STEP_SELECT_COLUMNS}
+            )
+            SELECT {EXECUTION_STEP_SELECT_COLUMNS}
+            FROM updated
+            "#
+        ))
+        .bind(step_id)
+        .bind(order_id)
+        .bind(attempt_id)
+        .bind(checkpoint)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await;
+        telemetry::record_db_query(
+            "order.record_execution_step_provider_side_effect_checkpoint",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        let row = result?;
+        self.map_execution_step_row(&row)
+    }
+
+    pub async fn record_stale_running_step_classification(
+        &self,
+        order_id: Uuid,
+        attempt_id: Uuid,
+        step_id: Uuid,
+        classification: serde_json::Value,
+        now: DateTime<Utc>,
+    ) -> RouterCoreResult<OrderExecutionStep> {
+        let started = Instant::now();
+        let result = sqlx_core::query::query(&format!(
+            r#"
+            WITH updated AS (
+                UPDATE order_execution_steps
+                SET
+                    details_json = jsonb_set(
+                        details_json,
+                        '{{stale_running_step_classification}}',
+                        $4::jsonb,
+                        true
+                    ),
+                    updated_at = $5
+                WHERE id = $1
+                  AND order_id = $2
+                  AND execution_attempt_id = $3
+                RETURNING {EXECUTION_STEP_SELECT_COLUMNS}
+            )
+            SELECT {EXECUTION_STEP_SELECT_COLUMNS}
+            FROM updated
+            "#
+        ))
+        .bind(step_id)
+        .bind(order_id)
+        .bind(attempt_id)
+        .bind(classification)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await;
+        telemetry::record_db_query(
+            "order.record_stale_running_step_classification",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        let row = result?;
+        self.map_execution_step_row(&row)
+    }
+
     pub async fn persist_execution_step_failed(
         &self,
         order_id: Uuid,
@@ -3192,6 +3293,99 @@ impl OrderRepository {
         .await;
         telemetry::record_db_query(
             "order.mark_order_refunded",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        result
+    }
+
+    pub async fn mark_order_manual_intervention_required(
+        &self,
+        order_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> RouterCoreResult<RouterOrder> {
+        let started = Instant::now();
+        let result = async {
+            let mut tx = self.pool.begin().await?;
+            let order_row = sqlx_core::query::query(&format!(
+                r#"
+                SELECT {ORDER_SELECT_COLUMNS}
+                FROM router_orders ro
+                LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
+                LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
+                WHERE ro.id = $1
+                FOR UPDATE OF ro
+                "#
+            ))
+            .bind(order_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let locked_order = self.map_order_row(&order_row)?;
+
+            if let Some(funding_vault_id) = locked_order.funding_vault_id {
+                sqlx_core::query::query(
+                    r#"
+                    UPDATE deposit_vaults
+                    SET status = $2, updated_at = $3
+                    WHERE id = $1
+                      AND status = ANY($4)
+                    "#,
+                )
+                .bind(funding_vault_id)
+                .bind(DepositVaultStatus::ManualInterventionRequired.to_db_string())
+                .bind(now)
+                .bind(vec![
+                    DepositVaultStatus::Funded.to_db_string(),
+                    DepositVaultStatus::Executing.to_db_string(),
+                    DepositVaultStatus::RefundRequired.to_db_string(),
+                    DepositVaultStatus::Refunding.to_db_string(),
+                ])
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            let order_row = sqlx_core::query::query(&format!(
+                r#"
+                WITH updated AS (
+                    UPDATE router_orders
+                    SET status = $2, updated_at = $3
+                    WHERE id = $1
+                      AND status = ANY($4)
+                    RETURNING *
+                )
+                SELECT {ORDER_SELECT_COLUMNS}
+                FROM updated ro
+                LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
+                LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
+                UNION ALL
+                SELECT {ORDER_SELECT_COLUMNS}
+                FROM router_orders ro
+                LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
+                LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
+                WHERE ro.id = $1
+                  AND ro.status = $2
+                LIMIT 1
+                "#
+            ))
+            .bind(order_id)
+            .bind(RouterOrderStatus::ManualInterventionRequired.to_db_string())
+            .bind(now)
+            .bind(vec![
+                RouterOrderStatus::Funded.to_db_string(),
+                RouterOrderStatus::Executing.to_db_string(),
+                RouterOrderStatus::RefundRequired.to_db_string(),
+                RouterOrderStatus::Refunding.to_db_string(),
+            ])
+            .fetch_one(&mut *tx)
+            .await?;
+            let order = self.map_order_row(&order_row)?;
+
+            tx.commit().await?;
+            Ok::<RouterOrder, RouterCoreError>(order)
+        }
+        .await;
+        telemetry::record_db_query(
+            "order.mark_order_manual_intervention_required",
             result.is_ok(),
             started.elapsed(),
         );

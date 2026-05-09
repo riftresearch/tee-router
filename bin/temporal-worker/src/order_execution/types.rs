@@ -254,6 +254,20 @@ pub struct ClassifyStepFailureInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClassifyStaleRunningStepInput {
+    pub order_id: WorkflowOrderId,
+    pub attempt_id: WorkflowAttemptId,
+    pub step_id: WorkflowStepId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StaleRunningStepClassified {
+    pub step_id: WorkflowStepId,
+    pub decision: StaleRunningStepDecision,
+    pub reason: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WriteFailedAttemptSnapshotInput {
     pub order_id: WorkflowOrderId,
     pub attempt_id: WorkflowAttemptId,
@@ -271,7 +285,9 @@ pub struct FailedAttemptSnapshotWritten {
 pub struct FinalizeOrderOrRefundInput {
     pub order_id: WorkflowOrderId,
     pub attempt_id: Option<WorkflowAttemptId>,
+    pub step_id: Option<WorkflowStepId>,
     pub terminal_status: OrderTerminalStatus,
+    pub reason: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -556,6 +572,26 @@ pub enum StepFailureDecision {
     RefreshQuote,
     StartRefund,
     ManualIntervention,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StaleRunningStepDecision {
+    DurableProviderOperationWaitingExternalProgress,
+    AmbiguousExternalSideEffectWindow,
+    StaleRunningStepWithoutCheckpoint,
+}
+
+impl StaleRunningStepDecision {
+    #[must_use]
+    pub fn reason_str(self) -> &'static str {
+        match self {
+            Self::DurableProviderOperationWaitingExternalProgress => {
+                "durable_provider_operation_waiting_external_progress"
+            }
+            Self::AmbiguousExternalSideEffectWindow => "ambiguous_external_side_effect_window",
+            Self::StaleRunningStepWithoutCheckpoint => "stale_running_step_without_checkpoint",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

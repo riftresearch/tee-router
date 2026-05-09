@@ -40,22 +40,24 @@ use uuid::Uuid;
 
 use super::types::{
     AcrossOnchainLogRecovered, BoundaryPersisted, CancelTimedOutHyperliquidTradeInput,
-    ClassifyStepFailureInput, ComposeRefreshedQuoteAttemptInput, DiscoverSingleRefundPositionInput,
-    DispatchStepProviderActionInput, ExecuteStepInput, ExecutionPlan, FailedAttemptSnapshotWritten,
-    FinalizeOrderOrRefundInput, FinalizedOrder, HyperliquidTradeCancelRecorded,
-    LoadOrderExecutionStateInput, MarkOrderCompletedInput, MaterializeExecutionAttemptInput,
-    MaterializeRefreshedAttemptInput, MaterializeRefundPlanInput, MaterializeRetryAttemptInput,
-    MaterializedExecutionAttempt, OrderCompleted, OrderExecutionState, OrderTerminalStatus,
-    OrderWorkflowPhase, PersistProviderOperationStatusInput, PersistProviderReceiptInput,
-    PersistStepFailedInput, PersistStepReadyToFireInput, PersistStepTerminalStatusInput,
-    PersistenceBoundary, PollProviderOperationHintsInput, ProviderActionDispatchShape,
-    ProviderHintKind, ProviderOperationHintDecision, ProviderOperationHintVerified,
-    ProviderOperationHintsPolled, RecoverAcrossOnchainLogInput, RecoverablePositionKind,
-    RefreshedAttemptMaterialized, RefreshedQuoteAttemptOutcome, RefreshedQuoteAttemptShape,
-    RefundPlanOutcome, RefundPlanShape, RefundUntenableReason, SettleProviderStepInput,
-    SingleRefundPosition, SingleRefundPositionDiscovery, SingleRefundPositionOutcome,
-    StaleQuoteRefreshUntenableReason, StepExecuted, StepExecutionOutcome, StepFailureDecision,
-    VerifyProviderOperationHintInput, WorkflowExecutionStep, WriteFailedAttemptSnapshotInput,
+    ClassifyStaleRunningStepInput, ClassifyStepFailureInput, ComposeRefreshedQuoteAttemptInput,
+    DiscoverSingleRefundPositionInput, DispatchStepProviderActionInput, ExecuteStepInput,
+    ExecutionPlan, FailedAttemptSnapshotWritten, FinalizeOrderOrRefundInput, FinalizedOrder,
+    HyperliquidTradeCancelRecorded, LoadOrderExecutionStateInput, MarkOrderCompletedInput,
+    MaterializeExecutionAttemptInput, MaterializeRefreshedAttemptInput, MaterializeRefundPlanInput,
+    MaterializeRetryAttemptInput, MaterializedExecutionAttempt, OrderCompleted,
+    OrderExecutionState, OrderTerminalStatus, OrderWorkflowPhase,
+    PersistProviderOperationStatusInput, PersistProviderReceiptInput, PersistStepFailedInput,
+    PersistStepReadyToFireInput, PersistStepTerminalStatusInput, PersistenceBoundary,
+    PollProviderOperationHintsInput, ProviderActionDispatchShape, ProviderHintKind,
+    ProviderOperationHintDecision, ProviderOperationHintVerified, ProviderOperationHintsPolled,
+    RecoverAcrossOnchainLogInput, RecoverablePositionKind, RefreshedAttemptMaterialized,
+    RefreshedQuoteAttemptOutcome, RefreshedQuoteAttemptShape, RefundPlanOutcome, RefundPlanShape,
+    RefundUntenableReason, SettleProviderStepInput, SingleRefundPosition,
+    SingleRefundPositionDiscovery, SingleRefundPositionOutcome, StaleQuoteRefreshUntenableReason,
+    StaleRunningStepClassified, StaleRunningStepDecision, StepExecuted, StepExecutionOutcome,
+    StepFailureDecision, VerifyProviderOperationHintInput, WorkflowExecutionStep,
+    WriteFailedAttemptSnapshotInput,
 };
 
 const MAX_EXECUTION_ATTEMPTS: i32 = 2;
@@ -140,6 +142,26 @@ impl OrderActivities {
                 step.status.to_db_string()
             )));
         }
+        let checkpoint = json!({
+            "kind": "provider_side_effect_about_to_fire",
+            "reason": "about_to_fire_provider_side_effect",
+            "step_id": step.id,
+            "attempt_id": input.attempt_id,
+            "recorded_at": Utc::now().to_rfc3339(),
+            "scar_tissue": "§6"
+        });
+        let step = deps
+            .db
+            .orders()
+            .record_execution_step_provider_side_effect_checkpoint(
+                input.order_id,
+                input.attempt_id,
+                input.step_id,
+                checkpoint,
+                Utc::now(),
+            )
+            .await
+            .map_err(activity_error_from_display)?;
         let completion = execute_running_step(&deps, &step).await?;
         Ok(StepExecuted {
             order_id: input.order_id,
@@ -637,6 +659,17 @@ impl OrderActivities {
         Ok(decision)
     }
 
+    /// Scar tissue: §6 stale running step manual intervention.
+    #[activity]
+    pub async fn classify_stale_running_step(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: ClassifyStaleRunningStepInput,
+    ) -> Result<StaleRunningStepClassified, ActivityError> {
+        let deps = self.deps()?;
+        classify_stale_running_step_for_deps(&deps, input).await
+    }
+
     /// Scar tissue: §15 failure snapshot.
     #[activity]
     pub async fn write_failed_attempt_snapshot(
@@ -785,11 +818,250 @@ impl OrderActivities {
                     terminal_status: OrderTerminalStatus::RefundManualInterventionRequired,
                 })
             }
+            OrderTerminalStatus::ManualInterventionRequired => {
+                let attempt_id = input.attempt_id.ok_or_else(|| {
+                    activity_error("finalize manual intervention requires an execution attempt id")
+                })?;
+                let step_id = input.step_id.ok_or_else(|| {
+                    activity_error("finalize manual intervention requires an execution step id")
+                })?;
+                let order = finalize_execution_manual_intervention(
+                    &deps,
+                    input.order_id,
+                    attempt_id,
+                    step_id,
+                    input.reason.unwrap_or_else(|| {
+                        json!({
+                            "reason": "execution_manual_intervention_required",
+                            "step_id": step_id,
+                        })
+                    }),
+                )
+                .await?;
+                tracing::info!(
+                    order_id = %order.id,
+                    attempt_id = %attempt_id,
+                    step_id = %step_id,
+                    event_name = "order.execution_manual_intervention_required",
+                    "order.execution_manual_intervention_required"
+                );
+                Ok(FinalizedOrder {
+                    order_id: order.id,
+                    terminal_status: OrderTerminalStatus::ManualInterventionRequired,
+                })
+            }
             terminal_status => Err(activity_error(format!(
                 "finalize_order_or_refund does not handle {terminal_status:?} in PR6a"
             ))),
         }
     }
+}
+
+async fn classify_stale_running_step_for_deps(
+    deps: &OrderActivityDeps,
+    input: ClassifyStaleRunningStepInput,
+) -> Result<StaleRunningStepClassified, ActivityError> {
+    let step = deps
+        .db
+        .orders()
+        .get_execution_step(input.step_id)
+        .await
+        .map_err(activity_error_from_display)?;
+    if step.order_id != input.order_id || step.execution_attempt_id != Some(input.attempt_id) {
+        return Err(activity_error(format!(
+            "step {} does not belong to order {} attempt {}",
+            step.id, input.order_id, input.attempt_id
+        )));
+    }
+
+    let step_operations: Vec<_> = deps
+        .db
+        .orders()
+        .get_provider_operations(input.order_id)
+        .await
+        .map_err(activity_error_from_display)?
+        .into_iter()
+        .filter(|operation| operation.execution_step_id == Some(step.id))
+        .collect();
+
+    let durable_operation = step_operations
+        .iter()
+        .filter(|operation| {
+            matches!(
+                operation.status,
+                ProviderOperationStatus::Submitted | ProviderOperationStatus::WaitingExternal
+            ) && provider_operation_has_checkpoint(operation)
+        })
+        .max_by_key(|operation| (operation.updated_at, operation.created_at, operation.id));
+
+    let (decision, mut reason) = if let Some(operation) = durable_operation {
+        (
+            StaleRunningStepDecision::DurableProviderOperationWaitingExternalProgress,
+            json!({
+                "kind": "stale_running_step_recovery",
+                "reason": StaleRunningStepDecision::DurableProviderOperationWaitingExternalProgress.reason_str(),
+                "provider_operation_id": operation.id,
+                "provider_operation_status": operation.status.to_db_string(),
+            }),
+        )
+    } else if let Some(checkpoint) = step.details.get("provider_side_effect_checkpoint") {
+        (
+            StaleRunningStepDecision::AmbiguousExternalSideEffectWindow,
+            json!({
+                "kind": "stale_running_step_recovery",
+                "reason": StaleRunningStepDecision::AmbiguousExternalSideEffectWindow.reason_str(),
+                "checkpoint": checkpoint,
+                "started_at": step.started_at,
+                "updated_at": step.updated_at,
+            }),
+        )
+    } else {
+        (
+            StaleRunningStepDecision::StaleRunningStepWithoutCheckpoint,
+            json!({
+                "kind": "stale_running_step_recovery",
+                "reason": StaleRunningStepDecision::StaleRunningStepWithoutCheckpoint.reason_str(),
+                "started_at": step.started_at,
+                "updated_at": step.updated_at,
+            }),
+        )
+    };
+
+    if let Some(object) = reason.as_object_mut() {
+        object.insert("step_id".to_string(), json!(step.id));
+        object.insert("attempt_id".to_string(), json!(input.attempt_id));
+    }
+
+    let recorded = deps
+        .db
+        .orders()
+        .record_stale_running_step_classification(
+            input.order_id,
+            input.attempt_id,
+            input.step_id,
+            reason.clone(),
+            Utc::now(),
+        )
+        .await
+        .map_err(activity_error_from_display)?;
+    tracing::info!(
+        order_id = %input.order_id,
+        attempt_id = %input.attempt_id,
+        step_id = %recorded.id,
+        decision = ?decision,
+        event_name = "execution_step.stale_running_classified",
+        "execution_step.stale_running_classified"
+    );
+
+    Ok(StaleRunningStepClassified {
+        step_id: input.step_id,
+        decision,
+        reason,
+    })
+}
+
+async fn finalize_execution_manual_intervention(
+    deps: &OrderActivityDeps,
+    order_id: Uuid,
+    attempt_id: Uuid,
+    step_id: Uuid,
+    reason: Value,
+) -> Result<RouterOrder, ActivityError> {
+    let now = Utc::now();
+    let step = deps
+        .db
+        .orders()
+        .get_execution_step(step_id)
+        .await
+        .map_err(activity_error_from_display)?;
+    if step.order_id != order_id || step.execution_attempt_id != Some(attempt_id) {
+        return Err(activity_error(format!(
+            "step {} does not belong to order {} attempt {}",
+            step.id, order_id, attempt_id
+        )));
+    }
+
+    let step_error = json!({
+        "error": "execution step requires manual intervention",
+        "reason": reason
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("execution_manual_intervention_required"),
+        "manual_intervention": reason.clone(),
+    });
+    let failed_step = match step.status {
+        OrderExecutionStepStatus::Running => deps
+            .db
+            .orders()
+            .fail_execution_step(step.id, step_error, now)
+            .await
+            .map_err(activity_error_from_display)?,
+        OrderExecutionStepStatus::Waiting => deps
+            .db
+            .orders()
+            .fail_observed_execution_step(step.id, step_error, now)
+            .await
+            .map_err(activity_error_from_display)?,
+        OrderExecutionStepStatus::Failed => step,
+        status => {
+            return Err(activity_error(format!(
+                "step {} cannot be finalized as manual intervention from status {}",
+                step.id,
+                status.to_db_string()
+            )));
+        }
+    };
+
+    let order = deps
+        .db
+        .orders()
+        .get(order_id)
+        .await
+        .map_err(activity_error_from_display)?;
+    let failure_reason = json!({
+        "reason": reason
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("execution_manual_intervention_required"),
+        "step_id": failed_step.id,
+        "step_type": failed_step.step_type.to_db_string(),
+        "step_error": &failed_step.error,
+        "manual_intervention": reason,
+    });
+    match deps
+        .db
+        .orders()
+        .mark_execution_attempt_manual_intervention_required(
+            attempt_id,
+            failure_reason,
+            failed_attempt_snapshot(&order, &failed_step),
+            now,
+        )
+        .await
+    {
+        Ok(_) => {}
+        Err(RouterCoreError::NotFound) => {
+            let attempt = deps
+                .db
+                .orders()
+                .get_execution_attempt(attempt_id)
+                .await
+                .map_err(activity_error_from_display)?;
+            if attempt.status != OrderExecutionAttemptStatus::ManualInterventionRequired {
+                return Err(activity_error(format!(
+                    "attempt {} was not eligible for manual intervention finalization",
+                    attempt_id
+                )));
+            }
+        }
+        Err(source) => return Err(activity_error_from_display(source)),
+    }
+
+    deps.db
+        .orders()
+        .mark_order_manual_intervention_required(order_id, now)
+        .await
+        .map_err(activity_error_from_display)
 }
 
 async fn settle_waiting_provider_step(
@@ -1237,6 +1509,16 @@ async fn find_destination_execution_vault(
 
 fn json_string_equals(value: &Value, key: &'static str, expected: &'static str) -> bool {
     value.get(key).and_then(Value::as_str) == Some(expected)
+}
+
+fn provider_operation_has_checkpoint(operation: &OrderProviderOperation) -> bool {
+    operation.provider_ref.is_some()
+        || json_object_non_empty(&operation.response)
+        || json_object_non_empty(&operation.observed_state)
+}
+
+fn json_object_non_empty(value: &Value) -> bool {
+    value.as_object().is_some_and(|object| !object.is_empty())
 }
 
 fn is_unique_violation(err: &RouterCoreError) -> bool {
@@ -2789,5 +3071,435 @@ impl StepDispatchActivities {
         _input: DispatchStepProviderActionInput,
     ) -> Result<ProviderActionDispatchShape, ActivityError> {
         todo!("PR7: dispatch provider action for the active step")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use chains::ChainRegistry;
+    use router_core::{
+        config::Settings,
+        services::{custody_action_executor::HyperliquidCallNetwork, ActionProviderHttpOptions},
+    };
+    use sqlx_postgres::PgPool;
+    use testcontainers::{
+        core::{IntoContainerPort, WaitFor},
+        runners::AsyncRunner,
+        ContainerAsync, GenericImage, ImageExt,
+    };
+
+    const POSTGRES_PORT: u16 = 5432;
+    const POSTGRES_USER: &str = "postgres";
+    const POSTGRES_PASSWORD: &str = "password";
+    const POSTGRES_DATABASE: &str = "postgres";
+
+    struct TestDatabase {
+        _container: ContainerAsync<GenericImage>,
+        db: Database,
+        pool: PgPool,
+    }
+
+    struct SeededRunningStep {
+        order_id: Uuid,
+        attempt_id: Uuid,
+        step_id: Uuid,
+    }
+
+    #[tokio::test]
+    async fn classify_stale_running_step_records_all_decisions() {
+        let test_db = test_database().await;
+        let deps = test_deps(test_db.db.clone());
+
+        let durable = seed_running_step(&test_db.pool, true, true).await;
+        let classified = classify_stale_running_step_for_deps(
+            &deps,
+            ClassifyStaleRunningStepInput {
+                order_id: durable.order_id,
+                attempt_id: durable.attempt_id,
+                step_id: durable.step_id,
+            },
+        )
+        .await
+        .expect("classify durable progress");
+        assert_eq!(
+            classified.decision,
+            StaleRunningStepDecision::DurableProviderOperationWaitingExternalProgress
+        );
+        assert_step_classification(
+            &test_db.db,
+            durable.step_id,
+            "durable_provider_operation_waiting_external_progress",
+        )
+        .await;
+
+        let ambiguous = seed_running_step(&test_db.pool, true, false).await;
+        let classified = classify_stale_running_step_for_deps(
+            &deps,
+            ClassifyStaleRunningStepInput {
+                order_id: ambiguous.order_id,
+                attempt_id: ambiguous.attempt_id,
+                step_id: ambiguous.step_id,
+            },
+        )
+        .await
+        .expect("classify ambiguous external window");
+        assert_eq!(
+            classified.decision,
+            StaleRunningStepDecision::AmbiguousExternalSideEffectWindow
+        );
+        assert_step_classification(
+            &test_db.db,
+            ambiguous.step_id,
+            "ambiguous_external_side_effect_window",
+        )
+        .await;
+
+        let missing_checkpoint = seed_running_step(&test_db.pool, false, false).await;
+        let classified = classify_stale_running_step_for_deps(
+            &deps,
+            ClassifyStaleRunningStepInput {
+                order_id: missing_checkpoint.order_id,
+                attempt_id: missing_checkpoint.attempt_id,
+                step_id: missing_checkpoint.step_id,
+            },
+        )
+        .await
+        .expect("classify missing checkpoint");
+        assert_eq!(
+            classified.decision,
+            StaleRunningStepDecision::StaleRunningStepWithoutCheckpoint
+        );
+        assert_step_classification(
+            &test_db.db,
+            missing_checkpoint.step_id,
+            "stale_running_step_without_checkpoint",
+        )
+        .await;
+    }
+
+    async fn test_database() -> TestDatabase {
+        let image = GenericImage::new("postgres", "18-alpine")
+            .with_exposed_port(POSTGRES_PORT.tcp())
+            .with_wait_for(WaitFor::message_on_stderr(
+                "database system is ready to accept connections",
+            ))
+            .with_env_var("POSTGRES_USER", POSTGRES_USER)
+            .with_env_var("POSTGRES_PASSWORD", POSTGRES_PASSWORD)
+            .with_env_var("POSTGRES_DB", POSTGRES_DATABASE)
+            .with_cmd([
+                "postgres",
+                "-c",
+                "wal_level=logical",
+                "-c",
+                "max_wal_senders=10",
+                "-c",
+                "max_replication_slots=10",
+            ]);
+
+        let container = image.start().await.expect("start Postgres testcontainer");
+        let port = container
+            .get_host_port_ipv4(POSTGRES_PORT.tcp())
+            .await
+            .expect("read Postgres testcontainer port");
+        let database_url = format!(
+            "postgres://{POSTGRES_USER}:{POSTGRES_PASSWORD}@127.0.0.1:{port}/{POSTGRES_DATABASE}"
+        );
+        let db = Database::connect(&database_url, 4, 1)
+            .await
+            .expect("connect migrated test database");
+        let pool = PgPool::connect(&database_url)
+            .await
+            .expect("connect raw test pool");
+
+        TestDatabase {
+            _container: container,
+            db,
+            pool,
+        }
+    }
+
+    fn test_deps(db: Database) -> OrderActivityDeps {
+        let settings = Arc::new(test_settings());
+        let chain_registry = Arc::new(ChainRegistry::new());
+        let action_providers = Arc::new(
+            ActionProviderRegistry::http_from_options(ActionProviderHttpOptions {
+                across: None,
+                cctp: None,
+                hyperunit_base_url: None,
+                hyperunit_proxy_url: None,
+                hyperliquid_base_url: None,
+                velora: None,
+                hyperliquid_network: HyperliquidCallNetwork::Testnet,
+                hyperliquid_order_timeout_ms: 30_000,
+            })
+            .expect("empty action provider registry"),
+        );
+        let custody_executor = Arc::new(CustodyActionExecutor::new(
+            db.clone(),
+            settings,
+            chain_registry,
+        ));
+        OrderActivityDeps::new(db, action_providers, custody_executor)
+    }
+
+    fn test_settings() -> Settings {
+        let dir = tempfile::tempdir().expect("settings tempdir");
+        let path = dir.path().join("router-master-key.hex");
+        std::fs::write(&path, alloy::hex::encode([0x42_u8; 64])).expect("write router master key");
+        Settings::load(&path).expect("load test settings")
+    }
+
+    async fn seed_running_step(
+        pool: &PgPool,
+        with_checkpoint: bool,
+        with_durable_provider_operation: bool,
+    ) -> SeededRunningStep {
+        let order_id = Uuid::now_v7();
+        let attempt_id = Uuid::now_v7();
+        let leg_id = Uuid::now_v7();
+        let step_id = Uuid::now_v7();
+        let now = Utc::now();
+        let started_at = now - chrono::Duration::minutes(10);
+        let trace_id = order_id.simple().to_string();
+        let parent_span_id = trace_id[..16].to_string();
+        let details = if with_checkpoint {
+            json!({
+                "provider_side_effect_checkpoint": {
+                    "kind": "provider_side_effect_about_to_fire",
+                    "reason": "about_to_fire_provider_side_effect",
+                    "recorded_at": started_at.to_rfc3339(),
+                    "scar_tissue": "§6"
+                }
+            })
+        } else {
+            json!({})
+        };
+
+        sqlx_core::query::query(
+            r#"
+            INSERT INTO router_orders (
+                id,
+                order_type,
+                status,
+                source_chain_id,
+                source_asset_id,
+                destination_chain_id,
+                destination_asset_id,
+                recipient_address,
+                refund_address,
+                action_timeout_at,
+                workflow_trace_id,
+                workflow_parent_span_id,
+                created_at,
+                updated_at
+            )
+            VALUES (
+                $1, 'market_order', 'executing', 'evm:8453', 'native',
+                'evm:8453', 'native', '0x0000000000000000000000000000000000000001',
+                '0x0000000000000000000000000000000000000002',
+                $2, $3, $4, $5, $5
+            )
+            "#,
+        )
+        .bind(order_id)
+        .bind(now + chrono::Duration::hours(1))
+        .bind(trace_id)
+        .bind(parent_span_id)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert router order");
+
+        sqlx_core::query::query(
+            r#"
+            INSERT INTO market_order_actions (
+                order_id,
+                order_kind,
+                amount_in,
+                min_amount_out,
+                amount_out,
+                max_amount_in,
+                created_at,
+                updated_at,
+                slippage_bps
+            )
+            VALUES ($1, 'exact_in', '100', '1', NULL, NULL, $2, $2, 100)
+            "#,
+        )
+        .bind(order_id)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert market order action");
+
+        sqlx_core::query::query(
+            r#"
+            INSERT INTO order_execution_attempts (
+                id,
+                order_id,
+                attempt_index,
+                attempt_kind,
+                status,
+                failure_reason_json,
+                input_custody_snapshot_json,
+                created_at,
+                updated_at
+            )
+            VALUES ($1, $2, 1, 'primary_execution', 'active', '{}'::jsonb, '{}'::jsonb, $3, $3)
+            "#,
+        )
+        .bind(attempt_id)
+        .bind(order_id)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert execution attempt");
+
+        sqlx_core::query::query(
+            r#"
+            INSERT INTO order_execution_legs (
+                id,
+                order_id,
+                execution_attempt_id,
+                transition_decl_id,
+                leg_index,
+                leg_type,
+                provider,
+                status,
+                input_chain_id,
+                input_asset_id,
+                output_chain_id,
+                output_asset_id,
+                amount_in,
+                expected_amount_out,
+                min_amount_out,
+                started_at,
+                details_json,
+                usd_valuation_json,
+                created_at,
+                updated_at
+            )
+            VALUES (
+                $1, $2, $3, 'test-transition', 0, 'swap', 'velora',
+                'running', 'evm:8453', 'native', 'evm:8453', 'native',
+                '100', '100', '1', $4, '{}'::jsonb, '{}'::jsonb, $5, $5
+            )
+            "#,
+        )
+        .bind(leg_id)
+        .bind(order_id)
+        .bind(attempt_id)
+        .bind(started_at)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert execution leg");
+
+        sqlx_core::query::query(
+            r#"
+            INSERT INTO order_execution_steps (
+                id,
+                order_id,
+                execution_attempt_id,
+                execution_leg_id,
+                transition_decl_id,
+                step_index,
+                step_type,
+                provider,
+                status,
+                input_chain_id,
+                input_asset_id,
+                output_chain_id,
+                output_asset_id,
+                amount_in,
+                min_amount_out,
+                idempotency_key,
+                attempt_count,
+                started_at,
+                details_json,
+                request_json,
+                response_json,
+                error_json,
+                usd_valuation_json,
+                created_at,
+                updated_at
+            )
+            VALUES (
+                $1, $2, $3, $4, 'test-transition', 0, 'universal_router_swap',
+                'velora', 'running', 'evm:8453', 'native', 'evm:8453', 'native',
+                '100', '1', $5, 1, $6, $7, '{}'::jsonb, '{}'::jsonb,
+                '{}'::jsonb, '{}'::jsonb, $8, $8
+            )
+            "#,
+        )
+        .bind(step_id)
+        .bind(order_id)
+        .bind(attempt_id)
+        .bind(leg_id)
+        .bind(format!("order:{order_id}:execution:0"))
+        .bind(started_at)
+        .bind(details)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert execution step");
+
+        if with_durable_provider_operation {
+            sqlx_core::query::query(
+                r#"
+                INSERT INTO order_provider_operations (
+                    id,
+                    order_id,
+                    execution_attempt_id,
+                    execution_step_id,
+                    provider,
+                    operation_type,
+                    provider_ref,
+                    status,
+                    request_json,
+                    response_json,
+                    observed_state_json,
+                    created_at,
+                    updated_at
+                )
+                VALUES (
+                    $1, $2, $3, $4, 'velora', 'universal_router_swap',
+                    'provider-ref', 'waiting_external', '{}'::jsonb,
+                    '{"receipt":"recorded"}'::jsonb, '{}'::jsonb, $5, $5
+                )
+                "#,
+            )
+            .bind(Uuid::now_v7())
+            .bind(order_id)
+            .bind(attempt_id)
+            .bind(step_id)
+            .bind(now)
+            .execute(pool)
+            .await
+            .expect("insert durable provider operation");
+        }
+
+        SeededRunningStep {
+            order_id,
+            attempt_id,
+            step_id,
+        }
+    }
+
+    async fn assert_step_classification(db: &Database, step_id: Uuid, expected_reason: &str) {
+        let step = db
+            .orders()
+            .get_execution_step(step_id)
+            .await
+            .expect("load classified step");
+        assert_eq!(
+            step.details
+                .get("stale_running_step_classification")
+                .and_then(|classification| classification.get("reason"))
+                .and_then(Value::as_str),
+            Some(expected_reason)
+        );
     }
 }
