@@ -145,6 +145,17 @@ pub struct ProviderOperationHintSignal {
     pub provider: ProviderKind,
     pub hint_kind: ProviderHintKind,
     pub provider_ref: Option<String>,
+    #[serde(default)]
+    pub evidence: Option<ProviderOperationHintEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderOperationHintEvidence {
+    pub tx_hash: String,
+    pub address: String,
+    pub transfer_index: u64,
+    #[serde(default)]
+    pub amount: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

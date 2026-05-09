@@ -7,7 +7,10 @@ use alloy::{
     rpc::types::TransactionRequest,
     signers::local::PrivateKeySigner,
 };
+use bitcoin::{Address as BitcoinAddress, Amount as BitcoinAmount, Network as BitcoinNetwork};
+use bitcoincore_rpc_async::Auth as BitcoinRpcAuth;
 use chains::{
+    bitcoin::BitcoinChain,
     evm::{EvmChain, EvmGasSponsorConfig},
     hyperliquid::HyperliquidChain,
     ChainRegistry,
@@ -80,6 +83,7 @@ const EVM_NATIVE_GAS_BUFFER_WEI: u128 = 1_000_000_000_000_000_000;
 const EXECUTE_STEP_TEMPORAL_ATTEMPTS: usize = 3;
 const ORDER_WORKFLOW_TEST_TIMEOUT: Duration = Duration::from_secs(240);
 const ORDER_AMOUNT_IN_WEI: &str = "60000000000000000";
+const ORDER_BTC_AMOUNT_SATS: &str = "1000000";
 const ORDER_USDC_AMOUNT_RAW: &str = "150000000";
 const TEST_RESIDUAL_SINK_ADDRESS: &str = "0x2222222222222222222222222222222222222222";
 
@@ -103,6 +107,7 @@ enum WorkflowRoute {
     VeloraBaseEthToBaseUsdc,
     AcrossBaseEthToEthereumUsdc,
     CctpBaseUsdcToArbitrumEth,
+    UnitBitcoinToBaseEth,
 }
 
 #[derive(Default)]
@@ -206,6 +211,45 @@ async fn order_workflow_completes_across_step_via_polling_fallback() {
         .await
         .expect("load Across step");
     assert_eq!(step.status, OrderExecutionStepStatus::Completed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn order_workflow_completes_unit_deposit_via_polling_fallback() {
+    let run = run_order_workflow(WorkflowOptions {
+        route: WorkflowRoute::UnitBitcoinToBaseEth,
+        ..WorkflowOptions::default()
+    })
+    .await;
+
+    assert_eq!(run.output.terminal_status, OrderTerminalStatus::Completed);
+    let completed = run
+        .db
+        .orders()
+        .get(run.order_id)
+        .await
+        .expect("load completed Unit order");
+    assert_eq!(completed.status, RouterOrderStatus::Completed);
+
+    let unit_deposit_operation =
+        provider_operation_by_type(&run.db, run.order_id, ProviderOperationType::UnitDeposit).await;
+    assert_eq!(
+        unit_deposit_operation.status,
+        ProviderOperationStatus::Completed
+    );
+    let unit_deposit_step = run
+        .db
+        .orders()
+        .get_execution_step(
+            unit_deposit_operation
+                .execution_step_id
+                .expect("UnitDeposit operation should be linked to a step"),
+        )
+        .await
+        .expect("load UnitDeposit step");
+    assert_eq!(
+        unit_deposit_step.status,
+        OrderExecutionStepStatus::Completed
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -905,6 +949,9 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
     let across_enabled = matches!(options.route, WorkflowRoute::AcrossBaseEthToEthereumUsdc)
         || options.expect_external_custody_across_then_velora_refund;
     let cctp_enabled = matches!(options.route, WorkflowRoute::CctpBaseUsdcToArbitrumEth);
+    let unit_enabled = matches!(options.route, WorkflowRoute::UnitBitcoinToBaseEth)
+        || options.expect_hyperliquid_spot_unit_refund;
+    let bitcoin_enabled = matches!(options.route, WorkflowRoute::UnitBitcoinToBaseEth);
     if across_enabled {
         install_mock_usdc_clone(
             &devnet.ethereum,
@@ -925,7 +972,7 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
     }
     let mocks = spawn_mocks(&devnet, &options).await;
     let settings = Arc::new(test_settings());
-    let hyperliquid_enabled = options.expect_hyperliquid_spot_unit_refund;
+    let hyperliquid_enabled = unit_enabled;
     let chain_registry = Arc::new(
         test_chain_registry(
             &devnet,
@@ -933,6 +980,7 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
             hyperliquid_enabled,
             across_enabled,
             cctp_enabled,
+            bitcoin_enabled,
         )
         .await,
     );
@@ -985,6 +1033,16 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
             )
             .await
         }
+        WorkflowRoute::UnitBitcoinToBaseEth => {
+            seed_funded_unit_order(
+                &db,
+                settings.clone(),
+                chain_registry.clone(),
+                action_providers.clone(),
+                &devnet,
+            )
+            .await
+        }
     };
     let order_id = seeded.order_id;
     if options.expect_hyperliquid_spot_unit_refund {
@@ -1027,7 +1085,12 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
         temporal_address: "http://127.0.0.1:7233".to_string(),
         namespace: "default".to_string(),
     };
-    let activity_deps = OrderActivityDeps::new(db.clone(), action_providers, custody_executor);
+    let activity_deps = OrderActivityDeps::new(
+        db.clone(),
+        action_providers,
+        custody_executor,
+        chain_registry.clone(),
+    );
 
     let local = tokio::task::LocalSet::new();
     let db_for_workflow = db.clone();
@@ -1098,6 +1161,7 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
                                 provider: ProviderKind::Bridge,
                                 hint_kind: ProviderHintKind::AcrossFill,
                                 provider_ref: across_operation.provider_ref,
+                                evidence: None,
                             },
                             WorkflowSignalOptions::default(),
                         )
@@ -1126,6 +1190,16 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
                 }
                 signal_order_cctp_attestation(&client, &workflow_id, order_id, cctp_operation)
                     .await;
+            }
+            if matches!(options.route, WorkflowRoute::UnitBitcoinToBaseEth) {
+                signal_order_unit_withdrawal_observation(
+                    &client,
+                    &db_for_workflow,
+                    &mocks,
+                    &workflow_id,
+                    order_id,
+                )
+                .await;
             }
             if options.expect_external_custody_across_refund {
                 signal_external_custody_refund_across_fill(
@@ -1290,6 +1364,7 @@ async fn test_chain_registry(
     hyperliquid_enabled: bool,
     across_enabled: bool,
     cctp_enabled: bool,
+    bitcoin_enabled: bool,
 ) -> ChainRegistry {
     let base_chain = EvmChain::new_with_gas_sponsor(
         &devnet.base.anvil.endpoint(),
@@ -1360,6 +1435,20 @@ async fn test_chain_registry(
             )),
         );
     }
+    if bitcoin_enabled {
+        let bitcoin_chain = BitcoinChain::new(
+            &devnet.bitcoin.rpc_url,
+            BitcoinRpcAuth::CookieFile(devnet.bitcoin.cookie.clone()),
+            devnet
+                .bitcoin
+                .esplora_url
+                .as_deref()
+                .expect("Bitcoin esplora URL is available"),
+            BitcoinNetwork::Regtest,
+        )
+        .expect("bitcoin chain setup");
+        registry.register_bitcoin(ChainType::Bitcoin, Arc::new(bitcoin_chain));
+    }
     registry
 }
 
@@ -1398,6 +1487,8 @@ async fn spawn_mocks(devnet: &RiftDevnet, options: &WorkflowOptions) -> MockInte
     let mut config = MockIntegratorConfig::default();
     let across_enabled = matches!(options.route, WorkflowRoute::AcrossBaseEthToEthereumUsdc)
         || options.expect_external_custody_across_then_velora_refund;
+    let unit_enabled = matches!(options.route, WorkflowRoute::UnitBitcoinToBaseEth)
+        || options.expect_hyperliquid_spot_unit_refund;
     if matches!(options.route, WorkflowRoute::VeloraBaseEthToBaseUsdc) {
         config = config.with_velora_swap_contract_address(
             devnet.base.anvil.chain_id(),
@@ -1450,13 +1541,19 @@ async fn spawn_mocks(devnet: &RiftDevnet, options: &WorkflowOptions) -> MockInte
             .with_cctp_destination_token(devnet.base.anvil.chain_id(), BASE_USDC_ADDRESS)
             .with_cctp_destination_token(devnet.arbitrum.anvil.chain_id(), ARBITRUM_USDC_ADDRESS);
     }
-    if options.expect_hyperliquid_spot_unit_refund {
+    if unit_enabled {
         config = config
             .with_unit_evm_rpc_url(
                 hyperunit_client::UnitChain::Base,
                 devnet.base.anvil.endpoint_url().to_string(),
             )
             .with_mainnet_hyperliquid(false);
+    }
+    if matches!(options.route, WorkflowRoute::UnitBitcoinToBaseEth) {
+        config = config.with_unit_bitcoin_rpc(
+            devnet.bitcoin.rpc_url.clone(),
+            devnet.bitcoin.cookie.clone(),
+        );
     }
     config = config
         .with_velora_transaction_fail_next_n(options.velora_transaction_failures)
@@ -1672,11 +1769,64 @@ async fn signal_order_cctp_attestation(
                 provider: ProviderKind::Bridge,
                 hint_kind: ProviderHintKind::ProviderObservation,
                 provider_ref: cctp_operation.provider_ref,
+                evidence: None,
             },
             WorkflowSignalOptions::default(),
         )
         .await
         .expect("send CCTP provider-operation hint signal");
+}
+
+async fn signal_order_unit_withdrawal_observation(
+    client: &Client,
+    db: &Database,
+    mocks: &MockIntegratorServer,
+    workflow_id: &str,
+    order_id: Uuid,
+) {
+    let handle_before_hint = client.get_workflow_handle::<OrderWorkflow>(workflow_id);
+    let unit_withdrawal_operation = tokio::select! {
+        operation = wait_for_provider_operation(
+            db,
+            order_id,
+            ProviderOperationType::UnitWithdrawal,
+            Duration::from_secs(180),
+        ) => operation,
+        result = handle_before_hint.get_result(WorkflowGetResultOptions::default()) => {
+            let state = workflow_state_summary(db, order_id).await;
+            panic!("OrderWorkflow ended before the UnitWithdrawal provider operation was persisted: {result:?}\n{state}");
+        }
+    };
+    let provider_ref = unit_withdrawal_operation
+        .provider_ref
+        .as_deref()
+        .expect("UnitWithdrawal operation should carry provider_ref");
+    let amount = unit_withdrawal_operation
+        .request
+        .get("amount")
+        .and_then(serde_json::Value::as_str)
+        .expect("UnitWithdrawal operation request should carry amount");
+    mocks
+        .complete_unit_operation_with_source_amount(provider_ref, amount)
+        .await
+        .expect("complete mock Unit withdrawal operation");
+
+    handle_before_hint
+        .signal(
+            OrderWorkflow::provider_operation_hint,
+            ProviderOperationHintSignal {
+                order_id,
+                hint_id: Uuid::now_v7(),
+                provider_operation_id: Some(unit_withdrawal_operation.id),
+                provider: ProviderKind::Unit,
+                hint_kind: ProviderHintKind::ProviderObservation,
+                provider_ref: unit_withdrawal_operation.provider_ref,
+                evidence: None,
+            },
+            WorkflowSignalOptions::default(),
+        )
+        .await
+        .expect("send UnitWithdrawal provider-operation hint signal");
 }
 
 async fn drain_base_usdc_funding_vault_residual(
@@ -1815,6 +1965,7 @@ async fn signal_external_custody_refund_across_fill(
                 provider: ProviderKind::Bridge,
                 hint_kind: ProviderHintKind::AcrossFill,
                 provider_ref: refund_operation.provider_ref,
+                evidence: None,
             },
             WorkflowSignalOptions::default(),
         )
@@ -1883,6 +2034,7 @@ async fn signal_external_custody_refund_cctp_attestation(
                 provider: ProviderKind::Bridge,
                 hint_kind: ProviderHintKind::ProviderObservation,
                 provider_ref: refund_operation.provider_ref,
+                evidence: None,
             },
             WorkflowSignalOptions::default(),
         )
@@ -1948,6 +2100,7 @@ async fn signal_hyperliquid_spot_refund_unit_withdrawal(
                 provider: ProviderKind::Unit,
                 hint_kind: ProviderHintKind::ProviderObservation,
                 provider_ref: refund_operation.provider_ref,
+                evidence: None,
             },
             WorkflowSignalOptions::default(),
         )
@@ -2549,6 +2702,116 @@ async fn seed_funded_cctp_order(
         )
         .await
         .expect("mark CCTP order funded");
+    SeededOrder {
+        order_id: order.id,
+        funding_vault_address: vault.deposit_vault_address,
+    }
+}
+
+async fn seed_funded_unit_order(
+    db: &Database,
+    settings: Arc<Settings>,
+    chain_registry: Arc<ChainRegistry>,
+    action_providers: Arc<ActionProviderRegistry>,
+    devnet: &RiftDevnet,
+) -> SeededOrder {
+    let order_manager = OrderManager::with_action_providers(
+        db.clone(),
+        settings.clone(),
+        chain_registry.clone(),
+        action_providers,
+    );
+    let vault_manager = VaultManager::new(db.clone(), settings, chain_registry);
+    let source_asset = DepositAsset {
+        chain: ChainId::parse("bitcoin").expect("bitcoin chain id"),
+        asset: AssetId::Native,
+    };
+    let destination_asset = DepositAsset {
+        chain: ChainId::parse("evm:8453").expect("base chain id"),
+        asset: AssetId::Native,
+    };
+    let quote = order_manager
+        .quote_market_order(MarketOrderQuoteRequest {
+            from_asset: source_asset.clone(),
+            to_asset: destination_asset,
+            recipient_address: valid_evm_address(),
+            order_kind: MarketOrderQuoteKind::ExactIn {
+                amount_in: ORDER_BTC_AMOUNT_SATS.to_string(),
+                slippage_bps: Some(100),
+            },
+        })
+        .await
+        .expect("quote Unit order");
+    let market_quote = match quote.quote {
+        RouterOrderQuote::MarketOrder(quote) => quote,
+        RouterOrderQuote::LimitOrder(_) => panic!("expected market quote"),
+    };
+    assert!(
+        market_quote.provider_id.contains("unit_deposit:unit")
+            && market_quote
+                .provider_id
+                .contains("hyperliquid_trade:hyperliquid")
+            && market_quote.provider_id.contains("unit_withdrawal:unit"),
+        "expected a UnitDeposit + HyperliquidTrade + UnitWithdrawal route, got {}",
+        market_quote.provider_id
+    );
+
+    let (order, _) = order_manager
+        .create_order_from_quote(CreateOrderRequest {
+            quote_id: market_quote.id,
+            refund_address: devnet.bitcoin.miner_address.to_string(),
+            idempotency_key: None,
+            metadata: json!({ "test": "temporal_order_workflow_unit" }),
+        })
+        .await
+        .expect("create Unit order from quote");
+    let vault = vault_manager
+        .create_vault(CreateVaultRequest {
+            order_id: Some(order.id),
+            deposit_asset: source_asset,
+            action: VaultAction::Null,
+            recovery_address: devnet.bitcoin.miner_address.to_string(),
+            cancellation_commitment:
+                "0x1111111111111111111111111111111111111111111111111111111111111111".to_string(),
+            cancel_after: None,
+            metadata: json!({ "test": "temporal_order_workflow_unit" }),
+        })
+        .await
+        .expect("create Unit funding vault");
+    let funding_address = BitcoinAddress::from_str(&vault.deposit_vault_address)
+        .expect("funding vault Bitcoin address")
+        .require_network(BitcoinNetwork::Regtest)
+        .expect("regtest funding vault address");
+    let amount_sats = market_quote
+        .amount_in
+        .parse::<u64>()
+        .expect("Unit quote amount_in should fit in sats")
+        + 50_000;
+    devnet
+        .bitcoin
+        .deal_bitcoin(&funding_address, &BitcoinAmount::from_sat(amount_sats))
+        .await
+        .expect("fund Bitcoin source vault");
+
+    let now = Utc::now();
+    db.vaults()
+        .transition_status(
+            vault.id,
+            DepositVaultStatus::PendingFunding,
+            DepositVaultStatus::Funded,
+            now,
+        )
+        .await
+        .expect("mark Unit vault funded");
+    db.orders()
+        .transition_status(
+            order.id,
+            RouterOrderStatus::PendingFunding,
+            RouterOrderStatus::Funded,
+            now,
+        )
+        .await
+        .expect("mark Unit order funded");
     SeededOrder {
         order_id: order.id,
         funding_vault_address: vault.deposit_vault_address,
