@@ -14,6 +14,7 @@ use chains::{
 };
 use chrono::Utc;
 use devnet::{
+    evm_devnet::{MOCK_CCTP_MESSAGE_TRANSMITTER_V2_ADDRESS, MOCK_CCTP_TOKEN_MESSENGER_V2_ADDRESS},
     mock_integrators::{MockIntegratorConfig, MockIntegratorServer},
     RiftDevnet,
 };
@@ -33,7 +34,7 @@ use router_core::{
             CustodyActionExecutor, HyperliquidCallNetwork, HyperliquidRuntimeConfig,
         },
         AcrossHttpProviderConfig, ActionProviderHttpOptions, ActionProviderRegistry,
-        VeloraHttpProviderConfig,
+        CctpHttpProviderConfig, VeloraHttpProviderConfig,
     },
 };
 use router_primitives::ChainType;
@@ -69,6 +70,7 @@ use uuid::Uuid;
 
 const BASE_USDC_ADDRESS: &str = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
 const ETHEREUM_USDC_ADDRESS: &str = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+const ARBITRUM_USDC_ADDRESS: &str = "0xaf88d065e77c8cc2239327c5edb3a432268e5831";
 const POSTGRES_PORT: u16 = 5432;
 const POSTGRES_USER: &str = "postgres";
 const POSTGRES_PASSWORD: &str = "password";
@@ -78,6 +80,8 @@ const EVM_NATIVE_GAS_BUFFER_WEI: u128 = 1_000_000_000_000_000_000;
 const EXECUTE_STEP_TEMPORAL_ATTEMPTS: usize = 3;
 const ORDER_WORKFLOW_TEST_TIMEOUT: Duration = Duration::from_secs(240);
 const ORDER_AMOUNT_IN_WEI: &str = "60000000000000000";
+const ORDER_USDC_AMOUNT_RAW: &str = "150000000";
+const TEST_RESIDUAL_SINK_ADDRESS: &str = "0x2222222222222222222222222222222222222222";
 
 struct TestPostgres {
     admin_database_url: String,
@@ -90,6 +94,7 @@ struct WorkflowRun {
     order_id: Uuid,
     output: OrderWorkflowOutput,
     refund_address_balance: U256,
+    refund_address_base_usdc_balance: U256,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -97,6 +102,7 @@ enum WorkflowRoute {
     #[default]
     VeloraBaseEthToBaseUsdc,
     AcrossBaseEthToEthereumUsdc,
+    CctpBaseUsdcToArbitrumEth,
 }
 
 #[derive(Default)]
@@ -108,6 +114,7 @@ struct WorkflowOptions {
     refreshed_eth_usd_micro: Option<u128>,
     expect_external_custody_across_refund: bool,
     expect_hyperliquid_spot_unit_refund: bool,
+    expect_external_custody_cctp_refund: bool,
 }
 
 struct SeededOrder {
@@ -356,6 +363,72 @@ async fn order_workflow_refunds_external_custody_across_after_retry_exhaustion()
     assert!(
         run.refund_address_balance >= U256::from_str_radix(ORDER_AMOUNT_IN_WEI, 10).unwrap(),
         "refund address should receive the bridged external-custody balance"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn order_workflow_refunds_external_custody_cctp_after_retry_exhaustion() {
+    let run = run_order_workflow(WorkflowOptions {
+        route: WorkflowRoute::CctpBaseUsdcToArbitrumEth,
+        velora_transaction_failures: EXECUTE_STEP_TEMPORAL_ATTEMPTS * 2,
+        expect_external_custody_cctp_refund: true,
+        ..WorkflowOptions::default()
+    })
+    .await;
+
+    assert_eq!(run.output.terminal_status, OrderTerminalStatus::Refunded);
+    let refunded = run
+        .db
+        .orders()
+        .get(run.order_id)
+        .await
+        .expect("load CCTP-refunded order");
+    assert_eq!(refunded.status, RouterOrderStatus::Refunded);
+
+    let attempts = run
+        .db
+        .orders()
+        .get_execution_attempts(run.order_id)
+        .await
+        .expect("load execution attempts");
+    assert_eq!(attempts.len(), 3);
+    assert_eq!(
+        attempts[2].attempt_kind,
+        OrderExecutionAttemptKind::RefundRecovery
+    );
+    assert_eq!(attempts[2].status, OrderExecutionAttemptStatus::Completed);
+
+    let refund_steps = run
+        .db
+        .orders()
+        .get_execution_steps_for_attempt(attempts[2].id)
+        .await
+        .expect("load CCTP refund attempt steps");
+    assert_eq!(
+        refund_steps
+            .iter()
+            .map(|step| step.step_type)
+            .collect::<Vec<_>>(),
+        vec![
+            OrderExecutionStepType::CctpBurn,
+            OrderExecutionStepType::CctpReceive
+        ]
+    );
+    let expected_refund_amount = refund_steps
+        .iter()
+        .find(|step| step.step_type == OrderExecutionStepType::CctpReceive)
+        .and_then(|step| step.amount_in.as_deref())
+        .and_then(|amount| U256::from_str_radix(amount, 10).ok())
+        .expect("CCTP receive step should carry expected refund amount");
+    assert!(
+        refund_steps
+            .iter()
+            .all(|step| step.status == OrderExecutionStepStatus::Completed),
+        "CCTP burn and receive should both complete"
+    );
+    assert!(
+        run.refund_address_base_usdc_balance >= expected_refund_amount,
+        "refund address should receive the CCTP-bridged ExternalCustody USDC balance"
     );
 }
 
@@ -676,15 +749,26 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
         )
         .await;
     }
+    if matches!(options.route, WorkflowRoute::CctpBaseUsdcToArbitrumEth) {
+        install_mock_usdc_clone(
+            &devnet.arbitrum,
+            ARBITRUM_USDC_ADDRESS
+                .parse()
+                .expect("valid Arbitrum USDC address"),
+        )
+        .await;
+    }
     let mocks = spawn_mocks(&devnet, &options).await;
     let settings = Arc::new(test_settings());
     let hyperliquid_enabled = options.expect_hyperliquid_spot_unit_refund;
+    let cctp_enabled = matches!(options.route, WorkflowRoute::CctpBaseUsdcToArbitrumEth);
     let chain_registry =
         Arc::new(test_chain_registry(&devnet, options.route, hyperliquid_enabled).await);
     let action_providers = Arc::new(test_action_providers(
         &mocks,
         options.route,
         hyperliquid_enabled,
+        cctp_enabled,
     ));
     let mut custody_executor =
         CustodyActionExecutor::new(db.clone(), settings.clone(), chain_registry.clone());
@@ -701,8 +785,8 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
         WorkflowRoute::VeloraBaseEthToBaseUsdc => {
             seed_funded_single_step_order(
                 &db,
-                settings,
-                chain_registry,
+                settings.clone(),
+                chain_registry.clone(),
                 action_providers.clone(),
                 &devnet,
             )
@@ -711,8 +795,18 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
         WorkflowRoute::AcrossBaseEthToEthereumUsdc => {
             seed_funded_across_order(
                 &db,
-                settings,
-                chain_registry,
+                settings.clone(),
+                chain_registry.clone(),
+                action_providers.clone(),
+                &devnet,
+            )
+            .await
+        }
+        WorkflowRoute::CctpBaseUsdcToArbitrumEth => {
+            seed_funded_cctp_order(
+                &db,
+                settings.clone(),
+                chain_registry.clone(),
                 action_providers.clone(),
                 &devnet,
             )
@@ -746,6 +840,8 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
 
     let local = tokio::task::LocalSet::new();
     let db_for_workflow = db.clone();
+    let settings_for_workflow = settings.clone();
+    let chain_registry_for_workflow = chain_registry.clone();
     let devnet_for_workflow = &devnet;
     let output = local
         .run_until(async move {
@@ -816,6 +912,28 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
                     .await
                     .expect("send Across provider-operation hint signal");
             }
+            if matches!(options.route, WorkflowRoute::CctpBaseUsdcToArbitrumEth) {
+                let cctp_operation = wait_for_order_cctp_burn(
+                    &client,
+                    &db_for_workflow,
+                    &mocks,
+                    &workflow_id,
+                    order_id,
+                )
+                .await;
+                if options.expect_external_custody_cctp_refund {
+                    drain_base_usdc_funding_vault_residual(
+                        &db_for_workflow,
+                        &settings_for_workflow,
+                        &chain_registry_for_workflow,
+                        order_id,
+                        &seeded.funding_vault_address,
+                    )
+                    .await;
+                }
+                signal_order_cctp_attestation(&client, &workflow_id, order_id, cctp_operation)
+                    .await;
+            }
             if options.expect_external_custody_across_refund {
                 signal_external_custody_refund_across_fill(
                     &client,
@@ -823,6 +941,16 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
                     &mocks,
                     devnet_for_workflow,
                     &seeded.funding_vault_address,
+                    order_id,
+                )
+                .await;
+            }
+            if options.expect_external_custody_cctp_refund {
+                signal_external_custody_refund_cctp_attestation(
+                    &client,
+                    &db_for_workflow,
+                    &mocks,
+                    &workflow_id,
                     order_id,
                 )
                 .await;
@@ -854,6 +982,12 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
         })
         .await;
     let refund_address_balance = native_balance(&devnet.base, &valid_evm_address()).await;
+    let refund_address_base_usdc_balance = erc20_balance(
+        &devnet.base,
+        BASE_USDC_ADDRESS.parse().expect("valid Base USDC address"),
+        Address::from_str(&valid_evm_address()).expect("valid refund address"),
+    )
+    .await;
 
     WorkflowRun {
         _postgres: postgres,
@@ -861,6 +995,7 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
         order_id,
         output,
         refund_address_balance,
+        refund_address_base_usdc_balance,
     }
 }
 
@@ -987,6 +1122,26 @@ async fn test_chain_registry(
         .expect("ethereum chain setup");
         registry.register_evm(ChainType::Ethereum, Arc::new(ethereum_chain));
     }
+    if matches!(route, WorkflowRoute::CctpBaseUsdcToArbitrumEth) {
+        let arbitrum_chain = EvmChain::new_with_gas_sponsor(
+            &devnet.arbitrum.anvil.endpoint(),
+            ARBITRUM_USDC_ADDRESS,
+            ChainType::Arbitrum,
+            b"temporal-worker-arbitrum-wallet",
+            1,
+            Duration::from_secs(1),
+            Some(EvmGasSponsorConfig {
+                private_key: format!(
+                    "0x{}",
+                    alloy::hex::encode(devnet.arbitrum.anvil.keys()[0].to_bytes())
+                ),
+                vault_gas_buffer_wei: U256::from(EVM_NATIVE_GAS_BUFFER_WEI),
+            }),
+        )
+        .await
+        .expect("arbitrum chain setup");
+        registry.register_evm(ChainType::Arbitrum, Arc::new(arbitrum_chain));
+    }
     if hyperliquid_enabled {
         registry.register(
             ChainType::Hyperliquid,
@@ -1004,18 +1159,21 @@ fn test_action_providers(
     mocks: &MockIntegratorServer,
     route: WorkflowRoute,
     hyperliquid_enabled: bool,
+    cctp_enabled: bool,
 ) -> ActionProviderRegistry {
     ActionProviderRegistry::http_from_options(ActionProviderHttpOptions {
         across: matches!(route, WorkflowRoute::AcrossBaseEthToEthereumUsdc).then(|| {
             AcrossHttpProviderConfig::new(mocks.base_url().to_string(), "temporal-worker-across")
         }),
-        cctp: None,
+        cctp: cctp_enabled.then(|| CctpHttpProviderConfig::mock(mocks.base_url().to_string())),
         hyperunit_base_url: hyperliquid_enabled.then(|| mocks.base_url().to_string()),
         hyperunit_proxy_url: None,
         hyperliquid_base_url: hyperliquid_enabled.then(|| mocks.base_url().to_string()),
         velora: matches!(
             route,
-            WorkflowRoute::VeloraBaseEthToBaseUsdc | WorkflowRoute::AcrossBaseEthToEthereumUsdc
+            WorkflowRoute::VeloraBaseEthToBaseUsdc
+                | WorkflowRoute::AcrossBaseEthToEthereumUsdc
+                | WorkflowRoute::CctpBaseUsdcToArbitrumEth
         )
         .then(|| VeloraHttpProviderConfig {
             base_url: mocks.base_url().to_string(),
@@ -1061,6 +1219,25 @@ async fn spawn_mocks(devnet: &RiftDevnet, options: &WorkflowOptions) -> MockInte
                 ),
                 devnet.base.anvil.ws_endpoint_url().to_string(),
             );
+    }
+    if matches!(options.route, WorkflowRoute::CctpBaseUsdcToArbitrumEth) {
+        config = config
+            .with_velora_swap_contract_address(
+                devnet.arbitrum.anvil.chain_id(),
+                format!("{:#x}", devnet.arbitrum.mock_velora_swap_contract.address()),
+            )
+            .with_cctp_chain(
+                devnet.base.anvil.chain_id(),
+                MOCK_CCTP_TOKEN_MESSENGER_V2_ADDRESS,
+                devnet.base.anvil.endpoint(),
+            )
+            .with_cctp_chain(
+                devnet.arbitrum.anvil.chain_id(),
+                MOCK_CCTP_TOKEN_MESSENGER_V2_ADDRESS,
+                devnet.arbitrum.anvil.endpoint(),
+            )
+            .with_cctp_destination_token(devnet.base.anvil.chain_id(), BASE_USDC_ADDRESS)
+            .with_cctp_destination_token(devnet.arbitrum.anvil.chain_id(), ARBITRUM_USDC_ADDRESS);
     }
     if options.expect_hyperliquid_spot_unit_refund {
         config = config
@@ -1168,6 +1345,126 @@ async fn wait_for_provider_operation(
     }
 }
 
+async fn wait_for_order_cctp_burn(
+    client: &Client,
+    db: &Database,
+    mocks: &MockIntegratorServer,
+    workflow_id: &str,
+    order_id: Uuid,
+) -> OrderProviderOperation {
+    let handle_before_hint = client.get_workflow_handle::<OrderWorkflow>(workflow_id);
+    let cctp_operation = tokio::select! {
+        operation = wait_for_provider_operation_with_ref(
+            db,
+            order_id,
+            None,
+            ProviderOperationType::CctpBridge,
+            Duration::from_secs(90),
+        ) => operation,
+        result = handle_before_hint.get_result(WorkflowGetResultOptions::default()) => {
+            let state = workflow_state_summary(db, order_id).await;
+            panic!("OrderWorkflow ended before the CCTP provider operation reached a checkpoint: {result:?}\n{state}");
+        }
+    };
+    wait_for_cctp_burn_indexed(
+        mocks,
+        cctp_operation
+            .provider_ref
+            .as_deref()
+            .expect("CCTP operation should carry burn tx hash"),
+        Duration::from_secs(90),
+    )
+    .await;
+    cctp_operation
+}
+
+async fn signal_order_cctp_attestation(
+    client: &Client,
+    workflow_id: &str,
+    order_id: Uuid,
+    cctp_operation: OrderProviderOperation,
+) {
+    let handle_before_hint = client.get_workflow_handle::<OrderWorkflow>(workflow_id);
+    handle_before_hint
+        .signal(
+            OrderWorkflow::provider_operation_hint,
+            ProviderOperationHintSignal {
+                order_id,
+                hint_id: Uuid::now_v7(),
+                provider_operation_id: Some(cctp_operation.id),
+                provider: ProviderKind::Bridge,
+                hint_kind: ProviderHintKind::ProviderObservation,
+                provider_ref: cctp_operation.provider_ref,
+            },
+            WorkflowSignalOptions::default(),
+        )
+        .await
+        .expect("send CCTP provider-operation hint signal");
+}
+
+async fn drain_base_usdc_funding_vault_residual(
+    db: &Database,
+    settings: &Settings,
+    chain_registry: &ChainRegistry,
+    order_id: Uuid,
+    funding_vault_address: &str,
+) {
+    let evm_chain = chain_registry
+        .get_evm(&ChainType::Base)
+        .expect("Base chain registered");
+    let balance = evm_chain
+        .erc20_balance(BASE_USDC_ADDRESS, funding_vault_address)
+        .await
+        .expect("read Base USDC funding-vault residual");
+    if balance.is_zero() {
+        return;
+    }
+
+    let order = db.orders().get(order_id).await.expect("load CCTP order");
+    let funding_vault_id = order
+        .funding_vault_id
+        .expect("CCTP order should have a funding vault");
+    let funding_vault = db
+        .vaults()
+        .get(funding_vault_id)
+        .await
+        .expect("load CCTP funding vault");
+    let chain = chain_registry
+        .get(&ChainType::Base)
+        .expect("Base chain operations registered");
+    let wallet = chain
+        .derive_wallet(
+            &settings.master_key_bytes(),
+            &funding_vault.deposit_vault_salt,
+        )
+        .expect("derive CCTP funding-vault wallet");
+
+    evm_chain
+        .ensure_native_gas_for_erc20_transfer(
+            BASE_USDC_ADDRESS,
+            funding_vault_address,
+            TEST_RESIDUAL_SINK_ADDRESS,
+            balance,
+        )
+        .await
+        .expect("fund CCTP source residual drain gas");
+    evm_chain
+        .transfer_erc20_amount(
+            BASE_USDC_ADDRESS,
+            wallet.private_key(),
+            TEST_RESIDUAL_SINK_ADDRESS,
+            balance,
+        )
+        .await
+        .expect("drain CCTP source residual");
+
+    let remaining = evm_chain
+        .erc20_balance(BASE_USDC_ADDRESS, funding_vault_address)
+        .await
+        .expect("read drained Base USDC funding-vault residual");
+    assert_eq!(remaining, U256::ZERO);
+}
+
 async fn signal_external_custody_refund_across_fill(
     client: &Client,
     db: &Database,
@@ -1242,6 +1539,74 @@ async fn signal_external_custody_refund_across_fill(
         )
         .await
         .expect("send refund Across provider-operation hint signal");
+}
+
+async fn signal_external_custody_refund_cctp_attestation(
+    client: &Client,
+    db: &Database,
+    mocks: &MockIntegratorServer,
+    workflow_id: &str,
+    order_id: Uuid,
+) {
+    let parent_attempt = wait_for_execution_attempt(
+        db,
+        order_id,
+        OrderExecutionAttemptKind::PrimaryExecution,
+        2,
+        Some(OrderExecutionAttemptStatus::Failed),
+        Duration::from_secs(120),
+    )
+    .await;
+    let order_workflow = client.get_workflow_handle::<OrderWorkflow>(workflow_id);
+    let refund_attempt = tokio::select! {
+        attempt = wait_for_execution_attempt(
+            db,
+            order_id,
+            OrderExecutionAttemptKind::RefundRecovery,
+            3,
+            None,
+            Duration::from_secs(120),
+        ) => attempt,
+        result = order_workflow.get_result(WorkflowGetResultOptions::default()) => {
+            let state = workflow_state_summary(db, order_id).await;
+            panic!("OrderWorkflow ended before the CCTP refund attempt was materialized: {result:?}\n{state}");
+        }
+    };
+    let refund_operation = wait_for_provider_operation_with_ref(
+        db,
+        order_id,
+        Some(refund_attempt.id),
+        ProviderOperationType::CctpBridge,
+        Duration::from_secs(120),
+    )
+    .await;
+    wait_for_cctp_burn_indexed(
+        mocks,
+        refund_operation
+            .provider_ref
+            .as_deref()
+            .expect("refund CCTP operation should carry burn tx hash"),
+        Duration::from_secs(90),
+    )
+    .await;
+
+    let refund_workflow = client
+        .get_workflow_handle::<RefundWorkflow>(&refund_workflow_id(order_id, parent_attempt.id));
+    refund_workflow
+        .signal(
+            RefundWorkflow::provider_operation_hint,
+            ProviderOperationHintSignal {
+                order_id,
+                hint_id: Uuid::now_v7(),
+                provider_operation_id: Some(refund_operation.id),
+                provider: ProviderKind::Bridge,
+                hint_kind: ProviderHintKind::ProviderObservation,
+                provider_ref: refund_operation.provider_ref,
+            },
+            WorkflowSignalOptions::default(),
+        )
+        .await
+        .expect("send refund CCTP provider-operation hint signal");
 }
 
 async fn signal_hyperliquid_spot_refund_unit_withdrawal(
@@ -1331,10 +1696,12 @@ async fn wait_for_execution_attempt(
         }) {
             return attempt;
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for {attempt_kind:?} attempt {attempt_index} on order {order_id}"
-        );
+        if tokio::time::Instant::now() >= deadline {
+            let state = workflow_state_summary(db, order_id).await;
+            panic!(
+                "timed out waiting for {attempt_kind:?} attempt {attempt_index} on order {order_id}\n{state}"
+            );
+        }
         sleep(Duration::from_millis(250)).await;
     }
 }
@@ -1359,9 +1726,66 @@ async fn wait_for_provider_operation_for_attempt(
         }) {
             return operation;
         }
+        if tokio::time::Instant::now() >= deadline {
+            let state = workflow_state_summary(db, order_id).await;
+            panic!(
+                "timed out waiting for provider operation {operation_type:?} on attempt {attempt_id}\n{state}"
+            );
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn wait_for_provider_operation_with_ref(
+    db: &Database,
+    order_id: Uuid,
+    attempt_id: Option<Uuid>,
+    operation_type: ProviderOperationType,
+    max_wait: Duration,
+) -> OrderProviderOperation {
+    let deadline = tokio::time::Instant::now() + max_wait;
+    loop {
+        let operations = db
+            .orders()
+            .get_provider_operations(order_id)
+            .await
+            .expect("load provider operations");
+        if let Some(operation) = operations.into_iter().find(|operation| {
+            operation.operation_type == operation_type
+                && attempt_id
+                    .is_none_or(|attempt_id| operation.execution_attempt_id == Some(attempt_id))
+                && operation.provider_ref.is_some()
+        }) {
+            return operation;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let state = workflow_state_summary(db, order_id).await;
+            panic!(
+                "timed out waiting for provider operation {operation_type:?} with provider_ref on order {order_id}\n{state}"
+            );
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn wait_for_cctp_burn_indexed(
+    mocks: &MockIntegratorServer,
+    burn_tx_hash: &str,
+    max_wait: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + max_wait;
+    loop {
+        if mocks
+            .cctp_burns()
+            .await
+            .iter()
+            .any(|record| record.burn_tx_hash.eq_ignore_ascii_case(burn_tx_hash))
+        {
+            return;
+        }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "timed out waiting for provider operation {operation_type:?} on attempt {attempt_id}"
+            "timed out waiting for CCTP mock to index burn {burn_tx_hash}"
         );
         sleep(Duration::from_millis(250)).await;
     }
@@ -1456,6 +1880,13 @@ async fn provider_operation_by_type(
 
 async fn workflow_state_summary(db: &Database, order_id: Uuid) -> String {
     let mut lines = Vec::new();
+    match db.orders().get(order_id).await {
+        Ok(order) => lines.push(format!(
+            "order: status={:?} funding_vault_id={:?}",
+            order.status, order.funding_vault_id
+        )),
+        Err(err) => lines.push(format!("order load failed: {err}")),
+    }
     match db.orders().get_execution_attempts(order_id).await {
         Ok(attempts) => {
             lines.push(format!("attempts: {}", attempts.len()));
@@ -1490,6 +1921,18 @@ async fn workflow_state_summary(db: &Database, order_id: Uuid) -> String {
             }
         }
         Err(err) => lines.push(format!("attempts load failed: {err}")),
+    }
+    match db.orders().get_custody_vaults(order_id).await {
+        Ok(vaults) => {
+            lines.push(format!("custody_vaults: {}", vaults.len()));
+            for vault in vaults {
+                lines.push(format!(
+                    "  vault id={} role={:?} chain={} asset={:?} address={} status={:?}",
+                    vault.id, vault.role, vault.chain, vault.asset, vault.address, vault.status
+                ));
+            }
+        }
+        Err(err) => lines.push(format!("custody vaults load failed: {err}")),
     }
     match db.orders().get_provider_operations(order_id).await {
         Ok(operations) => {
@@ -1712,6 +2155,108 @@ async fn seed_funded_across_order(
     }
 }
 
+async fn seed_funded_cctp_order(
+    db: &Database,
+    settings: Arc<Settings>,
+    chain_registry: Arc<ChainRegistry>,
+    action_providers: Arc<ActionProviderRegistry>,
+    devnet: &RiftDevnet,
+) -> SeededOrder {
+    let order_manager = OrderManager::with_action_providers(
+        db.clone(),
+        settings.clone(),
+        chain_registry.clone(),
+        action_providers,
+    );
+    let vault_manager = VaultManager::new(db.clone(), settings, chain_registry);
+    let source_asset = DepositAsset {
+        chain: ChainId::parse("evm:8453").expect("base chain id"),
+        asset: AssetId::parse(BASE_USDC_ADDRESS).expect("base USDC asset"),
+    };
+    let destination_asset = DepositAsset {
+        chain: ChainId::parse("evm:42161").expect("arbitrum chain id"),
+        asset: AssetId::Native,
+    };
+    let quote = order_manager
+        .quote_market_order(MarketOrderQuoteRequest {
+            from_asset: source_asset.clone(),
+            to_asset: destination_asset,
+            recipient_address: valid_evm_address(),
+            order_kind: MarketOrderQuoteKind::ExactIn {
+                amount_in: ORDER_USDC_AMOUNT_RAW.to_string(),
+                slippage_bps: Some(100),
+            },
+        })
+        .await
+        .expect("quote CCTP order");
+    let market_quote = match quote.quote {
+        RouterOrderQuote::MarketOrder(quote) => quote,
+        RouterOrderQuote::LimitOrder(_) => panic!("expected market quote"),
+    };
+    assert!(
+        market_quote.provider_id.contains("cctp_bridge:cctp")
+            && market_quote
+                .provider_id
+                .contains("universal_router_swap:velora"),
+        "expected a CCTP + Velora route, got {}",
+        market_quote.provider_id
+    );
+
+    let (order, _) = order_manager
+        .create_order_from_quote(CreateOrderRequest {
+            quote_id: market_quote.id,
+            refund_address: valid_evm_address(),
+            idempotency_key: None,
+            metadata: json!({ "test": "temporal_order_workflow_cctp" }),
+        })
+        .await
+        .expect("create CCTP order from quote");
+    let vault = vault_manager
+        .create_vault(CreateVaultRequest {
+            order_id: Some(order.id),
+            deposit_asset: source_asset,
+            action: VaultAction::Null,
+            recovery_address: valid_evm_address(),
+            cancellation_commitment:
+                "0x1111111111111111111111111111111111111111111111111111111111111111".to_string(),
+            cancel_after: None,
+            metadata: json!({ "test": "temporal_order_workflow_cctp" }),
+        })
+        .await
+        .expect("create CCTP funding vault");
+    fund_erc20_source_vault(
+        &devnet.base,
+        BASE_USDC_ADDRESS.parse().expect("valid Base USDC address"),
+        &vault.deposit_vault_address,
+        &market_quote.amount_in,
+    )
+    .await;
+
+    let now = Utc::now();
+    db.vaults()
+        .transition_status(
+            vault.id,
+            DepositVaultStatus::PendingFunding,
+            DepositVaultStatus::Funded,
+            now,
+        )
+        .await
+        .expect("mark CCTP vault funded");
+    db.orders()
+        .transition_status(
+            order.id,
+            RouterOrderStatus::PendingFunding,
+            RouterOrderStatus::Funded,
+            now,
+        )
+        .await
+        .expect("mark CCTP order funded");
+    SeededOrder {
+        order_id: order.id,
+        funding_vault_address: vault.deposit_vault_address,
+    }
+}
+
 async fn fund_source_vault(devnet: &RiftDevnet, vault_address: &str, amount_in: &str) {
     let vault_address = Address::from_str(vault_address).expect("funding vault EVM address");
     let amount = U256::from_str_radix(amount_in, 10).expect("amount parses");
@@ -1722,6 +2267,19 @@ async fn fund_source_vault(devnet: &RiftDevnet, vault_address: &str, amount_in: 
     )
     .await;
     mine_evm_confirmation_block(&devnet.base).await;
+}
+
+async fn fund_erc20_source_vault(
+    devnet: &devnet::EthDevnet,
+    token_address: Address,
+    vault_address: &str,
+    amount_in: &str,
+) {
+    let vault_address = Address::from_str(vault_address).expect("funding vault EVM address");
+    let amount = U256::from_str_radix(amount_in, 10).expect("amount parses");
+    send_native(devnet, vault_address, U256::from(EVM_NATIVE_GAS_BUFFER_WEI)).await;
+    mint_erc20(devnet, token_address, vault_address, amount).await;
+    mine_evm_confirmation_block(devnet).await;
 }
 
 async fn send_native(devnet: &devnet::EthDevnet, recipient: Address, amount: U256) {
@@ -1764,6 +2322,18 @@ async fn native_balance(devnet: &devnet::EthDevnet, address: &str) -> U256 {
         .get_balance(Address::from_str(address).expect("valid EVM balance address"))
         .await
         .expect("read native balance")
+}
+
+async fn erc20_balance(devnet: &devnet::EthDevnet, token_address: Address, owner: Address) -> U256 {
+    let provider = ProviderBuilder::new()
+        .connect_http(devnet.anvil.endpoint_url())
+        .erased();
+    let token = GenericEIP3009ERC20Instance::new(token_address, provider);
+    token
+        .balanceOf(owner)
+        .call()
+        .await
+        .expect("read ERC20 balance")
 }
 
 async fn mint_erc20(
@@ -1821,14 +2391,22 @@ async fn install_mock_usdc_clone(devnet: &devnet::EthDevnet, token_address: Addr
         .get_receipt()
         .await
         .expect("mock USDC initialize receipt");
-    token
-        .configureMinter(admin, U256::MAX)
-        .send()
-        .await
-        .expect("send mock USDC configureMinter")
-        .get_receipt()
-        .await
-        .expect("mock USDC configureMinter receipt");
+    let minters = [
+        admin,
+        *devnet.mock_velora_swap_contract.address(),
+        Address::from_str(MOCK_CCTP_MESSAGE_TRANSMITTER_V2_ADDRESS)
+            .expect("valid mock CCTP MessageTransmitterV2 address"),
+    ];
+    for minter in minters {
+        token
+            .configureMinter(minter, U256::MAX)
+            .send()
+            .await
+            .expect("send mock USDC configureMinter")
+            .get_receipt()
+            .await
+            .expect("mock USDC configureMinter receipt");
+    }
 }
 
 fn anvil_signer(devnet: &devnet::EthDevnet) -> PrivateKeySigner {
