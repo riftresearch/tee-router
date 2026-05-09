@@ -7223,6 +7223,7 @@ dependencies = [
  "eip3009-erc20-contract",
  "futures",
  "futures-util",
+ "hyperunit-client",
  "router-core",
  "router-primitives",
  "router-server",

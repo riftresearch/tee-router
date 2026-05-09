@@ -7,8 +7,9 @@ pub mod worker_lease_repo;
 
 pub use order_repo::{
     CompletedExecutionOrder, ExecutionAttemptMaterializationRecord, ExecutionAttemptPlan,
-    ExternalCustodyRefundAttemptPlan, FundingVaultRefundAttemptPlan, OrderRepository,
-    PersistStepCompletionRecord, RefreshedExecutionAttemptPlan, StepCompletionRecord,
+    ExternalCustodyRefundAttemptPlan, FundingVaultRefundAttemptPlan,
+    HyperliquidSpotRefundAttemptPlan, OrderRepository, PersistStepCompletionRecord,
+    RefreshedExecutionAttemptPlan, StepCompletionRecord,
 };
 pub use provider_health_repo::ProviderHealthRepository;
 pub use provider_policy_repo::ProviderPolicyRepository;

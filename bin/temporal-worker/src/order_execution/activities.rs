@@ -7,7 +7,8 @@ use chrono::Utc;
 use router_core::{
     db::{
         Database, ExecutionAttemptPlan, ExternalCustodyRefundAttemptPlan,
-        FundingVaultRefundAttemptPlan, PersistStepCompletionRecord, RefreshedExecutionAttemptPlan,
+        FundingVaultRefundAttemptPlan, HyperliquidSpotRefundAttemptPlan,
+        PersistStepCompletionRecord, RefreshedExecutionAttemptPlan,
     },
     error::{RouterCoreError, RouterCoreResult},
     models::{
@@ -26,7 +27,10 @@ use router_core::{
             ProviderOperationObservation, ProviderOperationObservationRequest,
             UnitDepositStepRequest, UnitWithdrawalStepRequest,
         },
-        asset_registry::{MarketOrderNode, MarketOrderTransitionKind, ProviderId, TransitionDecl},
+        asset_registry::{
+            CanonicalAsset, MarketOrderNode, MarketOrderTransitionKind, ProviderId, TransitionDecl,
+            TransitionPath,
+        },
         custody_action_executor::{CustodyAction, CustodyActionError, CustodyActionRequest},
         market_order_planner::MarketOrderPlanRemainingStart,
         quote_legs::{
@@ -2587,7 +2591,7 @@ impl RefundActivities {
             return materialize_external_custody_refund_plan(&deps, input).await;
         }
         if input.position.position_kind == RecoverablePositionKind::HyperliquidSpot {
-            deferred_hyperliquid_refund_positions();
+            return materialize_hyperliquid_spot_refund_plan(&deps, input).await;
         }
         let order = deps
             .db
@@ -2810,6 +2814,364 @@ async fn materialize_external_custody_refund_plan(
     })
 }
 
+async fn materialize_hyperliquid_spot_refund_plan(
+    deps: &OrderActivityDeps,
+    input: MaterializeRefundPlanInput,
+) -> Result<RefundPlanShape, ActivityError> {
+    let order = deps
+        .db
+        .orders()
+        .get(input.order_id)
+        .await
+        .map_err(activity_error_from_display)?;
+    let custody_vault_id = input.position.custody_vault_id.ok_or_else(|| {
+        activity_error("HyperliquidSpot refund position is missing custody_vault_id")
+    })?;
+    let vault = match deps.db.orders().get_custody_vault(custody_vault_id).await {
+        Ok(vault) => vault,
+        Err(RouterCoreError::NotFound) => {
+            return Ok(refund_plan_untenable(
+                RefundUntenableReason::RefundRecoverablePositionDisappearedAfterValidation,
+            ));
+        }
+        Err(source) => return Err(activity_error_from_display(source)),
+    };
+    if vault.order_id != Some(input.order_id) {
+        return Err(activity_error(format!(
+            "HyperliquidSpot vault {} does not belong to order {}",
+            vault.id, input.order_id
+        )));
+    }
+    if vault.role != CustodyVaultRole::HyperliquidSpot {
+        return Err(activity_error(format!(
+            "custody vault {} is {}, not hyperliquid_spot",
+            vault.id,
+            vault.role.to_db_string()
+        )));
+    }
+
+    let coin = input
+        .position
+        .hyperliquid_coin
+        .clone()
+        .ok_or_else(|| activity_error("HyperliquidSpot refund position is missing coin"))?;
+    let canonical = input.position.hyperliquid_canonical.ok_or_else(|| {
+        activity_error("HyperliquidSpot refund position is missing canonical asset")
+    })?;
+    let (asset, amount) =
+        match current_hyperliquid_spot_refund_balance(deps, &order, &vault, &coin).await? {
+            Some((current_canonical, asset, amount)) if current_canonical == canonical => {
+                (asset, amount)
+            }
+            Some((current_canonical, _, _)) => {
+                return Err(activity_error(format!(
+                    "HyperliquidSpot refund coin {coin} canonical changed from {} to {}",
+                    canonical.as_str(),
+                    current_canonical.as_str()
+                )));
+            }
+            None => {
+                return Ok(refund_plan_untenable(
+                    RefundUntenableReason::RefundRecoverablePositionDisappearedAfterValidation,
+                ));
+            }
+        };
+
+    let now = Utc::now();
+    let Some((legs, steps)) = hyperliquid_spot_first_hop_refund_steps(
+        deps, &order, &vault, canonical, &asset, &amount, now,
+    )
+    .await?
+    else {
+        return Ok(refund_plan_untenable(
+            RefundUntenableReason::RefundRecoverablePositionDisappearedAfterValidation,
+        ));
+    };
+    let record = deps
+        .db
+        .orders()
+        .create_refund_attempt_from_hyperliquid_spot(
+            input.order_id,
+            input.failed_attempt_id,
+            HyperliquidSpotRefundAttemptPlan {
+                source_custody_vault_id: vault.id,
+                legs,
+                steps,
+                failure_reason: json!({
+                    "reason": "primary_execution_attempts_exhausted",
+                    "trace": "refund_workflow",
+                    "failed_attempt_id": input.failed_attempt_id,
+                }),
+                input_custody_snapshot: json!({
+                    "schema_version": 1,
+                    "source_kind": "hyperliquid_spot",
+                    "custody_vault_id": vault.id,
+                    "source_asset": {
+                        "chain": asset.chain.as_str(),
+                        "asset": asset.asset.as_str(),
+                    },
+                    "hyperliquid_coin": coin,
+                    "hyperliquid_canonical": canonical.as_str(),
+                    "amount": amount,
+                }),
+            },
+            now,
+        )
+        .await
+        .map_err(activity_error_from_display)?;
+    tracing::info!(
+        order_id = %record.order.id,
+        attempt_id = %record.attempt.id,
+        step_count = record.steps.len(),
+        event_name = "order.refund_plan_materialized",
+        "order.refund_plan_materialized"
+    );
+    Ok(RefundPlanShape {
+        outcome: RefundPlanOutcome::Materialized {
+            refund_attempt_id: record.attempt.id,
+            steps: record
+                .steps
+                .into_iter()
+                .map(|step| WorkflowExecutionStep {
+                    step_id: step.id,
+                    step_index: step.step_index,
+                })
+                .collect(),
+        },
+    })
+}
+
+async fn current_hyperliquid_spot_refund_balance(
+    deps: &OrderActivityDeps,
+    order: &RouterOrder,
+    vault: &CustodyVault,
+    coin: &str,
+) -> Result<Option<(CanonicalAsset, DepositAsset, String)>, ActivityError> {
+    let balances = deps
+        .custody_action_executor
+        .inspect_hyperliquid_spot_balances(vault)
+        .await
+        .map_err(activity_error_from_display)?;
+    let Some(balance) = balances.into_iter().find(|balance| balance.coin == coin) else {
+        return Ok(None);
+    };
+    let registry = deps.action_providers.asset_registry();
+    let Some((canonical, asset)) =
+        registry.hyperliquid_coin_asset(&balance.coin, Some(&order.source_asset.chain))
+    else {
+        return Ok(None);
+    };
+    let decimals = registry
+        .chain_asset(&asset)
+        .ok_or_else(|| {
+            activity_error(format!(
+                "missing registered decimals for Hyperliquid refund asset {} {}",
+                asset.chain, asset.asset
+            ))
+        })?
+        .decimals;
+    let Some(amount) =
+        hyperliquid_refund_balance_amount_raw(&balance.total, &balance.hold, decimals)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((canonical, asset, amount)))
+}
+
+async fn hyperliquid_spot_first_hop_refund_steps(
+    deps: &OrderActivityDeps,
+    order: &RouterOrder,
+    vault: &CustodyVault,
+    canonical: CanonicalAsset,
+    asset: &DepositAsset,
+    amount: &str,
+    planned_at: chrono::DateTime<Utc>,
+) -> Result<Option<(Vec<OrderExecutionLeg>, Vec<OrderExecutionStep>)>, ActivityError> {
+    let start = MarketOrderNode::Venue {
+        provider: ProviderId::Hyperliquid,
+        canonical,
+    };
+    let goal = MarketOrderNode::External(order.source_asset.clone());
+    let mut paths = deps
+        .action_providers
+        .asset_registry()
+        .select_transition_paths_between(start, goal, 1)
+        .into_iter()
+        .filter(|path| {
+            refund_path_compatible_with_position(RecoverablePositionKind::HyperliquidSpot, path)
+        })
+        .collect::<Vec<_>>();
+    paths.sort_by(|left, right| left.id.cmp(&right.id));
+
+    for path in paths {
+        let Some(transition) = path.transitions.first() else {
+            continue;
+        };
+        let maybe_steps = match transition.kind {
+            MarketOrderTransitionKind::UnitWithdrawal => {
+                Some(hyperliquid_spot_unit_withdrawal_refund_steps(
+                    order, vault, transition, amount, planned_at,
+                )?)
+            }
+            MarketOrderTransitionKind::HyperliquidTrade => {
+                hyperliquid_spot_trade_refund_steps(
+                    deps, order, vault, transition, amount, planned_at,
+                )
+                .await?
+            }
+            _ => None,
+        };
+        if maybe_steps.is_some() {
+            return Ok(maybe_steps);
+        }
+    }
+
+    tracing::warn!(
+        order_id = %order.id,
+        source_asset_chain = %asset.chain,
+        source_asset = %asset.asset,
+        amount,
+        event_name = "order.refund_plan_unavailable",
+        "no PR6b2 HyperliquidSpot first-hop refund path is available"
+    );
+    Ok(None)
+}
+
+fn refund_path_compatible_with_position(
+    position_kind: RecoverablePositionKind,
+    path: &TransitionPath,
+) -> bool {
+    let Some(first) = path.transitions.first() else {
+        return false;
+    };
+    match position_kind {
+        RecoverablePositionKind::FundingVault => false,
+        RecoverablePositionKind::ExternalCustody => {
+            first.kind == MarketOrderTransitionKind::AcrossBridge
+                || deferred_pr6b3_refund_transition_compatibility()
+        }
+        RecoverablePositionKind::HyperliquidSpot => matches!(
+            first.kind,
+            MarketOrderTransitionKind::HyperliquidTrade | MarketOrderTransitionKind::UnitWithdrawal
+        ),
+    }
+}
+
+fn hyperliquid_spot_unit_withdrawal_refund_steps(
+    order: &RouterOrder,
+    vault: &CustodyVault,
+    transition: &TransitionDecl,
+    amount: &str,
+    planned_at: chrono::DateTime<Utc>,
+) -> Result<(Vec<OrderExecutionLeg>, Vec<OrderExecutionStep>), ActivityError> {
+    let leg = QuoteLeg::new(QuoteLegSpec {
+        transition_decl_id: &transition.id,
+        transition_kind: transition.kind,
+        provider: transition.provider,
+        input_asset: &transition.input.asset,
+        output_asset: &transition.output.asset,
+        amount_in: amount,
+        amount_out: amount,
+        expires_at: planned_at + chrono::Duration::minutes(10),
+        raw: json!({
+            "recipient_address": order.refund_address,
+        }),
+    });
+    let custody = RefundHyperliquidBinding::Explicit {
+        vault_id: vault.id,
+        address: vault.address.clone(),
+        role: CustodyVaultRole::HyperliquidSpot,
+        asset: None,
+    };
+    let mut step = refund_transition_unit_withdrawal_step(
+        order, transition, &leg, &custody, true, 0, planned_at,
+    )?;
+    let leg = refund_execution_leg_from_quote_legs(order, transition, &[leg], 0, planned_at)?;
+    step.execution_leg_id = Some(leg.id);
+    Ok((vec![leg], vec![step]))
+}
+
+async fn hyperliquid_spot_trade_refund_steps(
+    deps: &OrderActivityDeps,
+    order: &RouterOrder,
+    vault: &CustodyVault,
+    transition: &TransitionDecl,
+    amount: &str,
+    planned_at: chrono::DateTime<Utc>,
+) -> Result<Option<(Vec<OrderExecutionLeg>, Vec<OrderExecutionStep>)>, ActivityError> {
+    let exchange = deps
+        .action_providers
+        .exchange(transition.provider.as_str())
+        .ok_or_else(|| {
+            activity_error(format!(
+                "exchange provider {} is not configured",
+                transition.provider.as_str()
+            ))
+        })?;
+    let quote = exchange
+        .quote_trade(ExchangeQuoteRequest {
+            input_asset: transition.input.asset.clone(),
+            output_asset: transition.output.asset.clone(),
+            input_decimals: None,
+            output_decimals: None,
+            order_kind: MarketOrderKind::ExactIn {
+                amount_in: amount.to_string(),
+                min_amount_out: Some("1".to_string()),
+            },
+            sender_address: None,
+            recipient_address: order.refund_address.clone(),
+        })
+        .await
+        .map_err(activity_error_from_display)?;
+    let Some(quote) = quote else {
+        return Ok(None);
+    };
+    let quote_legs = refund_exchange_quote_transition_legs(
+        &transition.id,
+        transition.kind,
+        transition.provider,
+        &quote,
+    )?;
+    if quote_legs.is_empty() {
+        return Ok(None);
+    }
+    let custody = RefundHyperliquidBinding::Explicit {
+        vault_id: vault.id,
+        address: vault.address.clone(),
+        role: CustodyVaultRole::HyperliquidSpot,
+        asset: None,
+    };
+    let refund_quote_id = Uuid::now_v7();
+    let leg_count = quote_legs.len();
+    let mut steps = Vec::with_capacity(leg_count);
+    for (leg_index, leg) in quote_legs.iter().enumerate() {
+        steps.push(refund_transition_hyperliquid_trade_step(
+            RefundHyperliquidTradeStepSpec {
+                order,
+                transition,
+                leg,
+                custody: &custody,
+                prefund_from_withdrawable: false,
+                refund_quote_id,
+                leg_index,
+                leg_count,
+                step_index: i32::try_from(leg_index).map_err(|err| {
+                    activity_error(format!(
+                        "refund HyperliquidTrade step_index overflow: {err}"
+                    ))
+                })?,
+                planned_at,
+            },
+        )?);
+    }
+    let leg = refund_execution_leg_from_quote_legs(order, transition, &quote_legs, 0, planned_at)?;
+    let leg_id = leg.id;
+    for step in &mut steps {
+        step.execution_leg_id = Some(leg_id);
+    }
+    Ok(Some((vec![leg], steps)))
+}
+
 fn external_custody_direct_refund_steps(
     order: &RouterOrder,
     vault: &CustodyVault,
@@ -2898,7 +3260,7 @@ async fn external_custody_across_refund_steps(
     planned_at: chrono::DateTime<Utc>,
 ) -> Result<Option<(Vec<OrderExecutionLeg>, Vec<OrderExecutionStep>)>, ActivityError> {
     let transition = direct_across_refund_transition(deps, asset, &order.source_asset)
-        .unwrap_or_else(|| deferred_non_across_refund_transitions());
+        .unwrap_or_else(|| deferred_pr6b3_refund_transitions());
     let bridge = deps
         .action_providers
         .bridge(ProviderId::Across.as_str())
@@ -3040,6 +3402,399 @@ fn direct_across_refund_transition(
         .find(|transition| transition.kind == MarketOrderTransitionKind::AcrossBridge)
 }
 
+#[derive(Debug, Clone)]
+enum RefundHyperliquidBinding {
+    Explicit {
+        vault_id: Uuid,
+        address: String,
+        role: CustodyVaultRole,
+        asset: Option<DepositAsset>,
+    },
+}
+
+struct RefundHyperliquidTradeStepSpec<'a> {
+    order: &'a RouterOrder,
+    transition: &'a TransitionDecl,
+    leg: &'a QuoteLeg,
+    custody: &'a RefundHyperliquidBinding,
+    prefund_from_withdrawable: bool,
+    refund_quote_id: Uuid,
+    leg_index: usize,
+    leg_count: usize,
+    step_index: i32,
+    planned_at: chrono::DateTime<Utc>,
+}
+
+struct RefundPlannedStepSpec {
+    order_id: Uuid,
+    transition_decl_id: Option<String>,
+    step_index: i32,
+    step_type: OrderExecutionStepType,
+    provider: String,
+    input_asset: Option<DepositAsset>,
+    output_asset: Option<DepositAsset>,
+    amount_in: Option<String>,
+    min_amount_out: Option<String>,
+    provider_ref: Option<String>,
+    request: Value,
+    details: Value,
+    planned_at: chrono::DateTime<Utc>,
+}
+
+fn refund_transition_hyperliquid_trade_step(
+    spec: RefundHyperliquidTradeStepSpec<'_>,
+) -> Result<OrderExecutionStep, ActivityError> {
+    let RefundHyperliquidTradeStepSpec {
+        order,
+        transition,
+        leg,
+        custody,
+        prefund_from_withdrawable,
+        refund_quote_id,
+        leg_index,
+        leg_count,
+        step_index,
+        planned_at,
+    } = spec;
+    let provider = refund_leg_provider(leg, transition)?.as_str().to_string();
+    let trade_leg = &leg.raw;
+    let order_kind = refund_required_str(trade_leg, "order_kind")?;
+    let amount_in = leg.amount_in.as_str();
+    let amount_out = leg.amount_out.as_str();
+    let min_amount_out = trade_leg
+        .get("min_amount_out")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let max_amount_in = trade_leg
+        .get("max_amount_in")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let input_asset = leg.input_deposit_asset().map_err(activity_error)?;
+    let output_asset = leg.output_deposit_asset().map_err(activity_error)?;
+    let request_input_asset = input_asset.clone();
+    let request_output_asset = output_asset.clone();
+    let RefundHyperliquidBinding::Explicit {
+        vault_id,
+        address,
+        role,
+        asset,
+    } = custody;
+
+    Ok(refund_planned_step(RefundPlannedStepSpec {
+        order_id: order.id,
+        transition_decl_id: Some(transition.id.clone()),
+        step_index,
+        step_type: OrderExecutionStepType::HyperliquidTrade,
+        provider,
+        input_asset: Some(input_asset),
+        output_asset: Some(output_asset),
+        amount_in: Some(amount_in.to_string()),
+        min_amount_out: min_amount_out.clone(),
+        provider_ref: Some(format!("refund-quote-{refund_quote_id}")),
+        request: json!({
+            "order_id": order.id,
+            "quote_id": refund_quote_id,
+            "leg_index": leg_index,
+            "leg_count": leg_count,
+            "order_kind": order_kind,
+            "amount_in": amount_in,
+            "amount_out": amount_out,
+            "min_amount_out": min_amount_out,
+            "max_amount_in": max_amount_in,
+            "input_asset": {
+                "chain_id": request_input_asset.chain.as_str(),
+                "asset": request_input_asset.asset.as_str(),
+            },
+            "output_asset": {
+                "chain_id": request_output_asset.chain.as_str(),
+                "asset": request_output_asset.asset.as_str(),
+            },
+            "prefund_from_withdrawable": prefund_from_withdrawable,
+            "hyperliquid_custody_vault_role": role.to_db_string(),
+            "hyperliquid_custody_vault_id": vault_id,
+            "hyperliquid_custody_vault_address": address,
+            "hyperliquid_custody_vault_chain_id": asset.as_ref().map(|asset| asset.chain.as_str()),
+            "hyperliquid_custody_vault_asset_id": asset.as_ref().map(|asset| asset.asset.as_str()),
+        }),
+        details: json!({
+            "schema_version": 1,
+            "refund_kind": "transition_path",
+            "leg_index": leg_index,
+            "leg_count": leg_count,
+            "hyperliquid_custody_vault_role": role.to_db_string(),
+            "hyperliquid_custody_vault_status": "bound",
+        }),
+        planned_at,
+    }))
+}
+
+fn refund_transition_unit_withdrawal_step(
+    order: &RouterOrder,
+    transition: &TransitionDecl,
+    leg: &QuoteLeg,
+    custody: &RefundHyperliquidBinding,
+    is_final: bool,
+    step_index: i32,
+    planned_at: chrono::DateTime<Utc>,
+) -> Result<OrderExecutionStep, ActivityError> {
+    let provider = refund_leg_provider(leg, transition)?.as_str().to_string();
+    let amount_in = leg.amount_in.clone();
+    let amount_out = leg.amount_out.clone();
+    let RefundHyperliquidBinding::Explicit {
+        vault_id,
+        address,
+        role,
+        asset,
+    } = custody;
+
+    Ok(refund_planned_step(RefundPlannedStepSpec {
+        order_id: order.id,
+        transition_decl_id: Some(transition.id.clone()),
+        step_index,
+        step_type: OrderExecutionStepType::UnitWithdrawal,
+        provider,
+        input_asset: Some(transition.input.asset.clone()),
+        output_asset: Some(transition.output.asset.clone()),
+        amount_in: Some(amount_in),
+        min_amount_out: Some("0".to_string()),
+        provider_ref: None,
+        request: json!({
+            "order_id": order.id,
+            "input_chain_id": transition.input.asset.chain.as_str(),
+            "input_asset": transition.input.asset.asset.as_str(),
+            "dst_chain_id": transition.output.asset.chain.as_str(),
+            "asset_id": transition.output.asset.asset.as_str(),
+            "amount": amount_out,
+            "recipient_address": if is_final { json!(order.refund_address) } else { Value::Null },
+            "recipient_custody_vault_role": if is_final { Value::Null } else { json!(CustodyVaultRole::DestinationExecution.to_db_string()) },
+            "recipient_custody_vault_id": null,
+            "min_amount_out": "0",
+            "hyperliquid_custody_vault_role": role.to_db_string(),
+            "hyperliquid_custody_vault_id": vault_id,
+            "hyperliquid_custody_vault_address": address,
+            "hyperliquid_custody_vault_chain_id": asset.as_ref().map(|asset| asset.chain.as_str()),
+            "hyperliquid_custody_vault_asset_id": asset.as_ref().map(|asset| asset.asset.as_str()),
+        }),
+        details: json!({
+            "schema_version": 1,
+            "refund_kind": "transition_path",
+            "recipient_address": if is_final { json!(order.refund_address) } else { Value::Null },
+            "recipient_custody_vault_role": if is_final { Value::Null } else { json!(CustodyVaultRole::DestinationExecution.to_db_string()) },
+            "recipient_custody_vault_status": if is_final { Value::Null } else { json!("pending_derivation") },
+            "hyperliquid_custody_vault_role": role.to_db_string(),
+            "hyperliquid_custody_vault_status": "bound",
+        }),
+        planned_at,
+    }))
+}
+
+fn refund_planned_step(spec: RefundPlannedStepSpec) -> OrderExecutionStep {
+    OrderExecutionStep {
+        id: Uuid::now_v7(),
+        order_id: spec.order_id,
+        execution_attempt_id: None,
+        execution_leg_id: None,
+        transition_decl_id: spec.transition_decl_id,
+        step_index: spec.step_index,
+        step_type: spec.step_type,
+        provider: spec.provider,
+        status: OrderExecutionStepStatus::Planned,
+        input_asset: spec.input_asset,
+        output_asset: spec.output_asset,
+        amount_in: spec.amount_in,
+        min_amount_out: spec.min_amount_out,
+        tx_hash: None,
+        provider_ref: spec.provider_ref,
+        idempotency_key: None,
+        attempt_count: 0,
+        next_attempt_at: None,
+        started_at: None,
+        completed_at: None,
+        details: spec.details,
+        request: spec.request,
+        response: json!({}),
+        error: json!({}),
+        usd_valuation: json!({}),
+        created_at: spec.planned_at,
+        updated_at: spec.planned_at,
+    }
+}
+
+fn refund_execution_leg_from_quote_legs(
+    order: &RouterOrder,
+    transition: &TransitionDecl,
+    quote_legs: &[QuoteLeg],
+    leg_index: i32,
+    planned_at: chrono::DateTime<Utc>,
+) -> Result<OrderExecutionLeg, ActivityError> {
+    let first = quote_legs.first().ok_or_else(|| {
+        activity_error(format!(
+            "refund transition {} ({}) has no quoted legs to materialize",
+            transition.id,
+            transition.kind.as_str()
+        ))
+    })?;
+    let last = quote_legs.last().ok_or_else(|| {
+        activity_error(format!(
+            "refund transition {} ({}) has no quoted legs to materialize",
+            transition.id,
+            transition.kind.as_str()
+        ))
+    })?;
+    let input_asset = first.input_deposit_asset().map_err(activity_error)?;
+    let output_asset = last.output_deposit_asset().map_err(activity_error)?;
+    let provider = quote_legs
+        .iter()
+        .map(|leg| leg.provider.as_str())
+        .reduce(|first, next| if first == next { first } else { "multi" })
+        .unwrap_or("unknown")
+        .to_string();
+    let min_amount_out = last
+        .raw
+        .get("min_amount_out")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+
+    Ok(OrderExecutionLeg {
+        id: Uuid::now_v7(),
+        order_id: order.id,
+        execution_attempt_id: None,
+        transition_decl_id: Some(transition.id.clone()),
+        leg_index,
+        leg_type: transition.kind.as_str().to_string(),
+        provider,
+        status: OrderExecutionStepStatus::Planned,
+        input_asset,
+        output_asset,
+        amount_in: first.amount_in.clone(),
+        expected_amount_out: last.amount_out.clone(),
+        min_amount_out,
+        actual_amount_in: None,
+        actual_amount_out: None,
+        started_at: None,
+        completed_at: None,
+        provider_quote_expires_at: quote_legs.iter().map(|leg| leg.expires_at).min(),
+        details: json!({
+            "schema_version": 1,
+            "refund_kind": "transition_path",
+            "transition_kind": transition.kind.as_str(),
+            "quote_leg_count": quote_legs.len(),
+            "quote_leg_transition_decl_ids": quote_legs
+                .iter()
+                .map(|leg| leg.transition_decl_id.clone())
+                .collect::<Vec<_>>(),
+            "action_step_types": quote_legs
+                .iter()
+                .map(|leg| leg.execution_step_type.to_db_string())
+                .collect::<Vec<_>>(),
+        }),
+        usd_valuation: json!({}),
+        created_at: planned_at,
+        updated_at: planned_at,
+    })
+}
+
+fn refund_exchange_quote_transition_legs(
+    transition_decl_id: &str,
+    transition_kind: MarketOrderTransitionKind,
+    provider: ProviderId,
+    quote: &ExchangeQuote,
+) -> Result<Vec<QuoteLeg>, ActivityError> {
+    let provider_name = provider.as_str();
+    let kind = quote
+        .provider_quote
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    match kind {
+        "spot_no_op" => Ok(vec![]),
+        "spot_cross_token" => {
+            let Some(legs) = quote.provider_quote.get("legs").and_then(Value::as_array) else {
+                return Err(activity_error(format!(
+                    "refund exchange quote from {provider_name} missing spot_cross_token legs"
+                )));
+            };
+            legs.iter()
+                .enumerate()
+                .map(|(index, leg)| {
+                    let input_asset = leg
+                        .get("input_asset")
+                        .ok_or_else(|| {
+                            activity_error("refund hyperliquid quote leg missing input_asset")
+                        })
+                        .and_then(|value| {
+                            QuoteLegAsset::from_value(value, "input_asset").map_err(activity_error)
+                        })?;
+                    let output_asset = leg
+                        .get("output_asset")
+                        .ok_or_else(|| {
+                            activity_error("refund hyperliquid quote leg missing output_asset")
+                        })
+                        .and_then(|value| {
+                            QuoteLegAsset::from_value(value, "output_asset").map_err(activity_error)
+                        })?;
+                    Ok(QuoteLeg {
+                        transition_decl_id: format!("{transition_decl_id}:leg:{index}"),
+                        transition_parent_decl_id: transition_decl_id.to_string(),
+                        transition_kind,
+                        execution_step_type: execution_step_type_for_transition_kind(
+                            transition_kind,
+                        ),
+                        provider,
+                        input_asset,
+                        output_asset,
+                        amount_in: required_refund_quote_leg_amount(leg, "amount_in")?,
+                        amount_out: required_refund_quote_leg_amount(leg, "amount_out")?,
+                        expires_at: quote.expires_at,
+                        raw: leg.clone(),
+                    })
+                })
+                .collect()
+        }
+        other => Err(activity_error(format!(
+            "unsupported refund exchange quote kind in transition path: {other:?}"
+        ))),
+    }
+}
+
+fn required_refund_quote_leg_amount(
+    leg: &Value,
+    field: &'static str,
+) -> Result<String, ActivityError> {
+    let Some(amount) = leg.get(field).and_then(Value::as_str) else {
+        return Err(activity_error(format!(
+            "refund hyperliquid quote leg missing {field}"
+        )));
+    };
+    if amount.is_empty() {
+        return Err(activity_error(format!(
+            "refund hyperliquid quote leg has empty {field}"
+        )));
+    }
+    Ok(amount.to_string())
+}
+
+fn refund_leg_provider(
+    leg: &QuoteLeg,
+    transition: &TransitionDecl,
+) -> Result<ProviderId, ActivityError> {
+    if leg.provider != transition.provider {
+        return Err(activity_error(format!(
+            "refund quote leg provider {} does not match transition provider {}",
+            leg.provider.as_str(),
+            transition.provider.as_str()
+        )));
+    }
+    Ok(leg.provider)
+}
+
+fn refund_required_str<'a>(value: &'a Value, key: &'static str) -> Result<&'a str, ActivityError> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| activity_error(format!("refund quote leg missing string field {key}")))
+}
+
 fn hyperliquid_refund_balance_amount_raw(
     total: &str,
     hold: &str,
@@ -3082,16 +3837,17 @@ fn decimal_string_to_raw_digits(value: &str, decimals: u8) -> Result<String, Str
     Ok(if digits.is_empty() { "0" } else { digits }.to_string())
 }
 
-/// PR6b2 deferred: materialize HyperliquidSpot refund positions.
+/// PR6b3 deferred: materialize CCTP, UnitDeposit, Hyperliquid bridge, UniversalRouter,
+/// and multi-hop refund transitions outside the PR6b1/PR6b2 first-hop slices.
 #[allow(dead_code)]
-fn deferred_hyperliquid_refund_positions() -> ! {
-    todo!("PR6b2: materialize HyperliquidSpot refund positions")
+fn deferred_pr6b3_refund_transitions() -> ! {
+    todo!("PR6b3: non-first-hop and non-shipped refund transitions")
 }
 
-/// PR6b2 deferred: materialize CCTP, Unit, Hyperliquid, and multi-leg refund transitions.
+/// PR6b3 deferred: generalize transition compatibility gates across all source handles.
 #[allow(dead_code)]
-fn deferred_non_across_refund_transitions() -> ! {
-    todo!("PR6b2: non-Across and multi-leg refund transitions")
+fn deferred_pr6b3_refund_transition_compatibility() -> ! {
+    todo!("PR6b3: general refund path compatibility gate")
 }
 
 #[derive(Clone, Default)]
@@ -3643,7 +4399,8 @@ impl ProviderObservationActivities {
                 todo!("PR7b: UnitDeposit verifier")
             }
             ProviderHintKind::ProviderObservation => {
-                todo!("PR7b: ProviderObservation verifier")
+                let deps = self.deps()?;
+                verify_provider_observation_hint(&deps, input).await
             }
             ProviderHintKind::HyperliquidTrade => {
                 todo!("PR7b: HyperliquidTrade verifier")
@@ -3812,6 +4569,190 @@ async fn verify_across_fill_hint(
             format!(
                 "Across fill observation returned {}",
                 observation.status.to_db_string()
+            ),
+        )),
+    }
+}
+
+async fn verify_provider_observation_hint(
+    deps: &OrderActivityDeps,
+    input: VerifyProviderOperationHintInput,
+) -> Result<ProviderOperationHintVerified, ActivityError> {
+    let Some(provider_operation_id) = input.signal.provider_operation_id else {
+        return Ok(provider_hint_deferred(
+            None,
+            "ProviderObservation hint missing provider_operation_id",
+        ));
+    };
+    let operation = deps
+        .db
+        .orders()
+        .get_provider_operation(provider_operation_id)
+        .await
+        .map_err(activity_error_from_display)?;
+
+    if operation.order_id != input.order_id {
+        return Ok(provider_hint_rejected(
+            Some(provider_operation_id),
+            format!(
+                "provider operation {} belongs to order {}, not {}",
+                operation.id, operation.order_id, input.order_id
+            ),
+        ));
+    }
+    if operation.execution_step_id != Some(input.step_id) {
+        return Ok(provider_hint_deferred(
+            Some(provider_operation_id),
+            format!(
+                "provider operation {} belongs to step {:?}, not {}",
+                operation.id, operation.execution_step_id, input.step_id
+            ),
+        ));
+    }
+    if matches!(
+        operation.status,
+        ProviderOperationStatus::Completed
+            | ProviderOperationStatus::Failed
+            | ProviderOperationStatus::Expired
+    ) {
+        return Ok(ProviderOperationHintVerified {
+            provider_operation_id: Some(operation.id),
+            decision: if operation.status == ProviderOperationStatus::Completed {
+                ProviderOperationHintDecision::Accept
+            } else {
+                ProviderOperationHintDecision::Reject
+            },
+            reason: Some(format!(
+                "provider operation already terminal: {}",
+                operation.status.to_db_string()
+            )),
+        });
+    }
+
+    let request = ProviderOperationObservationRequest {
+        operation_id: operation.id,
+        operation_type: operation.operation_type,
+        provider_ref: operation.provider_ref.clone(),
+        request: operation.request.clone(),
+        response: operation.response.clone(),
+        observed_state: operation.observed_state.clone(),
+        hint_evidence: json!({
+            "source": "temporal_provider_operation_hint_signal",
+            "hint_id": input.signal.hint_id,
+            "provider": input.signal.provider,
+            "hint_kind": input.signal.hint_kind,
+            "provider_ref": input.signal.provider_ref,
+        }),
+    };
+    let observation = match operation.operation_type {
+        ProviderOperationType::AcrossBridge
+        | ProviderOperationType::CctpBridge
+        | ProviderOperationType::HyperliquidBridgeDeposit
+        | ProviderOperationType::HyperliquidBridgeWithdrawal => {
+            let provider = deps
+                .action_providers
+                .bridge(&operation.provider)
+                .ok_or_else(|| {
+                    activity_error(format!(
+                        "bridge provider {} is not configured",
+                        operation.provider
+                    ))
+                })?;
+            provider
+                .observe_bridge_operation(request)
+                .await
+                .map_err(activity_error)?
+        }
+        ProviderOperationType::UnitDeposit | ProviderOperationType::UnitWithdrawal => {
+            let provider = deps
+                .action_providers
+                .unit(&operation.provider)
+                .ok_or_else(|| {
+                    activity_error(format!(
+                        "unit provider {} is not configured",
+                        operation.provider
+                    ))
+                })?;
+            provider
+                .observe_unit_operation(request)
+                .await
+                .map_err(activity_error)?
+        }
+        ProviderOperationType::HyperliquidTrade
+        | ProviderOperationType::HyperliquidLimitOrder
+        | ProviderOperationType::UniversalRouterSwap => {
+            let provider = deps
+                .action_providers
+                .exchange(&operation.provider)
+                .ok_or_else(|| {
+                    activity_error(format!(
+                        "exchange provider {} is not configured",
+                        operation.provider
+                    ))
+                })?;
+            provider
+                .observe_trade_operation(request)
+                .await
+                .map_err(activity_error)?
+        }
+    };
+
+    let Some(observation) = observation else {
+        return Ok(provider_hint_deferred(
+            Some(provider_operation_id),
+            format!(
+                "provider {} returned no observation for {}",
+                operation.provider,
+                operation.operation_type.to_db_string()
+            ),
+        ));
+    };
+    if let Some(reason) = provider_observation_ref_reject_reason(&operation, &observation) {
+        return Ok(provider_hint_rejected(Some(provider_operation_id), reason));
+    }
+
+    let provider_ref = observation
+        .provider_ref
+        .clone()
+        .or_else(|| operation.provider_ref.clone())
+        .or_else(|| observation.tx_hash.clone());
+    let observed_state = provider_hint_observed_state(&operation, &input, &observation);
+    let (updated, _) = deps
+        .db
+        .orders()
+        .update_provider_operation_status(
+            operation.id,
+            observation.status,
+            provider_ref,
+            observed_state,
+            observation.response.clone(),
+            Utc::now(),
+        )
+        .await
+        .map_err(activity_error_from_display)?;
+
+    match updated.status {
+        ProviderOperationStatus::Completed => Ok(ProviderOperationHintVerified {
+            provider_operation_id: Some(updated.id),
+            decision: ProviderOperationHintDecision::Accept,
+            reason: None,
+        }),
+        ProviderOperationStatus::Failed | ProviderOperationStatus::Expired => {
+            Ok(provider_hint_rejected(
+                Some(updated.id),
+                format!(
+                    "provider observation returned {}",
+                    updated.status.to_db_string()
+                ),
+            ))
+        }
+        ProviderOperationStatus::Planned
+        | ProviderOperationStatus::Submitted
+        | ProviderOperationStatus::WaitingExternal => Ok(provider_hint_deferred(
+            Some(updated.id),
+            format!(
+                "provider observation returned {}",
+                updated.status.to_db_string()
             ),
         )),
     }
