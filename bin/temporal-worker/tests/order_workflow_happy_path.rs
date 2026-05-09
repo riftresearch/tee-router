@@ -45,7 +45,7 @@ use router_server::{
     api::{CreateOrderRequest, CreateVaultRequest, MarketOrderQuoteKind, MarketOrderQuoteRequest},
     services::{order_manager::OrderManager, vault_manager::VaultManager},
 };
-use serde_json::json;
+use serde_json::{json, Value};
 use sqlx_core::connection::Connection;
 use sqlx_postgres::{PgConnectOptions, PgConnection, PgPool};
 use temporal_worker::{
@@ -123,6 +123,7 @@ struct WorkflowOptions {
     expect_external_custody_velora_refund: bool,
     expect_external_custody_across_then_velora_refund: bool,
     suppress_across_hint_signal: bool,
+    simulate_across_lost_intent_checkpoint: bool,
 }
 
 struct SeededOrder {
@@ -211,6 +212,42 @@ async fn order_workflow_completes_across_step_via_polling_fallback() {
         .await
         .expect("load Across step");
     assert_eq!(step.status, OrderExecutionStepStatus::Completed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn order_workflow_recovers_across_lost_intent_from_onchain_log() {
+    let run = run_order_workflow(WorkflowOptions {
+        route: WorkflowRoute::AcrossBaseEthToEthereumUsdc,
+        simulate_across_lost_intent_checkpoint: true,
+        ..WorkflowOptions::default()
+    })
+    .await;
+
+    assert_eq!(run.output.terminal_status, OrderTerminalStatus::Completed);
+    let completed = run
+        .db
+        .orders()
+        .get(run.order_id)
+        .await
+        .expect("load completed order");
+    assert_eq!(completed.status, RouterOrderStatus::Completed);
+
+    let across_operation =
+        provider_operation_by_type(&run.db, run.order_id, ProviderOperationType::AcrossBridge)
+            .await;
+    assert_eq!(across_operation.status, ProviderOperationStatus::Completed);
+    assert!(
+        across_operation.provider_ref.is_some(),
+        "recovered Across operation should persist deposit id as provider_ref"
+    );
+    assert!(
+        across_operation
+            .observed_state
+            .to_string()
+            .contains("across_deposit_log_recovery"),
+        "completed Across operation should retain the log-recovery marker: {}",
+        across_operation.observed_state
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1091,6 +1128,7 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
         custody_executor,
         chain_registry.clone(),
     );
+    let database_url_for_workflow = database_url.clone();
 
     let local = tokio::task::LocalSet::new();
     let db_for_workflow = db.clone();
@@ -1150,6 +1188,16 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
                     &across_operation,
                 )
                 .await;
+                let across_operation = if options.simulate_across_lost_intent_checkpoint {
+                    simulate_across_lost_intent_checkpoint(
+                        &database_url_for_workflow,
+                        &db_for_workflow,
+                        &across_operation,
+                    )
+                    .await
+                } else {
+                    across_operation
+                };
                 if !options.suppress_across_hint_signal {
                     handle
                         .signal(
@@ -2311,6 +2359,53 @@ fn evm_devnet_for_chain<'a>(devnet: &'a RiftDevnet, chain: &str) -> &'a devnet::
         "evm:42161" => &devnet.arbitrum,
         other => panic!("unsupported EVM chain {other}"),
     }
+}
+
+async fn simulate_across_lost_intent_checkpoint(
+    database_url: &str,
+    db: &Database,
+    operation: &OrderProviderOperation,
+) -> OrderProviderOperation {
+    let deposit_tx_hash = operation
+        .observed_state
+        .get("deposit_tx_hash")
+        .or_else(|| operation.observed_state.get("tx_hash"))
+        .and_then(Value::as_str)
+        .expect("Across operation should carry deposit tx hash before lost-intent simulation")
+        .to_string();
+    let checkpoint_response = json!({
+        "kind": "provider_receipt_checkpoint",
+        "provider": &operation.provider,
+        "operation_id": operation.id,
+        "provider_response": &operation.response,
+        "tx_hash": &deposit_tx_hash,
+        "tx_hashes": [&deposit_tx_hash],
+    });
+    let pool = PgPool::connect(database_url)
+        .await
+        .expect("connect raw pool for lost-intent simulation");
+    sqlx_core::query::query(
+        r#"
+        UPDATE order_provider_operations
+        SET provider_ref = NULL,
+            status = $2,
+            response_json = $3,
+            observed_state_json = '{}'::jsonb,
+            updated_at = $4
+        WHERE id = $1
+        "#,
+    )
+    .bind(operation.id)
+    .bind(ProviderOperationStatus::WaitingExternal.to_db_string())
+    .bind(checkpoint_response)
+    .bind(Utc::now())
+    .execute(&pool)
+    .await
+    .expect("simulate Across lost-intent checkpoint");
+    db.orders()
+        .get_provider_operation(operation.id)
+        .await
+        .expect("reload simulated Across lost-intent operation")
 }
 
 async fn provider_operation_by_type(
