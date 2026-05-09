@@ -3121,21 +3121,34 @@ fn refund_path_compatible_with_position(
         RecoverablePositionKind::FundingVault => false,
         RecoverablePositionKind::ExternalCustody => match first.kind {
             MarketOrderTransitionKind::AcrossBridge | MarketOrderTransitionKind::CctpBridge => true,
-            MarketOrderTransitionKind::UnitDeposit
-            | MarketOrderTransitionKind::UniversalRouterSwap => {
-                deferred_pr6b4_external_custody_refund_transitions()
+            MarketOrderTransitionKind::UniversalRouterSwap => {
+                external_custody_universal_router_refund_is_terminal(path)
+            }
+            MarketOrderTransitionKind::UnitDeposit => {
+                deferred_pr6b7_external_custody_unit_deposit_refund_transition()
             }
             MarketOrderTransitionKind::HyperliquidBridgeDeposit
             | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
-                deferred_pr6b5_external_custody_hyperliquid_refund_transitions()
+                deferred_pr6b6_external_custody_hyperliquid_refund_transitions()
             }
-            _ => deferred_pr6b6_refund_transition_compatibility(),
+            _ => deferred_pr6b7_refund_transition_compatibility(),
         },
         RecoverablePositionKind::HyperliquidSpot => matches!(
             first.kind,
             MarketOrderTransitionKind::HyperliquidTrade | MarketOrderTransitionKind::UnitWithdrawal
         ),
     }
+}
+
+fn external_custody_universal_router_refund_is_terminal(path: &TransitionPath) -> bool {
+    let [transition] = path.transitions.as_slice() else {
+        return false;
+    };
+    matches!(transition.from, MarketOrderNode::External(_))
+        && matches!(transition.to, MarketOrderNode::External(_))
+        && transition.input.asset.chain == transition.output.asset.chain
+        && transition.input.asset.asset != transition.output.asset.asset
+        && transition.input.asset.chain.evm_chain_id().is_some()
 }
 
 fn hyperliquid_spot_unit_withdrawal_refund_steps(
@@ -3387,7 +3400,17 @@ async fn external_custody_refund_back_steps(
                 planned_at,
             )?
         }
-        _ => deferred_pr6b4_external_custody_refund_transitions(),
+        MarketOrderTransitionKind::UniversalRouterSwap => {
+            let leg = refund_take_one_leg(
+                &quoted_path.legs,
+                transition,
+                OrderExecutionStepType::UniversalRouterSwap,
+            )?;
+            vec![refund_transition_universal_router_swap_step(
+                order, vault, transition, &leg, true, planned_at,
+            )?]
+        }
+        _ => deferred_pr6b7_refund_transition_compatibility(),
     };
     let leg =
         refund_execution_leg_from_quote_legs(order, transition, &quoted_path.legs, 0, planned_at)?;
@@ -3454,38 +3477,91 @@ async fn quote_external_custody_refund_path(
     if path.transitions.len() != 1 {
         return Ok(None);
     }
-    let bridge = deps
-        .action_providers
-        .bridge(transition.provider.as_str())
-        .ok_or_else(|| {
-            activity_error(format!(
-                "{} bridge provider is not configured",
-                transition.provider.as_str()
-            ))
-        })?;
-    let quote = bridge
-        .quote_bridge(BridgeQuoteRequest {
-            source_asset: transition.input.asset.clone(),
-            destination_asset: transition.output.asset.clone(),
-            order_kind: MarketOrderKind::ExactIn {
-                amount_in: amount.to_string(),
-                min_amount_out: Some("1".to_string()),
-            },
-            recipient_address: order.refund_address.clone(),
-            depositor_address: vault.address.clone(),
-            partial_fills_enabled: false,
-        })
-        .await
-        .map_err(activity_error)?;
-    let Some(quote) = quote else {
-        return Ok(None);
-    };
-    let legs = refund_bridge_quote_legs(transition, &quote)?;
-    Ok(Some(RefundQuotedPath {
-        path,
-        amount_out: quote.amount_out,
-        legs,
-    }))
+    match transition.kind {
+        MarketOrderTransitionKind::AcrossBridge | MarketOrderTransitionKind::CctpBridge => {
+            let bridge = deps
+                .action_providers
+                .bridge(transition.provider.as_str())
+                .ok_or_else(|| {
+                    activity_error(format!(
+                        "{} bridge provider is not configured",
+                        transition.provider.as_str()
+                    ))
+                })?;
+            let quote = bridge
+                .quote_bridge(BridgeQuoteRequest {
+                    source_asset: transition.input.asset.clone(),
+                    destination_asset: transition.output.asset.clone(),
+                    order_kind: MarketOrderKind::ExactIn {
+                        amount_in: amount.to_string(),
+                        min_amount_out: Some("1".to_string()),
+                    },
+                    recipient_address: order.refund_address.clone(),
+                    depositor_address: vault.address.clone(),
+                    partial_fills_enabled: false,
+                })
+                .await
+                .map_err(activity_error)?;
+            let Some(quote) = quote else {
+                return Ok(None);
+            };
+            let legs = refund_bridge_quote_legs(transition, &quote)?;
+            Ok(Some(RefundQuotedPath {
+                path,
+                amount_out: quote.amount_out,
+                legs,
+            }))
+        }
+        MarketOrderTransitionKind::UniversalRouterSwap => {
+            let exchange = deps
+                .action_providers
+                .exchange(transition.provider.as_str())
+                .ok_or_else(|| {
+                    activity_error(format!(
+                        "{} exchange provider is not configured",
+                        transition.provider.as_str()
+                    ))
+                })?;
+            let quote = exchange
+                .quote_trade(ExchangeQuoteRequest {
+                    input_asset: transition.input.asset.clone(),
+                    output_asset: transition.output.asset.clone(),
+                    input_decimals: refund_asset_decimals(deps, &transition.input.asset),
+                    output_decimals: refund_asset_decimals(deps, &transition.output.asset),
+                    order_kind: MarketOrderKind::ExactIn {
+                        amount_in: amount.to_string(),
+                        min_amount_out: Some("1".to_string()),
+                    },
+                    sender_address: Some(vault.address.clone()),
+                    recipient_address: order.refund_address.clone(),
+                })
+                .await
+                .map_err(activity_error)?;
+            let Some(quote) = quote else {
+                return Ok(None);
+            };
+            let legs = refund_exchange_quote_transition_legs(
+                &transition.id,
+                transition.kind,
+                transition.provider,
+                &quote,
+            )?;
+            Ok(Some(RefundQuotedPath {
+                path,
+                amount_out: quote.amount_out,
+                legs,
+            }))
+        }
+        _ => deferred_pr6b7_refund_transition_compatibility(),
+    }
+}
+
+fn refund_asset_decimals(deps: &OrderActivityDeps, asset: &DepositAsset) -> Option<u8> {
+    deps.action_providers
+        .asset_registry()
+        .chain_asset(asset)
+        .map(|entry| entry.decimals)
+        .or_else(|| (asset.chain.evm_chain_id().is_some() && asset.asset.is_native()).then_some(18))
 }
 
 fn choose_better_refund_quote(
@@ -3579,7 +3655,7 @@ fn refund_bridge_quote_legs(
             .with_execution_step_type(OrderExecutionStepType::CctpReceive);
             Ok(vec![burn, receive])
         }
-        _ => deferred_pr6b4_external_custody_refund_transitions(),
+        _ => deferred_pr6b7_refund_transition_compatibility(),
     }
 }
 
@@ -3793,6 +3869,91 @@ fn refund_transition_cctp_bridge_steps(
         planned_at,
     });
     Ok(vec![burn, receive])
+}
+
+fn refund_transition_universal_router_swap_step(
+    order: &RouterOrder,
+    vault: &CustodyVault,
+    transition: &TransitionDecl,
+    leg: &QuoteLeg,
+    is_final: bool,
+    planned_at: chrono::DateTime<Utc>,
+) -> Result<OrderExecutionStep, ActivityError> {
+    let provider = refund_leg_provider(leg, transition)?.as_str().to_string();
+    let swap_leg = &leg.raw;
+    let order_kind = refund_required_str(swap_leg, "order_kind")?;
+    let amount_in = leg.amount_in.as_str();
+    let amount_out = leg.amount_out.as_str();
+    let input_asset = leg.input_deposit_asset().map_err(activity_error)?;
+    let output_asset = leg.output_deposit_asset().map_err(activity_error)?;
+    let input_decimals = refund_required_u8(swap_leg, "src_decimals")?;
+    let output_decimals = refund_required_u8(swap_leg, "dest_decimals")?;
+    let price_route = swap_leg
+        .get("price_route")
+        .cloned()
+        .ok_or_else(|| activity_error("universal router refund swap leg missing price_route"))?;
+    let min_amount_out = swap_leg
+        .get("min_amount_out")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let max_amount_in = swap_leg
+        .get("max_amount_in")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let slippage_bps = swap_leg.get("slippage_bps").and_then(Value::as_u64);
+
+    Ok(refund_planned_step(RefundPlannedStepSpec {
+        order_id: order.id,
+        transition_decl_id: Some(transition.id.clone()),
+        step_index: 0,
+        step_type: OrderExecutionStepType::UniversalRouterSwap,
+        provider,
+        input_asset: Some(input_asset.clone()),
+        output_asset: Some(output_asset.clone()),
+        amount_in: Some(amount_in.to_string()),
+        min_amount_out: min_amount_out.clone(),
+        provider_ref: Some(format!("order:{}:external-refund:swap", order.id)),
+        request: json!({
+            "order_id": order.id,
+            "quote_id": Uuid::now_v7(),
+            "order_kind": order_kind,
+            "amount_in": amount_in,
+            "amount_out": amount_out,
+            "min_amount_out": min_amount_out,
+            "max_amount_in": max_amount_in,
+            "input_asset": {
+                "chain_id": input_asset.chain.as_str(),
+                "asset": input_asset.asset.as_str(),
+            },
+            "output_asset": {
+                "chain_id": output_asset.chain.as_str(),
+                "asset": output_asset.asset.as_str(),
+            },
+            "input_decimals": input_decimals,
+            "output_decimals": output_decimals,
+            "price_route": price_route,
+            "slippage_bps": slippage_bps,
+            "source_custody_vault_id": vault.id,
+            "source_custody_vault_address": &vault.address,
+            "source_custody_vault_role": vault.role.to_db_string(),
+            "recipient_address": if is_final { json!(order.refund_address) } else { Value::Null },
+            "recipient_custody_vault_id": null,
+            "recipient_custody_vault_role": if is_final { Value::Null } else { json!(CustodyVaultRole::DestinationExecution.to_db_string()) },
+        }),
+        details: json!({
+            "schema_version": 1,
+            "transition_kind": transition.kind.as_str(),
+            "refund_kind": "external_custody_universal_router_swap",
+            "source_custody_vault_id": vault.id,
+            "source_custody_vault_address": &vault.address,
+            "source_custody_vault_role": vault.role.to_db_string(),
+            "source_custody_vault_status": "bound",
+            "recipient_address": if is_final { json!(&order.refund_address) } else { Value::Null },
+            "recipient_custody_vault_role": if is_final { Value::Null } else { json!(CustodyVaultRole::DestinationExecution.to_db_string()) },
+            "recipient_custody_vault_status": if is_final { Value::Null } else { json!("pending_derivation") },
+        }),
+        planned_at,
+    }))
 }
 
 #[derive(Debug, Clone)]
@@ -4101,6 +4262,35 @@ fn refund_exchange_quote_transition_legs(
         .unwrap_or("");
     match kind {
         "spot_no_op" => Ok(vec![]),
+        "universal_router_swap" => {
+            let input_asset = quote
+                .provider_quote
+                .get("input_asset")
+                .ok_or_else(|| activity_error("refund universal router quote missing input_asset"))
+                .and_then(|value| {
+                    QuoteLegAsset::from_value(value, "input_asset").map_err(activity_error)
+                })?;
+            let output_asset = quote
+                .provider_quote
+                .get("output_asset")
+                .ok_or_else(|| activity_error("refund universal router quote missing output_asset"))
+                .and_then(|value| {
+                    QuoteLegAsset::from_value(value, "output_asset").map_err(activity_error)
+                })?;
+            Ok(vec![QuoteLeg {
+                transition_decl_id: transition_decl_id.to_string(),
+                transition_parent_decl_id: transition_decl_id.to_string(),
+                transition_kind,
+                execution_step_type: execution_step_type_for_transition_kind(transition_kind),
+                provider,
+                input_asset,
+                output_asset,
+                amount_in: quote.amount_in.clone(),
+                amount_out: quote.amount_out.clone(),
+                expires_at: quote.expires_at,
+                raw: quote.provider_quote.clone(),
+            }])
+        }
         "spot_cross_token" => {
             let Some(legs) = quote.provider_quote.get("legs").and_then(Value::as_array) else {
                 return Err(activity_error(format!(
@@ -4188,6 +4378,18 @@ fn refund_required_str<'a>(value: &'a Value, key: &'static str) -> Result<&'a st
         .ok_or_else(|| activity_error(format!("refund quote leg missing string field {key}")))
 }
 
+fn refund_required_u8(value: &Value, key: &'static str) -> Result<u8, ActivityError> {
+    let raw = value
+        .get(key)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| activity_error(format!("refund quote leg missing numeric field {key}")))?;
+    u8::try_from(raw).map_err(|source| {
+        activity_error(format!(
+            "refund quote leg field {key} does not fit u8: {source}"
+        ))
+    })
+}
+
 fn hyperliquid_refund_balance_amount_raw(
     total: &str,
     hold: &str,
@@ -4230,22 +4432,22 @@ fn decimal_string_to_raw_digits(value: &str, decimals: u8) -> Result<String, Str
     Ok(if digits.is_empty() { "0" } else { digits }.to_string())
 }
 
-/// PR6b4 deferred: ExternalCustody UnitDeposit and UniversalRouter refund transitions.
+/// PR6b7 deferred: ExternalCustody UnitDeposit requires multi-hop refund continuation.
 #[allow(dead_code)]
-fn deferred_pr6b4_external_custody_refund_transitions() -> ! {
-    todo!("PR6b4: ExternalCustody UnitDeposit and UniversalRouter refund transitions")
+fn deferred_pr6b7_external_custody_unit_deposit_refund_transition() -> ! {
+    todo!("PR6b7: ExternalCustody UnitDeposit requires multi-hop refund continuation")
 }
 
-/// PR6b5 deferred: ExternalCustody Hyperliquid bridge role-gated refund transitions.
+/// PR6b6 deferred: ExternalCustody Hyperliquid bridge role-gated refund transitions.
 #[allow(dead_code)]
-fn deferred_pr6b5_external_custody_hyperliquid_refund_transitions() -> ! {
-    todo!("PR6b5: ExternalCustody Hyperliquid bridge refund transitions")
+fn deferred_pr6b6_external_custody_hyperliquid_refund_transitions() -> ! {
+    todo!("PR6b6: ExternalCustody Hyperliquid bridge refund transitions")
 }
 
-/// PR6b6 deferred: multi-hop refund continuations and generalized compatibility gates.
+/// PR6b7 deferred: multi-hop refund continuations and generalized compatibility gates.
 #[allow(dead_code)]
-fn deferred_pr6b6_refund_transition_compatibility() -> ! {
-    todo!("PR6b6: multi-hop refund transition compatibility gate")
+fn deferred_pr6b7_refund_transition_compatibility() -> ! {
+    todo!("PR6b7: multi-hop refund transition compatibility gate")
 }
 
 #[derive(Clone, Default)]

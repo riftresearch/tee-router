@@ -115,6 +115,7 @@ struct WorkflowOptions {
     expect_external_custody_across_refund: bool,
     expect_hyperliquid_spot_unit_refund: bool,
     expect_external_custody_cctp_refund: bool,
+    expect_external_custody_velora_refund: bool,
 }
 
 struct SeededOrder {
@@ -429,6 +430,63 @@ async fn order_workflow_refunds_external_custody_cctp_after_retry_exhaustion() {
     assert!(
         run.refund_address_base_usdc_balance >= expected_refund_amount,
         "refund address should receive the CCTP-bridged ExternalCustody USDC balance"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn order_workflow_refunds_external_custody_universal_router_after_retry_exhaustion() {
+    let run = run_order_workflow(WorkflowOptions {
+        velora_transaction_failures: EXECUTE_STEP_TEMPORAL_ATTEMPTS * 2,
+        expect_external_custody_velora_refund: true,
+        ..WorkflowOptions::default()
+    })
+    .await;
+
+    assert_eq!(run.output.terminal_status, OrderTerminalStatus::Refunded);
+    let refunded = run
+        .db
+        .orders()
+        .get(run.order_id)
+        .await
+        .expect("load UniversalRouter-refunded order");
+    assert_eq!(refunded.status, RouterOrderStatus::Refunded);
+
+    let attempts = run
+        .db
+        .orders()
+        .get_execution_attempts(run.order_id)
+        .await
+        .expect("load execution attempts");
+    assert_eq!(attempts.len(), 3);
+    assert_eq!(
+        attempts[2].attempt_kind,
+        OrderExecutionAttemptKind::RefundRecovery
+    );
+    assert_eq!(attempts[2].status, OrderExecutionAttemptStatus::Completed);
+
+    let refund_steps = run
+        .db
+        .orders()
+        .get_execution_steps_for_attempt(attempts[2].id)
+        .await
+        .expect("load UniversalRouter refund attempt steps");
+    assert_eq!(refund_steps.len(), 1);
+    let refund_step = &refund_steps[0];
+    assert_eq!(
+        refund_step.step_type,
+        OrderExecutionStepType::UniversalRouterSwap
+    );
+    assert_eq!(refund_step.provider, "velora");
+    assert_eq!(refund_step.status, OrderExecutionStepStatus::Completed);
+    let expected_refund_amount = refund_step
+        .request
+        .get("amount_out")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|amount| U256::from_str_radix(amount, 10).ok())
+        .expect("UniversalRouter refund step should carry amount_out");
+    assert!(
+        run.refund_address_balance >= expected_refund_amount,
+        "refund address should receive the UniversalRouter-swapped ExternalCustody balance"
     );
 }
 
@@ -818,6 +876,15 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
         seed_hyperliquid_spot_refund_position(
             &custody_executor,
             &mocks,
+            &devnet,
+            order_id,
+            &seeded.funding_vault_address,
+        )
+        .await;
+    }
+    if options.expect_external_custody_velora_refund {
+        seed_external_custody_universal_router_refund_position(
+            &custody_executor,
             &devnet,
             order_id,
             &seeded.funding_vault_address,
@@ -1316,6 +1383,38 @@ async fn seed_hyperliquid_spot_refund_position(
     mocks
         .credit_hyperliquid_balance(user, "UETH", natural_eth)
         .await;
+}
+
+async fn seed_external_custody_universal_router_refund_position(
+    custody_executor: &CustodyActionExecutor,
+    devnet: &RiftDevnet,
+    order_id: Uuid,
+    funding_vault_address: &str,
+) {
+    set_native_balance(
+        &devnet.base,
+        Address::from_str(funding_vault_address).expect("funding vault EVM address"),
+        U256::ZERO,
+    )
+    .await;
+    let vault = custody_executor
+        .create_router_derived_vault(
+            order_id,
+            CustodyVaultRole::DestinationExecution,
+            CustodyVaultVisibility::Internal,
+            ChainId::parse("evm:8453").expect("base chain id"),
+            Some(AssetId::parse(BASE_USDC_ADDRESS).expect("base USDC asset")),
+            json!({ "test": "temporal_external_custody_universal_router_refund" }),
+        )
+        .await
+        .expect("create UniversalRouter ExternalCustody refund vault");
+    fund_erc20_source_vault(
+        &devnet.base,
+        BASE_USDC_ADDRESS.parse().expect("valid Base USDC address"),
+        &vault.address,
+        ORDER_USDC_AMOUNT_RAW,
+    )
+    .await;
 }
 
 async fn wait_for_provider_operation(
