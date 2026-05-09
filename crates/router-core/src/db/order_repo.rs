@@ -300,6 +300,15 @@ pub struct FundingVaultRefundAttemptPlan {
 }
 
 #[derive(Debug, Clone)]
+pub struct ExternalCustodyRefundAttemptPlan {
+    pub source_custody_vault_id: Uuid,
+    pub legs: Vec<OrderExecutionLeg>,
+    pub steps: Vec<OrderExecutionStep>,
+    pub failure_reason: serde_json::Value,
+    pub input_custody_snapshot: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
 pub struct ExecutionAttemptMaterializationRecord {
     pub order: RouterOrder,
     pub attempt: OrderExecutionAttempt,
@@ -3109,6 +3118,244 @@ impl OrderRepository {
         .await;
         telemetry::record_db_query(
             "order.create_refund_attempt_from_funding_vault",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        result
+    }
+
+    pub async fn create_refund_attempt_from_external_custody(
+        &self,
+        order_id: Uuid,
+        failed_attempt_id: Uuid,
+        plan: ExternalCustodyRefundAttemptPlan,
+        now: DateTime<Utc>,
+    ) -> RouterCoreResult<ExecutionAttemptMaterializationRecord> {
+        let started = Instant::now();
+        let result = async {
+            if plan.legs.is_empty() || plan.steps.is_empty() {
+                return Err(RouterCoreError::InvalidData {
+                    message: "external-custody refund plan must contain legs and steps".to_string(),
+                });
+            }
+
+            let mut tx = self.pool.begin().await?;
+
+            let order_row = sqlx_core::query::query(&format!(
+                r#"
+                SELECT {ORDER_SELECT_COLUMNS}
+                FROM router_orders ro
+                LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
+                LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
+                WHERE ro.id = $1
+                FOR UPDATE OF ro
+                "#
+            ))
+            .bind(order_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let order = self.map_order_row(&order_row)?;
+
+            let failed_attempt_row = sqlx_core::query::query(&format!(
+                r#"
+                SELECT {EXECUTION_ATTEMPT_SELECT_COLUMNS}
+                FROM order_execution_attempts
+                WHERE id = $1
+                FOR UPDATE
+                "#
+            ))
+            .bind(failed_attempt_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let failed_attempt = self.map_execution_attempt_row(&failed_attempt_row)?;
+            if failed_attempt.order_id != order_id {
+                return Err(RouterCoreError::Conflict {
+                    message: format!(
+                        "attempt {} does not belong to order {}",
+                        failed_attempt.id, order_id
+                    ),
+                });
+            }
+            if failed_attempt.status != OrderExecutionAttemptStatus::Failed {
+                return Err(RouterCoreError::Conflict {
+                    message: format!(
+                        "attempt {} cannot start refund from {}",
+                        failed_attempt.id,
+                        failed_attempt.status.to_db_string()
+                    ),
+                });
+            }
+
+            let source_vault_row = sqlx_core::query::query(&format!(
+                r#"
+                SELECT {CUSTODY_VAULT_SELECT_COLUMNS}
+                FROM custody_vaults
+                WHERE id = $1
+                FOR UPDATE
+                "#
+            ))
+            .bind(plan.source_custody_vault_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let source_vault = self.map_custody_vault_row(&source_vault_row)?;
+            if source_vault.order_id != Some(order_id) {
+                return Err(RouterCoreError::Conflict {
+                    message: format!(
+                        "custody vault {} does not belong to order {}",
+                        source_vault.id, order_id
+                    ),
+                });
+            }
+
+            let refund_attempt_index = failed_attempt.attempt_index + 1;
+            if let Some(existing_refund_row) = sqlx_core::query::query(&format!(
+                r#"
+                SELECT {EXECUTION_ATTEMPT_SELECT_COLUMNS}
+                FROM order_execution_attempts
+                WHERE order_id = $1
+                  AND attempt_index = $2
+                ORDER BY created_at ASC, id ASC
+                LIMIT 1
+                FOR UPDATE
+                "#
+            ))
+            .bind(order_id)
+            .bind(refund_attempt_index)
+            .fetch_optional(&mut *tx)
+            .await?
+            {
+                let attempt = self.map_execution_attempt_row(&existing_refund_row)?;
+                if attempt.attempt_kind != OrderExecutionAttemptKind::RefundRecovery {
+                    return Err(RouterCoreError::Conflict {
+                        message: format!(
+                            "order {} attempt_index {} already materialized as {}",
+                            order_id,
+                            refund_attempt_index,
+                            attempt.attempt_kind.to_db_string()
+                        ),
+                    });
+                }
+                let leg_rows = sqlx_core::query::query(&format!(
+                    r#"
+                    SELECT {EXECUTION_LEG_SELECT_COLUMNS}
+                    FROM order_execution_legs
+                    WHERE execution_attempt_id = $1
+                    ORDER BY leg_index ASC, created_at ASC, id ASC
+                    "#
+                ))
+                .bind(attempt.id)
+                .fetch_all(&mut *tx)
+                .await?;
+                let legs = leg_rows
+                    .iter()
+                    .map(|row| self.map_execution_leg_row(row))
+                    .collect::<RouterCoreResult<Vec<_>>>()?;
+                let step_rows = sqlx_core::query::query(&format!(
+                    r#"
+                    SELECT {EXECUTION_STEP_SELECT_COLUMNS}
+                    FROM order_execution_steps
+                    WHERE execution_attempt_id = $1
+                    ORDER BY step_index ASC, created_at ASC, id ASC
+                    "#
+                ))
+                .bind(attempt.id)
+                .fetch_all(&mut *tx)
+                .await?;
+                let steps = step_rows
+                    .iter()
+                    .map(|row| self.map_execution_step_row(row))
+                    .collect::<RouterCoreResult<Vec<_>>>()?;
+                tx.commit().await?;
+                return Ok::<ExecutionAttemptMaterializationRecord, RouterCoreError>(
+                    ExecutionAttemptMaterializationRecord {
+                        order,
+                        attempt,
+                        legs,
+                        steps,
+                    },
+                );
+            }
+
+            let refund_attempt = OrderExecutionAttempt {
+                id: Uuid::now_v7(),
+                order_id,
+                attempt_index: refund_attempt_index,
+                attempt_kind: OrderExecutionAttemptKind::RefundRecovery,
+                status: OrderExecutionAttemptStatus::Active,
+                trigger_step_id: failed_attempt.trigger_step_id,
+                trigger_provider_operation_id: failed_attempt.trigger_provider_operation_id,
+                failure_reason: plan.failure_reason,
+                input_custody_snapshot: plan.input_custody_snapshot,
+                created_at: now,
+                updated_at: now,
+            };
+            let refund_attempt_row = sqlx_core::query::query(&format!(
+                r#"
+                INSERT INTO order_execution_attempts (
+                    id,
+                    order_id,
+                    attempt_index,
+                    attempt_kind,
+                    status,
+                    trigger_step_id,
+                    trigger_provider_operation_id,
+                    failure_reason_json,
+                    input_custody_snapshot_json,
+                    superseded_by_attempt_id,
+                    superseded_reason_json,
+                    created_at,
+                    updated_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, '{{}}'::jsonb, $10, $11)
+                RETURNING {EXECUTION_ATTEMPT_SELECT_COLUMNS}
+                "#
+            ))
+            .bind(refund_attempt.id)
+            .bind(refund_attempt.order_id)
+            .bind(refund_attempt.attempt_index)
+            .bind(refund_attempt.attempt_kind.to_db_string())
+            .bind(refund_attempt.status.to_db_string())
+            .bind(refund_attempt.trigger_step_id)
+            .bind(refund_attempt.trigger_provider_operation_id)
+            .bind(refund_attempt.failure_reason.clone())
+            .bind(refund_attempt.input_custody_snapshot.clone())
+            .bind(refund_attempt.created_at)
+            .bind(refund_attempt.updated_at)
+            .fetch_one(&mut *tx)
+            .await?;
+            let refund_attempt = self.map_execution_attempt_row(&refund_attempt_row)?;
+
+            let mut legs = plan.legs;
+            for leg in &mut legs {
+                leg.order_id = order_id;
+                leg.execution_attempt_id = Some(refund_attempt.id);
+                leg.created_at = now;
+                leg.updated_at = now;
+                insert_execution_leg_tx(&mut tx, leg).await?;
+            }
+
+            let mut steps = plan.steps;
+            for step in &mut steps {
+                step.order_id = order_id;
+                step.execution_attempt_id = Some(refund_attempt.id);
+                step.created_at = now;
+                step.updated_at = now;
+                insert_execution_step_tx(&mut tx, step).await?;
+            }
+
+            tx.commit().await?;
+            Ok::<ExecutionAttemptMaterializationRecord, RouterCoreError>(
+                ExecutionAttemptMaterializationRecord {
+                    order,
+                    attempt: refund_attempt,
+                    legs,
+                    steps,
+                },
+            )
+        }
+        .await;
+        telemetry::record_db_query(
+            "order.create_refund_attempt_from_external_custody",
             result.is_ok(),
             started.elapsed(),
         );

@@ -685,6 +685,55 @@ impl CustodyActionExecutor {
         }
     }
 
+    pub async fn custody_vault_balance_raw(
+        &self,
+        vault: &CustodyVault,
+    ) -> CustodyActionResult<String> {
+        let Some(asset) = vault.asset.as_ref() else {
+            return Ok("0".to_string());
+        };
+        let backend_chain = backend_chain_for_id(&vault.chain).ok_or_else(|| {
+            CustodyActionError::ChainNotSupported {
+                chain: vault.chain.clone(),
+            }
+        })?;
+        match backend_chain {
+            ChainType::Bitcoin => {
+                let Some(chain) = self.chain_registry.get_bitcoin(&backend_chain) else {
+                    return Err(CustodyActionError::UnsupportedAction {
+                        action: "bitcoin_balance",
+                        chain: vault.chain.clone(),
+                    });
+                };
+                Ok(chain
+                    .address_balance_sats(&vault.address)
+                    .await
+                    .map_err(|source| CustodyActionError::Chain { source })?
+                    .to_string())
+            }
+            _ => {
+                let Some(chain) = self.chain_registry.get_evm(&backend_chain) else {
+                    return Err(CustodyActionError::UnsupportedAction {
+                        action: "evm_balance",
+                        chain: vault.chain.clone(),
+                    });
+                };
+                match asset {
+                    AssetId::Native => Ok(chain
+                        .native_balance(&vault.address)
+                        .await
+                        .map_err(|source| CustodyActionError::Chain { source })?
+                        .to_string()),
+                    AssetId::Reference(token) => Ok(chain
+                        .erc20_balance(token, &vault.address)
+                        .await
+                        .map_err(|source| CustodyActionError::Chain { source })?
+                        .to_string()),
+                }
+            }
+        }
+    }
+
     pub async fn create_router_derived_vault(
         &self,
         order_id: Uuid,
