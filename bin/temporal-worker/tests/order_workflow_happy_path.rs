@@ -116,6 +116,7 @@ struct WorkflowOptions {
     expect_hyperliquid_spot_unit_refund: bool,
     expect_external_custody_cctp_refund: bool,
     expect_external_custody_velora_refund: bool,
+    expect_external_custody_across_then_velora_refund: bool,
 }
 
 struct SeededOrder {
@@ -491,6 +492,73 @@ async fn order_workflow_refunds_external_custody_universal_router_after_retry_ex
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn order_workflow_refunds_external_custody_across_then_universal_router_after_retry_exhaustion(
+) {
+    let run = run_order_workflow(WorkflowOptions {
+        velora_transaction_failures: EXECUTE_STEP_TEMPORAL_ATTEMPTS * 2,
+        expect_external_custody_across_then_velora_refund: true,
+        ..WorkflowOptions::default()
+    })
+    .await;
+
+    assert_eq!(run.output.terminal_status, OrderTerminalStatus::Refunded);
+    let refunded = run
+        .db
+        .orders()
+        .get(run.order_id)
+        .await
+        .expect("load multi-hop refunded order");
+    assert_eq!(refunded.status, RouterOrderStatus::Refunded);
+
+    let attempts = run
+        .db
+        .orders()
+        .get_execution_attempts(run.order_id)
+        .await
+        .expect("load execution attempts");
+    assert_eq!(attempts.len(), 3);
+    assert_eq!(
+        attempts[2].attempt_kind,
+        OrderExecutionAttemptKind::RefundRecovery
+    );
+    assert_eq!(attempts[2].status, OrderExecutionAttemptStatus::Completed);
+
+    let refund_steps = run
+        .db
+        .orders()
+        .get_execution_steps_for_attempt(attempts[2].id)
+        .await
+        .expect("load multi-hop refund attempt steps");
+    assert_eq!(
+        refund_steps
+            .iter()
+            .map(|step| step.step_type)
+            .collect::<Vec<_>>(),
+        vec![
+            OrderExecutionStepType::AcrossBridge,
+            OrderExecutionStepType::UniversalRouterSwap
+        ]
+    );
+    assert!(
+        refund_steps
+            .iter()
+            .all(|step| step.status == OrderExecutionStepStatus::Completed),
+        "Across and UniversalRouter refund steps should both complete"
+    );
+    let expected_refund_amount = refund_steps
+        .iter()
+        .find(|step| step.step_type == OrderExecutionStepType::UniversalRouterSwap)
+        .and_then(|step| step.request.get("amount_out"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|amount| U256::from_str_radix(amount, 10).ok())
+        .expect("UniversalRouter refund step should carry amount_out");
+    assert!(
+        run.refund_address_balance >= expected_refund_amount,
+        "refund address should receive the two-hop ExternalCustody refund output"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn order_workflow_refunds_hyperliquid_spot_unit_withdrawal_after_retry_exhaustion() {
     let run = run_order_workflow(WorkflowOptions {
         velora_transaction_failures: EXECUTE_STEP_TEMPORAL_ATTEMPTS * 2,
@@ -798,7 +866,10 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
         BASE_USDC_ADDRESS.parse().expect("valid Base USDC address"),
     )
     .await;
-    if matches!(options.route, WorkflowRoute::AcrossBaseEthToEthereumUsdc) {
+    let across_enabled = matches!(options.route, WorkflowRoute::AcrossBaseEthToEthereumUsdc)
+        || options.expect_external_custody_across_then_velora_refund;
+    let cctp_enabled = matches!(options.route, WorkflowRoute::CctpBaseUsdcToArbitrumEth);
+    if across_enabled {
         install_mock_usdc_clone(
             &devnet.ethereum,
             ETHEREUM_USDC_ADDRESS
@@ -807,7 +878,7 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
         )
         .await;
     }
-    if matches!(options.route, WorkflowRoute::CctpBaseUsdcToArbitrumEth) {
+    if cctp_enabled {
         install_mock_usdc_clone(
             &devnet.arbitrum,
             ARBITRUM_USDC_ADDRESS
@@ -819,13 +890,21 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
     let mocks = spawn_mocks(&devnet, &options).await;
     let settings = Arc::new(test_settings());
     let hyperliquid_enabled = options.expect_hyperliquid_spot_unit_refund;
-    let cctp_enabled = matches!(options.route, WorkflowRoute::CctpBaseUsdcToArbitrumEth);
-    let chain_registry =
-        Arc::new(test_chain_registry(&devnet, options.route, hyperliquid_enabled).await);
+    let chain_registry = Arc::new(
+        test_chain_registry(
+            &devnet,
+            options.route,
+            hyperliquid_enabled,
+            across_enabled,
+            cctp_enabled,
+        )
+        .await,
+    );
     let action_providers = Arc::new(test_action_providers(
         &mocks,
         options.route,
         hyperliquid_enabled,
+        across_enabled,
         cctp_enabled,
     ));
     let mut custody_executor =
@@ -884,6 +963,15 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
     }
     if options.expect_external_custody_velora_refund {
         seed_external_custody_universal_router_refund_position(
+            &custody_executor,
+            &devnet,
+            order_id,
+            &seeded.funding_vault_address,
+        )
+        .await;
+    }
+    if options.expect_external_custody_across_then_velora_refund {
+        seed_external_custody_across_then_universal_router_refund_position(
             &custody_executor,
             &devnet,
             order_id,
@@ -1009,6 +1097,19 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
                     devnet_for_workflow,
                     &seeded.funding_vault_address,
                     order_id,
+                    false,
+                )
+                .await;
+            }
+            if options.expect_external_custody_across_then_velora_refund {
+                signal_external_custody_refund_across_fill(
+                    &client,
+                    &db_for_workflow,
+                    &mocks,
+                    devnet_for_workflow,
+                    &seeded.funding_vault_address,
+                    order_id,
+                    true,
                 )
                 .await;
             }
@@ -1147,8 +1248,10 @@ fn test_settings() -> Settings {
 
 async fn test_chain_registry(
     devnet: &RiftDevnet,
-    route: WorkflowRoute,
+    _route: WorkflowRoute,
     hyperliquid_enabled: bool,
+    across_enabled: bool,
+    cctp_enabled: bool,
 ) -> ChainRegistry {
     let base_chain = EvmChain::new_with_gas_sponsor(
         &devnet.base.anvil.endpoint(),
@@ -1169,7 +1272,7 @@ async fn test_chain_registry(
     .expect("base chain setup");
     let mut registry = ChainRegistry::new();
     registry.register_evm(ChainType::Base, Arc::new(base_chain));
-    if matches!(route, WorkflowRoute::AcrossBaseEthToEthereumUsdc) {
+    if across_enabled {
         let ethereum_chain = EvmChain::new_with_gas_sponsor(
             &devnet.ethereum.anvil.endpoint(),
             ETHEREUM_USDC_ADDRESS,
@@ -1189,7 +1292,7 @@ async fn test_chain_registry(
         .expect("ethereum chain setup");
         registry.register_evm(ChainType::Ethereum, Arc::new(ethereum_chain));
     }
-    if matches!(route, WorkflowRoute::CctpBaseUsdcToArbitrumEth) {
+    if cctp_enabled {
         let arbitrum_chain = EvmChain::new_with_gas_sponsor(
             &devnet.arbitrum.anvil.endpoint(),
             ARBITRUM_USDC_ADDRESS,
@@ -1226,10 +1329,11 @@ fn test_action_providers(
     mocks: &MockIntegratorServer,
     route: WorkflowRoute,
     hyperliquid_enabled: bool,
+    across_enabled: bool,
     cctp_enabled: bool,
 ) -> ActionProviderRegistry {
     ActionProviderRegistry::http_from_options(ActionProviderHttpOptions {
-        across: matches!(route, WorkflowRoute::AcrossBaseEthToEthereumUsdc).then(|| {
+        across: across_enabled.then(|| {
             AcrossHttpProviderConfig::new(mocks.base_url().to_string(), "temporal-worker-across")
         }),
         cctp: cctp_enabled.then(|| CctpHttpProviderConfig::mock(mocks.base_url().to_string())),
@@ -1254,13 +1358,15 @@ fn test_action_providers(
 
 async fn spawn_mocks(devnet: &RiftDevnet, options: &WorkflowOptions) -> MockIntegratorServer {
     let mut config = MockIntegratorConfig::default();
+    let across_enabled = matches!(options.route, WorkflowRoute::AcrossBaseEthToEthereumUsdc)
+        || options.expect_external_custody_across_then_velora_refund;
     if matches!(options.route, WorkflowRoute::VeloraBaseEthToBaseUsdc) {
         config = config.with_velora_swap_contract_address(
             devnet.base.anvil.chain_id(),
             format!("{:#x}", devnet.base.mock_velora_swap_contract.address()),
         );
     }
-    if matches!(options.route, WorkflowRoute::AcrossBaseEthToEthereumUsdc) {
+    if across_enabled {
         config = config
             .with_velora_swap_contract_address(
                 devnet.base.anvil.chain_id(),
@@ -1411,6 +1517,40 @@ async fn seed_external_custody_universal_router_refund_position(
     fund_erc20_source_vault(
         &devnet.base,
         BASE_USDC_ADDRESS.parse().expect("valid Base USDC address"),
+        &vault.address,
+        ORDER_USDC_AMOUNT_RAW,
+    )
+    .await;
+}
+
+async fn seed_external_custody_across_then_universal_router_refund_position(
+    custody_executor: &CustodyActionExecutor,
+    devnet: &RiftDevnet,
+    order_id: Uuid,
+    funding_vault_address: &str,
+) {
+    set_native_balance(
+        &devnet.base,
+        Address::from_str(funding_vault_address).expect("funding vault EVM address"),
+        U256::ZERO,
+    )
+    .await;
+    let vault = custody_executor
+        .create_router_derived_vault(
+            order_id,
+            CustodyVaultRole::DestinationExecution,
+            CustodyVaultVisibility::Internal,
+            ChainId::parse("evm:1").expect("ethereum chain id"),
+            Some(AssetId::parse(ETHEREUM_USDC_ADDRESS).expect("ethereum USDC asset")),
+            json!({ "test": "temporal_external_custody_across_then_universal_router_refund" }),
+        )
+        .await
+        .expect("create Across-to-UniversalRouter ExternalCustody refund vault");
+    fund_erc20_source_vault(
+        &devnet.ethereum,
+        ETHEREUM_USDC_ADDRESS
+            .parse()
+            .expect("valid Ethereum USDC address"),
         &vault.address,
         ORDER_USDC_AMOUNT_RAW,
     )
@@ -1571,6 +1711,7 @@ async fn signal_external_custody_refund_across_fill(
     devnet: &RiftDevnet,
     funding_vault_address: &str,
     order_id: Uuid,
+    fund_destination_vault: bool,
 ) {
     set_native_balance(
         &devnet.base,
@@ -1620,6 +1761,9 @@ async fn signal_external_custody_refund_across_fill(
         .and_then(|value| Address::from_str(value).ok())
         .expect("refund Across step should carry an EVM depositor_address");
     wait_for_across_deposit_indexed(mocks, depositor, Duration::from_secs(90)).await;
+    if fund_destination_vault {
+        fund_destination_execution_vault_from_across(db, devnet, order_id, &refund_operation).await;
+    }
 
     let refund_workflow = client
         .get_workflow_handle::<RefundWorkflow>(&refund_workflow_id(order_id, parent_attempt.id));
@@ -1914,13 +2058,30 @@ async fn fund_destination_execution_vault_from_across(
     order_id: Uuid,
     operation: &OrderProviderOperation,
 ) {
+    let step = db
+        .orders()
+        .get_execution_step(
+            operation
+                .execution_step_id
+                .expect("Across operation should be linked to a step"),
+        )
+        .await
+        .expect("load Across operation step");
+    let output_asset = step
+        .output_asset
+        .clone()
+        .expect("Across operation step should carry output_asset");
     let destination_vault = db
         .orders()
         .get_custody_vaults(order_id)
         .await
         .expect("load custody vaults")
         .into_iter()
-        .find(|vault| vault.role == CustodyVaultRole::DestinationExecution)
+        .find(|vault| {
+            vault.role == CustodyVaultRole::DestinationExecution
+                && vault.chain == output_asset.chain
+                && vault.asset.as_ref() == Some(&output_asset.asset)
+        })
         .expect("Across step should create destination execution custody vault");
     let output_amount = operation
         .response
