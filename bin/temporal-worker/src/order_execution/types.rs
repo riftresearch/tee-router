@@ -451,6 +451,20 @@ pub struct ComposeRefreshedQuoteAttemptInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckPreExecutionStaleQuoteInput {
+    pub order_id: WorkflowOrderId,
+    pub attempt_id: WorkflowAttemptId,
+    pub step_id: WorkflowStepId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreExecutionStaleQuoteCheck {
+    pub should_refresh: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefreshedQuoteAttemptShape {
     pub outcome: RefreshedQuoteAttemptOutcome,
 }

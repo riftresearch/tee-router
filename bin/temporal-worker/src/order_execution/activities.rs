@@ -56,24 +56,25 @@ use uuid::Uuid;
 
 use super::types::{
     AcrossOnchainLogRecovered, BoundaryPersisted, CancelTimedOutHyperliquidTradeInput,
-    ClassifyStaleRunningStepInput, ClassifyStepFailureInput, ComposeRefreshedQuoteAttemptInput,
-    DiscoverSingleRefundPositionInput, DispatchStepProviderActionInput, ExecuteStepInput,
-    ExecutionPlan, FailedAttemptSnapshotWritten, FinalizeOrderOrRefundInput, FinalizedOrder,
-    HyperliquidTradeCancelRecorded, LoadOrderExecutionStateInput, MarkOrderCompletedInput,
-    MaterializeExecutionAttemptInput, MaterializeRefreshedAttemptInput, MaterializeRefundPlanInput,
-    MaterializeRetryAttemptInput, MaterializedExecutionAttempt, OrderCompleted,
-    OrderExecutionState, OrderTerminalStatus, OrderWorkflowPhase,
-    PersistProviderOperationStatusInput, PersistProviderReceiptInput, PersistStepFailedInput,
-    PersistStepReadyToFireInput, PersistStepTerminalStatusInput, PersistenceBoundary,
-    PollProviderOperationHintsInput, ProviderActionDispatchShape, ProviderHintKind, ProviderKind,
-    ProviderOperationHintDecision, ProviderOperationHintEvidence, ProviderOperationHintSignal,
-    ProviderOperationHintVerified, ProviderOperationHintsPolled, RecoverAcrossOnchainLogInput,
-    RecoverablePositionKind, RefreshedAttemptMaterialized, RefreshedQuoteAttemptOutcome,
-    RefreshedQuoteAttemptShape, RefundPlanOutcome, RefundPlanShape, RefundUntenableReason,
-    SettleProviderStepInput, SingleRefundPosition, SingleRefundPositionDiscovery,
-    SingleRefundPositionOutcome, StaleQuoteRefreshUntenableReason, StaleRunningStepClassified,
-    StaleRunningStepDecision, StepExecuted, StepExecutionOutcome, StepFailureDecision,
-    VerifyProviderOperationHintInput, WorkflowExecutionStep, WriteFailedAttemptSnapshotInput,
+    CheckPreExecutionStaleQuoteInput, ClassifyStaleRunningStepInput, ClassifyStepFailureInput,
+    ComposeRefreshedQuoteAttemptInput, DiscoverSingleRefundPositionInput,
+    DispatchStepProviderActionInput, ExecuteStepInput, ExecutionPlan, FailedAttemptSnapshotWritten,
+    FinalizeOrderOrRefundInput, FinalizedOrder, HyperliquidTradeCancelRecorded,
+    LoadOrderExecutionStateInput, MarkOrderCompletedInput, MaterializeExecutionAttemptInput,
+    MaterializeRefreshedAttemptInput, MaterializeRefundPlanInput, MaterializeRetryAttemptInput,
+    MaterializedExecutionAttempt, OrderCompleted, OrderExecutionState, OrderTerminalStatus,
+    OrderWorkflowPhase, PersistProviderOperationStatusInput, PersistProviderReceiptInput,
+    PersistStepFailedInput, PersistStepReadyToFireInput, PersistStepTerminalStatusInput,
+    PersistenceBoundary, PollProviderOperationHintsInput, PreExecutionStaleQuoteCheck,
+    ProviderActionDispatchShape, ProviderHintKind, ProviderKind, ProviderOperationHintDecision,
+    ProviderOperationHintEvidence, ProviderOperationHintSignal, ProviderOperationHintVerified,
+    ProviderOperationHintsPolled, RecoverAcrossOnchainLogInput, RecoverablePositionKind,
+    RefreshedAttemptMaterialized, RefreshedQuoteAttemptOutcome, RefreshedQuoteAttemptShape,
+    RefundPlanOutcome, RefundPlanShape, RefundUntenableReason, SettleProviderStepInput,
+    SingleRefundPosition, SingleRefundPositionDiscovery, SingleRefundPositionOutcome,
+    StaleQuoteRefreshUntenableReason, StaleRunningStepClassified, StaleRunningStepDecision,
+    StepExecuted, StepExecutionOutcome, StepFailureDecision, VerifyProviderOperationHintInput,
+    WorkflowExecutionStep, WriteFailedAttemptSnapshotInput,
 };
 
 const MAX_EXECUTION_ATTEMPTS: i32 = 2;
@@ -704,6 +705,148 @@ impl OrderActivities {
             "execution_step.failure_classified"
         );
         Ok(decision)
+    }
+
+    /// Scar tissue: §7 stale quote refresh. This mirrors the legacy
+    /// refresh-before-step boundary: an expired, unstarted market-order leg
+    /// refreshes before any external side effect is fired.
+    #[activity]
+    pub async fn check_pre_execution_stale_quote(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: CheckPreExecutionStaleQuoteInput,
+    ) -> Result<PreExecutionStaleQuoteCheck, ActivityError> {
+        let deps = self.deps()?;
+        let attempt = deps
+            .db
+            .orders()
+            .get_execution_attempt(input.attempt_id)
+            .await
+            .map_err(activity_error_from_display)?;
+        if attempt.order_id != input.order_id {
+            return Err(activity_error(format!(
+                "attempt {} does not belong to order {}",
+                attempt.id, input.order_id
+            )));
+        }
+        if attempt.status != OrderExecutionAttemptStatus::Active
+            || attempt.attempt_kind == OrderExecutionAttemptKind::RefundRecovery
+        {
+            return Ok(PreExecutionStaleQuoteCheck {
+                should_refresh: false,
+                reason: None,
+            });
+        }
+        let order_quote = deps
+            .db
+            .orders()
+            .get_router_order_quote(input.order_id)
+            .await
+            .map_err(activity_error_from_display)?;
+        if !matches!(order_quote, RouterOrderQuote::MarketOrder(_)) {
+            return Ok(PreExecutionStaleQuoteCheck {
+                should_refresh: false,
+                reason: None,
+            });
+        }
+        let refreshed_attempt_count = deps
+            .db
+            .orders()
+            .get_execution_attempts(input.order_id)
+            .await
+            .map_err(activity_error_from_display)?
+            .into_iter()
+            .filter(|attempt| attempt.attempt_kind == OrderExecutionAttemptKind::RefreshedExecution)
+            .count();
+        if refreshed_attempt_count >= MAX_STALE_QUOTE_REFRESHES_PER_ORDER_EXECUTION {
+            return Ok(PreExecutionStaleQuoteCheck {
+                should_refresh: false,
+                reason: None,
+            });
+        }
+        let step = deps
+            .db
+            .orders()
+            .get_execution_step(input.step_id)
+            .await
+            .map_err(activity_error_from_display)?;
+        if step.order_id != input.order_id || step.execution_attempt_id != Some(input.attempt_id) {
+            return Err(activity_error(format!(
+                "step {} does not belong to order {} attempt {}",
+                step.id, input.order_id, input.attempt_id
+            )));
+        }
+        let has_provider_operation = deps
+            .db
+            .orders()
+            .get_provider_operations(input.order_id)
+            .await
+            .map_err(activity_error_from_display)?
+            .into_iter()
+            .any(|operation| operation.execution_step_id == Some(step.id));
+        let provider_side_effect_started = step
+            .details
+            .get("provider_side_effect_checkpoint")
+            .is_some()
+            || step.tx_hash.is_some()
+            || step.provider_ref.is_some()
+            || has_provider_operation;
+        if step.status != OrderExecutionStepStatus::Running || provider_side_effect_started {
+            return Ok(PreExecutionStaleQuoteCheck {
+                should_refresh: false,
+                reason: None,
+            });
+        }
+        let Some(leg_id) = step.execution_leg_id else {
+            return Ok(PreExecutionStaleQuoteCheck {
+                should_refresh: false,
+                reason: None,
+            });
+        };
+        let legs = deps
+            .db
+            .orders()
+            .get_execution_legs_for_attempt(input.attempt_id)
+            .await
+            .map_err(activity_error_from_display)?;
+        let Some(leg) = legs.into_iter().find(|leg| leg.id == leg_id) else {
+            return Ok(PreExecutionStaleQuoteCheck {
+                should_refresh: false,
+                reason: None,
+            });
+        };
+        let Some(provider_quote_expires_at) = leg.provider_quote_expires_at else {
+            return Ok(PreExecutionStaleQuoteCheck {
+                should_refresh: false,
+                reason: None,
+            });
+        };
+        if provider_quote_expires_at >= Utc::now() {
+            return Ok(PreExecutionStaleQuoteCheck {
+                should_refresh: false,
+                reason: None,
+            });
+        }
+        let reason = json!({
+            "reason": "pre_execution_stale_provider_quote",
+            "step_id": step.id,
+            "execution_leg_id": leg.id,
+            "provider_quote_expires_at": provider_quote_expires_at.to_rfc3339(),
+            "refreshed_attempt_count": refreshed_attempt_count,
+        });
+        tracing::info!(
+            order_id = %input.order_id,
+            attempt_id = %input.attempt_id,
+            step_id = %step.id,
+            execution_leg_id = %leg.id,
+            provider_quote_expires_at = %provider_quote_expires_at,
+            event_name = "execution_step.pre_execution_stale_quote_detected",
+            "execution_step.pre_execution_stale_quote_detected"
+        );
+        Ok(PreExecutionStaleQuoteCheck {
+            should_refresh: true,
+            reason: Some(reason),
+        })
     }
 
     /// Scar tissue: §6 stale running step manual intervention.
@@ -2413,7 +2556,7 @@ fn refresh_bridge_quote_transition_legs(
     quote: &BridgeQuote,
 ) -> Result<Vec<QuoteLeg>, ActivityError> {
     if transition.kind == MarketOrderTransitionKind::CctpBridge {
-        todo!("PR5c: CCTP multi-leg refresh");
+        return Ok(refresh_cctp_quote_transition_legs(transition, quote));
     }
     Ok(vec![QuoteLeg::new(QuoteLegSpec {
         transition_decl_id: &transition.id,
@@ -2440,7 +2583,12 @@ fn refresh_exchange_quote_transition_legs(
         .and_then(Value::as_str)
         .unwrap_or("");
     if kind == "spot_cross_token" {
-        todo!("PR5c: Hyperliquid multi-leg refresh");
+        return refresh_spot_cross_token_quote_transition_legs(
+            transition_decl_id,
+            transition_kind,
+            provider,
+            quote,
+        );
     }
     if kind != "universal_router_swap" {
         return Err(activity_error(format!(
@@ -2902,6 +3050,25 @@ fn refresh_source_address(
     )))
 }
 
+fn refresh_bridge_recipient_address(
+    order: &RouterOrder,
+    source_vault: &DepositVault,
+    steps: &[OrderExecutionStep],
+    transitions: &[TransitionDecl],
+    index: usize,
+) -> Result<String, ActivityError> {
+    let transition = &transitions[index];
+    if transition.kind == MarketOrderTransitionKind::HyperliquidBridgeDeposit {
+        return refresh_hyperliquid_bridge_deposit_account_address(
+            source_vault,
+            steps,
+            transition,
+            index,
+        );
+    }
+    refresh_recipient_address(order, steps, transitions, index)
+}
+
 fn refresh_recipient_address(
     order: &RouterOrder,
     steps: &[OrderExecutionStep],
@@ -2919,6 +3086,32 @@ fn refresh_recipient_address(
     }
     Err(activity_error(format!(
         "cannot refresh transition {} because no recipient address is materialized",
+        transition.id
+    )))
+}
+
+fn refresh_hyperliquid_bridge_deposit_account_address(
+    source_vault: &DepositVault,
+    steps: &[OrderExecutionStep],
+    transition: &TransitionDecl,
+    index: usize,
+) -> Result<String, ActivityError> {
+    if let Some(value) = refresh_step_request_string(
+        steps,
+        transition,
+        &[
+            "source_custody_vault_address",
+            "hyperliquid_custody_vault_address",
+            "depositor_address",
+        ],
+    ) {
+        return Ok(value);
+    }
+    if index == 0 {
+        return Ok(source_vault.deposit_vault_address.clone());
+    }
+    Err(activity_error(format!(
+        "cannot refresh transition {} because no Hyperliquid account/source address is materialized",
         transition.id
     )))
 }
@@ -6165,9 +6358,8 @@ impl QuoteRefreshActivities {
 impl QuoteRefreshActivities {
     /// Scar tissue: §7 stale quote refresh and §16.4 refresh helpers.
     ///
-    /// PR5b supports ExactIn forward iteration for the Across + Velora route. PR5c owns
-    /// ExactOut-backward iteration, Bitcoin unit-deposit fee reserve, and Hyperliquid gas-reserve
-    /// branches.
+    /// PR5c-ii wires ExactIn refresh for bridge, Unit, and Hyperliquid families.
+    /// PR5c-iii owns the remaining ExactOut backward iteration.
     #[activity]
     pub async fn compose_refreshed_quote_attempt(
         self: Arc<Self>,
@@ -6404,7 +6596,10 @@ impl QuoteRefreshActivities {
                         &refreshed_quote,
                     )?);
                 }
-                MarketOrderTransitionKind::AcrossBridge => {
+                MarketOrderTransitionKind::AcrossBridge
+                | MarketOrderTransitionKind::CctpBridge
+                | MarketOrderTransitionKind::HyperliquidBridgeDeposit
+                | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
                     let bridge = deps
                         .action_providers
                         .bridge(transition.provider.as_str())
@@ -6422,8 +6617,9 @@ impl QuoteRefreshActivities {
                                 amount_in: cursor_amount.clone(),
                                 min_amount_out: Some("1".to_string()),
                             },
-                            recipient_address: refresh_recipient_address(
+                            recipient_address: refresh_bridge_recipient_address(
                                 &order,
+                                &source_vault,
                                 &stale_attempt_steps,
                                 &transitions,
                                 index,
@@ -6451,19 +6647,128 @@ impl QuoteRefreshActivities {
                         &refreshed_quote,
                     )?);
                 }
-                MarketOrderTransitionKind::CctpBridge => {
-                    todo!("PR5c: CCTP stale quote refresh");
-                }
                 MarketOrderTransitionKind::UnitDeposit => {
-                    todo!("PR5c: Bitcoin unit-deposit fee reserve refresh");
+                    let unit = deps
+                        .action_providers
+                        .unit(transition.provider.as_str())
+                        .ok_or_else(|| {
+                            activity_error(format!(
+                                "unit provider {} is not configured",
+                                transition.provider.as_str()
+                            ))
+                        })?;
+                    let (unit_amount_in, provider_quote) = if let Some(fee_reserve) =
+                        refresh_unit_deposit_fee_reserve(&original_quote, transition)?
+                    {
+                        (
+                            refresh_subtract_amount(
+                                "amount_in",
+                                &cursor_amount,
+                                fee_reserve,
+                                &transition.id,
+                                "bitcoin miner fee reserve",
+                            )?,
+                            refresh_bitcoin_fee_reserve_quote(fee_reserve),
+                        )
+                    } else {
+                        (cursor_amount.clone(), json!({}))
+                    };
+                    if !unit.supports_deposit(&transition.input.asset) {
+                        return Err(activity_error(format!(
+                            "unit provider {} does not support refreshed deposit",
+                            unit.id()
+                        )));
+                    }
+                    cursor_amount = unit_amount_in.clone();
+                    refreshed_legs.push(refresh_unit_deposit_quote_leg(
+                        transition,
+                        &unit_amount_in,
+                        expires_at,
+                        provider_quote,
+                    ));
                 }
-                MarketOrderTransitionKind::HyperliquidBridgeDeposit
-                | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal
-                | MarketOrderTransitionKind::HyperliquidTrade => {
-                    todo!("PR5c: Hyperliquid stale quote refresh");
+                MarketOrderTransitionKind::HyperliquidTrade => {
+                    let exchange = deps
+                        .action_providers
+                        .exchange(transition.provider.as_str())
+                        .ok_or_else(|| {
+                            activity_error(format!(
+                                "exchange provider {} is not configured",
+                                transition.provider.as_str()
+                            ))
+                        })?;
+                    let mut quote_amount_in = cursor_amount.clone();
+                    if index > 0
+                        && transitions[index - 1].kind
+                            == MarketOrderTransitionKind::HyperliquidBridgeDeposit
+                    {
+                        quote_amount_in = refresh_reserve_hyperliquid_spot_send_quote_gas(
+                            "hyperliquid_trade.amount_in",
+                            &quote_amount_in,
+                        )?;
+                    }
+                    let refreshed_quote = exchange
+                        .quote_trade(ExchangeQuoteRequest {
+                            input_asset: transition.input.asset.clone(),
+                            output_asset: transition.output.asset.clone(),
+                            input_decimals: None,
+                            output_decimals: None,
+                            order_kind: MarketOrderKind::ExactIn {
+                                amount_in: quote_amount_in,
+                                min_amount_out: refresh_transition_min_amount_out(
+                                    &transitions,
+                                    index,
+                                    &original_quote.min_amount_out,
+                                ),
+                            },
+                            sender_address: None,
+                            recipient_address: order.recipient_address.clone(),
+                        })
+                        .await
+                        .map_err(activity_error_from_display)?
+                        .ok_or_else(|| {
+                            activity_error(format!(
+                                "exchange provider {} returned no refreshed quote",
+                                exchange.id()
+                            ))
+                        })?;
+                    expires_at = expires_at.min(refreshed_quote.expires_at);
+                    cursor_amount = refreshed_quote.amount_out.clone();
+                    refreshed_legs.extend(refresh_exchange_quote_transition_legs(
+                        transition.id.as_str(),
+                        transition.kind,
+                        transition.provider,
+                        &refreshed_quote,
+                    )?);
                 }
                 MarketOrderTransitionKind::UnitWithdrawal => {
-                    todo!("PR5c: Unit withdrawal stale quote refresh");
+                    let unit = deps
+                        .action_providers
+                        .unit(transition.provider.as_str())
+                        .ok_or_else(|| {
+                            activity_error(format!(
+                                "unit provider {} is not configured",
+                                transition.provider.as_str()
+                            ))
+                        })?;
+                    if !unit.supports_withdrawal(&transition.output.asset) {
+                        return Err(activity_error(format!(
+                            "unit provider {} does not support refreshed withdrawal",
+                            unit.id()
+                        )));
+                    }
+                    let recipient_address = refresh_recipient_address(
+                        &order,
+                        &stale_attempt_steps,
+                        &transitions,
+                        index,
+                    )?;
+                    refreshed_legs.push(refresh_unit_withdrawal_quote_leg(
+                        transition,
+                        &cursor_amount,
+                        &recipient_address,
+                        expires_at,
+                    ));
                 }
             }
         }

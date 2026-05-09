@@ -17,13 +17,13 @@ use super::activities::{
 };
 use super::refund_workflow_id;
 use super::types::{
-    ClassifyStaleRunningStepInput, ClassifyStepFailureInput, ComposeRefreshedQuoteAttemptInput,
-    DiscoverSingleRefundPositionInput, ExecuteStepInput, FinalizeOrderOrRefundInput,
-    FinalizedOrder, FundingVaultFundedSignal, LoadOrderExecutionStateInput,
-    ManualInterventionReleaseSignal, ManualRefundTriggerSignal, MarkOrderCompletedInput,
-    MaterializeExecutionAttemptInput, MaterializeRefreshedAttemptInput, MaterializeRefundPlanInput,
-    MaterializeRetryAttemptInput, OrderTerminalStatus, OrderWorkflowDebugCursor,
-    OrderWorkflowInput, OrderWorkflowOutput, OrderWorkflowPhase,
+    CheckPreExecutionStaleQuoteInput, ClassifyStaleRunningStepInput, ClassifyStepFailureInput,
+    ComposeRefreshedQuoteAttemptInput, DiscoverSingleRefundPositionInput, ExecuteStepInput,
+    FinalizeOrderOrRefundInput, FinalizedOrder, FundingVaultFundedSignal,
+    LoadOrderExecutionStateInput, ManualInterventionReleaseSignal, ManualRefundTriggerSignal,
+    MarkOrderCompletedInput, MaterializeExecutionAttemptInput, MaterializeRefreshedAttemptInput,
+    MaterializeRefundPlanInput, MaterializeRetryAttemptInput, OrderTerminalStatus,
+    OrderWorkflowDebugCursor, OrderWorkflowInput, OrderWorkflowOutput, OrderWorkflowPhase,
     PersistProviderOperationStatusInput, PersistProviderReceiptInput, PersistStepFailedInput,
     PersistStepReadyToFireInput, PollProviderOperationHintsInput, ProviderHintPollWorkflowInput,
     ProviderHintPollWorkflowOutput, ProviderOperationHintDecision, ProviderOperationHintSignal,
@@ -120,6 +120,96 @@ impl OrderWorkflow {
                         db_activity_options.clone(),
                     )
                     .await?;
+                let stale_quote_check = ctx
+                    .start_activity(
+                        OrderActivities::check_pre_execution_stale_quote,
+                        CheckPreExecutionStaleQuoteInput {
+                            order_id: input.order_id,
+                            attempt_id: execution_attempt.attempt_id,
+                            step_id: step.step_id,
+                        },
+                        db_activity_options.clone(),
+                    )
+                    .await?;
+                if stale_quote_check.should_refresh {
+                    let reason = stale_quote_check.reason.unwrap_or_else(|| {
+                        json_reason("pre_execution_stale_provider_quote", step.step_id)
+                    });
+                    let _failed = ctx
+                        .start_activity(
+                            OrderActivities::persist_step_failed,
+                            PersistStepFailedInput {
+                                order_id: input.order_id,
+                                attempt_id: execution_attempt.attempt_id,
+                                step_id: step.step_id,
+                                failure_reason: reason.to_string(),
+                            },
+                            db_activity_options.clone(),
+                        )
+                        .await?;
+                    let _snapshot = ctx
+                        .start_activity(
+                            OrderActivities::write_failed_attempt_snapshot,
+                            WriteFailedAttemptSnapshotInput {
+                                order_id: input.order_id,
+                                attempt_id: execution_attempt.attempt_id,
+                                failed_step_id: step.step_id,
+                            },
+                            db_activity_options.clone(),
+                        )
+                        .await?;
+                    ctx.state_mut(|state| {
+                        state.phase = OrderWorkflowPhase::RefreshingQuote;
+                        state.active_step_id = Some(step.step_id);
+                    });
+                    let child = ctx
+                        .child_workflow(
+                            QuoteRefreshWorkflow::run,
+                            QuoteRefreshWorkflowInput {
+                                order_id: input.order_id,
+                                stale_attempt_id: execution_attempt.attempt_id,
+                                failed_step_id: step.step_id,
+                            },
+                            quote_refresh_child_options(input.order_id, step.step_id),
+                        )
+                        .await?;
+                    let refreshed = child.result().await?;
+                    match refreshed.outcome {
+                        QuoteRefreshWorkflowOutcome::Refreshed { attempt_id, steps } => {
+                            execution_attempt =
+                                super::types::MaterializedExecutionAttempt { attempt_id, steps };
+                            ctx.state_mut(|state| {
+                                state.phase = OrderWorkflowPhase::Executing;
+                                state.active_attempt_id = Some(execution_attempt.attempt_id);
+                                state.active_step_id = None;
+                            });
+                            continue 'attempts;
+                        }
+                        QuoteRefreshWorkflowOutcome::Untenable { .. } => {
+                            ctx.state_mut(|state| {
+                                state.phase = OrderWorkflowPhase::Finalizing;
+                                state.active_step_id = None;
+                            });
+                            let finalized = ctx
+                                .start_activity(
+                                    OrderActivities::finalize_order_or_refund,
+                                    FinalizeOrderOrRefundInput {
+                                        order_id: input.order_id,
+                                        attempt_id: None,
+                                        step_id: None,
+                                        terminal_status: OrderTerminalStatus::RefundRequired,
+                                        reason: None,
+                                    },
+                                    db_activity_options.clone(),
+                                )
+                                .await?;
+                            return Ok(OrderWorkflowOutput {
+                                order_id: input.order_id,
+                                terminal_status: finalized.terminal_status,
+                            });
+                        }
+                    }
+                }
                 let executed = match execute_step_with_stale_running_timer(
                     ctx,
                     input.order_id,
