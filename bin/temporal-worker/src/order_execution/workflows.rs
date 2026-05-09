@@ -8,19 +8,20 @@ use temporalio_sdk::{
 };
 use uuid::Uuid;
 
-use super::activities::{OrderActivities, QuoteRefreshActivities};
+use super::activities::{OrderActivities, QuoteRefreshActivities, RefundActivities};
 use super::types::{
-    ClassifyStepFailureInput, ComposeRefreshedQuoteAttemptInput, ExecuteStepInput,
-    FinalizeOrderOrRefundInput, FundingVaultFundedSignal, LoadOrderExecutionStateInput,
-    ManualInterventionReleaseSignal, ManualRefundTriggerSignal, MarkOrderCompletedInput,
-    MaterializeExecutionAttemptInput, MaterializeRefreshedAttemptInput,
-    MaterializeRetryAttemptInput, OrderTerminalStatus, OrderWorkflowDebugCursor,
-    OrderWorkflowInput, OrderWorkflowOutput, OrderWorkflowPhase,
+    ClassifyStepFailureInput, ComposeRefreshedQuoteAttemptInput, DiscoverSingleRefundPositionInput,
+    ExecuteStepInput, FinalizeOrderOrRefundInput, FundingVaultFundedSignal,
+    LoadOrderExecutionStateInput, ManualInterventionReleaseSignal, ManualRefundTriggerSignal,
+    MarkOrderCompletedInput, MaterializeExecutionAttemptInput, MaterializeRefreshedAttemptInput,
+    MaterializeRefundPlanInput, MaterializeRetryAttemptInput, OrderTerminalStatus,
+    OrderWorkflowDebugCursor, OrderWorkflowInput, OrderWorkflowOutput, OrderWorkflowPhase,
     PersistProviderOperationStatusInput, PersistProviderReceiptInput, PersistStepFailedInput,
     PersistStepReadyToFireInput, ProviderHintPollWorkflowInput, ProviderHintPollWorkflowOutput,
     ProviderOperationHintSignal, QuoteRefreshWorkflowInput, QuoteRefreshWorkflowOutcome,
-    QuoteRefreshWorkflowOutput, RefreshedQuoteAttemptOutcome, RefundWorkflowInput,
-    RefundWorkflowOutput, SettleProviderStepInput, StaleRunningStepWatchdogInput,
+    QuoteRefreshWorkflowOutput, RefreshedQuoteAttemptOutcome, RefundPlanOutcome,
+    RefundTerminalStatus, RefundTrigger, RefundWorkflowInput, RefundWorkflowOutput,
+    SettleProviderStepInput, SingleRefundPositionOutcome, StaleRunningStepWatchdogInput,
     StaleRunningStepWatchdogOutput, StepFailureDecision, WriteFailedAttemptSnapshotInput,
 };
 
@@ -177,22 +178,33 @@ impl OrderWorkflow {
                             }
                             StepFailureDecision::StartRefund => {
                                 ctx.state_mut(|state| {
-                                    state.phase = OrderWorkflowPhase::Finalizing;
+                                    state.phase = OrderWorkflowPhase::Refunding;
                                     state.active_step_id = None;
                                 });
-                                let finalized = ctx
-                                    .start_activity(
-                                        OrderActivities::finalize_order_or_refund,
-                                        FinalizeOrderOrRefundInput {
+                                let child = ctx
+                                    .child_workflow(
+                                        RefundWorkflow::run,
+                                        RefundWorkflowInput {
                                             order_id: input.order_id,
-                                            terminal_status: OrderTerminalStatus::RefundRequired,
+                                            parent_attempt_id: Some(execution_attempt.attempt_id),
+                                            trigger: RefundTrigger::FailedAttempt,
                                         },
-                                        db_activity_options,
+                                        refund_child_options(
+                                            input.order_id,
+                                            execution_attempt.attempt_id,
+                                        ),
                                     )
                                     .await?;
+                                let refunded = child.result().await?;
+                                let terminal_status = match refunded.terminal_status {
+                                    RefundTerminalStatus::Refunded => OrderTerminalStatus::Refunded,
+                                    RefundTerminalStatus::RefundManualInterventionRequired => {
+                                        OrderTerminalStatus::RefundManualInterventionRequired
+                                    }
+                                };
                                 return Ok(OrderWorkflowOutput {
                                     order_id: input.order_id,
-                                    terminal_status: finalized.terminal_status,
+                                    terminal_status,
                                 });
                             }
                             StepFailureDecision::RefreshQuote => {
@@ -240,6 +252,7 @@ impl OrderWorkflow {
                                                 OrderActivities::finalize_order_or_refund,
                                                 FinalizeOrderOrRefundInput {
                                                     order_id: input.order_id,
+                                                    attempt_id: None,
                                                     terminal_status:
                                                         OrderTerminalStatus::RefundRequired,
                                                 },
@@ -309,12 +322,6 @@ impl OrderWorkflow {
             )
             .await?;
 
-        // TODO(PR6, brief §6 invariant 2; scar §5): route refund failures to manual
-        // intervention, never to primary-execution retry.
-        // TODO(PR6, brief §6 invariant 4; scar §8): start refund only after single-position
-        // discovery succeeds.
-        // TODO(PR5, brief §6 invariant 5; scar §7): start quote refresh as a child workflow that
-        // creates its own attempt.
         // Child-workflow shape: RefundWorkflow, QuoteRefreshWorkflow,
         // StaleRunningStepWatchdogWorkflow, and ProviderHintPollWorkflow.
         Ok(OrderWorkflowOutput {
@@ -392,6 +399,24 @@ fn execute_activity_options() -> ActivityOptions {
         .build()
 }
 
+fn refund_execute_activity_options() -> ActivityOptions {
+    ActivityOptions::with_start_to_close_timeout(Duration::from_secs(120))
+        .retry_policy(RetryPolicy {
+            maximum_attempts: 1,
+            ..Default::default()
+        })
+        .build()
+}
+
+fn refund_child_options(order_id: Uuid, parent_attempt_id: Uuid) -> ChildWorkflowOptions {
+    ChildWorkflowOptions {
+        workflow_id: format!("order:{order_id}:refund:{parent_attempt_id}"),
+        run_timeout: Some(Duration::from_secs(240)),
+        task_timeout: Some(Duration::from_secs(30)),
+        ..Default::default()
+    }
+}
+
 fn quote_refresh_child_options(order_id: Uuid, failed_step_id: Uuid) -> ChildWorkflowOptions {
     ChildWorkflowOptions {
         workflow_id: format!("order:{order_id}:quote-refresh:{failed_step_id}"),
@@ -412,12 +437,200 @@ pub struct RefundWorkflow;
 impl RefundWorkflow {
     #[run]
     pub async fn run(
-        _ctx: &mut WorkflowContext<Self>,
-        _input: RefundWorkflowInput,
+        ctx: &mut WorkflowContext<Self>,
+        input: RefundWorkflowInput,
     ) -> WorkflowResult<RefundWorkflowOutput> {
-        // TODO(PR4, brief §6 invariant 2; scar §5): refund attempts never retry.
-        // TODO(PR4, brief §6 invariant 4; scar §8): require exactly one recoverable position.
-        todo!("PR4: orchestrate refund child workflow")
+        if input.trigger != RefundTrigger::FailedAttempt {
+            return Err(anyhow::anyhow!(
+                "PR6a RefundWorkflow only handles failed-attempt triggers"
+            )
+            .into());
+        }
+        let failed_attempt_id = input.parent_attempt_id.ok_or_else(|| {
+            anyhow::anyhow!("failed-attempt RefundWorkflow requires parent_attempt_id")
+        })?;
+        let db_activity_options = db_activity_options();
+        let refund_execute_activity_options = refund_execute_activity_options();
+
+        let discovery = ctx
+            .start_activity(
+                RefundActivities::discover_single_refund_position,
+                DiscoverSingleRefundPositionInput {
+                    order_id: input.order_id,
+                    failed_attempt_id,
+                },
+                db_activity_options.clone(),
+            )
+            .await?;
+        let position = match discovery.outcome {
+            SingleRefundPositionOutcome::Position(position) => position,
+            SingleRefundPositionOutcome::Untenable { .. } => {
+                let _finalized = ctx
+                    .start_activity(
+                        OrderActivities::finalize_order_or_refund,
+                        FinalizeOrderOrRefundInput {
+                            order_id: input.order_id,
+                            attempt_id: None,
+                            terminal_status: OrderTerminalStatus::RefundManualInterventionRequired,
+                        },
+                        db_activity_options,
+                    )
+                    .await?;
+                return Ok(RefundWorkflowOutput {
+                    order_id: input.order_id,
+                    terminal_status: RefundTerminalStatus::RefundManualInterventionRequired,
+                });
+            }
+        };
+
+        let plan = ctx
+            .start_activity(
+                RefundActivities::materialize_refund_plan,
+                MaterializeRefundPlanInput {
+                    order_id: input.order_id,
+                    failed_attempt_id,
+                    position,
+                },
+                db_activity_options.clone(),
+            )
+            .await?;
+        let (refund_attempt_id, steps) = match plan.outcome {
+            RefundPlanOutcome::Materialized {
+                refund_attempt_id,
+                steps,
+            } => (refund_attempt_id, steps),
+            RefundPlanOutcome::Untenable { .. } => {
+                let _finalized = ctx
+                    .start_activity(
+                        OrderActivities::finalize_order_or_refund,
+                        FinalizeOrderOrRefundInput {
+                            order_id: input.order_id,
+                            attempt_id: None,
+                            terminal_status: OrderTerminalStatus::RefundManualInterventionRequired,
+                        },
+                        db_activity_options,
+                    )
+                    .await?;
+                return Ok(RefundWorkflowOutput {
+                    order_id: input.order_id,
+                    terminal_status: RefundTerminalStatus::RefundManualInterventionRequired,
+                });
+            }
+        };
+
+        for step in steps {
+            let _ready = ctx
+                .start_activity(
+                    OrderActivities::persist_step_ready_to_fire,
+                    PersistStepReadyToFireInput {
+                        order_id: input.order_id,
+                        attempt_id: refund_attempt_id,
+                        step_id: step.step_id,
+                    },
+                    db_activity_options.clone(),
+                )
+                .await?;
+            let executed = match ctx
+                .start_activity(
+                    OrderActivities::execute_step,
+                    ExecuteStepInput {
+                        order_id: input.order_id,
+                        attempt_id: refund_attempt_id,
+                        step_id: step.step_id,
+                    },
+                    refund_execute_activity_options.clone(),
+                )
+                .await
+            {
+                Ok(executed) => executed,
+                Err(source) => {
+                    let failure_reason = source.to_string();
+                    drop(source);
+                    let _failed = ctx
+                        .start_activity(
+                            OrderActivities::persist_step_failed,
+                            PersistStepFailedInput {
+                                order_id: input.order_id,
+                                attempt_id: refund_attempt_id,
+                                step_id: step.step_id,
+                                failure_reason,
+                            },
+                            db_activity_options.clone(),
+                        )
+                        .await?;
+                    let _snapshot = ctx
+                        .start_activity(
+                            OrderActivities::write_failed_attempt_snapshot,
+                            WriteFailedAttemptSnapshotInput {
+                                order_id: input.order_id,
+                                attempt_id: refund_attempt_id,
+                                failed_step_id: step.step_id,
+                            },
+                            db_activity_options.clone(),
+                        )
+                        .await?;
+                    let _finalized = ctx
+                        .start_activity(
+                            OrderActivities::finalize_order_or_refund,
+                            FinalizeOrderOrRefundInput {
+                                order_id: input.order_id,
+                                attempt_id: None,
+                                terminal_status:
+                                    OrderTerminalStatus::RefundManualInterventionRequired,
+                            },
+                            db_activity_options,
+                        )
+                        .await?;
+                    return Ok(RefundWorkflowOutput {
+                        order_id: input.order_id,
+                        terminal_status: RefundTerminalStatus::RefundManualInterventionRequired,
+                    });
+                }
+            };
+            let _receipt = ctx
+                .start_activity(
+                    OrderActivities::persist_provider_receipt,
+                    PersistProviderReceiptInput {
+                        execution: executed.clone(),
+                    },
+                    db_activity_options.clone(),
+                )
+                .await?;
+            let _provider_status = ctx
+                .start_activity(
+                    OrderActivities::persist_provider_operation_status,
+                    PersistProviderOperationStatusInput {
+                        execution: executed.clone(),
+                    },
+                    db_activity_options.clone(),
+                )
+                .await?;
+            let _settled = ctx
+                .start_activity(
+                    OrderActivities::settle_provider_step,
+                    SettleProviderStepInput {
+                        execution: executed,
+                    },
+                    db_activity_options.clone(),
+                )
+                .await?;
+        }
+
+        let _finalized = ctx
+            .start_activity(
+                OrderActivities::finalize_order_or_refund,
+                FinalizeOrderOrRefundInput {
+                    order_id: input.order_id,
+                    attempt_id: Some(refund_attempt_id),
+                    terminal_status: OrderTerminalStatus::Refunded,
+                },
+                db_activity_options,
+            )
+            .await?;
+        Ok(RefundWorkflowOutput {
+            order_id: input.order_id,
+            terminal_status: RefundTerminalStatus::Refunded,
+        })
     }
 }
 

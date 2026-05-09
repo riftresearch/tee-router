@@ -7,7 +7,10 @@ use alloy::{
     rpc::types::TransactionRequest,
     signers::local::PrivateKeySigner,
 };
-use chains::{evm::EvmChain, ChainRegistry};
+use chains::{
+    evm::{EvmChain, EvmGasSponsorConfig},
+    ChainRegistry,
+};
 use chrono::Utc;
 use devnet::{
     mock_integrators::{MockIntegratorConfig, MockIntegratorServer},
@@ -19,7 +22,8 @@ use router_core::{
     db::Database,
     models::{
         DepositVaultStatus, OrderExecutionAttemptKind, OrderExecutionAttemptStatus,
-        OrderExecutionStepStatus, RouterOrderQuote, RouterOrderStatus, VaultAction,
+        OrderExecutionStepStatus, OrderExecutionStepType, RouterOrderQuote, RouterOrderStatus,
+        VaultAction,
     },
     protocol::{AssetId, ChainId, DepositAsset},
     services::{
@@ -64,6 +68,7 @@ const ROUTER_TEST_DATABASE_URL_ENV: &str = "ROUTER_TEST_DATABASE_URL";
 const EVM_NATIVE_GAS_BUFFER_WEI: u128 = 1_000_000_000_000_000_000;
 const EXECUTE_STEP_TEMPORAL_ATTEMPTS: usize = 3;
 const ORDER_WORKFLOW_TEST_TIMEOUT: Duration = Duration::from_secs(240);
+const ORDER_AMOUNT_IN_WEI: &str = "60000000000000000";
 
 struct TestPostgres {
     admin_database_url: String,
@@ -75,6 +80,7 @@ struct WorkflowRun {
     db: Database,
     order_id: Uuid,
     output: OrderWorkflowOutput,
+    refund_address_balance: U256,
 }
 
 #[derive(Default)]
@@ -163,24 +169,21 @@ async fn order_workflow_retries_failed_step_then_completes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn order_workflow_marks_refund_required_after_second_failed_attempt() {
+async fn order_workflow_refunds_after_retry_exhaustion() {
     let run = run_order_workflow(WorkflowOptions {
         velora_transaction_failures: EXECUTE_STEP_TEMPORAL_ATTEMPTS * 2,
         ..WorkflowOptions::default()
     })
     .await;
 
-    assert_eq!(
-        run.output.terminal_status,
-        OrderTerminalStatus::RefundRequired
-    );
-    let refund_required = run
+    assert_eq!(run.output.terminal_status, OrderTerminalStatus::Refunded);
+    let refunded = run
         .db
         .orders()
         .get(run.order_id)
         .await
-        .expect("load refund-required order");
-    assert_eq!(refund_required.status, RouterOrderStatus::RefundRequired);
+        .expect("load refunded order");
+    assert_eq!(refunded.status, RouterOrderStatus::Refunded);
 
     let attempts = run
         .db
@@ -188,11 +191,25 @@ async fn order_workflow_marks_refund_required_after_second_failed_attempt() {
         .get_execution_attempts(run.order_id)
         .await
         .expect("load execution attempts");
-    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts.len(), 3);
     assert_eq!(attempts[0].attempt_index, 1);
+    assert_eq!(
+        attempts[0].attempt_kind,
+        OrderExecutionAttemptKind::PrimaryExecution
+    );
     assert_eq!(attempts[0].status, OrderExecutionAttemptStatus::Failed);
     assert_eq!(attempts[1].attempt_index, 2);
+    assert_eq!(
+        attempts[1].attempt_kind,
+        OrderExecutionAttemptKind::PrimaryExecution
+    );
     assert_eq!(attempts[1].status, OrderExecutionAttemptStatus::Failed);
+    assert_eq!(attempts[2].attempt_index, 3);
+    assert_eq!(
+        attempts[2].attempt_kind,
+        OrderExecutionAttemptKind::RefundRecovery
+    );
+    assert_eq!(attempts[2].status, OrderExecutionAttemptStatus::Completed);
 
     let first_attempt_steps = run
         .db
@@ -217,6 +234,21 @@ async fn order_workflow_marks_refund_required_after_second_failed_attempt() {
             .iter()
             .any(|step| step.status == OrderExecutionStepStatus::Failed),
         "second attempt should retain the terminal failed step"
+    );
+    let refund_steps = run
+        .db
+        .orders()
+        .get_execution_steps_for_attempt(attempts[2].id)
+        .await
+        .expect("load refund attempt steps");
+    assert_eq!(refund_steps.len(), 1);
+    let refund_step = &refund_steps[0];
+    assert_eq!(refund_step.step_type, OrderExecutionStepType::Refund);
+    assert_eq!(refund_step.provider, "internal");
+    assert_eq!(refund_step.status, OrderExecutionStepStatus::Completed);
+    assert!(
+        run.refund_address_balance >= U256::from_str_radix(ORDER_AMOUNT_IN_WEI, 10).unwrap(),
+        "refund address should receive at least the original funded amount"
     );
 }
 
@@ -402,12 +434,14 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
             output
         })
         .await;
+    let refund_address_balance = native_balance(&devnet.base, &valid_evm_address()).await;
 
     WorkflowRun {
         _postgres: postgres,
         db,
         order_id,
         output,
+        refund_address_balance,
     }
 }
 
@@ -491,13 +525,20 @@ fn test_settings() -> Settings {
 }
 
 async fn test_chain_registry(devnet: &RiftDevnet) -> ChainRegistry {
-    let base_chain = EvmChain::new(
+    let base_chain = EvmChain::new_with_gas_sponsor(
         &devnet.base.anvil.endpoint(),
         BASE_USDC_ADDRESS,
         ChainType::Base,
         b"temporal-worker-base-wallet",
         1,
         Duration::from_secs(1),
+        Some(EvmGasSponsorConfig {
+            private_key: format!(
+                "0x{}",
+                alloy::hex::encode(devnet.base.anvil.keys()[0].to_bytes())
+            ),
+            vault_gas_buffer_wei: U256::from(EVM_NATIVE_GAS_BUFFER_WEI),
+        }),
     )
     .await
     .expect("base chain setup");
@@ -594,7 +635,7 @@ async fn seed_funded_single_step_order(
             to_asset: destination_asset,
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
-                amount_in: "60000000000000000".to_string(),
+                amount_in: ORDER_AMOUNT_IN_WEI.to_string(),
                 slippage_bps: Some(100),
             },
         })
@@ -698,6 +739,14 @@ async fn mine_evm_confirmation_block(devnet: &devnet::EthDevnet) {
         .anvil_mine(Some(1), None)
         .await
         .expect("mine EVM confirmation block");
+}
+
+async fn native_balance(devnet: &devnet::EthDevnet, address: &str) -> U256 {
+    let provider = ProviderBuilder::new().connect_http(devnet.anvil.endpoint_url());
+    provider
+        .get_balance(Address::from_str(address).expect("valid EVM balance address"))
+        .await
+        .expect("read native balance")
 }
 
 async fn install_mock_usdc_clone(devnet: &devnet::EthDevnet, token_address: Address) {

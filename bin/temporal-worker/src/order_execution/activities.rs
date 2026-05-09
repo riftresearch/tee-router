@@ -6,7 +6,8 @@ use std::sync::Arc;
 use chrono::Utc;
 use router_core::{
     db::{
-        Database, ExecutionAttemptPlan, PersistStepCompletionRecord, RefreshedExecutionAttemptPlan,
+        Database, ExecutionAttemptPlan, FundingVaultRefundAttemptPlan, PersistStepCompletionRecord,
+        RefreshedExecutionAttemptPlan,
     },
     error::{RouterCoreError, RouterCoreResult},
     models::{
@@ -21,7 +22,7 @@ use router_core::{
             ProviderExecutionStatePatch, UnitDepositStepRequest, UnitWithdrawalStepRequest,
         },
         asset_registry::{MarketOrderTransitionKind, ProviderId, TransitionDecl},
-        custody_action_executor::CustodyActionRequest,
+        custody_action_executor::{CustodyAction, CustodyActionRequest},
         market_order_planner::MarketOrderPlanRemainingStart,
         quote_legs::{execution_step_type_for_transition_kind, QuoteLeg, QuoteLegAsset},
         ActionProviderRegistry, CustodyActionExecutor, CustodyActionReceipt,
@@ -46,10 +47,12 @@ use super::types::{
     PersistStepFailedInput, PersistStepReadyToFireInput, PersistStepTerminalStatusInput,
     PersistenceBoundary, PollProviderOperationHintsInput, ProviderActionDispatchShape,
     ProviderOperationHintVerified, ProviderOperationHintsPolled, RecoverAcrossOnchainLogInput,
-    RefreshedAttemptMaterialized, RefreshedQuoteAttemptOutcome, RefreshedQuoteAttemptShape,
-    RefundPlanShape, SettleProviderStepInput, SingleRefundPosition,
-    StaleQuoteRefreshUntenableReason, StepExecuted, StepExecutionOutcome, StepFailureDecision,
-    VerifyProviderOperationHintInput, WorkflowExecutionStep, WriteFailedAttemptSnapshotInput,
+    RecoverablePositionKind, RefreshedAttemptMaterialized, RefreshedQuoteAttemptOutcome,
+    RefreshedQuoteAttemptShape, RefundPlanOutcome, RefundPlanShape, RefundUntenableReason,
+    SettleProviderStepInput, SingleRefundPosition, SingleRefundPositionDiscovery,
+    SingleRefundPositionOutcome, StaleQuoteRefreshUntenableReason, StepExecuted,
+    StepExecutionOutcome, StepFailureDecision, VerifyProviderOperationHintInput,
+    WorkflowExecutionStep, WriteFailedAttemptSnapshotInput,
 };
 
 const MAX_EXECUTION_ATTEMPTS: i32 = 2;
@@ -739,8 +742,46 @@ impl OrderActivities {
                     terminal_status: OrderTerminalStatus::RefundRequired,
                 })
             }
+            OrderTerminalStatus::Refunded => {
+                let attempt_id = input.attempt_id.ok_or_else(|| {
+                    activity_error("finalize refunded order requires a refund attempt id")
+                })?;
+                let completed = deps
+                    .db
+                    .orders()
+                    .mark_order_refunded(input.order_id, attempt_id, Utc::now())
+                    .await
+                    .map_err(activity_error_from_display)?;
+                tracing::info!(
+                    order_id = %completed.order.id,
+                    attempt_id = %completed.attempt.id,
+                    event_name = "order.refunded",
+                    "order.refunded"
+                );
+                Ok(FinalizedOrder {
+                    order_id: completed.order.id,
+                    terminal_status: OrderTerminalStatus::Refunded,
+                })
+            }
+            OrderTerminalStatus::RefundManualInterventionRequired => {
+                let order = deps
+                    .db
+                    .orders()
+                    .mark_order_refund_manual_intervention_required(input.order_id, Utc::now())
+                    .await
+                    .map_err(activity_error_from_display)?;
+                tracing::info!(
+                    order_id = %order.id,
+                    event_name = "order.refund_manual_intervention_required",
+                    "order.refund_manual_intervention_required"
+                );
+                Ok(FinalizedOrder {
+                    order_id: order.id,
+                    terminal_status: OrderTerminalStatus::RefundManualInterventionRequired,
+                })
+            }
             terminal_status => Err(activity_error(format!(
-                "finalize_order_or_refund does not handle {terminal_status:?} in PR4b"
+                "finalize_order_or_refund does not handle {terminal_status:?} in PR6a"
             ))),
         }
     }
@@ -773,16 +814,73 @@ impl PostExecuteProvider {
     }
 }
 
+fn request_string_field(
+    step: &OrderExecutionStep,
+    field: &'static str,
+) -> Result<String, ActivityError> {
+    step.request
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            activity_error(format!(
+                "step {} refund request is missing string field {field}",
+                step.id
+            ))
+        })
+}
+
+fn request_uuid_field(
+    step: &OrderExecutionStep,
+    field: &'static str,
+) -> Result<Uuid, ActivityError> {
+    let value = request_string_field(step, field)?;
+    Uuid::parse_str(&value).map_err(|source| {
+        activity_error(format!(
+            "step {} refund request field {field} is not a uuid: {source}",
+            step.id
+        ))
+    })
+}
+
 async fn execute_running_step(
     deps: &OrderActivityDeps,
     step: &OrderExecutionStep,
 ) -> Result<StepCompletion, ActivityError> {
     let intent = match step.step_type {
-        OrderExecutionStepType::WaitForDeposit | OrderExecutionStepType::Refund => {
+        OrderExecutionStepType::WaitForDeposit => {
             return Err(activity_error(format!(
                 "{} is not executable in PR4a OrderWorkflow",
                 step.step_type.to_db_string()
             )));
+        }
+        OrderExecutionStepType::Refund => {
+            let custody_vault_id = request_uuid_field(step, "source_custody_vault_id")?;
+            let recipient_address = request_string_field(step, "recipient_address")?;
+            let amount = request_string_field(step, "amount")?;
+            let receipt = deps
+                .custody_action_executor
+                .execute(CustodyActionRequest {
+                    custody_vault_id,
+                    action: CustodyAction::Transfer {
+                        to_address: recipient_address.clone(),
+                        amount: amount.clone(),
+                        bitcoin_fee_budget_sats: None,
+                    },
+                })
+                .await
+                .map_err(activity_error_from_display)?;
+            return Ok(StepCompletion {
+                response: json!({
+                    "kind": "refund_transfer",
+                    "recipient_address": recipient_address,
+                    "amount": amount,
+                    "tx_hash": &receipt.tx_hash,
+                }),
+                tx_hash: Some(receipt.tx_hash),
+                provider_state: ProviderExecutionState::default(),
+                outcome: StepExecutionOutcome::Completed,
+            });
         }
         OrderExecutionStepType::AcrossBridge => {
             let request =
@@ -1384,29 +1482,212 @@ fn activity_error_from_display(source: impl std::fmt::Display) -> ActivityError 
     activity_error(source)
 }
 
-pub struct RefundActivities;
+#[derive(Clone, Default)]
+pub struct RefundActivities {
+    deps: Option<Arc<OrderActivityDeps>>,
+}
+
+impl RefundActivities {
+    #[must_use]
+    pub(crate) fn from_order_activities(order_activities: &OrderActivities) -> Self {
+        Self {
+            deps: order_activities.shared_deps(),
+        }
+    }
+
+    fn deps(&self) -> Result<Arc<OrderActivityDeps>, ActivityError> {
+        self.deps
+            .clone()
+            .ok_or_else(|| activity_error("refund activities are not configured"))
+    }
+}
 
 #[activities]
 impl RefundActivities {
     /// Scar tissue: §8 refund position discovery and §16.1 balance reads.
+    ///
+    /// PR6a only enumerates the funding vault. PR6b owns the deferred branches:
+    /// ExternalCustody and HyperliquidSpot recoverable positions.
     #[activity]
     pub async fn discover_single_refund_position(
+        self: Arc<Self>,
         _ctx: ActivityContext,
-        _input: DiscoverSingleRefundPositionInput,
-    ) -> Result<SingleRefundPosition, ActivityError> {
-        // TODO(PR4, brief §6 invariant 4; scar §8): require exactly one recoverable position.
-        todo!("PR4: discover single recoverable refund position")
+        input: DiscoverSingleRefundPositionInput,
+    ) -> Result<SingleRefundPositionDiscovery, ActivityError> {
+        let deps = self.deps()?;
+        let failed_attempt = deps
+            .db
+            .orders()
+            .get_execution_attempt(input.failed_attempt_id)
+            .await
+            .map_err(activity_error_from_display)?;
+        if failed_attempt.order_id != input.order_id {
+            return Err(activity_error(format!(
+                "refund failed attempt {} does not belong to order {}",
+                failed_attempt.id, input.order_id
+            )));
+        }
+        let order = deps
+            .db
+            .orders()
+            .get(input.order_id)
+            .await
+            .map_err(activity_error_from_display)?;
+        let Some(funding_vault_id) = order.funding_vault_id else {
+            return Ok(refund_single_position_untenable(0, 0));
+        };
+        let vault = match deps.db.vaults().get(funding_vault_id).await {
+            Ok(vault) => vault,
+            Err(RouterCoreError::NotFound) => return Ok(refund_single_position_untenable(0, 0)),
+            Err(source) => return Err(activity_error_from_display(source)),
+        };
+        let amount = deps
+            .custody_action_executor
+            .deposit_vault_balance_raw(&vault)
+            .await
+            .map_err(activity_error_from_display)?;
+        if raw_amount_is_positive(&amount, "funding vault refund balance")? {
+            return Ok(SingleRefundPositionDiscovery {
+                outcome: SingleRefundPositionOutcome::Position(SingleRefundPosition {
+                    position_kind: RecoverablePositionKind::FundingVault,
+                    owning_step_id: None,
+                }),
+            });
+        }
+        Ok(refund_single_position_untenable(0, 0))
     }
 
     /// Scar tissue: §9 refund tree and §16.1 refund materialisation.
+    ///
+    /// PR6a materializes FundingVault -> direct internal refund only. PR6b owns the deferred
+    /// multi-step and multi-leg transitions such as CCTP burn/receive and Hyperliquid prefund.
     #[activity]
     pub async fn materialize_refund_plan(
+        self: Arc<Self>,
         _ctx: ActivityContext,
-        _input: MaterializeRefundPlanInput,
+        input: MaterializeRefundPlanInput,
     ) -> Result<RefundPlanShape, ActivityError> {
-        // TODO(PR4, brief §6 invariant 2; scar §5): refund attempts never get retry branches.
-        todo!("PR4: materialize refund plan")
+        let deps = self.deps()?;
+        if input.position.position_kind != RecoverablePositionKind::FundingVault {
+            deferred_external_or_hyperliquid_refund_positions();
+        }
+        let order = deps
+            .db
+            .orders()
+            .get(input.order_id)
+            .await
+            .map_err(activity_error_from_display)?;
+        let Some(funding_vault_id) = order.funding_vault_id else {
+            return Ok(refund_plan_untenable(
+                RefundUntenableReason::RefundRecoverablePositionDisappearedAfterValidation,
+            ));
+        };
+        let vault = match deps.db.vaults().get(funding_vault_id).await {
+            Ok(vault) => vault,
+            Err(RouterCoreError::NotFound) => {
+                return Ok(refund_plan_untenable(
+                    RefundUntenableReason::RefundRecoverablePositionDisappearedAfterValidation,
+                ));
+            }
+            Err(source) => return Err(activity_error_from_display(source)),
+        };
+        let amount = deps
+            .custody_action_executor
+            .deposit_vault_balance_raw(&vault)
+            .await
+            .map_err(activity_error_from_display)?;
+        if !raw_amount_is_positive(&amount, "funding vault refund balance")? {
+            return Ok(refund_plan_untenable(
+                RefundUntenableReason::RefundRecoverablePositionDisappearedAfterValidation,
+            ));
+        }
+        let record = deps
+            .db
+            .orders()
+            .create_refund_attempt_from_funding_vault(
+                input.order_id,
+                input.failed_attempt_id,
+                FundingVaultRefundAttemptPlan {
+                    funding_vault_id,
+                    amount,
+                    failure_reason: json!({
+                        "reason": "primary_execution_attempts_exhausted",
+                        "trace": "refund_workflow",
+                        "failed_attempt_id": input.failed_attempt_id,
+                    }),
+                    input_custody_snapshot: json!({
+                        "schema_version": 1,
+                        "source_kind": "funding_vault",
+                        "funding_vault_id": funding_vault_id,
+                    }),
+                },
+                Utc::now(),
+            )
+            .await
+            .map_err(activity_error_from_display)?;
+        tracing::info!(
+            order_id = %record.order.id,
+            attempt_id = %record.attempt.id,
+            step_count = record.steps.len(),
+            event_name = "order.refund_plan_materialized",
+            "order.refund_plan_materialized"
+        );
+        Ok(RefundPlanShape {
+            outcome: RefundPlanOutcome::Materialized {
+                refund_attempt_id: record.attempt.id,
+                steps: record
+                    .steps
+                    .into_iter()
+                    .map(|step| WorkflowExecutionStep {
+                        step_id: step.id,
+                        step_index: step.step_index,
+                    })
+                    .collect(),
+            },
+        })
     }
+}
+
+fn refund_single_position_untenable(
+    position_count: usize,
+    recoverable_position_count: usize,
+) -> SingleRefundPositionDiscovery {
+    SingleRefundPositionDiscovery {
+        outcome: SingleRefundPositionOutcome::Untenable {
+            reason: RefundUntenableReason::RefundRequiresSingleRecoverablePosition {
+                position_count,
+                recoverable_position_count,
+            },
+        },
+    }
+}
+
+fn refund_plan_untenable(reason: RefundUntenableReason) -> RefundPlanShape {
+    RefundPlanShape {
+        outcome: RefundPlanOutcome::Untenable { reason },
+    }
+}
+
+fn raw_amount_is_positive(value: &str, label: &'static str) -> Result<bool, ActivityError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || !trimmed.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err(activity_error(format!(
+            "{label} is not a raw unsigned integer: {value:?}"
+        )));
+    }
+    Ok(trimmed.as_bytes().iter().any(|digit| *digit != b'0'))
+}
+
+/// PR6b deferred: enumerate ExternalCustody and HyperliquidSpot refund positions.
+#[allow(dead_code)]
+fn deferred_external_or_hyperliquid_refund_positions() -> ! {
+    todo!("PR6b: enumerate external/hyperliquid refund positions")
+}
+
+/// PR6b deferred: materialize non-internal and multi-leg refund transitions.
+#[allow(dead_code)]
+fn deferred_multi_leg_refund_transitions() -> ! {
+    todo!("PR6b: multi-leg refund transitions")
 }
 
 #[derive(Clone, Default)]

@@ -5,7 +5,7 @@ use crate::{
     error::RouterCoreError,
     models::{
         CustodyVault, CustodyVaultControlType, CustodyVaultRole, CustodyVaultStatus,
-        CustodyVaultVisibility,
+        CustodyVaultVisibility, DepositVault,
     },
     protocol::{backend_chain_for_id, AssetId, ChainId},
 };
@@ -618,6 +618,71 @@ impl CustodyActionExecutor {
             logs,
             response,
         })
+    }
+
+    pub async fn deposit_vault_balance_raw(
+        &self,
+        vault: &DepositVault,
+    ) -> CustodyActionResult<String> {
+        let backend_chain = backend_chain_for_id(&vault.deposit_asset.chain).ok_or_else(|| {
+            CustodyActionError::ChainNotSupported {
+                chain: vault.deposit_asset.chain.clone(),
+            }
+        })?;
+        match backend_chain {
+            ChainType::Bitcoin => {
+                let Some(chain) = self.chain_registry.get_bitcoin(&backend_chain) else {
+                    return Err(CustodyActionError::UnsupportedAction {
+                        action: "bitcoin_balance",
+                        chain: vault.deposit_asset.chain.clone(),
+                    });
+                };
+                if let Some(outpoint) =
+                    observed_bitcoin_outpoint(vault.funding_observation.as_ref()).map_err(
+                        |reason| CustodyActionError::InvalidBitcoinFundingObservation {
+                            vault_id: vault.id,
+                            reason,
+                        },
+                    )?
+                {
+                    return Ok(chain
+                        .spendable_outpoint_value_sats(
+                            &vault.deposit_vault_address,
+                            &outpoint.tx_hash,
+                            outpoint.vout,
+                            outpoint.amount_sats,
+                        )
+                        .await
+                        .map_err(|source| CustodyActionError::Chain { source })?
+                        .to_string());
+                }
+                Ok(chain
+                    .address_balance_sats(&vault.deposit_vault_address)
+                    .await
+                    .map_err(|source| CustodyActionError::Chain { source })?
+                    .to_string())
+            }
+            _ => {
+                let Some(chain) = self.chain_registry.get_evm(&backend_chain) else {
+                    return Err(CustodyActionError::UnsupportedAction {
+                        action: "evm_balance",
+                        chain: vault.deposit_asset.chain.clone(),
+                    });
+                };
+                match &vault.deposit_asset.asset {
+                    AssetId::Native => Ok(chain
+                        .native_balance(&vault.deposit_vault_address)
+                        .await
+                        .map_err(|source| CustodyActionError::Chain { source })?
+                        .to_string()),
+                    AssetId::Reference(token) => Ok(chain
+                        .erc20_balance(token, &vault.deposit_vault_address)
+                        .await
+                        .map_err(|source| CustodyActionError::Chain { source })?
+                        .to_string()),
+                }
+            }
+        }
     }
 
     pub async fn create_router_derived_vault(
