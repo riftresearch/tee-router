@@ -2,11 +2,9 @@ use std::time::Duration;
 
 use metrics::histogram;
 use reqwest::StatusCode;
-use router_core::services::action_providers::ProviderOperationObservation;
 use router_server::api::{
     DetectorHintEnvelope, DetectorHintRequest, ProviderOperationHintEnvelope,
-    ProviderOperationHintRequest, ProviderOperationObserveRequest, VaultFundingHintEnvelope,
-    VaultFundingHintRequest,
+    ProviderOperationHintRequest, VaultFundingHintEnvelope, VaultFundingHintRequest,
 };
 use snafu::ResultExt;
 use uuid::Uuid;
@@ -56,18 +54,6 @@ impl RouterClient {
     ) -> Result<ProviderOperationHintEnvelope> {
         self.submit_hint("/api/v1/provider-operations/hints", request)
             .await
-    }
-
-    pub async fn observe_provider_operation(
-        &self,
-        operation_id: Uuid,
-        request: &ProviderOperationObserveRequest,
-    ) -> Result<Option<ProviderOperationObservation>> {
-        self.submit_hint(
-            &format!("/api/v1/provider-operations/{operation_id}/observe"),
-            request,
-        )
-        .await
     }
 
     pub async fn submit_detector_hint(

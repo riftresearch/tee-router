@@ -2,8 +2,8 @@ use crate::{
     app::{initialize_components, PaymasterMode},
     runtime::BackgroundTaskResult,
     services::{
-        vault_manager::FundingHintPassSummary, OrderExecutionManager, ProviderHealthPollSummary,
-        ProviderHealthPoller, VaultManager,
+        vault_manager::FundingHintPassSummary, ProviderHealthPollSummary, ProviderHealthPoller,
+        VaultManager,
     },
     telemetry, Error, Result, RouterServerArgs,
 };
@@ -32,7 +32,6 @@ use uuid::Uuid;
 
 const DEFAULT_WORKER_LEASE_NAME: &str = "global-router-worker";
 const WORKFLOW_START_QUEUE_MAX_IDS: usize = 10_000;
-const PROVIDER_OPERATION_HINT_CHANNEL: &str = "router_provider_operation_hints";
 const VAULT_FUNDING_HINT_CHANNEL: &str = "router_vault_funding_hints";
 const VAULT_REFUND_WAKEUP_CHANNEL: &str = "router_vault_refund_wakeups";
 const QUOTE_CLEANUP_INTERVAL: Duration = Duration::from_secs(3600);
@@ -51,7 +50,6 @@ pub struct RouterWorkerConfig {
     pub order_execution_poll_interval: Duration,
     pub route_cost_refresh_interval: Duration,
     pub provider_health_poll_interval: Duration,
-    pub provider_operation_hint_pass_limit: i64,
     pub order_maintenance_pass_limit: i64,
     pub order_planning_pass_limit: i64,
     pub order_execution_pass_limit: i64,
@@ -80,10 +78,6 @@ impl fmt::Debug for RouterWorkerConfig {
             .field(
                 "provider_health_poll_interval",
                 &self.provider_health_poll_interval,
-            )
-            .field(
-                "provider_operation_hint_pass_limit",
-                &self.provider_operation_hint_pass_limit,
             )
             .field(
                 "order_maintenance_pass_limit",
@@ -138,10 +132,6 @@ impl RouterWorkerConfig {
             args.provider_health_timeout_seconds,
         )?;
         ensure_positive_count(
-            "worker provider-operation hint pass limit",
-            args.worker_provider_operation_hint_pass_limit,
-        )?;
-        ensure_positive_count(
             "worker order maintenance pass limit",
             args.worker_order_maintenance_pass_limit,
         )?;
@@ -194,9 +184,6 @@ impl RouterWorkerConfig {
             ),
             provider_health_poll_interval: Duration::from_secs(
                 args.worker_provider_health_poll_seconds,
-            ),
-            provider_operation_hint_pass_limit: i64::from(
-                args.worker_provider_operation_hint_pass_limit,
             ),
             order_maintenance_pass_limit: i64::from(args.worker_order_maintenance_pass_limit),
             order_planning_pass_limit: i64::from(args.worker_order_planning_pass_limit),
@@ -295,7 +282,6 @@ impl WorkflowStartSummary {
 
 type VaultTaskResult = std::result::Result<VaultWorkOutcome, String>;
 type WorkflowStartTaskResult = std::result::Result<WorkflowStartSummary, String>;
-type ProviderOperationHintTaskResult = std::result::Result<usize, String>;
 type RouteCostTaskResult = std::result::Result<RouteCostRefreshSummary, String>;
 type ProviderHealthTaskResult = std::result::Result<ProviderHealthPollSummary, String>;
 type QuoteCleanupTaskResult = std::result::Result<u64, String>;
@@ -332,7 +318,6 @@ pub async fn run_worker(args: RouterServerArgs) -> Result<()> {
     run_worker_loop(
         components.db,
         components.vault_manager,
-        components.order_execution_manager,
         order_workflow_client,
         components.route_costs,
         components.provider_health_poller,
@@ -347,7 +332,6 @@ pub async fn run_worker(args: RouterServerArgs) -> Result<()> {
 pub async fn run_worker_loop(
     db: Database,
     vault_manager: Arc<VaultManager>,
-    order_execution_manager: Arc<OrderExecutionManager>,
     order_workflow_client: Arc<OrderWorkflowClient>,
     route_costs: Arc<RouteCostService>,
     provider_health_poller: Arc<ProviderHealthPoller>,
@@ -359,8 +343,6 @@ pub async fn run_worker_loop(
     lease_renew_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut vault_work_poll_interval = interval(config.vault_work_poll_interval);
     vault_work_poll_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut provider_operation_hint_poll_interval = interval(config.order_execution_poll_interval);
-    provider_operation_hint_poll_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut workflow_start_poll_interval = interval(config.order_execution_poll_interval);
     workflow_start_poll_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut route_cost_refresh_interval = interval(config.route_cost_refresh_interval);
@@ -372,14 +354,11 @@ pub async fn run_worker_loop(
     let mut worker_listener = Some(connect_worker_listener(&config.database_url).await?);
     let mut vault_tasks: JoinSet<VaultTaskResult> = JoinSet::new();
     let mut workflow_start_tasks: JoinSet<WorkflowStartTaskResult> = JoinSet::new();
-    let mut provider_operation_hint_tasks: JoinSet<ProviderOperationHintTaskResult> =
-        JoinSet::new();
     let mut route_cost_tasks: JoinSet<RouteCostTaskResult> = JoinSet::new();
     let mut provider_health_tasks: JoinSet<ProviderHealthTaskResult> = JoinSet::new();
     let mut quote_cleanup_tasks: JoinSet<QuoteCleanupTaskResult> = JoinSet::new();
     let mut workflow_start_queue = WorkflowStartQueue::default();
     let mut pending_vault_wakeup = false;
-    let mut pending_provider_operation_hint_wakeup = false;
     let mut pending_route_cost_refresh = false;
     let mut pending_provider_health_poll = false;
     let mut pending_quote_cleanup = false;
@@ -400,7 +379,6 @@ pub async fn run_worker_loop(
                     active_lease = Some(lease);
                     lease_renew_interval.reset();
                     vault_work_poll_interval.reset();
-                    provider_operation_hint_poll_interval.reset();
                     workflow_start_poll_interval.reset();
                     route_cost_refresh_interval.reset();
                     provider_health_poll_interval.reset();
@@ -412,13 +390,6 @@ pub async fn run_worker_loop(
                         order_workflow_client.clone(),
                         &mut workflow_start_queue,
                         config.order_execution_pass_limit,
-                    );
-                    pending_provider_operation_hint_wakeup = true;
-                    spawn_provider_operation_hint_work_if_idle(
-                        &mut provider_operation_hint_tasks,
-                        order_execution_manager.clone(),
-                        &mut pending_provider_operation_hint_wakeup,
-                        config.provider_operation_hint_pass_limit,
                     );
                     pending_vault_wakeup = true;
                     spawn_vault_work_if_idle(
@@ -489,13 +460,11 @@ pub async fn run_worker_loop(
                         active_lease = None;
                         abort_vault_tasks(&mut vault_tasks).await;
                         abort_workflow_start_tasks(&mut workflow_start_tasks).await;
-                        abort_provider_operation_hint_tasks(&mut provider_operation_hint_tasks).await;
                         abort_route_cost_tasks(&mut route_cost_tasks).await;
                         abort_provider_health_tasks(&mut provider_health_tasks).await;
                         abort_quote_cleanup_tasks(&mut quote_cleanup_tasks).await;
                         workflow_start_queue = WorkflowStartQueue::default();
                         pending_vault_wakeup = false;
-                        pending_provider_operation_hint_wakeup = false;
                         pending_route_cost_refresh = false;
                         pending_provider_health_poll = false;
                         pending_quote_cleanup = false;
@@ -534,15 +503,6 @@ pub async fn run_worker_loop(
                     &mut pending_route_cost_refresh,
                 );
             }
-            _ = provider_operation_hint_poll_interval.tick(), if provider_operation_hint_tasks.is_empty() => {
-                pending_provider_operation_hint_wakeup = true;
-                spawn_provider_operation_hint_work_if_idle(
-                    &mut provider_operation_hint_tasks,
-                    order_execution_manager.clone(),
-                    &mut pending_provider_operation_hint_wakeup,
-                    config.provider_operation_hint_pass_limit,
-                );
-            }
             _ = workflow_start_poll_interval.tick(), if workflow_start_tasks.is_empty() => {
                 workflow_start_queue.enqueue_global();
                 spawn_workflow_start_if_idle(
@@ -578,15 +538,6 @@ pub async fn run_worker_loop(
                             "Router worker received hint wakeup"
                         );
                         match notification.channel() {
-                            PROVIDER_OPERATION_HINT_CHANNEL => {
-                                pending_provider_operation_hint_wakeup = true;
-                                spawn_provider_operation_hint_work_if_idle(
-                                    &mut provider_operation_hint_tasks,
-                                    order_execution_manager.clone(),
-                                    &mut pending_provider_operation_hint_wakeup,
-                                    config.provider_operation_hint_pass_limit,
-                                );
-                            }
                             VAULT_FUNDING_HINT_CHANNEL | VAULT_REFUND_WAKEUP_CHANNEL => {
                                 pending_vault_wakeup = true;
                                 spawn_vault_work_if_idle(
@@ -657,19 +608,6 @@ pub async fn run_worker_loop(
                     order_workflow_client.clone(),
                     &mut workflow_start_queue,
                     config.order_execution_pass_limit,
-                );
-            }
-            provider_operation_hint_result = provider_operation_hint_tasks.join_next(), if !provider_operation_hint_tasks.is_empty() => {
-                let processed_provider_hints =
-                    handle_provider_operation_hint_task_result(provider_operation_hint_result)?;
-                if processed_provider_hints > 0 {
-                    pending_provider_operation_hint_wakeup = true;
-                }
-                spawn_provider_operation_hint_work_if_idle(
-                    &mut provider_operation_hint_tasks,
-                    order_execution_manager.clone(),
-                    &mut pending_provider_operation_hint_wakeup,
-                    config.provider_operation_hint_pass_limit,
                 );
             }
             route_cost_result = route_cost_tasks.join_next(), if !route_cost_tasks.is_empty() => {
@@ -751,10 +689,6 @@ async fn connect_worker_listener(database_url: &str) -> Result<PgListener, Strin
         .await
         .map_err(|err| format!("failed to connect worker listener: {err}"))?;
     listener
-        .listen(PROVIDER_OPERATION_HINT_CHANNEL)
-        .await
-        .map_err(|err| format!("failed to listen for provider operation hints: {err}"))?;
-    listener
         .listen(VAULT_FUNDING_HINT_CHANNEL)
         .await
         .map_err(|err| format!("failed to listen for vault funding hints: {err}"))?;
@@ -824,21 +758,6 @@ fn spawn_workflow_start_if_idle(
                 batch_limit,
             ));
         }
-    }
-}
-
-fn spawn_provider_operation_hint_work_if_idle(
-    provider_operation_hint_tasks: &mut JoinSet<ProviderOperationHintTaskResult>,
-    order_execution_manager: Arc<OrderExecutionManager>,
-    pending_provider_operation_hint_wakeup: &mut bool,
-    pass_limit: i64,
-) {
-    if provider_operation_hint_tasks.is_empty() && *pending_provider_operation_hint_wakeup {
-        *pending_provider_operation_hint_wakeup = false;
-        provider_operation_hint_tasks.spawn(run_provider_operation_hint_pass(
-            order_execution_manager,
-            pass_limit,
-        ));
     }
 }
 
@@ -1007,26 +926,6 @@ async fn mark_order_funded_and_start_workflow(
     }
 }
 
-async fn run_provider_operation_hint_pass(
-    order_execution_manager: Arc<OrderExecutionManager>,
-    pass_limit: i64,
-) -> ProviderOperationHintTaskResult {
-    let started = Instant::now();
-    let processed_provider_hints = order_execution_manager
-        .process_provider_operation_hints(pass_limit)
-        .await
-        .map_err(|err| err.to_string())?;
-    if processed_provider_hints > 0 {
-        info!(
-            processed_provider_hints,
-            "Router worker processed provider-operation hints"
-        );
-    }
-    telemetry::record_worker_provider_operation_hint_pass(processed_provider_hints);
-    telemetry::record_worker_tick("provider_operation_hints", started.elapsed());
-    Ok(processed_provider_hints)
-}
-
 async fn run_route_cost_refresh(route_costs: Arc<RouteCostService>) -> RouteCostTaskResult {
     let started = Instant::now();
     let summary = route_costs
@@ -1086,19 +985,6 @@ fn handle_workflow_start_task_result(
     }
 }
 
-fn handle_provider_operation_hint_task_result(
-    result: Option<std::result::Result<ProviderOperationHintTaskResult, JoinError>>,
-) -> std::result::Result<usize, String> {
-    match result {
-        Some(Ok(Ok(processed))) => Ok(processed),
-        Some(Ok(Err(error))) => Err(format!("provider-operation hint pass failed: {error}")),
-        Some(Err(error)) => Err(format!(
-            "provider-operation hint pass panicked or was cancelled: {error}"
-        )),
-        None => Err("provider-operation hint task set terminated unexpectedly".to_string()),
-    }
-}
-
 fn handle_route_cost_task_result(
     result: Option<std::result::Result<RouteCostTaskResult, JoinError>>,
 ) -> std::result::Result<RouteCostRefreshSummary, String> {
@@ -1144,13 +1030,6 @@ async fn abort_vault_tasks(vault_tasks: &mut JoinSet<VaultTaskResult>) {
 async fn abort_workflow_start_tasks(workflow_start_tasks: &mut JoinSet<WorkflowStartTaskResult>) {
     workflow_start_tasks.abort_all();
     while workflow_start_tasks.join_next().await.is_some() {}
-}
-
-async fn abort_provider_operation_hint_tasks(
-    provider_operation_hint_tasks: &mut JoinSet<ProviderOperationHintTaskResult>,
-) {
-    provider_operation_hint_tasks.abort_all();
-    while provider_operation_hint_tasks.join_next().await.is_some() {}
 }
 
 async fn abort_route_cost_tasks(route_cost_tasks: &mut JoinSet<RouteCostTaskResult>) {
@@ -1308,7 +1187,6 @@ mod tests {
             order_execution_poll_interval: Duration::from_secs(5),
             route_cost_refresh_interval: Duration::from_secs(300),
             provider_health_poll_interval: Duration::from_secs(120),
-            provider_operation_hint_pass_limit: 500,
             order_maintenance_pass_limit: 100,
             order_planning_pass_limit: 100,
             order_execution_pass_limit: 25,

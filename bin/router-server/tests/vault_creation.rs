@@ -759,6 +759,7 @@ async fn spawn_router_api_from_components_with_auth(
             provider_policies: components.provider_policies,
             address_screener: components.address_screener,
             chain_registry: components.chain_registry,
+            order_workflow_client: None,
             internal_api_auth,
             gateway_api_auth,
             admin_api_auth,
