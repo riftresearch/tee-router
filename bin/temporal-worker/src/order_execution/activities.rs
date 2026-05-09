@@ -57,15 +57,15 @@ use super::types::{
     OrderExecutionState, OrderTerminalStatus, OrderWorkflowPhase,
     PersistProviderOperationStatusInput, PersistProviderReceiptInput, PersistStepFailedInput,
     PersistStepReadyToFireInput, PersistStepTerminalStatusInput, PersistenceBoundary,
-    PollProviderOperationHintsInput, ProviderActionDispatchShape, ProviderHintKind,
-    ProviderOperationHintDecision, ProviderOperationHintVerified, ProviderOperationHintsPolled,
-    RecoverAcrossOnchainLogInput, RecoverablePositionKind, RefreshedAttemptMaterialized,
-    RefreshedQuoteAttemptOutcome, RefreshedQuoteAttemptShape, RefundPlanOutcome, RefundPlanShape,
-    RefundUntenableReason, SettleProviderStepInput, SingleRefundPosition,
-    SingleRefundPositionDiscovery, SingleRefundPositionOutcome, StaleQuoteRefreshUntenableReason,
-    StaleRunningStepClassified, StaleRunningStepDecision, StepExecuted, StepExecutionOutcome,
-    StepFailureDecision, VerifyProviderOperationHintInput, WorkflowExecutionStep,
-    WriteFailedAttemptSnapshotInput,
+    PollProviderOperationHintsInput, ProviderActionDispatchShape, ProviderHintKind, ProviderKind,
+    ProviderOperationHintDecision, ProviderOperationHintSignal, ProviderOperationHintVerified,
+    ProviderOperationHintsPolled, RecoverAcrossOnchainLogInput, RecoverablePositionKind,
+    RefreshedAttemptMaterialized, RefreshedQuoteAttemptOutcome, RefreshedQuoteAttemptShape,
+    RefundPlanOutcome, RefundPlanShape, RefundUntenableReason, SettleProviderStepInput,
+    SingleRefundPosition, SingleRefundPositionDiscovery, SingleRefundPositionOutcome,
+    StaleQuoteRefreshUntenableReason, StaleRunningStepClassified, StaleRunningStepDecision,
+    StepExecuted, StepExecutionOutcome, StepFailureDecision, VerifyProviderOperationHintInput,
+    WorkflowExecutionStep, WriteFailedAttemptSnapshotInput,
 };
 
 const MAX_EXECUTION_ATTEMPTS: i32 = 2;
@@ -6296,10 +6296,12 @@ impl ProviderObservationActivities {
     /// signal-first plus fallback shape for brief §8.4.
     #[activity]
     pub async fn poll_provider_operation_hints(
+        self: Arc<Self>,
         _ctx: ActivityContext,
-        _input: PollProviderOperationHintsInput,
+        input: PollProviderOperationHintsInput,
     ) -> Result<ProviderOperationHintsPolled, ActivityError> {
-        todo!("PR7: poll provider hints as a fallback to signals")
+        let deps = self.deps()?;
+        poll_provider_operation_hint_for_step(&deps, input).await
     }
 
     /// Scar tissue: §11 Across on-chain log recovery.
@@ -6318,6 +6320,130 @@ impl ProviderObservationActivities {
         _input: CancelTimedOutHyperliquidTradeInput,
     ) -> Result<HyperliquidTradeCancelRecorded, ActivityError> {
         todo!("PR4: cancel timed-out Hyperliquid trade")
+    }
+}
+
+async fn poll_provider_operation_hint_for_step(
+    deps: &OrderActivityDeps,
+    input: PollProviderOperationHintsInput,
+) -> Result<ProviderOperationHintsPolled, ActivityError> {
+    let step = deps
+        .db
+        .orders()
+        .get_execution_step(input.step_id)
+        .await
+        .map_err(activity_error_from_display)?;
+    if step.order_id != input.order_id {
+        return Ok(provider_hints_polled(provider_hint_rejected(
+            None,
+            format!(
+                "step {} belongs to order {}, not {}",
+                step.id, step.order_id, input.order_id
+            ),
+        )));
+    }
+
+    let operations = deps
+        .db
+        .orders()
+        .get_provider_operations(input.order_id)
+        .await
+        .map_err(activity_error_from_display)?;
+    let Some(operation) = operations
+        .into_iter()
+        .filter(|operation| operation.execution_step_id == Some(input.step_id))
+        .max_by_key(|operation| (operation.updated_at, operation.created_at, operation.id))
+    else {
+        return Ok(provider_hints_polled(provider_hint_deferred(
+            None,
+            format!(
+                "provider hint poll found no provider operation for step {}",
+                input.step_id
+            ),
+        )));
+    };
+
+    let Some((provider, hint_kind)) = polling_hint_shape_for_operation(&operation) else {
+        return Ok(provider_hints_polled(provider_hint_deferred(
+            Some(operation.id),
+            format!(
+                "provider hint polling for {} is deferred to a later PR7b verifier",
+                operation.operation_type.to_db_string()
+            ),
+        )));
+    };
+
+    let signal = ProviderOperationHintSignal {
+        order_id: input.order_id,
+        // Deterministic synthetic hint id for activity-driven polling; this is
+        // not persisted as a user hint row.
+        hint_id: operation.id,
+        provider_operation_id: Some(operation.id),
+        provider,
+        hint_kind,
+        provider_ref: operation.provider_ref.clone(),
+    };
+    let verified = match hint_kind {
+        ProviderHintKind::AcrossFill => {
+            verify_across_fill_hint(
+                deps,
+                VerifyProviderOperationHintInput {
+                    order_id: input.order_id,
+                    step_id: input.step_id,
+                    signal,
+                },
+            )
+            .await?
+        }
+        ProviderHintKind::ProviderObservation => {
+            verify_provider_observation_hint(
+                deps,
+                VerifyProviderOperationHintInput {
+                    order_id: input.order_id,
+                    step_id: input.step_id,
+                    signal,
+                },
+            )
+            .await?
+        }
+        ProviderHintKind::CctpAttestation
+        | ProviderHintKind::UnitDeposit
+        | ProviderHintKind::HyperliquidTrade => {
+            return Ok(provider_hints_polled(provider_hint_deferred(
+                Some(operation.id),
+                format!("polling for {hint_kind:?} is deferred to a later PR7b verifier"),
+            )));
+        }
+    };
+    Ok(provider_hints_polled(verified))
+}
+
+fn polling_hint_shape_for_operation(
+    operation: &OrderProviderOperation,
+) -> Option<(ProviderKind, ProviderHintKind)> {
+    match operation.operation_type {
+        ProviderOperationType::AcrossBridge => {
+            Some((ProviderKind::Bridge, ProviderHintKind::AcrossFill))
+        }
+        // PR7b-i intentionally proves the polling architecture with Across.
+        // Typed CCTP, Unit, and Hyperliquid pollers are added in the following
+        // PR7b verifier slices.
+        ProviderOperationType::CctpBridge
+        | ProviderOperationType::UnitDeposit
+        | ProviderOperationType::UnitWithdrawal
+        | ProviderOperationType::HyperliquidTrade
+        | ProviderOperationType::HyperliquidLimitOrder
+        | ProviderOperationType::HyperliquidBridgeDeposit
+        | ProviderOperationType::HyperliquidBridgeWithdrawal
+        | ProviderOperationType::UniversalRouterSwap => None,
+    }
+}
+
+fn provider_hints_polled(verified: ProviderOperationHintVerified) -> ProviderOperationHintsPolled {
+    ProviderOperationHintsPolled {
+        provider_operation_id: verified.provider_operation_id,
+        decision: verified.decision,
+        reason: verified.reason,
     }
 }
 
