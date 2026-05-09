@@ -358,8 +358,158 @@ async fn order_workflow_refreshes_stale_quote_then_completes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn order_workflow_refreshes_stale_quote_multi_leg_then_completes() {
+    let run = run_order_workflow(WorkflowOptions {
+        route: WorkflowRoute::AcrossBaseEthToEthereumUsdc,
+        velora_stale_quote_failures: EXECUTE_STEP_TEMPORAL_ATTEMPTS,
+        expire_quote_legs: true,
+        ..WorkflowOptions::default()
+    })
+    .await;
+
+    assert_eq!(run.output.terminal_status, OrderTerminalStatus::Completed);
+    let completed = run
+        .db
+        .orders()
+        .get(run.order_id)
+        .await
+        .expect("load completed order");
+    assert_eq!(completed.status, RouterOrderStatus::Completed);
+
+    let attempts = run
+        .db
+        .orders()
+        .get_execution_attempts(run.order_id)
+        .await
+        .expect("load execution attempts");
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(
+        attempts[0].attempt_kind,
+        OrderExecutionAttemptKind::PrimaryExecution
+    );
+    assert_eq!(attempts[0].status, OrderExecutionAttemptStatus::Failed);
+    assert_eq!(
+        attempts[1].attempt_kind,
+        OrderExecutionAttemptKind::RefreshedExecution
+    );
+    assert_eq!(attempts[1].status, OrderExecutionAttemptStatus::Completed);
+
+    let stale_attempt_steps = run
+        .db
+        .orders()
+        .get_execution_steps_for_attempt(attempts[0].id)
+        .await
+        .expect("load stale attempt steps");
+    let across_step = stale_attempt_steps
+        .iter()
+        .find(|step| step.step_type == OrderExecutionStepType::AcrossBridge)
+        .expect("stale attempt should contain the completed Across step");
+    assert_eq!(across_step.status, OrderExecutionStepStatus::Completed);
+    let stale_velora_step = stale_attempt_steps
+        .iter()
+        .find(|step| step.step_type == OrderExecutionStepType::UniversalRouterSwap)
+        .expect("stale attempt should contain the superseded Velora step");
+    assert_eq!(
+        stale_velora_step.status,
+        OrderExecutionStepStatus::Superseded
+    );
+    assert_eq!(
+        stale_velora_step
+            .error
+            .get("reason")
+            .and_then(serde_json::Value::as_str),
+        Some("superseded_by_stale_provider_quote_refresh")
+    );
+
+    let stale_attempt_legs = run
+        .db
+        .orders()
+        .get_execution_legs_for_attempt(attempts[0].id)
+        .await
+        .expect("load stale attempt legs");
+    let completed_across_leg = stale_attempt_legs
+        .iter()
+        .find(|leg| leg.leg_type == "across_bridge")
+        .expect("stale attempt should contain an Across leg");
+    let actual_across_output = completed_across_leg
+        .actual_amount_out
+        .as_ref()
+        .expect("completed Across leg should record actual output");
+
+    let refreshed_attempt_steps = run
+        .db
+        .orders()
+        .get_execution_steps_for_attempt(attempts[1].id)
+        .await
+        .expect("load refreshed attempt steps");
+    assert_eq!(refreshed_attempt_steps.len(), 1);
+    assert_eq!(
+        refreshed_attempt_steps[0].step_type,
+        OrderExecutionStepType::UniversalRouterSwap
+    );
+    assert_eq!(
+        refreshed_attempt_steps[0].status,
+        OrderExecutionStepStatus::Completed
+    );
+    assert_eq!(
+        refreshed_attempt_steps[0].step_index,
+        stale_velora_step.step_index
+    );
+
+    let refreshed_attempt_legs = run
+        .db
+        .orders()
+        .get_execution_legs_for_attempt(attempts[1].id)
+        .await
+        .expect("load refreshed attempt legs");
+    assert_eq!(refreshed_attempt_legs.len(), 1);
+    assert_eq!(refreshed_attempt_legs[0].leg_index, 1);
+    assert_eq!(
+        refreshed_attempt_legs[0].amount_in.as_str(),
+        actual_across_output
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn order_workflow_refresh_untenable_routes_to_refund() {
     let run = run_order_workflow(WorkflowOptions {
+        velora_stale_quote_failures: EXECUTE_STEP_TEMPORAL_ATTEMPTS,
+        expire_quote_legs: true,
+        refreshed_eth_usd_micro: Some(1_000_000),
+        ..WorkflowOptions::default()
+    })
+    .await;
+
+    assert_eq!(
+        run.output.terminal_status,
+        OrderTerminalStatus::RefundRequired
+    );
+    let refund_required = run
+        .db
+        .orders()
+        .get(run.order_id)
+        .await
+        .expect("load refund-required order");
+    assert_eq!(refund_required.status, RouterOrderStatus::RefundRequired);
+
+    let attempts = run
+        .db
+        .orders()
+        .get_execution_attempts(run.order_id)
+        .await
+        .expect("load execution attempts");
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(
+        attempts[0].attempt_kind,
+        OrderExecutionAttemptKind::PrimaryExecution
+    );
+    assert_eq!(attempts[0].status, OrderExecutionAttemptStatus::Failed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn order_workflow_refresh_multi_leg_untenable_routes_to_refund() {
+    let run = run_order_workflow(WorkflowOptions {
+        route: WorkflowRoute::AcrossBaseEthToEthereumUsdc,
         velora_stale_quote_failures: EXECUTE_STEP_TEMPORAL_ATTEMPTS,
         expire_quote_legs: true,
         refreshed_eth_usd_micro: Some(1_000_000),
