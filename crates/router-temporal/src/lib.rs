@@ -2,15 +2,19 @@ use std::{error::Error as StdError, fmt::Display};
 
 use serde::{Deserialize, Serialize};
 use snafu::Snafu;
-use temporalio_client::{
-    Client, ClientOptions, UntypedSignal, WorkflowHandle, WorkflowSignalOptions,
-    WorkflowStartOptions,
-};
 use temporalio_common::{
     data_converters::{PayloadConverter, RawValue},
-    protos::temporal::api::enums::v1::{WorkflowIdConflictPolicy, WorkflowIdReusePolicy},
-    UntypedWorkflow,
+    protos::temporal::api::{
+        common::v1::{Payloads, WorkflowExecution, WorkflowType},
+        enums::v1::{TaskQueueKind, WorkflowIdConflictPolicy, WorkflowIdReusePolicy},
+        taskqueue::v1::TaskQueue,
+        workflowservice::v1::{
+            workflow_service_client::WorkflowServiceClient, SignalWorkflowExecutionRequest,
+            StartWorkflowExecutionRequest,
+        },
+    },
 };
+use tonic::{transport::Channel, Code};
 use uuid::Uuid;
 
 pub const DEFAULT_TASK_QUEUE: &str = "tee-router-order-execution";
@@ -76,6 +80,12 @@ pub enum RouterTemporalError {
         source: url::ParseError,
     },
 
+    #[snafu(display("OrderWorkflow {workflow_id} already started"))]
+    WorkflowAlreadyStarted {
+        workflow_id: String,
+        run_id: Option<String>,
+    },
+
     #[snafu(display("failed to {action}"))]
     Temporal {
         action: &'static str,
@@ -87,16 +97,24 @@ pub type RouterTemporalResult<T> = Result<T, RouterTemporalError>;
 
 #[derive(Clone)]
 pub struct OrderWorkflowClient {
-    client: Client,
+    client: WorkflowServiceClient<Channel>,
+    namespace: String,
     task_queue: String,
+    identity: String,
 }
 
 impl OrderWorkflowClient {
     #[must_use]
-    pub fn new(client: Client, task_queue: impl Into<String>) -> Self {
+    pub fn new(
+        client: WorkflowServiceClient<Channel>,
+        namespace: impl Into<String>,
+        task_queue: impl Into<String>,
+    ) -> Self {
         Self {
             client,
+            namespace: namespace.into(),
             task_queue: task_queue.into(),
+            identity: "tee-router".to_owned(),
         }
     }
 
@@ -105,26 +123,52 @@ impl OrderWorkflowClient {
         task_queue: impl Into<String>,
     ) -> RouterTemporalResult<Self> {
         let client = connect_client(connection).await?;
-        Ok(Self::new(client, task_queue))
+        Ok(Self::new(
+            client,
+            connection.namespace.clone(),
+            task_queue.into(),
+        ))
     }
 
-    pub async fn start_order_workflow(
-        &self,
-        order_id: Uuid,
-    ) -> RouterTemporalResult<WorkflowHandle<Client, UntypedWorkflow>> {
+    pub async fn start_order_workflow(&self, order_id: Uuid) -> RouterTemporalResult<String> {
         let workflow_id = order_workflow_id(order_id);
-        let input = raw_workflow_value(&OrderWorkflowInput { order_id });
-        self.client
-            .start_workflow(
-                UntypedWorkflow::new(ORDER_WORKFLOW_TYPE),
-                input,
-                workflow_start_options(&self.task_queue, &workflow_id),
-            )
-            .await
-            .map_err(|source| RouterTemporalError::Temporal {
-                action: "start OrderWorkflow",
-                source: boxed(source),
+        let input = payloads(&OrderWorkflowInput { order_id });
+        let response = self
+            .client
+            .clone()
+            .start_workflow_execution(StartWorkflowExecutionRequest {
+                namespace: self.namespace.clone(),
+                workflow_id: workflow_id.clone(),
+                workflow_type: Some(WorkflowType {
+                    name: ORDER_WORKFLOW_TYPE.to_owned(),
+                }),
+                task_queue: Some(TaskQueue {
+                    name: self.task_queue.clone(),
+                    kind: TaskQueueKind::Unspecified as i32,
+                    normal_name: String::new(),
+                }),
+                input: Some(input),
+                identity: self.identity.clone(),
+                request_id: Uuid::now_v7().to_string(),
+                workflow_id_reuse_policy: WorkflowIdReusePolicy::AllowDuplicateFailedOnly as i32,
+                workflow_id_conflict_policy: WorkflowIdConflictPolicy::Fail as i32,
+                ..Default::default()
             })
+            .await
+            .map_err(|source| {
+                if source.code() == Code::AlreadyExists {
+                    RouterTemporalError::WorkflowAlreadyStarted {
+                        workflow_id: workflow_id.clone(),
+                        run_id: None,
+                    }
+                } else {
+                    RouterTemporalError::Temporal {
+                        action: "start OrderWorkflow",
+                        source: boxed(source),
+                    }
+                }
+            })?;
+        Ok(response.into_inner().run_id)
     }
 
     pub async fn signal_provider_hint(
@@ -133,48 +177,45 @@ impl OrderWorkflowClient {
         signal: ProviderOperationHintSignal,
     ) -> RouterTemporalResult<()> {
         let workflow_id = order_workflow_id(order_id);
-        let input = raw_workflow_value(&signal);
-        let handle = self
-            .client
-            .get_workflow_handle::<UntypedWorkflow>(workflow_id);
-        handle
-            .signal(
-                UntypedSignal::new(ORDER_WORKFLOW_PROVIDER_HINT_SIGNAL),
-                input,
-                WorkflowSignalOptions::default(),
-            )
+        let input = payloads(&signal);
+        self.client
+            .clone()
+            .signal_workflow_execution(SignalWorkflowExecutionRequest {
+                namespace: self.namespace.clone(),
+                workflow_execution: Some(WorkflowExecution {
+                    workflow_id,
+                    run_id: String::new(),
+                }),
+                signal_name: ORDER_WORKFLOW_PROVIDER_HINT_SIGNAL.to_owned(),
+                input: Some(input),
+                identity: self.identity.clone(),
+                request_id: Uuid::now_v7().to_string(),
+                ..Default::default()
+            })
             .await
             .map_err(|source| RouterTemporalError::Temporal {
                 action: "signal OrderWorkflow provider-operation hint",
                 source: boxed(source),
-            })
+            })?;
+        Ok(())
     }
 }
 
-pub async fn connect_client(connection: &TemporalConnection) -> RouterTemporalResult<Client> {
-    let target =
-        temporalio_sdk_core::Url::parse(&connection.temporal_address).map_err(|source| {
-            RouterTemporalError::InvalidTemporalAddress {
-                address: connection.temporal_address.clone(),
-                source,
-            }
-        })?;
-    let connection_options = temporalio_client::ConnectionOptions::new(target).build();
-    let temporal_connection = temporalio_client::Connection::connect(connection_options)
+pub async fn connect_client(
+    connection: &TemporalConnection,
+) -> RouterTemporalResult<WorkflowServiceClient<Channel>> {
+    url::Url::parse(&connection.temporal_address).map_err(|source| {
+        RouterTemporalError::InvalidTemporalAddress {
+            address: connection.temporal_address.clone(),
+            source,
+        }
+    })?;
+    WorkflowServiceClient::connect(connection.temporal_address.clone())
         .await
         .map_err(|source| RouterTemporalError::Temporal {
             action: "connect to Temporal",
             source: boxed(source),
-        })?;
-
-    Client::new(
-        temporal_connection,
-        ClientOptions::new(connection.namespace.clone()).build(),
-    )
-    .map_err(|source| RouterTemporalError::Temporal {
-        action: "create Temporal client",
-        source: boxed(source),
-    })
+        })
 }
 
 #[must_use]
@@ -198,16 +239,15 @@ pub fn provider_hint_poll_workflow_id(order_id: Uuid, step_id: Uuid) -> String {
 }
 
 #[must_use]
-pub fn workflow_start_options(task_queue: &str, workflow_id: &str) -> WorkflowStartOptions {
-    WorkflowStartOptions::new(task_queue.to_owned(), workflow_id.to_owned())
-        .id_reuse_policy(WorkflowIdReusePolicy::AllowDuplicateFailedOnly)
-        .id_conflict_policy(WorkflowIdConflictPolicy::Fail)
-        .build()
+pub fn raw_workflow_value<T: Serialize + 'static>(value: &T) -> RawValue {
+    RawValue::from_value(value, &PayloadConverter::default())
 }
 
 #[must_use]
-pub fn raw_workflow_value<T: Serialize + 'static>(value: &T) -> RawValue {
-    RawValue::from_value(value, &PayloadConverter::default())
+fn payloads<T: Serialize + 'static>(value: &T) -> Payloads {
+    Payloads {
+        payloads: raw_workflow_value(value).payloads,
+    }
 }
 
 pub fn boxed(source: impl Display) -> BoxError {

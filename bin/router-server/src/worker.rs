@@ -2,17 +2,18 @@ use crate::{
     app::{initialize_components, PaymasterMode},
     runtime::BackgroundTaskResult,
     services::{
-        order_executor::{OrderWorkerPassLimits, OrderWorkerPassSummary},
-        vault_manager::{FundingHintPassSummary, RefundPassSummary},
-        OrderExecutionManager, ProviderHealthPollSummary, ProviderHealthPoller, VaultManager,
+        vault_manager::FundingHintPassSummary, OrderExecutionManager, ProviderHealthPollSummary,
+        ProviderHealthPoller, VaultManager,
     },
     telemetry, Error, Result, RouterServerArgs,
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use router_core::{
     db::{worker_lease_repo::WorkerLease, Database},
+    error::RouterCoreError,
     services::route_costs::{RouteCostRefreshSummary, RouteCostService},
 };
+use router_temporal::{OrderWorkflowClient, RouterTemporalError, TemporalConnection};
 use snafu::{FromString, Whatever};
 use sqlx_core::error::Error as SqlxError;
 use sqlx_postgres::{PgListener, PgNotification};
@@ -30,7 +31,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 const DEFAULT_WORKER_LEASE_NAME: &str = "global-router-worker";
-const ORDER_WAKE_QUEUE_MAX_IDS: usize = 10_000;
+const WORKFLOW_START_QUEUE_MAX_IDS: usize = 10_000;
 const PROVIDER_OPERATION_HINT_CHANNEL: &str = "router_provider_operation_hints";
 const VAULT_FUNDING_HINT_CHANNEL: &str = "router_vault_funding_hints";
 const VAULT_REFUND_WAKEUP_CHANNEL: &str = "router_vault_refund_wakeups";
@@ -204,31 +205,22 @@ impl RouterWorkerConfig {
             vault_funding_hint_pass_limit: i64::from(args.worker_vault_funding_hint_pass_limit),
         })
     }
-
-    fn order_pass_limits(&self) -> OrderWorkerPassLimits {
-        OrderWorkerPassLimits {
-            provider_operation_hints: 0,
-            maintenance: self.order_maintenance_pass_limit,
-            planning: self.order_planning_pass_limit,
-            execution: self.order_execution_pass_limit,
-        }
-    }
 }
 
 #[derive(Debug)]
-enum OrderWorkBatch {
+enum WorkflowStartBatch {
     Global,
     Orders(Vec<Uuid>),
 }
 
 #[derive(Debug, Default)]
-struct OrderWakeQueue {
+struct WorkflowStartQueue {
     global: bool,
     queued_order_ids: HashSet<Uuid>,
     order_ids: VecDeque<Uuid>,
 }
 
-impl OrderWakeQueue {
+impl WorkflowStartQueue {
     fn enqueue_global(&mut self) {
         self.global = true;
     }
@@ -237,7 +229,7 @@ impl OrderWakeQueue {
         if self.queued_order_ids.contains(&order_id) {
             return;
         }
-        if self.queued_order_ids.len() >= ORDER_WAKE_QUEUE_MAX_IDS {
+        if self.queued_order_ids.len() >= WORKFLOW_START_QUEUE_MAX_IDS {
             self.queued_order_ids.clear();
             self.order_ids.clear();
             self.enqueue_global();
@@ -253,13 +245,13 @@ impl OrderWakeQueue {
         }
     }
 
-    fn take_batch(&mut self, batch_limit: usize) -> Option<OrderWorkBatch> {
+    fn take_batch(&mut self, batch_limit: usize) -> Option<WorkflowStartBatch> {
         let batch_limit = batch_limit.max(1);
         if self.global {
             self.global = false;
             self.queued_order_ids.clear();
             self.order_ids.clear();
-            return Some(OrderWorkBatch::Global);
+            return Some(WorkflowStartBatch::Global);
         }
 
         let mut order_ids = Vec::with_capacity(batch_limit);
@@ -274,7 +266,7 @@ impl OrderWakeQueue {
         if order_ids.is_empty() {
             None
         } else {
-            Some(OrderWorkBatch::Orders(order_ids))
+            Some(WorkflowStartBatch::Orders(order_ids))
         }
     }
 }
@@ -282,11 +274,27 @@ impl OrderWakeQueue {
 #[derive(Debug, Clone, Default)]
 struct VaultWorkOutcome {
     funding_hints: FundingHintPassSummary,
-    refunds: RefundPassSummary,
+}
+
+#[derive(Debug, Clone, Default)]
+struct WorkflowStartSummary {
+    considered_orders: usize,
+    marked_funded_orders: usize,
+    started_workflows: usize,
+    already_started_workflows: usize,
+    skipped_orders: usize,
+}
+
+impl WorkflowStartSummary {
+    fn has_activity(&self) -> bool {
+        self.marked_funded_orders > 0
+            || self.started_workflows > 0
+            || self.already_started_workflows > 0
+    }
 }
 
 type VaultTaskResult = std::result::Result<VaultWorkOutcome, String>;
-type OrderTaskResult = std::result::Result<OrderWorkerPassSummary, String>;
+type WorkflowStartTaskResult = std::result::Result<WorkflowStartSummary, String>;
 type ProviderOperationHintTaskResult = std::result::Result<usize, String>;
 type RouteCostTaskResult = std::result::Result<RouteCostRefreshSummary, String>;
 type ProviderHealthTaskResult = std::result::Result<ProviderHealthPollSummary, String>;
@@ -305,11 +313,27 @@ pub async fn run_worker(args: RouterServerArgs) -> Result<()> {
         PaymasterMode::Enabled,
     )
     .await?;
+    let order_workflow_client = Arc::new(
+        OrderWorkflowClient::connect(
+            &TemporalConnection {
+                temporal_address: args.temporal_address.clone(),
+                namespace: args.temporal_namespace.clone(),
+            },
+            args.temporal_task_queue.clone(),
+        )
+        .await
+        .map_err(|source| Error::Generic {
+            source: Whatever::without_source(format!(
+                "failed to initialize Temporal order workflow client: {source}"
+            )),
+        })?,
+    );
 
     run_worker_loop(
         components.db,
         components.vault_manager,
         components.order_execution_manager,
+        order_workflow_client,
         components.route_costs,
         components.provider_health_poller,
         config,
@@ -324,6 +348,7 @@ pub async fn run_worker_loop(
     db: Database,
     vault_manager: Arc<VaultManager>,
     order_execution_manager: Arc<OrderExecutionManager>,
+    order_workflow_client: Arc<OrderWorkflowClient>,
     route_costs: Arc<RouteCostService>,
     provider_health_poller: Arc<ProviderHealthPoller>,
     config: RouterWorkerConfig,
@@ -336,8 +361,8 @@ pub async fn run_worker_loop(
     vault_work_poll_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut provider_operation_hint_poll_interval = interval(config.order_execution_poll_interval);
     provider_operation_hint_poll_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut order_execution_poll_interval = interval(config.order_execution_poll_interval);
-    order_execution_poll_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut workflow_start_poll_interval = interval(config.order_execution_poll_interval);
+    workflow_start_poll_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut route_cost_refresh_interval = interval(config.route_cost_refresh_interval);
     route_cost_refresh_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut provider_health_poll_interval = interval(config.provider_health_poll_interval);
@@ -346,13 +371,13 @@ pub async fn run_worker_loop(
     quote_cleanup_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut worker_listener = Some(connect_worker_listener(&config.database_url).await?);
     let mut vault_tasks: JoinSet<VaultTaskResult> = JoinSet::new();
-    let mut order_execution_tasks: JoinSet<OrderTaskResult> = JoinSet::new();
+    let mut workflow_start_tasks: JoinSet<WorkflowStartTaskResult> = JoinSet::new();
     let mut provider_operation_hint_tasks: JoinSet<ProviderOperationHintTaskResult> =
         JoinSet::new();
     let mut route_cost_tasks: JoinSet<RouteCostTaskResult> = JoinSet::new();
     let mut provider_health_tasks: JoinSet<ProviderHealthTaskResult> = JoinSet::new();
     let mut quote_cleanup_tasks: JoinSet<QuoteCleanupTaskResult> = JoinSet::new();
-    let mut order_wake_queue = OrderWakeQueue::default();
+    let mut workflow_start_queue = WorkflowStartQueue::default();
     let mut pending_vault_wakeup = false;
     let mut pending_provider_operation_hint_wakeup = false;
     let mut pending_route_cost_refresh = false;
@@ -376,17 +401,17 @@ pub async fn run_worker_loop(
                     lease_renew_interval.reset();
                     vault_work_poll_interval.reset();
                     provider_operation_hint_poll_interval.reset();
-                    order_execution_poll_interval.reset();
+                    workflow_start_poll_interval.reset();
                     route_cost_refresh_interval.reset();
                     provider_health_poll_interval.reset();
                     quote_cleanup_interval.reset();
-                    order_wake_queue.enqueue_global();
-                    spawn_order_execution_work_if_idle(
-                        &mut order_execution_tasks,
-                        order_execution_manager.clone(),
-                        &mut order_wake_queue,
-                        config.order_pass_limits(),
-                        config.order_execution_concurrency,
+                    workflow_start_queue.enqueue_global();
+                    spawn_workflow_start_if_idle(
+                        &mut workflow_start_tasks,
+                        db.clone(),
+                        order_workflow_client.clone(),
+                        &mut workflow_start_queue,
+                        config.order_execution_pass_limit,
                     );
                     pending_provider_operation_hint_wakeup = true;
                     spawn_provider_operation_hint_work_if_idle(
@@ -463,12 +488,12 @@ pub async fn run_worker_loop(
                         telemetry::record_worker_active(false);
                         active_lease = None;
                         abort_vault_tasks(&mut vault_tasks).await;
-                        abort_order_execution_tasks(&mut order_execution_tasks).await;
+                        abort_workflow_start_tasks(&mut workflow_start_tasks).await;
                         abort_provider_operation_hint_tasks(&mut provider_operation_hint_tasks).await;
                         abort_route_cost_tasks(&mut route_cost_tasks).await;
                         abort_provider_health_tasks(&mut provider_health_tasks).await;
                         abort_quote_cleanup_tasks(&mut quote_cleanup_tasks).await;
-                        order_wake_queue = OrderWakeQueue::default();
+                        workflow_start_queue = WorkflowStartQueue::default();
                         pending_vault_wakeup = false;
                         pending_provider_operation_hint_wakeup = false;
                         pending_route_cost_refresh = false;
@@ -518,14 +543,14 @@ pub async fn run_worker_loop(
                     config.provider_operation_hint_pass_limit,
                 );
             }
-            _ = order_execution_poll_interval.tick(), if order_execution_tasks.is_empty() => {
-                order_wake_queue.enqueue_global();
-                spawn_order_execution_work_if_idle(
-                    &mut order_execution_tasks,
-                    order_execution_manager.clone(),
-                    &mut order_wake_queue,
-                    config.order_pass_limits(),
-                    config.order_execution_concurrency,
+            _ = workflow_start_poll_interval.tick(), if workflow_start_tasks.is_empty() => {
+                workflow_start_queue.enqueue_global();
+                spawn_workflow_start_if_idle(
+                    &mut workflow_start_tasks,
+                    db.clone(),
+                    order_workflow_client.clone(),
+                    &mut workflow_start_queue,
+                    config.order_execution_pass_limit,
                 );
             }
             _ = provider_health_poll_interval.tick(), if provider_health_tasks.is_empty() => {
@@ -598,14 +623,13 @@ pub async fn run_worker_loop(
             }
             vault_result = vault_tasks.join_next(), if !vault_tasks.is_empty() => {
                 let outcome = handle_vault_task_result(vault_result)?;
-                order_wake_queue.enqueue_orders(outcome.funding_hints.funded_order_ids);
-                order_wake_queue.enqueue_orders(outcome.refunds.refunded_order_ids);
-                spawn_order_execution_work_if_idle(
-                    &mut order_execution_tasks,
-                    order_execution_manager.clone(),
-                    &mut order_wake_queue,
-                    config.order_pass_limits(),
-                    config.order_execution_concurrency,
+                workflow_start_queue.enqueue_orders(outcome.funding_hints.funded_order_ids);
+                spawn_workflow_start_if_idle(
+                    &mut workflow_start_tasks,
+                    db.clone(),
+                    order_workflow_client.clone(),
+                    &mut workflow_start_queue,
+                    config.order_execution_pass_limit,
                 );
                 next_refund_due_at = refresh_next_refund_due_at(&db).await?;
                 spawn_vault_work_if_idle(
@@ -615,17 +639,24 @@ pub async fn run_worker_loop(
                     config.vault_funding_hint_pass_limit,
                 );
             }
-            order_execution_result = order_execution_tasks.join_next(), if !order_execution_tasks.is_empty() => {
-                let summary = handle_order_execution_task_result(order_execution_result)?;
+            workflow_start_result = workflow_start_tasks.join_next(), if !workflow_start_tasks.is_empty() => {
+                let summary = handle_workflow_start_task_result(workflow_start_result)?;
                 if summary.has_activity() {
-                    order_wake_queue.enqueue_global();
+                    info!(
+                        considered_orders = summary.considered_orders,
+                        marked_funded_orders = summary.marked_funded_orders,
+                        started_workflows = summary.started_workflows,
+                        already_started_workflows = summary.already_started_workflows,
+                        skipped_orders = summary.skipped_orders,
+                        "Router worker started order workflows"
+                    );
                 }
-                spawn_order_execution_work_if_idle(
-                    &mut order_execution_tasks,
-                    order_execution_manager.clone(),
-                    &mut order_wake_queue,
-                    config.order_pass_limits(),
-                    config.order_execution_concurrency,
+                spawn_workflow_start_if_idle(
+                    &mut workflow_start_tasks,
+                    db.clone(),
+                    order_workflow_client.clone(),
+                    &mut workflow_start_queue,
+                    config.order_execution_pass_limit,
                 );
             }
             provider_operation_hint_result = provider_operation_hint_tasks.join_next(), if !provider_operation_hint_tasks.is_empty() => {
@@ -633,14 +664,6 @@ pub async fn run_worker_loop(
                     handle_provider_operation_hint_task_result(provider_operation_hint_result)?;
                 if processed_provider_hints > 0 {
                     pending_provider_operation_hint_wakeup = true;
-                    order_wake_queue.enqueue_global();
-                    spawn_order_execution_work_if_idle(
-                        &mut order_execution_tasks,
-                        order_execution_manager.clone(),
-                        &mut order_wake_queue,
-                        config.order_pass_limits(),
-                        config.order_execution_concurrency,
-                    );
                 }
                 spawn_provider_operation_hint_work_if_idle(
                     &mut provider_operation_hint_tasks,
@@ -782,34 +805,26 @@ fn spawn_vault_work_if_idle(
     }
 }
 
-fn spawn_order_execution_work_if_idle(
-    order_execution_tasks: &mut JoinSet<OrderTaskResult>,
-    order_execution_manager: Arc<OrderExecutionManager>,
-    order_wake_queue: &mut OrderWakeQueue,
-    pass_limits: OrderWorkerPassLimits,
-    execution_concurrency: usize,
+fn spawn_workflow_start_if_idle(
+    workflow_start_tasks: &mut JoinSet<WorkflowStartTaskResult>,
+    db: Database,
+    order_workflow_client: Arc<OrderWorkflowClient>,
+    workflow_start_queue: &mut WorkflowStartQueue,
+    batch_limit: i64,
 ) {
-    if order_execution_tasks.is_empty() {
-        if let Some(batch) = order_wake_queue.take_batch(order_wake_batch_limit(pass_limits)) {
-            order_execution_tasks.spawn(run_order_execution_work_batch(
-                order_execution_manager,
+    if workflow_start_tasks.is_empty() {
+        let batch_limit = usize::try_from(batch_limit)
+            .unwrap_or(WORKFLOW_START_QUEUE_MAX_IDS)
+            .min(WORKFLOW_START_QUEUE_MAX_IDS);
+        if let Some(batch) = workflow_start_queue.take_batch(batch_limit) {
+            workflow_start_tasks.spawn(run_workflow_start_batch(
+                db,
+                order_workflow_client,
                 batch,
-                pass_limits,
-                execution_concurrency,
+                batch_limit,
             ));
         }
     }
-}
-
-fn order_wake_batch_limit(pass_limits: OrderWorkerPassLimits) -> usize {
-    let limit = pass_limits
-        .maintenance
-        .max(pass_limits.planning)
-        .max(pass_limits.execution)
-        .max(1);
-    usize::try_from(limit)
-        .unwrap_or(ORDER_WAKE_QUEUE_MAX_IDS)
-        .min(ORDER_WAKE_QUEUE_MAX_IDS)
 }
 
 fn spawn_provider_operation_hint_work_if_idle(
@@ -899,60 +914,97 @@ async fn run_vault_work_pass(
         );
     }
     telemetry::record_worker_tick("vault_worker", started.elapsed());
-    Ok(VaultWorkOutcome {
-        funding_hints,
-        refunds,
-    })
+    Ok(VaultWorkOutcome { funding_hints })
 }
 
-async fn run_order_execution_work_batch(
-    order_execution_manager: Arc<OrderExecutionManager>,
-    batch: OrderWorkBatch,
-    pass_limits: OrderWorkerPassLimits,
-    execution_concurrency: usize,
-) -> OrderTaskResult {
+async fn run_workflow_start_batch(
+    db: Database,
+    order_workflow_client: Arc<OrderWorkflowClient>,
+    batch: WorkflowStartBatch,
+    batch_limit: usize,
+) -> WorkflowStartTaskResult {
     let started = Instant::now();
-    let summary = match batch {
-        OrderWorkBatch::Global => {
-            order_execution_manager
-                .process_worker_pass_with_limits_and_concurrency(pass_limits, execution_concurrency)
-                .await
-        }
-        OrderWorkBatch::Orders(order_ids) => {
-            order_execution_manager
-                .process_order_ids_with_concurrency(&order_ids, execution_concurrency)
-                .await
+    let order_ids = match batch {
+        WorkflowStartBatch::Global => db
+            .orders()
+            .get_market_orders_needing_execution_plan(
+                i64::try_from(batch_limit).unwrap_or(i64::MAX),
+            )
+            .await
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|order| order.id)
+            .collect::<Vec<_>>(),
+        WorkflowStartBatch::Orders(order_ids) => order_ids,
+    };
+
+    let mut summary = WorkflowStartSummary {
+        considered_orders: order_ids.len(),
+        ..WorkflowStartSummary::default()
+    };
+    for order_id in order_ids {
+        match mark_order_funded_and_start_workflow(&db, &order_workflow_client, order_id).await {
+            Ok(StartOrderWorkflowOutcome::Started) => {
+                summary.marked_funded_orders += 1;
+                summary.started_workflows += 1;
+            }
+            Ok(StartOrderWorkflowOutcome::AlreadyStarted) => {
+                summary.marked_funded_orders += 1;
+                summary.already_started_workflows += 1;
+            }
+            Ok(StartOrderWorkflowOutcome::Skipped) => {
+                summary.skipped_orders += 1;
+            }
+            Err(error) => return Err(error),
         }
     }
-    .map_err(|err| err.to_string())?;
-    if summary.has_activity() {
-        info!(
-            reconciled_failed_orders = summary.reconciled_failed_orders,
-            processed_provider_hints = summary.processed_provider_hints,
-            maintenance_tasks = summary.maintenance_tasks,
-            planned_orders = summary.planned_orders,
-            executed_orders = summary.executed_orders,
-            "Router worker processed orders"
-        );
-    }
-    telemetry::record_worker_order_pass_summary(
-        summary.reconciled_failed_orders,
-        summary.processed_provider_hints,
-        summary.maintenance_tasks,
-        summary.planned_orders,
-        summary.executed_orders,
-    );
-    if let Err(err) = order_execution_manager
-        .sample_order_in_progress_queue_depth()
+    telemetry::record_worker_tick("order_workflow_start", started.elapsed());
+    Ok(summary)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartOrderWorkflowOutcome {
+    Started,
+    AlreadyStarted,
+    Skipped,
+}
+
+async fn mark_order_funded_and_start_workflow(
+    db: &Database,
+    order_workflow_client: &OrderWorkflowClient,
+    order_id: Uuid,
+) -> std::result::Result<StartOrderWorkflowOutcome, String> {
+    match db
+        .orders()
+        .mark_order_funded_from_funded_vault(order_id, Utc::now())
         .await
     {
-        warn!(
-            error = %err,
-            "Router worker failed to sample in-progress order queue depth"
-        );
+        Ok(_) => {}
+        Err(RouterCoreError::NotFound) => {
+            let order = db
+                .orders()
+                .get(order_id)
+                .await
+                .map_err(|err| err.to_string())?;
+            if order.status != router_core::models::RouterOrderStatus::Funded {
+                debug!(
+                    order_id = %order_id,
+                    status = %order.status.to_db_string(),
+                    "Router worker skipped OrderWorkflow start for order not ready to execute"
+                );
+                return Ok(StartOrderWorkflowOutcome::Skipped);
+            }
+        }
+        Err(err) => return Err(err.to_string()),
     }
-    telemetry::record_worker_tick("order_executor", started.elapsed());
-    Ok(summary)
+
+    match order_workflow_client.start_order_workflow(order_id).await {
+        Ok(_) => Ok(StartOrderWorkflowOutcome::Started),
+        Err(RouterTemporalError::WorkflowAlreadyStarted { .. }) => {
+            Ok(StartOrderWorkflowOutcome::AlreadyStarted)
+        }
+        Err(err) => Err(err.to_string()),
+    }
 }
 
 async fn run_provider_operation_hint_pass(
@@ -1021,16 +1073,16 @@ fn handle_vault_task_result(
     }
 }
 
-fn handle_order_execution_task_result(
-    result: Option<std::result::Result<OrderTaskResult, JoinError>>,
-) -> std::result::Result<OrderWorkerPassSummary, String> {
+fn handle_workflow_start_task_result(
+    result: Option<std::result::Result<WorkflowStartTaskResult, JoinError>>,
+) -> std::result::Result<WorkflowStartSummary, String> {
     match result {
         Some(Ok(Ok(summary))) => Ok(summary),
-        Some(Ok(Err(error))) => Err(format!("order executor pass failed: {error}")),
+        Some(Ok(Err(error))) => Err(format!("order workflow start pass failed: {error}")),
         Some(Err(error)) => Err(format!(
-            "order executor pass panicked or was cancelled: {error}"
+            "order workflow start pass panicked or was cancelled: {error}"
         )),
-        None => Err("order executor task set terminated unexpectedly".to_string()),
+        None => Err("order workflow start task set terminated unexpectedly".to_string()),
     }
 }
 
@@ -1089,9 +1141,9 @@ async fn abort_vault_tasks(vault_tasks: &mut JoinSet<VaultTaskResult>) {
     while vault_tasks.join_next().await.is_some() {}
 }
 
-async fn abort_order_execution_tasks(order_execution_tasks: &mut JoinSet<OrderTaskResult>) {
-    order_execution_tasks.abort_all();
-    while order_execution_tasks.join_next().await.is_some() {}
+async fn abort_workflow_start_tasks(workflow_start_tasks: &mut JoinSet<WorkflowStartTaskResult>) {
+    workflow_start_tasks.abort_all();
+    while workflow_start_tasks.join_next().await.is_some() {}
 }
 
 async fn abort_provider_operation_hint_tasks(
@@ -1196,17 +1248,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn order_wake_queue_dedupes_order_ids_without_global_work() {
+    fn workflow_start_queue_dedupes_order_ids_without_global_work() {
         let first = Uuid::now_v7();
         let second = Uuid::now_v7();
-        let mut queue = OrderWakeQueue::default();
+        let mut queue = WorkflowStartQueue::default();
 
         queue.enqueue_order(first);
         queue.enqueue_order(first);
         queue.enqueue_order(second);
 
         match queue.take_batch(25) {
-            Some(OrderWorkBatch::Orders(order_ids)) => {
+            Some(WorkflowStartBatch::Orders(order_ids)) => {
                 assert_eq!(order_ids, vec![first, second]);
             }
             other => panic!("expected deduped order batch, got {other:?}"),
@@ -1215,16 +1267,19 @@ mod tests {
     }
 
     #[test]
-    fn order_wake_queue_global_work_supersedes_targeted_ids() {
+    fn workflow_start_queue_global_work_supersedes_targeted_ids() {
         let first = Uuid::now_v7();
         let second = Uuid::now_v7();
-        let mut queue = OrderWakeQueue::default();
+        let mut queue = WorkflowStartQueue::default();
 
         queue.enqueue_order(first);
         queue.enqueue_order(second);
         queue.enqueue_global();
 
-        assert!(matches!(queue.take_batch(25), Some(OrderWorkBatch::Global)));
+        assert!(matches!(
+            queue.take_batch(25),
+            Some(WorkflowStartBatch::Global)
+        ));
         assert!(queue.take_batch(25).is_none());
     }
 
@@ -1269,8 +1324,8 @@ mod tests {
     }
 
     #[test]
-    fn order_wake_queue_prioritizes_global_work_over_targeted_batches() {
-        let mut queue = OrderWakeQueue::default();
+    fn workflow_start_queue_prioritizes_global_work_over_targeted_batches() {
+        let mut queue = WorkflowStartQueue::default();
         let batch_limit = 4;
         let order_ids = (0..(batch_limit + 1))
             .map(|_| Uuid::now_v7())
@@ -1281,33 +1336,24 @@ mod tests {
 
         assert!(matches!(
             queue.take_batch(batch_limit),
-            Some(OrderWorkBatch::Global)
+            Some(WorkflowStartBatch::Global)
         ));
         assert!(queue.take_batch(batch_limit).is_none());
     }
 
     #[test]
-    fn order_wake_batch_limit_tracks_configured_order_pass_limits() {
-        let limits = OrderWorkerPassLimits {
-            provider_operation_hints: 5000,
-            maintenance: 1000,
-            planning: 64,
-            execution: 256,
-        };
+    fn workflow_start_queue_collapses_to_global_when_targeted_ids_are_unbounded() {
+        let mut queue = WorkflowStartQueue::default();
 
-        assert_eq!(order_wake_batch_limit(limits), 1000);
-    }
-
-    #[test]
-    fn order_wake_queue_collapses_to_global_when_targeted_ids_are_unbounded() {
-        let mut queue = OrderWakeQueue::default();
-
-        for _ in 0..ORDER_WAKE_QUEUE_MAX_IDS {
+        for _ in 0..WORKFLOW_START_QUEUE_MAX_IDS {
             queue.enqueue_order(Uuid::now_v7());
         }
         queue.enqueue_order(Uuid::now_v7());
 
-        assert!(matches!(queue.take_batch(25), Some(OrderWorkBatch::Global)));
+        assert!(matches!(
+            queue.take_batch(25),
+            Some(WorkflowStartBatch::Global)
+        ));
         assert!(queue.take_batch(25).is_none());
     }
 

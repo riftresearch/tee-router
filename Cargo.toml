@@ -73,6 +73,7 @@ temporalio-common = { version = "0.4.0", default-features = false }
 temporalio-macros = "0.4.0"
 temporalio-sdk = { version = "0.4.0", default-features = false }
 temporalio-sdk-core = { version = "0.4.0", default-features = false }
+tonic = { version = "0.14", default-features = false, features = ["transport", "codegen", "tls-ring", "tls-webpki-roots"] }
 axum = { version = "0.7", features = ["ws"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 clap = { version = "4.5", features = ["derive", "env"] }

@@ -7603,12 +7603,30 @@ fn polling_hint_shape_for_operation(
         ProviderOperationType::HyperliquidTrade | ProviderOperationType::HyperliquidLimitOrder => {
             Some((ProviderKind::Exchange, ProviderHintKind::HyperliquidTrade))
         }
-        // UnitWithdrawal currently settles through explicit ProviderObservation
-        // hints; there is no dedicated ProviderHintKind for it.
+        // These operation families do not have typed hint kinds, but the generic
+        // provider observation verifier can still poll their real provider APIs.
         ProviderOperationType::UnitWithdrawal
         | ProviderOperationType::HyperliquidBridgeDeposit
         | ProviderOperationType::HyperliquidBridgeWithdrawal
-        | ProviderOperationType::UniversalRouterSwap => None,
+        | ProviderOperationType::UniversalRouterSwap => Some((
+            provider_kind_for_operation(&operation.operation_type),
+            ProviderHintKind::ProviderObservation,
+        )),
+    }
+}
+
+fn provider_kind_for_operation(operation_type: &ProviderOperationType) -> ProviderKind {
+    match operation_type {
+        ProviderOperationType::AcrossBridge
+        | ProviderOperationType::CctpBridge
+        | ProviderOperationType::HyperliquidBridgeDeposit
+        | ProviderOperationType::HyperliquidBridgeWithdrawal => ProviderKind::Bridge,
+        ProviderOperationType::UnitDeposit | ProviderOperationType::UnitWithdrawal => {
+            ProviderKind::Unit
+        }
+        ProviderOperationType::HyperliquidTrade
+        | ProviderOperationType::HyperliquidLimitOrder
+        | ProviderOperationType::UniversalRouterSwap => ProviderKind::Exchange,
     }
 }
 
@@ -8747,10 +8765,71 @@ fn provider_hint_observed_state(
     if let Some(error) = &observation.error {
         observed_state["provider_error"] = error.clone();
     }
+    if let Some(recovery) = across_log_recovery_marker(operation) {
+        observed_state["router_recovery"] = recovery;
+    }
     if !is_empty_json_object(&operation.observed_state) {
         observed_state["previous_observed_state"] = operation.observed_state.clone();
     }
     observed_state
+}
+
+fn across_log_recovery_marker(operation: &OrderProviderOperation) -> Option<Value> {
+    if operation.operation_type != ProviderOperationType::AcrossBridge {
+        return None;
+    }
+    if let Some(recovery) = find_across_log_recovery_marker(&operation.observed_state) {
+        return Some(recovery);
+    }
+    if let Some(deposit_tx_hash) =
+        recovered_across_deposit_tx_hash_from_value(&operation.observed_state)
+    {
+        return Some(json!({
+            "kind": "across_deposit_log_recovery",
+            "deposit_tx_hash": deposit_tx_hash,
+            "source_provider_ref": &operation.provider_ref,
+        }));
+    }
+    if operation.response.get("kind").and_then(Value::as_str) != Some("provider_receipt_checkpoint")
+    {
+        return None;
+    }
+    let deposit_tx_hash = provider_operation_tx_hash_from_value(&operation.response)
+        .or_else(|| provider_operation_tx_hash_from_value(&operation.observed_state));
+    Some(json!({
+        "kind": "across_deposit_log_recovery",
+        "deposit_tx_hash": deposit_tx_hash,
+        "source_provider_ref": &operation.provider_ref,
+    }))
+}
+
+fn find_across_log_recovery_marker(value: &Value) -> Option<Value> {
+    let object = value.as_object()?;
+    if object
+        .get("kind")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind == "across_deposit_log_recovery")
+    {
+        return Some(value.clone());
+    }
+    object.values().find_map(find_across_log_recovery_marker)
+}
+
+fn recovered_across_deposit_tx_hash_from_value(value: &Value) -> Option<String> {
+    let object = value.as_object()?;
+    let has_recovery_shape = object.contains_key("deposit_id")
+        || object
+            .get("source")
+            .and_then(Value::as_str)
+            .is_some_and(|source| source == "temporal_across_deposit_log_recovery");
+    if has_recovery_shape {
+        if let Some(deposit_tx_hash) = object.get("deposit_tx_hash").and_then(Value::as_str) {
+            return Some(deposit_tx_hash.to_string());
+        }
+    }
+    object
+        .get("previous_observed_state")
+        .and_then(recovered_across_deposit_tx_hash_from_value)
 }
 
 fn provider_hint_signal_evidence(signal: &ProviderOperationHintSignal) -> Value {

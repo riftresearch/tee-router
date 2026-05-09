@@ -4,6 +4,7 @@ use std::{
     future::Future,
     net::IpAddr,
     path::{Path, PathBuf},
+    process::Command,
     str::FromStr,
     sync::OnceLock,
     time::{Duration, Instant},
@@ -40,17 +41,23 @@ use router_server::{
     worker::{run_worker_loop, RouterWorkerConfig},
     RouterServerArgs,
 };
+use router_temporal::{OrderWorkflowClient, TemporalConnection as RouterTemporalConnection};
 use sauron::discovery::{evm_erc20::EvmErc20DiscoveryBackend, DiscoveryBackend};
 use sauron::{run as run_sauron, SauronArgs};
 use serde_json::{json, Value};
 use sqlx_core::connection::Connection;
 use sqlx_postgres::{PgConnectOptions, PgConnection, PgPoolOptions};
+use temporal_worker::{
+    order_execution::{activities::OrderActivities, build_worker},
+    production::OrderWorkerRuntimeArgs,
+    runtime::TemporalConnection,
+};
 use testcontainers::{
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
     ContainerAsync, GenericImage, ImageExt,
 };
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, LocalSet};
 use uuid::Uuid;
 
 const MOCK_ERC20_ADDRESS: &str = "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf";
@@ -169,13 +176,62 @@ struct TestPostgres {
     _container: Option<ContainerAsync<GenericImage>>,
 }
 
+impl TestPostgres {
+    async fn shutdown(&mut self) {
+        if let Some(container) = self._container.take() {
+            container.rm().await.expect("remove Postgres testcontainer");
+        }
+    }
+}
+
 struct RuntimeTask {
-    handle: JoinHandle<()>,
+    handle: Option<JoinHandle<()>>,
+    shutdown: Option<Box<dyn FnOnce()>>,
 }
 
 impl Drop for RuntimeTask {
     fn drop(&mut self) {
-        self.handle.abort();
+        if let Some(shutdown) = self.shutdown.take() {
+            shutdown();
+        }
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+impl RuntimeTask {
+    fn new(handle: JoinHandle<()>) -> Self {
+        Self {
+            handle: Some(handle),
+            shutdown: None,
+        }
+    }
+
+    fn with_shutdown(handle: JoinHandle<()>, shutdown: impl FnOnce() + 'static) -> Self {
+        Self {
+            handle: Some(handle),
+            shutdown: Some(Box::new(shutdown)),
+        }
+    }
+
+    async fn abort_and_join(&mut self) {
+        let Some(mut handle) = self.handle.take() else {
+            return;
+        };
+        if let Some(shutdown) = self.shutdown.take() {
+            shutdown();
+            tokio::select! {
+                _ = &mut handle => {}
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                    handle.abort();
+                    let _ = handle.await;
+                }
+            }
+        } else {
+            handle.abort();
+            let _ = handle.await;
+        }
     }
 }
 
@@ -847,7 +903,91 @@ async fn spawn_router_api(mut args: RouterServerArgs) -> (String, RuntimeTask) {
     })
     .await;
 
-    (base_url, RuntimeTask { handle })
+    (base_url, RuntimeTask::new(handle))
+}
+
+async fn spawn_temporal_order_worker(args: &RouterServerArgs) -> RuntimeTask {
+    let runtime_args = order_worker_runtime_args_from_router_args(args);
+    let connection = TemporalConnection {
+        temporal_address: args.temporal_address.clone(),
+        namespace: args.temporal_namespace.clone(),
+    };
+    let task_queue = args.temporal_task_queue.clone();
+    let order_activities = runtime_args
+        .build_order_activities()
+        .await
+        .expect("build temporal-worker order activities");
+    let mut built = build_worker(
+        &connection,
+        &task_queue,
+        OrderActivities::new(order_activities),
+    )
+    .await
+    .expect("build temporal order worker");
+    let shutdown = built.worker.shutdown_handle();
+    let handle = tokio::task::spawn_local(async move {
+        built
+            .worker
+            .run()
+            .await
+            .expect("temporal order worker should keep running until test aborts");
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !handle.is_finished(),
+        "temporal order worker exited during startup"
+    );
+    RuntimeTask::with_shutdown(handle, shutdown)
+}
+
+fn order_worker_runtime_args_from_router_args(args: &RouterServerArgs) -> OrderWorkerRuntimeArgs {
+    OrderWorkerRuntimeArgs {
+        database_url: args.database_url.clone(),
+        db_max_connections: args.db_max_connections,
+        db_min_connections: args.db_min_connections,
+        master_key_path: args.master_key_path.clone(),
+        ethereum_mainnet_rpc_url: args.ethereum_mainnet_rpc_url.clone(),
+        ethereum_reference_token: args.ethereum_reference_token.clone(),
+        ethereum_paymaster_private_key: args.ethereum_paymaster_private_key.clone(),
+        base_rpc_url: args.base_rpc_url.clone(),
+        base_reference_token: args.base_reference_token.clone(),
+        base_paymaster_private_key: args.base_paymaster_private_key.clone(),
+        arbitrum_rpc_url: args.arbitrum_rpc_url.clone(),
+        arbitrum_reference_token: args.arbitrum_reference_token.clone(),
+        arbitrum_paymaster_private_key: args.arbitrum_paymaster_private_key.clone(),
+        evm_paymaster_vault_gas_buffer_wei: args.evm_paymaster_vault_gas_buffer_wei.clone(),
+        evm_paymaster_vault_gas_target_wei: args.evm_paymaster_vault_gas_target_wei.clone(),
+        bitcoin_rpc_url: args.bitcoin_rpc_url.clone(),
+        bitcoin_rpc_auth: args.bitcoin_rpc_auth.clone(),
+        untrusted_esplora_http_server_url: args.untrusted_esplora_http_server_url.clone(),
+        bitcoin_network: args.bitcoin_network,
+        bitcoin_paymaster_private_key: args.bitcoin_paymaster_private_key.clone(),
+        across_api_url: args.across_api_url.clone(),
+        across_api_key: args.across_api_key.clone(),
+        across_integrator_id: args.across_integrator_id.clone(),
+        cctp_api_url: args.cctp_api_url.clone(),
+        cctp_token_messenger_v2_address: args.cctp_token_messenger_v2_address.clone(),
+        cctp_message_transmitter_v2_address: args.cctp_message_transmitter_v2_address.clone(),
+        hyperunit_api_url: args.hyperunit_api_url.clone(),
+        hyperunit_proxy_url: args.hyperunit_proxy_url.clone(),
+        hyperliquid_api_url: args.hyperliquid_api_url.clone(),
+        velora_api_url: args.velora_api_url.clone(),
+        velora_partner: args.velora_partner.clone(),
+        hyperliquid_execution_private_key: args.hyperliquid_execution_private_key.clone(),
+        hyperliquid_account_address: args.hyperliquid_account_address.clone(),
+        hyperliquid_vault_address: args.hyperliquid_vault_address.clone(),
+        hyperliquid_paymaster_private_key: args.hyperliquid_paymaster_private_key.clone(),
+        hyperliquid_network: args.hyperliquid_network,
+        hyperliquid_order_timeout_ms: args.hyperliquid_order_timeout_ms,
+    }
+}
+
+fn ensure_temporal_up() {
+    let status = Command::new("just")
+        .arg("temporal-up")
+        .status()
+        .expect("run `just temporal-up`; install just or start Temporal manually");
+    assert!(status.success(), "`just temporal-up` failed with {status}");
 }
 
 async fn reserve_local_port() -> u16 {
@@ -950,6 +1090,9 @@ fn router_args(
         hyperliquid_account_address: None,
         hyperliquid_vault_address: None,
         hyperliquid_paymaster_private_key: Some(test_hyperliquid_paymaster_private_key()),
+        temporal_address: "http://127.0.0.1:7233".to_string(),
+        temporal_namespace: "default".to_string(),
+        temporal_task_queue: format!("tee-router-order-execution-{}", Uuid::now_v7()),
         router_detector_api_key: Some(ROUTER_DETECTOR_API_KEY.to_string()),
         router_gateway_api_key: None,
         router_admin_api_key: None,
@@ -1027,6 +1170,9 @@ fn live_router_args(
         hyperliquid_account_address: live.hyperliquid_account_address.clone(),
         hyperliquid_vault_address: live.hyperliquid_vault_address.clone(),
         hyperliquid_paymaster_private_key: None,
+        temporal_address: "http://127.0.0.1:7233".to_string(),
+        temporal_namespace: "default".to_string(),
+        temporal_task_queue: format!("tee-router-order-execution-{}", Uuid::now_v7()),
         router_detector_api_key: Some(ROUTER_DETECTOR_API_KEY.to_string()),
         router_gateway_api_key: None,
         router_admin_api_key: None,
@@ -1106,7 +1252,7 @@ async fn spawn_sauron(
             .expect("Sauron task should not panic before startup");
         panic!("Sauron exited during startup");
     }
-    RuntimeTask { handle }
+    RuntimeTask::new(handle)
 }
 
 fn token_indexer_urls_from_devnet(devnet: &RiftDevnet) -> RuntimeTokenIndexerUrls {
@@ -1157,7 +1303,7 @@ async fn spawn_live_sauron(
             .expect("live Sauron task should not panic before startup");
         panic!("live Sauron exited during startup");
     }
-    RuntimeTask { handle }
+    RuntimeTask::new(handle)
 }
 
 fn live_sauron_args(
@@ -1938,12 +2084,16 @@ async fn fund_live_source_vault(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sauron_runtime_drives_router_worker_through_mock_base_eth_btc_progress() {
-    run_mock_runtime_route(RuntimeRoute::BaseEthToBtc).await;
+    LocalSet::new()
+        .run_until(run_mock_runtime_route(RuntimeRoute::BaseEthToBtc))
+        .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sauron_runtime_drives_router_worker_through_mock_base_usdc_btc_progress() {
-    run_mock_runtime_route(RuntimeRoute::BaseUsdcToBtc).await;
+    LocalSet::new()
+        .run_until(run_mock_runtime_route(RuntimeRoute::BaseUsdcToBtc))
+        .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2102,7 +2252,9 @@ async fn live_sauron_runtime_drives_router_worker_through_base_eth_btc_progress(
         return;
     }
     require_live_spend_confirmation();
-    run_live_runtime_route(RuntimeRoute::BaseEthToBtc).await;
+    LocalSet::new()
+        .run_until(run_live_runtime_route(RuntimeRoute::BaseEthToBtc))
+        .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2113,7 +2265,9 @@ async fn live_sauron_runtime_drives_router_worker_through_base_usdc_btc_progress
         return;
     }
     require_live_spend_confirmation();
-    run_live_runtime_route(RuntimeRoute::BaseUsdcToBtc).await;
+    LocalSet::new()
+        .run_until(run_live_runtime_route(RuntimeRoute::BaseUsdcToBtc))
+        .await;
 }
 
 async fn run_live_runtime_route(route: RuntimeRoute) {
@@ -2124,7 +2278,7 @@ async fn run_live_runtime_route(route: RuntimeRoute) {
         .expect("valid live runtime private key");
     let source_address = signer.address();
 
-    let postgres = test_postgres().await;
+    let mut postgres = test_postgres().await;
     let database_url = create_test_database(&postgres.admin_database_url).await;
     let state_database_url = create_test_database(&postgres.admin_database_url).await;
     let config_dir = tempfile::tempdir().expect("router live config dir");
@@ -2141,20 +2295,32 @@ async fn run_live_runtime_route(route: RuntimeRoute) {
     let db = worker_components.db.clone();
     let chain_registry = worker_components.chain_registry.clone();
     let (router_base_url, _api_task) = spawn_router_api(args.clone()).await;
-    let _worker_task = RuntimeTask {
-        handle: tokio::spawn(async move {
-            run_worker_loop(
-                worker_components.db,
-                worker_components.vault_manager,
-                worker_components.order_execution_manager,
-                worker_components.route_costs,
-                worker_components.provider_health_poller,
-                worker_config,
-            )
-            .await
-            .expect("live router worker loop should keep running until test aborts");
-        }),
-    };
+    ensure_temporal_up();
+    let mut temporal_worker_task = spawn_temporal_order_worker(&args).await;
+    let order_workflow_client = std::sync::Arc::new(
+        OrderWorkflowClient::connect(
+            &RouterTemporalConnection {
+                temporal_address: args.temporal_address.clone(),
+                namespace: args.temporal_namespace.clone(),
+            },
+            args.temporal_task_queue.clone(),
+        )
+        .await
+        .expect("connect Temporal order workflow client"),
+    );
+    let _worker_task = RuntimeTask::new(tokio::spawn(async move {
+        run_worker_loop(
+            worker_components.db,
+            worker_components.vault_manager,
+            worker_components.order_execution_manager,
+            order_workflow_client,
+            worker_components.route_costs,
+            worker_components.provider_health_poller,
+            worker_config,
+        )
+        .await
+        .expect("live router worker loop should keep running until test aborts");
+    }));
     let _sauron =
         spawn_live_sauron(&database_url, &state_database_url, &router_base_url, &live).await;
     let client = reqwest::Client::new();
@@ -2303,10 +2469,12 @@ async fn run_live_runtime_route(route: RuntimeRoute) {
             .all(|operation| operation.status == ProviderOperationStatus::Completed),
         "all provider operations should be completed for a successful live route"
     );
+    temporal_worker_task.abort_and_join().await;
+    postgres.shutdown().await;
 }
 
 async fn run_mock_runtime_route(route: RuntimeRoute) {
-    let postgres = test_postgres().await;
+    let mut postgres = test_postgres().await;
     let database_url = create_test_database(&postgres.admin_database_url).await;
     let state_database_url = create_test_database(&postgres.admin_database_url).await;
     let (devnet, _) = RiftDevnet::builder()
@@ -2337,20 +2505,32 @@ async fn run_mock_runtime_route(route: RuntimeRoute) {
     .expect("initialize worker components");
     let db = worker_components.db.clone();
     let (router_base_url, _api_task) = spawn_router_api(args.clone()).await;
-    let _worker_task = RuntimeTask {
-        handle: tokio::spawn(async move {
-            run_worker_loop(
-                worker_components.db,
-                worker_components.vault_manager,
-                worker_components.order_execution_manager,
-                worker_components.route_costs,
-                worker_components.provider_health_poller,
-                worker_config,
-            )
-            .await
-            .expect("router worker loop should keep running until test aborts");
-        }),
-    };
+    ensure_temporal_up();
+    let mut temporal_worker_task = spawn_temporal_order_worker(&args).await;
+    let order_workflow_client = std::sync::Arc::new(
+        OrderWorkflowClient::connect(
+            &RouterTemporalConnection {
+                temporal_address: args.temporal_address.clone(),
+                namespace: args.temporal_namespace.clone(),
+            },
+            args.temporal_task_queue.clone(),
+        )
+        .await
+        .expect("connect Temporal order workflow client"),
+    );
+    let _worker_task = RuntimeTask::new(tokio::spawn(async move {
+        run_worker_loop(
+            worker_components.db,
+            worker_components.vault_manager,
+            worker_components.order_execution_manager,
+            order_workflow_client,
+            worker_components.route_costs,
+            worker_components.provider_health_poller,
+            worker_config,
+        )
+        .await
+        .expect("router worker loop should keep running until test aborts");
+    }));
     let _sauron = spawn_sauron(
         &devnet,
         &database_url,
@@ -2507,7 +2687,8 @@ async fn run_mock_runtime_route(route: RuntimeRoute) {
         .await
         .expect("completed funding vault");
     assert_eq!(completed_vault.status, DepositVaultStatus::Completed);
-    assert_runtime_hints_were_sauron_driven(&database_url, order.order.id, funding_vault.id).await;
+    assert_runtime_hints_are_production_driven(&database_url, order.order.id, funding_vault.id)
+        .await;
 
     let steps = db
         .orders()
@@ -2558,6 +2739,8 @@ async fn run_mock_runtime_route(route: RuntimeRoute) {
         usize::from(matches!(route, RuntimeRoute::BaseEthToBtc))
     );
     assert_eq!(withdrawal_ops.len(), 1);
+    temporal_worker_task.abort_and_join().await;
+    postgres.shutdown().await;
 }
 
 async fn assert_source_vault_received_paymaster_gas(
@@ -2579,7 +2762,7 @@ async fn assert_source_vault_received_paymaster_gas(
     );
 }
 
-async fn assert_runtime_hints_were_sauron_driven(
+async fn assert_runtime_hints_are_production_driven(
     database_url: &str,
     order_id: Uuid,
     funding_vault_id: Uuid,
@@ -2670,51 +2853,48 @@ async fn assert_runtime_hints_were_sauron_driven(
     .fetch_one(&pool)
     .await
     .expect("count provider operation hints");
-    assert!(
-        provider_hint_count > 0,
-        "runtime route should require Sauron to submit provider-operation hints"
-    );
+    if provider_hint_count > 0 {
+        let non_sauron_provider_hints = sqlx_core::query_scalar::query_scalar::<_, i64>(
+            r#"
+                SELECT COUNT(*)::bigint
+                FROM order_provider_operation_hints hints
+                JOIN order_provider_operations operations
+                  ON operations.id = hints.provider_operation_id
+                WHERE operations.order_id = $1
+                  AND hints.source NOT IN (
+                    'sauron',
+                    'sauron_provider_operation_observation'
+                  )
+                "#,
+        )
+        .bind(order_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count non-Sauron provider operation hints");
+        assert_eq!(
+            non_sauron_provider_hints, 0,
+            "production-shaped runtime route should not insert provider-operation hints from test helpers"
+        );
 
-    let non_sauron_provider_hints = sqlx_core::query_scalar::query_scalar::<_, i64>(
-        r#"
-            SELECT COUNT(*)::bigint
-            FROM order_provider_operation_hints hints
-            JOIN order_provider_operations operations
-              ON operations.id = hints.provider_operation_id
-            WHERE operations.order_id = $1
-              AND hints.source NOT IN (
-                'sauron',
-                'sauron_provider_operation_observation'
-              )
-            "#,
-    )
-    .bind(order_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count non-Sauron provider operation hints");
-    assert_eq!(
-        non_sauron_provider_hints, 0,
-        "production-shaped runtime route should not insert provider-operation hints from test helpers"
-    );
-
-    let processed_provider_hints = sqlx_core::query_scalar::query_scalar::<_, i64>(
-        r#"
-            SELECT COUNT(*)::bigint
-            FROM order_provider_operation_hints hints
-            JOIN order_provider_operations operations
-              ON operations.id = hints.provider_operation_id
-            WHERE operations.order_id = $1
-              AND hints.status = 'processed'
-            "#,
-    )
-    .bind(order_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count processed provider operation hints");
-    assert!(
-        processed_provider_hints > 0,
-        "runtime route should process provider-operation hints emitted from Sauron"
-    );
+        let processed_provider_hints = sqlx_core::query_scalar::query_scalar::<_, i64>(
+            r#"
+                SELECT COUNT(*)::bigint
+                FROM order_provider_operation_hints hints
+                JOIN order_provider_operations operations
+                  ON operations.id = hints.provider_operation_id
+                WHERE operations.order_id = $1
+                  AND hints.status = 'processed'
+                "#,
+        )
+        .bind(order_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count processed provider operation hints");
+        assert!(
+            processed_provider_hints > 0,
+            "runtime route should process provider-operation hints when Sauron wins the observation race"
+        );
+    }
 }
 
 fn assert_async_provider_operation_started(operation: &OrderProviderOperation) {

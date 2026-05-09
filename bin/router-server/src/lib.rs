@@ -229,6 +229,26 @@ pub struct RouterServerArgs {
     #[arg(long, env = "HYPERLIQUID_PAYMASTER_PRIVATE_KEY")]
     pub hyperliquid_paymaster_private_key: Option<String>,
 
+    /// Temporal frontend URL used by router-worker to start order workflows
+    #[arg(
+        long,
+        env = "TEMPORAL_ADDRESS",
+        default_value = "http://127.0.0.1:7233"
+    )]
+    pub temporal_address: String,
+
+    /// Temporal namespace used by router-worker for order workflows
+    #[arg(long, env = "TEMPORAL_NAMESPACE", default_value = "default")]
+    pub temporal_namespace: String,
+
+    /// Temporal task queue consumed by temporal-worker for order execution
+    #[arg(
+        long,
+        env = "ORDER_EXECUTION_TEMPORAL_TASK_QUEUE",
+        default_value_t = router_temporal::DEFAULT_TASK_QUEUE.to_string()
+    )]
+    pub temporal_task_queue: String,
+
     /// Bearer API key accepted from Sauron on internal detector callbacks
     #[arg(long, env = "ROUTER_DETECTOR_API_KEY")]
     pub router_detector_api_key: Option<String>,
