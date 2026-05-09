@@ -11,18 +11,21 @@ use router_core::{
     },
     error::{RouterCoreError, RouterCoreResult},
     models::{
-        MarketOrderKind, MarketOrderKindType, MarketOrderQuote, OrderExecutionAttemptKind,
+        CustodyVault, CustodyVaultRole, CustodyVaultVisibility, MarketOrderKind,
+        MarketOrderKindType, MarketOrderQuote, OrderExecutionAttemptKind,
         OrderExecutionAttemptStatus, OrderExecutionStep, OrderExecutionStepStatus,
         OrderExecutionStepType, OrderProviderAddress, OrderProviderOperation,
-        ProviderOperationStatus, RouterOrder, RouterOrderQuote,
+        ProviderOperationStatus, ProviderOperationType, RouterOrder, RouterOrderQuote,
     },
+    protocol::DepositAsset,
     services::{
         action_providers::{
             BridgeExecutionRequest, ExchangeExecutionRequest, ExchangeQuote, ExchangeQuoteRequest,
-            ProviderExecutionStatePatch, UnitDepositStepRequest, UnitWithdrawalStepRequest,
+            ProviderExecutionStatePatch, ProviderOperationObservation,
+            ProviderOperationObservationRequest, UnitDepositStepRequest, UnitWithdrawalStepRequest,
         },
         asset_registry::{MarketOrderTransitionKind, ProviderId, TransitionDecl},
-        custody_action_executor::{CustodyAction, CustodyActionRequest},
+        custody_action_executor::{CustodyAction, CustodyActionError, CustodyActionRequest},
         market_order_planner::MarketOrderPlanRemainingStart,
         quote_legs::{execution_step_type_for_transition_kind, QuoteLeg, QuoteLegAsset},
         ActionProviderRegistry, CustodyActionExecutor, CustodyActionReceipt,
@@ -46,13 +49,13 @@ use super::types::{
     OrderWorkflowPhase, PersistProviderOperationStatusInput, PersistProviderReceiptInput,
     PersistStepFailedInput, PersistStepReadyToFireInput, PersistStepTerminalStatusInput,
     PersistenceBoundary, PollProviderOperationHintsInput, ProviderActionDispatchShape,
-    ProviderOperationHintVerified, ProviderOperationHintsPolled, RecoverAcrossOnchainLogInput,
-    RecoverablePositionKind, RefreshedAttemptMaterialized, RefreshedQuoteAttemptOutcome,
-    RefreshedQuoteAttemptShape, RefundPlanOutcome, RefundPlanShape, RefundUntenableReason,
-    SettleProviderStepInput, SingleRefundPosition, SingleRefundPositionDiscovery,
-    SingleRefundPositionOutcome, StaleQuoteRefreshUntenableReason, StepExecuted,
-    StepExecutionOutcome, StepFailureDecision, VerifyProviderOperationHintInput,
-    WorkflowExecutionStep, WriteFailedAttemptSnapshotInput,
+    ProviderHintKind, ProviderOperationHintDecision, ProviderOperationHintVerified,
+    ProviderOperationHintsPolled, RecoverAcrossOnchainLogInput, RecoverablePositionKind,
+    RefreshedAttemptMaterialized, RefreshedQuoteAttemptOutcome, RefreshedQuoteAttemptShape,
+    RefundPlanOutcome, RefundPlanShape, RefundUntenableReason, SettleProviderStepInput,
+    SingleRefundPosition, SingleRefundPositionDiscovery, SingleRefundPositionOutcome,
+    StaleQuoteRefreshUntenableReason, StepExecuted, StepExecutionOutcome, StepFailureDecision,
+    VerifyProviderOperationHintInput, WorkflowExecutionStep, WriteFailedAttemptSnapshotInput,
 };
 
 const MAX_EXECUTION_ATTEMPTS: i32 = 2;
@@ -258,14 +261,16 @@ impl OrderActivities {
         input: MaterializeExecutionAttemptInput,
     ) -> Result<MaterializedExecutionAttempt, ActivityError> {
         let deps = self.deps()?;
+        let mut plan = input.plan;
+        plan.steps = hydrate_destination_execution_steps(&deps, input.order_id, plan.steps).await?;
         let record = deps
             .db
             .orders()
             .materialize_primary_execution_attempt(
                 input.order_id,
                 ExecutionAttemptPlan {
-                    legs: input.plan.legs,
-                    steps: input.plan.steps,
+                    legs: plan.legs,
+                    steps: plan.steps,
                 },
                 Utc::now(),
             )
@@ -512,13 +517,13 @@ impl OrderActivities {
         _ctx: ActivityContext,
         input: SettleProviderStepInput,
     ) -> Result<BoundaryPersisted, ActivityError> {
-        if input.execution.outcome == StepExecutionOutcome::Waiting {
-            return Err(activity_error(format!(
-                "step {} is waiting for provider observation; PR7 adds the observation/recovery path",
-                input.execution.step_id
-            )));
-        }
         let deps = self.deps()?;
+        if input.execution.outcome == StepExecutionOutcome::Waiting {
+            settle_waiting_provider_step(&deps, &input.execution).await?;
+            return Ok(BoundaryPersisted {
+                boundary: PersistenceBoundary::AfterProviderStepSettlement,
+            });
+        }
         let record = deps
             .db
             .orders()
@@ -787,6 +792,189 @@ impl OrderActivities {
     }
 }
 
+async fn settle_waiting_provider_step(
+    deps: &OrderActivityDeps,
+    execution: &StepExecuted,
+) -> Result<(), ActivityError> {
+    let operations = deps
+        .db
+        .orders()
+        .get_provider_operations(execution.order_id)
+        .await
+        .map_err(activity_error_from_display)?;
+    let operation = operations
+        .iter()
+        .filter(|operation| operation.execution_step_id == Some(execution.step_id))
+        .max_by_key(|operation| (operation.updated_at, operation.created_at, operation.id));
+
+    match operation.map(|operation| operation.status) {
+        Some(ProviderOperationStatus::Completed) => {
+            let operation = operation.expect("checked completed operation above");
+            complete_observed_provider_step(deps, execution, operation).await?;
+            tracing::info!(
+                order_id = %execution.order_id,
+                attempt_id = %execution.attempt_id,
+                step_id = %execution.step_id,
+                provider_operation_id = %operation.id,
+                event_name = "execution_step.completed",
+                "execution_step.completed"
+            );
+        }
+        Some(ProviderOperationStatus::Failed | ProviderOperationStatus::Expired) => {
+            let operation = operation.expect("checked failed operation above");
+            let step = deps
+                .db
+                .orders()
+                .fail_observed_execution_step(
+                    execution.step_id,
+                    json!({
+                        "kind": "provider_status_update",
+                        "provider": &operation.provider,
+                        "operation_id": operation.id,
+                        "provider_ref": &operation.provider_ref,
+                        "status": operation.status.to_db_string(),
+                        "observed_state": &operation.observed_state,
+                    }),
+                    Utc::now(),
+                )
+                .await;
+            match step {
+                Ok(_) => {}
+                Err(RouterCoreError::NotFound) => {
+                    let current = deps
+                        .db
+                        .orders()
+                        .get_execution_step(execution.step_id)
+                        .await
+                        .map_err(activity_error_from_display)?;
+                    if current.status != OrderExecutionStepStatus::Failed {
+                        return Err(activity_error(format!(
+                            "failed provider step {} is in unexpected status {}",
+                            execution.step_id,
+                            current.status.to_db_string()
+                        )));
+                    }
+                }
+                Err(source) => return Err(activity_error_from_display(source)),
+            }
+        }
+        Some(
+            ProviderOperationStatus::Planned
+            | ProviderOperationStatus::Submitted
+            | ProviderOperationStatus::WaitingExternal,
+        )
+        | None => {
+            let waiting = deps
+                .db
+                .orders()
+                .wait_execution_step(
+                    execution.step_id,
+                    execution.response.clone(),
+                    execution.tx_hash.clone(),
+                    Utc::now(),
+                )
+                .await;
+            match waiting {
+                Ok(_) => {
+                    tracing::info!(
+                        order_id = %execution.order_id,
+                        attempt_id = %execution.attempt_id,
+                        step_id = %execution.step_id,
+                        event_name = "execution_step.waiting_external",
+                        "execution_step.waiting_external"
+                    );
+                }
+                Err(RouterCoreError::NotFound) => {
+                    let current = deps
+                        .db
+                        .orders()
+                        .get_execution_step(execution.step_id)
+                        .await
+                        .map_err(activity_error_from_display)?;
+                    if !matches!(
+                        current.status,
+                        OrderExecutionStepStatus::Waiting | OrderExecutionStepStatus::Completed
+                    ) {
+                        return Err(activity_error(format!(
+                            "waiting provider step {} is in unexpected status {}",
+                            execution.step_id,
+                            current.status.to_db_string()
+                        )));
+                    }
+                }
+                Err(source) => return Err(activity_error_from_display(source)),
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn complete_observed_provider_step(
+    deps: &OrderActivityDeps,
+    execution: &StepExecuted,
+    operation: &OrderProviderOperation,
+) -> Result<OrderExecutionStep, ActivityError> {
+    let completed = deps
+        .db
+        .orders()
+        .complete_observed_execution_step(
+            execution.step_id,
+            provider_operation_step_response(operation),
+            provider_operation_tx_hash(operation),
+            json!({}),
+            Utc::now(),
+        )
+        .await;
+    match completed {
+        Ok(step) => Ok(step),
+        Err(RouterCoreError::NotFound) => {
+            let current = deps
+                .db
+                .orders()
+                .get_execution_step(execution.step_id)
+                .await
+                .map_err(activity_error_from_display)?;
+            if current.status == OrderExecutionStepStatus::Completed {
+                Ok(current)
+            } else {
+                Err(activity_error(format!(
+                    "completed provider operation {} could not settle step {} in status {}",
+                    operation.id,
+                    execution.step_id,
+                    current.status.to_db_string()
+                )))
+            }
+        }
+        Err(source) => Err(activity_error_from_display(source)),
+    }
+}
+
+fn provider_operation_step_response(operation: &OrderProviderOperation) -> Value {
+    if !is_empty_json_object(&operation.response) {
+        return operation.response.clone();
+    }
+    json!({
+        "kind": "provider_status_update",
+        "provider": &operation.provider,
+        "operation_id": operation.id,
+        "provider_ref": &operation.provider_ref,
+        "observed_state": &operation.observed_state,
+    })
+}
+
+fn provider_operation_tx_hash(operation: &OrderProviderOperation) -> Option<String> {
+    operation
+        .observed_state
+        .get("tx_hash")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+fn is_empty_json_object(value: &Value) -> bool {
+    value.as_object().is_some_and(serde_json::Map::is_empty)
+}
+
 struct StepCompletion {
     response: Value,
     tx_hash: Option<String>,
@@ -812,6 +1000,255 @@ impl PostExecuteProvider {
             Self::Unit(provider) => provider.post_execute(provider_context, receipts).await,
         }
     }
+}
+
+async fn hydrate_destination_execution_steps(
+    deps: &OrderActivityDeps,
+    order_id: Uuid,
+    steps: Vec<OrderExecutionStep>,
+) -> Result<Vec<OrderExecutionStep>, ActivityError> {
+    let mut destination_execution_vault: Option<CustodyVault> = None;
+    let mut hydrated = Vec::with_capacity(steps.len());
+
+    for mut step in steps {
+        if json_string_equals(
+            &step.request,
+            "recipient_custody_vault_role",
+            CustodyVaultRole::DestinationExecution.to_db_string(),
+        ) {
+            let asset = step.output_asset.clone().ok_or_else(|| {
+                activity_error(format!(
+                    "destination execution recipient requires output_asset for step {}",
+                    step.id
+                ))
+            })?;
+            let vault = ensure_destination_execution_vault(
+                deps,
+                order_id,
+                &asset,
+                &mut destination_execution_vault,
+            )
+            .await?;
+            if step.request.get("recipient").is_some() {
+                set_json_value(&mut step.request, "recipient", json!(vault.address));
+            }
+            if step.request.get("recipient_address").is_some() {
+                set_json_value(&mut step.request, "recipient_address", json!(vault.address));
+            }
+            set_json_value(
+                &mut step.request,
+                "recipient_custody_vault_id",
+                json!(vault.id),
+            );
+            set_json_value(
+                &mut step.details,
+                "destination_custody_vault_id",
+                json!(vault.id),
+            );
+            set_json_value(
+                &mut step.details,
+                "destination_custody_vault_address",
+                json!(vault.address),
+            );
+        }
+
+        if json_string_equals(
+            &step.request,
+            "source_custody_vault_role",
+            CustodyVaultRole::DestinationExecution.to_db_string(),
+        ) {
+            let asset = step.input_asset.clone().ok_or_else(|| {
+                activity_error(format!(
+                    "destination execution source requires input_asset for step {}",
+                    step.id
+                ))
+            })?;
+            let vault = ensure_destination_execution_vault(
+                deps,
+                order_id,
+                &asset,
+                &mut destination_execution_vault,
+            )
+            .await?;
+            set_json_value(
+                &mut step.request,
+                "source_custody_vault_id",
+                json!(vault.id),
+            );
+            set_json_value(
+                &mut step.request,
+                "source_custody_vault_address",
+                json!(vault.address),
+            );
+            set_json_value(
+                &mut step.details,
+                "source_custody_vault_id",
+                json!(vault.id),
+            );
+            set_json_value(
+                &mut step.details,
+                "source_custody_vault_address",
+                json!(vault.address),
+            );
+        }
+
+        if json_string_equals(
+            &step.request,
+            "depositor_custody_vault_role",
+            CustodyVaultRole::DestinationExecution.to_db_string(),
+        ) {
+            let asset = step.input_asset.clone().ok_or_else(|| {
+                activity_error(format!(
+                    "destination execution depositor requires input_asset for step {}",
+                    step.id
+                ))
+            })?;
+            let vault = ensure_destination_execution_vault(
+                deps,
+                order_id,
+                &asset,
+                &mut destination_execution_vault,
+            )
+            .await?;
+            set_json_value(
+                &mut step.request,
+                "depositor_custody_vault_id",
+                json!(vault.id),
+            );
+            set_json_value(&mut step.request, "depositor_address", json!(vault.address));
+            set_json_value(
+                &mut step.details,
+                "depositor_custody_vault_id",
+                json!(vault.id),
+            );
+            set_json_value(
+                &mut step.details,
+                "depositor_custody_vault_address",
+                json!(vault.address),
+            );
+        }
+
+        if json_string_equals(
+            &step.request,
+            "refund_custody_vault_role",
+            CustodyVaultRole::DestinationExecution.to_db_string(),
+        ) {
+            let asset = step.input_asset.clone().ok_or_else(|| {
+                activity_error(format!(
+                    "destination execution refund requires input_asset for step {}",
+                    step.id
+                ))
+            })?;
+            let vault = ensure_destination_execution_vault(
+                deps,
+                order_id,
+                &asset,
+                &mut destination_execution_vault,
+            )
+            .await?;
+            set_json_value(
+                &mut step.request,
+                "refund_custody_vault_id",
+                json!(vault.id),
+            );
+            set_json_value(&mut step.request, "refund_address", json!(vault.address));
+            set_json_value(
+                &mut step.details,
+                "refund_custody_vault_id",
+                json!(vault.id),
+            );
+            set_json_value(
+                &mut step.details,
+                "refund_custody_vault_address",
+                json!(vault.address),
+            );
+        }
+
+        hydrated.push(step);
+    }
+
+    Ok(hydrated)
+}
+
+async fn ensure_destination_execution_vault(
+    deps: &OrderActivityDeps,
+    order_id: Uuid,
+    asset: &DepositAsset,
+    cache: &mut Option<CustodyVault>,
+) -> Result<CustodyVault, ActivityError> {
+    if let Some(vault) = cache.as_ref().filter(|vault| {
+        vault.chain == asset.chain
+            && vault.asset.as_ref() == Some(&asset.asset)
+            && vault.role == CustodyVaultRole::DestinationExecution
+    }) {
+        return Ok(vault.clone());
+    }
+
+    if let Some(vault) = find_destination_execution_vault(deps, order_id, asset).await? {
+        *cache = Some(vault.clone());
+        return Ok(vault);
+    }
+
+    let created = deps
+        .custody_action_executor
+        .create_router_derived_vault(
+            order_id,
+            CustodyVaultRole::DestinationExecution,
+            CustodyVaultVisibility::Internal,
+            asset.chain.clone(),
+            Some(asset.asset.clone()),
+            json!({ "source": "order_workflow_plan_hydration" }),
+        )
+        .await;
+    let vault = match created {
+        Ok(vault) => vault,
+        Err(CustodyActionError::Database { source }) if is_unique_violation(&source) => find_destination_execution_vault(deps, order_id, asset)
+            .await?
+            .ok_or_else(|| {
+                activity_error(format!(
+                    "custody vault unique violation for order {order_id} on {} {} but re-read returned none",
+                    asset.chain.as_str(),
+                    asset.asset.as_str()
+                ))
+            })?,
+        Err(source) => return Err(activity_error_from_display(source)),
+    };
+    *cache = Some(vault.clone());
+    Ok(vault)
+}
+
+async fn find_destination_execution_vault(
+    deps: &OrderActivityDeps,
+    order_id: Uuid,
+    asset: &DepositAsset,
+) -> Result<Option<CustodyVault>, ActivityError> {
+    let vaults = deps
+        .db
+        .orders()
+        .get_custody_vaults(order_id)
+        .await
+        .map_err(activity_error_from_display)?;
+    Ok(vaults.into_iter().find(|vault| {
+        vault.role == CustodyVaultRole::DestinationExecution
+            && vault.chain == asset.chain
+            && vault.asset.as_ref() == Some(&asset.asset)
+    }))
+}
+
+fn json_string_equals(value: &Value, key: &'static str, expected: &'static str) -> bool {
+    value.get(key).and_then(Value::as_str) == Some(expected)
+}
+
+fn is_unique_violation(err: &RouterCoreError) -> bool {
+    matches!(
+        err,
+        RouterCoreError::DatabaseQuery { source }
+            if source
+                .as_database_error()
+                .and_then(|db_err| db_err.code())
+                .as_deref()
+                == Some("23505")
+    )
 }
 
 fn request_string_field(
@@ -2064,17 +2501,53 @@ impl QuoteRefreshActivities {
     }
 }
 
-pub struct ProviderObservationActivities;
+#[derive(Clone, Default)]
+pub struct ProviderObservationActivities {
+    deps: Option<Arc<OrderActivityDeps>>,
+}
+
+impl ProviderObservationActivities {
+    #[must_use]
+    pub(crate) fn from_order_activities(order_activities: &OrderActivities) -> Self {
+        Self {
+            deps: order_activities.shared_deps(),
+        }
+    }
+
+    fn deps(&self) -> Result<Arc<OrderActivityDeps>, ActivityError> {
+        self.deps
+            .clone()
+            .ok_or_else(|| activity_error("provider observation activities are not configured"))
+    }
+}
 
 #[activities]
 impl ProviderObservationActivities {
     /// Scar tissue: §10 provider operation hint flow and verifier dispatch.
     #[activity]
     pub async fn verify_provider_operation_hint(
+        self: Arc<Self>,
         _ctx: ActivityContext,
-        _input: VerifyProviderOperationHintInput,
+        input: VerifyProviderOperationHintInput,
     ) -> Result<ProviderOperationHintVerified, ActivityError> {
-        todo!("PR7: verify provider operation hint against provider API")
+        match input.signal.hint_kind {
+            ProviderHintKind::AcrossFill => {
+                let deps = self.deps()?;
+                verify_across_fill_hint(&deps, input).await
+            }
+            ProviderHintKind::CctpAttestation => {
+                todo!("PR7b: CctpAttestation verifier")
+            }
+            ProviderHintKind::UnitDeposit => {
+                todo!("PR7b: UnitDeposit verifier")
+            }
+            ProviderHintKind::ProviderObservation => {
+                todo!("PR7b: ProviderObservation verifier")
+            }
+            ProviderHintKind::HyperliquidTrade => {
+                todo!("PR7b: HyperliquidTrade verifier")
+            }
+        }
     }
 
     /// Scar tissue: §10 provider hint recovery. This is the polling half of the user-approved
@@ -2093,7 +2566,7 @@ impl ProviderObservationActivities {
         _ctx: ActivityContext,
         _input: RecoverAcrossOnchainLogInput,
     ) -> Result<AcrossOnchainLogRecovered, ActivityError> {
-        todo!("PR4: recover Across fill from on-chain logs")
+        todo!("PR7c: recover lost across intent from on-chain logs")
     }
 
     /// Scar tissue: §12 Hyperliquid trade timeout cancel.
@@ -2104,6 +2577,205 @@ impl ProviderObservationActivities {
     ) -> Result<HyperliquidTradeCancelRecorded, ActivityError> {
         todo!("PR4: cancel timed-out Hyperliquid trade")
     }
+}
+
+async fn verify_across_fill_hint(
+    deps: &OrderActivityDeps,
+    input: VerifyProviderOperationHintInput,
+) -> Result<ProviderOperationHintVerified, ActivityError> {
+    let Some(provider_operation_id) = input.signal.provider_operation_id else {
+        return Ok(provider_hint_deferred(
+            None,
+            "AcrossFill hint missing provider_operation_id",
+        ));
+    };
+    let operation = deps
+        .db
+        .orders()
+        .get_provider_operation(provider_operation_id)
+        .await
+        .map_err(activity_error_from_display)?;
+
+    if operation.order_id != input.order_id {
+        return Ok(provider_hint_rejected(
+            Some(provider_operation_id),
+            format!(
+                "provider operation {} belongs to order {}, not {}",
+                operation.id, operation.order_id, input.order_id
+            ),
+        ));
+    }
+    if operation.execution_step_id != Some(input.step_id) {
+        return Ok(provider_hint_deferred(
+            Some(provider_operation_id),
+            format!(
+                "provider operation {} belongs to step {:?}, not {}",
+                operation.id, operation.execution_step_id, input.step_id
+            ),
+        ));
+    }
+    if operation.operation_type != ProviderOperationType::AcrossBridge {
+        return Ok(provider_hint_rejected(
+            Some(provider_operation_id),
+            format!(
+                "AcrossFill hint cannot verify {} operation",
+                operation.operation_type.to_db_string()
+            ),
+        ));
+    }
+
+    let provider = deps
+        .action_providers
+        .bridge(&operation.provider)
+        .ok_or_else(|| {
+            activity_error(format!(
+                "bridge provider {} is not configured",
+                operation.provider
+            ))
+        })?;
+    let observation = provider
+        .observe_bridge_operation(ProviderOperationObservationRequest {
+            operation_id: operation.id,
+            operation_type: operation.operation_type,
+            provider_ref: operation.provider_ref.clone(),
+            request: operation.request.clone(),
+            response: operation.response.clone(),
+            observed_state: operation.observed_state.clone(),
+            hint_evidence: json!({
+                "source": "temporal_provider_operation_hint_signal",
+                "hint_id": input.signal.hint_id,
+                "provider": input.signal.provider,
+                "hint_kind": input.signal.hint_kind,
+                "provider_ref": input.signal.provider_ref,
+            }),
+        })
+        .await
+        .map_err(activity_error)?;
+
+    let Some(observation) = observation else {
+        return Ok(provider_hint_deferred(
+            Some(provider_operation_id),
+            "Across provider returned no observation",
+        ));
+    };
+    if let Some(reason) = provider_observation_ref_reject_reason(&operation, &observation) {
+        return Ok(provider_hint_rejected(Some(provider_operation_id), reason));
+    }
+
+    match observation.status {
+        ProviderOperationStatus::Completed => {
+            let provider_ref = observation
+                .provider_ref
+                .clone()
+                .or_else(|| operation.provider_ref.clone());
+            let observed_state = provider_hint_observed_state(&operation, &input, &observation);
+            let (updated, _) = deps
+                .db
+                .orders()
+                .update_provider_operation_status(
+                    operation.id,
+                    ProviderOperationStatus::Completed,
+                    provider_ref,
+                    observed_state,
+                    observation.response.clone(),
+                    Utc::now(),
+                )
+                .await
+                .map_err(activity_error_from_display)?;
+            tracing::info!(
+                order_id = %updated.order_id,
+                provider_operation_id = %updated.id,
+                step_id = ?updated.execution_step_id,
+                event_name = "provider_operation.completed",
+                "provider_operation.completed"
+            );
+            Ok(ProviderOperationHintVerified {
+                provider_operation_id: Some(updated.id),
+                decision: ProviderOperationHintDecision::Accept,
+                reason: None,
+            })
+        }
+        ProviderOperationStatus::Failed | ProviderOperationStatus::Expired => {
+            Ok(provider_hint_rejected(
+                Some(provider_operation_id),
+                format!(
+                    "Across fill observation returned {}",
+                    observation.status.to_db_string()
+                ),
+            ))
+        }
+        ProviderOperationStatus::Planned
+        | ProviderOperationStatus::Submitted
+        | ProviderOperationStatus::WaitingExternal => Ok(provider_hint_deferred(
+            Some(provider_operation_id),
+            format!(
+                "Across fill observation returned {}",
+                observation.status.to_db_string()
+            ),
+        )),
+    }
+}
+
+fn provider_hint_deferred(
+    provider_operation_id: Option<Uuid>,
+    reason: impl Into<String>,
+) -> ProviderOperationHintVerified {
+    ProviderOperationHintVerified {
+        provider_operation_id,
+        decision: ProviderOperationHintDecision::Defer,
+        reason: Some(reason.into()),
+    }
+}
+
+fn provider_hint_rejected(
+    provider_operation_id: Option<Uuid>,
+    reason: impl Into<String>,
+) -> ProviderOperationHintVerified {
+    ProviderOperationHintVerified {
+        provider_operation_id,
+        decision: ProviderOperationHintDecision::Reject,
+        reason: Some(reason.into()),
+    }
+}
+
+fn provider_observation_ref_reject_reason(
+    operation: &OrderProviderOperation,
+    observation: &ProviderOperationObservation,
+) -> Option<String> {
+    let expected = operation.provider_ref.as_deref()?;
+    match observation.provider_ref.as_deref() {
+        Some(observed) if observed == expected => None,
+        Some(observed) => Some(format!(
+            "provider observation ref {observed} does not match operation ref {expected}"
+        )),
+        None => Some(format!(
+            "provider observation for {} did not include expected operation ref {expected}",
+            operation.operation_type.to_db_string()
+        )),
+    }
+}
+
+fn provider_hint_observed_state(
+    operation: &OrderProviderOperation,
+    input: &VerifyProviderOperationHintInput,
+    observation: &ProviderOperationObservation,
+) -> Value {
+    let mut observed_state = json!({
+        "source": "temporal_provider_operation_hint_signal",
+        "hint_id": input.signal.hint_id,
+        "hint_kind": input.signal.hint_kind,
+        "provider_observed_state": &observation.observed_state,
+    });
+    if let Some(tx_hash) = &observation.tx_hash {
+        observed_state["tx_hash"] = json!(tx_hash);
+    }
+    if let Some(error) = &observation.error {
+        observed_state["provider_error"] = error.clone();
+    }
+    if !is_empty_json_object(&operation.observed_state) {
+        observed_state["previous_observed_state"] = operation.observed_state.clone();
+    }
+    observed_state
 }
 
 pub struct StepDispatchActivities;
