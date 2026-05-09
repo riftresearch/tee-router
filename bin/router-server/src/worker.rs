@@ -7,9 +7,9 @@ use crate::{
     },
     telemetry, Error, Result, RouterServerArgs,
 };
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Utc};
 use router_core::{
-    db::{worker_lease_repo::WorkerLease, Database},
+    db::Database,
     error::RouterCoreError,
     services::route_costs::{RouteCostRefreshSummary, RouteCostService},
 };
@@ -30,7 +30,6 @@ use tokio::{
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-const DEFAULT_WORKER_LEASE_NAME: &str = "global-router-worker";
 const WORKFLOW_START_QUEUE_MAX_IDS: usize = 10_000;
 const VAULT_FUNDING_HINT_CHANNEL: &str = "router_vault_funding_hints";
 const VAULT_REFUND_WAKEUP_CHANNEL: &str = "router_vault_refund_wakeups";
@@ -42,10 +41,6 @@ const MAX_WORKER_IDENTIFIER_LEN: usize = 128;
 pub struct RouterWorkerConfig {
     pub database_url: String,
     pub worker_id: String,
-    pub lease_name: String,
-    pub lease_duration: ChronoDuration,
-    pub lease_renew_interval: Duration,
-    pub standby_poll_interval: Duration,
     pub vault_work_poll_interval: Duration,
     pub order_execution_poll_interval: Duration,
     pub route_cost_refresh_interval: Duration,
@@ -62,10 +57,6 @@ impl fmt::Debug for RouterWorkerConfig {
         f.debug_struct("RouterWorkerConfig")
             .field("database_url", &"<redacted>")
             .field("worker_id", &self.worker_id)
-            .field("lease_name", &self.lease_name)
-            .field("lease_duration", &self.lease_duration)
-            .field("lease_renew_interval", &self.lease_renew_interval)
-            .field("standby_poll_interval", &self.standby_poll_interval)
             .field("vault_work_poll_interval", &self.vault_work_poll_interval)
             .field(
                 "order_execution_poll_interval",
@@ -102,15 +93,6 @@ impl fmt::Debug for RouterWorkerConfig {
 
 impl RouterWorkerConfig {
     pub fn from_args(args: &RouterServerArgs) -> Result<Self> {
-        ensure_positive_seconds("worker lease seconds", args.worker_lease_seconds)?;
-        ensure_positive_seconds(
-            "worker lease renew seconds",
-            args.worker_lease_renew_seconds,
-        )?;
-        ensure_positive_seconds(
-            "worker standby poll seconds",
-            args.worker_standby_poll_seconds,
-        )?;
         ensure_positive_seconds(
             "worker refund/vault poll seconds",
             args.worker_refund_poll_seconds,
@@ -151,30 +133,12 @@ impl RouterWorkerConfig {
             "worker vault funding hint pass limit",
             args.worker_vault_funding_hint_pass_limit,
         )?;
-        if args.worker_lease_renew_seconds >= args.worker_lease_seconds {
-            return Err(invalid_worker_config(
-                "worker lease renew seconds must be less than worker lease seconds",
-            ));
-        }
-
-        let lease_duration = ChronoDuration::from_std(Duration::from_secs(
-            args.worker_lease_seconds,
-        ))
-        .map_err(|err| invalid_worker_config(&format!("invalid worker lease duration: {err}")))?;
-
         Ok(Self {
             database_url: args.database_url.clone(),
             worker_id: match args.worker_id.as_deref() {
                 Some(worker_id) => normalize_worker_identifier("worker id", worker_id)?,
                 None => format!("router-worker-{}", Uuid::now_v7()),
             },
-            lease_name: match args.worker_lease_name.as_deref() {
-                Some(lease_name) => normalize_worker_identifier("worker lease name", lease_name)?,
-                None => DEFAULT_WORKER_LEASE_NAME.to_string(),
-            },
-            lease_duration,
-            lease_renew_interval: Duration::from_secs(args.worker_lease_renew_seconds),
-            standby_poll_interval: Duration::from_secs(args.worker_standby_poll_seconds),
             vault_work_poll_interval: Duration::from_secs(args.worker_refund_poll_seconds),
             order_execution_poll_interval: Duration::from_secs(
                 args.worker_order_execution_poll_seconds,
@@ -290,7 +254,6 @@ pub async fn run_worker(args: RouterServerArgs) -> Result<()> {
     let config = RouterWorkerConfig::from_args(&args)?;
     info!(
         worker_id = %config.worker_id,
-        lease_name = %config.lease_name,
         "Starting router-worker"
     );
     let components = initialize_components(
@@ -337,10 +300,6 @@ pub async fn run_worker_loop(
     provider_health_poller: Arc<ProviderHealthPoller>,
     config: RouterWorkerConfig,
 ) -> BackgroundTaskResult {
-    let lease_repo = db.worker_leases();
-    let mut active_lease: Option<WorkerLease> = None;
-    let mut lease_renew_interval = interval(config.lease_renew_interval);
-    lease_renew_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut vault_work_poll_interval = interval(config.vault_work_poll_interval);
     vault_work_poll_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut workflow_start_poll_interval = interval(config.order_execution_poll_interval);
@@ -358,124 +317,45 @@ pub async fn run_worker_loop(
     let mut provider_health_tasks: JoinSet<ProviderHealthTaskResult> = JoinSet::new();
     let mut quote_cleanup_tasks: JoinSet<QuoteCleanupTaskResult> = JoinSet::new();
     let mut workflow_start_queue = WorkflowStartQueue::default();
-    let mut pending_vault_wakeup = false;
-    let mut pending_route_cost_refresh = false;
-    let mut pending_provider_health_poll = false;
-    let mut pending_quote_cleanup = false;
-    let mut next_refund_due_at: Option<DateTime<Utc>> = None;
+    let mut pending_vault_wakeup = true;
+    let mut pending_route_cost_refresh = true;
+    let mut pending_provider_health_poll = true;
+    let mut pending_quote_cleanup = true;
+
+    info!(worker_id = %config.worker_id, "Router worker started");
+    workflow_start_queue.enqueue_global();
+    spawn_workflow_start_if_idle(
+        &mut workflow_start_tasks,
+        db.clone(),
+        order_workflow_client.clone(),
+        &mut workflow_start_queue,
+        config.order_execution_pass_limit,
+    );
+    spawn_vault_work_if_idle(
+        &mut vault_tasks,
+        vault_manager.clone(),
+        &mut pending_vault_wakeup,
+        config.vault_funding_hint_pass_limit,
+    );
+    spawn_route_cost_refresh_if_idle(
+        &mut route_cost_tasks,
+        route_costs.clone(),
+        &mut pending_route_cost_refresh,
+    );
+    spawn_provider_health_poll_if_idle(
+        &mut provider_health_tasks,
+        provider_health_poller.clone(),
+        &mut pending_provider_health_poll,
+    );
+    spawn_quote_cleanup_if_idle(
+        &mut quote_cleanup_tasks,
+        db.clone(),
+        &mut pending_quote_cleanup,
+    );
+    let mut next_refund_due_at = refresh_next_refund_due_at(&db).await?;
 
     loop {
-        if active_lease.is_none() {
-            match try_acquire_worker_lease(&db, &config).await {
-                Ok(Some(lease)) => {
-                    info!(
-                        worker_id = %config.worker_id,
-                        lease_name = %lease.lease_name,
-                        fencing_token = lease.fencing_token,
-                        expires_at = %lease.expires_at,
-                        "Router worker became active"
-                    );
-                    telemetry::record_worker_active(true);
-                    active_lease = Some(lease);
-                    lease_renew_interval.reset();
-                    vault_work_poll_interval.reset();
-                    workflow_start_poll_interval.reset();
-                    route_cost_refresh_interval.reset();
-                    provider_health_poll_interval.reset();
-                    quote_cleanup_interval.reset();
-                    workflow_start_queue.enqueue_global();
-                    spawn_workflow_start_if_idle(
-                        &mut workflow_start_tasks,
-                        db.clone(),
-                        order_workflow_client.clone(),
-                        &mut workflow_start_queue,
-                        config.order_execution_pass_limit,
-                    );
-                    pending_vault_wakeup = true;
-                    spawn_vault_work_if_idle(
-                        &mut vault_tasks,
-                        vault_manager.clone(),
-                        &mut pending_vault_wakeup,
-                        config.vault_funding_hint_pass_limit,
-                    );
-                    pending_route_cost_refresh = true;
-                    spawn_route_cost_refresh_if_idle(
-                        &mut route_cost_tasks,
-                        route_costs.clone(),
-                        &mut pending_route_cost_refresh,
-                    );
-                    pending_provider_health_poll = true;
-                    spawn_provider_health_poll_if_idle(
-                        &mut provider_health_tasks,
-                        provider_health_poller.clone(),
-                        &mut pending_provider_health_poll,
-                    );
-                    pending_quote_cleanup = true;
-                    spawn_quote_cleanup_if_idle(
-                        &mut quote_cleanup_tasks,
-                        db.clone(),
-                        &mut pending_quote_cleanup,
-                    );
-                    next_refund_due_at = refresh_next_refund_due_at(&db).await?;
-                }
-                Ok(None) => {
-                    telemetry::record_worker_active(false);
-                    debug!(
-                        worker_id = %config.worker_id,
-                        lease_name = %config.lease_name,
-                        "Router worker is standby"
-                    );
-                    sleep(config.standby_poll_interval).await;
-                }
-                Err(err) => {
-                    telemetry::record_worker_lease_event("acquire", "error");
-                    return Err(format!("failed to acquire worker lease: {err}"));
-                }
-            }
-            continue;
-        }
-
         tokio::select! {
-            _ = lease_renew_interval.tick() => {
-                let Some(lease) = active_lease.as_ref() else {
-                    warn!(
-                        worker_id = %config.worker_id,
-                        lease_name = %config.lease_name,
-                        "Router worker reached lease renewal without an active lease"
-                    );
-                    telemetry::record_worker_active(false);
-                    continue;
-                };
-                match renew_worker_lease(&lease_repo, &config, lease).await {
-                    Ok(Some(lease)) => {
-                        active_lease = Some(lease);
-                    }
-                    Ok(None) => {
-                        warn!(
-                            worker_id = %config.worker_id,
-                            lease_name = %config.lease_name,
-                            "Router worker lost leadership lease"
-                        );
-                        telemetry::record_worker_active(false);
-                        active_lease = None;
-                        abort_vault_tasks(&mut vault_tasks).await;
-                        abort_workflow_start_tasks(&mut workflow_start_tasks).await;
-                        abort_route_cost_tasks(&mut route_cost_tasks).await;
-                        abort_provider_health_tasks(&mut provider_health_tasks).await;
-                        abort_quote_cleanup_tasks(&mut quote_cleanup_tasks).await;
-                        workflow_start_queue = WorkflowStartQueue::default();
-                        pending_vault_wakeup = false;
-                        pending_route_cost_refresh = false;
-                        pending_provider_health_poll = false;
-                        pending_quote_cleanup = false;
-                        next_refund_due_at = None;
-                    }
-                    Err(err) => {
-                        telemetry::record_worker_lease_event("renew", "error");
-                        return Err(format!("failed to renew worker lease: {err}"));
-                    }
-                }
-            }
             _ = sleep(refund_due_delay(next_refund_due_at.as_ref())), if next_refund_due_at.is_some() && vault_tasks.is_empty() => {
                 next_refund_due_at = None;
                 pending_vault_wakeup = true;
@@ -659,31 +539,6 @@ pub async fn run_worker_loop(
     }
 }
 
-async fn try_acquire_worker_lease(
-    db: &Database,
-    config: &RouterWorkerConfig,
-) -> crate::error::RouterServerResult<Option<WorkerLease>> {
-    let now = Utc::now();
-    let lease = db
-        .worker_leases()
-        .try_acquire(
-            &config.lease_name,
-            &config.worker_id,
-            now,
-            now + config.lease_duration,
-        )
-        .await?;
-    telemetry::record_worker_lease_event(
-        "acquire",
-        if lease.is_some() {
-            "acquired"
-        } else {
-            "standby"
-        },
-    );
-    Ok(lease)
-}
-
 async fn connect_worker_listener(database_url: &str) -> Result<PgListener, String> {
     let mut listener = PgListener::connect(database_url)
         .await
@@ -706,25 +561,6 @@ async fn recv_worker_notification(
         Some(listener) => Some(listener.recv().await),
         None => None,
     }
-}
-
-async fn renew_worker_lease(
-    lease_repo: &router_core::db::WorkerLeaseRepository,
-    config: &RouterWorkerConfig,
-    lease: &WorkerLease,
-) -> crate::error::RouterServerResult<Option<WorkerLease>> {
-    let now = Utc::now();
-    let lease = lease_repo
-        .renew(
-            &config.lease_name,
-            &config.worker_id,
-            lease.fencing_token,
-            now,
-            now + config.lease_duration,
-        )
-        .await?;
-    telemetry::record_worker_lease_event("renew", if lease.is_some() { "renewed" } else { "lost" });
-    Ok(lease)
 }
 
 fn spawn_vault_work_if_idle(
@@ -1022,33 +858,6 @@ fn handle_quote_cleanup_task_result(
     }
 }
 
-async fn abort_vault_tasks(vault_tasks: &mut JoinSet<VaultTaskResult>) {
-    vault_tasks.abort_all();
-    while vault_tasks.join_next().await.is_some() {}
-}
-
-async fn abort_workflow_start_tasks(workflow_start_tasks: &mut JoinSet<WorkflowStartTaskResult>) {
-    workflow_start_tasks.abort_all();
-    while workflow_start_tasks.join_next().await.is_some() {}
-}
-
-async fn abort_route_cost_tasks(route_cost_tasks: &mut JoinSet<RouteCostTaskResult>) {
-    route_cost_tasks.abort_all();
-    while route_cost_tasks.join_next().await.is_some() {}
-}
-
-async fn abort_provider_health_tasks(
-    provider_health_tasks: &mut JoinSet<ProviderHealthTaskResult>,
-) {
-    provider_health_tasks.abort_all();
-    while provider_health_tasks.join_next().await.is_some() {}
-}
-
-async fn abort_quote_cleanup_tasks(quote_cleanup_tasks: &mut JoinSet<QuoteCleanupTaskResult>) {
-    quote_cleanup_tasks.abort_all();
-    while quote_cleanup_tasks.join_next().await.is_some() {}
-}
-
 async fn refresh_next_refund_due_at(
     db: &Database,
 ) -> std::result::Result<Option<DateTime<Utc>>, String> {
@@ -1179,10 +988,6 @@ mod tests {
         let config = RouterWorkerConfig {
             database_url: "postgres://router_user:secret-password@db.example/router_db".to_string(),
             worker_id: "worker-1".to_string(),
-            lease_name: "global-router-worker".to_string(),
-            lease_duration: ChronoDuration::seconds(300),
-            lease_renew_interval: Duration::from_secs(30),
-            standby_poll_interval: Duration::from_secs(5),
             vault_work_poll_interval: Duration::from_secs(60),
             order_execution_poll_interval: Duration::from_secs(5),
             route_cost_refresh_interval: Duration::from_secs(300),
@@ -1239,7 +1044,7 @@ mod tests {
     fn refund_due_delay_is_zero_for_due_or_overdue_work() {
         assert_eq!(refund_due_delay(Some(&Utc::now())), Duration::ZERO);
         assert_eq!(
-            refund_due_delay(Some(&(Utc::now() - ChronoDuration::seconds(1)))),
+            refund_due_delay(Some(&(Utc::now() - chrono::Duration::seconds(1)))),
             Duration::ZERO
         );
     }

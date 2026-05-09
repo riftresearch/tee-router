@@ -1,9 +1,8 @@
 use crate::{
     error::RouterServerError,
     services::{
-        AddressScreeningService, OrderExecutionManager, OrderManager, ProviderHealthPoller,
-        ProviderHealthProbe, ProviderHealthService, ProviderPolicyService, RouteMinimumService,
-        VaultManager,
+        AddressScreeningService, OrderManager, ProviderHealthPoller, ProviderHealthProbe,
+        ProviderHealthService, ProviderPolicyService, RouteMinimumService, VaultManager,
     },
     Result, RouterServerArgs,
 };
@@ -24,10 +23,6 @@ use router_core::{
             CctpHttpProviderConfig, VeloraHttpProviderConfig,
         },
         asset_registry::ProviderId,
-        custody_action_executor::{
-            bitcoin_address_from_private_key, evm_address_from_private_key, CustodyActionExecutor,
-            HyperliquidRuntimeConfig, PaymasterRegistry,
-        },
         route_costs::RouteCostService,
     },
 };
@@ -49,7 +44,6 @@ pub struct RouterComponents {
     pub chain_registry: Arc<ChainRegistry>,
     pub vault_manager: Arc<VaultManager>,
     pub order_manager: Arc<OrderManager>,
-    pub order_execution_manager: Arc<OrderExecutionManager>,
     pub provider_policies: Arc<ProviderPolicyService>,
     pub provider_health: Arc<ProviderHealthService>,
     pub provider_health_poller: Arc<ProviderHealthPoller>,
@@ -99,10 +93,7 @@ pub async fn initialize_components_with_action_providers(
     .map_err(RouterServerError::from)
     .context(crate::DatabaseInitSnafu)?;
 
-    reject_shared_hyperliquid_execution_config(args)?;
-    let hyperliquid_runtime = hyperliquid_runtime_config(args)?;
     let chain_registry = Arc::new(initialize_chain_registry(args, paymaster_mode).await?);
-    let paymasters = paymaster_registry(args)?;
     let provider_policies = Arc::new(ProviderPolicyService::new(db.clone()));
     let provider_health = Arc::new(ProviderHealthService::new(db.clone()));
     let provider_health_poller = Arc::new(initialize_provider_health_poller(
@@ -129,21 +120,6 @@ pub async fn initialize_components_with_action_providers(
         .with_provider_policies(Some(provider_policies.clone()))
         .with_provider_health(Some(provider_health.clone())),
     );
-    let custody_action_executor = Arc::new(
-        CustodyActionExecutor::new(db.clone(), settings.clone(), chain_registry.clone())
-            .with_hyperliquid_runtime(hyperliquid_runtime)
-            .with_paymasters(paymasters),
-    );
-    let order_execution_manager = Arc::new(
-        OrderExecutionManager::with_dependencies(
-            db.clone(),
-            action_providers,
-            custody_action_executor,
-            chain_registry.clone(),
-        )
-        .with_route_costs(Some(route_costs.clone()))
-        .with_provider_policies(Some(provider_policies.clone())),
-    );
     let vault_manager = Arc::new(match worker_id {
         Some(worker_id) => VaultManager::with_worker_id(
             db.clone(),
@@ -159,7 +135,6 @@ pub async fn initialize_components_with_action_providers(
         chain_registry,
         vault_manager,
         order_manager,
-        order_execution_manager,
         provider_policies,
         provider_health,
         provider_health_poller,
@@ -488,42 +463,6 @@ fn normalize_optional_string(value: Option<&str>) -> Option<String> {
         .map(|value| value.to_string())
 }
 
-fn reject_shared_hyperliquid_execution_config(args: &RouterServerArgs) -> Result<()> {
-    let configured_fields = [
-        (
-            "HYPERLIQUID_EXECUTION_PRIVATE_KEY",
-            normalize_optional_string(args.hyperliquid_execution_private_key.as_deref()),
-        ),
-        (
-            "HYPERLIQUID_ACCOUNT_ADDRESS",
-            normalize_optional_string(args.hyperliquid_account_address.as_deref()),
-        ),
-        (
-            "HYPERLIQUID_VAULT_ADDRESS",
-            normalize_optional_string(args.hyperliquid_vault_address.as_deref()),
-        ),
-    ]
-    .into_iter()
-    .filter_map(|(name, value)| value.map(|_| name))
-    .collect::<Vec<_>>();
-
-    if configured_fields.is_empty() {
-        return Ok(());
-    }
-
-    Err(invalid_config(format!(
-        "shared Hyperliquid execution identities are no longer supported; remove {} and use per-order router-derived Hyperliquid custody",
-        configured_fields.join(", ")
-    )))
-}
-
-fn hyperliquid_runtime_config(args: &RouterServerArgs) -> Result<Option<HyperliquidRuntimeConfig>> {
-    Ok(
-        normalize_optional_url(args.hyperliquid_api_url.as_deref(), "Hyperliquid API URL")?
-            .map(|base_url| HyperliquidRuntimeConfig::new(base_url, args.hyperliquid_network)),
-    )
-}
-
 fn initialize_address_screener(
     args: &RouterServerArgs,
 ) -> Result<Option<Arc<AddressScreeningService>>> {
@@ -543,47 +482,6 @@ fn initialize_address_screener(
             "CHAINALYSIS_HOST and CHAINALYSIS_TOKEN must be configured together",
         )),
     }
-}
-
-fn paymaster_registry(args: &RouterServerArgs) -> Result<PaymasterRegistry> {
-    let mut registry = PaymasterRegistry::new();
-
-    if let Some(private_key) =
-        normalize_optional_string(args.ethereum_paymaster_private_key.as_deref())
-    {
-        let address = evm_address_from_private_key(&private_key)
-            .map_err(|err| invalid_config(err.to_string()))?;
-        registry.register(ChainType::Ethereum, address);
-    }
-    if let Some(private_key) = normalize_optional_string(args.base_paymaster_private_key.as_deref())
-    {
-        let address = evm_address_from_private_key(&private_key)
-            .map_err(|err| invalid_config(err.to_string()))?;
-        registry.register(ChainType::Base, address);
-    }
-    if let Some(private_key) =
-        normalize_optional_string(args.arbitrum_paymaster_private_key.as_deref())
-    {
-        let address = evm_address_from_private_key(&private_key)
-            .map_err(|err| invalid_config(err.to_string()))?;
-        registry.register(ChainType::Arbitrum, address);
-    }
-    if let Some(private_key) =
-        normalize_optional_string(args.bitcoin_paymaster_private_key.as_deref())
-    {
-        let address = bitcoin_address_from_private_key(&private_key, args.bitcoin_network)
-            .map_err(|err| invalid_config(err.to_string()))?;
-        registry.register(ChainType::Bitcoin, address);
-    }
-    if let Some(private_key) =
-        normalize_optional_string(args.hyperliquid_paymaster_private_key.as_deref())
-    {
-        let address = evm_address_from_private_key(&private_key)
-            .map_err(|err| invalid_config(err.to_string()))?;
-        registry.register(ChainType::Hyperliquid, address);
-    }
-
-    Ok(registry)
 }
 
 fn invalid_config(message: impl Into<String>) -> crate::Error {
@@ -680,16 +578,11 @@ mod tests {
                 router_core::services::custody_action_executor::HyperliquidCallNetwork::Mainnet,
             hyperliquid_order_timeout_ms: 30_000,
             worker_id: None,
-            worker_lease_name: Some("global-router-worker".to_string()),
-            worker_lease_seconds: 300,
-            worker_lease_renew_seconds: 30,
-            worker_standby_poll_seconds: 5,
             worker_refund_poll_seconds: 60,
             worker_order_execution_poll_seconds: 5,
             worker_route_cost_refresh_seconds: 300,
             worker_provider_health_poll_seconds: 120,
             provider_health_timeout_seconds: 10,
-            worker_provider_operation_hint_pass_limit: 500,
             worker_order_maintenance_pass_limit: 100,
             worker_order_planning_pass_limit: 100,
             worker_order_execution_pass_limit: 25,
@@ -760,28 +653,5 @@ mod tests {
             assert!(!message.contains("token"));
             assert!(!message.contains("secret"));
         }
-    }
-
-    #[test]
-    fn reject_shared_hyperliquid_execution_config_accepts_absent_settings() {
-        let args = base_args();
-        reject_shared_hyperliquid_execution_config(&args).unwrap();
-    }
-
-    #[test]
-    fn reject_shared_hyperliquid_execution_config_rejects_legacy_settings() {
-        let mut args = base_args();
-        args.hyperliquid_execution_private_key =
-            Some("0x59c6995e998f97a5a0044976f7ad0a7df4976fbe66f6cc18ff3c16f18a6b9e3f".to_string());
-        args.hyperliquid_account_address =
-            Some("0x1111111111111111111111111111111111111111".to_string());
-        args.hyperliquid_vault_address =
-            Some("0x2222222222222222222222222222222222222222".to_string());
-        let err = reject_shared_hyperliquid_execution_config(&args).expect_err("must reject");
-        let message = err.to_string();
-        assert!(message.contains("shared Hyperliquid execution identities"));
-        assert!(message.contains("HYPERLIQUID_EXECUTION_PRIVATE_KEY"));
-        assert!(message.contains("HYPERLIQUID_ACCOUNT_ADDRESS"));
-        assert!(message.contains("HYPERLIQUID_VAULT_ADDRESS"));
     }
 }

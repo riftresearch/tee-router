@@ -371,28 +371,6 @@ pub fn record_order_in_progress_queue_depth(status_counts: &[(RouterOrderStatus,
     .set(total as f64);
 }
 
-pub fn record_worker_provider_operation_hint_pass(processed_hints: usize) {
-    gauge!("tee_router_worker_provider_operation_hint_pass_last_rows").set(processed_hints as f64);
-
-    if processed_hints > 0 {
-        counter!("tee_router_worker_provider_operation_hint_pass_rows_total")
-            .increment(processed_hints as u64);
-    }
-}
-
-pub fn record_worker_lease_event(event: &'static str, status: &'static str) {
-    counter!(
-        "tee_router_worker_lease_events_total",
-        "event" => event,
-        "status" => status,
-    )
-    .increment(1);
-}
-
-pub fn record_worker_active(active: bool) {
-    gauge!("tee_router_worker_active").set(if active { 1.0 } else { 0.0 });
-}
-
 pub fn record_market_order_quote_requested(source_asset: &DepositAsset) {
     counter!(
         "tee_router_market_order_quote_requested_total",

@@ -3,7 +3,6 @@ pub mod provider_health_repo;
 pub mod provider_policy_repo;
 pub mod route_cost_repo;
 pub mod vault_repo;
-pub mod worker_lease_repo;
 
 pub use order_repo::{
     CompletedExecutionOrder, ExecutionAttemptMaterializationRecord, ExecutionAttemptPlan,
@@ -15,7 +14,6 @@ pub use provider_health_repo::ProviderHealthRepository;
 pub use provider_policy_repo::ProviderPolicyRepository;
 pub use route_cost_repo::RouteCostRepository;
 pub use vault_repo::VaultRepository;
-pub use worker_lease_repo::WorkerLeaseRepository;
 
 use crate::error::RouterCoreResult;
 use sqlx_core::migrate::Migrator;
@@ -92,10 +90,5 @@ impl Database {
     #[must_use]
     pub fn route_costs(&self) -> RouteCostRepository {
         RouteCostRepository::new(self.pool.clone())
-    }
-
-    #[must_use]
-    pub fn worker_leases(&self) -> WorkerLeaseRepository {
-        WorkerLeaseRepository::new(self.pool.clone())
     }
 }

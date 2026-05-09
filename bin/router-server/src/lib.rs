@@ -280,29 +280,9 @@ pub struct RouterServerArgs {
     #[arg(long, env = "HYPERLIQUID_ORDER_TIMEOUT_MS", default_value = "30000")]
     pub hyperliquid_order_timeout_ms: u64,
 
-    /// Stable worker identity for the router-worker database lease
+    /// Stable worker identity for router-worker records
     #[arg(long, env = "ROUTER_WORKER_ID")]
     pub worker_id: Option<String>,
-
-    /// Global worker lease name
-    #[arg(
-        long,
-        env = "ROUTER_WORKER_LEASE_NAME",
-        default_value = "global-router-worker"
-    )]
-    pub worker_lease_name: Option<String>,
-
-    /// Worker leadership lease duration, in seconds
-    #[arg(long, env = "ROUTER_WORKER_LEASE_SECONDS", default_value = "300")]
-    pub worker_lease_seconds: u64,
-
-    /// Worker leadership lease renewal interval, in seconds
-    #[arg(long, env = "ROUTER_WORKER_LEASE_RENEW_SECONDS", default_value = "30")]
-    pub worker_lease_renew_seconds: u64,
-
-    /// Standby worker poll interval for trying to acquire leadership, in seconds
-    #[arg(long, env = "ROUTER_WORKER_STANDBY_POLL_SECONDS", default_value = "5")]
-    pub worker_standby_poll_seconds: u64,
 
     /// Vault work safety-sweep interval. LISTEN/NOTIFY drives normal funding and
     /// refund wakeups, but this periodic pass recovers missed wakeups and stale
@@ -343,14 +323,6 @@ pub struct RouterServerArgs {
         default_value = "10"
     )]
     pub provider_health_timeout_seconds: u64,
-
-    /// Provider-operation observation hints to claim per router-worker hint pass
-    #[arg(
-        long,
-        env = "ROUTER_WORKER_PROVIDER_OPERATION_HINT_PASS_LIMIT",
-        default_value = "500"
-    )]
-    pub worker_provider_operation_hint_pass_limit: u32,
 
     /// Order maintenance rows to process per router-worker global pass
     #[arg(
