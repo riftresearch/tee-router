@@ -80,6 +80,11 @@ pub fn order_workflow_id(order_id: Uuid) -> String {
 }
 
 #[must_use]
+pub fn refund_workflow_id(order_id: Uuid, parent_attempt_id: Uuid) -> String {
+    format!("order:{order_id}:refund:{parent_attempt_id}")
+}
+
+#[must_use]
 pub fn workflow_start_options(task_queue: &str, workflow_id: &str) -> WorkflowStartOptions {
     WorkflowStartOptions::new(task_queue.to_owned(), workflow_id.to_owned())
         .id_reuse_policy(WorkflowIdReusePolicy::AllowDuplicateFailedOnly)

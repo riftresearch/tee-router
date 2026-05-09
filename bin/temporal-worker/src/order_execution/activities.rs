@@ -6,8 +6,8 @@ use std::sync::Arc;
 use chrono::Utc;
 use router_core::{
     db::{
-        Database, ExecutionAttemptPlan, FundingVaultRefundAttemptPlan, PersistStepCompletionRecord,
-        RefreshedExecutionAttemptPlan,
+        Database, ExecutionAttemptPlan, ExternalCustodyRefundAttemptPlan,
+        FundingVaultRefundAttemptPlan, PersistStepCompletionRecord, RefreshedExecutionAttemptPlan,
     },
     error::{RouterCoreError, RouterCoreResult},
     models::{
@@ -26,7 +26,7 @@ use router_core::{
             ProviderOperationObservation, ProviderOperationObservationRequest,
             UnitDepositStepRequest, UnitWithdrawalStepRequest,
         },
-        asset_registry::{MarketOrderTransitionKind, ProviderId, TransitionDecl},
+        asset_registry::{MarketOrderNode, MarketOrderTransitionKind, ProviderId, TransitionDecl},
         custody_action_executor::{CustodyAction, CustodyActionError, CustodyActionRequest},
         market_order_planner::MarketOrderPlanRemainingStart,
         quote_legs::{
@@ -2431,9 +2431,6 @@ impl RefundActivities {
 #[activities]
 impl RefundActivities {
     /// Scar tissue: §8 refund position discovery and §16.1 balance reads.
-    ///
-    /// PR6a only enumerates the funding vault. PR6b owns the deferred branches:
-    /// ExternalCustody and HyperliquidSpot recoverable positions.
     #[activity]
     pub async fn discover_single_refund_position(
         self: Arc<Self>,
@@ -2459,34 +2456,126 @@ impl RefundActivities {
             .get(input.order_id)
             .await
             .map_err(activity_error_from_display)?;
-        let Some(funding_vault_id) = order.funding_vault_id else {
-            return Ok(refund_single_position_untenable(0, 0));
-        };
-        let vault = match deps.db.vaults().get(funding_vault_id).await {
-            Ok(vault) => vault,
-            Err(RouterCoreError::NotFound) => return Ok(refund_single_position_untenable(0, 0)),
-            Err(source) => return Err(activity_error_from_display(source)),
-        };
-        let amount = deps
-            .custody_action_executor
-            .deposit_vault_balance_raw(&vault)
+
+        let mut positions = Vec::new();
+        if let Some(funding_vault_id) = order.funding_vault_id {
+            let vault = match deps.db.vaults().get(funding_vault_id).await {
+                Ok(vault) => Some(vault),
+                Err(RouterCoreError::NotFound) => None,
+                Err(source) => return Err(activity_error_from_display(source)),
+            };
+            if let Some(vault) = vault {
+                let amount = deps
+                    .custody_action_executor
+                    .deposit_vault_balance_raw(&vault)
+                    .await
+                    .map_err(activity_error_from_display)?;
+                if raw_amount_is_positive(&amount, "funding vault refund balance")? {
+                    positions.push(SingleRefundPosition {
+                        position_kind: RecoverablePositionKind::FundingVault,
+                        owning_step_id: None,
+                        funding_vault_id: Some(funding_vault_id),
+                        custody_vault_id: None,
+                        asset: vault.deposit_asset,
+                        amount,
+                        hyperliquid_coin: None,
+                        hyperliquid_canonical: None,
+                    });
+                }
+            }
+        }
+
+        let custody_vaults = deps
+            .db
+            .orders()
+            .get_custody_vaults(order.id)
             .await
             .map_err(activity_error_from_display)?;
-        if raw_amount_is_positive(&amount, "funding vault refund balance")? {
+        for vault in custody_vaults {
+            match vault.role {
+                CustodyVaultRole::SourceDeposit => {}
+                CustodyVaultRole::DestinationExecution => {
+                    let Some(asset_id) = vault.asset.clone() else {
+                        continue;
+                    };
+                    let amount = deps
+                        .custody_action_executor
+                        .custody_vault_balance_raw(&vault)
+                        .await
+                        .map_err(activity_error_from_display)?;
+                    if raw_amount_is_positive(&amount, "external custody refund balance")? {
+                        positions.push(SingleRefundPosition {
+                            position_kind: RecoverablePositionKind::ExternalCustody,
+                            owning_step_id: None,
+                            funding_vault_id: None,
+                            custody_vault_id: Some(vault.id),
+                            asset: DepositAsset {
+                                chain: vault.chain,
+                                asset: asset_id,
+                            },
+                            amount,
+                            hyperliquid_coin: None,
+                            hyperliquid_canonical: None,
+                        });
+                    }
+                }
+                CustodyVaultRole::HyperliquidSpot => {
+                    let balances = deps
+                        .custody_action_executor
+                        .inspect_hyperliquid_spot_balances(&vault)
+                        .await
+                        .map_err(activity_error_from_display)?;
+                    for balance in balances {
+                        let registry = deps.action_providers.asset_registry();
+                        let Some((canonical, asset)) = registry
+                            .hyperliquid_coin_asset(&balance.coin, Some(&order.source_asset.chain))
+                        else {
+                            continue;
+                        };
+                        let decimals = registry
+                            .chain_asset(&asset)
+                            .ok_or_else(|| {
+                                activity_error(format!(
+                                    "missing registered decimals for Hyperliquid refund asset {} {}",
+                                    asset.chain, asset.asset
+                                ))
+                            })?
+                            .decimals;
+                        let Some(amount) = hyperliquid_refund_balance_amount_raw(
+                            &balance.total,
+                            &balance.hold,
+                            decimals,
+                        )?
+                        else {
+                            continue;
+                        };
+                        positions.push(SingleRefundPosition {
+                            position_kind: RecoverablePositionKind::HyperliquidSpot,
+                            owning_step_id: None,
+                            funding_vault_id: None,
+                            custody_vault_id: Some(vault.id),
+                            asset,
+                            amount,
+                            hyperliquid_coin: Some(balance.coin),
+                            hyperliquid_canonical: Some(canonical),
+                        });
+                    }
+                }
+            }
+        }
+
+        if positions.len() == 1 {
             return Ok(SingleRefundPositionDiscovery {
-                outcome: SingleRefundPositionOutcome::Position(SingleRefundPosition {
-                    position_kind: RecoverablePositionKind::FundingVault,
-                    owning_step_id: None,
-                }),
+                outcome: SingleRefundPositionOutcome::Position(positions.remove(0)),
             });
         }
-        Ok(refund_single_position_untenable(0, 0))
+        Ok(refund_single_position_untenable(
+            positions.len(),
+            positions.len(),
+        ))
     }
 
     /// Scar tissue: §9 refund tree and §16.1 refund materialisation.
-    ///
-    /// PR6a materializes FundingVault -> direct internal refund only. PR6b owns the deferred
-    /// multi-step and multi-leg transitions such as CCTP burn/receive and Hyperliquid prefund.
     #[activity]
     pub async fn materialize_refund_plan(
         self: Arc<Self>,
@@ -2494,8 +2583,11 @@ impl RefundActivities {
         input: MaterializeRefundPlanInput,
     ) -> Result<RefundPlanShape, ActivityError> {
         let deps = self.deps()?;
-        if input.position.position_kind != RecoverablePositionKind::FundingVault {
-            deferred_external_or_hyperliquid_refund_positions();
+        if input.position.position_kind == RecoverablePositionKind::ExternalCustody {
+            return materialize_external_custody_refund_plan(&deps, input).await;
+        }
+        if input.position.position_kind == RecoverablePositionKind::HyperliquidSpot {
+            deferred_hyperliquid_refund_positions();
         }
         let order = deps
             .db
@@ -2604,16 +2696,402 @@ fn raw_amount_is_positive(value: &str, label: &'static str) -> Result<bool, Acti
     Ok(trimmed.as_bytes().iter().any(|digit| *digit != b'0'))
 }
 
-/// PR6b deferred: enumerate ExternalCustody and HyperliquidSpot refund positions.
-#[allow(dead_code)]
-fn deferred_external_or_hyperliquid_refund_positions() -> ! {
-    todo!("PR6b: enumerate external/hyperliquid refund positions")
+async fn materialize_external_custody_refund_plan(
+    deps: &OrderActivityDeps,
+    input: MaterializeRefundPlanInput,
+) -> Result<RefundPlanShape, ActivityError> {
+    let order = deps
+        .db
+        .orders()
+        .get(input.order_id)
+        .await
+        .map_err(activity_error_from_display)?;
+    let custody_vault_id = input.position.custody_vault_id.ok_or_else(|| {
+        activity_error("external-custody refund position is missing custody_vault_id")
+    })?;
+    let vault = match deps.db.orders().get_custody_vault(custody_vault_id).await {
+        Ok(vault) => vault,
+        Err(RouterCoreError::NotFound) => {
+            return Ok(refund_plan_untenable(
+                RefundUntenableReason::RefundRecoverablePositionDisappearedAfterValidation,
+            ));
+        }
+        Err(source) => return Err(activity_error_from_display(source)),
+    };
+    if vault.order_id != Some(input.order_id) {
+        return Err(activity_error(format!(
+            "external-custody vault {} does not belong to order {}",
+            vault.id, input.order_id
+        )));
+    }
+    let Some(asset_id) = vault.asset.clone() else {
+        return Ok(refund_plan_untenable(
+            RefundUntenableReason::RefundRecoverablePositionDisappearedAfterValidation,
+        ));
+    };
+    let asset = DepositAsset {
+        chain: vault.chain.clone(),
+        asset: asset_id,
+    };
+    let amount = deps
+        .custody_action_executor
+        .custody_vault_balance_raw(&vault)
+        .await
+        .map_err(activity_error_from_display)?;
+    if !raw_amount_is_positive(&amount, "external custody refund balance")? {
+        return Ok(refund_plan_untenable(
+            RefundUntenableReason::RefundRecoverablePositionDisappearedAfterValidation,
+        ));
+    }
+
+    let now = Utc::now();
+    let maybe_plan = if asset == order.source_asset {
+        Some(external_custody_direct_refund_steps(
+            &order, &vault, &asset, &amount, now,
+        ))
+    } else {
+        external_custody_across_refund_steps(deps, &order, &vault, &asset, &amount, now).await?
+    };
+    let Some((legs, steps)) = maybe_plan else {
+        return Ok(refund_plan_untenable(
+            RefundUntenableReason::RefundRecoverablePositionDisappearedAfterValidation,
+        ));
+    };
+    let record = deps
+        .db
+        .orders()
+        .create_refund_attempt_from_external_custody(
+            input.order_id,
+            input.failed_attempt_id,
+            ExternalCustodyRefundAttemptPlan {
+                source_custody_vault_id: vault.id,
+                legs,
+                steps,
+                failure_reason: json!({
+                    "reason": "primary_execution_attempts_exhausted",
+                    "trace": "refund_workflow",
+                    "failed_attempt_id": input.failed_attempt_id,
+                }),
+                input_custody_snapshot: json!({
+                    "schema_version": 1,
+                    "source_kind": "external_custody",
+                    "custody_vault_id": vault.id,
+                    "custody_vault_role": vault.role.to_db_string(),
+                    "source_asset": {
+                        "chain": asset.chain.as_str(),
+                        "asset": asset.asset.as_str(),
+                    },
+                    "amount": amount,
+                }),
+            },
+            now,
+        )
+        .await
+        .map_err(activity_error_from_display)?;
+    tracing::info!(
+        order_id = %record.order.id,
+        attempt_id = %record.attempt.id,
+        step_count = record.steps.len(),
+        event_name = "order.refund_plan_materialized",
+        "order.refund_plan_materialized"
+    );
+    Ok(RefundPlanShape {
+        outcome: RefundPlanOutcome::Materialized {
+            refund_attempt_id: record.attempt.id,
+            steps: record
+                .steps
+                .into_iter()
+                .map(|step| WorkflowExecutionStep {
+                    step_id: step.id,
+                    step_index: step.step_index,
+                })
+                .collect(),
+        },
+    })
 }
 
-/// PR6b deferred: materialize non-internal and multi-leg refund transitions.
+fn external_custody_direct_refund_steps(
+    order: &RouterOrder,
+    vault: &CustodyVault,
+    asset: &DepositAsset,
+    amount: &str,
+    planned_at: chrono::DateTime<Utc>,
+) -> (Vec<OrderExecutionLeg>, Vec<OrderExecutionStep>) {
+    let leg = OrderExecutionLeg {
+        id: Uuid::now_v7(),
+        order_id: order.id,
+        execution_attempt_id: None,
+        transition_decl_id: None,
+        leg_index: 0,
+        leg_type: OrderExecutionStepType::Refund.to_db_string().to_string(),
+        provider: "internal".to_string(),
+        status: OrderExecutionStepStatus::Planned,
+        input_asset: asset.clone(),
+        output_asset: asset.clone(),
+        amount_in: amount.to_string(),
+        expected_amount_out: amount.to_string(),
+        min_amount_out: None,
+        actual_amount_in: None,
+        actual_amount_out: None,
+        started_at: None,
+        completed_at: None,
+        provider_quote_expires_at: None,
+        details: json!({
+            "schema_version": 1,
+            "refund_kind": "external_custody_direct_transfer",
+            "quote_leg_count": 1,
+            "action_step_types": [OrderExecutionStepType::Refund.to_db_string()],
+        }),
+        usd_valuation: json!({}),
+        created_at: planned_at,
+        updated_at: planned_at,
+    };
+    let step = OrderExecutionStep {
+        id: Uuid::now_v7(),
+        order_id: order.id,
+        execution_attempt_id: None,
+        execution_leg_id: Some(leg.id),
+        transition_decl_id: None,
+        step_index: 0,
+        step_type: OrderExecutionStepType::Refund,
+        provider: "internal".to_string(),
+        status: OrderExecutionStepStatus::Planned,
+        input_asset: Some(asset.clone()),
+        output_asset: Some(asset.clone()),
+        amount_in: Some(amount.to_string()),
+        min_amount_out: None,
+        tx_hash: None,
+        provider_ref: None,
+        idempotency_key: Some(format!("order:{}:external-refund:0", order.id)),
+        attempt_count: 0,
+        next_attempt_at: None,
+        started_at: None,
+        completed_at: None,
+        details: json!({
+            "schema_version": 1,
+            "refund_kind": "external_custody_direct_transfer",
+            "source_custody_vault_id": vault.id,
+            "source_custody_vault_role": vault.role.to_db_string(),
+            "recipient_address": &order.refund_address,
+        }),
+        request: json!({
+            "order_id": order.id,
+            "source_custody_vault_id": vault.id,
+            "recipient_address": &order.refund_address,
+            "amount": amount,
+        }),
+        response: json!({}),
+        error: json!({}),
+        usd_valuation: json!({}),
+        created_at: planned_at,
+        updated_at: planned_at,
+    };
+    (vec![leg], vec![step])
+}
+
+async fn external_custody_across_refund_steps(
+    deps: &OrderActivityDeps,
+    order: &RouterOrder,
+    vault: &CustodyVault,
+    asset: &DepositAsset,
+    amount: &str,
+    planned_at: chrono::DateTime<Utc>,
+) -> Result<Option<(Vec<OrderExecutionLeg>, Vec<OrderExecutionStep>)>, ActivityError> {
+    let transition = direct_across_refund_transition(deps, asset, &order.source_asset)
+        .unwrap_or_else(|| deferred_non_across_refund_transitions());
+    let bridge = deps
+        .action_providers
+        .bridge(ProviderId::Across.as_str())
+        .ok_or_else(|| activity_error("Across bridge provider is not configured"))?;
+    let quote = bridge
+        .quote_bridge(BridgeQuoteRequest {
+            source_asset: transition.input.asset.clone(),
+            destination_asset: transition.output.asset.clone(),
+            order_kind: MarketOrderKind::ExactIn {
+                amount_in: amount.to_string(),
+                min_amount_out: Some("1".to_string()),
+            },
+            recipient_address: order.refund_address.clone(),
+            depositor_address: vault.address.clone(),
+            partial_fills_enabled: false,
+        })
+        .await
+        .map_err(activity_error)?;
+    let Some(quote) = quote else { return Ok(None) };
+    let quote_leg = QuoteLeg::new(QuoteLegSpec {
+        transition_decl_id: &transition.id,
+        transition_kind: transition.kind,
+        provider: transition.provider,
+        input_asset: &transition.input.asset,
+        output_asset: &transition.output.asset,
+        amount_in: &quote.amount_in,
+        amount_out: &quote.amount_out,
+        expires_at: quote.expires_at,
+        raw: quote.provider_quote.clone(),
+    });
+    let leg = OrderExecutionLeg {
+        id: Uuid::now_v7(),
+        order_id: order.id,
+        execution_attempt_id: None,
+        transition_decl_id: Some(transition.id.clone()),
+        leg_index: 0,
+        leg_type: OrderExecutionStepType::AcrossBridge
+            .to_db_string()
+            .to_string(),
+        provider: ProviderId::Across.as_str().to_string(),
+        status: OrderExecutionStepStatus::Planned,
+        input_asset: transition.input.asset.clone(),
+        output_asset: transition.output.asset.clone(),
+        amount_in: quote.amount_in.clone(),
+        expected_amount_out: quote.amount_out.clone(),
+        min_amount_out: None,
+        actual_amount_in: None,
+        actual_amount_out: None,
+        started_at: None,
+        completed_at: None,
+        provider_quote_expires_at: Some(quote.expires_at),
+        details: json!({
+            "schema_version": 1,
+            "refund_kind": "external_custody_across_bridge",
+            "transition_kind": transition.kind.as_str(),
+            "quote_leg_count": 1,
+            "quote_legs": [quote_leg],
+            "action_step_types": [OrderExecutionStepType::AcrossBridge.to_db_string()],
+        }),
+        usd_valuation: json!({}),
+        created_at: planned_at,
+        updated_at: planned_at,
+    };
+    let step = OrderExecutionStep {
+        id: Uuid::now_v7(),
+        order_id: order.id,
+        execution_attempt_id: None,
+        execution_leg_id: Some(leg.id),
+        transition_decl_id: Some(transition.id.clone()),
+        step_index: 0,
+        step_type: OrderExecutionStepType::AcrossBridge,
+        provider: ProviderId::Across.as_str().to_string(),
+        status: OrderExecutionStepStatus::Planned,
+        input_asset: Some(transition.input.asset.clone()),
+        output_asset: Some(transition.output.asset.clone()),
+        amount_in: Some(quote.amount_in.clone()),
+        min_amount_out: None,
+        tx_hash: None,
+        provider_ref: Some(format!("order:{}:external-refund", order.id)),
+        idempotency_key: None,
+        attempt_count: 0,
+        next_attempt_at: None,
+        started_at: None,
+        completed_at: None,
+        details: json!({
+            "schema_version": 1,
+            "refund_kind": "external_custody_across_bridge",
+            "transition_kind": transition.kind.as_str(),
+            "depositor_custody_vault_id": vault.id,
+            "depositor_custody_vault_address": &vault.address,
+            "depositor_custody_vault_role": vault.role.to_db_string(),
+            "refund_custody_vault_id": vault.id,
+            "refund_custody_vault_address": &vault.address,
+            "refund_custody_vault_role": vault.role.to_db_string(),
+            "recipient_address": &order.refund_address,
+        }),
+        request: json!({
+            "order_id": order.id,
+            "origin_chain_id": transition.input.asset.chain.as_str(),
+            "destination_chain_id": transition.output.asset.chain.as_str(),
+            "input_asset": transition.input.asset.asset.as_str(),
+            "output_asset": transition.output.asset.asset.as_str(),
+            "amount": quote.amount_in,
+            "recipient": &order.refund_address,
+            "recipient_custody_vault_role": null,
+            "recipient_custody_vault_id": null,
+            "refund_address": &vault.address,
+            "refund_custody_vault_id": vault.id,
+            "refund_custody_vault_role": vault.role.to_db_string(),
+            "partial_fills_enabled": false,
+            "depositor_address": &vault.address,
+            "depositor_custody_vault_id": vault.id,
+            "depositor_custody_vault_role": vault.role.to_db_string(),
+        }),
+        response: json!({}),
+        error: json!({}),
+        usd_valuation: json!({}),
+        created_at: planned_at,
+        updated_at: planned_at,
+    };
+    Ok(Some((vec![leg], vec![step])))
+}
+
+fn direct_across_refund_transition(
+    deps: &OrderActivityDeps,
+    source: &DepositAsset,
+    destination: &DepositAsset,
+) -> Option<TransitionDecl> {
+    deps.action_providers
+        .asset_registry()
+        .select_transition_paths_between(
+            MarketOrderNode::External(source.clone()),
+            MarketOrderNode::External(destination.clone()),
+            1,
+        )
+        .into_iter()
+        .filter(|path| path.transitions.len() == 1)
+        .flat_map(|path| path.transitions.into_iter())
+        .find(|transition| transition.kind == MarketOrderTransitionKind::AcrossBridge)
+}
+
+fn hyperliquid_refund_balance_amount_raw(
+    total: &str,
+    hold: &str,
+    decimals: u8,
+) -> Result<Option<String>, ActivityError> {
+    let total_raw = decimal_string_to_raw_digits(total, decimals).map_err(|message| {
+        activity_error(format!(
+            "invalid Hyperliquid refund total balance: {message}"
+        ))
+    })?;
+    let hold_raw = decimal_string_to_raw_digits(hold, decimals).map_err(|message| {
+        activity_error(format!(
+            "invalid Hyperliquid refund hold balance: {message}"
+        ))
+    })?;
+    if total_raw == "0" || hold_raw != "0" {
+        return Ok(None);
+    }
+    Ok(Some(total_raw))
+}
+
+fn decimal_string_to_raw_digits(value: &str, decimals: u8) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("invalid decimal amount {value:?}"));
+    }
+    let mut parts = trimmed.split('.');
+    let whole = parts.next().unwrap_or_default();
+    let frac = parts.next().unwrap_or_default();
+    if parts.next().is_some()
+        || whole.is_empty()
+        || !whole.chars().all(|ch| ch.is_ascii_digit())
+        || !frac.chars().all(|ch| ch.is_ascii_digit())
+        || frac.len() > usize::from(decimals)
+    {
+        return Err(format!("invalid decimal amount {value:?}"));
+    }
+    let combined = format!("{whole}{:0<width$}", frac, width = usize::from(decimals));
+    let digits = combined.trim_start_matches('0');
+    Ok(if digits.is_empty() { "0" } else { digits }.to_string())
+}
+
+/// PR6b2 deferred: materialize HyperliquidSpot refund positions.
 #[allow(dead_code)]
-fn deferred_multi_leg_refund_transitions() -> ! {
-    todo!("PR6b: multi-leg refund transitions")
+fn deferred_hyperliquid_refund_positions() -> ! {
+    todo!("PR6b2: materialize HyperliquidSpot refund positions")
+}
+
+/// PR6b2 deferred: materialize CCTP, Unit, Hyperliquid, and multi-leg refund transitions.
+#[allow(dead_code)]
+fn deferred_non_across_refund_transitions() -> ! {
+    todo!("PR6b2: non-Across and multi-leg refund transitions")
 }
 
 #[derive(Clone, Default)]

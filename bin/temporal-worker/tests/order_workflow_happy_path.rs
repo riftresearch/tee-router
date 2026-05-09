@@ -21,7 +21,7 @@ use router_core::{
     config::Settings,
     db::Database,
     models::{
-        CustodyVaultRole, DepositVaultStatus, OrderExecutionAttemptKind,
+        CustodyVaultRole, DepositVaultStatus, OrderExecutionAttempt, OrderExecutionAttemptKind,
         OrderExecutionAttemptStatus, OrderExecutionStepStatus, OrderExecutionStepType,
         OrderProviderOperation, ProviderOperationStatus, ProviderOperationType, RouterOrderQuote,
         RouterOrderStatus, VaultAction,
@@ -44,18 +44,18 @@ use sqlx_postgres::{PgConnectOptions, PgConnection, PgPool};
 use temporal_worker::{
     order_execution::{
         activities::{OrderActivities, OrderActivityDeps},
-        build_worker, order_workflow_id,
+        build_worker, order_workflow_id, refund_workflow_id,
         types::{
             OrderTerminalStatus, OrderWorkflowInput, OrderWorkflowOutput, ProviderHintKind,
             ProviderKind, ProviderOperationHintSignal,
         },
         workflow_start_options,
-        workflows::OrderWorkflow,
+        workflows::{OrderWorkflow, RefundWorkflow},
         DEFAULT_TASK_QUEUE,
     },
     runtime::{connect_client, TemporalConnection},
 };
-use temporalio_client::{WorkflowGetResultOptions, WorkflowSignalOptions};
+use temporalio_client::{Client, WorkflowGetResultOptions, WorkflowSignalOptions};
 use testcontainers::{
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
@@ -103,6 +103,7 @@ struct WorkflowOptions {
     velora_stale_quote_failures: usize,
     expire_quote_legs: bool,
     refreshed_eth_usd_micro: Option<u128>,
+    expect_external_custody_across_refund: bool,
 }
 
 struct SeededOrder {
@@ -302,6 +303,55 @@ async fn order_workflow_refunds_after_retry_exhaustion() {
     assert!(
         run.refund_address_balance >= U256::from_str_radix(ORDER_AMOUNT_IN_WEI, 10).unwrap(),
         "refund address should receive at least the original funded amount"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn order_workflow_refunds_external_custody_across_after_retry_exhaustion() {
+    let run = run_order_workflow(WorkflowOptions {
+        route: WorkflowRoute::AcrossBaseEthToEthereumUsdc,
+        velora_transaction_failures: EXECUTE_STEP_TEMPORAL_ATTEMPTS * 2,
+        expect_external_custody_across_refund: true,
+        ..WorkflowOptions::default()
+    })
+    .await;
+
+    assert_eq!(run.output.terminal_status, OrderTerminalStatus::Refunded);
+    let refunded = run
+        .db
+        .orders()
+        .get(run.order_id)
+        .await
+        .expect("load refunded order");
+    assert_eq!(refunded.status, RouterOrderStatus::Refunded);
+
+    let attempts = run
+        .db
+        .orders()
+        .get_execution_attempts(run.order_id)
+        .await
+        .expect("load execution attempts");
+    assert_eq!(attempts.len(), 3);
+    assert_eq!(
+        attempts[2].attempt_kind,
+        OrderExecutionAttemptKind::RefundRecovery
+    );
+    assert_eq!(attempts[2].status, OrderExecutionAttemptStatus::Completed);
+
+    let refund_steps = run
+        .db
+        .orders()
+        .get_execution_steps_for_attempt(attempts[2].id)
+        .await
+        .expect("load external refund attempt steps");
+    assert_eq!(refund_steps.len(), 1);
+    let refund_step = &refund_steps[0];
+    assert_eq!(refund_step.step_type, OrderExecutionStepType::AcrossBridge);
+    assert_eq!(refund_step.provider, "across");
+    assert_eq!(refund_step.status, OrderExecutionStepStatus::Completed);
+    assert!(
+        run.refund_address_balance >= U256::from_str_radix(ORDER_AMOUNT_IN_WEI, 10).unwrap(),
+        "refund address should receive the bridged external-custody balance"
     );
 }
 
@@ -690,6 +740,17 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
                     .await
                     .expect("send Across provider-operation hint signal");
             }
+            if options.expect_external_custody_across_refund {
+                signal_external_custody_refund_across_fill(
+                    &client,
+                    &db_for_workflow,
+                    &mocks,
+                    devnet_for_workflow,
+                    &seeded.funding_vault_address,
+                    order_id,
+                )
+                .await;
+            }
             let output: OrderWorkflowOutput = timeout(
                 ORDER_WORKFLOW_TEST_TIMEOUT,
                 handle.get_result(WorkflowGetResultOptions::default()),
@@ -958,6 +1019,140 @@ async fn wait_for_provider_operation(
         assert!(
             tokio::time::Instant::now() < deadline,
             "timed out waiting for provider operation {operation_type:?} on order {order_id}"
+        );
+        sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn signal_external_custody_refund_across_fill(
+    client: &Client,
+    db: &Database,
+    mocks: &MockIntegratorServer,
+    devnet: &RiftDevnet,
+    funding_vault_address: &str,
+    order_id: Uuid,
+) {
+    set_native_balance(
+        &devnet.base,
+        Address::from_str(funding_vault_address).expect("funding vault EVM address"),
+        U256::ZERO,
+    )
+    .await;
+    let parent_attempt = wait_for_execution_attempt(
+        db,
+        order_id,
+        OrderExecutionAttemptKind::PrimaryExecution,
+        2,
+        Some(OrderExecutionAttemptStatus::Failed),
+        Duration::from_secs(120),
+    )
+    .await;
+    let refund_attempt = wait_for_execution_attempt(
+        db,
+        order_id,
+        OrderExecutionAttemptKind::RefundRecovery,
+        3,
+        None,
+        Duration::from_secs(120),
+    )
+    .await;
+    let refund_operation = wait_for_provider_operation_for_attempt(
+        db,
+        order_id,
+        refund_attempt.id,
+        ProviderOperationType::AcrossBridge,
+        Duration::from_secs(120),
+    )
+    .await;
+    let refund_step = db
+        .orders()
+        .get_execution_step(
+            refund_operation
+                .execution_step_id
+                .expect("refund Across operation should be linked to a step"),
+        )
+        .await
+        .expect("load refund Across step");
+    let depositor = refund_step
+        .request
+        .get("depositor_address")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| Address::from_str(value).ok())
+        .expect("refund Across step should carry an EVM depositor_address");
+    wait_for_across_deposit_indexed(mocks, depositor, Duration::from_secs(90)).await;
+
+    let refund_workflow = client
+        .get_workflow_handle::<RefundWorkflow>(&refund_workflow_id(order_id, parent_attempt.id));
+    refund_workflow
+        .signal(
+            RefundWorkflow::provider_operation_hint,
+            ProviderOperationHintSignal {
+                order_id,
+                hint_id: Uuid::now_v7(),
+                provider_operation_id: Some(refund_operation.id),
+                provider: ProviderKind::Bridge,
+                hint_kind: ProviderHintKind::AcrossFill,
+                provider_ref: refund_operation.provider_ref,
+            },
+            WorkflowSignalOptions::default(),
+        )
+        .await
+        .expect("send refund Across provider-operation hint signal");
+}
+
+async fn wait_for_execution_attempt(
+    db: &Database,
+    order_id: Uuid,
+    attempt_kind: OrderExecutionAttemptKind,
+    attempt_index: i32,
+    status: Option<OrderExecutionAttemptStatus>,
+    max_wait: Duration,
+) -> OrderExecutionAttempt {
+    let deadline = tokio::time::Instant::now() + max_wait;
+    loop {
+        let attempts = db
+            .orders()
+            .get_execution_attempts(order_id)
+            .await
+            .expect("load execution attempts");
+        if let Some(attempt) = attempts.into_iter().find(|attempt| {
+            attempt.attempt_kind == attempt_kind
+                && attempt.attempt_index == attempt_index
+                && status.is_none_or(|status| attempt.status == status)
+        }) {
+            return attempt;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {attempt_kind:?} attempt {attempt_index} on order {order_id}"
+        );
+        sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn wait_for_provider_operation_for_attempt(
+    db: &Database,
+    order_id: Uuid,
+    attempt_id: Uuid,
+    operation_type: ProviderOperationType,
+    max_wait: Duration,
+) -> OrderProviderOperation {
+    let deadline = tokio::time::Instant::now() + max_wait;
+    loop {
+        let operations = db
+            .orders()
+            .get_provider_operations(order_id)
+            .await
+            .expect("load provider operations");
+        if let Some(operation) = operations.into_iter().find(|operation| {
+            operation.execution_attempt_id == Some(attempt_id)
+                && operation.operation_type == operation_type
+        }) {
+            return operation;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for provider operation {operation_type:?} on attempt {attempt_id}"
         );
         sleep(Duration::from_millis(250)).await;
     }
@@ -1335,6 +1530,15 @@ async fn send_native(devnet: &devnet::EthDevnet, recipient: Address, amount: U25
         .await
         .expect("native transfer receipt");
     assert!(receipt.status(), "native transfer reverted");
+}
+
+async fn set_native_balance(devnet: &devnet::EthDevnet, address: Address, amount: U256) {
+    let provider = ProviderBuilder::new().connect_http(devnet.anvil.endpoint_url());
+    provider
+        .anvil_set_balance(address, amount)
+        .await
+        .expect("set native balance");
+    mine_evm_confirmation_block(devnet).await;
 }
 
 async fn mine_evm_confirmation_block(devnet: &devnet::EthDevnet) {

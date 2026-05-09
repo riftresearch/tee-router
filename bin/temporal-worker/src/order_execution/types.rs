@@ -1,6 +1,7 @@
 use router_core::{
     models::{OrderExecutionLeg, OrderExecutionStep, RouterOrder},
-    services::ProviderExecutionState,
+    protocol::DepositAsset,
+    services::{asset_registry::CanonicalAsset, ProviderExecutionState},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -359,6 +360,12 @@ pub struct DiscoverSingleRefundPositionInput {
 pub struct SingleRefundPosition {
     pub position_kind: RecoverablePositionKind,
     pub owning_step_id: Option<WorkflowStepId>,
+    pub funding_vault_id: Option<WorkflowVaultId>,
+    pub custody_vault_id: Option<WorkflowVaultId>,
+    pub asset: DepositAsset,
+    pub amount: String,
+    pub hyperliquid_coin: Option<String>,
+    pub hyperliquid_canonical: Option<CanonicalAsset>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -615,7 +622,7 @@ pub enum ProviderHintKind {
 pub enum RecoverablePositionKind {
     FundingVault,
     ExternalCustody,
-    InternalCustody,
+    HyperliquidSpot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -12,6 +12,7 @@ use uuid::Uuid;
 use super::activities::{
     OrderActivities, ProviderObservationActivities, QuoteRefreshActivities, RefundActivities,
 };
+use super::refund_workflow_id;
 use super::types::{
     ClassifyStaleRunningStepInput, ClassifyStepFailureInput, ComposeRefreshedQuoteAttemptInput,
     DiscoverSingleRefundPositionInput, ExecuteStepInput, FinalizeOrderOrRefundInput,
@@ -634,6 +635,83 @@ async fn next_provider_operation_hint(
     }
 }
 
+async fn wait_for_refund_provider_completion_hint(
+    ctx: &mut WorkflowContext<RefundWorkflow>,
+    order_id: Uuid,
+    step_id: Uuid,
+    execution: StepExecuted,
+    db_activity_options: ActivityOptions,
+) -> WorkflowResult<()> {
+    loop {
+        let Some(signal) = next_refund_provider_operation_hint(ctx, order_id).await? else {
+            tracing::warn!(
+                order_id = %order_id,
+                step_id = %step_id,
+                event_name = "provider_operation_hint.wait_timeout",
+                "provider_operation_hint.wait_timeout"
+            );
+            return Err(anyhow::anyhow!(
+                "refund provider hint wait timed out for step {step_id}; PR7b polling fallback is deferred"
+            )
+            .into());
+        };
+        let verified = ctx
+            .start_activity(
+                ProviderObservationActivities::verify_provider_operation_hint,
+                VerifyProviderOperationHintInput {
+                    order_id,
+                    step_id,
+                    signal,
+                },
+                db_activity_options.clone(),
+            )
+            .await?;
+
+        match verified.decision {
+            ProviderOperationHintDecision::Accept => {
+                let _settled = ctx
+                    .start_activity(
+                        OrderActivities::settle_provider_step,
+                        SettleProviderStepInput {
+                            execution: execution.clone(),
+                        },
+                        db_activity_options.clone(),
+                    )
+                    .await?;
+                return Ok(());
+            }
+            ProviderOperationHintDecision::Reject | ProviderOperationHintDecision::Defer => {
+                tracing::info!(
+                    order_id = %order_id,
+                    step_id = %step_id,
+                    provider_operation_id = ?verified.provider_operation_id,
+                    decision = ?verified.decision,
+                    reason = ?verified.reason,
+                    event_name = "provider_operation_hint.ignored",
+                    "provider_operation_hint.ignored"
+                );
+            }
+        }
+    }
+}
+
+async fn next_refund_provider_operation_hint(
+    ctx: &mut WorkflowContext<RefundWorkflow>,
+    order_id: Uuid,
+) -> WorkflowResult<Option<ProviderOperationHintSignal>> {
+    if let Some(signal) = ctx.state_mut(|state| state.pop_provider_operation_hint(order_id)) {
+        return Ok(Some(signal));
+    }
+    temporalio_sdk::workflows::select! {
+        _ = ctx.wait_condition(move |state: &RefundWorkflow| state.has_provider_operation_hint(order_id)) => {
+            Ok(ctx.state_mut(|state| state.pop_provider_operation_hint(order_id)))
+        }
+        _ = ctx.timer(PROVIDER_HINT_WAIT_TIMEOUT) => {
+            Ok(None)
+        }
+    }
+}
+
 fn db_activity_options() -> ActivityOptions {
     ActivityOptions::with_start_to_close_timeout(Duration::from_secs(30))
         .retry_policy(RetryPolicy {
@@ -663,8 +741,8 @@ fn refund_execute_activity_options() -> ActivityOptions {
 
 fn refund_child_options(order_id: Uuid, parent_attempt_id: Uuid) -> ChildWorkflowOptions {
     ChildWorkflowOptions {
-        workflow_id: format!("order:{order_id}:refund:{parent_attempt_id}"),
-        run_timeout: Some(Duration::from_secs(240)),
+        workflow_id: refund_workflow_id(order_id, parent_attempt_id),
+        run_timeout: Some(PROVIDER_HINT_WAIT_TIMEOUT + Duration::from_secs(15 * 60)),
         task_timeout: Some(Duration::from_secs(30)),
         ..Default::default()
     }
@@ -684,7 +762,10 @@ fn quote_refresh_child_options(order_id: Uuid, failed_step_id: Uuid) -> ChildWor
 /// Scar tissue: §5 retry/refund decision, §8 position discovery, and §9 refund tree.
 #[workflow]
 #[derive(Default)]
-pub struct RefundWorkflow;
+pub struct RefundWorkflow {
+    order_id: Option<Uuid>,
+    provider_operation_hints: Vec<ProviderOperationHintSignal>,
+}
 
 #[workflow_methods]
 impl RefundWorkflow {
@@ -693,6 +774,9 @@ impl RefundWorkflow {
         ctx: &mut WorkflowContext<Self>,
         input: RefundWorkflowInput,
     ) -> WorkflowResult<RefundWorkflowOutput> {
+        ctx.state_mut(|state| {
+            state.order_id = Some(input.order_id);
+        });
         if input.trigger != RefundTrigger::FailedAttempt {
             return Err(anyhow::anyhow!(
                 "PR6a RefundWorkflow only handles failed-attempt triggers"
@@ -868,11 +952,21 @@ impl RefundWorkflow {
                 .start_activity(
                     OrderActivities::settle_provider_step,
                     SettleProviderStepInput {
-                        execution: executed,
+                        execution: executed.clone(),
                     },
                     db_activity_options.clone(),
                 )
                 .await?;
+            if executed.outcome == StepExecutionOutcome::Waiting {
+                wait_for_refund_provider_completion_hint(
+                    ctx,
+                    input.order_id,
+                    step.step_id,
+                    executed,
+                    db_activity_options.clone(),
+                )
+                .await?;
+            }
         }
 
         let _finalized = ctx
@@ -892,6 +986,40 @@ impl RefundWorkflow {
             order_id: input.order_id,
             terminal_status: RefundTerminalStatus::Refunded,
         })
+    }
+
+    /// Scar tissue: §10 provider operation hint flow for refund transition steps.
+    #[signal]
+    pub fn provider_operation_hint(
+        &mut self,
+        _ctx: &mut SyncWorkflowContext<Self>,
+        signal: ProviderOperationHintSignal,
+    ) {
+        if self
+            .order_id
+            .map_or(true, |order_id| order_id == signal.order_id)
+        {
+            self.provider_operation_hints.push(signal);
+        }
+    }
+}
+
+impl RefundWorkflow {
+    fn has_provider_operation_hint(&self, order_id: Uuid) -> bool {
+        self.provider_operation_hints
+            .iter()
+            .any(|signal| signal.order_id == order_id)
+    }
+
+    fn pop_provider_operation_hint(
+        &mut self,
+        order_id: Uuid,
+    ) -> Option<ProviderOperationHintSignal> {
+        let index = self
+            .provider_operation_hints
+            .iter()
+            .position(|signal| signal.order_id == order_id)?;
+        Some(self.provider_operation_hints.remove(index))
     }
 }
 
