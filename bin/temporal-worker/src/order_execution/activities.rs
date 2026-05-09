@@ -1570,6 +1570,77 @@ fn request_uuid_field(
     })
 }
 
+async fn hydrate_cctp_receive_request(
+    deps: &OrderActivityDeps,
+    step: &OrderExecutionStep,
+) -> Result<Value, ActivityError> {
+    let burn_transition_decl_id = step
+        .request
+        .get("burn_transition_decl_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| activity_error("CCTP receive step missing burn_transition_decl_id"))?;
+    let operations = deps
+        .db
+        .orders()
+        .get_provider_operations(step.order_id)
+        .await
+        .map_err(activity_error_from_display)?;
+    let operation = operations.into_iter().rev().find(|operation| {
+        operation.operation_type == ProviderOperationType::CctpBridge
+            && operation.status == ProviderOperationStatus::Completed
+            && operation
+                .request
+                .get("transition_decl_id")
+                .and_then(Value::as_str)
+                == Some(burn_transition_decl_id)
+    });
+    let Some(operation) = operation else {
+        return Err(activity_error(format!(
+            "CCTP receive step could not find completed burn operation for transition {burn_transition_decl_id}"
+        )));
+    };
+    let cctp_state = operation
+        .observed_state
+        .get("provider_observed_state")
+        .unwrap_or(&operation.observed_state);
+    if let Some(decoded_amount) = cctp_state
+        .get("decoded_message_body")
+        .and_then(|body| body.get("amount"))
+        .and_then(Value::as_str)
+    {
+        let planned_amount = step
+            .request
+            .get("amount")
+            .and_then(Value::as_str)
+            .ok_or_else(|| activity_error("CCTP receive step missing amount"))?;
+        if decoded_amount != planned_amount {
+            return Err(activity_error(format!(
+                "CCTP receive amount {planned_amount} does not match attested burn amount {decoded_amount}"
+            )));
+        }
+    }
+    let message = cctp_state
+        .get("message")
+        .and_then(Value::as_str)
+        .ok_or_else(|| activity_error("completed CCTP burn operation missing attested message"))?;
+    let attestation = cctp_state
+        .get("attestation")
+        .and_then(Value::as_str)
+        .ok_or_else(|| activity_error("completed CCTP burn operation missing attestation"))?;
+    let mut request = step.request.clone();
+    set_json_value(&mut request, "message", json!(message));
+    set_json_value(&mut request, "attestation", json!(attestation));
+    set_json_value(
+        &mut request,
+        "burn_provider_operation_id",
+        json!(operation.id),
+    );
+    if let Some(tx_hash) = operation.provider_ref {
+        set_json_value(&mut request, "burn_tx_hash", json!(tx_hash));
+    }
+    Ok(request)
+}
+
 async fn execute_running_step(
     deps: &OrderActivityDeps,
     step: &OrderExecutionStep,
@@ -1630,7 +1701,8 @@ async fn execute_running_step(
                 .map_err(activity_error)?
         }
         OrderExecutionStepType::CctpReceive => {
-            let request = BridgeExecutionRequest::cctp_receive_from_value(&step.request)
+            let request_json = hydrate_cctp_receive_request(deps, step).await?;
+            let request = BridgeExecutionRequest::cctp_receive_from_value(&request_json)
                 .map_err(activity_error)?;
             deps.action_providers
                 .bridge(&step.provider)
@@ -2754,13 +2826,14 @@ async fn materialize_external_custody_refund_plan(
             &order, &vault, &asset, &amount, now,
         ))
     } else {
-        external_custody_across_refund_steps(deps, &order, &vault, &asset, &amount, now).await?
+        external_custody_refund_back_steps(deps, &order, &vault, &asset, &amount, now).await?
     };
-    let Some((legs, steps)) = maybe_plan else {
+    let Some((legs, mut steps)) = maybe_plan else {
         return Ok(refund_plan_untenable(
             RefundUntenableReason::RefundRecoverablePositionDisappearedAfterValidation,
         ));
     };
+    steps = hydrate_destination_execution_steps(deps, input.order_id, steps).await?;
     let record = deps
         .db
         .orders()
@@ -3046,10 +3119,18 @@ fn refund_path_compatible_with_position(
     };
     match position_kind {
         RecoverablePositionKind::FundingVault => false,
-        RecoverablePositionKind::ExternalCustody => {
-            first.kind == MarketOrderTransitionKind::AcrossBridge
-                || deferred_pr6b3_refund_transition_compatibility()
-        }
+        RecoverablePositionKind::ExternalCustody => match first.kind {
+            MarketOrderTransitionKind::AcrossBridge | MarketOrderTransitionKind::CctpBridge => true,
+            MarketOrderTransitionKind::UnitDeposit
+            | MarketOrderTransitionKind::UniversalRouterSwap => {
+                deferred_pr6b4_external_custody_refund_transitions()
+            }
+            MarketOrderTransitionKind::HyperliquidBridgeDeposit
+            | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
+                deferred_pr6b5_external_custody_hyperliquid_refund_transitions()
+            }
+            _ => deferred_pr6b6_refund_transition_compatibility(),
+        },
         RecoverablePositionKind::HyperliquidSpot => matches!(
             first.kind,
             MarketOrderTransitionKind::HyperliquidTrade | MarketOrderTransitionKind::UnitWithdrawal
@@ -3251,7 +3332,14 @@ fn external_custody_direct_refund_steps(
     (vec![leg], vec![step])
 }
 
-async fn external_custody_across_refund_steps(
+#[derive(Clone)]
+struct RefundQuotedPath {
+    path: TransitionPath,
+    amount_out: String,
+    legs: Vec<QuoteLeg>,
+}
+
+async fn external_custody_refund_back_steps(
     deps: &OrderActivityDeps,
     order: &RouterOrder,
     vault: &CustodyVault,
@@ -3259,12 +3347,122 @@ async fn external_custody_across_refund_steps(
     amount: &str,
     planned_at: chrono::DateTime<Utc>,
 ) -> Result<Option<(Vec<OrderExecutionLeg>, Vec<OrderExecutionStep>)>, ActivityError> {
-    let transition = direct_across_refund_transition(deps, asset, &order.source_asset)
-        .unwrap_or_else(|| deferred_pr6b3_refund_transitions());
+    let Some(quoted_path) =
+        best_external_custody_refund_quote(deps, order, vault, asset, amount).await?
+    else {
+        return Ok(None);
+    };
+    let Some(transition) = quoted_path.path.transitions.first() else {
+        return Ok(None);
+    };
+    let mut steps = match transition.kind {
+        MarketOrderTransitionKind::AcrossBridge => {
+            let leg = refund_take_one_leg(
+                &quoted_path.legs,
+                transition,
+                OrderExecutionStepType::AcrossBridge,
+            )?;
+            vec![refund_transition_across_bridge_step(
+                order, vault, transition, &leg, true, planned_at,
+            )?]
+        }
+        MarketOrderTransitionKind::CctpBridge => {
+            let burn_leg = refund_take_one_leg(
+                &quoted_path.legs,
+                transition,
+                OrderExecutionStepType::CctpBurn,
+            )?;
+            let receive_leg = refund_take_one_leg(
+                &quoted_path.legs,
+                transition,
+                OrderExecutionStepType::CctpReceive,
+            )?;
+            refund_transition_cctp_bridge_steps(
+                order,
+                vault,
+                transition,
+                &burn_leg,
+                &receive_leg,
+                true,
+                planned_at,
+            )?
+        }
+        _ => deferred_pr6b4_external_custody_refund_transitions(),
+    };
+    let leg =
+        refund_execution_leg_from_quote_legs(order, transition, &quoted_path.legs, 0, planned_at)?;
+    let leg_id = leg.id;
+    for step in &mut steps {
+        step.execution_leg_id = Some(leg_id);
+    }
+    Ok(Some((vec![leg], steps)))
+}
+
+async fn best_external_custody_refund_quote(
+    deps: &OrderActivityDeps,
+    order: &RouterOrder,
+    vault: &CustodyVault,
+    asset: &DepositAsset,
+    amount: &str,
+) -> Result<Option<RefundQuotedPath>, ActivityError> {
+    let mut paths = deps
+        .action_providers
+        .asset_registry()
+        .select_transition_paths_between(
+            MarketOrderNode::External(asset.clone()),
+            MarketOrderNode::External(order.source_asset.clone()),
+            1,
+        )
+        .into_iter()
+        .filter(|path| {
+            refund_path_compatible_with_position(RecoverablePositionKind::ExternalCustody, path)
+        })
+        .collect::<Vec<_>>();
+    paths.sort_by(|left, right| left.id.cmp(&right.id));
+
+    let mut best = None;
+    for path in paths {
+        let path_id = path.id.clone();
+        match quote_external_custody_refund_path(deps, order, vault, amount, path).await {
+            Ok(Some(quoted)) => {
+                best = choose_better_refund_quote(quoted, best)?;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(
+                    order_id = %order.id,
+                    path_id,
+                    error = ?err,
+                    "refund transition-path quote failed"
+                );
+            }
+        }
+    }
+    Ok(best)
+}
+
+async fn quote_external_custody_refund_path(
+    deps: &OrderActivityDeps,
+    order: &RouterOrder,
+    vault: &CustodyVault,
+    amount: &str,
+    path: TransitionPath,
+) -> Result<Option<RefundQuotedPath>, ActivityError> {
+    let Some(transition) = path.transitions.first() else {
+        return Ok(None);
+    };
+    if path.transitions.len() != 1 {
+        return Ok(None);
+    }
     let bridge = deps
         .action_providers
-        .bridge(ProviderId::Across.as_str())
-        .ok_or_else(|| activity_error("Across bridge provider is not configured"))?;
+        .bridge(transition.provider.as_str())
+        .ok_or_else(|| {
+            activity_error(format!(
+                "{} bridge provider is not configured",
+                transition.provider.as_str()
+            ))
+        })?;
     let quote = bridge
         .quote_bridge(BridgeQuoteRequest {
             source_asset: transition.input.asset.clone(),
@@ -3279,72 +3477,197 @@ async fn external_custody_across_refund_steps(
         })
         .await
         .map_err(activity_error)?;
-    let Some(quote) = quote else { return Ok(None) };
-    let quote_leg = QuoteLeg::new(QuoteLegSpec {
-        transition_decl_id: &transition.id,
-        transition_kind: transition.kind,
-        provider: transition.provider,
-        input_asset: &transition.input.asset,
-        output_asset: &transition.output.asset,
-        amount_in: &quote.amount_in,
-        amount_out: &quote.amount_out,
-        expires_at: quote.expires_at,
-        raw: quote.provider_quote.clone(),
-    });
-    let leg = OrderExecutionLeg {
-        id: Uuid::now_v7(),
-        order_id: order.id,
-        execution_attempt_id: None,
-        transition_decl_id: Some(transition.id.clone()),
-        leg_index: 0,
-        leg_type: OrderExecutionStepType::AcrossBridge
-            .to_db_string()
-            .to_string(),
-        provider: ProviderId::Across.as_str().to_string(),
-        status: OrderExecutionStepStatus::Planned,
-        input_asset: transition.input.asset.clone(),
-        output_asset: transition.output.asset.clone(),
-        amount_in: quote.amount_in.clone(),
-        expected_amount_out: quote.amount_out.clone(),
-        min_amount_out: None,
-        actual_amount_in: None,
-        actual_amount_out: None,
-        started_at: None,
-        completed_at: None,
-        provider_quote_expires_at: Some(quote.expires_at),
-        details: json!({
-            "schema_version": 1,
-            "refund_kind": "external_custody_across_bridge",
-            "transition_kind": transition.kind.as_str(),
-            "quote_leg_count": 1,
-            "quote_legs": [quote_leg],
-            "action_step_types": [OrderExecutionStepType::AcrossBridge.to_db_string()],
-        }),
-        usd_valuation: json!({}),
-        created_at: planned_at,
-        updated_at: planned_at,
+    let Some(quote) = quote else {
+        return Ok(None);
     };
-    let step = OrderExecutionStep {
-        id: Uuid::now_v7(),
+    let legs = refund_bridge_quote_legs(transition, &quote)?;
+    Ok(Some(RefundQuotedPath {
+        path,
+        amount_out: quote.amount_out,
+        legs,
+    }))
+}
+
+fn choose_better_refund_quote(
+    candidate: RefundQuotedPath,
+    current: Option<RefundQuotedPath>,
+) -> Result<Option<RefundQuotedPath>, ActivityError> {
+    let Some(current) = current else {
+        validate_refund_amount("refund.amount_out", &candidate.amount_out)?;
+        return Ok(Some(candidate));
+    };
+    if refund_amount_gt(&candidate.amount_out, &current.amount_out)? {
+        Ok(Some(candidate))
+    } else {
+        Ok(Some(current))
+    }
+}
+
+fn refund_amount_gt(candidate: &str, current: &str) -> Result<bool, ActivityError> {
+    let candidate = normalize_refund_amount("refund.amount_out", candidate)?;
+    let current = normalize_refund_amount("refund.amount_out", current)?;
+    Ok(candidate.len() > current.len() || candidate.len() == current.len() && candidate > current)
+}
+
+fn validate_refund_amount(field: &'static str, value: &str) -> Result<(), ActivityError> {
+    normalize_refund_amount(field, value).map(|_| ())
+}
+
+fn normalize_refund_amount<'a>(
+    field: &'static str,
+    value: &'a str,
+) -> Result<&'a str, ActivityError> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(activity_error(format!(
+            "invalid amount for {field}: expected unsigned decimal integer"
+        )));
+    }
+    let normalized = value.trim_start_matches('0');
+    Ok(if normalized.is_empty() {
+        "0"
+    } else {
+        normalized
+    })
+}
+
+fn refund_bridge_quote_legs(
+    transition: &TransitionDecl,
+    quote: &BridgeQuote,
+) -> Result<Vec<QuoteLeg>, ActivityError> {
+    match transition.kind {
+        MarketOrderTransitionKind::AcrossBridge => Ok(vec![QuoteLeg::new(QuoteLegSpec {
+            transition_decl_id: &transition.id,
+            transition_kind: transition.kind,
+            provider: transition.provider,
+            input_asset: &transition.input.asset,
+            output_asset: &transition.output.asset,
+            amount_in: &quote.amount_in,
+            amount_out: &quote.amount_out,
+            expires_at: quote.expires_at,
+            raw: quote.provider_quote.clone(),
+        })]),
+        MarketOrderTransitionKind::CctpBridge => {
+            let burn = QuoteLeg::new(QuoteLegSpec {
+                transition_decl_id: &transition.id,
+                transition_kind: transition.kind,
+                provider: transition.provider,
+                input_asset: &transition.input.asset,
+                output_asset: &transition.output.asset,
+                amount_in: &quote.amount_in,
+                amount_out: &quote.amount_out,
+                expires_at: quote.expires_at,
+                raw: cctp_refund_quote_leg_raw(
+                    &quote.provider_quote,
+                    OrderExecutionStepType::CctpBurn,
+                ),
+            });
+            let receive = QuoteLeg::new(QuoteLegSpec {
+                transition_decl_id: &transition.id,
+                transition_kind: transition.kind,
+                provider: transition.provider,
+                input_asset: &transition.output.asset,
+                output_asset: &transition.output.asset,
+                amount_in: &quote.amount_out,
+                amount_out: &quote.amount_out,
+                expires_at: quote.expires_at,
+                raw: cctp_refund_quote_leg_raw(
+                    &quote.provider_quote,
+                    OrderExecutionStepType::CctpReceive,
+                ),
+            })
+            .with_child_transition_id(format!("{}:receive", transition.id))
+            .with_execution_step_type(OrderExecutionStepType::CctpReceive);
+            Ok(vec![burn, receive])
+        }
+        _ => deferred_pr6b4_external_custody_refund_transitions(),
+    }
+}
+
+fn cctp_refund_quote_leg_raw(provider_quote: &Value, step_type: OrderExecutionStepType) -> Value {
+    let mut raw = provider_quote.clone();
+    set_json_value(&mut raw, "bridge_kind", json!("cctp_bridge"));
+    set_json_value(
+        &mut raw,
+        "execution_step_type",
+        json!(step_type.to_db_string()),
+    );
+    set_json_value(
+        &mut raw,
+        "kind",
+        json!(match step_type {
+            OrderExecutionStepType::CctpBurn => "cctp_burn",
+            OrderExecutionStepType::CctpReceive => "cctp_receive",
+            _ => "cctp_bridge",
+        }),
+    );
+    raw
+}
+
+fn refund_take_one_leg(
+    legs: &[QuoteLeg],
+    transition: &TransitionDecl,
+    step_type: OrderExecutionStepType,
+) -> Result<QuoteLeg, ActivityError> {
+    let mut matches = legs
+        .iter()
+        .filter(|leg| {
+            leg.parent_transition_id() == transition.id
+                && leg.transition_kind == transition.kind
+                && leg.execution_step_type == step_type
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(activity_error(format!(
+            "refund transition {} ({}) expected exactly one {:?} leg, found {}",
+            transition.id,
+            transition.kind.as_str(),
+            step_type,
+            matches.len()
+        )));
+    }
+    Ok(matches.remove(0))
+}
+
+fn refund_transition_across_bridge_step(
+    order: &RouterOrder,
+    vault: &CustodyVault,
+    transition: &TransitionDecl,
+    leg: &QuoteLeg,
+    is_final: bool,
+    planned_at: chrono::DateTime<Utc>,
+) -> Result<OrderExecutionStep, ActivityError> {
+    let provider = refund_leg_provider(leg, transition)?.as_str().to_string();
+    let amount_in = leg.amount_in.clone();
+    Ok(refund_planned_step(RefundPlannedStepSpec {
         order_id: order.id,
-        execution_attempt_id: None,
-        execution_leg_id: Some(leg.id),
         transition_decl_id: Some(transition.id.clone()),
         step_index: 0,
         step_type: OrderExecutionStepType::AcrossBridge,
-        provider: ProviderId::Across.as_str().to_string(),
-        status: OrderExecutionStepStatus::Planned,
+        provider,
         input_asset: Some(transition.input.asset.clone()),
         output_asset: Some(transition.output.asset.clone()),
-        amount_in: Some(quote.amount_in.clone()),
+        amount_in: Some(amount_in.clone()),
         min_amount_out: None,
-        tx_hash: None,
         provider_ref: Some(format!("order:{}:external-refund", order.id)),
-        idempotency_key: None,
-        attempt_count: 0,
-        next_attempt_at: None,
-        started_at: None,
-        completed_at: None,
+        request: json!({
+            "order_id": order.id,
+            "origin_chain_id": transition.input.asset.chain.as_str(),
+            "destination_chain_id": transition.output.asset.chain.as_str(),
+            "input_asset": transition.input.asset.asset.as_str(),
+            "output_asset": transition.output.asset.asset.as_str(),
+            "amount": amount_in,
+            "recipient": if is_final { json!(order.refund_address) } else { Value::Null },
+            "recipient_custody_vault_role": if is_final { Value::Null } else { json!(CustodyVaultRole::DestinationExecution.to_db_string()) },
+            "recipient_custody_vault_id": null,
+            "refund_address": &vault.address,
+            "refund_custody_vault_id": vault.id,
+            "refund_custody_vault_role": vault.role.to_db_string(),
+            "partial_fills_enabled": false,
+            "depositor_address": &vault.address,
+            "depositor_custody_vault_id": vault.id,
+            "depositor_custody_vault_role": vault.role.to_db_string(),
+        }),
         details: json!({
             "schema_version": 1,
             "refund_kind": "external_custody_across_bridge",
@@ -3355,51 +3678,121 @@ async fn external_custody_across_refund_steps(
             "refund_custody_vault_id": vault.id,
             "refund_custody_vault_address": &vault.address,
             "refund_custody_vault_role": vault.role.to_db_string(),
-            "recipient_address": &order.refund_address,
+            "recipient_address": if is_final { json!(&order.refund_address) } else { Value::Null },
         }),
+        planned_at,
+    }))
+}
+
+fn refund_transition_cctp_bridge_steps(
+    order: &RouterOrder,
+    vault: &CustodyVault,
+    transition: &TransitionDecl,
+    burn_leg: &QuoteLeg,
+    receive_leg: &QuoteLeg,
+    is_final: bool,
+    planned_at: chrono::DateTime<Utc>,
+) -> Result<Vec<OrderExecutionStep>, ActivityError> {
+    let provider = refund_leg_provider(burn_leg, transition)?
+        .as_str()
+        .to_string();
+    let receive_provider = refund_leg_provider(receive_leg, transition)?;
+    if receive_provider.as_str() != provider {
+        return Err(activity_error(format!(
+            "CCTP receive leg provider {} does not match burn leg provider {} for transition {}",
+            receive_provider.as_str(),
+            provider,
+            transition.id
+        )));
+    }
+    let amount_in = burn_leg.amount_in.clone();
+    let amount_out = receive_leg.amount_out.clone();
+    let max_fee = burn_leg
+        .raw
+        .get("max_fee")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            activity_error(format!(
+                "CCTP burn leg {} missing raw.max_fee",
+                burn_leg.transition_decl_id
+            ))
+        })?
+        .to_string();
+    let burn = refund_planned_step(RefundPlannedStepSpec {
+        order_id: order.id,
+        transition_decl_id: Some(burn_leg.transition_decl_id.clone()),
+        step_index: 0,
+        step_type: OrderExecutionStepType::CctpBurn,
+        provider: provider.clone(),
+        input_asset: Some(transition.input.asset.clone()),
+        output_asset: Some(transition.output.asset.clone()),
+        amount_in: Some(amount_in.clone()),
+        min_amount_out: None,
+        provider_ref: Some(format!("order:{}:external-refund:cctp", order.id)),
         request: json!({
             "order_id": order.id,
-            "origin_chain_id": transition.input.asset.chain.as_str(),
+            "transition_decl_id": transition.id,
+            "source_chain_id": transition.input.asset.chain.as_str(),
             "destination_chain_id": transition.output.asset.chain.as_str(),
             "input_asset": transition.input.asset.asset.as_str(),
             "output_asset": transition.output.asset.asset.as_str(),
-            "amount": quote.amount_in,
-            "recipient": &order.refund_address,
-            "recipient_custody_vault_role": null,
+            "amount": amount_in,
+            "recipient_address": if is_final { json!(order.refund_address) } else { Value::Null },
             "recipient_custody_vault_id": null,
-            "refund_address": &vault.address,
-            "refund_custody_vault_id": vault.id,
-            "refund_custody_vault_role": vault.role.to_db_string(),
-            "partial_fills_enabled": false,
-            "depositor_address": &vault.address,
-            "depositor_custody_vault_id": vault.id,
-            "depositor_custody_vault_role": vault.role.to_db_string(),
+            "recipient_custody_vault_role": if is_final { Value::Null } else { json!(CustodyVaultRole::DestinationExecution.to_db_string()) },
+            "source_custody_vault_id": vault.id,
+            "source_custody_vault_address": &vault.address,
+            "source_custody_vault_role": vault.role.to_db_string(),
+            "max_fee": max_fee,
         }),
-        response: json!({}),
-        error: json!({}),
-        usd_valuation: json!({}),
-        created_at: planned_at,
-        updated_at: planned_at,
-    };
-    Ok(Some((vec![leg], vec![step])))
-}
-
-fn direct_across_refund_transition(
-    deps: &OrderActivityDeps,
-    source: &DepositAsset,
-    destination: &DepositAsset,
-) -> Option<TransitionDecl> {
-    deps.action_providers
-        .asset_registry()
-        .select_transition_paths_between(
-            MarketOrderNode::External(source.clone()),
-            MarketOrderNode::External(destination.clone()),
-            1,
-        )
-        .into_iter()
-        .filter(|path| path.transitions.len() == 1)
-        .flat_map(|path| path.transitions.into_iter())
-        .find(|transition| transition.kind == MarketOrderTransitionKind::AcrossBridge)
+        details: json!({
+            "schema_version": 1,
+            "transition_kind": transition.kind.as_str(),
+            "refund_kind": "external_custody_cctp_bridge",
+            "source_custody_vault_role": vault.role.to_db_string(),
+            "source_custody_vault_status": "bound",
+            "recipient_custody_vault_role": if is_final { Value::Null } else { json!(CustodyVaultRole::DestinationExecution.to_db_string()) },
+            "recipient_custody_vault_status": if is_final { Value::Null } else { json!("pending_derivation") },
+            "receive_step_index": 1,
+        }),
+        planned_at,
+    });
+    let receive = refund_planned_step(RefundPlannedStepSpec {
+        order_id: order.id,
+        transition_decl_id: Some(receive_leg.transition_decl_id.clone()),
+        step_index: 1,
+        step_type: OrderExecutionStepType::CctpReceive,
+        provider,
+        input_asset: Some(transition.output.asset.clone()),
+        output_asset: Some(transition.output.asset.clone()),
+        amount_in: Some(amount_out.clone()),
+        min_amount_out: None,
+        provider_ref: Some(format!("order:{}:external-refund:cctp", order.id)),
+        request: json!({
+            "order_id": order.id,
+            "burn_transition_decl_id": transition.id,
+            "destination_chain_id": transition.output.asset.chain.as_str(),
+            "output_asset": transition.output.asset.asset.as_str(),
+            "amount": amount_out,
+            "source_custody_vault_id": null,
+            "source_custody_vault_address": null,
+            "source_custody_vault_role": CustodyVaultRole::DestinationExecution.to_db_string(),
+            "recipient_address": if is_final { json!(order.refund_address) } else { Value::Null },
+            "recipient_custody_vault_id": null,
+            "message": "",
+            "attestation": "",
+        }),
+        details: json!({
+            "schema_version": 1,
+            "transition_kind": transition.kind.as_str(),
+            "refund_kind": "external_custody_cctp_bridge",
+            "burn_step_index": 0,
+            "source_custody_vault_role": CustodyVaultRole::DestinationExecution.to_db_string(),
+            "source_custody_vault_status": "pending_derivation",
+        }),
+        planned_at,
+    });
+    Ok(vec![burn, receive])
 }
 
 #[derive(Debug, Clone)]
@@ -3837,17 +4230,22 @@ fn decimal_string_to_raw_digits(value: &str, decimals: u8) -> Result<String, Str
     Ok(if digits.is_empty() { "0" } else { digits }.to_string())
 }
 
-/// PR6b3 deferred: materialize CCTP, UnitDeposit, Hyperliquid bridge, UniversalRouter,
-/// and multi-hop refund transitions outside the PR6b1/PR6b2 first-hop slices.
+/// PR6b4 deferred: ExternalCustody UnitDeposit and UniversalRouter refund transitions.
 #[allow(dead_code)]
-fn deferred_pr6b3_refund_transitions() -> ! {
-    todo!("PR6b3: non-first-hop and non-shipped refund transitions")
+fn deferred_pr6b4_external_custody_refund_transitions() -> ! {
+    todo!("PR6b4: ExternalCustody UnitDeposit and UniversalRouter refund transitions")
 }
 
-/// PR6b3 deferred: generalize transition compatibility gates across all source handles.
+/// PR6b5 deferred: ExternalCustody Hyperliquid bridge role-gated refund transitions.
 #[allow(dead_code)]
-fn deferred_pr6b3_refund_transition_compatibility() -> ! {
-    todo!("PR6b3: general refund path compatibility gate")
+fn deferred_pr6b5_external_custody_hyperliquid_refund_transitions() -> ! {
+    todo!("PR6b5: ExternalCustody Hyperliquid bridge refund transitions")
+}
+
+/// PR6b6 deferred: multi-hop refund continuations and generalized compatibility gates.
+#[allow(dead_code)]
+fn deferred_pr6b6_refund_transition_compatibility() -> ! {
+    todo!("PR6b6: multi-hop refund transition compatibility gate")
 }
 
 #[derive(Clone, Default)]
