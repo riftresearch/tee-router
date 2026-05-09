@@ -3,7 +3,12 @@
 // Activity function constants are registered before the later rewrite slices invoke them.
 use std::{str::FromStr, sync::Arc};
 
-use alloy::primitives::U256;
+use alloy::{
+    primitives::{Address, FixedBytes, U256},
+    rpc::types::Filter,
+    sol,
+    sol_types::SolEvent,
+};
 use chains::{ChainRegistry, UserDepositCandidateStatus};
 use chrono::Utc;
 use router_core::{
@@ -75,6 +80,26 @@ const MAX_EXECUTION_ATTEMPTS: i32 = 2;
 const MAX_STALE_QUOTE_REFRESHES_PER_ORDER_EXECUTION: usize = 8;
 const REFUND_PATH_MAX_DEPTH: usize = 5;
 const REFUND_HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW: u64 = 1_000_000;
+
+// Canonical Across V3 `FundsDeposited` event used for scar §11 lost-intent
+// recovery. Keep this byte-for-byte aligned with router-core's Across provider.
+sol! {
+    event FundsDeposited(
+        bytes32 inputToken,
+        bytes32 outputToken,
+        uint256 inputAmount,
+        uint256 outputAmount,
+        uint256 indexed destinationChainId,
+        uint256 indexed depositId,
+        uint32 quoteTimestamp,
+        uint32 fillDeadline,
+        uint32 exclusivityDeadline,
+        bytes32 indexed depositor,
+        bytes32 recipient,
+        bytes32 exclusiveRelayer,
+        bytes message
+    );
+}
 
 #[derive(Clone)]
 pub struct OrderActivityDeps {
@@ -6404,10 +6429,39 @@ impl ProviderObservationActivities {
     /// Scar tissue: §11 Across on-chain log recovery.
     #[activity]
     pub async fn recover_across_onchain_log(
+        self: Arc<Self>,
         _ctx: ActivityContext,
-        _input: RecoverAcrossOnchainLogInput,
+        input: RecoverAcrossOnchainLogInput,
     ) -> Result<AcrossOnchainLogRecovered, ActivityError> {
-        todo!("PR7c: recover lost across intent from on-chain logs")
+        let deps = self.deps()?;
+        let operation = deps
+            .db
+            .orders()
+            .get_provider_operation(input.provider_operation_id)
+            .await
+            .map_err(activity_error_from_display)?;
+        if operation.order_id != input.order_id {
+            return Err(activity_error(format!(
+                "provider operation {} belongs to order {}, not {}",
+                operation.id, operation.order_id, input.order_id
+            )));
+        }
+
+        let recovered = recover_across_operation_from_checkpoint(&deps, operation).await?;
+        if recovered
+            .as_ref()
+            .and_then(|operation| operation.provider_ref.as_deref())
+            .is_some_and(is_decimal_u256)
+        {
+            Ok(AcrossOnchainLogRecovered {
+                provider_operation_id: input.provider_operation_id,
+            })
+        } else {
+            Err(activity_error(format!(
+                "Across provider operation {} has no recoverable deposit log yet",
+                input.provider_operation_id
+            )))
+        }
     }
 
     /// Scar tissue: §12 Hyperliquid trade timeout cancel.
@@ -6574,6 +6628,232 @@ fn provider_hints_polled(verified: ProviderOperationHintVerified) -> ProviderOpe
     }
 }
 
+#[derive(Debug, Clone)]
+struct RecoveredAcrossDeposit {
+    deposit_id: String,
+    deposit_tx_hash: String,
+}
+
+async fn recover_across_operation_from_checkpoint(
+    deps: &OrderActivityDeps,
+    operation: OrderProviderOperation,
+) -> Result<Option<OrderProviderOperation>, ActivityError> {
+    if operation.operation_type != ProviderOperationType::AcrossBridge {
+        return Ok(Some(operation));
+    }
+    if operation
+        .provider_ref
+        .as_deref()
+        .is_some_and(is_decimal_u256)
+    {
+        return Ok(Some(operation));
+    }
+    if operation.response.get("kind").and_then(Value::as_str) != Some("provider_receipt_checkpoint")
+    {
+        return Ok(None);
+    }
+
+    let Some(step_id) = operation.execution_step_id else {
+        return Ok(None);
+    };
+    let step = deps
+        .db
+        .orders()
+        .get_execution_step(step_id)
+        .await
+        .map_err(activity_error_from_display)?;
+    let Some(recovered) = recover_across_deposit_from_origin_logs(deps, &operation, &step).await?
+    else {
+        return Ok(None);
+    };
+
+    let mut observed_state = json!({
+        "source": "temporal_across_deposit_log_recovery",
+        "deposit_id": &recovered.deposit_id,
+        "deposit_tx_hash": &recovered.deposit_tx_hash,
+        "router_recovery": {
+            "kind": "across_deposit_log_recovery",
+            "deposit_tx_hash": &recovered.deposit_tx_hash,
+            "source_provider_ref": &operation.provider_ref,
+        },
+    });
+    if !is_empty_json_object(&operation.observed_state) {
+        observed_state["previous_observed_state"] = operation.observed_state.clone();
+    }
+
+    let (updated, _) = deps
+        .db
+        .orders()
+        .update_provider_operation_status(
+            operation.id,
+            operation.status,
+            Some(recovered.deposit_id),
+            observed_state,
+            None,
+            Utc::now(),
+        )
+        .await
+        .map_err(activity_error_from_display)?;
+    tracing::info!(
+        order_id = %updated.order_id,
+        provider_operation_id = %updated.id,
+        step_id = ?updated.execution_step_id,
+        event_name = "provider_operation.across_onchain_log_recovered",
+        "provider_operation.across_onchain_log_recovered"
+    );
+    Ok(Some(updated))
+}
+
+async fn recover_across_deposit_from_origin_logs(
+    deps: &OrderActivityDeps,
+    operation: &OrderProviderOperation,
+    step: &OrderExecutionStep,
+) -> Result<Option<RecoveredAcrossDeposit>, ActivityError> {
+    let provider_response = operation
+        .response
+        .get("provider_response")
+        .unwrap_or(&operation.response);
+    let swap_tx = provider_response.get("swapTx").ok_or_else(|| {
+        activity_error(format!(
+            "Across checkpoint recovery missing provider_response.swapTx for operation {}",
+            operation.id
+        ))
+    })?;
+    let spoke_pool_address = json_str_field(swap_tx, "to").ok_or_else(|| {
+        activity_error(format!(
+            "Across checkpoint recovery missing swapTx.to for operation {}",
+            operation.id
+        ))
+    })?;
+    let spoke_pool_address = Address::from_str(spoke_pool_address).map_err(|err| {
+        activity_error(format!(
+            "Across checkpoint recovery invalid swapTx.to for operation {}: {err}",
+            operation.id
+        ))
+    })?;
+
+    let origin_chain_id =
+        json_u64_field(&operation.request, "origin_chain_id").ok_or_else(|| {
+            activity_error(format!(
+                "Across checkpoint recovery missing origin_chain_id for operation {}",
+                operation.id
+            ))
+        })?;
+    let destination_chain_id = json_u64_field(&operation.request, "destination_chain_id")
+        .ok_or_else(|| {
+            activity_error(format!(
+                "Across checkpoint recovery missing destination_chain_id for operation {}",
+                operation.id
+            ))
+        })?;
+    let origin_chain = ChainId::parse(&format!("evm:{origin_chain_id}")).map_err(|err| {
+        activity_error(format!(
+            "Across checkpoint recovery invalid origin chain for operation {}: {err}",
+            operation.id
+        ))
+    })?;
+    let backend_chain = backend_chain_for_id(&origin_chain).ok_or_else(|| {
+        activity_error(format!(
+            "Across checkpoint recovery unsupported origin chain {origin_chain}"
+        ))
+    })?;
+    let evm_chain = deps.chain_registry.get_evm(&backend_chain).ok_or_else(|| {
+        activity_error(format!(
+            "Across checkpoint recovery origin chain {origin_chain} is not configured"
+        ))
+    })?;
+
+    let BridgeExecutionRequest::Across(step_request) =
+        BridgeExecutionRequest::across_from_value(&step.request).map_err(|err| {
+            activity_error(format!(
+                "Across checkpoint recovery could not decode step request for operation {}: {err}",
+                operation.id
+            ))
+        })?
+    else {
+        return Err(activity_error(format!(
+            "Across checkpoint recovery step {} is not an Across request",
+            step.id
+        )));
+    };
+    let input_token =
+        recovery_step_asset_address(&step_request.input_asset, "input_asset", operation)?;
+    let output_token =
+        recovery_step_asset_address(&step_request.output_asset, "output_asset", operation)?;
+    let depositor = recovery_step_address(
+        &step_request.depositor_address,
+        "depositor_address",
+        operation,
+    )?;
+    let recipient = recovery_step_address(&step_request.recipient, "recipient", operation)?;
+    let amount = U256::from_str_radix(&step_request.amount, 10).map_err(|err| {
+        activity_error(format!(
+            "Across checkpoint recovery invalid request.amount for operation {}: {err}",
+            operation.id
+        ))
+    })?;
+    let expected_output = json_u256_string_field(provider_response, "expectedOutputAmount")
+        .or_else(|| json_u256_string_field(provider_response, "minOutputAmount"));
+
+    let Some(checkpoint_tx_hash) = persisted_provider_operation_tx_hash(operation) else {
+        return Ok(None);
+    };
+    let Some(checkpoint_receipt) = evm_chain
+        .transaction_receipt(&checkpoint_tx_hash)
+        .await
+        .map_err(activity_error_from_display)?
+    else {
+        return Ok(None);
+    };
+    let Some(from_block) = checkpoint_receipt.block_number else {
+        return Ok(None);
+    };
+
+    let logs = evm_chain
+        .logs(
+            &Filter::new()
+                .address(spoke_pool_address)
+                .event_signature(FundsDeposited::SIGNATURE_HASH)
+                .from_block(from_block),
+        )
+        .await
+        .map_err(activity_error_from_display)?;
+
+    let input_token = evm_address_to_bytes32(input_token);
+    let output_token = evm_address_to_bytes32(output_token);
+    let depositor = evm_address_to_bytes32(depositor);
+    let recipient = evm_address_to_bytes32(recipient);
+    let destination_chain_id = U256::from(destination_chain_id);
+
+    for log in logs {
+        let Ok(decoded) = FundsDeposited::decode_log(&log.inner) else {
+            continue;
+        };
+        let event = decoded.data;
+        if event.destinationChainId != destination_chain_id
+            || event.inputToken != input_token
+            || event.outputToken != output_token
+            || event.inputAmount != amount
+            || expected_output
+                .as_ref()
+                .is_some_and(|expected| event.outputAmount != *expected)
+            || event.depositor != depositor
+            || event.recipient != recipient
+        {
+            continue;
+        }
+        let Some(deposit_tx_hash) = log.transaction_hash.map(|hash| format!("{hash:#x}")) else {
+            continue;
+        };
+        return Ok(Some(RecoveredAcrossDeposit {
+            deposit_id: event.depositId.to_string(),
+            deposit_tx_hash,
+        }));
+    }
+
+    Ok(None)
+}
+
 async fn verify_across_fill_hint(
     deps: &OrderActivityDeps,
     input: VerifyProviderOperationHintInput,
@@ -6618,6 +6898,12 @@ async fn verify_across_fill_hint(
             ),
         ));
     }
+    let Some(operation) = recover_across_operation_from_checkpoint(deps, operation).await? else {
+        return Ok(provider_hint_deferred(
+            Some(provider_operation_id),
+            "Across provider operation has no deposit-id provider_ref and no recoverable deposit log yet",
+        ));
+    };
 
     let provider = deps
         .action_providers
@@ -7277,6 +7563,18 @@ async fn verify_provider_observation_hint(
             )),
         });
     }
+    let operation = if operation.operation_type == ProviderOperationType::AcrossBridge {
+        let Some(operation) = recover_across_operation_from_checkpoint(deps, operation).await?
+        else {
+            return Ok(provider_hint_deferred(
+                Some(provider_operation_id),
+                "Across provider operation has no deposit-id provider_ref and no recoverable deposit log yet",
+            ));
+        };
+        operation
+    } else {
+        operation
+    };
 
     let request = ProviderOperationObservationRequest {
         operation_id: operation.id,
@@ -7571,6 +7869,117 @@ fn currency_decimals(chain: &ChainType, asset: &AssetId) -> u8 {
         (_, AssetId::Native) => 18,
         (_, AssetId::Reference(_)) => 8,
     }
+}
+
+fn is_decimal_u256(value: &str) -> bool {
+    !value.is_empty() && U256::from_str_radix(value, 10).is_ok()
+}
+
+fn json_str_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(Value::as_str)
+}
+
+fn json_u64_field(value: &Value, key: &str) -> Option<u64> {
+    value.get(key).and_then(Value::as_u64).or_else(|| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(|raw| raw.parse::<u64>().ok())
+    })
+}
+
+fn json_u256_string_field(value: &Value, key: &str) -> Option<U256> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .and_then(|raw| U256::from_str_radix(raw, 10).ok())
+}
+
+fn recovery_step_asset_address(
+    raw: &str,
+    key: &'static str,
+    operation: &OrderProviderOperation,
+) -> Result<Address, ActivityError> {
+    let asset = AssetId::parse(raw).map_err(|err| {
+        activity_error(format!(
+            "Across checkpoint recovery invalid request.{key} for operation {}: {err}",
+            operation.id
+        ))
+    })?;
+    match asset {
+        AssetId::Native => Ok(Address::ZERO),
+        AssetId::Reference(address) => Address::from_str(&address).map_err(|err| {
+            activity_error(format!(
+                "Across checkpoint recovery invalid request.{key} for operation {}: {err}",
+                operation.id
+            ))
+        }),
+    }
+}
+
+fn recovery_step_address(
+    raw: &str,
+    key: &'static str,
+    operation: &OrderProviderOperation,
+) -> Result<Address, ActivityError> {
+    Address::from_str(raw).map_err(|err| {
+        activity_error(format!(
+            "Across checkpoint recovery invalid request.{key} for operation {}: {err}",
+            operation.id
+        ))
+    })
+}
+
+fn evm_address_to_bytes32(address: Address) -> FixedBytes<32> {
+    let mut bytes = [0_u8; 32];
+    bytes[12..].copy_from_slice(address.as_slice());
+    FixedBytes::from(bytes)
+}
+
+fn persisted_provider_operation_tx_hash(operation: &OrderProviderOperation) -> Option<String> {
+    provider_operation_tx_hash_from_value(&operation.response)
+        .or_else(|| provider_operation_tx_hash_from_value(&operation.observed_state))
+}
+
+fn provider_operation_tx_hash_from_value(value: &Value) -> Option<String> {
+    value
+        .get("tx_hash")
+        .or_else(|| value.get("latest_tx_hash"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| {
+            value
+                .get("tx_hashes")
+                .and_then(Value::as_array)
+                .and_then(|hashes| hashes.last())
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .or_else(|| {
+            value
+                .get("receipt")
+                .and_then(provider_operation_tx_hash_from_value)
+        })
+        .or_else(|| {
+            value
+                .get("response")
+                .and_then(provider_operation_tx_hash_from_value)
+        })
+        .or_else(|| {
+            value
+                .get("provider_response")
+                .and_then(provider_operation_tx_hash_from_value)
+        })
+        .or_else(|| {
+            value
+                .get("previous_observed_state")
+                .and_then(provider_operation_tx_hash_from_value)
+        })
+        .or_else(|| {
+            value
+                .get("provider_observed_state")
+                .and_then(provider_operation_tx_hash_from_value)
+        })
 }
 
 fn json_object_or_wrapped(value: Value) -> Value {
