@@ -106,6 +106,7 @@ struct WorkflowRun {
 enum WorkflowRoute {
     #[default]
     VeloraBaseEthToBaseUsdc,
+    VeloraBaseEthToBaseUsdcExactOut,
     AcrossBaseEthToEthereumUsdc,
     CctpBaseUsdcToArbitrumEth,
     CctpBaseUsdcToBitcoin,
@@ -781,6 +782,79 @@ async fn order_workflow_refreshes_stale_quote_then_completes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn order_workflow_refreshes_exact_out_stale_quote_then_completes() {
+    let run = run_order_workflow(WorkflowOptions {
+        route: WorkflowRoute::VeloraBaseEthToBaseUsdcExactOut,
+        expire_quote_legs: true,
+        ..WorkflowOptions::default()
+    })
+    .await;
+
+    assert_eq!(run.output.terminal_status, OrderTerminalStatus::Completed);
+    let completed = run
+        .db
+        .orders()
+        .get(run.order_id)
+        .await
+        .expect("load completed ExactOut order");
+    assert_eq!(completed.status, RouterOrderStatus::Completed);
+
+    let original_quote = match run
+        .db
+        .orders()
+        .get_router_order_quote(run.order_id)
+        .await
+        .expect("load ExactOut order quote")
+    {
+        RouterOrderQuote::MarketOrder(quote) => quote,
+        RouterOrderQuote::LimitOrder(_) => panic!("expected market quote"),
+    };
+    assert_eq!(original_quote.order_kind.to_db_string(), "exact_out");
+
+    let attempts = run
+        .db
+        .orders()
+        .get_execution_attempts(run.order_id)
+        .await
+        .expect("load ExactOut refresh attempts");
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(
+        attempts[1].attempt_kind,
+        OrderExecutionAttemptKind::RefreshedExecution
+    );
+    assert_eq!(attempts[1].status, OrderExecutionAttemptStatus::Completed);
+
+    let refreshed_legs = run
+        .db
+        .orders()
+        .get_execution_legs_for_attempt(attempts[1].id)
+        .await
+        .expect("load refreshed ExactOut legs");
+    assert_eq!(refreshed_legs.len(), 1);
+    assert_eq!(
+        refreshed_legs[0].expected_amount_out,
+        original_quote.amount_out
+    );
+    assert_eq!(refreshed_legs[0].amount_in, original_quote.amount_in);
+
+    let refreshed_steps = run
+        .db
+        .orders()
+        .get_execution_steps_for_attempt(attempts[1].id)
+        .await
+        .expect("load refreshed ExactOut steps");
+    assert_eq!(refreshed_steps.len(), 1);
+    assert_eq!(
+        refreshed_steps[0].step_type,
+        OrderExecutionStepType::UniversalRouterSwap
+    );
+    assert_eq!(
+        refreshed_steps[0].status,
+        OrderExecutionStepStatus::Completed
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn order_workflow_refreshes_stale_quote_multi_leg_then_completes() {
     let run = run_order_workflow(WorkflowOptions {
         route: WorkflowRoute::AcrossBaseEthToEthereumUsdc,
@@ -1248,6 +1322,24 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
                 chain_registry.clone(),
                 action_providers.clone(),
                 &devnet,
+                MarketOrderQuoteKind::ExactIn {
+                    amount_in: ORDER_AMOUNT_IN_WEI.to_string(),
+                    slippage_bps: Some(100),
+                },
+            )
+            .await
+        }
+        WorkflowRoute::VeloraBaseEthToBaseUsdcExactOut => {
+            seed_funded_single_step_order(
+                &db,
+                settings.clone(),
+                chain_registry.clone(),
+                action_providers.clone(),
+                &devnet,
+                MarketOrderQuoteKind::ExactOut {
+                    amount_out: ORDER_USDC_AMOUNT_RAW.to_string(),
+                    slippage_bps: Some(100),
+                },
             )
             .await
         }
@@ -1750,6 +1842,7 @@ fn test_action_providers(
         velora: matches!(
             route,
             WorkflowRoute::VeloraBaseEthToBaseUsdc
+                | WorkflowRoute::VeloraBaseEthToBaseUsdcExactOut
                 | WorkflowRoute::AcrossBaseEthToEthereumUsdc
                 | WorkflowRoute::CctpBaseUsdcToArbitrumEth
         )
@@ -1770,7 +1863,10 @@ async fn spawn_mocks(devnet: &RiftDevnet, options: &WorkflowOptions) -> MockInte
     let unit_enabled = matches!(options.route, WorkflowRoute::UnitBitcoinToBaseEth)
         || matches!(options.route, WorkflowRoute::CctpBaseUsdcToBitcoin)
         || options.expect_hyperliquid_spot_unit_refund;
-    if matches!(options.route, WorkflowRoute::VeloraBaseEthToBaseUsdc) {
+    if matches!(
+        options.route,
+        WorkflowRoute::VeloraBaseEthToBaseUsdc | WorkflowRoute::VeloraBaseEthToBaseUsdcExactOut
+    ) {
         config = config.with_velora_swap_contract_address(
             devnet.base.anvil.chain_id(),
             format!("{:#x}", devnet.base.mock_velora_swap_contract.address()),
@@ -2832,6 +2928,7 @@ async fn seed_funded_single_step_order(
     chain_registry: Arc<ChainRegistry>,
     action_providers: Arc<ActionProviderRegistry>,
     devnet: &RiftDevnet,
+    order_kind: MarketOrderQuoteKind,
 ) -> SeededOrder {
     let order_manager = OrderManager::with_action_providers(
         db.clone(),
@@ -2853,10 +2950,7 @@ async fn seed_funded_single_step_order(
             from_asset: source_asset.clone(),
             to_asset: destination_asset,
             recipient_address: valid_evm_address(),
-            order_kind: MarketOrderQuoteKind::ExactIn {
-                amount_in: ORDER_AMOUNT_IN_WEI.to_string(),
-                slippage_bps: Some(100),
-            },
+            order_kind,
         })
         .await
         .expect("quote single-step order");
