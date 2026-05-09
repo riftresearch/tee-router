@@ -4981,8 +4981,8 @@ impl HyperliquidProvider {
 /// shows up as a decoding error rather than silent misrouting.
 ///
 /// Slippage fields (`min_amount_out` / `max_amount_in`) are required on the
-/// cross-token path — they bound the Hyperliquid limit price. The hydrator (in
-/// `order_executor`) fills `hyperliquid_custody_vault_{id,address}` by role.
+/// cross-token path — they bound the Hyperliquid limit price. The execution
+/// hydrator fills `hyperliquid_custody_vault_{id,address}` by role.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct HyperliquidTradeStepRequest {
     pub order_id: Uuid,

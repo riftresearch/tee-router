@@ -9,8 +9,8 @@ use crate::{
     app::{initialize_components, PaymasterMode, RouterComponents},
     error::{RouterServerError, RouterServerResult},
     services::{
-        AddressScreeningPurpose, AddressScreeningService, OrderExecutionManager, OrderManager,
-        ProviderHealthService, ProviderPolicyService, VaultManager,
+        AddressScreeningPurpose, AddressScreeningService, OrderManager, ProviderHealthService,
+        ProviderPolicyService, VaultManager,
     },
     Error, Result, RouterServerArgs,
 };
@@ -168,7 +168,6 @@ pub struct AppState {
     pub db: router_core::db::Database,
     pub vault_manager: Arc<VaultManager>,
     pub order_manager: Arc<OrderManager>,
-    pub order_execution_manager: Arc<OrderExecutionManager>,
     pub provider_health: Arc<ProviderHealthService>,
     pub provider_policies: Arc<ProviderPolicyService>,
     pub address_screener: Option<Arc<AddressScreeningService>>,
@@ -207,7 +206,6 @@ async fn serve_api(args: RouterServerArgs, components: RouterComponents) -> Resu
         db: components.db,
         vault_manager: components.vault_manager,
         order_manager: components.order_manager,
-        order_execution_manager: components.order_execution_manager,
         provider_health: components.provider_health,
         provider_policies: components.provider_policies,
         address_screener: components.address_screener,
