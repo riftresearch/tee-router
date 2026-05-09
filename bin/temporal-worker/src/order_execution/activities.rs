@@ -84,6 +84,7 @@ const REFUND_HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW: u64 = 1_000_000;
 const REFRESH_HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW: u64 =
     REFUND_HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW;
 const REFRESH_BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_BPS: u64 = 12_500;
+const REFRESH_PROBE_MAX_AMOUNT_IN: &str = "340282366920938463463374607431768211455";
 
 // Canonical Across V3 `FundsDeposited` event used for scar §11 lost-intent
 // recovery. Keep this byte-for-byte aligned with router-core's Across provider.
@@ -2551,6 +2552,65 @@ fn refreshed_market_order_quote_exact_in(
     }
 }
 
+fn refreshed_market_order_quote_exact_out(
+    order: &RouterOrder,
+    original_quote: &MarketOrderQuote,
+    transitions: &[TransitionDecl],
+    legs: Vec<QuoteLeg>,
+    amount_in: String,
+    max_amount_in: String,
+    expires_at: chrono::DateTime<Utc>,
+    created_at: chrono::DateTime<Utc>,
+) -> MarketOrderQuote {
+    MarketOrderQuote {
+        id: Uuid::now_v7(),
+        order_id: Some(order.id),
+        source_asset: original_quote.source_asset.clone(),
+        destination_asset: original_quote.destination_asset.clone(),
+        recipient_address: original_quote.recipient_address.clone(),
+        provider_id: original_quote.provider_id.clone(),
+        order_kind: original_quote.order_kind,
+        amount_in,
+        amount_out: original_quote.amount_out.clone(),
+        min_amount_out: None,
+        max_amount_in: Some(max_amount_in),
+        slippage_bps: original_quote.slippage_bps,
+        provider_quote: json!({
+            "schema_version": 2,
+            "planner": "transition_decl_v1",
+            "path_id": original_quote
+                .provider_quote
+                .get("path_id")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+                .unwrap_or_else(|| transitions
+                    .iter()
+                    .map(|transition| transition.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(">")),
+            "transition_decl_ids": transitions
+                .iter()
+                .map(|transition| transition.id.clone())
+                .collect::<Vec<_>>(),
+            "transitions": transitions,
+            "legs": legs,
+            "gas_reimbursement": original_quote
+                .provider_quote
+                .get("gas_reimbursement")
+                .cloned()
+                .unwrap_or_else(|| json!({ "retention_actions": [] })),
+            "refresh": {
+                "schema_version": 1,
+                "source_quote_id": original_quote.id,
+                "source_quote_expires_at": original_quote.expires_at.to_rfc3339(),
+            },
+        }),
+        usd_valuation: json!({}),
+        expires_at,
+        created_at,
+    }
+}
+
 fn refresh_bridge_quote_transition_legs(
     transition: &TransitionDecl,
     quote: &BridgeQuote,
@@ -2919,6 +2979,26 @@ fn refresh_transition_min_amount_out(
     } else {
         Some("1".to_string())
     }
+}
+
+fn refresh_exact_out_max_input(
+    start_transition_index: usize,
+    index: usize,
+    available_amount: &str,
+) -> Option<String> {
+    if index == start_transition_index {
+        Some(available_amount.to_string())
+    } else {
+        Some(REFRESH_PROBE_MAX_AMOUNT_IN.to_string())
+    }
+}
+
+fn flatten_refresh_transition_legs(legs_per_transition: Vec<Vec<QuoteLeg>>) -> Vec<QuoteLeg> {
+    let mut flattened = Vec::new();
+    for mut transition_legs in legs_per_transition {
+        flattened.append(&mut transition_legs);
+    }
+    flattened
 }
 
 fn refresh_remaining_exact_in_amount(
@@ -6358,8 +6438,8 @@ impl QuoteRefreshActivities {
 impl QuoteRefreshActivities {
     /// Scar tissue: §7 stale quote refresh and §16.4 refresh helpers.
     ///
-    /// PR5c-ii wires ExactIn refresh for bridge, Unit, and Hyperliquid families.
-    /// PR5c-iii owns the remaining ExactOut backward iteration.
+    /// ExactIn refresh walks the stale suffix forward; ExactOut refresh walks it
+    /// backward from the requested terminal output.
     #[activity]
     pub async fn compose_refreshed_quote_attempt(
         self: Arc<Self>,
@@ -6441,9 +6521,6 @@ impl QuoteRefreshActivities {
                 failed_step.id, stale_leg.id
             )));
         }
-        if original_quote.order_kind != MarketOrderKindType::ExactIn {
-            todo!("PR5c: ExactOut stale quote refresh");
-        }
         let source_vault_id = order.funding_vault_id.ok_or_else(|| {
             activity_error(format!(
                 "order {} cannot refresh a quote without a funding vault",
@@ -6513,14 +6590,16 @@ impl QuoteRefreshActivities {
             }
         };
         let now = Utc::now();
-        let mut cursor_amount = available_amount.clone();
-        let mut expires_at = now + chrono::Duration::minutes(10);
-        let mut refreshed_legs = Vec::new();
-        for index in start_transition_index..transitions.len() {
-            let transition = &transitions[index];
-            match transition.kind {
-                MarketOrderTransitionKind::UniversalRouterSwap => {
-                    let template_step = stale_attempt_steps
+        let refreshed_quote = match original_quote.order_kind {
+            MarketOrderKindType::ExactIn => {
+                let mut cursor_amount = available_amount.clone();
+                let mut expires_at = now + chrono::Duration::minutes(10);
+                let mut refreshed_legs = Vec::new();
+                for index in start_transition_index..transitions.len() {
+                    let transition = &transitions[index];
+                    match transition.kind {
+                        MarketOrderTransitionKind::UniversalRouterSwap => {
+                            let template_step = stale_attempt_steps
                         .iter()
                         .find(|step| refresh_step_matches_transition(step, transition))
                         .ok_or_else(|| {
@@ -6529,276 +6608,580 @@ impl QuoteRefreshActivities {
                                 transition.id
                             ))
                         })?;
-                    let step_request =
-                        match ExchangeExecutionRequest::universal_router_swap_from_value(
-                            &template_step.request,
-                        )
-                        .map_err(activity_error_from_display)?
-                        {
-                            ExchangeExecutionRequest::UniversalRouterSwap(request) => request,
-                            _ => {
+                            let step_request =
+                                match ExchangeExecutionRequest::universal_router_swap_from_value(
+                                    &template_step.request,
+                                )
+                                .map_err(activity_error_from_display)?
+                                {
+                                    ExchangeExecutionRequest::UniversalRouterSwap(request) => {
+                                        request
+                                    }
+                                    _ => {
+                                        return Err(activity_error(format!(
+                                            "step {} is not a universal-router swap request",
+                                            template_step.id
+                                        )));
+                                    }
+                                };
+                            let exchange = deps
+                                .action_providers
+                                .exchange(transition.provider.as_str())
+                                .ok_or_else(|| {
+                                    activity_error(format!(
+                                        "exchange provider {} is not configured",
+                                        transition.provider.as_str()
+                                    ))
+                                })?;
+                            let refreshed_quote = exchange
+                                .quote_trade(ExchangeQuoteRequest {
+                                    input_asset: transition.input.asset.clone(),
+                                    output_asset: transition.output.asset.clone(),
+                                    input_decimals: Some(step_request.input_decimals),
+                                    output_decimals: Some(step_request.output_decimals),
+                                    order_kind: MarketOrderKind::ExactIn {
+                                        amount_in: cursor_amount.clone(),
+                                        min_amount_out: refresh_transition_min_amount_out(
+                                            &transitions,
+                                            index,
+                                            &original_quote.min_amount_out,
+                                        ),
+                                    },
+                                    sender_address: Some(refresh_source_address(
+                                        &source_vault,
+                                        &stale_attempt_steps,
+                                        &transitions,
+                                        index,
+                                    )?),
+                                    recipient_address: refresh_recipient_address(
+                                        &order,
+                                        &stale_attempt_steps,
+                                        &transitions,
+                                        index,
+                                    )?,
+                                })
+                                .await
+                                .map_err(activity_error_from_display)?
+                                .ok_or_else(|| {
+                                    activity_error(format!(
+                                        "exchange provider {} returned no refreshed quote",
+                                        exchange.id()
+                                    ))
+                                })?;
+                            expires_at = expires_at.min(refreshed_quote.expires_at);
+                            cursor_amount = refreshed_quote.amount_out.clone();
+                            refreshed_legs.extend(refresh_exchange_quote_transition_legs(
+                                transition.id.as_str(),
+                                transition.kind,
+                                transition.provider,
+                                &refreshed_quote,
+                            )?);
+                        }
+                        MarketOrderTransitionKind::AcrossBridge
+                        | MarketOrderTransitionKind::CctpBridge
+                        | MarketOrderTransitionKind::HyperliquidBridgeDeposit
+                        | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
+                            let bridge = deps
+                                .action_providers
+                                .bridge(transition.provider.as_str())
+                                .ok_or_else(|| {
+                                    activity_error(format!(
+                                        "bridge provider {} is not configured",
+                                        transition.provider.as_str()
+                                    ))
+                                })?;
+                            let refreshed_quote = bridge
+                                .quote_bridge(BridgeQuoteRequest {
+                                    source_asset: transition.input.asset.clone(),
+                                    destination_asset: transition.output.asset.clone(),
+                                    order_kind: MarketOrderKind::ExactIn {
+                                        amount_in: cursor_amount.clone(),
+                                        min_amount_out: Some("1".to_string()),
+                                    },
+                                    recipient_address: refresh_bridge_recipient_address(
+                                        &order,
+                                        &source_vault,
+                                        &stale_attempt_steps,
+                                        &transitions,
+                                        index,
+                                    )?,
+                                    depositor_address: refresh_source_address(
+                                        &source_vault,
+                                        &stale_attempt_steps,
+                                        &transitions,
+                                        index,
+                                    )?,
+                                    partial_fills_enabled: false,
+                                })
+                                .await
+                                .map_err(activity_error_from_display)?
+                                .ok_or_else(|| {
+                                    activity_error(format!(
+                                        "bridge provider {} returned no refreshed quote",
+                                        bridge.id()
+                                    ))
+                                })?;
+                            expires_at = expires_at.min(refreshed_quote.expires_at);
+                            cursor_amount = refreshed_quote.amount_out.clone();
+                            refreshed_legs.extend(refresh_bridge_quote_transition_legs(
+                                transition,
+                                &refreshed_quote,
+                            )?);
+                        }
+                        MarketOrderTransitionKind::UnitDeposit => {
+                            let unit = deps
+                                .action_providers
+                                .unit(transition.provider.as_str())
+                                .ok_or_else(|| {
+                                    activity_error(format!(
+                                        "unit provider {} is not configured",
+                                        transition.provider.as_str()
+                                    ))
+                                })?;
+                            let (unit_amount_in, provider_quote) = if let Some(fee_reserve) =
+                                refresh_unit_deposit_fee_reserve(&original_quote, transition)?
+                            {
+                                (
+                                    refresh_subtract_amount(
+                                        "amount_in",
+                                        &cursor_amount,
+                                        fee_reserve,
+                                        &transition.id,
+                                        "bitcoin miner fee reserve",
+                                    )?,
+                                    refresh_bitcoin_fee_reserve_quote(fee_reserve),
+                                )
+                            } else {
+                                (cursor_amount.clone(), json!({}))
+                            };
+                            if !unit.supports_deposit(&transition.input.asset) {
                                 return Err(activity_error(format!(
-                                    "step {} is not a universal-router swap request",
-                                    template_step.id
+                                    "unit provider {} does not support refreshed deposit",
+                                    unit.id()
                                 )));
                             }
-                        };
-                    let exchange = deps
-                        .action_providers
-                        .exchange(transition.provider.as_str())
-                        .ok_or_else(|| {
-                            activity_error(format!(
-                                "exchange provider {} is not configured",
-                                transition.provider.as_str()
-                            ))
-                        })?;
-                    let refreshed_quote = exchange
-                        .quote_trade(ExchangeQuoteRequest {
-                            input_asset: transition.input.asset.clone(),
-                            output_asset: transition.output.asset.clone(),
-                            input_decimals: Some(step_request.input_decimals),
-                            output_decimals: Some(step_request.output_decimals),
-                            order_kind: MarketOrderKind::ExactIn {
-                                amount_in: cursor_amount.clone(),
-                                min_amount_out: refresh_transition_min_amount_out(
-                                    &transitions,
-                                    index,
-                                    &original_quote.min_amount_out,
-                                ),
-                            },
-                            sender_address: Some(refresh_source_address(
-                                &source_vault,
-                                &stale_attempt_steps,
-                                &transitions,
-                                index,
-                            )?),
-                            recipient_address: refresh_recipient_address(
+                            cursor_amount = unit_amount_in.clone();
+                            refreshed_legs.push(refresh_unit_deposit_quote_leg(
+                                transition,
+                                &unit_amount_in,
+                                expires_at,
+                                provider_quote,
+                            ));
+                        }
+                        MarketOrderTransitionKind::HyperliquidTrade => {
+                            let exchange = deps
+                                .action_providers
+                                .exchange(transition.provider.as_str())
+                                .ok_or_else(|| {
+                                    activity_error(format!(
+                                        "exchange provider {} is not configured",
+                                        transition.provider.as_str()
+                                    ))
+                                })?;
+                            let mut quote_amount_in = cursor_amount.clone();
+                            if index > 0
+                                && transitions[index - 1].kind
+                                    == MarketOrderTransitionKind::HyperliquidBridgeDeposit
+                            {
+                                quote_amount_in = refresh_reserve_hyperliquid_spot_send_quote_gas(
+                                    "hyperliquid_trade.amount_in",
+                                    &quote_amount_in,
+                                )?;
+                            }
+                            let refreshed_quote = exchange
+                                .quote_trade(ExchangeQuoteRequest {
+                                    input_asset: transition.input.asset.clone(),
+                                    output_asset: transition.output.asset.clone(),
+                                    input_decimals: None,
+                                    output_decimals: None,
+                                    order_kind: MarketOrderKind::ExactIn {
+                                        amount_in: quote_amount_in,
+                                        min_amount_out: refresh_transition_min_amount_out(
+                                            &transitions,
+                                            index,
+                                            &original_quote.min_amount_out,
+                                        ),
+                                    },
+                                    sender_address: None,
+                                    recipient_address: order.recipient_address.clone(),
+                                })
+                                .await
+                                .map_err(activity_error_from_display)?
+                                .ok_or_else(|| {
+                                    activity_error(format!(
+                                        "exchange provider {} returned no refreshed quote",
+                                        exchange.id()
+                                    ))
+                                })?;
+                            expires_at = expires_at.min(refreshed_quote.expires_at);
+                            cursor_amount = refreshed_quote.amount_out.clone();
+                            refreshed_legs.extend(refresh_exchange_quote_transition_legs(
+                                transition.id.as_str(),
+                                transition.kind,
+                                transition.provider,
+                                &refreshed_quote,
+                            )?);
+                        }
+                        MarketOrderTransitionKind::UnitWithdrawal => {
+                            let unit = deps
+                                .action_providers
+                                .unit(transition.provider.as_str())
+                                .ok_or_else(|| {
+                                    activity_error(format!(
+                                        "unit provider {} is not configured",
+                                        transition.provider.as_str()
+                                    ))
+                                })?;
+                            if !unit.supports_withdrawal(&transition.output.asset) {
+                                return Err(activity_error(format!(
+                                    "unit provider {} does not support refreshed withdrawal",
+                                    unit.id()
+                                )));
+                            }
+                            let recipient_address = refresh_recipient_address(
                                 &order,
                                 &stale_attempt_steps,
                                 &transitions,
                                 index,
-                            )?,
-                        })
-                        .await
-                        .map_err(activity_error_from_display)?
-                        .ok_or_else(|| {
-                            activity_error(format!(
-                                "exchange provider {} returned no refreshed quote",
-                                exchange.id()
-                            ))
-                        })?;
-                    expires_at = expires_at.min(refreshed_quote.expires_at);
-                    cursor_amount = refreshed_quote.amount_out.clone();
-                    refreshed_legs.extend(refresh_exchange_quote_transition_legs(
-                        transition.id.as_str(),
-                        transition.kind,
-                        transition.provider,
-                        &refreshed_quote,
-                    )?);
-                }
-                MarketOrderTransitionKind::AcrossBridge
-                | MarketOrderTransitionKind::CctpBridge
-                | MarketOrderTransitionKind::HyperliquidBridgeDeposit
-                | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
-                    let bridge = deps
-                        .action_providers
-                        .bridge(transition.provider.as_str())
-                        .ok_or_else(|| {
-                            activity_error(format!(
-                                "bridge provider {} is not configured",
-                                transition.provider.as_str()
-                            ))
-                        })?;
-                    let refreshed_quote = bridge
-                        .quote_bridge(BridgeQuoteRequest {
-                            source_asset: transition.input.asset.clone(),
-                            destination_asset: transition.output.asset.clone(),
-                            order_kind: MarketOrderKind::ExactIn {
-                                amount_in: cursor_amount.clone(),
-                                min_amount_out: Some("1".to_string()),
-                            },
-                            recipient_address: refresh_bridge_recipient_address(
-                                &order,
-                                &source_vault,
-                                &stale_attempt_steps,
-                                &transitions,
-                                index,
-                            )?,
-                            depositor_address: refresh_source_address(
-                                &source_vault,
-                                &stale_attempt_steps,
-                                &transitions,
-                                index,
-                            )?,
-                            partial_fills_enabled: false,
-                        })
-                        .await
-                        .map_err(activity_error_from_display)?
-                        .ok_or_else(|| {
-                            activity_error(format!(
-                                "bridge provider {} returned no refreshed quote",
-                                bridge.id()
-                            ))
-                        })?;
-                    expires_at = expires_at.min(refreshed_quote.expires_at);
-                    cursor_amount = refreshed_quote.amount_out.clone();
-                    refreshed_legs.extend(refresh_bridge_quote_transition_legs(
-                        transition,
-                        &refreshed_quote,
-                    )?);
-                }
-                MarketOrderTransitionKind::UnitDeposit => {
-                    let unit = deps
-                        .action_providers
-                        .unit(transition.provider.as_str())
-                        .ok_or_else(|| {
-                            activity_error(format!(
-                                "unit provider {} is not configured",
-                                transition.provider.as_str()
-                            ))
-                        })?;
-                    let (unit_amount_in, provider_quote) = if let Some(fee_reserve) =
-                        refresh_unit_deposit_fee_reserve(&original_quote, transition)?
-                    {
-                        (
-                            refresh_subtract_amount(
-                                "amount_in",
+                            )?;
+                            refreshed_legs.push(refresh_unit_withdrawal_quote_leg(
+                                transition,
                                 &cursor_amount,
-                                fee_reserve,
-                                &transition.id,
-                                "bitcoin miner fee reserve",
-                            )?,
-                            refresh_bitcoin_fee_reserve_quote(fee_reserve),
-                        )
-                    } else {
-                        (cursor_amount.clone(), json!({}))
-                    };
-                    if !unit.supports_deposit(&transition.input.asset) {
-                        return Err(activity_error(format!(
-                            "unit provider {} does not support refreshed deposit",
-                            unit.id()
-                        )));
+                                &recipient_address,
+                                expires_at,
+                            ));
+                        }
                     }
-                    cursor_amount = unit_amount_in.clone();
-                    refreshed_legs.push(refresh_unit_deposit_quote_leg(
-                        transition,
-                        &unit_amount_in,
-                        expires_at,
-                        provider_quote,
-                    ));
                 }
-                MarketOrderTransitionKind::HyperliquidTrade => {
-                    let exchange = deps
-                        .action_providers
-                        .exchange(transition.provider.as_str())
-                        .ok_or_else(|| {
-                            activity_error(format!(
-                                "exchange provider {} is not configured",
-                                transition.provider.as_str()
-                            ))
-                        })?;
-                    let mut quote_amount_in = cursor_amount.clone();
-                    if index > 0
-                        && transitions[index - 1].kind
-                            == MarketOrderTransitionKind::HyperliquidBridgeDeposit
-                    {
-                        quote_amount_in = refresh_reserve_hyperliquid_spot_send_quote_gas(
-                            "hyperliquid_trade.amount_in",
-                            &quote_amount_in,
-                        )?;
-                    }
-                    let refreshed_quote = exchange
-                        .quote_trade(ExchangeQuoteRequest {
-                            input_asset: transition.input.asset.clone(),
-                            output_asset: transition.output.asset.clone(),
-                            input_decimals: None,
-                            output_decimals: None,
-                            order_kind: MarketOrderKind::ExactIn {
-                                amount_in: quote_amount_in,
-                                min_amount_out: refresh_transition_min_amount_out(
-                                    &transitions,
-                                    index,
-                                    &original_quote.min_amount_out,
-                                ),
+                if let Some(min_amount_out) = original_quote.min_amount_out.as_deref() {
+                    let quoted_amount_out = parse_refresh_amount("amount_out", &cursor_amount)?;
+                    let min_amount_out_raw =
+                        parse_refresh_amount("min_amount_out", min_amount_out)?;
+                    if quoted_amount_out < min_amount_out_raw {
+                        return Ok(RefreshedQuoteAttemptShape {
+                            outcome: RefreshedQuoteAttemptOutcome::Untenable {
+                                order_id: input.order_id,
+                                stale_attempt_id: input.stale_attempt_id,
+                                failed_step_id: input.failed_step_id,
+                                reason: StaleQuoteRefreshUntenableReason::RefreshedExactInOutputBelowMinAmountOut {
+                                    amount_out: cursor_amount,
+                                    min_amount_out: min_amount_out.to_string(),
+                                },
                             },
-                            sender_address: None,
-                            recipient_address: order.recipient_address.clone(),
-                        })
-                        .await
-                        .map_err(activity_error_from_display)?
-                        .ok_or_else(|| {
-                            activity_error(format!(
-                                "exchange provider {} returned no refreshed quote",
-                                exchange.id()
-                            ))
-                        })?;
-                    expires_at = expires_at.min(refreshed_quote.expires_at);
-                    cursor_amount = refreshed_quote.amount_out.clone();
-                    refreshed_legs.extend(refresh_exchange_quote_transition_legs(
-                        transition.id.as_str(),
-                        transition.kind,
-                        transition.provider,
-                        &refreshed_quote,
-                    )?);
-                }
-                MarketOrderTransitionKind::UnitWithdrawal => {
-                    let unit = deps
-                        .action_providers
-                        .unit(transition.provider.as_str())
-                        .ok_or_else(|| {
-                            activity_error(format!(
-                                "unit provider {} is not configured",
-                                transition.provider.as_str()
-                            ))
-                        })?;
-                    if !unit.supports_withdrawal(&transition.output.asset) {
-                        return Err(activity_error(format!(
-                            "unit provider {} does not support refreshed withdrawal",
-                            unit.id()
-                        )));
+                        });
                     }
-                    let recipient_address = refresh_recipient_address(
-                        &order,
-                        &stale_attempt_steps,
-                        &transitions,
-                        index,
-                    )?;
-                    refreshed_legs.push(refresh_unit_withdrawal_quote_leg(
-                        transition,
-                        &cursor_amount,
-                        &recipient_address,
-                        expires_at,
-                    ));
                 }
+                refreshed_market_order_quote_exact_in(
+                    &order,
+                    &original_quote,
+                    &transitions,
+                    refreshed_legs,
+                    available_amount,
+                    cursor_amount,
+                    expires_at,
+                    now,
+                )
             }
-        }
-        if let Some(min_amount_out) = original_quote.min_amount_out.as_deref() {
-            let quoted_amount_out = parse_refresh_amount("amount_out", &cursor_amount)?;
-            let min_amount_out_raw = parse_refresh_amount("min_amount_out", min_amount_out)?;
-            if quoted_amount_out < min_amount_out_raw {
-                return Ok(RefreshedQuoteAttemptShape {
-                    outcome: RefreshedQuoteAttemptOutcome::Untenable {
-                        order_id: input.order_id,
-                        stale_attempt_id: input.stale_attempt_id,
-                        failed_step_id: input.failed_step_id,
-                        reason: StaleQuoteRefreshUntenableReason::RefreshedExactInOutputBelowMinAmountOut {
-                            amount_out: cursor_amount,
-                            min_amount_out: min_amount_out.to_string(),
+            MarketOrderKindType::ExactOut => {
+                let mut required_output = original_quote.amount_out.clone();
+                let mut expires_at = now + chrono::Duration::minutes(10);
+                let mut refreshed_legs_per_transition: Vec<Vec<QuoteLeg>> =
+                    (0..transitions.len()).map(|_| Vec::new()).collect();
+                for index in (start_transition_index..transitions.len()).rev() {
+                    let transition = &transitions[index];
+                    match transition.kind {
+                        MarketOrderTransitionKind::UnitWithdrawal => {
+                            let unit = deps
+                                .action_providers
+                                .unit(transition.provider.as_str())
+                                .ok_or_else(|| {
+                                    activity_error(format!(
+                                        "unit provider {} is not configured",
+                                        transition.provider.as_str()
+                                    ))
+                                })?;
+                            if !unit.supports_withdrawal(&transition.output.asset) {
+                                return Err(activity_error(format!(
+                                    "unit provider {} does not support refreshed withdrawal",
+                                    unit.id()
+                                )));
+                            }
+                            let recipient_address = refresh_recipient_address(
+                                &order,
+                                &stale_attempt_steps,
+                                &transitions,
+                                index,
+                            )?;
+                            refreshed_legs_per_transition[index].push(
+                                refresh_unit_withdrawal_quote_leg(
+                                    transition,
+                                    &required_output,
+                                    &recipient_address,
+                                    expires_at,
+                                ),
+                            );
+                        }
+                        MarketOrderTransitionKind::HyperliquidTrade => {
+                            let exchange = deps
+                                .action_providers
+                                .exchange(transition.provider.as_str())
+                                .ok_or_else(|| {
+                                    activity_error(format!(
+                                        "exchange provider {} is not configured",
+                                        transition.provider.as_str()
+                                    ))
+                                })?;
+                            let refreshed_quote = exchange
+                                .quote_trade(ExchangeQuoteRequest {
+                                    input_asset: transition.input.asset.clone(),
+                                    output_asset: transition.output.asset.clone(),
+                                    input_decimals: None,
+                                    output_decimals: None,
+                                    order_kind: MarketOrderKind::ExactOut {
+                                        amount_out: required_output.clone(),
+                                        max_amount_in: refresh_exact_out_max_input(
+                                            start_transition_index,
+                                            index,
+                                            &available_amount,
+                                        ),
+                                    },
+                                    sender_address: None,
+                                    recipient_address: order.recipient_address.clone(),
+                                })
+                                .await
+                                .map_err(activity_error_from_display)?
+                                .ok_or_else(|| {
+                                    activity_error(format!(
+                                        "exchange provider {} returned no refreshed quote",
+                                        exchange.id()
+                                    ))
+                                })?;
+                            expires_at = expires_at.min(refreshed_quote.expires_at);
+                            let mut next_required = refreshed_quote.amount_in.clone();
+                            if index > 0
+                                && transitions[index - 1].kind
+                                    == MarketOrderTransitionKind::HyperliquidBridgeDeposit
+                            {
+                                next_required =
+                                    refresh_add_hyperliquid_spot_send_quote_gas_reserve(
+                                        "hyperliquid_trade.amount_in",
+                                        &next_required,
+                                    )?;
+                            }
+                            required_output = next_required;
+                            refreshed_legs_per_transition[index] =
+                                refresh_exchange_quote_transition_legs(
+                                    transition.id.as_str(),
+                                    transition.kind,
+                                    transition.provider,
+                                    &refreshed_quote,
+                                )?;
+                        }
+                        MarketOrderTransitionKind::UniversalRouterSwap => {
+                            let template_step = stale_attempt_steps
+                                .iter()
+                                .find(|step| refresh_step_matches_transition(step, transition))
+                                .ok_or_else(|| {
+                                    activity_error(format!(
+                                        "cannot refresh transition {} because no template step is materialized",
+                                        transition.id
+                                    ))
+                                })?;
+                            let step_request =
+                                match ExchangeExecutionRequest::universal_router_swap_from_value(
+                                    &template_step.request,
+                                )
+                                .map_err(activity_error_from_display)?
+                                {
+                                    ExchangeExecutionRequest::UniversalRouterSwap(request) => {
+                                        request
+                                    }
+                                    _ => {
+                                        return Err(activity_error(format!(
+                                            "step {} is not a universal-router swap request",
+                                            template_step.id
+                                        )));
+                                    }
+                                };
+                            let exchange = deps
+                                .action_providers
+                                .exchange(transition.provider.as_str())
+                                .ok_or_else(|| {
+                                    activity_error(format!(
+                                        "exchange provider {} is not configured",
+                                        transition.provider.as_str()
+                                    ))
+                                })?;
+                            let refreshed_quote = exchange
+                                .quote_trade(ExchangeQuoteRequest {
+                                    input_asset: transition.input.asset.clone(),
+                                    output_asset: transition.output.asset.clone(),
+                                    input_decimals: Some(step_request.input_decimals),
+                                    output_decimals: Some(step_request.output_decimals),
+                                    order_kind: MarketOrderKind::ExactOut {
+                                        amount_out: required_output.clone(),
+                                        max_amount_in: refresh_exact_out_max_input(
+                                            start_transition_index,
+                                            index,
+                                            &available_amount,
+                                        ),
+                                    },
+                                    sender_address: Some(refresh_source_address(
+                                        &source_vault,
+                                        &stale_attempt_steps,
+                                        &transitions,
+                                        index,
+                                    )?),
+                                    recipient_address: refresh_recipient_address(
+                                        &order,
+                                        &stale_attempt_steps,
+                                        &transitions,
+                                        index,
+                                    )?,
+                                })
+                                .await
+                                .map_err(activity_error_from_display)?
+                                .ok_or_else(|| {
+                                    activity_error(format!(
+                                        "exchange provider {} returned no refreshed quote",
+                                        exchange.id()
+                                    ))
+                                })?;
+                            expires_at = expires_at.min(refreshed_quote.expires_at);
+                            required_output = refreshed_quote.amount_in.clone();
+                            refreshed_legs_per_transition[index] =
+                                refresh_exchange_quote_transition_legs(
+                                    transition.id.as_str(),
+                                    transition.kind,
+                                    transition.provider,
+                                    &refreshed_quote,
+                                )?;
+                        }
+                        MarketOrderTransitionKind::AcrossBridge
+                        | MarketOrderTransitionKind::CctpBridge
+                        | MarketOrderTransitionKind::HyperliquidBridgeDeposit
+                        | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
+                            let bridge = deps
+                                .action_providers
+                                .bridge(transition.provider.as_str())
+                                .ok_or_else(|| {
+                                    activity_error(format!(
+                                        "bridge provider {} is not configured",
+                                        transition.provider.as_str()
+                                    ))
+                                })?;
+                            let refreshed_quote = bridge
+                                .quote_bridge(BridgeQuoteRequest {
+                                    source_asset: transition.input.asset.clone(),
+                                    destination_asset: transition.output.asset.clone(),
+                                    order_kind: MarketOrderKind::ExactOut {
+                                        amount_out: required_output.clone(),
+                                        max_amount_in: refresh_exact_out_max_input(
+                                            start_transition_index,
+                                            index,
+                                            &available_amount,
+                                        ),
+                                    },
+                                    recipient_address: refresh_bridge_recipient_address(
+                                        &order,
+                                        &source_vault,
+                                        &stale_attempt_steps,
+                                        &transitions,
+                                        index,
+                                    )?,
+                                    depositor_address: refresh_source_address(
+                                        &source_vault,
+                                        &stale_attempt_steps,
+                                        &transitions,
+                                        index,
+                                    )?,
+                                    partial_fills_enabled: false,
+                                })
+                                .await
+                                .map_err(activity_error_from_display)?
+                                .ok_or_else(|| {
+                                    activity_error(format!(
+                                        "bridge provider {} returned no refreshed quote",
+                                        bridge.id()
+                                    ))
+                                })?;
+                            expires_at = expires_at.min(refreshed_quote.expires_at);
+                            required_output = refreshed_quote.amount_in.clone();
+                            refreshed_legs_per_transition[index] =
+                                refresh_bridge_quote_transition_legs(transition, &refreshed_quote)?;
+                        }
+                        MarketOrderTransitionKind::UnitDeposit => {
+                            let unit = deps
+                                .action_providers
+                                .unit(transition.provider.as_str())
+                                .ok_or_else(|| {
+                                    activity_error(format!(
+                                        "unit provider {} is not configured",
+                                        transition.provider.as_str()
+                                    ))
+                                })?;
+                            if !unit.supports_deposit(&transition.input.asset) {
+                                return Err(activity_error(format!(
+                                    "unit provider {} does not support refreshed deposit",
+                                    unit.id()
+                                )));
+                            }
+                            let (unit_amount_in, upstream_required, provider_quote) =
+                                if let Some(fee_reserve) =
+                                    refresh_unit_deposit_fee_reserve(&original_quote, transition)?
+                                {
+                                    (
+                                        required_output.clone(),
+                                        refresh_add_amount(
+                                            "amount_in",
+                                            &required_output,
+                                            fee_reserve,
+                                            "bitcoin miner fee reserve",
+                                        )?,
+                                        refresh_bitcoin_fee_reserve_quote(fee_reserve),
+                                    )
+                                } else {
+                                    (required_output.clone(), required_output.clone(), json!({}))
+                                };
+                            refreshed_legs_per_transition[index].push(
+                                refresh_unit_deposit_quote_leg(
+                                    transition,
+                                    &unit_amount_in,
+                                    expires_at,
+                                    provider_quote,
+                                ),
+                            );
+                            required_output = upstream_required;
+                        }
+                    }
+                }
+                let required_input = parse_refresh_amount("amount_in", &required_output)?;
+                let available = parse_refresh_amount("available_amount", &available_amount)?;
+                if required_input > available {
+                    return Ok(RefreshedQuoteAttemptShape {
+                        outcome: RefreshedQuoteAttemptOutcome::Untenable {
+                            order_id: input.order_id,
+                            stale_attempt_id: input.stale_attempt_id,
+                            failed_step_id: input.failed_step_id,
+                            reason: StaleQuoteRefreshUntenableReason::RefreshedExactOutInputAboveAvailableAmount {
+                                amount_in: required_output,
+                                available_amount,
+                            },
                         },
-                    },
-                });
+                    });
+                }
+                refreshed_market_order_quote_exact_out(
+                    &order,
+                    &original_quote,
+                    &transitions,
+                    flatten_refresh_transition_legs(refreshed_legs_per_transition),
+                    required_output,
+                    available_amount,
+                    expires_at,
+                    now,
+                )
             }
-        }
-        let refreshed_quote = refreshed_market_order_quote_exact_in(
-            &order,
-            &original_quote,
-            &transitions,
-            refreshed_legs,
-            available_amount,
-            cursor_amount,
-            expires_at,
-            now,
-        );
+        };
         let mut plan = deps
             .planner
             .plan_remaining(
