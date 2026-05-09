@@ -6371,7 +6371,8 @@ impl ProviderObservationActivities {
                 verify_across_fill_hint(&deps, input).await
             }
             ProviderHintKind::CctpAttestation => {
-                todo!("PR7b: CctpAttestation verifier")
+                let deps = self.deps()?;
+                verify_cctp_attestation_hint(&deps, input).await
             }
             ProviderHintKind::UnitDeposit => {
                 let deps = self.deps()?;
@@ -6513,7 +6514,18 @@ async fn poll_provider_operation_hint_for_step(
             )
             .await?
         }
-        ProviderHintKind::CctpAttestation | ProviderHintKind::HyperliquidTrade => {
+        ProviderHintKind::CctpAttestation => {
+            verify_cctp_attestation_hint(
+                deps,
+                VerifyProviderOperationHintInput {
+                    order_id: input.order_id,
+                    step_id: input.step_id,
+                    signal,
+                },
+            )
+            .await?
+        }
+        ProviderHintKind::HyperliquidTrade => {
             return Ok(provider_hints_polled(provider_hint_deferred(
                 Some(operation.id),
                 format!("polling for {hint_kind:?} is deferred to a later PR7b verifier"),
@@ -6533,10 +6545,12 @@ fn polling_hint_shape_for_operation(
         ProviderOperationType::UnitDeposit => {
             Some((ProviderKind::Unit, ProviderHintKind::UnitDeposit))
         }
-        // Typed CCTP, UnitWithdrawal, and Hyperliquid pollers are added in the
+        ProviderOperationType::CctpBridge => {
+            Some((ProviderKind::Bridge, ProviderHintKind::CctpAttestation))
+        }
+        // Typed UnitWithdrawal and Hyperliquid pollers are added in the
         // following PR7b verifier slices.
-        ProviderOperationType::CctpBridge
-        | ProviderOperationType::UnitWithdrawal
+        ProviderOperationType::UnitWithdrawal
         | ProviderOperationType::HyperliquidTrade
         | ProviderOperationType::HyperliquidLimitOrder
         | ProviderOperationType::HyperliquidBridgeDeposit
@@ -6679,6 +6693,149 @@ async fn verify_across_fill_hint(
             format!(
                 "Across fill observation returned {}",
                 observation.status.to_db_string()
+            ),
+        )),
+    }
+}
+
+async fn verify_cctp_attestation_hint(
+    deps: &OrderActivityDeps,
+    input: VerifyProviderOperationHintInput,
+) -> Result<ProviderOperationHintVerified, ActivityError> {
+    let Some(provider_operation_id) = input.signal.provider_operation_id else {
+        return Ok(provider_hint_deferred(
+            None,
+            "CctpAttestation hint missing provider_operation_id",
+        ));
+    };
+    let operation = deps
+        .db
+        .orders()
+        .get_provider_operation(provider_operation_id)
+        .await
+        .map_err(activity_error_from_display)?;
+
+    if operation.order_id != input.order_id {
+        return Ok(provider_hint_rejected(
+            Some(provider_operation_id),
+            format!(
+                "provider operation {} belongs to order {}, not {}",
+                operation.id, operation.order_id, input.order_id
+            ),
+        ));
+    }
+    if operation.execution_step_id != Some(input.step_id) {
+        return Ok(provider_hint_deferred(
+            Some(provider_operation_id),
+            format!(
+                "provider operation {} belongs to step {:?}, not {}",
+                operation.id, operation.execution_step_id, input.step_id
+            ),
+        ));
+    }
+    if operation.operation_type != ProviderOperationType::CctpBridge {
+        return Ok(provider_hint_rejected(
+            Some(provider_operation_id),
+            format!(
+                "CctpAttestation hint cannot verify {} operation",
+                operation.operation_type.to_db_string()
+            ),
+        ));
+    }
+    if matches!(
+        operation.status,
+        ProviderOperationStatus::Completed
+            | ProviderOperationStatus::Failed
+            | ProviderOperationStatus::Expired
+    ) {
+        return Ok(ProviderOperationHintVerified {
+            provider_operation_id: Some(operation.id),
+            decision: if operation.status == ProviderOperationStatus::Completed {
+                ProviderOperationHintDecision::Accept
+            } else {
+                ProviderOperationHintDecision::Reject
+            },
+            reason: Some(format!(
+                "provider operation already terminal: {}",
+                operation.status.to_db_string()
+            )),
+        });
+    }
+
+    let provider = deps
+        .action_providers
+        .bridge(&operation.provider)
+        .ok_or_else(|| {
+            activity_error(format!(
+                "bridge provider {} is not configured",
+                operation.provider
+            ))
+        })?;
+    let observation = provider
+        .observe_bridge_operation(ProviderOperationObservationRequest {
+            operation_id: operation.id,
+            operation_type: operation.operation_type,
+            provider_ref: operation.provider_ref.clone(),
+            request: operation.request.clone(),
+            response: operation.response.clone(),
+            observed_state: operation.observed_state.clone(),
+            hint_evidence: provider_hint_signal_evidence(&input.signal),
+        })
+        .await
+        .map_err(activity_error)?;
+
+    let Some(observation) = observation else {
+        return Ok(provider_hint_deferred(
+            Some(provider_operation_id),
+            "CCTP provider returned no attestation observation",
+        ));
+    };
+    if let Some(reason) = provider_observation_ref_reject_reason(&operation, &observation) {
+        return Ok(provider_hint_rejected(Some(provider_operation_id), reason));
+    }
+
+    let provider_ref = observation
+        .provider_ref
+        .clone()
+        .or_else(|| operation.provider_ref.clone())
+        .or_else(|| observation.tx_hash.clone());
+    let observed_state = provider_hint_observed_state(&operation, &input, &observation);
+    let (updated, _) = deps
+        .db
+        .orders()
+        .update_provider_operation_status(
+            operation.id,
+            observation.status,
+            provider_ref,
+            observed_state,
+            observation.response.clone(),
+            Utc::now(),
+        )
+        .await
+        .map_err(activity_error_from_display)?;
+
+    match updated.status {
+        ProviderOperationStatus::Completed => Ok(ProviderOperationHintVerified {
+            provider_operation_id: Some(updated.id),
+            decision: ProviderOperationHintDecision::Accept,
+            reason: None,
+        }),
+        ProviderOperationStatus::Failed | ProviderOperationStatus::Expired => {
+            Ok(provider_hint_rejected(
+                Some(updated.id),
+                format!(
+                    "CCTP attestation observation returned {}",
+                    updated.status.to_db_string()
+                ),
+            ))
+        }
+        ProviderOperationStatus::Planned
+        | ProviderOperationStatus::Submitted
+        | ProviderOperationStatus::WaitingExternal => Ok(provider_hint_deferred(
+            Some(updated.id),
+            format!(
+                "CCTP attestation observation returned {}",
+                updated.status.to_db_string()
             ),
         )),
     }
