@@ -282,6 +282,9 @@ pub struct MockIntegratorConfig {
     /// Number of upcoming Velora transaction builds that should return a
     /// temporary 503 error in the same JSON error envelope shape Velora documents.
     pub velora_transaction_fail_next_n: usize,
+    /// Number of upcoming Velora transaction builds that should reject the
+    /// submitted priceRoute as stale using Velora's non-2xx JSON error envelope.
+    pub velora_transaction_stale_quote_fail_next_n: usize,
     /// Artificial delay before the mock Bridge2 releases the net `withdraw3`
     /// payout onto the EVM chain. Defaults to zero.
     pub hyperliquid_withdrawal_latency: Duration,
@@ -327,6 +330,7 @@ impl Default for MockIntegratorConfig {
             address_screening_rules: BTreeMap::new(),
             velora_swap_contract_addresses: BTreeMap::new(),
             velora_transaction_fail_next_n: 0,
+            velora_transaction_stale_quote_fail_next_n: 0,
             hyperliquid_withdrawal_latency: Duration::ZERO,
             across_quote_fee_bps: 0,
             across_quote_jitter_bps: 0,
@@ -558,6 +562,12 @@ impl MockIntegratorConfig {
     }
 
     #[must_use]
+    pub fn with_velora_transaction_stale_quote_fail_next_n(mut self, failures: usize) -> Self {
+        self.velora_transaction_stale_quote_fail_next_n = failures;
+        self
+    }
+
+    #[must_use]
     pub fn with_hyperliquid_withdrawal_latency(mut self, latency: Duration) -> Self {
         self.hyperliquid_withdrawal_latency = latency;
         self
@@ -619,6 +629,7 @@ struct MockIntegratorState {
     address_screening_rules: BTreeMap<String, MockAddressScreeningRule>,
     velora_swap_contract_addresses: BTreeMap<u64, String>,
     velora_transaction_failures_remaining: Mutex<usize>,
+    velora_transaction_stale_quote_failures_remaining: Mutex<usize>,
     next_across_swap_approval_error: Mutex<Option<String>>,
     next_unit_generate_address_error: Mutex<Option<String>>,
     next_unit_withdrawal_completion_error: Mutex<Option<String>>,
@@ -1179,6 +1190,14 @@ impl MockIntegratorServer {
             .lock()
             .await = failures;
     }
+
+    pub async fn set_velora_transaction_stale_quote_fail_next_n(&self, failures: usize) {
+        *self
+            .state
+            .velora_transaction_stale_quote_failures_remaining
+            .lock()
+            .await = failures;
+    }
 }
 
 impl MockIntegratorState {
@@ -1213,6 +1232,9 @@ impl MockIntegratorState {
             velora_swap_contract_addresses: config.velora_swap_contract_addresses.clone(),
             velora_transaction_failures_remaining: Mutex::new(
                 config.velora_transaction_fail_next_n,
+            ),
+            velora_transaction_stale_quote_failures_remaining: Mutex::new(
+                config.velora_transaction_stale_quote_fail_next_n,
             ),
             next_across_swap_approval_error: Mutex::default(),
             next_unit_generate_address_error: Mutex::default(),
@@ -1650,6 +1672,23 @@ async fn mock_velora_transaction(
     Path(network): Path<u64>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    let mut stale_quote_failures_remaining = state
+        .velora_transaction_stale_quote_failures_remaining
+        .lock()
+        .await;
+    if *stale_quote_failures_remaining > 0 {
+        *stale_quote_failures_remaining -= 1;
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": "stale_quote",
+                "message": "price route expired",
+            })),
+        )
+            .into_response();
+    }
+    drop(stale_quote_failures_remaining);
+
     let mut failures_remaining = state.velora_transaction_failures_remaining.lock().await;
     if *failures_remaining > 0 {
         *failures_remaining -= 1;

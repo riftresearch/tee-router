@@ -3,23 +3,25 @@ use std::time::Duration;
 use temporalio_common::protos::temporal::api::common::v1::RetryPolicy;
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityOptions, SyncWorkflowContext, WorkflowContext, WorkflowContextView, WorkflowResult,
+    ActivityOptions, ChildWorkflowOptions, SyncWorkflowContext, WorkflowContext,
+    WorkflowContextView, WorkflowResult,
 };
 use uuid::Uuid;
 
-use super::activities::OrderActivities;
+use super::activities::{OrderActivities, QuoteRefreshActivities};
 use super::types::{
-    ClassifyStepFailureInput, ExecuteStepInput, FinalizeOrderOrRefundInput,
-    FundingVaultFundedSignal, LoadOrderExecutionStateInput, ManualInterventionReleaseSignal,
-    ManualRefundTriggerSignal, MarkOrderCompletedInput, MaterializeExecutionAttemptInput,
+    ClassifyStepFailureInput, ComposeRefreshedQuoteAttemptInput, ExecuteStepInput,
+    FinalizeOrderOrRefundInput, FundingVaultFundedSignal, LoadOrderExecutionStateInput,
+    ManualInterventionReleaseSignal, ManualRefundTriggerSignal, MarkOrderCompletedInput,
+    MaterializeExecutionAttemptInput, MaterializeRefreshedAttemptInput,
     MaterializeRetryAttemptInput, OrderTerminalStatus, OrderWorkflowDebugCursor,
     OrderWorkflowInput, OrderWorkflowOutput, OrderWorkflowPhase,
     PersistProviderOperationStatusInput, PersistProviderReceiptInput, PersistStepFailedInput,
     PersistStepReadyToFireInput, ProviderHintPollWorkflowInput, ProviderHintPollWorkflowOutput,
-    ProviderOperationHintSignal, QuoteRefreshWorkflowInput, QuoteRefreshWorkflowOutput,
-    RefundWorkflowInput, RefundWorkflowOutput, SettleProviderStepInput,
-    StaleRunningStepWatchdogInput, StaleRunningStepWatchdogOutput, StepFailureDecision,
-    WriteFailedAttemptSnapshotInput,
+    ProviderOperationHintSignal, QuoteRefreshWorkflowInput, QuoteRefreshWorkflowOutcome,
+    QuoteRefreshWorkflowOutput, RefreshedQuoteAttemptOutcome, RefundWorkflowInput,
+    RefundWorkflowOutput, SettleProviderStepInput, StaleRunningStepWatchdogInput,
+    StaleRunningStepWatchdogOutput, StepFailureDecision, WriteFailedAttemptSnapshotInput,
 };
 
 /// Root order execution workflow.
@@ -194,11 +196,62 @@ impl OrderWorkflow {
                                 });
                             }
                             StepFailureDecision::RefreshQuote => {
-                                return Err(anyhow::anyhow!(
-                                    "PR4b does not implement RefreshQuote for failed step {}",
-                                    step.step_id
-                                )
-                                .into());
+                                ctx.state_mut(|state| {
+                                    state.phase = OrderWorkflowPhase::RefreshingQuote;
+                                    state.active_step_id = Some(step.step_id);
+                                });
+                                let child = ctx
+                                    .child_workflow(
+                                        QuoteRefreshWorkflow::run,
+                                        QuoteRefreshWorkflowInput {
+                                            order_id: input.order_id,
+                                            stale_attempt_id: execution_attempt.attempt_id,
+                                            failed_step_id: step.step_id,
+                                        },
+                                        quote_refresh_child_options(input.order_id, step.step_id),
+                                    )
+                                    .await?;
+                                let refreshed = child.result().await?;
+                                match refreshed.outcome {
+                                    QuoteRefreshWorkflowOutcome::Refreshed {
+                                        attempt_id,
+                                        steps,
+                                    } => {
+                                        execution_attempt =
+                                            super::types::MaterializedExecutionAttempt {
+                                                attempt_id,
+                                                steps,
+                                            };
+                                        ctx.state_mut(|state| {
+                                            state.phase = OrderWorkflowPhase::Executing;
+                                            state.active_attempt_id =
+                                                Some(execution_attempt.attempt_id);
+                                            state.active_step_id = None;
+                                        });
+                                        continue 'attempts;
+                                    }
+                                    QuoteRefreshWorkflowOutcome::Untenable { .. } => {
+                                        ctx.state_mut(|state| {
+                                            state.phase = OrderWorkflowPhase::Finalizing;
+                                            state.active_step_id = None;
+                                        });
+                                        let finalized = ctx
+                                            .start_activity(
+                                                OrderActivities::finalize_order_or_refund,
+                                                FinalizeOrderOrRefundInput {
+                                                    order_id: input.order_id,
+                                                    terminal_status:
+                                                        OrderTerminalStatus::RefundRequired,
+                                                },
+                                                db_activity_options,
+                                            )
+                                            .await?;
+                                        return Ok(OrderWorkflowOutput {
+                                            order_id: input.order_id,
+                                            terminal_status: finalized.terminal_status,
+                                        });
+                                    }
+                                }
                             }
                             StepFailureDecision::ManualIntervention => {
                                 return Err(anyhow::anyhow!(
@@ -339,6 +392,15 @@ fn execute_activity_options() -> ActivityOptions {
         .build()
 }
 
+fn quote_refresh_child_options(order_id: Uuid, failed_step_id: Uuid) -> ChildWorkflowOptions {
+    ChildWorkflowOptions {
+        workflow_id: format!("order:{order_id}:quote-refresh:{failed_step_id}"),
+        run_timeout: Some(Duration::from_secs(120)),
+        task_timeout: Some(Duration::from_secs(30)),
+        ..Default::default()
+    }
+}
+
 /// Refund child workflow.
 ///
 /// Scar tissue: §5 retry/refund decision, §8 position discovery, and §9 refund tree.
@@ -370,11 +432,44 @@ pub struct QuoteRefreshWorkflow;
 impl QuoteRefreshWorkflow {
     #[run]
     pub async fn run(
-        _ctx: &mut WorkflowContext<Self>,
-        _input: QuoteRefreshWorkflowInput,
+        ctx: &mut WorkflowContext<Self>,
+        input: QuoteRefreshWorkflowInput,
     ) -> WorkflowResult<QuoteRefreshWorkflowOutput> {
-        // TODO(PR4, brief §6 invariant 5; scar §7): quote refresh creates its own attempt.
-        todo!("PR4: orchestrate quote refresh child workflow")
+        let db_activity_options = db_activity_options();
+        let refreshed_attempt = ctx
+            .start_activity(
+                QuoteRefreshActivities::compose_refreshed_quote_attempt,
+                ComposeRefreshedQuoteAttemptInput {
+                    order_id: input.order_id,
+                    stale_attempt_id: input.stale_attempt_id,
+                    failed_step_id: input.failed_step_id,
+                },
+                db_activity_options.clone(),
+            )
+            .await?;
+        if let RefreshedQuoteAttemptOutcome::Untenable { reason, .. } = &refreshed_attempt.outcome {
+            return Ok(QuoteRefreshWorkflowOutput {
+                outcome: QuoteRefreshWorkflowOutcome::Untenable {
+                    reason: reason.clone(),
+                },
+            });
+        }
+        let materialized = ctx
+            .start_activity(
+                QuoteRefreshActivities::materialize_refreshed_attempt,
+                MaterializeRefreshedAttemptInput {
+                    order_id: input.order_id,
+                    refreshed_attempt,
+                },
+                db_activity_options,
+            )
+            .await?;
+        Ok(QuoteRefreshWorkflowOutput {
+            outcome: QuoteRefreshWorkflowOutcome::Refreshed {
+                attempt_id: materialized.attempt_id,
+                steps: materialized.steps,
+            },
+        })
     }
 }
 

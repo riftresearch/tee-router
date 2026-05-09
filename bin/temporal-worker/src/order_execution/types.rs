@@ -90,7 +90,18 @@ pub struct QuoteRefreshWorkflowInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuoteRefreshWorkflowOutput {
-    pub refreshed_attempt_id: WorkflowAttemptId,
+    pub outcome: QuoteRefreshWorkflowOutcome,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum QuoteRefreshWorkflowOutcome {
+    Refreshed {
+        attempt_id: WorkflowAttemptId,
+        steps: Vec<WorkflowExecutionStep>,
+    },
+    Untenable {
+        reason: StaleQuoteRefreshUntenableReason,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -342,7 +353,26 @@ pub struct ComposeRefreshedQuoteAttemptInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefreshedQuoteAttemptShape {
-    pub next_attempt_id: WorkflowAttemptId,
+    pub outcome: RefreshedQuoteAttemptOutcome,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RefreshedQuoteAttemptOutcome {
+    Refreshed {
+        order_id: WorkflowOrderId,
+        stale_attempt_id: WorkflowAttemptId,
+        failed_step_id: WorkflowStepId,
+        plan: ExecutionPlan,
+        failure_reason: Value,
+        superseded_reason: Value,
+        input_custody_snapshot: Value,
+    },
+    Untenable {
+        order_id: WorkflowOrderId,
+        stale_attempt_id: WorkflowAttemptId,
+        failed_step_id: WorkflowStepId,
+        reason: StaleQuoteRefreshUntenableReason,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -354,6 +384,40 @@ pub struct MaterializeRefreshedAttemptInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefreshedAttemptMaterialized {
     pub attempt_id: WorkflowAttemptId,
+    pub steps: Vec<WorkflowExecutionStep>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum StaleQuoteRefreshUntenableReason {
+    RefreshedExactInOutputBelowMinAmountOut {
+        amount_out: String,
+        min_amount_out: String,
+    },
+    RefreshedExactOutInputAboveAvailableAmount {
+        amount_in: String,
+        available_amount: String,
+    },
+    StaleProviderQuoteRefreshUntenable {
+        message: String,
+    },
+}
+
+impl StaleQuoteRefreshUntenableReason {
+    #[must_use]
+    pub fn reason_str(&self) -> &'static str {
+        match self {
+            Self::RefreshedExactInOutputBelowMinAmountOut { .. } => {
+                "refreshed_exact_in_output_below_min_amount_out"
+            }
+            Self::RefreshedExactOutInputAboveAvailableAmount { .. } => {
+                "refreshed_exact_out_input_above_available_amount"
+            }
+            Self::StaleProviderQuoteRefreshUntenable { .. } => {
+                "stale_provider_quote_refresh_untenable"
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

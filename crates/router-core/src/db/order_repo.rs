@@ -283,6 +283,15 @@ pub struct ExecutionAttemptPlan {
 }
 
 #[derive(Debug, Clone)]
+pub struct RefreshedExecutionAttemptPlan {
+    pub legs: Vec<OrderExecutionLeg>,
+    pub steps: Vec<OrderExecutionStep>,
+    pub failure_reason: serde_json::Value,
+    pub superseded_reason: serde_json::Value,
+    pub input_custody_snapshot: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
 pub struct ExecutionAttemptMaterializationRecord {
     pub order: RouterOrder,
     pub attempt: OrderExecutionAttempt,
@@ -2349,6 +2358,340 @@ impl OrderRepository {
         .await;
         telemetry::record_db_query(
             "order.create_retry_execution_attempt_from_failed_step",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        result
+    }
+
+    pub async fn create_refreshed_execution_attempt_from_failed_step(
+        &self,
+        order_id: Uuid,
+        stale_attempt_id: Uuid,
+        failed_step_id: Uuid,
+        plan: RefreshedExecutionAttemptPlan,
+        now: DateTime<Utc>,
+    ) -> RouterCoreResult<ExecutionAttemptMaterializationRecord> {
+        let started = Instant::now();
+        let result = async {
+            let mut tx = self.pool.begin().await?;
+
+            let order_row = sqlx_core::query::query(&format!(
+                r#"
+                SELECT {ORDER_SELECT_COLUMNS}
+                FROM router_orders ro
+                LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
+                LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
+                WHERE ro.id = $1
+                FOR UPDATE OF ro
+                "#
+            ))
+            .bind(order_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let order = self.map_order_row(&order_row)?;
+
+            let stale_attempt_row = sqlx_core::query::query(&format!(
+                r#"
+                SELECT {EXECUTION_ATTEMPT_SELECT_COLUMNS}
+                FROM order_execution_attempts
+                WHERE id = $1
+                FOR UPDATE
+                "#
+            ))
+            .bind(stale_attempt_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let stale_attempt = self.map_execution_attempt_row(&stale_attempt_row)?;
+            if stale_attempt.order_id != order_id {
+                return Err(RouterCoreError::Conflict {
+                    message: format!(
+                        "attempt {} does not belong to order {}",
+                        stale_attempt.id, order_id
+                    ),
+                });
+            }
+            if stale_attempt.status != OrderExecutionAttemptStatus::Failed {
+                return Err(RouterCoreError::Conflict {
+                    message: format!(
+                        "attempt {} cannot be refreshed from {}",
+                        stale_attempt.id,
+                        stale_attempt.status.to_db_string()
+                    ),
+                });
+            }
+
+            let failed_step_row = sqlx_core::query::query(&format!(
+                r#"
+                SELECT {EXECUTION_STEP_SELECT_COLUMNS}
+                FROM order_execution_steps
+                WHERE id = $1
+                FOR UPDATE
+                "#
+            ))
+            .bind(failed_step_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let failed_step = self.map_execution_step_row(&failed_step_row)?;
+            if failed_step.order_id != order_id
+                || failed_step.execution_attempt_id != Some(stale_attempt.id)
+            {
+                return Err(RouterCoreError::Conflict {
+                    message: format!(
+                        "step {} does not belong to order {} attempt {}",
+                        failed_step.id, order_id, stale_attempt.id
+                    ),
+                });
+            }
+
+            let refreshed_attempt_index = stale_attempt.attempt_index + 1;
+            if let Some(existing_refreshed_row) = sqlx_core::query::query(&format!(
+                r#"
+                SELECT {EXECUTION_ATTEMPT_SELECT_COLUMNS}
+                FROM order_execution_attempts
+                WHERE order_id = $1
+                  AND attempt_index = $2
+                ORDER BY created_at ASC, id ASC
+                LIMIT 1
+                FOR UPDATE
+                "#
+            ))
+            .bind(order_id)
+            .bind(refreshed_attempt_index)
+            .fetch_optional(&mut *tx)
+            .await?
+            {
+                let attempt = self.map_execution_attempt_row(&existing_refreshed_row)?;
+                if attempt.attempt_kind != OrderExecutionAttemptKind::RefreshedExecution {
+                    return Err(RouterCoreError::Conflict {
+                        message: format!(
+                            "order {} attempt_index {} already materialized as {}",
+                            order_id,
+                            refreshed_attempt_index,
+                            attempt.attempt_kind.to_db_string()
+                        ),
+                    });
+                }
+                let leg_rows = sqlx_core::query::query(&format!(
+                    r#"
+                    SELECT {EXECUTION_LEG_SELECT_COLUMNS}
+                    FROM order_execution_legs
+                    WHERE execution_attempt_id = $1
+                    ORDER BY leg_index ASC, created_at ASC, id ASC
+                    "#
+                ))
+                .bind(attempt.id)
+                .fetch_all(&mut *tx)
+                .await?;
+                let legs = leg_rows
+                    .iter()
+                    .map(|row| self.map_execution_leg_row(row))
+                    .collect::<RouterCoreResult<Vec<_>>>()?;
+                let step_rows = sqlx_core::query::query(&format!(
+                    r#"
+                    SELECT {EXECUTION_STEP_SELECT_COLUMNS}
+                    FROM order_execution_steps
+                    WHERE execution_attempt_id = $1
+                    ORDER BY step_index ASC, created_at ASC, id ASC
+                    "#
+                ))
+                .bind(attempt.id)
+                .fetch_all(&mut *tx)
+                .await?;
+                let steps = step_rows
+                    .iter()
+                    .map(|row| self.map_execution_step_row(row))
+                    .collect::<RouterCoreResult<Vec<_>>>()?;
+                tx.commit().await?;
+                return Ok::<ExecutionAttemptMaterializationRecord, RouterCoreError>(
+                    ExecutionAttemptMaterializationRecord {
+                        order,
+                        attempt,
+                        legs,
+                        steps,
+                    },
+                );
+            }
+
+            if plan.steps.is_empty() {
+                return Err(RouterCoreError::InvalidData {
+                    message: format!(
+                        "refreshed attempt for order {} has no execution steps",
+                        order_id
+                    ),
+                });
+            }
+
+            let refreshed_attempt = OrderExecutionAttempt {
+                id: Uuid::now_v7(),
+                order_id,
+                attempt_index: refreshed_attempt_index,
+                attempt_kind: OrderExecutionAttemptKind::RefreshedExecution,
+                status: OrderExecutionAttemptStatus::Active,
+                trigger_step_id: Some(failed_step.id),
+                trigger_provider_operation_id: stale_attempt.trigger_provider_operation_id,
+                failure_reason: plan.failure_reason,
+                input_custody_snapshot: plan.input_custody_snapshot,
+                created_at: now,
+                updated_at: now,
+            };
+            let refreshed_attempt_row = sqlx_core::query::query(&format!(
+                r#"
+                INSERT INTO order_execution_attempts (
+                    id,
+                    order_id,
+                    attempt_index,
+                    attempt_kind,
+                    status,
+                    trigger_step_id,
+                    trigger_provider_operation_id,
+                    failure_reason_json,
+                    input_custody_snapshot_json,
+                    superseded_by_attempt_id,
+                    superseded_reason_json,
+                    created_at,
+                    updated_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, '{{}}'::jsonb, $10, $11)
+                RETURNING {EXECUTION_ATTEMPT_SELECT_COLUMNS}
+                "#
+            ))
+            .bind(refreshed_attempt.id)
+            .bind(refreshed_attempt.order_id)
+            .bind(refreshed_attempt.attempt_index)
+            .bind(refreshed_attempt.attempt_kind.to_db_string())
+            .bind(refreshed_attempt.status.to_db_string())
+            .bind(refreshed_attempt.trigger_step_id)
+            .bind(refreshed_attempt.trigger_provider_operation_id)
+            .bind(refreshed_attempt.failure_reason.clone())
+            .bind(refreshed_attempt.input_custody_snapshot.clone())
+            .bind(refreshed_attempt.created_at)
+            .bind(refreshed_attempt.updated_at)
+            .fetch_one(&mut *tx)
+            .await?;
+            let refreshed_attempt = self.map_execution_attempt_row(&refreshed_attempt_row)?;
+
+            let mut refreshed_legs = Vec::with_capacity(plan.legs.len());
+            for mut leg in plan.legs {
+                leg.order_id = order_id;
+                leg.execution_attempt_id = Some(refreshed_attempt.id);
+                leg.status = OrderExecutionStepStatus::Planned;
+                leg.actual_amount_in = None;
+                leg.actual_amount_out = None;
+                leg.started_at = None;
+                leg.completed_at = None;
+                leg.created_at = now;
+                leg.updated_at = now;
+                set_json_value(
+                    &mut leg.details,
+                    "refreshed_from_attempt_id",
+                    serde_json::json!(stale_attempt.id),
+                );
+                set_json_value(
+                    &mut leg.details,
+                    "refreshed_from_step_id",
+                    serde_json::json!(failed_step.id),
+                );
+                insert_execution_leg_tx(&mut tx, &leg).await?;
+                refreshed_legs.push(leg);
+            }
+
+            let known_leg_ids = refreshed_legs
+                .iter()
+                .map(|leg| leg.id)
+                .collect::<std::collections::BTreeSet<_>>();
+            let mut refreshed_steps = Vec::with_capacity(plan.steps.len());
+            for mut step in plan.steps {
+                if let Some(execution_leg_id) = step.execution_leg_id {
+                    if !known_leg_ids.contains(&execution_leg_id) {
+                        return Err(RouterCoreError::InvalidData {
+                            message: format!(
+                                "refreshed step {} references unmaterialized execution leg {}",
+                                step.id, execution_leg_id
+                            ),
+                        });
+                    }
+                }
+                step.order_id = order_id;
+                step.execution_attempt_id = Some(refreshed_attempt.id);
+                step.status = OrderExecutionStepStatus::Planned;
+                step.tx_hash = None;
+                step.provider_ref = None;
+                step.idempotency_key = Some(format!(
+                    "order:{order_id}:attempt:{refreshed_attempt_index}:{}:{}",
+                    step.provider, step.step_index
+                ));
+                step.attempt_count = 0;
+                step.next_attempt_at = None;
+                step.started_at = None;
+                step.completed_at = None;
+                step.response = serde_json::json!({});
+                step.error = serde_json::json!({});
+                step.created_at = now;
+                step.updated_at = now;
+                set_json_value(
+                    &mut step.details,
+                    "refreshed_from_attempt_id",
+                    serde_json::json!(stale_attempt.id),
+                );
+                set_json_value(
+                    &mut step.details,
+                    "refreshed_from_step_id",
+                    serde_json::json!(failed_step.id),
+                );
+                insert_execution_step_tx(&mut tx, &step).await?;
+                refreshed_steps.push(step);
+            }
+
+            sqlx_core::query::query(
+                r#"
+                UPDATE order_execution_steps
+                SET
+                    status = 'superseded',
+                    error_json = $3,
+                    completed_at = COALESCE(completed_at, $4),
+                    updated_at = $4
+                WHERE execution_attempt_id = $1
+                  AND step_index >= $2
+                  AND status IN ('failed', 'planned', 'ready', 'waiting', 'running')
+                "#,
+            )
+            .bind(stale_attempt.id)
+            .bind(failed_step.step_index)
+            .bind(plan.superseded_reason.clone())
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            sqlx_core::query::query(
+                r#"
+                UPDATE order_execution_attempts
+                SET
+                    superseded_by_attempt_id = $2,
+                    superseded_reason_json = $3,
+                    updated_at = $4
+                WHERE id = $1
+                "#,
+            )
+            .bind(stale_attempt.id)
+            .bind(refreshed_attempt.id)
+            .bind(plan.superseded_reason)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+            Ok::<ExecutionAttemptMaterializationRecord, RouterCoreError>(
+                ExecutionAttemptMaterializationRecord {
+                    order,
+                    attempt: refreshed_attempt,
+                    legs: refreshed_legs,
+                    steps: refreshed_steps,
+                },
+            )
+        }
+        .await;
+        telemetry::record_db_query(
+            "order.create_refreshed_execution_attempt_from_failed_step",
             result.is_ok(),
             started.elapsed(),
         );
