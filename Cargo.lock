@@ -6118,11 +6118,13 @@ dependencies = [
  "reqwest",
  "router-core",
  "router-server",
+ "router-temporal",
  "sauron",
  "serde_json",
  "sqlx-core",
  "sqlx-postgres",
  "tempfile",
+ "temporal-worker",
  "testcontainers",
  "tokio",
  "url",
@@ -6187,6 +6189,7 @@ dependencies = [
  "reqwest",
  "router-core",
  "router-primitives",
+ "router-temporal",
  "secrecy",
  "serde",
  "serde_json",
@@ -6212,9 +6215,8 @@ version = "0.1.8"
 dependencies = [
  "serde",
  "snafu",
- "temporalio-client",
  "temporalio-common",
- "temporalio-sdk-core",
+ "tonic 0.14.5",
  "url",
  "uuid",
 ]
@@ -6462,6 +6464,7 @@ dependencies = [
  "router-core",
  "router-primitives",
  "router-server",
+ "router-temporal",
  "serde",
  "serde_json",
  "sha2",
@@ -6469,6 +6472,7 @@ dependencies = [
  "sqlx-core",
  "sqlx-postgres",
  "tempfile",
+ "temporal-worker",
  "testcontainers",
  "tokio",
  "tracing",
@@ -7785,6 +7789,7 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
+ "webpki-roots 1.0.7",
 ]
 
 [[package]]

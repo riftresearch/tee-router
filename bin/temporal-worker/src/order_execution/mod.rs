@@ -4,7 +4,11 @@ pub mod workflows;
 
 pub use router_temporal::{
     order_workflow_id, provider_hint_poll_workflow_id, quote_refresh_workflow_id,
-    refund_workflow_id, workflow_start_options, DEFAULT_TASK_QUEUE,
+    refund_workflow_id, DEFAULT_TASK_QUEUE,
+};
+use temporalio_client::WorkflowStartOptions;
+use temporalio_common::protos::temporal::api::enums::v1::{
+    WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
 };
 use temporalio_sdk::{Worker, WorkerOptions};
 use temporalio_sdk_core::CoreRuntime;
@@ -73,4 +77,12 @@ pub async fn build_worker(
         })?;
 
     Ok(BuiltOrderWorker { runtime, worker })
+}
+
+#[must_use]
+pub fn workflow_start_options(task_queue: &str, workflow_id: &str) -> WorkflowStartOptions {
+    WorkflowStartOptions::new(task_queue.to_owned(), workflow_id.to_owned())
+        .id_reuse_policy(WorkflowIdReusePolicy::AllowDuplicateFailedOnly)
+        .id_conflict_policy(WorkflowIdConflictPolicy::Fail)
+        .build()
 }

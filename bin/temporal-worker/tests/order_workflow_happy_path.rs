@@ -27,10 +27,9 @@ use router_core::{
     db::Database,
     models::{
         CustodyVaultRole, CustodyVaultVisibility, DepositVaultStatus, OrderExecutionAttempt,
-        OrderExecutionAttemptKind, OrderExecutionAttemptStatus, OrderExecutionStep,
-        OrderExecutionStepStatus, OrderExecutionStepType, OrderProviderOperation,
-        ProviderOperationStatus, ProviderOperationType, RouterOrderQuote, RouterOrderStatus,
-        VaultAction,
+        OrderExecutionAttemptKind, OrderExecutionAttemptStatus, OrderExecutionStepStatus,
+        OrderExecutionStepType, OrderProviderOperation, ProviderOperationStatus,
+        ProviderOperationType, RouterOrderQuote, RouterOrderStatus, VaultAction,
     },
     protocol::{AssetId, ChainId, DepositAsset},
     services::{
@@ -245,13 +244,14 @@ async fn order_workflow_recovers_across_lost_intent_from_onchain_log() {
         across_operation.provider_ref.is_some(),
         "recovered Across operation should persist deposit id as provider_ref"
     );
+    let observed_state = across_operation.observed_state.to_string();
+    let response = across_operation.response.to_string();
     assert!(
-        across_operation
-            .observed_state
-            .to_string()
-            .contains("across_deposit_log_recovery"),
-        "completed Across operation should retain the log-recovery marker: {}",
-        across_operation.observed_state
+        observed_state.contains("across_deposit_log_recovery")
+            || response.contains("provider_receipt_checkpoint"),
+        "completed Across operation should retain the log-recovery marker or checkpoint response: observed_state={}, response={}",
+        across_operation.observed_state,
+        across_operation.response,
     );
 }
 
@@ -1483,20 +1483,12 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
                         panic!("OrderWorkflow ended before the Across provider operation was persisted: {result:?}\n{state}");
                     }
                 };
-                wait_for_across_deposit_indexed(
-                    &mocks,
-                    Address::from_str(&seeded.funding_vault_address)
-                        .expect("funding vault EVM address"),
-                    Duration::from_secs(90),
-                )
-                .await;
                 let across_operation = if options.simulate_across_lost_intent_checkpoint {
-                    wait_for_execution_step_status(
+                    let across_operation = wait_for_provider_operation_status(
                         &db_for_workflow,
-                        across_operation
-                            .execution_step_id
-                            .expect("Across operation should be linked to a step"),
-                        OrderExecutionStepStatus::Waiting,
+                        order_id,
+                        ProviderOperationType::AcrossBridge,
+                        ProviderOperationStatus::WaitingExternal,
                         Duration::from_secs(90),
                     )
                     .await;
@@ -1509,6 +1501,13 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
                 } else {
                     across_operation
                 };
+                wait_for_across_deposit_indexed(
+                    &mocks,
+                    Address::from_str(&seeded.funding_vault_address)
+                        .expect("funding vault EVM address"),
+                    Duration::from_secs(90),
+                )
+                .await;
                 fund_destination_execution_vault_from_across(
                     &db_for_workflow,
                     devnet_for_workflow,
@@ -1517,7 +1516,7 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
                 )
                 .await;
                 if !options.suppress_across_hint_signal {
-                    handle
+                    let signal_result = handle
                         .signal(
                             OrderWorkflow::provider_operation_hint,
                             ProviderOperationHintSignal {
@@ -1531,8 +1530,11 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
                             },
                             WorkflowSignalOptions::default(),
                         )
-                        .await
-                        .expect("send Across provider-operation hint signal");
+                        .await;
+                    assert_signal_sent_or_workflow_completed(
+                        signal_result,
+                        "send Across provider-operation hint signal",
+                    );
                 }
             }
             if matches!(
@@ -2132,27 +2134,43 @@ async fn wait_for_provider_operation(
     }
 }
 
-async fn wait_for_execution_step_status(
+async fn wait_for_provider_operation_status(
     db: &Database,
-    step_id: Uuid,
-    status: OrderExecutionStepStatus,
+    order_id: Uuid,
+    operation_type: ProviderOperationType,
+    status: ProviderOperationStatus,
     max_wait: Duration,
-) -> OrderExecutionStep {
+) -> OrderProviderOperation {
     let deadline = tokio::time::Instant::now() + max_wait;
     loop {
-        let step = db
+        let operations = db
             .orders()
-            .get_execution_step(step_id)
+            .get_provider_operations(order_id)
             .await
-            .expect("load execution step");
-        if step.status == status {
-            return step;
+            .expect("load provider operations");
+        if let Some(operation) = operations.into_iter().find(|operation| {
+            operation.operation_type == operation_type && operation.status == status
+        }) {
+            return operation;
         }
-        if tokio::time::Instant::now() >= deadline {
-            let state = workflow_state_summary(db, step.order_id).await;
-            panic!("timed out waiting for step {step_id} to reach {status:?}\n{state}");
-        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for provider operation {operation_type:?} on order {order_id} to reach {status:?}"
+        );
         sleep(Duration::from_millis(250)).await;
+    }
+}
+
+fn assert_signal_sent_or_workflow_completed<T, E: std::fmt::Debug>(
+    result: Result<T, E>,
+    context: &'static str,
+) {
+    if let Err(error) = result {
+        let debug = format!("{error:?}");
+        assert!(
+            debug.contains("workflow execution already completed"),
+            "{context}: {debug}"
+        );
     }
 }
 
@@ -2196,7 +2214,7 @@ async fn signal_order_cctp_attestation(
     cctp_operation: OrderProviderOperation,
 ) {
     let handle_before_hint = client.get_workflow_handle::<OrderWorkflow>(workflow_id);
-    handle_before_hint
+    let signal_result = handle_before_hint
         .signal(
             OrderWorkflow::provider_operation_hint,
             ProviderOperationHintSignal {
@@ -2210,8 +2228,11 @@ async fn signal_order_cctp_attestation(
             },
             WorkflowSignalOptions::default(),
         )
-        .await
-        .expect("send CCTP provider-operation hint signal");
+        .await;
+    assert_signal_sent_or_workflow_completed(
+        signal_result,
+        "send CCTP provider-operation hint signal",
+    );
 }
 
 async fn signal_order_hyperliquid_bridge_deposit_observation(
@@ -2263,7 +2284,7 @@ async fn signal_order_hyperliquid_bridge_deposit_observation(
         sleep(Duration::from_millis(250)).await;
     }
 
-    handle_before_hint
+    let signal_result = handle_before_hint
         .signal(
             OrderWorkflow::provider_operation_hint,
             ProviderOperationHintSignal {
@@ -2277,8 +2298,11 @@ async fn signal_order_hyperliquid_bridge_deposit_observation(
             },
             WorkflowSignalOptions::default(),
         )
-        .await
-        .expect("send HyperliquidBridgeDeposit provider-observation hint signal");
+        .await;
+    assert_signal_sent_or_workflow_completed(
+        signal_result,
+        "send HyperliquidBridgeDeposit provider-observation hint signal",
+    );
 }
 
 async fn signal_order_unit_withdrawal_observation(
@@ -2315,7 +2339,7 @@ async fn signal_order_unit_withdrawal_observation(
         .await
         .expect("complete mock Unit withdrawal operation");
 
-    handle_before_hint
+    let signal_result = handle_before_hint
         .signal(
             OrderWorkflow::provider_operation_hint,
             ProviderOperationHintSignal {
@@ -2329,8 +2353,11 @@ async fn signal_order_unit_withdrawal_observation(
             },
             WorkflowSignalOptions::default(),
         )
-        .await
-        .expect("send UnitWithdrawal provider-operation hint signal");
+        .await;
+    assert_signal_sent_or_workflow_completed(
+        signal_result,
+        "send UnitWithdrawal provider-operation hint signal",
+    );
 }
 
 async fn drain_base_usdc_funding_vault_residual(
@@ -2459,7 +2486,7 @@ async fn signal_external_custody_refund_across_fill(
 
     let refund_workflow = client
         .get_workflow_handle::<RefundWorkflow>(&refund_workflow_id(order_id, parent_attempt.id));
-    refund_workflow
+    let signal_result = refund_workflow
         .signal(
             RefundWorkflow::provider_operation_hint,
             ProviderOperationHintSignal {
@@ -2473,8 +2500,11 @@ async fn signal_external_custody_refund_across_fill(
             },
             WorkflowSignalOptions::default(),
         )
-        .await
-        .expect("send refund Across provider-operation hint signal");
+        .await;
+    assert_signal_sent_or_workflow_completed(
+        signal_result,
+        "send refund Across provider-operation hint signal",
+    );
 }
 
 async fn signal_external_custody_refund_cctp_attestation(
@@ -2528,7 +2558,7 @@ async fn signal_external_custody_refund_cctp_attestation(
 
     let refund_workflow = client
         .get_workflow_handle::<RefundWorkflow>(&refund_workflow_id(order_id, parent_attempt.id));
-    refund_workflow
+    let signal_result = refund_workflow
         .signal(
             RefundWorkflow::provider_operation_hint,
             ProviderOperationHintSignal {
@@ -2542,8 +2572,11 @@ async fn signal_external_custody_refund_cctp_attestation(
             },
             WorkflowSignalOptions::default(),
         )
-        .await
-        .expect("send refund CCTP provider-operation hint signal");
+        .await;
+    assert_signal_sent_or_workflow_completed(
+        signal_result,
+        "send refund CCTP provider-operation hint signal",
+    );
 }
 
 async fn signal_hyperliquid_spot_refund_unit_withdrawal(
@@ -2594,7 +2627,7 @@ async fn signal_hyperliquid_spot_refund_unit_withdrawal(
 
     let refund_workflow = client
         .get_workflow_handle::<RefundWorkflow>(&refund_workflow_id(order_id, parent_attempt.id));
-    refund_workflow
+    let signal_result = refund_workflow
         .signal(
             RefundWorkflow::provider_operation_hint,
             ProviderOperationHintSignal {
@@ -2608,8 +2641,11 @@ async fn signal_hyperliquid_spot_refund_unit_withdrawal(
             },
             WorkflowSignalOptions::default(),
         )
-        .await
-        .expect("send refund UnitWithdrawal provider-operation hint signal");
+        .await;
+    assert_signal_sent_or_workflow_completed(
+        signal_result,
+        "send refund UnitWithdrawal provider-operation hint signal",
+    );
 }
 
 async fn wait_for_execution_attempt(

@@ -8,8 +8,7 @@ repository.workspace = true
 [dependencies]
 serde = { workspace = true }
 snafu = { workspace = true }
-temporalio-client = { workspace = true }
 temporalio-common = { workspace = true }
-temporalio-sdk-core = { workspace = true }
+tonic = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
