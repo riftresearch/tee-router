@@ -1,8 +1,10 @@
 #![allow(dead_code)]
 
 // Activity function constants are registered before the later rewrite slices invoke them.
-use std::sync::Arc;
+use std::{str::FromStr, sync::Arc};
 
+use alloy::primitives::U256;
+use chains::{ChainRegistry, UserDepositCandidateStatus};
 use chrono::Utc;
 use router_core::{
     db::{
@@ -16,10 +18,10 @@ use router_core::{
         MarketOrderKindType, MarketOrderQuote, OrderExecutionAttempt, OrderExecutionAttemptKind,
         OrderExecutionAttemptStatus, OrderExecutionLeg, OrderExecutionStep,
         OrderExecutionStepStatus, OrderExecutionStepType, OrderProviderAddress,
-        OrderProviderOperation, ProviderOperationStatus, ProviderOperationType, RouterOrder,
-        RouterOrderQuote,
+        OrderProviderOperation, ProviderAddressRole, ProviderOperationStatus,
+        ProviderOperationType, RouterOrder, RouterOrderQuote,
     },
-    protocol::{AssetId, ChainId, DepositAsset},
+    protocol::{backend_chain_for_id, AssetId, ChainId, DepositAsset},
     services::{
         action_providers::{
             unit_withdrawal_minimum_raw, BridgeExecutionRequest, BridgeQuote, BridgeQuoteRequest,
@@ -41,6 +43,7 @@ use router_core::{
         ProviderOperationIntent,
     },
 };
+use router_primitives::{ChainType, Currency, TokenIdentifier};
 use serde_json::{json, Value};
 use temporalio_macros::activities;
 use temporalio_sdk::activities::{ActivityContext, ActivityError};
@@ -58,14 +61,14 @@ use super::types::{
     PersistProviderOperationStatusInput, PersistProviderReceiptInput, PersistStepFailedInput,
     PersistStepReadyToFireInput, PersistStepTerminalStatusInput, PersistenceBoundary,
     PollProviderOperationHintsInput, ProviderActionDispatchShape, ProviderHintKind, ProviderKind,
-    ProviderOperationHintDecision, ProviderOperationHintSignal, ProviderOperationHintVerified,
-    ProviderOperationHintsPolled, RecoverAcrossOnchainLogInput, RecoverablePositionKind,
-    RefreshedAttemptMaterialized, RefreshedQuoteAttemptOutcome, RefreshedQuoteAttemptShape,
-    RefundPlanOutcome, RefundPlanShape, RefundUntenableReason, SettleProviderStepInput,
-    SingleRefundPosition, SingleRefundPositionDiscovery, SingleRefundPositionOutcome,
-    StaleQuoteRefreshUntenableReason, StaleRunningStepClassified, StaleRunningStepDecision,
-    StepExecuted, StepExecutionOutcome, StepFailureDecision, VerifyProviderOperationHintInput,
-    WorkflowExecutionStep, WriteFailedAttemptSnapshotInput,
+    ProviderOperationHintDecision, ProviderOperationHintEvidence, ProviderOperationHintSignal,
+    ProviderOperationHintVerified, ProviderOperationHintsPolled, RecoverAcrossOnchainLogInput,
+    RecoverablePositionKind, RefreshedAttemptMaterialized, RefreshedQuoteAttemptOutcome,
+    RefreshedQuoteAttemptShape, RefundPlanOutcome, RefundPlanShape, RefundUntenableReason,
+    SettleProviderStepInput, SingleRefundPosition, SingleRefundPositionDiscovery,
+    SingleRefundPositionOutcome, StaleQuoteRefreshUntenableReason, StaleRunningStepClassified,
+    StaleRunningStepDecision, StepExecuted, StepExecutionOutcome, StepFailureDecision,
+    VerifyProviderOperationHintInput, WorkflowExecutionStep, WriteFailedAttemptSnapshotInput,
 };
 
 const MAX_EXECUTION_ATTEMPTS: i32 = 2;
@@ -78,6 +81,7 @@ pub struct OrderActivityDeps {
     pub db: Database,
     pub action_providers: Arc<ActionProviderRegistry>,
     pub custody_action_executor: Arc<CustodyActionExecutor>,
+    pub chain_registry: Arc<ChainRegistry>,
     pub planner: MarketOrderRoutePlanner,
 }
 
@@ -87,12 +91,14 @@ impl OrderActivityDeps {
         db: Database,
         action_providers: Arc<ActionProviderRegistry>,
         custody_action_executor: Arc<CustodyActionExecutor>,
+        chain_registry: Arc<ChainRegistry>,
     ) -> Self {
         let planner = MarketOrderRoutePlanner::new(action_providers.asset_registry());
         Self {
             db,
             action_providers,
             custody_action_executor,
+            chain_registry,
             planner,
         }
     }
@@ -1293,6 +1299,7 @@ async fn hydrate_destination_execution_steps(
     steps: Vec<OrderExecutionStep>,
 ) -> Result<Vec<OrderExecutionStep>, ActivityError> {
     let mut destination_execution_vault: Option<CustodyVault> = None;
+    let mut hyperliquid_spot_vault: Option<CustodyVault> = None;
     let mut hydrated = Vec::with_capacity(steps.len());
 
     for mut step in steps {
@@ -1452,6 +1459,35 @@ async fn hydrate_destination_execution_steps(
         if json_string_equals(
             &step.request,
             "hyperliquid_custody_vault_role",
+            CustodyVaultRole::HyperliquidSpot.to_db_string(),
+        ) {
+            let vault =
+                ensure_hyperliquid_spot_vault(deps, order_id, &mut hyperliquid_spot_vault).await?;
+            set_json_value(
+                &mut step.request,
+                "hyperliquid_custody_vault_id",
+                json!(vault.id),
+            );
+            set_json_value(
+                &mut step.request,
+                "hyperliquid_custody_vault_address",
+                json!(vault.address),
+            );
+            set_json_value(
+                &mut step.details,
+                "hyperliquid_custody_vault_id",
+                json!(vault.id),
+            );
+            set_json_value(
+                &mut step.details,
+                "hyperliquid_custody_vault_address",
+                json!(vault.address),
+            );
+        }
+
+        if json_string_equals(
+            &step.request,
+            "hyperliquid_custody_vault_role",
             CustodyVaultRole::DestinationExecution.to_db_string(),
         ) {
             let chain_id = step
@@ -1521,6 +1557,64 @@ async fn hydrate_destination_execution_steps(
     }
 
     Ok(hydrated)
+}
+
+async fn ensure_hyperliquid_spot_vault(
+    deps: &OrderActivityDeps,
+    order_id: Uuid,
+    cache: &mut Option<CustodyVault>,
+) -> Result<CustodyVault, ActivityError> {
+    if let Some(vault) = cache.as_ref() {
+        return Ok(vault.clone());
+    }
+
+    if let Some(vault) = find_hyperliquid_spot_vault(deps, order_id).await? {
+        *cache = Some(vault.clone());
+        return Ok(vault);
+    }
+
+    let created = deps
+        .custody_action_executor
+        .create_router_derived_vault(
+            order_id,
+            CustodyVaultRole::HyperliquidSpot,
+            CustodyVaultVisibility::Internal,
+            ChainId::parse("hyperliquid").map_err(activity_error)?,
+            None,
+            json!({ "source": "order_workflow_plan_hydration" }),
+        )
+        .await;
+    let vault = match created {
+        Ok(vault) => vault,
+        Err(CustodyActionError::Database { source }) if is_unique_violation(&source) => {
+            find_hyperliquid_spot_vault(deps, order_id)
+                .await?
+                .ok_or_else(|| {
+                    activity_error(format!(
+                        "HyperliquidSpot custody vault unique violation for order {order_id} but re-read returned none"
+                    ))
+                })?
+        }
+        Err(source) => return Err(activity_error_from_display(source)),
+    };
+    *cache = Some(vault.clone());
+    Ok(vault)
+}
+
+async fn find_hyperliquid_spot_vault(
+    deps: &OrderActivityDeps,
+    order_id: Uuid,
+) -> Result<Option<CustodyVault>, ActivityError> {
+    let vaults = deps
+        .db
+        .orders()
+        .get_custody_vaults(order_id)
+        .await
+        .map_err(activity_error_from_display)?;
+    Ok(vaults.into_iter().find(|vault| {
+        vault.role == CustodyVaultRole::HyperliquidSpot
+            && vault.chain == ChainId::parse("hyperliquid").expect("valid hyperliquid chain id")
+    }))
 }
 
 async fn ensure_destination_execution_vault(
@@ -6280,7 +6374,8 @@ impl ProviderObservationActivities {
                 todo!("PR7b: CctpAttestation verifier")
             }
             ProviderHintKind::UnitDeposit => {
-                todo!("PR7b: UnitDeposit verifier")
+                let deps = self.deps()?;
+                verify_unit_deposit_hint(&deps, input).await
             }
             ProviderHintKind::ProviderObservation => {
                 let deps = self.deps()?;
@@ -6382,6 +6477,7 @@ async fn poll_provider_operation_hint_for_step(
         provider,
         hint_kind,
         provider_ref: operation.provider_ref.clone(),
+        evidence: None,
     };
     let verified = match hint_kind {
         ProviderHintKind::AcrossFill => {
@@ -6406,9 +6502,18 @@ async fn poll_provider_operation_hint_for_step(
             )
             .await?
         }
-        ProviderHintKind::CctpAttestation
-        | ProviderHintKind::UnitDeposit
-        | ProviderHintKind::HyperliquidTrade => {
+        ProviderHintKind::UnitDeposit => {
+            verify_unit_deposit_hint(
+                deps,
+                VerifyProviderOperationHintInput {
+                    order_id: input.order_id,
+                    step_id: input.step_id,
+                    signal,
+                },
+            )
+            .await?
+        }
+        ProviderHintKind::CctpAttestation | ProviderHintKind::HyperliquidTrade => {
             return Ok(provider_hints_polled(provider_hint_deferred(
                 Some(operation.id),
                 format!("polling for {hint_kind:?} is deferred to a later PR7b verifier"),
@@ -6425,11 +6530,12 @@ fn polling_hint_shape_for_operation(
         ProviderOperationType::AcrossBridge => {
             Some((ProviderKind::Bridge, ProviderHintKind::AcrossFill))
         }
-        // PR7b-i intentionally proves the polling architecture with Across.
-        // Typed CCTP, Unit, and Hyperliquid pollers are added in the following
-        // PR7b verifier slices.
+        ProviderOperationType::UnitDeposit => {
+            Some((ProviderKind::Unit, ProviderHintKind::UnitDeposit))
+        }
+        // Typed CCTP, UnitWithdrawal, and Hyperliquid pollers are added in the
+        // following PR7b verifier slices.
         ProviderOperationType::CctpBridge
-        | ProviderOperationType::UnitDeposit
         | ProviderOperationType::UnitWithdrawal
         | ProviderOperationType::HyperliquidTrade
         | ProviderOperationType::HyperliquidLimitOrder
@@ -6509,13 +6615,7 @@ async fn verify_across_fill_hint(
             request: operation.request.clone(),
             response: operation.response.clone(),
             observed_state: operation.observed_state.clone(),
-            hint_evidence: json!({
-                "source": "temporal_provider_operation_hint_signal",
-                "hint_id": input.signal.hint_id,
-                "provider": input.signal.provider,
-                "hint_kind": input.signal.hint_kind,
-                "provider_ref": input.signal.provider_ref,
-            }),
+            hint_evidence: provider_hint_signal_evidence(&input.signal),
         })
         .await
         .map_err(activity_error)?;
@@ -6584,6 +6684,235 @@ async fn verify_across_fill_hint(
     }
 }
 
+async fn verify_unit_deposit_hint(
+    deps: &OrderActivityDeps,
+    input: VerifyProviderOperationHintInput,
+) -> Result<ProviderOperationHintVerified, ActivityError> {
+    let Some(provider_operation_id) = input.signal.provider_operation_id else {
+        return Ok(provider_hint_deferred(
+            None,
+            "UnitDeposit hint missing provider_operation_id",
+        ));
+    };
+    let operation = deps
+        .db
+        .orders()
+        .get_provider_operation(provider_operation_id)
+        .await
+        .map_err(activity_error_from_display)?;
+
+    if operation.order_id != input.order_id {
+        return Ok(provider_hint_rejected(
+            Some(provider_operation_id),
+            format!(
+                "provider operation {} belongs to order {}, not {}",
+                operation.id, operation.order_id, input.order_id
+            ),
+        ));
+    }
+    if operation.execution_step_id != Some(input.step_id) {
+        return Ok(provider_hint_deferred(
+            Some(provider_operation_id),
+            format!(
+                "provider operation {} belongs to step {:?}, not {}",
+                operation.id, operation.execution_step_id, input.step_id
+            ),
+        ));
+    }
+    if operation.operation_type != ProviderOperationType::UnitDeposit {
+        return Ok(provider_hint_rejected(
+            Some(provider_operation_id),
+            format!(
+                "UnitDeposit hint cannot verify {} operation",
+                operation.operation_type.to_db_string()
+            ),
+        ));
+    }
+    if matches!(
+        operation.status,
+        ProviderOperationStatus::Completed
+            | ProviderOperationStatus::Failed
+            | ProviderOperationStatus::Expired
+    ) {
+        return Ok(ProviderOperationHintVerified {
+            provider_operation_id: Some(operation.id),
+            decision: if operation.status == ProviderOperationStatus::Completed {
+                ProviderOperationHintDecision::Accept
+            } else {
+                ProviderOperationHintDecision::Reject
+            },
+            reason: Some(format!(
+                "provider operation already terminal: {}",
+                operation.status.to_db_string()
+            )),
+        });
+    }
+
+    let Some(evidence) = input.signal.evidence.as_ref() else {
+        return verify_provider_observation_hint(deps, input).await;
+    };
+    if evidence.tx_hash.trim().is_empty() {
+        return Ok(provider_hint_rejected(
+            Some(provider_operation_id),
+            "UnitDeposit evidence tx_hash is empty",
+        ));
+    }
+    if evidence.address.trim().is_empty() {
+        return Ok(provider_hint_rejected(
+            Some(provider_operation_id),
+            "UnitDeposit evidence address is empty",
+        ));
+    }
+
+    let addresses = deps
+        .db
+        .orders()
+        .get_provider_addresses_by_operation(operation.id)
+        .await
+        .map_err(activity_error_from_display)?;
+    let Some(provider_address) = addresses.iter().find(|address| {
+        address.role == ProviderAddressRole::UnitDeposit
+            && address.address.eq_ignore_ascii_case(&evidence.address)
+    }) else {
+        return Ok(provider_hint_rejected(
+            Some(provider_operation_id),
+            format!(
+                "evidence address {} does not match a UnitDeposit provider address",
+                evidence.address
+            ),
+        ));
+    };
+    let verified_amount =
+        match verify_unit_deposit_candidate(deps, provider_address, evidence).await {
+            Ok(amount) => amount,
+            Err(reason) => return Ok(provider_hint_rejected(Some(provider_operation_id), reason)),
+        };
+    let step = deps
+        .db
+        .orders()
+        .get_execution_step(input.step_id)
+        .await
+        .map_err(activity_error_from_display)?;
+    let expected_amount =
+        match expected_provider_operation_amount(&operation, Some(&step), input.signal.hint_id) {
+            Ok(amount) => amount,
+            Err(reason) => return Ok(provider_hint_rejected(Some(provider_operation_id), reason)),
+        };
+    if verified_amount < expected_amount {
+        return Ok(provider_hint_rejected(
+            Some(provider_operation_id),
+            format!("observed amount {verified_amount} is below expected amount {expected_amount}"),
+        ));
+    }
+
+    let provider = deps
+        .action_providers
+        .unit(&operation.provider)
+        .ok_or_else(|| {
+            activity_error(format!(
+                "unit provider {} is not configured",
+                operation.provider
+            ))
+        })?;
+    let provider_observation = provider
+        .observe_unit_operation(ProviderOperationObservationRequest {
+            operation_id: operation.id,
+            operation_type: operation.operation_type,
+            provider_ref: operation.provider_ref.clone(),
+            request: operation.request.clone(),
+            response: operation.response.clone(),
+            observed_state: operation.observed_state.clone(),
+            hint_evidence: unit_deposit_evidence_json(evidence),
+        })
+        .await
+        .map_err(activity_error)?;
+    let (status, provider_observed_state, provider_tx_hash, provider_error, provider_response) =
+        if let Some(observation) = provider_observation {
+            (
+                observation.status,
+                json_object_or_wrapped(observation.observed_state),
+                observation.tx_hash,
+                observation.error,
+                observation.response,
+            )
+        } else {
+            (
+                ProviderOperationStatus::WaitingExternal,
+                json!({}),
+                None,
+                None,
+                None,
+            )
+        };
+    let tx_hash = provider_tx_hash.unwrap_or_else(|| evidence.tx_hash.clone());
+    let mut observed_state = json!({
+        "source": "temporal_provider_operation_hint_validation",
+        "hint_id": input.signal.hint_id,
+        "hint_kind": input.signal.hint_kind,
+        "evidence": unit_deposit_evidence_json(evidence),
+        "validated_provider_address_id": provider_address.id,
+        "expected_amount": expected_amount.to_string(),
+        "observed_amount": verified_amount.to_string(),
+        "transfer_index": evidence.transfer_index,
+        "chain_verified": true,
+        "tx_hash": &tx_hash,
+        "provider_observed_state": provider_observed_state,
+    });
+    if let Some(error) = provider_error {
+        observed_state["provider_error"] = error;
+    }
+    let response = provider_response.or_else(|| {
+        Some(json!({
+            "kind": "provider_operation_hint_validation",
+            "provider": &operation.provider,
+            "operation_id": operation.id,
+            "hint_id": input.signal.hint_id,
+            "tx_hash": &tx_hash,
+            "amount": verified_amount.to_string(),
+            "chain_verified": true,
+        }))
+    });
+    let (updated, _) = deps
+        .db
+        .orders()
+        .update_provider_operation_status(
+            operation.id,
+            status,
+            operation.provider_ref.clone(),
+            observed_state,
+            response,
+            Utc::now(),
+        )
+        .await
+        .map_err(activity_error_from_display)?;
+
+    match updated.status {
+        ProviderOperationStatus::Completed => Ok(ProviderOperationHintVerified {
+            provider_operation_id: Some(updated.id),
+            decision: ProviderOperationHintDecision::Accept,
+            reason: None,
+        }),
+        ProviderOperationStatus::Failed | ProviderOperationStatus::Expired => {
+            Ok(provider_hint_rejected(
+                Some(updated.id),
+                format!(
+                    "UnitDeposit observation returned {}",
+                    updated.status.to_db_string()
+                ),
+            ))
+        }
+        ProviderOperationStatus::Planned
+        | ProviderOperationStatus::Submitted
+        | ProviderOperationStatus::WaitingExternal => Ok(provider_hint_deferred(
+            Some(updated.id),
+            format!(
+                "UnitDeposit observation returned {}",
+                updated.status.to_db_string()
+            ),
+        )),
+    }
+}
+
 async fn verify_provider_observation_hint(
     deps: &OrderActivityDeps,
     input: VerifyProviderOperationHintInput,
@@ -6646,13 +6975,7 @@ async fn verify_provider_observation_hint(
         request: operation.request.clone(),
         response: operation.response.clone(),
         observed_state: operation.observed_state.clone(),
-        hint_evidence: json!({
-            "source": "temporal_provider_operation_hint_signal",
-            "hint_id": input.signal.hint_id,
-            "provider": input.signal.provider,
-            "hint_kind": input.signal.hint_kind,
-            "provider_ref": input.signal.provider_ref,
-        }),
+        hint_evidence: provider_hint_signal_evidence(&input.signal),
     };
     let observation = match operation.operation_type {
         ProviderOperationType::AcrossBridge
@@ -6828,6 +7151,124 @@ fn provider_hint_observed_state(
         observed_state["previous_observed_state"] = operation.observed_state.clone();
     }
     observed_state
+}
+
+fn provider_hint_signal_evidence(signal: &ProviderOperationHintSignal) -> Value {
+    json!({
+        "source": "temporal_provider_operation_hint_signal",
+        "hint_id": signal.hint_id,
+        "provider": signal.provider,
+        "hint_kind": signal.hint_kind,
+        "provider_ref": &signal.provider_ref,
+        "evidence": &signal.evidence,
+    })
+}
+
+fn unit_deposit_evidence_json(evidence: &ProviderOperationHintEvidence) -> Value {
+    let mut value = json!({
+        "tx_hash": &evidence.tx_hash,
+        "address": &evidence.address,
+        "transfer_index": evidence.transfer_index,
+    });
+    if let Some(amount) = &evidence.amount {
+        value["amount"] = json!(amount);
+    }
+    value
+}
+
+async fn verify_unit_deposit_candidate(
+    deps: &OrderActivityDeps,
+    provider_address: &OrderProviderAddress,
+    evidence: &ProviderOperationHintEvidence,
+) -> Result<U256, String> {
+    let backend_chain = backend_chain_for_id(&provider_address.chain).ok_or_else(|| {
+        format!(
+            "provider address chain {} is not supported by the temporal worker",
+            provider_address.chain
+        )
+    })?;
+    let chain = deps.chain_registry.get(&backend_chain).ok_or_else(|| {
+        format!(
+            "temporal worker has no chain implementation for {}",
+            backend_chain.to_db_string()
+        )
+    })?;
+    let asset = provider_address
+        .asset
+        .as_ref()
+        .ok_or_else(|| "provider address does not declare an asset".to_string())?;
+    let currency = Currency {
+        chain: backend_chain,
+        token: token_identifier(asset),
+        decimals: currency_decimals(&backend_chain, asset),
+    };
+
+    match chain
+        .verify_user_deposit_candidate(
+            &provider_address.address,
+            &currency,
+            &evidence.tx_hash,
+            evidence.transfer_index,
+        )
+        .await
+    {
+        Ok(UserDepositCandidateStatus::Verified(deposit)) => Ok(deposit.amount),
+        Ok(UserDepositCandidateStatus::TxNotFound) => Err(format!(
+            "candidate transaction {} was not found",
+            evidence.tx_hash
+        )),
+        Ok(UserDepositCandidateStatus::TransferNotFound) => Err(format!(
+            "candidate transaction {} does not pay provider address {} at transfer index {}",
+            evidence.tx_hash, provider_address.address, evidence.transfer_index
+        )),
+        Err(err) => Err(format!(
+            "failed to verify candidate deposit on chain: {err}"
+        )),
+    }
+}
+
+fn expected_provider_operation_amount(
+    operation: &OrderProviderOperation,
+    step: Option<&OrderExecutionStep>,
+    hint_id: Uuid,
+) -> Result<U256, String> {
+    if let Some(expected) = operation
+        .request
+        .get("expected_amount")
+        .and_then(Value::as_str)
+    {
+        return U256::from_str(expected)
+            .map_err(|err| format!("hint {hint_id}: operation expected_amount is invalid: {err}"));
+    }
+    if let Some(amount_in) = step.and_then(|step| step.amount_in.as_deref()) {
+        return U256::from_str(amount_in)
+            .map_err(|err| format!("hint {hint_id}: step amount_in is invalid: {err}"));
+    }
+
+    Ok(U256::from(1_u64))
+}
+
+fn token_identifier(asset: &AssetId) -> TokenIdentifier {
+    match asset {
+        AssetId::Native => TokenIdentifier::Native,
+        AssetId::Reference(value) => TokenIdentifier::address(value.clone()),
+    }
+}
+
+fn currency_decimals(chain: &ChainType, asset: &AssetId) -> u8 {
+    match (chain, asset) {
+        (ChainType::Bitcoin, AssetId::Native) => 8,
+        (_, AssetId::Native) => 18,
+        (_, AssetId::Reference(_)) => 8,
+    }
+}
+
+fn json_object_or_wrapped(value: Value) -> Value {
+    if value.is_object() {
+        value
+    } else {
+        json!({ "value": value })
+    }
 }
 
 pub struct StepDispatchActivities;
@@ -7521,9 +7962,9 @@ mod tests {
         let custody_executor = Arc::new(CustodyActionExecutor::new(
             db.clone(),
             settings,
-            chain_registry,
+            chain_registry.clone(),
         ));
-        OrderActivityDeps::new(db, action_providers, custody_executor)
+        OrderActivityDeps::new(db, action_providers, custody_executor, chain_registry)
     }
 
     fn test_settings() -> Settings {

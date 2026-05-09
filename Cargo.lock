@@ -7216,6 +7216,8 @@ version = "0.1.8"
 dependencies = [
  "alloy",
  "anyhow",
+ "bitcoin",
+ "bitcoincore-rpc-async",
  "chains",
  "chrono",
  "clap",
