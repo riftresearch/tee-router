@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use serde_json::{json, Value};
 use temporalio_common::protos::temporal::api::common::v1::RetryPolicy;
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
@@ -12,24 +13,27 @@ use super::activities::{
     OrderActivities, ProviderObservationActivities, QuoteRefreshActivities, RefundActivities,
 };
 use super::types::{
-    ClassifyStepFailureInput, ComposeRefreshedQuoteAttemptInput, DiscoverSingleRefundPositionInput,
-    ExecuteStepInput, FinalizeOrderOrRefundInput, FundingVaultFundedSignal,
-    LoadOrderExecutionStateInput, ManualInterventionReleaseSignal, ManualRefundTriggerSignal,
-    MarkOrderCompletedInput, MaterializeExecutionAttemptInput, MaterializeRefreshedAttemptInput,
-    MaterializeRefundPlanInput, MaterializeRetryAttemptInput, OrderTerminalStatus,
-    OrderWorkflowDebugCursor, OrderWorkflowInput, OrderWorkflowOutput, OrderWorkflowPhase,
+    ClassifyStaleRunningStepInput, ClassifyStepFailureInput, ComposeRefreshedQuoteAttemptInput,
+    DiscoverSingleRefundPositionInput, ExecuteStepInput, FinalizeOrderOrRefundInput,
+    FinalizedOrder, FundingVaultFundedSignal, LoadOrderExecutionStateInput,
+    ManualInterventionReleaseSignal, ManualRefundTriggerSignal, MarkOrderCompletedInput,
+    MaterializeExecutionAttemptInput, MaterializeRefreshedAttemptInput, MaterializeRefundPlanInput,
+    MaterializeRetryAttemptInput, OrderTerminalStatus, OrderWorkflowDebugCursor,
+    OrderWorkflowInput, OrderWorkflowOutput, OrderWorkflowPhase,
     PersistProviderOperationStatusInput, PersistProviderReceiptInput, PersistStepFailedInput,
     PersistStepReadyToFireInput, ProviderHintPollWorkflowInput, ProviderHintPollWorkflowOutput,
     ProviderOperationHintDecision, ProviderOperationHintSignal, QuoteRefreshWorkflowInput,
     QuoteRefreshWorkflowOutcome, QuoteRefreshWorkflowOutput, RefreshedQuoteAttemptOutcome,
     RefundPlanOutcome, RefundTerminalStatus, RefundTrigger, RefundWorkflowInput,
     RefundWorkflowOutput, SettleProviderStepInput, SingleRefundPositionOutcome,
-    StaleRunningStepWatchdogInput, StaleRunningStepWatchdogOutput, StepExecuted,
-    StepExecutionOutcome, StepFailureDecision, VerifyProviderOperationHintInput,
-    WriteFailedAttemptSnapshotInput,
+    StaleRunningStepClassified, StaleRunningStepDecision, StaleRunningStepWatchdogInput,
+    StaleRunningStepWatchdogOutput, StepExecuted, StepExecutionOutcome, StepFailureDecision,
+    VerifyProviderOperationHintInput, WriteFailedAttemptSnapshotInput,
 };
 
 const PROVIDER_HINT_WAIT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const STALE_RUNNING_STEP_RECOVERY_AFTER: Duration = Duration::from_secs(5 * 60);
+const EXECUTE_STEP_START_TO_CLOSE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// Root order execution workflow.
 ///
@@ -79,9 +83,6 @@ impl OrderWorkflow {
             )
             .await?;
 
-        // TODO(PR8, brief §6 invariant 3; scar §6): start the stale-running-step watchdog child
-        // before provider execution and surface manual intervention after five minutes without a
-        // checkpoint.
         let mut execution_attempt = ctx
             .start_activity(
                 OrderActivities::materialize_execution_attempt,
@@ -113,22 +114,18 @@ impl OrderWorkflow {
                         db_activity_options.clone(),
                     )
                     .await?;
-                let executed = match ctx
-                    .start_activity(
-                        OrderActivities::execute_step,
-                        ExecuteStepInput {
-                            order_id: input.order_id,
-                            attempt_id: execution_attempt.attempt_id,
-                            step_id: step.step_id,
-                        },
-                        execute_activity_options.clone(),
-                    )
-                    .await
+                let executed = match execute_step_with_stale_running_timer(
+                    ctx,
+                    input.order_id,
+                    execution_attempt.attempt_id,
+                    step.step_id,
+                    execute_activity_options.clone(),
+                    db_activity_options.clone(),
+                )
+                .await?
                 {
-                    Ok(executed) => executed,
-                    Err(source) => {
-                        let failure_reason = source.to_string();
-                        drop(source);
+                    StepExecutionProgress::Executed(executed) => executed,
+                    StepExecutionProgress::ActivityFailed { failure_reason } => {
                         let _failed = ctx
                             .start_activity(
                                 OrderActivities::persist_step_failed,
@@ -261,8 +258,10 @@ impl OrderWorkflow {
                                                 FinalizeOrderOrRefundInput {
                                                     order_id: input.order_id,
                                                     attempt_id: None,
+                                                    step_id: None,
                                                     terminal_status:
                                                         OrderTerminalStatus::RefundRequired,
+                                                    reason: None,
                                                 },
                                                 db_activity_options,
                                             )
@@ -275,13 +274,43 @@ impl OrderWorkflow {
                                 }
                             }
                             StepFailureDecision::ManualIntervention => {
-                                return Err(anyhow::anyhow!(
-                                    "PR4b does not implement ManualIntervention for failed step {}",
-                                    step.step_id
+                                let finalized = finalize_manual_intervention(
+                                    ctx,
+                                    input.order_id,
+                                    execution_attempt.attempt_id,
+                                    step.step_id,
+                                    json_reason(
+                                        "execution_step_failure_manual_intervention",
+                                        step.step_id,
+                                    ),
+                                    db_activity_options.clone(),
                                 )
-                                .into());
+                                .await?;
+                                return Ok(OrderWorkflowOutput {
+                                    order_id: input.order_id,
+                                    terminal_status: finalized.terminal_status,
+                                });
                             }
                         }
+                    }
+                    StepExecutionProgress::ManualInterventionRequired { classified } => {
+                        ctx.state_mut(|state| {
+                            state.phase = OrderWorkflowPhase::WaitingForManualIntervention;
+                            state.active_step_id = Some(step.step_id);
+                        });
+                        let finalized = finalize_manual_intervention(
+                            ctx,
+                            input.order_id,
+                            execution_attempt.attempt_id,
+                            step.step_id,
+                            classified.reason,
+                            db_activity_options.clone(),
+                        )
+                        .await?;
+                        return Ok(OrderWorkflowOutput {
+                            order_id: input.order_id,
+                            terminal_status: finalized.terminal_status,
+                        });
                     }
                 };
                 let _receipt = ctx
@@ -424,6 +453,110 @@ impl OrderWorkflow {
     }
 }
 
+enum StepExecutionProgress {
+    Executed(StepExecuted),
+    ActivityFailed {
+        failure_reason: String,
+    },
+    ManualInterventionRequired {
+        classified: StaleRunningStepClassified,
+    },
+}
+
+async fn execute_step_with_stale_running_timer(
+    ctx: &mut WorkflowContext<OrderWorkflow>,
+    order_id: Uuid,
+    attempt_id: Uuid,
+    step_id: Uuid,
+    execute_activity_options: ActivityOptions,
+    db_activity_options: ActivityOptions,
+) -> WorkflowResult<StepExecutionProgress> {
+    let execute_future = ctx.start_activity(
+        OrderActivities::execute_step,
+        ExecuteStepInput {
+            order_id,
+            attempt_id,
+            step_id,
+        },
+        execute_activity_options,
+    );
+    futures_util::pin_mut!(execute_future);
+
+    loop {
+        temporalio_sdk::workflows::select! {
+            result = execute_future => {
+                return Ok(match result {
+                    Ok(executed) => StepExecutionProgress::Executed(executed),
+                    Err(source) => StepExecutionProgress::ActivityFailed {
+                        failure_reason: source.to_string(),
+                    },
+                });
+            }
+            _ = ctx.timer(STALE_RUNNING_STEP_RECOVERY_AFTER) => {
+                let classified = ctx
+                    .start_activity(
+                        OrderActivities::classify_stale_running_step,
+                        ClassifyStaleRunningStepInput {
+                            order_id,
+                            attempt_id,
+                            step_id,
+                        },
+                        db_activity_options.clone(),
+                    )
+                    .await?;
+                match classified.decision {
+                    StaleRunningStepDecision::DurableProviderOperationWaitingExternalProgress => {
+                        tracing::info!(
+                            order_id = %order_id,
+                            attempt_id = %attempt_id,
+                            step_id = %step_id,
+                            event_name = "execution_step.stale_running_durable_progress",
+                            "execution_step.stale_running_durable_progress"
+                        );
+                        continue;
+                    }
+                    StaleRunningStepDecision::AmbiguousExternalSideEffectWindow
+                    | StaleRunningStepDecision::StaleRunningStepWithoutCheckpoint => {
+                        return Ok(StepExecutionProgress::ManualInterventionRequired {
+                            classified,
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn finalize_manual_intervention(
+    ctx: &mut WorkflowContext<OrderWorkflow>,
+    order_id: Uuid,
+    attempt_id: Uuid,
+    step_id: Uuid,
+    reason: Value,
+    db_activity_options: ActivityOptions,
+) -> WorkflowResult<FinalizedOrder> {
+    Ok(ctx
+        .start_activity(
+            OrderActivities::finalize_order_or_refund,
+            FinalizeOrderOrRefundInput {
+                order_id,
+                attempt_id: Some(attempt_id),
+                step_id: Some(step_id),
+                terminal_status: OrderTerminalStatus::ManualInterventionRequired,
+                reason: Some(reason),
+            },
+            db_activity_options,
+        )
+        .await?)
+}
+
+fn json_reason(reason: &'static str, step_id: Uuid) -> Value {
+    json!({
+        "reason": reason,
+        "step_id": step_id,
+    })
+}
+
 async fn wait_for_provider_completion_hint(
     ctx: &mut WorkflowContext<OrderWorkflow>,
     order_id: Uuid,
@@ -511,7 +644,7 @@ fn db_activity_options() -> ActivityOptions {
 }
 
 fn execute_activity_options() -> ActivityOptions {
-    ActivityOptions::with_start_to_close_timeout(Duration::from_secs(120))
+    ActivityOptions::with_start_to_close_timeout(EXECUTE_STEP_START_TO_CLOSE_TIMEOUT)
         .retry_policy(RetryPolicy {
             maximum_attempts: 3,
             ..Default::default()
@@ -591,7 +724,9 @@ impl RefundWorkflow {
                         FinalizeOrderOrRefundInput {
                             order_id: input.order_id,
                             attempt_id: None,
+                            step_id: None,
                             terminal_status: OrderTerminalStatus::RefundManualInterventionRequired,
+                            reason: None,
                         },
                         db_activity_options,
                     )
@@ -626,7 +761,9 @@ impl RefundWorkflow {
                         FinalizeOrderOrRefundInput {
                             order_id: input.order_id,
                             attempt_id: None,
+                            step_id: None,
                             terminal_status: OrderTerminalStatus::RefundManualInterventionRequired,
+                            reason: None,
                         },
                         db_activity_options,
                     )
@@ -695,8 +832,10 @@ impl RefundWorkflow {
                             FinalizeOrderOrRefundInput {
                                 order_id: input.order_id,
                                 attempt_id: None,
+                                step_id: None,
                                 terminal_status:
                                     OrderTerminalStatus::RefundManualInterventionRequired,
+                                reason: None,
                             },
                             db_activity_options,
                         )
@@ -742,7 +881,9 @@ impl RefundWorkflow {
                 FinalizeOrderOrRefundInput {
                     order_id: input.order_id,
                     attempt_id: Some(refund_attempt_id),
+                    step_id: None,
                     terminal_status: OrderTerminalStatus::Refunded,
+                    reason: None,
                 },
                 db_activity_options,
             )
