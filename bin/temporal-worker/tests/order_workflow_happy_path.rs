@@ -9,6 +9,7 @@ use alloy::{
 };
 use chains::{
     evm::{EvmChain, EvmGasSponsorConfig},
+    hyperliquid::HyperliquidChain,
     ChainRegistry,
 };
 use chrono::Utc;
@@ -21,14 +22,16 @@ use router_core::{
     config::Settings,
     db::Database,
     models::{
-        CustodyVaultRole, DepositVaultStatus, OrderExecutionAttempt, OrderExecutionAttemptKind,
-        OrderExecutionAttemptStatus, OrderExecutionStepStatus, OrderExecutionStepType,
-        OrderProviderOperation, ProviderOperationStatus, ProviderOperationType, RouterOrderQuote,
-        RouterOrderStatus, VaultAction,
+        CustodyVaultRole, CustodyVaultVisibility, DepositVaultStatus, OrderExecutionAttempt,
+        OrderExecutionAttemptKind, OrderExecutionAttemptStatus, OrderExecutionStepStatus,
+        OrderExecutionStepType, OrderProviderOperation, ProviderOperationStatus,
+        ProviderOperationType, RouterOrderQuote, RouterOrderStatus, VaultAction,
     },
     protocol::{AssetId, ChainId, DepositAsset},
     services::{
-        custody_action_executor::{CustodyActionExecutor, HyperliquidCallNetwork},
+        custody_action_executor::{
+            CustodyActionExecutor, HyperliquidCallNetwork, HyperliquidRuntimeConfig,
+        },
         AcrossHttpProviderConfig, ActionProviderHttpOptions, ActionProviderRegistry,
         VeloraHttpProviderConfig,
     },
@@ -104,6 +107,7 @@ struct WorkflowOptions {
     expire_quote_legs: bool,
     refreshed_eth_usd_micro: Option<u128>,
     expect_external_custody_across_refund: bool,
+    expect_hyperliquid_spot_unit_refund: bool,
 }
 
 struct SeededOrder {
@@ -352,6 +356,57 @@ async fn order_workflow_refunds_external_custody_across_after_retry_exhaustion()
     assert!(
         run.refund_address_balance >= U256::from_str_radix(ORDER_AMOUNT_IN_WEI, 10).unwrap(),
         "refund address should receive the bridged external-custody balance"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn order_workflow_refunds_hyperliquid_spot_unit_withdrawal_after_retry_exhaustion() {
+    let run = run_order_workflow(WorkflowOptions {
+        velora_transaction_failures: EXECUTE_STEP_TEMPORAL_ATTEMPTS * 2,
+        expect_hyperliquid_spot_unit_refund: true,
+        ..WorkflowOptions::default()
+    })
+    .await;
+
+    assert_eq!(run.output.terminal_status, OrderTerminalStatus::Refunded);
+    let refunded = run
+        .db
+        .orders()
+        .get(run.order_id)
+        .await
+        .expect("load refunded order");
+    assert_eq!(refunded.status, RouterOrderStatus::Refunded);
+
+    let attempts = run
+        .db
+        .orders()
+        .get_execution_attempts(run.order_id)
+        .await
+        .expect("load execution attempts");
+    assert_eq!(attempts.len(), 3);
+    assert_eq!(
+        attempts[2].attempt_kind,
+        OrderExecutionAttemptKind::RefundRecovery
+    );
+    assert_eq!(attempts[2].status, OrderExecutionAttemptStatus::Completed);
+
+    let refund_steps = run
+        .db
+        .orders()
+        .get_execution_steps_for_attempt(attempts[2].id)
+        .await
+        .expect("load HyperliquidSpot refund attempt steps");
+    assert_eq!(refund_steps.len(), 1);
+    let refund_step = &refund_steps[0];
+    assert_eq!(
+        refund_step.step_type,
+        OrderExecutionStepType::UnitWithdrawal
+    );
+    assert_eq!(refund_step.provider, "unit");
+    assert_eq!(refund_step.status, OrderExecutionStepStatus::Completed);
+    assert!(
+        run.refund_address_balance >= U256::from_str_radix(ORDER_AMOUNT_IN_WEI, 10).unwrap(),
+        "refund address should receive the Unit withdrawal from HyperliquidSpot"
     );
 }
 
@@ -623,13 +678,24 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
     }
     let mocks = spawn_mocks(&devnet, &options).await;
     let settings = Arc::new(test_settings());
-    let chain_registry = Arc::new(test_chain_registry(&devnet, options.route).await);
-    let action_providers = Arc::new(test_action_providers(&mocks, options.route));
-    let custody_executor = Arc::new(CustodyActionExecutor::new(
-        db.clone(),
-        settings.clone(),
-        chain_registry.clone(),
+    let hyperliquid_enabled = options.expect_hyperliquid_spot_unit_refund;
+    let chain_registry =
+        Arc::new(test_chain_registry(&devnet, options.route, hyperliquid_enabled).await);
+    let action_providers = Arc::new(test_action_providers(
+        &mocks,
+        options.route,
+        hyperliquid_enabled,
     ));
+    let mut custody_executor =
+        CustodyActionExecutor::new(db.clone(), settings.clone(), chain_registry.clone());
+    if hyperliquid_enabled {
+        custody_executor =
+            custody_executor.with_hyperliquid_runtime(Some(HyperliquidRuntimeConfig::new(
+                mocks.base_url().to_string(),
+                HyperliquidCallNetwork::Testnet,
+            )));
+    }
+    let custody_executor = Arc::new(custody_executor);
 
     let seeded = match options.route {
         WorkflowRoute::VeloraBaseEthToBaseUsdc => {
@@ -654,6 +720,16 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
         }
     };
     let order_id = seeded.order_id;
+    if options.expect_hyperliquid_spot_unit_refund {
+        seed_hyperliquid_spot_refund_position(
+            &custody_executor,
+            &mocks,
+            &devnet,
+            order_id,
+            &seeded.funding_vault_address,
+        )
+        .await;
+    }
     if options.expire_quote_legs {
         expire_market_order_quote_legs(&database_url, order_id).await;
     }
@@ -747,6 +823,15 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
                     &mocks,
                     devnet_for_workflow,
                     &seeded.funding_vault_address,
+                    order_id,
+                )
+                .await;
+            }
+            if options.expect_hyperliquid_spot_unit_refund {
+                signal_hyperliquid_spot_refund_unit_withdrawal(
+                    &client,
+                    &db_for_workflow,
+                    &mocks,
                     order_id,
                 )
                 .await;
@@ -858,7 +943,11 @@ fn test_settings() -> Settings {
     Settings::load(&path).expect("load test settings")
 }
 
-async fn test_chain_registry(devnet: &RiftDevnet, route: WorkflowRoute) -> ChainRegistry {
+async fn test_chain_registry(
+    devnet: &RiftDevnet,
+    route: WorkflowRoute,
+    hyperliquid_enabled: bool,
+) -> ChainRegistry {
     let base_chain = EvmChain::new_with_gas_sponsor(
         &devnet.base.anvil.endpoint(),
         BASE_USDC_ADDRESS,
@@ -898,21 +987,32 @@ async fn test_chain_registry(devnet: &RiftDevnet, route: WorkflowRoute) -> Chain
         .expect("ethereum chain setup");
         registry.register_evm(ChainType::Ethereum, Arc::new(ethereum_chain));
     }
+    if hyperliquid_enabled {
+        registry.register(
+            ChainType::Hyperliquid,
+            Arc::new(HyperliquidChain::new(
+                b"temporal-worker-hyperliquid-wallet",
+                1,
+                Duration::from_secs(1),
+            )),
+        );
+    }
     registry
 }
 
 fn test_action_providers(
     mocks: &MockIntegratorServer,
     route: WorkflowRoute,
+    hyperliquid_enabled: bool,
 ) -> ActionProviderRegistry {
     ActionProviderRegistry::http_from_options(ActionProviderHttpOptions {
         across: matches!(route, WorkflowRoute::AcrossBaseEthToEthereumUsdc).then(|| {
             AcrossHttpProviderConfig::new(mocks.base_url().to_string(), "temporal-worker-across")
         }),
         cctp: None,
-        hyperunit_base_url: None,
+        hyperunit_base_url: hyperliquid_enabled.then(|| mocks.base_url().to_string()),
         hyperunit_proxy_url: None,
-        hyperliquid_base_url: None,
+        hyperliquid_base_url: hyperliquid_enabled.then(|| mocks.base_url().to_string()),
         velora: matches!(
             route,
             WorkflowRoute::VeloraBaseEthToBaseUsdc | WorkflowRoute::AcrossBaseEthToEthereumUsdc
@@ -962,6 +1062,14 @@ async fn spawn_mocks(devnet: &RiftDevnet, options: &WorkflowOptions) -> MockInte
                 devnet.base.anvil.ws_endpoint_url().to_string(),
             );
     }
+    if options.expect_hyperliquid_spot_unit_refund {
+        config = config
+            .with_unit_evm_rpc_url(
+                hyperunit_client::UnitChain::Base,
+                devnet.base.anvil.endpoint_url().to_string(),
+            )
+            .with_mainnet_hyperliquid(false);
+    }
     config = config
         .with_velora_transaction_fail_next_n(options.velora_transaction_failures)
         .with_velora_transaction_stale_quote_fail_next_n(options.velora_stale_quote_failures);
@@ -995,6 +1103,42 @@ async fn expire_market_order_quote_legs(database_url: &str, order_id: Uuid) {
     .execute(&pool)
     .await
     .expect("expire market quote legs");
+}
+
+async fn seed_hyperliquid_spot_refund_position(
+    custody_executor: &CustodyActionExecutor,
+    mocks: &MockIntegratorServer,
+    devnet: &RiftDevnet,
+    order_id: Uuid,
+    funding_vault_address: &str,
+) {
+    set_native_balance(
+        &devnet.base,
+        Address::from_str(funding_vault_address).expect("funding vault EVM address"),
+        U256::ZERO,
+    )
+    .await;
+    let vault = custody_executor
+        .create_router_derived_vault(
+            order_id,
+            CustodyVaultRole::HyperliquidSpot,
+            CustodyVaultVisibility::Internal,
+            ChainId::parse("hyperliquid").expect("hyperliquid chain id"),
+            None,
+            json!({ "test": "temporal_hyperliquid_spot_refund" }),
+        )
+        .await
+        .expect("create HyperliquidSpot custody vault");
+    let user = Address::from_str(&vault.address).expect("Hyperliquid vault address");
+    let amount = U256::from_str_radix(ORDER_AMOUNT_IN_WEI, 10).expect("order amount parses");
+    let natural_eth = amount
+        .to_string()
+        .parse::<f64>()
+        .expect("amount parses as f64")
+        / 1_000_000_000_000_000_000_f64;
+    mocks
+        .credit_hyperliquid_balance(user, "UETH", natural_eth)
+        .await;
 }
 
 async fn wait_for_provider_operation(
@@ -1098,6 +1242,71 @@ async fn signal_external_custody_refund_across_fill(
         )
         .await
         .expect("send refund Across provider-operation hint signal");
+}
+
+async fn signal_hyperliquid_spot_refund_unit_withdrawal(
+    client: &Client,
+    db: &Database,
+    mocks: &MockIntegratorServer,
+    order_id: Uuid,
+) {
+    let parent_attempt = wait_for_execution_attempt(
+        db,
+        order_id,
+        OrderExecutionAttemptKind::PrimaryExecution,
+        2,
+        Some(OrderExecutionAttemptStatus::Failed),
+        Duration::from_secs(120),
+    )
+    .await;
+    let refund_attempt = wait_for_execution_attempt(
+        db,
+        order_id,
+        OrderExecutionAttemptKind::RefundRecovery,
+        3,
+        None,
+        Duration::from_secs(120),
+    )
+    .await;
+    let refund_operation = wait_for_provider_operation_for_attempt(
+        db,
+        order_id,
+        refund_attempt.id,
+        ProviderOperationType::UnitWithdrawal,
+        Duration::from_secs(120),
+    )
+    .await;
+    let provider_ref = refund_operation
+        .provider_ref
+        .as_deref()
+        .expect("UnitWithdrawal refund operation should carry provider_ref");
+    let amount = refund_operation
+        .request
+        .get("amount")
+        .and_then(serde_json::Value::as_str)
+        .expect("UnitWithdrawal refund operation request should carry amount");
+    mocks
+        .complete_unit_operation_with_source_amount(provider_ref, amount)
+        .await
+        .expect("complete mock Unit withdrawal operation");
+
+    let refund_workflow = client
+        .get_workflow_handle::<RefundWorkflow>(&refund_workflow_id(order_id, parent_attempt.id));
+    refund_workflow
+        .signal(
+            RefundWorkflow::provider_operation_hint,
+            ProviderOperationHintSignal {
+                order_id,
+                hint_id: Uuid::now_v7(),
+                provider_operation_id: Some(refund_operation.id),
+                provider: ProviderKind::Unit,
+                hint_kind: ProviderHintKind::ProviderObservation,
+                provider_ref: refund_operation.provider_ref,
+            },
+            WorkflowSignalOptions::default(),
+        )
+        .await
+        .expect("send refund UnitWithdrawal provider-operation hint signal");
 }
 
 async fn wait_for_execution_attempt(

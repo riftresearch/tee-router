@@ -32,6 +32,7 @@ alloy = { workspace = true }
 chains = { workspace = true }
 devnet = { workspace = true }
 eip3009-erc20-contract = { workspace = true }
+hyperunit-client = { workspace = true }
 router-primitives = { workspace = true }
 router-server = { path = "../router-server" }
 sqlx-core = { workspace = true }
