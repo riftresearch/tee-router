@@ -27,9 +27,10 @@ use router_core::{
     db::Database,
     models::{
         CustodyVaultRole, CustodyVaultVisibility, DepositVaultStatus, OrderExecutionAttempt,
-        OrderExecutionAttemptKind, OrderExecutionAttemptStatus, OrderExecutionStepStatus,
-        OrderExecutionStepType, OrderProviderOperation, ProviderOperationStatus,
-        ProviderOperationType, RouterOrderQuote, RouterOrderStatus, VaultAction,
+        OrderExecutionAttemptKind, OrderExecutionAttemptStatus, OrderExecutionStep,
+        OrderExecutionStepStatus, OrderExecutionStepType, OrderProviderOperation,
+        ProviderOperationStatus, ProviderOperationType, RouterOrderQuote, RouterOrderStatus,
+        VaultAction,
     },
     protocol::{AssetId, ChainId, DepositAsset},
     services::{
@@ -1489,14 +1490,16 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
                     Duration::from_secs(90),
                 )
                 .await;
-                fund_destination_execution_vault_from_across(
-                    &db_for_workflow,
-                    devnet_for_workflow,
-                    order_id,
-                    &across_operation,
-                )
-                .await;
                 let across_operation = if options.simulate_across_lost_intent_checkpoint {
+                    wait_for_execution_step_status(
+                        &db_for_workflow,
+                        across_operation
+                            .execution_step_id
+                            .expect("Across operation should be linked to a step"),
+                        OrderExecutionStepStatus::Waiting,
+                        Duration::from_secs(90),
+                    )
+                    .await;
                     simulate_across_lost_intent_checkpoint(
                         &database_url_for_workflow,
                         &db_for_workflow,
@@ -1506,6 +1509,13 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
                 } else {
                     across_operation
                 };
+                fund_destination_execution_vault_from_across(
+                    &db_for_workflow,
+                    devnet_for_workflow,
+                    order_id,
+                    &across_operation,
+                )
+                .await;
                 if !options.suppress_across_hint_signal {
                     handle
                         .signal(
@@ -2118,6 +2128,30 @@ async fn wait_for_provider_operation(
             tokio::time::Instant::now() < deadline,
             "timed out waiting for provider operation {operation_type:?} on order {order_id}"
         );
+        sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn wait_for_execution_step_status(
+    db: &Database,
+    step_id: Uuid,
+    status: OrderExecutionStepStatus,
+    max_wait: Duration,
+) -> OrderExecutionStep {
+    let deadline = tokio::time::Instant::now() + max_wait;
+    loop {
+        let step = db
+            .orders()
+            .get_execution_step(step_id)
+            .await
+            .expect("load execution step");
+        if step.status == status {
+            return step;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let state = workflow_state_summary(db, step.order_id).await;
+            panic!("timed out waiting for step {step_id} to reach {status:?}\n{state}");
+        }
         sleep(Duration::from_millis(250)).await;
     }
 }
@@ -2744,10 +2778,13 @@ async fn fund_destination_execution_vault_from_across(
                 && vault.asset.as_ref() == Some(&output_asset.asset)
         })
         .expect("Across step should create destination execution custody vault");
-    let output_amount = operation
+    let provider_response = operation
         .response
+        .get("provider_response")
+        .unwrap_or(&operation.response);
+    let output_amount = provider_response
         .get("expectedOutputAmount")
-        .or_else(|| operation.response.get("outputAmount"))
+        .or_else(|| provider_response.get("outputAmount"))
         .and_then(serde_json::Value::as_str)
         .and_then(|amount| U256::from_str_radix(amount, 10).ok())
         .expect("Across response should include expected output amount");

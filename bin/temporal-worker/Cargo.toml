@@ -9,6 +9,8 @@ repository.workspace = true
 # Required by temporalio-macros 0.4.0 expansion; spike-owned errors still use snafu.
 anyhow = "1.0"
 alloy = { workspace = true }
+bitcoin = { workspace = true }
+bitcoincore-rpc-async = { workspace = true }
 chains = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
@@ -19,6 +21,7 @@ serde_json = { workspace = true }
 snafu = { workspace = true }
 router-core = { workspace = true }
 router-primitives = { workspace = true }
+router-temporal = { workspace = true }
 temporalio-client = { workspace = true }
 temporalio-common = { workspace = true }
 temporalio-macros = { workspace = true }
@@ -31,8 +34,6 @@ url = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-bitcoin = { workspace = true }
-bitcoincore-rpc-async = { workspace = true }
 devnet = { workspace = true }
 eip3009-erc20-contract = { workspace = true }
 hyperunit-client = { workspace = true }

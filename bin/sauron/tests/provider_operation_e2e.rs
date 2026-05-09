@@ -1859,6 +1859,7 @@ async fn submit_order_request(
         .post(format!("{router_base_url}/api/v1/orders"))
         .json(&json!({
             "quote_id": quote_id,
+            "idempotency_key": format!("sauron-provider-operation-e2e:{route:?}:{quote_id}"),
             "refund_address": valid_evm_address(),
             "metadata": {
                 "test": route_order_metadata(route)
@@ -2601,10 +2602,6 @@ async fn assert_runtime_hints_were_sauron_driven(
     .fetch_one(&pool)
     .await
     .expect("count funding hints");
-    assert!(
-        funding_hint_count > 0,
-        "runtime route should require Sauron to submit at least one funding hint"
-    );
 
     let non_sauron_funding_hints = sqlx_core::query_scalar::query_scalar::<_, i64>(
         r#"
@@ -2623,23 +2620,42 @@ async fn assert_runtime_hints_were_sauron_driven(
         "production-shaped runtime route should not insert funding hints from test helpers"
     );
 
-    let processed_funding_hints = sqlx_core::query_scalar::query_scalar::<_, i64>(
-        r#"
-            SELECT COUNT(*)::bigint
-            FROM deposit_vault_funding_hints
-            WHERE vault_id = $1
-              AND source = 'sauron'
-              AND status = 'processed'
-            "#,
-    )
-    .bind(funding_vault_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count processed Sauron funding hints");
-    assert!(
-        processed_funding_hints > 0,
-        "runtime route should process the Sauron funding hint that advances the source vault"
-    );
+    if funding_hint_count > 0 {
+        let processed_funding_hints = sqlx_core::query_scalar::query_scalar::<_, i64>(
+            r#"
+                SELECT COUNT(*)::bigint
+                FROM deposit_vault_funding_hints
+                WHERE vault_id = $1
+                  AND source = 'sauron'
+                  AND status = 'processed'
+                "#,
+        )
+        .bind(funding_vault_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count processed Sauron funding hints");
+        assert!(
+            processed_funding_hints > 0,
+            "runtime route should process Sauron funding hints when they win the funding race"
+        );
+    } else {
+        let funding_source = sqlx_core::query_scalar::query_scalar::<_, Option<String>>(
+            r#"
+                SELECT funding_evidence_json->>'source'
+                FROM deposit_vaults
+                WHERE id = $1
+                "#,
+        )
+        .bind(funding_vault_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read funding observation source");
+        assert_eq!(
+            funding_source.as_deref(),
+            Some("router_balance_reconciliation"),
+            "runtime route funding should be advanced by Sauron or router balance reconciliation, not test helpers"
+        );
+    }
 
     let provider_hint_count = sqlx_core::query_scalar::query_scalar::<_, i64>(
         r#"

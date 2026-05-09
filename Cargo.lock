@@ -6207,6 +6207,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "router-temporal"
+version = "0.1.8"
+dependencies = [
+ "serde",
+ "snafu",
+ "temporalio-client",
+ "temporalio-common",
+ "temporalio-sdk-core",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "ruint"
 version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7229,6 +7242,7 @@ dependencies = [
  "router-core",
  "router-primitives",
  "router-server",
+ "router-temporal",
  "serde",
  "serde_json",
  "snafu",

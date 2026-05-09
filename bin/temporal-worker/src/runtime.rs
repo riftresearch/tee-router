@@ -39,6 +39,9 @@ pub enum WorkerError {
 
     #[snafu(display("Temporal spike assertion failed: {reason}"))]
     Assertion { reason: String },
+
+    #[snafu(display("invalid temporal-worker configuration: {message}"))]
+    Configuration { message: String },
 }
 
 pub async fn connect_client(connection: &TemporalConnection) -> WorkerResult<Client> {

@@ -3,6 +3,10 @@ use router_core::{
     protocol::DepositAsset,
     services::{asset_registry::CanonicalAsset, ProviderExecutionState},
 };
+pub use router_temporal::{
+    OrderWorkflowInput, ProviderHintKind, ProviderKind, ProviderOperationHintEvidence,
+    ProviderOperationHintSignal,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -13,11 +17,6 @@ pub type WorkflowStepId = Uuid;
 pub type WorkflowVaultId = Uuid;
 pub type WorkflowProviderOperationId = Uuid;
 pub type WorkflowHintId = Uuid;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OrderWorkflowInput {
-    pub order_id: WorkflowOrderId,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderWorkflowOutput {
@@ -135,27 +134,6 @@ pub struct FundingVaultFundedSignal {
     pub vault_id: WorkflowVaultId,
     pub observed_amount_raw: String,
     pub source_ref: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderOperationHintSignal {
-    pub order_id: WorkflowOrderId,
-    pub hint_id: WorkflowHintId,
-    pub provider_operation_id: Option<WorkflowProviderOperationId>,
-    pub provider: ProviderKind,
-    pub hint_kind: ProviderHintKind,
-    pub provider_ref: Option<String>,
-    #[serde(default)]
-    pub evidence: Option<ProviderOperationHintEvidence>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderOperationHintEvidence {
-    pub tx_hash: String,
-    pub address: String,
-    pub transfer_index: u64,
-    #[serde(default)]
-    pub amount: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -630,23 +608,6 @@ impl StaleRunningStepDecision {
             Self::StaleRunningStepWithoutCheckpoint => "stale_running_step_without_checkpoint",
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ProviderKind {
-    Bridge,
-    Unit,
-    Exchange,
-    CustodyActionExecutor,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ProviderHintKind {
-    CctpAttestation,
-    AcrossFill,
-    UnitDeposit,
-    ProviderObservation,
-    HyperliquidTrade,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

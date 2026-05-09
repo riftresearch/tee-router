@@ -24,6 +24,7 @@ members = [
     "crates/otc-models",
     "crates/router-core",
     "crates/router-primitives",
+    "crates/router-temporal",
     "crates/utc",
 ]
 
@@ -36,6 +37,7 @@ repository = "https://github.com/riftresearch/tee-router"
 [workspace.dependencies]
 # Internal dependencies
 router-primitives = { path = "crates/router-primitives" }
+router-temporal = { path = "crates/router-temporal" }
 router-core = { path = "crates/router-core" }
 chains = { path = "crates/chains" }
 hyperliquid-client = { path = "crates/hyperliquid-client" }
