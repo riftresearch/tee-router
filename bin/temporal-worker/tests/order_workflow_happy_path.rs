@@ -117,6 +117,7 @@ struct WorkflowOptions {
     expect_external_custody_cctp_refund: bool,
     expect_external_custody_velora_refund: bool,
     expect_external_custody_across_then_velora_refund: bool,
+    suppress_across_hint_signal: bool,
 }
 
 struct SeededOrder {
@@ -142,6 +143,41 @@ async fn order_workflow_completes_funded_single_step_order() {
 async fn order_workflow_completes_across_step_via_hint() {
     let run = run_order_workflow(WorkflowOptions {
         route: WorkflowRoute::AcrossBaseEthToEthereumUsdc,
+        ..WorkflowOptions::default()
+    })
+    .await;
+
+    assert_eq!(run.output.terminal_status, OrderTerminalStatus::Completed);
+    let completed = run
+        .db
+        .orders()
+        .get(run.order_id)
+        .await
+        .expect("load completed order");
+    assert_eq!(completed.status, RouterOrderStatus::Completed);
+
+    let across_operation =
+        provider_operation_by_type(&run.db, run.order_id, ProviderOperationType::AcrossBridge)
+            .await;
+    assert_eq!(across_operation.status, ProviderOperationStatus::Completed);
+    let step = run
+        .db
+        .orders()
+        .get_execution_step(
+            across_operation
+                .execution_step_id
+                .expect("Across operation should be linked to a step"),
+        )
+        .await
+        .expect("load Across step");
+    assert_eq!(step.status, OrderExecutionStepStatus::Completed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn order_workflow_completes_across_step_via_polling_fallback() {
+    let run = run_order_workflow(WorkflowOptions {
+        route: WorkflowRoute::AcrossBaseEthToEthereumUsdc,
+        suppress_across_hint_signal: true,
         ..WorkflowOptions::default()
     })
     .await;
@@ -1051,21 +1087,23 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
                     &across_operation,
                 )
                 .await;
-                handle
-                    .signal(
-                        OrderWorkflow::provider_operation_hint,
-                        ProviderOperationHintSignal {
-                            order_id,
-                            hint_id: Uuid::now_v7(),
-                            provider_operation_id: Some(across_operation.id),
-                            provider: ProviderKind::Bridge,
-                            hint_kind: ProviderHintKind::AcrossFill,
-                            provider_ref: across_operation.provider_ref,
-                        },
-                        WorkflowSignalOptions::default(),
-                    )
-                    .await
-                    .expect("send Across provider-operation hint signal");
+                if !options.suppress_across_hint_signal {
+                    handle
+                        .signal(
+                            OrderWorkflow::provider_operation_hint,
+                            ProviderOperationHintSignal {
+                                order_id,
+                                hint_id: Uuid::now_v7(),
+                                provider_operation_id: Some(across_operation.id),
+                                provider: ProviderKind::Bridge,
+                                hint_kind: ProviderHintKind::AcrossFill,
+                                provider_ref: across_operation.provider_ref,
+                            },
+                            WorkflowSignalOptions::default(),
+                        )
+                        .await
+                        .expect("send Across provider-operation hint signal");
+                }
             }
             if matches!(options.route, WorkflowRoute::CctpBaseUsdcToArbitrumEth) {
                 let cctp_operation = wait_for_order_cctp_burn(

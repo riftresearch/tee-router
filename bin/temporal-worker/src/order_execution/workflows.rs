@@ -1,10 +1,13 @@
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use temporalio_common::protos::temporal::api::common::v1::RetryPolicy;
+use temporalio_common::protos::{
+    coresdk::child_workflow::ChildWorkflowCancellationType,
+    temporal::api::{common::v1::RetryPolicy, enums::v1::ParentClosePolicy},
+};
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityOptions, ChildWorkflowOptions, SyncWorkflowContext, WorkflowContext,
+    ActivityOptions, CancellableFuture, ChildWorkflowOptions, SyncWorkflowContext, WorkflowContext,
     WorkflowContextView, WorkflowResult,
 };
 use uuid::Uuid;
@@ -22,17 +25,19 @@ use super::types::{
     MaterializeRetryAttemptInput, OrderTerminalStatus, OrderWorkflowDebugCursor,
     OrderWorkflowInput, OrderWorkflowOutput, OrderWorkflowPhase,
     PersistProviderOperationStatusInput, PersistProviderReceiptInput, PersistStepFailedInput,
-    PersistStepReadyToFireInput, ProviderHintPollWorkflowInput, ProviderHintPollWorkflowOutput,
-    ProviderOperationHintDecision, ProviderOperationHintSignal, QuoteRefreshWorkflowInput,
-    QuoteRefreshWorkflowOutcome, QuoteRefreshWorkflowOutput, RefreshedQuoteAttemptOutcome,
-    RefundPlanOutcome, RefundTerminalStatus, RefundTrigger, RefundWorkflowInput,
-    RefundWorkflowOutput, SettleProviderStepInput, SingleRefundPositionOutcome,
-    StaleRunningStepClassified, StaleRunningStepDecision, StaleRunningStepWatchdogInput,
-    StaleRunningStepWatchdogOutput, StepExecuted, StepExecutionOutcome, StepFailureDecision,
-    VerifyProviderOperationHintInput, WriteFailedAttemptSnapshotInput,
+    PersistStepReadyToFireInput, PollProviderOperationHintsInput, ProviderHintPollWorkflowInput,
+    ProviderHintPollWorkflowOutput, ProviderOperationHintDecision, ProviderOperationHintSignal,
+    QuoteRefreshWorkflowInput, QuoteRefreshWorkflowOutcome, QuoteRefreshWorkflowOutput,
+    RefreshedQuoteAttemptOutcome, RefundPlanOutcome, RefundTerminalStatus, RefundTrigger,
+    RefundWorkflowInput, RefundWorkflowOutput, SettleProviderStepInput,
+    SingleRefundPositionOutcome, StaleRunningStepClassified, StaleRunningStepDecision,
+    StaleRunningStepWatchdogInput, StaleRunningStepWatchdogOutput, StepExecuted,
+    StepExecutionOutcome, StepFailureDecision, VerifyProviderOperationHintInput,
+    WriteFailedAttemptSnapshotInput,
 };
 
 const PROVIDER_HINT_WAIT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const PROVIDER_HINT_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const STALE_RUNNING_STEP_RECOVERY_AFTER: Duration = Duration::from_secs(5 * 60);
 const EXECUTE_STEP_START_TO_CLOSE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
@@ -342,14 +347,23 @@ impl OrderWorkflow {
                     )
                     .await?;
                 if executed.outcome == StepExecutionOutcome::Waiting {
-                    wait_for_provider_completion_hint(
+                    match wait_for_provider_completion_hint(
                         ctx,
                         input.order_id,
                         step.step_id,
                         executed,
                         db_activity_options.clone(),
                     )
-                    .await?;
+                    .await?
+                    {
+                        ProviderCompletionWait::Completed => {}
+                        ProviderCompletionWait::ManualInterventionRequired { finalized } => {
+                            return Ok(OrderWorkflowOutput {
+                                order_id: input.order_id,
+                                terminal_status: finalized.terminal_status,
+                            });
+                        }
+                    }
                 }
             }
             break;
@@ -464,6 +478,16 @@ enum StepExecutionProgress {
     },
 }
 
+enum ProviderCompletionWait {
+    Completed,
+    ManualInterventionRequired { finalized: FinalizedOrder },
+}
+
+enum RefundProviderCompletionWait {
+    Completed,
+    RefundManualInterventionRequired,
+}
+
 async fn execute_step_with_stale_running_timer(
     ctx: &mut WorkflowContext<OrderWorkflow>,
     order_id: Uuid,
@@ -551,6 +575,118 @@ async fn finalize_manual_intervention(
         .await?)
 }
 
+async fn finalize_provider_hint_manual_intervention(
+    ctx: &mut WorkflowContext<OrderWorkflow>,
+    order_id: Uuid,
+    attempt_id: Uuid,
+    step_id: Uuid,
+    reason: Value,
+    db_activity_options: ActivityOptions,
+) -> WorkflowResult<FinalizedOrder> {
+    tracing::warn!(
+        order_id = %order_id,
+        attempt_id = %attempt_id,
+        step_id = %step_id,
+        reason = %reason,
+        event_name = "provider_operation_hint.manual_intervention_required",
+        "provider_operation_hint.manual_intervention_required"
+    );
+    finalize_manual_intervention(
+        ctx,
+        order_id,
+        attempt_id,
+        step_id,
+        reason,
+        db_activity_options,
+    )
+    .await
+}
+
+async fn settle_provider_completion(
+    ctx: &mut WorkflowContext<OrderWorkflow>,
+    execution: StepExecuted,
+    db_activity_options: ActivityOptions,
+) -> WorkflowResult<()> {
+    let _settled = ctx
+        .start_activity(
+            OrderActivities::settle_provider_step,
+            SettleProviderStepInput { execution },
+            db_activity_options,
+        )
+        .await?;
+    Ok(())
+}
+
+async fn settle_refund_provider_completion(
+    ctx: &mut WorkflowContext<RefundWorkflow>,
+    execution: StepExecuted,
+    db_activity_options: ActivityOptions,
+) -> WorkflowResult<()> {
+    let _settled = ctx
+        .start_activity(
+            OrderActivities::settle_provider_step,
+            SettleProviderStepInput { execution },
+            db_activity_options,
+        )
+        .await?;
+    Ok(())
+}
+
+async fn finalize_refund_provider_hint_manual_intervention(
+    ctx: &mut WorkflowContext<RefundWorkflow>,
+    order_id: Uuid,
+    attempt_id: Uuid,
+    step_id: Uuid,
+    reason: Value,
+    db_activity_options: ActivityOptions,
+) -> WorkflowResult<()> {
+    tracing::warn!(
+        order_id = %order_id,
+        attempt_id = %attempt_id,
+        step_id = %step_id,
+        reason = %reason,
+        event_name = "provider_operation_hint.refund_manual_intervention_required",
+        "provider_operation_hint.refund_manual_intervention_required"
+    );
+    let _failed = ctx
+        .start_activity(
+            OrderActivities::persist_step_failed,
+            PersistStepFailedInput {
+                order_id,
+                attempt_id,
+                step_id,
+                failure_reason: reason.to_string(),
+            },
+            db_activity_options.clone(),
+        )
+        .await?;
+    let _snapshot = ctx
+        .start_activity(
+            OrderActivities::write_failed_attempt_snapshot,
+            WriteFailedAttemptSnapshotInput {
+                order_id,
+                attempt_id,
+                failed_step_id: step_id,
+            },
+            db_activity_options.clone(),
+        )
+        .await?;
+    let _finalized = ctx
+        .start_activity(
+            OrderActivities::finalize_order_or_refund,
+            FinalizeOrderOrRefundInput {
+                order_id,
+                attempt_id: Some(attempt_id),
+                step_id: Some(step_id),
+                terminal_status: OrderTerminalStatus::RefundManualInterventionRequired,
+                reason: Some(reason),
+            },
+            db_activity_options,
+        )
+        .await?;
+    Ok(())
+}
+
 fn json_reason(reason: &'static str, step_id: Uuid) -> Value {
     json!({
         "reason": reason,
@@ -564,73 +700,105 @@ async fn wait_for_provider_completion_hint(
     step_id: Uuid,
     execution: StepExecuted,
     db_activity_options: ActivityOptions,
-) -> WorkflowResult<()> {
-    loop {
-        let Some(signal) = next_provider_operation_hint(ctx, order_id).await? else {
-            tracing::warn!(
-                order_id = %order_id,
-                step_id = %step_id,
-                event_name = "provider_operation_hint.wait_timeout",
-                "provider_operation_hint.wait_timeout"
-            );
-            return Err(anyhow::anyhow!(
-                "provider hint wait timed out for step {step_id}; PR7b polling fallback is deferred"
-            )
-            .into());
-        };
-        let verified = ctx
-            .start_activity(
-                ProviderObservationActivities::verify_provider_operation_hint,
-                VerifyProviderOperationHintInput {
-                    order_id,
-                    step_id,
-                    signal,
-                },
-                db_activity_options.clone(),
-            )
-            .await?;
+) -> WorkflowResult<ProviderCompletionWait> {
+    let poll_child = ctx
+        .child_workflow(
+            ProviderHintPollWorkflow::run,
+            ProviderHintPollWorkflowInput { order_id, step_id },
+            provider_hint_poll_child_options(order_id, step_id),
+        )
+        .await?;
+    let poll_result = poll_child.result();
+    futures_util::pin_mut!(poll_result);
 
-        match verified.decision {
-            ProviderOperationHintDecision::Accept => {
-                let _settled = ctx
+    loop {
+        temporalio_sdk::workflows::select! {
+            _ = ctx.wait_condition(move |state: &OrderWorkflow| state.has_provider_operation_hint(order_id)) => {
+                let signal = ctx
+                    .state_mut(|state| state.pop_provider_operation_hint(order_id))
+                    .expect("provider operation hint condition was satisfied");
+                let verified = ctx
                     .start_activity(
-                        OrderActivities::settle_provider_step,
-                        SettleProviderStepInput {
-                            execution: execution.clone(),
+                        ProviderObservationActivities::verify_provider_operation_hint,
+                        VerifyProviderOperationHintInput {
+                            order_id,
+                            step_id,
+                            signal,
                         },
                         db_activity_options.clone(),
                     )
                     .await?;
-                return Ok(());
-            }
-            ProviderOperationHintDecision::Reject | ProviderOperationHintDecision::Defer => {
-                tracing::info!(
-                    order_id = %order_id,
-                    step_id = %step_id,
-                    provider_operation_id = ?verified.provider_operation_id,
-                    decision = ?verified.decision,
-                    reason = ?verified.reason,
-                    event_name = "provider_operation_hint.ignored",
-                    "provider_operation_hint.ignored"
-                );
-            }
-        }
-    }
-}
 
-async fn next_provider_operation_hint(
-    ctx: &mut WorkflowContext<OrderWorkflow>,
-    order_id: Uuid,
-) -> WorkflowResult<Option<ProviderOperationHintSignal>> {
-    if let Some(signal) = ctx.state_mut(|state| state.pop_provider_operation_hint(order_id)) {
-        return Ok(Some(signal));
-    }
-    temporalio_sdk::workflows::select! {
-        _ = ctx.wait_condition(move |state: &OrderWorkflow| state.has_provider_operation_hint(order_id)) => {
-            Ok(ctx.state_mut(|state| state.pop_provider_operation_hint(order_id)))
-        }
-        _ = ctx.timer(PROVIDER_HINT_WAIT_TIMEOUT) => {
-            Ok(None)
+                match verified.decision {
+                    ProviderOperationHintDecision::Accept => {
+                        let _ = ctx
+                            .external_workflow(provider_hint_poll_workflow_id(order_id, step_id), None)
+                            .cancel(Some("provider operation hint accepted by signal".to_string()))
+                            .await;
+                        poll_result.cancel();
+                        settle_provider_completion(ctx, execution.clone(), db_activity_options.clone()).await?;
+                        return Ok(ProviderCompletionWait::Completed);
+                    }
+                    ProviderOperationHintDecision::Reject | ProviderOperationHintDecision::Defer => {
+                        tracing::info!(
+                            order_id = %order_id,
+                            step_id = %step_id,
+                            provider_operation_id = ?verified.provider_operation_id,
+                            decision = ?verified.decision,
+                            reason = ?verified.reason,
+                            event_name = "provider_operation_hint.ignored",
+                            "provider_operation_hint.ignored"
+                        );
+                    }
+                }
+            }
+            polled = poll_result => {
+                let polled = polled?;
+                match polled.decision {
+                    ProviderOperationHintDecision::Accept => {
+                        settle_provider_completion(ctx, execution.clone(), db_activity_options.clone()).await?;
+                        return Ok(ProviderCompletionWait::Completed);
+                    }
+                    ProviderOperationHintDecision::Reject | ProviderOperationHintDecision::Defer => {
+                        let finalized = finalize_provider_hint_manual_intervention(
+                            ctx,
+                            order_id,
+                            execution.attempt_id,
+                            step_id,
+                            json!({
+                                "reason": "provider_operation_hint_poll_unresolved",
+                                "step_id": step_id,
+                                "provider_operation_id": polled.provider_operation_id,
+                                "decision": format!("{:?}", polled.decision),
+                                "poll_reason": polled.reason,
+                            }),
+                            db_activity_options.clone(),
+                        )
+                        .await?;
+                        return Ok(ProviderCompletionWait::ManualInterventionRequired { finalized });
+                    }
+                }
+            }
+            _ = ctx.timer(PROVIDER_HINT_WAIT_TIMEOUT) => {
+                let _ = ctx
+                    .external_workflow(provider_hint_poll_workflow_id(order_id, step_id), None)
+                    .cancel(Some("provider hint wait timed out".to_string()))
+                    .await;
+                poll_result.cancel();
+                let finalized = finalize_provider_hint_manual_intervention(
+                    ctx,
+                    order_id,
+                    execution.attempt_id,
+                    step_id,
+                    json!({
+                        "reason": "provider_operation_hint_wait_timeout",
+                        "step_id": step_id,
+                    }),
+                    db_activity_options.clone(),
+                )
+                .await?;
+                return Ok(ProviderCompletionWait::ManualInterventionRequired { finalized });
+            }
         }
     }
 }
@@ -641,73 +809,105 @@ async fn wait_for_refund_provider_completion_hint(
     step_id: Uuid,
     execution: StepExecuted,
     db_activity_options: ActivityOptions,
-) -> WorkflowResult<()> {
-    loop {
-        let Some(signal) = next_refund_provider_operation_hint(ctx, order_id).await? else {
-            tracing::warn!(
-                order_id = %order_id,
-                step_id = %step_id,
-                event_name = "provider_operation_hint.wait_timeout",
-                "provider_operation_hint.wait_timeout"
-            );
-            return Err(anyhow::anyhow!(
-                "refund provider hint wait timed out for step {step_id}; PR7b polling fallback is deferred"
-            )
-            .into());
-        };
-        let verified = ctx
-            .start_activity(
-                ProviderObservationActivities::verify_provider_operation_hint,
-                VerifyProviderOperationHintInput {
-                    order_id,
-                    step_id,
-                    signal,
-                },
-                db_activity_options.clone(),
-            )
-            .await?;
+) -> WorkflowResult<RefundProviderCompletionWait> {
+    let poll_child = ctx
+        .child_workflow(
+            ProviderHintPollWorkflow::run,
+            ProviderHintPollWorkflowInput { order_id, step_id },
+            provider_hint_poll_child_options(order_id, step_id),
+        )
+        .await?;
+    let poll_result = poll_child.result();
+    futures_util::pin_mut!(poll_result);
 
-        match verified.decision {
-            ProviderOperationHintDecision::Accept => {
-                let _settled = ctx
+    loop {
+        temporalio_sdk::workflows::select! {
+            _ = ctx.wait_condition(move |state: &RefundWorkflow| state.has_provider_operation_hint(order_id)) => {
+                let signal = ctx
+                    .state_mut(|state| state.pop_provider_operation_hint(order_id))
+                    .expect("refund provider operation hint condition was satisfied");
+                let verified = ctx
                     .start_activity(
-                        OrderActivities::settle_provider_step,
-                        SettleProviderStepInput {
-                            execution: execution.clone(),
+                        ProviderObservationActivities::verify_provider_operation_hint,
+                        VerifyProviderOperationHintInput {
+                            order_id,
+                            step_id,
+                            signal,
                         },
                         db_activity_options.clone(),
                     )
                     .await?;
-                return Ok(());
-            }
-            ProviderOperationHintDecision::Reject | ProviderOperationHintDecision::Defer => {
-                tracing::info!(
-                    order_id = %order_id,
-                    step_id = %step_id,
-                    provider_operation_id = ?verified.provider_operation_id,
-                    decision = ?verified.decision,
-                    reason = ?verified.reason,
-                    event_name = "provider_operation_hint.ignored",
-                    "provider_operation_hint.ignored"
-                );
-            }
-        }
-    }
-}
 
-async fn next_refund_provider_operation_hint(
-    ctx: &mut WorkflowContext<RefundWorkflow>,
-    order_id: Uuid,
-) -> WorkflowResult<Option<ProviderOperationHintSignal>> {
-    if let Some(signal) = ctx.state_mut(|state| state.pop_provider_operation_hint(order_id)) {
-        return Ok(Some(signal));
-    }
-    temporalio_sdk::workflows::select! {
-        _ = ctx.wait_condition(move |state: &RefundWorkflow| state.has_provider_operation_hint(order_id)) => {
-            Ok(ctx.state_mut(|state| state.pop_provider_operation_hint(order_id)))
-        }
-        _ = ctx.timer(PROVIDER_HINT_WAIT_TIMEOUT) => {
-            Ok(None)
+                match verified.decision {
+                    ProviderOperationHintDecision::Accept => {
+                        let _ = ctx
+                            .external_workflow(provider_hint_poll_workflow_id(order_id, step_id), None)
+                            .cancel(Some("provider operation hint accepted by signal".to_string()))
+                            .await;
+                        poll_result.cancel();
+                        settle_refund_provider_completion(ctx, execution.clone(), db_activity_options.clone()).await?;
+                        return Ok(RefundProviderCompletionWait::Completed);
+                    }
+                    ProviderOperationHintDecision::Reject | ProviderOperationHintDecision::Defer => {
+                        tracing::info!(
+                            order_id = %order_id,
+                            step_id = %step_id,
+                            provider_operation_id = ?verified.provider_operation_id,
+                            decision = ?verified.decision,
+                            reason = ?verified.reason,
+                            event_name = "provider_operation_hint.ignored",
+                            "provider_operation_hint.ignored"
+                        );
+                    }
+                }
+            }
+            polled = poll_result => {
+                let polled = polled?;
+                match polled.decision {
+                    ProviderOperationHintDecision::Accept => {
+                        settle_refund_provider_completion(ctx, execution.clone(), db_activity_options.clone()).await?;
+                        return Ok(RefundProviderCompletionWait::Completed);
+                    }
+                    ProviderOperationHintDecision::Reject | ProviderOperationHintDecision::Defer => {
+                        finalize_refund_provider_hint_manual_intervention(
+                            ctx,
+                            order_id,
+                            execution.attempt_id,
+                            step_id,
+                            json!({
+                                "reason": "provider_operation_hint_poll_unresolved",
+                                "step_id": step_id,
+                                "provider_operation_id": polled.provider_operation_id,
+                                "decision": format!("{:?}", polled.decision),
+                                "poll_reason": polled.reason,
+                            }),
+                            db_activity_options.clone(),
+                        )
+                        .await?;
+                        return Ok(RefundProviderCompletionWait::RefundManualInterventionRequired);
+                    }
+                }
+            }
+            _ = ctx.timer(PROVIDER_HINT_WAIT_TIMEOUT) => {
+                let _ = ctx
+                    .external_workflow(provider_hint_poll_workflow_id(order_id, step_id), None)
+                    .cancel(Some("provider hint wait timed out".to_string()))
+                    .await;
+                poll_result.cancel();
+                finalize_refund_provider_hint_manual_intervention(
+                    ctx,
+                    order_id,
+                    execution.attempt_id,
+                    step_id,
+                    json!({
+                        "reason": "provider_operation_hint_wait_timeout",
+                        "step_id": step_id,
+                    }),
+                    db_activity_options.clone(),
+                )
+                .await?;
+                return Ok(RefundProviderCompletionWait::RefundManualInterventionRequired);
+            }
         }
     }
 }
@@ -755,6 +955,21 @@ fn quote_refresh_child_options(order_id: Uuid, failed_step_id: Uuid) -> ChildWor
         task_timeout: Some(Duration::from_secs(30)),
         ..Default::default()
     }
+}
+
+fn provider_hint_poll_child_options(order_id: Uuid, step_id: Uuid) -> ChildWorkflowOptions {
+    ChildWorkflowOptions {
+        workflow_id: provider_hint_poll_workflow_id(order_id, step_id),
+        cancel_type: ChildWorkflowCancellationType::Abandon,
+        parent_close_policy: ParentClosePolicy::Terminate,
+        run_timeout: Some(PROVIDER_HINT_WAIT_TIMEOUT + Duration::from_secs(60)),
+        task_timeout: Some(Duration::from_secs(30)),
+        ..Default::default()
+    }
+}
+
+fn provider_hint_poll_workflow_id(order_id: Uuid, step_id: Uuid) -> String {
+    format!("order:{order_id}:provider-hint-poll:{step_id}")
 }
 
 /// Refund child workflow.
@@ -958,14 +1173,23 @@ impl RefundWorkflow {
                 )
                 .await?;
             if executed.outcome == StepExecutionOutcome::Waiting {
-                wait_for_refund_provider_completion_hint(
+                match wait_for_refund_provider_completion_hint(
                     ctx,
                     input.order_id,
                     step.step_id,
                     executed,
                     db_activity_options.clone(),
                 )
-                .await?;
+                .await?
+                {
+                    RefundProviderCompletionWait::Completed => {}
+                    RefundProviderCompletionWait::RefundManualInterventionRequired => {
+                        return Ok(RefundWorkflowOutput {
+                            order_id: input.order_id,
+                            terminal_status: RefundTerminalStatus::RefundManualInterventionRequired,
+                        });
+                    }
+                }
             }
         }
 
@@ -1107,9 +1331,47 @@ pub struct ProviderHintPollWorkflow;
 impl ProviderHintPollWorkflow {
     #[run]
     pub async fn run(
-        _ctx: &mut WorkflowContext<Self>,
-        _input: ProviderHintPollWorkflowInput,
+        ctx: &mut WorkflowContext<Self>,
+        input: ProviderHintPollWorkflowInput,
     ) -> WorkflowResult<ProviderHintPollWorkflowOutput> {
-        todo!("PR7b: poll provider hints as signal fallback")
+        let db_activity_options = db_activity_options();
+        let mut elapsed = Duration::ZERO;
+
+        loop {
+            let polled = ctx
+                .start_activity(
+                    ProviderObservationActivities::poll_provider_operation_hints,
+                    PollProviderOperationHintsInput {
+                        order_id: input.order_id,
+                        step_id: input.step_id,
+                    },
+                    db_activity_options.clone(),
+                )
+                .await?;
+            match polled.decision {
+                ProviderOperationHintDecision::Accept | ProviderOperationHintDecision::Reject => {
+                    return Ok(ProviderHintPollWorkflowOutput {
+                        provider_operation_id: polled.provider_operation_id,
+                        decision: polled.decision,
+                        reason: polled.reason,
+                    });
+                }
+                ProviderOperationHintDecision::Defer => {
+                    if elapsed >= PROVIDER_HINT_WAIT_TIMEOUT {
+                        return Ok(ProviderHintPollWorkflowOutput {
+                            provider_operation_id: polled.provider_operation_id,
+                            decision: ProviderOperationHintDecision::Defer,
+                            reason: Some(
+                                polled.reason.unwrap_or_else(|| {
+                                    "provider hint polling timed out".to_string()
+                                }),
+                            ),
+                        });
+                    }
+                    ctx.timer(PROVIDER_HINT_POLL_INTERVAL).await;
+                    elapsed = elapsed.saturating_add(PROVIDER_HINT_POLL_INTERVAL);
+                }
+            }
+        }
     }
 }

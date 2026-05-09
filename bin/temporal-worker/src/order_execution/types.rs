@@ -119,11 +119,14 @@ pub struct StaleRunningStepWatchdogOutput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderHintPollWorkflowInput {
     pub order_id: WorkflowOrderId,
+    pub step_id: WorkflowStepId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderHintPollWorkflowOutput {
-    pub hints_claimed: u32,
+    pub provider_operation_id: Option<WorkflowProviderOperationId>,
+    pub decision: ProviderOperationHintDecision,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -321,11 +324,14 @@ pub enum ProviderOperationHintDecision {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PollProviderOperationHintsInput {
     pub order_id: WorkflowOrderId,
+    pub step_id: WorkflowStepId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderOperationHintsPolled {
-    pub hints_claimed: u32,
+    pub provider_operation_id: Option<WorkflowProviderOperationId>,
+    pub decision: ProviderOperationHintDecision,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
