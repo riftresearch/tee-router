@@ -80,6 +80,9 @@ const MAX_EXECUTION_ATTEMPTS: i32 = 2;
 const MAX_STALE_QUOTE_REFRESHES_PER_ORDER_EXECUTION: usize = 8;
 const REFUND_PATH_MAX_DEPTH: usize = 5;
 const REFUND_HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW: u64 = 1_000_000;
+const REFRESH_HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW: u64 =
+    REFUND_HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW;
+const REFRESH_BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_BPS: u64 = 12_500;
 
 // Canonical Across V3 `FundsDeposited` event used for scar §11 lost-intent
 // recovery. Keep this byte-for-byte aligned with router-core's Across provider.
@@ -2471,6 +2474,291 @@ fn refresh_exchange_quote_transition_legs(
         expires_at: quote.expires_at,
         raw: quote.provider_quote.clone(),
     }])
+}
+
+fn refresh_cctp_quote_transition_legs(
+    transition: &TransitionDecl,
+    quote: &BridgeQuote,
+) -> Vec<QuoteLeg> {
+    let burn = QuoteLeg::new(QuoteLegSpec {
+        transition_decl_id: &transition.id,
+        transition_kind: transition.kind,
+        provider: transition.provider,
+        input_asset: &transition.input.asset,
+        output_asset: &transition.output.asset,
+        amount_in: &quote.amount_in,
+        amount_out: &quote.amount_out,
+        expires_at: quote.expires_at,
+        raw: refresh_cctp_quote_phase_raw(&quote.provider_quote, OrderExecutionStepType::CctpBurn),
+    })
+    .with_execution_step_type(OrderExecutionStepType::CctpBurn);
+
+    let receive = QuoteLeg::new(QuoteLegSpec {
+        transition_decl_id: &transition.id,
+        transition_kind: transition.kind,
+        provider: transition.provider,
+        input_asset: &transition.output.asset,
+        output_asset: &transition.output.asset,
+        amount_in: &quote.amount_out,
+        amount_out: &quote.amount_out,
+        expires_at: quote.expires_at,
+        raw: refresh_cctp_quote_phase_raw(
+            &quote.provider_quote,
+            OrderExecutionStepType::CctpReceive,
+        ),
+    })
+    .with_child_transition_id(format!("{}:receive", transition.id))
+    .with_execution_step_type(OrderExecutionStepType::CctpReceive);
+
+    vec![burn, receive]
+}
+
+fn refresh_cctp_quote_phase_raw(
+    provider_quote: &Value,
+    execution_step_type: OrderExecutionStepType,
+) -> Value {
+    let mut raw = provider_quote.clone();
+    set_json_value(&mut raw, "bridge_kind", json!("cctp_bridge"));
+    set_json_value(&mut raw, "kind", json!(execution_step_type.to_db_string()));
+    set_json_value(
+        &mut raw,
+        "execution_step_type",
+        json!(execution_step_type.to_db_string()),
+    );
+    raw
+}
+
+fn refresh_spot_cross_token_quote_transition_legs(
+    transition_decl_id: &str,
+    transition_kind: MarketOrderTransitionKind,
+    provider: ProviderId,
+    quote: &ExchangeQuote,
+) -> Result<Vec<QuoteLeg>, ActivityError> {
+    let provider_name = provider.as_str();
+    let legs = quote
+        .provider_quote
+        .get("legs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| activity_error("exchange quote missing spot_cross_token legs"))?;
+    legs.iter()
+        .enumerate()
+        .map(|(index, leg)| {
+            let input_asset = leg
+                .get("input_asset")
+                .ok_or_else(|| activity_error("hyperliquid quote leg missing input_asset"))
+                .and_then(|value| {
+                    QuoteLegAsset::from_value(value, "input_asset").map_err(activity_error)
+                })?;
+            let output_asset = leg
+                .get("output_asset")
+                .ok_or_else(|| activity_error("hyperliquid quote leg missing output_asset"))
+                .and_then(|value| {
+                    QuoteLegAsset::from_value(value, "output_asset").map_err(activity_error)
+                })?;
+            Ok(QuoteLeg {
+                transition_decl_id: format!("{transition_decl_id}:leg:{index}"),
+                transition_parent_decl_id: transition_decl_id.to_string(),
+                transition_kind,
+                execution_step_type: execution_step_type_for_transition_kind(transition_kind),
+                provider,
+                input_asset,
+                output_asset,
+                amount_in: refresh_required_quote_leg_amount(provider_name, leg, "amount_in")?,
+                amount_out: refresh_required_quote_leg_amount(provider_name, leg, "amount_out")?,
+                expires_at: quote.expires_at,
+                raw: leg.clone(),
+            })
+        })
+        .collect()
+}
+
+fn refresh_required_quote_leg_amount(
+    provider: &str,
+    leg: &Value,
+    field: &'static str,
+) -> Result<String, ActivityError> {
+    let amount = leg
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| activity_error(format!("{provider} quote leg missing {field}")))?;
+    if amount.is_empty() {
+        return Err(activity_error(format!(
+            "{provider} quote leg has empty {field}"
+        )));
+    }
+    Ok(amount.to_string())
+}
+
+fn refresh_unit_deposit_quote_leg(
+    transition: &TransitionDecl,
+    amount: &str,
+    expires_at: chrono::DateTime<Utc>,
+    raw: Value,
+) -> QuoteLeg {
+    QuoteLeg::new(QuoteLegSpec {
+        transition_decl_id: &transition.id,
+        transition_kind: transition.kind,
+        provider: transition.provider,
+        input_asset: &transition.input.asset,
+        output_asset: &transition.output.asset,
+        amount_in: amount,
+        amount_out: amount,
+        expires_at,
+        raw,
+    })
+    .with_execution_step_type(OrderExecutionStepType::UnitDeposit)
+}
+
+fn refresh_unit_withdrawal_quote_leg(
+    transition: &TransitionDecl,
+    amount: &str,
+    recipient_address: &str,
+    expires_at: chrono::DateTime<Utc>,
+) -> QuoteLeg {
+    QuoteLeg::new(QuoteLegSpec {
+        transition_decl_id: &transition.id,
+        transition_kind: transition.kind,
+        provider: transition.provider,
+        input_asset: &transition.input.asset,
+        output_asset: &transition.output.asset,
+        amount_in: amount,
+        amount_out: amount,
+        expires_at,
+        raw: refresh_unit_withdrawal_quote_raw(recipient_address),
+    })
+    .with_execution_step_type(OrderExecutionStepType::UnitWithdrawal)
+}
+
+fn refresh_unit_withdrawal_quote_raw(recipient_address: &str) -> Value {
+    json!({
+        "recipient_address": recipient_address,
+        "hyperliquid_core_activation_fee": refresh_hyperliquid_core_activation_fee_quote_json(),
+    })
+}
+
+fn refresh_hyperliquid_core_activation_fee_quote_json() -> Value {
+    json!({
+        "kind": "first_transfer_to_new_hypercore_destination",
+        "quote_asset": "USDC",
+        "amount_raw": REFRESH_HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW.to_string(),
+        "amount_decimal": "1",
+        "source": "hyperliquid_activation_gas_fee",
+    })
+}
+
+fn refresh_unit_deposit_fee_reserve(
+    quote: &MarketOrderQuote,
+    transition: &TransitionDecl,
+) -> Result<Option<U256>, ActivityError> {
+    if transition.kind != MarketOrderTransitionKind::UnitDeposit {
+        return Ok(None);
+    }
+    let Some(legs) = quote.provider_quote.get("legs").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    for leg in legs {
+        let parsed: QuoteLeg = serde_json::from_value(leg.clone())
+            .map_err(|source| activity_error(format!("stored quote leg is invalid: {source}")))?;
+        if parsed.parent_transition_id() != transition.id {
+            continue;
+        }
+        let Some(amount) = parsed
+            .raw
+            .get("source_fee_reserve")
+            .and_then(|value| value.get("amount"))
+            .and_then(Value::as_str)
+        else {
+            return Ok(None);
+        };
+        return refresh_parse_u256_amount("source_fee_reserve.amount", amount).map(Some);
+    }
+    Ok(None)
+}
+
+fn refresh_bitcoin_fee_reserve_quote(fee_reserve: U256) -> Value {
+    json!({
+        "source_fee_reserve": {
+            "kind": "bitcoin_miner_fee",
+            "chain_id": "bitcoin",
+            "asset": AssetId::Native.as_str(),
+            "amount": fee_reserve.to_string(),
+            "reserve_bps": REFRESH_BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_BPS,
+        }
+    })
+}
+
+fn refresh_parse_u256_amount(field: &'static str, value: &str) -> Result<U256, ActivityError> {
+    if value.is_empty() || !value.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err(activity_error(format!(
+            "{field} must be a raw unsigned integer: {value:?}"
+        )));
+    }
+    U256::from_str_radix(value, 10)
+        .map_err(|source| activity_error(format!("{field} is not a valid raw amount: {source}")))
+}
+
+fn refresh_subtract_amount(
+    field: &'static str,
+    gross_amount: &str,
+    subtract: U256,
+    transition_id: &str,
+    label: &'static str,
+) -> Result<String, ActivityError> {
+    let gross = refresh_parse_u256_amount(field, gross_amount)?;
+    if subtract == U256::ZERO {
+        return Ok(gross_amount.to_string());
+    }
+    if gross <= subtract {
+        return Err(activity_error(format!(
+            "{field} must exceed {label} {subtract} for transition {transition_id}"
+        )));
+    }
+    gross
+        .checked_sub(subtract)
+        .ok_or_else(|| {
+            activity_error(format!(
+                "{field} minus {label} underflowed for transition {transition_id}"
+            ))
+        })
+        .map(|amount| amount.to_string())
+}
+
+fn refresh_add_amount(
+    field: &'static str,
+    amount: &str,
+    add: U256,
+    label: &'static str,
+) -> Result<String, ActivityError> {
+    let amount = refresh_parse_u256_amount(field, amount)?;
+    amount
+        .checked_add(add)
+        .ok_or_else(|| activity_error(format!("{field} plus {label} overflowed")))
+        .map(|amount| amount.to_string())
+}
+
+fn refresh_reserve_hyperliquid_spot_send_quote_gas(
+    field: &'static str,
+    value: &str,
+) -> Result<String, ActivityError> {
+    refresh_subtract_amount(
+        field,
+        value,
+        U256::from(REFRESH_HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW),
+        "hyperliquid_trade",
+        "Hyperliquid spot token transfer gas reserve",
+    )
+}
+
+fn refresh_add_hyperliquid_spot_send_quote_gas_reserve(
+    field: &'static str,
+    value: &str,
+) -> Result<String, ActivityError> {
+    refresh_add_amount(
+        field,
+        value,
+        U256::from(REFRESH_HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW),
+        "Hyperliquid spot token transfer gas reserve",
+    )
 }
 
 fn refresh_transition_min_amount_out(
@@ -8621,6 +8909,276 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn refresh_cctp_quote_legs_materialize_burn_and_receive() {
+        let expires_at = Utc::now();
+        let base_usdc = test_asset("evm:8453", "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913");
+        let arbitrum_usdc = test_asset("evm:42161", "0xaf88d065e77c8cc2239327c5edb3a432268e5831");
+        let transition = cctp_transition(base_usdc.clone(), arbitrum_usdc.clone());
+        let quote = BridgeQuote {
+            provider_id: "cctp".to_string(),
+            amount_in: "1000000".to_string(),
+            amount_out: "999000".to_string(),
+            provider_quote: json!({ "message_hash": "0xcctp" }),
+            expires_at,
+        };
+
+        let legs = refresh_cctp_quote_transition_legs(&transition, &quote);
+
+        assert_eq!(legs.len(), 2);
+        assert_eq!(legs[0].transition_decl_id, "cctp");
+        assert_eq!(legs[0].parent_transition_id(), "cctp");
+        assert_eq!(
+            legs[0].execution_step_type,
+            OrderExecutionStepType::CctpBurn
+        );
+        assert_eq!(
+            legs[0].input_asset,
+            QuoteLegAsset::from_deposit_asset(&base_usdc)
+        );
+        assert_eq!(
+            legs[0].output_asset,
+            QuoteLegAsset::from_deposit_asset(&arbitrum_usdc)
+        );
+        assert_eq!(legs[0].amount_in, "1000000");
+        assert_eq!(legs[0].amount_out, "999000");
+        assert_eq!(
+            legs[0]
+                .raw
+                .get("execution_step_type")
+                .and_then(Value::as_str),
+            Some(OrderExecutionStepType::CctpBurn.to_db_string())
+        );
+
+        assert_eq!(legs[1].transition_decl_id, "cctp:receive");
+        assert_eq!(legs[1].parent_transition_id(), "cctp");
+        assert_eq!(
+            legs[1].execution_step_type,
+            OrderExecutionStepType::CctpReceive
+        );
+        assert_eq!(
+            legs[1].input_asset,
+            QuoteLegAsset::from_deposit_asset(&arbitrum_usdc)
+        );
+        assert_eq!(
+            legs[1].output_asset,
+            QuoteLegAsset::from_deposit_asset(&arbitrum_usdc)
+        );
+        assert_eq!(legs[1].amount_in, "999000");
+        assert_eq!(legs[1].amount_out, "999000");
+        assert_eq!(
+            legs[1].raw.get("kind").and_then(Value::as_str),
+            Some(OrderExecutionStepType::CctpReceive.to_db_string())
+        );
+        assert_eq!(
+            legs[1].raw.get("bridge_kind").and_then(Value::as_str),
+            Some("cctp_bridge")
+        );
+    }
+
+    #[test]
+    fn refresh_spot_cross_token_quote_legs_parse_hyperliquid_legs() {
+        let expires_at = Utc::now();
+        let hl_btc = test_asset("hyperliquid", "UBTC");
+        let hl_usdc = test_asset("hyperliquid", "native");
+        let hl_eth = test_asset("hyperliquid", "UETH");
+        let quote = ExchangeQuote {
+            provider_id: "hyperliquid".to_string(),
+            amount_in: "30000".to_string(),
+            amount_out: "40000000000000000".to_string(),
+            min_amount_out: Some("1".to_string()),
+            max_amount_in: None,
+            provider_quote: json!({
+                "kind": "spot_cross_token",
+                "legs": [
+                    {
+                        "input_asset": QuoteLegAsset::from_deposit_asset(&hl_btc),
+                        "output_asset": QuoteLegAsset::from_deposit_asset(&hl_usdc),
+                        "amount_in": "30000",
+                        "amount_out": "20000000"
+                    },
+                    {
+                        "input_asset": QuoteLegAsset::from_deposit_asset(&hl_usdc),
+                        "output_asset": QuoteLegAsset::from_deposit_asset(&hl_eth),
+                        "amount_in": "20000000",
+                        "amount_out": "40000000000000000"
+                    }
+                ]
+            }),
+            expires_at,
+        };
+
+        let legs = refresh_spot_cross_token_quote_transition_legs(
+            "hl-trade",
+            MarketOrderTransitionKind::HyperliquidTrade,
+            ProviderId::Hyperliquid,
+            &quote,
+        )
+        .expect("parse spot_cross_token legs");
+
+        assert_eq!(legs.len(), 2);
+        assert_eq!(legs[0].transition_decl_id, "hl-trade:leg:0");
+        assert_eq!(legs[0].parent_transition_id(), "hl-trade");
+        assert_eq!(
+            legs[0].execution_step_type,
+            OrderExecutionStepType::HyperliquidTrade
+        );
+        assert_eq!(
+            legs[0].input_asset,
+            QuoteLegAsset::from_deposit_asset(&hl_btc)
+        );
+        assert_eq!(
+            legs[0].output_asset,
+            QuoteLegAsset::from_deposit_asset(&hl_usdc)
+        );
+        assert_eq!(legs[0].amount_in, "30000");
+        assert_eq!(legs[0].amount_out, "20000000");
+        assert_eq!(legs[1].transition_decl_id, "hl-trade:leg:1");
+        assert_eq!(legs[1].parent_transition_id(), "hl-trade");
+        assert_eq!(
+            legs[1].input_asset,
+            QuoteLegAsset::from_deposit_asset(&hl_usdc)
+        );
+        assert_eq!(
+            legs[1].output_asset,
+            QuoteLegAsset::from_deposit_asset(&hl_eth)
+        );
+        assert_eq!(legs[1].amount_in, "20000000");
+        assert_eq!(legs[1].amount_out, "40000000000000000");
+    }
+
+    #[test]
+    fn refresh_unit_quote_legs_are_passthrough_shapes() {
+        let expires_at = Utc::now();
+        let btc = test_asset("bitcoin", "native");
+        let hl_btc = test_asset("hyperliquid", "UBTC");
+        let deposit = unit_deposit_transition(btc.clone(), hl_btc.clone(), CanonicalAsset::Btc);
+        let withdrawal =
+            unit_withdrawal_transition(hl_btc.clone(), btc.clone(), CanonicalAsset::Btc);
+        let reserve_quote = refresh_bitcoin_fee_reserve_quote(U256::from(2500_u64));
+
+        let deposit_leg =
+            refresh_unit_deposit_quote_leg(&deposit, "30000", expires_at, reserve_quote.clone());
+        assert_eq!(
+            deposit_leg.execution_step_type,
+            OrderExecutionStepType::UnitDeposit
+        );
+        assert_eq!(
+            deposit_leg.input_asset,
+            QuoteLegAsset::from_deposit_asset(&btc)
+        );
+        assert_eq!(
+            deposit_leg.output_asset,
+            QuoteLegAsset::from_deposit_asset(&hl_btc)
+        );
+        assert_eq!(deposit_leg.amount_in, "30000");
+        assert_eq!(deposit_leg.amount_out, "30000");
+        assert_eq!(deposit_leg.raw, reserve_quote);
+        assert_eq!(
+            deposit_leg
+                .raw
+                .pointer("/source_fee_reserve/reserve_bps")
+                .and_then(Value::as_u64),
+            Some(REFRESH_BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_BPS)
+        );
+
+        let withdrawal_leg =
+            refresh_unit_withdrawal_quote_leg(&withdrawal, "30000", "0xrecipient", expires_at);
+        assert_eq!(
+            withdrawal_leg.execution_step_type,
+            OrderExecutionStepType::UnitWithdrawal
+        );
+        assert_eq!(
+            withdrawal_leg.input_asset,
+            QuoteLegAsset::from_deposit_asset(&hl_btc)
+        );
+        assert_eq!(
+            withdrawal_leg.output_asset,
+            QuoteLegAsset::from_deposit_asset(&btc)
+        );
+        assert_eq!(withdrawal_leg.amount_in, "30000");
+        assert_eq!(withdrawal_leg.amount_out, "30000");
+        assert_eq!(
+            withdrawal_leg
+                .raw
+                .get("recipient_address")
+                .and_then(Value::as_str),
+            Some("0xrecipient")
+        );
+        assert_eq!(
+            withdrawal_leg
+                .raw
+                .pointer("/hyperliquid_core_activation_fee/amount_raw")
+                .and_then(Value::as_str),
+            Some(
+                REFRESH_HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW
+                    .to_string()
+                    .as_str()
+            )
+        );
+    }
+
+    #[test]
+    fn refresh_unit_deposit_fee_reserve_reads_original_quote_leg() {
+        let now = Utc::now();
+        let btc = test_asset("bitcoin", "native");
+        let hl_btc = test_asset("hyperliquid", "UBTC");
+        let transition = unit_deposit_transition(btc.clone(), hl_btc, CanonicalAsset::Btc);
+        let fee_reserve = U256::from(42_000_u64);
+        let leg = refresh_unit_deposit_quote_leg(
+            &transition,
+            "100000",
+            now,
+            refresh_bitcoin_fee_reserve_quote(fee_reserve),
+        );
+        let quote = test_market_order_quote(
+            btc,
+            transition.output.asset.clone(),
+            vec![leg],
+            now + chrono::Duration::minutes(5),
+            now,
+        );
+
+        assert_eq!(
+            refresh_unit_deposit_fee_reserve(&quote, &transition).expect("read fee reserve"),
+            Some(fee_reserve)
+        );
+
+        let mut no_reserve_quote = quote.clone();
+        no_reserve_quote.provider_quote = json!({ "legs": [] });
+        assert_eq!(
+            refresh_unit_deposit_fee_reserve(&no_reserve_quote, &transition)
+                .expect("missing fee reserve is allowed"),
+            None
+        );
+    }
+
+    #[test]
+    fn refresh_hyperliquid_spot_send_reserve_math_matches_legacy() {
+        assert_eq!(
+            refresh_reserve_hyperliquid_spot_send_quote_gas("amount_in", "1000001")
+                .expect("subtract reserve"),
+            "1"
+        );
+        assert_eq!(
+            refresh_add_hyperliquid_spot_send_quote_gas_reserve("amount_in", "1")
+                .expect("add reserve"),
+            "1000001"
+        );
+        assert!(
+            refresh_reserve_hyperliquid_spot_send_quote_gas("amount_in", "1000000").is_err(),
+            "amount must strictly exceed the reserve"
+        );
+        assert!(
+            refresh_add_hyperliquid_spot_send_quote_gas_reserve(
+                "amount_in",
+                &U256::MAX.to_string(),
+            )
+            .is_err(),
+            "addition must reject overflow"
+        );
+    }
+
     async fn test_database() -> TestDatabase {
         let image = GenericImage::new("postgres", "18-alpine")
             .with_exposed_port(POSTGRES_PORT.tcp())
@@ -8851,6 +9409,24 @@ mod tests {
         }
     }
 
+    fn cctp_transition(input: DepositAsset, output: DepositAsset) -> TransitionDecl {
+        TransitionDecl {
+            id: "cctp".to_string(),
+            kind: MarketOrderTransitionKind::CctpBridge,
+            provider: ProviderId::Cctp,
+            input: AssetSlot {
+                asset: input.clone(),
+                required_custody_role: RequiredCustodyRole::SourceOrIntermediate,
+            },
+            output: AssetSlot {
+                asset: output.clone(),
+                required_custody_role: RequiredCustodyRole::IntermediateExecution,
+            },
+            from: MarketOrderNode::External(input),
+            to: MarketOrderNode::External(output),
+        }
+    }
+
     fn quote_leg_for_transition(
         transition: &TransitionDecl,
         amount_in: &str,
@@ -8877,6 +9453,33 @@ mod tests {
         .with_execution_step_type(execution_step_type_for_transition_kind(
             transition.kind,
         ))
+    }
+
+    fn test_market_order_quote(
+        source_asset: DepositAsset,
+        destination_asset: DepositAsset,
+        legs: Vec<QuoteLeg>,
+        expires_at: chrono::DateTime<Utc>,
+        created_at: chrono::DateTime<Utc>,
+    ) -> MarketOrderQuote {
+        MarketOrderQuote {
+            id: Uuid::now_v7(),
+            order_id: None,
+            source_asset,
+            destination_asset,
+            recipient_address: test_address(1),
+            provider_id: "path:test".to_string(),
+            order_kind: MarketOrderKindType::ExactIn,
+            amount_in: "100000".to_string(),
+            amount_out: "100000".to_string(),
+            min_amount_out: Some("1".to_string()),
+            max_amount_in: None,
+            slippage_bps: Some(100),
+            provider_quote: json!({ "legs": legs }),
+            usd_valuation: json!({}),
+            expires_at,
+            created_at,
+        }
     }
 
     async fn seed_running_step(
