@@ -632,6 +632,9 @@ impl OrderActivities {
             .filter(|attempt| attempt.attempt_kind == OrderExecutionAttemptKind::RefreshedExecution)
             .count();
         let stale_quote_refresh_allowed = if matches!(order_quote, RouterOrderQuote::MarketOrder(_))
+            // Scar §7: RefundRecovery attempts never stale-refresh. Funds may be
+            // mid-flight during a refund, so stale refund quotes route to refund
+            // manual intervention instead of being re-quoted.
             && attempt.attempt_kind != OrderExecutionAttemptKind::RefundRecovery
             && refreshed_attempt_count < MAX_STALE_QUOTE_REFRESHES_PER_ORDER_EXECUTION
         {
@@ -2390,6 +2393,8 @@ fn refresh_remaining_exact_in_amount(
             let Some(attempt) = attempts.iter().find(|attempt| attempt.id == attempt_id) else {
                 return false;
             };
+            // Keep refund-recovery attempts out of stale-quote refresh accounting;
+            // scar §7 treats refund re-quotes as unsafe once funds may be mid-flight.
             attempt.attempt_kind != OrderExecutionAttemptKind::RefundRecovery
                 && attempt.attempt_index <= stale_attempt.attempt_index
                 && leg.transition_decl_id.as_deref() == Some(previous_transition.id.as_str())
@@ -5722,13 +5727,12 @@ fn decimal_string_to_raw_digits(value: &str, decimals: u8) -> Result<String, Str
     Ok(if digits.is_empty() { "0" } else { digits }.to_string())
 }
 
-/// PR6b7d deferred: refund-side stale quote refresh interactions.
-/// PR7b separately owns Unit/CCTP/Hyperliquid provider hint verifiers needed for
-/// end-to-end Unit route coverage.
-#[allow(dead_code)]
-fn deferred_pr6b7d_refund_side_stale_quote_refresh() -> ! {
-    todo!("PR6b7d: refund-side stale quote refresh interactions")
-}
+// Refund-side stale quote refresh is intentionally not implemented. Scar §7
+// preserves the legacy rule that RefundRecovery attempts never stale-refresh:
+// partial-execution funds may be mid-flight during a refund, so re-quoting is
+// unsafe. A stale refund quote routes to RefundManualInterventionRequired via
+// the existing classify_step_failure path, matching
+// bin/router-server/src/services/order_executor.rs.
 
 #[derive(Clone, Default)]
 pub struct QuoteRefreshActivities {
