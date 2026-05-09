@@ -270,6 +270,7 @@ pub struct FailedAttemptSnapshotWritten {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FinalizeOrderOrRefundInput {
     pub order_id: WorkflowOrderId,
+    pub attempt_id: Option<WorkflowAttemptId>,
     pub terminal_status: OrderTerminalStatus,
 }
 
@@ -334,14 +335,61 @@ pub struct SingleRefundPosition {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SingleRefundPositionDiscovery {
+    pub outcome: SingleRefundPositionOutcome,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SingleRefundPositionOutcome {
+    Position(SingleRefundPosition),
+    Untenable { reason: RefundUntenableReason },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum RefundUntenableReason {
+    RefundRequiresSingleRecoverablePosition {
+        position_count: usize,
+        recoverable_position_count: usize,
+    },
+    RefundRecoverablePositionDisappearedAfterValidation,
+}
+
+impl RefundUntenableReason {
+    #[must_use]
+    pub fn reason_str(&self) -> &'static str {
+        match self {
+            Self::RefundRequiresSingleRecoverablePosition { .. } => {
+                "refund_requires_single_recoverable_position"
+            }
+            Self::RefundRecoverablePositionDisappearedAfterValidation => {
+                "refund_recoverable_position_disappeared_after_validation"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MaterializeRefundPlanInput {
     pub order_id: WorkflowOrderId,
+    pub failed_attempt_id: WorkflowAttemptId,
     pub position: SingleRefundPosition,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefundPlanShape {
-    pub refund_attempt_id: WorkflowAttemptId,
+    pub outcome: RefundPlanOutcome,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RefundPlanOutcome {
+    Materialized {
+        refund_attempt_id: WorkflowAttemptId,
+        steps: Vec<WorkflowExecutionStep>,
+    },
+    Untenable {
+        reason: RefundUntenableReason,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
