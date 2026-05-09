@@ -5,19 +5,25 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use router_core::{
-    db::{Database, ExecutionAttemptPlan, PersistStepCompletionRecord},
+    db::{
+        Database, ExecutionAttemptPlan, PersistStepCompletionRecord, RefreshedExecutionAttemptPlan,
+    },
     error::{RouterCoreError, RouterCoreResult},
     models::{
+        MarketOrderKind, MarketOrderKindType, MarketOrderQuote, OrderExecutionAttemptKind,
         OrderExecutionAttemptStatus, OrderExecutionStep, OrderExecutionStepStatus,
         OrderExecutionStepType, OrderProviderAddress, OrderProviderOperation,
         ProviderOperationStatus, RouterOrder, RouterOrderQuote,
     },
     services::{
         action_providers::{
-            BridgeExecutionRequest, ExchangeExecutionRequest, ProviderExecutionStatePatch,
-            UnitDepositStepRequest, UnitWithdrawalStepRequest,
+            BridgeExecutionRequest, ExchangeExecutionRequest, ExchangeQuote, ExchangeQuoteRequest,
+            ProviderExecutionStatePatch, UnitDepositStepRequest, UnitWithdrawalStepRequest,
         },
+        asset_registry::{MarketOrderTransitionKind, ProviderId, TransitionDecl},
         custody_action_executor::CustodyActionRequest,
+        market_order_planner::MarketOrderPlanRemainingStart,
+        quote_legs::{execution_step_type_for_transition_kind, QuoteLeg, QuoteLegAsset},
         ActionProviderRegistry, CustodyActionExecutor, CustodyActionReceipt,
         MarketOrderRoutePlanner, ProviderExecutionIntent, ProviderExecutionState,
         ProviderOperationIntent,
@@ -40,13 +46,14 @@ use super::types::{
     PersistStepFailedInput, PersistStepReadyToFireInput, PersistStepTerminalStatusInput,
     PersistenceBoundary, PollProviderOperationHintsInput, ProviderActionDispatchShape,
     ProviderOperationHintVerified, ProviderOperationHintsPolled, RecoverAcrossOnchainLogInput,
-    RefreshedAttemptMaterialized, RefreshedQuoteAttemptShape, RefundPlanShape,
-    SettleProviderStepInput, SingleRefundPosition, StepExecuted, StepExecutionOutcome,
-    StepFailureDecision, VerifyProviderOperationHintInput, WorkflowExecutionStep,
-    WriteFailedAttemptSnapshotInput,
+    RefreshedAttemptMaterialized, RefreshedQuoteAttemptOutcome, RefreshedQuoteAttemptShape,
+    RefundPlanShape, SettleProviderStepInput, SingleRefundPosition,
+    StaleQuoteRefreshUntenableReason, StepExecuted, StepExecutionOutcome, StepFailureDecision,
+    VerifyProviderOperationHintInput, WorkflowExecutionStep, WriteFailedAttemptSnapshotInput,
 };
 
 const MAX_EXECUTION_ATTEMPTS: i32 = 2;
+const MAX_STALE_QUOTE_REFRESHES_PER_ORDER_EXECUTION: usize = 8;
 
 #[derive(Clone)]
 pub struct OrderActivityDeps {
@@ -84,6 +91,11 @@ impl OrderActivities {
         Self {
             deps: Some(Arc::new(deps)),
         }
+    }
+
+    #[must_use]
+    pub(crate) fn shared_deps(&self) -> Option<Arc<OrderActivityDeps>> {
+        self.deps.clone()
     }
 
     fn deps(&self) -> Result<Arc<OrderActivityDeps>, ActivityError> {
@@ -550,7 +562,56 @@ impl OrderActivities {
                 attempt.id, input.order_id
             )));
         }
-        let decision = if attempt.attempt_index < MAX_EXECUTION_ATTEMPTS {
+        let order_quote = deps
+            .db
+            .orders()
+            .get_router_order_quote(input.order_id)
+            .await
+            .map_err(activity_error_from_display)?;
+        let failed_step = deps
+            .db
+            .orders()
+            .get_execution_step(input.failed_step_id)
+            .await
+            .map_err(activity_error_from_display)?;
+        if failed_step.order_id != input.order_id
+            || failed_step.execution_attempt_id != Some(input.attempt_id)
+        {
+            return Err(activity_error(format!(
+                "step {} does not belong to order {} attempt {}",
+                failed_step.id, input.order_id, input.attempt_id
+            )));
+        }
+        let refreshed_attempt_count = deps
+            .db
+            .orders()
+            .get_execution_attempts(input.order_id)
+            .await
+            .map_err(activity_error_from_display)?
+            .into_iter()
+            .filter(|attempt| attempt.attempt_kind == OrderExecutionAttemptKind::RefreshedExecution)
+            .count();
+        let stale_quote_refresh_allowed = if matches!(order_quote, RouterOrderQuote::MarketOrder(_))
+            && attempt.attempt_kind != OrderExecutionAttemptKind::RefundRecovery
+            && refreshed_attempt_count < MAX_STALE_QUOTE_REFRESHES_PER_ORDER_EXECUTION
+        {
+            let legs = deps
+                .db
+                .orders()
+                .get_execution_legs_for_attempt(input.attempt_id)
+                .await
+                .map_err(activity_error_from_display)?;
+            failed_step
+                .execution_leg_id
+                .and_then(|leg_id| legs.into_iter().find(|leg| leg.id == leg_id))
+                .and_then(|leg| leg.provider_quote_expires_at)
+                .is_some_and(|expires_at| expires_at < Utc::now())
+        } else {
+            false
+        };
+        let decision = if stale_quote_refresh_allowed {
+            StepFailureDecision::RefreshQuote
+        } else if attempt.attempt_index < MAX_EXECUTION_ATTEMPTS {
             StepFailureDecision::RetryNewAttempt
         } else {
             StepFailureDecision::StartRefund
@@ -560,6 +621,7 @@ impl OrderActivities {
             attempt_id = %input.attempt_id,
             failed_step_id = %input.failed_step_id,
             attempt_index = attempt.attempt_index,
+            refreshed_attempt_count,
             decision = ?decision,
             event_name = "execution_step.failure_classified",
             "execution_step.failure_classified"
@@ -1195,6 +1257,125 @@ fn failed_attempt_snapshot(order: &RouterOrder, failed_step: &OrderExecutionStep
     })
 }
 
+fn refreshed_market_order_quote_single(
+    order: &RouterOrder,
+    original_quote: &MarketOrderQuote,
+    transitions: &[TransitionDecl],
+    legs: Vec<QuoteLeg>,
+    exchange_quote: &ExchangeQuote,
+    created_at: chrono::DateTime<Utc>,
+) -> MarketOrderQuote {
+    MarketOrderQuote {
+        id: Uuid::now_v7(),
+        order_id: Some(order.id),
+        source_asset: original_quote.source_asset.clone(),
+        destination_asset: original_quote.destination_asset.clone(),
+        recipient_address: original_quote.recipient_address.clone(),
+        provider_id: original_quote.provider_id.clone(),
+        order_kind: original_quote.order_kind,
+        amount_in: exchange_quote.amount_in.clone(),
+        amount_out: exchange_quote.amount_out.clone(),
+        min_amount_out: original_quote.min_amount_out.clone(),
+        max_amount_in: None,
+        slippage_bps: original_quote.slippage_bps,
+        provider_quote: json!({
+            "schema_version": 2,
+            "planner": "transition_decl_v1",
+            "path_id": original_quote
+                .provider_quote
+                .get("path_id")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+                .unwrap_or_else(|| transitions
+                    .iter()
+                    .map(|transition| transition.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(">")),
+            "transition_decl_ids": transitions
+                .iter()
+                .map(|transition| transition.id.clone())
+                .collect::<Vec<_>>(),
+            "transitions": transitions,
+            "legs": legs,
+            "gas_reimbursement": original_quote
+                .provider_quote
+                .get("gas_reimbursement")
+                .cloned()
+                .unwrap_or_else(|| json!({ "retention_actions": [] })),
+            "refresh": {
+                "schema_version": 1,
+                "source_quote_id": original_quote.id,
+                "source_quote_expires_at": original_quote.expires_at.to_rfc3339(),
+            },
+        }),
+        usd_valuation: json!({}),
+        expires_at: exchange_quote.expires_at,
+        created_at,
+    }
+}
+
+fn refresh_exchange_quote_transition_legs_single(
+    transition_decl_id: &str,
+    transition_kind: MarketOrderTransitionKind,
+    provider: ProviderId,
+    quote: &ExchangeQuote,
+) -> Result<Vec<QuoteLeg>, ActivityError> {
+    let kind = quote
+        .provider_quote
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if kind != "universal_router_swap" {
+        return Err(activity_error(format!(
+            "unsupported single-leg refreshed exchange quote kind {kind:?}"
+        )));
+    }
+    let input_asset = quote
+        .provider_quote
+        .get("input_asset")
+        .ok_or_else(|| activity_error("universal router quote missing input_asset"))
+        .and_then(|value| {
+            QuoteLegAsset::from_value(value, "input_asset").map_err(activity_error)
+        })?;
+    let output_asset = quote
+        .provider_quote
+        .get("output_asset")
+        .ok_or_else(|| activity_error("universal router quote missing output_asset"))
+        .and_then(|value| {
+            QuoteLegAsset::from_value(value, "output_asset").map_err(activity_error)
+        })?;
+    Ok(vec![QuoteLeg {
+        transition_decl_id: transition_decl_id.to_string(),
+        transition_parent_decl_id: transition_decl_id.to_string(),
+        transition_kind,
+        execution_step_type: execution_step_type_for_transition_kind(transition_kind),
+        provider,
+        input_asset,
+        output_asset,
+        amount_in: quote.amount_in.clone(),
+        amount_out: quote.amount_out.clone(),
+        expires_at: quote.expires_at,
+        raw: quote.provider_quote.clone(),
+    }])
+}
+
+fn parse_refresh_amount(field: &'static str, value: &str) -> Result<u128, ActivityError> {
+    value.parse::<u128>().map_err(|source| {
+        activity_error(format!(
+            "refreshed quote {field} must be an unsigned integer: {source}"
+        ))
+    })
+}
+
+fn set_json_value(target: &mut Value, key: &'static str, value: Value) {
+    if !target.is_object() {
+        *target = json!({});
+    }
+    if let Some(object) = target.as_object_mut() {
+        object.insert(key.to_string(), value);
+    }
+}
+
 fn activity_error(message: impl ToString) -> ActivityError {
     std::io::Error::other(message.to_string()).into()
 }
@@ -1228,28 +1409,377 @@ impl RefundActivities {
     }
 }
 
-pub struct QuoteRefreshActivities;
+#[derive(Clone, Default)]
+pub struct QuoteRefreshActivities {
+    deps: Option<Arc<OrderActivityDeps>>,
+}
+
+impl QuoteRefreshActivities {
+    #[must_use]
+    pub(crate) fn from_order_activities(order_activities: &OrderActivities) -> Self {
+        Self {
+            deps: order_activities.shared_deps(),
+        }
+    }
+
+    fn deps(&self) -> Result<Arc<OrderActivityDeps>, ActivityError> {
+        self.deps
+            .clone()
+            .ok_or_else(|| activity_error("quote refresh activities are not configured"))
+    }
+}
 
 #[activities]
 impl QuoteRefreshActivities {
     /// Scar tissue: §7 stale quote refresh and §16.4 refresh helpers.
+    ///
+    /// PR5a supports single-leg ExactIn market orders only. PR5b owns the deferred branches:
+    /// multi-leg ExactIn-forward iteration, ExactOut-backward iteration, Bitcoin unit-deposit fee
+    /// reserve, and Hyperliquid spot-send gas reserve.
     #[activity]
     pub async fn compose_refreshed_quote_attempt(
+        self: Arc<Self>,
         _ctx: ActivityContext,
-        _input: ComposeRefreshedQuoteAttemptInput,
+        input: ComposeRefreshedQuoteAttemptInput,
     ) -> Result<RefreshedQuoteAttemptShape, ActivityError> {
-        // TODO(PR4, brief §6 invariant 5; scar §7): stale quote refresh is its own attempt.
-        todo!("PR4: compose refreshed quote attempt")
+        let deps = self.deps()?;
+        let order = deps
+            .db
+            .orders()
+            .get(input.order_id)
+            .await
+            .map_err(activity_error_from_display)?;
+        let original_quote = match deps
+            .db
+            .orders()
+            .get_router_order_quote(input.order_id)
+            .await
+            .map_err(activity_error_from_display)?
+        {
+            RouterOrderQuote::MarketOrder(quote) => quote,
+            RouterOrderQuote::LimitOrder(_) => {
+                return Err(activity_error(format!(
+                    "order {} is a limit order and cannot refresh stale market quotes",
+                    input.order_id
+                )));
+            }
+        };
+        let stale_attempt = deps
+            .db
+            .orders()
+            .get_execution_attempt(input.stale_attempt_id)
+            .await
+            .map_err(activity_error_from_display)?;
+        if stale_attempt.order_id != input.order_id {
+            return Err(activity_error(format!(
+                "attempt {} does not belong to order {}",
+                stale_attempt.id, input.order_id
+            )));
+        }
+        let failed_step = deps
+            .db
+            .orders()
+            .get_execution_step(input.failed_step_id)
+            .await
+            .map_err(activity_error_from_display)?;
+        if failed_step.order_id != input.order_id
+            || failed_step.execution_attempt_id != Some(input.stale_attempt_id)
+        {
+            return Err(activity_error(format!(
+                "step {} does not belong to order {} attempt {}",
+                failed_step.id, input.order_id, input.stale_attempt_id
+            )));
+        }
+        let stale_legs = deps
+            .db
+            .orders()
+            .get_execution_legs_for_attempt(input.stale_attempt_id)
+            .await
+            .map_err(activity_error_from_display)?;
+        let stale_leg = failed_step
+            .execution_leg_id
+            .and_then(|leg_id| stale_legs.into_iter().find(|leg| leg.id == leg_id))
+            .ok_or_else(|| {
+                activity_error(format!(
+                    "failed step {} has no materialized stale execution leg",
+                    failed_step.id
+                ))
+            })?;
+        let Some(provider_quote_expires_at) = stale_leg.provider_quote_expires_at else {
+            return Err(activity_error(format!(
+                "failed step {} execution leg {} has no provider quote expiry",
+                failed_step.id, stale_leg.id
+            )));
+        };
+        if provider_quote_expires_at >= Utc::now() {
+            return Err(activity_error(format!(
+                "failed step {} execution leg {} provider quote has not expired",
+                failed_step.id, stale_leg.id
+            )));
+        }
+        if original_quote.order_kind != MarketOrderKindType::ExactIn {
+            todo!("PR5b: multi-leg refresh");
+        }
+        let source_vault_id = order.funding_vault_id.ok_or_else(|| {
+            activity_error(format!(
+                "order {} cannot refresh a quote without a funding vault",
+                order.id
+            ))
+        })?;
+        let source_vault = deps
+            .db
+            .vaults()
+            .get(source_vault_id)
+            .await
+            .map_err(activity_error_from_display)?;
+        let transitions = deps
+            .planner
+            .quoted_transition_path(&order, &original_quote)
+            .map_err(activity_error_from_display)?;
+        if transitions.len() != 1 {
+            todo!("PR5b: multi-leg refresh");
+        }
+        let transition = transitions
+            .first()
+            .expect("single transition checked above");
+        if transition.kind != MarketOrderTransitionKind::UniversalRouterSwap {
+            todo!("PR5b: multi-leg refresh");
+        }
+        let step_request =
+            match ExchangeExecutionRequest::universal_router_swap_from_value(&failed_step.request)
+                .map_err(activity_error_from_display)?
+            {
+                ExchangeExecutionRequest::UniversalRouterSwap(request) => request,
+                _ => {
+                    return Err(activity_error(format!(
+                        "step {} is not a universal-router swap request",
+                        failed_step.id
+                    )));
+                }
+            };
+        let exchange = deps
+            .action_providers
+            .exchange(transition.provider.as_str())
+            .ok_or_else(|| {
+                activity_error(format!(
+                    "exchange provider {} is not configured",
+                    transition.provider.as_str()
+                ))
+            })?;
+        let refreshed_quote = exchange
+            .quote_trade(ExchangeQuoteRequest {
+                input_asset: transition.input.asset.clone(),
+                output_asset: transition.output.asset.clone(),
+                input_decimals: Some(step_request.input_decimals),
+                output_decimals: Some(step_request.output_decimals),
+                order_kind: MarketOrderKind::ExactIn {
+                    amount_in: original_quote.amount_in.clone(),
+                    min_amount_out: original_quote.min_amount_out.clone(),
+                },
+                sender_address: Some(
+                    step_request
+                        .source_custody_vault_address
+                        .clone()
+                        .unwrap_or_else(|| source_vault.deposit_vault_address.clone()),
+                ),
+                recipient_address: if step_request.recipient_address.is_empty() {
+                    order.recipient_address.clone()
+                } else {
+                    step_request.recipient_address.clone()
+                },
+            })
+            .await
+            .map_err(activity_error_from_display)?
+            .ok_or_else(|| {
+                activity_error(format!(
+                    "exchange provider {} returned no refreshed quote",
+                    exchange.id()
+                ))
+            })?;
+        if let Some(min_amount_out) = original_quote.min_amount_out.as_deref() {
+            let quoted_amount_out =
+                parse_refresh_amount("amount_out", &refreshed_quote.amount_out)?;
+            let min_amount_out_raw = parse_refresh_amount("min_amount_out", min_amount_out)?;
+            if quoted_amount_out < min_amount_out_raw {
+                return Ok(RefreshedQuoteAttemptShape {
+                    outcome: RefreshedQuoteAttemptOutcome::Untenable {
+                        order_id: input.order_id,
+                        stale_attempt_id: input.stale_attempt_id,
+                        failed_step_id: input.failed_step_id,
+                        reason: StaleQuoteRefreshUntenableReason::RefreshedExactInOutputBelowMinAmountOut {
+                            amount_out: refreshed_quote.amount_out,
+                            min_amount_out: min_amount_out.to_string(),
+                        },
+                    },
+                });
+            }
+        }
+        let refreshed_legs = refresh_exchange_quote_transition_legs_single(
+            transition.id.as_str(),
+            transition.kind,
+            transition.provider,
+            &refreshed_quote,
+        )?;
+        let refreshed_quote = refreshed_market_order_quote_single(
+            &order,
+            &original_quote,
+            &transitions,
+            refreshed_legs,
+            &refreshed_quote,
+            Utc::now(),
+        );
+        let now = Utc::now();
+        let mut plan = deps
+            .planner
+            .plan_remaining(
+                &order,
+                &source_vault,
+                &refreshed_quote,
+                MarketOrderPlanRemainingStart {
+                    transition_decl_id: &transition.id,
+                    step_index: failed_step.step_index,
+                    leg_index: stale_leg.leg_index,
+                    planned_at: now,
+                },
+            )
+            .map_err(activity_error_from_display)?;
+        for leg in &mut plan.legs {
+            set_json_value(
+                &mut leg.details,
+                "refreshed_from_attempt_id",
+                json!(stale_attempt.id),
+            );
+            set_json_value(
+                &mut leg.details,
+                "refreshed_from_execution_leg_id",
+                json!(stale_leg.id),
+            );
+            set_json_value(
+                &mut leg.details,
+                "refreshed_quote_id",
+                json!(refreshed_quote.id),
+            );
+        }
+        for step in &mut plan.steps {
+            set_json_value(
+                &mut step.details,
+                "refreshed_from_attempt_id",
+                json!(stale_attempt.id),
+            );
+            set_json_value(
+                &mut step.details,
+                "refreshed_from_step_id",
+                json!(failed_step.id),
+            );
+            set_json_value(
+                &mut step.details,
+                "refreshed_quote_id",
+                json!(refreshed_quote.id),
+            );
+        }
+
+        Ok(RefreshedQuoteAttemptShape {
+            outcome: RefreshedQuoteAttemptOutcome::Refreshed {
+                order_id: input.order_id,
+                stale_attempt_id: input.stale_attempt_id,
+                failed_step_id: input.failed_step_id,
+                plan: ExecutionPlan {
+                    path_id: plan.path_id,
+                    transition_decl_ids: plan.transition_decl_ids,
+                    legs: plan.legs,
+                    steps: plan.steps,
+                },
+                failure_reason: json!({
+                    "reason": "stale_provider_quote_refresh",
+                    "trace": "quote_refresh_workflow",
+                    "stale_attempt_id": stale_attempt.id,
+                    "failed_step_id": failed_step.id,
+                    "superseded_attempt_id": stale_attempt.id,
+                    "superseded_attempt_index": stale_attempt.attempt_index,
+                    "stale_step_id": failed_step.id,
+                    "stale_execution_leg_id": stale_leg.id,
+                    "provider_quote_expires_at": provider_quote_expires_at.to_rfc3339(),
+                    "refreshed_quote_id": refreshed_quote.id,
+                }),
+                superseded_reason: json!({
+                    "reason": "superseded_by_stale_provider_quote_refresh",
+                    "stale_attempt_id": stale_attempt.id,
+                    "failed_step_id": failed_step.id,
+                    "stale_step_id": failed_step.id,
+                    "stale_execution_leg_id": stale_leg.id,
+                    "provider_quote_expires_at": provider_quote_expires_at.to_rfc3339(),
+                    "refreshed_quote_id": refreshed_quote.id,
+                }),
+                input_custody_snapshot: failed_attempt_snapshot(&order, &failed_step),
+            },
+        })
     }
 
     /// Scar tissue: §7 stale quote refresh and §16.4 refresh helpers.
     #[activity]
     pub async fn materialize_refreshed_attempt(
+        self: Arc<Self>,
         _ctx: ActivityContext,
-        _input: MaterializeRefreshedAttemptInput,
+        input: MaterializeRefreshedAttemptInput,
     ) -> Result<RefreshedAttemptMaterialized, ActivityError> {
-        // TODO(PR4, brief §6 invariant 5; scar §7): persist refreshed attempt separately.
-        todo!("PR4: materialize refreshed quote attempt")
+        let deps = self.deps()?;
+        let RefreshedQuoteAttemptOutcome::Refreshed {
+            order_id,
+            stale_attempt_id,
+            failed_step_id,
+            plan,
+            failure_reason,
+            superseded_reason,
+            input_custody_snapshot,
+        } = input.refreshed_attempt.outcome
+        else {
+            return Err(activity_error(
+                "untenable stale quote refresh must not be materialized",
+            ));
+        };
+        if order_id != input.order_id {
+            return Err(activity_error(format!(
+                "refreshed attempt order {} does not match materialize input order {}",
+                order_id, input.order_id
+            )));
+        }
+        let record = deps
+            .db
+            .orders()
+            .create_refreshed_execution_attempt_from_failed_step(
+                order_id,
+                stale_attempt_id,
+                failed_step_id,
+                RefreshedExecutionAttemptPlan {
+                    legs: plan.legs,
+                    steps: plan.steps,
+                    failure_reason,
+                    superseded_reason,
+                    input_custody_snapshot,
+                },
+                Utc::now(),
+            )
+            .await
+            .map_err(activity_error_from_display)?;
+        tracing::info!(
+            order_id = %record.order.id,
+            attempt_id = %record.attempt.id,
+            stale_attempt_id = %stale_attempt_id,
+            failed_step_id = %failed_step_id,
+            event_name = "order.execution_quote_refreshed",
+            "order.execution_quote_refreshed"
+        );
+        Ok(RefreshedAttemptMaterialized {
+            attempt_id: record.attempt.id,
+            steps: record
+                .steps
+                .into_iter()
+                .map(|step| WorkflowExecutionStep {
+                    step_id: step.id,
+                    step_index: step.step_index,
+                })
+                .collect(),
+        })
     }
 }
 

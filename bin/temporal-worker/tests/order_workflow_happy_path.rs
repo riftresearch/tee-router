@@ -34,7 +34,7 @@ use router_server::{
 };
 use serde_json::json;
 use sqlx_core::connection::Connection;
-use sqlx_postgres::{PgConnectOptions, PgConnection};
+use sqlx_postgres::{PgConnectOptions, PgConnection, PgPool};
 use temporal_worker::{
     order_execution::{
         activities::{OrderActivities, OrderActivityDeps},
@@ -63,6 +63,7 @@ const POSTGRES_DATABASE: &str = "postgres";
 const ROUTER_TEST_DATABASE_URL_ENV: &str = "ROUTER_TEST_DATABASE_URL";
 const EVM_NATIVE_GAS_BUFFER_WEI: u128 = 1_000_000_000_000_000_000;
 const EXECUTE_STEP_TEMPORAL_ATTEMPTS: usize = 3;
+const ORDER_WORKFLOW_TEST_TIMEOUT: Duration = Duration::from_secs(240);
 
 struct TestPostgres {
     admin_database_url: String,
@@ -76,9 +77,17 @@ struct WorkflowRun {
     output: OrderWorkflowOutput,
 }
 
+#[derive(Default)]
+struct WorkflowOptions {
+    velora_transaction_failures: usize,
+    velora_stale_quote_failures: usize,
+    expire_quote_legs: bool,
+    refreshed_eth_usd_micro: Option<u128>,
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn order_workflow_completes_funded_single_step_order() {
-    let run = run_order_workflow_with_velora_transaction_failures(0).await;
+    let run = run_order_workflow(WorkflowOptions::default()).await;
 
     assert_eq!(run.output.terminal_status, OrderTerminalStatus::Completed);
     let completed = run
@@ -92,8 +101,11 @@ async fn order_workflow_completes_funded_single_step_order() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn order_workflow_retries_failed_step_then_completes() {
-    let run =
-        run_order_workflow_with_velora_transaction_failures(EXECUTE_STEP_TEMPORAL_ATTEMPTS).await;
+    let run = run_order_workflow(WorkflowOptions {
+        velora_transaction_failures: EXECUTE_STEP_TEMPORAL_ATTEMPTS,
+        ..WorkflowOptions::default()
+    })
+    .await;
 
     assert_eq!(run.output.terminal_status, OrderTerminalStatus::Completed);
     let completed = run
@@ -152,9 +164,11 @@ async fn order_workflow_retries_failed_step_then_completes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn order_workflow_marks_refund_required_after_second_failed_attempt() {
-    let run =
-        run_order_workflow_with_velora_transaction_failures(EXECUTE_STEP_TEMPORAL_ATTEMPTS * 2)
-            .await;
+    let run = run_order_workflow(WorkflowOptions {
+        velora_transaction_failures: EXECUTE_STEP_TEMPORAL_ATTEMPTS * 2,
+        ..WorkflowOptions::default()
+    })
+    .await;
 
     assert_eq!(
         run.output.terminal_status,
@@ -206,7 +220,95 @@ async fn order_workflow_marks_refund_required_after_second_failed_attempt() {
     );
 }
 
-async fn run_order_workflow_with_velora_transaction_failures(failures: usize) -> WorkflowRun {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn order_workflow_refreshes_stale_quote_then_completes() {
+    let run = run_order_workflow(WorkflowOptions {
+        velora_stale_quote_failures: EXECUTE_STEP_TEMPORAL_ATTEMPTS,
+        expire_quote_legs: true,
+        ..WorkflowOptions::default()
+    })
+    .await;
+
+    assert_eq!(run.output.terminal_status, OrderTerminalStatus::Completed);
+    let completed = run
+        .db
+        .orders()
+        .get(run.order_id)
+        .await
+        .expect("load completed order");
+    assert_eq!(completed.status, RouterOrderStatus::Completed);
+
+    let attempts = run
+        .db
+        .orders()
+        .get_execution_attempts(run.order_id)
+        .await
+        .expect("load execution attempts");
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(
+        attempts[0].attempt_kind,
+        OrderExecutionAttemptKind::PrimaryExecution
+    );
+    assert_eq!(attempts[0].status, OrderExecutionAttemptStatus::Failed);
+    assert_eq!(
+        attempts[1].attempt_kind,
+        OrderExecutionAttemptKind::RefreshedExecution
+    );
+    assert_eq!(attempts[1].status, OrderExecutionAttemptStatus::Completed);
+
+    let stale_attempt_steps = run
+        .db
+        .orders()
+        .get_execution_steps_for_attempt(attempts[0].id)
+        .await
+        .expect("load stale attempt steps");
+    assert!(
+        stale_attempt_steps.iter().any(|step| {
+            step.status == OrderExecutionStepStatus::Superseded
+                && step.error.get("reason").and_then(serde_json::Value::as_str)
+                    == Some("superseded_by_stale_provider_quote_refresh")
+        }),
+        "stale attempt failed suffix should be superseded by quote refresh"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn order_workflow_refresh_untenable_routes_to_refund() {
+    let run = run_order_workflow(WorkflowOptions {
+        velora_stale_quote_failures: EXECUTE_STEP_TEMPORAL_ATTEMPTS,
+        expire_quote_legs: true,
+        refreshed_eth_usd_micro: Some(1_000_000),
+        ..WorkflowOptions::default()
+    })
+    .await;
+
+    assert_eq!(
+        run.output.terminal_status,
+        OrderTerminalStatus::RefundRequired
+    );
+    let refund_required = run
+        .db
+        .orders()
+        .get(run.order_id)
+        .await
+        .expect("load refund-required order");
+    assert_eq!(refund_required.status, RouterOrderStatus::RefundRequired);
+
+    let attempts = run
+        .db
+        .orders()
+        .get_execution_attempts(run.order_id)
+        .await
+        .expect("load execution attempts");
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(
+        attempts[0].attempt_kind,
+        OrderExecutionAttemptKind::PrimaryExecution
+    );
+    assert_eq!(attempts[0].status, OrderExecutionAttemptStatus::Failed);
+}
+
+async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
     ensure_temporal_up();
 
     let postgres = test_postgres().await;
@@ -225,7 +327,7 @@ async fn run_order_workflow_with_velora_transaction_failures(failures: usize) ->
         BASE_USDC_ADDRESS.parse().expect("valid Base USDC address"),
     )
     .await;
-    let mocks = spawn_velora_mocks(&devnet, failures).await;
+    let mocks = spawn_velora_mocks(&devnet, &options).await;
     let settings = Arc::new(test_settings());
     let chain_registry = Arc::new(test_chain_registry(&devnet).await);
     let action_providers = Arc::new(test_action_providers(&mocks));
@@ -243,6 +345,12 @@ async fn run_order_workflow_with_velora_transaction_failures(failures: usize) ->
         &devnet,
     )
     .await;
+    if options.expire_quote_legs {
+        expire_market_order_quote_legs(&database_url, order_id).await;
+    }
+    if let Some(usd_micro) = options.refreshed_eth_usd_micro {
+        mocks.set_velora_usd_price_micro("ETH", usd_micro).await;
+    }
 
     let task_queue = format!("{DEFAULT_TASK_QUEUE}-{}", Uuid::now_v7());
     let connection = TemporalConnection {
@@ -278,7 +386,7 @@ async fn run_order_workflow_with_velora_transaction_failures(failures: usize) ->
                 .await
                 .expect("start OrderWorkflow");
             let output: OrderWorkflowOutput = timeout(
-                Duration::from_secs(120),
+                ORDER_WORKFLOW_TEST_TIMEOUT,
                 handle.get_result(WorkflowGetResultOptions::default()),
             )
             .await
@@ -417,17 +525,45 @@ fn test_action_providers(mocks: &MockIntegratorServer) -> ActionProviderRegistry
 
 async fn spawn_velora_mocks(
     devnet: &RiftDevnet,
-    transaction_failures: usize,
+    options: &WorkflowOptions,
 ) -> MockIntegratorServer {
     let config = MockIntegratorConfig::default()
         .with_velora_swap_contract_address(
             devnet.base.anvil.chain_id(),
             format!("{:#x}", devnet.base.mock_velora_swap_contract.address()),
         )
-        .with_velora_transaction_fail_next_n(transaction_failures);
+        .with_velora_transaction_fail_next_n(options.velora_transaction_failures)
+        .with_velora_transaction_stale_quote_fail_next_n(options.velora_stale_quote_failures);
     MockIntegratorServer::spawn_with_config(config)
         .await
         .expect("spawn mock integrators")
+}
+
+async fn expire_market_order_quote_legs(database_url: &str, order_id: Uuid) {
+    let pool = PgPool::connect(database_url)
+        .await
+        .expect("connect raw pool for quote expiry");
+    let expired_at = (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+    sqlx_core::query::query(
+        r#"
+        UPDATE market_order_quotes
+        SET provider_quote = jsonb_set(
+            provider_quote,
+            '{legs}',
+            (
+                SELECT jsonb_agg(jsonb_set(leg.value, '{expires_at}', to_jsonb($2::text), false))
+                FROM jsonb_array_elements(provider_quote->'legs') AS leg(value)
+            ),
+            false
+        )
+        WHERE order_id = $1
+        "#,
+    )
+    .bind(order_id)
+    .bind(expired_at)
+    .execute(&pool)
+    .await
+    .expect("expire market quote legs");
 }
 
 async fn seed_funded_single_step_order(
