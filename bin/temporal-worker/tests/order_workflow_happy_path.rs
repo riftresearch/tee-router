@@ -21,14 +21,16 @@ use router_core::{
     config::Settings,
     db::Database,
     models::{
-        DepositVaultStatus, OrderExecutionAttemptKind, OrderExecutionAttemptStatus,
-        OrderExecutionStepStatus, OrderExecutionStepType, RouterOrderQuote, RouterOrderStatus,
-        VaultAction,
+        CustodyVaultRole, DepositVaultStatus, OrderExecutionAttemptKind,
+        OrderExecutionAttemptStatus, OrderExecutionStepStatus, OrderExecutionStepType,
+        OrderProviderOperation, ProviderOperationStatus, ProviderOperationType, RouterOrderQuote,
+        RouterOrderStatus, VaultAction,
     },
     protocol::{AssetId, ChainId, DepositAsset},
     services::{
         custody_action_executor::{CustodyActionExecutor, HyperliquidCallNetwork},
-        ActionProviderHttpOptions, ActionProviderRegistry, VeloraHttpProviderConfig,
+        AcrossHttpProviderConfig, ActionProviderHttpOptions, ActionProviderRegistry,
+        VeloraHttpProviderConfig,
     },
 };
 use router_primitives::ChainType;
@@ -43,14 +45,17 @@ use temporal_worker::{
     order_execution::{
         activities::{OrderActivities, OrderActivityDeps},
         build_worker, order_workflow_id,
-        types::{OrderTerminalStatus, OrderWorkflowInput, OrderWorkflowOutput},
+        types::{
+            OrderTerminalStatus, OrderWorkflowInput, OrderWorkflowOutput, ProviderHintKind,
+            ProviderKind, ProviderOperationHintSignal,
+        },
         workflow_start_options,
         workflows::OrderWorkflow,
         DEFAULT_TASK_QUEUE,
     },
     runtime::{connect_client, TemporalConnection},
 };
-use temporalio_client::WorkflowGetResultOptions;
+use temporalio_client::{WorkflowGetResultOptions, WorkflowSignalOptions};
 use testcontainers::{
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
@@ -60,6 +65,7 @@ use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
 const BASE_USDC_ADDRESS: &str = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+const ETHEREUM_USDC_ADDRESS: &str = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
 const POSTGRES_PORT: u16 = 5432;
 const POSTGRES_USER: &str = "postgres";
 const POSTGRES_PASSWORD: &str = "password";
@@ -83,12 +89,25 @@ struct WorkflowRun {
     refund_address_balance: U256,
 }
 
+#[derive(Clone, Copy, Default)]
+enum WorkflowRoute {
+    #[default]
+    VeloraBaseEthToBaseUsdc,
+    AcrossBaseEthToEthereumUsdc,
+}
+
 #[derive(Default)]
 struct WorkflowOptions {
+    route: WorkflowRoute,
     velora_transaction_failures: usize,
     velora_stale_quote_failures: usize,
     expire_quote_legs: bool,
     refreshed_eth_usd_micro: Option<u128>,
+}
+
+struct SeededOrder {
+    order_id: Uuid,
+    funding_vault_address: String,
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -103,6 +122,40 @@ async fn order_workflow_completes_funded_single_step_order() {
         .await
         .expect("load completed order");
     assert_eq!(completed.status, RouterOrderStatus::Completed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn order_workflow_completes_across_step_via_hint() {
+    let run = run_order_workflow(WorkflowOptions {
+        route: WorkflowRoute::AcrossBaseEthToEthereumUsdc,
+        ..WorkflowOptions::default()
+    })
+    .await;
+
+    assert_eq!(run.output.terminal_status, OrderTerminalStatus::Completed);
+    let completed = run
+        .db
+        .orders()
+        .get(run.order_id)
+        .await
+        .expect("load completed order");
+    assert_eq!(completed.status, RouterOrderStatus::Completed);
+
+    let across_operation =
+        provider_operation_by_type(&run.db, run.order_id, ProviderOperationType::AcrossBridge)
+            .await;
+    assert_eq!(across_operation.status, ProviderOperationStatus::Completed);
+    let step = run
+        .db
+        .orders()
+        .get_execution_step(
+            across_operation
+                .execution_step_id
+                .expect("Across operation should be linked to a step"),
+        )
+        .await
+        .expect("load Across step");
+    assert_eq!(step.status, OrderExecutionStepStatus::Completed);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -359,24 +412,48 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
         BASE_USDC_ADDRESS.parse().expect("valid Base USDC address"),
     )
     .await;
-    let mocks = spawn_velora_mocks(&devnet, &options).await;
+    if matches!(options.route, WorkflowRoute::AcrossBaseEthToEthereumUsdc) {
+        install_mock_usdc_clone(
+            &devnet.ethereum,
+            ETHEREUM_USDC_ADDRESS
+                .parse()
+                .expect("valid Ethereum USDC address"),
+        )
+        .await;
+    }
+    let mocks = spawn_mocks(&devnet, &options).await;
     let settings = Arc::new(test_settings());
-    let chain_registry = Arc::new(test_chain_registry(&devnet).await);
-    let action_providers = Arc::new(test_action_providers(&mocks));
+    let chain_registry = Arc::new(test_chain_registry(&devnet, options.route).await);
+    let action_providers = Arc::new(test_action_providers(&mocks, options.route));
     let custody_executor = Arc::new(CustodyActionExecutor::new(
         db.clone(),
         settings.clone(),
         chain_registry.clone(),
     ));
 
-    let order_id = seed_funded_single_step_order(
-        &db,
-        settings,
-        chain_registry,
-        action_providers.clone(),
-        &devnet,
-    )
-    .await;
+    let seeded = match options.route {
+        WorkflowRoute::VeloraBaseEthToBaseUsdc => {
+            seed_funded_single_step_order(
+                &db,
+                settings,
+                chain_registry,
+                action_providers.clone(),
+                &devnet,
+            )
+            .await
+        }
+        WorkflowRoute::AcrossBaseEthToEthereumUsdc => {
+            seed_funded_across_order(
+                &db,
+                settings,
+                chain_registry,
+                action_providers.clone(),
+                &devnet,
+            )
+            .await
+        }
+    };
+    let order_id = seeded.order_id;
     if options.expire_quote_legs {
         expire_market_order_quote_legs(&database_url, order_id).await;
     }
@@ -392,6 +469,8 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
     let activity_deps = OrderActivityDeps::new(db.clone(), action_providers, custody_executor);
 
     let local = tokio::task::LocalSet::new();
+    let db_for_workflow = db.clone();
+    let devnet_for_workflow = &devnet;
     let output = local
         .run_until(async move {
             let mut built = build_worker(
@@ -417,6 +496,50 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
                 )
                 .await
                 .expect("start OrderWorkflow");
+            if matches!(options.route, WorkflowRoute::AcrossBaseEthToEthereumUsdc) {
+                let handle_before_hint = client.get_workflow_handle::<OrderWorkflow>(&workflow_id);
+                let across_operation = tokio::select! {
+                    operation = wait_for_provider_operation(
+                        &db_for_workflow,
+                        order_id,
+                        ProviderOperationType::AcrossBridge,
+                        Duration::from_secs(90),
+                    ) => operation,
+                    result = handle_before_hint.get_result(WorkflowGetResultOptions::default()) => {
+                        let state = workflow_state_summary(&db_for_workflow, order_id).await;
+                        panic!("OrderWorkflow ended before the Across provider operation was persisted: {result:?}\n{state}");
+                    }
+                };
+                wait_for_across_deposit_indexed(
+                    &mocks,
+                    Address::from_str(&seeded.funding_vault_address)
+                        .expect("funding vault EVM address"),
+                    Duration::from_secs(90),
+                )
+                .await;
+                fund_destination_execution_vault_from_across(
+                    &db_for_workflow,
+                    devnet_for_workflow,
+                    order_id,
+                    &across_operation,
+                )
+                .await;
+                handle
+                    .signal(
+                        OrderWorkflow::provider_operation_hint,
+                        ProviderOperationHintSignal {
+                            order_id,
+                            hint_id: Uuid::now_v7(),
+                            provider_operation_id: Some(across_operation.id),
+                            provider: ProviderKind::Bridge,
+                            hint_kind: ProviderHintKind::AcrossFill,
+                            provider_ref: across_operation.provider_ref,
+                        },
+                        WorkflowSignalOptions::default(),
+                    )
+                    .await
+                    .expect("send Across provider-operation hint signal");
+            }
             let output: OrderWorkflowOutput = timeout(
                 ORDER_WORKFLOW_TEST_TIMEOUT,
                 handle.get_result(WorkflowGetResultOptions::default()),
@@ -524,7 +647,7 @@ fn test_settings() -> Settings {
     Settings::load(&path).expect("load test settings")
 }
 
-async fn test_chain_registry(devnet: &RiftDevnet) -> ChainRegistry {
+async fn test_chain_registry(devnet: &RiftDevnet, route: WorkflowRoute) -> ChainRegistry {
     let base_chain = EvmChain::new_with_gas_sponsor(
         &devnet.base.anvil.endpoint(),
         BASE_USDC_ADDRESS,
@@ -544,17 +667,46 @@ async fn test_chain_registry(devnet: &RiftDevnet) -> ChainRegistry {
     .expect("base chain setup");
     let mut registry = ChainRegistry::new();
     registry.register_evm(ChainType::Base, Arc::new(base_chain));
+    if matches!(route, WorkflowRoute::AcrossBaseEthToEthereumUsdc) {
+        let ethereum_chain = EvmChain::new_with_gas_sponsor(
+            &devnet.ethereum.anvil.endpoint(),
+            ETHEREUM_USDC_ADDRESS,
+            ChainType::Ethereum,
+            b"temporal-worker-ethereum-wallet",
+            1,
+            Duration::from_secs(1),
+            Some(EvmGasSponsorConfig {
+                private_key: format!(
+                    "0x{}",
+                    alloy::hex::encode(devnet.ethereum.anvil.keys()[0].to_bytes())
+                ),
+                vault_gas_buffer_wei: U256::from(EVM_NATIVE_GAS_BUFFER_WEI),
+            }),
+        )
+        .await
+        .expect("ethereum chain setup");
+        registry.register_evm(ChainType::Ethereum, Arc::new(ethereum_chain));
+    }
     registry
 }
 
-fn test_action_providers(mocks: &MockIntegratorServer) -> ActionProviderRegistry {
+fn test_action_providers(
+    mocks: &MockIntegratorServer,
+    route: WorkflowRoute,
+) -> ActionProviderRegistry {
     ActionProviderRegistry::http_from_options(ActionProviderHttpOptions {
-        across: None,
+        across: matches!(route, WorkflowRoute::AcrossBaseEthToEthereumUsdc).then(|| {
+            AcrossHttpProviderConfig::new(mocks.base_url().to_string(), "temporal-worker-across")
+        }),
         cctp: None,
         hyperunit_base_url: None,
         hyperunit_proxy_url: None,
         hyperliquid_base_url: None,
-        velora: Some(VeloraHttpProviderConfig {
+        velora: matches!(
+            route,
+            WorkflowRoute::VeloraBaseEthToBaseUsdc | WorkflowRoute::AcrossBaseEthToEthereumUsdc
+        )
+        .then(|| VeloraHttpProviderConfig {
             base_url: mocks.base_url().to_string(),
             partner: Some("temporal-worker-e2e".to_string()),
         }),
@@ -564,15 +716,42 @@ fn test_action_providers(mocks: &MockIntegratorServer) -> ActionProviderRegistry
     .expect("action providers")
 }
 
-async fn spawn_velora_mocks(
-    devnet: &RiftDevnet,
-    options: &WorkflowOptions,
-) -> MockIntegratorServer {
-    let config = MockIntegratorConfig::default()
-        .with_velora_swap_contract_address(
+async fn spawn_mocks(devnet: &RiftDevnet, options: &WorkflowOptions) -> MockIntegratorServer {
+    let mut config = MockIntegratorConfig::default();
+    if matches!(options.route, WorkflowRoute::VeloraBaseEthToBaseUsdc) {
+        config = config.with_velora_swap_contract_address(
             devnet.base.anvil.chain_id(),
             format!("{:#x}", devnet.base.mock_velora_swap_contract.address()),
-        )
+        );
+    }
+    if matches!(options.route, WorkflowRoute::AcrossBaseEthToEthereumUsdc) {
+        config = config
+            .with_velora_swap_contract_address(
+                devnet.base.anvil.chain_id(),
+                format!("{:#x}", devnet.base.mock_velora_swap_contract.address()),
+            )
+            .with_velora_swap_contract_address(
+                devnet.ethereum.anvil.chain_id(),
+                format!("{:#x}", devnet.ethereum.mock_velora_swap_contract.address()),
+            )
+            .with_across_chain(
+                devnet.ethereum.anvil.chain_id(),
+                format!(
+                    "{:#x}",
+                    devnet.ethereum.mock_across_spoke_pool_contract.address()
+                ),
+                devnet.ethereum.anvil.ws_endpoint_url().to_string(),
+            )
+            .with_across_chain(
+                devnet.base.anvil.chain_id(),
+                format!(
+                    "{:#x}",
+                    devnet.base.mock_across_spoke_pool_contract.address()
+                ),
+                devnet.base.anvil.ws_endpoint_url().to_string(),
+            );
+    }
+    config = config
         .with_velora_transaction_fail_next_n(options.velora_transaction_failures)
         .with_velora_transaction_stale_quote_fail_next_n(options.velora_stale_quote_failures);
     MockIntegratorServer::spawn_with_config(config)
@@ -607,13 +786,184 @@ async fn expire_market_order_quote_legs(database_url: &str, order_id: Uuid) {
     .expect("expire market quote legs");
 }
 
+async fn wait_for_provider_operation(
+    db: &Database,
+    order_id: Uuid,
+    operation_type: ProviderOperationType,
+    max_wait: Duration,
+) -> OrderProviderOperation {
+    let deadline = tokio::time::Instant::now() + max_wait;
+    loop {
+        let operations = db
+            .orders()
+            .get_provider_operations(order_id)
+            .await
+            .expect("load provider operations");
+        if let Some(operation) = operations
+            .into_iter()
+            .find(|operation| operation.operation_type == operation_type)
+        {
+            return operation;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for provider operation {operation_type:?} on order {order_id}"
+        );
+        sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn wait_for_across_deposit_indexed(
+    mocks: &MockIntegratorServer,
+    depositor: Address,
+    max_wait: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + max_wait;
+    loop {
+        if !mocks.across_deposits_from(depositor).await.is_empty() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for Across mock to index deposit from {depositor:#x}"
+        );
+        sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn fund_destination_execution_vault_from_across(
+    db: &Database,
+    devnet: &RiftDevnet,
+    order_id: Uuid,
+    operation: &OrderProviderOperation,
+) {
+    let destination_vault = db
+        .orders()
+        .get_custody_vaults(order_id)
+        .await
+        .expect("load custody vaults")
+        .into_iter()
+        .find(|vault| vault.role == CustodyVaultRole::DestinationExecution)
+        .expect("Across step should create destination execution custody vault");
+    let output_amount = operation
+        .response
+        .get("expectedOutputAmount")
+        .or_else(|| operation.response.get("outputAmount"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|amount| U256::from_str_radix(amount, 10).ok())
+        .expect("Across response should include expected output amount");
+    let destination_devnet = evm_devnet_for_chain(devnet, destination_vault.chain.as_str());
+    let address = Address::from_str(&destination_vault.address)
+        .expect("destination execution vault address should be EVM address");
+    let gas_balance = U256::from(EVM_NATIVE_GAS_BUFFER_WEI);
+
+    match destination_vault.asset.as_ref().unwrap_or(&AssetId::Native) {
+        AssetId::Native => {
+            send_native(destination_devnet, address, output_amount + gas_balance).await;
+        }
+        AssetId::Reference(token_address) => {
+            send_native(destination_devnet, address, gas_balance).await;
+            mint_erc20(
+                destination_devnet,
+                token_address.parse().expect("destination token address"),
+                address,
+                output_amount,
+            )
+            .await;
+        }
+    }
+    mine_evm_confirmation_block(destination_devnet).await;
+}
+
+fn evm_devnet_for_chain<'a>(devnet: &'a RiftDevnet, chain: &str) -> &'a devnet::EthDevnet {
+    match chain {
+        "evm:1" => &devnet.ethereum,
+        "evm:8453" => &devnet.base,
+        "evm:42161" => &devnet.arbitrum,
+        other => panic!("unsupported EVM chain {other}"),
+    }
+}
+
+async fn provider_operation_by_type(
+    db: &Database,
+    order_id: Uuid,
+    operation_type: ProviderOperationType,
+) -> OrderProviderOperation {
+    db.orders()
+        .get_provider_operations(order_id)
+        .await
+        .expect("load provider operations")
+        .into_iter()
+        .find(|operation| operation.operation_type == operation_type)
+        .unwrap_or_else(|| {
+            panic!("expected provider operation {operation_type:?} for order {order_id}")
+        })
+}
+
+async fn workflow_state_summary(db: &Database, order_id: Uuid) -> String {
+    let mut lines = Vec::new();
+    match db.orders().get_execution_attempts(order_id).await {
+        Ok(attempts) => {
+            lines.push(format!("attempts: {}", attempts.len()));
+            for attempt in attempts {
+                lines.push(format!(
+                    "  attempt index={} kind={:?} status={:?} failure={}",
+                    attempt.attempt_index,
+                    attempt.attempt_kind,
+                    attempt.status,
+                    attempt.failure_reason
+                ));
+                match db
+                    .orders()
+                    .get_execution_steps_for_attempt(attempt.id)
+                    .await
+                {
+                    Ok(steps) => {
+                        for step in steps {
+                            lines.push(format!(
+                                "    step index={} type={:?} provider={} status={:?} error={} response={}",
+                                step.step_index,
+                                step.step_type,
+                                step.provider,
+                                step.status,
+                                step.error,
+                                step.response
+                            ));
+                        }
+                    }
+                    Err(err) => lines.push(format!("    steps load failed: {err}")),
+                }
+            }
+        }
+        Err(err) => lines.push(format!("attempts load failed: {err}")),
+    }
+    match db.orders().get_provider_operations(order_id).await {
+        Ok(operations) => {
+            lines.push(format!("provider_operations: {}", operations.len()));
+            for operation in operations {
+                lines.push(format!(
+                    "  operation type={:?} provider={} status={:?} ref={:?} request={} response={}",
+                    operation.operation_type,
+                    operation.provider,
+                    operation.status,
+                    operation.provider_ref,
+                    operation.request,
+                    operation.response
+                ));
+            }
+        }
+        Err(err) => lines.push(format!("provider operations load failed: {err}")),
+    }
+    lines.join("\n")
+}
+
 async fn seed_funded_single_step_order(
     db: &Database,
     settings: Arc<Settings>,
     chain_registry: Arc<ChainRegistry>,
     action_providers: Arc<ActionProviderRegistry>,
     devnet: &RiftDevnet,
-) -> Uuid {
+) -> SeededOrder {
     let order_manager = OrderManager::with_action_providers(
         db.clone(),
         settings.clone(),
@@ -701,7 +1051,111 @@ async fn seed_funded_single_step_order(
         )
         .await
         .expect("mark order funded");
-    order.id
+    SeededOrder {
+        order_id: order.id,
+        funding_vault_address: vault.deposit_vault_address,
+    }
+}
+
+async fn seed_funded_across_order(
+    db: &Database,
+    settings: Arc<Settings>,
+    chain_registry: Arc<ChainRegistry>,
+    action_providers: Arc<ActionProviderRegistry>,
+    devnet: &RiftDevnet,
+) -> SeededOrder {
+    let order_manager = OrderManager::with_action_providers(
+        db.clone(),
+        settings.clone(),
+        chain_registry.clone(),
+        action_providers,
+    );
+    let vault_manager = VaultManager::new(db.clone(), settings, chain_registry);
+    let source_asset = DepositAsset {
+        chain: ChainId::parse("evm:8453").expect("base chain id"),
+        asset: AssetId::Native,
+    };
+    let destination_asset = DepositAsset {
+        chain: ChainId::parse("evm:1").expect("ethereum chain id"),
+        asset: AssetId::parse(ETHEREUM_USDC_ADDRESS).expect("ethereum USDC asset"),
+    };
+    let quote = order_manager
+        .quote_market_order(MarketOrderQuoteRequest {
+            from_asset: source_asset.clone(),
+            to_asset: destination_asset,
+            recipient_address: valid_evm_address(),
+            order_kind: MarketOrderQuoteKind::ExactIn {
+                amount_in: ORDER_AMOUNT_IN_WEI.to_string(),
+                slippage_bps: Some(100),
+            },
+        })
+        .await
+        .expect("quote Across order");
+    let market_quote = match quote.quote {
+        RouterOrderQuote::MarketOrder(quote) => quote,
+        RouterOrderQuote::LimitOrder(_) => panic!("expected market quote"),
+    };
+    assert!(
+        market_quote.provider_id.contains("across_bridge:across")
+            && market_quote
+                .provider_id
+                .contains("universal_router_swap:velora"),
+        "expected an Across + Velora route, got {}",
+        market_quote.provider_id
+    );
+
+    let (order, _) = order_manager
+        .create_order_from_quote(CreateOrderRequest {
+            quote_id: market_quote.id,
+            refund_address: valid_evm_address(),
+            idempotency_key: None,
+            metadata: json!({ "test": "temporal_order_workflow_across" }),
+        })
+        .await
+        .expect("create Across order from quote");
+    let vault = vault_manager
+        .create_vault(CreateVaultRequest {
+            order_id: Some(order.id),
+            deposit_asset: source_asset,
+            action: VaultAction::Null,
+            recovery_address: valid_evm_address(),
+            cancellation_commitment:
+                "0x1111111111111111111111111111111111111111111111111111111111111111".to_string(),
+            cancel_after: None,
+            metadata: json!({ "test": "temporal_order_workflow_across" }),
+        })
+        .await
+        .expect("create Across funding vault");
+    fund_source_vault(
+        devnet,
+        &vault.deposit_vault_address,
+        &market_quote.amount_in,
+    )
+    .await;
+
+    let now = Utc::now();
+    db.vaults()
+        .transition_status(
+            vault.id,
+            DepositVaultStatus::PendingFunding,
+            DepositVaultStatus::Funded,
+            now,
+        )
+        .await
+        .expect("mark Across vault funded");
+    db.orders()
+        .transition_status(
+            order.id,
+            RouterOrderStatus::PendingFunding,
+            RouterOrderStatus::Funded,
+            now,
+        )
+        .await
+        .expect("mark Across order funded");
+    SeededOrder {
+        order_id: order.id,
+        funding_vault_address: vault.deposit_vault_address,
+    }
 }
 
 async fn fund_source_vault(devnet: &RiftDevnet, vault_address: &str, amount_in: &str) {
@@ -747,6 +1201,28 @@ async fn native_balance(devnet: &devnet::EthDevnet, address: &str) -> U256 {
         .get_balance(Address::from_str(address).expect("valid EVM balance address"))
         .await
         .expect("read native balance")
+}
+
+async fn mint_erc20(
+    devnet: &devnet::EthDevnet,
+    token_address: Address,
+    recipient: Address,
+    amount: U256,
+) {
+    let provider = ProviderBuilder::new()
+        .wallet(EthereumWallet::new(anvil_signer(devnet)))
+        .connect_http(devnet.anvil.endpoint_url())
+        .erased();
+    let token = GenericEIP3009ERC20Instance::new(token_address, provider);
+    let receipt = token
+        .mint(recipient, amount)
+        .send()
+        .await
+        .expect("send mint")
+        .get_receipt()
+        .await
+        .expect("mint receipt");
+    assert!(receipt.status(), "ERC20 mint reverted");
 }
 
 async fn install_mock_usdc_clone(devnet: &devnet::EthDevnet, token_address: Address) {

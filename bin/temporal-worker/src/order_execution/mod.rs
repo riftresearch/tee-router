@@ -51,6 +51,8 @@ pub async fn build_worker(
     let client = connect_client(connection).await?;
     let quote_refresh_activities = QuoteRefreshActivities::from_order_activities(&order_activities);
     let refund_activities = RefundActivities::from_order_activities(&order_activities);
+    let provider_observation_activities =
+        ProviderObservationActivities::from_order_activities(&order_activities);
     let worker_options = WorkerOptions::new(task_queue)
         .register_workflow::<OrderWorkflow>()
         .register_workflow::<RefundWorkflow>()
@@ -60,7 +62,7 @@ pub async fn build_worker(
         .register_activities(order_activities)
         .register_activities(refund_activities)
         .register_activities(quote_refresh_activities)
-        .register_activities(ProviderObservationActivities)
+        .register_activities(provider_observation_activities)
         .register_activities(StepDispatchActivities)
         .build();
     let worker =

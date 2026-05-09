@@ -282,12 +282,23 @@ pub struct FinalizedOrder {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerifyProviderOperationHintInput {
+    pub order_id: WorkflowOrderId,
+    pub step_id: WorkflowStepId,
     pub signal: ProviderOperationHintSignal,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderOperationHintVerified {
-    pub provider_operation_id: WorkflowProviderOperationId,
+    pub provider_operation_id: Option<WorkflowProviderOperationId>,
+    pub decision: ProviderOperationHintDecision,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProviderOperationHintDecision {
+    Accept,
+    Reject,
+    Defer,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
