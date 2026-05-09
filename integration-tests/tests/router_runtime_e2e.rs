@@ -300,6 +300,7 @@ async fn router_api_worker_sauron_complete_mock_limit_order_matrix() {
 async fn spawn_mock_router_runtime() -> RouterRuntimeHarness {
     let postgres = test_postgres().await;
     let database_url = create_test_database(&postgres.admin_database_url).await;
+    let sauron_state_database_url = create_test_database(&postgres.admin_database_url).await;
     let (devnet, _) = RiftDevnet::builder()
         .using_esplora(true)
         .using_token_indexer(database_url.clone())
@@ -332,7 +333,13 @@ async fn spawn_mock_router_runtime() -> RouterRuntimeHarness {
 
     let (router_base_url, _api_task) = spawn_router_api(args.clone()).await;
     let _worker_task = spawn_router_worker(args.clone()).await;
-    let _sauron_task = spawn_sauron(&devnet, &database_url, &router_base_url).await;
+    let _sauron_task = spawn_sauron(
+        &devnet,
+        &database_url,
+        &sauron_state_database_url,
+        &router_base_url,
+    )
+    .await;
 
     RouterRuntimeHarness {
         client: reqwest::Client::new(),
@@ -464,6 +471,7 @@ async fn reserve_local_port() -> u16 {
 async fn spawn_sauron(
     devnet: &RiftDevnet,
     database_url: &str,
+    sauron_state_database_url: &str,
     router_base_url: &str,
 ) -> RuntimeTask {
     let token_indexer_api_key = [
@@ -479,7 +487,7 @@ async fn spawn_sauron(
     let args = SauronArgs {
         log_level: "warn".to_string(),
         router_replica_database_url: database_url.to_string(),
-        sauron_state_database_url: database_url.to_string(),
+        sauron_state_database_url: sauron_state_database_url.to_string(),
         sauron_replica_event_source: sauron::config::SauronReplicaEventSource::Cdc,
         router_replica_database_name: "router_db".to_string(),
         sauron_cdc_slot_name: "sauron_watch_cdc".to_string(),
@@ -837,6 +845,7 @@ async fn submit_order(
         .post(format!("{router_base_url}/api/v1/orders"))
         .json(&json!({
             "quote_id": quote_id,
+            "idempotency_key": format!("router-runtime-e2e:{}:{quote_id}", route_case.name),
             "refund_address": refund_address_for(route_case.from),
             "metadata": {
                 "test": route_case.name
@@ -861,6 +870,7 @@ async fn submit_limit_order(
         .post(format!("{router_base_url}/api/v1/orders"))
         .json(&json!({
             "quote_id": quote_id,
+            "idempotency_key": format!("router-runtime-e2e:{}:{quote_id}", route_case.name),
             "refund_address": refund_address_for(route_case.from),
             "metadata": {
                 "test": route_case.name

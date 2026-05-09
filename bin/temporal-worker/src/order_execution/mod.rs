@@ -2,13 +2,12 @@ pub mod activities;
 pub mod types;
 pub mod workflows;
 
-use temporalio_client::WorkflowStartOptions;
-use temporalio_common::protos::temporal::api::enums::v1::{
-    WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
+pub use router_temporal::{
+    order_workflow_id, provider_hint_poll_workflow_id, quote_refresh_workflow_id,
+    refund_workflow_id, workflow_start_options, DEFAULT_TASK_QUEUE,
 };
 use temporalio_sdk::{Worker, WorkerOptions};
 use temporalio_sdk_core::CoreRuntime;
-use uuid::Uuid;
 
 use crate::runtime::{
     boxed, connect_client, new_core_runtime, TemporalConnection, WorkerError, WorkerResult,
@@ -23,10 +22,12 @@ use workflows::{
     StaleRunningStepWatchdogWorkflow,
 };
 
-pub const DEFAULT_TASK_QUEUE: &str = "tee-router-order-execution";
-
-pub async fn run_worker(connection: &TemporalConnection, task_queue: &str) -> WorkerResult<()> {
-    let mut built = build_worker(connection, task_queue, OrderActivities::default()).await?;
+pub async fn run_worker_with_activities(
+    connection: &TemporalConnection,
+    task_queue: &str,
+    order_activities: OrderActivities,
+) -> WorkerResult<()> {
+    let mut built = build_worker(connection, task_queue, order_activities).await?;
     built
         .worker
         .run()
@@ -72,22 +73,4 @@ pub async fn build_worker(
         })?;
 
     Ok(BuiltOrderWorker { runtime, worker })
-}
-
-#[must_use]
-pub fn order_workflow_id(order_id: Uuid) -> String {
-    format!("order:{order_id}:execution")
-}
-
-#[must_use]
-pub fn refund_workflow_id(order_id: Uuid, parent_attempt_id: Uuid) -> String {
-    format!("order:{order_id}:refund:{parent_attempt_id}")
-}
-
-#[must_use]
-pub fn workflow_start_options(task_queue: &str, workflow_id: &str) -> WorkflowStartOptions {
-    WorkflowStartOptions::new(task_queue.to_owned(), workflow_id.to_owned())
-        .id_reuse_policy(WorkflowIdReusePolicy::AllowDuplicateFailedOnly)
-        .id_conflict_policy(WorkflowIdConflictPolicy::Fail)
-        .build()
 }

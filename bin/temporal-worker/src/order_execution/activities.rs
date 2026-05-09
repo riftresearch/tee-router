@@ -272,6 +272,22 @@ impl OrderActivities {
             .get(funding_vault_id)
             .await
             .map_err(activity_error_from_display)?;
+        let order = if order.status == router_core::models::RouterOrderStatus::PendingFunding {
+            let funded = deps
+                .db
+                .orders()
+                .mark_order_funded_from_funded_vault(order.id, Utc::now())
+                .await
+                .map_err(activity_error_from_display)?;
+            tracing::info!(
+                order_id = %funded.id,
+                event_name = "order.funded",
+                "order.funded"
+            );
+            funded
+        } else {
+            order
+        };
         let quote = deps
             .db
             .orders()

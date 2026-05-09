@@ -877,6 +877,59 @@ impl OrderRepository {
         self.map_order_row(&row)
     }
 
+    pub async fn mark_order_funded_from_funded_vault(
+        &self,
+        order_id: Uuid,
+        updated_at: DateTime<Utc>,
+    ) -> RouterCoreResult<RouterOrder> {
+        let started = Instant::now();
+        let result = sqlx_core::query::query(&format!(
+            r#"
+            WITH updated AS (
+                UPDATE router_orders ro
+                SET
+                    status = $2,
+                    updated_at = $3
+                FROM custody_vaults cv
+                JOIN deposit_vaults dv ON dv.id = cv.id
+                WHERE ro.id = $1
+                  AND ro.status = $4
+                  AND ro.funding_vault_id = cv.id
+                  AND cv.order_id = ro.id
+                  AND dv.status = $5
+                RETURNING ro.*
+            )
+            SELECT {ORDER_SELECT_COLUMNS}
+            FROM updated ro
+            LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
+            LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
+            UNION ALL
+            SELECT {ORDER_SELECT_COLUMNS}
+            FROM router_orders ro
+            LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
+            LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
+            WHERE ro.id = $1
+              AND ro.status = $2
+            LIMIT 1
+            "#
+        ))
+        .bind(order_id)
+        .bind(RouterOrderStatus::Funded.to_db_string())
+        .bind(updated_at)
+        .bind(RouterOrderStatus::PendingFunding.to_db_string())
+        .bind(DepositVaultStatus::Funded.to_db_string())
+        .fetch_one(&self.pool)
+        .await;
+        telemetry::record_db_query(
+            "order.mark_order_funded_from_funded_vault",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        let row = result?;
+
+        self.map_order_row(&row)
+    }
+
     pub async fn expire_unfunded_order(
         &self,
         id: Uuid,

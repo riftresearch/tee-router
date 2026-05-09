@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use temporal_worker::{
     order_execution,
+    production::OrderWorkerRuntimeArgs,
     runtime::{TemporalConnection, WorkerResult},
     spike,
 };
@@ -24,10 +25,13 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run the production order-execution worker skeleton.
+    /// Run the production order-execution worker.
     Worker {
         #[arg(long, env = "TEMPORAL_TASK_QUEUE", default_value = order_execution::DEFAULT_TASK_QUEUE)]
         task_queue: String,
+
+        #[command(flatten)]
+        runtime: OrderWorkerRuntimeArgs,
     },
     /// Run the PR1 Rust SDK capability spike.
     Spike {
@@ -52,8 +56,15 @@ async fn main() -> WorkerResult<()> {
     };
 
     match cli.command {
-        Command::Worker { task_queue } => {
-            order_execution::run_worker(&connection, &task_queue).await?;
+        Command::Worker {
+            task_queue,
+            runtime,
+        } => {
+            let activities = order_execution::activities::OrderActivities::new(
+                runtime.build_order_activities().await?,
+            );
+            order_execution::run_worker_with_activities(&connection, &task_queue, activities)
+                .await?;
         }
         Command::Spike {
             task_queue,
