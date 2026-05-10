@@ -5,338 +5,357 @@ pub(super) async fn hydrate_destination_execution_steps(
     order_id: Uuid,
     steps: Vec<OrderExecutionStep>,
 ) -> Result<Vec<OrderExecutionStep>, OrderActivityError> {
-    let mut source_deposit_vault: Option<CustodyVault> = None;
-    let mut destination_execution_vault: Option<CustodyVault> = None;
-    let mut hyperliquid_spot_vault: Option<CustodyVault> = None;
+    let mut cache = StepHydrationCache::default();
     let mut hydrated = Vec::with_capacity(steps.len());
 
     for mut step in steps {
-        if json_string_equals(
-            &step.request,
-            "recipient_custody_vault_role",
-            CustodyVaultRole::DestinationExecution.to_db_string(),
-        ) {
-            let asset = step
-                .output_asset
-                .clone()
-                .ok_or(OrderActivityError::MissingHydration {
-                    vault_role: "destination_execution_recipient_output_asset",
-                    step_id: step.id.into(),
-                })?;
-            let vault = ensure_destination_execution_vault(
-                deps,
-                order_id,
-                &asset,
-                &mut destination_execution_vault,
-            )
-            .await?;
-            if step.request.get("recipient").is_some() {
-                set_json_value(&mut step.request, "recipient", json!(vault.address));
-            }
-            if step.request.get("recipient_address").is_some() {
-                set_json_value(&mut step.request, "recipient_address", json!(vault.address));
-            }
-            set_json_value(
-                &mut step.request,
-                "recipient_custody_vault_id",
-                json!(vault.id),
-            );
-            set_json_value(
-                &mut step.details,
-                "destination_custody_vault_id",
-                json!(vault.id),
-            );
-            set_json_value(
-                &mut step.details,
-                "destination_custody_vault_address",
-                json!(vault.address),
-            );
-        }
-
-        if json_string_equals(
-            &step.request,
-            "source_custody_vault_role",
-            CustodyVaultRole::DestinationExecution.to_db_string(),
-        ) {
-            let asset = step
-                .input_asset
-                .clone()
-                .ok_or(OrderActivityError::MissingHydration {
-                    vault_role: "destination_execution_source_input_asset",
-                    step_id: step.id.into(),
-                })?;
-            let vault = ensure_destination_execution_vault(
-                deps,
-                order_id,
-                &asset,
-                &mut destination_execution_vault,
-            )
-            .await?;
-            set_json_value(
-                &mut step.request,
-                "source_custody_vault_id",
-                json!(vault.id),
-            );
-            set_json_value(
-                &mut step.request,
-                "source_custody_vault_address",
-                json!(vault.address),
-            );
-            set_json_value(
-                &mut step.details,
-                "source_custody_vault_id",
-                json!(vault.id),
-            );
-            set_json_value(
-                &mut step.details,
-                "source_custody_vault_address",
-                json!(vault.address),
-            );
-        }
-
-        if json_string_equals(
-            &step.request,
-            "depositor_custody_vault_role",
-            CustodyVaultRole::DestinationExecution.to_db_string(),
-        ) {
-            let asset = step
-                .input_asset
-                .clone()
-                .ok_or(OrderActivityError::MissingHydration {
-                    vault_role: "destination_execution_depositor_input_asset",
-                    step_id: step.id.into(),
-                })?;
-            let vault = ensure_destination_execution_vault(
-                deps,
-                order_id,
-                &asset,
-                &mut destination_execution_vault,
-            )
-            .await?;
-            set_json_value(
-                &mut step.request,
-                "depositor_custody_vault_id",
-                json!(vault.id),
-            );
-            set_json_value(&mut step.request, "depositor_address", json!(vault.address));
-            set_json_value(
-                &mut step.details,
-                "depositor_custody_vault_id",
-                json!(vault.id),
-            );
-            set_json_value(
-                &mut step.details,
-                "depositor_custody_vault_address",
-                json!(vault.address),
-            );
-        }
-
-        if json_string_equals(
-            &step.request,
-            "refund_custody_vault_role",
-            CustodyVaultRole::DestinationExecution.to_db_string(),
-        ) {
-            let asset = step
-                .input_asset
-                .clone()
-                .ok_or(OrderActivityError::MissingHydration {
-                    vault_role: "destination_execution_refund_input_asset",
-                    step_id: step.id.into(),
-                })?;
-            let vault = ensure_destination_execution_vault(
-                deps,
-                order_id,
-                &asset,
-                &mut destination_execution_vault,
-            )
-            .await?;
-            set_json_value(
-                &mut step.request,
-                "refund_custody_vault_id",
-                json!(vault.id),
-            );
-            set_json_value(&mut step.request, "refund_address", json!(vault.address));
-            set_json_value(
-                &mut step.details,
-                "refund_custody_vault_id",
-                json!(vault.id),
-            );
-            set_json_value(
-                &mut step.details,
-                "refund_custody_vault_address",
-                json!(vault.address),
-            );
-        }
-
-        if json_string_equals(
-            &step.request,
-            "hyperliquid_custody_vault_role",
-            CustodyVaultRole::SourceDeposit.to_db_string(),
-        ) {
-            let chain_id = step
-                .request
-                .get("hyperliquid_custody_vault_chain_id")
-                .and_then(Value::as_str)
-                .ok_or(OrderActivityError::MissingHydration {
-                    vault_role: "source_deposit_hyperliquid_chain",
-                    step_id: step.id.into(),
-                })?;
-            let asset_id = step
-                .request
-                .get("hyperliquid_custody_vault_asset_id")
-                .and_then(Value::as_str)
-                .ok_or(OrderActivityError::MissingHydration {
-                    vault_role: "source_deposit_hyperliquid_asset",
-                    step_id: step.id.into(),
-                })?;
-            let asset = DepositAsset {
-                chain: ChainId::parse(chain_id).map_err(|source| {
-                    invariant_error(
-                        "hyperliquid_custody_vault_chain_id_valid",
-                        format!(
-                            "step {} hyperliquid_custody_vault_chain_id is invalid: {source}",
-                            step.id
-                        ),
-                    )
-                })?,
-                asset: AssetId::parse(asset_id).map_err(|source| {
-                    invariant_error(
-                        "hyperliquid_custody_vault_asset_id_valid",
-                        format!(
-                            "step {} hyperliquid_custody_vault_asset_id is invalid: {source}",
-                            step.id
-                        ),
-                    )
-                })?,
-            };
-            let vault =
-                ensure_source_deposit_vault(deps, order_id, &asset, &mut source_deposit_vault)
-                    .await?;
-            set_json_value(
-                &mut step.request,
-                "hyperliquid_custody_vault_id",
-                json!(vault.id),
-            );
-            set_json_value(
-                &mut step.request,
-                "hyperliquid_custody_vault_address",
-                json!(vault.address),
-            );
-            set_json_value(
-                &mut step.details,
-                "hyperliquid_custody_vault_id",
-                json!(vault.id),
-            );
-            set_json_value(
-                &mut step.details,
-                "hyperliquid_custody_vault_address",
-                json!(vault.address),
-            );
-        }
-
-        if json_string_equals(
-            &step.request,
-            "hyperliquid_custody_vault_role",
-            CustodyVaultRole::HyperliquidSpot.to_db_string(),
-        ) {
-            let vault =
-                ensure_hyperliquid_spot_vault(deps, order_id, &mut hyperliquid_spot_vault).await?;
-            set_json_value(
-                &mut step.request,
-                "hyperliquid_custody_vault_id",
-                json!(vault.id),
-            );
-            set_json_value(
-                &mut step.request,
-                "hyperliquid_custody_vault_address",
-                json!(vault.address),
-            );
-            set_json_value(
-                &mut step.details,
-                "hyperliquid_custody_vault_id",
-                json!(vault.id),
-            );
-            set_json_value(
-                &mut step.details,
-                "hyperliquid_custody_vault_address",
-                json!(vault.address),
-            );
-        }
-
-        if json_string_equals(
-            &step.request,
-            "hyperliquid_custody_vault_role",
-            CustodyVaultRole::DestinationExecution.to_db_string(),
-        ) {
-            let chain_id = step
-                .request
-                .get("hyperliquid_custody_vault_chain_id")
-                .and_then(Value::as_str)
-                .ok_or(OrderActivityError::MissingHydration {
-                    vault_role: "destination_execution_hyperliquid_chain",
-                    step_id: step.id.into(),
-                })?;
-            let asset_id = step
-                .request
-                .get("hyperliquid_custody_vault_asset_id")
-                .and_then(Value::as_str)
-                .ok_or(OrderActivityError::MissingHydration {
-                    vault_role: "destination_execution_hyperliquid_asset",
-                    step_id: step.id.into(),
-                })?;
-            let asset = DepositAsset {
-                chain: ChainId::parse(chain_id).map_err(|source| {
-                    invariant_error(
-                        "hyperliquid_custody_vault_chain_id_valid",
-                        format!(
-                            "step {} hyperliquid_custody_vault_chain_id is invalid: {source}",
-                            step.id
-                        ),
-                    )
-                })?,
-                asset: AssetId::parse(asset_id).map_err(|source| {
-                    invariant_error(
-                        "hyperliquid_custody_vault_asset_id_valid",
-                        format!(
-                            "step {} hyperliquid_custody_vault_asset_id is invalid: {source}",
-                            step.id
-                        ),
-                    )
-                })?,
-            };
-            let vault = ensure_destination_execution_vault(
-                deps,
-                order_id,
-                &asset,
-                &mut destination_execution_vault,
-            )
-            .await?;
-            set_json_value(
-                &mut step.request,
-                "hyperliquid_custody_vault_id",
-                json!(vault.id),
-            );
-            set_json_value(
-                &mut step.request,
-                "hyperliquid_custody_vault_address",
-                json!(vault.address),
-            );
-            set_json_value(
-                &mut step.details,
-                "hyperliquid_custody_vault_id",
-                json!(vault.id),
-            );
-            set_json_value(
-                &mut step.details,
-                "hyperliquid_custody_vault_address",
-                json!(vault.address),
-            );
-        }
-
+        hydrate_step_vault_roles(deps, order_id, &mut step, &mut cache).await?;
         hydrated.push(step);
     }
 
     Ok(hydrated)
+}
+
+#[derive(Default)]
+struct StepHydrationCache {
+    source_deposit_vault: Option<CustodyVault>,
+    destination_execution_vault: Option<CustodyVault>,
+    hyperliquid_spot_vault: Option<CustodyVault>,
+}
+
+async fn hydrate_step_vault_roles(
+    deps: &OrderActivityDeps,
+    order_id: Uuid,
+    step: &mut OrderExecutionStep,
+    cache: &mut StepHydrationCache,
+) -> Result<(), OrderActivityError> {
+    hydrate_destination_execution_role(
+        deps,
+        order_id,
+        step,
+        &mut cache.destination_execution_vault,
+    )
+    .await?;
+    hydrate_source_deposit_role(deps, order_id, step, &mut cache.source_deposit_vault).await?;
+    hydrate_hyperliquid_spot_role(deps, order_id, step, &mut cache.hyperliquid_spot_vault).await
+}
+
+async fn hydrate_destination_execution_role(
+    deps: &OrderActivityDeps,
+    order_id: Uuid,
+    step: &mut OrderExecutionStep,
+    cache: &mut Option<CustodyVault>,
+) -> Result<(), OrderActivityError> {
+    hydrate_destination_recipient(deps, order_id, step, cache).await?;
+    hydrate_destination_source(deps, order_id, step, cache).await?;
+    hydrate_destination_depositor(deps, order_id, step, cache).await?;
+    hydrate_destination_refund(deps, order_id, step, cache).await?;
+    hydrate_destination_hyperliquid(deps, order_id, step, cache).await
+}
+
+async fn hydrate_source_deposit_role(
+    deps: &OrderActivityDeps,
+    order_id: Uuid,
+    step: &mut OrderExecutionStep,
+    cache: &mut Option<CustodyVault>,
+) -> Result<(), OrderActivityError> {
+    if !json_string_equals(
+        &step.request,
+        "hyperliquid_custody_vault_role",
+        CustodyVaultRole::SourceDeposit.to_db_string(),
+    ) {
+        return Ok(());
+    }
+    let asset = hyperliquid_vault_asset(step, "source_deposit")?;
+    let vault = ensure_source_deposit_vault(deps, order_id, &asset, cache).await?;
+    write_hyperliquid_vault_fields(step, &vault);
+    Ok(())
+}
+
+async fn hydrate_hyperliquid_spot_role(
+    deps: &OrderActivityDeps,
+    order_id: Uuid,
+    step: &mut OrderExecutionStep,
+    cache: &mut Option<CustodyVault>,
+) -> Result<(), OrderActivityError> {
+    if !json_string_equals(
+        &step.request,
+        "hyperliquid_custody_vault_role",
+        CustodyVaultRole::HyperliquidSpot.to_db_string(),
+    ) {
+        return Ok(());
+    }
+    let vault = ensure_hyperliquid_spot_vault(deps, order_id, cache).await?;
+    write_hyperliquid_vault_fields(step, &vault);
+    Ok(())
+}
+
+async fn hydrate_destination_recipient(
+    deps: &OrderActivityDeps,
+    order_id: Uuid,
+    step: &mut OrderExecutionStep,
+    cache: &mut Option<CustodyVault>,
+) -> Result<(), OrderActivityError> {
+    if !json_string_equals(
+        &step.request,
+        "recipient_custody_vault_role",
+        CustodyVaultRole::DestinationExecution.to_db_string(),
+    ) {
+        return Ok(());
+    }
+    let asset = step_asset(
+        step,
+        HydrationStepAsset::Output,
+        "destination_execution_recipient_output_asset",
+    )?;
+    let vault = ensure_destination_execution_vault(deps, order_id, &asset, cache).await?;
+    if step.request.get("recipient").is_some() {
+        set_json_value(&mut step.request, "recipient", json!(vault.address));
+    }
+    if step.request.get("recipient_address").is_some() {
+        set_json_value(&mut step.request, "recipient_address", json!(vault.address));
+    }
+    set_json_value(
+        &mut step.request,
+        "recipient_custody_vault_id",
+        json!(vault.id),
+    );
+    write_detail_vault_fields(step, "destination_custody", &vault);
+    Ok(())
+}
+
+async fn hydrate_destination_source(
+    deps: &OrderActivityDeps,
+    order_id: Uuid,
+    step: &mut OrderExecutionStep,
+    cache: &mut Option<CustodyVault>,
+) -> Result<(), OrderActivityError> {
+    if !json_string_equals(
+        &step.request,
+        "source_custody_vault_role",
+        CustodyVaultRole::DestinationExecution.to_db_string(),
+    ) {
+        return Ok(());
+    }
+    let asset = step_asset(
+        step,
+        HydrationStepAsset::Input,
+        "destination_execution_source_input_asset",
+    )?;
+    let vault = ensure_destination_execution_vault(deps, order_id, &asset, cache).await?;
+    write_vault_fields(
+        step,
+        "source_custody_vault_id",
+        "source_custody_vault_address",
+        "source_custody",
+        &vault,
+    );
+    Ok(())
+}
+
+async fn hydrate_destination_depositor(
+    deps: &OrderActivityDeps,
+    order_id: Uuid,
+    step: &mut OrderExecutionStep,
+    cache: &mut Option<CustodyVault>,
+) -> Result<(), OrderActivityError> {
+    if !json_string_equals(
+        &step.request,
+        "depositor_custody_vault_role",
+        CustodyVaultRole::DestinationExecution.to_db_string(),
+    ) {
+        return Ok(());
+    }
+    let asset = step_asset(
+        step,
+        HydrationStepAsset::Input,
+        "destination_execution_depositor_input_asset",
+    )?;
+    let vault = ensure_destination_execution_vault(deps, order_id, &asset, cache).await?;
+    set_json_value(
+        &mut step.request,
+        "depositor_custody_vault_id",
+        json!(vault.id),
+    );
+    set_json_value(&mut step.request, "depositor_address", json!(vault.address));
+    write_detail_vault_fields(step, "depositor_custody", &vault);
+    Ok(())
+}
+
+async fn hydrate_destination_refund(
+    deps: &OrderActivityDeps,
+    order_id: Uuid,
+    step: &mut OrderExecutionStep,
+    cache: &mut Option<CustodyVault>,
+) -> Result<(), OrderActivityError> {
+    if !json_string_equals(
+        &step.request,
+        "refund_custody_vault_role",
+        CustodyVaultRole::DestinationExecution.to_db_string(),
+    ) {
+        return Ok(());
+    }
+    let asset = step_asset(
+        step,
+        HydrationStepAsset::Input,
+        "destination_execution_refund_input_asset",
+    )?;
+    let vault = ensure_destination_execution_vault(deps, order_id, &asset, cache).await?;
+    set_json_value(
+        &mut step.request,
+        "refund_custody_vault_id",
+        json!(vault.id),
+    );
+    set_json_value(&mut step.request, "refund_address", json!(vault.address));
+    write_detail_vault_fields(step, "refund_custody", &vault);
+    Ok(())
+}
+
+async fn hydrate_destination_hyperliquid(
+    deps: &OrderActivityDeps,
+    order_id: Uuid,
+    step: &mut OrderExecutionStep,
+    cache: &mut Option<CustodyVault>,
+) -> Result<(), OrderActivityError> {
+    if !json_string_equals(
+        &step.request,
+        "hyperliquid_custody_vault_role",
+        CustodyVaultRole::DestinationExecution.to_db_string(),
+    ) {
+        return Ok(());
+    }
+    let asset = hyperliquid_vault_asset(step, "destination_execution")?;
+    let vault = ensure_destination_execution_vault(deps, order_id, &asset, cache).await?;
+    write_hyperliquid_vault_fields(step, &vault);
+    Ok(())
+}
+
+enum HydrationStepAsset {
+    Input,
+    Output,
+}
+
+fn step_asset(
+    step: &OrderExecutionStep,
+    side: HydrationStepAsset,
+    vault_role: &'static str,
+) -> Result<DepositAsset, OrderActivityError> {
+    let asset = match side {
+        HydrationStepAsset::Input => step.input_asset.clone(),
+        HydrationStepAsset::Output => step.output_asset.clone(),
+    };
+    asset.ok_or(OrderActivityError::MissingHydration {
+        vault_role,
+        step_id: step.id.into(),
+    })
+}
+
+fn hyperliquid_vault_asset(
+    step: &OrderExecutionStep,
+    role_prefix: &'static str,
+) -> Result<DepositAsset, OrderActivityError> {
+    let chain_id = hyperliquid_vault_asset_field(step, role_prefix, "chain")?;
+    let asset_id = hyperliquid_vault_asset_field(step, role_prefix, "asset")?;
+    Ok(DepositAsset {
+        chain: ChainId::parse(chain_id).map_err(|source| {
+            invariant_error(
+                "hyperliquid_custody_vault_chain_id_valid",
+                format!(
+                    "step {} hyperliquid_custody_vault_chain_id is invalid: {source}",
+                    step.id
+                ),
+            )
+        })?,
+        asset: AssetId::parse(asset_id).map_err(|source| {
+            invariant_error(
+                "hyperliquid_custody_vault_asset_id_valid",
+                format!(
+                    "step {} hyperliquid_custody_vault_asset_id is invalid: {source}",
+                    step.id
+                ),
+            )
+        })?,
+    })
+}
+
+fn hyperliquid_vault_asset_field<'a>(
+    step: &'a OrderExecutionStep,
+    role_prefix: &'static str,
+    field_kind: &'static str,
+) -> Result<&'a str, OrderActivityError> {
+    let field = match field_kind {
+        "chain" => "hyperliquid_custody_vault_chain_id",
+        "asset" => "hyperliquid_custody_vault_asset_id",
+        _ => unreachable!("unsupported hyperliquid vault asset field"),
+    };
+    step.request
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or(OrderActivityError::MissingHydration {
+            vault_role: match (role_prefix, field_kind) {
+                ("source_deposit", "chain") => "source_deposit_hyperliquid_chain",
+                ("source_deposit", "asset") => "source_deposit_hyperliquid_asset",
+                ("destination_execution", "chain") => "destination_execution_hyperliquid_chain",
+                ("destination_execution", "asset") => "destination_execution_hyperliquid_asset",
+                _ => "hyperliquid_custody_vault_asset",
+            },
+            step_id: step.id.into(),
+        })
+}
+
+fn write_vault_fields(
+    step: &mut OrderExecutionStep,
+    request_id_key: &'static str,
+    request_address_key: &'static str,
+    detail_prefix: &'static str,
+    vault: &CustodyVault,
+) {
+    set_json_value(&mut step.request, request_id_key, json!(vault.id));
+    set_json_value(&mut step.request, request_address_key, json!(vault.address));
+    write_detail_vault_fields(step, detail_prefix, vault);
+}
+
+fn write_detail_vault_fields(
+    step: &mut OrderExecutionStep,
+    detail_prefix: &'static str,
+    vault: &CustodyVault,
+) {
+    set_json_value(
+        &mut step.details,
+        detail_prefix_field(detail_prefix, "id"),
+        json!(vault.id),
+    );
+    set_json_value(
+        &mut step.details,
+        detail_prefix_field(detail_prefix, "address"),
+        json!(vault.address),
+    );
+}
+
+fn write_hyperliquid_vault_fields(step: &mut OrderExecutionStep, vault: &CustodyVault) {
+    write_vault_fields(
+        step,
+        "hyperliquid_custody_vault_id",
+        "hyperliquid_custody_vault_address",
+        "hyperliquid_custody_vault",
+        vault,
+    );
+}
+
+fn detail_prefix_field(prefix: &'static str, suffix: &'static str) -> &'static str {
+    match (prefix, suffix) {
+        ("destination_custody", "id") => "destination_custody_vault_id",
+        ("destination_custody", "address") => "destination_custody_vault_address",
+        ("source_custody", "id") => "source_custody_vault_id",
+        ("source_custody", "address") => "source_custody_vault_address",
+        ("depositor_custody", "id") => "depositor_custody_vault_id",
+        ("depositor_custody", "address") => "depositor_custody_vault_address",
+        ("refund_custody", "id") => "refund_custody_vault_id",
+        ("refund_custody", "address") => "refund_custody_vault_address",
+        ("hyperliquid_custody_vault", "id") => "hyperliquid_custody_vault_id",
+        ("hyperliquid_custody_vault", "address") => "hyperliquid_custody_vault_address",
+        _ => unreachable!("unsupported custody vault detail field"),
+    }
 }
 
 pub(super) async fn ensure_source_deposit_vault(
