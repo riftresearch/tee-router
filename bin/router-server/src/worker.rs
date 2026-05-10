@@ -713,6 +713,16 @@ async fn run_workflow_start_batch(
             Err(error) => return Err(error),
         }
     }
+    let status_counts = db
+        .orders()
+        .count_operator_order_statuses()
+        .await
+        .map_err(|err| err.to_string())?;
+    let status_counts = status_counts
+        .iter()
+        .map(|count| (count.status, count.order_count))
+        .collect::<Vec<_>>();
+    telemetry::record_operator_order_status_depth(&status_counts);
     telemetry::record_worker_tick("order_workflow_start", started.elapsed());
     Ok(summary)
 }
