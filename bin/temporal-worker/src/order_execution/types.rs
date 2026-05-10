@@ -11,6 +11,85 @@ pub use router_temporal::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::{error::Error, fmt};
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct RawAmount(String);
+
+impl RawAmount {
+    pub fn new(value: impl Into<String>) -> Result<Self, RawAmountError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(RawAmountError::Empty);
+        }
+        if !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(RawAmountError::NonDecimalDigit);
+        }
+        if value.len() > 1 && value.starts_with('0') {
+            return Err(RawAmountError::LeadingZero);
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for RawAmount {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl TryFrom<String> for RawAmount {
+    type Error = RawAmountError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<&str> for RawAmount {
+    type Error = RawAmountError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for RawAmount {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawAmountError {
+    Empty,
+    NonDecimalDigit,
+    LeadingZero,
+}
+
+impl fmt::Display for RawAmountError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("raw amount is empty"),
+            Self::NonDecimalDigit => {
+                formatter.write_str("raw amount must contain only ASCII decimal digits")
+            }
+            Self::LeadingZero => formatter.write_str("raw amount must not contain leading zeroes"),
+        }
+    }
+}
+
+impl Error for RawAmountError {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderWorkflowOutput {
@@ -115,7 +194,7 @@ pub struct ProviderHintPollWorkflowOutput {
 pub struct FundingVaultFundedSignal {
     pub order_id: WorkflowOrderId,
     pub vault_id: WorkflowVaultId,
-    pub observed_amount_raw: String,
+    pub observed_amount_raw: RawAmount,
     pub source_ref: Option<String>,
 }
 
@@ -379,7 +458,7 @@ pub struct SingleRefundPosition {
     pub funding_vault_id: Option<WorkflowVaultId>,
     pub custody_vault_id: Option<WorkflowVaultId>,
     pub asset: DepositAsset,
-    pub amount: String,
+    pub amount: RawAmount,
     pub hyperliquid_coin: Option<String>,
     pub hyperliquid_canonical: Option<CanonicalAsset>,
 }
@@ -617,4 +696,61 @@ pub enum RecoverablePositionKind {
     FundingVault,
     ExternalCustody,
     HyperliquidSpot,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RawAmount, RawAmountError};
+
+    #[test]
+    fn raw_amount_accepts_positive_decimal_string() {
+        let amount = RawAmount::new("123456789012345678901234567890").unwrap();
+        assert_eq!(amount.as_str(), "123456789012345678901234567890");
+        assert_eq!(amount.to_string(), "123456789012345678901234567890");
+    }
+
+    #[test]
+    fn raw_amount_accepts_zero() {
+        let amount = RawAmount::new("0").unwrap();
+        assert_eq!(amount.as_str(), "0");
+    }
+
+    #[test]
+    fn raw_amount_rejects_empty_string() {
+        assert_eq!(RawAmount::new("").unwrap_err(), RawAmountError::Empty);
+    }
+
+    #[test]
+    fn raw_amount_rejects_non_decimal_digits() {
+        assert_eq!(
+            RawAmount::new("12_34").unwrap_err(),
+            RawAmountError::NonDecimalDigit
+        );
+        assert_eq!(
+            RawAmount::new("１２").unwrap_err(),
+            RawAmountError::NonDecimalDigit
+        );
+    }
+
+    #[test]
+    fn raw_amount_rejects_leading_zeroes() {
+        assert_eq!(
+            RawAmount::new("01").unwrap_err(),
+            RawAmountError::LeadingZero
+        );
+        assert_eq!(
+            RawAmount::new("00").unwrap_err(),
+            RawAmountError::LeadingZero
+        );
+    }
+
+    #[test]
+    fn raw_amount_serde_uses_decimal_string_wire_format() {
+        let amount = RawAmount::new("42").unwrap();
+        let encoded = serde_json::to_string(&amount).unwrap();
+        assert_eq!(encoded, "\"42\"");
+        let decoded: RawAmount = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, amount);
+        assert!(serde_json::from_str::<RawAmount>("\"0042\"").is_err());
+    }
 }
