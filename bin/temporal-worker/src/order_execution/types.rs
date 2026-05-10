@@ -12,6 +12,7 @@ pub use router_temporal::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{error::Error, fmt};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
@@ -548,15 +549,217 @@ pub struct RefreshedQuoteAttemptShape {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefreshedQuoteFailureReason {
+    pub reason: String,
+    pub trace: String,
+    pub stale_attempt_id: WorkflowAttemptId,
+    pub failed_step_id: WorkflowStepId,
+    pub superseded_attempt_id: WorkflowAttemptId,
+    pub superseded_attempt_index: i32,
+    pub stale_step_id: WorkflowStepId,
+    pub stale_execution_leg_id: Uuid,
+    pub provider_quote_expires_at: String,
+    pub refreshed_quote_id: Uuid,
+}
+
+impl RefreshedQuoteFailureReason {
+    #[must_use]
+    pub fn stale_provider_quote_refresh(
+        stale_attempt_id: Uuid,
+        superseded_attempt_index: i32,
+        failed_step_id: Uuid,
+        stale_execution_leg_id: Uuid,
+        provider_quote_expires_at: chrono::DateTime<chrono::Utc>,
+        refreshed_quote_id: Uuid,
+    ) -> Self {
+        Self {
+            reason: "stale_provider_quote_refresh".to_string(),
+            trace: "quote_refresh_workflow".to_string(),
+            stale_attempt_id: stale_attempt_id.into(),
+            failed_step_id: failed_step_id.into(),
+            superseded_attempt_id: stale_attempt_id.into(),
+            superseded_attempt_index,
+            stale_step_id: failed_step_id.into(),
+            stale_execution_leg_id,
+            provider_quote_expires_at: provider_quote_expires_at.to_rfc3339(),
+            refreshed_quote_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefreshedQuoteSupersededReason {
+    pub reason: String,
+    pub stale_attempt_id: WorkflowAttemptId,
+    pub failed_step_id: WorkflowStepId,
+    pub stale_step_id: WorkflowStepId,
+    pub stale_execution_leg_id: Uuid,
+    pub provider_quote_expires_at: String,
+    pub refreshed_quote_id: Uuid,
+}
+
+impl RefreshedQuoteSupersededReason {
+    #[must_use]
+    pub fn stale_provider_quote_refresh(
+        stale_attempt_id: Uuid,
+        failed_step_id: Uuid,
+        stale_execution_leg_id: Uuid,
+        provider_quote_expires_at: chrono::DateTime<chrono::Utc>,
+        refreshed_quote_id: Uuid,
+    ) -> Self {
+        Self {
+            reason: "superseded_by_stale_provider_quote_refresh".to_string(),
+            stale_attempt_id: stale_attempt_id.into(),
+            failed_step_id: failed_step_id.into(),
+            stale_step_id: failed_step_id.into(),
+            stale_execution_leg_id,
+            provider_quote_expires_at: provider_quote_expires_at.to_rfc3339(),
+            refreshed_quote_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputCustodySourceKind {
+    FundingVault,
+    ExternalCustody,
+    HyperliquidCustody,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputCustodySnapshotAsset {
+    pub chain: String,
+    pub asset: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputCustodySnapshot {
+    pub source_kind: InputCustodySourceKind,
+    pub funding_vault_id: Option<WorkflowVaultId>,
+    pub failed_step_id: WorkflowStepId,
+    pub failed_step_index: i32,
+    pub failed_step_type: String,
+    pub amount_in: Option<String>,
+    pub min_amount_out: Option<String>,
+    pub source_asset: InputCustodySnapshotAsset,
+    pub source_custody_vault_id: Option<Value>,
+    pub source_custody_vault_role: Option<Value>,
+    pub source_custody_vault_address: Option<Value>,
+    pub hyperliquid_custody_vault_id: Option<Value>,
+    pub hyperliquid_custody_vault_role: Option<Value>,
+    pub hyperliquid_custody_vault_address: Option<Value>,
+    pub recipient_custody_vault_id: Option<Value>,
+    pub recipient_custody_vault_role: Option<Value>,
+    pub recipient: Option<Value>,
+    pub revert_custody_vault_id: Option<Value>,
+    pub revert_custody_vault_role: Option<Value>,
+    pub revert_custody_vault_address: Option<Value>,
+}
+
+impl InputCustodySnapshot {
+    #[must_use]
+    pub fn from_failed_step(order: &RouterOrder, failed_step: &OrderExecutionStep) -> Self {
+        let source_kind = if failed_step.request.get("source_custody_vault_id").is_some() {
+            InputCustodySourceKind::ExternalCustody
+        } else if failed_step
+            .request
+            .get("hyperliquid_custody_vault_id")
+            .is_some()
+        {
+            InputCustodySourceKind::HyperliquidCustody
+        } else {
+            InputCustodySourceKind::FundingVault
+        };
+        let source_asset = failed_step
+            .input_asset
+            .clone()
+            .or_else(|| failed_step.output_asset.clone())
+            .unwrap_or_else(|| order.source_asset.clone());
+
+        Self {
+            source_kind,
+            funding_vault_id: order.funding_vault_id.map(Into::into),
+            failed_step_id: failed_step.id.into(),
+            failed_step_index: failed_step.step_index,
+            failed_step_type: failed_step.step_type.to_db_string().to_string(),
+            amount_in: failed_step.amount_in.clone(),
+            min_amount_out: failed_step.min_amount_out.clone(),
+            source_asset: InputCustodySnapshotAsset {
+                chain: source_asset.chain.as_str().to_string(),
+                asset: source_asset.asset.as_str().to_string(),
+            },
+            source_custody_vault_id: failed_step.request.get("source_custody_vault_id").cloned(),
+            source_custody_vault_role: failed_step
+                .request
+                .get("source_custody_vault_role")
+                .cloned(),
+            source_custody_vault_address: failed_step
+                .request
+                .get("source_custody_vault_address")
+                .cloned(),
+            hyperliquid_custody_vault_id: failed_step
+                .request
+                .get("hyperliquid_custody_vault_id")
+                .cloned(),
+            hyperliquid_custody_vault_role: failed_step
+                .request
+                .get("hyperliquid_custody_vault_role")
+                .cloned(),
+            hyperliquid_custody_vault_address: failed_step
+                .request
+                .get("hyperliquid_custody_vault_address")
+                .cloned(),
+            recipient_custody_vault_id: failed_step
+                .request
+                .get("recipient_custody_vault_id")
+                .cloned(),
+            recipient_custody_vault_role: failed_step
+                .request
+                .get("recipient_custody_vault_role")
+                .cloned(),
+            recipient: failed_step.request.get("recipient").cloned(),
+            revert_custody_vault_id: failed_step.request.get("revert_custody_vault_id").cloned(),
+            revert_custody_vault_role: failed_step
+                .request
+                .get("revert_custody_vault_role")
+                .cloned(),
+            revert_custody_vault_address: failed_step
+                .details
+                .get("revert_custody_vault_address")
+                .cloned(),
+        }
+    }
+}
+
+impl From<RefreshedQuoteFailureReason> for Value {
+    fn from(value: RefreshedQuoteFailureReason) -> Self {
+        serde_json::to_value(value).expect("refreshed quote failure reason serializes to JSON")
+    }
+}
+
+impl From<RefreshedQuoteSupersededReason> for Value {
+    fn from(value: RefreshedQuoteSupersededReason) -> Self {
+        serde_json::to_value(value).expect("refreshed quote superseded reason serializes to JSON")
+    }
+}
+
+impl From<InputCustodySnapshot> for Value {
+    fn from(value: InputCustodySnapshot) -> Self {
+        serde_json::to_value(value).expect("input custody snapshot serializes to JSON")
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RefreshedQuoteAttemptOutcome {
     Refreshed {
         order_id: WorkflowOrderId,
         stale_attempt_id: WorkflowAttemptId,
         failed_step_id: WorkflowStepId,
         plan: ExecutionPlan,
-        failure_reason: Value,
-        superseded_reason: Value,
-        input_custody_snapshot: Value,
+        failure_reason: RefreshedQuoteFailureReason,
+        superseded_reason: RefreshedQuoteSupersededReason,
+        input_custody_snapshot: InputCustodySnapshot,
     },
     Untenable {
         order_id: WorkflowOrderId,
@@ -700,7 +903,11 @@ pub enum RecoverablePositionKind {
 
 #[cfg(test)]
 mod tests {
-    use super::{RawAmount, RawAmountError};
+    use super::{
+        InputCustodySnapshot, RawAmount, RawAmountError, RefreshedQuoteFailureReason,
+        RefreshedQuoteSupersededReason,
+    };
+    use serde_json::json;
 
     #[test]
     fn raw_amount_accepts_positive_decimal_string() {
@@ -752,5 +959,76 @@ mod tests {
         let decoded: RawAmount = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, amount);
         assert!(serde_json::from_str::<RawAmount>("\"0042\"").is_err());
+    }
+
+    #[test]
+    fn refreshed_quote_failure_reason_preserves_json_wire_shape() {
+        let value = json!({
+            "reason": "stale_provider_quote_refresh",
+            "trace": "quote_refresh_workflow",
+            "stale_attempt_id": "018f13e1-0000-7000-8000-000000000001",
+            "failed_step_id": "018f13e1-0000-7000-8000-000000000002",
+            "superseded_attempt_id": "018f13e1-0000-7000-8000-000000000001",
+            "superseded_attempt_index": 1,
+            "stale_step_id": "018f13e1-0000-7000-8000-000000000002",
+            "stale_execution_leg_id": "018f13e1-0000-7000-8000-000000000003",
+            "provider_quote_expires_at": "2026-05-10T12:00:00+00:00",
+            "refreshed_quote_id": "018f13e1-0000-7000-8000-000000000004",
+        });
+
+        let decoded: RefreshedQuoteFailureReason = serde_json::from_value(value.clone()).unwrap();
+
+        assert_eq!(serde_json::to_value(decoded).unwrap(), value);
+    }
+
+    #[test]
+    fn refreshed_quote_superseded_reason_preserves_json_wire_shape() {
+        let value = json!({
+            "reason": "superseded_by_stale_provider_quote_refresh",
+            "stale_attempt_id": "018f13e1-0000-7000-8000-000000000001",
+            "failed_step_id": "018f13e1-0000-7000-8000-000000000002",
+            "stale_step_id": "018f13e1-0000-7000-8000-000000000002",
+            "stale_execution_leg_id": "018f13e1-0000-7000-8000-000000000003",
+            "provider_quote_expires_at": "2026-05-10T12:00:00+00:00",
+            "refreshed_quote_id": "018f13e1-0000-7000-8000-000000000004",
+        });
+
+        let decoded: RefreshedQuoteSupersededReason =
+            serde_json::from_value(value.clone()).unwrap();
+
+        assert_eq!(serde_json::to_value(decoded).unwrap(), value);
+    }
+
+    #[test]
+    fn input_custody_snapshot_preserves_json_wire_shape() {
+        let value = json!({
+            "source_kind": "external_custody",
+            "funding_vault_id": "018f13e1-0000-7000-8000-000000000001",
+            "failed_step_id": "018f13e1-0000-7000-8000-000000000002",
+            "failed_step_index": 1,
+            "failed_step_type": "across_bridge",
+            "amount_in": "1000000",
+            "min_amount_out": "990000",
+            "source_asset": {
+                "chain": "base",
+                "asset": "usdc"
+            },
+            "source_custody_vault_id": "018f13e1-0000-7000-8000-000000000003",
+            "source_custody_vault_role": "source_deposit",
+            "source_custody_vault_address": "0x0000000000000000000000000000000000000001",
+            "hyperliquid_custody_vault_id": null,
+            "hyperliquid_custody_vault_role": null,
+            "hyperliquid_custody_vault_address": null,
+            "recipient_custody_vault_id": "018f13e1-0000-7000-8000-000000000004",
+            "recipient_custody_vault_role": "destination_execution",
+            "recipient": "0x0000000000000000000000000000000000000002",
+            "revert_custody_vault_id": null,
+            "revert_custody_vault_role": null,
+            "revert_custody_vault_address": null,
+        });
+
+        let decoded: InputCustodySnapshot = serde_json::from_value(value.clone()).unwrap();
+
+        assert_eq!(serde_json::to_value(decoded).unwrap(), value);
     }
 }
