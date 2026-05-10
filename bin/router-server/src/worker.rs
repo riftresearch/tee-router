@@ -13,7 +13,9 @@ use router_core::{
     error::RouterCoreError,
     services::route_costs::{RouteCostRefreshSummary, RouteCostService},
 };
-use router_temporal::{OrderWorkflowClient, RouterTemporalError, TemporalConnection};
+use router_temporal::{
+    OrderWorkflowClient, RouterTemporalError, TemporalConnection, WorkflowOrderId,
+};
 use snafu::{FromString, Whatever};
 use sqlx_core::error::Error as SqlxError;
 use sqlx_postgres::{PgListener, PgNotification};
@@ -763,7 +765,10 @@ async fn mark_order_funded_and_start_workflow(
         Err(err) => return Err(err.to_string()),
     }
 
-    match order_workflow_client.start_order_workflow(order_id).await {
+    match order_workflow_client
+        .start_order_workflow(WorkflowOrderId::from(order_id))
+        .await
+    {
         Ok(_) => Ok(StartOrderWorkflowOutcome::Started),
         Err(RouterTemporalError::WorkflowAlreadyStarted { .. }) => {
             Ok(StartOrderWorkflowOutcome::AlreadyStarted)

@@ -27,6 +27,105 @@ pub const ORDER_WORKFLOW_ACKNOWLEDGE_UNRECOVERABLE_SIGNAL: &str = "acknowledge_u
 
 pub type BoxError = Box<dyn StdError + Send + Sync + 'static>;
 
+macro_rules! workflow_id_type {
+    ($name:ident) => {
+        #[derive(
+            Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+        )]
+        #[serde(transparent)]
+        pub struct $name(pub Uuid);
+
+        impl $name {
+            #[must_use]
+            pub fn as_uuid(&self) -> &Uuid {
+                &self.0
+            }
+
+            #[must_use]
+            pub fn inner(self) -> Uuid {
+                self.0
+            }
+        }
+
+        impl From<Uuid> for $name {
+            fn from(value: Uuid) -> Self {
+                Self(value)
+            }
+        }
+
+        impl From<$name> for Uuid {
+            fn from(value: $name) -> Self {
+                value.0
+            }
+        }
+
+        impl PartialEq<Uuid> for $name {
+            fn eq(&self, other: &Uuid) -> bool {
+                self.0 == *other
+            }
+        }
+
+        impl PartialEq<$name> for Uuid {
+            fn eq(&self, other: &$name) -> bool {
+                *self == other.0
+            }
+        }
+
+        impl Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fmt(f)
+            }
+        }
+    };
+}
+
+workflow_id_type!(WorkflowOrderId);
+workflow_id_type!(WorkflowAttemptId);
+workflow_id_type!(WorkflowStepId);
+workflow_id_type!(WorkflowVaultId);
+workflow_id_type!(WorkflowProviderOperationId);
+workflow_id_type!(WorkflowHintId);
+
+/// Compile-fail examples proving workflow IDs are not interchangeable.
+///
+/// ```compile_fail
+/// use router_temporal::{WorkflowAttemptId, WorkflowOrderId};
+/// let attempt_id = WorkflowAttemptId::from(uuid::Uuid::nil());
+/// let _: WorkflowOrderId = attempt_id;
+/// ```
+///
+/// ```compile_fail
+/// use router_temporal::{WorkflowAttemptId, WorkflowStepId};
+/// let step_id = WorkflowStepId::from(uuid::Uuid::nil());
+/// let _: WorkflowAttemptId = step_id;
+/// ```
+///
+/// ```compile_fail
+/// use router_temporal::{WorkflowStepId, WorkflowVaultId};
+/// let vault_id = WorkflowVaultId::from(uuid::Uuid::nil());
+/// let _: WorkflowStepId = vault_id;
+/// ```
+///
+/// ```compile_fail
+/// use router_temporal::{WorkflowProviderOperationId, WorkflowVaultId};
+/// let provider_operation_id = WorkflowProviderOperationId::from(uuid::Uuid::nil());
+/// let _: WorkflowVaultId = provider_operation_id;
+/// ```
+///
+/// ```compile_fail
+/// use router_temporal::{WorkflowHintId, WorkflowProviderOperationId};
+/// let hint_id = WorkflowHintId::from(uuid::Uuid::nil());
+/// let _: WorkflowProviderOperationId = hint_id;
+/// ```
+///
+/// ```compile_fail
+/// use router_temporal::{WorkflowHintId, WorkflowOrderId};
+/// let order_id = WorkflowOrderId::from(uuid::Uuid::nil());
+/// let _: WorkflowHintId = order_id;
+/// ```
+#[doc(hidden)]
+pub mod workflow_id_type_safety {}
+
 #[derive(Debug, Clone)]
 pub struct TemporalConnection {
     pub temporal_address: String,
@@ -35,14 +134,14 @@ pub struct TemporalConnection {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderWorkflowInput {
-    pub order_id: Uuid,
+    pub order_id: WorkflowOrderId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderOperationHintSignal {
-    pub order_id: Uuid,
-    pub hint_id: Uuid,
-    pub provider_operation_id: Option<Uuid>,
+    pub order_id: WorkflowOrderId,
+    pub hint_id: WorkflowHintId,
+    pub provider_operation_id: Option<WorkflowProviderOperationId>,
     pub provider: ProviderKind,
     pub hint_kind: ProviderHintKind,
     pub provider_ref: Option<String>,
@@ -166,7 +265,10 @@ impl OrderWorkflowClient {
         ))
     }
 
-    pub async fn start_order_workflow(&self, order_id: Uuid) -> RouterTemporalResult<String> {
+    pub async fn start_order_workflow(
+        &self,
+        order_id: WorkflowOrderId,
+    ) -> RouterTemporalResult<String> {
         let workflow_id = order_workflow_id(order_id);
         let input = payloads(&OrderWorkflowInput { order_id });
         let response = self
@@ -209,7 +311,7 @@ impl OrderWorkflowClient {
 
     pub async fn signal_provider_hint(
         &self,
-        order_id: Uuid,
+        order_id: WorkflowOrderId,
         signal: ProviderOperationHintSignal,
     ) -> RouterTemporalResult<()> {
         let workflow_id = order_workflow_id(order_id);
@@ -219,7 +321,7 @@ impl OrderWorkflowClient {
 
     pub async fn signal_manual_release(
         &self,
-        order_id: Uuid,
+        order_id: WorkflowOrderId,
         signal: ManualReleaseSignal,
     ) -> RouterTemporalResult<()> {
         self.signal_manual_release_to_workflow(order_workflow_id(order_id), signal)
@@ -228,8 +330,8 @@ impl OrderWorkflowClient {
 
     pub async fn signal_refund_manual_release(
         &self,
-        order_id: Uuid,
-        parent_attempt_id: Uuid,
+        order_id: WorkflowOrderId,
+        parent_attempt_id: WorkflowAttemptId,
         signal: ManualReleaseSignal,
     ) -> RouterTemporalResult<()> {
         self.signal_manual_release_to_workflow(
@@ -241,7 +343,7 @@ impl OrderWorkflowClient {
 
     pub async fn signal_manual_trigger_refund(
         &self,
-        order_id: Uuid,
+        order_id: WorkflowOrderId,
         signal: ManualTriggerRefundSignal,
     ) -> RouterTemporalResult<()> {
         self.signal_manual_trigger_refund_to_workflow(order_workflow_id(order_id), signal)
@@ -250,8 +352,8 @@ impl OrderWorkflowClient {
 
     pub async fn signal_refund_manual_trigger_refund(
         &self,
-        order_id: Uuid,
-        parent_attempt_id: Uuid,
+        order_id: WorkflowOrderId,
+        parent_attempt_id: WorkflowAttemptId,
         signal: ManualTriggerRefundSignal,
     ) -> RouterTemporalResult<()> {
         self.signal_manual_trigger_refund_to_workflow(
@@ -263,7 +365,7 @@ impl OrderWorkflowClient {
 
     pub async fn signal_acknowledge_unrecoverable(
         &self,
-        order_id: Uuid,
+        order_id: WorkflowOrderId,
         signal: AcknowledgeUnrecoverableSignal,
     ) -> RouterTemporalResult<()> {
         self.signal_acknowledge_unrecoverable_to_workflow(order_workflow_id(order_id), signal)
@@ -272,8 +374,8 @@ impl OrderWorkflowClient {
 
     pub async fn signal_refund_acknowledge_unrecoverable(
         &self,
-        order_id: Uuid,
-        parent_attempt_id: Uuid,
+        order_id: WorkflowOrderId,
+        parent_attempt_id: WorkflowAttemptId,
         signal: AcknowledgeUnrecoverableSignal,
     ) -> RouterTemporalResult<()> {
         self.signal_acknowledge_unrecoverable_to_workflow(
@@ -327,8 +429,8 @@ impl OrderWorkflowClient {
 
     pub async fn signal_refund_provider_hint(
         &self,
-        order_id: Uuid,
-        parent_attempt_id: Uuid,
+        order_id: WorkflowOrderId,
+        parent_attempt_id: WorkflowAttemptId,
         signal: ProviderOperationHintSignal,
     ) -> RouterTemporalResult<()> {
         let workflow_id = refund_workflow_id(order_id, parent_attempt_id);
@@ -407,22 +509,31 @@ pub async fn connect_client(
 }
 
 #[must_use]
-pub fn order_workflow_id(order_id: Uuid) -> String {
+pub fn order_workflow_id(order_id: WorkflowOrderId) -> String {
     format!("order:{order_id}:execution")
 }
 
 #[must_use]
-pub fn refund_workflow_id(order_id: Uuid, parent_attempt_id: Uuid) -> String {
+pub fn refund_workflow_id(
+    order_id: WorkflowOrderId,
+    parent_attempt_id: WorkflowAttemptId,
+) -> String {
     format!("order:{order_id}:refund:{parent_attempt_id}")
 }
 
 #[must_use]
-pub fn quote_refresh_workflow_id(order_id: Uuid, failed_step_id: Uuid) -> String {
+pub fn quote_refresh_workflow_id(
+    order_id: WorkflowOrderId,
+    failed_step_id: WorkflowStepId,
+) -> String {
     format!("order:{order_id}:quote-refresh:{failed_step_id}")
 }
 
 #[must_use]
-pub fn provider_hint_poll_workflow_id(order_id: Uuid, step_id: Uuid) -> String {
+pub fn provider_hint_poll_workflow_id(
+    order_id: WorkflowOrderId,
+    step_id: WorkflowStepId,
+) -> String {
     format!("order:{order_id}:provider-hint-poll:{step_id}")
 }
 

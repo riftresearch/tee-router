@@ -1771,11 +1771,13 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
             let client = connect_client(&connection)
                 .await
                 .expect("connect Temporal client");
-            let workflow_id = order_workflow_id(order_id);
+            let workflow_id = order_workflow_id(order_id.into());
             let handle = client
                 .start_workflow(
                     OrderWorkflow::run,
-                    OrderWorkflowInput { order_id },
+                    OrderWorkflowInput {
+                        order_id: order_id.into(),
+                    },
                     workflow_start_options(&task_queue, &workflow_id),
                 )
                 .await
@@ -1879,9 +1881,9 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
                         .signal(
                             OrderWorkflow::provider_operation_hint,
                             ProviderOperationHintSignal {
-                                order_id,
-                                hint_id: Uuid::now_v7(),
-                                provider_operation_id: Some(across_operation.id),
+                                order_id: order_id.into(),
+                                hint_id: Uuid::now_v7().into(),
+                                provider_operation_id: Some(across_operation.id.into()),
                                 provider: ProviderKind::Bridge,
                                 hint_kind: ProviderHintKind::AcrossFill,
                                 provider_ref: across_operation.provider_ref,
@@ -2667,9 +2669,9 @@ async fn signal_order_cctp_attestation(
         .signal(
             OrderWorkflow::provider_operation_hint,
             ProviderOperationHintSignal {
-                order_id,
-                hint_id: Uuid::now_v7(),
-                provider_operation_id: Some(cctp_operation.id),
+                order_id: order_id.into(),
+                hint_id: Uuid::now_v7().into(),
+                provider_operation_id: Some(cctp_operation.id.into()),
                 provider: ProviderKind::Bridge,
                 hint_kind: ProviderHintKind::CctpAttestation,
                 provider_ref: cctp_operation.provider_ref,
@@ -2737,9 +2739,9 @@ async fn signal_order_hyperliquid_bridge_deposit_observation(
         .signal(
             OrderWorkflow::provider_operation_hint,
             ProviderOperationHintSignal {
-                order_id,
-                hint_id: Uuid::now_v7(),
-                provider_operation_id: Some(operation.id),
+                order_id: order_id.into(),
+                hint_id: Uuid::now_v7().into(),
+                provider_operation_id: Some(operation.id.into()),
                 provider: ProviderKind::Bridge,
                 hint_kind: ProviderHintKind::ProviderObservation,
                 provider_ref: operation.provider_ref,
@@ -2792,9 +2794,9 @@ async fn signal_order_unit_withdrawal_observation(
         .signal(
             OrderWorkflow::provider_operation_hint,
             ProviderOperationHintSignal {
-                order_id,
-                hint_id: Uuid::now_v7(),
-                provider_operation_id: Some(unit_withdrawal_operation.id),
+                order_id: order_id.into(),
+                hint_id: Uuid::now_v7().into(),
+                provider_operation_id: Some(unit_withdrawal_operation.id.into()),
                 provider: ProviderKind::Unit,
                 hint_kind: ProviderHintKind::ProviderObservation,
                 provider_ref: unit_withdrawal_operation.provider_ref,
@@ -2933,15 +2935,17 @@ async fn signal_external_custody_refund_across_fill(
         fund_destination_execution_vault_from_across(db, devnet, order_id, &refund_operation).await;
     }
 
-    let refund_workflow = client
-        .get_workflow_handle::<RefundWorkflow>(&refund_workflow_id(order_id, parent_attempt.id));
+    let refund_workflow = client.get_workflow_handle::<RefundWorkflow>(&refund_workflow_id(
+        order_id.into(),
+        parent_attempt.id.into(),
+    ));
     let signal_result = refund_workflow
         .signal(
             RefundWorkflow::provider_operation_hint,
             ProviderOperationHintSignal {
-                order_id,
-                hint_id: Uuid::now_v7(),
-                provider_operation_id: Some(refund_operation.id),
+                order_id: order_id.into(),
+                hint_id: Uuid::now_v7().into(),
+                provider_operation_id: Some(refund_operation.id.into()),
                 provider: ProviderKind::Bridge,
                 hint_kind: ProviderHintKind::AcrossFill,
                 provider_ref: refund_operation.provider_ref,
@@ -3005,15 +3009,17 @@ async fn signal_external_custody_refund_cctp_attestation(
     )
     .await;
 
-    let refund_workflow = client
-        .get_workflow_handle::<RefundWorkflow>(&refund_workflow_id(order_id, parent_attempt.id));
+    let refund_workflow = client.get_workflow_handle::<RefundWorkflow>(&refund_workflow_id(
+        order_id.into(),
+        parent_attempt.id.into(),
+    ));
     let signal_result = refund_workflow
         .signal(
             RefundWorkflow::provider_operation_hint,
             ProviderOperationHintSignal {
-                order_id,
-                hint_id: Uuid::now_v7(),
-                provider_operation_id: Some(refund_operation.id),
+                order_id: order_id.into(),
+                hint_id: Uuid::now_v7().into(),
+                provider_operation_id: Some(refund_operation.id.into()),
                 provider: ProviderKind::Bridge,
                 hint_kind: ProviderHintKind::CctpAttestation,
                 provider_ref: refund_operation.provider_ref,
@@ -3074,15 +3080,17 @@ async fn signal_hyperliquid_spot_refund_unit_withdrawal(
         .await
         .expect("complete mock Unit withdrawal operation");
 
-    let refund_workflow = client
-        .get_workflow_handle::<RefundWorkflow>(&refund_workflow_id(order_id, parent_attempt.id));
+    let refund_workflow = client.get_workflow_handle::<RefundWorkflow>(&refund_workflow_id(
+        order_id.into(),
+        parent_attempt.id.into(),
+    ));
     let signal_result = refund_workflow
         .signal(
             RefundWorkflow::provider_operation_hint,
             ProviderOperationHintSignal {
-                order_id,
-                hint_id: Uuid::now_v7(),
-                provider_operation_id: Some(refund_operation.id),
+                order_id: order_id.into(),
+                hint_id: Uuid::now_v7().into(),
+                provider_operation_id: Some(refund_operation.id.into()),
                 provider: ProviderKind::Unit,
                 hint_kind: ProviderHintKind::ProviderObservation,
                 provider_ref: refund_operation.provider_ref,
