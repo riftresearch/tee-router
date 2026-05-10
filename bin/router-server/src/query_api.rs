@@ -11,7 +11,7 @@ use router_core::{
     error::RouterCoreError,
     models::{OrderExecutionAttemptKind, RouterOrderStatus},
 };
-use router_temporal::{order_workflow_id, refund_workflow_id};
+use router_temporal::{order_workflow_id, refund_workflow_id, WorkflowAttemptId, WorkflowOrderId};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -128,7 +128,7 @@ pub async fn get_manual_intervention_signal_target(
     match flow.order.status {
         RouterOrderStatus::ManualInterventionRequired => {
             Ok(ManualInterventionSignalTarget::OrderWorkflow {
-                workflow_id: order_workflow_id(flow.order.id),
+                workflow_id: order_workflow_id(WorkflowOrderId::from(flow.order.id)),
             })
         }
         RouterOrderStatus::RefundManualInterventionRequired => {
@@ -153,7 +153,7 @@ pub async fn get_manual_intervention_signal_target(
                 }
             })?;
             Ok(ManualInterventionSignalTarget::RefundWorkflow {
-                workflow_id: refund_workflow_id(flow.order.id, parent_attempt_id),
+                workflow_id: refund_workflow_id(flow.order.id.into(), parent_attempt_id.into()),
                 parent_attempt_id,
             })
         }
@@ -167,7 +167,7 @@ pub async fn get_manual_intervention_signal_target(
 }
 
 fn manual_intervention_workflow_ids(flow: &OrderFlow) -> (String, Option<String>) {
-    let root_workflow_id = order_workflow_id(flow.order.id);
+    let root_workflow_id = order_workflow_id(WorkflowOrderId::from(flow.order.id));
     let Some(attempt) = latest_attempt(flow) else {
         return (root_workflow_id, None);
     };
@@ -180,7 +180,10 @@ fn manual_intervention_workflow_ids(flow: &OrderFlow) -> (String, Option<String>
     };
 
     (
-        refund_workflow_id(flow.order.id, parent_attempt_id),
+        refund_workflow_id(
+            WorkflowOrderId::from(flow.order.id),
+            WorkflowAttemptId::from(parent_attempt_id),
+        ),
         Some(root_workflow_id),
     )
 }

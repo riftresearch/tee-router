@@ -186,15 +186,17 @@ impl OrderActivities {
             let step = deps
                 .db
                 .orders()
-                .get_execution_step(input.step_id)
+                .get_execution_step(input.step_id.inner())
                 .await
                 .map_err(activity_error_from_display)?;
-            if step.order_id != input.order_id
-                || step.execution_attempt_id != Some(input.attempt_id)
+            if step.order_id != input.order_id.inner()
+                || step.execution_attempt_id != Some(input.attempt_id.inner())
             {
                 return Err(activity_error(format!(
                     "step {} does not belong to order {} attempt {}",
-                    step.id, input.order_id, input.attempt_id
+                    step.id,
+                    input.order_id.inner(),
+                    input.attempt_id.inner()
                 )));
             }
             if step.status != OrderExecutionStepStatus::Running {
@@ -208,7 +210,7 @@ impl OrderActivities {
                 "kind": "provider_side_effect_about_to_fire",
                 "reason": "about_to_fire_provider_side_effect",
                 "step_id": step.id,
-                "attempt_id": input.attempt_id,
+                "attempt_id": input.attempt_id.inner(),
                 "recorded_at": Utc::now().to_rfc3339(),
                 "scar_tissue": "§6"
             });
@@ -216,9 +218,9 @@ impl OrderActivities {
                 .db
                 .orders()
                 .record_execution_step_provider_side_effect_checkpoint(
-                    input.order_id,
-                    input.attempt_id,
-                    input.step_id,
+                    input.order_id.inner(),
+                    input.attempt_id.inner(),
+                    input.step_id.inner(),
                     checkpoint,
                     Utc::now(),
                 )
@@ -250,7 +252,11 @@ impl OrderActivities {
             let completed = deps
                 .db
                 .orders()
-                .mark_execution_order_completed(input.order_id, input.attempt_id, Utc::now())
+                .mark_execution_order_completed(
+                    input.order_id.inner(),
+                    input.attempt_id.inner(),
+                    Utc::now(),
+                )
                 .await
                 .map_err(activity_error_from_display)?;
             tracing::info!(
@@ -260,8 +266,8 @@ impl OrderActivities {
                 "order.completed"
             );
             Ok(OrderCompleted {
-                order_id: completed.order.id,
-                attempt_id: completed.attempt.id,
+                order_id: completed.order.id.into(),
+                attempt_id: completed.attempt.id.into(),
             })
         })
         .await
@@ -279,7 +285,7 @@ impl OrderActivities {
             let order = deps
                 .db
                 .orders()
-                .get(input.order_id)
+                .get(input.order_id.inner())
                 .await
                 .map_err(activity_error_from_display)?;
             let funding_vault_id = order.funding_vault_id.ok_or_else(|| {
@@ -345,7 +351,7 @@ impl OrderActivities {
                 "order.execution_plan_started"
             );
             Ok(OrderExecutionState {
-                order_id: order.id,
+                order_id: order.id.into(),
                 phase: OrderWorkflowPhase::WaitingForFunding,
                 active_attempt_id: None,
                 active_step_id: None,
@@ -377,7 +383,7 @@ impl OrderActivities {
             let attempt = deps
                 .db
                 .orders()
-                .get_execution_attempts(input.order_id)
+                .get_execution_attempts(input.order_id.inner())
                 .await
                 .map_err(activity_error_from_display)?
                 .into_iter()
@@ -405,8 +411,8 @@ impl OrderActivities {
                     )
                 });
             Ok(ManualInterventionWorkflowContext {
-                attempt_id: Some(attempt.id),
-                step_id: step.map(|step| step.id),
+                attempt_id: Some(attempt.id.into()),
+                step_id: step.map(|step| step.id.into()),
             })
         })
         .await
@@ -423,12 +429,13 @@ impl OrderActivities {
             let deps = self.deps()?;
             let mut plan = input.plan;
             plan.steps =
-                hydrate_destination_execution_steps(&deps, input.order_id, plan.steps).await?;
+                hydrate_destination_execution_steps(&deps, input.order_id.inner(), plan.steps)
+                    .await?;
             let record = deps
                 .db
                 .orders()
                 .materialize_primary_execution_attempt(
-                    input.order_id,
+                    input.order_id.inner(),
                     ExecutionAttemptPlan {
                         legs: plan.legs,
                         steps: plan.steps,
@@ -451,12 +458,12 @@ impl OrderActivities {
                 "order.executing"
             );
             Ok(MaterializedExecutionAttempt {
-                attempt_id: record.attempt.id,
+                attempt_id: record.attempt.id.into(),
                 steps: record
                     .steps
                     .into_iter()
                     .map(|step| WorkflowExecutionStep {
-                        step_id: step.id,
+                        step_id: step.id.into(),
                         step_index: step.step_index,
                     })
                     .collect(),
@@ -478,9 +485,9 @@ impl OrderActivities {
                 .db
                 .orders()
                 .create_retry_execution_attempt_from_failed_step(
-                    input.order_id,
-                    input.failed_attempt_id,
-                    input.failed_step_id,
+                    input.order_id.inner(),
+                    input.failed_attempt_id.inner(),
+                    input.failed_step_id.inner(),
                     Utc::now(),
                 )
                 .await
@@ -488,18 +495,18 @@ impl OrderActivities {
             tracing::info!(
                 order_id = %record.order.id,
                 attempt_id = %record.attempt.id,
-                failed_attempt_id = %input.failed_attempt_id,
-                failed_step_id = %input.failed_step_id,
+                failed_attempt_id = %input.failed_attempt_id.inner(),
+                failed_step_id = %input.failed_step_id.inner(),
                 event_name = "order.execution_retry_materialized",
                 "order.execution_retry_materialized"
             );
             Ok(MaterializedExecutionAttempt {
-                attempt_id: record.attempt.id,
+                attempt_id: record.attempt.id.into(),
                 steps: record
                     .steps
                     .into_iter()
                     .map(|step| WorkflowExecutionStep {
-                        step_id: step.id,
+                        step_id: step.id.into(),
                         step_index: step.step_index,
                     })
                     .collect(),
@@ -521,16 +528,16 @@ impl OrderActivities {
                 .db
                 .orders()
                 .persist_execution_step_ready_to_fire(
-                    input.order_id,
-                    input.attempt_id,
-                    input.step_id,
+                    input.order_id.inner(),
+                    input.attempt_id.inner(),
+                    input.step_id.inner(),
                     Utc::now(),
                 )
                 .await
                 .map_err(activity_error_from_display)?;
             tracing::info!(
-                order_id = %input.order_id,
-                attempt_id = %input.attempt_id,
+                order_id = %input.order_id.inner(),
+                attempt_id = %input.attempt_id.inner(),
                 step_id = %step.id,
                 step_index = step.step_index,
                 event_name = "execution_step.started",
@@ -556,17 +563,17 @@ impl OrderActivities {
                 .db
                 .orders()
                 .persist_execution_step_failed(
-                    input.order_id,
-                    input.attempt_id,
-                    input.step_id,
+                    input.order_id.inner(),
+                    input.attempt_id.inner(),
+                    input.step_id.inner(),
                     json!({ "error": input.failure_reason }),
                     Utc::now(),
                 )
                 .await
                 .map_err(activity_error_from_display)?;
             tracing::info!(
-                order_id = %input.order_id,
-                attempt_id = %input.attempt_id,
+                order_id = %input.order_id.inner(),
+                attempt_id = %input.attempt_id.inner(),
                 step_id = %step.id,
                 event_name = "execution_step.failed",
                 "execution_step.failed"
@@ -590,7 +597,7 @@ impl OrderActivities {
             let step = deps
                 .db
                 .orders()
-                .get_execution_step(input.execution.step_id)
+                .get_execution_step(input.execution.step_id.inner())
                 .await
                 .map_err(activity_error_from_display)?;
             let (operation, mut addresses) = provider_state_records(
@@ -616,7 +623,7 @@ impl OrderActivities {
                         .map_err(activity_error_from_display)?;
                 }
                 tracing::info!(
-                    order_id = %input.execution.order_id,
+                    order_id = %input.execution.order_id.inner(),
                     provider_operation_id = %provider_operation_id,
                     event_name = "provider_operation.persisted",
                     "provider_operation.persisted"
@@ -641,7 +648,7 @@ impl OrderActivities {
             let step = deps
                 .db
                 .orders()
-                .get_execution_step(input.execution.step_id)
+                .get_execution_step(input.execution.step_id.inner())
                 .await
                 .map_err(activity_error_from_display)?;
             let (operation, _) = provider_state_records(
@@ -697,7 +704,7 @@ impl OrderActivities {
                 .db
                 .orders()
                 .persist_execution_step_completion(PersistStepCompletionRecord {
-                    step_id: input.execution.step_id,
+                    step_id: input.execution.step_id.inner(),
                     operation: None,
                     addresses: Vec::new(),
                     response: input.execution.response,
@@ -708,8 +715,8 @@ impl OrderActivities {
                 .await
                 .map_err(activity_error_from_display)?;
             tracing::info!(
-                order_id = %input.execution.order_id,
-                attempt_id = %input.execution.attempt_id,
+                order_id = %input.execution.order_id.inner(),
+                attempt_id = %input.execution.attempt_id.inner(),
                 step_id = %record.step.id,
                 event_name = "execution_step.completed",
                 "execution_step.completed"
@@ -733,39 +740,39 @@ impl OrderActivities {
         let attempt = deps
             .db
             .orders()
-            .get_execution_attempt(input.attempt_id)
+            .get_execution_attempt(input.attempt_id.inner())
             .await
             .map_err(activity_error_from_display)?;
-        if attempt.order_id != input.order_id {
+        if attempt.order_id != input.order_id.inner() {
             return Err(activity_error(format!(
                 "attempt {} does not belong to order {}",
-                attempt.id, input.order_id
+                attempt.id, input.order_id.inner()
             )));
         }
         let order_quote = deps
             .db
             .orders()
-            .get_router_order_quote(input.order_id)
+            .get_router_order_quote(input.order_id.inner())
             .await
             .map_err(activity_error_from_display)?;
         let failed_step = deps
             .db
             .orders()
-            .get_execution_step(input.failed_step_id)
+            .get_execution_step(input.failed_step_id.inner())
             .await
             .map_err(activity_error_from_display)?;
-        if failed_step.order_id != input.order_id
-            || failed_step.execution_attempt_id != Some(input.attempt_id)
+        if failed_step.order_id != input.order_id.inner()
+            || failed_step.execution_attempt_id != Some(input.attempt_id.inner())
         {
             return Err(activity_error(format!(
                 "step {} does not belong to order {} attempt {}",
-                failed_step.id, input.order_id, input.attempt_id
+                failed_step.id, input.order_id.inner(), input.attempt_id.inner()
             )));
         }
         let refreshed_attempt_count = deps
             .db
             .orders()
-            .get_execution_attempts(input.order_id)
+            .get_execution_attempts(input.order_id.inner())
             .await
             .map_err(activity_error_from_display)?
             .into_iter()
@@ -781,7 +788,7 @@ impl OrderActivities {
             let legs = deps
                 .db
                 .orders()
-                .get_execution_legs_for_attempt(input.attempt_id)
+                .get_execution_legs_for_attempt(input.attempt_id.inner())
                 .await
                 .map_err(activity_error_from_display)?;
             failed_step
@@ -807,9 +814,9 @@ impl OrderActivities {
             StepFailureDecision::StartRefund
         };
         tracing::info!(
-            order_id = %input.order_id,
-            attempt_id = %input.attempt_id,
-            failed_step_id = %input.failed_step_id,
+            order_id = %input.order_id.inner(),
+            attempt_id = %input.attempt_id.inner(),
+            failed_step_id = %input.failed_step_id.inner(),
             attempt_index = attempt.attempt_index,
             refreshed_attempt_count,
             decision = ?decision,
@@ -835,13 +842,14 @@ impl OrderActivities {
             let attempt = deps
                 .db
                 .orders()
-                .get_execution_attempt(input.attempt_id)
+                .get_execution_attempt(input.attempt_id.inner())
                 .await
                 .map_err(activity_error_from_display)?;
-            if attempt.order_id != input.order_id {
+            if attempt.order_id != input.order_id.inner() {
                 return Err(activity_error(format!(
                     "attempt {} does not belong to order {}",
-                    attempt.id, input.order_id
+                    attempt.id,
+                    input.order_id.inner()
                 )));
             }
             if attempt.status != OrderExecutionAttemptStatus::Active
@@ -855,7 +863,7 @@ impl OrderActivities {
             let order_quote = deps
                 .db
                 .orders()
-                .get_router_order_quote(input.order_id)
+                .get_router_order_quote(input.order_id.inner())
                 .await
                 .map_err(activity_error_from_display)?;
             if !matches!(order_quote, RouterOrderQuote::MarketOrder(_)) {
@@ -867,7 +875,7 @@ impl OrderActivities {
             let refreshed_attempt_count = deps
                 .db
                 .orders()
-                .get_execution_attempts(input.order_id)
+                .get_execution_attempts(input.order_id.inner())
                 .await
                 .map_err(activity_error_from_display)?
                 .into_iter()
@@ -885,21 +893,23 @@ impl OrderActivities {
             let step = deps
                 .db
                 .orders()
-                .get_execution_step(input.step_id)
+                .get_execution_step(input.step_id.inner())
                 .await
                 .map_err(activity_error_from_display)?;
-            if step.order_id != input.order_id
-                || step.execution_attempt_id != Some(input.attempt_id)
+            if step.order_id != input.order_id.inner()
+                || step.execution_attempt_id != Some(input.attempt_id.inner())
             {
                 return Err(activity_error(format!(
                     "step {} does not belong to order {} attempt {}",
-                    step.id, input.order_id, input.attempt_id
+                    step.id,
+                    input.order_id.inner(),
+                    input.attempt_id.inner()
                 )));
             }
             let has_provider_operation = deps
                 .db
                 .orders()
-                .get_provider_operations(input.order_id)
+                .get_provider_operations(input.order_id.inner())
                 .await
                 .map_err(activity_error_from_display)?
                 .into_iter()
@@ -926,7 +936,7 @@ impl OrderActivities {
             let legs = deps
                 .db
                 .orders()
-                .get_execution_legs_for_attempt(input.attempt_id)
+                .get_execution_legs_for_attempt(input.attempt_id.inner())
                 .await
                 .map_err(activity_error_from_display)?;
             let Some(leg) = legs.into_iter().find(|leg| leg.id == leg_id) else {
@@ -955,8 +965,8 @@ impl OrderActivities {
                 "refreshed_attempt_count": refreshed_attempt_count,
             });
             tracing::info!(
-                order_id = %input.order_id,
-                attempt_id = %input.attempt_id,
+                order_id = %input.order_id.inner(),
+                attempt_id = %input.attempt_id.inner(),
                 step_id = %step.id,
                 execution_leg_id = %leg.id,
                 provider_quote_expires_at = %provider_quote_expires_at,
@@ -998,27 +1008,29 @@ impl OrderActivities {
             let order = deps
                 .db
                 .orders()
-                .get(input.order_id)
+                .get(input.order_id.inner())
                 .await
                 .map_err(activity_error_from_display)?;
             let failed_step = deps
                 .db
                 .orders()
-                .get_execution_step(input.failed_step_id)
+                .get_execution_step(input.failed_step_id.inner())
                 .await
                 .map_err(activity_error_from_display)?;
-            if failed_step.order_id != input.order_id
-                || failed_step.execution_attempt_id != Some(input.attempt_id)
+            if failed_step.order_id != input.order_id.inner()
+                || failed_step.execution_attempt_id != Some(input.attempt_id.inner())
             {
                 return Err(activity_error(format!(
                     "step {} does not belong to order {} attempt {}",
-                    failed_step.id, input.order_id, input.attempt_id
+                    failed_step.id,
+                    input.order_id.inner(),
+                    input.attempt_id.inner()
                 )));
             }
             let trigger_provider_operation_id = deps
                 .db
                 .orders()
-                .get_provider_operations(input.order_id)
+                .get_provider_operations(input.order_id.inner())
                 .await
                 .map_err(activity_error_from_display)?
                 .into_iter()
@@ -1037,7 +1049,7 @@ impl OrderActivities {
                 .db
                 .orders()
                 .mark_execution_attempt_failed(
-                    input.attempt_id,
+                    input.attempt_id.inner(),
                     Some(failed_step.id),
                     trigger_provider_operation_id,
                     failure_reason,
@@ -1051,13 +1063,13 @@ impl OrderActivities {
                     let attempt = deps
                         .db
                         .orders()
-                        .get_execution_attempt(input.attempt_id)
+                        .get_execution_attempt(input.attempt_id.inner())
                         .await
                         .map_err(activity_error_from_display)?;
                     if attempt.status != OrderExecutionAttemptStatus::Failed {
                         return Err(activity_error(format!(
                             "attempt {} was not active or failed while writing failure snapshot",
-                            input.attempt_id
+                            input.attempt_id.inner()
                         )));
                     }
                     attempt
@@ -1065,9 +1077,9 @@ impl OrderActivities {
                 Err(source) => return Err(activity_error_from_display(source)),
             };
             Ok(FailedAttemptSnapshotWritten {
-                attempt_id: attempt.id,
+                attempt_id: attempt.id.into(),
                 attempt_index: attempt.attempt_index,
-                failed_step_id: failed_step.id,
+                failed_step_id: failed_step.id.into(),
             })
         })
         .await
@@ -1087,7 +1099,7 @@ impl OrderActivities {
                     let order = deps
                         .db
                         .orders()
-                        .mark_order_refund_required(input.order_id, Utc::now())
+                        .mark_order_refund_required(input.order_id.inner(), Utc::now())
                         .await
                         .map_err(activity_error_from_display)?;
                     tracing::info!(
@@ -1096,18 +1108,18 @@ impl OrderActivities {
                         "order.refund_required"
                     );
                     Ok(FinalizedOrder {
-                        order_id: order.id,
+                        order_id: order.id.into(),
                         terminal_status: OrderTerminalStatus::RefundRequired,
                     })
                 }
                 OrderTerminalStatus::Refunded => {
-                    let attempt_id = input.attempt_id.ok_or_else(|| {
+                    let attempt_id = input.attempt_id.map(|id| id.inner()).ok_or_else(|| {
                         activity_error("finalize refunded order requires a refund attempt id")
                     })?;
                     let completed = deps
                         .db
                         .orders()
-                        .mark_order_refunded(input.order_id, attempt_id, Utc::now())
+                        .mark_order_refunded(input.order_id.inner(), attempt_id, Utc::now())
                         .await
                         .map_err(activity_error_from_display)?;
                     tracing::info!(
@@ -1117,7 +1129,7 @@ impl OrderActivities {
                         "order.refunded"
                     );
                     Ok(FinalizedOrder {
-                        order_id: completed.order.id,
+                        order_id: completed.order.id.into(),
                         terminal_status: OrderTerminalStatus::Refunded,
                     })
                 }
@@ -1125,7 +1137,10 @@ impl OrderActivities {
                     let order = deps
                         .db
                         .orders()
-                        .mark_order_refund_manual_intervention_required(input.order_id, Utc::now())
+                        .mark_order_refund_manual_intervention_required(
+                            input.order_id.inner(),
+                            Utc::now(),
+                        )
                         .await
                         .map_err(activity_error_from_display)?;
                     tracing::info!(
@@ -1134,22 +1149,22 @@ impl OrderActivities {
                         "order.refund_manual_intervention_required"
                     );
                     Ok(FinalizedOrder {
-                        order_id: order.id,
+                        order_id: order.id.into(),
                         terminal_status: OrderTerminalStatus::RefundManualInterventionRequired,
                     })
                 }
                 OrderTerminalStatus::ManualInterventionRequired => {
-                    let attempt_id = input.attempt_id.ok_or_else(|| {
+                    let attempt_id = input.attempt_id.map(|id| id.inner()).ok_or_else(|| {
                         activity_error(
                             "finalize manual intervention requires an execution attempt id",
                         )
                     })?;
-                    let step_id = input.step_id.ok_or_else(|| {
+                    let step_id = input.step_id.map(|id| id.inner()).ok_or_else(|| {
                         activity_error("finalize manual intervention requires an execution step id")
                     })?;
                     let order = finalize_execution_manual_intervention(
                         &deps,
-                        input.order_id,
+                        input.order_id.inner(),
                         attempt_id,
                         step_id,
                         input.reason.unwrap_or_else(|| {
@@ -1168,7 +1183,7 @@ impl OrderActivities {
                         "order.execution_manual_intervention_required"
                     );
                     Ok(FinalizedOrder {
-                        order_id: order.id,
+                        order_id: order.id.into(),
                         terminal_status: OrderTerminalStatus::ManualInterventionRequired,
                     })
                 }
@@ -1200,9 +1215,9 @@ impl OrderActivities {
                 .db
                 .orders()
                 .prepare_manual_intervention_retry(
-                    input.order_id,
-                    input.attempt_id,
-                    input.step_id,
+                    input.order_id.inner(),
+                    input.attempt_id.inner(),
+                    input.step_id.inner(),
                     resolution,
                     Utc::now(),
                 )
@@ -1210,13 +1225,13 @@ impl OrderActivities {
                 .map_err(activity_error_from_display)?;
             tracing::info!(
                 order_id = %order.id,
-                attempt_id = %input.attempt_id,
-                step_id = %input.step_id,
+                attempt_id = %input.attempt_id.inner(),
+                step_id = %input.step_id.inner(),
                 event_name = "order.manual_intervention_released",
                 "order.manual_intervention_released"
             );
             Ok(FinalizedOrder {
-                order_id: order.id,
+                order_id: order.id.into(),
                 terminal_status: OrderTerminalStatus::ManualInterventionRequired,
             })
         })
@@ -1244,9 +1259,9 @@ impl OrderActivities {
                 .db
                 .orders()
                 .prepare_manual_intervention_refund(
-                    input.order_id,
-                    input.attempt_id,
-                    input.step_id,
+                    input.order_id.inner(),
+                    input.attempt_id.inner(),
+                    input.step_id.inner(),
                     resolution,
                     Utc::now(),
                 )
@@ -1254,13 +1269,13 @@ impl OrderActivities {
                 .map_err(activity_error_from_display)?;
             tracing::info!(
                 order_id = %order.id,
-                attempt_id = %input.attempt_id,
-                step_id = %input.step_id,
+                attempt_id = %input.attempt_id.inner(),
+                step_id = %input.step_id.inner(),
                 event_name = "order.manual_intervention_refund_triggered",
                 "order.manual_intervention_refund_triggered"
             );
             Ok(FinalizedOrder {
-                order_id: order.id,
+                order_id: order.id.into(),
                 terminal_status: OrderTerminalStatus::RefundRequired,
             })
         })
@@ -1290,9 +1305,9 @@ impl OrderActivities {
                 .db
                 .orders()
                 .release_refund_manual_intervention(
-                    input.order_id,
-                    input.refund_attempt_id,
-                    input.step_id,
+                    input.order_id.inner(),
+                    input.refund_attempt_id.map(|id| id.inner()),
+                    input.step_id.map(|id| id.inner()),
                     resolution,
                     Utc::now(),
                 )
@@ -1306,7 +1321,7 @@ impl OrderActivities {
                 "order.refund_manual_intervention_released"
             );
             Ok(FinalizedOrder {
-                order_id: order.id,
+                order_id: order.id.into(),
                 terminal_status: OrderTerminalStatus::RefundManualInterventionRequired,
             })
         })
@@ -1342,9 +1357,9 @@ impl OrderActivities {
                 .db
                 .orders()
                 .acknowledge_manual_intervention_terminal(
-                    input.order_id,
-                    input.attempt_id,
-                    input.step_id,
+                    input.order_id.inner(),
+                    input.attempt_id.map(|id| id.inner()),
+                    input.step_id.map(|id| id.inner()),
                     input.refund_manual,
                     resolution,
                     Utc::now(),
@@ -1359,7 +1374,7 @@ impl OrderActivities {
                 "order.manual_intervention_terminal_acknowledged"
             );
             Ok(FinalizedOrder {
-                order_id: order.id,
+                order_id: order.id.into(),
                 terminal_status,
             })
         })
@@ -1374,20 +1389,24 @@ async fn classify_stale_running_step_for_deps(
     let step = deps
         .db
         .orders()
-        .get_execution_step(input.step_id)
+        .get_execution_step(input.step_id.inner())
         .await
         .map_err(activity_error_from_display)?;
-    if step.order_id != input.order_id || step.execution_attempt_id != Some(input.attempt_id) {
+    if step.order_id != input.order_id.inner()
+        || step.execution_attempt_id != Some(input.attempt_id.inner())
+    {
         return Err(activity_error(format!(
             "step {} does not belong to order {} attempt {}",
-            step.id, input.order_id, input.attempt_id
+            step.id,
+            input.order_id.inner(),
+            input.attempt_id.inner()
         )));
     }
 
     let step_operations: Vec<_> = deps
         .db
         .orders()
-        .get_provider_operations(input.order_id)
+        .get_provider_operations(input.order_id.inner())
         .await
         .map_err(activity_error_from_display)?
         .into_iter()
@@ -1439,24 +1458,24 @@ async fn classify_stale_running_step_for_deps(
 
     if let Some(object) = reason.as_object_mut() {
         object.insert("step_id".to_string(), json!(step.id));
-        object.insert("attempt_id".to_string(), json!(input.attempt_id));
+        object.insert("attempt_id".to_string(), json!(input.attempt_id.inner()));
     }
 
     let recorded = deps
         .db
         .orders()
         .record_stale_running_step_classification(
-            input.order_id,
-            input.attempt_id,
-            input.step_id,
+            input.order_id.inner(),
+            input.attempt_id.inner(),
+            input.step_id.inner(),
             reason.clone(),
             Utc::now(),
         )
         .await
         .map_err(activity_error_from_display)?;
     tracing::info!(
-        order_id = %input.order_id,
-        attempt_id = %input.attempt_id,
+        order_id = %input.order_id.inner(),
+        attempt_id = %input.attempt_id.inner(),
         step_id = %recorded.id,
         decision = ?decision,
         event_name = "execution_step.stale_running_classified",
@@ -1581,12 +1600,12 @@ async fn settle_waiting_provider_step(
     let operations = deps
         .db
         .orders()
-        .get_provider_operations(execution.order_id)
+        .get_provider_operations(execution.order_id.inner())
         .await
         .map_err(activity_error_from_display)?;
     let operation = operations
         .iter()
-        .filter(|operation| operation.execution_step_id == Some(execution.step_id))
+        .filter(|operation| operation.execution_step_id == Some(execution.step_id.inner()))
         .max_by_key(|operation| (operation.updated_at, operation.created_at, operation.id));
 
     match operation.map(|operation| operation.status) {
@@ -1594,9 +1613,9 @@ async fn settle_waiting_provider_step(
             let operation = operation.expect("checked completed operation above");
             complete_observed_provider_step(deps, execution, operation).await?;
             tracing::info!(
-                order_id = %execution.order_id,
-                attempt_id = %execution.attempt_id,
-                step_id = %execution.step_id,
+                order_id = %execution.order_id.inner(),
+                attempt_id = %execution.attempt_id.inner(),
+                step_id = %execution.step_id.inner(),
                 provider_operation_id = %operation.id,
                 event_name = "execution_step.completed",
                 "execution_step.completed"
@@ -1608,7 +1627,7 @@ async fn settle_waiting_provider_step(
                 .db
                 .orders()
                 .fail_observed_execution_step(
-                    execution.step_id,
+                    execution.step_id.inner(),
                     json!({
                         "kind": "provider_status_update",
                         "provider": &operation.provider,
@@ -1626,13 +1645,13 @@ async fn settle_waiting_provider_step(
                     let current = deps
                         .db
                         .orders()
-                        .get_execution_step(execution.step_id)
+                        .get_execution_step(execution.step_id.inner())
                         .await
                         .map_err(activity_error_from_display)?;
                     if current.status != OrderExecutionStepStatus::Failed {
                         return Err(activity_error(format!(
                             "failed provider step {} is in unexpected status {}",
-                            execution.step_id,
+                            execution.step_id.inner(),
                             current.status.to_db_string()
                         )));
                     }
@@ -1650,7 +1669,7 @@ async fn settle_waiting_provider_step(
                 .db
                 .orders()
                 .wait_execution_step(
-                    execution.step_id,
+                    execution.step_id.inner(),
                     execution.response.clone(),
                     execution.tx_hash.clone(),
                     Utc::now(),
@@ -1659,9 +1678,9 @@ async fn settle_waiting_provider_step(
             match waiting {
                 Ok(_) => {
                     tracing::info!(
-                        order_id = %execution.order_id,
-                        attempt_id = %execution.attempt_id,
-                        step_id = %execution.step_id,
+                        order_id = %execution.order_id.inner(),
+                        attempt_id = %execution.attempt_id.inner(),
+                        step_id = %execution.step_id.inner(),
                         event_name = "execution_step.waiting_external",
                         "execution_step.waiting_external"
                     );
@@ -1670,7 +1689,7 @@ async fn settle_waiting_provider_step(
                     let current = deps
                         .db
                         .orders()
-                        .get_execution_step(execution.step_id)
+                        .get_execution_step(execution.step_id.inner())
                         .await
                         .map_err(activity_error_from_display)?;
                     if !matches!(
@@ -1679,7 +1698,7 @@ async fn settle_waiting_provider_step(
                     ) {
                         return Err(activity_error(format!(
                             "waiting provider step {} is in unexpected status {}",
-                            execution.step_id,
+                            execution.step_id.inner(),
                             current.status.to_db_string()
                         )));
                     }
@@ -1701,7 +1720,7 @@ async fn complete_observed_provider_step(
         .db
         .orders()
         .complete_observed_execution_step(
-            execution.step_id,
+            execution.step_id.inner(),
             provider_operation_step_response(operation),
             provider_operation_tx_hash(operation),
             json!({}),
@@ -1714,7 +1733,7 @@ async fn complete_observed_provider_step(
             let current = deps
                 .db
                 .orders()
-                .get_execution_step(execution.step_id)
+                .get_execution_step(execution.step_id.inner())
                 .await
                 .map_err(activity_error_from_display)?;
             if current.status == OrderExecutionStepStatus::Completed {
@@ -1723,7 +1742,7 @@ async fn complete_observed_provider_step(
                 Err(activity_error(format!(
                     "completed provider operation {} could not settle step {} in status {}",
                     operation.id,
-                    execution.step_id,
+                    execution.step_id.inner(),
                     current.status.to_db_string()
                 )))
             }
@@ -3644,9 +3663,9 @@ fn stale_quote_refresh_untenable(
 ) -> RefreshedQuoteAttemptShape {
     RefreshedQuoteAttemptShape {
         outcome: RefreshedQuoteAttemptOutcome::Untenable {
-            order_id,
-            stale_attempt_id,
-            failed_step_id,
+            order_id: order_id.into(),
+            stale_attempt_id: stale_attempt_id.into(),
+            failed_step_id: failed_step_id.into(),
             reason: StaleQuoteRefreshUntenableReason::StaleProviderQuoteRefreshUntenable {
                 message: message.to_string(),
             },
@@ -3713,19 +3732,19 @@ impl RefundActivities {
         let failed_attempt = deps
             .db
             .orders()
-            .get_execution_attempt(input.failed_attempt_id)
+            .get_execution_attempt(input.failed_attempt_id.inner())
             .await
             .map_err(activity_error_from_display)?;
-        if failed_attempt.order_id != input.order_id {
+        if failed_attempt.order_id != input.order_id.inner() {
             return Err(activity_error(format!(
                 "refund failed attempt {} does not belong to order {}",
-                failed_attempt.id, input.order_id
+                failed_attempt.id, input.order_id.inner()
             )));
         }
         let order = deps
             .db
             .orders()
-            .get(input.order_id)
+            .get(input.order_id.inner())
             .await
             .map_err(activity_error_from_display)?;
 
@@ -3746,7 +3765,7 @@ impl RefundActivities {
                     positions.push(SingleRefundPosition {
                         position_kind: RecoverablePositionKind::FundingVault,
                         owning_step_id: None,
-                        funding_vault_id: Some(funding_vault_id),
+                        funding_vault_id: Some(funding_vault_id.into()),
                         custody_vault_id: None,
                         asset: vault.deposit_asset,
                         amount,
@@ -3780,7 +3799,7 @@ impl RefundActivities {
                             position_kind: RecoverablePositionKind::ExternalCustody,
                             owning_step_id: None,
                             funding_vault_id: None,
-                            custody_vault_id: Some(vault.id),
+                            custody_vault_id: Some(vault.id.into()),
                             asset: DepositAsset {
                                 chain: vault.chain,
                                 asset: asset_id,
@@ -3825,7 +3844,7 @@ impl RefundActivities {
                             position_kind: RecoverablePositionKind::HyperliquidSpot,
                             owning_step_id: None,
                             funding_vault_id: None,
-                            custody_vault_id: Some(vault.id),
+                            custody_vault_id: Some(vault.id.into()),
                             asset,
                             amount,
                             hyperliquid_coin: Some(balance.coin),
@@ -3867,7 +3886,7 @@ impl RefundActivities {
             let order = deps
                 .db
                 .orders()
-                .get(input.order_id)
+                .get(input.order_id.inner())
                 .await
                 .map_err(activity_error_from_display)?;
             let Some(funding_vault_id) = order.funding_vault_id else {
@@ -3898,15 +3917,15 @@ impl RefundActivities {
                 .db
                 .orders()
                 .create_refund_attempt_from_funding_vault(
-                    input.order_id,
-                    input.failed_attempt_id,
+                    input.order_id.inner(),
+                    input.failed_attempt_id.inner(),
                     FundingVaultRefundAttemptPlan {
                         funding_vault_id,
                         amount,
                         failure_reason: json!({
                             "reason": "primary_execution_attempts_exhausted",
                             "trace": "refund_workflow",
-                            "failed_attempt_id": input.failed_attempt_id,
+                            "failed_attempt_id": input.failed_attempt_id.inner(),
                         }),
                         input_custody_snapshot: json!({
                             "schema_version": 1,
@@ -3928,12 +3947,12 @@ impl RefundActivities {
             telemetry::record_refund_attempt_materialized("funding_vault", "direct_internal");
             Ok(RefundPlanShape {
                 outcome: RefundPlanOutcome::Materialized {
-                    refund_attempt_id: record.attempt.id,
+                    refund_attempt_id: record.attempt.id.into(),
                     steps: record
                         .steps
                         .into_iter()
                         .map(|step| WorkflowExecutionStep {
-                            step_id: step.id,
+                            step_id: step.id.into(),
                             step_index: step.step_index,
                         })
                         .collect(),
@@ -3997,13 +4016,18 @@ async fn materialize_external_custody_refund_plan(
     let order = deps
         .db
         .orders()
-        .get(input.order_id)
+        .get(input.order_id.inner())
         .await
         .map_err(activity_error_from_display)?;
     let custody_vault_id = input.position.custody_vault_id.ok_or_else(|| {
         activity_error("external-custody refund position is missing custody_vault_id")
     })?;
-    let vault = match deps.db.orders().get_custody_vault(custody_vault_id).await {
+    let vault = match deps
+        .db
+        .orders()
+        .get_custody_vault(custody_vault_id.inner())
+        .await
+    {
         Ok(vault) => vault,
         Err(RouterCoreError::NotFound) => {
             return Ok(refund_plan_untenable(
@@ -4012,10 +4036,11 @@ async fn materialize_external_custody_refund_plan(
         }
         Err(source) => return Err(activity_error_from_display(source)),
     };
-    if vault.order_id != Some(input.order_id) {
+    if vault.order_id != Some(input.order_id.inner()) {
         return Err(activity_error(format!(
             "external-custody vault {} does not belong to order {}",
-            vault.id, input.order_id
+            vault.id,
+            input.order_id.inner()
         )));
     }
     let Some(asset_id) = vault.asset.clone() else {
@@ -4056,13 +4081,13 @@ async fn materialize_external_custody_refund_plan(
         .and_then(|leg| leg.transition_decl_id.as_deref())
         .unwrap_or("direct_internal")
         .to_string();
-    steps = hydrate_destination_execution_steps(deps, input.order_id, steps).await?;
+    steps = hydrate_destination_execution_steps(deps, input.order_id.inner(), steps).await?;
     let record = deps
         .db
         .orders()
         .create_refund_attempt_from_external_custody(
-            input.order_id,
-            input.failed_attempt_id,
+            input.order_id.inner(),
+            input.failed_attempt_id.inner(),
             ExternalCustodyRefundAttemptPlan {
                 source_custody_vault_id: vault.id,
                 legs,
@@ -4070,7 +4095,7 @@ async fn materialize_external_custody_refund_plan(
                 failure_reason: json!({
                     "reason": "primary_execution_attempts_exhausted",
                     "trace": "refund_workflow",
-                    "failed_attempt_id": input.failed_attempt_id,
+                    "failed_attempt_id": input.failed_attempt_id.inner(),
                 }),
                 input_custody_snapshot: json!({
                     "schema_version": 1,
@@ -4101,12 +4126,12 @@ async fn materialize_external_custody_refund_plan(
     );
     Ok(RefundPlanShape {
         outcome: RefundPlanOutcome::Materialized {
-            refund_attempt_id: record.attempt.id,
+            refund_attempt_id: record.attempt.id.into(),
             steps: record
                 .steps
                 .into_iter()
                 .map(|step| WorkflowExecutionStep {
-                    step_id: step.id,
+                    step_id: step.id.into(),
                     step_index: step.step_index,
                 })
                 .collect(),
@@ -4121,13 +4146,18 @@ async fn materialize_hyperliquid_spot_refund_plan(
     let order = deps
         .db
         .orders()
-        .get(input.order_id)
+        .get(input.order_id.inner())
         .await
         .map_err(activity_error_from_display)?;
     let custody_vault_id = input.position.custody_vault_id.ok_or_else(|| {
         activity_error("HyperliquidSpot refund position is missing custody_vault_id")
     })?;
-    let vault = match deps.db.orders().get_custody_vault(custody_vault_id).await {
+    let vault = match deps
+        .db
+        .orders()
+        .get_custody_vault(custody_vault_id.inner())
+        .await
+    {
         Ok(vault) => vault,
         Err(RouterCoreError::NotFound) => {
             return Ok(refund_plan_untenable(
@@ -4136,10 +4166,11 @@ async fn materialize_hyperliquid_spot_refund_plan(
         }
         Err(source) => return Err(activity_error_from_display(source)),
     };
-    if vault.order_id != Some(input.order_id) {
+    if vault.order_id != Some(input.order_id.inner()) {
         return Err(activity_error(format!(
             "HyperliquidSpot vault {} does not belong to order {}",
-            vault.id, input.order_id
+            vault.id,
+            input.order_id.inner()
         )));
     }
     if vault.role != CustodyVaultRole::HyperliquidSpot {
@@ -4195,8 +4226,8 @@ async fn materialize_hyperliquid_spot_refund_plan(
         .db
         .orders()
         .create_refund_attempt_from_hyperliquid_spot(
-            input.order_id,
-            input.failed_attempt_id,
+            input.order_id.inner(),
+            input.failed_attempt_id.inner(),
             HyperliquidSpotRefundAttemptPlan {
                 source_custody_vault_id: vault.id,
                 legs,
@@ -4204,7 +4235,7 @@ async fn materialize_hyperliquid_spot_refund_plan(
                 failure_reason: json!({
                     "reason": "primary_execution_attempts_exhausted",
                     "trace": "refund_workflow",
-                    "failed_attempt_id": input.failed_attempt_id,
+                    "failed_attempt_id": input.failed_attempt_id.inner(),
                 }),
                 input_custody_snapshot: json!({
                     "schema_version": 1,
@@ -4236,12 +4267,12 @@ async fn materialize_hyperliquid_spot_refund_plan(
     );
     Ok(RefundPlanShape {
         outcome: RefundPlanOutcome::Materialized {
-            refund_attempt_id: record.attempt.id,
+            refund_attempt_id: record.attempt.id.into(),
             steps: record
                 .steps
                 .into_iter()
                 .map(|step| WorkflowExecutionStep {
-                    step_id: step.id,
+                    step_id: step.id.into(),
                     step_index: step.step_index,
                 })
                 .collect(),
@@ -4998,7 +5029,7 @@ fn external_custody_direct_refund_steps(
 ) -> (Vec<OrderExecutionLeg>, Vec<OrderExecutionStep>) {
     let leg = OrderExecutionLeg {
         id: Uuid::now_v7(),
-        order_id: order.id,
+        order_id: order.id.into(),
         execution_attempt_id: None,
         transition_decl_id: None,
         leg_index: 0,
@@ -5027,7 +5058,7 @@ fn external_custody_direct_refund_steps(
     };
     let step = OrderExecutionStep {
         id: Uuid::now_v7(),
-        order_id: order.id,
+        order_id: order.id.into(),
         execution_attempt_id: None,
         execution_leg_id: Some(leg.id),
         transition_decl_id: None,
@@ -5804,7 +5835,7 @@ fn refund_transition_across_bridge_step(
             ),
         };
     Ok(refund_planned_step(RefundPlannedStepSpec {
-        order_id: order.id,
+        order_id: order.id.into(),
         transition_decl_id: Some(transition.id.clone()),
         step_index,
         step_type: OrderExecutionStepType::AcrossBridge,
@@ -5901,7 +5932,7 @@ fn refund_transition_cctp_bridge_steps(
         ),
     };
     let burn = refund_planned_step(RefundPlannedStepSpec {
-        order_id: order.id,
+        order_id: order.id.into(),
         transition_decl_id: Some(burn_leg.transition_decl_id.clone()),
         step_index,
         step_type: OrderExecutionStepType::CctpBurn,
@@ -5946,7 +5977,7 @@ fn refund_transition_cctp_bridge_steps(
         planned_at,
     });
     let receive = refund_planned_step(RefundPlannedStepSpec {
-        order_id: order.id,
+        order_id: order.id.into(),
         transition_decl_id: Some(receive_leg.transition_decl_id.clone()),
         step_index: step_index + 1,
         step_type: OrderExecutionStepType::CctpReceive,
@@ -6029,7 +6060,7 @@ fn refund_transition_universal_router_swap_step(
     };
 
     Ok(refund_planned_step(RefundPlannedStepSpec {
-        order_id: order.id,
+        order_id: order.id.into(),
         transition_decl_id: Some(transition.id.clone()),
         step_index,
         step_type: OrderExecutionStepType::UniversalRouterSwap,
@@ -6119,7 +6150,7 @@ fn refund_transition_unit_deposit_step(
     };
 
     Ok(refund_planned_step(RefundPlannedStepSpec {
-        order_id: order.id,
+        order_id: order.id.into(),
         transition_decl_id: Some(transition.id.clone()),
         step_index,
         step_type: OrderExecutionStepType::UnitDeposit,
@@ -6188,7 +6219,7 @@ fn refund_transition_hyperliquid_bridge_deposit_step(
     };
 
     Ok(refund_planned_step(RefundPlannedStepSpec {
-        order_id: order.id,
+        order_id: order.id.into(),
         transition_decl_id: Some(transition.id.clone()),
         step_index,
         step_type: OrderExecutionStepType::HyperliquidBridgeDeposit,
@@ -6241,7 +6272,7 @@ fn refund_transition_hyperliquid_bridge_withdrawal_step(
     let transfer_from_spot = hyperliquid_binding_transfers_from_spot(custody);
 
     Ok(refund_planned_step(RefundPlannedStepSpec {
-        order_id: order.id,
+        order_id: order.id.into(),
         transition_decl_id: Some(transition.id.clone()),
         step_index,
         step_type: OrderExecutionStepType::HyperliquidBridgeWithdrawal,
@@ -6495,7 +6526,7 @@ fn refund_transition_hyperliquid_trade_step(
         hyperliquid_binding_request_parts(custody);
 
     Ok(refund_planned_step(RefundPlannedStepSpec {
-        order_id: order.id,
+        order_id: order.id.into(),
         transition_decl_id: Some(transition.id.clone()),
         step_index,
         step_type: OrderExecutionStepType::HyperliquidTrade,
@@ -6558,7 +6589,7 @@ fn refund_transition_unit_withdrawal_step(
         hyperliquid_binding_request_parts(custody);
 
     Ok(refund_planned_step(RefundPlannedStepSpec {
-        order_id: order.id,
+        order_id: order.id.into(),
         transition_decl_id: Some(transition.id.clone()),
         step_index,
         step_type: OrderExecutionStepType::UnitWithdrawal,
@@ -6667,7 +6698,7 @@ fn refund_execution_leg_from_quote_legs(
 
     Ok(OrderExecutionLeg {
         id: Uuid::now_v7(),
-        order_id: order.id,
+        order_id: order.id.into(),
         execution_attempt_id: None,
         transition_decl_id: Some(transition.id.clone()),
         leg_index,
@@ -6932,13 +6963,13 @@ impl QuoteRefreshActivities {
         let order = deps
             .db
             .orders()
-            .get(input.order_id)
+            .get(input.order_id.inner())
             .await
             .map_err(activity_error_from_display)?;
         let original_quote = match deps
             .db
             .orders()
-            .get_router_order_quote(input.order_id)
+            .get_router_order_quote(input.order_id.inner())
             .await
             .map_err(activity_error_from_display)?
         {
@@ -6946,40 +6977,40 @@ impl QuoteRefreshActivities {
             RouterOrderQuote::LimitOrder(_) => {
                 return Err(activity_error(format!(
                     "order {} is a limit order and cannot refresh stale market quotes",
-                    input.order_id
+                    input.order_id.inner()
                 )));
             }
         };
         let stale_attempt = deps
             .db
             .orders()
-            .get_execution_attempt(input.stale_attempt_id)
+            .get_execution_attempt(input.stale_attempt_id.inner())
             .await
             .map_err(activity_error_from_display)?;
-        if stale_attempt.order_id != input.order_id {
+        if stale_attempt.order_id != input.order_id.inner() {
             return Err(activity_error(format!(
                 "attempt {} does not belong to order {}",
-                stale_attempt.id, input.order_id
+                stale_attempt.id, input.order_id.inner()
             )));
         }
         let failed_step = deps
             .db
             .orders()
-            .get_execution_step(input.failed_step_id)
+            .get_execution_step(input.failed_step_id.inner())
             .await
             .map_err(activity_error_from_display)?;
-        if failed_step.order_id != input.order_id
-            || failed_step.execution_attempt_id != Some(input.stale_attempt_id)
+        if failed_step.order_id != input.order_id.inner()
+            || failed_step.execution_attempt_id != Some(input.stale_attempt_id.inner())
         {
             return Err(activity_error(format!(
                 "step {} does not belong to order {} attempt {}",
-                failed_step.id, input.order_id, input.stale_attempt_id
+                failed_step.id, input.order_id.inner(), input.stale_attempt_id.inner()
             )));
         }
         let stale_legs = deps
             .db
             .orders()
-            .get_execution_legs_for_attempt(input.stale_attempt_id)
+            .get_execution_legs_for_attempt(input.stale_attempt_id.inner())
             .await
             .map_err(activity_error_from_display)?;
         let stale_leg = failed_step
@@ -7037,19 +7068,19 @@ impl QuoteRefreshActivities {
         let attempts = deps
             .db
             .orders()
-            .get_execution_attempts(input.order_id)
+            .get_execution_attempts(input.order_id.inner())
             .await
             .map_err(activity_error_from_display)?;
         let execution_history = deps
             .db
             .orders()
-            .get_execution_legs(input.order_id)
+            .get_execution_legs(input.order_id.inner())
             .await
             .map_err(activity_error_from_display)?;
         let stale_attempt_steps = deps
             .db
             .orders()
-            .get_execution_steps_for_attempt(input.stale_attempt_id)
+            .get_execution_steps_for_attempt(input.stale_attempt_id.inner())
             .await
             .map_err(activity_error_from_display)?;
         let available_amount = match refresh_remaining_exact_in_amount(
@@ -7064,9 +7095,9 @@ impl QuoteRefreshActivities {
             Ok(amount) => amount,
             Err(err) => {
                 return Ok(stale_quote_refresh_untenable(
-                    input.order_id,
-                    input.stale_attempt_id,
-                    input.failed_step_id,
+                    input.order_id.inner(),
+                    input.stale_attempt_id.inner(),
+                    input.failed_step_id.inner(),
                     err,
                 ));
             }
@@ -7777,21 +7808,23 @@ impl QuoteRefreshActivities {
                     "untenable stale quote refresh must not be materialized",
                 ));
             };
-            if order_id != input.order_id {
+            if order_id != input.order_id.inner() {
                 return Err(activity_error(format!(
                     "refreshed attempt order {} does not match materialize input order {}",
-                    order_id, input.order_id
+                    order_id,
+                    input.order_id.inner()
                 )));
             }
             plan.steps =
-                hydrate_destination_execution_steps(&deps, input.order_id, plan.steps).await?;
+                hydrate_destination_execution_steps(&deps, input.order_id.inner(), plan.steps)
+                    .await?;
             let record = deps
                 .db
                 .orders()
                 .create_refreshed_execution_attempt_from_failed_step(
-                    order_id,
-                    stale_attempt_id,
-                    failed_step_id,
+                    order_id.inner(),
+                    stale_attempt_id.inner(),
+                    failed_step_id.inner(),
                     RefreshedExecutionAttemptPlan {
                         legs: plan.legs,
                         steps: plan.steps,
@@ -7813,12 +7846,12 @@ impl QuoteRefreshActivities {
             );
             telemetry::record_stale_quote_refresh("attempt_materialized");
             Ok(RefreshedAttemptMaterialized {
-                attempt_id: record.attempt.id,
+                attempt_id: record.attempt.id.into(),
                 steps: record
                     .steps
                     .into_iter()
                     .map(|step| WorkflowExecutionStep {
-                        step_id: step.id,
+                        step_id: step.id.into(),
                         step_index: step.step_index,
                     })
                     .collect(),
@@ -7911,13 +7944,15 @@ impl ProviderObservationActivities {
             let operation = deps
                 .db
                 .orders()
-                .get_provider_operation(input.provider_operation_id)
+                .get_provider_operation(input.provider_operation_id.inner())
                 .await
                 .map_err(activity_error_from_display)?;
-            if operation.order_id != input.order_id {
+            if operation.order_id != input.order_id.inner() {
                 return Err(activity_error(format!(
                     "provider operation {} belongs to order {}, not {}",
-                    operation.id, operation.order_id, input.order_id
+                    operation.id,
+                    operation.order_id,
+                    input.order_id.inner()
                 )));
             }
 
@@ -7933,7 +7968,7 @@ impl ProviderObservationActivities {
             } else {
                 Err(activity_error(format!(
                     "Across provider operation {} has no recoverable deposit log yet",
-                    input.provider_operation_id
+                    input.provider_operation_id.inner()
                 )))
             }
         })
@@ -7948,15 +7983,17 @@ async fn poll_provider_operation_hint_for_step(
     let step = deps
         .db
         .orders()
-        .get_execution_step(input.step_id)
+        .get_execution_step(input.step_id.inner())
         .await
         .map_err(activity_error_from_display)?;
-    if step.order_id != input.order_id {
+    if step.order_id != input.order_id.inner() {
         return Ok(provider_hints_polled(provider_hint_rejected(
             None,
             format!(
                 "step {} belongs to order {}, not {}",
-                step.id, step.order_id, input.order_id
+                step.id,
+                step.order_id,
+                input.order_id.inner()
             ),
         )));
     }
@@ -7964,19 +8001,19 @@ async fn poll_provider_operation_hint_for_step(
     let operations = deps
         .db
         .orders()
-        .get_provider_operations(input.order_id)
+        .get_provider_operations(input.order_id.inner())
         .await
         .map_err(activity_error_from_display)?;
     let Some(operation) = operations
         .into_iter()
-        .filter(|operation| operation.execution_step_id == Some(input.step_id))
+        .filter(|operation| operation.execution_step_id == Some(input.step_id.inner()))
         .max_by_key(|operation| (operation.updated_at, operation.created_at, operation.id))
     else {
         return Ok(provider_hints_polled(provider_hint_deferred(
             None,
             format!(
                 "provider hint poll found no provider operation for step {}",
-                input.step_id
+                input.step_id.inner()
             ),
         )));
     };
@@ -7995,8 +8032,8 @@ async fn poll_provider_operation_hint_for_step(
         order_id: input.order_id,
         // Deterministic synthetic hint id for activity-driven polling; this is
         // not persisted as a user hint row.
-        hint_id: operation.id,
-        provider_operation_id: Some(operation.id),
+        hint_id: operation.id.into(),
+        provider_operation_id: Some(operation.id.into()),
         provider,
         hint_kind,
         provider_ref: operation.provider_ref.clone(),
@@ -8349,6 +8386,7 @@ async fn verify_across_fill_hint(
             "AcrossFill hint missing provider_operation_id",
         ));
     };
+    let provider_operation_id = provider_operation_id.inner();
     let operation = deps
         .db
         .orders()
@@ -8356,21 +8394,25 @@ async fn verify_across_fill_hint(
         .await
         .map_err(activity_error_from_display)?;
 
-    if operation.order_id != input.order_id {
+    if operation.order_id != input.order_id.inner() {
         return Ok(provider_hint_rejected(
             Some(provider_operation_id),
             format!(
                 "provider operation {} belongs to order {}, not {}",
-                operation.id, operation.order_id, input.order_id
+                operation.id,
+                operation.order_id,
+                input.order_id.inner()
             ),
         ));
     }
-    if operation.execution_step_id != Some(input.step_id) {
+    if operation.execution_step_id != Some(input.step_id.inner()) {
         return Ok(provider_hint_deferred(
             Some(provider_operation_id),
             format!(
                 "provider operation {} belongs to step {:?}, not {}",
-                operation.id, operation.execution_step_id, input.step_id
+                operation.id,
+                operation.execution_step_id,
+                input.step_id.inner()
             ),
         ));
     }
@@ -8450,7 +8492,7 @@ async fn verify_across_fill_hint(
                 "provider_operation.completed"
             );
             Ok(ProviderOperationHintVerified {
-                provider_operation_id: Some(updated.id),
+                provider_operation_id: Some(updated.id.into()),
                 decision: ProviderOperationHintDecision::Accept,
                 reason: None,
             })
@@ -8486,6 +8528,7 @@ async fn verify_cctp_attestation_hint(
             "CctpAttestation hint missing provider_operation_id",
         ));
     };
+    let provider_operation_id = provider_operation_id.inner();
     let operation = deps
         .db
         .orders()
@@ -8493,21 +8536,25 @@ async fn verify_cctp_attestation_hint(
         .await
         .map_err(activity_error_from_display)?;
 
-    if operation.order_id != input.order_id {
+    if operation.order_id != input.order_id.inner() {
         return Ok(provider_hint_rejected(
             Some(provider_operation_id),
             format!(
                 "provider operation {} belongs to order {}, not {}",
-                operation.id, operation.order_id, input.order_id
+                operation.id,
+                operation.order_id,
+                input.order_id.inner()
             ),
         ));
     }
-    if operation.execution_step_id != Some(input.step_id) {
+    if operation.execution_step_id != Some(input.step_id.inner()) {
         return Ok(provider_hint_deferred(
             Some(provider_operation_id),
             format!(
                 "provider operation {} belongs to step {:?}, not {}",
-                operation.id, operation.execution_step_id, input.step_id
+                operation.id,
+                operation.execution_step_id,
+                input.step_id.inner()
             ),
         ));
     }
@@ -8527,7 +8574,7 @@ async fn verify_cctp_attestation_hint(
             | ProviderOperationStatus::Expired
     ) {
         return Ok(ProviderOperationHintVerified {
-            provider_operation_id: Some(operation.id),
+            provider_operation_id: Some(operation.id.into()),
             decision: if operation.status == ProviderOperationStatus::Completed {
                 ProviderOperationHintDecision::Accept
             } else {
@@ -8594,7 +8641,7 @@ async fn verify_cctp_attestation_hint(
 
     match updated.status {
         ProviderOperationStatus::Completed => Ok(ProviderOperationHintVerified {
-            provider_operation_id: Some(updated.id),
+            provider_operation_id: Some(updated.id.into()),
             decision: ProviderOperationHintDecision::Accept,
             reason: None,
         }),
@@ -8629,6 +8676,7 @@ async fn verify_hyperliquid_trade_hint(
             "HyperliquidTrade hint missing provider_operation_id",
         ));
     };
+    let provider_operation_id = provider_operation_id.inner();
     let operation = deps
         .db
         .orders()
@@ -8636,21 +8684,25 @@ async fn verify_hyperliquid_trade_hint(
         .await
         .map_err(activity_error_from_display)?;
 
-    if operation.order_id != input.order_id {
+    if operation.order_id != input.order_id.inner() {
         return Ok(provider_hint_rejected(
             Some(provider_operation_id),
             format!(
                 "provider operation {} belongs to order {}, not {}",
-                operation.id, operation.order_id, input.order_id
+                operation.id,
+                operation.order_id,
+                input.order_id.inner()
             ),
         ));
     }
-    if operation.execution_step_id != Some(input.step_id) {
+    if operation.execution_step_id != Some(input.step_id.inner()) {
         return Ok(provider_hint_deferred(
             Some(provider_operation_id),
             format!(
                 "provider operation {} belongs to step {:?}, not {}",
-                operation.id, operation.execution_step_id, input.step_id
+                operation.id,
+                operation.execution_step_id,
+                input.step_id.inner()
             ),
         ));
     }
@@ -8673,7 +8725,7 @@ async fn verify_hyperliquid_trade_hint(
             | ProviderOperationStatus::Expired
     ) {
         return Ok(ProviderOperationHintVerified {
-            provider_operation_id: Some(operation.id),
+            provider_operation_id: Some(operation.id.into()),
             decision: if operation.status == ProviderOperationStatus::Completed {
                 ProviderOperationHintDecision::Accept
             } else {
@@ -8740,7 +8792,7 @@ async fn verify_hyperliquid_trade_hint(
 
     match updated.status {
         ProviderOperationStatus::Completed => Ok(ProviderOperationHintVerified {
-            provider_operation_id: Some(updated.id),
+            provider_operation_id: Some(updated.id.into()),
             decision: ProviderOperationHintDecision::Accept,
             reason: None,
         }),
@@ -8775,6 +8827,7 @@ async fn verify_unit_deposit_hint(
             "UnitDeposit hint missing provider_operation_id",
         ));
     };
+    let provider_operation_id = provider_operation_id.inner();
     let operation = deps
         .db
         .orders()
@@ -8782,21 +8835,25 @@ async fn verify_unit_deposit_hint(
         .await
         .map_err(activity_error_from_display)?;
 
-    if operation.order_id != input.order_id {
+    if operation.order_id != input.order_id.inner() {
         return Ok(provider_hint_rejected(
             Some(provider_operation_id),
             format!(
                 "provider operation {} belongs to order {}, not {}",
-                operation.id, operation.order_id, input.order_id
+                operation.id,
+                operation.order_id,
+                input.order_id.inner()
             ),
         ));
     }
-    if operation.execution_step_id != Some(input.step_id) {
+    if operation.execution_step_id != Some(input.step_id.inner()) {
         return Ok(provider_hint_deferred(
             Some(provider_operation_id),
             format!(
                 "provider operation {} belongs to step {:?}, not {}",
-                operation.id, operation.execution_step_id, input.step_id
+                operation.id,
+                operation.execution_step_id,
+                input.step_id.inner()
             ),
         ));
     }
@@ -8816,7 +8873,7 @@ async fn verify_unit_deposit_hint(
             | ProviderOperationStatus::Expired
     ) {
         return Ok(ProviderOperationHintVerified {
-            provider_operation_id: Some(operation.id),
+            provider_operation_id: Some(operation.id.into()),
             decision: if operation.status == ProviderOperationStatus::Completed {
                 ProviderOperationHintDecision::Accept
             } else {
@@ -8871,14 +8928,17 @@ async fn verify_unit_deposit_hint(
     let step = deps
         .db
         .orders()
-        .get_execution_step(input.step_id)
+        .get_execution_step(input.step_id.inner())
         .await
         .map_err(activity_error_from_display)?;
-    let expected_amount =
-        match expected_provider_operation_amount(&operation, Some(&step), input.signal.hint_id) {
-            Ok(amount) => amount,
-            Err(reason) => return Ok(provider_hint_rejected(Some(provider_operation_id), reason)),
-        };
+    let expected_amount = match expected_provider_operation_amount(
+        &operation,
+        Some(&step),
+        input.signal.hint_id.inner(),
+    ) {
+        Ok(amount) => amount,
+        Err(reason) => return Ok(provider_hint_rejected(Some(provider_operation_id), reason)),
+    };
     if verified_amount < expected_amount {
         return Ok(provider_hint_rejected(
             Some(provider_operation_id),
@@ -8969,7 +9029,7 @@ async fn verify_unit_deposit_hint(
 
     match updated.status {
         ProviderOperationStatus::Completed => Ok(ProviderOperationHintVerified {
-            provider_operation_id: Some(updated.id),
+            provider_operation_id: Some(updated.id.into()),
             decision: ProviderOperationHintDecision::Accept,
             reason: None,
         }),
@@ -9004,6 +9064,7 @@ async fn verify_provider_observation_hint(
             "ProviderObservation hint missing provider_operation_id",
         ));
     };
+    let provider_operation_id = provider_operation_id.inner();
     let operation = deps
         .db
         .orders()
@@ -9011,21 +9072,25 @@ async fn verify_provider_observation_hint(
         .await
         .map_err(activity_error_from_display)?;
 
-    if operation.order_id != input.order_id {
+    if operation.order_id != input.order_id.inner() {
         return Ok(provider_hint_rejected(
             Some(provider_operation_id),
             format!(
                 "provider operation {} belongs to order {}, not {}",
-                operation.id, operation.order_id, input.order_id
+                operation.id,
+                operation.order_id,
+                input.order_id.inner()
             ),
         ));
     }
-    if operation.execution_step_id != Some(input.step_id) {
+    if operation.execution_step_id != Some(input.step_id.inner()) {
         return Ok(provider_hint_deferred(
             Some(provider_operation_id),
             format!(
                 "provider operation {} belongs to step {:?}, not {}",
-                operation.id, operation.execution_step_id, input.step_id
+                operation.id,
+                operation.execution_step_id,
+                input.step_id.inner()
             ),
         ));
     }
@@ -9036,7 +9101,7 @@ async fn verify_provider_observation_hint(
             | ProviderOperationStatus::Expired
     ) {
         return Ok(ProviderOperationHintVerified {
-            provider_operation_id: Some(operation.id),
+            provider_operation_id: Some(operation.id.into()),
             decision: if operation.status == ProviderOperationStatus::Completed {
                 ProviderOperationHintDecision::Accept
             } else {
@@ -9159,7 +9224,7 @@ async fn verify_provider_observation_hint(
 
     match updated.status {
         ProviderOperationStatus::Completed => Ok(ProviderOperationHintVerified {
-            provider_operation_id: Some(updated.id),
+            provider_operation_id: Some(updated.id.into()),
             decision: ProviderOperationHintDecision::Accept,
             reason: None,
         }),
@@ -9189,7 +9254,7 @@ fn provider_hint_deferred(
     reason: impl Into<String>,
 ) -> ProviderOperationHintVerified {
     ProviderOperationHintVerified {
-        provider_operation_id,
+        provider_operation_id: provider_operation_id.map(Into::into),
         decision: ProviderOperationHintDecision::Defer,
         reason: Some(reason.into()),
     }
@@ -9200,7 +9265,7 @@ fn provider_hint_rejected(
     reason: impl Into<String>,
 ) -> ProviderOperationHintVerified {
     ProviderOperationHintVerified {
-        provider_operation_id,
+        provider_operation_id: provider_operation_id.map(Into::into),
         decision: ProviderOperationHintDecision::Reject,
         reason: Some(reason.into()),
     }
@@ -9586,9 +9651,9 @@ mod tests {
         let classified = classify_stale_running_step_for_deps(
             &deps,
             ClassifyStaleRunningStepInput {
-                order_id: durable.order_id,
-                attempt_id: durable.attempt_id,
-                step_id: durable.step_id,
+                order_id: durable.order_id.into(),
+                attempt_id: durable.attempt_id.into(),
+                step_id: durable.step_id.into(),
             },
         )
         .await
@@ -9608,9 +9673,9 @@ mod tests {
         let classified = classify_stale_running_step_for_deps(
             &deps,
             ClassifyStaleRunningStepInput {
-                order_id: ambiguous.order_id,
-                attempt_id: ambiguous.attempt_id,
-                step_id: ambiguous.step_id,
+                order_id: ambiguous.order_id.into(),
+                attempt_id: ambiguous.attempt_id.into(),
+                step_id: ambiguous.step_id.into(),
             },
         )
         .await
@@ -9630,9 +9695,9 @@ mod tests {
         let classified = classify_stale_running_step_for_deps(
             &deps,
             ClassifyStaleRunningStepInput {
-                order_id: missing_checkpoint.order_id,
-                attempt_id: missing_checkpoint.attempt_id,
-                step_id: missing_checkpoint.step_id,
+                order_id: missing_checkpoint.order_id.into(),
+                attempt_id: missing_checkpoint.attempt_id.into(),
+                step_id: missing_checkpoint.step_id.into(),
             },
         )
         .await

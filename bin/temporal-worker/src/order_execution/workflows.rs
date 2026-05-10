@@ -36,7 +36,8 @@ use super::types::{
     RefundTerminalStatus, RefundTrigger, RefundWorkflowInput, RefundWorkflowOutput,
     ReleaseRefundManualInterventionInput, SettleProviderStepInput, SingleRefundPositionOutcome,
     StaleRunningStepClassified, StaleRunningStepDecision, StepExecuted, StepExecutionOutcome,
-    StepFailureDecision, VerifyProviderOperationHintInput, WriteFailedAttemptSnapshotInput,
+    StepFailureDecision, VerifyProviderOperationHintInput, WorkflowAttemptId, WorkflowOrderId,
+    WorkflowStepId, WriteFailedAttemptSnapshotInput,
 };
 use crate::telemetry;
 
@@ -54,10 +55,10 @@ const REFUND_WORKFLOW_TYPE: &str = "RefundWorkflow";
 /// Scar tissue: §3 phase pass, §4 state alignment, and §14 benign CAS races.
 #[workflow]
 pub struct OrderWorkflow {
-    order_id: Option<Uuid>,
+    order_id: Option<WorkflowOrderId>,
     phase: OrderWorkflowPhase,
-    active_attempt_id: Option<Uuid>,
-    active_step_id: Option<Uuid>,
+    active_attempt_id: Option<WorkflowAttemptId>,
+    active_step_id: Option<WorkflowStepId>,
     provider_operation_hints: Vec<ProviderOperationHintSignal>,
     manual_releases: Vec<ManualReleaseSignal>,
     manual_refund_triggers: Vec<ManualTriggerRefundSignal>,
@@ -764,7 +765,9 @@ impl OrderWorkflow {
     #[query]
     pub fn debug_cursor(&self, _ctx: &WorkflowContextView) -> OrderWorkflowDebugCursor {
         OrderWorkflowDebugCursor {
-            order_id: self.order_id.unwrap_or_else(Uuid::nil),
+            order_id: self
+                .order_id
+                .unwrap_or_else(|| WorkflowOrderId::from(Uuid::nil())),
             phase: self.phase,
             active_attempt_id: self.active_attempt_id,
             active_step_id: self.active_step_id,
@@ -773,7 +776,7 @@ impl OrderWorkflow {
 }
 
 impl OrderWorkflow {
-    fn has_provider_operation_hint(&self, order_id: Uuid) -> bool {
+    fn has_provider_operation_hint(&self, order_id: WorkflowOrderId) -> bool {
         self.provider_operation_hints
             .iter()
             .any(|signal| signal.order_id == order_id)
@@ -781,7 +784,7 @@ impl OrderWorkflow {
 
     fn pop_provider_operation_hint(
         &mut self,
-        order_id: Uuid,
+        order_id: WorkflowOrderId,
     ) -> Option<ProviderOperationHintSignal> {
         let index = self
             .provider_operation_hints
@@ -878,7 +881,7 @@ fn workflow_duration<W>(
 fn order_workflow_output(
     ctx: &WorkflowContext<OrderWorkflow>,
     started_at: Option<SystemTime>,
-    order_id: Uuid,
+    order_id: WorkflowOrderId,
     terminal_status: OrderTerminalStatus,
 ) -> WorkflowResult<OrderWorkflowOutput> {
     if !ctx.is_replaying() {
@@ -897,7 +900,7 @@ fn order_workflow_output(
 fn refund_workflow_output(
     ctx: &WorkflowContext<RefundWorkflow>,
     started_at: Option<SystemTime>,
-    order_id: Uuid,
+    order_id: WorkflowOrderId,
     terminal_status: RefundTerminalStatus,
 ) -> WorkflowResult<RefundWorkflowOutput> {
     if !ctx.is_replaying() {
@@ -990,9 +993,9 @@ fn record_provider_hint_wait<W>(
 
 async fn execute_step_with_stale_running_timer(
     ctx: &mut WorkflowContext<OrderWorkflow>,
-    order_id: Uuid,
-    attempt_id: Uuid,
-    step_id: Uuid,
+    order_id: WorkflowOrderId,
+    attempt_id: WorkflowAttemptId,
+    step_id: WorkflowStepId,
     execute_activity_options: ActivityOptions,
     db_activity_options: ActivityOptions,
 ) -> WorkflowResult<StepExecutionProgress> {
@@ -1054,8 +1057,8 @@ async fn execute_step_with_stale_running_timer(
 
 async fn run_refund_child(
     ctx: &mut WorkflowContext<OrderWorkflow>,
-    order_id: Uuid,
-    parent_attempt_id: Uuid,
+    order_id: WorkflowOrderId,
+    parent_attempt_id: WorkflowAttemptId,
 ) -> WorkflowResult<OrderTerminalStatus> {
     let child = ctx
         .child_workflow(
@@ -1079,9 +1082,9 @@ async fn run_refund_child(
 
 async fn finalize_manual_intervention(
     ctx: &mut WorkflowContext<OrderWorkflow>,
-    order_id: Uuid,
-    attempt_id: Uuid,
-    step_id: Uuid,
+    order_id: WorkflowOrderId,
+    attempt_id: WorkflowAttemptId,
+    step_id: WorkflowStepId,
     reason: Value,
     db_activity_options: ActivityOptions,
 ) -> WorkflowResult<FinalizedOrder> {
@@ -1102,9 +1105,9 @@ async fn finalize_manual_intervention(
 
 async fn wait_for_manual_intervention_resolution(
     ctx: &mut WorkflowContext<OrderWorkflow>,
-    order_id: Uuid,
-    attempt_id: Uuid,
-    step_id: Uuid,
+    order_id: WorkflowOrderId,
+    attempt_id: WorkflowAttemptId,
+    step_id: WorkflowStepId,
     reason: Value,
     db_activity_options: ActivityOptions,
 ) -> WorkflowResult<ManualInterventionResolution> {
@@ -1221,9 +1224,9 @@ async fn wait_for_manual_intervention_resolution(
 
 async fn acknowledge_manual_intervention_terminal(
     ctx: &mut WorkflowContext<OrderWorkflow>,
-    order_id: Uuid,
-    attempt_id: Option<Uuid>,
-    step_id: Option<Uuid>,
+    order_id: WorkflowOrderId,
+    attempt_id: Option<WorkflowAttemptId>,
+    step_id: Option<WorkflowStepId>,
     refund_manual: bool,
     signal: AcknowledgeUnrecoverableSignal,
     zombie_cleanup: bool,
@@ -1277,9 +1280,9 @@ async fn settle_refund_provider_completion(
 
 async fn finalize_refund_provider_hint_manual_intervention(
     ctx: &mut WorkflowContext<RefundWorkflow>,
-    order_id: Uuid,
-    attempt_id: Uuid,
-    step_id: Uuid,
+    order_id: WorkflowOrderId,
+    attempt_id: WorkflowAttemptId,
+    step_id: WorkflowStepId,
     reason: Value,
     db_activity_options: ActivityOptions,
 ) -> WorkflowResult<()> {
@@ -1332,9 +1335,9 @@ async fn finalize_refund_provider_hint_manual_intervention(
 
 async fn wait_for_refund_manual_intervention_resolution(
     ctx: &mut WorkflowContext<RefundWorkflow>,
-    order_id: Uuid,
-    refund_attempt_id: Option<Uuid>,
-    step_id: Option<Uuid>,
+    order_id: WorkflowOrderId,
+    refund_attempt_id: Option<WorkflowAttemptId>,
+    step_id: Option<WorkflowStepId>,
     db_activity_options: ActivityOptions,
 ) -> WorkflowResult<RefundManualInterventionResolution> {
     let wait_started_at = manual_wait_started(ctx, REFUND_WORKFLOW_TYPE);
@@ -1453,9 +1456,9 @@ async fn wait_for_refund_manual_intervention_resolution(
 
 async fn acknowledge_refund_manual_intervention_terminal(
     ctx: &mut WorkflowContext<RefundWorkflow>,
-    order_id: Uuid,
-    attempt_id: Option<Uuid>,
-    step_id: Option<Uuid>,
+    order_id: WorkflowOrderId,
+    attempt_id: Option<WorkflowAttemptId>,
+    step_id: Option<WorkflowStepId>,
     signal: AcknowledgeUnrecoverableSignal,
     zombie_cleanup: bool,
     db_activity_options: ActivityOptions,
@@ -1476,7 +1479,7 @@ async fn acknowledge_refund_manual_intervention_terminal(
         .await?)
 }
 
-fn json_reason(reason: &'static str, step_id: Uuid) -> Value {
+fn json_reason(reason: &'static str, step_id: WorkflowStepId) -> Value {
     json!({
         "reason": reason,
         "step_id": step_id,
@@ -1503,8 +1506,8 @@ fn refund_terminal_status(status: OrderTerminalStatus) -> RefundTerminalStatus {
 
 async fn wait_for_provider_completion_hint(
     ctx: &mut WorkflowContext<OrderWorkflow>,
-    order_id: Uuid,
-    step_id: Uuid,
+    order_id: WorkflowOrderId,
+    step_id: WorkflowStepId,
     execution: StepExecuted,
     db_activity_options: ActivityOptions,
 ) -> WorkflowResult<ProviderCompletionWait> {
@@ -1638,8 +1641,8 @@ async fn wait_for_provider_completion_hint(
 
 async fn wait_for_refund_provider_completion_hint(
     ctx: &mut WorkflowContext<RefundWorkflow>,
-    order_id: Uuid,
-    step_id: Uuid,
+    order_id: WorkflowOrderId,
+    step_id: WorkflowStepId,
     execution: StepExecuted,
     db_activity_options: ActivityOptions,
 ) -> WorkflowResult<RefundProviderCompletionWait> {
@@ -1813,7 +1816,10 @@ fn refund_execute_activity_options() -> ActivityOptions {
         .build()
 }
 
-fn refund_child_options(order_id: Uuid, parent_attempt_id: Uuid) -> ChildWorkflowOptions {
+fn refund_child_options(
+    order_id: WorkflowOrderId,
+    parent_attempt_id: WorkflowAttemptId,
+) -> ChildWorkflowOptions {
     ChildWorkflowOptions {
         workflow_id: refund_workflow_id(order_id, parent_attempt_id),
         run_timeout: Some(MANUAL_INTERVENTION_WAIT_TIMEOUT + Duration::from_secs(60 * 60)),
@@ -1822,7 +1828,10 @@ fn refund_child_options(order_id: Uuid, parent_attempt_id: Uuid) -> ChildWorkflo
     }
 }
 
-fn quote_refresh_child_options(order_id: Uuid, failed_step_id: Uuid) -> ChildWorkflowOptions {
+fn quote_refresh_child_options(
+    order_id: WorkflowOrderId,
+    failed_step_id: WorkflowStepId,
+) -> ChildWorkflowOptions {
     ChildWorkflowOptions {
         workflow_id: format!("order:{order_id}:quote-refresh:{failed_step_id}"),
         // Quote refresh must tolerate activity queue backlog during load spikes. Short run timeouts
@@ -1833,7 +1842,10 @@ fn quote_refresh_child_options(order_id: Uuid, failed_step_id: Uuid) -> ChildWor
     }
 }
 
-fn provider_hint_poll_child_options(order_id: Uuid, step_id: Uuid) -> ChildWorkflowOptions {
+fn provider_hint_poll_child_options(
+    order_id: WorkflowOrderId,
+    step_id: WorkflowStepId,
+) -> ChildWorkflowOptions {
     ChildWorkflowOptions {
         workflow_id: provider_hint_poll_workflow_id(order_id, step_id),
         cancel_type: ChildWorkflowCancellationType::Abandon,
@@ -1844,7 +1856,7 @@ fn provider_hint_poll_child_options(order_id: Uuid, step_id: Uuid) -> ChildWorkf
     }
 }
 
-fn provider_hint_poll_workflow_id(order_id: Uuid, step_id: Uuid) -> String {
+fn provider_hint_poll_workflow_id(order_id: WorkflowOrderId, step_id: WorkflowStepId) -> String {
     format!("order:{order_id}:provider-hint-poll:{step_id}")
 }
 
@@ -1854,7 +1866,7 @@ fn provider_hint_poll_workflow_id(order_id: Uuid, step_id: Uuid) -> String {
 #[workflow]
 #[derive(Default)]
 pub struct RefundWorkflow {
-    order_id: Option<Uuid>,
+    order_id: Option<WorkflowOrderId>,
     provider_operation_hints: Vec<ProviderOperationHintSignal>,
     manual_releases: Vec<ManualReleaseSignal>,
     manual_refund_triggers: Vec<ManualTriggerRefundSignal>,
@@ -2156,7 +2168,7 @@ impl RefundWorkflow {
 }
 
 impl RefundWorkflow {
-    fn has_provider_operation_hint(&self, order_id: Uuid) -> bool {
+    fn has_provider_operation_hint(&self, order_id: WorkflowOrderId) -> bool {
         self.provider_operation_hints
             .iter()
             .any(|signal| signal.order_id == order_id)
@@ -2164,7 +2176,7 @@ impl RefundWorkflow {
 
     fn pop_provider_operation_hint(
         &mut self,
-        order_id: Uuid,
+        order_id: WorkflowOrderId,
     ) -> Option<ProviderOperationHintSignal> {
         let index = self
             .provider_operation_hints

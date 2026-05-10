@@ -47,7 +47,8 @@ use router_temporal::{
     boxed as boxed_temporal_error, AcknowledgeUnrecoverableSignal, ManualReleaseSignal,
     ManualTriggerRefundSignal, OrderWorkflowClient, ProviderHintKind, ProviderKind,
     ProviderOperationHintEvidence, ProviderOperationHintSignal, RouterTemporalError,
-    TemporalConnection,
+    TemporalConnection, WorkflowAttemptId, WorkflowHintId, WorkflowOrderId,
+    WorkflowProviderOperationId,
 };
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
@@ -839,9 +840,9 @@ fn provider_operation_hint_signal(
 ) -> RouterServerResult<ProviderOperationHintSignal> {
     let (provider, hint_kind) = provider_hint_shape_for_operation(operation.operation_type);
     Ok(ProviderOperationHintSignal {
-        order_id: operation.order_id,
-        hint_id: hint.id,
-        provider_operation_id: Some(operation.id),
+        order_id: WorkflowOrderId::from(operation.order_id),
+        hint_id: WorkflowHintId::from(hint.id),
+        provider_operation_id: Some(WorkflowProviderOperationId::from(operation.id)),
         provider,
         hint_kind,
         provider_ref: operation.provider_ref.clone(),
@@ -934,7 +935,7 @@ async fn signal_provider_operation_hint(
         | OrderExecutionAttemptKind::RetryExecution
         | OrderExecutionAttemptKind::RefreshedExecution => {
             order_workflow_client
-                .signal_provider_hint(order_id, signal)
+                .signal_provider_hint(WorkflowOrderId::from(order_id), signal)
                 .await
         }
         OrderExecutionAttemptKind::RefundRecovery => {
@@ -951,7 +952,11 @@ async fn signal_provider_operation_hint(
                     )),
                 })?;
             order_workflow_client
-                .signal_refund_provider_hint(order_id, parent_attempt_id, signal)
+                .signal_refund_provider_hint(
+                    WorkflowOrderId::from(order_id),
+                    WorkflowAttemptId::from(parent_attempt_id),
+                    signal,
+                )
                 .await
         }
     }
@@ -1191,7 +1196,7 @@ async fn signal_manual_intervention_action(
             ManualInterventionAction::Release(signal),
         ) => {
             order_workflow_client
-                .signal_manual_release(order_id, signal)
+                .signal_manual_release(WorkflowOrderId::from(order_id), signal)
                 .await
                 .map_err(manual_signal_error)?;
             workflow_id.clone()
@@ -1201,7 +1206,7 @@ async fn signal_manual_intervention_action(
             ManualInterventionAction::TriggerRefund(signal),
         ) => {
             order_workflow_client
-                .signal_manual_trigger_refund(order_id, signal)
+                .signal_manual_trigger_refund(WorkflowOrderId::from(order_id), signal)
                 .await
                 .map_err(manual_signal_error)?;
             workflow_id.clone()
@@ -1211,7 +1216,7 @@ async fn signal_manual_intervention_action(
             ManualInterventionAction::AcknowledgeUnrecoverable(signal),
         ) => {
             order_workflow_client
-                .signal_acknowledge_unrecoverable(order_id, signal)
+                .signal_acknowledge_unrecoverable(WorkflowOrderId::from(order_id), signal)
                 .await
                 .map_err(manual_signal_error)?;
             workflow_id.clone()
@@ -1224,7 +1229,11 @@ async fn signal_manual_intervention_action(
             ManualInterventionAction::Release(signal),
         ) => {
             order_workflow_client
-                .signal_refund_manual_release(order_id, *parent_attempt_id, signal)
+                .signal_refund_manual_release(
+                    WorkflowOrderId::from(order_id),
+                    WorkflowAttemptId::from(*parent_attempt_id),
+                    signal,
+                )
                 .await
                 .map_err(manual_signal_error)?;
             workflow_id.clone()
@@ -1237,7 +1246,11 @@ async fn signal_manual_intervention_action(
             ManualInterventionAction::TriggerRefund(signal),
         ) => {
             order_workflow_client
-                .signal_refund_manual_trigger_refund(order_id, *parent_attempt_id, signal)
+                .signal_refund_manual_trigger_refund(
+                    WorkflowOrderId::from(order_id),
+                    WorkflowAttemptId::from(*parent_attempt_id),
+                    signal,
+                )
                 .await
                 .map_err(manual_signal_error)?;
             workflow_id.clone()
@@ -1250,7 +1263,11 @@ async fn signal_manual_intervention_action(
             ManualInterventionAction::AcknowledgeUnrecoverable(signal),
         ) => {
             order_workflow_client
-                .signal_refund_acknowledge_unrecoverable(order_id, *parent_attempt_id, signal)
+                .signal_refund_acknowledge_unrecoverable(
+                    WorkflowOrderId::from(order_id),
+                    WorkflowAttemptId::from(*parent_attempt_id),
+                    signal,
+                )
                 .await
                 .map_err(manual_signal_error)?;
             workflow_id.clone()

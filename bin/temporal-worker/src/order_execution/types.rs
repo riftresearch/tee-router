@@ -6,18 +6,11 @@ use router_core::{
 pub use router_temporal::{
     AcknowledgeUnrecoverableSignal, ManualReleaseSignal, ManualTriggerRefundSignal,
     OrderWorkflowInput, ProviderHintKind, ProviderKind, ProviderOperationHintEvidence,
-    ProviderOperationHintSignal,
+    ProviderOperationHintSignal, WorkflowAttemptId, WorkflowHintId, WorkflowOrderId,
+    WorkflowProviderOperationId, WorkflowStepId, WorkflowVaultId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use uuid::Uuid;
-
-pub type WorkflowOrderId = Uuid;
-pub type WorkflowAttemptId = Uuid;
-pub type WorkflowStepId = Uuid;
-pub type WorkflowVaultId = Uuid;
-pub type WorkflowProviderOperationId = Uuid;
-pub type WorkflowHintId = Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderWorkflowOutput {
