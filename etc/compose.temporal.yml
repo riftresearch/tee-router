@@ -136,8 +136,10 @@ services:
       POSTGRES_SEEDS: temporal-postgres
       BIND_ON_IP: 0.0.0.0
       DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/development-sql.yaml
+      PROMETHEUS_ENDPOINT: 0.0.0.0:9090
     ports:
       - "7233:7233"
+      - "9090:9090"
     configs:
       - source: temporal-dynamic-config
         target: /etc/temporal/config/dynamicconfig/development-sql.yaml

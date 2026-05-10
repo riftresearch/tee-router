@@ -113,6 +113,9 @@ The interactive devnet should reserve the following ports:
 - `devnet`
 - `router-postgres`
 - `router-postgres-replica`
+- `temporal-postgres`
+- `temporal`
+- `temporal-worker`
 - `router-api`
 - `router-worker`
 - `sauron-state-db`
@@ -131,6 +134,9 @@ The compose file should configure router services with local URLs:
 - `BITCOIN_RPC_URL=http://devnet:50100`
 - `ELECTRUM_HTTP_SERVER_URL=http://devnet:50110`
 - provider API URLs pointed at `http://devnet:50107`
+- `TEMPORAL_ADDRESS=http://temporal:7233`
+- shared order-execution task queue env for router-worker, router-api, and
+  temporal-worker
 - replica/admin URLs pointed at the local logical replica
 
 ## Load generator initial command shape

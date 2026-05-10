@@ -27,7 +27,7 @@
         "type": "prometheus",
         "uid": "victoriametrics"
       },
-      "description": "Current active router orders by lifecycle status, sampled by the active router worker.",
+      "description": "Current router orders in non-terminal execution statuses. Temporal owns execution; router-worker samples canonical status from Postgres.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -131,7 +131,7 @@
             "axisBorderShow": false,
             "axisCenteredZero": false,
             "axisColorMode": "text",
-            "axisLabel": "rows",
+            "axisLabel": "ticks/s",
             "axisPlacement": "auto",
             "barAlignment": 0,
             "drawStyle": "line",
@@ -201,13 +201,13 @@
             "uid": "victoriametrics"
           },
           "editorMode": "code",
-          "expr": "tee_router_worker_order_pass_last_rows{service=\"router-worker\", stage=~\"planned_orders|executed_orders|maintenance_tasks|processed_provider_hints|reconciled_failed_orders\"}",
-          "legendFormat": "{{stage}}",
+          "expr": "sum by (worker) (rate(tee_router_worker_tick_total{service=\"router-worker\"}[1m]))",
+          "legendFormat": "{{worker}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Worker Rows Per Pass",
+      "title": "Worker Tick Rate",
       "type": "timeseries"
     },
     {
@@ -300,7 +300,7 @@
           "refId": "A"
         }
       ],
-      "title": "Worker Pass Latency",
+      "title": "Worker Tick p95 Latency",
       "type": "timeseries"
     },
     {
@@ -358,13 +358,13 @@
             "uid": "victoriametrics"
           },
           "editorMode": "code",
-          "expr": "sum by (stage) (tee_router_worker_order_pass_last_rows{service=\"router-worker\"})",
-          "legendFormat": "{{stage}}",
+          "expr": "up{job=\"temporal\"}",
+          "legendFormat": "{{job}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Last Worker Pass",
+      "title": "Temporal Server Scrape Health",
       "type": "bargauge"
     },
     {

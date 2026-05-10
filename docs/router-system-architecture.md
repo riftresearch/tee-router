@@ -7,15 +7,16 @@ binaries.
 ## Current Implementation Notes
 
 - `router-api` is the standard API process. It serves HTTP routes, creates vault
-  rows, and records cancellation/refund requests without running background
-  refund processing.
-- `router-worker` is the standard worker process. It acquires the global
-  PostgreSQL worker lease, renews it while active, and processes refund/action
-  work only while it holds the lease.
-- The worker leadership lease is stored in `router_worker_leases` with
-  `owner_id`, `expires_at`, and monotonic `fencing_token`.
-- Refund rows also use per-row claim leases so a worker pass can safely claim
-  bounded batches of refundable vaults.
+  rows, records cancellation/refund requests, and signals Temporal workflows
+  for provider-operation hints.
+- `router-worker` is the standard maintenance process. It reconciles vault
+  funding/refund work and starts `OrderWorkflow` when an order reaches
+  `Funded`.
+- `temporal-worker` hosts order workflow/activity code and polls the Temporal
+  task queue. Temporal owns workflow state and per-order execution ownership.
+- Postgres remains the canonical business-state store. Refund rows still use
+  per-row claim leases so a worker pass can safely claim bounded batches of
+  refundable funding vaults.
 
 ## 1. Overview
 
@@ -72,20 +73,17 @@ resources.
 
 ### Execution Model
 
-- Exactly 1 active worker at any time
-- Remaining workers are standby
+- Router workers are horizontally safe because maintenance passes use
+  idempotent Postgres transitions and row-level claim leases where needed.
+- Order execution is serialized by deterministic Temporal workflow IDs, not by
+  a global router-worker lease.
 
-### Leadership
+### Workflow Ownership
 
-- Controlled via database lease
-
-### Lease Requirements
-
-Lease stored in PostgreSQL with these fields:
-
-- `owner_id`
-- `expiration_timestamp`
-- `fencing_token` (monotonic)
+- New funded orders start `OrderWorkflow` with workflow ID
+  `order:{order_id}:execution`.
+- Provider-operation hints are persisted in Postgres and delivered to the
+  owning order/refund workflow as Temporal signals.
 
 ### Behavior
 

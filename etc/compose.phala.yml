@@ -62,6 +62,93 @@ configs:
 
       echo "Router Postgres init complete"
 
+  temporal-dynamic-config:
+    content: |
+      limit.maxIDLength:
+        - value: 255
+          constraints: {}
+      system.forceSearchAttributesCacheRefreshOnRead:
+        - value: true
+          constraints: {}
+
+  temporal-setup-postgres:
+    content: |
+      #!/bin/sh
+      set -eu
+
+      : "$${POSTGRES_SEEDS:?POSTGRES_SEEDS is required}"
+      : "$${POSTGRES_USER:?POSTGRES_USER is required}"
+
+      echo "Waiting for PostgreSQL port..."
+      nc -z -w 10 "$${POSTGRES_SEEDS}" "$${DB_PORT:-5432}"
+      echo "PostgreSQL port is available"
+
+      temporal-sql-tool --plugin postgres12 --ep "$${POSTGRES_SEEDS}" -u "$${POSTGRES_USER}" -p "$${DB_PORT:-5432}" --db temporal create
+      temporal-sql-tool --plugin postgres12 --ep "$${POSTGRES_SEEDS}" -u "$${POSTGRES_USER}" -p "$${DB_PORT:-5432}" --db temporal setup-schema -v 0.0
+      temporal-sql-tool --plugin postgres12 --ep "$${POSTGRES_SEEDS}" -u "$${POSTGRES_USER}" -p "$${DB_PORT:-5432}" --db temporal update-schema -d /etc/temporal/schema/postgresql/v12/temporal/versioned
+
+      temporal-sql-tool --plugin postgres12 --ep "$${POSTGRES_SEEDS}" -u "$${POSTGRES_USER}" -p "$${DB_PORT:-5432}" --db temporal_visibility create
+      temporal-sql-tool --plugin postgres12 --ep "$${POSTGRES_SEEDS}" -u "$${POSTGRES_USER}" -p "$${DB_PORT:-5432}" --db temporal_visibility setup-schema -v 0.0
+      temporal-sql-tool --plugin postgres12 --ep "$${POSTGRES_SEEDS}" -u "$${POSTGRES_USER}" -p "$${DB_PORT:-5432}" --db temporal_visibility update-schema -d /etc/temporal/schema/postgresql/v12/visibility/versioned
+
+      echo "PostgreSQL schema setup complete"
+
+  temporal-create-namespace:
+    content: |
+      #!/bin/sh
+      set -eu
+
+      namespace="$${DEFAULT_NAMESPACE:-default}"
+      temporal_address="$${TEMPORAL_ADDRESS:-temporal:7233}"
+      max_attempts="$${TEMPORAL_HEALTH_CHECK_MAX_ATTEMPTS:-30}"
+      sleep_seconds="$${TEMPORAL_HEALTH_CHECK_SLEEP_SECONDS:-5}"
+      server_host="$$(echo "$${temporal_address}" | cut -d: -f1)"
+      server_port="$$(echo "$${temporal_address}" | cut -d: -f2)"
+
+      echo "Waiting for Temporal server port..."
+      attempt=1
+      while ! nc -z -w 10 "$${server_host}" "$${server_port}"; do
+        if [ "$${attempt}" -ge "$${max_attempts}" ]; then
+          echo "Temporal server port did not become available after $${max_attempts} attempts"
+          exit 1
+        fi
+        echo "Temporal server port not ready yet, waiting... (attempt $${attempt}/$${max_attempts})"
+        attempt="$$(($${attempt} + 1))"
+        sleep "$${sleep_seconds}"
+      done
+
+      echo "Waiting for Temporal server health..."
+      attempt=1
+      while ! temporal operator cluster health --address "$${temporal_address}"; do
+        if [ "$${attempt}" -ge "$${max_attempts}" ]; then
+          echo "Temporal server did not become healthy after $${max_attempts} attempts"
+          exit 1
+        fi
+        echo "Temporal server not healthy yet, waiting... (attempt $${attempt}/$${max_attempts})"
+        attempt="$$(($${attempt} + 1))"
+        sleep "$${sleep_seconds}"
+      done
+
+      echo "Ensuring Temporal namespace '$${namespace}' exists..."
+      attempt=1
+      while :; do
+        if temporal operator namespace describe --namespace "$${namespace}" --address "$${temporal_address}" >/dev/null 2>&1; then
+          echo "Namespace '$${namespace}' already exists"
+          break
+        fi
+        if temporal operator namespace create --namespace "$${namespace}" --address "$${temporal_address}" >/dev/null 2>&1; then
+          echo "Namespace '$${namespace}' created"
+          break
+        fi
+        if [ "$${attempt}" -ge "$${max_attempts}" ]; then
+          echo "Failed to create namespace '$${namespace}' after $${max_attempts} attempts"
+          exit 1
+        fi
+        echo "Namespace operation not ready yet, waiting... (attempt $${attempt}/$${max_attempts})"
+        attempt="$$(($${attempt} + 1))"
+        sleep "$${sleep_seconds}"
+      done
+
 x-router-environment: &router-environment
   - RUST_LOG=${RUST_LOG:-info}
   - DEPLOYMENT_ENVIRONMENT=${DEPLOYMENT_ENVIRONMENT:-alpha}
@@ -104,6 +191,10 @@ x-router-environment: &router-environment
   - CORS_DOMAIN
   - VELORA_PARTNER
   - LOKI_URL
+  - TEMPORAL_ADDRESS=http://temporal:7233
+  - TEMPORAL_NAMESPACE=${TEMPORAL_NAMESPACE:-default}
+  - ORDER_EXECUTION_TEMPORAL_TASK_QUEUE=${ORDER_EXECUTION_TEMPORAL_TASK_QUEUE:-tee-router-order-execution}
+  - TEMPORAL_TASK_QUEUE=${ORDER_EXECUTION_TEMPORAL_TASK_QUEUE:-tee-router-order-execution}
 
 services:
   pg-secret-generator:
@@ -223,6 +314,97 @@ services:
     networks:
       - router-replication-network
 
+  temporal-postgres:
+    image: postgres:16-alpine
+    container_name: temporal-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${TEMPORAL_POSTGRES_PASSWORD:?set TEMPORAL_POSTGRES_PASSWORD}
+      POSTGRES_USER: temporal
+    volumes:
+      - temporal_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - router-network
+
+  temporal-schema:
+    image: temporalio/admin-tools:1.31.0
+    container_name: temporal-schema
+    restart: "no"
+    depends_on:
+      temporal-postgres:
+        condition: service_healthy
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: temporal
+      POSTGRES_PWD: ${TEMPORAL_POSTGRES_PASSWORD:?set TEMPORAL_POSTGRES_PASSWORD}
+      POSTGRES_SEEDS: temporal-postgres
+      SQL_PASSWORD: ${TEMPORAL_POSTGRES_PASSWORD:?set TEMPORAL_POSTGRES_PASSWORD}
+    configs:
+      - source: temporal-setup-postgres
+        target: /scripts/setup-postgres.sh
+        mode: 0555
+    entrypoint: ["/bin/sh"]
+    command: /scripts/setup-postgres.sh
+    networks:
+      - router-network
+
+  temporal:
+    image: temporalio/server:1.31.0
+    container_name: temporal
+    restart: unless-stopped
+    depends_on:
+      temporal-schema:
+        condition: service_completed_successfully
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: temporal
+      POSTGRES_PWD: ${TEMPORAL_POSTGRES_PASSWORD:?set TEMPORAL_POSTGRES_PASSWORD}
+      POSTGRES_SEEDS: temporal-postgres
+      BIND_ON_IP: 0.0.0.0
+      DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/development-sql.yaml
+      PROMETHEUS_ENDPOINT: 0.0.0.0:9090
+    expose:
+      - "7233"
+      - "9090"
+    configs:
+      - source: temporal-dynamic-config
+        target: /etc/temporal/config/dynamicconfig/development-sql.yaml
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "7233"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+      start_period: 30s
+    networks:
+      - router-network
+
+  temporal-create-namespace:
+    image: temporalio/admin-tools:1.31.0
+    container_name: temporal-create-namespace
+    restart: on-failure:5
+    depends_on:
+      temporal:
+        condition: service_healthy
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      DEFAULT_NAMESPACE: ${TEMPORAL_NAMESPACE:-default}
+    configs:
+      - source: temporal-create-namespace
+        target: /scripts/create-namespace.sh
+        mode: 0555
+    entrypoint: ["/bin/sh"]
+    command: /scripts/create-namespace.sh
+    networks:
+      - router-network
+
   router-api:
     image: ghcr.io/riftresearch/tee-router:0.1.8
     container_name: router-api
@@ -247,6 +429,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      temporal-create-namespace:
+        condition: service_completed_successfully
       router-master-key-init:
         condition: service_completed_successfully
     networks:
@@ -274,6 +458,33 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      temporal-create-namespace:
+        condition: service_completed_successfully
+      router-master-key-init:
+        condition: service_completed_successfully
+    networks:
+      - router-network
+
+  temporal-worker:
+    image: ghcr.io/riftresearch/tee-router-temporal-worker:0.1.8
+    container_name: temporal-worker
+    restart: unless-stopped
+    environment: *router-environment
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        DB_USER="$$(tr -d '\n\r' < /run/postgres-secrets/app_user.txt)"
+        DB_PASS="$$(tr -d '\n\r' < /run/postgres-secrets/app_password.txt)"
+        export DATABASE_URL="postgres://$${DB_USER}:$${DB_PASS}@postgres:5432/router_db"
+        exec /usr/local/bin/temporal-worker worker
+    volumes:
+      - router_postgres_secrets:/run/postgres-secrets:ro
+      - router_master_key:/run/router-secrets:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      temporal-create-namespace:
+        condition: service_completed_successfully
       router-master-key-init:
         condition: service_completed_successfully
     networks:
@@ -295,3 +506,4 @@ volumes:
   router_postgres_data:
   router_postgres_secrets:
   router_master_key:
+  temporal_postgres_data:

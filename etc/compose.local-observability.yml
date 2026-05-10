@@ -13,7 +13,6 @@ services:
       METRICS_BIND_ADDR: 0.0.0.0:9101
       OTEL_EXPORTER_OTLP_ENDPOINT: http://alloy:4318
       ROUTER_WORKER_ORDER_EXECUTION_POLL_SECONDS: "1"
-      ROUTER_WORKER_PROVIDER_OPERATION_HINT_PASS_LIMIT: "5000"
       ROUTER_WORKER_ORDER_MAINTENANCE_PASS_LIMIT: "1000"
       ROUTER_WORKER_ORDER_PLANNING_PASS_LIMIT: "1000"
       ROUTER_WORKER_ORDER_EXECUTION_PASS_LIMIT: "1000"
@@ -87,6 +86,7 @@ services:
     depends_on:
       - router-api
       - router-worker
+      - temporal
       - sauron
       - alloy
       - victoriametrics
