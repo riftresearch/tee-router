@@ -10,12 +10,14 @@ use router_core::{
 use std::time::Duration;
 use tracing::info;
 
-const IN_PROGRESS_ORDER_STATUSES: [RouterOrderStatus; 5] = [
+const OPERATOR_ORDER_STATUSES: [RouterOrderStatus; 7] = [
     RouterOrderStatus::PendingFunding,
     RouterOrderStatus::Funded,
     RouterOrderStatus::Executing,
     RouterOrderStatus::RefundRequired,
     RouterOrderStatus::Refunding,
+    RouterOrderStatus::ManualInterventionRequired,
+    RouterOrderStatus::RefundManualInterventionRequired,
 ];
 
 pub fn record_http_response(route: &str, method: &str, status: u16, duration: Duration) {
@@ -319,53 +321,23 @@ pub fn record_worker_tick(worker: &'static str, duration: Duration) {
     .record(duration.as_secs_f64());
 }
 
-pub fn record_worker_order_pass_summary(
-    reconciled_failed_orders: usize,
-    processed_provider_hints: usize,
-    maintenance_tasks: usize,
-    planned_orders: usize,
-    executed_orders: usize,
-) {
-    record_worker_order_pass_stage("reconciled_failed_orders", reconciled_failed_orders);
-    record_worker_order_pass_stage("processed_provider_hints", processed_provider_hints);
-    record_worker_order_pass_stage("maintenance_tasks", maintenance_tasks);
-    record_worker_order_pass_stage("planned_orders", planned_orders);
-    record_worker_order_pass_stage("executed_orders", executed_orders);
-}
-
-fn record_worker_order_pass_stage(stage: &'static str, count: usize) {
-    gauge!(
-        "tee_router_worker_order_pass_last_rows",
-        "stage" => stage,
-    )
-    .set(count as f64);
-
-    if count > 0 {
-        counter!(
-            "tee_router_worker_order_pass_rows_total",
-            "stage" => stage,
-        )
-        .increment(count as u64);
-    }
-}
-
-pub fn record_order_in_progress_queue_depth(status_counts: &[(RouterOrderStatus, u64)]) {
+pub fn record_operator_order_status_depth(status_counts: &[(RouterOrderStatus, u64)]) {
     let mut total = 0_u64;
-    for status in IN_PROGRESS_ORDER_STATUSES {
+    for status in OPERATOR_ORDER_STATUSES {
         let count = status_counts
             .iter()
             .find_map(|(count_status, count)| (*count_status == status).then_some(*count))
             .unwrap_or(0);
         total = total.saturating_add(count);
         gauge!(
-            "tee_router_order_in_progress_queue_depth",
+            "tee_router_operator_order_status_depth",
             "status" => status.to_db_string(),
         )
         .set(count as f64);
     }
 
     gauge!(
-        "tee_router_order_in_progress_queue_depth",
+        "tee_router_operator_order_status_depth",
         "status" => "all",
     )
     .set(total as f64);

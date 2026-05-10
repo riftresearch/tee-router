@@ -789,9 +789,7 @@ impl OrderRepository {
         self.map_order_row(&row)
     }
 
-    pub async fn count_in_progress_orders_by_status(
-        &self,
-    ) -> RouterCoreResult<Vec<OrderStatusCount>> {
+    pub async fn count_operator_order_statuses(&self) -> RouterCoreResult<Vec<OrderStatusCount>> {
         let started = Instant::now();
         let result = sqlx_core::query::query(
             r#"
@@ -802,7 +800,9 @@ impl OrderRepository {
                 'funded',
                 'executing',
                 'refund_required',
-                'refunding'
+                'refunding',
+                'manual_intervention_required',
+                'refund_manual_intervention_required'
             )
             GROUP BY status
             "#,
@@ -810,7 +810,7 @@ impl OrderRepository {
         .fetch_all(&self.pool)
         .await;
         telemetry::record_db_query(
-            "order.count_in_progress_orders_by_status",
+            "order.count_operator_order_statuses",
             result.is_ok(),
             started.elapsed(),
         );
@@ -838,6 +838,38 @@ impl OrderRepository {
                 })
             })
             .collect()
+    }
+
+    pub async fn list_manual_intervention_orders(
+        &self,
+        limit: i64,
+    ) -> RouterCoreResult<Vec<RouterOrder>> {
+        let started = Instant::now();
+        let result = sqlx_core::query::query(&format!(
+            r#"
+            SELECT {ORDER_SELECT_COLUMNS}
+            FROM router_orders ro
+            LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
+            LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
+            WHERE ro.status IN (
+                'manual_intervention_required',
+                'refund_manual_intervention_required'
+            )
+            ORDER BY ro.updated_at DESC, ro.id DESC
+            LIMIT $1
+            "#
+        ))
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await;
+        telemetry::record_db_query(
+            "order.list_manual_intervention_orders",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        let rows = result?;
+
+        rows.iter().map(|row| self.map_order_row(row)).collect()
     }
 
     pub async fn transition_status(

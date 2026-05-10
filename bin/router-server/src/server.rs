@@ -1,7 +1,8 @@
 use crate::{
     api::{
         CreateOrderCancellationRequest, CreateOrderRequest, CreateQuoteRequest, CreateVaultRequest,
-        DetectorHintEnvelope, DetectorHintRequest, DetectorHintTarget, ProviderHealthEnvelope,
+        DetectorHintEnvelope, DetectorHintRequest, DetectorHintTarget,
+        ManualInterventionOrderEnvelope, ManualInterventionOrdersEnvelope, ProviderHealthEnvelope,
         ProviderOperationHintEnvelope, ProviderOperationHintRequest, ProviderPolicyEnvelope,
         ProviderPolicyListEnvelope, UpdateProviderPolicyRequest, VaultFundingHintEnvelope,
         VaultFundingHintRequest, MAX_HINT_IDEMPOTENCY_KEY_LEN,
@@ -19,7 +20,8 @@ use axum::{
     body::Body,
     extract::{
         rejection::{JsonRejection, PathRejection},
-        DefaultBodyLimit, FromRequest, FromRequestParts, MatchedPath, Path as AxumPath, State,
+        DefaultBodyLimit, FromRequest, FromRequestParts, MatchedPath, Path as AxumPath, Query,
+        State,
     },
     http::{header, request::Parts, HeaderMap, Request, StatusCode},
     middleware::{self, Next},
@@ -70,6 +72,8 @@ const MAX_HINT_EVIDENCE_JSON_BYTES: usize = 16 * 1024;
 pub const MAX_ROUTER_JSON_BODY_BYTES: usize = 256 * 1024;
 const _: () = assert!(MAX_ROUTER_JSON_BODY_BYTES >= MAX_HINT_EVIDENCE_JSON_BYTES * 2);
 const _: () = assert!(MAX_ROUTER_JSON_BODY_BYTES <= 1024 * 1024);
+const DEFAULT_MANUAL_INTERVENTION_ORDER_LIMIT: i64 = 50;
+const MAX_MANUAL_INTERVENTION_ORDER_LIMIT: i64 = 500;
 
 struct RouterJson<T>(T);
 struct RouterPath<T>(T);
@@ -256,6 +260,14 @@ pub fn build_api_router(state: AppState, cors_domain: Option<String>) -> Router 
         .route(
             "/internal/v1/provider-policies/:provider",
             put(update_provider_policy),
+        )
+        .route(
+            "/internal/v1/orders/manual-interventions",
+            get(list_manual_intervention_orders),
+        )
+        .route(
+            "/internal/v1/orders/:id/manual-intervention",
+            get(get_manual_intervention_order),
         )
         .route("/internal/v1/orders/:id/flow", get(get_order_flow))
         .route("/api/v1/chains/:chain/tip", get(get_chain_tip))
@@ -1032,6 +1044,44 @@ async fn get_order_flow(
 ) -> RouterServerResult<Json<crate::api::OrderFlowEnvelope>> {
     authorize_admin_api_request(&state, &headers)?;
     Ok(Json(crate::query_api::get_order_flow(&state.db, id).await?))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ManualInterventionOrdersQuery {
+    limit: Option<i64>,
+}
+
+async fn list_manual_intervention_orders(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ManualInterventionOrdersQuery>,
+) -> RouterServerResult<Json<ManualInterventionOrdersEnvelope>> {
+    authorize_admin_api_request(&state, &headers)?;
+    let limit = normalized_manual_intervention_order_limit(query.limit)?;
+    Ok(Json(
+        crate::query_api::list_manual_intervention_orders(&state.db, limit).await?,
+    ))
+}
+
+async fn get_manual_intervention_order(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RouterPath(id): RouterPath<Uuid>,
+) -> RouterServerResult<Json<ManualInterventionOrderEnvelope>> {
+    authorize_admin_api_request(&state, &headers)?;
+    Ok(Json(
+        crate::query_api::get_manual_intervention_order(&state.db, id).await?,
+    ))
+}
+
+fn normalized_manual_intervention_order_limit(limit: Option<i64>) -> RouterServerResult<i64> {
+    let limit = limit.unwrap_or(DEFAULT_MANUAL_INTERVENTION_ORDER_LIMIT);
+    if !(1..=MAX_MANUAL_INTERVENTION_ORDER_LIMIT).contains(&limit) {
+        return Err(RouterServerError::Validation {
+            message: format!("limit must be between 1 and {MAX_MANUAL_INTERVENTION_ORDER_LIMIT}"),
+        });
+    }
+    Ok(limit)
 }
 
 fn authorize_internal_api_request(state: &AppState, headers: &HeaderMap) -> RouterServerResult<()> {
@@ -1877,6 +1927,28 @@ mod tests {
             auth.verify_headers(&wrong_key),
             Err(RouterServerError::Unauthorized { .. })
         ));
+    }
+
+    #[test]
+    fn manual_intervention_order_limit_is_bounded() {
+        assert_eq!(
+            normalized_manual_intervention_order_limit(None).unwrap(),
+            DEFAULT_MANUAL_INTERVENTION_ORDER_LIMIT
+        );
+        assert_eq!(
+            normalized_manual_intervention_order_limit(Some(1)).unwrap(),
+            1
+        );
+        assert_eq!(
+            normalized_manual_intervention_order_limit(Some(MAX_MANUAL_INTERVENTION_ORDER_LIMIT))
+                .unwrap(),
+            MAX_MANUAL_INTERVENTION_ORDER_LIMIT
+        );
+        assert!(normalized_manual_intervention_order_limit(Some(0)).is_err());
+        assert!(normalized_manual_intervention_order_limit(Some(
+            MAX_MANUAL_INTERVENTION_ORDER_LIMIT + 1
+        ))
+        .is_err());
     }
 
     #[test]

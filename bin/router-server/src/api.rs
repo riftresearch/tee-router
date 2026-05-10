@@ -2,10 +2,12 @@ use chrono::{DateTime, Utc};
 use router_core::{
     models::{
         empty_metadata, CustodyVault, DepositVaultFundingHint, OrderExecutionAttempt,
-        OrderExecutionLeg, OrderExecutionStep, OrderExecutionStepStatus, OrderProviderOperation,
-        OrderProviderOperationHint, ProviderExecutionPolicyState, ProviderHealthCheck,
-        ProviderHealthSummaryStatus, ProviderOperationHintKind, ProviderPolicy,
-        ProviderQuotePolicyState, RouterOrder, RouterOrderQuote, RouterOrderStatus, VaultAction,
+        OrderExecutionAttemptKind, OrderExecutionAttemptStatus, OrderExecutionLeg,
+        OrderExecutionStep, OrderExecutionStepStatus, OrderExecutionStepType,
+        OrderProviderOperation, OrderProviderOperationHint, ProviderExecutionPolicyState,
+        ProviderHealthCheck, ProviderHealthSummaryStatus, ProviderOperationHintKind,
+        ProviderPolicy, ProviderQuotePolicyState, RouterOrder, RouterOrderQuote, RouterOrderStatus,
+        VaultAction,
     },
     protocol::DepositAsset,
 };
@@ -226,6 +228,132 @@ pub struct OrderFlow {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManualInterventionOrdersEnvelope {
+    pub orders: Vec<ManualInterventionOrderSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManualInterventionOrderEnvelope {
+    pub order: ManualInterventionOrderContext,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManualInterventionOrderContext {
+    pub summary: ManualInterventionOrderSummary,
+    pub flow: OrderFlow,
+}
+
+impl ManualInterventionOrderContext {
+    #[must_use]
+    pub fn from_flow(
+        flow: OrderFlow,
+        workflow_id: String,
+        parent_workflow_id: Option<String>,
+    ) -> Self {
+        let summary =
+            ManualInterventionOrderSummary::from_flow(&flow, workflow_id, parent_workflow_id);
+        Self { summary, flow }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManualInterventionOrderSummary {
+    pub order_id: Uuid,
+    pub status: RouterOrderStatus,
+    pub workflow_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_workflow_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_attempt: Option<ManualInterventionAttemptSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_step: Option<ManualInterventionStepSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_provider_operation_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<Value>,
+    pub last_activity_at: DateTime<Utc>,
+}
+
+impl ManualInterventionOrderSummary {
+    #[must_use]
+    pub fn from_flow(
+        flow: &OrderFlow,
+        workflow_id: String,
+        parent_workflow_id: Option<String>,
+    ) -> Self {
+        let current_attempt = current_attempt(&flow.attempts);
+        let last_step = last_known_step(&flow.steps, current_attempt.map(|attempt| attempt.id));
+        let current_provider_operation_id = last_step.and_then(|step| {
+            flow.provider_operations
+                .iter()
+                .filter(|operation| operation.execution_step_id == Some(step.id))
+                .max_by_key(|operation| operation.updated_at)
+                .map(|operation| operation.id)
+        });
+        let failure_reason = current_attempt
+            .and_then(|attempt| non_empty_json(&attempt.failure_reason))
+            .or_else(|| last_step.and_then(|step| non_empty_json(&step.error)))
+            .or_else(|| last_step.and_then(|step| non_empty_json(&step.details)));
+
+        Self {
+            order_id: flow.order.id,
+            status: flow.order.status,
+            workflow_id,
+            parent_workflow_id,
+            current_attempt: current_attempt.map(ManualInterventionAttemptSummary::from),
+            last_step: last_step.map(ManualInterventionStepSummary::from),
+            current_provider_operation_id,
+            failure_reason: failure_reason.cloned(),
+            last_activity_at: last_activity_at(flow),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManualInterventionAttemptSummary {
+    pub attempt_id: Uuid,
+    pub attempt_index: i32,
+    pub attempt_kind: OrderExecutionAttemptKind,
+    pub status: OrderExecutionAttemptStatus,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl From<&OrderExecutionAttempt> for ManualInterventionAttemptSummary {
+    fn from(attempt: &OrderExecutionAttempt) -> Self {
+        Self {
+            attempt_id: attempt.id,
+            attempt_index: attempt.attempt_index,
+            attempt_kind: attempt.attempt_kind,
+            status: attempt.status,
+            updated_at: attempt.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManualInterventionStepSummary {
+    pub step_id: Uuid,
+    pub step_index: i32,
+    pub step_type: OrderExecutionStepType,
+    pub provider: String,
+    pub status: OrderExecutionStepStatus,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl From<&OrderExecutionStep> for ManualInterventionStepSummary {
+    fn from(step: &OrderExecutionStep) -> Self {
+        Self {
+            step_id: step.id,
+            step_index: step.step_index,
+            step_type: step.step_type,
+            provider: step.provider.clone(),
+            status: step.status,
+            updated_at: step.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderFlowTrace {
     pub trace_id: String,
     pub parent_span_id: String,
@@ -343,6 +471,75 @@ fn percent_complete_from_counts(completed_steps: usize, total_steps: usize) -> u
     percent.min(100) as u8
 }
 
+fn current_attempt(attempts: &[OrderExecutionAttempt]) -> Option<&OrderExecutionAttempt> {
+    attempts
+        .iter()
+        .max_by_key(|attempt| (attempt.attempt_index, attempt.updated_at))
+}
+
+fn last_known_step(
+    steps: &[OrderExecutionStep],
+    current_attempt_id: Option<Uuid>,
+) -> Option<&OrderExecutionStep> {
+    steps
+        .iter()
+        .filter(|step| {
+            current_attempt_id
+                .map(|attempt_id| step.execution_attempt_id == Some(attempt_id))
+                .unwrap_or(true)
+        })
+        .filter(|step| {
+            step.step_type != OrderExecutionStepType::WaitForDeposit
+                && step.status != OrderExecutionStepStatus::Superseded
+        })
+        .max_by_key(|step| {
+            (
+                manual_step_status_rank(step.status),
+                step.updated_at,
+                step.step_index,
+            )
+        })
+}
+
+fn manual_step_status_rank(status: OrderExecutionStepStatus) -> u8 {
+    match status {
+        OrderExecutionStepStatus::Failed => 5,
+        OrderExecutionStepStatus::Running | OrderExecutionStepStatus::Waiting => 4,
+        OrderExecutionStepStatus::Ready | OrderExecutionStepStatus::Planned => 3,
+        OrderExecutionStepStatus::Completed => 2,
+        OrderExecutionStepStatus::Cancelled | OrderExecutionStepStatus::Skipped => 1,
+        OrderExecutionStepStatus::Superseded => 0,
+    }
+}
+
+fn non_empty_json(value: &Value) -> Option<&Value> {
+    match value {
+        Value::Null => None,
+        Value::Object(map) if map.is_empty() => None,
+        _ => Some(value),
+    }
+}
+
+fn last_activity_at(flow: &OrderFlow) -> DateTime<Utc> {
+    let mut latest = flow.order.updated_at;
+    for timestamp in flow
+        .attempts
+        .iter()
+        .map(|attempt| attempt.updated_at)
+        .chain(flow.legs.iter().map(|leg| leg.updated_at))
+        .chain(flow.steps.iter().map(|step| step.updated_at))
+        .chain(
+            flow.provider_operations
+                .iter()
+                .map(|operation| operation.updated_at),
+        )
+        .chain(flow.custody_vaults.iter().map(|vault| vault.updated_at))
+    {
+        latest = latest.max(timestamp);
+    }
+    latest
+}
+
 fn default_hint_source() -> String {
     "unknown".to_string()
 }
@@ -358,8 +555,9 @@ mod tests {
     use router_core::{
         models::{
             MarketOrderAction, MarketOrderKind, MarketOrderKindType, MarketOrderQuote,
-            ProviderOperationStatus, ProviderOperationType, RouterOrderAction, RouterOrderEnvelope,
-            RouterOrderQuote, RouterOrderType,
+            OrderExecutionAttemptKind, OrderExecutionAttemptStatus, ProviderOperationStatus,
+            ProviderOperationType, RouterOrderAction, RouterOrderEnvelope, RouterOrderQuote,
+            RouterOrderType,
         },
         protocol::{AssetId, ChainId},
     };
@@ -589,6 +787,83 @@ mod tests {
     }
 
     #[test]
+    fn manual_intervention_context_reports_operator_shape() {
+        let order_id = Uuid::now_v7();
+        let attempt_id = Uuid::now_v7();
+        let step_id = Uuid::now_v7();
+        let operation_id = Uuid::now_v7();
+        let order = test_order(order_id, RouterOrderStatus::ManualInterventionRequired);
+        let attempt = test_attempt(
+            order_id,
+            attempt_id,
+            1,
+            OrderExecutionAttemptKind::PrimaryExecution,
+            OrderExecutionAttemptStatus::ManualInterventionRequired,
+            json!({"reason": "stale_running_step_without_checkpoint"}),
+        );
+        let mut step = test_step_with_id(order_id, step_id, 1, OrderExecutionStepStatus::Failed, 0);
+        step.execution_attempt_id = Some(attempt_id);
+        step.error = json!({"error": "execution step requires manual intervention"});
+        let mut operation = test_provider_operation(order_id, operation_id, step_id);
+        operation.execution_attempt_id = Some(attempt_id);
+        let progress = OrderFlowProgress::from_parts(
+            &order,
+            std::slice::from_ref(&step),
+            std::slice::from_ref(&operation),
+        );
+        let flow = OrderFlow {
+            order,
+            trace: OrderFlowTrace {
+                trace_id: order_id.simple().to_string(),
+                parent_span_id: "1111111111111111".to_string(),
+            },
+            progress,
+            quote: None,
+            attempts: vec![attempt],
+            legs: vec![],
+            steps: vec![step],
+            provider_operations: vec![operation],
+            custody_vaults: vec![],
+        };
+
+        let context = ManualInterventionOrderContext::from_flow(
+            flow,
+            format!("order:{order_id}:execution"),
+            None,
+        );
+
+        assert_eq!(context.summary.order_id, order_id);
+        assert_eq!(
+            context.summary.status,
+            RouterOrderStatus::ManualInterventionRequired
+        );
+        assert_eq!(
+            context.summary.workflow_id,
+            format!("order:{order_id}:execution")
+        );
+        assert_eq!(
+            context
+                .summary
+                .current_attempt
+                .as_ref()
+                .map(|attempt| attempt.attempt_id),
+            Some(attempt_id)
+        );
+        assert_eq!(
+            context.summary.last_step.as_ref().map(|step| step.step_id),
+            Some(step_id)
+        );
+        assert_eq!(
+            context.summary.current_provider_operation_id,
+            Some(operation_id)
+        );
+        assert_eq!(
+            context.summary.failure_reason,
+            Some(json!({"reason": "stale_running_step_without_checkpoint"}))
+        );
+    }
+
+    #[test]
     fn percent_complete_uses_wide_math_and_clamps_overcomplete_counts() {
         assert_eq!(percent_complete_from_counts(usize::MAX, 1), 100);
         assert_eq!(percent_complete_from_counts(usize::MAX / 2, usize::MAX), 49);
@@ -694,6 +969,30 @@ mod tests {
             request: json!({}),
             response: json!({}),
             observed_state: json!({}),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn test_attempt(
+        order_id: Uuid,
+        attempt_id: Uuid,
+        attempt_index: i32,
+        attempt_kind: OrderExecutionAttemptKind,
+        status: OrderExecutionAttemptStatus,
+        failure_reason: serde_json::Value,
+    ) -> OrderExecutionAttempt {
+        let now = Utc::now();
+        OrderExecutionAttempt {
+            id: attempt_id,
+            order_id,
+            attempt_index,
+            attempt_kind,
+            status,
+            trigger_step_id: None,
+            trigger_provider_operation_id: None,
+            failure_reason,
+            input_custody_snapshot: json!({}),
             created_at: now,
             updated_at: now,
         }
