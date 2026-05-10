@@ -2,7 +2,7 @@ use std::{
     env,
     error::Error,
     future::Future,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::Command,
     str::FromStr,
@@ -982,6 +982,11 @@ fn order_worker_runtime_args_from_router_args(args: &RouterServerArgs) -> OrderW
 }
 
 fn ensure_temporal_up() {
+    let local_temporal = SocketAddr::from(([127, 0, 0, 1], 7233));
+    if TcpStream::connect_timeout(&local_temporal, Duration::from_millis(500)).is_ok() {
+        return;
+    }
+
     let status = Command::new("just")
         .arg("temporal-up")
         .status()

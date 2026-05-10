@@ -1,4 +1,10 @@
-use std::{process::Command, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    net::{SocketAddr, TcpStream},
+    process::Command,
+    str::FromStr,
+    sync::Arc,
+    time::Duration,
+};
 
 use alloy::{
     network::{EthereumWallet, TransactionBuilder},
@@ -112,6 +118,7 @@ enum WorkflowRoute {
     AcrossBaseEthToEthereumUsdc,
     CctpBaseUsdcToArbitrumEth,
     CctpBaseUsdcToBitcoin,
+    HyperliquidArbitrumUsdcToBitcoin,
     UnitBitcoinToBaseEth,
 }
 
@@ -1264,6 +1271,75 @@ async fn order_workflow_refreshes_hyperliquid_bridge_quote_then_completes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn order_workflow_completes_arbitrum_usdc_hyperliquid_trade_path() {
+    let run = run_order_workflow(WorkflowOptions {
+        route: WorkflowRoute::HyperliquidArbitrumUsdcToBitcoin,
+        ..WorkflowOptions::default()
+    })
+    .await;
+
+    assert_eq!(run.output.terminal_status, OrderTerminalStatus::Completed);
+    let completed = run
+        .db
+        .orders()
+        .get(run.order_id)
+        .await
+        .expect("load completed Arbitrum USDC order");
+    assert_eq!(completed.status, RouterOrderStatus::Completed);
+
+    let attempts = run
+        .db
+        .orders()
+        .get_execution_attempts(run.order_id)
+        .await
+        .expect("load Arbitrum USDC attempts");
+    assert_eq!(attempts.len(), 1);
+    let steps = run
+        .db
+        .orders()
+        .get_execution_steps_for_attempt(attempts[0].id)
+        .await
+        .expect("load Arbitrum USDC steps");
+    let bridge_deposit = steps
+        .iter()
+        .find(|step| step.step_type == OrderExecutionStepType::HyperliquidBridgeDeposit)
+        .expect("Arbitrum USDC route should bridge into Hyperliquid");
+    assert_eq!(
+        bridge_deposit.status,
+        OrderExecutionStepStatus::Completed,
+        "Hyperliquid bridge deposit should complete before the trade"
+    );
+    let trade = steps
+        .iter()
+        .find(|step| step.step_type == OrderExecutionStepType::HyperliquidTrade)
+        .expect("Arbitrum USDC route should include HyperliquidTrade");
+    assert_eq!(trade.status, OrderExecutionStepStatus::Completed);
+    assert_eq!(
+        trade
+            .request
+            .get("hyperliquid_custody_vault_role")
+            .and_then(Value::as_str),
+        Some(CustodyVaultRole::SourceDeposit.to_db_string())
+    );
+    assert!(
+        trade
+            .request
+            .get("hyperliquid_custody_vault_id")
+            .and_then(Value::as_str)
+            .is_some(),
+        "source-deposit HyperliquidTrade must be hydrated with the funding vault id"
+    );
+    assert!(
+        trade
+            .request
+            .get("hyperliquid_custody_vault_address")
+            .and_then(Value::as_str)
+            .is_some(),
+        "source-deposit HyperliquidTrade must be hydrated with the funding vault address"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn order_workflow_refresh_untenable_routes_to_refund() {
     let run = run_order_workflow(WorkflowOptions {
         expire_quote_legs: true,
@@ -1360,12 +1436,23 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
         options.route,
         WorkflowRoute::CctpBaseUsdcToArbitrumEth | WorkflowRoute::CctpBaseUsdcToBitcoin
     );
+    let arbitrum_enabled = cctp_enabled
+        || matches!(
+            options.route,
+            WorkflowRoute::HyperliquidArbitrumUsdcToBitcoin
+        );
     let unit_enabled = matches!(options.route, WorkflowRoute::UnitBitcoinToBaseEth)
         || matches!(options.route, WorkflowRoute::CctpBaseUsdcToBitcoin)
+        || matches!(
+            options.route,
+            WorkflowRoute::HyperliquidArbitrumUsdcToBitcoin
+        )
         || options.expect_hyperliquid_spot_unit_refund;
     let bitcoin_enabled = matches!(
         options.route,
-        WorkflowRoute::UnitBitcoinToBaseEth | WorkflowRoute::CctpBaseUsdcToBitcoin
+        WorkflowRoute::UnitBitcoinToBaseEth
+            | WorkflowRoute::CctpBaseUsdcToBitcoin
+            | WorkflowRoute::HyperliquidArbitrumUsdcToBitcoin
     );
     if across_enabled {
         install_mock_usdc_clone(
@@ -1376,7 +1463,7 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
         )
         .await;
     }
-    if cctp_enabled {
+    if arbitrum_enabled {
         install_mock_usdc_clone(
             &devnet.arbitrum,
             ARBITRUM_USDC_ADDRESS
@@ -1394,7 +1481,7 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
             options.route,
             hyperliquid_enabled,
             across_enabled,
-            cctp_enabled,
+            arbitrum_enabled,
             bitcoin_enabled,
         )
         .await,
@@ -1468,6 +1555,16 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
         }
         WorkflowRoute::CctpBaseUsdcToBitcoin => {
             seed_funded_cctp_hyperliquid_unit_order(
+                &db,
+                settings.clone(),
+                chain_registry.clone(),
+                action_providers.clone(),
+                &devnet,
+            )
+            .await
+        }
+        WorkflowRoute::HyperliquidArbitrumUsdcToBitcoin => {
+            seed_funded_arbitrum_hyperliquid_unit_order(
                 &db,
                 settings.clone(),
                 chain_registry.clone(),
@@ -1715,7 +1812,11 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
                 signal_order_cctp_attestation(&client, &workflow_id, order_id, cctp_operation)
                     .await;
             }
-            if matches!(options.route, WorkflowRoute::CctpBaseUsdcToBitcoin) {
+            if matches!(
+                options.route,
+                WorkflowRoute::CctpBaseUsdcToBitcoin
+                    | WorkflowRoute::HyperliquidArbitrumUsdcToBitcoin
+            ) {
                 signal_order_hyperliquid_bridge_deposit_observation(
                     &client,
                     &db_for_workflow,
@@ -1727,7 +1828,9 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
             }
             if matches!(
                 options.route,
-                WorkflowRoute::UnitBitcoinToBaseEth | WorkflowRoute::CctpBaseUsdcToBitcoin
+                WorkflowRoute::UnitBitcoinToBaseEth
+                    | WorkflowRoute::CctpBaseUsdcToBitcoin
+                    | WorkflowRoute::HyperliquidArbitrumUsdcToBitcoin
             ) {
                 signal_order_unit_withdrawal_observation(
                     &client,
@@ -1892,6 +1995,11 @@ async fn seed_manual_intervention_state(
 }
 
 fn ensure_temporal_up() {
+    let local_temporal = SocketAddr::from(([127, 0, 0, 1], 7233));
+    if TcpStream::connect_timeout(&local_temporal, Duration::from_millis(500)).is_ok() {
+        return;
+    }
+
     let status = Command::new("just")
         .arg("temporal-up")
         .status()
@@ -1975,7 +2083,7 @@ async fn test_chain_registry(
     _route: WorkflowRoute,
     hyperliquid_enabled: bool,
     across_enabled: bool,
-    cctp_enabled: bool,
+    arbitrum_enabled: bool,
     bitcoin_enabled: bool,
 ) -> ChainRegistry {
     let base_chain = EvmChain::new_with_gas_sponsor(
@@ -2017,7 +2125,7 @@ async fn test_chain_registry(
         .expect("ethereum chain setup");
         registry.register_evm(ChainType::Ethereum, Arc::new(ethereum_chain));
     }
-    if cctp_enabled {
+    if arbitrum_enabled {
         let arbitrum_chain = EvmChain::new_with_gas_sponsor(
             &devnet.arbitrum.anvil.endpoint(),
             ARBITRUM_USDC_ADDRESS,
@@ -2102,6 +2210,10 @@ async fn spawn_mocks(devnet: &RiftDevnet, options: &WorkflowOptions) -> MockInte
         || options.expect_external_custody_across_then_velora_refund;
     let unit_enabled = matches!(options.route, WorkflowRoute::UnitBitcoinToBaseEth)
         || matches!(options.route, WorkflowRoute::CctpBaseUsdcToBitcoin)
+        || matches!(
+            options.route,
+            WorkflowRoute::HyperliquidArbitrumUsdcToBitcoin
+        )
         || options.expect_hyperliquid_spot_unit_refund;
     if matches!(
         options.route,
@@ -3624,6 +3736,114 @@ async fn seed_funded_cctp_hyperliquid_unit_order(
         )
         .await
         .expect("mark CCTP + Hyperliquid + Unit order funded");
+    SeededOrder {
+        order_id: order.id,
+        funding_vault_address: vault.deposit_vault_address,
+    }
+}
+
+async fn seed_funded_arbitrum_hyperliquid_unit_order(
+    db: &Database,
+    settings: Arc<Settings>,
+    chain_registry: Arc<ChainRegistry>,
+    action_providers: Arc<ActionProviderRegistry>,
+    devnet: &RiftDevnet,
+) -> SeededOrder {
+    let order_manager = OrderManager::with_action_providers(
+        db.clone(),
+        settings.clone(),
+        chain_registry.clone(),
+        action_providers,
+    );
+    let vault_manager = VaultManager::new(db.clone(), settings, chain_registry);
+    let source_asset = DepositAsset {
+        chain: ChainId::parse("evm:42161").expect("arbitrum chain id"),
+        asset: AssetId::parse(ARBITRUM_USDC_ADDRESS).expect("Arbitrum USDC asset"),
+    };
+    let destination_asset = DepositAsset {
+        chain: ChainId::parse("bitcoin").expect("bitcoin chain id"),
+        asset: AssetId::Native,
+    };
+    let quote = order_manager
+        .quote_market_order(MarketOrderQuoteRequest {
+            from_asset: source_asset.clone(),
+            to_asset: destination_asset,
+            recipient_address: devnet.bitcoin.miner_address.to_string(),
+            order_kind: MarketOrderQuoteKind::ExactIn {
+                amount_in: ORDER_USDC_AMOUNT_RAW.to_string(),
+                slippage_bps: Some(100),
+            },
+        })
+        .await
+        .expect("quote Arbitrum USDC + Hyperliquid + Unit order");
+    let market_quote = match quote.quote {
+        RouterOrderQuote::MarketOrder(quote) => quote,
+        RouterOrderQuote::LimitOrder(_) => panic!("expected market quote"),
+    };
+    assert!(
+        !market_quote.provider_id.contains("cctp_bridge:cctp")
+            && market_quote
+                .provider_id
+                .contains("hyperliquid_bridge_deposit:hyperliquid_bridge")
+            && market_quote
+                .provider_id
+                .contains("hyperliquid_trade:hyperliquid")
+            && market_quote.provider_id.contains("unit_withdrawal:unit"),
+        "expected direct Arbitrum HyperliquidBridgeDeposit + HyperliquidTrade + UnitWithdrawal route, got {}",
+        market_quote.provider_id
+    );
+
+    let (order, _) = order_manager
+        .create_order_from_quote(CreateOrderRequest {
+            quote_id: market_quote.id,
+            refund_address: valid_evm_address(),
+            idempotency_key: None,
+            metadata: json!({ "test": "temporal_order_workflow_arbitrum_hyperliquid_unit" }),
+        })
+        .await
+        .expect("create Arbitrum USDC + Hyperliquid + Unit order from quote");
+    let vault = vault_manager
+        .create_vault(CreateVaultRequest {
+            order_id: Some(order.id),
+            deposit_asset: source_asset,
+            action: VaultAction::Null,
+            recovery_address: valid_evm_address(),
+            cancellation_commitment:
+                "0x1111111111111111111111111111111111111111111111111111111111111111".to_string(),
+            cancel_after: None,
+            metadata: json!({ "test": "temporal_order_workflow_arbitrum_hyperliquid_unit" }),
+        })
+        .await
+        .expect("create Arbitrum USDC + Hyperliquid + Unit funding vault");
+    fund_erc20_source_vault(
+        &devnet.arbitrum,
+        ARBITRUM_USDC_ADDRESS
+            .parse()
+            .expect("valid Arbitrum USDC address"),
+        &vault.deposit_vault_address,
+        &market_quote.amount_in,
+    )
+    .await;
+
+    let now = Utc::now();
+    db.vaults()
+        .transition_status(
+            vault.id,
+            DepositVaultStatus::PendingFunding,
+            DepositVaultStatus::Funded,
+            now,
+        )
+        .await
+        .expect("mark Arbitrum USDC + Hyperliquid + Unit vault funded");
+    db.orders()
+        .transition_status(
+            order.id,
+            RouterOrderStatus::PendingFunding,
+            RouterOrderStatus::Funded,
+            now,
+        )
+        .await
+        .expect("mark Arbitrum USDC + Hyperliquid + Unit order funded");
     SeededOrder {
         order_id: order.id,
         funding_vault_address: vault.deposit_vault_address,
