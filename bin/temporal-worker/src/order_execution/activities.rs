@@ -620,7 +620,7 @@ impl OrderActivities {
                 &input.execution.provider_state,
                 &input.execution.response,
             )
-            .map_err(activity_error_from_display)?;
+            .map_err(|source| provider_execute_error(&step.provider, source))?;
             if let Some(mut operation) = operation {
                 operation.status = receipt_boundary_status(operation.status);
                 let provider_operation_id = deps
@@ -671,7 +671,7 @@ impl OrderActivities {
                 &input.execution.provider_state,
                 &input.execution.response,
             )
-            .map_err(activity_error_from_display)?;
+            .map_err(|source| provider_execute_error(&step.provider, source))?;
             if let Some(operation) = operation {
                 let provider_operation_id = deps
                     .db
@@ -1045,29 +1045,32 @@ impl OrderActivities {
                 .orders()
                 .get(input.order_id.inner())
                 .await
-                .map_err(activity_error_from_display)?;
+                .map_err(OrderActivityError::db_query)?;
             let failed_step = deps
                 .db
                 .orders()
                 .get_execution_step(input.failed_step_id.inner())
                 .await
-                .map_err(activity_error_from_display)?;
+                .map_err(OrderActivityError::db_query)?;
             if failed_step.order_id != input.order_id.inner()
                 || failed_step.execution_attempt_id != Some(input.attempt_id.inner())
             {
-                return Err(activity_error(format!(
-                    "step {} does not belong to order {} attempt {}",
-                    failed_step.id,
-                    input.order_id.inner(),
-                    input.attempt_id.inner()
-                )));
+                return Err(invariant_error(
+                    "step_belongs_to_order_attempt",
+                    format!(
+                        "step {} does not belong to order {} attempt {}",
+                        failed_step.id,
+                        input.order_id.inner(),
+                        input.attempt_id.inner()
+                    ),
+                ));
             }
             let trigger_provider_operation_id = deps
                 .db
                 .orders()
                 .get_provider_operations(input.order_id.inner())
                 .await
-                .map_err(activity_error_from_display)?
+                .map_err(OrderActivityError::db_query)?
                 .into_iter()
                 .filter(|operation| operation.execution_step_id == Some(failed_step.id))
                 .map(|operation| (operation.created_at, operation.id))
@@ -1100,16 +1103,19 @@ impl OrderActivities {
                         .orders()
                         .get_execution_attempt(input.attempt_id.inner())
                         .await
-                        .map_err(activity_error_from_display)?;
+                        .map_err(OrderActivityError::db_query)?;
                     if attempt.status != OrderExecutionAttemptStatus::Failed {
-                        return Err(activity_error(format!(
-                            "attempt {} was not active or failed while writing failure snapshot",
-                            input.attempt_id.inner()
-                        )));
+                        return Err(invariant_error(
+                            "failed_attempt_snapshot_idempotent_state",
+                            format!(
+                                "attempt {} was not active or failed while writing failure snapshot",
+                                input.attempt_id.inner()
+                            ),
+                        ));
                     }
                     attempt
                 }
-                Err(source) => return Err(activity_error_from_display(source)),
+                Err(source) => return Err(OrderActivityError::db_query(source)),
             };
             Ok(FailedAttemptSnapshotWritten {
                 attempt_id: attempt.id.into(),
@@ -1136,7 +1142,7 @@ impl OrderActivities {
                         .orders()
                         .mark_order_refund_required(input.order_id.inner(), Utc::now())
                         .await
-                        .map_err(activity_error_from_display)?;
+                        .map_err(OrderActivityError::db_query)?;
                     tracing::info!(
                         order_id = %order.id,
                         event_name = "order.refund_required",
@@ -1149,14 +1155,17 @@ impl OrderActivities {
                 }
                 OrderTerminalStatus::Refunded => {
                     let attempt_id = input.attempt_id.map(|id| id.inner()).ok_or_else(|| {
-                        activity_error("finalize refunded order requires a refund attempt id")
+                        invariant_error(
+                            "finalize_refunded_order_requires_refund_attempt",
+                            "finalize refunded order requires a refund attempt id",
+                        )
                     })?;
                     let completed = deps
                         .db
                         .orders()
                         .mark_order_refunded(input.order_id.inner(), attempt_id, Utc::now())
                         .await
-                        .map_err(activity_error_from_display)?;
+                        .map_err(OrderActivityError::db_query)?;
                     tracing::info!(
                         order_id = %completed.order.id,
                         attempt_id = %completed.attempt.id,
@@ -1177,7 +1186,7 @@ impl OrderActivities {
                             Utc::now(),
                         )
                         .await
-                        .map_err(activity_error_from_display)?;
+                        .map_err(OrderActivityError::db_query)?;
                     tracing::info!(
                         order_id = %order.id,
                         event_name = "order.refund_manual_intervention_required",
@@ -1190,12 +1199,16 @@ impl OrderActivities {
                 }
                 OrderTerminalStatus::ManualInterventionRequired => {
                     let attempt_id = input.attempt_id.map(|id| id.inner()).ok_or_else(|| {
-                        activity_error(
+                        invariant_error(
+                            "finalize_manual_intervention_requires_attempt",
                             "finalize manual intervention requires an execution attempt id",
                         )
                     })?;
                     let step_id = input.step_id.map(|id| id.inner()).ok_or_else(|| {
-                        activity_error("finalize manual intervention requires an execution step id")
+                        invariant_error(
+                            "finalize_manual_intervention_requires_step",
+                            "finalize manual intervention requires an execution step id",
+                        )
                     })?;
                     let order = finalize_execution_manual_intervention(
                         &deps,
@@ -1222,9 +1235,10 @@ impl OrderActivities {
                         terminal_status: OrderTerminalStatus::ManualInterventionRequired,
                     })
                 }
-                terminal_status => Err(activity_error(format!(
-                    "finalize_order_or_refund does not handle {terminal_status:?} in PR6a"
-                ))),
+                terminal_status => Err(invariant_error(
+                    "unsupported_order_terminal_status",
+                    format!("finalize_order_or_refund does not handle {terminal_status:?}"),
+                )),
             }
         })
         .await
@@ -1301,7 +1315,7 @@ impl OrderActivities {
                     Utc::now(),
                 )
                 .await
-                .map_err(activity_error_from_display)?;
+                .map_err(OrderActivityError::db_query)?;
             tracing::info!(
                 order_id = %order.id,
                 attempt_id = %input.attempt_id.inner(),
@@ -1347,7 +1361,7 @@ impl OrderActivities {
                     Utc::now(),
                 )
                 .await
-                .map_err(activity_error_from_display)?;
+                .map_err(OrderActivityError::db_query)?;
             tracing::info!(
                 order_id = %order.id,
                 refund_attempt_id = ?input.refund_attempt_id,
@@ -1405,7 +1419,7 @@ impl OrderActivities {
                     Utc::now(),
                 )
                 .await
-                .map_err(activity_error_from_display)?;
+                .map_err(OrderActivityError::db_query)?;
             tracing::info!(
                 order_id = %order.id,
                 terminal_status = ?terminal_status,
@@ -1431,16 +1445,19 @@ async fn classify_stale_running_step_for_deps(
         .orders()
         .get_execution_step(input.step_id.inner())
         .await
-        .map_err(activity_error_from_display)?;
+        .map_err(OrderActivityError::db_query)?;
     if step.order_id != input.order_id.inner()
         || step.execution_attempt_id != Some(input.attempt_id.inner())
     {
-        return Err(activity_error(format!(
-            "step {} does not belong to order {} attempt {}",
-            step.id,
-            input.order_id.inner(),
-            input.attempt_id.inner()
-        )));
+        return Err(invariant_error(
+            "step_belongs_to_order_attempt",
+            format!(
+                "step {} does not belong to order {} attempt {}",
+                step.id,
+                input.order_id.inner(),
+                input.attempt_id.inner()
+            ),
+        ));
     }
 
     let step_operations: Vec<_> = deps
@@ -1448,7 +1465,7 @@ async fn classify_stale_running_step_for_deps(
         .orders()
         .get_provider_operations(input.order_id.inner())
         .await
-        .map_err(activity_error_from_display)?
+        .map_err(OrderActivityError::db_query)?
         .into_iter()
         .filter(|operation| operation.execution_step_id == Some(step.id))
         .collect();
@@ -1512,7 +1529,7 @@ async fn classify_stale_running_step_for_deps(
             Utc::now(),
         )
         .await
-        .map_err(activity_error_from_display)?;
+        .map_err(OrderActivityError::db_query)?;
     tracing::info!(
         order_id = %input.order_id.inner(),
         attempt_id = %input.attempt_id.inner(),
@@ -1575,12 +1592,15 @@ async fn finalize_execution_manual_intervention(
         .orders()
         .get_execution_step(step_id)
         .await
-        .map_err(activity_error_from_display)?;
+        .map_err(OrderActivityError::db_query)?;
     if step.order_id != order_id || step.execution_attempt_id != Some(attempt_id) {
-        return Err(activity_error(format!(
-            "step {} does not belong to order {} attempt {}",
-            step.id, order_id, attempt_id
-        )));
+        return Err(invariant_error(
+            "step_belongs_to_order_attempt",
+            format!(
+                "step {} does not belong to order {} attempt {}",
+                step.id, order_id, attempt_id
+            ),
+        ));
     }
 
     let step_error = json!({
@@ -1597,20 +1617,19 @@ async fn finalize_execution_manual_intervention(
             .orders()
             .fail_execution_step(step.id, step_error, now)
             .await
-            .map_err(activity_error_from_display)?,
+            .map_err(OrderActivityError::db_query)?,
         OrderExecutionStepStatus::Waiting => deps
             .db
             .orders()
             .fail_observed_execution_step(step.id, step_error, now)
             .await
-            .map_err(activity_error_from_display)?,
+            .map_err(OrderActivityError::db_query)?,
         OrderExecutionStepStatus::Failed => step,
         status => {
-            return Err(activity_error(format!(
-                "step {} cannot be finalized as manual intervention from status {}",
-                step.id,
-                status.to_db_string()
-            )));
+            return Err(OrderActivityError::invalid_terminal_state(
+                status.to_db_string(),
+                "running, waiting, or failed",
+            ));
         }
     };
 
@@ -1619,7 +1638,7 @@ async fn finalize_execution_manual_intervention(
         .orders()
         .get(order_id)
         .await
-        .map_err(activity_error_from_display)?;
+        .map_err(OrderActivityError::db_query)?;
     let failure_reason = json!({
         "reason": reason
             .get("reason")
@@ -1648,22 +1667,25 @@ async fn finalize_execution_manual_intervention(
                 .orders()
                 .get_execution_attempt(attempt_id)
                 .await
-                .map_err(activity_error_from_display)?;
+                .map_err(OrderActivityError::db_query)?;
             if attempt.status != OrderExecutionAttemptStatus::ManualInterventionRequired {
-                return Err(activity_error(format!(
-                    "attempt {} was not eligible for manual intervention finalization",
-                    attempt_id
-                )));
+                return Err(invariant_error(
+                    "attempt_eligible_for_manual_intervention_finalization",
+                    format!(
+                        "attempt {} was not eligible for manual intervention finalization",
+                        attempt_id
+                    ),
+                ));
             }
         }
-        Err(source) => return Err(activity_error_from_display(source)),
+        Err(source) => return Err(OrderActivityError::db_query(source)),
     }
 
     deps.db
         .orders()
         .mark_order_manual_intervention_required(order_id, now)
         .await
-        .map_err(activity_error_from_display)
+        .map_err(OrderActivityError::db_query)
 }
 
 async fn settle_waiting_provider_step(
@@ -1675,7 +1697,7 @@ async fn settle_waiting_provider_step(
         .orders()
         .get_provider_operations(execution.order_id.inner())
         .await
-        .map_err(activity_error_from_display)?;
+        .map_err(OrderActivityError::db_query)?;
     let operation = operations
         .iter()
         .filter(|operation| operation.execution_step_id == Some(execution.step_id.inner()))
@@ -1720,16 +1742,19 @@ async fn settle_waiting_provider_step(
                         .orders()
                         .get_execution_step(execution.step_id.inner())
                         .await
-                        .map_err(activity_error_from_display)?;
+                        .map_err(OrderActivityError::db_query)?;
                     if current.status != OrderExecutionStepStatus::Failed {
-                        return Err(activity_error(format!(
-                            "failed provider step {} is in unexpected status {}",
-                            execution.step_id.inner(),
-                            current.status.to_db_string()
-                        )));
+                        return Err(invariant_error(
+                            "failed_provider_step_status",
+                            format!(
+                                "failed provider step {} is in unexpected status {}",
+                                execution.step_id.inner(),
+                                current.status.to_db_string()
+                            ),
+                        ));
                     }
                 }
-                Err(source) => return Err(activity_error_from_display(source)),
+                Err(source) => return Err(OrderActivityError::db_query(source)),
             }
         }
         Some(
@@ -1764,19 +1789,22 @@ async fn settle_waiting_provider_step(
                         .orders()
                         .get_execution_step(execution.step_id.inner())
                         .await
-                        .map_err(activity_error_from_display)?;
+                        .map_err(OrderActivityError::db_query)?;
                     if !matches!(
                         current.status,
                         OrderExecutionStepStatus::Waiting | OrderExecutionStepStatus::Completed
                     ) {
-                        return Err(activity_error(format!(
-                            "waiting provider step {} is in unexpected status {}",
-                            execution.step_id.inner(),
-                            current.status.to_db_string()
-                        )));
+                        return Err(invariant_error(
+                            "waiting_provider_step_status",
+                            format!(
+                                "waiting provider step {} is in unexpected status {}",
+                                execution.step_id.inner(),
+                                current.status.to_db_string()
+                            ),
+                        ));
                     }
                 }
-                Err(source) => return Err(activity_error_from_display(source)),
+                Err(source) => return Err(OrderActivityError::db_query(source)),
             }
         }
     }
@@ -1808,19 +1836,22 @@ async fn complete_observed_provider_step(
                 .orders()
                 .get_execution_step(execution.step_id.inner())
                 .await
-                .map_err(activity_error_from_display)?;
+                .map_err(OrderActivityError::db_query)?;
             if current.status == OrderExecutionStepStatus::Completed {
                 Ok(current)
             } else {
-                Err(activity_error(format!(
-                    "completed provider operation {} could not settle step {} in status {}",
-                    operation.id,
-                    execution.step_id.inner(),
-                    current.status.to_db_string()
-                )))
+                Err(invariant_error(
+                    "completed_provider_operation_settlement_status",
+                    format!(
+                        "completed provider operation {} could not settle step {} in status {}",
+                        operation.id,
+                        execution.step_id.inner(),
+                        current.status.to_db_string()
+                    ),
+                ))
             }
         }
-        Err(source) => Err(activity_error_from_display(source)),
+        Err(source) => Err(OrderActivityError::db_query(source)),
     }
 }
 
@@ -1892,12 +1923,13 @@ async fn hydrate_destination_execution_steps(
             "recipient_custody_vault_role",
             CustodyVaultRole::DestinationExecution.to_db_string(),
         ) {
-            let asset = step.output_asset.clone().ok_or_else(|| {
-                activity_error(format!(
-                    "destination execution recipient requires output_asset for step {}",
-                    step.id
-                ))
-            })?;
+            let asset = step
+                .output_asset
+                .clone()
+                .ok_or(OrderActivityError::MissingHydration {
+                    vault_role: "destination_execution_recipient_output_asset",
+                    step_id: step.id.into(),
+                })?;
             let vault = ensure_destination_execution_vault(
                 deps,
                 order_id,
@@ -1933,12 +1965,13 @@ async fn hydrate_destination_execution_steps(
             "source_custody_vault_role",
             CustodyVaultRole::DestinationExecution.to_db_string(),
         ) {
-            let asset = step.input_asset.clone().ok_or_else(|| {
-                activity_error(format!(
-                    "destination execution source requires input_asset for step {}",
-                    step.id
-                ))
-            })?;
+            let asset = step
+                .input_asset
+                .clone()
+                .ok_or(OrderActivityError::MissingHydration {
+                    vault_role: "destination_execution_source_input_asset",
+                    step_id: step.id.into(),
+                })?;
             let vault = ensure_destination_execution_vault(
                 deps,
                 order_id,
@@ -1973,12 +2006,13 @@ async fn hydrate_destination_execution_steps(
             "depositor_custody_vault_role",
             CustodyVaultRole::DestinationExecution.to_db_string(),
         ) {
-            let asset = step.input_asset.clone().ok_or_else(|| {
-                activity_error(format!(
-                    "destination execution depositor requires input_asset for step {}",
-                    step.id
-                ))
-            })?;
+            let asset = step
+                .input_asset
+                .clone()
+                .ok_or(OrderActivityError::MissingHydration {
+                    vault_role: "destination_execution_depositor_input_asset",
+                    step_id: step.id.into(),
+                })?;
             let vault = ensure_destination_execution_vault(
                 deps,
                 order_id,
@@ -2009,12 +2043,13 @@ async fn hydrate_destination_execution_steps(
             "refund_custody_vault_role",
             CustodyVaultRole::DestinationExecution.to_db_string(),
         ) {
-            let asset = step.input_asset.clone().ok_or_else(|| {
-                activity_error(format!(
-                    "destination execution refund requires input_asset for step {}",
-                    step.id
-                ))
-            })?;
+            let asset = step
+                .input_asset
+                .clone()
+                .ok_or(OrderActivityError::MissingHydration {
+                    vault_role: "destination_execution_refund_input_asset",
+                    step_id: step.id.into(),
+                })?;
             let vault = ensure_destination_execution_vault(
                 deps,
                 order_id,
@@ -2049,34 +2084,36 @@ async fn hydrate_destination_execution_steps(
                 .request
                 .get("hyperliquid_custody_vault_chain_id")
                 .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    activity_error(format!(
-                        "source deposit Hyperliquid custody requires hyperliquid_custody_vault_chain_id for step {}",
-                        step.id
-                    ))
+                .ok_or(OrderActivityError::MissingHydration {
+                    vault_role: "source_deposit_hyperliquid_chain",
+                    step_id: step.id.into(),
                 })?;
             let asset_id = step
                 .request
                 .get("hyperliquid_custody_vault_asset_id")
                 .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    activity_error(format!(
-                        "source deposit Hyperliquid custody requires hyperliquid_custody_vault_asset_id for step {}",
-                        step.id
-                    ))
+                .ok_or(OrderActivityError::MissingHydration {
+                    vault_role: "source_deposit_hyperliquid_asset",
+                    step_id: step.id.into(),
                 })?;
             let asset = DepositAsset {
                 chain: ChainId::parse(chain_id).map_err(|source| {
-                    activity_error(format!(
-                        "step {} hyperliquid_custody_vault_chain_id is invalid: {source}",
-                        step.id
-                    ))
+                    invariant_error(
+                        "hyperliquid_custody_vault_chain_id_valid",
+                        format!(
+                            "step {} hyperliquid_custody_vault_chain_id is invalid: {source}",
+                            step.id
+                        ),
+                    )
                 })?,
                 asset: AssetId::parse(asset_id).map_err(|source| {
-                    activity_error(format!(
-                        "step {} hyperliquid_custody_vault_asset_id is invalid: {source}",
-                        step.id
-                    ))
+                    invariant_error(
+                        "hyperliquid_custody_vault_asset_id_valid",
+                        format!(
+                            "step {} hyperliquid_custody_vault_asset_id is invalid: {source}",
+                            step.id
+                        ),
+                    )
                 })?,
             };
             let vault =
@@ -2142,34 +2179,36 @@ async fn hydrate_destination_execution_steps(
                 .request
                 .get("hyperliquid_custody_vault_chain_id")
                 .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    activity_error(format!(
-                        "destination execution Hyperliquid custody requires hyperliquid_custody_vault_chain_id for step {}",
-                        step.id
-                    ))
+                .ok_or(OrderActivityError::MissingHydration {
+                    vault_role: "destination_execution_hyperliquid_chain",
+                    step_id: step.id.into(),
                 })?;
             let asset_id = step
                 .request
                 .get("hyperliquid_custody_vault_asset_id")
                 .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    activity_error(format!(
-                        "destination execution Hyperliquid custody requires hyperliquid_custody_vault_asset_id for step {}",
-                        step.id
-                    ))
+                .ok_or(OrderActivityError::MissingHydration {
+                    vault_role: "destination_execution_hyperliquid_asset",
+                    step_id: step.id.into(),
                 })?;
             let asset = DepositAsset {
                 chain: ChainId::parse(chain_id).map_err(|source| {
-                    activity_error(format!(
-                        "step {} hyperliquid_custody_vault_chain_id is invalid: {source}",
-                        step.id
-                    ))
+                    invariant_error(
+                        "hyperliquid_custody_vault_chain_id_valid",
+                        format!(
+                            "step {} hyperliquid_custody_vault_chain_id is invalid: {source}",
+                            step.id
+                        ),
+                    )
                 })?,
                 asset: AssetId::parse(asset_id).map_err(|source| {
-                    activity_error(format!(
-                        "step {} hyperliquid_custody_vault_asset_id is invalid: {source}",
-                        step.id
-                    ))
+                    invariant_error(
+                        "hyperliquid_custody_vault_asset_id_valid",
+                        format!(
+                            "step {} hyperliquid_custody_vault_asset_id is invalid: {source}",
+                            step.id
+                        ),
+                    )
                 })?,
             };
             let vault = ensure_destination_execution_vault(
@@ -2224,11 +2263,14 @@ async fn ensure_source_deposit_vault(
     let vault = find_source_deposit_vault(deps, order_id, asset)
         .await?
         .ok_or_else(|| {
-            activity_error(format!(
-                "source deposit custody vault for order {order_id} and asset {}:{} was not found",
-                asset.chain.as_str(),
-                asset.asset.as_str()
-            ))
+            invariant_error(
+                "source_deposit_vault_hydrated",
+                format!(
+                    "source deposit custody vault for order {order_id} and asset {}:{} was not found",
+                    asset.chain.as_str(),
+                    asset.asset.as_str()
+                ),
+            )
         })?;
     *cache = Some(vault.clone());
     Ok(vault)
@@ -2244,7 +2286,7 @@ async fn find_source_deposit_vault(
         .orders()
         .get_custody_vaults(order_id)
         .await
-        .map_err(activity_error_from_display)?;
+        .map_err(OrderActivityError::db_query)?;
     Ok(vaults.into_iter().find(|vault| {
         vault.role == CustodyVaultRole::SourceDeposit
             && vault.chain == asset.chain
@@ -2272,7 +2314,9 @@ async fn ensure_hyperliquid_spot_vault(
             order_id,
             CustodyVaultRole::HyperliquidSpot,
             CustodyVaultVisibility::Internal,
-            ChainId::parse("hyperliquid").map_err(activity_error)?,
+            ChainId::parse("hyperliquid").map_err(|source| {
+                invariant_error("hyperliquid_chain_id_constant_valid", source.to_string())
+            })?,
             None,
             json!({ "source": "order_workflow_plan_hydration" }),
         )
@@ -2283,12 +2327,19 @@ async fn ensure_hyperliquid_spot_vault(
             find_hyperliquid_spot_vault(deps, order_id)
                 .await?
                 .ok_or_else(|| {
-                    activity_error(format!(
+                    invariant_error(
+                        "hyperliquid_spot_vault_unique_reread",
+                        format!(
                         "HyperliquidSpot custody vault unique violation for order {order_id} but re-read returned none"
                     ))
                 })?
         }
-        Err(source) => return Err(activity_error_from_display(source)),
+        Err(source) => {
+            return Err(custody_action_error(
+                "create hyperliquid spot vault",
+                source,
+            ))
+        }
     };
     *cache = Some(vault.clone());
     Ok(vault)
@@ -2303,7 +2354,7 @@ async fn find_hyperliquid_spot_vault(
         .orders()
         .get_custody_vaults(order_id)
         .await
-        .map_err(activity_error_from_display)?;
+        .map_err(OrderActivityError::db_query)?;
     Ok(vaults.into_iter().find(|vault| {
         vault.role == CustodyVaultRole::HyperliquidSpot
             && vault.chain == ChainId::parse("hyperliquid").expect("valid hyperliquid chain id")
@@ -2345,13 +2396,21 @@ async fn ensure_destination_execution_vault(
         Err(CustodyActionError::Database { source }) if is_unique_violation(&source) => find_destination_execution_vault(deps, order_id, asset)
             .await?
             .ok_or_else(|| {
-                activity_error(format!(
-                    "custody vault unique violation for order {order_id} on {} {} but re-read returned none",
-                    asset.chain.as_str(),
-                    asset.asset.as_str()
-                ))
+                invariant_error(
+                    "destination_execution_vault_unique_reread",
+                    format!(
+                        "custody vault unique violation for order {order_id} on {} {} but re-read returned none",
+                        asset.chain.as_str(),
+                        asset.asset.as_str()
+                    ),
+                )
             })?,
-        Err(source) => return Err(activity_error_from_display(source)),
+        Err(source) => {
+            return Err(custody_action_error(
+                "create destination execution vault",
+                source,
+            ))
+        }
     };
     *cache = Some(vault.clone());
     Ok(vault)
@@ -2367,7 +2426,7 @@ async fn find_destination_execution_vault(
         .orders()
         .get_custody_vaults(order_id)
         .await
-        .map_err(activity_error_from_display)?;
+        .map_err(OrderActivityError::db_query)?;
     Ok(vaults.into_iter().find(|vault| {
         vault.role == CustodyVaultRole::DestinationExecution
             && vault.chain == asset.chain
@@ -2421,7 +2480,7 @@ fn request_string_field(
         .and_then(Value::as_str)
         .map(str::to_owned)
         .ok_or_else(|| {
-            activity_error(format!(
+            refund_materialization_error(format!(
                 "step {} refund request is missing string field {field}",
                 step.id
             ))
@@ -2434,7 +2493,7 @@ fn request_uuid_field(
 ) -> Result<Uuid, OrderActivityError> {
     let value = request_string_field(step, field)?;
     Uuid::parse_str(&value).map_err(|source| {
-        activity_error(format!(
+        refund_materialization_error(format!(
             "step {} refund request field {field} is not a uuid: {source}",
             step.id
         ))
@@ -2449,13 +2508,16 @@ async fn hydrate_cctp_receive_request(
         .request
         .get("burn_transition_decl_id")
         .and_then(Value::as_str)
-        .ok_or_else(|| activity_error("CCTP receive step missing burn_transition_decl_id"))?;
+        .ok_or(OrderActivityError::MissingHydration {
+            vault_role: "cctp_receive_burn_transition",
+            step_id: step.id.into(),
+        })?;
     let operations = deps
         .db
         .orders()
         .get_provider_operations(step.order_id)
         .await
-        .map_err(activity_error_from_display)?;
+        .map_err(OrderActivityError::db_query)?;
     let operation = operations.into_iter().rev().find(|operation| {
         operation.operation_type == ProviderOperationType::CctpBridge
             && operation.status == ProviderOperationStatus::Completed
@@ -2466,9 +2528,10 @@ async fn hydrate_cctp_receive_request(
                 == Some(burn_transition_decl_id)
     });
     let Some(operation) = operation else {
-        return Err(activity_error(format!(
-            "CCTP receive step could not find completed burn operation for transition {burn_transition_decl_id}"
-        )));
+        return Err(OrderActivityError::MissingHydration {
+            vault_role: "cctp_completed_burn_operation",
+            step_id: step.id.into(),
+        });
     };
     let cctp_state = operation
         .observed_state
@@ -2479,25 +2542,34 @@ async fn hydrate_cctp_receive_request(
         .and_then(|body| body.get("amount"))
         .and_then(Value::as_str)
     {
-        let planned_amount = step
-            .request
-            .get("amount")
-            .and_then(Value::as_str)
-            .ok_or_else(|| activity_error("CCTP receive step missing amount"))?;
+        let planned_amount = step.request.get("amount").and_then(Value::as_str).ok_or(
+            OrderActivityError::MissingHydration {
+                vault_role: "cctp_receive_amount",
+                step_id: step.id.into(),
+            },
+        )?;
         if decoded_amount != planned_amount {
-            return Err(activity_error(format!(
-                "CCTP receive amount {planned_amount} does not match attested burn amount {decoded_amount}"
-            )));
+            return Err(invariant_error(
+                "cctp_receive_amount_matches_attestation",
+                format!(
+                    "CCTP receive amount {planned_amount} does not match attested burn amount {decoded_amount}"
+                ),
+            ));
         }
     }
-    let message = cctp_state
-        .get("message")
-        .and_then(Value::as_str)
-        .ok_or_else(|| activity_error("completed CCTP burn operation missing attested message"))?;
+    let message = cctp_state.get("message").and_then(Value::as_str).ok_or(
+        OrderActivityError::MissingHydration {
+            vault_role: "cctp_attested_message",
+            step_id: step.id.into(),
+        },
+    )?;
     let attestation = cctp_state
         .get("attestation")
         .and_then(Value::as_str)
-        .ok_or_else(|| activity_error("completed CCTP burn operation missing attestation"))?;
+        .ok_or(OrderActivityError::MissingHydration {
+            vault_role: "cctp_attestation",
+            step_id: step.id.into(),
+        })?;
     let mut request = step.request.clone();
     set_json_value(&mut request, "message", json!(message));
     set_json_value(&mut request, "attestation", json!(attestation));
@@ -2518,10 +2590,13 @@ async fn execute_running_step(
 ) -> Result<StepCompletion, OrderActivityError> {
     let intent = match step.step_type {
         OrderExecutionStepType::WaitForDeposit => {
-            return Err(activity_error(format!(
-                "{} is not executable in PR4a OrderWorkflow",
-                step.step_type.to_db_string()
-            )));
+            return Err(invariant_error(
+                "wait_for_deposit_not_provider_executable",
+                format!(
+                    "{} is not provider executable",
+                    step.step_type.to_db_string()
+                ),
+            ));
         }
         OrderExecutionStepType::Refund => {
             let custody_vault_id = request_uuid_field(step, "source_custody_vault_id")?;
@@ -2538,7 +2613,7 @@ async fn execute_running_step(
                     },
                 })
                 .await
-                .map_err(activity_error_from_display)?;
+                .map_err(|source| custody_action_error("execute refund transfer", source))?;
             return Ok(StepCompletion {
                 response: json!({
                     "kind": "refund_transfer",
@@ -2552,8 +2627,8 @@ async fn execute_running_step(
             });
         }
         OrderExecutionStepType::AcrossBridge => {
-            let request =
-                BridgeExecutionRequest::across_from_value(&step.request).map_err(activity_error)?;
+            let request = BridgeExecutionRequest::across_from_value(&step.request)
+                .map_err(|source| provider_execute_error(&step.provider, source))?;
             deps.action_providers
                 .bridge(&step.provider)
                 .ok_or_else(|| provider_not_configured(step))?
@@ -2563,7 +2638,7 @@ async fn execute_running_step(
         }
         OrderExecutionStepType::CctpBurn => {
             let request = BridgeExecutionRequest::cctp_burn_from_value(&step.request)
-                .map_err(activity_error)?;
+                .map_err(|source| provider_execute_error(&step.provider, source))?;
             deps.action_providers
                 .bridge(&step.provider)
                 .ok_or_else(|| provider_not_configured(step))?
@@ -2574,7 +2649,7 @@ async fn execute_running_step(
         OrderExecutionStepType::CctpReceive => {
             let request_json = hydrate_cctp_receive_request(deps, step).await?;
             let request = BridgeExecutionRequest::cctp_receive_from_value(&request_json)
-                .map_err(activity_error)?;
+                .map_err(|source| provider_execute_error(&step.provider, source))?;
             deps.action_providers
                 .bridge(&step.provider)
                 .ok_or_else(|| provider_not_configured(step))?
@@ -2585,7 +2660,7 @@ async fn execute_running_step(
         OrderExecutionStepType::HyperliquidBridgeDeposit => {
             let request =
                 BridgeExecutionRequest::hyperliquid_bridge_deposit_from_value(&step.request)
-                    .map_err(activity_error)?;
+                    .map_err(|source| provider_execute_error(&step.provider, source))?;
             deps.action_providers
                 .bridge(&step.provider)
                 .ok_or_else(|| provider_not_configured(step))?
@@ -2596,7 +2671,7 @@ async fn execute_running_step(
         OrderExecutionStepType::HyperliquidBridgeWithdrawal => {
             let request =
                 BridgeExecutionRequest::hyperliquid_bridge_withdrawal_from_value(&step.request)
-                    .map_err(activity_error)?;
+                    .map_err(|source| provider_execute_error(&step.provider, source))?;
             deps.action_providers
                 .bridge(&step.provider)
                 .ok_or_else(|| provider_not_configured(step))?
@@ -2605,8 +2680,8 @@ async fn execute_running_step(
                 .map_err(|source| provider_execute_error(&step.provider, source))?
         }
         OrderExecutionStepType::UnitDeposit => {
-            let request =
-                UnitDepositStepRequest::from_value(&step.request).map_err(activity_error)?;
+            let request = UnitDepositStepRequest::from_value(&step.request)
+                .map_err(|source| provider_execute_error(&step.provider, source))?;
             deps.action_providers
                 .unit(&step.provider)
                 .ok_or_else(|| provider_not_configured(step))?
@@ -2615,8 +2690,8 @@ async fn execute_running_step(
                 .map_err(|source| provider_execute_error(&step.provider, source))?
         }
         OrderExecutionStepType::UnitWithdrawal => {
-            let request =
-                UnitWithdrawalStepRequest::from_value(&step.request).map_err(activity_error)?;
+            let request = UnitWithdrawalStepRequest::from_value(&step.request)
+                .map_err(|source| provider_execute_error(&step.provider, source))?;
             deps.action_providers
                 .unit(&step.provider)
                 .ok_or_else(|| provider_not_configured(step))?
@@ -2626,7 +2701,7 @@ async fn execute_running_step(
         }
         OrderExecutionStepType::HyperliquidTrade => {
             let request = ExchangeExecutionRequest::hyperliquid_trade_from_value(&step.request)
-                .map_err(activity_error)?;
+                .map_err(|source| provider_execute_error(&step.provider, source))?;
             deps.action_providers
                 .exchange(&step.provider)
                 .ok_or_else(|| provider_not_configured(step))?
@@ -2637,7 +2712,7 @@ async fn execute_running_step(
         OrderExecutionStepType::HyperliquidLimitOrder => {
             let request =
                 ExchangeExecutionRequest::hyperliquid_limit_order_from_value(&step.request)
-                    .map_err(activity_error)?;
+                    .map_err(|source| provider_execute_error(&step.provider, source))?;
             deps.action_providers
                 .exchange(&step.provider)
                 .ok_or_else(|| provider_not_configured(step))?
@@ -2647,7 +2722,7 @@ async fn execute_running_step(
         }
         OrderExecutionStepType::UniversalRouterSwap => {
             let request = ExchangeExecutionRequest::universal_router_swap_from_value(&step.request)
-                .map_err(activity_error)?;
+                .map_err(|source| provider_execute_error(&step.provider, source))?;
             deps.action_providers
                 .exchange(&step.provider)
                 .ok_or_else(|| provider_not_configured(step))?
@@ -2694,7 +2769,9 @@ async fn prepare_provider_completion(
                     action,
                 })
                 .await
-                .map_err(activity_error_from_display)?;
+                .map_err(|source| {
+                    custody_action_error("execute provider custody action", source)
+                })?;
             let outcome = provider_operation_outcome(step, state.operation.as_ref())
                 .map_err(|source| provider_execute_error(&step.provider, source))?;
             let observed_state = state
@@ -2753,7 +2830,9 @@ async fn prepare_provider_completion(
                         action,
                     })
                     .await
-                    .map_err(activity_error_from_display)?;
+                    .map_err(|source| {
+                        custody_action_error("execute provider custody action batch", source)
+                    })?;
                 receipts.push(receipt);
             }
             let patch = post_execute_provider
@@ -2973,6 +3052,52 @@ fn provider_execute_not_configured(provider: impl AsRef<str>) -> OrderActivityEr
 
 fn provider_observe_not_configured(provider: impl AsRef<str>) -> OrderActivityError {
     provider_observe_error(provider, "provider is not configured")
+}
+
+fn invariant_error(invariant: &'static str, detail: impl Into<String>) -> OrderActivityError {
+    OrderActivityError::invariant(invariant, detail)
+}
+
+fn refund_discovery_error(context: impl Into<String>) -> OrderActivityError {
+    OrderActivityError::refund_discovery(context)
+}
+
+fn refund_materialization_error(context: impl Into<String>) -> OrderActivityError {
+    OrderActivityError::refund_materialization(context)
+}
+
+fn refresh_materialization_error(context: impl Into<String>) -> OrderActivityError {
+    OrderActivityError::refresh_materialization(context)
+}
+
+fn refresh_untenable_error(context: impl Into<String>) -> OrderActivityError {
+    OrderActivityError::refresh_untenable(context)
+}
+
+fn hint_verification_error(
+    hint_kind: impl Into<String>,
+    source: impl ToString,
+) -> OrderActivityError {
+    OrderActivityError::hint_verification(hint_kind, source)
+}
+
+fn observation_error(context: impl Into<String>, source: impl ToString) -> OrderActivityError {
+    OrderActivityError::observation(context, source)
+}
+
+fn lost_intent_recovery_error(
+    context: impl Into<String>,
+    source: impl ToString,
+) -> OrderActivityError {
+    OrderActivityError::lost_intent_recovery(context, source)
+}
+
+fn custody_action_error(context: impl Into<String>, source: impl ToString) -> OrderActivityError {
+    OrderActivityError::custody_action(context, source)
+}
+
+fn amount_parse_error(context: impl Into<String>, source: impl ToString) -> OrderActivityError {
+    OrderActivityError::amount_parse(context, source)
 }
 
 fn failed_attempt_snapshot(order: &RouterOrder, failed_step: &OrderExecutionStep) -> Value {
@@ -3207,23 +3332,23 @@ fn refresh_exchange_quote_transition_legs(
         );
     }
     if kind != "universal_router_swap" {
-        return Err(activity_error(format!(
+        return Err(refresh_materialization_error(format!(
             "unsupported refreshed exchange quote kind {kind:?}"
         )));
     }
     let input_asset = quote
         .provider_quote
         .get("input_asset")
-        .ok_or_else(|| activity_error("universal router quote missing input_asset"))
+        .ok_or_else(|| refresh_materialization_error("universal router quote missing input_asset"))
         .and_then(|value| {
-            QuoteLegAsset::from_value(value, "input_asset").map_err(activity_error)
+            QuoteLegAsset::from_value(value, "input_asset").map_err(refresh_materialization_error)
         })?;
     let output_asset = quote
         .provider_quote
         .get("output_asset")
-        .ok_or_else(|| activity_error("universal router quote missing output_asset"))
+        .ok_or_else(|| refresh_materialization_error("universal router quote missing output_asset"))
         .and_then(|value| {
-            QuoteLegAsset::from_value(value, "output_asset").map_err(activity_error)
+            QuoteLegAsset::from_value(value, "output_asset").map_err(refresh_materialization_error)
         })?;
     Ok(vec![QuoteLeg {
         transition_decl_id: transition_decl_id.to_string(),
@@ -3303,21 +3428,29 @@ fn refresh_spot_cross_token_quote_transition_legs(
         .provider_quote
         .get("legs")
         .and_then(Value::as_array)
-        .ok_or_else(|| activity_error("exchange quote missing spot_cross_token legs"))?;
+        .ok_or_else(|| {
+            refresh_materialization_error("exchange quote missing spot_cross_token legs")
+        })?;
     legs.iter()
         .enumerate()
         .map(|(index, leg)| {
             let input_asset = leg
                 .get("input_asset")
-                .ok_or_else(|| activity_error("hyperliquid quote leg missing input_asset"))
+                .ok_or_else(|| {
+                    refresh_materialization_error("hyperliquid quote leg missing input_asset")
+                })
                 .and_then(|value| {
-                    QuoteLegAsset::from_value(value, "input_asset").map_err(activity_error)
+                    QuoteLegAsset::from_value(value, "input_asset")
+                        .map_err(refresh_materialization_error)
                 })?;
             let output_asset = leg
                 .get("output_asset")
-                .ok_or_else(|| activity_error("hyperliquid quote leg missing output_asset"))
+                .ok_or_else(|| {
+                    refresh_materialization_error("hyperliquid quote leg missing output_asset")
+                })
                 .and_then(|value| {
-                    QuoteLegAsset::from_value(value, "output_asset").map_err(activity_error)
+                    QuoteLegAsset::from_value(value, "output_asset")
+                        .map_err(refresh_materialization_error)
                 })?;
             Ok(QuoteLeg {
                 transition_decl_id: format!("{transition_decl_id}:leg:{index}"),
@@ -3341,12 +3474,11 @@ fn refresh_required_quote_leg_amount(
     leg: &Value,
     field: &'static str,
 ) -> Result<String, OrderActivityError> {
-    let amount = leg
-        .get(field)
-        .and_then(Value::as_str)
-        .ok_or_else(|| activity_error(format!("{provider} quote leg missing {field}")))?;
+    let amount = leg.get(field).and_then(Value::as_str).ok_or_else(|| {
+        refresh_materialization_error(format!("{provider} quote leg missing {field}"))
+    })?;
     if amount.is_empty() {
-        return Err(activity_error(format!(
+        return Err(refresh_materialization_error(format!(
             "{provider} quote leg has empty {field}"
         )));
     }
@@ -3421,8 +3553,9 @@ fn refresh_unit_deposit_fee_reserve(
         return Ok(None);
     };
     for leg in legs {
-        let parsed: QuoteLeg = serde_json::from_value(leg.clone())
-            .map_err(|source| activity_error(format!("stored quote leg is invalid: {source}")))?;
+        let parsed: QuoteLeg = serde_json::from_value(leg.clone()).map_err(|source| {
+            OrderActivityError::serialization("reading stored quote leg", source)
+        })?;
         if parsed.parent_transition_id() != transition.id {
             continue;
         }
@@ -3453,12 +3586,12 @@ fn refresh_bitcoin_fee_reserve_quote(fee_reserve: U256) -> Value {
 
 fn refresh_parse_u256_amount(field: &'static str, value: &str) -> Result<U256, OrderActivityError> {
     if value.is_empty() || !value.chars().all(|ch| ch.is_ascii_digit()) {
-        return Err(activity_error(format!(
-            "{field} must be a raw unsigned integer: {value:?}"
-        )));
+        return Err(amount_parse_error(
+            field,
+            format!("{field} must be a raw unsigned integer: {value:?}"),
+        ));
     }
-    U256::from_str_radix(value, 10)
-        .map_err(|source| activity_error(format!("{field} is not a valid raw amount: {source}")))
+    U256::from_str_radix(value, 10).map_err(|source| amount_parse_error(field, source))
 }
 
 fn refresh_subtract_amount(
@@ -3473,14 +3606,14 @@ fn refresh_subtract_amount(
         return Ok(gross_amount.to_string());
     }
     if gross <= subtract {
-        return Err(activity_error(format!(
+        return Err(refresh_untenable_error(format!(
             "{field} must exceed {label} {subtract} for transition {transition_id}"
         )));
     }
     gross
         .checked_sub(subtract)
         .ok_or_else(|| {
-            activity_error(format!(
+            refresh_materialization_error(format!(
                 "{field} minus {label} underflowed for transition {transition_id}"
             ))
         })
@@ -3496,7 +3629,7 @@ fn refresh_add_amount(
     let amount = refresh_parse_u256_amount(field, amount)?;
     amount
         .checked_add(add)
-        .ok_or_else(|| activity_error(format!("{field} plus {label} overflowed")))
+        .ok_or_else(|| refresh_materialization_error(format!("{field} plus {label} overflowed")))
         .map(|amount| amount.to_string())
 }
 
@@ -3680,7 +3813,7 @@ fn refresh_source_address(
     if index == 0 {
         return Ok(source_vault.deposit_vault_address.clone());
     }
-    Err(activity_error(format!(
+    Err(refresh_materialization_error(format!(
         "cannot refresh transition {} because no source address is materialized",
         transition.id
     )))
@@ -3720,7 +3853,7 @@ fn refresh_recipient_address(
     if index + 1 == transitions.len() {
         return Ok(order.recipient_address.clone());
     }
-    Err(activity_error(format!(
+    Err(refresh_materialization_error(format!(
         "cannot refresh transition {} because no recipient address is materialized",
         transition.id
     )))
@@ -3746,7 +3879,7 @@ fn refresh_hyperliquid_bridge_deposit_account_address(
     if index == 0 {
         return Ok(source_vault.deposit_vault_address.clone());
     }
-    Err(activity_error(format!(
+    Err(refresh_materialization_error(format!(
         "cannot refresh transition {} because no Hyperliquid account/source address is materialized",
         transition.id
     )))
@@ -3771,11 +3904,9 @@ fn stale_quote_refresh_untenable(
 }
 
 fn parse_refresh_amount(field: &'static str, value: &str) -> Result<u128, OrderActivityError> {
-    value.parse::<u128>().map_err(|source| {
-        activity_error(format!(
-            "refreshed quote {field} must be an unsigned integer: {source}"
-        ))
-    })
+    value
+        .parse::<u128>()
+        .map_err(|source| amount_parse_error(format!("refreshed quote {field}"), source))
 }
 
 fn set_json_value(target: &mut Value, key: &'static str, value: Value) {
@@ -3785,14 +3916,6 @@ fn set_json_value(target: &mut Value, key: &'static str, value: Value) {
     if let Some(object) = target.as_object_mut() {
         object.insert(key.to_string(), value);
     }
-}
-
-fn activity_error(message: impl ToString) -> OrderActivityError {
-    OrderActivityError::whatever(message)
-}
-
-fn activity_error_from_display(source: impl std::fmt::Display) -> OrderActivityError {
-    activity_error(source)
 }
 
 #[derive(Clone, Default)]
@@ -3831,33 +3954,39 @@ impl RefundActivities {
             .orders()
             .get_execution_attempt(input.failed_attempt_id.inner())
             .await
-            .map_err(activity_error_from_display)?;
+            .map_err(OrderActivityError::db_query)?;
         if failed_attempt.order_id != input.order_id.inner() {
-            return Err(activity_error(format!(
-                "refund failed attempt {} does not belong to order {}",
-                failed_attempt.id, input.order_id.inner()
-            )));
+            return Err(invariant_error(
+                "refund_failed_attempt_belongs_to_order",
+                format!(
+                    "refund failed attempt {} does not belong to order {}",
+                    failed_attempt.id,
+                    input.order_id.inner()
+                ),
+            ));
         }
         let order = deps
             .db
             .orders()
             .get(input.order_id.inner())
             .await
-            .map_err(activity_error_from_display)?;
+            .map_err(OrderActivityError::db_query)?;
 
         let mut positions = Vec::new();
         if let Some(funding_vault_id) = order.funding_vault_id {
             let vault = match deps.db.vaults().get(funding_vault_id).await {
                 Ok(vault) => Some(vault),
                 Err(RouterCoreError::NotFound) => None,
-                Err(source) => return Err(activity_error_from_display(source)),
+                Err(source) => return Err(OrderActivityError::db_query(source)),
             };
             if let Some(vault) = vault {
                 let amount = deps
                     .custody_action_executor
                     .deposit_vault_balance_raw(&vault)
                     .await
-                    .map_err(activity_error_from_display)?;
+                    .map_err(|source| {
+                        custody_action_error("read funding vault refund balance", source)
+                    })?;
                 if raw_amount_is_positive(&amount, "funding vault refund balance")? {
                     positions.push(SingleRefundPosition {
                         position_kind: RecoverablePositionKind::FundingVault,
@@ -3865,7 +3994,8 @@ impl RefundActivities {
                         funding_vault_id: Some(funding_vault_id.into()),
                         custody_vault_id: None,
                         asset: vault.deposit_asset,
-                        amount: RawAmount::new(amount).map_err(activity_error_from_display)?,
+                        amount: RawAmount::new(amount)
+                            .map_err(|source| amount_parse_error("funding vault refund balance", source))?,
                         hyperliquid_coin: None,
                         hyperliquid_canonical: None,
                     });
@@ -3878,7 +4008,7 @@ impl RefundActivities {
             .orders()
             .get_custody_vaults(order.id)
             .await
-            .map_err(activity_error_from_display)?;
+            .map_err(OrderActivityError::db_query)?;
         for vault in custody_vaults {
             match vault.role {
                 CustodyVaultRole::SourceDeposit => {}
@@ -3890,7 +4020,9 @@ impl RefundActivities {
                         .custody_action_executor
                         .custody_vault_balance_raw(&vault)
                         .await
-                        .map_err(activity_error_from_display)?;
+                        .map_err(|source| {
+                            custody_action_error("read external custody refund balance", source)
+                        })?;
                     if raw_amount_is_positive(&amount, "external custody refund balance")? {
                         positions.push(SingleRefundPosition {
                             position_kind: RecoverablePositionKind::ExternalCustody,
@@ -3901,7 +4033,9 @@ impl RefundActivities {
                                 chain: vault.chain,
                                 asset: asset_id,
                             },
-                            amount: RawAmount::new(amount).map_err(activity_error_from_display)?,
+                            amount: RawAmount::new(amount).map_err(|source| {
+                                amount_parse_error("external custody refund balance", source)
+                            })?,
                             hyperliquid_coin: None,
                             hyperliquid_canonical: None,
                         });
@@ -3912,7 +4046,9 @@ impl RefundActivities {
                         .custody_action_executor
                         .inspect_hyperliquid_spot_balances(&vault)
                         .await
-                        .map_err(activity_error_from_display)?;
+                        .map_err(|source| {
+                            custody_action_error("inspect hyperliquid spot refund balances", source)
+                        })?;
                     for balance in balances {
                         let registry = deps.action_providers.asset_registry();
                         let Some((canonical, asset)) = registry
@@ -3923,7 +4059,7 @@ impl RefundActivities {
                         let decimals = registry
                             .chain_asset(&asset)
                             .ok_or_else(|| {
-                                activity_error(format!(
+                                refund_discovery_error(format!(
                                     "missing registered decimals for Hyperliquid refund asset {} {}",
                                     asset.chain, asset.asset
                                 ))
@@ -3943,7 +4079,9 @@ impl RefundActivities {
                             funding_vault_id: None,
                             custody_vault_id: Some(vault.id.into()),
                             asset,
-                            amount: RawAmount::new(amount).map_err(activity_error_from_display)?,
+                            amount: RawAmount::new(amount).map_err(|source| {
+                                amount_parse_error("hyperliquid spot refund balance", source)
+                            })?,
                             hyperliquid_coin: Some(balance.coin),
                             hyperliquid_canonical: Some(canonical),
                         });
@@ -3985,7 +4123,7 @@ impl RefundActivities {
                 .orders()
                 .get(input.order_id.inner())
                 .await
-                .map_err(activity_error_from_display)?;
+                .map_err(OrderActivityError::db_query)?;
             let Some(funding_vault_id) = order.funding_vault_id else {
                 return Ok(refund_plan_untenable(
                     RefundUntenableReason::RefundRecoverablePositionDisappearedAfterValidation,
@@ -3998,13 +4136,15 @@ impl RefundActivities {
                         RefundUntenableReason::RefundRecoverablePositionDisappearedAfterValidation,
                     ));
                 }
-                Err(source) => return Err(activity_error_from_display(source)),
+                Err(source) => return Err(OrderActivityError::db_query(source)),
             };
             let amount = deps
                 .custody_action_executor
                 .deposit_vault_balance_raw(&vault)
                 .await
-                .map_err(activity_error_from_display)?;
+                .map_err(|source| {
+                    custody_action_error("read funding vault refund balance", source)
+                })?;
             if !raw_amount_is_positive(&amount, "funding vault refund balance")? {
                 return Ok(refund_plan_untenable(
                     RefundUntenableReason::RefundRecoverablePositionDisappearedAfterValidation,
@@ -4033,7 +4173,7 @@ impl RefundActivities {
                     Utc::now(),
                 )
                 .await
-                .map_err(activity_error_from_display)?;
+                .map_err(OrderActivityError::db_query)?;
             tracing::info!(
                 order_id = %record.order.id,
                 attempt_id = %record.attempt.id,
@@ -4099,9 +4239,10 @@ fn recoverable_position_kind_label(position_kind: RecoverablePositionKind) -> &'
 fn raw_amount_is_positive(value: &str, label: &'static str) -> Result<bool, OrderActivityError> {
     let trimmed = value.trim();
     if trimmed.is_empty() || !trimmed.chars().all(|ch| ch.is_ascii_digit()) {
-        return Err(activity_error(format!(
-            "{label} is not a raw unsigned integer: {value:?}"
-        )));
+        return Err(amount_parse_error(
+            label,
+            format!("{label} is not a raw unsigned integer: {value:?}"),
+        ));
     }
     Ok(trimmed.as_bytes().iter().any(|digit| *digit != b'0'))
 }
@@ -4115,9 +4256,9 @@ async fn materialize_external_custody_refund_plan(
         .orders()
         .get(input.order_id.inner())
         .await
-        .map_err(activity_error_from_display)?;
+        .map_err(OrderActivityError::db_query)?;
     let custody_vault_id = input.position.custody_vault_id.ok_or_else(|| {
-        activity_error("external-custody refund position is missing custody_vault_id")
+        refund_materialization_error("external-custody refund position is missing custody_vault_id")
     })?;
     let vault = match deps
         .db
@@ -4131,14 +4272,17 @@ async fn materialize_external_custody_refund_plan(
                 RefundUntenableReason::RefundRecoverablePositionDisappearedAfterValidation,
             ));
         }
-        Err(source) => return Err(activity_error_from_display(source)),
+        Err(source) => return Err(OrderActivityError::db_query(source)),
     };
     if vault.order_id != Some(input.order_id.inner()) {
-        return Err(activity_error(format!(
-            "external-custody vault {} does not belong to order {}",
-            vault.id,
-            input.order_id.inner()
-        )));
+        return Err(invariant_error(
+            "external_custody_vault_belongs_to_order",
+            format!(
+                "external-custody vault {} does not belong to order {}",
+                vault.id,
+                input.order_id.inner()
+            ),
+        ));
     }
     let Some(asset_id) = vault.asset.clone() else {
         return Ok(refund_plan_untenable(
@@ -4153,7 +4297,7 @@ async fn materialize_external_custody_refund_plan(
         .custody_action_executor
         .custody_vault_balance_raw(&vault)
         .await
-        .map_err(activity_error_from_display)?;
+        .map_err(|source| custody_action_error("read external custody refund balance", source))?;
     if !raw_amount_is_positive(&amount, "external custody refund balance")? {
         return Ok(refund_plan_untenable(
             RefundUntenableReason::RefundRecoverablePositionDisappearedAfterValidation,
@@ -4209,7 +4353,7 @@ async fn materialize_external_custody_refund_plan(
             now,
         )
         .await
-        .map_err(activity_error_from_display)?;
+        .map_err(OrderActivityError::db_query)?;
     tracing::info!(
         order_id = %record.order.id,
         attempt_id = %record.attempt.id,
@@ -4245,9 +4389,9 @@ async fn materialize_hyperliquid_spot_refund_plan(
         .orders()
         .get(input.order_id.inner())
         .await
-        .map_err(activity_error_from_display)?;
+        .map_err(OrderActivityError::db_query)?;
     let custody_vault_id = input.position.custody_vault_id.ok_or_else(|| {
-        activity_error("HyperliquidSpot refund position is missing custody_vault_id")
+        refund_materialization_error("HyperliquidSpot refund position is missing custody_vault_id")
     })?;
     let vault = match deps
         .db
@@ -4261,30 +4405,34 @@ async fn materialize_hyperliquid_spot_refund_plan(
                 RefundUntenableReason::RefundRecoverablePositionDisappearedAfterValidation,
             ));
         }
-        Err(source) => return Err(activity_error_from_display(source)),
+        Err(source) => return Err(OrderActivityError::db_query(source)),
     };
     if vault.order_id != Some(input.order_id.inner()) {
-        return Err(activity_error(format!(
-            "HyperliquidSpot vault {} does not belong to order {}",
-            vault.id,
-            input.order_id.inner()
-        )));
+        return Err(invariant_error(
+            "hyperliquid_spot_vault_belongs_to_order",
+            format!(
+                "HyperliquidSpot vault {} does not belong to order {}",
+                vault.id,
+                input.order_id.inner()
+            ),
+        ));
     }
     if vault.role != CustodyVaultRole::HyperliquidSpot {
-        return Err(activity_error(format!(
-            "custody vault {} is {}, not hyperliquid_spot",
-            vault.id,
-            vault.role.to_db_string()
-        )));
+        return Err(invariant_error(
+            "hyperliquid_spot_vault_role",
+            format!(
+                "custody vault {} is {}, not hyperliquid_spot",
+                vault.id,
+                vault.role.to_db_string()
+            ),
+        ));
     }
 
-    let coin = input
-        .position
-        .hyperliquid_coin
-        .clone()
-        .ok_or_else(|| activity_error("HyperliquidSpot refund position is missing coin"))?;
+    let coin = input.position.hyperliquid_coin.clone().ok_or_else(|| {
+        refund_materialization_error("HyperliquidSpot refund position is missing coin")
+    })?;
     let canonical = input.position.hyperliquid_canonical.ok_or_else(|| {
-        activity_error("HyperliquidSpot refund position is missing canonical asset")
+        refund_materialization_error("HyperliquidSpot refund position is missing canonical asset")
     })?;
     let (asset, amount) =
         match current_hyperliquid_spot_refund_balance(deps, &order, &vault, &coin).await? {
@@ -4292,11 +4440,14 @@ async fn materialize_hyperliquid_spot_refund_plan(
                 (asset, amount)
             }
             Some((current_canonical, _, _)) => {
-                return Err(activity_error(format!(
-                    "HyperliquidSpot refund coin {coin} canonical changed from {} to {}",
-                    canonical.as_str(),
-                    current_canonical.as_str()
-                )));
+                return Err(invariant_error(
+                    "hyperliquid_spot_refund_coin_canonical_stable",
+                    format!(
+                        "HyperliquidSpot refund coin {coin} canonical changed from {} to {}",
+                        canonical.as_str(),
+                        current_canonical.as_str()
+                    ),
+                ));
             }
             None => {
                 return Ok(refund_plan_untenable(
@@ -4350,7 +4501,7 @@ async fn materialize_hyperliquid_spot_refund_plan(
             now,
         )
         .await
-        .map_err(activity_error_from_display)?;
+        .map_err(OrderActivityError::db_query)?;
     tracing::info!(
         order_id = %record.order.id,
         attempt_id = %record.attempt.id,
@@ -4387,7 +4538,9 @@ async fn current_hyperliquid_spot_refund_balance(
         .custody_action_executor
         .inspect_hyperliquid_spot_balances(vault)
         .await
-        .map_err(activity_error_from_display)?;
+        .map_err(|source| {
+            custody_action_error("inspecting HyperliquidSpot refund balance", source)
+        })?;
     let Some(balance) = balances.into_iter().find(|balance| balance.coin == coin) else {
         return Ok(None);
     };
@@ -4400,7 +4553,7 @@ async fn current_hyperliquid_spot_refund_balance(
     let decimals = registry
         .chain_asset(&asset)
         .ok_or_else(|| {
-            activity_error(format!(
+            refund_discovery_error(format!(
                 "missing registered decimals for Hyperliquid refund asset {} {}",
                 asset.chain, asset.asset
             ))
@@ -4507,12 +4660,7 @@ async fn quote_hyperliquid_spot_refund_path(
                 let exchange = deps
                     .action_providers
                     .exchange(transition.provider.as_str())
-                    .ok_or_else(|| {
-                        activity_error(format!(
-                            "exchange provider {} is not configured",
-                            transition.provider.as_str()
-                        ))
-                    })?;
+                    .ok_or_else(|| provider_quote_not_configured(transition.provider.as_str()))?;
                 let quote = exchange
                     .quote_trade(ExchangeQuoteRequest {
                         input_asset: transition.input.asset.clone(),
@@ -4527,7 +4675,7 @@ async fn quote_hyperliquid_spot_refund_path(
                         recipient_address: order.refund_address.clone(),
                     })
                     .await
-                    .map_err(activity_error_from_display)?;
+                    .map_err(|source| provider_quote_error(transition.provider.as_str(), source))?;
                 let Some(quote) = quote else {
                     return Ok(None);
                 };
@@ -4543,12 +4691,7 @@ async fn quote_hyperliquid_spot_refund_path(
                 let unit = deps
                     .action_providers
                     .unit(transition.provider.as_str())
-                    .ok_or_else(|| {
-                        activity_error(format!(
-                            "{} unit provider is not configured",
-                            transition.provider.as_str()
-                        ))
-                    })?;
+                    .ok_or_else(|| provider_quote_not_configured(transition.provider.as_str()))?;
                 if !unit.supports_withdrawal(&transition.output.asset)
                     || !refund_unit_withdrawal_amount_meets_minimum(transition, &cursor_amount)?
                 {
@@ -4565,12 +4708,7 @@ async fn quote_hyperliquid_spot_refund_path(
                 let bridge = deps
                     .action_providers
                     .bridge(transition.provider.as_str())
-                    .ok_or_else(|| {
-                        activity_error(format!(
-                            "{} bridge provider is not configured",
-                            transition.provider.as_str()
-                        ))
-                    })?;
+                    .ok_or_else(|| provider_quote_not_configured(transition.provider.as_str()))?;
                 let quote = bridge
                     .quote_bridge(BridgeQuoteRequest {
                         source_asset: transition.input.asset.clone(),
@@ -4584,7 +4722,7 @@ async fn quote_hyperliquid_spot_refund_path(
                         partial_fills_enabled: false,
                     })
                     .await
-                    .map_err(activity_error)?;
+                    .map_err(|source| provider_quote_error(transition.provider.as_str(), source))?;
                 let Some(quote) = quote else {
                     return Ok(None);
                 };
@@ -4596,12 +4734,7 @@ async fn quote_hyperliquid_spot_refund_path(
                 let bridge = deps
                     .action_providers
                     .bridge(transition.provider.as_str())
-                    .ok_or_else(|| {
-                        activity_error(format!(
-                            "{} bridge provider is not configured",
-                            transition.provider.as_str()
-                        ))
-                    })?;
+                    .ok_or_else(|| provider_quote_not_configured(transition.provider.as_str()))?;
                 let quote = bridge
                     .quote_bridge(BridgeQuoteRequest {
                         source_asset: transition.input.asset.clone(),
@@ -4615,7 +4748,7 @@ async fn quote_hyperliquid_spot_refund_path(
                         partial_fills_enabled: false,
                     })
                     .await
-                    .map_err(activity_error)?;
+                    .map_err(|source| provider_quote_error(transition.provider.as_str(), source))?;
                 let Some(quote) = quote else {
                     return Ok(None);
                 };
@@ -4626,12 +4759,7 @@ async fn quote_hyperliquid_spot_refund_path(
                 let exchange = deps
                     .action_providers
                     .exchange(transition.provider.as_str())
-                    .ok_or_else(|| {
-                        activity_error(format!(
-                            "{} exchange provider is not configured",
-                            transition.provider.as_str()
-                        ))
-                    })?;
+                    .ok_or_else(|| provider_quote_not_configured(transition.provider.as_str()))?;
                 let quote = exchange
                     .quote_trade(ExchangeQuoteRequest {
                         input_asset: transition.input.asset.clone(),
@@ -4646,7 +4774,7 @@ async fn quote_hyperliquid_spot_refund_path(
                         recipient_address: order.refund_address.clone(),
                     })
                     .await
-                    .map_err(activity_error)?;
+                    .map_err(|source| provider_quote_error(transition.provider.as_str(), source))?;
                 let Some(quote) = quote else {
                     return Ok(None);
                 };
@@ -4662,12 +4790,7 @@ async fn quote_hyperliquid_spot_refund_path(
                 let unit = deps
                     .action_providers
                     .unit(transition.provider.as_str())
-                    .ok_or_else(|| {
-                        activity_error(format!(
-                            "{} unit provider is not configured",
-                            transition.provider.as_str()
-                        ))
-                    })?;
+                    .ok_or_else(|| provider_quote_not_configured(transition.provider.as_str()))?;
                 if !unit.supports_deposit(&transition.input.asset) {
                     return Ok(None);
                 }
@@ -4742,7 +4865,7 @@ fn materialize_hyperliquid_spot_refund_path(
         let is_final = transition_index + 1 == quoted_path.path.transitions.len();
         let transition_legs = refund_legs_for_transition(&quoted_path.legs, transition);
         if transition_legs.is_empty() {
-            return Err(activity_error(format!(
+            return Err(refund_materialization_error(format!(
                 "quoted HyperliquidSpot refund path is missing legs for transition {}",
                 transition.id
             )));
@@ -4771,12 +4894,14 @@ fn materialize_hyperliquid_spot_refund_path(
                             leg_count,
                             step_index: step_index
                                 .checked_add(i32::try_from(local_leg_index).map_err(|err| {
-                                    activity_error(format!(
+                                    refund_materialization_error(format!(
                                         "refund HyperliquidTrade step_index overflow: {err}"
                                     ))
                                 })?)
                                 .ok_or_else(|| {
-                                    activity_error("refund HyperliquidTrade step_index overflow")
+                                    refund_materialization_error(
+                                        "refund HyperliquidTrade step_index overflow",
+                                    )
                                 })?,
                             planned_at,
                         },
@@ -4913,9 +5038,10 @@ fn materialize_hyperliquid_spot_refund_path(
         )?;
         leg_index = leg_index
             .checked_add(1)
-            .ok_or_else(|| activity_error("refund leg_index overflow"))?;
-        step_index = i32::try_from(steps.len())
-            .map_err(|err| activity_error(format!("refund step_index overflow: {err}")))?;
+            .ok_or_else(|| refund_materialization_error("refund leg_index overflow"))?;
+        step_index = i32::try_from(steps.len()).map_err(|err| {
+            refund_materialization_error(format!("refund step_index overflow: {err}"))
+        })?;
     }
 
     Ok((execution_legs, steps))
@@ -5047,12 +5173,7 @@ async fn hyperliquid_spot_trade_refund_steps(
     let exchange = deps
         .action_providers
         .exchange(transition.provider.as_str())
-        .ok_or_else(|| {
-            activity_error(format!(
-                "exchange provider {} is not configured",
-                transition.provider.as_str()
-            ))
-        })?;
+        .ok_or_else(|| provider_quote_not_configured(transition.provider.as_str()))?;
     let quote = exchange
         .quote_trade(ExchangeQuoteRequest {
             input_asset: transition.input.asset.clone(),
@@ -5067,7 +5188,7 @@ async fn hyperliquid_spot_trade_refund_steps(
             recipient_address: order.refund_address.clone(),
         })
         .await
-        .map_err(activity_error_from_display)?;
+        .map_err(|source| provider_quote_error(transition.provider.as_str(), source))?;
     let Some(quote) = quote else {
         return Ok(None);
     };
@@ -5101,7 +5222,7 @@ async fn hyperliquid_spot_trade_refund_steps(
                 leg_index,
                 leg_count,
                 step_index: i32::try_from(leg_index).map_err(|err| {
-                    activity_error(format!(
+                    refund_materialization_error(format!(
                         "refund HyperliquidTrade step_index overflow: {err}"
                     ))
                 })?,
@@ -5234,7 +5355,7 @@ fn materialize_external_custody_refund_path(
         let is_final = transition_index + 1 == quoted_path.path.transitions.len();
         let transition_legs = refund_legs_for_transition(&quoted_path.legs, transition);
         if transition_legs.is_empty() {
-            return Err(activity_error(format!(
+            return Err(refund_materialization_error(format!(
                 "quoted ExternalCustody refund path is missing legs for transition {}",
                 transition.id
             )));
@@ -5321,7 +5442,7 @@ fn materialize_external_custody_refund_path(
             MarketOrderTransitionKind::HyperliquidTrade => {
                 let transition_legs = refund_legs_for_transition(&quoted_path.legs, transition);
                 if transition_legs.is_empty() {
-                    return Err(activity_error(format!(
+                    return Err(refund_materialization_error(format!(
                         "quoted refund path is missing HyperliquidTrade legs for transition {}",
                         transition.id
                     )));
@@ -5351,12 +5472,14 @@ fn materialize_external_custody_refund_path(
                             leg_count,
                             step_index: step_index
                                 .checked_add(i32::try_from(local_leg_index).map_err(|err| {
-                                    activity_error(format!(
+                                    refund_materialization_error(format!(
                                         "refund HyperliquidTrade step_index overflow: {err}"
                                     ))
                                 })?)
                                 .ok_or_else(|| {
-                                    activity_error("refund HyperliquidTrade step_index overflow")
+                                    refund_materialization_error(
+                                        "refund HyperliquidTrade step_index overflow",
+                                    )
                                 })?,
                             planned_at,
                         },
@@ -5392,9 +5515,10 @@ fn materialize_external_custody_refund_path(
         )?;
         leg_index = leg_index
             .checked_add(1)
-            .ok_or_else(|| activity_error("refund leg_index overflow"))?;
-        step_index = i32::try_from(steps.len())
-            .map_err(|err| activity_error(format!("refund step_index overflow: {err}")))?;
+            .ok_or_else(|| refund_materialization_error("refund leg_index overflow"))?;
+        step_index = i32::try_from(steps.len()).map_err(|err| {
+            refund_materialization_error(format!("refund step_index overflow: {err}"))
+        })?;
     }
 
     Ok((execution_legs, steps))
@@ -5471,12 +5595,7 @@ async fn quote_external_custody_refund_path(
                 let bridge = deps
                     .action_providers
                     .bridge(transition.provider.as_str())
-                    .ok_or_else(|| {
-                        activity_error(format!(
-                            "{} bridge provider is not configured",
-                            transition.provider.as_str()
-                        ))
-                    })?;
+                    .ok_or_else(|| provider_quote_not_configured(transition.provider.as_str()))?;
                 let quote = bridge
                     .quote_bridge(BridgeQuoteRequest {
                         source_asset: transition.input.asset.clone(),
@@ -5490,7 +5609,7 @@ async fn quote_external_custody_refund_path(
                         partial_fills_enabled: false,
                     })
                     .await
-                    .map_err(activity_error)?;
+                    .map_err(|source| provider_quote_error(transition.provider.as_str(), source))?;
                 let Some(quote) = quote else {
                     return Ok(None);
                 };
@@ -5501,12 +5620,7 @@ async fn quote_external_custody_refund_path(
                 let exchange = deps
                     .action_providers
                     .exchange(transition.provider.as_str())
-                    .ok_or_else(|| {
-                        activity_error(format!(
-                            "{} exchange provider is not configured",
-                            transition.provider.as_str()
-                        ))
-                    })?;
+                    .ok_or_else(|| provider_quote_not_configured(transition.provider.as_str()))?;
                 let quote = exchange
                     .quote_trade(ExchangeQuoteRequest {
                         input_asset: transition.input.asset.clone(),
@@ -5521,7 +5635,7 @@ async fn quote_external_custody_refund_path(
                         recipient_address: order.refund_address.clone(),
                     })
                     .await
-                    .map_err(activity_error)?;
+                    .map_err(|source| provider_quote_error(transition.provider.as_str(), source))?;
                 let Some(quote) = quote else {
                     return Ok(None);
                 };
@@ -5537,12 +5651,7 @@ async fn quote_external_custody_refund_path(
                 let unit = deps
                     .action_providers
                     .unit(transition.provider.as_str())
-                    .ok_or_else(|| {
-                        activity_error(format!(
-                            "{} unit provider is not configured",
-                            transition.provider.as_str()
-                        ))
-                    })?;
+                    .ok_or_else(|| provider_quote_not_configured(transition.provider.as_str()))?;
                 if !unit.supports_deposit(&transition.input.asset) {
                     return Ok(None);
                 }
@@ -5556,12 +5665,7 @@ async fn quote_external_custody_refund_path(
                 let exchange = deps
                     .action_providers
                     .exchange(transition.provider.as_str())
-                    .ok_or_else(|| {
-                        activity_error(format!(
-                            "{} exchange provider is not configured",
-                            transition.provider.as_str()
-                        ))
-                    })?;
+                    .ok_or_else(|| provider_quote_not_configured(transition.provider.as_str()))?;
                 let mut quote_amount_in = cursor_amount.clone();
                 if transition_index > 0
                     && path.transitions[transition_index - 1].kind
@@ -5586,7 +5690,7 @@ async fn quote_external_custody_refund_path(
                         recipient_address: order.refund_address.clone(),
                     })
                     .await
-                    .map_err(activity_error)?;
+                    .map_err(|source| provider_quote_error(transition.provider.as_str(), source))?;
                 let Some(quote) = quote else {
                     return Ok(None);
                 };
@@ -5602,12 +5706,7 @@ async fn quote_external_custody_refund_path(
                 let unit = deps
                     .action_providers
                     .unit(transition.provider.as_str())
-                    .ok_or_else(|| {
-                        activity_error(format!(
-                            "{} unit provider is not configured",
-                            transition.provider.as_str()
-                        ))
-                    })?;
+                    .ok_or_else(|| provider_quote_not_configured(transition.provider.as_str()))?;
                 if !unit.supports_withdrawal(&transition.output.asset)
                     || !refund_unit_withdrawal_amount_meets_minimum(transition, &cursor_amount)?
                 {
@@ -5674,9 +5773,10 @@ fn normalize_refund_amount<'a>(
     value: &'a str,
 ) -> Result<&'a str, OrderActivityError> {
     if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(activity_error(format!(
-            "invalid amount for {field}: expected unsigned decimal integer"
-        )));
+        return Err(amount_parse_error(
+            field,
+            "invalid amount for {field}: expected unsigned decimal integer",
+        ));
     }
     let normalized = value.trim_start_matches('0');
     Ok(if normalized.is_empty() {
@@ -5752,7 +5852,7 @@ fn refund_bridge_quote_legs(
                 execution_step_type_for_transition_kind(transition.kind),
             )])
         }
-        other => Err(activity_error(format!(
+        other => Err(refund_materialization_error(format!(
             "transition kind {} does not produce bridge quote legs",
             other.as_str()
         ))),
@@ -5766,7 +5866,7 @@ fn reserve_refund_hyperliquid_spot_send_quote_gas(
     let amount = normalize_refund_amount(field, value)?;
     let reserve = REFUND_HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW.to_string();
     if !refund_amount_gt(amount, &reserve)? {
-        return Err(activity_error(format!(
+        return Err(refund_materialization_error(format!(
             "amount must exceed Hyperliquid spot token transfer gas reserve {reserve}"
         )));
     }
@@ -5797,19 +5897,18 @@ fn subtract_refund_decimal_amount(
             (lhs - rhs, 0)
         };
         digits[digit_index] = b'0'
-            + u8::try_from(next_digit).map_err(|err| {
-                activity_error(format!("refund amount subtraction digit overflow: {err}"))
-            })?;
+            + u8::try_from(next_digit)
+                .map_err(|err| amount_parse_error("refund amount subtraction digit", err))?;
         borrow = next_borrow;
     }
 
     if borrow != 0 {
-        return Err(activity_error(
+        return Err(refund_materialization_error(
             "Hyperliquid spot token transfer gas reserve exceeded amount",
         ));
     }
     let raw = String::from_utf8(digits)
-        .map_err(|err| activity_error(format!("refund amount subtraction utf8: {err}")))?;
+        .map_err(|err| amount_parse_error("refund amount subtraction utf8", err))?;
     let normalized = raw.trim_start_matches('0');
     Ok(if normalized.is_empty() {
         "0".to_string()
@@ -5853,7 +5952,7 @@ fn refund_take_one_leg(
         .cloned()
         .collect::<Vec<_>>();
     if matches.len() != 1 {
-        return Err(activity_error(format!(
+        return Err(refund_materialization_error(format!(
             "refund transition {} ({}) expected exactly one {:?} leg, found {}",
             transition.id,
             transition.kind.as_str(),
@@ -5998,7 +6097,7 @@ fn refund_transition_cctp_bridge_steps(
         .to_string();
     let receive_provider = refund_leg_provider(receive_leg, transition)?;
     if receive_provider.as_str() != provider {
-        return Err(activity_error(format!(
+        return Err(refund_materialization_error(format!(
             "CCTP receive leg provider {} does not match burn leg provider {} for transition {}",
             receive_provider.as_str(),
             provider,
@@ -6012,7 +6111,7 @@ fn refund_transition_cctp_bridge_steps(
         .get("max_fee")
         .and_then(Value::as_str)
         .ok_or_else(|| {
-            activity_error(format!(
+            refund_materialization_error(format!(
                 "CCTP burn leg {} missing raw.max_fee",
                 burn_leg.transition_decl_id
             ))
@@ -6128,14 +6227,17 @@ fn refund_transition_universal_router_swap_step(
     let order_kind = refund_required_str(swap_leg, "order_kind")?;
     let amount_in = leg.amount_in.as_str();
     let amount_out = leg.amount_out.as_str();
-    let input_asset = leg.input_deposit_asset().map_err(activity_error)?;
-    let output_asset = leg.output_deposit_asset().map_err(activity_error)?;
+    let input_asset = leg
+        .input_deposit_asset()
+        .map_err(refund_materialization_error)?;
+    let output_asset = leg
+        .output_deposit_asset()
+        .map_err(refund_materialization_error)?;
     let input_decimals = refund_required_u8(swap_leg, "src_decimals")?;
     let output_decimals = refund_required_u8(swap_leg, "dest_decimals")?;
-    let price_route = swap_leg
-        .get("price_route")
-        .cloned()
-        .ok_or_else(|| activity_error("universal router refund swap leg missing price_route"))?;
+    let price_route = swap_leg.get("price_route").cloned().ok_or_else(|| {
+        refund_materialization_error("universal router refund swap leg missing price_route")
+    })?;
     let min_amount_out = swap_leg
         .get("min_amount_out")
         .and_then(Value::as_str)
@@ -6431,7 +6533,7 @@ fn external_refund_hyperliquid_binding(
     transition_index: usize,
 ) -> Result<RefundHyperliquidBinding, OrderActivityError> {
     let prior_transitions = transitions.get(..transition_index).ok_or_else(|| {
-        activity_error(format!(
+        refund_materialization_error(format!(
             "refund transition index {transition_index} is out of bounds"
         ))
     })?;
@@ -6443,7 +6545,7 @@ fn external_refund_hyperliquid_binding(
             .all(|transition| transition.kind != MarketOrderTransitionKind::AcrossBridge)
     {
         let asset_id = vault.asset.clone().ok_or_else(|| {
-            activity_error(format!(
+            refund_materialization_error(format!(
                 "external custody vault {} is missing asset for Hyperliquid binding",
                 vault.id
             ))
@@ -6470,7 +6572,7 @@ fn external_refund_hyperliquid_binding(
         .iter()
         .find(|transition| transition.kind == MarketOrderTransitionKind::HyperliquidBridgeDeposit)
     else {
-        return Err(activity_error(format!(
+        return Err(refund_materialization_error(format!(
             "refund transition {} has no preceding Hyperliquid custody source",
             transitions[transition_index].id
         )));
@@ -6618,8 +6720,12 @@ fn refund_transition_hyperliquid_trade_step(
         .get("max_amount_in")
         .and_then(Value::as_str)
         .map(ToString::to_string);
-    let input_asset = leg.input_deposit_asset().map_err(activity_error)?;
-    let output_asset = leg.output_deposit_asset().map_err(activity_error)?;
+    let input_asset = leg
+        .input_deposit_asset()
+        .map_err(refund_materialization_error)?;
+    let output_asset = leg
+        .output_deposit_asset()
+        .map_err(refund_materialization_error)?;
     let request_input_asset = input_asset.clone();
     let request_output_asset = output_asset.clone();
     let (vault_id, vault_address, vault_role, vault_chain_id, vault_asset_id) =
@@ -6769,21 +6875,25 @@ fn refund_execution_leg_from_quote_legs(
     planned_at: chrono::DateTime<Utc>,
 ) -> Result<OrderExecutionLeg, OrderActivityError> {
     let first = quote_legs.first().ok_or_else(|| {
-        activity_error(format!(
+        refund_materialization_error(format!(
             "refund transition {} ({}) has no quoted legs to materialize",
             transition.id,
             transition.kind.as_str()
         ))
     })?;
     let last = quote_legs.last().ok_or_else(|| {
-        activity_error(format!(
+        refund_materialization_error(format!(
             "refund transition {} ({}) has no quoted legs to materialize",
             transition.id,
             transition.kind.as_str()
         ))
     })?;
-    let input_asset = first.input_deposit_asset().map_err(activity_error)?;
-    let output_asset = last.output_deposit_asset().map_err(activity_error)?;
+    let input_asset = first
+        .input_deposit_asset()
+        .map_err(refund_materialization_error)?;
+    let output_asset = last
+        .output_deposit_asset()
+        .map_err(refund_materialization_error)?;
     let provider = quote_legs
         .iter()
         .map(|leg| leg.provider.as_str())
@@ -6853,16 +6963,26 @@ fn refund_exchange_quote_transition_legs(
             let input_asset = quote
                 .provider_quote
                 .get("input_asset")
-                .ok_or_else(|| activity_error("refund universal router quote missing input_asset"))
+                .ok_or_else(|| {
+                    refund_materialization_error(
+                        "refund universal router quote missing input_asset",
+                    )
+                })
                 .and_then(|value| {
-                    QuoteLegAsset::from_value(value, "input_asset").map_err(activity_error)
+                    QuoteLegAsset::from_value(value, "input_asset")
+                        .map_err(refund_materialization_error)
                 })?;
             let output_asset = quote
                 .provider_quote
                 .get("output_asset")
-                .ok_or_else(|| activity_error("refund universal router quote missing output_asset"))
+                .ok_or_else(|| {
+                    refund_materialization_error(
+                        "refund universal router quote missing output_asset",
+                    )
+                })
                 .and_then(|value| {
-                    QuoteLegAsset::from_value(value, "output_asset").map_err(activity_error)
+                    QuoteLegAsset::from_value(value, "output_asset")
+                        .map_err(refund_materialization_error)
                 })?;
             Ok(vec![QuoteLeg {
                 transition_decl_id: transition_decl_id.to_string(),
@@ -6880,7 +7000,7 @@ fn refund_exchange_quote_transition_legs(
         }
         "spot_cross_token" => {
             let Some(legs) = quote.provider_quote.get("legs").and_then(Value::as_array) else {
-                return Err(activity_error(format!(
+                return Err(refund_materialization_error(format!(
                     "refund exchange quote from {provider_name} missing spot_cross_token legs"
                 )));
             };
@@ -6890,18 +7010,24 @@ fn refund_exchange_quote_transition_legs(
                     let input_asset = leg
                         .get("input_asset")
                         .ok_or_else(|| {
-                            activity_error("refund hyperliquid quote leg missing input_asset")
+                            refund_materialization_error(
+                                "refund hyperliquid quote leg missing input_asset",
+                            )
                         })
                         .and_then(|value| {
-                            QuoteLegAsset::from_value(value, "input_asset").map_err(activity_error)
+                            QuoteLegAsset::from_value(value, "input_asset")
+                                .map_err(refund_materialization_error)
                         })?;
                     let output_asset = leg
                         .get("output_asset")
                         .ok_or_else(|| {
-                            activity_error("refund hyperliquid quote leg missing output_asset")
+                            refund_materialization_error(
+                                "refund hyperliquid quote leg missing output_asset",
+                            )
                         })
                         .and_then(|value| {
-                            QuoteLegAsset::from_value(value, "output_asset").map_err(activity_error)
+                            QuoteLegAsset::from_value(value, "output_asset")
+                                .map_err(refund_materialization_error)
                         })?;
                     Ok(QuoteLeg {
                         transition_decl_id: format!("{transition_decl_id}:leg:{index}"),
@@ -6921,7 +7047,7 @@ fn refund_exchange_quote_transition_legs(
                 })
                 .collect()
         }
-        other => Err(activity_error(format!(
+        other => Err(refund_materialization_error(format!(
             "unsupported refund exchange quote kind in transition path: {other:?}"
         ))),
     }
@@ -6932,12 +7058,12 @@ fn required_refund_quote_leg_amount(
     field: &'static str,
 ) -> Result<String, OrderActivityError> {
     let Some(amount) = leg.get(field).and_then(Value::as_str) else {
-        return Err(activity_error(format!(
+        return Err(refund_materialization_error(format!(
             "refund hyperliquid quote leg missing {field}"
         )));
     };
     if amount.is_empty() {
-        return Err(activity_error(format!(
+        return Err(refund_materialization_error(format!(
             "refund hyperliquid quote leg has empty {field}"
         )));
     }
@@ -6949,7 +7075,7 @@ fn refund_leg_provider(
     transition: &TransitionDecl,
 ) -> Result<ProviderId, OrderActivityError> {
     if leg.provider != transition.provider {
-        return Err(activity_error(format!(
+        return Err(refund_materialization_error(format!(
             "refund quote leg provider {} does not match transition provider {}",
             leg.provider.as_str(),
             transition.provider.as_str()
@@ -6962,19 +7088,17 @@ fn refund_required_str<'a>(
     value: &'a Value,
     key: &'static str,
 ) -> Result<&'a str, OrderActivityError> {
-    value
-        .get(key)
-        .and_then(Value::as_str)
-        .ok_or_else(|| activity_error(format!("refund quote leg missing string field {key}")))
+    value.get(key).and_then(Value::as_str).ok_or_else(|| {
+        refund_materialization_error(format!("refund quote leg missing string field {key}"))
+    })
 }
 
 fn refund_required_u8(value: &Value, key: &'static str) -> Result<u8, OrderActivityError> {
-    let raw = value
-        .get(key)
-        .and_then(Value::as_u64)
-        .ok_or_else(|| activity_error(format!("refund quote leg missing numeric field {key}")))?;
+    let raw = value.get(key).and_then(Value::as_u64).ok_or_else(|| {
+        refund_materialization_error(format!("refund quote leg missing numeric field {key}"))
+    })?;
     u8::try_from(raw).map_err(|source| {
-        activity_error(format!(
+        refund_materialization_error(format!(
             "refund quote leg field {key} does not fit u8: {source}"
         ))
     })
@@ -6986,14 +7110,16 @@ fn hyperliquid_refund_balance_amount_raw(
     decimals: u8,
 ) -> Result<Option<String>, OrderActivityError> {
     let total_raw = decimal_string_to_raw_digits(total, decimals).map_err(|message| {
-        activity_error(format!(
-            "invalid Hyperliquid refund total balance: {message}"
-        ))
+        amount_parse_error(
+            "Hyperliquid refund total balance",
+            format!("invalid Hyperliquid refund total balance: {message}"),
+        )
     })?;
     let hold_raw = decimal_string_to_raw_digits(hold, decimals).map_err(|message| {
-        activity_error(format!(
-            "invalid Hyperliquid refund hold balance: {message}"
-        ))
+        amount_parse_error(
+            "Hyperliquid refund hold balance",
+            format!("invalid Hyperliquid refund hold balance: {message}"),
+        )
     })?;
     if total_raw == "0" || hold_raw != "0" {
         return Ok(None);
@@ -7068,17 +7194,17 @@ impl QuoteRefreshActivities {
             .orders()
             .get(input.order_id.inner())
             .await
-            .map_err(activity_error_from_display)?;
+            .map_err(OrderActivityError::db_query)?;
         let original_quote = match deps
             .db
             .orders()
             .get_router_order_quote(input.order_id.inner())
             .await
-            .map_err(activity_error_from_display)?
+            .map_err(OrderActivityError::db_query)?
         {
             RouterOrderQuote::MarketOrder(quote) => quote,
             RouterOrderQuote::LimitOrder(_) => {
-                return Err(activity_error(format!(
+                return Err(refresh_materialization_error(format!(
                     "order {} is a limit order and cannot refresh stale market quotes",
                     input.order_id.inner()
                 )));
@@ -7089,56 +7215,62 @@ impl QuoteRefreshActivities {
             .orders()
             .get_execution_attempt(input.stale_attempt_id.inner())
             .await
-            .map_err(activity_error_from_display)?;
+            .map_err(OrderActivityError::db_query)?;
         if stale_attempt.order_id != input.order_id.inner() {
-            return Err(activity_error(format!(
+            return Err(invariant_error(
+                "refresh_attempt_order",
+                format!(
                 "attempt {} does not belong to order {}",
                 stale_attempt.id, input.order_id.inner()
-            )));
+                ),
+            ));
         }
         let failed_step = deps
             .db
             .orders()
             .get_execution_step(input.failed_step_id.inner())
             .await
-            .map_err(activity_error_from_display)?;
+            .map_err(OrderActivityError::db_query)?;
         if failed_step.order_id != input.order_id.inner()
             || failed_step.execution_attempt_id != Some(input.stale_attempt_id.inner())
         {
-            return Err(activity_error(format!(
+            return Err(invariant_error(
+                "refresh_failed_step_owner",
+                format!(
                 "step {} does not belong to order {} attempt {}",
                 failed_step.id, input.order_id.inner(), input.stale_attempt_id.inner()
-            )));
+                ),
+            ));
         }
         let stale_legs = deps
             .db
             .orders()
             .get_execution_legs_for_attempt(input.stale_attempt_id.inner())
             .await
-            .map_err(activity_error_from_display)?;
+            .map_err(OrderActivityError::db_query)?;
         let stale_leg = failed_step
             .execution_leg_id
             .and_then(|leg_id| stale_legs.iter().find(|leg| leg.id == leg_id).cloned())
             .ok_or_else(|| {
-                activity_error(format!(
+                refresh_materialization_error(format!(
                     "failed step {} has no materialized stale execution leg",
                     failed_step.id
                 ))
             })?;
         let Some(provider_quote_expires_at) = stale_leg.provider_quote_expires_at else {
-            return Err(activity_error(format!(
+            return Err(refresh_materialization_error(format!(
                 "failed step {} execution leg {} has no provider quote expiry",
                 failed_step.id, stale_leg.id
             )));
         };
         if provider_quote_expires_at >= Utc::now() {
-            return Err(activity_error(format!(
+            return Err(refresh_untenable_error(format!(
                 "failed step {} execution leg {} provider quote has not expired",
                 failed_step.id, stale_leg.id
             )));
         }
         let source_vault_id = order.funding_vault_id.ok_or_else(|| {
-            activity_error(format!(
+            refresh_materialization_error(format!(
                 "order {} cannot refresh a quote without a funding vault",
                 order.id
             ))
@@ -7148,13 +7280,13 @@ impl QuoteRefreshActivities {
             .vaults()
             .get(source_vault_id)
             .await
-            .map_err(activity_error_from_display)?;
+            .map_err(OrderActivityError::db_query)?;
         let transitions = deps
             .planner
             .quoted_transition_path(&order, &original_quote)
-            .map_err(activity_error_from_display)?;
+            .map_err(|source| refresh_materialization_error(source.to_string()))?;
         let Some(stale_transition_id) = stale_leg.transition_decl_id.as_deref() else {
-            return Err(activity_error(format!(
+            return Err(refresh_materialization_error(format!(
                 "failed stale execution leg {} has no transition declaration",
                 stale_leg.id
             )));
@@ -7163,7 +7295,7 @@ impl QuoteRefreshActivities {
             .iter()
             .position(|transition| transition.id == stale_transition_id)
             .ok_or_else(|| {
-                activity_error(format!(
+                refresh_materialization_error(format!(
                     "stale execution leg {} transition {} is not in the quoted path",
                     stale_leg.id, stale_transition_id
                 ))
@@ -7173,19 +7305,19 @@ impl QuoteRefreshActivities {
             .orders()
             .get_execution_attempts(input.order_id.inner())
             .await
-            .map_err(activity_error_from_display)?;
+            .map_err(OrderActivityError::db_query)?;
         let execution_history = deps
             .db
             .orders()
             .get_execution_legs(input.order_id.inner())
             .await
-            .map_err(activity_error_from_display)?;
+            .map_err(OrderActivityError::db_query)?;
         let stale_attempt_steps = deps
             .db
             .orders()
             .get_execution_steps_for_attempt(input.stale_attempt_id.inner())
             .await
-            .map_err(activity_error_from_display)?;
+            .map_err(OrderActivityError::db_query)?;
         let available_amount = match refresh_remaining_exact_in_amount(
             &execution_history,
             &attempts,
@@ -7219,7 +7351,7 @@ impl QuoteRefreshActivities {
                         .iter()
                         .find(|step| refresh_step_matches_transition(step, transition))
                         .ok_or_else(|| {
-                            activity_error(format!(
+                            refresh_materialization_error(format!(
                                 "cannot refresh transition {} because no template step is materialized",
                                 transition.id
                             ))
@@ -7228,13 +7360,13 @@ impl QuoteRefreshActivities {
                                 match ExchangeExecutionRequest::universal_router_swap_from_value(
                                     &template_step.request,
                                 )
-                                .map_err(activity_error_from_display)?
+                                .map_err(refresh_materialization_error)?
                                 {
                                     ExchangeExecutionRequest::UniversalRouterSwap(request) => {
                                         request
                                     }
                                     _ => {
-                                        return Err(activity_error(format!(
+                                        return Err(refresh_materialization_error(format!(
                                             "step {} is not a universal-router swap request",
                                             template_step.id
                                         )));
@@ -7585,7 +7717,7 @@ impl QuoteRefreshActivities {
                                 .iter()
                                 .find(|step| refresh_step_matches_transition(step, transition))
                                 .ok_or_else(|| {
-                                    activity_error(format!(
+                                    refresh_materialization_error(format!(
                                         "cannot refresh transition {} because no template step is materialized",
                                         transition.id
                                     ))
@@ -7594,13 +7726,13 @@ impl QuoteRefreshActivities {
                                 match ExchangeExecutionRequest::universal_router_swap_from_value(
                                     &template_step.request,
                                 )
-                                .map_err(activity_error_from_display)?
+                                .map_err(refresh_materialization_error)?
                                 {
                                     ExchangeExecutionRequest::UniversalRouterSwap(request) => {
                                         request
                                     }
                                     _ => {
-                                        return Err(activity_error(format!(
+                                        return Err(refresh_materialization_error(format!(
                                             "step {} is not a universal-router swap request",
                                             template_step.id
                                         )));
@@ -7793,7 +7925,7 @@ impl QuoteRefreshActivities {
                     planned_at: now,
                 },
             )
-            .map_err(activity_error_from_display)?;
+            .map_err(|source| refresh_materialization_error(source.to_string()))?;
         for leg in &mut plan.legs {
             set_json_value(
                 &mut leg.details,
@@ -7889,16 +8021,19 @@ impl QuoteRefreshActivities {
                 input_custody_snapshot,
             } = input.refreshed_attempt.outcome
             else {
-                return Err(activity_error(
+                return Err(refresh_materialization_error(
                     "untenable stale quote refresh must not be materialized",
                 ));
             };
             if order_id != input.order_id.inner() {
-                return Err(activity_error(format!(
-                    "refreshed attempt order {} does not match materialize input order {}",
-                    order_id,
-                    input.order_id.inner()
-                )));
+                return Err(invariant_error(
+                    "refreshed_attempt_order",
+                    format!(
+                        "refreshed attempt order {} does not match materialize input order {}",
+                        order_id,
+                        input.order_id.inner()
+                    ),
+                ));
             }
             plan.steps =
                 hydrate_destination_execution_steps(&deps, input.order_id.inner(), plan.steps)
@@ -7920,7 +8055,7 @@ impl QuoteRefreshActivities {
                     Utc::now(),
                 )
                 .await
-                .map_err(activity_error_from_display)?;
+                .map_err(OrderActivityError::db_query)?;
             tracing::info!(
                 order_id = %record.order.id,
                 attempt_id = %record.attempt.id,
@@ -8031,14 +8166,17 @@ impl ProviderObservationActivities {
                 .orders()
                 .get_provider_operation(input.provider_operation_id.inner())
                 .await
-                .map_err(activity_error_from_display)?;
+                .map_err(OrderActivityError::db_query)?;
             if operation.order_id != input.order_id.inner() {
-                return Err(activity_error(format!(
-                    "provider operation {} belongs to order {}, not {}",
-                    operation.id,
-                    operation.order_id,
-                    input.order_id.inner()
-                )));
+                return Err(lost_intent_recovery_error(
+                    "validating provider operation order",
+                    format!(
+                        "provider operation {} belongs to order {}, not {}",
+                        operation.id,
+                        operation.order_id,
+                        input.order_id.inner()
+                    ),
+                ));
             }
 
             let recovered = recover_across_operation_from_checkpoint(&deps, operation).await?;
@@ -8051,10 +8189,13 @@ impl ProviderObservationActivities {
                     provider_operation_id: input.provider_operation_id,
                 })
             } else {
-                Err(activity_error(format!(
-                    "Across provider operation {} has no recoverable deposit log yet",
-                    input.provider_operation_id.inner()
-                )))
+                Err(lost_intent_recovery_error(
+                    "recovering Across deposit log",
+                    format!(
+                        "Across provider operation {} has no recoverable deposit log yet",
+                        input.provider_operation_id.inner()
+                    ),
+                ))
             }
         })
         .await
@@ -8070,7 +8211,7 @@ async fn poll_provider_operation_hint_for_step(
         .orders()
         .get_execution_step(input.step_id.inner())
         .await
-        .map_err(activity_error_from_display)?;
+        .map_err(OrderActivityError::db_query)?;
     if step.order_id != input.order_id.inner() {
         return Ok(provider_hints_polled(provider_hint_rejected(
             None,
@@ -8088,7 +8229,7 @@ async fn poll_provider_operation_hint_for_step(
         .orders()
         .get_provider_operations(input.order_id.inner())
         .await
-        .map_err(activity_error_from_display)?;
+        .map_err(OrderActivityError::db_query)?;
     let Some(operation) = operations
         .into_iter()
         .filter(|operation| operation.execution_step_id == Some(input.step_id.inner()))
@@ -8268,7 +8409,7 @@ async fn recover_across_operation_from_checkpoint(
         .orders()
         .get_execution_step(step_id)
         .await
-        .map_err(activity_error_from_display)?;
+        .map_err(OrderActivityError::db_query)?;
     let Some(recovered) = recover_across_deposit_from_origin_logs(deps, &operation, &step).await?
     else {
         return Ok(None);
@@ -8300,7 +8441,7 @@ async fn recover_across_operation_from_checkpoint(
             Utc::now(),
         )
         .await
-        .map_err(activity_error_from_display)?;
+        .map_err(OrderActivityError::db_query)?;
     tracing::info!(
         order_id = %updated.order_id,
         provider_operation_id = %updated.id,
@@ -8321,67 +8462,93 @@ async fn recover_across_deposit_from_origin_logs(
         .get("provider_response")
         .unwrap_or(&operation.response);
     let swap_tx = provider_response.get("swapTx").ok_or_else(|| {
-        activity_error(format!(
-            "Across checkpoint recovery missing provider_response.swapTx for operation {}",
-            operation.id
-        ))
+        lost_intent_recovery_error(
+            "reading Across provider checkpoint",
+            format!(
+                "Across checkpoint recovery missing provider_response.swapTx for operation {}",
+                operation.id
+            ),
+        )
     })?;
     let spoke_pool_address = json_str_field(swap_tx, "to").ok_or_else(|| {
-        activity_error(format!(
-            "Across checkpoint recovery missing swapTx.to for operation {}",
-            operation.id
-        ))
+        lost_intent_recovery_error(
+            "reading Across provider checkpoint",
+            format!(
+                "Across checkpoint recovery missing swapTx.to for operation {}",
+                operation.id
+            ),
+        )
     })?;
     let spoke_pool_address = Address::from_str(spoke_pool_address).map_err(|err| {
-        activity_error(format!(
-            "Across checkpoint recovery invalid swapTx.to for operation {}: {err}",
-            operation.id
-        ))
+        lost_intent_recovery_error(
+            "parsing Across spoke pool address",
+            format!(
+                "Across checkpoint recovery invalid swapTx.to for operation {}: {err}",
+                operation.id
+            ),
+        )
     })?;
 
     let origin_chain_id =
         json_u64_field(&operation.request, "origin_chain_id").ok_or_else(|| {
-            activity_error(format!(
-                "Across checkpoint recovery missing origin_chain_id for operation {}",
-                operation.id
-            ))
+            lost_intent_recovery_error(
+                "reading Across operation request",
+                format!(
+                    "Across checkpoint recovery missing origin_chain_id for operation {}",
+                    operation.id
+                ),
+            )
         })?;
     let destination_chain_id = json_u64_field(&operation.request, "destination_chain_id")
         .ok_or_else(|| {
-            activity_error(format!(
-                "Across checkpoint recovery missing destination_chain_id for operation {}",
-                operation.id
-            ))
+            lost_intent_recovery_error(
+                "reading Across operation request",
+                format!(
+                    "Across checkpoint recovery missing destination_chain_id for operation {}",
+                    operation.id
+                ),
+            )
         })?;
     let origin_chain = ChainId::parse(&format!("evm:{origin_chain_id}")).map_err(|err| {
-        activity_error(format!(
-            "Across checkpoint recovery invalid origin chain for operation {}: {err}",
-            operation.id
-        ))
+        lost_intent_recovery_error(
+            "parsing Across origin chain",
+            format!(
+                "Across checkpoint recovery invalid origin chain for operation {}: {err}",
+                operation.id
+            ),
+        )
     })?;
     let backend_chain = backend_chain_for_id(&origin_chain).ok_or_else(|| {
-        activity_error(format!(
-            "Across checkpoint recovery unsupported origin chain {origin_chain}"
-        ))
+        lost_intent_recovery_error(
+            "resolving Across origin backend chain",
+            format!("Across checkpoint recovery unsupported origin chain {origin_chain}"),
+        )
     })?;
     let evm_chain = deps.chain_registry.get_evm(&backend_chain).ok_or_else(|| {
-        activity_error(format!(
-            "Across checkpoint recovery origin chain {origin_chain} is not configured"
-        ))
+        lost_intent_recovery_error(
+            "loading Across origin EVM chain",
+            format!("Across checkpoint recovery origin chain {origin_chain} is not configured"),
+        )
     })?;
 
     let BridgeExecutionRequest::Across(step_request) =
         BridgeExecutionRequest::across_from_value(&step.request).map_err(|err| {
-            activity_error(format!(
+            lost_intent_recovery_error(
+                "decoding Across step request",
+                format!(
                 "Across checkpoint recovery could not decode step request for operation {}: {err}",
                 operation.id
-            ))
+                ),
+            )
         })?
     else {
-        return Err(activity_error(format!(
-            "Across checkpoint recovery step {} is not an Across request",
-            step.id
-        )));
+        return Err(lost_intent_recovery_error(
+            "validating Across step request",
+            format!(
+                "Across checkpoint recovery step {} is not an Across request",
+                step.id
+            ),
+        ));
     };
     let input_token =
         recovery_step_asset_address(&step_request.input_asset, "input_asset", operation)?;
@@ -8394,10 +8561,13 @@ async fn recover_across_deposit_from_origin_logs(
     )?;
     let recipient = recovery_step_address(&step_request.recipient, "recipient", operation)?;
     let amount = U256::from_str_radix(&step_request.amount, 10).map_err(|err| {
-        activity_error(format!(
-            "Across checkpoint recovery invalid request.amount for operation {}: {err}",
-            operation.id
-        ))
+        lost_intent_recovery_error(
+            "parsing Across request amount",
+            format!(
+                "Across checkpoint recovery invalid request.amount for operation {}: {err}",
+                operation.id
+            ),
+        )
     })?;
     let expected_output = json_u256_string_field(provider_response, "expectedOutputAmount")
         .or_else(|| json_u256_string_field(provider_response, "minOutputAmount"));
@@ -8408,7 +8578,9 @@ async fn recover_across_deposit_from_origin_logs(
     let Some(checkpoint_receipt) = evm_chain
         .transaction_receipt(&checkpoint_tx_hash)
         .await
-        .map_err(activity_error_from_display)?
+        .map_err(|source| {
+            lost_intent_recovery_error("reading Across checkpoint transaction receipt", source)
+        })?
     else {
         return Ok(None);
     };
@@ -8424,7 +8596,9 @@ async fn recover_across_deposit_from_origin_logs(
                 .from_block(from_block),
         )
         .await
-        .map_err(activity_error_from_display)?;
+        .map_err(|source| {
+            lost_intent_recovery_error("scanning Across FundsDeposited logs", source)
+        })?;
 
     let input_token = evm_address_to_bytes32(input_token);
     let output_token = evm_address_to_bytes32(output_token);
@@ -8477,7 +8651,7 @@ async fn verify_across_fill_hint(
         .orders()
         .get_provider_operation(provider_operation_id)
         .await
-        .map_err(activity_error_from_display)?;
+        .map_err(OrderActivityError::db_query)?;
 
     if operation.order_id != input.order_id.inner() {
         return Ok(provider_hint_rejected(
@@ -8563,7 +8737,7 @@ async fn verify_across_fill_hint(
                     Utc::now(),
                 )
                 .await
-                .map_err(activity_error_from_display)?;
+                .map_err(OrderActivityError::db_query)?;
             tracing::info!(
                 order_id = %updated.order_id,
                 provider_operation_id = %updated.id,
@@ -8614,7 +8788,7 @@ async fn verify_cctp_attestation_hint(
         .orders()
         .get_provider_operation(provider_operation_id)
         .await
-        .map_err(activity_error_from_display)?;
+        .map_err(OrderActivityError::db_query)?;
 
     if operation.order_id != input.order_id.inner() {
         return Ok(provider_hint_rejected(
@@ -8712,7 +8886,7 @@ async fn verify_cctp_attestation_hint(
             Utc::now(),
         )
         .await
-        .map_err(activity_error_from_display)?;
+        .map_err(OrderActivityError::db_query)?;
 
     match updated.status {
         ProviderOperationStatus::Completed => Ok(ProviderOperationHintVerified {
@@ -8757,7 +8931,7 @@ async fn verify_hyperliquid_trade_hint(
         .orders()
         .get_provider_operation(provider_operation_id)
         .await
-        .map_err(activity_error_from_display)?;
+        .map_err(OrderActivityError::db_query)?;
 
     if operation.order_id != input.order_id.inner() {
         return Ok(provider_hint_rejected(
@@ -8858,7 +9032,7 @@ async fn verify_hyperliquid_trade_hint(
             Utc::now(),
         )
         .await
-        .map_err(activity_error_from_display)?;
+        .map_err(OrderActivityError::db_query)?;
 
     match updated.status {
         ProviderOperationStatus::Completed => Ok(ProviderOperationHintVerified {
@@ -8903,7 +9077,7 @@ async fn verify_unit_deposit_hint(
         .orders()
         .get_provider_operation(provider_operation_id)
         .await
-        .map_err(activity_error_from_display)?;
+        .map_err(OrderActivityError::db_query)?;
 
     if operation.order_id != input.order_id.inner() {
         return Ok(provider_hint_rejected(
@@ -8977,7 +9151,7 @@ async fn verify_unit_deposit_hint(
         .orders()
         .get_provider_addresses_by_operation(operation.id)
         .await
-        .map_err(activity_error_from_display)?;
+        .map_err(OrderActivityError::db_query)?;
     let Some(provider_address) = addresses.iter().find(|address| {
         address.role == ProviderAddressRole::UnitDeposit
             && address.address.eq_ignore_ascii_case(&evidence.address)
@@ -9000,7 +9174,7 @@ async fn verify_unit_deposit_hint(
         .orders()
         .get_execution_step(input.step_id.inner())
         .await
-        .map_err(activity_error_from_display)?;
+        .map_err(OrderActivityError::db_query)?;
     let expected_amount = match expected_provider_operation_amount(
         &operation,
         Some(&step),
@@ -9090,7 +9264,7 @@ async fn verify_unit_deposit_hint(
             Utc::now(),
         )
         .await
-        .map_err(activity_error_from_display)?;
+        .map_err(OrderActivityError::db_query)?;
 
     match updated.status {
         ProviderOperationStatus::Completed => Ok(ProviderOperationHintVerified {
@@ -9135,7 +9309,7 @@ async fn verify_provider_observation_hint(
         .orders()
         .get_provider_operation(provider_operation_id)
         .await
-        .map_err(activity_error_from_display)?;
+        .map_err(OrderActivityError::db_query)?;
 
     if operation.order_id != input.order_id.inner() {
         return Ok(provider_hint_rejected(
@@ -9270,7 +9444,7 @@ async fn verify_provider_observation_hint(
             Utc::now(),
         )
         .await
-        .map_err(activity_error_from_display)?;
+        .map_err(OrderActivityError::db_query)?;
 
     match updated.status {
         ProviderOperationStatus::Completed => Ok(ProviderOperationHintVerified {
@@ -9562,18 +9736,24 @@ fn recovery_step_asset_address(
     operation: &OrderProviderOperation,
 ) -> Result<Address, OrderActivityError> {
     let asset = AssetId::parse(raw).map_err(|err| {
-        activity_error(format!(
-            "Across checkpoint recovery invalid request.{key} for operation {}: {err}",
-            operation.id
-        ))
+        lost_intent_recovery_error(
+            "parsing Across step asset address",
+            format!(
+                "Across checkpoint recovery invalid request.{key} for operation {}: {err}",
+                operation.id
+            ),
+        )
     })?;
     match asset {
         AssetId::Native => Ok(Address::ZERO),
         AssetId::Reference(address) => Address::from_str(&address).map_err(|err| {
-            activity_error(format!(
-                "Across checkpoint recovery invalid request.{key} for operation {}: {err}",
-                operation.id
-            ))
+            lost_intent_recovery_error(
+                "parsing Across reference asset address",
+                format!(
+                    "Across checkpoint recovery invalid request.{key} for operation {}: {err}",
+                    operation.id
+                ),
+            )
         }),
     }
 }
@@ -9584,10 +9764,13 @@ fn recovery_step_address(
     operation: &OrderProviderOperation,
 ) -> Result<Address, OrderActivityError> {
     Address::from_str(raw).map_err(|err| {
-        activity_error(format!(
-            "Across checkpoint recovery invalid request.{key} for operation {}: {err}",
-            operation.id
-        ))
+        lost_intent_recovery_error(
+            "parsing Across request address",
+            format!(
+                "Across checkpoint recovery invalid request.{key} for operation {}: {err}",
+                operation.id
+            ),
+        )
     })
 }
 

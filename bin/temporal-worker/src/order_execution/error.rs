@@ -61,6 +61,43 @@ pub enum OrderActivityError {
     #[snafu(display("refund materialization failed while {context}"))]
     RefundMaterialization { context: String },
 
+    #[snafu(display("refund position discovery failed while {context}"))]
+    RefundDiscovery { context: String },
+
+    #[snafu(display("refresh materialization failed while {context}"))]
+    RefreshMaterialization { context: String },
+
+    #[snafu(display("refresh is untenable while {context}"))]
+    RefreshUntenable { context: String },
+
+    #[snafu(display("hint verification failed for {hint_kind}: {source}"))]
+    HintVerification {
+        hint_kind: String,
+        #[snafu(source(false))]
+        source: String,
+    },
+
+    #[snafu(display("provider observation failed while {context}: {source}"))]
+    Observation {
+        context: String,
+        #[snafu(source(false))]
+        source: String,
+    },
+
+    #[snafu(display("lost-intent recovery failed while {context}: {source}"))]
+    LostIntentRecovery {
+        context: String,
+        #[snafu(source(false))]
+        source: String,
+    },
+
+    #[snafu(display("custody action failed while {context}: {source}"))]
+    CustodyAction {
+        context: String,
+        #[snafu(source(false))]
+        source: String,
+    },
+
     #[snafu(display("invalid terminal state {current}; expected {expected}"))]
     InvalidTerminalState {
         current: String,
@@ -139,17 +176,63 @@ impl OrderActivityError {
     }
 
     #[must_use]
-    pub fn invalid_terminal_state(current: impl Into<String>, expected: &'static str) -> Self {
-        Self::InvalidTerminalState {
-            current: current.into(),
-            expected,
+    pub fn refund_discovery(context: impl Into<String>) -> Self {
+        Self::RefundDiscovery {
+            context: context.into(),
         }
     }
 
     #[must_use]
-    pub fn whatever(message: impl ToString) -> Self {
-        Self::Whatever {
-            message: message.to_string(),
+    pub fn refresh_materialization(context: impl Into<String>) -> Self {
+        Self::RefreshMaterialization {
+            context: context.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn refresh_untenable(context: impl Into<String>) -> Self {
+        Self::RefreshUntenable {
+            context: context.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn hint_verification(hint_kind: impl Into<String>, source: impl ToString) -> Self {
+        Self::HintVerification {
+            hint_kind: hint_kind.into(),
+            source: source.to_string(),
+        }
+    }
+
+    #[must_use]
+    pub fn observation(context: impl Into<String>, source: impl ToString) -> Self {
+        Self::Observation {
+            context: context.into(),
+            source: source.to_string(),
+        }
+    }
+
+    #[must_use]
+    pub fn lost_intent_recovery(context: impl Into<String>, source: impl ToString) -> Self {
+        Self::LostIntentRecovery {
+            context: context.into(),
+            source: source.to_string(),
+        }
+    }
+
+    #[must_use]
+    pub fn custody_action(context: impl Into<String>, source: impl ToString) -> Self {
+        Self::CustodyAction {
+            context: context.into(),
+            source: source.to_string(),
+        }
+    }
+
+    #[must_use]
+    pub fn invalid_terminal_state(current: impl Into<String>, expected: &'static str) -> Self {
+        Self::InvalidTerminalState {
+            current: current.into(),
+            expected,
         }
     }
 
@@ -159,22 +242,9 @@ impl OrderActivityError {
     }
 }
 
-impl From<ActivityError> for OrderActivityError {
-    fn from(source: ActivityError) -> Self {
-        Self::whatever(format!("{source:?}"))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::OrderActivityError;
-
-    #[test]
-    fn whatever_preserves_message() {
-        let error = OrderActivityError::whatever("legacy message");
-
-        assert_eq!(error.to_string(), "legacy message");
-    }
 
     #[test]
     fn invariant_display_includes_name_and_detail() {
