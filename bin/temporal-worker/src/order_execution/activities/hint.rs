@@ -30,25 +30,26 @@ impl ProviderObservationActivities {
         input: VerifyProviderOperationHintInput,
     ) -> Result<ProviderOperationHintVerified, ActivityError> {
         record_activity("verify_provider_operation_hint", async move {
+            let deps = self.deps()?;
+            deps.db
+                .orders()
+                .record_execution_step_hint_arrival(
+                    input.step_id.inner(),
+                    HINT_SOURCE_SAURON_SIGNAL,
+                    Utc::now(),
+                )
+                .await
+                .map_err(OrderActivityError::db_query)?;
             match input.signal.hint_kind {
-                ProviderHintKind::AcrossFill => {
-                    let deps = self.deps()?;
-                    verify_across_fill_hint(&deps, input).await
-                }
+                ProviderHintKind::AcrossFill => verify_across_fill_hint(&deps, input).await,
                 ProviderHintKind::CctpAttestation => {
-                    let deps = self.deps()?;
                     verify_cctp_attestation_hint(&deps, input).await
                 }
-                ProviderHintKind::UnitDeposit => {
-                    let deps = self.deps()?;
-                    verify_unit_deposit_hint(&deps, input).await
-                }
+                ProviderHintKind::UnitDeposit => verify_unit_deposit_hint(&deps, input).await,
                 ProviderHintKind::ProviderObservation => {
-                    let deps = self.deps()?;
                     verify_provider_observation_hint(&deps, input).await
                 }
                 ProviderHintKind::HyperliquidTrade => {
-                    let deps = self.deps()?;
                     verify_hyperliquid_trade_hint(&deps, input).await
                 }
             }
@@ -142,6 +143,15 @@ pub(super) async fn poll_provider_operation_hint_for_step(
             ),
         )));
     }
+    deps.db
+        .orders()
+        .record_execution_step_hint_arrival(
+            input.step_id.inner(),
+            HINT_SOURCE_HINT_POLL,
+            Utc::now(),
+        )
+        .await
+        .map_err(OrderActivityError::db_query)?;
 
     let operations = deps
         .db

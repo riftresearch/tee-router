@@ -193,6 +193,57 @@ async fn classify_stale_running_step_records_all_decisions() {
 }
 
 #[tokio::test]
+async fn waiting_external_transition_records_latency_timestamp() {
+    let test_db = test_database().await;
+    let seeded = seed_running_step(&test_db.pool, false, false).await;
+    let waiting_at = Utc::now();
+
+    let step = test_db
+        .db
+        .orders()
+        .wait_execution_step(seeded.step_id, json!({"kind": "waiting"}), None, waiting_at)
+        .await
+        .expect("mark step waiting external");
+    assert_eq!(step.status, OrderExecutionStepStatus::Waiting);
+
+    let latency = test_db
+        .db
+        .orders()
+        .get_execution_step_latency_record(seeded.step_id)
+        .await
+        .expect("load latency record");
+    assert!(latency.waiting_external_at.is_some());
+    assert_eq!(latency.hint_arrived_at, None);
+    assert_eq!(latency.hint_source, None);
+}
+
+#[tokio::test]
+async fn hint_arrival_records_latency_source() {
+    let test_db = test_database().await;
+    let seeded = seed_running_step(&test_db.pool, false, false).await;
+    let arrived_at = Utc::now();
+
+    test_db
+        .db
+        .orders()
+        .record_execution_step_hint_arrival(seeded.step_id, HINT_SOURCE_SAURON_SIGNAL, arrived_at)
+        .await
+        .expect("record hint arrival");
+
+    let latency = test_db
+        .db
+        .orders()
+        .get_execution_step_latency_record(seeded.step_id)
+        .await
+        .expect("load latency record");
+    assert!(latency.hint_arrived_at.is_some());
+    assert_eq!(
+        latency.hint_source.as_deref(),
+        Some(HINT_SOURCE_SAURON_SIGNAL)
+    );
+}
+
+#[tokio::test]
 async fn hyperliquid_bridge_quotes_build_refund_quote_leg_shapes() {
     let registry = ActionProviderRegistry::http_from_options(ActionProviderHttpOptions {
         across: None,
