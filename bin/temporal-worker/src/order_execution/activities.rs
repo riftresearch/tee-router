@@ -1789,6 +1789,7 @@ async fn hydrate_destination_execution_steps(
     order_id: Uuid,
     steps: Vec<OrderExecutionStep>,
 ) -> Result<Vec<OrderExecutionStep>, ActivityError> {
+    let mut source_deposit_vault: Option<CustodyVault> = None;
     let mut destination_execution_vault: Option<CustodyVault> = None;
     let mut hyperliquid_spot_vault: Option<CustodyVault> = None;
     let mut hydrated = Vec::with_capacity(steps.len());
@@ -1950,6 +1951,70 @@ async fn hydrate_destination_execution_steps(
         if json_string_equals(
             &step.request,
             "hyperliquid_custody_vault_role",
+            CustodyVaultRole::SourceDeposit.to_db_string(),
+        ) {
+            let chain_id = step
+                .request
+                .get("hyperliquid_custody_vault_chain_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    activity_error(format!(
+                        "source deposit Hyperliquid custody requires hyperliquid_custody_vault_chain_id for step {}",
+                        step.id
+                    ))
+                })?;
+            let asset_id = step
+                .request
+                .get("hyperliquid_custody_vault_asset_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    activity_error(format!(
+                        "source deposit Hyperliquid custody requires hyperliquid_custody_vault_asset_id for step {}",
+                        step.id
+                    ))
+                })?;
+            let asset = DepositAsset {
+                chain: ChainId::parse(chain_id).map_err(|source| {
+                    activity_error(format!(
+                        "step {} hyperliquid_custody_vault_chain_id is invalid: {source}",
+                        step.id
+                    ))
+                })?,
+                asset: AssetId::parse(asset_id).map_err(|source| {
+                    activity_error(format!(
+                        "step {} hyperliquid_custody_vault_asset_id is invalid: {source}",
+                        step.id
+                    ))
+                })?,
+            };
+            let vault =
+                ensure_source_deposit_vault(deps, order_id, &asset, &mut source_deposit_vault)
+                    .await?;
+            set_json_value(
+                &mut step.request,
+                "hyperliquid_custody_vault_id",
+                json!(vault.id),
+            );
+            set_json_value(
+                &mut step.request,
+                "hyperliquid_custody_vault_address",
+                json!(vault.address),
+            );
+            set_json_value(
+                &mut step.details,
+                "hyperliquid_custody_vault_id",
+                json!(vault.id),
+            );
+            set_json_value(
+                &mut step.details,
+                "hyperliquid_custody_vault_address",
+                json!(vault.address),
+            );
+        }
+
+        if json_string_equals(
+            &step.request,
+            "hyperliquid_custody_vault_role",
             CustodyVaultRole::HyperliquidSpot.to_db_string(),
         ) {
             let vault =
@@ -2048,6 +2113,51 @@ async fn hydrate_destination_execution_steps(
     }
 
     Ok(hydrated)
+}
+
+async fn ensure_source_deposit_vault(
+    deps: &OrderActivityDeps,
+    order_id: Uuid,
+    asset: &DepositAsset,
+    cache: &mut Option<CustodyVault>,
+) -> Result<CustodyVault, ActivityError> {
+    if let Some(vault) = cache.as_ref().filter(|vault| {
+        vault.chain == asset.chain
+            && vault.asset.as_ref() == Some(&asset.asset)
+            && vault.role == CustodyVaultRole::SourceDeposit
+    }) {
+        return Ok(vault.clone());
+    }
+
+    let vault = find_source_deposit_vault(deps, order_id, asset)
+        .await?
+        .ok_or_else(|| {
+            activity_error(format!(
+                "source deposit custody vault for order {order_id} and asset {}:{} was not found",
+                asset.chain.as_str(),
+                asset.asset.as_str()
+            ))
+        })?;
+    *cache = Some(vault.clone());
+    Ok(vault)
+}
+
+async fn find_source_deposit_vault(
+    deps: &OrderActivityDeps,
+    order_id: Uuid,
+    asset: &DepositAsset,
+) -> Result<Option<CustodyVault>, ActivityError> {
+    let vaults = deps
+        .db
+        .orders()
+        .get_custody_vaults(order_id)
+        .await
+        .map_err(activity_error_from_display)?;
+    Ok(vaults.into_iter().find(|vault| {
+        vault.role == CustodyVaultRole::SourceDeposit
+            && vault.chain == asset.chain
+            && vault.asset.as_ref() == Some(&asset.asset)
+    }))
 }
 
 async fn ensure_hyperliquid_spot_vault(
