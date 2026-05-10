@@ -1,5 +1,10 @@
 // Activity function constants are registered before the later rewrite slices invoke them.
-use std::{future::Future, str::FromStr, sync::Arc, time::Instant};
+use std::{
+    future::Future,
+    str::FromStr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use alloy::{
     primitives::{Address, FixedBytes, U256},
@@ -11,9 +16,10 @@ use chains::{ChainRegistry, UserDepositCandidateStatus};
 use chrono::Utc;
 use router_core::{
     db::{
-        Database, ExecutionAttemptPlan, ExternalCustodyRefundAttemptPlan,
-        FundingVaultRefundAttemptPlan, HyperliquidSpotRefundAttemptPlan,
-        PersistStepCompletionRecord, RefreshedExecutionAttemptPlan,
+        Database, ExecutionAttemptPlan, ExecutionStepLatencyRecord,
+        ExternalCustodyRefundAttemptPlan, FundingVaultRefundAttemptPlan,
+        HyperliquidSpotRefundAttemptPlan, PersistStepCompletionRecord,
+        RefreshedExecutionAttemptPlan,
     },
     error::{RouterCoreError, RouterCoreResult},
     models::{
@@ -93,6 +99,8 @@ const REFRESH_HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW: u64 =
     REFUND_HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW;
 const REFRESH_BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_BPS: u64 = 12_500;
 const REFRESH_PROBE_MAX_AMOUNT_IN: &str = "340282366920938463463374607431768211455";
+const HINT_SOURCE_SAURON_SIGNAL: &str = "sauron_signal";
+const HINT_SOURCE_HINT_POLL: &str = "hint_poll";
 
 async fn record_activity<T, F>(activity_name: &'static str, activity: F) -> Result<T, ActivityError>
 where
@@ -102,6 +110,152 @@ where
     let result = activity.await.map_err(ActivityError::from);
     telemetry::record_activity(activity_name, result.is_ok(), started.elapsed());
     result
+}
+
+async fn record_step_waiting_external_latency_metrics(deps: &OrderActivityDeps, step_id: Uuid) {
+    match deps
+        .db
+        .orders()
+        .get_execution_step_latency_record(step_id)
+        .await
+    {
+        Ok(record) => record_waiting_external_latency_record(&record),
+        Err(error) => {
+            tracing::warn!(
+                step_id = %step_id,
+                error = %error,
+                "failed to record waiting-external latency metrics"
+            );
+        }
+    }
+}
+
+async fn record_step_terminal_latency_metrics(deps: &OrderActivityDeps, step_id: Uuid) {
+    match deps
+        .db
+        .orders()
+        .get_execution_step_latency_record(step_id)
+        .await
+    {
+        Ok(record) => record_terminal_latency_record(&record),
+        Err(error) => {
+            tracing::warn!(
+                step_id = %step_id,
+                error = %error,
+                "failed to record terminal step latency metrics"
+            );
+        }
+    }
+}
+
+async fn record_order_executor_wait_total_metric(
+    deps: &OrderActivityDeps,
+    order_id: Uuid,
+    outcome: &'static str,
+    funded_to_workflow_start_seconds: Option<f64>,
+) {
+    match deps
+        .db
+        .orders()
+        .get_order_executor_wait_total(order_id)
+        .await
+    {
+        Ok(total) => telemetry::record_order_executor_wait_total(
+            outcome,
+            total.total_seconds() + funded_to_workflow_start_seconds.unwrap_or(0.0),
+        ),
+        Err(error) => {
+            tracing::warn!(
+                order_id = %order_id,
+                outcome,
+                error = %error,
+                "failed to record order executor wait total metric"
+            );
+        }
+    }
+}
+
+fn record_waiting_external_latency_record(record: &ExecutionStepLatencyRecord) {
+    let step_type = record.step_type.to_db_string();
+    if let Some(started_at) = record.started_at {
+        if let Some(duration) = nonnegative_duration(record.created_at, started_at) {
+            telemetry::record_step_queue_latency(step_type, duration);
+        }
+        if let Some(waiting_external_at) = record.waiting_external_at {
+            if let Some(duration) = nonnegative_duration(started_at, waiting_external_at) {
+                telemetry::record_step_dispatch_latency(step_type, duration);
+            }
+        }
+    }
+}
+
+fn record_terminal_latency_record(record: &ExecutionStepLatencyRecord) {
+    let step_type = record.step_type.to_db_string();
+    if record.waiting_external_at.is_none() {
+        if let Some(started_at) = record.started_at {
+            if let Some(duration) = nonnegative_duration(record.created_at, started_at) {
+                telemetry::record_step_queue_latency(step_type, duration);
+            }
+        }
+        return;
+    }
+
+    let Some(waiting_external_at) = record.waiting_external_at else {
+        return;
+    };
+    let Some(hint_arrived_at) = record.hint_arrived_at else {
+        return;
+    };
+    let Some(completed_at) = record.completed_at else {
+        return;
+    };
+    let Some(source) = record.hint_source.as_deref() else {
+        return;
+    };
+
+    if let Some(duration) = nonnegative_duration(waiting_external_at, hint_arrived_at) {
+        telemetry::record_step_external_wait(step_type, source, duration);
+    }
+    if let Some(duration) = nonnegative_duration(hint_arrived_at, completed_at) {
+        telemetry::record_step_verification_latency(
+            provider_operation_hint_kind_label(record.provider_operation_type),
+            duration,
+        );
+    }
+}
+
+fn nonnegative_duration(
+    start: chrono::DateTime<Utc>,
+    end: chrono::DateTime<Utc>,
+) -> Option<Duration> {
+    end.signed_duration_since(start).to_std().ok()
+}
+
+fn nonnegative_duration_seconds(
+    start: chrono::DateTime<Utc>,
+    end: chrono::DateTime<Utc>,
+) -> Option<f64> {
+    nonnegative_duration(start, end).map(|duration| duration.as_secs_f64())
+}
+
+fn provider_operation_hint_kind_label(
+    operation_type: Option<ProviderOperationType>,
+) -> &'static str {
+    match operation_type {
+        Some(ProviderOperationType::AcrossBridge) => "across_fill",
+        Some(ProviderOperationType::CctpBridge) => "cctp_attestation",
+        Some(ProviderOperationType::UnitDeposit) => "unit_deposit",
+        Some(
+            ProviderOperationType::HyperliquidTrade | ProviderOperationType::HyperliquidLimitOrder,
+        ) => "hyperliquid_trade",
+        Some(
+            ProviderOperationType::UnitWithdrawal
+            | ProviderOperationType::HyperliquidBridgeDeposit
+            | ProviderOperationType::HyperliquidBridgeWithdrawal
+            | ProviderOperationType::UniversalRouterSwap,
+        ) => "provider_observation",
+        None => "unknown",
+    }
 }
 
 // Canonical Across V3 `FundsDeposited` event used for scar §11 lost-intent

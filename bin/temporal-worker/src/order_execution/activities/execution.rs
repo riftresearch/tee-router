@@ -101,6 +101,13 @@ impl OrderActivities {
                 event_name = "order.completed",
                 "order.completed"
             );
+            record_order_executor_wait_total_metric(
+                &deps,
+                completed.order.id,
+                "completed",
+                input.funded_to_workflow_start_seconds,
+            )
+            .await;
             Ok(OrderCompleted {
                 order_id: completed.order.id.into(),
                 attempt_id: completed.attempt.id.into(),
@@ -118,12 +125,22 @@ impl OrderActivities {
     ) -> Result<OrderExecutionState, ActivityError> {
         record_activity("load_order_execution_state", async move {
             let deps = self.deps()?;
+            let first_activity_at = Utc::now();
             let order = deps
                 .db
                 .orders()
                 .get(input.order_id.inner())
                 .await
                 .map_err(OrderActivityError::db_query)?;
+            let funded_to_workflow_start_seconds =
+                if order.status == router_core::models::RouterOrderStatus::Funded {
+                    nonnegative_duration_seconds(order.updated_at, first_activity_at)
+                } else {
+                    None
+                };
+            if let Some(seconds) = funded_to_workflow_start_seconds {
+                telemetry::record_funded_to_workflow_start(Duration::from_secs_f64(seconds));
+            }
             let funding_vault_id = order.funding_vault_id.ok_or_else(|| {
                 OrderActivityError::invariant(
                     "order_has_funding_vault",
@@ -194,6 +211,7 @@ impl OrderActivities {
                 phase: OrderWorkflowPhase::WaitingForFunding,
                 active_attempt_id: None,
                 active_step_id: None,
+                funded_to_workflow_start_seconds,
                 order,
                 plan: ExecutionPlan {
                     path_id: route.path_id,
@@ -418,6 +436,7 @@ impl OrderActivities {
                 event_name = "execution_step.failed",
                 "execution_step.failed"
             );
+            record_step_terminal_latency_metrics(&deps, step.id).await;
             Ok(BoundaryPersisted {
                 boundary: PersistenceBoundary::AfterStepMarkedFailed,
             })
@@ -561,6 +580,7 @@ impl OrderActivities {
                 event_name = "execution_step.completed",
                 "execution_step.completed"
             );
+            record_step_terminal_latency_metrics(&deps, record.step.id).await;
             Ok(BoundaryPersisted {
                 boundary: PersistenceBoundary::AfterProviderStepSettlement,
             })
@@ -973,6 +993,13 @@ impl OrderActivities {
                         event_name = "order.refund_required",
                         "order.refund_required"
                     );
+                    record_order_executor_wait_total_metric(
+                        &deps,
+                        order.id,
+                        "refund_required",
+                        input.funded_to_workflow_start_seconds,
+                    )
+                    .await;
                     Ok(FinalizedOrder {
                         order_id: order.id.into(),
                         terminal_status: OrderTerminalStatus::RefundRequired,
@@ -997,6 +1024,13 @@ impl OrderActivities {
                         event_name = "order.refunded",
                         "order.refunded"
                     );
+                    record_order_executor_wait_total_metric(
+                        &deps,
+                        completed.order.id,
+                        "refunded",
+                        input.funded_to_workflow_start_seconds,
+                    )
+                    .await;
                     Ok(FinalizedOrder {
                         order_id: completed.order.id.into(),
                         terminal_status: OrderTerminalStatus::Refunded,
@@ -1017,6 +1051,13 @@ impl OrderActivities {
                         event_name = "order.refund_manual_intervention_required",
                         "order.refund_manual_intervention_required"
                     );
+                    record_order_executor_wait_total_metric(
+                        &deps,
+                        order.id,
+                        "refund_manual_intervention_required",
+                        input.funded_to_workflow_start_seconds,
+                    )
+                    .await;
                     Ok(FinalizedOrder {
                         order_id: order.id.into(),
                         terminal_status: OrderTerminalStatus::RefundManualInterventionRequired,
@@ -1055,6 +1096,13 @@ impl OrderActivities {
                         event_name = "order.execution_manual_intervention_required",
                         "order.execution_manual_intervention_required"
                     );
+                    record_order_executor_wait_total_metric(
+                        &deps,
+                        order.id,
+                        "manual_intervention_required",
+                        input.funded_to_workflow_start_seconds,
+                    )
+                    .await;
                     Ok(FinalizedOrder {
                         order_id: order.id.into(),
                         terminal_status: OrderTerminalStatus::ManualInterventionRequired,
@@ -1457,6 +1505,7 @@ pub(super) async fn finalize_execution_manual_intervention(
             ));
         }
     };
+    record_step_terminal_latency_metrics(deps, failed_step.id).await;
 
     let order = deps
         .db
@@ -1531,7 +1580,7 @@ pub(super) async fn settle_waiting_provider_step(
     match operation.map(|operation| operation.status) {
         Some(ProviderOperationStatus::Completed) => {
             let operation = operation.expect("checked completed operation above");
-            complete_observed_provider_step(deps, execution, operation).await?;
+            let completed = complete_observed_provider_step(deps, execution, operation).await?;
             tracing::info!(
                 order_id = %execution.order_id.inner(),
                 attempt_id = %execution.attempt_id.inner(),
@@ -1540,6 +1589,7 @@ pub(super) async fn settle_waiting_provider_step(
                 event_name = "execution_step.completed",
                 "execution_step.completed"
             );
+            record_step_terminal_latency_metrics(deps, completed.id).await;
         }
         Some(ProviderOperationStatus::Failed | ProviderOperationStatus::Expired) => {
             let operation = operation.expect("checked failed operation above");
@@ -1560,7 +1610,9 @@ pub(super) async fn settle_waiting_provider_step(
                 )
                 .await;
             match step {
-                Ok(_) => {}
+                Ok(step) => {
+                    record_step_terminal_latency_metrics(deps, step.id).await;
+                }
                 Err(RouterCoreError::NotFound) => {
                     let current = deps
                         .db
@@ -1599,7 +1651,7 @@ pub(super) async fn settle_waiting_provider_step(
                 )
                 .await;
             match waiting {
-                Ok(_) => {
+                Ok(step) => {
                     tracing::info!(
                         order_id = %execution.order_id.inner(),
                         attempt_id = %execution.attempt_id.inner(),
@@ -1607,6 +1659,7 @@ pub(super) async fn settle_waiting_provider_step(
                         event_name = "execution_step.waiting_external",
                         "execution_step.waiting_external"
                     );
+                    record_step_waiting_external_latency_metrics(deps, step.id).await;
                 }
                 Err(RouterCoreError::NotFound) => {
                     let current = deps

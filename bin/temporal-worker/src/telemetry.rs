@@ -139,6 +139,52 @@ pub fn record_stale_quote_refresh_cap_hit() {
     counter!("tee_router_temporal_worker_stale_quote_refresh_cap_hit_total").increment(1);
 }
 
+pub fn record_step_queue_latency(step_type: &str, duration: Duration) {
+    histogram!(
+        "tee_router_temporal_worker_step_queue_latency_seconds",
+        "step_type" => step_type.to_string(),
+    )
+    .record(duration.as_secs_f64());
+}
+
+pub fn record_step_dispatch_latency(step_type: &str, duration: Duration) {
+    histogram!(
+        "tee_router_temporal_worker_step_dispatch_latency_seconds",
+        "step_type" => step_type.to_string(),
+    )
+    .record(duration.as_secs_f64());
+}
+
+pub fn record_step_external_wait(step_type: &str, source: &str, duration: Duration) {
+    histogram!(
+        "tee_router_temporal_worker_step_external_wait_seconds",
+        "step_type" => step_type.to_string(),
+        "source" => source.to_string(),
+    )
+    .record(duration.as_secs_f64());
+}
+
+pub fn record_step_verification_latency(hint_kind: &str, duration: Duration) {
+    histogram!(
+        "tee_router_temporal_worker_step_verification_latency_seconds",
+        "hint_kind" => hint_kind.to_string(),
+    )
+    .record(duration.as_secs_f64());
+}
+
+pub fn record_funded_to_workflow_start(duration: Duration) {
+    histogram!("tee_router_temporal_worker_funded_to_workflow_start_seconds")
+        .record(duration.as_secs_f64());
+}
+
+pub fn record_order_executor_wait_total(outcome: &'static str, seconds: f64) {
+    histogram!(
+        "tee_router_temporal_worker_order_executor_wait_total_seconds",
+        "outcome" => outcome,
+    )
+    .record(seconds);
+}
+
 fn success_status(success: bool) -> &'static str {
     if success {
         "success"

@@ -254,6 +254,7 @@ impl OrderWorkflow {
                 db_activity_options.clone(),
             )
             .await?;
+        let funded_to_workflow_start_seconds = execution_state.funded_to_workflow_start_seconds;
 
         let mut resumed_manual_attempt = None;
         if execution_state.order.status == RouterOrderStatus::ManualInterventionRequired {
@@ -286,6 +287,7 @@ impl OrderWorkflow {
                 step_id,
                 json_reason("workflow_started_in_manual_intervention", step_id),
                 db_activity_options.clone(),
+                funded_to_workflow_start_seconds,
             )
             .await?
             {
@@ -306,7 +308,13 @@ impl OrderWorkflow {
                 }
                 ManualInterventionResolution::TriggerRefund => {
                     set_order_workflow_refunding(ctx, input.order_id, attempt_id);
-                    let terminal_status = run_refund_child(ctx, input.order_id, attempt_id).await?;
+                    let terminal_status = run_refund_child(
+                        ctx,
+                        input.order_id,
+                        attempt_id,
+                        funded_to_workflow_start_seconds,
+                    )
+                    .await?;
                     return order_workflow_output(
                         ctx,
                         workflow_started_at,
@@ -435,6 +443,7 @@ impl OrderWorkflow {
                                         step_id: None,
                                         terminal_status: OrderTerminalStatus::RefundRequired,
                                         reason: None,
+                                        funded_to_workflow_start_seconds,
                                     },
                                     db_activity_options.clone(),
                                 )
@@ -525,6 +534,7 @@ impl OrderWorkflow {
                                     ctx,
                                     input.order_id,
                                     execution_attempt.attempt_id,
+                                    funded_to_workflow_start_seconds,
                                 )
                                 .await?;
                                 return order_workflow_output(
@@ -583,6 +593,7 @@ impl OrderWorkflow {
                                                     terminal_status:
                                                         OrderTerminalStatus::RefundRequired,
                                                     reason: None,
+                                                    funded_to_workflow_start_seconds,
                                                 },
                                                 db_activity_options,
                                             )
@@ -607,6 +618,7 @@ impl OrderWorkflow {
                                         step.step_id,
                                     ),
                                     db_activity_options.clone(),
+                                    funded_to_workflow_start_seconds,
                                 )
                                 .await?
                                 {
@@ -639,6 +651,7 @@ impl OrderWorkflow {
                                             ctx,
                                             input.order_id,
                                             execution_attempt.attempt_id,
+                                            funded_to_workflow_start_seconds,
                                         )
                                         .await?;
                                         return order_workflow_output(
@@ -668,6 +681,7 @@ impl OrderWorkflow {
                             step.step_id,
                             classified.reason,
                             db_activity_options.clone(),
+                            funded_to_workflow_start_seconds,
                         )
                         .await?
                         {
@@ -700,6 +714,7 @@ impl OrderWorkflow {
                                     ctx,
                                     input.order_id,
                                     execution_attempt.attempt_id,
+                                    funded_to_workflow_start_seconds,
                                 )
                                 .await?;
                                 return order_workflow_output(
@@ -754,6 +769,7 @@ impl OrderWorkflow {
                         step.step_id,
                         executed,
                         db_activity_options.clone(),
+                        funded_to_workflow_start_seconds,
                     )
                     .await?
                     {
@@ -789,6 +805,7 @@ impl OrderWorkflow {
                                         ctx,
                                         input.order_id,
                                         execution_attempt.attempt_id,
+                                        funded_to_workflow_start_seconds,
                                     )
                                     .await?;
                                     return order_workflow_output(
@@ -821,6 +838,7 @@ impl OrderWorkflow {
                 MarkOrderCompletedInput {
                     order_id: input.order_id,
                     attempt_id: execution_attempt.attempt_id,
+                    funded_to_workflow_start_seconds,
                 },
                 db_activity_options,
             )
@@ -1049,6 +1067,7 @@ async fn run_refund_child(
     ctx: &mut WorkflowContext<OrderWorkflow>,
     order_id: WorkflowOrderId,
     parent_attempt_id: WorkflowAttemptId,
+    funded_to_workflow_start_seconds: Option<f64>,
 ) -> WorkflowResult<OrderTerminalStatus> {
     let child = ctx
         .child_workflow(
@@ -1057,6 +1076,7 @@ async fn run_refund_child(
                 order_id,
                 parent_attempt_id: Some(parent_attempt_id),
                 trigger: RefundTrigger::FailedAttempt,
+                funded_to_workflow_start_seconds,
             },
             refund_child_options(order_id, parent_attempt_id),
         )
@@ -1077,6 +1097,7 @@ async fn finalize_manual_intervention(
     step_id: WorkflowStepId,
     reason: Value,
     db_activity_options: ActivityOptions,
+    funded_to_workflow_start_seconds: Option<f64>,
 ) -> WorkflowResult<FinalizedOrder> {
     Ok(ctx
         .start_activity(
@@ -1087,6 +1108,7 @@ async fn finalize_manual_intervention(
                 step_id: Some(step_id),
                 terminal_status: OrderTerminalStatus::ManualInterventionRequired,
                 reason: Some(reason),
+                funded_to_workflow_start_seconds,
             },
             db_activity_options,
         )
@@ -1100,6 +1122,7 @@ async fn wait_for_manual_intervention_resolution(
     step_id: WorkflowStepId,
     reason: Value,
     db_activity_options: ActivityOptions,
+    funded_to_workflow_start_seconds: Option<f64>,
 ) -> WorkflowResult<ManualInterventionResolution> {
     ctx.state_mut(|workflow| {
         workflow.state =
@@ -1113,6 +1136,7 @@ async fn wait_for_manual_intervention_resolution(
         step_id,
         reason,
         db_activity_options.clone(),
+        funded_to_workflow_start_seconds,
     )
     .await?;
 
@@ -1258,6 +1282,7 @@ async fn wait_for_provider_completion_hint(
     step_id: WorkflowStepId,
     execution: StepExecuted,
     db_activity_options: ActivityOptions,
+    funded_to_workflow_start_seconds: Option<f64>,
 ) -> WorkflowResult<ProviderCompletionWait> {
     let wait_started_at = provider_hint_wait_started(ctx);
     let poll_child = ctx
@@ -1345,6 +1370,7 @@ async fn wait_for_provider_completion_hint(
                             step_id,
                             reason,
                             db_activity_options.clone(),
+                            funded_to_workflow_start_seconds,
                         )
                         .await?;
                         record_provider_hint_wait(
@@ -1373,6 +1399,7 @@ async fn wait_for_provider_completion_hint(
                         "step_id": step_id,
                     }),
                     db_activity_options.clone(),
+                    funded_to_workflow_start_seconds,
                 )
                 .await?;
                 record_provider_hint_wait(

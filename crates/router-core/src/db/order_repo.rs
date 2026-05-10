@@ -348,6 +348,33 @@ pub struct CompletedExecutionOrder {
     pub attempt: OrderExecutionAttempt,
 }
 
+#[derive(Debug, Clone)]
+pub struct ExecutionStepLatencyRecord {
+    pub step_id: Uuid,
+    pub step_type: OrderExecutionStepType,
+    pub created_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub waiting_external_at: Option<DateTime<Utc>>,
+    pub hint_arrived_at: Option<DateTime<Utc>>,
+    pub hint_source: Option<String>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub provider_operation_type: Option<ProviderOperationType>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OrderExecutorWaitTotal {
+    pub step_queue_seconds: f64,
+    pub step_dispatch_seconds: f64,
+    pub step_verification_seconds: f64,
+}
+
+impl OrderExecutorWaitTotal {
+    #[must_use]
+    pub fn total_seconds(self) -> f64 {
+        self.step_queue_seconds + self.step_dispatch_seconds + self.step_verification_seconds
+    }
+}
+
 #[derive(Clone)]
 pub struct OrderRepository {
     pool: PgPool,
@@ -6744,6 +6771,109 @@ impl OrderRepository {
         self.map_execution_step_row(&row)
     }
 
+    pub async fn get_execution_step_latency_record(
+        &self,
+        id: Uuid,
+    ) -> RouterCoreResult<ExecutionStepLatencyRecord> {
+        let started = Instant::now();
+        let result = sqlx_core::query::query(
+            r#"
+            SELECT
+                steps.id,
+                steps.step_type,
+                steps.created_at,
+                steps.started_at,
+                steps.waiting_external_at,
+                steps.hint_arrived_at,
+                steps.hint_source,
+                steps.completed_at,
+                latest_operation.operation_type AS provider_operation_type
+            FROM order_execution_steps steps
+            LEFT JOIN LATERAL (
+                SELECT ops.operation_type
+                FROM order_provider_operations ops
+                WHERE ops.execution_step_id = steps.id
+                ORDER BY ops.updated_at DESC, ops.created_at DESC, ops.id DESC
+                LIMIT 1
+            ) latest_operation ON true
+            WHERE steps.id = $1
+            "#,
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await;
+        telemetry::record_db_query(
+            "order.get_execution_step_latency_record",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        let row = result?;
+        self.map_execution_step_latency_record_row(&row)
+    }
+
+    pub async fn get_order_executor_wait_total(
+        &self,
+        order_id: Uuid,
+    ) -> RouterCoreResult<OrderExecutorWaitTotal> {
+        let started = Instant::now();
+        let result = sqlx_core::query::query(
+            r#"
+            SELECT
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN started_at IS NOT NULL AND started_at >= created_at
+                                THEN EXTRACT(EPOCH FROM (started_at - created_at))
+                            ELSE 0
+                        END
+                    ),
+                    0
+                )::float8 AS queue_seconds,
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN waiting_external_at IS NOT NULL
+                             AND started_at IS NOT NULL
+                             AND waiting_external_at >= started_at
+                                THEN EXTRACT(EPOCH FROM (waiting_external_at - started_at))
+                            ELSE 0
+                        END
+                    ),
+                    0
+                )::float8 AS dispatch_seconds,
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN completed_at IS NOT NULL
+                             AND hint_arrived_at IS NOT NULL
+                             AND completed_at >= hint_arrived_at
+                                THEN EXTRACT(EPOCH FROM (completed_at - hint_arrived_at))
+                            ELSE 0
+                        END
+                    ),
+                    0
+                )::float8 AS verification_seconds
+            FROM order_execution_steps
+            WHERE order_id = $1
+              AND status IN ('completed', 'failed', 'cancelled', 'skipped')
+            "#,
+        )
+        .bind(order_id)
+        .fetch_one(&self.pool)
+        .await;
+        telemetry::record_db_query(
+            "order.get_order_executor_wait_total",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        let row = result?;
+        Ok(OrderExecutorWaitTotal {
+            step_queue_seconds: row.get("queue_seconds"),
+            step_dispatch_seconds: row.get("dispatch_seconds"),
+            step_verification_seconds: row.get("verification_seconds"),
+        })
+    }
+
     pub async fn refresh_execution_leg_from_actions(
         &self,
         execution_leg_id: Uuid,
@@ -7741,6 +7871,7 @@ impl OrderRepository {
                 response_json = $2,
                 tx_hash = COALESCE($3, tx_hash),
                 next_attempt_at = NULL,
+                waiting_external_at = COALESCE(waiting_external_at, $4),
                 updated_at = $4
             WHERE id = $1
               AND status = 'running'
@@ -7763,6 +7894,37 @@ impl OrderRepository {
         let step = self.map_execution_step_row(&row)?;
         self.refresh_execution_leg_for_step(&step).await?;
         Ok(step)
+    }
+
+    pub async fn record_execution_step_hint_arrival(
+        &self,
+        id: Uuid,
+        hint_source: &str,
+        arrived_at: DateTime<Utc>,
+    ) -> RouterCoreResult<()> {
+        let started = Instant::now();
+        let result = sqlx_core::query::query(
+            r#"
+            UPDATE order_execution_steps
+            SET
+                hint_arrived_at = $2,
+                hint_source = $3,
+                updated_at = $2
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .bind(arrived_at)
+        .bind(hint_source)
+        .execute(&self.pool)
+        .await;
+        telemetry::record_db_query(
+            "order.record_execution_step_hint_arrival",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        result?;
+        Ok(())
     }
 
     pub async fn complete_observed_execution_step(
@@ -8402,6 +8564,40 @@ impl OrderRepository {
             usd_valuation: row.get("usd_valuation_json"),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
+        })
+    }
+
+    fn map_execution_step_latency_record_row(
+        &self,
+        row: &sqlx_postgres::PgRow,
+    ) -> RouterCoreResult<ExecutionStepLatencyRecord> {
+        let step_type = row.get::<String, _>("step_type");
+        let step_type = OrderExecutionStepType::from_db_string(&step_type).ok_or_else(|| {
+            RouterCoreError::InvalidData {
+                message: format!("unsupported order execution step type: {step_type}"),
+            }
+        })?;
+        let provider_operation_type = row
+            .get::<Option<String>, _>("provider_operation_type")
+            .map(|operation_type| {
+                ProviderOperationType::from_db_string(&operation_type).ok_or_else(|| {
+                    RouterCoreError::InvalidData {
+                        message: format!("unsupported provider operation type: {operation_type}"),
+                    }
+                })
+            })
+            .transpose()?;
+
+        Ok(ExecutionStepLatencyRecord {
+            step_id: row.get("id"),
+            step_type,
+            created_at: row.get("created_at"),
+            started_at: row.get("started_at"),
+            waiting_external_at: row.get("waiting_external_at"),
+            hint_arrived_at: row.get("hint_arrived_at"),
+            hint_source: row.get("hint_source"),
+            completed_at: row.get("completed_at"),
+            provider_operation_type,
         })
     }
 

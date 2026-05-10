@@ -134,6 +134,8 @@ pub enum StepExecutionOutcome {
 pub struct MarkOrderCompletedInput {
     pub order_id: WorkflowOrderId,
     pub attempt_id: WorkflowAttemptId,
+    #[serde(default)]
+    pub funded_to_workflow_start_seconds: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,6 +149,8 @@ pub struct RefundWorkflowInput {
     pub order_id: WorkflowOrderId,
     pub parent_attempt_id: Option<WorkflowAttemptId>,
     pub trigger: RefundTrigger,
+    #[serde(default)]
+    pub funded_to_workflow_start_seconds: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -218,6 +222,8 @@ pub struct OrderExecutionState {
     pub phase: OrderWorkflowPhase,
     pub active_attempt_id: Option<WorkflowAttemptId>,
     pub active_step_id: Option<WorkflowStepId>,
+    #[serde(default)]
+    pub funded_to_workflow_start_seconds: Option<f64>,
     pub order: RouterOrder,
     pub plan: ExecutionPlan,
 }
@@ -336,6 +342,8 @@ pub struct FinalizeOrderOrRefundInput {
     pub step_id: Option<WorkflowStepId>,
     pub terminal_status: OrderTerminalStatus,
     pub reason: Option<Value>,
+    #[serde(default)]
+    pub funded_to_workflow_start_seconds: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -248,6 +248,7 @@ impl RefundWorkflow {
                         step_id: None,
                         terminal_status: OrderTerminalStatus::Refunded,
                         reason: None,
+                        funded_to_workflow_start_seconds: input.funded_to_workflow_start_seconds,
                     },
                     db_activity_options,
                 )
@@ -429,6 +430,7 @@ async fn finalize_refund_provider_hint_manual_intervention(
                 step_id: Some(step_id),
                 terminal_status: OrderTerminalStatus::RefundManualInterventionRequired,
                 reason: Some(reason),
+                funded_to_workflow_start_seconds: None,
             },
             db_activity_options,
         )
@@ -453,6 +455,7 @@ async fn wait_for_refund_manual_intervention_resolution(
                 step_id,
                 terminal_status: OrderTerminalStatus::RefundManualInterventionRequired,
                 reason: None,
+                funded_to_workflow_start_seconds: None,
             },
             db_activity_options.clone(),
         )
