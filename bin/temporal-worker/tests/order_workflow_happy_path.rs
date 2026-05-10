@@ -1271,6 +1271,115 @@ async fn order_workflow_refreshes_hyperliquid_bridge_quote_then_completes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn order_workflow_refreshes_hyperliquid_trade_quote_then_completes() {
+    let run = run_order_workflow(WorkflowOptions {
+        route: WorkflowRoute::UnitBitcoinToBaseEth,
+        expire_quote_legs: true,
+        expire_quote_transition_kinds: vec!["hyperliquid_trade"],
+        ..WorkflowOptions::default()
+    })
+    .await;
+
+    assert_eq!(run.output.terminal_status, OrderTerminalStatus::Completed);
+    let completed = run
+        .db
+        .orders()
+        .get(run.order_id)
+        .await
+        .expect("load completed HyperliquidTrade refresh order");
+    assert_eq!(completed.status, RouterOrderStatus::Completed);
+
+    let attempts = run
+        .db
+        .orders()
+        .get_execution_attempts(run.order_id)
+        .await
+        .expect("load HyperliquidTrade refresh attempts");
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(
+        attempts[0].attempt_kind,
+        OrderExecutionAttemptKind::PrimaryExecution
+    );
+    assert_eq!(attempts[0].status, OrderExecutionAttemptStatus::Failed);
+    assert_eq!(
+        attempts[1].attempt_kind,
+        OrderExecutionAttemptKind::RefreshedExecution
+    );
+    assert_eq!(attempts[1].status, OrderExecutionAttemptStatus::Completed);
+
+    let primary_steps = run
+        .db
+        .orders()
+        .get_execution_steps_for_attempt(attempts[0].id)
+        .await
+        .expect("load primary HyperliquidTrade refresh steps");
+    assert!(
+        primary_steps
+            .iter()
+            .any(|step| step.step_type == OrderExecutionStepType::UnitDeposit
+                && step.status == OrderExecutionStepStatus::Completed),
+        "primary attempt should complete UnitDeposit before refreshing the stale HL trade leg"
+    );
+    assert!(
+        primary_steps.iter().any(
+            |step| step.step_type == OrderExecutionStepType::HyperliquidTrade
+                && step.status == OrderExecutionStepStatus::Superseded
+        ),
+        "primary HL trade step should be superseded by stale-quote refresh"
+    );
+
+    let primary_legs = run
+        .db
+        .orders()
+        .get_execution_legs_for_attempt(attempts[0].id)
+        .await
+        .expect("load primary HyperliquidTrade refresh legs");
+    let unit_deposit_leg = primary_legs
+        .iter()
+        .find(|leg| leg.leg_type == "unit_deposit")
+        .expect("primary attempt should include the completed UnitDeposit leg");
+    let actual_unit_output = unit_deposit_leg
+        .actual_amount_out
+        .as_ref()
+        .expect("completed UnitDeposit leg should record actual output for HL trade refresh");
+
+    let refreshed_steps = run
+        .db
+        .orders()
+        .get_execution_steps_for_attempt(attempts[1].id)
+        .await
+        .expect("load refreshed HyperliquidTrade steps");
+    for step_type in [
+        OrderExecutionStepType::HyperliquidTrade,
+        OrderExecutionStepType::UnitWithdrawal,
+    ] {
+        assert!(
+            refreshed_steps
+                .iter()
+                .any(|step| step.step_type == step_type
+                    && step.status == OrderExecutionStepStatus::Completed),
+            "refreshed attempt should complete {step_type:?}"
+        );
+    }
+
+    let refreshed_legs = run
+        .db
+        .orders()
+        .get_execution_legs_for_attempt(attempts[1].id)
+        .await
+        .expect("load refreshed HyperliquidTrade legs");
+    let refreshed_trade = refreshed_legs
+        .iter()
+        .find(|leg| leg.leg_type == "hyperliquid_trade")
+        .expect("refreshed attempt should include the HyperliquidTrade leg");
+    assert_eq!(
+        refreshed_trade.amount_in.as_str(),
+        actual_unit_output,
+        "refreshed HL trade should carry the completed UnitDeposit output forward"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn order_workflow_completes_arbitrum_usdc_hyperliquid_trade_path() {
     let run = run_order_workflow(WorkflowOptions {
         route: WorkflowRoute::HyperliquidArbitrumUsdcToBitcoin,

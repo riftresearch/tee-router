@@ -7040,6 +7040,9 @@ impl OrderRepository {
                             WHEN leg.leg_type = 'unit_deposit'
                              AND (rolled_up.last_response_json->>'amount') ~ '^[0-9]+$'
                                 THEN rolled_up.last_response_json->>'amount'
+                            WHEN leg.leg_type = 'unit_deposit'
+                             AND (rolled_up.last_response_json #>> '{{provider_context,amount}}') ~ '^[0-9]+$'
+                                THEN rolled_up.last_response_json #>> '{{provider_context,amount}}'
                         END,
                         rolled_up.last_response_json #>> '{{observed_state,amount_out}}',
                         rolled_up.last_response_json #>> '{{observed_state,amountOut}}',
