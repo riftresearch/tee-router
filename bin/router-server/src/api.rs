@@ -238,6 +238,29 @@ pub struct ManualInterventionOrderEnvelope {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManualInterventionActionRequest {
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManualTriggerRefundRequest {
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refund_kind_hint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManualInterventionActionEnvelope {
+    pub order_id: Uuid,
+    pub workflow_id: String,
+    pub action: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManualInterventionOrderContext {
     pub summary: ManualInterventionOrderSummary,
     pub flow: OrderFlow,

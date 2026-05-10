@@ -55,26 +55,30 @@ use temporalio_sdk::activities::{ActivityContext, ActivityError};
 use uuid::Uuid;
 
 use super::types::{
-    AcrossOnchainLogRecovered, BoundaryPersisted, CancelTimedOutHyperliquidTradeInput,
-    CheckPreExecutionStaleQuoteInput, ClassifyStaleRunningStepInput, ClassifyStepFailureInput,
-    ComposeRefreshedQuoteAttemptInput, DiscoverSingleRefundPositionInput,
-    DispatchStepProviderActionInput, ExecuteStepInput, ExecutionPlan, FailedAttemptSnapshotWritten,
-    FinalizeOrderOrRefundInput, FinalizedOrder, HyperliquidTradeCancelRecorded,
-    LoadOrderExecutionStateInput, MarkOrderCompletedInput, MaterializeExecutionAttemptInput,
-    MaterializeRefreshedAttemptInput, MaterializeRefundPlanInput, MaterializeRetryAttemptInput,
-    MaterializedExecutionAttempt, OrderCompleted, OrderExecutionState, OrderTerminalStatus,
-    OrderWorkflowPhase, PersistProviderOperationStatusInput, PersistProviderReceiptInput,
-    PersistStepFailedInput, PersistStepReadyToFireInput, PersistStepTerminalStatusInput,
-    PersistenceBoundary, PollProviderOperationHintsInput, PreExecutionStaleQuoteCheck,
+    AcknowledgeManualInterventionInput, AcrossOnchainLogRecovered, BoundaryPersisted,
+    CancelTimedOutHyperliquidTradeInput, CheckPreExecutionStaleQuoteInput,
+    ClassifyStaleRunningStepInput, ClassifyStepFailureInput, ComposeRefreshedQuoteAttemptInput,
+    DiscoverSingleRefundPositionInput, DispatchStepProviderActionInput, ExecuteStepInput,
+    ExecutionPlan, FailedAttemptSnapshotWritten, FinalizeOrderOrRefundInput, FinalizedOrder,
+    HyperliquidTradeCancelRecorded, LoadManualInterventionContextInput,
+    LoadOrderExecutionStateInput, ManualInterventionWorkflowContext, MarkOrderCompletedInput,
+    MaterializeExecutionAttemptInput, MaterializeRefreshedAttemptInput, MaterializeRefundPlanInput,
+    MaterializeRetryAttemptInput, MaterializedExecutionAttempt, OrderCompleted,
+    OrderExecutionState, OrderTerminalStatus, OrderWorkflowPhase,
+    PersistProviderOperationStatusInput, PersistProviderReceiptInput, PersistStepFailedInput,
+    PersistStepReadyToFireInput, PersistStepTerminalStatusInput, PersistenceBoundary,
+    PollProviderOperationHintsInput, PreExecutionStaleQuoteCheck,
+    PrepareManualInterventionRefundInput, PrepareManualInterventionRetryInput,
     ProviderActionDispatchShape, ProviderHintKind, ProviderKind, ProviderOperationHintDecision,
     ProviderOperationHintEvidence, ProviderOperationHintSignal, ProviderOperationHintVerified,
     ProviderOperationHintsPolled, RecoverAcrossOnchainLogInput, RecoverablePositionKind,
     RefreshedAttemptMaterialized, RefreshedQuoteAttemptOutcome, RefreshedQuoteAttemptShape,
-    RefundPlanOutcome, RefundPlanShape, RefundUntenableReason, SettleProviderStepInput,
-    SingleRefundPosition, SingleRefundPositionDiscovery, SingleRefundPositionOutcome,
-    StaleQuoteRefreshUntenableReason, StaleRunningStepClassified, StaleRunningStepDecision,
-    StepExecuted, StepExecutionOutcome, StepFailureDecision, VerifyProviderOperationHintInput,
-    WorkflowExecutionStep, WriteFailedAttemptSnapshotInput,
+    RefundPlanOutcome, RefundPlanShape, RefundUntenableReason,
+    ReleaseRefundManualInterventionInput, SettleProviderStepInput, SingleRefundPosition,
+    SingleRefundPositionDiscovery, SingleRefundPositionOutcome, StaleQuoteRefreshUntenableReason,
+    StaleRunningStepClassified, StaleRunningStepDecision, StepExecuted, StepExecutionOutcome,
+    StepFailureDecision, VerifyProviderOperationHintInput, WorkflowExecutionStep,
+    WriteFailedAttemptSnapshotInput,
 };
 
 const MAX_EXECUTION_ATTEMPTS: i32 = 2;
@@ -334,6 +338,54 @@ impl OrderActivities {
                 legs: route.legs,
                 steps: route.steps,
             },
+        })
+    }
+
+    #[activity]
+    pub async fn load_manual_intervention_context(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: LoadManualInterventionContextInput,
+    ) -> Result<ManualInterventionWorkflowContext, ActivityError> {
+        let deps = self.deps()?;
+        let expected_attempt_kind = if input.refund_manual {
+            OrderExecutionAttemptKind::RefundRecovery
+        } else {
+            OrderExecutionAttemptKind::PrimaryExecution
+        };
+        let attempt = deps
+            .db
+            .orders()
+            .get_execution_attempts(input.order_id)
+            .await
+            .map_err(activity_error_from_display)?
+            .into_iter()
+            .filter(|attempt| attempt.attempt_kind == expected_attempt_kind)
+            .max_by_key(|attempt| (attempt.attempt_index, attempt.updated_at));
+        let Some(attempt) = attempt else {
+            return Ok(ManualInterventionWorkflowContext {
+                attempt_id: None,
+                step_id: None,
+            });
+        };
+        let step = deps
+            .db
+            .orders()
+            .get_execution_steps_for_attempt(attempt.id)
+            .await
+            .map_err(activity_error_from_display)?
+            .into_iter()
+            .filter(|step| step.status != OrderExecutionStepStatus::Superseded)
+            .max_by_key(|step| {
+                (
+                    manual_context_step_rank(step.status),
+                    step.updated_at,
+                    step.step_index,
+                )
+            });
+        Ok(ManualInterventionWorkflowContext {
+            attempt_id: Some(attempt.id),
+            step_id: step.map(|step| step.id),
         })
     }
 
@@ -1061,6 +1113,180 @@ impl OrderActivities {
                 "finalize_order_or_refund does not handle {terminal_status:?} in PR6a"
             ))),
         }
+    }
+
+    /// Operator-driven release from the root ManualInterventionRequired wait-state.
+    #[activity]
+    pub async fn prepare_manual_intervention_retry(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: PrepareManualInterventionRetryInput,
+    ) -> Result<FinalizedOrder, ActivityError> {
+        let deps = self.deps()?;
+        let resolution = json!({
+            "kind": "manual_intervention_resolution",
+            "action": "release",
+            "reason": input.signal.reason,
+            "operator_id": input.signal.operator_id,
+            "requested_at": input.signal.requested_at,
+        });
+        let order = deps
+            .db
+            .orders()
+            .prepare_manual_intervention_retry(
+                input.order_id,
+                input.attempt_id,
+                input.step_id,
+                resolution,
+                Utc::now(),
+            )
+            .await
+            .map_err(activity_error_from_display)?;
+        tracing::info!(
+            order_id = %order.id,
+            attempt_id = %input.attempt_id,
+            step_id = %input.step_id,
+            event_name = "order.manual_intervention_released",
+            "order.manual_intervention_released"
+        );
+        Ok(FinalizedOrder {
+            order_id: order.id,
+            terminal_status: OrderTerminalStatus::ManualInterventionRequired,
+        })
+    }
+
+    /// Operator-driven refund trigger from the root ManualInterventionRequired wait-state.
+    #[activity]
+    pub async fn prepare_manual_intervention_refund(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: PrepareManualInterventionRefundInput,
+    ) -> Result<FinalizedOrder, ActivityError> {
+        let deps = self.deps()?;
+        let resolution = json!({
+            "kind": "manual_intervention_resolution",
+            "action": "trigger_refund",
+            "reason": input.signal.reason,
+            "operator_id": input.signal.operator_id,
+            "requested_at": input.signal.requested_at,
+            "refund_kind_hint": input.signal.refund_kind_hint,
+        });
+        let order = deps
+            .db
+            .orders()
+            .prepare_manual_intervention_refund(
+                input.order_id,
+                input.attempt_id,
+                input.step_id,
+                resolution,
+                Utc::now(),
+            )
+            .await
+            .map_err(activity_error_from_display)?;
+        tracing::info!(
+            order_id = %order.id,
+            attempt_id = %input.attempt_id,
+            step_id = %input.step_id,
+            event_name = "order.manual_intervention_refund_triggered",
+            "order.manual_intervention_refund_triggered"
+        );
+        Ok(FinalizedOrder {
+            order_id: order.id,
+            terminal_status: OrderTerminalStatus::RefundRequired,
+        })
+    }
+
+    /// Operator-driven release from RefundManualInterventionRequired.
+    #[activity]
+    pub async fn release_refund_manual_intervention(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: ReleaseRefundManualInterventionInput,
+    ) -> Result<FinalizedOrder, ActivityError> {
+        let deps = self.deps()?;
+        let resolution = json!({
+            "kind": "manual_intervention_resolution",
+            "action": match input.signal_kind {
+                super::types::ManualResolutionSignalKind::Release => "release",
+                super::types::ManualResolutionSignalKind::TriggerRefund => "trigger_refund",
+            },
+            "reason": input.reason,
+            "operator_id": input.operator_id,
+            "requested_at": input.requested_at,
+        });
+        let order = deps
+            .db
+            .orders()
+            .release_refund_manual_intervention(
+                input.order_id,
+                input.refund_attempt_id,
+                input.step_id,
+                resolution,
+                Utc::now(),
+            )
+            .await
+            .map_err(activity_error_from_display)?;
+        tracing::info!(
+            order_id = %order.id,
+            refund_attempt_id = ?input.refund_attempt_id,
+            step_id = ?input.step_id,
+            event_name = "order.refund_manual_intervention_released",
+            "order.refund_manual_intervention_released"
+        );
+        Ok(FinalizedOrder {
+            order_id: order.id,
+            terminal_status: OrderTerminalStatus::RefundManualInterventionRequired,
+        })
+    }
+
+    /// Acknowledges manual intervention as a true terminal state.
+    #[activity]
+    pub async fn acknowledge_manual_intervention_terminal(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: AcknowledgeManualInterventionInput,
+    ) -> Result<FinalizedOrder, ActivityError> {
+        let deps = self.deps()?;
+        let terminal_status = if input.refund_manual {
+            OrderTerminalStatus::RefundManualInterventionRequired
+        } else {
+            OrderTerminalStatus::ManualInterventionRequired
+        };
+        let resolution = json!({
+            "kind": "manual_intervention_terminal_ack",
+            "action": if input.zombie_cleanup {
+                "zombie_cleanup"
+            } else {
+                "acknowledge_unrecoverable"
+            },
+            "reason": input.signal.reason,
+            "operator_id": input.signal.operator_id,
+            "requested_at": input.signal.requested_at,
+        });
+        let order = deps
+            .db
+            .orders()
+            .acknowledge_manual_intervention_terminal(
+                input.order_id,
+                input.attempt_id,
+                input.step_id,
+                input.refund_manual,
+                resolution,
+                Utc::now(),
+            )
+            .await
+            .map_err(activity_error_from_display)?;
+        tracing::info!(
+            order_id = %order.id,
+            terminal_status = ?terminal_status,
+            zombie_cleanup = input.zombie_cleanup,
+            event_name = "order.manual_intervention_terminal_acknowledged",
+            "order.manual_intervention_terminal_acknowledged"
+        );
+        Ok(FinalizedOrder {
+            order_id: order.id,
+            terminal_status,
+        })
     }
 }
 
@@ -1878,6 +2104,17 @@ fn provider_operation_has_checkpoint(operation: &OrderProviderOperation) -> bool
     operation.provider_ref.is_some()
         || json_object_non_empty(&operation.response)
         || json_object_non_empty(&operation.observed_state)
+}
+
+fn manual_context_step_rank(status: OrderExecutionStepStatus) -> u8 {
+    match status {
+        OrderExecutionStepStatus::Failed => 5,
+        OrderExecutionStepStatus::Running | OrderExecutionStepStatus::Waiting => 4,
+        OrderExecutionStepStatus::Ready | OrderExecutionStepStatus::Planned => 3,
+        OrderExecutionStepStatus::Completed => 2,
+        OrderExecutionStepStatus::Cancelled | OrderExecutionStepStatus::Skipped => 1,
+        OrderExecutionStepStatus::Superseded => 0,
+    }
 }
 
 fn json_object_non_empty(value: &Value) -> bool {

@@ -14,6 +14,17 @@ use router_core::{
 use router_temporal::{order_workflow_id, refund_workflow_id};
 use uuid::Uuid;
 
+#[derive(Debug, Clone)]
+pub enum ManualInterventionSignalTarget {
+    OrderWorkflow {
+        workflow_id: String,
+    },
+    RefundWorkflow {
+        workflow_id: String,
+        parent_attempt_id: Uuid,
+    },
+}
+
 pub async fn get_order_flow(db: &Database, id: Uuid) -> RouterServerResult<OrderFlowEnvelope> {
     let order = db.orders().get(id).await.map_err(RouterServerError::from)?;
     let quote = match db.orders().get_router_order_quote(id).await {
@@ -109,23 +120,61 @@ pub async fn get_manual_intervention_order(
     })
 }
 
+pub async fn get_manual_intervention_signal_target(
+    db: &Database,
+    id: Uuid,
+) -> RouterServerResult<ManualInterventionSignalTarget> {
+    let flow = get_order_flow(db, id).await?.flow;
+    match flow.order.status {
+        RouterOrderStatus::ManualInterventionRequired => {
+            Ok(ManualInterventionSignalTarget::OrderWorkflow {
+                workflow_id: order_workflow_id(flow.order.id),
+            })
+        }
+        RouterOrderStatus::RefundManualInterventionRequired => {
+            let attempt = latest_attempt(&flow).ok_or_else(|| RouterServerError::InvalidData {
+                message: format!("manual-intervention order {id} has no execution attempts"),
+            })?;
+            if attempt.attempt_kind != OrderExecutionAttemptKind::RefundRecovery {
+                return Err(RouterServerError::InvalidData {
+                    message: format!(
+                        "refund manual-intervention order {id} latest attempt {} is {}",
+                        attempt.id,
+                        attempt.attempt_kind.to_db_string()
+                    ),
+                });
+            }
+            let parent_attempt_id = refund_parent_attempt_id(attempt).ok_or_else(|| {
+                RouterServerError::InvalidData {
+                    message: format!(
+                        "RefundRecovery attempt {} is missing failure_reason.failed_attempt_id",
+                        attempt.id
+                    ),
+                }
+            })?;
+            Ok(ManualInterventionSignalTarget::RefundWorkflow {
+                workflow_id: refund_workflow_id(flow.order.id, parent_attempt_id),
+                parent_attempt_id,
+            })
+        }
+        status => Err(RouterServerError::Validation {
+            message: format!(
+                "order {id} is {} instead of a manual-intervention state",
+                status.to_db_string()
+            ),
+        }),
+    }
+}
+
 fn manual_intervention_workflow_ids(flow: &OrderFlow) -> (String, Option<String>) {
     let root_workflow_id = order_workflow_id(flow.order.id);
-    let Some(attempt) = flow
-        .attempts
-        .iter()
-        .max_by_key(|attempt| (attempt.attempt_index, attempt.updated_at))
-    else {
+    let Some(attempt) = latest_attempt(flow) else {
         return (root_workflow_id, None);
     };
     if attempt.attempt_kind != OrderExecutionAttemptKind::RefundRecovery {
         return (root_workflow_id, None);
     }
-    let parent_attempt_id = attempt
-        .failure_reason
-        .get("failed_attempt_id")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|value| value.parse::<Uuid>().ok());
+    let parent_attempt_id = refund_parent_attempt_id(attempt);
     let Some(parent_attempt_id) = parent_attempt_id else {
         return (root_workflow_id, None);
     };
@@ -134,4 +183,18 @@ fn manual_intervention_workflow_ids(flow: &OrderFlow) -> (String, Option<String>
         refund_workflow_id(flow.order.id, parent_attempt_id),
         Some(root_workflow_id),
     )
+}
+
+fn latest_attempt(flow: &OrderFlow) -> Option<&router_core::models::OrderExecutionAttempt> {
+    flow.attempts
+        .iter()
+        .max_by_key(|attempt| (attempt.attempt_index, attempt.updated_at))
+}
+
+fn refund_parent_attempt_id(attempt: &router_core::models::OrderExecutionAttempt) -> Option<Uuid> {
+    attempt
+        .failure_reason
+        .get("failed_attempt_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.parse::<Uuid>().ok())
 }

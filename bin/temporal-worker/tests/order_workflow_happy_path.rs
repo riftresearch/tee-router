@@ -25,6 +25,7 @@ use eip3009_erc20_contract::GenericEIP3009ERC20::GenericEIP3009ERC20Instance;
 use router_core::{
     config::Settings,
     db::Database,
+    db::ExecutionAttemptPlan,
     models::{
         CustodyVaultRole, CustodyVaultVisibility, DepositVaultStatus, OrderExecutionAttempt,
         OrderExecutionAttemptKind, OrderExecutionAttemptStatus, OrderExecutionStepStatus,
@@ -53,6 +54,7 @@ use temporal_worker::{
         activities::{OrderActivities, OrderActivityDeps},
         build_worker, order_workflow_id, refund_workflow_id,
         types::{
+            AcknowledgeUnrecoverableSignal, ManualReleaseSignal, ManualTriggerRefundSignal,
             OrderTerminalStatus, OrderWorkflowInput, OrderWorkflowOutput, ProviderHintKind,
             ProviderKind, ProviderOperationHintSignal,
         },
@@ -113,6 +115,13 @@ enum WorkflowRoute {
     UnitBitcoinToBaseEth,
 }
 
+#[derive(Clone, Copy)]
+enum ManualInterventionTestAction {
+    Release,
+    TriggerRefund,
+    AcknowledgeUnrecoverable,
+}
+
 #[derive(Default)]
 struct WorkflowOptions {
     route: WorkflowRoute,
@@ -128,6 +137,7 @@ struct WorkflowOptions {
     expect_external_custody_across_then_velora_refund: bool,
     suppress_across_hint_signal: bool,
     simulate_across_lost_intent_checkpoint: bool,
+    manual_intervention_action: Option<ManualInterventionTestAction>,
 }
 
 struct SeededOrder {
@@ -150,6 +160,94 @@ async fn order_workflow_completes_funded_single_step_order() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn order_workflow_manual_intervention_release_resumes_and_completes() {
+    let run = run_order_workflow(WorkflowOptions {
+        manual_intervention_action: Some(ManualInterventionTestAction::Release),
+        ..WorkflowOptions::default()
+    })
+    .await;
+
+    assert_eq!(run.output.terminal_status, OrderTerminalStatus::Completed);
+    let completed = run
+        .db
+        .orders()
+        .get(run.order_id)
+        .await
+        .expect("load completed order after manual release");
+    assert_eq!(completed.status, RouterOrderStatus::Completed);
+    let attempts = run
+        .db
+        .orders()
+        .get_execution_attempts(run.order_id)
+        .await
+        .expect("load attempts after manual release");
+    assert!(
+        attempts.iter().any(|attempt| attempt.attempt_index == 2),
+        "manual release should resume through a retry attempt"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn order_workflow_manual_intervention_trigger_refund_reaches_refunded() {
+    let run = run_order_workflow(WorkflowOptions {
+        manual_intervention_action: Some(ManualInterventionTestAction::TriggerRefund),
+        ..WorkflowOptions::default()
+    })
+    .await;
+
+    assert_eq!(run.output.terminal_status, OrderTerminalStatus::Refunded);
+    let refunded = run
+        .db
+        .orders()
+        .get(run.order_id)
+        .await
+        .expect("load refunded order after manual trigger");
+    assert_eq!(refunded.status, RouterOrderStatus::Refunded);
+    assert!(
+        run.refund_address_balance >= U256::from_str(ORDER_AMOUNT_IN_WEI).expect("amount in wei"),
+        "manual trigger refund should return the funding vault balance"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn order_workflow_manual_intervention_acknowledge_unrecoverable_stays_terminal() {
+    let run = run_order_workflow(WorkflowOptions {
+        manual_intervention_action: Some(ManualInterventionTestAction::AcknowledgeUnrecoverable),
+        ..WorkflowOptions::default()
+    })
+    .await;
+
+    assert_eq!(
+        run.output.terminal_status,
+        OrderTerminalStatus::ManualInterventionRequired
+    );
+    let acknowledged = run
+        .db
+        .orders()
+        .get(run.order_id)
+        .await
+        .expect("load acknowledged manual intervention order");
+    assert_eq!(
+        acknowledged.status,
+        RouterOrderStatus::ManualInterventionRequired
+    );
+    let attempt = run
+        .db
+        .orders()
+        .get_latest_execution_attempt(run.order_id)
+        .await
+        .expect("load latest attempt")
+        .expect("manual intervention attempt");
+    assert!(
+        attempt
+            .failure_reason
+            .get("manual_intervention_terminal_ack")
+            .is_some(),
+        "acknowledge signal should persist terminal acknowledgement"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn order_workflow_completes_across_step_via_hint() {
     let run = run_order_workflow(WorkflowOptions {
         route: WorkflowRoute::AcrossBaseEthToEthereumUsdc,
@@ -166,10 +264,14 @@ async fn order_workflow_completes_across_step_via_hint() {
         .expect("load completed order");
     assert_eq!(completed.status, RouterOrderStatus::Completed);
 
-    let across_operation =
-        provider_operation_by_type(&run.db, run.order_id, ProviderOperationType::AcrossBridge)
-            .await;
-    assert_eq!(across_operation.status, ProviderOperationStatus::Completed);
+    let across_operation = wait_for_provider_operation_status(
+        &run.db,
+        run.order_id,
+        ProviderOperationType::AcrossBridge,
+        ProviderOperationStatus::Completed,
+        Duration::from_secs(5),
+    )
+    .await;
     let step = run
         .db
         .orders()
@@ -1437,6 +1539,9 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
         custody_executor,
         chain_registry.clone(),
     );
+    if options.manual_intervention_action.is_some() {
+        seed_manual_intervention_state(&db, &activity_deps, order_id).await;
+    }
     let database_url_for_workflow = database_url.clone();
 
     let local = tokio::task::LocalSet::new();
@@ -1469,6 +1574,54 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
                 )
                 .await
                 .expect("start OrderWorkflow");
+            if let Some(action) = options.manual_intervention_action {
+                let signal_result = match action {
+                    ManualInterventionTestAction::Release => {
+                        handle
+                            .signal(
+                                OrderWorkflow::manual_intervention_release,
+                                ManualReleaseSignal {
+                                    reason: "operator fixed manual release test".to_string(),
+                                    operator_id: Some("temporal-test".to_string()),
+                                    requested_at: Utc::now(),
+                                },
+                                WorkflowSignalOptions::default(),
+                            )
+                            .await
+                    }
+                    ManualInterventionTestAction::TriggerRefund => {
+                        handle
+                            .signal(
+                                OrderWorkflow::manual_refund_trigger,
+                                ManualTriggerRefundSignal {
+                                    reason: "operator requested refund in manual test".to_string(),
+                                    operator_id: Some("temporal-test".to_string()),
+                                    requested_at: Utc::now(),
+                                    refund_kind_hint: None,
+                                },
+                                WorkflowSignalOptions::default(),
+                            )
+                            .await
+                    }
+                    ManualInterventionTestAction::AcknowledgeUnrecoverable => {
+                        handle
+                            .signal(
+                                OrderWorkflow::acknowledge_unrecoverable,
+                                AcknowledgeUnrecoverableSignal {
+                                    reason: "operator acknowledged unrecoverable test".to_string(),
+                                    operator_id: Some("temporal-test".to_string()),
+                                    requested_at: Utc::now(),
+                                },
+                                WorkflowSignalOptions::default(),
+                            )
+                            .await
+                    }
+                };
+                assert_signal_sent_or_workflow_completed(
+                    signal_result,
+                    "send manual intervention signal",
+                );
+            }
             if matches!(options.route, WorkflowRoute::AcrossBaseEthToEthereumUsdc) {
                 let handle_before_hint = client.get_workflow_handle::<OrderWorkflow>(&workflow_id);
                 let across_operation = tokio::select! {
@@ -1661,6 +1814,81 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
         refund_address_balance,
         refund_address_base_usdc_balance,
     }
+}
+
+async fn seed_manual_intervention_state(
+    db: &Database,
+    activity_deps: &OrderActivityDeps,
+    order_id: Uuid,
+) {
+    let order = db.orders().get(order_id).await.expect("load order");
+    let funding_vault_id = order.funding_vault_id.expect("order funding vault");
+    let source_vault = db
+        .vaults()
+        .get(funding_vault_id)
+        .await
+        .expect("load funding vault");
+    let quote = db
+        .orders()
+        .get_router_order_quote(order_id)
+        .await
+        .expect("load order quote");
+    let route = match quote {
+        RouterOrderQuote::MarketOrder(quote) => activity_deps
+            .planner
+            .plan(&order, &source_vault, &quote, Utc::now())
+            .expect("plan manual intervention seed"),
+        RouterOrderQuote::LimitOrder(_) => panic!("manual intervention seed expects market order"),
+    };
+    let materialized = db
+        .orders()
+        .materialize_primary_execution_attempt(
+            order_id,
+            ExecutionAttemptPlan {
+                legs: route.legs,
+                steps: route.steps,
+            },
+            Utc::now(),
+        )
+        .await
+        .expect("materialize manual intervention seed attempt");
+    let step = materialized
+        .steps
+        .first()
+        .expect("materialized manual intervention step")
+        .clone();
+    let now = Utc::now();
+    db.orders()
+        .persist_execution_step_ready_to_fire(order_id, materialized.attempt.id, step.id, now)
+        .await
+        .expect("mark manual intervention seed step running");
+    db.orders()
+        .fail_execution_step(
+            step.id,
+            json!({
+                "error": "seeded manual intervention test failure",
+                "reason": "seeded_manual_intervention",
+            }),
+            now,
+        )
+        .await
+        .expect("fail manual intervention seed step");
+    db.orders()
+        .mark_execution_attempt_manual_intervention_required(
+            materialized.attempt.id,
+            json!({
+                "reason": "seeded_manual_intervention",
+                "step_id": step.id,
+            }),
+            json!({}),
+            now,
+        )
+        .await
+        .expect("mark manual intervention seed attempt");
+    db.orders()
+        .mark_order_manual_intervention_required(order_id, now)
+        .await
+        .expect("mark manual intervention seed order");
 }
 
 fn ensure_temporal_up() {

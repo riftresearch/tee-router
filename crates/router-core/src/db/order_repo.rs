@@ -4072,6 +4072,454 @@ impl OrderRepository {
         result
     }
 
+    pub async fn prepare_manual_intervention_retry(
+        &self,
+        order_id: Uuid,
+        attempt_id: Uuid,
+        step_id: Uuid,
+        resolution: serde_json::Value,
+        now: DateTime<Utc>,
+    ) -> RouterCoreResult<RouterOrder> {
+        let started = Instant::now();
+        let result = async {
+            let mut tx = self.pool.begin().await?;
+            let order = self.lock_order_tx(&mut tx, order_id).await?;
+            if !matches!(
+                order.status,
+                RouterOrderStatus::ManualInterventionRequired | RouterOrderStatus::Executing
+            ) {
+                return Err(RouterCoreError::Conflict {
+                    message: format!(
+                        "order {} cannot release manual intervention from {}",
+                        order.id,
+                        order.status.to_db_string()
+                    ),
+                });
+            }
+            lock_attempt_step_for_manual_resolution(
+                self,
+                &mut tx,
+                order_id,
+                attempt_id,
+                Some(step_id),
+                OrderExecutionAttemptKind::PrimaryExecution,
+            )
+            .await?;
+
+            if let Some(funding_vault_id) = order.funding_vault_id {
+                sqlx_core::query::query(
+                    r#"
+                    UPDATE deposit_vaults
+                    SET status = $2, updated_at = $3
+                    WHERE id = $1
+                      AND status IN ('manual_intervention_required', 'executing')
+                    "#,
+                )
+                .bind(funding_vault_id)
+                .bind(DepositVaultStatus::Executing.to_db_string())
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            sqlx_core::query::query(
+                r#"
+                UPDATE order_execution_steps
+                SET
+                    details_json = jsonb_set(
+                        details_json,
+                        '{manual_intervention_resolution}',
+                        $2::jsonb,
+                        true
+                    ),
+                    updated_at = $3
+                WHERE id = $1
+                "#,
+            )
+            .bind(step_id)
+            .bind(resolution.clone())
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            sqlx_core::query::query(
+                r#"
+                UPDATE order_execution_attempts
+                SET
+                    status = 'failed',
+                    failure_reason_json = jsonb_set(
+                        failure_reason_json,
+                        '{manual_intervention_resolution}',
+                        $2::jsonb,
+                        true
+                    ),
+                    updated_at = $3
+                WHERE id = $1
+                  AND status IN ('manual_intervention_required', 'failed')
+                "#,
+            )
+            .bind(attempt_id)
+            .bind(resolution)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+
+            let order = self
+                .transition_order_status_tx(
+                    &mut tx,
+                    order_id,
+                    RouterOrderStatus::ManualInterventionRequired,
+                    RouterOrderStatus::Executing,
+                    now,
+                )
+                .await?;
+            tx.commit().await?;
+            Ok::<RouterOrder, RouterCoreError>(order)
+        }
+        .await;
+        telemetry::record_db_query(
+            "order.prepare_manual_intervention_retry",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        result
+    }
+
+    pub async fn prepare_manual_intervention_refund(
+        &self,
+        order_id: Uuid,
+        attempt_id: Uuid,
+        step_id: Uuid,
+        resolution: serde_json::Value,
+        now: DateTime<Utc>,
+    ) -> RouterCoreResult<RouterOrder> {
+        let started = Instant::now();
+        let result = async {
+            let mut tx = self.pool.begin().await?;
+            let order = self.lock_order_tx(&mut tx, order_id).await?;
+            if !matches!(
+                order.status,
+                RouterOrderStatus::ManualInterventionRequired
+                    | RouterOrderStatus::RefundRequired
+                    | RouterOrderStatus::Executing
+            ) {
+                return Err(RouterCoreError::Conflict {
+                    message: format!(
+                        "order {} cannot trigger refund from {}",
+                        order.id,
+                        order.status.to_db_string()
+                    ),
+                });
+            }
+            lock_attempt_step_for_manual_resolution(
+                self,
+                &mut tx,
+                order_id,
+                attempt_id,
+                Some(step_id),
+                OrderExecutionAttemptKind::PrimaryExecution,
+            )
+            .await?;
+
+            if let Some(funding_vault_id) = order.funding_vault_id {
+                sqlx_core::query::query(
+                    r#"
+                    UPDATE deposit_vaults
+                    SET status = $2, updated_at = $3
+                    WHERE id = $1
+                      AND status IN (
+                          'funded',
+                          'executing',
+                          'refund_required',
+                          'manual_intervention_required'
+                      )
+                    "#,
+                )
+                .bind(funding_vault_id)
+                .bind(DepositVaultStatus::RefundRequired.to_db_string())
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            sqlx_core::query::query(
+                r#"
+                UPDATE order_execution_steps
+                SET
+                    details_json = jsonb_set(
+                        details_json,
+                        '{manual_intervention_resolution}',
+                        $2::jsonb,
+                        true
+                    ),
+                    updated_at = $3
+                WHERE id = $1
+                "#,
+            )
+            .bind(step_id)
+            .bind(resolution.clone())
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            sqlx_core::query::query(
+                r#"
+                UPDATE order_execution_attempts
+                SET
+                    status = 'failed',
+                    failure_reason_json = jsonb_set(
+                        failure_reason_json,
+                        '{manual_intervention_resolution}',
+                        $2::jsonb,
+                        true
+                    ),
+                    updated_at = $3
+                WHERE id = $1
+                  AND status IN ('manual_intervention_required', 'failed')
+                "#,
+            )
+            .bind(attempt_id)
+            .bind(resolution)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+
+            let order = self
+                .transition_order_status_tx(
+                    &mut tx,
+                    order_id,
+                    RouterOrderStatus::ManualInterventionRequired,
+                    RouterOrderStatus::RefundRequired,
+                    now,
+                )
+                .await?;
+            tx.commit().await?;
+            Ok::<RouterOrder, RouterCoreError>(order)
+        }
+        .await;
+        telemetry::record_db_query(
+            "order.prepare_manual_intervention_refund",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        result
+    }
+
+    pub async fn release_refund_manual_intervention(
+        &self,
+        order_id: Uuid,
+        refund_attempt_id: Option<Uuid>,
+        step_id: Option<Uuid>,
+        resolution: serde_json::Value,
+        now: DateTime<Utc>,
+    ) -> RouterCoreResult<RouterOrder> {
+        let started = Instant::now();
+        let result = async {
+            let mut tx = self.pool.begin().await?;
+            let order = self.lock_order_tx(&mut tx, order_id).await?;
+            if !matches!(
+                order.status,
+                RouterOrderStatus::RefundManualInterventionRequired | RouterOrderStatus::Refunding
+            ) {
+                return Err(RouterCoreError::Conflict {
+                    message: format!(
+                        "order {} cannot release refund manual intervention from {}",
+                        order.id,
+                        order.status.to_db_string()
+                    ),
+                });
+            }
+
+            if let Some(attempt_id) = refund_attempt_id {
+                lock_attempt_step_for_manual_resolution(
+                    self,
+                    &mut tx,
+                    order_id,
+                    attempt_id,
+                    step_id,
+                    OrderExecutionAttemptKind::RefundRecovery,
+                )
+                .await?;
+                sqlx_core::query::query(
+                    r#"
+                    UPDATE order_execution_attempts
+                    SET
+                        status = 'active',
+                        failure_reason_json = jsonb_set(
+                            failure_reason_json,
+                            '{manual_intervention_resolution}',
+                            $2::jsonb,
+                            true
+                        ),
+                        updated_at = $3
+                    WHERE id = $1
+                      AND status IN ('manual_intervention_required', 'failed', 'active')
+                    "#,
+                )
+                .bind(attempt_id)
+                .bind(resolution.clone())
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            if let Some(step_id) = step_id {
+                sqlx_core::query::query(
+                    r#"
+                    UPDATE order_execution_steps
+                    SET
+                        status = 'planned',
+                        tx_hash = NULL,
+                        provider_ref = NULL,
+                        started_at = NULL,
+                        completed_at = NULL,
+                        response_json = '{}'::jsonb,
+                        error_json = '{}'::jsonb,
+                        details_json = jsonb_set(
+                            details_json,
+                            '{manual_intervention_resolution}',
+                            $2::jsonb,
+                            true
+                        ),
+                        updated_at = $3
+                    WHERE id = $1
+                      AND status IN ('failed', 'planned', 'ready')
+                    "#,
+                )
+                .bind(step_id)
+                .bind(resolution.clone())
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            if let Some(funding_vault_id) = order.funding_vault_id {
+                sqlx_core::query::query(
+                    r#"
+                    UPDATE deposit_vaults
+                    SET status = $2, updated_at = $3
+                    WHERE id = $1
+                      AND status IN (
+                          'refund_manual_intervention_required',
+                          'refund_required',
+                          'refunding'
+                      )
+                    "#,
+                )
+                .bind(funding_vault_id)
+                .bind(DepositVaultStatus::Refunding.to_db_string())
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            let order = self
+                .transition_order_status_tx(
+                    &mut tx,
+                    order_id,
+                    RouterOrderStatus::RefundManualInterventionRequired,
+                    RouterOrderStatus::Refunding,
+                    now,
+                )
+                .await?;
+            tx.commit().await?;
+            Ok::<RouterOrder, RouterCoreError>(order)
+        }
+        .await;
+        telemetry::record_db_query(
+            "order.release_refund_manual_intervention",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        result
+    }
+
+    pub async fn acknowledge_manual_intervention_terminal(
+        &self,
+        order_id: Uuid,
+        attempt_id: Option<Uuid>,
+        step_id: Option<Uuid>,
+        refund_manual: bool,
+        resolution: serde_json::Value,
+        now: DateTime<Utc>,
+    ) -> RouterCoreResult<RouterOrder> {
+        let started = Instant::now();
+        let result = async {
+            let mut tx = self.pool.begin().await?;
+            let order = self.lock_order_tx(&mut tx, order_id).await?;
+            let expected_status = if refund_manual {
+                RouterOrderStatus::RefundManualInterventionRequired
+            } else {
+                RouterOrderStatus::ManualInterventionRequired
+            };
+            if order.status != expected_status {
+                return Err(RouterCoreError::Conflict {
+                    message: format!(
+                        "order {} cannot acknowledge {} from {}",
+                        order.id,
+                        expected_status.to_db_string(),
+                        order.status.to_db_string()
+                    ),
+                });
+            }
+
+            if let Some(attempt_id) = attempt_id {
+                sqlx_core::query::query(
+                    r#"
+                    UPDATE order_execution_attempts
+                    SET
+                        failure_reason_json = jsonb_set(
+                            failure_reason_json,
+                            '{manual_intervention_terminal_ack}',
+                            $2::jsonb,
+                            true
+                        ),
+                        updated_at = $3
+                    WHERE id = $1
+                      AND order_id = $4
+                    "#,
+                )
+                .bind(attempt_id)
+                .bind(resolution.clone())
+                .bind(now)
+                .bind(order_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            if let Some(step_id) = step_id {
+                sqlx_core::query::query(
+                    r#"
+                    UPDATE order_execution_steps
+                    SET
+                        details_json = jsonb_set(
+                            details_json,
+                            '{manual_intervention_terminal_ack}',
+                            $2::jsonb,
+                            true
+                        ),
+                        updated_at = $3
+                    WHERE id = $1
+                      AND order_id = $4
+                    "#,
+                )
+                .bind(step_id)
+                .bind(resolution)
+                .bind(now)
+                .bind(order_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            tx.commit().await?;
+            Ok::<RouterOrder, RouterCoreError>(order)
+        }
+        .await;
+        telemetry::record_db_query(
+            "order.acknowledge_manual_intervention_terminal",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        result
+    }
+
     pub async fn create_refreshed_execution_attempt(
         &self,
         active_attempt_id: Uuid,
@@ -7471,6 +7919,67 @@ impl OrderRepository {
         Ok(step)
     }
 
+    async fn lock_order_tx(
+        &self,
+        tx: &mut sqlx_core::transaction::Transaction<'_, Postgres>,
+        order_id: Uuid,
+    ) -> RouterCoreResult<RouterOrder> {
+        let row = sqlx_core::query::query(&format!(
+            r#"
+            SELECT {ORDER_SELECT_COLUMNS}
+            FROM router_orders ro
+            LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
+            LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
+            WHERE ro.id = $1
+            FOR UPDATE OF ro
+            "#
+        ))
+        .bind(order_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        self.map_order_row(&row)
+    }
+
+    async fn transition_order_status_tx(
+        &self,
+        tx: &mut sqlx_core::transaction::Transaction<'_, Postgres>,
+        order_id: Uuid,
+        from_status: RouterOrderStatus,
+        to_status: RouterOrderStatus,
+        updated_at: DateTime<Utc>,
+    ) -> RouterCoreResult<RouterOrder> {
+        let row = sqlx_core::query::query(&format!(
+            r#"
+            WITH updated AS (
+                UPDATE router_orders
+                SET status = $2, updated_at = $3
+                WHERE id = $1
+                  AND status = $4
+                RETURNING *
+            )
+            SELECT {ORDER_SELECT_COLUMNS}
+            FROM updated ro
+            LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
+            LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
+            UNION ALL
+            SELECT {ORDER_SELECT_COLUMNS}
+            FROM router_orders ro
+            LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
+            LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
+            WHERE ro.id = $1
+              AND ro.status = $2
+            LIMIT 1
+            "#
+        ))
+        .bind(order_id)
+        .bind(to_status.to_db_string())
+        .bind(updated_at)
+        .bind(from_status.to_db_string())
+        .fetch_one(&mut **tx)
+        .await?;
+        self.map_order_row(&row)
+    }
+
     fn map_order_row(&self, row: &sqlx_postgres::PgRow) -> RouterCoreResult<RouterOrder> {
         let order_type = row.get::<String, _>("order_type");
         let order_type = RouterOrderType::from_db_string(&order_type).ok_or_else(|| {
@@ -7972,6 +8481,71 @@ impl OrderRepository {
             updated_at: row.get("updated_at"),
         })
     }
+}
+
+async fn lock_attempt_step_for_manual_resolution(
+    repo: &OrderRepository,
+    tx: &mut sqlx_core::transaction::Transaction<'_, Postgres>,
+    order_id: Uuid,
+    attempt_id: Uuid,
+    step_id: Option<Uuid>,
+    expected_kind: OrderExecutionAttemptKind,
+) -> RouterCoreResult<()> {
+    let attempt_row = sqlx_core::query::query(&format!(
+        r#"
+        SELECT {EXECUTION_ATTEMPT_SELECT_COLUMNS}
+        FROM order_execution_attempts
+        WHERE id = $1
+        FOR UPDATE
+        "#
+    ))
+    .bind(attempt_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let attempt = repo.map_execution_attempt_row(&attempt_row)?;
+    if attempt.order_id != order_id {
+        return Err(RouterCoreError::Conflict {
+            message: format!(
+                "manual-intervention attempt {} does not belong to order {}",
+                attempt.id, order_id
+            ),
+        });
+    }
+    if attempt.attempt_kind != expected_kind {
+        return Err(RouterCoreError::Conflict {
+            message: format!(
+                "manual-intervention attempt {} is {} instead of {}",
+                attempt.id,
+                attempt.attempt_kind.to_db_string(),
+                expected_kind.to_db_string()
+            ),
+        });
+    }
+
+    if let Some(step_id) = step_id {
+        let step_row = sqlx_core::query::query(&format!(
+            r#"
+            SELECT {EXECUTION_STEP_SELECT_COLUMNS}
+            FROM order_execution_steps
+            WHERE id = $1
+            FOR UPDATE
+            "#
+        ))
+        .bind(step_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        let step = repo.map_execution_step_row(&step_row)?;
+        if step.order_id != order_id || step.execution_attempt_id != Some(attempt.id) {
+            return Err(RouterCoreError::Conflict {
+                message: format!(
+                    "manual-intervention step {} does not belong to order {} attempt {}",
+                    step.id, order_id, attempt.id
+                ),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 async fn insert_execution_leg_tx(
