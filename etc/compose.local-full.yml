@@ -414,6 +414,8 @@ services:
       RUST_LOG: info
     volumes:
       - router_local_master_key:/run/router-secrets:ro
+    expose:
+      - "9103"
 
   router-postgres-replica:
     build:
