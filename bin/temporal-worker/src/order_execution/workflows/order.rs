@@ -3,29 +3,232 @@ use super::*;
 
 #[workflow]
 pub struct OrderWorkflow {
-    order_id: Option<WorkflowOrderId>,
-    phase: OrderWorkflowPhase,
-    active_attempt_id: Option<WorkflowAttemptId>,
-    active_step_id: Option<WorkflowStepId>,
+    state: OrderWorkflowState,
     provider_operation_hints: Vec<ProviderOperationHintSignal>,
     manual_releases: Vec<ManualReleaseSignal>,
     manual_refund_triggers: Vec<ManualTriggerRefundSignal>,
     acknowledge_unrecoverables: Vec<AcknowledgeUnrecoverableSignal>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum OrderWorkflowState {
+    NotStarted,
+    WaitingForFunding(WaitingForFundingState),
+    Executing(ExecutingState),
+    RefreshingQuote(RefreshingQuoteState),
+    Refunding(RefundingState),
+    WaitingForManualIntervention(WaitingForManualInterventionState),
+    Finalizing(FinalizingState),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WaitingForFundingState {
+    order_id: WorkflowOrderId,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExecutingState {
+    order_id: WorkflowOrderId,
+    attempt_id: WorkflowAttemptId,
+    active_step_id: Option<WorkflowStepId>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RefreshingQuoteState {
+    order_id: WorkflowOrderId,
+    stale_attempt_id: WorkflowAttemptId,
+    failed_step_id: WorkflowStepId,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RefundingState {
+    order_id: WorkflowOrderId,
+    parent_attempt_id: WorkflowAttemptId,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WaitingForManualInterventionState {
+    order_id: WorkflowOrderId,
+    attempt_id: WorkflowAttemptId,
+    step_id: WorkflowStepId,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FinalizingState {
+    order_id: WorkflowOrderId,
+    terminal_status: Option<OrderTerminalStatus>,
+}
+
+impl OrderWorkflowState {
+    fn waiting_for_funding(order_id: WorkflowOrderId) -> Self {
+        Self::WaitingForFunding(WaitingForFundingState { order_id })
+    }
+
+    fn executing(order_id: WorkflowOrderId, attempt_id: WorkflowAttemptId) -> Self {
+        Self::Executing(ExecutingState {
+            order_id,
+            attempt_id,
+            active_step_id: None,
+        })
+    }
+
+    fn refreshing_quote(
+        order_id: WorkflowOrderId,
+        stale_attempt_id: WorkflowAttemptId,
+        failed_step_id: WorkflowStepId,
+    ) -> Self {
+        Self::RefreshingQuote(RefreshingQuoteState {
+            order_id,
+            stale_attempt_id,
+            failed_step_id,
+        })
+    }
+
+    fn refunding(order_id: WorkflowOrderId, parent_attempt_id: WorkflowAttemptId) -> Self {
+        Self::Refunding(RefundingState {
+            order_id,
+            parent_attempt_id,
+        })
+    }
+
+    fn waiting_for_manual_intervention(
+        order_id: WorkflowOrderId,
+        attempt_id: WorkflowAttemptId,
+        step_id: WorkflowStepId,
+    ) -> Self {
+        Self::WaitingForManualIntervention(WaitingForManualInterventionState {
+            order_id,
+            attempt_id,
+            step_id,
+        })
+    }
+
+    fn finalizing(order_id: WorkflowOrderId, terminal_status: Option<OrderTerminalStatus>) -> Self {
+        Self::Finalizing(FinalizingState {
+            order_id,
+            terminal_status,
+        })
+    }
+
+    fn phase(&self) -> OrderWorkflowPhase {
+        match self {
+            Self::NotStarted | Self::WaitingForFunding(_) => OrderWorkflowPhase::WaitingForFunding,
+            Self::Executing(_) => OrderWorkflowPhase::Executing,
+            Self::RefreshingQuote(_) => OrderWorkflowPhase::RefreshingQuote,
+            Self::Refunding(_) => OrderWorkflowPhase::Refunding,
+            Self::WaitingForManualIntervention(_) => {
+                OrderWorkflowPhase::WaitingForManualIntervention
+            }
+            Self::Finalizing(state) => {
+                let _terminal_status = state.terminal_status;
+                OrderWorkflowPhase::Finalizing
+            }
+        }
+    }
+
+    fn order_id(&self) -> Option<WorkflowOrderId> {
+        match self {
+            Self::NotStarted => None,
+            Self::WaitingForFunding(state) => Some(state.order_id),
+            Self::Executing(state) => Some(state.order_id),
+            Self::RefreshingQuote(state) => Some(state.order_id),
+            Self::Refunding(state) => Some(state.order_id),
+            Self::WaitingForManualIntervention(state) => Some(state.order_id),
+            Self::Finalizing(state) => Some(state.order_id),
+        }
+    }
+
+    fn active_attempt_id(&self) -> Option<WorkflowAttemptId> {
+        match self {
+            Self::Executing(state) => Some(state.attempt_id),
+            Self::RefreshingQuote(state) => Some(state.stale_attempt_id),
+            Self::Refunding(state) => Some(state.parent_attempt_id),
+            Self::WaitingForManualIntervention(state) => Some(state.attempt_id),
+            Self::NotStarted | Self::WaitingForFunding(_) | Self::Finalizing(_) => None,
+        }
+    }
+
+    fn active_step_id(&self) -> Option<WorkflowStepId> {
+        match self {
+            Self::Executing(state) => state.active_step_id,
+            Self::RefreshingQuote(state) => Some(state.failed_step_id),
+            Self::WaitingForManualIntervention(state) => Some(state.step_id),
+            Self::NotStarted
+            | Self::WaitingForFunding(_)
+            | Self::Refunding(_)
+            | Self::Finalizing(_) => None,
+        }
+    }
+
+    fn set_active_step_id(&mut self, step_id: WorkflowStepId) {
+        let Self::Executing(state) = self else {
+            panic!("active execution step can only be set while executing");
+        };
+        state.active_step_id = Some(step_id);
+    }
+}
+
 impl Default for OrderWorkflow {
     fn default() -> Self {
         Self {
-            order_id: None,
-            phase: OrderWorkflowPhase::WaitingForFunding,
-            active_attempt_id: None,
-            active_step_id: None,
+            state: OrderWorkflowState::NotStarted,
             provider_operation_hints: Vec::new(),
             manual_releases: Vec::new(),
             manual_refund_triggers: Vec::new(),
             acknowledge_unrecoverables: Vec::new(),
         }
     }
+}
+
+fn set_order_workflow_executing(
+    ctx: &mut WorkflowContext<OrderWorkflow>,
+    order_id: WorkflowOrderId,
+    attempt_id: WorkflowAttemptId,
+) {
+    ctx.state_mut(|workflow| {
+        workflow.state = OrderWorkflowState::executing(order_id, attempt_id);
+    });
+}
+
+fn set_order_workflow_active_step(
+    ctx: &mut WorkflowContext<OrderWorkflow>,
+    step_id: WorkflowStepId,
+) {
+    ctx.state_mut(|workflow| {
+        workflow.state.set_active_step_id(step_id);
+    });
+}
+
+fn set_order_workflow_refreshing_quote(
+    ctx: &mut WorkflowContext<OrderWorkflow>,
+    order_id: WorkflowOrderId,
+    stale_attempt_id: WorkflowAttemptId,
+    failed_step_id: WorkflowStepId,
+) {
+    ctx.state_mut(|workflow| {
+        workflow.state =
+            OrderWorkflowState::refreshing_quote(order_id, stale_attempt_id, failed_step_id);
+    });
+}
+
+fn set_order_workflow_refunding(
+    ctx: &mut WorkflowContext<OrderWorkflow>,
+    order_id: WorkflowOrderId,
+    parent_attempt_id: WorkflowAttemptId,
+) {
+    ctx.state_mut(|workflow| {
+        workflow.state = OrderWorkflowState::refunding(order_id, parent_attempt_id);
+    });
+}
+
+fn set_order_workflow_finalizing(
+    ctx: &mut WorkflowContext<OrderWorkflow>,
+    order_id: WorkflowOrderId,
+    terminal_status: Option<OrderTerminalStatus>,
+) {
+    ctx.state_mut(|workflow| {
+        workflow.state = OrderWorkflowState::finalizing(order_id, terminal_status);
+    });
 }
 
 #[workflow_methods]
@@ -36,8 +239,7 @@ impl OrderWorkflow {
         input: OrderWorkflowInput,
     ) -> WorkflowResult<OrderWorkflowOutput> {
         ctx.state_mut(|state| {
-            state.order_id = Some(input.order_id);
-            state.phase = OrderWorkflowPhase::WaitingForFunding;
+            state.state = OrderWorkflowState::waiting_for_funding(input.order_id);
         });
         let workflow_started_at = workflow_start_time(ctx, ORDER_WORKFLOW_TYPE);
         let db_activity_options = db_activity_options();
@@ -99,19 +301,11 @@ impl OrderWorkflow {
                             db_activity_options.clone(),
                         )
                         .await?;
-                    ctx.state_mut(|state| {
-                        state.phase = OrderWorkflowPhase::Executing;
-                        state.active_attempt_id = Some(execution_attempt.attempt_id);
-                        state.active_step_id = None;
-                    });
+                    set_order_workflow_executing(ctx, input.order_id, execution_attempt.attempt_id);
                     resumed_manual_attempt = Some(execution_attempt);
                 }
                 ManualInterventionResolution::TriggerRefund => {
-                    ctx.state_mut(|state| {
-                        state.phase = OrderWorkflowPhase::Refunding;
-                        state.active_attempt_id = Some(attempt_id);
-                        state.active_step_id = None;
-                    });
+                    set_order_workflow_refunding(ctx, input.order_id, attempt_id);
                     let terminal_status = run_refund_child(ctx, input.order_id, attempt_id).await?;
                     return order_workflow_output(
                         ctx,
@@ -144,16 +338,11 @@ impl OrderWorkflow {
             )
             .await?
         };
-        ctx.state_mut(|state| {
-            state.phase = OrderWorkflowPhase::Executing;
-            state.active_attempt_id = Some(execution_attempt.attempt_id);
-        });
+        set_order_workflow_executing(ctx, input.order_id, execution_attempt.attempt_id);
 
         'attempts: loop {
             for step in execution_attempt.steps.clone() {
-                ctx.state_mut(|state| {
-                    state.active_step_id = Some(step.step_id);
-                });
+                set_order_workflow_active_step(ctx, step.step_id);
                 let _ready = ctx
                     .start_activity(
                         OrderActivities::persist_step_ready_to_fire,
@@ -203,10 +392,12 @@ impl OrderWorkflow {
                             db_activity_options.clone(),
                         )
                         .await?;
-                    ctx.state_mut(|state| {
-                        state.phase = OrderWorkflowPhase::RefreshingQuote;
-                        state.active_step_id = Some(step.step_id);
-                    });
+                    set_order_workflow_refreshing_quote(
+                        ctx,
+                        input.order_id,
+                        execution_attempt.attempt_id,
+                        step.step_id,
+                    );
                     let child = ctx
                         .child_workflow(
                             QuoteRefreshWorkflow::run,
@@ -222,18 +413,19 @@ impl OrderWorkflow {
                     match refreshed.outcome {
                         QuoteRefreshWorkflowOutcome::Refreshed { attempt_id, steps } => {
                             execution_attempt = MaterializedExecutionAttempt { attempt_id, steps };
-                            ctx.state_mut(|state| {
-                                state.phase = OrderWorkflowPhase::Executing;
-                                state.active_attempt_id = Some(execution_attempt.attempt_id);
-                                state.active_step_id = None;
-                            });
+                            set_order_workflow_executing(
+                                ctx,
+                                input.order_id,
+                                execution_attempt.attempt_id,
+                            );
                             continue 'attempts;
                         }
                         QuoteRefreshWorkflowOutcome::Untenable { .. } => {
-                            ctx.state_mut(|state| {
-                                state.phase = OrderWorkflowPhase::Finalizing;
-                                state.active_step_id = None;
-                            });
+                            set_order_workflow_finalizing(
+                                ctx,
+                                input.order_id,
+                                Some(OrderTerminalStatus::RefundRequired),
+                            );
                             let finalized = ctx
                                 .start_activity(
                                     OrderActivities::finalize_order_or_refund,
@@ -316,18 +508,19 @@ impl OrderWorkflow {
                                         db_activity_options.clone(),
                                     )
                                     .await?;
-                                ctx.state_mut(|state| {
-                                    state.phase = OrderWorkflowPhase::Executing;
-                                    state.active_attempt_id = Some(execution_attempt.attempt_id);
-                                    state.active_step_id = None;
-                                });
+                                set_order_workflow_executing(
+                                    ctx,
+                                    input.order_id,
+                                    execution_attempt.attempt_id,
+                                );
                                 continue 'attempts;
                             }
                             StepFailureDecision::StartRefund => {
-                                ctx.state_mut(|state| {
-                                    state.phase = OrderWorkflowPhase::Refunding;
-                                    state.active_step_id = None;
-                                });
+                                set_order_workflow_refunding(
+                                    ctx,
+                                    input.order_id,
+                                    execution_attempt.attempt_id,
+                                );
                                 let terminal_status = run_refund_child(
                                     ctx,
                                     input.order_id,
@@ -342,10 +535,12 @@ impl OrderWorkflow {
                                 );
                             }
                             StepFailureDecision::RefreshQuote => {
-                                ctx.state_mut(|state| {
-                                    state.phase = OrderWorkflowPhase::RefreshingQuote;
-                                    state.active_step_id = Some(step.step_id);
-                                });
+                                set_order_workflow_refreshing_quote(
+                                    ctx,
+                                    input.order_id,
+                                    execution_attempt.attempt_id,
+                                    step.step_id,
+                                );
                                 let child = ctx
                                     .child_workflow(
                                         QuoteRefreshWorkflow::run,
@@ -365,19 +560,19 @@ impl OrderWorkflow {
                                     } => {
                                         execution_attempt =
                                             MaterializedExecutionAttempt { attempt_id, steps };
-                                        ctx.state_mut(|state| {
-                                            state.phase = OrderWorkflowPhase::Executing;
-                                            state.active_attempt_id =
-                                                Some(execution_attempt.attempt_id);
-                                            state.active_step_id = None;
-                                        });
+                                        set_order_workflow_executing(
+                                            ctx,
+                                            input.order_id,
+                                            execution_attempt.attempt_id,
+                                        );
                                         continue 'attempts;
                                     }
                                     QuoteRefreshWorkflowOutcome::Untenable { .. } => {
-                                        ctx.state_mut(|state| {
-                                            state.phase = OrderWorkflowPhase::Finalizing;
-                                            state.active_step_id = None;
-                                        });
+                                        set_order_workflow_finalizing(
+                                            ctx,
+                                            input.order_id,
+                                            Some(OrderTerminalStatus::RefundRequired),
+                                        );
                                         let finalized = ctx
                                             .start_activity(
                                                 OrderActivities::finalize_order_or_refund,
@@ -427,19 +622,19 @@ impl OrderWorkflow {
                                                 db_activity_options.clone(),
                                             )
                                             .await?;
-                                        ctx.state_mut(|state| {
-                                            state.phase = OrderWorkflowPhase::Executing;
-                                            state.active_attempt_id =
-                                                Some(execution_attempt.attempt_id);
-                                            state.active_step_id = None;
-                                        });
+                                        set_order_workflow_executing(
+                                            ctx,
+                                            input.order_id,
+                                            execution_attempt.attempt_id,
+                                        );
                                         continue 'attempts;
                                     }
                                     ManualInterventionResolution::TriggerRefund => {
-                                        ctx.state_mut(|state| {
-                                            state.phase = OrderWorkflowPhase::Refunding;
-                                            state.active_step_id = None;
-                                        });
+                                        set_order_workflow_refunding(
+                                            ctx,
+                                            input.order_id,
+                                            execution_attempt.attempt_id,
+                                        );
                                         let terminal_status = run_refund_child(
                                             ctx,
                                             input.order_id,
@@ -488,18 +683,19 @@ impl OrderWorkflow {
                                         db_activity_options.clone(),
                                     )
                                     .await?;
-                                ctx.state_mut(|state| {
-                                    state.phase = OrderWorkflowPhase::Executing;
-                                    state.active_attempt_id = Some(execution_attempt.attempt_id);
-                                    state.active_step_id = None;
-                                });
+                                set_order_workflow_executing(
+                                    ctx,
+                                    input.order_id,
+                                    execution_attempt.attempt_id,
+                                );
                                 continue 'attempts;
                             }
                             ManualInterventionResolution::TriggerRefund => {
-                                ctx.state_mut(|state| {
-                                    state.phase = OrderWorkflowPhase::Refunding;
-                                    state.active_step_id = None;
-                                });
+                                set_order_workflow_refunding(
+                                    ctx,
+                                    input.order_id,
+                                    execution_attempt.attempt_id,
+                                );
                                 let terminal_status = run_refund_child(
                                     ctx,
                                     input.order_id,
@@ -576,19 +772,19 @@ impl OrderWorkflow {
                                             db_activity_options.clone(),
                                         )
                                         .await?;
-                                    ctx.state_mut(|state| {
-                                        state.phase = OrderWorkflowPhase::Executing;
-                                        state.active_attempt_id =
-                                            Some(execution_attempt.attempt_id);
-                                        state.active_step_id = None;
-                                    });
+                                    set_order_workflow_executing(
+                                        ctx,
+                                        input.order_id,
+                                        execution_attempt.attempt_id,
+                                    );
                                     continue 'attempts;
                                 }
                                 ManualInterventionResolution::TriggerRefund => {
-                                    ctx.state_mut(|state| {
-                                        state.phase = OrderWorkflowPhase::Refunding;
-                                        state.active_step_id = None;
-                                    });
+                                    set_order_workflow_refunding(
+                                        ctx,
+                                        input.order_id,
+                                        execution_attempt.attempt_id,
+                                    );
                                     let terminal_status = run_refund_child(
                                         ctx,
                                         input.order_id,
@@ -618,10 +814,7 @@ impl OrderWorkflow {
             break;
         }
 
-        ctx.state_mut(|state| {
-            state.phase = OrderWorkflowPhase::Finalizing;
-            state.active_step_id = None;
-        });
+        set_order_workflow_finalizing(ctx, input.order_id, Some(OrderTerminalStatus::Completed));
         let _completed = ctx
             .start_activity(
                 OrderActivities::mark_order_completed,
@@ -661,7 +854,8 @@ impl OrderWorkflow {
     ) {
         maybe_record_signal(ctx, ORDER_WORKFLOW_TYPE, "provider_operation_hint");
         if self
-            .order_id
+            .state
+            .order_id()
             .map_or(true, |order_id| order_id == signal.order_id)
         {
             self.provider_operation_hints.push(signal);
@@ -710,11 +904,12 @@ impl OrderWorkflow {
     pub fn debug_cursor(&self, _ctx: &WorkflowContextView) -> OrderWorkflowDebugCursor {
         OrderWorkflowDebugCursor {
             order_id: self
-                .order_id
+                .state
+                .order_id()
                 .unwrap_or_else(|| WorkflowOrderId::from(Uuid::nil())),
-            phase: self.phase,
-            active_attempt_id: self.active_attempt_id,
-            active_step_id: self.active_step_id,
+            phase: self.state.phase(),
+            active_attempt_id: self.state.active_attempt_id(),
+            active_step_id: self.state.active_step_id(),
         }
     }
 }
@@ -906,10 +1101,9 @@ async fn wait_for_manual_intervention_resolution(
     reason: Value,
     db_activity_options: ActivityOptions,
 ) -> WorkflowResult<ManualInterventionResolution> {
-    ctx.state_mut(|state| {
-        state.phase = OrderWorkflowPhase::WaitingForManualIntervention;
-        state.active_attempt_id = Some(attempt_id);
-        state.active_step_id = Some(step_id);
+    ctx.state_mut(|workflow| {
+        workflow.state =
+            OrderWorkflowState::waiting_for_manual_intervention(order_id, attempt_id, step_id);
     });
     let wait_started_at = manual_wait_started(ctx, ORDER_WORKFLOW_TYPE);
     let _paused = finalize_manual_intervention(
@@ -1190,5 +1384,47 @@ async fn wait_for_provider_completion_hint(
                 return Ok(ProviderCompletionWait::ManualInterventionRequired { resolution });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn workflow_order_id(value: u128) -> WorkflowOrderId {
+        WorkflowOrderId::from(Uuid::from_u128(value))
+    }
+
+    fn workflow_attempt_id(value: u128) -> WorkflowAttemptId {
+        WorkflowAttemptId::from(Uuid::from_u128(value))
+    }
+
+    fn workflow_step_id(value: u128) -> WorkflowStepId {
+        WorkflowStepId::from(Uuid::from_u128(value))
+    }
+
+    #[test]
+    fn waiting_for_funding_state_has_no_execution_cursor() {
+        let state = OrderWorkflowState::waiting_for_funding(workflow_order_id(1));
+
+        assert_eq!(state.phase(), OrderWorkflowPhase::WaitingForFunding);
+        assert_eq!(state.active_attempt_id(), None);
+        assert_eq!(state.active_step_id(), None);
+
+        // WaitingForFundingState has no attempt_id or step_id fields; code that needs those
+        // values must first match or transition into an execution-bearing state.
+    }
+
+    #[test]
+    fn executing_state_owns_execution_cursor() {
+        let attempt_id = workflow_attempt_id(2);
+        let step_id = workflow_step_id(3);
+        let mut state = OrderWorkflowState::executing(workflow_order_id(1), attempt_id);
+
+        state.set_active_step_id(step_id);
+
+        assert_eq!(state.phase(), OrderWorkflowPhase::Executing);
+        assert_eq!(state.active_attempt_id(), Some(attempt_id));
+        assert_eq!(state.active_step_id(), Some(step_id));
     }
 }
