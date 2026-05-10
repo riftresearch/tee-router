@@ -19,12 +19,8 @@ use crate::runtime::{
 
 use activities::{
     OrderActivities, ProviderObservationActivities, QuoteRefreshActivities, RefundActivities,
-    StepDispatchActivities,
 };
-use workflows::{
-    OrderWorkflow, ProviderHintPollWorkflow, QuoteRefreshWorkflow, RefundWorkflow,
-    StaleRunningStepWatchdogWorkflow,
-};
+use workflows::{OrderWorkflow, ProviderHintPollWorkflow, QuoteRefreshWorkflow, RefundWorkflow};
 
 pub async fn run_worker_with_activities(
     connection: &TemporalConnection,
@@ -62,13 +58,11 @@ pub async fn build_worker(
         .register_workflow::<OrderWorkflow>()
         .register_workflow::<RefundWorkflow>()
         .register_workflow::<QuoteRefreshWorkflow>()
-        .register_workflow::<StaleRunningStepWatchdogWorkflow>()
         .register_workflow::<ProviderHintPollWorkflow>()
         .register_activities(order_activities)
         .register_activities(refund_activities)
         .register_activities(quote_refresh_activities)
         .register_activities(provider_observation_activities)
-        .register_activities(StepDispatchActivities)
         .build();
     let worker =
         Worker::new(&runtime, client, worker_options).map_err(|source| WorkerError::Temporal {

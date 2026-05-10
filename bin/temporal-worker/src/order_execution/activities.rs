@@ -58,29 +58,26 @@ use crate::telemetry;
 
 use super::types::{
     AcknowledgeManualInterventionInput, AcrossOnchainLogRecovered, BoundaryPersisted,
-    CancelTimedOutHyperliquidTradeInput, CheckPreExecutionStaleQuoteInput,
-    ClassifyStaleRunningStepInput, ClassifyStepFailureInput, ComposeRefreshedQuoteAttemptInput,
-    DiscoverSingleRefundPositionInput, DispatchStepProviderActionInput, ExecuteStepInput,
+    CheckPreExecutionStaleQuoteInput, ClassifyStaleRunningStepInput, ClassifyStepFailureInput,
+    ComposeRefreshedQuoteAttemptInput, DiscoverSingleRefundPositionInput, ExecuteStepInput,
     ExecutionPlan, FailedAttemptSnapshotWritten, FinalizeOrderOrRefundInput, FinalizedOrder,
-    HyperliquidTradeCancelRecorded, LoadManualInterventionContextInput,
-    LoadOrderExecutionStateInput, ManualInterventionWorkflowContext, MarkOrderCompletedInput,
-    MaterializeExecutionAttemptInput, MaterializeRefreshedAttemptInput, MaterializeRefundPlanInput,
-    MaterializeRetryAttemptInput, MaterializedExecutionAttempt, OrderCompleted,
-    OrderExecutionState, OrderTerminalStatus, OrderWorkflowPhase,
-    PersistProviderOperationStatusInput, PersistProviderReceiptInput, PersistStepFailedInput,
-    PersistStepReadyToFireInput, PersistStepTerminalStatusInput, PersistenceBoundary,
+    LoadManualInterventionContextInput, LoadOrderExecutionStateInput,
+    ManualInterventionWorkflowContext, MarkOrderCompletedInput, MaterializeExecutionAttemptInput,
+    MaterializeRefreshedAttemptInput, MaterializeRefundPlanInput, MaterializeRetryAttemptInput,
+    MaterializedExecutionAttempt, OrderCompleted, OrderExecutionState, OrderTerminalStatus,
+    OrderWorkflowPhase, PersistProviderOperationStatusInput, PersistProviderReceiptInput,
+    PersistStepFailedInput, PersistStepReadyToFireInput, PersistenceBoundary,
     PollProviderOperationHintsInput, PreExecutionStaleQuoteCheck,
-    PrepareManualInterventionRefundInput, PrepareManualInterventionRetryInput,
-    ProviderActionDispatchShape, ProviderHintKind, ProviderKind, ProviderOperationHintDecision,
-    ProviderOperationHintEvidence, ProviderOperationHintSignal, ProviderOperationHintVerified,
-    ProviderOperationHintsPolled, RecoverAcrossOnchainLogInput, RecoverablePositionKind,
-    RefreshedAttemptMaterialized, RefreshedQuoteAttemptOutcome, RefreshedQuoteAttemptShape,
-    RefundPlanOutcome, RefundPlanShape, RefundUntenableReason,
-    ReleaseRefundManualInterventionInput, SettleProviderStepInput, SingleRefundPosition,
-    SingleRefundPositionDiscovery, SingleRefundPositionOutcome, StaleQuoteRefreshUntenableReason,
-    StaleRunningStepClassified, StaleRunningStepDecision, StepExecuted, StepExecutionOutcome,
-    StepFailureDecision, VerifyProviderOperationHintInput, WorkflowExecutionStep,
-    WriteFailedAttemptSnapshotInput,
+    PrepareManualInterventionRefundInput, PrepareManualInterventionRetryInput, ProviderHintKind,
+    ProviderKind, ProviderOperationHintDecision, ProviderOperationHintEvidence,
+    ProviderOperationHintSignal, ProviderOperationHintVerified, ProviderOperationHintsPolled,
+    RecoverAcrossOnchainLogInput, RecoverablePositionKind, RefreshedAttemptMaterialized,
+    RefreshedQuoteAttemptOutcome, RefreshedQuoteAttemptShape, RefundPlanOutcome, RefundPlanShape,
+    RefundUntenableReason, ReleaseRefundManualInterventionInput, SettleProviderStepInput,
+    SingleRefundPosition, SingleRefundPositionDiscovery, SingleRefundPositionOutcome,
+    StaleQuoteRefreshUntenableReason, StaleRunningStepClassified, StaleRunningStepDecision,
+    StepExecuted, StepExecutionOutcome, StepFailureDecision, VerifyProviderOperationHintInput,
+    WorkflowExecutionStep, WriteFailedAttemptSnapshotInput,
 };
 
 const MAX_EXECUTION_ATTEMPTS: i32 = 2;
@@ -579,16 +576,6 @@ impl OrderActivities {
             })
         })
         .await
-    }
-
-    /// Scar tissue: §2 boundary 3, `AfterExecutionStepStatusPersisted`.
-    #[activity]
-    pub async fn persist_step_terminal_status(
-        _ctx: ActivityContext,
-        _input: PersistStepTerminalStatusInput,
-    ) -> Result<BoundaryPersisted, ActivityError> {
-        // TODO(PR4b, brief §6 invariant 1; scar §2): keep this as its own activity call.
-        todo!("PR4b: persist boundary 3")
     }
 
     /// Scar tissue: §2 boundary 4, `AfterProviderReceiptPersisted`.
@@ -7842,18 +7829,6 @@ impl ProviderObservationActivities {
         })
         .await
     }
-
-    /// Scar tissue: §12 Hyperliquid trade timeout cancel.
-    #[activity]
-    pub async fn cancel_timed_out_hyperliquid_trade(
-        _ctx: ActivityContext,
-        _input: CancelTimedOutHyperliquidTradeInput,
-    ) -> Result<HyperliquidTradeCancelRecorded, ActivityError> {
-        record_activity("cancel_timed_out_hyperliquid_trade", async move {
-            todo!("PR4: cancel timed-out Hyperliquid trade")
-        })
-        .await
-    }
 }
 
 async fn poll_provider_operation_hint_for_step(
@@ -9448,23 +9423,6 @@ fn json_object_or_wrapped(value: Value) -> Value {
         value
     } else {
         json!({ "value": value })
-    }
-}
-
-pub struct StepDispatchActivities;
-
-#[activities]
-impl StepDispatchActivities {
-    /// Scar tissue: §13 step type dispatch provider trait family mapping.
-    #[activity]
-    pub async fn dispatch_step_provider_action(
-        _ctx: ActivityContext,
-        _input: DispatchStepProviderActionInput,
-    ) -> Result<ProviderActionDispatchShape, ActivityError> {
-        record_activity("dispatch_step_provider_action", async move {
-            todo!("PR7: dispatch provider action for the active step")
-        })
-        .await
     }
 }
 

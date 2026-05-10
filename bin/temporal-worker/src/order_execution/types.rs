@@ -106,17 +106,6 @@ pub enum QuoteRefreshWorkflowOutcome {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StaleRunningStepWatchdogInput {
-    pub order_id: WorkflowOrderId,
-    pub step_id: WorkflowStepId,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StaleRunningStepWatchdogOutput {
-    pub manual_intervention_required: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderHintPollWorkflowInput {
     pub order_id: WorkflowOrderId,
     pub step_id: WorkflowStepId,
@@ -210,14 +199,6 @@ pub struct PersistStepFailedInput {
     pub attempt_id: WorkflowAttemptId,
     pub step_id: WorkflowStepId,
     pub failure_reason: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PersistStepTerminalStatusInput {
-    pub order_id: WorkflowOrderId,
-    pub attempt_id: WorkflowAttemptId,
-    pub step_id: WorkflowStepId,
-    pub terminal_status: StepTerminalSubStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -375,17 +356,6 @@ pub struct RecoverAcrossOnchainLogInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AcrossOnchainLogRecovered {
-    pub provider_operation_id: WorkflowProviderOperationId,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CancelTimedOutHyperliquidTradeInput {
-    pub order_id: WorkflowOrderId,
-    pub provider_operation_id: WorkflowProviderOperationId,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HyperliquidTradeCancelRecorded {
     pub provider_operation_id: WorkflowProviderOperationId,
 }
 
@@ -555,19 +525,6 @@ impl StaleQuoteRefreshUntenableReason {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DispatchStepProviderActionInput {
-    pub order_id: WorkflowOrderId,
-    pub attempt_id: WorkflowAttemptId,
-    pub step_id: WorkflowStepId,
-    pub step_kind: ProviderStepKind,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderActionDispatchShape {
-    pub provider_operation_id: WorkflowProviderOperationId,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderWorkflowPhase {
     WaitingForFunding,
@@ -598,12 +555,6 @@ pub enum RefundTrigger {
     FailedAttempt,
     ManualRefund,
     VaultAlreadyRefunded,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum StepTerminalSubStatus {
-    Completed,
-    Waiting,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -659,17 +610,4 @@ pub enum RecoverablePositionKind {
     FundingVault,
     ExternalCustody,
     HyperliquidSpot,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ProviderStepKind {
-    Refund,
-    AcrossBridge,
-    CctpBridge,
-    HyperliquidBridgeDeposit,
-    HyperliquidBridgeWithdrawal,
-    UnitDeposit,
-    UnitWithdrawal,
-    HyperliquidTrade,
-    UniversalRouterSwap,
 }

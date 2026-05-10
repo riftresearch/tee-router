@@ -35,9 +35,8 @@ use super::types::{
     QuoteRefreshWorkflowOutput, RefreshedQuoteAttemptOutcome, RefundPlanOutcome,
     RefundTerminalStatus, RefundTrigger, RefundWorkflowInput, RefundWorkflowOutput,
     ReleaseRefundManualInterventionInput, SettleProviderStepInput, SingleRefundPositionOutcome,
-    StaleRunningStepClassified, StaleRunningStepDecision, StaleRunningStepWatchdogInput,
-    StaleRunningStepWatchdogOutput, StepExecuted, StepExecutionOutcome, StepFailureDecision,
-    VerifyProviderOperationHintInput, WriteFailedAttemptSnapshotInput,
+    StaleRunningStepClassified, StaleRunningStepDecision, StepExecuted, StepExecutionOutcome,
+    StepFailureDecision, VerifyProviderOperationHintInput, WriteFailedAttemptSnapshotInput,
 };
 use crate::telemetry;
 
@@ -689,7 +688,7 @@ impl OrderWorkflow {
             .await?;
 
         // Child-workflow shape: RefundWorkflow, QuoteRefreshWorkflow,
-        // StaleRunningStepWatchdogWorkflow, and ProviderHintPollWorkflow.
+        // ProviderHintPollWorkflow.
         order_workflow_output(
             ctx,
             workflow_started_at,
@@ -2246,26 +2245,6 @@ impl QuoteRefreshWorkflow {
                 steps: materialized.steps,
             },
         })
-    }
-}
-
-/// Stale-running-step watchdog child workflow.
-///
-/// Scar tissue: §6 stale running step manual intervention.
-#[workflow]
-#[derive(Default)]
-pub struct StaleRunningStepWatchdogWorkflow;
-
-#[workflow_methods]
-impl StaleRunningStepWatchdogWorkflow {
-    #[run]
-    pub async fn run(
-        _ctx: &mut WorkflowContext<Self>,
-        _input: StaleRunningStepWatchdogInput,
-    ) -> WorkflowResult<StaleRunningStepWatchdogOutput> {
-        // TODO(PR4, brief §6 invariant 3; scar §6): five minutes without checkpoint requires
-        // manual intervention.
-        todo!("PR4: monitor stale running step checkpoint")
     }
 }
 
