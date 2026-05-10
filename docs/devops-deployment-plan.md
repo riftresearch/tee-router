@@ -10,13 +10,17 @@ the deployment files and scripts.
 Phala runs the security-critical router execution stack:
 
 - `router-postgres-primary`
+- `temporal-postgres`
+- `temporal`
+- `temporal-worker`
 - `router-master-key-init`
 - `router-api`
 - `router-worker`
 
 `router-api` and `router-worker` are separate binaries from the same
-`router-server` package. They should be deployed as separate compose services,
-using the same Docker image with different commands.
+`router-server` package. `temporal-worker` is built as its own image from
+`bin/temporal-worker` and polls the same task queue that router-api/router-worker
+use for workflow starts and signals.
 
 ### Railway
 
@@ -55,17 +59,23 @@ router-api:
 router-worker:
   image: ghcr.io/riftresearch/tee-router:<semver-or-sha-tag>
   command: ["router-worker"]
+
+temporal-worker:
+  image: ghcr.io/riftresearch/tee-router-temporal-worker:<semver-or-sha-tag>
+  command: ["worker"]
 ```
 
-Both services use the same primary Postgres instance inside the Phala compose
-network.
+The router services and temporal-worker use the same primary router Postgres
+instance inside the Phala compose network. Temporal Server uses a separate
+Temporal Postgres instance so workflow history is isolated from router business
+state.
 
 `router-api` is exposed through a direct Phala public endpoint. Sauron receives
 that public URL as `ROUTER_INTERNAL_BASE_URL` and posts detector/provider hints
 to the router API over the internet. Internal hint endpoints must be protected
 with `ROUTER_DETECTOR_API_KEY`.
 
-`router-worker` should not expose a public endpoint.
+`router-worker` and `temporal-worker` should not expose public endpoints.
 
 Phala public endpoints are generated from literal Docker Compose `ports:`
 entries. Keep the externally reachable router API mapping literal:
@@ -87,6 +97,7 @@ Image target:
 
 ```text
 ghcr.io/riftresearch/tee-router
+ghcr.io/riftresearch/tee-router-temporal-worker
 ```
 
 The GHCR package should be public so Phala can pull immutable deploy tags
@@ -99,6 +110,11 @@ The router image should contain:
 - router-server migrations
 - CA certificates
 - any small entrypoint/helper scripts needed for deployment
+
+The temporal-worker image should contain:
+
+- `/usr/local/bin/temporal-worker`
+- CA certificates
 
 Every pushed image should get a `sha-<git-sha>` tag. Semver release tags should
 be produced from git tags of the form `vX.Y.Z`; the workflow should also emit
@@ -452,35 +468,42 @@ private scrapers can reach the endpoint through `*.railway.internal`.
 ## Implementation Checklist
 
 1. Add router Dockerfile that builds `router-api` and `router-worker`.
-2. Add GitHub Actions image build/push workflow for public
-   `ghcr.io/riftresearch/tee-router`.
-3. Add Phala compose file for:
+2. Add temporal-worker Dockerfile that builds `temporal-worker`.
+3. Add GitHub Actions image build/push workflow for public
+   `ghcr.io/riftresearch/tee-router` and
+   `ghcr.io/riftresearch/tee-router-temporal-worker`.
+4. Add Phala compose file for:
    - router primary Postgres
+   - Temporal Postgres
+   - Temporal Server and namespace bootstrap
    - DB secret generator
    - router master key init
    - router API
    - router worker
+   - temporal worker
    Use Phala-provided environment variables with `${VAR:?}` guards rather than
    hard-coded env values.
    Exposed Phala service ports must be literal values, and existing CVMs must
    be updated with Phala's `update_ports` API behavior when port mappings
    change.
-4. Adapt primary Postgres config/init scripts from old `compose.phala.yml`.
-5. Deploy Railway `router-physical-standby-v3` and `sauron-state-db-v3`.
-6. Verify physical standby replay and CDC decoding on the standby.
-7. Configure `sauron-worker-v3` on Railway against the physical standby and
+5. Adapt primary Postgres config/init scripts from old `compose.phala.yml`.
+6. Deploy Railway `router-physical-standby-v3` and `sauron-state-db-v3`.
+7. Verify physical standby replay and CDC decoding on the standby.
+8. Configure `sauron-worker-v3` on Railway against the physical standby and
    state DB.
-8. Configure new Ponder token indexers on Railway with `-v3` service names.
-9. Publicly expose and lock down the existing HyperUnit SOCKS5 proxy, without
+9. Configure new Ponder token indexers on Railway with `-v3` service names.
+10. Publicly expose and lock down the existing HyperUnit SOCKS5 proxy, without
    `ALLOWED_IPS`.
-10. Reuse the existing Railway Bitcoin RPC/ZMQ rathole broker for v3 Sauron.
-11. Smoke test:
+11. Reuse the existing Railway Bitcoin RPC/ZMQ rathole broker for v3 Sauron.
+12. Smoke test:
     - Phala router API `/status`
     - primary DB migration
-    - router-worker lease acquisition
+    - Temporal namespace bootstrap
+    - temporal-worker starts and polls the order-execution task queue
+    - router-worker starts funded-order workflows
     - Railway physical standby replay health
     - Sauron CDC slot/checkpoint health
     - Sauron startup and watch sync
     - Ponder indexer health
     - Sauron hint submission to Phala router API
-12. Run a dust-sized live route only after the smoke checks pass.
+13. Run a dust-sized live route only after the smoke checks pass.

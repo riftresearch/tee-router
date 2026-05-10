@@ -13,6 +13,8 @@ observability stack.
 tee-router runtime stack
   router-api
   router-worker
+  temporal
+  temporal-worker
   sauron
   alloy
 
@@ -40,6 +42,13 @@ The router services keep exposing Prometheus-format metrics:
 - `router-api:9100`
 - `router-worker:9101`
 - `sauron:9102`
+- `temporal:9090`
+
+`temporal:9090` is Temporal Server's Prometheus endpoint. The
+`temporal-worker` process is currently observed through process logs and the
+Temporal Server metrics for task queue/workflow health; adding first-class
+temporal-worker application metrics requires code instrumentation and is
+outside the deployment-only cutover.
 
 The router services may also emit OTLP logs/traces when
 `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, or
@@ -124,6 +133,7 @@ docker compose \
 Local ports:
 
 - Grafana: `http://localhost:3002`
+- Temporal UI: `http://localhost:8080`
 - VictoriaMetrics: `http://localhost:8428`
 - Loki: `http://localhost:3100`
 - Tempo: `http://localhost:3200`
