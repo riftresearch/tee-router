@@ -908,22 +908,27 @@ impl OrderActivities {
                     input.attempt_id.inner()
                 )));
             }
-            let has_provider_operation = deps
+            let provider_operations = deps
                 .db
                 .orders()
                 .get_provider_operations(input.order_id.inner())
                 .await
-                .map_err(activity_error_from_display)?
-                .into_iter()
-                .any(|operation| operation.execution_step_id == Some(step.id));
-            let provider_side_effect_started = step
-                .details
-                .get("provider_side_effect_checkpoint")
-                .is_some()
-                || step.tx_hash.is_some()
-                || step.provider_ref.is_some()
-                || has_provider_operation;
+                .map_err(activity_error_from_display)?;
+            let provider_side_effect_started =
+                step_provider_side_effect_started(&step, &provider_operations);
             if step.status != OrderExecutionStepStatus::Running || provider_side_effect_started {
+                return Ok(PreExecutionStaleQuoteCheck {
+                    should_refresh: false,
+                    reason: None,
+                });
+            }
+            let attempt_steps = deps
+                .db
+                .orders()
+                .get_execution_steps_for_attempt(input.attempt_id.inner())
+                .await
+                .map_err(activity_error_from_display)?;
+            if leg_already_crossed_provider_boundary(&step, &attempt_steps, &provider_operations) {
                 return Ok(PreExecutionStaleQuoteCheck {
                     should_refresh: false,
                     reason: None,
@@ -1493,6 +1498,39 @@ async fn classify_stale_running_step_for_deps(
         step_id: input.step_id,
         decision,
         reason,
+    })
+}
+
+fn step_provider_side_effect_started(
+    step: &OrderExecutionStep,
+    provider_operations: &[OrderProviderOperation],
+) -> bool {
+    step.details
+        .get("provider_side_effect_checkpoint")
+        .is_some()
+        || step.tx_hash.is_some()
+        || step.provider_ref.is_some()
+        || provider_operations
+            .iter()
+            .any(|operation| operation.execution_step_id == Some(step.id))
+}
+
+fn leg_already_crossed_provider_boundary(
+    current_step: &OrderExecutionStep,
+    attempt_steps: &[OrderExecutionStep],
+    provider_operations: &[OrderProviderOperation],
+) -> bool {
+    let Some(leg_id) = current_step.execution_leg_id else {
+        return false;
+    };
+
+    attempt_steps.iter().any(|step| {
+        step.id != current_step.id
+            && step.execution_leg_id == Some(leg_id)
+            && (matches!(
+                step.status,
+                OrderExecutionStepStatus::Waiting | OrderExecutionStepStatus::Completed
+            ) || step_provider_side_effect_started(step, provider_operations))
     })
 }
 
@@ -9649,6 +9687,90 @@ mod tests {
         step_id: Uuid,
     }
 
+    #[test]
+    fn same_leg_completed_step_blocks_pre_execution_refresh() {
+        let order_id = Uuid::now_v7();
+        let attempt_id = Uuid::now_v7();
+        let leg_id = Uuid::now_v7();
+        let current_step = test_execution_step(
+            order_id,
+            attempt_id,
+            leg_id,
+            1,
+            OrderExecutionStepStatus::Running,
+        );
+        let completed_same_leg = test_execution_step(
+            order_id,
+            attempt_id,
+            leg_id,
+            0,
+            OrderExecutionStepStatus::Completed,
+        );
+
+        assert!(leg_already_crossed_provider_boundary(
+            &current_step,
+            &[completed_same_leg, current_step.clone()],
+            &[]
+        ));
+    }
+
+    #[test]
+    fn same_leg_provider_operation_blocks_pre_execution_refresh() {
+        let order_id = Uuid::now_v7();
+        let attempt_id = Uuid::now_v7();
+        let leg_id = Uuid::now_v7();
+        let current_step = test_execution_step(
+            order_id,
+            attempt_id,
+            leg_id,
+            1,
+            OrderExecutionStepStatus::Running,
+        );
+        let submitted_same_leg = test_execution_step(
+            order_id,
+            attempt_id,
+            leg_id,
+            0,
+            OrderExecutionStepStatus::Running,
+        );
+        let provider_operation =
+            test_provider_operation(order_id, attempt_id, submitted_same_leg.id);
+
+        assert!(leg_already_crossed_provider_boundary(
+            &current_step,
+            &[submitted_same_leg, current_step.clone()],
+            &[provider_operation]
+        ));
+    }
+
+    #[test]
+    fn different_leg_completed_step_does_not_block_pre_execution_refresh() {
+        let order_id = Uuid::now_v7();
+        let attempt_id = Uuid::now_v7();
+        let current_leg_id = Uuid::now_v7();
+        let other_leg_id = Uuid::now_v7();
+        let current_step = test_execution_step(
+            order_id,
+            attempt_id,
+            current_leg_id,
+            1,
+            OrderExecutionStepStatus::Running,
+        );
+        let completed_other_leg = test_execution_step(
+            order_id,
+            attempt_id,
+            other_leg_id,
+            0,
+            OrderExecutionStepStatus::Completed,
+        );
+
+        assert!(!leg_already_crossed_provider_boundary(
+            &current_step,
+            &[completed_other_leg, current_step.clone()],
+            &[]
+        ));
+    }
+
     #[tokio::test]
     async fn classify_stale_running_step_records_all_decisions() {
         let test_db = test_database().await;
@@ -10795,6 +10917,72 @@ mod tests {
             usd_valuation: json!({}),
             expires_at,
             created_at,
+        }
+    }
+
+    fn test_execution_step(
+        order_id: Uuid,
+        attempt_id: Uuid,
+        leg_id: Uuid,
+        step_index: i32,
+        status: OrderExecutionStepStatus,
+    ) -> OrderExecutionStep {
+        let now = Utc::now();
+        OrderExecutionStep {
+            id: Uuid::now_v7(),
+            order_id,
+            execution_attempt_id: Some(attempt_id),
+            execution_leg_id: Some(leg_id),
+            transition_decl_id: Some(format!("test-transition-{step_index}")),
+            step_index,
+            step_type: OrderExecutionStepType::UniversalRouterSwap,
+            provider: ProviderId::Velora.as_str().to_string(),
+            status,
+            input_asset: None,
+            output_asset: None,
+            amount_in: Some("1000".to_string()),
+            min_amount_out: Some("1".to_string()),
+            tx_hash: None,
+            provider_ref: None,
+            idempotency_key: Some(format!("test-step-{step_index}")),
+            attempt_count: 0,
+            next_attempt_at: None,
+            started_at: Some(now),
+            completed_at: if status == OrderExecutionStepStatus::Completed {
+                Some(now)
+            } else {
+                None
+            },
+            details: json!({}),
+            request: json!({}),
+            response: json!({}),
+            error: json!({}),
+            usd_valuation: json!({}),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn test_provider_operation(
+        order_id: Uuid,
+        attempt_id: Uuid,
+        step_id: Uuid,
+    ) -> OrderProviderOperation {
+        let now = Utc::now();
+        OrderProviderOperation {
+            id: Uuid::now_v7(),
+            order_id,
+            execution_attempt_id: Some(attempt_id),
+            execution_step_id: Some(step_id),
+            provider: ProviderId::Velora.as_str().to_string(),
+            operation_type: ProviderOperationType::UniversalRouterSwap,
+            provider_ref: Some("test-provider-ref".to_string()),
+            status: ProviderOperationStatus::Submitted,
+            request: json!({}),
+            response: json!({}),
+            observed_state: json!({}),
+            created_at: now,
+            updated_at: now,
         }
     }
 
