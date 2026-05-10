@@ -916,7 +916,7 @@ impl OrderActivities {
                     Some(failed_step.id),
                     trigger_provider_operation_id,
                     failure_reason,
-                    snapshot,
+                    snapshot.into(),
                     Utc::now(),
                 )
                 .await
@@ -1480,7 +1480,7 @@ pub(super) async fn finalize_execution_manual_intervention(
         .mark_execution_attempt_manual_intervention_required(
             attempt_id,
             failure_reason,
-            failed_attempt_snapshot(&order, &failed_step),
+            failed_attempt_snapshot(&order, &failed_step).into(),
             now,
         )
         .await
@@ -2421,76 +2421,6 @@ pub(super) fn amount_parse_error(
 pub(super) fn failed_attempt_snapshot(
     order: &RouterOrder,
     failed_step: &OrderExecutionStep,
-) -> Value {
-    let source_kind = if failed_step.request.get("source_custody_vault_id").is_some() {
-        "external_custody"
-    } else if failed_step
-        .request
-        .get("hyperliquid_custody_vault_id")
-        .is_some()
-    {
-        "hyperliquid_custody"
-    } else {
-        "funding_vault"
-    };
-    let source_asset = failed_step
-        .input_asset
-        .clone()
-        .or_else(|| failed_step.output_asset.clone())
-        .map(|asset| {
-            json!({
-                "chain": asset.chain.as_str(),
-                "asset": asset.asset.as_str(),
-            })
-        })
-        .unwrap_or_else(|| {
-            json!({
-                "chain": order.source_asset.chain.as_str(),
-                "asset": order.source_asset.asset.as_str(),
-            })
-        });
-
-    json!({
-        "source_kind": source_kind,
-        "funding_vault_id": order.funding_vault_id,
-        "failed_step_id": failed_step.id,
-        "failed_step_index": failed_step.step_index,
-        "failed_step_type": failed_step.step_type.to_db_string(),
-        "amount_in": failed_step.amount_in,
-        "min_amount_out": failed_step.min_amount_out,
-        "source_asset": source_asset,
-        "source_custody_vault_id": failed_step.request.get("source_custody_vault_id").cloned(),
-        "source_custody_vault_role": failed_step.request.get("source_custody_vault_role").cloned(),
-        "source_custody_vault_address": failed_step
-            .request
-            .get("source_custody_vault_address")
-            .cloned(),
-        "hyperliquid_custody_vault_id": failed_step
-            .request
-            .get("hyperliquid_custody_vault_id")
-            .cloned(),
-        "hyperliquid_custody_vault_role": failed_step
-            .request
-            .get("hyperliquid_custody_vault_role")
-            .cloned(),
-        "hyperliquid_custody_vault_address": failed_step
-            .request
-            .get("hyperliquid_custody_vault_address")
-            .cloned(),
-        "recipient_custody_vault_id": failed_step
-            .request
-            .get("recipient_custody_vault_id")
-            .cloned(),
-        "recipient_custody_vault_role": failed_step
-            .request
-            .get("recipient_custody_vault_role")
-            .cloned(),
-        "recipient": failed_step.request.get("recipient").cloned(),
-        "revert_custody_vault_id": failed_step.request.get("revert_custody_vault_id").cloned(),
-        "revert_custody_vault_role": failed_step.request.get("revert_custody_vault_role").cloned(),
-        "revert_custody_vault_address": failed_step
-            .details
-            .get("revert_custody_vault_address")
-            .cloned(),
-    })
+) -> InputCustodySnapshot {
+    InputCustodySnapshot::from_failed_step(order, failed_step)
 }
