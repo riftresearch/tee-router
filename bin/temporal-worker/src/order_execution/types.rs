@@ -145,7 +145,7 @@ pub struct OrderExecutionState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoadManualInterventionContextInput {
     pub order_id: WorkflowOrderId,
-    pub refund_manual: bool,
+    pub scope: ManualInterventionScope,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -290,9 +290,23 @@ pub struct AcknowledgeManualInterventionInput {
     pub order_id: WorkflowOrderId,
     pub attempt_id: Option<WorkflowAttemptId>,
     pub step_id: Option<WorkflowStepId>,
-    pub refund_manual: bool,
+    pub scope: ManualInterventionScope,
     pub signal: AcknowledgeUnrecoverableSignal,
-    pub zombie_cleanup: bool,
+    pub reason: AcknowledgeReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManualInterventionScope {
+    OrderAttempt,
+    RefundAttempt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcknowledgeReason {
+    OperatorTerminal,
+    ZombieCleanup,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
