@@ -440,10 +440,17 @@ services:
     volumes:
       - router_local_physical_standby:/var/lib/postgresql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U router_app -d router_db"]
+      # Verify replication has caught up enough that downstream consumers (Sauron)
+      # can find the tables they query at startup. `pg_isready` alone marks the
+      # replica healthy as soon as Postgres accepts connections, which races
+      # ahead of the streamed schema and crashes Sauron.
+      test:
+        - CMD-SHELL
+        - pg_isready -U router_app -d router_db && psql -U router_app -d router_db -tAc "SELECT to_regclass('public.limit_order_quotes') IS NOT NULL" | grep -qx t
       interval: 5s
       timeout: 5s
-      retries: 20
+      retries: 60
+      start_period: 30s
 
   sauron-state-db:
     image: postgres:16-alpine
@@ -463,6 +470,7 @@ services:
     build:
       context: ..
       dockerfile: etc/Dockerfile.sauron
+    restart: on-failure
     depends_on:
       router-postgres-replica:
         condition: service_healthy
