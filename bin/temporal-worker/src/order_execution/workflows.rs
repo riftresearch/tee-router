@@ -44,6 +44,7 @@ const PROVIDER_HINT_WAIT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const PROVIDER_HINT_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const STALE_RUNNING_STEP_RECOVERY_AFTER: Duration = Duration::from_secs(5 * 60);
 const EXECUTE_STEP_START_TO_CLOSE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const QUOTE_REFRESH_WORKFLOW_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 const MANUAL_INTERVENTION_WAIT_TIMEOUT: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const ORDER_WORKFLOW_TYPE: &str = "OrderWorkflow";
 const REFUND_WORKFLOW_TYPE: &str = "RefundWorkflow";
@@ -1824,7 +1825,9 @@ fn refund_child_options(order_id: Uuid, parent_attempt_id: Uuid) -> ChildWorkflo
 fn quote_refresh_child_options(order_id: Uuid, failed_step_id: Uuid) -> ChildWorkflowOptions {
     ChildWorkflowOptions {
         workflow_id: format!("order:{order_id}:quote-refresh:{failed_step_id}"),
-        run_timeout: Some(Duration::from_secs(120)),
+        // Quote refresh must tolerate activity queue backlog during load spikes. Short run timeouts
+        // let load-induced refresh delays fail the parent workflow while leaving Postgres executing.
+        run_timeout: Some(QUOTE_REFRESH_WORKFLOW_TIMEOUT),
         task_timeout: Some(Duration::from_secs(30)),
         ..Default::default()
     }

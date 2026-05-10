@@ -1764,7 +1764,9 @@ async fn estimate_evm_gas_or_cap(
 
 fn is_balance_bound_estimate_error<E: std::fmt::Display>(err: &E) -> bool {
     let message = err.to_string().to_ascii_lowercase();
-    message.contains("insufficient funds") || message.contains("insufficient balance")
+    message.contains("insufficient funds")
+        || message.contains("insufficient balance")
+        || message.contains("transfer amount exceeds balance")
 }
 
 fn is_retryable_evm_rpc_error<E: std::fmt::Display>(err: &E) -> bool {
@@ -1777,7 +1779,9 @@ fn is_retryable_evm_rpc_error<E: std::fmt::Display>(err: &E) -> bool {
 
 fn classify_evm_rpc_error<E: std::fmt::Display>(err: &E) -> &'static str {
     let message = err.to_string().to_ascii_lowercase();
-    if message.contains("429")
+    if is_evm_execution_revert(&message) {
+        "execution_reverted"
+    } else if contains_status_code(&message, "429")
         || message.contains("rate limit")
         || message.contains("rate-limited")
         || message.contains("too many requests")
@@ -1789,10 +1793,10 @@ fn classify_evm_rpc_error<E: std::fmt::Display>(err: &E) -> &'static str {
         || message.contains("temporary internal error")
         || message.contains("incorrect response body")
         || message.contains("wrong json-rpc response")
-        || message.contains("502")
-        || message.contains("503")
-        || message.contains("504")
-        || message.contains("500")
+        || contains_status_code(&message, "502")
+        || contains_status_code(&message, "503")
+        || contains_status_code(&message, "504")
+        || contains_status_code(&message, "500")
     {
         "upstream_unavailable"
     } else if message.contains("connection reset")
@@ -1805,6 +1809,22 @@ fn classify_evm_rpc_error<E: std::fmt::Display>(err: &E) -> &'static str {
     } else {
         "other"
     }
+}
+
+fn is_evm_execution_revert(message: &str) -> bool {
+    message.contains("execution reverted")
+        || message.contains("transaction reverted")
+        || message.contains("revert reason")
+        || message.contains("evm revert")
+}
+
+fn contains_status_code(message: &str, code: &str) -> bool {
+    message.match_indices(code).any(|(idx, _)| {
+        let before = message[..idx].chars().next_back();
+        let after = message[idx + code.len()..].chars().next();
+        before.is_none_or(|ch| !ch.is_ascii_alphanumeric())
+            && after.is_none_or(|ch| !ch.is_ascii_alphanumeric())
+    })
 }
 
 fn record_evm_rpc_retry(chain_type: ChainType, rpc_method: &'static str, error_kind: &'static str) {
@@ -2376,6 +2396,39 @@ mod tests {
         );
         assert!(evm_transfer_index_matches(Some(0), 0).unwrap());
         assert!(!evm_transfer_index_matches(Some(1), 0).unwrap());
+    }
+
+    #[test]
+    fn erc20_transfer_amount_exceeds_balance_revert_is_not_retryable() {
+        let error = "server returned an error response: error code 3: execution reverted: ERC20: transfer amount exceeds balance, data: 0x08c379a00000000000000000000000000000000000000000000000000000000000000204524332303a207472616e7366657220616d6f756e7420657863656564732062616c616e6365";
+
+        assert_eq!(classify_evm_rpc_error(&error), "execution_reverted");
+        assert!(!is_retryable_evm_rpc_error(&error));
+        assert!(is_balance_bound_estimate_error(&error));
+    }
+
+    #[test]
+    fn revert_data_containing_status_digits_is_not_upstream_unavailable() {
+        let error = "server returned an error response: error code 3: execution reverted: ERC20: transfer amount exceeds balance, data: 0x0000000000000000000000000000000000000000000000000000000000050000";
+
+        assert_eq!(classify_evm_rpc_error(&error), "execution_reverted");
+        assert!(!is_retryable_evm_rpc_error(&error));
+    }
+
+    #[test]
+    fn delimited_http_status_code_is_retryable() {
+        let error = "upstream responded with HTTP 500";
+
+        assert_eq!(classify_evm_rpc_error(&error), "upstream_unavailable");
+        assert!(is_retryable_evm_rpc_error(&error));
+    }
+
+    #[test]
+    fn status_digits_embedded_in_payload_are_not_http_status_codes() {
+        let error = "bad rpc payload 0x0000000000050000";
+
+        assert_eq!(classify_evm_rpc_error(&error), "other");
+        assert!(!is_retryable_evm_rpc_error(&error));
     }
 
     #[test]
