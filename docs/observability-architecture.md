@@ -42,13 +42,13 @@ The router services keep exposing Prometheus-format metrics:
 - `router-api:9100`
 - `router-worker:9101`
 - `sauron:9102`
+- `temporal-worker:9103`
 - `temporal:9090`
 
-`temporal:9090` is Temporal Server's Prometheus endpoint. The
-`temporal-worker` process is currently observed through process logs and the
-Temporal Server metrics for task queue/workflow health; adding first-class
-temporal-worker application metrics requires code instrumentation and is
-outside the deployment-only cutover.
+`temporal:9090` is Temporal Server's Prometheus endpoint. `temporal-worker:9103`
+is the application metrics endpoint for workflow lifecycle, activity latency,
+provider hint waits, manual-intervention waits, stale-quote refreshes, and refund
+materialization counters.
 
 The router services may also emit OTLP logs/traces when
 `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, or
@@ -148,8 +148,8 @@ http://localhost:3002/d/tee-router-local-overview/tee-router-local-overview
 ```
 
 The dashboard includes router metrics, Tempo trace ingestion/activity, and recent
-router logs. Individual trace inspection remains available through the Tempo
-datasource in Grafana Explore.
+router logs, plus temporal-worker workflow/activity panels. Individual trace
+inspection remains available through the Tempo datasource in Grafana Explore.
 
 ## Why Keep Prometheus-Format Metrics?
 

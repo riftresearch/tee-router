@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 // Activity function constants are registered before the later rewrite slices invoke them.
-use std::{str::FromStr, sync::Arc};
+use std::{future::Future, str::FromStr, sync::Arc, time::Instant};
 
 use alloy::{
     primitives::{Address, FixedBytes, U256},
@@ -54,6 +54,8 @@ use temporalio_macros::activities;
 use temporalio_sdk::activities::{ActivityContext, ActivityError};
 use uuid::Uuid;
 
+use crate::telemetry;
+
 use super::types::{
     AcknowledgeManualInterventionInput, AcrossOnchainLogRecovered, BoundaryPersisted,
     CancelTimedOutHyperliquidTradeInput, CheckPreExecutionStaleQuoteInput,
@@ -89,6 +91,16 @@ const REFRESH_HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW: u64 =
     REFUND_HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW;
 const REFRESH_BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_BPS: u64 = 12_500;
 const REFRESH_PROBE_MAX_AMOUNT_IN: &str = "340282366920938463463374607431768211455";
+
+async fn record_activity<T, F>(activity_name: &'static str, activity: F) -> Result<T, ActivityError>
+where
+    F: Future<Output = Result<T, ActivityError>>,
+{
+    let started = Instant::now();
+    let result = activity.await;
+    telemetry::record_activity(activity_name, result.is_ok(), started.elapsed());
+    result
+}
 
 // Canonical Across V3 `FundsDeposited` event used for scar §11 lost-intent
 // recovery. Keep this byte-for-byte aligned with router-core's Across provider.
@@ -172,56 +184,61 @@ impl OrderActivities {
         _ctx: ActivityContext,
         input: ExecuteStepInput,
     ) -> Result<StepExecuted, ActivityError> {
-        let deps = self.deps()?;
-        let step = deps
-            .db
-            .orders()
-            .get_execution_step(input.step_id)
-            .await
-            .map_err(activity_error_from_display)?;
-        if step.order_id != input.order_id || step.execution_attempt_id != Some(input.attempt_id) {
-            return Err(activity_error(format!(
-                "step {} does not belong to order {} attempt {}",
-                step.id, input.order_id, input.attempt_id
-            )));
-        }
-        if step.status != OrderExecutionStepStatus::Running {
-            return Err(activity_error(format!(
-                "step {} must be running before provider execution, got {}",
-                step.id,
-                step.status.to_db_string()
-            )));
-        }
-        let checkpoint = json!({
-            "kind": "provider_side_effect_about_to_fire",
-            "reason": "about_to_fire_provider_side_effect",
-            "step_id": step.id,
-            "attempt_id": input.attempt_id,
-            "recorded_at": Utc::now().to_rfc3339(),
-            "scar_tissue": "§6"
-        });
-        let step = deps
-            .db
-            .orders()
-            .record_execution_step_provider_side_effect_checkpoint(
-                input.order_id,
-                input.attempt_id,
-                input.step_id,
-                checkpoint,
-                Utc::now(),
-            )
-            .await
-            .map_err(activity_error_from_display)?;
-        let completion = execute_running_step(&deps, &step).await?;
-        Ok(StepExecuted {
-            order_id: input.order_id,
-            attempt_id: input.attempt_id,
-            step_id: input.step_id,
-            response: completion.response,
-            tx_hash: completion.tx_hash,
-            provider_state: completion.provider_state,
-            outcome: completion.outcome,
+        record_activity("execute_step", async move {
+            let deps = self.deps()?;
+            let step = deps
+                .db
+                .orders()
+                .get_execution_step(input.step_id)
+                .await
+                .map_err(activity_error_from_display)?;
+            if step.order_id != input.order_id
+                || step.execution_attempt_id != Some(input.attempt_id)
+            {
+                return Err(activity_error(format!(
+                    "step {} does not belong to order {} attempt {}",
+                    step.id, input.order_id, input.attempt_id
+                )));
+            }
+            if step.status != OrderExecutionStepStatus::Running {
+                return Err(activity_error(format!(
+                    "step {} must be running before provider execution, got {}",
+                    step.id,
+                    step.status.to_db_string()
+                )));
+            }
+            let checkpoint = json!({
+                "kind": "provider_side_effect_about_to_fire",
+                "reason": "about_to_fire_provider_side_effect",
+                "step_id": step.id,
+                "attempt_id": input.attempt_id,
+                "recorded_at": Utc::now().to_rfc3339(),
+                "scar_tissue": "§6"
+            });
+            let step = deps
+                .db
+                .orders()
+                .record_execution_step_provider_side_effect_checkpoint(
+                    input.order_id,
+                    input.attempt_id,
+                    input.step_id,
+                    checkpoint,
+                    Utc::now(),
+                )
+                .await
+                .map_err(activity_error_from_display)?;
+            let completion = execute_running_step(&deps, &step).await?;
+            Ok(StepExecuted {
+                order_id: input.order_id,
+                attempt_id: input.attempt_id,
+                step_id: input.step_id,
+                response: completion.response,
+                tx_hash: completion.tx_hash,
+                provider_state: completion.provider_state,
+                outcome: completion.outcome,
+            })
         })
+        .await
     }
 
     /// Scar tissue: §16.3 order finalisation and custody lifecycle.
@@ -231,23 +248,26 @@ impl OrderActivities {
         _ctx: ActivityContext,
         input: MarkOrderCompletedInput,
     ) -> Result<OrderCompleted, ActivityError> {
-        let deps = self.deps()?;
-        let completed = deps
-            .db
-            .orders()
-            .mark_execution_order_completed(input.order_id, input.attempt_id, Utc::now())
-            .await
-            .map_err(activity_error_from_display)?;
-        tracing::info!(
-            order_id = %completed.order.id,
-            attempt_id = %completed.attempt.id,
-            event_name = "order.completed",
-            "order.completed"
-        );
-        Ok(OrderCompleted {
-            order_id: completed.order.id,
-            attempt_id: completed.attempt.id,
+        record_activity("mark_order_completed", async move {
+            let deps = self.deps()?;
+            let completed = deps
+                .db
+                .orders()
+                .mark_execution_order_completed(input.order_id, input.attempt_id, Utc::now())
+                .await
+                .map_err(activity_error_from_display)?;
+            tracing::info!(
+                order_id = %completed.order.id,
+                attempt_id = %completed.attempt.id,
+                event_name = "order.completed",
+                "order.completed"
+            );
+            Ok(OrderCompleted {
+                order_id: completed.order.id,
+                attempt_id: completed.attempt.id,
+            })
         })
+        .await
     }
 
     /// Scar tissue: §3 phase pass and §4 order/vault/step state alignment.
@@ -257,88 +277,91 @@ impl OrderActivities {
         _ctx: ActivityContext,
         input: LoadOrderExecutionStateInput,
     ) -> Result<OrderExecutionState, ActivityError> {
-        let deps = self.deps()?;
-        let order = deps
-            .db
-            .orders()
-            .get(input.order_id)
-            .await
-            .map_err(activity_error_from_display)?;
-        let funding_vault_id = order.funding_vault_id.ok_or_else(|| {
-            activity_error(format!(
-                "order {} cannot execute without a funding vault",
-                order.id
-            ))
-        })?;
-        let source_vault = deps
-            .db
-            .vaults()
-            .get(funding_vault_id)
-            .await
-            .map_err(activity_error_from_display)?;
-        let order = if order.status == router_core::models::RouterOrderStatus::PendingFunding {
-            let funded = deps
+        record_activity("load_order_execution_state", async move {
+            let deps = self.deps()?;
+            let order = deps
                 .db
                 .orders()
-                .mark_order_funded_from_funded_vault(order.id, Utc::now())
+                .get(input.order_id)
                 .await
                 .map_err(activity_error_from_display)?;
-            tracing::info!(
-                order_id = %funded.id,
-                event_name = "order.funded",
-                "order.funded"
-            );
-            funded
-        } else {
-            order
-        };
-        let quote = deps
-            .db
-            .orders()
-            .get_router_order_quote(order.id)
-            .await
-            .map_err(activity_error_from_display)?;
-        let planned_at = Utc::now();
-        let route = match quote {
-            RouterOrderQuote::MarketOrder(quote) => deps
-                .planner
-                .plan(&order, &source_vault, &quote, planned_at)
-                .map_err(activity_error_from_display)?,
-            RouterOrderQuote::LimitOrder(quote) => deps
-                .planner
-                .plan_limit_order(&order, &source_vault, &quote, planned_at)
-                .map_err(activity_error_from_display)?,
-        };
-        if route.legs.is_empty() || route.steps.is_empty() {
-            return Err(activity_error(format!(
-                "order {} execution plan has {} legs and {} steps",
-                order.id,
-                route.legs.len(),
-                route.steps.len()
-            )));
-        }
+            let funding_vault_id = order.funding_vault_id.ok_or_else(|| {
+                activity_error(format!(
+                    "order {} cannot execute without a funding vault",
+                    order.id
+                ))
+            })?;
+            let source_vault = deps
+                .db
+                .vaults()
+                .get(funding_vault_id)
+                .await
+                .map_err(activity_error_from_display)?;
+            let order = if order.status == router_core::models::RouterOrderStatus::PendingFunding {
+                let funded = deps
+                    .db
+                    .orders()
+                    .mark_order_funded_from_funded_vault(order.id, Utc::now())
+                    .await
+                    .map_err(activity_error_from_display)?;
+                tracing::info!(
+                    order_id = %funded.id,
+                    event_name = "order.funded",
+                    "order.funded"
+                );
+                funded
+            } else {
+                order
+            };
+            let quote = deps
+                .db
+                .orders()
+                .get_router_order_quote(order.id)
+                .await
+                .map_err(activity_error_from_display)?;
+            let planned_at = Utc::now();
+            let route = match quote {
+                RouterOrderQuote::MarketOrder(quote) => deps
+                    .planner
+                    .plan(&order, &source_vault, &quote, planned_at)
+                    .map_err(activity_error_from_display)?,
+                RouterOrderQuote::LimitOrder(quote) => deps
+                    .planner
+                    .plan_limit_order(&order, &source_vault, &quote, planned_at)
+                    .map_err(activity_error_from_display)?,
+            };
+            if route.legs.is_empty() || route.steps.is_empty() {
+                return Err(activity_error(format!(
+                    "order {} execution plan has {} legs and {} steps",
+                    order.id,
+                    route.legs.len(),
+                    route.steps.len()
+                )));
+            }
 
-        tracing::info!(
-            order_id = %order.id,
-            path_id = %route.path_id,
-            leg_count = route.legs.len(),
-            step_count = route.steps.len(),
-            event_name = "order.execution_plan_started",
-            "order.execution_plan_started"
-        );
-        Ok(OrderExecutionState {
-            order_id: order.id,
-            phase: OrderWorkflowPhase::WaitingForFunding,
-            active_attempt_id: None,
-            active_step_id: None,
-            order,
-            plan: ExecutionPlan {
-                path_id: route.path_id,
-                transition_decl_ids: route.transition_decl_ids,
-                legs: route.legs,
-                steps: route.steps,
-            },
+            tracing::info!(
+                order_id = %order.id,
+                path_id = %route.path_id,
+                leg_count = route.legs.len(),
+                step_count = route.steps.len(),
+                event_name = "order.execution_plan_started",
+                "order.execution_plan_started"
+            );
+            Ok(OrderExecutionState {
+                order_id: order.id,
+                phase: OrderWorkflowPhase::WaitingForFunding,
+                active_attempt_id: None,
+                active_step_id: None,
+                order,
+                plan: ExecutionPlan {
+                    path_id: route.path_id,
+                    transition_decl_ids: route.transition_decl_ids,
+                    legs: route.legs,
+                    steps: route.steps,
+                },
+            })
         })
+        .await
     }
 
     #[activity]
@@ -347,46 +370,49 @@ impl OrderActivities {
         _ctx: ActivityContext,
         input: LoadManualInterventionContextInput,
     ) -> Result<ManualInterventionWorkflowContext, ActivityError> {
-        let deps = self.deps()?;
-        let expected_attempt_kind = if input.refund_manual {
-            OrderExecutionAttemptKind::RefundRecovery
-        } else {
-            OrderExecutionAttemptKind::PrimaryExecution
-        };
-        let attempt = deps
-            .db
-            .orders()
-            .get_execution_attempts(input.order_id)
-            .await
-            .map_err(activity_error_from_display)?
-            .into_iter()
-            .filter(|attempt| attempt.attempt_kind == expected_attempt_kind)
-            .max_by_key(|attempt| (attempt.attempt_index, attempt.updated_at));
-        let Some(attempt) = attempt else {
-            return Ok(ManualInterventionWorkflowContext {
-                attempt_id: None,
-                step_id: None,
-            });
-        };
-        let step = deps
-            .db
-            .orders()
-            .get_execution_steps_for_attempt(attempt.id)
-            .await
-            .map_err(activity_error_from_display)?
-            .into_iter()
-            .filter(|step| step.status != OrderExecutionStepStatus::Superseded)
-            .max_by_key(|step| {
-                (
-                    manual_context_step_rank(step.status),
-                    step.updated_at,
-                    step.step_index,
-                )
-            });
-        Ok(ManualInterventionWorkflowContext {
-            attempt_id: Some(attempt.id),
-            step_id: step.map(|step| step.id),
+        record_activity("load_manual_intervention_context", async move {
+            let deps = self.deps()?;
+            let expected_attempt_kind = if input.refund_manual {
+                OrderExecutionAttemptKind::RefundRecovery
+            } else {
+                OrderExecutionAttemptKind::PrimaryExecution
+            };
+            let attempt = deps
+                .db
+                .orders()
+                .get_execution_attempts(input.order_id)
+                .await
+                .map_err(activity_error_from_display)?
+                .into_iter()
+                .filter(|attempt| attempt.attempt_kind == expected_attempt_kind)
+                .max_by_key(|attempt| (attempt.attempt_index, attempt.updated_at));
+            let Some(attempt) = attempt else {
+                return Ok(ManualInterventionWorkflowContext {
+                    attempt_id: None,
+                    step_id: None,
+                });
+            };
+            let step = deps
+                .db
+                .orders()
+                .get_execution_steps_for_attempt(attempt.id)
+                .await
+                .map_err(activity_error_from_display)?
+                .into_iter()
+                .filter(|step| step.status != OrderExecutionStepStatus::Superseded)
+                .max_by_key(|step| {
+                    (
+                        manual_context_step_rank(step.status),
+                        step.updated_at,
+                        step.step_index,
+                    )
+                });
+            Ok(ManualInterventionWorkflowContext {
+                attempt_id: Some(attempt.id),
+                step_id: step.map(|step| step.id),
+            })
         })
+        .await
     }
 
     /// Scar tissue: §2.1 `AfterExecutionLegsPersisted`, §3 phase 2, and §4 state alignment.
@@ -396,46 +422,50 @@ impl OrderActivities {
         _ctx: ActivityContext,
         input: MaterializeExecutionAttemptInput,
     ) -> Result<MaterializedExecutionAttempt, ActivityError> {
-        let deps = self.deps()?;
-        let mut plan = input.plan;
-        plan.steps = hydrate_destination_execution_steps(&deps, input.order_id, plan.steps).await?;
-        let record = deps
-            .db
-            .orders()
-            .materialize_primary_execution_attempt(
-                input.order_id,
-                ExecutionAttemptPlan {
-                    legs: plan.legs,
-                    steps: plan.steps,
-                },
-                Utc::now(),
-            )
-            .await
-            .map_err(activity_error_from_display)?;
-        tracing::info!(
-            order_id = %record.order.id,
-            attempt_id = %record.attempt.id,
-            leg_count = record.legs.len(),
-            step_count = record.steps.len(),
-            event_name = "order.execution_plan_materialized",
-            "order.execution_plan_materialized"
-        );
-        tracing::info!(
-            order_id = %record.order.id,
-            event_name = "order.executing",
-            "order.executing"
-        );
-        Ok(MaterializedExecutionAttempt {
-            attempt_id: record.attempt.id,
-            steps: record
-                .steps
-                .into_iter()
-                .map(|step| WorkflowExecutionStep {
-                    step_id: step.id,
-                    step_index: step.step_index,
-                })
-                .collect(),
+        record_activity("materialize_execution_attempt", async move {
+            let deps = self.deps()?;
+            let mut plan = input.plan;
+            plan.steps =
+                hydrate_destination_execution_steps(&deps, input.order_id, plan.steps).await?;
+            let record = deps
+                .db
+                .orders()
+                .materialize_primary_execution_attempt(
+                    input.order_id,
+                    ExecutionAttemptPlan {
+                        legs: plan.legs,
+                        steps: plan.steps,
+                    },
+                    Utc::now(),
+                )
+                .await
+                .map_err(activity_error_from_display)?;
+            tracing::info!(
+                order_id = %record.order.id,
+                attempt_id = %record.attempt.id,
+                leg_count = record.legs.len(),
+                step_count = record.steps.len(),
+                event_name = "order.execution_plan_materialized",
+                "order.execution_plan_materialized"
+            );
+            tracing::info!(
+                order_id = %record.order.id,
+                event_name = "order.executing",
+                "order.executing"
+            );
+            Ok(MaterializedExecutionAttempt {
+                attempt_id: record.attempt.id,
+                steps: record
+                    .steps
+                    .into_iter()
+                    .map(|step| WorkflowExecutionStep {
+                        step_id: step.id,
+                        step_index: step.step_index,
+                    })
+                    .collect(),
+            })
         })
+        .await
     }
 
     /// Scar tissue: §5 retry attempt creation and suffix supersession.
@@ -445,37 +475,40 @@ impl OrderActivities {
         _ctx: ActivityContext,
         input: MaterializeRetryAttemptInput,
     ) -> Result<MaterializedExecutionAttempt, ActivityError> {
-        let deps = self.deps()?;
-        let record = deps
-            .db
-            .orders()
-            .create_retry_execution_attempt_from_failed_step(
-                input.order_id,
-                input.failed_attempt_id,
-                input.failed_step_id,
-                Utc::now(),
-            )
-            .await
-            .map_err(activity_error_from_display)?;
-        tracing::info!(
-            order_id = %record.order.id,
-            attempt_id = %record.attempt.id,
-            failed_attempt_id = %input.failed_attempt_id,
-            failed_step_id = %input.failed_step_id,
-            event_name = "order.execution_retry_materialized",
-            "order.execution_retry_materialized"
-        );
-        Ok(MaterializedExecutionAttempt {
-            attempt_id: record.attempt.id,
-            steps: record
-                .steps
-                .into_iter()
-                .map(|step| WorkflowExecutionStep {
-                    step_id: step.id,
-                    step_index: step.step_index,
-                })
-                .collect(),
+        record_activity("materialize_retry_attempt", async move {
+            let deps = self.deps()?;
+            let record = deps
+                .db
+                .orders()
+                .create_retry_execution_attempt_from_failed_step(
+                    input.order_id,
+                    input.failed_attempt_id,
+                    input.failed_step_id,
+                    Utc::now(),
+                )
+                .await
+                .map_err(activity_error_from_display)?;
+            tracing::info!(
+                order_id = %record.order.id,
+                attempt_id = %record.attempt.id,
+                failed_attempt_id = %input.failed_attempt_id,
+                failed_step_id = %input.failed_step_id,
+                event_name = "order.execution_retry_materialized",
+                "order.execution_retry_materialized"
+            );
+            Ok(MaterializedExecutionAttempt {
+                attempt_id: record.attempt.id,
+                steps: record
+                    .steps
+                    .into_iter()
+                    .map(|step| WorkflowExecutionStep {
+                        step_id: step.id,
+                        step_index: step.step_index,
+                    })
+                    .collect(),
+            })
         })
+        .await
     }
 
     /// Scar tissue: §2.1 `AfterExecutionLegsPersisted`.
@@ -485,29 +518,32 @@ impl OrderActivities {
         _ctx: ActivityContext,
         input: PersistStepReadyToFireInput,
     ) -> Result<BoundaryPersisted, ActivityError> {
-        let deps = self.deps()?;
-        let step = deps
-            .db
-            .orders()
-            .persist_execution_step_ready_to_fire(
-                input.order_id,
-                input.attempt_id,
-                input.step_id,
-                Utc::now(),
-            )
-            .await
-            .map_err(activity_error_from_display)?;
-        tracing::info!(
-            order_id = %input.order_id,
-            attempt_id = %input.attempt_id,
-            step_id = %step.id,
-            step_index = step.step_index,
-            event_name = "execution_step.started",
-            "execution_step.started"
-        );
-        Ok(BoundaryPersisted {
-            boundary: PersistenceBoundary::AfterExecutionLegsPersisted,
+        record_activity("persist_step_ready_to_fire", async move {
+            let deps = self.deps()?;
+            let step = deps
+                .db
+                .orders()
+                .persist_execution_step_ready_to_fire(
+                    input.order_id,
+                    input.attempt_id,
+                    input.step_id,
+                    Utc::now(),
+                )
+                .await
+                .map_err(activity_error_from_display)?;
+            tracing::info!(
+                order_id = %input.order_id,
+                attempt_id = %input.attempt_id,
+                step_id = %step.id,
+                step_index = step.step_index,
+                event_name = "execution_step.started",
+                "execution_step.started"
+            );
+            Ok(BoundaryPersisted {
+                boundary: PersistenceBoundary::AfterExecutionLegsPersisted,
+            })
         })
+        .await
     }
 
     /// Scar tissue: §2 boundary 2, `AfterStepMarkedFailed`.
@@ -517,29 +553,32 @@ impl OrderActivities {
         _ctx: ActivityContext,
         input: PersistStepFailedInput,
     ) -> Result<BoundaryPersisted, ActivityError> {
-        let deps = self.deps()?;
-        let step = deps
-            .db
-            .orders()
-            .persist_execution_step_failed(
-                input.order_id,
-                input.attempt_id,
-                input.step_id,
-                json!({ "error": input.failure_reason }),
-                Utc::now(),
-            )
-            .await
-            .map_err(activity_error_from_display)?;
-        tracing::info!(
-            order_id = %input.order_id,
-            attempt_id = %input.attempt_id,
-            step_id = %step.id,
-            event_name = "execution_step.failed",
-            "execution_step.failed"
-        );
-        Ok(BoundaryPersisted {
-            boundary: PersistenceBoundary::AfterStepMarkedFailed,
+        record_activity("persist_step_failed", async move {
+            let deps = self.deps()?;
+            let step = deps
+                .db
+                .orders()
+                .persist_execution_step_failed(
+                    input.order_id,
+                    input.attempt_id,
+                    input.step_id,
+                    json!({ "error": input.failure_reason }),
+                    Utc::now(),
+                )
+                .await
+                .map_err(activity_error_from_display)?;
+            tracing::info!(
+                order_id = %input.order_id,
+                attempt_id = %input.attempt_id,
+                step_id = %step.id,
+                event_name = "execution_step.failed",
+                "execution_step.failed"
+            );
+            Ok(BoundaryPersisted {
+                boundary: PersistenceBoundary::AfterStepMarkedFailed,
+            })
         })
+        .await
     }
 
     /// Scar tissue: §2 boundary 3, `AfterExecutionStepStatusPersisted`.
@@ -559,45 +598,48 @@ impl OrderActivities {
         _ctx: ActivityContext,
         input: PersistProviderReceiptInput,
     ) -> Result<BoundaryPersisted, ActivityError> {
-        let deps = self.deps()?;
-        let step = deps
-            .db
-            .orders()
-            .get_execution_step(input.execution.step_id)
-            .await
-            .map_err(activity_error_from_display)?;
-        let (operation, mut addresses) = provider_state_records(
-            &step,
-            &input.execution.provider_state,
-            &input.execution.response,
-        )
-        .map_err(activity_error_from_display)?;
-        if let Some(mut operation) = operation {
-            operation.status = receipt_boundary_status(operation.status);
-            let provider_operation_id = deps
+        record_activity("persist_provider_receipt", async move {
+            let deps = self.deps()?;
+            let step = deps
                 .db
                 .orders()
-                .upsert_provider_operation(&operation)
+                .get_execution_step(input.execution.step_id)
                 .await
                 .map_err(activity_error_from_display)?;
-            for address in &mut addresses {
-                address.provider_operation_id = Some(provider_operation_id);
-                deps.db
+            let (operation, mut addresses) = provider_state_records(
+                &step,
+                &input.execution.provider_state,
+                &input.execution.response,
+            )
+            .map_err(activity_error_from_display)?;
+            if let Some(mut operation) = operation {
+                operation.status = receipt_boundary_status(operation.status);
+                let provider_operation_id = deps
+                    .db
                     .orders()
-                    .upsert_provider_address(address)
+                    .upsert_provider_operation(&operation)
                     .await
                     .map_err(activity_error_from_display)?;
+                for address in &mut addresses {
+                    address.provider_operation_id = Some(provider_operation_id);
+                    deps.db
+                        .orders()
+                        .upsert_provider_address(address)
+                        .await
+                        .map_err(activity_error_from_display)?;
+                }
+                tracing::info!(
+                    order_id = %input.execution.order_id,
+                    provider_operation_id = %provider_operation_id,
+                    event_name = "provider_operation.persisted",
+                    "provider_operation.persisted"
+                );
             }
-            tracing::info!(
-                order_id = %input.execution.order_id,
-                provider_operation_id = %provider_operation_id,
-                event_name = "provider_operation.persisted",
-                "provider_operation.persisted"
-            );
-        }
-        Ok(BoundaryPersisted {
-            boundary: PersistenceBoundary::AfterProviderReceiptPersisted,
+            Ok(BoundaryPersisted {
+                boundary: PersistenceBoundary::AfterProviderReceiptPersisted,
+            })
         })
+        .await
     }
 
     /// Scar tissue: §2 boundary 5, `AfterProviderOperationStatusPersisted`.
@@ -607,43 +649,46 @@ impl OrderActivities {
         _ctx: ActivityContext,
         input: PersistProviderOperationStatusInput,
     ) -> Result<BoundaryPersisted, ActivityError> {
-        let deps = self.deps()?;
-        let step = deps
-            .db
-            .orders()
-            .get_execution_step(input.execution.step_id)
-            .await
+        record_activity("persist_provider_operation_status", async move {
+            let deps = self.deps()?;
+            let step = deps
+                .db
+                .orders()
+                .get_execution_step(input.execution.step_id)
+                .await
+                .map_err(activity_error_from_display)?;
+            let (operation, _) = provider_state_records(
+                &step,
+                &input.execution.provider_state,
+                &input.execution.response,
+            )
             .map_err(activity_error_from_display)?;
-        let (operation, _) = provider_state_records(
-            &step,
-            &input.execution.provider_state,
-            &input.execution.response,
-        )
-        .map_err(activity_error_from_display)?;
-        if let Some(operation) = operation {
-            let provider_operation_id = deps
-                .db
-                .orders()
-                .upsert_provider_operation(&operation)
-                .await
-                .map_err(activity_error_from_display)?;
-            let _ = deps
-                .db
-                .orders()
-                .update_provider_operation_status(
-                    provider_operation_id,
-                    operation.status,
-                    operation.provider_ref,
-                    operation.observed_state,
-                    Some(operation.response),
-                    Utc::now(),
-                )
-                .await
-                .map_err(activity_error_from_display)?;
-        }
-        Ok(BoundaryPersisted {
-            boundary: PersistenceBoundary::AfterProviderOperationStatusPersisted,
+            if let Some(operation) = operation {
+                let provider_operation_id = deps
+                    .db
+                    .orders()
+                    .upsert_provider_operation(&operation)
+                    .await
+                    .map_err(activity_error_from_display)?;
+                let _ = deps
+                    .db
+                    .orders()
+                    .update_provider_operation_status(
+                        provider_operation_id,
+                        operation.status,
+                        operation.provider_ref,
+                        operation.observed_state,
+                        Some(operation.response),
+                        Utc::now(),
+                    )
+                    .await
+                    .map_err(activity_error_from_display)?;
+            }
+            Ok(BoundaryPersisted {
+                boundary: PersistenceBoundary::AfterProviderOperationStatusPersisted,
+            })
         })
+        .await
     }
 
     /// Scar tissue: §2 boundary 6, `AfterProviderStepSettlement`.
@@ -653,37 +698,40 @@ impl OrderActivities {
         _ctx: ActivityContext,
         input: SettleProviderStepInput,
     ) -> Result<BoundaryPersisted, ActivityError> {
-        let deps = self.deps()?;
-        if input.execution.outcome == StepExecutionOutcome::Waiting {
-            settle_waiting_provider_step(&deps, &input.execution).await?;
-            return Ok(BoundaryPersisted {
+        record_activity("settle_provider_step", async move {
+            let deps = self.deps()?;
+            if input.execution.outcome == StepExecutionOutcome::Waiting {
+                settle_waiting_provider_step(&deps, &input.execution).await?;
+                return Ok(BoundaryPersisted {
+                    boundary: PersistenceBoundary::AfterProviderStepSettlement,
+                });
+            }
+            let record = deps
+                .db
+                .orders()
+                .persist_execution_step_completion(PersistStepCompletionRecord {
+                    step_id: input.execution.step_id,
+                    operation: None,
+                    addresses: Vec::new(),
+                    response: input.execution.response,
+                    tx_hash: input.execution.tx_hash,
+                    usd_valuation: json!({}),
+                    completed_at: Utc::now(),
+                })
+                .await
+                .map_err(activity_error_from_display)?;
+            tracing::info!(
+                order_id = %input.execution.order_id,
+                attempt_id = %input.execution.attempt_id,
+                step_id = %record.step.id,
+                event_name = "execution_step.completed",
+                "execution_step.completed"
+            );
+            Ok(BoundaryPersisted {
                 boundary: PersistenceBoundary::AfterProviderStepSettlement,
-            });
-        }
-        let record = deps
-            .db
-            .orders()
-            .persist_execution_step_completion(PersistStepCompletionRecord {
-                step_id: input.execution.step_id,
-                operation: None,
-                addresses: Vec::new(),
-                response: input.execution.response,
-                tx_hash: input.execution.tx_hash,
-                usd_valuation: json!({}),
-                completed_at: Utc::now(),
             })
-            .await
-            .map_err(activity_error_from_display)?;
-        tracing::info!(
-            order_id = %input.execution.order_id,
-            attempt_id = %input.execution.attempt_id,
-            step_id = %record.step.id,
-            event_name = "execution_step.completed",
-            "execution_step.completed"
-        );
-        Ok(BoundaryPersisted {
-            boundary: PersistenceBoundary::AfterProviderStepSettlement,
         })
+        .await
     }
 
     /// Scar tissue: §5 retry/refund decision and §7 stale quote branch.
@@ -693,6 +741,7 @@ impl OrderActivities {
         _ctx: ActivityContext,
         input: ClassifyStepFailureInput,
     ) -> Result<StepFailureDecision, ActivityError> {
+        record_activity("classify_step_failure", async move {
         let deps = self.deps()?;
         let attempt = deps
             .db
@@ -756,7 +805,14 @@ impl OrderActivities {
         } else {
             false
         };
+        if refreshed_attempt_count >= MAX_STALE_QUOTE_REFRESHES_PER_ORDER_EXECUTION
+            && matches!(order_quote, RouterOrderQuote::MarketOrder(_))
+            && attempt.attempt_kind != OrderExecutionAttemptKind::RefundRecovery
+        {
+            telemetry::record_stale_quote_refresh_cap_hit();
+        }
         let decision = if stale_quote_refresh_allowed {
+            telemetry::record_stale_quote_refresh("post_failure_detected");
             StepFailureDecision::RefreshQuote
         } else if attempt.attempt_index < MAX_EXECUTION_ATTEMPTS {
             StepFailureDecision::RetryNewAttempt
@@ -774,6 +830,8 @@ impl OrderActivities {
             "execution_step.failure_classified"
         );
         Ok(decision)
+        })
+        .await
     }
 
     /// Scar tissue: §7 stale quote refresh. This mirrors the legacy
@@ -785,137 +843,146 @@ impl OrderActivities {
         _ctx: ActivityContext,
         input: CheckPreExecutionStaleQuoteInput,
     ) -> Result<PreExecutionStaleQuoteCheck, ActivityError> {
-        let deps = self.deps()?;
-        let attempt = deps
-            .db
-            .orders()
-            .get_execution_attempt(input.attempt_id)
-            .await
-            .map_err(activity_error_from_display)?;
-        if attempt.order_id != input.order_id {
-            return Err(activity_error(format!(
-                "attempt {} does not belong to order {}",
-                attempt.id, input.order_id
-            )));
-        }
-        if attempt.status != OrderExecutionAttemptStatus::Active
-            || attempt.attempt_kind == OrderExecutionAttemptKind::RefundRecovery
-        {
-            return Ok(PreExecutionStaleQuoteCheck {
-                should_refresh: false,
-                reason: None,
+        record_activity("check_pre_execution_stale_quote", async move {
+            let deps = self.deps()?;
+            let attempt = deps
+                .db
+                .orders()
+                .get_execution_attempt(input.attempt_id)
+                .await
+                .map_err(activity_error_from_display)?;
+            if attempt.order_id != input.order_id {
+                return Err(activity_error(format!(
+                    "attempt {} does not belong to order {}",
+                    attempt.id, input.order_id
+                )));
+            }
+            if attempt.status != OrderExecutionAttemptStatus::Active
+                || attempt.attempt_kind == OrderExecutionAttemptKind::RefundRecovery
+            {
+                return Ok(PreExecutionStaleQuoteCheck {
+                    should_refresh: false,
+                    reason: None,
+                });
+            }
+            let order_quote = deps
+                .db
+                .orders()
+                .get_router_order_quote(input.order_id)
+                .await
+                .map_err(activity_error_from_display)?;
+            if !matches!(order_quote, RouterOrderQuote::MarketOrder(_)) {
+                return Ok(PreExecutionStaleQuoteCheck {
+                    should_refresh: false,
+                    reason: None,
+                });
+            }
+            let refreshed_attempt_count = deps
+                .db
+                .orders()
+                .get_execution_attempts(input.order_id)
+                .await
+                .map_err(activity_error_from_display)?
+                .into_iter()
+                .filter(|attempt| {
+                    attempt.attempt_kind == OrderExecutionAttemptKind::RefreshedExecution
+                })
+                .count();
+            if refreshed_attempt_count >= MAX_STALE_QUOTE_REFRESHES_PER_ORDER_EXECUTION {
+                telemetry::record_stale_quote_refresh_cap_hit();
+                return Ok(PreExecutionStaleQuoteCheck {
+                    should_refresh: false,
+                    reason: None,
+                });
+            }
+            let step = deps
+                .db
+                .orders()
+                .get_execution_step(input.step_id)
+                .await
+                .map_err(activity_error_from_display)?;
+            if step.order_id != input.order_id
+                || step.execution_attempt_id != Some(input.attempt_id)
+            {
+                return Err(activity_error(format!(
+                    "step {} does not belong to order {} attempt {}",
+                    step.id, input.order_id, input.attempt_id
+                )));
+            }
+            let has_provider_operation = deps
+                .db
+                .orders()
+                .get_provider_operations(input.order_id)
+                .await
+                .map_err(activity_error_from_display)?
+                .into_iter()
+                .any(|operation| operation.execution_step_id == Some(step.id));
+            let provider_side_effect_started = step
+                .details
+                .get("provider_side_effect_checkpoint")
+                .is_some()
+                || step.tx_hash.is_some()
+                || step.provider_ref.is_some()
+                || has_provider_operation;
+            if step.status != OrderExecutionStepStatus::Running || provider_side_effect_started {
+                return Ok(PreExecutionStaleQuoteCheck {
+                    should_refresh: false,
+                    reason: None,
+                });
+            }
+            let Some(leg_id) = step.execution_leg_id else {
+                return Ok(PreExecutionStaleQuoteCheck {
+                    should_refresh: false,
+                    reason: None,
+                });
+            };
+            let legs = deps
+                .db
+                .orders()
+                .get_execution_legs_for_attempt(input.attempt_id)
+                .await
+                .map_err(activity_error_from_display)?;
+            let Some(leg) = legs.into_iter().find(|leg| leg.id == leg_id) else {
+                return Ok(PreExecutionStaleQuoteCheck {
+                    should_refresh: false,
+                    reason: None,
+                });
+            };
+            let Some(provider_quote_expires_at) = leg.provider_quote_expires_at else {
+                return Ok(PreExecutionStaleQuoteCheck {
+                    should_refresh: false,
+                    reason: None,
+                });
+            };
+            if provider_quote_expires_at >= Utc::now() {
+                return Ok(PreExecutionStaleQuoteCheck {
+                    should_refresh: false,
+                    reason: None,
+                });
+            }
+            let reason = json!({
+                "reason": "pre_execution_stale_provider_quote",
+                "step_id": step.id,
+                "execution_leg_id": leg.id,
+                "provider_quote_expires_at": provider_quote_expires_at.to_rfc3339(),
+                "refreshed_attempt_count": refreshed_attempt_count,
             });
-        }
-        let order_quote = deps
-            .db
-            .orders()
-            .get_router_order_quote(input.order_id)
-            .await
-            .map_err(activity_error_from_display)?;
-        if !matches!(order_quote, RouterOrderQuote::MarketOrder(_)) {
-            return Ok(PreExecutionStaleQuoteCheck {
-                should_refresh: false,
-                reason: None,
-            });
-        }
-        let refreshed_attempt_count = deps
-            .db
-            .orders()
-            .get_execution_attempts(input.order_id)
-            .await
-            .map_err(activity_error_from_display)?
-            .into_iter()
-            .filter(|attempt| attempt.attempt_kind == OrderExecutionAttemptKind::RefreshedExecution)
-            .count();
-        if refreshed_attempt_count >= MAX_STALE_QUOTE_REFRESHES_PER_ORDER_EXECUTION {
-            return Ok(PreExecutionStaleQuoteCheck {
-                should_refresh: false,
-                reason: None,
-            });
-        }
-        let step = deps
-            .db
-            .orders()
-            .get_execution_step(input.step_id)
-            .await
-            .map_err(activity_error_from_display)?;
-        if step.order_id != input.order_id || step.execution_attempt_id != Some(input.attempt_id) {
-            return Err(activity_error(format!(
-                "step {} does not belong to order {} attempt {}",
-                step.id, input.order_id, input.attempt_id
-            )));
-        }
-        let has_provider_operation = deps
-            .db
-            .orders()
-            .get_provider_operations(input.order_id)
-            .await
-            .map_err(activity_error_from_display)?
-            .into_iter()
-            .any(|operation| operation.execution_step_id == Some(step.id));
-        let provider_side_effect_started = step
-            .details
-            .get("provider_side_effect_checkpoint")
-            .is_some()
-            || step.tx_hash.is_some()
-            || step.provider_ref.is_some()
-            || has_provider_operation;
-        if step.status != OrderExecutionStepStatus::Running || provider_side_effect_started {
-            return Ok(PreExecutionStaleQuoteCheck {
-                should_refresh: false,
-                reason: None,
-            });
-        }
-        let Some(leg_id) = step.execution_leg_id else {
-            return Ok(PreExecutionStaleQuoteCheck {
-                should_refresh: false,
-                reason: None,
-            });
-        };
-        let legs = deps
-            .db
-            .orders()
-            .get_execution_legs_for_attempt(input.attempt_id)
-            .await
-            .map_err(activity_error_from_display)?;
-        let Some(leg) = legs.into_iter().find(|leg| leg.id == leg_id) else {
-            return Ok(PreExecutionStaleQuoteCheck {
-                should_refresh: false,
-                reason: None,
-            });
-        };
-        let Some(provider_quote_expires_at) = leg.provider_quote_expires_at else {
-            return Ok(PreExecutionStaleQuoteCheck {
-                should_refresh: false,
-                reason: None,
-            });
-        };
-        if provider_quote_expires_at >= Utc::now() {
-            return Ok(PreExecutionStaleQuoteCheck {
-                should_refresh: false,
-                reason: None,
-            });
-        }
-        let reason = json!({
-            "reason": "pre_execution_stale_provider_quote",
-            "step_id": step.id,
-            "execution_leg_id": leg.id,
-            "provider_quote_expires_at": provider_quote_expires_at.to_rfc3339(),
-            "refreshed_attempt_count": refreshed_attempt_count,
-        });
-        tracing::info!(
-            order_id = %input.order_id,
-            attempt_id = %input.attempt_id,
-            step_id = %step.id,
-            execution_leg_id = %leg.id,
-            provider_quote_expires_at = %provider_quote_expires_at,
-            event_name = "execution_step.pre_execution_stale_quote_detected",
-            "execution_step.pre_execution_stale_quote_detected"
-        );
-        Ok(PreExecutionStaleQuoteCheck {
-            should_refresh: true,
-            reason: Some(reason),
+            tracing::info!(
+                order_id = %input.order_id,
+                attempt_id = %input.attempt_id,
+                step_id = %step.id,
+                execution_leg_id = %leg.id,
+                provider_quote_expires_at = %provider_quote_expires_at,
+                event_name = "execution_step.pre_execution_stale_quote_detected",
+                "execution_step.pre_execution_stale_quote_detected"
+            );
+            telemetry::record_stale_quote_refresh("pre_execution_detected");
+            Ok(PreExecutionStaleQuoteCheck {
+                should_refresh: true,
+                reason: Some(reason),
+            })
         })
+        .await
     }
 
     /// Scar tissue: §6 stale running step manual intervention.
@@ -925,8 +992,11 @@ impl OrderActivities {
         _ctx: ActivityContext,
         input: ClassifyStaleRunningStepInput,
     ) -> Result<StaleRunningStepClassified, ActivityError> {
-        let deps = self.deps()?;
-        classify_stale_running_step_for_deps(&deps, input).await
+        record_activity("classify_stale_running_step", async move {
+            let deps = self.deps()?;
+            classify_stale_running_step_for_deps(&deps, input).await
+        })
+        .await
     }
 
     /// Scar tissue: §15 failure snapshot.
@@ -936,81 +1006,84 @@ impl OrderActivities {
         _ctx: ActivityContext,
         input: WriteFailedAttemptSnapshotInput,
     ) -> Result<FailedAttemptSnapshotWritten, ActivityError> {
-        let deps = self.deps()?;
-        let order = deps
-            .db
-            .orders()
-            .get(input.order_id)
-            .await
-            .map_err(activity_error_from_display)?;
-        let failed_step = deps
-            .db
-            .orders()
-            .get_execution_step(input.failed_step_id)
-            .await
-            .map_err(activity_error_from_display)?;
-        if failed_step.order_id != input.order_id
-            || failed_step.execution_attempt_id != Some(input.attempt_id)
-        {
-            return Err(activity_error(format!(
-                "step {} does not belong to order {} attempt {}",
-                failed_step.id, input.order_id, input.attempt_id
-            )));
-        }
-        let trigger_provider_operation_id = deps
-            .db
-            .orders()
-            .get_provider_operations(input.order_id)
-            .await
-            .map_err(activity_error_from_display)?
-            .into_iter()
-            .filter(|operation| operation.execution_step_id == Some(failed_step.id))
-            .map(|operation| (operation.created_at, operation.id))
-            .max_by_key(|(created_at, _)| *created_at)
-            .map(|(_, id)| id);
-        let snapshot = failed_attempt_snapshot(&order, &failed_step);
-        let failure_reason = json!({
-            "reason": "execution_step_failed",
-            "step_id": failed_step.id,
-            "step_type": failed_step.step_type.to_db_string(),
-            "step_error": &failed_step.error,
-        });
-        let attempt = match deps
-            .db
-            .orders()
-            .mark_execution_attempt_failed(
-                input.attempt_id,
-                Some(failed_step.id),
-                trigger_provider_operation_id,
-                failure_reason,
-                snapshot,
-                Utc::now(),
-            )
-            .await
-        {
-            Ok(attempt) => attempt,
-            Err(RouterCoreError::NotFound) => {
-                let attempt = deps
-                    .db
-                    .orders()
-                    .get_execution_attempt(input.attempt_id)
-                    .await
-                    .map_err(activity_error_from_display)?;
-                if attempt.status != OrderExecutionAttemptStatus::Failed {
-                    return Err(activity_error(format!(
-                        "attempt {} was not active or failed while writing failure snapshot",
-                        input.attempt_id
-                    )));
-                }
-                attempt
+        record_activity("write_failed_attempt_snapshot", async move {
+            let deps = self.deps()?;
+            let order = deps
+                .db
+                .orders()
+                .get(input.order_id)
+                .await
+                .map_err(activity_error_from_display)?;
+            let failed_step = deps
+                .db
+                .orders()
+                .get_execution_step(input.failed_step_id)
+                .await
+                .map_err(activity_error_from_display)?;
+            if failed_step.order_id != input.order_id
+                || failed_step.execution_attempt_id != Some(input.attempt_id)
+            {
+                return Err(activity_error(format!(
+                    "step {} does not belong to order {} attempt {}",
+                    failed_step.id, input.order_id, input.attempt_id
+                )));
             }
-            Err(source) => return Err(activity_error_from_display(source)),
-        };
-        Ok(FailedAttemptSnapshotWritten {
-            attempt_id: attempt.id,
-            attempt_index: attempt.attempt_index,
-            failed_step_id: failed_step.id,
+            let trigger_provider_operation_id = deps
+                .db
+                .orders()
+                .get_provider_operations(input.order_id)
+                .await
+                .map_err(activity_error_from_display)?
+                .into_iter()
+                .filter(|operation| operation.execution_step_id == Some(failed_step.id))
+                .map(|operation| (operation.created_at, operation.id))
+                .max_by_key(|(created_at, _)| *created_at)
+                .map(|(_, id)| id);
+            let snapshot = failed_attempt_snapshot(&order, &failed_step);
+            let failure_reason = json!({
+                "reason": "execution_step_failed",
+                "step_id": failed_step.id,
+                "step_type": failed_step.step_type.to_db_string(),
+                "step_error": &failed_step.error,
+            });
+            let attempt = match deps
+                .db
+                .orders()
+                .mark_execution_attempt_failed(
+                    input.attempt_id,
+                    Some(failed_step.id),
+                    trigger_provider_operation_id,
+                    failure_reason,
+                    snapshot,
+                    Utc::now(),
+                )
+                .await
+            {
+                Ok(attempt) => attempt,
+                Err(RouterCoreError::NotFound) => {
+                    let attempt = deps
+                        .db
+                        .orders()
+                        .get_execution_attempt(input.attempt_id)
+                        .await
+                        .map_err(activity_error_from_display)?;
+                    if attempt.status != OrderExecutionAttemptStatus::Failed {
+                        return Err(activity_error(format!(
+                            "attempt {} was not active or failed while writing failure snapshot",
+                            input.attempt_id
+                        )));
+                    }
+                    attempt
+                }
+                Err(source) => return Err(activity_error_from_display(source)),
+            };
+            Ok(FailedAttemptSnapshotWritten {
+                attempt_id: attempt.id,
+                attempt_index: attempt.attempt_index,
+                failed_step_id: failed_step.id,
+            })
         })
+        .await
     }
 
     /// Scar tissue: §16.3 order finalisation and custody lifecycle.
@@ -1020,99 +1093,104 @@ impl OrderActivities {
         _ctx: ActivityContext,
         input: FinalizeOrderOrRefundInput,
     ) -> Result<FinalizedOrder, ActivityError> {
-        let deps = self.deps()?;
-        match input.terminal_status {
-            OrderTerminalStatus::RefundRequired => {
-                let order = deps
-                    .db
-                    .orders()
-                    .mark_order_refund_required(input.order_id, Utc::now())
-                    .await
-                    .map_err(activity_error_from_display)?;
-                tracing::info!(
-                    order_id = %order.id,
-                    event_name = "order.refund_required",
-                    "order.refund_required"
-                );
-                Ok(FinalizedOrder {
-                    order_id: order.id,
-                    terminal_status: OrderTerminalStatus::RefundRequired,
-                })
+        record_activity("finalize_order_or_refund", async move {
+            let deps = self.deps()?;
+            match input.terminal_status {
+                OrderTerminalStatus::RefundRequired => {
+                    let order = deps
+                        .db
+                        .orders()
+                        .mark_order_refund_required(input.order_id, Utc::now())
+                        .await
+                        .map_err(activity_error_from_display)?;
+                    tracing::info!(
+                        order_id = %order.id,
+                        event_name = "order.refund_required",
+                        "order.refund_required"
+                    );
+                    Ok(FinalizedOrder {
+                        order_id: order.id,
+                        terminal_status: OrderTerminalStatus::RefundRequired,
+                    })
+                }
+                OrderTerminalStatus::Refunded => {
+                    let attempt_id = input.attempt_id.ok_or_else(|| {
+                        activity_error("finalize refunded order requires a refund attempt id")
+                    })?;
+                    let completed = deps
+                        .db
+                        .orders()
+                        .mark_order_refunded(input.order_id, attempt_id, Utc::now())
+                        .await
+                        .map_err(activity_error_from_display)?;
+                    tracing::info!(
+                        order_id = %completed.order.id,
+                        attempt_id = %completed.attempt.id,
+                        event_name = "order.refunded",
+                        "order.refunded"
+                    );
+                    Ok(FinalizedOrder {
+                        order_id: completed.order.id,
+                        terminal_status: OrderTerminalStatus::Refunded,
+                    })
+                }
+                OrderTerminalStatus::RefundManualInterventionRequired => {
+                    let order = deps
+                        .db
+                        .orders()
+                        .mark_order_refund_manual_intervention_required(input.order_id, Utc::now())
+                        .await
+                        .map_err(activity_error_from_display)?;
+                    tracing::info!(
+                        order_id = %order.id,
+                        event_name = "order.refund_manual_intervention_required",
+                        "order.refund_manual_intervention_required"
+                    );
+                    Ok(FinalizedOrder {
+                        order_id: order.id,
+                        terminal_status: OrderTerminalStatus::RefundManualInterventionRequired,
+                    })
+                }
+                OrderTerminalStatus::ManualInterventionRequired => {
+                    let attempt_id = input.attempt_id.ok_or_else(|| {
+                        activity_error(
+                            "finalize manual intervention requires an execution attempt id",
+                        )
+                    })?;
+                    let step_id = input.step_id.ok_or_else(|| {
+                        activity_error("finalize manual intervention requires an execution step id")
+                    })?;
+                    let order = finalize_execution_manual_intervention(
+                        &deps,
+                        input.order_id,
+                        attempt_id,
+                        step_id,
+                        input.reason.unwrap_or_else(|| {
+                            json!({
+                                "reason": "execution_manual_intervention_required",
+                                "step_id": step_id,
+                            })
+                        }),
+                    )
+                    .await?;
+                    tracing::info!(
+                        order_id = %order.id,
+                        attempt_id = %attempt_id,
+                        step_id = %step_id,
+                        event_name = "order.execution_manual_intervention_required",
+                        "order.execution_manual_intervention_required"
+                    );
+                    Ok(FinalizedOrder {
+                        order_id: order.id,
+                        terminal_status: OrderTerminalStatus::ManualInterventionRequired,
+                    })
+                }
+                terminal_status => Err(activity_error(format!(
+                    "finalize_order_or_refund does not handle {terminal_status:?} in PR6a"
+                ))),
             }
-            OrderTerminalStatus::Refunded => {
-                let attempt_id = input.attempt_id.ok_or_else(|| {
-                    activity_error("finalize refunded order requires a refund attempt id")
-                })?;
-                let completed = deps
-                    .db
-                    .orders()
-                    .mark_order_refunded(input.order_id, attempt_id, Utc::now())
-                    .await
-                    .map_err(activity_error_from_display)?;
-                tracing::info!(
-                    order_id = %completed.order.id,
-                    attempt_id = %completed.attempt.id,
-                    event_name = "order.refunded",
-                    "order.refunded"
-                );
-                Ok(FinalizedOrder {
-                    order_id: completed.order.id,
-                    terminal_status: OrderTerminalStatus::Refunded,
-                })
-            }
-            OrderTerminalStatus::RefundManualInterventionRequired => {
-                let order = deps
-                    .db
-                    .orders()
-                    .mark_order_refund_manual_intervention_required(input.order_id, Utc::now())
-                    .await
-                    .map_err(activity_error_from_display)?;
-                tracing::info!(
-                    order_id = %order.id,
-                    event_name = "order.refund_manual_intervention_required",
-                    "order.refund_manual_intervention_required"
-                );
-                Ok(FinalizedOrder {
-                    order_id: order.id,
-                    terminal_status: OrderTerminalStatus::RefundManualInterventionRequired,
-                })
-            }
-            OrderTerminalStatus::ManualInterventionRequired => {
-                let attempt_id = input.attempt_id.ok_or_else(|| {
-                    activity_error("finalize manual intervention requires an execution attempt id")
-                })?;
-                let step_id = input.step_id.ok_or_else(|| {
-                    activity_error("finalize manual intervention requires an execution step id")
-                })?;
-                let order = finalize_execution_manual_intervention(
-                    &deps,
-                    input.order_id,
-                    attempt_id,
-                    step_id,
-                    input.reason.unwrap_or_else(|| {
-                        json!({
-                            "reason": "execution_manual_intervention_required",
-                            "step_id": step_id,
-                        })
-                    }),
-                )
-                .await?;
-                tracing::info!(
-                    order_id = %order.id,
-                    attempt_id = %attempt_id,
-                    step_id = %step_id,
-                    event_name = "order.execution_manual_intervention_required",
-                    "order.execution_manual_intervention_required"
-                );
-                Ok(FinalizedOrder {
-                    order_id: order.id,
-                    terminal_status: OrderTerminalStatus::ManualInterventionRequired,
-                })
-            }
-            terminal_status => Err(activity_error(format!(
-                "finalize_order_or_refund does not handle {terminal_status:?} in PR6a"
-            ))),
-        }
+        })
+        .await
     }
 
     /// Operator-driven release from the root ManualInterventionRequired wait-state.
@@ -1122,37 +1200,40 @@ impl OrderActivities {
         _ctx: ActivityContext,
         input: PrepareManualInterventionRetryInput,
     ) -> Result<FinalizedOrder, ActivityError> {
-        let deps = self.deps()?;
-        let resolution = json!({
-            "kind": "manual_intervention_resolution",
-            "action": "release",
-            "reason": input.signal.reason,
-            "operator_id": input.signal.operator_id,
-            "requested_at": input.signal.requested_at,
-        });
-        let order = deps
-            .db
-            .orders()
-            .prepare_manual_intervention_retry(
-                input.order_id,
-                input.attempt_id,
-                input.step_id,
-                resolution,
-                Utc::now(),
-            )
-            .await
-            .map_err(activity_error_from_display)?;
-        tracing::info!(
-            order_id = %order.id,
-            attempt_id = %input.attempt_id,
-            step_id = %input.step_id,
-            event_name = "order.manual_intervention_released",
-            "order.manual_intervention_released"
-        );
-        Ok(FinalizedOrder {
-            order_id: order.id,
-            terminal_status: OrderTerminalStatus::ManualInterventionRequired,
+        record_activity("prepare_manual_intervention_retry", async move {
+            let deps = self.deps()?;
+            let resolution = json!({
+                "kind": "manual_intervention_resolution",
+                "action": "release",
+                "reason": input.signal.reason,
+                "operator_id": input.signal.operator_id,
+                "requested_at": input.signal.requested_at,
+            });
+            let order = deps
+                .db
+                .orders()
+                .prepare_manual_intervention_retry(
+                    input.order_id,
+                    input.attempt_id,
+                    input.step_id,
+                    resolution,
+                    Utc::now(),
+                )
+                .await
+                .map_err(activity_error_from_display)?;
+            tracing::info!(
+                order_id = %order.id,
+                attempt_id = %input.attempt_id,
+                step_id = %input.step_id,
+                event_name = "order.manual_intervention_released",
+                "order.manual_intervention_released"
+            );
+            Ok(FinalizedOrder {
+                order_id: order.id,
+                terminal_status: OrderTerminalStatus::ManualInterventionRequired,
+            })
         })
+        .await
     }
 
     /// Operator-driven refund trigger from the root ManualInterventionRequired wait-state.
@@ -1162,38 +1243,41 @@ impl OrderActivities {
         _ctx: ActivityContext,
         input: PrepareManualInterventionRefundInput,
     ) -> Result<FinalizedOrder, ActivityError> {
-        let deps = self.deps()?;
-        let resolution = json!({
-            "kind": "manual_intervention_resolution",
-            "action": "trigger_refund",
-            "reason": input.signal.reason,
-            "operator_id": input.signal.operator_id,
-            "requested_at": input.signal.requested_at,
-            "refund_kind_hint": input.signal.refund_kind_hint,
-        });
-        let order = deps
-            .db
-            .orders()
-            .prepare_manual_intervention_refund(
-                input.order_id,
-                input.attempt_id,
-                input.step_id,
-                resolution,
-                Utc::now(),
-            )
-            .await
-            .map_err(activity_error_from_display)?;
-        tracing::info!(
-            order_id = %order.id,
-            attempt_id = %input.attempt_id,
-            step_id = %input.step_id,
-            event_name = "order.manual_intervention_refund_triggered",
-            "order.manual_intervention_refund_triggered"
-        );
-        Ok(FinalizedOrder {
-            order_id: order.id,
-            terminal_status: OrderTerminalStatus::RefundRequired,
+        record_activity("prepare_manual_intervention_refund", async move {
+            let deps = self.deps()?;
+            let resolution = json!({
+                "kind": "manual_intervention_resolution",
+                "action": "trigger_refund",
+                "reason": input.signal.reason,
+                "operator_id": input.signal.operator_id,
+                "requested_at": input.signal.requested_at,
+                "refund_kind_hint": input.signal.refund_kind_hint,
+            });
+            let order = deps
+                .db
+                .orders()
+                .prepare_manual_intervention_refund(
+                    input.order_id,
+                    input.attempt_id,
+                    input.step_id,
+                    resolution,
+                    Utc::now(),
+                )
+                .await
+                .map_err(activity_error_from_display)?;
+            tracing::info!(
+                order_id = %order.id,
+                attempt_id = %input.attempt_id,
+                step_id = %input.step_id,
+                event_name = "order.manual_intervention_refund_triggered",
+                "order.manual_intervention_refund_triggered"
+            );
+            Ok(FinalizedOrder {
+                order_id: order.id,
+                terminal_status: OrderTerminalStatus::RefundRequired,
+            })
         })
+        .await
     }
 
     /// Operator-driven release from RefundManualInterventionRequired.
@@ -1203,40 +1287,43 @@ impl OrderActivities {
         _ctx: ActivityContext,
         input: ReleaseRefundManualInterventionInput,
     ) -> Result<FinalizedOrder, ActivityError> {
-        let deps = self.deps()?;
-        let resolution = json!({
-            "kind": "manual_intervention_resolution",
-            "action": match input.signal_kind {
-                super::types::ManualResolutionSignalKind::Release => "release",
-                super::types::ManualResolutionSignalKind::TriggerRefund => "trigger_refund",
-            },
-            "reason": input.reason,
-            "operator_id": input.operator_id,
-            "requested_at": input.requested_at,
-        });
-        let order = deps
-            .db
-            .orders()
-            .release_refund_manual_intervention(
-                input.order_id,
-                input.refund_attempt_id,
-                input.step_id,
-                resolution,
-                Utc::now(),
-            )
-            .await
-            .map_err(activity_error_from_display)?;
-        tracing::info!(
-            order_id = %order.id,
-            refund_attempt_id = ?input.refund_attempt_id,
-            step_id = ?input.step_id,
-            event_name = "order.refund_manual_intervention_released",
-            "order.refund_manual_intervention_released"
-        );
-        Ok(FinalizedOrder {
-            order_id: order.id,
-            terminal_status: OrderTerminalStatus::RefundManualInterventionRequired,
+        record_activity("release_refund_manual_intervention", async move {
+            let deps = self.deps()?;
+            let resolution = json!({
+                "kind": "manual_intervention_resolution",
+                "action": match input.signal_kind {
+                    super::types::ManualResolutionSignalKind::Release => "release",
+                    super::types::ManualResolutionSignalKind::TriggerRefund => "trigger_refund",
+                },
+                "reason": input.reason,
+                "operator_id": input.operator_id,
+                "requested_at": input.requested_at,
+            });
+            let order = deps
+                .db
+                .orders()
+                .release_refund_manual_intervention(
+                    input.order_id,
+                    input.refund_attempt_id,
+                    input.step_id,
+                    resolution,
+                    Utc::now(),
+                )
+                .await
+                .map_err(activity_error_from_display)?;
+            tracing::info!(
+                order_id = %order.id,
+                refund_attempt_id = ?input.refund_attempt_id,
+                step_id = ?input.step_id,
+                event_name = "order.refund_manual_intervention_released",
+                "order.refund_manual_intervention_released"
+            );
+            Ok(FinalizedOrder {
+                order_id: order.id,
+                terminal_status: OrderTerminalStatus::RefundManualInterventionRequired,
+            })
         })
+        .await
     }
 
     /// Acknowledges manual intervention as a true terminal state.
@@ -1246,47 +1333,50 @@ impl OrderActivities {
         _ctx: ActivityContext,
         input: AcknowledgeManualInterventionInput,
     ) -> Result<FinalizedOrder, ActivityError> {
-        let deps = self.deps()?;
-        let terminal_status = if input.refund_manual {
-            OrderTerminalStatus::RefundManualInterventionRequired
-        } else {
-            OrderTerminalStatus::ManualInterventionRequired
-        };
-        let resolution = json!({
-            "kind": "manual_intervention_terminal_ack",
-            "action": if input.zombie_cleanup {
-                "zombie_cleanup"
+        record_activity("acknowledge_manual_intervention_terminal", async move {
+            let deps = self.deps()?;
+            let terminal_status = if input.refund_manual {
+                OrderTerminalStatus::RefundManualInterventionRequired
             } else {
-                "acknowledge_unrecoverable"
-            },
-            "reason": input.signal.reason,
-            "operator_id": input.signal.operator_id,
-            "requested_at": input.signal.requested_at,
-        });
-        let order = deps
-            .db
-            .orders()
-            .acknowledge_manual_intervention_terminal(
-                input.order_id,
-                input.attempt_id,
-                input.step_id,
-                input.refund_manual,
-                resolution,
-                Utc::now(),
-            )
-            .await
-            .map_err(activity_error_from_display)?;
-        tracing::info!(
-            order_id = %order.id,
-            terminal_status = ?terminal_status,
-            zombie_cleanup = input.zombie_cleanup,
-            event_name = "order.manual_intervention_terminal_acknowledged",
-            "order.manual_intervention_terminal_acknowledged"
-        );
-        Ok(FinalizedOrder {
-            order_id: order.id,
-            terminal_status,
+                OrderTerminalStatus::ManualInterventionRequired
+            };
+            let resolution = json!({
+                "kind": "manual_intervention_terminal_ack",
+                "action": if input.zombie_cleanup {
+                    "zombie_cleanup"
+                } else {
+                    "acknowledge_unrecoverable"
+                },
+                "reason": input.signal.reason,
+                "operator_id": input.signal.operator_id,
+                "requested_at": input.signal.requested_at,
+            });
+            let order = deps
+                .db
+                .orders()
+                .acknowledge_manual_intervention_terminal(
+                    input.order_id,
+                    input.attempt_id,
+                    input.step_id,
+                    input.refund_manual,
+                    resolution,
+                    Utc::now(),
+                )
+                .await
+                .map_err(activity_error_from_display)?;
+            tracing::info!(
+                order_id = %order.id,
+                terminal_status = ?terminal_status,
+                zombie_cleanup = input.zombie_cleanup,
+                event_name = "order.manual_intervention_terminal_acknowledged",
+                "order.manual_intervention_terminal_acknowledged"
+            );
+            Ok(FinalizedOrder {
+                order_id: order.id,
+                terminal_status,
+            })
         })
+        .await
     }
 }
 
@@ -3521,6 +3611,7 @@ impl RefundActivities {
         _ctx: ActivityContext,
         input: DiscoverSingleRefundPositionInput,
     ) -> Result<SingleRefundPositionDiscovery, ActivityError> {
+        record_activity("discover_single_refund_position", async move {
         let deps = self.deps()?;
         let failed_attempt = deps
             .db
@@ -3657,6 +3748,8 @@ impl RefundActivities {
             positions.len(),
             positions.len(),
         ))
+        })
+        .await
     }
 
     /// Scar tissue: §9 refund tree and §16.1 refund materialisation.
@@ -3666,87 +3759,91 @@ impl RefundActivities {
         _ctx: ActivityContext,
         input: MaterializeRefundPlanInput,
     ) -> Result<RefundPlanShape, ActivityError> {
-        let deps = self.deps()?;
-        if input.position.position_kind == RecoverablePositionKind::ExternalCustody {
-            return materialize_external_custody_refund_plan(&deps, input).await;
-        }
-        if input.position.position_kind == RecoverablePositionKind::HyperliquidSpot {
-            return materialize_hyperliquid_spot_refund_plan(&deps, input).await;
-        }
-        let order = deps
-            .db
-            .orders()
-            .get(input.order_id)
-            .await
-            .map_err(activity_error_from_display)?;
-        let Some(funding_vault_id) = order.funding_vault_id else {
-            return Ok(refund_plan_untenable(
-                RefundUntenableReason::RefundRecoverablePositionDisappearedAfterValidation,
-            ));
-        };
-        let vault = match deps.db.vaults().get(funding_vault_id).await {
-            Ok(vault) => vault,
-            Err(RouterCoreError::NotFound) => {
+        record_activity("materialize_refund_plan", async move {
+            let deps = self.deps()?;
+            if input.position.position_kind == RecoverablePositionKind::ExternalCustody {
+                return materialize_external_custody_refund_plan(&deps, input).await;
+            }
+            if input.position.position_kind == RecoverablePositionKind::HyperliquidSpot {
+                return materialize_hyperliquid_spot_refund_plan(&deps, input).await;
+            }
+            let order = deps
+                .db
+                .orders()
+                .get(input.order_id)
+                .await
+                .map_err(activity_error_from_display)?;
+            let Some(funding_vault_id) = order.funding_vault_id else {
+                return Ok(refund_plan_untenable(
+                    RefundUntenableReason::RefundRecoverablePositionDisappearedAfterValidation,
+                ));
+            };
+            let vault = match deps.db.vaults().get(funding_vault_id).await {
+                Ok(vault) => vault,
+                Err(RouterCoreError::NotFound) => {
+                    return Ok(refund_plan_untenable(
+                        RefundUntenableReason::RefundRecoverablePositionDisappearedAfterValidation,
+                    ));
+                }
+                Err(source) => return Err(activity_error_from_display(source)),
+            };
+            let amount = deps
+                .custody_action_executor
+                .deposit_vault_balance_raw(&vault)
+                .await
+                .map_err(activity_error_from_display)?;
+            if !raw_amount_is_positive(&amount, "funding vault refund balance")? {
                 return Ok(refund_plan_untenable(
                     RefundUntenableReason::RefundRecoverablePositionDisappearedAfterValidation,
                 ));
             }
-            Err(source) => return Err(activity_error_from_display(source)),
-        };
-        let amount = deps
-            .custody_action_executor
-            .deposit_vault_balance_raw(&vault)
-            .await
-            .map_err(activity_error_from_display)?;
-        if !raw_amount_is_positive(&amount, "funding vault refund balance")? {
-            return Ok(refund_plan_untenable(
-                RefundUntenableReason::RefundRecoverablePositionDisappearedAfterValidation,
-            ));
-        }
-        let record = deps
-            .db
-            .orders()
-            .create_refund_attempt_from_funding_vault(
-                input.order_id,
-                input.failed_attempt_id,
-                FundingVaultRefundAttemptPlan {
-                    funding_vault_id,
-                    amount,
-                    failure_reason: json!({
-                        "reason": "primary_execution_attempts_exhausted",
-                        "trace": "refund_workflow",
-                        "failed_attempt_id": input.failed_attempt_id,
-                    }),
-                    input_custody_snapshot: json!({
-                        "schema_version": 1,
-                        "source_kind": "funding_vault",
-                        "funding_vault_id": funding_vault_id,
-                    }),
+            let record = deps
+                .db
+                .orders()
+                .create_refund_attempt_from_funding_vault(
+                    input.order_id,
+                    input.failed_attempt_id,
+                    FundingVaultRefundAttemptPlan {
+                        funding_vault_id,
+                        amount,
+                        failure_reason: json!({
+                            "reason": "primary_execution_attempts_exhausted",
+                            "trace": "refund_workflow",
+                            "failed_attempt_id": input.failed_attempt_id,
+                        }),
+                        input_custody_snapshot: json!({
+                            "schema_version": 1,
+                            "source_kind": "funding_vault",
+                            "funding_vault_id": funding_vault_id,
+                        }),
+                    },
+                    Utc::now(),
+                )
+                .await
+                .map_err(activity_error_from_display)?;
+            tracing::info!(
+                order_id = %record.order.id,
+                attempt_id = %record.attempt.id,
+                step_count = record.steps.len(),
+                event_name = "order.refund_plan_materialized",
+                "order.refund_plan_materialized"
+            );
+            telemetry::record_refund_attempt_materialized("funding_vault", "direct_internal");
+            Ok(RefundPlanShape {
+                outcome: RefundPlanOutcome::Materialized {
+                    refund_attempt_id: record.attempt.id,
+                    steps: record
+                        .steps
+                        .into_iter()
+                        .map(|step| WorkflowExecutionStep {
+                            step_id: step.id,
+                            step_index: step.step_index,
+                        })
+                        .collect(),
                 },
-                Utc::now(),
-            )
-            .await
-            .map_err(activity_error_from_display)?;
-        tracing::info!(
-            order_id = %record.order.id,
-            attempt_id = %record.attempt.id,
-            step_count = record.steps.len(),
-            event_name = "order.refund_plan_materialized",
-            "order.refund_plan_materialized"
-        );
-        Ok(RefundPlanShape {
-            outcome: RefundPlanOutcome::Materialized {
-                refund_attempt_id: record.attempt.id,
-                steps: record
-                    .steps
-                    .into_iter()
-                    .map(|step| WorkflowExecutionStep {
-                        step_id: step.id,
-                        step_index: step.step_index,
-                    })
-                    .collect(),
-            },
+            })
         })
+        .await
     }
 }
 
@@ -3754,6 +3851,13 @@ fn refund_single_position_untenable(
     position_count: usize,
     recoverable_position_count: usize,
 ) -> SingleRefundPositionDiscovery {
+    telemetry::record_refund_position_untenable(
+        RefundUntenableReason::RefundRequiresSingleRecoverablePosition {
+            position_count,
+            recoverable_position_count,
+        }
+        .reason_str(),
+    );
     SingleRefundPositionDiscovery {
         outcome: SingleRefundPositionOutcome::Untenable {
             reason: RefundUntenableReason::RefundRequiresSingleRecoverablePosition {
@@ -3765,8 +3869,17 @@ fn refund_single_position_untenable(
 }
 
 fn refund_plan_untenable(reason: RefundUntenableReason) -> RefundPlanShape {
+    telemetry::record_refund_position_untenable(reason.reason_str());
     RefundPlanShape {
         outcome: RefundPlanOutcome::Untenable { reason },
+    }
+}
+
+fn recoverable_position_kind_label(position_kind: RecoverablePositionKind) -> &'static str {
+    match position_kind {
+        RecoverablePositionKind::FundingVault => "funding_vault",
+        RecoverablePositionKind::ExternalCustody => "external_custody",
+        RecoverablePositionKind::HyperliquidSpot => "hyperliquid_spot",
     }
 }
 
@@ -3841,6 +3954,11 @@ async fn materialize_external_custody_refund_plan(
             RefundUntenableReason::RefundRecoverablePositionDisappearedAfterValidation,
         ));
     };
+    let first_transition_kind = legs
+        .first()
+        .and_then(|leg| leg.transition_decl_id.as_deref())
+        .unwrap_or("direct_internal")
+        .to_string();
     steps = hydrate_destination_execution_steps(deps, input.order_id, steps).await?;
     let record = deps
         .db
@@ -3879,6 +3997,10 @@ async fn materialize_external_custody_refund_plan(
         step_count = record.steps.len(),
         event_name = "order.refund_plan_materialized",
         "order.refund_plan_materialized"
+    );
+    telemetry::record_refund_attempt_materialized(
+        recoverable_position_kind_label(input.position.position_kind),
+        &first_transition_kind,
     );
     Ok(RefundPlanShape {
         outcome: RefundPlanOutcome::Materialized {
@@ -3967,6 +4089,11 @@ async fn materialize_hyperliquid_spot_refund_plan(
             RefundUntenableReason::RefundRecoverablePositionDisappearedAfterValidation,
         ));
     };
+    let first_transition_kind = legs
+        .first()
+        .and_then(|leg| leg.transition_decl_id.as_deref())
+        .unwrap_or("unknown")
+        .to_string();
     let record = deps
         .db
         .orders()
@@ -4005,6 +4132,10 @@ async fn materialize_hyperliquid_spot_refund_plan(
         step_count = record.steps.len(),
         event_name = "order.refund_plan_materialized",
         "order.refund_plan_materialized"
+    );
+    telemetry::record_refund_attempt_materialized(
+        recoverable_position_kind_label(input.position.position_kind),
+        &first_transition_kind,
     );
     Ok(RefundPlanShape {
         outcome: RefundPlanOutcome::Materialized {
@@ -6699,6 +6830,7 @@ impl QuoteRefreshActivities {
         _ctx: ActivityContext,
         input: ComposeRefreshedQuoteAttemptInput,
     ) -> Result<RefreshedQuoteAttemptShape, ActivityError> {
+        record_activity("compose_refreshed_quote_attempt", async move {
         let deps = self.deps()?;
         let order = deps
             .db
@@ -7484,7 +7616,7 @@ impl QuoteRefreshActivities {
             );
         }
 
-        Ok(RefreshedQuoteAttemptShape {
+        let refreshed_shape = RefreshedQuoteAttemptShape {
             outcome: RefreshedQuoteAttemptOutcome::Refreshed {
                 order_id: input.order_id,
                 stale_attempt_id: input.stale_attempt_id,
@@ -7518,7 +7650,11 @@ impl QuoteRefreshActivities {
                 }),
                 input_custody_snapshot: failed_attempt_snapshot(&order, &failed_step),
             },
+        };
+        telemetry::record_stale_quote_refresh("attempt_composed");
+        Ok(refreshed_shape)
         })
+        .await
     }
 
     /// Scar tissue: §7 stale quote refresh and §16.4 refresh helpers.
@@ -7528,65 +7664,70 @@ impl QuoteRefreshActivities {
         _ctx: ActivityContext,
         input: MaterializeRefreshedAttemptInput,
     ) -> Result<RefreshedAttemptMaterialized, ActivityError> {
-        let deps = self.deps()?;
-        let RefreshedQuoteAttemptOutcome::Refreshed {
-            order_id,
-            stale_attempt_id,
-            failed_step_id,
-            mut plan,
-            failure_reason,
-            superseded_reason,
-            input_custody_snapshot,
-        } = input.refreshed_attempt.outcome
-        else {
-            return Err(activity_error(
-                "untenable stale quote refresh must not be materialized",
-            ));
-        };
-        if order_id != input.order_id {
-            return Err(activity_error(format!(
-                "refreshed attempt order {} does not match materialize input order {}",
-                order_id, input.order_id
-            )));
-        }
-        plan.steps = hydrate_destination_execution_steps(&deps, input.order_id, plan.steps).await?;
-        let record = deps
-            .db
-            .orders()
-            .create_refreshed_execution_attempt_from_failed_step(
+        record_activity("materialize_refreshed_attempt", async move {
+            let deps = self.deps()?;
+            let RefreshedQuoteAttemptOutcome::Refreshed {
                 order_id,
                 stale_attempt_id,
                 failed_step_id,
-                RefreshedExecutionAttemptPlan {
-                    legs: plan.legs,
-                    steps: plan.steps,
-                    failure_reason,
-                    superseded_reason,
-                    input_custody_snapshot,
-                },
-                Utc::now(),
-            )
-            .await
-            .map_err(activity_error_from_display)?;
-        tracing::info!(
-            order_id = %record.order.id,
-            attempt_id = %record.attempt.id,
-            stale_attempt_id = %stale_attempt_id,
-            failed_step_id = %failed_step_id,
-            event_name = "order.execution_quote_refreshed",
-            "order.execution_quote_refreshed"
-        );
-        Ok(RefreshedAttemptMaterialized {
-            attempt_id: record.attempt.id,
-            steps: record
-                .steps
-                .into_iter()
-                .map(|step| WorkflowExecutionStep {
-                    step_id: step.id,
-                    step_index: step.step_index,
-                })
-                .collect(),
+                mut plan,
+                failure_reason,
+                superseded_reason,
+                input_custody_snapshot,
+            } = input.refreshed_attempt.outcome
+            else {
+                return Err(activity_error(
+                    "untenable stale quote refresh must not be materialized",
+                ));
+            };
+            if order_id != input.order_id {
+                return Err(activity_error(format!(
+                    "refreshed attempt order {} does not match materialize input order {}",
+                    order_id, input.order_id
+                )));
+            }
+            plan.steps =
+                hydrate_destination_execution_steps(&deps, input.order_id, plan.steps).await?;
+            let record = deps
+                .db
+                .orders()
+                .create_refreshed_execution_attempt_from_failed_step(
+                    order_id,
+                    stale_attempt_id,
+                    failed_step_id,
+                    RefreshedExecutionAttemptPlan {
+                        legs: plan.legs,
+                        steps: plan.steps,
+                        failure_reason,
+                        superseded_reason,
+                        input_custody_snapshot,
+                    },
+                    Utc::now(),
+                )
+                .await
+                .map_err(activity_error_from_display)?;
+            tracing::info!(
+                order_id = %record.order.id,
+                attempt_id = %record.attempt.id,
+                stale_attempt_id = %stale_attempt_id,
+                failed_step_id = %failed_step_id,
+                event_name = "order.execution_quote_refreshed",
+                "order.execution_quote_refreshed"
+            );
+            telemetry::record_stale_quote_refresh("attempt_materialized");
+            Ok(RefreshedAttemptMaterialized {
+                attempt_id: record.attempt.id,
+                steps: record
+                    .steps
+                    .into_iter()
+                    .map(|step| WorkflowExecutionStep {
+                        step_id: step.id,
+                        step_index: step.step_index,
+                    })
+                    .collect(),
+            })
         })
+        .await
     }
 }
 
@@ -7619,28 +7760,31 @@ impl ProviderObservationActivities {
         _ctx: ActivityContext,
         input: VerifyProviderOperationHintInput,
     ) -> Result<ProviderOperationHintVerified, ActivityError> {
-        match input.signal.hint_kind {
-            ProviderHintKind::AcrossFill => {
-                let deps = self.deps()?;
-                verify_across_fill_hint(&deps, input).await
+        record_activity("verify_provider_operation_hint", async move {
+            match input.signal.hint_kind {
+                ProviderHintKind::AcrossFill => {
+                    let deps = self.deps()?;
+                    verify_across_fill_hint(&deps, input).await
+                }
+                ProviderHintKind::CctpAttestation => {
+                    let deps = self.deps()?;
+                    verify_cctp_attestation_hint(&deps, input).await
+                }
+                ProviderHintKind::UnitDeposit => {
+                    let deps = self.deps()?;
+                    verify_unit_deposit_hint(&deps, input).await
+                }
+                ProviderHintKind::ProviderObservation => {
+                    let deps = self.deps()?;
+                    verify_provider_observation_hint(&deps, input).await
+                }
+                ProviderHintKind::HyperliquidTrade => {
+                    let deps = self.deps()?;
+                    verify_hyperliquid_trade_hint(&deps, input).await
+                }
             }
-            ProviderHintKind::CctpAttestation => {
-                let deps = self.deps()?;
-                verify_cctp_attestation_hint(&deps, input).await
-            }
-            ProviderHintKind::UnitDeposit => {
-                let deps = self.deps()?;
-                verify_unit_deposit_hint(&deps, input).await
-            }
-            ProviderHintKind::ProviderObservation => {
-                let deps = self.deps()?;
-                verify_provider_observation_hint(&deps, input).await
-            }
-            ProviderHintKind::HyperliquidTrade => {
-                let deps = self.deps()?;
-                verify_hyperliquid_trade_hint(&deps, input).await
-            }
-        }
+        })
+        .await
     }
 
     /// Scar tissue: §10 provider hint recovery. This is the polling half of the user-approved
@@ -7651,8 +7795,11 @@ impl ProviderObservationActivities {
         _ctx: ActivityContext,
         input: PollProviderOperationHintsInput,
     ) -> Result<ProviderOperationHintsPolled, ActivityError> {
-        let deps = self.deps()?;
-        poll_provider_operation_hint_for_step(&deps, input).await
+        record_activity("poll_provider_operation_hints", async move {
+            let deps = self.deps()?;
+            poll_provider_operation_hint_for_step(&deps, input).await
+        })
+        .await
     }
 
     /// Scar tissue: §11 Across on-chain log recovery.
@@ -7662,35 +7809,38 @@ impl ProviderObservationActivities {
         _ctx: ActivityContext,
         input: RecoverAcrossOnchainLogInput,
     ) -> Result<AcrossOnchainLogRecovered, ActivityError> {
-        let deps = self.deps()?;
-        let operation = deps
-            .db
-            .orders()
-            .get_provider_operation(input.provider_operation_id)
-            .await
-            .map_err(activity_error_from_display)?;
-        if operation.order_id != input.order_id {
-            return Err(activity_error(format!(
-                "provider operation {} belongs to order {}, not {}",
-                operation.id, operation.order_id, input.order_id
-            )));
-        }
+        record_activity("recover_across_onchain_log", async move {
+            let deps = self.deps()?;
+            let operation = deps
+                .db
+                .orders()
+                .get_provider_operation(input.provider_operation_id)
+                .await
+                .map_err(activity_error_from_display)?;
+            if operation.order_id != input.order_id {
+                return Err(activity_error(format!(
+                    "provider operation {} belongs to order {}, not {}",
+                    operation.id, operation.order_id, input.order_id
+                )));
+            }
 
-        let recovered = recover_across_operation_from_checkpoint(&deps, operation).await?;
-        if recovered
-            .as_ref()
-            .and_then(|operation| operation.provider_ref.as_deref())
-            .is_some_and(is_decimal_u256)
-        {
-            Ok(AcrossOnchainLogRecovered {
-                provider_operation_id: input.provider_operation_id,
-            })
-        } else {
-            Err(activity_error(format!(
-                "Across provider operation {} has no recoverable deposit log yet",
-                input.provider_operation_id
-            )))
-        }
+            let recovered = recover_across_operation_from_checkpoint(&deps, operation).await?;
+            if recovered
+                .as_ref()
+                .and_then(|operation| operation.provider_ref.as_deref())
+                .is_some_and(is_decimal_u256)
+            {
+                Ok(AcrossOnchainLogRecovered {
+                    provider_operation_id: input.provider_operation_id,
+                })
+            } else {
+                Err(activity_error(format!(
+                    "Across provider operation {} has no recoverable deposit log yet",
+                    input.provider_operation_id
+                )))
+            }
+        })
+        .await
     }
 
     /// Scar tissue: §12 Hyperliquid trade timeout cancel.
@@ -7699,7 +7849,10 @@ impl ProviderObservationActivities {
         _ctx: ActivityContext,
         _input: CancelTimedOutHyperliquidTradeInput,
     ) -> Result<HyperliquidTradeCancelRecorded, ActivityError> {
-        todo!("PR4: cancel timed-out Hyperliquid trade")
+        record_activity("cancel_timed_out_hyperliquid_trade", async move {
+            todo!("PR4: cancel timed-out Hyperliquid trade")
+        })
+        .await
     }
 }
 
@@ -9308,7 +9461,10 @@ impl StepDispatchActivities {
         _ctx: ActivityContext,
         _input: DispatchStepProviderActionInput,
     ) -> Result<ProviderActionDispatchShape, ActivityError> {
-        todo!("PR7: dispatch provider action for the active step")
+        record_activity("dispatch_step_provider_action", async move {
+            todo!("PR7: dispatch provider action for the active step")
+        })
+        .await
     }
 }
 

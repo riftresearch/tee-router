@@ -476,7 +476,10 @@ services:
         DB_USER="$$(tr -d '\n\r' < /run/postgres-secrets/app_user.txt)"
         DB_PASS="$$(tr -d '\n\r' < /run/postgres-secrets/app_password.txt)"
         export DATABASE_URL="postgres://$${DB_USER}:$${DB_PASS}@postgres:5432/router_db"
+        export METRICS_BIND_ADDR=0.0.0.0:9103
         exec /usr/local/bin/temporal-worker worker
+    expose:
+      - "9103"
     volumes:
       - router_postgres_secrets:/run/postgres-secrets:ro
       - router_master_key:/run/router-secrets:ro

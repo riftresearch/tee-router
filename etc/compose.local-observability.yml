@@ -31,6 +31,14 @@ services:
     ports:
       - "9102:9102"
 
+  temporal-worker:
+    environment:
+      DEPLOYMENT_ENVIRONMENT: local
+      METRICS_BIND_ADDR: 0.0.0.0:9103
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://alloy:4318
+    ports:
+      - "9103:9103"
+
   alloy:
     image: grafana/alloy:latest
     command:

@@ -8,6 +8,7 @@ prometheus.scrape "router" {
     {"__address__" = "router-api:9100", "job" = "router-api"},
     {"__address__" = "router-worker:9101", "job" = "router-worker"},
     {"__address__" = "sauron:9102", "job" = "sauron"},
+    {"__address__" = "temporal-worker:9103", "job" = "temporal-worker"},
     {"__address__" = "temporal:9090", "job" = "temporal"},
     {"__address__" = "tempo:3200", "job" = "tempo"},
   ]

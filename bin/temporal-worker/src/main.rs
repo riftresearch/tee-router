@@ -48,6 +48,9 @@ async fn main() -> WorkerResult<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
+    observability::init_prometheus_metrics_from_env("temporal-worker")
+        .map_err(|message| temporal_worker::runtime::WorkerError::Configuration { message })?;
+    temporal_worker::telemetry::record_process_started();
 
     let cli = Cli::parse();
     let connection = TemporalConnection {

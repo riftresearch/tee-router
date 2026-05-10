@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use router_core::models::RouterOrderStatus;
 use serde_json::{json, Value};
@@ -39,12 +39,15 @@ use super::types::{
     StaleRunningStepWatchdogOutput, StepExecuted, StepExecutionOutcome, StepFailureDecision,
     VerifyProviderOperationHintInput, WriteFailedAttemptSnapshotInput,
 };
+use crate::telemetry;
 
 const PROVIDER_HINT_WAIT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const PROVIDER_HINT_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const STALE_RUNNING_STEP_RECOVERY_AFTER: Duration = Duration::from_secs(5 * 60);
 const EXECUTE_STEP_START_TO_CLOSE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MANUAL_INTERVENTION_WAIT_TIMEOUT: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const ORDER_WORKFLOW_TYPE: &str = "OrderWorkflow";
+const REFUND_WORKFLOW_TYPE: &str = "RefundWorkflow";
 
 /// Root order execution workflow.
 ///
@@ -87,6 +90,7 @@ impl OrderWorkflow {
             state.order_id = Some(input.order_id);
             state.phase = OrderWorkflowPhase::WaitingForFunding;
         });
+        let workflow_started_at = workflow_start_time(ctx, ORDER_WORKFLOW_TYPE);
         let db_activity_options = db_activity_options();
         let execute_activity_options = execute_activity_options();
 
@@ -160,16 +164,20 @@ impl OrderWorkflow {
                         state.active_step_id = None;
                     });
                     let terminal_status = run_refund_child(ctx, input.order_id, attempt_id).await?;
-                    return Ok(OrderWorkflowOutput {
-                        order_id: input.order_id,
+                    return order_workflow_output(
+                        ctx,
+                        workflow_started_at,
+                        input.order_id,
                         terminal_status,
-                    });
+                    );
                 }
                 ManualInterventionResolution::Terminal(finalized) => {
-                    return Ok(OrderWorkflowOutput {
-                        order_id: input.order_id,
-                        terminal_status: finalized.terminal_status,
-                    });
+                    return order_workflow_output(
+                        ctx,
+                        workflow_started_at,
+                        input.order_id,
+                        finalized.terminal_status,
+                    );
                 }
             }
         }
@@ -291,10 +299,12 @@ impl OrderWorkflow {
                                     db_activity_options.clone(),
                                 )
                                 .await?;
-                            return Ok(OrderWorkflowOutput {
-                                order_id: input.order_id,
-                                terminal_status: finalized.terminal_status,
-                            });
+                            return order_workflow_output(
+                                ctx,
+                                workflow_started_at,
+                                input.order_id,
+                                finalized.terminal_status,
+                            );
                         }
                     }
                 }
@@ -376,10 +386,12 @@ impl OrderWorkflow {
                                     execution_attempt.attempt_id,
                                 )
                                 .await?;
-                                return Ok(OrderWorkflowOutput {
-                                    order_id: input.order_id,
+                                return order_workflow_output(
+                                    ctx,
+                                    workflow_started_at,
+                                    input.order_id,
                                     terminal_status,
-                                });
+                                );
                             }
                             StepFailureDecision::RefreshQuote => {
                                 ctx.state_mut(|state| {
@@ -435,10 +447,12 @@ impl OrderWorkflow {
                                                 db_activity_options,
                                             )
                                             .await?;
-                                        return Ok(OrderWorkflowOutput {
-                                            order_id: input.order_id,
-                                            terminal_status: finalized.terminal_status,
-                                        });
+                                        return order_workflow_output(
+                                            ctx,
+                                            workflow_started_at,
+                                            input.order_id,
+                                            finalized.terminal_status,
+                                        );
                                     }
                                 }
                             }
@@ -487,16 +501,20 @@ impl OrderWorkflow {
                                             execution_attempt.attempt_id,
                                         )
                                         .await?;
-                                        return Ok(OrderWorkflowOutput {
-                                            order_id: input.order_id,
+                                        return order_workflow_output(
+                                            ctx,
+                                            workflow_started_at,
+                                            input.order_id,
                                             terminal_status,
-                                        });
+                                        );
                                     }
                                     ManualInterventionResolution::Terminal(finalized) => {
-                                        return Ok(OrderWorkflowOutput {
-                                            order_id: input.order_id,
-                                            terminal_status: finalized.terminal_status,
-                                        });
+                                        return order_workflow_output(
+                                            ctx,
+                                            workflow_started_at,
+                                            input.order_id,
+                                            finalized.terminal_status,
+                                        );
                                     }
                                 }
                             }
@@ -543,16 +561,20 @@ impl OrderWorkflow {
                                     execution_attempt.attempt_id,
                                 )
                                 .await?;
-                                return Ok(OrderWorkflowOutput {
-                                    order_id: input.order_id,
+                                return order_workflow_output(
+                                    ctx,
+                                    workflow_started_at,
+                                    input.order_id,
                                     terminal_status,
-                                });
+                                );
                             }
                             ManualInterventionResolution::Terminal(finalized) => {
-                                return Ok(OrderWorkflowOutput {
-                                    order_id: input.order_id,
-                                    terminal_status: finalized.terminal_status,
-                                });
+                                return order_workflow_output(
+                                    ctx,
+                                    workflow_started_at,
+                                    input.order_id,
+                                    finalized.terminal_status,
+                                );
                             }
                         }
                     }
@@ -628,16 +650,20 @@ impl OrderWorkflow {
                                         execution_attempt.attempt_id,
                                     )
                                     .await?;
-                                    return Ok(OrderWorkflowOutput {
-                                        order_id: input.order_id,
+                                    return order_workflow_output(
+                                        ctx,
+                                        workflow_started_at,
+                                        input.order_id,
                                         terminal_status,
-                                    });
+                                    );
                                 }
                                 ManualInterventionResolution::Terminal(finalized) => {
-                                    return Ok(OrderWorkflowOutput {
-                                        order_id: input.order_id,
-                                        terminal_status: finalized.terminal_status,
-                                    });
+                                    return order_workflow_output(
+                                        ctx,
+                                        workflow_started_at,
+                                        input.order_id,
+                                        finalized.terminal_status,
+                                    );
                                 }
                             }
                         }
@@ -664,10 +690,12 @@ impl OrderWorkflow {
 
         // Child-workflow shape: RefundWorkflow, QuoteRefreshWorkflow,
         // StaleRunningStepWatchdogWorkflow, and ProviderHintPollWorkflow.
-        Ok(OrderWorkflowOutput {
-            order_id: input.order_id,
-            terminal_status: OrderTerminalStatus::Completed,
-        })
+        order_workflow_output(
+            ctx,
+            workflow_started_at,
+            input.order_id,
+            OrderTerminalStatus::Completed,
+        )
     }
 
     /// Scar tissue: §4 order/vault/step state alignment.
@@ -683,9 +711,10 @@ impl OrderWorkflow {
     #[signal]
     pub fn provider_operation_hint(
         &mut self,
-        _ctx: &mut SyncWorkflowContext<Self>,
+        ctx: &mut SyncWorkflowContext<Self>,
         signal: ProviderOperationHintSignal,
     ) {
+        maybe_record_signal(ctx, ORDER_WORKFLOW_TYPE, "provider_operation_hint");
         if self
             .order_id
             .map_or(true, |order_id| order_id == signal.order_id)
@@ -698,9 +727,10 @@ impl OrderWorkflow {
     #[signal]
     pub fn manual_refund_trigger(
         &mut self,
-        _ctx: &mut SyncWorkflowContext<Self>,
+        ctx: &mut SyncWorkflowContext<Self>,
         signal: ManualTriggerRefundSignal,
     ) {
+        maybe_record_signal(ctx, ORDER_WORKFLOW_TYPE, "manual_trigger_refund");
         self.manual_refund_triggers.push(signal);
     }
 
@@ -709,9 +739,10 @@ impl OrderWorkflow {
     #[signal]
     pub fn manual_intervention_release(
         &mut self,
-        _ctx: &mut SyncWorkflowContext<Self>,
+        ctx: &mut SyncWorkflowContext<Self>,
         signal: ManualReleaseSignal,
     ) {
+        maybe_record_signal(ctx, ORDER_WORKFLOW_TYPE, "manual_release");
         self.manual_releases.push(signal);
     }
 
@@ -720,9 +751,10 @@ impl OrderWorkflow {
     #[signal]
     pub fn acknowledge_unrecoverable(
         &mut self,
-        _ctx: &mut SyncWorkflowContext<Self>,
+        ctx: &mut SyncWorkflowContext<Self>,
         signal: AcknowledgeUnrecoverableSignal,
     ) {
+        maybe_record_signal(ctx, ORDER_WORKFLOW_TYPE, "acknowledge_unrecoverable");
         self.acknowledge_unrecoverables.push(signal);
     }
 
@@ -823,6 +855,137 @@ enum ManualInterventionResolution {
 enum RefundManualInterventionResolution {
     Continue,
     Terminal(FinalizedOrder),
+}
+
+fn workflow_start_time<W>(
+    ctx: &WorkflowContext<W>,
+    workflow_type: &'static str,
+) -> Option<SystemTime> {
+    if !ctx.is_replaying() {
+        telemetry::record_workflow_started(workflow_type);
+    }
+    ctx.workflow_time()
+}
+
+fn workflow_duration<W>(
+    ctx: &WorkflowContext<W>,
+    started_at: Option<SystemTime>,
+) -> Option<Duration> {
+    let started_at = started_at?;
+    ctx.workflow_time()?.duration_since(started_at).ok()
+}
+
+fn order_workflow_output(
+    ctx: &WorkflowContext<OrderWorkflow>,
+    started_at: Option<SystemTime>,
+    order_id: Uuid,
+    terminal_status: OrderTerminalStatus,
+) -> WorkflowResult<OrderWorkflowOutput> {
+    if !ctx.is_replaying() {
+        telemetry::record_workflow_terminal(
+            ORDER_WORKFLOW_TYPE,
+            order_terminal_status_label(terminal_status),
+            workflow_duration(ctx, started_at),
+        );
+    }
+    Ok(OrderWorkflowOutput {
+        order_id,
+        terminal_status,
+    })
+}
+
+fn refund_workflow_output(
+    ctx: &WorkflowContext<RefundWorkflow>,
+    started_at: Option<SystemTime>,
+    order_id: Uuid,
+    terminal_status: RefundTerminalStatus,
+) -> WorkflowResult<RefundWorkflowOutput> {
+    if !ctx.is_replaying() {
+        telemetry::record_workflow_terminal(
+            REFUND_WORKFLOW_TYPE,
+            refund_terminal_status_label(terminal_status),
+            workflow_duration(ctx, started_at),
+        );
+    }
+    Ok(RefundWorkflowOutput {
+        order_id,
+        terminal_status,
+    })
+}
+
+fn order_terminal_status_label(status: OrderTerminalStatus) -> &'static str {
+    match status {
+        OrderTerminalStatus::Completed => "completed",
+        OrderTerminalStatus::RefundRequired => "refund_required",
+        OrderTerminalStatus::Refunded => "refunded",
+        OrderTerminalStatus::ManualInterventionRequired => "manual_intervention_required",
+        OrderTerminalStatus::RefundManualInterventionRequired => {
+            "refund_manual_intervention_required"
+        }
+    }
+}
+
+fn refund_terminal_status_label(status: RefundTerminalStatus) -> &'static str {
+    match status {
+        RefundTerminalStatus::Refunded => "refunded",
+        RefundTerminalStatus::RefundManualInterventionRequired => {
+            "refund_manual_intervention_required"
+        }
+    }
+}
+
+fn maybe_record_signal<W>(
+    ctx: &SyncWorkflowContext<W>,
+    workflow_type: &'static str,
+    signal_name: &'static str,
+) {
+    if !ctx.is_replaying() {
+        telemetry::record_signal(workflow_type, signal_name);
+    }
+}
+
+fn manual_wait_started<W>(
+    ctx: &WorkflowContext<W>,
+    workflow_type: &'static str,
+) -> Option<SystemTime> {
+    if !ctx.is_replaying() {
+        telemetry::record_manual_intervention_wait_started(workflow_type);
+    }
+    ctx.workflow_time()
+}
+
+fn record_manual_wait_completed<W>(
+    ctx: &WorkflowContext<W>,
+    workflow_type: &'static str,
+    started_at: Option<SystemTime>,
+    resolution: &'static str,
+) {
+    if !ctx.is_replaying() {
+        telemetry::record_manual_intervention_wait_completed(
+            workflow_type,
+            resolution,
+            workflow_duration(ctx, started_at),
+        );
+    }
+}
+
+fn provider_hint_wait_started<W>(ctx: &WorkflowContext<W>) -> Option<SystemTime> {
+    ctx.workflow_time()
+}
+
+fn record_provider_hint_wait<W>(
+    ctx: &WorkflowContext<W>,
+    workflow_type: &'static str,
+    started_at: Option<SystemTime>,
+    outcome: &'static str,
+) {
+    if !ctx.is_replaying() {
+        telemetry::record_provider_hint_wait(
+            workflow_type,
+            outcome,
+            workflow_duration(ctx, started_at),
+        );
+    }
 }
 
 async fn execute_step_with_stale_running_timer(
@@ -950,6 +1113,7 @@ async fn wait_for_manual_intervention_resolution(
         state.active_attempt_id = Some(attempt_id);
         state.active_step_id = Some(step_id);
     });
+    let wait_started_at = manual_wait_started(ctx, ORDER_WORKFLOW_TYPE);
     let _paused = finalize_manual_intervention(
         ctx,
         order_id,
@@ -980,6 +1144,12 @@ async fn wait_for_manual_intervention_resolution(
                                 db_activity_options.clone(),
                             )
                             .await?;
+                        record_manual_wait_completed(
+                            ctx,
+                            ORDER_WORKFLOW_TYPE,
+                            wait_started_at,
+                            "release",
+                        );
                         return Ok(ManualInterventionResolution::Release);
                     }
                     ManualInterventionSignal::TriggerRefund(signal) => {
@@ -995,6 +1165,12 @@ async fn wait_for_manual_intervention_resolution(
                                 db_activity_options.clone(),
                             )
                             .await?;
+                        record_manual_wait_completed(
+                            ctx,
+                            ORDER_WORKFLOW_TYPE,
+                            wait_started_at,
+                            "trigger_refund",
+                        );
                         return Ok(ManualInterventionResolution::TriggerRefund);
                     }
                     ManualInterventionSignal::AcknowledgeUnrecoverable(signal) => {
@@ -1009,6 +1185,12 @@ async fn wait_for_manual_intervention_resolution(
                             db_activity_options.clone(),
                         )
                         .await?;
+                        record_manual_wait_completed(
+                            ctx,
+                            ORDER_WORKFLOW_TYPE,
+                            wait_started_at,
+                            "acknowledge_unrecoverable",
+                        );
                         return Ok(ManualInterventionResolution::Terminal(finalized));
                     }
                 }
@@ -1025,6 +1207,12 @@ async fn wait_for_manual_intervention_resolution(
                     db_activity_options.clone(),
                 )
                 .await?;
+                record_manual_wait_completed(
+                    ctx,
+                    ORDER_WORKFLOW_TYPE,
+                    wait_started_at,
+                    "zombie_cleanup",
+                );
                 return Ok(ManualInterventionResolution::Terminal(finalized));
             }
         }
@@ -1149,6 +1337,7 @@ async fn wait_for_refund_manual_intervention_resolution(
     step_id: Option<Uuid>,
     db_activity_options: ActivityOptions,
 ) -> WorkflowResult<RefundManualInterventionResolution> {
+    let wait_started_at = manual_wait_started(ctx, REFUND_WORKFLOW_TYPE);
     let _paused = ctx
         .start_activity(
             OrderActivities::finalize_order_or_refund,
@@ -1186,6 +1375,12 @@ async fn wait_for_refund_manual_intervention_resolution(
                                 db_activity_options.clone(),
                             )
                             .await?;
+                        record_manual_wait_completed(
+                            ctx,
+                            REFUND_WORKFLOW_TYPE,
+                            wait_started_at,
+                            "release",
+                        );
                         return Ok(RefundManualInterventionResolution::Continue);
                     }
                     ManualInterventionSignal::TriggerRefund(signal) => {
@@ -1204,6 +1399,12 @@ async fn wait_for_refund_manual_intervention_resolution(
                                 db_activity_options.clone(),
                             )
                             .await?;
+                        record_manual_wait_completed(
+                            ctx,
+                            REFUND_WORKFLOW_TYPE,
+                            wait_started_at,
+                            "trigger_refund",
+                        );
                         return Ok(RefundManualInterventionResolution::Continue);
                     }
                     ManualInterventionSignal::AcknowledgeUnrecoverable(signal) => {
@@ -1217,6 +1418,12 @@ async fn wait_for_refund_manual_intervention_resolution(
                             db_activity_options.clone(),
                         )
                         .await?;
+                        record_manual_wait_completed(
+                            ctx,
+                            REFUND_WORKFLOW_TYPE,
+                            wait_started_at,
+                            "acknowledge_unrecoverable",
+                        );
                         return Ok(RefundManualInterventionResolution::Terminal(finalized));
                     }
                 }
@@ -1232,6 +1439,12 @@ async fn wait_for_refund_manual_intervention_resolution(
                     db_activity_options.clone(),
                 )
                 .await?;
+                record_manual_wait_completed(
+                    ctx,
+                    REFUND_WORKFLOW_TYPE,
+                    wait_started_at,
+                    "zombie_cleanup",
+                );
                 return Ok(RefundManualInterventionResolution::Terminal(finalized));
             }
         }
@@ -1295,6 +1508,7 @@ async fn wait_for_provider_completion_hint(
     execution: StepExecuted,
     db_activity_options: ActivityOptions,
 ) -> WorkflowResult<ProviderCompletionWait> {
+    let wait_started_at = provider_hint_wait_started(ctx);
     let poll_child = ctx
         .child_workflow(
             ProviderHintPollWorkflow::run,
@@ -1331,6 +1545,12 @@ async fn wait_for_provider_completion_hint(
                             .await;
                         poll_result.cancel();
                         settle_provider_completion(ctx, execution.clone(), db_activity_options.clone()).await?;
+                        record_provider_hint_wait(
+                            ctx,
+                            ORDER_WORKFLOW_TYPE,
+                            wait_started_at,
+                            "signal_accept",
+                        );
                         return Ok(ProviderCompletionWait::Completed);
                     }
                     ProviderOperationHintDecision::Reject | ProviderOperationHintDecision::Defer => {
@@ -1351,6 +1571,12 @@ async fn wait_for_provider_completion_hint(
                 match polled.decision {
                     ProviderOperationHintDecision::Accept => {
                         settle_provider_completion(ctx, execution.clone(), db_activity_options.clone()).await?;
+                        record_provider_hint_wait(
+                            ctx,
+                            ORDER_WORKFLOW_TYPE,
+                            wait_started_at,
+                            "poll_accept",
+                        );
                         return Ok(ProviderCompletionWait::Completed);
                     }
                     ProviderOperationHintDecision::Reject | ProviderOperationHintDecision::Defer => {
@@ -1370,6 +1596,12 @@ async fn wait_for_provider_completion_hint(
                             db_activity_options.clone(),
                         )
                         .await?;
+                        record_provider_hint_wait(
+                            ctx,
+                            ORDER_WORKFLOW_TYPE,
+                            wait_started_at,
+                            "poll_unresolved_manual_intervention",
+                        );
                         return Ok(ProviderCompletionWait::ManualInterventionRequired { resolution });
                     }
                 }
@@ -1392,6 +1624,12 @@ async fn wait_for_provider_completion_hint(
                     db_activity_options.clone(),
                 )
                 .await?;
+                record_provider_hint_wait(
+                    ctx,
+                    ORDER_WORKFLOW_TYPE,
+                    wait_started_at,
+                    "timeout_manual_intervention",
+                );
                 return Ok(ProviderCompletionWait::ManualInterventionRequired { resolution });
             }
         }
@@ -1405,6 +1643,7 @@ async fn wait_for_refund_provider_completion_hint(
     execution: StepExecuted,
     db_activity_options: ActivityOptions,
 ) -> WorkflowResult<RefundProviderCompletionWait> {
+    let wait_started_at = provider_hint_wait_started(ctx);
     let poll_child = ctx
         .child_workflow(
             ProviderHintPollWorkflow::run,
@@ -1441,6 +1680,12 @@ async fn wait_for_refund_provider_completion_hint(
                             .await;
                         poll_result.cancel();
                         settle_refund_provider_completion(ctx, execution.clone(), db_activity_options.clone()).await?;
+                        record_provider_hint_wait(
+                            ctx,
+                            REFUND_WORKFLOW_TYPE,
+                            wait_started_at,
+                            "signal_accept",
+                        );
                         return Ok(RefundProviderCompletionWait::Completed);
                     }
                     ProviderOperationHintDecision::Reject | ProviderOperationHintDecision::Defer => {
@@ -1461,6 +1706,12 @@ async fn wait_for_refund_provider_completion_hint(
                 match polled.decision {
                     ProviderOperationHintDecision::Accept => {
                         settle_refund_provider_completion(ctx, execution.clone(), db_activity_options.clone()).await?;
+                        record_provider_hint_wait(
+                            ctx,
+                            REFUND_WORKFLOW_TYPE,
+                            wait_started_at,
+                            "poll_accept",
+                        );
                         return Ok(RefundProviderCompletionWait::Completed);
                     }
                     ProviderOperationHintDecision::Reject | ProviderOperationHintDecision::Defer => {
@@ -1487,6 +1738,12 @@ async fn wait_for_refund_provider_completion_hint(
                             db_activity_options.clone(),
                         )
                         .await?;
+                        record_provider_hint_wait(
+                            ctx,
+                            REFUND_WORKFLOW_TYPE,
+                            wait_started_at,
+                            "poll_unresolved_manual_intervention",
+                        );
                         return Ok(RefundProviderCompletionWait::RefundManualInterventionRequired { resolution });
                     }
                 }
@@ -1517,6 +1774,12 @@ async fn wait_for_refund_provider_completion_hint(
                     db_activity_options.clone(),
                 )
                 .await?;
+                record_provider_hint_wait(
+                    ctx,
+                    REFUND_WORKFLOW_TYPE,
+                    wait_started_at,
+                    "timeout_manual_intervention",
+                );
                 return Ok(RefundProviderCompletionWait::RefundManualInterventionRequired { resolution });
             }
         }
@@ -1606,6 +1869,7 @@ impl RefundWorkflow {
         ctx.state_mut(|state| {
             state.order_id = Some(input.order_id);
         });
+        let workflow_started_at = workflow_start_time(ctx, REFUND_WORKFLOW_TYPE);
         if input.trigger != RefundTrigger::FailedAttempt {
             return Err(anyhow::anyhow!(
                 "PR6a RefundWorkflow only handles failed-attempt triggers"
@@ -1643,10 +1907,12 @@ impl RefundWorkflow {
                     {
                         RefundManualInterventionResolution::Continue => continue 'refund,
                         RefundManualInterventionResolution::Terminal(finalized) => {
-                            return Ok(RefundWorkflowOutput {
-                                order_id: input.order_id,
-                                terminal_status: refund_terminal_status(finalized.terminal_status),
-                            });
+                            return refund_workflow_output(
+                                ctx,
+                                workflow_started_at,
+                                input.order_id,
+                                refund_terminal_status(finalized.terminal_status),
+                            );
                         }
                     }
                 }
@@ -1680,10 +1946,12 @@ impl RefundWorkflow {
                     {
                         RefundManualInterventionResolution::Continue => continue 'refund,
                         RefundManualInterventionResolution::Terminal(finalized) => {
-                            return Ok(RefundWorkflowOutput {
-                                order_id: input.order_id,
-                                terminal_status: refund_terminal_status(finalized.terminal_status),
-                            });
+                            return refund_workflow_output(
+                                ctx,
+                                workflow_started_at,
+                                input.order_id,
+                                refund_terminal_status(finalized.terminal_status),
+                            );
                         }
                     }
                 }
@@ -1751,12 +2019,12 @@ impl RefundWorkflow {
                         {
                             RefundManualInterventionResolution::Continue => continue 'refund,
                             RefundManualInterventionResolution::Terminal(finalized) => {
-                                return Ok(RefundWorkflowOutput {
-                                    order_id: input.order_id,
-                                    terminal_status: refund_terminal_status(
-                                        finalized.terminal_status,
-                                    ),
-                                });
+                                return refund_workflow_output(
+                                    ctx,
+                                    workflow_started_at,
+                                    input.order_id,
+                                    refund_terminal_status(finalized.terminal_status),
+                                );
                             }
                         }
                     }
@@ -1804,12 +2072,12 @@ impl RefundWorkflow {
                         } => match resolution {
                             RefundManualInterventionResolution::Continue => continue 'refund,
                             RefundManualInterventionResolution::Terminal(finalized) => {
-                                return Ok(RefundWorkflowOutput {
-                                    order_id: input.order_id,
-                                    terminal_status: refund_terminal_status(
-                                        finalized.terminal_status,
-                                    ),
-                                });
+                                return refund_workflow_output(
+                                    ctx,
+                                    workflow_started_at,
+                                    input.order_id,
+                                    refund_terminal_status(finalized.terminal_status),
+                                );
                             }
                         },
                     }
@@ -1829,10 +2097,12 @@ impl RefundWorkflow {
                     db_activity_options,
                 )
                 .await?;
-            return Ok(RefundWorkflowOutput {
-                order_id: input.order_id,
-                terminal_status: RefundTerminalStatus::Refunded,
-            });
+            return refund_workflow_output(
+                ctx,
+                workflow_started_at,
+                input.order_id,
+                RefundTerminalStatus::Refunded,
+            );
         }
     }
 
@@ -1840,9 +2110,10 @@ impl RefundWorkflow {
     #[signal]
     pub fn provider_operation_hint(
         &mut self,
-        _ctx: &mut SyncWorkflowContext<Self>,
+        ctx: &mut SyncWorkflowContext<Self>,
         signal: ProviderOperationHintSignal,
     ) {
+        maybe_record_signal(ctx, REFUND_WORKFLOW_TYPE, "provider_operation_hint");
         if self
             .order_id
             .map_or(true, |order_id| order_id == signal.order_id)
@@ -1854,27 +2125,30 @@ impl RefundWorkflow {
     #[signal]
     pub fn manual_refund_trigger(
         &mut self,
-        _ctx: &mut SyncWorkflowContext<Self>,
+        ctx: &mut SyncWorkflowContext<Self>,
         signal: ManualTriggerRefundSignal,
     ) {
+        maybe_record_signal(ctx, REFUND_WORKFLOW_TYPE, "manual_trigger_refund");
         self.manual_refund_triggers.push(signal);
     }
 
     #[signal]
     pub fn manual_intervention_release(
         &mut self,
-        _ctx: &mut SyncWorkflowContext<Self>,
+        ctx: &mut SyncWorkflowContext<Self>,
         signal: ManualReleaseSignal,
     ) {
+        maybe_record_signal(ctx, REFUND_WORKFLOW_TYPE, "manual_release");
         self.manual_releases.push(signal);
     }
 
     #[signal]
     pub fn acknowledge_unrecoverable(
         &mut self,
-        _ctx: &mut SyncWorkflowContext<Self>,
+        ctx: &mut SyncWorkflowContext<Self>,
         signal: AcknowledgeUnrecoverableSignal,
     ) {
+        maybe_record_signal(ctx, REFUND_WORKFLOW_TYPE, "acknowledge_unrecoverable");
         self.acknowledge_unrecoverables.push(signal);
     }
 }
