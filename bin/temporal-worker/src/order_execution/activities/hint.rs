@@ -1000,8 +1000,105 @@ pub(super) async fn verify_unit_deposit_hint(
         .await
         .map_err(OrderActivityError::db_query)?;
 
+    if let Some(decision) = validate_unit_deposit_operation(&operation, &input) {
+        return Ok(decision);
+    }
+
+    let Some(evidence) = input.signal.evidence.as_ref() else {
+        return verify_provider_observation_hint(deps, input).await;
+    };
+    let chain = match verify_chain_evidence(evidence) {
+        Ok(chain) => chain,
+        Err(reason) => return Ok(provider_hint_rejected(Some(provider_operation_id), reason)),
+    };
+    let recipient = match verify_recipient_evidence(deps, &operation, &chain).await? {
+        Ok(recipient) => recipient,
+        Err(reason) => return Ok(provider_hint_rejected(Some(provider_operation_id), reason)),
+    };
+    let amount = match verify_amount_evidence(
+        deps,
+        &operation,
+        input.step_id.inner(),
+        &input,
+        &recipient,
+        &chain,
+    )
+    .await?
+    {
+        Ok(amount) => amount,
+        Err(reason) => return Ok(provider_hint_rejected(Some(provider_operation_id), reason)),
+    };
+    let provider_observation = observe_unit_deposit_provider(deps, &operation, &chain).await?;
+    let updated = persist_unit_deposit_hint_observation(
+        deps,
+        &operation,
+        &input,
+        &recipient,
+        &amount,
+        &chain,
+        provider_observation,
+    )
+    .await?;
+
+    Ok(unit_deposit_hint_decision(&updated))
+}
+
+fn unit_deposit_hint_decision(updated: &OrderProviderOperation) -> ProviderOperationHintVerified {
+    match updated.status {
+        ProviderOperationStatus::Completed => ProviderOperationHintVerified {
+            provider_operation_id: Some(updated.id.into()),
+            decision: ProviderOperationHintDecision::Accept,
+            reason: None,
+        },
+        ProviderOperationStatus::Failed | ProviderOperationStatus::Expired => {
+            provider_hint_rejected(
+                Some(updated.id),
+                format!(
+                    "UnitDeposit observation returned {}",
+                    updated.status.to_db_string()
+                ),
+            )
+        }
+        ProviderOperationStatus::Planned
+        | ProviderOperationStatus::Submitted
+        | ProviderOperationStatus::WaitingExternal => provider_hint_deferred(
+            Some(updated.id),
+            format!(
+                "UnitDeposit observation returned {}",
+                updated.status.to_db_string()
+            ),
+        ),
+    }
+}
+
+struct ChainEvidence<'a> {
+    evidence: &'a ProviderOperationHintEvidence,
+}
+
+struct RecipientEvidence {
+    provider_address: OrderProviderAddress,
+}
+
+struct AmountEvidence {
+    expected_amount: U256,
+    verified_amount: U256,
+}
+
+struct UnitDepositProviderObservation {
+    status: ProviderOperationStatus,
+    provider_observed_state: Value,
+    provider_tx_hash: Option<String>,
+    provider_error: Option<Value>,
+    provider_response: Option<Value>,
+}
+
+fn validate_unit_deposit_operation(
+    operation: &OrderProviderOperation,
+    input: &VerifyProviderOperationHintInput,
+) -> Option<ProviderOperationHintVerified> {
+    let provider_operation_id = operation.id;
     if operation.order_id != input.order_id.inner() {
-        return Ok(provider_hint_rejected(
+        return Some(provider_hint_rejected(
             Some(provider_operation_id),
             format!(
                 "provider operation {} belongs to order {}, not {}",
@@ -1012,7 +1109,7 @@ pub(super) async fn verify_unit_deposit_hint(
         ));
     }
     if operation.execution_step_id != Some(input.step_id.inner()) {
-        return Ok(provider_hint_deferred(
+        return Some(provider_hint_deferred(
             Some(provider_operation_id),
             format!(
                 "provider operation {} belongs to step {:?}, not {}",
@@ -1023,7 +1120,7 @@ pub(super) async fn verify_unit_deposit_hint(
         ));
     }
     if operation.operation_type != ProviderOperationType::UnitDeposit {
-        return Ok(provider_hint_rejected(
+        return Some(provider_hint_rejected(
             Some(provider_operation_id),
             format!(
                 "UnitDeposit hint cannot verify {} operation",
@@ -1031,91 +1128,124 @@ pub(super) async fn verify_unit_deposit_hint(
             ),
         ));
     }
-    if matches!(
+    terminal_hint_decision(operation)
+}
+
+fn terminal_hint_decision(
+    operation: &OrderProviderOperation,
+) -> Option<ProviderOperationHintVerified> {
+    if !matches!(
         operation.status,
         ProviderOperationStatus::Completed
             | ProviderOperationStatus::Failed
             | ProviderOperationStatus::Expired
     ) {
-        return Ok(ProviderOperationHintVerified {
-            provider_operation_id: Some(operation.id.into()),
-            decision: if operation.status == ProviderOperationStatus::Completed {
-                ProviderOperationHintDecision::Accept
-            } else {
-                ProviderOperationHintDecision::Reject
-            },
-            reason: Some(format!(
-                "provider operation already terminal: {}",
-                operation.status.to_db_string()
-            )),
-        });
+        return None;
     }
+    Some(ProviderOperationHintVerified {
+        provider_operation_id: Some(operation.id.into()),
+        decision: if operation.status == ProviderOperationStatus::Completed {
+            ProviderOperationHintDecision::Accept
+        } else {
+            ProviderOperationHintDecision::Reject
+        },
+        reason: Some(format!(
+            "provider operation already terminal: {}",
+            operation.status.to_db_string()
+        )),
+    })
+}
 
-    let Some(evidence) = input.signal.evidence.as_ref() else {
-        return verify_provider_observation_hint(deps, input).await;
-    };
+fn verify_chain_evidence(
+    evidence: &ProviderOperationHintEvidence,
+) -> Result<ChainEvidence<'_>, String> {
     if evidence.tx_hash.trim().is_empty() {
-        return Ok(provider_hint_rejected(
-            Some(provider_operation_id),
-            "UnitDeposit evidence tx_hash is empty",
-        ));
+        return Err("UnitDeposit evidence tx_hash is empty".to_string());
     }
     if evidence.address.trim().is_empty() {
-        return Ok(provider_hint_rejected(
-            Some(provider_operation_id),
-            "UnitDeposit evidence address is empty",
-        ));
+        return Err("UnitDeposit evidence address is empty".to_string());
     }
+    Ok(ChainEvidence { evidence })
+}
 
+async fn verify_recipient_evidence(
+    deps: &OrderActivityDeps,
+    operation: &OrderProviderOperation,
+    chain: &ChainEvidence<'_>,
+) -> Result<Result<RecipientEvidence, String>, OrderActivityError> {
     let addresses = deps
         .db
         .orders()
         .get_provider_addresses_by_operation(operation.id)
         .await
         .map_err(OrderActivityError::db_query)?;
-    let Some(provider_address) = addresses.iter().find(|address| {
+    let Some(provider_address) = addresses.into_iter().find(|address| {
         address.role == ProviderAddressRole::UnitDeposit
-            && address.address.eq_ignore_ascii_case(&evidence.address)
+            && address
+                .address
+                .eq_ignore_ascii_case(&chain.evidence.address)
     }) else {
-        return Ok(provider_hint_rejected(
-            Some(provider_operation_id),
-            format!(
-                "evidence address {} does not match a UnitDeposit provider address",
-                evidence.address
-            ),
-        ));
+        return Ok(Err(format!(
+            "evidence address {} does not match a UnitDeposit provider address",
+            chain.evidence.address
+        )));
     };
-    let verified_amount =
-        match verify_unit_deposit_candidate(deps, provider_address, evidence).await {
-            Ok(amount) => amount,
-            Err(reason) => return Ok(provider_hint_rejected(Some(provider_operation_id), reason)),
-        };
+    Ok(Ok(RecipientEvidence { provider_address }))
+}
+
+async fn verify_amount_evidence(
+    deps: &OrderActivityDeps,
+    operation: &OrderProviderOperation,
+    step_id: Uuid,
+    input: &VerifyProviderOperationHintInput,
+    recipient: &RecipientEvidence,
+    chain: &ChainEvidence<'_>,
+) -> Result<Result<AmountEvidence, String>, OrderActivityError> {
+    let verified_amount = match verify_unit_deposit_candidate(
+        deps,
+        &recipient.provider_address,
+        chain.evidence,
+    )
+    .await
+    {
+        Ok(amount) => amount,
+        Err(reason) => return Ok(Err(reason)),
+    };
     let step = deps
         .db
         .orders()
-        .get_execution_step(input.step_id.inner())
+        .get_execution_step(step_id)
         .await
         .map_err(OrderActivityError::db_query)?;
     let expected_amount = match expected_provider_operation_amount(
-        &operation,
+        operation,
         Some(&step),
         input.signal.hint_id.inner(),
     ) {
         Ok(amount) => amount,
-        Err(reason) => return Ok(provider_hint_rejected(Some(provider_operation_id), reason)),
+        Err(reason) => return Ok(Err(reason)),
     };
     if verified_amount < expected_amount {
-        return Ok(provider_hint_rejected(
-            Some(provider_operation_id),
-            format!("observed amount {verified_amount} is below expected amount {expected_amount}"),
-        ));
+        return Ok(Err(format!(
+            "observed amount {verified_amount} is below expected amount {expected_amount}"
+        )));
     }
+    Ok(Ok(AmountEvidence {
+        expected_amount,
+        verified_amount,
+    }))
+}
 
+async fn observe_unit_deposit_provider(
+    deps: &OrderActivityDeps,
+    operation: &OrderProviderOperation,
+    chain: &ChainEvidence<'_>,
+) -> Result<UnitDepositProviderObservation, OrderActivityError> {
     let provider = deps
         .action_providers
         .unit(&operation.provider)
         .ok_or_else(|| provider_observe_not_configured(&operation.provider))?;
-    let provider_observation = provider
+    let observation = provider
         .observe_unit_operation(ProviderOperationObservationRequest {
             operation_id: operation.id,
             operation_type: operation.operation_type,
@@ -1123,62 +1253,62 @@ pub(super) async fn verify_unit_deposit_hint(
             request: operation.request.clone(),
             response: operation.response.clone(),
             observed_state: operation.observed_state.clone(),
-            hint_evidence: unit_deposit_evidence_json(evidence),
+            hint_evidence: unit_deposit_evidence_json(chain.evidence),
         })
         .await
         .map_err(|source| provider_observe_error(&operation.provider, source))?;
-    let (status, provider_observed_state, provider_tx_hash, provider_error, provider_response) =
-        if let Some(observation) = provider_observation {
-            (
-                observation.status,
-                json_object_or_wrapped(observation.observed_state),
-                observation.tx_hash,
-                observation.error,
-                observation.response,
-            )
-        } else {
-            (
-                ProviderOperationStatus::WaitingExternal,
-                json!({}),
-                None,
-                None,
-                None,
-            )
-        };
-    let tx_hash = provider_tx_hash.unwrap_or_else(|| evidence.tx_hash.clone());
-    let mut observed_state = json!({
-        "source": "temporal_provider_operation_hint_validation",
-        "hint_id": input.signal.hint_id,
-        "hint_kind": input.signal.hint_kind,
-        "evidence": unit_deposit_evidence_json(evidence),
-        "validated_provider_address_id": provider_address.id,
-        "expected_amount": expected_amount.to_string(),
-        "observed_amount": verified_amount.to_string(),
-        "transfer_index": evidence.transfer_index,
-        "chain_verified": true,
-        "tx_hash": &tx_hash,
-        "provider_observed_state": provider_observed_state,
-    });
-    if let Some(error) = provider_error {
+    Ok(match observation {
+        Some(observation) => UnitDepositProviderObservation {
+            status: observation.status,
+            provider_observed_state: json_object_or_wrapped(observation.observed_state),
+            provider_tx_hash: observation.tx_hash,
+            provider_error: observation.error,
+            provider_response: observation.response,
+        },
+        None => UnitDepositProviderObservation {
+            status: ProviderOperationStatus::WaitingExternal,
+            provider_observed_state: json!({}),
+            provider_tx_hash: None,
+            provider_error: None,
+            provider_response: None,
+        },
+    })
+}
+
+async fn persist_unit_deposit_hint_observation(
+    deps: &OrderActivityDeps,
+    operation: &OrderProviderOperation,
+    input: &VerifyProviderOperationHintInput,
+    recipient: &RecipientEvidence,
+    amount: &AmountEvidence,
+    chain: &ChainEvidence<'_>,
+    observation: UnitDepositProviderObservation,
+) -> Result<OrderProviderOperation, OrderActivityError> {
+    let tx_hash = observation
+        .provider_tx_hash
+        .unwrap_or_else(|| chain.evidence.tx_hash.clone());
+    let mut observed_state = unit_deposit_observed_state(
+        input,
+        recipient,
+        amount,
+        chain,
+        &tx_hash,
+        observation.provider_observed_state,
+    );
+    if let Some(error) = observation.provider_error {
         observed_state["provider_error"] = error;
     }
-    let response = provider_response.or_else(|| {
-        Some(json!({
-            "kind": "provider_operation_hint_validation",
-            "provider": &operation.provider,
-            "operation_id": operation.id,
-            "hint_id": input.signal.hint_id,
-            "tx_hash": &tx_hash,
-            "amount": verified_amount.to_string(),
-            "chain_verified": true,
-        }))
+    let response = observation.provider_response.or_else(|| {
+        Some(unit_deposit_hint_response(
+            operation, input, amount, &tx_hash,
+        ))
     });
     let (updated, _) = deps
         .db
         .orders()
         .update_provider_operation_status(
             operation.id,
-            status,
+            observation.status,
             operation.provider_ref.clone(),
             observed_state,
             response,
@@ -1186,32 +1316,47 @@ pub(super) async fn verify_unit_deposit_hint(
         )
         .await
         .map_err(OrderActivityError::db_query)?;
+    Ok(updated)
+}
 
-    match updated.status {
-        ProviderOperationStatus::Completed => Ok(ProviderOperationHintVerified {
-            provider_operation_id: Some(updated.id.into()),
-            decision: ProviderOperationHintDecision::Accept,
-            reason: None,
-        }),
-        ProviderOperationStatus::Failed | ProviderOperationStatus::Expired => {
-            Ok(provider_hint_rejected(
-                Some(updated.id),
-                format!(
-                    "UnitDeposit observation returned {}",
-                    updated.status.to_db_string()
-                ),
-            ))
-        }
-        ProviderOperationStatus::Planned
-        | ProviderOperationStatus::Submitted
-        | ProviderOperationStatus::WaitingExternal => Ok(provider_hint_deferred(
-            Some(updated.id),
-            format!(
-                "UnitDeposit observation returned {}",
-                updated.status.to_db_string()
-            ),
-        )),
-    }
+fn unit_deposit_observed_state(
+    input: &VerifyProviderOperationHintInput,
+    recipient: &RecipientEvidence,
+    amount: &AmountEvidence,
+    chain: &ChainEvidence<'_>,
+    tx_hash: &str,
+    provider_observed_state: Value,
+) -> Value {
+    json!({
+        "source": "temporal_provider_operation_hint_validation",
+        "hint_id": input.signal.hint_id,
+        "hint_kind": input.signal.hint_kind,
+        "evidence": unit_deposit_evidence_json(chain.evidence),
+        "validated_provider_address_id": recipient.provider_address.id,
+        "expected_amount": amount.expected_amount.to_string(),
+        "observed_amount": amount.verified_amount.to_string(),
+        "transfer_index": chain.evidence.transfer_index,
+        "chain_verified": true,
+        "tx_hash": tx_hash,
+        "provider_observed_state": provider_observed_state,
+    })
+}
+
+fn unit_deposit_hint_response(
+    operation: &OrderProviderOperation,
+    input: &VerifyProviderOperationHintInput,
+    amount: &AmountEvidence,
+    tx_hash: &str,
+) -> Value {
+    json!({
+        "kind": "provider_operation_hint_validation",
+        "provider": &operation.provider,
+        "operation_id": operation.id,
+        "hint_id": input.signal.hint_id,
+        "tx_hash": tx_hash,
+        "amount": amount.verified_amount.to_string(),
+        "chain_verified": true,
+    })
 }
 
 pub(super) async fn verify_provider_observation_hint(
