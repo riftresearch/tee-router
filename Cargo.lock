@@ -6213,6 +6213,7 @@ dependencies = [
 name = "router-temporal"
 version = "0.1.8"
 dependencies = [
+ "chrono",
  "serde",
  "snafu",
  "temporalio-common",

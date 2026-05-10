@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+chrono = { workspace = true }
 serde = { workspace = true }
 snafu = { workspace = true }
 temporalio-common = { workspace = true }

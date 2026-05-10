@@ -20,8 +20,7 @@ workflow history and replay.
      `GET /internal/v1/orders/manual-interventions?limit=25`
    - Read one paused order:
      `GET /internal/v1/orders/{order_id}/manual-intervention`
-   - Use the configured admin bearer token. These endpoints are read-only in
-     PR10-i.
+   - Use the configured admin bearer token.
 3. Open Temporal Web UI and search for the returned `workflow_id`.
    - Root execution workflows use `order:{order_id}:execution`.
    - Refund child workflows use `order:{order_id}:refund:{parent_attempt_id}`.
@@ -54,15 +53,20 @@ Confirm all of the following:
 - For refunds, exactly one recoverable position exists before attempting any
   manual recovery outside the workflow.
 
-## PR10-ii Placeholder
+## Operator Actions
 
-PR10-ii will convert manual intervention from a terminal workflow result into a
-long-lived workflow pause. It will add operator actions for:
+Manual intervention is a workflow pause. Use these actions only after comparing
+Postgres state with Temporal history and confirming the next side effect is safe:
 
-- releasing a paused order back into the workflow,
-- triggering a refund from a paused primary execution,
-- acknowledging an unrecoverable order.
+- Release a paused order back into workflow execution:
+  `POST /internal/v1/orders/{order_id}/manual-intervention/release`
+- Trigger refund recovery from paused primary execution:
+  `POST /internal/v1/orders/{order_id}/manual-intervention/trigger-refund`
+- Acknowledge an unrecoverable order as truly terminal:
+  `POST /internal/v1/orders/{order_id}/manual-intervention/acknowledge-unrecoverable`
 
-Until PR10-ii lands, the PR10-i endpoints are read-only. Operators should use
-them for diagnosis and coordinate any manual database or custody action through
-the engineering runbook for the incident.
+Each request body requires a `reason` and may include `operator_id`. Triggering a
+refund may also include `refund_kind_hint`. The router sends the corresponding
+Temporal signal to the active OrderWorkflow or RefundWorkflow; the workflow keeps
+the same deterministic workflow id for the order/refund attempt and records the
+operator reason in Postgres.
