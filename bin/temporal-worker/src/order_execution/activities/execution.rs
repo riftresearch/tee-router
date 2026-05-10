@@ -1,3 +1,5 @@
+use futures_util::future::{BoxFuture, FutureExt};
+
 use super::*;
 
 #[activities]
@@ -1710,6 +1712,85 @@ pub(super) struct StepCompletion {
     outcome: StepExecutionOutcome,
 }
 
+enum StepDispatchResult {
+    ProviderIntent(ProviderExecutionIntent),
+    Complete(StepCompletion),
+}
+
+type StepDispatchFuture<'a> = BoxFuture<'a, Result<StepDispatchResult, OrderActivityError>>;
+type StepDispatchHandler =
+    for<'a> fn(&'a OrderActivityDeps, &'a OrderExecutionStep) -> StepDispatchFuture<'a>;
+
+struct StepDispatch {
+    execute: StepDispatchHandler,
+}
+
+impl StepDispatch {
+    fn execute<'a>(
+        &self,
+        deps: &'a OrderActivityDeps,
+        step: &'a OrderExecutionStep,
+    ) -> StepDispatchFuture<'a> {
+        (self.execute)(deps, step)
+    }
+}
+
+const WAIT_FOR_DEPOSIT_DISPATCH: StepDispatch = StepDispatch {
+    execute: execute_wait_for_deposit_step,
+};
+const REFUND_DISPATCH: StepDispatch = StepDispatch {
+    execute: execute_refund_step,
+};
+const ACROSS_BRIDGE_DISPATCH: StepDispatch = StepDispatch {
+    execute: execute_across_bridge_step,
+};
+const CCTP_BURN_DISPATCH: StepDispatch = StepDispatch {
+    execute: execute_cctp_burn_step,
+};
+const CCTP_RECEIVE_DISPATCH: StepDispatch = StepDispatch {
+    execute: execute_cctp_receive_step,
+};
+const HYPERLIQUID_BRIDGE_DEPOSIT_DISPATCH: StepDispatch = StepDispatch {
+    execute: execute_hyperliquid_bridge_deposit_step,
+};
+const HYPERLIQUID_BRIDGE_WITHDRAWAL_DISPATCH: StepDispatch = StepDispatch {
+    execute: execute_hyperliquid_bridge_withdrawal_step,
+};
+const UNIT_DEPOSIT_DISPATCH: StepDispatch = StepDispatch {
+    execute: execute_unit_deposit_step,
+};
+const UNIT_WITHDRAWAL_DISPATCH: StepDispatch = StepDispatch {
+    execute: execute_unit_withdrawal_step,
+};
+const HYPERLIQUID_TRADE_DISPATCH: StepDispatch = StepDispatch {
+    execute: execute_hyperliquid_trade_step,
+};
+const HYPERLIQUID_LIMIT_ORDER_DISPATCH: StepDispatch = StepDispatch {
+    execute: execute_hyperliquid_limit_order_step,
+};
+const UNIVERSAL_ROUTER_SWAP_DISPATCH: StepDispatch = StepDispatch {
+    execute: execute_universal_router_swap_step,
+};
+
+fn step_dispatch(step_type: OrderExecutionStepType) -> &'static StepDispatch {
+    match step_type {
+        OrderExecutionStepType::WaitForDeposit => &WAIT_FOR_DEPOSIT_DISPATCH,
+        OrderExecutionStepType::Refund => &REFUND_DISPATCH,
+        OrderExecutionStepType::AcrossBridge => &ACROSS_BRIDGE_DISPATCH,
+        OrderExecutionStepType::CctpBurn => &CCTP_BURN_DISPATCH,
+        OrderExecutionStepType::CctpReceive => &CCTP_RECEIVE_DISPATCH,
+        OrderExecutionStepType::HyperliquidBridgeDeposit => &HYPERLIQUID_BRIDGE_DEPOSIT_DISPATCH,
+        OrderExecutionStepType::HyperliquidBridgeWithdrawal => {
+            &HYPERLIQUID_BRIDGE_WITHDRAWAL_DISPATCH
+        }
+        OrderExecutionStepType::UnitDeposit => &UNIT_DEPOSIT_DISPATCH,
+        OrderExecutionStepType::UnitWithdrawal => &UNIT_WITHDRAWAL_DISPATCH,
+        OrderExecutionStepType::HyperliquidTrade => &HYPERLIQUID_TRADE_DISPATCH,
+        OrderExecutionStepType::HyperliquidLimitOrder => &HYPERLIQUID_LIMIT_ORDER_DISPATCH,
+        OrderExecutionStepType::UniversalRouterSwap => &UNIVERSAL_ROUTER_SWAP_DISPATCH,
+    }
+}
+
 pub(super) enum PostExecuteProvider {
     Bridge(Arc<dyn router_core::services::action_providers::BridgeProvider>),
     Exchange(Arc<dyn router_core::services::action_providers::ExchangeProvider>),
@@ -1734,151 +1815,235 @@ pub(super) async fn execute_running_step(
     deps: &OrderActivityDeps,
     step: &OrderExecutionStep,
 ) -> Result<StepCompletion, OrderActivityError> {
-    let intent = match step.step_type {
-        OrderExecutionStepType::WaitForDeposit => {
-            return Err(invariant_error(
-                "wait_for_deposit_not_provider_executable",
-                format!(
-                    "{} is not provider executable",
-                    step.step_type.to_db_string()
-                ),
-            ));
+    match step_dispatch(step.step_type).execute(deps, step).await? {
+        StepDispatchResult::ProviderIntent(intent) => {
+            prepare_provider_completion(deps, step, intent).await
         }
-        OrderExecutionStepType::Refund => {
-            let custody_vault_id = request_uuid_field(step, "source_custody_vault_id")?;
-            let recipient_address = request_string_field(step, "recipient_address")?;
-            let amount = request_string_field(step, "amount")?;
-            let receipt = deps
-                .custody_action_executor
-                .execute(CustodyActionRequest {
-                    custody_vault_id,
-                    action: CustodyAction::Transfer {
-                        to_address: recipient_address.clone(),
-                        amount: amount.clone(),
-                        bitcoin_fee_budget_sats: None,
-                    },
-                })
-                .await
-                .map_err(|source| custody_action_error("execute refund transfer", source))?;
-            return Ok(StepCompletion {
-                response: json!({
-                    "kind": "refund_transfer",
-                    "recipient_address": recipient_address,
-                    "amount": amount,
-                    "tx_hash": &receipt.tx_hash,
-                }),
-                tx_hash: Some(receipt.tx_hash),
-                provider_state: ProviderExecutionState::default(),
-                outcome: StepExecutionOutcome::Completed,
-            });
-        }
-        OrderExecutionStepType::AcrossBridge => {
-            let request = BridgeExecutionRequest::across_from_value(&step.request)
-                .map_err(|source| provider_execute_error(&step.provider, source))?;
-            deps.action_providers
-                .bridge(&step.provider)
-                .ok_or_else(|| provider_not_configured(step))?
-                .execute_bridge(&request)
-                .await
-                .map_err(|source| provider_execute_error(&step.provider, source))?
-        }
-        OrderExecutionStepType::CctpBurn => {
-            let request = BridgeExecutionRequest::cctp_burn_from_value(&step.request)
-                .map_err(|source| provider_execute_error(&step.provider, source))?;
-            deps.action_providers
-                .bridge(&step.provider)
-                .ok_or_else(|| provider_not_configured(step))?
-                .execute_bridge(&request)
-                .await
-                .map_err(|source| provider_execute_error(&step.provider, source))?
-        }
-        OrderExecutionStepType::CctpReceive => {
-            let request_json = hydrate_cctp_receive_request(deps, step).await?;
-            let request = BridgeExecutionRequest::cctp_receive_from_value(&request_json)
-                .map_err(|source| provider_execute_error(&step.provider, source))?;
-            deps.action_providers
-                .bridge(&step.provider)
-                .ok_or_else(|| provider_not_configured(step))?
-                .execute_bridge(&request)
-                .await
-                .map_err(|source| provider_execute_error(&step.provider, source))?
-        }
-        OrderExecutionStepType::HyperliquidBridgeDeposit => {
-            let request =
-                BridgeExecutionRequest::hyperliquid_bridge_deposit_from_value(&step.request)
-                    .map_err(|source| provider_execute_error(&step.provider, source))?;
-            deps.action_providers
-                .bridge(&step.provider)
-                .ok_or_else(|| provider_not_configured(step))?
-                .execute_bridge(&request)
-                .await
-                .map_err(|source| provider_execute_error(&step.provider, source))?
-        }
-        OrderExecutionStepType::HyperliquidBridgeWithdrawal => {
-            let request =
-                BridgeExecutionRequest::hyperliquid_bridge_withdrawal_from_value(&step.request)
-                    .map_err(|source| provider_execute_error(&step.provider, source))?;
-            deps.action_providers
-                .bridge(&step.provider)
-                .ok_or_else(|| provider_not_configured(step))?
-                .execute_bridge(&request)
-                .await
-                .map_err(|source| provider_execute_error(&step.provider, source))?
-        }
-        OrderExecutionStepType::UnitDeposit => {
-            let request = UnitDepositStepRequest::from_value(&step.request)
-                .map_err(|source| provider_execute_error(&step.provider, source))?;
-            deps.action_providers
-                .unit(&step.provider)
-                .ok_or_else(|| provider_not_configured(step))?
-                .execute_deposit(&request)
-                .await
-                .map_err(|source| provider_execute_error(&step.provider, source))?
-        }
-        OrderExecutionStepType::UnitWithdrawal => {
-            let request = UnitWithdrawalStepRequest::from_value(&step.request)
-                .map_err(|source| provider_execute_error(&step.provider, source))?;
-            deps.action_providers
-                .unit(&step.provider)
-                .ok_or_else(|| provider_not_configured(step))?
-                .execute_withdrawal(&request)
-                .await
-                .map_err(|source| provider_execute_error(&step.provider, source))?
-        }
-        OrderExecutionStepType::HyperliquidTrade => {
-            let request = ExchangeExecutionRequest::hyperliquid_trade_from_value(&step.request)
-                .map_err(|source| provider_execute_error(&step.provider, source))?;
-            deps.action_providers
-                .exchange(&step.provider)
-                .ok_or_else(|| provider_not_configured(step))?
-                .execute_trade(&request)
-                .await
-                .map_err(|source| provider_execute_error(&step.provider, source))?
-        }
-        OrderExecutionStepType::HyperliquidLimitOrder => {
-            let request =
-                ExchangeExecutionRequest::hyperliquid_limit_order_from_value(&step.request)
-                    .map_err(|source| provider_execute_error(&step.provider, source))?;
-            deps.action_providers
-                .exchange(&step.provider)
-                .ok_or_else(|| provider_not_configured(step))?
-                .execute_trade(&request)
-                .await
-                .map_err(|source| provider_execute_error(&step.provider, source))?
-        }
-        OrderExecutionStepType::UniversalRouterSwap => {
-            let request = ExchangeExecutionRequest::universal_router_swap_from_value(&step.request)
-                .map_err(|source| provider_execute_error(&step.provider, source))?;
-            deps.action_providers
-                .exchange(&step.provider)
-                .ok_or_else(|| provider_not_configured(step))?
-                .execute_trade(&request)
-                .await
-                .map_err(|source| provider_execute_error(&step.provider, source))?
-        }
-    };
+        StepDispatchResult::Complete(completion) => Ok(completion),
+    }
+}
 
-    prepare_provider_completion(deps, step, intent).await
+fn execute_wait_for_deposit_step<'a>(
+    _deps: &'a OrderActivityDeps,
+    step: &'a OrderExecutionStep,
+) -> StepDispatchFuture<'a> {
+    async move {
+        Err(invariant_error(
+            "wait_for_deposit_not_provider_executable",
+            format!(
+                "{} is not provider executable",
+                step.step_type.to_db_string()
+            ),
+        ))
+    }
+    .boxed()
+}
+
+fn execute_refund_step<'a>(
+    deps: &'a OrderActivityDeps,
+    step: &'a OrderExecutionStep,
+) -> StepDispatchFuture<'a> {
+    async move {
+        let custody_vault_id = request_uuid_field(step, "source_custody_vault_id")?;
+        let recipient_address = request_string_field(step, "recipient_address")?;
+        let amount = request_string_field(step, "amount")?;
+        let receipt = deps
+            .custody_action_executor
+            .execute(CustodyActionRequest {
+                custody_vault_id,
+                action: CustodyAction::Transfer {
+                    to_address: recipient_address.clone(),
+                    amount: amount.clone(),
+                    bitcoin_fee_budget_sats: None,
+                },
+            })
+            .await
+            .map_err(|source| custody_action_error("execute refund transfer", source))?;
+        Ok(StepDispatchResult::Complete(StepCompletion {
+            response: json!({
+                "kind": "refund_transfer",
+                "recipient_address": recipient_address,
+                "amount": amount,
+                "tx_hash": &receipt.tx_hash,
+            }),
+            tx_hash: Some(receipt.tx_hash),
+            provider_state: ProviderExecutionState::default(),
+            outcome: StepExecutionOutcome::Completed,
+        }))
+    }
+    .boxed()
+}
+
+fn execute_across_bridge_step<'a>(
+    deps: &'a OrderActivityDeps,
+    step: &'a OrderExecutionStep,
+) -> StepDispatchFuture<'a> {
+    execute_bridge_step(deps, step, BridgeExecutionRequest::across_from_value)
+}
+
+fn execute_cctp_burn_step<'a>(
+    deps: &'a OrderActivityDeps,
+    step: &'a OrderExecutionStep,
+) -> StepDispatchFuture<'a> {
+    execute_bridge_step(deps, step, BridgeExecutionRequest::cctp_burn_from_value)
+}
+
+fn execute_cctp_receive_step<'a>(
+    deps: &'a OrderActivityDeps,
+    step: &'a OrderExecutionStep,
+) -> StepDispatchFuture<'a> {
+    async move {
+        let request_json = hydrate_cctp_receive_request(deps, step).await?;
+        execute_bridge_request(
+            deps,
+            step,
+            BridgeExecutionRequest::cctp_receive_from_value(&request_json)
+                .map_err(|source| provider_execute_error(&step.provider, source))?,
+        )
+        .await
+    }
+    .boxed()
+}
+
+fn execute_hyperliquid_bridge_deposit_step<'a>(
+    deps: &'a OrderActivityDeps,
+    step: &'a OrderExecutionStep,
+) -> StepDispatchFuture<'a> {
+    execute_bridge_step(
+        deps,
+        step,
+        BridgeExecutionRequest::hyperliquid_bridge_deposit_from_value,
+    )
+}
+
+fn execute_hyperliquid_bridge_withdrawal_step<'a>(
+    deps: &'a OrderActivityDeps,
+    step: &'a OrderExecutionStep,
+) -> StepDispatchFuture<'a> {
+    execute_bridge_step(
+        deps,
+        step,
+        BridgeExecutionRequest::hyperliquid_bridge_withdrawal_from_value,
+    )
+}
+
+fn execute_unit_deposit_step<'a>(
+    deps: &'a OrderActivityDeps,
+    step: &'a OrderExecutionStep,
+) -> StepDispatchFuture<'a> {
+    async move {
+        let request = UnitDepositStepRequest::from_value(&step.request)
+            .map_err(|source| provider_execute_error(&step.provider, source))?;
+        let intent = deps
+            .action_providers
+            .unit(&step.provider)
+            .ok_or_else(|| provider_not_configured(step))?
+            .execute_deposit(&request)
+            .await
+            .map_err(|source| provider_execute_error(&step.provider, source))?;
+        Ok(StepDispatchResult::ProviderIntent(intent))
+    }
+    .boxed()
+}
+
+fn execute_unit_withdrawal_step<'a>(
+    deps: &'a OrderActivityDeps,
+    step: &'a OrderExecutionStep,
+) -> StepDispatchFuture<'a> {
+    async move {
+        let request = UnitWithdrawalStepRequest::from_value(&step.request)
+            .map_err(|source| provider_execute_error(&step.provider, source))?;
+        let intent = deps
+            .action_providers
+            .unit(&step.provider)
+            .ok_or_else(|| provider_not_configured(step))?
+            .execute_withdrawal(&request)
+            .await
+            .map_err(|source| provider_execute_error(&step.provider, source))?;
+        Ok(StepDispatchResult::ProviderIntent(intent))
+    }
+    .boxed()
+}
+
+fn execute_hyperliquid_trade_step<'a>(
+    deps: &'a OrderActivityDeps,
+    step: &'a OrderExecutionStep,
+) -> StepDispatchFuture<'a> {
+    execute_exchange_step(
+        deps,
+        step,
+        ExchangeExecutionRequest::hyperliquid_trade_from_value,
+    )
+}
+
+fn execute_hyperliquid_limit_order_step<'a>(
+    deps: &'a OrderActivityDeps,
+    step: &'a OrderExecutionStep,
+) -> StepDispatchFuture<'a> {
+    execute_exchange_step(
+        deps,
+        step,
+        ExchangeExecutionRequest::hyperliquid_limit_order_from_value,
+    )
+}
+
+fn execute_universal_router_swap_step<'a>(
+    deps: &'a OrderActivityDeps,
+    step: &'a OrderExecutionStep,
+) -> StepDispatchFuture<'a> {
+    execute_exchange_step(
+        deps,
+        step,
+        ExchangeExecutionRequest::universal_router_swap_from_value,
+    )
+}
+
+fn execute_bridge_step<'a>(
+    deps: &'a OrderActivityDeps,
+    step: &'a OrderExecutionStep,
+    decode: fn(&Value) -> Result<BridgeExecutionRequest, String>,
+) -> StepDispatchFuture<'a> {
+    async move {
+        let request = decode(&step.request)
+            .map_err(|source| provider_execute_error(&step.provider, source))?;
+        execute_bridge_request(deps, step, request).await
+    }
+    .boxed()
+}
+
+async fn execute_bridge_request(
+    deps: &OrderActivityDeps,
+    step: &OrderExecutionStep,
+    request: BridgeExecutionRequest,
+) -> Result<StepDispatchResult, OrderActivityError> {
+    let intent = deps
+        .action_providers
+        .bridge(&step.provider)
+        .ok_or_else(|| provider_not_configured(step))?
+        .execute_bridge(&request)
+        .await
+        .map_err(|source| provider_execute_error(&step.provider, source))?;
+    Ok(StepDispatchResult::ProviderIntent(intent))
+}
+
+fn execute_exchange_step<'a>(
+    deps: &'a OrderActivityDeps,
+    step: &'a OrderExecutionStep,
+    decode: fn(&Value) -> Result<ExchangeExecutionRequest, String>,
+) -> StepDispatchFuture<'a> {
+    async move {
+        let request = decode(&step.request)
+            .map_err(|source| provider_execute_error(&step.provider, source))?;
+        let intent = deps
+            .action_providers
+            .exchange(&step.provider)
+            .ok_or_else(|| provider_not_configured(step))?
+            .execute_trade(&request)
+            .await
+            .map_err(|source| provider_execute_error(&step.provider, source))?;
+        Ok(StepDispatchResult::ProviderIntent(intent))
+    }
+    .boxed()
 }
 
 pub(super) async fn prepare_provider_completion(
