@@ -71,14 +71,14 @@ use super::types::{
     PreExecutionStaleQuoteCheck, PrepareManualInterventionRefundInput,
     PrepareManualInterventionRetryInput, ProviderHintKind, ProviderKind,
     ProviderOperationHintDecision, ProviderOperationHintEvidence, ProviderOperationHintSignal,
-    ProviderOperationHintVerified, ProviderOperationHintsPolled, RecoverAcrossOnchainLogInput,
-    RecoverablePositionKind, RefreshedAttemptMaterialized, RefreshedQuoteAttemptOutcome,
-    RefreshedQuoteAttemptShape, RefundPlanOutcome, RefundPlanShape, RefundUntenableReason,
-    ReleaseRefundManualInterventionInput, SettleProviderStepInput, SingleRefundPosition,
-    SingleRefundPositionDiscovery, SingleRefundPositionOutcome, StaleQuoteRefreshUntenableReason,
-    StaleRunningStepClassified, StaleRunningStepDecision, StepExecuted, StepExecutionOutcome,
-    StepFailureDecision, VerifyProviderOperationHintInput, WorkflowExecutionStep,
-    WriteFailedAttemptSnapshotInput,
+    ProviderOperationHintVerified, ProviderOperationHintsPolled, RawAmount,
+    RecoverAcrossOnchainLogInput, RecoverablePositionKind, RefreshedAttemptMaterialized,
+    RefreshedQuoteAttemptOutcome, RefreshedQuoteAttemptShape, RefundPlanOutcome, RefundPlanShape,
+    RefundUntenableReason, ReleaseRefundManualInterventionInput, SettleProviderStepInput,
+    SingleRefundPosition, SingleRefundPositionDiscovery, SingleRefundPositionOutcome,
+    StaleQuoteRefreshUntenableReason, StaleRunningStepClassified, StaleRunningStepDecision,
+    StepExecuted, StepExecutionOutcome, StepFailureDecision, VerifyProviderOperationHintInput,
+    WorkflowExecutionStep, WriteFailedAttemptSnapshotInput,
 };
 
 const MAX_EXECUTION_ATTEMPTS: i32 = 2;
@@ -3775,7 +3775,7 @@ impl RefundActivities {
                         funding_vault_id: Some(funding_vault_id.into()),
                         custody_vault_id: None,
                         asset: vault.deposit_asset,
-                        amount,
+                        amount: RawAmount::new(amount).map_err(activity_error_from_display)?,
                         hyperliquid_coin: None,
                         hyperliquid_canonical: None,
                     });
@@ -3811,7 +3811,7 @@ impl RefundActivities {
                                 chain: vault.chain,
                                 asset: asset_id,
                             },
-                            amount,
+                            amount: RawAmount::new(amount).map_err(activity_error_from_display)?,
                             hyperliquid_coin: None,
                             hyperliquid_canonical: None,
                         });
@@ -3853,7 +3853,7 @@ impl RefundActivities {
                             funding_vault_id: None,
                             custody_vault_id: Some(vault.id.into()),
                             asset,
-                            amount,
+                            amount: RawAmount::new(amount).map_err(activity_error_from_display)?,
                             hyperliquid_coin: Some(balance.coin),
                             hyperliquid_canonical: Some(canonical),
                         });
