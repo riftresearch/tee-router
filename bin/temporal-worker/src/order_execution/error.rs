@@ -84,6 +84,30 @@ impl OrderActivityError {
     }
 
     #[must_use]
+    pub fn provider_quote(provider: impl Into<String>, source: impl ToString) -> Self {
+        Self::ProviderQuote {
+            provider: provider.into(),
+            source: source.to_string(),
+        }
+    }
+
+    #[must_use]
+    pub fn provider_execute(provider: impl Into<String>, source: impl ToString) -> Self {
+        Self::ProviderExecute {
+            provider: provider.into(),
+            source: source.to_string(),
+        }
+    }
+
+    #[must_use]
+    pub fn provider_observe(provider: impl Into<String>, source: impl ToString) -> Self {
+        Self::ProviderObserve {
+            provider: provider.into(),
+            source: source.to_string(),
+        }
+    }
+
+    #[must_use]
     pub fn serialization(context: impl Into<String>, source: serde_json::Error) -> Self {
         Self::Serialization {
             context: context.into(),
@@ -159,5 +183,14 @@ mod tests {
 
         assert!(rendered.contains("step_owner"));
         assert!(rendered.contains("wrong attempt"));
+    }
+
+    #[test]
+    fn provider_execute_display_includes_provider_and_source() {
+        let error = OrderActivityError::provider_execute("hyperliquid", "rejected");
+        let rendered = error.to_string();
+
+        assert!(rendered.contains("hyperliquid"));
+        assert!(rendered.contains("rejected"));
     }
 }
