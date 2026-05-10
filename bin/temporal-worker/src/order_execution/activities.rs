@@ -338,11 +338,11 @@ impl OrderActivities {
                 RouterOrderQuote::MarketOrder(quote) => deps
                     .planner
                     .plan(&order, &source_vault, &quote, planned_at)
-                    .map_err(activity_error_from_display)?,
+                    .map_err(|source| provider_quote_error("market_order_route_planner", source))?,
                 RouterOrderQuote::LimitOrder(quote) => deps
                     .planner
                     .plan_limit_order(&order, &source_vault, &quote, planned_at)
-                    .map_err(activity_error_from_display)?,
+                    .map_err(|source| provider_quote_error("market_order_route_planner", source))?,
             };
             if route.legs.is_empty() || route.steps.is_empty() {
                 return Err(OrderActivityError::invariant(
@@ -2559,7 +2559,7 @@ async fn execute_running_step(
                 .ok_or_else(|| provider_not_configured(step))?
                 .execute_bridge(&request)
                 .await
-                .map_err(activity_error)?
+                .map_err(|source| provider_execute_error(&step.provider, source))?
         }
         OrderExecutionStepType::CctpBurn => {
             let request = BridgeExecutionRequest::cctp_burn_from_value(&step.request)
@@ -2569,7 +2569,7 @@ async fn execute_running_step(
                 .ok_or_else(|| provider_not_configured(step))?
                 .execute_bridge(&request)
                 .await
-                .map_err(activity_error)?
+                .map_err(|source| provider_execute_error(&step.provider, source))?
         }
         OrderExecutionStepType::CctpReceive => {
             let request_json = hydrate_cctp_receive_request(deps, step).await?;
@@ -2580,7 +2580,7 @@ async fn execute_running_step(
                 .ok_or_else(|| provider_not_configured(step))?
                 .execute_bridge(&request)
                 .await
-                .map_err(activity_error)?
+                .map_err(|source| provider_execute_error(&step.provider, source))?
         }
         OrderExecutionStepType::HyperliquidBridgeDeposit => {
             let request =
@@ -2591,7 +2591,7 @@ async fn execute_running_step(
                 .ok_or_else(|| provider_not_configured(step))?
                 .execute_bridge(&request)
                 .await
-                .map_err(activity_error)?
+                .map_err(|source| provider_execute_error(&step.provider, source))?
         }
         OrderExecutionStepType::HyperliquidBridgeWithdrawal => {
             let request =
@@ -2602,7 +2602,7 @@ async fn execute_running_step(
                 .ok_or_else(|| provider_not_configured(step))?
                 .execute_bridge(&request)
                 .await
-                .map_err(activity_error)?
+                .map_err(|source| provider_execute_error(&step.provider, source))?
         }
         OrderExecutionStepType::UnitDeposit => {
             let request =
@@ -2612,7 +2612,7 @@ async fn execute_running_step(
                 .ok_or_else(|| provider_not_configured(step))?
                 .execute_deposit(&request)
                 .await
-                .map_err(activity_error)?
+                .map_err(|source| provider_execute_error(&step.provider, source))?
         }
         OrderExecutionStepType::UnitWithdrawal => {
             let request =
@@ -2622,7 +2622,7 @@ async fn execute_running_step(
                 .ok_or_else(|| provider_not_configured(step))?
                 .execute_withdrawal(&request)
                 .await
-                .map_err(activity_error)?
+                .map_err(|source| provider_execute_error(&step.provider, source))?
         }
         OrderExecutionStepType::HyperliquidTrade => {
             let request = ExchangeExecutionRequest::hyperliquid_trade_from_value(&step.request)
@@ -2632,7 +2632,7 @@ async fn execute_running_step(
                 .ok_or_else(|| provider_not_configured(step))?
                 .execute_trade(&request)
                 .await
-                .map_err(activity_error)?
+                .map_err(|source| provider_execute_error(&step.provider, source))?
         }
         OrderExecutionStepType::HyperliquidLimitOrder => {
             let request =
@@ -2643,7 +2643,7 @@ async fn execute_running_step(
                 .ok_or_else(|| provider_not_configured(step))?
                 .execute_trade(&request)
                 .await
-                .map_err(activity_error)?
+                .map_err(|source| provider_execute_error(&step.provider, source))?
         }
         OrderExecutionStepType::UniversalRouterSwap => {
             let request = ExchangeExecutionRequest::universal_router_swap_from_value(&step.request)
@@ -2653,7 +2653,7 @@ async fn execute_running_step(
                 .ok_or_else(|| provider_not_configured(step))?
                 .execute_trade(&request)
                 .await
-                .map_err(activity_error)?
+                .map_err(|source| provider_execute_error(&step.provider, source))?
         }
     };
 
@@ -2668,7 +2668,7 @@ async fn prepare_provider_completion(
     match intent {
         ProviderExecutionIntent::ProviderOnly { response, state } => {
             let outcome = provider_only_outcome(step, state.operation.as_ref())
-                .map_err(activity_error_from_display)?;
+                .map_err(|source| provider_execute_error(&step.provider, source))?;
             Ok(StepCompletion {
                 response: json!({
                     "kind": "provider_only",
@@ -2696,7 +2696,7 @@ async fn prepare_provider_completion(
                 .await
                 .map_err(activity_error_from_display)?;
             let outcome = provider_operation_outcome(step, state.operation.as_ref())
-                .map_err(activity_error_from_display)?;
+                .map_err(|source| provider_execute_error(&step.provider, source))?;
             let observed_state = state
                 .operation
                 .as_ref()
@@ -2738,10 +2738,10 @@ async fn prepare_provider_completion(
                         .map(PostExecuteProvider::Unit)
                 })
                 .ok_or_else(|| {
-                    activity_error(format!(
-                        "custody_actions intent for {} requires a configured provider",
-                        step.provider
-                    ))
+                    provider_execute_error(
+                        &step.provider,
+                        "custody_actions intent requires a configured provider",
+                    )
                 })?;
             let actions_for_response = actions.clone();
             let mut receipts = Vec::with_capacity(actions.len());
@@ -2759,16 +2759,16 @@ async fn prepare_provider_completion(
             let patch = post_execute_provider
                 .post_execute(&provider_context, &receipts)
                 .await
-                .map_err(activity_error)?;
+                .map_err(|source| provider_execute_error(&step.provider, source))?;
             apply_post_execute_patch(&mut state, patch, &step.provider)
-                .map_err(activity_error_from_display)?;
+                .map_err(|source| provider_execute_error(&step.provider, source))?;
             let tx_hashes: Vec<String> = receipts
                 .iter()
                 .map(|receipt| receipt.tx_hash.clone())
                 .collect();
             let primary_tx_hash = receipts.last().map(|receipt| receipt.tx_hash.clone());
             let outcome = provider_operation_outcome(step, state.operation.as_ref())
-                .map_err(activity_error_from_display)?;
+                .map_err(|source| provider_execute_error(&step.provider, source))?;
             let observed_state = state
                 .operation
                 .as_ref()
@@ -2948,7 +2948,31 @@ fn apply_post_execute_patch(
 }
 
 fn provider_not_configured(step: &OrderExecutionStep) -> OrderActivityError {
-    activity_error(format!("{} provider is not configured", step.provider))
+    provider_execute_not_configured(&step.provider)
+}
+
+fn provider_quote_error(provider: impl AsRef<str>, source: impl ToString) -> OrderActivityError {
+    OrderActivityError::provider_quote(provider.as_ref(), source)
+}
+
+fn provider_execute_error(provider: impl AsRef<str>, source: impl ToString) -> OrderActivityError {
+    OrderActivityError::provider_execute(provider.as_ref(), source)
+}
+
+fn provider_observe_error(provider: impl AsRef<str>, source: impl ToString) -> OrderActivityError {
+    OrderActivityError::provider_observe(provider.as_ref(), source)
+}
+
+fn provider_quote_not_configured(provider: impl AsRef<str>) -> OrderActivityError {
+    provider_quote_error(provider, "provider is not configured")
+}
+
+fn provider_execute_not_configured(provider: impl AsRef<str>) -> OrderActivityError {
+    provider_execute_error(provider, "provider is not configured")
+}
+
+fn provider_observe_not_configured(provider: impl AsRef<str>) -> OrderActivityError {
+    provider_observe_error(provider, "provider is not configured")
 }
 
 fn failed_attempt_snapshot(order: &RouterOrder, failed_step: &OrderExecutionStep) -> Value {
@@ -7220,10 +7244,7 @@ impl QuoteRefreshActivities {
                                 .action_providers
                                 .exchange(transition.provider.as_str())
                                 .ok_or_else(|| {
-                                    activity_error(format!(
-                                        "exchange provider {} is not configured",
-                                        transition.provider.as_str()
-                                    ))
+                                    provider_quote_not_configured(transition.provider.as_str())
                                 })?;
                             let refreshed_quote = exchange
                                 .quote_trade(ExchangeQuoteRequest {
@@ -7253,12 +7274,14 @@ impl QuoteRefreshActivities {
                                     )?,
                                 })
                                 .await
-                                .map_err(activity_error_from_display)?
+                                .map_err(|source| {
+                                    provider_quote_error(transition.provider.as_str(), source)
+                                })?
                                 .ok_or_else(|| {
-                                    activity_error(format!(
-                                        "exchange provider {} returned no refreshed quote",
-                                        exchange.id()
-                                    ))
+                                    provider_quote_error(
+                                        exchange.id(),
+                                        "provider returned no refreshed quote",
+                                    )
                                 })?;
                             expires_at = expires_at.min(refreshed_quote.expires_at);
                             cursor_amount = refreshed_quote.amount_out.clone();
@@ -7277,10 +7300,7 @@ impl QuoteRefreshActivities {
                                 .action_providers
                                 .bridge(transition.provider.as_str())
                                 .ok_or_else(|| {
-                                    activity_error(format!(
-                                        "bridge provider {} is not configured",
-                                        transition.provider.as_str()
-                                    ))
+                                    provider_quote_not_configured(transition.provider.as_str())
                                 })?;
                             let refreshed_quote = bridge
                                 .quote_bridge(BridgeQuoteRequest {
@@ -7306,12 +7326,14 @@ impl QuoteRefreshActivities {
                                     partial_fills_enabled: false,
                                 })
                                 .await
-                                .map_err(activity_error_from_display)?
+                                .map_err(|source| {
+                                    provider_quote_error(transition.provider.as_str(), source)
+                                })?
                                 .ok_or_else(|| {
-                                    activity_error(format!(
-                                        "bridge provider {} returned no refreshed quote",
-                                        bridge.id()
-                                    ))
+                                    provider_quote_error(
+                                        bridge.id(),
+                                        "provider returned no refreshed quote",
+                                    )
                                 })?;
                             expires_at = expires_at.min(refreshed_quote.expires_at);
                             cursor_amount = refreshed_quote.amount_out.clone();
@@ -7325,10 +7347,7 @@ impl QuoteRefreshActivities {
                                 .action_providers
                                 .unit(transition.provider.as_str())
                                 .ok_or_else(|| {
-                                    activity_error(format!(
-                                        "unit provider {} is not configured",
-                                        transition.provider.as_str()
-                                    ))
+                                    provider_quote_not_configured(transition.provider.as_str())
                                 })?;
                             let (unit_amount_in, provider_quote) = if let Some(fee_reserve) =
                                 refresh_unit_deposit_fee_reserve(&original_quote, transition)?
@@ -7347,10 +7366,10 @@ impl QuoteRefreshActivities {
                                 (cursor_amount.clone(), json!({}))
                             };
                             if !unit.supports_deposit(&transition.input.asset) {
-                                return Err(activity_error(format!(
-                                    "unit provider {} does not support refreshed deposit",
-                                    unit.id()
-                                )));
+                                return Err(provider_quote_error(
+                                    unit.id(),
+                                    "provider does not support refreshed deposit",
+                                ));
                             }
                             cursor_amount = unit_amount_in.clone();
                             refreshed_legs.push(refresh_unit_deposit_quote_leg(
@@ -7365,10 +7384,7 @@ impl QuoteRefreshActivities {
                                 .action_providers
                                 .exchange(transition.provider.as_str())
                                 .ok_or_else(|| {
-                                    activity_error(format!(
-                                        "exchange provider {} is not configured",
-                                        transition.provider.as_str()
-                                    ))
+                                    provider_quote_not_configured(transition.provider.as_str())
                                 })?;
                             let mut quote_amount_in = cursor_amount.clone();
                             if index > 0
@@ -7398,12 +7414,14 @@ impl QuoteRefreshActivities {
                                     recipient_address: order.recipient_address.clone(),
                                 })
                                 .await
-                                .map_err(activity_error_from_display)?
+                                .map_err(|source| {
+                                    provider_quote_error(transition.provider.as_str(), source)
+                                })?
                                 .ok_or_else(|| {
-                                    activity_error(format!(
-                                        "exchange provider {} returned no refreshed quote",
-                                        exchange.id()
-                                    ))
+                                    provider_quote_error(
+                                        exchange.id(),
+                                        "provider returned no refreshed quote",
+                                    )
                                 })?;
                             expires_at = expires_at.min(refreshed_quote.expires_at);
                             cursor_amount = refreshed_quote.amount_out.clone();
@@ -7419,16 +7437,13 @@ impl QuoteRefreshActivities {
                                 .action_providers
                                 .unit(transition.provider.as_str())
                                 .ok_or_else(|| {
-                                    activity_error(format!(
-                                        "unit provider {} is not configured",
-                                        transition.provider.as_str()
-                                    ))
+                                    provider_quote_not_configured(transition.provider.as_str())
                                 })?;
                             if !unit.supports_withdrawal(&transition.output.asset) {
-                                return Err(activity_error(format!(
-                                    "unit provider {} does not support refreshed withdrawal",
-                                    unit.id()
-                                )));
+                                return Err(provider_quote_error(
+                                    unit.id(),
+                                    "provider does not support refreshed withdrawal",
+                                ));
                             }
                             let recipient_address = refresh_recipient_address(
                                 &order,
@@ -7487,16 +7502,13 @@ impl QuoteRefreshActivities {
                                 .action_providers
                                 .unit(transition.provider.as_str())
                                 .ok_or_else(|| {
-                                    activity_error(format!(
-                                        "unit provider {} is not configured",
-                                        transition.provider.as_str()
-                                    ))
+                                    provider_quote_not_configured(transition.provider.as_str())
                                 })?;
                             if !unit.supports_withdrawal(&transition.output.asset) {
-                                return Err(activity_error(format!(
-                                    "unit provider {} does not support refreshed withdrawal",
-                                    unit.id()
-                                )));
+                                return Err(provider_quote_error(
+                                    unit.id(),
+                                    "provider does not support refreshed withdrawal",
+                                ));
                             }
                             let recipient_address = refresh_recipient_address(
                                 &order,
@@ -7518,10 +7530,7 @@ impl QuoteRefreshActivities {
                                 .action_providers
                                 .exchange(transition.provider.as_str())
                                 .ok_or_else(|| {
-                                    activity_error(format!(
-                                        "exchange provider {} is not configured",
-                                        transition.provider.as_str()
-                                    ))
+                                    provider_quote_not_configured(transition.provider.as_str())
                                 })?;
                             let refreshed_quote = exchange
                                 .quote_trade(ExchangeQuoteRequest {
@@ -7541,12 +7550,14 @@ impl QuoteRefreshActivities {
                                     recipient_address: order.recipient_address.clone(),
                                 })
                                 .await
-                                .map_err(activity_error_from_display)?
+                                .map_err(|source| {
+                                    provider_quote_error(transition.provider.as_str(), source)
+                                })?
                                 .ok_or_else(|| {
-                                    activity_error(format!(
-                                        "exchange provider {} returned no refreshed quote",
-                                        exchange.id()
-                                    ))
+                                    provider_quote_error(
+                                        exchange.id(),
+                                        "provider returned no refreshed quote",
+                                    )
                                 })?;
                             expires_at = expires_at.min(refreshed_quote.expires_at);
                             let mut next_required = refreshed_quote.amount_in.clone();
@@ -7599,10 +7610,7 @@ impl QuoteRefreshActivities {
                                 .action_providers
                                 .exchange(transition.provider.as_str())
                                 .ok_or_else(|| {
-                                    activity_error(format!(
-                                        "exchange provider {} is not configured",
-                                        transition.provider.as_str()
-                                    ))
+                                    provider_quote_not_configured(transition.provider.as_str())
                                 })?;
                             let refreshed_quote = exchange
                                 .quote_trade(ExchangeQuoteRequest {
@@ -7632,12 +7640,14 @@ impl QuoteRefreshActivities {
                                     )?,
                                 })
                                 .await
-                                .map_err(activity_error_from_display)?
+                                .map_err(|source| {
+                                    provider_quote_error(transition.provider.as_str(), source)
+                                })?
                                 .ok_or_else(|| {
-                                    activity_error(format!(
-                                        "exchange provider {} returned no refreshed quote",
-                                        exchange.id()
-                                    ))
+                                    provider_quote_error(
+                                        exchange.id(),
+                                        "provider returned no refreshed quote",
+                                    )
                                 })?;
                             expires_at = expires_at.min(refreshed_quote.expires_at);
                             required_output = refreshed_quote.amount_in.clone();
@@ -7657,10 +7667,7 @@ impl QuoteRefreshActivities {
                                 .action_providers
                                 .bridge(transition.provider.as_str())
                                 .ok_or_else(|| {
-                                    activity_error(format!(
-                                        "bridge provider {} is not configured",
-                                        transition.provider.as_str()
-                                    ))
+                                    provider_quote_not_configured(transition.provider.as_str())
                                 })?;
                             let refreshed_quote = bridge
                                 .quote_bridge(BridgeQuoteRequest {
@@ -7690,12 +7697,14 @@ impl QuoteRefreshActivities {
                                     partial_fills_enabled: false,
                                 })
                                 .await
-                                .map_err(activity_error_from_display)?
+                                .map_err(|source| {
+                                    provider_quote_error(transition.provider.as_str(), source)
+                                })?
                                 .ok_or_else(|| {
-                                    activity_error(format!(
-                                        "bridge provider {} returned no refreshed quote",
-                                        bridge.id()
-                                    ))
+                                    provider_quote_error(
+                                        bridge.id(),
+                                        "provider returned no refreshed quote",
+                                    )
                                 })?;
                             expires_at = expires_at.min(refreshed_quote.expires_at);
                             required_output = refreshed_quote.amount_in.clone();
@@ -7707,16 +7716,13 @@ impl QuoteRefreshActivities {
                                 .action_providers
                                 .unit(transition.provider.as_str())
                                 .ok_or_else(|| {
-                                    activity_error(format!(
-                                        "unit provider {} is not configured",
-                                        transition.provider.as_str()
-                                    ))
+                                    provider_quote_not_configured(transition.provider.as_str())
                                 })?;
                             if !unit.supports_deposit(&transition.input.asset) {
-                                return Err(activity_error(format!(
-                                    "unit provider {} does not support refreshed deposit",
-                                    unit.id()
-                                )));
+                                return Err(provider_quote_error(
+                                    unit.id(),
+                                    "provider does not support refreshed deposit",
+                                ));
                             }
                             let (unit_amount_in, upstream_required, provider_quote) =
                                 if let Some(fee_reserve) =
@@ -8514,12 +8520,7 @@ async fn verify_across_fill_hint(
     let provider = deps
         .action_providers
         .bridge(&operation.provider)
-        .ok_or_else(|| {
-            activity_error(format!(
-                "bridge provider {} is not configured",
-                operation.provider
-            ))
-        })?;
+        .ok_or_else(|| provider_observe_not_configured(&operation.provider))?;
     let observation = provider
         .observe_bridge_operation(ProviderOperationObservationRequest {
             operation_id: operation.id,
@@ -8531,7 +8532,7 @@ async fn verify_across_fill_hint(
             hint_evidence: provider_hint_signal_evidence(&input.signal),
         })
         .await
-        .map_err(activity_error)?;
+        .map_err(|source| provider_observe_error(&operation.provider, source))?;
 
     let Some(observation) = observation else {
         return Ok(provider_hint_deferred(
@@ -8669,12 +8670,7 @@ async fn verify_cctp_attestation_hint(
     let provider = deps
         .action_providers
         .bridge(&operation.provider)
-        .ok_or_else(|| {
-            activity_error(format!(
-                "bridge provider {} is not configured",
-                operation.provider
-            ))
-        })?;
+        .ok_or_else(|| provider_observe_not_configured(&operation.provider))?;
     let observation = provider
         .observe_bridge_operation(ProviderOperationObservationRequest {
             operation_id: operation.id,
@@ -8686,7 +8682,7 @@ async fn verify_cctp_attestation_hint(
             hint_evidence: provider_hint_signal_evidence(&input.signal),
         })
         .await
-        .map_err(activity_error)?;
+        .map_err(|source| provider_observe_error(&operation.provider, source))?;
 
     let Some(observation) = observation else {
         return Ok(provider_hint_deferred(
@@ -8820,12 +8816,7 @@ async fn verify_hyperliquid_trade_hint(
     let provider = deps
         .action_providers
         .exchange(&operation.provider)
-        .ok_or_else(|| {
-            activity_error(format!(
-                "exchange provider {} is not configured",
-                operation.provider
-            ))
-        })?;
+        .ok_or_else(|| provider_observe_not_configured(&operation.provider))?;
     let observation = provider
         .observe_trade_operation(ProviderOperationObservationRequest {
             operation_id: operation.id,
@@ -8837,7 +8828,7 @@ async fn verify_hyperliquid_trade_hint(
             hint_evidence: provider_hint_signal_evidence(&input.signal),
         })
         .await
-        .map_err(activity_error)?;
+        .map_err(|source| provider_observe_error(&operation.provider, source))?;
 
     let Some(observation) = observation else {
         return Ok(provider_hint_deferred(
@@ -9028,12 +9019,7 @@ async fn verify_unit_deposit_hint(
     let provider = deps
         .action_providers
         .unit(&operation.provider)
-        .ok_or_else(|| {
-            activity_error(format!(
-                "unit provider {} is not configured",
-                operation.provider
-            ))
-        })?;
+        .ok_or_else(|| provider_observe_not_configured(&operation.provider))?;
     let provider_observation = provider
         .observe_unit_operation(ProviderOperationObservationRequest {
             operation_id: operation.id,
@@ -9045,7 +9031,7 @@ async fn verify_unit_deposit_hint(
             hint_evidence: unit_deposit_evidence_json(evidence),
         })
         .await
-        .map_err(activity_error)?;
+        .map_err(|source| provider_observe_error(&operation.provider, source))?;
     let (status, provider_observed_state, provider_tx_hash, provider_error, provider_response) =
         if let Some(observation) = provider_observation {
             (
@@ -9222,31 +9208,21 @@ async fn verify_provider_observation_hint(
             let provider = deps
                 .action_providers
                 .bridge(&operation.provider)
-                .ok_or_else(|| {
-                    activity_error(format!(
-                        "bridge provider {} is not configured",
-                        operation.provider
-                    ))
-                })?;
+                .ok_or_else(|| provider_observe_not_configured(&operation.provider))?;
             provider
                 .observe_bridge_operation(request)
                 .await
-                .map_err(activity_error)?
+                .map_err(|source| provider_observe_error(&operation.provider, source))?
         }
         ProviderOperationType::UnitDeposit | ProviderOperationType::UnitWithdrawal => {
             let provider = deps
                 .action_providers
                 .unit(&operation.provider)
-                .ok_or_else(|| {
-                    activity_error(format!(
-                        "unit provider {} is not configured",
-                        operation.provider
-                    ))
-                })?;
+                .ok_or_else(|| provider_observe_not_configured(&operation.provider))?;
             provider
                 .observe_unit_operation(request)
                 .await
-                .map_err(activity_error)?
+                .map_err(|source| provider_observe_error(&operation.provider, source))?
         }
         ProviderOperationType::HyperliquidTrade
         | ProviderOperationType::HyperliquidLimitOrder
@@ -9254,16 +9230,11 @@ async fn verify_provider_observation_hint(
             let provider = deps
                 .action_providers
                 .exchange(&operation.provider)
-                .ok_or_else(|| {
-                    activity_error(format!(
-                        "exchange provider {} is not configured",
-                        operation.provider
-                    ))
-                })?;
+                .ok_or_else(|| provider_observe_not_configured(&operation.provider))?;
             provider
                 .observe_trade_operation(request)
                 .await
-                .map_err(activity_error)?
+                .map_err(|source| provider_observe_error(&operation.provider, source))?
         }
     };
 
