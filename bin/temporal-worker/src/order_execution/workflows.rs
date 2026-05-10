@@ -18,15 +18,15 @@ use super::activities::{
 };
 use super::refund_workflow_id;
 use super::types::{
-    AcknowledgeManualInterventionInput, AcknowledgeUnrecoverableSignal,
+    AcknowledgeManualInterventionInput, AcknowledgeReason, AcknowledgeUnrecoverableSignal,
     CheckPreExecutionStaleQuoteInput, ClassifyStaleRunningStepInput, ClassifyStepFailureInput,
     ComposeRefreshedQuoteAttemptInput, DiscoverSingleRefundPositionInput, ExecuteStepInput,
     FinalizeOrderOrRefundInput, FinalizedOrder, FundingVaultFundedSignal,
-    LoadManualInterventionContextInput, LoadOrderExecutionStateInput, ManualReleaseSignal,
-    ManualResolutionSignalKind, ManualTriggerRefundSignal, MarkOrderCompletedInput,
-    MaterializeExecutionAttemptInput, MaterializeRefreshedAttemptInput, MaterializeRefundPlanInput,
-    MaterializeRetryAttemptInput, OrderTerminalStatus, OrderWorkflowDebugCursor,
-    OrderWorkflowInput, OrderWorkflowOutput, OrderWorkflowPhase,
+    LoadManualInterventionContextInput, LoadOrderExecutionStateInput, ManualInterventionScope,
+    ManualReleaseSignal, ManualResolutionSignalKind, ManualTriggerRefundSignal,
+    MarkOrderCompletedInput, MaterializeExecutionAttemptInput, MaterializeRefreshedAttemptInput,
+    MaterializeRefundPlanInput, MaterializeRetryAttemptInput, OrderTerminalStatus,
+    OrderWorkflowDebugCursor, OrderWorkflowInput, OrderWorkflowOutput, OrderWorkflowPhase,
     PersistProviderOperationStatusInput, PersistProviderReceiptInput, PersistStepFailedInput,
     PersistStepReadyToFireInput, PollProviderOperationHintsInput,
     PrepareManualInterventionRefundInput, PrepareManualInterventionRetryInput,
@@ -112,7 +112,7 @@ impl OrderWorkflow {
                     OrderActivities::load_manual_intervention_context,
                     LoadManualInterventionContextInput {
                         order_id: input.order_id,
-                        refund_manual: false,
+                        scope: ManualInterventionScope::OrderAttempt,
                     },
                     db_activity_options.clone(),
                 )
@@ -1182,9 +1182,9 @@ async fn wait_for_manual_intervention_resolution(
                             order_id,
                             Some(attempt_id),
                             Some(step_id),
-                            false,
+                            ManualInterventionScope::OrderAttempt,
                             signal,
-                            false,
+                            AcknowledgeReason::OperatorTerminal,
                             db_activity_options.clone(),
                         )
                         .await?;
@@ -1204,9 +1204,9 @@ async fn wait_for_manual_intervention_resolution(
                     order_id,
                     Some(attempt_id),
                     Some(step_id),
-                    false,
+                    ManualInterventionScope::OrderAttempt,
                     zombie_cleanup_signal(),
-                    true,
+                    AcknowledgeReason::ZombieCleanup,
                     db_activity_options.clone(),
                 )
                 .await?;
@@ -1227,9 +1227,9 @@ async fn acknowledge_manual_intervention_terminal(
     order_id: WorkflowOrderId,
     attempt_id: Option<WorkflowAttemptId>,
     step_id: Option<WorkflowStepId>,
-    refund_manual: bool,
+    scope: ManualInterventionScope,
     signal: AcknowledgeUnrecoverableSignal,
-    zombie_cleanup: bool,
+    reason: AcknowledgeReason,
     db_activity_options: ActivityOptions,
 ) -> WorkflowResult<FinalizedOrder> {
     Ok(ctx
@@ -1239,9 +1239,9 @@ async fn acknowledge_manual_intervention_terminal(
                 order_id,
                 attempt_id,
                 step_id,
-                refund_manual,
+                scope,
                 signal,
-                zombie_cleanup,
+                reason,
             },
             db_activity_options,
         )
@@ -1417,7 +1417,7 @@ async fn wait_for_refund_manual_intervention_resolution(
                             refund_attempt_id,
                             step_id,
                             signal,
-                            false,
+                            AcknowledgeReason::OperatorTerminal,
                             db_activity_options.clone(),
                         )
                         .await?;
@@ -1438,7 +1438,7 @@ async fn wait_for_refund_manual_intervention_resolution(
                     refund_attempt_id,
                     step_id,
                     zombie_cleanup_signal(),
-                    true,
+                    AcknowledgeReason::ZombieCleanup,
                     db_activity_options.clone(),
                 )
                 .await?;
@@ -1460,7 +1460,7 @@ async fn acknowledge_refund_manual_intervention_terminal(
     attempt_id: Option<WorkflowAttemptId>,
     step_id: Option<WorkflowStepId>,
     signal: AcknowledgeUnrecoverableSignal,
-    zombie_cleanup: bool,
+    reason: AcknowledgeReason,
     db_activity_options: ActivityOptions,
 ) -> WorkflowResult<FinalizedOrder> {
     Ok(ctx
@@ -1470,9 +1470,9 @@ async fn acknowledge_refund_manual_intervention_terminal(
                 order_id,
                 attempt_id,
                 step_id,
-                refund_manual: true,
+                scope: ManualInterventionScope::RefundAttempt,
                 signal,
-                zombie_cleanup,
+                reason,
             },
             db_activity_options,
         )

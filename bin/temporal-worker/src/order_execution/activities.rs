@@ -57,27 +57,28 @@ use uuid::Uuid;
 use crate::telemetry;
 
 use super::types::{
-    AcknowledgeManualInterventionInput, AcrossOnchainLogRecovered, BoundaryPersisted,
-    CheckPreExecutionStaleQuoteInput, ClassifyStaleRunningStepInput, ClassifyStepFailureInput,
-    ComposeRefreshedQuoteAttemptInput, DiscoverSingleRefundPositionInput, ExecuteStepInput,
-    ExecutionPlan, FailedAttemptSnapshotWritten, FinalizeOrderOrRefundInput, FinalizedOrder,
-    LoadManualInterventionContextInput, LoadOrderExecutionStateInput,
-    ManualInterventionWorkflowContext, MarkOrderCompletedInput, MaterializeExecutionAttemptInput,
-    MaterializeRefreshedAttemptInput, MaterializeRefundPlanInput, MaterializeRetryAttemptInput,
-    MaterializedExecutionAttempt, OrderCompleted, OrderExecutionState, OrderTerminalStatus,
-    OrderWorkflowPhase, PersistProviderOperationStatusInput, PersistProviderReceiptInput,
-    PersistStepFailedInput, PersistStepReadyToFireInput, PersistenceBoundary,
-    PollProviderOperationHintsInput, PreExecutionStaleQuoteCheck,
-    PrepareManualInterventionRefundInput, PrepareManualInterventionRetryInput, ProviderHintKind,
-    ProviderKind, ProviderOperationHintDecision, ProviderOperationHintEvidence,
-    ProviderOperationHintSignal, ProviderOperationHintVerified, ProviderOperationHintsPolled,
-    RecoverAcrossOnchainLogInput, RecoverablePositionKind, RefreshedAttemptMaterialized,
-    RefreshedQuoteAttemptOutcome, RefreshedQuoteAttemptShape, RefundPlanOutcome, RefundPlanShape,
-    RefundUntenableReason, ReleaseRefundManualInterventionInput, SettleProviderStepInput,
-    SingleRefundPosition, SingleRefundPositionDiscovery, SingleRefundPositionOutcome,
-    StaleQuoteRefreshUntenableReason, StaleRunningStepClassified, StaleRunningStepDecision,
-    StepExecuted, StepExecutionOutcome, StepFailureDecision, VerifyProviderOperationHintInput,
-    WorkflowExecutionStep, WriteFailedAttemptSnapshotInput,
+    AcknowledgeManualInterventionInput, AcknowledgeReason, AcrossOnchainLogRecovered,
+    BoundaryPersisted, CheckPreExecutionStaleQuoteInput, ClassifyStaleRunningStepInput,
+    ClassifyStepFailureInput, ComposeRefreshedQuoteAttemptInput, DiscoverSingleRefundPositionInput,
+    ExecuteStepInput, ExecutionPlan, FailedAttemptSnapshotWritten, FinalizeOrderOrRefundInput,
+    FinalizedOrder, LoadManualInterventionContextInput, LoadOrderExecutionStateInput,
+    ManualInterventionScope, ManualInterventionWorkflowContext, MarkOrderCompletedInput,
+    MaterializeExecutionAttemptInput, MaterializeRefreshedAttemptInput, MaterializeRefundPlanInput,
+    MaterializeRetryAttemptInput, MaterializedExecutionAttempt, OrderCompleted,
+    OrderExecutionState, OrderTerminalStatus, OrderWorkflowPhase,
+    PersistProviderOperationStatusInput, PersistProviderReceiptInput, PersistStepFailedInput,
+    PersistStepReadyToFireInput, PersistenceBoundary, PollProviderOperationHintsInput,
+    PreExecutionStaleQuoteCheck, PrepareManualInterventionRefundInput,
+    PrepareManualInterventionRetryInput, ProviderHintKind, ProviderKind,
+    ProviderOperationHintDecision, ProviderOperationHintEvidence, ProviderOperationHintSignal,
+    ProviderOperationHintVerified, ProviderOperationHintsPolled, RecoverAcrossOnchainLogInput,
+    RecoverablePositionKind, RefreshedAttemptMaterialized, RefreshedQuoteAttemptOutcome,
+    RefreshedQuoteAttemptShape, RefundPlanOutcome, RefundPlanShape, RefundUntenableReason,
+    ReleaseRefundManualInterventionInput, SettleProviderStepInput, SingleRefundPosition,
+    SingleRefundPositionDiscovery, SingleRefundPositionOutcome, StaleQuoteRefreshUntenableReason,
+    StaleRunningStepClassified, StaleRunningStepDecision, StepExecuted, StepExecutionOutcome,
+    StepFailureDecision, VerifyProviderOperationHintInput, WorkflowExecutionStep,
+    WriteFailedAttemptSnapshotInput,
 };
 
 const MAX_EXECUTION_ATTEMPTS: i32 = 2;
@@ -375,10 +376,11 @@ impl OrderActivities {
     ) -> Result<ManualInterventionWorkflowContext, ActivityError> {
         record_activity("load_manual_intervention_context", async move {
             let deps = self.deps()?;
-            let expected_attempt_kind = if input.refund_manual {
-                OrderExecutionAttemptKind::RefundRecovery
-            } else {
-                OrderExecutionAttemptKind::PrimaryExecution
+            let expected_attempt_kind = match input.scope {
+                ManualInterventionScope::OrderAttempt => {
+                    OrderExecutionAttemptKind::PrimaryExecution
+                }
+                ManualInterventionScope::RefundAttempt => OrderExecutionAttemptKind::RefundRecovery,
             };
             let attempt = deps
                 .db
@@ -1337,14 +1339,19 @@ impl OrderActivities {
     ) -> Result<FinalizedOrder, ActivityError> {
         record_activity("acknowledge_manual_intervention_terminal", async move {
             let deps = self.deps()?;
-            let terminal_status = if input.refund_manual {
-                OrderTerminalStatus::RefundManualInterventionRequired
-            } else {
-                OrderTerminalStatus::ManualInterventionRequired
+            let refund_manual = matches!(input.scope, ManualInterventionScope::RefundAttempt);
+            let zombie_cleanup = matches!(input.reason, AcknowledgeReason::ZombieCleanup);
+            let terminal_status = match input.scope {
+                ManualInterventionScope::OrderAttempt => {
+                    OrderTerminalStatus::ManualInterventionRequired
+                }
+                ManualInterventionScope::RefundAttempt => {
+                    OrderTerminalStatus::RefundManualInterventionRequired
+                }
             };
             let resolution = json!({
                 "kind": "manual_intervention_terminal_ack",
-                "action": if input.zombie_cleanup {
+                "action": if zombie_cleanup {
                     "zombie_cleanup"
                 } else {
                     "acknowledge_unrecoverable"
@@ -1360,7 +1367,7 @@ impl OrderActivities {
                     input.order_id.inner(),
                     input.attempt_id.map(|id| id.inner()),
                     input.step_id.map(|id| id.inner()),
-                    input.refund_manual,
+                    refund_manual,
                     resolution,
                     Utc::now(),
                 )
@@ -1369,7 +1376,7 @@ impl OrderActivities {
             tracing::info!(
                 order_id = %order.id,
                 terminal_status = ?terminal_status,
-                zombie_cleanup = input.zombie_cleanup,
+                zombie_cleanup,
                 event_name = "order.manual_intervention_terminal_acknowledged",
                 "order.manual_intervention_terminal_acknowledged"
             );
