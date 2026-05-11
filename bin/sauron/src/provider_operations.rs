@@ -3,6 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use chrono::{DateTime, Utc};
 use metrics::{gauge, histogram};
 use router_core::models::{ProviderOperationStatus, ProviderOperationType};
+use router_temporal::WorkflowStepId;
 use serde_json::Value;
 use snafu::ResultExt;
 use sqlx_core::row::Row;
@@ -15,36 +16,42 @@ use crate::error::{ReplicaDatabaseQuerySnafu, Result};
 
 const FULL_PROVIDER_OPERATION_WATCH_QUERY: &str = r#"
 SELECT
-  id::text AS operation_id,
-  provider,
-  operation_type,
-  provider_ref,
-  status,
-  request_json,
-  response_json,
-  observed_state_json,
-  updated_at
-FROM public.order_provider_operations
-WHERE operation_type IN ('across_bridge', 'cctp_bridge', 'hyperliquid_bridge_deposit', 'hyperliquid_bridge_withdrawal', 'unit_deposit', 'unit_withdrawal', 'hyperliquid_trade', 'hyperliquid_limit_order', 'universal_router_swap')
-  AND status IN ('submitted', 'waiting_external')
-ORDER BY updated_at ASC, id ASC
+  opo.id::text AS operation_id,
+  opo.execution_step_id::text AS execution_step_id,
+  opo.provider,
+  opo.operation_type,
+  opo.provider_ref,
+  opo.status,
+  opo.request_json,
+  opo.response_json,
+  opo.observed_state_json,
+  opo.updated_at
+FROM public.order_provider_operations opo
+JOIN public.order_execution_steps oes ON oes.id = opo.execution_step_id
+WHERE opo.operation_type IN ('across_bridge', 'cctp_bridge', 'hyperliquid_bridge_deposit', 'hyperliquid_bridge_withdrawal', 'unit_deposit', 'unit_withdrawal', 'hyperliquid_trade', 'hyperliquid_limit_order', 'universal_router_swap')
+  AND opo.status IN ('submitted', 'waiting_external')
+  AND oes.status IN ('running', 'waiting')
+ORDER BY opo.updated_at ASC, opo.id ASC
 "#;
 
 const TARGETED_PROVIDER_OPERATION_WATCH_QUERY: &str = r#"
 SELECT
-  id::text AS operation_id,
-  provider,
-  operation_type,
-  provider_ref,
-  status,
-  request_json,
-  response_json,
-  observed_state_json,
-  updated_at
-FROM public.order_provider_operations
-WHERE id = $1::uuid
-  AND operation_type IN ('across_bridge', 'cctp_bridge', 'hyperliquid_bridge_deposit', 'hyperliquid_bridge_withdrawal', 'unit_deposit', 'unit_withdrawal', 'hyperliquid_trade', 'hyperliquid_limit_order', 'universal_router_swap')
-  AND status IN ('submitted', 'waiting_external')
+  opo.id::text AS operation_id,
+  opo.execution_step_id::text AS execution_step_id,
+  opo.provider,
+  opo.operation_type,
+  opo.provider_ref,
+  opo.status,
+  opo.request_json,
+  opo.response_json,
+  opo.observed_state_json,
+  opo.updated_at
+FROM public.order_provider_operations opo
+JOIN public.order_execution_steps oes ON oes.id = opo.execution_step_id
+WHERE opo.id = $1::uuid
+  AND opo.operation_type IN ('across_bridge', 'cctp_bridge', 'hyperliquid_bridge_deposit', 'hyperliquid_bridge_withdrawal', 'unit_deposit', 'unit_withdrawal', 'hyperliquid_trade', 'hyperliquid_limit_order', 'universal_router_swap')
+  AND opo.status IN ('submitted', 'waiting_external')
+  AND oes.status IN ('running', 'waiting')
 "#;
 
 const SAURON_PROVIDER_OPERATION_WATCH_COUNT_METRIC: &str = "sauron_provider_operation_watch_count";
@@ -57,6 +64,7 @@ const SAURON_PROVIDER_OPERATION_LOAD_WATCH_DURATION_SECONDS: &str =
 #[derive(Debug, Clone)]
 pub struct ProviderOperationWatchEntry {
     pub operation_id: Uuid,
+    pub execution_step_id: WorkflowStepId,
     pub provider: String,
     pub operation_type: ProviderOperationType,
     pub provider_ref: Option<String>,
@@ -298,6 +306,19 @@ fn parse_provider_operation_row(row: sqlx_postgres::PgRow) -> Result<ProviderOpe
         Uuid::parse_str(&operation_id_raw).map_err(|_| crate::error::Error::InvalidWatchRow {
             message: format!("provider operation id {operation_id_raw} was not a valid UUID"),
         })?;
+    let execution_step_id_raw: String =
+        row.try_get("execution_step_id")
+            .map_err(|_| crate::error::Error::InvalidWatchRow {
+                message: format!("provider operation {operation_id} missing execution_step_id"),
+            })?;
+    let execution_step_id =
+        Uuid::parse_str(&execution_step_id_raw).map_err(|_| {
+            crate::error::Error::InvalidWatchRow {
+                message: format!(
+                    "provider operation {operation_id} execution_step_id {execution_step_id_raw} was not a valid UUID"
+                ),
+            }
+        })?;
     let operation_type_raw: String =
         row.try_get("operation_type")
             .map_err(|_| crate::error::Error::InvalidWatchRow {
@@ -326,6 +347,7 @@ fn parse_provider_operation_row(row: sqlx_postgres::PgRow) -> Result<ProviderOpe
 
     Ok(ProviderOperationWatchEntry {
         operation_id,
+        execution_step_id: WorkflowStepId::from(execution_step_id),
         provider: row
             .try_get("provider")
             .map_err(|_| crate::error::Error::InvalidWatchRow {
@@ -363,15 +385,20 @@ fn parse_provider_operation_row(row: sqlx_postgres::PgRow) -> Result<ProviderOpe
 
 #[cfg(test)]
 mod tests {
-    use super::{ProviderOperationWatchEntry, ProviderOperationWatchStore};
+    use super::{
+        ProviderOperationWatchEntry, ProviderOperationWatchStore,
+        FULL_PROVIDER_OPERATION_WATCH_QUERY, TARGETED_PROVIDER_OPERATION_WATCH_QUERY,
+    };
     use chrono::Duration;
     use router_core::models::{ProviderOperationStatus, ProviderOperationType};
+    use router_temporal::WorkflowStepId;
     use serde_json::json;
     use uuid::Uuid;
 
     fn watch(operation_id: Uuid) -> ProviderOperationWatchEntry {
         ProviderOperationWatchEntry {
             operation_id,
+            execution_step_id: WorkflowStepId::from(Uuid::now_v7()),
             provider: "unit".to_string(),
             operation_type: ProviderOperationType::UnitWithdrawal,
             provider_ref: Some("unit-op-1".to_string()),
@@ -399,6 +426,32 @@ mod tests {
         let remaining = store.snapshot().await;
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].operation_id, second_id);
+    }
+
+    #[test]
+    fn provider_operation_watch_queries_select_step_and_filter_terminal_steps() {
+        for query in [
+            FULL_PROVIDER_OPERATION_WATCH_QUERY,
+            TARGETED_PROVIDER_OPERATION_WATCH_QUERY,
+        ] {
+            assert!(query.contains("opo.execution_step_id::text AS execution_step_id"));
+            assert!(query.contains("JOIN public.order_execution_steps oes"));
+            assert!(query.contains("oes.status IN ('running', 'waiting')"));
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_operation_watch_store_preserves_execution_step_id() {
+        let store = ProviderOperationWatchStore::default();
+        let operation_id = Uuid::now_v7();
+        let entry = watch(operation_id);
+        let step_id = entry.execution_step_id;
+
+        store.replace_all(vec![entry]).await;
+
+        let snapshot = store.snapshot().await;
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].execution_step_id, step_id);
     }
 
     #[tokio::test]

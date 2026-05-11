@@ -760,6 +760,7 @@ mod tests {
     fn provider_operation_hint_fingerprint_is_stable_and_status_sensitive() {
         let waiting = ProviderOperationWatchEntry {
             operation_id: uuid::Uuid::now_v7(),
+            execution_step_id: router_temporal::WorkflowStepId::from(uuid::Uuid::now_v7()),
             provider: "velora".to_string(),
             operation_type: ProviderOperationType::UniversalRouterSwap,
             status: ProviderOperationStatus::WaitingExternal,
@@ -793,11 +794,42 @@ mod tests {
     }
 
     #[test]
+    fn provider_operation_hint_request_carries_execution_step_id() {
+        let operation = ProviderOperationWatchEntry {
+            operation_id: uuid::Uuid::now_v7(),
+            execution_step_id: router_temporal::WorkflowStepId::from(uuid::Uuid::now_v7()),
+            provider: "velora".to_string(),
+            operation_type: ProviderOperationType::UniversalRouterSwap,
+            status: ProviderOperationStatus::WaitingExternal,
+            provider_ref: Some("provider-ref-1".to_string()),
+            request: serde_json::json!({ "amount_in": "100" }),
+            response: serde_json::json!({}),
+            observed_state: serde_json::json!({ "state": "pending" }),
+            updated_at: DateTime::parse_from_rfc3339("2026-05-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+
+        let request = provider_operation_hint_request(&operation, "fingerprint", 2);
+
+        assert_eq!(request.provider_operation_id, operation.operation_id);
+        assert_eq!(request.execution_step_id, operation.execution_step_id);
+        assert_eq!(
+            request.evidence.get("execution_step_id"),
+            Some(&serde_json::json!(operation.execution_step_id))
+        );
+        assert_eq!(
+            request.evidence.get("submission_index"),
+            Some(&serde_json::json!(2_u64))
+        );
+    }
+
+    #[test]
     fn provider_operation_hint_idempotency_key_is_bounded_token_text() {
         let operation_id = uuid::Uuid::now_v7();
         let fingerprint = "a".repeat(64);
 
-        let key = provider_operation_hint_idempotency_key(operation_id, &fingerprint);
+        let key = provider_operation_hint_idempotency_key(operation_id, &fingerprint, 7);
 
         assert!(key.len() <= MAX_HINT_IDEMPOTENCY_KEY_LEN);
         assert!(key.bytes().all(|byte| matches!(
@@ -806,7 +838,7 @@ mod tests {
         )));
         assert_eq!(
             key,
-            format!("sauron:op-observe:{operation_id}:{fingerprint}")
+            format!("sauron:op-observe:{operation_id}:{fingerprint}:7")
         );
     }
 
@@ -815,10 +847,12 @@ mod tests {
         let now = Instant::now();
         let recent = SubmittedProviderOperationHint {
             fingerprint: "same".to_string(),
+            submission_index: 0,
             submitted_at: now - (PROVIDER_OPERATION_OBSERVATION_RESUBMIT_INTERVAL / 2),
         };
         let stale = SubmittedProviderOperationHint {
             fingerprint: "same".to_string(),
+            submission_index: 0,
             submitted_at: now - PROVIDER_OPERATION_OBSERVATION_RESUBMIT_INTERVAL,
         };
 
@@ -838,6 +872,25 @@ mod tests {
             "same",
             now
         ));
+    }
+
+    #[test]
+    fn provider_operation_hint_submission_index_advances_for_resubmission() {
+        let last = SubmittedProviderOperationHint {
+            fingerprint: "same".to_string(),
+            submission_index: 3,
+            submitted_at: Instant::now(),
+        };
+
+        assert_eq!(provider_operation_hint_submission_index(None, "same"), 0);
+        assert_eq!(
+            provider_operation_hint_submission_index(Some(&last), "changed"),
+            0
+        );
+        assert_eq!(
+            provider_operation_hint_submission_index(Some(&last), "same"),
+            4
+        );
     }
 
     #[test]
@@ -1204,6 +1257,7 @@ struct ProviderOperationObserveOutcome {
 #[derive(Debug, Clone)]
 struct SubmittedProviderOperationHint {
     fingerprint: String,
+    submission_index: u64,
     submitted_at: Instant,
 }
 
@@ -1278,16 +1332,10 @@ async fn observe_provider_operation_once(
         };
     }
 
-    let request = ProviderOperationHintRequest {
-        provider_operation_id: operation_id,
-        source: PROVIDER_OPERATION_OBSERVATION_HINT_SOURCE.to_string(),
-        hint_kind: ProviderOperationHintKind::PossibleProgress,
-        evidence: provider_operation_progress_hint_evidence(operation.as_ref(), &fingerprint),
-        idempotency_key: Some(provider_operation_hint_idempotency_key(
-            operation_id,
-            &fingerprint,
-        )),
-    };
+    let submission_index =
+        provider_operation_hint_submission_index(last_submission.as_ref(), &fingerprint);
+    let request =
+        provider_operation_hint_request(operation.as_ref(), &fingerprint, submission_index);
 
     match timeout(
         PROVIDER_OPERATION_HINT_SUBMIT_TIMEOUT,
@@ -1299,6 +1347,7 @@ async fn observe_provider_operation_once(
             operation_id,
             submitted_hint: Some(SubmittedProviderOperationHint {
                 fingerprint,
+                submission_index,
                 submitted_at: Instant::now(),
             }),
         },
@@ -1344,20 +1393,56 @@ fn should_submit_provider_operation_hint(
             >= PROVIDER_OPERATION_OBSERVATION_RESUBMIT_INTERVAL
 }
 
+fn provider_operation_hint_submission_index(
+    last_submission: Option<&SubmittedProviderOperationHint>,
+    fingerprint: &str,
+) -> u64 {
+    last_submission
+        .filter(|submission| submission.fingerprint == fingerprint)
+        .map(|submission| submission.submission_index.saturating_add(1))
+        .unwrap_or(0)
+}
+
 fn provider_operation_progress_hint_evidence(
     operation: &ProviderOperationWatchEntry,
     fingerprint: &str,
+    submission_index: u64,
 ) -> serde_json::Value {
     serde_json::json!({
         "source": "sauron_provider_operation_observer",
         "provider": &operation.provider,
         "operation_type": operation.operation_type.to_db_string(),
+        "execution_step_id": operation.execution_step_id,
         "provider_ref": &operation.provider_ref,
         "operation_status": operation.status.to_db_string(),
         "operation_updated_at": operation.updated_at,
         "operation_fingerprint": fingerprint,
+        "submission_index": submission_index,
         "observed_at": chrono::Utc::now(),
     })
+}
+
+fn provider_operation_hint_request(
+    operation: &ProviderOperationWatchEntry,
+    fingerprint: &str,
+    submission_index: u64,
+) -> ProviderOperationHintRequest {
+    ProviderOperationHintRequest {
+        provider_operation_id: operation.operation_id,
+        execution_step_id: operation.execution_step_id,
+        source: PROVIDER_OPERATION_OBSERVATION_HINT_SOURCE.to_string(),
+        hint_kind: ProviderOperationHintKind::PossibleProgress,
+        evidence: provider_operation_progress_hint_evidence(
+            operation,
+            fingerprint,
+            submission_index,
+        ),
+        idempotency_key: Some(provider_operation_hint_idempotency_key(
+            operation.operation_id,
+            fingerprint,
+            submission_index,
+        )),
+    }
 }
 
 fn provider_operation_hint_fingerprint(
@@ -1366,6 +1451,7 @@ fn provider_operation_hint_fingerprint(
     let bytes = serde_json::to_vec(&serde_json::json!({
         "provider": &operation.provider,
         "operation_type": operation.operation_type.to_db_string(),
+        "execution_step_id": operation.execution_step_id,
         "provider_ref": &operation.provider_ref,
         "status": operation.status.to_db_string(),
         "request": &operation.request,
@@ -1377,8 +1463,13 @@ fn provider_operation_hint_fingerprint(
     Ok(alloy::hex::encode(digest))
 }
 
-fn provider_operation_hint_idempotency_key(operation_id: Uuid, fingerprint: &str) -> String {
-    let idempotency_key = format!("sauron:op-observe:{operation_id}:{fingerprint}");
+fn provider_operation_hint_idempotency_key(
+    operation_id: Uuid,
+    fingerprint: &str,
+    submission_index: u64,
+) -> String {
+    let idempotency_key =
+        format!("sauron:op-observe:{operation_id}:{fingerprint}:{submission_index}");
     debug_assert!(idempotency_key.len() <= MAX_HINT_IDEMPOTENCY_KEY_LEN);
     idempotency_key
 }

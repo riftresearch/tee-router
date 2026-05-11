@@ -36,6 +36,9 @@ pub fn make_mixed_watch_entries(count: usize) -> Vec<WatchEntry> {
             WatchEntry {
                 watch_target: WatchTarget::ProviderOperation,
                 watch_id: Uuid::from_u128((index + 1) as u128),
+                execution_step_id: Some(router_temporal::WorkflowStepId::from(Uuid::from_u128(
+                    (index + 1) as u128,
+                ))),
                 order_id: Uuid::from_u128((index + 1) as u128),
                 source_chain,
                 source_token,
@@ -66,6 +69,9 @@ pub fn make_single_chain_shared_watch_entries(
             Arc::new(WatchEntry {
                 watch_target: WatchTarget::ProviderOperation,
                 watch_id: Uuid::from_u128((index + 1) as u128),
+                execution_step_id: Some(router_temporal::WorkflowStepId::from(Uuid::from_u128(
+                    (index + 1) as u128,
+                ))),
                 order_id: Uuid::from_u128((index + 1) as u128),
                 source_chain: chain,
                 source_token: source_token.clone(),

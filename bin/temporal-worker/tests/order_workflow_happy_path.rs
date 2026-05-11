@@ -1845,6 +1845,10 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
                         OrderWorkflow::provider_operation_hint,
                         ProviderOperationHintSignal {
                             order_id: order_id.into(),
+                            execution_step_id: across_operation
+                                .execution_step_id
+                                .expect("Across operation should carry execution_step_id")
+                                .into(),
                             hint_id: Uuid::now_v7().into(),
                             provider_operation_id: Some(across_operation.id.into()),
                             provider: ProviderKind::Bridge,
@@ -2642,6 +2646,10 @@ async fn signal_order_cctp_attestation(
             OrderWorkflow::provider_operation_hint,
             ProviderOperationHintSignal {
                 order_id: order_id.into(),
+                execution_step_id: cctp_operation
+                    .execution_step_id
+                    .expect("CCTP operation should carry execution_step_id")
+                    .into(),
                 hint_id: Uuid::now_v7().into(),
                 provider_operation_id: Some(cctp_operation.id.into()),
                 provider: ProviderKind::Bridge,
@@ -2712,6 +2720,10 @@ async fn signal_order_hyperliquid_bridge_deposit_observation(
             OrderWorkflow::provider_operation_hint,
             ProviderOperationHintSignal {
                 order_id: order_id.into(),
+                execution_step_id: operation
+                    .execution_step_id
+                    .expect("Hyperliquid bridge operation should carry execution_step_id")
+                    .into(),
                 hint_id: Uuid::now_v7().into(),
                 provider_operation_id: Some(operation.id.into()),
                 provider: ProviderKind::Bridge,
@@ -2772,6 +2784,10 @@ async fn signal_order_unit_deposit_hint(
             OrderWorkflow::provider_operation_hint,
             ProviderOperationHintSignal {
                 order_id: order_id.into(),
+                execution_step_id: unit_deposit_operation
+                    .execution_step_id
+                    .expect("UnitDeposit operation should carry execution_step_id")
+                    .into(),
                 hint_id: Uuid::now_v7().into(),
                 provider_operation_id: Some(unit_deposit_operation.id.into()),
                 provider: ProviderKind::Unit,
@@ -2824,6 +2840,10 @@ async fn signal_order_unit_withdrawal_observation(
             OrderWorkflow::provider_operation_hint,
             ProviderOperationHintSignal {
                 order_id: order_id.into(),
+                execution_step_id: unit_withdrawal_operation
+                    .execution_step_id
+                    .expect("UnitWithdrawal operation should carry execution_step_id")
+                    .into(),
                 hint_id: Uuid::now_v7().into(),
                 provider_operation_id: Some(unit_withdrawal_operation.id.into()),
                 provider: ProviderKind::Unit,
@@ -2973,6 +2993,10 @@ async fn signal_external_custody_refund_across_fill(
             RefundWorkflow::provider_operation_hint,
             ProviderOperationHintSignal {
                 order_id: order_id.into(),
+                execution_step_id: refund_operation
+                    .execution_step_id
+                    .expect("refund Across operation should carry execution_step_id")
+                    .into(),
                 hint_id: Uuid::now_v7().into(),
                 provider_operation_id: Some(refund_operation.id.into()),
                 provider: ProviderKind::Bridge,
@@ -3047,6 +3071,10 @@ async fn signal_external_custody_refund_cctp_attestation(
             RefundWorkflow::provider_operation_hint,
             ProviderOperationHintSignal {
                 order_id: order_id.into(),
+                execution_step_id: refund_operation
+                    .execution_step_id
+                    .expect("refund CCTP operation should carry execution_step_id")
+                    .into(),
                 hint_id: Uuid::now_v7().into(),
                 provider_operation_id: Some(refund_operation.id.into()),
                 provider: ProviderKind::Bridge,
@@ -3118,6 +3146,10 @@ async fn signal_hyperliquid_spot_refund_unit_withdrawal(
             RefundWorkflow::provider_operation_hint,
             ProviderOperationHintSignal {
                 order_id: order_id.into(),
+                execution_step_id: refund_operation
+                    .execution_step_id
+                    .expect("refund UnitWithdrawal operation should carry execution_step_id")
+                    .into(),
                 hint_id: Uuid::now_v7().into(),
                 provider_operation_id: Some(refund_operation.id.into()),
                 provider: ProviderKind::Unit,

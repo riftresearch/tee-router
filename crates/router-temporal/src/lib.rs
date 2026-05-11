@@ -140,6 +140,8 @@ pub struct OrderWorkflowInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderOperationHintSignal {
     pub order_id: WorkflowOrderId,
+    #[serde(default = "legacy_missing_execution_step_id")]
+    pub execution_step_id: WorkflowStepId,
     pub hint_id: WorkflowHintId,
     pub provider_operation_id: Option<WorkflowProviderOperationId>,
     pub provider: ProviderKind,
@@ -147,6 +149,10 @@ pub struct ProviderOperationHintSignal {
     pub provider_ref: Option<String>,
     #[serde(default)]
     pub evidence: Option<ProviderOperationHintEvidence>,
+}
+
+fn legacy_missing_execution_step_id() -> WorkflowStepId {
+    WorkflowStepId(Uuid::nil())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

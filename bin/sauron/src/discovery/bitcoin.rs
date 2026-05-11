@@ -402,6 +402,7 @@ impl DiscoveryBackend for BitcoinDiscoveryBackend {
             let candidate = DetectedDeposit {
                 watch_target: watch.watch_target,
                 watch_id: watch.watch_id,
+                execution_step_id: watch.execution_step_id,
                 source_chain: ChainType::Bitcoin,
                 source_token: TokenIdentifier::Native,
                 address: watch.address.clone(),
@@ -567,6 +568,7 @@ fn match_single_transaction(
             detections.push(DetectedDeposit {
                 watch_target: watch.watch_target,
                 watch_id: watch.watch_id,
+                execution_step_id: watch.execution_step_id,
                 source_chain: ChainType::Bitcoin,
                 source_token: TokenIdentifier::Native,
                 address: watch.address.clone(),
@@ -1476,6 +1478,7 @@ mod tests {
         let watch = Arc::new(WatchEntry {
             watch_target: crate::watch::WatchTarget::FundingVault,
             watch_id: uuid::Uuid::now_v7(),
+            execution_step_id: None,
             order_id: uuid::Uuid::now_v7(),
             source_chain: ChainType::Bitcoin,
             source_token: TokenIdentifier::Native,
@@ -1537,6 +1540,7 @@ mod tests {
         let watch = Arc::new(WatchEntry {
             watch_target: crate::watch::WatchTarget::FundingVault,
             watch_id: uuid::Uuid::now_v7(),
+            execution_step_id: None,
             order_id: uuid::Uuid::now_v7(),
             source_chain: ChainType::Bitcoin,
             source_token: TokenIdentifier::Native,
@@ -1616,6 +1620,7 @@ mod tests {
         let watch = Arc::new(WatchEntry {
             watch_target: crate::watch::WatchTarget::FundingVault,
             watch_id: uuid::Uuid::now_v7(),
+            execution_step_id: None,
             order_id: uuid::Uuid::now_v7(),
             source_chain: ChainType::Bitcoin,
             source_token: TokenIdentifier::Native,
@@ -1697,6 +1702,7 @@ mod tests {
         let watch_a = Arc::new(WatchEntry {
             watch_target: crate::watch::WatchTarget::FundingVault,
             watch_id: uuid::Uuid::now_v7(),
+            execution_step_id: None,
             order_id: uuid::Uuid::now_v7(),
             source_chain: ChainType::Bitcoin,
             source_token: TokenIdentifier::Native,
@@ -1711,6 +1717,7 @@ mod tests {
         let watch_b = Arc::new(WatchEntry {
             watch_target: crate::watch::WatchTarget::FundingVault,
             watch_id: uuid::Uuid::now_v7(),
+            execution_step_id: None,
             order_id: uuid::Uuid::now_v7(),
             source_chain: ChainType::Bitcoin,
             source_token: TokenIdentifier::Native,
@@ -1778,6 +1785,7 @@ mod tests {
         let watch = Arc::new(WatchEntry {
             watch_target: crate::watch::WatchTarget::FundingVault,
             watch_id: uuid::Uuid::now_v7(),
+            execution_step_id: None,
             order_id: uuid::Uuid::now_v7(),
             source_chain: ChainType::Bitcoin,
             source_token: TokenIdentifier::Native,

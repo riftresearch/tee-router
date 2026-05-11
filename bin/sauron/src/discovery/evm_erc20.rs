@@ -463,6 +463,7 @@ impl EvmErc20DiscoveryBackend {
         Ok(Some(DetectedDeposit {
             watch_target,
             watch_id,
+            execution_step_id: watch.execution_step_id,
             source_chain: self.chain_type,
             source_token,
             address: watch.address.clone(),
@@ -521,6 +522,7 @@ impl EvmErc20DiscoveryBackend {
         Ok(Some(DetectedDeposit {
             watch_target: watch.watch_target,
             watch_id: watch.watch_id,
+            execution_step_id: watch.execution_step_id,
             source_chain: self.chain_type,
             source_token: watch.source_token.clone(),
             address: watch.address.clone(),
@@ -606,6 +608,7 @@ impl EvmErc20DiscoveryBackend {
                 let detected = DetectedDeposit {
                     watch_target: watch.watch_target,
                     watch_id: watch.watch_id,
+                    execution_step_id: watch.execution_step_id,
                     source_chain: self.chain_type,
                     source_token: watch.source_token.clone(),
                     address: watch.address.clone(),
@@ -892,6 +895,7 @@ impl EvmErc20DiscoveryBackend {
                 detections.push(DetectedDeposit {
                     watch_target: watch.watch_target,
                     watch_id: watch.watch_id,
+                    execution_step_id: watch.execution_step_id,
                     source_chain: self.chain_type,
                     source_token: TokenIdentifier::Native,
                     address: watch.address.clone(),
@@ -1145,6 +1149,7 @@ impl DiscoveryBackend for EvmErc20DiscoveryBackend {
                         detections.push(DetectedDeposit {
                             watch_target: watch.watch_target,
                             watch_id: watch.watch_id,
+                            execution_step_id: watch.execution_step_id,
                             source_chain: self.chain_type,
                             source_token: watch.source_token.clone(),
                             address: watch.address.clone(),
@@ -2016,6 +2021,7 @@ mod tests {
         Arc::new(WatchEntry {
             watch_target: WatchTarget::FundingVault,
             watch_id: Uuid::new_v4(),
+            execution_step_id: None,
             order_id: Uuid::new_v4(),
             source_chain: ChainType::Base,
             source_token: token,

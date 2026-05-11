@@ -31,6 +31,18 @@ impl ProviderObservationActivities {
     ) -> Result<ProviderOperationHintVerified, ActivityError> {
         record_activity("verify_provider_operation_hint", async move {
             let deps = self.deps()?;
+            if input.signal.execution_step_id != input.step_id
+                && !input.signal.execution_step_id.inner().is_nil()
+            {
+                return Ok(ProviderOperationHintVerified {
+                    provider_operation_id: input.signal.provider_operation_id,
+                    decision: ProviderOperationHintDecision::Reject,
+                    reason: Some(format!(
+                        "hint targets step {}, not {}",
+                        input.signal.execution_step_id, input.step_id
+                    )),
+                });
+            }
             deps.db
                 .orders()
                 .record_execution_step_hint_arrival(input.step_id.inner(), Utc::now())
