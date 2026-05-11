@@ -39,6 +39,14 @@ services:
     ports:
       - "9103:9103"
 
+  hl-shim-indexer:
+    environment:
+      DEPLOYMENT_ENVIRONMENT: local
+      METRICS_BIND_ADDR: 0.0.0.0:9104
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://alloy:4318
+    ports:
+      - "9104:9104"
+
   alloy:
     image: grafana/alloy:latest
     command:
@@ -96,6 +104,7 @@ services:
       - router-worker
       - temporal
       - sauron
+      - hl-shim-indexer
       - alloy
       - victoriametrics
       - loki
