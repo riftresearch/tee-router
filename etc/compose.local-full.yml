@@ -506,19 +506,33 @@ services:
       HL_SHIM_INDEXER_URL: http://hl-shim-indexer:8080
       SAURON_HL_BRIDGE_MATCH_WINDOW_SECONDS: 1800
 
+  hl-shim-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: hl_shim
+    volumes:
+      - router_local_hl_shim_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d hl_shim"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
   hl-shim-indexer:
     build:
       context: ..
       dockerfile: etc/Dockerfile.hl-shim-indexer
     restart: on-failure
     depends_on:
-      router-postgres:
+      hl-shim-db:
         condition: service_healthy
       devnet:
         condition: service_healthy
     environment:
       RUST_LOG: info
-      HL_SHIM_DATABASE_URL: postgres://router_app:router_app@router-postgres:5432/router_db
+      HL_SHIM_DATABASE_URL: postgres://postgres:postgres@hl-shim-db:5432/hl_shim
       HL_SHIM_INFO_URL: http://devnet:50107
       HL_SHIM_BIND: 0.0.0.0:8080
       METRICS_BIND_ADDR: 0.0.0.0:9104
@@ -671,6 +685,7 @@ volumes:
   router_local_token_indexer_db:
   router_local_physical_standby:
   router_local_sauron_state_db:
+  router_local_hl_shim_db:
   router_local_gateway_db:
   router_local_admin_auth_db:
   router_local_admin_analytics_db:
