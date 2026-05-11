@@ -11,8 +11,7 @@ pub(super) fn provider_operation_hint_targets_step(
     order_id: WorkflowOrderId,
     step_id: WorkflowStepId,
 ) -> bool {
-    signal.order_id == order_id
-        && (signal.execution_step_id == step_id || signal.execution_step_id.inner().is_nil())
+    signal.order_id == order_id && signal.execution_step_id == step_id
 }
 
 pub(super) fn workflow_start_time<W>(
