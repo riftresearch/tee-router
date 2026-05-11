@@ -77,6 +77,30 @@ struct HlOrderEvent {
 }
 ```
 
+### `POST /orders/watch`
+
+```
+POST /orders/watch
+{
+  "user": "0x...",
+  "oid": 123456
+}
+```
+
+Registers a pending oid for hot-cadence `orderStatus` polling. The endpoint is
+idempotent and exists for Sauron's by-id lookup access pattern: Sauron knows the
+oid it is waiting on, but the shim needs an explicit registration to spend the
+upstream `orderStatus` polling budget. Delivery still happens through
+`GET /orders` replay and `WS /subscribe` order events.
+
+```
+DELETE /orders/watch/<oid>
+GET /orders/watch
+```
+
+`DELETE` deregisters an oid idempotently. `GET` is a debug endpoint that lists
+currently watched oids.
+
 ### `POST /prune`
 
 ```

@@ -47,8 +47,8 @@ use router_temporal::{
     boxed as boxed_temporal_error, AcknowledgeUnrecoverableSignal, ManualReleaseSignal,
     ManualTriggerRefundSignal, OrderWorkflowClient, ProviderHintKind, ProviderKind,
     ProviderOperationHintEvidence, ProviderOperationHintSignal, RouterTemporalError,
-    TemporalConnection, WorkflowAttemptId, WorkflowHintId, WorkflowOrderId,
-    WorkflowProviderOperationId, WorkflowStepId,
+    TemporalConnection, UnitDepositHintEvidence, WorkflowAttemptId, WorkflowHintId,
+    WorkflowOrderId, WorkflowProviderOperationId, WorkflowStepId,
 };
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
@@ -843,7 +843,8 @@ fn provider_operation_hint_signal(
     requested_step_id: WorkflowStepId,
     hint: &OrderProviderOperationHint,
 ) -> RouterServerResult<ProviderOperationHintSignal> {
-    let (provider, hint_kind) = provider_hint_shape_for_operation(operation.operation_type);
+    let (provider, hint_kind) =
+        provider_hint_shape_for_hint(operation.operation_type, hint.hint_kind);
     let execution_step_id =
         operation
             .execution_step_id
@@ -871,6 +872,38 @@ fn provider_operation_hint_signal(
         provider_ref: operation.provider_ref.clone(),
         evidence: provider_hint_evidence_for_signal(hint_kind, &hint.evidence)?,
     })
+}
+
+fn provider_hint_shape_for_hint(
+    operation_type: ProviderOperationType,
+    hint_kind: router_core::models::ProviderOperationHintKind,
+) -> (ProviderKind, ProviderHintKind) {
+    match hint_kind {
+        router_core::models::ProviderOperationHintKind::PossibleProgress => {
+            provider_hint_shape_for_operation(operation_type)
+        }
+        router_core::models::ProviderOperationHintKind::HlTradeFilled => {
+            (ProviderKind::Exchange, ProviderHintKind::HlTradeFilled)
+        }
+        router_core::models::ProviderOperationHintKind::HlTradeCanceled => {
+            (ProviderKind::Exchange, ProviderHintKind::HlTradeCanceled)
+        }
+        router_core::models::ProviderOperationHintKind::HlBridgeDepositObserved => (
+            ProviderKind::Bridge,
+            ProviderHintKind::HlBridgeDepositObserved,
+        ),
+        router_core::models::ProviderOperationHintKind::HlBridgeDepositCredited => (
+            ProviderKind::Bridge,
+            ProviderHintKind::HlBridgeDepositCredited,
+        ),
+        router_core::models::ProviderOperationHintKind::HlWithdrawalAcknowledged => (
+            ProviderKind::Bridge,
+            ProviderHintKind::HlWithdrawalAcknowledged,
+        ),
+        router_core::models::ProviderOperationHintKind::HlWithdrawalSettled => {
+            (ProviderKind::Bridge, ProviderHintKind::HlWithdrawalSettled)
+        }
+    }
 }
 
 fn provider_hint_shape_for_operation(
@@ -903,6 +936,38 @@ fn provider_hint_evidence_for_signal(
     hint_kind: ProviderHintKind,
     evidence: &serde_json::Value,
 ) -> RouterServerResult<Option<ProviderOperationHintEvidence>> {
+    match hint_kind {
+        ProviderHintKind::HlTradeFilled => {
+            return typed_hint_evidence(evidence)
+                .map(|e| Some(ProviderOperationHintEvidence::HlTradeFilled(e)));
+        }
+        ProviderHintKind::HlTradeCanceled => {
+            return typed_hint_evidence(evidence)
+                .map(|e| Some(ProviderOperationHintEvidence::HlTradeCanceled(e)));
+        }
+        ProviderHintKind::HlBridgeDepositObserved => {
+            return typed_hint_evidence(evidence)
+                .map(|e| Some(ProviderOperationHintEvidence::HlBridgeDepositObserved(e)));
+        }
+        ProviderHintKind::HlBridgeDepositCredited => {
+            return typed_hint_evidence(evidence)
+                .map(|e| Some(ProviderOperationHintEvidence::HlBridgeDepositCredited(e)));
+        }
+        ProviderHintKind::HlWithdrawalAcknowledged => {
+            return typed_hint_evidence(evidence)
+                .map(|e| Some(ProviderOperationHintEvidence::HlWithdrawalAcknowledged(e)));
+        }
+        ProviderHintKind::HlWithdrawalSettled => {
+            return typed_hint_evidence(evidence)
+                .map(|e| Some(ProviderOperationHintEvidence::HlWithdrawalSettled(e)));
+        }
+        ProviderHintKind::CctpAttestation
+        | ProviderHintKind::AcrossFill
+        | ProviderHintKind::UnitDeposit
+        | ProviderHintKind::ProviderObservation
+        | ProviderHintKind::HyperliquidTrade => {}
+    }
+
     let tx_hash = evidence
         .get("tx_hash")
         .and_then(serde_json::Value::as_str)
@@ -924,12 +989,14 @@ fn provider_hint_evidence_for_signal(
                 serde_json::Value::Number(value) => Some(value.to_string()),
                 _ => None,
             });
-            Ok(Some(ProviderOperationHintEvidence {
-                tx_hash,
-                address,
-                transfer_index,
-                amount,
-            }))
+            Ok(Some(ProviderOperationHintEvidence::UnitDeposit(
+                UnitDepositHintEvidence {
+                    tx_hash,
+                    address,
+                    transfer_index,
+                    amount,
+                },
+            )))
         }
         (None, None, None) => Ok(None),
         _ if hint_kind != ProviderHintKind::UnitDeposit => Ok(None),
@@ -939,6 +1006,15 @@ fn provider_hint_evidence_for_signal(
                     .to_string(),
         }),
     }
+}
+
+fn typed_hint_evidence<T>(evidence: &serde_json::Value) -> RouterServerResult<T>
+where
+    T: DeserializeOwned,
+{
+    serde_json::from_value(evidence.clone()).map_err(|source| RouterServerError::Validation {
+        message: format!("invalid typed provider-operation hint evidence: {source}"),
+    })
 }
 
 fn json_u64_or_string(value: &serde_json::Value) -> Option<u64> {

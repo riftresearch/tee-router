@@ -19,6 +19,7 @@ blockchain-utils = { workspace = true }
 bitcoincore-rpc-async = { workspace = true }
 esplora-client = { workspace = true }
 evm-token-indexer-client = { workspace = true }
+hl-shim-client = { workspace = true }
 observability = { workspace = true }
 router-core = { workspace = true }
 router-primitives = { workspace = true }
@@ -48,11 +49,13 @@ uuid = { workspace = true }
 zeromq = "0.6.0-pre.1"
 
 [dev-dependencies]
+axum = { workspace = true }
 chains = { workspace = true }
 criterion = "0.5"
 devnet = { workspace = true }
 eip3009-erc20-contract = { workspace = true }
 dotenvy = { workspace = true }
+hl-shim-indexer = { workspace = true }
 hyperunit-client = { workspace = true }
 temporal-worker = { path = "../temporal-worker" }
 tempfile = { workspace = true }

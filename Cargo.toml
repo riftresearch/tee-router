@@ -19,6 +19,7 @@ members = [
     "crates/esplora-client",
     "crates/chains",
     "crates/hyperliquid-client",
+    "crates/hl-shim-client",
     "crates/hyperunit-client",
     "crates/market-pricing",
     "crates/observability",
@@ -42,6 +43,8 @@ router-temporal = { path = "crates/router-temporal" }
 router-core = { path = "crates/router-core" }
 chains = { path = "crates/chains" }
 hyperliquid-client = { path = "crates/hyperliquid-client" }
+hl-shim-client = { path = "crates/hl-shim-client" }
+hl-shim-indexer = { path = "hl-shim-indexer" }
 hyperunit-client = { path = "crates/hyperunit-client" }
 market-pricing = { path = "crates/market-pricing" }
 observability = { path = "crates/observability" }

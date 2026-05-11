@@ -1,5 +1,9 @@
 pub mod bitcoin;
 pub mod evm_erc20;
+pub mod hyperliquid;
+pub mod hyperliquid_bridge;
+pub mod hyperliquid_spot_trade;
+pub mod hyperliquid_trade;
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},

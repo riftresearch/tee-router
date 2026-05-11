@@ -151,12 +151,91 @@ pub struct ProviderOperationHintSignal {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderOperationHintEvidence {
+#[serde(untagged)]
+pub enum ProviderOperationHintEvidence {
+    UnitDeposit(UnitDepositHintEvidence),
+    HlTradeFilled(HlTradeFilledEvidence),
+    HlTradeCanceled(HlTradeCanceledEvidence),
+    HlBridgeDepositObserved(HlBridgeDepositObservedEvidence),
+    HlBridgeDepositCredited(HlBridgeDepositCreditedEvidence),
+    HlWithdrawalAcknowledged(HlWithdrawalAcknowledgedEvidence),
+    HlWithdrawalSettled(HlWithdrawalSettledEvidence),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnitDepositHintEvidence {
     pub tx_hash: String,
     pub address: String,
     pub transfer_index: u64,
     #[serde(default)]
     pub amount: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HlTradeFilledEvidence {
+    pub user: String,
+    pub oid: u64,
+    pub tid: u64,
+    pub coin: String,
+    pub side: String,
+    pub px: String,
+    pub sz: String,
+    pub crossed: bool,
+    pub hash: String,
+    pub time_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HlTradeCanceledEvidence {
+    pub user: String,
+    pub oid: u64,
+    pub coin: String,
+    pub status: String,
+    pub status_timestamp_ms: i64,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HlBridgeDepositObservedEvidence {
+    pub user: String,
+    pub usdc: String,
+    pub arb_tx_hash: String,
+    pub log_index: u64,
+    pub block_number: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HlBridgeDepositCreditedEvidence {
+    pub user: String,
+    pub usdc: String,
+    pub hl_credit_hash: String,
+    pub hl_credit_time_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HlWithdrawalAcknowledgedEvidence {
+    pub user: String,
+    pub usdc: String,
+    pub nonce: u64,
+    pub hl_request_hash: String,
+    pub hl_request_time_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HlWithdrawalSettledEvidence {
+    pub user: String,
+    pub usdc: String,
+    pub arb_payout_tx_hash: String,
+    pub log_index: u64,
+    pub block_number: u64,
+    pub time_window_match_to_nonce: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,6 +279,12 @@ pub enum ProviderHintKind {
     UnitDeposit,
     ProviderObservation,
     HyperliquidTrade,
+    HlTradeFilled,
+    HlTradeCanceled,
+    HlBridgeDepositObserved,
+    HlBridgeDepositCredited,
+    HlWithdrawalAcknowledged,
+    HlWithdrawalSettled,
 }
 
 #[derive(Debug, Snafu)]

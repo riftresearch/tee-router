@@ -234,6 +234,43 @@ async fn storage_dedups_transfers_and_cursor_advances_after_poll() {
 }
 
 #[tokio::test]
+async fn order_watch_endpoint_registers_and_removes_pending_oid() {
+    let postgres = test_postgres().await;
+    let database_url = create_test_database(&postgres.admin_database_url).await;
+    let hl = MockIntegratorServer::spawn().await.expect("spawn HL mock");
+    let user = sample_user();
+    let (base_url, _poller, scheduler, _storage, _pubsub) =
+        build_test_app(&database_url, hl.base_url()).await;
+    let client = reqwest::Client::new();
+
+    let response: serde_json::Value = client
+        .post(format!("{base_url}/orders/watch"))
+        .json(&serde_json::json!({
+            "user": format!("{user:?}"),
+            "oid": 77_u64,
+        }))
+        .send()
+        .await
+        .expect("post watch")
+        .error_for_status()
+        .expect("watch status")
+        .json()
+        .await
+        .expect("watch json");
+    assert_eq!(response["oid"], 77);
+    assert_eq!(scheduler.pending_orders().await, vec![(user, 77)]);
+
+    client
+        .delete(format!("{base_url}/orders/watch/77"))
+        .send()
+        .await
+        .expect("delete watch")
+        .error_for_status()
+        .expect("delete status");
+    assert!(scheduler.pending_orders().await.is_empty());
+}
+
+#[tokio::test]
 async fn websocket_subscription_receives_matching_transfer_but_not_other_user_order() {
     let postgres = test_postgres().await;
     let database_url = create_test_database(&postgres.admin_database_url).await;

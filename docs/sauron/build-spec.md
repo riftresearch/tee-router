@@ -166,6 +166,18 @@ Join key: `nonce` for withdrawals; `(user, amount, time-window)` for deposits (n
 
 **Implication for the Arbitrum EVM indexer:** add Bridge2 to its watched-contract set — `RequestedWithdrawal`, `FinalizedWithdrawal`, `InvalidatedWithdrawal` events plus inbound USDC `Transfer` to the bridge address. Additive change to the EVM indexer's filter set, no schema change.
 
+**v1 implementation note:** until the EVM token indexer grows a generic `/logs`
+primitive, the HL Bridge observer uses the existing ERC-20 Transfer surface only.
+Deposits join HL `deposit` ledger entries with Arbitrum USDC transfers into
+Bridge2 by `(user, amount, 30-minute time window)`. Withdrawals emit
+`HlWithdrawalAcknowledged` from the HL `withdraw` ledger entry, then
+`HlWithdrawalSettled` when a matching Arbitrum USDC payout transfer from
+Bridge2 to the recipient appears within the configured 30-minute window. The HL
+nonce is carried in the acknowledgement/settlement evidence, but Bridge2
+`InvalidatedWithdrawal` is not directly observed in v1; missing payouts time out
+through the existing manual-intervention path. Task #5 will replace this with a
+nonce-keyed Bridge2 log join once `/logs` exists.
+
 #### WS subscription scaling — the load-bearing operational concern
 
 HL caps **10 unique users in user-specific subscriptions per IP**. With one IP we can watch ≤10 HL accounts simultaneously (each with 4–5 subscriptions = 40–50 total subs per IP, well under the 1000 cap).

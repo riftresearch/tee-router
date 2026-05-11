@@ -109,6 +109,7 @@ pub struct Scheduler {
 #[derive(Debug)]
 struct SchedulerInner {
     users: HashMap<Address, UserState>,
+    pending_orders: HashMap<u64, Address>,
     heap: BinaryHeap<ScheduledPoll>,
     slow_until: Option<Instant>,
 }
@@ -126,6 +127,7 @@ impl Scheduler {
         Self {
             inner: Arc::new(Mutex::new(SchedulerInner {
                 users: HashMap::new(),
+                pending_orders: HashMap::new(),
                 heap: BinaryHeap::new(),
                 slow_until: None,
             })),
@@ -189,11 +191,26 @@ impl Scheduler {
     pub async fn register_pending_order(&self, user: Address, oid: u64) {
         self.register_user(user).await;
         let mut inner = self.inner.lock().await;
+        inner.pending_orders.insert(oid, user);
         inner.heap.push(ScheduledPoll {
             user,
             endpoint: PollEndpoint::OrderStatus(oid),
             deadline: Instant::now(),
         });
+    }
+
+    pub async fn deregister_pending_order(&self, oid: u64) {
+        self.inner.lock().await.pending_orders.remove(&oid);
+    }
+
+    pub async fn pending_orders(&self) -> Vec<(Address, u64)> {
+        self.inner
+            .lock()
+            .await
+            .pending_orders
+            .iter()
+            .map(|(oid, user)| (*user, *oid))
+            .collect()
     }
 
     pub async fn next_due(&self) -> ScheduledPoll {
@@ -203,6 +220,9 @@ impl Scheduler {
                 inner.heap.pop()
             };
             if let Some(next) = maybe_due {
+                if !self.poll_is_still_registered(next).await {
+                    continue;
+                }
                 let now = Instant::now();
                 if next.deadline > now {
                     sleep_until(next.deadline.into()).await;
@@ -215,6 +235,11 @@ impl Scheduler {
 
     pub async fn reschedule(&self, poll: ScheduledPoll) {
         let mut inner = self.inner.lock().await;
+        if let PollEndpoint::OrderStatus(oid) = poll.endpoint {
+            if inner.pending_orders.get(&oid) != Some(&poll.user) {
+                return;
+            }
+        }
         let Some(state) = inner.users.get(&poll.user) else {
             return;
         };
@@ -224,6 +249,13 @@ impl Scheduler {
             deadline: Instant::now() + delay,
             ..poll
         });
+    }
+
+    async fn poll_is_still_registered(&self, poll: ScheduledPoll) -> bool {
+        if let PollEndpoint::OrderStatus(oid) = poll.endpoint {
+            return self.inner.lock().await.pending_orders.get(&oid) == Some(&poll.user);
+        }
+        true
     }
 
     pub async fn rebucket_once(&self) {

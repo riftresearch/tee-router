@@ -318,7 +318,9 @@ impl Storage {
     }
 
     pub async fn healthcheck(&self) -> Result<()> {
-        let _: i64 = query_scalar("SELECT 1").fetch_one(&self.pool).await?;
+        let _: i64 = query_scalar("SELECT 1::bigint")
+            .fetch_one(&self.pool)
+            .await?;
         Ok(())
     }
 }

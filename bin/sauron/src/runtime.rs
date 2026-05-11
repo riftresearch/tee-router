@@ -7,6 +7,8 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
+use evm_token_indexer_client::TokenIndexerClient;
+use hl_shim_client::HlShimClient;
 use pgwire_replication::ReplicationEvent;
 use router_core::models::{ProviderOperationHintKind, PROVIDER_OPERATION_OBSERVATION_HINT_SOURCE};
 use router_server::api::{ProviderOperationHintRequest, MAX_HINT_IDEMPOTENCY_KEY_LEN};
@@ -25,8 +27,9 @@ use crate::{
     config::{normalize_router_detector_api_key, SauronArgs, MIN_TOKEN_INDEXER_API_KEY_LEN},
     cursor::CursorRepository,
     discovery::{
-        bitcoin::BitcoinDiscoveryBackend, evm_erc20::EvmErc20DiscoveryBackend, run_backends,
-        DiscoveryBackend, DiscoveryContext,
+        bitcoin::BitcoinDiscoveryBackend, evm_erc20::EvmErc20DiscoveryBackend,
+        hyperliquid::run_hyperliquid_observer_loop, run_backends, DiscoveryBackend,
+        DiscoveryContext,
     },
     error::{Error, ReplicaDatabaseConnectionSnafu, Result, StateDatabaseConnectionSnafu},
     provider_operations::{
@@ -101,6 +104,11 @@ pub async fn run(args: SauronArgs) -> Result<()> {
         router_client.clone(),
         PROVIDER_OPERATION_OBSERVE_INTERVAL,
     );
+    let hyperliquid_observer_task = build_hyperliquid_observer_task(
+        &args,
+        provider_operation_store.clone(),
+        router_client.clone(),
+    )?;
     let discovery_task = run_backends(
         backends,
         DiscoveryContext {
@@ -115,6 +123,7 @@ pub async fn run(args: SauronArgs) -> Result<()> {
         full_reconcile_task,
         expiration_prune_task,
         provider_operation_observer_task,
+        hyperliquid_observer_task,
         discovery_task
     )?;
     Ok(())
@@ -137,6 +146,11 @@ fn validate_runtime_config(args: &SauronArgs) -> Result<()> {
         args.sauron_evm_indexed_lookup_concurrency,
         "SAURON_EVM_INDEXED_LOOKUP_CONCURRENCY",
     )?;
+    if args.sauron_hl_bridge_match_window_seconds <= 0 {
+        return Err(Error::InvalidConfiguration {
+            message: "SAURON_HL_BRIDGE_MATCH_WINDOW_SECONDS must be positive".to_string(),
+        });
+    }
     validate_router_internal_base_url(&args.router_internal_base_url)?;
     validate_router_detector_api_key(&args.router_detector_api_key)?;
     validate_token_indexer_api_key(args)?;
@@ -261,6 +275,33 @@ async fn build_backends(args: &SauronArgs) -> Result<Vec<Arc<dyn DiscoveryBacken
         Arc::new(arbitrum),
         Arc::new(base),
     ])
+}
+
+fn build_hyperliquid_observer_task(
+    args: &SauronArgs,
+    provider_operation_store: ProviderOperationWatchStore,
+    router_client: RouterClient,
+) -> Result<BoxedSauronTask> {
+    let Some(url) = args.hl_shim_indexer_url.as_deref() else {
+        return Ok(Box::pin(async {
+            std::future::pending::<Result<()>>().await
+        }));
+    };
+    let hl_client = HlShimClient::new(url).map_err(|source| Error::HlShim { source })?;
+    let arbitrum_token_indexer = match args.arbitrum_token_indexer_url.as_deref() {
+        Some(url) => Some(Arc::new(
+            TokenIndexerClient::new_with_api_key(url, args.token_indexer_api_key.clone())
+                .map_err(|source| Error::EvmTokenIndexer { source })?,
+        )),
+        None => None,
+    };
+    Ok(Box::pin(run_hyperliquid_observer_loop(
+        provider_operation_store,
+        router_client,
+        hl_client,
+        arbitrum_token_indexer,
+        args.sauron_hl_bridge_match_window_seconds,
+    )))
 }
 
 async fn run_cdc_loop(
@@ -620,6 +661,8 @@ mod tests {
             base_token_indexer_url: None,
             arbitrum_rpc_url: "http://arbitrum:8545".to_string(),
             arbitrum_token_indexer_url: None,
+            hl_shim_indexer_url: None,
+            sauron_hl_bridge_match_window_seconds: 1_800,
             token_indexer_api_key: None,
             sauron_reconcile_interval_seconds: 3600,
             sauron_bitcoin_scan_interval_seconds: 15,
@@ -768,6 +811,7 @@ mod tests {
             request: serde_json::json!({ "amount_in": "100" }),
             response: serde_json::json!({}),
             observed_state: serde_json::json!({ "state": "pending" }),
+            execution_step_request: serde_json::json!({}),
             updated_at: DateTime::parse_from_rfc3339("2026-05-01T00:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
@@ -805,6 +849,7 @@ mod tests {
             request: serde_json::json!({ "amount_in": "100" }),
             response: serde_json::json!({}),
             observed_state: serde_json::json!({ "state": "pending" }),
+            execution_step_request: serde_json::json!({}),
             updated_at: DateTime::parse_from_rfc3339("2026-05-01T00:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),

@@ -10,6 +10,7 @@ publish = false
 devnet = { workspace = true }
 eip3009-erc20-contract = { workspace = true }
 hyperunit-client = { workspace = true }
+hl-shim-indexer = { workspace = true }
 router-core = { workspace = true }
 router-temporal = { workspace = true }
 router-server = { path = "../bin/router-server" }
@@ -17,6 +18,7 @@ sauron = { path = "../bin/sauron" }
 temporal-worker = { path = "../bin/temporal-worker" }
 
 alloy = { workspace = true }
+axum = { workspace = true }
 bitcoin = { workspace = true }
 bitcoincore-rpc-async = { workspace = true }
 reqwest = { workspace = true }
