@@ -4,10 +4,13 @@ use router_core::{
     services::{asset_registry::CanonicalAsset, ProviderExecutionState},
 };
 pub use router_temporal::{
-    AcknowledgeUnrecoverableSignal, ManualReleaseSignal, ManualTriggerRefundSignal,
-    OrderWorkflowInput, ProviderHintKind, ProviderKind, ProviderOperationHintEvidence,
-    ProviderOperationHintSignal, WorkflowAttemptId, WorkflowHintId, WorkflowOrderId,
-    WorkflowProviderOperationId, WorkflowStepId, WorkflowVaultId,
+    AcknowledgeUnrecoverableSignal, HlBridgeDepositCreditedEvidence,
+    HlBridgeDepositObservedEvidence, HlTradeCanceledEvidence, HlTradeFilledEvidence,
+    HlWithdrawalAcknowledgedEvidence, HlWithdrawalSettledEvidence, ManualReleaseSignal,
+    ManualTriggerRefundSignal, OrderWorkflowInput, ProviderHintKind, ProviderKind,
+    ProviderOperationHintEvidence, ProviderOperationHintSignal, UnitDepositHintEvidence,
+    WorkflowAttemptId, WorkflowHintId, WorkflowOrderId, WorkflowProviderOperationId,
+    WorkflowStepId, WorkflowVaultId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

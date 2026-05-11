@@ -20,8 +20,8 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use hyperliquid_client::{
     recover_l1_signer, recover_typed_signer, spot_wire_asset_index, Actions, PerpAssetMeta,
     PerpMeta, SendAsset, SpotAssetMeta, SpotMeta, SpotSend, TokenInfo, UsdClassTransfer, UserFill,
-    UserFunding, UserNonFundingLedgerUpdate, UserRateLimit, Withdraw3, MINIMUM_BRIDGE_DEPOSIT_USDC,
-    SPOT_ASSET_INDEX_OFFSET,
+    UserFunding, UserNonFundingLedgerDelta, UserNonFundingLedgerUpdate, UserRateLimit, Withdraw3,
+    MINIMUM_BRIDGE_DEPOSIT_USDC, SPOT_ASSET_INDEX_OFFSET,
 };
 use hyperunit_client::{
     UnitAsset, UnitChain, UnitGenerateAddressResponse, UnitOperation, UnitOperationsResponse,
@@ -3646,11 +3646,18 @@ async fn credit_mock_hyperliquid_bridge_deposit(
     amount: f64,
     tx_hash: &str,
 ) {
-    state
-        .hyperliquid
-        .lock()
-        .await
-        .credit_clearinghouse(user, "USDC", amount);
+    let mut hl = state.hyperliquid.lock().await;
+    hl.credit_clearinghouse(user, "USDC", amount);
+    hl.record_ledger_update(
+        user,
+        UserNonFundingLedgerUpdate {
+            time: Utc::now().timestamp_millis().max(0) as u64,
+            hash: tx_hash.to_string(),
+            delta: UserNonFundingLedgerDelta::Deposit {
+                usdc: format_hl_amount(amount),
+            },
+        },
+    );
     tracing::debug!(
         %user,
         amount,
@@ -4913,6 +4920,24 @@ async fn handle_withdraw3(
             );
         }
         hl.debit_clearinghouse_total(user, "USDC", gross_amount);
+        hl.record_ledger_update(
+            user,
+            UserNonFundingLedgerUpdate {
+                time: payload.time,
+                hash: format!(
+                    "0x{}",
+                    hex::encode(Sha256::digest(format!(
+                        "mock-hl-withdraw:{user}:{destination}:{amount_raw}:{}",
+                        payload.time
+                    )))
+                ),
+                delta: UserNonFundingLedgerDelta::Withdraw {
+                    usdc: payload.amount.clone(),
+                    nonce: payload.time,
+                    fee: "1".to_string(),
+                },
+            },
+        );
     }
     schedule_mock_hyperliquid_withdrawal_release(
         state,

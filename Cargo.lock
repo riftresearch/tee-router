@@ -3724,6 +3724,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "hl-shim-client"
+version = "0.1.8"
+dependencies = [
+ "alloy",
+ "async-trait",
+ "futures-util",
+ "hl-shim-indexer",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "snafu",
+ "tokio",
+ "tokio-tungstenite 0.24.0",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "hl-shim-indexer"
 version = "0.1.8"
 dependencies = [
@@ -6140,10 +6158,12 @@ name = "router-integration-tests"
 version = "0.1.8"
 dependencies = [
  "alloy",
+ "axum 0.7.9",
  "bitcoin",
  "bitcoincore-rpc-async",
  "devnet",
  "eip3009-erc20-contract",
+ "hl-shim-indexer",
  "hyperunit-client",
  "reqwest",
  "router-core",
@@ -6474,6 +6494,7 @@ version = "0.1.8"
 dependencies = [
  "alloy",
  "async-trait",
+ "axum 0.7.9",
  "bitcoin",
  "bitcoincore-rpc-async",
  "blockchain-utils",
@@ -6486,6 +6507,8 @@ dependencies = [
  "eip3009-erc20-contract",
  "esplora-client",
  "evm-token-indexer-client",
+ "hl-shim-client",
+ "hl-shim-indexer",
  "hyperunit-client",
  "metrics",
  "observability",

@@ -25,12 +25,20 @@ use devnet::{
     RiftDevnet,
 };
 use eip3009_erc20_contract::GenericEIP3009ERC20::GenericEIP3009ERC20Instance;
+use hl_shim_indexer::{
+    build_router as build_hl_shim_router,
+    config::Cadences as HlShimCadences,
+    poller::{Poller as HlShimPoller, Scheduler as HlShimScheduler},
+    storage::Storage as HlShimStorage,
+    AppState as HlShimAppState, PubSub as HlShimPubSub,
+};
 use router_core::{
     db::Database,
     models::{
         CustodyVaultControlType, DepositVaultStatus, OrderExecutionStepType,
         OrderProviderOperation, ProviderOperationStatus, ProviderOperationType,
         RouterOrderEnvelope, RouterOrderQuoteEnvelope, RouterOrderStatus,
+        SAURON_HYPERLIQUID_OBSERVER_HINT_SOURCE,
     },
     protocol::{backend_chain_for_id, AssetId, ChainId},
 };
@@ -57,7 +65,11 @@ use testcontainers::{
     runners::AsyncRunner,
     ContainerAsync, GenericImage, ImageExt,
 };
-use tokio::task::{JoinHandle, LocalSet};
+use tokio::{
+    net::TcpListener,
+    sync::oneshot,
+    task::{JoinHandle, LocalSet},
+};
 use uuid::Uuid;
 
 const MOCK_ERC20_ADDRESS: &str = "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf";
@@ -212,6 +224,12 @@ impl RuntimeTask {
             handle: Some(handle),
             shutdown: Some(Box::new(shutdown)),
         }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.handle
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
     }
 
     async fn abort_and_join(&mut self) {
@@ -1198,6 +1216,7 @@ async fn spawn_sauron(
     state_database_url: &str,
     router_base_url: &str,
     token_indexer_urls: RuntimeTokenIndexerUrls,
+    hl_shim_indexer_url: Option<String>,
 ) -> RuntimeTask {
     let args = SauronArgs {
         log_level: "warn".to_string(),
@@ -1228,6 +1247,8 @@ async fn spawn_sauron(
         base_token_indexer_url: token_indexer_urls.base,
         arbitrum_rpc_url: devnet.arbitrum.anvil.endpoint_url().to_string(),
         arbitrum_token_indexer_url: token_indexer_urls.arbitrum,
+        hl_shim_indexer_url,
+        sauron_hl_bridge_match_window_seconds: 1_800,
         token_indexer_api_key: token_indexer_urls.api_key,
         sauron_reconcile_interval_seconds: 2,
         sauron_bitcoin_scan_interval_seconds: 60,
@@ -1247,6 +1268,67 @@ async fn spawn_sauron(
         panic!("Sauron exited during startup");
     }
     RuntimeTask::new(handle)
+}
+
+fn hl_shim_cadences() -> HlShimCadences {
+    HlShimCadences {
+        hot: Duration::from_millis(100),
+        warm: Duration::from_millis(250),
+        cold: Duration::from_millis(500),
+        funding_hot: Duration::from_millis(250),
+        funding_warm: Duration::from_millis(500),
+        funding_cold: Duration::from_millis(1_000),
+        order_status: Duration::from_millis(100),
+    }
+}
+
+async fn spawn_hl_shim_indexer(database_url: &str, hl_url: &str) -> (String, RuntimeTask) {
+    let storage = HlShimStorage::connect(database_url, 4)
+        .await
+        .expect("connect HL shim storage");
+    let pubsub = HlShimPubSub::new(512);
+    let scheduler = HlShimScheduler::new(hl_shim_cadences());
+    let poller = HlShimPoller::new(
+        scheduler.clone(),
+        storage.clone(),
+        pubsub.clone(),
+        hl_url,
+        1_100,
+    )
+    .await
+    .expect("create HL shim poller");
+    let app = build_hl_shim_router(HlShimAppState {
+        storage,
+        scheduler,
+        pubsub,
+    });
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind HL shim listener");
+    let addr = listener.local_addr().expect("read HL shim listener addr");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let handle = tokio::spawn(async move {
+        let poller_task = tokio::spawn(async move {
+            poller
+                .run(2)
+                .await
+                .expect("HL shim poller should run until test shutdown");
+        });
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("HL shim server should run until test shutdown");
+        poller_task.abort();
+        let _ = poller_task.await;
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let task = RuntimeTask::with_shutdown(handle, move || {
+        let _ = shutdown_tx.send(());
+    });
+    assert!(!task.is_finished(), "HL shim indexer exited during startup");
+    (format!("http://{addr}"), task)
 }
 
 fn token_indexer_urls_from_devnet(devnet: &RiftDevnet) -> RuntimeTokenIndexerUrls {
@@ -1330,6 +1412,8 @@ fn live_sauron_args(
         base_token_indexer_url: live.base_token_indexer_url.clone(),
         arbitrum_rpc_url: live.arbitrum_rpc_url.clone(),
         arbitrum_token_indexer_url: live.arbitrum_token_indexer_url.clone(),
+        hl_shim_indexer_url: None,
+        sauron_hl_bridge_match_window_seconds: 1_800,
         token_indexer_api_key: live.token_indexer_api_key.clone(),
         sauron_reconcile_interval_seconds: 30,
         sauron_bitcoin_scan_interval_seconds: 15,
@@ -2077,6 +2161,7 @@ async fn fund_live_source_vault(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "integration: spawns devnet stack"]
 async fn sauron_runtime_drives_router_worker_through_mock_base_eth_btc_progress() {
     LocalSet::new()
         .run_until(run_mock_runtime_route(RuntimeRoute::BaseEthToBtc))
@@ -2084,6 +2169,7 @@ async fn sauron_runtime_drives_router_worker_through_mock_base_eth_btc_progress(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "integration: spawns devnet stack"]
 async fn sauron_runtime_drives_router_worker_through_mock_base_usdc_btc_progress() {
     LocalSet::new()
         .run_until(run_mock_runtime_route(RuntimeRoute::BaseUsdcToBtc))
@@ -2470,6 +2556,7 @@ async fn run_mock_runtime_route(route: RuntimeRoute) {
     let mut postgres = test_postgres().await;
     let database_url = create_test_database(&postgres.admin_database_url).await;
     let state_database_url = create_test_database(&postgres.admin_database_url).await;
+    let hl_shim_database_url = create_test_database(&postgres.admin_database_url).await;
     let (devnet, _) = RiftDevnet::builder()
         .using_esplora(true)
         .using_token_indexer(database_url.clone())
@@ -2499,6 +2586,8 @@ async fn run_mock_runtime_route(route: RuntimeRoute) {
     let db = worker_components.db.clone();
     let (router_base_url, _api_task) = spawn_router_api(args.clone()).await;
     ensure_temporal_up();
+    let (hl_shim_base_url, _hl_shim_task) =
+        spawn_hl_shim_indexer(&hl_shim_database_url, mocks.base_url()).await;
     let mut temporal_worker_task = spawn_temporal_order_worker(&args).await;
     let order_workflow_client = std::sync::Arc::new(
         OrderWorkflowClient::connect(
@@ -2529,6 +2618,7 @@ async fn run_mock_runtime_route(route: RuntimeRoute) {
         &state_database_url,
         &router_base_url,
         token_indexer_urls,
+        Some(hl_shim_base_url),
     )
     .await;
     let client = reqwest::Client::new();
@@ -2855,11 +2945,13 @@ async fn assert_runtime_hints_are_production_driven(
                 WHERE operations.order_id = $1
                   AND hints.source NOT IN (
                     'sauron',
-                    'sauron_provider_operation_observation'
+                    'sauron_provider_operation_observation',
+                    $2
                   )
                 "#,
         )
         .bind(order_id)
+        .bind(SAURON_HYPERLIQUID_OBSERVER_HINT_SOURCE)
         .fetch_one(&pool)
         .await
         .expect("count non-Sauron provider operation hints");

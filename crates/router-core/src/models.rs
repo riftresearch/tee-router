@@ -738,6 +738,12 @@ impl ProviderOperationStatus {
 #[serde(rename_all = "snake_case")]
 pub enum ProviderOperationHintKind {
     PossibleProgress,
+    HlTradeFilled,
+    HlTradeCanceled,
+    HlBridgeDepositObserved,
+    HlBridgeDepositCredited,
+    HlWithdrawalAcknowledged,
+    HlWithdrawalSettled,
 }
 
 impl ProviderOperationHintKind {
@@ -745,15 +751,93 @@ impl ProviderOperationHintKind {
     pub fn to_db_string(self) -> &'static str {
         match self {
             Self::PossibleProgress => "possible_progress",
+            Self::HlTradeFilled => "hl_trade_filled",
+            Self::HlTradeCanceled => "hl_trade_canceled",
+            Self::HlBridgeDepositObserved => "hl_bridge_deposit_observed",
+            Self::HlBridgeDepositCredited => "hl_bridge_deposit_credited",
+            Self::HlWithdrawalAcknowledged => "hl_withdrawal_acknowledged",
+            Self::HlWithdrawalSettled => "hl_withdrawal_settled",
         }
     }
 
     pub fn from_db_string(value: &str) -> Option<Self> {
         match value {
             "possible_progress" => Some(Self::PossibleProgress),
+            "hl_trade_filled" => Some(Self::HlTradeFilled),
+            "hl_trade_canceled" => Some(Self::HlTradeCanceled),
+            "hl_bridge_deposit_observed" => Some(Self::HlBridgeDepositObserved),
+            "hl_bridge_deposit_credited" => Some(Self::HlBridgeDepositCredited),
+            "hl_withdrawal_acknowledged" => Some(Self::HlWithdrawalAcknowledged),
+            "hl_withdrawal_settled" => Some(Self::HlWithdrawalSettled),
             _ => None,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HlTradeFilledEvidence {
+    pub user: String,
+    pub oid: u64,
+    pub tid: u64,
+    pub coin: String,
+    pub side: String,
+    pub px: String,
+    pub sz: String,
+    pub crossed: bool,
+    pub hash: String,
+    pub time_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HlTradeCanceledEvidence {
+    pub user: String,
+    pub oid: u64,
+    pub coin: String,
+    pub status: String,
+    pub status_timestamp_ms: i64,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HlBridgeDepositObservedEvidence {
+    pub user: String,
+    pub usdc: String,
+    pub arb_tx_hash: String,
+    pub log_index: u64,
+    pub block_number: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HlBridgeDepositCreditedEvidence {
+    pub user: String,
+    pub usdc: String,
+    pub hl_credit_hash: String,
+    pub hl_credit_time_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HlWithdrawalAcknowledgedEvidence {
+    pub user: String,
+    pub usdc: String,
+    pub nonce: u64,
+    pub hl_request_hash: String,
+    pub hl_request_time_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HlWithdrawalSettledEvidence {
+    pub user: String,
+    pub usdc: String,
+    pub arb_payout_tx_hash: String,
+    pub log_index: u64,
+    pub block_number: u64,
+    pub time_window_match_to_nonce: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -946,6 +1030,7 @@ pub struct OrderProviderOperationHint {
 pub const PROVIDER_OPERATION_OBSERVATION_HINT_SOURCE: &str =
     "sauron_provider_operation_observation";
 pub const SAURON_DETECTOR_HINT_SOURCE: &str = "sauron";
+pub const SAURON_HYPERLIQUID_OBSERVER_HINT_SOURCE: &str = "sauron_hyperliquid_observer";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DepositVaultFundingHint {

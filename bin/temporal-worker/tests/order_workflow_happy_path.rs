@@ -60,9 +60,10 @@ use temporal_worker::{
         activities::{OrderActivities, OrderActivityDeps},
         build_worker, order_workflow_id, refund_workflow_id,
         types::{
-            AcknowledgeUnrecoverableSignal, ManualReleaseSignal, ManualTriggerRefundSignal,
-            OrderTerminalStatus, OrderWorkflowInput, OrderWorkflowOutput, ProviderHintKind,
-            ProviderKind, ProviderOperationHintSignal,
+            AcknowledgeUnrecoverableSignal, HlBridgeDepositCreditedEvidence, ManualReleaseSignal,
+            ManualTriggerRefundSignal, OrderTerminalStatus, OrderWorkflowInput,
+            OrderWorkflowOutput, ProviderHintKind, ProviderKind, ProviderOperationHintEvidence,
+            ProviderOperationHintSignal,
         },
         workflow_start_options,
         workflows::{OrderWorkflow, RefundWorkflow},
@@ -2739,6 +2740,11 @@ async fn signal_order_hyperliquid_bridge_deposit_observation(
         sleep(Duration::from_millis(250)).await;
     }
 
+    let amount = operation
+        .request
+        .get("amount")
+        .and_then(serde_json::Value::as_str)
+        .expect("HyperliquidBridgeDeposit request should carry amount");
     let signal_result = handle_before_hint
         .signal(
             OrderWorkflow::provider_operation_hint,
@@ -2751,17 +2757,50 @@ async fn signal_order_hyperliquid_bridge_deposit_observation(
                 hint_id: Uuid::now_v7().into(),
                 provider_operation_id: Some(operation.id.into()),
                 provider: ProviderKind::Bridge,
-                hint_kind: ProviderHintKind::ProviderObservation,
-                provider_ref: operation.provider_ref,
-                evidence: None,
+                hint_kind: ProviderHintKind::HlBridgeDepositCredited,
+                provider_ref: operation.provider_ref.clone(),
+                evidence: Some(ProviderOperationHintEvidence::HlBridgeDepositCredited(
+                    HlBridgeDepositCreditedEvidence {
+                        user: format!("{user:#x}"),
+                        usdc: raw_usdc_to_decimal_string(amount),
+                        hl_credit_hash: format!("mock-hl-credit-{}", operation.id),
+                        hl_credit_time_ms: Utc::now().timestamp_millis(),
+                    },
+                )),
             },
             WorkflowSignalOptions::default(),
         )
         .await;
     assert_signal_sent_or_workflow_completed(
         signal_result,
-        "send HyperliquidBridgeDeposit provider-observation hint signal",
+        "send HyperliquidBridgeDeposit credited hint signal",
     );
+}
+
+fn raw_usdc_to_decimal_string(raw: &str) -> String {
+    assert!(
+        !raw.is_empty() && raw.bytes().all(|byte| byte.is_ascii_digit()),
+        "USDC raw amount should be a decimal integer"
+    );
+    let raw = raw.trim_start_matches('0');
+    let raw = if raw.is_empty() { "0" } else { raw };
+    if raw.len() <= 6 {
+        let mut fraction = "0".repeat(6 - raw.len());
+        fraction.push_str(raw);
+        let fraction = fraction.trim_end_matches('0');
+        return if fraction.is_empty() {
+            "0".to_string()
+        } else {
+            format!("0.{fraction}")
+        };
+    }
+    let (whole, fraction) = raw.split_at(raw.len() - 6);
+    let fraction = fraction.trim_end_matches('0');
+    if fraction.is_empty() {
+        whole.to_string()
+    } else {
+        format!("{whole}.{fraction}")
+    }
 }
 
 async fn signal_order_unit_deposit_hint(

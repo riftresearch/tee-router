@@ -478,6 +478,8 @@ services:
         condition: service_healthy
       devnet:
         condition: service_healthy
+      hl-shim-indexer:
+        condition: service_started
     environment:
       RUST_LOG: info
       ROUTER_REPLICA_DATABASE_URL: postgres://router_app:router_app@router-postgres-replica:5432/router_db
@@ -501,6 +503,8 @@ services:
       BASE_TOKEN_INDEXER_URL: http://devnet:50105
       ARBITRUM_TOKEN_INDEXER_URL: http://devnet:50106
       TOKEN_INDEXER_API_KEY: local-token-indexer-api-key-000000000
+      HL_SHIM_INDEXER_URL: http://hl-shim-indexer:8080
+      SAURON_HL_BRIDGE_MATCH_WINDOW_SECONDS: 1800
 
   hl-shim-indexer:
     build:

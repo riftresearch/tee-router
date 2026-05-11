@@ -134,6 +134,18 @@ pub struct SauronArgs {
     #[arg(long, env = "ARBITRUM_TOKEN_INDEXER_URL")]
     pub arbitrum_token_indexer_url: Option<String>,
 
+    /// Hyperliquid shim indexer URL
+    #[arg(long, env = "HL_SHIM_INDEXER_URL")]
+    pub hl_shim_indexer_url: Option<String>,
+
+    /// HL bridge Arbitrum/HL ledger correlation window, in seconds
+    #[arg(
+        long,
+        env = "SAURON_HL_BRIDGE_MATCH_WINDOW_SECONDS",
+        default_value = "1800"
+    )]
+    pub sauron_hl_bridge_match_window_seconds: i64,
+
     /// Bearer key shared by configured EVM token-indexer APIs
     #[arg(long, env = "TOKEN_INDEXER_API_KEY")]
     pub token_indexer_api_key: Option<String>,
@@ -228,6 +240,14 @@ impl fmt::Debug for SauronArgs {
                     .map(|_| "<redacted>"),
             )
             .field(
+                "hl_shim_indexer_url",
+                &self.hl_shim_indexer_url.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "sauron_hl_bridge_match_window_seconds",
+                &self.sauron_hl_bridge_match_window_seconds,
+            )
+            .field(
                 "token_indexer_api_key",
                 &self.token_indexer_api_key.as_ref().map(|_| "<redacted>"),
             )
@@ -309,6 +329,8 @@ mod tests {
             arbitrum_token_indexer_url: Some(
                 "https://arb-indexer.example/token-secret".to_string(),
             ),
+            hl_shim_indexer_url: Some("https://hl-shim.example/token-secret".to_string()),
+            sauron_hl_bridge_match_window_seconds: 1_800,
             token_indexer_api_key: Some("token-indexer-api-key-secret".to_string()),
             sauron_reconcile_interval_seconds: 3600,
             sauron_bitcoin_scan_interval_seconds: 15,

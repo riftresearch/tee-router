@@ -79,6 +79,9 @@ pub enum Error {
         source: evm_token_indexer_client::Error,
     },
 
+    #[snafu(display("HL shim indexer request failed"))]
+    HlShim { source: hl_shim_client::Error },
+
     #[snafu(display("ROUTER request failed"))]
     RouterRequest { source: reqwest::Error },
 

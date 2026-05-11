@@ -25,6 +25,7 @@ SELECT
   opo.request_json,
   opo.response_json,
   opo.observed_state_json,
+  oes.request_json AS execution_step_request_json,
   opo.updated_at
 FROM public.order_provider_operations opo
 JOIN public.order_execution_steps oes ON oes.id = opo.execution_step_id
@@ -45,6 +46,7 @@ SELECT
   opo.request_json,
   opo.response_json,
   opo.observed_state_json,
+  oes.request_json AS execution_step_request_json,
   opo.updated_at
 FROM public.order_provider_operations opo
 JOIN public.order_execution_steps oes ON oes.id = opo.execution_step_id
@@ -72,6 +74,7 @@ pub struct ProviderOperationWatchEntry {
     pub request: Value,
     pub response: Value,
     pub observed_state: Value,
+    pub execution_step_request: Value,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -375,6 +378,13 @@ fn parse_provider_operation_row(row: sqlx_postgres::PgRow) -> Result<ProviderOpe
                 message: format!("provider operation {operation_id} missing observed_state_json"),
             }
         })?,
+        execution_step_request: row.try_get("execution_step_request_json").map_err(|_| {
+            crate::error::Error::InvalidWatchRow {
+                message: format!(
+                    "provider operation {operation_id} missing execution_step_request_json"
+                ),
+            }
+        })?,
         updated_at: row.try_get("updated_at").map_err(|_| {
             crate::error::Error::InvalidWatchRow {
                 message: format!("provider operation {operation_id} missing updated_at"),
@@ -406,6 +416,7 @@ mod tests {
             request: json!({}),
             response: json!({}),
             observed_state: json!({}),
+            execution_step_request: json!({}),
             updated_at: utc::now(),
         }
     }

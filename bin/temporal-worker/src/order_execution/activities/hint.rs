@@ -58,6 +58,22 @@ impl ProviderObservationActivities {
                 ProviderHintKind::HyperliquidTrade => {
                     verify_hyperliquid_trade_hint(&deps, input).await
                 }
+                ProviderHintKind::HlTradeFilled => verify_hl_trade_filled_hint(&deps, input).await,
+                ProviderHintKind::HlTradeCanceled => {
+                    verify_hl_trade_canceled_hint(&deps, input).await
+                }
+                ProviderHintKind::HlBridgeDepositObserved => {
+                    verify_hl_bridge_deposit_observed_hint(&deps, input).await
+                }
+                ProviderHintKind::HlBridgeDepositCredited => {
+                    verify_hl_bridge_deposit_credited_hint(&deps, input).await
+                }
+                ProviderHintKind::HlWithdrawalAcknowledged => {
+                    verify_hl_withdrawal_acknowledged_hint(&deps, input).await
+                }
+                ProviderHintKind::HlWithdrawalSettled => {
+                    verify_hl_withdrawal_settled_hint(&deps, input).await
+                }
             }
         })
         .await
@@ -724,78 +740,710 @@ pub(super) async fn verify_hyperliquid_trade_hint(
         });
     }
 
-    let provider = deps
-        .action_providers
-        .exchange(&operation.provider)
-        .ok_or_else(|| provider_observe_not_configured(&operation.provider))?;
-    let observation = provider
-        .observe_trade_operation(ProviderOperationObservationRequest {
-            operation_id: operation.id,
-            operation_type: operation.operation_type,
-            provider_ref: operation.provider_ref.clone(),
-            request: operation.request.clone(),
-            response: operation.response.clone(),
-            observed_state: operation.observed_state.clone(),
-            hint_evidence: provider_hint_signal_evidence(&input.signal),
-        })
-        .await
-        .map_err(|source| provider_observe_error(&operation.provider, source))?;
+    Ok(provider_hint_deferred(
+        Some(provider_operation_id),
+        "Hyperliquid trade operations require typed Sauron HL trade evidence",
+    ))
+}
 
-    let Some(observation) = observation else {
-        return Ok(provider_hint_deferred(
-            Some(provider_operation_id),
-            "Hyperliquid provider returned no trade observation",
+pub(super) async fn verify_hl_trade_filled_hint(
+    deps: &OrderActivityDeps,
+    input: VerifyProviderOperationHintInput,
+) -> Result<ProviderOperationHintVerified, OrderActivityError> {
+    let Some(ProviderOperationHintEvidence::HlTradeFilled(evidence)) =
+        input.signal.evidence.as_ref()
+    else {
+        return Ok(provider_hint_rejected(
+            input.signal.provider_operation_id.map(|id| id.inner()),
+            "HlTradeFilled hint missing typed evidence",
         ));
     };
-    if let Some(reason) = provider_observation_ref_reject_reason(&operation, &observation) {
-        return Ok(provider_hint_rejected(Some(provider_operation_id), reason));
+    let operation = load_hl_typed_hint_operation(
+        deps,
+        &input,
+        "HlTradeFilled",
+        &[
+            ProviderOperationType::HyperliquidTrade,
+            ProviderOperationType::HyperliquidLimitOrder,
+        ],
+    )
+    .await?;
+    if let Some(decision) = terminal_hint_decision(&operation) {
+        return Ok(decision);
     }
+    validate_hl_trade_user(&operation, &evidence.user)?;
+    validate_hl_trade_oid(&operation, evidence.oid)?;
+    validate_hl_trade_size(&operation, &evidence.sz)?;
+    complete_provider_operation_from_typed_hl_hint(
+        deps,
+        &input,
+        operation,
+        TypedHlProviderOperationUpdate {
+            status: ProviderOperationStatus::Completed,
+            provider_ref: input
+                .signal
+                .provider_ref
+                .clone()
+                .or_else(|| Some(evidence.hash.clone())),
+            observed_state: typed_hl_evidence_state("hl_trade_filled", evidence)?,
+            response: None,
+            tx_hash: Some(evidence.hash.clone()),
+        },
+    )
+    .await
+}
 
-    let provider_ref = observation
-        .provider_ref
-        .clone()
-        .or_else(|| operation.provider_ref.clone())
-        .or_else(|| observation.tx_hash.clone());
-    let observed_state = provider_hint_observed_state(&operation, &input, &observation);
+async fn load_hl_typed_hint_operation(
+    deps: &OrderActivityDeps,
+    input: &VerifyProviderOperationHintInput,
+    label: &'static str,
+    allowed_types: &[ProviderOperationType],
+) -> Result<OrderProviderOperation, OrderActivityError> {
+    let provider_operation_id = input
+        .signal
+        .provider_operation_id
+        .ok_or_else(|| {
+            OrderActivityError::hint_verification(label, "missing provider_operation_id")
+        })?
+        .inner();
+    let operation = deps
+        .db
+        .orders()
+        .get_provider_operation(provider_operation_id)
+        .await
+        .map_err(OrderActivityError::db_query)?;
+    if operation.order_id != input.order_id.inner() {
+        return Err(OrderActivityError::hint_verification(
+            label,
+            format!(
+                "provider operation {} belongs to order {}, not {}",
+                operation.id,
+                operation.order_id,
+                input.order_id.inner()
+            ),
+        ));
+    }
+    if operation.execution_step_id != Some(input.step_id.inner()) {
+        return Err(OrderActivityError::hint_verification(
+            label,
+            format!(
+                "provider operation {} belongs to step {:?}, not {}",
+                operation.id,
+                operation.execution_step_id,
+                input.step_id.inner()
+            ),
+        ));
+    }
+    if !allowed_types.contains(&operation.operation_type) {
+        return Err(OrderActivityError::hint_verification(
+            label,
+            format!(
+                "{label} cannot verify {} operation",
+                operation.operation_type.to_db_string()
+            ),
+        ));
+    }
+    Ok(operation)
+}
+
+async fn complete_provider_operation_from_typed_hl_hint(
+    deps: &OrderActivityDeps,
+    input: &VerifyProviderOperationHintInput,
+    operation: OrderProviderOperation,
+    update: TypedHlProviderOperationUpdate,
+) -> Result<ProviderOperationHintVerified, OrderActivityError> {
+    let mut observed_state = update.observed_state;
+    if let Some(tx_hash) = &update.tx_hash {
+        observed_state["tx_hash"] = json!(tx_hash);
+    }
+    if !is_empty_json_object(&operation.observed_state) {
+        observed_state["previous_observed_state"] = operation.observed_state.clone();
+    }
     let (updated, _) = deps
         .db
         .orders()
         .update_provider_operation_status(
             operation.id,
-            observation.status,
-            provider_ref,
+            update.status,
+            update.provider_ref,
             observed_state,
-            observation.response.clone(),
+            update.response,
             Utc::now(),
         )
         .await
         .map_err(OrderActivityError::db_query)?;
-
-    match updated.status {
-        ProviderOperationStatus::Completed => Ok(ProviderOperationHintVerified {
-            provider_operation_id: Some(updated.id.into()),
-            decision: ProviderOperationHintDecision::Accept,
-            reason: None,
-        }),
+    let decision = match updated.status {
+        ProviderOperationStatus::Completed => ProviderOperationHintDecision::Accept,
         ProviderOperationStatus::Failed | ProviderOperationStatus::Expired => {
-            Ok(provider_hint_rejected(
-                Some(updated.id),
-                format!(
-                    "Hyperliquid trade observation returned {}",
-                    updated.status.to_db_string()
-                ),
-            ))
+            ProviderOperationHintDecision::Reject
         }
         ProviderOperationStatus::Planned
         | ProviderOperationStatus::Submitted
-        | ProviderOperationStatus::WaitingExternal => Ok(provider_hint_deferred(
-            Some(updated.id),
-            format!(
-                "Hyperliquid trade observation returned {}",
+        | ProviderOperationStatus::WaitingExternal => ProviderOperationHintDecision::Defer,
+    };
+    Ok(ProviderOperationHintVerified {
+        provider_operation_id: Some(updated.id.into()),
+        decision,
+        reason: if decision == ProviderOperationHintDecision::Defer {
+            Some(format!(
+                "{:?} typed hint kept provider operation in {}",
+                input.signal.hint_kind,
                 updated.status.to_db_string()
-            ),
+            ))
+        } else {
+            None
+        },
+    })
+}
+
+struct TypedHlProviderOperationUpdate {
+    status: ProviderOperationStatus,
+    provider_ref: Option<String>,
+    observed_state: Value,
+    response: Option<Value>,
+    tx_hash: Option<String>,
+}
+
+fn typed_hl_evidence_state<T: serde::Serialize>(
+    source: &'static str,
+    evidence: &T,
+) -> Result<Value, OrderActivityError> {
+    Ok(json!({
+        "source": source,
+        "evidence": serde_json::to_value(evidence)
+            .map_err(|err| OrderActivityError::serialization("serializing typed HL hint evidence", err))?,
+    }))
+}
+
+fn validate_hl_trade_oid(
+    operation: &OrderProviderOperation,
+    evidence_oid: u64,
+) -> Result<(), OrderActivityError> {
+    let expected = hl_order_oid_from_observed_state(&operation.observed_state).or_else(|| {
+        operation
+            .provider_ref
+            .as_deref()
+            .and_then(|value| value.parse().ok())
+    });
+    match expected {
+        Some(expected) if expected == evidence_oid => Ok(()),
+        Some(expected) => Err(OrderActivityError::hint_verification(
+            "HyperliquidTrade",
+            format!("evidence oid {evidence_oid} does not match operation oid {expected}"),
+        )),
+        None => Err(OrderActivityError::hint_verification(
+            "HyperliquidTrade",
+            "operation is missing expected oid",
         )),
     }
+}
+
+fn validate_hl_trade_user(
+    operation: &OrderProviderOperation,
+    evidence_user: &str,
+) -> Result<(), OrderActivityError> {
+    let expected = operation.request.get("user").and_then(Value::as_str);
+    match expected {
+        Some(expected) if expected.eq_ignore_ascii_case(evidence_user) => Ok(()),
+        Some(expected) => Err(OrderActivityError::hint_verification(
+            "HyperliquidTrade",
+            format!("evidence user {evidence_user} does not match operation user {expected}"),
+        )),
+        None => Err(OrderActivityError::hint_verification(
+            "HyperliquidTrade",
+            "operation request is missing expected user",
+        )),
+    }
+}
+
+fn validate_hl_trade_size(
+    operation: &OrderProviderOperation,
+    filled_sz: &str,
+) -> Result<(), OrderActivityError> {
+    let Some(expected_sz) = operation.request.get("sz").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    if decimal_string_gte(filled_sz, expected_sz)? {
+        Ok(())
+    } else {
+        Err(OrderActivityError::hint_verification(
+            "HyperliquidTrade",
+            format!("filled size {filled_sz} is below expected size {expected_sz}"),
+        ))
+    }
+}
+
+fn validate_hl_bridge_user(
+    operation: &OrderProviderOperation,
+    evidence_user: &str,
+) -> Result<(), OrderActivityError> {
+    let expected = operation.provider_ref.as_deref().or_else(|| {
+        operation
+            .request
+            .get("hyperliquid_user")
+            .and_then(Value::as_str)
+    });
+    match expected {
+        Some(expected) if expected.eq_ignore_ascii_case(evidence_user) => Ok(()),
+        Some(expected) => Err(OrderActivityError::hint_verification(
+            "HyperliquidBridge",
+            format!("evidence user {evidence_user} does not match operation user {expected}"),
+        )),
+        None => Err(OrderActivityError::hint_verification(
+            "HyperliquidBridge",
+            "operation is missing expected Hyperliquid user",
+        )),
+    }
+}
+
+fn validate_hl_withdrawal_user(
+    operation: &OrderProviderOperation,
+    evidence_user: &str,
+) -> Result<(), OrderActivityError> {
+    let expected = operation
+        .request
+        .get("hyperliquid_custody_vault_address")
+        .and_then(Value::as_str);
+    match expected {
+        Some(expected) if expected.eq_ignore_ascii_case(evidence_user) => Ok(()),
+        Some(expected) => Err(OrderActivityError::hint_verification(
+            "HyperliquidBridgeWithdrawal",
+            format!("evidence user {evidence_user} does not match operation user {expected}"),
+        )),
+        None => Ok(()),
+    }
+}
+
+fn validate_hl_withdrawal_settlement_nonce(
+    operation: &OrderProviderOperation,
+    evidence_nonce: u64,
+) -> Result<(), OrderActivityError> {
+    let acknowledged_nonce = operation
+        .observed_state
+        .pointer("/evidence/nonce")
+        .and_then(Value::as_u64);
+    match acknowledged_nonce {
+        Some(acknowledged_nonce) if acknowledged_nonce == evidence_nonce => Ok(()),
+        Some(acknowledged_nonce) => Err(OrderActivityError::hint_verification(
+            "HyperliquidBridgeWithdrawal",
+            format!(
+                "settlement nonce {evidence_nonce} does not match acknowledged nonce {acknowledged_nonce}"
+            ),
+        )),
+        None => Ok(()),
+    }
+}
+
+fn validate_hl_bridge_usdc_amount(
+    operation: &OrderProviderOperation,
+    evidence_usdc: &str,
+) -> Result<(), OrderActivityError> {
+    let amount = operation
+        .request
+        .get("amount")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            OrderActivityError::hint_verification(
+                "HyperliquidBridgeDeposit",
+                "operation request missing amount",
+            )
+        })?;
+    validate_usdc_decimal_matches_raw("HyperliquidBridgeDeposit", evidence_usdc, amount)
+}
+
+fn validate_hl_withdrawal_gross_usdc_amount(
+    operation: &OrderProviderOperation,
+    evidence_usdc: &str,
+) -> Result<(), OrderActivityError> {
+    let expected = operation
+        .request
+        .get("amount_decimal")
+        .and_then(Value::as_str)
+        .or_else(|| operation.request.get("amount").and_then(Value::as_str))
+        .ok_or_else(|| {
+            OrderActivityError::hint_verification(
+                "HyperliquidBridgeWithdrawal",
+                "operation request missing amount",
+            )
+        })?;
+    if expected.contains('.') {
+        if decimal_strings_equal(evidence_usdc, expected)? {
+            Ok(())
+        } else {
+            Err(OrderActivityError::hint_verification(
+                "HyperliquidBridgeWithdrawal",
+                format!("evidence usdc {evidence_usdc} does not match operation amount {expected}"),
+            ))
+        }
+    } else {
+        validate_usdc_decimal_matches_raw("HyperliquidBridgeWithdrawal", evidence_usdc, expected)
+    }
+}
+
+fn validate_hl_withdrawal_payout_usdc_amount(
+    operation: &OrderProviderOperation,
+    evidence_usdc: &str,
+) -> Result<(), OrderActivityError> {
+    let expected = hl_withdrawal_payout_raw_amount(operation)?;
+    validate_usdc_decimal_matches_raw("HyperliquidBridgeWithdrawal", evidence_usdc, &expected)
+}
+
+fn hl_withdrawal_payout_raw_amount(
+    operation: &OrderProviderOperation,
+) -> Result<String, OrderActivityError> {
+    let amount = operation
+        .request
+        .get("amount")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            OrderActivityError::hint_verification(
+                "HyperliquidBridgeWithdrawal",
+                "operation request missing amount",
+            )
+        })?;
+    let gross = parse_raw_usdc_u256("HyperliquidBridgeWithdrawal amount", amount)?;
+    let fee = operation
+        .request
+        .get("withdraw_fee_raw")
+        .and_then(Value::as_str)
+        .map(|raw| parse_raw_usdc_u256("HyperliquidBridgeWithdrawal withdraw_fee_raw", raw))
+        .transpose()?
+        .unwrap_or(U256::ZERO);
+    if gross < fee {
+        return Err(OrderActivityError::hint_verification(
+            "HyperliquidBridgeWithdrawal",
+            format!("operation amount {amount} is smaller than withdraw fee {fee}"),
+        ));
+    }
+    Ok((gross - fee).to_string())
+}
+
+fn parse_raw_usdc_u256(context: &str, raw: &str) -> Result<U256, OrderActivityError> {
+    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(OrderActivityError::amount_parse(
+            context.to_string(),
+            format!("invalid raw USDC amount {raw:?}"),
+        ));
+    }
+    U256::from_str_radix(raw, 10)
+        .map_err(|source| OrderActivityError::amount_parse(context.to_string(), source.to_string()))
+}
+
+fn validate_usdc_decimal_matches_raw(
+    context: &'static str,
+    decimal: &str,
+    raw: &str,
+) -> Result<(), OrderActivityError> {
+    let expected = raw_usdc_to_decimal(raw)?;
+    if decimal_strings_equal(decimal, &expected)? {
+        Ok(())
+    } else {
+        Err(OrderActivityError::hint_verification(
+            context,
+            format!("evidence usdc {decimal} does not match raw amount {raw} ({expected})"),
+        ))
+    }
+}
+
+fn raw_usdc_to_decimal(raw: &str) -> Result<String, OrderActivityError> {
+    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(OrderActivityError::amount_parse(
+            "formatting raw USDC hint amount",
+            format!("invalid raw amount {raw:?}"),
+        ));
+    }
+    let raw = raw.trim_start_matches('0');
+    let raw = if raw.is_empty() { "0" } else { raw };
+    if raw.len() <= 6 {
+        let mut fraction = "0".repeat(6 - raw.len());
+        fraction.push_str(raw);
+        let fraction = fraction.trim_end_matches('0');
+        return Ok(if fraction.is_empty() {
+            "0".to_string()
+        } else {
+            format!("0.{fraction}")
+        });
+    }
+    let (whole, fraction) = raw.split_at(raw.len() - 6);
+    let fraction = fraction.trim_end_matches('0');
+    Ok(if fraction.is_empty() {
+        whole.to_string()
+    } else {
+        format!("{whole}.{fraction}")
+    })
+}
+
+fn decimal_strings_equal(left: &str, right: &str) -> Result<bool, OrderActivityError> {
+    Ok(normalize_decimal_string(left)? == normalize_decimal_string(right)?)
+}
+
+fn decimal_string_gte(left: &str, right: &str) -> Result<bool, OrderActivityError> {
+    let left = normalize_decimal_string(left)?;
+    let right = normalize_decimal_string(right)?;
+    let (left_whole, left_frac) = split_decimal(&left);
+    let (right_whole, right_frac) = split_decimal(&right);
+    if left_whole.len() != right_whole.len() {
+        return Ok(left_whole.len() > right_whole.len());
+    }
+    if left_whole != right_whole {
+        return Ok(left_whole > right_whole);
+    }
+    let width = left_frac.len().max(right_frac.len());
+    let mut left_frac = left_frac.to_string();
+    let mut right_frac = right_frac.to_string();
+    left_frac.extend(std::iter::repeat_n('0', width - left_frac.len()));
+    right_frac.extend(std::iter::repeat_n('0', width - right_frac.len()));
+    Ok(left_frac >= right_frac)
+}
+
+fn normalize_decimal_string(value: &str) -> Result<String, OrderActivityError> {
+    let Some((whole, fraction)) = value.split_once('.') else {
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(OrderActivityError::amount_parse(
+                "normalizing decimal hint amount",
+                format!("invalid decimal amount {value:?}"),
+            ));
+        }
+        return Ok(nonempty_decimal_digits(value.trim_start_matches('0')));
+    };
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(OrderActivityError::amount_parse(
+            "normalizing decimal hint amount",
+            format!("invalid decimal amount {value:?}"),
+        ));
+    }
+    let whole = nonempty_decimal_digits(whole.trim_start_matches('0'));
+    let fraction = fraction.trim_end_matches('0');
+    Ok(if fraction.is_empty() {
+        whole
+    } else {
+        format!("{whole}.{fraction}")
+    })
+}
+
+fn split_decimal(value: &str) -> (&str, &str) {
+    value.split_once('.').unwrap_or((value, ""))
+}
+
+fn nonempty_decimal_digits(value: &str) -> String {
+    if value.is_empty() {
+        "0".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn hl_order_oid_from_observed_state(value: &Value) -> Option<u64> {
+    [
+        "/oid",
+        "/provider_observed_state/order/order/oid",
+        "/previous_observed_state/oid",
+        "/previous_observed_state/provider_observed_state/order/order/oid",
+    ]
+    .iter()
+    .find_map(|pointer| value.pointer(pointer).and_then(Value::as_u64))
+}
+
+pub(super) async fn verify_hl_trade_canceled_hint(
+    deps: &OrderActivityDeps,
+    input: VerifyProviderOperationHintInput,
+) -> Result<ProviderOperationHintVerified, OrderActivityError> {
+    let Some(ProviderOperationHintEvidence::HlTradeCanceled(evidence)) =
+        input.signal.evidence.as_ref()
+    else {
+        return Ok(provider_hint_rejected(
+            input.signal.provider_operation_id.map(|id| id.inner()),
+            "HlTradeCanceled hint missing typed evidence",
+        ));
+    };
+    let operation = load_hl_typed_hint_operation(
+        deps,
+        &input,
+        "HlTradeCanceled",
+        &[
+            ProviderOperationType::HyperliquidTrade,
+            ProviderOperationType::HyperliquidLimitOrder,
+        ],
+    )
+    .await?;
+    if let Some(decision) = terminal_hint_decision(&operation) {
+        return Ok(decision);
+    }
+    validate_hl_trade_user(&operation, &evidence.user)?;
+    validate_hl_trade_oid(&operation, evidence.oid)?;
+    complete_provider_operation_from_typed_hl_hint(
+        deps,
+        &input,
+        operation,
+        TypedHlProviderOperationUpdate {
+            status: ProviderOperationStatus::Failed,
+            provider_ref: input.signal.provider_ref.clone(),
+            observed_state: typed_hl_evidence_state("hl_trade_canceled", evidence)?,
+            response: None,
+            tx_hash: None,
+        },
+    )
+    .await
+}
+
+pub(super) async fn verify_hl_bridge_deposit_observed_hint(
+    deps: &OrderActivityDeps,
+    input: VerifyProviderOperationHintInput,
+) -> Result<ProviderOperationHintVerified, OrderActivityError> {
+    let Some(ProviderOperationHintEvidence::HlBridgeDepositObserved(evidence)) =
+        input.signal.evidence.as_ref()
+    else {
+        return Ok(provider_hint_rejected(
+            input.signal.provider_operation_id.map(|id| id.inner()),
+            "HlBridgeDepositObserved hint missing typed evidence",
+        ));
+    };
+    let operation = load_hl_typed_hint_operation(
+        deps,
+        &input,
+        "HlBridgeDepositObserved",
+        &[ProviderOperationType::HyperliquidBridgeDeposit],
+    )
+    .await?;
+    if let Some(decision) = terminal_hint_decision(&operation) {
+        return Ok(decision);
+    }
+    validate_hl_bridge_user(&operation, &evidence.user)?;
+    validate_hl_bridge_usdc_amount(&operation, &evidence.usdc)?;
+    complete_provider_operation_from_typed_hl_hint(
+        deps,
+        &input,
+        operation,
+        TypedHlProviderOperationUpdate {
+            status: ProviderOperationStatus::WaitingExternal,
+            provider_ref: Some(evidence.user.clone()),
+            observed_state: typed_hl_evidence_state("hl_bridge_deposit_observed", evidence)?,
+            response: None,
+            tx_hash: Some(evidence.arb_tx_hash.clone()),
+        },
+    )
+    .await
+}
+
+pub(super) async fn verify_hl_bridge_deposit_credited_hint(
+    deps: &OrderActivityDeps,
+    input: VerifyProviderOperationHintInput,
+) -> Result<ProviderOperationHintVerified, OrderActivityError> {
+    let Some(ProviderOperationHintEvidence::HlBridgeDepositCredited(evidence)) =
+        input.signal.evidence.as_ref()
+    else {
+        return Ok(provider_hint_rejected(
+            input.signal.provider_operation_id.map(|id| id.inner()),
+            "HlBridgeDepositCredited hint missing typed evidence",
+        ));
+    };
+    let operation = load_hl_typed_hint_operation(
+        deps,
+        &input,
+        "HlBridgeDepositCredited",
+        &[ProviderOperationType::HyperliquidBridgeDeposit],
+    )
+    .await?;
+    if let Some(decision) = terminal_hint_decision(&operation) {
+        return Ok(decision);
+    }
+    validate_hl_bridge_user(&operation, &evidence.user)?;
+    validate_hl_bridge_usdc_amount(&operation, &evidence.usdc)?;
+    complete_provider_operation_from_typed_hl_hint(
+        deps,
+        &input,
+        operation,
+        TypedHlProviderOperationUpdate {
+            status: ProviderOperationStatus::Completed,
+            provider_ref: Some(evidence.user.clone()),
+            observed_state: typed_hl_evidence_state("hl_bridge_deposit_credited", evidence)?,
+            response: None,
+            tx_hash: Some(evidence.hl_credit_hash.clone()),
+        },
+    )
+    .await
+}
+
+pub(super) async fn verify_hl_withdrawal_acknowledged_hint(
+    deps: &OrderActivityDeps,
+    input: VerifyProviderOperationHintInput,
+) -> Result<ProviderOperationHintVerified, OrderActivityError> {
+    let Some(ProviderOperationHintEvidence::HlWithdrawalAcknowledged(evidence)) =
+        input.signal.evidence.as_ref()
+    else {
+        return Ok(provider_hint_rejected(
+            input.signal.provider_operation_id.map(|id| id.inner()),
+            "HlWithdrawalAcknowledged hint missing typed evidence",
+        ));
+    };
+    let operation = load_hl_typed_hint_operation(
+        deps,
+        &input,
+        "HlWithdrawalAcknowledged",
+        &[ProviderOperationType::HyperliquidBridgeWithdrawal],
+    )
+    .await?;
+    if let Some(decision) = terminal_hint_decision(&operation) {
+        return Ok(decision);
+    }
+    validate_hl_withdrawal_user(&operation, &evidence.user)?;
+    validate_hl_withdrawal_gross_usdc_amount(&operation, &evidence.usdc)?;
+    complete_provider_operation_from_typed_hl_hint(
+        deps,
+        &input,
+        operation,
+        TypedHlProviderOperationUpdate {
+            status: ProviderOperationStatus::WaitingExternal,
+            provider_ref: input.signal.provider_ref.clone(),
+            observed_state: typed_hl_evidence_state("hl_withdrawal_acknowledged", evidence)?,
+            response: None,
+            tx_hash: Some(evidence.hl_request_hash.clone()),
+        },
+    )
+    .await
+}
+
+pub(super) async fn verify_hl_withdrawal_settled_hint(
+    deps: &OrderActivityDeps,
+    input: VerifyProviderOperationHintInput,
+) -> Result<ProviderOperationHintVerified, OrderActivityError> {
+    let Some(ProviderOperationHintEvidence::HlWithdrawalSettled(evidence)) =
+        input.signal.evidence.as_ref()
+    else {
+        return Ok(provider_hint_rejected(
+            input.signal.provider_operation_id.map(|id| id.inner()),
+            "HlWithdrawalSettled hint missing typed evidence",
+        ));
+    };
+    let operation = load_hl_typed_hint_operation(
+        deps,
+        &input,
+        "HlWithdrawalSettled",
+        &[ProviderOperationType::HyperliquidBridgeWithdrawal],
+    )
+    .await?;
+    if let Some(decision) = terminal_hint_decision(&operation) {
+        return Ok(decision);
+    }
+    validate_hl_withdrawal_user(&operation, &evidence.user)?;
+    validate_hl_withdrawal_payout_usdc_amount(&operation, &evidence.usdc)?;
+    validate_hl_withdrawal_settlement_nonce(&operation, evidence.time_window_match_to_nonce)?;
+    complete_provider_operation_from_typed_hl_hint(
+        deps,
+        &input,
+        operation,
+        TypedHlProviderOperationUpdate {
+            status: ProviderOperationStatus::Completed,
+            provider_ref: Some(evidence.arb_payout_tx_hash.clone()),
+            observed_state: typed_hl_evidence_state("hl_withdrawal_settled", evidence)?,
+            response: None,
+            tx_hash: Some(evidence.arb_payout_tx_hash.clone()),
+        },
+    )
+    .await
 }
 
 pub(super) async fn verify_unit_deposit_hint(
@@ -820,7 +1468,8 @@ pub(super) async fn verify_unit_deposit_hint(
         return Ok(decision);
     }
 
-    let Some(evidence) = input.signal.evidence.as_ref() else {
+    let Some(ProviderOperationHintEvidence::UnitDeposit(evidence)) = input.signal.evidence.as_ref()
+    else {
         return verify_provider_observation_hint(deps, input).await;
     };
     let chain = match verify_chain_evidence(evidence) {
@@ -888,7 +1537,7 @@ fn unit_deposit_hint_decision(updated: &OrderProviderOperation) -> ProviderOpera
 }
 
 struct ChainEvidence<'a> {
-    evidence: &'a ProviderOperationHintEvidence,
+    evidence: &'a UnitDepositHintEvidence,
 }
 
 struct RecipientEvidence {
@@ -972,9 +1621,7 @@ fn terminal_hint_decision(
     })
 }
 
-fn verify_chain_evidence(
-    evidence: &ProviderOperationHintEvidence,
-) -> Result<ChainEvidence<'_>, String> {
+fn verify_chain_evidence(evidence: &UnitDepositHintEvidence) -> Result<ChainEvidence<'_>, String> {
     if evidence.tx_hash.trim().is_empty() {
         return Err("UnitDeposit evidence tx_hash is empty".to_string());
     }
@@ -1246,6 +1893,18 @@ pub(super) async fn verify_provider_observation_hint(
     } else {
         operation
     };
+    if matches!(
+        operation.operation_type,
+        ProviderOperationType::HyperliquidBridgeDeposit
+            | ProviderOperationType::HyperliquidBridgeWithdrawal
+            | ProviderOperationType::HyperliquidTrade
+            | ProviderOperationType::HyperliquidLimitOrder
+    ) {
+        return Ok(provider_hint_deferred(
+            Some(provider_operation_id),
+            "Hyperliquid operations require typed Sauron HL evidence",
+        ));
+    }
 
     let request = ProviderOperationObservationRequest {
         operation_id: operation.id,
@@ -1489,7 +2148,7 @@ pub(super) fn provider_hint_signal_evidence(signal: &ProviderOperationHintSignal
     })
 }
 
-pub(super) fn unit_deposit_evidence_json(evidence: &ProviderOperationHintEvidence) -> Value {
+pub(super) fn unit_deposit_evidence_json(evidence: &UnitDepositHintEvidence) -> Value {
     let mut value = json!({
         "tx_hash": &evidence.tx_hash,
         "address": &evidence.address,
@@ -1504,7 +2163,7 @@ pub(super) fn unit_deposit_evidence_json(evidence: &ProviderOperationHintEvidenc
 pub(super) async fn verify_unit_deposit_candidate(
     deps: &OrderActivityDeps,
     provider_address: &OrderProviderAddress,
-    evidence: &ProviderOperationHintEvidence,
+    evidence: &UnitDepositHintEvidence,
 ) -> Result<U256, String> {
     let backend_chain = backend_chain_for_id(&provider_address.chain).ok_or_else(|| {
         format!(

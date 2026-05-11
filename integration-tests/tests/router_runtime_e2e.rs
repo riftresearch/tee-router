@@ -23,6 +23,13 @@ use devnet::{
     RiftDevnet,
 };
 use eip3009_erc20_contract::GenericEIP3009ERC20::GenericEIP3009ERC20Instance;
+use hl_shim_indexer::{
+    build_router as build_hl_shim_router,
+    config::Cadences as HlShimCadences,
+    poller::{Poller as HlShimPoller, Scheduler as HlShimScheduler},
+    storage::Storage as HlShimStorage,
+    AppState as HlShimAppState, PubSub as HlShimPubSub,
+};
 use router_core::{
     models::{
         CustodyVaultRole, DepositVault, OrderProviderOperation, ProviderOperationStatus,
@@ -49,7 +56,11 @@ use testcontainers::{
     runners::AsyncRunner,
     ContainerAsync, GenericImage, ImageExt,
 };
-use tokio::task::{JoinHandle, LocalSet};
+use tokio::{
+    net::TcpListener,
+    sync::oneshot,
+    task::{JoinHandle, LocalSet},
+};
 use uuid::Uuid;
 
 const BASE_USDC_ADDRESS: &str = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
@@ -241,6 +252,7 @@ struct RouterRuntimeHarness {
     _api_task: RuntimeTask,
     _worker_task: RuntimeTask,
     _temporal_worker_task: RuntimeTask,
+    _hl_shim_task: RuntimeTask,
     _sauron_task: RuntimeTask,
 }
 
@@ -296,6 +308,7 @@ impl RuntimeTask {
 impl RouterRuntimeHarness {
     async fn shutdown(mut self) {
         self._sauron_task.abort_and_join().await;
+        self._hl_shim_task.abort_and_join().await;
         self._worker_task.abort_and_join().await;
         self._temporal_worker_task.abort_and_join().await;
         self._api_task.abort_and_join().await;
@@ -304,6 +317,7 @@ impl RouterRuntimeHarness {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "integration: spawns devnet stack"]
 async fn router_api_worker_sauron_complete_mock_route_matrix() {
     LocalSet::new()
         .run_until(async {
@@ -324,6 +338,7 @@ async fn router_api_worker_sauron_complete_mock_route_matrix() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "integration: spawns devnet stack"]
 async fn router_api_worker_sauron_complete_mock_limit_order_matrix() {
     LocalSet::new()
         .run_until(async {
@@ -347,6 +362,7 @@ async fn spawn_mock_router_runtime() -> RouterRuntimeHarness {
     let postgres = test_postgres().await;
     let database_url = create_test_database(&postgres.admin_database_url).await;
     let sauron_state_database_url = create_test_database(&postgres.admin_database_url).await;
+    let hl_shim_database_url = create_test_database(&postgres.admin_database_url).await;
     let (devnet, _) = RiftDevnet::builder()
         .using_esplora(true)
         .using_token_indexer(database_url.clone())
@@ -374,6 +390,8 @@ async fn spawn_mock_router_runtime() -> RouterRuntimeHarness {
     .await;
 
     let mocks = spawn_runtime_mocks(&devnet).await;
+    let (hl_shim_base_url, _hl_shim_task) =
+        spawn_hl_shim_indexer(&hl_shim_database_url, mocks.base_url()).await;
     let config_dir = tempfile::tempdir().expect("router config dir");
     let args = router_args(&devnet, config_dir.path(), database_url.clone(), &mocks);
 
@@ -386,6 +404,7 @@ async fn spawn_mock_router_runtime() -> RouterRuntimeHarness {
         &database_url,
         &sauron_state_database_url,
         &router_base_url,
+        &hl_shim_base_url,
     )
     .await;
 
@@ -399,6 +418,7 @@ async fn spawn_mock_router_runtime() -> RouterRuntimeHarness {
         _api_task,
         _worker_task,
         _temporal_worker_task,
+        _hl_shim_task,
         _sauron_task,
     }
 }
@@ -607,11 +627,73 @@ async fn reserve_local_port() -> u16 {
     port
 }
 
+fn hl_shim_cadences() -> HlShimCadences {
+    HlShimCadences {
+        hot: Duration::from_millis(100),
+        warm: Duration::from_millis(250),
+        cold: Duration::from_millis(500),
+        funding_hot: Duration::from_millis(250),
+        funding_warm: Duration::from_millis(500),
+        funding_cold: Duration::from_millis(1_000),
+        order_status: Duration::from_millis(100),
+    }
+}
+
+async fn spawn_hl_shim_indexer(database_url: &str, hl_url: &str) -> (String, RuntimeTask) {
+    let storage = HlShimStorage::connect(database_url, 4)
+        .await
+        .expect("connect HL shim storage");
+    let pubsub = HlShimPubSub::new(512);
+    let scheduler = HlShimScheduler::new(hl_shim_cadences());
+    let poller = HlShimPoller::new(
+        scheduler.clone(),
+        storage.clone(),
+        pubsub.clone(),
+        hl_url,
+        1_100,
+    )
+    .await
+    .expect("create HL shim poller");
+    let app = build_hl_shim_router(HlShimAppState {
+        storage,
+        scheduler,
+        pubsub,
+    });
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind HL shim listener");
+    let addr = listener.local_addr().expect("read HL shim listener addr");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let handle = tokio::spawn(async move {
+        let poller_task = tokio::spawn(async move {
+            poller
+                .run(2)
+                .await
+                .expect("HL shim poller should run until test shutdown");
+        });
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("HL shim server should run until test shutdown");
+        poller_task.abort();
+        let _ = poller_task.await;
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let task = RuntimeTask::with_shutdown(handle, move || {
+        let _ = shutdown_tx.send(());
+    });
+    assert!(!task.is_finished(), "HL shim indexer exited during startup");
+    (format!("http://{addr}"), task)
+}
+
 async fn spawn_sauron(
     devnet: &RiftDevnet,
     database_url: &str,
     sauron_state_database_url: &str,
     router_base_url: &str,
+    hl_shim_base_url: &str,
 ) -> RuntimeTask {
     let token_indexer_api_key = [
         devnet.ethereum.token_indexer.as_ref(),
@@ -664,6 +746,8 @@ async fn spawn_sauron(
             .token_indexer
             .as_ref()
             .map(|indexer| indexer.api_server_url.clone()),
+        hl_shim_indexer_url: Some(hl_shim_base_url.to_string()),
+        sauron_hl_bridge_match_window_seconds: 1_800,
         token_indexer_api_key,
         sauron_reconcile_interval_seconds: 1,
         sauron_bitcoin_scan_interval_seconds: 1,

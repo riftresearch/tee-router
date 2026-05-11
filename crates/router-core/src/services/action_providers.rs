@@ -2135,9 +2135,20 @@ impl HyperliquidBridgeProvider {
             "hyperliquid bridge withdrawal: hyperliquid_custody_vault_id must be hydrated"
                 .to_string()
         })?;
+        let hyperliquid_custody_vault_address = step
+            .hyperliquid_custody_vault_address
+            .clone()
+            .ok_or_else(|| {
+                "hyperliquid bridge withdrawal: hyperliquid_custody_vault_address must be hydrated"
+                    .to_string()
+            })?;
         let destination = Address::from_str(&step.recipient_address)
             .map_err(|err| format!("invalid hyperliquid withdrawal recipient: {err}"))?;
         let amount = format_hyperliquid_amount(&step.amount, decimals)?;
+        let bridge_address = format!(
+            "{:#x}",
+            hyperliquid_bridge_address(hyperliquid_api_network(self.network))
+        );
         let mut actions = Vec::new();
         if step.transfer_from_spot {
             actions.push(CustodyAction::Call(ChainCall::Hyperliquid(
@@ -2170,8 +2181,10 @@ impl HyperliquidBridgeProvider {
             "amount_decimal": amount,
             "recipient_address": format!("{destination:#x}"),
             "hyperliquid_custody_vault_id": source_custody_vault_id,
+            "hyperliquid_custody_vault_address": hyperliquid_custody_vault_address,
             "transfer_from_spot": step.transfer_from_spot,
             "withdraw_fee_raw": HYPERLIQUID_BRIDGE_WITHDRAW_FEE_RAW.to_string(),
+            "bridge_address": bridge_address,
             "target_base_url": self.target_base_url,
             "network": self.network,
         });

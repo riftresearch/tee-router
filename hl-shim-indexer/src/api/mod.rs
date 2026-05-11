@@ -27,6 +27,14 @@ pub fn build_router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/transfers", get(get_transfers))
         .route("/orders", get(get_orders))
+        .route(
+            "/orders/watch",
+            get(get_order_watches).post(post_order_watch),
+        )
+        .route(
+            "/orders/watch/:oid",
+            axum::routing::delete(delete_order_watch),
+        )
         .route("/prune", post(post_prune))
         .route("/subscribe", get(ws_subscribe))
         .with_state(Arc::new(state))
@@ -91,6 +99,51 @@ async fn post_prune(
     Ok(Json(PruneResponse { accepted: true }))
 }
 
+async fn post_order_watch(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<OrderWatchRequest>,
+) -> ApiResult<Json<OrderWatchResponse>> {
+    let user = parse_address(&request.user)?;
+    state
+        .scheduler
+        .register_pending_order(user, request.oid)
+        .await;
+    Ok(Json(OrderWatchResponse {
+        user: format!("{user:?}"),
+        oid: request.oid,
+        watched: true,
+    }))
+}
+
+async fn delete_order_watch(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(oid): axum::extract::Path<u64>,
+) -> ApiResult<Json<OrderWatchDeleteResponse>> {
+    state.scheduler.deregister_pending_order(oid).await;
+    Ok(Json(OrderWatchDeleteResponse {
+        oid,
+        watched: false,
+    }))
+}
+
+async fn get_order_watches(
+    State(state): State<Arc<AppState>>,
+) -> ApiResult<Json<OrderWatchesResponse>> {
+    let mut watches = state
+        .scheduler
+        .pending_orders()
+        .await
+        .into_iter()
+        .map(|(user, oid)| OrderWatchResponse {
+            user: format!("{user:?}"),
+            oid,
+            watched: true,
+        })
+        .collect::<Vec<_>>();
+    watches.sort_by(|left, right| left.user.cmp(&right.user).then(left.oid.cmp(&right.oid)));
+    Ok(Json(OrderWatchesResponse { watches }))
+}
+
 async fn ws_subscribe(
     State(state): State<Arc<AppState>>,
     ws: WebSocketUpgrade,
@@ -110,6 +163,30 @@ struct EventQuery {
 struct PruneRequest {
     relevant_users: Vec<String>,
     before_time_ms: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct OrderWatchRequest {
+    user: String,
+    oid: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct OrderWatchResponse {
+    user: String,
+    oid: u64,
+    watched: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct OrderWatchDeleteResponse {
+    oid: u64,
+    watched: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct OrderWatchesResponse {
+    watches: Vec<OrderWatchResponse>,
 }
 
 #[derive(Debug, Serialize)]
