@@ -688,6 +688,7 @@ impl BitcoinChain {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn transfer_native_amount_from_outpoint(
         &self,
         private_key: &str,
@@ -795,6 +796,7 @@ impl BitcoinChain {
         self.broadcast_signed_transaction(&hex::encode(raw)).await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn dump_to_address_from_outpoint(
         &self,
         token: &TokenIdentifier,

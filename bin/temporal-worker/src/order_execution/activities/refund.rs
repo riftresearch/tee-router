@@ -1223,7 +1223,7 @@ pub(super) fn external_custody_direct_refund_steps(
 ) -> (Vec<OrderExecutionLeg>, Vec<OrderExecutionStep>) {
     let leg = OrderExecutionLeg {
         id: Uuid::now_v7(),
-        order_id: order.id.into(),
+        order_id: order.id,
         execution_attempt_id: None,
         transition_decl_id: None,
         leg_index: 0,
@@ -1252,7 +1252,7 @@ pub(super) fn external_custody_direct_refund_steps(
     };
     let step = OrderExecutionStep {
         id: Uuid::now_v7(),
-        order_id: order.id.into(),
+        order_id: order.id,
         execution_attempt_id: None,
         execution_leg_id: Some(leg.id),
         transition_decl_id: None,

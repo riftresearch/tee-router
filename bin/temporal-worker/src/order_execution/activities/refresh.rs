@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use super::*;
 
 pub(super) fn refreshed_market_order_quote_exact_in(

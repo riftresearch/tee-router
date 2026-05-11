@@ -844,8 +844,7 @@ impl OrderWorkflow {
             )
             .await?;
 
-        // Child-workflow shape: RefundWorkflow, QuoteRefreshWorkflow,
-        // ProviderHintPollWorkflow.
+        // Child-workflow shape: RefundWorkflow and QuoteRefreshWorkflow.
         order_workflow_output(
             ctx,
             workflow_started_at,
@@ -874,7 +873,7 @@ impl OrderWorkflow {
         if self
             .state
             .order_id()
-            .map_or(true, |order_id| order_id == signal.order_id)
+            .is_none_or(|order_id| order_id == signal.order_id)
         {
             self.provider_operation_hints.push(signal);
         }
@@ -976,6 +975,7 @@ impl OrderWorkflow {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum StepExecutionProgress {
     Executed(StepExecuted),
     ActivityFailed {
@@ -1115,6 +1115,7 @@ async fn finalize_manual_intervention(
         .await?)
 }
 
+#[allow(clippy::never_loop)]
 async fn wait_for_manual_intervention_resolution(
     ctx: &mut WorkflowContext<OrderWorkflow>,
     order_id: WorkflowOrderId,
@@ -1235,6 +1236,7 @@ async fn wait_for_manual_intervention_resolution(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn acknowledge_manual_intervention_terminal(
     ctx: &mut WorkflowContext<OrderWorkflow>,
     order_id: WorkflowOrderId,
@@ -1285,15 +1287,6 @@ async fn wait_for_provider_completion_hint(
     funded_to_workflow_start_seconds: Option<f64>,
 ) -> WorkflowResult<ProviderCompletionWait> {
     let wait_started_at = provider_hint_wait_started(ctx);
-    let poll_child = ctx
-        .child_workflow(
-            ProviderHintPollWorkflow::run,
-            ProviderHintPollWorkflowInput { order_id, step_id },
-            provider_hint_poll_child_options(order_id, step_id),
-        )
-        .await?;
-    let poll_result = poll_child.result();
-    futures_util::pin_mut!(poll_result);
 
     loop {
         temporalio_sdk::workflows::select! {
@@ -1315,11 +1308,6 @@ async fn wait_for_provider_completion_hint(
 
                 match verified.decision {
                     ProviderOperationHintDecision::Accept => {
-                        let _ = ctx
-                            .external_workflow(provider_hint_poll_workflow_id(order_id, step_id), None)
-                            .cancel(Some("provider operation hint accepted by signal".to_string()))
-                            .await;
-                        poll_result.cancel();
                         settle_provider_completion(ctx, execution.clone(), db_activity_options.clone()).await?;
                         record_provider_hint_wait(
                             ctx,
@@ -1342,53 +1330,7 @@ async fn wait_for_provider_completion_hint(
                     }
                 }
             }
-            polled = poll_result => {
-                let polled = polled?;
-                match polled.decision {
-                    ProviderOperationHintDecision::Accept => {
-                        settle_provider_completion(ctx, execution.clone(), db_activity_options.clone()).await?;
-                        record_provider_hint_wait(
-                            ctx,
-                            ORDER_WORKFLOW_TYPE,
-                            wait_started_at,
-                            "poll_accept",
-                        );
-                        return Ok(ProviderCompletionWait::Completed);
-                    }
-                    ProviderOperationHintDecision::Reject | ProviderOperationHintDecision::Defer => {
-                        let reason = json!({
-                            "reason": "provider_operation_hint_poll_unresolved",
-                            "step_id": step_id,
-                            "provider_operation_id": polled.provider_operation_id,
-                            "decision": format!("{:?}", polled.decision),
-                            "poll_reason": polled.reason,
-                        });
-                        let resolution = wait_for_manual_intervention_resolution(
-                            ctx,
-                            order_id,
-                            execution.attempt_id,
-                            step_id,
-                            reason,
-                            db_activity_options.clone(),
-                            funded_to_workflow_start_seconds,
-                        )
-                        .await?;
-                        record_provider_hint_wait(
-                            ctx,
-                            ORDER_WORKFLOW_TYPE,
-                            wait_started_at,
-                            "poll_unresolved_manual_intervention",
-                        );
-                        return Ok(ProviderCompletionWait::ManualInterventionRequired { resolution });
-                    }
-                }
-            }
             _ = ctx.timer(PROVIDER_HINT_WAIT_TIMEOUT) => {
-                let _ = ctx
-                    .external_workflow(provider_hint_poll_workflow_id(order_id, step_id), None)
-                    .cancel(Some("provider hint wait timed out".to_string()))
-                    .await;
-                poll_result.cancel();
                 let resolution = wait_for_manual_intervention_resolution(
                     ctx,
                     order_id,

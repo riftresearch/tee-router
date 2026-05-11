@@ -33,11 +33,7 @@ impl ProviderObservationActivities {
             let deps = self.deps()?;
             deps.db
                 .orders()
-                .record_execution_step_hint_arrival(
-                    input.step_id.inner(),
-                    HINT_SOURCE_SAURON_SIGNAL,
-                    Utc::now(),
-                )
+                .record_execution_step_hint_arrival(input.step_id.inner(), Utc::now())
                 .await
                 .map_err(OrderActivityError::db_query)?;
             match input.signal.hint_kind {
@@ -53,21 +49,6 @@ impl ProviderObservationActivities {
                     verify_hyperliquid_trade_hint(&deps, input).await
                 }
             }
-        })
-        .await
-    }
-
-    /// Scar tissue: §10 provider hint recovery. This is the polling half of the user-approved
-    /// signal-first plus fallback shape for brief §8.4.
-    #[activity]
-    pub async fn poll_provider_operation_hints(
-        self: Arc<Self>,
-        _ctx: ActivityContext,
-        input: PollProviderOperationHintsInput,
-    ) -> Result<ProviderOperationHintsPolled, ActivityError> {
-        record_activity("poll_provider_operation_hints", async move {
-            let deps = self.deps()?;
-            poll_provider_operation_hint_for_step(&deps, input).await
         })
         .await
     }
@@ -119,191 +100,6 @@ impl ProviderObservationActivities {
             }
         })
         .await
-    }
-}
-
-pub(super) async fn poll_provider_operation_hint_for_step(
-    deps: &OrderActivityDeps,
-    input: PollProviderOperationHintsInput,
-) -> Result<ProviderOperationHintsPolled, OrderActivityError> {
-    let step = deps
-        .db
-        .orders()
-        .get_execution_step(input.step_id.inner())
-        .await
-        .map_err(OrderActivityError::db_query)?;
-    if step.order_id != input.order_id.inner() {
-        return Ok(provider_hints_polled(provider_hint_rejected(
-            None,
-            format!(
-                "step {} belongs to order {}, not {}",
-                step.id,
-                step.order_id,
-                input.order_id.inner()
-            ),
-        )));
-    }
-    deps.db
-        .orders()
-        .record_execution_step_hint_arrival(
-            input.step_id.inner(),
-            HINT_SOURCE_HINT_POLL,
-            Utc::now(),
-        )
-        .await
-        .map_err(OrderActivityError::db_query)?;
-
-    let operations = deps
-        .db
-        .orders()
-        .get_provider_operations(input.order_id.inner())
-        .await
-        .map_err(OrderActivityError::db_query)?;
-    let Some(operation) = operations
-        .into_iter()
-        .filter(|operation| operation.execution_step_id == Some(input.step_id.inner()))
-        .max_by_key(|operation| (operation.updated_at, operation.created_at, operation.id))
-    else {
-        return Ok(provider_hints_polled(provider_hint_deferred(
-            None,
-            format!(
-                "provider hint poll found no provider operation for step {}",
-                input.step_id.inner()
-            ),
-        )));
-    };
-
-    let Some((provider, hint_kind)) = polling_hint_shape_for_operation(&operation) else {
-        return Ok(provider_hints_polled(provider_hint_deferred(
-            Some(operation.id),
-            format!(
-                "provider hint polling for {} is deferred to a later PR7b verifier",
-                operation.operation_type.to_db_string()
-            ),
-        )));
-    };
-
-    let signal = ProviderOperationHintSignal {
-        order_id: input.order_id,
-        // Deterministic synthetic hint id for activity-driven polling; this is
-        // not persisted as a user hint row.
-        hint_id: operation.id.into(),
-        provider_operation_id: Some(operation.id.into()),
-        provider,
-        hint_kind,
-        provider_ref: operation.provider_ref.clone(),
-        evidence: None,
-    };
-    let verified = match hint_kind {
-        ProviderHintKind::AcrossFill => {
-            verify_across_fill_hint(
-                deps,
-                VerifyProviderOperationHintInput {
-                    order_id: input.order_id,
-                    step_id: input.step_id,
-                    signal,
-                },
-            )
-            .await?
-        }
-        ProviderHintKind::ProviderObservation => {
-            verify_provider_observation_hint(
-                deps,
-                VerifyProviderOperationHintInput {
-                    order_id: input.order_id,
-                    step_id: input.step_id,
-                    signal,
-                },
-            )
-            .await?
-        }
-        ProviderHintKind::UnitDeposit => {
-            verify_unit_deposit_hint(
-                deps,
-                VerifyProviderOperationHintInput {
-                    order_id: input.order_id,
-                    step_id: input.step_id,
-                    signal,
-                },
-            )
-            .await?
-        }
-        ProviderHintKind::CctpAttestation => {
-            verify_cctp_attestation_hint(
-                deps,
-                VerifyProviderOperationHintInput {
-                    order_id: input.order_id,
-                    step_id: input.step_id,
-                    signal,
-                },
-            )
-            .await?
-        }
-        ProviderHintKind::HyperliquidTrade => {
-            verify_hyperliquid_trade_hint(
-                deps,
-                VerifyProviderOperationHintInput {
-                    order_id: input.order_id,
-                    step_id: input.step_id,
-                    signal,
-                },
-            )
-            .await?
-        }
-    };
-    Ok(provider_hints_polled(verified))
-}
-
-pub(super) fn polling_hint_shape_for_operation(
-    operation: &OrderProviderOperation,
-) -> Option<(ProviderKind, ProviderHintKind)> {
-    match operation.operation_type {
-        ProviderOperationType::AcrossBridge => {
-            Some((ProviderKind::Bridge, ProviderHintKind::AcrossFill))
-        }
-        ProviderOperationType::UnitDeposit => {
-            Some((ProviderKind::Unit, ProviderHintKind::UnitDeposit))
-        }
-        ProviderOperationType::CctpBridge => {
-            Some((ProviderKind::Bridge, ProviderHintKind::CctpAttestation))
-        }
-        ProviderOperationType::HyperliquidTrade | ProviderOperationType::HyperliquidLimitOrder => {
-            Some((ProviderKind::Exchange, ProviderHintKind::HyperliquidTrade))
-        }
-        // These operation families do not have typed hint kinds, but the generic
-        // provider observation verifier can still poll their real provider APIs.
-        ProviderOperationType::UnitWithdrawal
-        | ProviderOperationType::HyperliquidBridgeDeposit
-        | ProviderOperationType::HyperliquidBridgeWithdrawal
-        | ProviderOperationType::UniversalRouterSwap => Some((
-            provider_kind_for_operation(&operation.operation_type),
-            ProviderHintKind::ProviderObservation,
-        )),
-    }
-}
-
-pub(super) fn provider_kind_for_operation(operation_type: &ProviderOperationType) -> ProviderKind {
-    match operation_type {
-        ProviderOperationType::AcrossBridge
-        | ProviderOperationType::CctpBridge
-        | ProviderOperationType::HyperliquidBridgeDeposit
-        | ProviderOperationType::HyperliquidBridgeWithdrawal => ProviderKind::Bridge,
-        ProviderOperationType::UnitDeposit | ProviderOperationType::UnitWithdrawal => {
-            ProviderKind::Unit
-        }
-        ProviderOperationType::HyperliquidTrade
-        | ProviderOperationType::HyperliquidLimitOrder
-        | ProviderOperationType::UniversalRouterSwap => ProviderKind::Exchange,
-    }
-}
-
-pub(super) fn provider_hints_polled(
-    verified: ProviderOperationHintVerified,
-) -> ProviderOperationHintsPolled {
-    ProviderOperationHintsPolled {
-        provider_operation_id: verified.provider_operation_id,
-        decision: verified.decision,
-        reason: verified.reason,
     }
 }
 
@@ -440,7 +236,7 @@ pub(super) async fn recover_across_deposit_from_origin_logs(
                 ),
             )
         })?;
-    let origin_chain = ChainId::parse(&format!("evm:{origin_chain_id}")).map_err(|err| {
+    let origin_chain = ChainId::parse(format!("evm:{origin_chain_id}")).map_err(|err| {
         lost_intent_recovery_error(
             "parsing Across origin chain",
             format!(

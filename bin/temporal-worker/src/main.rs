@@ -23,6 +23,7 @@ struct Cli {
     command: Command,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Run the production order-execution worker.

@@ -272,7 +272,7 @@ impl RefundWorkflow {
         maybe_record_signal(ctx, REFUND_WORKFLOW_TYPE, "provider_operation_hint");
         if self
             .order_id
-            .map_or(true, |order_id| order_id == signal.order_id)
+            .is_none_or(|order_id| order_id == signal.order_id)
         {
             self.provider_operation_hints.push(signal);
         }
@@ -352,8 +352,6 @@ impl RefundWorkflow {
         None
     }
 }
-
-/// Quote-refresh child workflow.
 
 enum RefundProviderCompletionWait {
     Completed,
@@ -438,6 +436,7 @@ async fn finalize_refund_provider_hint_manual_intervention(
     Ok(())
 }
 
+#[allow(clippy::never_loop)]
 async fn wait_for_refund_manual_intervention_resolution(
     ctx: &mut WorkflowContext<RefundWorkflow>,
     order_id: WorkflowOrderId,
@@ -593,15 +592,6 @@ async fn wait_for_refund_provider_completion_hint(
     db_activity_options: ActivityOptions,
 ) -> WorkflowResult<RefundProviderCompletionWait> {
     let wait_started_at = provider_hint_wait_started(ctx);
-    let poll_child = ctx
-        .child_workflow(
-            ProviderHintPollWorkflow::run,
-            ProviderHintPollWorkflowInput { order_id, step_id },
-            provider_hint_poll_child_options(order_id, step_id),
-        )
-        .await?;
-    let poll_result = poll_child.result();
-    futures_util::pin_mut!(poll_result);
 
     loop {
         temporalio_sdk::workflows::select! {
@@ -623,11 +613,6 @@ async fn wait_for_refund_provider_completion_hint(
 
                 match verified.decision {
                     ProviderOperationHintDecision::Accept => {
-                        let _ = ctx
-                            .external_workflow(provider_hint_poll_workflow_id(order_id, step_id), None)
-                            .cancel(Some("provider operation hint accepted by signal".to_string()))
-                            .await;
-                        poll_result.cancel();
                         settle_refund_provider_completion(ctx, execution.clone(), db_activity_options.clone()).await?;
                         record_provider_hint_wait(
                             ctx,
@@ -650,59 +635,7 @@ async fn wait_for_refund_provider_completion_hint(
                     }
                 }
             }
-            polled = poll_result => {
-                let polled = polled?;
-                match polled.decision {
-                    ProviderOperationHintDecision::Accept => {
-                        settle_refund_provider_completion(ctx, execution.clone(), db_activity_options.clone()).await?;
-                        record_provider_hint_wait(
-                            ctx,
-                            REFUND_WORKFLOW_TYPE,
-                            wait_started_at,
-                            "poll_accept",
-                        );
-                        return Ok(RefundProviderCompletionWait::Completed);
-                    }
-                    ProviderOperationHintDecision::Reject | ProviderOperationHintDecision::Defer => {
-                        finalize_refund_provider_hint_manual_intervention(
-                            ctx,
-                            order_id,
-                            execution.attempt_id,
-                            step_id,
-                            json!({
-                                "reason": "provider_operation_hint_poll_unresolved",
-                                "step_id": step_id,
-                                "provider_operation_id": polled.provider_operation_id,
-                                "decision": format!("{:?}", polled.decision),
-                                "poll_reason": polled.reason,
-                            }),
-                            db_activity_options.clone(),
-                        )
-                        .await?;
-                        let resolution = wait_for_refund_manual_intervention_resolution(
-                            ctx,
-                            order_id,
-                            Some(execution.attempt_id),
-                            Some(step_id),
-                            db_activity_options.clone(),
-                        )
-                        .await?;
-                        record_provider_hint_wait(
-                            ctx,
-                            REFUND_WORKFLOW_TYPE,
-                            wait_started_at,
-                            "poll_unresolved_manual_intervention",
-                        );
-                        return Ok(RefundProviderCompletionWait::RefundManualInterventionRequired { resolution });
-                    }
-                }
-            }
             _ = ctx.timer(PROVIDER_HINT_WAIT_TIMEOUT) => {
-                let _ = ctx
-                    .external_workflow(provider_hint_poll_workflow_id(order_id, step_id), None)
-                    .cancel(Some("provider hint wait timed out".to_string()))
-                    .await;
-                poll_result.cancel();
                 finalize_refund_provider_hint_manual_intervention(
                     ctx,
                     order_id,

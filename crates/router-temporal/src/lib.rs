@@ -530,14 +530,6 @@ pub fn quote_refresh_workflow_id(
 }
 
 #[must_use]
-pub fn provider_hint_poll_workflow_id(
-    order_id: WorkflowOrderId,
-    step_id: WorkflowStepId,
-) -> String {
-    format!("order:{order_id}:provider-hint-poll:{step_id}")
-}
-
-#[must_use]
 pub fn raw_workflow_value<T: Serialize + 'static>(value: &T) -> RawValue {
     RawValue::from_value(value, &PayloadConverter::default())
 }

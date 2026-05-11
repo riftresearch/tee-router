@@ -356,7 +356,6 @@ pub struct ExecutionStepLatencyRecord {
     pub started_at: Option<DateTime<Utc>>,
     pub waiting_external_at: Option<DateTime<Utc>>,
     pub hint_arrived_at: Option<DateTime<Utc>>,
-    pub hint_source: Option<String>,
     pub completed_at: Option<DateTime<Utc>>,
     pub provider_operation_type: Option<ProviderOperationType>,
 }
@@ -6785,7 +6784,6 @@ impl OrderRepository {
                 steps.started_at,
                 steps.waiting_external_at,
                 steps.hint_arrived_at,
-                steps.hint_source,
                 steps.completed_at,
                 latest_operation.operation_type AS provider_operation_type
             FROM order_execution_steps steps
@@ -7899,7 +7897,6 @@ impl OrderRepository {
     pub async fn record_execution_step_hint_arrival(
         &self,
         id: Uuid,
-        hint_source: &str,
         arrived_at: DateTime<Utc>,
     ) -> RouterCoreResult<()> {
         let started = Instant::now();
@@ -7908,14 +7905,12 @@ impl OrderRepository {
             UPDATE order_execution_steps
             SET
                 hint_arrived_at = $2,
-                hint_source = $3,
                 updated_at = $2
             WHERE id = $1
             "#,
         )
         .bind(id)
         .bind(arrived_at)
-        .bind(hint_source)
         .execute(&self.pool)
         .await;
         telemetry::record_db_query(
@@ -8595,7 +8590,6 @@ impl OrderRepository {
             started_at: row.get("started_at"),
             waiting_external_at: row.get("waiting_external_at"),
             hint_arrived_at: row.get("hint_arrived_at"),
-            hint_source: row.get("hint_source"),
             completed_at: row.get("completed_at"),
             provider_operation_type,
         })

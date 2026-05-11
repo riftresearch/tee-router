@@ -75,19 +75,17 @@ use super::{
         MaterializedExecutionAttempt, OrderCompleted, OrderExecutionState, OrderTerminalStatus,
         OrderWorkflowPhase, PersistProviderOperationStatusInput, PersistProviderReceiptInput,
         PersistStepFailedInput, PersistStepReadyToFireInput, PersistenceBoundary,
-        PollProviderOperationHintsInput, PreExecutionStaleQuoteCheck,
-        PrepareManualInterventionRefundInput, PrepareManualInterventionRetryInput,
-        ProviderHintKind, ProviderKind, ProviderOperationHintDecision,
+        PreExecutionStaleQuoteCheck, PrepareManualInterventionRefundInput,
+        PrepareManualInterventionRetryInput, ProviderHintKind, ProviderOperationHintDecision,
         ProviderOperationHintEvidence, ProviderOperationHintSignal, ProviderOperationHintVerified,
-        ProviderOperationHintsPolled, RawAmount, RecoverAcrossOnchainLogInput,
-        RecoverablePositionKind, RefreshedAttemptMaterialized, RefreshedQuoteAttemptOutcome,
-        RefreshedQuoteAttemptShape, RefreshedQuoteFailureReason, RefreshedQuoteSupersededReason,
-        RefundPlanOutcome, RefundPlanShape, RefundUntenableReason,
-        ReleaseRefundManualInterventionInput, SettleProviderStepInput, SingleRefundPosition,
-        SingleRefundPositionDiscovery, SingleRefundPositionOutcome,
-        StaleQuoteRefreshUntenableReason, StaleRunningStepClassified, StaleRunningStepDecision,
-        StepExecuted, StepExecutionOutcome, StepFailureDecision, VerifyProviderOperationHintInput,
-        WorkflowExecutionStep, WriteFailedAttemptSnapshotInput,
+        RawAmount, RecoverAcrossOnchainLogInput, RecoverablePositionKind,
+        RefreshedAttemptMaterialized, RefreshedQuoteAttemptOutcome, RefreshedQuoteAttemptShape,
+        RefreshedQuoteFailureReason, RefreshedQuoteSupersededReason, RefundPlanOutcome,
+        RefundPlanShape, RefundUntenableReason, ReleaseRefundManualInterventionInput,
+        SettleProviderStepInput, SingleRefundPosition, SingleRefundPositionDiscovery,
+        SingleRefundPositionOutcome, StaleQuoteRefreshUntenableReason, StaleRunningStepClassified,
+        StaleRunningStepDecision, StepExecuted, StepExecutionOutcome, StepFailureDecision,
+        VerifyProviderOperationHintInput, WorkflowExecutionStep, WriteFailedAttemptSnapshotInput,
     },
 };
 
@@ -99,8 +97,6 @@ const REFRESH_HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW: u64 =
     REFUND_HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW;
 const REFRESH_BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_BPS: u64 = 12_500;
 const REFRESH_PROBE_MAX_AMOUNT_IN: &str = "340282366920938463463374607431768211455";
-const HINT_SOURCE_SAURON_SIGNAL: &str = "sauron_signal";
-const HINT_SOURCE_HINT_POLL: &str = "hint_poll";
 
 async fn record_activity<T, F>(activity_name: &'static str, activity: F) -> Result<T, ActivityError>
 where
@@ -209,12 +205,8 @@ fn record_terminal_latency_record(record: &ExecutionStepLatencyRecord) {
     let Some(completed_at) = record.completed_at else {
         return;
     };
-    let Some(source) = record.hint_source.as_deref() else {
-        return;
-    };
-
     if let Some(duration) = nonnegative_duration(waiting_external_at, hint_arrived_at) {
-        telemetry::record_step_external_wait(step_type, source, duration);
+        telemetry::record_step_external_wait(step_type, duration);
     }
     if let Some(duration) = nonnegative_duration(hint_arrived_at, completed_at) {
         telemetry::record_step_verification_latency(
