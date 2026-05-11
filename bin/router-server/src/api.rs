@@ -11,6 +11,7 @@ use router_core::{
     },
     protocol::DepositAsset,
 };
+use router_temporal::WorkflowStepId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
@@ -119,6 +120,7 @@ pub enum MarketOrderQuoteKind {
 #[serde(deny_unknown_fields)]
 pub struct ProviderOperationHintRequest {
     pub provider_operation_id: Uuid,
+    pub execution_step_id: WorkflowStepId,
     #[serde(default = "default_hint_source")]
     pub source: String,
     #[serde(default = "default_hint_kind")]
@@ -170,8 +172,13 @@ pub struct DetectorHintRequest {
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[serde(deny_unknown_fields)]
 pub enum DetectorHintTarget {
-    ProviderOperation { id: Uuid },
-    FundingVault { id: Uuid },
+    ProviderOperation {
+        id: Uuid,
+        execution_step_id: WorkflowStepId,
+    },
+    FundingVault {
+        id: Uuid,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -738,6 +745,7 @@ mod tests {
     fn internal_hint_request_rejects_unknown_fields() {
         let error = serde_json::from_value::<ProviderOperationHintRequest>(json!({
             "provider_operation_id": Uuid::now_v7(),
+            "execution_step_id": Uuid::now_v7(),
             "source": "sauron",
             "hint_kind": "possible_progress",
             "evidence": {},
@@ -754,6 +762,7 @@ mod tests {
             "target": {
                 "kind": "provider_operation",
                 "id": Uuid::now_v7(),
+                "execution_step_id": Uuid::now_v7(),
                 "ignored": true
             },
             "source": "sauron",

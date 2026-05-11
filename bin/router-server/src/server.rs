@@ -48,7 +48,7 @@ use router_temporal::{
     ManualTriggerRefundSignal, OrderWorkflowClient, ProviderHintKind, ProviderKind,
     ProviderOperationHintEvidence, ProviderOperationHintSignal, RouterTemporalError,
     TemporalConnection, WorkflowAttemptId, WorkflowHintId, WorkflowOrderId,
-    WorkflowProviderOperationId,
+    WorkflowProviderOperationId, WorkflowStepId,
 };
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
@@ -645,11 +645,15 @@ async fn record_detector_hint(
 ) -> RouterServerResult<Json<DetectorHintEnvelope>> {
     authorize_internal_api_request(&state, &headers)?;
     match request.target {
-        DetectorHintTarget::ProviderOperation { id } => {
+        DetectorHintTarget::ProviderOperation {
+            id,
+            execution_step_id,
+        } => {
             let hint = record_provider_operation_hint_inner(
                 state,
                 ProviderOperationHintRequest {
                     provider_operation_id: id,
+                    execution_step_id,
                     source: request.source,
                     hint_kind: request.hint_kind,
                     evidence: request.evidence,
@@ -737,7 +741,7 @@ async fn record_provider_operation_hint_inner(
     }
 
     let attempt = load_provider_operation_attempt(&state, &operation).await?;
-    let signal = provider_operation_hint_signal(&operation, &hint)?;
+    let signal = provider_operation_hint_signal(&operation, request.execution_step_id, &hint)?;
     match signal_provider_operation_hint(
         order_workflow_client,
         &attempt,
@@ -836,11 +840,30 @@ async fn load_provider_operation_attempt(
 
 fn provider_operation_hint_signal(
     operation: &OrderProviderOperation,
+    requested_step_id: WorkflowStepId,
     hint: &OrderProviderOperationHint,
 ) -> RouterServerResult<ProviderOperationHintSignal> {
     let (provider, hint_kind) = provider_hint_shape_for_operation(operation.operation_type);
+    let execution_step_id =
+        operation
+            .execution_step_id
+            .ok_or_else(|| RouterServerError::InvalidData {
+                message: format!(
+                    "provider operation {} is not attached to an execution step",
+                    operation.id
+                ),
+            })?;
+    if requested_step_id.inner() != execution_step_id {
+        return Err(RouterServerError::Validation {
+            message: format!(
+                "provider operation {} belongs to step {}, not requested step {}",
+                operation.id, execution_step_id, requested_step_id
+            ),
+        });
+    }
     Ok(ProviderOperationHintSignal {
         order_id: WorkflowOrderId::from(operation.order_id),
+        execution_step_id: requested_step_id,
         hint_id: WorkflowHintId::from(hint.id),
         provider_operation_id: Some(WorkflowProviderOperationId::from(operation.id)),
         provider,
@@ -2001,6 +2024,66 @@ mod tests {
             })),
             Err(RouterServerError::Validation { .. })
         ));
+    }
+
+    fn test_provider_operation(
+        order_id: Uuid,
+        operation_id: Uuid,
+        step_id: Uuid,
+    ) -> OrderProviderOperation {
+        let now = Utc::now();
+        OrderProviderOperation {
+            id: operation_id,
+            order_id,
+            execution_attempt_id: Some(Uuid::now_v7()),
+            execution_step_id: Some(step_id),
+            provider: "across".to_string(),
+            operation_type: ProviderOperationType::AcrossBridge,
+            provider_ref: Some("provider-ref".to_string()),
+            status: router_core::models::ProviderOperationStatus::WaitingExternal,
+            request: serde_json::json!({}),
+            response: serde_json::json!({}),
+            observed_state: serde_json::json!({}),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn test_provider_operation_hint(operation_id: Uuid) -> OrderProviderOperationHint {
+        let now = Utc::now();
+        OrderProviderOperationHint {
+            id: Uuid::now_v7(),
+            provider_operation_id: operation_id,
+            source: "sauron".to_string(),
+            hint_kind: router_core::models::ProviderOperationHintKind::PossibleProgress,
+            evidence: serde_json::json!({}),
+            status: ProviderOperationHintStatus::Processing,
+            idempotency_key: None,
+            error: serde_json::json!({}),
+            claimed_at: None,
+            processed_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn provider_operation_hint_signal_carries_and_validates_step_id() {
+        let order_id = Uuid::now_v7();
+        let operation_id = Uuid::now_v7();
+        let step_id = Uuid::now_v7();
+        let operation = test_provider_operation(order_id, operation_id, step_id);
+        let hint = test_provider_operation_hint(operation_id);
+
+        let signal =
+            provider_operation_hint_signal(&operation, WorkflowStepId::from(step_id), &hint)
+                .expect("matching step should build signal");
+        assert_eq!(signal.execution_step_id, WorkflowStepId::from(step_id));
+
+        let err =
+            provider_operation_hint_signal(&operation, WorkflowStepId::from(Uuid::now_v7()), &hint)
+                .expect_err("mismatched step should be rejected");
+        assert!(matches!(err, RouterServerError::Validation { .. }));
     }
 
     #[test]

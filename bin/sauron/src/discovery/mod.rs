@@ -17,6 +17,7 @@ use router_primitives::{ChainType, TokenIdentifier};
 use router_server::api::{
     DetectorHintEnvelope, DetectorHintRequest, DetectorHintTarget, MAX_HINT_IDEMPOTENCY_KEY_LEN,
 };
+use router_temporal::WorkflowStepId;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use snafu::ResultExt;
@@ -72,6 +73,7 @@ impl DepositConfirmationState {
 pub struct DetectedDeposit {
     pub watch_target: WatchTarget,
     pub watch_id: Uuid,
+    pub execution_step_id: Option<WorkflowStepId>,
     pub source_chain: ChainType,
     pub source_token: TokenIdentifier,
     pub address: String,
@@ -807,6 +809,7 @@ async fn submit_detected_deposit(
         "source": "sauron",
         "backend": backend_name,
         "watch_target": detected.watch_target.as_str(),
+        "execution_step_id": detected.execution_step_id,
         "chain": detected.source_chain.to_db_string(),
         "token": detected.source_token.clone(),
         "address": detected.address,
@@ -827,13 +830,12 @@ async fn submit_detected_deposit(
         detected,
     ));
 
-    let target = match detected.watch_target {
-        WatchTarget::ProviderOperation => DetectorHintTarget::ProviderOperation {
-            id: detected.watch_id,
-        },
-        WatchTarget::FundingVault => DetectorHintTarget::FundingVault {
-            id: detected.watch_id,
-        },
+    let Some(target) = detector_hint_target_for_detected(detected) else {
+        warn!(
+            watch_id = %detected.watch_id,
+            "Provider-operation detection missing execution_step_id; dropping hint"
+        );
+        return SubmissionOutcome::TerminalFailure;
     };
     let submit_result = context
         .router_client
@@ -932,6 +934,18 @@ async fn submit_detected_deposit(
                 SubmissionOutcome::TerminalFailure
             }
         }
+    }
+}
+
+fn detector_hint_target_for_detected(detected: &DetectedDeposit) -> Option<DetectorHintTarget> {
+    match detected.watch_target {
+        WatchTarget::ProviderOperation => Some(DetectorHintTarget::ProviderOperation {
+            id: detected.watch_id,
+            execution_step_id: detected.execution_step_id?,
+        }),
+        WatchTarget::FundingVault => Some(DetectorHintTarget::FundingVault {
+            id: detected.watch_id,
+        }),
     }
 }
 
@@ -1079,7 +1093,8 @@ fn submission_retry_jitter_millis(detected: &DetectedDeposit, attempts: u32) -> 
 #[cfg(test)]
 mod tests {
     use super::{
-        detected_deposit_hint_idempotency_key, detected_deposit_key, run_indexed_lookup_task,
+        detected_deposit_hint_idempotency_key, detected_deposit_key,
+        detector_hint_target_for_detected, run_indexed_lookup_task,
         scan_has_pending_ephemeral_submissions, should_retry_submission, submission_retry_delay,
         submission_retry_is_expected_catchup, validate_pending_submission_backlog, BlockCursor,
         BlockScan, DepositConfirmationState, DetectedDeposit, DiscoveryBackend,
@@ -1094,6 +1109,8 @@ mod tests {
     use chrono::{Duration, Utc};
     use reqwest::StatusCode;
     use router_primitives::{ChainType, TokenIdentifier};
+    use router_server::api::DetectorHintTarget;
+    use router_temporal::WorkflowStepId;
     use std::{
         collections::HashMap,
         sync::Arc,
@@ -1147,6 +1164,7 @@ mod tests {
         DetectedDeposit {
             watch_target: WatchTarget::ProviderOperation,
             watch_id: Uuid::now_v7(),
+            execution_step_id: Some(WorkflowStepId::from(Uuid::now_v7())),
             source_chain: ChainType::Bitcoin,
             source_token: TokenIdentifier::Native,
             address: "btc-address".to_string(),
@@ -1186,6 +1204,47 @@ mod tests {
         keyed.insert(detected_deposit_key(&fourth), fourth);
 
         assert_eq!(keyed.len(), 4);
+    }
+
+    #[test]
+    fn detector_hint_target_carries_provider_operation_step_id() {
+        let detected = detected_deposit();
+        let step_id = detected
+            .execution_step_id
+            .expect("provider-operation detection should carry step id");
+
+        let target = detector_hint_target_for_detected(&detected)
+            .expect("provider-operation detection should build target");
+
+        assert_eq!(
+            target,
+            DetectorHintTarget::ProviderOperation {
+                id: detected.watch_id,
+                execution_step_id: step_id,
+            }
+        );
+    }
+
+    #[test]
+    fn detector_hint_target_rejects_provider_operation_without_step_id() {
+        let mut detected = detected_deposit();
+        detected.execution_step_id = None;
+
+        assert_eq!(detector_hint_target_for_detected(&detected), None);
+    }
+
+    #[test]
+    fn detector_hint_target_for_funding_vault_does_not_require_step_id() {
+        let mut detected = detected_deposit();
+        detected.watch_target = WatchTarget::FundingVault;
+        detected.execution_step_id = None;
+
+        assert_eq!(
+            detector_hint_target_for_detected(&detected),
+            Some(DetectorHintTarget::FundingVault {
+                id: detected.watch_id,
+            })
+        );
     }
 
     #[test]
@@ -1282,6 +1341,7 @@ mod tests {
         Arc::new(WatchEntry {
             watch_target: WatchTarget::ProviderOperation,
             watch_id,
+            execution_step_id: Some(WorkflowStepId::from(watch_id)),
             order_id: watch_id,
             source_chain: ChainType::Bitcoin,
             source_token: TokenIdentifier::Native,

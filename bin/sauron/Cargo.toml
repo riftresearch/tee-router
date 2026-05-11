@@ -23,6 +23,7 @@ observability = { workspace = true }
 router-core = { workspace = true }
 router-primitives = { workspace = true }
 router-server = { path = "../router-server" }
+router-temporal = { workspace = true }
 utc = { workspace = true }
 
 alloy = { workspace = true }
@@ -53,7 +54,6 @@ devnet = { workspace = true }
 eip3009-erc20-contract = { workspace = true }
 dotenvy = { workspace = true }
 hyperunit-client = { workspace = true }
-router-temporal = { workspace = true }
 temporal-worker = { path = "../temporal-worker" }
 tempfile = { workspace = true }
 testcontainers = "0.27.2"

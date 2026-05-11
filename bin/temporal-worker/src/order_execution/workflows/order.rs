@@ -932,20 +932,25 @@ impl OrderWorkflow {
 }
 
 impl OrderWorkflow {
-    fn has_provider_operation_hint(&self, order_id: WorkflowOrderId) -> bool {
+    fn has_provider_operation_hint(
+        &self,
+        order_id: WorkflowOrderId,
+        step_id: WorkflowStepId,
+    ) -> bool {
         self.provider_operation_hints
             .iter()
-            .any(|signal| signal.order_id == order_id)
+            .any(|signal| provider_operation_hint_targets_step(signal, order_id, step_id))
     }
 
     fn pop_provider_operation_hint(
         &mut self,
         order_id: WorkflowOrderId,
+        step_id: WorkflowStepId,
     ) -> Option<ProviderOperationHintSignal> {
         let index = self
             .provider_operation_hints
             .iter()
-            .position(|signal| signal.order_id == order_id)?;
+            .position(|signal| provider_operation_hint_targets_step(signal, order_id, step_id))?;
         Some(self.provider_operation_hints.remove(index))
     }
 
@@ -1290,9 +1295,9 @@ async fn wait_for_provider_completion_hint(
 
     loop {
         temporalio_sdk::workflows::select! {
-            _ = ctx.wait_condition(move |state: &OrderWorkflow| state.has_provider_operation_hint(order_id)) => {
+            _ = ctx.wait_condition(move |state: &OrderWorkflow| state.has_provider_operation_hint(order_id, step_id)) => {
                 let signal = ctx
-                    .state_mut(|state| state.pop_provider_operation_hint(order_id))
+                    .state_mut(|state| state.pop_provider_operation_hint(order_id, step_id))
                     .expect("provider operation hint condition was satisfied");
                 let verified = ctx
                     .start_activity(

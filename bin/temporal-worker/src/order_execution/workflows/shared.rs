@@ -6,6 +6,15 @@ pub(super) enum ManualInterventionSignal {
     AcknowledgeUnrecoverable(AcknowledgeUnrecoverableSignal),
 }
 
+pub(super) fn provider_operation_hint_targets_step(
+    signal: &ProviderOperationHintSignal,
+    order_id: WorkflowOrderId,
+    step_id: WorkflowStepId,
+) -> bool {
+    signal.order_id == order_id
+        && (signal.execution_step_id == step_id || signal.execution_step_id.inner().is_nil())
+}
+
 pub(super) fn workflow_start_time<W>(
     ctx: &WorkflowContext<W>,
     workflow_type: &'static str,
