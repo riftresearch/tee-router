@@ -502,6 +502,26 @@ services:
       ARBITRUM_TOKEN_INDEXER_URL: http://devnet:50106
       TOKEN_INDEXER_API_KEY: local-token-indexer-api-key-000000000
 
+  hl-shim-indexer:
+    build:
+      context: ..
+      dockerfile: etc/Dockerfile.hl-shim-indexer
+    restart: on-failure
+    depends_on:
+      router-postgres:
+        condition: service_healthy
+      devnet:
+        condition: service_healthy
+    environment:
+      RUST_LOG: info
+      HL_SHIM_DATABASE_URL: postgres://router_app:router_app@router-postgres:5432/router_db
+      HL_SHIM_INFO_URL: http://devnet:50107
+      HL_SHIM_BIND: 0.0.0.0:8080
+      METRICS_BIND_ADDR: 0.0.0.0:9104
+    expose:
+      - "8080"
+      - "9104"
+
   router-gateway-db:
     image: postgres:16-alpine
     environment:

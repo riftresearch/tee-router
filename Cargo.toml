@@ -8,6 +8,7 @@ members = [
     "bin/router-server",
     "bin/sauron",
     "bin/temporal-worker",
+    "hl-shim-indexer",
     "integration-tests",
     "crates/blockchain-utils",
     "crates/chainalysis-address-screener",

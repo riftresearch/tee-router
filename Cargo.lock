@@ -3724,6 +3724,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "hl-shim-indexer"
+version = "0.1.8"
+dependencies = [
+ "alloy",
+ "axum 0.7.9",
+ "chrono",
+ "clap",
+ "devnet",
+ "futures-util",
+ "hex",
+ "hyperliquid-client",
+ "metrics",
+ "observability",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "snafu",
+ "sqlx-core",
+ "sqlx-postgres",
+ "testcontainers",
+ "tokio",
+ "tokio-tungstenite 0.24.0",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "hmac"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7651,8 +7681,12 @@ checksum = "edc5f74e248dc973e0dbb7b74c7e0d6fcc301c694ff50049504004ef4d0cdcd9"
 dependencies = [
  "futures-util",
  "log",
+ "rustls 0.23.32",
+ "rustls-pki-types",
  "tokio",
+ "tokio-rustls",
  "tungstenite 0.24.0",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -8045,6 +8079,8 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.8.5",
+ "rustls 0.23.32",
+ "rustls-pki-types",
  "sha1",
  "thiserror 1.0.69",
  "utf-8",
