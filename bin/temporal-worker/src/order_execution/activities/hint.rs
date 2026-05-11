@@ -31,9 +31,7 @@ impl ProviderObservationActivities {
     ) -> Result<ProviderOperationHintVerified, ActivityError> {
         record_activity("verify_provider_operation_hint", async move {
             let deps = self.deps()?;
-            if input.signal.execution_step_id != input.step_id
-                && !input.signal.execution_step_id.inner().is_nil()
-            {
+            if input.signal.execution_step_id != input.step_id {
                 return Ok(ProviderOperationHintVerified {
                     provider_operation_id: input.signal.provider_operation_id,
                     decision: ProviderOperationHintDecision::Reject,
