@@ -1107,6 +1107,7 @@ async fn record_confirmed_sauron_funding_hint(
 // mock Across relayer side effect instead.
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn test_database_harness_runs_migrations() {
     let postgres = test_postgres().await;
     let url = create_test_database(&postgres.admin_database_url).await;
@@ -1346,6 +1347,7 @@ async fn database_table_exists(conn: &mut PgConnection, table: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn quote_market_order_persists_ephemeral_quote_without_order() {
     let mocks = MockIntegratorServer::spawn().await.unwrap();
     let (order_manager, db) = test_order_manager(Arc::new(ActionProviderRegistry::mock_http(
@@ -1451,6 +1453,7 @@ async fn quote_market_order_persists_ephemeral_quote_without_order() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_order_idempotency_keys_are_scoped_to_their_quote() {
     let mocks = MockIntegratorServer::spawn().await.unwrap();
     let (order_manager, _db) = test_order_manager(Arc::new(ActionProviderRegistry::mock_http(
@@ -1539,6 +1542,7 @@ async fn create_order_idempotency_keys_are_scoped_to_their_quote() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn concurrent_create_order_requests_resume_same_quote_idempotently() {
     let mocks = MockIntegratorServer::spawn().await.unwrap();
     let (order_manager, db) = test_order_manager(Arc::new(ActionProviderRegistry::mock_http(
@@ -1615,6 +1619,7 @@ async fn concurrent_create_order_requests_resume_same_quote_idempotently() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_limit_order_idempotency_keys_are_scoped_to_their_quote() {
     let mocks = MockIntegratorServer::spawn().await.unwrap();
     let (order_manager, _db) = test_order_manager(Arc::new(ActionProviderRegistry::mock_http(
@@ -1695,6 +1700,7 @@ async fn create_limit_order_idempotency_keys_are_scoped_to_their_quote() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn concurrent_create_limit_order_requests_resume_same_quote_idempotently() {
     let mocks = MockIntegratorServer::spawn().await.unwrap();
     let (order_manager, db) = test_order_manager(Arc::new(ActionProviderRegistry::mock_http(
@@ -1769,6 +1775,7 @@ async fn concurrent_create_limit_order_requests_resume_same_quote_idempotently()
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn quote_market_order_supports_velora_arbitrary_evm_start_and_end() {
     let h = harness().await;
     let mocks = spawn_harness_mocks(h, "evm:8453").await;
@@ -1885,6 +1892,7 @@ async fn quote_market_order_supports_velora_arbitrary_evm_start_and_end() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn quote_market_order_rejects_universal_router_route_without_minimum_policy() {
     let h = harness().await;
     let mocks = spawn_harness_mocks(h, "evm:8453").await;
@@ -1937,6 +1945,7 @@ async fn quote_market_order_rejects_universal_router_route_without_minimum_polic
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn quote_market_order_bitcoin_to_base_usdc_keeps_configured_provider_path_before_top_k() {
     let h = harness().await;
     let mocks = spawn_harness_mocks(h, "evm:8453").await;
@@ -1993,6 +2002,7 @@ async fn quote_market_order_bitcoin_to_base_usdc_keeps_configured_provider_path_
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn quote_market_order_exact_in_reports_net_output_after_unit_withdrawal_retention() {
     let h = harness().await;
     let mocks = MockIntegratorServer::spawn().await.unwrap();
@@ -2088,6 +2098,7 @@ async fn quote_market_order_exact_in_reports_net_output_after_unit_withdrawal_re
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn mock_velora_transaction_spends_input_and_mints_output_on_local_evm() {
     let h = harness().await;
     let mocks = spawn_harness_mocks(h, "evm:8453").await;
@@ -2253,6 +2264,7 @@ async fn mock_velora_transaction_spends_input_and_mints_output_on_local_evm() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn quote_market_order_exact_out_uses_exchange_provider_quote() {
     let mocks = MockIntegratorServer::spawn().await.unwrap();
     let (order_manager, _db) = test_order_manager(Arc::new(ActionProviderRegistry::mock_http(
@@ -2293,6 +2305,7 @@ async fn quote_market_order_exact_out_uses_exchange_provider_quote() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn quote_limit_order_base_usdc_to_eth_includes_downstream_ueth_retention() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -2373,6 +2386,7 @@ async fn quote_limit_order_base_usdc_to_eth_includes_downstream_ueth_retention()
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn router_api_quote_and_order_flow_uses_production_component_initialization() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -2587,6 +2601,7 @@ async fn router_api_quote_and_order_flow_uses_production_component_initializatio
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn router_api_address_screening_covers_allow_block_and_provider_error() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -2700,6 +2715,7 @@ async fn router_api_address_screening_covers_allow_block_and_provider_error() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn router_public_gateway_routes_require_bearer_api_key_when_configured() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -2809,6 +2825,7 @@ async fn router_public_gateway_routes_require_bearer_api_key_when_configured() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn router_admin_provider_policy_endpoint_requires_bearer_api_key_and_persists_updates() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -2871,6 +2888,7 @@ async fn router_admin_provider_policy_endpoint_requires_bearer_api_key_and_persi
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn provider_policy_upsert_preserves_newer_update_against_stale_write() {
     let db = test_db().await;
     let base = Utc::now();
@@ -2930,6 +2948,7 @@ async fn provider_policy_upsert_preserves_newer_update_against_stale_write() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn router_admin_provider_policy_drain_excludes_provider_from_new_quotes_immediately() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -3034,6 +3053,7 @@ async fn router_admin_provider_policy_drain_excludes_provider_from_new_quotes_im
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn funding_hints_validate_balance_once_and_mark_vault_funded() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -3187,6 +3207,7 @@ async fn funding_hints_validate_balance_once_and_mark_vault_funded() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn funding_hint_records_observation_for_refunding_late_deposit() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -3255,6 +3276,7 @@ async fn funding_hint_records_observation_for_refunding_late_deposit() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn unfunded_expiry_skips_order_when_funding_vault_already_funded() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -3351,6 +3373,7 @@ async fn unfunded_expiry_skips_order_when_funding_vault_already_funded() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn sauron_funding_hint_retry_reopens_terminal_same_key_hint() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -3546,6 +3569,7 @@ async fn sauron_funding_hint_retry_reopens_terminal_same_key_hint() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn funding_hint_completion_requires_current_processing_lease() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -3630,6 +3654,7 @@ async fn funding_hint_completion_requires_current_processing_lease() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn sauron_provider_operation_retry_reopens_failed_but_not_processed_same_key_hint() {
     let db = test_db().await;
     let now = Utc::now();
@@ -3898,6 +3923,7 @@ async fn sauron_provider_operation_retry_reopens_failed_but_not_processed_same_k
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn provider_operation_terminal_status_is_monotonic_against_stale_writes() {
     let db = test_db().await;
     let now = Utc::now();
@@ -4152,6 +4178,7 @@ async fn provider_operation_terminal_status_is_monotonic_against_stale_writes() 
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn route_cost_refresh_persists_anchor_snapshots() {
     let db = test_db().await;
     let action_providers = Arc::new(ActionProviderRegistry::with_asset_registry(
@@ -4203,6 +4230,7 @@ fn fresh_test_pricing() -> PricingSnapshot {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn route_cost_upsert_preserves_newer_snapshot_against_stale_write() {
     let db = test_db().await;
     let base = Utc::now();
@@ -4292,6 +4320,7 @@ async fn route_cost_upsert_preserves_newer_snapshot_against_stale_write() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn route_cost_refresh_samples_configured_bridge_providers() {
     let h = harness().await;
     let db = test_db().await;
@@ -4317,6 +4346,7 @@ async fn route_cost_refresh_samples_configured_bridge_providers() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn provider_health_upsert_preserves_newer_check_against_stale_write() {
     let db = test_db().await;
     let base = Utc::now();
@@ -4386,6 +4416,7 @@ async fn provider_health_upsert_preserves_newer_check_against_stale_write() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn route_minimum_service_computes_mock_base_usdc_to_btc_floor() {
     let h = harness().await;
     let mocks = spawn_harness_mocks(h, "evm:8453").await;
@@ -4425,6 +4456,7 @@ async fn route_minimum_service_computes_mock_base_usdc_to_btc_floor() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn route_minimum_service_computes_mock_btc_to_eth_floor() {
     let h = harness().await;
     let mocks = spawn_harness_mocks(h, "evm:8453").await;
@@ -4461,6 +4493,7 @@ async fn route_minimum_service_computes_mock_btc_to_eth_floor() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn route_minimum_service_computes_mock_btc_to_base_usdc_floor() {
     let h = harness().await;
     let mocks = spawn_harness_mocks(h, "evm:8453").await;
@@ -4509,6 +4542,7 @@ async fn route_minimum_service_computes_mock_btc_to_base_usdc_floor() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn quote_market_order_rejects_base_usdc_to_btc_below_operational_floor() {
     let h = harness().await;
     let mocks = spawn_harness_mocks(h, "evm:8453").await;
@@ -4543,6 +4577,7 @@ async fn quote_market_order_rejects_base_usdc_to_btc_below_operational_floor() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn quote_market_order_allows_base_usdc_to_btc_at_operational_floor() {
     let h = harness().await;
     let mocks = spawn_harness_mocks(h, "evm:8453").await;
@@ -4598,6 +4633,7 @@ async fn quote_market_order_allows_base_usdc_to_btc_at_operational_floor() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn quote_market_order_allows_btc_to_eth_at_operational_floor() {
     let h = harness().await;
     let mocks = spawn_harness_mocks(h, "evm:8453").await;
@@ -4652,6 +4688,7 @@ async fn quote_market_order_allows_btc_to_eth_at_operational_floor() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn quote_market_order_rejects_zero_amounts() {
     let mocks = MockIntegratorServer::spawn().await.unwrap();
     let (order_manager, _db) = test_order_manager(Arc::new(ActionProviderRegistry::mock_http(
@@ -4682,6 +4719,7 @@ async fn quote_market_order_rejects_zero_amounts() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_vault_with_order_id_links_generic_order_to_vault() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -4765,6 +4803,7 @@ async fn create_vault_with_order_id_links_generic_order_to_vault() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn custody_action_executor_transfers_evm_native_from_router_vault() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -4820,6 +4859,7 @@ async fn custody_action_executor_transfers_evm_native_from_router_vault() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn custody_action_executor_transfers_evm_native_from_router_vault_with_paymaster_gas() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -4897,6 +4937,7 @@ async fn custody_action_executor_transfers_evm_native_from_router_vault_with_pay
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn custody_action_executor_transfers_erc20_from_router_vault_with_paymaster_gas() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -4982,6 +5023,7 @@ async fn custody_action_executor_transfers_erc20_from_router_vault_with_paymaste
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn custody_action_executor_executes_evm_call_with_paymaster_gas() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -5070,6 +5112,7 @@ async fn custody_action_executor_executes_evm_call_with_paymaster_gas() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn custody_action_executor_transfers_bitcoin_native_from_router_vault() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -5143,6 +5186,7 @@ async fn custody_action_executor_transfers_bitcoin_native_from_router_vault() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn custody_action_executor_transfers_bitcoin_native_from_mempool_funding() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -5208,6 +5252,7 @@ async fn custody_action_executor_transfers_bitcoin_native_from_mempool_funding()
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn provider_operations_store_protocol_addresses_outside_custody_vaults() {
     let mocks = MockIntegratorServer::spawn().await.unwrap();
     let (order_manager, db) = test_order_manager(Arc::new(ActionProviderRegistry::mock_http(
@@ -5454,6 +5499,7 @@ async fn provider_operations_store_protocol_addresses_outside_custody_vaults() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn provider_addresses_are_scoped_to_execution_step_not_order_address() {
     let db = test_db().await;
     let now = Utc::now();
@@ -5650,6 +5696,7 @@ async fn provider_addresses_are_scoped_to_execution_step_not_order_address() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn market_order_route_planner_uses_direct_unit_when_source_is_unit_ingress() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -5789,6 +5836,7 @@ async fn market_order_route_planner_uses_direct_unit_when_source_is_unit_ingress
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn execution_leg_rollup_ignores_superseded_failed_retry_actions() {
     let h = harness().await;
     let db = test_db().await;
@@ -5997,6 +6045,7 @@ async fn execution_leg_rollup_ignores_superseded_failed_retry_actions() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn execution_leg_rollup_uses_step_amount_when_provider_source_amount_is_decimal() {
     let h = harness().await;
     let db = test_db().await;
@@ -6147,6 +6196,7 @@ async fn execution_leg_rollup_uses_step_amount_when_provider_source_amount_is_de
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn execution_leg_rollup_uses_unit_deposit_source_amount_as_output_evidence() {
     let h = harness().await;
     let db = test_db().await;
@@ -6284,6 +6334,7 @@ async fn execution_leg_rollup_uses_unit_deposit_source_amount_as_output_evidence
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn execution_leg_rollup_uses_cctp_receive_source_credit_as_bridge_output() {
     let db = test_db().await;
     let now = Utc::now();
@@ -6437,6 +6488,7 @@ async fn execution_leg_rollup_uses_cctp_receive_source_credit_as_bridge_output()
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn completion_finalization_candidates_include_stale_execution_legs_for_rollup_recovery() {
     let db = test_db().await;
     let now = Utc::now();
@@ -6535,6 +6587,7 @@ async fn completion_finalization_candidates_include_stale_execution_legs_for_rol
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn execution_leg_usd_valuation_update_returns_updated_leg() {
     let db = test_db().await;
     let now = Utc::now();
@@ -6573,6 +6626,7 @@ async fn execution_leg_usd_valuation_update_returns_updated_leg() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn execution_leg_rollup_rejects_completed_leg_without_actual_amount_evidence() {
     let h = harness().await;
     let db = test_db().await;
@@ -6706,6 +6760,7 @@ async fn execution_leg_rollup_rejects_completed_leg_without_actual_amount_eviden
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn release_quote_after_vault_creation_failure_allows_order_retry() {
     let h = harness().await;
     let db = test_db().await;
@@ -6788,6 +6843,7 @@ async fn release_quote_after_vault_creation_failure_allows_order_retry() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_order_from_quote_resumes_after_funding_vault_attached() {
     let h = harness().await;
     let db = test_db().await;
@@ -6858,6 +6914,7 @@ async fn create_order_from_quote_resumes_after_funding_vault_attached() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn expired_quote_cleanup_deletes_only_unassociated_quotes() {
     let postgres = test_postgres().await;
     let database_url = create_test_database(&postgres.admin_database_url).await;
@@ -6994,6 +7051,7 @@ fn test_market_order_quote(
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn market_order_route_planner_uses_across_only_when_unit_needs_ingress_bridge() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -7140,6 +7198,7 @@ async fn market_order_route_planner_uses_across_only_when_unit_needs_ingress_bri
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn market_order_route_planner_reserves_bitcoin_fee_for_unit_ingress() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -7262,6 +7321,7 @@ async fn market_order_route_planner_reserves_bitcoin_fee_for_unit_ingress() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn market_order_route_planner_supports_cctp_to_hyperliquid_bridge_path() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -7425,6 +7485,7 @@ async fn market_order_route_planner_supports_cctp_to_hyperliquid_bridge_path() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn provider_quotes_support_across_to_hyperliquid_bridge_path_under_mocks() {
     let h = harness().await;
     let mocks = spawn_harness_mocks(h, "evm:8453").await;
@@ -7528,6 +7589,7 @@ async fn provider_quotes_support_across_to_hyperliquid_bridge_path_under_mocks()
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_vault_evm_native() {
     let dir = tempfile::tempdir().unwrap();
     let vm = test_vault_manager(dir.path()).await;
@@ -7544,6 +7606,7 @@ async fn create_vault_evm_native() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_vault_base_native() {
     let dir = tempfile::tempdir().unwrap();
     let vm = test_vault_manager(dir.path()).await;
@@ -7566,6 +7629,7 @@ async fn create_vault_base_native() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_vault_evm_erc20_token() {
     let dir = tempfile::tempdir().unwrap();
     let vm = test_vault_manager(dir.path()).await;
@@ -7587,6 +7651,7 @@ async fn create_vault_evm_erc20_token() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_vault_bitcoin_native() {
     let dir = tempfile::tempdir().unwrap();
     let vm = test_vault_manager(dir.path()).await;
@@ -7610,6 +7675,7 @@ async fn create_vault_bitcoin_native() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_vault_unsupported_chain_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let vm = test_vault_manager(dir.path()).await;
@@ -7627,6 +7693,7 @@ async fn create_vault_unsupported_chain_rejected() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_vault_bitcoin_rejects_erc20_asset() {
     let dir = tempfile::tempdir().unwrap();
     let vm = test_vault_manager(dir.path()).await;
@@ -7645,6 +7712,7 @@ async fn create_vault_bitcoin_rejects_erc20_asset() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_vault_invalid_recovery_address_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let vm = test_vault_manager(dir.path()).await;
@@ -7659,6 +7727,7 @@ async fn create_vault_invalid_recovery_address_rejected() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_vault_invalid_cancellation_commitment_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let vm = test_vault_manager(dir.path()).await;
@@ -7673,6 +7742,7 @@ async fn create_vault_invalid_cancellation_commitment_rejected() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_vault_cancel_after_in_past_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let vm = test_vault_manager(dir.path()).await;
@@ -7687,6 +7757,7 @@ async fn create_vault_cancel_after_in_past_rejected() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_vault_non_object_metadata_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let vm = test_vault_manager(dir.path()).await;
@@ -7705,6 +7776,7 @@ async fn create_vault_non_object_metadata_rejected() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_then_get_vault_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
     let vm = test_vault_manager(dir.path()).await;
@@ -7724,6 +7796,7 @@ async fn create_then_get_vault_roundtrip() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_vault_generates_unique_addresses() {
     let dir = tempfile::tempdir().unwrap();
     let vm = test_vault_manager(dir.path()).await;
@@ -7737,6 +7810,7 @@ async fn create_vault_generates_unique_addresses() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_vault_default_cancel_after_is_future() {
     let dir = tempfile::tempdir().unwrap();
     let vm = test_vault_manager(dir.path()).await;
@@ -7753,6 +7827,7 @@ async fn create_vault_default_cancel_after_is_future() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_vault_preserves_custom_metadata() {
     let dir = tempfile::tempdir().unwrap();
     let vm = test_vault_manager(dir.path()).await;
@@ -7771,6 +7846,7 @@ async fn create_vault_preserves_custom_metadata() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_vault_normalizes_evm_token_address_to_lowercase() {
     let dir = tempfile::tempdir().unwrap();
     let vm = test_vault_manager(dir.path()).await;
@@ -7792,6 +7868,7 @@ async fn create_vault_normalizes_evm_token_address_to_lowercase() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_vault_normalizes_evm_recovery_address_to_lowercase() {
     let dir = tempfile::tempdir().unwrap();
     let vm = test_vault_manager(dir.path()).await;
@@ -7807,6 +7884,7 @@ async fn create_vault_normalizes_evm_recovery_address_to_lowercase() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_vault_invalid_evm_token_address_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let vm = test_vault_manager(dir.path()).await;
@@ -7824,6 +7902,7 @@ async fn create_vault_invalid_evm_token_address_rejected() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn cancel_vault_rejects_executing_status() {
     let dir = tempfile::tempdir().unwrap();
     let (vm, db) = test_vault_manager_with_db(dir.path()).await;
@@ -7855,6 +7934,7 @@ async fn cancel_vault_rejects_executing_status() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn refund_claim_lease_blocks_duplicate_workers() {
     let dir = tempfile::tempdir().unwrap();
     let (vm, db) = test_vault_manager_with_db(dir.path()).await;
@@ -7907,6 +7987,7 @@ async fn refund_claim_lease_blocks_duplicate_workers() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn refunding_retry_claims_are_atomic() {
     let dir = tempfile::tempdir().unwrap();
     let (vm, db) = test_vault_manager_with_db(dir.path()).await;
@@ -7943,6 +8024,7 @@ async fn refunding_retry_claims_are_atomic() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn refund_error_completion_requires_current_processing_lease() {
     let dir = tempfile::tempdir().unwrap();
     let (vm, db) = test_vault_manager_with_db(dir.path()).await;
@@ -8019,6 +8101,7 @@ async fn refund_error_completion_requires_current_processing_lease() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn refund_success_completion_requires_current_processing_lease() {
     let dir = tempfile::tempdir().unwrap();
     let (vm, db) = test_vault_manager_with_db(dir.path()).await;
@@ -8097,6 +8180,7 @@ async fn refund_success_completion_requires_current_processing_lease() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn cancel_vault_requests_worker_refund_for_evm_native_eth() {
     let h = harness().await;
     let dir = tempfile::tempdir().unwrap();
@@ -8148,6 +8232,7 @@ async fn cancel_vault_requests_worker_refund_for_evm_native_eth() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn cancel_vault_requests_worker_refund_for_evm_erc20() {
     let h = harness().await;
     let dir = tempfile::tempdir().unwrap();
@@ -8224,6 +8309,7 @@ async fn cancel_vault_requests_worker_refund_for_evm_erc20() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn cancel_vault_requests_worker_refund_for_bitcoin() {
     let h = harness().await;
     let dir = tempfile::tempdir().unwrap();
@@ -8271,6 +8357,7 @@ async fn cancel_vault_requests_worker_refund_for_bitcoin() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn vault_address_matches_deterministic_derivation_from_quote() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -8337,6 +8424,7 @@ async fn vault_address_matches_deterministic_derivation_from_quote() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn quote_envelope_never_exposes_deposit_address() {
     let mocks = MockIntegratorServer::spawn().await.unwrap();
     let (order_manager, _db) = test_order_manager(Arc::new(ActionProviderRegistry::mock_http(
