@@ -202,3 +202,21 @@ router-loadgen-limit count='100' concurrency='64' rps='5' min_raw_amount='100000
 #   just wallet-balance --address bcrt1... --skip-evm --skip-hyperliquid
 wallet-balance +args:
     cargo run -p devnet --bin wallet-balance -- {{args}}
+
+# --- Test recipes -----------------------------------------------------------
+# Fast iteration: unit + lib + lightweight integration tests. Devnet-spawning
+# tests are tagged `#[ignore = "integration: ..."]` and excluded here.
+# Target runtime: under 30 seconds.
+test:
+    cargo nextest run --workspace
+
+# Slow integration tests only (devnet-spawning, multi-process).
+# Use this when validating cross-cutting changes that touch Sauron + T-router
+# + provider observers end-to-end.
+test-integration:
+    cargo nextest run --workspace --run-ignored=ignored-only
+
+# Full gate: every test including integration. Run before commit on changes
+# that touch order workflow / Sauron observation / hint verification.
+test-all:
+    cargo nextest run --workspace --run-ignored=all

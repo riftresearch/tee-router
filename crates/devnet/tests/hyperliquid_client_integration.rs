@@ -742,6 +742,7 @@ async fn native_bridge_deposit_credit_can_be_delayed_by_mock() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn native_bridge_deposit_credit_can_fail_deterministically() {
     let amount_raw = U256::from(6_000_000u64);
     let (_anvil, server, client, user, token, bridge_address) =
@@ -798,6 +799,7 @@ async fn usd_class_transfer_moves_withdrawable_usdc_into_spot() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn withdraw3_deducts_gross_amount_and_releases_net_usdc() {
     let minted_raw = U256::from(12_000_000u64);
     let deposit_raw = U256::from(6_000_000u64);

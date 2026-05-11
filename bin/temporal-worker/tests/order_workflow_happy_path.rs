@@ -152,6 +152,7 @@ struct SeededOrder {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "integration: spawns devnet stack"]
 async fn order_workflow_completes_funded_single_step_order() {
     let run = run_order_workflow(WorkflowOptions::default()).await;
 
@@ -166,6 +167,7 @@ async fn order_workflow_completes_funded_single_step_order() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "integration: spawns devnet stack"]
 async fn order_workflow_manual_intervention_release_resumes_and_completes() {
     let run = run_order_workflow(WorkflowOptions {
         manual_intervention_action: Some(ManualInterventionTestAction::Release),
@@ -194,6 +196,7 @@ async fn order_workflow_manual_intervention_release_resumes_and_completes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "integration: spawns devnet stack"]
 async fn order_workflow_manual_intervention_trigger_refund_reaches_refunded() {
     let run = run_order_workflow(WorkflowOptions {
         manual_intervention_action: Some(ManualInterventionTestAction::TriggerRefund),
@@ -216,6 +219,7 @@ async fn order_workflow_manual_intervention_trigger_refund_reaches_refunded() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "integration: spawns devnet stack"]
 async fn order_workflow_manual_intervention_acknowledge_unrecoverable_stays_terminal() {
     let run = run_order_workflow(WorkflowOptions {
         manual_intervention_action: Some(ManualInterventionTestAction::AcknowledgeUnrecoverable),
@@ -254,6 +258,7 @@ async fn order_workflow_manual_intervention_acknowledge_unrecoverable_stays_term
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "integration: spawns devnet stack"]
 async fn order_workflow_completes_across_step_via_hint() {
     let run = run_order_workflow(WorkflowOptions {
         route: WorkflowRoute::AcrossBaseEthToEthereumUsdc,
@@ -292,6 +297,7 @@ async fn order_workflow_completes_across_step_via_hint() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "integration: spawns devnet stack"]
 async fn order_workflow_recovers_across_lost_intent_from_onchain_log() {
     let run = run_order_workflow(WorkflowOptions {
         route: WorkflowRoute::AcrossBaseEthToEthereumUsdc,
@@ -329,6 +335,7 @@ async fn order_workflow_recovers_across_lost_intent_from_onchain_log() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "integration: spawns devnet stack"]
 async fn order_workflow_completes_unit_deposit_via_hint() {
     let run = run_order_workflow(WorkflowOptions {
         route: WorkflowRoute::UnitBitcoinToBaseEth,
@@ -368,6 +375,7 @@ async fn order_workflow_completes_unit_deposit_via_hint() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "integration: spawns devnet stack"]
 async fn order_workflow_retries_failed_step_then_completes() {
     let run = run_order_workflow(WorkflowOptions {
         velora_transaction_failures: EXECUTE_STEP_TEMPORAL_ATTEMPTS,
@@ -431,6 +439,7 @@ async fn order_workflow_retries_failed_step_then_completes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "integration: spawns devnet stack"]
 async fn order_workflow_refunds_after_retry_exhaustion() {
     let run = run_order_workflow(WorkflowOptions {
         velora_transaction_failures: EXECUTE_STEP_TEMPORAL_ATTEMPTS * 2,
@@ -515,6 +524,7 @@ async fn order_workflow_refunds_after_retry_exhaustion() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "integration: spawns devnet stack"]
 async fn order_workflow_refunds_external_custody_across_after_retry_exhaustion() {
     let run = run_order_workflow(WorkflowOptions {
         route: WorkflowRoute::AcrossBaseEthToEthereumUsdc,
@@ -564,6 +574,7 @@ async fn order_workflow_refunds_external_custody_across_after_retry_exhaustion()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "integration: spawns devnet stack"]
 async fn order_workflow_refunds_external_custody_cctp_after_retry_exhaustion() {
     let run = run_order_workflow(WorkflowOptions {
         route: WorkflowRoute::CctpBaseUsdcToArbitrumEth,
@@ -630,6 +641,7 @@ async fn order_workflow_refunds_external_custody_cctp_after_retry_exhaustion() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "integration: spawns devnet stack"]
 async fn order_workflow_refunds_external_custody_universal_router_after_retry_exhaustion() {
     let run = run_order_workflow(WorkflowOptions {
         velora_transaction_failures: EXECUTE_STEP_TEMPORAL_ATTEMPTS * 2,
@@ -687,6 +699,7 @@ async fn order_workflow_refunds_external_custody_universal_router_after_retry_ex
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "integration: spawns devnet stack"]
 async fn order_workflow_refunds_external_custody_across_then_universal_router_after_retry_exhaustion(
 ) {
     let run = run_order_workflow(WorkflowOptions {
@@ -754,6 +767,7 @@ async fn order_workflow_refunds_external_custody_across_then_universal_router_af
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "integration: spawns devnet stack"]
 async fn order_workflow_refunds_hyperliquid_spot_unit_withdrawal_after_retry_exhaustion() {
     let run = run_order_workflow(WorkflowOptions {
         velora_transaction_failures: EXECUTE_STEP_TEMPORAL_ATTEMPTS * 2,
@@ -805,6 +819,7 @@ async fn order_workflow_refunds_hyperliquid_spot_unit_withdrawal_after_retry_exh
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "integration: spawns devnet stack"]
 async fn order_workflow_refreshes_stale_quote_then_completes() {
     let run = run_order_workflow(WorkflowOptions {
         expire_quote_legs: true,
@@ -856,6 +871,7 @@ async fn order_workflow_refreshes_stale_quote_then_completes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "integration: spawns devnet stack"]
 async fn order_workflow_refreshes_exact_out_stale_quote_then_completes() {
     let run = run_order_workflow(WorkflowOptions {
         route: WorkflowRoute::VeloraBaseEthToBaseUsdcExactOut,
@@ -929,6 +945,7 @@ async fn order_workflow_refreshes_exact_out_stale_quote_then_completes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "integration: spawns devnet stack"]
 async fn order_workflow_refreshes_stale_quote_multi_leg_then_completes() {
     let run = run_order_workflow(WorkflowOptions {
         route: WorkflowRoute::AcrossBaseEthToEthereumUsdc,
@@ -1042,6 +1059,7 @@ async fn order_workflow_refreshes_stale_quote_multi_leg_then_completes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "integration: spawns devnet stack"]
 async fn order_workflow_refreshes_stale_cctp_quote_then_completes() {
     let run = run_order_workflow(WorkflowOptions {
         route: WorkflowRoute::CctpBaseUsdcToArbitrumEth,
@@ -1096,6 +1114,7 @@ async fn order_workflow_refreshes_stale_cctp_quote_then_completes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "integration: spawns devnet stack"]
 async fn order_workflow_refreshes_unit_deposit_quote_with_fee_reserve_then_completes() {
     let run = run_order_workflow(WorkflowOptions {
         route: WorkflowRoute::UnitBitcoinToBaseEth,
@@ -1170,6 +1189,7 @@ async fn order_workflow_refreshes_unit_deposit_quote_with_fee_reserve_then_compl
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "integration: spawns devnet stack"]
 async fn order_workflow_refreshes_hyperliquid_bridge_quote_then_completes() {
     let run = run_order_workflow(WorkflowOptions {
         route: WorkflowRoute::CctpBaseUsdcToBitcoin,
@@ -1235,6 +1255,7 @@ async fn order_workflow_refreshes_hyperliquid_bridge_quote_then_completes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "integration: spawns devnet stack"]
 async fn order_workflow_refreshes_hyperliquid_trade_quote_then_completes() {
     let run = run_order_workflow(WorkflowOptions {
         route: WorkflowRoute::UnitBitcoinToBaseEth,
@@ -1344,6 +1365,7 @@ async fn order_workflow_refreshes_hyperliquid_trade_quote_then_completes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "integration: spawns devnet stack"]
 async fn order_workflow_completes_arbitrum_usdc_hyperliquid_trade_path() {
     let run = run_order_workflow(WorkflowOptions {
         route: WorkflowRoute::HyperliquidArbitrumUsdcToBitcoin,
@@ -1413,6 +1435,7 @@ async fn order_workflow_completes_arbitrum_usdc_hyperliquid_trade_path() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "integration: spawns devnet stack"]
 async fn order_workflow_refresh_untenable_routes_to_refund() {
     let run = run_order_workflow(WorkflowOptions {
         expire_quote_legs: true,
@@ -1448,6 +1471,7 @@ async fn order_workflow_refresh_untenable_routes_to_refund() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "integration: spawns devnet stack"]
 async fn order_workflow_refresh_multi_leg_untenable_routes_to_refund() {
     let run = run_order_workflow(WorkflowOptions {
         route: WorkflowRoute::AcrossBaseEthToEthereumUsdc,
