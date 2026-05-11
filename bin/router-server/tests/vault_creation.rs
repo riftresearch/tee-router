@@ -944,10 +944,10 @@ fn assert_path_provider_id(provider_id: &str, expected_fragments: &[&str]) {
     }
 }
 
-/// Step-request mirror used when asserting what the planner persisted into
-/// `execution_steps.request`. Matches `UnitDepositStepRequest` /
-/// `UnitWithdrawalStepRequest` in `action_providers.rs` — redefined here so
-/// test code can deserialize the JSON without importing internal types.
+// Step-request mirror used when asserting what the planner persisted into
+// `execution_steps.request`. Matches `UnitDepositStepRequest` /
+// `UnitWithdrawalStepRequest` in `action_providers.rs` — redefined here so
+// test code can deserialize the JSON without importing internal types.
 
 async fn anvil_set_balance(h: &TestHarness, address: Address, amount: U256) {
     let provider = ProviderBuilder::new().connect_http(h.ethereum_endpoint_url());
@@ -1090,21 +1090,21 @@ async fn record_confirmed_sauron_funding_hint(
     assert_eq!(funded_summary.processed, 1);
 }
 
-/// Wait for the mock Across indexer to observe a `FundsDeposited` event from
-/// the specified depositor, confirming the on-chain deposit landed and the
-/// mock's `/deposit/status` will now report `"filled"` for that deposit id.
-/// Scoped by depositor so parallel tests sharing the anvil spoke pool don't
-/// witness each other's deposits and return early.
-
-/// Drive an Across → (optional Unit deposit) → (optional Unit withdrawal) →
-/// (optional Hyperliquid) market order to terminal state. External provider
-/// progress is observed through the mocks where available; direct mock
-/// completion is kept only for Unit withdrawal until that lifecycle is modeled.
-
-/// State-injection recovery tests may fabricate a completed Across operation
-/// without calling the mock Across status endpoint. Those tests must also
-/// fabricate the matching destination funds; production-shaped tests rely on the
-/// mock Across relayer side effect instead.
+// Wait for the mock Across indexer to observe a `FundsDeposited` event from
+// the specified depositor, confirming the on-chain deposit landed and the
+// mock's `/deposit/status` will now report `"filled"` for that deposit id.
+// Scoped by depositor so parallel tests sharing the anvil spoke pool don't
+// witness each other's deposits and return early.
+//
+// Drive an Across → (optional Unit deposit) → (optional Unit withdrawal) →
+// (optional Hyperliquid) market order to terminal state. External provider
+// progress is observed through the mocks where available; direct mock
+// completion is kept only for Unit withdrawal until that lifecycle is modeled.
+//
+// State-injection recovery tests may fabricate a completed Across operation
+// without calling the mock Across status endpoint. Those tests must also
+// fabricate the matching destination funds; production-shaped tests rely on the
+// mock Across relayer side effect instead.
 
 #[tokio::test]
 async fn test_database_harness_runs_migrations() {
@@ -7518,10 +7518,10 @@ async fn provider_quotes_support_across_to_hyperliquid_bridge_path_under_mocks()
 /// legs and the planner materializes two `HyperliquidTrade` steps in sequence
 /// between UnitDeposit and UnitWithdrawal.
 
-/// Variant of `drive_across_order_to_completion` for cross-token HL routes.
-/// UnitDeposit completion is driven by the mock Unit EVM indexer observing the
-/// router's on-chain transfer into the generated Unit protocol address, which
-/// then credits the mock HL spot ledger before the first HL leg runs.
+// Variant of `drive_across_order_to_completion` for cross-token HL routes.
+// UnitDeposit completion is driven by the mock Unit EVM indexer observing the
+// router's on-chain transfer into the generated Unit protocol address, which
+// then credits the mock HL spot ledger before the first HL leg runs.
 
 // ---------------------------------------------------------------------------
 // Vault creation tests

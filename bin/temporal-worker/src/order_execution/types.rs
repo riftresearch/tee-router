@@ -183,19 +183,6 @@ pub enum QuoteRefreshWorkflowOutcome {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderHintPollWorkflowInput {
-    pub order_id: WorkflowOrderId,
-    pub step_id: WorkflowStepId,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderHintPollWorkflowOutput {
-    pub provider_operation_id: Option<WorkflowProviderOperationId>,
-    pub decision: ProviderOperationHintDecision,
-    pub reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FundingVaultFundedSignal {
     pub order_id: WorkflowOrderId,
     pub vault_id: WorkflowVaultId,
@@ -428,19 +415,6 @@ pub enum ProviderOperationHintDecision {
     Accept,
     Reject,
     Defer,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PollProviderOperationHintsInput {
-    pub order_id: WorkflowOrderId,
-    pub step_id: WorkflowStepId,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderOperationHintsPolled {
-    pub provider_operation_id: Option<WorkflowProviderOperationId>,
-    pub decision: ProviderOperationHintDecision,
-    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -758,6 +732,7 @@ impl From<InputCustodySnapshot> for Value {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RefreshedQuoteAttemptOutcome {
     Refreshed {

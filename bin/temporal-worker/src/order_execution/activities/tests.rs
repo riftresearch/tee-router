@@ -214,11 +214,10 @@ async fn waiting_external_transition_records_latency_timestamp() {
         .expect("load latency record");
     assert!(latency.waiting_external_at.is_some());
     assert_eq!(latency.hint_arrived_at, None);
-    assert_eq!(latency.hint_source, None);
 }
 
 #[tokio::test]
-async fn hint_arrival_records_latency_source() {
+async fn hint_arrival_records_latency_timestamp() {
     let test_db = test_database().await;
     let seeded = seed_running_step(&test_db.pool, false, false).await;
     let arrived_at = Utc::now();
@@ -226,7 +225,7 @@ async fn hint_arrival_records_latency_source() {
     test_db
         .db
         .orders()
-        .record_execution_step_hint_arrival(seeded.step_id, HINT_SOURCE_SAURON_SIGNAL, arrived_at)
+        .record_execution_step_hint_arrival(seeded.step_id, arrived_at)
         .await
         .expect("record hint arrival");
 
@@ -237,10 +236,6 @@ async fn hint_arrival_records_latency_source() {
         .await
         .expect("load latency record");
     assert!(latency.hint_arrived_at.is_some());
-    assert_eq!(
-        latency.hint_source.as_deref(),
-        Some(HINT_SOURCE_SAURON_SIGNAL)
-    );
 }
 
 #[tokio::test]

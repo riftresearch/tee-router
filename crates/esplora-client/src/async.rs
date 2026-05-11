@@ -288,13 +288,13 @@ impl<S: Sleeper> AsyncClient<S> {
             });
         }
 
-        Ok(response
+        response
             .text()
             .await
             .map_err(|e| Error::ReqwestWithContext {
                 error: e,
                 context: "get_response_text: Failed to get response text".to_string(),
-            })?)
+            })
     }
 
     /// Make an HTTP GET request to given URL, deserializing to `Option<T>`.

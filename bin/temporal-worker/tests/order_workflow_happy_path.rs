@@ -142,7 +142,6 @@ struct WorkflowOptions {
     expect_external_custody_cctp_refund: bool,
     expect_external_custody_velora_refund: bool,
     expect_external_custody_across_then_velora_refund: bool,
-    suppress_across_hint_signal: bool,
     simulate_across_lost_intent_checkpoint: bool,
     manual_intervention_action: Option<ManualInterventionTestAction>,
 }
@@ -293,41 +292,6 @@ async fn order_workflow_completes_across_step_via_hint() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn order_workflow_completes_across_step_via_polling_fallback() {
-    let run = run_order_workflow(WorkflowOptions {
-        route: WorkflowRoute::AcrossBaseEthToEthereumUsdc,
-        suppress_across_hint_signal: true,
-        ..WorkflowOptions::default()
-    })
-    .await;
-
-    assert_eq!(run.output.terminal_status, OrderTerminalStatus::Completed);
-    let completed = run
-        .db
-        .orders()
-        .get(run.order_id)
-        .await
-        .expect("load completed order");
-    assert_eq!(completed.status, RouterOrderStatus::Completed);
-
-    let across_operation =
-        provider_operation_by_type(&run.db, run.order_id, ProviderOperationType::AcrossBridge)
-            .await;
-    assert_eq!(across_operation.status, ProviderOperationStatus::Completed);
-    let step = run
-        .db
-        .orders()
-        .get_execution_step(
-            across_operation
-                .execution_step_id
-                .expect("Across operation should be linked to a step"),
-        )
-        .await
-        .expect("load Across step");
-    assert_eq!(step.status, OrderExecutionStepStatus::Completed);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn order_workflow_recovers_across_lost_intent_from_onchain_log() {
     let run = run_order_workflow(WorkflowOptions {
         route: WorkflowRoute::AcrossBaseEthToEthereumUsdc,
@@ -365,7 +329,7 @@ async fn order_workflow_recovers_across_lost_intent_from_onchain_log() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn order_workflow_completes_unit_deposit_via_polling_fallback() {
+async fn order_workflow_completes_unit_deposit_via_hint() {
     let run = run_order_workflow(WorkflowOptions {
         route: WorkflowRoute::UnitBitcoinToBaseEth,
         ..WorkflowOptions::default()
@@ -1876,27 +1840,25 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
                     &across_operation,
                 )
                 .await;
-                if !options.suppress_across_hint_signal {
-                    let signal_result = handle
-                        .signal(
-                            OrderWorkflow::provider_operation_hint,
-                            ProviderOperationHintSignal {
-                                order_id: order_id.into(),
-                                hint_id: Uuid::now_v7().into(),
-                                provider_operation_id: Some(across_operation.id.into()),
-                                provider: ProviderKind::Bridge,
-                                hint_kind: ProviderHintKind::AcrossFill,
-                                provider_ref: across_operation.provider_ref,
-                                evidence: None,
-                            },
-                            WorkflowSignalOptions::default(),
-                        )
-                        .await;
-                    assert_signal_sent_or_workflow_completed(
-                        signal_result,
-                        "send Across provider-operation hint signal",
-                    );
-                }
+                let signal_result = handle
+                    .signal(
+                        OrderWorkflow::provider_operation_hint,
+                        ProviderOperationHintSignal {
+                            order_id: order_id.into(),
+                            hint_id: Uuid::now_v7().into(),
+                            provider_operation_id: Some(across_operation.id.into()),
+                            provider: ProviderKind::Bridge,
+                            hint_kind: ProviderHintKind::AcrossFill,
+                            provider_ref: across_operation.provider_ref,
+                            evidence: None,
+                        },
+                        WorkflowSignalOptions::default(),
+                    )
+                    .await;
+                assert_signal_sent_or_workflow_completed(
+                    signal_result,
+                    "send Across provider-operation hint signal",
+                );
             }
             if matches!(
                 options.route,
@@ -1943,6 +1905,16 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
                     | WorkflowRoute::CctpBaseUsdcToBitcoin
                     | WorkflowRoute::HyperliquidArbitrumUsdcToBitcoin
             ) {
+                if matches!(options.route, WorkflowRoute::UnitBitcoinToBaseEth) {
+                    signal_order_unit_deposit_hint(
+                        &client,
+                        &db_for_workflow,
+                        &mocks,
+                        &workflow_id,
+                        order_id,
+                    )
+                    .await;
+                }
                 signal_order_unit_withdrawal_observation(
                     &client,
                     &db_for_workflow,
@@ -2754,6 +2726,63 @@ async fn signal_order_hyperliquid_bridge_deposit_observation(
         signal_result,
         "send HyperliquidBridgeDeposit provider-observation hint signal",
     );
+}
+
+async fn signal_order_unit_deposit_hint(
+    client: &Client,
+    db: &Database,
+    mocks: &MockIntegratorServer,
+    workflow_id: &str,
+    order_id: Uuid,
+) {
+    let handle_before_hint = client.get_workflow_handle::<OrderWorkflow>(workflow_id);
+    let unit_deposit_operation = tokio::select! {
+        operation = wait_for_provider_operation(
+            db,
+            order_id,
+            ProviderOperationType::UnitDeposit,
+            Duration::from_secs(180),
+        ) => operation,
+        result = handle_before_hint.get_result(WorkflowGetResultOptions::default()) => {
+            let state = workflow_state_summary(db, order_id).await;
+            panic!("OrderWorkflow ended before the UnitDeposit provider operation was persisted: {result:?}\n{state}");
+        }
+    };
+    let provider_ref = unit_deposit_operation
+        .provider_ref
+        .as_deref()
+        .expect("UnitDeposit operation should carry provider_ref");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    loop {
+        if matches!(
+            mocks.unit_operation_state(provider_ref).await.as_deref(),
+            Some("done")
+        ) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for UnitDeposit operation {provider_ref} to complete"
+        );
+        sleep(Duration::from_millis(250)).await;
+    }
+
+    let signal_result = handle_before_hint
+        .signal(
+            OrderWorkflow::provider_operation_hint,
+            ProviderOperationHintSignal {
+                order_id: order_id.into(),
+                hint_id: Uuid::now_v7().into(),
+                provider_operation_id: Some(unit_deposit_operation.id.into()),
+                provider: ProviderKind::Unit,
+                hint_kind: ProviderHintKind::UnitDeposit,
+                provider_ref: unit_deposit_operation.provider_ref,
+                evidence: None,
+            },
+            WorkflowSignalOptions::default(),
+        )
+        .await;
+    assert_signal_sent_or_workflow_completed(signal_result, "send UnitDeposit hint signal");
 }
 
 async fn signal_order_unit_withdrawal_observation(

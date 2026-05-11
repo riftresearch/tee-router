@@ -2936,13 +2936,13 @@
             "uid": "victoriametrics"
           },
           "editorMode": "code",
-          "expr": "tee_router_temporal_worker_step_external_wait_seconds{service=\"temporal-worker\", quantile=\"0.99\"}",
-          "legendFormat": "{{source}} {{step_type}}",
+          "expr": "avg by (step_type) (tee_router_temporal_worker_step_external_wait_seconds{service=\"temporal-worker\", quantile=\"0.99\"})",
+          "legendFormat": "{{step_type}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "External Wait p99 by Source",
+      "title": "External Wait p99",
       "type": "timeseries"
     },
     {

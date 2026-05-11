@@ -214,24 +214,3 @@ pub(super) fn quote_refresh_child_options(
         ..Default::default()
     }
 }
-
-pub(super) fn provider_hint_poll_child_options(
-    order_id: WorkflowOrderId,
-    step_id: WorkflowStepId,
-) -> ChildWorkflowOptions {
-    ChildWorkflowOptions {
-        workflow_id: provider_hint_poll_workflow_id(order_id, step_id),
-        cancel_type: ChildWorkflowCancellationType::Abandon,
-        parent_close_policy: ParentClosePolicy::Terminate,
-        run_timeout: Some(PROVIDER_HINT_WAIT_TIMEOUT + Duration::from_secs(60)),
-        task_timeout: Some(Duration::from_secs(30)),
-        ..Default::default()
-    }
-}
-
-pub(super) fn provider_hint_poll_workflow_id(
-    order_id: WorkflowOrderId,
-    step_id: WorkflowStepId,
-) -> String {
-    format!("order:{order_id}:provider-hint-poll:{step_id}")
-}

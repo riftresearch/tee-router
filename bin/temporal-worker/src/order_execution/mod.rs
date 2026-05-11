@@ -4,8 +4,7 @@ pub mod types;
 pub mod workflows;
 
 pub use router_temporal::{
-    order_workflow_id, provider_hint_poll_workflow_id, quote_refresh_workflow_id,
-    refund_workflow_id, DEFAULT_TASK_QUEUE,
+    order_workflow_id, quote_refresh_workflow_id, refund_workflow_id, DEFAULT_TASK_QUEUE,
 };
 use temporalio_client::WorkflowStartOptions;
 use temporalio_common::protos::temporal::api::enums::v1::{
@@ -21,7 +20,7 @@ use crate::runtime::{
 use activities::{
     OrderActivities, ProviderObservationActivities, QuoteRefreshActivities, RefundActivities,
 };
-use workflows::{OrderWorkflow, ProviderHintPollWorkflow, QuoteRefreshWorkflow, RefundWorkflow};
+use workflows::{OrderWorkflow, QuoteRefreshWorkflow, RefundWorkflow};
 
 pub async fn run_worker_with_activities(
     connection: &TemporalConnection,
@@ -59,7 +58,6 @@ pub async fn build_worker(
         .register_workflow::<OrderWorkflow>()
         .register_workflow::<RefundWorkflow>()
         .register_workflow::<QuoteRefreshWorkflow>()
-        .register_workflow::<ProviderHintPollWorkflow>()
         .register_activities(order_activities)
         .register_activities(refund_activities)
         .register_activities(quote_refresh_activities)

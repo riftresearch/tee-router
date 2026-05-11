@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use super::*;
 
 #[derive(Clone)]
@@ -943,7 +945,7 @@ pub(super) fn refund_transition_across_bridge_step(
             ),
         };
     Ok(refund_planned_step(RefundPlannedStepSpec {
-        order_id: order.id.into(),
+        order_id: order.id,
         transition_decl_id: Some(transition.id.clone()),
         step_index,
         step_type: OrderExecutionStepType::AcrossBridge,
@@ -1100,7 +1102,7 @@ fn refund_transition_cctp_burn_step(
     let (source_detail_role, source_detail_status) =
         refund_external_source_detail_parts(source_for_details);
     refund_planned_step(RefundPlannedStepSpec {
-        order_id: order.id.into(),
+        order_id: order.id,
         transition_decl_id: Some(burn_leg.transition_decl_id.clone()),
         step_index,
         step_type: OrderExecutionStepType::CctpBurn,
@@ -1151,7 +1153,7 @@ fn refund_transition_cctp_receive_step(
     planned_at: chrono::DateTime<Utc>,
 ) -> OrderExecutionStep {
     refund_planned_step(RefundPlannedStepSpec {
-        order_id: order.id.into(),
+        order_id: order.id,
         transition_decl_id: Some(receive_leg.transition_decl_id.clone()),
         step_index: step_index + 1,
         step_type: OrderExecutionStepType::CctpReceive,
@@ -1256,7 +1258,7 @@ pub(super) fn refund_transition_universal_router_swap_step(
         refund_external_source_detail_parts(&source_for_details);
 
     Ok(refund_planned_step(RefundPlannedStepSpec {
-        order_id: order.id.into(),
+        order_id: order.id,
         transition_decl_id: Some(transition.id.clone()),
         step_index,
         step_type: OrderExecutionStepType::UniversalRouterSwap,
@@ -1340,7 +1342,7 @@ pub(super) fn refund_transition_unit_deposit_step(
     };
 
     Ok(refund_planned_step(RefundPlannedStepSpec {
-        order_id: order.id.into(),
+        order_id: order.id,
         transition_decl_id: Some(transition.id.clone()),
         step_index,
         step_type: OrderExecutionStepType::UnitDeposit,
@@ -1409,7 +1411,7 @@ pub(super) fn refund_transition_hyperliquid_bridge_deposit_step(
     };
 
     Ok(refund_planned_step(RefundPlannedStepSpec {
-        order_id: order.id.into(),
+        order_id: order.id,
         transition_decl_id: Some(transition.id.clone()),
         step_index,
         step_type: OrderExecutionStepType::HyperliquidBridgeDeposit,
@@ -1462,7 +1464,7 @@ pub(super) fn refund_transition_hyperliquid_bridge_withdrawal_step(
     let transfer_from_spot = hyperliquid_binding_transfers_from_spot(custody);
 
     Ok(refund_planned_step(RefundPlannedStepSpec {
-        order_id: order.id.into(),
+        order_id: order.id,
         transition_decl_id: Some(transition.id.clone()),
         step_index,
         step_type: OrderExecutionStepType::HyperliquidBridgeWithdrawal,
@@ -1720,7 +1722,7 @@ pub(super) fn refund_transition_hyperliquid_trade_step(
         hyperliquid_binding_request_parts(custody);
 
     Ok(refund_planned_step(RefundPlannedStepSpec {
-        order_id: order.id.into(),
+        order_id: order.id,
         transition_decl_id: Some(transition.id.clone()),
         step_index,
         step_type: OrderExecutionStepType::HyperliquidTrade,
@@ -1783,7 +1785,7 @@ pub(super) fn refund_transition_unit_withdrawal_step(
         hyperliquid_binding_request_parts(custody);
 
     Ok(refund_planned_step(RefundPlannedStepSpec {
-        order_id: order.id.into(),
+        order_id: order.id,
         transition_decl_id: Some(transition.id.clone()),
         step_index,
         step_type: OrderExecutionStepType::UnitWithdrawal,
@@ -1896,7 +1898,7 @@ pub(super) fn refund_execution_leg_from_quote_legs(
 
     Ok(OrderExecutionLeg {
         id: Uuid::now_v7(),
-        order_id: order.id.into(),
+        order_id: order.id,
         execution_attempt_id: None,
         transition_decl_id: Some(transition.id.clone()),
         leg_index,

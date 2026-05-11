@@ -155,11 +155,10 @@ pub fn record_step_dispatch_latency(step_type: &str, duration: Duration) {
     .record(duration.as_secs_f64());
 }
 
-pub fn record_step_external_wait(step_type: &str, source: &str, duration: Duration) {
+pub fn record_step_external_wait(step_type: &str, duration: Duration) {
     histogram!(
         "tee_router_temporal_worker_step_external_wait_seconds",
         "step_type" => step_type.to_string(),
-        "source" => source.to_string(),
     )
     .record(duration.as_secs_f64());
 }
