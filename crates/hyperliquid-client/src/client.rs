@@ -26,8 +26,8 @@ use crate::{
     error::Error,
     http::HttpClient,
     info::{
-        ClearinghouseState, L2BookSnapshot, OpenOrder, OrderStatusResponse, SpotClearinghouseState,
-        UserFill,
+        ClearinghouseState, L2BookSnapshot, OpenOrder, OrderStatusResponse, PerpMeta,
+        SpotClearinghouseState, UserFill, UserFunding, UserNonFundingLedgerUpdate, UserRateLimit,
     },
     meta::SpotMeta,
     signature::{sign_l1_action, sign_typed_data},
@@ -101,6 +101,12 @@ impl HyperliquidInfoClient {
     /// that want the metadata snapshot but keep their own caching strategy.
     pub async fn fetch_spot_meta(&self) -> Result<SpotMeta, Error> {
         let req = serde_json::json!({ "type": "spotMeta" });
+        self.http.post_json("/info", &req).await
+    }
+
+    /// Fetch perp market metadata (`/info { type: "meta" }`).
+    pub async fn fetch_perp_meta(&self) -> Result<PerpMeta, Error> {
+        let req = serde_json::json!({ "type": "meta" });
         self.http.post_json("/info", &req).await
     }
 
@@ -200,6 +206,71 @@ impl HyperliquidInfoClient {
     pub async fn user_fills(&self, user: Address) -> Result<Vec<UserFill>, Error> {
         let req = serde_json::json!({
             "type": "userFills",
+            "user": format!("{user:?}"),
+        });
+        self.http.post_json("/info", &req).await
+    }
+
+    /// Fetch paginated historical fills filtered by millisecond timestamp.
+    pub async fn user_fills_by_time(
+        &self,
+        user: Address,
+        start_time: u64,
+        end_time: Option<u64>,
+        aggregate_by_time: bool,
+    ) -> Result<Vec<UserFill>, Error> {
+        let mut req = serde_json::json!({
+            "type": "userFillsByTime",
+            "user": format!("{user:?}"),
+            "startTime": start_time,
+            "aggregateByTime": aggregate_by_time,
+        });
+        if let (Some(end_time), Some(map)) = (end_time, req.as_object_mut()) {
+            map.insert("endTime".to_string(), serde_json::json!(end_time));
+        }
+        self.http.post_json("/info", &req).await
+    }
+
+    /// Fetch non-funding ledger deltas filtered by millisecond timestamp.
+    pub async fn user_non_funding_ledger_updates(
+        &self,
+        user: Address,
+        start_time: u64,
+        end_time: Option<u64>,
+    ) -> Result<Vec<UserNonFundingLedgerUpdate>, Error> {
+        let mut req = serde_json::json!({
+            "type": "userNonFundingLedgerUpdates",
+            "user": format!("{user:?}"),
+            "startTime": start_time,
+        });
+        if let (Some(end_time), Some(map)) = (end_time, req.as_object_mut()) {
+            map.insert("endTime".to_string(), serde_json::json!(end_time));
+        }
+        self.http.post_json("/info", &req).await
+    }
+
+    /// Fetch funding payments filtered by millisecond timestamp.
+    pub async fn user_funding(
+        &self,
+        user: Address,
+        start_time: u64,
+        end_time: Option<u64>,
+    ) -> Result<Vec<UserFunding>, Error> {
+        let mut req = serde_json::json!({
+            "type": "userFunding",
+            "user": format!("{user:?}"),
+            "startTime": start_time,
+        });
+        if let (Some(end_time), Some(map)) = (end_time, req.as_object_mut()) {
+            map.insert("endTime".to_string(), serde_json::json!(end_time));
+        }
+        self.http.post_json("/info", &req).await
+    }
+
+    /// Fetch the user's current Hyperliquid API rate-limit counters.
+    pub async fn user_rate_limit(&self, user: Address) -> Result<UserRateLimit, Error> {
+        let req = serde_json::json!({
+            "type": "userRateLimit",
             "user": format!("{user:?}"),
         });
         self.http.post_json("/info", &req).await
@@ -599,6 +670,10 @@ impl HyperliquidClient {
         self.info.fetch_spot_meta().await
     }
 
+    pub async fn fetch_perp_meta(&self) -> Result<PerpMeta, Error> {
+        self.info.fetch_perp_meta().await
+    }
+
     pub async fn refresh_spot_meta(&mut self) -> Result<SpotMeta, Error> {
         self.info.refresh_spot_meta().await
     }
@@ -617,6 +692,42 @@ impl HyperliquidClient {
         oid: u64,
     ) -> Result<OrderStatusResponse, Error> {
         self.info.order_status(user, oid).await
+    }
+
+    pub async fn user_fills_by_time(
+        &self,
+        user: Address,
+        start_time: u64,
+        end_time: Option<u64>,
+        aggregate_by_time: bool,
+    ) -> Result<Vec<UserFill>, Error> {
+        self.info
+            .user_fills_by_time(user, start_time, end_time, aggregate_by_time)
+            .await
+    }
+
+    pub async fn user_non_funding_ledger_updates(
+        &self,
+        user: Address,
+        start_time: u64,
+        end_time: Option<u64>,
+    ) -> Result<Vec<UserNonFundingLedgerUpdate>, Error> {
+        self.info
+            .user_non_funding_ledger_updates(user, start_time, end_time)
+            .await
+    }
+
+    pub async fn user_funding(
+        &self,
+        user: Address,
+        start_time: u64,
+        end_time: Option<u64>,
+    ) -> Result<Vec<UserFunding>, Error> {
+        self.info.user_funding(user, start_time, end_time).await
+    }
+
+    pub async fn user_rate_limit(&self, user: Address) -> Result<UserRateLimit, Error> {
+        self.info.user_rate_limit(user).await
     }
 
     pub async fn spot_clearinghouse_state(
