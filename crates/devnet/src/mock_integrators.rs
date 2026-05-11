@@ -18,9 +18,10 @@ use axum::{
 use bitcoincore_rpc_async::{Auth as BitcoinRpcAuth, Client as BitcoinRpcClient, RpcApi};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use hyperliquid_client::{
-    recover_l1_signer, recover_typed_signer, spot_wire_asset_index, Actions, SendAsset,
-    SpotAssetMeta, SpotMeta, SpotSend, TokenInfo, UsdClassTransfer, Withdraw3,
-    MINIMUM_BRIDGE_DEPOSIT_USDC, SPOT_ASSET_INDEX_OFFSET,
+    recover_l1_signer, recover_typed_signer, spot_wire_asset_index, Actions, PerpAssetMeta,
+    PerpMeta, SendAsset, SpotAssetMeta, SpotMeta, SpotSend, TokenInfo, UsdClassTransfer, UserFill,
+    UserFunding, UserNonFundingLedgerUpdate, UserRateLimit, Withdraw3, MINIMUM_BRIDGE_DEPOSIT_USDC,
+    SPOT_ASSET_INDEX_OFFSET,
 };
 use hyperunit_client::{
     UnitAsset, UnitChain, UnitGenerateAddressResponse, UnitOperation, UnitOperationsResponse,
@@ -721,6 +722,13 @@ struct HyperliquidMockState {
     terminal_orders: BTreeMap<u64, TerminalOrder>,
     /// `user -> fills`, newest first (real API ordering).
     fills: BTreeMap<Address, Vec<HyperliquidFillRecord>>,
+    /// `user -> externally seeded fills`, used by backfill endpoints that
+    /// tests need to control independently of the synthetic exchange engine.
+    recorded_fills: BTreeMap<Address, Vec<UserFill>>,
+    /// `user -> non-funding ledger updates`, newest first.
+    ledger_updates: BTreeMap<Address, Vec<UserNonFundingLedgerUpdate>>,
+    /// `user -> funding payments`, newest first.
+    fundings: BTreeMap<Address, Vec<UserFunding>>,
     /// Currently resting open orders, keyed by oid.
     open_orders: BTreeMap<u64, HyperliquidSubmittedOrder>,
     /// Per-user dead-man switch deadline, in unix milliseconds. Once the
@@ -730,6 +738,8 @@ struct HyperliquidMockState {
     /// Spot meta served from `/info { type: "spotMeta" }` and also used to
     /// resolve asset ids → pair names for rate lookup.
     spot_meta: Option<SpotMeta>,
+    /// Perp meta served from `/info { type: "meta" }`.
+    perp_meta: PerpMeta,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1141,6 +1151,35 @@ impl MockIntegratorServer {
             .lock()
             .await
             .clearinghouse_total(user, coin)
+    }
+
+    /// Seed a historical Hyperliquid fill for `/info { type:
+    /// "userFillsByTime" }` and `/info { type: "userFills" }` shape tests.
+    pub async fn record_hyperliquid_fill(&self, user: Address, fill: UserFill) {
+        self.state.hyperliquid.lock().await.record_fill(user, fill);
+    }
+
+    /// Seed a non-funding ledger update for `/info { type:
+    /// "userNonFundingLedgerUpdates" }`.
+    pub async fn record_hyperliquid_ledger_update(
+        &self,
+        user: Address,
+        update: UserNonFundingLedgerUpdate,
+    ) {
+        self.state
+            .hyperliquid
+            .lock()
+            .await
+            .record_ledger_update(user, update);
+    }
+
+    /// Seed a funding payment for `/info { type: "userFunding" }`.
+    pub async fn record_hyperliquid_funding(&self, user: Address, funding: UserFunding) {
+        self.state
+            .hyperliquid
+            .lock()
+            .await
+            .record_funding(user, funding);
     }
 
     /// Install (or overwrite) the exchange rate for a spot pair. `rate` is the
@@ -4098,6 +4137,29 @@ fn addresses_match(left: &str, right: &str) -> bool {
     }
 }
 
+fn required_hyperliquid_user(request: &Value, endpoint: &str) -> Result<Address, String> {
+    request
+        .get("user")
+        .and_then(Value::as_str)
+        .and_then(parse_user_address)
+        .ok_or_else(|| format!("{endpoint} requires a 0x-prefixed `user` field"))
+}
+
+fn required_hyperliquid_u64(request: &Value, endpoint: &str, field: &str) -> Result<u64, String> {
+    request
+        .get(field)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("{endpoint} requires a numeric `{field}` field"))
+}
+
+fn hyperliquid_info_validation_error(message: String) -> axum::response::Response {
+    error_response(StatusCode::UNPROCESSABLE_ENTITY, message)
+}
+
+fn optional_hyperliquid_u64(request: &Value, field: &str) -> Option<u64> {
+    request.get(field).and_then(Value::as_u64)
+}
+
 /// Mocks Hyperliquid's `POST /info` read-only endpoint. Dispatches on the
 /// `type` discriminator — every supported response is round-trippable into
 /// the matching `hyperliquid_client` type so clients exercising this mock
@@ -4119,6 +4181,7 @@ async fn mock_hyperliquid_info(
             Ok(value) => Json(value).into_response(),
             Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, error),
         },
+        "meta" => Json(hl.perp_meta()).into_response(),
         "l2Book" => {
             let Some(coin) = request.get("coin").and_then(Value::as_str) else {
                 return error_response(
@@ -4187,17 +4250,63 @@ async fn mock_hyperliquid_info(
             Json(hl.open_orders_for(user)).into_response()
         }
         "userFills" => {
-            let Some(user) = request
-                .get("user")
-                .and_then(Value::as_str)
-                .and_then(parse_user_address)
-            else {
-                return error_response(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "userFills requires a 0x-prefixed `user` field",
-                );
+            let user = match required_hyperliquid_user(&request, "userFills") {
+                Ok(user) => user,
+                Err(message) => return hyperliquid_info_validation_error(message),
             };
             Json(hl.fills_for(user)).into_response()
+        }
+        "userFillsByTime" => {
+            let user = match required_hyperliquid_user(&request, "userFillsByTime") {
+                Ok(user) => user,
+                Err(message) => return hyperliquid_info_validation_error(message),
+            };
+            let start_time =
+                match required_hyperliquid_u64(&request, "userFillsByTime", "startTime") {
+                    Ok(start_time) => start_time,
+                    Err(message) => return hyperliquid_info_validation_error(message),
+                };
+            let end_time = optional_hyperliquid_u64(&request, "endTime");
+            let aggregate_by_time = request
+                .get("aggregateByTime")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            Json(hl.fills_by_time(user, start_time, end_time, aggregate_by_time)).into_response()
+        }
+        "userNonFundingLedgerUpdates" => {
+            let user = match required_hyperliquid_user(&request, "userNonFundingLedgerUpdates") {
+                Ok(user) => user,
+                Err(message) => return hyperliquid_info_validation_error(message),
+            };
+            let start_time = match required_hyperliquid_u64(
+                &request,
+                "userNonFundingLedgerUpdates",
+                "startTime",
+            ) {
+                Ok(start_time) => start_time,
+                Err(message) => return hyperliquid_info_validation_error(message),
+            };
+            let end_time = optional_hyperliquid_u64(&request, "endTime");
+            Json(hl.ledger_updates_by_time(user, start_time, end_time)).into_response()
+        }
+        "userFunding" => {
+            let user = match required_hyperliquid_user(&request, "userFunding") {
+                Ok(user) => user,
+                Err(message) => return hyperliquid_info_validation_error(message),
+            };
+            let start_time = match required_hyperliquid_u64(&request, "userFunding", "startTime") {
+                Ok(start_time) => start_time,
+                Err(message) => return hyperliquid_info_validation_error(message),
+            };
+            let end_time = optional_hyperliquid_u64(&request, "endTime");
+            Json(hl.fundings_by_time(user, start_time, end_time)).into_response()
+        }
+        "userRateLimit" => {
+            let user = match required_hyperliquid_user(&request, "userRateLimit") {
+                Ok(user) => user,
+                Err(message) => return hyperliquid_info_validation_error(message),
+            };
+            Json(hl.user_rate_limit(user)).into_response()
         }
         other => error_response(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -4856,9 +4965,13 @@ fn hyperliquid_execution_px(is_buy: bool, limit_px: f64, rate: f64) -> f64 {
     }
 }
 const HYPERLIQUID_BRIDGE_WITHDRAW_FEE_RAW: u64 = 1_000_000;
+const HYPERLIQUID_INFO_RESULT_LIMIT: usize = 2_000;
 
 fn parse_user_address(value: &str) -> Option<Address> {
-    Address::from_str(value).ok()
+    value
+        .starts_with("0x")
+        .then(|| Address::from_str(value).ok())
+        .flatten()
 }
 
 fn parse_usd_class_transfer_amount(value: &str) -> Result<(f64, Option<Address>), String> {
@@ -5471,6 +5584,31 @@ fn default_hyperliquid_spot_meta() -> SpotMeta {
     }
 }
 
+fn default_hyperliquid_perp_meta() -> PerpMeta {
+    PerpMeta {
+        universe: vec![
+            PerpAssetMeta {
+                name: "BTC".to_string(),
+                sz_decimals: 5,
+                max_leverage: 50,
+                only_isolated: None,
+            },
+            PerpAssetMeta {
+                name: "ETH".to_string(),
+                sz_decimals: 4,
+                max_leverage: 50,
+                only_isolated: None,
+            },
+            PerpAssetMeta {
+                name: "HYPE".to_string(),
+                sz_decimals: 2,
+                max_leverage: 3,
+                only_isolated: None,
+            },
+        ],
+    }
+}
+
 struct AssetResolution {
     pair_name: String,
     base_symbol: String,
@@ -5493,6 +5631,7 @@ impl HyperliquidMockState {
             next_oid: 1000,
             next_tid: 1,
             spot_meta: Some(default_hyperliquid_spot_meta()),
+            perp_meta: default_hyperliquid_perp_meta(),
             ..Default::default()
         };
         state.set_rate("UBTC", "USDC", DEFAULT_UBTC_USDC_RATE);
@@ -5506,6 +5645,28 @@ impl HyperliquidMockState {
         };
         serde_json::to_value(spot_meta)
             .map_err(|error| format!("mock Hyperliquid spot meta failed to serialize: {error}"))
+    }
+
+    fn perp_meta(&self) -> PerpMeta {
+        self.perp_meta.clone()
+    }
+
+    fn record_fill(&mut self, user: Address, fill: UserFill) {
+        let fills = self.recorded_fills.entry(user).or_default();
+        fills.push(fill);
+        fills.sort_by(|left, right| right.time.cmp(&left.time));
+    }
+
+    fn record_ledger_update(&mut self, user: Address, update: UserNonFundingLedgerUpdate) {
+        let updates = self.ledger_updates.entry(user).or_default();
+        updates.push(update);
+        updates.sort_by(|left, right| right.time.cmp(&left.time));
+    }
+
+    fn record_funding(&mut self, user: Address, funding: UserFunding) {
+        let fundings = self.fundings.entry(user).or_default();
+        fundings.push(funding);
+        fundings.sort_by(|left, right| right.time.cmp(&left.time));
     }
 
     fn allocate_oid(&mut self) -> u64 {
@@ -5853,30 +6014,94 @@ impl HyperliquidMockState {
         )
     }
 
-    fn fills_for(&self, user: Address) -> Value {
-        let rows = self.fills.get(&user).cloned().unwrap_or_default();
-        Value::Array(
-            rows.into_iter()
-                .map(|fill| {
-                    json!({
-                        "coin": fill.coin,
-                        "px": format_hl_amount(fill.px),
-                        "sz": format_hl_amount(fill.sz),
-                        "side": if fill.is_buy { "B" } else { "A" },
-                        "time": fill.time,
-                        "startPosition": "0",
-                        "dir": if fill.is_buy { "Buy" } else { "Sell" },
-                        "closedPnl": "0",
-                        "hash": format!("0x{}", "ab".repeat(32)),
-                        "oid": fill.oid,
-                        "crossed": true,
-                        "fee": format_hl_amount(fill.fee),
-                        "tid": fill.tid,
-                        "feeToken": fill.fee_token,
-                    })
-                })
-                .collect(),
-        )
+    fn fills_for(&self, user: Address) -> Vec<UserFill> {
+        let mut rows = self.generated_fills_for(user);
+        rows.extend(self.recorded_fills.get(&user).cloned().unwrap_or_default());
+        rows.sort_by(|left, right| right.time.cmp(&left.time));
+        rows.truncate(HYPERLIQUID_INFO_RESULT_LIMIT);
+        rows
+    }
+
+    fn fills_by_time(
+        &self,
+        user: Address,
+        start_time: u64,
+        end_time: Option<u64>,
+        _aggregate_by_time: bool,
+    ) -> Vec<UserFill> {
+        let mut rows = self.fills_for(user);
+        rows.retain(|fill| fill.time >= start_time && end_time.is_none_or(|end| fill.time <= end));
+        rows.sort_by(|left, right| left.time.cmp(&right.time));
+        rows.truncate(HYPERLIQUID_INFO_RESULT_LIMIT);
+        rows
+    }
+
+    fn ledger_updates_by_time(
+        &self,
+        user: Address,
+        start_time: u64,
+        end_time: Option<u64>,
+    ) -> Vec<UserNonFundingLedgerUpdate> {
+        let mut rows = self.ledger_updates.get(&user).cloned().unwrap_or_default();
+        rows.retain(|update| {
+            update.time >= start_time && end_time.is_none_or(|end| update.time <= end)
+        });
+        rows.sort_by(|left, right| left.time.cmp(&right.time));
+        rows.truncate(HYPERLIQUID_INFO_RESULT_LIMIT);
+        rows
+    }
+
+    fn fundings_by_time(
+        &self,
+        user: Address,
+        start_time: u64,
+        end_time: Option<u64>,
+    ) -> Vec<UserFunding> {
+        let mut rows = self.fundings.get(&user).cloned().unwrap_or_default();
+        rows.retain(|funding| {
+            funding.time >= start_time && end_time.is_none_or(|end| funding.time <= end)
+        });
+        rows.sort_by(|left, right| left.time.cmp(&right.time));
+        rows.truncate(HYPERLIQUID_INFO_RESULT_LIMIT);
+        rows
+    }
+
+    fn user_rate_limit(&self, _user: Address) -> UserRateLimit {
+        UserRateLimit {
+            cum_vlm: "0".to_string(),
+            n_requests_used: 0,
+            n_requests_cap: 1200,
+            n_requests_surplus: 1200,
+        }
+    }
+
+    fn generated_fills_for(&self, user: Address) -> Vec<UserFill> {
+        self.fills
+            .get(&user)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(Self::fill_record_to_user_fill)
+            .collect()
+    }
+
+    fn fill_record_to_user_fill(fill: HyperliquidFillRecord) -> UserFill {
+        UserFill {
+            coin: fill.coin,
+            px: format_hl_amount(fill.px),
+            sz: format_hl_amount(fill.sz),
+            side: if fill.is_buy { "B" } else { "A" }.to_string(),
+            time: fill.time,
+            start_position: "0".to_string(),
+            dir: if fill.is_buy { "Buy" } else { "Sell" }.to_string(),
+            closed_pnl: "0".to_string(),
+            hash: format!("0x{}", "ab".repeat(32)),
+            oid: fill.oid,
+            crossed: true,
+            fee: format_hl_amount(fill.fee),
+            tid: fill.tid,
+            fee_token: fill.fee_token,
+        }
     }
 
     fn fill_crossed_resting_orders(&mut self, base: &str, quote: &str, rate: f64) {
@@ -8239,6 +8464,47 @@ mod tests {
     /// types. This guards the "speak the real API shape byte-for-byte"
     /// invariant: production code paths expecting HL's wire format will also
     /// work against the mock.
+    fn hyperliquid_shape_test_user() -> Address {
+        "0x1111111111111111111111111111111111111111"
+            .parse()
+            .expect("static address parses")
+    }
+
+    fn sample_hyperliquid_user_fill(time: u64, tid: u64) -> UserFill {
+        UserFill {
+            coin: "UBTC/USDC".to_string(),
+            px: "60000".to_string(),
+            sz: "0.001".to_string(),
+            side: "B".to_string(),
+            time,
+            start_position: "0".to_string(),
+            dir: "Buy".to_string(),
+            closed_pnl: "0".to_string(),
+            hash: format!("0x{}", "ab".repeat(32)),
+            oid: 42,
+            crossed: true,
+            fee: "0.00001".to_string(),
+            tid,
+            fee_token: "UBTC".to_string(),
+        }
+    }
+
+    async fn assert_hyperliquid_info_error(
+        server: &MockIntegratorServer,
+        request: Value,
+        expected_error: &str,
+    ) {
+        let response = reqwest::Client::new()
+            .post(format!("{}/info", server.base_url()))
+            .json(&request)
+            .send()
+            .await
+            .expect("http");
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body: MockIntegratorErrorResponse = response.json().await.expect("error body");
+        assert_eq!(body.error, expected_error);
+    }
+
     #[tokio::test]
     async fn hyperliquid_info_spot_meta_matches_real_shape() {
         use hyperliquid_client::meta::SpotMeta;
@@ -8259,6 +8525,325 @@ mod tests {
             .expect("mock spotMeta should produce valid wire asset ids");
         assert_eq!(map.get("UBTC/USDC"), Some(&10_140));
         assert_eq!(map.get("@140"), Some(&10_140));
+    }
+
+    #[tokio::test]
+    async fn hyperliquid_info_meta_matches_real_shape() {
+        use hyperliquid_client::info::PerpMeta;
+
+        let server = MockIntegratorServer::spawn().await.expect("spawn");
+        let raw: Value = reqwest::Client::new()
+            .post(format!("{}/info", server.base_url()))
+            .json(&json!({ "type": "meta" }))
+            .send()
+            .await
+            .expect("http")
+            .json()
+            .await
+            .expect("json");
+        assert!(raw["universe"].is_array());
+        assert!(raw["universe"][0]["szDecimals"].is_number());
+        assert!(raw["universe"][0]["maxLeverage"].is_number());
+
+        let body: PerpMeta = serde_json::from_value(raw).expect("deserialize PerpMeta");
+        assert!(body.universe.iter().any(|asset| asset.name == "BTC"));
+        assert!(body.universe.iter().any(|asset| asset.name == "ETH"));
+        assert!(body.universe.iter().any(|asset| asset.name == "HYPE"));
+    }
+
+    #[tokio::test]
+    async fn hyperliquid_info_user_fills_by_time_matches_real_shape() {
+        use hyperliquid_client::info::UserFill;
+
+        let server = MockIntegratorServer::spawn().await.expect("spawn");
+        let user = hyperliquid_shape_test_user();
+        server
+            .record_hyperliquid_fill(user, sample_hyperliquid_user_fill(1_700_000_000_000, 1))
+            .await;
+        server
+            .record_hyperliquid_fill(user, sample_hyperliquid_user_fill(1_700_000_010_000, 2))
+            .await;
+        server
+            .record_hyperliquid_fill(user, sample_hyperliquid_user_fill(1_700_000_020_000, 3))
+            .await;
+
+        let raw: Value = reqwest::Client::new()
+            .post(format!("{}/info", server.base_url()))
+            .json(&json!({
+                "type": "userFillsByTime",
+                "user": format!("{user:#x}"),
+                "startTime": 1_700_000_005_000_u64,
+                "endTime": 1_700_000_020_000_u64,
+                "aggregateByTime": false
+            }))
+            .send()
+            .await
+            .expect("http")
+            .json()
+            .await
+            .expect("json");
+        assert_eq!(raw.as_array().expect("array").len(), 2);
+        assert!(raw[0]["startPosition"].is_string());
+        assert!(raw[0]["closedPnl"].is_string());
+        assert!(raw[0]["feeToken"].is_string());
+        assert!(raw[0]["time"].is_number());
+        assert!(raw[0]["px"].is_string());
+
+        let body: Vec<UserFill> = serde_json::from_value(raw).expect("deserialize UserFill");
+        assert_eq!(
+            body.iter().map(|fill| fill.tid).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+    }
+
+    #[tokio::test]
+    async fn hyperliquid_info_user_fills_by_time_rejects_missing_start_time_and_bad_user() {
+        let server = MockIntegratorServer::spawn().await.expect("spawn");
+        assert_hyperliquid_info_error(
+            &server,
+            json!({
+                "type": "userFillsByTime",
+                "user": "0x1111111111111111111111111111111111111111"
+            }),
+            "userFillsByTime requires a numeric `startTime` field",
+        )
+        .await;
+        assert_hyperliquid_info_error(
+            &server,
+            json!({
+                "type": "userFillsByTime",
+                "user": "1111111111111111111111111111111111111111",
+                "startTime": 1_u64
+            }),
+            "userFillsByTime requires a 0x-prefixed `user` field",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn hyperliquid_info_user_non_funding_ledger_updates_matches_real_shape() {
+        use hyperliquid_client::info::{UserNonFundingLedgerDelta, UserNonFundingLedgerUpdate};
+
+        let server = MockIntegratorServer::spawn().await.expect("spawn");
+        let user = hyperliquid_shape_test_user();
+        let hash = format!("0x{}", "cd".repeat(32));
+        for (time, delta) in [
+            (
+                1_700_000_000_000,
+                UserNonFundingLedgerDelta::Deposit {
+                    usdc: "10.5".to_string(),
+                },
+            ),
+            (
+                1_700_000_001_000,
+                UserNonFundingLedgerDelta::Withdraw {
+                    usdc: "1.5".to_string(),
+                    nonce: 7,
+                    fee: "1".to_string(),
+                },
+            ),
+            (
+                1_700_000_002_000,
+                UserNonFundingLedgerDelta::InternalTransfer {
+                    usdc: "2".to_string(),
+                    user: format!("{user:#x}"),
+                    destination: "0x2222222222222222222222222222222222222222".to_string(),
+                    fee: "0".to_string(),
+                },
+            ),
+            (
+                1_700_000_003_000,
+                UserNonFundingLedgerDelta::AccountClassTransfer {
+                    usdc: "3".to_string(),
+                    to_perp: false,
+                },
+            ),
+            (
+                1_700_000_004_000,
+                UserNonFundingLedgerDelta::SpotTransfer {
+                    token: "UBTC:0x11111111111111111111111111111111".to_string(),
+                    amount: "0.001".to_string(),
+                    usdc_value: "60".to_string(),
+                    user: format!("{user:#x}"),
+                    destination: "0x2222222222222222222222222222222222222222".to_string(),
+                    fee: "0".to_string(),
+                    native_token_fee: "0.00001".to_string(),
+                    nonce: 8,
+                },
+            ),
+        ] {
+            server
+                .record_hyperliquid_ledger_update(
+                    user,
+                    UserNonFundingLedgerUpdate {
+                        time,
+                        hash: hash.clone(),
+                        delta,
+                    },
+                )
+                .await;
+        }
+
+        let raw: Value = reqwest::Client::new()
+            .post(format!("{}/info", server.base_url()))
+            .json(&json!({
+                "type": "userNonFundingLedgerUpdates",
+                "user": format!("{user:#x}"),
+                "startTime": 1_700_000_001_000_u64,
+                "endTime": 1_700_000_004_000_u64
+            }))
+            .send()
+            .await
+            .expect("http")
+            .json()
+            .await
+            .expect("json");
+        assert_eq!(raw.as_array().expect("array").len(), 4);
+        assert_eq!(raw[0]["delta"]["type"], "withdraw");
+        assert!(raw[2]["delta"]["toPerp"].is_boolean());
+        assert!(raw[3]["delta"]["usdcValue"].is_string());
+        assert!(raw[3]["delta"]["nativeTokenFee"].is_string());
+
+        let body: Vec<UserNonFundingLedgerUpdate> =
+            serde_json::from_value(raw).expect("deserialize ledger updates");
+        assert_eq!(body.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn hyperliquid_info_user_non_funding_ledger_updates_rejects_missing_start_time_and_bad_user(
+    ) {
+        let server = MockIntegratorServer::spawn().await.expect("spawn");
+        assert_hyperliquid_info_error(
+            &server,
+            json!({
+                "type": "userNonFundingLedgerUpdates",
+                "user": "0x1111111111111111111111111111111111111111"
+            }),
+            "userNonFundingLedgerUpdates requires a numeric `startTime` field",
+        )
+        .await;
+        assert_hyperliquid_info_error(
+            &server,
+            json!({
+                "type": "userNonFundingLedgerUpdates",
+                "user": "1111111111111111111111111111111111111111",
+                "startTime": 1_u64
+            }),
+            "userNonFundingLedgerUpdates requires a 0x-prefixed `user` field",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn hyperliquid_info_user_funding_matches_real_shape() {
+        use hyperliquid_client::info::UserFunding;
+
+        let server = MockIntegratorServer::spawn().await.expect("spawn");
+        let user = hyperliquid_shape_test_user();
+        server
+            .record_hyperliquid_funding(
+                user,
+                UserFunding {
+                    time: 1_700_000_000_000,
+                    coin: "ETH".to_string(),
+                    usdc: "-0.0123".to_string(),
+                    szi: "1.25".to_string(),
+                    funding_rate: "0.0000125".to_string(),
+                },
+            )
+            .await;
+
+        let raw: Value = reqwest::Client::new()
+            .post(format!("{}/info", server.base_url()))
+            .json(&json!({
+                "type": "userFunding",
+                "user": format!("{user:#x}"),
+                "startTime": 1_699_999_999_999_u64
+            }))
+            .send()
+            .await
+            .expect("http")
+            .json()
+            .await
+            .expect("json");
+        assert!(raw[0]["fundingRate"].is_string());
+        assert!(raw[0]["usdc"].is_string());
+        assert!(raw[0]["szi"].is_string());
+        assert!(raw[0]["time"].is_number());
+
+        let body: Vec<UserFunding> = serde_json::from_value(raw).expect("deserialize funding");
+        assert_eq!(body[0].usdc, "-0.0123");
+    }
+
+    #[tokio::test]
+    async fn hyperliquid_info_user_funding_rejects_missing_start_time_and_bad_user() {
+        let server = MockIntegratorServer::spawn().await.expect("spawn");
+        assert_hyperliquid_info_error(
+            &server,
+            json!({
+                "type": "userFunding",
+                "user": "0x1111111111111111111111111111111111111111"
+            }),
+            "userFunding requires a numeric `startTime` field",
+        )
+        .await;
+        assert_hyperliquid_info_error(
+            &server,
+            json!({
+                "type": "userFunding",
+                "user": "1111111111111111111111111111111111111111",
+                "startTime": 1_u64
+            }),
+            "userFunding requires a 0x-prefixed `user` field",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn hyperliquid_info_user_rate_limit_matches_real_shape() {
+        use hyperliquid_client::info::UserRateLimit;
+
+        let server = MockIntegratorServer::spawn().await.expect("spawn");
+        let user = hyperliquid_shape_test_user();
+        let raw: Value = reqwest::Client::new()
+            .post(format!("{}/info", server.base_url()))
+            .json(&json!({
+                "type": "userRateLimit",
+                "user": format!("{user:#x}")
+            }))
+            .send()
+            .await
+            .expect("http")
+            .json()
+            .await
+            .expect("json");
+        assert!(raw["cumVlm"].is_string());
+        assert!(raw["nRequestsUsed"].is_number());
+        assert!(raw["nRequestsCap"].is_number());
+        assert!(raw["nRequestsSurplus"].is_number());
+
+        let body: UserRateLimit = serde_json::from_value(raw).expect("deserialize rate limit");
+        assert_eq!(body.n_requests_cap, 1200);
+    }
+
+    #[tokio::test]
+    async fn hyperliquid_info_user_rate_limit_rejects_bad_user() {
+        let server = MockIntegratorServer::spawn().await.expect("spawn");
+        assert_hyperliquid_info_error(
+            &server,
+            json!({ "type": "userRateLimit" }),
+            "userRateLimit requires a 0x-prefixed `user` field",
+        )
+        .await;
+        assert_hyperliquid_info_error(
+            &server,
+            json!({
+                "type": "userRateLimit",
+                "user": "1111111111111111111111111111111111111111"
+            }),
+            "userRateLimit requires a 0x-prefixed `user` field",
+        )
+        .await;
     }
 
     #[tokio::test]

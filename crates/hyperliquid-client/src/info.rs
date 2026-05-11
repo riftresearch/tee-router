@@ -201,3 +201,85 @@ pub struct UserFill {
     #[serde(default)]
     pub fee_token: String,
 }
+
+/// Response to `/info { type: "userNonFundingLedgerUpdates", user,
+/// startTime, endTime? }`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct UserNonFundingLedgerUpdate {
+    pub time: u64,
+    pub hash: String,
+    pub delta: UserNonFundingLedgerDelta,
+}
+
+/// Non-funding ledger delta shapes documented by Hyperliquid. This client
+/// intentionally models the subset used by router/shim tests.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type")]
+pub enum UserNonFundingLedgerDelta {
+    #[serde(rename = "deposit")]
+    Deposit { usdc: String },
+    #[serde(rename = "withdraw")]
+    Withdraw {
+        usdc: String,
+        nonce: u64,
+        fee: String,
+    },
+    #[serde(rename = "internalTransfer", rename_all = "camelCase")]
+    InternalTransfer {
+        usdc: String,
+        user: String,
+        destination: String,
+        fee: String,
+    },
+    #[serde(rename = "accountClassTransfer", rename_all = "camelCase")]
+    AccountClassTransfer { usdc: String, to_perp: bool },
+    #[serde(rename = "spotTransfer", rename_all = "camelCase")]
+    SpotTransfer {
+        token: String,
+        amount: String,
+        usdc_value: String,
+        user: String,
+        destination: String,
+        fee: String,
+        native_token_fee: String,
+        nonce: u64,
+    },
+}
+
+/// Response item for `/info { type: "userFunding", user, startTime,
+/// endTime? }`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserFunding {
+    pub time: u64,
+    pub coin: String,
+    pub usdc: String,
+    pub szi: String,
+    pub funding_rate: String,
+}
+
+/// Response to `/info { type: "meta" }` for the perp universe.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct PerpMeta {
+    pub universe: Vec<PerpAssetMeta>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PerpAssetMeta {
+    pub name: String,
+    pub sz_decimals: u8,
+    pub max_leverage: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub only_isolated: Option<bool>,
+}
+
+/// Response to `/info { type: "userRateLimit", user }`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserRateLimit {
+    pub cum_vlm: String,
+    pub n_requests_used: u64,
+    pub n_requests_cap: u64,
+    pub n_requests_surplus: u64,
+}

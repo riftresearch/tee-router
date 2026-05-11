@@ -33,7 +33,9 @@ pub use error::{Error, Result};
 pub use http::HttpClient;
 pub use info::{
     BasicOrderInfo, ClearinghouseState, L2BookSnapshot, L2Level, MarginSummary, OpenOrder,
-    OrderInfoEnvelope, OrderStatusResponse, SpotBalance, SpotClearinghouseState, UserFill,
+    OrderInfoEnvelope, OrderStatusResponse, PerpAssetMeta, PerpMeta, SpotBalance,
+    SpotClearinghouseState, UserFill, UserFunding, UserNonFundingLedgerDelta,
+    UserNonFundingLedgerUpdate, UserRateLimit,
 };
 pub use meta::{
     spot_wire_asset_index, SpotAssetMeta, SpotMeta, TokenInfo, SPOT_ASSET_INDEX_OFFSET,
