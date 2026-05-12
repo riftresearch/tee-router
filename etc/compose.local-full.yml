@@ -313,6 +313,7 @@ services:
       - "50110:50110"
       - "50111:50111"
       - "50112:50112"
+      - "50118:50118"
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:50108/status >/dev/null"]
       interval: 10s
@@ -486,6 +487,10 @@ services:
         condition: service_started
       evm-receipt-watcher-arbitrum:
         condition: service_started
+      bitcoin-indexer:
+        condition: service_started
+      bitcoin-receipt-watcher:
+        condition: service_started
     environment:
       RUST_LOG: info
       ROUTER_REPLICA_DATABASE_URL: postgres://router_app:router_app@router-postgres-replica:5432/router_db
@@ -500,6 +505,7 @@ services:
       ELECTRUM_HTTP_SERVER_URL: http://devnet:50110
       BITCOIN_RPC_URL: http://devnet:50100
       BITCOIN_RPC_AUTH: devnet:devnet
+      BITCOIN_ZMQ_RAWBLOCK_ENDPOINT: tcp://devnet:50118
       BITCOIN_ZMQ_RAWTX_ENDPOINT: tcp://devnet:50111
       BITCOIN_ZMQ_SEQUENCE_ENDPOINT: tcp://devnet:50112
       ETH_RPC_URL: http://devnet:50101
@@ -511,6 +517,8 @@ services:
       ETHEREUM_RECEIPT_WATCHER_URL: http://evm-receipt-watcher-ethereum:8080
       BASE_RECEIPT_WATCHER_URL: http://evm-receipt-watcher-base:8080
       ARBITRUM_RECEIPT_WATCHER_URL: http://evm-receipt-watcher-arbitrum:8080
+      BITCOIN_INDEXER_URL: http://bitcoin-indexer:8080
+      BITCOIN_RECEIPT_WATCHER_URL: http://bitcoin-receipt-watcher:8080
       TOKEN_INDEXER_API_KEY: local-token-indexer-api-key-000000000
       HL_SHIM_INDEXER_URL: http://hl-shim-indexer:8080
       SAURON_HL_BRIDGE_MATCH_WINDOW_SECONDS: 1800
@@ -606,6 +614,50 @@ services:
       EVM_RECEIPT_WATCHER_POLL_INTERVAL_MS: 1000
     ports:
       - "50115:8080"
+    expose:
+      - "8080"
+
+  bitcoin-indexer:
+    build:
+      context: ..
+      dockerfile: etc/Dockerfile.bitcoin-indexer
+    restart: on-failure
+    depends_on:
+      devnet:
+        condition: service_healthy
+    environment:
+      RUST_LOG: info
+      BITCOIN_INDEXER_NETWORK: regtest
+      BITCOIN_INDEXER_RPC_URL: http://devnet:50100
+      BITCOIN_INDEXER_RPC_AUTH: devnet:devnet
+      BITCOIN_INDEXER_ESPLORA_URL: http://devnet:50110
+      BITCOIN_INDEXER_ZMQ_RAWBLOCK_ENDPOINT: tcp://devnet:50118
+      BITCOIN_INDEXER_ZMQ_RAWTX_ENDPOINT: tcp://devnet:50111
+      BITCOIN_INDEXER_BIND: 0.0.0.0:8080
+      BITCOIN_INDEXER_POLL_INTERVAL_MS: 1000
+    ports:
+      - "50116:8080"
+    expose:
+      - "8080"
+
+  bitcoin-receipt-watcher:
+    build:
+      context: ..
+      dockerfile: etc/Dockerfile.bitcoin-receipt-watcher
+    restart: on-failure
+    depends_on:
+      devnet:
+        condition: service_healthy
+    environment:
+      RUST_LOG: info
+      BITCOIN_RECEIPT_WATCHER_CHAIN: bitcoin
+      BITCOIN_RECEIPT_WATCHER_RPC_URL: http://devnet:50100
+      BITCOIN_RECEIPT_WATCHER_RPC_AUTH: devnet:devnet
+      BITCOIN_RECEIPT_WATCHER_ZMQ_RAWBLOCK_ENDPOINT: tcp://devnet:50118
+      BITCOIN_RECEIPT_WATCHER_BIND: 0.0.0.0:8080
+      BITCOIN_RECEIPT_WATCHER_POLL_INTERVAL_MS: 1000
+    ports:
+      - "50117:8080"
     expose:
       - "8080"
 

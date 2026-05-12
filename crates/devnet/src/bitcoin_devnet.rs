@@ -17,8 +17,8 @@ use electrsd::ElectrsD;
 use esplora_client::AsyncClient as EsploraClient;
 
 use crate::manifest::{
-    DEVNET_BITCOIN_RPC_PORT, DEVNET_BITCOIN_ZMQ_RAWTX_PORT, DEVNET_BITCOIN_ZMQ_SEQUENCE_PORT,
-    DEVNET_ESPLORA_PORT,
+    DEVNET_BITCOIN_RPC_PORT, DEVNET_BITCOIN_ZMQ_RAWBLOCK_PORT, DEVNET_BITCOIN_ZMQ_RAWTX_PORT,
+    DEVNET_BITCOIN_ZMQ_SEQUENCE_PORT, DEVNET_ESPLORA_PORT,
 };
 use crate::{get_new_temp_dir, Result, RiftDevnetCache};
 
@@ -41,6 +41,7 @@ pub struct BitcoinDevnet {
     pub cookie: PathBuf,
     pub datadir: PathBuf,
     pub rpc_url: String,
+    pub zmq_rawblock_endpoint: String,
     pub zmq_rawtx_endpoint: String,
     pub zmq_sequence_endpoint: String,
     pub electrsd: Option<Arc<ElectrsD>>,
@@ -78,6 +79,11 @@ impl BitcoinDevnet {
         conf.wallet = None;
         conf.view_stdout = false;
 
+        let zmq_rawblock_port = if fixed_esplora_url {
+            DEVNET_BITCOIN_ZMQ_RAWBLOCK_PORT
+        } else {
+            reserve_local_port()?
+        };
         let zmq_rawtx_port = if fixed_esplora_url {
             DEVNET_BITCOIN_ZMQ_RAWTX_PORT
         } else {
@@ -93,8 +99,12 @@ impl BitcoinDevnet {
         } else {
             "127.0.0.1"
         };
+        let zmq_rawblock_endpoint = format!("tcp://{zmq_host}:{zmq_rawblock_port}");
         let zmq_rawtx_endpoint = format!("tcp://{zmq_host}:{zmq_rawtx_port}");
         let zmq_sequence_endpoint = format!("tcp://{zmq_host}:{zmq_sequence_port}");
+        conf.args.push(Box::leak(
+            format!("-zmqpubrawblock={zmq_rawblock_endpoint}").into_boxed_str(),
+        ));
         conf.args.push(Box::leak(
             format!("-zmqpubrawtx={zmq_rawtx_endpoint}").into_boxed_str(),
         ));
@@ -338,6 +348,7 @@ impl BitcoinDevnet {
             miner_address: alice_address,
             cookie,
             rpc_url,
+            zmq_rawblock_endpoint,
             zmq_rawtx_endpoint,
             zmq_sequence_endpoint,
             funded_sats,

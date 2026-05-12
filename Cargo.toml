@@ -8,6 +8,8 @@ members = [
     "bin/router-server",
     "bin/sauron",
     "bin/temporal-worker",
+    "bitcoin-indexer",
+    "bitcoin-receipt-watcher",
     "evm-receipt-watcher",
     "hl-shim-indexer",
     "integration-tests",
@@ -20,6 +22,8 @@ members = [
     "crates/evm-receipt-watcher-client",
     "crates/evm-token-indexer-client",
     "crates/esplora-client",
+    "crates/bitcoin-indexer-client",
+    "crates/bitcoin-receipt-watcher-client",
     "crates/chains",
     "crates/hyperliquid-client",
     "crates/hl-shim-client",
@@ -56,6 +60,8 @@ devnet = { path = "crates/devnet" }
 evm-indexer-client = { path = "crates/evm-indexer-client" }
 evm-receipt-watcher-client = { path = "crates/evm-receipt-watcher-client" }
 evm-token-indexer-client = { path = "crates/evm-token-indexer-client" }
+bitcoin-indexer-client = { path = "crates/bitcoin-indexer-client" }
+bitcoin-receipt-watcher-client = { path = "crates/bitcoin-receipt-watcher-client" }
 eip7702-delegator-contract = {path = "crates/eip7702-delegator-contract"}
 eip3009-erc20-contract = {path = "crates/eip3009-erc20-contract"}
 utc = {path = "crates/utc"}
@@ -122,6 +128,7 @@ mock_instant = "0.6.0"
 libc = "0.2.176"
 dotenvy = "0.15"
 eyre = "0.6.12"
+zeromq = "0.6.0-pre.1"
 
 [patch.crates-io]
 corepc-node = { git = "https://github.com/alpinevm/corepc", rev = "2b21b2bfeb4b4c8bc71fccba87d86054a648f242" }

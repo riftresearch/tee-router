@@ -1831,6 +1831,49 @@ dependencies = [
 ]
 
 [[package]]
+name = "bitcoin-indexer"
+version = "0.1.8"
+dependencies = [
+ "axum 0.7.9",
+ "bitcoin",
+ "bitcoin-indexer-client",
+ "bitcoincore-rpc-async",
+ "clap",
+ "devnet",
+ "esplora-client",
+ "futures-util",
+ "metrics-exporter-prometheus",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "snafu",
+ "tokio",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "zeromq",
+]
+
+[[package]]
+name = "bitcoin-indexer-client"
+version = "0.1.8"
+dependencies = [
+ "async-trait",
+ "bitcoin",
+ "futures-util",
+ "metrics",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "snafu",
+ "tokio",
+ "tokio-tungstenite 0.24.0",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "bitcoin-internals"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1850,6 +1893,49 @@ name = "bitcoin-io"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b47c4ab7a93edb0c7198c5535ed9b52b63095f4e9b45279c6736cec4b856baf"
+
+[[package]]
+name = "bitcoin-receipt-watcher"
+version = "0.1.8"
+dependencies = [
+ "axum 0.7.9",
+ "bitcoin",
+ "bitcoin-receipt-watcher-client",
+ "bitcoincore-rpc-async",
+ "clap",
+ "devnet",
+ "futures-util",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "snafu",
+ "tokio",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "zeromq",
+]
+
+[[package]]
+name = "bitcoin-receipt-watcher-client"
+version = "0.1.8"
+dependencies = [
+ "async-trait",
+ "bitcoin",
+ "futures-util",
+ "metrics",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "snafu",
+ "tokio",
+ "tokio-tungstenite 0.24.0",
+ "tracing",
+ "url",
+]
 
 [[package]]
 name = "bitcoin-units"
