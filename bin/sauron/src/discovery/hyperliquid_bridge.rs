@@ -7,7 +7,11 @@ use router_core::models::{
     ProviderOperationHintKind, ProviderOperationType, SAURON_HYPERLIQUID_OBSERVER_HINT_SOURCE,
 };
 use router_server::api::{ProviderOperationHintRequest, MAX_HINT_IDEMPOTENCY_KEY_LEN};
-use serde_json::{json, Value};
+use router_temporal::{
+    HlBridgeDepositCreditedEvidence, HlBridgeDepositObservedEvidence,
+    HlWithdrawalAcknowledgedEvidence, HlWithdrawalSettledEvidence,
+};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tracing::debug;
 
@@ -87,12 +91,7 @@ async fn deposit_hint(
         return Ok(Some(hint_request(
             operation,
             ProviderOperationHintKind::HlBridgeDepositCredited,
-            json!({
-                "user": format!("{user:?}"),
-                "usdc": decimal_amount,
-                "hl_credit_hash": credit.hash,
-                "hl_credit_time_ms": credit.time_ms,
-            }),
+            hl_bridge_deposit_credited_evidence(user, decimal_amount, &credit),
             "hl-bridge-deposit",
         )));
     };
@@ -105,13 +104,13 @@ async fn deposit_hint(
     Ok(Some(hint_request(
         operation,
         ProviderOperationHintKind::HlBridgeDepositObserved,
-        json!({
-            "user": format!("{user:?}"),
-            "usdc": decimal_amount,
-            "arb_tx_hash": format!("{:?}", transfer.transaction_hash),
-            "log_index": transfer.log_index.unwrap_or_default(),
-            "block_number": parse_u64_or_zero(&transfer.block_number),
-        }),
+        hl_bridge_deposit_observed_evidence(
+            user,
+            decimal_amount,
+            format!("{:?}", transfer.transaction_hash),
+            transfer.log_index.unwrap_or_default(),
+            parse_u64_or_zero(&transfer.block_number),
+        ),
         "hl-bridge-deposit",
     )))
 }
@@ -178,14 +177,14 @@ async fn withdrawal_hint(
                     return Ok(Some(hint_request(
                         operation,
                         ProviderOperationHintKind::HlWithdrawalSettled,
-                        json!({
-                            "user": format!("{user:?}"),
-                            "usdc": payout_decimal_amount,
-                            "arb_payout_tx_hash": format!("{:?}", payout.transaction_hash),
-                            "log_index": payout.log_index.unwrap_or_default(),
-                            "block_number": parse_u64_or_zero(&payout.block_number),
-                            "time_window_match_to_nonce": nonce,
-                        }),
+                        hl_withdrawal_settled_evidence(
+                            user,
+                            payout_decimal_amount,
+                            format!("{:?}", payout.transaction_hash),
+                            payout.log_index.unwrap_or_default(),
+                            parse_u64_or_zero(&payout.block_number),
+                            nonce,
+                        ),
                         "hl-withdrawal-settled",
                     )));
                 }
@@ -203,15 +202,75 @@ async fn withdrawal_hint(
     Ok(Some(hint_request(
         operation,
         ProviderOperationHintKind::HlWithdrawalAcknowledged,
-        json!({
-            "user": format!("{user:?}"),
-            "usdc": decimal_amount,
-            "nonce": nonce,
-            "hl_request_hash": withdraw.hash,
-            "hl_request_time_ms": withdraw.time_ms,
-        }),
+        hl_withdrawal_ack_evidence(user, decimal_amount, nonce, &withdraw),
         "hl-withdrawal-ack",
     )))
+}
+
+fn hl_bridge_deposit_credited_evidence(
+    user: Address,
+    usdc: String,
+    credit: &HlTransferEvent,
+) -> Value {
+    typed_evidence(HlBridgeDepositCreditedEvidence {
+        user: format!("{user:?}"),
+        usdc,
+        hl_credit_hash: credit.hash.clone(),
+        hl_credit_time_ms: credit.time_ms,
+    })
+}
+
+fn hl_bridge_deposit_observed_evidence(
+    user: Address,
+    usdc: String,
+    arb_tx_hash: String,
+    log_index: u64,
+    block_number: u64,
+) -> Value {
+    typed_evidence(HlBridgeDepositObservedEvidence {
+        user: format!("{user:?}"),
+        usdc,
+        arb_tx_hash,
+        log_index,
+        block_number,
+    })
+}
+
+fn hl_withdrawal_ack_evidence(
+    user: Address,
+    usdc: String,
+    nonce: u64,
+    withdraw: &HlTransferEvent,
+) -> Value {
+    typed_evidence(HlWithdrawalAcknowledgedEvidence {
+        user: format!("{user:?}"),
+        usdc,
+        nonce,
+        hl_request_hash: withdraw.hash.clone(),
+        hl_request_time_ms: withdraw.time_ms,
+    })
+}
+
+fn hl_withdrawal_settled_evidence(
+    user: Address,
+    usdc: String,
+    arb_payout_tx_hash: String,
+    log_index: u64,
+    block_number: u64,
+    time_window_match_to_nonce: u64,
+) -> Value {
+    typed_evidence(HlWithdrawalSettledEvidence {
+        user: format!("{user:?}"),
+        usdc,
+        arb_payout_tx_hash,
+        log_index,
+        block_number,
+        time_window_match_to_nonce,
+    })
+}
+
+fn typed_evidence<T: serde::Serialize>(evidence: T) -> Value {
+    serde_json::to_value(evidence).expect("typed provider-operation evidence serializes")
 }
 
 fn hint_request(
@@ -463,6 +522,9 @@ mod tests {
     use chrono::Utc;
     use router_core::models::{ProviderOperationStatus, ProviderOperationType};
     use router_temporal::WorkflowStepId;
+    use serde::de::DeserializeOwned;
+    use serde_json::json;
+    use std::collections::BTreeSet;
     use uuid::Uuid;
 
     fn watch() -> ProviderOperationWatchEntry {
@@ -532,5 +594,114 @@ mod tests {
         );
 
         assert!(key.len() <= MAX_HINT_IDEMPOTENCY_KEY_LEN);
+    }
+
+    #[test]
+    fn hl_bridge_deposit_observed_evidence_matches_router_typed_shape() {
+        let evidence = hl_bridge_deposit_observed_evidence(
+            user(),
+            "105.362953".to_string(),
+            "0xarb".to_string(),
+            7,
+            123,
+        );
+
+        assert_typed_evidence::<HlBridgeDepositObservedEvidence>(
+            &evidence,
+            &["user", "usdc", "arb_tx_hash", "log_index", "block_number"],
+        );
+    }
+
+    #[test]
+    fn hl_bridge_deposit_credited_evidence_matches_router_typed_shape() {
+        let credit = hl_transfer_event("deposit", None);
+
+        let evidence =
+            hl_bridge_deposit_credited_evidence(user(), "105.362953".to_string(), &credit);
+
+        assert_typed_evidence::<HlBridgeDepositCreditedEvidence>(
+            &evidence,
+            &["user", "usdc", "hl_credit_hash", "hl_credit_time_ms"],
+        );
+    }
+
+    #[test]
+    fn hl_withdrawal_ack_evidence_matches_router_typed_shape() {
+        let withdraw = hl_transfer_event("withdraw", Some(99));
+
+        let evidence = hl_withdrawal_ack_evidence(user(), "105.362953".to_string(), 99, &withdraw);
+
+        assert_typed_evidence::<HlWithdrawalAcknowledgedEvidence>(
+            &evidence,
+            &[
+                "user",
+                "usdc",
+                "nonce",
+                "hl_request_hash",
+                "hl_request_time_ms",
+            ],
+        );
+    }
+
+    #[test]
+    fn hl_withdrawal_settled_evidence_matches_router_typed_shape() {
+        let evidence = hl_withdrawal_settled_evidence(
+            user(),
+            "105.362953".to_string(),
+            "0xarb".to_string(),
+            7,
+            123,
+            99,
+        );
+
+        assert_typed_evidence::<HlWithdrawalSettledEvidence>(
+            &evidence,
+            &[
+                "user",
+                "usdc",
+                "arb_payout_tx_hash",
+                "log_index",
+                "block_number",
+                "time_window_match_to_nonce",
+            ],
+        );
+    }
+
+    fn user() -> Address {
+        "0x1111111111111111111111111111111111111111"
+            .parse()
+            .expect("address")
+    }
+
+    fn hl_transfer_event(kind: &str, nonce: Option<u64>) -> HlTransferEvent {
+        let kind = match nonce {
+            Some(nonce) => json!({ "type": kind, "nonce": nonce }),
+            None => json!({ "type": kind }),
+        };
+        serde_json::from_value(json!({
+            "user": "0x1111111111111111111111111111111111111111",
+            "time_ms": 1_778_522_898_534i64,
+            "kind": kind,
+            "asset": "USDC",
+            "market": "spot",
+            "amount_delta": "105.362953",
+            "fee": null,
+            "fee_token": null,
+            "hash": "0x832fd0f4639c39c05011217e5b28840f9376cc24c4366660595a0cc158a88034",
+            "observed_at_ms": 1_778_522_898_535i64
+        }))
+        .expect("HL transfer event")
+    }
+
+    fn assert_typed_evidence<T: DeserializeOwned>(value: &Value, expected: &[&str]) {
+        let actual = value
+            .as_object()
+            .expect("evidence should be an object")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let expected = expected.iter().copied().collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected);
+        serde_json::from_value::<T>(value.clone()).expect("typed evidence should deserialize");
     }
 }

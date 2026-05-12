@@ -14,7 +14,11 @@ use router_core::models::{
     ProviderOperationHintKind, ProviderOperationType, SAURON_HYPERUNIT_OBSERVER_HINT_SOURCE,
 };
 use router_server::api::{ProviderOperationHintRequest, MAX_HINT_IDEMPOTENCY_KEY_LEN};
-use serde_json::{json, Value};
+use router_temporal::{
+    BtcDepositObservedEvidence, HyperUnitDepositCreditedEvidence,
+    HyperUnitWithdrawalAcknowledgedEvidence, HyperUnitWithdrawalSettledEvidence,
+};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::time::{timeout, MissedTickBehavior};
 use tracing::warn;
@@ -392,14 +396,19 @@ fn hint_idempotency_key(
 }
 
 fn btc_deposit_evidence(address: &str, output: &TxOutput) -> Value {
-    json!({
-        "tx_hash": output.txid.to_string(),
-        "address": address,
-        "transfer_index": output.vout,
-        "amount": output.amount_sats.to_string(),
-        "confirmation_state": if output.confirmations > 0 { "confirmed" } else { "mempool" },
-        "block_height": output.block_height,
-        "block_hash": output.block_hash.as_ref().map(|hash| hash.to_string()),
+    typed_evidence(BtcDepositObservedEvidence {
+        tx_hash: output.txid.to_string(),
+        address: address.to_string(),
+        transfer_index: u64::from(output.vout),
+        amount: output.amount_sats.to_string(),
+        confirmation_state: if output.confirmations > 0 {
+            "confirmed"
+        } else {
+            "mempool"
+        }
+        .to_string(),
+        block_height: output.block_height,
+        block_hash: output.block_hash.as_ref().map(|hash| hash.to_string()),
     })
 }
 
@@ -414,7 +423,7 @@ fn hyperunit_deposit_credited_evidence(
             .map(|output| {
                 (
                     Some(output.txid.to_string()),
-                    Some(output.vout),
+                    Some(u64::from(output.vout)),
                     Some(output.amount_sats.to_string()),
                     Some(output.confirmations),
                     output.block_height,
@@ -422,34 +431,34 @@ fn hyperunit_deposit_credited_evidence(
                 )
             })
             .unwrap_or((None, None, None, None, None, None));
-    json!({
-        "protocol_address": protocol_address,
-        "btc_tx_hash": btc_tx_hash,
-        "btc_vout": btc_vout,
-        "btc_amount": btc_amount,
-        "btc_confirmations": btc_confirmations,
-        "btc_block_height": btc_block_height,
-        "btc_block_hash": btc_block_hash,
-        "hyperunit_operation_id": &status.operation_id,
-        "hyperunit_status": &status.state,
-        "hyperunit_source_tx_hash": &status.source_tx_hash,
-        "hyperunit_destination_tx_hash": &status.destination_tx_hash,
-        "hl_user": format!("{:#x}", credit.user),
-        "hl_amount": credit.amount_delta.as_str(),
-        "hl_credit_hash": credit.hash,
-        "hl_credit_time_ms": credit.time_ms,
+    typed_evidence(HyperUnitDepositCreditedEvidence {
+        protocol_address: protocol_address.to_string(),
+        btc_tx_hash,
+        btc_vout,
+        btc_amount,
+        btc_confirmations,
+        btc_block_height,
+        btc_block_hash,
+        hyperunit_operation_id: status.operation_id.clone(),
+        hyperunit_status: status.state.clone(),
+        hyperunit_source_tx_hash: status.source_tx_hash.clone(),
+        hyperunit_destination_tx_hash: status.destination_tx_hash.clone(),
+        hl_user: format!("{:#x}", credit.user),
+        hl_amount: credit.amount_delta.as_str().to_string(),
+        hl_credit_hash: credit.hash.clone(),
+        hl_credit_time_ms: credit.time_ms,
     })
 }
 
 fn hyperunit_withdrawal_ack_evidence(protocol_address: &str, status: &UnitOperation) -> Value {
-    json!({
-        "protocol_address": protocol_address,
-        "hyperunit_operation_id": &status.operation_id,
-        "hyperunit_status": &status.state,
-        "destination_address": &status.destination_address,
-        "amount": &status.source_amount,
-        "btc_tx_hash": &status.destination_tx_hash,
-        "broadcast_at": &status.broadcast_at,
+    typed_evidence(HyperUnitWithdrawalAcknowledgedEvidence {
+        protocol_address: protocol_address.to_string(),
+        hyperunit_operation_id: status.operation_id.clone(),
+        hyperunit_status: status.state.clone(),
+        destination_address: status.destination_address.clone(),
+        amount: status.source_amount.clone(),
+        btc_tx_hash: status.destination_tx_hash.clone(),
+        broadcast_at: status.broadcast_at.clone(),
     })
 }
 
@@ -461,17 +470,21 @@ fn hyperunit_withdrawal_settled_evidence(
     amount_sats: u64,
     confirmations: u64,
 ) -> Value {
-    json!({
-        "protocol_address": protocol_address,
-        "hyperunit_operation_id": &status.operation_id,
-        "hyperunit_status": &status.state,
-        "destination_address": destination_address,
-        "amount": &status.source_amount,
-        "btc_tx_hash": &status.destination_tx_hash,
-        "btc_vout": vout,
-        "btc_amount": amount_sats.to_string(),
-        "btc_confirmations": confirmations,
+    typed_evidence(HyperUnitWithdrawalSettledEvidence {
+        protocol_address: protocol_address.to_string(),
+        hyperunit_operation_id: status.operation_id.clone(),
+        hyperunit_status: status.state.clone(),
+        destination_address: destination_address.to_string(),
+        amount: status.source_amount.clone(),
+        btc_tx_hash: status.destination_tx_hash.clone(),
+        btc_vout: u64::from(vout),
+        btc_amount: amount_sats.to_string(),
+        btc_confirmations: confirmations,
     })
+}
+
+fn typed_evidence<T: serde::Serialize>(evidence: T) -> Value {
+    serde_json::to_value(evidence).expect("typed provider-operation evidence serializes")
 }
 
 fn payout_output(tx: &bitcoin::Transaction, destination_address: &str) -> Option<(u32, u64)> {
@@ -615,5 +628,181 @@ fn hyperunit_poll_interval(elapsed: Duration) -> Duration {
         Duration::from_secs(30)
     } else {
         Duration::from_secs(60)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::de::DeserializeOwned;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn btc_deposit_evidence_matches_router_typed_shape() {
+        let output = tx_output();
+
+        let evidence = btc_deposit_evidence("1BoatSLRHtKNngkdXEeobR76b53LETtpyT", &output);
+
+        assert_typed_evidence::<BtcDepositObservedEvidence>(
+            &evidence,
+            &[
+                "tx_hash",
+                "address",
+                "transfer_index",
+                "amount",
+                "confirmation_state",
+                "block_height",
+                "block_hash",
+            ],
+        );
+    }
+
+    #[test]
+    fn hyperunit_deposit_credited_evidence_matches_router_typed_shape() {
+        let output = tx_output();
+        let status = unit_operation();
+        let credit = hl_credit_event();
+
+        let evidence = hyperunit_deposit_credited_evidence(
+            "1BoatSLRHtKNngkdXEeobR76b53LETtpyT",
+            Some(&output),
+            &status,
+            &credit,
+        );
+
+        assert_typed_evidence::<HyperUnitDepositCreditedEvidence>(
+            &evidence,
+            &[
+                "protocol_address",
+                "btc_tx_hash",
+                "btc_vout",
+                "btc_amount",
+                "btc_confirmations",
+                "btc_block_height",
+                "btc_block_hash",
+                "hyperunit_operation_id",
+                "hyperunit_status",
+                "hyperunit_source_tx_hash",
+                "hyperunit_destination_tx_hash",
+                "hl_user",
+                "hl_amount",
+                "hl_credit_hash",
+                "hl_credit_time_ms",
+            ],
+        );
+    }
+
+    #[test]
+    fn hyperunit_withdrawal_ack_evidence_matches_router_typed_shape() {
+        let status = unit_operation();
+
+        let evidence =
+            hyperunit_withdrawal_ack_evidence("1BoatSLRHtKNngkdXEeobR76b53LETtpyT", &status);
+
+        assert_typed_evidence::<HyperUnitWithdrawalAcknowledgedEvidence>(
+            &evidence,
+            &[
+                "protocol_address",
+                "hyperunit_operation_id",
+                "hyperunit_status",
+                "destination_address",
+                "amount",
+                "btc_tx_hash",
+                "broadcast_at",
+            ],
+        );
+    }
+
+    #[test]
+    fn hyperunit_withdrawal_settled_evidence_matches_router_typed_shape() {
+        let status = unit_operation();
+
+        let evidence = hyperunit_withdrawal_settled_evidence(
+            "1BoatSLRHtKNngkdXEeobR76b53LETtpyT",
+            &status,
+            "1BoatSLRHtKNngkdXEeobR76b53LETtpyT",
+            1,
+            50_000,
+            6,
+        );
+
+        assert_typed_evidence::<HyperUnitWithdrawalSettledEvidence>(
+            &evidence,
+            &[
+                "protocol_address",
+                "hyperunit_operation_id",
+                "hyperunit_status",
+                "destination_address",
+                "amount",
+                "btc_tx_hash",
+                "btc_vout",
+                "btc_amount",
+                "btc_confirmations",
+            ],
+        );
+    }
+
+    fn tx_output() -> TxOutput {
+        TxOutput {
+            txid: "0000000000000000000000000000000000000000000000000000000000000001"
+                .parse()
+                .expect("txid"),
+            vout: 1,
+            address: "1BoatSLRHtKNngkdXEeobR76b53LETtpyT"
+                .parse()
+                .expect("bitcoin address"),
+            amount_sats: 50_000,
+            block_height: Some(840_000),
+            block_hash: Some(
+                "0000000000000000000000000000000000000000000000000000000000000002"
+                    .parse()
+                    .expect("block hash"),
+            ),
+            block_time: None,
+            confirmations: 6,
+            removed: false,
+        }
+    }
+
+    fn unit_operation() -> UnitOperation {
+        serde_json::from_value(serde_json::json!({
+            "operationId": "unit-op-1",
+            "protocolAddress": "1BoatSLRHtKNngkdXEeobR76b53LETtpyT",
+            "destinationAddress": "1BoatSLRHtKNngkdXEeobR76b53LETtpyT",
+            "sourceAmount": "50000",
+            "state": "credited",
+            "sourceTxHash": "btc-source-tx",
+            "destinationTxHash": "btc-destination-tx",
+            "broadcastAt": "2026-05-12T00:00:00Z"
+        }))
+        .expect("unit operation")
+    }
+
+    fn hl_credit_event() -> HlTransferEvent {
+        serde_json::from_value(serde_json::json!({
+            "user": "0x1111111111111111111111111111111111111111",
+            "time_ms": 1_778_522_898_534i64,
+            "kind": { "type": "deposit" },
+            "asset": "UBTC",
+            "market": "spot",
+            "amount_delta": "0.0005",
+            "fee": null,
+            "fee_token": null,
+            "hash": "0x832fd0f4639c39c05011217e5b28840f9376cc24c4366660595a0cc158a88034",
+            "observed_at_ms": 1_778_522_898_535i64
+        }))
+        .expect("HL credit event")
+    }
+
+    fn assert_typed_evidence<T: DeserializeOwned>(value: &Value, expected: &[&str]) {
+        let actual = value
+            .as_object()
+            .expect("evidence should be an object")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let expected = expected.iter().copied().collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected);
+        serde_json::from_value::<T>(value.clone()).expect("typed evidence should deserialize");
     }
 }

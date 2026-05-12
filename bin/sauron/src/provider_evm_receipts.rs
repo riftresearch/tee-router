@@ -12,7 +12,8 @@ use router_core::{
     protocol::{AssetId, ChainId, DepositAsset},
 };
 use router_server::api::{ProviderOperationHintRequest, MAX_HINT_IDEMPOTENCY_KEY_LEN};
-use serde_json::{json, Value};
+use router_temporal::{CctpReceiveObservedEvidence, VeloraSwapSettledEvidence};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::time::{timeout, MissedTickBehavior};
 use tracing::{debug, warn};
@@ -256,21 +257,19 @@ async fn velora_swap_settled_hint(
         let Some(log_index) = decoded.log_index else {
             continue;
         };
-        let mut evidence = json!({
-            "tx_hash": format!("{tx_hash:?}"),
-            "log_index": log_index,
-            "amount_out": decoded.inner.data.destAmount.to_string(),
-            "recipient": format!("{:#x}", decoded.inner.data.recipient),
-            "executor": format!("{:#x}", decoded.inner.data.sender),
-            "block_number": decoded.block_number,
-        });
-        if decoded.inner.data.destToken != Address::ZERO {
-            evidence["token_address"] = json!(format!("{:#x}", decoded.inner.data.destToken));
-        }
         return Ok(Some(hint_request(
             operation,
             ProviderOperationHintKind::VeloraSwapSettled,
-            evidence,
+            velora_swap_settled_evidence(
+                format!("{tx_hash:?}"),
+                log_index,
+                decoded.inner.data.destAmount.to_string(),
+                format!("{:#x}", decoded.inner.data.recipient),
+                Some(format!("{:#x}", decoded.inner.data.sender)),
+                (decoded.inner.data.destToken != Address::ZERO)
+                    .then(|| format!("{:#x}", decoded.inner.data.destToken)),
+                decoded.block_number,
+            ),
             log_index,
         )));
     }
@@ -303,15 +302,15 @@ async fn velora_swap_settled_hint(
         return Ok(Some(hint_request(
             operation,
             ProviderOperationHintKind::VeloraSwapSettled,
-            json!({
-                "tx_hash": format!("{tx_hash:?}"),
-                "log_index": log_index,
-                "amount_out": decoded.inner.data.value.to_string(),
-                "recipient": format!("{:#x}", decoded.inner.data.to),
-                "executor": format!("{:#x}", decoded.inner.data.from),
-                "token_address": format!("{:#x}", decoded.address()),
-                "block_number": decoded.block_number,
-            }),
+            velora_swap_settled_evidence(
+                format!("{tx_hash:?}"),
+                log_index,
+                decoded.inner.data.value.to_string(),
+                format!("{:#x}", decoded.inner.data.to),
+                Some(format!("{:#x}", decoded.inner.data.from)),
+                Some(format!("{:#x}", decoded.address())),
+                decoded.block_number,
+            ),
             log_index,
         )));
     }
@@ -404,18 +403,60 @@ async fn cctp_receive_observed_hint(
         return Ok(Some(hint_request(
             operation,
             ProviderOperationHintKind::CctpReceiveObserved,
-            json!({
-                "tx_hash": format!("{tx_hash:?}"),
-                "log_index": log_index,
-                "token": format!("{:#x}", decoded.inner.data.token),
-                "recipient": format!("{:#x}", decoded.inner.data.recipient),
-                "amount": decoded.inner.data.amount.to_string(),
-                "block_number": decoded.block_number,
-            }),
+            cctp_receive_observed_evidence(
+                format!("{tx_hash:?}"),
+                log_index,
+                format!("{:#x}", decoded.inner.data.token),
+                format!("{:#x}", decoded.inner.data.recipient),
+                decoded.inner.data.amount.to_string(),
+                decoded.block_number,
+            ),
             log_index,
         )));
     }
     Ok(None)
+}
+
+fn velora_swap_settled_evidence(
+    tx_hash: String,
+    log_index: u64,
+    amount_out: String,
+    recipient: String,
+    executor: Option<String>,
+    token_address: Option<String>,
+    block_number: Option<u64>,
+) -> Value {
+    typed_evidence(VeloraSwapSettledEvidence {
+        tx_hash,
+        log_index,
+        amount_out,
+        recipient,
+        executor,
+        token_address,
+        block_number,
+    })
+}
+
+fn cctp_receive_observed_evidence(
+    tx_hash: String,
+    log_index: u64,
+    token: String,
+    recipient: String,
+    amount: String,
+    block_number: Option<u64>,
+) -> Value {
+    typed_evidence(CctpReceiveObservedEvidence {
+        tx_hash,
+        log_index,
+        token,
+        recipient,
+        amount,
+        block_number,
+    })
+}
+
+fn typed_evidence<T: serde::Serialize>(evidence: T) -> Value {
+    serde_json::to_value(evidence).expect("typed provider-operation evidence serializes")
 }
 
 fn hint_request(
@@ -479,4 +520,73 @@ fn normalized_reference_asset(chain_id: &str, asset: &str) -> Option<Address> {
 
 fn evm_chain_number(chain_id: &str) -> Option<u64> {
     ChainId::parse(chain_id).ok()?.evm_chain_id()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::de::DeserializeOwned;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn velora_swap_settled_evidence_matches_router_typed_shape() {
+        let evidence = velora_swap_settled_evidence(
+            "0xswap".to_string(),
+            7,
+            "1000000".to_string(),
+            "0x1111111111111111111111111111111111111111".to_string(),
+            Some("0x2222222222222222222222222222222222222222".to_string()),
+            Some("0x3333333333333333333333333333333333333333".to_string()),
+            Some(123),
+        );
+
+        assert_typed_evidence::<VeloraSwapSettledEvidence>(
+            &evidence,
+            &[
+                "tx_hash",
+                "log_index",
+                "amount_out",
+                "recipient",
+                "executor",
+                "token_address",
+                "block_number",
+            ],
+        );
+    }
+
+    #[test]
+    fn cctp_receive_observed_evidence_matches_router_typed_shape() {
+        let evidence = cctp_receive_observed_evidence(
+            "0xcctp".to_string(),
+            7,
+            "0x3333333333333333333333333333333333333333".to_string(),
+            "0x1111111111111111111111111111111111111111".to_string(),
+            "1000000".to_string(),
+            Some(123),
+        );
+
+        assert_typed_evidence::<CctpReceiveObservedEvidence>(
+            &evidence,
+            &[
+                "tx_hash",
+                "log_index",
+                "token",
+                "recipient",
+                "amount",
+                "block_number",
+            ],
+        );
+    }
+
+    fn assert_typed_evidence<T: DeserializeOwned>(value: &Value, expected: &[&str]) {
+        let actual = value
+            .as_object()
+            .expect("evidence should be an object")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let expected = expected.iter().copied().collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected);
+        serde_json::from_value::<T>(value.clone()).expect("typed evidence should deserialize");
+    }
 }

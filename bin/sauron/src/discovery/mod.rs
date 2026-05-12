@@ -17,13 +17,15 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use metrics::{gauge, histogram};
 use reqwest::StatusCode;
-use router_core::models::{ProviderOperationHintKind, SAURON_DETECTOR_HINT_SOURCE};
+use router_core::models::{
+    BtcDepositObservedEvidence, ProviderOperationHintKind, SAURON_DETECTOR_HINT_SOURCE,
+};
 use router_primitives::{ChainType, TokenIdentifier};
 use router_server::api::{
     DetectorHintEnvelope, DetectorHintRequest, DetectorHintTarget, MAX_HINT_IDEMPOTENCY_KEY_LEN,
 };
 use router_temporal::WorkflowStepId;
-use serde_json::json;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use snafu::ResultExt;
 use tokio::{
@@ -810,26 +812,8 @@ async fn submit_detected_deposit(
     reported_candidates: &mut HashMap<DetectedDepositKey, DetectedDeposit>,
 ) -> SubmissionOutcome {
     let key = detected_deposit_key(detected);
-    let evidence = json!({
-        "source": "sauron",
-        "backend": backend_name,
-        "watch_target": detected.watch_target.as_str(),
-        "execution_step_id": detected.execution_step_id,
-        "chain": detected.source_chain.to_db_string(),
-        "token": detected.source_token.clone(),
-        "address": detected.address,
-        "recipient_address": detected.address,
-        "sender_address": detected.sender_addresses.first().cloned(),
-        "sender_addresses": detected.sender_addresses.clone(),
-        "tx_hash": detected.tx_hash,
-        "transfer_index": detected.transfer_index,
-        "vout": detected.transfer_index,
-        "amount": detected.amount.to_string(),
-        "confirmation_state": detected.confirmation_state.as_str(),
-        "block_height": detected.block_height,
-        "block_hash": detected.block_hash,
-        "observed_at": detected.observed_at,
-    });
+    let hint_kind = detected_deposit_hint_kind(detected);
+    let evidence = build_detected_deposit_evidence(backend_name, detected, hint_kind);
     let idempotency_key = Some(detected_deposit_hint_idempotency_key(
         backend_name,
         detected,
@@ -847,7 +831,7 @@ async fn submit_detected_deposit(
         .submit_detector_hint(&DetectorHintRequest {
             target,
             source: SAURON_DETECTOR_HINT_SOURCE.to_string(),
-            hint_kind: detected_deposit_hint_kind(detected),
+            hint_kind,
             evidence,
             idempotency_key,
         })
@@ -939,6 +923,50 @@ async fn submit_detected_deposit(
                 SubmissionOutcome::TerminalFailure
             }
         }
+    }
+}
+
+fn build_detected_deposit_evidence(
+    backend_name: &str,
+    detected: &DetectedDeposit,
+    hint_kind: ProviderOperationHintKind,
+) -> Value {
+    match hint_kind {
+        ProviderOperationHintKind::BtcDepositObserved => {
+            serde_json::to_value(BtcDepositObservedEvidence {
+                tx_hash: detected.tx_hash.clone(),
+                address: detected.address.clone(),
+                transfer_index: detected.transfer_index,
+                amount: detected.amount.to_string(),
+                confirmation_state: detected.confirmation_state.as_str().to_string(),
+                block_height: detected.block_height,
+                block_hash: detected.block_hash.clone(),
+            })
+            .expect("BtcDepositObservedEvidence serializes")
+        }
+        ProviderOperationHintKind::PossibleProgress => json!({
+            "source": "sauron",
+            "backend": backend_name,
+            "watch_target": detected.watch_target.as_str(),
+            "execution_step_id": detected.execution_step_id,
+            "chain": detected.source_chain.to_db_string(),
+            "token": detected.source_token.clone(),
+            "address": detected.address,
+            "recipient_address": detected.address,
+            "sender_address": detected.sender_addresses.first().cloned(),
+            "sender_addresses": detected.sender_addresses.clone(),
+            "tx_hash": detected.tx_hash,
+            "transfer_index": detected.transfer_index,
+            "vout": detected.transfer_index,
+            "amount": detected.amount.to_string(),
+            "confirmation_state": detected.confirmation_state.as_str(),
+            "block_height": detected.block_height,
+            "block_hash": detected.block_hash,
+            "observed_at": detected.observed_at,
+        }),
+        other => unreachable!(
+            "submit_detected_deposit only emits BtcDepositObserved/PossibleProgress, got {other:?}"
+        ),
     }
 }
 
@@ -1108,8 +1136,8 @@ fn submission_retry_jitter_millis(detected: &DetectedDeposit, attempts: u32) -> 
 #[cfg(test)]
 mod tests {
     use super::{
-        detected_deposit_hint_idempotency_key, detected_deposit_key,
-        detector_hint_target_for_detected, run_indexed_lookup_task,
+        build_detected_deposit_evidence, detected_deposit_hint_idempotency_key,
+        detected_deposit_key, detector_hint_target_for_detected, run_indexed_lookup_task,
         scan_has_pending_ephemeral_submissions, should_retry_submission, submission_retry_delay,
         submission_retry_is_expected_catchup, validate_pending_submission_backlog, BlockCursor,
         BlockScan, DepositConfirmationState, DetectedDeposit, DiscoveryBackend,
@@ -1123,11 +1151,12 @@ mod tests {
     use async_trait::async_trait;
     use chrono::{Duration, Utc};
     use reqwest::StatusCode;
+    use router_core::models::{BtcDepositObservedEvidence, ProviderOperationHintKind};
     use router_primitives::{ChainType, TokenIdentifier};
     use router_server::api::DetectorHintTarget;
     use router_temporal::WorkflowStepId;
     use std::{
-        collections::HashMap,
+        collections::{BTreeSet, HashMap},
         sync::Arc,
         time::{Duration as StdDuration, Instant},
     };
@@ -1241,6 +1270,55 @@ mod tests {
     }
 
     #[test]
+    fn btc_deposit_observed_evidence_uses_router_typed_shape() {
+        let mut detected = detected_deposit();
+        detected.block_height = Some(840_000);
+        detected.block_hash =
+            Some("0000000000000000000000000000000000000000000000000000000000000001".to_string());
+
+        let evidence = build_detected_deposit_evidence(
+            "bitcoin",
+            &detected,
+            ProviderOperationHintKind::BtcDepositObserved,
+        );
+
+        assert_object_keys(
+            &evidence,
+            &[
+                "tx_hash",
+                "address",
+                "transfer_index",
+                "amount",
+                "confirmation_state",
+                "block_height",
+                "block_hash",
+            ],
+        );
+        assert!(!evidence
+            .as_object()
+            .expect("evidence should be an object")
+            .contains_key("execution_step_id"));
+
+        let typed: BtcDepositObservedEvidence =
+            serde_json::from_value(evidence.clone()).expect("router-core evidence shape");
+        assert_eq!(
+            typed,
+            BtcDepositObservedEvidence {
+                tx_hash: detected.tx_hash,
+                address: detected.address,
+                transfer_index: detected.transfer_index,
+                amount: detected.amount.to_string(),
+                confirmation_state: detected.confirmation_state.as_str().to_string(),
+                block_height: detected.block_height,
+                block_hash: detected.block_hash,
+            }
+        );
+
+        let _: router_temporal::BtcDepositObservedEvidence =
+            serde_json::from_value(evidence).expect("router-server evidence shape");
+    }
+
+    #[test]
     fn detector_hint_target_rejects_provider_operation_without_step_id() {
         let mut detected = detected_deposit();
         detected.execution_step_id = None;
@@ -1278,6 +1356,17 @@ mod tests {
             b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'_' | b':' | b'-'
         )));
         assert!(key.starts_with(&format!("sauron:deposit:{}:", detected.watch_id)));
+    }
+
+    fn assert_object_keys(value: &serde_json::Value, expected: &[&str]) {
+        let actual = value
+            .as_object()
+            .expect("evidence should be an object")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let expected = expected.iter().copied().collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected);
     }
 
     #[test]
