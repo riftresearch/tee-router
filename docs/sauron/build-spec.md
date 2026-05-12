@@ -406,12 +406,30 @@ Each variant carries chain-typed evidence (block hash, log index, fill payload, 
 
 The migration is tractable in 6 phases. Each phase ships independently and leaves the system functional.
 
+### Implementation status (2026-05-12)
+
+All nine retrofit tasks are complete:
+
+1. Sauron execution-step propagation.
+2. Hyperliquid devnet mock `/info` coverage.
+3. Hyperliquid shim indexer.
+4. Sauron Hyperliquid venue observers.
+5. EVM token indexer pure-primitive API.
+6. EVM receipt watcher.
+7. Sauron EVM retrofit plus Velora, Across, and CCTP observers.
+8. Bitcoin indexer plus Bitcoin receipt watcher.
+9. Sauron Bitcoin retrofit plus HyperUnit venue observer.
+
 ### Phase 0: Foundations (must land first)
+
+**Status: complete.**
 
 - Add `execution_step_id` to `ProviderOperationWatchEntry` and propagate through current Sauron hint emission. Eliminates the 127-order stall class. **Highest priority.**
 - Define `ProviderOperationHintKind` v2 enum + serde compat. Existing emitters keep using `PossibleProgress`; new code paths use specialized variants.
 
 ### Phase 1: Refactor evm-token-indexer to pure primitive
+
+**Status: complete.**
 
 - Add new endpoints (`GET /transfers`, `POST /prune`, `WS /subscribe`) alongside existing ones.
 - Add `EvmIndexerClient` typed client crate.
@@ -419,11 +437,15 @@ The migration is tractable in 6 phases. Each phase ships independently and leave
 
 ### Phase 2: Build EVM receipt watcher service
 
+**Status: complete.**
+
 - New service per EVM chain: newHeads sub + pending hash store + WS push API.
 - `EvmReceiptWatcherClient` typed client.
 - T-router gains the ability to "hand off" submitted tx hashes to the receipt watcher (via Sauron, per the actor/observer split).
 
 ### Phase 3: Sauron retrofit (EVM)
+
+**Status: complete.**
 
 - Replace `bin/sauron/src/discovery/evm_erc20.rs` usages with `EvmIndexerClient` + `EvmReceiptWatcherClient`.
 - Implement Velora, Across, CCTP venue observers using the new typed clients.
@@ -432,6 +454,8 @@ The migration is tractable in 6 phases. Each phase ships independently and leave
 
 ### Phase 4: Bitcoin indexer + Sauron retrofit (BTC)
 
+**Status: complete.**
+
 - Build Bitcoin indexer service (electrs-shim or pure Rust — decide before starting).
 - Build Bitcoin receipt watcher.
 - Replace `bin/sauron/src/discovery/bitcoin.rs` with `BitcoinIndexerClient` + `BitcoinReceiptWatcherClient`.
@@ -439,6 +463,8 @@ The migration is tractable in 6 phases. Each phase ships independently and leave
 - Delete the old `bitcoin.rs` discovery backend.
 
 ### Phase 5: Hyperliquid indexer + receipt watcher + Sauron retrofit (HL)
+
+**Status: complete for the v1 observer scope.** The shipped v1 uses the HL shim indexer and typed Sauron observers. A standalone HL receipt watcher remains optional future hardening because current observers consume typed HL indexer events directly.
 
 API + ingestion semantics finalized (component §3 + `docs/sauron/hyperliquid-api-reference.md`).
 
@@ -449,6 +475,8 @@ API + ingestion semantics finalized (component §3 + `docs/sauron/hyperliquid-ap
 - This phase eliminates the original loadgen-stall failure mode.
 
 ### Phase 6: MultiSource concurrent-poll within each indexer
+
+**Status: deferred.**
 
 - Add periodic full-poll source to each indexer (alongside push) with deduplication.
 - Initially low-priority — push is enough for steady-state correctness; full-poll is a belt-and-suspenders reconciliation.
