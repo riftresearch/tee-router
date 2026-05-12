@@ -10,7 +10,9 @@ use chrono::{DateTime, Utc};
 use evm_token_indexer_client::TokenIndexerClient;
 use hl_shim_client::HlShimClient;
 use pgwire_replication::ReplicationEvent;
-use router_core::models::{ProviderOperationHintKind, PROVIDER_OPERATION_OBSERVATION_HINT_SOURCE};
+use router_core::models::{
+    ProviderOperationHintKind, ProviderOperationType, PROVIDER_OPERATION_OBSERVATION_HINT_SOURCE,
+};
 use router_server::api::{ProviderOperationHintRequest, MAX_HINT_IDEMPOTENCY_KEY_LEN};
 use sha2::{Digest, Sha256};
 use snafu::ResultExt;
@@ -32,6 +34,7 @@ use crate::{
         DiscoveryContext,
     },
     error::{Error, ReplicaDatabaseConnectionSnafu, Result, StateDatabaseConnectionSnafu},
+    provider_evm_receipts::{run_evm_receipt_observer_loop, EvmReceiptObserverClients},
     provider_operations::{
         full_provider_operation_reconcile, ProviderOperationWatchEntry,
         ProviderOperationWatchRepository, ProviderOperationWatchStore,
@@ -109,6 +112,11 @@ pub async fn run(args: SauronArgs) -> Result<()> {
         provider_operation_store.clone(),
         router_client.clone(),
     )?;
+    let evm_receipt_observer_task = build_evm_receipt_observer_task(
+        &args,
+        provider_operation_store.clone(),
+        router_client.clone(),
+    )?;
     let discovery_task = run_backends(
         backends,
         DiscoveryContext {
@@ -124,6 +132,7 @@ pub async fn run(args: SauronArgs) -> Result<()> {
         expiration_prune_task,
         provider_operation_observer_task,
         hyperliquid_observer_task,
+        evm_receipt_observer_task,
         discovery_task
     )?;
     Ok(())
@@ -301,6 +310,23 @@ fn build_hyperliquid_observer_task(
         hl_client,
         arbitrum_token_indexer,
         args.sauron_hl_bridge_match_window_seconds,
+    )))
+}
+
+fn build_evm_receipt_observer_task(
+    args: &SauronArgs,
+    provider_operation_store: ProviderOperationWatchStore,
+    router_client: RouterClient,
+) -> Result<BoxedSauronTask> {
+    let Some(clients) = EvmReceiptObserverClients::from_args(args)? else {
+        return Ok(Box::pin(async {
+            std::future::pending::<Result<()>>().await
+        }));
+    };
+    Ok(Box::pin(run_evm_receipt_observer_loop(
+        clients,
+        provider_operation_store,
+        router_client,
     )))
 }
 
@@ -657,10 +683,13 @@ mod tests {
             bitcoin_zmq_sequence_endpoint: "tcp://bitcoin:28333".to_string(),
             ethereum_mainnet_rpc_url: "http://ethereum:8545".to_string(),
             ethereum_token_indexer_url: None,
+            ethereum_receipt_watcher_url: None,
             base_rpc_url: "http://base:8545".to_string(),
             base_token_indexer_url: None,
+            base_receipt_watcher_url: None,
             arbitrum_rpc_url: "http://arbitrum:8545".to_string(),
             arbitrum_token_indexer_url: None,
+            arbitrum_receipt_watcher_url: None,
             hl_shim_indexer_url: None,
             sauron_hl_bridge_match_window_seconds: 1_800,
             token_indexer_api_key: None,
@@ -1353,6 +1382,12 @@ async fn observe_provider_operation_once(
     last_submission: Option<SubmittedProviderOperationHint>,
 ) -> ProviderOperationObserveOutcome {
     let operation_id = operation.operation_id;
+    if uses_typed_evm_receipt_observer(operation.operation_type) {
+        return ProviderOperationObserveOutcome {
+            operation_id,
+            submitted_hint: None,
+        };
+    }
     let fingerprint = match provider_operation_hint_fingerprint(operation.as_ref()) {
         Ok(fingerprint) => fingerprint,
         Err(error) => {
@@ -1423,6 +1458,13 @@ async fn observe_provider_operation_once(
             }
         }
     }
+}
+
+fn uses_typed_evm_receipt_observer(operation_type: ProviderOperationType) -> bool {
+    matches!(
+        operation_type,
+        ProviderOperationType::CctpReceive | ProviderOperationType::UniversalRouterSwap
+    )
 }
 
 fn should_submit_provider_operation_hint(

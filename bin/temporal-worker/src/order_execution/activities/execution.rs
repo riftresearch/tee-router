@@ -2123,7 +2123,7 @@ pub(super) async fn prepare_provider_completion(
             custody_vault_id,
             action,
             provider_context,
-            state,
+            mut state,
         } => {
             let action_for_response = action.clone();
             let receipt = deps
@@ -2136,6 +2136,17 @@ pub(super) async fn prepare_provider_completion(
                 .map_err(|source| {
                     custody_action_error("execute provider custody action", source)
                 })?;
+            if let Some(operation) = state.operation.as_mut() {
+                operation
+                    .provider_ref
+                    .get_or_insert_with(|| receipt.tx_hash.clone());
+                let submitted_state = json!({
+                    "kind": "custody_action_submitted",
+                    "tx_hash": receipt.tx_hash.clone(),
+                    "custody_vault_id": receipt.custody_vault_id,
+                });
+                operation.observed_state.get_or_insert(submitted_state);
+            }
             let outcome = provider_operation_outcome(step, state.operation.as_ref())
                 .map_err(|source| provider_execute_error(&step.provider, source))?;
             let observed_state = state

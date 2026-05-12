@@ -42,6 +42,7 @@ async fn confirms_registered_tx_hash_against_anvil() -> TestResult<()> {
     let pending = PendingWatches::new(config.chain.clone(), config.max_pending);
     let pubsub = ReceiptPubSub::new(config.max_subscriber_lag);
     let watcher = Watcher::new(&config, pending.clone(), pubsub.clone()).await?;
+    let receipt_provider = watcher.receipt_provider();
     tokio::spawn(async move {
         watcher.run().await;
     });
@@ -50,6 +51,7 @@ async fn confirms_registered_tx_hash_against_anvil() -> TestResult<()> {
         chain: config.chain.clone(),
         pending,
         pubsub,
+        receipt_provider,
         metrics: None,
     });
     let listener = TcpListener::bind(config.bind).await?;

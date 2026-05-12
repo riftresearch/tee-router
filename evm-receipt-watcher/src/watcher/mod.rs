@@ -76,6 +76,10 @@ impl Watcher {
         })
     }
 
+    pub fn receipt_provider(&self) -> DynProvider {
+        self.http_provider.clone()
+    }
+
     pub async fn run(self) {
         let mut last_observed_height = None;
 

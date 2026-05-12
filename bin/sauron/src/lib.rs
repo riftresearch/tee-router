@@ -4,6 +4,7 @@ pub mod config;
 pub mod cursor;
 pub mod discovery;
 pub mod error;
+pub mod provider_evm_receipts;
 pub mod provider_operations;
 pub mod router_client;
 pub mod runtime;

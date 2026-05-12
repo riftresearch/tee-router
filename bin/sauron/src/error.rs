@@ -79,6 +79,11 @@ pub enum Error {
         source: evm_token_indexer_client::Error,
     },
 
+    #[snafu(display("EVM receipt watcher request failed"))]
+    EvmReceiptWatcher {
+        source: evm_receipt_watcher_client::Error,
+    },
+
     #[snafu(display("HL shim indexer request failed"))]
     HlShim { source: hl_shim_client::Error },
 

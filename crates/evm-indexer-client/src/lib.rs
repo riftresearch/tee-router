@@ -97,8 +97,31 @@ pub struct EvmTransfer {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvmLog {
+    pub id: String,
+    pub chain_id: u64,
+    pub block_number: u64,
+    pub log_index: u64,
+    pub tx_hash: B256,
+    pub address: Address,
+    pub topic0: B256,
+    pub topic1: Option<B256>,
+    pub topic2: Option<B256>,
+    pub topic3: Option<B256>,
+    pub data: String,
+    pub block_timestamp: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferPage {
     pub transfers: Vec<EvmTransfer>,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogPage {
+    pub logs: Vec<EvmLog>,
     pub next_cursor: Option<String>,
     pub has_more: bool,
 }
@@ -129,11 +152,47 @@ impl TransferQuery {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogQuery {
+    pub address: Address,
+    pub topic0: B256,
+    pub topic1: Option<B256>,
+    pub topic2: Option<B256>,
+    pub topic3: Option<B256>,
+    pub from_block: Option<u64>,
+    pub limit: Option<u32>,
+    pub cursor: Option<String>,
+}
+
+impl LogQuery {
+    pub fn new(address: Address, topic0: B256) -> Self {
+        Self {
+            address,
+            topic0,
+            topic1: None,
+            topic2: None,
+            topic3: None,
+            from_block: None,
+            limit: None,
+            cursor: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubscribeFilter {
     pub token_addresses: Vec<Address>,
     pub recipient_addresses: Vec<Address>,
     pub min_amount: Option<U256>,
     pub max_amount: Option<U256>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogSubscribeFilter {
+    pub addresses: Vec<Address>,
+    pub topic0: B256,
+    pub topic1: Option<B256>,
+    pub topic2: Option<B256>,
+    pub topic3: Option<B256>,
 }
 
 pub type EvmTransferFilter = (Vec<Address>, Vec<Address>, Option<U256>, Option<U256>);
@@ -214,6 +273,16 @@ impl EvmIndexerClient {
         read_transfer_page_response(response).await
     }
 
+    pub async fn logs(&self, query: LogQuery) -> Result<LogPage> {
+        let mut url = self.base_url.join("logs").context(InvalidUrlSnafu)?;
+        append_log_query(&mut url, &query);
+        let response = self
+            .send_request("GET", "/logs", self.authorize(self.http.get(url)))
+            .await
+            .context(RequestSnafu)?;
+        read_log_page_response(response).await
+    }
+
     pub async fn prune(&self, request: PruneRequest) -> Result<PruneResponse> {
         let url = self.base_url.join("prune").context(InvalidUrlSnafu)?;
         let response = self
@@ -256,7 +325,7 @@ impl EvmIndexerClient {
         socket
             .send(Message::Text(
                 serde_json::to_string(&ClientMessage::Subscribe {
-                    filter: WireSubscribeFilter::from(filter),
+                    filter: WireClientSubscribeFilter::Transfer(WireSubscribeFilter::from(filter)),
                 })
                 .map_err(|source| Error::WebSocketJson { source })?,
             ))
@@ -270,6 +339,63 @@ impl EvmIndexerClient {
             while let Some(frame) = socket.next().await {
                 let event = match frame {
                     Ok(Message::Text(text)) => match decode_server_message(&text) {
+                        Ok(Some(event)) => Ok(event),
+                        Ok(None) => continue,
+                        Err(error) => Err(error),
+                    },
+                    Ok(Message::Close(_)) | Err(_) => break,
+                    Ok(_) => continue,
+                };
+                if tx.send(event).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(rx)
+    }
+
+    pub async fn subscribe_logs(
+        &self,
+        filter: LogSubscribeFilter,
+    ) -> Result<mpsc::Receiver<Result<EvmLog>>> {
+        let mut request = self
+            .subscribe_url
+            .as_str()
+            .into_client_request()
+            .map_err(|source| Error::WebSocket {
+                source: source.to_string(),
+            })?;
+        if let Some(api_key) = &self.api_key {
+            let value = HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|source| {
+                Error::WebSocket {
+                    source: source.to_string(),
+                }
+            })?;
+            request.headers_mut().insert(AUTHORIZATION, value);
+        }
+
+        let (mut socket, _) = connect_async(request)
+            .await
+            .map_err(|source| Error::WebSocket {
+                source: source.to_string(),
+            })?;
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&ClientMessage::Subscribe {
+                    filter: WireClientSubscribeFilter::Log(WireLogSubscribeFilter::from(filter)),
+                })
+                .map_err(|source| Error::WebSocketJson { source })?,
+            ))
+            .await
+            .map_err(|source| Error::WebSocket {
+                source: source.to_string(),
+            })?;
+
+        let (tx, rx) = mpsc::channel(256);
+        tokio::spawn(async move {
+            while let Some(frame) = socket.next().await {
+                let event = match frame {
+                    Ok(Message::Text(text)) => match decode_log_server_message(&text) {
                         Ok(Some(event)) => Ok(event),
                         Ok(None) => continue,
                         Err(error) => Err(error),
@@ -351,6 +477,14 @@ struct WireTransferPage {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct WireLogPage {
+    logs: Vec<WireEvmLog>,
+    next_cursor: Option<String>,
+    has_more: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct WireEvmTransfer {
     id: String,
     chain_id: u64,
@@ -362,6 +496,23 @@ struct WireEvmTransfer {
     block_number: String,
     block_hash: B256,
     log_index: u64,
+    block_timestamp: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireEvmLog {
+    id: String,
+    chain_id: u64,
+    block_number: String,
+    log_index: u64,
+    tx_hash: B256,
+    address: Address,
+    topic0: B256,
+    topic1: Option<B256>,
+    topic2: Option<B256>,
+    topic3: Option<B256>,
+    data: String,
     block_timestamp: String,
 }
 
@@ -380,6 +531,27 @@ impl TryFrom<WireEvmTransfer> for EvmTransfer {
             block_number: parse_u64_decimal(&value.block_number, "block_number")?,
             block_hash: value.block_hash,
             log_index: value.log_index,
+            block_timestamp: parse_u64_decimal(&value.block_timestamp, "block_timestamp")?,
+        })
+    }
+}
+
+impl TryFrom<WireEvmLog> for EvmLog {
+    type Error = Error;
+
+    fn try_from(value: WireEvmLog) -> Result<Self> {
+        Ok(Self {
+            id: value.id,
+            chain_id: value.chain_id,
+            block_number: parse_u64_decimal(&value.block_number, "block_number")?,
+            log_index: value.log_index,
+            tx_hash: value.tx_hash,
+            address: value.address,
+            topic0: value.topic0,
+            topic1: value.topic1,
+            topic2: value.topic2,
+            topic3: value.topic3,
+            data: value.data,
             block_timestamp: parse_u64_decimal(&value.block_timestamp, "block_timestamp")?,
         })
     }
@@ -434,9 +606,45 @@ impl From<SubscribeFilter> for WireSubscribeFilter {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+struct WireLogSubscribeFilter {
+    addresses: Vec<String>,
+    topic0: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    topic1: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    topic2: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    topic3: Option<String>,
+}
+
+impl From<LogSubscribeFilter> for WireLogSubscribeFilter {
+    fn from(value: LogSubscribeFilter) -> Self {
+        Self {
+            addresses: value
+                .addresses
+                .into_iter()
+                .map(|address| format!("{address:?}"))
+                .collect(),
+            topic0: format!("{:?}", value.topic0),
+            topic1: value.topic1.map(|topic| format!("{topic:?}")),
+            topic2: value.topic2.map(|topic| format!("{topic:?}")),
+            topic3: value.topic3.map(|topic| format!("{topic:?}")),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum WireClientSubscribeFilter {
+    Transfer(WireSubscribeFilter),
+    Log(WireLogSubscribeFilter),
+}
+
+#[derive(Debug, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 enum ClientMessage {
-    Subscribe { filter: WireSubscribeFilter },
+    Subscribe { filter: WireClientSubscribeFilter },
 }
 
 #[derive(Debug, Deserialize)]
@@ -453,6 +661,9 @@ enum ServerMessage {
     Transfer {
         event: WireEvmTransfer,
     },
+    Log {
+        event: WireEvmLog,
+    },
     Error {
         error: String,
     },
@@ -464,7 +675,21 @@ fn decode_server_message(text: &str) -> Result<Option<EvmTransfer>> {
     {
         ServerMessage::Transfer { event } => Ok(Some(event.try_into()?)),
         ServerMessage::Error { error } => Err(Error::WebSocket { source: error }),
-        ServerMessage::Subscribed { .. } | ServerMessage::Unsubscribed { .. } => Ok(None),
+        ServerMessage::Subscribed { .. }
+        | ServerMessage::Unsubscribed { .. }
+        | ServerMessage::Log { .. } => Ok(None),
+    }
+}
+
+fn decode_log_server_message(text: &str) -> Result<Option<EvmLog>> {
+    match serde_json::from_str::<ServerMessage>(text)
+        .map_err(|source| Error::WebSocketJson { source })?
+    {
+        ServerMessage::Log { event } => Ok(Some(event.try_into()?)),
+        ServerMessage::Error { error } => Err(Error::WebSocket { source: error }),
+        ServerMessage::Subscribed { .. }
+        | ServerMessage::Unsubscribed { .. }
+        | ServerMessage::Transfer { .. } => Ok(None),
     }
 }
 
@@ -491,6 +716,30 @@ fn append_transfer_query(url: &mut Url, query: &TransferQuery) {
     }
 }
 
+fn append_log_query(url: &mut Url, query: &LogQuery) {
+    let mut pairs = url.query_pairs_mut();
+    pairs.append_pair("address", &format!("{:?}", query.address));
+    pairs.append_pair("topic0", &format!("{:?}", query.topic0));
+    if let Some(topic1) = query.topic1 {
+        pairs.append_pair("topic1", &format!("{topic1:?}"));
+    }
+    if let Some(topic2) = query.topic2 {
+        pairs.append_pair("topic2", &format!("{topic2:?}"));
+    }
+    if let Some(topic3) = query.topic3 {
+        pairs.append_pair("topic3", &format!("{topic3:?}"));
+    }
+    if let Some(from_block) = query.from_block {
+        pairs.append_pair("from_block", &from_block.to_string());
+    }
+    if let Some(limit) = query.limit {
+        pairs.append_pair("limit", &limit.to_string());
+    }
+    if let Some(cursor) = &query.cursor {
+        pairs.append_pair("cursor", cursor);
+    }
+}
+
 async fn read_transfer_page_response(response: reqwest::Response) -> Result<TransferPage> {
     let wire = read_json_response::<WireTransferPage>(response).await?;
     let transfers = wire
@@ -500,6 +749,20 @@ async fn read_transfer_page_response(response: reqwest::Response) -> Result<Tran
         .collect::<Result<Vec<_>>>()?;
     Ok(TransferPage {
         transfers,
+        next_cursor: wire.next_cursor,
+        has_more: wire.has_more,
+    })
+}
+
+async fn read_log_page_response(response: reqwest::Response) -> Result<LogPage> {
+    let wire = read_json_response::<WireLogPage>(response).await?;
+    let logs = wire
+        .logs
+        .into_iter()
+        .map(EvmLog::try_from)
+        .collect::<Result<Vec<_>>>()?;
+    Ok(LogPage {
+        logs,
         next_cursor: wire.next_cursor,
         has_more: wire.has_more,
     })
@@ -712,6 +975,30 @@ mod tests {
     }
 
     #[test]
+    fn log_query_uses_primitive_endpoint_and_snake_case_parameters() {
+        let client = EvmIndexerClient::new("http://localhost:4001/base-indexer").unwrap();
+        let mut url = client.base_url.join("logs").unwrap();
+        append_log_query(
+            &mut url,
+            &LogQuery {
+                address: addr(0x11),
+                topic0: B256::repeat_byte(0x22),
+                topic1: Some(B256::repeat_byte(0x33)),
+                topic2: None,
+                topic3: Some(B256::repeat_byte(0x44)),
+                from_block: Some(123),
+                limit: Some(50),
+                cursor: Some("opaque".to_string()),
+            },
+        );
+
+        assert_eq!(
+            url.as_str(),
+            "http://localhost:4001/base-indexer/logs?address=0x1111111111111111111111111111111111111111&topic0=0x2222222222222222222222222222222222222222222222222222222222222222&topic1=0x3333333333333333333333333333333333333333333333333333333333333333&topic3=0x4444444444444444444444444444444444444444444444444444444444444444&from_block=123&limit=50&cursor=opaque"
+        );
+    }
+
+    #[test]
     fn websocket_url_preserves_path_base() {
         let base = normalize_http_base_url("https://example.com/erc20-indexer").unwrap();
         let ws = subscribe_url_from_base(&base).unwrap();
@@ -734,13 +1021,38 @@ mod tests {
             max_amount: Some(U256::from(9_u64)),
         });
 
-        let json = serde_json::to_string(&ClientMessage::Subscribe { filter: wire }).unwrap();
+        let json = serde_json::to_string(&ClientMessage::Subscribe {
+            filter: WireClientSubscribeFilter::Transfer(wire),
+        })
+        .unwrap();
 
         assert!(json.contains("\"action\":\"subscribe\""));
         assert!(json.contains("\"token_addresses\""));
         assert!(json.contains("\"recipient_addresses\""));
         assert!(json.contains("\"min_amount\":\"7\""));
         assert!(json.contains("\"max_amount\":\"9\""));
+    }
+
+    #[test]
+    fn wire_log_filter_serializes_as_subscribe_action() {
+        let wire = WireLogSubscribeFilter::from(LogSubscribeFilter {
+            addresses: vec![addr(0xaa), addr(0xbb)],
+            topic0: B256::repeat_byte(0x01),
+            topic1: Some(B256::repeat_byte(0x02)),
+            topic2: None,
+            topic3: None,
+        });
+
+        let json = serde_json::to_string(&ClientMessage::Subscribe {
+            filter: WireClientSubscribeFilter::Log(wire),
+        })
+        .unwrap();
+
+        assert!(json.contains("\"action\":\"subscribe\""));
+        assert!(json.contains("\"addresses\""));
+        assert!(json.contains("\"topic0\""));
+        assert!(json.contains("\"topic1\""));
+        assert!(!json.contains("\"topic2\""));
     }
 
     #[test]

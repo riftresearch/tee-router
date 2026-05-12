@@ -154,12 +154,41 @@ pub struct ProviderOperationHintSignal {
 #[serde(untagged)]
 pub enum ProviderOperationHintEvidence {
     UnitDeposit(UnitDepositHintEvidence),
+    VeloraSwapSettled(VeloraSwapSettledEvidence),
+    CctpReceiveObserved(CctpReceiveObservedEvidence),
     HlTradeFilled(HlTradeFilledEvidence),
     HlTradeCanceled(HlTradeCanceledEvidence),
     HlBridgeDepositObserved(HlBridgeDepositObservedEvidence),
     HlBridgeDepositCredited(HlBridgeDepositCreditedEvidence),
     HlWithdrawalAcknowledged(HlWithdrawalAcknowledgedEvidence),
     HlWithdrawalSettled(HlWithdrawalSettledEvidence),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VeloraSwapSettledEvidence {
+    pub tx_hash: String,
+    pub log_index: u64,
+    pub amount_out: String,
+    pub recipient: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_number: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CctpReceiveObservedEvidence {
+    pub tx_hash: String,
+    pub log_index: u64,
+    pub token: String,
+    pub recipient: String,
+    pub amount: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_number: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -275,9 +304,12 @@ pub enum ProviderKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProviderHintKind {
     CctpAttestation,
+    CctpReceiveObserved,
     AcrossFill,
+    AcrossDestinationFilled,
     UnitDeposit,
     ProviderObservation,
+    VeloraSwapSettled,
     HyperliquidTrade,
     HlTradeFilled,
     HlTradeCanceled,
