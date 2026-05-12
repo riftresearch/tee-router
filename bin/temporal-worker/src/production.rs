@@ -9,6 +9,7 @@ use chains::{
     ChainRegistry,
 };
 use clap::Args;
+use market_pricing::{MarketPricingOracle, MarketPricingOracleConfig};
 use router_core::{
     config::Settings,
     db::Database,
@@ -21,6 +22,7 @@ use router_core::{
             bitcoin_address_from_private_key, evm_address_from_private_key, CustodyActionExecutor,
             HyperliquidCallNetwork, HyperliquidRuntimeConfig, PaymasterRegistry,
         },
+        PricingSnapshotProvider, RouteCostService,
     },
 };
 use router_primitives::ChainType;
@@ -203,6 +205,14 @@ pub struct OrderWorkerRuntimeArgs {
     /// Timeout for Hyperliquid resting orders before exchange-side cancel, in milliseconds.
     #[arg(long, env = "HYPERLIQUID_ORDER_TIMEOUT_MS", default_value = "30000")]
     pub hyperliquid_order_timeout_ms: u64,
+
+    /// Coinbase unauthenticated price API base URL used by USD valuation pricing refresh
+    #[arg(
+        long,
+        env = "COINBASE_PRICE_API_BASE_URL",
+        default_value = "https://api.coinbase.com"
+    )]
+    pub coinbase_price_api_base_url: String,
 }
 
 impl OrderWorkerRuntimeArgs {
@@ -220,6 +230,9 @@ impl OrderWorkerRuntimeArgs {
         reject_shared_hyperliquid_execution_config(self)?;
         let chain_registry = Arc::new(initialize_chain_registry(self).await?);
         let action_providers = Arc::new(initialize_action_providers(self)?);
+        let pricing_provider: Arc<dyn PricingSnapshotProvider> = Arc::new(
+            initialize_pricing_provider(self, db.clone(), action_providers.clone())?,
+        );
         let custody_action_executor = Arc::new(
             CustodyActionExecutor::new(db.clone(), settings, chain_registry.clone())
                 .with_hyperliquid_runtime(hyperliquid_runtime_config(self)?)
@@ -230,8 +243,27 @@ impl OrderWorkerRuntimeArgs {
             action_providers,
             custody_action_executor,
             chain_registry,
+            pricing_provider,
         ))
     }
+}
+
+fn initialize_pricing_provider(
+    args: &OrderWorkerRuntimeArgs,
+    db: Database,
+    action_providers: Arc<ActionProviderRegistry>,
+) -> WorkerResult<RouteCostService> {
+    let oracle_config = MarketPricingOracleConfig::new(
+        &args.coinbase_price_api_base_url,
+        &args.ethereum_mainnet_rpc_url,
+        &args.arbitrum_rpc_url,
+        &args.base_rpc_url,
+    )
+    .map_err(|source| config_error(format!("invalid USD pricing oracle config: {source}")))?;
+    let pricing_oracle = Arc::new(MarketPricingOracle::new(oracle_config).map_err(|source| {
+        config_error(format!("failed to initialize USD pricing oracle: {source}"))
+    })?);
+    Ok(RouteCostService::new(db, action_providers).with_pricing_oracle(pricing_oracle))
 }
 
 fn load_settings(master_key_path: &str) -> WorkerResult<Settings> {

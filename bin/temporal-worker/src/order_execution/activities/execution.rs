@@ -289,6 +289,7 @@ impl OrderActivities {
             plan.steps =
                 hydrate_destination_execution_steps(&deps, input.order_id.inner(), plan.steps)
                     .await?;
+            apply_execution_leg_usd_valuations(&deps, &mut plan.legs).await;
             let record = deps
                 .db
                 .orders()
@@ -559,6 +560,15 @@ impl OrderActivities {
                     boundary: PersistenceBoundary::AfterProviderStepSettlement,
                 });
             }
+            let step = deps
+                .db
+                .orders()
+                .get_execution_step(input.execution.step_id.inner())
+                .await
+                .map_err(OrderActivityError::db_query)?;
+            let response = input.execution.response;
+            let usd_valuation =
+                execution_step_usd_valuation_for_response(&deps, &step, &response).await;
             let record = deps
                 .db
                 .orders()
@@ -566,9 +576,9 @@ impl OrderActivities {
                     step_id: input.execution.step_id.inner(),
                     operation: None,
                     addresses: Vec::new(),
-                    response: input.execution.response,
+                    response,
                     tx_hash: input.execution.tx_hash,
-                    usd_valuation: json!({}),
+                    usd_valuation,
                     completed_at: Utc::now(),
                 })
                 .await
@@ -1695,14 +1705,22 @@ pub(super) async fn complete_observed_provider_step(
     execution: &StepExecuted,
     operation: &OrderProviderOperation,
 ) -> Result<OrderExecutionStep, OrderActivityError> {
+    let step = deps
+        .db
+        .orders()
+        .get_execution_step(execution.step_id.inner())
+        .await
+        .map_err(OrderActivityError::db_query)?;
+    let response = provider_operation_step_response(operation);
+    let usd_valuation = execution_step_usd_valuation_for_response(deps, &step, &response).await;
     let completed = deps
         .db
         .orders()
         .complete_observed_execution_step(
             execution.step_id.inner(),
-            provider_operation_step_response(operation),
+            response,
             provider_operation_tx_hash(operation),
-            json!({}),
+            usd_valuation,
             Utc::now(),
         )
         .await;

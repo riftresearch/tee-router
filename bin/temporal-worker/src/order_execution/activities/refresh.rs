@@ -1634,6 +1634,7 @@ impl QuoteRefreshActivities {
             plan.steps =
                 hydrate_destination_execution_steps(&deps, input.order_id.inner(), plan.steps)
                     .await?;
+            apply_execution_leg_usd_valuations(&deps, &mut plan.legs).await;
             let record = deps
                 .db
                 .orders()

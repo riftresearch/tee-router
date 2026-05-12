@@ -3,12 +3,18 @@ use crate::{
     services::asset_registry::CanonicalAsset,
 };
 use alloy::primitives::U256;
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use router_primitives::ChainType;
 
 pub const USD_MICRO: u64 = 1_000_000;
 pub const BPS_DENOMINATOR: u64 = 10_000;
 pub const STATIC_BOOTSTRAP_PRICING_SOURCE: &str = "static_bootstrap_pricing_v1";
+
+#[async_trait]
+pub trait PricingSnapshotProvider: Send + Sync {
+    async fn usd_pricing_snapshot(&self) -> Option<PricingSnapshot>;
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PricingSnapshot {

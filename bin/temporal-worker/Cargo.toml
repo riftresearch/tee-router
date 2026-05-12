@@ -17,6 +17,7 @@ clap = { workspace = true }
 futures = "0.3"
 futures-util = "0.3"
 metrics = { workspace = true }
+market-pricing = { workspace = true }
 observability = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

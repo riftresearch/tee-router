@@ -655,6 +655,7 @@ fn order_worker_runtime_args_from_router_args(args: &RouterServerArgs) -> OrderW
         hyperliquid_paymaster_private_key: args.hyperliquid_paymaster_private_key.clone(),
         hyperliquid_network: args.hyperliquid_network,
         hyperliquid_order_timeout_ms: args.hyperliquid_order_timeout_ms,
+        coinbase_price_api_base_url: args.coinbase_price_api_base_url.clone(),
     }
 }
 

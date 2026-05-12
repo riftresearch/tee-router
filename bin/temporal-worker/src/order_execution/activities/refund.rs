@@ -364,7 +364,7 @@ pub(super) async fn materialize_external_custody_refund_plan(
         )
         .await?
     };
-    let Some((legs, mut steps)) = maybe_plan else {
+    let Some((mut legs, mut steps)) = maybe_plan else {
         return Ok(refund_plan_untenable(
             RefundUntenableReason::RefundRecoverablePositionDisappearedAfterValidation,
         ));
@@ -375,6 +375,7 @@ pub(super) async fn materialize_external_custody_refund_plan(
         .unwrap_or("direct_internal")
         .to_string();
     steps = hydrate_destination_execution_steps(deps, input.order_id.inner(), steps).await?;
+    apply_execution_leg_usd_valuations(deps, &mut legs).await;
     let (refund_attempt_id, steps) =
         create_external_custody_refund_attempt(deps, &input, &source, legs, steps, now).await?;
     telemetry::record_refund_attempt_materialized(
@@ -507,7 +508,7 @@ pub(super) async fn materialize_hyperliquid_spot_refund_plan(
     };
 
     let now = Utc::now();
-    let Some((legs, steps)) = hyperliquid_spot_refund_back_steps(
+    let Some((mut legs, steps)) = hyperliquid_spot_refund_back_steps(
         deps,
         &source.order,
         &source.vault,
@@ -527,6 +528,7 @@ pub(super) async fn materialize_hyperliquid_spot_refund_plan(
         .and_then(|leg| leg.transition_decl_id.as_deref())
         .unwrap_or("unknown")
         .to_string();
+    apply_execution_leg_usd_valuations(deps, &mut legs).await;
     let (refund_attempt_id, steps) =
         create_hyperliquid_spot_refund_attempt(deps, &input, &source, legs, steps, now).await?;
     telemetry::record_refund_attempt_materialized(

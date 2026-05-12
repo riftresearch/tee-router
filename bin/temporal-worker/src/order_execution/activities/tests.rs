@@ -1066,7 +1066,17 @@ fn test_deps(db: Database) -> OrderActivityDeps {
         settings,
         chain_registry.clone(),
     ));
-    OrderActivityDeps::new(db, action_providers, custody_executor, chain_registry)
+    let pricing_provider = Arc::new(router_core::services::RouteCostService::new(
+        db.clone(),
+        action_providers.clone(),
+    ));
+    OrderActivityDeps::new(
+        db,
+        action_providers,
+        custody_executor,
+        chain_registry,
+        pricing_provider,
+    )
 }
 
 fn test_settings() -> Settings {
