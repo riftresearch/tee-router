@@ -1,6 +1,8 @@
 # EVM Token Indexer
 
-Ponder-based chain-wide ERC-20 transfer indexer for Sauron deposit detection.
+Ponder-based chain-wide ERC-20 transfer indexer. The primitive API exposes raw
+ERC-20 transfers without Sauron watch or candidate vocabulary; the legacy
+Sauron endpoints remain available until the Sauron retrofit is complete.
 
 The indexer is chain-agnostic at runtime:
 
@@ -14,13 +16,33 @@ The indexer is chain-agnostic at runtime:
   `EVM_TOKEN_INDEXER_ALLOW_UNAUTHENTICATED=true` explicitly. This escape hatch
   is rejected when `NODE_ENV=production` or `RAILWAY_ENVIRONMENT=production`.
 
-The app indexes addressless ERC-20 `Transfer` logs. It stores raw rolling transfer
-rows, mirrors Sauron's active deposit watches, and materializes durable deposit
-candidates for Sauron to submit as router hints.
+The app indexes addressless ERC-20 `Transfer` logs into `erc20_transfer_raw`.
+Legacy routes also mirror Sauron's active deposit watches and materialize
+durable deposit candidates for Sauron to submit as router hints.
 
 ## API
 
 All API routes require `Authorization: Bearer $EVM_TOKEN_INDEXER_API_KEY`.
+
+### Primitive API
+
+- `GET /transfers?to=0x...&token=0x...&from_block=0&min_amount=1&max_amount=100&limit=100&cursor=...`
+  returns ascending raw ERC-20 transfers for a recipient. `to` is required;
+  `token`, block, amount, limit, and cursor filters are optional. The response
+  shape is `{ transfers, nextCursor, hasMore }`; cursors are opaque base64url
+  encodings of the last `(block_number, log_index)` tuple.
+- `POST /prune` with body
+  `{ "relevant_addresses": ["0x..."], "before_block": 12345 }` accepts an
+  asynchronous raw-transfer prune job. `before_block` must be at least the
+  configured reorg horizon behind the indexed head
+  (`EVM_TOKEN_INDEXER_REORG_SAFE_BLOCKS`, default `1000`).
+- `WS /subscribe` accepts a first frame
+  `{ "action": "subscribe", "filter": { "token_addresses": ["0x..."], "recipient_addresses": ["0x..."], "min_amount": "1", "max_amount": "100" } }`
+  and pushes matching frames as `{ "kind": "transfer", "event": ... }`.
+  Slow subscribers are disconnected once their pending socket buffer exceeds
+  `EVM_TOKEN_INDEXER_WS_MAX_BUFFERED_BYTES` (default `1 MiB`).
+
+### Legacy Sauron API
 
 - `PUT /watches` replaces the active ERC-20 watch mirror for this chain and
   materializes matching candidates.

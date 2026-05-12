@@ -3156,6 +3156,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "evm-indexer-client"
+version = "0.1.8"
+dependencies = [
+ "alloy",
+ "async-trait",
+ "futures-util",
+ "metrics",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "snafu",
+ "tokio",
+ "tokio-tungstenite 0.24.0",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "evm-token-indexer-client"
 version = "0.1.8"
 dependencies = [
