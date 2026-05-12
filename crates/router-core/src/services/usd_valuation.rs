@@ -246,6 +246,47 @@ pub fn execution_leg_usd_valuation(
 }
 
 #[must_use]
+pub fn execution_leg_actual_usd_valuation(
+    existing_valuation: &Value,
+    actual_amount_in: Option<&str>,
+    actual_amount_out: Option<&str>,
+    input_asset: &DepositAsset,
+    output_asset: &DepositAsset,
+) -> Value {
+    let mut valuation = existing_valuation.clone();
+    let Some(amounts) = valuation.get_mut("amounts").and_then(Value::as_object_mut) else {
+        return valuation;
+    };
+
+    if amounts.get("actualInput").is_none() {
+        if let (Some(actual_amount_in), Some(planned_input)) =
+            (actual_amount_in, amounts.get("plannedInput"))
+        {
+            if let Some(actual_input) =
+                actual_amount_from_planned(actual_amount_in, input_asset, planned_input)
+            {
+                amounts.insert("actualInput".to_string(), actual_input);
+            }
+        }
+    }
+
+    if amounts.get("actualOutput").is_none() {
+        if let Some(actual_amount_out) = actual_amount_out {
+            let planned_output = amounts
+                .get("plannedOutput")
+                .or_else(|| amounts.get("plannedMinOutput"));
+            if let Some(actual_output) = planned_output.and_then(|planned_output| {
+                actual_amount_from_planned(actual_amount_out, output_asset, planned_output)
+            }) {
+                amounts.insert("actualOutput".to_string(), actual_output);
+            }
+        }
+    }
+
+    valuation
+}
+
+#[must_use]
 pub fn pricing_has_live_usd_values(pricing: &PricingSnapshot) -> bool {
     pricing.source != STATIC_BOOTSTRAP_PRICING_SOURCE
 }
@@ -436,6 +477,80 @@ fn insert_amount(
         Ok(None) => {}
         Err(error) => errors.push(format!("{key}: {error}")),
     }
+}
+
+fn actual_amount_from_planned(
+    raw_amount: &str,
+    asset: &DepositAsset,
+    planned_amount: &Value,
+) -> Option<Value> {
+    if raw_amount.is_empty()
+        || !raw_amount
+            .chars()
+            .all(|character| character.is_ascii_digit())
+    {
+        return None;
+    }
+    let planned_amount = planned_amount.as_object()?;
+    let unit_usd_micro = planned_amount.get("unitUsdMicro")?.as_str()?;
+    if unit_usd_micro.is_empty()
+        || !unit_usd_micro
+            .chars()
+            .all(|character| character.is_ascii_digit())
+    {
+        return None;
+    }
+    let decimals = json_u8_between(planned_amount.get("decimals")?, 0, 36)?;
+    let raw = U256::from_str(raw_amount).ok()?;
+    let unit_usd_micro_value = U256::from_str(unit_usd_micro).ok()?;
+    let amount_usd_micro = raw.checked_mul(unit_usd_micro_value)? / checked_pow10(decimals)?;
+
+    let mut valuation = Map::new();
+    valuation.insert("raw".to_string(), Value::String(raw_amount.to_string()));
+    valuation.insert(
+        "asset".to_string(),
+        json!({
+            "chainId": asset.chain.as_str(),
+            "assetId": asset.asset.as_str(),
+        }),
+    );
+    valuation.insert(
+        "decimals".to_string(),
+        Value::Number(serde_json::Number::from(decimals)),
+    );
+    if let Some(canonical) = planned_amount.get("canonical").and_then(Value::as_str) {
+        valuation.insert(
+            "canonical".to_string(),
+            Value::String(canonical.to_string()),
+        );
+    }
+    valuation.insert(
+        "unitUsdMicro".to_string(),
+        Value::String(unit_usd_micro.to_string()),
+    );
+    valuation.insert(
+        "amountUsdMicro".to_string(),
+        Value::String(amount_usd_micro.to_string()),
+    );
+
+    Some(Value::Object(valuation))
+}
+
+fn json_u8_between(value: &Value, min: u8, max: u8) -> Option<u8> {
+    let parsed = match value {
+        Value::Number(number) => number.as_u64()?,
+        Value::String(text) => {
+            if text.is_empty() || !text.chars().all(|character| character.is_ascii_digit()) {
+                return None;
+            }
+            text.parse::<u64>().ok()?
+        }
+        _ => return None,
+    };
+    if parsed < u64::from(min) || parsed > u64::from(max) {
+        return None;
+    }
+    u8::try_from(parsed).ok()
 }
 
 #[cfg(test)]
@@ -729,6 +844,156 @@ mod tests {
             valuation["amounts"]["actualOutput"]["amountUsdMicro"],
             "100000000"
         );
+    }
+
+    #[test]
+    fn execution_leg_actual_usd_valuation_prices_actual_amounts_from_planned_unit_price() {
+        let input_asset = DepositAsset {
+            chain: ChainId::parse("evm:8453").unwrap(),
+            asset: AssetId::parse("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913").unwrap(),
+        };
+        let output_asset = DepositAsset {
+            chain: ChainId::parse("evm:42161").unwrap(),
+            asset: AssetId::parse("0xaf88d065e77c8cc2239327c5edb3a432268e5831").unwrap(),
+        };
+        let valuation = json!({
+            "schemaVersion": 1,
+            "amounts": {
+                "plannedInput": {
+                    "raw": "100000000",
+                    "asset": {
+                        "chainId": "evm:8453",
+                        "assetId": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+                    },
+                    "canonical": "usdc",
+                    "decimals": 6,
+                    "unitUsdMicro": "1000000",
+                    "amountUsdMicro": "100000000"
+                },
+                "plannedOutput": {
+                    "raw": "100000000",
+                    "asset": {
+                        "chainId": "evm:42161",
+                        "assetId": "0xaf88d065e77c8cc2239327c5edb3a432268e5831"
+                    },
+                    "canonical": "usdc",
+                    "decimals": 6,
+                    "unitUsdMicro": "1000000",
+                    "amountUsdMicro": "100000000"
+                }
+            },
+            "legs": []
+        });
+
+        let valuation = execution_leg_actual_usd_valuation(
+            &valuation,
+            Some("139128786"),
+            Some("139128786"),
+            &input_asset,
+            &output_asset,
+        );
+
+        assert_eq!(
+            valuation["amounts"]["actualInput"]["amountUsdMicro"],
+            "139128786"
+        );
+        assert_eq!(
+            valuation["amounts"]["actualOutput"]["amountUsdMicro"],
+            "139128786"
+        );
+    }
+
+    #[test]
+    fn execution_leg_actual_usd_valuation_preserves_planned_amounts() {
+        let input_asset = DepositAsset {
+            chain: ChainId::parse("evm:8453").unwrap(),
+            asset: AssetId::parse("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913").unwrap(),
+        };
+        let output_asset = DepositAsset {
+            chain: ChainId::parse("bitcoin").unwrap(),
+            asset: AssetId::Native,
+        };
+        let planned_input = json!({
+            "raw": "100000000",
+            "asset": {
+                "chainId": "evm:8453",
+                "assetId": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+            },
+            "canonical": "usdc",
+            "decimals": 6,
+            "unitUsdMicro": "1000000",
+            "amountUsdMicro": "100000000"
+        });
+        let planned_output = json!({
+            "raw": "100000",
+            "asset": {
+                "chainId": "bitcoin",
+                "assetId": "native"
+            },
+            "canonical": "btc",
+            "decimals": 8,
+            "unitUsdMicro": "100000000000",
+            "amountUsdMicro": "100000000"
+        });
+        let valuation = json!({
+            "schemaVersion": 1,
+            "amounts": {
+                "plannedInput": planned_input,
+                "plannedOutput": planned_output,
+                "plannedMinOutput": planned_output
+            },
+            "legs": []
+        });
+
+        let merged = execution_leg_actual_usd_valuation(
+            &valuation,
+            Some("100000000"),
+            Some("100000"),
+            &input_asset,
+            &output_asset,
+        );
+
+        assert_eq!(
+            merged["amounts"]["plannedInput"],
+            valuation["amounts"]["plannedInput"]
+        );
+        assert_eq!(
+            merged["amounts"]["plannedOutput"],
+            valuation["amounts"]["plannedOutput"]
+        );
+        assert_eq!(
+            merged["amounts"]["plannedMinOutput"],
+            valuation["amounts"]["plannedMinOutput"]
+        );
+        assert!(merged["amounts"]["actualInput"].is_object());
+        assert!(merged["amounts"]["actualOutput"].is_object());
+    }
+
+    #[test]
+    fn execution_leg_actual_usd_valuation_is_noop_without_planned_input() {
+        let input_asset = DepositAsset {
+            chain: ChainId::parse("evm:8453").unwrap(),
+            asset: AssetId::parse("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913").unwrap(),
+        };
+        let output_asset = DepositAsset {
+            chain: ChainId::parse("bitcoin").unwrap(),
+            asset: AssetId::Native,
+        };
+        let valuation = json!({
+            "schemaVersion": 1,
+            "amounts": {},
+            "legs": []
+        });
+
+        let merged = execution_leg_actual_usd_valuation(
+            &valuation,
+            Some("100000000"),
+            Some("100000"),
+            &input_asset,
+            &output_asset,
+        );
+
+        assert_eq!(merged, valuation);
     }
 
     #[test]

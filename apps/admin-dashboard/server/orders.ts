@@ -1217,7 +1217,10 @@ function summarizeExecutionLegsForList(
       details: {},
       usdValuation: summarizeUsdValuationForList(leg.usdValuation, [
         'actualInput',
-        'actualOutput'
+        'actualOutput',
+        'plannedInput',
+        'plannedOutput',
+        'plannedMinOutput'
       ])
     }))
 }

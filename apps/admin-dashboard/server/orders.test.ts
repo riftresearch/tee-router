@@ -183,6 +183,9 @@ test('fetchOrderFirehose keeps summary rows lightweight', async () => {
   const now = new Date('2026-05-04T00:00:00.000Z')
   const actualInput = usdAmount('10000000', 'evm:8453', 'usdc')
   const actualOutput = usdAmount('10000000', 'evm:42161', 'usdc')
+  const plannedInput = usdAmount('10000000', 'evm:8453', 'usdc')
+  const plannedOutput = usdAmount('10000000', 'evm:42161', 'usdc')
+  const plannedMinOutput = usdAmount('9900000', 'evm:42161', 'usdc')
   const pool = {
     query: async () => {
       return {
@@ -197,7 +200,7 @@ test('fetchOrderFirehose keeps summary rows lightweight', async () => {
               amounts: {
                 input: actualInput,
                 output: actualOutput,
-                plannedInput: actualInput
+                plannedInput
               },
               legs: [{ index: 0, amounts: { input: actualInput } }]
             },
@@ -212,7 +215,9 @@ test('fetchOrderFirehose keeps summary rows lightweight', async () => {
                   amounts: {
                     actualInput,
                     actualOutput,
-                    plannedInput: actualInput
+                    plannedInput,
+                    plannedOutput,
+                    plannedMinOutput
                   },
                   legs: [{ index: 0, amounts: { actualInput } }]
                 }
@@ -248,7 +253,10 @@ test('fetchOrderFirehose keeps summary rows lightweight', async () => {
   expect(legValuation?.legs).toBeUndefined()
   expect(Object.keys(legValuation?.amounts ?? {}).sort()).toEqual([
     'actualInput',
-    'actualOutput'
+    'actualOutput',
+    'plannedInput',
+    'plannedMinOutput',
+    'plannedOutput'
   ])
 })
 
