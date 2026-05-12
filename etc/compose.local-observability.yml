@@ -56,7 +56,6 @@ services:
     depends_on:
       - victoriametrics
       - loki
-      - tempo
     volumes:
       - ./alloy.local.alloy:/etc/alloy/config.alloy:ro
     ports:
@@ -85,18 +84,6 @@ services:
     ports:
       - "3100:3100"
 
-  tempo:
-    image: grafana/tempo:2.9.0
-    command:
-      - -config.file=/etc/tempo/local-config.yaml
-    volumes:
-      - ./tempo.local.yml:/etc/tempo/local-config.yaml:ro
-      - router_local_tempo:/var/tempo
-    ports:
-      - "3200:3200"
-      - "4319:4317"
-      - "4320:4318"
-
   grafana:
     image: grafana/grafana:10.4.2
     depends_on:
@@ -108,7 +95,6 @@ services:
       - alloy
       - victoriametrics
       - loki
-      - tempo
     environment:
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
@@ -128,5 +114,4 @@ services:
 volumes:
   router_local_grafana:
   router_local_loki:
-  router_local_tempo:
   router_local_victoriametrics:

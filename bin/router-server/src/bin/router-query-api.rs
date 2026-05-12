@@ -15,8 +15,7 @@ use router_server::{
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use snafu::{FromString, Whatever};
-use tower_http::trace::{DefaultMakeSpan, TraceLayer};
-use tracing::{info, Level};
+use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 use uuid::Uuid;
 
@@ -89,14 +88,7 @@ async fn run(args: RouterQueryApiArgs) -> Result<()> {
     let app = Router::new()
         .route("/status", get(status_handler))
         .route("/internal/v1/orders/:id/flow", get(get_order_flow))
-        .with_state(QueryApiState { db, query_api_key })
-        .layer(
-            TraceLayer::new_for_http().make_span_with(
-                DefaultMakeSpan::new()
-                    .level(Level::INFO)
-                    .include_headers(false),
-            ),
-        );
+        .with_state(QueryApiState { db, query_api_key });
 
     info!("Listening on {}", addr);
     let listener = tokio::net::TcpListener::bind(addr)

@@ -8,7 +8,6 @@ use hl_shim_indexer::{
 };
 use snafu::ResultExt;
 use tokio::net::TcpListener;
-use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 #[tokio::main]
@@ -41,8 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         storage,
         scheduler,
         pubsub,
-    })
-    .layer(TraceLayer::new_for_http());
+    });
     let listener = TcpListener::bind(config.bind)
         .await
         .context(hl_shim_indexer::error::HttpServerSnafu)?;

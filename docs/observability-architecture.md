@@ -21,7 +21,6 @@ tee-router runtime stack
 Railway observability stack
   VictoriaMetrics
   Loki
-  Tempo
   Grafana
 ```
 
@@ -29,13 +28,10 @@ Alloy is the only observability process that should run next to tee-router in a
 production-like deployment. It should:
 
 - scrape router Prometheus metrics endpoints
-- scrape Tempo's local metrics endpoint in development so Grafana can show trace
-  ingestion health
-- receive OTLP logs, traces, and any future OTLP metrics
+- receive OTLP logs and any future OTLP metrics
 - batch and retry outbound telemetry
 - remote-write metrics to VictoriaMetrics
 - push logs to Loki
-- export traces to Tempo
 
 The router services keep exposing Prometheus-format metrics:
 
@@ -50,9 +46,8 @@ is the application metrics endpoint for workflow lifecycle, activity latency,
 provider hint waits, manual-intervention waits, stale-quote refreshes, and refund
 materialization counters.
 
-The router services may also emit OTLP logs/traces when
-`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, or
-`OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` is configured.
+The router services may also emit OTLP logs when `OTEL_EXPORTER_OTLP_ENDPOINT`
+or `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` is configured.
 
 ## Metrics Backend Choice
 
@@ -136,7 +131,6 @@ Local ports:
 - Temporal UI: `http://localhost:8080`
 - VictoriaMetrics: `http://localhost:8428`
 - Loki: `http://localhost:3100`
-- Tempo: `http://localhost:3200`
 - Alloy UI: `http://localhost:12345`
 - Alloy OTLP gRPC: `localhost:4317`
 - Alloy OTLP HTTP: `localhost:4318`
@@ -147,9 +141,8 @@ The main local Grafana dashboard is:
 http://localhost:3002/d/tee-router-local-overview/tee-router-local-overview
 ```
 
-The dashboard includes router metrics, Tempo trace ingestion/activity, and recent
-router logs, plus temporal-worker workflow/activity panels. Individual trace
-inspection remains available through the Tempo datasource in Grafana Explore.
+The dashboard includes router metrics, recent router logs, and temporal-worker
+workflow/activity panels.
 
 ## Why Keep Prometheus-Format Metrics?
 
@@ -162,9 +155,8 @@ The clean practical model is:
 - Rust `metrics` crate for counters, gauges, and timings
 - Alloy scrapes Prometheus-format `/metrics`
 - Alloy remote-writes metrics to VictoriaMetrics
-- Rust OTLP is used for logs and traces
-- Grafana reads metrics from VictoriaMetrics, logs from Loki, and traces from
-  Tempo
+- Rust OTLP is used for logs
+- Grafana reads metrics from VictoriaMetrics and logs from Loki
 
 This keeps instrumentation simple while still giving us a unified Grafana
 experience.

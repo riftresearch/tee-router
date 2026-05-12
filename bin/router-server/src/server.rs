@@ -58,11 +58,8 @@ use std::{
     sync::Arc,
     time::Instant,
 };
-use tower_http::{
-    cors::{AllowOrigin, CorsLayer},
-    trace::{DefaultMakeSpan, TraceLayer},
-};
-use tracing::{info, warn, Level};
+use tower_http::cors::{AllowOrigin, CorsLayer};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 const MIN_INTERNAL_API_KEY_LEN: usize = 32;
@@ -288,13 +285,6 @@ pub fn build_api_router(state: AppState, cors_domain: Option<String>) -> Router 
         .route("/internal/v1/orders/:id/flow", get(get_order_flow))
         .route("/api/v1/chains/:chain/tip", get(get_chain_tip))
         .with_state(state)
-        .layer(
-            TraceLayer::new_for_http().make_span_with(
-                DefaultMakeSpan::new()
-                    .level(Level::INFO)
-                    .include_headers(false),
-            ),
-        )
         .layer(DefaultBodyLimit::max(MAX_ROUTER_JSON_BODY_BYTES))
         .layer(middleware::from_fn(track_http_metrics));
 

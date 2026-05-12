@@ -1848,7 +1848,6 @@ dependencies = [
  "serde_json",
  "snafu",
  "tokio",
- "tower-http",
  "tracing",
  "tracing-subscriber",
  "url",
@@ -1912,7 +1911,6 @@ dependencies = [
  "serde_json",
  "snafu",
  "tokio",
- "tower-http",
  "tracing",
  "tracing-subscriber",
  "url",
@@ -3275,7 +3273,6 @@ dependencies = [
  "serde_json",
  "snafu",
  "tokio",
- "tower-http",
  "tracing",
  "tracing-subscriber",
  "url",
@@ -3908,7 +3905,6 @@ dependencies = [
  "testcontainers",
  "tokio",
  "tokio-tungstenite 0.24.0",
- "tower-http",
  "tracing",
  "tracing-subscriber",
  "url",
@@ -5096,8 +5092,6 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -5146,7 +5140,6 @@ dependencies = [
  "opentelemetry",
  "tracing",
  "tracing-core",
- "tracing-opentelemetry",
  "tracing-subscriber",
 ]
 
@@ -8099,7 +8092,6 @@ dependencies = [
  "tower 0.5.2",
  "tower-layer",
  "tower-service",
- "tracing",
 ]
 
 [[package]]
@@ -8189,22 +8181,6 @@ dependencies = [
  "tracing-serde",
  "tracing-subscriber",
  "url",
-]
-
-[[package]]
-name = "tracing-opentelemetry"
-version = "0.32.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ac28f2d093c6c477eaa76b23525478f38de514fa9aeb1285738d4b97a9552fc"
-dependencies = [
- "js-sys",
- "opentelemetry",
- "smallvec",
- "tracing",
- "tracing-core",
- "tracing-log",
- "tracing-subscriber",
- "web-time",
 ]
 
 [[package]]

@@ -493,8 +493,7 @@ impl OrderManager {
         }
         let now = Utc::now();
         let order_id = Uuid::now_v7();
-        let workflow_trace = observability::current_workflow_trace_context()
-            .unwrap_or_else(|| fallback_workflow_trace_context(order_id));
+        let (workflow_trace_id, workflow_parent_span_id) = fallback_workflow_trace_ids(order_id);
         let refund_address = self.validate_and_normalize_refund_address(
             &quote.source_asset.chain,
             &request.refund_address,
@@ -514,8 +513,8 @@ impl OrderManager {
             }),
             action_timeout_at: now + MARKET_ORDER_ACTION_TIMEOUT,
             idempotency_key: normalize_idempotency_key(request.idempotency_key.clone())?,
-            workflow_trace_id: workflow_trace.trace_id,
-            workflow_parent_span_id: workflow_trace.parent_span_id,
+            workflow_trace_id,
+            workflow_parent_span_id,
             created_at: now,
             updated_at: now,
         };
@@ -549,8 +548,7 @@ impl OrderManager {
         }
         let now = Utc::now();
         let order_id = Uuid::now_v7();
-        let workflow_trace = observability::current_workflow_trace_context()
-            .unwrap_or_else(|| fallback_workflow_trace_context(order_id));
+        let (workflow_trace_id, workflow_parent_span_id) = fallback_workflow_trace_ids(order_id);
         let refund_address = self.validate_and_normalize_refund_address(
             &quote.source_asset.chain,
             &request.refund_address,
@@ -571,8 +569,8 @@ impl OrderManager {
             }),
             action_timeout_at: now + LIMIT_ORDER_ACTION_TIMEOUT,
             idempotency_key: normalize_idempotency_key(request.idempotency_key.clone())?,
-            workflow_trace_id: workflow_trace.trace_id,
-            workflow_parent_span_id: workflow_trace.parent_span_id,
+            workflow_trace_id,
+            workflow_parent_span_id,
             created_at: now,
             updated_at: now,
         };
@@ -3324,17 +3322,14 @@ fn is_protocol_token(value: &str) -> bool {
     })
 }
 
-fn fallback_workflow_trace_context(order_id: Uuid) -> observability::WorkflowTraceContext {
+fn fallback_workflow_trace_ids(order_id: Uuid) -> (String, String) {
     let trace_id = order_id.simple().to_string();
     let mut parent_span_id = trace_id[16..32].to_string();
     if parent_span_id == "0000000000000000" {
         parent_span_id = "0000000000000001".to_string();
     }
 
-    observability::WorkflowTraceContext {
-        trace_id,
-        parent_span_id,
-    }
+    (trace_id, parent_span_id)
 }
 
 fn is_better_quote(

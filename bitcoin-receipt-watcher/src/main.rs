@@ -5,7 +5,6 @@ use clap::Parser;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use snafu::ResultExt;
 use tokio::net::TcpListener;
-use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 #[tokio::main]
@@ -35,8 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         pubsub,
         rpc,
         metrics: Some(metrics),
-    })
-    .layer(TraceLayer::new_for_http());
+    });
 
     let listener = TcpListener::bind(config.bind)
         .await
