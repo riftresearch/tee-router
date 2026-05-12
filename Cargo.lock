@@ -6304,6 +6304,8 @@ dependencies = [
  "alloy",
  "axum 0.7.9",
  "bitcoin",
+ "bitcoin-indexer",
+ "bitcoin-receipt-watcher",
  "bitcoincore-rpc-async",
  "devnet",
  "eip3009-erc20-contract",
@@ -6641,6 +6643,10 @@ dependencies = [
  "async-trait",
  "axum 0.7.9",
  "bitcoin",
+ "bitcoin-indexer",
+ "bitcoin-indexer-client",
+ "bitcoin-receipt-watcher",
+ "bitcoin-receipt-watcher-client",
  "bitcoincore-rpc-async",
  "blockchain-utils",
  "chains",
@@ -6650,7 +6656,6 @@ dependencies = [
  "devnet",
  "dotenvy",
  "eip3009-erc20-contract",
- "esplora-client",
  "evm-receipt-watcher",
  "evm-receipt-watcher-client",
  "evm-token-indexer-client",
@@ -6681,7 +6686,6 @@ dependencies = [
  "url",
  "utc",
  "uuid",
- "zeromq",
 ]
 
 [[package]]

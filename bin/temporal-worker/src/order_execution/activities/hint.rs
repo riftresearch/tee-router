@@ -56,7 +56,19 @@ impl ProviderObservationActivities {
                 ProviderHintKind::CctpReceiveObserved => {
                     verify_cctp_receive_observed_hint(&deps, input).await
                 }
+                ProviderHintKind::BtcDepositObserved => {
+                    verify_btc_deposit_observed_hint(&deps, input).await
+                }
                 ProviderHintKind::UnitDeposit => verify_unit_deposit_hint(&deps, input).await,
+                ProviderHintKind::HyperUnitDepositCredited => {
+                    verify_hyperunit_deposit_credited_hint(&deps, input).await
+                }
+                ProviderHintKind::HyperUnitWithdrawalAcknowledged => {
+                    verify_hyperunit_withdrawal_acknowledged_hint(&deps, input).await
+                }
+                ProviderHintKind::HyperUnitWithdrawalSettled => {
+                    verify_hyperunit_withdrawal_settled_hint(&deps, input).await
+                }
                 ProviderHintKind::ProviderObservation => {
                     verify_provider_observation_hint(&deps, input).await
                 }
@@ -1105,6 +1117,82 @@ fn validate_request_address_match(
     }
 }
 
+fn validate_hyperunit_protocol_address(
+    label: &'static str,
+    operation: &OrderProviderOperation,
+    observed: &str,
+) -> Result<(), OrderActivityError> {
+    let expected = operation.provider_ref.as_deref().or_else(|| {
+        operation
+            .request
+            .get("protocol_address")
+            .and_then(Value::as_str)
+    });
+    match expected {
+        Some(expected) if expected.eq_ignore_ascii_case(observed) => Ok(()),
+        Some(expected) => Err(OrderActivityError::hint_verification(
+            label,
+            format!("protocol address {observed} does not match operation ref {expected}"),
+        )),
+        None => Err(OrderActivityError::hint_verification(
+            label,
+            format!(
+                "provider operation {} is missing HyperUnit protocol address",
+                operation.id
+            ),
+        )),
+    }
+}
+
+fn unit_operation_source_is_bitcoin(operation: &OrderProviderOperation) -> bool {
+    operation
+        .request
+        .get("src_chain")
+        .or_else(|| operation.request.get("source_chain"))
+        .and_then(Value::as_str)
+        .is_some_and(|chain| chain.eq_ignore_ascii_case("bitcoin"))
+}
+
+fn validate_hyperunit_btc_confirmations(
+    label: &'static str,
+    confirmations: u64,
+) -> Result<(), OrderActivityError> {
+    if confirmations > 0 {
+        Ok(())
+    } else {
+        Err(OrderActivityError::hint_verification(
+            label,
+            "BTC settlement evidence is not confirmed",
+        ))
+    }
+}
+
+fn validate_non_empty_hint_field(
+    label: &'static str,
+    field: &'static str,
+    value: &str,
+) -> Result<(), OrderActivityError> {
+    if value.trim().is_empty() {
+        Err(OrderActivityError::hint_verification(
+            label,
+            format!("evidence {field} is empty"),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_hyperunit_request_amount_gte(
+    label: &'static str,
+    operation: &OrderProviderOperation,
+    observed: &str,
+) -> Result<(), OrderActivityError> {
+    let Some(expected) = operation.request.get("amount").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    validate_decimal_gte(label, observed, expected)
+}
+
 fn validate_expected_asset_token(
     label: &'static str,
     chain_id: Option<&str>,
@@ -1713,9 +1801,257 @@ pub(super) async fn verify_hl_withdrawal_settled_hint(
     .await
 }
 
+pub(super) async fn verify_hyperunit_deposit_credited_hint(
+    deps: &OrderActivityDeps,
+    input: VerifyProviderOperationHintInput,
+) -> Result<ProviderOperationHintVerified, OrderActivityError> {
+    let Some(ProviderOperationHintEvidence::HyperUnitDepositCredited(evidence)) =
+        input.signal.evidence.as_ref()
+    else {
+        return Ok(provider_hint_rejected(
+            input.signal.provider_operation_id.map(|id| id.inner()),
+            "HyperUnitDepositCredited hint missing typed evidence",
+        ));
+    };
+    let operation = load_typed_hint_operation(
+        deps,
+        &input,
+        "HyperUnitDepositCredited",
+        &[ProviderOperationType::UnitDeposit],
+    )
+    .await?;
+    if let Some(decision) = terminal_hint_decision(&operation) {
+        return Ok(decision);
+    }
+    validate_hyperunit_protocol_address(
+        "HyperUnitDepositCredited",
+        &operation,
+        &evidence.protocol_address,
+    )?;
+    validate_request_address_match(
+        "HyperUnitDepositCredited Hyperliquid user",
+        operation.request.get("dst_addr").and_then(Value::as_str),
+        &evidence.hl_user,
+    )?;
+    if unit_operation_source_is_bitcoin(&operation) {
+        validate_hyperunit_btc_confirmations(
+            "HyperUnitDepositCredited",
+            evidence.btc_confirmations.unwrap_or(0),
+        )?;
+        if let Some(expected_amount) = operation.request.get("amount").and_then(Value::as_str) {
+            let Some(btc_amount) = evidence.btc_amount.as_deref() else {
+                return Err(OrderActivityError::hint_verification(
+                    "HyperUnitDepositCredited",
+                    "Bitcoin-sourced deposit evidence missing btc_amount",
+                ));
+            };
+            validate_decimal_gte(
+                "HyperUnitDepositCredited BTC amount",
+                btc_amount,
+                expected_amount,
+            )?;
+        }
+    }
+    validate_non_empty_hint_field(
+        "HyperUnitDepositCredited",
+        "hl_credit_hash",
+        &evidence.hl_credit_hash,
+    )?;
+    validate_non_empty_hint_field("HyperUnitDepositCredited", "hl_amount", &evidence.hl_amount)?;
+    let tx_hash = evidence
+        .hyperunit_destination_tx_hash
+        .clone()
+        .or_else(|| evidence.hyperunit_source_tx_hash.clone())
+        .or_else(|| evidence.btc_tx_hash.clone())
+        .unwrap_or_else(|| evidence.hl_credit_hash.clone());
+    complete_provider_operation_from_typed_hint(
+        deps,
+        &input,
+        operation,
+        TypedProviderOperationUpdate {
+            status: ProviderOperationStatus::Completed,
+            provider_ref: Some(evidence.protocol_address.clone()),
+            observed_state: typed_evidence_state("hyperunit_deposit_credited", evidence)?,
+            response: Some(json!({
+                "kind": "hyperunit_deposit_credited",
+                "protocol_address": &evidence.protocol_address,
+                "btc_tx_hash": &evidence.btc_tx_hash,
+                "btc_vout": evidence.btc_vout,
+                "hl_credit_hash": &evidence.hl_credit_hash,
+            })),
+            tx_hash: Some(tx_hash),
+        },
+    )
+    .await
+}
+
+pub(super) async fn verify_hyperunit_withdrawal_acknowledged_hint(
+    deps: &OrderActivityDeps,
+    input: VerifyProviderOperationHintInput,
+) -> Result<ProviderOperationHintVerified, OrderActivityError> {
+    let Some(ProviderOperationHintEvidence::HyperUnitWithdrawalAcknowledged(evidence)) =
+        input.signal.evidence.as_ref()
+    else {
+        return Ok(provider_hint_rejected(
+            input.signal.provider_operation_id.map(|id| id.inner()),
+            "HyperUnitWithdrawalAcknowledged hint missing typed evidence",
+        ));
+    };
+    let operation = load_typed_hint_operation(
+        deps,
+        &input,
+        "HyperUnitWithdrawalAcknowledged",
+        &[ProviderOperationType::UnitWithdrawal],
+    )
+    .await?;
+    if let Some(decision) = terminal_hint_decision(&operation) {
+        return Ok(decision);
+    }
+    validate_hyperunit_protocol_address(
+        "HyperUnitWithdrawalAcknowledged",
+        &operation,
+        &evidence.protocol_address,
+    )?;
+    if let Some(destination_address) = evidence.destination_address.as_deref() {
+        validate_request_address_match(
+            "HyperUnitWithdrawalAcknowledged destination",
+            operation.request.get("dst_addr").and_then(Value::as_str),
+            destination_address,
+        )?;
+    }
+    if let Some(amount) = evidence.amount.as_deref() {
+        validate_hyperunit_request_amount_gte(
+            "HyperUnitWithdrawalAcknowledged amount",
+            &operation,
+            amount,
+        )?;
+    }
+    complete_provider_operation_from_typed_hint(
+        deps,
+        &input,
+        operation,
+        TypedProviderOperationUpdate {
+            status: ProviderOperationStatus::WaitingExternal,
+            provider_ref: Some(evidence.protocol_address.clone()),
+            observed_state: typed_evidence_state("hyperunit_withdrawal_acknowledged", evidence)?,
+            response: None,
+            tx_hash: evidence.btc_tx_hash.clone(),
+        },
+    )
+    .await
+}
+
+pub(super) async fn verify_hyperunit_withdrawal_settled_hint(
+    deps: &OrderActivityDeps,
+    input: VerifyProviderOperationHintInput,
+) -> Result<ProviderOperationHintVerified, OrderActivityError> {
+    let Some(ProviderOperationHintEvidence::HyperUnitWithdrawalSettled(evidence)) =
+        input.signal.evidence.as_ref()
+    else {
+        return Ok(provider_hint_rejected(
+            input.signal.provider_operation_id.map(|id| id.inner()),
+            "HyperUnitWithdrawalSettled hint missing typed evidence",
+        ));
+    };
+    let operation = load_typed_hint_operation(
+        deps,
+        &input,
+        "HyperUnitWithdrawalSettled",
+        &[ProviderOperationType::UnitWithdrawal],
+    )
+    .await?;
+    if let Some(decision) = terminal_hint_decision(&operation) {
+        return Ok(decision);
+    }
+    validate_hyperunit_protocol_address(
+        "HyperUnitWithdrawalSettled",
+        &operation,
+        &evidence.protocol_address,
+    )?;
+    validate_request_address_match(
+        "HyperUnitWithdrawalSettled destination",
+        operation.request.get("dst_addr").and_then(Value::as_str),
+        &evidence.destination_address,
+    )?;
+    validate_hyperunit_btc_confirmations("HyperUnitWithdrawalSettled", evidence.btc_confirmations)?;
+    if let Some(amount) = evidence.amount.as_deref() {
+        validate_hyperunit_request_amount_gte(
+            "HyperUnitWithdrawalSettled amount",
+            &operation,
+            amount,
+        )?;
+    }
+    let Some(tx_hash) = evidence
+        .btc_tx_hash
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Err(OrderActivityError::hint_verification(
+            "HyperUnitWithdrawalSettled",
+            "settlement evidence missing btc_tx_hash",
+        ));
+    };
+    complete_provider_operation_from_typed_hint(
+        deps,
+        &input,
+        operation,
+        TypedProviderOperationUpdate {
+            status: ProviderOperationStatus::Completed,
+            provider_ref: Some(evidence.protocol_address.clone()),
+            observed_state: typed_evidence_state("hyperunit_withdrawal_settled", evidence)?,
+            response: Some(json!({
+                "kind": "hyperunit_withdrawal_settled",
+                "protocol_address": &evidence.protocol_address,
+                "btc_tx_hash": &tx_hash,
+                "btc_vout": evidence.btc_vout,
+                "destination_address": &evidence.destination_address,
+            })),
+            tx_hash: Some(tx_hash),
+        },
+    )
+    .await
+}
+
 pub(super) async fn verify_unit_deposit_hint(
     deps: &OrderActivityDeps,
     input: VerifyProviderOperationHintInput,
+) -> Result<ProviderOperationHintVerified, OrderActivityError> {
+    let Some(ProviderOperationHintEvidence::UnitDeposit(evidence)) = input.signal.evidence.clone()
+    else {
+        return Ok(provider_hint_deferred(
+            input.signal.provider_operation_id.map(|id| id.inner()),
+            "UnitDeposit operations require typed Sauron BTC deposit evidence",
+        ));
+    };
+    verify_unit_deposit_chain_hint(deps, input, evidence, "unit_deposit_observed").await
+}
+
+pub(super) async fn verify_btc_deposit_observed_hint(
+    deps: &OrderActivityDeps,
+    input: VerifyProviderOperationHintInput,
+) -> Result<ProviderOperationHintVerified, OrderActivityError> {
+    let Some(ProviderOperationHintEvidence::BtcDepositObserved(evidence)) =
+        input.signal.evidence.clone()
+    else {
+        return Ok(provider_hint_rejected(
+            input.signal.provider_operation_id.map(|id| id.inner()),
+            "BtcDepositObserved hint missing typed evidence",
+        ));
+    };
+    let unit_evidence = UnitDepositHintEvidence {
+        tx_hash: evidence.tx_hash,
+        address: evidence.address,
+        transfer_index: evidence.transfer_index,
+        amount: Some(evidence.amount),
+    };
+    verify_unit_deposit_chain_hint(deps, input, unit_evidence, "btc_deposit_observed").await
+}
+
+async fn verify_unit_deposit_chain_hint(
+    deps: &OrderActivityDeps,
+    input: VerifyProviderOperationHintInput,
+    evidence: UnitDepositHintEvidence,
+    observed_source: &'static str,
 ) -> Result<ProviderOperationHintVerified, OrderActivityError> {
     let Some(provider_operation_id) = input.signal.provider_operation_id else {
         return Ok(provider_hint_deferred(
@@ -1735,11 +2071,7 @@ pub(super) async fn verify_unit_deposit_hint(
         return Ok(decision);
     }
 
-    let Some(ProviderOperationHintEvidence::UnitDeposit(evidence)) = input.signal.evidence.as_ref()
-    else {
-        return verify_provider_observation_hint(deps, input).await;
-    };
-    let chain = match verify_chain_evidence(evidence) {
+    let chain = match verify_chain_evidence(&evidence) {
         Ok(chain) => chain,
         Err(reason) => return Ok(provider_hint_rejected(Some(provider_operation_id), reason)),
     };
@@ -1760,7 +2092,16 @@ pub(super) async fn verify_unit_deposit_hint(
         Ok(amount) => amount,
         Err(reason) => return Ok(provider_hint_rejected(Some(provider_operation_id), reason)),
     };
-    let provider_observation = observe_unit_deposit_provider(deps, &operation, &chain).await?;
+    let provider_observation = UnitDepositProviderObservation {
+        status: ProviderOperationStatus::WaitingExternal,
+        provider_observed_state: json!({
+            "source": observed_source,
+            "terminal_hyperunit_hint_required": true,
+        }),
+        provider_tx_hash: None,
+        provider_error: None,
+        provider_response: None,
+    };
     let updated = persist_unit_deposit_hint_observation(
         deps,
         &operation,
@@ -1966,45 +2307,6 @@ async fn verify_amount_evidence(
     }))
 }
 
-async fn observe_unit_deposit_provider(
-    deps: &OrderActivityDeps,
-    operation: &OrderProviderOperation,
-    chain: &ChainEvidence<'_>,
-) -> Result<UnitDepositProviderObservation, OrderActivityError> {
-    let provider = deps
-        .action_providers
-        .unit(&operation.provider)
-        .ok_or_else(|| provider_observe_not_configured(&operation.provider))?;
-    let observation = provider
-        .observe_unit_operation(ProviderOperationObservationRequest {
-            operation_id: operation.id,
-            operation_type: operation.operation_type,
-            provider_ref: operation.provider_ref.clone(),
-            request: operation.request.clone(),
-            response: operation.response.clone(),
-            observed_state: operation.observed_state.clone(),
-            hint_evidence: unit_deposit_evidence_json(chain.evidence),
-        })
-        .await
-        .map_err(|source| provider_observe_error(&operation.provider, source))?;
-    Ok(match observation {
-        Some(observation) => UnitDepositProviderObservation {
-            status: observation.status,
-            provider_observed_state: json_object_or_wrapped(observation.observed_state),
-            provider_tx_hash: observation.tx_hash,
-            provider_error: observation.error,
-            provider_response: observation.response,
-        },
-        None => UnitDepositProviderObservation {
-            status: ProviderOperationStatus::WaitingExternal,
-            provider_observed_state: json!({}),
-            provider_tx_hash: None,
-            provider_error: None,
-            provider_response: None,
-        },
-    })
-}
-
 async fn persist_unit_deposit_hint_observation(
     deps: &OrderActivityDeps,
     operation: &OrderProviderOperation,
@@ -2166,10 +2468,20 @@ pub(super) async fn verify_provider_observation_hint(
             | ProviderOperationType::HyperliquidBridgeWithdrawal
             | ProviderOperationType::HyperliquidTrade
             | ProviderOperationType::HyperliquidLimitOrder
+            | ProviderOperationType::UnitDeposit
+            | ProviderOperationType::UnitWithdrawal
     ) {
+        let provider_family = if matches!(
+            operation.operation_type,
+            ProviderOperationType::UnitDeposit | ProviderOperationType::UnitWithdrawal
+        ) {
+            "HyperUnit operations require typed Sauron HyperUnit evidence"
+        } else {
+            "Hyperliquid operations require typed Sauron HL evidence"
+        };
         return Ok(provider_hint_deferred(
             Some(provider_operation_id),
-            "Hyperliquid operations require typed Sauron HL evidence",
+            provider_family,
         ));
     }
     if matches!(
@@ -2647,12 +2959,4 @@ pub(super) fn provider_operation_tx_hash_from_value(value: &Value) -> Option<Str
                 .get("provider_observed_state")
                 .and_then(provider_operation_tx_hash_from_value)
         })
-}
-
-pub(super) fn json_object_or_wrapped(value: Value) -> Value {
-    if value.is_object() {
-        value
-    } else {
-        json!({ "value": value })
-    }
 }

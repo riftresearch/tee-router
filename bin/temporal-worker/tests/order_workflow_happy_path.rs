@@ -24,7 +24,7 @@ use chains::{
 use chrono::Utc;
 use devnet::{
     evm_devnet::{MOCK_CCTP_MESSAGE_TRANSMITTER_V2_ADDRESS, MOCK_CCTP_TOKEN_MESSENGER_V2_ADDRESS},
-    mock_integrators::{MockIntegratorConfig, MockIntegratorServer},
+    mock_integrators::{MockIntegratorConfig, MockIntegratorServer, MockUnitOperationRecord},
     RiftDevnet,
 };
 use eip3009_erc20_contract::GenericEIP3009ERC20::GenericEIP3009ERC20Instance;
@@ -61,10 +61,11 @@ use temporal_worker::{
         activities::{OrderActivities, OrderActivityDeps},
         build_worker, order_workflow_id, refund_workflow_id,
         types::{
-            AcknowledgeUnrecoverableSignal, HlBridgeDepositCreditedEvidence, ManualReleaseSignal,
-            ManualTriggerRefundSignal, OrderTerminalStatus, OrderWorkflowInput,
-            OrderWorkflowOutput, ProviderHintKind, ProviderKind, ProviderOperationHintEvidence,
-            ProviderOperationHintSignal,
+            AcknowledgeUnrecoverableSignal, HlBridgeDepositCreditedEvidence,
+            HyperUnitDepositCreditedEvidence, HyperUnitWithdrawalSettledEvidence,
+            ManualReleaseSignal, ManualTriggerRefundSignal, OrderTerminalStatus,
+            OrderWorkflowInput, OrderWorkflowOutput, ProviderHintKind, ProviderKind,
+            ProviderOperationHintEvidence, ProviderOperationHintSignal,
         },
         workflow_start_options,
         workflows::{OrderWorkflow, RefundWorkflow},
@@ -3060,6 +3061,33 @@ fn cctp_receive_observed_evidence(
     }
 }
 
+async fn mock_unit_operation_for_protocol(
+    mocks: &MockIntegratorServer,
+    protocol_address: &str,
+) -> MockUnitOperationRecord {
+    mocks
+        .unit_operations()
+        .await
+        .into_iter()
+        .rev()
+        .find(|operation| {
+            operation
+                .protocol_address
+                .eq_ignore_ascii_case(protocol_address)
+        })
+        .unwrap_or_else(|| panic!("mock Unit operation {protocol_address} should be recorded"))
+}
+
+fn split_mock_unit_tx_ref(tx_ref: &str) -> (String, u64) {
+    let Some((tx_hash, index)) = tx_ref.rsplit_once(':') else {
+        return (tx_ref.to_string(), 0);
+    };
+    match index.parse::<u64>() {
+        Ok(index) => (tx_hash.to_string(), index),
+        Err(_) => (tx_ref.to_string(), 0),
+    }
+}
+
 async fn signal_order_unit_deposit_hint(
     client: &Client,
     db: &Database,
@@ -3082,12 +3110,17 @@ async fn signal_order_unit_deposit_hint(
     };
     let provider_ref = unit_deposit_operation
         .provider_ref
-        .as_deref()
+        .clone()
         .expect("UnitDeposit operation should carry provider_ref");
+    let amount = unit_deposit_operation
+        .request
+        .get("amount")
+        .and_then(serde_json::Value::as_str)
+        .expect("UnitDeposit operation request should carry amount");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     loop {
         if matches!(
-            mocks.unit_operation_state(provider_ref).await.as_deref(),
+            mocks.unit_operation_state(&provider_ref).await.as_deref(),
             Some("done")
         ) {
             break;
@@ -3098,6 +3131,12 @@ async fn signal_order_unit_deposit_hint(
         );
         sleep(Duration::from_millis(250)).await;
     }
+    let mock_operation = mock_unit_operation_for_protocol(mocks, &provider_ref).await;
+    let source_tx_hash = mock_operation
+        .source_tx_hash
+        .clone()
+        .expect("completed UnitDeposit operation should carry source_tx_hash");
+    let (btc_tx_hash, btc_vout) = split_mock_unit_tx_ref(&source_tx_hash);
 
     let signal_result = handle_before_hint
         .signal(
@@ -3111,9 +3150,36 @@ async fn signal_order_unit_deposit_hint(
                 hint_id: Uuid::now_v7().into(),
                 provider_operation_id: Some(unit_deposit_operation.id.into()),
                 provider: ProviderKind::Unit,
-                hint_kind: ProviderHintKind::UnitDeposit,
-                provider_ref: unit_deposit_operation.provider_ref,
-                evidence: None,
+                hint_kind: ProviderHintKind::HyperUnitDepositCredited,
+                provider_ref: Some(provider_ref.clone()),
+                evidence: Some(ProviderOperationHintEvidence::HyperUnitDepositCredited(
+                    HyperUnitDepositCreditedEvidence {
+                        protocol_address: provider_ref,
+                        btc_tx_hash: Some(btc_tx_hash),
+                        btc_vout: Some(btc_vout),
+                        btc_amount: Some(
+                            mock_operation
+                                .source_amount
+                                .unwrap_or_else(|| amount.to_string()),
+                        ),
+                        btc_confirmations: Some(10),
+                        btc_block_height: Some(1),
+                        btc_block_hash: None,
+                        hyperunit_operation_id: Some(source_tx_hash.clone()),
+                        hyperunit_status: Some("done".to_string()),
+                        hyperunit_source_tx_hash: Some(source_tx_hash.clone()),
+                        hyperunit_destination_tx_hash: mock_operation.destination_tx_hash.clone(),
+                        hl_user: unit_deposit_operation
+                            .request
+                            .get("dst_addr")
+                            .and_then(serde_json::Value::as_str)
+                            .expect("UnitDeposit request should carry dst_addr")
+                            .to_string(),
+                        hl_amount: amount.to_string(),
+                        hl_credit_hash: source_tx_hash,
+                        hl_credit_time_ms: Utc::now().timestamp_millis(),
+                    },
+                )),
             },
             WorkflowSignalOptions::default(),
         )
@@ -3143,7 +3209,7 @@ async fn signal_order_unit_withdrawal_observation(
     };
     let provider_ref = unit_withdrawal_operation
         .provider_ref
-        .as_deref()
+        .clone()
         .expect("UnitWithdrawal operation should carry provider_ref");
     let amount = unit_withdrawal_operation
         .request
@@ -3151,9 +3217,15 @@ async fn signal_order_unit_withdrawal_observation(
         .and_then(serde_json::Value::as_str)
         .expect("UnitWithdrawal operation request should carry amount");
     mocks
-        .complete_unit_operation_with_source_amount(provider_ref, amount)
+        .complete_unit_operation_with_source_amount(&provider_ref, amount)
         .await
         .expect("complete mock Unit withdrawal operation");
+    let mock_operation = mock_unit_operation_for_protocol(mocks, &provider_ref).await;
+    let destination_tx_hash = mock_operation
+        .destination_tx_hash
+        .clone()
+        .expect("completed UnitWithdrawal operation should carry destination_tx_hash");
+    let (btc_tx_hash, btc_vout) = split_mock_unit_tx_ref(&destination_tx_hash);
 
     let signal_result = handle_before_hint
         .signal(
@@ -3167,9 +3239,26 @@ async fn signal_order_unit_withdrawal_observation(
                 hint_id: Uuid::now_v7().into(),
                 provider_operation_id: Some(unit_withdrawal_operation.id.into()),
                 provider: ProviderKind::Unit,
-                hint_kind: ProviderHintKind::ProviderObservation,
-                provider_ref: unit_withdrawal_operation.provider_ref,
-                evidence: None,
+                hint_kind: ProviderHintKind::HyperUnitWithdrawalSettled,
+                provider_ref: Some(provider_ref.clone()),
+                evidence: Some(ProviderOperationHintEvidence::HyperUnitWithdrawalSettled(
+                    HyperUnitWithdrawalSettledEvidence {
+                        protocol_address: provider_ref,
+                        hyperunit_operation_id: mock_operation.source_tx_hash.clone(),
+                        hyperunit_status: Some("done".to_string()),
+                        destination_address: unit_withdrawal_operation
+                            .request
+                            .get("dst_addr")
+                            .and_then(serde_json::Value::as_str)
+                            .expect("UnitWithdrawal request should carry dst_addr")
+                            .to_string(),
+                        amount: mock_operation.source_amount.clone(),
+                        btc_tx_hash: Some(btc_tx_hash),
+                        btc_vout,
+                        btc_amount: amount.to_string(),
+                        btc_confirmations: 10,
+                    },
+                )),
             },
             WorkflowSignalOptions::default(),
         )
@@ -3568,7 +3657,7 @@ async fn signal_hyperliquid_spot_refund_unit_withdrawal(
     .await;
     let provider_ref = refund_operation
         .provider_ref
-        .as_deref()
+        .clone()
         .expect("UnitWithdrawal refund operation should carry provider_ref");
     let amount = refund_operation
         .request
@@ -3576,9 +3665,15 @@ async fn signal_hyperliquid_spot_refund_unit_withdrawal(
         .and_then(serde_json::Value::as_str)
         .expect("UnitWithdrawal refund operation request should carry amount");
     mocks
-        .complete_unit_operation_with_source_amount(provider_ref, amount)
+        .complete_unit_operation_with_source_amount(&provider_ref, amount)
         .await
         .expect("complete mock Unit withdrawal operation");
+    let mock_operation = mock_unit_operation_for_protocol(mocks, &provider_ref).await;
+    let destination_tx_hash = mock_operation
+        .destination_tx_hash
+        .clone()
+        .expect("completed refund UnitWithdrawal operation should carry destination_tx_hash");
+    let (btc_tx_hash, btc_vout) = split_mock_unit_tx_ref(&destination_tx_hash);
 
     let refund_workflow = client.get_workflow_handle::<RefundWorkflow>(&refund_workflow_id(
         order_id.into(),
@@ -3596,9 +3691,26 @@ async fn signal_hyperliquid_spot_refund_unit_withdrawal(
                 hint_id: Uuid::now_v7().into(),
                 provider_operation_id: Some(refund_operation.id.into()),
                 provider: ProviderKind::Unit,
-                hint_kind: ProviderHintKind::ProviderObservation,
-                provider_ref: refund_operation.provider_ref,
-                evidence: None,
+                hint_kind: ProviderHintKind::HyperUnitWithdrawalSettled,
+                provider_ref: Some(provider_ref.clone()),
+                evidence: Some(ProviderOperationHintEvidence::HyperUnitWithdrawalSettled(
+                    HyperUnitWithdrawalSettledEvidence {
+                        protocol_address: provider_ref,
+                        hyperunit_operation_id: mock_operation.source_tx_hash.clone(),
+                        hyperunit_status: Some("done".to_string()),
+                        destination_address: refund_operation
+                            .request
+                            .get("dst_addr")
+                            .and_then(serde_json::Value::as_str)
+                            .expect("refund UnitWithdrawal request should carry dst_addr")
+                            .to_string(),
+                        amount: mock_operation.source_amount.clone(),
+                        btc_tx_hash: Some(btc_tx_hash),
+                        btc_vout,
+                        btc_amount: amount.to_string(),
+                        btc_confirmations: 10,
+                    },
+                )),
             },
             WorkflowSignalOptions::default(),
         )

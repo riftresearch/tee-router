@@ -616,6 +616,8 @@ struct MockIntegratorState {
     unit_operations: Mutex<BTreeMap<String, Vec<MockUnitOperationEntry>>>,
     unit_protocol_private_keys: Mutex<BTreeMap<String, MockUnitProtocolKey>>,
     unit_evm_rpc_urls: BTreeMap<String, String>,
+    unit_bitcoin_rpc_url: Option<String>,
+    unit_bitcoin_cookie_path: Option<PathBuf>,
     ledger: Mutex<MockIntegratorLedger>,
     evm_unlocked_account_tx_locks: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
     evm_native_balance_credit_locks: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
@@ -867,6 +869,14 @@ impl MockIntegratorServer {
                 get(mock_unit_gen),
             )
             .route("/operations/:address", get(mock_unit_operations))
+            .route(
+                "/v2/operations/deposit/:operation_id",
+                get(mock_unit_deposit_operation),
+            )
+            .route(
+                "/v2/operations/withdrawal/:operation_id",
+                get(mock_unit_withdrawal_operation),
+            )
             .route("/v2/messages/:source_domain", get(mock_cctp_messages))
             .route(
                 "/v2/burn/USDC/fees/:source_domain/:destination_domain",
@@ -1256,6 +1266,8 @@ impl MockIntegratorState {
             unit_operations: Mutex::default(),
             unit_protocol_private_keys: Mutex::default(),
             unit_evm_rpc_urls: config.unit_evm_rpc_urls.clone(),
+            unit_bitcoin_rpc_url: config.unit_bitcoin_rpc_url.clone(),
+            unit_bitcoin_cookie_path: config.unit_bitcoin_cookie_path.clone(),
             ledger: Mutex::default(),
             evm_unlocked_account_tx_locks: Mutex::default(),
             evm_native_balance_credit_locks: Mutex::default(),
@@ -4113,6 +4125,48 @@ async fn mock_unit_operations(
     Json(response).into_response()
 }
 
+async fn mock_unit_deposit_operation(
+    State(state): State<Arc<MockIntegratorState>>,
+    Path(operation_id): Path<String>,
+) -> impl IntoResponse {
+    mock_unit_operation_by_id(state, MockUnitOperationKind::Deposit, operation_id).await
+}
+
+async fn mock_unit_withdrawal_operation(
+    State(state): State<Arc<MockIntegratorState>>,
+    Path(operation_id): Path<String>,
+) -> impl IntoResponse {
+    mock_unit_operation_by_id(state, MockUnitOperationKind::Withdrawal, operation_id).await
+}
+
+async fn mock_unit_operation_by_id(
+    state: Arc<MockIntegratorState>,
+    kind: MockUnitOperationKind,
+    operation_id: String,
+) -> axum::response::Response {
+    let operations = state.unit_operations.lock().await;
+    let operation = operations
+        .values()
+        .flat_map(|entries| entries.iter())
+        .filter(|entry| entry.visible)
+        .find(|entry| entry.kind == kind && unit_operation_matches_identifier(entry, &operation_id))
+        .map(|entry| entry.operation.clone());
+    match operation {
+        Some(operation) => Json(operation).into_response(),
+        None => error_response(
+            StatusCode::NOT_FOUND,
+            format!(
+                "mock Unit /v2/operations/{}/{} not found",
+                match kind {
+                    MockUnitOperationKind::Deposit => "deposit",
+                    MockUnitOperationKind::Withdrawal => "withdrawal",
+                },
+                operation_id
+            ),
+        ),
+    }
+}
+
 fn unit_operation_matches_query(entry: &MockUnitOperationEntry, query: &str) -> bool {
     entry
         .operation
@@ -4120,6 +4174,25 @@ fn unit_operation_matches_query(entry: &MockUnitOperationEntry, query: &str) -> 
         .as_deref()
         .is_some_and(|protocol_address| addresses_match(protocol_address, query))
         || addresses_match(&entry.dst_addr, query)
+}
+
+fn unit_operation_matches_identifier(entry: &MockUnitOperationEntry, query: &str) -> bool {
+    unit_operation_matches_query(entry, query)
+        || entry
+            .operation
+            .operation_id
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case(query))
+        || entry
+            .operation
+            .source_tx_hash
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case(query))
+        || entry
+            .operation
+            .destination_tx_hash
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case(query))
 }
 
 fn mock_unit_signatures(kind: MockUnitOperationKind) -> Value {
@@ -6305,12 +6378,18 @@ struct MockUnitEvmWithdrawalRelease {
     amount: String,
 }
 
+struct MockUnitBitcoinWithdrawalRelease {
+    protocol_address: String,
+    dst_addr: String,
+    amount: String,
+}
+
 async fn complete_mock_unit_operation_with_observation(
     state: &Arc<MockIntegratorState>,
     protocol_address: &str,
     observation: Option<UnitOperationObservation>,
 ) -> Result<(), String> {
-    let (maybe_deposit_credit, maybe_evm_withdrawal_release) = {
+    let (maybe_deposit_credit, maybe_evm_withdrawal_release, maybe_bitcoin_withdrawal_release) = {
         let mut operations = state.unit_operations.lock().await;
         let entries = operations
             .get_mut(protocol_address)
@@ -6404,7 +6483,12 @@ async fn complete_mock_unit_operation_with_observation(
                     entry.operation.destination_fee_amount.as_deref(),
                     entry.operation.sweep_fee_amount.as_deref(),
                 )?;
-                Some((user, coin, net_amount))
+                Some((
+                    user,
+                    coin,
+                    net_amount,
+                    entry.operation.source_tx_hash.clone().unwrap_or_default(),
+                ))
             }
             _ => None,
         };
@@ -6427,17 +6511,64 @@ async fn complete_mock_unit_operation_with_observation(
             }
             _ => None,
         };
-        (maybe_deposit_credit, maybe_evm_withdrawal_release)
+        let maybe_bitcoin_withdrawal_release = match entry.kind {
+            MockUnitOperationKind::Withdrawal
+                if entry.dst_chain == UnitChain::Bitcoin && entry.asset == UnitAsset::Btc =>
+            {
+                let amount = entry.operation.source_amount.clone().ok_or_else(|| {
+                    format!(
+                        "mock unit operation {protocol_address} cannot release Bitcoin withdrawal without source_amount evidence"
+                    )
+                })?;
+                Some(MockUnitBitcoinWithdrawalRelease {
+                    protocol_address: protocol_address.to_string(),
+                    dst_addr: entry.dst_addr.clone(),
+                    amount,
+                })
+            }
+            _ => None,
+        };
+        (
+            maybe_deposit_credit,
+            maybe_evm_withdrawal_release,
+            maybe_bitcoin_withdrawal_release,
+        )
     };
 
-    if let Some((user, coin, amount)) = maybe_deposit_credit {
+    if let Some((user, coin, amount, tx_hash)) = maybe_deposit_credit {
         if amount > 0.0 {
             let mut hl = state.hyperliquid.lock().await;
             hl.credit_spot(user, coin, amount);
+            hl.record_ledger_update(
+                user,
+                UserNonFundingLedgerUpdate {
+                    time: Utc::now().timestamp_millis().max(0) as u64,
+                    hash: tx_hash,
+                    delta: UserNonFundingLedgerDelta::Deposit {
+                        usdc: format_hl_amount(amount),
+                    },
+                },
+            );
         }
     }
     if let Some(release) = maybe_evm_withdrawal_release {
         let tx_hash = match send_mock_unit_evm_withdrawal_release(state, &release).await {
+            Ok(tx_hash) => tx_hash,
+            Err(error) => {
+                mark_mock_unit_operation_failed(state, &release.protocol_address).await;
+                return Err(error);
+            }
+        };
+        let mut operations = state.unit_operations.lock().await;
+        if let Some(entry) = operations
+            .get_mut(&release.protocol_address)
+            .and_then(|entries| entries.last_mut())
+        {
+            entry.operation.destination_tx_hash = Some(tx_hash);
+        }
+    }
+    if let Some(release) = maybe_bitcoin_withdrawal_release {
+        let tx_hash = match send_mock_unit_bitcoin_withdrawal_release(state, &release).await {
             Ok(tx_hash) => tx_hash,
             Err(error) => {
                 mark_mock_unit_operation_failed(state, &release.protocol_address).await;
@@ -6503,6 +6634,61 @@ async fn send_mock_unit_evm_withdrawal_release(
         .map_err(|err| format!("mock Unit withdrawal release native credit failed: {err}"))?;
 
     Ok(mock_unit_evm_withdrawal_release_tx_hash(release))
+}
+
+async fn send_mock_unit_bitcoin_withdrawal_release(
+    state: &Arc<MockIntegratorState>,
+    release: &MockUnitBitcoinWithdrawalRelease,
+) -> Result<String, String> {
+    let (Some(rpc_url), Some(cookie_path)) = (
+        state.unit_bitcoin_rpc_url.clone(),
+        state.unit_bitcoin_cookie_path.clone(),
+    ) else {
+        return Err(
+            "mock Unit Bitcoin withdrawal release has no Bitcoin RPC configuration".to_string(),
+        );
+    };
+    let client = BitcoinRpcClient::new(rpc_url, BitcoinRpcAuth::CookieFile(cookie_path))
+        .await
+        .map_err(|err| format!("mock Unit Bitcoin withdrawal RPC init failed: {err}"))?;
+    let destination = bitcoin::Address::from_str(&release.dst_addr)
+        .map_err(|err| {
+            format!(
+                "mock Unit Bitcoin withdrawal destination {:?} is invalid: {err}",
+                release.dst_addr
+            )
+        })?
+        .require_network(bitcoin::Network::Regtest)
+        .map_err(|err| {
+            format!(
+                "mock Unit Bitcoin withdrawal destination {:?} is not regtest: {err}",
+                release.dst_addr
+            )
+        })?;
+    let amount_sats = release.amount.parse::<u64>().map_err(|err| {
+        format!(
+            "mock Unit Bitcoin amount {:?} is invalid: {err}",
+            release.amount
+        )
+    })?;
+    let sent = client
+        .send_to_address(&destination, bitcoin::Amount::from_sat(amount_sats))
+        .await
+        .map_err(|err| format!("mock Unit Bitcoin withdrawal send failed: {err}"))?;
+    let txid = sent
+        .txid()
+        .map_err(|err| format!("mock Unit Bitcoin withdrawal txid decode failed: {err}"))?;
+    let miner = client
+        .get_new_address(None, None)
+        .await
+        .map_err(|err| format!("mock Unit Bitcoin miner address allocation failed: {err}"))?
+        .require_network(bitcoin::Network::Regtest)
+        .map_err(|err| format!("mock Unit Bitcoin miner address network mismatch: {err}"))?;
+    client
+        .generate_to_address(1, &miner)
+        .await
+        .map_err(|err| format!("mock Unit Bitcoin withdrawal mining failed: {err}"))?;
+    Ok(txid.to_string())
 }
 
 fn mock_unit_evm_withdrawal_release_tx_hash(release: &MockUnitEvmWithdrawalRelease) -> String {

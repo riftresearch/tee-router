@@ -741,9 +741,13 @@ impl ProviderOperationStatus {
 #[serde(rename_all = "snake_case")]
 pub enum ProviderOperationHintKind {
     PossibleProgress,
+    BtcDepositObserved,
     AcrossDestinationFilled,
     CctpReceiveObserved,
     VeloraSwapSettled,
+    HyperUnitDepositCredited,
+    HyperUnitWithdrawalAcknowledged,
+    HyperUnitWithdrawalSettled,
     HlTradeFilled,
     HlTradeCanceled,
     HlBridgeDepositObserved,
@@ -757,9 +761,13 @@ impl ProviderOperationHintKind {
     pub fn to_db_string(self) -> &'static str {
         match self {
             Self::PossibleProgress => "possible_progress",
+            Self::BtcDepositObserved => "btc_deposit_observed",
             Self::AcrossDestinationFilled => "across_destination_filled",
             Self::CctpReceiveObserved => "cctp_receive_observed",
             Self::VeloraSwapSettled => "velora_swap_settled",
+            Self::HyperUnitDepositCredited => "hyperunit_deposit_credited",
+            Self::HyperUnitWithdrawalAcknowledged => "hyperunit_withdrawal_acknowledged",
+            Self::HyperUnitWithdrawalSettled => "hyperunit_withdrawal_settled",
             Self::HlTradeFilled => "hl_trade_filled",
             Self::HlTradeCanceled => "hl_trade_canceled",
             Self::HlBridgeDepositObserved => "hl_bridge_deposit_observed",
@@ -772,9 +780,13 @@ impl ProviderOperationHintKind {
     pub fn from_db_string(value: &str) -> Option<Self> {
         match value {
             "possible_progress" => Some(Self::PossibleProgress),
+            "btc_deposit_observed" => Some(Self::BtcDepositObserved),
             "across_destination_filled" => Some(Self::AcrossDestinationFilled),
             "cctp_receive_observed" => Some(Self::CctpReceiveObserved),
             "velora_swap_settled" => Some(Self::VeloraSwapSettled),
+            "hyperunit_deposit_credited" => Some(Self::HyperUnitDepositCredited),
+            "hyperunit_withdrawal_acknowledged" => Some(Self::HyperUnitWithdrawalAcknowledged),
+            "hyperunit_withdrawal_settled" => Some(Self::HyperUnitWithdrawalSettled),
             "hl_trade_filled" => Some(Self::HlTradeFilled),
             "hl_trade_canceled" => Some(Self::HlTradeCanceled),
             "hl_bridge_deposit_observed" => Some(Self::HlBridgeDepositObserved),
@@ -784,6 +796,86 @@ impl ProviderOperationHintKind {
             _ => None,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BtcDepositObservedEvidence {
+    pub tx_hash: String,
+    pub address: String,
+    pub transfer_index: u64,
+    pub amount: String,
+    pub confirmation_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_height: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HyperUnitDepositCreditedEvidence {
+    pub protocol_address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub btc_tx_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub btc_vout: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub btc_amount: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub btc_confirmations: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub btc_block_height: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub btc_block_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hyperunit_operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hyperunit_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hyperunit_source_tx_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hyperunit_destination_tx_hash: Option<String>,
+    pub hl_user: String,
+    pub hl_amount: String,
+    pub hl_credit_hash: String,
+    pub hl_credit_time_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HyperUnitWithdrawalAcknowledgedEvidence {
+    pub protocol_address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hyperunit_operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hyperunit_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amount: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub btc_tx_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broadcast_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HyperUnitWithdrawalSettledEvidence {
+    pub protocol_address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hyperunit_operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hyperunit_status: Option<String>,
+    pub destination_address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amount: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub btc_tx_hash: Option<String>,
+    pub btc_vout: u64,
+    pub btc_amount: String,
+    pub btc_confirmations: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1044,6 +1136,7 @@ pub const PROVIDER_OPERATION_OBSERVATION_HINT_SOURCE: &str =
 pub const SAURON_DETECTOR_HINT_SOURCE: &str = "sauron";
 pub const SAURON_EVM_RECEIPT_OBSERVER_HINT_SOURCE: &str = "sauron_evm_receipt_observer";
 pub const SAURON_HYPERLIQUID_OBSERVER_HINT_SOURCE: &str = "sauron_hyperliquid_observer";
+pub const SAURON_HYPERUNIT_OBSERVER_HINT_SOURCE: &str = "sauron_hyperunit_observer";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DepositVaultFundingHint {

@@ -1,9 +1,10 @@
-pub mod bitcoin;
+pub mod btc;
 pub mod evm_erc20;
 pub mod hyperliquid;
 pub mod hyperliquid_bridge;
 pub mod hyperliquid_spot_trade;
 pub mod hyperliquid_trade;
+pub mod hyperunit;
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -846,7 +847,7 @@ async fn submit_detected_deposit(
         .submit_detector_hint(&DetectorHintRequest {
             target,
             source: SAURON_DETECTOR_HINT_SOURCE.to_string(),
-            hint_kind: ProviderOperationHintKind::PossibleProgress,
+            hint_kind: detected_deposit_hint_kind(detected),
             evidence,
             idempotency_key,
         })
@@ -938,6 +939,16 @@ async fn submit_detected_deposit(
                 SubmissionOutcome::TerminalFailure
             }
         }
+    }
+}
+
+fn detected_deposit_hint_kind(detected: &DetectedDeposit) -> ProviderOperationHintKind {
+    if detected.watch_target == WatchTarget::ProviderOperation
+        && detected.source_chain == ChainType::Bitcoin
+    {
+        ProviderOperationHintKind::BtcDepositObserved
+    } else {
+        ProviderOperationHintKind::PossibleProgress
     }
 }
 

@@ -18,6 +18,16 @@ use alloy::{
     signers::local::PrivateKeySigner,
     sol,
 };
+use bitcoin_indexer::{
+    build_router as build_bitcoin_indexer_router, AppState as BitcoinIndexerAppState,
+    BitcoinIndexer, Config as BitcoinIndexerConfig, IndexerPubSub as BitcoinIndexerPubSub,
+};
+use bitcoin_receipt_watcher::{
+    build_router as build_bitcoin_receipt_watcher_router,
+    AppState as BitcoinReceiptWatcherAppState, Config as BitcoinReceiptWatcherConfig,
+    PendingWatches as BitcoinReceiptPendingWatches, ReceiptPubSub as BitcoinReceiptPubSub,
+    Watcher as BitcoinReceiptWatcher,
+};
 use bitcoincore_rpc_async::Auth;
 use chains::ChainRegistry;
 use devnet::{
@@ -44,6 +54,7 @@ use router_core::{
         OrderProviderOperation, ProviderOperationStatus, ProviderOperationType,
         RouterOrderEnvelope, RouterOrderQuoteEnvelope, RouterOrderStatus,
         SAURON_EVM_RECEIPT_OBSERVER_HINT_SOURCE, SAURON_HYPERLIQUID_OBSERVER_HINT_SOURCE,
+        SAURON_HYPERUNIT_OBSERVER_HINT_SOURCE,
     },
     protocol::{backend_chain_for_id, AssetId, ChainId},
 };
@@ -99,8 +110,8 @@ const ARBITRUM_RPC_URL_ENV: &str = "ARBITRUM_RPC_URL";
 const ELECTRUM_HTTP_SERVER_URL_ENV: &str = "ELECTRUM_HTTP_SERVER_URL";
 const BITCOIN_RPC_URL_ENV: &str = "BITCOIN_RPC_URL";
 const BITCOIN_RPC_AUTH_ENV: &str = "BITCOIN_RPC_AUTH";
-const BITCOIN_ZMQ_RAWTX_ENDPOINT_ENV: &str = "BITCOIN_ZMQ_RAWTX_ENDPOINT";
-const BITCOIN_ZMQ_SEQUENCE_ENDPOINT_ENV: &str = "BITCOIN_ZMQ_SEQUENCE_ENDPOINT";
+const BITCOIN_INDEXER_URL_ENV: &str = "BITCOIN_INDEXER_URL";
+const BITCOIN_RECEIPT_WATCHER_URL_ENV: &str = "BITCOIN_RECEIPT_WATCHER_URL";
 const ACROSS_API_URL_ENV: &str = "ACROSS_API_URL";
 const ACROSS_API_KEY_ENV: &str = "ACROSS_API_KEY";
 const ACROSS_INTEGRATOR_ID_ENV: &str = "ACROSS_INTEGRATOR_ID";
@@ -265,9 +276,9 @@ struct LiveRuntimeConfig {
     arbitrum_rpc_url: String,
     bitcoin_rpc_url: String,
     bitcoin_rpc_auth: Auth,
-    bitcoin_zmq_rawtx_endpoint: String,
-    bitcoin_zmq_sequence_endpoint: String,
     electrum_http_server_url: String,
+    bitcoin_indexer_url: Option<String>,
+    bitcoin_receipt_watcher_url: Option<String>,
     across_api_url: String,
     across_api_key: String,
     across_integrator_id: Option<String>,
@@ -303,9 +314,9 @@ impl LiveRuntimeConfig {
             arbitrum_rpc_url: env_var_required(ARBITRUM_RPC_URL_ENV),
             bitcoin_rpc_url: env_var_required(BITCOIN_RPC_URL_ENV),
             bitcoin_rpc_auth: parse_auth_env(BITCOIN_RPC_AUTH_ENV),
-            bitcoin_zmq_rawtx_endpoint: env_var_required(BITCOIN_ZMQ_RAWTX_ENDPOINT_ENV),
-            bitcoin_zmq_sequence_endpoint: env_var_required(BITCOIN_ZMQ_SEQUENCE_ENDPOINT_ENV),
             electrum_http_server_url: env_var_required(ELECTRUM_HTTP_SERVER_URL_ENV),
+            bitcoin_indexer_url: env_var_optional(BITCOIN_INDEXER_URL_ENV),
+            bitcoin_receipt_watcher_url: env_var_optional(BITCOIN_RECEIPT_WATCHER_URL_ENV),
             across_api_url: env_var_optional(ACROSS_API_URL_ENV)
                 .unwrap_or_else(|| DEFAULT_LIVE_ACROSS_API_URL.to_string()),
             across_api_key: env_var_required(ACROSS_API_KEY_ENV),
@@ -1223,6 +1234,8 @@ async fn spawn_sauron(
     token_indexer_urls: RuntimeTokenIndexerUrls,
     receipt_watcher_urls: EvmReceiptWatcherUrls,
     hl_shim_indexer_url: Option<String>,
+    bitcoin_observer_urls: Option<BitcoinObserverUrls>,
+    hyperunit_api_url: Option<String>,
 ) -> RuntimeTask {
     let args = SauronArgs {
         log_level: "warn".to_string(),
@@ -1237,16 +1250,12 @@ async fn spawn_sauron(
         sauron_cdc_idle_wakeup_interval_ms: 10_000,
         router_internal_base_url: router_base_url.to_string(),
         router_detector_api_key: ROUTER_DETECTOR_API_KEY.to_string(),
-        electrum_http_server_url: devnet
-            .bitcoin
-            .esplora_url
+        bitcoin_indexer_url: bitcoin_observer_urls
             .as_ref()
-            .expect("esplora URL")
-            .clone(),
-        bitcoin_rpc_url: bitcoin_rpc_url(devnet),
-        bitcoin_rpc_auth: Auth::CookieFile(devnet.bitcoin.cookie.clone()),
-        bitcoin_zmq_rawtx_endpoint: devnet.bitcoin.zmq_rawtx_endpoint.clone(),
-        bitcoin_zmq_sequence_endpoint: devnet.bitcoin.zmq_sequence_endpoint.clone(),
+            .map(|urls| urls.indexer.clone()),
+        bitcoin_receipt_watcher_url: bitcoin_observer_urls
+            .as_ref()
+            .map(|urls| urls.receipt_watcher.clone()),
         ethereum_mainnet_rpc_url: devnet.ethereum.anvil.endpoint_url().to_string(),
         ethereum_token_indexer_url: token_indexer_urls.ethereum,
         ethereum_receipt_watcher_url: Some(receipt_watcher_urls.ethereum),
@@ -1257,6 +1266,8 @@ async fn spawn_sauron(
         arbitrum_token_indexer_url: token_indexer_urls.arbitrum,
         arbitrum_receipt_watcher_url: Some(receipt_watcher_urls.arbitrum),
         hl_shim_indexer_url,
+        hyperunit_api_url,
+        hyperunit_proxy_url: None,
         sauron_hl_bridge_match_window_seconds: 1_800,
         token_indexer_api_key: token_indexer_urls.api_key,
         sauron_reconcile_interval_seconds: 2,
@@ -1414,6 +1425,132 @@ async fn spawn_evm_receipt_watcher(
     (base_url, task)
 }
 
+struct BitcoinObserverUrls {
+    indexer: String,
+    receipt_watcher: String,
+}
+
+async fn spawn_bitcoin_observers(devnet: &RiftDevnet) -> (BitcoinObserverUrls, Vec<RuntimeTask>) {
+    let (indexer_url, indexer_task) = spawn_bitcoin_indexer(devnet).await;
+    let (receipt_watcher_url, receipt_watcher_task) = spawn_bitcoin_receipt_watcher(devnet).await;
+    (
+        BitcoinObserverUrls {
+            indexer: indexer_url,
+            receipt_watcher: receipt_watcher_url,
+        },
+        vec![indexer_task, receipt_watcher_task],
+    )
+}
+
+async fn spawn_bitcoin_indexer(devnet: &RiftDevnet) -> (String, RuntimeTask) {
+    let bind = "127.0.0.1:0"
+        .parse::<SocketAddr>()
+        .expect("valid Bitcoin indexer bind");
+    let config = BitcoinIndexerConfig {
+        network: bitcoin::Network::Regtest,
+        rpc_url: devnet.bitcoin.rpc_url.clone(),
+        rpc_auth: Some(format!("cookie:{}", devnet.bitcoin.cookie.display())),
+        esplora_url: devnet
+            .bitcoin
+            .esplora_url
+            .clone()
+            .expect("devnet esplora URL"),
+        zmq_rawblock_endpoint: devnet.bitcoin.zmq_rawblock_endpoint.clone(),
+        zmq_rawtx_endpoint: devnet.bitcoin.zmq_rawtx_endpoint.clone(),
+        bind,
+        max_subscriber_lag: 1_000,
+        poll_interval_ms: 100,
+        zmq_reconnect_delay_ms: 100,
+        reorg_rescan_depth: 6,
+    };
+    let pubsub = BitcoinIndexerPubSub::new(config.max_subscriber_lag);
+    let indexer = BitcoinIndexer::new(&config, pubsub.clone())
+        .await
+        .expect("create Bitcoin indexer");
+    indexer.clone().run().await;
+    let app = build_bitcoin_indexer_router(BitcoinIndexerAppState {
+        indexer,
+        pubsub,
+        metrics: None,
+    });
+    let listener = TcpListener::bind(config.bind)
+        .await
+        .expect("bind Bitcoin indexer listener");
+    let addr = listener.local_addr().expect("read Bitcoin indexer addr");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("Bitcoin indexer server should run until test shutdown");
+    });
+    let base_url = format!("http://{addr}");
+    wait_for_http_health(&base_url, "/healthz", "Bitcoin indexer").await;
+    let task = RuntimeTask::with_shutdown(handle, move || {
+        let _ = shutdown_tx.send(());
+    });
+    assert!(!task.is_finished(), "Bitcoin indexer exited during startup");
+    (base_url, task)
+}
+
+async fn spawn_bitcoin_receipt_watcher(devnet: &RiftDevnet) -> (String, RuntimeTask) {
+    let bind = "127.0.0.1:0"
+        .parse::<SocketAddr>()
+        .expect("valid Bitcoin receipt watcher bind");
+    let config = BitcoinReceiptWatcherConfig {
+        chain: "bitcoin".to_string(),
+        rpc_url: devnet.bitcoin.rpc_url.clone(),
+        rpc_auth: Some(format!("cookie:{}", devnet.bitcoin.cookie.display())),
+        zmq_rawblock_endpoint: devnet.bitcoin.zmq_rawblock_endpoint.clone(),
+        bind,
+        max_pending: 10_000,
+        max_subscriber_lag: 1_000,
+        poll_interval_ms: 100,
+        zmq_reconnect_delay_ms: 100,
+    };
+    let pending = BitcoinReceiptPendingWatches::new(config.chain.clone(), config.max_pending);
+    let pubsub = BitcoinReceiptPubSub::new(config.max_subscriber_lag);
+    let watcher = BitcoinReceiptWatcher::new(&config, pending.clone(), pubsub.clone())
+        .await
+        .expect("create Bitcoin receipt watcher");
+    let rpc = watcher.rpc_client();
+    watcher.clone().run().await;
+    let app = build_bitcoin_receipt_watcher_router(BitcoinReceiptWatcherAppState {
+        chain: config.chain.clone(),
+        pending,
+        pubsub,
+        rpc,
+        metrics: None,
+    });
+    let listener = TcpListener::bind(config.bind)
+        .await
+        .expect("bind Bitcoin receipt watcher listener");
+    let addr = listener
+        .local_addr()
+        .expect("read Bitcoin receipt watcher addr");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("Bitcoin receipt watcher server should run until test shutdown");
+    });
+    let base_url = format!("http://{addr}");
+    wait_for_http_health(&base_url, "/healthz", "Bitcoin receipt watcher").await;
+    let task = RuntimeTask::with_shutdown(handle, move || {
+        let _ = shutdown_tx.send(());
+    });
+    assert!(
+        !task.is_finished(),
+        "Bitcoin receipt watcher exited during startup"
+    );
+    (base_url, task)
+}
+
 async fn wait_for_http_health(base_url: &str, path: &str, label: &str) {
     let client = reqwest::Client::new();
     let url = format!("{base_url}{path}");
@@ -1496,11 +1633,8 @@ fn live_sauron_args(
         sauron_cdc_idle_wakeup_interval_ms: 10_000,
         router_internal_base_url: router_base_url.to_string(),
         router_detector_api_key: ROUTER_DETECTOR_API_KEY.to_string(),
-        electrum_http_server_url: live.electrum_http_server_url.clone(),
-        bitcoin_rpc_url: live.bitcoin_rpc_url.clone(),
-        bitcoin_rpc_auth: live.bitcoin_rpc_auth.clone(),
-        bitcoin_zmq_rawtx_endpoint: live.bitcoin_zmq_rawtx_endpoint.clone(),
-        bitcoin_zmq_sequence_endpoint: live.bitcoin_zmq_sequence_endpoint.clone(),
+        bitcoin_indexer_url: live.bitcoin_indexer_url.clone(),
+        bitcoin_receipt_watcher_url: live.bitcoin_receipt_watcher_url.clone(),
         ethereum_mainnet_rpc_url: live.ethereum_rpc_url.clone(),
         ethereum_token_indexer_url: live.ethereum_token_indexer_url.clone(),
         ethereum_receipt_watcher_url: None,
@@ -1511,6 +1645,8 @@ fn live_sauron_args(
         arbitrum_token_indexer_url: live.arbitrum_token_indexer_url.clone(),
         arbitrum_receipt_watcher_url: None,
         hl_shim_indexer_url: None,
+        hyperunit_api_url: Some(live.hyperunit_api_url.clone()),
+        hyperunit_proxy_url: live.hyperunit_proxy_url.clone(),
         sauron_hl_bridge_match_window_seconds: 1_800,
         token_indexer_api_key: live.token_indexer_api_key.clone(),
         sauron_reconcile_interval_seconds: 30,
@@ -2096,6 +2232,10 @@ async fn spawn_runtime_mocks(devnet: &RiftDevnet, route: RuntimeRoute) -> MockIn
         .with_unit_evm_rpc_url(
             hyperunit_client::UnitChain::Ethereum,
             devnet.ethereum.anvil.endpoint(),
+        )
+        .with_unit_bitcoin_rpc(
+            devnet.bitcoin.rpc_url.clone(),
+            devnet.bitcoin.cookie.clone(),
         )
         .with_across_status_latency(Duration::from_secs(2))
         .with_mainnet_hyperliquid(true);
@@ -2709,6 +2849,7 @@ async fn run_mock_runtime_route(route: RuntimeRoute) {
     ensure_temporal_up();
     let (hl_shim_base_url, _hl_shim_task) =
         spawn_hl_shim_indexer(&hl_shim_database_url, mocks.base_url()).await;
+    let (bitcoin_observer_urls, _bitcoin_observer_tasks) = spawn_bitcoin_observers(&devnet).await;
     let mut temporal_worker_task = spawn_temporal_order_worker(&args).await;
     let order_workflow_client = std::sync::Arc::new(
         OrderWorkflowClient::connect(
@@ -2745,6 +2886,8 @@ async fn run_mock_runtime_route(route: RuntimeRoute) {
             arbitrum: arbitrum_receipt_watcher_url,
         },
         Some(hl_shim_base_url),
+        Some(bitcoin_observer_urls),
+        Some(mocks.base_url().to_string()),
     )
     .await;
     let client = reqwest::Client::new();
@@ -3073,13 +3216,15 @@ async fn assert_runtime_hints_are_production_driven(
                     'sauron',
                     'sauron_provider_operation_observation',
                     $2,
-                    $3
+                    $3,
+                    $4
                   )
                 "#,
         )
         .bind(order_id)
         .bind(SAURON_HYPERLIQUID_OBSERVER_HINT_SOURCE)
         .bind(SAURON_EVM_RECEIPT_OBSERVER_HINT_SOURCE)
+        .bind(SAURON_HYPERUNIT_OBSERVER_HINT_SOURCE)
         .fetch_one(&pool)
         .await
         .expect("count non-Sauron provider operation hints");
