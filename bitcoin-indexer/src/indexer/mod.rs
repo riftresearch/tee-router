@@ -1,3 +1,5 @@
+mod multisource;
+
 use std::{collections::VecDeque, str::FromStr, sync::Arc, time::Duration};
 
 use bitcoin::{
@@ -14,9 +16,11 @@ use tokio::{
 use zeromq::{Socket, SocketRecv, ZmqMessage};
 
 use crate::{config::Config, Error, Result};
+use multisource::{DedupOutcome, MultiSource, Source};
 
 const MAX_QUERY_LIMIT: usize = 1_000;
 const DEFAULT_QUERY_LIMIT: usize = 100;
+const BITCOIN_MULTISOURCE_RECENT_SEEN: usize = 100_000;
 
 #[derive(Clone)]
 pub struct IndexerPubSub {
@@ -46,6 +50,7 @@ pub struct BitcoinIndexer {
     rawblock_endpoint: String,
     rawtx_endpoint: String,
     pubsub: IndexerPubSub,
+    multi_source: MultiSource<TxOutput, OutputDedupKey, BitcoinEventSource>,
     cursor: Arc<Mutex<BlockCursorState>>,
     poll_interval: Duration,
     zmq_reconnect_delay: Duration,
@@ -67,6 +72,15 @@ impl BitcoinIndexer {
             rawblock_endpoint: config.zmq_rawblock_endpoint.clone(),
             rawtx_endpoint: config.zmq_rawtx_endpoint.clone(),
             pubsub,
+            multi_source: MultiSource::new(
+                vec![
+                    BitcoinEventSource::ZmqRawTx,
+                    BitcoinEventSource::ZmqRawBlock,
+                    BitcoinEventSource::RpcPoll,
+                ],
+                output_dedup_key,
+                BITCOIN_MULTISOURCE_RECENT_SEEN,
+            ),
             cursor: Arc::new(Mutex::new(BlockCursorState::new(config.reorg_rescan_depth))),
             poll_interval: config.poll_interval(),
             zmq_reconnect_delay: config.zmq_reconnect_delay(),
@@ -187,7 +201,10 @@ impl BitcoinIndexer {
 
             while let Ok(message) = socket.recv().await {
                 match rawtx_from_message(message) {
-                    Ok(Some(tx)) => self.publish_transaction_outputs(&tx),
+                    Ok(Some(tx)) => {
+                        self.publish_transaction_outputs(BitcoinEventSource::ZmqRawTx, &tx)
+                            .await;
+                    }
                     Ok(None) => {}
                     Err(error) => {
                         tracing::warn!(%error, "failed to process Bitcoin rawtx ZMQ message");
@@ -228,7 +245,10 @@ impl BitcoinIndexer {
             while let Ok(message) = socket.recv().await {
                 match block_from_message(message) {
                     Ok(Some(block)) => {
-                        if let Err(error) = self.apply_block(block).await {
+                        if let Err(error) = self
+                            .apply_block(BitcoinEventSource::ZmqRawBlock, block)
+                            .await
+                        {
                             tracing::warn!(%error, "failed to index Bitcoin rawblock ZMQ message");
                         }
                     }
@@ -264,33 +284,34 @@ impl BitcoinIndexer {
             Some(last_height) => last_height.saturating_add(1),
             None => tip_height,
         };
-        self.rescan_canonical_from(start).await
+        self.rescan_canonical_from(BitcoinEventSource::RpcPoll, start)
+            .await
     }
 
-    async fn apply_block(&self, block: Block) -> Result<()> {
+    async fn apply_block(&self, source: BitcoinEventSource, block: Block) -> Result<()> {
         let indexed = self.indexed_block(block).await?;
         let update = self.cursor.lock().await.observe_block(indexed);
         match update {
             CursorUpdate::Accepted(outputs) => {
-                for output in outputs {
-                    self.pubsub.publish(output);
-                }
+                self.publish_outputs(source, outputs).await;
             }
             CursorUpdate::Ignored => {}
             CursorUpdate::Reorg {
                 retracted_outputs,
                 rescan_from,
             } => {
-                for output in retracted_outputs {
-                    self.pubsub.publish(output);
-                }
-                self.rescan_canonical_from(rescan_from).await?;
+                self.publish_outputs(source, retracted_outputs).await;
+                self.rescan_canonical_from(source, rescan_from).await?;
             }
         }
         Ok(())
     }
 
-    async fn rescan_canonical_from(&self, mut start_height: u64) -> Result<()> {
+    async fn rescan_canonical_from(
+        &self,
+        source: BitcoinEventSource,
+        mut start_height: u64,
+    ) -> Result<()> {
         loop {
             let tip_height = self.current_tip_height().await?;
             if start_height > tip_height {
@@ -304,18 +325,14 @@ impl BitcoinIndexer {
                 let update = self.cursor.lock().await.observe_block(indexed);
                 match update {
                     CursorUpdate::Accepted(outputs) => {
-                        for output in outputs {
-                            self.pubsub.publish(output);
-                        }
+                        self.publish_outputs(source, outputs).await;
                     }
                     CursorUpdate::Ignored => {}
                     CursorUpdate::Reorg {
                         retracted_outputs,
                         rescan_from,
                     } => {
-                        for output in retracted_outputs {
-                            self.pubsub.publish(output);
-                        }
+                        self.publish_outputs(source, retracted_outputs).await;
                         restart_from = Some(rescan_from);
                         break;
                     }
@@ -384,11 +401,49 @@ impl BitcoinIndexer {
             })
     }
 
-    fn publish_transaction_outputs(&self, tx: &Transaction) {
+    async fn publish_transaction_outputs(&self, source: BitcoinEventSource, tx: &Transaction) {
         for output in tx_outputs_from_transaction(tx, self.network, None, false) {
+            self.publish_output(source, output).await;
+        }
+    }
+
+    async fn publish_outputs(&self, source: BitcoinEventSource, outputs: Vec<TxOutput>) {
+        for output in outputs {
+            self.publish_output(source, output).await;
+        }
+    }
+
+    async fn publish_output(&self, source: BitcoinEventSource, output: TxOutput) {
+        if self.multi_source.observe(source, &output).await == DedupOutcome::New {
             self.pubsub.publish(output);
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BitcoinEventSource {
+    ZmqRawTx,
+    ZmqRawBlock,
+    RpcPoll,
+}
+
+impl Source for BitcoinEventSource {
+    fn name(self) -> &'static str {
+        match self {
+            Self::ZmqRawTx => "zmq_rawtx",
+            Self::ZmqRawBlock => "zmq_rawblock",
+            Self::RpcPoll => "rpc_poll",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct OutputDedupKey {
+    txid: Txid,
+    vout: u32,
+    block_height: Option<u64>,
+    block_hash: Option<BlockHash>,
+    removed: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -581,6 +636,16 @@ fn nonnegative_i64_to_u64(value: i64, field: &'static str) -> Result<u64> {
 fn mark_removed(mut output: TxOutput) -> TxOutput {
     output.removed = true;
     output
+}
+
+fn output_dedup_key(output: &TxOutput) -> OutputDedupKey {
+    OutputDedupKey {
+        txid: output.txid,
+        vout: output.vout,
+        block_height: output.block_height,
+        block_hash: output.block_hash,
+        removed: output.removed,
+    }
 }
 
 fn tx_outputs_from_block(
@@ -810,5 +875,62 @@ mod tests {
             }
             other => panic!("expected reorg, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn multisource_dedups_same_confirmed_output_across_sources() {
+        let source = MultiSource::new(
+            vec![BitcoinEventSource::ZmqRawBlock, BitcoinEventSource::RpcPoll],
+            output_dedup_key,
+            16,
+        );
+        let event = output(1, 101);
+
+        assert_eq!(
+            source
+                .observe(BitcoinEventSource::ZmqRawBlock, &event)
+                .await,
+            DedupOutcome::New
+        );
+        assert_eq!(
+            source.observe(BitcoinEventSource::RpcPoll, &event).await,
+            DedupOutcome::Duplicate
+        );
+        assert_eq!(source.recent_seen_len().await, 1);
+        assert_eq!(source.source_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn multisource_keeps_mempool_and_confirmed_output_events_distinct() {
+        let source = MultiSource::new(
+            vec![
+                BitcoinEventSource::ZmqRawTx,
+                BitcoinEventSource::ZmqRawBlock,
+            ],
+            output_dedup_key,
+            16,
+        );
+        let mut mempool = output(1, 0);
+        mempool.block_height = None;
+        mempool.block_hash = None;
+        mempool.confirmations = 0;
+        let confirmed = TxOutput {
+            block_height: Some(101),
+            block_hash: Some(hash(1)),
+            confirmations: 1,
+            ..mempool.clone()
+        };
+
+        assert_eq!(
+            source.observe(BitcoinEventSource::ZmqRawTx, &mempool).await,
+            DedupOutcome::New
+        );
+        assert_eq!(
+            source
+                .observe(BitcoinEventSource::ZmqRawBlock, &confirmed)
+                .await,
+            DedupOutcome::New
+        );
+        assert_eq!(source.recent_seen_len().await, 2);
     }
 }
