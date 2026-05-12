@@ -9,7 +9,9 @@ use bitcoin::{address::NetworkUnchecked, Address as BitcoinAddress};
 use bitcoin_indexer_client::TxOutput;
 use bitcoin_receipt_watcher_client::{parse_txid, ByIdLookup};
 use hl_shim_client::{HlShimClient, HlTransferEvent, HlTransferKind};
-use hyperunit_client::{HyperUnitClient, HyperUnitClientError, UnitOperation};
+use hyperunit_client::{
+    HyperUnitClient, HyperUnitClientError, UnitOperation, UnitOperationsRequest,
+};
 use router_core::models::{
     ProviderOperationHintKind, ProviderOperationType, SAURON_HYPERUNIT_OBSERVER_HINT_SOURCE,
 };
@@ -299,28 +301,63 @@ async fn bitcoin_output(
 
 async fn lookup_deposit_status(
     unit: &HyperUnitClient,
-    operation_id: &str,
+    protocol_address: &str,
 ) -> Result<Option<UnitOperation>> {
-    lookup_status(unit.deposit_operation(operation_id)).await
+    let operations = lookup_operations(unit, protocol_address).await?;
+    Ok(select_deposit_operation(operations, protocol_address))
 }
 
 async fn lookup_withdrawal_status(
     unit: &HyperUnitClient,
-    operation_id: &str,
+    protocol_address: &str,
 ) -> Result<Option<UnitOperation>> {
-    lookup_status(unit.withdrawal_operation(operation_id)).await
+    let operations = lookup_operations(unit, protocol_address).await?;
+    Ok(select_withdrawal_operation(operations, protocol_address))
 }
 
-async fn lookup_status<F>(future: F) -> Result<Option<UnitOperation>>
-where
-    F: std::future::Future<Output = hyperunit_client::HyperUnitResult<UnitOperation>>,
-{
-    match timeout(HYPERUNIT_STATUS_TIMEOUT, future).await {
-        Ok(Ok(operation)) => Ok(Some(operation)),
-        Ok(Err(HyperUnitClientError::HttpStatus { status: 404, .. })) => Ok(None),
+async fn lookup_operations(
+    unit: &HyperUnitClient,
+    protocol_address: &str,
+) -> Result<Vec<UnitOperation>> {
+    let request = UnitOperationsRequest {
+        address: protocol_address.to_string(),
+    };
+    match timeout(HYPERUNIT_STATUS_TIMEOUT, unit.operations(request)).await {
+        Ok(Ok(response)) => Ok(response.operations),
+        Ok(Err(HyperUnitClientError::HttpStatus { status: 404, .. })) => Ok(Vec::new()),
         Ok(Err(source)) => Err(Error::HyperUnit { source }),
-        Err(_) => Ok(None),
+        Err(_) => Ok(Vec::new()),
     }
+}
+
+fn select_deposit_operation(
+    operations: Vec<UnitOperation>,
+    protocol_address: &str,
+) -> Option<UnitOperation> {
+    operations
+        .into_iter()
+        .find(|op| op.matches_protocol_address(protocol_address) && is_deposit_direction(op))
+}
+
+fn select_withdrawal_operation(
+    operations: Vec<UnitOperation>,
+    protocol_address: &str,
+) -> Option<UnitOperation> {
+    operations
+        .into_iter()
+        .find(|op| op.matches_protocol_address(protocol_address) && is_withdrawal_direction(op))
+}
+
+fn is_deposit_direction(op: &UnitOperation) -> bool {
+    op.destination_chain
+        .as_deref()
+        .is_some_and(|chain| chain.eq_ignore_ascii_case("hyperliquid"))
+}
+
+fn is_withdrawal_direction(op: &UnitOperation) -> bool {
+    op.source_chain
+        .as_deref()
+        .is_some_and(|chain| chain.eq_ignore_ascii_case("hyperliquid"))
 }
 
 async fn hl_credit_event(
@@ -634,8 +671,16 @@ fn hyperunit_poll_interval(elapsed: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        extract::{Path, State},
+        http::StatusCode,
+        response::{IntoResponse, Response},
+        routing::get,
+        Json, Router,
+    };
     use serde::de::DeserializeOwned;
     use std::collections::BTreeSet;
+    use tokio::{net::TcpListener, task::JoinHandle};
 
     #[test]
     fn btc_deposit_evidence_matches_router_typed_shape() {
@@ -742,6 +787,90 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn lookup_statuses_select_operations_from_listing_endpoint() {
+        let protocol_address = "0x73c1d4b7add80c7cfea60a997c615064a424a844";
+        let deposit = unit_operation_with_direction(
+            "deposit-op",
+            "0x73C1D4B7ADD80C7CFEA60A997C615064A424A844",
+            "bitcoin",
+            "hyperliquid",
+        );
+        let withdrawal = unit_operation_with_direction(
+            "withdrawal-op",
+            "0x73C1D4B7ADD80C7CFEA60A997C615064A424A844",
+            "hyperliquid",
+            "bitcoin",
+        );
+        let server = spawn_hyperunit_operations_server(
+            protocol_address,
+            StatusCode::OK,
+            serde_json::json!({
+                "addresses": [],
+                "operations": [deposit.clone(), withdrawal.clone()]
+            }),
+        )
+        .await;
+        let unit = HyperUnitClient::new(server.base_url()).expect("HyperUnit client");
+
+        let deposit_status = lookup_deposit_status(&unit, protocol_address)
+            .await
+            .expect("deposit lookup");
+        let withdrawal_status = lookup_withdrawal_status(&unit, protocol_address)
+            .await
+            .expect("withdrawal lookup");
+
+        assert_eq!(deposit_status, Some(deposit));
+        assert_eq!(withdrawal_status, Some(withdrawal));
+    }
+
+    #[tokio::test]
+    async fn lookup_statuses_return_none_for_empty_operations_listing() {
+        let protocol_address = "0x73c1d4b7add80c7cfea60a997c615064a424a844";
+        let server = spawn_hyperunit_operations_server(
+            protocol_address,
+            StatusCode::OK,
+            serde_json::json!({
+                "addresses": [],
+                "operations": []
+            }),
+        )
+        .await;
+        let unit = HyperUnitClient::new(server.base_url()).expect("HyperUnit client");
+
+        let deposit_status = lookup_deposit_status(&unit, protocol_address)
+            .await
+            .expect("deposit lookup");
+        let withdrawal_status = lookup_withdrawal_status(&unit, protocol_address)
+            .await
+            .expect("withdrawal lookup");
+
+        assert!(deposit_status.is_none());
+        assert!(withdrawal_status.is_none());
+    }
+
+    #[tokio::test]
+    async fn lookup_statuses_return_none_for_operations_404() {
+        let protocol_address = "0x73c1d4b7add80c7cfea60a997c615064a424a844";
+        let server = spawn_hyperunit_operations_server(
+            protocol_address,
+            StatusCode::NOT_FOUND,
+            serde_json::json!({ "error": "not found" }),
+        )
+        .await;
+        let unit = HyperUnitClient::new(server.base_url()).expect("HyperUnit client");
+
+        let deposit_status = lookup_deposit_status(&unit, protocol_address)
+            .await
+            .expect("deposit lookup");
+        let withdrawal_status = lookup_withdrawal_status(&unit, protocol_address)
+            .await
+            .expect("withdrawal lookup");
+
+        assert!(deposit_status.is_none());
+        assert!(withdrawal_status.is_none());
+    }
+
     fn tx_output() -> TxOutput {
         TxOutput {
             txid: "0000000000000000000000000000000000000000000000000000000000000001"
@@ -778,6 +907,23 @@ mod tests {
         .expect("unit operation")
     }
 
+    fn unit_operation_with_direction(
+        operation_id: &str,
+        protocol_address: &str,
+        source_chain: &str,
+        destination_chain: &str,
+    ) -> UnitOperation {
+        serde_json::from_value(serde_json::json!({
+            "operationId": operation_id,
+            "protocolAddress": protocol_address,
+            "sourceChain": source_chain,
+            "destinationChain": destination_chain,
+            "state": "done",
+            "destinationTxHash": "0x9e36"
+        }))
+        .expect("unit operation")
+    }
+
     fn hl_credit_event() -> HlTransferEvent {
         serde_json::from_value(serde_json::json!({
             "user": "0x1111111111111111111111111111111111111111",
@@ -804,5 +950,73 @@ mod tests {
         let expected = expected.iter().copied().collect::<BTreeSet<_>>();
         assert_eq!(actual, expected);
         serde_json::from_value::<T>(value.clone()).expect("typed evidence should deserialize");
+    }
+
+    #[derive(Clone)]
+    struct HyperUnitOperationsMockState {
+        expected_address: String,
+        status: StatusCode,
+        body: Value,
+    }
+
+    struct HyperUnitOperationsMockServer {
+        base_url: String,
+        handle: JoinHandle<()>,
+    }
+
+    impl HyperUnitOperationsMockServer {
+        fn base_url(&self) -> &str {
+            &self.base_url
+        }
+    }
+
+    impl Drop for HyperUnitOperationsMockServer {
+        fn drop(&mut self) {
+            self.handle.abort();
+        }
+    }
+
+    async fn spawn_hyperunit_operations_server(
+        expected_address: &str,
+        status: StatusCode,
+        body: Value,
+    ) -> HyperUnitOperationsMockServer {
+        let state = HyperUnitOperationsMockState {
+            expected_address: expected_address.to_string(),
+            status,
+            body,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind HyperUnit mock server");
+        let addr = listener.local_addr().expect("HyperUnit mock server addr");
+        let app = Router::new()
+            .route("/operations/:address", get(hyperunit_operations_handler))
+            .with_state(state);
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("HyperUnit mock server should run");
+        });
+        HyperUnitOperationsMockServer {
+            base_url: format!("http://{addr}"),
+            handle,
+        }
+    }
+
+    async fn hyperunit_operations_handler(
+        State(state): State<HyperUnitOperationsMockState>,
+        Path(address): Path<String>,
+    ) -> Response {
+        if address != state.expected_address {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("unexpected address {address}")
+                })),
+            )
+                .into_response();
+        }
+        (state.status, Json(state.body)).into_response()
     }
 }
