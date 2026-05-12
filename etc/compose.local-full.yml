@@ -540,6 +540,66 @@ services:
       - "8080"
       - "9104"
 
+  evm-receipt-watcher-ethereum:
+    build:
+      context: ..
+      dockerfile: etc/Dockerfile.evm-receipt-watcher
+    restart: on-failure
+    depends_on:
+      devnet:
+        condition: service_healthy
+    environment:
+      RUST_LOG: info
+      EVM_RECEIPT_WATCHER_CHAIN: ethereum
+      EVM_RECEIPT_WATCHER_HTTP_RPC_URL: http://devnet:50101
+      EVM_RECEIPT_WATCHER_WS_RPC_URL: ws://devnet:50101
+      EVM_RECEIPT_WATCHER_BIND: 0.0.0.0:8080
+      EVM_RECEIPT_WATCHER_POLL_INTERVAL_MS: 1000
+    ports:
+      - "50113:8080"
+    expose:
+      - "8080"
+
+  evm-receipt-watcher-base:
+    build:
+      context: ..
+      dockerfile: etc/Dockerfile.evm-receipt-watcher
+    restart: on-failure
+    depends_on:
+      devnet:
+        condition: service_healthy
+    environment:
+      RUST_LOG: info
+      EVM_RECEIPT_WATCHER_CHAIN: base
+      EVM_RECEIPT_WATCHER_HTTP_RPC_URL: http://devnet:50102
+      EVM_RECEIPT_WATCHER_WS_RPC_URL: ws://devnet:50102
+      EVM_RECEIPT_WATCHER_BIND: 0.0.0.0:8080
+      EVM_RECEIPT_WATCHER_POLL_INTERVAL_MS: 1000
+    ports:
+      - "50114:8080"
+    expose:
+      - "8080"
+
+  evm-receipt-watcher-arbitrum:
+    build:
+      context: ..
+      dockerfile: etc/Dockerfile.evm-receipt-watcher
+    restart: on-failure
+    depends_on:
+      devnet:
+        condition: service_healthy
+    environment:
+      RUST_LOG: info
+      EVM_RECEIPT_WATCHER_CHAIN: arbitrum
+      EVM_RECEIPT_WATCHER_HTTP_RPC_URL: http://devnet:50103
+      EVM_RECEIPT_WATCHER_WS_RPC_URL: ws://devnet:50103
+      EVM_RECEIPT_WATCHER_BIND: 0.0.0.0:8080
+      EVM_RECEIPT_WATCHER_POLL_INTERVAL_MS: 1000
+    ports:
+      - "50115:8080"
+    expose:
+      - "8080"
+
   router-gateway-db:
     image: postgres:16-alpine
     environment:
