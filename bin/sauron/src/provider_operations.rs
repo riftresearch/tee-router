@@ -29,7 +29,7 @@ SELECT
   opo.updated_at
 FROM public.order_provider_operations opo
 JOIN public.order_execution_steps oes ON oes.id = opo.execution_step_id
-WHERE opo.operation_type IN ('across_bridge', 'cctp_bridge', 'hyperliquid_bridge_deposit', 'hyperliquid_bridge_withdrawal', 'unit_deposit', 'unit_withdrawal', 'hyperliquid_trade', 'hyperliquid_limit_order', 'universal_router_swap')
+WHERE opo.operation_type IN ('across_bridge', 'cctp_bridge', 'cctp_receive', 'hyperliquid_bridge_deposit', 'hyperliquid_bridge_withdrawal', 'unit_deposit', 'unit_withdrawal', 'hyperliquid_trade', 'hyperliquid_limit_order', 'universal_router_swap')
   AND opo.status IN ('submitted', 'waiting_external')
   AND oes.status IN ('running', 'waiting')
 ORDER BY opo.updated_at ASC, opo.id ASC
@@ -51,7 +51,7 @@ SELECT
 FROM public.order_provider_operations opo
 JOIN public.order_execution_steps oes ON oes.id = opo.execution_step_id
 WHERE opo.id = $1::uuid
-  AND opo.operation_type IN ('across_bridge', 'cctp_bridge', 'hyperliquid_bridge_deposit', 'hyperliquid_bridge_withdrawal', 'unit_deposit', 'unit_withdrawal', 'hyperliquid_trade', 'hyperliquid_limit_order', 'universal_router_swap')
+  AND opo.operation_type IN ('across_bridge', 'cctp_bridge', 'cctp_receive', 'hyperliquid_bridge_deposit', 'hyperliquid_bridge_withdrawal', 'unit_deposit', 'unit_withdrawal', 'hyperliquid_trade', 'hyperliquid_limit_order', 'universal_router_swap')
   AND opo.status IN ('submitted', 'waiting_external')
   AND oes.status IN ('running', 'waiting')
 "#;

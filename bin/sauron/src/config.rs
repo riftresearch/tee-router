@@ -118,6 +118,10 @@ pub struct SauronArgs {
     #[arg(long, env = "ETHEREUM_TOKEN_INDEXER_URL")]
     pub ethereum_token_indexer_url: Option<String>,
 
+    /// Ethereum Mainnet Receipt Watcher URL
+    #[arg(long, env = "ETHEREUM_RECEIPT_WATCHER_URL")]
+    pub ethereum_receipt_watcher_url: Option<String>,
+
     /// Base RPC URL
     #[arg(long, env = "BASE_RPC_URL")]
     pub base_rpc_url: String,
@@ -126,6 +130,10 @@ pub struct SauronArgs {
     #[arg(long, env = "BASE_TOKEN_INDEXER_URL")]
     pub base_token_indexer_url: Option<String>,
 
+    /// Base Receipt Watcher URL
+    #[arg(long, env = "BASE_RECEIPT_WATCHER_URL")]
+    pub base_receipt_watcher_url: Option<String>,
+
     /// Arbitrum RPC URL
     #[arg(long, env = "ARBITRUM_RPC_URL")]
     pub arbitrum_rpc_url: String,
@@ -133,6 +141,10 @@ pub struct SauronArgs {
     /// Arbitrum Token Indexer URL
     #[arg(long, env = "ARBITRUM_TOKEN_INDEXER_URL")]
     pub arbitrum_token_indexer_url: Option<String>,
+
+    /// Arbitrum Receipt Watcher URL
+    #[arg(long, env = "ARBITRUM_RECEIPT_WATCHER_URL")]
+    pub arbitrum_receipt_watcher_url: Option<String>,
 
     /// Hyperliquid shim indexer URL
     #[arg(long, env = "HL_SHIM_INDEXER_URL")]
@@ -226,16 +238,34 @@ impl fmt::Debug for SauronArgs {
                     .as_ref()
                     .map(|_| "<redacted>"),
             )
+            .field(
+                "ethereum_receipt_watcher_url",
+                &self
+                    .ethereum_receipt_watcher_url
+                    .as_ref()
+                    .map(|_| "<redacted>"),
+            )
             .field("base_rpc_url", &"<redacted>")
             .field(
                 "base_token_indexer_url",
                 &self.base_token_indexer_url.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "base_receipt_watcher_url",
+                &self.base_receipt_watcher_url.as_ref().map(|_| "<redacted>"),
             )
             .field("arbitrum_rpc_url", &"<redacted>")
             .field(
                 "arbitrum_token_indexer_url",
                 &self
                     .arbitrum_token_indexer_url
+                    .as_ref()
+                    .map(|_| "<redacted>"),
+            )
+            .field(
+                "arbitrum_receipt_watcher_url",
+                &self
+                    .arbitrum_receipt_watcher_url
                     .as_ref()
                     .map(|_| "<redacted>"),
             )
@@ -323,11 +353,20 @@ mod tests {
             ethereum_token_indexer_url: Some(
                 "https://eth-indexer.example/token-secret".to_string(),
             ),
+            ethereum_receipt_watcher_url: Some(
+                "https://eth-receipts.example/receipt-secret".to_string(),
+            ),
             base_rpc_url: "https://base.example/rpc-secret".to_string(),
             base_token_indexer_url: Some("https://base-indexer.example/token-secret".to_string()),
+            base_receipt_watcher_url: Some(
+                "https://base-receipts.example/receipt-secret".to_string(),
+            ),
             arbitrum_rpc_url: "https://arb.example/rpc-secret".to_string(),
             arbitrum_token_indexer_url: Some(
                 "https://arb-indexer.example/token-secret".to_string(),
+            ),
+            arbitrum_receipt_watcher_url: Some(
+                "https://arb-receipts.example/receipt-secret".to_string(),
             ),
             hl_shim_indexer_url: Some("https://hl-shim.example/token-secret".to_string()),
             sauron_hl_bridge_match_window_seconds: 1_800,
@@ -347,6 +386,7 @@ mod tests {
             "detector-secret",
             "api-key-path",
             "token-secret",
+            "receipt-secret",
             "token-indexer-api-key-secret",
             "rpc-secret",
             "bitcoin-user",

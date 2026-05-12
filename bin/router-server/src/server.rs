@@ -882,6 +882,16 @@ fn provider_hint_shape_for_hint(
         router_core::models::ProviderOperationHintKind::PossibleProgress => {
             provider_hint_shape_for_operation(operation_type)
         }
+        router_core::models::ProviderOperationHintKind::AcrossDestinationFilled => (
+            ProviderKind::Bridge,
+            ProviderHintKind::AcrossDestinationFilled,
+        ),
+        router_core::models::ProviderOperationHintKind::CctpReceiveObserved => {
+            (ProviderKind::Bridge, ProviderHintKind::CctpReceiveObserved)
+        }
+        router_core::models::ProviderOperationHintKind::VeloraSwapSettled => {
+            (ProviderKind::Exchange, ProviderHintKind::VeloraSwapSettled)
+        }
         router_core::models::ProviderOperationHintKind::HlTradeFilled => {
             (ProviderKind::Exchange, ProviderHintKind::HlTradeFilled)
         }
@@ -914,6 +924,9 @@ fn provider_hint_shape_for_operation(
         ProviderOperationType::CctpBridge => {
             (ProviderKind::Bridge, ProviderHintKind::CctpAttestation)
         }
+        ProviderOperationType::CctpReceive => {
+            (ProviderKind::Bridge, ProviderHintKind::CctpReceiveObserved)
+        }
         ProviderOperationType::UnitDeposit => (ProviderKind::Unit, ProviderHintKind::UnitDeposit),
         ProviderOperationType::HyperliquidTrade | ProviderOperationType::HyperliquidLimitOrder => {
             (ProviderKind::Exchange, ProviderHintKind::HyperliquidTrade)
@@ -925,10 +938,9 @@ fn provider_hint_shape_for_operation(
         | ProviderOperationType::HyperliquidBridgeWithdrawal => {
             (ProviderKind::Bridge, ProviderHintKind::ProviderObservation)
         }
-        ProviderOperationType::UniversalRouterSwap => (
-            ProviderKind::Exchange,
-            ProviderHintKind::ProviderObservation,
-        ),
+        ProviderOperationType::UniversalRouterSwap => {
+            (ProviderKind::Exchange, ProviderHintKind::VeloraSwapSettled)
+        }
     }
 }
 
@@ -961,8 +973,17 @@ fn provider_hint_evidence_for_signal(
             return typed_hint_evidence(evidence)
                 .map(|e| Some(ProviderOperationHintEvidence::HlWithdrawalSettled(e)));
         }
+        ProviderHintKind::VeloraSwapSettled => {
+            return typed_hint_evidence(evidence)
+                .map(|e| Some(ProviderOperationHintEvidence::VeloraSwapSettled(e)));
+        }
+        ProviderHintKind::CctpReceiveObserved => {
+            return typed_hint_evidence(evidence)
+                .map(|e| Some(ProviderOperationHintEvidence::CctpReceiveObserved(e)));
+        }
         ProviderHintKind::CctpAttestation
         | ProviderHintKind::AcrossFill
+        | ProviderHintKind::AcrossDestinationFilled
         | ProviderHintKind::UnitDeposit
         | ProviderHintKind::ProviderObservation
         | ProviderHintKind::HyperliquidTrade => {}

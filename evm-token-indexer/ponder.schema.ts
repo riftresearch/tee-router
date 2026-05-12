@@ -34,6 +34,37 @@ export const erc20TransferRaw = onchainTable(
   }),
 );
 
+export const rawLog = onchainTable(
+  "raw_log",
+  (t) => ({
+    id: t.text().primaryKey(),
+    chainId: t.integer().notNull(),
+    blockNumber: t.bigint().notNull(),
+    logIndex: t.integer().notNull(),
+    txHash: t.hex().notNull(),
+    address: t.hex().notNull(),
+    topic0: t.hex().notNull(),
+    topic1: t.hex(),
+    topic2: t.hex(),
+    topic3: t.hex(),
+    data: t.hex().notNull(),
+    blockTimestamp: t.bigint().notNull(),
+  }),
+  (table) => ({
+    rawLogUniqIdx: index("raw_log_tx_log_idx").on(
+      table.chainId,
+      table.txHash,
+      table.logIndex,
+    ),
+    addressTopicBlockIdx: index("raw_log_address_topic_block_idx").on(
+      table.chainId,
+      table.address,
+      table.topic0,
+      table.blockNumber,
+    ),
+  }),
+);
+
 export const activeDepositWatch = onchainTable(
   "active_deposit_watch",
   (t) => ({

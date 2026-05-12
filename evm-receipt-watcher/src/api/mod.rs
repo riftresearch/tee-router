@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use alloy::providers::DynProvider;
 use axum::{
     routing::{delete, get, post},
     Router,
@@ -16,6 +17,7 @@ pub struct AppState {
     pub chain: String,
     pub pending: PendingWatches,
     pub pubsub: ReceiptPubSub,
+    pub receipt_provider: DynProvider,
     pub metrics: Option<PrometheusHandle>,
 }
 

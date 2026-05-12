@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 devnet = { workspace = true }
 eip3009-erc20-contract = { workspace = true }
+evm-receipt-watcher = { path = "../evm-receipt-watcher" }
 hyperunit-client = { workspace = true }
 hl-shim-indexer = { workspace = true }
 router-core = { workspace = true }

@@ -23,6 +23,11 @@ use devnet::{
     RiftDevnet,
 };
 use eip3009_erc20_contract::GenericEIP3009ERC20::GenericEIP3009ERC20Instance;
+use evm_receipt_watcher::{
+    build_router as build_evm_receipt_watcher_router, AppState as EvmReceiptWatcherAppState,
+    Config as EvmReceiptWatcherConfig, PendingWatches as EvmReceiptPendingWatches,
+    ReceiptPubSub as EvmReceiptPubSub, Watcher as EvmReceiptWatcher,
+};
 use hl_shim_indexer::{
     build_router as build_hl_shim_router,
     config::Cadences as HlShimCadences,
@@ -253,6 +258,7 @@ struct RouterRuntimeHarness {
     _worker_task: RuntimeTask,
     _temporal_worker_task: RuntimeTask,
     _hl_shim_task: RuntimeTask,
+    _receipt_watcher_tasks: Vec<RuntimeTask>,
     _sauron_task: RuntimeTask,
 }
 
@@ -309,6 +315,9 @@ impl RouterRuntimeHarness {
     async fn shutdown(mut self) {
         self._sauron_task.abort_and_join().await;
         self._hl_shim_task.abort_and_join().await;
+        for task in &mut self._receipt_watcher_tasks {
+            task.abort_and_join().await;
+        }
         self._worker_task.abort_and_join().await;
         self._temporal_worker_task.abort_and_join().await;
         self._api_task.abort_and_join().await;
@@ -392,6 +401,29 @@ async fn spawn_mock_router_runtime() -> RouterRuntimeHarness {
     let mocks = spawn_runtime_mocks(&devnet).await;
     let (hl_shim_base_url, _hl_shim_task) =
         spawn_hl_shim_indexer(&hl_shim_database_url, mocks.base_url()).await;
+    let (ethereum_receipt_watcher_url, ethereum_receipt_watcher_task) = spawn_evm_receipt_watcher(
+        "ethereum",
+        devnet.ethereum.anvil.endpoint_url().to_string(),
+        devnet.ethereum.anvil.ws_endpoint_url().to_string(),
+    )
+    .await;
+    let (base_receipt_watcher_url, base_receipt_watcher_task) = spawn_evm_receipt_watcher(
+        "base",
+        devnet.base.anvil.endpoint_url().to_string(),
+        devnet.base.anvil.ws_endpoint_url().to_string(),
+    )
+    .await;
+    let (arbitrum_receipt_watcher_url, arbitrum_receipt_watcher_task) = spawn_evm_receipt_watcher(
+        "arbitrum",
+        devnet.arbitrum.anvil.endpoint_url().to_string(),
+        devnet.arbitrum.anvil.ws_endpoint_url().to_string(),
+    )
+    .await;
+    let _receipt_watcher_tasks = vec![
+        ethereum_receipt_watcher_task,
+        base_receipt_watcher_task,
+        arbitrum_receipt_watcher_task,
+    ];
     let config_dir = tempfile::tempdir().expect("router config dir");
     let args = router_args(&devnet, config_dir.path(), database_url.clone(), &mocks);
 
@@ -405,6 +437,11 @@ async fn spawn_mock_router_runtime() -> RouterRuntimeHarness {
         &sauron_state_database_url,
         &router_base_url,
         &hl_shim_base_url,
+        EvmReceiptWatcherUrls {
+            ethereum: ethereum_receipt_watcher_url,
+            base: base_receipt_watcher_url,
+            arbitrum: arbitrum_receipt_watcher_url,
+        },
     )
     .await;
 
@@ -419,6 +456,7 @@ async fn spawn_mock_router_runtime() -> RouterRuntimeHarness {
         _worker_task,
         _temporal_worker_task,
         _hl_shim_task,
+        _receipt_watcher_tasks,
         _sauron_task,
     }
 }
@@ -688,12 +726,99 @@ async fn spawn_hl_shim_indexer(database_url: &str, hl_url: &str) -> (String, Run
     (format!("http://{addr}"), task)
 }
 
+struct EvmReceiptWatcherUrls {
+    ethereum: String,
+    base: String,
+    arbitrum: String,
+}
+
+async fn spawn_evm_receipt_watcher(
+    chain: &str,
+    http_rpc_url: String,
+    ws_rpc_url: String,
+) -> (String, RuntimeTask) {
+    let bind = "127.0.0.1:0"
+        .parse::<SocketAddr>()
+        .expect("valid receipt watcher bind");
+    let config = EvmReceiptWatcherConfig {
+        chain: chain.to_string(),
+        http_rpc_url,
+        ws_rpc_url: Some(ws_rpc_url),
+        bind,
+        max_pending: 10_000,
+        max_subscriber_lag: 1_000,
+        poll_interval_ms: 100,
+        ws_reconnect_delay_ms: 100,
+        receipt_retry_count: 5,
+        receipt_retry_delay_ms: 50,
+    };
+    let pending = EvmReceiptPendingWatches::new(config.chain.clone(), config.max_pending);
+    let pubsub = EvmReceiptPubSub::new(config.max_subscriber_lag);
+    let watcher = EvmReceiptWatcher::new(&config, pending.clone(), pubsub.clone())
+        .await
+        .expect("create EVM receipt watcher");
+    let receipt_provider = watcher.receipt_provider();
+    let app = build_evm_receipt_watcher_router(EvmReceiptWatcherAppState {
+        chain: config.chain.clone(),
+        pending,
+        pubsub,
+        receipt_provider,
+        metrics: None,
+    });
+    let listener = TcpListener::bind(config.bind)
+        .await
+        .expect("bind EVM receipt watcher listener");
+    let addr = listener
+        .local_addr()
+        .expect("read EVM receipt watcher listener addr");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let chain_label = chain.to_string();
+    let handle = tokio::spawn(async move {
+        let watcher_task = tokio::spawn(async move {
+            watcher.run().await;
+        });
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap_or_else(|error| {
+                panic!("{chain_label} EVM receipt watcher server stopped: {error}")
+            });
+        watcher_task.abort();
+        let _ = watcher_task.await;
+    });
+    let base_url = format!("http://{addr}");
+    wait_for_http_health(&base_url, "/healthz", "EVM receipt watcher").await;
+    let task = RuntimeTask::with_shutdown(handle, move || {
+        let _ = shutdown_tx.send(());
+    });
+    assert!(
+        !task.is_finished(),
+        "{chain} EVM receipt watcher exited during startup"
+    );
+    (base_url, task)
+}
+
+async fn wait_for_http_health(base_url: &str, path: &str, label: &str) {
+    let client = reqwest::Client::new();
+    let url = format!("{base_url}{path}");
+    for _ in 0..50 {
+        match client.get(&url).send().await {
+            Ok(response) if response.status().is_success() => return,
+            Ok(_) | Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+    panic!("{label} did not become healthy at {url}");
+}
+
 async fn spawn_sauron(
     devnet: &RiftDevnet,
     database_url: &str,
     sauron_state_database_url: &str,
     router_base_url: &str,
     hl_shim_base_url: &str,
+    receipt_watcher_urls: EvmReceiptWatcherUrls,
 ) -> RuntimeTask {
     let token_indexer_api_key = [
         devnet.ethereum.token_indexer.as_ref(),
@@ -734,18 +859,21 @@ async fn spawn_sauron(
             .token_indexer
             .as_ref()
             .map(|indexer| indexer.api_server_url.clone()),
+        ethereum_receipt_watcher_url: Some(receipt_watcher_urls.ethereum),
         base_rpc_url: devnet.base.anvil.endpoint_url().to_string(),
         base_token_indexer_url: devnet
             .base
             .token_indexer
             .as_ref()
             .map(|indexer| indexer.api_server_url.clone()),
+        base_receipt_watcher_url: Some(receipt_watcher_urls.base),
         arbitrum_rpc_url: devnet.arbitrum.anvil.endpoint_url().to_string(),
         arbitrum_token_indexer_url: devnet
             .arbitrum
             .token_indexer
             .as_ref()
             .map(|indexer| indexer.api_server_url.clone()),
+        arbitrum_receipt_watcher_url: Some(receipt_watcher_urls.arbitrum),
         hl_shim_indexer_url: Some(hl_shim_base_url.to_string()),
         sauron_hl_bridge_match_window_seconds: 1_800,
         token_indexer_api_key,

@@ -656,6 +656,7 @@ pub struct CustodyVault {
 pub enum ProviderOperationType {
     AcrossBridge,
     CctpBridge,
+    CctpReceive,
     HyperliquidBridgeDeposit,
     HyperliquidBridgeWithdrawal,
     UnitDeposit,
@@ -671,6 +672,7 @@ impl ProviderOperationType {
         match self {
             Self::AcrossBridge => "across_bridge",
             Self::CctpBridge => "cctp_bridge",
+            Self::CctpReceive => "cctp_receive",
             Self::HyperliquidBridgeDeposit => "hyperliquid_bridge_deposit",
             Self::HyperliquidBridgeWithdrawal => "hyperliquid_bridge_withdrawal",
             Self::UnitDeposit => "unit_deposit",
@@ -685,6 +687,7 @@ impl ProviderOperationType {
         match value {
             "across_bridge" => Some(Self::AcrossBridge),
             "cctp_bridge" => Some(Self::CctpBridge),
+            "cctp_receive" => Some(Self::CctpReceive),
             "hyperliquid_bridge_deposit" => Some(Self::HyperliquidBridgeDeposit),
             "hyperliquid_bridge_withdrawal" => Some(Self::HyperliquidBridgeWithdrawal),
             "unit_deposit" => Some(Self::UnitDeposit),
@@ -738,6 +741,9 @@ impl ProviderOperationStatus {
 #[serde(rename_all = "snake_case")]
 pub enum ProviderOperationHintKind {
     PossibleProgress,
+    AcrossDestinationFilled,
+    CctpReceiveObserved,
+    VeloraSwapSettled,
     HlTradeFilled,
     HlTradeCanceled,
     HlBridgeDepositObserved,
@@ -751,6 +757,9 @@ impl ProviderOperationHintKind {
     pub fn to_db_string(self) -> &'static str {
         match self {
             Self::PossibleProgress => "possible_progress",
+            Self::AcrossDestinationFilled => "across_destination_filled",
+            Self::CctpReceiveObserved => "cctp_receive_observed",
+            Self::VeloraSwapSettled => "velora_swap_settled",
             Self::HlTradeFilled => "hl_trade_filled",
             Self::HlTradeCanceled => "hl_trade_canceled",
             Self::HlBridgeDepositObserved => "hl_bridge_deposit_observed",
@@ -763,6 +772,9 @@ impl ProviderOperationHintKind {
     pub fn from_db_string(value: &str) -> Option<Self> {
         match value {
             "possible_progress" => Some(Self::PossibleProgress),
+            "across_destination_filled" => Some(Self::AcrossDestinationFilled),
+            "cctp_receive_observed" => Some(Self::CctpReceiveObserved),
+            "velora_swap_settled" => Some(Self::VeloraSwapSettled),
             "hl_trade_filled" => Some(Self::HlTradeFilled),
             "hl_trade_canceled" => Some(Self::HlTradeCanceled),
             "hl_bridge_deposit_observed" => Some(Self::HlBridgeDepositObserved),
@@ -1030,6 +1042,7 @@ pub struct OrderProviderOperationHint {
 pub const PROVIDER_OPERATION_OBSERVATION_HINT_SOURCE: &str =
     "sauron_provider_operation_observation";
 pub const SAURON_DETECTOR_HINT_SOURCE: &str = "sauron";
+pub const SAURON_EVM_RECEIPT_OBSERVER_HINT_SOURCE: &str = "sauron_evm_receipt_observer";
 pub const SAURON_HYPERLIQUID_OBSERVER_HINT_SOURCE: &str = "sauron_hyperliquid_observer";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

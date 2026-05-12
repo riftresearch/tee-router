@@ -26,6 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let pending = PendingWatches::new(config.chain.clone(), config.max_pending);
     let pubsub = ReceiptPubSub::new(config.max_subscriber_lag);
     let watcher = Watcher::new(&config, pending.clone(), pubsub.clone()).await?;
+    let receipt_provider = watcher.receipt_provider();
     tokio::spawn(async move {
         watcher.run().await;
     });
@@ -34,6 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         chain: config.chain.clone(),
         pending,
         pubsub,
+        receipt_provider,
         metrics: Some(metrics),
     })
     .layer(TraceLayer::new_for_http());

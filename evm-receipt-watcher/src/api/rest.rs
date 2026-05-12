@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use alloy::providers::Provider;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -70,6 +71,34 @@ pub async fn post_watch(
         receipt: None,
         logs: Vec::new(),
     });
+    match state
+        .receipt_provider
+        .get_transaction_receipt(watch.tx_hash)
+        .await
+    {
+        Ok(Some(receipt)) => {
+            if let Some(current_watch) = state.pending.take(&watch.tx_hash).await {
+                let logs = receipt.logs().to_vec();
+                state.pubsub.publish(WatchEvent {
+                    chain: current_watch.chain,
+                    tx_hash: current_watch.tx_hash,
+                    requesting_operation_id: current_watch.requesting_operation_id,
+                    status: WatchStatus::Confirmed,
+                    receipt: Some(receipt),
+                    logs,
+                });
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(
+                chain = state.chain,
+                tx_hash = %watch.tx_hash,
+                %error,
+                "immediate receipt lookup failed after watch registration"
+            );
+        }
+    }
 
     Ok(Json(WatchResponse {
         chain: watch.chain,

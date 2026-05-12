@@ -237,15 +237,16 @@ fn provider_operation_hint_kind_label(
     match operation_type {
         Some(ProviderOperationType::AcrossBridge) => "across_fill",
         Some(ProviderOperationType::CctpBridge) => "cctp_attestation",
+        Some(ProviderOperationType::CctpReceive) => "cctp_receive_observed",
         Some(ProviderOperationType::UnitDeposit) => "unit_deposit",
         Some(
             ProviderOperationType::HyperliquidTrade | ProviderOperationType::HyperliquidLimitOrder,
         ) => "hyperliquid_trade",
+        Some(ProviderOperationType::UniversalRouterSwap) => "velora_swap_settled",
         Some(
             ProviderOperationType::UnitWithdrawal
             | ProviderOperationType::HyperliquidBridgeDeposit
-            | ProviderOperationType::HyperliquidBridgeWithdrawal
-            | ProviderOperationType::UniversalRouterSwap,
+            | ProviderOperationType::HyperliquidBridgeWithdrawal,
         ) => "provider_observation",
         None => "unknown",
     }

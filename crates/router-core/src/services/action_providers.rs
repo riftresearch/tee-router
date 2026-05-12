@@ -3066,6 +3066,15 @@ impl CctpProvider {
             message: Bytes::from(message),
             attestation: Bytes::from(attestation),
         };
+        let operation_request = json!({
+            "kind": "cctp_receive",
+            "burn_transition_decl_id": step.burn_transition_decl_id,
+            "destination_chain_id": step.destination_chain_id,
+            "output_asset": step.output_asset,
+            "amount": step.amount,
+            "recipient_address": step.recipient_address,
+            "message_transmitter_v2": format!("{:#x}", self.message_transmitter_v2_address),
+        });
         Ok(ProviderExecutionIntent::CustodyAction {
             custody_vault_id: source_custody_vault_id,
             action: CustodyAction::Call(ChainCall::Evm(EvmCall {
@@ -3074,13 +3083,20 @@ impl CctpProvider {
                 calldata: format!("0x{}", hex::encode(call.abi_encode())),
                 broadcast_policy: Default::default(),
             })),
-            provider_context: json!({
-                "kind": "cctp_receive",
-                "burn_transition_decl_id": step.burn_transition_decl_id,
-                "amount": step.amount,
-                "message_transmitter_v2": format!("{:#x}", self.message_transmitter_v2_address),
-            }),
-            state: ProviderExecutionState::default(),
+            provider_context: operation_request.clone(),
+            state: ProviderExecutionState {
+                operation: Some(ProviderOperationIntent {
+                    operation_type: ProviderOperationType::CctpReceive,
+                    status: ProviderOperationStatus::Submitted,
+                    provider_ref: None,
+                    request: Some(operation_request),
+                    response: Some(json!({
+                        "kind": "cctp_receive_submitted",
+                    })),
+                    observed_state: None,
+                }),
+                addresses: vec![],
+            },
         })
     }
 }
@@ -4512,25 +4528,16 @@ impl ExchangeProvider for VeloraProvider {
                     "tx_hashes": tx_hashes,
                 })),
                 response: None,
-                status: Some(ProviderOperationStatus::Completed),
+                status: Some(ProviderOperationStatus::WaitingExternal),
             })
         })
     }
 
     fn observe_trade_operation<'a>(
         &'a self,
-        request: ProviderOperationObservationRequest,
+        _request: ProviderOperationObservationRequest,
     ) -> ProviderFuture<'a, Option<ProviderOperationObservation>> {
-        Box::pin(async move {
-            Ok(Some(ProviderOperationObservation {
-                status: ProviderOperationStatus::Completed,
-                provider_ref: request.provider_ref.clone(),
-                observed_state: request.observed_state.clone(),
-                response: Some(request.response.clone()),
-                tx_hash: request.provider_ref.clone(),
-                error: None,
-            }))
-        })
+        Box::pin(async move { Ok(None) })
     }
 }
 

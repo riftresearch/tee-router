@@ -25,6 +25,11 @@ use devnet::{
     RiftDevnet,
 };
 use eip3009_erc20_contract::GenericEIP3009ERC20::GenericEIP3009ERC20Instance;
+use evm_receipt_watcher::{
+    build_router as build_evm_receipt_watcher_router, AppState as EvmReceiptWatcherAppState,
+    Config as EvmReceiptWatcherConfig, PendingWatches as EvmReceiptPendingWatches,
+    ReceiptPubSub as EvmReceiptPubSub, Watcher as EvmReceiptWatcher,
+};
 use hl_shim_indexer::{
     build_router as build_hl_shim_router,
     config::Cadences as HlShimCadences,
@@ -38,7 +43,7 @@ use router_core::{
         CustodyVaultControlType, DepositVaultStatus, OrderExecutionStepType,
         OrderProviderOperation, ProviderOperationStatus, ProviderOperationType,
         RouterOrderEnvelope, RouterOrderQuoteEnvelope, RouterOrderStatus,
-        SAURON_HYPERLIQUID_OBSERVER_HINT_SOURCE,
+        SAURON_EVM_RECEIPT_OBSERVER_HINT_SOURCE, SAURON_HYPERLIQUID_OBSERVER_HINT_SOURCE,
     },
     protocol::{backend_chain_for_id, AssetId, ChainId},
 };
@@ -1216,6 +1221,7 @@ async fn spawn_sauron(
     state_database_url: &str,
     router_base_url: &str,
     token_indexer_urls: RuntimeTokenIndexerUrls,
+    receipt_watcher_urls: EvmReceiptWatcherUrls,
     hl_shim_indexer_url: Option<String>,
 ) -> RuntimeTask {
     let args = SauronArgs {
@@ -1243,10 +1249,13 @@ async fn spawn_sauron(
         bitcoin_zmq_sequence_endpoint: devnet.bitcoin.zmq_sequence_endpoint.clone(),
         ethereum_mainnet_rpc_url: devnet.ethereum.anvil.endpoint_url().to_string(),
         ethereum_token_indexer_url: token_indexer_urls.ethereum,
+        ethereum_receipt_watcher_url: Some(receipt_watcher_urls.ethereum),
         base_rpc_url: devnet.base.anvil.endpoint_url().to_string(),
         base_token_indexer_url: token_indexer_urls.base,
+        base_receipt_watcher_url: Some(receipt_watcher_urls.base),
         arbitrum_rpc_url: devnet.arbitrum.anvil.endpoint_url().to_string(),
         arbitrum_token_indexer_url: token_indexer_urls.arbitrum,
+        arbitrum_receipt_watcher_url: Some(receipt_watcher_urls.arbitrum),
         hl_shim_indexer_url,
         sauron_hl_bridge_match_window_seconds: 1_800,
         token_indexer_api_key: token_indexer_urls.api_key,
@@ -1331,6 +1340,92 @@ async fn spawn_hl_shim_indexer(database_url: &str, hl_url: &str) -> (String, Run
     (format!("http://{addr}"), task)
 }
 
+struct EvmReceiptWatcherUrls {
+    ethereum: String,
+    base: String,
+    arbitrum: String,
+}
+
+async fn spawn_evm_receipt_watcher(
+    chain: &str,
+    http_rpc_url: String,
+    ws_rpc_url: String,
+) -> (String, RuntimeTask) {
+    let bind = "127.0.0.1:0"
+        .parse::<SocketAddr>()
+        .expect("valid receipt watcher bind");
+    let config = EvmReceiptWatcherConfig {
+        chain: chain.to_string(),
+        http_rpc_url,
+        ws_rpc_url: Some(ws_rpc_url),
+        bind,
+        max_pending: 10_000,
+        max_subscriber_lag: 1_000,
+        poll_interval_ms: 100,
+        ws_reconnect_delay_ms: 100,
+        receipt_retry_count: 5,
+        receipt_retry_delay_ms: 50,
+    };
+    let pending = EvmReceiptPendingWatches::new(config.chain.clone(), config.max_pending);
+    let pubsub = EvmReceiptPubSub::new(config.max_subscriber_lag);
+    let watcher = EvmReceiptWatcher::new(&config, pending.clone(), pubsub.clone())
+        .await
+        .expect("create EVM receipt watcher");
+    let receipt_provider = watcher.receipt_provider();
+    let app = build_evm_receipt_watcher_router(EvmReceiptWatcherAppState {
+        chain: config.chain.clone(),
+        pending,
+        pubsub,
+        receipt_provider,
+        metrics: None,
+    });
+    let listener = TcpListener::bind(config.bind)
+        .await
+        .expect("bind EVM receipt watcher listener");
+    let addr = listener
+        .local_addr()
+        .expect("read EVM receipt watcher listener addr");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let chain_label = chain.to_string();
+    let handle = tokio::spawn(async move {
+        let watcher_task = tokio::spawn(async move {
+            watcher.run().await;
+        });
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap_or_else(|error| {
+                panic!("{chain_label} EVM receipt watcher server stopped: {error}")
+            });
+        watcher_task.abort();
+        let _ = watcher_task.await;
+    });
+    let base_url = format!("http://{addr}");
+    wait_for_http_health(&base_url, "/healthz", "EVM receipt watcher").await;
+    let task = RuntimeTask::with_shutdown(handle, move || {
+        let _ = shutdown_tx.send(());
+    });
+    assert!(
+        !task.is_finished(),
+        "{chain} EVM receipt watcher exited during startup"
+    );
+    (base_url, task)
+}
+
+async fn wait_for_http_health(base_url: &str, path: &str, label: &str) {
+    let client = reqwest::Client::new();
+    let url = format!("{base_url}{path}");
+    for _ in 0..50 {
+        match client.get(&url).send().await {
+            Ok(response) if response.status().is_success() => return,
+            Ok(_) | Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+    panic!("{label} did not become healthy at {url}");
+}
+
 fn token_indexer_urls_from_devnet(devnet: &RiftDevnet) -> RuntimeTokenIndexerUrls {
     RuntimeTokenIndexerUrls {
         ethereum: devnet
@@ -1408,10 +1503,13 @@ fn live_sauron_args(
         bitcoin_zmq_sequence_endpoint: live.bitcoin_zmq_sequence_endpoint.clone(),
         ethereum_mainnet_rpc_url: live.ethereum_rpc_url.clone(),
         ethereum_token_indexer_url: live.ethereum_token_indexer_url.clone(),
+        ethereum_receipt_watcher_url: None,
         base_rpc_url: live.base_rpc_url.clone(),
         base_token_indexer_url: live.base_token_indexer_url.clone(),
+        base_receipt_watcher_url: None,
         arbitrum_rpc_url: live.arbitrum_rpc_url.clone(),
         arbitrum_token_indexer_url: live.arbitrum_token_indexer_url.clone(),
+        arbitrum_receipt_watcher_url: None,
         hl_shim_indexer_url: None,
         sauron_hl_bridge_match_window_seconds: 1_800,
         token_indexer_api_key: live.token_indexer_api_key.clone(),
@@ -2565,6 +2663,29 @@ async fn run_mock_runtime_route(route: RuntimeRoute) {
         .expect("devnet setup failed");
     prepare_route_chain_state(&devnet, route).await;
     let token_indexer_urls = token_indexer_urls_from_devnet(&devnet);
+    let (ethereum_receipt_watcher_url, ethereum_receipt_watcher_task) = spawn_evm_receipt_watcher(
+        "ethereum",
+        devnet.ethereum.anvil.endpoint_url().to_string(),
+        devnet.ethereum.anvil.ws_endpoint_url().to_string(),
+    )
+    .await;
+    let (base_receipt_watcher_url, base_receipt_watcher_task) = spawn_evm_receipt_watcher(
+        "base",
+        devnet.base.anvil.endpoint_url().to_string(),
+        devnet.base.anvil.ws_endpoint_url().to_string(),
+    )
+    .await;
+    let (arbitrum_receipt_watcher_url, arbitrum_receipt_watcher_task) = spawn_evm_receipt_watcher(
+        "arbitrum",
+        devnet.arbitrum.anvil.endpoint_url().to_string(),
+        devnet.arbitrum.anvil.ws_endpoint_url().to_string(),
+    )
+    .await;
+    let _receipt_watcher_tasks = [
+        ethereum_receipt_watcher_task,
+        base_receipt_watcher_task,
+        arbitrum_receipt_watcher_task,
+    ];
     let config_dir = tempfile::tempdir().expect("router config dir");
     let mocks = spawn_runtime_mocks(&devnet, route).await;
     let chain_tokens = route_chain_tokens(route);
@@ -2618,6 +2739,11 @@ async fn run_mock_runtime_route(route: RuntimeRoute) {
         &state_database_url,
         &router_base_url,
         token_indexer_urls,
+        EvmReceiptWatcherUrls {
+            ethereum: ethereum_receipt_watcher_url,
+            base: base_receipt_watcher_url,
+            arbitrum: arbitrum_receipt_watcher_url,
+        },
         Some(hl_shim_base_url),
     )
     .await;
@@ -2946,12 +3072,14 @@ async fn assert_runtime_hints_are_production_driven(
                   AND hints.source NOT IN (
                     'sauron',
                     'sauron_provider_operation_observation',
-                    $2
+                    $2,
+                    $3
                   )
                 "#,
         )
         .bind(order_id)
         .bind(SAURON_HYPERLIQUID_OBSERVER_HINT_SOURCE)
+        .bind(SAURON_EVM_RECEIPT_OBSERVER_HINT_SOURCE)
         .fetch_one(&pool)
         .await
         .expect("count non-Sauron provider operation hints");

@@ -47,13 +47,21 @@ impl ProviderObservationActivities {
                 .await
                 .map_err(OrderActivityError::db_query)?;
             match input.signal.hint_kind {
-                ProviderHintKind::AcrossFill => verify_across_fill_hint(&deps, input).await,
+                ProviderHintKind::AcrossFill | ProviderHintKind::AcrossDestinationFilled => {
+                    verify_across_fill_hint(&deps, input).await
+                }
                 ProviderHintKind::CctpAttestation => {
                     verify_cctp_attestation_hint(&deps, input).await
+                }
+                ProviderHintKind::CctpReceiveObserved => {
+                    verify_cctp_receive_observed_hint(&deps, input).await
                 }
                 ProviderHintKind::UnitDeposit => verify_unit_deposit_hint(&deps, input).await,
                 ProviderHintKind::ProviderObservation => {
                     verify_provider_observation_hint(&deps, input).await
+                }
+                ProviderHintKind::VeloraSwapSettled => {
+                    verify_velora_swap_settled_hint(&deps, input).await
                 }
                 ProviderHintKind::HyperliquidTrade => {
                     verify_hyperliquid_trade_hint(&deps, input).await
@@ -758,7 +766,7 @@ pub(super) async fn verify_hl_trade_filled_hint(
             "HlTradeFilled hint missing typed evidence",
         ));
     };
-    let operation = load_hl_typed_hint_operation(
+    let operation = load_typed_hint_operation(
         deps,
         &input,
         "HlTradeFilled",
@@ -774,18 +782,18 @@ pub(super) async fn verify_hl_trade_filled_hint(
     validate_hl_trade_user(&operation, &evidence.user)?;
     validate_hl_trade_oid(&operation, evidence.oid)?;
     validate_hl_trade_size(&operation, &evidence.sz)?;
-    complete_provider_operation_from_typed_hl_hint(
+    complete_provider_operation_from_typed_hint(
         deps,
         &input,
         operation,
-        TypedHlProviderOperationUpdate {
+        TypedProviderOperationUpdate {
             status: ProviderOperationStatus::Completed,
             provider_ref: input
                 .signal
                 .provider_ref
                 .clone()
                 .or_else(|| Some(evidence.hash.clone())),
-            observed_state: typed_hl_evidence_state("hl_trade_filled", evidence)?,
+            observed_state: typed_evidence_state("hl_trade_filled", evidence)?,
             response: None,
             tx_hash: Some(evidence.hash.clone()),
         },
@@ -793,7 +801,7 @@ pub(super) async fn verify_hl_trade_filled_hint(
     .await
 }
 
-async fn load_hl_typed_hint_operation(
+async fn load_typed_hint_operation(
     deps: &OrderActivityDeps,
     input: &VerifyProviderOperationHintInput,
     label: &'static str,
@@ -846,11 +854,11 @@ async fn load_hl_typed_hint_operation(
     Ok(operation)
 }
 
-async fn complete_provider_operation_from_typed_hl_hint(
+async fn complete_provider_operation_from_typed_hint(
     deps: &OrderActivityDeps,
     input: &VerifyProviderOperationHintInput,
     operation: OrderProviderOperation,
-    update: TypedHlProviderOperationUpdate,
+    update: TypedProviderOperationUpdate,
 ) -> Result<ProviderOperationHintVerified, OrderActivityError> {
     let mut observed_state = update.observed_state;
     if let Some(tx_hash) = &update.tx_hash {
@@ -896,7 +904,7 @@ async fn complete_provider_operation_from_typed_hl_hint(
     })
 }
 
-struct TypedHlProviderOperationUpdate {
+struct TypedProviderOperationUpdate {
     status: ProviderOperationStatus,
     provider_ref: Option<String>,
     observed_state: Value,
@@ -904,15 +912,274 @@ struct TypedHlProviderOperationUpdate {
     tx_hash: Option<String>,
 }
 
-fn typed_hl_evidence_state<T: serde::Serialize>(
+fn typed_evidence_state<T: serde::Serialize>(
     source: &'static str,
     evidence: &T,
 ) -> Result<Value, OrderActivityError> {
     Ok(json!({
         "source": source,
         "evidence": serde_json::to_value(evidence)
-            .map_err(|err| OrderActivityError::serialization("serializing typed HL hint evidence", err))?,
+            .map_err(|err| OrderActivityError::serialization("serializing typed hint evidence", err))?,
     }))
+}
+
+pub(super) async fn verify_velora_swap_settled_hint(
+    deps: &OrderActivityDeps,
+    input: VerifyProviderOperationHintInput,
+) -> Result<ProviderOperationHintVerified, OrderActivityError> {
+    let Some(ProviderOperationHintEvidence::VeloraSwapSettled(evidence)) =
+        input.signal.evidence.as_ref()
+    else {
+        return Ok(provider_hint_rejected(
+            input.signal.provider_operation_id.map(|id| id.inner()),
+            "VeloraSwapSettled hint missing typed evidence",
+        ));
+    };
+    let operation = load_typed_hint_operation(
+        deps,
+        &input,
+        "VeloraSwapSettled",
+        &[ProviderOperationType::UniversalRouterSwap],
+    )
+    .await?;
+    if let Some(decision) = terminal_hint_decision(&operation) {
+        return Ok(decision);
+    }
+    validate_provider_ref_matches("VeloraSwapSettled", &operation, &evidence.tx_hash)?;
+    validate_request_address_match(
+        "VeloraSwapSettled recipient",
+        operation
+            .request
+            .get("recipient_address")
+            .and_then(Value::as_str),
+        &evidence.recipient,
+    )?;
+    if let Some(token_address) = evidence.token_address.as_deref() {
+        validate_expected_asset_token(
+            "VeloraSwapSettled output token",
+            operation
+                .request
+                .pointer("/output_asset/chain_id")
+                .and_then(Value::as_str),
+            operation
+                .request
+                .pointer("/output_asset/asset")
+                .and_then(Value::as_str),
+            token_address,
+        )?;
+    }
+    let expected_amount_out = operation
+        .request
+        .get("min_amount_out")
+        .and_then(Value::as_str)
+        .or_else(|| operation.request.get("amount_out").and_then(Value::as_str));
+    if let Some(expected_amount_out) = expected_amount_out {
+        validate_decimal_gte(
+            "VeloraSwapSettled amount_out",
+            &evidence.amount_out,
+            expected_amount_out,
+        )?;
+    }
+
+    complete_provider_operation_from_typed_hint(
+        deps,
+        &input,
+        operation,
+        TypedProviderOperationUpdate {
+            status: ProviderOperationStatus::Completed,
+            provider_ref: Some(evidence.tx_hash.clone()),
+            observed_state: typed_evidence_state("velora_swap_settled", evidence)?,
+            response: None,
+            tx_hash: Some(evidence.tx_hash.clone()),
+        },
+    )
+    .await
+}
+
+pub(super) async fn verify_cctp_receive_observed_hint(
+    deps: &OrderActivityDeps,
+    input: VerifyProviderOperationHintInput,
+) -> Result<ProviderOperationHintVerified, OrderActivityError> {
+    let Some(ProviderOperationHintEvidence::CctpReceiveObserved(evidence)) =
+        input.signal.evidence.as_ref()
+    else {
+        return Ok(provider_hint_rejected(
+            input.signal.provider_operation_id.map(|id| id.inner()),
+            "CctpReceiveObserved hint missing typed evidence",
+        ));
+    };
+    let operation = load_typed_hint_operation(
+        deps,
+        &input,
+        "CctpReceiveObserved",
+        &[ProviderOperationType::CctpReceive],
+    )
+    .await?;
+    if let Some(decision) = terminal_hint_decision(&operation) {
+        return Ok(decision);
+    }
+    validate_provider_ref_matches("CctpReceiveObserved", &operation, &evidence.tx_hash)?;
+    validate_request_address_match(
+        "CctpReceiveObserved recipient",
+        operation
+            .request
+            .get("recipient_address")
+            .and_then(Value::as_str),
+        &evidence.recipient,
+    )?;
+    validate_expected_asset_token(
+        "CctpReceiveObserved token",
+        operation
+            .request
+            .get("destination_chain_id")
+            .and_then(Value::as_str),
+        operation
+            .request
+            .get("output_asset")
+            .and_then(Value::as_str),
+        &evidence.token,
+    )?;
+    let Some(expected_amount) = operation.request.get("amount").and_then(Value::as_str) else {
+        return Err(OrderActivityError::hint_verification(
+            "CctpReceiveObserved",
+            format!("provider operation {} request missing amount", operation.id),
+        ));
+    };
+    validate_decimal_equal(
+        "CctpReceiveObserved amount",
+        &evidence.amount,
+        expected_amount,
+    )?;
+
+    complete_provider_operation_from_typed_hint(
+        deps,
+        &input,
+        operation,
+        TypedProviderOperationUpdate {
+            status: ProviderOperationStatus::Completed,
+            provider_ref: Some(evidence.tx_hash.clone()),
+            observed_state: typed_evidence_state("cctp_receive_observed", evidence)?,
+            response: None,
+            tx_hash: Some(evidence.tx_hash.clone()),
+        },
+    )
+    .await
+}
+
+fn validate_provider_ref_matches(
+    label: &'static str,
+    operation: &OrderProviderOperation,
+    observed_tx_hash: &str,
+) -> Result<(), OrderActivityError> {
+    match operation.provider_ref.as_deref() {
+        Some(expected) if expected.eq_ignore_ascii_case(observed_tx_hash) => Ok(()),
+        Some(expected) => Err(OrderActivityError::hint_verification(
+            label,
+            format!("observed tx_hash {observed_tx_hash} does not match operation ref {expected}"),
+        )),
+        None => Err(OrderActivityError::hint_verification(
+            label,
+            format!(
+                "provider operation {} is missing provider_ref",
+                operation.id
+            ),
+        )),
+    }
+}
+
+fn validate_request_address_match(
+    label: &'static str,
+    expected: Option<&str>,
+    observed: &str,
+) -> Result<(), OrderActivityError> {
+    let Some(expected) = expected.filter(|value| !value.trim().is_empty()) else {
+        return Ok(());
+    };
+    if expected.eq_ignore_ascii_case(observed) {
+        Ok(())
+    } else {
+        Err(OrderActivityError::hint_verification(
+            label,
+            format!("observed address {observed} does not match request address {expected}"),
+        ))
+    }
+}
+
+fn validate_expected_asset_token(
+    label: &'static str,
+    chain_id: Option<&str>,
+    asset: Option<&str>,
+    observed_token: &str,
+) -> Result<(), OrderActivityError> {
+    let Some(expected_token) = normalized_reference_asset(chain_id, asset, label)? else {
+        return Ok(());
+    };
+    if expected_token.eq_ignore_ascii_case(observed_token) {
+        Ok(())
+    } else {
+        Err(OrderActivityError::hint_verification(
+            label,
+            format!(
+                "observed token {observed_token} does not match expected token {expected_token}"
+            ),
+        ))
+    }
+}
+
+fn normalized_reference_asset(
+    chain_id: Option<&str>,
+    asset: Option<&str>,
+    label: &'static str,
+) -> Result<Option<String>, OrderActivityError> {
+    let (Some(chain_id), Some(asset)) = (chain_id, asset) else {
+        return Ok(None);
+    };
+    let deposit_asset = DepositAsset {
+        chain: ChainId::parse(chain_id).map_err(|err| {
+            OrderActivityError::hint_verification(label, format!("invalid chain_id: {err}"))
+        })?,
+        asset: AssetId::parse(asset).map_err(|err| {
+            OrderActivityError::hint_verification(label, format!("invalid asset: {err}"))
+        })?,
+    }
+    .normalized_asset_identity()
+    .map_err(|err| OrderActivityError::hint_verification(label, err))?;
+    Ok(match deposit_asset.asset {
+        AssetId::Native => None,
+        AssetId::Reference(address) => Some(address),
+    })
+}
+
+fn validate_decimal_gte(
+    label: &'static str,
+    observed: &str,
+    expected_minimum: &str,
+) -> Result<(), OrderActivityError> {
+    if decimal_string_gte(observed, expected_minimum)? {
+        Ok(())
+    } else {
+        Err(OrderActivityError::hint_verification(
+            label,
+            format!("observed amount {observed} is below expected minimum {expected_minimum}"),
+        ))
+    }
+}
+
+fn validate_decimal_equal(
+    label: &'static str,
+    observed: &str,
+    expected: &str,
+) -> Result<(), OrderActivityError> {
+    let observed = normalize_decimal_string(observed)?;
+    let expected = normalize_decimal_string(expected)?;
+    if observed == expected {
+        Ok(())
+    } else {
+        Err(OrderActivityError::hint_verification(
+            label,
+            format!("observed amount {observed} does not match expected amount {expected}"),
+        ))
+    }
 }
 
 fn validate_hl_trade_oid(
@@ -1259,7 +1526,7 @@ pub(super) async fn verify_hl_trade_canceled_hint(
             "HlTradeCanceled hint missing typed evidence",
         ));
     };
-    let operation = load_hl_typed_hint_operation(
+    let operation = load_typed_hint_operation(
         deps,
         &input,
         "HlTradeCanceled",
@@ -1274,14 +1541,14 @@ pub(super) async fn verify_hl_trade_canceled_hint(
     }
     validate_hl_trade_user(&operation, &evidence.user)?;
     validate_hl_trade_oid(&operation, evidence.oid)?;
-    complete_provider_operation_from_typed_hl_hint(
+    complete_provider_operation_from_typed_hint(
         deps,
         &input,
         operation,
-        TypedHlProviderOperationUpdate {
+        TypedProviderOperationUpdate {
             status: ProviderOperationStatus::Failed,
             provider_ref: input.signal.provider_ref.clone(),
-            observed_state: typed_hl_evidence_state("hl_trade_canceled", evidence)?,
+            observed_state: typed_evidence_state("hl_trade_canceled", evidence)?,
             response: None,
             tx_hash: None,
         },
@@ -1301,7 +1568,7 @@ pub(super) async fn verify_hl_bridge_deposit_observed_hint(
             "HlBridgeDepositObserved hint missing typed evidence",
         ));
     };
-    let operation = load_hl_typed_hint_operation(
+    let operation = load_typed_hint_operation(
         deps,
         &input,
         "HlBridgeDepositObserved",
@@ -1313,14 +1580,14 @@ pub(super) async fn verify_hl_bridge_deposit_observed_hint(
     }
     validate_hl_bridge_user(&operation, &evidence.user)?;
     validate_hl_bridge_usdc_amount(&operation, &evidence.usdc)?;
-    complete_provider_operation_from_typed_hl_hint(
+    complete_provider_operation_from_typed_hint(
         deps,
         &input,
         operation,
-        TypedHlProviderOperationUpdate {
+        TypedProviderOperationUpdate {
             status: ProviderOperationStatus::WaitingExternal,
             provider_ref: Some(evidence.user.clone()),
-            observed_state: typed_hl_evidence_state("hl_bridge_deposit_observed", evidence)?,
+            observed_state: typed_evidence_state("hl_bridge_deposit_observed", evidence)?,
             response: None,
             tx_hash: Some(evidence.arb_tx_hash.clone()),
         },
@@ -1340,7 +1607,7 @@ pub(super) async fn verify_hl_bridge_deposit_credited_hint(
             "HlBridgeDepositCredited hint missing typed evidence",
         ));
     };
-    let operation = load_hl_typed_hint_operation(
+    let operation = load_typed_hint_operation(
         deps,
         &input,
         "HlBridgeDepositCredited",
@@ -1352,14 +1619,14 @@ pub(super) async fn verify_hl_bridge_deposit_credited_hint(
     }
     validate_hl_bridge_user(&operation, &evidence.user)?;
     validate_hl_bridge_usdc_amount(&operation, &evidence.usdc)?;
-    complete_provider_operation_from_typed_hl_hint(
+    complete_provider_operation_from_typed_hint(
         deps,
         &input,
         operation,
-        TypedHlProviderOperationUpdate {
+        TypedProviderOperationUpdate {
             status: ProviderOperationStatus::Completed,
             provider_ref: Some(evidence.user.clone()),
-            observed_state: typed_hl_evidence_state("hl_bridge_deposit_credited", evidence)?,
+            observed_state: typed_evidence_state("hl_bridge_deposit_credited", evidence)?,
             response: None,
             tx_hash: Some(evidence.hl_credit_hash.clone()),
         },
@@ -1379,7 +1646,7 @@ pub(super) async fn verify_hl_withdrawal_acknowledged_hint(
             "HlWithdrawalAcknowledged hint missing typed evidence",
         ));
     };
-    let operation = load_hl_typed_hint_operation(
+    let operation = load_typed_hint_operation(
         deps,
         &input,
         "HlWithdrawalAcknowledged",
@@ -1391,14 +1658,14 @@ pub(super) async fn verify_hl_withdrawal_acknowledged_hint(
     }
     validate_hl_withdrawal_user(&operation, &evidence.user)?;
     validate_hl_withdrawal_gross_usdc_amount(&operation, &evidence.usdc)?;
-    complete_provider_operation_from_typed_hl_hint(
+    complete_provider_operation_from_typed_hint(
         deps,
         &input,
         operation,
-        TypedHlProviderOperationUpdate {
+        TypedProviderOperationUpdate {
             status: ProviderOperationStatus::WaitingExternal,
             provider_ref: input.signal.provider_ref.clone(),
-            observed_state: typed_hl_evidence_state("hl_withdrawal_acknowledged", evidence)?,
+            observed_state: typed_evidence_state("hl_withdrawal_acknowledged", evidence)?,
             response: None,
             tx_hash: Some(evidence.hl_request_hash.clone()),
         },
@@ -1418,7 +1685,7 @@ pub(super) async fn verify_hl_withdrawal_settled_hint(
             "HlWithdrawalSettled hint missing typed evidence",
         ));
     };
-    let operation = load_hl_typed_hint_operation(
+    let operation = load_typed_hint_operation(
         deps,
         &input,
         "HlWithdrawalSettled",
@@ -1431,14 +1698,14 @@ pub(super) async fn verify_hl_withdrawal_settled_hint(
     validate_hl_withdrawal_user(&operation, &evidence.user)?;
     validate_hl_withdrawal_payout_usdc_amount(&operation, &evidence.usdc)?;
     validate_hl_withdrawal_settlement_nonce(&operation, evidence.time_window_match_to_nonce)?;
-    complete_provider_operation_from_typed_hl_hint(
+    complete_provider_operation_from_typed_hint(
         deps,
         &input,
         operation,
-        TypedHlProviderOperationUpdate {
+        TypedProviderOperationUpdate {
             status: ProviderOperationStatus::Completed,
             provider_ref: Some(evidence.arb_payout_tx_hash.clone()),
-            observed_state: typed_hl_evidence_state("hl_withdrawal_settled", evidence)?,
+            observed_state: typed_evidence_state("hl_withdrawal_settled", evidence)?,
             response: None,
             tx_hash: Some(evidence.arb_payout_tx_hash.clone()),
         },
@@ -1905,6 +2172,18 @@ pub(super) async fn verify_provider_observation_hint(
             "Hyperliquid operations require typed Sauron HL evidence",
         ));
     }
+    if matches!(
+        operation.operation_type,
+        ProviderOperationType::CctpReceive | ProviderOperationType::UniversalRouterSwap
+    ) {
+        return Ok(provider_hint_deferred(
+            Some(provider_operation_id),
+            format!(
+                "{} operations require typed Sauron EVM receipt evidence",
+                operation.operation_type.to_db_string()
+            ),
+        ));
+    }
 
     let request = ProviderOperationObservationRequest {
         operation_id: operation.id,
@@ -1918,6 +2197,7 @@ pub(super) async fn verify_provider_observation_hint(
     let observation = match operation.operation_type {
         ProviderOperationType::AcrossBridge
         | ProviderOperationType::CctpBridge
+        | ProviderOperationType::CctpReceive
         | ProviderOperationType::HyperliquidBridgeDeposit
         | ProviderOperationType::HyperliquidBridgeWithdrawal => {
             let provider = deps
