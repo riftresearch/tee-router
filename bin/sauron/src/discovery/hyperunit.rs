@@ -7,7 +7,8 @@ use std::{
 use alloy::primitives::Address;
 use bitcoin::{address::NetworkUnchecked, Address as BitcoinAddress};
 use bitcoin_indexer_client::TxOutput;
-use bitcoin_receipt_watcher_client::{parse_txid, ByIdLookup};
+use bitcoin_receipt_watcher_client::{parse_txid, ByIdLookup as BitcoinByIdLookup};
+use evm_receipt_watcher_client::{parse_tx_hash, ByIdLookup as EvmByIdLookup};
 use hl_shim_client::{HlShimClient, HlTransferEvent, HlTransferKind};
 use hyperunit_client::{
     HyperUnitClient, HyperUnitClientError, UnitOperation, UnitOperationsRequest,
@@ -29,6 +30,7 @@ use uuid::Uuid;
 use crate::{
     discovery::btc::{best_output, BitcoinClients},
     error::{Error, Result},
+    provider_evm_receipts::EvmReceiptObserverClients,
     provider_operations::{ProviderOperationWatchStore, SharedProviderOperationWatchEntry},
     router_client::RouterClient,
 };
@@ -38,6 +40,54 @@ const HYPERUNIT_MAX_WAIT: Duration = Duration::from_secs(2 * 60 * 60);
 const HYPERUNIT_STATUS_TIMEOUT: Duration = Duration::from_secs(10);
 const HYPERUNIT_HL_LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
 const HYPERUNIT_BTC_LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
+const HYPERUNIT_EVM_LOOKUP_TIMEOUT: Duration = Duration::from_secs(20);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HyperUnitChain {
+    Bitcoin,
+    Ethereum,
+    Base,
+    Arbitrum,
+}
+
+impl HyperUnitChain {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "bitcoin" => Some(Self::Bitcoin),
+            "ethereum" | "eth" => Some(Self::Ethereum),
+            "base" => Some(Self::Base),
+            "arbitrum" | "arb" => Some(Self::Arbitrum),
+            _ => None,
+        }
+    }
+
+    fn as_hyperunit_str(self) -> &'static str {
+        match self {
+            Self::Bitcoin => "bitcoin",
+            Self::Ethereum => "ethereum",
+            Self::Base => "base",
+            Self::Arbitrum => "arbitrum",
+        }
+    }
+
+    fn evm_chain_id(self) -> Option<&'static str> {
+        match self {
+            Self::Bitcoin => None,
+            Self::Ethereum => Some("evm:1"),
+            Self::Base => Some("evm:8453"),
+            Self::Arbitrum => Some("evm:42161"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct EvmReceiptEvidence {
+    chain_id: String,
+    tx_hash: String,
+    block_number: Option<u64>,
+    block_hash: Option<String>,
+    status: bool,
+}
 
 #[derive(Debug, Clone)]
 struct PollState {
@@ -51,6 +101,7 @@ pub async fn run_hyperunit_observer_loop(
     unit: HyperUnitClient,
     hl: HlShimClient,
     btc: BitcoinClients,
+    evm: Option<EvmReceiptObserverClients>,
 ) -> Result<()> {
     let mut poll_state = HashMap::<Uuid, PollState>::new();
     let mut submitted = HashSet::<(Uuid, String)>::new();
@@ -92,7 +143,7 @@ pub async fn run_hyperunit_observer_loop(
             }
             state.next_poll_at = now + hyperunit_poll_interval(state.first_seen.elapsed());
 
-            let hints = match hyperunit_hints(&unit, &hl, &btc, &operation).await {
+            let hints = match hyperunit_hints(&unit, &hl, &btc, evm.as_ref(), &operation).await {
                 Ok(hints) => hints,
                 Err(error) => {
                     warn!(
@@ -117,11 +168,12 @@ async fn hyperunit_hints(
     unit: &HyperUnitClient,
     hl: &HlShimClient,
     btc: &BitcoinClients,
+    evm: Option<&EvmReceiptObserverClients>,
     operation: &SharedProviderOperationWatchEntry,
 ) -> Result<Vec<ProviderOperationHintRequest>> {
     match operation.operation_type {
-        ProviderOperationType::UnitDeposit => deposit_hints(unit, hl, btc, operation).await,
-        ProviderOperationType::UnitWithdrawal => withdrawal_hints(unit, btc, operation).await,
+        ProviderOperationType::UnitDeposit => deposit_hints(unit, hl, btc, evm, operation).await,
+        ProviderOperationType::UnitWithdrawal => withdrawal_hints(unit, btc, evm, operation).await,
         _ => Ok(Vec::new()),
     }
 }
@@ -130,19 +182,23 @@ async fn deposit_hints(
     unit: &HyperUnitClient,
     hl: &HlShimClient,
     btc: &BitcoinClients,
+    evm: Option<&EvmReceiptObserverClients>,
     operation: &SharedProviderOperationWatchEntry,
 ) -> Result<Vec<ProviderOperationHintRequest>> {
     let Some(protocol_address) = protocol_address(operation) else {
         return Ok(Vec::new());
     };
-    let source_is_bitcoin = unit_operation_source_is_bitcoin(operation);
-    let output = if source_is_bitcoin {
+    let request_source_chain = unit_operation_source_chain(operation);
+    let request_source_is_bitcoin = request_source_chain
+        .and_then(HyperUnitChain::parse)
+        .is_some_and(|chain| chain == HyperUnitChain::Bitcoin);
+    let output = if request_source_is_bitcoin {
         let amount = request_str(&operation.request, "amount").and_then(parse_u64);
         bitcoin_output(btc, protocol_address, amount.unwrap_or(1), u64::MAX).await?
     } else {
         None
     };
-    if source_is_bitcoin && output.is_none() {
+    if request_source_is_bitcoin && output.is_none() {
         return Ok(Vec::new());
     }
 
@@ -167,6 +223,31 @@ async fn deposit_hints(
     {
         return Ok(hints);
     }
+    let source_chain = match hyperunit_chain_from_status_or_request(
+        status.source_chain.as_deref(),
+        request_source_chain,
+        operation,
+        "source",
+    ) {
+        Some(chain) => chain,
+        None => return Ok(hints),
+    };
+    let evm_source = match source_chain {
+        HyperUnitChain::Bitcoin => None,
+        HyperUnitChain::Ethereum | HyperUnitChain::Base | HyperUnitChain::Arbitrum => {
+            let Some(source_tx_hash) = status.source_tx_hash.as_deref() else {
+                return Ok(hints);
+            };
+            lookup_evm_receipt_evidence(evm, source_chain, source_tx_hash, operation).await?
+        }
+    };
+    if matches!(
+        source_chain,
+        HyperUnitChain::Ethereum | HyperUnitChain::Base | HyperUnitChain::Arbitrum
+    ) && evm_source.is_none()
+    {
+        return Ok(hints);
+    }
     let Some(user) = request_str(&operation.request, "dst_addr").and_then(parse_hl_address) else {
         return Ok(hints);
     };
@@ -180,6 +261,8 @@ async fn deposit_hints(
                 output.as_ref(),
                 &status,
                 &credit,
+                source_chain,
+                evm_source.as_ref(),
             ),
             "unit-deposit-credited",
         ));
@@ -190,6 +273,7 @@ async fn deposit_hints(
 async fn withdrawal_hints(
     unit: &HyperUnitClient,
     btc: &BitcoinClients,
+    evm: Option<&EvmReceiptObserverClients>,
     operation: &SharedProviderOperationWatchEntry,
 ) -> Result<Vec<ProviderOperationHintRequest>> {
     let Some(protocol_address) = protocol_address(operation) else {
@@ -201,53 +285,97 @@ async fn withdrawal_hints(
     if !status_matches_protocol(&status, protocol_address) {
         return Ok(Vec::new());
     }
-    let Some(btc_txid) = status.destination_tx_hash.as_deref() else {
+    let Some(destination_tx_hash) = status.destination_tx_hash.as_deref() else {
         return Ok(Vec::new());
     };
+    let destination_chain = hyperunit_chain_from_status_or_request(
+        status.destination_chain.as_deref(),
+        unit_operation_destination_chain(operation),
+        operation,
+        "destination",
+    );
     let mut hints = vec![hint_request(
         operation,
         ProviderOperationHintKind::HyperUnitWithdrawalAcknowledged,
-        hyperunit_withdrawal_ack_evidence(protocol_address, &status),
+        hyperunit_withdrawal_ack_evidence(protocol_address, &status, destination_chain),
         "unit-withdrawal-ack",
     )];
-    let Some(receipt_watcher) = btc.receipt_watcher.as_ref() else {
-        return Ok(hints);
-    };
-    let Ok(txid) = parse_txid(btc_txid) else {
-        return Ok(hints);
-    };
-    let receipt = match timeout(
-        HYPERUNIT_BTC_LOOKUP_TIMEOUT,
-        receipt_watcher.lookup_by_id(txid),
-    )
-    .await
-    {
-        Ok(Ok(receipt)) => receipt,
-        Ok(Err(source)) => return Err(Error::BitcoinReceiptWatcher { source }),
-        Err(_) => None,
-    };
-    let Some((tx, confirmations)) = receipt else {
+    let Some(destination_chain) = destination_chain else {
         return Ok(hints);
     };
     let Some(destination_address) = request_str(&operation.request, "dst_addr") else {
         return Ok(hints);
     };
-    let Some((vout, amount_sats)) = payout_output(&tx, destination_address) else {
-        return Ok(hints);
+
+    match destination_chain {
+        HyperUnitChain::Bitcoin => {
+            let Some(receipt_watcher) = btc.receipt_watcher.as_ref() else {
+                warn!(
+                    operation_id = %operation.operation_id,
+                    destination_chain = destination_chain.as_hyperunit_str(),
+                    "HyperUnit withdrawal destination is Bitcoin but no Bitcoin receipt watcher is configured"
+                );
+                return Ok(hints);
+            };
+            let Ok(txid) = parse_txid(destination_tx_hash) else {
+                warn!(
+                    operation_id = %operation.operation_id,
+                    destination_tx_hash,
+                    "HyperUnit withdrawal destination transaction hash is not a valid Bitcoin txid"
+                );
+                return Ok(hints);
+            };
+            let receipt = match timeout(
+                HYPERUNIT_BTC_LOOKUP_TIMEOUT,
+                receipt_watcher.lookup_by_id(txid),
+            )
+            .await
+            {
+                Ok(Ok(receipt)) => receipt,
+                Ok(Err(source)) => return Err(Error::BitcoinReceiptWatcher { source }),
+                Err(_) => None,
+            };
+            let Some((tx, confirmations)) = receipt else {
+                return Ok(hints);
+            };
+            let Some((vout, amount_sats)) = payout_output(&tx, destination_address) else {
+                return Ok(hints);
+            };
+            hints.push(hint_request(
+                operation,
+                ProviderOperationHintKind::HyperUnitWithdrawalSettled,
+                hyperunit_withdrawal_btc_settled_evidence(
+                    protocol_address,
+                    &status,
+                    destination_address,
+                    vout,
+                    amount_sats,
+                    confirmations,
+                ),
+                "unit-withdrawal-settled",
+            ));
+        }
+        HyperUnitChain::Ethereum | HyperUnitChain::Base | HyperUnitChain::Arbitrum => {
+            let Some(evm_receipt) =
+                lookup_evm_receipt_evidence(evm, destination_chain, destination_tx_hash, operation)
+                    .await?
+            else {
+                return Ok(hints);
+            };
+            hints.push(hint_request(
+                operation,
+                ProviderOperationHintKind::HyperUnitWithdrawalSettled,
+                hyperunit_withdrawal_evm_settled_evidence(
+                    protocol_address,
+                    &status,
+                    destination_address,
+                    destination_chain,
+                    &evm_receipt,
+                ),
+                "unit-withdrawal-settled",
+            ));
+        }
     };
-    hints.push(hint_request(
-        operation,
-        ProviderOperationHintKind::HyperUnitWithdrawalSettled,
-        hyperunit_withdrawal_settled_evidence(
-            protocol_address,
-            &status,
-            destination_address,
-            vout,
-            amount_sats,
-            confirmations,
-        ),
-        "unit-withdrawal-settled",
-    ));
     Ok(hints)
 }
 
@@ -454,6 +582,8 @@ fn hyperunit_deposit_credited_evidence(
     output: Option<&TxOutput>,
     status: &UnitOperation,
     credit: &HlTransferEvent,
+    source_chain: HyperUnitChain,
+    evm_source: Option<&EvmReceiptEvidence>,
 ) -> Value {
     let (btc_tx_hash, btc_vout, btc_amount, btc_confirmations, btc_block_height, btc_block_hash) =
         output
@@ -480,6 +610,12 @@ fn hyperunit_deposit_credited_evidence(
         hyperunit_status: status.state.clone(),
         hyperunit_source_tx_hash: status.source_tx_hash.clone(),
         hyperunit_destination_tx_hash: status.destination_tx_hash.clone(),
+        source_chain: Some(source_chain.as_hyperunit_str().to_string()),
+        evm_source_chain_id: evm_source.map(|evidence| evidence.chain_id.clone()),
+        evm_source_tx_hash: evm_source.map(|evidence| evidence.tx_hash.clone()),
+        evm_source_block_number: evm_source.and_then(|evidence| evidence.block_number),
+        evm_source_block_hash: evm_source.and_then(|evidence| evidence.block_hash.clone()),
+        evm_source_status: evm_source.map(|evidence| evidence.status),
         hl_user: format!("{:#x}", credit.user),
         hl_amount: credit.amount_delta.as_str().to_string(),
         hl_credit_hash: credit.hash.clone(),
@@ -487,19 +623,28 @@ fn hyperunit_deposit_credited_evidence(
     })
 }
 
-fn hyperunit_withdrawal_ack_evidence(protocol_address: &str, status: &UnitOperation) -> Value {
+fn hyperunit_withdrawal_ack_evidence(
+    protocol_address: &str,
+    status: &UnitOperation,
+    destination_chain: Option<HyperUnitChain>,
+) -> Value {
     typed_evidence(HyperUnitWithdrawalAcknowledgedEvidence {
         protocol_address: protocol_address.to_string(),
         hyperunit_operation_id: status.operation_id.clone(),
         hyperunit_status: status.state.clone(),
         destination_address: status.destination_address.clone(),
         amount: status.source_amount.clone(),
-        btc_tx_hash: status.destination_tx_hash.clone(),
+        destination_chain: destination_chain.map(|chain| chain.as_hyperunit_str().to_string()),
+        destination_tx_hash: status.destination_tx_hash.clone(),
+        btc_tx_hash: destination_chain
+            .is_some_and(|chain| chain == HyperUnitChain::Bitcoin)
+            .then(|| status.destination_tx_hash.clone())
+            .flatten(),
         broadcast_at: status.broadcast_at.clone(),
     })
 }
 
-fn hyperunit_withdrawal_settled_evidence(
+fn hyperunit_withdrawal_btc_settled_evidence(
     protocol_address: &str,
     status: &UnitOperation,
     destination_address: &str,
@@ -513,10 +658,44 @@ fn hyperunit_withdrawal_settled_evidence(
         hyperunit_status: status.state.clone(),
         destination_address: destination_address.to_string(),
         amount: status.source_amount.clone(),
+        destination_chain: Some(HyperUnitChain::Bitcoin.as_hyperunit_str().to_string()),
+        destination_tx_hash: status.destination_tx_hash.clone(),
         btc_tx_hash: status.destination_tx_hash.clone(),
-        btc_vout: u64::from(vout),
-        btc_amount: amount_sats.to_string(),
-        btc_confirmations: confirmations,
+        btc_vout: Some(u64::from(vout)),
+        btc_amount: Some(amount_sats.to_string()),
+        btc_confirmations: Some(confirmations),
+        evm_chain_id: None,
+        evm_tx_hash: None,
+        evm_block_number: None,
+        evm_block_hash: None,
+        evm_status: None,
+    })
+}
+
+fn hyperunit_withdrawal_evm_settled_evidence(
+    protocol_address: &str,
+    status: &UnitOperation,
+    destination_address: &str,
+    destination_chain: HyperUnitChain,
+    evm: &EvmReceiptEvidence,
+) -> Value {
+    typed_evidence(HyperUnitWithdrawalSettledEvidence {
+        protocol_address: protocol_address.to_string(),
+        hyperunit_operation_id: status.operation_id.clone(),
+        hyperunit_status: status.state.clone(),
+        destination_address: destination_address.to_string(),
+        amount: status.source_amount.clone(),
+        destination_chain: Some(destination_chain.as_hyperunit_str().to_string()),
+        destination_tx_hash: status.destination_tx_hash.clone(),
+        btc_tx_hash: None,
+        btc_vout: None,
+        btc_amount: None,
+        btc_confirmations: None,
+        evm_chain_id: Some(evm.chain_id.clone()),
+        evm_tx_hash: Some(evm.tx_hash.clone()),
+        evm_block_number: evm.block_number,
+        evm_block_hash: evm.block_hash.clone(),
+        evm_status: Some(evm.status),
     })
 }
 
@@ -548,10 +727,102 @@ fn request_str<'a>(value: &'a Value, field: &str) -> Option<&'a str> {
     value.get(field).and_then(Value::as_str)
 }
 
-fn unit_operation_source_is_bitcoin(operation: &SharedProviderOperationWatchEntry) -> bool {
+fn unit_operation_source_chain(operation: &SharedProviderOperationWatchEntry) -> Option<&str> {
     request_str(&operation.request, "src_chain")
         .or_else(|| request_str(&operation.request, "source_chain"))
-        .is_some_and(|chain| chain.eq_ignore_ascii_case("bitcoin"))
+}
+
+fn unit_operation_destination_chain(operation: &SharedProviderOperationWatchEntry) -> Option<&str> {
+    request_str(&operation.request, "dst_chain")
+        .or_else(|| request_str(&operation.request, "destination_chain"))
+}
+
+fn hyperunit_chain_from_status_or_request(
+    status_chain: Option<&str>,
+    request_chain: Option<&str>,
+    operation: &SharedProviderOperationWatchEntry,
+    label: &'static str,
+) -> Option<HyperUnitChain> {
+    let chain = status_chain.or(request_chain);
+    let Some(chain) = chain else {
+        warn!(
+            operation_id = %operation.operation_id,
+            chain_label = label,
+            "HyperUnit operation is missing chain name; emitting only currently available hints"
+        );
+        return None;
+    };
+    let parsed = HyperUnitChain::parse(chain);
+    if parsed.is_none() {
+        warn!(
+            operation_id = %operation.operation_id,
+            chain_label = label,
+            chain,
+            "HyperUnit operation used an unrecognized chain; emitting only currently available hints"
+        );
+    }
+    parsed
+}
+
+async fn lookup_evm_receipt_evidence(
+    clients: Option<&EvmReceiptObserverClients>,
+    chain: HyperUnitChain,
+    tx_hash: &str,
+    operation: &SharedProviderOperationWatchEntry,
+) -> Result<Option<EvmReceiptEvidence>> {
+    let Some(chain_id) = chain.evm_chain_id() else {
+        return Ok(None);
+    };
+    let Some(clients) = clients else {
+        warn!(
+            operation_id = %operation.operation_id,
+            chain = chain.as_hyperunit_str(),
+            chain_id,
+            "HyperUnit operation needs EVM receipt lookup but no EVM receipt watcher clients are configured"
+        );
+        return Ok(None);
+    };
+    let Some(client) = clients.client_for_chain(chain_id) else {
+        warn!(
+            operation_id = %operation.operation_id,
+            chain = chain.as_hyperunit_str(),
+            chain_id,
+            "HyperUnit operation needs EVM receipt lookup but no receipt watcher client is configured for this chain"
+        );
+        return Ok(None);
+    };
+    let Ok(parsed_hash) = parse_tx_hash(tx_hash) else {
+        warn!(
+            operation_id = %operation.operation_id,
+            chain = chain.as_hyperunit_str(),
+            tx_hash,
+            "HyperUnit operation EVM transaction hash is invalid"
+        );
+        return Ok(None);
+    };
+    let receipt = match timeout(
+        HYPERUNIT_EVM_LOOKUP_TIMEOUT,
+        client.lookup_by_id(parsed_hash),
+    )
+    .await
+    {
+        Ok(Ok(receipt)) => receipt,
+        Ok(Err(source)) => return Err(Error::EvmReceiptWatcher { source }),
+        Err(_) => None,
+    };
+    let Some((receipt, _logs)) = receipt else {
+        return Ok(None);
+    };
+    if !receipt.status() {
+        return Ok(None);
+    }
+    Ok(Some(EvmReceiptEvidence {
+        chain_id: chain_id.to_string(),
+        tx_hash: format!("{:#x}", receipt.transaction_hash),
+        block_number: receipt.block_number,
+        block_hash: receipt.block_hash.map(|hash| format!("{hash:#x}")),
+        status: receipt.status(),
+    }))
 }
 
 fn status_matches_protocol(status: &UnitOperation, protocol_address: &str) -> bool {
@@ -672,15 +943,25 @@ fn hyperunit_poll_interval(elapsed: Duration) -> Duration {
 mod tests {
     use super::*;
     use axum::{
-        extract::{Path, State},
+        extract::{
+            ws::{Message as WsMessage, WebSocketUpgrade},
+            Path, State,
+        },
         http::StatusCode,
         response::{IntoResponse, Response},
-        routing::get,
+        routing::{get, post},
         Json, Router,
     };
+    use bitcoin::{
+        absolute::LockTime, transaction::Version, Amount, OutPoint, ScriptBuf, Sequence,
+        Transaction, TxIn, TxOut, Witness,
+    };
+    use router_core::models::ProviderOperationStatus;
+    use router_temporal::WorkflowStepId;
     use serde::de::DeserializeOwned;
     use std::collections::BTreeSet;
-    use tokio::{net::TcpListener, task::JoinHandle};
+    use std::sync::Arc;
+    use tokio::{net::TcpListener, sync::watch, task::JoinHandle};
 
     #[test]
     fn btc_deposit_evidence_matches_router_typed_shape() {
@@ -713,6 +994,8 @@ mod tests {
             Some(&output),
             &status,
             &credit,
+            HyperUnitChain::Bitcoin,
+            None,
         );
 
         assert_typed_evidence::<HyperUnitDepositCreditedEvidence>(
@@ -729,6 +1012,7 @@ mod tests {
                 "hyperunit_status",
                 "hyperunit_source_tx_hash",
                 "hyperunit_destination_tx_hash",
+                "source_chain",
                 "hl_user",
                 "hl_amount",
                 "hl_credit_hash",
@@ -741,8 +1025,11 @@ mod tests {
     fn hyperunit_withdrawal_ack_evidence_matches_router_typed_shape() {
         let status = unit_operation();
 
-        let evidence =
-            hyperunit_withdrawal_ack_evidence("1BoatSLRHtKNngkdXEeobR76b53LETtpyT", &status);
+        let evidence = hyperunit_withdrawal_ack_evidence(
+            "1BoatSLRHtKNngkdXEeobR76b53LETtpyT",
+            &status,
+            Some(HyperUnitChain::Bitcoin),
+        );
 
         assert_typed_evidence::<HyperUnitWithdrawalAcknowledgedEvidence>(
             &evidence,
@@ -752,6 +1039,8 @@ mod tests {
                 "hyperunit_status",
                 "destination_address",
                 "amount",
+                "destination_chain",
+                "destination_tx_hash",
                 "btc_tx_hash",
                 "broadcast_at",
             ],
@@ -762,7 +1051,7 @@ mod tests {
     fn hyperunit_withdrawal_settled_evidence_matches_router_typed_shape() {
         let status = unit_operation();
 
-        let evidence = hyperunit_withdrawal_settled_evidence(
+        let evidence = hyperunit_withdrawal_btc_settled_evidence(
             "1BoatSLRHtKNngkdXEeobR76b53LETtpyT",
             &status,
             "1BoatSLRHtKNngkdXEeobR76b53LETtpyT",
@@ -779,6 +1068,8 @@ mod tests {
                 "hyperunit_status",
                 "destination_address",
                 "amount",
+                "destination_chain",
+                "destination_tx_hash",
                 "btc_tx_hash",
                 "btc_vout",
                 "btc_amount",
@@ -871,6 +1162,219 @@ mod tests {
         assert!(withdrawal_status.is_none());
     }
 
+    #[tokio::test]
+    async fn withdrawal_hints_emit_ack_and_settled_for_base_destination() {
+        let protocol_address = "0x73c1d4b7add80c7cfea60a997c615064a424a844";
+        let destination = "0x1111111111111111111111111111111111111111";
+        let tx_hash = "0xa4b0ef0fc686e5b300337b27ca6432bcd1e0879ca825c5c0bbe637dba62190ef";
+        let status = unit_operation_with_tx_hashes(
+            "withdrawal-base",
+            protocol_address,
+            "hyperliquid",
+            "base",
+            None,
+            Some(tx_hash),
+            Some(destination),
+        );
+        let unit_server = spawn_hyperunit_operations_server(
+            protocol_address,
+            StatusCode::OK,
+            serde_json::json!({ "addresses": [], "operations": [status] }),
+        )
+        .await;
+        let evm_server = spawn_evm_receipt_watcher_server("base").await;
+        let unit = HyperUnitClient::new(unit_server.base_url()).expect("HyperUnit client");
+        let btc = dummy_bitcoin_clients(None);
+        let evm = evm_clients_for(HyperUnitChain::Base, evm_server.base_url());
+        let operation = provider_operation(
+            ProviderOperationType::UnitWithdrawal,
+            protocol_address,
+            serde_json::json!({
+                "dst_addr": destination,
+                "dst_chain": "base",
+                "amount": "1000000000000000000"
+            }),
+        );
+
+        let hints = withdrawal_hints(&unit, &btc, Some(&evm), &operation)
+            .await
+            .expect("withdrawal hints");
+
+        assert_hint_kinds(
+            &hints,
+            &[
+                ProviderOperationHintKind::HyperUnitWithdrawalAcknowledged,
+                ProviderOperationHintKind::HyperUnitWithdrawalSettled,
+            ],
+        );
+        let settled = hint_evidence(
+            &hints,
+            ProviderOperationHintKind::HyperUnitWithdrawalSettled,
+        );
+        assert_eq!(settled["destination_chain"], "base");
+        assert_eq!(settled["destination_tx_hash"], tx_hash);
+        assert_eq!(settled["evm_chain_id"], "evm:8453");
+        assert_eq!(settled["evm_tx_hash"], tx_hash);
+    }
+
+    #[tokio::test]
+    async fn withdrawal_hints_emit_ack_and_settled_for_ethereum_destination() {
+        let protocol_address = "0x73c1d4b7add80c7cfea60a997c615064a424a844";
+        let destination = "0x2222222222222222222222222222222222222222";
+        let tx_hash = "0xb4b0ef0fc686e5b300337b27ca6432bcd1e0879ca825c5c0bbe637dba62190ef";
+        let status = unit_operation_with_tx_hashes(
+            "withdrawal-ethereum",
+            protocol_address,
+            "hyperliquid",
+            "ethereum",
+            None,
+            Some(tx_hash),
+            Some(destination),
+        );
+        let unit_server = spawn_hyperunit_operations_server(
+            protocol_address,
+            StatusCode::OK,
+            serde_json::json!({ "addresses": [], "operations": [status] }),
+        )
+        .await;
+        let evm_server = spawn_evm_receipt_watcher_server("ethereum").await;
+        let unit = HyperUnitClient::new(unit_server.base_url()).expect("HyperUnit client");
+        let btc = dummy_bitcoin_clients(None);
+        let evm = evm_clients_for(HyperUnitChain::Ethereum, evm_server.base_url());
+        let operation = provider_operation(
+            ProviderOperationType::UnitWithdrawal,
+            protocol_address,
+            serde_json::json!({
+                "dst_addr": destination,
+                "dst_chain": "ethereum",
+                "amount": "1000000000000000000"
+            }),
+        );
+
+        let hints = withdrawal_hints(&unit, &btc, Some(&evm), &operation)
+            .await
+            .expect("withdrawal hints");
+
+        assert_hint_kinds(
+            &hints,
+            &[
+                ProviderOperationHintKind::HyperUnitWithdrawalAcknowledged,
+                ProviderOperationHintKind::HyperUnitWithdrawalSettled,
+            ],
+        );
+        let settled = hint_evidence(
+            &hints,
+            ProviderOperationHintKind::HyperUnitWithdrawalSettled,
+        );
+        assert_eq!(settled["destination_chain"], "ethereum");
+        assert_eq!(settled["evm_chain_id"], "evm:1");
+    }
+
+    #[tokio::test]
+    async fn withdrawal_hints_emit_ack_and_settled_for_bitcoin_destination() {
+        let protocol_address = "0x73c1d4b7add80c7cfea60a997c615064a424a844";
+        let destination = "1BoatSLRHtKNngkdXEeobR76b53LETtpyT";
+        let txid = "0000000000000000000000000000000000000000000000000000000000000001";
+        let status = unit_operation_with_tx_hashes(
+            "withdrawal-bitcoin",
+            protocol_address,
+            "hyperliquid",
+            "bitcoin",
+            None,
+            Some(txid),
+            Some(destination),
+        );
+        let unit_server = spawn_hyperunit_operations_server(
+            protocol_address,
+            StatusCode::OK,
+            serde_json::json!({ "addresses": [], "operations": [status] }),
+        )
+        .await;
+        let tx = bitcoin_payout_tx(destination, 50_000);
+        let btc_server = spawn_bitcoin_receipt_watcher_server(tx).await;
+        let unit = HyperUnitClient::new(unit_server.base_url()).expect("HyperUnit client");
+        let btc = dummy_bitcoin_clients(Some(btc_server.base_url()));
+        let operation = provider_operation(
+            ProviderOperationType::UnitWithdrawal,
+            protocol_address,
+            serde_json::json!({
+                "dst_addr": destination,
+                "dst_chain": "bitcoin",
+                "amount": "50000"
+            }),
+        );
+
+        let hints = withdrawal_hints(&unit, &btc, None, &operation)
+            .await
+            .expect("withdrawal hints");
+
+        assert_hint_kinds(
+            &hints,
+            &[
+                ProviderOperationHintKind::HyperUnitWithdrawalAcknowledged,
+                ProviderOperationHintKind::HyperUnitWithdrawalSettled,
+            ],
+        );
+        let settled = hint_evidence(
+            &hints,
+            ProviderOperationHintKind::HyperUnitWithdrawalSettled,
+        );
+        assert_eq!(settled["destination_chain"], "bitcoin");
+        assert_eq!(settled["btc_tx_hash"], txid);
+        assert_eq!(settled["btc_vout"], 0);
+    }
+
+    #[tokio::test]
+    async fn deposit_hints_emit_credited_for_base_source() {
+        let protocol_address = "0x73c1d4b7add80c7cfea60a997c615064a424a844";
+        let user = "0x1111111111111111111111111111111111111111";
+        let tx_hash = "0xc4b0ef0fc686e5b300337b27ca6432bcd1e0879ca825c5c0bbe637dba62190ef";
+        let status = unit_operation_with_tx_hashes(
+            "deposit-base",
+            protocol_address,
+            "base",
+            "hyperliquid",
+            Some(tx_hash),
+            None,
+            Some(user),
+        );
+        let unit_server = spawn_hyperunit_operations_server(
+            protocol_address,
+            StatusCode::OK,
+            serde_json::json!({ "addresses": [], "operations": [status] }),
+        )
+        .await;
+        let evm_server = spawn_evm_receipt_watcher_server("base").await;
+        let hl_server = spawn_hl_transfers_server(hl_credit_event()).await;
+        let unit = HyperUnitClient::new(unit_server.base_url()).expect("HyperUnit client");
+        let hl = HlShimClient::new(hl_server.base_url()).expect("HL shim client");
+        let btc = dummy_bitcoin_clients(None);
+        let evm = evm_clients_for(HyperUnitChain::Base, evm_server.base_url());
+        let operation = provider_operation(
+            ProviderOperationType::UnitDeposit,
+            protocol_address,
+            serde_json::json!({
+                "src_chain": "base",
+                "dst_chain": "hyperliquid",
+                "dst_addr": user,
+                "amount": "50000"
+            }),
+        );
+
+        let hints = deposit_hints(&unit, &hl, &btc, Some(&evm), &operation)
+            .await
+            .expect("deposit hints");
+
+        assert_hint_kinds(
+            &hints,
+            &[ProviderOperationHintKind::HyperUnitDepositCredited],
+        );
+        let credited = hint_evidence(&hints, ProviderOperationHintKind::HyperUnitDepositCredited);
+        assert_eq!(credited["source_chain"], "base");
+        assert_eq!(credited["evm_source_chain_id"], "evm:8453");
+        assert_eq!(credited["evm_source_tx_hash"], tx_hash);
+    }
+
     fn tx_output() -> TxOutput {
         TxOutput {
             txid: "0000000000000000000000000000000000000000000000000000000000000001"
@@ -922,6 +1426,125 @@ mod tests {
             "destinationTxHash": "0x9e36"
         }))
         .expect("unit operation")
+    }
+
+    fn unit_operation_with_tx_hashes(
+        operation_id: &str,
+        protocol_address: &str,
+        source_chain: &str,
+        destination_chain: &str,
+        source_tx_hash: Option<&str>,
+        destination_tx_hash: Option<&str>,
+        destination_address: Option<&str>,
+    ) -> UnitOperation {
+        serde_json::from_value(serde_json::json!({
+            "operationId": operation_id,
+            "protocolAddress": protocol_address,
+            "sourceChain": source_chain,
+            "destinationChain": destination_chain,
+            "sourceAddress": protocol_address,
+            "destinationAddress": destination_address,
+            "sourceAmount": "50000",
+            "state": "done",
+            "sourceTxHash": source_tx_hash,
+            "destinationTxHash": destination_tx_hash,
+            "broadcastAt": "2026-05-12T00:00:00Z"
+        }))
+        .expect("unit operation")
+    }
+
+    fn provider_operation(
+        operation_type: ProviderOperationType,
+        protocol_address: &str,
+        request: Value,
+    ) -> SharedProviderOperationWatchEntry {
+        Arc::new(crate::provider_operations::ProviderOperationWatchEntry {
+            operation_id: Uuid::now_v7(),
+            execution_step_id: WorkflowStepId::from(Uuid::now_v7()),
+            provider: "unit".to_string(),
+            operation_type,
+            provider_ref: Some(protocol_address.to_string()),
+            status: ProviderOperationStatus::WaitingExternal,
+            request,
+            response: serde_json::json!({}),
+            observed_state: serde_json::json!({}),
+            execution_step_request: serde_json::json!({}),
+            updated_at: chrono::DateTime::parse_from_rfc3339("2026-05-12T00:00:00Z")
+                .expect("timestamp")
+                .with_timezone(&chrono::Utc),
+        })
+    }
+
+    fn dummy_bitcoin_clients(receipt_watcher_url: Option<&str>) -> BitcoinClients {
+        BitcoinClients {
+            indexer: Arc::new(
+                bitcoin_indexer_client::BitcoinIndexerClient::new("http://127.0.0.1:1")
+                    .expect("dummy Bitcoin indexer client"),
+            ),
+            receipt_watcher: receipt_watcher_url.map(|url| {
+                Arc::new(
+                    bitcoin_receipt_watcher_client::BitcoinReceiptWatcherClient::new(
+                        url, "bitcoin",
+                    )
+                    .expect("Bitcoin receipt watcher client"),
+                )
+            }),
+        }
+    }
+
+    fn evm_clients_for(chain: HyperUnitChain, url: &str) -> EvmReceiptObserverClients {
+        let client = Arc::new(
+            evm_receipt_watcher_client::EvmReceiptWatcherClient::new(url, chain.as_hyperunit_str())
+                .expect("EVM receipt watcher client"),
+        );
+        EvmReceiptObserverClients {
+            ethereum: (chain == HyperUnitChain::Ethereum).then(|| client.clone()),
+            base: (chain == HyperUnitChain::Base).then(|| client.clone()),
+            arbitrum: (chain == HyperUnitChain::Arbitrum).then_some(client),
+        }
+    }
+
+    fn bitcoin_payout_tx(destination_address: &str, amount_sats: u64) -> Transaction {
+        let address = destination_address
+            .parse::<BitcoinAddress<NetworkUnchecked>>()
+            .expect("Bitcoin destination")
+            .assume_checked();
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(amount_sats),
+                script_pubkey: address.script_pubkey(),
+            }],
+        }
+    }
+
+    fn assert_hint_kinds(
+        hints: &[ProviderOperationHintRequest],
+        expected: &[ProviderOperationHintKind],
+    ) {
+        let mut actual = hints.iter().map(|hint| hint.hint_kind).collect::<Vec<_>>();
+        actual.sort_by_key(|kind| kind.to_db_string());
+        let mut expected = expected.to_vec();
+        expected.sort_by_key(|kind| kind.to_db_string());
+        assert_eq!(actual, expected);
+    }
+
+    fn hint_evidence(
+        hints: &[ProviderOperationHintRequest],
+        kind: ProviderOperationHintKind,
+    ) -> &Value {
+        &hints
+            .iter()
+            .find(|hint| hint.hint_kind == kind)
+            .expect("hint kind should be emitted")
+            .evidence
     }
 
     fn hl_credit_event() -> HlTransferEvent {
@@ -1018,5 +1641,292 @@ mod tests {
                 .into_response();
         }
         (state.status, Json(state.body)).into_response()
+    }
+
+    #[derive(Clone)]
+    struct EvmReceiptWatcherMockState {
+        chain: String,
+        events: watch::Sender<Option<String>>,
+    }
+
+    struct EvmReceiptWatcherMockServer {
+        base_url: String,
+        handle: JoinHandle<()>,
+    }
+
+    impl EvmReceiptWatcherMockServer {
+        fn base_url(&self) -> &str {
+            &self.base_url
+        }
+    }
+
+    impl Drop for EvmReceiptWatcherMockServer {
+        fn drop(&mut self) {
+            self.handle.abort();
+        }
+    }
+
+    async fn spawn_evm_receipt_watcher_server(chain: &str) -> EvmReceiptWatcherMockServer {
+        let (events, _) = watch::channel(None);
+        let state = EvmReceiptWatcherMockState {
+            chain: chain.to_string(),
+            events,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind EVM receipt watcher mock server");
+        let addr = listener.local_addr().expect("EVM receipt watcher addr");
+        let app = Router::new()
+            .route("/subscribe", get(evm_receipt_subscribe_handler))
+            .route("/watch", post(evm_receipt_watch_handler))
+            .with_state(state);
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("EVM receipt watcher mock server should run");
+        });
+        EvmReceiptWatcherMockServer {
+            base_url: format!("http://{addr}"),
+            handle,
+        }
+    }
+
+    async fn evm_receipt_subscribe_handler(
+        State(state): State<EvmReceiptWatcherMockState>,
+        ws: WebSocketUpgrade,
+    ) -> Response {
+        ws.on_upgrade(move |mut socket| async move {
+            let mut events = state.events.subscribe();
+            let initial_event = events.borrow().clone();
+            if let Some(event) = initial_event {
+                let _ = socket.send(WsMessage::Text(event)).await;
+            }
+            while events.changed().await.is_ok() {
+                let event = events.borrow().clone();
+                let Some(event) = event else {
+                    continue;
+                };
+                if socket.send(WsMessage::Text(event)).await.is_err() {
+                    break;
+                }
+            }
+        })
+        .into_response()
+    }
+
+    async fn evm_receipt_watch_handler(
+        State(state): State<EvmReceiptWatcherMockState>,
+        Json(request): Json<evm_receipt_watcher_client::WatchRequest>,
+    ) -> Response {
+        if request.chain != state.chain {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("unexpected chain {}", request.chain)
+                })),
+            )
+                .into_response();
+        }
+        let tx_hash = format!("{:#x}", request.tx_hash);
+        let event = serde_json::json!({
+            "chain": request.chain,
+            "tx_hash": tx_hash,
+            "requesting_operation_id": request.requesting_operation_id,
+            "status": "confirmed",
+            "receipt": evm_receipt_json(&tx_hash),
+            "logs": []
+        });
+        state
+            .events
+            .send(Some(event.to_string()))
+            .expect("send EVM receipt event");
+        Json(evm_receipt_watcher_client::WatchResponse {
+            chain: state.chain,
+            tx_hash: request.tx_hash,
+            requesting_operation_id: request.requesting_operation_id,
+            watched: true,
+        })
+        .into_response()
+    }
+
+    fn evm_receipt_json(tx_hash: &str) -> Value {
+        serde_json::json!({
+            "transactionHash": tx_hash,
+            "blockHash": "0x4acbdefb861ef4adedb135ca52865f6743451bfbfa35db78076f881a40401a5e",
+            "blockNumber": "0x129f4b9",
+            "logsBloom": format!("0x{}", "0".repeat(512)),
+            "gasUsed": "0xbde1",
+            "contractAddress": null,
+            "cumulativeGasUsed": "0xa42aec",
+            "transactionIndex": "0x7f",
+            "from": "0x9a53bfba35269414f3b2d20b52ca01b15932c7b2",
+            "to": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+            "type": "0x2",
+            "effectiveGasPrice": "0xfb0f6e8c9",
+            "logs": [],
+            "status": "0x1"
+        })
+    }
+
+    #[derive(Clone)]
+    struct BitcoinReceiptWatcherMockState {
+        tx: Transaction,
+        events: watch::Sender<Option<String>>,
+    }
+
+    struct BitcoinReceiptWatcherMockServer {
+        base_url: String,
+        handle: JoinHandle<()>,
+    }
+
+    impl BitcoinReceiptWatcherMockServer {
+        fn base_url(&self) -> &str {
+            &self.base_url
+        }
+    }
+
+    impl Drop for BitcoinReceiptWatcherMockServer {
+        fn drop(&mut self) {
+            self.handle.abort();
+        }
+    }
+
+    async fn spawn_bitcoin_receipt_watcher_server(
+        tx: Transaction,
+    ) -> BitcoinReceiptWatcherMockServer {
+        let (events, _) = watch::channel(None);
+        let state = BitcoinReceiptWatcherMockState { tx, events };
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Bitcoin receipt watcher mock server");
+        let addr = listener.local_addr().expect("Bitcoin receipt watcher addr");
+        let app = Router::new()
+            .route("/subscribe", get(bitcoin_receipt_subscribe_handler))
+            .route("/watch", post(bitcoin_receipt_watch_handler))
+            .with_state(state);
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("Bitcoin receipt watcher mock server should run");
+        });
+        BitcoinReceiptWatcherMockServer {
+            base_url: format!("http://{addr}"),
+            handle,
+        }
+    }
+
+    async fn bitcoin_receipt_subscribe_handler(
+        State(state): State<BitcoinReceiptWatcherMockState>,
+        ws: WebSocketUpgrade,
+    ) -> Response {
+        ws.on_upgrade(move |mut socket| async move {
+            let mut events = state.events.subscribe();
+            let initial_event = events.borrow().clone();
+            if let Some(event) = initial_event {
+                let _ = socket.send(WsMessage::Text(event)).await;
+            }
+            while events.changed().await.is_ok() {
+                let event = events.borrow().clone();
+                let Some(event) = event else {
+                    continue;
+                };
+                if socket.send(WsMessage::Text(event)).await.is_err() {
+                    break;
+                }
+            }
+        })
+        .into_response()
+    }
+
+    async fn bitcoin_receipt_watch_handler(
+        State(state): State<BitcoinReceiptWatcherMockState>,
+        Json(request): Json<bitcoin_receipt_watcher_client::WatchRequest>,
+    ) -> Response {
+        if request.chain != "bitcoin" {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("unexpected chain {}", request.chain)
+                })),
+            )
+                .into_response();
+        }
+        let event = bitcoin_receipt_watcher_client::WatchEvent {
+            chain: request.chain.clone(),
+            txid: request.txid,
+            requesting_operation_id: request.requesting_operation_id.clone(),
+            status: bitcoin_receipt_watcher_client::WatchStatus::Confirmed,
+            receipt: Some(bitcoin_receipt_watcher_client::Receipt {
+                tx: state.tx,
+                block_hash: "0000000000000000000000000000000000000000000000000000000000000002"
+                    .parse()
+                    .expect("block hash"),
+                block_height: 840_000,
+                confirmations: 6,
+            }),
+        };
+        state
+            .events
+            .send(Some(
+                serde_json::to_string(&event).expect("serialize Bitcoin receipt event"),
+            ))
+            .expect("send Bitcoin receipt event");
+        Json(bitcoin_receipt_watcher_client::WatchResponse {
+            chain: request.chain,
+            txid: request.txid,
+            requesting_operation_id: request.requesting_operation_id,
+            watched: true,
+        })
+        .into_response()
+    }
+
+    #[derive(Clone)]
+    struct HlTransfersMockState {
+        event: HlTransferEvent,
+    }
+
+    struct HlTransfersMockServer {
+        base_url: String,
+        handle: JoinHandle<()>,
+    }
+
+    impl HlTransfersMockServer {
+        fn base_url(&self) -> &str {
+            &self.base_url
+        }
+    }
+
+    impl Drop for HlTransfersMockServer {
+        fn drop(&mut self) {
+            self.handle.abort();
+        }
+    }
+
+    async fn spawn_hl_transfers_server(event: HlTransferEvent) -> HlTransfersMockServer {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind HL transfers mock server");
+        let addr = listener.local_addr().expect("HL transfers addr");
+        let app = Router::new()
+            .route("/transfers", get(hl_transfers_handler))
+            .with_state(HlTransfersMockState { event });
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("HL transfers mock server should run");
+        });
+        HlTransfersMockServer {
+            base_url: format!("http://{addr}"),
+            handle,
+        }
+    }
+
+    async fn hl_transfers_handler(State(state): State<HlTransfersMockState>) -> Response {
+        Json(serde_json::json!({
+            "events": [state.event],
+            "next_cursor": "",
+            "has_more": false
+        }))
+        .into_response()
     }
 }

@@ -48,9 +48,9 @@ sol! {
 
 #[derive(Clone)]
 pub struct EvmReceiptObserverClients {
-    ethereum: Option<Arc<EvmReceiptWatcherClient>>,
-    base: Option<Arc<EvmReceiptWatcherClient>>,
-    arbitrum: Option<Arc<EvmReceiptWatcherClient>>,
+    pub(crate) ethereum: Option<Arc<EvmReceiptWatcherClient>>,
+    pub(crate) base: Option<Arc<EvmReceiptWatcherClient>>,
+    pub(crate) arbitrum: Option<Arc<EvmReceiptWatcherClient>>,
 }
 
 impl EvmReceiptObserverClients {
@@ -68,7 +68,7 @@ impl EvmReceiptObserverClients {
         }))
     }
 
-    fn client_for_chain(&self, chain_id: &str) -> Option<Arc<EvmReceiptWatcherClient>> {
+    pub(crate) fn client_for_chain(&self, chain_id: &str) -> Option<Arc<EvmReceiptWatcherClient>> {
         match evm_chain_number(chain_id) {
             Some(1) => self.ethereum.clone(),
             Some(8453) => self.base.clone(),

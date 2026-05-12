@@ -836,6 +836,18 @@ pub struct HyperUnitDepositCreditedEvidence {
     pub hyperunit_source_tx_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hyperunit_destination_tx_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_chain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evm_source_chain_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evm_source_tx_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evm_source_block_number: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evm_source_block_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evm_source_status: Option<bool>,
     pub hl_user: String,
     pub hl_amount: String,
     pub hl_credit_hash: String,
@@ -855,6 +867,10 @@ pub struct HyperUnitWithdrawalAcknowledgedEvidence {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub amount: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_chain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_tx_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub btc_tx_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub broadcast_at: Option<String>,
@@ -872,10 +888,27 @@ pub struct HyperUnitWithdrawalSettledEvidence {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub amount: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_chain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_tx_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub btc_tx_hash: Option<String>,
-    pub btc_vout: u64,
-    pub btc_amount: String,
-    pub btc_confirmations: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub btc_vout: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub btc_amount: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub btc_confirmations: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evm_chain_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evm_tx_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evm_block_number: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evm_block_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evm_status: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

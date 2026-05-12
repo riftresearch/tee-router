@@ -399,6 +399,17 @@ fn build_hyperunit_observer_task(
         .as_deref()
         .expect("checked HyperLiquid shim URL is configured");
     let bitcoin_clients = bitcoin_clients.expect("checked Bitcoin clients are configured");
+    let evm_receipt_clients = EvmReceiptObserverClients::from_args(args)?;
+    if evm_receipt_clients.is_none() {
+        warn!(
+            missing = ?[
+                "ETHEREUM_RECEIPT_WATCHER_URL",
+                "BASE_RECEIPT_WATCHER_URL",
+                "ARBITRUM_RECEIPT_WATCHER_URL",
+            ],
+            "HyperUnit observer started without EVM receipt watcher clients; EVM-source deposits and EVM-destination withdrawals will only emit preliminary hints."
+        );
+    }
     let unit_client = hyperunit_client::HyperUnitClient::new_with_proxy_url(
         hyperunit_url,
         args.hyperunit_proxy_url.clone(),
@@ -411,6 +422,7 @@ fn build_hyperunit_observer_task(
         unit_client,
         hl_client,
         bitcoin_clients,
+        evm_receipt_clients,
     )))
 }
 

@@ -1153,6 +1153,89 @@ fn unit_operation_source_is_bitcoin(operation: &OrderProviderOperation) -> bool 
         .is_some_and(|chain| chain.eq_ignore_ascii_case("bitcoin"))
 }
 
+fn unit_operation_destination_chain(operation: &OrderProviderOperation) -> Option<&str> {
+    operation
+        .request
+        .get("dst_chain")
+        .or_else(|| operation.request.get("destination_chain"))
+        .and_then(Value::as_str)
+}
+
+fn unit_chain_is_bitcoin(chain: &str) -> bool {
+    chain.eq_ignore_ascii_case("bitcoin")
+}
+
+fn unit_chain_is_evm(chain: &str) -> bool {
+    matches!(
+        chain.to_ascii_lowercase().as_str(),
+        "ethereum" | "eth" | "base" | "arbitrum" | "arb"
+    )
+}
+
+fn validate_hyperunit_withdrawal_settlement_chain(
+    operation: &OrderProviderOperation,
+    evidence: &HyperUnitWithdrawalSettledEvidence,
+) -> Result<(), OrderActivityError> {
+    let request_chain = unit_operation_destination_chain(operation);
+    if request_chain.is_some_and(unit_chain_is_bitcoin)
+        || evidence.btc_tx_hash.is_some()
+        || evidence.btc_vout.is_some()
+    {
+        validate_hyperunit_btc_confirmations(
+            "HyperUnitWithdrawalSettled",
+            evidence.btc_confirmations.unwrap_or(0),
+        )?;
+        if evidence.btc_vout.is_none() {
+            return Err(OrderActivityError::hint_verification(
+                "HyperUnitWithdrawalSettled",
+                "Bitcoin settlement evidence missing btc_vout",
+            ));
+        }
+        if evidence.btc_amount.as_deref().is_none_or(str::is_empty) {
+            return Err(OrderActivityError::hint_verification(
+                "HyperUnitWithdrawalSettled",
+                "Bitcoin settlement evidence missing btc_amount",
+            ));
+        }
+        return Ok(());
+    }
+
+    if request_chain.is_some_and(unit_chain_is_evm)
+        || evidence.evm_tx_hash.is_some()
+        || evidence.evm_chain_id.is_some()
+    {
+        if evidence.evm_status != Some(true) {
+            return Err(OrderActivityError::hint_verification(
+                "HyperUnitWithdrawalSettled",
+                "EVM settlement evidence is not successful",
+            ));
+        }
+        return Ok(());
+    }
+
+    Err(OrderActivityError::hint_verification(
+        "HyperUnitWithdrawalSettled",
+        "settlement evidence does not identify a supported destination chain",
+    ))
+}
+
+fn hyperunit_withdrawal_settlement_tx_hash(
+    evidence: &HyperUnitWithdrawalSettledEvidence,
+) -> Result<String, OrderActivityError> {
+    evidence
+        .destination_tx_hash
+        .clone()
+        .or_else(|| evidence.evm_tx_hash.clone())
+        .or_else(|| evidence.btc_tx_hash.clone())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            OrderActivityError::hint_verification(
+                "HyperUnitWithdrawalSettled",
+                "settlement evidence missing destination transaction hash",
+            )
+        })
+}
+
 fn validate_hyperunit_btc_confirmations(
     label: &'static str,
     confirmations: u64,
@@ -1935,7 +2018,10 @@ pub(super) async fn verify_hyperunit_withdrawal_acknowledged_hint(
             provider_ref: Some(evidence.protocol_address.clone()),
             observed_state: typed_evidence_state("hyperunit_withdrawal_acknowledged", evidence)?,
             response: None,
-            tx_hash: evidence.btc_tx_hash.clone(),
+            tx_hash: evidence
+                .destination_tx_hash
+                .clone()
+                .or_else(|| evidence.btc_tx_hash.clone()),
         },
     )
     .await
@@ -1973,7 +2059,7 @@ pub(super) async fn verify_hyperunit_withdrawal_settled_hint(
         operation.request.get("dst_addr").and_then(Value::as_str),
         &evidence.destination_address,
     )?;
-    validate_hyperunit_btc_confirmations("HyperUnitWithdrawalSettled", evidence.btc_confirmations)?;
+    validate_hyperunit_withdrawal_settlement_chain(&operation, evidence)?;
     if let Some(amount) = evidence.amount.as_deref() {
         validate_hyperunit_request_amount_gte(
             "HyperUnitWithdrawalSettled amount",
@@ -1981,16 +2067,7 @@ pub(super) async fn verify_hyperunit_withdrawal_settled_hint(
             amount,
         )?;
     }
-    let Some(tx_hash) = evidence
-        .btc_tx_hash
-        .clone()
-        .filter(|value| !value.trim().is_empty())
-    else {
-        return Err(OrderActivityError::hint_verification(
-            "HyperUnitWithdrawalSettled",
-            "settlement evidence missing btc_tx_hash",
-        ));
-    };
+    let tx_hash = hyperunit_withdrawal_settlement_tx_hash(evidence)?;
     complete_provider_operation_from_typed_hint(
         deps,
         &input,
@@ -2002,8 +2079,12 @@ pub(super) async fn verify_hyperunit_withdrawal_settled_hint(
             response: Some(json!({
                 "kind": "hyperunit_withdrawal_settled",
                 "protocol_address": &evidence.protocol_address,
-                "btc_tx_hash": &tx_hash,
+                "destination_chain": &evidence.destination_chain,
+                "destination_tx_hash": &tx_hash,
+                "btc_tx_hash": &evidence.btc_tx_hash,
                 "btc_vout": evidence.btc_vout,
+                "evm_chain_id": &evidence.evm_chain_id,
+                "evm_tx_hash": &evidence.evm_tx_hash,
                 "destination_address": &evidence.destination_address,
             })),
             tx_hash: Some(tx_hash),
