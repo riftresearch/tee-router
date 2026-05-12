@@ -72,6 +72,7 @@ const USD_MICRO: u128 = 1_000_000;
 const DEFAULT_ETH_USD_MICRO: u128 = 3_000 * USD_MICRO;
 const DEFAULT_BTC_USD_MICRO: u128 = 100_000 * USD_MICRO;
 const DEFAULT_USD_STABLE_USD_MICRO: u128 = USD_MICRO;
+const MOCK_UNIT_DESTINATION_TX_CONFIRMATIONS: u64 = 10;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MockAssetRef {
@@ -1058,7 +1059,7 @@ impl MockIntegratorServer {
                     Utc::now().timestamp_millis()
                 )),
                 source_tx_confirmations: None,
-                destination_tx_confirmations: Some(10),
+                destination_tx_confirmations: Some(MOCK_UNIT_DESTINATION_TX_CONFIRMATIONS),
                 position_in_withdraw_queue: None,
                 broadcast_at: Some(now.clone()),
                 asset: Some("eth".to_string()),
@@ -6448,7 +6449,12 @@ async fn complete_mock_unit_operation_with_observation(
         if entry.operation.source_tx_hash.is_none() {
             entry.operation.source_tx_hash = Some(default_mock_unit_source_tx_hash(entry));
         }
-        if entry.operation.destination_tx_hash.is_none() {
+        let release_requires_real_destination_tx =
+            matches!(entry.kind, MockUnitOperationKind::Withdrawal)
+                && (matches!(entry.dst_chain, UnitChain::Ethereum | UnitChain::Base)
+                    && matches!(entry.asset, UnitAsset::Eth)
+                    || entry.dst_chain == UnitChain::Bitcoin && entry.asset == UnitAsset::Btc);
+        if entry.operation.destination_tx_hash.is_none() && !release_requires_real_destination_tx {
             entry.operation.destination_tx_hash =
                 Some(default_mock_unit_destination_tx_hash(entry));
         }
@@ -6463,7 +6469,7 @@ async fn complete_mock_unit_operation_with_observation(
             entry.operation.sweep_fee_amount = Some(sweep_fee_amount);
         }
         entry.operation.source_tx_confirmations = None;
-        entry.operation.destination_tx_confirmations = Some(10);
+        entry.operation.destination_tx_confirmations = Some(MOCK_UNIT_DESTINATION_TX_CONFIRMATIONS);
         let maybe_deposit_credit = match entry.kind {
             MockUnitOperationKind::Deposit if matches!(entry.dst_chain, UnitChain::Hyperliquid) => {
                 let user = Address::from_str(&entry.dst_addr).map_err(|err| {
@@ -6629,11 +6635,46 @@ async fn send_mock_unit_evm_withdrawal_release(
         ));
     }
 
-    mock_credit_native_on_anvil(state, &rpc_url, destination, amount)
+    let provider = ProviderBuilder::new()
+        .connect(&rpc_url)
         .await
-        .map_err(|err| format!("mock Unit withdrawal release native credit failed: {err}"))?;
+        .map_err(|err| format!("mock Unit withdrawal release RPC init failed: {err}"))?;
+    let sender = provider
+        .get_accounts()
+        .await
+        .map_err(|err| format!("mock Unit withdrawal release get_accounts failed: {err}"))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "mock Unit withdrawal release requires one unlocked account".to_string())?;
+    let tx = TransactionRequest::default()
+        .with_from(sender)
+        .with_to(destination)
+        .with_value(amount);
+    let tx_lock = evm_unlocked_account_tx_lock(state, &rpc_url).await;
+    let _tx_guard = tx_lock.lock().await;
+    let receipt = provider
+        .send_transaction(tx)
+        .await
+        .map_err(|err| format!("mock Unit withdrawal release send_transaction failed: {err}"))?
+        .get_receipt()
+        .await
+        .map_err(|err| format!("mock Unit withdrawal release receipt failed: {err}"))?;
+    if !receipt.status() {
+        return Err(format!(
+            "mock Unit withdrawal release transaction failed: {:#x}",
+            receipt.transaction_hash
+        ));
+    }
+    if MOCK_UNIT_DESTINATION_TX_CONFIRMATIONS > 1 {
+        provider
+            .anvil_mine(Some(MOCK_UNIT_DESTINATION_TX_CONFIRMATIONS - 1), None)
+            .await
+            .map_err(|err| {
+                format!("mock Unit withdrawal release confirmation mining failed: {err}")
+            })?;
+    }
 
-    Ok(mock_unit_evm_withdrawal_release_tx_hash(release))
+    Ok(format!("{:#x}", receipt.transaction_hash))
 }
 
 async fn send_mock_unit_bitcoin_withdrawal_release(
@@ -6689,19 +6730,6 @@ async fn send_mock_unit_bitcoin_withdrawal_release(
         .await
         .map_err(|err| format!("mock Unit Bitcoin withdrawal mining failed: {err}"))?;
     Ok(txid.to_string())
-}
-
-fn mock_unit_evm_withdrawal_release_tx_hash(release: &MockUnitEvmWithdrawalRelease) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"mock-unit-evm-withdrawal-release|");
-    hasher.update(release.protocol_address.as_bytes());
-    hasher.update(b"|");
-    hasher.update(release.dst_chain.as_wire_str().as_bytes());
-    hasher.update(b"|");
-    hasher.update(release.dst_addr.as_bytes());
-    hasher.update(b"|");
-    hasher.update(release.amount.as_bytes());
-    format!("0x{}", hex::encode(hasher.finalize()))
 }
 
 fn parse_unit_decimal_amount_to_raw(value: &str, decimals: u8) -> Result<U256, String> {
@@ -8433,7 +8461,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unit_mock_eth_withdrawal_releases_native_funds_on_destination_chain() {
+    async fn unit_mock_eth_withdrawal_releases_native_funds_with_real_destination_tx() {
         use alloy::node_bindings::Anvil;
 
         let anvil = Anvil::new().try_spawn().expect("anvil spawn");
@@ -8457,11 +8485,6 @@ mod tests {
         .expect("gen json");
 
         let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
-        let unlocked_sender = anvil.addresses()[0];
-        provider
-            .anvil_set_balance(unlocked_sender, U256::ZERO)
-            .await
-            .expect("zero unlocked sender balance");
 
         complete_mock_unit_operation_with_observation(
             &server.state,
@@ -8479,11 +8502,6 @@ mod tests {
             .await
             .expect("recipient balance");
         assert_eq!(balance, U256::from(1_250_000_000_000_000_000_u128));
-        let unlocked_balance = provider
-            .get_balance(unlocked_sender)
-            .await
-            .expect("unlocked sender balance");
-        assert_eq!(unlocked_balance, U256::ZERO);
 
         let operations: UnitOperationsResponse = reqwest::get(format!(
             "{}/operations/{}",
@@ -8503,6 +8521,24 @@ mod tests {
             .expect("destination tx hash");
         assert!(tx_hash.starts_with("0x"));
         assert_eq!(tx_hash.len(), 66);
+        assert_eq!(
+            operations.operations[0].destination_tx_confirmations,
+            Some(MOCK_UNIT_DESTINATION_TX_CONFIRMATIONS)
+        );
+
+        let tx_hash = B256::from_str(tx_hash).expect("destination tx hash parses");
+        let receipt = provider
+            .get_transaction_receipt(tx_hash)
+            .await
+            .expect("receipt lookup")
+            .expect("destination receipt exists");
+        assert!(receipt.status());
+        let tx_block = receipt.block_number.expect("receipt block number");
+        let current_block = provider.get_block_number().await.expect("current block");
+        assert_eq!(
+            current_block - tx_block + 1,
+            MOCK_UNIT_DESTINATION_TX_CONFIRMATIONS
+        );
     }
 
     #[tokio::test]

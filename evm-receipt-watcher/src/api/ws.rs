@@ -1,6 +1,9 @@
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
+use std::{
+    error::Error as StdError,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
 };
 
 use axum::extract::ws::{Message, WebSocket};
@@ -36,7 +39,14 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Ok(_)) => {}
                     Some(Err(error)) => {
-                        tracing::warn!(?error, "EVM receipt watcher websocket receive failed");
+                        if websocket_reset_without_closing_handshake(&error) {
+                            tracing::debug!(
+                                ?error,
+                                "EVM receipt watcher websocket closed without close frame"
+                            );
+                        } else {
+                            tracing::warn!(?error, "EVM receipt watcher websocket receive failed");
+                        }
                         break;
                     }
                 }
@@ -85,4 +95,44 @@ async fn send_json<T: Serialize>(
 #[derive(Serialize)]
 struct WsError {
     error: String,
+}
+
+fn websocket_reset_without_closing_handshake(error: &axum::Error) -> bool {
+    let mut source: Option<&(dyn StdError + 'static)> = Some(error);
+    while let Some(error) = source {
+        if error
+            .to_string()
+            .contains("reset without closing handshake")
+        {
+            return true;
+        }
+        source = error.source();
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+
+    #[test]
+    fn websocket_reset_without_closing_handshake_matches_source_chain() {
+        let error = axum::Error::new(io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            "Connection reset without closing handshake",
+        ));
+
+        assert!(websocket_reset_without_closing_handshake(&error));
+    }
+
+    #[test]
+    fn websocket_reset_without_closing_handshake_rejects_other_errors() {
+        let error = axum::Error::new(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "unexpected eof",
+        ));
+
+        assert!(!websocket_reset_without_closing_handshake(&error));
+    }
 }
