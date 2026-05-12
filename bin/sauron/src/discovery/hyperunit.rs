@@ -928,9 +928,13 @@ fn expected_hl_credit_amount(operation: &UnitOperation) -> Option<String> {
     let net = source
         .saturating_sub(destination_fee)
         .saturating_sub(sweep_fee);
-    Some(raw_to_decimal(
+    let expected = raw_to_decimal(
         net,
         unit_asset_decimals(operation.asset.as_deref()?),
+    );
+    Some(truncate_decimal(
+        &expected,
+        usize::from(hyperliquid_client::wire::WIRE_DECIMALS),
     ))
 }
 
@@ -960,6 +964,20 @@ fn raw_to_decimal(raw: u128, decimals: u8) -> String {
         whole.to_string()
     } else {
         format!("{whole}.{fraction}")
+    }
+}
+
+fn truncate_decimal(value: &str, max_fraction: usize) -> String {
+    match value.split_once('.') {
+        Some((whole, fraction)) if fraction.len() > max_fraction => {
+            let fraction = fraction[..max_fraction].trim_end_matches('0');
+            if fraction.is_empty() {
+                whole.to_string()
+            } else {
+                format!("{whole}.{fraction}")
+            }
+        }
+        _ => value.to_string(),
     }
 }
 
@@ -1231,6 +1249,40 @@ mod tests {
         assert_eq!(format!("{parsed_hash:#x}"), tx_hash);
         assert_eq!(log_index, Some(0));
         assert!(parse_evm_tx_hash(&format!("{tx_hash}:0"), EvmTxHashParseMode::Plain).is_none());
+    }
+
+    #[test]
+    fn expected_hl_credit_amount_truncates_eth_to_hl_wire_precision() {
+        let operation = unit_operation_with_amount("eth", "57507271000000000");
+
+        assert_eq!(
+            expected_hl_credit_amount(&operation).as_deref(),
+            Some("0.05750727")
+        );
+    }
+
+    #[test]
+    fn expected_hl_credit_amount_preserves_btc_wire_precision() {
+        let operation = unit_operation_with_amount("btc", "12345678");
+
+        assert_eq!(
+            expected_hl_credit_amount(&operation).as_deref(),
+            Some("0.12345678")
+        );
+    }
+
+    #[test]
+    fn truncate_decimal_limits_fraction_and_trims_trailing_zeroes() {
+        assert_eq!(truncate_decimal("0.057507271", 8), "0.05750727");
+        assert_eq!(truncate_decimal("0.0575072700000", 8), "0.05750727");
+    }
+
+    #[test]
+    fn btc_source_deposit_credit_comparison_matches_exact_wire_amount() {
+        let operation = unit_operation_with_amount("btc", "12345678");
+        let expected = expected_hl_credit_amount(&operation).expect("expected amount");
+
+        assert!(decimal_strings_equal("0.12345678", &expected));
     }
 
     #[tokio::test]
@@ -1620,6 +1672,19 @@ mod tests {
             "sourceTxHash": source_tx_hash,
             "destinationTxHash": destination_tx_hash,
             "broadcastAt": "2026-05-12T00:00:00Z"
+        }))
+        .expect("unit operation")
+    }
+
+    fn unit_operation_with_amount(asset: &str, source_amount: &str) -> UnitOperation {
+        serde_json::from_value(serde_json::json!({
+            "operationId": "unit-op-amount",
+            "protocolAddress": "0x73c1d4b7add80c7cfea60a997c615064a424a844",
+            "sourceChain": "ethereum",
+            "destinationChain": "hyperliquid",
+            "sourceAmount": source_amount,
+            "asset": asset,
+            "state": "done"
         }))
         .expect("unit operation")
     }

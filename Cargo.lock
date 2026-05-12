@@ -6655,6 +6655,7 @@ dependencies = [
  "evm-token-indexer-client",
  "hl-shim-client",
  "hl-shim-indexer",
+ "hyperliquid-client",
  "hyperunit-client",
  "metrics",
  "observability",

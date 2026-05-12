@@ -22,6 +22,7 @@ evm-indexer-client = { workspace = true }
 evm-receipt-watcher-client = { workspace = true }
 evm-token-indexer-client = { workspace = true }
 hl-shim-client = { workspace = true }
+hyperliquid-client = { workspace = true }
 hyperunit-client = { workspace = true }
 observability = { workspace = true }
 router-core = { workspace = true }
