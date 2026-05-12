@@ -321,9 +321,11 @@ fn build_hyperliquid_observer_task(
     router_client: RouterClient,
 ) -> Result<BoxedSauronTask> {
     let Some(url) = args.hl_shim_indexer_url.as_deref() else {
-        return Ok(Box::pin(async {
-            std::future::pending::<Result<()>>().await
-        }));
+        warn!(
+            missing = ?["HL_SHIM_INDEXER_URL"],
+            "HyperLiquid observer disabled; required configuration missing. Set the listed env vars to enable observation."
+        );
+        return Ok(disabled_observer_task());
     };
     let hl_client = HlShimClient::new(url).map_err(|source| Error::HlShim { source })?;
     let arbitrum_token_indexer = match args.arbitrum_token_indexer_url.as_deref() {
@@ -348,9 +350,15 @@ fn build_evm_receipt_observer_task(
     router_client: RouterClient,
 ) -> Result<BoxedSauronTask> {
     let Some(clients) = EvmReceiptObserverClients::from_args(args)? else {
-        return Ok(Box::pin(async {
-            std::future::pending::<Result<()>>().await
-        }));
+        warn!(
+            missing = ?[
+                "ETHEREUM_RECEIPT_WATCHER_URL",
+                "BASE_RECEIPT_WATCHER_URL",
+                "ARBITRUM_RECEIPT_WATCHER_URL",
+            ],
+            "EVM receipt observer disabled; no receipt watcher URLs configured. Set at least one listed env var to enable observation."
+        );
+        return Ok(disabled_observer_task());
     };
     Ok(Box::pin(run_evm_receipt_observer_loop(
         clients,
@@ -365,15 +373,32 @@ fn build_hyperunit_observer_task(
     router_client: RouterClient,
     bitcoin_clients: Option<BitcoinClients>,
 ) -> Result<BoxedSauronTask> {
-    let (Some(hyperunit_url), Some(hl_url), Some(bitcoin_clients)) = (
-        args.hyperunit_api_url.as_deref(),
-        args.hl_shim_indexer_url.as_deref(),
-        bitcoin_clients,
-    ) else {
-        return Ok(Box::pin(async {
-            std::future::pending::<Result<()>>().await
-        }));
-    };
+    let missing = [
+        ("HYPERUNIT_API_URL", args.hyperunit_api_url.is_none()),
+        ("HL_SHIM_INDEXER_URL", args.hl_shim_indexer_url.is_none()),
+        (
+            "BITCOIN_RPC_URL (or BitcoinClients init)",
+            bitcoin_clients.is_none(),
+        ),
+    ];
+    let missing_names = missing_config_names(&missing);
+    if !missing_names.is_empty() {
+        warn!(
+            missing = ?missing_names,
+            "HyperUnit observer disabled; required configuration missing. Orders using HyperUnit (e.g. *->BTC, BTC->*) will stall at unit_withdrawal/unit_deposit. Set the listed env vars to enable observation."
+        );
+        return Ok(disabled_observer_task());
+    }
+
+    let hyperunit_url = args
+        .hyperunit_api_url
+        .as_deref()
+        .expect("checked HyperUnit API URL is configured");
+    let hl_url = args
+        .hl_shim_indexer_url
+        .as_deref()
+        .expect("checked HyperLiquid shim URL is configured");
+    let bitcoin_clients = bitcoin_clients.expect("checked Bitcoin clients are configured");
     let unit_client = hyperunit_client::HyperUnitClient::new_with_proxy_url(
         hyperunit_url,
         args.hyperunit_proxy_url.clone(),
@@ -387,6 +412,17 @@ fn build_hyperunit_observer_task(
         hl_client,
         bitcoin_clients,
     )))
+}
+
+fn disabled_observer_task() -> BoxedSauronTask {
+    Box::pin(async { std::future::pending::<Result<()>>().await })
+}
+
+fn missing_config_names<'a>(missing: &'a [(&'a str, bool)]) -> Vec<&'a str> {
+    missing
+        .iter()
+        .filter_map(|(name, is_missing)| if *is_missing { Some(*name) } else { None })
+        .collect()
 }
 
 async fn run_cdc_loop(
@@ -688,6 +724,21 @@ mod tests {
 
         args.token_indexer_api_key = Some("token-indexer-api-key-000000000000".to_string());
         validate_token_indexer_api_key(&args).unwrap();
+    }
+
+    #[test]
+    fn hyperunit_observer_missing_config_preserves_disabled_fallback() {
+        let args = test_sauron_args();
+        let router_client = RouterClient::new(&args).expect("test router client should build");
+
+        let result = build_hyperunit_observer_task(
+            &args,
+            ProviderOperationWatchStore::default(),
+            router_client,
+            None,
+        );
+
+        assert!(result.is_ok());
     }
 
     #[test]
