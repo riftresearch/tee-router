@@ -99,16 +99,13 @@ fn record_venue_request(
 }
 
 pub fn record_order_workflow_event(order: &RouterOrder, event: &'static str) {
-    let span = order_workflow_span(order, event);
-    span.in_scope(|| {
-        info!(
-            order_id = %order.id,
-            order_status = order.status.to_db_string(),
-            workflow_trace_id = %order.workflow_trace_id,
-            workflow_event = event,
-            "Router order workflow event",
-        );
-    });
+    info!(
+        order_id = %order.id,
+        order_status = order.status.to_db_string(),
+        workflow_trace_id = %order.workflow_trace_id,
+        workflow_event = event,
+        "Router order workflow event",
+    );
 }
 
 pub fn record_execution_step_workflow_event(
@@ -116,21 +113,18 @@ pub fn record_execution_step_workflow_event(
     step: &OrderExecutionStep,
     event: &'static str,
 ) {
-    let span = order_workflow_span(order, event);
-    span.in_scope(|| {
-        info!(
-            order_id = %order.id,
-            step_id = %step.id,
-            execution_attempt_id = %step.execution_attempt_id.map(|id| id.to_string()).unwrap_or_default(),
-            step_index = step.step_index,
-            step_type = step.step_type.to_db_string(),
-            step_status = step.status.to_db_string(),
-            provider = %step.provider,
-            workflow_trace_id = %order.workflow_trace_id,
-            workflow_event = event,
-            "Router order execution-step workflow event",
-        );
-    });
+    info!(
+        order_id = %order.id,
+        step_id = %step.id,
+        execution_attempt_id = %step.execution_attempt_id.map(|id| id.to_string()).unwrap_or_default(),
+        step_index = step.step_index,
+        step_type = step.step_type.to_db_string(),
+        step_status = step.status.to_db_string(),
+        provider = %step.provider,
+        workflow_trace_id = %order.workflow_trace_id,
+        workflow_event = event,
+        "Router order execution-step workflow event",
+    );
 }
 
 pub fn record_provider_operation_workflow_event(
@@ -138,22 +132,19 @@ pub fn record_provider_operation_workflow_event(
     operation: &OrderProviderOperation,
     event: &'static str,
 ) {
-    let span = order_workflow_span(order, event);
-    span.in_scope(|| {
-        info!(
-            order_id = %order.id,
-            provider_operation_id = %operation.id,
-            execution_attempt_id = %operation.execution_attempt_id.map(|id| id.to_string()).unwrap_or_default(),
-            execution_step_id = %operation.execution_step_id.map(|id| id.to_string()).unwrap_or_default(),
-            provider = %operation.provider,
-            provider_operation_type = operation.operation_type.to_db_string(),
-            provider_operation_status = operation.status.to_db_string(),
-            provider_ref = operation.provider_ref.as_deref().unwrap_or_default(),
-            workflow_trace_id = %order.workflow_trace_id,
-            workflow_event = event,
-            "Router provider-operation workflow event",
-        );
-    });
+    info!(
+        order_id = %order.id,
+        provider_operation_id = %operation.id,
+        execution_attempt_id = %operation.execution_attempt_id.map(|id| id.to_string()).unwrap_or_default(),
+        execution_step_id = %operation.execution_step_id.map(|id| id.to_string()).unwrap_or_default(),
+        provider = %operation.provider,
+        provider_operation_type = operation.operation_type.to_db_string(),
+        provider_operation_status = operation.status.to_db_string(),
+        provider_ref = operation.provider_ref.as_deref().unwrap_or_default(),
+        workflow_trace_id = %order.workflow_trace_id,
+        workflow_event = event,
+        "Router provider-operation workflow event",
+    );
 }
 
 pub fn record_provider_operation_hint_workflow_event(
@@ -162,37 +153,18 @@ pub fn record_provider_operation_hint_workflow_event(
     operation: &OrderProviderOperation,
     event: &'static str,
 ) {
-    let span = order_workflow_span(order, event);
-    span.in_scope(|| {
-        info!(
-            order_id = %order.id,
-            provider_operation_id = %operation.id,
-            provider_operation_hint_id = %hint.id,
-            provider = %operation.provider,
-            provider_operation_type = operation.operation_type.to_db_string(),
-            hint_source = %hint.source,
-            hint_status = hint.status.to_db_string(),
-            workflow_trace_id = %order.workflow_trace_id,
-            workflow_event = event,
-            "Router provider-operation hint workflow event",
-        );
-    });
-}
-
-fn order_workflow_span(order: &RouterOrder, event: &'static str) -> tracing::Span {
-    let span = tracing::info_span!(
-        "router.order.workflow",
+    info!(
         order_id = %order.id,
-        order_status = order.status.to_db_string(),
+        provider_operation_id = %operation.id,
+        provider_operation_hint_id = %hint.id,
+        provider = %operation.provider,
+        provider_operation_type = operation.operation_type.to_db_string(),
+        hint_source = %hint.source,
+        hint_status = hint.status.to_db_string(),
         workflow_trace_id = %order.workflow_trace_id,
         workflow_event = event,
+        "Router provider-operation hint workflow event",
     );
-    let context = observability::WorkflowTraceContext {
-        trace_id: order.workflow_trace_id.clone(),
-        parent_span_id: order.workflow_parent_span_id.clone(),
-    };
-    let _ = observability::set_workflow_parent(&span, &context);
-    span
 }
 
 pub fn record_vault_created(vault: &DepositVault) {

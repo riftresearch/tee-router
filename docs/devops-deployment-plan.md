@@ -434,8 +434,8 @@ stack keeps these endpoints private on the compose network:
 - `router-api:9100`
 - `router-worker:9101`
 
-Local development uses the Alloy, VictoriaMetrics, Loki, Tempo, and Grafana
-compose overlay:
+Local development uses the Alloy, VictoriaMetrics, Loki, and Grafana compose
+overlay:
 
 ```sh
 docker compose \
@@ -450,15 +450,14 @@ That overlay runs Alloy locally. Alloy scrapes:
 - `router-worker:9101`
 - `sauron:9102`
 
-and forwards metrics to VictoriaMetrics. Router services also send OTLP
-logs/traces to Alloy, which forwards logs to Loki and traces to Tempo. Grafana
-is provisioned with all three datasources and the local dashboard at
+and forwards metrics to VictoriaMetrics. Router services also send OTLP logs to
+Alloy, which forwards logs to Loki. Grafana is provisioned with metrics and log
+datasources and the local dashboard at
 `http://localhost:3002/d/tee-router-local-overview/tee-router-local-overview`.
 
 OpenTelemetry export remains a generic runtime capability in the Rust
 observability helper. It is disabled unless `OTEL_EXPORTER_OTLP_ENDPOINT`,
-`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, or `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` is
-set by a deployment.
+or `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` is set by a deployment.
 
 Railway private networking can require IPv6 wildcard listeners. The Rust
 observability helper keeps the operator-facing `METRICS_BIND_ADDR=0.0.0.0:9102`

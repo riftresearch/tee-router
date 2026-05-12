@@ -90,7 +90,7 @@ temporalio-sdk = { version = "0.4.0", default-features = false }
 temporalio-sdk-core = { version = "0.4.0", default-features = false }
 tonic = { version = "0.14", default-features = false, features = ["transport", "codegen", "tls-ring", "tls-webpki-roots"] }
 axum = { version = "0.7", features = ["ws"] }
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["cors"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 uuid = { version = "1.10", features = ["v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -119,11 +119,10 @@ metrics = "0.23.1"
 pgwire-replication = "0.3.1"
 percent-encoding = "2.3"
 metrics-exporter-prometheus = { version = "0.15.3", default-features = false, features = ["http-listener"] }
-opentelemetry = { version = "0.31.0", default-features = false, features = ["trace", "logs"] }
-opentelemetry-appender-tracing = { version = "0.31.1", default-features = false, features = ["experimental_use_tracing_span_context"] }
-opentelemetry-otlp = { version = "0.31.1", default-features = false, features = ["http-proto", "reqwest-blocking-client", "reqwest-rustls-webpki-roots", "trace", "logs"] }
-opentelemetry_sdk = { version = "0.31.0", default-features = false, features = ["trace", "logs", "rt-tokio"] }
-tracing-opentelemetry = { version = "0.32.1", default-features = false, features = ["tracing-log"] }
+opentelemetry = { version = "0.31.0", default-features = false, features = ["logs"] }
+opentelemetry-appender-tracing = { version = "0.31.1", default-features = false }
+opentelemetry-otlp = { version = "0.31.1", default-features = false, features = ["http-proto", "reqwest-blocking-client", "reqwest-rustls-webpki-roots", "logs"] }
+opentelemetry_sdk = { version = "0.31.0", default-features = false, features = ["logs", "rt-tokio"] }
 mock_instant = "0.6.0"
 libc = "0.2.176"
 dotenvy = "0.15"

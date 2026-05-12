@@ -5,7 +5,7 @@ use reqwest::{
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
 use std::time::{Duration, Instant};
-use tracing::{debug, instrument};
+use tracing::debug;
 use url::Url;
 
 #[derive(Debug, Snafu)]
@@ -76,7 +76,6 @@ impl ChainalysisAddressScreener {
         Ok(Self { host, token, http })
     }
 
-    #[instrument(level = "debug", skip(self))]
     pub async fn get_address_risk(&self, address: &str) -> Result<AddressRiskResponse> {
         let url = self.address_risk_url(address)?;
         debug!(%url, "fetching entity");
