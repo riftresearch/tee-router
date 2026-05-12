@@ -3,8 +3,11 @@ import { erc20TransferRaw } from "ponder:schema";
 import { and, desc, eq, gte } from "ponder";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
-import { timingSafeEqual } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
+import http, { type IncomingMessage } from "node:http";
+import type { Socket } from "node:net";
 import pg from "pg";
+import { WebSocket, WebSocketServer, type RawData } from "ws";
 
 const app = new Hono();
 const schemaName = process.env.DATABASE_SCHEMA ?? process.env.PONDER_SCHEMA;
@@ -56,10 +59,23 @@ const MAX_WATCH_SYNC_SIZE = 50_000;
 const MAX_PENDING_CANDIDATES_LIMIT = 1_000;
 const DEFAULT_TRANSFER_LOOKUP_LIMIT = 50;
 const MAX_TRANSFER_LOOKUP_LIMIT = 250;
+const DEFAULT_TRANSFERS_LIMIT = 100;
+const MAX_TRANSFERS_LIMIT = 1_000;
 const MAX_DECIMAL_STRING_LENGTH = 78;
+const U64_MAX = (1n << 64n) - 1n;
 const MAX_API_BODY_BYTES = 64 * 1024 * 1024;
 const MAX_CANDIDATE_ID_LENGTH = 512;
 const MAX_CANDIDATE_ERROR_LENGTH = 2_048;
+const MAX_PRUNE_RELEVANT_ADDRESSES = 100_000;
+const MAX_SUBSCRIBE_FILTER_VALUES = 1_000;
+const DEFAULT_REORG_SAFE_BLOCKS = 1_000;
+const WS_PATH = "/subscribe";
+const WS_SLOW_SUBSCRIBER_BUFFER_BYTES = parsePositiveInteger(
+  process.env.EVM_TOKEN_INDEXER_WS_MAX_BUFFERED_BYTES,
+  "EVM_TOKEN_INDEXER_WS_MAX_BUFFERED_BYTES",
+  1024 * 1024,
+  64 * 1024 * 1024,
+);
 const WATCH_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const CANDIDATE_ID_PATTERN = /^[A-Za-z0-9._:-]+$/;
 
@@ -124,6 +140,7 @@ const rawRetentionSeconds = () =>
 const activeWatchTable = tableName("active_deposit_watch");
 const rawTransferTable = tableName("erc20_transfer_raw");
 const candidateTable = tableName("detected_deposit_candidate");
+const transferNotifyChannel = `evm_token_indexer_transfer_${chainId}`;
 
 type NormalizedWatchPayload = {
   watch_id: string;
@@ -136,6 +153,51 @@ type NormalizedWatchPayload = {
   created_at: string;
   updated_at: string;
   expires_at: string;
+};
+
+type TransferRow = {
+  id: string;
+  chain_id: number;
+  token_address: string;
+  from_address: string;
+  to_address: string;
+  amount: string;
+  transaction_hash: string;
+  block_number: string;
+  block_hash: string;
+  log_index: number;
+  block_timestamp: string;
+};
+
+type EvmTransfer = {
+  id: string;
+  chainId: number;
+  tokenAddress: string;
+  fromAddress: string;
+  toAddress: string;
+  amount: string;
+  transactionHash: string;
+  blockNumber: string;
+  blockHash: string;
+  logIndex: number;
+  blockTimestamp: string;
+};
+
+type Cursor = {
+  blockNumber: string;
+  logIndex: number;
+};
+
+type SubscribeFilter = {
+  tokenAddresses: Set<string>;
+  recipientAddresses: Set<string>;
+  minAmount?: bigint;
+  maxAmount?: bigint;
+};
+
+type Subscription = {
+  id: string;
+  filter: SubscribeFilter;
 };
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -203,6 +265,26 @@ function parseQueryInteger(
   return parsed;
 }
 
+function parseOptionalU64(value: string | undefined, field: string) {
+  if (value === undefined || value.length === 0) return undefined;
+  return parseU64(value, field);
+}
+
+function parseU64(value: unknown, field: string) {
+  if (typeof value !== "string" && typeof value !== "number") {
+    throw new Error(`${field} must be a u64 integer`);
+  }
+  const raw = typeof value === "number" ? value.toString() : value;
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(`${field} must be a u64 integer`);
+  }
+  const parsed = BigInt(raw);
+  if (parsed > U64_MAX) {
+    throw new Error(`${field} must be <= ${U64_MAX.toString()}`);
+  }
+  return raw;
+}
+
 function parseDecimalString(value: unknown, field: string) {
   if (
     typeof value !== "string" ||
@@ -216,11 +298,74 @@ function parseDecimalString(value: unknown, field: string) {
   return value;
 }
 
+function parseOptionalDecimalString(value: unknown, field: string) {
+  if (value === undefined || value === null || value === "") return undefined;
+  return parseDecimalString(value, field);
+}
+
 function parseHexAddress(value: unknown, field: string) {
   if (typeof value !== "string" || !/^0x[0-9a-fA-F]{40}$/.test(value)) {
     throw new Error(`${field} must be a 20-byte hex address`);
   }
   return normalizeAddress(value);
+}
+
+function parseHexAddressArray(value: unknown, field: string, max: number) {
+  if (!Array.isArray(value)) {
+    throw new Error(`${field} must be an array`);
+  }
+  if (value.length > max) {
+    throw new Error(`${field} must contain at most ${max} addresses`);
+  }
+  const seen = new Set<string>();
+  for (const [index, item] of value.entries()) {
+    seen.add(parseHexAddress(item, `${field}[${index}]`));
+  }
+  return [...seen];
+}
+
+function transferFromRow(row: TransferRow): EvmTransfer {
+  return {
+    id: row.id,
+    chainId: row.chain_id,
+    tokenAddress: row.token_address,
+    fromAddress: row.from_address,
+    toAddress: row.to_address,
+    amount: row.amount,
+    transactionHash: row.transaction_hash,
+    blockNumber: row.block_number,
+    blockHash: row.block_hash,
+    logIndex: row.log_index,
+    blockTimestamp: row.block_timestamp,
+  };
+}
+
+function encodeCursor(cursor: Cursor) {
+  return Buffer.from(`${cursor.blockNumber}:${cursor.logIndex}`).toString("base64url");
+}
+
+function decodeCursor(value: string | undefined) {
+  if (value === undefined || value.length === 0) return undefined;
+  let decoded: string;
+  try {
+    decoded = Buffer.from(value, "base64url").toString("utf8");
+  } catch {
+    throw new Error("cursor must be an opaque base64url cursor");
+  }
+  const parts = decoded.split(":");
+  if (parts.length !== 2 || !parts[0] || !parts[1]) {
+    throw new Error("cursor is malformed");
+  }
+  const blockNumber = parseU64(parts[0], "cursor.block_number");
+  const rawLogIndex = parts[1];
+  if (!/^\d+$/.test(rawLogIndex)) {
+    throw new Error("cursor.log_index must be a non-negative integer");
+  }
+  const logIndex = Number(rawLogIndex);
+  if (!Number.isSafeInteger(logIndex) || logIndex < 0) {
+    throw new Error("cursor.log_index must be a safe non-negative integer");
+  }
+  return { blockNumber, logIndex };
 }
 
 function parseWatchPayloads(value: unknown): NormalizedWatchPayload[] {
@@ -363,6 +508,41 @@ const materializeCandidates = async () => {
     `,
     [chainId, nowSeconds()],
   );
+};
+
+const reorgSafeBlocks = () =>
+  parsePositiveInteger(
+    process.env.EVM_TOKEN_INDEXER_REORG_SAFE_BLOCKS,
+    "EVM_TOKEN_INDEXER_REORG_SAFE_BLOCKS",
+    DEFAULT_REORG_SAFE_BLOCKS,
+    1_000_000,
+  );
+
+const pruneTransfers = async (relevantAddresses: string[], beforeBlock: string) => {
+  const result = await pool.query(
+    `
+    DELETE FROM ${rawTransferTable}
+    WHERE chain_id = $1
+      AND block_number < $2::numeric
+      AND NOT (to_address = ANY($3::text[]))
+    `,
+    [chainId, beforeBlock, relevantAddresses],
+  );
+  console.info(
+    `accepted prune completed: pruned=${result.rowCount ?? 0} before_block=${beforeBlock}`,
+  );
+};
+
+const latestIndexedBlock = async () => {
+  const result = await pool.query<{ head_block: string | null }>(
+    `
+    SELECT max(block_number)::text AS head_block
+    FROM ${rawTransferTable}
+    WHERE chain_id = $1
+    `,
+    [chainId],
+  );
+  return result.rows[0]?.head_block ?? null;
 };
 
 app.put("/watches", async (c) => {
@@ -620,6 +800,152 @@ app.post("/maintenance/prune-raw", async (c) => {
   return c.json({ pruned: result.rowCount ?? 0, cutoff: cutoff.toString() });
 });
 
+app.get("/transfers", async (c) => {
+  let toAddress: string;
+  let tokenAddress: string | undefined;
+  let fromBlock: string | undefined;
+  let minAmount: string | undefined;
+  let maxAmount: string | undefined;
+  let cursor: Cursor | undefined;
+  try {
+    toAddress = parseHexAddress(c.req.query("to"), "to");
+    const token = c.req.query("token");
+    tokenAddress =
+      token === undefined || token.length === 0
+        ? undefined
+        : parseHexAddress(token, "token");
+    fromBlock = parseOptionalU64(c.req.query("from_block"), "from_block");
+    minAmount = parseOptionalDecimalString(c.req.query("min_amount"), "min_amount");
+    maxAmount = parseOptionalDecimalString(c.req.query("max_amount"), "max_amount");
+    if (
+      minAmount !== undefined &&
+      maxAmount !== undefined &&
+      BigInt(minAmount) > BigInt(maxAmount)
+    ) {
+      throw new Error("min_amount cannot exceed max_amount");
+    }
+    cursor = decodeCursor(c.req.query("cursor"));
+  } catch (error) {
+    return badRequest(error instanceof Error ? error.message : "invalid transfer query");
+  }
+
+  const limit = parseQueryInteger(
+    c.req.query("limit"),
+    DEFAULT_TRANSFERS_LIMIT,
+    MAX_TRANSFERS_LIMIT,
+  );
+  if (limit === undefined) {
+    return badRequest(`limit must be a positive integer <= ${MAX_TRANSFERS_LIMIT}`);
+  }
+
+  const params: unknown[] = [chainId, toAddress];
+  const conditions = ["chain_id = $1", "to_address = $2"];
+  if (tokenAddress !== undefined) {
+    params.push(tokenAddress);
+    conditions.push(`token_address = $${params.length}`);
+  }
+  if (fromBlock !== undefined) {
+    params.push(fromBlock);
+    conditions.push(`block_number >= $${params.length}::numeric`);
+  }
+  if (minAmount !== undefined) {
+    params.push(minAmount);
+    conditions.push(`amount >= $${params.length}::numeric`);
+  }
+  if (maxAmount !== undefined) {
+    params.push(maxAmount);
+    conditions.push(`amount <= $${params.length}::numeric`);
+  }
+  if (cursor !== undefined) {
+    params.push(cursor.blockNumber, cursor.logIndex);
+    const blockParam = params.length - 1;
+    const logParam = params.length;
+    conditions.push(
+      `(block_number > $${blockParam}::numeric OR (block_number = $${blockParam}::numeric AND log_index > $${logParam}))`,
+    );
+  }
+  params.push(limit + 1);
+
+  const result = await pool.query<TransferRow>(
+    `
+    SELECT
+      id,
+      chain_id,
+      token_address,
+      from_address,
+      to_address,
+      amount::text,
+      transaction_hash,
+      block_number::text,
+      block_hash,
+      log_index,
+      block_timestamp::text
+    FROM ${rawTransferTable}
+    WHERE ${conditions.join("\n      AND ")}
+    ORDER BY block_number ASC, log_index ASC
+    LIMIT $${params.length}
+    `,
+    params,
+  );
+
+  const rows = result.rows.slice(0, limit);
+  const hasMore = result.rows.length > limit;
+  const last = rows.at(-1);
+  return c.json({
+    transfers: rows.map(transferFromRow),
+    nextCursor:
+      hasMore && last
+        ? encodeCursor({ blockNumber: last.block_number, logIndex: last.log_index })
+        : null,
+    hasMore,
+  });
+});
+
+app.post("/prune", async (c) => {
+  const body = (await c.req.json().catch(() => undefined)) as unknown;
+  let relevantAddresses: string[];
+  let beforeBlock: string;
+  try {
+    if (!isRecord(body)) {
+      throw new Error("request body must be an object");
+    }
+    relevantAddresses = parseHexAddressArray(
+      body.relevant_addresses,
+      "relevant_addresses",
+      MAX_PRUNE_RELEVANT_ADDRESSES,
+    );
+    beforeBlock = parseU64(body.before_block, "before_block");
+  } catch (error) {
+    return badRequest(error instanceof Error ? error.message : "invalid prune request");
+  }
+
+  const headBlock = await latestIndexedBlock();
+  if (headBlock === null) {
+    return c.json({ error: "cannot prune before any indexed transfer exists" }, 409);
+  }
+
+  const horizon = BigInt(reorgSafeBlocks());
+  const highestPrunableBlock = BigInt(headBlock) > horizon ? BigInt(headBlock) - horizon : 0n;
+  if (BigInt(beforeBlock) > highestPrunableBlock) {
+    return badRequest(
+      `before_block must be <= indexed head (${headBlock}) - reorg horizon (${horizon.toString()})`,
+    );
+  }
+
+  setImmediate(() => {
+    void pruneTransfers(relevantAddresses, beforeBlock).catch((error) => {
+      console.warn("accepted prune failed", error);
+    });
+  });
+
+  return c.json({
+    accepted: true,
+    beforeBlock,
+    relevantAddressCount: relevantAddresses.length,
+    reorgSafeBlocks: horizon.toString(),
+  });
+});
+
 app.get("/transfers/to/:address", async (c) => {
   let address: `0x${string}`;
   try {
@@ -684,5 +1010,293 @@ app.get("/transfers/to/:address", async (c) => {
     })),
   });
 });
+
+const wsServer = new WebSocketServer({ noServer: true });
+const subscriptions = new Map<WebSocket, Subscription>();
+const attachedServers = new WeakSet<http.Server>();
+
+function startWebSocketUpgradeHandler() {
+  if (process.env.EVM_TOKEN_INDEXER_DISABLE_WS === "true") return;
+
+  wsServer.on("connection", (socket) => {
+    socket.on("message", (data) => handleWebSocketMessage(socket, data));
+    socket.on("close", () => subscriptions.delete(socket));
+    socket.on("error", () => subscriptions.delete(socket));
+  });
+
+  startTransferNotificationListener();
+
+  const attach = () => {
+    const handles =
+      (process as NodeJS.Process & { _getActiveHandles?: () => unknown[] })
+        ._getActiveHandles?.() ?? [];
+    let attached = false;
+    for (const handle of handles) {
+      if (!isHttpServer(handle) || attachedServers.has(handle)) continue;
+      handle.on("upgrade", handleUpgrade);
+      attachedServers.add(handle);
+      attached = true;
+    }
+    return attached;
+  };
+
+  attach();
+  const timer = setInterval(attach, 1_000);
+  timer.unref?.();
+}
+
+function isHttpServer(value: unknown): value is http.Server {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Partial<http.Server>;
+  return (
+    typeof candidate.on === "function" &&
+    typeof candidate.address === "function" &&
+    typeof candidate.listeners === "function"
+  );
+}
+
+function handleUpgrade(request: IncomingMessage, socket: Socket, head: Buffer) {
+  if (requestPath(request) !== WS_PATH) return;
+
+  if (!isUpgradeAuthorized(request)) {
+    socket.write(
+      "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\nContent-Length: 0\r\n\r\n",
+    );
+    socket.destroy();
+    return;
+  }
+
+  wsServer.handleUpgrade(request, socket, head, (ws) => {
+    wsServer.emit("connection", ws, request);
+  });
+}
+
+function requestPath(request: IncomingMessage) {
+  try {
+    return new URL(
+      request.url ?? "/",
+      `http://${request.headers.host ?? "localhost"}`,
+    ).pathname;
+  } catch {
+    return undefined;
+  }
+}
+
+function isUpgradeAuthorized(request: IncomingMessage) {
+  const authorization = Array.isArray(request.headers.authorization)
+    ? request.headers.authorization[0]
+    : request.headers.authorization;
+
+  if (apiKey && isAuthorizedBearer(authorization, apiKey)) return true;
+  return !apiKey && allowUnauthenticated;
+}
+
+function handleWebSocketMessage(socket: WebSocket, data: RawData) {
+  const text = rawDataToString(data);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    sendWebSocketJson(socket, {
+      kind: "error",
+      error: error instanceof Error ? `invalid JSON frame: ${error.message}` : "invalid JSON frame",
+    });
+    return;
+  }
+
+  if (isRecord(parsed) && parsed.action === "unsubscribe") {
+    const subscription = subscriptions.get(socket);
+    subscriptions.delete(socket);
+    sendWebSocketJson(socket, {
+      kind: "unsubscribed",
+      subscription_id: subscription?.id ?? null,
+    });
+    return;
+  }
+
+  try {
+    const filter = parseSubscribeMessage(parsed);
+    const subscription = { id: randomUUID(), filter };
+    subscriptions.set(socket, subscription);
+    sendWebSocketJson(socket, {
+      kind: "subscribed",
+      subscription_id: subscription.id,
+    });
+  } catch (error) {
+    sendWebSocketJson(socket, {
+      kind: "error",
+      error: error instanceof Error ? error.message : "invalid subscribe frame",
+    });
+  }
+}
+
+function rawDataToString(data: RawData) {
+  if (typeof data === "string") return data;
+  if (Buffer.isBuffer(data)) return data.toString("utf8");
+  if (Array.isArray(data)) return Buffer.concat(data).toString("utf8");
+  return Buffer.from(data).toString("utf8");
+}
+
+function parseSubscribeMessage(value: unknown): SubscribeFilter {
+  const payload =
+    isRecord(value) && value.action === "subscribe" ? value.filter : value;
+  if (!isRecord(payload)) {
+    throw new Error("subscribe frame must contain a filter object");
+  }
+
+  const tokenAddresses = parseHexAddressArray(
+    payload.token_addresses,
+    "filter.token_addresses",
+    MAX_SUBSCRIBE_FILTER_VALUES,
+  );
+  const recipientAddresses = parseHexAddressArray(
+    payload.recipient_addresses,
+    "filter.recipient_addresses",
+    MAX_SUBSCRIBE_FILTER_VALUES,
+  );
+  if (tokenAddresses.length === 0) {
+    throw new Error("filter.token_addresses must not be empty");
+  }
+  if (recipientAddresses.length === 0) {
+    throw new Error("filter.recipient_addresses must not be empty");
+  }
+
+  const minAmount = parseOptionalDecimalString(payload.min_amount, "filter.min_amount");
+  const maxAmount = parseOptionalDecimalString(payload.max_amount, "filter.max_amount");
+  if (
+    minAmount !== undefined &&
+    maxAmount !== undefined &&
+    BigInt(minAmount) > BigInt(maxAmount)
+  ) {
+    throw new Error("filter.min_amount cannot exceed filter.max_amount");
+  }
+
+  return {
+    tokenAddresses: new Set(tokenAddresses),
+    recipientAddresses: new Set(recipientAddresses),
+    minAmount: minAmount === undefined ? undefined : BigInt(minAmount),
+    maxAmount: maxAmount === undefined ? undefined : BigInt(maxAmount),
+  };
+}
+
+function startTransferNotificationListener() {
+  const connect = async () => {
+    const client = new pg.Client({
+      connectionString: databaseUrl,
+      application_name: "evm-token-indexer-ws-listener",
+    });
+    let reconnecting = false;
+
+    const reconnect = () => {
+      if (reconnecting) return;
+      reconnecting = true;
+      void client.end().catch(() => undefined);
+      setTimeout(() => {
+        void connect();
+      }, 1_000).unref?.();
+    };
+
+    client.on("notification", (message) => {
+      if (message.channel !== transferNotifyChannel || !message.payload) return;
+      let transfer: EvmTransfer;
+      try {
+        transfer = parseTransferNotification(JSON.parse(message.payload));
+      } catch (error) {
+        console.warn("invalid transfer notification", error);
+        return;
+      }
+      broadcastTransfer(transfer);
+    });
+    client.on("error", (error) => {
+      console.warn("transfer notification listener failed", error);
+      reconnect();
+    });
+    client.on("end", reconnect);
+
+    try {
+      await client.connect();
+      await client.query(`LISTEN ${quoteIdentifier(transferNotifyChannel)}`);
+    } catch (error) {
+      console.warn("transfer notification listener failed to start", error);
+      reconnect();
+    }
+  };
+
+  void connect();
+}
+
+function parseTransferNotification(value: unknown): EvmTransfer {
+  if (!isRecord(value)) {
+    throw new Error("transfer notification must be an object");
+  }
+  return {
+    id: requireString(value.id, "id"),
+    chainId: Number(parseU64(value.chainId, "chainId")),
+    tokenAddress: parseHexAddress(value.tokenAddress, "tokenAddress"),
+    fromAddress: parseHexAddress(value.fromAddress, "fromAddress"),
+    toAddress: parseHexAddress(value.toAddress, "toAddress"),
+    amount: parseDecimalString(value.amount, "amount"),
+    transactionHash: requireHex(value.transactionHash, "transactionHash", 32),
+    blockNumber: parseU64(value.blockNumber, "blockNumber"),
+    blockHash: requireHex(value.blockHash, "blockHash", 32),
+    logIndex: Number(parseU64(value.logIndex, "logIndex")),
+    blockTimestamp: parseU64(value.blockTimestamp, "blockTimestamp"),
+  };
+}
+
+function requireString(value: unknown, field: string) {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`${field} must be a non-empty string`);
+  }
+  return value;
+}
+
+function requireHex(value: unknown, field: string, bytes: number) {
+  if (
+    typeof value !== "string" ||
+    !new RegExp(`^0x[0-9a-fA-F]{${bytes * 2}}$`).test(value)
+  ) {
+    throw new Error(`${field} must be a ${bytes}-byte hex string`);
+  }
+  return value.toLowerCase();
+}
+
+function broadcastTransfer(transfer: EvmTransfer) {
+  for (const [socket, subscription] of subscriptions) {
+    if (socket.readyState !== WebSocket.OPEN) {
+      subscriptions.delete(socket);
+      continue;
+    }
+    if (!transferMatchesFilter(transfer, subscription.filter)) continue;
+    sendWebSocketJson(socket, { kind: "transfer", event: transfer });
+  }
+}
+
+function transferMatchesFilter(transfer: EvmTransfer, filter: SubscribeFilter) {
+  if (!filter.tokenAddresses.has(transfer.tokenAddress)) return false;
+  if (!filter.recipientAddresses.has(transfer.toAddress)) return false;
+  const amount = BigInt(transfer.amount);
+  if (filter.minAmount !== undefined && amount < filter.minAmount) return false;
+  if (filter.maxAmount !== undefined && amount > filter.maxAmount) return false;
+  return true;
+}
+
+function sendWebSocketJson(socket: WebSocket, value: unknown) {
+  if (socket.readyState !== WebSocket.OPEN) return false;
+  if (socket.bufferedAmount > WS_SLOW_SUBSCRIBER_BUFFER_BYTES) {
+    subscriptions.delete(socket);
+    socket.close(1013, "subscriber too slow");
+    return false;
+  }
+  socket.send(JSON.stringify(value), (error) => {
+    if (error) {
+      subscriptions.delete(socket);
+      socket.close(1011, "send failed");
+    }
+  });
+  return true;
+}
+
+startWebSocketUpgradeHandler();
 
 export default app;

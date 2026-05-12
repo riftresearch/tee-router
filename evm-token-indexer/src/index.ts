@@ -64,6 +64,28 @@ const tableName = (table: string) =>
 const activeWatchTable = tableName("active_deposit_watch");
 const candidateTable = tableName("detected_deposit_candidate");
 const nowSeconds = () => Math.floor(Date.now() / 1000).toString();
+const transferNotifyChannel = `evm_token_indexer_transfer_${validatedChainId}`;
+
+type TransferNotification = {
+  id: string;
+  chainId: number;
+  tokenAddress: `0x${string}`;
+  fromAddress: `0x${string}`;
+  toAddress: `0x${string}`;
+  amount: string;
+  transactionHash: `0x${string}`;
+  blockNumber: string;
+  blockHash: `0x${string}`;
+  logIndex: number;
+  blockTimestamp: string;
+};
+
+const publishTransfer = async (transfer: TransferNotification) => {
+  await pool.query("SELECT pg_notify($1, $2)", [
+    transferNotifyChannel,
+    JSON.stringify(transfer),
+  ]);
+};
 
 ponder.on("erc20:Transfer", async ({ event, context }) => {
   const tokenAddress = normalizeAddress(event.log.address);
@@ -157,4 +179,20 @@ ponder.on("erc20:Transfer", async ({ event, context }) => {
       nowSeconds(),
     ],
   );
+
+  await publishTransfer({
+    id: event.id,
+    chainId: validatedChainId,
+    tokenAddress,
+    fromAddress,
+    toAddress,
+    amount: amount.toString(),
+    transactionHash,
+    blockNumber: blockNumber.toString(),
+    blockHash,
+    logIndex: transferIndex,
+    blockTimestamp: blockTimestamp.toString(),
+  }).catch((error) => {
+    console.warn("failed to publish transfer notification", error);
+  });
 });
