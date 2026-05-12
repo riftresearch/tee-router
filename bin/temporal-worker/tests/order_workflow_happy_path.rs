@@ -52,6 +52,7 @@ use router_server::{
     api::{CreateOrderRequest, CreateVaultRequest, MarketOrderQuoteKind, MarketOrderQuoteRequest},
     services::{order_manager::OrderManager, vault_manager::VaultManager},
 };
+use router_temporal::{CctpReceiveObservedEvidence, VeloraSwapSettledEvidence};
 use serde_json::{json, Value};
 use sqlx_core::connection::Connection;
 use sqlx_postgres::{PgConnectOptions, PgConnection, PgPool};
@@ -1819,6 +1820,23 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
                     "send manual intervention signal",
                 );
             }
+            let should_signal_primary_velora =
+                should_signal_primary_velora_settled_hint(&options);
+            if should_signal_primary_velora
+                && matches!(
+                    options.route,
+                    WorkflowRoute::VeloraBaseEthToBaseUsdc
+                        | WorkflowRoute::VeloraBaseEthToBaseUsdcExactOut
+                )
+            {
+                signal_order_velora_settled(
+                    &client,
+                    &db_for_workflow,
+                    &workflow_id,
+                    order_id,
+                )
+                .await;
+            }
             if matches!(options.route, WorkflowRoute::AcrossBaseEthToEthereumUsdc) {
                 let handle_before_hint = client.get_workflow_handle::<OrderWorkflow>(&workflow_id);
                 let across_operation = tokio::select! {
@@ -1888,6 +1906,15 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
                     signal_result,
                     "send Across provider-operation hint signal",
                 );
+                if should_signal_primary_velora {
+                    signal_order_velora_settled(
+                        &client,
+                        &db_for_workflow,
+                        &workflow_id,
+                        order_id,
+                    )
+                    .await;
+                }
             }
             if matches!(
                 options.route,
@@ -1913,6 +1940,24 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
                 }
                 signal_order_cctp_attestation(&client, &workflow_id, order_id, cctp_operation)
                     .await;
+                signal_order_cctp_receive_observed(
+                    &client,
+                    &db_for_workflow,
+                    &workflow_id,
+                    order_id,
+                )
+                .await;
+                if should_signal_primary_velora
+                    && matches!(options.route, WorkflowRoute::CctpBaseUsdcToArbitrumEth)
+                {
+                    signal_order_velora_settled(
+                        &client,
+                        &db_for_workflow,
+                        &workflow_id,
+                        order_id,
+                    )
+                    .await;
+                }
             }
             if matches!(
                 options.route,
@@ -1976,6 +2021,12 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
                     true,
                 )
                 .await;
+                signal_external_custody_refund_velora_settled(
+                    &client,
+                    &db_for_workflow,
+                    order_id,
+                )
+                .await;
             }
             if options.expect_external_custody_cctp_refund {
                 signal_external_custody_refund_cctp_attestation(
@@ -1983,6 +2034,20 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
                     &db_for_workflow,
                     &mocks,
                     &workflow_id,
+                    order_id,
+                )
+                .await;
+                signal_external_custody_refund_cctp_receive_observed(
+                    &client,
+                    &db_for_workflow,
+                    order_id,
+                )
+                .await;
+            }
+            if options.expect_external_custody_velora_refund {
+                signal_external_custody_refund_velora_settled(
+                    &client,
+                    &db_for_workflow,
                     order_id,
                 )
                 .await;
@@ -2605,10 +2670,12 @@ async fn wait_for_provider_operation_status(
         }) {
             return operation;
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for provider operation {operation_type:?} on order {order_id} to reach {status:?}"
-        );
+        if tokio::time::Instant::now() >= deadline {
+            let state = workflow_state_summary(db, order_id).await;
+            panic!(
+                "timed out waiting for provider operation {operation_type:?} on order {order_id} to reach {status:?}\n{state}"
+            );
+        }
         sleep(Duration::from_millis(250)).await;
     }
 }
@@ -2624,6 +2691,77 @@ fn assert_signal_sent_or_workflow_completed<T, E: std::fmt::Debug>(
             "{context}: {debug}"
         );
     }
+}
+
+fn should_signal_primary_velora_settled_hint(options: &WorkflowOptions) -> bool {
+    if options.refreshed_eth_usd_micro.is_some() {
+        return false;
+    }
+    if options.velora_transaction_failures >= EXECUTE_STEP_TEMPORAL_ATTEMPTS * 2 {
+        return false;
+    }
+    if matches!(
+        options.manual_intervention_action,
+        Some(
+            ManualInterventionTestAction::TriggerRefund
+                | ManualInterventionTestAction::AcknowledgeUnrecoverable
+        )
+    ) {
+        return false;
+    }
+    matches!(
+        options.route,
+        WorkflowRoute::VeloraBaseEthToBaseUsdc
+            | WorkflowRoute::VeloraBaseEthToBaseUsdcExactOut
+            | WorkflowRoute::AcrossBaseEthToEthereumUsdc
+            | WorkflowRoute::CctpBaseUsdcToArbitrumEth
+    )
+}
+
+async fn signal_order_velora_settled(
+    client: &Client,
+    db: &Database,
+    workflow_id: &str,
+    order_id: Uuid,
+) {
+    let handle_before_hint = client.get_workflow_handle::<OrderWorkflow>(workflow_id);
+    let operation = tokio::select! {
+        operation = wait_for_provider_operation_status(
+            db,
+            order_id,
+            ProviderOperationType::UniversalRouterSwap,
+            ProviderOperationStatus::WaitingExternal,
+            Duration::from_secs(180),
+        ) => operation,
+        result = handle_before_hint.get_result(WorkflowGetResultOptions::default()) => {
+            let state = workflow_state_summary(db, order_id).await;
+            panic!("OrderWorkflow ended before the Velora provider operation reached WaitingExternal: {result:?}\n{state}");
+        }
+    };
+    let evidence = velora_swap_settled_evidence(&operation);
+    let signal_result = handle_before_hint
+        .signal(
+            OrderWorkflow::provider_operation_hint,
+            ProviderOperationHintSignal {
+                order_id: order_id.into(),
+                execution_step_id: operation
+                    .execution_step_id
+                    .expect("Velora operation should carry execution_step_id")
+                    .into(),
+                hint_id: Uuid::now_v7().into(),
+                provider_operation_id: Some(operation.id.into()),
+                provider: ProviderKind::Exchange,
+                hint_kind: ProviderHintKind::VeloraSwapSettled,
+                provider_ref: operation.provider_ref.clone(),
+                evidence: Some(ProviderOperationHintEvidence::VeloraSwapSettled(evidence)),
+            },
+            WorkflowSignalOptions::default(),
+        )
+        .await;
+    assert_signal_sent_or_workflow_completed(
+        signal_result,
+        "send VeloraSwapSettled provider-operation hint signal",
+    );
 }
 
 async fn wait_for_order_cctp_burn(
@@ -2688,6 +2826,52 @@ async fn signal_order_cctp_attestation(
     assert_signal_sent_or_workflow_completed(
         signal_result,
         "send CCTP provider-operation hint signal",
+    );
+}
+
+async fn signal_order_cctp_receive_observed(
+    client: &Client,
+    db: &Database,
+    workflow_id: &str,
+    order_id: Uuid,
+) {
+    let handle_before_hint = client.get_workflow_handle::<OrderWorkflow>(workflow_id);
+    let operation = tokio::select! {
+        operation = wait_for_provider_operation_with_ref(
+            db,
+            order_id,
+            None,
+            ProviderOperationType::CctpReceive,
+            Duration::from_secs(180),
+        ) => operation,
+        result = handle_before_hint.get_result(WorkflowGetResultOptions::default()) => {
+            let state = workflow_state_summary(db, order_id).await;
+            panic!("OrderWorkflow ended before the CCTP receive provider operation was persisted with provider_ref: {result:?}\n{state}");
+        }
+    };
+    let evidence = cctp_receive_observed_evidence(&operation);
+    let signal_result = handle_before_hint
+        .signal(
+            OrderWorkflow::provider_operation_hint,
+            ProviderOperationHintSignal {
+                order_id: order_id.into(),
+                execution_step_id: operation
+                    .execution_step_id
+                    .expect("CCTP receive operation should carry execution_step_id")
+                    .into(),
+                hint_id: Uuid::now_v7().into(),
+                provider_operation_id: Some(operation.id.into()),
+                provider: ProviderKind::Bridge,
+                hint_kind: ProviderHintKind::CctpReceiveObserved,
+                provider_ref: operation.provider_ref.clone(),
+                evidence: Some(ProviderOperationHintEvidence::CctpReceiveObserved(evidence)),
+            },
+            WorkflowSignalOptions::default(),
+        )
+        .await;
+    assert_signal_sent_or_workflow_completed(
+        signal_result,
+        "send CctpReceiveObserved provider-operation hint signal",
     );
 }
 
@@ -2800,6 +2984,79 @@ fn raw_usdc_to_decimal_string(raw: &str) -> String {
         whole.to_string()
     } else {
         format!("{whole}.{fraction}")
+    }
+}
+
+fn provider_operation_provider_ref(
+    operation: &OrderProviderOperation,
+    context: &'static str,
+) -> String {
+    operation
+        .provider_ref
+        .clone()
+        .unwrap_or_else(|| panic!("{context} operation should carry provider_ref"))
+}
+
+fn provider_operation_request_str(
+    operation: &OrderProviderOperation,
+    field: &'static str,
+    context: &'static str,
+) -> String {
+    operation
+        .request
+        .get(field)
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .unwrap_or_else(|| panic!("{context} operation request should carry {field}"))
+}
+
+fn provider_operation_request_str_any(
+    operation: &OrderProviderOperation,
+    fields: &[&'static str],
+) -> Option<String> {
+    fields.iter().find_map(|field| {
+        operation
+            .request
+            .get(field)
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+    })
+}
+
+fn velora_swap_settled_evidence(operation: &OrderProviderOperation) -> VeloraSwapSettledEvidence {
+    let amount_out =
+        provider_operation_request_str_any(operation, &["amount_out", "min_amount_out"]).expect(
+            "VeloraSwapSettled operation request should carry amount_out or min_amount_out",
+        );
+    VeloraSwapSettledEvidence {
+        tx_hash: provider_operation_provider_ref(operation, "VeloraSwapSettled"),
+        log_index: 0,
+        amount_out,
+        recipient: provider_operation_request_str(
+            operation,
+            "recipient_address",
+            "VeloraSwapSettled",
+        ),
+        executor: None,
+        token_address: None,
+        block_number: None,
+    }
+}
+
+fn cctp_receive_observed_evidence(
+    operation: &OrderProviderOperation,
+) -> CctpReceiveObservedEvidence {
+    CctpReceiveObservedEvidence {
+        tx_hash: provider_operation_provider_ref(operation, "CctpReceiveObserved"),
+        log_index: 0,
+        token: provider_operation_request_str(operation, "output_asset", "CctpReceiveObserved"),
+        recipient: provider_operation_request_str_any(
+            operation,
+            &["recipient_address", "source_custody_vault_address"],
+        )
+        .unwrap_or_else(valid_evm_address),
+        amount: provider_operation_request_str(operation, "amount", "CctpReceiveObserved"),
+        block_number: None,
     }
 }
 
@@ -3154,6 +3411,129 @@ async fn signal_external_custody_refund_cctp_attestation(
     );
 }
 
+async fn signal_external_custody_refund_cctp_receive_observed(
+    client: &Client,
+    db: &Database,
+    order_id: Uuid,
+) {
+    let parent_attempt = wait_for_execution_attempt(
+        db,
+        order_id,
+        OrderExecutionAttemptKind::PrimaryExecution,
+        2,
+        Some(OrderExecutionAttemptStatus::Failed),
+        Duration::from_secs(120),
+    )
+    .await;
+    let refund_attempt = wait_for_execution_attempt(
+        db,
+        order_id,
+        OrderExecutionAttemptKind::RefundRecovery,
+        3,
+        None,
+        Duration::from_secs(120),
+    )
+    .await;
+    let refund_operation = wait_for_provider_operation_with_ref(
+        db,
+        order_id,
+        Some(refund_attempt.id),
+        ProviderOperationType::CctpReceive,
+        Duration::from_secs(120),
+    )
+    .await;
+    let evidence = cctp_receive_observed_evidence(&refund_operation);
+    let refund_workflow = client.get_workflow_handle::<RefundWorkflow>(&refund_workflow_id(
+        order_id.into(),
+        parent_attempt.id.into(),
+    ));
+    let signal_result = refund_workflow
+        .signal(
+            RefundWorkflow::provider_operation_hint,
+            ProviderOperationHintSignal {
+                order_id: order_id.into(),
+                execution_step_id: refund_operation
+                    .execution_step_id
+                    .expect("refund CCTP receive operation should carry execution_step_id")
+                    .into(),
+                hint_id: Uuid::now_v7().into(),
+                provider_operation_id: Some(refund_operation.id.into()),
+                provider: ProviderKind::Bridge,
+                hint_kind: ProviderHintKind::CctpReceiveObserved,
+                provider_ref: refund_operation.provider_ref.clone(),
+                evidence: Some(ProviderOperationHintEvidence::CctpReceiveObserved(evidence)),
+            },
+            WorkflowSignalOptions::default(),
+        )
+        .await;
+    assert_signal_sent_or_workflow_completed(
+        signal_result,
+        "send refund CctpReceiveObserved provider-operation hint signal",
+    );
+}
+
+async fn signal_external_custody_refund_velora_settled(
+    client: &Client,
+    db: &Database,
+    order_id: Uuid,
+) {
+    let parent_attempt = wait_for_execution_attempt(
+        db,
+        order_id,
+        OrderExecutionAttemptKind::PrimaryExecution,
+        2,
+        Some(OrderExecutionAttemptStatus::Failed),
+        Duration::from_secs(120),
+    )
+    .await;
+    let refund_attempt = wait_for_execution_attempt(
+        db,
+        order_id,
+        OrderExecutionAttemptKind::RefundRecovery,
+        3,
+        None,
+        Duration::from_secs(120),
+    )
+    .await;
+    let refund_operation = wait_for_provider_operation_for_attempt_status(
+        db,
+        order_id,
+        refund_attempt.id,
+        ProviderOperationType::UniversalRouterSwap,
+        ProviderOperationStatus::WaitingExternal,
+        Duration::from_secs(120),
+    )
+    .await;
+    let evidence = velora_swap_settled_evidence(&refund_operation);
+    let refund_workflow = client.get_workflow_handle::<RefundWorkflow>(&refund_workflow_id(
+        order_id.into(),
+        parent_attempt.id.into(),
+    ));
+    let signal_result = refund_workflow
+        .signal(
+            RefundWorkflow::provider_operation_hint,
+            ProviderOperationHintSignal {
+                order_id: order_id.into(),
+                execution_step_id: refund_operation
+                    .execution_step_id
+                    .expect("refund Velora operation should carry execution_step_id")
+                    .into(),
+                hint_id: Uuid::now_v7().into(),
+                provider_operation_id: Some(refund_operation.id.into()),
+                provider: ProviderKind::Exchange,
+                hint_kind: ProviderHintKind::VeloraSwapSettled,
+                provider_ref: refund_operation.provider_ref.clone(),
+                evidence: Some(ProviderOperationHintEvidence::VeloraSwapSettled(evidence)),
+            },
+            WorkflowSignalOptions::default(),
+        )
+        .await;
+    assert_signal_sent_or_workflow_completed(
+        signal_result,
+        "send refund VeloraSwapSettled provider-operation hint signal",
+    );
+}
+
 async fn signal_hyperliquid_spot_refund_unit_withdrawal(
     client: &Client,
     db: &Database,
@@ -3285,6 +3665,38 @@ async fn wait_for_provider_operation_for_attempt(
             let state = workflow_state_summary(db, order_id).await;
             panic!(
                 "timed out waiting for provider operation {operation_type:?} on attempt {attempt_id}\n{state}"
+            );
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn wait_for_provider_operation_for_attempt_status(
+    db: &Database,
+    order_id: Uuid,
+    attempt_id: Uuid,
+    operation_type: ProviderOperationType,
+    status: ProviderOperationStatus,
+    max_wait: Duration,
+) -> OrderProviderOperation {
+    let deadline = tokio::time::Instant::now() + max_wait;
+    loop {
+        let operations = db
+            .orders()
+            .get_provider_operations(order_id)
+            .await
+            .expect("load provider operations");
+        if let Some(operation) = operations.into_iter().find(|operation| {
+            operation.execution_attempt_id == Some(attempt_id)
+                && operation.operation_type == operation_type
+                && operation.status == status
+        }) {
+            return operation;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let state = workflow_state_summary(db, order_id).await;
+            panic!(
+                "timed out waiting for provider operation {operation_type:?} on attempt {attempt_id} to reach {status:?}\n{state}"
             );
         }
         sleep(Duration::from_millis(250)).await;
