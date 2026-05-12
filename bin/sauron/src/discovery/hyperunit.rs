@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, TxHash};
 use bitcoin::{address::NetworkUnchecked, Address as BitcoinAddress};
 use bitcoin_indexer_client::TxOutput;
 use bitcoin_receipt_watcher_client::{parse_txid, ByIdLookup as BitcoinByIdLookup};
@@ -48,6 +48,12 @@ enum HyperUnitChain {
     Ethereum,
     Base,
     Arbitrum,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvmTxHashParseMode {
+    Plain,
+    HyperUnitSourceRef,
 }
 
 impl HyperUnitChain {
@@ -235,19 +241,33 @@ async fn deposit_hints(
     let evm_source = match source_chain {
         HyperUnitChain::Bitcoin => None,
         HyperUnitChain::Ethereum | HyperUnitChain::Base | HyperUnitChain::Arbitrum => {
-            let Some(source_tx_hash) = status.source_tx_hash.as_deref() else {
-                return Ok(hints);
-            };
-            lookup_evm_receipt_evidence(evm, source_chain, source_tx_hash, operation).await?
+            match status.source_tx_hash.as_deref() {
+                Some(source_tx_hash) => {
+                    match lookup_evm_receipt_evidence(
+                        evm,
+                        source_chain,
+                        source_tx_hash,
+                        operation,
+                        EvmTxHashParseMode::HyperUnitSourceRef,
+                    )
+                    .await
+                    {
+                        Ok(evidence) => evidence,
+                        Err(error) => {
+                            warn!(
+                                operation_id = %operation.operation_id,
+                                chain = source_chain.as_hyperunit_str(),
+                                %error,
+                                "HyperUnit deposit EVM source receipt lookup failed; emitting credited hint without EVM receipt evidence"
+                            );
+                            None
+                        }
+                    }
+                }
+                None => None,
+            }
         }
     };
-    if matches!(
-        source_chain,
-        HyperUnitChain::Ethereum | HyperUnitChain::Base | HyperUnitChain::Arbitrum
-    ) && evm_source.is_none()
-    {
-        return Ok(hints);
-    }
     let Some(user) = request_str(&operation.request, "dst_addr").and_then(parse_hl_address) else {
         return Ok(hints);
     };
@@ -285,9 +305,6 @@ async fn withdrawal_hints(
     if !status_matches_protocol(&status, protocol_address) {
         return Ok(Vec::new());
     }
-    let Some(destination_tx_hash) = status.destination_tx_hash.as_deref() else {
-        return Ok(Vec::new());
-    };
     let destination_chain = hyperunit_chain_from_status_or_request(
         status.destination_chain.as_deref(),
         unit_operation_destination_chain(operation),
@@ -301,6 +318,9 @@ async fn withdrawal_hints(
         "unit-withdrawal-ack",
     )];
     let Some(destination_chain) = destination_chain else {
+        return Ok(hints);
+    };
+    let Some(destination_tx_hash) = status.destination_tx_hash.as_deref() else {
         return Ok(hints);
     };
     let Some(destination_address) = request_str(&operation.request, "dst_addr") else {
@@ -332,7 +352,15 @@ async fn withdrawal_hints(
             .await
             {
                 Ok(Ok(receipt)) => receipt,
-                Ok(Err(source)) => return Err(Error::BitcoinReceiptWatcher { source }),
+                Ok(Err(source)) => {
+                    warn!(
+                        operation_id = %operation.operation_id,
+                        destination_chain = destination_chain.as_hyperunit_str(),
+                        %source,
+                        "HyperUnit withdrawal Bitcoin receipt lookup failed; emitting acknowledgment without settled hint"
+                    );
+                    return Ok(hints);
+                }
                 Err(_) => None,
             };
             let Some((tx, confirmations)) = receipt else {
@@ -356,11 +384,26 @@ async fn withdrawal_hints(
             ));
         }
         HyperUnitChain::Ethereum | HyperUnitChain::Base | HyperUnitChain::Arbitrum => {
-            let Some(evm_receipt) =
-                lookup_evm_receipt_evidence(evm, destination_chain, destination_tx_hash, operation)
-                    .await?
-            else {
-                return Ok(hints);
+            let evm_receipt = match lookup_evm_receipt_evidence(
+                evm,
+                destination_chain,
+                destination_tx_hash,
+                operation,
+                EvmTxHashParseMode::Plain,
+            )
+            .await
+            {
+                Ok(Some(evm_receipt)) => evm_receipt,
+                Ok(None) => return Ok(hints),
+                Err(error) => {
+                    warn!(
+                        operation_id = %operation.operation_id,
+                        destination_chain = destination_chain.as_hyperunit_str(),
+                        %error,
+                        "HyperUnit withdrawal EVM receipt lookup failed; emitting acknowledgment without settled hint"
+                    );
+                    return Ok(hints);
+                }
             };
             hints.push(hint_request(
                 operation,
@@ -769,6 +812,7 @@ async fn lookup_evm_receipt_evidence(
     chain: HyperUnitChain,
     tx_hash: &str,
     operation: &SharedProviderOperationWatchEntry,
+    parse_mode: EvmTxHashParseMode,
 ) -> Result<Option<EvmReceiptEvidence>> {
     let Some(chain_id) = chain.evm_chain_id() else {
         return Ok(None);
@@ -791,7 +835,7 @@ async fn lookup_evm_receipt_evidence(
         );
         return Ok(None);
     };
-    let Ok(parsed_hash) = parse_tx_hash(tx_hash) else {
+    let Some((parsed_hash, _log_index)) = parse_evm_tx_hash(tx_hash, parse_mode) else {
         warn!(
             operation_id = %operation.operation_id,
             chain = chain.as_hyperunit_str(),
@@ -823,6 +867,19 @@ async fn lookup_evm_receipt_evidence(
         block_hash: receipt.block_hash.map(|hash| format!("{hash:#x}")),
         status: receipt.status(),
     }))
+}
+
+fn parse_evm_tx_hash(value: &str, mode: EvmTxHashParseMode) -> Option<(TxHash, Option<u64>)> {
+    match mode {
+        EvmTxHashParseMode::Plain => parse_tx_hash(value).ok().map(|hash| (hash, None)),
+        EvmTxHashParseMode::HyperUnitSourceRef => {
+            let (tx_hash, log_index) = match value.split_once(':') {
+                Some((tx_hash, log_index)) => (tx_hash, Some(log_index.parse::<u64>().ok()?)),
+                None => (value, None),
+            };
+            parse_tx_hash(tx_hash).ok().map(|hash| (hash, log_index))
+        }
+    }
 }
 
 fn status_matches_protocol(status: &UnitOperation, protocol_address: &str) -> bool {
@@ -1162,6 +1219,20 @@ mod tests {
         assert!(withdrawal_status.is_none());
     }
 
+    #[test]
+    fn parse_evm_tx_hash_accepts_hyperunit_source_log_index_suffix() {
+        let tx_hash = "0x471a57d43c1130735cb2c18a857cb284b67003bcccd62eb981d4e26264b822cb";
+        let (parsed_hash, log_index) = parse_evm_tx_hash(
+            &format!("{tx_hash}:0"),
+            EvmTxHashParseMode::HyperUnitSourceRef,
+        )
+        .expect("HyperUnit source tx ref should parse");
+
+        assert_eq!(format!("{parsed_hash:#x}"), tx_hash);
+        assert_eq!(log_index, Some(0));
+        assert!(parse_evm_tx_hash(&format!("{tx_hash}:0"), EvmTxHashParseMode::Plain).is_none());
+    }
+
     #[tokio::test]
     async fn withdrawal_hints_emit_ack_and_settled_for_base_destination() {
         let protocol_address = "0x73c1d4b7add80c7cfea60a997c615064a424a844";
@@ -1271,6 +1342,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn withdrawal_hints_emit_ack_when_evm_receipt_lookup_returns_none() {
+        let protocol_address = "0x73c1d4b7add80c7cfea60a997c615064a424a844";
+        let destination = "0x2222222222222222222222222222222222222222";
+        let tx_hash = "0xb4b0ef0fc686e5b300337b27ca6432bcd1e0879ca825c5c0bbe637dba62190ef";
+        let status = unit_operation_with_tx_hashes(
+            "withdrawal-ethereum-no-receipt",
+            protocol_address,
+            "hyperliquid",
+            "ethereum",
+            None,
+            Some(tx_hash),
+            Some(destination),
+        );
+        let unit_server = spawn_hyperunit_operations_server(
+            protocol_address,
+            StatusCode::OK,
+            serde_json::json!({ "addresses": [], "operations": [status] }),
+        )
+        .await;
+        let unit = HyperUnitClient::new(unit_server.base_url()).expect("HyperUnit client");
+        let btc = dummy_bitcoin_clients(None);
+        let evm = evm_clients_without_configured_chains();
+        let operation = provider_operation(
+            ProviderOperationType::UnitWithdrawal,
+            protocol_address,
+            serde_json::json!({
+                "dst_addr": destination,
+                "dst_chain": "ethereum",
+                "amount": "1000000000000000000"
+            }),
+        );
+
+        let hints = withdrawal_hints(&unit, &btc, Some(&evm), &operation)
+            .await
+            .expect("withdrawal hints");
+
+        assert_hint_kinds(
+            &hints,
+            &[ProviderOperationHintKind::HyperUnitWithdrawalAcknowledged],
+        );
+        let ack = hint_evidence(
+            &hints,
+            ProviderOperationHintKind::HyperUnitWithdrawalAcknowledged,
+        );
+        assert_eq!(ack["destination_chain"], "ethereum");
+        assert_eq!(ack["destination_tx_hash"], tx_hash);
+    }
+
+    #[tokio::test]
     async fn withdrawal_hints_emit_ack_and_settled_for_bitcoin_destination() {
         let protocol_address = "0x73c1d4b7add80c7cfea60a997c615064a424a844";
         let destination = "1BoatSLRHtKNngkdXEeobR76b53LETtpyT";
@@ -1329,12 +1449,13 @@ mod tests {
         let protocol_address = "0x73c1d4b7add80c7cfea60a997c615064a424a844";
         let user = "0x1111111111111111111111111111111111111111";
         let tx_hash = "0xc4b0ef0fc686e5b300337b27ca6432bcd1e0879ca825c5c0bbe637dba62190ef";
+        let source_tx_ref = format!("{tx_hash}:0");
         let status = unit_operation_with_tx_hashes(
             "deposit-base",
             protocol_address,
             "base",
             "hyperliquid",
-            Some(tx_hash),
+            Some(&source_tx_ref),
             None,
             Some(user),
         );
@@ -1371,8 +1492,58 @@ mod tests {
         );
         let credited = hint_evidence(&hints, ProviderOperationHintKind::HyperUnitDepositCredited);
         assert_eq!(credited["source_chain"], "base");
+        assert_eq!(credited["hyperunit_source_tx_hash"], source_tx_ref.as_str());
         assert_eq!(credited["evm_source_chain_id"], "evm:8453");
         assert_eq!(credited["evm_source_tx_hash"], tx_hash);
+    }
+
+    #[tokio::test]
+    async fn deposit_hints_emit_credited_when_evm_source_receipt_lookup_returns_none() {
+        let protocol_address = "0x73c1d4b7add80c7cfea60a997c615064a424a844";
+        let user = "0x1111111111111111111111111111111111111111";
+        let tx_hash = "0xc4b0ef0fc686e5b300337b27ca6432bcd1e0879ca825c5c0bbe637dba62190ef";
+        let status = unit_operation_with_tx_hashes(
+            "deposit-base-no-receipt",
+            protocol_address,
+            "base",
+            "hyperliquid",
+            Some(tx_hash),
+            None,
+            Some(user),
+        );
+        let unit_server = spawn_hyperunit_operations_server(
+            protocol_address,
+            StatusCode::OK,
+            serde_json::json!({ "addresses": [], "operations": [status] }),
+        )
+        .await;
+        let hl_server = spawn_hl_transfers_server(hl_credit_event()).await;
+        let unit = HyperUnitClient::new(unit_server.base_url()).expect("HyperUnit client");
+        let hl = HlShimClient::new(hl_server.base_url()).expect("HL shim client");
+        let btc = dummy_bitcoin_clients(None);
+        let evm = evm_clients_without_configured_chains();
+        let operation = provider_operation(
+            ProviderOperationType::UnitDeposit,
+            protocol_address,
+            serde_json::json!({
+                "src_chain": "base",
+                "dst_chain": "hyperliquid",
+                "dst_addr": user,
+                "amount": "50000"
+            }),
+        );
+
+        let hints = deposit_hints(&unit, &hl, &btc, Some(&evm), &operation)
+            .await
+            .expect("deposit hints");
+
+        assert_hint_kinds(
+            &hints,
+            &[ProviderOperationHintKind::HyperUnitDepositCredited],
+        );
+        let credited = hint_evidence(&hints, ProviderOperationHintKind::HyperUnitDepositCredited);
+        assert_eq!(credited["source_chain"], "base");
+        assert!(credited.get("evm_source_tx_hash").is_none());
     }
 
     fn tx_output() -> TxOutput {
@@ -1501,6 +1672,14 @@ mod tests {
             ethereum: (chain == HyperUnitChain::Ethereum).then(|| client.clone()),
             base: (chain == HyperUnitChain::Base).then(|| client.clone()),
             arbitrum: (chain == HyperUnitChain::Arbitrum).then_some(client),
+        }
+    }
+
+    fn evm_clients_without_configured_chains() -> EvmReceiptObserverClients {
+        EvmReceiptObserverClients {
+            ethereum: None,
+            base: None,
+            arbitrum: None,
         }
     }
 
