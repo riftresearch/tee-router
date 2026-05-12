@@ -18,6 +18,7 @@ async-trait = { workspace = true }
 blockchain-utils = { workspace = true }
 bitcoin-indexer-client = { workspace = true }
 bitcoin-receipt-watcher-client = { workspace = true }
+evm-indexer-client = { workspace = true }
 evm-receipt-watcher-client = { workspace = true }
 evm-token-indexer-client = { workspace = true }
 hl-shim-client = { workspace = true }

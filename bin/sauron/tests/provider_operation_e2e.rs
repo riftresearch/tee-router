@@ -66,7 +66,7 @@ use router_server::{
     RouterServerArgs,
 };
 use router_temporal::{OrderWorkflowClient, TemporalConnection as RouterTemporalConnection};
-use sauron::discovery::{evm_erc20::EvmErc20DiscoveryBackend, DiscoveryBackend};
+use sauron::discovery::{evm_indexer::EvmIndexerDiscoveryBackend, DiscoveryBackend};
 use sauron::{run as run_sauron, SauronArgs};
 use serde_json::{json, Value};
 use sqlx_core::connection::Connection;
@@ -2481,9 +2481,7 @@ async fn live_sauron_evm_backend_cursor_contract() {
         &live,
     );
 
-    let ethereum = EvmErc20DiscoveryBackend::new_ethereum(&args)
-        .await
-        .expect("build ethereum backend");
+    let ethereum = EvmIndexerDiscoveryBackend::new_ethereum(&args).expect("build ethereum backend");
     let ethereum_cursor = ethereum
         .current_cursor()
         .await
@@ -2493,18 +2491,14 @@ async fn live_sauron_evm_backend_cursor_contract() {
         ethereum_cursor.height, ethereum_cursor.hash
     );
 
-    let base = EvmErc20DiscoveryBackend::new_base(&args)
-        .await
-        .expect("build base backend");
+    let base = EvmIndexerDiscoveryBackend::new_base(&args).expect("build base backend");
     let base_cursor = base.current_cursor().await.expect("base current cursor");
     eprintln!(
         "base cursor height={} hash={}",
         base_cursor.height, base_cursor.hash
     );
 
-    let arbitrum = EvmErc20DiscoveryBackend::new_arbitrum(&args)
-        .await
-        .expect("build arbitrum backend");
+    let arbitrum = EvmIndexerDiscoveryBackend::new_arbitrum(&args).expect("build arbitrum backend");
     let arbitrum_cursor = arbitrum
         .current_cursor()
         .await
@@ -2531,15 +2525,9 @@ async fn live_sauron_evm_backend_cursor_concurrency_contract() {
         &live,
     );
 
-    let ethereum = EvmErc20DiscoveryBackend::new_ethereum(&args)
-        .await
-        .expect("build ethereum backend");
-    let base = EvmErc20DiscoveryBackend::new_base(&args)
-        .await
-        .expect("build base backend");
-    let arbitrum = EvmErc20DiscoveryBackend::new_arbitrum(&args)
-        .await
-        .expect("build arbitrum backend");
+    let ethereum = EvmIndexerDiscoveryBackend::new_ethereum(&args).expect("build ethereum backend");
+    let base = EvmIndexerDiscoveryBackend::new_base(&args).expect("build base backend");
+    let arbitrum = EvmIndexerDiscoveryBackend::new_arbitrum(&args).expect("build arbitrum backend");
 
     for round in 0..10 {
         let (ethereum_cursor, base_cursor, arbitrum_cursor) = tokio::join!(

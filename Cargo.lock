@@ -6656,6 +6656,7 @@ dependencies = [
  "devnet",
  "dotenvy",
  "eip3009-erc20-contract",
+ "evm-indexer-client",
  "evm-receipt-watcher",
  "evm-receipt-watcher-client",
  "evm-token-indexer-client",
