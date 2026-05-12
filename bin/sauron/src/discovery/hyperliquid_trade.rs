@@ -3,7 +3,8 @@ use router_core::models::{
     ProviderOperationHintKind, ProviderOperationType, SAURON_HYPERLIQUID_OBSERVER_HINT_SOURCE,
 };
 use router_server::api::ProviderOperationHintRequest;
-use serde_json::json;
+use router_temporal::{HlTradeCanceledEvidence, HlTradeFilledEvidence};
+use serde_json::Value;
 
 use crate::provider_operations::ProviderOperationWatchEntry;
 
@@ -46,30 +47,12 @@ pub async fn trade_hint(
             };
             (
                 ProviderOperationHintKind::HlTradeFilled,
-                json!({
-                    "user": format!("{user:?}"),
-                    "oid": oid,
-                    "tid": fill.tid,
-                    "coin": fill.coin,
-                    "side": fill.side,
-                    "px": fill.px,
-                    "sz": fill.sz,
-                    "crossed": fill.crossed,
-                    "hash": fill.hash,
-                    "time_ms": fill.time_ms,
-                }),
+                hl_trade_filled_evidence(user, oid, fill),
             )
         }
         HlOrderStatus::Canceled | HlOrderStatus::Rejected | HlOrderStatus::MarginCanceled => (
             ProviderOperationHintKind::HlTradeCanceled,
-            json!({
-                "user": format!("{user:?}"),
-                "oid": order.oid,
-                "coin": order.coin,
-                "status": format!("{:?}", order.status),
-                "status_timestamp_ms": order.status_timestamp_ms,
-                "reason": "terminal order status from HL shim",
-            }),
+            hl_trade_canceled_evidence(user, &order),
         ),
         _ => return Ok(None),
     };
@@ -85,6 +68,43 @@ pub async fn trade_hint(
             kind.to_db_string()
         )),
     }))
+}
+
+fn hl_trade_filled_evidence(
+    user: alloy::primitives::Address,
+    oid: u64,
+    fill: FillEvidence,
+) -> Value {
+    typed_evidence(HlTradeFilledEvidence {
+        user: format!("{user:?}"),
+        oid,
+        tid: fill.tid,
+        coin: fill.coin,
+        side: fill.side,
+        px: fill.px,
+        sz: fill.sz,
+        crossed: fill.crossed,
+        hash: fill.hash,
+        time_ms: fill.time_ms,
+    })
+}
+
+fn hl_trade_canceled_evidence(
+    user: alloy::primitives::Address,
+    order: &hl_shim_client::HlOrderEvent,
+) -> Value {
+    typed_evidence(HlTradeCanceledEvidence {
+        user: format!("{user:?}"),
+        oid: order.oid,
+        coin: order.coin.clone(),
+        status: format!("{:?}", order.status),
+        status_timestamp_ms: order.status_timestamp_ms,
+        reason: "terminal order status from HL shim".to_string(),
+    })
+}
+
+fn typed_evidence<T: serde::Serialize>(evidence: T) -> Value {
+    serde_json::to_value(evidence).expect("typed provider-operation evidence serializes")
 }
 
 struct FillEvidence {
@@ -154,7 +174,9 @@ mod tests {
     use chrono::Utc;
     use router_core::models::{ProviderOperationStatus, ProviderOperationType};
     use router_temporal::WorkflowStepId;
+    use serde::de::DeserializeOwned;
     use serde_json::json;
+    use std::collections::BTreeSet;
     use uuid::Uuid;
 
     use super::*;
@@ -176,5 +198,80 @@ mod tests {
         };
 
         assert_eq!(operation_oid(&operation), Some(42));
+    }
+
+    #[test]
+    fn hl_trade_filled_evidence_matches_router_typed_shape() {
+        let evidence = hl_trade_filled_evidence(
+            user(),
+            42,
+            FillEvidence {
+                tid: 7,
+                coin: "BTC".to_string(),
+                side: "B".to_string(),
+                px: "65000".to_string(),
+                sz: "0.1".to_string(),
+                crossed: true,
+                hash: "0xfill".to_string(),
+                time_ms: 1_778_522_898_534,
+            },
+        );
+
+        assert_typed_evidence::<HlTradeFilledEvidence>(
+            &evidence,
+            &[
+                "user", "oid", "tid", "coin", "side", "px", "sz", "crossed", "hash", "time_ms",
+            ],
+        );
+    }
+
+    #[test]
+    fn hl_trade_canceled_evidence_matches_router_typed_shape() {
+        let order: hl_shim_client::HlOrderEvent = serde_json::from_value(json!({
+            "user": "0x1111111111111111111111111111111111111111",
+            "oid": 42,
+            "cloid": null,
+            "coin": "BTC",
+            "side": "B",
+            "limit_px": "65000",
+            "sz": "0.1",
+            "orig_sz": "0.1",
+            "status": "canceled",
+            "status_timestamp_ms": 1_778_522_898_534i64,
+            "observed_at_ms": 1_778_522_898_535i64
+        }))
+        .expect("HL order event");
+
+        let evidence = hl_trade_canceled_evidence(user(), &order);
+
+        assert_typed_evidence::<HlTradeCanceledEvidence>(
+            &evidence,
+            &[
+                "user",
+                "oid",
+                "coin",
+                "status",
+                "status_timestamp_ms",
+                "reason",
+            ],
+        );
+    }
+
+    fn user() -> alloy::primitives::Address {
+        "0x1111111111111111111111111111111111111111"
+            .parse()
+            .expect("address")
+    }
+
+    fn assert_typed_evidence<T: DeserializeOwned>(value: &serde_json::Value, expected: &[&str]) {
+        let actual = value
+            .as_object()
+            .expect("evidence should be an object")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let expected = expected.iter().copied().collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected);
+        serde_json::from_value::<T>(value.clone()).expect("typed evidence should deserialize");
     }
 }
