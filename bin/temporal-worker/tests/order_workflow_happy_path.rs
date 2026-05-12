@@ -44,7 +44,7 @@ use router_core::{
             CustodyActionExecutor, HyperliquidCallNetwork, HyperliquidRuntimeConfig,
         },
         AcrossHttpProviderConfig, ActionProviderHttpOptions, ActionProviderRegistry,
-        CctpHttpProviderConfig, VeloraHttpProviderConfig,
+        CctpHttpProviderConfig, RouteCostService, VeloraHttpProviderConfig,
     },
 };
 use router_primitives::ChainType;
@@ -1732,9 +1732,10 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
     };
     let activity_deps = OrderActivityDeps::new(
         db.clone(),
-        action_providers,
+        action_providers.clone(),
         custody_executor,
         chain_registry.clone(),
+        Arc::new(RouteCostService::new(db.clone(), action_providers)),
     );
     if options.manual_intervention_action.is_some() {
         seed_manual_intervention_state(&db, &activity_deps, order_id).await;

@@ -511,7 +511,7 @@ mod tests {
     use super::*;
     use crate::{
         models::{
-            LimitOrderResidualPolicy, MarketOrderKindType, OrderExecutionStep,
+            LimitOrderResidualPolicy, MarketOrderKindType, OrderExecutionLeg, OrderExecutionStep,
             OrderExecutionStepStatus, OrderExecutionStepType,
         },
         services::pricing::{PricingSnapshot, USD_MICRO},
@@ -678,6 +678,137 @@ mod tests {
                 .as_str()
                 .is_some_and(|error| error.contains("invalid asset.chain")),
             "{valuation}"
+        );
+    }
+
+    #[test]
+    fn execution_leg_usd_valuation_prices_planned_and_actual_amounts() {
+        let pricing = test_pricing();
+        let now = Utc::now();
+        let leg = OrderExecutionLeg {
+            id: Uuid::now_v7(),
+            order_id: Uuid::now_v7(),
+            execution_attempt_id: Some(Uuid::now_v7()),
+            transition_decl_id: Some("base-usdc-to-btc".to_string()),
+            leg_index: 0,
+            leg_type: "test".to_string(),
+            provider: "test".to_string(),
+            status: OrderExecutionStepStatus::Completed,
+            input_asset: DepositAsset {
+                chain: ChainId::parse("evm:8453").unwrap(),
+                asset: AssetId::parse("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913").unwrap(),
+            },
+            output_asset: DepositAsset {
+                chain: ChainId::parse("bitcoin").unwrap(),
+                asset: AssetId::Native,
+            },
+            amount_in: "100000000".to_string(),
+            expected_amount_out: "100000".to_string(),
+            min_amount_out: Some("99000".to_string()),
+            actual_amount_in: Some("100000000".to_string()),
+            actual_amount_out: Some("100000".to_string()),
+            started_at: Some(now),
+            completed_at: Some(now),
+            provider_quote_expires_at: None,
+            details: json!({}),
+            usd_valuation: empty_usd_valuation(),
+            created_at: now,
+            updated_at: now,
+        };
+
+        let valuation =
+            execution_leg_usd_valuation(&AssetRegistry::default(), Some(&pricing), &leg);
+
+        assert_eq!(valuation["amounts"]["plannedInput"]["canonical"], "usdc");
+        assert_eq!(valuation["amounts"]["plannedOutput"]["canonical"], "btc");
+        assert_eq!(
+            valuation["amounts"]["actualInput"]["amountUsdMicro"],
+            "100000000"
+        );
+        assert_eq!(
+            valuation["amounts"]["actualOutput"]["amountUsdMicro"],
+            "100000000"
+        );
+    }
+
+    #[test]
+    fn execution_step_usd_valuation_prices_planned_and_observed_amounts() {
+        let pricing = test_pricing();
+        let now = Utc::now();
+        let step = OrderExecutionStep {
+            id: Uuid::now_v7(),
+            order_id: Uuid::now_v7(),
+            execution_attempt_id: Some(Uuid::now_v7()),
+            execution_leg_id: Some(Uuid::now_v7()),
+            transition_decl_id: Some("base-usdc-to-btc".to_string()),
+            step_index: 0,
+            step_type: OrderExecutionStepType::AcrossBridge,
+            provider: "test".to_string(),
+            status: OrderExecutionStepStatus::Completed,
+            input_asset: Some(DepositAsset {
+                chain: ChainId::parse("evm:8453").unwrap(),
+                asset: AssetId::parse("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913").unwrap(),
+            }),
+            output_asset: Some(DepositAsset {
+                chain: ChainId::parse("bitcoin").unwrap(),
+                asset: AssetId::Native,
+            }),
+            amount_in: Some("100000000".to_string()),
+            min_amount_out: Some("99000".to_string()),
+            tx_hash: None,
+            provider_ref: None,
+            idempotency_key: None,
+            attempt_count: 0,
+            next_attempt_at: None,
+            started_at: Some(now),
+            completed_at: Some(now),
+            details: json!({}),
+            request: json!({}),
+            response: json!({}),
+            error: json!({}),
+            usd_valuation: empty_usd_valuation(),
+            created_at: now,
+            updated_at: now,
+        };
+        let response = json!({
+            "balance_observation": {
+                "probes": [
+                    {
+                        "role": "source",
+                        "asset": {
+                            "chain": "evm:8453",
+                            "asset": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+                        },
+                        "debit_delta": "100000000"
+                    },
+                    {
+                        "role": "destination",
+                        "asset": {
+                            "chain": "bitcoin",
+                            "asset": "native"
+                        },
+                        "credit_delta": "100000"
+                    }
+                ]
+            }
+        });
+
+        let valuation = execution_step_usd_valuation(
+            &AssetRegistry::default(),
+            Some(&pricing),
+            &step,
+            Some(&response),
+        );
+
+        assert_eq!(valuation["amounts"]["plannedInput"]["canonical"], "usdc");
+        assert_eq!(valuation["amounts"]["plannedMinOutput"]["canonical"], "btc");
+        assert_eq!(
+            valuation["amounts"]["actualInput"]["amountUsdMicro"],
+            "100000000"
+        );
+        assert_eq!(
+            valuation["amounts"]["actualOutput"]["amountUsdMicro"],
+            "100000000"
         );
     }
 

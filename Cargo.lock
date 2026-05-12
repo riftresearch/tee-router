@@ -7449,6 +7449,7 @@ dependencies = [
  "futures",
  "futures-util",
  "hyperunit-client",
+ "market-pricing",
  "metrics",
  "observability",
  "router-core",

@@ -47,9 +47,10 @@ use router_core::{
         quote_legs::{
             execution_step_type_for_transition_kind, QuoteLeg, QuoteLegAsset, QuoteLegSpec,
         },
+        usd_valuation::{execution_leg_usd_valuation, execution_step_usd_valuation},
         ActionProviderRegistry, CustodyActionExecutor, CustodyActionReceipt,
-        MarketOrderRoutePlanner, ProviderExecutionIntent, ProviderExecutionState,
-        ProviderOperationIntent,
+        MarketOrderRoutePlanner, PricingSnapshotProvider, ProviderExecutionIntent,
+        ProviderExecutionState, ProviderOperationIntent,
     },
 };
 use router_primitives::{ChainType, Currency, TokenIdentifier};
@@ -107,6 +108,27 @@ where
     let result = activity.await.map_err(ActivityError::from);
     telemetry::record_activity(activity_name, result.is_ok(), started.elapsed());
     result
+}
+
+async fn apply_execution_leg_usd_valuations(
+    deps: &OrderActivityDeps,
+    legs: &mut [OrderExecutionLeg],
+) {
+    let pricing = deps.usd_pricing_snapshot().await;
+    let asset_registry = deps.action_providers.asset_registry();
+    for leg in legs {
+        leg.usd_valuation = execution_leg_usd_valuation(&asset_registry, pricing.as_ref(), leg);
+    }
+}
+
+async fn execution_step_usd_valuation_for_response(
+    deps: &OrderActivityDeps,
+    step: &OrderExecutionStep,
+    response: &Value,
+) -> Value {
+    let pricing = deps.usd_pricing_snapshot().await;
+    let asset_registry = deps.action_providers.asset_registry();
+    execution_step_usd_valuation(&asset_registry, pricing.as_ref(), step, Some(response))
 }
 
 async fn record_step_waiting_external_latency_metrics(deps: &OrderActivityDeps, step_id: Uuid) {
@@ -278,6 +300,7 @@ pub struct OrderActivityDeps {
     pub action_providers: Arc<ActionProviderRegistry>,
     pub custody_action_executor: Arc<CustodyActionExecutor>,
     pub chain_registry: Arc<ChainRegistry>,
+    pub pricing_provider: Arc<dyn PricingSnapshotProvider>,
     pub planner: MarketOrderRoutePlanner,
 }
 
@@ -288,6 +311,7 @@ impl OrderActivityDeps {
         action_providers: Arc<ActionProviderRegistry>,
         custody_action_executor: Arc<CustodyActionExecutor>,
         chain_registry: Arc<ChainRegistry>,
+        pricing_provider: Arc<dyn PricingSnapshotProvider>,
     ) -> Self {
         let planner = MarketOrderRoutePlanner::new(action_providers.asset_registry());
         Self {
@@ -295,8 +319,13 @@ impl OrderActivityDeps {
             action_providers,
             custody_action_executor,
             chain_registry,
+            pricing_provider,
             planner,
         }
+    }
+
+    pub async fn usd_pricing_snapshot(&self) -> Option<router_core::services::PricingSnapshot> {
+        self.pricing_provider.usd_pricing_snapshot().await
     }
 }
 

@@ -7373,7 +7373,10 @@ impl OrderRepository {
                     ELSE response_json || $2
                 END,
                 tx_hash = COALESCE($3, tx_hash),
-                usd_valuation_json = $4,
+                usd_valuation_json = CASE
+                    WHEN $4 = '{{}}'::jsonb THEN usd_valuation_json
+                    ELSE $4
+                END,
                 completed_at = $5,
                 updated_at = $5
             WHERE id = $1
@@ -7611,7 +7614,10 @@ impl OrderRepository {
                             ELSE response_json || $2
                         END,
                         tx_hash = COALESCE($3, tx_hash),
-                        usd_valuation_json = $4,
+                        usd_valuation_json = CASE
+                            WHEN $4 = '{{}}'::jsonb THEN usd_valuation_json
+                            ELSE $4
+                        END,
                         completed_at = COALESCE(completed_at, $5),
                         updated_at = $5
                     WHERE id = $1
@@ -7941,7 +7947,10 @@ impl OrderRepository {
                     ELSE response_json || $2
                 END,
                 tx_hash = COALESCE($3, tx_hash),
-                usd_valuation_json = $4,
+                usd_valuation_json = CASE
+                    WHEN $4 = '{{}}'::jsonb THEN usd_valuation_json
+                    ELSE $4
+                END,
                 completed_at = $5,
                 updated_at = $5
             WHERE id = $1

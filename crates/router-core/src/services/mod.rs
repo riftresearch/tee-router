@@ -27,5 +27,5 @@ pub use custody_action_executor::{
 };
 pub use gas_reimbursement::{GasReimbursementPlan, GasRetentionAction};
 pub use market_order_planner::MarketOrderRoutePlanner;
-pub use pricing::PricingSnapshot;
+pub use pricing::{PricingSnapshot, PricingSnapshotProvider};
 pub use route_costs::{RouteCostRefreshSummary, RouteCostService, RouteCostSnapshot};

@@ -8,11 +8,12 @@ use crate::{
         asset_registry::{
             AssetRegistry, ChainAsset, MarketOrderTransitionKind, TransitionDecl, TransitionPath,
         },
-        pricing::{checked_pow10, STATIC_BOOTSTRAP_PRICING_SOURCE},
+        pricing::{checked_pow10, PricingSnapshotProvider, STATIC_BOOTSTRAP_PRICING_SOURCE},
         pricing::{PricingSnapshot, BPS_DENOMINATOR},
     },
 };
 use alloy::primitives::{U256, U512};
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use market_pricing::MarketPricingOracle;
 use serde::{Deserialize, Serialize};
@@ -344,6 +345,13 @@ impl RouteCostService {
             refreshed_at,
             expires_at,
         }))
+    }
+}
+
+#[async_trait]
+impl PricingSnapshotProvider for RouteCostService {
+    async fn usd_pricing_snapshot(&self) -> Option<PricingSnapshot> {
+        self.current_or_refresh_live_pricing_snapshot().await
     }
 }
 
