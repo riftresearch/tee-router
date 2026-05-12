@@ -206,6 +206,93 @@ fn operation_user(
             })
             .and_then(serde_json::Value::as_str)
             .and_then(|value| value.parse().ok()),
+        ProviderOperationType::UnitDeposit => operation
+            .request
+            .get("dst_addr")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| value.parse().ok()),
+        ProviderOperationType::UnitWithdrawal => operation
+            .request
+            .get("protocol_address")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| value.parse().ok()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider_operations::ProviderOperationWatchEntry;
+    use chrono::Utc;
+    use router_core::models::ProviderOperationStatus;
+    use router_temporal::WorkflowStepId;
+    use serde_json::{json, Value};
+    use uuid::Uuid;
+
+    fn watch(operation_type: ProviderOperationType, request: Value) -> ProviderOperationWatchEntry {
+        ProviderOperationWatchEntry {
+            operation_id: Uuid::now_v7(),
+            execution_step_id: WorkflowStepId::from(Uuid::now_v7()),
+            provider: "hyperliquid".to_string(),
+            operation_type,
+            provider_ref: None,
+            status: ProviderOperationStatus::WaitingExternal,
+            request,
+            response: json!({}),
+            observed_state: json!({}),
+            execution_step_request: json!({}),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn operation_user_reads_unit_deposit_dst_addr() {
+        let user = "0xd1e351af26521ca53aa6efbdf6f690b16ba12e5d";
+        let operation = watch(
+            ProviderOperationType::UnitDeposit,
+            json!({
+                "asset": "eth",
+                "amount": "1",
+                "dst_addr": user,
+                "dst_chain": "hyperliquid",
+                "src_chain": "ethereum",
+                "protocol_address": "0xc0d3b8fddafa7e82d221d512df8b7cf04bcbb4eb"
+            }),
+        );
+
+        assert_eq!(operation_user(&operation), Some(user.parse().unwrap()));
+    }
+
+    #[test]
+    fn operation_user_reads_unit_withdrawal_protocol_address() {
+        let user = "0xbc6faa3475c0234dff0a904b28dcef417be60281";
+        let operation = watch(
+            ProviderOperationType::UnitWithdrawal,
+            json!({
+                "asset": "eth",
+                "amount": "1",
+                "dst_addr": "0x2222222222222222222222222222222222222222",
+                "dst_chain": "base",
+                "src_chain": "hyperliquid",
+                "protocol_address": user
+            }),
+        );
+
+        assert_eq!(operation_user(&operation), Some(user.parse().unwrap()));
+    }
+
+    #[test]
+    fn operation_user_reads_hyperliquid_trade_user() {
+        let user = "0x1111111111111111111111111111111111111111";
+        let operation = watch(
+            ProviderOperationType::HyperliquidTrade,
+            json!({
+                "user": user,
+                "coin": "BTC"
+            }),
+        );
+
+        assert_eq!(operation_user(&operation), Some(user.parse().unwrap()));
     }
 }
