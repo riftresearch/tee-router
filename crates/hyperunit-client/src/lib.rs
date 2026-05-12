@@ -446,6 +446,24 @@ impl HyperUnitClient {
         self.get_json(&path).await
     }
 
+    pub async fn deposit_operation(
+        &self,
+        operation_id: impl AsRef<str>,
+    ) -> HyperUnitResult<UnitOperation> {
+        let operation_id = validated_path_segment("operation_id", operation_id.as_ref())?;
+        self.get_json(&format!("/v2/operations/deposit/{operation_id}"))
+            .await
+    }
+
+    pub async fn withdrawal_operation(
+        &self,
+        operation_id: impl AsRef<str>,
+    ) -> HyperUnitResult<UnitOperation> {
+        let operation_id = validated_path_segment("operation_id", operation_id.as_ref())?;
+        self.get_json(&format!("/v2/operations/withdrawal/{operation_id}"))
+            .await
+    }
+
     pub async fn estimate_fees(&self) -> HyperUnitResult<Value> {
         self.get_json("/v2/estimate-fees").await
     }
@@ -518,6 +536,10 @@ fn hyperunit_endpoint_label(path: &str) -> &'static str {
         "/gen/:src/:dst/:asset/:dst_addr"
     } else if path.starts_with("/operations/") {
         "/operations/:address"
+    } else if path.starts_with("/v2/operations/deposit/") {
+        "/v2/operations/deposit/:id"
+    } else if path.starts_with("/v2/operations/withdrawal/") {
+        "/v2/operations/withdrawal/:id"
     } else {
         match path {
             "/v2/estimate-fees" => "/v2/estimate-fees",

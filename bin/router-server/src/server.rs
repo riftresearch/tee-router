@@ -882,6 +882,9 @@ fn provider_hint_shape_for_hint(
         router_core::models::ProviderOperationHintKind::PossibleProgress => {
             provider_hint_shape_for_operation(operation_type)
         }
+        router_core::models::ProviderOperationHintKind::BtcDepositObserved => {
+            (ProviderKind::Unit, ProviderHintKind::BtcDepositObserved)
+        }
         router_core::models::ProviderOperationHintKind::AcrossDestinationFilled => (
             ProviderKind::Bridge,
             ProviderHintKind::AcrossDestinationFilled,
@@ -892,6 +895,18 @@ fn provider_hint_shape_for_hint(
         router_core::models::ProviderOperationHintKind::VeloraSwapSettled => {
             (ProviderKind::Exchange, ProviderHintKind::VeloraSwapSettled)
         }
+        router_core::models::ProviderOperationHintKind::HyperUnitDepositCredited => (
+            ProviderKind::Unit,
+            ProviderHintKind::HyperUnitDepositCredited,
+        ),
+        router_core::models::ProviderOperationHintKind::HyperUnitWithdrawalAcknowledged => (
+            ProviderKind::Unit,
+            ProviderHintKind::HyperUnitWithdrawalAcknowledged,
+        ),
+        router_core::models::ProviderOperationHintKind::HyperUnitWithdrawalSettled => (
+            ProviderKind::Unit,
+            ProviderHintKind::HyperUnitWithdrawalSettled,
+        ),
         router_core::models::ProviderOperationHintKind::HlTradeFilled => {
             (ProviderKind::Exchange, ProviderHintKind::HlTradeFilled)
         }
@@ -949,6 +964,22 @@ fn provider_hint_evidence_for_signal(
     evidence: &serde_json::Value,
 ) -> RouterServerResult<Option<ProviderOperationHintEvidence>> {
     match hint_kind {
+        ProviderHintKind::BtcDepositObserved => {
+            return typed_hint_evidence(evidence)
+                .map(|e| Some(ProviderOperationHintEvidence::BtcDepositObserved(e)));
+        }
+        ProviderHintKind::HyperUnitDepositCredited => {
+            return typed_hint_evidence(evidence)
+                .map(|e| Some(ProviderOperationHintEvidence::HyperUnitDepositCredited(e)));
+        }
+        ProviderHintKind::HyperUnitWithdrawalAcknowledged => {
+            return typed_hint_evidence(evidence)
+                .map(|e| Some(ProviderOperationHintEvidence::HyperUnitWithdrawalAcknowledged(e)));
+        }
+        ProviderHintKind::HyperUnitWithdrawalSettled => {
+            return typed_hint_evidence(evidence)
+                .map(|e| Some(ProviderOperationHintEvidence::HyperUnitWithdrawalSettled(e)));
+        }
         ProviderHintKind::HlTradeFilled => {
             return typed_hint_evidence(evidence)
                 .map(|e| Some(ProviderOperationHintEvidence::HlTradeFilled(e)));

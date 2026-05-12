@@ -1,7 +1,5 @@
-use std::{fmt, fs, path::PathBuf};
-
-use bitcoincore_rpc_async::Auth;
 use clap::{Parser, ValueEnum};
+use std::fmt;
 
 use crate::cdc::{ROUTER_CDC_MESSAGE_PREFIX, ROUTER_CDC_PUBLICATION_NAME};
 
@@ -90,25 +88,13 @@ pub struct SauronArgs {
     #[arg(long, env = "ROUTER_DETECTOR_API_KEY")]
     pub router_detector_api_key: String,
 
-    /// Electrum HTTP Server URL
-    #[arg(long, env = "ELECTRUM_HTTP_SERVER_URL")]
-    pub electrum_http_server_url: String,
+    /// Bitcoin indexer API URL
+    #[arg(long, env = "BITCOIN_INDEXER_URL")]
+    pub bitcoin_indexer_url: Option<String>,
 
-    /// Direct Bitcoin Core RPC URL used for tip, block, and mempool reconciliation
-    #[arg(long, env = "BITCOIN_RPC_URL")]
-    pub bitcoin_rpc_url: String,
-
-    /// Bitcoin Core RPC authentication
-    #[arg(long, env = "BITCOIN_RPC_AUTH", value_parser = parse_auth)]
-    pub bitcoin_rpc_auth: Auth,
-
-    /// Bitcoin Core ZMQ raw transaction endpoint
-    #[arg(long, env = "BITCOIN_ZMQ_RAWTX_ENDPOINT")]
-    pub bitcoin_zmq_rawtx_endpoint: String,
-
-    /// Bitcoin Core ZMQ mempool sequence endpoint
-    #[arg(long, env = "BITCOIN_ZMQ_SEQUENCE_ENDPOINT")]
-    pub bitcoin_zmq_sequence_endpoint: String,
+    /// Bitcoin receipt watcher API URL
+    #[arg(long, env = "BITCOIN_RECEIPT_WATCHER_URL")]
+    pub bitcoin_receipt_watcher_url: Option<String>,
 
     /// Ethereum Mainnet RPC URL
     #[arg(long, env = "ETH_RPC_URL")]
@@ -149,6 +135,14 @@ pub struct SauronArgs {
     /// Hyperliquid shim indexer URL
     #[arg(long, env = "HL_SHIM_INDEXER_URL")]
     pub hl_shim_indexer_url: Option<String>,
+
+    /// HyperUnit API base URL
+    #[arg(long, env = "HYPERUNIT_API_URL")]
+    pub hyperunit_api_url: Option<String>,
+
+    /// Optional HyperUnit SOCKS5 proxy URL
+    #[arg(long, env = "HYPERUNIT_PROXY_URL")]
+    pub hyperunit_proxy_url: Option<String>,
 
     /// HL bridge Arbitrum/HL ledger correlation window, in seconds
     #[arg(
@@ -225,11 +219,17 @@ impl fmt::Debug for SauronArgs {
             )
             .field("router_internal_base_url", &"<redacted>")
             .field("router_detector_api_key", &"<redacted>")
-            .field("electrum_http_server_url", &"<redacted>")
-            .field("bitcoin_rpc_url", &"<redacted>")
-            .field("bitcoin_rpc_auth", &"<redacted>")
-            .field("bitcoin_zmq_rawtx_endpoint", &"<redacted>")
-            .field("bitcoin_zmq_sequence_endpoint", &"<redacted>")
+            .field(
+                "bitcoin_indexer_url",
+                &self.bitcoin_indexer_url.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "bitcoin_receipt_watcher_url",
+                &self
+                    .bitcoin_receipt_watcher_url
+                    .as_ref()
+                    .map(|_| "<redacted>"),
+            )
             .field("ethereum_mainnet_rpc_url", &"<redacted>")
             .field(
                 "ethereum_token_indexer_url",
@@ -274,6 +274,14 @@ impl fmt::Debug for SauronArgs {
                 &self.hl_shim_indexer_url.as_ref().map(|_| "<redacted>"),
             )
             .field(
+                "hyperunit_api_url",
+                &self.hyperunit_api_url.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "hyperunit_proxy_url",
+                &self.hyperunit_proxy_url.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
                 "sauron_hl_bridge_match_window_seconds",
                 &self.sauron_hl_bridge_match_window_seconds,
             )
@@ -309,19 +317,6 @@ pub fn normalize_router_detector_api_key(value: &str) -> Option<&str> {
     Some(value)
 }
 
-fn parse_auth(s: &str) -> Result<Auth, String> {
-    if s.eq_ignore_ascii_case("none") {
-        Ok(Auth::None)
-    } else if fs::exists(s).map_err(|error| error.to_string())? {
-        Ok(Auth::CookieFile(PathBuf::from(s)))
-    } else {
-        let mut split = s.splitn(2, ':');
-        let user = split.next().ok_or("Invalid auth string")?;
-        let password = split.next().ok_or("Invalid auth string")?;
-        Ok(Auth::UserPass(user.to_string(), password.to_string()))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,14 +336,10 @@ mod tests {
             sauron_cdc_idle_wakeup_interval_ms: 10_000,
             router_internal_base_url: "https://router.internal/api-key-path".to_string(),
             router_detector_api_key: "detector-secret-00000000000000000000".to_string(),
-            electrum_http_server_url: "https://electrum.example/token-secret".to_string(),
-            bitcoin_rpc_url: "http://bitcoin-rpc.example/rpc-secret".to_string(),
-            bitcoin_rpc_auth: Auth::UserPass(
-                "bitcoin-user".to_string(),
-                "bitcoin-pass".to_string(),
+            bitcoin_indexer_url: Some("https://bitcoin-indexer.example/token-secret".to_string()),
+            bitcoin_receipt_watcher_url: Some(
+                "https://bitcoin-receipts.example/token-secret".to_string(),
             ),
-            bitcoin_zmq_rawtx_endpoint: "tcp://bitcoin-zmq-secret:28332".to_string(),
-            bitcoin_zmq_sequence_endpoint: "tcp://bitcoin-zmq-secret:28333".to_string(),
             ethereum_mainnet_rpc_url: "https://eth.example/rpc-secret".to_string(),
             ethereum_token_indexer_url: Some(
                 "https://eth-indexer.example/token-secret".to_string(),
@@ -369,6 +360,8 @@ mod tests {
                 "https://arb-receipts.example/receipt-secret".to_string(),
             ),
             hl_shim_indexer_url: Some("https://hl-shim.example/token-secret".to_string()),
+            hyperunit_api_url: Some("https://hyperunit.example/token-secret".to_string()),
+            hyperunit_proxy_url: Some("socks5://hyperunit-proxy-secret:1080".to_string()),
             sauron_hl_bridge_match_window_seconds: 1_800,
             token_indexer_api_key: Some("token-indexer-api-key-secret".to_string()),
             sauron_reconcile_interval_seconds: 3600,
@@ -391,7 +384,7 @@ mod tests {
             "rpc-secret",
             "bitcoin-user",
             "bitcoin-pass",
-            "bitcoin-zmq-secret",
+            "hyperunit-proxy-secret",
         ] {
             assert!(
                 !rendered.contains(secret),

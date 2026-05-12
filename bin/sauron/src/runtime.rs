@@ -29,9 +29,11 @@ use crate::{
     config::{normalize_router_detector_api_key, SauronArgs, MIN_TOKEN_INDEXER_API_KEY_LEN},
     cursor::CursorRepository,
     discovery::{
-        bitcoin::BitcoinDiscoveryBackend, evm_erc20::EvmErc20DiscoveryBackend,
-        hyperliquid::run_hyperliquid_observer_loop, run_backends, DiscoveryBackend,
-        DiscoveryContext,
+        btc::{BitcoinClients, BitcoinDiscoveryBackend},
+        evm_erc20::EvmErc20DiscoveryBackend,
+        hyperliquid::run_hyperliquid_observer_loop,
+        hyperunit::run_hyperunit_observer_loop,
+        run_backends, DiscoveryBackend, DiscoveryContext,
     },
     error::{Error, ReplicaDatabaseConnectionSnafu, Result, StateDatabaseConnectionSnafu},
     provider_evm_receipts::{run_evm_receipt_observer_loop, EvmReceiptObserverClients},
@@ -69,7 +71,8 @@ pub async fn run(args: SauronArgs) -> Result<()> {
     let router_client = RouterClient::new(&args)?;
     let store = WatchStore::default();
     let provider_operation_store = ProviderOperationWatchStore::default();
-    let backends = build_backends(&args).await?;
+    let bitcoin_clients = BitcoinClients::from_args(&args)?;
+    let backends = build_backends(&args, bitcoin_clients.clone()).await?;
 
     full_reconcile(&store, &repository).await?;
     full_provider_operation_reconcile(&provider_operation_store, &provider_operation_repository)
@@ -117,6 +120,12 @@ pub async fn run(args: SauronArgs) -> Result<()> {
         provider_operation_store.clone(),
         router_client.clone(),
     )?;
+    let hyperunit_observer_task = build_hyperunit_observer_task(
+        &args,
+        provider_operation_store.clone(),
+        router_client.clone(),
+        bitcoin_clients,
+    )?;
     let discovery_task = run_backends(
         backends,
         DiscoveryContext {
@@ -133,6 +142,7 @@ pub async fn run(args: SauronArgs) -> Result<()> {
         provider_operation_observer_task,
         hyperliquid_observer_task,
         evm_receipt_observer_task,
+        hyperunit_observer_task,
         discovery_task
     )?;
     Ok(())
@@ -272,18 +282,27 @@ fn cdc_config_from_args(args: &SauronArgs) -> Result<CdcConfig> {
     Ok(config)
 }
 
-async fn build_backends(args: &SauronArgs) -> Result<Vec<Arc<dyn DiscoveryBackend>>> {
-    let bitcoin = BitcoinDiscoveryBackend::new(args).await?;
+async fn build_backends(
+    args: &SauronArgs,
+    bitcoin_clients: Option<BitcoinClients>,
+) -> Result<Vec<Arc<dyn DiscoveryBackend>>> {
     let ethereum = EvmErc20DiscoveryBackend::new_ethereum(args).await?;
     let arbitrum = EvmErc20DiscoveryBackend::new_arbitrum(args).await?;
     let base = EvmErc20DiscoveryBackend::new_base(args).await?;
 
-    Ok(vec![
-        Arc::new(bitcoin),
-        Arc::new(ethereum),
-        Arc::new(arbitrum),
-        Arc::new(base),
-    ])
+    let mut backends: Vec<Arc<dyn DiscoveryBackend>> = Vec::new();
+    if let Some(bitcoin_clients) = bitcoin_clients {
+        backends.push(Arc::new(BitcoinDiscoveryBackend::new(
+            bitcoin_clients,
+            args,
+        )));
+    } else {
+        warn!("BITCOIN_INDEXER_URL is not configured; Bitcoin discovery backend is disabled");
+    }
+    backends.push(Arc::new(ethereum));
+    backends.push(Arc::new(arbitrum));
+    backends.push(Arc::new(base));
+    Ok(backends)
 }
 
 fn build_hyperliquid_observer_task(
@@ -327,6 +346,36 @@ fn build_evm_receipt_observer_task(
         clients,
         provider_operation_store,
         router_client,
+    )))
+}
+
+fn build_hyperunit_observer_task(
+    args: &SauronArgs,
+    provider_operation_store: ProviderOperationWatchStore,
+    router_client: RouterClient,
+    bitcoin_clients: Option<BitcoinClients>,
+) -> Result<BoxedSauronTask> {
+    let (Some(hyperunit_url), Some(hl_url), Some(bitcoin_clients)) = (
+        args.hyperunit_api_url.as_deref(),
+        args.hl_shim_indexer_url.as_deref(),
+        bitcoin_clients,
+    ) else {
+        return Ok(Box::pin(async {
+            std::future::pending::<Result<()>>().await
+        }));
+    };
+    let unit_client = hyperunit_client::HyperUnitClient::new_with_proxy_url(
+        hyperunit_url,
+        args.hyperunit_proxy_url.clone(),
+    )
+    .map_err(|source| Error::HyperUnit { source })?;
+    let hl_client = HlShimClient::new(hl_url).map_err(|source| Error::HlShim { source })?;
+    Ok(Box::pin(run_hyperunit_observer_loop(
+        provider_operation_store,
+        router_client,
+        unit_client,
+        hl_client,
+        bitcoin_clients,
     )))
 }
 
@@ -676,11 +725,8 @@ mod tests {
             sauron_cdc_idle_wakeup_interval_ms: 10_000,
             router_internal_base_url: "http://router-api:4522".to_string(),
             router_detector_api_key: "detector-api-key-0000000000000000".to_string(),
-            electrum_http_server_url: "http://electrum:3000".to_string(),
-            bitcoin_rpc_url: "http://bitcoin:8332".to_string(),
-            bitcoin_rpc_auth: bitcoincore_rpc_async::Auth::None,
-            bitcoin_zmq_rawtx_endpoint: "tcp://bitcoin:28332".to_string(),
-            bitcoin_zmq_sequence_endpoint: "tcp://bitcoin:28333".to_string(),
+            bitcoin_indexer_url: Some("http://bitcoin-indexer:8080".to_string()),
+            bitcoin_receipt_watcher_url: Some("http://bitcoin-receipts:8080".to_string()),
             ethereum_mainnet_rpc_url: "http://ethereum:8545".to_string(),
             ethereum_token_indexer_url: None,
             ethereum_receipt_watcher_url: None,
@@ -691,6 +737,8 @@ mod tests {
             arbitrum_token_indexer_url: None,
             arbitrum_receipt_watcher_url: None,
             hl_shim_indexer_url: None,
+            hyperunit_api_url: None,
+            hyperunit_proxy_url: None,
             sauron_hl_bridge_match_window_seconds: 1_800,
             token_indexer_api_key: None,
             sauron_reconcile_interval_seconds: 3600,
@@ -1382,7 +1430,7 @@ async fn observe_provider_operation_once(
     last_submission: Option<SubmittedProviderOperationHint>,
 ) -> ProviderOperationObserveOutcome {
     let operation_id = operation.operation_id;
-    if uses_typed_evm_receipt_observer(operation.operation_type) {
+    if uses_typed_venue_observer(operation.operation_type) {
         return ProviderOperationObserveOutcome {
             operation_id,
             submitted_hint: None,
@@ -1460,10 +1508,17 @@ async fn observe_provider_operation_once(
     }
 }
 
-fn uses_typed_evm_receipt_observer(operation_type: ProviderOperationType) -> bool {
+fn uses_typed_venue_observer(operation_type: ProviderOperationType) -> bool {
     matches!(
         operation_type,
-        ProviderOperationType::CctpReceive | ProviderOperationType::UniversalRouterSwap
+        ProviderOperationType::CctpReceive
+            | ProviderOperationType::UniversalRouterSwap
+            | ProviderOperationType::UnitDeposit
+            | ProviderOperationType::UnitWithdrawal
+            | ProviderOperationType::HyperliquidTrade
+            | ProviderOperationType::HyperliquidLimitOrder
+            | ProviderOperationType::HyperliquidBridgeDeposit
+            | ProviderOperationType::HyperliquidBridgeWithdrawal
     )
 }
 
