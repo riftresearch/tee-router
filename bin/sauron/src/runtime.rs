@@ -30,7 +30,7 @@ use crate::{
     cursor::CursorRepository,
     discovery::{
         btc::{BitcoinClients, BitcoinDiscoveryBackend},
-        evm_erc20::EvmErc20DiscoveryBackend,
+        evm_indexer::EvmIndexerDiscoveryBackend,
         hyperliquid::run_hyperliquid_observer_loop,
         hyperunit::run_hyperunit_observer_loop,
         run_backends, DiscoveryBackend, DiscoveryContext,
@@ -286,10 +286,6 @@ async fn build_backends(
     args: &SauronArgs,
     bitcoin_clients: Option<BitcoinClients>,
 ) -> Result<Vec<Arc<dyn DiscoveryBackend>>> {
-    let ethereum = EvmErc20DiscoveryBackend::new_ethereum(args).await?;
-    let arbitrum = EvmErc20DiscoveryBackend::new_arbitrum(args).await?;
-    let base = EvmErc20DiscoveryBackend::new_base(args).await?;
-
     let mut backends: Vec<Arc<dyn DiscoveryBackend>> = Vec::new();
     if let Some(bitcoin_clients) = bitcoin_clients {
         backends.push(Arc::new(BitcoinDiscoveryBackend::new(
@@ -299,9 +295,23 @@ async fn build_backends(
     } else {
         warn!("BITCOIN_INDEXER_URL is not configured; Bitcoin discovery backend is disabled");
     }
-    backends.push(Arc::new(ethereum));
-    backends.push(Arc::new(arbitrum));
-    backends.push(Arc::new(base));
+    if let Some(ethereum) = EvmIndexerDiscoveryBackend::maybe_ethereum(args)? {
+        backends.push(Arc::new(ethereum));
+    } else {
+        warn!("ETHEREUM_TOKEN_INDEXER_URL is not configured; Ethereum ERC-20 discovery backend is disabled");
+    }
+    if let Some(arbitrum) = EvmIndexerDiscoveryBackend::maybe_arbitrum(args)? {
+        backends.push(Arc::new(arbitrum));
+    } else {
+        warn!("ARBITRUM_TOKEN_INDEXER_URL is not configured; Arbitrum ERC-20 discovery backend is disabled");
+    }
+    if let Some(base) = EvmIndexerDiscoveryBackend::maybe_base(args)? {
+        backends.push(Arc::new(base));
+    } else {
+        warn!(
+            "BASE_TOKEN_INDEXER_URL is not configured; Base ERC-20 discovery backend is disabled"
+        );
+    }
     Ok(backends)
 }
 

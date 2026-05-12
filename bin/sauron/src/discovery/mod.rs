@@ -1,5 +1,5 @@
 pub mod btc;
-pub mod evm_erc20;
+pub mod evm_indexer;
 pub mod hyperliquid;
 pub mod hyperliquid_bridge;
 pub mod hyperliquid_spot_trade;
