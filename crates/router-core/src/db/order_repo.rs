@@ -7647,15 +7647,148 @@ impl OrderRepository {
             if let Some(execution_leg_id) = step.execution_leg_id {
                 let _ = sqlx_core::query::query(
                     r#"
-                    UPDATE order_execution_legs
+                    WITH candidates AS (
+                        SELECT
+                            leg.id,
+                            COALESCE(leg.actual_amount_in, leg.amount_in) AS actual_amount_in,
+                            COALESCE(leg.actual_amount_out, leg.expected_amount_out) AS actual_amount_out,
+                            leg.input_chain_id,
+                            leg.input_asset_id,
+                            leg.output_chain_id,
+                            leg.output_asset_id,
+                            leg.usd_valuation_json,
+                            COALESCE(
+                                first_step.usd_valuation_json #> '{amounts,actualInput}',
+                                leg.usd_valuation_json #> '{amounts,plannedInput}'
+                            ) AS input_price,
+                            COALESCE(
+                                last_step.usd_valuation_json #> '{amounts,actualOutput}',
+                                leg.usd_valuation_json #> '{amounts,plannedOutput}',
+                                leg.usd_valuation_json #> '{amounts,plannedMinOutput}'
+                            ) AS output_price
+                        FROM order_execution_legs leg
+                        LEFT JOIN LATERAL (
+                            SELECT step.usd_valuation_json
+                            FROM order_execution_steps step
+                            WHERE step.execution_leg_id = leg.id
+                              AND step.status = 'completed'
+                            ORDER BY step.step_index ASC, step.completed_at ASC NULLS LAST, step.created_at ASC, step.id ASC
+                            LIMIT 1
+                        ) first_step ON true
+                        LEFT JOIN LATERAL (
+                            SELECT step.usd_valuation_json
+                            FROM order_execution_steps step
+                            WHERE step.execution_leg_id = leg.id
+                              AND step.status = 'completed'
+                            ORDER BY step.step_index DESC, step.completed_at DESC NULLS LAST, step.created_at DESC, step.id DESC
+                            LIMIT 1
+                        ) last_step ON true
+                        WHERE leg.id = $1
+                          AND leg.status IN ('running', 'completed')
+                    ),
+                    derived AS (
+                        SELECT
+                            id,
+                            usd_valuation_json,
+                            actual_amount_in,
+                            actual_amount_out,
+                            CASE
+                                WHEN actual_amount_in ~ '^[0-9]+$'
+                                 AND usd_valuation_json #> '{amounts,actualInput}' IS NULL
+                                 AND jsonb_typeof(input_price) = 'object'
+                                 AND (input_price->>'unitUsdMicro') ~ '^[0-9]+$'
+                                 AND (input_price->>'decimals') ~ '^[0-9]+$'
+                                 AND (input_price->>'decimals')::int BETWEEN 0 AND 36
+                                    THEN jsonb_strip_nulls(jsonb_build_object(
+                                        'raw', actual_amount_in,
+                                        'asset', jsonb_build_object(
+                                            'chainId', input_chain_id,
+                                            'assetId', input_asset_id
+                                        ),
+                                        'decimals', (input_price->>'decimals')::int,
+                                        'canonical', input_price->>'canonical',
+                                        'unitUsdMicro', input_price->>'unitUsdMicro',
+                                        'amountUsdMicro', floor(
+                                            (actual_amount_in::numeric * (input_price->>'unitUsdMicro')::numeric)
+                                            / power(10::numeric, (input_price->>'decimals')::int)
+                                        )::text
+                                    ))
+                            END AS actual_input,
+                            CASE
+                                WHEN actual_amount_out ~ '^[0-9]+$'
+                                 AND usd_valuation_json #> '{amounts,actualOutput}' IS NULL
+                                 AND jsonb_typeof(output_price) = 'object'
+                                 AND (output_price->>'unitUsdMicro') ~ '^[0-9]+$'
+                                 AND (output_price->>'decimals') ~ '^[0-9]+$'
+                                 AND (output_price->>'decimals')::int BETWEEN 0 AND 36
+                                    THEN jsonb_strip_nulls(jsonb_build_object(
+                                        'raw', actual_amount_out,
+                                        'asset', jsonb_build_object(
+                                            'chainId', output_chain_id,
+                                            'assetId', output_asset_id
+                                        ),
+                                        'decimals', (output_price->>'decimals')::int,
+                                        'canonical', output_price->>'canonical',
+                                        'unitUsdMicro', output_price->>'unitUsdMicro',
+                                        'amountUsdMicro', floor(
+                                            (actual_amount_out::numeric * (output_price->>'unitUsdMicro')::numeric)
+                                            / power(10::numeric, (output_price->>'decimals')::int)
+                                        )::text
+                                    ))
+                            END AS actual_output
+                        FROM candidates
+                    ),
+                    patched AS (
+                        SELECT
+                            id,
+                            CASE
+                                WHEN actual_output IS NOT NULL THEN jsonb_set(
+                                    CASE
+                                        WHEN actual_input IS NOT NULL THEN jsonb_set(
+                                            base_valuation,
+                                            '{amounts,actualInput}',
+                                            actual_input,
+                                            true
+                                        )
+                                        ELSE base_valuation
+                                    END,
+                                    '{amounts,actualOutput}',
+                                    actual_output,
+                                    true
+                                )
+                                WHEN actual_input IS NOT NULL THEN jsonb_set(
+                                    base_valuation,
+                                    '{amounts,actualInput}',
+                                    actual_input,
+                                    true
+                                )
+                                ELSE base_valuation
+                            END AS usd_valuation_json
+                        FROM (
+                            SELECT
+                                *,
+                                jsonb_set(
+                                    usd_valuation_json,
+                                    '{amounts}',
+                                    COALESCE(usd_valuation_json->'amounts', '{}'::jsonb),
+                                    true
+                                ) AS base_valuation
+                            FROM derived
+                        ) prepared
+                        WHERE actual_input IS NOT NULL
+                           OR actual_output IS NOT NULL
+                    )
+                    UPDATE order_execution_legs leg
                     SET
                         status = 'completed',
-                        actual_amount_in = COALESCE(actual_amount_in, amount_in),
-                        actual_amount_out = COALESCE(actual_amount_out, expected_amount_out),
-                        completed_at = COALESCE(completed_at, $2),
+                        actual_amount_in = candidates.actual_amount_in,
+                        actual_amount_out = candidates.actual_amount_out,
+                        usd_valuation_json = COALESCE(patched.usd_valuation_json, leg.usd_valuation_json),
+                        completed_at = COALESCE(leg.completed_at, $2),
                         updated_at = $2
-                    WHERE id = $1
-                      AND status IN ('running', 'completed')
+                    FROM candidates
+                    LEFT JOIN patched ON patched.id = candidates.id
+                    WHERE leg.id = candidates.id
                     "#,
                 )
                 .bind(execution_leg_id)
