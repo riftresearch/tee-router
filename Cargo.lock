@@ -3174,6 +3174,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "evm-receipt-watcher"
+version = "0.1.8"
+dependencies = [
+ "alloy",
+ "axum 0.7.9",
+ "clap",
+ "evm-receipt-watcher-client",
+ "futures-util",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "snafu",
+ "tokio",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
+name = "evm-receipt-watcher-client"
+version = "0.1.8"
+dependencies = [
+ "alloy",
+ "async-trait",
+ "futures-util",
+ "metrics",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "snafu",
+ "tokio",
+ "tokio-tungstenite 0.24.0",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "evm-token-indexer-client"
 version = "0.1.8"
 dependencies = [
