@@ -92,7 +92,7 @@ use super::{
 };
 
 const MAX_EXECUTION_ATTEMPTS: i32 = 2;
-const MAX_STALE_QUOTE_REFRESHES_PER_ORDER_EXECUTION: usize = 8;
+pub const DEFAULT_QUOTE_REFRESH_MAX_ATTEMPTS: usize = 3;
 const REFUND_PATH_MAX_DEPTH: usize = 5;
 const REFUND_HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW: u64 = 1_000_000;
 const REFRESH_HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW: u64 =
@@ -302,6 +302,7 @@ pub struct OrderActivityDeps {
     pub chain_registry: Arc<ChainRegistry>,
     pub pricing_provider: Arc<dyn PricingSnapshotProvider>,
     pub planner: MarketOrderRoutePlanner,
+    pub quote_refresh_max_attempts: usize,
 }
 
 impl OrderActivityDeps {
@@ -321,7 +322,14 @@ impl OrderActivityDeps {
             chain_registry,
             pricing_provider,
             planner,
+            quote_refresh_max_attempts: DEFAULT_QUOTE_REFRESH_MAX_ATTEMPTS,
         }
+    }
+
+    #[must_use]
+    pub fn with_quote_refresh_max_attempts(mut self, quote_refresh_max_attempts: usize) -> Self {
+        self.quote_refresh_max_attempts = quote_refresh_max_attempts;
+        self
     }
 
     pub async fn usd_pricing_snapshot(&self) -> Option<router_core::services::PricingSnapshot> {

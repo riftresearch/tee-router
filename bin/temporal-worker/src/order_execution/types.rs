@@ -525,6 +525,8 @@ pub struct CheckPreExecutionStaleQuoteInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreExecutionStaleQuoteCheck {
     pub should_refresh: bool,
+    #[serde(default)]
+    pub should_refund: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<Value>,
 }

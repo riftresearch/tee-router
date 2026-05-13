@@ -31,6 +31,13 @@ enum Command {
         #[arg(long, env = "TEMPORAL_TASK_QUEUE", default_value = order_execution::DEFAULT_TASK_QUEUE)]
         task_queue: String,
 
+        #[arg(
+            long,
+            env = "SAURON_QUOTE_REFRESH_MAX_ATTEMPTS",
+            default_value_t = order_execution::activities::DEFAULT_QUOTE_REFRESH_MAX_ATTEMPTS
+        )]
+        quote_refresh_max_attempts: usize,
+
         #[command(flatten)]
         runtime: OrderWorkerRuntimeArgs,
     },
@@ -62,10 +69,14 @@ async fn main() -> WorkerResult<()> {
     match cli.command {
         Command::Worker {
             task_queue,
+            quote_refresh_max_attempts,
             runtime,
         } => {
             let activities = order_execution::activities::OrderActivities::new(
-                runtime.build_order_activities().await?,
+                runtime
+                    .build_order_activities()
+                    .await?
+                    .with_quote_refresh_max_attempts(quote_refresh_max_attempts),
             );
             order_execution::run_worker_with_activities(&connection, &task_queue, activities)
                 .await?;
