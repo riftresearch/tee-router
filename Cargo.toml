@@ -62,9 +62,9 @@ evm-receipt-watcher-client = { path = "crates/evm-receipt-watcher-client" }
 evm-token-indexer-client = { path = "crates/evm-token-indexer-client" }
 bitcoin-indexer-client = { path = "crates/bitcoin-indexer-client" }
 bitcoin-receipt-watcher-client = { path = "crates/bitcoin-receipt-watcher-client" }
-eip7702-delegator-contract = {path = "crates/eip7702-delegator-contract"}
-eip3009-erc20-contract = {path = "crates/eip3009-erc20-contract"}
-utc = {path = "crates/utc"}
+eip3009-erc20-contract = { path = "crates/eip3009-erc20-contract" }
+eip7702-delegator-contract = { path = "crates/eip7702-delegator-contract" }
+utc = { path = "crates/utc" }
 chainalysis-address-screener = { path = "crates/chainalysis-address-screener" }
 
 # All of the following dependences (before the empty line) are implicitly linked to the same version, if one of them is updated they must all be updated simultaneously 
