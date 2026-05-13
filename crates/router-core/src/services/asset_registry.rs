@@ -1832,6 +1832,28 @@ mod tests {
     }
 
     #[test]
+    fn transition_paths_from_hyperliquid_spot_to_bitcoin_exist() {
+        let registry = AssetRegistry::default();
+        let paths = registry.select_transition_paths_between(
+            hyperliquid_venue(CanonicalAsset::Eth),
+            MarketOrderNode::External(asset("bitcoin", AssetId::Native)),
+            5,
+        );
+
+        assert!(paths.iter().any(|path| {
+            path.transitions
+                .iter()
+                .map(|transition| transition.kind)
+                .collect::<Vec<_>>()
+                == vec![
+                    MarketOrderTransitionKind::HyperliquidTrade,
+                    MarketOrderTransitionKind::HyperliquidTrade,
+                    MarketOrderTransitionKind::UnitWithdrawal,
+                ]
+        }));
+    }
+
+    #[test]
     fn unit_support_distinguishes_deposit_from_withdrawal() {
         let registry = AssetRegistry::default();
         let base_eth = asset("evm:8453", AssetId::Native);
