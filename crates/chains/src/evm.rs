@@ -32,9 +32,12 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::{
+        mpsc::{self, error::TryRecvError},
+        oneshot,
+    },
     task::{JoinError, JoinSet},
-    time::{sleep, timeout},
+    time::sleep,
 };
 use tracing::{debug, info, warn};
 
@@ -51,9 +54,7 @@ const EVM_RPC_RETRY_ATTEMPTS: usize = 6;
 const EVM_RPC_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(500);
 const EVM_CALL_ESTIMATE_GAS_CAP: u64 = 1_000_000;
 const EVM_PAYMASTER_BATCH_DEFAULT_MAX_SIZE: usize = 64;
-const EVM_PAYMASTER_BATCH_DEFAULT_WINDOW: Duration = Duration::from_millis(100);
 const ROUTER_PAYMASTER_BATCH_MAX_SIZE_ENV: &str = "ROUTER_PAYMASTER_BATCH_MAX_SIZE";
-const ROUTER_PAYMASTER_BATCH_WINDOW_MS_ENV: &str = "ROUTER_PAYMASTER_BATCH_WINDOW_MS";
 const WEI_PER_GWEI: f64 = 1_000_000_000.0;
 const FLASHBOTS_ETHEREUM_RPC_URL: &str = "https://rpc.flashbots.net";
 
@@ -116,7 +117,6 @@ struct EvmPaymasterActor {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct EvmPaymasterBatchConfig {
     max_size: usize,
-    window: Duration,
 }
 
 #[derive(Clone)]
@@ -151,7 +151,6 @@ impl Default for EvmPaymasterBatchConfig {
     fn default() -> Self {
         Self {
             max_size: EVM_PAYMASTER_BATCH_DEFAULT_MAX_SIZE,
-            window: EVM_PAYMASTER_BATCH_DEFAULT_WINDOW,
         }
     }
 }
@@ -161,7 +160,6 @@ impl EvmPaymasterBatchConfig {
         let default = Self::default();
         Self {
             max_size: parse_paymaster_batch_max_size_env(default.max_size),
-            window: parse_paymaster_batch_window_env(default.window),
         }
     }
 }
@@ -1290,24 +1288,6 @@ fn parse_paymaster_batch_max_size_env(default: usize) -> usize {
     }
 }
 
-fn parse_paymaster_batch_window_env(default: Duration) -> Duration {
-    match std::env::var(ROUTER_PAYMASTER_BATCH_WINDOW_MS_ENV) {
-        Ok(value) => match value.parse::<u64>() {
-            Ok(parsed) => Duration::from_millis(parsed),
-            Err(_) => {
-                warn!(
-                    env_var = ROUTER_PAYMASTER_BATCH_WINDOW_MS_ENV,
-                    value,
-                    default_ms = default.as_millis(),
-                    "invalid EVM paymaster batch window; using default"
-                );
-                default
-            }
-        },
-        Err(_) => default,
-    }
-}
-
 fn record_paymaster_actor_start(chain_type: ChainType, start_kind: &'static str) {
     counter!(
         "tee_router_paymaster_actor_start_total",
@@ -1543,7 +1523,6 @@ async fn run_evm_paymaster_actor(
                 chain = %actor.chain_type.to_db_string(),
                 sponsor = %actor.sponsor_address,
                 batch_max_size = actor.batch_config.max_size,
-                batch_window_ms = actor.batch_config.window.as_millis(),
                 "EVM paymaster actor using EIP-7702 batched funding"
             );
         }
@@ -1559,14 +1538,9 @@ async fn run_evm_paymaster_actor(
         }
     }
 
-    while let Some(first_command) = command_rx.recv().await {
-        let batch = drain_paymaster_batch(
-            first_command,
-            &mut command_rx,
-            actor.batch_config.max_size,
-            actor.batch_config.window,
-        )
-        .await;
+    while let Some(batch) =
+        drain_paymaster_batch(&mut command_rx, actor.batch_config.max_size).await
+    {
         process_evm_paymaster_batch(&actor, batch).await;
     }
 }
@@ -1612,31 +1586,22 @@ async fn run_evm_paymaster_actor_serial(
 }
 
 async fn drain_paymaster_batch(
-    first_command: EvmPaymasterCommand,
     command_rx: &mut mpsc::Receiver<EvmPaymasterCommand>,
     max_size: usize,
-    window: Duration,
-) -> Vec<EvmPaymasterCommand> {
+) -> Option<Vec<EvmPaymasterCommand>> {
     let max_size = max_size.max(1);
+    let first_command = command_rx.recv().await?;
     let mut batch = Vec::with_capacity(max_size.min(EVM_PAYMASTER_COMMAND_BUFFER));
     batch.push(first_command);
-    if max_size == 1 {
-        return batch;
-    }
 
-    let drain_deadline = Instant::now() + window;
     while batch.len() < max_size {
-        let remaining = drain_deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        match timeout(remaining, command_rx.recv()).await {
-            Ok(Some(command)) => batch.push(command),
-            Ok(None) | Err(_) => break,
+        match command_rx.try_recv() {
+            Ok(command) => batch.push(command),
+            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
         }
     }
 
-    batch
+    Some(batch)
 }
 
 async fn process_evm_paymaster_batch(
@@ -3185,23 +3150,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_batch_accumulates_up_to_max_size_within_window() {
+    async fn drain_batch_drains_available_commands_up_to_max_size() {
         let (command_tx, mut command_rx) = mpsc::channel(4);
-        let first = test_paymaster_command(Address::repeat_byte(0x01));
-        command_tx
-            .send(test_paymaster_command(Address::repeat_byte(0x02)))
-            .await
-            .unwrap();
-        command_tx
-            .send(test_paymaster_command(Address::repeat_byte(0x03)))
-            .await
-            .unwrap();
+        for byte in 0x01..=0x03 {
+            command_tx
+                .send(test_paymaster_command(Address::repeat_byte(byte)))
+                .await
+                .unwrap();
+        }
 
-        let batch =
-            drain_paymaster_batch(first, &mut command_rx, 2, Duration::from_millis(100)).await;
+        let batch = drain_paymaster_batch(&mut command_rx, 4).await.unwrap();
+
+        assert_eq!(batch.len(), 3);
+        assert!(matches!(command_rx.try_recv(), Err(TryRecvError::Empty)));
+
+        for byte in 0x04..=0x06 {
+            command_tx
+                .send(test_paymaster_command(Address::repeat_byte(byte)))
+                .await
+                .unwrap();
+        }
+
+        let batch = drain_paymaster_batch(&mut command_rx, 2).await.unwrap();
 
         assert_eq!(batch.len(), 2);
         assert!(command_rx.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn drain_batch_returns_single_command_without_waiting_for_more() {
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        command_tx
+            .send(test_paymaster_command(Address::repeat_byte(0x01)))
+            .await
+            .unwrap();
+
+        let batch = drain_paymaster_batch(&mut command_rx, EVM_PAYMASTER_BATCH_DEFAULT_MAX_SIZE)
+            .await
+            .unwrap();
+
+        assert_eq!(batch.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn drain_batch_waits_for_first_command_when_empty() {
+        let (_command_tx, mut command_rx) = mpsc::channel(1);
+        let mut drain = Box::pin(drain_paymaster_batch(
+            &mut command_rx,
+            EVM_PAYMASTER_BATCH_DEFAULT_MAX_SIZE,
+        ));
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+
+        assert!(matches!(
+            std::future::Future::poll(drain.as_mut(), &mut context),
+            std::task::Poll::Pending
+        ));
     }
 
     #[test]

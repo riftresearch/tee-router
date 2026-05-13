@@ -420,6 +420,7 @@ services:
     environment:
       <<: *router_env
       RUST_LOG: info
+      ROUTER_PAYMASTER_BATCH_MAX_SIZE: 64
     volumes:
       - router_local_master_key:/run/router-secrets:ro
     expose:
