@@ -1,6 +1,8 @@
 use super::*;
 
-use chains::ChainRegistry;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use chains::{hyperliquid::HyperliquidChain, ChainOperations, ChainRegistry};
 use router_core::{
     config::Settings,
     models::{
@@ -10,10 +12,14 @@ use router_core::{
     services::{
         action_providers::{ExchangeProvider, ProviderFuture, UnitProvider},
         asset_registry::{AssetSlot, RequiredCustodyRole},
-        custody_action_executor::{HyperliquidCallNetwork, HyperliquidRuntimeConfig},
+        custody_action_executor::{
+            ChainCall, HyperliquidCall, HyperliquidCallNetwork, HyperliquidCallPayload,
+            HyperliquidRuntimeConfig,
+        },
         ActionProviderHttpOptions,
     },
 };
+use router_primitives::ChainType;
 use sqlx_postgres::PgPool;
 use testcontainers::{
     core::{IntoContainerPort, WaitFor},
@@ -73,6 +79,103 @@ impl UnitProvider for TestUnitProvider {
             Ok(ProviderExecutionIntent::ProviderOnly {
                 response: json!({ "kind": "test_unit_withdrawal" }),
                 state: ProviderExecutionState::default(),
+            })
+        })
+    }
+}
+
+struct CountingUnitWithdrawalProvider {
+    hyperliquid_base_url: String,
+    gen_calls: Arc<AtomicUsize>,
+}
+
+impl CountingUnitWithdrawalProvider {
+    fn new(hyperliquid_base_url: String) -> (Self, Arc<AtomicUsize>) {
+        let gen_calls = Arc::new(AtomicUsize::new(0));
+        (
+            Self {
+                hyperliquid_base_url,
+                gen_calls: gen_calls.clone(),
+            },
+            gen_calls,
+        )
+    }
+}
+
+impl UnitProvider for CountingUnitWithdrawalProvider {
+    fn id(&self) -> &str {
+        ProviderId::Unit.as_str()
+    }
+
+    fn supports_deposit(&self, _asset: &DepositAsset) -> bool {
+        true
+    }
+
+    fn supports_withdrawal(&self, _asset: &DepositAsset) -> bool {
+        true
+    }
+
+    fn execute_deposit<'a>(
+        &'a self,
+        _request: &'a UnitDepositStepRequest,
+    ) -> ProviderFuture<'a, ProviderExecutionIntent> {
+        Box::pin(async {
+            Ok(ProviderExecutionIntent::ProviderOnly {
+                response: json!({ "kind": "counting_unit_deposit" }),
+                state: ProviderExecutionState::default(),
+            })
+        })
+    }
+
+    fn execute_withdrawal<'a>(
+        &'a self,
+        request: &'a UnitWithdrawalStepRequest,
+    ) -> ProviderFuture<'a, ProviderExecutionIntent> {
+        let hyperliquid_base_url = self.hyperliquid_base_url.clone();
+        let gen_calls = self.gen_calls.clone();
+        Box::pin(async move {
+            let gen_call = gen_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let protocol_address = format!("0x{gen_call:040x}");
+            let custody_vault_id = request
+                .hyperliquid_custody_vault_id
+                .ok_or_else(|| "test withdrawal missing custody vault id".to_string())?;
+            let operation_request = json!({
+                "protocol_address": protocol_address,
+                "amount": request.amount,
+                "requested_amount": request.amount,
+            });
+            Ok(ProviderExecutionIntent::CustodyActions {
+                custody_vault_id,
+                actions: vec![CustodyAction::Call(ChainCall::Hyperliquid(
+                    HyperliquidCall {
+                        target_base_url: hyperliquid_base_url,
+                        network: HyperliquidCallNetwork::Testnet,
+                        vault_address: None,
+                        payload: HyperliquidCallPayload::SendAsset {
+                            destination: protocol_address.clone(),
+                            source_dex: "spot".to_string(),
+                            destination_dex: "spot".to_string(),
+                            token: "UETH:0x0000000000000000000000000000000000000000".to_string(),
+                            amount: "0.0391".to_string(),
+                        },
+                    },
+                ))],
+                provider_context: operation_request.clone(),
+                state: ProviderExecutionState {
+                    operation: Some(ProviderOperationIntent {
+                        operation_type: ProviderOperationType::UnitWithdrawal,
+                        status: ProviderOperationStatus::Submitted,
+                        provider_ref: Some(protocol_address),
+                        idempotency_key: None,
+                        request: Some(operation_request),
+                        response: Some(json!({
+                            "kind": "test_hyperunit_gen_response",
+                            "call": gen_call,
+                        })),
+                        observed_state: None,
+                    }),
+                    addresses: vec![],
+                },
             })
         })
     }
@@ -147,6 +250,51 @@ struct TestHyperliquidInfoServer {
     handle: tokio::task::JoinHandle<()>,
 }
 
+struct TestHyperliquidExchangeServer {
+    base_url: String,
+    send_asset_calls: Arc<AtomicUsize>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl TestHyperliquidExchangeServer {
+    async fn spawn() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test Hyperliquid exchange server");
+        let addr = listener
+            .local_addr()
+            .expect("read test Hyperliquid exchange server address");
+        let send_asset_calls = Arc::new(AtomicUsize::new(0));
+        let server_calls = send_asset_calls.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _peer)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(handle_test_hyperliquid_exchange_connection(
+                    stream,
+                    server_calls.clone(),
+                ));
+            }
+        });
+        Self {
+            base_url: format!("http://{addr}"),
+            send_asset_calls,
+            handle,
+        }
+    }
+
+    fn send_asset_call_count(&self) -> usize {
+        self.send_asset_calls.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for TestHyperliquidExchangeServer {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
 impl TestHyperliquidInfoServer {
     async fn spawn() -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -168,6 +316,48 @@ impl TestHyperliquidInfoServer {
             handle,
         }
     }
+}
+
+async fn handle_test_hyperliquid_exchange_connection(
+    mut stream: tokio::net::TcpStream,
+    send_asset_calls: Arc<AtomicUsize>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    loop {
+        let Ok(read) = stream.read(&mut chunk).await else {
+            return;
+        };
+        if read == 0 {
+            return;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if test_http_request_complete(&buffer) {
+            break;
+        }
+    }
+
+    let request = String::from_utf8_lossy(&buffer);
+    let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+    let payload = serde_json::from_str::<Value>(body).unwrap_or_else(|_| json!({}));
+    if payload.pointer("/action/type").and_then(Value::as_str) == Some("sendAsset") {
+        send_asset_calls.fetch_add(1, Ordering::SeqCst);
+    }
+    let response_body = json!({
+        "status": "ok",
+        "response": {
+            "type": "default"
+        }
+    })
+    .to_string();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        response_body.len(),
+        response_body
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
 }
 
 impl Drop for TestHyperliquidInfoServer {
@@ -500,6 +690,26 @@ async fn hint_arrival_records_latency_timestamp() {
         .await
         .expect("load latency record");
     assert!(latency.hint_arrived_at.is_some());
+}
+
+#[tokio::test]
+async fn unit_withdrawal_retry_reuses_existing_protocol_address_without_second_gen() {
+    let (gen_calls, _send_asset_calls) = run_unit_withdrawal_retry_idempotency_scenario().await;
+
+    assert_eq!(
+        gen_calls, 1,
+        "unit_withdrawal retry must not call HyperUnit /gen after a prior attempt persisted the protocol address"
+    );
+}
+
+#[tokio::test]
+async fn unit_withdrawal_retry_does_not_resend_hyperliquid_send_asset() {
+    let (_gen_calls, send_asset_calls) = run_unit_withdrawal_retry_idempotency_scenario().await;
+
+    assert_eq!(
+        send_asset_calls, 1,
+        "unit_withdrawal retry must observe the existing operation instead of firing sendAsset again"
+    );
 }
 
 #[tokio::test]
@@ -1500,8 +1710,21 @@ fn test_deps_with_action_providers(
     action_providers: Arc<ActionProviderRegistry>,
     hyperliquid_base_url: Option<String>,
 ) -> OrderActivityDeps {
+    test_deps_with_action_providers_and_chain_registry(
+        db,
+        action_providers,
+        hyperliquid_base_url,
+        Arc::new(ChainRegistry::new()),
+    )
+}
+
+fn test_deps_with_action_providers_and_chain_registry(
+    db: Database,
+    action_providers: Arc<ActionProviderRegistry>,
+    hyperliquid_base_url: Option<String>,
+    chain_registry: Arc<ChainRegistry>,
+) -> OrderActivityDeps {
     let settings = Arc::new(test_settings());
-    let chain_registry = Arc::new(ChainRegistry::new());
     let custody_executor = CustodyActionExecutor::new(db.clone(), settings, chain_registry.clone())
         .with_hyperliquid_runtime(hyperliquid_base_url.map(|base_url| {
             HyperliquidRuntimeConfig::new(base_url, HyperliquidCallNetwork::Testnet)
@@ -1875,6 +2098,7 @@ fn test_provider_operation(
         provider: ProviderId::Velora.as_str().to_string(),
         operation_type: ProviderOperationType::UniversalRouterSwap,
         provider_ref: Some("test-provider-ref".to_string()),
+        idempotency_key: None,
         status: ProviderOperationStatus::Submitted,
         request: json!({}),
         response: json!({}),
@@ -2256,6 +2480,340 @@ async fn seed_running_step(
         attempt_id,
         step_id,
     }
+}
+
+async fn seed_unit_withdrawal_retry_steps(
+    db: &Database,
+    pool: &PgPool,
+    vault_id: Uuid,
+    vault_address: String,
+    derivation_salt: [u8; 32],
+) -> (OrderExecutionStep, OrderExecutionStep) {
+    let order_id = Uuid::now_v7();
+    let first_attempt_id = Uuid::now_v7();
+    let retry_attempt_id = Uuid::now_v7();
+    let first_leg_id = Uuid::now_v7();
+    let retry_leg_id = Uuid::now_v7();
+    let first_step_id = Uuid::now_v7();
+    let retry_step_id = Uuid::now_v7();
+    let now = Utc::now();
+    let trace_id = order_id.simple().to_string();
+    let parent_span_id = trace_id[..16].to_string();
+    let request = json!({
+        "order_id": order_id,
+        "input_chain_id": "hyperliquid",
+        "input_asset": "UETH",
+        "dst_chain_id": "evm:8453",
+        "asset_id": "native",
+        "amount": "39000000000000000",
+        "min_amount_out": "1",
+        "recipient_address": test_address(3),
+        "hyperliquid_custody_vault_id": vault_id,
+        "hyperliquid_custody_vault_address": vault_address,
+    });
+
+    sqlx_core::query::query(
+        r#"
+            INSERT INTO router_orders (
+                id,
+                order_type,
+                status,
+                source_chain_id,
+                source_asset_id,
+                destination_chain_id,
+                destination_asset_id,
+                recipient_address,
+                refund_address,
+                action_timeout_at,
+                workflow_trace_id,
+                workflow_parent_span_id,
+                created_at,
+                updated_at
+            )
+            VALUES (
+                $1, 'market_order', 'executing', 'hyperliquid', 'UETH',
+                'evm:8453', 'native', $2, $3, $4, $5, $6, $7, $7
+            )
+            "#,
+    )
+    .bind(order_id)
+    .bind(test_address(3))
+    .bind(test_address(4))
+    .bind(now + chrono::Duration::hours(1))
+    .bind(trace_id)
+    .bind(parent_span_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert unit withdrawal test order");
+
+    sqlx_core::query::query(
+        r#"
+            INSERT INTO market_order_actions (
+                order_id,
+                order_kind,
+                amount_in,
+                min_amount_out,
+                amount_out,
+                max_amount_in,
+                created_at,
+                updated_at,
+                slippage_bps
+            )
+            VALUES ($1, 'exact_in', '39000000000000000', '1', NULL, NULL, $2, $2, 100)
+            "#,
+    )
+    .bind(order_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert unit withdrawal test market action");
+
+    for (attempt_id, attempt_index, attempt_kind, status) in [
+        (
+            first_attempt_id,
+            1_i32,
+            OrderExecutionAttemptKind::PrimaryExecution,
+            OrderExecutionAttemptStatus::Superseded,
+        ),
+        (
+            retry_attempt_id,
+            2_i32,
+            OrderExecutionAttemptKind::RetryExecution,
+            OrderExecutionAttemptStatus::Active,
+        ),
+    ] {
+        sqlx_core::query::query(
+            r#"
+                INSERT INTO order_execution_attempts (
+                    id,
+                    order_id,
+                    attempt_index,
+                    attempt_kind,
+                    status,
+                    trigger_step_id,
+                    failure_reason_json,
+                    input_custody_snapshot_json,
+                    created_at,
+                    updated_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, '{}'::jsonb, '{}'::jsonb, $7, $7)
+                "#,
+        )
+        .bind(attempt_id)
+        .bind(order_id)
+        .bind(attempt_index)
+        .bind(attempt_kind.to_db_string())
+        .bind(status.to_db_string())
+        .bind(None::<Uuid>)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert unit withdrawal test attempt");
+    }
+
+    let vault = CustodyVault {
+        id: vault_id,
+        order_id: Some(order_id),
+        role: CustodyVaultRole::HyperliquidSpot,
+        visibility: CustodyVaultVisibility::Internal,
+        chain: ChainId::parse("hyperliquid").expect("valid hyperliquid chain"),
+        asset: Some(AssetId::parse("UETH").expect("valid UETH asset")),
+        address: vault_address,
+        control_type: CustodyVaultControlType::RouterDerivedKey,
+        derivation_salt: Some(derivation_salt),
+        signer_ref: None,
+        status: CustodyVaultStatus::Active,
+        metadata: json!({}),
+        created_at: now,
+        updated_at: now,
+    };
+    db.orders()
+        .create_custody_vault(&vault)
+        .await
+        .expect("insert unit withdrawal test custody vault");
+
+    for (attempt_id, leg_id, step_id, details) in [
+        (first_attempt_id, first_leg_id, first_step_id, json!({})),
+        (
+            retry_attempt_id,
+            retry_leg_id,
+            retry_step_id,
+            json!({
+                "retry_attempt_from_step_id": first_step_id,
+                "retry_attempt_from_attempt_id": first_attempt_id,
+            }),
+        ),
+    ] {
+        sqlx_core::query::query(
+            r#"
+                INSERT INTO order_execution_legs (
+                    id,
+                    order_id,
+                    execution_attempt_id,
+                    transition_decl_id,
+                    leg_index,
+                    leg_type,
+                    provider,
+                    status,
+                    input_chain_id,
+                    input_asset_id,
+                    output_chain_id,
+                    output_asset_id,
+                    amount_in,
+                    expected_amount_out,
+                    min_amount_out,
+                    started_at,
+                    details_json,
+                    usd_valuation_json,
+                    created_at,
+                    updated_at
+                )
+                VALUES (
+                    $1, $2, $3, 'unit-withdrawal', 5, 'unit_withdrawal',
+                    'unit', 'running', 'hyperliquid', 'UETH', 'evm:8453', 'native',
+                    '39000000000000000', '39000000000000000', '1', $4, $5,
+                    '{}'::jsonb, $4, $4
+                )
+                "#,
+        )
+        .bind(leg_id)
+        .bind(order_id)
+        .bind(attempt_id)
+        .bind(now)
+        .bind(details.clone())
+        .execute(pool)
+        .await
+        .expect("insert unit withdrawal test leg");
+
+        sqlx_core::query::query(
+            r#"
+                INSERT INTO order_execution_steps (
+                    id,
+                    order_id,
+                    execution_attempt_id,
+                    execution_leg_id,
+                    transition_decl_id,
+                    step_index,
+                    step_type,
+                    provider,
+                    status,
+                    input_chain_id,
+                    input_asset_id,
+                    output_chain_id,
+                    output_asset_id,
+                    amount_in,
+                    min_amount_out,
+                    idempotency_key,
+                    attempt_count,
+                    started_at,
+                    details_json,
+                    request_json,
+                    response_json,
+                    error_json,
+                    usd_valuation_json,
+                    created_at,
+                    updated_at
+                )
+                VALUES (
+                    $1, $2, $3, $4, 'unit-withdrawal', 5, 'unit_withdrawal',
+                    'unit', 'running', 'hyperliquid', 'UETH', 'evm:8453', 'native',
+                    '39000000000000000', '1', $5, 1, $6, $7, $8,
+                    '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, $6, $6
+                )
+                "#,
+        )
+        .bind(step_id)
+        .bind(order_id)
+        .bind(attempt_id)
+        .bind(leg_id)
+        .bind(format!("attempt:{attempt_id}:unit-withdrawal"))
+        .bind(now)
+        .bind(details)
+        .bind(request.clone())
+        .execute(pool)
+        .await
+        .expect("insert unit withdrawal test step");
+    }
+
+    let first = db
+        .orders()
+        .get_execution_step(first_step_id)
+        .await
+        .expect("load first unit withdrawal step");
+    let retry = db
+        .orders()
+        .get_execution_step(retry_step_id)
+        .await
+        .expect("load retry unit withdrawal step");
+    (first, retry)
+}
+
+async fn run_unit_withdrawal_retry_idempotency_scenario() -> (usize, usize) {
+    let test_db = test_database().await;
+    let exchange_server = TestHyperliquidExchangeServer::spawn().await;
+    let (unit_provider, gen_calls) =
+        CountingUnitWithdrawalProvider::new(exchange_server.base_url.clone());
+    let action_providers = Arc::new(ActionProviderRegistry::new(
+        vec![],
+        vec![Arc::new(unit_provider)],
+        vec![],
+    ));
+    let settings = test_settings();
+    let derivation_salt = [0x55_u8; 32];
+    let hyperliquid_chain = Arc::new(HyperliquidChain::new(
+        b"hyperliquid-wallet",
+        1,
+        std::time::Duration::from_secs(1),
+    ));
+    let vault_address = hyperliquid_chain
+        .derive_wallet(&settings.master_key_bytes(), &derivation_salt)
+        .expect("derive test Hyperliquid wallet")
+        .address
+        .clone();
+    let mut chain_registry = ChainRegistry::new();
+    chain_registry.register(ChainType::Hyperliquid, hyperliquid_chain);
+    let deps = test_deps_with_action_providers_and_chain_registry(
+        test_db.db.clone(),
+        action_providers,
+        Some(exchange_server.base_url.clone()),
+        Arc::new(chain_registry),
+    );
+    let (first_step, retry_step) = seed_unit_withdrawal_retry_steps(
+        &test_db.db,
+        &test_db.pool,
+        Uuid::now_v7(),
+        vault_address,
+        derivation_salt,
+    )
+    .await;
+
+    execute_running_step(&deps, &first_step)
+        .await
+        .expect("execute first unit withdrawal attempt");
+    sqlx_core::query::query(
+        r#"
+        UPDATE order_execution_steps
+        SET status = 'superseded',
+            completed_at = $2,
+            updated_at = $2
+        WHERE id = $1
+        "#,
+    )
+    .bind(first_step.id)
+    .bind(Utc::now())
+    .execute(&test_db.pool)
+    .await
+    .expect("mark first unit withdrawal step superseded");
+
+    execute_running_step(&deps, &retry_step)
+        .await
+        .expect("execute retry unit withdrawal attempt");
+
+    (
+        gen_calls.load(Ordering::SeqCst),
+        exchange_server.send_asset_call_count(),
+    )
 }
 
 async fn assert_step_classification(db: &Database, step_id: Uuid, expected_reason: &str) {

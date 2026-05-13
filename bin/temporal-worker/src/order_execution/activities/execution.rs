@@ -2078,16 +2078,154 @@ fn execute_unit_withdrawal_step<'a>(
     async move {
         let request = UnitWithdrawalStepRequest::from_value(&step.request)
             .map_err(|source| provider_execute_error(&step.provider, source))?;
-        let intent = deps
+        let idempotency_key = unit_withdrawal_operation_idempotency_key(step, &request)
+            .map_err(|source| provider_execute_error(&step.provider, source))?;
+        if let Some(operation) = deps
+            .db
+            .orders()
+            .get_provider_operation_by_idempotency_key(
+                &step.provider,
+                ProviderOperationType::UnitWithdrawal,
+                &idempotency_key,
+            )
+            .await
+            .map_err(OrderActivityError::db_query)?
+        {
+            return unit_withdrawal_existing_operation_completion(step, operation, idempotency_key);
+        }
+
+        let mut intent = deps
             .action_providers
             .unit(&step.provider)
             .ok_or_else(|| provider_not_configured(step))?
             .execute_withdrawal(&request)
             .await
             .map_err(|source| provider_execute_error(&step.provider, source))?;
+        set_provider_intent_operation_idempotency_key(&mut intent, idempotency_key.clone());
+        if let Some(operation) =
+            persist_unit_withdrawal_intent_before_side_effect(deps, step, &intent).await?
+        {
+            return unit_withdrawal_existing_operation_completion(step, operation, idempotency_key);
+        }
         Ok(StepDispatchResult::ProviderIntent(intent))
     }
     .boxed()
+}
+
+fn unit_withdrawal_operation_idempotency_key(
+    step: &OrderExecutionStep,
+    request: &UnitWithdrawalStepRequest,
+) -> Result<String, String> {
+    let vault_id = request.hyperliquid_custody_vault_id.ok_or_else(|| {
+        "unit withdrawal idempotency requires hyperliquid_custody_vault_id".to_string()
+    })?;
+    Ok(format!(
+        "order:{}:unit_withdrawal:step:{}:hyperliquid_custody_vault:{}",
+        step.order_id, step.step_index, vault_id
+    ))
+}
+
+fn set_provider_intent_operation_idempotency_key(
+    intent: &mut ProviderExecutionIntent,
+    idempotency_key: String,
+) {
+    let operation = match intent {
+        ProviderExecutionIntent::ProviderOnly { state, .. }
+        | ProviderExecutionIntent::CustodyAction { state, .. }
+        | ProviderExecutionIntent::CustodyActions { state, .. } => state.operation.as_mut(),
+    };
+    if let Some(operation) = operation {
+        operation.idempotency_key = Some(idempotency_key);
+    }
+}
+
+async fn persist_unit_withdrawal_intent_before_side_effect(
+    deps: &OrderActivityDeps,
+    step: &OrderExecutionStep,
+    intent: &ProviderExecutionIntent,
+) -> Result<Option<OrderProviderOperation>, OrderActivityError> {
+    let state = match intent {
+        ProviderExecutionIntent::ProviderOnly { state, .. }
+        | ProviderExecutionIntent::CustodyAction { state, .. }
+        | ProviderExecutionIntent::CustodyActions { state, .. } => state,
+    };
+    let Some(operation_intent) = state.operation.as_ref() else {
+        return Ok(None);
+    };
+    if operation_intent.operation_type != ProviderOperationType::UnitWithdrawal {
+        return Ok(None);
+    }
+
+    let (operation, _) = provider_state_records(
+        step,
+        state,
+        &json!({
+            "kind": "unit_withdrawal_provider_operation_pre_side_effect",
+        }),
+    )
+    .map_err(|source| provider_execute_error(&step.provider, source))?;
+    let Some(operation) = operation else {
+        return Ok(None);
+    };
+    let candidate_operation_id = operation.id;
+    let provider_operation_id = deps
+        .db
+        .orders()
+        .upsert_provider_operation(&operation)
+        .await
+        .map_err(OrderActivityError::db_query)?;
+    if provider_operation_id == candidate_operation_id {
+        return Ok(None);
+    }
+
+    deps.db
+        .orders()
+        .get_provider_operation(provider_operation_id)
+        .await
+        .map(Some)
+        .map_err(OrderActivityError::db_query)
+}
+
+fn unit_withdrawal_existing_operation_completion(
+    step: &OrderExecutionStep,
+    operation: OrderProviderOperation,
+    idempotency_key: String,
+) -> Result<StepDispatchResult, OrderActivityError> {
+    let outcome = if operation.status == ProviderOperationStatus::Completed {
+        StepExecutionOutcome::Completed
+    } else {
+        StepExecutionOutcome::Waiting
+    };
+    let tx_hash = provider_operation_tx_hash(&operation);
+    let state = ProviderExecutionState {
+        operation: Some(ProviderOperationIntent {
+            operation_type: operation.operation_type,
+            status: operation.status,
+            provider_ref: operation.provider_ref.clone(),
+            idempotency_key: operation
+                .idempotency_key
+                .clone()
+                .or_else(|| Some(idempotency_key.clone())),
+            request: Some(operation.request.clone()),
+            response: Some(operation.response.clone()),
+            observed_state: Some(operation.observed_state.clone()),
+        }),
+        addresses: Vec::new(),
+    };
+    Ok(StepDispatchResult::Complete(StepCompletion {
+        response: json!({
+            "kind": "unit_withdrawal_idempotency_reuse",
+            "provider": &step.provider,
+            "step_id": step.id,
+            "provider_operation_id": operation.id,
+            "provider_ref": &operation.provider_ref,
+            "idempotency_key": idempotency_key,
+            "status": operation.status.to_db_string(),
+        }),
+        tx_hash,
+        provider_state: state,
+        outcome,
+    }))
 }
 
 fn execute_hyperliquid_trade_step<'a>(
@@ -2336,6 +2474,7 @@ pub(super) fn provider_state_records(
                 provider: step.provider.clone(),
                 operation_type: operation.operation_type,
                 provider_ref: provider_operation_ref_for_persist(step, operation)?,
+                idempotency_key: operation.idempotency_key.clone(),
                 status: operation.status,
                 request: operation
                     .request

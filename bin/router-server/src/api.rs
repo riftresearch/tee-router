@@ -997,6 +997,7 @@ mod tests {
             provider: "across".to_string(),
             operation_type: ProviderOperationType::AcrossBridge,
             provider_ref: Some("provider-ref".to_string()),
+            idempotency_key: None,
             status: ProviderOperationStatus::WaitingExternal,
             request: json!({}),
             response: json!({}),
