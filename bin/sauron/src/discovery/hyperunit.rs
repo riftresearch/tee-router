@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     str::FromStr,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -23,7 +24,11 @@ use router_temporal::{
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio::time::{timeout, MissedTickBehavior};
+use tokio::{
+    sync::Mutex,
+    task::JoinSet,
+    time::{timeout, MissedTickBehavior},
+};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -108,65 +113,131 @@ pub async fn run_hyperunit_observer_loop(
     hl: HlShimClient,
     btc: BitcoinClients,
     evm: Option<EvmReceiptObserverClients>,
+    concurrency_limit: usize,
 ) -> Result<()> {
+    let router_client = Arc::new(router_client);
+    let unit = Arc::new(unit);
+    let hl = Arc::new(hl);
+    let btc = Arc::new(btc);
+    let evm = evm.map(Arc::new);
     let mut poll_state = HashMap::<Uuid, PollState>::new();
-    let mut submitted = HashSet::<(Uuid, String)>::new();
+    let submitted = Arc::new(Mutex::new(HashSet::<(Uuid, String)>::new()));
     let mut ticker = tokio::time::interval(HYPERUNIT_OBSERVER_TICK);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     ticker.tick().await;
 
     loop {
-        let operations = store.snapshot().await;
-        let active = operations
-            .iter()
-            .map(|operation| operation.operation_id)
-            .collect::<HashSet<_>>();
-        poll_state.retain(|operation_id, _| active.contains(operation_id));
-        submitted.retain(|(operation_id, _)| active.contains(operation_id));
-
-        for operation in operations {
-            if !is_hyperunit_operation(operation.operation_type) {
-                continue;
-            }
-            let now = Instant::now();
-            let state = poll_state
-                .entry(operation.operation_id)
-                .or_insert(PollState {
-                    first_seen: now,
-                    next_poll_at: now,
-                });
-            if state.first_seen.elapsed() > HYPERUNIT_MAX_WAIT {
-                warn!(
-                    operation_id = %operation.operation_id,
-                    operation_type = operation.operation_type.to_db_string(),
-                    "HyperUnit observer reached max wait; leaving operation for router timeout/MIR"
-                );
-                state.next_poll_at = now + Duration::from_secs(60);
-                continue;
-            }
-            if state.next_poll_at > now {
-                continue;
-            }
-            state.next_poll_at = now + hyperunit_poll_interval(state.first_seen.elapsed());
-
-            let hints = match hyperunit_hints(&unit, &hl, &btc, evm.as_ref(), &operation).await {
-                Ok(hints) => hints,
-                Err(error) => {
-                    warn!(
-                        operation_id = %operation.operation_id,
-                        operation_type = operation.operation_type.to_db_string(),
-                        %error,
-                        "HyperUnit observer failed to build hints"
-                    );
-                    continue;
-                }
-            };
-            for hint in hints {
-                submit_hint(&router_client, &mut submitted, &operation, hint).await;
-            }
-        }
+        run_hyperunit_observer_cycle(
+            &store,
+            Arc::clone(&router_client),
+            Arc::clone(&unit),
+            Arc::clone(&hl),
+            Arc::clone(&btc),
+            evm.clone(),
+            concurrency_limit,
+            &mut poll_state,
+            Arc::clone(&submitted),
+        )
+        .await;
 
         ticker.tick().await;
+    }
+}
+
+async fn run_hyperunit_observer_cycle(
+    store: &ProviderOperationWatchStore,
+    router_client: Arc<RouterClient>,
+    unit: Arc<HyperUnitClient>,
+    hl: Arc<HlShimClient>,
+    btc: Arc<BitcoinClients>,
+    evm: Option<Arc<EvmReceiptObserverClients>>,
+    concurrency_limit: usize,
+    poll_state: &mut HashMap<Uuid, PollState>,
+    submitted: Arc<Mutex<HashSet<(Uuid, String)>>>,
+) {
+    let operations = store.snapshot().await;
+    let active = operations
+        .iter()
+        .map(|operation| operation.operation_id)
+        .collect::<HashSet<_>>();
+    poll_state.retain(|operation_id, _| active.contains(operation_id));
+    {
+        let mut submitted = submitted.lock().await;
+        submitted.retain(|(operation_id, _)| active.contains(operation_id));
+    }
+
+    let mut due = Vec::new();
+    for operation in operations {
+        if !is_hyperunit_operation(operation.operation_type) {
+            continue;
+        }
+        let now = Instant::now();
+        let state = poll_state
+            .entry(operation.operation_id)
+            .or_insert(PollState {
+                first_seen: now,
+                next_poll_at: now,
+            });
+        if state.first_seen.elapsed() > HYPERUNIT_MAX_WAIT {
+            warn!(
+                operation_id = %operation.operation_id,
+                operation_type = operation.operation_type.to_db_string(),
+                "HyperUnit observer reached max wait; leaving operation for router timeout/MIR"
+            );
+            state.next_poll_at = now + Duration::from_secs(60);
+            continue;
+        }
+        if state.next_poll_at > now {
+            continue;
+        }
+        state.next_poll_at = now + hyperunit_poll_interval(state.first_seen.elapsed());
+        due.push(operation);
+    }
+
+    let concurrency_limit = concurrency_limit.max(1);
+    let mut operations = due.into_iter();
+    let mut tasks = JoinSet::new();
+    loop {
+        while tasks.len() < concurrency_limit {
+            let Some(operation) = operations.next() else {
+                break;
+            };
+            let router_client = Arc::clone(&router_client);
+            let unit = Arc::clone(&unit);
+            let hl = Arc::clone(&hl);
+            let btc = Arc::clone(&btc);
+            let evm = evm.clone();
+            let submitted = Arc::clone(&submitted);
+            tasks.spawn(async move {
+                let hints =
+                    match hyperunit_hints(&unit, &hl, &btc, evm.as_deref(), &operation).await {
+                        Ok(hints) => hints,
+                        Err(error) => {
+                            warn!(
+                                operation_id = %operation.operation_id,
+                                operation_type = operation.operation_type.to_db_string(),
+                                %error,
+                                "HyperUnit observer failed to build hints"
+                            );
+                            return;
+                        }
+                    };
+                for hint in hints {
+                    submit_hint(&router_client, &submitted, &operation, hint).await;
+                }
+            });
+        }
+
+        if tasks.is_empty() {
+            break;
+        }
+        match tasks.join_next().await {
+            Some(Ok(())) => {}
+            Some(Err(error)) => {
+                warn!(%error, "HyperUnit observer task failed");
+            }
+            None => break,
+        }
     }
 }
 
@@ -424,7 +495,7 @@ async fn withdrawal_hints(
 
 async fn submit_hint(
     router_client: &RouterClient,
-    submitted: &mut HashSet<(Uuid, String)>,
+    submitted: &Mutex<HashSet<(Uuid, String)>>,
     operation: &SharedProviderOperationWatchEntry,
     hint: ProviderOperationHintRequest,
 ) {
@@ -433,14 +504,16 @@ async fn submit_hint(
         .clone()
         .unwrap_or_else(|| operation.operation_id.to_string());
     let key = (operation.operation_id, key_text);
-    if submitted.contains(&key) {
-        return;
+    {
+        let mut submitted = submitted.lock().await;
+        if !submitted.insert(key.clone()) {
+            return;
+        }
     }
     match router_client.submit_provider_operation_hint(&hint).await {
-        Ok(_) => {
-            submitted.insert(key);
-        }
+        Ok(_) => {}
         Err(error) => {
+            submitted.lock().await.remove(&key);
             warn!(
                 operation_id = %operation.operation_id,
                 hint_kind = hint.hint_kind.to_db_string(),
@@ -1100,12 +1173,23 @@ mod tests {
         absolute::LockTime, transaction::Version, Amount, OutPoint, ScriptBuf, Sequence,
         Transaction, TxIn, TxOut, Witness,
     };
-    use router_core::models::ProviderOperationStatus;
+    use router_core::models::{
+        OrderProviderOperationHint, ProviderOperationHintStatus, ProviderOperationStatus,
+    };
+    use router_server::api::ProviderOperationHintEnvelope;
     use router_temporal::WorkflowStepId;
     use serde::de::DeserializeOwned;
-    use std::collections::BTreeSet;
-    use std::sync::Arc;
-    use tokio::{net::TcpListener, sync::watch, task::JoinHandle};
+    use std::collections::{BTreeSet, HashMap, HashSet};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use tokio::{
+        net::TcpListener,
+        sync::{watch, Mutex},
+        task::JoinHandle,
+        time::sleep,
+    };
 
     #[test]
     fn btc_deposit_evidence_matches_router_typed_shape() {
@@ -1304,6 +1388,98 @@ mod tests {
 
         assert!(deposit_status.is_none());
         assert!(withdrawal_status.is_none());
+    }
+
+    #[tokio::test]
+    async fn hyperunit_observer_cycle_polls_due_operations_concurrently() {
+        let protocol_address = "0x73c1d4b7add80c7cfea60a997c615064a424a844";
+        let operation_count = 100;
+        let server = spawn_delayed_hyperunit_operations_server(
+            protocol_address,
+            StatusCode::OK,
+            serde_json::json!({
+                "addresses": [],
+                "operations": []
+            }),
+            Duration::from_millis(50),
+        )
+        .await;
+        let store = ProviderOperationWatchStore::default();
+        let entries = (0..operation_count)
+            .map(|_| {
+                provider_operation(
+                    ProviderOperationType::UnitDeposit,
+                    protocol_address,
+                    serde_json::json!({
+                        "asset": "eth",
+                        "amount": "1",
+                        "src_chain": "ethereum",
+                        "dst_chain": "hyperliquid",
+                        "protocol_address": protocol_address
+                    }),
+                )
+                .as_ref()
+                .clone()
+            })
+            .collect::<Vec<_>>();
+        store.replace_all(entries).await;
+
+        let started = Instant::now();
+        let mut poll_state = HashMap::new();
+        let submitted = Arc::new(Mutex::new(HashSet::new()));
+        run_hyperunit_observer_cycle(
+            &store,
+            Arc::new(RouterClient::new_for_test("http://127.0.0.1:1")),
+            Arc::new(HyperUnitClient::new(server.base_url()).expect("HyperUnit client")),
+            Arc::new(HlShimClient::new("http://127.0.0.1:1").expect("HL client")),
+            Arc::new(dummy_bitcoin_clients(None)),
+            None,
+            25,
+            &mut poll_state,
+            Arc::clone(&submitted),
+        )
+        .await;
+
+        assert_eq!(server.request_count(), operation_count);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "bounded-concurrent cycle should complete well below serial 5s path, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_hint_deduplicates_concurrent_submissions() {
+        let protocol_address = "0x73c1d4b7add80c7cfea60a997c615064a424a844";
+        let router = spawn_router_hint_server(Duration::from_millis(100)).await;
+        let router_client = RouterClient::new_for_test(router.base_url());
+        let operation = provider_operation(
+            ProviderOperationType::UnitDeposit,
+            protocol_address,
+            serde_json::json!({
+                "asset": "eth",
+                "amount": "1",
+                "src_chain": "ethereum",
+                "dst_chain": "hyperliquid"
+            }),
+        );
+        let hint = ProviderOperationHintRequest {
+            provider_operation_id: operation.operation_id,
+            execution_step_id: operation.execution_step_id,
+            source: SAURON_HYPERUNIT_OBSERVER_HINT_SOURCE.to_string(),
+            hint_kind: ProviderOperationHintKind::BtcDepositObserved,
+            evidence: serde_json::json!({ "tx": "same" }),
+            idempotency_key: Some("same-hint-key".to_string()),
+        };
+        let submitted = Arc::new(Mutex::new(HashSet::new()));
+
+        tokio::join!(
+            submit_hint(&router_client, &submitted, &operation, hint.clone()),
+            submit_hint(&router_client, &submitted, &operation, hint)
+        );
+
+        assert_eq!(router.request_count(), 1);
+        assert_eq!(submitted.lock().await.len(), 1);
     }
 
     #[test]
@@ -1913,16 +2089,23 @@ mod tests {
         expected_address: String,
         status: StatusCode,
         body: Value,
+        delay: Duration,
+        requests: Arc<AtomicUsize>,
     }
 
     struct HyperUnitOperationsMockServer {
         base_url: String,
         handle: JoinHandle<()>,
+        requests: Arc<AtomicUsize>,
     }
 
     impl HyperUnitOperationsMockServer {
         fn base_url(&self) -> &str {
             &self.base_url
+        }
+
+        fn request_count(&self) -> usize {
+            self.requests.load(Ordering::SeqCst)
         }
     }
 
@@ -1937,10 +2120,23 @@ mod tests {
         status: StatusCode,
         body: Value,
     ) -> HyperUnitOperationsMockServer {
+        spawn_delayed_hyperunit_operations_server(expected_address, status, body, Duration::ZERO)
+            .await
+    }
+
+    async fn spawn_delayed_hyperunit_operations_server(
+        expected_address: &str,
+        status: StatusCode,
+        body: Value,
+        delay: Duration,
+    ) -> HyperUnitOperationsMockServer {
+        let requests = Arc::new(AtomicUsize::new(0));
         let state = HyperUnitOperationsMockState {
             expected_address: expected_address.to_string(),
             status,
             body,
+            delay,
+            requests: Arc::clone(&requests),
         };
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -1957,6 +2153,7 @@ mod tests {
         HyperUnitOperationsMockServer {
             base_url: format!("http://{addr}"),
             handle,
+            requests,
         }
     }
 
@@ -1964,6 +2161,10 @@ mod tests {
         State(state): State<HyperUnitOperationsMockState>,
         Path(address): Path<String>,
     ) -> Response {
+        state.requests.fetch_add(1, Ordering::SeqCst);
+        if !state.delay.is_zero() {
+            sleep(state.delay).await;
+        }
         if address != state.expected_address {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1974,6 +2175,89 @@ mod tests {
                 .into_response();
         }
         (state.status, Json(state.body)).into_response()
+    }
+
+    #[derive(Clone)]
+    struct RouterHintMockState {
+        delay: Duration,
+        requests: Arc<AtomicUsize>,
+    }
+
+    struct RouterHintMockServer {
+        base_url: String,
+        handle: JoinHandle<()>,
+        requests: Arc<AtomicUsize>,
+    }
+
+    impl RouterHintMockServer {
+        fn base_url(&self) -> &str {
+            &self.base_url
+        }
+
+        fn request_count(&self) -> usize {
+            self.requests.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for RouterHintMockServer {
+        fn drop(&mut self) {
+            self.handle.abort();
+        }
+    }
+
+    async fn spawn_router_hint_server(delay: Duration) -> RouterHintMockServer {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind router hint mock server");
+        let addr = listener.local_addr().expect("router hint mock server addr");
+        let app = Router::new()
+            .route(
+                "/api/v1/provider-operations/hints",
+                post(router_hint_handler),
+            )
+            .with_state(RouterHintMockState {
+                delay,
+                requests: Arc::clone(&requests),
+            });
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("router hint mock server should run");
+        });
+        RouterHintMockServer {
+            base_url: format!("http://{addr}"),
+            handle,
+            requests,
+        }
+    }
+
+    async fn router_hint_handler(
+        State(state): State<RouterHintMockState>,
+        Json(request): Json<ProviderOperationHintRequest>,
+    ) -> Response {
+        state.requests.fetch_add(1, Ordering::SeqCst);
+        if !state.delay.is_zero() {
+            sleep(state.delay).await;
+        }
+        let now = chrono::Utc::now();
+        Json(ProviderOperationHintEnvelope {
+            hint: OrderProviderOperationHint {
+                id: Uuid::now_v7(),
+                provider_operation_id: request.provider_operation_id,
+                source: request.source,
+                hint_kind: request.hint_kind,
+                evidence: request.evidence,
+                status: ProviderOperationHintStatus::Pending,
+                idempotency_key: request.idempotency_key,
+                error: serde_json::json!({}),
+                claimed_at: None,
+                processed_at: None,
+                created_at: now,
+                updated_at: now,
+            },
+        })
+        .into_response()
     }
 
     #[derive(Clone)]
