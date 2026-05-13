@@ -75,7 +75,11 @@ async fn bridge_fixture_with_config(
     GenericEIP3009ERC20Instance<DynProvider>,
     Address,
 ) {
-    let anvil = Anvil::new().block_time(1).try_spawn().expect("anvil spawn");
+    let anvil = Anvil::new()
+        .prague()
+        .block_time(1)
+        .try_spawn()
+        .expect("anvil spawn");
     let rpc_url: Url = anvil.endpoint_url();
     let private_key: [u8; 32] = anvil.keys()[0].clone().to_bytes().into();
     let signer = format!("0x{}", hex::encode(private_key))
@@ -107,7 +111,8 @@ async fn bridge_fixture_with_config(
     let config = MockIntegratorConfig::default()
         .with_hyperliquid_bridge_address(format!("{bridge_address:#x}"))
         .with_hyperliquid_evm_rpc_url(rpc_url.to_string())
-        .with_hyperliquid_usdc_token_address(format!("{:#x}", token.address()));
+        .with_hyperliquid_usdc_token_address(format!("{:#x}", token.address()))
+        .with_mock_service_evm_chain(anvil.chain_id(), rpc_url.to_string());
     let server = MockIntegratorServer::spawn_with_config(configure(config))
         .await
         .expect("spawn mock integrator");

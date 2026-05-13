@@ -1,4 +1,4 @@
-use std::{fmt, sync::Arc};
+use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use blockchain_utils::create_websocket_wallet_provider;
 use eip3009_erc20_contract::GenericEIP3009ERC20::GenericEIP3009ERC20Instance;
@@ -6,6 +6,7 @@ use eip7702_delegator_contract::{
     EIP7702Delegator::EIP7702DelegatorInstance, EIP7702_DELEGATOR_BYTECODE,
     EIP7702_DELEGATOR_CROSSCHAIN_ADDRESS,
 };
+use eip7702_paymaster::{Paymaster, PaymasterBatchConfig};
 use eyre::{eyre, Result};
 use hyperliquid_client::{
     bridge::bridge_address as hyperliquid_bridge_address, client::Network as HyperliquidNetwork,
@@ -14,9 +15,11 @@ use tokio::time::Instant;
 use tracing::info;
 
 use alloy::{
+    network::EthereumWallet,
     node_bindings::{Anvil, AnvilInstance},
     primitives::{Address, Bytes, U256},
-    providers::{ext::AnvilApi, DynProvider, Provider},
+    providers::{ext::AnvilApi, DynProvider, Provider, ProviderBuilder},
+    signers::local::PrivateKeySigner,
 };
 
 use crate::{
@@ -27,10 +30,11 @@ use crate::{
     },
     get_new_temp_dir,
     hyperliquid_bridge_mock::MockHyperliquidBridge2::MockHyperliquidBridge2Instance,
-    manifest::DEVNET_ETHEREUM_RPC_PORT,
+    manifest::{DEVNET_ETHEREUM_RPC_PORT, MOCK_SERVICE_NATIVE_BALANCE_WEI},
+    mock_integrators::{MockService, MockServicePaymaster},
     token_indexerd::{TokenIndexerConfig, TokenIndexerInstance},
     velora_mock::MockVeloraSwap::MockVeloraSwapInstance,
-    RiftDevnetCache,
+    MultichainAccount, RiftDevnetCache,
 };
 
 pub const MOCK_ERC20_ADDRESS: &str = "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf";
@@ -48,6 +52,8 @@ pub const MOCK_VELORA_NATIVE_RESERVE_WEI: u128 = 1_000_000_000_000_000_000_000_0
 pub const MOCK_CCTP_TOKEN_MESSENGER_V2_ADDRESS: &str = "0xcccccccccccccccccccccccccccccccccccc0001";
 pub const MOCK_CCTP_MESSAGE_TRANSMITTER_V2_ADDRESS: &str =
     "0xcccccccccccccccccccccccccccccccccccc0002";
+const MOCK_SERVICE_PAYMASTER_VAULT_GAS_BUFFER_WEI: U256 =
+    U256::from_limbs([100_000_000_000_000_000, 0, 0, 0]);
 
 /// Holds all Ethereum-related devnet state.
 pub struct EthDevnet {
@@ -262,6 +268,103 @@ impl EthDevnet {
     }
 
     */
+}
+
+pub async fn setup_mock_service_paymasters(
+    evm_chains: &BTreeMap<u64, String>,
+    accounts: &BTreeMap<MockService, MultichainAccount>,
+) -> Result<BTreeMap<(MockService, u64), MockServicePaymaster>> {
+    let mut paymasters = BTreeMap::new();
+    let delegator_address =
+        parse_address(EIP7702_DELEGATOR_CROSSCHAIN_ADDRESS, "EIP-7702 delegator")?;
+    let delegator_bytecode =
+        parse_bytes(EIP7702_DELEGATOR_BYTECODE, "EIP-7702 delegator bytecode")?;
+
+    for (&chain_id, rpc_url) in evm_chains {
+        let http_url = evm_http_url_for_paymaster(rpc_url)?;
+        let provider = ProviderBuilder::new()
+            .connect_http(http_url.clone())
+            .erased();
+        provider
+            .anvil_set_code(delegator_address, delegator_bytecode.clone())
+            .await?;
+
+        for service in MockService::ALL {
+            let account = accounts.get(&service).ok_or_else(|| {
+                eyre!(
+                    "missing deterministic account for {} mock service",
+                    service.display_name()
+                )
+            })?;
+            let service_signer = PrivateKeySigner::from_bytes(&account.secret_bytes.into())
+                .map_err(|error| {
+                    eyre!(
+                        "failed to derive {} mock service EVM signer from salt {}: {error}",
+                        service.display_name(),
+                        service.salt()
+                    )
+                })?;
+            let wallet_provider = ProviderBuilder::new()
+                .wallet(EthereumWallet::new(service_signer.clone()))
+                .connect_http(http_url.clone())
+                .erased();
+            let metric_label = service.metric_label(chain_id);
+
+            provider
+                .anvil_set_balance(account.ethereum_address, MOCK_SERVICE_NATIVE_BALANCE_WEI)
+                .await?;
+            eip7702_paymaster::ensure_eip7702_delegation(
+                &wallet_provider,
+                &service_signer,
+                metric_label,
+            )
+            .await?;
+            let handle = Paymaster::spawn(
+                provider.clone(),
+                wallet_provider,
+                service_signer,
+                MOCK_SERVICE_PAYMASTER_VAULT_GAS_BUFFER_WEI,
+                metric_label,
+                PaymasterBatchConfig::default(),
+            );
+
+            info!(
+                service = ?service,
+                chain_id,
+                metric_label,
+                evm_address = %account.ethereum_address,
+                bitcoin_address = %account.bitcoin_wallet.address,
+                balance_wei = %MOCK_SERVICE_NATIVE_BALANCE_WEI,
+                "mock service EIP-7702 paymaster provisioned"
+            );
+            paymasters.insert(
+                (service, chain_id),
+                MockServicePaymaster::live(service, chain_id, handle),
+            );
+        }
+    }
+
+    Ok(paymasters)
+}
+
+fn evm_http_url_for_paymaster(raw_url: &str) -> Result<url::Url> {
+    let mut url = url::Url::parse(raw_url.trim())
+        .map_err(|error| eyre!("invalid mock service EVM RPC URL {raw_url:?}: {error}"))?;
+    match url.scheme() {
+        "http" | "https" => {}
+        "ws" => url
+            .set_scheme("http")
+            .map_err(|()| eyre!("invalid ws mock service EVM RPC URL {raw_url:?}"))?,
+        "wss" => url
+            .set_scheme("https")
+            .map_err(|()| eyre!("invalid wss mock service EVM RPC URL {raw_url:?}"))?,
+        scheme => {
+            return Err(eyre!(
+                "unsupported mock service EVM RPC URL scheme {scheme:?} for {raw_url:?}"
+            ))
+        }
+    }
+    Ok(url)
 }
 
 #[derive(Clone)]

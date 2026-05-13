@@ -11,8 +11,14 @@ use crate::{
     },
     MultichainAccount, Result, RiftDevnet,
 };
+use alloy::primitives::U256;
 
 pub const DEVNET_DEMO_ACCOUNT_SALT: u32 = 110_101;
+pub const SALT_MOCK_HYPERUNIT: u32 = 800_001;
+pub const SALT_MOCK_HYPERLIQUID_BRIDGE: u32 = 800_002;
+pub const SALT_MOCK_ACROSS: u32 = 800_003;
+pub const MOCK_SERVICE_NATIVE_BALANCE_WEI: U256 =
+    U256::from_limbs([0xb34b_9f10_0000_0000, 0x00c0_97ce_7bc9_0715, 0, 0]);
 pub const DEVNET_BITCOIN_RPC_PORT: u16 = 50_100;
 pub const DEVNET_ETHEREUM_RPC_PORT: u16 = 50_101;
 pub const DEVNET_BASE_RPC_PORT: u16 = 50_102;

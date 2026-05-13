@@ -1,9 +1,8 @@
 use alloy::{
     hex,
-    network::TransactionBuilder,
-    primitives::{Address, Bytes, FixedBytes, B256, U256},
+    primitives::{Address, Bytes, FixedBytes, TxHash, B256, U256},
     providers::{ext::AnvilApi, DynProvider, Provider, ProviderBuilder},
-    rpc::types::{Filter, TransactionRequest},
+    rpc::types::Filter,
     signers::local::PrivateKeySigner,
     sol,
     sol_types::{SolCall, SolEvent, SolValue},
@@ -39,15 +38,17 @@ use std::{
     time::Duration,
 };
 use tokio::{net::TcpListener, sync::Mutex, task::JoinHandle};
-use url::Url;
 use uuid::Uuid;
 
 use crate::{
     across_spoke_pool_mock::MockSpokePool::{depositCall, FundsDeposited},
     cctp_mock::MockCctpTokenMessengerV2::DepositForBurn,
     hyperliquid_bridge_mock::MockHyperliquidBridge2,
+    manifest::{SALT_MOCK_ACROSS, SALT_MOCK_HYPERLIQUID_BRIDGE, SALT_MOCK_HYPERUNIT},
     velora_mock::MockVeloraSwap,
+    MultichainAccount,
 };
+use eip7702_paymaster::{Execution, PaymasterError, PaymasterHandle};
 
 sol! {
     #[sol(rpc)]
@@ -73,6 +74,108 @@ const DEFAULT_ETH_USD_MICRO: u128 = 3_000 * USD_MICRO;
 const DEFAULT_BTC_USD_MICRO: u128 = 100_000 * USD_MICRO;
 const DEFAULT_USD_STABLE_USD_MICRO: u128 = USD_MICRO;
 const MOCK_UNIT_DESTINATION_TX_CONFIRMATIONS: u64 = 10;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MockService {
+    Hyperunit,
+    HyperliquidBridge,
+    Across,
+}
+
+impl MockService {
+    pub const ALL: [Self; 3] = [Self::Hyperunit, Self::HyperliquidBridge, Self::Across];
+
+    pub fn salt(self) -> u32 {
+        match self {
+            Self::Hyperunit => SALT_MOCK_HYPERUNIT,
+            Self::HyperliquidBridge => SALT_MOCK_HYPERLIQUID_BRIDGE,
+            Self::Across => SALT_MOCK_ACROSS,
+        }
+    }
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Hyperunit => "HyperUnit",
+            Self::HyperliquidBridge => "Hyperliquid Bridge",
+            Self::Across => "Across",
+        }
+    }
+
+    pub fn metric_label(self, chain_id: u64) -> &'static str {
+        match (self, chain_id) {
+            (Self::Hyperunit, 1) => "mock_hyperunit_eth",
+            (Self::Hyperunit, 8453) => "mock_hyperunit_base",
+            (Self::Hyperunit, 42161) => "mock_hyperunit_arb",
+            (Self::Hyperunit, _) => "mock_hyperunit_dev",
+            (Self::HyperliquidBridge, 1) => "mock_hyperliquid_bridge_eth",
+            (Self::HyperliquidBridge, 8453) => "mock_hyperliquid_bridge_base",
+            (Self::HyperliquidBridge, 42161) => "mock_hyperliquid_bridge_arb",
+            (Self::HyperliquidBridge, _) => "mock_hyperliquid_bridge_dev",
+            (Self::Across, 1) => "mock_across_eth",
+            (Self::Across, 8453) => "mock_across_base",
+            (Self::Across, 42161) => "mock_across_arb",
+            (Self::Across, _) => "mock_across_dev",
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct MockServicePaymaster {
+    service: MockService,
+    chain_id: u64,
+    handle: Option<PaymasterHandle>,
+}
+
+impl fmt::Debug for MockServicePaymaster {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MockServicePaymaster")
+            .field("service", &self.service)
+            .field("chain_id", &self.chain_id)
+            .field("handle", &self.handle.is_some())
+            .finish()
+    }
+}
+
+impl MockServicePaymaster {
+    pub fn live(service: MockService, chain_id: u64, handle: PaymasterHandle) -> Self {
+        Self {
+            service,
+            chain_id,
+            handle: Some(handle),
+        }
+    }
+
+    #[cfg(test)]
+    fn stub(service: MockService, chain_id: u64) -> Self {
+        Self {
+            service,
+            chain_id,
+            handle: None,
+        }
+    }
+
+    pub fn service(&self) -> MockService {
+        self.service
+    }
+
+    pub fn chain_id(&self) -> u64 {
+        self.chain_id
+    }
+
+    pub async fn submit(&self, execution: Execution) -> eip7702_paymaster::Result<TxHash> {
+        self.handle
+            .as_ref()
+            .ok_or_else(|| PaymasterError::Actor {
+                message: format!(
+                    "mock {} paymaster for chain {} is not initialized",
+                    self.service.display_name(),
+                    self.chain_id
+                ),
+            })?
+            .submit(execution)
+            .await
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MockAssetRef {
@@ -250,6 +353,11 @@ pub struct MockIntegratorConfig {
     /// EVM RPC URLs used to detect native Unit deposits into generated
     /// protocol addresses.
     pub unit_evm_rpc_urls: BTreeMap<String, String>,
+    /// EVM RPC URLs where every mock service treasury should be funded,
+    /// delegated, and backed by its own paymaster.
+    pub mock_service_evm_chains: BTreeMap<u64, String>,
+    /// Pre-spawned mock-service paymasters keyed by `(service, chain_id)`.
+    pub mock_service_paymasters: BTreeMap<(MockService, u64), MockServicePaymaster>,
     /// Bitcoin Core RPC URL and cookie used to detect mempool/confirmed Unit
     /// deposits into generated protocol addresses.
     pub unit_bitcoin_rpc_url: Option<String>,
@@ -320,6 +428,8 @@ impl Default for MockIntegratorConfig {
             hyperliquid_bridge_deposit_latency: Duration::ZERO,
             hyperliquid_bridge_deposit_failure_probability_bps: 0,
             unit_evm_rpc_urls: BTreeMap::new(),
+            mock_service_evm_chains: BTreeMap::new(),
+            mock_service_paymasters: BTreeMap::new(),
             unit_bitcoin_rpc_url: None,
             unit_bitcoin_cookie_path: None,
             cctp_token_messenger_address: None,
@@ -438,6 +548,21 @@ impl MockIntegratorConfig {
     pub fn with_unit_evm_rpc_url(mut self, chain: UnitChain, url: impl Into<String>) -> Self {
         self.unit_evm_rpc_urls
             .insert(chain.as_wire_str().to_string(), url.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_mock_service_evm_chain(mut self, chain_id: u64, url: impl Into<String>) -> Self {
+        self.mock_service_evm_chains.insert(chain_id, url.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_mock_service_paymasters(
+        mut self,
+        paymasters: BTreeMap<(MockService, u64), MockServicePaymaster>,
+    ) -> Self {
+        self.mock_service_paymasters = paymasters;
         self
     }
 
@@ -617,11 +742,13 @@ struct MockIntegratorState {
     unit_operations: Mutex<BTreeMap<String, Vec<MockUnitOperationEntry>>>,
     unit_protocol_private_keys: Mutex<BTreeMap<String, MockUnitProtocolKey>>,
     unit_evm_rpc_urls: BTreeMap<String, String>,
+    mock_service_evm_chains: BTreeMap<u64, String>,
+    mock_service_accounts: BTreeMap<MockService, MultichainAccount>,
+    /// `(service, chain_id) -> paymaster handle`.
+    mock_service_paymasters: BTreeMap<(MockService, u64), MockServicePaymaster>,
     unit_bitcoin_rpc_url: Option<String>,
     unit_bitcoin_cookie_path: Option<PathBuf>,
     ledger: Mutex<MockIntegratorLedger>,
-    evm_unlocked_account_tx_locks: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
-    evm_native_balance_credit_locks: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
     across_deposits: Mutex<BTreeMap<AcrossDepositKey, MockAcrossDepositRecord>>,
     across_destination_credit_tx_hashes: Mutex<BTreeMap<AcrossDepositKey, String>>,
     cctp_burns: Mutex<BTreeMap<String, MockCctpBurnRecord>>,
@@ -841,6 +968,19 @@ impl MockIntegratorServer {
     pub async fn spawn_with_config(config: MockIntegratorConfig) -> eyre::Result<Self> {
         let listener = TcpListener::bind(config.bind_addr).await?;
         let addr = listener.local_addr()?;
+        let config = if config.mock_service_paymasters.is_empty()
+            && !config.mock_service_evm_chains.is_empty()
+        {
+            let accounts = mock_service_accounts();
+            let paymasters = crate::evm_devnet::setup_mock_service_paymasters(
+                &config.mock_service_evm_chains,
+                &accounts,
+            )
+            .await?;
+            config.with_mock_service_paymasters(paymasters)
+        } else {
+            config
+        };
         let state = Arc::new(MockIntegratorState::new(&config));
 
         let (across_indexer_shutdowns, across_indexer_handles) =
@@ -1267,11 +1407,12 @@ impl MockIntegratorState {
             unit_operations: Mutex::default(),
             unit_protocol_private_keys: Mutex::default(),
             unit_evm_rpc_urls: config.unit_evm_rpc_urls.clone(),
+            mock_service_evm_chains: config.mock_service_evm_chains.clone(),
+            mock_service_accounts: mock_service_accounts(),
+            mock_service_paymasters: config.mock_service_paymasters.clone(),
             unit_bitcoin_rpc_url: config.unit_bitcoin_rpc_url.clone(),
             unit_bitcoin_cookie_path: config.unit_bitcoin_cookie_path.clone(),
             ledger: Mutex::default(),
-            evm_unlocked_account_tx_locks: Mutex::default(),
-            evm_native_balance_credit_locks: Mutex::default(),
             across_deposits: Mutex::default(),
             across_destination_credit_tx_hashes: Mutex::default(),
             cctp_burns: Mutex::default(),
@@ -1303,6 +1444,32 @@ impl MockIntegratorState {
         }
     }
 
+    fn mock_service_paymaster(
+        &self,
+        service: MockService,
+        chain_id: u64,
+    ) -> Result<&MockServicePaymaster, String> {
+        self.mock_service_paymasters
+            .get(&(service, chain_id))
+            .ok_or_else(|| {
+                let evm_address = self
+                    .mock_service_accounts
+                    .get(&service)
+                    .map(|account| format!("{:#x}", account.ethereum_address))
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                format!(
+                    "missing mock {} paymaster for EVM chain {chain_id} (service EOA {evm_address})",
+                    service.display_name()
+                )
+            })
+    }
+
+    fn mock_service_paymaster_rpc_url(&self, chain_id: u64) -> Option<&str> {
+        self.mock_service_evm_chains
+            .get(&chain_id)
+            .map(String::as_str)
+    }
+
     fn across_chain_config(&self, origin_chain_id: u64) -> Option<ResolvedMockAcrossChainConfig> {
         self.across_chains
             .get(&origin_chain_id)
@@ -1330,6 +1497,22 @@ impl MockIntegratorState {
                 }
             })
     }
+}
+
+pub fn mock_service_accounts() -> BTreeMap<MockService, MultichainAccount> {
+    MockService::ALL
+        .into_iter()
+        .map(|service| {
+            let account = MultichainAccount::new(service.salt()).unwrap_or_else(|error| {
+                panic!(
+                    "failed to derive deterministic {} mock service account from salt {}: {error}",
+                    service.display_name(),
+                    service.salt()
+                )
+            });
+            (service, account)
+        })
+        .collect()
 }
 
 impl Drop for MockIntegratorServer {
@@ -2863,20 +3046,28 @@ async fn mock_across_credit_destination(
         return Ok(mock_across_pending_fill_tx_ref(record));
     }
     let destination_chain_id = mock_across_destination_chain_id(record.destination_chain_id)?;
-    let Some(rpc_url) = state.across_chain_rpc_url(destination_chain_id) else {
+    if state.across_chain_rpc_url(destination_chain_id).is_none() {
         return Err(format!(
             "mock Across destination chain {destination_chain_id} has no RPC configured"
         ));
-    };
+    }
     let recipient = bytes32_to_evm_address(record.recipient);
     let output_token = bytes32_to_evm_address(record.output_token);
     if output_token == Address::ZERO {
-        mock_credit_native_on_anvil(state, &rpc_url, recipient, record.output_amount).await?;
+        mock_credit_native_on_anvil(
+            state,
+            destination_chain_id,
+            MockService::Across,
+            recipient,
+            record.output_amount,
+        )
+        .await?;
         return Ok(mock_across_pending_fill_tx_ref(record));
     }
     mock_mint_erc20_on_anvil(
         state,
-        &rpc_url,
+        destination_chain_id,
+        MockService::Across,
         output_token,
         recipient,
         record.output_amount,
@@ -2886,54 +3077,39 @@ async fn mock_across_credit_destination(
 
 async fn mock_credit_native_on_anvil(
     state: &MockIntegratorState,
-    rpc_url: &str,
+    chain_id: u64,
+    service: MockService,
     recipient: Address,
     amount: U256,
 ) -> Result<(), String> {
-    let provider = ProviderBuilder::new()
-        .connect(rpc_url)
+    let handle = state.mock_service_paymaster(service, chain_id)?;
+    let execution = Execution {
+        target: recipient,
+        value: amount,
+        callData: Bytes::new(),
+    };
+    handle
+        .submit(execution)
         .await
-        .map_err(|err| err.to_string())?;
-    let credit_lock = evm_native_balance_credit_lock(state, rpc_url, recipient).await;
-    let _credit_guard = credit_lock.lock().await;
-    let current = provider
-        .get_balance(recipient)
-        .await
-        .map_err(|err| err.to_string())?;
-    let next = checked_native_credit_balance(current, amount)?;
-    provider
-        .anvil_set_balance(recipient, next)
-        .await
-        .map_err(|err| err.to_string())
-}
-
-async fn evm_native_balance_credit_lock(
-    state: &MockIntegratorState,
-    rpc_url: &str,
-    recipient: Address,
-) -> Arc<Mutex<()>> {
-    let mut locks = state.evm_native_balance_credit_locks.lock().await;
-    locks
-        .entry(format!("{}|{recipient:#x}", rpc_url.trim()))
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone()
-}
-
-fn checked_native_credit_balance(current: U256, amount: U256) -> Result<U256, String> {
-    current
-        .checked_add(amount)
-        .ok_or_else(|| "mock native destination credit balance overflow".to_string())
+        .map(|_| ())
+        .map_err(|err| format!("mock native credit submit failed: {err}"))
 }
 
 async fn mock_mint_erc20_on_anvil(
     state: &MockIntegratorState,
-    rpc_url: &str,
+    chain_id: u64,
+    service: MockService,
     token: Address,
     recipient: Address,
     amount: U256,
 ) -> Result<String, String> {
+    let handle = state.mock_service_paymaster(service, chain_id)?;
     let provider = ProviderBuilder::new()
-        .connect(rpc_url)
+        .connect(
+            state
+                .mock_service_paymaster_rpc_url(chain_id)
+                .ok_or_else(|| format!("mock service EVM chain {chain_id} has no RPC URL"))?,
+        )
         .await
         .map_err(|err| err.to_string())?;
     let code = provider
@@ -2943,45 +3119,17 @@ async fn mock_mint_erc20_on_anvil(
     if code.is_empty() {
         return Err(format!("destination token {token:#x} is not deployed"));
     }
-    let sender = provider
-        .get_accounts()
-        .await
-        .map_err(|err| format!("get_accounts failed: {err}"))?
-        .into_iter()
-        .next()
-        .ok_or_else(|| "destination ERC20 mint requires one unlocked account".to_string())?;
     let calldata = Bytes::from(IMockMintableERC20::mintCall { recipient, amount }.abi_encode());
-    let tx = TransactionRequest::default()
-        .with_from(sender)
-        .with_to(token)
-        .with_input(calldata);
-    let tx_lock = evm_unlocked_account_tx_lock(state, rpc_url).await;
-    let _tx_guard = tx_lock.lock().await;
-    let receipt = provider
-        .send_transaction(tx)
+    let execution = Execution {
+        target: token,
+        value: U256::ZERO,
+        callData: calldata,
+    };
+    let tx_hash = handle
+        .submit(execution)
         .await
-        .map_err(|err| format!("mint send_transaction failed: {err}"))?
-        .get_receipt()
-        .await
-        .map_err(|err| format!("mint receipt failed: {err}"))?;
-    if !receipt.status() {
-        return Err(format!(
-            "destination token mint transaction failed: {:#x}",
-            receipt.transaction_hash
-        ));
-    }
-    Ok(format!("{:#x}", receipt.transaction_hash))
-}
-
-async fn evm_unlocked_account_tx_lock(
-    state: &MockIntegratorState,
-    rpc_url: &str,
-) -> Arc<Mutex<()>> {
-    let mut locks = state.evm_unlocked_account_tx_locks.lock().await;
-    locks
-        .entry(rpc_url.trim().to_string())
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone()
+        .map_err(|err| format!("mock mint submit failed: {err}"))?;
+    Ok(format!("{tx_hash:#x}"))
 }
 
 fn mock_across_pending_fill_tx_ref(record: &MockAcrossDepositRecord) -> String {
@@ -5162,35 +5310,28 @@ async fn send_mock_hyperliquid_withdrawal_release(
     payout_raw: u64,
 ) -> Result<(), String> {
     let rpc_endpoint = rpc_url;
-    let rpc_url: Url = rpc_endpoint.parse().map_err(|err| {
-        format!(
-            "invalid hyperliquid EVM RPC URL {}: {err}",
-            sanitize_url_for_error(rpc_endpoint)
-        )
-    })?;
     let bridge_address = Address::from_str(bridge_address)
         .map_err(|err| format!("invalid hyperliquid bridge address {bridge_address:?}: {err}"))?;
     let usdc_token_address = Address::from_str(usdc_token_address).map_err(|err| {
         format!("invalid hyperliquid USDC token address {usdc_token_address:?}: {err}")
     })?;
+    let provider = ProviderBuilder::new()
+        .connect(rpc_endpoint)
+        .await
+        .map_err(|err| format!("hyperliquid withdrawal release RPC init failed: {err}"))?;
+    let chain_id = provider
+        .get_chain_id()
+        .await
+        .map_err(|err| format!("hyperliquid withdrawal release get_chain_id failed: {err}"))?;
     mock_mint_erc20_on_anvil(
         &state,
-        rpc_endpoint,
+        chain_id,
+        MockService::HyperliquidBridge,
         usdc_token_address,
         bridge_address,
         U256::from(payout_raw),
     )
     .await?;
-    let provider = ProviderBuilder::new().connect_http(rpc_url);
-    let sender = provider
-        .get_accounts()
-        .await
-        .map_err(|err| format!("get_accounts failed: {err}"))?
-        .into_iter()
-        .next()
-        .ok_or_else(|| {
-            "hyperliquid withdrawal release requires one unlocked account".to_string()
-        })?;
     let calldata = Bytes::from(
         MockHyperliquidBridge2::releaseCall {
             user: destination,
@@ -5198,32 +5339,22 @@ async fn send_mock_hyperliquid_withdrawal_release(
         }
         .abi_encode(),
     );
-    let tx = TransactionRequest::default()
-        .with_from(sender)
-        .with_to(bridge_address)
-        .with_input(calldata);
-    let tx_lock = evm_unlocked_account_tx_lock(&state, rpc_endpoint).await;
-    let _tx_guard = tx_lock.lock().await;
-    let pending = provider
-        .send_transaction(tx)
+    let handle = state.mock_service_paymaster(MockService::HyperliquidBridge, chain_id)?;
+    let execution = Execution {
+        target: bridge_address,
+        value: U256::ZERO,
+        callData: calldata,
+    };
+    handle
+        .submit(execution)
         .await
-        .map_err(|err| format!("bridge release send_transaction failed: {err}"))?;
-    let receipt = pending
-        .get_receipt()
-        .await
-        .map_err(|err| format!("bridge release receipt failed: {err}"))?;
-    if receipt.status() {
-        Ok(())
-    } else {
-        Err(format!(
-            "bridge release transaction reverted: {}",
-            receipt.transaction_hash
-        ))
-    }
+        .map(|_| ())
+        .map_err(|err| format!("bridge release submit failed: {err}"))
 }
 
+#[cfg(test)]
 fn sanitize_url_for_error(value: &str) -> String {
-    let Ok(parsed) = Url::parse(value.trim()) else {
+    let Ok(parsed) = url::Url::parse(value.trim()) else {
         return "<invalid url>".to_string();
     };
 
@@ -6639,32 +6770,20 @@ async fn send_mock_unit_evm_withdrawal_release(
         .connect(&rpc_url)
         .await
         .map_err(|err| format!("mock Unit withdrawal release RPC init failed: {err}"))?;
-    let sender = provider
-        .get_accounts()
+    let chain_id = provider
+        .get_chain_id()
         .await
-        .map_err(|err| format!("mock Unit withdrawal release get_accounts failed: {err}"))?
-        .into_iter()
-        .next()
-        .ok_or_else(|| "mock Unit withdrawal release requires one unlocked account".to_string())?;
-    let tx = TransactionRequest::default()
-        .with_from(sender)
-        .with_to(destination)
-        .with_value(amount);
-    let tx_lock = evm_unlocked_account_tx_lock(state, &rpc_url).await;
-    let _tx_guard = tx_lock.lock().await;
-    let receipt = provider
-        .send_transaction(tx)
+        .map_err(|err| format!("mock Unit withdrawal release get_chain_id failed: {err}"))?;
+    let handle = state.mock_service_paymaster(MockService::Hyperunit, chain_id)?;
+    let execution = Execution {
+        target: destination,
+        value: amount,
+        callData: Bytes::new(),
+    };
+    let tx_hash = handle
+        .submit(execution)
         .await
-        .map_err(|err| format!("mock Unit withdrawal release send_transaction failed: {err}"))?
-        .get_receipt()
-        .await
-        .map_err(|err| format!("mock Unit withdrawal release receipt failed: {err}"))?;
-    if !receipt.status() {
-        return Err(format!(
-            "mock Unit withdrawal release transaction failed: {:#x}",
-            receipt.transaction_hash
-        ));
-    }
+        .map_err(|err| format!("mock Unit withdrawal release failed: {err}"))?;
     if MOCK_UNIT_DESTINATION_TX_CONFIRMATIONS > 1 {
         provider
             .anvil_mine(Some(MOCK_UNIT_DESTINATION_TX_CONFIRMATIONS - 1), None)
@@ -6674,7 +6793,7 @@ async fn send_mock_unit_evm_withdrawal_release(
             })?;
     }
 
-    Ok(format!("{:#x}", receipt.transaction_hash))
+    Ok(format!("{tx_hash:#x}"))
 }
 
 async fn send_mock_unit_bitcoin_withdrawal_release(
@@ -7212,47 +7331,56 @@ mod tests {
     }
 
     #[test]
-    fn mock_native_destination_credit_rejects_balance_overflow() {
-        assert_eq!(
-            checked_native_credit_balance(U256::from(40_u64), U256::from(2_u64)).unwrap(),
-            U256::from(42_u64)
+    fn mock_service_accounts_are_distinct() {
+        let accounts = mock_service_accounts();
+
+        let evm_addresses = accounts
+            .values()
+            .map(|account| account.ethereum_address)
+            .collect::<BTreeSet<_>>();
+        let bitcoin_addresses = accounts
+            .values()
+            .map(|account| account.bitcoin_wallet.address.to_string())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(accounts.len(), MockService::ALL.len());
+        assert_eq!(evm_addresses.len(), MockService::ALL.len());
+        assert_eq!(bitcoin_addresses.len(), MockService::ALL.len());
+    }
+
+    #[test]
+    fn mock_service_paymaster_lookup_keyed_correctly() {
+        let chain_id = 8453;
+        let paymasters = MockService::ALL
+            .into_iter()
+            .map(|service| {
+                (
+                    (service, chain_id),
+                    MockServicePaymaster::stub(service, chain_id),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let state = MockIntegratorState::new(
+            &MockIntegratorConfig::default()
+                .with_mock_service_evm_chain(chain_id, "http://localhost:8545")
+                .with_mock_service_paymasters(paymasters),
         );
-        assert!(checked_native_credit_balance(U256::MAX, U256::from(1_u64)).is_err());
-    }
 
-    #[tokio::test]
-    async fn evm_unlocked_account_tx_lock_is_scoped_by_rpc_url() {
-        let state = MockIntegratorState::new(&MockIntegratorConfig::default());
+        let hyperunit = state
+            .mock_service_paymaster(MockService::Hyperunit, chain_id)
+            .expect("hyperunit paymaster");
+        let across = state
+            .mock_service_paymaster(MockService::Across, chain_id)
+            .expect("across paymaster");
 
-        let first = evm_unlocked_account_tx_lock(&state, "http://localhost:50101").await;
-        let same = evm_unlocked_account_tx_lock(&state, " http://localhost:50101 ").await;
-        let other = evm_unlocked_account_tx_lock(&state, "http://localhost:50102").await;
-
-        assert!(Arc::ptr_eq(&first, &same));
-        assert!(!Arc::ptr_eq(&first, &other));
-    }
-
-    #[tokio::test]
-    async fn evm_native_balance_credit_lock_is_scoped_by_rpc_url_and_recipient() {
-        let state = MockIntegratorState::new(&MockIntegratorConfig::default());
-        let recipient = Address::repeat_byte(0x11);
-
-        let first =
-            evm_native_balance_credit_lock(&state, "http://localhost:50101", recipient).await;
-        let same =
-            evm_native_balance_credit_lock(&state, " http://localhost:50101 ", recipient).await;
-        let other_rpc =
-            evm_native_balance_credit_lock(&state, "http://localhost:50102", recipient).await;
-        let other_recipient = evm_native_balance_credit_lock(
-            &state,
-            "http://localhost:50101",
-            Address::repeat_byte(0x22),
-        )
-        .await;
-
-        assert!(Arc::ptr_eq(&first, &same));
-        assert!(!Arc::ptr_eq(&first, &other_rpc));
-        assert!(!Arc::ptr_eq(&first, &other_recipient));
+        assert_eq!(hyperunit.service(), MockService::Hyperunit);
+        assert_eq!(across.service(), MockService::Across);
+        assert_eq!(hyperunit.chain_id(), chain_id);
+        assert_eq!(across.chain_id(), chain_id);
+        assert_ne!(hyperunit.service(), across.service());
+        assert!(state
+            .mock_service_paymaster(MockService::Hyperunit, 1)
+            .is_err());
     }
 
     #[test]
@@ -7778,7 +7906,11 @@ mod tests {
     async fn mock_swap_approval_skips_approval_when_allowance_already_exists() {
         use alloy::node_bindings::Anvil;
 
-        let anvil = Anvil::new().block_time(1).try_spawn().expect("anvil spawn");
+        let anvil = Anvil::new()
+            .prague()
+            .block_time(1)
+            .try_spawn()
+            .expect("anvil spawn");
         let ws_url = anvil.ws_endpoint_url().to_string();
         let private_key: [u8; 32] = anvil.keys()[0].clone().to_bytes().into();
         let provider = create_websocket_wallet_provider(&ws_url, private_key)
@@ -8003,11 +8135,16 @@ mod tests {
         use crate::across_spoke_pool_mock::MockSpokePool;
         use alloy::node_bindings::Anvil;
 
-        let anvil = Anvil::new().block_time(1).try_spawn().expect("anvil spawn");
+        let anvil = Anvil::new()
+            .prague()
+            .block_time(1)
+            .try_spawn()
+            .expect("anvil spawn");
         let ws_url = anvil.ws_endpoint_url().to_string();
         let chain_id = anvil.chain_id();
         let depositor = anvil.addresses()[0];
         let recipient_addr = anvil.addresses()[1];
+        let destination_chain_id = 42161_u64;
 
         let private_key: [u8; 32] = anvil.keys()[0].clone().to_bytes().into();
         let provider = create_websocket_wallet_provider(&ws_url, private_key)
@@ -8021,13 +8158,13 @@ mod tests {
         let server = MockIntegratorServer::spawn_with_config(
             MockIntegratorConfig::default()
                 .with_across_spoke_pool_address(format!("{spoke_pool_address:#x}"))
-                .with_across_evm_rpc_url(ws_url),
+                .with_across_evm_rpc_url(ws_url)
+                .with_mock_service_evm_chain(destination_chain_id, anvil.endpoint()),
         )
         .await
         .expect("spawn mock integrator");
 
         let amount = U256::from(1_000_u64);
-        let destination_chain_id = 42161_u64;
         let fill_deadline: u32 = u32::MAX;
         let receipt = spoke_pool
             .deposit(
@@ -8117,7 +8254,7 @@ mod tests {
     async fn deposit_status_mints_erc20_output_before_reporting_filled() {
         use alloy::node_bindings::Anvil;
 
-        let anvil = Anvil::new().try_spawn().expect("anvil spawn");
+        let anvil = Anvil::new().prague().try_spawn().expect("anvil spawn");
         let ws_url = anvil.ws_endpoint_url().to_string();
         let private_key: [u8; 32] = anvil.keys()[0].clone().to_bytes().into();
         let provider = create_websocket_wallet_provider(&ws_url, private_key)
@@ -8134,11 +8271,13 @@ mod tests {
         let spoke_pool = Address::repeat_byte(0x44);
 
         let server = MockIntegratorServer::spawn_with_config(
-            MockIntegratorConfig::default().with_across_chain(
-                destination_chain_id,
-                format!("{spoke_pool:#x}"),
-                anvil.endpoint(),
-            ),
+            MockIntegratorConfig::default()
+                .with_across_chain(
+                    destination_chain_id,
+                    format!("{spoke_pool:#x}"),
+                    anvil.endpoint(),
+                )
+                .with_mock_service_evm_chain(destination_chain_id, anvil.endpoint()),
         )
         .await
         .expect("spawn mock integrator");
@@ -8464,11 +8603,12 @@ mod tests {
     async fn unit_mock_eth_withdrawal_releases_native_funds_with_real_destination_tx() {
         use alloy::node_bindings::Anvil;
 
-        let anvil = Anvil::new().try_spawn().expect("anvil spawn");
+        let anvil = Anvil::new().prague().try_spawn().expect("anvil spawn");
         let recipient = Address::repeat_byte(0x77);
         let server = MockIntegratorServer::spawn_with_config(
             MockIntegratorConfig::default()
-                .with_unit_evm_rpc_url(UnitChain::Base, anvil.endpoint()),
+                .with_unit_evm_rpc_url(UnitChain::Base, anvil.endpoint())
+                .with_mock_service_evm_chain(anvil.chain_id(), anvil.endpoint()),
         )
         .await
         .expect("spawn mock integrator");

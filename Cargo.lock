@@ -2910,6 +2910,7 @@ dependencies = [
  "dotenvy",
  "eip3009-erc20-contract",
  "eip7702-delegator-contract",
+ "eip7702-paymaster",
  "electrsd",
  "esplora-client",
  "eyre",

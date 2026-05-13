@@ -27,6 +27,7 @@ reqwest = {workspace = true}
 uuid = {workspace= true}
 eip3009-erc20-contract = { workspace = true }
 eip7702-delegator-contract = { workspace = true }
+eip7702-paymaster = { workspace = true }
 hyperliquid-client = {workspace=true}
 hyperunit-client = {workspace=true}
 libc = {workspace=true} 
