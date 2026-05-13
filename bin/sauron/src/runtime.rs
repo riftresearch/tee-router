@@ -32,7 +32,7 @@ use crate::{
         btc::{BitcoinClients, BitcoinDiscoveryBackend},
         evm_indexer::EvmIndexerDiscoveryBackend,
         hyperliquid::run_hyperliquid_observer_loop,
-        hyperunit::run_hyperunit_observer_loop,
+        hyperunit::{run_hyperunit_observer_loop, HyperUnitObserverOptions},
         run_backends, DiscoveryBackend, DiscoveryContext,
     },
     error::{Error, ReplicaDatabaseConnectionSnafu, Result, StateDatabaseConnectionSnafu},
@@ -168,6 +168,18 @@ fn validate_runtime_config(args: &SauronArgs) -> Result<()> {
     validate_positive_usize(
         args.sauron_hyperunit_observer_concurrency,
         "SAURON_HYPERUNIT_OBSERVER_CONCURRENCY",
+    )?;
+    validate_positive_seconds(
+        args.sauron_hu_poll_fast_seconds,
+        "SAURON_HU_POLL_FAST_SECONDS",
+    )?;
+    validate_positive_seconds(
+        args.sauron_hu_poll_medium_seconds,
+        "SAURON_HU_POLL_MEDIUM_SECONDS",
+    )?;
+    validate_positive_seconds(
+        args.sauron_hu_poll_slow_seconds,
+        "SAURON_HU_POLL_SLOW_SECONDS",
     )?;
     validate_positive_usize(
         args.sauron_hyperliquid_observer_concurrency,
@@ -437,7 +449,12 @@ fn build_hyperunit_observer_task(
         hl_client,
         bitcoin_clients,
         evm_receipt_clients,
-        args.sauron_hyperunit_observer_concurrency,
+        HyperUnitObserverOptions {
+            concurrency_limit: args.sauron_hyperunit_observer_concurrency,
+            poll_fast_interval: Duration::from_secs(args.sauron_hu_poll_fast_seconds),
+            poll_medium_interval: Duration::from_secs(args.sauron_hu_poll_medium_seconds),
+            poll_slow_interval: Duration::from_secs(args.sauron_hu_poll_slow_seconds),
+        },
     )))
 }
 
@@ -829,6 +846,9 @@ mod tests {
             hyperunit_proxy_url: None,
             sauron_hl_bridge_match_window_seconds: 1_800,
             sauron_hyperunit_observer_concurrency: 64,
+            sauron_hu_poll_fast_seconds: 5,
+            sauron_hu_poll_medium_seconds: 10,
+            sauron_hu_poll_slow_seconds: 20,
             sauron_hyperliquid_observer_concurrency: 128,
             sauron_evm_receipt_observer_concurrency: 128,
             token_indexer_api_key: None,
