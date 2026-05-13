@@ -1,3 +1,25 @@
+x-temporal-server-base: &temporal-server-base
+  image: temporalio/server:1.31.0
+  depends_on:
+    temporal-schema:
+      condition: service_completed_successfully
+  environment: &temporal-server-env
+    DB: postgres12
+    DB_PORT: 5432
+    POSTGRES_USER: temporal
+    POSTGRES_PWD: temporal
+    POSTGRES_SEEDS: temporal-postgres
+    BIND_ON_IP: 0.0.0.0
+    DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/development-sql.yaml
+    NUM_HISTORY_SHARDS: "512"
+    SQL_MAX_CONNS: "64"
+    SQL_MAX_IDLE_CONNS: "32"
+    SQL_MAX_CONN_TIME: "5m"
+    PROMETHEUS_ENDPOINT: 0.0.0.0:9090
+  configs:
+    - source: temporal-dynamic-config
+      target: /etc/temporal/config/dynamicconfig/development-sql.yaml
+
 configs:
   temporal-dynamic-config:
     content: |
@@ -6,6 +28,44 @@ configs:
           constraints: {}
       system.forceSearchAttributesCacheRefreshOnRead:
         - value: true
+          constraints: {}
+
+      # Throughput ceilings -- raise from defaults (frontend 2400 / matching 1200 / history 3000)
+      frontend.rps:
+        - value: 4800
+          constraints: {}
+      matching.rps:
+        - value: 2400
+          constraints: {}
+      history.rps:
+        - value: 6000
+          constraints: {}
+
+      # Persistence QPS ceilings -- raise from defaults (frontend 2000 / matching+history 9000)
+      frontend.persistenceMaxQPS:
+        - value: 4000
+          constraints: {}
+      matching.persistenceMaxQPS:
+        - value: 18000
+          constraints: {}
+      history.persistenceMaxQPS:
+        - value: 18000
+          constraints: {}
+
+      # Task queue partitions -- raise from default 4 to match poller concurrency (~64-128)
+      matching.numTaskqueueReadPartitions:
+        - value: 16
+          constraints: {}
+      matching.numTaskqueueWritePartitions:
+        - value: 16
+          constraints: {}
+
+      # History cache -- raise to reduce shard reload churn under load
+      history.cacheMaxSize:
+        - value: 4096
+          constraints: {}
+      history.eventsCacheMaxSizeBytes:
+        - value: 1073741824   # 1 GiB
           constraints: {}
 
   temporal-setup-postgres:
@@ -87,8 +147,15 @@ configs:
       done
 
 services:
+  # numHistoryShards is fixed at first server start; changing it requires resetting the Temporal Postgres volume.
   temporal-postgres:
     image: postgres:16-alpine
+    command:
+      - postgres
+      - -c
+      - max_connections=800
+      - -c
+      - shared_buffers=512MB
     environment:
       POSTGRES_PASSWORD: temporal
       POSTGRES_USER: temporal
@@ -123,32 +190,77 @@ services:
     entrypoint: ["/bin/sh"]
     command: /scripts/setup-postgres.sh
 
-  temporal:
-    image: temporalio/server:1.31.0
-    depends_on:
-      temporal-schema:
-        condition: service_completed_successfully
+  temporal-history:
+    <<: *temporal-server-base
     environment:
-      DB: postgres12
-      DB_PORT: 5432
-      POSTGRES_USER: temporal
-      POSTGRES_PWD: temporal
-      POSTGRES_SEEDS: temporal-postgres
-      BIND_ON_IP: 0.0.0.0
-      DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/development-sql.yaml
-      PROMETHEUS_ENDPOINT: 0.0.0.0:9090
+      <<: *temporal-server-env
+      SERVICES: history
+      TEMPORAL_BROADCAST_ADDRESS: temporal-history
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "7234"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "13"
+
+  temporal-matching:
+    <<: *temporal-server-base
+    environment:
+      <<: *temporal-server-env
+      SERVICES: matching
+      TEMPORAL_BROADCAST_ADDRESS: temporal-matching
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "7235"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "8"
+
+  # This is Temporal's internal worker service, distinct from the app's Rust temporal-worker.
+  temporal-internal-worker:
+    <<: *temporal-server-base
+    environment:
+      <<: *temporal-server-env
+      SERVICES: worker
+      TEMPORAL_BROADCAST_ADDRESS: temporal-internal-worker
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "7239"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "3"
+
+  temporal:
+    <<: *temporal-server-base
+    environment:
+      <<: *temporal-server-env
+      SERVICES: frontend
+      TEMPORAL_BROADCAST_ADDRESS: temporal
     ports:
       - "7233:7233"
       - "9090:9090"
-    configs:
-      - source: temporal-dynamic-config
-        target: /etc/temporal/config/dynamicconfig/development-sql.yaml
     healthcheck:
       test: ["CMD", "nc", "-z", "localhost", "7233"]
       interval: 5s
       timeout: 3s
       retries: 60
       start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "8"
 
   temporal-create-namespace:
     image: temporalio/admin-tools:1.31.0
