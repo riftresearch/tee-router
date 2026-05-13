@@ -76,6 +76,34 @@ enum Command {
         )]
         workflow_task_pollers: usize,
 
+        #[arg(
+            long,
+            env = "ROUTER_TEMPORAL_ACTIVITY_SLOT_MIN",
+            default_value_t = order_execution::DEFAULT_TEMPORAL_ACTIVITY_SLOT_MIN
+        )]
+        activity_slot_min: usize,
+
+        #[arg(
+            long,
+            env = "ROUTER_TEMPORAL_ACTIVITY_SLOT_MAX",
+            default_value_t = order_execution::DEFAULT_TEMPORAL_ACTIVITY_SLOT_MAX
+        )]
+        activity_slot_max: usize,
+
+        #[arg(
+            long,
+            env = "ROUTER_TEMPORAL_WORKFLOW_SLOT_MIN",
+            default_value_t = order_execution::DEFAULT_TEMPORAL_WORKFLOW_SLOT_MIN
+        )]
+        workflow_slot_min: usize,
+
+        #[arg(
+            long,
+            env = "ROUTER_TEMPORAL_WORKFLOW_SLOT_MAX",
+            default_value_t = order_execution::DEFAULT_TEMPORAL_WORKFLOW_SLOT_MAX
+        )]
+        workflow_slot_max: usize,
+
         #[command(flatten)]
         runtime: OrderWorkerRuntimeArgs,
     },
@@ -113,6 +141,10 @@ async fn main() -> WorkerResult<()> {
             sauron_temporal_max_cached_workflows,
             activity_task_pollers,
             workflow_task_pollers,
+            activity_slot_min,
+            activity_slot_max,
+            workflow_slot_min,
+            workflow_slot_max,
             runtime,
         } => {
             let activities = order_execution::activities::OrderActivities::new(
@@ -131,6 +163,10 @@ async fn main() -> WorkerResult<()> {
                     max_cached_workflows: sauron_temporal_max_cached_workflows,
                     activity_task_poller_max: activity_task_pollers,
                     workflow_task_poller_max: workflow_task_pollers,
+                    activity_slot_min,
+                    activity_slot_max,
+                    workflow_slot_min,
+                    workflow_slot_max,
                 },
             )
             .await?;
@@ -198,13 +234,17 @@ mod tests {
         }
     }
 
-    fn temporal_env_vars() -> [(&'static str, Option<&'static str>); 6] {
+    fn temporal_env_vars() -> [(&'static str, Option<&'static str>); 10] {
         [
             ("SAURON_TEMPORAL_TARGET_MEM_USAGE", None),
             ("SAURON_TEMPORAL_TARGET_CPU_USAGE", None),
             ("SAURON_TEMPORAL_MAX_CACHED_WORKFLOWS", None),
             ("ROUTER_TEMPORAL_ACTIVITY_POLLERS", None),
             ("ROUTER_TEMPORAL_WORKFLOW_POLLERS", None),
+            ("ROUTER_TEMPORAL_ACTIVITY_SLOT_MIN", None),
+            ("ROUTER_TEMPORAL_ACTIVITY_SLOT_MAX", None),
+            ("ROUTER_TEMPORAL_WORKFLOW_SLOT_MIN", None),
+            ("ROUTER_TEMPORAL_WORKFLOW_SLOT_MAX", None),
             ("SAURON_TEMPORAL_DB_MAX_CONNECTIONS", None),
         ]
     }
@@ -237,6 +277,10 @@ mod tests {
             ("SAURON_TEMPORAL_MAX_CACHED_WORKFLOWS", Some("3000")),
             ("ROUTER_TEMPORAL_ACTIVITY_POLLERS", Some("111")),
             ("ROUTER_TEMPORAL_WORKFLOW_POLLERS", Some("33")),
+            ("ROUTER_TEMPORAL_ACTIVITY_SLOT_MIN", Some("66")),
+            ("ROUTER_TEMPORAL_ACTIVITY_SLOT_MAX", Some("1999")),
+            ("ROUTER_TEMPORAL_WORKFLOW_SLOT_MIN", Some("18")),
+            ("ROUTER_TEMPORAL_WORKFLOW_SLOT_MAX", Some("1500")),
             ("SAURON_TEMPORAL_DB_MAX_CONNECTIONS", Some("222")),
         ]);
 
@@ -248,6 +292,10 @@ mod tests {
                 sauron_temporal_max_cached_workflows,
                 activity_task_pollers,
                 workflow_task_pollers,
+                activity_slot_min,
+                activity_slot_max,
+                workflow_slot_min,
+                workflow_slot_max,
                 runtime,
                 ..
             } => {
@@ -256,6 +304,10 @@ mod tests {
                 assert_eq!(sauron_temporal_max_cached_workflows, 3000);
                 assert_eq!(activity_task_pollers, 111);
                 assert_eq!(workflow_task_pollers, 33);
+                assert_eq!(activity_slot_min, 66);
+                assert_eq!(activity_slot_max, 1999);
+                assert_eq!(workflow_slot_min, 18);
+                assert_eq!(workflow_slot_max, 1500);
                 assert_eq!(runtime.db_max_connections, 222);
             }
             Command::Spike { .. } => panic!("expected worker command"),

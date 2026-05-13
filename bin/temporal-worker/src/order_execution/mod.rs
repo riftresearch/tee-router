@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 pub mod activities;
 pub mod error;
@@ -13,7 +13,9 @@ use temporalio_common::protos::temporal::api::enums::v1::{
     WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
 };
 use temporalio_sdk::{Worker, WorkerOptions};
-use temporalio_sdk_core::{CoreRuntime, PollerBehavior, ResourceBasedTuner, WorkerTuner};
+use temporalio_sdk_core::{
+    CoreRuntime, PollerBehavior, ResourceBasedTuner, ResourceSlotOptions, WorkerTuner,
+};
 
 use crate::runtime::{
     boxed, connect_client, new_core_runtime, TemporalConnection, WorkerError, WorkerResult,
@@ -29,6 +31,10 @@ pub const DEFAULT_TEMPORAL_TARGET_CPU_USAGE: f64 = 0.9;
 pub const DEFAULT_TEMPORAL_MAX_CACHED_WORKFLOWS: usize = 2000;
 pub const DEFAULT_TEMPORAL_ACTIVITY_TASK_POLLER_MAX: usize = 128;
 pub const DEFAULT_TEMPORAL_WORKFLOW_TASK_POLLER_MAX: usize = 32;
+pub const DEFAULT_TEMPORAL_ACTIVITY_SLOT_MIN: usize = 64;
+pub const DEFAULT_TEMPORAL_ACTIVITY_SLOT_MAX: usize = 2000;
+pub const DEFAULT_TEMPORAL_WORKFLOW_SLOT_MIN: usize = 16;
+pub const DEFAULT_TEMPORAL_WORKFLOW_SLOT_MAX: usize = 2000;
 
 #[derive(Debug, Clone, Copy)]
 pub struct OrderWorkerTuning {
@@ -37,6 +43,10 @@ pub struct OrderWorkerTuning {
     pub max_cached_workflows: usize,
     pub activity_task_poller_max: usize,
     pub workflow_task_poller_max: usize,
+    pub activity_slot_min: usize,
+    pub activity_slot_max: usize,
+    pub workflow_slot_min: usize,
+    pub workflow_slot_max: usize,
 }
 
 pub type WorkerTuningConfig = OrderWorkerTuning;
@@ -44,10 +54,18 @@ pub type WorkerTuningConfig = OrderWorkerTuning;
 impl OrderWorkerTuning {
     #[must_use]
     pub fn resource_based_tuner(&self) -> Arc<dyn WorkerTuner + Send + Sync> {
-        Arc::new(ResourceBasedTuner::new(
-            self.target_mem_usage,
-            self.target_cpu_usage,
-        ))
+        let mut tuner = ResourceBasedTuner::new(self.target_mem_usage, self.target_cpu_usage);
+        tuner.with_activity_slots_options(ResourceSlotOptions::new(
+            self.activity_slot_min,
+            self.activity_slot_max,
+            Duration::from_millis(20),
+        ));
+        tuner.with_workflow_slots_options(ResourceSlotOptions::new(
+            self.workflow_slot_min,
+            self.workflow_slot_max,
+            Duration::from_millis(0),
+        ));
+        Arc::new(tuner)
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -61,6 +79,18 @@ impl OrderWorkerTuning {
             "ROUTER_TEMPORAL_WORKFLOW_POLLERS",
             self.workflow_task_poller_max,
         )?;
+        validate_slot_config(
+            "ROUTER_TEMPORAL_ACTIVITY_SLOT_MIN",
+            self.activity_slot_min,
+            "ROUTER_TEMPORAL_ACTIVITY_SLOT_MAX",
+            self.activity_slot_max,
+        )?;
+        validate_slot_config(
+            "ROUTER_TEMPORAL_WORKFLOW_SLOT_MIN",
+            self.workflow_slot_min,
+            "ROUTER_TEMPORAL_WORKFLOW_SLOT_MAX",
+            self.workflow_slot_max,
+        )?;
         Ok(())
     }
 }
@@ -73,6 +103,10 @@ impl Default for OrderWorkerTuning {
             max_cached_workflows: DEFAULT_TEMPORAL_MAX_CACHED_WORKFLOWS,
             activity_task_poller_max: DEFAULT_TEMPORAL_ACTIVITY_TASK_POLLER_MAX,
             workflow_task_poller_max: DEFAULT_TEMPORAL_WORKFLOW_TASK_POLLER_MAX,
+            activity_slot_min: DEFAULT_TEMPORAL_ACTIVITY_SLOT_MIN,
+            activity_slot_max: DEFAULT_TEMPORAL_ACTIVITY_SLOT_MAX,
+            workflow_slot_min: DEFAULT_TEMPORAL_WORKFLOW_SLOT_MIN,
+            workflow_slot_max: DEFAULT_TEMPORAL_WORKFLOW_SLOT_MAX,
         }
     }
 }
@@ -93,6 +127,23 @@ fn validate_poller_max(name: &str, value: usize) -> Result<usize, String> {
     } else {
         Err(format!("{name} must be at least 2"))
     }
+}
+
+fn validate_slot_config(
+    min_name: &str,
+    min_value: usize,
+    max_name: &str,
+    max_value: usize,
+) -> Result<(), String> {
+    if min_value < 2 {
+        return Err(format!("{min_name} must be at least 2"));
+    }
+    if min_value > max_value {
+        return Err(format!(
+            "{min_name} must be less than or equal to {max_name}"
+        ));
+    }
+    Ok(())
 }
 
 pub async fn run_worker_with_activities(
@@ -257,5 +308,52 @@ mod tests {
             DEFAULT_TEMPORAL_WORKFLOW_TASK_POLLER_MAX
         );
         assert!(tuning.workflow_task_poller_max >= 2);
+    }
+
+    #[test]
+    fn tuning_validates_slot_config() {
+        let mut tuning = OrderWorkerTuning::default();
+        tuning.activity_slot_min = 0;
+        let err = tuning
+            .validate()
+            .expect_err("zero activity slot minimum must be rejected");
+        assert!(err.contains("ROUTER_TEMPORAL_ACTIVITY_SLOT_MIN"));
+
+        let mut tuning = OrderWorkerTuning::default();
+        tuning.activity_slot_min = tuning.activity_slot_max + 1;
+        let err = tuning
+            .validate()
+            .expect_err("activity slot minimum above maximum must be rejected");
+        assert!(err.contains("ROUTER_TEMPORAL_ACTIVITY_SLOT_MIN"));
+        assert!(err.contains("ROUTER_TEMPORAL_ACTIVITY_SLOT_MAX"));
+
+        let mut tuning = OrderWorkerTuning::default();
+        tuning.workflow_slot_min = 0;
+        let err = tuning
+            .validate()
+            .expect_err("zero workflow slot minimum must be rejected");
+        assert!(err.contains("ROUTER_TEMPORAL_WORKFLOW_SLOT_MIN"));
+
+        let mut tuning = OrderWorkerTuning::default();
+        tuning.workflow_slot_min = tuning.workflow_slot_max + 1;
+        let err = tuning
+            .validate()
+            .expect_err("workflow slot minimum above maximum must be rejected");
+        assert!(err.contains("ROUTER_TEMPORAL_WORKFLOW_SLOT_MIN"));
+        assert!(err.contains("ROUTER_TEMPORAL_WORKFLOW_SLOT_MAX"));
+    }
+
+    #[test]
+    fn tuning_defaults_have_sane_slots() {
+        let tuning = OrderWorkerTuning::default();
+
+        assert!(tuning.activity_slot_min >= 64);
+        assert_eq!(tuning.activity_slot_min, DEFAULT_TEMPORAL_ACTIVITY_SLOT_MIN);
+        assert_eq!(tuning.activity_slot_max, DEFAULT_TEMPORAL_ACTIVITY_SLOT_MAX);
+        assert!(tuning.activity_slot_max >= tuning.activity_slot_min);
+        assert!(tuning.workflow_slot_min >= 16);
+        assert_eq!(tuning.workflow_slot_min, DEFAULT_TEMPORAL_WORKFLOW_SLOT_MIN);
+        assert_eq!(tuning.workflow_slot_max, DEFAULT_TEMPORAL_WORKFLOW_SLOT_MAX);
+        assert!(tuning.workflow_slot_max >= tuning.workflow_slot_min);
     }
 }
