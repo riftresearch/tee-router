@@ -2290,6 +2290,7 @@ dependencies = [
  "bitcoincore-rpc-async",
  "blockchain-utils",
  "eip3009-erc20-contract",
+ "eip7702-delegator-contract",
  "esplora-client",
  "evm-token-indexer-client",
  "getrandom 0.2.16",
