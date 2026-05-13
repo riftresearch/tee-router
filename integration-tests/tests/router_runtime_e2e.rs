@@ -954,6 +954,7 @@ async fn wait_for_http_health(base_url: &str, path: &str, label: &str) {
     panic!("{label} did not become healthy at {url}");
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn spawn_sauron(
     devnet: &RiftDevnet,
     database_url: &str,

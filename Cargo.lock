@@ -2291,6 +2291,7 @@ dependencies = [
  "blockchain-utils",
  "eip3009-erc20-contract",
  "eip7702-delegator-contract",
+ "eip7702-paymaster",
  "esplora-client",
  "evm-token-indexer-client",
  "getrandom 0.2.16",
@@ -3067,6 +3068,18 @@ name = "eip7702-delegator-contract"
 version = "0.1.8"
 dependencies = [
  "alloy",
+]
+
+[[package]]
+name = "eip7702-paymaster"
+version = "0.1.8"
+dependencies = [
+ "alloy",
+ "eip7702-delegator-contract",
+ "metrics",
+ "snafu",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

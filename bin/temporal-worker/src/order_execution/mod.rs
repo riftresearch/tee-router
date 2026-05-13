@@ -247,6 +247,7 @@ pub fn workflow_start_options(task_queue: &str, workflow_id: &str) -> WorkflowSt
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
 

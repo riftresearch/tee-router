@@ -17,6 +17,7 @@ members = [
     "crates/chainalysis-address-screener",
     "crates/devnet",
     "crates/eip3009-erc20-contract",
+    "crates/eip7702-paymaster",
     "crates/eip7702-delegator-contract",
     "crates/evm-indexer-client",
     "crates/evm-receipt-watcher-client",
@@ -63,6 +64,7 @@ evm-token-indexer-client = { path = "crates/evm-token-indexer-client" }
 bitcoin-indexer-client = { path = "crates/bitcoin-indexer-client" }
 bitcoin-receipt-watcher-client = { path = "crates/bitcoin-receipt-watcher-client" }
 eip3009-erc20-contract = { path = "crates/eip3009-erc20-contract" }
+eip7702-paymaster = { path = "crates/eip7702-paymaster" }
 eip7702-delegator-contract = { path = "crates/eip7702-delegator-contract" }
 utc = { path = "crates/utc" }
 chainalysis-address-screener = { path = "crates/chainalysis-address-screener" }
