@@ -1186,6 +1186,15 @@ impl RiftDevnetBuilder {
                 MOCK_ACROSS_SPOKE_POOL_ADDRESS,
                 arbitrum_devnet.anvil.endpoint(),
             )
+            .with_mock_service_evm_chain(
+                ethereum_devnet.anvil.chain_id(),
+                ethereum_devnet.anvil.endpoint(),
+            )
+            .with_mock_service_evm_chain(base_devnet.anvil.chain_id(), base_devnet.anvil.endpoint())
+            .with_mock_service_evm_chain(
+                arbitrum_devnet.anvil.chain_id(),
+                arbitrum_devnet.anvil.endpoint(),
+            )
             .with_across_auth("devnet-across", "rift-devnet")
             .with_cctp_chain(
                 ethereum_devnet.anvil.chain_id(),
