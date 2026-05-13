@@ -5577,6 +5577,7 @@ fn place_orders_on_mock(
             };
             let available = hl.available_spot(user, &reserve_coin);
             if !hyperliquid_has_sufficient_amount(available, reserve_amount) {
+                hl.reject_order(submitted, timestamp);
                 return json!({
                     "error": format!(
                         "insufficient {reserve_coin} balance: have {available}, need {reserve_amount}",
@@ -5600,8 +5601,13 @@ fn place_orders_on_mock(
                 )
             };
 
-            hl.debit_spot_total(user, &debit_coin, debit_amount);
-            hl.credit_spot(user, &credit_coin, credit_amount);
+            hl.apply_spot_fill(
+                user,
+                &debit_coin,
+                debit_amount,
+                &credit_coin,
+                credit_amount,
+            );
 
             let tid = hl.allocate_tid();
             let fill = HyperliquidFillRecord {
@@ -5909,6 +5915,29 @@ impl HyperliquidMockState {
         let tid = self.next_tid;
         self.next_tid += 1;
         tid
+    }
+
+    fn apply_spot_fill(
+        &mut self,
+        user: Address,
+        debit_coin: &str,
+        debit_amount: f64,
+        credit_coin: &str,
+        credit_amount: f64,
+    ) {
+        self.debit_spot_total(user, debit_coin, debit_amount);
+        self.credit_spot(user, credit_coin, credit_amount);
+    }
+
+    fn reject_order(&mut self, order: HyperliquidSubmittedOrder, timestamp: u64) {
+        self.terminal_orders.insert(
+            order.oid,
+            TerminalOrder {
+                order,
+                status: "rejected".to_string(),
+                status_timestamp: timestamp,
+            },
+        );
     }
 
     fn credit_spot(&mut self, user: Address, coin: &str, amount: f64) {
@@ -6389,19 +6418,17 @@ impl HyperliquidMockState {
                 self.spot_total(order.user, &debit_coin),
                 debit_amount,
             ) {
-                self.terminal_orders.insert(
-                    order.oid,
-                    TerminalOrder {
-                        order,
-                        status: "rejected".to_string(),
-                        status_timestamp: Utc::now().timestamp_millis().max(0) as u64,
-                    },
-                );
+                self.reject_order(order, Utc::now().timestamp_millis().max(0) as u64);
                 continue;
             }
 
-            self.debit_spot_total(order.user, &debit_coin, debit_amount);
-            self.credit_spot(order.user, &credit_coin, credit_amount);
+            self.apply_spot_fill(
+                order.user,
+                &debit_coin,
+                debit_amount,
+                &credit_coin,
+                credit_amount,
+            );
 
             let timestamp = Utc::now().timestamp_millis().max(0) as u64;
             let tid = self.allocate_tid();
@@ -9608,6 +9635,129 @@ mod tests {
             assert_eq!(filled["totalSz"], "30.3148");
             assert_eq!(filled["avgPx"], "2999.9");
             assert!((server.hyperliquid_balance_of(user, "UETH").await - 30.3148).abs() < 1e-9);
+        }
+
+        #[tokio::test]
+        async fn chained_sell_then_buy_credits_both_legs() {
+            let server = MockIntegratorServer::spawn_with_config(MockIntegratorConfig::default())
+                .await
+                .expect("spawn");
+            let wallet = TEST_WALLET.parse::<PrivateKeySigner>().expect("wallet");
+            let vault = Address::repeat_byte(0xc2);
+            let mut client =
+                HyperliquidClient::new(server.base_url(), wallet, Some(vault), Network::Testnet)
+                    .expect("client");
+            client.refresh_spot_meta().await.expect("spot meta");
+
+            server.set_hyperliquid_rate("UBTC", "USDC", 60_000.0).await;
+            server.set_hyperliquid_rate("UETH", "USDC", 3_000.0).await;
+
+            let rejected_buy = client
+                .place_orders(
+                    vec![OrderRequest {
+                        asset: client.asset_index("UETH/USDC").expect("ueth asset"),
+                        is_buy: true,
+                        limit_px: "3000".to_string(),
+                        sz: "1".to_string(),
+                        reduce_only: false,
+                        order_type: Order::Limit(Limit {
+                            tif: "Ioc".to_string(),
+                        }),
+                        cloid: None,
+                    }],
+                    "na",
+                )
+                .await
+                .expect("prefundless buy");
+            let rejected_error = rejected_buy["response"]["data"]["statuses"][0]["error"]
+                .as_str()
+                .expect("insufficient balance error");
+            assert!(
+                rejected_error.contains("insufficient USDC balance"),
+                "unexpected rejection: {rejected_error}"
+            );
+            let rejected_status = client
+                .order_status(vault, 1000)
+                .await
+                .expect("rejected order status");
+            assert_eq!(
+                rejected_status.order.expect("rejected order").status,
+                "rejected"
+            );
+            assert!(client
+                .user_fills(vault)
+                .await
+                .expect("fills after rejected buy")
+                .is_empty());
+
+            server.credit_hyperliquid_balance(vault, "UBTC", 1.0).await;
+
+            let sell = client
+                .place_orders(
+                    vec![OrderRequest {
+                        asset: client.asset_index("UBTC/USDC").expect("ubtc asset"),
+                        is_buy: false,
+                        limit_px: "60000".to_string(),
+                        sz: "0.1".to_string(),
+                        reduce_only: false,
+                        order_type: Order::Limit(Limit {
+                            tif: "Ioc".to_string(),
+                        }),
+                        cloid: None,
+                    }],
+                    "na",
+                )
+                .await
+                .expect("sell UBTC");
+            let sell_oid = sell["response"]["data"]["statuses"][0]["filled"]["oid"]
+                .as_u64()
+                .expect("sell oid");
+            let sell_status = client
+                .order_status(vault, sell_oid)
+                .await
+                .expect("sell order status");
+            assert_eq!(sell_status.order.expect("sell order").status, "filled");
+
+            let state = client
+                .spot_clearinghouse_state(vault)
+                .await
+                .expect("post-sell spot state");
+            assert_eq!(state.balance_of("USDC"), "6000");
+            assert_eq!(state.balance_of("UBTC"), "0.9");
+
+            let buy = client
+                .place_orders(
+                    vec![OrderRequest {
+                        asset: client.asset_index("UETH/USDC").expect("ueth asset"),
+                        is_buy: true,
+                        limit_px: "3000".to_string(),
+                        sz: "1".to_string(),
+                        reduce_only: false,
+                        order_type: Order::Limit(Limit {
+                            tif: "Ioc".to_string(),
+                        }),
+                        cloid: None,
+                    }],
+                    "na",
+                )
+                .await
+                .expect("buy UETH");
+            let buy_oid = buy["response"]["data"]["statuses"][0]["filled"]["oid"]
+                .as_u64()
+                .expect("buy oid");
+            let buy_status = client
+                .order_status(vault, buy_oid)
+                .await
+                .expect("buy order status");
+            assert_eq!(buy_status.order.expect("buy order").status, "filled");
+
+            let state = client
+                .spot_clearinghouse_state(vault)
+                .await
+                .expect("post-buy spot state");
+            assert_eq!(state.balance_of("USDC"), "3000");
+            assert_eq!(state.balance_of("UETH"), "1");
+            assert_eq!(state.balance_of("UBTC"), "0.9");
         }
 
         #[tokio::test]
