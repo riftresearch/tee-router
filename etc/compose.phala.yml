@@ -19,7 +19,7 @@ configs:
       max_wal_size = 2GB
       random_page_cost = 1.1
       effective_io_concurrency = 200
-      max_connections = 256
+      max_connections = 400
       log_connections = on
       log_disconnections = on
       log_statement = 'none'
@@ -154,8 +154,12 @@ x-router-environment: &router-environment
   - DEPLOYMENT_ENVIRONMENT=${DEPLOYMENT_ENVIRONMENT:-alpha}
   - SERVICE_NAMESPACE=tee-router
   - SERVICE_VERSION=${SERVICE_VERSION:-0.1.8}
-  - DB_MAX_CONNECTIONS=${DB_MAX_CONNECTIONS:-32}
+  - DB_MAX_CONNECTIONS=${DB_MAX_CONNECTIONS:-100}
   - DB_MIN_CONNECTIONS=${DB_MIN_CONNECTIONS:-4}
+  - SAURON_TEMPORAL_DB_MAX_CONNECTIONS=${SAURON_TEMPORAL_DB_MAX_CONNECTIONS:-200}
+  - SAURON_TEMPORAL_TARGET_MEM_USAGE=${SAURON_TEMPORAL_TARGET_MEM_USAGE:-0.8}
+  - SAURON_TEMPORAL_TARGET_CPU_USAGE=${SAURON_TEMPORAL_TARGET_CPU_USAGE:-0.9}
+  - SAURON_TEMPORAL_MAX_CACHED_WORKFLOWS=${SAURON_TEMPORAL_MAX_CACHED_WORKFLOWS:-2000}
   - ROUTER_MASTER_KEY_PATH=/run/router-secrets/router-master-key.hex
   - ETH_RPC_URL=${ETH_RPC_URL:?set ETH_RPC_URL}
   - BASE_RPC_URL=${BASE_RPC_URL:?set BASE_RPC_URL}

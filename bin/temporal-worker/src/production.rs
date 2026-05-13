@@ -46,7 +46,11 @@ pub struct OrderWorkerRuntimeArgs {
     pub database_url: String,
 
     /// Database max connections
-    #[arg(long, env = "DB_MAX_CONNECTIONS", default_value = "32")]
+    #[arg(
+        long = "db-max-connections",
+        env = "SAURON_TEMPORAL_DB_MAX_CONNECTIONS",
+        default_value = "200"
+    )]
     pub db_max_connections: u32,
 
     /// Database min connections
