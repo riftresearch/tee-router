@@ -139,6 +139,8 @@ services:
       - -c
       - max_replication_slots=10
       - -c
+      - max_connections=400
+      - -c
       - hba_file=/etc/postgresql/pg_hba.conf
       - -c
       - synchronous_commit=on
@@ -338,6 +340,11 @@ services:
     environment: &router_env
       RUST_LOG: info
       DATABASE_URL: postgres://router_app:router_app@router-postgres:5432/router_db
+      DB_MAX_CONNECTIONS: "100"
+      SAURON_TEMPORAL_DB_MAX_CONNECTIONS: "200"
+      SAURON_TEMPORAL_TARGET_MEM_USAGE: "0.8"
+      SAURON_TEMPORAL_TARGET_CPU_USAGE: "0.9"
+      SAURON_TEMPORAL_MAX_CACHED_WORKFLOWS: "2000"
       ROUTER_MASTER_KEY_PATH: /run/router-secrets/router-master-key.hex
       ETH_RPC_URL: http://devnet:50101
       BASE_RPC_URL: http://devnet:50102

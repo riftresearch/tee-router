@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use temporal_worker::{
     order_execution,
+    order_execution::WorkerTuningConfig,
     production::OrderWorkerRuntimeArgs,
     runtime::{TemporalConnection, WorkerResult},
     spike,
@@ -38,6 +39,29 @@ enum Command {
         )]
         quote_refresh_max_attempts: usize,
 
+        #[arg(
+            long,
+            env = "SAURON_TEMPORAL_TARGET_MEM_USAGE",
+            default_value = "0.8",
+            value_parser = parse_resource_target
+        )]
+        sauron_temporal_target_mem_usage: f64,
+
+        #[arg(
+            long,
+            env = "SAURON_TEMPORAL_TARGET_CPU_USAGE",
+            default_value = "0.9",
+            value_parser = parse_resource_target
+        )]
+        sauron_temporal_target_cpu_usage: f64,
+
+        #[arg(
+            long,
+            env = "SAURON_TEMPORAL_MAX_CACHED_WORKFLOWS",
+            default_value_t = order_execution::DEFAULT_TEMPORAL_MAX_CACHED_WORKFLOWS
+        )]
+        sauron_temporal_max_cached_workflows: usize,
+
         #[command(flatten)]
         runtime: OrderWorkerRuntimeArgs,
     },
@@ -70,6 +94,9 @@ async fn main() -> WorkerResult<()> {
         Command::Worker {
             task_queue,
             quote_refresh_max_attempts,
+            sauron_temporal_target_mem_usage,
+            sauron_temporal_target_cpu_usage,
+            sauron_temporal_max_cached_workflows,
             runtime,
         } => {
             let activities = order_execution::activities::OrderActivities::new(
@@ -78,8 +105,17 @@ async fn main() -> WorkerResult<()> {
                     .await?
                     .with_quote_refresh_max_attempts(quote_refresh_max_attempts),
             );
-            order_execution::run_worker_with_activities(&connection, &task_queue, activities)
-                .await?;
+            order_execution::run_worker_with_activities_and_tuning(
+                &connection,
+                &task_queue,
+                activities,
+                WorkerTuningConfig {
+                    target_mem_usage: sauron_temporal_target_mem_usage,
+                    target_cpu_usage: sauron_temporal_target_cpu_usage,
+                    max_cached_workflows: sauron_temporal_max_cached_workflows,
+                },
+            )
+            .await?;
         }
         Command::Spike {
             task_queue,
@@ -90,4 +126,135 @@ async fn main() -> WorkerResult<()> {
     }
 
     Ok(())
+}
+
+fn parse_resource_target(value: &str) -> Result<f64, String> {
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|source| format!("invalid resource target {value:?}: {source}"))?;
+    order_execution::validate_resource_target("resource target", parsed)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        env,
+        ffi::OsString,
+        sync::{Mutex, OnceLock},
+    };
+
+    use clap::{error::ErrorKind, Parser};
+
+    use super::*;
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl EnvGuard {
+        fn set(vars: &[(&'static str, Option<&'static str>)]) -> Self {
+            let saved = vars
+                .iter()
+                .map(|(key, _)| (*key, env::var_os(key)))
+                .collect::<Vec<_>>();
+            for (key, value) in vars {
+                match value {
+                    Some(value) => env::set_var(key, value),
+                    None => env::remove_var(key),
+                }
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.drain(..) {
+                match value {
+                    Some(value) => env::set_var(key, value),
+                    None => env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    fn temporal_env_vars() -> [(&'static str, Option<&'static str>); 4] {
+        [
+            ("SAURON_TEMPORAL_TARGET_MEM_USAGE", None),
+            ("SAURON_TEMPORAL_TARGET_CPU_USAGE", None),
+            ("SAURON_TEMPORAL_MAX_CACHED_WORKFLOWS", None),
+            ("SAURON_TEMPORAL_DB_MAX_CONNECTIONS", None),
+        ]
+    }
+
+    fn worker_args() -> Vec<&'static str> {
+        vec![
+            "temporal-worker",
+            "worker",
+            "--master-key-path",
+            "/tmp/router-master-key.hex",
+            "--ethereum-mainnet-rpc-url",
+            "http://ethereum.example",
+            "--base-rpc-url",
+            "http://base.example",
+            "--arbitrum-rpc-url",
+            "http://arbitrum.example",
+            "--bitcoin-rpc-url",
+            "http://bitcoin.example",
+            "--untrusted-esplora-http-server-url",
+            "http://electrum.example",
+        ]
+    }
+
+    #[test]
+    fn worker_cli_reads_temporal_env_tuning_values() {
+        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _env = EnvGuard::set(&[
+            ("SAURON_TEMPORAL_TARGET_MEM_USAGE", Some("0.7")),
+            ("SAURON_TEMPORAL_TARGET_CPU_USAGE", Some("0.6")),
+            ("SAURON_TEMPORAL_MAX_CACHED_WORKFLOWS", Some("3000")),
+            ("SAURON_TEMPORAL_DB_MAX_CONNECTIONS", Some("222")),
+        ]);
+
+        let cli = Cli::try_parse_from(worker_args()).expect("worker CLI parses");
+        match cli.command {
+            Command::Worker {
+                sauron_temporal_target_mem_usage,
+                sauron_temporal_target_cpu_usage,
+                sauron_temporal_max_cached_workflows,
+                runtime,
+                ..
+            } => {
+                assert_eq!(sauron_temporal_target_mem_usage, 0.7);
+                assert_eq!(sauron_temporal_target_cpu_usage, 0.6);
+                assert_eq!(sauron_temporal_max_cached_workflows, 3000);
+                assert_eq!(runtime.db_max_connections, 222);
+            }
+            Command::Spike { .. } => panic!("expected worker command"),
+        }
+    }
+
+    #[test]
+    fn worker_cli_rejects_target_mem_usage_above_one() {
+        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _env = EnvGuard::set(&temporal_env_vars());
+        let mut args = worker_args();
+        args.extend(["--sauron-temporal-target-mem-usage", "2.0"]);
+
+        let err = Cli::try_parse_from(args).expect_err("target above 1.0 must be rejected");
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn worker_cli_rejects_negative_target_cpu_usage() {
+        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _env = EnvGuard::set(&temporal_env_vars());
+        let mut args = worker_args();
+        args.push("--sauron-temporal-target-cpu-usage=-0.1");
+
+        let err = Cli::try_parse_from(args).expect_err("negative target must be rejected");
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+    }
 }

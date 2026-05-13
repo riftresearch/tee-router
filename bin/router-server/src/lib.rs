@@ -57,7 +57,7 @@ pub struct RouterServerArgs {
     pub database_url: String,
 
     /// Database max connections
-    #[arg(long, env = "DB_MAX_CONNECTIONS", default_value = "32")]
+    #[arg(long, env = "DB_MAX_CONNECTIONS", default_value = "100")]
     pub db_max_connections: u32,
 
     /// Database min connections

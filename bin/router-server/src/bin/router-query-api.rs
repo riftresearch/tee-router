@@ -41,7 +41,7 @@ struct RouterQueryApiArgs {
     database_url: String,
 
     /// Database max connections
-    #[arg(long, env = "DB_MAX_CONNECTIONS", default_value = "16")]
+    #[arg(long, env = "DB_MAX_CONNECTIONS", default_value = "100")]
     db_max_connections: u32,
 
     /// Database min connections
