@@ -628,6 +628,17 @@ mod tests {
     }
 
     #[test]
+    fn eip7702_delegator_constants_parse_for_devnet_injection() {
+        let bytecode = parse_bytes(EIP7702_DELEGATOR_BYTECODE, "EIP-7702 delegator bytecode")
+            .expect("EIP-7702 delegator bytecode must parse as bytes");
+        assert!(!bytecode.is_empty());
+
+        let address = parse_address(EIP7702_DELEGATOR_CROSSCHAIN_ADDRESS, "EIP-7702 delegator")
+            .expect("EIP-7702 delegator address must parse");
+        assert_eq!(address.as_slice().len(), 20);
+    }
+
+    #[test]
     fn fork_config_debug_redacts_rpc_url_credentials() {
         let config = ForkConfig {
             url: "https://rpc-user:rpc-pass@mainnet.example/v2/path-secret?api_key=query-secret"
