@@ -538,6 +538,8 @@ services:
       <<: *router_env
       RUST_LOG: info
       ROUTER_PAYMASTER_BATCH_MAX_SIZE: 64
+      ROUTER_TEMPORAL_ACTIVITY_POLLERS: "128"
+      ROUTER_TEMPORAL_WORKFLOW_POLLERS: "32"
     volumes:
       - router_local_master_key:/run/router-secrets:ro
     expose:

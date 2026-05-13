@@ -13,7 +13,7 @@ use temporalio_common::protos::temporal::api::enums::v1::{
     WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
 };
 use temporalio_sdk::{Worker, WorkerOptions};
-use temporalio_sdk_core::{CoreRuntime, ResourceBasedTuner, WorkerTuner};
+use temporalio_sdk_core::{CoreRuntime, PollerBehavior, ResourceBasedTuner, WorkerTuner};
 
 use crate::runtime::{
     boxed, connect_client, new_core_runtime, TemporalConnection, WorkerError, WorkerResult,
@@ -27,15 +27,21 @@ use workflows::{OrderWorkflow, QuoteRefreshWorkflow, RefundWorkflow};
 pub const DEFAULT_TEMPORAL_TARGET_MEM_USAGE: f64 = 0.8;
 pub const DEFAULT_TEMPORAL_TARGET_CPU_USAGE: f64 = 0.9;
 pub const DEFAULT_TEMPORAL_MAX_CACHED_WORKFLOWS: usize = 2000;
+pub const DEFAULT_TEMPORAL_ACTIVITY_TASK_POLLER_MAX: usize = 128;
+pub const DEFAULT_TEMPORAL_WORKFLOW_TASK_POLLER_MAX: usize = 32;
 
 #[derive(Debug, Clone, Copy)]
-pub struct WorkerTuningConfig {
+pub struct OrderWorkerTuning {
     pub target_mem_usage: f64,
     pub target_cpu_usage: f64,
     pub max_cached_workflows: usize,
+    pub activity_task_poller_max: usize,
+    pub workflow_task_poller_max: usize,
 }
 
-impl WorkerTuningConfig {
+pub type WorkerTuningConfig = OrderWorkerTuning;
+
+impl OrderWorkerTuning {
     #[must_use]
     pub fn resource_based_tuner(&self) -> Arc<dyn WorkerTuner + Send + Sync> {
         Arc::new(ResourceBasedTuner::new(
@@ -47,16 +53,26 @@ impl WorkerTuningConfig {
     pub fn validate(&self) -> Result<(), String> {
         validate_resource_target("SAURON_TEMPORAL_TARGET_MEM_USAGE", self.target_mem_usage)?;
         validate_resource_target("SAURON_TEMPORAL_TARGET_CPU_USAGE", self.target_cpu_usage)?;
+        validate_poller_max(
+            "ROUTER_TEMPORAL_ACTIVITY_POLLERS",
+            self.activity_task_poller_max,
+        )?;
+        validate_poller_max(
+            "ROUTER_TEMPORAL_WORKFLOW_POLLERS",
+            self.workflow_task_poller_max,
+        )?;
         Ok(())
     }
 }
 
-impl Default for WorkerTuningConfig {
+impl Default for OrderWorkerTuning {
     fn default() -> Self {
         Self {
             target_mem_usage: DEFAULT_TEMPORAL_TARGET_MEM_USAGE,
             target_cpu_usage: DEFAULT_TEMPORAL_TARGET_CPU_USAGE,
             max_cached_workflows: DEFAULT_TEMPORAL_MAX_CACHED_WORKFLOWS,
+            activity_task_poller_max: DEFAULT_TEMPORAL_ACTIVITY_TASK_POLLER_MAX,
+            workflow_task_poller_max: DEFAULT_TEMPORAL_WORKFLOW_TASK_POLLER_MAX,
         }
     }
 }
@@ -71,6 +87,14 @@ pub fn validate_resource_target(name: &str, value: f64) -> Result<f64, String> {
     }
 }
 
+fn validate_poller_max(name: &str, value: usize) -> Result<usize, String> {
+    if value >= 2 {
+        Ok(value)
+    } else {
+        Err(format!("{name} must be at least 2"))
+    }
+}
+
 pub async fn run_worker_with_activities(
     connection: &TemporalConnection,
     task_queue: &str,
@@ -80,7 +104,7 @@ pub async fn run_worker_with_activities(
         connection,
         task_queue,
         order_activities,
-        WorkerTuningConfig::default(),
+        OrderWorkerTuning::default(),
     )
     .await
 }
@@ -89,7 +113,7 @@ pub async fn run_worker_with_activities_and_tuning(
     connection: &TemporalConnection,
     task_queue: &str,
     order_activities: OrderActivities,
-    tuning: WorkerTuningConfig,
+    tuning: OrderWorkerTuning,
 ) -> WorkerResult<()> {
     let mut built =
         build_worker_with_tuning(connection, task_queue, order_activities, tuning).await?;
@@ -117,7 +141,7 @@ pub async fn build_worker(
         connection,
         task_queue,
         order_activities,
-        WorkerTuningConfig::default(),
+        OrderWorkerTuning::default(),
     )
     .await
 }
@@ -126,7 +150,7 @@ pub async fn build_worker_with_tuning(
     connection: &TemporalConnection,
     task_queue: &str,
     order_activities: OrderActivities,
-    tuning: WorkerTuningConfig,
+    tuning: OrderWorkerTuning,
 ) -> WorkerResult<BuiltOrderWorker> {
     tuning
         .validate()
@@ -140,6 +164,12 @@ pub async fn build_worker_with_tuning(
     let worker_options = WorkerOptions::new(task_queue)
         .tuner(tuning.resource_based_tuner())
         .max_cached_workflows(tuning.max_cached_workflows)
+        .activity_task_poller_behavior(PollerBehavior::SimpleMaximum(
+            tuning.activity_task_poller_max,
+        ))
+        .workflow_task_poller_behavior(PollerBehavior::SimpleMaximum(
+            tuning.workflow_task_poller_max,
+        ))
         .register_workflow::<OrderWorkflow>()
         .register_workflow::<RefundWorkflow>()
         .register_workflow::<QuoteRefreshWorkflow>()
@@ -171,12 +201,61 @@ mod tests {
 
     #[test]
     fn resource_based_tuner_constructs_as_worker_tuner() {
-        let tuning = WorkerTuningConfig::default();
+        let tuning = OrderWorkerTuning::default();
         tuning.validate().expect("default tuning config is valid");
 
         let tuner: Arc<dyn WorkerTuner + Send + Sync> = tuning.resource_based_tuner();
         let _ = tuner.workflow_task_slot_supplier();
         let _ = tuner.activity_task_slot_supplier();
         let _ = tuner.local_activity_slot_supplier();
+    }
+
+    #[test]
+    fn tuning_validates_positive_poller_counts() {
+        let mut tuning = OrderWorkerTuning::default();
+        tuning.activity_task_poller_max = 0;
+        let err = tuning
+            .validate()
+            .expect_err("zero activity pollers must be rejected");
+        assert!(err.contains("ROUTER_TEMPORAL_ACTIVITY_POLLERS"));
+
+        let mut tuning = OrderWorkerTuning::default();
+        tuning.activity_task_poller_max = 1;
+        let err = tuning
+            .validate()
+            .expect_err("one activity poller must be rejected");
+        assert!(err.contains("ROUTER_TEMPORAL_ACTIVITY_POLLERS"));
+
+        let mut tuning = OrderWorkerTuning::default();
+        tuning.workflow_task_poller_max = 0;
+        let err = tuning
+            .validate()
+            .expect_err("zero workflow pollers must be rejected");
+        assert!(err.contains("ROUTER_TEMPORAL_WORKFLOW_POLLERS"));
+
+        let mut tuning = OrderWorkerTuning::default();
+        tuning.workflow_task_poller_max = 1;
+        let err = tuning
+            .validate()
+            .expect_err("one workflow poller must be rejected");
+        assert!(err.contains("ROUTER_TEMPORAL_WORKFLOW_POLLERS"));
+    }
+
+    #[test]
+    fn tuning_defaults_have_sane_pollers() {
+        const EXPECTED_TASK_QUEUE_PARTITIONS: usize = 16;
+
+        let tuning = OrderWorkerTuning::default();
+
+        assert!(tuning.activity_task_poller_max >= EXPECTED_TASK_QUEUE_PARTITIONS);
+        assert_eq!(
+            tuning.activity_task_poller_max,
+            DEFAULT_TEMPORAL_ACTIVITY_TASK_POLLER_MAX
+        );
+        assert_eq!(
+            tuning.workflow_task_poller_max,
+            DEFAULT_TEMPORAL_WORKFLOW_TASK_POLLER_MAX
+        );
+        assert!(tuning.workflow_task_poller_max >= 2);
     }
 }
