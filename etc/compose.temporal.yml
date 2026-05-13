@@ -19,6 +19,14 @@ x-temporal-server-base: &temporal-server-base
   configs:
     - source: temporal-dynamic-config
       target: /etc/temporal/config/dynamicconfig/development-sql.yaml
+  entrypoint: ["/bin/sh", "-c"]
+  command:
+    - |
+      set -e
+      TEMPORAL_BROADCAST_ADDRESS="$$(getent hosts $$(hostname) | awk '{print $$1}')"
+      export TEMPORAL_BROADCAST_ADDRESS
+      echo "Resolved TEMPORAL_BROADCAST_ADDRESS=$$TEMPORAL_BROADCAST_ADDRESS for $$(hostname)"
+      exec /etc/temporal/entrypoint.sh
 
 configs:
   temporal-dynamic-config:
@@ -60,9 +68,10 @@ configs:
         - value: 16
           constraints: {}
 
-      # History cache -- raise to reduce shard reload churn under load
-      history.cacheMaxSize:
-        - value: 4096
+      # Host-level history cache (entries). Was history.cacheMaxSize pre-1.27.
+      # Default is 128000; bumping to 256000 to reduce shard reload churn under sustained load.
+      history.hostLevelCacheMaxSize:
+        - value: 256000
           constraints: {}
       history.eventsCacheMaxSizeBytes:
         - value: 1073741824   # 1 GiB
@@ -195,7 +204,6 @@ services:
     environment:
       <<: *temporal-server-env
       SERVICES: history
-      TEMPORAL_BROADCAST_ADDRESS: temporal-history
     healthcheck:
       test: ["CMD", "nc", "-z", "localhost", "7234"]
       interval: 5s
@@ -212,7 +220,6 @@ services:
     environment:
       <<: *temporal-server-env
       SERVICES: matching
-      TEMPORAL_BROADCAST_ADDRESS: temporal-matching
     healthcheck:
       test: ["CMD", "nc", "-z", "localhost", "7235"]
       interval: 5s
@@ -230,7 +237,6 @@ services:
     environment:
       <<: *temporal-server-env
       SERVICES: worker
-      TEMPORAL_BROADCAST_ADDRESS: temporal-internal-worker
     healthcheck:
       test: ["CMD", "nc", "-z", "localhost", "7239"]
       interval: 5s
@@ -247,7 +253,6 @@ services:
     environment:
       <<: *temporal-server-env
       SERVICES: frontend
-      TEMPORAL_BROADCAST_ADDRESS: temporal
     ports:
       - "7233:7233"
       - "9090:9090"
