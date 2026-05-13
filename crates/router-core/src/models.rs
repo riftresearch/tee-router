@@ -1140,6 +1140,7 @@ pub struct OrderProviderOperation {
     pub provider: String,
     pub operation_type: ProviderOperationType,
     pub provider_ref: Option<String>,
+    pub idempotency_key: Option<String>,
     pub status: ProviderOperationStatus,
     pub request: Value,
     pub response: Value,

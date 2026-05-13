@@ -113,6 +113,7 @@ const PROVIDER_OPERATION_SELECT_COLUMNS: &str = r#"
     provider,
     operation_type,
     provider_ref,
+    idempotency_key,
     status,
     request_json,
     response_json,
@@ -5345,6 +5346,7 @@ impl OrderRepository {
                 provider,
                 operation_type,
                 provider_ref,
+                idempotency_key,
                 status,
                 request_json,
                 response_json,
@@ -5352,7 +5354,7 @@ impl OrderRepository {
                 created_at,
                 updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             "#,
         )
         .bind(operation.id)
@@ -5362,6 +5364,7 @@ impl OrderRepository {
         .bind(&operation.provider)
         .bind(operation.operation_type.to_db_string())
         .bind(operation.provider_ref.clone())
+        .bind(operation.idempotency_key.clone())
         .bind(operation.status.to_db_string())
         .bind(operation.request.clone())
         .bind(operation.response.clone())
@@ -5384,7 +5387,7 @@ impl OrderRepository {
         operation: &OrderProviderOperation,
     ) -> RouterCoreResult<Uuid> {
         let started = Instant::now();
-        let result = sqlx_core::query_scalar::query_scalar(
+        let query = if operation.idempotency_key.is_some() {
             r#"
             WITH upserted AS (
                 INSERT INTO order_provider_operations (
@@ -5395,6 +5398,7 @@ impl OrderRepository {
                     provider,
                     operation_type,
                     provider_ref,
+                    idempotency_key,
                     status,
                     request_json,
                     response_json,
@@ -5402,7 +5406,73 @@ impl OrderRepository {
                     created_at,
                     updated_at
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                ON CONFLICT (provider, operation_type, idempotency_key)
+                WHERE idempotency_key IS NOT NULL
+                DO UPDATE SET
+                    order_id = EXCLUDED.order_id,
+                    execution_attempt_id = CASE
+                        WHEN order_provider_operations.execution_step_id IS NULL
+                          OR order_provider_operations.execution_step_id = EXCLUDED.execution_step_id
+                          OR EXISTS (
+                              SELECT 1
+                              FROM order_execution_steps current_step
+                              WHERE current_step.id = order_provider_operations.execution_step_id
+                                AND current_step.status IN ('superseded', 'failed', 'cancelled')
+                          )
+                        THEN EXCLUDED.execution_attempt_id
+                        ELSE order_provider_operations.execution_attempt_id
+                    END,
+                    execution_step_id = CASE
+                        WHEN order_provider_operations.execution_step_id IS NULL
+                          OR order_provider_operations.execution_step_id = EXCLUDED.execution_step_id
+                          OR EXISTS (
+                              SELECT 1
+                              FROM order_execution_steps current_step
+                              WHERE current_step.id = order_provider_operations.execution_step_id
+                                AND current_step.status IN ('superseded', 'failed', 'cancelled')
+                          )
+                        THEN EXCLUDED.execution_step_id
+                        ELSE order_provider_operations.execution_step_id
+                    END,
+                    provider_ref = COALESCE(EXCLUDED.provider_ref, order_provider_operations.provider_ref),
+                    status = EXCLUDED.status,
+                    request_json = EXCLUDED.request_json,
+                    response_json = EXCLUDED.response_json,
+                    observed_state_json = EXCLUDED.observed_state_json,
+                    updated_at = EXCLUDED.updated_at
+                WHERE order_provider_operations.status NOT IN ('completed', 'failed', 'expired')
+                RETURNING id
+            )
+            SELECT id FROM upserted
+            UNION ALL
+            SELECT id
+            FROM order_provider_operations
+            WHERE provider = $5
+              AND operation_type = $6
+              AND idempotency_key = $8
+            LIMIT 1
+            "#
+        } else {
+            r#"
+            WITH upserted AS (
+                INSERT INTO order_provider_operations (
+                    id,
+                    order_id,
+                    execution_attempt_id,
+                    execution_step_id,
+                    provider,
+                    operation_type,
+                    provider_ref,
+                    idempotency_key,
+                    status,
+                    request_json,
+                    response_json,
+                    observed_state_json,
+                    created_at,
+                    updated_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
                 ON CONFLICT (execution_step_id) WHERE execution_step_id IS NOT NULL
                 DO UPDATE SET
                     order_id = EXCLUDED.order_id,
@@ -5410,6 +5480,7 @@ impl OrderRepository {
                     provider = EXCLUDED.provider,
                     operation_type = EXCLUDED.operation_type,
                     provider_ref = EXCLUDED.provider_ref,
+                    idempotency_key = EXCLUDED.idempotency_key,
                     status = EXCLUDED.status,
                     request_json = EXCLUDED.request_json,
                     response_json = EXCLUDED.response_json,
@@ -5422,6 +5493,7 @@ impl OrderRepository {
                     OR order_provider_operations.provider IS DISTINCT FROM EXCLUDED.provider
                     OR order_provider_operations.operation_type IS DISTINCT FROM EXCLUDED.operation_type
                     OR order_provider_operations.provider_ref IS DISTINCT FROM EXCLUDED.provider_ref
+                    OR order_provider_operations.idempotency_key IS DISTINCT FROM EXCLUDED.idempotency_key
                     OR order_provider_operations.status IS DISTINCT FROM EXCLUDED.status
                     OR order_provider_operations.request_json IS DISTINCT FROM EXCLUDED.request_json
                     OR order_provider_operations.response_json IS DISTINCT FROM EXCLUDED.response_json
@@ -5435,23 +5507,25 @@ impl OrderRepository {
             FROM order_provider_operations
             WHERE execution_step_id = $4
             LIMIT 1
-            "#,
-        )
-        .bind(operation.id)
-        .bind(operation.order_id)
-        .bind(operation.execution_attempt_id)
-        .bind(operation.execution_step_id)
-        .bind(&operation.provider)
-        .bind(operation.operation_type.to_db_string())
-        .bind(operation.provider_ref.clone())
-        .bind(operation.status.to_db_string())
-        .bind(operation.request.clone())
-        .bind(operation.response.clone())
-        .bind(operation.observed_state.clone())
-        .bind(operation.created_at)
-        .bind(operation.updated_at)
-        .fetch_one(&self.pool)
-        .await;
+            "#
+        };
+        let result = sqlx_core::query_scalar::query_scalar(query)
+            .bind(operation.id)
+            .bind(operation.order_id)
+            .bind(operation.execution_attempt_id)
+            .bind(operation.execution_step_id)
+            .bind(&operation.provider)
+            .bind(operation.operation_type.to_db_string())
+            .bind(operation.provider_ref.clone())
+            .bind(operation.idempotency_key.clone())
+            .bind(operation.status.to_db_string())
+            .bind(operation.request.clone())
+            .bind(operation.response.clone())
+            .bind(operation.observed_state.clone())
+            .bind(operation.created_at)
+            .bind(operation.updated_at)
+            .fetch_one(&self.pool)
+            .await;
         telemetry::record_db_query(
             "order.upsert_provider_operation",
             result.is_ok(),
@@ -5513,6 +5587,40 @@ impl OrderRepository {
         self.map_provider_operation_row(&row)
     }
 
+    pub async fn get_provider_operation_by_idempotency_key(
+        &self,
+        provider: &str,
+        operation_type: ProviderOperationType,
+        idempotency_key: &str,
+    ) -> RouterCoreResult<Option<OrderProviderOperation>> {
+        let started = Instant::now();
+        let result = sqlx_core::query::query(&format!(
+            r#"
+            SELECT {PROVIDER_OPERATION_SELECT_COLUMNS}
+            FROM order_provider_operations
+            WHERE provider = $1
+              AND operation_type = $2
+              AND idempotency_key = $3
+            ORDER BY updated_at DESC, created_at DESC, id DESC
+            LIMIT 1
+            "#
+        ))
+        .bind(provider)
+        .bind(operation_type.to_db_string())
+        .bind(idempotency_key)
+        .fetch_optional(&self.pool)
+        .await;
+        telemetry::record_db_query(
+            "order.get_provider_operation_by_idempotency_key",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        result?
+            .as_ref()
+            .map(|row| self.map_provider_operation_row(row))
+            .transpose()
+    }
+
     pub async fn find_terminal_provider_operations_pending_step_settlement(
         &self,
         limit: i64,
@@ -5528,6 +5636,7 @@ impl OrderRepository {
                 ops.provider,
                 ops.operation_type,
                 ops.provider_ref,
+                ops.idempotency_key,
                 ops.status,
                 ops.request_json,
                 ops.response_json,
@@ -7424,6 +7533,7 @@ impl OrderRepository {
                             provider,
                             operation_type,
                             provider_ref,
+                            idempotency_key,
                             status,
                             request_json,
                             response_json,
@@ -7431,7 +7541,7 @@ impl OrderRepository {
                             created_at,
                             updated_at
                         )
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
                         ON CONFLICT (execution_step_id) WHERE execution_step_id IS NOT NULL
                         DO UPDATE SET
                             order_id = EXCLUDED.order_id,
@@ -7439,6 +7549,7 @@ impl OrderRepository {
                             provider = EXCLUDED.provider,
                             operation_type = EXCLUDED.operation_type,
                             provider_ref = EXCLUDED.provider_ref,
+                            idempotency_key = EXCLUDED.idempotency_key,
                             status = EXCLUDED.status,
                             request_json = EXCLUDED.request_json,
                             response_json = EXCLUDED.response_json,
@@ -7451,6 +7562,7 @@ impl OrderRepository {
                             OR order_provider_operations.provider IS DISTINCT FROM EXCLUDED.provider
                             OR order_provider_operations.operation_type IS DISTINCT FROM EXCLUDED.operation_type
                             OR order_provider_operations.provider_ref IS DISTINCT FROM EXCLUDED.provider_ref
+                            OR order_provider_operations.idempotency_key IS DISTINCT FROM EXCLUDED.idempotency_key
                             OR order_provider_operations.status IS DISTINCT FROM EXCLUDED.status
                             OR order_provider_operations.request_json IS DISTINCT FROM EXCLUDED.request_json
                             OR order_provider_operations.response_json IS DISTINCT FROM EXCLUDED.response_json
@@ -7473,6 +7585,7 @@ impl OrderRepository {
                 .bind(&operation.provider)
                 .bind(operation.operation_type.to_db_string())
                 .bind(operation.provider_ref.clone())
+                .bind(operation.idempotency_key.clone())
                 .bind(operation.status.to_db_string())
                 .bind(operation.request.clone())
                 .bind(operation.response.clone())
@@ -8572,6 +8685,7 @@ impl OrderRepository {
             provider: row.get("provider"),
             operation_type,
             provider_ref: row.get("provider_ref"),
+            idempotency_key: row.get("idempotency_key"),
             status,
             request: row.get("request_json"),
             response: row.get("response_json"),

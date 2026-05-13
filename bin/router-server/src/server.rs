@@ -2158,6 +2158,7 @@ mod tests {
             provider: "across".to_string(),
             operation_type: ProviderOperationType::AcrossBridge,
             provider_ref: Some("provider-ref".to_string()),
+            idempotency_key: None,
             status: router_core::models::ProviderOperationStatus::WaitingExternal,
             request: serde_json::json!({}),
             response: serde_json::json!({}),

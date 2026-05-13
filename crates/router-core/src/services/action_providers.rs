@@ -268,6 +268,8 @@ pub struct ProviderOperationIntent {
     #[serde(default)]
     pub provider_ref: Option<String>,
     #[serde(default)]
+    pub idempotency_key: Option<String>,
+    #[serde(default)]
     pub request: Option<Value>,
     #[serde(default)]
     pub response: Option<Value>,
@@ -1044,6 +1046,7 @@ impl BridgeProvider for AcrossProvider {
                         operation_type: ProviderOperationType::AcrossBridge,
                         status: ProviderOperationStatus::Submitted,
                         provider_ref: None,
+                        idempotency_key: None,
                         request: Some(operation_request),
                         response: Some(response_json),
                         observed_state: None,
@@ -1653,6 +1656,7 @@ impl UnitProvider for HyperUnitProvider {
                         operation_type: ProviderOperationType::UnitDeposit,
                         status: ProviderOperationStatus::Submitted,
                         provider_ref: Some(protocol_address.clone()),
+                        idempotency_key: None,
                         request: Some(operation_request),
                         response: Some(gen_response_json),
                         observed_state: None,
@@ -1849,6 +1853,7 @@ impl UnitProvider for HyperUnitProvider {
                         operation_type: ProviderOperationType::UnitWithdrawal,
                         status: ProviderOperationStatus::Submitted,
                         provider_ref: Some(protocol_address),
+                        idempotency_key: None,
                         request: Some(operation_request),
                         response: Some(gen_response_json),
                         observed_state: None,
@@ -2199,6 +2204,7 @@ impl HyperliquidBridgeProvider {
                     operation_type: ProviderOperationType::HyperliquidBridgeWithdrawal,
                     status: ProviderOperationStatus::Submitted,
                     provider_ref: None,
+                    idempotency_key: None,
                     request: Some(operation_request),
                     response: None,
                     observed_state: None,
@@ -2357,6 +2363,7 @@ impl BridgeProvider for HyperliquidBridgeProvider {
                         operation_type: ProviderOperationType::HyperliquidBridgeDeposit,
                         status: ProviderOperationStatus::Submitted,
                         provider_ref: Some(hyperliquid_user.clone()),
+                        idempotency_key: None,
                         request: Some(json!({
                             "source_chain_id": step.source_chain_id,
                             "input_asset": step.input_asset,
@@ -3042,6 +3049,7 @@ impl CctpProvider {
                     operation_type: ProviderOperationType::CctpBridge,
                     status: ProviderOperationStatus::Submitted,
                     provider_ref: None,
+                    idempotency_key: None,
                     request: Some(operation_request),
                     response: Some(json!({
                         "kind": "cctp_burn_submitted",
@@ -3089,6 +3097,7 @@ impl CctpProvider {
                     operation_type: ProviderOperationType::CctpReceive,
                     status: ProviderOperationStatus::Submitted,
                     provider_ref: None,
+                    idempotency_key: None,
                     request: Some(operation_request),
                     response: Some(json!({
                         "kind": "cctp_receive_submitted",
@@ -4130,6 +4139,7 @@ impl HyperliquidProvider {
                     operation_type: ProviderOperationType::HyperliquidLimitOrder,
                     status: ProviderOperationStatus::Submitted,
                     provider_ref: None,
+                    idempotency_key: None,
                     request: Some(operation_request),
                     response: None,
                     observed_state: None,
@@ -4492,6 +4502,7 @@ impl ExchangeProvider for VeloraProvider {
                         operation_type: ProviderOperationType::UniversalRouterSwap,
                         status: ProviderOperationStatus::Submitted,
                         provider_ref: None,
+                        idempotency_key: None,
                         request: Some(
                             serde_json::to_value(step)
                                 .map_err(|err| format!("serialize velora step request: {err}"))?,
@@ -4770,6 +4781,7 @@ impl ExchangeProvider for HyperliquidProvider {
                         operation_type: ProviderOperationType::HyperliquidTrade,
                         status: ProviderOperationStatus::Submitted,
                         provider_ref: None,
+                        idempotency_key: None,
                         request: Some(operation_request),
                         response: None,
                         observed_state: None,
