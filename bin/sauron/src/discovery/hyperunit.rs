@@ -106,6 +106,14 @@ struct PollState {
     next_poll_at: Instant,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct HyperUnitObserverOptions {
+    pub concurrency_limit: usize,
+    pub poll_fast_interval: Duration,
+    pub poll_medium_interval: Duration,
+    pub poll_slow_interval: Duration,
+}
+
 pub async fn run_hyperunit_observer_loop(
     store: ProviderOperationWatchStore,
     router_client: RouterClient,
@@ -113,7 +121,7 @@ pub async fn run_hyperunit_observer_loop(
     hl: HlShimClient,
     btc: BitcoinClients,
     evm: Option<EvmReceiptObserverClients>,
-    concurrency_limit: usize,
+    options: HyperUnitObserverOptions,
 ) -> Result<()> {
     let router_client = Arc::new(router_client);
     let unit = Arc::new(unit);
@@ -134,7 +142,7 @@ pub async fn run_hyperunit_observer_loop(
             Arc::clone(&hl),
             Arc::clone(&btc),
             evm.clone(),
-            concurrency_limit,
+            options,
             &mut poll_state,
             Arc::clone(&submitted),
         )
@@ -151,7 +159,7 @@ async fn run_hyperunit_observer_cycle(
     hl: Arc<HlShimClient>,
     btc: Arc<BitcoinClients>,
     evm: Option<Arc<EvmReceiptObserverClients>>,
-    concurrency_limit: usize,
+    options: HyperUnitObserverOptions,
     poll_state: &mut HashMap<Uuid, PollState>,
     submitted: Arc<Mutex<HashSet<(Uuid, String)>>>,
 ) {
@@ -190,11 +198,17 @@ async fn run_hyperunit_observer_cycle(
         if state.next_poll_at > now {
             continue;
         }
-        state.next_poll_at = now + hyperunit_poll_interval(state.first_seen.elapsed());
+        state.next_poll_at = now
+            + hyperunit_poll_interval(
+                state.first_seen.elapsed(),
+                options.poll_fast_interval,
+                options.poll_medium_interval,
+                options.poll_slow_interval,
+            );
         due.push(operation);
     }
 
-    let concurrency_limit = concurrency_limit.max(1);
+    let concurrency_limit = options.concurrency_limit.max(1);
     let mut operations = due.into_iter();
     let mut tasks = JoinSet::new();
     loop {
@@ -1146,13 +1160,18 @@ fn normalize_decimal(value: &str) -> Option<String> {
     })
 }
 
-fn hyperunit_poll_interval(elapsed: Duration) -> Duration {
+fn hyperunit_poll_interval(
+    elapsed: Duration,
+    fast: Duration,
+    medium: Duration,
+    slow: Duration,
+) -> Duration {
     if elapsed < Duration::from_secs(5 * 60) {
-        Duration::from_secs(5)
+        fast
     } else if elapsed < Duration::from_secs(30 * 60) {
-        Duration::from_secs(30)
+        medium
     } else {
-        Duration::from_secs(60)
+        slow
     }
 }
 
@@ -1190,6 +1209,45 @@ mod tests {
         task::JoinHandle,
         time::sleep,
     };
+
+    #[test]
+    fn hyperunit_poll_interval_uses_fast_interval_for_new_operations() {
+        assert_eq!(
+            hyperunit_poll_interval(
+                Duration::from_secs(10),
+                Duration::from_secs(5),
+                Duration::from_secs(10),
+                Duration::from_secs(20),
+            ),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn hyperunit_poll_interval_uses_medium_interval_after_five_minutes() {
+        assert_eq!(
+            hyperunit_poll_interval(
+                Duration::from_secs(10 * 60),
+                Duration::from_secs(5),
+                Duration::from_secs(10),
+                Duration::from_secs(20),
+            ),
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn hyperunit_poll_interval_uses_slow_interval_after_thirty_minutes() {
+        assert_eq!(
+            hyperunit_poll_interval(
+                Duration::from_secs(60 * 60),
+                Duration::from_secs(5),
+                Duration::from_secs(10),
+                Duration::from_secs(20),
+            ),
+            Duration::from_secs(20)
+        );
+    }
 
     #[test]
     fn btc_deposit_evidence_matches_router_typed_shape() {
@@ -1434,7 +1492,12 @@ mod tests {
             Arc::new(HlShimClient::new("http://127.0.0.1:1").expect("HL client")),
             Arc::new(dummy_bitcoin_clients(None)),
             None,
-            25,
+            HyperUnitObserverOptions {
+                concurrency_limit: 25,
+                poll_fast_interval: Duration::from_secs(5),
+                poll_medium_interval: Duration::from_secs(10),
+                poll_slow_interval: Duration::from_secs(20),
+            },
             &mut poll_state,
             Arc::clone(&submitted),
         )
