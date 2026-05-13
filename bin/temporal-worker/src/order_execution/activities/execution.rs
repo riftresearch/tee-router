@@ -2,6 +2,33 @@ use futures_util::future::{BoxFuture, FutureExt};
 
 use super::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StaleQuoteRefreshBudgetDecision {
+    Refresh,
+    RefundRequired,
+}
+
+pub(super) fn stale_quote_refresh_budget_decision(
+    refreshed_attempt_count: usize,
+    max_refresh_attempts: usize,
+) -> StaleQuoteRefreshBudgetDecision {
+    if refreshed_attempt_count < max_refresh_attempts {
+        StaleQuoteRefreshBudgetDecision::Refresh
+    } else {
+        StaleQuoteRefreshBudgetDecision::RefundRequired
+    }
+}
+
+pub(super) fn stale_quote_step_failure_decision(
+    refreshed_attempt_count: usize,
+    max_refresh_attempts: usize,
+) -> StepFailureDecision {
+    match stale_quote_refresh_budget_decision(refreshed_attempt_count, max_refresh_attempts) {
+        StaleQuoteRefreshBudgetDecision::Refresh => StepFailureDecision::RefreshQuote,
+        StaleQuoteRefreshBudgetDecision::RefundRequired => StepFailureDecision::StartRefund,
+    }
+}
+
 #[activities]
 impl OrderActivities {
     /// Scar tissue: §13 step type dispatch provider trait family mapping.
@@ -657,13 +684,12 @@ impl OrderActivities {
             .into_iter()
             .filter(|attempt| attempt.attempt_kind == OrderExecutionAttemptKind::RefreshedExecution)
             .count();
-        let stale_quote_refresh_allowed = if matches!(order_quote, RouterOrderQuote::MarketOrder(_))
+        let stale_quote_refresh_eligible = matches!(&order_quote, RouterOrderQuote::MarketOrder(_))
             // Scar §7: RefundRecovery attempts never stale-refresh. Funds may be
             // mid-flight during a refund, so stale refund quotes route to refund
             // manual intervention instead of being re-quoted.
-            && attempt.attempt_kind != OrderExecutionAttemptKind::RefundRecovery
-            && refreshed_attempt_count < MAX_STALE_QUOTE_REFRESHES_PER_ORDER_EXECUTION
-        {
+            && attempt.attempt_kind != OrderExecutionAttemptKind::RefundRecovery;
+        let stale_quote_expired = if stale_quote_refresh_eligible {
             let legs = deps
                 .db
                 .orders()
@@ -678,15 +704,24 @@ impl OrderActivities {
         } else {
             false
         };
-        if refreshed_attempt_count >= MAX_STALE_QUOTE_REFRESHES_PER_ORDER_EXECUTION
-            && matches!(order_quote, RouterOrderQuote::MarketOrder(_))
-            && attempt.attempt_kind != OrderExecutionAttemptKind::RefundRecovery
+        let refresh_budget_decision = stale_quote_refresh_budget_decision(
+            refreshed_attempt_count,
+            deps.quote_refresh_max_attempts,
+        );
+        if stale_quote_expired
+            && refresh_budget_decision == StaleQuoteRefreshBudgetDecision::RefundRequired
         {
             telemetry::record_stale_quote_refresh_cap_hit();
         }
-        let decision = if stale_quote_refresh_allowed {
-            telemetry::record_stale_quote_refresh("post_failure_detected");
-            StepFailureDecision::RefreshQuote
+        let decision = if stale_quote_expired {
+            let decision = stale_quote_step_failure_decision(
+                refreshed_attempt_count,
+                deps.quote_refresh_max_attempts,
+            );
+            if decision == StepFailureDecision::RefreshQuote {
+                telemetry::record_stale_quote_refresh("post_failure_detected");
+            }
+            decision
         } else if attempt.attempt_index < MAX_EXECUTION_ATTEMPTS {
             StepFailureDecision::RetryNewAttempt
         } else {
@@ -698,6 +733,7 @@ impl OrderActivities {
             failed_step_id = %input.failed_step_id.inner(),
             attempt_index = attempt.attempt_index,
             refreshed_attempt_count,
+            quote_refresh_max_attempts = deps.quote_refresh_max_attempts,
             decision = ?decision,
             event_name = "execution_step.failure_classified",
             "execution_step.failure_classified"
@@ -739,6 +775,7 @@ impl OrderActivities {
             {
                 return Ok(PreExecutionStaleQuoteCheck {
                     should_refresh: false,
+                    should_refund: false,
                     reason: None,
                 });
             }
@@ -751,6 +788,7 @@ impl OrderActivities {
             if !matches!(order_quote, RouterOrderQuote::MarketOrder(_)) {
                 return Ok(PreExecutionStaleQuoteCheck {
                     should_refresh: false,
+                    should_refund: false,
                     reason: None,
                 });
             }
@@ -765,13 +803,6 @@ impl OrderActivities {
                     attempt.attempt_kind == OrderExecutionAttemptKind::RefreshedExecution
                 })
                 .count();
-            if refreshed_attempt_count >= MAX_STALE_QUOTE_REFRESHES_PER_ORDER_EXECUTION {
-                telemetry::record_stale_quote_refresh_cap_hit();
-                return Ok(PreExecutionStaleQuoteCheck {
-                    should_refresh: false,
-                    reason: None,
-                });
-            }
             let step = deps
                 .db
                 .orders()
@@ -802,6 +833,7 @@ impl OrderActivities {
             if step.status != OrderExecutionStepStatus::Running || provider_side_effect_started {
                 return Ok(PreExecutionStaleQuoteCheck {
                     should_refresh: false,
+                    should_refund: false,
                     reason: None,
                 });
             }
@@ -814,12 +846,14 @@ impl OrderActivities {
             if leg_already_crossed_provider_boundary(&step, &attempt_steps, &provider_operations) {
                 return Ok(PreExecutionStaleQuoteCheck {
                     should_refresh: false,
+                    should_refund: false,
                     reason: None,
                 });
             }
             let Some(leg_id) = step.execution_leg_id else {
                 return Ok(PreExecutionStaleQuoteCheck {
                     should_refresh: false,
+                    should_refund: false,
                     reason: None,
                 });
             };
@@ -832,18 +866,21 @@ impl OrderActivities {
             let Some(leg) = legs.into_iter().find(|leg| leg.id == leg_id) else {
                 return Ok(PreExecutionStaleQuoteCheck {
                     should_refresh: false,
+                    should_refund: false,
                     reason: None,
                 });
             };
             let Some(provider_quote_expires_at) = leg.provider_quote_expires_at else {
                 return Ok(PreExecutionStaleQuoteCheck {
                     should_refresh: false,
+                    should_refund: false,
                     reason: None,
                 });
             };
             if provider_quote_expires_at >= Utc::now() {
                 return Ok(PreExecutionStaleQuoteCheck {
                     should_refresh: false,
+                    should_refund: false,
                     reason: None,
                 });
             }
@@ -853,6 +890,7 @@ impl OrderActivities {
                 "execution_leg_id": leg.id,
                 "provider_quote_expires_at": provider_quote_expires_at.to_rfc3339(),
                 "refreshed_attempt_count": refreshed_attempt_count,
+                "quote_refresh_max_attempts": deps.quote_refresh_max_attempts,
             });
             tracing::info!(
                 order_id = %input.order_id.inner(),
@@ -863,11 +901,27 @@ impl OrderActivities {
                 event_name = "execution_step.pre_execution_stale_quote_detected",
                 "execution_step.pre_execution_stale_quote_detected"
             );
-            telemetry::record_stale_quote_refresh("pre_execution_detected");
-            Ok(PreExecutionStaleQuoteCheck {
-                should_refresh: true,
-                reason: Some(reason),
-            })
+            match stale_quote_refresh_budget_decision(
+                refreshed_attempt_count,
+                deps.quote_refresh_max_attempts,
+            ) {
+                StaleQuoteRefreshBudgetDecision::Refresh => {
+                    telemetry::record_stale_quote_refresh("pre_execution_detected");
+                    Ok(PreExecutionStaleQuoteCheck {
+                        should_refresh: true,
+                        should_refund: false,
+                        reason: Some(reason),
+                    })
+                }
+                StaleQuoteRefreshBudgetDecision::RefundRequired => {
+                    telemetry::record_stale_quote_refresh_cap_hit();
+                    Ok(PreExecutionStaleQuoteCheck {
+                        should_refresh: false,
+                        should_refund: true,
+                        reason: Some(reason),
+                    })
+                }
+            }
         })
         .await
     }

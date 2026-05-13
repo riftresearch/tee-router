@@ -120,6 +120,30 @@ fn different_leg_completed_step_does_not_block_pre_execution_refresh() {
     ));
 }
 
+#[test]
+fn stale_quote_refresh_budget_refreshes_first_pre_execution_stale_quote() {
+    assert_eq!(
+        stale_quote_refresh_budget_decision(0, DEFAULT_QUOTE_REFRESH_MAX_ATTEMPTS),
+        StaleQuoteRefreshBudgetDecision::Refresh
+    );
+    assert_eq!(
+        stale_quote_step_failure_decision(0, DEFAULT_QUOTE_REFRESH_MAX_ATTEMPTS),
+        StepFailureDecision::RefreshQuote
+    );
+}
+
+#[test]
+fn stale_quote_refresh_budget_refunds_after_three_refresh_attempts() {
+    assert_eq!(
+        stale_quote_refresh_budget_decision(3, DEFAULT_QUOTE_REFRESH_MAX_ATTEMPTS),
+        StaleQuoteRefreshBudgetDecision::RefundRequired
+    );
+    assert_eq!(
+        stale_quote_step_failure_decision(3, DEFAULT_QUOTE_REFRESH_MAX_ATTEMPTS),
+        StepFailureDecision::StartRefund
+    );
+}
+
 #[tokio::test]
 async fn classify_stale_running_step_records_all_decisions() {
     let test_db = test_database().await;

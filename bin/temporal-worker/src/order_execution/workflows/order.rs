@@ -59,6 +59,23 @@ struct FinalizingState {
     terminal_status: Option<OrderTerminalStatus>,
 }
 
+enum QuoteRefreshContinuation {
+    ResumeExecution(MaterializedExecutionAttempt),
+    RefundRequired,
+}
+
+fn quote_refresh_continuation(outcome: QuoteRefreshWorkflowOutcome) -> QuoteRefreshContinuation {
+    match outcome {
+        QuoteRefreshWorkflowOutcome::Refreshed { attempt_id, steps } => {
+            QuoteRefreshContinuation::ResumeExecution(MaterializedExecutionAttempt {
+                attempt_id,
+                steps,
+            })
+        }
+        QuoteRefreshWorkflowOutcome::Untenable { .. } => QuoteRefreshContinuation::RefundRequired,
+    }
+}
+
 impl OrderWorkflowState {
     fn waiting_for_funding(order_id: WorkflowOrderId) -> Self {
         Self::WaitingForFunding(WaitingForFundingState { order_id })
@@ -373,7 +390,7 @@ impl OrderWorkflow {
                         db_activity_options.clone(),
                     )
                     .await?;
-                if stale_quote_check.should_refresh {
+                if stale_quote_check.should_refresh || stale_quote_check.should_refund {
                     let reason = stale_quote_check.reason.unwrap_or_else(|| {
                         json_reason("pre_execution_stale_provider_quote", step.step_id)
                     });
@@ -400,6 +417,33 @@ impl OrderWorkflow {
                             db_activity_options.clone(),
                         )
                         .await?;
+                    if stale_quote_check.should_refund {
+                        set_order_workflow_finalizing(
+                            ctx,
+                            input.order_id,
+                            Some(OrderTerminalStatus::RefundRequired),
+                        );
+                        let finalized = ctx
+                            .start_activity(
+                                OrderActivities::finalize_order_or_refund,
+                                FinalizeOrderOrRefundInput {
+                                    order_id: input.order_id,
+                                    attempt_id: None,
+                                    step_id: None,
+                                    terminal_status: OrderTerminalStatus::RefundRequired,
+                                    reason: None,
+                                    funded_to_workflow_start_seconds,
+                                },
+                                db_activity_options.clone(),
+                            )
+                            .await?;
+                        return order_workflow_output(
+                            ctx,
+                            workflow_started_at,
+                            input.order_id,
+                            finalized.terminal_status,
+                        );
+                    }
                     set_order_workflow_refreshing_quote(
                         ctx,
                         input.order_id,
@@ -418,9 +462,9 @@ impl OrderWorkflow {
                         )
                         .await?;
                     let refreshed = child.result().await?;
-                    match refreshed.outcome {
-                        QuoteRefreshWorkflowOutcome::Refreshed { attempt_id, steps } => {
-                            execution_attempt = MaterializedExecutionAttempt { attempt_id, steps };
+                    match quote_refresh_continuation(refreshed.outcome) {
+                        QuoteRefreshContinuation::ResumeExecution(refreshed_attempt) => {
+                            execution_attempt = refreshed_attempt;
                             set_order_workflow_executing(
                                 ctx,
                                 input.order_id,
@@ -428,7 +472,7 @@ impl OrderWorkflow {
                             );
                             continue 'attempts;
                         }
-                        QuoteRefreshWorkflowOutcome::Untenable { .. } => {
+                        QuoteRefreshContinuation::RefundRequired => {
                             set_order_workflow_finalizing(
                                 ctx,
                                 input.order_id,
@@ -563,13 +607,11 @@ impl OrderWorkflow {
                                     )
                                     .await?;
                                 let refreshed = child.result().await?;
-                                match refreshed.outcome {
-                                    QuoteRefreshWorkflowOutcome::Refreshed {
-                                        attempt_id,
-                                        steps,
-                                    } => {
-                                        execution_attempt =
-                                            MaterializedExecutionAttempt { attempt_id, steps };
+                                match quote_refresh_continuation(refreshed.outcome) {
+                                    QuoteRefreshContinuation::ResumeExecution(
+                                        refreshed_attempt,
+                                    ) => {
+                                        execution_attempt = refreshed_attempt;
                                         set_order_workflow_executing(
                                             ctx,
                                             input.order_id,
@@ -577,7 +619,7 @@ impl OrderWorkflow {
                                         );
                                         continue 'attempts;
                                     }
-                                    QuoteRefreshWorkflowOutcome::Untenable { .. } => {
+                                    QuoteRefreshContinuation::RefundRequired => {
                                         set_order_workflow_finalizing(
                                             ctx,
                                             input.order_id,
@@ -1364,6 +1406,7 @@ async fn wait_for_provider_completion_hint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::order_execution::types::WorkflowExecutionStep;
 
     fn workflow_order_id(value: u128) -> WorkflowOrderId {
         WorkflowOrderId::from(Uuid::from_u128(value))
@@ -1400,5 +1443,29 @@ mod tests {
         assert_eq!(state.phase(), OrderWorkflowPhase::Executing);
         assert_eq!(state.active_attempt_id(), Some(attempt_id));
         assert_eq!(state.active_step_id(), Some(step_id));
+    }
+
+    #[test]
+    fn refreshed_quote_outcome_resumes_execution() {
+        let attempt_id = workflow_attempt_id(2);
+        let step_id = workflow_step_id(3);
+        let continuation = quote_refresh_continuation(QuoteRefreshWorkflowOutcome::Refreshed {
+            attempt_id,
+            steps: vec![WorkflowExecutionStep {
+                step_id,
+                step_index: 0,
+            }],
+        });
+
+        match continuation {
+            QuoteRefreshContinuation::ResumeExecution(attempt) => {
+                assert_eq!(attempt.attempt_id, attempt_id);
+                assert_eq!(attempt.steps.len(), 1);
+                assert_eq!(attempt.steps[0].step_id, step_id);
+            }
+            QuoteRefreshContinuation::RefundRequired => {
+                panic!("refreshed quote continuation should resume execution")
+            }
+        }
     }
 }

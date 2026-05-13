@@ -26,7 +26,7 @@ re-derive them, do not pick new round numbers.
 | `REFRESH_PROVIDER_TIMEOUT` | `10s` | Same, for the stale-quote refresh path. |
 | `REFUND_HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW` | `1_000_000` | Gas reserve withheld from a Hyperliquid spot-send quote so the follow-up trade can pay. |
 | `STALE_RUNNING_STEP_RECOVERY_AFTER` | `5 min` | A step stuck `Running` past this threshold without a checkpoint is treated as ambiguous (see §6). |
-| `MAX_STALE_QUOTE_REFRESHES_PER_ORDER_EXECUTION` | `8` | Cap on how many `RefreshedExecution` attempts can chain within a single execution pass. |
+| `SAURON_QUOTE_REFRESH_MAX_ATTEMPTS` | `3` default | Env-tunable cap on how many `RefreshedExecution` attempts can chain within a single execution pass. |
 | `REFRESH_BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_BPS` | `12_500` (= 125 %) | Miner-fee reserve (in bps over expected) carved out of unit-deposit refreshes targeting Bitcoin. |
 | `REFRESH_PROBE_MAX_AMOUNT_IN` | `U256::MAX` decimal | Sentinel used for ExactOut probe quotes — refreshed quote treats this as “unbounded input.” |
 
@@ -179,7 +179,7 @@ quote refresh. Highlights:
   (reason `stale_provider_quote_refresh`, line 5363) that **supersedes**
   prior steps from the failed step's index
   (`superseded_by_stale_provider_quote_refresh`, line 5382/5410).
-- Bound: `MAX_STALE_QUOTE_REFRESHES_PER_ORDER_EXECUTION = 8` per execution
+- Bound: `SAURON_QUOTE_REFRESH_MAX_ATTEMPTS = 3` by default per execution
   pass — past this, give up.
 
 **Rewrite rule:** a refresh is its own attempt, not a step-internal retry.
