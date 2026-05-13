@@ -8,8 +8,9 @@ use router_core::{
         RouterOrderStatus, RouterOrderType,
     },
     services::{
+        action_providers::{ExchangeProvider, ProviderFuture, UnitProvider},
         asset_registry::{AssetSlot, RequiredCustodyRole},
-        custody_action_executor::HyperliquidCallNetwork,
+        custody_action_executor::{HyperliquidCallNetwork, HyperliquidRuntimeConfig},
         ActionProviderHttpOptions,
     },
 };
@@ -35,6 +36,245 @@ struct SeededRunningStep {
     order_id: Uuid,
     attempt_id: Uuid,
     step_id: Uuid,
+}
+
+struct TestUnitProvider;
+
+impl UnitProvider for TestUnitProvider {
+    fn id(&self) -> &str {
+        ProviderId::Unit.as_str()
+    }
+
+    fn supports_deposit(&self, _asset: &DepositAsset) -> bool {
+        true
+    }
+
+    fn supports_withdrawal(&self, asset: &DepositAsset) -> bool {
+        asset.chain.as_str() == "bitcoin" && asset.asset.is_native()
+    }
+
+    fn execute_deposit<'a>(
+        &'a self,
+        _request: &'a UnitDepositStepRequest,
+    ) -> ProviderFuture<'a, ProviderExecutionIntent> {
+        Box::pin(async {
+            Ok(ProviderExecutionIntent::ProviderOnly {
+                response: json!({ "kind": "test_unit_deposit" }),
+                state: ProviderExecutionState::default(),
+            })
+        })
+    }
+
+    fn execute_withdrawal<'a>(
+        &'a self,
+        _request: &'a UnitWithdrawalStepRequest,
+    ) -> ProviderFuture<'a, ProviderExecutionIntent> {
+        Box::pin(async {
+            Ok(ProviderExecutionIntent::ProviderOnly {
+                response: json!({ "kind": "test_unit_withdrawal" }),
+                state: ProviderExecutionState::default(),
+            })
+        })
+    }
+}
+
+struct TestHyperliquidExchangeProvider;
+
+impl ExchangeProvider for TestHyperliquidExchangeProvider {
+    fn id(&self) -> &str {
+        ProviderId::Hyperliquid.as_str()
+    }
+
+    fn quote_trade<'a>(
+        &'a self,
+        request: ExchangeQuoteRequest,
+    ) -> ProviderFuture<'a, Option<ExchangeQuote>> {
+        Box::pin(async move {
+            let amount_in = match &request.order_kind {
+                MarketOrderKind::ExactIn { amount_in, .. } => amount_in.clone(),
+                MarketOrderKind::ExactOut { amount_out, .. } => amount_out.clone(),
+            };
+            let amount_out = if request.output_asset.chain.as_str() == "hyperliquid"
+                && request.output_asset.asset.as_str() == "UBTC"
+            {
+                "50000".to_string()
+            } else if request.output_asset.chain.as_str() == "hyperliquid"
+                && request.output_asset.asset.is_native()
+            {
+                "5000000000".to_string()
+            } else {
+                amount_in.clone()
+            };
+
+            Ok(Some(ExchangeQuote {
+                provider_id: self.id().to_string(),
+                amount_in: amount_in.clone(),
+                amount_out: amount_out.clone(),
+                min_amount_out: Some("1".to_string()),
+                max_amount_in: None,
+                provider_quote: json!({
+                    "schema_version": 1,
+                    "kind": "spot_cross_token",
+                    "legs": [{
+                        "input_asset": QuoteLegAsset::from_deposit_asset(&request.input_asset),
+                        "output_asset": QuoteLegAsset::from_deposit_asset(&request.output_asset),
+                        "amount_in": amount_in,
+                        "amount_out": amount_out,
+                        "order_kind": request.order_kind.kind_type().to_db_string(),
+                        "min_amount_out": "1",
+                    }],
+                }),
+                expires_at: Utc::now() + chrono::Duration::minutes(10),
+            }))
+        })
+    }
+
+    fn execute_trade<'a>(
+        &'a self,
+        _request: &'a ExchangeExecutionRequest,
+    ) -> ProviderFuture<'a, ProviderExecutionIntent> {
+        Box::pin(async {
+            Ok(ProviderExecutionIntent::ProviderOnly {
+                response: json!({ "kind": "test_hyperliquid_trade" }),
+                state: ProviderExecutionState::default(),
+            })
+        })
+    }
+}
+
+struct TestHyperliquidInfoServer {
+    base_url: String,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl TestHyperliquidInfoServer {
+    async fn spawn() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test Hyperliquid info server");
+        let addr = listener
+            .local_addr()
+            .expect("read test Hyperliquid info server address");
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _peer)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(handle_test_hyperliquid_info_connection(stream));
+            }
+        });
+        Self {
+            base_url: format!("http://{addr}"),
+            handle,
+        }
+    }
+}
+
+impl Drop for TestHyperliquidInfoServer {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+async fn handle_test_hyperliquid_info_connection(mut stream: tokio::net::TcpStream) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    loop {
+        let Ok(read) = stream.read(&mut chunk).await else {
+            return;
+        };
+        if read == 0 {
+            return;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if test_http_request_complete(&buffer) {
+            break;
+        }
+    }
+
+    let request = String::from_utf8_lossy(&buffer);
+    let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+    let payload = serde_json::from_str::<Value>(body).unwrap_or_else(|_| json!({}));
+    let response_body = match payload.get("type").and_then(Value::as_str) {
+        Some("spotMeta") => test_hyperliquid_spot_meta(),
+        Some("spotClearinghouseState") => json!({
+            "balances": [{
+                "coin": "UETH",
+                "token": 0,
+                "hold": "0",
+                "total": "1",
+            }],
+        }),
+        other => json!({ "error": format!("unexpected test Hyperliquid info request {other:?}") }),
+    }
+    .to_string();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        response_body.len(),
+        response_body
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+}
+
+fn test_http_request_complete(buffer: &[u8]) -> bool {
+    let Some(header_end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return false;
+    };
+    let headers = String::from_utf8_lossy(&buffer[..header_end]);
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or(0);
+    buffer.len() >= header_end + 4 + content_length
+}
+
+fn test_hyperliquid_spot_meta() -> Value {
+    json!({
+        "universe": [
+            {
+                "tokens": [0, 1],
+                "name": "UETH/USDC",
+                "index": 0,
+                "isCanonical": true,
+            },
+            {
+                "tokens": [2, 1],
+                "name": "UBTC/USDC",
+                "index": 1,
+                "isCanonical": true,
+            },
+        ],
+        "tokens": [
+            {
+                "name": "UETH",
+                "szDecimals": 4,
+                "weiDecimals": 18,
+                "index": 0,
+                "isCanonical": true,
+            },
+            {
+                "name": "USDC",
+                "szDecimals": 2,
+                "weiDecimals": 6,
+                "index": 1,
+                "isCanonical": true,
+            },
+            {
+                "name": "UBTC",
+                "szDecimals": 5,
+                "weiDecimals": 8,
+                "index": 2,
+                "isCanonical": true,
+            },
+        ],
+    })
 }
 
 #[test]
@@ -632,6 +872,145 @@ fn external_custody_unit_path_materializes_deposit_and_withdrawal_steps() {
 }
 
 #[test]
+fn hyperliquid_spot_refund_path_to_bitcoin_materializes_final_unit_withdrawal() {
+    let planned_at = Utc::now();
+    let btc = test_asset("bitcoin", "native");
+    let hl_eth = test_asset("hyperliquid", "UETH");
+    let hl_usdc = test_asset("hyperliquid", "native");
+    let hl_btc = test_asset("hyperliquid", "UBTC");
+    let mut order = test_order(btc.clone(), planned_at);
+    order.refund_address = "bc1qpr6b7atestrefund0000000000000000000000".to_string();
+    let vault = test_custody_vault(&order, CustodyVaultRole::HyperliquidSpot, &hl_eth);
+    let eth_to_usdc = hyperliquid_trade_transition(
+        hl_eth.clone(),
+        hl_usdc.clone(),
+        CanonicalAsset::Eth,
+        CanonicalAsset::Usdc,
+    );
+    let usdc_to_btc = hyperliquid_trade_transition(
+        hl_usdc.clone(),
+        hl_btc.clone(),
+        CanonicalAsset::Usdc,
+        CanonicalAsset::Btc,
+    );
+    let withdrawal = unit_withdrawal_transition(hl_btc.clone(), btc.clone(), CanonicalAsset::Btc);
+    let quoted_path = RefundQuotedPath {
+        path: TransitionPath {
+            id: "hl-eth-to-usdc>hl-usdc-to-btc>unit-withdrawal".to_string(),
+            transitions: vec![eth_to_usdc.clone(), usdc_to_btc.clone(), withdrawal.clone()],
+        },
+        amount_out: "50000".to_string(),
+        legs: vec![
+            hyperliquid_trade_quote_leg(
+                &eth_to_usdc,
+                "1000000000000000000",
+                "5000000000",
+                planned_at,
+            ),
+            hyperliquid_trade_quote_leg(&usdc_to_btc, "5000000000", "50000", planned_at),
+            refund_unit_withdrawal_quote_leg(&order, &withdrawal, "50000", planned_at),
+        ],
+    };
+
+    let (_legs, steps) =
+        materialize_hyperliquid_spot_refund_path(&order, &vault, &quoted_path, planned_at)
+            .expect("materialize HyperliquidSpot refund path");
+
+    assert!(!steps.is_empty());
+    let last_step = steps.last().expect("final refund step");
+    assert_eq!(last_step.step_type, OrderExecutionStepType::UnitWithdrawal);
+    assert_eq!(last_step.input_asset, Some(hl_btc));
+    assert_eq!(last_step.output_asset, Some(btc));
+    assert_eq!(
+        last_step
+            .request
+            .get("recipient_address")
+            .and_then(Value::as_str),
+        Some(order.refund_address.as_str())
+    );
+}
+
+#[tokio::test]
+async fn hyperliquid_spot_refund_plan_to_bitcoin_is_quotable_and_materialized() {
+    let test_db = test_database().await;
+    let hyperliquid_info = TestHyperliquidInfoServer::spawn().await;
+    let action_providers = Arc::new(ActionProviderRegistry::new(
+        vec![],
+        vec![Arc::new(TestUnitProvider) as Arc<dyn UnitProvider>],
+        vec![Arc::new(TestHyperliquidExchangeProvider) as Arc<dyn ExchangeProvider>],
+    ));
+    let deps = test_deps_with_action_providers(
+        test_db.db.clone(),
+        action_providers,
+        Some(hyperliquid_info.base_url.clone()),
+    );
+    let planned_at = Utc::now();
+    let btc = test_asset("bitcoin", "native");
+    let hl_eth = test_asset("hyperliquid", "UETH");
+    let mut order = test_order(btc.clone(), planned_at);
+    order.refund_address = "bc1qpr6b7aplanrefund000000000000000000000".to_string();
+    order.workflow_parent_span_id = order.workflow_trace_id[..16].to_string();
+    let failed_attempt_id = Uuid::now_v7();
+    let vault = test_custody_vault(&order, CustodyVaultRole::HyperliquidSpot, &hl_eth);
+    seed_hyperliquid_spot_refund_order(
+        &test_db.db,
+        &test_db.pool,
+        &order,
+        failed_attempt_id,
+        &vault,
+    )
+    .await;
+
+    let shape = materialize_hyperliquid_spot_refund_plan(
+        &deps,
+        MaterializeRefundPlanInput {
+            order_id: order.id.into(),
+            failed_attempt_id: failed_attempt_id.into(),
+            position: SingleRefundPosition {
+                position_kind: RecoverablePositionKind::HyperliquidSpot,
+                owning_step_id: None,
+                funding_vault_id: None,
+                custody_vault_id: Some(vault.id.into()),
+                asset: hl_eth,
+                amount: RawAmount::new("1000000000000000000").expect("valid raw amount"),
+                hyperliquid_coin: Some("UETH".to_string()),
+                hyperliquid_canonical: Some(CanonicalAsset::Eth),
+            },
+        },
+    )
+    .await
+    .expect("materialize HyperliquidSpot refund plan");
+
+    let (refund_attempt_id, workflow_steps) = match shape.outcome {
+        RefundPlanOutcome::Materialized {
+            refund_attempt_id,
+            steps,
+        } => (refund_attempt_id, steps),
+        RefundPlanOutcome::Untenable { reason } => {
+            panic!("expected materialized refund plan, got {reason:?}")
+        }
+    };
+    assert!(!workflow_steps.is_empty());
+
+    let persisted_steps = deps
+        .db
+        .orders()
+        .get_execution_steps_for_attempt(refund_attempt_id.inner())
+        .await
+        .expect("load persisted refund steps");
+    let last_step = persisted_steps.last().expect("persisted final refund step");
+    assert_eq!(last_step.step_type, OrderExecutionStepType::UnitWithdrawal);
+    assert_eq!(last_step.output_asset, Some(btc));
+    assert_eq!(
+        last_step
+            .request
+            .get("recipient_address")
+            .and_then(Value::as_str),
+        Some(order.refund_address.as_str())
+    );
+}
+
+#[test]
 fn unit_withdrawal_builder_accepts_all_hyperliquid_binding_flavors() {
     let planned_at = Utc::now();
     let btc = test_asset("bitcoin", "native");
@@ -759,6 +1138,36 @@ fn unit_refund_compat_gate_accepts_external_deposit_and_hyperliquid_withdrawal()
         &TransitionPath {
             id: "unit-withdrawal".to_string(),
             transitions: vec![withdrawal],
+        },
+    ));
+}
+
+#[test]
+fn hyperliquid_spot_compat_gate_accepts_trade_first_multi_hop_path() {
+    let btc = test_asset("bitcoin", "native");
+    let hl_eth = test_asset("hyperliquid", "UETH");
+    let hl_usdc = test_asset("hyperliquid", "native");
+    let hl_btc = test_asset("hyperliquid", "UBTC");
+    let eth_to_usdc = hyperliquid_trade_transition(
+        hl_eth,
+        hl_usdc.clone(),
+        CanonicalAsset::Eth,
+        CanonicalAsset::Usdc,
+    );
+    let usdc_to_btc = hyperliquid_trade_transition(
+        hl_usdc,
+        hl_btc.clone(),
+        CanonicalAsset::Usdc,
+        CanonicalAsset::Btc,
+    );
+    let withdrawal = unit_withdrawal_transition(hl_btc, btc, CanonicalAsset::Btc);
+
+    assert!(refund_path_compatible_with_position(
+        RecoverablePositionKind::HyperliquidSpot,
+        None,
+        &TransitionPath {
+            id: "hl-eth-to-usdc>hl-usdc-to-btc>unit-withdrawal".to_string(),
+            transitions: vec![eth_to_usdc, usdc_to_btc, withdrawal],
         },
     ));
 }
@@ -1070,8 +1479,6 @@ async fn test_database() -> TestDatabase {
 }
 
 fn test_deps(db: Database) -> OrderActivityDeps {
-    let settings = Arc::new(test_settings());
-    let chain_registry = Arc::new(ChainRegistry::new());
     let action_providers = Arc::new(
         ActionProviderRegistry::http_from_options(ActionProviderHttpOptions {
             across: None,
@@ -1085,11 +1492,21 @@ fn test_deps(db: Database) -> OrderActivityDeps {
         })
         .expect("empty action provider registry"),
     );
-    let custody_executor = Arc::new(CustodyActionExecutor::new(
-        db.clone(),
-        settings,
-        chain_registry.clone(),
-    ));
+    test_deps_with_action_providers(db, action_providers, None)
+}
+
+fn test_deps_with_action_providers(
+    db: Database,
+    action_providers: Arc<ActionProviderRegistry>,
+    hyperliquid_base_url: Option<String>,
+) -> OrderActivityDeps {
+    let settings = Arc::new(test_settings());
+    let chain_registry = Arc::new(ChainRegistry::new());
+    let custody_executor = CustodyActionExecutor::new(db.clone(), settings, chain_registry.clone())
+        .with_hyperliquid_runtime(hyperliquid_base_url.map(|base_url| {
+            HyperliquidRuntimeConfig::new(base_url, HyperliquidCallNetwork::Testnet)
+        }));
+    let custody_executor = Arc::new(custody_executor);
     let pricing_provider = Arc::new(router_core::services::RouteCostService::new(
         db.clone(),
         action_providers.clone(),
@@ -1218,6 +1635,39 @@ fn hyperliquid_bridge_withdrawal_transition(
     }
 }
 
+fn hyperliquid_trade_transition(
+    input: DepositAsset,
+    output: DepositAsset,
+    input_canonical: CanonicalAsset,
+    output_canonical: CanonicalAsset,
+) -> TransitionDecl {
+    TransitionDecl {
+        id: format!(
+            "hl-trade-{}-to-{}",
+            input_canonical.as_str(),
+            output_canonical.as_str()
+        ),
+        kind: MarketOrderTransitionKind::HyperliquidTrade,
+        provider: ProviderId::Hyperliquid,
+        input: AssetSlot {
+            asset: input,
+            required_custody_role: RequiredCustodyRole::IntermediateExecution,
+        },
+        output: AssetSlot {
+            asset: output,
+            required_custody_role: RequiredCustodyRole::IntermediateExecution,
+        },
+        from: MarketOrderNode::Venue {
+            provider: ProviderId::Hyperliquid,
+            canonical: input_canonical,
+        },
+        to: MarketOrderNode::Venue {
+            provider: ProviderId::Hyperliquid,
+            canonical: output_canonical,
+        },
+    }
+}
+
 fn unit_deposit_transition(
     input: DepositAsset,
     output: DepositAsset,
@@ -1314,6 +1764,33 @@ fn quote_leg_for_transition(
         ))
 }
 
+fn hyperliquid_trade_quote_leg(
+    transition: &TransitionDecl,
+    amount_in: &str,
+    amount_out: &str,
+    expires_at: chrono::DateTime<Utc>,
+) -> QuoteLeg {
+    QuoteLeg::new(QuoteLegSpec {
+        transition_decl_id: &transition.id,
+        transition_kind: transition.kind,
+        provider: transition.provider,
+        input_asset: &transition.input.asset,
+        output_asset: &transition.output.asset,
+        amount_in,
+        amount_out,
+        expires_at,
+        raw: json!({
+            "kind": "spot_cross_token",
+            "order_kind": MarketOrderKindType::ExactIn.to_db_string(),
+            "min_amount_out": "1",
+            "input_asset": QuoteLegAsset::from_deposit_asset(&transition.input.asset),
+            "output_asset": QuoteLegAsset::from_deposit_asset(&transition.output.asset),
+            "amount_in": amount_in,
+            "amount_out": amount_out,
+        }),
+    })
+}
+
 fn test_market_order_quote(
     source_asset: DepositAsset,
     destination_asset: DepositAsset,
@@ -1405,6 +1882,143 @@ fn test_provider_operation(
         created_at: now,
         updated_at: now,
     }
+}
+
+async fn seed_hyperliquid_spot_refund_order(
+    db: &Database,
+    pool: &PgPool,
+    order: &RouterOrder,
+    failed_attempt_id: Uuid,
+    vault: &CustodyVault,
+) {
+    let RouterOrderAction::MarketOrder(action) = &order.action else {
+        panic!("test refund order must be a market order")
+    };
+    let (amount_in, min_amount_out, amount_out, max_amount_in) = match &action.order_kind {
+        MarketOrderKind::ExactIn {
+            amount_in,
+            min_amount_out,
+        } => (
+            Some(amount_in.as_str()),
+            min_amount_out.as_deref(),
+            None,
+            None,
+        ),
+        MarketOrderKind::ExactOut {
+            amount_out,
+            max_amount_in,
+        } => (
+            None,
+            None,
+            Some(amount_out.as_str()),
+            max_amount_in.as_deref(),
+        ),
+    };
+
+    sqlx_core::query::query(
+        r#"
+            INSERT INTO router_orders (
+                id,
+                order_type,
+                status,
+                funding_vault_id,
+                source_chain_id,
+                source_asset_id,
+                destination_chain_id,
+                destination_asset_id,
+                recipient_address,
+                refund_address,
+                action_timeout_at,
+                idempotency_key,
+                workflow_trace_id,
+                workflow_parent_span_id,
+                created_at,
+                updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+            "#,
+    )
+    .bind(order.id)
+    .bind(order.order_type.to_db_string())
+    .bind(order.status.to_db_string())
+    .bind(order.funding_vault_id)
+    .bind(order.source_asset.chain.as_str())
+    .bind(order.source_asset.asset.as_str())
+    .bind(order.destination_asset.chain.as_str())
+    .bind(order.destination_asset.asset.as_str())
+    .bind(&order.recipient_address)
+    .bind(&order.refund_address)
+    .bind(order.action_timeout_at)
+    .bind(order.idempotency_key.clone())
+    .bind(&order.workflow_trace_id)
+    .bind(&order.workflow_parent_span_id)
+    .bind(order.created_at)
+    .bind(order.updated_at)
+    .execute(pool)
+    .await
+    .expect("insert refund test order");
+
+    sqlx_core::query::query(
+        r#"
+            INSERT INTO market_order_actions (
+                order_id,
+                order_kind,
+                amount_in,
+                min_amount_out,
+                amount_out,
+                max_amount_in,
+                created_at,
+                updated_at,
+                slippage_bps
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8)
+            "#,
+    )
+    .bind(order.id)
+    .bind(action.order_kind.kind_type().to_db_string())
+    .bind(amount_in)
+    .bind(min_amount_out)
+    .bind(amount_out)
+    .bind(max_amount_in)
+    .bind(order.created_at)
+    .bind(
+        action
+            .slippage_bps
+            .map(|bps| i64::try_from(bps).expect("test slippage bps fits i64")),
+    )
+    .execute(pool)
+    .await
+    .expect("insert refund test market action");
+
+    sqlx_core::query::query(
+        r#"
+            INSERT INTO order_execution_attempts (
+                id,
+                order_id,
+                attempt_index,
+                attempt_kind,
+                status,
+                failure_reason_json,
+                input_custody_snapshot_json,
+                created_at,
+                updated_at
+            )
+            VALUES ($1, $2, 1, $3, $4, '{}'::jsonb, '{}'::jsonb, $5, $5)
+            "#,
+    )
+    .bind(failed_attempt_id)
+    .bind(order.id)
+    .bind(OrderExecutionAttemptKind::PrimaryExecution.to_db_string())
+    .bind(OrderExecutionAttemptStatus::Failed.to_db_string())
+    .bind(order.created_at)
+    .execute(pool)
+    .await
+    .expect("insert refund test failed attempt");
+
+    db.orders()
+        .create_custody_vault(vault)
+        .await
+        .expect("insert refund test HyperliquidSpot custody vault");
 }
 
 async fn seed_running_step(
