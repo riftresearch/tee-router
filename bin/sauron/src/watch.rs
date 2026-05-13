@@ -27,7 +27,7 @@ SELECT
   COALESCE(opo.request_json->>'expected_amount', oes.amount_in, '1') AS min_amount,
   '115792089237316195423570985008687907853269984665640564039457584007913129639935' AS max_amount,
   COALESCE(opo.request_json->>'expected_amount', oes.amount_in, '1') AS required_amount,
-  COALESCE(opa.expires_at, ro.action_timeout_at, opa.created_at + INTERVAL '15 months') AS deposit_deadline,
+  COALESCE(ro.action_timeout_at, opa.created_at + INTERVAL '15 months') AS deposit_deadline,
   opa.created_at AS created_at,
   GREATEST(
     opa.updated_at,
@@ -99,7 +99,7 @@ SELECT
   COALESCE(opo.request_json->>'expected_amount', oes.amount_in, '1') AS min_amount,
   '115792089237316195423570985008687907853269984665640564039457584007913129639935' AS max_amount,
   COALESCE(opo.request_json->>'expected_amount', oes.amount_in, '1') AS required_amount,
-  COALESCE(opa.expires_at, ro.action_timeout_at, opa.created_at + INTERVAL '15 months') AS deposit_deadline,
+  COALESCE(ro.action_timeout_at, opa.created_at + INTERVAL '15 months') AS deposit_deadline,
   opa.created_at AS created_at,
   GREATEST(
     opa.updated_at,
@@ -172,7 +172,7 @@ SELECT
   COALESCE(opo.request_json->>'expected_amount', oes.amount_in, '1') AS min_amount,
   '115792089237316195423570985008687907853269984665640564039457584007913129639935' AS max_amount,
   COALESCE(opo.request_json->>'expected_amount', oes.amount_in, '1') AS required_amount,
-  COALESCE(opa.expires_at, ro.action_timeout_at, opa.created_at + INTERVAL '15 months') AS deposit_deadline,
+  COALESCE(ro.action_timeout_at, opa.created_at + INTERVAL '15 months') AS deposit_deadline,
   opa.created_at AS created_at,
   GREATEST(
     opa.updated_at,
@@ -914,6 +914,17 @@ mod tests {
     }
 
     #[test]
+    fn provider_operation_deposit_watch_queries_use_order_lifetime_for_deadline() {
+        let operation_expiry_column = ["opa", ".expires_at"].concat();
+        for query in [FULL_WATCH_QUERY, TARGETED_WATCH_QUERY, ORDER_WATCH_QUERY] {
+            assert!(query.contains(
+                "COALESCE(ro.action_timeout_at, opa.created_at + INTERVAL '15 months') AS deposit_deadline"
+            ));
+            assert!(!query.contains(&operation_expiry_column));
+        }
+    }
+
+    #[test]
     fn router_asset_tokens_are_normalized_for_evm_watches() {
         let token = token_identifier_from_router_asset_id(
             Uuid::now_v7(),
@@ -1313,6 +1324,51 @@ mod tests {
 
         assert_eq!(pruned, 1);
         assert_eq!(store.len().await, 1);
+        assert!(store.snapshot_for_chain(ChainType::Base).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn prune_expired_keeps_provider_watch_when_operation_expired_but_order_alive() {
+        let store = WatchStore::default();
+        let now = utc::now();
+        let operation_expires_at = now - Duration::minutes(1);
+        let order_action_timeout_at = now + Duration::minutes(5);
+        assert!(operation_expires_at < now);
+
+        store
+            .replace_all(vec![watch_entry(
+                Uuid::now_v7(),
+                ChainType::Base,
+                "0x0000000000000000000000000000000000000004",
+                order_action_timeout_at,
+            )])
+            .await;
+
+        let pruned = store.prune_expired().await;
+
+        assert_eq!(pruned, 0);
+        assert_eq!(store.len().await, 1);
+        assert_eq!(store.snapshot_for_chain(ChainType::Base).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn prune_expired_removes_provider_watch_after_order_deadline() {
+        let store = WatchStore::default();
+        let now = utc::now();
+
+        store
+            .replace_all(vec![watch_entry(
+                Uuid::now_v7(),
+                ChainType::Base,
+                "0x0000000000000000000000000000000000000005",
+                now - Duration::minutes(1),
+            )])
+            .await;
+
+        let pruned = store.prune_expired().await;
+
+        assert_eq!(pruned, 1);
+        assert_eq!(store.len().await, 0);
         assert!(store.snapshot_for_chain(ChainType::Base).await.is_empty());
     }
 }
