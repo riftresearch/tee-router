@@ -165,6 +165,18 @@ fn validate_runtime_config(args: &SauronArgs) -> Result<()> {
         args.sauron_evm_indexed_lookup_concurrency,
         "SAURON_EVM_INDEXED_LOOKUP_CONCURRENCY",
     )?;
+    validate_positive_usize(
+        args.sauron_hyperunit_observer_concurrency,
+        "SAURON_HYPERUNIT_OBSERVER_CONCURRENCY",
+    )?;
+    validate_positive_usize(
+        args.sauron_hyperliquid_observer_concurrency,
+        "SAURON_HYPERLIQUID_OBSERVER_CONCURRENCY",
+    )?;
+    validate_positive_usize(
+        args.sauron_evm_receipt_observer_concurrency,
+        "SAURON_EVM_RECEIPT_OBSERVER_CONCURRENCY",
+    )?;
     if args.sauron_hl_bridge_match_window_seconds <= 0 {
         return Err(Error::InvalidConfiguration {
             message: "SAURON_HL_BRIDGE_MATCH_WINDOW_SECONDS must be positive".to_string(),
@@ -341,6 +353,7 @@ fn build_hyperliquid_observer_task(
         hl_client,
         arbitrum_token_indexer,
         args.sauron_hl_bridge_match_window_seconds,
+        args.sauron_hyperliquid_observer_concurrency,
     )))
 }
 
@@ -364,6 +377,7 @@ fn build_evm_receipt_observer_task(
         clients,
         provider_operation_store,
         router_client,
+        args.sauron_evm_receipt_observer_concurrency,
     )))
 }
 
@@ -423,6 +437,7 @@ fn build_hyperunit_observer_task(
         hl_client,
         bitcoin_clients,
         evm_receipt_clients,
+        args.sauron_hyperunit_observer_concurrency,
     )))
 }
 
@@ -813,6 +828,9 @@ mod tests {
             hyperunit_api_url: None,
             hyperunit_proxy_url: None,
             sauron_hl_bridge_match_window_seconds: 1_800,
+            sauron_hyperunit_observer_concurrency: 64,
+            sauron_hyperliquid_observer_concurrency: 128,
+            sauron_evm_receipt_observer_concurrency: 128,
             token_indexer_api_key: None,
             sauron_reconcile_interval_seconds: 3600,
             sauron_bitcoin_scan_interval_seconds: 15,

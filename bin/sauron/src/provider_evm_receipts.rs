@@ -15,7 +15,11 @@ use router_server::api::{ProviderOperationHintRequest, MAX_HINT_IDEMPOTENCY_KEY_
 use router_temporal::{CctpReceiveObservedEvidence, VeloraSwapSettledEvidence};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio::time::{timeout, MissedTickBehavior};
+use tokio::{
+    sync::Mutex,
+    task::JoinSet,
+    time::{timeout, MissedTickBehavior},
+};
 use tracing::{debug, warn};
 
 use crate::{
@@ -98,59 +102,125 @@ pub async fn run_evm_receipt_observer_loop(
     clients: EvmReceiptObserverClients,
     store: ProviderOperationWatchStore,
     router_client: RouterClient,
+    concurrency_limit: usize,
 ) -> Result<()> {
-    let mut submitted: HashSet<(uuid::Uuid, String)> = HashSet::new();
+    let clients = Arc::new(clients);
+    let router_client = Arc::new(router_client);
+    let submitted = Arc::new(Mutex::new(HashSet::<(uuid::Uuid, String)>::new()));
     let mut ticker = tokio::time::interval(EVM_RECEIPT_OBSERVER_INTERVAL);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     ticker.tick().await;
 
     loop {
-        let operations = store.snapshot().await;
-        let active = operations
-            .iter()
-            .map(|operation| operation.operation_id)
-            .collect::<HashSet<_>>();
-        submitted.retain(|(operation_id, _)| active.contains(operation_id));
+        run_evm_receipt_observer_cycle(
+            &store,
+            Arc::clone(&clients),
+            Arc::clone(&router_client),
+            concurrency_limit,
+            Arc::clone(&submitted),
+        )
+        .await;
 
-        for operation in operations {
-            let request = match evm_receipt_hint_request(&clients, &operation).await {
-                Ok(request) => request,
-                Err(error) => {
-                    warn!(
-                        operation_id = %operation.operation_id,
-                        operation_type = %operation.operation_type.to_db_string(),
-                        %error,
-                        "failed to inspect EVM receipt for provider-operation hint"
-                    );
-                    continue;
-                }
+        ticker.tick().await;
+    }
+}
+
+async fn run_evm_receipt_observer_cycle(
+    store: &ProviderOperationWatchStore,
+    clients: Arc<EvmReceiptObserverClients>,
+    router_client: Arc<RouterClient>,
+    concurrency_limit: usize,
+    submitted: Arc<Mutex<HashSet<(uuid::Uuid, String)>>>,
+) {
+    let operations = store.snapshot().await;
+    let active = operations
+        .iter()
+        .map(|operation| operation.operation_id)
+        .collect::<HashSet<_>>();
+    {
+        let mut submitted = submitted.lock().await;
+        submitted.retain(|(operation_id, _)| active.contains(operation_id));
+    }
+
+    let due = operations
+        .into_iter()
+        .filter(|operation| is_evm_receipt_operation(operation.operation_type))
+        .collect::<Vec<_>>();
+    let concurrency_limit = concurrency_limit.max(1);
+    let mut operations = due.into_iter();
+    let mut tasks = JoinSet::new();
+    loop {
+        while tasks.len() < concurrency_limit {
+            let Some(operation) = operations.next() else {
+                break;
             };
-            if let Some(request) = request {
-                let key_text = request
-                    .idempotency_key
-                    .clone()
-                    .unwrap_or_else(|| operation.operation_id.to_string());
-                let key = (operation.operation_id, key_text);
-                if submitted.contains(&key) {
-                    continue;
-                }
-                match router_client.submit_provider_operation_hint(&request).await {
-                    Ok(_) => {
-                        submitted.insert(key);
-                    }
+            let clients = Arc::clone(&clients);
+            let router_client = Arc::clone(&router_client);
+            let submitted = Arc::clone(&submitted);
+            tasks.spawn(async move {
+                let request = match evm_receipt_hint_request(&clients, &operation).await {
+                    Ok(request) => request,
                     Err(error) => {
                         warn!(
                             operation_id = %operation.operation_id,
                             operation_type = %operation.operation_type.to_db_string(),
                             %error,
-                            "failed to submit EVM receipt provider-operation hint"
+                            "failed to inspect EVM receipt for provider-operation hint"
                         );
+                        return;
                     }
+                };
+                if let Some(request) = request {
+                    submit_evm_receipt_hint(&router_client, &submitted, &operation, request).await;
                 }
-            }
+            });
         }
 
-        ticker.tick().await;
+        if tasks.is_empty() {
+            break;
+        }
+        match tasks.join_next().await {
+            Some(Ok(())) => {}
+            Some(Err(error)) => {
+                warn!(%error, "EVM receipt observer task failed");
+            }
+            None => break,
+        }
+    }
+}
+
+fn is_evm_receipt_operation(operation_type: ProviderOperationType) -> bool {
+    matches!(
+        operation_type,
+        ProviderOperationType::UniversalRouterSwap | ProviderOperationType::CctpReceive
+    )
+}
+
+async fn submit_evm_receipt_hint(
+    router_client: &RouterClient,
+    submitted: &Mutex<HashSet<(uuid::Uuid, String)>>,
+    operation: &SharedProviderOperationWatchEntry,
+    request: ProviderOperationHintRequest,
+) {
+    let key_text = request
+        .idempotency_key
+        .clone()
+        .unwrap_or_else(|| operation.operation_id.to_string());
+    let key = (operation.operation_id, key_text);
+    {
+        let mut submitted = submitted.lock().await;
+        if !submitted.insert(key.clone()) {
+            return;
+        }
+    }
+    if let Err(error) = router_client.submit_provider_operation_hint(&request).await {
+        submitted.lock().await.remove(&key);
+        warn!(
+            operation_id = %operation.operation_id,
+            operation_type = %operation.operation_type.to_db_string(),
+            %error,
+            "failed to submit EVM receipt provider-operation hint"
+        );
     }
 }
 

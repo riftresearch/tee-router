@@ -152,6 +152,40 @@ pub struct SauronArgs {
     )]
     pub sauron_hl_bridge_match_window_seconds: i64,
 
+    /// Maximum number of concurrent HyperUnit observer operation polls
+    ///
+    /// HyperUnit is the externally rate-limited leg of this observer path. The client does not
+    /// apply its own request-concurrency cap, so default to 64 to stay below the documented
+    /// ~100 req/s per-IP production limit while still draining large active-operation sets quickly.
+    #[arg(
+        long,
+        env = "SAURON_HYPERUNIT_OBSERVER_CONCURRENCY",
+        default_value = "64"
+    )]
+    pub sauron_hyperunit_observer_concurrency: usize,
+
+    /// Maximum number of concurrent Hyperliquid observer operation polls
+    ///
+    /// The HL shim is internal and its reqwest client construction does not cap concurrent
+    /// requests. 128 keeps 1000 active operations to roughly eight bounded waves.
+    #[arg(
+        long,
+        env = "SAURON_HYPERLIQUID_OBSERVER_CONCURRENCY",
+        default_value = "128"
+    )]
+    pub sauron_hyperliquid_observer_concurrency: usize,
+
+    /// Maximum number of concurrent EVM receipt observer operation polls
+    ///
+    /// Receipt watchers are internal lookup services and the per-op work is HTTP wait time, not DB
+    /// work. Match the HL observer default while keeping worst-case load explicitly bounded.
+    #[arg(
+        long,
+        env = "SAURON_EVM_RECEIPT_OBSERVER_CONCURRENCY",
+        default_value = "128"
+    )]
+    pub sauron_evm_receipt_observer_concurrency: usize,
+
     /// Bearer key shared by configured EVM token-indexer APIs
     #[arg(long, env = "TOKEN_INDEXER_API_KEY")]
     pub token_indexer_api_key: Option<String>,
@@ -286,6 +320,18 @@ impl fmt::Debug for SauronArgs {
                 &self.sauron_hl_bridge_match_window_seconds,
             )
             .field(
+                "sauron_hyperunit_observer_concurrency",
+                &self.sauron_hyperunit_observer_concurrency,
+            )
+            .field(
+                "sauron_hyperliquid_observer_concurrency",
+                &self.sauron_hyperliquid_observer_concurrency,
+            )
+            .field(
+                "sauron_evm_receipt_observer_concurrency",
+                &self.sauron_evm_receipt_observer_concurrency,
+            )
+            .field(
                 "token_indexer_api_key",
                 &self.token_indexer_api_key.as_ref().map(|_| "<redacted>"),
             )
@@ -363,6 +409,9 @@ mod tests {
             hyperunit_api_url: Some("https://hyperunit.example/token-secret".to_string()),
             hyperunit_proxy_url: Some("socks5://hyperunit-proxy-secret:1080".to_string()),
             sauron_hl_bridge_match_window_seconds: 1_800,
+            sauron_hyperunit_observer_concurrency: 64,
+            sauron_hyperliquid_observer_concurrency: 128,
+            sauron_evm_receipt_observer_concurrency: 128,
             token_indexer_api_key: Some("token-indexer-api-key-secret".to_string()),
             sauron_reconcile_interval_seconds: 3600,
             sauron_bitcoin_scan_interval_seconds: 15,
