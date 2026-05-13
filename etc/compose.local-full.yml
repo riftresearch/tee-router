@@ -441,7 +441,7 @@ services:
       PRIMARY_DB_SSLMODE: disable
       PRIMARY_REPLICATION_SLOT: router_local_physical_standby
       STANDBY_APPLICATION_NAME: router-local-physical-standby
-      STANDBY_MAX_CONNECTIONS: 256
+      STANDBY_MAX_CONNECTIONS: 400
       PGDATA: /var/lib/postgresql/18/docker
     ports:
       - "55433:5432"
