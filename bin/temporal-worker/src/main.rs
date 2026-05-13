@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use temporal_worker::{
     order_execution,
-    order_execution::WorkerTuningConfig,
+    order_execution::OrderWorkerTuning,
     production::OrderWorkerRuntimeArgs,
     runtime::{TemporalConnection, WorkerResult},
     spike,
@@ -62,6 +62,20 @@ enum Command {
         )]
         sauron_temporal_max_cached_workflows: usize,
 
+        #[arg(
+            long,
+            env = "ROUTER_TEMPORAL_ACTIVITY_POLLERS",
+            default_value_t = order_execution::DEFAULT_TEMPORAL_ACTIVITY_TASK_POLLER_MAX
+        )]
+        activity_task_pollers: usize,
+
+        #[arg(
+            long,
+            env = "ROUTER_TEMPORAL_WORKFLOW_POLLERS",
+            default_value_t = order_execution::DEFAULT_TEMPORAL_WORKFLOW_TASK_POLLER_MAX
+        )]
+        workflow_task_pollers: usize,
+
         #[command(flatten)]
         runtime: OrderWorkerRuntimeArgs,
     },
@@ -97,6 +111,8 @@ async fn main() -> WorkerResult<()> {
             sauron_temporal_target_mem_usage,
             sauron_temporal_target_cpu_usage,
             sauron_temporal_max_cached_workflows,
+            activity_task_pollers,
+            workflow_task_pollers,
             runtime,
         } => {
             let activities = order_execution::activities::OrderActivities::new(
@@ -109,10 +125,12 @@ async fn main() -> WorkerResult<()> {
                 &connection,
                 &task_queue,
                 activities,
-                WorkerTuningConfig {
+                OrderWorkerTuning {
                     target_mem_usage: sauron_temporal_target_mem_usage,
                     target_cpu_usage: sauron_temporal_target_cpu_usage,
                     max_cached_workflows: sauron_temporal_max_cached_workflows,
+                    activity_task_poller_max: activity_task_pollers,
+                    workflow_task_poller_max: workflow_task_pollers,
                 },
             )
             .await?;
@@ -180,11 +198,13 @@ mod tests {
         }
     }
 
-    fn temporal_env_vars() -> [(&'static str, Option<&'static str>); 4] {
+    fn temporal_env_vars() -> [(&'static str, Option<&'static str>); 6] {
         [
             ("SAURON_TEMPORAL_TARGET_MEM_USAGE", None),
             ("SAURON_TEMPORAL_TARGET_CPU_USAGE", None),
             ("SAURON_TEMPORAL_MAX_CACHED_WORKFLOWS", None),
+            ("ROUTER_TEMPORAL_ACTIVITY_POLLERS", None),
+            ("ROUTER_TEMPORAL_WORKFLOW_POLLERS", None),
             ("SAURON_TEMPORAL_DB_MAX_CONNECTIONS", None),
         ]
     }
@@ -215,6 +235,8 @@ mod tests {
             ("SAURON_TEMPORAL_TARGET_MEM_USAGE", Some("0.7")),
             ("SAURON_TEMPORAL_TARGET_CPU_USAGE", Some("0.6")),
             ("SAURON_TEMPORAL_MAX_CACHED_WORKFLOWS", Some("3000")),
+            ("ROUTER_TEMPORAL_ACTIVITY_POLLERS", Some("111")),
+            ("ROUTER_TEMPORAL_WORKFLOW_POLLERS", Some("33")),
             ("SAURON_TEMPORAL_DB_MAX_CONNECTIONS", Some("222")),
         ]);
 
@@ -224,12 +246,16 @@ mod tests {
                 sauron_temporal_target_mem_usage,
                 sauron_temporal_target_cpu_usage,
                 sauron_temporal_max_cached_workflows,
+                activity_task_pollers,
+                workflow_task_pollers,
                 runtime,
                 ..
             } => {
                 assert_eq!(sauron_temporal_target_mem_usage, 0.7);
                 assert_eq!(sauron_temporal_target_cpu_usage, 0.6);
                 assert_eq!(sauron_temporal_max_cached_workflows, 3000);
+                assert_eq!(activity_task_pollers, 111);
+                assert_eq!(workflow_task_pollers, 33);
                 assert_eq!(runtime.db_max_connections, 222);
             }
             Command::Spike { .. } => panic!("expected worker command"),
