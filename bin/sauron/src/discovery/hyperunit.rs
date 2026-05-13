@@ -928,11 +928,8 @@ fn expected_hl_credit_amount(operation: &UnitOperation) -> Option<String> {
     let net = source
         .saturating_sub(destination_fee)
         .saturating_sub(sweep_fee);
-    let expected = raw_to_decimal(
-        net,
-        unit_asset_decimals(operation.asset.as_deref()?),
-    );
-    Some(truncate_decimal(
+    let expected = raw_to_decimal(net, unit_asset_decimals(operation.asset.as_deref()?));
+    Some(round_decimal_half_to_even(
         &expected,
         usize::from(hyperliquid_client::wire::WIRE_DECIMALS),
     ))
@@ -967,17 +964,89 @@ fn raw_to_decimal(raw: u128, decimals: u8) -> String {
     }
 }
 
-fn truncate_decimal(value: &str, max_fraction: usize) -> String {
-    match value.split_once('.') {
-        Some((whole, fraction)) if fraction.len() > max_fraction => {
-            let fraction = fraction[..max_fraction].trim_end_matches('0');
-            if fraction.is_empty() {
-                whole.to_string()
+fn round_decimal_half_to_even(value: &str, max_fraction: usize) -> String {
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return value.to_string();
+    }
+    if fraction.len() <= max_fraction {
+        return trim_decimal_fraction(value);
+    }
+
+    let (keep, drop) = fraction.split_at(max_fraction);
+    let first_drop = drop.as_bytes()[0];
+    let rest_drop = &drop[1..];
+    let round_up = match first_drop {
+        b'0'..=b'4' => false,
+        b'6'..=b'9' => true,
+        b'5' => {
+            if rest_drop.bytes().all(|byte| byte == b'0') {
+                let last_keep_digit = keep
+                    .bytes()
+                    .next_back()
+                    .or_else(|| whole.bytes().next_back())
+                    .unwrap_or(b'0')
+                    - b'0';
+                last_keep_digit % 2 == 1
             } else {
-                format!("{whole}.{fraction}")
+                true
             }
         }
-        _ => value.to_string(),
+        _ => return value.to_string(),
+    };
+
+    let rounded = if round_up {
+        increment_decimal_string(whole, keep)
+    } else if keep.is_empty() {
+        whole.to_string()
+    } else {
+        format!("{whole}.{keep}")
+    };
+    trim_decimal_fraction(&rounded)
+}
+
+fn increment_decimal_string(whole: &str, fraction: &str) -> String {
+    let mut digits = whole.bytes().chain(fraction.bytes()).collect::<Vec<u8>>();
+    let mut carry = 1;
+    for digit in digits.iter_mut().rev() {
+        if carry == 0 {
+            break;
+        }
+        let value = (*digit - b'0') + carry;
+        *digit = b'0' + (value % 10);
+        carry = value / 10;
+    }
+    if carry > 0 {
+        digits.insert(0, b'0' + carry);
+    }
+
+    let whole_len = whole.len() + usize::from(carry > 0);
+    let new_whole = std::str::from_utf8(&digits[..whole_len]).unwrap_or("");
+    let new_fraction = std::str::from_utf8(&digits[whole_len..]).unwrap_or("");
+    if new_fraction.is_empty() {
+        new_whole.to_string()
+    } else {
+        format!("{new_whole}.{new_fraction}")
+    }
+}
+
+fn trim_decimal_fraction(value: &str) -> String {
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    if fraction.is_empty() {
+        return if whole.is_empty() {
+            "0".to_string()
+        } else {
+            whole.to_string()
+        };
+    }
+    let fraction = fraction.trim_end_matches('0');
+    if fraction.is_empty() {
+        whole.to_string()
+    } else {
+        format!("{whole}.{fraction}")
     }
 }
 
@@ -1252,12 +1321,22 @@ mod tests {
     }
 
     #[test]
-    fn expected_hl_credit_amount_truncates_eth_to_hl_wire_precision() {
+    fn expected_hl_credit_amount_rounds_eth_to_hl_wire_precision() {
         let operation = unit_operation_with_amount("eth", "57507271000000000");
 
         assert_eq!(
             expected_hl_credit_amount(&operation).as_deref(),
             Some("0.05750727")
+        );
+    }
+
+    #[test]
+    fn expected_hl_credit_amount_rounds_eth_when_hl_wire_rounds_up() {
+        let operation = unit_operation_with_amount("eth", "77158107666666666");
+
+        assert_eq!(
+            expected_hl_credit_amount(&operation).as_deref(),
+            Some("0.07715811")
         );
     }
 
@@ -1272,9 +1351,19 @@ mod tests {
     }
 
     #[test]
-    fn truncate_decimal_limits_fraction_and_trims_trailing_zeroes() {
-        assert_eq!(truncate_decimal("0.057507271", 8), "0.05750727");
-        assert_eq!(truncate_decimal("0.0575072700000", 8), "0.05750727");
+    fn round_decimal_half_to_even_matches_hl_wire_precision() {
+        assert_eq!(
+            round_decimal_half_to_even("0.077158107666666666", 8),
+            "0.07715811"
+        );
+        assert_eq!(round_decimal_half_to_even("0.057507271", 8), "0.05750727");
+        assert_eq!(round_decimal_half_to_even("0.000000005", 8), "0");
+        assert_eq!(round_decimal_half_to_even("0.000000015", 8), "0.00000002");
+        assert_eq!(
+            round_decimal_half_to_even("99999999.999999955", 8),
+            "99999999.99999996"
+        );
+        assert_eq!(round_decimal_half_to_even("0.12345678", 8), "0.12345678");
     }
 
     #[test]
