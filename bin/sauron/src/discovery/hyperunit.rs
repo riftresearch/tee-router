@@ -152,6 +152,7 @@ pub async fn run_hyperunit_observer_loop(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_hyperunit_observer_cycle(
     store: &ProviderOperationWatchStore,
     router_client: Arc<RouterClient>,

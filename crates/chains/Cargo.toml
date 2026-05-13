@@ -26,6 +26,7 @@ bdk_wallet = { workspace = true }
 alloy = { workspace = true }
 evm-token-indexer-client = {workspace=true}
 eip3009-erc20-contract = {workspace=true}
+eip7702-paymaster = {workspace=true}
 eip7702-delegator-contract = {workspace=true}
 
 # Common

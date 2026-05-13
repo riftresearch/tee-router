@@ -1227,6 +1227,7 @@ fn live_router_args(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn spawn_sauron(
     devnet: &RiftDevnet,
     database_url: &str,

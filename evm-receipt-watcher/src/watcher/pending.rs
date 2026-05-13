@@ -88,6 +88,7 @@ impl PendingWatches {
             .collect()
     }
 
+    #[allow(clippy::len_without_is_empty)]
     pub async fn len(&self) -> usize {
         self.inner.read().await.watches.len()
     }
