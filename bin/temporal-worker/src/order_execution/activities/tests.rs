@@ -285,6 +285,45 @@ impl UnitProvider for CountingUnitWithdrawalProvider {
 
 struct TestHyperliquidExchangeProvider;
 
+struct TestHyperliquidBridgeProvider;
+
+impl router_core::services::action_providers::BridgeProvider for TestHyperliquidBridgeProvider {
+    fn id(&self) -> &str {
+        ProviderId::HyperliquidBridge.as_str()
+    }
+
+    fn quote_bridge<'a>(
+        &'a self,
+        request: BridgeQuoteRequest,
+    ) -> ProviderFuture<'a, Option<BridgeQuote>> {
+        Box::pin(async move {
+            let amount_in = match &request.order_kind {
+                MarketOrderKind::ExactIn { amount_in, .. } => amount_in.clone(),
+                MarketOrderKind::ExactOut { amount_out, .. } => amount_out.clone(),
+            };
+            Ok(Some(BridgeQuote {
+                provider_id: ProviderId::HyperliquidBridge.as_str().to_string(),
+                amount_in: amount_in.clone(),
+                amount_out: amount_in,
+                provider_quote: json!({ "kind": "test_hyperliquid_bridge" }),
+                expires_at: Utc::now() + chrono::Duration::minutes(10),
+            }))
+        })
+    }
+
+    fn execute_bridge<'a>(
+        &'a self,
+        _request: &'a BridgeExecutionRequest,
+    ) -> ProviderFuture<'a, ProviderExecutionIntent> {
+        Box::pin(async {
+            Ok(ProviderExecutionIntent::ProviderOnly {
+                response: json!({ "kind": "test_hyperliquid_bridge" }),
+                state: ProviderExecutionState::default(),
+            })
+        })
+    }
+}
+
 impl ExchangeProvider for TestHyperliquidExchangeProvider {
     fn id(&self) -> &str {
         ProviderId::Hyperliquid.as_str()
@@ -403,6 +442,13 @@ impl TestHyperliquidInfoServer {
     }
 
     async fn spawn_with_balances(balances: Vec<Value>) -> Self {
+        Self::spawn_with_balances_and_clearinghouse(balances, "0").await
+    }
+
+    async fn spawn_with_balances_and_clearinghouse(
+        balances: Vec<Value>,
+        clearinghouse_account_value: &str,
+    ) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test Hyperliquid info server");
@@ -410,6 +456,7 @@ impl TestHyperliquidInfoServer {
             .local_addr()
             .expect("read test Hyperliquid info server address");
         let balances = Arc::new(balances);
+        let clearinghouse_account_value = Arc::new(clearinghouse_account_value.to_string());
         let handle = tokio::spawn(async move {
             loop {
                 let Ok((stream, _peer)) = listener.accept().await else {
@@ -418,6 +465,7 @@ impl TestHyperliquidInfoServer {
                 tokio::spawn(handle_test_hyperliquid_info_connection(
                     stream,
                     balances.clone(),
+                    clearinghouse_account_value.clone(),
                 ));
             }
         });
@@ -479,6 +527,7 @@ impl Drop for TestHyperliquidInfoServer {
 async fn handle_test_hyperliquid_info_connection(
     mut stream: tokio::net::TcpStream,
     balances: Arc<Vec<Value>>,
+    clearinghouse_account_value: Arc<String>,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -505,6 +554,9 @@ async fn handle_test_hyperliquid_info_connection(
         Some("spotClearinghouseState") => json!({
             "balances": balances.as_ref().clone(),
         }),
+        Some("clearinghouseState") => {
+            test_hyperliquid_clearinghouse_state(clearinghouse_account_value.as_str())
+        }
         other => json!({ "error": format!("unexpected test Hyperliquid info request {other:?}") }),
     }
     .to_string();
@@ -522,6 +574,26 @@ fn test_hyperliquid_spot_balance(coin: &str, token: u64, total: &str, hold: &str
         "token": token,
         "hold": hold,
         "total": total,
+    })
+}
+
+fn test_hyperliquid_clearinghouse_state(account_value: &str) -> Value {
+    json!({
+        "marginSummary": {
+            "accountValue": account_value,
+            "totalNtlPos": "0",
+            "totalRawUsd": account_value,
+            "totalMarginUsed": "0",
+        },
+        "crossMarginSummary": {
+            "accountValue": account_value,
+            "totalNtlPos": "0",
+            "totalRawUsd": account_value,
+            "totalMarginUsed": "0",
+        },
+        "crossMaintenanceMarginUsed": "0",
+        "withdrawable": account_value,
+        "assetPositions": [],
     })
 }
 
@@ -1388,9 +1460,15 @@ fn hyperliquid_spot_refund_path_to_bitcoin_materializes_final_unit_withdrawal() 
         ],
     };
 
-    let (_legs, steps) =
-        materialize_hyperliquid_spot_refund_path(&order, &vault, &quoted_path, planned_at)
-            .expect("materialize HyperliquidSpot refund path");
+    let (_legs, steps) = materialize_hyperliquid_spot_refund_path(
+        &order,
+        &vault,
+        &quoted_path,
+        "1000000000000000000",
+        false,
+        planned_at,
+    )
+    .expect("materialize HyperliquidSpot refund path");
 
     assert!(!steps.is_empty());
     let last_step = steps.last().expect("final refund step");
@@ -1451,6 +1529,7 @@ async fn hyperliquid_spot_refund_plan_to_bitcoin_is_quotable_and_materialized() 
                 amount: RawAmount::new("1000000000000000000").expect("valid raw amount"),
                 hyperliquid_coin: Some("UETH".to_string()),
                 hyperliquid_canonical: Some(CanonicalAsset::Eth),
+                requires_clearinghouse_unwrap: false,
             },
         },
     )
@@ -1483,6 +1562,97 @@ async fn hyperliquid_spot_refund_plan_to_bitcoin_is_quotable_and_materialized() 
             .get("recipient_address")
             .and_then(Value::as_str),
         Some(order.refund_address.as_str())
+    );
+}
+
+#[tokio::test]
+async fn hyperliquid_clearinghouse_refund_plan_prepends_unwrap_step() {
+    let test_db = test_database().await;
+    let hyperliquid_info =
+        TestHyperliquidInfoServer::spawn_with_balances_and_clearinghouse(vec![], "100").await;
+    let action_providers = Arc::new(ActionProviderRegistry::new(
+        vec![Arc::new(TestHyperliquidBridgeProvider)
+            as Arc<
+                dyn router_core::services::action_providers::BridgeProvider,
+            >],
+        vec![],
+        vec![Arc::new(TestHyperliquidExchangeProvider) as Arc<dyn ExchangeProvider>],
+    ));
+    let deps = test_deps_with_action_providers(
+        test_db.db.clone(),
+        action_providers,
+        Some(hyperliquid_info.base_url.clone()),
+    );
+    let planned_at = Utc::now();
+    let source_usdc = test_asset("evm:42161", "0xaf88d065e77c8cc2239327c5edb3a432268e5831");
+    let mut order = test_order(source_usdc.clone(), planned_at);
+    order.destination_asset = test_asset("bitcoin", "native");
+    order.workflow_parent_span_id = order.workflow_trace_id[..16].to_string();
+    let failed_attempt_id = Uuid::now_v7();
+    let vault = test_custody_vault(&order, CustodyVaultRole::SourceDeposit, &source_usdc);
+    seed_hyperliquid_spot_refund_order(
+        &test_db.db,
+        &test_db.pool,
+        &order,
+        failed_attempt_id,
+        &vault,
+    )
+    .await;
+
+    let shape = materialize_hyperliquid_spot_refund_plan(
+        &deps,
+        MaterializeRefundPlanInput {
+            order_id: order.id.into(),
+            failed_attempt_id: failed_attempt_id.into(),
+            position: SingleRefundPosition {
+                position_kind: RecoverablePositionKind::HyperliquidSpot,
+                owning_step_id: None,
+                funding_vault_id: None,
+                custody_vault_id: Some(vault.id.into()),
+                asset: source_usdc,
+                amount: RawAmount::new("100000000").expect("valid raw amount"),
+                hyperliquid_coin: Some("USDC".to_string()),
+                hyperliquid_canonical: Some(CanonicalAsset::Usdc),
+                requires_clearinghouse_unwrap: true,
+            },
+        },
+    )
+    .await
+    .expect("materialize clearinghouse-origin HyperliquidSpot refund plan");
+
+    let refund_attempt_id = match shape.outcome {
+        RefundPlanOutcome::Materialized {
+            refund_attempt_id, ..
+        } => refund_attempt_id,
+        RefundPlanOutcome::Untenable { reason } => {
+            panic!("expected materialized refund plan, got {reason:?}")
+        }
+    };
+    let persisted_steps = deps
+        .db
+        .orders()
+        .get_execution_steps_for_attempt(refund_attempt_id.inner())
+        .await
+        .expect("load persisted clearinghouse refund steps");
+    let first_step = persisted_steps.first().expect("prep step");
+    assert_eq!(
+        first_step.step_type,
+        OrderExecutionStepType::HyperliquidClearinghouseToSpot
+    );
+    assert_eq!(first_step.step_index, 0);
+    assert_eq!(first_step.amount_in.as_deref(), Some("100000000"));
+    assert_eq!(
+        first_step
+            .request
+            .get("hyperliquid_custody_vault_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        Some(vault.id.to_string())
+    );
+    let last_step = persisted_steps.last().expect("final refund step");
+    assert_eq!(
+        last_step.step_type,
+        OrderExecutionStepType::HyperliquidBridgeWithdrawal
     );
 }
 
@@ -1542,8 +1712,132 @@ async fn refund_position_discovery_reads_hl_spot_balance_from_source_deposit_vau
             assert_eq!(position.amount.as_str(), "1000000");
             assert_eq!(position.hyperliquid_coin.as_deref(), Some("USDC"));
             assert_eq!(position.hyperliquid_canonical, Some(CanonicalAsset::Usdc));
+            assert!(!position.requires_clearinghouse_unwrap);
         }
         other => panic!("expected source_deposit HyperliquidSpot refund position, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn refund_position_discovery_reads_hl_clearinghouse_balance_from_source_deposit_vault() {
+    let test_db = test_database().await;
+    let hyperliquid_info = TestHyperliquidInfoServer::spawn_with_balances_and_clearinghouse(
+        vec![test_hyperliquid_spot_balance("USDC", 1, "0", "0")],
+        "100",
+    )
+    .await;
+    let action_providers = Arc::new(ActionProviderRegistry::new(vec![], vec![], vec![]));
+    let deps = test_deps_with_action_providers(
+        test_db.db.clone(),
+        action_providers,
+        Some(hyperliquid_info.base_url.clone()),
+    );
+    let planned_at = Utc::now();
+    let source_usdc = test_asset("evm:42161", "0xaf88d065e77c8cc2239327c5edb3a432268e5831");
+    let mut order = test_order(source_usdc.clone(), planned_at);
+    order.destination_asset = test_asset("bitcoin", "native");
+    order.workflow_parent_span_id = order.workflow_trace_id[..16].to_string();
+    let failed_attempt_id = Uuid::now_v7();
+    let source_deposit_vault =
+        test_custody_vault(&order, CustodyVaultRole::SourceDeposit, &source_usdc);
+    seed_hyperliquid_spot_refund_order(
+        &test_db.db,
+        &test_db.pool,
+        &order,
+        failed_attempt_id,
+        &source_deposit_vault,
+    )
+    .await;
+
+    let discovery = discover_single_refund_position_with_deps(
+        &deps,
+        DiscoverSingleRefundPositionInput {
+            order_id: order.id.into(),
+            failed_attempt_id: failed_attempt_id.into(),
+        },
+    )
+    .await
+    .expect("discover refund position from source_deposit HL clearinghouse balance");
+
+    match discovery.outcome {
+        SingleRefundPositionOutcome::Position(position) => {
+            assert_eq!(
+                position.position_kind,
+                RecoverablePositionKind::HyperliquidSpot
+            );
+            assert_eq!(
+                position.custody_vault_id,
+                Some(source_deposit_vault.id.into())
+            );
+            assert_eq!(position.asset, source_usdc);
+            assert_eq!(position.amount.as_str(), "100000000");
+            assert_eq!(position.hyperliquid_coin.as_deref(), Some("USDC"));
+            assert_eq!(position.hyperliquid_canonical, Some(CanonicalAsset::Usdc));
+            assert!(position.requires_clearinghouse_unwrap);
+        }
+        other => {
+            panic!(
+                "expected source_deposit Hyperliquid clearinghouse refund position, got {other:?}"
+            )
+        }
+    }
+}
+
+#[tokio::test]
+async fn refund_position_discovery_handles_hl_spot_and_clearinghouse_balances() {
+    let test_db = test_database().await;
+    let hyperliquid_info = TestHyperliquidInfoServer::spawn_with_balances_and_clearinghouse(
+        vec![test_hyperliquid_spot_balance("UBTC", 0, "0.0005", "0")],
+        "100",
+    )
+    .await;
+    let action_providers = Arc::new(ActionProviderRegistry::new(vec![], vec![], vec![]));
+    let deps = test_deps_with_action_providers(
+        test_db.db.clone(),
+        action_providers,
+        Some(hyperliquid_info.base_url.clone()),
+    );
+    let planned_at = Utc::now();
+    let btc = test_asset("bitcoin", "native");
+    let mut order = test_order(btc.clone(), planned_at);
+    order.workflow_parent_span_id = order.workflow_trace_id[..16].to_string();
+    let failed_attempt_id = Uuid::now_v7();
+    let source_deposit_vault = test_custody_vault(&order, CustodyVaultRole::SourceDeposit, &btc);
+    seed_hyperliquid_spot_refund_order(
+        &test_db.db,
+        &test_db.pool,
+        &order,
+        failed_attempt_id,
+        &source_deposit_vault,
+    )
+    .await;
+
+    let discovery = discover_single_refund_position_with_deps(
+        &deps,
+        DiscoverSingleRefundPositionInput {
+            order_id: order.id.into(),
+            failed_attempt_id: failed_attempt_id.into(),
+        },
+    )
+    .await
+    .expect("discover refund position with HL spot and clearinghouse balances");
+
+    match discovery.outcome {
+        SingleRefundPositionOutcome::Position(position) => {
+            assert_eq!(
+                position.position_kind,
+                RecoverablePositionKind::HyperliquidSpot
+            );
+            assert_eq!(
+                position.custody_vault_id,
+                Some(source_deposit_vault.id.into())
+            );
+            assert_eq!(position.asset, btc);
+            assert_eq!(position.hyperliquid_coin.as_deref(), Some("UBTC"));
+            assert_eq!(position.hyperliquid_canonical, Some(CanonicalAsset::Btc));
+            assert!(!position.requires_clearinghouse_unwrap);
+        }
+        other => panic!("expected selected HyperliquidSpot refund position, got {other:?}"),
     }
 }
 
@@ -2281,6 +2575,7 @@ fn test_refund_position(
             .then_some("UBTC".to_string()),
         hyperliquid_canonical: (position_kind == RecoverablePositionKind::HyperliquidSpot)
             .then_some(CanonicalAsset::Btc),
+        requires_clearinghouse_unwrap: false,
     }
 }
 

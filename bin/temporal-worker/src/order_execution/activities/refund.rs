@@ -187,6 +187,7 @@ pub(super) async fn discover_single_refund_position_with_deps(
                     })?,
                     hyperliquid_coin: None,
                     hyperliquid_canonical: None,
+                    requires_clearinghouse_unwrap: false,
                 });
             }
         }
@@ -232,6 +233,7 @@ pub(super) async fn discover_single_refund_position_with_deps(
                         })?,
                         hyperliquid_coin: None,
                         hyperliquid_canonical: None,
+                        requires_clearinghouse_unwrap: false,
                     });
                 }
             }
@@ -306,6 +308,29 @@ async fn hyperliquid_spot_refund_positions_for_vault(
                 .map_err(|source| amount_parse_error("hyperliquid spot refund balance", source))?,
             hyperliquid_coin: Some(balance.coin),
             hyperliquid_canonical: Some(canonical),
+            requires_clearinghouse_unwrap: false,
+        });
+    }
+    let clearinghouse_amount = deps
+        .custody_action_executor
+        .inspect_hyperliquid_clearinghouse_balance(vault)
+        .await
+        .map_err(|source| {
+            custody_action_error("inspect hyperliquid clearinghouse refund balance", source)
+        })?;
+    if !clearinghouse_amount.is_zero() {
+        positions.push(SingleRefundPosition {
+            position_kind: RecoverablePositionKind::HyperliquidSpot,
+            owning_step_id: None,
+            funding_vault_id: None,
+            custody_vault_id: Some(vault.id.into()),
+            asset: position_asset.unwrap_or_else(|| order.source_asset.clone()),
+            amount: RawAmount::new(clearinghouse_amount.to_string()).map_err(|source| {
+                amount_parse_error("hyperliquid clearinghouse refund balance", source)
+            })?,
+            hyperliquid_coin: Some("USDC".to_string()),
+            hyperliquid_canonical: Some(CanonicalAsset::Usdc),
+            requires_clearinghouse_unwrap: true,
         });
     }
     Ok(positions)
@@ -584,8 +609,8 @@ pub(super) async fn materialize_hyperliquid_spot_refund_plan(
         &source.order,
         &source.vault,
         source.canonical,
-        &source.asset,
         &source.amount,
+        source.requires_clearinghouse_unwrap,
         now,
     )
     .await?
@@ -616,6 +641,7 @@ struct HyperliquidSpotRefundSource {
     amount: String,
     coin: String,
     canonical: CanonicalAsset,
+    requires_clearinghouse_unwrap: bool,
 }
 
 async fn load_hyperliquid_spot_refund_source(
@@ -648,10 +674,28 @@ async fn load_hyperliquid_spot_refund_source(
     let canonical = input.position.hyperliquid_canonical.ok_or_else(|| {
         refund_materialization_error("HyperliquidSpot refund position is missing canonical asset")
     })?;
-    let Some((current_canonical, asset, amount)) =
-        current_hyperliquid_spot_refund_balance(deps, &order, &vault, &coin).await?
-    else {
-        return Ok(None);
+    let (current_canonical, asset, amount) = if input.position.requires_clearinghouse_unwrap {
+        if canonical != CanonicalAsset::Usdc || !coin.eq_ignore_ascii_case("USDC") {
+            return Err(invariant_error(
+                "hyperliquid_clearinghouse_refund_usdc_only",
+                format!(
+                    "Hyperliquid clearinghouse refund position must be USDC, got coin {coin} canonical {}",
+                    canonical.as_str()
+                ),
+            ));
+        }
+        let Some(amount) = current_hyperliquid_clearinghouse_refund_balance(deps, &vault).await?
+        else {
+            return Ok(None);
+        };
+        (CanonicalAsset::Usdc, input.position.asset.clone(), amount)
+    } else {
+        let Some((current_canonical, asset, amount)) =
+            current_hyperliquid_spot_refund_balance(deps, &order, &vault, &coin).await?
+        else {
+            return Ok(None);
+        };
+        (current_canonical, asset, amount)
     };
     if current_canonical != canonical {
         return Err(invariant_error(
@@ -670,6 +714,7 @@ async fn load_hyperliquid_spot_refund_source(
         amount,
         coin,
         canonical,
+        requires_clearinghouse_unwrap: input.position.requires_clearinghouse_unwrap,
     }))
 }
 
@@ -687,11 +732,14 @@ fn validate_hyperliquid_spot_refund_vault(
             ),
         ));
     }
-    if vault.role != CustodyVaultRole::HyperliquidSpot {
+    if !matches!(
+        vault.role,
+        CustodyVaultRole::HyperliquidSpot | CustodyVaultRole::SourceDeposit
+    ) {
         return Err(invariant_error(
             "hyperliquid_spot_vault_role",
             format!(
-                "custody vault {} is {}, not hyperliquid_spot",
+                "custody vault {} is {}, not hyperliquid_spot or source_deposit",
                 vault.id,
                 vault.role.to_db_string()
             ),
@@ -727,12 +775,14 @@ async fn create_hyperliquid_spot_refund_attempt(
                     "schema_version": 1,
                     "source_kind": "hyperliquid_spot",
                     "custody_vault_id": source.vault.id,
+                    "custody_vault_role": source.vault.role.to_db_string(),
                     "source_asset": {
                         "chain": source.asset.chain.as_str(),
                         "asset": source.asset.asset.as_str(),
                     },
                     "hyperliquid_coin": source.coin,
                     "hyperliquid_canonical": source.canonical.as_str(),
+                    "requires_clearinghouse_unwrap": source.requires_clearinghouse_unwrap,
                     "amount": source.amount,
                 }),
             },
@@ -807,13 +857,33 @@ pub(super) async fn current_hyperliquid_spot_refund_balance(
     Ok(Some((canonical, asset, amount)))
 }
 
+pub(super) async fn current_hyperliquid_clearinghouse_refund_balance(
+    deps: &OrderActivityDeps,
+    vault: &CustodyVault,
+) -> Result<Option<String>, OrderActivityError> {
+    let amount = deps
+        .custody_action_executor
+        .inspect_hyperliquid_clearinghouse_balance(vault)
+        .await
+        .map_err(|source| {
+            custody_action_error(
+                "inspecting Hyperliquid clearinghouse refund balance",
+                source,
+            )
+        })?;
+    if amount.is_zero() {
+        return Ok(None);
+    }
+    Ok(Some(amount.to_string()))
+}
+
 pub(super) async fn hyperliquid_spot_refund_back_steps(
     deps: &OrderActivityDeps,
     order: &RouterOrder,
     vault: &CustodyVault,
     canonical: CanonicalAsset,
-    asset: &DepositAsset,
     amount: &str,
+    requires_clearinghouse_unwrap: bool,
     planned_at: chrono::DateTime<Utc>,
 ) -> Result<Option<(Vec<OrderExecutionLeg>, Vec<OrderExecutionStep>)>, OrderActivityError> {
     let Some(quoted_path) =
@@ -821,8 +891,8 @@ pub(super) async fn hyperliquid_spot_refund_back_steps(
     else {
         tracing::warn!(
             order_id = %order.id,
-            source_asset_chain = %asset.chain,
-            source_asset = %asset.asset,
+            source_asset_chain = %order.source_asset.chain,
+            source_asset = %order.source_asset.asset,
             amount,
             event_name = "order.refund_plan_unavailable",
             "no PR6b7a HyperliquidSpot refund path is available"
@@ -830,7 +900,15 @@ pub(super) async fn hyperliquid_spot_refund_back_steps(
         return Ok(None);
     };
 
-    materialize_hyperliquid_spot_refund_path(order, vault, &quoted_path, planned_at).map(Some)
+    materialize_hyperliquid_spot_refund_path(
+        order,
+        vault,
+        &quoted_path,
+        amount,
+        requires_clearinghouse_unwrap,
+        planned_at,
+    )
+    .map(Some)
 }
 
 pub(super) async fn best_hyperliquid_spot_refund_quote(
@@ -972,7 +1050,9 @@ pub(super) fn refund_path_compatible_with_position(
         },
         RecoverablePositionKind::HyperliquidSpot => matches!(
             first.kind,
-            MarketOrderTransitionKind::HyperliquidTrade | MarketOrderTransitionKind::UnitWithdrawal
+            MarketOrderTransitionKind::HyperliquidTrade
+                | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal
+                | MarketOrderTransitionKind::UnitWithdrawal
         ),
     }
 }
@@ -994,12 +1074,23 @@ pub(super) fn materialize_hyperliquid_spot_refund_path(
     order: &RouterOrder,
     vault: &CustodyVault,
     quoted_path: &RefundQuotedPath,
+    source_amount: &str,
+    requires_clearinghouse_unwrap: bool,
     planned_at: chrono::DateTime<Utc>,
 ) -> Result<(Vec<OrderExecutionLeg>, Vec<OrderExecutionStep>), OrderActivityError> {
     let mut execution_legs = Vec::new();
     let mut steps = Vec::new();
     let mut step_index = 0_i32;
     let mut leg_index = 0_i32;
+
+    if requires_clearinghouse_unwrap {
+        let (leg, step) =
+            hyperliquid_clearinghouse_to_spot_refund_prep(order, vault, source_amount, planned_at)?;
+        execution_legs.push(leg);
+        steps.push(step);
+        step_index = 1;
+        leg_index = 1;
+    }
 
     for (transition_index, transition) in quoted_path.path.transitions.iter().enumerate() {
         let is_final = transition_index + 1 == quoted_path.path.transitions.len();
@@ -1038,6 +1129,90 @@ pub(super) fn materialize_hyperliquid_spot_refund_path(
     }
 
     Ok((execution_legs, steps))
+}
+
+fn hyperliquid_clearinghouse_to_spot_refund_prep(
+    order: &RouterOrder,
+    vault: &CustodyVault,
+    amount: &str,
+    planned_at: chrono::DateTime<Utc>,
+) -> Result<(OrderExecutionLeg, OrderExecutionStep), OrderActivityError> {
+    let hyperliquid_usdc = DepositAsset {
+        chain: ChainId::parse("hyperliquid").map_err(refund_materialization_error)?,
+        asset: AssetId::Native,
+    };
+    let leg_id = Uuid::now_v7();
+    let leg = OrderExecutionLeg {
+        id: leg_id,
+        order_id: order.id,
+        execution_attempt_id: None,
+        transition_decl_id: None,
+        leg_index: 0,
+        leg_type: OrderExecutionStepType::HyperliquidClearinghouseToSpot
+            .to_db_string()
+            .to_string(),
+        provider: ProviderId::Hyperliquid.as_str().to_string(),
+        status: OrderExecutionStepStatus::Planned,
+        input_asset: hyperliquid_usdc.clone(),
+        output_asset: hyperliquid_usdc.clone(),
+        amount_in: amount.to_string(),
+        expected_amount_out: amount.to_string(),
+        min_amount_out: Some(amount.to_string()),
+        actual_amount_in: None,
+        actual_amount_out: None,
+        started_at: None,
+        completed_at: None,
+        provider_quote_expires_at: None,
+        details: json!({
+            "schema_version": 1,
+            "refund_kind": "hyperliquid_clearinghouse_unwrap",
+            "action_step_types": [OrderExecutionStepType::HyperliquidClearinghouseToSpot.to_db_string()],
+        }),
+        usd_valuation: json!({}),
+        created_at: planned_at,
+        updated_at: planned_at,
+    };
+    let step = OrderExecutionStep {
+        id: Uuid::now_v7(),
+        order_id: order.id,
+        execution_attempt_id: None,
+        execution_leg_id: Some(leg_id),
+        transition_decl_id: None,
+        step_index: 0,
+        step_type: OrderExecutionStepType::HyperliquidClearinghouseToSpot,
+        provider: ProviderId::Hyperliquid.as_str().to_string(),
+        status: OrderExecutionStepStatus::Planned,
+        input_asset: Some(hyperliquid_usdc.clone()),
+        output_asset: Some(hyperliquid_usdc),
+        amount_in: Some(amount.to_string()),
+        min_amount_out: Some(amount.to_string()),
+        tx_hash: None,
+        provider_ref: None,
+        idempotency_key: None,
+        attempt_count: 0,
+        next_attempt_at: None,
+        started_at: None,
+        completed_at: None,
+        request: json!({
+            "order_id": order.id,
+            "amount": amount,
+            "hyperliquid_custody_vault_id": vault.id,
+            "hyperliquid_custody_vault_address": vault.address,
+        }),
+        details: json!({
+            "schema_version": 1,
+            "refund_kind": "hyperliquid_clearinghouse_unwrap",
+            "hyperliquid_custody_vault_id": vault.id,
+            "hyperliquid_custody_vault_role": vault.role.to_db_string(),
+            "hyperliquid_custody_vault_status": "bound",
+        }),
+        response: json!({}),
+        error: json!({}),
+        usd_valuation: json!({}),
+        created_at: planned_at,
+        updated_at: planned_at,
+    };
+    Ok((leg, step))
 }
 
 fn materialize_hyperliquid_spot_refund_transition(
@@ -1203,7 +1378,7 @@ fn explicit_hyperliquid_spot_refund_binding(vault: &CustodyVault) -> RefundHyper
     RefundHyperliquidBinding::Explicit {
         vault_id: vault.id,
         address: vault.address.clone(),
-        role: CustodyVaultRole::HyperliquidSpot,
+        role: vault.role,
         asset: None,
     }
 }
