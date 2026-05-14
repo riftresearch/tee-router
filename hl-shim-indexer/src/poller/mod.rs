@@ -214,22 +214,40 @@ impl Scheduler {
     }
 
     pub async fn next_due(&self) -> ScheduledPoll {
+        // Peek-then-conditional-pop. Items only leave the heap when they are
+        // actually due, so a worker never "owns" a future-dated item while
+        // sleeping. When a future-dated item is at the front, all idle workers
+        // sleep until that single deadline; on wake they race for the lock and
+        // fan out across whatever is now due.
         loop {
-            let maybe_due = {
-                let mut inner = self.inner.lock().await;
-                inner.heap.pop()
+            let front_deadline = {
+                let inner = self.inner.lock().await;
+                inner.heap.peek().map(|p| p.deadline)
             };
-            if let Some(next) = maybe_due {
-                if !self.poll_is_still_registered(next).await {
-                    continue;
-                }
-                let now = Instant::now();
-                if next.deadline > now {
-                    sleep_until(next.deadline.into()).await;
-                }
-                return next;
+            let Some(deadline) = front_deadline else {
+                sleep(Duration::from_millis(100)).await;
+                continue;
+            };
+            let now = Instant::now();
+            if deadline > now {
+                sleep_until(deadline.into()).await;
+                continue;
             }
-            sleep(Duration::from_millis(100)).await;
+            // Item at the front is due. Race for it.
+            let popped = {
+                let mut inner = self.inner.lock().await;
+                match inner.heap.peek() {
+                    Some(p) if p.deadline <= Instant::now() => inner.heap.pop(),
+                    _ => None,
+                }
+            };
+            let Some(next) = popped else {
+                continue; // Lost the race; re-peek.
+            };
+            if !self.poll_is_still_registered(next).await {
+                continue;
+            }
+            return next;
         }
     }
 
