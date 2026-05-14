@@ -172,14 +172,9 @@ impl RefundActivities {
             }
         }
 
-        if positions.len() == 1 {
-            return Ok(SingleRefundPositionDiscovery {
-                outcome: SingleRefundPositionOutcome::Position(positions.remove(0)),
-            });
-        }
-        Ok(refund_single_position_untenable(
-            positions.len(),
-            positions.len(),
+        Ok(refund_position_discovery_from_positions(
+            input.order_id.inner(),
+            positions,
         ))
         })
         .await
@@ -279,6 +274,48 @@ impl RefundActivities {
             })
         })
         .await
+    }
+}
+
+pub(super) fn refund_position_discovery_from_positions(
+    order_id: Uuid,
+    mut positions: Vec<SingleRefundPosition>,
+) -> SingleRefundPositionDiscovery {
+    if positions.is_empty() {
+        return refund_single_position_untenable(0, 0);
+    }
+
+    let selected_index = positions
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, position)| refund_position_priority(position.position_kind))
+        .map(|(index, _)| index)
+        .expect("positions is not empty");
+    let selected = positions.remove(selected_index);
+
+    for dropped in &positions {
+        let dropped_position_kind = recoverable_position_kind_label(dropped.position_kind);
+        tracing::warn!(
+            order_id = %order_id,
+            selected_position_kind = recoverable_position_kind_label(selected.position_kind),
+            dropped_position_kind,
+            dropped_amount = %dropped.amount,
+            event_name = "order.refund_position_dropped",
+            "order.refund_position_dropped"
+        );
+        telemetry::record_refund_positions_dropped(dropped_position_kind);
+    }
+
+    SingleRefundPositionDiscovery {
+        outcome: SingleRefundPositionOutcome::Position(selected),
+    }
+}
+
+fn refund_position_priority(position_kind: RecoverablePositionKind) -> u8 {
+    match position_kind {
+        RecoverablePositionKind::FundingVault => 0,
+        RecoverablePositionKind::ExternalCustody => 1,
+        RecoverablePositionKind::HyperliquidSpot => 2,
     }
 }
 

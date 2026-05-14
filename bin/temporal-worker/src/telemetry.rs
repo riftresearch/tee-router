@@ -127,6 +127,14 @@ pub fn record_refund_position_untenable(reason: &'static str) {
     .increment(1);
 }
 
+pub fn record_refund_positions_dropped(position_kind: &'static str) {
+    counter!(
+        "tee_router_temporal_worker_refund_positions_dropped_total",
+        "position_kind" => position_kind,
+    )
+    .increment(1);
+}
+
 pub fn record_stale_quote_refresh(outcome: &'static str) {
     counter!(
         "tee_router_temporal_worker_stale_quote_refresh_total",
