@@ -418,30 +418,23 @@ impl OrderWorkflow {
                         )
                         .await?;
                     if stale_quote_check.should_refund {
-                        set_order_workflow_finalizing(
+                        set_order_workflow_refunding(
                             ctx,
                             input.order_id,
-                            Some(OrderTerminalStatus::RefundRequired),
+                            execution_attempt.attempt_id,
                         );
-                        let finalized = ctx
-                            .start_activity(
-                                OrderActivities::finalize_order_or_refund,
-                                FinalizeOrderOrRefundInput {
-                                    order_id: input.order_id,
-                                    attempt_id: None,
-                                    step_id: None,
-                                    terminal_status: OrderTerminalStatus::RefundRequired,
-                                    reason: None,
-                                    funded_to_workflow_start_seconds,
-                                },
-                                db_activity_options.clone(),
-                            )
-                            .await?;
+                        let terminal_status = run_refund_child(
+                            ctx,
+                            input.order_id,
+                            execution_attempt.attempt_id,
+                            funded_to_workflow_start_seconds,
+                        )
+                        .await?;
                         return order_workflow_output(
                             ctx,
                             workflow_started_at,
                             input.order_id,
-                            finalized.terminal_status,
+                            terminal_status,
                         );
                     }
                     set_order_workflow_refreshing_quote(
@@ -473,30 +466,23 @@ impl OrderWorkflow {
                             continue 'attempts;
                         }
                         QuoteRefreshContinuation::RefundRequired => {
-                            set_order_workflow_finalizing(
+                            set_order_workflow_refunding(
                                 ctx,
                                 input.order_id,
-                                Some(OrderTerminalStatus::RefundRequired),
+                                execution_attempt.attempt_id,
                             );
-                            let finalized = ctx
-                                .start_activity(
-                                    OrderActivities::finalize_order_or_refund,
-                                    FinalizeOrderOrRefundInput {
-                                        order_id: input.order_id,
-                                        attempt_id: None,
-                                        step_id: None,
-                                        terminal_status: OrderTerminalStatus::RefundRequired,
-                                        reason: None,
-                                        funded_to_workflow_start_seconds,
-                                    },
-                                    db_activity_options.clone(),
-                                )
-                                .await?;
+                            let terminal_status = run_refund_child(
+                                ctx,
+                                input.order_id,
+                                execution_attempt.attempt_id,
+                                funded_to_workflow_start_seconds,
+                            )
+                            .await?;
                             return order_workflow_output(
                                 ctx,
                                 workflow_started_at,
                                 input.order_id,
-                                finalized.terminal_status,
+                                terminal_status,
                             );
                         }
                     }
@@ -620,31 +606,23 @@ impl OrderWorkflow {
                                         continue 'attempts;
                                     }
                                     QuoteRefreshContinuation::RefundRequired => {
-                                        set_order_workflow_finalizing(
+                                        set_order_workflow_refunding(
                                             ctx,
                                             input.order_id,
-                                            Some(OrderTerminalStatus::RefundRequired),
+                                            execution_attempt.attempt_id,
                                         );
-                                        let finalized = ctx
-                                            .start_activity(
-                                                OrderActivities::finalize_order_or_refund,
-                                                FinalizeOrderOrRefundInput {
-                                                    order_id: input.order_id,
-                                                    attempt_id: None,
-                                                    step_id: None,
-                                                    terminal_status:
-                                                        OrderTerminalStatus::RefundRequired,
-                                                    reason: None,
-                                                    funded_to_workflow_start_seconds,
-                                                },
-                                                db_activity_options,
-                                            )
-                                            .await?;
+                                        let terminal_status = run_refund_child(
+                                            ctx,
+                                            input.order_id,
+                                            execution_attempt.attempt_id,
+                                            funded_to_workflow_start_seconds,
+                                        )
+                                        .await?;
                                         return order_workflow_output(
                                             ctx,
                                             workflow_started_at,
                                             input.order_id,
-                                            finalized.terminal_status,
+                                            terminal_status,
                                         );
                                     }
                                 }
@@ -1474,5 +1452,86 @@ mod tests {
                 panic!("refreshed quote continuation should resume execution")
             }
         }
+    }
+
+    #[test]
+    fn refund_required_workflow_paths_start_refund_child() {
+        let source = workflow_implementation_source();
+        assert!(
+            !source.contains("OrderTerminalStatus::RefundRequired"),
+            "OrderWorkflow must not finalize or output RefundRequired directly"
+        );
+
+        let pre_execution_branch =
+            branch_window(source, "if stale_quote_check.should_refund {", 0, 24);
+        assert_refund_child_branch("pre-execution stale quote refund", &pre_execution_branch);
+
+        let quote_refresh_branches =
+            branch_windows(source, "QuoteRefreshContinuation::RefundRequired => {", 24);
+        assert_eq!(
+            quote_refresh_branches.len(),
+            2,
+            "expected both quote-refresh RefundRequired workflow branches"
+        );
+        for (index, branch) in quote_refresh_branches.iter().enumerate() {
+            assert_refund_child_branch(
+                &format!("quote-refresh refund branch {}", index + 1),
+                branch,
+            );
+        }
+    }
+
+    fn workflow_implementation_source() -> &'static str {
+        include_str!("order.rs")
+            .split_once("#[cfg(test)]")
+            .map(|(source, _tests)| source)
+            .expect("order workflow source should contain cfg(test) module")
+    }
+
+    fn branch_windows(source: &str, needle: &str, line_count: usize) -> Vec<String> {
+        let lines = source.lines().collect::<Vec<_>>();
+        lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.contains(needle))
+            .map(|(index, _)| lines[index..usize::min(index + line_count, lines.len())].join("\n"))
+            .collect()
+    }
+
+    fn branch_window(
+        source: &str,
+        needle: &str,
+        occurrence_index: usize,
+        line_count: usize,
+    ) -> String {
+        branch_windows(source, needle, line_count)
+            .into_iter()
+            .nth(occurrence_index)
+            .unwrap_or_else(|| {
+                panic!("missing occurrence {occurrence_index} for workflow branch {needle}")
+            })
+    }
+
+    fn assert_refund_child_branch(label: &str, branch: &str) {
+        assert!(
+            branch.contains("set_order_workflow_refunding("),
+            "{label} should set the workflow state to refunding"
+        );
+        assert!(
+            branch.contains("run_refund_child("),
+            "{label} should invoke the refund child workflow"
+        );
+        assert!(
+            branch.contains("execution_attempt.attempt_id"),
+            "{label} should chain the refund to the failed execution attempt"
+        );
+        assert!(
+            !branch.contains("set_order_workflow_finalizing("),
+            "{label} must not finalize directly"
+        );
+        assert!(
+            !branch.contains("finalize_order_or_refund"),
+            "{label} must not mark RefundRequired without attempting refund"
+        );
     }
 }

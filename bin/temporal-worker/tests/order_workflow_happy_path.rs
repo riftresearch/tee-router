@@ -149,6 +149,35 @@ struct WorkflowOptions {
     manual_intervention_action: Option<ManualInterventionTestAction>,
 }
 
+fn assert_refund_child_terminal_status(status: OrderTerminalStatus) {
+    assert!(
+        matches!(
+            status,
+            OrderTerminalStatus::Refunded | OrderTerminalStatus::RefundManualInterventionRequired
+        ),
+        "refund-required workflow paths must exit through the refund child, got {status:?}"
+    );
+}
+
+fn assert_refund_child_order_status(status: RouterOrderStatus) {
+    assert!(
+        matches!(
+            status,
+            RouterOrderStatus::Refunded | RouterOrderStatus::RefundManualInterventionRequired
+        ),
+        "refund-required workflow paths must not leave the order refund_required, got {status:?}"
+    );
+}
+
+fn assert_refund_recovery_attempt_materialized(attempts: &[OrderExecutionAttempt]) {
+    assert!(
+        attempts
+            .iter()
+            .any(|attempt| attempt.attempt_kind == OrderExecutionAttemptKind::RefundRecovery),
+        "refund child should materialize a refund recovery attempt"
+    );
+}
+
 struct SeededOrder {
     order_id: Uuid,
     funding_vault_address: String,
@@ -1447,17 +1476,14 @@ async fn order_workflow_refresh_untenable_routes_to_refund() {
     })
     .await;
 
-    assert_eq!(
-        run.output.terminal_status,
-        OrderTerminalStatus::RefundRequired
-    );
-    let refund_required = run
+    assert_refund_child_terminal_status(run.output.terminal_status);
+    let refunded = run
         .db
         .orders()
         .get(run.order_id)
         .await
-        .expect("load refund-required order");
-    assert_eq!(refund_required.status, RouterOrderStatus::RefundRequired);
+        .expect("load refunded order");
+    assert_refund_child_order_status(refunded.status);
 
     let attempts = run
         .db
@@ -1465,12 +1491,12 @@ async fn order_workflow_refresh_untenable_routes_to_refund() {
         .get_execution_attempts(run.order_id)
         .await
         .expect("load execution attempts");
-    assert_eq!(attempts.len(), 1);
     assert_eq!(
         attempts[0].attempt_kind,
         OrderExecutionAttemptKind::PrimaryExecution
     );
     assert_eq!(attempts[0].status, OrderExecutionAttemptStatus::Failed);
+    assert_refund_recovery_attempt_materialized(&attempts);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1480,22 +1506,20 @@ async fn order_workflow_refresh_multi_leg_untenable_routes_to_refund() {
         route: WorkflowRoute::AcrossBaseEthToEthereumUsdc,
         expire_quote_legs: true,
         expire_quote_transition_kinds: vec!["universal_router_swap"],
+        expect_external_custody_across_refund: true,
         refreshed_eth_usd_micro: Some(1_000_000),
         ..WorkflowOptions::default()
     })
     .await;
 
-    assert_eq!(
-        run.output.terminal_status,
-        OrderTerminalStatus::RefundRequired
-    );
-    let refund_required = run
+    assert_refund_child_terminal_status(run.output.terminal_status);
+    let refunded = run
         .db
         .orders()
         .get(run.order_id)
         .await
-        .expect("load refund-required order");
-    assert_eq!(refund_required.status, RouterOrderStatus::RefundRequired);
+        .expect("load refunded order");
+    assert_refund_child_order_status(refunded.status);
 
     let attempts = run
         .db
@@ -1503,12 +1527,12 @@ async fn order_workflow_refresh_multi_leg_untenable_routes_to_refund() {
         .get_execution_attempts(run.order_id)
         .await
         .expect("load execution attempts");
-    assert_eq!(attempts.len(), 1);
     assert_eq!(
         attempts[0].attempt_kind,
         OrderExecutionAttemptKind::PrimaryExecution
     );
     assert_eq!(attempts[0].status, OrderExecutionAttemptStatus::Failed);
+    assert_refund_recovery_attempt_materialized(&attempts);
 }
 
 async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
