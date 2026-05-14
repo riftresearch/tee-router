@@ -18,7 +18,7 @@ use devnet::{
 use eip3009_erc20_contract::GenericEIP3009ERC20::GenericEIP3009ERC20Instance;
 use router_core::{
     config::Settings,
-    db::Database,
+    db::{Database, RefreshedExecutionAttemptPlan},
     error::RouterCoreError,
     models::{
         CustodyVault, CustodyVaultControlType, CustodyVaultRole, CustodyVaultStatus,
@@ -565,6 +565,234 @@ async fn create_test_execution_leg_for_step(spec: TestExecutionLegForStep<'_>) -
     leg.id
 }
 
+struct FailedAttemptFixture {
+    attempt: OrderExecutionAttempt,
+    legs: Vec<OrderExecutionLeg>,
+    steps: Vec<OrderExecutionStep>,
+}
+
+async fn create_failed_attempt_with_transient_legs(
+    db: &Database,
+    order: &RouterOrder,
+    now: chrono::DateTime<Utc>,
+    idempotency_prefix: &str,
+) -> FailedAttemptFixture {
+    let attempt = OrderExecutionAttempt {
+        id: Uuid::now_v7(),
+        order_id: order.id,
+        attempt_index: 1,
+        attempt_kind: OrderExecutionAttemptKind::PrimaryExecution,
+        status: OrderExecutionAttemptStatus::Failed,
+        trigger_step_id: None,
+        trigger_provider_operation_id: None,
+        failure_reason: json!({ "reason": "test_failed_attempt" }),
+        input_custody_snapshot: json!({}),
+        created_at: now,
+        updated_at: now,
+    };
+    db.orders()
+        .create_execution_attempt(&attempt)
+        .await
+        .unwrap();
+
+    let specs = [
+        (
+            OrderExecutionStepType::UnitDeposit,
+            "unit",
+            OrderExecutionStepStatus::Failed,
+        ),
+        (
+            OrderExecutionStepType::UnitWithdrawal,
+            "unit",
+            OrderExecutionStepStatus::Planned,
+        ),
+        (
+            OrderExecutionStepType::HyperliquidTrade,
+            "hyperliquid",
+            OrderExecutionStepStatus::Running,
+        ),
+        (
+            OrderExecutionStepType::UniversalRouterSwap,
+            "velora",
+            OrderExecutionStepStatus::Waiting,
+        ),
+    ];
+    let mut legs = Vec::with_capacity(specs.len());
+    let mut steps = Vec::with_capacity(specs.len());
+    for (index, (step_type, provider, status)) in specs.into_iter().enumerate() {
+        let index = index as i32;
+        let transition_decl_id = Some(format!("{idempotency_prefix}:{}", step_type.to_db_string()));
+        let leg = OrderExecutionLeg {
+            id: Uuid::now_v7(),
+            order_id: order.id,
+            execution_attempt_id: Some(attempt.id),
+            transition_decl_id: transition_decl_id.clone(),
+            leg_index: index,
+            leg_type: step_type.to_db_string().to_string(),
+            provider: provider.to_string(),
+            status,
+            input_asset: order.source_asset.clone(),
+            output_asset: order.destination_asset.clone(),
+            amount_in: "1000".to_string(),
+            expected_amount_out: "990".to_string(),
+            min_amount_out: Some("980".to_string()),
+            actual_amount_in: None,
+            actual_amount_out: None,
+            started_at: matches!(
+                status,
+                OrderExecutionStepStatus::Running | OrderExecutionStepStatus::Failed
+            )
+            .then_some(now),
+            completed_at: (status == OrderExecutionStepStatus::Failed).then_some(now),
+            provider_quote_expires_at: None,
+            details: json!({ "source": "supersede_fixture" }),
+            usd_valuation: json!({}),
+            created_at: now,
+            updated_at: now,
+        };
+        let step = OrderExecutionStep {
+            id: Uuid::now_v7(),
+            order_id: order.id,
+            execution_attempt_id: Some(attempt.id),
+            execution_leg_id: Some(leg.id),
+            transition_decl_id,
+            step_index: index,
+            step_type,
+            provider: provider.to_string(),
+            status,
+            input_asset: Some(order.source_asset.clone()),
+            output_asset: Some(order.destination_asset.clone()),
+            amount_in: Some("1000".to_string()),
+            min_amount_out: Some("980".to_string()),
+            tx_hash: None,
+            provider_ref: None,
+            idempotency_key: Some(format!("{idempotency_prefix}:step:{index}")),
+            attempt_count: if matches!(
+                status,
+                OrderExecutionStepStatus::Running | OrderExecutionStepStatus::Failed
+            ) {
+                1
+            } else {
+                0
+            },
+            next_attempt_at: None,
+            started_at: matches!(
+                status,
+                OrderExecutionStepStatus::Running | OrderExecutionStepStatus::Failed
+            )
+            .then_some(now),
+            completed_at: (status == OrderExecutionStepStatus::Failed).then_some(now),
+            details: json!({ "source": "supersede_fixture" }),
+            request: json!({}),
+            response: json!({}),
+            error: if status == OrderExecutionStepStatus::Failed {
+                json!({ "reason": "fixture_failed_step" })
+            } else {
+                json!({})
+            },
+            usd_valuation: json!({}),
+            created_at: now,
+            updated_at: now,
+        };
+        legs.push(leg);
+        steps.push(step);
+    }
+
+    db.orders()
+        .create_execution_legs_idempotent(&legs)
+        .await
+        .unwrap();
+    db.orders()
+        .create_execution_steps_idempotent(&steps)
+        .await
+        .unwrap();
+
+    FailedAttemptFixture {
+        attempt,
+        legs,
+        steps,
+    }
+}
+
+fn refreshed_attempt_plan_for_order(
+    order: &RouterOrder,
+    now: chrono::DateTime<Utc>,
+    idempotency_prefix: &str,
+) -> RefreshedExecutionAttemptPlan {
+    let specs = [
+        (OrderExecutionStepType::UnitWithdrawal, "unit"),
+        (OrderExecutionStepType::UniversalRouterSwap, "velora"),
+    ];
+    let mut legs = Vec::with_capacity(specs.len());
+    let mut steps = Vec::with_capacity(specs.len());
+    for (index, (step_type, provider)) in specs.into_iter().enumerate() {
+        let index = index as i32;
+        let transition_decl_id = Some(format!("{idempotency_prefix}:{}", step_type.to_db_string()));
+        let leg = OrderExecutionLeg {
+            id: Uuid::now_v7(),
+            order_id: order.id,
+            execution_attempt_id: None,
+            transition_decl_id: transition_decl_id.clone(),
+            leg_index: index,
+            leg_type: step_type.to_db_string().to_string(),
+            provider: provider.to_string(),
+            status: OrderExecutionStepStatus::Planned,
+            input_asset: order.source_asset.clone(),
+            output_asset: order.destination_asset.clone(),
+            amount_in: "1000".to_string(),
+            expected_amount_out: "990".to_string(),
+            min_amount_out: Some("980".to_string()),
+            actual_amount_in: None,
+            actual_amount_out: None,
+            started_at: None,
+            completed_at: None,
+            provider_quote_expires_at: None,
+            details: json!({ "source": "refreshed_supersede_fixture" }),
+            usd_valuation: json!({}),
+            created_at: now,
+            updated_at: now,
+        };
+        steps.push(OrderExecutionStep {
+            id: Uuid::now_v7(),
+            order_id: order.id,
+            execution_attempt_id: None,
+            execution_leg_id: Some(leg.id),
+            transition_decl_id,
+            step_index: index,
+            step_type,
+            provider: provider.to_string(),
+            status: OrderExecutionStepStatus::Planned,
+            input_asset: Some(order.source_asset.clone()),
+            output_asset: Some(order.destination_asset.clone()),
+            amount_in: Some("1000".to_string()),
+            min_amount_out: Some("980".to_string()),
+            tx_hash: None,
+            provider_ref: None,
+            idempotency_key: Some(format!("{idempotency_prefix}:step:{index}")),
+            attempt_count: 0,
+            next_attempt_at: None,
+            started_at: None,
+            completed_at: None,
+            details: json!({ "source": "refreshed_supersede_fixture" }),
+            request: json!({}),
+            response: json!({}),
+            error: json!({}),
+            usd_valuation: json!({}),
+            created_at: now,
+            updated_at: now,
+        });
+        legs.push(leg);
+    }
+
+    RefreshedExecutionAttemptPlan {
+        legs,
+        steps,
+        failure_reason: json!({ "reason": "test_refreshed_attempt" }),
+        superseded_reason: json!({ "reason": "test_superseded_by_refreshed_attempt" }),
+        input_custody_snapshot: json!({}),
+    }
+}
+
 async fn create_executing_market_test_order(
     db: &Database,
     now: chrono::DateTime<Utc>,
@@ -612,6 +840,116 @@ async fn create_executing_market_test_order(
         .await
         .unwrap();
     order
+}
+
+#[tokio::test]
+async fn retry_supersedes_failed_attempt_legs() {
+    let db = test_db().await;
+    let now = Utc::now();
+    let order = create_executing_market_test_order(&db, now).await;
+    let fixture =
+        create_failed_attempt_with_transient_legs(&db, &order, now, "retry-supersedes").await;
+    let retry = db
+        .orders()
+        .create_retry_execution_attempt_from_failed_step(
+            order.id,
+            fixture.attempt.id,
+            fixture.steps[0].id,
+            now + chrono::Duration::seconds(5),
+        )
+        .await
+        .unwrap();
+
+    let superseded_legs = db
+        .orders()
+        .get_execution_legs_for_attempt(fixture.attempt.id)
+        .await
+        .unwrap();
+    assert_eq!(superseded_legs.len(), fixture.legs.len());
+    assert!(
+        superseded_legs
+            .iter()
+            .all(|leg| leg.status == OrderExecutionStepStatus::Superseded),
+        "failed attempt leg statuses: {:?}",
+        superseded_legs
+            .iter()
+            .map(|leg| leg.status)
+            .collect::<Vec<_>>()
+    );
+
+    let retry_legs = db
+        .orders()
+        .get_execution_legs_for_attempt(retry.attempt.id)
+        .await
+        .unwrap();
+    assert_eq!(retry_legs.len(), fixture.legs.len());
+    assert!(
+        retry_legs
+            .iter()
+            .all(|leg| leg.status == OrderExecutionStepStatus::Planned),
+        "retry leg statuses: {:?}",
+        retry_legs.iter().map(|leg| leg.status).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn refreshed_supersedes_failed_attempt_legs() {
+    let db = test_db().await;
+    let now = Utc::now();
+    let order = create_executing_market_test_order(&db, now).await;
+    let fixture =
+        create_failed_attempt_with_transient_legs(&db, &order, now, "refresh-supersedes").await;
+    let plan = refreshed_attempt_plan_for_order(
+        &order,
+        now + chrono::Duration::seconds(5),
+        "refresh-new-attempt",
+    );
+    let refreshed_leg_count = plan.legs.len();
+    let refreshed = db
+        .orders()
+        .create_refreshed_execution_attempt_from_failed_step(
+            order.id,
+            fixture.attempt.id,
+            fixture.steps[0].id,
+            plan,
+            now + chrono::Duration::seconds(5),
+        )
+        .await
+        .unwrap();
+
+    let superseded_legs = db
+        .orders()
+        .get_execution_legs_for_attempt(fixture.attempt.id)
+        .await
+        .unwrap();
+    assert_eq!(superseded_legs.len(), fixture.legs.len());
+    assert!(
+        superseded_legs
+            .iter()
+            .all(|leg| leg.status == OrderExecutionStepStatus::Superseded),
+        "failed attempt leg statuses: {:?}",
+        superseded_legs
+            .iter()
+            .map(|leg| leg.status)
+            .collect::<Vec<_>>()
+    );
+
+    let refreshed_legs = db
+        .orders()
+        .get_execution_legs_for_attempt(refreshed.attempt.id)
+        .await
+        .unwrap();
+    assert_eq!(refreshed_legs.len(), refreshed_leg_count);
+    assert!(
+        refreshed_legs
+            .iter()
+            .all(|leg| leg.status == OrderExecutionStepStatus::Planned),
+        "refreshed leg statuses: {:?}",
+        refreshed_legs
+            .iter()
+            .map(|leg| leg.status)
+            .collect::<Vec<_>>()
+    );
 }
 
 fn write_test_master_key(config_dir: &std::path::Path) -> std::path::PathBuf {

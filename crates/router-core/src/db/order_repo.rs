@@ -2569,6 +2569,20 @@ impl OrderRepository {
             .await?;
             sqlx_core::query::query(
                 r#"
+                UPDATE order_execution_legs
+                SET
+                    status = 'superseded',
+                    updated_at = $2
+                WHERE execution_attempt_id = $1
+                  AND status IN ('failed', 'planned', 'ready', 'waiting', 'running')
+                "#,
+            )
+            .bind(failed_attempt.id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            sqlx_core::query::query(
+                r#"
                 UPDATE order_execution_attempts
                 SET
                     superseded_by_attempt_id = $2,
@@ -2898,6 +2912,20 @@ impl OrderRepository {
             .bind(stale_attempt.id)
             .bind(failed_step.step_index)
             .bind(plan.superseded_reason.clone())
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            sqlx_core::query::query(
+                r#"
+                UPDATE order_execution_legs
+                SET
+                    status = 'superseded',
+                    updated_at = $2
+                WHERE execution_attempt_id = $1
+                  AND status IN ('failed', 'planned', 'ready', 'waiting', 'running')
+                "#,
+            )
+            .bind(stale_attempt.id)
             .bind(now)
             .execute(&mut *tx)
             .await?;
