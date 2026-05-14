@@ -399,18 +399,26 @@ impl Drop for TestHyperliquidExchangeServer {
 
 impl TestHyperliquidInfoServer {
     async fn spawn() -> Self {
+        Self::spawn_with_balances(vec![test_hyperliquid_spot_balance("UETH", 0, "1", "0")]).await
+    }
+
+    async fn spawn_with_balances(balances: Vec<Value>) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test Hyperliquid info server");
         let addr = listener
             .local_addr()
             .expect("read test Hyperliquid info server address");
+        let balances = Arc::new(balances);
         let handle = tokio::spawn(async move {
             loop {
                 let Ok((stream, _peer)) = listener.accept().await else {
                     break;
                 };
-                tokio::spawn(handle_test_hyperliquid_info_connection(stream));
+                tokio::spawn(handle_test_hyperliquid_info_connection(
+                    stream,
+                    balances.clone(),
+                ));
             }
         });
         Self {
@@ -468,7 +476,10 @@ impl Drop for TestHyperliquidInfoServer {
     }
 }
 
-async fn handle_test_hyperliquid_info_connection(mut stream: tokio::net::TcpStream) {
+async fn handle_test_hyperliquid_info_connection(
+    mut stream: tokio::net::TcpStream,
+    balances: Arc<Vec<Value>>,
+) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut buffer = Vec::new();
@@ -492,12 +503,7 @@ async fn handle_test_hyperliquid_info_connection(mut stream: tokio::net::TcpStre
     let response_body = match payload.get("type").and_then(Value::as_str) {
         Some("spotMeta") => test_hyperliquid_spot_meta(),
         Some("spotClearinghouseState") => json!({
-            "balances": [{
-                "coin": "UETH",
-                "token": 0,
-                "hold": "0",
-                "total": "1",
-            }],
+            "balances": balances.as_ref().clone(),
         }),
         other => json!({ "error": format!("unexpected test Hyperliquid info request {other:?}") }),
     }
@@ -508,6 +514,15 @@ async fn handle_test_hyperliquid_info_connection(mut stream: tokio::net::TcpStre
         response_body
     );
     let _ = stream.write_all(response.as_bytes()).await;
+}
+
+fn test_hyperliquid_spot_balance(coin: &str, token: u64, total: &str, hold: &str) -> Value {
+    json!({
+        "coin": coin,
+        "token": token,
+        "hold": hold,
+        "total": total,
+    })
 }
 
 fn test_http_request_complete(buffer: &[u8]) -> bool {
@@ -1469,6 +1484,123 @@ async fn hyperliquid_spot_refund_plan_to_bitcoin_is_quotable_and_materialized() 
             .and_then(Value::as_str),
         Some(order.refund_address.as_str())
     );
+}
+
+#[tokio::test]
+async fn refund_position_discovery_reads_hl_spot_balance_from_source_deposit_vault() {
+    let test_db = test_database().await;
+    let hyperliquid_info =
+        TestHyperliquidInfoServer::spawn_with_balances(vec![test_hyperliquid_spot_balance(
+            "USDC", 1, "1", "0",
+        )])
+        .await;
+    let action_providers = Arc::new(ActionProviderRegistry::new(vec![], vec![], vec![]));
+    let deps = test_deps_with_action_providers(
+        test_db.db.clone(),
+        action_providers,
+        Some(hyperliquid_info.base_url.clone()),
+    );
+    let planned_at = Utc::now();
+    let source_usdc = test_asset("evm:42161", "0xaf88d065e77c8cc2239327c5edb3a432268e5831");
+    let mut order = test_order(source_usdc.clone(), planned_at);
+    order.destination_asset = test_asset("bitcoin", "native");
+    order.workflow_parent_span_id = order.workflow_trace_id[..16].to_string();
+    let failed_attempt_id = Uuid::now_v7();
+    let source_deposit_vault =
+        test_custody_vault(&order, CustodyVaultRole::SourceDeposit, &source_usdc);
+    seed_hyperliquid_spot_refund_order(
+        &test_db.db,
+        &test_db.pool,
+        &order,
+        failed_attempt_id,
+        &source_deposit_vault,
+    )
+    .await;
+
+    let discovery = discover_single_refund_position_with_deps(
+        &deps,
+        DiscoverSingleRefundPositionInput {
+            order_id: order.id.into(),
+            failed_attempt_id: failed_attempt_id.into(),
+        },
+    )
+    .await
+    .expect("discover refund position from source_deposit HL spot balance");
+
+    match discovery.outcome {
+        SingleRefundPositionOutcome::Position(position) => {
+            assert_eq!(
+                position.position_kind,
+                RecoverablePositionKind::HyperliquidSpot
+            );
+            assert_eq!(
+                position.custody_vault_id,
+                Some(source_deposit_vault.id.into())
+            );
+            assert_eq!(position.funding_vault_id, None);
+            assert_eq!(position.asset, source_usdc);
+            assert_eq!(position.amount.as_str(), "1000000");
+            assert_eq!(position.hyperliquid_coin.as_deref(), Some("USDC"));
+            assert_eq!(position.hyperliquid_canonical, Some(CanonicalAsset::Usdc));
+        }
+        other => panic!("expected source_deposit HyperliquidSpot refund position, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn refund_position_discovery_ignores_zero_hl_spot_source_deposit_balance() {
+    let test_db = test_database().await;
+    let hyperliquid_info =
+        TestHyperliquidInfoServer::spawn_with_balances(vec![test_hyperliquid_spot_balance(
+            "USDC", 1, "0", "0",
+        )])
+        .await;
+    let action_providers = Arc::new(ActionProviderRegistry::new(vec![], vec![], vec![]));
+    let deps = test_deps_with_action_providers(
+        test_db.db.clone(),
+        action_providers,
+        Some(hyperliquid_info.base_url.clone()),
+    );
+    let planned_at = Utc::now();
+    let source_usdc = test_asset("evm:42161", "0xaf88d065e77c8cc2239327c5edb3a432268e5831");
+    let mut order = test_order(source_usdc.clone(), planned_at);
+    order.destination_asset = test_asset("bitcoin", "native");
+    order.workflow_parent_span_id = order.workflow_trace_id[..16].to_string();
+    let failed_attempt_id = Uuid::now_v7();
+    let source_deposit_vault =
+        test_custody_vault(&order, CustodyVaultRole::SourceDeposit, &source_usdc);
+    seed_hyperliquid_spot_refund_order(
+        &test_db.db,
+        &test_db.pool,
+        &order,
+        failed_attempt_id,
+        &source_deposit_vault,
+    )
+    .await;
+
+    let discovery = discover_single_refund_position_with_deps(
+        &deps,
+        DiscoverSingleRefundPositionInput {
+            order_id: order.id.into(),
+            failed_attempt_id: failed_attempt_id.into(),
+        },
+    )
+    .await
+    .expect("discover zero source_deposit HL spot refund position");
+
+    match discovery.outcome {
+        SingleRefundPositionOutcome::Untenable {
+            reason:
+                RefundUntenableReason::RefundRequiresSingleRecoverablePosition {
+                    position_count,
+                    recoverable_position_count,
+                },
+        } => {
+            assert_eq!(position_count, 0);
+            assert_eq!(recoverable_position_count, 0);
+        }
+        other => panic!("expected zero-position discovery, got {other:?}"),
+    }
 }
 
 #[test]

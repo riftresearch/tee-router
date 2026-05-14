@@ -30,152 +30,8 @@ impl RefundActivities {
         input: DiscoverSingleRefundPositionInput,
     ) -> Result<SingleRefundPositionDiscovery, ActivityError> {
         record_activity("discover_single_refund_position", async move {
-        let deps = self.deps()?;
-        let failed_attempt = deps
-            .db
-            .orders()
-            .get_execution_attempt(input.failed_attempt_id.inner())
-            .await
-            .map_err(OrderActivityError::db_query)?;
-        if failed_attempt.order_id != input.order_id.inner() {
-            return Err(invariant_error(
-                "refund_failed_attempt_belongs_to_order",
-                format!(
-                    "refund failed attempt {} does not belong to order {}",
-                    failed_attempt.id,
-                    input.order_id.inner()
-                ),
-            ));
-        }
-        let order = deps
-            .db
-            .orders()
-            .get(input.order_id.inner())
-            .await
-            .map_err(OrderActivityError::db_query)?;
-
-        let mut positions = Vec::new();
-        if let Some(funding_vault_id) = order.funding_vault_id {
-            let vault = match deps.db.vaults().get(funding_vault_id).await {
-                Ok(vault) => Some(vault),
-                Err(RouterCoreError::NotFound) => None,
-                Err(source) => return Err(OrderActivityError::db_query(source)),
-            };
-            if let Some(vault) = vault {
-                let amount = deps
-                    .custody_action_executor
-                    .deposit_vault_balance_raw(&vault)
-                    .await
-                    .map_err(|source| {
-                        custody_action_error("read funding vault refund balance", source)
-                    })?;
-                if raw_amount_is_positive(&amount, "funding vault refund balance")? {
-                    positions.push(SingleRefundPosition {
-                        position_kind: RecoverablePositionKind::FundingVault,
-                        owning_step_id: None,
-                        funding_vault_id: Some(funding_vault_id.into()),
-                        custody_vault_id: None,
-                        asset: vault.deposit_asset,
-                        amount: RawAmount::new(amount)
-                            .map_err(|source| amount_parse_error("funding vault refund balance", source))?,
-                        hyperliquid_coin: None,
-                        hyperliquid_canonical: None,
-                    });
-                }
-            }
-        }
-
-        let custody_vaults = deps
-            .db
-            .orders()
-            .get_custody_vaults(order.id)
-            .await
-            .map_err(OrderActivityError::db_query)?;
-        for vault in custody_vaults {
-            match vault.role {
-                CustodyVaultRole::SourceDeposit => {}
-                CustodyVaultRole::DestinationExecution => {
-                    let Some(asset_id) = vault.asset.clone() else {
-                        continue;
-                    };
-                    let amount = deps
-                        .custody_action_executor
-                        .custody_vault_balance_raw(&vault)
-                        .await
-                        .map_err(|source| {
-                            custody_action_error("read external custody refund balance", source)
-                        })?;
-                    if raw_amount_is_positive(&amount, "external custody refund balance")? {
-                        positions.push(SingleRefundPosition {
-                            position_kind: RecoverablePositionKind::ExternalCustody,
-                            owning_step_id: None,
-                            funding_vault_id: None,
-                            custody_vault_id: Some(vault.id.into()),
-                            asset: DepositAsset {
-                                chain: vault.chain,
-                                asset: asset_id,
-                            },
-                            amount: RawAmount::new(amount).map_err(|source| {
-                                amount_parse_error("external custody refund balance", source)
-                            })?,
-                            hyperliquid_coin: None,
-                            hyperliquid_canonical: None,
-                        });
-                    }
-                }
-                CustodyVaultRole::HyperliquidSpot => {
-                    let balances = deps
-                        .custody_action_executor
-                        .inspect_hyperliquid_spot_balances(&vault)
-                        .await
-                        .map_err(|source| {
-                            custody_action_error("inspect hyperliquid spot refund balances", source)
-                        })?;
-                    for balance in balances {
-                        let registry = deps.action_providers.asset_registry();
-                        let Some((canonical, asset)) = registry
-                            .hyperliquid_coin_asset(&balance.coin, Some(&order.source_asset.chain))
-                        else {
-                            continue;
-                        };
-                        let decimals = registry
-                            .chain_asset(&asset)
-                            .ok_or_else(|| {
-                                refund_discovery_error(format!(
-                                    "missing registered decimals for Hyperliquid refund asset {} {}",
-                                    asset.chain, asset.asset
-                                ))
-                            })?
-                            .decimals;
-                        let Some(amount) = hyperliquid_refund_balance_amount_raw(
-                            &balance.total,
-                            &balance.hold,
-                            decimals,
-                        )?
-                        else {
-                            continue;
-                        };
-                        positions.push(SingleRefundPosition {
-                            position_kind: RecoverablePositionKind::HyperliquidSpot,
-                            owning_step_id: None,
-                            funding_vault_id: None,
-                            custody_vault_id: Some(vault.id.into()),
-                            asset,
-                            amount: RawAmount::new(amount).map_err(|source| {
-                                amount_parse_error("hyperliquid spot refund balance", source)
-                            })?,
-                            hyperliquid_coin: Some(balance.coin),
-                            hyperliquid_canonical: Some(canonical),
-                        });
-                    }
-                }
-            }
-        }
-
-        Ok(refund_position_discovery_from_positions(
-            input.order_id.inner(),
-            positions,
-        ))
+            let deps = self.deps()?;
+            discover_single_refund_position_with_deps(&deps, input).await
         })
         .await
     }
@@ -275,6 +131,184 @@ impl RefundActivities {
         })
         .await
     }
+}
+
+pub(super) async fn discover_single_refund_position_with_deps(
+    deps: &OrderActivityDeps,
+    input: DiscoverSingleRefundPositionInput,
+) -> Result<SingleRefundPositionDiscovery, OrderActivityError> {
+    let failed_attempt = deps
+        .db
+        .orders()
+        .get_execution_attempt(input.failed_attempt_id.inner())
+        .await
+        .map_err(OrderActivityError::db_query)?;
+    if failed_attempt.order_id != input.order_id.inner() {
+        return Err(invariant_error(
+            "refund_failed_attempt_belongs_to_order",
+            format!(
+                "refund failed attempt {} does not belong to order {}",
+                failed_attempt.id,
+                input.order_id.inner()
+            ),
+        ));
+    }
+    let order = deps
+        .db
+        .orders()
+        .get(input.order_id.inner())
+        .await
+        .map_err(OrderActivityError::db_query)?;
+
+    let mut positions = Vec::new();
+    if let Some(funding_vault_id) = order.funding_vault_id {
+        let vault = match deps.db.vaults().get(funding_vault_id).await {
+            Ok(vault) => Some(vault),
+            Err(RouterCoreError::NotFound) => None,
+            Err(source) => return Err(OrderActivityError::db_query(source)),
+        };
+        if let Some(vault) = vault {
+            let amount = deps
+                .custody_action_executor
+                .deposit_vault_balance_raw(&vault)
+                .await
+                .map_err(|source| {
+                    custody_action_error("read funding vault refund balance", source)
+                })?;
+            if raw_amount_is_positive(&amount, "funding vault refund balance")? {
+                positions.push(SingleRefundPosition {
+                    position_kind: RecoverablePositionKind::FundingVault,
+                    owning_step_id: None,
+                    funding_vault_id: Some(funding_vault_id.into()),
+                    custody_vault_id: None,
+                    asset: vault.deposit_asset,
+                    amount: RawAmount::new(amount).map_err(|source| {
+                        amount_parse_error("funding vault refund balance", source)
+                    })?,
+                    hyperliquid_coin: None,
+                    hyperliquid_canonical: None,
+                });
+            }
+        }
+    }
+
+    let custody_vaults = deps
+        .db
+        .orders()
+        .get_custody_vaults(order.id)
+        .await
+        .map_err(OrderActivityError::db_query)?;
+    let mut source_deposit_vault = None;
+    for vault in custody_vaults {
+        match vault.role {
+            CustodyVaultRole::SourceDeposit => {
+                if source_deposit_vault.is_none() {
+                    source_deposit_vault = Some(vault);
+                }
+            }
+            CustodyVaultRole::DestinationExecution => {
+                let Some(asset_id) = vault.asset.clone() else {
+                    continue;
+                };
+                let amount = deps
+                    .custody_action_executor
+                    .custody_vault_balance_raw(&vault)
+                    .await
+                    .map_err(|source| {
+                        custody_action_error("read external custody refund balance", source)
+                    })?;
+                if raw_amount_is_positive(&amount, "external custody refund balance")? {
+                    positions.push(SingleRefundPosition {
+                        position_kind: RecoverablePositionKind::ExternalCustody,
+                        owning_step_id: None,
+                        funding_vault_id: None,
+                        custody_vault_id: Some(vault.id.into()),
+                        asset: DepositAsset {
+                            chain: vault.chain,
+                            asset: asset_id,
+                        },
+                        amount: RawAmount::new(amount).map_err(|source| {
+                            amount_parse_error("external custody refund balance", source)
+                        })?,
+                        hyperliquid_coin: None,
+                        hyperliquid_canonical: None,
+                    });
+                }
+            }
+            CustodyVaultRole::HyperliquidSpot => {
+                positions.extend(
+                    hyperliquid_spot_refund_positions_for_vault(deps, &order, &vault, None).await?,
+                );
+            }
+        }
+    }
+
+    if let Some(source_deposit_vault) = source_deposit_vault {
+        positions.extend(
+            hyperliquid_spot_refund_positions_for_vault(
+                deps,
+                &order,
+                &source_deposit_vault,
+                Some(order.source_asset.clone()),
+            )
+            .await?,
+        );
+    }
+
+    Ok(refund_position_discovery_from_positions(
+        input.order_id.inner(),
+        positions,
+    ))
+}
+
+async fn hyperliquid_spot_refund_positions_for_vault(
+    deps: &OrderActivityDeps,
+    order: &RouterOrder,
+    vault: &CustodyVault,
+    position_asset: Option<DepositAsset>,
+) -> Result<Vec<SingleRefundPosition>, OrderActivityError> {
+    let balances = deps
+        .custody_action_executor
+        .inspect_hyperliquid_spot_balances(vault)
+        .await
+        .map_err(|source| {
+            custody_action_error("inspect hyperliquid spot refund balances", source)
+        })?;
+    let registry = deps.action_providers.asset_registry();
+    let mut positions = Vec::new();
+    for balance in balances {
+        let Some((canonical, registered_asset)) =
+            registry.hyperliquid_coin_asset(&balance.coin, Some(&order.source_asset.chain))
+        else {
+            continue;
+        };
+        let decimals = registry
+            .chain_asset(&registered_asset)
+            .ok_or_else(|| {
+                refund_discovery_error(format!(
+                    "missing registered decimals for Hyperliquid refund asset {} {}",
+                    registered_asset.chain, registered_asset.asset
+                ))
+            })?
+            .decimals;
+        let Some(amount) =
+            hyperliquid_refund_balance_amount_raw(&balance.total, &balance.hold, decimals)?
+        else {
+            continue;
+        };
+        positions.push(SingleRefundPosition {
+            position_kind: RecoverablePositionKind::HyperliquidSpot,
+            owning_step_id: None,
+            funding_vault_id: None,
+            custody_vault_id: Some(vault.id.into()),
+            asset: position_asset.clone().unwrap_or(registered_asset),
+            amount: RawAmount::new(amount)
+                .map_err(|source| amount_parse_error("hyperliquid spot refund balance", source))?,
+            hyperliquid_coin: Some(balance.coin),
+            hyperliquid_canonical: Some(canonical),
+        });
+    }
+    Ok(positions)
 }
 
 pub(super) fn refund_position_discovery_from_positions(
