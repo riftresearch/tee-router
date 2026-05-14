@@ -6609,6 +6609,14 @@ struct UnitOperationObservation {
     source_tx_hash: Option<String>,
 }
 
+struct MockHyperunitDepositCredit {
+    user: Address,
+    coin: &'static str,
+    spot_amount: f64,
+    ledger_amount: String,
+    tx_hash: String,
+}
+
 struct MockUnitEvmWithdrawalRelease {
     protocol_address: String,
     dst_chain: UnitChain,
@@ -6726,7 +6734,7 @@ async fn complete_mock_unit_operation_with_observation(
                     )
                 })?;
                 let coin = hyperliquid_coin_for_unit_asset(entry.asset);
-                let net_amount = net_hyperunit_credit_amount(
+                let net_amount = net_hyperunit_credit_amounts(
                     entry.asset,
                     entry
                         .operation
@@ -6736,12 +6744,13 @@ async fn complete_mock_unit_operation_with_observation(
                     entry.operation.destination_fee_amount.as_deref(),
                     entry.operation.sweep_fee_amount.as_deref(),
                 )?;
-                Some((
+                Some(MockHyperunitDepositCredit {
                     user,
                     coin,
-                    net_amount,
-                    entry.operation.source_tx_hash.clone().unwrap_or_default(),
-                ))
+                    spot_amount: net_amount.spot_amount,
+                    ledger_amount: net_amount.ledger_amount,
+                    tx_hash: entry.operation.source_tx_hash.clone().unwrap_or_default(),
+                })
             }
             _ => None,
         };
@@ -6788,17 +6797,17 @@ async fn complete_mock_unit_operation_with_observation(
         )
     };
 
-    if let Some((user, coin, amount, tx_hash)) = maybe_deposit_credit {
-        if amount > 0.0 {
+    if let Some(credit) = maybe_deposit_credit {
+        if credit.spot_amount > 0.0 {
             let mut hl = state.hyperliquid.lock().await;
-            hl.credit_spot(user, coin, amount);
+            hl.credit_spot(credit.user, credit.coin, credit.spot_amount);
             hl.record_ledger_update(
-                user,
+                credit.user,
                 UserNonFundingLedgerUpdate {
                     time: Utc::now().timestamp_millis().max(0) as u64,
-                    hash: tx_hash,
+                    hash: credit.tx_hash,
                     delta: UserNonFundingLedgerDelta::Deposit {
-                        usdc: format_hl_amount(amount),
+                        usdc: credit.ledger_amount,
                     },
                 },
             );
@@ -7216,23 +7225,54 @@ fn default_mock_unit_fee_amounts() -> (String, String) {
     ("0".to_string(), "0".to_string())
 }
 
+struct MockHyperunitCreditAmounts {
+    spot_amount: f64,
+    ledger_amount: String,
+}
+
+fn net_hyperunit_credit_amounts(
+    asset: UnitAsset,
+    source_amount: &str,
+    destination_fee_amount: Option<&str>,
+    sweep_fee_amount: Option<&str>,
+) -> Result<MockHyperunitCreditAmounts, String> {
+    let net_raw =
+        net_hyperunit_credit_raw(source_amount, destination_fee_amount, sweep_fee_amount)?;
+    let ledger_amount = net_hyperunit_credit_amount(
+        asset,
+        source_amount,
+        destination_fee_amount,
+        sweep_fee_amount,
+    )?;
+    Ok(MockHyperunitCreditAmounts {
+        spot_amount: scaled_raw_to_f64(net_raw, unit_asset_decimals(asset)),
+        ledger_amount,
+    })
+}
+
 fn net_hyperunit_credit_amount(
     asset: UnitAsset,
     source_amount: &str,
     destination_fee_amount: Option<&str>,
     sweep_fee_amount: Option<&str>,
-) -> Result<f64, String> {
-    let decimals = match asset {
-        UnitAsset::Btc => 8,
-        UnitAsset::Eth => 18,
-        _ => 18,
-    };
-    let source_amount = parse_required_scaled_decimal(source_amount, decimals, "source_amount")?;
+) -> Result<String, String> {
+    let net_raw =
+        net_hyperunit_credit_raw(source_amount, destination_fee_amount, sweep_fee_amount)?;
+    Ok(hyperunit_credit_amount_from_raw(asset, net_raw))
+}
+
+fn net_hyperunit_credit_raw(
+    source_amount: &str,
+    destination_fee_amount: Option<&str>,
+    sweep_fee_amount: Option<&str>,
+) -> Result<u128, String> {
+    let source_amount = parse_required_raw_amount(source_amount, "source_amount")?;
     let destination_fee_amount =
-        parse_optional_scaled_decimal(destination_fee_amount, decimals, "destination_fee_amount")?;
-    let sweep_fee_amount =
-        parse_optional_scaled_decimal(sweep_fee_amount, decimals, "sweep_fee_amount")?;
-    Ok((source_amount - destination_fee_amount - sweep_fee_amount).max(0.0))
+        parse_optional_raw_amount(destination_fee_amount, "destination_fee_amount")?;
+    let sweep_fee_amount = parse_optional_raw_amount(sweep_fee_amount, "sweep_fee_amount")?;
+    Ok(source_amount
+        .saturating_sub(destination_fee_amount)
+        .saturating_sub(sweep_fee_amount))
 }
 
 fn unit_asset_decimals(asset: UnitAsset) -> u8 {
@@ -7243,26 +7283,136 @@ fn unit_asset_decimals(asset: UnitAsset) -> u8 {
     }
 }
 
-fn parse_optional_scaled_decimal(
-    value: Option<&str>,
-    decimals: u32,
-    field: &'static str,
-) -> Result<f64, String> {
-    let Some(value) = value else {
-        return Ok(0.0);
-    };
-    parse_required_scaled_decimal(value, decimals, field)
+fn hyperunit_credit_amount_from_raw(asset: UnitAsset, raw: u128) -> String {
+    let decimal = raw_to_decimal(raw, unit_asset_decimals(asset));
+    round_decimal_half_to_even(
+        &decimal,
+        usize::from(hyperliquid_client::wire::WIRE_DECIMALS),
+    )
 }
 
-fn parse_required_scaled_decimal(
-    value: &str,
-    decimals: u32,
-    field: &'static str,
-) -> Result<f64, String> {
-    let raw = value
-        .parse::<f64>()
-        .map_err(|err| format!("mock Unit {field} {value:?} is not numeric: {err}"))?;
-    Ok(raw / 10f64.powi(decimals as i32))
+fn scaled_raw_to_f64(raw: u128, decimals: u8) -> f64 {
+    raw as f64 / 10_f64.powi(i32::from(decimals))
+}
+
+fn parse_optional_raw_amount(value: Option<&str>, field: &'static str) -> Result<u128, String> {
+    let Some(value) = value else {
+        return Ok(0);
+    };
+    parse_required_raw_amount(value, field)
+}
+
+fn parse_required_raw_amount(value: &str, field: &'static str) -> Result<u128, String> {
+    value
+        .parse::<u128>()
+        .map_err(|err| format!("mock Unit {field} {value:?} is not a raw integer amount: {err}"))
+}
+
+fn raw_to_decimal(raw: u128, decimals: u8) -> String {
+    let mut raw = raw.to_string();
+    let decimals = usize::from(decimals);
+    if decimals == 0 {
+        return raw;
+    }
+    if raw.len() <= decimals {
+        let mut padded = "0".repeat(decimals + 1 - raw.len());
+        padded.push_str(&raw);
+        raw = padded;
+    }
+    let split = raw.len() - decimals;
+    let whole = &raw[..split];
+    let fraction = raw[split..].trim_end_matches('0');
+    if fraction.is_empty() {
+        whole.to_string()
+    } else {
+        format!("{whole}.{fraction}")
+    }
+}
+
+fn round_decimal_half_to_even(value: &str, max_fraction: usize) -> String {
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return value.to_string();
+    }
+    if fraction.len() <= max_fraction {
+        return trim_decimal_fraction(value);
+    }
+
+    let (keep, drop) = fraction.split_at(max_fraction);
+    let first_drop = drop.as_bytes()[0];
+    let rest_drop = &drop[1..];
+    let round_up = match first_drop {
+        b'0'..=b'4' => false,
+        b'6'..=b'9' => true,
+        b'5' => {
+            if rest_drop.bytes().all(|byte| byte == b'0') {
+                let last_keep_digit = keep
+                    .bytes()
+                    .next_back()
+                    .or_else(|| whole.bytes().next_back())
+                    .unwrap_or(b'0')
+                    - b'0';
+                last_keep_digit % 2 == 1
+            } else {
+                true
+            }
+        }
+        _ => return value.to_string(),
+    };
+
+    let rounded = if round_up {
+        increment_decimal_string(whole, keep)
+    } else if keep.is_empty() {
+        whole.to_string()
+    } else {
+        format!("{whole}.{keep}")
+    };
+    trim_decimal_fraction(&rounded)
+}
+
+fn increment_decimal_string(whole: &str, fraction: &str) -> String {
+    let mut digits = whole.bytes().chain(fraction.bytes()).collect::<Vec<u8>>();
+    let mut carry = 1;
+    for digit in digits.iter_mut().rev() {
+        if carry == 0 {
+            break;
+        }
+        let value = (*digit - b'0') + carry;
+        *digit = b'0' + (value % 10);
+        carry = value / 10;
+    }
+    if carry > 0 {
+        digits.insert(0, b'0' + carry);
+    }
+
+    let whole_len = whole.len() + usize::from(carry > 0);
+    let new_whole = std::str::from_utf8(&digits[..whole_len]).unwrap_or("");
+    let new_fraction = std::str::from_utf8(&digits[whole_len..]).unwrap_or("");
+    if new_fraction.is_empty() {
+        new_whole.to_string()
+    } else {
+        format!("{new_whole}.{new_fraction}")
+    }
+}
+
+fn trim_decimal_fraction(value: &str) -> String {
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    if fraction.is_empty() {
+        return if whole.is_empty() {
+            "0".to_string()
+        } else {
+            whole.to_string()
+        };
+    }
+    let fraction = fraction.trim_end_matches('0');
+    if fraction.is_empty() {
+        whole.to_string()
+    } else {
+        format!("{whole}.{fraction}")
+    }
 }
 
 fn hyperliquid_coin_for_unit_asset(asset: UnitAsset) -> &'static str {
@@ -7671,6 +7821,92 @@ mod tests {
     #[test]
     fn spot_balance_formatting_rounds_float_dust_up_to_token_precision() {
         assert_eq!(format_hl_token_amount(0.068_2, 18), "0.0682");
+    }
+
+    #[test]
+    fn mock_credit_amount_rounds_like_sauron_edge_cases() {
+        struct Case {
+            asset: UnitAsset,
+            source_amount: &'static str,
+            destination_fee_amount: Option<&'static str>,
+            sweep_fee_amount: Option<&'static str>,
+            expected: &'static str,
+        }
+
+        let cases = [
+            Case {
+                asset: UnitAsset::Eth,
+                source_amount: "69613175000000000",
+                destination_fee_amount: None,
+                sweep_fee_amount: None,
+                expected: "0.06961318",
+            },
+            Case {
+                asset: UnitAsset::Eth,
+                source_amount: "57507271000000000",
+                destination_fee_amount: None,
+                sweep_fee_amount: None,
+                expected: "0.05750727",
+            },
+            Case {
+                asset: UnitAsset::Eth,
+                source_amount: "77158107666666666",
+                destination_fee_amount: None,
+                sweep_fee_amount: None,
+                expected: "0.07715811",
+            },
+            Case {
+                asset: UnitAsset::Btc,
+                source_amount: "12345678",
+                destination_fee_amount: None,
+                sweep_fee_amount: None,
+                expected: "0.12345678",
+            },
+            Case {
+                asset: UnitAsset::Eth,
+                source_amount: "5000000000",
+                destination_fee_amount: None,
+                sweep_fee_amount: None,
+                expected: "0",
+            },
+            Case {
+                asset: UnitAsset::Eth,
+                source_amount: "15000000000",
+                destination_fee_amount: None,
+                sweep_fee_amount: None,
+                expected: "0.00000002",
+            },
+            Case {
+                asset: UnitAsset::Eth,
+                source_amount: "69613176000000000",
+                destination_fee_amount: Some("1000000000"),
+                sweep_fee_amount: None,
+                expected: "0.06961318",
+            },
+            Case {
+                asset: UnitAsset::Eth,
+                source_amount: "1000",
+                destination_fee_amount: Some("600"),
+                sweep_fee_amount: Some("500"),
+                expected: "0",
+            },
+        ];
+
+        for case in cases {
+            assert_eq!(
+                net_hyperunit_credit_amount(
+                    case.asset,
+                    case.source_amount,
+                    case.destination_fee_amount,
+                    case.sweep_fee_amount
+                )
+                .as_deref(),
+                Ok(case.expected),
+                "unexpected rounded credit for {:?} source_amount={}",
+                case.asset,
+                case.source_amount
+            );
+        }
     }
 
     #[test]
@@ -8868,6 +9104,46 @@ mod tests {
             error.contains("source_amount evidence"),
             "unexpected error: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn mock_credit_amount_matches_sauron_expectation() {
+        let server = MockIntegratorServer::spawn().await.expect("spawn");
+        let user = Address::repeat_byte(0x33);
+        let generated: UnitGenerateAddressResponse = reqwest::get(format!(
+            "{}/gen/ethereum/hyperliquid/eth/{user:#x}",
+            server.base_url()
+        ))
+        .await
+        .expect("gen")
+        .error_for_status()
+        .expect("gen 200")
+        .json()
+        .await
+        .expect("gen json");
+
+        complete_mock_unit_operation_with_observation(
+            &server.state,
+            &generated.address,
+            Some(UnitOperationObservation {
+                source_amount: "69613175000000000".to_string(),
+                source_tx_hash: Some("0xunitdepositprecision".to_string()),
+            }),
+        )
+        .await
+        .expect("complete unit deposit");
+
+        let hl = server.state.hyperliquid.lock().await;
+        let updates = hl.ledger_updates.get(&user).expect("ledger updates");
+        let amount = updates
+            .iter()
+            .find_map(|update| match &update.delta {
+                UserNonFundingLedgerDelta::Deposit { usdc } => Some(usdc.as_str()),
+                _ => None,
+            })
+            .expect("deposit ledger update");
+
+        assert_eq!(amount, "0.06961318");
     }
 
     #[tokio::test]
