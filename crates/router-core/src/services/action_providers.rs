@@ -1656,7 +1656,7 @@ impl UnitProvider for HyperUnitProvider {
                         operation_type: ProviderOperationType::UnitDeposit,
                         status: ProviderOperationStatus::Submitted,
                         provider_ref: Some(protocol_address.clone()),
-                        idempotency_key: None,
+                        idempotency_key: step.idempotency_key.clone(),
                         request: Some(operation_request),
                         response: Some(gen_response_json),
                         observed_state: None,
@@ -3407,6 +3407,8 @@ pub struct UnitDepositStepRequest {
     pub source_custody_vault_id: Option<Uuid>,
     #[serde(default)]
     pub hyperliquid_custody_vault_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 impl UnitDepositStepRequest {

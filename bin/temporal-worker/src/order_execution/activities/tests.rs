@@ -10,7 +10,7 @@ use router_core::{
         RouterOrderStatus, RouterOrderType,
     },
     services::{
-        action_providers::{ExchangeProvider, ProviderFuture, UnitProvider},
+        action_providers::{ExchangeProvider, ProviderAddressIntent, ProviderFuture, UnitProvider},
         asset_registry::{AssetSlot, RequiredCustodyRole},
         custody_action_executor::{
             ChainCall, HyperliquidCall, HyperliquidCallNetwork, HyperliquidCallPayload,
@@ -78,6 +78,108 @@ impl UnitProvider for TestUnitProvider {
         Box::pin(async {
             Ok(ProviderExecutionIntent::ProviderOnly {
                 response: json!({ "kind": "test_unit_withdrawal" }),
+                state: ProviderExecutionState::default(),
+            })
+        })
+    }
+}
+
+struct CountingUnitDepositProvider {
+    gen_calls: Arc<AtomicUsize>,
+    transfer_actions_built: Arc<AtomicUsize>,
+}
+
+impl CountingUnitDepositProvider {
+    fn new() -> (Self, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let gen_calls = Arc::new(AtomicUsize::new(0));
+        let transfer_actions_built = Arc::new(AtomicUsize::new(0));
+        (
+            Self {
+                gen_calls: gen_calls.clone(),
+                transfer_actions_built: transfer_actions_built.clone(),
+            },
+            gen_calls,
+            transfer_actions_built,
+        )
+    }
+}
+
+impl UnitProvider for CountingUnitDepositProvider {
+    fn id(&self) -> &str {
+        ProviderId::Unit.as_str()
+    }
+
+    fn supports_deposit(&self, _asset: &DepositAsset) -> bool {
+        true
+    }
+
+    fn supports_withdrawal(&self, _asset: &DepositAsset) -> bool {
+        true
+    }
+
+    fn execute_deposit<'a>(
+        &'a self,
+        request: &'a UnitDepositStepRequest,
+    ) -> ProviderFuture<'a, ProviderExecutionIntent> {
+        let gen_calls = self.gen_calls.clone();
+        let transfer_actions_built = self.transfer_actions_built.clone();
+        Box::pin(async move {
+            let gen_call = gen_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let protocol_address = format!("0x{gen_call:040x}");
+            let custody_vault_id = request
+                .source_custody_vault_id
+                .ok_or_else(|| "test deposit missing custody vault id".to_string())?;
+            let src_chain_id = ChainId::parse(&request.src_chain_id)
+                .map_err(|err| format!("invalid test deposit src_chain_id: {err}"))?;
+            let source_asset_id = AssetId::parse(&request.asset_id)
+                .map_err(|err| format!("invalid test deposit asset_id: {err}"))?;
+            transfer_actions_built.fetch_add(1, Ordering::SeqCst);
+            let operation_request = json!({
+                "protocol_address": protocol_address,
+                "amount": request.amount,
+            });
+            Ok(ProviderExecutionIntent::CustodyActions {
+                custody_vault_id,
+                actions: vec![CustodyAction::Transfer {
+                    to_address: protocol_address.clone(),
+                    amount: request.amount.clone(),
+                    bitcoin_fee_budget_sats: None,
+                }],
+                provider_context: operation_request.clone(),
+                state: ProviderExecutionState {
+                    operation: Some(ProviderOperationIntent {
+                        operation_type: ProviderOperationType::UnitDeposit,
+                        status: ProviderOperationStatus::Submitted,
+                        provider_ref: Some(protocol_address.clone()),
+                        idempotency_key: request.idempotency_key.clone(),
+                        request: Some(operation_request),
+                        response: Some(json!({
+                            "kind": "test_hyperunit_gen_response",
+                            "call": gen_call,
+                        })),
+                        observed_state: None,
+                    }),
+                    addresses: vec![ProviderAddressIntent {
+                        role: ProviderAddressRole::UnitDeposit,
+                        chain: src_chain_id,
+                        asset: Some(source_asset_id),
+                        address: protocol_address,
+                        memo: None,
+                        expires_at: None,
+                        metadata: None,
+                    }],
+                },
+            })
+        })
+    }
+
+    fn execute_withdrawal<'a>(
+        &'a self,
+        _request: &'a UnitWithdrawalStepRequest,
+    ) -> ProviderFuture<'a, ProviderExecutionIntent> {
+        Box::pin(async {
+            Ok(ProviderExecutionIntent::ProviderOnly {
+                response: json!({ "kind": "counting_unit_withdrawal" }),
                 state: ProviderExecutionState::default(),
             })
         })
@@ -709,6 +811,155 @@ async fn unit_withdrawal_retry_does_not_resend_hyperliquid_send_asset() {
     assert_eq!(
         send_asset_calls, 1,
         "unit_withdrawal retry must observe the existing operation instead of firing sendAsset again"
+    );
+}
+
+#[tokio::test]
+async fn unit_deposit_first_attempt_persists_idempotency_key_and_transfer_action() {
+    let test_db = test_database().await;
+    let vault_id = Uuid::now_v7();
+    let (first_step, _) =
+        seed_unit_deposit_retry_steps(&test_db.db, &test_db.pool, vault_id, vault_id).await;
+    let (deps, gen_calls, transfer_actions_built) =
+        unit_deposit_idempotency_test_deps(test_db.db.clone());
+    let expected_key = unit_deposit_expected_idempotency_key(&first_step, vault_id);
+    let expected_protocol_address = "0x0000000000000000000000000000000000000001";
+
+    let result = execute_unit_deposit_step(&deps, &first_step)
+        .await
+        .expect("execute first unit deposit dispatch");
+
+    assert_eq!(gen_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(transfer_actions_built.load(Ordering::SeqCst), 1);
+    let StepDispatchResult::ProviderIntent(ProviderExecutionIntent::CustodyActions {
+        actions,
+        state,
+        ..
+    }) = result
+    else {
+        panic!("first unit_deposit dispatch should return a custody transfer intent");
+    };
+    assert_eq!(actions.len(), 1);
+    let CustodyAction::Transfer {
+        to_address,
+        amount,
+        bitcoin_fee_budget_sats,
+    } = &actions[0]
+    else {
+        panic!("unit_deposit should build a transfer action");
+    };
+    assert_eq!(to_address, expected_protocol_address);
+    assert_eq!(amount, "100");
+    assert_eq!(bitcoin_fee_budget_sats, &None);
+    let operation_intent = state
+        .operation
+        .as_ref()
+        .expect("unit_deposit intent should carry provider operation");
+    assert_eq!(
+        operation_intent.idempotency_key.as_deref(),
+        Some(expected_key.as_str())
+    );
+
+    let operation = load_unit_deposit_operation(&test_db.db, &expected_key).await;
+    assert_eq!(
+        operation.idempotency_key.as_deref(),
+        Some(expected_key.as_str())
+    );
+    assert_eq!(
+        operation.provider_ref.as_deref(),
+        Some(expected_protocol_address)
+    );
+    let addresses = test_db
+        .db
+        .orders()
+        .get_provider_addresses_by_operation(operation.id)
+        .await
+        .expect("load unit deposit provider addresses");
+    assert_eq!(addresses.len(), 1);
+    assert_eq!(addresses[0].role, ProviderAddressRole::UnitDeposit);
+    assert_eq!(addresses[0].address, expected_protocol_address);
+}
+
+#[tokio::test]
+async fn unit_deposit_retry_reuses_existing_protocol_address_without_second_gen_or_transfer() {
+    let test_db = test_database().await;
+    let vault_id = Uuid::now_v7();
+    let (first_step, retry_step) =
+        seed_unit_deposit_retry_steps(&test_db.db, &test_db.pool, vault_id, vault_id).await;
+    let (deps, gen_calls, transfer_actions_built) =
+        unit_deposit_idempotency_test_deps(test_db.db.clone());
+    let expected_key = unit_deposit_expected_idempotency_key(&first_step, vault_id);
+
+    execute_unit_deposit_step(&deps, &first_step)
+        .await
+        .expect("execute first unit deposit dispatch");
+    let first_operation = load_unit_deposit_operation(&test_db.db, &expected_key).await;
+
+    let retry_result = execute_unit_deposit_step(&deps, &retry_step)
+        .await
+        .expect("execute retry unit deposit dispatch");
+
+    assert_eq!(
+        gen_calls.load(Ordering::SeqCst),
+        1,
+        "unit_deposit retry must not call HyperUnit /gen after a prior attempt persisted the protocol address"
+    );
+    assert_eq!(
+        transfer_actions_built.load(Ordering::SeqCst),
+        1,
+        "unit_deposit retry must observe the existing operation instead of building a second transfer"
+    );
+    let StepDispatchResult::Complete(completion) = retry_result else {
+        panic!("retry unit_deposit dispatch should reuse the existing provider operation");
+    };
+    assert_eq!(
+        completion.response.get("kind").and_then(Value::as_str),
+        Some("unit_deposit_idempotency_reuse")
+    );
+    assert_eq!(completion.outcome, StepExecutionOutcome::Waiting);
+    let retry_operation = completion
+        .provider_state
+        .operation
+        .expect("retry completion should carry provider operation state");
+    assert_eq!(retry_operation.provider_ref, first_operation.provider_ref);
+    assert_eq!(
+        retry_operation.idempotency_key.as_deref(),
+        Some(expected_key.as_str())
+    );
+}
+
+#[tokio::test]
+async fn unit_deposit_different_source_vaults_use_different_idempotency_keys() {
+    let test_db = test_database().await;
+    let first_vault_id = Uuid::now_v7();
+    let second_vault_id = Uuid::now_v7();
+    let (first_step, second_step) =
+        seed_unit_deposit_retry_steps(&test_db.db, &test_db.pool, first_vault_id, second_vault_id)
+            .await;
+    let (deps, gen_calls, transfer_actions_built) =
+        unit_deposit_idempotency_test_deps(test_db.db.clone());
+    let first_key = unit_deposit_expected_idempotency_key(&first_step, first_vault_id);
+    let second_key = unit_deposit_expected_idempotency_key(&second_step, second_vault_id);
+
+    execute_unit_deposit_step(&deps, &first_step)
+        .await
+        .expect("execute first unit deposit dispatch");
+    execute_unit_deposit_step(&deps, &second_step)
+        .await
+        .expect("execute second unit deposit dispatch");
+
+    assert_ne!(first_key, second_key);
+    assert_eq!(gen_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(transfer_actions_built.load(Ordering::SeqCst), 2);
+    let first_operation = load_unit_deposit_operation(&test_db.db, &first_key).await;
+    let second_operation = load_unit_deposit_operation(&test_db.db, &second_key).await;
+    assert_eq!(
+        first_operation.provider_ref.as_deref(),
+        Some("0x0000000000000000000000000000000000000001")
+    );
+    assert_eq!(
+        second_operation.provider_ref.as_deref(),
+        Some("0x0000000000000000000000000000000000000002")
     );
 }
 
@@ -2480,6 +2731,289 @@ async fn seed_running_step(
         attempt_id,
         step_id,
     }
+}
+
+fn unit_deposit_idempotency_test_deps(
+    db: Database,
+) -> (OrderActivityDeps, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    let (unit_provider, gen_calls, transfer_actions_built) = CountingUnitDepositProvider::new();
+    let action_providers = Arc::new(ActionProviderRegistry::new(
+        vec![],
+        vec![Arc::new(unit_provider)],
+        vec![],
+    ));
+    let deps = test_deps_with_action_providers(db, action_providers, None);
+    (deps, gen_calls, transfer_actions_built)
+}
+
+fn unit_deposit_expected_idempotency_key(step: &OrderExecutionStep, vault_id: Uuid) -> String {
+    format!(
+        "order:{}:unit_deposit:step:{}:source_custody_vault:{}",
+        step.order_id, step.step_index, vault_id
+    )
+}
+
+async fn load_unit_deposit_operation(
+    db: &Database,
+    idempotency_key: &str,
+) -> OrderProviderOperation {
+    db.orders()
+        .get_provider_operation_by_idempotency_key(
+            ProviderId::Unit.as_str(),
+            ProviderOperationType::UnitDeposit,
+            idempotency_key,
+        )
+        .await
+        .expect("load unit deposit operation by idempotency key")
+        .expect("unit deposit operation should exist")
+}
+
+async fn seed_unit_deposit_retry_steps(
+    db: &Database,
+    pool: &PgPool,
+    first_vault_id: Uuid,
+    retry_vault_id: Uuid,
+) -> (OrderExecutionStep, OrderExecutionStep) {
+    let order_id = Uuid::now_v7();
+    let first_attempt_id = Uuid::now_v7();
+    let retry_attempt_id = Uuid::now_v7();
+    let first_leg_id = Uuid::now_v7();
+    let retry_leg_id = Uuid::now_v7();
+    let first_step_id = Uuid::now_v7();
+    let retry_step_id = Uuid::now_v7();
+    let now = Utc::now();
+    let trace_id = order_id.simple().to_string();
+    let parent_span_id = trace_id[..16].to_string();
+
+    sqlx_core::query::query(
+        r#"
+            INSERT INTO router_orders (
+                id,
+                order_type,
+                status,
+                source_chain_id,
+                source_asset_id,
+                destination_chain_id,
+                destination_asset_id,
+                recipient_address,
+                refund_address,
+                action_timeout_at,
+                workflow_trace_id,
+                workflow_parent_span_id,
+                created_at,
+                updated_at
+            )
+            VALUES (
+                $1, 'market_order', 'executing', 'evm:8453', 'native',
+                'hyperliquid', 'UETH', $2, $3, $4, $5, $6, $7, $7
+            )
+            "#,
+    )
+    .bind(order_id)
+    .bind(test_address(5))
+    .bind(test_address(6))
+    .bind(now + chrono::Duration::hours(1))
+    .bind(trace_id)
+    .bind(parent_span_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert unit deposit test order");
+
+    sqlx_core::query::query(
+        r#"
+            INSERT INTO market_order_actions (
+                order_id,
+                order_kind,
+                amount_in,
+                min_amount_out,
+                amount_out,
+                max_amount_in,
+                created_at,
+                updated_at,
+                slippage_bps
+            )
+            VALUES ($1, 'exact_in', '100', '1', NULL, NULL, $2, $2, 100)
+            "#,
+    )
+    .bind(order_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert unit deposit test market action");
+
+    for (attempt_id, attempt_index, attempt_kind, status) in [
+        (
+            first_attempt_id,
+            1_i32,
+            OrderExecutionAttemptKind::PrimaryExecution,
+            OrderExecutionAttemptStatus::Superseded,
+        ),
+        (
+            retry_attempt_id,
+            2_i32,
+            OrderExecutionAttemptKind::RetryExecution,
+            OrderExecutionAttemptStatus::Active,
+        ),
+    ] {
+        sqlx_core::query::query(
+            r#"
+                INSERT INTO order_execution_attempts (
+                    id,
+                    order_id,
+                    attempt_index,
+                    attempt_kind,
+                    status,
+                    trigger_step_id,
+                    failure_reason_json,
+                    input_custody_snapshot_json,
+                    created_at,
+                    updated_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, '{}'::jsonb, '{}'::jsonb, $7, $7)
+                "#,
+        )
+        .bind(attempt_id)
+        .bind(order_id)
+        .bind(attempt_index)
+        .bind(attempt_kind.to_db_string())
+        .bind(status.to_db_string())
+        .bind(None::<Uuid>)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert unit deposit test attempt");
+    }
+
+    for (attempt_id, leg_id, step_id, vault_id, details) in [
+        (
+            first_attempt_id,
+            first_leg_id,
+            first_step_id,
+            first_vault_id,
+            json!({}),
+        ),
+        (
+            retry_attempt_id,
+            retry_leg_id,
+            retry_step_id,
+            retry_vault_id,
+            json!({
+                "retry_attempt_from_step_id": first_step_id,
+                "retry_attempt_from_attempt_id": first_attempt_id,
+            }),
+        ),
+    ] {
+        sqlx_core::query::query(
+            r#"
+                INSERT INTO order_execution_legs (
+                    id,
+                    order_id,
+                    execution_attempt_id,
+                    transition_decl_id,
+                    leg_index,
+                    leg_type,
+                    provider,
+                    status,
+                    input_chain_id,
+                    input_asset_id,
+                    output_chain_id,
+                    output_asset_id,
+                    amount_in,
+                    expected_amount_out,
+                    min_amount_out,
+                    started_at,
+                    details_json,
+                    usd_valuation_json,
+                    created_at,
+                    updated_at
+                )
+                VALUES (
+                    $1, $2, $3, 'unit-deposit', 5, 'unit_deposit',
+                    'unit', 'running', 'evm:8453', 'native', 'hyperliquid', 'UETH',
+                    '100', '100', '1', $4, $5, '{}'::jsonb, $4, $4
+                )
+                "#,
+        )
+        .bind(leg_id)
+        .bind(order_id)
+        .bind(attempt_id)
+        .bind(now)
+        .bind(details.clone())
+        .execute(pool)
+        .await
+        .expect("insert unit deposit test leg");
+
+        let request = json!({
+            "order_id": order_id,
+            "src_chain_id": "evm:8453",
+            "dst_chain_id": "hyperliquid",
+            "asset_id": "native",
+            "amount": "100",
+            "source_custody_vault_id": vault_id,
+            "hyperliquid_custody_vault_address": test_address(7),
+        });
+        sqlx_core::query::query(
+            r#"
+                INSERT INTO order_execution_steps (
+                    id,
+                    order_id,
+                    execution_attempt_id,
+                    execution_leg_id,
+                    transition_decl_id,
+                    step_index,
+                    step_type,
+                    provider,
+                    status,
+                    input_chain_id,
+                    input_asset_id,
+                    output_chain_id,
+                    output_asset_id,
+                    amount_in,
+                    min_amount_out,
+                    idempotency_key,
+                    attempt_count,
+                    started_at,
+                    details_json,
+                    request_json,
+                    response_json,
+                    error_json,
+                    usd_valuation_json,
+                    created_at,
+                    updated_at
+                )
+                VALUES (
+                    $1, $2, $3, $4, 'unit-deposit', 5, 'unit_deposit',
+                    'unit', 'running', 'evm:8453', 'native', 'hyperliquid', 'UETH',
+                    '100', '1', $5, 1, $6, $7, $8,
+                    '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, $6, $6
+                )
+                "#,
+        )
+        .bind(step_id)
+        .bind(order_id)
+        .bind(attempt_id)
+        .bind(leg_id)
+        .bind(format!("attempt:{attempt_id}:unit-deposit"))
+        .bind(now)
+        .bind(details)
+        .bind(request)
+        .execute(pool)
+        .await
+        .expect("insert unit deposit test step");
+    }
+
+    let first = db
+        .orders()
+        .get_execution_step(first_step_id)
+        .await
+        .expect("load first unit deposit step");
+    let retry = db
+        .orders()
+        .get_execution_step(retry_step_id)
+        .await
+        .expect("load retry unit deposit step");
+    (first, retry)
 }
 
 async fn seed_unit_withdrawal_retry_steps(
