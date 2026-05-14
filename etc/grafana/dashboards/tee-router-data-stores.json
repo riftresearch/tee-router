@@ -53,13 +53,13 @@
     },
     {
       "datasource": {"type": "prometheus", "uid": "victoriametrics"},
-      "description": "Scrape health for every Postgres instance + the data plane services that own them.",
+      "description": "Scrape health for the services that own Postgres instances. (No postgres-exporter is configured yet — when it is, this panel can filter by job=~\".*postgres.*\" directly.)",
       "fieldConfig": {"defaults": {"mappings": [{"options": {"0": {"color": "red", "text": "DOWN"}}, "type": "value"}, {"options": {"1": {"color": "green", "text": "UP"}}, "type": "value"}], "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}, "unit": "none"}},
       "gridPos": {"h": 6, "w": 24, "x": 0, "y": 30},
       "id": 5,
-      "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "value_and_name"},
-      "targets": [{"datasource": {"type": "prometheus", "uid": "victoriametrics"}, "editorMode": "code", "expr": "up{job=~\".*postgres.*|.*db.*\"}", "legendFormat": "{{job}}", "refId": "A"}],
-      "title": "Postgres / DB Scrape Health",
+      "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "center", "orientation": "horizontal", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "value_and_name"},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "victoriametrics"}, "editorMode": "code", "expr": "up{job=~\"router-api|router-worker|sauron|temporal-.*|hl-shim-indexer\"}", "legendFormat": "{{job}}", "refId": "A"}],
+      "title": "DB-owning Service Scrape Health",
       "type": "stat"
     }
   ],

@@ -99,7 +99,7 @@ def panel_p95_latency(panel_id, service_filter, x=0, y=8, w=12, h=8):
         "gridPos": {"h": h, "w": w, "x": x, "y": y},
         "id": panel_id,
         "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": True}, "tooltip": {"mode": "multi", "sort": "desc"}},
-        "targets": [{"datasource": DATASOURCE, "editorMode": "code", "expr": f'histogram_quantile(0.95, sum by (le, endpoint) (rate(tee_router_upstream_request_duration_seconds_bucket{{{service_filter}}}[5m])))', "legendFormat": "{{endpoint}}", "refId": "A"}],
+        "targets": [{"datasource": DATASOURCE, "editorMode": "code", "expr": f'avg by (endpoint) (tee_router_upstream_request_duration_seconds{{{service_filter}, quantile="0.95"}})', "legendFormat": "{{endpoint}}", "refId": "A"}],
         "title": "p95 Latency by Endpoint",
         "type": "timeseries",
     }
@@ -142,9 +142,12 @@ def panel_recent_logs(panel_id, service_filter_lq, x=0, y=16, w=24, h=10):
     }
 
 
-def build_dashboard(title, uid, service_label_value, scrape_job=None, with_logs=True, templating=None):
+def build_dashboard(title, uid, service_label_value, scrape_filter=None, loki_service_name=None, templating=None):
+    """`scrape_filter` is a raw label-matcher string for the up{} query, e.g.
+    `job="bitcoin-indexer"` or `job=~"evm-token-indexer.*"`. If omitted, falls back
+    to the upstream service filter."""
     service_filter = f'service="{service_label_value}"'
-    scrape_filter = f'job="{scrape_job}"' if scrape_job else service_filter
+    scrape_filter = scrape_filter or service_filter
     panels = [
         panel_up(1, scrape_filter),
         panel_request_rate(2, service_filter),
@@ -152,8 +155,8 @@ def build_dashboard(title, uid, service_label_value, scrape_job=None, with_logs=
         panel_p95_latency(4, service_filter),
         panel_success_ratio(5, service_filter),
     ]
-    if with_logs:
-        panels.append(panel_recent_logs(6, f'service_name="{service_label_value}"'))
+    if loki_service_name:
+        panels.append(panel_recent_logs(6, f'service_name="{loki_service_name}"'))
     dashboard = {
         "annotations": {"list": [{"builtIn": 1, "datasource": {"type": "grafana", "uid": "-- Grafana --"}, "enable": True, "hide": True, "iconColor": "rgba(0, 211, 255, 1)", "name": "Annotations & Alerts", "type": "dashboard"}]},
         "editable": True,
@@ -201,24 +204,24 @@ def evm_receipt_watcher_dashboard():
         title="Tee Router — EVM Receipt Watcher",
         uid="tee-router-evm-receipt-watcher",
         service_label_value="evm_receipt_watcher",
-        scrape_job="evm-receipt-watcher-$chain",
-        with_logs=True,
+        scrape_filter='job="evm-receipt-watcher-$chain"',
         templating=[chain_var],
     )
 
 
 DASHBOARDS = [
-    ("Tee Router — Bitcoin Indexer", "tee-router-bitcoin-indexer", "bitcoin_indexer", "bitcoin-indexer"),
-    ("Tee Router — Bitcoin Receipt Watcher", "tee-router-bitcoin-receipt-watcher", "bitcoin_receipt_watcher", "bitcoin-receipt-watcher"),
-    ("Tee Router — EVM Token Indexer", "tee-router-evm-token-indexer", "evm_token_indexer", "evm-token-indexer"),
-    ("Tee Router — HL Shim Indexer", "tee-router-hl-shim-indexer", "hl_shim_indexer", "hl-shim-indexer"),
+    ("Tee Router — Bitcoin Indexer", "tee-router-bitcoin-indexer", "bitcoin_indexer", 'job="bitcoin-indexer"'),
+    ("Tee Router — Bitcoin Receipt Watcher", "tee-router-bitcoin-receipt-watcher", "bitcoin_receipt_watcher", 'job="bitcoin-receipt-watcher"'),
+    ("Tee Router — EVM Token Indexer", "tee-router-evm-token-indexer", "evm_token_indexer", 'job=~"evm-token-indexer.*"'),
+    # hl-shim-indexer is hand-written (uses self-emitted metrics, not the upstream pattern)
+    # because hl-shim-client doesn't yet instrument outbound calls.
 ]
 
 
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
-    for title, uid, service, scrape_job in DASHBOARDS:
-        d = build_dashboard(title, uid, service, scrape_job=scrape_job)
+    for title, uid, service, scrape_filter in DASHBOARDS:
+        d = build_dashboard(title, uid, service, scrape_filter=scrape_filter)
         path = OUT / f"{uid}.json"
         path.write_text(json.dumps(d, indent=2) + "\n")
         print(f"wrote {path}")

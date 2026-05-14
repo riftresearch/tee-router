@@ -14,6 +14,14 @@ prometheus.scrape "router" {
     {"__address__" = "temporal-history:9090", "job" = "temporal-history"},
     {"__address__" = "temporal-matching:9090", "job" = "temporal-matching"},
     {"__address__" = "temporal-internal-worker:9090", "job" = "temporal-internal-worker"},
+    {"__address__" = "bitcoin-indexer:8080", "job" = "bitcoin-indexer"},
+    {"__address__" = "bitcoin-receipt-watcher:8080", "job" = "bitcoin-receipt-watcher"},
+    {"__address__" = "evm-receipt-watcher-ethereum:8080", "job" = "evm-receipt-watcher-ethereum"},
+    {"__address__" = "evm-receipt-watcher-base:8080", "job" = "evm-receipt-watcher-base"},
+    {"__address__" = "evm-receipt-watcher-arbitrum:8080", "job" = "evm-receipt-watcher-arbitrum"},
+    {"__address__" = "devnet:50104", "job" = "evm-token-indexer-ethereum"},
+    {"__address__" = "devnet:50105", "job" = "evm-token-indexer-base"},
+    {"__address__" = "devnet:50106", "job" = "evm-token-indexer-arbitrum"},
   ]
 
   scrape_interval = "5s"
