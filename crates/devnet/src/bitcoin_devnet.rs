@@ -23,9 +23,12 @@ use crate::manifest::{
 use crate::{get_new_temp_dir, Result, RiftDevnetCache};
 
 const REGTEST_BLOCK_REWARD_SATS: u64 = 50 * 100_000_000;
-const ESPLORA_LIVENESS_INTERVAL: Duration = Duration::from_secs(5);
-const ESPLORA_LIVENESS_TIMEOUT: Duration = Duration::from_secs(2);
-const ESPLORA_LIVENESS_FAILURE_LIMIT: usize = 3;
+const ESPLORA_LIVENESS_INTERVAL: Duration = Duration::from_secs(15);
+const ESPLORA_LIVENESS_TIMEOUT: Duration = Duration::from_secs(10);
+// Under heavy concurrent BTC ops (10k+ orders) electrs/Esplora can be momentarily
+// unresponsive while indexing. Tolerate that without taking down the whole devnet
+// process — the probe is for early-startup detection, not steady-state SLA.
+const ESPLORA_LIVENESS_FAILURE_LIMIT: usize = 60;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub enum MiningMode {
