@@ -79,7 +79,7 @@ export const orderMarketRoute = createRoute({
   method: 'post',
   path: '/order/market',
   tags: ['Orders'],
-  summary: 'Create an order from a quote',
+  summary: 'Create a market order',
   request: {
     body: {
       required: true,
