@@ -73,7 +73,10 @@ const USD_MICRO: u128 = 1_000_000;
 const DEFAULT_ETH_USD_MICRO: u128 = 3_000 * USD_MICRO;
 const DEFAULT_BTC_USD_MICRO: u128 = 100_000 * USD_MICRO;
 const DEFAULT_USD_STABLE_USD_MICRO: u128 = USD_MICRO;
-const MOCK_UNIT_DESTINATION_TX_CONFIRMATIONS: u64 = 10;
+// Anvil block-mining waits per HU op are pure mock artificial latency. 1 means
+// "single block of finality" — enough that the receipt watcher sees the tx, no
+// fake delay. (Was 10, adding ~20s of pure waiting per order at 10k scale.)
+const MOCK_UNIT_DESTINATION_TX_CONFIRMATIONS: u64 = 1;
 const DEFAULT_MOCK_UNIT_WITHDRAWAL_RELEASE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

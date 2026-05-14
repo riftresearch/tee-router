@@ -170,16 +170,16 @@ fn validate_runtime_config(args: &SauronArgs) -> Result<()> {
         "SAURON_HYPERUNIT_OBSERVER_CONCURRENCY",
     )?;
     validate_positive_seconds(
-        args.sauron_hu_poll_fast_seconds,
-        "SAURON_HU_POLL_FAST_SECONDS",
+        args.sauron_hu_poll_fast_millis,
+        "SAURON_HU_POLL_FAST_MILLIS",
     )?;
     validate_positive_seconds(
-        args.sauron_hu_poll_medium_seconds,
-        "SAURON_HU_POLL_MEDIUM_SECONDS",
+        args.sauron_hu_poll_medium_millis,
+        "SAURON_HU_POLL_MEDIUM_MILLIS",
     )?;
     validate_positive_seconds(
-        args.sauron_hu_poll_slow_seconds,
-        "SAURON_HU_POLL_SLOW_SECONDS",
+        args.sauron_hu_poll_slow_millis,
+        "SAURON_HU_POLL_SLOW_MILLIS",
     )?;
     validate_positive_usize(
         args.sauron_hyperliquid_observer_concurrency,
@@ -451,9 +451,9 @@ fn build_hyperunit_observer_task(
         evm_receipt_clients,
         HyperUnitObserverOptions {
             concurrency_limit: args.sauron_hyperunit_observer_concurrency,
-            poll_fast_interval: Duration::from_secs(args.sauron_hu_poll_fast_seconds),
-            poll_medium_interval: Duration::from_secs(args.sauron_hu_poll_medium_seconds),
-            poll_slow_interval: Duration::from_secs(args.sauron_hu_poll_slow_seconds),
+            poll_fast_interval: Duration::from_millis(args.sauron_hu_poll_fast_millis),
+            poll_medium_interval: Duration::from_millis(args.sauron_hu_poll_medium_millis),
+            poll_slow_interval: Duration::from_millis(args.sauron_hu_poll_slow_millis),
         },
     )))
 }
@@ -846,9 +846,9 @@ mod tests {
             hyperunit_proxy_url: None,
             sauron_hl_bridge_match_window_seconds: 1_800,
             sauron_hyperunit_observer_concurrency: 64,
-            sauron_hu_poll_fast_seconds: 5,
-            sauron_hu_poll_medium_seconds: 10,
-            sauron_hu_poll_slow_seconds: 20,
+            sauron_hu_poll_fast_millis: 5_000,
+            sauron_hu_poll_medium_millis: 10_000,
+            sauron_hu_poll_slow_millis: 20_000,
             sauron_hyperliquid_observer_concurrency: 128,
             sauron_evm_receipt_observer_concurrency: 128,
             token_indexer_api_key: None,
