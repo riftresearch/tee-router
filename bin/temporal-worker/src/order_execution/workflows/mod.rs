@@ -37,10 +37,12 @@ use super::types::{
 };
 use crate::telemetry;
 
-const PROVIDER_HINT_WAIT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-// Activity tasks can sit in Temporal matching for several minutes during burst load.
-// Keep this timer long enough that queue dispatch lag does not look like a stuck step.
-const STALE_RUNNING_STEP_RECOVERY_AFTER: Duration = Duration::from_secs(20 * 60);
+const PROVIDER_HINT_WAIT_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+// Activity tasks can sit in Temporal matching for tens of minutes during 10k+ order
+// bursts. Keep this timer long enough that queue dispatch lag does not look like a
+// stuck step. Honest "activity actually hung" cases will still surface, just with a
+// longer detection window.
+const STALE_RUNNING_STEP_RECOVERY_AFTER: Duration = Duration::from_secs(2 * 60 * 60);
 const EXECUTE_STEP_START_TO_CLOSE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const QUOTE_REFRESH_WORKFLOW_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 const MANUAL_INTERVENTION_WAIT_TIMEOUT: Duration = Duration::from_secs(30 * 24 * 60 * 60);
