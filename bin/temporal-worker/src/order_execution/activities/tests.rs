@@ -1472,6 +1472,69 @@ async fn hyperliquid_spot_refund_plan_to_bitcoin_is_quotable_and_materialized() 
 }
 
 #[test]
+fn refund_position_discovery_zero_positions_is_untenable() {
+    let discovery = refund_position_discovery_from_positions(Uuid::now_v7(), vec![]);
+
+    match discovery.outcome {
+        SingleRefundPositionOutcome::Untenable {
+            reason:
+                RefundUntenableReason::RefundRequiresSingleRecoverablePosition {
+                    position_count,
+                    recoverable_position_count,
+                },
+        } => {
+            assert_eq!(position_count, 0);
+            assert_eq!(recoverable_position_count, 0);
+        }
+        other => panic!("expected untenable zero-position discovery, got {other:?}"),
+    }
+}
+
+#[test]
+fn refund_position_discovery_single_position_still_returns_position() {
+    let discovery = refund_position_discovery_from_positions(
+        Uuid::now_v7(),
+        vec![test_refund_position(
+            RecoverablePositionKind::ExternalCustody,
+            "2500",
+        )],
+    );
+
+    match discovery.outcome {
+        SingleRefundPositionOutcome::Position(position) => {
+            assert_eq!(
+                position.position_kind,
+                RecoverablePositionKind::ExternalCustody
+            );
+            assert_eq!(position.amount.as_str(), "2500");
+        }
+        other => panic!("expected single refund position, got {other:?}"),
+    }
+}
+
+#[test]
+fn refund_position_discovery_multiple_positions_selects_highest_priority() {
+    let discovery = refund_position_discovery_from_positions(
+        Uuid::now_v7(),
+        vec![
+            test_refund_position(RecoverablePositionKind::HyperliquidSpot, "100"),
+            test_refund_position(RecoverablePositionKind::FundingVault, "50"),
+        ],
+    );
+
+    match discovery.outcome {
+        SingleRefundPositionOutcome::Position(position) => {
+            assert_eq!(
+                position.position_kind,
+                RecoverablePositionKind::FundingVault
+            );
+            assert_eq!(position.amount.as_str(), "50");
+        }
+        other => panic!("expected best-priority refund position, got {other:?}"),
+    }
+}
+
+#[test]
 fn unit_withdrawal_builder_accepts_all_hyperliquid_binding_flavors() {
     let planned_at = Utc::now();
     let btc = test_asset("bitcoin", "native");
@@ -2058,6 +2121,34 @@ fn test_custody_vault(
         metadata: json!({}),
         created_at: order.created_at,
         updated_at: order.created_at,
+    }
+}
+
+fn test_refund_position(
+    position_kind: RecoverablePositionKind,
+    amount: &str,
+) -> SingleRefundPosition {
+    let vault_id = Uuid::now_v7();
+    let asset = match position_kind {
+        RecoverablePositionKind::HyperliquidSpot => test_asset("hyperliquid", "UBTC"),
+        RecoverablePositionKind::FundingVault | RecoverablePositionKind::ExternalCustody => {
+            test_asset("bitcoin", "native")
+        }
+    };
+
+    SingleRefundPosition {
+        position_kind,
+        owning_step_id: None,
+        funding_vault_id: (position_kind == RecoverablePositionKind::FundingVault)
+            .then_some(vault_id.into()),
+        custody_vault_id: (position_kind != RecoverablePositionKind::FundingVault)
+            .then_some(vault_id.into()),
+        asset,
+        amount: RawAmount::new(amount).expect("valid raw amount"),
+        hyperliquid_coin: (position_kind == RecoverablePositionKind::HyperliquidSpot)
+            .then_some("UBTC".to_string()),
+        hyperliquid_canonical: (position_kind == RecoverablePositionKind::HyperliquidSpot)
+            .then_some(CanonicalAsset::Btc),
     }
 }
 
