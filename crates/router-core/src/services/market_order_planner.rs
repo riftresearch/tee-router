@@ -2497,7 +2497,9 @@ fn validate_intermediate_custody_plan(
                 "recipient_custody_vault_role",
                 &[CustodyVaultRole::DestinationExecution],
             )?,
-            OrderExecutionStepType::WaitForDeposit | OrderExecutionStepType::Refund => {
+            OrderExecutionStepType::WaitForDeposit
+            | OrderExecutionStepType::HyperliquidClearinghouseToSpot
+            | OrderExecutionStepType::Refund => {
                 return Err(MarketOrderRoutePlanError::IntermediateCustodyInvariant {
                     step_index: step.step_index,
                     step_type: step.step_type.to_db_string(),

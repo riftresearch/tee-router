@@ -1894,6 +1894,9 @@ const HYPERLIQUID_TRADE_DISPATCH: StepDispatch = StepDispatch {
 const HYPERLIQUID_LIMIT_ORDER_DISPATCH: StepDispatch = StepDispatch {
     execute: execute_hyperliquid_limit_order_step,
 };
+const HYPERLIQUID_CLEARINGHOUSE_TO_SPOT_DISPATCH: StepDispatch = StepDispatch {
+    execute: execute_hyperliquid_clearinghouse_to_spot_step,
+};
 const UNIVERSAL_ROUTER_SWAP_DISPATCH: StepDispatch = StepDispatch {
     execute: execute_universal_router_swap_step,
 };
@@ -1913,6 +1916,9 @@ fn step_dispatch(step_type: OrderExecutionStepType) -> &'static StepDispatch {
         OrderExecutionStepType::UnitWithdrawal => &UNIT_WITHDRAWAL_DISPATCH,
         OrderExecutionStepType::HyperliquidTrade => &HYPERLIQUID_TRADE_DISPATCH,
         OrderExecutionStepType::HyperliquidLimitOrder => &HYPERLIQUID_LIMIT_ORDER_DISPATCH,
+        OrderExecutionStepType::HyperliquidClearinghouseToSpot => {
+            &HYPERLIQUID_CLEARINGHOUSE_TO_SPOT_DISPATCH
+        }
         OrderExecutionStepType::UniversalRouterSwap => &UNIVERSAL_ROUTER_SWAP_DISPATCH,
     }
 }
@@ -2051,6 +2057,36 @@ fn execute_hyperliquid_bridge_withdrawal_step<'a>(
         step,
         BridgeExecutionRequest::hyperliquid_bridge_withdrawal_from_value,
     )
+}
+
+fn execute_hyperliquid_clearinghouse_to_spot_step<'a>(
+    deps: &'a OrderActivityDeps,
+    step: &'a OrderExecutionStep,
+) -> StepDispatchFuture<'a> {
+    async move {
+        let custody_vault_id = request_uuid_field(step, "hyperliquid_custody_vault_id")?;
+        let amount = request_string_field(step, "amount")?;
+        let receipt = deps
+            .custody_action_executor
+            .execute_hyperliquid_usd_class_transfer(custody_vault_id, &amount, false)
+            .await
+            .map_err(|source| {
+                custody_action_error("execute hyperliquid clearinghouse to spot transfer", source)
+            })?;
+        Ok(StepDispatchResult::Complete(StepCompletion {
+            response: json!({
+                "kind": "hyperliquid_clearinghouse_to_spot",
+                "amount": amount,
+                "tx_hash": &receipt.tx_hash,
+                "hyperliquid_custody_vault_id": custody_vault_id,
+                "provider_response": receipt.response,
+            }),
+            tx_hash: Some(receipt.tx_hash),
+            provider_state: ProviderExecutionState::default(),
+            outcome: StepExecutionOutcome::Completed,
+        }))
+    }
+    .boxed()
 }
 
 pub(super) fn execute_unit_deposit_step<'a>(

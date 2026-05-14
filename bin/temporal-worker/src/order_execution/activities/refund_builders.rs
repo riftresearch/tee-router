@@ -1646,7 +1646,10 @@ pub(super) fn hyperliquid_binding_status(custody: &RefundHyperliquidBinding) -> 
 pub(super) fn hyperliquid_binding_transfers_from_spot(custody: &RefundHyperliquidBinding) -> bool {
     match custody {
         RefundHyperliquidBinding::Explicit { role, .. } => {
-            *role == CustodyVaultRole::HyperliquidSpot
+            matches!(
+                role,
+                CustodyVaultRole::HyperliquidSpot | CustodyVaultRole::SourceDeposit
+            )
         }
         RefundHyperliquidBinding::DerivedSpot => true,
         RefundHyperliquidBinding::DerivedDestinationExecution { .. } => false,

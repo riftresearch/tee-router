@@ -3593,10 +3593,13 @@ impl OrderRepository {
                     ),
                 });
             }
-            if source_vault.role != CustodyVaultRole::HyperliquidSpot {
+            if !matches!(
+                source_vault.role,
+                CustodyVaultRole::HyperliquidSpot | CustodyVaultRole::SourceDeposit
+            ) {
                 return Err(RouterCoreError::Conflict {
                     message: format!(
-                        "custody vault {} is {}, not hyperliquid_spot",
+                        "custody vault {} is {}, not hyperliquid_spot or source_deposit",
                         source_vault.id,
                         source_vault.role.to_db_string()
                     ),

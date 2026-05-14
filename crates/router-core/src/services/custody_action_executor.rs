@@ -102,6 +102,9 @@ pub enum CustodyActionError {
     #[snafu(display("hyperliquid action failed: {}", reason))]
     HyperliquidAction { reason: String },
 
+    #[snafu(display("hyperliquid runtime is not configured"))]
+    MissingHyperliquidRuntime,
+
     #[snafu(display("invalid hyperliquid timestamp for {}: {}", context, reason))]
     InvalidHyperliquidTimestamp {
         context: &'static str,
@@ -856,6 +859,57 @@ impl CustodyActionExecutor {
             .collect())
     }
 
+    pub async fn inspect_hyperliquid_clearinghouse_balance(
+        &self,
+        vault: &CustodyVault,
+    ) -> CustodyActionResult<U256> {
+        if vault.control_type == CustodyVaultControlType::HyperliquidMasterSigner {
+            return Ok(U256::ZERO);
+        }
+        let Some(runtime) = self.hyperliquid_runtime.as_ref() else {
+            return Ok(U256::ZERO);
+        };
+
+        let user = Address::from_str(&vault.address).map_err(|err| {
+            CustodyActionError::InvalidHyperliquidWallet {
+                reason: err.to_string(),
+            }
+        })?;
+        let info = HyperliquidInfoClient::new(runtime.base_url())
+            .map_err(|source| CustodyActionError::Hyperliquid { source })?;
+        let state = info
+            .clearinghouse_state(user)
+            .await
+            .map_err(|source| CustodyActionError::Hyperliquid { source })?;
+        parse_decimal_to_raw_units_floor(
+            "hyperliquid clearinghouse account value",
+            &state.margin_summary.account_value,
+            6,
+        )
+    }
+
+    pub async fn execute_hyperliquid_usd_class_transfer(
+        &self,
+        custody_vault_id: Uuid,
+        raw_amount: &str,
+        to_perp: bool,
+    ) -> CustodyActionResult<CustodyActionReceipt> {
+        let Some(runtime) = self.hyperliquid_runtime.as_ref() else {
+            return Err(CustodyActionError::MissingHyperliquidRuntime);
+        };
+        let amount = format_hyperliquid_amount(raw_amount, 6)?;
+        self.execute(CustodyActionRequest {
+            custody_vault_id,
+            action: CustodyAction::Call(ChainCall::Hyperliquid(HyperliquidCall {
+                target_base_url: runtime.base_url().to_string(),
+                network: runtime.network(),
+                vault_address: None,
+                payload: HyperliquidCallPayload::UsdClassTransfer { amount, to_perp },
+            })),
+        })
+        .await
+    }
+
     fn derive_wallet(
         &self,
         vault: &CustodyVault,
@@ -1355,6 +1409,87 @@ fn parse_u256(field: &'static str, value: &str) -> CustodyActionResult<U256> {
         field,
         reason: err.to_string(),
     })
+}
+
+fn parse_decimal_to_raw_units_floor(
+    field: &'static str,
+    value: &str,
+    decimals: u8,
+) -> CustodyActionResult<U256> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(CustodyActionError::InvalidAmount {
+            field,
+            reason: "decimal amount must not be empty".to_string(),
+        });
+    }
+    let mut parts = trimmed.split('.');
+    let whole = parts.next().unwrap_or_default();
+    let frac = parts.next().unwrap_or_default();
+    if parts.next().is_some() {
+        return Err(CustodyActionError::InvalidAmount {
+            field,
+            reason: format!("invalid decimal amount {value:?}: multiple decimal points"),
+        });
+    }
+    if !whole.chars().all(|ch| ch.is_ascii_digit()) || !frac.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err(CustodyActionError::InvalidAmount {
+            field,
+            reason: format!("invalid decimal amount {value:?}: expected only decimal digits"),
+        });
+    }
+    let decimals = usize::from(decimals);
+    let frac = if frac.len() > decimals {
+        &frac[..decimals]
+    } else {
+        frac
+    };
+    let combined = format!("{whole}{:0<width$}", frac, width = decimals);
+    let normalized = combined.trim_start_matches('0');
+    let digits = if normalized.is_empty() {
+        "0"
+    } else {
+        normalized
+    };
+    U256::from_str_radix(digits, 10).map_err(|err| CustodyActionError::InvalidAmount {
+        field,
+        reason: format!("invalid decimal amount {value:?}: {err}"),
+    })
+}
+
+fn format_hyperliquid_amount(raw_amount: &str, decimals: u8) -> CustodyActionResult<String> {
+    let digits = raw_amount.trim();
+    if digits.is_empty() || !digits.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err(CustodyActionError::InvalidAmount {
+            field: "hyperliquid amount",
+            reason: format!("expected raw unsigned integer, got {raw_amount:?}"),
+        });
+    }
+    let amount = parse_positive_u256("hyperliquid amount", digits)?;
+    let digits = amount.to_string();
+    let decimals = usize::from(decimals);
+    if decimals == 0 {
+        return Ok(digits);
+    }
+    let padded = if digits.len() <= decimals {
+        format!("{:0>width$}", digits, width = decimals + 1)
+    } else {
+        digits
+    };
+    let split_at = padded.len() - decimals;
+    let (whole, frac) = padded.split_at(split_at);
+    let whole_trimmed = whole.trim_start_matches('0');
+    let whole_canonical = if whole_trimmed.is_empty() {
+        "0"
+    } else {
+        whole_trimmed
+    };
+    let frac_trimmed = frac.trim_end_matches('0');
+    if frac_trimmed.is_empty() {
+        Ok(whole_canonical.to_string())
+    } else {
+        Ok(format!("{whole_canonical}.{frac_trimmed}"))
+    }
 }
 
 /// Sign and submit a Hyperliquid action using the custody vault's derived EVM

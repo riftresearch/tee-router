@@ -448,6 +448,8 @@ pub struct SingleRefundPosition {
     pub amount: RawAmount,
     pub hyperliquid_coin: Option<String>,
     pub hyperliquid_canonical: Option<CanonicalAsset>,
+    #[serde(default)]
+    pub requires_clearinghouse_unwrap: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

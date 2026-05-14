@@ -1219,6 +1219,7 @@ pub enum OrderExecutionStepType {
     UnitWithdrawal,
     HyperliquidTrade,
     HyperliquidLimitOrder,
+    HyperliquidClearinghouseToSpot,
     UniversalRouterSwap,
     Refund,
 }
@@ -1237,6 +1238,7 @@ impl OrderExecutionStepType {
             Self::UnitWithdrawal => "unit_withdrawal",
             Self::HyperliquidTrade => "hyperliquid_trade",
             Self::HyperliquidLimitOrder => "hyperliquid_limit_order",
+            Self::HyperliquidClearinghouseToSpot => "hyperliquid_clearinghouse_to_spot",
             Self::UniversalRouterSwap => "universal_router_swap",
             Self::Refund => "refund",
         }
@@ -1254,6 +1256,7 @@ impl OrderExecutionStepType {
             "unit_withdrawal" => Some(Self::UnitWithdrawal),
             "hyperliquid_trade" => Some(Self::HyperliquidTrade),
             "hyperliquid_limit_order" => Some(Self::HyperliquidLimitOrder),
+            "hyperliquid_clearinghouse_to_spot" => Some(Self::HyperliquidClearinghouseToSpot),
             "universal_router_swap" => Some(Self::UniversalRouterSwap),
             "refund" => Some(Self::Refund),
             _ => None,
