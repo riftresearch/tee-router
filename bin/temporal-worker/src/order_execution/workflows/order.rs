@@ -1405,6 +1405,8 @@ async fn wait_for_provider_completion_hint(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::order_execution::types::WorkflowExecutionStep;
 
@@ -1418,6 +1420,11 @@ mod tests {
 
     fn workflow_step_id(value: u128) -> WorkflowStepId {
         WorkflowStepId::from(Uuid::from_u128(value))
+    }
+
+    #[test]
+    fn stale_running_step_recovery_timer_absorbs_dispatch_lag() {
+        assert!(super::super::STALE_RUNNING_STEP_RECOVERY_AFTER >= Duration::from_secs(15 * 60));
     }
 
     #[test]
