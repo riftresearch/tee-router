@@ -1831,18 +1831,19 @@ pub(super) fn is_empty_json_object(value: &Value) -> bool {
 }
 
 pub(super) struct StepCompletion {
-    response: Value,
-    tx_hash: Option<String>,
-    provider_state: ProviderExecutionState,
-    outcome: StepExecutionOutcome,
+    pub(super) response: Value,
+    pub(super) tx_hash: Option<String>,
+    pub(super) provider_state: ProviderExecutionState,
+    pub(super) outcome: StepExecutionOutcome,
 }
 
-enum StepDispatchResult {
+pub(super) enum StepDispatchResult {
     ProviderIntent(ProviderExecutionIntent),
     Complete(StepCompletion),
 }
 
-type StepDispatchFuture<'a> = BoxFuture<'a, Result<StepDispatchResult, OrderActivityError>>;
+pub(super) type StepDispatchFuture<'a> =
+    BoxFuture<'a, Result<StepDispatchResult, OrderActivityError>>;
 type StepDispatchHandler =
     for<'a> fn(&'a OrderActivityDeps, &'a OrderExecutionStep) -> StepDispatchFuture<'a>;
 
@@ -2052,20 +2053,43 @@ fn execute_hyperliquid_bridge_withdrawal_step<'a>(
     )
 }
 
-fn execute_unit_deposit_step<'a>(
+pub(super) fn execute_unit_deposit_step<'a>(
     deps: &'a OrderActivityDeps,
     step: &'a OrderExecutionStep,
 ) -> StepDispatchFuture<'a> {
     async move {
-        let request = UnitDepositStepRequest::from_value(&step.request)
+        let mut request = UnitDepositStepRequest::from_value(&step.request)
             .map_err(|source| provider_execute_error(&step.provider, source))?;
-        let intent = deps
+        let idempotency_key = unit_deposit_operation_idempotency_key(step, &request)
+            .map_err(|source| provider_execute_error(&step.provider, source))?;
+        if let Some(operation) = deps
+            .db
+            .orders()
+            .get_provider_operation_by_idempotency_key(
+                &step.provider,
+                ProviderOperationType::UnitDeposit,
+                &idempotency_key,
+            )
+            .await
+            .map_err(OrderActivityError::db_query)?
+        {
+            return unit_deposit_existing_operation_completion(step, operation, idempotency_key);
+        }
+
+        request.idempotency_key = Some(idempotency_key.clone());
+        let mut intent = deps
             .action_providers
             .unit(&step.provider)
             .ok_or_else(|| provider_not_configured(step))?
             .execute_deposit(&request)
             .await
             .map_err(|source| provider_execute_error(&step.provider, source))?;
+        set_provider_intent_operation_idempotency_key(&mut intent, idempotency_key.clone());
+        if let Some(operation) =
+            persist_unit_deposit_intent_before_side_effect(deps, step, &intent).await?
+        {
+            return unit_deposit_existing_operation_completion(step, operation, idempotency_key);
+        }
         Ok(StepDispatchResult::ProviderIntent(intent))
     }
     .boxed()
@@ -2125,6 +2149,19 @@ fn unit_withdrawal_operation_idempotency_key(
     ))
 }
 
+fn unit_deposit_operation_idempotency_key(
+    step: &OrderExecutionStep,
+    request: &UnitDepositStepRequest,
+) -> Result<String, String> {
+    let vault_id = request
+        .source_custody_vault_id
+        .ok_or_else(|| "unit deposit idempotency requires source_custody_vault_id".to_string())?;
+    Ok(format!(
+        "order:{}:unit_deposit:step:{}:source_custody_vault:{}",
+        step.order_id, step.step_index, vault_id
+    ))
+}
+
 fn set_provider_intent_operation_idempotency_key(
     intent: &mut ProviderExecutionIntent,
     idempotency_key: String,
@@ -2137,6 +2174,61 @@ fn set_provider_intent_operation_idempotency_key(
     if let Some(operation) = operation {
         operation.idempotency_key = Some(idempotency_key);
     }
+}
+
+async fn persist_unit_deposit_intent_before_side_effect(
+    deps: &OrderActivityDeps,
+    step: &OrderExecutionStep,
+    intent: &ProviderExecutionIntent,
+) -> Result<Option<OrderProviderOperation>, OrderActivityError> {
+    let state = match intent {
+        ProviderExecutionIntent::ProviderOnly { state, .. }
+        | ProviderExecutionIntent::CustodyAction { state, .. }
+        | ProviderExecutionIntent::CustodyActions { state, .. } => state,
+    };
+    let Some(operation_intent) = state.operation.as_ref() else {
+        return Ok(None);
+    };
+    if operation_intent.operation_type != ProviderOperationType::UnitDeposit {
+        return Ok(None);
+    }
+
+    let (operation, mut addresses) = provider_state_records(
+        step,
+        state,
+        &json!({
+            "kind": "unit_deposit_provider_operation_pre_side_effect",
+        }),
+    )
+    .map_err(|source| provider_execute_error(&step.provider, source))?;
+    let Some(operation) = operation else {
+        return Ok(None);
+    };
+    let candidate_operation_id = operation.id;
+    let provider_operation_id = deps
+        .db
+        .orders()
+        .upsert_provider_operation(&operation)
+        .await
+        .map_err(OrderActivityError::db_query)?;
+    if provider_operation_id == candidate_operation_id {
+        for address in &mut addresses {
+            address.provider_operation_id = Some(provider_operation_id);
+            deps.db
+                .orders()
+                .upsert_provider_address(address)
+                .await
+                .map_err(OrderActivityError::db_query)?;
+        }
+        return Ok(None);
+    }
+
+    deps.db
+        .orders()
+        .get_provider_operation(provider_operation_id)
+        .await
+        .map(Some)
+        .map_err(OrderActivityError::db_query)
 }
 
 async fn persist_unit_withdrawal_intent_before_side_effect(
@@ -2184,6 +2276,48 @@ async fn persist_unit_withdrawal_intent_before_side_effect(
         .await
         .map(Some)
         .map_err(OrderActivityError::db_query)
+}
+
+fn unit_deposit_existing_operation_completion(
+    step: &OrderExecutionStep,
+    operation: OrderProviderOperation,
+    idempotency_key: String,
+) -> Result<StepDispatchResult, OrderActivityError> {
+    let outcome = if operation.status == ProviderOperationStatus::Completed {
+        StepExecutionOutcome::Completed
+    } else {
+        StepExecutionOutcome::Waiting
+    };
+    let tx_hash = provider_operation_tx_hash(&operation);
+    let state = ProviderExecutionState {
+        operation: Some(ProviderOperationIntent {
+            operation_type: operation.operation_type,
+            status: operation.status,
+            provider_ref: operation.provider_ref.clone(),
+            idempotency_key: operation
+                .idempotency_key
+                .clone()
+                .or_else(|| Some(idempotency_key.clone())),
+            request: Some(operation.request.clone()),
+            response: Some(operation.response.clone()),
+            observed_state: Some(operation.observed_state.clone()),
+        }),
+        addresses: Vec::new(),
+    };
+    Ok(StepDispatchResult::Complete(StepCompletion {
+        response: json!({
+            "kind": "unit_deposit_idempotency_reuse",
+            "provider": &step.provider,
+            "step_id": step.id,
+            "provider_operation_id": operation.id,
+            "provider_ref": &operation.provider_ref,
+            "idempotency_key": idempotency_key,
+            "status": operation.status.to_db_string(),
+        }),
+        tx_hash,
+        provider_state: state,
+        outcome,
+    }))
 }
 
 fn unit_withdrawal_existing_operation_completion(
