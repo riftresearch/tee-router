@@ -8,6 +8,7 @@ repository.workspace = true
 [dependencies]
 alloy = { workspace = true }
 metrics = { workspace = true }
+observability = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 rmp-serde = "=1.1.2"
 serde = { workspace = true }

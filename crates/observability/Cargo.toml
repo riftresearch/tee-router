@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry-appender-tracing = { workspace = true }

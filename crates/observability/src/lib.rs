@@ -1,3 +1,5 @@
+pub mod upstream;
+
 use std::{
     env,
     net::{IpAddr, Ipv6Addr, SocketAddr},

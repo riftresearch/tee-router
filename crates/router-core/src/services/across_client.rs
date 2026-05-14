@@ -330,7 +330,7 @@ impl AcrossClient {
         let response = match builder.send().await {
             Ok(response) => response,
             Err(err) => {
-                telemetry::record_venue_transport_error(
+                telemetry::record_trading_venue_transport_error(
                     "across",
                     "GET",
                     endpoint_label,
@@ -341,7 +341,7 @@ impl AcrossClient {
         };
         let status = response.status();
         let body = read_limited_response_text(response, ACROSS_MAX_RESPONSE_BODY_BYTES).await?;
-        telemetry::record_venue_http_status(
+        telemetry::record_trading_venue_http_status(
             "across",
             "GET",
             endpoint_label,

@@ -1862,6 +1862,7 @@ dependencies = [
  "bitcoin",
  "futures-util",
  "metrics",
+ "observability",
  "reqwest",
  "serde",
  "serde_json",
@@ -1925,6 +1926,7 @@ dependencies = [
  "bitcoin",
  "futures-util",
  "metrics",
+ "observability",
  "reqwest",
  "serde",
  "serde_json",
@@ -2270,6 +2272,7 @@ name = "chainalysis-address-screener"
 version = "0.1.8"
 dependencies = [
  "metrics",
+ "observability",
  "reqwest",
  "serde",
  "serde_json",
@@ -3262,6 +3265,7 @@ dependencies = [
  "async-trait",
  "futures-util",
  "metrics",
+ "observability",
  "reqwest",
  "serde",
  "serde_json",
@@ -3301,6 +3305,7 @@ dependencies = [
  "async-trait",
  "futures-util",
  "metrics",
+ "observability",
  "reqwest",
  "serde",
  "serde_json",
@@ -3317,6 +3322,7 @@ version = "0.1.8"
 dependencies = [
  "alloy",
  "metrics",
+ "observability",
  "reqwest",
  "serde",
  "serde_json",
@@ -4117,6 +4123,7 @@ version = "0.1.8"
 dependencies = [
  "alloy",
  "metrics",
+ "observability",
  "reqwest",
  "rmp-serde",
  "serde",
@@ -4149,6 +4156,7 @@ dependencies = [
  "alloy",
  "hyperliquid-client",
  "metrics",
+ "observability",
  "reqwest",
  "serde",
  "serde_json",
@@ -4676,6 +4684,7 @@ version = "0.1.8"
 dependencies = [
  "chrono",
  "metrics",
+ "observability",
  "reqwest",
  "serde",
  "serde_json",
@@ -5101,6 +5110,7 @@ dependencies = [
 name = "observability"
 version = "0.1.8"
 dependencies = [
+ "metrics",
  "metrics-exporter-prometheus",
  "opentelemetry",
  "opentelemetry-appender-tracing",
