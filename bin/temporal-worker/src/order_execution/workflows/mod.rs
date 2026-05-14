@@ -43,7 +43,10 @@ const PROVIDER_HINT_WAIT_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 // stuck step. Honest "activity actually hung" cases will still surface, just with a
 // longer detection window.
 const STALE_RUNNING_STEP_RECOVERY_AFTER: Duration = Duration::from_secs(2 * 60 * 60);
-const EXECUTE_STEP_START_TO_CLOSE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+// Activity start-to-close timeout. Under 10k burst load, refund-side activities
+// (HL trade reversal + bridge withdrawal + sweep) can chain enough work to exceed
+// 10 min. 60 min keeps honest hang detection while absorbing burst-load lag.
+const EXECUTE_STEP_START_TO_CLOSE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const QUOTE_REFRESH_WORKFLOW_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 const MANUAL_INTERVENTION_WAIT_TIMEOUT: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const ORDER_WORKFLOW_TYPE: &str = "OrderWorkflow";
