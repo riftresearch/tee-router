@@ -10,6 +10,7 @@ alloy = { workspace = true }
 async-trait = { workspace = true }
 futures-util = "0.3"
 metrics = { workspace = true }
+observability = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

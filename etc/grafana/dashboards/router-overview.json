@@ -637,7 +637,7 @@
             "uid": "victoriametrics"
           },
           "editorMode": "code",
-          "expr": "sum by (venue) (rate(tee_router_venue_requests_total[1m]))",
+          "expr": "sum by (service) (rate(tee_router_upstream_requests_total[1m]))",
           "legendFormat": "{{venue}}",
           "range": true,
           "refId": "A"
@@ -730,7 +730,7 @@
             "uid": "victoriametrics"
           },
           "editorMode": "code",
-          "expr": "sum by (venue) (increase(tee_router_venue_requests_total[1m]))",
+          "expr": "sum by (service) (increase(tee_router_upstream_requests_total[1m]))",
           "legendFormat": "{{venue}}",
           "range": true,
           "refId": "A"
@@ -1196,7 +1196,7 @@
             "uid": "victoriametrics"
           },
           "editorMode": "code",
-          "expr": "100 * sum by (venue, method, endpoint) (rate(tee_router_venue_requests_total{status_class=\"2xx\"}[5m])) / sum by (venue, method, endpoint) (rate(tee_router_venue_requests_total[5m]))",
+          "expr": "100 * sum by (service, method, endpoint) (rate(tee_router_upstream_requests_total{status_class=\"2xx\"}[5m])) / sum by (service, method, endpoint) (rate(tee_router_upstream_requests_total[5m]))",
           "legendFormat": "{{venue}} {{method}} {{endpoint}}",
           "range": true,
           "refId": "A"
@@ -1384,7 +1384,7 @@
             "uid": "victoriametrics"
           },
           "editorMode": "code",
-          "expr": "sum by (venue, method, endpoint, status_class) (increase(tee_router_venue_requests_total{status_class!=\"2xx\"}[5m]))",
+          "expr": "sum by (service, method, endpoint, status_class) (increase(tee_router_upstream_requests_total{status_class!=\"2xx\"}[5m]))",
           "legendFormat": "{{venue}} {{method}} {{endpoint}} {{status_class}}",
           "range": true,
           "refId": "A"
@@ -1572,7 +1572,7 @@
             "uid": "victoriametrics"
           },
           "editorMode": "code",
-          "expr": "tee_router_venue_request_duration_seconds{quantile=\"0.95\"}",
+          "expr": "tee_router_upstream_request_duration_seconds{quantile=\"0.95\"}",
           "legendFormat": "{{venue}} {{method}} {{endpoint}} {{status_class}}",
           "range": true,
           "refId": "A"

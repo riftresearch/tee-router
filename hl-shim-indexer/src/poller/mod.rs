@@ -359,7 +359,7 @@ pub struct Poller {
     scheduler: Scheduler,
     storage: Storage,
     pubsub: PubSub,
-    hl: Arc<Mutex<HyperliquidInfoClient>>,
+    hl: Arc<HyperliquidInfoClient>,
     metadata: Arc<RwLock<MetadataSnapshot>>,
     weight_budget: Arc<WeightBudget>,
 }
@@ -382,7 +382,7 @@ impl Poller {
             scheduler,
             storage,
             pubsub,
-            hl: Arc::new(Mutex::new(hl)),
+            hl: Arc::new(hl),
             metadata: Arc::new(RwLock::new(MetadataSnapshot::default())),
             weight_budget: Arc::new(WeightBudget::new(weight_budget_per_min)),
         };
@@ -478,12 +478,13 @@ impl Poller {
 
     async fn refresh_metadata(&self) -> Result<()> {
         self.weight_budget.acquire(40).await;
-        let hl = self.hl.lock().await;
-        let perp = hl
+        let perp = self
+            .hl
             .fetch_perp_meta()
             .await
             .context(HyperliquidRequestSnafu { endpoint: "meta" })?;
-        let spot = hl
+        let spot = self
+            .hl
             .fetch_spot_meta()
             .await
             .context(HyperliquidRequestSnafu {
@@ -496,14 +497,13 @@ impl Poller {
     async fn poll_fills(&self, user: Address) -> Result<()> {
         let cursor = self.storage.cursor(user, CursorEndpoint::Fills).await?;
         let start = cursor.saturating_sub(CURSOR_SAFETY_WINDOW_MS).max(0) as u64;
-        let fills = {
-            let hl = self.hl.lock().await;
-            hl.user_fills_by_time(user, start, None, false)
-                .await
-                .context(HyperliquidRequestSnafu {
-                    endpoint: "userFillsByTime",
-                })?
-        };
+        let fills = self
+            .hl
+            .user_fills_by_time(user, start, None, false)
+            .await
+            .context(HyperliquidRequestSnafu {
+                endpoint: "userFillsByTime",
+            })?;
         telemetry::record_hl_request("userFillsByTime", "ok", PollEndpoint::Fills.weight());
         let max_time = fills
             .iter()
@@ -525,14 +525,13 @@ impl Poller {
     async fn poll_ledger(&self, user: Address) -> Result<()> {
         let cursor = self.storage.cursor(user, CursorEndpoint::Ledger).await?;
         let start = cursor.saturating_sub(CURSOR_SAFETY_WINDOW_MS).max(0) as u64;
-        let updates = {
-            let hl = self.hl.lock().await;
-            hl.user_non_funding_ledger_updates(user, start, None)
-                .await
-                .context(HyperliquidRequestSnafu {
-                    endpoint: "userNonFundingLedgerUpdates",
-                })?
-        };
+        let updates = self
+            .hl
+            .user_non_funding_ledger_updates(user, start, None)
+            .await
+            .context(HyperliquidRequestSnafu {
+                endpoint: "userNonFundingLedgerUpdates",
+            })?;
         telemetry::record_hl_request(
             "userNonFundingLedgerUpdates",
             "ok",
@@ -559,14 +558,13 @@ impl Poller {
     async fn poll_funding(&self, user: Address) -> Result<()> {
         let cursor = self.storage.cursor(user, CursorEndpoint::Funding).await?;
         let start = cursor.saturating_sub(CURSOR_SAFETY_WINDOW_MS).max(0) as u64;
-        let fundings = {
-            let hl = self.hl.lock().await;
-            hl.user_funding(user, start, None)
-                .await
-                .context(HyperliquidRequestSnafu {
-                    endpoint: "userFunding",
-                })?
-        };
+        let fundings = self
+            .hl
+            .user_funding(user, start, None)
+            .await
+            .context(HyperliquidRequestSnafu {
+                endpoint: "userFunding",
+            })?;
         telemetry::record_hl_request("userFunding", "ok", PollEndpoint::Funding.weight());
         let max_time = fundings
             .iter()
@@ -585,14 +583,13 @@ impl Poller {
     }
 
     async fn poll_order_status(&self, user: Address, oid: u64) -> Result<()> {
-        let response = {
-            let hl = self.hl.lock().await;
-            hl.order_status(user, oid)
-                .await
-                .context(HyperliquidRequestSnafu {
-                    endpoint: "orderStatus",
-                })?
-        };
+        let response = self
+            .hl
+            .order_status(user, oid)
+            .await
+            .context(HyperliquidRequestSnafu {
+                endpoint: "orderStatus",
+            })?;
         telemetry::record_hl_request("orderStatus", "ok", PollEndpoint::OrderStatus(oid).weight());
         if let Some(event) = order_event_from_status(user, response) {
             if self.storage.insert_order(&event).await? {
@@ -605,14 +602,13 @@ impl Poller {
 
     pub async fn check_rate_limit(&self, user: Address) -> Result<u64> {
         self.weight_budget.acquire(2).await;
-        let rate_limit = {
-            let hl = self.hl.lock().await;
-            hl.user_rate_limit(user)
-                .await
-                .context(HyperliquidRequestSnafu {
-                    endpoint: RATE_LIMIT_ENDPOINT,
-                })?
-        };
+        let rate_limit = self
+            .hl
+            .user_rate_limit(user)
+            .await
+            .context(HyperliquidRequestSnafu {
+                endpoint: RATE_LIMIT_ENDPOINT,
+            })?;
         telemetry::record_hl_request(RATE_LIMIT_ENDPOINT, "ok", 2);
         debug!(
             user = ?user,

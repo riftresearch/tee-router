@@ -461,22 +461,14 @@ fn record_upstream_request(
     status_class: &'static str,
     duration: Duration,
 ) {
-    metrics::counter!(
-        "tee_router_venue_requests_total",
-        "venue" => "bitcoin_receipt_watcher",
-        "method" => method,
-        "endpoint" => endpoint,
-        "status_class" => status_class,
-    )
-    .increment(1);
-    metrics::histogram!(
-        "tee_router_venue_request_duration_seconds",
-        "venue" => "bitcoin_receipt_watcher",
-        "method" => method,
-        "endpoint" => endpoint,
-        "status_class" => status_class,
-    )
-    .record(duration.as_secs_f64());
+    observability::upstream::record_upstream_request(
+        observability::upstream::UpstreamKind::SidecarService,
+        "bitcoin_receipt_watcher",
+        method,
+        endpoint,
+        status_class,
+        duration,
+    );
 }
 
 fn status_class(status: StatusCode) -> &'static str {

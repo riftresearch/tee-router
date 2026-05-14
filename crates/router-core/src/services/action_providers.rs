@@ -2642,7 +2642,7 @@ impl CctpProvider {
         {
             Ok(response) => response,
             Err(err) => {
-                telemetry::record_venue_transport_error(
+                telemetry::record_trading_venue_transport_error(
                     "cctp",
                     "GET",
                     "/v2/messages/:source_domain",
@@ -2655,7 +2655,7 @@ impl CctpProvider {
             }
         };
         let status = response.status();
-        telemetry::record_venue_http_status(
+        telemetry::record_trading_venue_http_status(
             "cctp",
             "GET",
             "/v2/messages/:source_domain",
@@ -2701,7 +2701,7 @@ impl CctpProvider {
         let response = match self.http.get(&url).send().await {
             Ok(response) => response,
             Err(err) => {
-                telemetry::record_venue_transport_error(
+                telemetry::record_trading_venue_transport_error(
                     "cctp",
                     "GET",
                     "/v2/burn/USDC/fees/:source_domain/:destination_domain",
@@ -2714,7 +2714,7 @@ impl CctpProvider {
             }
         };
         let status = response.status();
-        telemetry::record_venue_http_status(
+        telemetry::record_trading_venue_http_status(
             "cctp",
             "GET",
             "/v2/burn/USDC/fees/:source_domain/:destination_domain",
@@ -4218,7 +4218,7 @@ impl VeloraProvider {
         let response = match self.http.get(&url).query(&query).send().await {
             Ok(response) => response,
             Err(err) => {
-                telemetry::record_venue_transport_error(
+                telemetry::record_trading_venue_transport_error(
                     "velora",
                     "GET",
                     "/prices",
@@ -4231,7 +4231,7 @@ impl VeloraProvider {
             }
         };
         let status = response.status();
-        telemetry::record_venue_http_status(
+        telemetry::record_trading_venue_http_status(
             "velora",
             "GET",
             "/prices",
@@ -4318,7 +4318,7 @@ impl VeloraProvider {
         let response = match self.http.post(&url).json(&body).send().await {
             Ok(response) => response,
             Err(err) => {
-                telemetry::record_venue_transport_error(
+                telemetry::record_trading_venue_transport_error(
                     "velora",
                     "POST",
                     "/transactions/:network",
@@ -4331,7 +4331,7 @@ impl VeloraProvider {
             }
         };
         let status = response.status();
-        telemetry::record_venue_http_status(
+        telemetry::record_trading_venue_http_status(
             "velora",
             "POST",
             "/transactions/:network",

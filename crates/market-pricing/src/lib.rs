@@ -389,22 +389,14 @@ fn record_venue_request(
     status_class: &'static str,
     duration: Duration,
 ) {
-    metrics::counter!(
-        "tee_router_venue_requests_total",
-        "venue" => venue,
-        "method" => method,
-        "endpoint" => endpoint,
-        "status_class" => status_class,
-    )
-    .increment(1);
-    metrics::histogram!(
-        "tee_router_venue_request_duration_seconds",
-        "venue" => venue,
-        "method" => method,
-        "endpoint" => endpoint,
-        "status_class" => status_class,
-    )
-    .record(duration.as_secs_f64());
+    observability::upstream::record_upstream_request(
+        observability::upstream::UpstreamKind::TradingVenue,
+        venue,
+        method,
+        endpoint,
+        status_class,
+        duration,
+    );
 }
 
 fn record_chain_rpc_request(

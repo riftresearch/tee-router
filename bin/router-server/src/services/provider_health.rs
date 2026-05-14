@@ -410,16 +410,18 @@ fn record_provider_health_probe(
     duration: Duration,
 ) {
     metrics::counter!(
-        "tee_router_venue_requests_total",
-        "venue" => provider.to_string(),
+        "tee_router_upstream_requests_total",
+        "kind" => "trading_venue",
+        "service" => provider.to_string(),
         "method" => method.to_string(),
         "endpoint" => "/provider-health",
         "status_class" => status_class,
     )
     .increment(1);
     metrics::histogram!(
-        "tee_router_venue_request_duration_seconds",
-        "venue" => provider.to_string(),
+        "tee_router_upstream_request_duration_seconds",
+        "kind" => "trading_venue",
+        "service" => provider.to_string(),
         "method" => method.to_string(),
         "endpoint" => "/provider-health",
         "status_class" => status_class,
