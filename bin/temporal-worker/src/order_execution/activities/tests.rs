@@ -2,7 +2,7 @@ use super::*;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use chains::{hyperliquid::HyperliquidChain, ChainOperations, ChainRegistry};
+use chains::{evm::EvmChain, hyperliquid::HyperliquidChain, ChainOperations, ChainRegistry};
 use router_core::{
     config::Settings,
     models::{
@@ -397,6 +397,46 @@ struct TestHyperliquidExchangeServer {
     handle: tokio::task::JoinHandle<()>,
 }
 
+struct TestEvmRpcServer {
+    base_url: String,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl TestEvmRpcServer {
+    async fn spawn_with_balance(raw_balance: &str) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test EVM RPC server");
+        let addr = listener.local_addr().expect("read test EVM RPC address");
+        let balance = U256::from_str_radix(raw_balance, 10).expect("test EVM balance must parse");
+        let balance_hex = format!("{balance:x}");
+        let balance_quantity = Arc::new(format!("0x{balance_hex}"));
+        let balance_word = Arc::new(format!("0x{balance_hex:0>64}"));
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _peer)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(handle_test_evm_rpc_connection(
+                    stream,
+                    balance_quantity.clone(),
+                    balance_word.clone(),
+                ));
+            }
+        });
+        Self {
+            base_url: format!("http://{addr}"),
+            handle,
+        }
+    }
+}
+
+impl Drop for TestEvmRpcServer {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
 impl TestHyperliquidExchangeServer {
     async fn spawn() -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -522,6 +562,52 @@ impl Drop for TestHyperliquidInfoServer {
     fn drop(&mut self) {
         self.handle.abort();
     }
+}
+
+async fn handle_test_evm_rpc_connection(
+    mut stream: tokio::net::TcpStream,
+    balance_quantity: Arc<String>,
+    balance_word: Arc<String>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    loop {
+        let Ok(read) = stream.read(&mut chunk).await else {
+            return;
+        };
+        if read == 0 {
+            return;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if test_http_request_complete(&buffer) {
+            break;
+        }
+    }
+
+    let request = String::from_utf8_lossy(&buffer);
+    let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+    let payload = serde_json::from_str::<Value>(body).unwrap_or_else(|_| json!({}));
+    let id = payload.get("id").cloned().unwrap_or_else(|| json!(1));
+    let result = match payload.get("method").and_then(Value::as_str) {
+        Some("eth_getBalance") => json!(balance_quantity.as_str()),
+        Some("eth_call") => json!(balance_word.as_str()),
+        Some("eth_chainId") => json!("0xa4b1"),
+        other => json!({ "error": format!("unexpected test EVM RPC request {other:?}") }),
+    };
+    let response_body = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result,
+    })
+    .to_string();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        response_body.len(),
+        response_body
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
 }
 
 async fn handle_test_hyperliquid_info_connection(
@@ -1784,6 +1870,197 @@ async fn refund_position_discovery_reads_hl_clearinghouse_balance_from_source_de
 }
 
 #[tokio::test]
+async fn refund_position_discovery_reads_hl_spot_balance_from_destination_execution_vault() {
+    let test_db = test_database().await;
+    let hyperliquid_info = TestHyperliquidInfoServer::spawn_with_balances_and_clearinghouse(
+        vec![test_hyperliquid_spot_balance("USDC", 1, "1", "0")],
+        "100",
+    )
+    .await;
+    let (deps, _evm_rpc) = test_deps_with_arbitrum_evm_balance(
+        test_db.db.clone(),
+        hyperliquid_info.base_url.clone(),
+        "0",
+    )
+    .await;
+    let planned_at = Utc::now();
+    let source_usdc = test_asset("evm:42161", "0xaf88d065e77c8cc2239327c5edb3a432268e5831");
+    let mut order = test_order(source_usdc.clone(), planned_at);
+    order.destination_asset = test_asset("bitcoin", "native");
+    order.workflow_parent_span_id = order.workflow_trace_id[..16].to_string();
+    let failed_attempt_id = Uuid::now_v7();
+    let destination_execution_vault =
+        test_custody_vault(&order, CustodyVaultRole::DestinationExecution, &source_usdc);
+    seed_hyperliquid_spot_refund_order(
+        &test_db.db,
+        &test_db.pool,
+        &order,
+        failed_attempt_id,
+        &destination_execution_vault,
+    )
+    .await;
+
+    let discovery = discover_single_refund_position_with_deps(
+        &deps,
+        DiscoverSingleRefundPositionInput {
+            order_id: order.id.into(),
+            failed_attempt_id: failed_attempt_id.into(),
+        },
+    )
+    .await
+    .expect("discover refund position from destination_execution HL spot balance");
+
+    match discovery.outcome {
+        SingleRefundPositionOutcome::Position(position) => {
+            assert_eq!(
+                position.position_kind,
+                RecoverablePositionKind::HyperliquidSpot
+            );
+            assert_eq!(
+                position.custody_vault_id,
+                Some(destination_execution_vault.id.into())
+            );
+            assert_eq!(position.asset, source_usdc);
+            assert_eq!(position.amount.as_str(), "1000000");
+            assert_eq!(position.hyperliquid_coin.as_deref(), Some("USDC"));
+            assert_eq!(position.hyperliquid_canonical, Some(CanonicalAsset::Usdc));
+            assert!(!position.requires_clearinghouse_unwrap);
+        }
+        other => {
+            panic!("expected destination_execution HyperliquidSpot refund position, got {other:?}")
+        }
+    }
+}
+
+#[tokio::test]
+async fn refund_position_discovery_reads_hl_clearinghouse_balance_from_destination_execution_vault()
+{
+    let test_db = test_database().await;
+    let hyperliquid_info = TestHyperliquidInfoServer::spawn_with_balances_and_clearinghouse(
+        vec![test_hyperliquid_spot_balance("USDC", 1, "0", "0")],
+        "100",
+    )
+    .await;
+    let (deps, _evm_rpc) = test_deps_with_arbitrum_evm_balance(
+        test_db.db.clone(),
+        hyperliquid_info.base_url.clone(),
+        "0",
+    )
+    .await;
+    let planned_at = Utc::now();
+    let source_usdc = test_asset("evm:42161", "0xaf88d065e77c8cc2239327c5edb3a432268e5831");
+    let mut order = test_order(source_usdc.clone(), planned_at);
+    order.destination_asset = test_asset("bitcoin", "native");
+    order.workflow_parent_span_id = order.workflow_trace_id[..16].to_string();
+    let failed_attempt_id = Uuid::now_v7();
+    let destination_execution_vault =
+        test_custody_vault(&order, CustodyVaultRole::DestinationExecution, &source_usdc);
+    seed_hyperliquid_spot_refund_order(
+        &test_db.db,
+        &test_db.pool,
+        &order,
+        failed_attempt_id,
+        &destination_execution_vault,
+    )
+    .await;
+
+    let discovery = discover_single_refund_position_with_deps(
+        &deps,
+        DiscoverSingleRefundPositionInput {
+            order_id: order.id.into(),
+            failed_attempt_id: failed_attempt_id.into(),
+        },
+    )
+    .await
+    .expect("discover refund position from destination_execution HL clearinghouse balance");
+
+    match discovery.outcome {
+        SingleRefundPositionOutcome::Position(position) => {
+            assert_eq!(
+                position.position_kind,
+                RecoverablePositionKind::HyperliquidSpot
+            );
+            assert_eq!(
+                position.custody_vault_id,
+                Some(destination_execution_vault.id.into())
+            );
+            assert_eq!(position.asset, source_usdc);
+            assert_eq!(position.amount.as_str(), "100000000");
+            assert_eq!(position.hyperliquid_coin.as_deref(), Some("USDC"));
+            assert_eq!(position.hyperliquid_canonical, Some(CanonicalAsset::Usdc));
+            assert!(position.requires_clearinghouse_unwrap);
+        }
+        other => {
+            panic!(
+                "expected destination_execution Hyperliquid clearinghouse refund position, got {other:?}"
+            )
+        }
+    }
+}
+
+#[tokio::test]
+async fn refund_position_discovery_preserves_destination_execution_evm_balance_without_hl_balance()
+{
+    let test_db = test_database().await;
+    let hyperliquid_info = TestHyperliquidInfoServer::spawn_with_balances_and_clearinghouse(
+        vec![test_hyperliquid_spot_balance("USDC", 1, "0", "0")],
+        "0",
+    )
+    .await;
+    let (deps, _evm_rpc) = test_deps_with_arbitrum_evm_balance(
+        test_db.db.clone(),
+        hyperliquid_info.base_url.clone(),
+        "2500",
+    )
+    .await;
+    let planned_at = Utc::now();
+    let source_usdc = test_asset("evm:42161", "0xaf88d065e77c8cc2239327c5edb3a432268e5831");
+    let mut order = test_order(source_usdc.clone(), planned_at);
+    order.destination_asset = test_asset("bitcoin", "native");
+    order.workflow_parent_span_id = order.workflow_trace_id[..16].to_string();
+    let failed_attempt_id = Uuid::now_v7();
+    let destination_execution_vault =
+        test_custody_vault(&order, CustodyVaultRole::DestinationExecution, &source_usdc);
+    seed_hyperliquid_spot_refund_order(
+        &test_db.db,
+        &test_db.pool,
+        &order,
+        failed_attempt_id,
+        &destination_execution_vault,
+    )
+    .await;
+
+    let discovery = discover_single_refund_position_with_deps(
+        &deps,
+        DiscoverSingleRefundPositionInput {
+            order_id: order.id.into(),
+            failed_attempt_id: failed_attempt_id.into(),
+        },
+    )
+    .await
+    .expect("discover refund position from destination_execution EVM balance");
+
+    match discovery.outcome {
+        SingleRefundPositionOutcome::Position(position) => {
+            assert_eq!(
+                position.position_kind,
+                RecoverablePositionKind::ExternalCustody
+            );
+            assert_eq!(
+                position.custody_vault_id,
+                Some(destination_execution_vault.id.into())
+            );
+            assert_eq!(position.asset, source_usdc);
+            assert_eq!(position.amount.as_str(), "2500");
+            assert_eq!(position.hyperliquid_coin, None);
+            assert_eq!(position.hyperliquid_canonical, None);
+            assert!(!position.requires_clearinghouse_unwrap);
+        }
+        other => panic!("expected destination_execution ExternalCustody position, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn refund_position_discovery_handles_hl_spot_and_clearinghouse_balances() {
     let test_db = test_database().await;
     let hyperliquid_info = TestHyperliquidInfoServer::spawn_with_balances_and_clearinghouse(
@@ -2481,6 +2758,36 @@ fn test_deps_with_action_providers_and_chain_registry(
         chain_registry,
         pricing_provider,
     )
+}
+
+async fn test_deps_with_arbitrum_evm_balance(
+    db: Database,
+    hyperliquid_base_url: String,
+    raw_evm_balance: &str,
+) -> (OrderActivityDeps, TestEvmRpcServer) {
+    let evm_rpc = TestEvmRpcServer::spawn_with_balance(raw_evm_balance).await;
+    let action_providers = Arc::new(ActionProviderRegistry::new(vec![], vec![], vec![]));
+    let mut chain_registry = ChainRegistry::new();
+    let evm_chain = Arc::new(
+        EvmChain::new(
+            &evm_rpc.base_url,
+            "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+            ChainType::Arbitrum,
+            b"arbitrum-wallet",
+            1,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("construct test EVM chain"),
+    );
+    chain_registry.register_evm(ChainType::Arbitrum, evm_chain);
+    let deps = test_deps_with_action_providers_and_chain_registry(
+        db,
+        action_providers,
+        Some(hyperliquid_base_url),
+        Arc::new(chain_registry),
+    );
+    (deps, evm_rpc)
 }
 
 fn test_settings() -> Settings {
