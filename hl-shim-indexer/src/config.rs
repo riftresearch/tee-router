@@ -19,7 +19,11 @@ pub struct Config {
     #[arg(long, env = "HL_SHIM_BIND", default_value = "0.0.0.0:8080")]
     pub bind: SocketAddr,
 
-    #[arg(long, env = "HL_SHIM_MAX_DB_CONNECTIONS", default_value_t = 10)]
+    // Under 10k load with thousands of HL identities polled across 4 endpoints each,
+    // a 10-connection pool serializes inserts and surfaces as "slow statement"
+    // warnings — the statements aren't slow, the pool is the queue. 64 covers
+    // realistic burst concurrency without overwhelming Postgres.
+    #[arg(long, env = "HL_SHIM_MAX_DB_CONNECTIONS", default_value_t = 64)]
     pub max_db_connections: u32,
 
     #[arg(long, env = "HL_SHIM_HOT_CADENCE_MS", default_value_t = 5_000)]

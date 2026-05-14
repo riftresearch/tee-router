@@ -164,17 +164,17 @@ pub struct SauronArgs {
     )]
     pub sauron_hyperunit_observer_concurrency: usize,
 
-    /// HyperUnit observer poll interval for operations seen less than five minutes ago, in seconds
-    #[arg(long, env = "SAURON_HU_POLL_FAST_SECONDS", default_value = "5")]
-    pub sauron_hu_poll_fast_seconds: u64,
+    /// HyperUnit observer poll interval for operations seen less than five minutes ago, in milliseconds
+    #[arg(long, env = "SAURON_HU_POLL_FAST_MILLIS", default_value = "5000")]
+    pub sauron_hu_poll_fast_millis: u64,
 
-    /// HyperUnit observer poll interval for operations seen less than thirty minutes ago, in seconds
-    #[arg(long, env = "SAURON_HU_POLL_MEDIUM_SECONDS", default_value = "10")]
-    pub sauron_hu_poll_medium_seconds: u64,
+    /// HyperUnit observer poll interval for operations seen less than thirty minutes ago, in milliseconds
+    #[arg(long, env = "SAURON_HU_POLL_MEDIUM_MILLIS", default_value = "10000")]
+    pub sauron_hu_poll_medium_millis: u64,
 
-    /// HyperUnit observer poll interval for operations seen at least thirty minutes ago, in seconds
-    #[arg(long, env = "SAURON_HU_POLL_SLOW_SECONDS", default_value = "20")]
-    pub sauron_hu_poll_slow_seconds: u64,
+    /// HyperUnit observer poll interval for operations seen at least thirty minutes ago, in milliseconds
+    #[arg(long, env = "SAURON_HU_POLL_SLOW_MILLIS", default_value = "20000")]
+    pub sauron_hu_poll_slow_millis: u64,
 
     /// Maximum number of concurrent Hyperliquid observer operation polls
     ///
@@ -336,16 +336,16 @@ impl fmt::Debug for SauronArgs {
                 &self.sauron_hyperunit_observer_concurrency,
             )
             .field(
-                "sauron_hu_poll_fast_seconds",
-                &self.sauron_hu_poll_fast_seconds,
+                "sauron_hu_poll_fast_millis",
+                &self.sauron_hu_poll_fast_millis,
             )
             .field(
-                "sauron_hu_poll_medium_seconds",
-                &self.sauron_hu_poll_medium_seconds,
+                "sauron_hu_poll_medium_millis",
+                &self.sauron_hu_poll_medium_millis,
             )
             .field(
-                "sauron_hu_poll_slow_seconds",
-                &self.sauron_hu_poll_slow_seconds,
+                "sauron_hu_poll_slow_millis",
+                &self.sauron_hu_poll_slow_millis,
             )
             .field(
                 "sauron_hyperliquid_observer_concurrency",
@@ -434,9 +434,9 @@ mod tests {
             hyperunit_proxy_url: Some("socks5://hyperunit-proxy-secret:1080".to_string()),
             sauron_hl_bridge_match_window_seconds: 1_800,
             sauron_hyperunit_observer_concurrency: 64,
-            sauron_hu_poll_fast_seconds: 5,
-            sauron_hu_poll_medium_seconds: 10,
-            sauron_hu_poll_slow_seconds: 20,
+            sauron_hu_poll_fast_millis: 5_000,
+            sauron_hu_poll_medium_millis: 10_000,
+            sauron_hu_poll_slow_millis: 20_000,
             sauron_hyperliquid_observer_concurrency: 128,
             sauron_evm_receipt_observer_concurrency: 128,
             token_indexer_api_key: Some("token-indexer-api-key-secret".to_string()),
