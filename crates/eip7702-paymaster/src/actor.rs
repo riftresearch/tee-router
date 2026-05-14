@@ -20,7 +20,7 @@ use tokio::sync::{
 };
 use tracing::{debug, info, warn};
 
-pub const PAYMASTER_COMMAND_BUFFER: usize = 128;
+pub const PAYMASTER_COMMAND_BUFFER: usize = 1024;
 
 #[derive(Clone, Debug)]
 pub struct PaymasterFundingRequest {
@@ -202,6 +202,15 @@ impl PaymasterHandle {
                 }
             })
             .collect();
+
+        let queue_capacity = self.command_tx.max_capacity();
+        let queue_depth = queue_capacity.saturating_sub(self.command_tx.capacity());
+        if queue_depth.saturating_mul(5) >= queue_capacity.saturating_mul(4) {
+            warn!(
+                queue_depth,
+                queue_capacity, "EVM paymaster command queue is over 80% full"
+            );
+        }
 
         if self
             .command_tx

@@ -74,6 +74,7 @@ const DEFAULT_ETH_USD_MICRO: u128 = 3_000 * USD_MICRO;
 const DEFAULT_BTC_USD_MICRO: u128 = 100_000 * USD_MICRO;
 const DEFAULT_USD_STABLE_USD_MICRO: u128 = USD_MICRO;
 const MOCK_UNIT_DESTINATION_TX_CONFIRMATIONS: u64 = 10;
+const DEFAULT_MOCK_UNIT_WITHDRAWAL_RELEASE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MockService {
@@ -124,15 +125,27 @@ pub struct MockServicePaymaster {
     service: MockService,
     chain_id: u64,
     handle: Option<PaymasterHandle>,
+    #[cfg(test)]
+    test_behavior: Option<MockServicePaymasterTestBehavior>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+enum MockServicePaymasterTestBehavior {
+    Hang(Duration),
+    Succeed(TxHash),
 }
 
 impl fmt::Debug for MockServicePaymaster {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("MockServicePaymaster")
+        let mut debug = f.debug_struct("MockServicePaymaster");
+        debug
             .field("service", &self.service)
             .field("chain_id", &self.chain_id)
-            .field("handle", &self.handle.is_some())
-            .finish()
+            .field("handle", &self.handle.is_some());
+        #[cfg(test)]
+        debug.field("test_behavior", &self.test_behavior);
+        debug.finish()
     }
 }
 
@@ -142,6 +155,8 @@ impl MockServicePaymaster {
             service,
             chain_id,
             handle: Some(handle),
+            #[cfg(test)]
+            test_behavior: None,
         }
     }
 
@@ -151,6 +166,27 @@ impl MockServicePaymaster {
             service,
             chain_id,
             handle: None,
+            test_behavior: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn hanging(service: MockService, chain_id: u64, duration: Duration) -> Self {
+        Self {
+            service,
+            chain_id,
+            handle: None,
+            test_behavior: Some(MockServicePaymasterTestBehavior::Hang(duration)),
+        }
+    }
+
+    #[cfg(test)]
+    fn successful(service: MockService, chain_id: u64, tx_hash: TxHash) -> Self {
+        Self {
+            service,
+            chain_id,
+            handle: None,
+            test_behavior: Some(MockServicePaymasterTestBehavior::Succeed(tx_hash)),
         }
     }
 
@@ -163,6 +199,19 @@ impl MockServicePaymaster {
     }
 
     pub async fn submit(&self, execution: Execution) -> eip7702_paymaster::Result<TxHash> {
+        #[cfg(test)]
+        if let Some(test_behavior) = self.test_behavior {
+            return match test_behavior {
+                MockServicePaymasterTestBehavior::Hang(duration) => {
+                    tokio::time::sleep(duration).await;
+                    Err(PaymasterError::Actor {
+                        message: "test paymaster hang completed without submitting".to_string(),
+                    })
+                }
+                MockServicePaymasterTestBehavior::Succeed(tx_hash) => Ok(tx_hash),
+            };
+        }
+
         self.handle
             .as_ref()
             .ok_or_else(|| PaymasterError::Actor {
@@ -353,6 +402,9 @@ pub struct MockIntegratorConfig {
     /// EVM RPC URLs used to detect native Unit deposits into generated
     /// protocol addresses.
     pub unit_evm_rpc_urls: BTreeMap<String, String>,
+    /// Hard cap for mock Unit withdrawal release work after Hyperliquid
+    /// accepts the source transfer.
+    pub unit_withdrawal_release_timeout: Duration,
     /// EVM RPC URLs where every mock service treasury should be funded,
     /// delegated, and backed by its own paymaster.
     pub mock_service_evm_chains: BTreeMap<u64, String>,
@@ -428,6 +480,7 @@ impl Default for MockIntegratorConfig {
             hyperliquid_bridge_deposit_latency: Duration::ZERO,
             hyperliquid_bridge_deposit_failure_probability_bps: 0,
             unit_evm_rpc_urls: BTreeMap::new(),
+            unit_withdrawal_release_timeout: DEFAULT_MOCK_UNIT_WITHDRAWAL_RELEASE_TIMEOUT,
             mock_service_evm_chains: BTreeMap::new(),
             mock_service_paymasters: BTreeMap::new(),
             unit_bitcoin_rpc_url: None,
@@ -548,6 +601,12 @@ impl MockIntegratorConfig {
     pub fn with_unit_evm_rpc_url(mut self, chain: UnitChain, url: impl Into<String>) -> Self {
         self.unit_evm_rpc_urls
             .insert(chain.as_wire_str().to_string(), url.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_unit_withdrawal_release_timeout(mut self, timeout: Duration) -> Self {
+        self.unit_withdrawal_release_timeout = timeout;
         self
     }
 
@@ -742,6 +801,7 @@ struct MockIntegratorState {
     unit_operations: Mutex<BTreeMap<String, Vec<MockUnitOperationEntry>>>,
     unit_protocol_private_keys: Mutex<BTreeMap<String, MockUnitProtocolKey>>,
     unit_evm_rpc_urls: BTreeMap<String, String>,
+    unit_withdrawal_release_timeout: Duration,
     mock_service_evm_chains: BTreeMap<u64, String>,
     mock_service_accounts: BTreeMap<MockService, MultichainAccount>,
     /// `(service, chain_id) -> paymaster handle`.
@@ -1407,6 +1467,7 @@ impl MockIntegratorState {
             unit_operations: Mutex::default(),
             unit_protocol_private_keys: Mutex::default(),
             unit_evm_rpc_urls: config.unit_evm_rpc_urls.clone(),
+            unit_withdrawal_release_timeout: config.unit_withdrawal_release_timeout,
             mock_service_evm_chains: config.mock_service_evm_chains.clone(),
             mock_service_accounts: mock_service_accounts(),
             mock_service_paymasters: config.mock_service_paymasters.clone(),
@@ -4936,16 +4997,33 @@ async fn complete_unit_withdrawal_after_hyperliquid_transfer(
         }
     }
     if let Some((protocol_address, source_amount)) = unit_withdrawal_to_complete {
+        spawn_mock_unit_withdrawal_completion(
+            Arc::clone(state),
+            protocol_address,
+            source_amount,
+            source_tx_hash,
+        );
+    }
+    Ok(())
+}
+
+fn spawn_mock_unit_withdrawal_completion(
+    state: Arc<MockIntegratorState>,
+    protocol_address: String,
+    source_amount: String,
+    source_tx_hash: String,
+) {
+    tokio::spawn(async move {
         let completion_result = if let Some(error) = state
             .next_unit_withdrawal_completion_error
             .lock()
             .await
             .take()
         {
-            fail_mock_unit_operation(state, &protocol_address, error).await
+            fail_mock_unit_operation(&state, &protocol_address, error).await
         } else {
             complete_mock_unit_operation_with_observation(
-                state,
+                &state,
                 &protocol_address,
                 Some(UnitOperationObservation {
                     source_amount: source_amount.clone(),
@@ -4955,15 +5033,16 @@ async fn complete_unit_withdrawal_after_hyperliquid_transfer(
             .await
         };
         if let Err(err) = completion_result {
+            mark_mock_unit_operation_failed(&state, &protocol_address).await;
             tracing::warn!(
+                target: "mock_hu",
                 %protocol_address,
                 %source_amount,
                 %err,
-                "mock Unit withdrawal completion failed after Hyperliquid source transfer; preserving accepted sendAsset response"
+                "mock Unit withdrawal completion failed after Hyperliquid source transfer; marked operation failed"
             );
         }
-    }
-    Ok(())
+    });
 }
 
 async fn handle_usd_class_transfer(
@@ -6549,7 +6628,17 @@ async fn complete_mock_unit_operation_with_observation(
     observation: Option<UnitOperationObservation>,
 ) -> Result<(), String> {
     let (maybe_deposit_credit, maybe_evm_withdrawal_release, maybe_bitcoin_withdrawal_release) = {
+        tracing::info!(
+            target: "mock_hu",
+            %protocol_address,
+            "acquiring unit_operations lock"
+        );
         let mut operations = state.unit_operations.lock().await;
+        tracing::info!(
+            target: "mock_hu",
+            %protocol_address,
+            "acquired unit_operations lock"
+        );
         let entries = operations
             .get_mut(protocol_address)
             .ok_or_else(|| format!("mock unit operation {protocol_address} was not found"))?;
@@ -6716,39 +6805,117 @@ async fn complete_mock_unit_operation_with_observation(
         }
     }
     if let Some(release) = maybe_evm_withdrawal_release {
-        let tx_hash = match send_mock_unit_evm_withdrawal_release(state, &release).await {
-            Ok(tx_hash) => tx_hash,
-            Err(error) => {
+        let timeout = state.unit_withdrawal_release_timeout;
+        let tx_hash = match tokio::time::timeout(
+            timeout,
+            send_mock_unit_evm_withdrawal_release(state, &release),
+        )
+        .await
+        {
+            Ok(Ok(tx_hash)) => tx_hash,
+            Ok(Err(error)) => {
                 mark_mock_unit_operation_failed(state, &release.protocol_address).await;
                 return Err(error);
             }
+            Err(_) => {
+                mark_mock_unit_operation_failed(state, &release.protocol_address).await;
+                return Err(format!(
+                    "mock Unit EVM withdrawal release timed out after {}",
+                    format_duration_for_log(timeout)
+                ));
+            }
         };
+        tracing::info!(
+            target: "mock_hu",
+            protocol_address = %release.protocol_address,
+            %tx_hash,
+            "setting destination_tx_hash"
+        );
+        tracing::info!(
+            target: "mock_hu",
+            protocol_address = %release.protocol_address,
+            "acquiring unit_operations lock"
+        );
         let mut operations = state.unit_operations.lock().await;
+        tracing::info!(
+            target: "mock_hu",
+            protocol_address = %release.protocol_address,
+            "acquired unit_operations lock"
+        );
         if let Some(entry) = operations
             .get_mut(&release.protocol_address)
             .and_then(|entries| entries.last_mut())
         {
-            entry.operation.destination_tx_hash = Some(tx_hash);
+            entry.operation.destination_tx_hash = Some(tx_hash.clone());
         }
+        tracing::info!(
+            target: "mock_hu",
+            protocol_address = %release.protocol_address,
+            %tx_hash,
+            "set destination_tx_hash"
+        );
     }
     if let Some(release) = maybe_bitcoin_withdrawal_release {
-        let tx_hash = match send_mock_unit_bitcoin_withdrawal_release(state, &release).await {
-            Ok(tx_hash) => tx_hash,
-            Err(error) => {
+        let timeout = state.unit_withdrawal_release_timeout;
+        let tx_hash = match tokio::time::timeout(
+            timeout,
+            send_mock_unit_bitcoin_withdrawal_release(state, &release),
+        )
+        .await
+        {
+            Ok(Ok(tx_hash)) => tx_hash,
+            Ok(Err(error)) => {
                 mark_mock_unit_operation_failed(state, &release.protocol_address).await;
                 return Err(error);
             }
+            Err(_) => {
+                mark_mock_unit_operation_failed(state, &release.protocol_address).await;
+                return Err(format!(
+                    "mock Unit Bitcoin withdrawal release timed out after {}",
+                    format_duration_for_log(timeout)
+                ));
+            }
         };
+        tracing::info!(
+            target: "mock_hu",
+            protocol_address = %release.protocol_address,
+            %tx_hash,
+            "setting destination_tx_hash"
+        );
+        tracing::info!(
+            target: "mock_hu",
+            protocol_address = %release.protocol_address,
+            "acquiring unit_operations lock"
+        );
         let mut operations = state.unit_operations.lock().await;
+        tracing::info!(
+            target: "mock_hu",
+            protocol_address = %release.protocol_address,
+            "acquired unit_operations lock"
+        );
         if let Some(entry) = operations
             .get_mut(&release.protocol_address)
             .and_then(|entries| entries.last_mut())
         {
-            entry.operation.destination_tx_hash = Some(tx_hash);
+            entry.operation.destination_tx_hash = Some(tx_hash.clone());
         }
+        tracing::info!(
+            target: "mock_hu",
+            protocol_address = %release.protocol_address,
+            %tx_hash,
+            "set destination_tx_hash"
+        );
     }
 
     Ok(())
+}
+
+fn format_duration_for_log(duration: Duration) -> String {
+    if duration.subsec_nanos() == 0 {
+        format!("{}s", duration.as_secs())
+    } else {
+        format!("{duration:?}")
+    }
 }
 
 async fn mark_mock_unit_operation_failed(state: &Arc<MockIntegratorState>, protocol_address: &str) {
@@ -6769,6 +6936,14 @@ async fn send_mock_unit_evm_withdrawal_release(
     state: &Arc<MockIntegratorState>,
     release: &MockUnitEvmWithdrawalRelease,
 ) -> Result<String, String> {
+    tracing::info!(
+        target: "mock_hu",
+        protocol_address = %release.protocol_address,
+        dst_chain = %release.dst_chain,
+        dst_addr = %release.dst_addr,
+        amount = %release.amount,
+        "submitting mock Unit EVM withdrawal release"
+    );
     let Some(rpc_url) = state
         .unit_evm_rpc_urls
         .get(release.dst_chain.as_wire_str())
@@ -6793,6 +6968,12 @@ async fn send_mock_unit_evm_withdrawal_release(
         ));
     }
 
+    tracing::info!(
+        target: "mock_hu",
+        protocol_address = %release.protocol_address,
+        %rpc_url,
+        "connecting EVM provider for mock Unit withdrawal release"
+    );
     let provider = ProviderBuilder::new()
         .connect(&rpc_url)
         .await
@@ -6807,10 +6988,49 @@ async fn send_mock_unit_evm_withdrawal_release(
         value: amount,
         callData: Bytes::new(),
     };
-    let tx_hash = handle
-        .submit(execution)
-        .await
-        .map_err(|err| format!("mock Unit withdrawal release failed: {err}"))?;
+    tracing::info!(
+        target: "mock_hu",
+        protocol_address = %release.protocol_address,
+        chain_id,
+        "calling paymaster.submit"
+    );
+    let submit_result = tokio::time::timeout(
+        state.unit_withdrawal_release_timeout,
+        handle.submit(execution),
+    )
+    .await;
+    let tx_hash = match submit_result {
+        Ok(Ok(tx_hash)) => {
+            tracing::info!(
+                target: "mock_hu",
+                protocol_address = %release.protocol_address,
+                tx_hash = %format!("{tx_hash:#x}"),
+                "paymaster.submit returned: ok"
+            );
+            tx_hash
+        }
+        Ok(Err(err)) => {
+            tracing::info!(
+                target: "mock_hu",
+                protocol_address = %release.protocol_address,
+                error = %err,
+                "paymaster.submit returned: err"
+            );
+            return Err(format!("mock Unit withdrawal release failed: {err}"));
+        }
+        Err(_) => {
+            tracing::info!(
+                target: "mock_hu",
+                protocol_address = %release.protocol_address,
+                timeout = %format_duration_for_log(state.unit_withdrawal_release_timeout),
+                "paymaster.submit returned: err"
+            );
+            return Err(format!(
+                "mock Unit withdrawal release paymaster.submit timed out after {}",
+                format_duration_for_log(state.unit_withdrawal_release_timeout)
+            ));
+        }
+    };
     if MOCK_UNIT_DESTINATION_TX_CONFIRMATIONS > 1 {
         provider
             .anvil_mine(Some(MOCK_UNIT_DESTINATION_TX_CONFIRMATIONS - 1), None)
@@ -6827,6 +7047,13 @@ async fn send_mock_unit_bitcoin_withdrawal_release(
     state: &Arc<MockIntegratorState>,
     release: &MockUnitBitcoinWithdrawalRelease,
 ) -> Result<String, String> {
+    tracing::info!(
+        target: "mock_hu",
+        protocol_address = %release.protocol_address,
+        dst_addr = %release.dst_addr,
+        amount = %release.amount,
+        "submitting mock Unit Bitcoin withdrawal release"
+    );
     let (Some(rpc_url), Some(cookie_path)) = (
         state.unit_bitcoin_rpc_url.clone(),
         state.unit_bitcoin_cookie_path.clone(),
@@ -6858,6 +7085,12 @@ async fn send_mock_unit_bitcoin_withdrawal_release(
             release.amount
         )
     })?;
+    tracing::info!(
+        target: "mock_hu",
+        protocol_address = %release.protocol_address,
+        amount_sats,
+        "calling Bitcoin send_to_address"
+    );
     let sent = client
         .send_to_address(&destination, bitcoin::Amount::from_sat(amount_sats))
         .await
@@ -6865,12 +7098,23 @@ async fn send_mock_unit_bitcoin_withdrawal_release(
     let txid = sent
         .txid()
         .map_err(|err| format!("mock Unit Bitcoin withdrawal txid decode failed: {err}"))?;
+    tracing::info!(
+        target: "mock_hu",
+        protocol_address = %release.protocol_address,
+        %txid,
+        "Bitcoin send_to_address returned: ok"
+    );
     let miner = client
         .get_new_address(None, None)
         .await
         .map_err(|err| format!("mock Unit Bitcoin miner address allocation failed: {err}"))?
         .require_network(bitcoin::Network::Regtest)
         .map_err(|err| format!("mock Unit Bitcoin miner address network mismatch: {err}"))?;
+    tracing::info!(
+        target: "mock_hu",
+        protocol_address = %release.protocol_address,
+        "mining mock Unit Bitcoin withdrawal release"
+    );
     client
         .generate_to_address(1, &miner)
         .await
@@ -8757,6 +9001,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unit_mock_eth_withdrawal_times_out_hung_paymaster_and_marks_failure() {
+        use alloy::node_bindings::Anvil;
+
+        let anvil = Anvil::new().prague().try_spawn().expect("anvil spawn");
+        let chain_id = anvil.chain_id();
+        let recipient = Address::repeat_byte(0x99);
+        let mut paymasters = BTreeMap::new();
+        paymasters.insert(
+            (MockService::Hyperunit, chain_id),
+            MockServicePaymaster::hanging(
+                MockService::Hyperunit,
+                chain_id,
+                Duration::from_secs(10),
+            ),
+        );
+        let server = MockIntegratorServer::spawn_with_config(
+            MockIntegratorConfig::default()
+                .with_unit_evm_rpc_url(UnitChain::Base, anvil.endpoint())
+                .with_unit_withdrawal_release_timeout(Duration::from_millis(100))
+                .with_mock_service_evm_chain(chain_id, anvil.endpoint())
+                .with_mock_service_paymasters(paymasters),
+        )
+        .await
+        .expect("spawn mock integrator");
+        let generated: UnitGenerateAddressResponse = reqwest::get(format!(
+            "{}/gen/hyperliquid/base/eth/{recipient:#x}",
+            server.base_url()
+        ))
+        .await
+        .expect("gen request")
+        .error_for_status()
+        .expect("gen 200")
+        .json()
+        .await
+        .expect("gen json");
+
+        let started_at = std::time::Instant::now();
+        let error = complete_mock_unit_operation_with_observation(
+            &server.state,
+            &generated.address,
+            Some(UnitOperationObservation {
+                source_amount: "1250000000000000000".to_string(),
+                source_tx_hash: Some("hl:oid:1".to_string()),
+            }),
+        )
+        .await
+        .expect_err("hung paymaster should time out");
+        assert!(
+            started_at.elapsed() < Duration::from_secs(2),
+            "completion did not respect short timeout"
+        );
+        assert!(error.contains("timed out"), "{error}");
+
+        let operations = server.unit_operations().await;
+        let operation = operations
+            .iter()
+            .find(|operation| operation.protocol_address == generated.address)
+            .expect("unit operation");
+        assert_eq!(operation.state, "failure");
+        assert!(operation.destination_tx_hash.is_none());
+    }
+
+    #[tokio::test]
     async fn unit_bitcoin_indexer_completes_confirmed_block_outputs() {
         let state = Arc::new(MockIntegratorState::new(&MockIntegratorConfig::default()));
         let protocol_wallet =
@@ -9885,6 +10192,115 @@ mod tests {
             assert_eq!(submitted["action"]["nonce"], 1_700_000_000_000_u64);
             assert_eq!(submitted["action"]["hyperliquidChain"], "Testnet");
             assert_eq!(submitted["action"]["signatureChainId"], "0x66eee");
+        }
+
+        #[tokio::test]
+        async fn concurrent_send_asset_handlers_return_while_unit_withdrawals_complete() {
+            use alloy::node_bindings::Anvil;
+
+            let anvil = Anvil::new().prague().try_spawn().expect("anvil spawn");
+            let chain_id = anvil.chain_id();
+            let mut paymasters = BTreeMap::new();
+            paymasters.insert(
+                (MockService::Hyperunit, chain_id),
+                MockServicePaymaster::successful(
+                    MockService::Hyperunit,
+                    chain_id,
+                    B256::repeat_byte(0x42),
+                ),
+            );
+            let server = MockIntegratorServer::spawn_with_config(
+                MockIntegratorConfig::default()
+                    .with_unit_evm_rpc_url(UnitChain::Base, anvil.endpoint())
+                    .with_unit_withdrawal_release_timeout(Duration::from_secs(30))
+                    .with_mock_service_evm_chain(chain_id, anvil.endpoint())
+                    .with_mock_service_paymasters(paymasters),
+            )
+            .await
+            .expect("spawn mock integrator");
+            let wallet = TEST_WALLET.parse::<PrivateKeySigner>().expect("wallet");
+            server
+                .credit_hyperliquid_balance(wallet.address(), "UETH", 1.0)
+                .await;
+
+            let request_count = 200usize;
+            let mut protocol_addresses = Vec::with_capacity(request_count);
+            for index in 0..request_count {
+                let recipient = Address::repeat_byte(index as u8 + 1);
+                let generated: UnitGenerateAddressResponse = reqwest::get(format!(
+                    "{}/gen/hyperliquid/base/eth/{recipient:#x}",
+                    server.base_url()
+                ))
+                .await
+                .expect("gen request")
+                .error_for_status()
+                .expect("gen 200")
+                .json()
+                .await
+                .expect("gen json");
+                protocol_addresses.push(generated.address);
+            }
+
+            let base_url = server.base_url().to_string();
+            let mut send_tasks = tokio::task::JoinSet::new();
+            for (index, protocol_address) in protocol_addresses.iter().cloned().enumerate() {
+                let base_url = base_url.clone();
+                send_tasks.spawn(async move {
+                    let client = new_client(&base_url);
+                    client
+                        .send_asset(
+                            protocol_address,
+                            "spot".to_string(),
+                            "spot".to_string(),
+                            "UETH:0x0000000000000000000000000000000000000000".to_string(),
+                            "0.000000000000000001".to_string(),
+                            1_700_000_000_000_u64 + index as u64,
+                        )
+                        .await
+                });
+            }
+
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while let Some(result) = send_tasks.join_next().await {
+                    let response = result
+                        .expect("sendAsset task join")
+                        .expect("sendAsset response");
+                    assert_eq!(response["status"], "ok");
+                    assert_eq!(response["response"]["type"], "default");
+                }
+            })
+            .await
+            .expect("sendAsset handlers timed out");
+
+            let expected_protocol_addresses =
+                protocol_addresses.iter().cloned().collect::<BTreeSet<_>>();
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    let operations = server.unit_operations().await;
+                    let matching = operations
+                        .iter()
+                        .filter(|operation| {
+                            expected_protocol_addresses.contains(&operation.protocol_address)
+                        })
+                        .collect::<Vec<_>>();
+                    assert!(
+                        matching
+                            .iter()
+                            .all(|operation| operation.state != "failure"),
+                        "a concurrent Unit withdrawal failed"
+                    );
+                    if matching.len() == request_count
+                        && matching.iter().all(|operation| {
+                            operation.state == "done" && operation.destination_tx_hash.is_some()
+                        })
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .expect("Unit withdrawal completions timed out");
         }
 
         #[tokio::test]
