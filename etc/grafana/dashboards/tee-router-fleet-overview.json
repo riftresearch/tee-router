@@ -1,0 +1,133 @@
+{
+  "annotations": {"list": [{"builtIn": 1, "datasource": {"type": "grafana", "uid": "-- Grafana --"}, "enable": true, "hide": true, "iconColor": "rgba(0, 211, 255, 1)", "name": "Annotations & Alerts", "type": "dashboard"}]},
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [
+    {"asDropdown": false, "icon": "external link", "includeVars": false, "keepTime": true, "tags": [], "targetBlank": false, "title": "TEE Plane", "type": "link", "url": "/d/tee-router-tee-plane"},
+    {"asDropdown": false, "icon": "external link", "includeVars": false, "keepTime": true, "tags": [], "targetBlank": false, "title": "Sauron", "type": "link", "url": "/d/tee-router-sauron"},
+    {"asDropdown": false, "icon": "external link", "includeVars": false, "keepTime": true, "tags": [], "targetBlank": false, "title": "Data Stores", "type": "link", "url": "/d/tee-router-data-stores"},
+    {"asDropdown": true, "icon": "external link", "includeVars": false, "keepTime": true, "tags": ["tee-router"], "targetBlank": false, "title": "All sidecars", "type": "dashboards"}
+  ],
+  "liveNow": false,
+  "panels": [
+    {
+      "type": "row",
+      "id": 100,
+      "title": "Fleet health",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "collapsed": false
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+      "description": "Scrape health for every Tee Router process. Click a tile to drill into that service's dashboard.",
+      "fieldConfig": {"defaults": {"mappings": [{"options": {"0": {"color": "red", "text": "DOWN"}}, "type": "value"}, {"options": {"1": {"color": "green", "text": "UP"}}, "type": "value"}], "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}, "unit": "none"}, "overrides": []},
+      "gridPos": {"h": 6, "w": 24, "x": 0, "y": 1},
+      "id": 1,
+      "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "center", "orientation": "horizontal", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "value_and_name"},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "victoriametrics"}, "editorMode": "code", "expr": "up", "legendFormat": "{{job}}", "refId": "A"}
+      ],
+      "title": "Up Status (per scrape target)",
+      "type": "stat"
+    },
+    {
+      "type": "row",
+      "id": 101,
+      "title": "Order pipeline",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 7},
+      "collapsed": false
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+      "description": "Top-line: orders by status. The shape here is the truest indicator of throughput health.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisLabel": "orders", "drawStyle": "line", "fillOpacity": 25, "lineWidth": 2, "showPoints": "never", "stacking": {"group": "A", "mode": "normal"}}, "unit": "short"}},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "id": 2,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "victoriametrics"}, "editorMode": "code", "expr": "sum by (status) (tee_router_operator_order_status_depth{service=\"router-worker\"})", "legendFormat": "{{status}}", "refId": "A"}],
+      "title": "In-Progress Order Queue",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+      "description": "Completion + refund rate over last 5m. Completions/min is the throughput target.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisLabel": "ops/s", "drawStyle": "line", "fillOpacity": 25, "lineWidth": 2, "showPoints": "never"}, "unit": "reqps"}},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "id": 3,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "victoriametrics"}, "editorMode": "code", "expr": "sum by (terminal_status) (rate(tee_router_temporal_worker_workflow_terminal_total{service=\"temporal-worker\"}[5m]))", "legendFormat": "{{terminal_status}}", "refId": "A"}],
+      "title": "Workflow Terminations (5m rate)",
+      "type": "timeseries"
+    },
+    {
+      "type": "row",
+      "id": 102,
+      "title": "RED indicators (per service)",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 16},
+      "collapsed": false
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+      "description": "Outbound non-2xx error rate across every upstream the router talks to, grouped by kind={trading_venue|sidecar_service} and service.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisLabel": "errors/s", "drawStyle": "line", "fillOpacity": 25, "lineWidth": 2, "showPoints": "never"}, "unit": "reqps"}},
+      "gridPos": {"h": 10, "w": 12, "x": 0, "y": 17},
+      "id": 4,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "victoriametrics"}, "editorMode": "code", "expr": "sum by (kind, service) (rate(tee_router_upstream_requests_total{status_class!=\"2xx\"}[5m]))", "legendFormat": "{{kind}}/{{service}}", "refId": "A"}],
+      "title": "Upstream Error Rate (5m, by kind/service)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+      "description": "p95 outbound latency to each upstream. Click through to the per-service dashboard for endpoint-level breakdown.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisLabel": "seconds", "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never"}, "unit": "s"}},
+      "gridPos": {"h": 10, "w": 12, "x": 12, "y": 17},
+      "id": 5,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "victoriametrics"}, "editorMode": "code", "expr": "histogram_quantile(0.95, sum by (le, kind, service) (rate(tee_router_upstream_request_duration_seconds_bucket[5m])))", "legendFormat": "{{kind}}/{{service}}", "refId": "A"}],
+      "title": "Upstream p95 Latency (by kind/service)",
+      "type": "timeseries"
+    },
+    {
+      "type": "row",
+      "id": 103,
+      "title": "Temporal saturation",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 27},
+      "collapsed": false
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+      "description": "Task schedule→start p95. The truest indicator of Temporal-worker / Temporal-server load. Sustained values >5s = pollers can't keep up.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisLabel": "seconds", "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never"}, "unit": "s"}},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 28},
+      "id": 6,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "victoriametrics"}, "editorMode": "code", "expr": "histogram_quantile(0.95, sum by (le, task_type, taskqueue) (rate(task_schedule_to_start_latency_bucket{taskqueue=\"tee_router_order_execution\"}[1m])))", "legendFormat": "{{task_type}} {{taskqueue}}", "refId": "A"}],
+      "title": "Schedule-to-Start Latency p95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+      "description": "Temporal persistence layer p95. >100ms across hot ops = Temporal Postgres is the cap.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisLabel": "seconds", "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never"}, "unit": "s"}},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 28},
+      "id": 7,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "victoriametrics"}, "editorMode": "code", "expr": "histogram_quantile(0.95, sum by (le, operation) (rate(persistence_latency_bucket{namespace=\"default\"}[1m])))", "legendFormat": "{{operation}}", "refId": "A"}],
+      "title": "Temporal Persistence Latency p95",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["tee-router", "fleet", "overview"],
+  "templating": {"list": []},
+  "time": {"from": "now-30m", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Tee Router — Fleet Overview",
+  "uid": "tee-router-fleet",
+  "version": 1
+}

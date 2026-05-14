@@ -3525,8 +3525,8 @@
   },
   "timepicker": {},
   "timezone": "browser",
-  "title": "Tee Router Local Overview",
-  "uid": "tee-router-local-overview",
+  "title": "Tee Router — TEE Plane (legacy monolith)",
+  "uid": "tee-router-tee-plane",
   "version": 3,
   "weekStart": ""
 }
