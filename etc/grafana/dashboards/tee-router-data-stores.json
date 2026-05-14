@@ -1,0 +1,76 @@
+{
+  "annotations": {"list": [{"builtIn": 1, "datasource": {"type": "grafana", "uid": "-- Grafana --"}, "enable": true, "hide": true, "iconColor": "rgba(0, 211, 255, 1)", "name": "Annotations & Alerts", "type": "dashboard"}]},
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [{"asDropdown": true, "icon": "external link", "includeVars": false, "keepTime": true, "tags": ["tee-router"], "targetBlank": false, "title": "Tee Router dashboards", "type": "dashboards"}],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+      "description": "p95 latency of router-postgres queries broken down by operation. Slow ops often = lock contention (e.g. update_provider_operation_status holds FOR UPDATE) not statement-slow.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisLabel": "seconds", "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never"}, "unit": "s"}},
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 0},
+      "id": 1,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "victoriametrics"}, "editorMode": "code", "expr": "tee_router_db_query_duration_seconds{quantile=\"0.95\"}", "legendFormat": "{{service_name}} / {{operation}}", "refId": "A"}],
+      "title": "Router Postgres Query Latency p95 (by operation, by service)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+      "description": "Temporal's own Postgres persistence p95 latency. Critical for throughput: every async-matched task is persisted before pickup. Hot ops are UpdateTaskQueue and CompleteWorkflowExecution.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisLabel": "seconds", "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never"}, "unit": "s"}},
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 10},
+      "id": 2,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "victoriametrics"}, "editorMode": "code", "expr": "histogram_quantile(0.95, sum by (le, operation) (rate(persistence_latency_bucket{namespace=\"default\"}[1m])))", "legendFormat": "{{operation}}", "refId": "A"}],
+      "title": "Temporal Persistence Latency p95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+      "description": "DB query rate by operation/status. Useful for spotting hot queries.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisLabel": "q/s", "drawStyle": "line", "fillOpacity": 25, "lineWidth": 2, "showPoints": "never", "stacking": {"group": "A", "mode": "normal"}}, "unit": "qps"}},
+      "gridPos": {"h": 10, "w": 12, "x": 0, "y": 20},
+      "id": 3,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "victoriametrics"}, "editorMode": "code", "expr": "sum by (operation, status) (rate(tee_router_db_queries_total[1m]))", "legendFormat": "{{operation}} {{status}}", "refId": "A"}],
+      "title": "Router Postgres Query Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+      "description": "DB query error ratio per operation (5m). Sustained non-zero = trouble.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisLabel": "errors/s", "drawStyle": "line", "fillOpacity": 25, "lineWidth": 2, "showPoints": "never"}, "unit": "reqps"}},
+      "gridPos": {"h": 10, "w": 12, "x": 12, "y": 20},
+      "id": 4,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "victoriametrics"}, "editorMode": "code", "expr": "sum by (operation) (rate(tee_router_db_queries_total{status=\"error\"}[5m]))", "legendFormat": "{{operation}}", "refId": "A"}],
+      "title": "Router Postgres Query Errors (5m)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+      "description": "Scrape health for every Postgres instance + the data plane services that own them.",
+      "fieldConfig": {"defaults": {"mappings": [{"options": {"0": {"color": "red", "text": "DOWN"}}, "type": "value"}, {"options": {"1": {"color": "green", "text": "UP"}}, "type": "value"}], "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}, "unit": "none"}},
+      "gridPos": {"h": 6, "w": 24, "x": 0, "y": 30},
+      "id": 5,
+      "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "value_and_name"},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "victoriametrics"}, "editorMode": "code", "expr": "up{job=~\".*postgres.*|.*db.*\"}", "legendFormat": "{{job}}", "refId": "A"}],
+      "title": "Postgres / DB Scrape Health",
+      "type": "stat"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["tee-router", "data-stores"],
+  "templating": {"list": []},
+  "time": {"from": "now-30m", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Tee Router — Data Stores",
+  "uid": "tee-router-data-stores",
+  "version": 1
+}
