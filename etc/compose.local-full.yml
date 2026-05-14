@@ -1,3 +1,31 @@
+# Standard postgres tuning for non-source-of-truth databases. Trades durability
+# (synchronous_commit=off — can lose ~few seconds of writes on crash) for write
+# throughput (no per-commit fsync stall on the WAL lock). Safe for any DB whose
+# data is reconstructible: indexer cursors, observation snapshots, analytics
+# rollups, etc. NOT applied to router-postgres which holds the source of truth.
+x-postgres-reconstructible-command: &postgres-reconstructible-command
+  - postgres
+  - -c
+  - max_connections=400
+  - -c
+  - shared_buffers=1GB
+  - -c
+  - effective_cache_size=4GB
+  - -c
+  - work_mem=16MB
+  - -c
+  - maintenance_work_mem=256MB
+  - -c
+  - max_wal_size=2GB
+  - -c
+  - checkpoint_completion_target=0.9
+  - -c
+  - random_page_cost=1.1
+  - -c
+  - effective_io_concurrency=200
+  - -c
+  - synchronous_commit=off
+
 x-temporal-server-base: &temporal-server-base
   image: temporalio/server:1.31.0
   depends_on:
@@ -416,6 +444,7 @@ services:
 
   token-indexer-db:
     image: postgres:16-alpine
+    command: *postgres-reconstructible-command
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -615,6 +644,7 @@ services:
 
   sauron-state-db:
     image: postgres:16-alpine
+    command: *postgres-reconstructible-command
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -689,6 +719,7 @@ services:
 
   hl-shim-db:
     image: postgres:16-alpine
+    command: *postgres-reconstructible-command
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -726,7 +757,8 @@ services:
       HL_SHIM_FUNDING_COLD_CADENCE_MS: 10000
       HL_SHIM_ORDER_STATUS_CADENCE_MS: 1000
       HL_SHIM_WEIGHT_BUDGET_PER_MIN: 100000
-      HL_SHIM_WORKER_COUNT: 32
+      HL_SHIM_WORKER_COUNT: 128
+      HL_SHIM_MAX_DB_CONNECTIONS: 200
     expose:
       - "8080"
       - "9104"
@@ -837,6 +869,7 @@ services:
 
   router-gateway-db:
     image: postgres:16-alpine
+    command: *postgres-reconstructible-command
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -877,6 +910,7 @@ services:
 
   admin-dashboard-auth-db:
     image: postgres:16-alpine
+    command: *postgres-reconstructible-command
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -891,6 +925,7 @@ services:
 
   admin-dashboard-analytics-db:
     image: postgres:16-alpine
+    command: *postgres-reconstructible-command
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
