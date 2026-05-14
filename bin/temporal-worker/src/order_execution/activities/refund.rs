@@ -208,34 +208,42 @@ pub(super) async fn discover_single_refund_position_with_deps(
                 }
             }
             CustodyVaultRole::DestinationExecution => {
-                let Some(asset_id) = vault.asset.clone() else {
-                    continue;
-                };
-                let amount = deps
-                    .custody_action_executor
-                    .custody_vault_balance_raw(&vault)
-                    .await
-                    .map_err(|source| {
-                        custody_action_error("read external custody refund balance", source)
-                    })?;
-                if raw_amount_is_positive(&amount, "external custody refund balance")? {
-                    positions.push(SingleRefundPosition {
-                        position_kind: RecoverablePositionKind::ExternalCustody,
-                        owning_step_id: None,
-                        funding_vault_id: None,
-                        custody_vault_id: Some(vault.id.into()),
-                        asset: DepositAsset {
-                            chain: vault.chain,
-                            asset: asset_id,
-                        },
-                        amount: RawAmount::new(amount).map_err(|source| {
-                            amount_parse_error("external custody refund balance", source)
-                        })?,
-                        hyperliquid_coin: None,
-                        hyperliquid_canonical: None,
-                        requires_clearinghouse_unwrap: false,
-                    });
+                if let Some(asset_id) = vault.asset.clone() {
+                    let amount = deps
+                        .custody_action_executor
+                        .custody_vault_balance_raw(&vault)
+                        .await
+                        .map_err(|source| {
+                            custody_action_error("read external custody refund balance", source)
+                        })?;
+                    if raw_amount_is_positive(&amount, "external custody refund balance")? {
+                        positions.push(SingleRefundPosition {
+                            position_kind: RecoverablePositionKind::ExternalCustody,
+                            owning_step_id: None,
+                            funding_vault_id: None,
+                            custody_vault_id: Some(vault.id.into()),
+                            asset: DepositAsset {
+                                chain: vault.chain.clone(),
+                                asset: asset_id,
+                            },
+                            amount: RawAmount::new(amount).map_err(|source| {
+                                amount_parse_error("external custody refund balance", source)
+                            })?,
+                            hyperliquid_coin: None,
+                            hyperliquid_canonical: None,
+                            requires_clearinghouse_unwrap: false,
+                        });
+                    }
                 }
+                positions.extend(
+                    hyperliquid_spot_refund_positions_for_vault(
+                        deps,
+                        &order,
+                        &vault,
+                        Some(order.source_asset.clone()),
+                    )
+                    .await?,
+                );
             }
             CustodyVaultRole::HyperliquidSpot => {
                 positions.extend(
