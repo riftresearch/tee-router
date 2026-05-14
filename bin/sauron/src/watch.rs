@@ -27,7 +27,7 @@ SELECT
   COALESCE(opo.request_json->>'expected_amount', oes.amount_in, '1') AS min_amount,
   '115792089237316195423570985008687907853269984665640564039457584007913129639935' AS max_amount,
   COALESCE(opo.request_json->>'expected_amount', oes.amount_in, '1') AS required_amount,
-  COALESCE(ro.action_timeout_at, opa.created_at + INTERVAL '15 months') AS deposit_deadline,
+  opa.created_at + INTERVAL '15 months' AS deposit_deadline,
   opa.created_at AS created_at,
   GREATEST(
     opa.updated_at,
@@ -99,7 +99,7 @@ SELECT
   COALESCE(opo.request_json->>'expected_amount', oes.amount_in, '1') AS min_amount,
   '115792089237316195423570985008687907853269984665640564039457584007913129639935' AS max_amount,
   COALESCE(opo.request_json->>'expected_amount', oes.amount_in, '1') AS required_amount,
-  COALESCE(ro.action_timeout_at, opa.created_at + INTERVAL '15 months') AS deposit_deadline,
+  opa.created_at + INTERVAL '15 months' AS deposit_deadline,
   opa.created_at AS created_at,
   GREATEST(
     opa.updated_at,
@@ -172,7 +172,7 @@ SELECT
   COALESCE(opo.request_json->>'expected_amount', oes.amount_in, '1') AS min_amount,
   '115792089237316195423570985008687907853269984665640564039457584007913129639935' AS max_amount,
   COALESCE(opo.request_json->>'expected_amount', oes.amount_in, '1') AS required_amount,
-  COALESCE(ro.action_timeout_at, opa.created_at + INTERVAL '15 months') AS deposit_deadline,
+  opa.created_at + INTERVAL '15 months' AS deposit_deadline,
   opa.created_at AS created_at,
   GREATEST(
     opa.updated_at,
@@ -863,7 +863,7 @@ fn deposit_vault_watch_cutoff() -> Result<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_watch_address, parse_positive_watch_amount,
+        is_watch_active, normalize_watch_address, parse_positive_watch_amount,
         token_identifier_from_router_asset_id, validate_watch_amount_bounds, WatchEntry,
         WatchStore, WatchTarget, FULL_WATCH_QUERY, ORDER_WATCH_QUERY, TARGETED_WATCH_QUERY,
     };
@@ -904,6 +904,19 @@ mod tests {
         }
     }
 
+    fn funding_vault_watch_entry(
+        watch_id: Uuid,
+        source_chain: ChainType,
+        address: &str,
+        deposit_deadline: chrono::DateTime<chrono::Utc>,
+    ) -> WatchEntry {
+        WatchEntry {
+            watch_target: WatchTarget::FundingVault,
+            execution_step_id: None,
+            ..watch_entry(watch_id, source_chain, address, deposit_deadline)
+        }
+    }
+
     #[test]
     fn provider_operation_deposit_watch_queries_select_step_and_filter_terminal_steps() {
         for query in [FULL_WATCH_QUERY, TARGETED_WATCH_QUERY, ORDER_WATCH_QUERY] {
@@ -914,13 +927,19 @@ mod tests {
     }
 
     #[test]
-    fn provider_operation_deposit_watch_queries_use_order_lifetime_for_deadline() {
+    fn provider_operation_deposit_watch_queries_use_provider_operation_lifetime_for_deadline() {
         let operation_expiry_column = ["opa", ".expires_at"].concat();
         for query in [FULL_WATCH_QUERY, TARGETED_WATCH_QUERY, ORDER_WATCH_QUERY] {
-            assert!(query.contains(
-                "COALESCE(ro.action_timeout_at, opa.created_at + INTERVAL '15 months') AS deposit_deadline"
-            ));
+            assert!(query.contains("opa.created_at + INTERVAL '15 months' AS deposit_deadline"));
+            assert!(!query.contains("ro.action_timeout_at"));
             assert!(!query.contains(&operation_expiry_column));
+        }
+    }
+
+    #[test]
+    fn funding_vault_watch_queries_use_cancel_after_for_deadline() {
+        for query in [FULL_WATCH_QUERY, TARGETED_WATCH_QUERY, ORDER_WATCH_QUERY] {
+            assert!(query.contains("dv.cancel_after AS deposit_deadline"));
         }
     }
 
@@ -1332,7 +1351,7 @@ mod tests {
         let store = WatchStore::default();
         let now = utc::now();
         let operation_expires_at = now - Duration::minutes(1);
-        let order_action_timeout_at = now + Duration::minutes(5);
+        let provider_operation_deadline = now + Duration::minutes(5);
         assert!(operation_expires_at < now);
 
         store
@@ -1340,7 +1359,7 @@ mod tests {
                 Uuid::now_v7(),
                 ChainType::Base,
                 "0x0000000000000000000000000000000000000004",
-                order_action_timeout_at,
+                provider_operation_deadline,
             )])
             .await;
 
@@ -1351,8 +1370,51 @@ mod tests {
         assert_eq!(store.snapshot_for_chain(ChainType::Base).await.len(), 1);
     }
 
+    #[test]
+    fn provider_operation_watch_survives_action_timeout() {
+        let now = utc::now();
+        let action_timeout_at = now - Duration::minutes(1);
+        let created_at = now - Duration::minutes(10);
+        let provider_operation_deadline = created_at
+            .checked_add_months(chrono::Months::new(15))
+            .expect("provider-operation TTL should be representable");
+        assert!(action_timeout_at < now);
+        assert!(provider_operation_deadline > now);
+
+        let mut watch = watch_entry(
+            Uuid::now_v7(),
+            ChainType::Base,
+            "0x0000000000000000000000000000000000000005",
+            provider_operation_deadline,
+        );
+        watch.created_at = created_at;
+
+        assert!(is_watch_active(&watch, now));
+    }
+
     #[tokio::test]
-    async fn prune_expired_removes_provider_watch_after_order_deadline() {
+    async fn funding_vault_watch_respects_cancel_after() {
+        let store = WatchStore::default();
+        let now = utc::now();
+
+        store
+            .replace_all(vec![funding_vault_watch_entry(
+                Uuid::now_v7(),
+                ChainType::Base,
+                "0x0000000000000000000000000000000000000006",
+                now - Duration::minutes(1),
+            )])
+            .await;
+
+        let pruned = store.prune_expired().await;
+
+        assert_eq!(pruned, 1);
+        assert_eq!(store.len().await, 0);
+        assert!(store.snapshot_for_chain(ChainType::Base).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn prune_expired_removes_provider_watch_after_provider_deadline() {
         let store = WatchStore::default();
         let now = utc::now();
 
@@ -1360,7 +1422,7 @@ mod tests {
             .replace_all(vec![watch_entry(
                 Uuid::now_v7(),
                 ChainType::Base,
-                "0x0000000000000000000000000000000000000005",
+                "0x0000000000000000000000000000000000000007",
                 now - Duration::minutes(1),
             )])
             .await;
