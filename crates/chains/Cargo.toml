@@ -33,7 +33,7 @@ eip7702-delegator-contract = {workspace=true}
 sha2 = { workspace = true }
 hkdf = { workspace = true }
 getrandom = { workspace = true }
-reqwest = {workspace=true}
+reqwest = {workspace=true, features=["socks"]}
 
 # Metrics
 metrics = { workspace = true }

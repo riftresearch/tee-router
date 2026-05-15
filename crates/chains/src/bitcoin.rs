@@ -53,7 +53,7 @@ struct ReqwestRpcTransport {
 }
 
 impl ReqwestRpcTransport {
-    pub fn new(url: Url, auth: Auth) -> Result<Self> {
+    pub fn new(url: Url, auth: Auth, proxy_url: Option<&str>) -> Result<Self> {
         let auth = auth
             .get_user_pass()
             .map_err(|e| crate::Error::Serialization {
@@ -68,11 +68,21 @@ impl ReqwestRpcTransport {
         } else {
             None
         };
+        let mut client_builder = reqwest::Client::builder()
+            .use_rustls_tls()
+            .timeout(BITCOIN_RPC_HTTP_TIMEOUT);
+        if let Some(proxy_url) = proxy_url {
+            validate_socks5_proxy_url(proxy_url)?;
+            client_builder =
+                client_builder.proxy(reqwest::Proxy::all(proxy_url.trim()).map_err(|e| {
+                    crate::Error::Serialization {
+                        message: format!("invalid bitcoin RPC proxy URL: {e}"),
+                    }
+                })?);
+        }
         Ok(Self {
             url,
-            client: reqwest::Client::builder()
-                .use_rustls_tls()
-                .timeout(BITCOIN_RPC_HTTP_TIMEOUT)
+            client: client_builder
                 .build()
                 .map_err(|e| crate::Error::Serialization {
                     message: format!("failed to construct bitcoin reqwest client: {e}"),
@@ -214,6 +224,36 @@ fn redacted_url_for_debug(url: &Url) -> String {
         redacted.push_str("#<redacted-fragment>");
     }
     redacted
+}
+
+fn validate_socks5_proxy_url(proxy_url: &str) -> Result<()> {
+    let parsed = Url::parse(proxy_url.trim()).map_err(|e| crate::Error::Serialization {
+        message: format!("invalid proxy URL: {e}"),
+    })?;
+    if parsed.scheme() != "socks5" {
+        return Err(crate::Error::Serialization {
+            message: format!("proxy URL must use socks5 scheme, got {}", parsed.scheme()),
+        });
+    }
+    if parsed.host_str().is_none() {
+        return Err(crate::Error::Serialization {
+            message: "proxy URL must include a host".to_string(),
+        });
+    }
+    if parsed.port().is_none() {
+        return Err(crate::Error::Serialization {
+            message: "proxy URL must include a port".to_string(),
+        });
+    }
+    if (!parsed.path().is_empty() && parsed.path() != "/")
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(crate::Error::Serialization {
+            message: "proxy URL must not include a path, query string, or fragment".to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn bitcoin_p2wpkh_transfer_fee_sats(
@@ -379,22 +419,47 @@ impl BitcoinChain {
         untrusted_esplora_url: &str,
         network: Network,
     ) -> Result<Self> {
+        Self::new_with_proxy_urls(
+            bitcoin_core_rpc_url,
+            bitcoin_core_rpc_auth,
+            None,
+            untrusted_esplora_url,
+            None,
+            network,
+        )
+    }
+
+    pub fn new_with_proxy_urls(
+        bitcoin_core_rpc_url: &str,
+        bitcoin_core_rpc_auth: Auth,
+        bitcoin_core_rpc_proxy_url: Option<&str>,
+        untrusted_esplora_url: &str,
+        esplora_proxy_url: Option<&str>,
+        network: Network,
+    ) -> Result<Self> {
         // create a reqwest client
         let rpc_transport = ReqwestRpcTransport::new(
             Url::parse(bitcoin_core_rpc_url).map_err(|e| crate::Error::Serialization {
                 message: format!("invalid bitcoin RPC URL: {e}"),
             })?,
             bitcoin_core_rpc_auth,
+            bitcoin_core_rpc_proxy_url,
         )?;
         let jsonrpc_client = jsonrpc::Client::with_transport(rpc_transport);
         let rpc_client = Client::from_jsonrpc(jsonrpc_client);
 
-        let esplora_client = esplora_client::Builder::new(untrusted_esplora_url)
-            .build_async()
-            .map_err(|e| crate::Error::EsploraClientError {
-                source: e,
-                loc: location!(),
-            })?;
+        let mut esplora_builder = esplora_client::Builder::new(untrusted_esplora_url);
+        if let Some(proxy_url) = esplora_proxy_url {
+            validate_socks5_proxy_url(proxy_url)?;
+            esplora_builder = esplora_builder.proxy(proxy_url.trim());
+        }
+        let esplora_client =
+            esplora_builder
+                .build_async()
+                .map_err(|e| crate::Error::EsploraClientError {
+                    source: e,
+                    loc: location!(),
+                })?;
 
         Ok(Self {
             rpc_client,

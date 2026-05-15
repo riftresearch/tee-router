@@ -840,8 +840,7 @@ fn live_client(
     wallet: PrivateKeySigner,
     vault_address: Option<Address>,
 ) -> TestResult<HyperliquidClient> {
-    let base_url =
-        env::var(HYPERLIQUID_BASE_URL).unwrap_or_else(|_| "https://api.hyperliquid.xyz".into());
+    let base_url = required_env(HYPERLIQUID_BASE_URL)?;
     let network = match env::var(HYPERLIQUID_NETWORK)
         .unwrap_or_else(|_| "mainnet".into())
         .to_ascii_lowercase()

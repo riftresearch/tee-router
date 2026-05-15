@@ -48,7 +48,6 @@ const EVM_RECEIPT_TIMEOUT: Duration = Duration::from_secs(300);
 const EVM_RPC_RETRY_ATTEMPTS: usize = 6;
 const EVM_RPC_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(500);
 const EVM_CALL_ESTIMATE_GAS_CAP: u64 = 1_000_000;
-const FLASHBOTS_ETHEREUM_RPC_URL: &str = "https://rpc.flashbots.net";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -61,6 +60,8 @@ pub enum EvmBroadcastPolicy {
 pub struct EvmChain {
     provider: DynProvider,
     rpc_url: String,
+    rpc_proxy_url: Option<String>,
+    flashbots_rpc_url: Option<String>,
     allowed_token: Address,
     chain_type: ChainType,
     wallet_seed_tag: Vec<u8>,
@@ -160,15 +161,41 @@ impl EvmChain {
         est_block_time: Duration,
         gas_sponsor: Option<EvmGasSponsorConfig>,
     ) -> Result<Self> {
+        Self::new_with_gas_sponsor_and_proxy_urls(
+            rpc_url,
+            allowed_token,
+            chain_type,
+            wallet_seed_tag,
+            min_confirmations,
+            est_block_time,
+            gas_sponsor,
+            None,
+            None,
+        )
+        .await
+    }
+
+    pub async fn new_with_gas_sponsor_and_proxy_urls(
+        rpc_url: &str,
+        allowed_token: &str,
+        chain_type: ChainType,
+        wallet_seed_tag: &[u8],
+        min_confirmations: u32,
+        est_block_time: Duration,
+        gas_sponsor: Option<EvmGasSponsorConfig>,
+        rpc_proxy_url: Option<&str>,
+        flashbots_rpc_url: Option<&str>,
+    ) -> Result<Self> {
         let url = rpc_url.parse().map_err(|_| crate::Error::Serialization {
             message: "Invalid RPC URL".to_string(),
         })?;
+        let reqwest_client = evm_reqwest_client(rpc_proxy_url)?;
 
         let client = alloy::rpc::client::ClientBuilder::default()
             .layer(crate::rpc_metrics_layer::RpcMetricsLayer::new(
                 chain_type.to_db_string().to_string(),
             ))
-            .http(url);
+            .http_with_client(reqwest_client, url);
 
         let provider = ProviderBuilder::new().connect_client(client).erased();
         let allowed_token =
@@ -177,13 +204,21 @@ impl EvmChain {
             })?;
         let gas_sponsor = gas_sponsor
             .map(|config| {
-                EvmGasSponsor::start(config, provider.clone(), rpc_url.to_string(), chain_type)
+                EvmGasSponsor::start(
+                    config,
+                    provider.clone(),
+                    rpc_url.to_string(),
+                    rpc_proxy_url.map(str::to_string),
+                    chain_type,
+                )
             })
             .transpose()?;
 
         Ok(Self {
             provider,
             rpc_url: rpc_url.to_string(),
+            rpc_proxy_url: rpc_proxy_url.map(str::to_string),
+            flashbots_rpc_url: flashbots_rpc_url.map(str::to_string),
             allowed_token,
             chain_type,
             wallet_seed_tag: wallet_seed_tag.to_vec(),
@@ -512,15 +547,11 @@ impl EvmChain {
                 message: "Invalid recipient address".to_string(),
             })?;
 
-        let url = self
-            .rpc_url
-            .parse()
-            .map_err(|_| crate::Error::Serialization {
-                message: "Invalid RPC URL".to_string(),
-            })?;
-        let wallet_provider = ProviderBuilder::new()
-            .wallet(EthereumWallet::new(sender_signer))
-            .connect_http(url);
+        let wallet_provider = wallet_provider_with_signer(
+            sender_signer,
+            &self.rpc_url,
+            self.rpc_proxy_url.as_deref(),
+        )?;
 
         match token {
             TokenIdentifier::Native => {
@@ -700,15 +731,11 @@ impl EvmChain {
             native_balance
         };
 
-        let url = self
-            .rpc_url
-            .parse()
-            .map_err(|_| crate::Error::Serialization {
-                message: "Invalid RPC URL".to_string(),
-            })?;
-        let wallet_provider = ProviderBuilder::new()
-            .wallet(EthereumWallet::new(sender_signer))
-            .connect_http(url);
+        let wallet_provider = wallet_provider_with_signer(
+            sender_signer,
+            &self.rpc_url,
+            self.rpc_proxy_url.as_deref(),
+        )?;
 
         let transaction_request = TransactionRequest::default()
             .with_from(sender_address)
@@ -798,15 +825,11 @@ impl EvmChain {
                 message: "Invalid recipient address".to_string(),
             })?;
 
-        let url = self
-            .rpc_url
-            .parse()
-            .map_err(|_| crate::Error::Serialization {
-                message: "Invalid RPC URL".to_string(),
-            })?;
-        let wallet_provider = ProviderBuilder::new()
-            .wallet(EthereumWallet::new(sender_signer))
-            .connect_http(url);
+        let wallet_provider = wallet_provider_with_signer(
+            sender_signer,
+            &self.rpc_url,
+            self.rpc_proxy_url.as_deref(),
+        )?;
         let token_balance = self
             .read_erc20_balance_with_provider(&wallet_provider, token_address, sender_address)
             .await
@@ -915,15 +938,10 @@ impl EvmChain {
             native_balance
         };
 
-        let broadcast_rpc_url = self.broadcast_rpc_url(broadcast_policy);
-        let url = broadcast_rpc_url
-            .parse()
-            .map_err(|_| crate::Error::Serialization {
-                message: "Invalid EVM broadcast RPC URL".to_string(),
-            })?;
-        let wallet_provider = ProviderBuilder::new()
-            .wallet(EthereumWallet::new(sender_signer))
-            .connect_http(url);
+        let (broadcast_rpc_url, broadcast_proxy_url) =
+            self.broadcast_rpc_endpoint(broadcast_policy);
+        let wallet_provider =
+            wallet_provider_with_signer(sender_signer, broadcast_rpc_url, broadcast_proxy_url)?;
 
         let transaction_request = TransactionRequest::default()
             .with_from(sender_address)
@@ -951,24 +969,94 @@ impl EvmChain {
         })
     }
 
-    fn broadcast_rpc_url(&self, broadcast_policy: EvmBroadcastPolicy) -> &str {
-        select_broadcast_rpc_url(&self.rpc_url, self.chain_type, broadcast_policy)
+    fn broadcast_rpc_endpoint(&self, broadcast_policy: EvmBroadcastPolicy) -> (&str, Option<&str>) {
+        (
+            select_broadcast_rpc_url(
+                &self.rpc_url,
+                self.flashbots_rpc_url.as_deref(),
+                self.chain_type,
+                broadcast_policy,
+            ),
+            self.rpc_proxy_url.as_deref(),
+        )
     }
 }
 
-fn select_broadcast_rpc_url(
-    rpc_url: &str,
+fn select_broadcast_rpc_url<'a>(
+    rpc_url: &'a str,
+    flashbots_rpc_url: Option<&'a str>,
     chain_type: ChainType,
     broadcast_policy: EvmBroadcastPolicy,
-) -> &str {
+) -> &'a str {
     if matches!(broadcast_policy, EvmBroadcastPolicy::FlashbotsIfEthereum)
         && chain_type == ChainType::Ethereum
         && !is_local_evm_rpc_url(rpc_url)
     {
-        FLASHBOTS_ETHEREUM_RPC_URL
+        flashbots_rpc_url.unwrap_or(rpc_url)
     } else {
         rpc_url
     }
+}
+
+fn wallet_provider_with_signer(
+    signer: PrivateKeySigner,
+    rpc_url: &str,
+    proxy_url: Option<&str>,
+) -> Result<DynProvider> {
+    let url = rpc_url.parse().map_err(|_| crate::Error::Serialization {
+        message: "Invalid RPC URL".to_string(),
+    })?;
+    let client = evm_reqwest_client(proxy_url)?;
+    Ok(ProviderBuilder::new()
+        .wallet(EthereumWallet::new(signer))
+        .connect_reqwest(client, url)
+        .erased())
+}
+
+fn evm_reqwest_client(proxy_url: Option<&str>) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder().use_rustls_tls();
+    if let Some(proxy_url) = proxy_url {
+        validate_socks5_proxy_url(proxy_url)?;
+        builder = builder.proxy(reqwest::Proxy::all(proxy_url.trim()).map_err(|err| {
+            crate::Error::Serialization {
+                message: format!("invalid EVM RPC proxy URL: {err}"),
+            }
+        })?);
+    }
+    builder.build().map_err(|err| crate::Error::Serialization {
+        message: format!("failed to construct EVM reqwest client: {err}"),
+    })
+}
+
+fn validate_socks5_proxy_url(proxy_url: &str) -> Result<()> {
+    let parsed =
+        reqwest::Url::parse(proxy_url.trim()).map_err(|err| crate::Error::Serialization {
+            message: format!("invalid proxy URL: {err}"),
+        })?;
+    if parsed.scheme() != "socks5" {
+        return Err(crate::Error::Serialization {
+            message: format!("proxy URL must use socks5 scheme, got {}", parsed.scheme()),
+        });
+    }
+    if parsed.host_str().is_none() {
+        return Err(crate::Error::Serialization {
+            message: "proxy URL must include a host".to_string(),
+        });
+    }
+    if parsed.port().is_none() {
+        return Err(crate::Error::Serialization {
+            message: "proxy URL must include a port".to_string(),
+        });
+    }
+    if (!parsed.path().is_empty() && parsed.path() != "/")
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(crate::Error::Serialization {
+            message: "proxy URL must not include a path, query string, or fragment".to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn is_local_evm_rpc_url(rpc_url: &str) -> bool {
@@ -1001,6 +1089,7 @@ impl EvmGasSponsor {
         config: EvmGasSponsorConfig,
         provider: DynProvider,
         rpc_url: String,
+        rpc_proxy_url: Option<String>,
         chain_type: ChainType,
     ) -> Result<Self> {
         let signer = PrivateKeySigner::from_str(&config.private_key).map_err(|_| {
@@ -1008,13 +1097,8 @@ impl EvmGasSponsor {
                 message: "Invalid gas sponsor private key".to_string(),
             }
         })?;
-        let url = rpc_url.parse().map_err(|_| crate::Error::Serialization {
-            message: "Invalid RPC URL".to_string(),
-        })?;
-        let wallet_provider = ProviderBuilder::new()
-            .wallet(EthereumWallet::new(signer.clone()))
-            .connect_http(url)
-            .erased();
+        let wallet_provider =
+            wallet_provider_with_signer(signer.clone(), &rpc_url, rpc_proxy_url.as_deref())?;
         let batch_config = EvmPaymasterBatchConfig::from_env();
         let (command_tx, command_rx) = mpsc::channel(EVM_PAYMASTER_COMMAND_BUFFER);
         let mut actor_tasks = JoinSet::new();
@@ -2405,14 +2489,16 @@ mod tests {
         assert_eq!(
             select_broadcast_rpc_url(
                 "https://ethereum-mainnet.example",
+                Some("https://flashbots.example"),
                 ChainType::Ethereum,
                 EvmBroadcastPolicy::FlashbotsIfEthereum,
             ),
-            FLASHBOTS_ETHEREUM_RPC_URL
+            "https://flashbots.example"
         );
         assert_eq!(
             select_broadcast_rpc_url(
                 "https://base-mainnet.example",
+                Some("https://flashbots.example"),
                 ChainType::Base,
                 EvmBroadcastPolicy::FlashbotsIfEthereum,
             ),
@@ -2421,6 +2507,7 @@ mod tests {
         assert_eq!(
             select_broadcast_rpc_url(
                 "http://localhost:50101",
+                Some("https://flashbots.example"),
                 ChainType::Ethereum,
                 EvmBroadcastPolicy::FlashbotsIfEthereum,
             ),
@@ -2429,8 +2516,18 @@ mod tests {
         assert_eq!(
             select_broadcast_rpc_url(
                 "https://ethereum-mainnet.example",
+                Some("https://flashbots.example"),
                 ChainType::Ethereum,
                 EvmBroadcastPolicy::Standard,
+            ),
+            "https://ethereum-mainnet.example"
+        );
+        assert_eq!(
+            select_broadcast_rpc_url(
+                "https://ethereum-mainnet.example",
+                None,
+                ChainType::Ethereum,
+                EvmBroadcastPolicy::FlashbotsIfEthereum,
             ),
             "https://ethereum-mainnet.example"
         );

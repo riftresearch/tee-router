@@ -1,4 +1,7 @@
-use super::bitcoin_funding::{observed_bitcoin_outpoint, ObservedBitcoinOutpoint};
+use super::{
+    bitcoin_funding::{observed_bitcoin_outpoint, ObservedBitcoinOutpoint},
+    upstream_proxy::ProxyUrl,
+};
 use crate::{
     config::Settings,
     db::Database,
@@ -267,6 +270,7 @@ impl fmt::Debug for HyperliquidExecutionConfig {
 pub struct HyperliquidRuntimeConfig {
     base_url: String,
     network: HyperliquidCallNetwork,
+    proxy_url: Option<ProxyUrl>,
 }
 
 impl HyperliquidRuntimeConfig {
@@ -275,7 +279,14 @@ impl HyperliquidRuntimeConfig {
         Self {
             base_url: base_url.into(),
             network,
+            proxy_url: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_proxy_url(mut self, proxy_url: Option<ProxyUrl>) -> Self {
+        self.proxy_url = proxy_url;
+        self
     }
 
     #[must_use]
@@ -286,6 +297,11 @@ impl HyperliquidRuntimeConfig {
     #[must_use]
     pub fn network(&self) -> HyperliquidCallNetwork {
         self.network
+    }
+
+    #[must_use]
+    pub fn proxy_url(&self) -> Option<&ProxyUrl> {
+        self.proxy_url.as_ref()
     }
 }
 
@@ -613,8 +629,17 @@ impl CustodyActionExecutor {
                         .and_then(HyperliquidExecutionConfig::submission_vault_address)
                         .map(|address| format!("{address:#x}"));
                 }
-                let (tx_hash, response) =
-                    execute_hyperliquid_call(&effective_call, wallet.private_key()).await?;
+                let proxy_url = self
+                    .hyperliquid_runtime
+                    .as_ref()
+                    .filter(|runtime| runtime.base_url() == effective_call.target_base_url)
+                    .and_then(HyperliquidRuntimeConfig::proxy_url);
+                let (tx_hash, response) = execute_hyperliquid_call(
+                    &effective_call,
+                    wallet.private_key(),
+                    proxy_url.map(ProxyUrl::as_str),
+                )
+                .await?;
                 (tx_hash, Vec::new(), Some(response))
             }
         };
@@ -812,10 +837,7 @@ impl CustodyActionExecutor {
         };
 
         match backend_chain {
-            ChainType::Ethereum
-            | ChainType::Arbitrum
-            | ChainType::Base
-            | ChainType::Hyperevm => {
+            ChainType::Ethereum | ChainType::Arbitrum | ChainType::Base | ChainType::Hyperevm => {
                 self.sweep_released_evm_vault(vault, backend_chain, paymaster_address, attempted_at)
                     .await
             }
@@ -846,8 +868,11 @@ impl CustodyActionExecutor {
                 reason: err.to_string(),
             }
         })?;
-        let mut info = HyperliquidInfoClient::new(runtime.base_url())
-            .map_err(|source| CustodyActionError::Hyperliquid { source })?;
+        let mut info = HyperliquidInfoClient::new_with_proxy_url(
+            runtime.base_url(),
+            runtime.proxy_url().map(ProxyUrl::as_str),
+        )
+        .map_err(|source| CustodyActionError::Hyperliquid { source })?;
         info.refresh_spot_meta()
             .await
             .map_err(|source| CustodyActionError::Hyperliquid { source })?;
@@ -882,8 +907,11 @@ impl CustodyActionExecutor {
                 reason: err.to_string(),
             }
         })?;
-        let info = HyperliquidInfoClient::new(runtime.base_url())
-            .map_err(|source| CustodyActionError::Hyperliquid { source })?;
+        let info = HyperliquidInfoClient::new_with_proxy_url(
+            runtime.base_url(),
+            runtime.proxy_url().map(ProxyUrl::as_str),
+        )
+        .map_err(|source| CustodyActionError::Hyperliquid { source })?;
         let state = info
             .clearinghouse_state(user)
             .await
@@ -1238,8 +1266,11 @@ impl CustodyActionExecutor {
             .map_err(|err| CustodyActionError::InvalidHyperliquidWallet {
                 reason: err.to_string(),
             })?;
-        let mut info = HyperliquidInfoClient::new(runtime.base_url())
-            .map_err(|source| CustodyActionError::Hyperliquid { source })?;
+        let mut info = HyperliquidInfoClient::new_with_proxy_url(
+            runtime.base_url(),
+            runtime.proxy_url().map(ProxyUrl::as_str),
+        )
+        .map_err(|source| CustodyActionError::Hyperliquid { source })?;
         info.refresh_spot_meta()
             .await
             .map_err(|source| CustodyActionError::Hyperliquid { source })?;
@@ -1263,11 +1294,12 @@ impl CustodyActionExecutor {
             });
         }
 
-        let client = HyperliquidExchangeClient::new(
+        let client = HyperliquidExchangeClient::new_with_proxy_url(
             runtime.base_url(),
             signer,
             None,
             HyperliquidNetwork::from(runtime.network()),
+            runtime.proxy_url().map(ProxyUrl::as_str),
         )
         .map_err(|source| CustodyActionError::Hyperliquid { source })?;
         let mut transfers = Vec::new();
@@ -1508,6 +1540,7 @@ fn format_hyperliquid_amount(raw_amount: &str, decimals: u8) -> CustodyActionRes
 async fn execute_hyperliquid_call(
     call: &HyperliquidCall,
     private_key: &str,
+    proxy_url: Option<&str>,
 ) -> CustodyActionResult<(String, Value)> {
     let pk_hex = private_key.trim_start_matches("0x");
     let wallet = pk_hex.parse::<PrivateKeySigner>().map_err(|err| {
@@ -1527,11 +1560,12 @@ async fn execute_hyperliquid_call(
         })
         .transpose()?;
 
-    let client = HyperliquidExchangeClient::new(
+    let client = HyperliquidExchangeClient::new_with_proxy_url(
         &call.target_base_url,
         wallet,
         vault_address,
         HyperliquidNetwork::from(call.network),
+        proxy_url,
     )
     .map_err(|source| CustodyActionError::Hyperliquid { source })?;
 

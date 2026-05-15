@@ -80,8 +80,12 @@ pub struct HyperliquidInfoClient {
 
 impl HyperliquidInfoClient {
     pub fn new(base_url: &str) -> Result<Self, Error> {
+        Self::new_with_proxy_url(base_url, None)
+    }
+
+    pub fn new_with_proxy_url(base_url: &str, proxy_url: Option<&str>) -> Result<Self, Error> {
         Ok(Self {
-            http: build_http(base_url)?,
+            http: build_http(base_url, proxy_url)?,
             spot_meta: None,
             coin_to_asset: HashMap::new(),
         })
@@ -304,8 +308,18 @@ impl HyperliquidExchangeClient {
         vault_address: Option<Address>,
         network: Network,
     ) -> Result<Self, Error> {
+        Self::new_with_proxy_url(base_url, wallet, vault_address, network, None)
+    }
+
+    pub fn new_with_proxy_url(
+        base_url: &str,
+        wallet: PrivateKeySigner,
+        vault_address: Option<Address>,
+        network: Network,
+        proxy_url: Option<&str>,
+    ) -> Result<Self, Error> {
         Ok(Self {
-            http: build_http(base_url)?,
+            http: build_http(base_url, proxy_url)?,
             wallet,
             vault_address,
             network,
@@ -595,10 +609,26 @@ impl HyperliquidClient {
         vault_address: Option<Address>,
         network: Network,
     ) -> Result<Self, Error> {
+        Self::new_with_proxy_url(base_url, wallet, vault_address, network, None)
+    }
+
+    pub fn new_with_proxy_url(
+        base_url: &str,
+        wallet: PrivateKeySigner,
+        vault_address: Option<Address>,
+        network: Network,
+        proxy_url: Option<&str>,
+    ) -> Result<Self, Error> {
         let from = wallet.address();
         Ok(Self {
-            info: HyperliquidInfoClient::new(base_url)?,
-            exchange: HyperliquidExchangeClient::new(base_url, wallet, vault_address, network)?,
+            info: HyperliquidInfoClient::new_with_proxy_url(base_url, proxy_url)?,
+            exchange: HyperliquidExchangeClient::new_with_proxy_url(
+                base_url,
+                wallet,
+                vault_address,
+                network,
+                proxy_url,
+            )?,
             bridge: HyperliquidBridgeClient::new(from, network),
         })
     }
@@ -849,14 +879,51 @@ where
     state.end()
 }
 
-fn build_http(base_url: &str) -> Result<HttpClient, Error> {
+fn build_http(base_url: &str, proxy_url: Option<&str>) -> Result<HttpClient, Error> {
     let normalized = normalize_base_url(base_url)?;
-    let client = Client::builder()
+    let mut builder = Client::builder()
         .use_rustls_tls()
-        .timeout(HYPERLIQUID_HTTP_TIMEOUT)
+        .timeout(HYPERLIQUID_HTTP_TIMEOUT);
+    if let Some(proxy_url) = proxy_url {
+        validate_proxy_url(proxy_url)?;
+        builder = builder.proxy(
+            reqwest::Proxy::all(proxy_url.trim())
+                .map_err(|source| Error::HttpRequest { source })?,
+        );
+    }
+    let client = builder
         .build()
         .map_err(|source| Error::HttpRequest { source })?;
     Ok(HttpClient::new(client, normalized))
+}
+
+fn validate_proxy_url(proxy_url: &str) -> Result<(), Error> {
+    let parsed =
+        Url::parse(proxy_url.trim()).map_err(|source| Error::InvalidProxyUrl { source })?;
+    if parsed.scheme() != "socks5" {
+        return Err(Error::UnsupportedProxyUrl {
+            reason: format!("expected socks5 scheme, got {:?}", parsed.scheme()),
+        });
+    }
+    if parsed.host_str().is_none() {
+        return Err(Error::UnsupportedProxyUrl {
+            reason: "expected host".to_string(),
+        });
+    }
+    if parsed.port().is_none() {
+        return Err(Error::UnsupportedProxyUrl {
+            reason: "expected port".to_string(),
+        });
+    }
+    if (!parsed.path().is_empty() && parsed.path() != "/")
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(Error::UnsupportedProxyUrl {
+            reason: "paths, query strings, and fragments are not allowed".to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn normalize_base_url(base_url: &str) -> Result<String, Error> {

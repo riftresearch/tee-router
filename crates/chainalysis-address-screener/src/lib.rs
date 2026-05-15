@@ -54,6 +54,14 @@ pub struct ChainalysisAddressScreener {
 
 impl ChainalysisAddressScreener {
     pub fn new(host: impl Into<String>, token: impl Into<String>) -> Result<Self> {
+        Self::new_with_proxy_url(host, token, None)
+    }
+
+    pub fn new_with_proxy_url(
+        host: impl Into<String>,
+        token: impl Into<String>,
+        proxy_url: Option<&str>,
+    ) -> Result<Self> {
         let host = normalize_host_url(&host.into())?;
         let token = token.into().trim().to_string();
         if token.is_empty() {
@@ -66,12 +74,17 @@ impl ChainalysisAddressScreener {
             HeaderValue::from_static("chainalysis-address-screener/0.1"),
         );
 
-        let http = Client::builder()
+        let mut builder = Client::builder()
             .default_headers(headers)
             .use_rustls_tls()
-            .timeout(CHAINALYSIS_HTTP_TIMEOUT)
-            .build()
-            .context(BuildClientSnafu)?;
+            .timeout(CHAINALYSIS_HTTP_TIMEOUT);
+        if let Some(proxy_url) = proxy_url {
+            validate_proxy_url(proxy_url)?;
+            builder =
+                builder.proxy(reqwest::Proxy::all(proxy_url.trim()).context(BuildClientSnafu)?);
+        }
+
+        let http = builder.build().context(BuildClientSnafu)?;
 
         Ok(Self { host, token, http })
     }
@@ -124,6 +137,36 @@ impl ChainalysisAddressScreener {
         drop(segments);
         Ok(url)
     }
+}
+
+fn validate_proxy_url(proxy_url: &str) -> Result<()> {
+    let parsed = Url::parse(proxy_url.trim()).map_err(|source| Error::UnsupportedHost {
+        reason: format!("invalid proxy URL: {source}"),
+    })?;
+    if parsed.scheme() != "socks5" {
+        return Err(Error::UnsupportedHost {
+            reason: format!("expected socks5 proxy scheme, got {}", parsed.scheme()),
+        });
+    }
+    if parsed.host_str().is_none() {
+        return Err(Error::UnsupportedHost {
+            reason: "proxy URL must include a host".to_string(),
+        });
+    }
+    if parsed.port().is_none() {
+        return Err(Error::UnsupportedHost {
+            reason: "proxy URL must include a port".to_string(),
+        });
+    }
+    if (!parsed.path().is_empty() && parsed.path() != "/")
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(Error::UnsupportedHost {
+            reason: "proxy URL must not include a path, query string, or fragment".to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn record_upstream_request(

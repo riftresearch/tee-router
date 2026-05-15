@@ -48,7 +48,6 @@ const VELORA_SLIPPAGE_BPS: &str = "VELORA_LIVE_SLIPPAGE_BPS";
 const VELORA_SPEND_CONFIRMATION: &str = "VELORA_LIVE_I_UNDERSTAND_THIS_SWAPS_REAL_FUNDS";
 const LIVE_RECOVERY_DIR: &str = "ROUTER_LIVE_RECOVERY_DIR";
 
-const DEFAULT_VELORA_BASE_URL: &str = "https://api.paraswap.io";
 const DEFAULT_BASE_USDC: Address = address!("833589fcd6edb6e08f4c7c32d4f71b54bda02913");
 const DEFAULT_AMOUNT_IN_WEI: &str = "10000000000000";
 const DEFAULT_SLIPPAGE_BPS: u64 = 300;
@@ -98,7 +97,7 @@ async fn live_velora_base_eth_usdc_quote_transcript() -> TestResult<()> {
     emit_transcript(
         "velora.base_eth_usdc_quote",
         json!({
-            "base_url": live_velora_base_url(),
+            "base_url": live_velora_base_url()?,
             "network": BASE_CHAIN_ID,
             "user": format!("{user:#x}"),
             "request": {
@@ -192,7 +191,7 @@ async fn live_velora_base_eth_to_usdc_swap_transcript_spends_funds() -> TestResu
     emit_transcript(
         "velora.base_eth_to_usdc_swap.lifecycle",
         json!({
-            "base_url": live_velora_base_url(),
+            "base_url": live_velora_base_url()?,
             "base_rpc_url": live_base_rpc_url()?.as_str(),
             "network": BASE_CHAIN_ID,
             "user": format!("{user:#x}"),
@@ -218,7 +217,7 @@ async fn live_velora_base_eth_to_usdc_swap_transcript_spends_funds() -> TestResu
 
 fn live_velora_provider() -> TestResult<VeloraProvider> {
     Ok(VeloraProvider::new(
-        live_velora_base_url(),
+        live_velora_base_url()?,
         env_var_any(&[VELORA_PARTNER]),
     )?)
 }
@@ -249,7 +248,7 @@ async fn quote_base_eth_to_usdc(
 
 async fn fetch_raw_price_route(user: Address, amount_in: U256) -> TestResult<Value> {
     let response = reqwest::Client::new()
-        .get(format!("{}/prices", live_velora_base_url()))
+        .get(format!("{}/prices", live_velora_base_url()?))
         .query(&[
             ("srcToken", NATIVE_TOKEN_FOR_VELORA.to_string()),
             ("destToken", format!("{DEFAULT_BASE_USDC:#x}")),
@@ -427,9 +426,10 @@ fn live_base_rpc_url() -> TestResult<Url> {
     .and_then(|raw| raw.parse::<Url>().map_err(|error| error.into()))
 }
 
-fn live_velora_base_url() -> String {
-    env_var_any(&[VELORA_BASE_URL, VELORA_API_URL])
-        .unwrap_or_else(|| DEFAULT_VELORA_BASE_URL.to_string())
+fn live_velora_base_url() -> TestResult<String> {
+    env_var_any(&[VELORA_BASE_URL, VELORA_API_URL]).ok_or_else(|| {
+        format!("missing required env var {VELORA_BASE_URL} or {VELORA_API_URL}").into()
+    })
 }
 
 fn live_enabled() -> bool {

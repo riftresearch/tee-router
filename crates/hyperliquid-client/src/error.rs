@@ -11,6 +11,12 @@ pub enum Error {
     #[snafu(display("unsupported base URL: {reason}"))]
     UnsupportedBaseUrl { reason: String },
 
+    #[snafu(display("invalid proxy URL: {source}"))]
+    InvalidProxyUrl { source: url::ParseError },
+
+    #[snafu(display("unsupported proxy URL: {reason}"))]
+    UnsupportedProxyUrl { reason: String },
+
     #[snafu(display("HTTP request failed: {source}"))]
     HttpRequest { source: reqwest::Error },
 

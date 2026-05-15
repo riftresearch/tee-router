@@ -2039,6 +2039,7 @@ fn test_action_providers(
         hyperunit_base_url: hyperliquid_enabled.then(|| mocks.base_url().to_string()),
         hyperunit_proxy_url: None,
         hyperliquid_base_url: hyperliquid_enabled.then(|| mocks.base_url().to_string()),
+        hyperliquid_proxy_url: None,
         velora: matches!(
             route,
             WorkflowRoute::VeloraBaseEthToBaseUsdc
@@ -2048,6 +2049,7 @@ fn test_action_providers(
         .then(|| VeloraHttpProviderConfig {
             base_url: mocks.base_url().to_string(),
             partner: Some("temporal-worker-e2e".to_string()),
+            proxy_url: None,
         }),
         hyperliquid_network: HyperliquidCallNetwork::Testnet,
         hyperliquid_order_timeout_ms: 30_000,

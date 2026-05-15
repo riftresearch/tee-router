@@ -68,6 +68,19 @@ pub struct RouterServerArgs {
     #[arg(long, env = "RUST_LOG", default_value = "info")]
     pub log_level: String,
 
+    /// Enforce production upstream URL/proxy configuration
+    #[arg(
+        long,
+        env = "PRODUCTION",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    pub production: bool,
+
+    /// Global SOCKS5 proxy URL used for upstream services without a specific proxy override
+    #[arg(long, env = "UPSTREAM_PROXY_URL")]
+    pub upstream_proxy_url: Option<String>,
+
     /// File path to the router master key hex file
     #[arg(long, env = "ROUTER_MASTER_KEY_PATH")]
     pub master_key_path: String,
@@ -75,6 +88,14 @@ pub struct RouterServerArgs {
     /// Ethereum Mainnet RPC URL
     #[arg(long, env = "ETH_RPC_URL")]
     pub ethereum_mainnet_rpc_url: String,
+
+    /// Optional Ethereum Mainnet RPC SOCKS5 proxy URL
+    #[arg(long, env = "ETH_RPC_PROXY_URL")]
+    pub ethereum_mainnet_rpc_proxy_url: Option<String>,
+
+    /// Flashbots Ethereum RPC URL used for FlashbotsIfEthereum broadcasts
+    #[arg(long, env = "FLASHBOTS_RPC_URL")]
+    pub flashbots_rpc_url: Option<String>,
 
     /// Ethereum reference token address
     #[arg(
@@ -92,6 +113,10 @@ pub struct RouterServerArgs {
     #[arg(long, env = "BASE_RPC_URL")]
     pub base_rpc_url: String,
 
+    /// Optional Base RPC SOCKS5 proxy URL
+    #[arg(long, env = "BASE_RPC_PROXY_URL")]
+    pub base_rpc_proxy_url: Option<String>,
+
     /// Base reference token address
     #[arg(
         long,
@@ -108,6 +133,10 @@ pub struct RouterServerArgs {
     #[arg(long, env = "ARBITRUM_RPC_URL")]
     pub arbitrum_rpc_url: String,
 
+    /// Optional Arbitrum RPC SOCKS5 proxy URL
+    #[arg(long, env = "ARBITRUM_RPC_PROXY_URL")]
+    pub arbitrum_rpc_proxy_url: Option<String>,
+
     /// Arbitrum reference token address
     #[arg(
         long,
@@ -123,6 +152,10 @@ pub struct RouterServerArgs {
     /// HyperEVM RPC URL
     #[arg(long, env = "HYPEREVM_RPC_URL")]
     pub hyperevm_rpc_url: Option<String>,
+
+    /// Optional HyperEVM RPC SOCKS5 proxy URL
+    #[arg(long, env = "HYPEREVM_RPC_PROXY_URL")]
+    pub hyperevm_rpc_proxy_url: Option<String>,
 
     /// HyperEVM native USDC contract address
     #[arg(long, env = "HYPEREVM_ALLOWED_TOKEN")]
@@ -144,6 +177,10 @@ pub struct RouterServerArgs {
     #[arg(long, env = "BITCOIN_RPC_URL")]
     pub bitcoin_rpc_url: String,
 
+    /// Optional Bitcoin RPC SOCKS5 proxy URL
+    #[arg(long, env = "BITCOIN_RPC_PROXY_URL")]
+    pub bitcoin_rpc_proxy_url: Option<String>,
+
     /// Bitcoin RPC Auth
     #[arg(long, env = "BITCOIN_RPC_AUTH", default_value = "none", value_parser = parse_auth)]
     pub bitcoin_rpc_auth: Auth,
@@ -151,6 +188,10 @@ pub struct RouterServerArgs {
     /// Electrum HTTP Server URL
     #[arg(long, env = "ELECTRUM_HTTP_SERVER_URL")]
     pub untrusted_esplora_http_server_url: String,
+
+    /// Optional Esplora SOCKS5 proxy URL
+    #[arg(long, env = "ESPLORA_PROXY_URL")]
+    pub esplora_proxy_url: Option<String>,
 
     /// Bitcoin Network
     #[arg(long, env = "BITCOIN_NETWORK", default_value = "bitcoin")]
@@ -173,6 +214,10 @@ pub struct RouterServerArgs {
     #[arg(long, env = "CHAINALYSIS_TOKEN")]
     pub chainalysis_token: Option<String>,
 
+    /// Optional Chainalysis SOCKS5 proxy URL
+    #[arg(long, env = "CHAINALYSIS_PROXY_URL")]
+    pub chainalysis_proxy_url: Option<String>,
+
     /// Loki logging URL (if provided, logs will be shipped to Loki)
     #[arg(long, env = "LOKI_URL")]
     pub loki_url: Option<String>,
@@ -185,6 +230,10 @@ pub struct RouterServerArgs {
     #[arg(long, env = "ACROSS_API_KEY")]
     pub across_api_key: Option<String>,
 
+    /// Optional Across SOCKS5 proxy URL
+    #[arg(long, env = "ACROSS_PROXY_URL")]
+    pub across_proxy_url: Option<String>,
+
     /// Across integrator id sent on swap approval requests
     #[arg(long, env = "ACROSS_INTEGRATOR_ID")]
     pub across_integrator_id: Option<String>,
@@ -192,6 +241,10 @@ pub struct RouterServerArgs {
     /// Circle Iris CCTP API base URL
     #[arg(long, env = "CCTP_API_URL")]
     pub cctp_api_url: Option<String>,
+
+    /// Optional CCTP SOCKS5 proxy URL
+    #[arg(long, env = "CCTP_PROXY_URL")]
+    pub cctp_proxy_url: Option<String>,
 
     /// CCTP TokenMessengerV2 contract address override
     #[arg(long, env = "CCTP_TOKEN_MESSENGER_V2_ADDRESS")]
@@ -216,9 +269,17 @@ pub struct RouterServerArgs {
     #[arg(long, env = "HYPERLIQUID_API_URL")]
     pub hyperliquid_api_url: Option<String>,
 
+    /// Optional Hyperliquid SOCKS5 proxy URL
+    #[arg(long, env = "HYPERLIQUID_PROXY_URL")]
+    pub hyperliquid_proxy_url: Option<String>,
+
     /// Velora/ParaSwap Market API base URL
     #[arg(long, env = "VELORA_API_URL")]
     pub velora_api_url: Option<String>,
+
+    /// Optional Velora SOCKS5 proxy URL
+    #[arg(long, env = "VELORA_PROXY_URL")]
+    pub velora_proxy_url: Option<String>,
 
     /// Partner string sent to Velora for route analytics
     #[arg(long, env = "VELORA_PARTNER")]
@@ -380,12 +441,12 @@ pub struct RouterServerArgs {
     pub worker_vault_funding_hint_pass_limit: u32,
 
     /// Coinbase unauthenticated price API base URL used by route-cost pricing refresh
-    #[arg(
-        long,
-        env = "COINBASE_PRICE_API_BASE_URL",
-        default_value = "https://api.coinbase.com"
-    )]
-    pub coinbase_price_api_base_url: String,
+    #[arg(long, env = "COINBASE_PRICE_API_BASE_URL")]
+    pub coinbase_price_api_base_url: Option<String>,
+
+    /// Optional Coinbase SOCKS5 proxy URL
+    #[arg(long, env = "COINBASE_PROXY_URL")]
+    pub coinbase_proxy_url: Option<String>,
 }
 
 impl RouterServerArgs {

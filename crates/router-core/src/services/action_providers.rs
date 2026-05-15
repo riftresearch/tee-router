@@ -14,6 +14,7 @@ use crate::{
         },
         http_body::{read_limited_response_text, response_body_error_preview},
         pricing::checked_pow10,
+        upstream_proxy::ProxyUrl,
     },
     telemetry,
 };
@@ -497,6 +498,7 @@ pub struct AcrossHttpProviderConfig {
     pub base_url: String,
     pub api_key: String,
     pub integrator_id: Option<String>,
+    pub proxy_url: Option<ProxyUrl>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -529,7 +531,9 @@ impl FromStr for CctpTransferMode {
         match value.trim().to_ascii_lowercase().as_str() {
             "standard" => Ok(Self::Standard),
             "fast" => Ok(Self::Fast),
-            other => Err(format!("unsupported CCTP transfer mode {other:?}; expected standard or fast")),
+            other => Err(format!(
+                "unsupported CCTP transfer mode {other:?}; expected standard or fast"
+            )),
         }
     }
 }
@@ -540,12 +544,14 @@ pub struct CctpHttpProviderConfig {
     pub token_messenger_v2_address: String,
     pub message_transmitter_v2_address: String,
     pub transfer_mode: CctpTransferMode,
+    pub proxy_url: Option<ProxyUrl>,
 }
 
 #[derive(Clone)]
 pub struct VeloraHttpProviderConfig {
     pub base_url: String,
     pub partner: Option<String>,
+    pub proxy_url: Option<ProxyUrl>,
 }
 
 #[derive(Clone)]
@@ -553,8 +559,9 @@ pub struct ActionProviderHttpOptions {
     pub across: Option<AcrossHttpProviderConfig>,
     pub cctp: Option<CctpHttpProviderConfig>,
     pub hyperunit_base_url: Option<String>,
-    pub hyperunit_proxy_url: Option<String>,
+    pub hyperunit_proxy_url: Option<ProxyUrl>,
     pub hyperliquid_base_url: Option<String>,
+    pub hyperliquid_proxy_url: Option<ProxyUrl>,
     pub velora: Option<VeloraHttpProviderConfig>,
     pub hyperliquid_network: HyperliquidCallNetwork,
     pub hyperliquid_order_timeout_ms: u64,
@@ -567,6 +574,7 @@ impl fmt::Debug for AcrossHttpProviderConfig {
             .field("base_url", &redacted_url_for_debug(&self.base_url))
             .field("api_key", &"<redacted>")
             .field("integrator_id", &self.integrator_id)
+            .field("proxy_url", &self.proxy_url.as_ref().map(|_| "<redacted>"))
             .finish()
     }
 }
@@ -584,6 +592,7 @@ impl fmt::Debug for CctpHttpProviderConfig {
                 &self.message_transmitter_v2_address,
             )
             .field("transfer_mode", &self.transfer_mode)
+            .field("proxy_url", &self.proxy_url.as_ref().map(|_| "<redacted>"))
             .finish()
     }
 }
@@ -593,6 +602,7 @@ impl fmt::Debug for VeloraHttpProviderConfig {
         f.debug_struct("VeloraHttpProviderConfig")
             .field("base_url", &redacted_url_for_debug(&self.base_url))
             .field("partner", &self.partner)
+            .field("proxy_url", &self.proxy_url.as_ref().map(|_| "<redacted>"))
             .finish()
     }
 }
@@ -620,6 +630,10 @@ impl fmt::Debug for ActionProviderHttpOptions {
                     .as_deref()
                     .map(redacted_url_for_debug),
             )
+            .field(
+                "hyperliquid_proxy_url",
+                &self.hyperliquid_proxy_url.as_ref().map(|_| "<redacted>"),
+            )
             .field("velora", &self.velora)
             .field("hyperliquid_network", &self.hyperliquid_network)
             .field(
@@ -637,12 +651,19 @@ impl VeloraHttpProviderConfig {
         Self {
             base_url: base_url.into(),
             partner: Some(VELORA_DEFAULT_PARTNER.to_string()),
+            proxy_url: None,
         }
     }
 
     #[must_use]
     pub fn with_partner(mut self, partner: Option<String>) -> Self {
         self.partner = partner;
+        self
+    }
+
+    #[must_use]
+    pub fn with_proxy_url(mut self, proxy_url: Option<ProxyUrl>) -> Self {
+        self.proxy_url = proxy_url;
         self
     }
 }
@@ -655,12 +676,19 @@ impl AcrossHttpProviderConfig {
             base_url: base_url.into(),
             api_key,
             integrator_id: None,
+            proxy_url: None,
         }
     }
 
     #[must_use]
     pub fn with_integrator_id(mut self, integrator_id: Option<String>) -> Self {
         self.integrator_id = integrator_id;
+        self
+    }
+
+    #[must_use]
+    pub fn with_proxy_url(mut self, proxy_url: Option<ProxyUrl>) -> Self {
+        self.proxy_url = proxy_url;
         self
     }
 }
@@ -673,6 +701,7 @@ impl CctpHttpProviderConfig {
             token_messenger_v2_address: CCTP_TOKEN_MESSENGER_V2_ADDRESS.to_string(),
             message_transmitter_v2_address: CCTP_MESSAGE_TRANSMITTER_V2_ADDRESS.to_string(),
             transfer_mode: CctpTransferMode::Standard,
+            proxy_url: None,
         }
     }
 
@@ -683,6 +712,7 @@ impl CctpHttpProviderConfig {
             token_messenger_v2_address: MOCK_CCTP_TOKEN_MESSENGER_V2_ADDRESS.to_string(),
             message_transmitter_v2_address: MOCK_CCTP_MESSAGE_TRANSMITTER_V2_ADDRESS.to_string(),
             transfer_mode: CctpTransferMode::Standard,
+            proxy_url: None,
         }
     }
 
@@ -703,6 +733,12 @@ impl CctpHttpProviderConfig {
     #[must_use]
     pub fn with_transfer_mode(mut self, transfer_mode: CctpTransferMode) -> Self {
         self.transfer_mode = transfer_mode;
+        self
+    }
+
+    #[must_use]
+    pub fn with_proxy_url(mut self, proxy_url: Option<ProxyUrl>) -> Self {
+        self.proxy_url = proxy_url;
         self
     }
 }
@@ -768,6 +804,10 @@ impl ActionProviderRegistry {
         velora: Option<VeloraHttpProviderConfig>,
         hyperliquid_network: HyperliquidCallNetwork,
     ) -> Result<Self, String> {
+        let hyperunit_proxy_url = hyperunit_proxy_url
+            .map(|proxy_url| ProxyUrl::parse(proxy_url, "HYPERUNIT_PROXY_URL"))
+            .transpose()
+            .map_err(|err| err.to_string())?;
         Self::http_with_options(
             across,
             cctp,
@@ -783,7 +823,7 @@ impl ActionProviderRegistry {
         across: Option<AcrossHttpProviderConfig>,
         cctp: Option<CctpHttpProviderConfig>,
         hyperunit_base_url: Option<String>,
-        hyperunit_proxy_url: Option<String>,
+        hyperunit_proxy_url: Option<ProxyUrl>,
         hyperliquid_base_url: Option<String>,
         velora: Option<VeloraHttpProviderConfig>,
         hyperliquid_network: HyperliquidCallNetwork,
@@ -794,6 +834,7 @@ impl ActionProviderRegistry {
             hyperunit_base_url,
             hyperunit_proxy_url,
             hyperliquid_base_url,
+            hyperliquid_proxy_url: None,
             velora,
             hyperliquid_network,
             hyperliquid_order_timeout_ms: DEFAULT_HYPERLIQUID_ORDER_TIMEOUT_MS,
@@ -808,6 +849,7 @@ impl ActionProviderRegistry {
             hyperunit_base_url,
             hyperunit_proxy_url,
             hyperliquid_base_url,
+            hyperliquid_proxy_url,
             velora,
             hyperliquid_network,
             hyperliquid_order_timeout_ms,
@@ -816,36 +858,46 @@ impl ActionProviderRegistry {
         let asset_registry = Arc::new(AssetRegistry::default());
         let mut bridges = Vec::<Arc<dyn BridgeProvider>>::new();
         if let Some(config) = across {
-            let mut provider = AcrossProvider::new(config.base_url, config.api_key)?;
+            let mut provider = AcrossProvider::new_with_proxy_url(
+                config.base_url,
+                config.api_key,
+                config.proxy_url.as_ref(),
+            )?;
             if let Some(integrator_id) = config.integrator_id {
                 provider = provider.with_integrator_id(integrator_id);
             }
             bridges.push(Arc::new(provider));
         }
         if let Some(config) = cctp {
-            bridges.push(Arc::new(CctpProvider::new_with_transfer_mode(
-                config.base_url,
-                config.token_messenger_v2_address,
-                config.message_transmitter_v2_address,
-                config.transfer_mode,
-                asset_registry.clone(),
-            )?));
+            bridges.push(Arc::new(
+                CctpProvider::new_with_transfer_mode_and_proxy_url(
+                    config.base_url,
+                    config.token_messenger_v2_address,
+                    config.message_transmitter_v2_address,
+                    config.transfer_mode,
+                    asset_registry.clone(),
+                    config.proxy_url.as_ref(),
+                )?,
+            ));
         }
         if let Some(base_url) = hyperliquid_base_url.clone() {
-            bridges.push(Arc::new(HyperliquidBridgeProvider::new(
+            bridges.push(Arc::new(HyperliquidBridgeProvider::new_with_proxy_url(
                 base_url.clone(),
                 hyperliquid_network,
                 asset_registry.clone(),
+                hyperliquid_proxy_url.as_ref(),
             )?));
             if hypercore_bridge_enabled {
-                bridges.push(Arc::new(HypercoreBridgeProvider::new(
+                bridges.push(Arc::new(HypercoreBridgeProvider::new_with_proxy_url(
                     base_url,
                     hyperliquid_network,
                     asset_registry.clone(),
+                    hyperliquid_proxy_url.as_ref(),
                 )?));
             }
         }
         let hyperliquid_target_base_url = hyperliquid_base_url.clone();
+        let hyperliquid_target_proxy_url = hyperliquid_proxy_url.clone();
         let units = hyperunit_base_url
             .map(|base_url| {
                 let hyperliquid_base_url = hyperliquid_target_base_url.clone().ok_or_else(|| {
@@ -858,6 +910,7 @@ impl ActionProviderRegistry {
                     asset_registry.clone(),
                     hyperliquid_base_url,
                     hyperliquid_network,
+                    hyperliquid_target_proxy_url.as_ref(),
                 )
                 .map(|provider| Arc::new(provider) as Arc<dyn UnitProvider>)
             })
@@ -865,20 +918,22 @@ impl ActionProviderRegistry {
             .collect::<Result<Vec<_>, _>>()?;
         let mut exchanges: Vec<Arc<dyn ExchangeProvider>> = hyperliquid_base_url
             .map(|base_url| {
-                HyperliquidProvider::new(
+                HyperliquidProvider::new_with_proxy_url(
                     base_url,
                     hyperliquid_network,
                     asset_registry.clone(),
                     hyperliquid_order_timeout_ms,
+                    hyperliquid_proxy_url.as_ref(),
                 )
                 .map(|provider| Arc::new(provider) as Arc<dyn ExchangeProvider>)
             })
             .into_iter()
             .collect::<Result<Vec<_>, _>>()?;
         if let Some(config) = velora {
-            exchanges.push(Arc::new(VeloraProvider::new(
+            exchanges.push(Arc::new(VeloraProvider::new_with_proxy_url(
                 config.base_url,
                 config.partner,
+                config.proxy_url.as_ref(),
             )?));
         }
         Ok(Self::with_asset_registry(
@@ -944,9 +999,17 @@ pub struct AcrossProvider {
 
 impl AcrossProvider {
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Result<Self, String> {
+        Self::new_with_proxy_url(base_url, api_key, None)
+    }
+
+    pub fn new_with_proxy_url(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        proxy_url: Option<&ProxyUrl>,
+    ) -> Result<Self, String> {
         let base_url = normalize_base_url(base_url)?;
         Ok(Self {
-            client: AcrossClient::new(base_url, api_key)
+            client: AcrossClient::new_with_proxy_url(base_url, api_key, proxy_url)
                 .map_err(|err| format!("across client configuration failed: {err}"))?,
             integrator_id: ACROSS_INTEGRATOR_ID.to_string(),
         })
@@ -1602,16 +1665,20 @@ const HYPERLIQUID_CORE_ACTIVATION_FEE_RAW: u64 = 1_000_000;
 impl HyperUnitProvider {
     pub fn new(
         base_url: impl Into<String>,
-        proxy_url: Option<String>,
+        proxy_url: Option<ProxyUrl>,
         asset_registry: Arc<AssetRegistry>,
         hyperliquid_base_url: impl Into<String>,
         hyperliquid_network: HyperliquidCallNetwork,
+        hyperliquid_proxy_url: Option<&ProxyUrl>,
     ) -> Result<Self, String> {
         let hyperliquid_base_url = normalize_base_url(hyperliquid_base_url)?;
-        let hyperliquid_http =
-            HyperliquidHttpClient::new(rustls_http_client()?, hyperliquid_base_url.clone());
-        let client = HyperUnitClient::new_with_proxy_url(base_url, proxy_url)
-            .map_err(|err| format!("hyperunit client configuration failed: {err}"))?;
+        let hyperliquid_http = HyperliquidHttpClient::new(
+            rustls_http_client(hyperliquid_proxy_url)?,
+            hyperliquid_base_url.clone(),
+        );
+        let client =
+            HyperUnitClient::new_with_proxy_url(base_url, proxy_url.map(ProxyUrl::into_string))
+                .map_err(|err| format!("hyperunit client configuration failed: {err}"))?;
         Ok(Self {
             client,
             asset_registry,
@@ -2210,8 +2277,18 @@ impl HypercoreBridgeProvider {
         network: HyperliquidCallNetwork,
         asset_registry: Arc<AssetRegistry>,
     ) -> Result<Self, String> {
+        Self::new_with_proxy_url(base_url, network, asset_registry, None)
+    }
+
+    pub fn new_with_proxy_url(
+        base_url: impl Into<String>,
+        network: HyperliquidCallNetwork,
+        asset_registry: Arc<AssetRegistry>,
+        proxy_url: Option<&ProxyUrl>,
+    ) -> Result<Self, String> {
         let target_base_url = normalize_base_url(base_url)?;
-        let http = HyperliquidHttpClient::new(rustls_http_client()?, target_base_url.clone());
+        let http =
+            HyperliquidHttpClient::new(rustls_http_client(proxy_url)?, target_base_url.clone());
         let core_deposit_wallet = Address::from_str(hypercore_core_deposit_wallet_address(
             hyperliquid_api_network(network),
         ))
@@ -2275,8 +2352,12 @@ impl BridgeProvider for HypercoreBridgeProvider {
             }
 
             let (amount_in, amount_out) = match &request.order_kind {
-                ProviderOrderKind::ExactIn { amount_in, .. } => (amount_in.clone(), amount_in.clone()),
-                ProviderOrderKind::ExactOut { amount_out, .. } => (amount_out.clone(), amount_out.clone()),
+                ProviderOrderKind::ExactIn { amount_in, .. } => {
+                    (amount_in.clone(), amount_in.clone())
+                }
+                ProviderOrderKind::ExactOut { amount_out, .. } => {
+                    (amount_out.clone(), amount_out.clone())
+                }
             };
 
             Ok(Some(BridgeQuote {
@@ -2323,8 +2404,10 @@ impl BridgeProvider for HypercoreBridgeProvider {
                 "hypercore bridge: source_custody_vault_address must be hydrated".to_string()
             })?;
             let before_state = self.spot_clearinghouse_state(&hyperliquid_user).await?;
-            let before_spot_balance_raw =
-                parse_decimal_to_raw_units(before_state.balance_of(HYPERCORE_SPOT_SYMBOL), decimals)?;
+            let before_spot_balance_raw = parse_decimal_to_raw_units(
+                before_state.balance_of(HYPERCORE_SPOT_SYMBOL),
+                decimals,
+            )?;
             let activation_fee_raw = hypercore_activation_fee_raw(before_spot_balance_raw, amount);
             let expected_output_raw = amount
                 .checked_sub(activation_fee_raw)
@@ -2397,9 +2480,9 @@ impl BridgeProvider for HypercoreBridgeProvider {
         receipts: &'a [CustodyActionReceipt],
     ) -> ProviderFuture<'a, ProviderExecutionStatePatch> {
         Box::pin(async move {
-            let deposit_receipt = receipts
-                .last()
-                .ok_or_else(|| "hypercore bridge post_execute: no custody action receipts".to_string())?;
+            let deposit_receipt = receipts.last().ok_or_else(|| {
+                "hypercore bridge post_execute: no custody action receipts".to_string()
+            })?;
             let user = provider_context
                 .get("hyperliquid_user")
                 .and_then(Value::as_str)
@@ -2450,8 +2533,7 @@ impl BridgeProvider for HypercoreBridgeProvider {
                 return Ok(None);
             }
             let user = request.provider_ref.as_deref().ok_or_else(|| {
-                "hypercore bridge observe: provider_ref (hyperliquid user) is required"
-                    .to_string()
+                "hypercore bridge observe: provider_ref (hyperliquid user) is required".to_string()
             })?;
             let expected = hypercore_expected_balances(&request.request)?;
             let expected_spot_balance_raw = expected.expected_spot_balance_raw;
@@ -2515,8 +2597,18 @@ impl HyperliquidBridgeProvider {
         network: HyperliquidCallNetwork,
         asset_registry: Arc<AssetRegistry>,
     ) -> Result<Self, String> {
+        Self::new_with_proxy_url(base_url, network, asset_registry, None)
+    }
+
+    pub fn new_with_proxy_url(
+        base_url: impl Into<String>,
+        network: HyperliquidCallNetwork,
+        asset_registry: Arc<AssetRegistry>,
+        proxy_url: Option<&ProxyUrl>,
+    ) -> Result<Self, String> {
         let target_base_url = normalize_base_url(base_url)?;
-        let http = HyperliquidHttpClient::new(rustls_http_client()?, target_base_url.clone());
+        let http =
+            HyperliquidHttpClient::new(rustls_http_client(proxy_url)?, target_base_url.clone());
         Ok(Self {
             network,
             asset_registry,
@@ -2700,8 +2792,9 @@ fn hypercore_expected_balances(request: &Value) -> ProviderResult<HypercoreExpec
         .get("activation_fee_raw")
         .and_then(Value::as_str)
         .map(|raw| {
-            U256::from_str_radix(raw, 10)
-                .map_err(|err| format!("hypercore bridge observe: invalid activation_fee_raw: {err}"))
+            U256::from_str_radix(raw, 10).map_err(|err| {
+                format!("hypercore bridge observe: invalid activation_fee_raw: {err}")
+            })
         })
         .transpose()?
         .unwrap_or_else(|| hypercore_activation_fee_raw(before_spot_balance_raw, amount_raw));
@@ -2709,8 +2802,9 @@ fn hypercore_expected_balances(request: &Value) -> ProviderResult<HypercoreExpec
         .get("expected_output_raw")
         .and_then(Value::as_str)
         .map(|raw| {
-            U256::from_str_radix(raw, 10)
-                .map_err(|err| format!("hypercore bridge observe: invalid expected_output_raw: {err}"))
+            U256::from_str_radix(raw, 10).map_err(|err| {
+                format!("hypercore bridge observe: invalid expected_output_raw: {err}")
+            })
         })
         .transpose()?
         .unwrap_or_else(|| amount_raw.saturating_sub(activation_fee_raw));
@@ -2734,7 +2828,9 @@ fn hypercore_bridge_deposit_completion_response(
     let expected = hypercore_expected_balances(request)?;
     let observed_delta_raw = observed_spot_balance_raw
         .checked_sub(expected.before_spot_balance_raw)
-        .ok_or_else(|| "hypercore bridge observe: observed spot balance went backwards".to_string())?;
+        .ok_or_else(|| {
+            "hypercore bridge observe: observed spot balance went backwards".to_string()
+        })?;
 
     Ok(json!({
         "kind": "hypercore_bridge_deposit",
@@ -3103,12 +3199,13 @@ impl CctpProvider {
         message_transmitter_v2_address: impl AsRef<str>,
         asset_registry: Arc<AssetRegistry>,
     ) -> ProviderResult<Self> {
-        Self::new_with_transfer_mode(
+        Self::new_with_transfer_mode_and_proxy_url(
             base_url,
             token_messenger_v2_address,
             message_transmitter_v2_address,
             CctpTransferMode::Standard,
             asset_registry,
+            None,
         )
     }
 
@@ -3119,6 +3216,41 @@ impl CctpProvider {
         transfer_mode: CctpTransferMode,
         asset_registry: Arc<AssetRegistry>,
     ) -> ProviderResult<Self> {
+        Self::new_with_transfer_mode_and_proxy_url(
+            base_url,
+            token_messenger_v2_address,
+            message_transmitter_v2_address,
+            transfer_mode,
+            asset_registry,
+            None,
+        )
+    }
+
+    pub fn new_with_proxy_url(
+        base_url: impl Into<String>,
+        token_messenger_v2_address: impl AsRef<str>,
+        message_transmitter_v2_address: impl AsRef<str>,
+        asset_registry: Arc<AssetRegistry>,
+        proxy_url: Option<&ProxyUrl>,
+    ) -> ProviderResult<Self> {
+        Self::new_with_transfer_mode_and_proxy_url(
+            base_url,
+            token_messenger_v2_address,
+            message_transmitter_v2_address,
+            CctpTransferMode::Standard,
+            asset_registry,
+            proxy_url,
+        )
+    }
+
+    pub fn new_with_transfer_mode_and_proxy_url(
+        base_url: impl Into<String>,
+        token_messenger_v2_address: impl AsRef<str>,
+        message_transmitter_v2_address: impl AsRef<str>,
+        transfer_mode: CctpTransferMode,
+        asset_registry: Arc<AssetRegistry>,
+        proxy_url: Option<&ProxyUrl>,
+    ) -> ProviderResult<Self> {
         let token_messenger_v2_address = Address::from_str(token_messenger_v2_address.as_ref())
             .map_err(|err| format!("invalid CCTP TokenMessengerV2 address: {err}"))?;
         let message_transmitter_v2_address =
@@ -3126,7 +3258,7 @@ impl CctpProvider {
                 .map_err(|err| format!("invalid CCTP MessageTransmitterV2 address: {err}"))?;
         Ok(Self {
             base_url: normalize_base_url(base_url)?,
-            http: rustls_http_client()?,
+            http: rustls_http_client(proxy_url)?,
             asset_registry,
             token_messenger_v2_address,
             message_transmitter_v2_address,
@@ -4302,8 +4434,19 @@ impl HyperliquidProvider {
         asset_registry: Arc<AssetRegistry>,
         order_timeout_ms: u64,
     ) -> Result<Self, String> {
+        Self::new_with_proxy_url(base_url, network, asset_registry, order_timeout_ms, None)
+    }
+
+    pub fn new_with_proxy_url(
+        base_url: impl Into<String>,
+        network: HyperliquidCallNetwork,
+        asset_registry: Arc<AssetRegistry>,
+        order_timeout_ms: u64,
+        proxy_url: Option<&ProxyUrl>,
+    ) -> Result<Self, String> {
         let target_base_url = normalize_base_url(base_url)?;
-        let http = HyperliquidHttpClient::new(rustls_http_client()?, target_base_url.clone());
+        let http =
+            HyperliquidHttpClient::new(rustls_http_client(proxy_url)?, target_base_url.clone());
         Ok(Self {
             network,
             asset_registry,
@@ -4767,10 +4910,17 @@ impl HyperliquidProvider {
     }
 }
 
-fn rustls_http_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
+fn rustls_http_client(proxy_url: Option<&ProxyUrl>) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
         .use_rustls_tls()
-        .timeout(PROVIDER_HTTP_TIMEOUT)
+        .timeout(PROVIDER_HTTP_TIMEOUT);
+    if let Some(proxy_url) = proxy_url {
+        builder = builder.proxy(
+            reqwest::Proxy::all(proxy_url.as_str())
+                .map_err(|err| format!("failed to configure SOCKS5 proxy: {err}"))?,
+        );
+    }
+    builder
         .build()
         .map_err(|err| format!("failed to construct reqwest client: {err}"))
 }
@@ -4812,12 +4962,20 @@ fn trimmed_non_empty(value: &str) -> Option<&str> {
 
 impl VeloraProvider {
     pub fn new(base_url: impl Into<String>, partner: Option<String>) -> Result<Self, String> {
+        Self::new_with_proxy_url(base_url, partner, None)
+    }
+
+    pub fn new_with_proxy_url(
+        base_url: impl Into<String>,
+        partner: Option<String>,
+        proxy_url: Option<&ProxyUrl>,
+    ) -> Result<Self, String> {
         Ok(Self {
             base_url: normalize_base_url(base_url)?,
             partner: partner
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
-            http: rustls_http_client()?,
+            http: rustls_http_client(proxy_url)?,
         })
     }
 
@@ -7486,23 +7644,24 @@ mod hyperliquid_math_tests {
         cctp_quote_amounts, cctp_source_domain_from_request, checked_timeout_at_ms,
         classify_hl_leg, compute_base_sz, compute_limit_px, decimal_bps_string,
         encode_erc20_approve, format_hl_spot_price, format_hyperliquid_amount, hl_leg_descriptor,
-        hypercore_bridge_deposit_completion_response, hyperliquid_bridge_deposit_completion_response,
-        hyperliquid_filled_actual_amounts, hyperliquid_order_oid_from_observation_request,
-        hyperliquid_order_status_provider_status, observed_unit_operation_fingerprints,
-        parse_decimal_bps_to_micros, parse_decimal_to_raw_units, parse_decimal_to_raw_units_floor,
+        hypercore_bridge_deposit_completion_response,
+        hyperliquid_bridge_deposit_completion_response, hyperliquid_filled_actual_amounts,
+        hyperliquid_order_oid_from_observation_request, hyperliquid_order_status_provider_status,
+        observed_unit_operation_fingerprints, parse_decimal_bps_to_micros,
+        parse_decimal_to_raw_units, parse_decimal_to_raw_units_floor,
         seen_operation_fingerprints_from_request, set_velora_transaction_amount_constraints,
         simulate_leg, unit_operation_provider_status, unit_withdrawal_minimum_raw,
         validated_unit_generate_address, velora_slippage_bps, AcrossHttpProviderConfig,
         ActionProviderHttpOptions, ActionProviderRegistry, BridgeExecutionRequest, BridgeProvider,
         BridgeQuoteRequest, CctpHttpProviderConfig, CctpMessagesResponse, CctpProvider,
-        CctpQuoteAmounts, CctpTransferMode, ExchangeExecutionRequest, ExchangeProvider, HypercoreBridgeProvider,
-        HyperliquidBridgeProvider, HyperliquidCallNetwork, HyperliquidProvider,
-        HyperliquidTradeAssetRef,
-        HyperliquidTradeStepRequest, LimitPxInput, ProviderExecutionIntent,
-        ProviderOperationObservationRequest, UniversalRouterAssetRef, VeloraHttpProviderConfig,
-        VeloraProvider, DEFAULT_HYPERLIQUID_ORDER_TIMEOUT_MS, HYPERLIQUID_BRIDGE_WITHDRAW_FEE_RAW,
-        VELORA_DEFAULT_SLIPPAGE_BPS,
+        CctpQuoteAmounts, CctpTransferMode, ExchangeExecutionRequest, ExchangeProvider,
+        HypercoreBridgeProvider, HyperliquidBridgeProvider, HyperliquidCallNetwork,
+        HyperliquidProvider, HyperliquidTradeAssetRef, HyperliquidTradeStepRequest, LimitPxInput,
+        ProviderExecutionIntent, ProviderOperationObservationRequest, UniversalRouterAssetRef,
+        VeloraHttpProviderConfig, VeloraProvider, DEFAULT_HYPERLIQUID_ORDER_TIMEOUT_MS,
+        HYPERLIQUID_BRIDGE_WITHDRAW_FEE_RAW, VELORA_DEFAULT_SLIPPAGE_BPS,
     };
+    use crate::services::upstream_proxy::ProxyUrl;
     use crate::{
         models::{ProviderOperationStatus, ProviderOperationType, ProviderOrderKind},
         protocol::{AssetId, ChainId, DepositAsset},
@@ -7512,7 +7671,9 @@ mod hyperliquid_math_tests {
         },
     };
     use alloy::primitives::U256;
-    use hyperliquid_client::info::{ClearinghouseState, L2BookSnapshot, L2Level, SpotBalance, SpotClearinghouseState};
+    use hyperliquid_client::info::{
+        ClearinghouseState, L2BookSnapshot, L2Level, SpotBalance, SpotClearinghouseState,
+    };
     use hyperunit_client::{UnitChain, UnitGenerateAddressResponse};
     use serde_json::json;
     use std::sync::Arc;
@@ -7903,8 +8064,15 @@ mod hyperliquid_math_tests {
                 "https://cctp.example/cctp-path-secret",
             )),
             hyperunit_base_url: Some("https://unit.example/unit-path-secret".to_string()),
-            hyperunit_proxy_url: Some("socks5://user:proxy-secret@proxy.example:1080".to_string()),
+            hyperunit_proxy_url: Some(
+                ProxyUrl::parse(
+                    "socks5://user:proxy-secret@proxy.example:1080",
+                    "HYPERUNIT_PROXY_URL",
+                )
+                .expect("proxy URL"),
+            ),
             hyperliquid_base_url: Some("https://hyperliquid.example/hyper-path-secret".to_string()),
+            hyperliquid_proxy_url: None,
             velora: Some(VeloraHttpProviderConfig::new(
                 "not a url containing velora-secret",
             )),
@@ -8114,8 +8282,14 @@ mod hyperliquid_math_tests {
 
     #[test]
     fn cctp_transfer_mode_parses_expected_values() {
-        assert_eq!("standard".parse::<CctpTransferMode>().unwrap(), CctpTransferMode::Standard);
-        assert_eq!("fast".parse::<CctpTransferMode>().unwrap(), CctpTransferMode::Fast);
+        assert_eq!(
+            "standard".parse::<CctpTransferMode>().unwrap(),
+            CctpTransferMode::Standard
+        );
+        assert_eq!(
+            "fast".parse::<CctpTransferMode>().unwrap(),
+            CctpTransferMode::Fast
+        );
         assert!("turbo".parse::<CctpTransferMode>().is_err());
     }
 
@@ -8277,7 +8451,10 @@ mod hyperliquid_math_tests {
             quote.provider_quote["core_deposit_wallet"],
             "0x6b9e773128f453f5c2c60935ee2de2cbc5390a24"
         );
-        assert_eq!(quote.provider_quote["destination_dex"], serde_json::json!(u32::MAX));
+        assert_eq!(
+            quote.provider_quote["destination_dex"],
+            serde_json::json!(u32::MAX)
+        );
     }
     #[test]
     fn hypercore_bridge_completion_response_reports_spot_balance_delta() {

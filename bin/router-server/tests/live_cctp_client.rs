@@ -35,7 +35,6 @@ type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 const LIVE_PROVIDER_TESTS: &str = "LIVE_PROVIDER_TESTS";
 const CCTP_API_URL: &str = "CCTP_API_URL";
-const DEFAULT_CCTP_API_URL: &str = "https://iris-api.circle.com";
 const CCTP_BASE_RPC_URL: &str = "CCTP_LIVE_BASE_RPC_URL";
 const CCTP_ARBITRUM_RPC_URL: &str = "CCTP_LIVE_ARBITRUM_RPC_URL";
 const CCTP_PRIVATE_KEY: &str = "CCTP_LIVE_PRIVATE_KEY";
@@ -584,7 +583,7 @@ fn live_arbitrum_rpc_url() -> TestResult<Url> {
 
 fn live_cctp_base_url() -> TestResult<Url> {
     env_var_any(&[CCTP_API_URL])
-        .unwrap_or_else(|| DEFAULT_CCTP_API_URL.to_string())
+        .ok_or_else(|| format!("missing required env var {CCTP_API_URL}"))?
         .parse::<Url>()
         .map_err(|error| format!("invalid {CCTP_API_URL}: {error}").into())
 }

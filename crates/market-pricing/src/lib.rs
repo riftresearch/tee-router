@@ -144,17 +144,47 @@ impl MarketPricingOracleConfig {
 #[derive(Clone)]
 pub struct MarketPricingOracle {
     config: MarketPricingOracleConfig,
-    http: reqwest::Client,
+    coinbase_http: reqwest::Client,
+    ethereum_http: reqwest::Client,
+    arbitrum_http: reqwest::Client,
+    base_http: reqwest::Client,
+    hyperliquid_http: reqwest::Client,
+    hyperevm_http: Option<reqwest::Client>,
 }
 
 impl MarketPricingOracle {
     pub fn new(config: MarketPricingOracleConfig) -> MarketPricingResult<Self> {
-        let http = reqwest::Client::builder()
-            .timeout(config.timeout)
-            .user_agent("tee-router-market-pricing/1.0")
-            .build()
-            .map_err(|source| MarketPricingError::Http { source })?;
-        Ok(Self { config, http })
+        Self::new_with_proxy_urls(config, None, None, None, None, None, None)
+    }
+
+    pub fn new_with_proxy_urls(
+        config: MarketPricingOracleConfig,
+        coinbase_proxy_url: Option<&str>,
+        ethereum_rpc_proxy_url: Option<&str>,
+        arbitrum_rpc_proxy_url: Option<&str>,
+        base_rpc_proxy_url: Option<&str>,
+        hyperliquid_proxy_url: Option<&str>,
+        hyperevm_rpc_proxy_url: Option<&str>,
+    ) -> MarketPricingResult<Self> {
+        let coinbase_http = pricing_http_client(config.timeout, coinbase_proxy_url)?;
+        let ethereum_http = pricing_http_client(config.timeout, ethereum_rpc_proxy_url)?;
+        let arbitrum_http = pricing_http_client(config.timeout, arbitrum_rpc_proxy_url)?;
+        let base_http = pricing_http_client(config.timeout, base_rpc_proxy_url)?;
+        let hyperliquid_http = pricing_http_client(config.timeout, hyperliquid_proxy_url)?;
+        let hyperevm_http = config
+            .hyperevm_rpc_url
+            .as_ref()
+            .map(|_| pricing_http_client(config.timeout, hyperevm_rpc_proxy_url))
+            .transpose()?;
+        Ok(Self {
+            config,
+            coinbase_http,
+            ethereum_http,
+            arbitrum_http,
+            base_http,
+            hyperliquid_http,
+            hyperevm_http,
+        })
     }
 
     pub async fn snapshot(&self) -> MarketPricingResult<MarketPricingSnapshot> {
@@ -170,9 +200,17 @@ impl MarketPricingOracle {
             self.coinbase_spot_usd_micro("ETH-USD"),
             self.coinbase_spot_usd_micro("BTC-USD"),
             self.coinbase_spot_usd_micro("USDC-USD"),
-            self.evm_gas_price_wei("ethereum", &self.config.ethereum_rpc_url),
-            self.evm_gas_price_wei("arbitrum", &self.config.arbitrum_rpc_url),
-            self.evm_gas_price_wei("base", &self.config.base_rpc_url),
+            self.evm_gas_price_wei(
+                "ethereum",
+                &self.config.ethereum_rpc_url,
+                &self.ethereum_http
+            ),
+            self.evm_gas_price_wei(
+                "arbitrum",
+                &self.config.arbitrum_rpc_url,
+                &self.arbitrum_http
+            ),
+            self.evm_gas_price_wei("base", &self.config.base_rpc_url, &self.base_http),
         )?;
         let (hype_usd_micro, hyperevm_gas_price_wei) = tokio::join!(
             self.optional_hyperliquid_hype_usd_micro(),
@@ -214,7 +252,7 @@ impl MarketPricingOracle {
         let path = format!("/v2/prices/{product_id}/spot");
         let url = join_url(&self.config.coinbase_api_base_url, &path)?;
         let response: CoinbaseSpotPriceResponse = get_json(
-            &self.http,
+            &self.coinbase_http,
             url.clone(),
             "coinbase",
             "GET",
@@ -238,7 +276,7 @@ impl MarketPricingOracle {
     async fn hyperliquid_hype_usd_micro(&self) -> MarketPricingResult<u64> {
         let url = join_url(&self.config.hyperliquid_api_base_url, "/info")?;
         let response: HashMap<String, String> = post_json(
-            &self.http,
+            &self.hyperliquid_http,
             url,
             &json!({ "type": "allMids" }),
             "hyperliquid",
@@ -246,11 +284,13 @@ impl MarketPricingOracle {
             "/info",
         )
         .await?;
-        let raw = response.get("HYPE").ok_or_else(|| MarketPricingError::InvalidRpc {
-            url: sanitized_parsed_url_for_error(&self.config.hyperliquid_api_base_url),
-            reason: "allMids response missing HYPE".to_string(),
-            body: error_text_preview(&serde_json::to_string(&response).unwrap_or_default()),
-        })?;
+        let raw = response
+            .get("HYPE")
+            .ok_or_else(|| MarketPricingError::InvalidRpc {
+                url: sanitized_parsed_url_for_error(&self.config.hyperliquid_api_base_url),
+                reason: "allMids response missing HYPE".to_string(),
+                body: error_text_preview(&serde_json::to_string(&response).unwrap_or_default()),
+            })?;
         let value = parse_usd_micro(raw)?;
         ensure_positive_price("hyperliquid HYPE", value)?;
         Ok(value)
@@ -258,18 +298,20 @@ impl MarketPricingOracle {
 
     async fn optional_hyperevm_gas_price_wei(&self) -> Option<u64> {
         let rpc_url = self.config.hyperevm_rpc_url.as_ref()?;
-        self.evm_gas_price_wei("hyperevm", rpc_url).await.ok()
+        let http = self.hyperevm_http.as_ref()?;
+        self.evm_gas_price_wei("hyperevm", rpc_url, http).await.ok()
     }
 
     async fn evm_gas_price_wei(
         &self,
         chain: &'static str,
         rpc_url: &Url,
+        http: &reqwest::Client,
     ) -> MarketPricingResult<u64> {
         let mut delay = PRICING_RETRY_INITIAL_DELAY;
         let mut attempt = 1;
         loop {
-            match self.evm_gas_price_wei_once(chain, rpc_url).await {
+            match self.evm_gas_price_wei_once(chain, rpc_url, http).await {
                 Ok(value) => return Ok(value),
                 Err(error) if attempt < PRICING_RETRY_ATTEMPTS && error.is_retryable() => {
                     sleep(delay).await;
@@ -285,6 +327,7 @@ impl MarketPricingOracle {
         &self,
         chain: &'static str,
         rpc_url: &Url,
+        http: &reqwest::Client,
     ) -> MarketPricingResult<u64> {
         let body = json!({
             "jsonrpc": "2.0",
@@ -293,7 +336,7 @@ impl MarketPricingOracle {
             "params": [],
         });
         let started = Instant::now();
-        let response = match self.http.post(rpc_url.clone()).json(&body).send().await {
+        let response = match http.post(rpc_url.clone()).json(&body).send().await {
             Ok(response) => response,
             Err(source) => {
                 record_chain_rpc_request(
@@ -362,6 +405,60 @@ impl MarketPricingOracle {
         record_chain_rpc_request(chain, "eth_gasPrice", "success", started.elapsed());
         Ok(value)
     }
+}
+
+fn pricing_http_client(
+    timeout: Duration,
+    proxy_url: Option<&str>,
+) -> MarketPricingResult<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(timeout)
+        .user_agent("tee-router-market-pricing/1.0");
+    if let Some(proxy_url) = proxy_url {
+        validate_proxy_url(proxy_url)?;
+        builder = builder.proxy(
+            reqwest::Proxy::all(proxy_url.trim())
+                .map_err(|source| MarketPricingError::Http { source })?,
+        );
+    }
+    builder
+        .build()
+        .map_err(|source| MarketPricingError::Http { source })
+}
+
+fn validate_proxy_url(proxy_url: &str) -> MarketPricingResult<()> {
+    let url = Url::parse(proxy_url.trim()).map_err(|source| MarketPricingError::InvalidUrl {
+        url: sanitize_url_for_error(proxy_url),
+        source,
+    })?;
+    if url.scheme() != "socks5" {
+        return Err(MarketPricingError::InvalidUrlFormat {
+            url: sanitized_parsed_url_for_error(&url),
+            reason: format!("expected socks5 proxy scheme, got {:?}", url.scheme()),
+        });
+    }
+    if url.host_str().is_none() {
+        return Err(MarketPricingError::InvalidUrlFormat {
+            url: sanitized_parsed_url_for_error(&url),
+            reason: "proxy URL must include a host".to_string(),
+        });
+    }
+    if url.port().is_none() {
+        return Err(MarketPricingError::InvalidUrlFormat {
+            url: sanitized_parsed_url_for_error(&url),
+            reason: "proxy URL must include a port".to_string(),
+        });
+    }
+    if (!url.path().is_empty() && url.path() != "/")
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(MarketPricingError::InvalidUrlFormat {
+            url: sanitized_parsed_url_for_error(&url),
+            reason: "proxy URL must not include a path, query string, or fragment".to_string(),
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -625,7 +722,7 @@ fn sanitized_parsed_url_for_error(url: &Url) -> String {
         sanitized.push(':');
         sanitized.push_str(&port.to_string());
     }
-    if url.path() != "/" {
+    if !url.path().is_empty() && url.path() != "/" {
         sanitized.push_str("/<redacted-path>");
     }
     if url.query().is_some() {
@@ -936,6 +1033,8 @@ mod tests {
         assert!(snapshot.ethereum_gas_price_wei > 0);
         assert!(snapshot.arbitrum_gas_price_wei > 0);
         assert!(snapshot.base_gas_price_wei > 0);
-        assert!(snapshot.hyperevm_gas_price_wei.is_some_and(|value| value > 0));
-}
+        assert!(snapshot
+            .hyperevm_gas_price_wei
+            .is_some_and(|value| value > 0));
+    }
 }

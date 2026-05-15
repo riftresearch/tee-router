@@ -974,42 +974,57 @@ fn test_router_args(
         db_max_connections: 5,
         db_min_connections: 1,
         log_level: "info".to_string(),
+        production: false,
+        upstream_proxy_url: None,
         master_key_path: write_test_master_key(config_dir)
             .to_string_lossy()
             .to_string(),
         ethereum_mainnet_rpc_url: harness.ethereum_endpoint_url().to_string(),
+        ethereum_mainnet_rpc_proxy_url: None,
+        flashbots_rpc_url: None,
         ethereum_reference_token: MOCK_ERC20_ADDRESS.to_string(),
         ethereum_paymaster_private_key: Some(harness.ethereum_spawned_api_paymaster_private_key()),
         base_rpc_url: harness.base_endpoint_url().to_string(),
+        base_rpc_proxy_url: None,
         base_reference_token: MOCK_ERC20_ADDRESS.to_string(),
         base_paymaster_private_key: Some(harness.base_spawned_api_paymaster_private_key()),
         arbitrum_rpc_url: harness.arbitrum_endpoint_url().to_string(),
+        arbitrum_rpc_proxy_url: None,
         arbitrum_reference_token: MOCK_ERC20_ADDRESS.to_string(),
         arbitrum_paymaster_private_key: Some(harness.arbitrum_spawned_api_paymaster_private_key()),
         hyperevm_rpc_url: Some(harness.base_endpoint_url().to_string()),
+        hyperevm_rpc_proxy_url: None,
         hyperevm_reference_token: Some("0xb88339cb7199b77e23db6e890353e22632ba630f".to_string()),
         hyperevm_paymaster_private_key: Some(harness.base_spawned_api_paymaster_private_key()),
         hyperevm_min_confirmations: Some(4),
         hyperevm_estimated_block_time_ms: Some(1_000),
         bitcoin_rpc_url: harness.bitcoin_rpc_url(),
+        bitcoin_rpc_proxy_url: None,
         bitcoin_rpc_auth: harness.bitcoin_auth(),
         untrusted_esplora_http_server_url: harness.esplora_url(),
+        esplora_proxy_url: None,
         bitcoin_network: bitcoin::Network::Regtest,
         bitcoin_paymaster_private_key: Some(regtest_paymaster_private_key()),
         cors_domain: None,
         chainalysis_host: None,
         chainalysis_token: None,
+        chainalysis_proxy_url: None,
         loki_url: None,
         across_api_url: None,
         across_api_key: None,
+        across_proxy_url: None,
         across_integrator_id: None,
         cctp_api_url: None,
+        cctp_proxy_url: None,
         cctp_token_messenger_v2_address: None,
         cctp_message_transmitter_v2_address: None,
+        cctp_transfer_mode: None,
         hyperunit_api_url: None,
         hyperunit_proxy_url: None,
         hyperliquid_api_url: None,
+        hyperliquid_proxy_url: None,
         velora_api_url: None,
+        velora_proxy_url: None,
         velora_partner: None,
         hyperliquid_execution_private_key: None,
         hyperliquid_account_address: None,
@@ -1035,7 +1050,8 @@ fn test_router_args(
         worker_order_execution_pass_limit: 25,
         worker_order_execution_concurrency: 64,
         worker_vault_funding_hint_pass_limit: 100,
-        coinbase_price_api_base_url: "http://127.0.0.1:9".to_string(),
+        coinbase_price_api_base_url: Some("http://127.0.0.1:9".to_string()),
+        coinbase_proxy_url: None,
     }
 }
 
@@ -2634,7 +2650,7 @@ async fn router_api_quote_and_order_flow_uses_production_component_initializatio
     args.across_api_key = Some("mock-across-api-key".to_string());
     args.hyperunit_api_url = Some(mocks.base_url().to_string());
     args.hyperliquid_api_url = Some(mocks.base_url().to_string());
-    args.coinbase_price_api_base_url = mocks.base_url().to_string();
+    args.coinbase_price_api_base_url = Some(mocks.base_url().to_string());
     args.router_admin_api_key = Some(TEST_ADMIN_API_KEY.to_string());
     let (base_url, api_task) = spawn_router_api(args).await;
     let client = reqwest::Client::new();
@@ -2861,7 +2877,7 @@ async fn router_api_address_screening_covers_allow_block_and_provider_error() {
     args.across_api_key = Some("mock-across-api-key".to_string());
     args.hyperunit_api_url = Some(mocks.base_url().to_string());
     args.hyperliquid_api_url = Some(mocks.base_url().to_string());
-    args.coinbase_price_api_base_url = mocks.base_url().to_string();
+    args.coinbase_price_api_base_url = Some(mocks.base_url().to_string());
     args.chainalysis_host = Some(mocks.base_url().to_string());
     args.chainalysis_token = Some("mock-chainalysis-token".to_string());
     let (base_url, api_task) = spawn_router_api(args).await;
@@ -3168,7 +3184,7 @@ async fn router_admin_provider_policy_drain_excludes_provider_from_new_quotes_im
     args.across_api_key = Some("mock-across-api-key".to_string());
     args.hyperunit_api_url = Some(mocks.base_url().to_string());
     args.hyperliquid_api_url = Some(mocks.base_url().to_string());
-    args.coinbase_price_api_base_url = mocks.base_url().to_string();
+    args.coinbase_price_api_base_url = Some(mocks.base_url().to_string());
     args.router_admin_api_key = Some(TEST_ADMIN_API_KEY.to_string());
     let (base_url, api_task) = spawn_router_api(args).await;
     let client = reqwest::Client::new();

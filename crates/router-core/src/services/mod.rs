@@ -9,6 +9,7 @@ pub mod market_order_planner;
 pub mod pricing;
 pub mod quote_legs;
 pub mod route_costs;
+pub mod upstream_proxy;
 pub mod usd_valuation;
 
 pub use action_providers::{

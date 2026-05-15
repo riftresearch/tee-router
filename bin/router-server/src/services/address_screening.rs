@@ -56,8 +56,16 @@ impl AddressScreeningService {
         host: impl Into<String>,
         token: impl Into<String>,
     ) -> Result<Self, ChainalysisError> {
+        Self::new_with_proxy_url(host, token, None)
+    }
+
+    pub fn new_with_proxy_url(
+        host: impl Into<String>,
+        token: impl Into<String>,
+        proxy_url: Option<&str>,
+    ) -> Result<Self, ChainalysisError> {
         Ok(Self {
-            chainalysis: ChainalysisAddressScreener::new(host, token)?,
+            chainalysis: ChainalysisAddressScreener::new_with_proxy_url(host, token, proxy_url)?,
         })
     }
 

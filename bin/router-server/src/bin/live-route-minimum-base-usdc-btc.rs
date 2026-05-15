@@ -47,13 +47,10 @@ async fn main() -> CliResult<()> {
             .ok_or("missing ROUTER_LIVE_SOURCE_PRIVATE_KEY or LIVE_TEST_PRIVATE_KEY")?;
     let across_api_key = env_var_required("ACROSS_API_KEY")?;
     let across_integrator_id = env_var_required("ACROSS_INTEGRATOR_ID")?;
-    let across_api_url =
-        env::var("ACROSS_API_URL").unwrap_or_else(|_| "https://app.across.to/api".to_string());
-    let hyperunit_api_url =
-        env::var("HYPERUNIT_API_URL").unwrap_or_else(|_| "https://api.hyperunit.xyz".to_string());
+    let across_api_url = env_var_required("ACROSS_API_URL")?;
+    let hyperunit_api_url = env_var_required("HYPERUNIT_API_URL")?;
     let hyperunit_proxy_url = env::var("HYPERUNIT_PROXY_URL").ok();
-    let hyperliquid_api_url = env::var("HYPERLIQUID_API_URL")
-        .unwrap_or_else(|_| "https://api.hyperliquid.xyz".to_string());
+    let hyperliquid_api_url = env_var_required("HYPERLIQUID_API_URL")?;
     let base_rpc_url = env_var_required("BASE_RPC_URL")?;
     let recipient_address = env_var_any(&[
         "ROUTER_LIVE_BTC_RECIPIENT_ADDRESS",

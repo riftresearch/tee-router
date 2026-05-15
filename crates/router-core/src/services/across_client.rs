@@ -9,6 +9,7 @@ use std::{
 use url::Url;
 
 use super::http_body::{read_limited_response_text, response_body_error_preview};
+use super::upstream_proxy::ProxyUrl;
 use crate::telemetry;
 
 pub type AcrossResult<T> = Result<T, AcrossClientError>;
@@ -270,6 +271,14 @@ pub struct AcrossClient {
 
 impl AcrossClient {
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> AcrossResult<Self> {
+        Self::new_with_proxy_url(base_url, api_key, None)
+    }
+
+    pub fn new_with_proxy_url(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        proxy_url: Option<&ProxyUrl>,
+    ) -> AcrossResult<Self> {
         let api_key = api_key.into().trim().to_string();
         if api_key.is_empty() {
             return Err(AcrossClientError::ClientConfiguration {
@@ -278,7 +287,7 @@ impl AcrossClient {
         }
         let base_url = normalize_base_url(base_url)?;
         Ok(Self {
-            http: rustls_http_client()?,
+            http: rustls_http_client(proxy_url)?,
             base_url,
             api_key,
         })
@@ -375,10 +384,18 @@ fn across_endpoint_label(path: &str) -> &'static str {
     }
 }
 
-fn rustls_http_client() -> AcrossResult<reqwest::Client> {
-    reqwest::Client::builder()
+fn rustls_http_client(proxy_url: Option<&ProxyUrl>) -> AcrossResult<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
         .use_rustls_tls()
-        .timeout(ACROSS_HTTP_TIMEOUT)
+        .timeout(ACROSS_HTTP_TIMEOUT);
+    if let Some(proxy_url) = proxy_url {
+        builder = builder.proxy(reqwest::Proxy::all(proxy_url.as_str()).map_err(|err| {
+            AcrossClientError::ClientConfiguration {
+                message: format!("invalid Across proxy URL: {err}"),
+            }
+        })?);
+    }
+    builder
         .build()
         .map_err(|err| AcrossClientError::ClientConfiguration {
             message: err.to_string(),

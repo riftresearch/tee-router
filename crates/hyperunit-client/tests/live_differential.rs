@@ -33,8 +33,7 @@ const LIVE_PROVIDER_TESTS: &str = "LIVE_PROVIDER_TESTS";
 const LIVE_TEST_PRIVATE_KEY: &str = "LIVE_TEST_PRIVATE_KEY";
 const HYPERUNIT_BASE_URL: &str = "HYPERUNIT_LIVE_BASE_URL";
 const HYPERUNIT_FALLBACK_BASE_URL: &str = "HYPERUNIT_API_URL";
-const HYPERUNIT_PROXY_URL: &str = "HYPERUNIT_LIVE_PROXY_URL";
-const HYPERUNIT_FALLBACK_PROXY_URL: &str = "HYPERUNIT_PROXY_URL";
+const HYPERUNIT_PROXY_URL: &str = "HYPERUNIT_PROXY_URL";
 const HYPERUNIT_PRIVATE_KEY: &str = "HYPERUNIT_LIVE_PRIVATE_KEY";
 const HYPERUNIT_ETHEREUM_RPC_URL: &str = "HYPERUNIT_LIVE_ETHEREUM_RPC_URL";
 const HYPERUNIT_DEPOSIT_AMOUNT_WEI: &str = "HYPERUNIT_LIVE_ETH_DEPOSIT_AMOUNT_WEI";
@@ -49,8 +48,6 @@ const HYPERLIQUID_BASE_URL: &str = "HYPERLIQUID_LIVE_BASE_URL";
 const HYPERLIQUID_NETWORK: &str = "HYPERLIQUID_LIVE_NETWORK";
 const LIVE_RECOVERY_DIR: &str = "ROUTER_LIVE_RECOVERY_DIR";
 
-const DEFAULT_HYPERUNIT_BASE_URL: &str = "https://api.hyperunit.xyz";
-const DEFAULT_HYPERLIQUID_BASE_URL: &str = "https://api.hyperliquid.xyz";
 const DEFAULT_HYPERUNIT_DEPOSIT_AMOUNT_WEI: &str = "10000000000000000";
 const DEFAULT_HYPERUNIT_WITHDRAW_AMOUNT_ETH: &str = "0.008";
 const DEFAULT_HYPERUNIT_WITHDRAW_AMOUNT_BTC: &str = "0.0003";
@@ -708,7 +705,7 @@ async fn wait_for_terminal_unit_operation(
             match operation.classified_state() {
                 UnitOperationState::Done => return Ok((operation, samples)),
                 UnitOperationState::Failure => {
-                    return Err(format!("{label} failed: {operation:?}").into())
+                    return Err(format!("{label} failed: {operation:?}").into());
                 }
                 _ => {}
             }
@@ -848,8 +845,12 @@ async fn select_ethereum_rpc_url() -> TestResult<Url> {
             candidates.push(value.to_string());
         }
     }
-    candidates.push("https://ethereum-rpc.publicnode.com".to_string());
-    candidates.push("https://cloudflare-eth.com".to_string());
+    if candidates.is_empty() {
+        return Err(format!(
+            "missing required env var {HYPERUNIT_ETHEREUM_RPC_URL} or ETHEREUM_RPC_URL"
+        )
+        .into());
+    }
 
     let mut seen = BTreeSet::new();
     let mut errors = Vec::new();
@@ -1005,23 +1006,21 @@ fn unit_tx_hash_matches_submitted(observed: Option<&str>, submitted: &str) -> bo
 fn live_unit_client() -> TestResult<HyperUnitClient> {
     HyperUnitClient::new_with_proxy_url(
         env_var_any(&[HYPERUNIT_BASE_URL, HYPERUNIT_FALLBACK_BASE_URL])
-            .unwrap_or_else(|| DEFAULT_HYPERUNIT_BASE_URL.to_string()),
-        env_var_any(&[HYPERUNIT_PROXY_URL, HYPERUNIT_FALLBACK_PROXY_URL]),
+            .ok_or("missing HYPERUNIT_LIVE_BASE_URL or HYPERUNIT_API_URL")?,
+        env_var_any(&[HYPERUNIT_PROXY_URL]),
     )
     .map_err(Into::into)
 }
 
 fn live_hyperliquid_info_client() -> TestResult<HyperliquidInfoClient> {
-    let base_url =
-        env::var(HYPERLIQUID_BASE_URL).unwrap_or_else(|_| DEFAULT_HYPERLIQUID_BASE_URL.to_string());
+    let base_url = required_env(HYPERLIQUID_BASE_URL)?;
     Ok(HyperliquidInfoClient::new(&base_url)?)
 }
 
 fn live_hyperliquid_exchange_client(
     wallet: PrivateKeySigner,
 ) -> TestResult<HyperliquidExchangeClient> {
-    let base_url =
-        env::var(HYPERLIQUID_BASE_URL).unwrap_or_else(|_| DEFAULT_HYPERLIQUID_BASE_URL.to_string());
+    let base_url = required_env(HYPERLIQUID_BASE_URL)?;
     Ok(HyperliquidExchangeClient::new(
         &base_url,
         wallet,

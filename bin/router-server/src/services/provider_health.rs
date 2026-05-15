@@ -313,6 +313,25 @@ impl ProviderHealthProbe {
                 ),
             });
         }
+        if parsed.host_str().is_none() || parsed.port().is_none() {
+            return Err(RouterServerError::InvalidData {
+                message: format!(
+                    "provider health proxy URL for {} must include host and port",
+                    self.provider
+                ),
+            });
+        }
+        if (!parsed.path().is_empty() && parsed.path() != "/")
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return Err(RouterServerError::InvalidData {
+                message: format!(
+                    "provider health proxy URL for {} must not include a path, query string, or fragment",
+                    self.provider
+                ),
+            });
+        }
         let proxy = Proxy::all(proxy_url).map_err(|err| RouterServerError::InvalidData {
             message: format!(
                 "failed to configure provider health proxy for {}: {err}",

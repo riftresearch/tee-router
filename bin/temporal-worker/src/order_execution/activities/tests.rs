@@ -3,7 +3,7 @@ use crate::order_execution::types::{ProviderKind, WorkflowHintId};
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use chains::{ChainOperations, ChainRegistry, evm::EvmChain, hyperliquid::HyperliquidChain};
+use chains::{evm::EvmChain, hyperliquid::HyperliquidChain, ChainOperations, ChainRegistry};
 use router_core::{
     config::Settings,
     models::{
@@ -11,21 +11,21 @@ use router_core::{
         RouterOrderStatus, RouterOrderType,
     },
     services::{
-        ActionProviderHttpOptions,
         action_providers::{ExchangeProvider, ProviderAddressIntent, ProviderFuture, UnitProvider},
         asset_registry::{AssetSlot, RequiredCustodyRole},
         custody_action_executor::{
             ChainCall, HyperliquidCall, HyperliquidCallNetwork, HyperliquidCallPayload,
             HyperliquidRuntimeConfig,
         },
+        ActionProviderHttpOptions,
     },
 };
 use router_primitives::ChainType;
 use sqlx_postgres::PgPool;
 use testcontainers::{
-    ContainerAsync, GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
+    ContainerAsync, GenericImage, ImageExt,
 };
 
 const POSTGRES_PORT: u16 = 5432;
@@ -1604,6 +1604,7 @@ async fn hyperliquid_bridge_quotes_build_refund_quote_leg_shapes() {
         hyperunit_base_url: None,
         hyperunit_proxy_url: None,
         hyperliquid_base_url: Some("http://127.0.0.1:1".to_string()),
+        hyperliquid_proxy_url: None,
         velora: None,
         hyperliquid_network: HyperliquidCallNetwork::Testnet,
         hyperliquid_order_timeout_ms: 30_000,
@@ -2046,14 +2047,9 @@ fn hyperliquid_spot_refund_quote_reserves_activation_fee_before_unit_withdrawal(
         transitions: vec![trade.clone(), withdrawal],
     };
 
-    let quoted = quote_amount_for_hyperliquid_spot_refund_transition(
-        &path,
-        0,
-        &trade,
-        "38994800",
-    )
-    .expect("quote reserve logic")
-    .expect("amount should remain quoteable");
+    let quoted = quote_amount_for_hyperliquid_spot_refund_transition(&path, 0, &trade, "38994800")
+        .expect("quote reserve logic")
+        .expect("amount should remain quoteable");
 
     assert_eq!(quoted, "37994800");
 }
@@ -2073,14 +2069,9 @@ fn hyperliquid_spot_refund_quote_does_not_reserve_without_downstream_unit_withdr
         transitions: vec![trade.clone()],
     };
 
-    let quoted = quote_amount_for_hyperliquid_spot_refund_transition(
-        &path,
-        0,
-        &trade,
-        "38994800",
-    )
-    .expect("quote reserve logic")
-    .expect("amount should remain quoteable");
+    let quoted = quote_amount_for_hyperliquid_spot_refund_transition(&path, 0, &trade, "38994800")
+        .expect("quote reserve logic")
+        .expect("amount should remain quoteable");
 
     assert_eq!(quoted, "38994800");
 }
@@ -3806,10 +3797,7 @@ fn cctp_receive_existing_balance_completion_marks_operation_completed() {
     let attempt_id = Uuid::now_v7();
     let leg_id = Uuid::now_v7();
     let vault_id = Uuid::now_v7();
-    let asset = test_asset(
-        "evm:999",
-        "0xb88339cb7199b77e23db6e890353e22632ba630f",
-    );
+    let asset = test_asset("evm:999", "0xb88339cb7199b77e23db6e890353e22632ba630f");
     let mut step = test_execution_step(
         order_id,
         attempt_id,
@@ -3865,9 +3853,10 @@ fn cctp_receive_existing_balance_completion_marks_operation_completed() {
         .operation
         .expect("provider operation");
     assert_eq!(operation.status, ProviderOperationStatus::Completed);
-    assert!(operation.provider_ref.as_deref().is_some_and(|provider_ref| {
-        provider_ref.starts_with("cctp_receive_already_claimed:")
-    }));
+    assert!(operation
+        .provider_ref
+        .as_deref()
+        .is_some_and(|provider_ref| { provider_ref.starts_with("cctp_receive_already_claimed:") }));
     assert_eq!(
         operation
             .observed_state
@@ -4399,6 +4388,7 @@ fn test_deps(db: Database) -> OrderActivityDeps {
             hyperunit_base_url: None,
             hyperunit_proxy_url: None,
             hyperliquid_base_url: None,
+            hyperliquid_proxy_url: None,
             velora: None,
             hyperliquid_network: HyperliquidCallNetwork::Testnet,
             hyperliquid_order_timeout_ms: 30_000,

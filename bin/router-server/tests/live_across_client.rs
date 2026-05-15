@@ -140,7 +140,7 @@ async fn live_across_swap_lifecycle_transcript_spends_funds() -> TestResult<()> 
 
 fn live_client() -> TestResult<AcrossClient> {
     Ok(AcrossClient::new(
-        env::var(ACROSS_BASE_URL).unwrap_or_else(|_| "https://app.across.to/api".into()),
+        required_env(ACROSS_BASE_URL)?,
         required_env(ACROSS_API_KEY)?,
     )?)
 }

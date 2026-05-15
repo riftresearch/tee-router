@@ -66,14 +66,7 @@ const VELORA_AMOUNT_IN_WEI: &str = "VELORA_LIVE_BASE_ETH_AMOUNT_IN_WEI";
 const HYPERLIQUID_API_URL_ENV: &str = "HYPERLIQUID_API_URL";
 const HYPERUNIT_BASE_URL: &str = "HYPERUNIT_LIVE_BASE_URL";
 const HYPERUNIT_FALLBACK_BASE_URL: &str = "HYPERUNIT_API_URL";
-const HYPERUNIT_PROXY_URL: &str = "HYPERUNIT_LIVE_PROXY_URL";
-const HYPERUNIT_FALLBACK_PROXY_URL: &str = "HYPERUNIT_PROXY_URL";
-
-const DEFAULT_ACROSS_BASE_URL: &str = "https://app.across.to/api";
-const DEFAULT_CCTP_API_URL: &str = "https://iris-api.circle.com";
-const DEFAULT_VELORA_BASE_URL: &str = "https://api.paraswap.io";
-const DEFAULT_HYPERLIQUID_API_URL: &str = "https://api.hyperliquid.xyz";
-const DEFAULT_HYPERUNIT_BASE_URL: &str = "https://api.hyperunit.xyz";
+const HYPERUNIT_PROXY_URL: &str = "HYPERUNIT_PROXY_URL";
 
 const DEFAULT_ACROSS_AMOUNT_RAW: &str = "10000000";
 const DEFAULT_VELORA_AMOUNT_IN_WEI: &str = "10000000000000";
@@ -103,7 +96,7 @@ pub async fn live_vs_mock_across_swap_approval_contract() -> TestResult<()> {
     let request = configured_across_request(&integrator_id)?;
 
     let live_client = AcrossClient::new(
-        env_var_any(&[ACROSS_BASE_URL]).unwrap_or_else(|| DEFAULT_ACROSS_BASE_URL.to_string()),
+        required_env_any(&[ACROSS_BASE_URL, "ACROSS_API_URL"])?,
         api_key.clone(),
     )?;
     let live_response = live_client.swap_approval(request.clone()).await?;
@@ -147,19 +140,14 @@ pub async fn live_vs_mock_cctp_quote_contract() -> TestResult<()> {
 
     let amount = U256::from(100_000_u64);
     let request = cctp_quote_request(amount);
-    let live_provider = cctp_provider(
-        env_var_any(&[CCTP_API_URL]).unwrap_or_else(|| DEFAULT_CCTP_API_URL.to_string()),
-    )?;
+    let cctp_api_url = required_env_any(&[CCTP_API_URL])?;
+    let live_provider = cctp_provider(cctp_api_url.clone())?;
     let live_quote = live_provider
         .quote_bridge(request.clone())
         .await?
         .ok_or("live CCTP quote returned None")?;
     let live_contract = assert_cctp_quote_contract("live CCTP", &live_quote, &request)?;
-    let live_iris_contract = assert_iris_zero_hash_contract(
-        "live Iris",
-        &env_var_any(&[CCTP_API_URL]).unwrap_or_else(|| DEFAULT_CCTP_API_URL.to_string()),
-    )
-    .await?;
+    let live_iris_contract = assert_iris_zero_hash_contract("live Iris", &cctp_api_url).await?;
 
     let mock = MockIntegratorServer::spawn().await?;
     let mock_provider = cctp_provider(mock.base_url())?;
@@ -215,7 +203,7 @@ pub async fn live_vs_mock_velora_quote_contract() -> TestResult<()> {
         recipient_address: format!("{user:#x}"),
     };
 
-    let live_base_url = live_velora_base_url();
+    let live_base_url = live_velora_base_url()?;
     let live_provider = VeloraProvider::new(live_base_url.clone(), env_var_any(&[VELORA_PARTNER]))?;
     let live_quote = live_provider
         .quote_trade(request.clone())
@@ -285,7 +273,7 @@ pub async fn live_vs_mock_velora_quote_contract_no_sender() -> TestResult<()> {
         recipient_address: format!("{user:#x}"),
     };
 
-    let live_base_url = live_velora_base_url();
+    let live_base_url = live_velora_base_url()?;
     let live_provider = VeloraProvider::new(live_base_url.clone(), env_var_any(&[VELORA_PARTNER]))?;
     let live_quote = live_provider
         .quote_trade(request.clone())
@@ -355,8 +343,7 @@ pub async fn live_vs_mock_hyperliquid_quote_contract() -> TestResult<()> {
     };
 
     let live_provider = HyperliquidProvider::new(
-        env_var_any(&[HYPERLIQUID_API_URL_ENV])
-            .unwrap_or_else(|| DEFAULT_HYPERLIQUID_API_URL.to_string()),
+        required_env_any(&[HYPERLIQUID_API_URL_ENV])?,
         HyperliquidCallNetwork::Mainnet,
         Arc::new(AssetRegistry::default()),
         30_000,
@@ -414,9 +401,8 @@ pub async fn live_vs_mock_hyperunit_generate_address_contract() -> TestResult<()
     };
 
     let live_client = HyperUnitClient::new_with_proxy_url(
-        env_var_any(&[HYPERUNIT_BASE_URL, HYPERUNIT_FALLBACK_BASE_URL])
-            .unwrap_or_else(|| DEFAULT_HYPERUNIT_BASE_URL.to_string()),
-        env_var_any(&[HYPERUNIT_PROXY_URL, HYPERUNIT_FALLBACK_PROXY_URL]),
+        required_env_any(&[HYPERUNIT_BASE_URL, HYPERUNIT_FALLBACK_BASE_URL])?,
+        env_var_any(&[HYPERUNIT_PROXY_URL]),
     )?;
     let live_generated = live_client.generate_address(request.clone()).await?;
     let live_operations = live_client
@@ -684,7 +670,7 @@ fn assert_cctp_quote_contract(
     let request_amount = match &request.order_kind {
         ProviderOrderKind::ExactIn { amount_in, .. } => amount_in.as_str(),
         ProviderOrderKind::ExactOut { .. } => {
-            return Err(format!("{label} CCTP differential expects exact-in request").into())
+            return Err(format!("{label} CCTP differential expects exact-in request").into());
         }
     };
     assert_eq!(quote.amount_in, request_amount, "{label} amount_in");
@@ -913,7 +899,7 @@ fn assert_exchange_quote_contract(
     let requested_amount_in = match &request.order_kind {
         ProviderOrderKind::ExactIn { amount_in, .. } => amount_in.as_str(),
         ProviderOrderKind::ExactOut { .. } => {
-            return Err(format!("{label} differential expects exact-in request").into())
+            return Err(format!("{label} differential expects exact-in request").into());
         }
     };
     assert_raw_amount_string(&format!("{label} amount_in"), &quote.amount_in);
@@ -1117,9 +1103,8 @@ fn unit_address_kind(chain: &UnitChain, address: &str) -> TestResult<String> {
     }
 }
 
-fn live_velora_base_url() -> String {
-    env_var_any(&[VELORA_BASE_URL, VELORA_API_URL])
-        .unwrap_or_else(|| DEFAULT_VELORA_BASE_URL.to_string())
+fn live_velora_base_url() -> TestResult<String> {
+    required_env_any(&[VELORA_BASE_URL, VELORA_API_URL])
 }
 
 fn live_enabled() -> bool {

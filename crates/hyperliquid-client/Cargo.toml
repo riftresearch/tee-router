@@ -9,7 +9,7 @@ repository.workspace = true
 alloy = { workspace = true }
 metrics = { workspace = true }
 observability = { workspace = true }
-reqwest = { workspace = true, features = ["json"] }
+reqwest = { workspace = true, features = ["json", "socks"] }
 rmp-serde = "=1.1.2"
 serde = { workspace = true }
 serde_json = { workspace = true }

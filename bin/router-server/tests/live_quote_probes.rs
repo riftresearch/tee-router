@@ -34,11 +34,6 @@ type TestResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 const RUN_FLAG: &str = "ROUTER_LIVE_RUNTIME_E2E";
 const HYPERLIQUID_API_URL_ENV: &str = "HYPERLIQUID_API_URL";
-const DEFAULT_HYPERLIQUID_API_URL: &str = "https://api.hyperliquid.xyz";
-const DEFAULT_ACROSS_API_URL: &str = "https://app.across.to/api";
-const DEFAULT_CCTP_API_URL: &str = "https://iris-api.circle.com";
-const DEFAULT_HYPERUNIT_API_URL: &str = "https://api.hyperunit.xyz";
-const DEFAULT_VELORA_API_URL: &str = "https://api.paraswap.io";
 const ETHEREUM_USDC: &str = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
 const BASE_USDC: &str = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
 const ARBITRUM_USDC: &str = "0xaf88d065e77c8cc2239327c5edb3a432268e5831";
@@ -70,8 +65,7 @@ async fn live_hyperliquid_ueth_ubtc_quote_probe() -> TestResult<()> {
     }
 
     let provider = HyperliquidProvider::new(
-        env::var(HYPERLIQUID_API_URL_ENV)
-            .unwrap_or_else(|_| DEFAULT_HYPERLIQUID_API_URL.to_string()),
+        required_env(HYPERLIQUID_API_URL_ENV)?,
         HyperliquidCallNetwork::Mainnet,
         Arc::new(AssetRegistry::default()),
         30_000,
@@ -1042,21 +1036,21 @@ fn live_action_provider_registry() -> TestResult<ActionProviderRegistry> {
         "ACROSS_API_URL",
         "ACROSS_LIVE_BASE_URL",
     ])
-    .unwrap_or_else(|| DEFAULT_ACROSS_API_URL.to_string());
+    .ok_or("missing ROUTER_LIVE_ACROSS_API_URL, ACROSS_API_URL, or ACROSS_LIVE_BASE_URL")?;
     let hyperunit_api_url = env_var_any(&["ROUTER_LIVE_UNIT_API_URL", "HYPERUNIT_API_URL"])
-        .unwrap_or_else(|| DEFAULT_HYPERUNIT_API_URL.to_string());
-    let hyperunit_proxy_url = env_var_any(&["ROUTER_LIVE_UNIT_PROXY_URL", "HYPERUNIT_PROXY_URL"]);
+        .ok_or("missing ROUTER_LIVE_UNIT_API_URL or HYPERUNIT_API_URL")?;
+    let hyperunit_proxy_url = env_var_any(&["HYPERUNIT_PROXY_URL"]);
     let hyperliquid_api_url =
         env_var_any(&["ROUTER_LIVE_HYPERLIQUID_API_URL", HYPERLIQUID_API_URL_ENV])
-            .unwrap_or_else(|| DEFAULT_HYPERLIQUID_API_URL.to_string());
+            .ok_or("missing ROUTER_LIVE_HYPERLIQUID_API_URL or HYPERLIQUID_API_URL")?;
     let cctp_api_url = env_var_any(&["ROUTER_LIVE_CCTP_API_URL", "CCTP_API_URL"])
-        .unwrap_or_else(|| DEFAULT_CCTP_API_URL.to_string());
+        .ok_or("missing ROUTER_LIVE_CCTP_API_URL or CCTP_API_URL")?;
     let velora_api_url = env_var_any(&[
         "ROUTER_LIVE_VELORA_API_URL",
         "VELORA_LIVE_BASE_URL",
         "VELORA_API_URL",
     ])
-    .unwrap_or_else(|| DEFAULT_VELORA_API_URL.to_string());
+    .ok_or("missing ROUTER_LIVE_VELORA_API_URL, VELORA_LIVE_BASE_URL, or VELORA_API_URL")?;
     let velora_partner = env_var_any(&["ROUTER_LIVE_VELORA_PARTNER", "VELORA_LIVE_PARTNER"]);
 
     ActionProviderRegistry::http(
@@ -1174,6 +1168,10 @@ fn env_var_any(keys: &[&str]) -> Option<String> {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
     })
+}
+
+fn required_env(key: &str) -> TestResult<String> {
+    env_var_any(&[key]).ok_or_else(|| format!("missing required env var {key}").into())
 }
 
 fn assert_transition_kinds(provider_quote: &Value, expected_kinds: &[&str]) {

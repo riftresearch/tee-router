@@ -41,6 +41,8 @@ pub enum HyperUnitClientError {
         "unsupported HyperUnit proxy scheme {scheme:?} for {proxy_url}; expected socks5"
     ))]
     UnsupportedProxyScheme { proxy_url: String, scheme: String },
+    #[snafu(display("unsupported HyperUnit proxy URL {proxy_url}: {reason}"))]
+    UnsupportedProxyUrl { proxy_url: String, reason: String },
     #[snafu(display("failed to configure HyperUnit proxy {proxy_url}: {source}"))]
     ProxyConfiguration {
         proxy_url: String,
@@ -671,7 +673,7 @@ fn redacted_url_for_debug(value: &str) -> String {
         redacted.push(':');
         redacted.push_str(&port.to_string());
     }
-    if parsed.path() != "/" {
+    if !parsed.path().is_empty() && parsed.path() != "/" {
         redacted.push_str("/<redacted-path>");
     }
     if parsed.query().is_some() {
@@ -695,13 +697,34 @@ fn normalize_proxy_url(proxy_url: Option<String>) -> HyperUnitResult<Option<Stri
         proxy_url: sanitize_url_for_error(trimmed),
         source,
     })?;
-    match parsed.scheme() {
-        "socks5" => Ok(Some(trimmed.to_string())),
-        scheme => Err(HyperUnitClientError::UnsupportedProxyScheme {
+    if parsed.scheme() != "socks5" {
+        return Err(HyperUnitClientError::UnsupportedProxyScheme {
             proxy_url: sanitize_url_for_error(trimmed),
-            scheme: scheme.to_string(),
-        }),
+            scheme: parsed.scheme().to_string(),
+        });
     }
+    if parsed.host_str().is_none() {
+        return Err(HyperUnitClientError::UnsupportedProxyUrl {
+            proxy_url: sanitize_url_for_error(trimmed),
+            reason: "missing host".to_string(),
+        });
+    }
+    if parsed.port().is_none() {
+        return Err(HyperUnitClientError::UnsupportedProxyUrl {
+            proxy_url: sanitize_url_for_error(trimmed),
+            reason: "missing port".to_string(),
+        });
+    }
+    if (!parsed.path().is_empty() && parsed.path() != "/")
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(HyperUnitClientError::UnsupportedProxyUrl {
+            proxy_url: sanitize_url_for_error(trimmed),
+            reason: "paths, query strings, and fragments are not allowed".to_string(),
+        });
+    }
+    Ok(Some(trimmed.to_string()))
 }
 
 fn build_endpoint(base_url: &str, path: &str) -> HyperUnitResult<Url> {
