@@ -1,19 +1,18 @@
-use crate::{
-    db::Database,
-    error::{RouterServerError, RouterServerResult},
-    models::{ProviderHealthCheck, ProviderHealthStatus},
-};
+use crate::error::{RouterServerError, RouterServerResult};
 use chrono::Utc;
 use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE},
     Client, Method, Proxy, StatusCode,
 };
+use router_core::{
+    db::Database,
+    models::{ProviderHealthCheck, ProviderHealthStatus},
+    services::http_body::read_limited_response_text,
+};
 use serde_json::Value;
 use std::{collections::HashMap, sync::Arc, time::Duration, time::Instant};
 use tokio::sync::RwLock;
 use tracing::warn;
-
-use super::http_body::read_limited_response_text;
 
 const MAX_PROVIDER_HEALTH_RESPONSE_BODY_BYTES: usize = 64 * 1024;
 
@@ -70,7 +69,12 @@ impl ProviderHealthService {
             }
         }
 
-        let checks = self.db.provider_health().list().await?;
+        let checks = self
+            .db
+            .provider_health()
+            .list()
+            .await
+            .map_err(RouterServerError::from)?;
         let snapshot = ProviderHealthSnapshot {
             checks: checks
                 .into_iter()
@@ -86,14 +90,23 @@ impl ProviderHealthService {
     }
 
     pub async fn list(&self) -> RouterServerResult<Vec<ProviderHealthCheck>> {
-        self.db.provider_health().list().await
+        self.db
+            .provider_health()
+            .list()
+            .await
+            .map_err(RouterServerError::from)
     }
 
     pub async fn upsert(
         &self,
         check: &ProviderHealthCheck,
     ) -> RouterServerResult<ProviderHealthCheck> {
-        let stored = self.db.provider_health().upsert(check).await?;
+        let stored = self
+            .db
+            .provider_health()
+            .upsert(check)
+            .await
+            .map_err(RouterServerError::from)?;
         let mut cache = self.cache.write().await;
         *cache = None;
         Ok(stored)
@@ -324,6 +337,7 @@ impl ProviderHealthProbe {
 
     async fn send(&self, client: &Client) -> reqwest::Result<(StatusCode, String)> {
         let client = self.proxy_client.as_ref().unwrap_or(client);
+        let started = Instant::now();
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
         for (name, value) in &self.headers {
@@ -342,8 +356,25 @@ impl ProviderHealthProbe {
             request = request.header(CONTENT_TYPE, "application/json").json(body);
         }
 
-        let response = request.send().await?;
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                record_provider_health_probe(
+                    &self.provider,
+                    self.method.as_str(),
+                    "transport_error",
+                    started.elapsed(),
+                );
+                return Err(error);
+            }
+        };
         let status = response.status();
+        record_provider_health_probe(
+            &self.provider,
+            self.method.as_str(),
+            status_class(status),
+            started.elapsed(),
+        );
         let body =
             read_limited_response_text(response, MAX_PROVIDER_HEALTH_RESPONSE_BODY_BYTES).await?;
         let body = if body.truncated {
@@ -370,6 +401,43 @@ impl ProviderHealthProbe {
 
 fn provider_http_status_reachable(status: StatusCode) -> bool {
     status.as_u16() < 500
+}
+
+fn record_provider_health_probe(
+    provider: &str,
+    method: &str,
+    status_class: &'static str,
+    duration: Duration,
+) {
+    metrics::counter!(
+        "tee_router_upstream_requests_total",
+        "kind" => "trading_venue",
+        "service" => provider.to_string(),
+        "method" => method.to_string(),
+        "endpoint" => "/provider-health",
+        "status_class" => status_class,
+    )
+    .increment(1);
+    metrics::histogram!(
+        "tee_router_upstream_request_duration_seconds",
+        "kind" => "trading_venue",
+        "service" => provider.to_string(),
+        "method" => method.to_string(),
+        "endpoint" => "/provider-health",
+        "status_class" => status_class,
+    )
+    .record(duration.as_secs_f64());
+}
+
+fn status_class(status: StatusCode) -> &'static str {
+    match status.as_u16() {
+        100..=199 => "1xx",
+        200..=299 => "2xx",
+        300..=399 => "3xx",
+        400..=499 => "4xx",
+        500..=599 => "5xx",
+        _ => "unknown",
+    }
 }
 
 fn truncate_error_body(body: &str) -> String {

@@ -17,7 +17,11 @@ use eyre::{eyre, Result, WrapErr};
 use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
-use tokio::{sync::Semaphore, task::JoinSet, time::Instant};
+use tokio::{
+    sync::{Mutex, Semaphore},
+    task::JoinSet,
+    time::Instant,
+};
 use uuid::Uuid;
 
 const MAX_LOADGEN_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
@@ -542,6 +546,7 @@ struct RuntimeConfig {
 struct EvmFundingConfig {
     rpcs: BTreeMap<String, String>,
     private_keys: Vec<String>,
+    nonce_manager: EvmNonceManager,
 }
 
 impl fmt::Debug for EvmFundingConfig {
@@ -551,6 +556,23 @@ impl fmt::Debug for EvmFundingConfig {
             .field("private_keys", &redacted_vec(self.private_keys.len()))
             .finish()
     }
+}
+
+#[derive(Clone, Default)]
+struct EvmNonceManager {
+    next_by_sender: Arc<Mutex<BTreeMap<EvmNonceKey, u64>>>,
+}
+
+impl fmt::Debug for EvmNonceManager {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EvmNonceManager").finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct EvmNonceKey {
+    rpc_url: String,
+    sender: String,
 }
 
 #[derive(Clone)]
@@ -737,6 +759,7 @@ async fn run_create_and_fund(command: CreateAndFundCommand) -> Result<()> {
         evm: EvmFundingConfig {
             rpcs: command.evm_rpcs.iter().cloned().collect(),
             private_keys: evm_private_keys,
+            nonce_manager: EvmNonceManager::default(),
         },
         bitcoin: BitcoinFundingConfig {
             rpc_url: command.bitcoin_rpc_url.clone(),
@@ -990,6 +1013,7 @@ async fn fund_order(
             fund_evm_asset(
                 rpc_url,
                 private_key,
+                &funding.evm.nonce_manager,
                 &source.asset,
                 &order.order_address,
                 amount,
@@ -1029,6 +1053,7 @@ async fn with_funding_timeout<T>(
 async fn fund_evm_asset(
     rpc_url: &str,
     private_key: &str,
+    nonce_manager: &EvmNonceManager,
     asset: &str,
     recipient: &str,
     amount: U256,
@@ -1036,6 +1061,7 @@ async fn fund_evm_asset(
     let signer = LocalSigner::from_str(private_key).wrap_err("invalid EVM private key")?;
     let sender = signer.address();
     let recipient = Address::from_str(recipient).wrap_err("invalid EVM order address")?;
+    let rpc_url_key = rpc_url.to_string();
     let rpc_url = rpc_url.parse::<Url>().wrap_err("invalid EVM RPC URL")?;
     let provider = ProviderBuilder::new()
         .wallet(EthereumWallet::new(signer))
@@ -1055,7 +1081,27 @@ async fn fund_evm_asset(
             .with_input(calldata)
     };
 
-    let pending = provider.send_transaction(tx).await?;
+    let pending = {
+        let key = EvmNonceKey {
+            rpc_url: rpc_url_key,
+            sender: format!("{sender:#x}"),
+        };
+        let mut next_by_sender = nonce_manager.next_by_sender.lock().await;
+        let nonce = match next_by_sender.get(&key).copied() {
+            Some(nonce) => nonce,
+            None => provider
+                .get_transaction_count(sender)
+                .pending()
+                .await
+                .wrap_err_with(|| format!("failed to load pending nonce for {sender:#x}"))?,
+        };
+        let pending = provider.send_transaction(tx.with_nonce(nonce)).await?;
+        let next_nonce = nonce
+            .checked_add(1)
+            .ok_or_else(|| eyre!("EVM nonce overflow for {sender:#x}"))?;
+        next_by_sender.insert(key, next_nonce);
+        pending
+    };
     let tx_hash = *pending.tx_hash();
     let receipt = pending.get_receipt().await?;
     if !receipt.status() {
@@ -1639,6 +1685,7 @@ mod tests {
                     "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                         .to_string(),
                 ],
+                nonce_manager: EvmNonceManager::default(),
             },
             bitcoin: BitcoinFundingConfig {
                 rpc_url: Some("http://localhost:18443".to_string()),

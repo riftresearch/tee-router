@@ -1,5 +1,10 @@
-pub mod bitcoin;
-pub mod evm_erc20;
+pub mod btc;
+pub mod evm_indexer;
+pub mod hyperliquid;
+pub mod hyperliquid_bridge;
+pub mod hyperliquid_spot_trade;
+pub mod hyperliquid_trade;
+pub mod hyperunit;
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -12,21 +17,22 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use metrics::{gauge, histogram};
 use reqwest::StatusCode;
-use router_primitives::{ChainType, TokenIdentifier};
-use router_server::{
-    api::{
-        DetectorHintEnvelope, DetectorHintRequest, DetectorHintTarget, MAX_HINT_IDEMPOTENCY_KEY_LEN,
-    },
-    models::{ProviderOperationHintKind, SAURON_DETECTOR_HINT_SOURCE},
+use router_core::models::{
+    BtcDepositObservedEvidence, ProviderOperationHintKind, SAURON_DETECTOR_HINT_SOURCE,
 };
-use serde_json::json;
+use router_primitives::{ChainType, TokenIdentifier};
+use router_server::api::{
+    DetectorHintEnvelope, DetectorHintRequest, DetectorHintTarget, MAX_HINT_IDEMPOTENCY_KEY_LEN,
+};
+use router_temporal::WorkflowStepId;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use snafu::ResultExt;
 use tokio::{
     task::JoinSet,
     time::{timeout, MissedTickBehavior},
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -74,6 +80,7 @@ impl DepositConfirmationState {
 pub struct DetectedDeposit {
     pub watch_target: WatchTarget,
     pub watch_id: Uuid,
+    pub execution_step_id: Option<WorkflowStepId>,
     pub source_chain: ChainType,
     pub source_token: TokenIdentifier,
     pub address: String,
@@ -304,7 +311,7 @@ async fn run_backend_loop(
                     validate_pending_submission_backlog(&pending_submissions)?;
                 }
                 if scan_has_pending_ephemeral_submissions(&scan.detections, &pending_submissions) {
-                    warn!(
+                    debug!(
                         backend = backend.name(),
                         height = new_cursor.height,
                         hash = %new_cursor.hash,
@@ -399,6 +406,9 @@ impl IndexedLookupBackfillState {
     }
 
     fn sync_snapshot_at(&mut self, watches: &HashMap<Uuid, SharedWatchEntry>, now: Instant) {
+        let mut fresh_candidates = Vec::new();
+        let mut retry_candidates = Vec::new();
+
         for (watch_id, watch) in watches {
             let version = watch.updated_at;
 
@@ -414,10 +424,26 @@ impl IndexedLookupBackfillState {
                     continue;
                 }
                 self.deferred_versions.remove(watch_id);
+                retry_candidates.push((*watch_id, version));
+                continue;
             }
 
-            self.queue.push_back((*watch_id, version));
-            self.queued_versions.insert(*watch_id, version);
+            fresh_candidates.push((watch.created_at, *watch_id, version));
+        }
+
+        fresh_candidates.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.as_bytes().cmp(right.1.as_bytes()))
+        });
+        for (_, watch_id, version) in fresh_candidates {
+            self.queue.push_front((watch_id, version));
+            self.queued_versions.insert(watch_id, version);
+        }
+
+        for (watch_id, version) in retry_candidates {
+            self.queue.push_back((watch_id, version));
+            self.queued_versions.insert(watch_id, version);
         }
     }
 
@@ -511,6 +537,11 @@ impl IndexedLookupBackfillState {
 
     fn inflight_len(&self) -> usize {
         self.inflight_versions.len()
+    }
+
+    #[cfg(test)]
+    fn queued_watch_ids(&self) -> Vec<Uuid> {
+        self.queue.iter().map(|(watch_id, _)| *watch_id).collect()
     }
 }
 
@@ -781,44 +812,26 @@ async fn submit_detected_deposit(
     reported_candidates: &mut HashMap<DetectedDepositKey, DetectedDeposit>,
 ) -> SubmissionOutcome {
     let key = detected_deposit_key(detected);
-    let evidence = json!({
-        "source": "sauron",
-        "backend": backend_name,
-        "watch_target": detected.watch_target.as_str(),
-        "chain": detected.source_chain.to_db_string(),
-        "token": detected.source_token.clone(),
-        "address": detected.address,
-        "recipient_address": detected.address,
-        "sender_address": detected.sender_addresses.first().cloned(),
-        "sender_addresses": detected.sender_addresses.clone(),
-        "tx_hash": detected.tx_hash,
-        "transfer_index": detected.transfer_index,
-        "vout": detected.transfer_index,
-        "amount": detected.amount.to_string(),
-        "confirmation_state": detected.confirmation_state.as_str(),
-        "block_height": detected.block_height,
-        "block_hash": detected.block_hash,
-        "observed_at": detected.observed_at,
-    });
+    let hint_kind = detected_deposit_hint_kind(detected);
+    let evidence = build_detected_deposit_evidence(backend_name, detected, hint_kind);
     let idempotency_key = Some(detected_deposit_hint_idempotency_key(
         backend_name,
         detected,
     ));
 
-    let target = match detected.watch_target {
-        WatchTarget::ProviderOperation => DetectorHintTarget::ProviderOperation {
-            id: detected.watch_id,
-        },
-        WatchTarget::FundingVault => DetectorHintTarget::FundingVault {
-            id: detected.watch_id,
-        },
+    let Some(target) = detector_hint_target_for_detected(detected) else {
+        warn!(
+            watch_id = %detected.watch_id,
+            "Provider-operation detection missing execution_step_id; dropping hint"
+        );
+        return SubmissionOutcome::TerminalFailure;
     };
     let submit_result = context
         .router_client
         .submit_detector_hint(&DetectorHintRequest {
             target,
             source: SAURON_DETECTOR_HINT_SOURCE.to_string(),
-            hint_kind: ProviderOperationHintKind::PossibleProgress,
+            hint_kind,
             evidence,
             idempotency_key,
         })
@@ -844,13 +857,23 @@ async fn submit_detected_deposit(
             if should_retry_submission(&error) {
                 if detected.indexer_candidate_id.is_some() {
                     let message = error.to_string();
-                    warn!(
-                        backend = backend_name,
-                        watch_id = %detected.watch_id,
-                        tx_hash = %detected.tx_hash,
-                        %error,
-                        "Discovery backend submit was retryable; durable candidate will be released"
-                    );
+                    if submission_retry_is_expected_catchup(&error) {
+                        debug!(
+                            backend = backend_name,
+                            watch_id = %detected.watch_id,
+                            tx_hash = %detected.tx_hash,
+                            %error,
+                            "Discovery backend submit was retryable; durable candidate will be released"
+                        );
+                    } else {
+                        warn!(
+                            backend = backend_name,
+                            watch_id = %detected.watch_id,
+                            tx_hash = %detected.tx_hash,
+                            %error,
+                            "Discovery backend submit was retryable; durable candidate will be released"
+                        );
+                    }
                     return SubmissionOutcome::RetryableFailure(message);
                 }
                 let now = Instant::now();
@@ -866,15 +889,27 @@ async fn submit_detected_deposit(
                         next_attempt_at: now + retry_delay,
                     },
                 );
-                warn!(
-                    backend = backend_name,
-                    watch_id = %detected.watch_id,
-                    tx_hash = %detected.tx_hash,
-                    attempts,
-                    retry_in_ms = retry_delay.as_millis(),
-                    %error,
-                    "Discovery backend submit was retryable; keeping candidate queued for retry"
-                );
+                if submission_retry_is_expected_catchup(&error) {
+                    debug!(
+                        backend = backend_name,
+                        watch_id = %detected.watch_id,
+                        tx_hash = %detected.tx_hash,
+                        attempts,
+                        retry_in_ms = retry_delay.as_millis(),
+                        %error,
+                        "Discovery backend submit was retryable; keeping candidate queued for retry"
+                    );
+                } else {
+                    warn!(
+                        backend = backend_name,
+                        watch_id = %detected.watch_id,
+                        tx_hash = %detected.tx_hash,
+                        attempts,
+                        retry_in_ms = retry_delay.as_millis(),
+                        %error,
+                        "Discovery backend submit was retryable; keeping candidate queued for retry"
+                    );
+                }
                 SubmissionOutcome::RetryableFailure(error.to_string())
             } else {
                 pending_submissions.remove(&key);
@@ -888,6 +923,72 @@ async fn submit_detected_deposit(
                 SubmissionOutcome::TerminalFailure
             }
         }
+    }
+}
+
+fn build_detected_deposit_evidence(
+    backend_name: &str,
+    detected: &DetectedDeposit,
+    hint_kind: ProviderOperationHintKind,
+) -> Value {
+    match hint_kind {
+        ProviderOperationHintKind::BtcDepositObserved => {
+            serde_json::to_value(BtcDepositObservedEvidence {
+                tx_hash: detected.tx_hash.clone(),
+                address: detected.address.clone(),
+                transfer_index: detected.transfer_index,
+                amount: detected.amount.to_string(),
+                confirmation_state: detected.confirmation_state.as_str().to_string(),
+                block_height: detected.block_height,
+                block_hash: detected.block_hash.clone(),
+            })
+            .expect("BtcDepositObservedEvidence serializes")
+        }
+        ProviderOperationHintKind::PossibleProgress => json!({
+            "source": "sauron",
+            "backend": backend_name,
+            "watch_target": detected.watch_target.as_str(),
+            "execution_step_id": detected.execution_step_id,
+            "chain": detected.source_chain.to_db_string(),
+            "token": detected.source_token.clone(),
+            "address": detected.address,
+            "recipient_address": detected.address,
+            "sender_address": detected.sender_addresses.first().cloned(),
+            "sender_addresses": detected.sender_addresses.clone(),
+            "tx_hash": detected.tx_hash,
+            "transfer_index": detected.transfer_index,
+            "vout": detected.transfer_index,
+            "amount": detected.amount.to_string(),
+            "confirmation_state": detected.confirmation_state.as_str(),
+            "block_height": detected.block_height,
+            "block_hash": detected.block_hash,
+            "observed_at": detected.observed_at,
+        }),
+        other => unreachable!(
+            "submit_detected_deposit only emits BtcDepositObserved/PossibleProgress, got {other:?}"
+        ),
+    }
+}
+
+fn detected_deposit_hint_kind(detected: &DetectedDeposit) -> ProviderOperationHintKind {
+    if detected.watch_target == WatchTarget::ProviderOperation
+        && detected.source_chain == ChainType::Bitcoin
+    {
+        ProviderOperationHintKind::BtcDepositObserved
+    } else {
+        ProviderOperationHintKind::PossibleProgress
+    }
+}
+
+fn detector_hint_target_for_detected(detected: &DetectedDeposit) -> Option<DetectorHintTarget> {
+    match detected.watch_target {
+        WatchTarget::ProviderOperation => Some(DetectorHintTarget::ProviderOperation {
+            id: detected.watch_id,
+            execution_step_id: detected.execution_step_id?,
+        }),
+        WatchTarget::FundingVault => Some(DetectorHintTarget::FundingVault {
+            id: detected.watch_id,
+        }),
     }
 }
 
@@ -984,6 +1085,7 @@ fn should_retry_submission(error: &Error) -> bool {
                 || matches!(
                     *status,
                     StatusCode::REQUEST_TIMEOUT
+                        | StatusCode::TOO_EARLY
                         | StatusCode::TOO_MANY_REQUESTS
                         | StatusCode::BAD_GATEWAY
                         | StatusCode::SERVICE_UNAVAILABLE
@@ -992,6 +1094,16 @@ fn should_retry_submission(error: &Error) -> bool {
         }
         _ => false,
     }
+}
+
+fn submission_retry_is_expected_catchup(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::RouterRejected {
+            status: StatusCode::TOO_EARLY,
+            ..
+        }
+    )
 }
 
 fn submission_retry_delay(detected: &DetectedDeposit, attempts: u32) -> Duration {
@@ -1024,12 +1136,14 @@ fn submission_retry_jitter_millis(detected: &DetectedDeposit, attempts: u32) -> 
 #[cfg(test)]
 mod tests {
     use super::{
-        detected_deposit_hint_idempotency_key, detected_deposit_key, run_indexed_lookup_task,
+        build_detected_deposit_evidence, detected_deposit_hint_idempotency_key,
+        detected_deposit_key, detector_hint_target_for_detected, run_indexed_lookup_task,
         scan_has_pending_ephemeral_submissions, should_retry_submission, submission_retry_delay,
-        validate_pending_submission_backlog, BlockCursor, BlockScan, DepositConfirmationState,
-        DetectedDeposit, DiscoveryBackend, IndexedLookupBackfillState, PendingSubmission,
-        INDEXED_LOOKUP_UNRESOLVED_RETRY_DELAY, MAX_HINT_IDEMPOTENCY_KEY_LEN,
-        MAX_PENDING_DISCOVERY_SUBMISSIONS, SUBMISSION_RETRY_BASE_DELAY, SUBMISSION_RETRY_MAX_DELAY,
+        submission_retry_is_expected_catchup, validate_pending_submission_backlog, BlockCursor,
+        BlockScan, DepositConfirmationState, DetectedDeposit, DiscoveryBackend,
+        IndexedLookupBackfillState, PendingSubmission, INDEXED_LOOKUP_UNRESOLVED_RETRY_DELAY,
+        MAX_HINT_IDEMPOTENCY_KEY_LEN, MAX_PENDING_DISCOVERY_SUBMISSIONS,
+        SUBMISSION_RETRY_BASE_DELAY, SUBMISSION_RETRY_MAX_DELAY,
     };
     use crate::error::Error;
     use crate::watch::{WatchEntry, WatchTarget};
@@ -1037,9 +1151,12 @@ mod tests {
     use async_trait::async_trait;
     use chrono::{Duration, Utc};
     use reqwest::StatusCode;
+    use router_core::models::{BtcDepositObservedEvidence, ProviderOperationHintKind};
     use router_primitives::{ChainType, TokenIdentifier};
+    use router_server::api::DetectorHintTarget;
+    use router_temporal::WorkflowStepId;
     use std::{
-        collections::HashMap,
+        collections::{BTreeSet, HashMap},
         sync::Arc,
         time::{Duration as StdDuration, Instant},
     };
@@ -1076,10 +1193,22 @@ mod tests {
         assert!(should_retry_submission(&error));
     }
 
+    #[test]
+    fn retries_not_ready_rejection() {
+        let error = Error::RouterRejected {
+            status: StatusCode::TOO_EARLY,
+            body: r#"{"error":{"code":425,"message":"not ready yet"}}"#.to_string(),
+        };
+
+        assert!(should_retry_submission(&error));
+        assert!(submission_retry_is_expected_catchup(&error));
+    }
+
     fn detected_deposit() -> DetectedDeposit {
         DetectedDeposit {
             watch_target: WatchTarget::ProviderOperation,
             watch_id: Uuid::now_v7(),
+            execution_step_id: Some(WorkflowStepId::from(Uuid::now_v7())),
             source_chain: ChainType::Bitcoin,
             source_token: TokenIdentifier::Native,
             address: "btc-address".to_string(),
@@ -1122,6 +1251,96 @@ mod tests {
     }
 
     #[test]
+    fn detector_hint_target_carries_provider_operation_step_id() {
+        let detected = detected_deposit();
+        let step_id = detected
+            .execution_step_id
+            .expect("provider-operation detection should carry step id");
+
+        let target = detector_hint_target_for_detected(&detected)
+            .expect("provider-operation detection should build target");
+
+        assert_eq!(
+            target,
+            DetectorHintTarget::ProviderOperation {
+                id: detected.watch_id,
+                execution_step_id: step_id,
+            }
+        );
+    }
+
+    #[test]
+    fn btc_deposit_observed_evidence_uses_router_typed_shape() {
+        let mut detected = detected_deposit();
+        detected.block_height = Some(840_000);
+        detected.block_hash =
+            Some("0000000000000000000000000000000000000000000000000000000000000001".to_string());
+
+        let evidence = build_detected_deposit_evidence(
+            "bitcoin",
+            &detected,
+            ProviderOperationHintKind::BtcDepositObserved,
+        );
+
+        assert_object_keys(
+            &evidence,
+            &[
+                "tx_hash",
+                "address",
+                "transfer_index",
+                "amount",
+                "confirmation_state",
+                "block_height",
+                "block_hash",
+            ],
+        );
+        assert!(!evidence
+            .as_object()
+            .expect("evidence should be an object")
+            .contains_key("execution_step_id"));
+
+        let typed: BtcDepositObservedEvidence =
+            serde_json::from_value(evidence.clone()).expect("router-core evidence shape");
+        assert_eq!(
+            typed,
+            BtcDepositObservedEvidence {
+                tx_hash: detected.tx_hash,
+                address: detected.address,
+                transfer_index: detected.transfer_index,
+                amount: detected.amount.to_string(),
+                confirmation_state: detected.confirmation_state.as_str().to_string(),
+                block_height: detected.block_height,
+                block_hash: detected.block_hash,
+            }
+        );
+
+        let _: router_temporal::BtcDepositObservedEvidence =
+            serde_json::from_value(evidence).expect("router-server evidence shape");
+    }
+
+    #[test]
+    fn detector_hint_target_rejects_provider_operation_without_step_id() {
+        let mut detected = detected_deposit();
+        detected.execution_step_id = None;
+
+        assert_eq!(detector_hint_target_for_detected(&detected), None);
+    }
+
+    #[test]
+    fn detector_hint_target_for_funding_vault_does_not_require_step_id() {
+        let mut detected = detected_deposit();
+        detected.watch_target = WatchTarget::FundingVault;
+        detected.execution_step_id = None;
+
+        assert_eq!(
+            detector_hint_target_for_detected(&detected),
+            Some(DetectorHintTarget::FundingVault {
+                id: detected.watch_id,
+            })
+        );
+    }
+
+    #[test]
     fn detected_deposit_hint_idempotency_key_is_bounded_token_text() {
         let mut detected = detected_deposit();
         detected.watch_id = Uuid::now_v7();
@@ -1137,6 +1356,17 @@ mod tests {
             b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'_' | b':' | b'-'
         )));
         assert!(key.starts_with(&format!("sauron:deposit:{}:", detected.watch_id)));
+    }
+
+    fn assert_object_keys(value: &serde_json::Value, expected: &[&str]) {
+        let actual = value
+            .as_object()
+            .expect("evidence should be an object")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let expected = expected.iter().copied().collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -1204,9 +1434,18 @@ mod tests {
     }
 
     fn watch_entry(watch_id: Uuid, updated_at: chrono::DateTime<Utc>) -> Arc<WatchEntry> {
+        watch_entry_created_at(watch_id, updated_at, Utc::now())
+    }
+
+    fn watch_entry_created_at(
+        watch_id: Uuid,
+        updated_at: chrono::DateTime<Utc>,
+        created_at: chrono::DateTime<Utc>,
+    ) -> Arc<WatchEntry> {
         Arc::new(WatchEntry {
             watch_target: WatchTarget::ProviderOperation,
             watch_id,
+            execution_step_id: Some(WorkflowStepId::from(watch_id)),
             order_id: watch_id,
             source_chain: ChainType::Bitcoin,
             source_token: TokenIdentifier::Native,
@@ -1215,7 +1454,7 @@ mod tests {
             max_amount: U256::from(10_u64),
             required_amount: U256::from(10_u64),
             deposit_deadline: Utc::now() + Duration::minutes(5),
-            created_at: Utc::now(),
+            created_at,
             updated_at,
         })
     }
@@ -1291,6 +1530,40 @@ mod tests {
         watches.insert(watch_id, watch_entry(watch_id, newer_updated_at));
         state.sync_snapshot(&watches);
         assert_eq!(state.queue_len(), 1);
+    }
+
+    #[test]
+    fn backfill_state_prioritizes_new_watches_over_unresolved_retries() {
+        let old_watch_id = Uuid::now_v7();
+        let new_watch_id = Uuid::now_v7();
+        let now = Utc::now();
+        let retry_ready_at = Instant::now();
+        let mut state = IndexedLookupBackfillState::default();
+        let old_watch = watch_entry_created_at(old_watch_id, now, now - Duration::minutes(10));
+        let old_watches = HashMap::from([(old_watch_id, old_watch)]);
+
+        state.sync_snapshot(&old_watches);
+        assert_eq!(state.take_ready(&old_watches, 1).len(), 1);
+        assert!(state.finish(old_watch_id, now, &HashMap::from([(old_watch_id, now)]),));
+        state.retry_unresolved_at(old_watch_id, now, retry_ready_at);
+
+        let new_watch = watch_entry_created_at(
+            new_watch_id,
+            now + Duration::seconds(1),
+            now + Duration::seconds(1),
+        );
+        let watches = HashMap::from([
+            (old_watch_id, old_watches[&old_watch_id].clone()),
+            (new_watch_id, new_watch),
+        ]);
+
+        state.sync_snapshot_at(&watches, retry_ready_at + StdDuration::from_secs(1));
+
+        assert_eq!(
+            state.queued_watch_ids(),
+            vec![new_watch_id, old_watch_id],
+            "fresh watches must not wait behind stale unresolved backfill retries"
+        );
     }
 
     #[test]

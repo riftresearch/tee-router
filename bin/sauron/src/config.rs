@@ -1,7 +1,5 @@
-use std::{fmt, fs, path::PathBuf};
-
-use bitcoincore_rpc_async::Auth;
 use clap::{Parser, ValueEnum};
+use std::fmt;
 
 use crate::cdc::{ROUTER_CDC_MESSAGE_PREFIX, ROUTER_CDC_PUBLICATION_NAME};
 
@@ -10,7 +8,7 @@ pub const MIN_TOKEN_INDEXER_API_KEY_LEN: usize = 32;
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SauronReplicaEventSource {
-    /// Consume a logical replication stream from the router replica.
+    /// Consume the router CDC stream from the router replica.
     Cdc,
 }
 
@@ -50,11 +48,11 @@ pub struct SauronArgs {
     )]
     pub router_replica_database_name: String,
 
-    /// Logical decoding slot used when SAURON_REPLICA_EVENT_SOURCE=cdc.
+    /// CDC decoding slot used when SAURON_REPLICA_EVENT_SOURCE=cdc.
     #[arg(long, env = "SAURON_CDC_SLOT_NAME", default_value = "sauron_watch_cdc")]
     pub sauron_cdc_slot_name: String,
 
-    /// Publication used by the pgoutput logical replication stream.
+    /// Publication used by the pgoutput CDC stream.
     #[arg(
         long,
         env = "ROUTER_CDC_PUBLICATION_NAME",
@@ -62,7 +60,7 @@ pub struct SauronArgs {
     )]
     pub router_cdc_publication_name: String,
 
-    /// Message prefix emitted through pg_logical_emit_message by router DB triggers.
+    /// Message prefix emitted by router DB CDC triggers.
     #[arg(
         long,
         env = "ROUTER_CDC_MESSAGE_PREFIX",
@@ -90,25 +88,13 @@ pub struct SauronArgs {
     #[arg(long, env = "ROUTER_DETECTOR_API_KEY")]
     pub router_detector_api_key: String,
 
-    /// Electrum HTTP Server URL
-    #[arg(long, env = "ELECTRUM_HTTP_SERVER_URL")]
-    pub electrum_http_server_url: String,
+    /// Bitcoin indexer API URL
+    #[arg(long, env = "BITCOIN_INDEXER_URL")]
+    pub bitcoin_indexer_url: Option<String>,
 
-    /// Direct Bitcoin Core RPC URL used for tip, block, and mempool reconciliation
-    #[arg(long, env = "BITCOIN_RPC_URL")]
-    pub bitcoin_rpc_url: String,
-
-    /// Bitcoin Core RPC authentication
-    #[arg(long, env = "BITCOIN_RPC_AUTH", value_parser = parse_auth)]
-    pub bitcoin_rpc_auth: Auth,
-
-    /// Bitcoin Core ZMQ raw transaction endpoint
-    #[arg(long, env = "BITCOIN_ZMQ_RAWTX_ENDPOINT")]
-    pub bitcoin_zmq_rawtx_endpoint: String,
-
-    /// Bitcoin Core ZMQ mempool sequence endpoint
-    #[arg(long, env = "BITCOIN_ZMQ_SEQUENCE_ENDPOINT")]
-    pub bitcoin_zmq_sequence_endpoint: String,
+    /// Bitcoin receipt watcher API URL
+    #[arg(long, env = "BITCOIN_RECEIPT_WATCHER_URL")]
+    pub bitcoin_receipt_watcher_url: Option<String>,
 
     /// Ethereum Mainnet RPC URL
     #[arg(long, env = "ETH_RPC_URL")]
@@ -118,6 +104,10 @@ pub struct SauronArgs {
     #[arg(long, env = "ETHEREUM_TOKEN_INDEXER_URL")]
     pub ethereum_token_indexer_url: Option<String>,
 
+    /// Ethereum Mainnet Receipt Watcher URL
+    #[arg(long, env = "ETHEREUM_RECEIPT_WATCHER_URL")]
+    pub ethereum_receipt_watcher_url: Option<String>,
+
     /// Base RPC URL
     #[arg(long, env = "BASE_RPC_URL")]
     pub base_rpc_url: String,
@@ -126,6 +116,10 @@ pub struct SauronArgs {
     #[arg(long, env = "BASE_TOKEN_INDEXER_URL")]
     pub base_token_indexer_url: Option<String>,
 
+    /// Base Receipt Watcher URL
+    #[arg(long, env = "BASE_RECEIPT_WATCHER_URL")]
+    pub base_receipt_watcher_url: Option<String>,
+
     /// Arbitrum RPC URL
     #[arg(long, env = "ARBITRUM_RPC_URL")]
     pub arbitrum_rpc_url: String,
@@ -133,6 +127,76 @@ pub struct SauronArgs {
     /// Arbitrum Token Indexer URL
     #[arg(long, env = "ARBITRUM_TOKEN_INDEXER_URL")]
     pub arbitrum_token_indexer_url: Option<String>,
+
+    /// Arbitrum Receipt Watcher URL
+    #[arg(long, env = "ARBITRUM_RECEIPT_WATCHER_URL")]
+    pub arbitrum_receipt_watcher_url: Option<String>,
+
+    /// Hyperliquid shim indexer URL
+    #[arg(long, env = "HL_SHIM_INDEXER_URL")]
+    pub hl_shim_indexer_url: Option<String>,
+
+    /// HyperUnit API base URL
+    #[arg(long, env = "HYPERUNIT_API_URL")]
+    pub hyperunit_api_url: Option<String>,
+
+    /// Optional HyperUnit SOCKS5 proxy URL
+    #[arg(long, env = "HYPERUNIT_PROXY_URL")]
+    pub hyperunit_proxy_url: Option<String>,
+
+    /// HL bridge Arbitrum/HL ledger correlation window, in seconds
+    #[arg(
+        long,
+        env = "SAURON_HL_BRIDGE_MATCH_WINDOW_SECONDS",
+        default_value = "1800"
+    )]
+    pub sauron_hl_bridge_match_window_seconds: i64,
+
+    /// Maximum number of concurrent HyperUnit observer operation polls
+    ///
+    /// HyperUnit is the externally rate-limited leg of this observer path. The client does not
+    /// apply its own request-concurrency cap, so default to 64 to stay below the documented
+    /// ~100 req/s per-IP production limit while still draining large active-operation sets quickly.
+    #[arg(
+        long,
+        env = "SAURON_HYPERUNIT_OBSERVER_CONCURRENCY",
+        default_value = "64"
+    )]
+    pub sauron_hyperunit_observer_concurrency: usize,
+
+    /// HyperUnit observer poll interval for operations seen less than five minutes ago, in milliseconds
+    #[arg(long, env = "SAURON_HU_POLL_FAST_MILLIS", default_value = "5000")]
+    pub sauron_hu_poll_fast_millis: u64,
+
+    /// HyperUnit observer poll interval for operations seen less than thirty minutes ago, in milliseconds
+    #[arg(long, env = "SAURON_HU_POLL_MEDIUM_MILLIS", default_value = "10000")]
+    pub sauron_hu_poll_medium_millis: u64,
+
+    /// HyperUnit observer poll interval for operations seen at least thirty minutes ago, in milliseconds
+    #[arg(long, env = "SAURON_HU_POLL_SLOW_MILLIS", default_value = "20000")]
+    pub sauron_hu_poll_slow_millis: u64,
+
+    /// Maximum number of concurrent Hyperliquid observer operation polls
+    ///
+    /// The HL shim is internal and its reqwest client construction does not cap concurrent
+    /// requests. 128 keeps 1000 active operations to roughly eight bounded waves.
+    #[arg(
+        long,
+        env = "SAURON_HYPERLIQUID_OBSERVER_CONCURRENCY",
+        default_value = "128"
+    )]
+    pub sauron_hyperliquid_observer_concurrency: usize,
+
+    /// Maximum number of concurrent EVM receipt observer operation polls
+    ///
+    /// Receipt watchers are internal lookup services and the per-op work is HTTP wait time, not DB
+    /// work. Match the HL observer default while keeping worst-case load explicitly bounded.
+    #[arg(
+        long,
+        env = "SAURON_EVM_RECEIPT_OBSERVER_CONCURRENCY",
+        default_value = "128"
+    )]
+    pub sauron_evm_receipt_observer_concurrency: usize,
 
     /// Bearer key shared by configured EVM token-indexer APIs
     #[arg(long, env = "TOKEN_INDEXER_API_KEY")]
@@ -201,11 +265,17 @@ impl fmt::Debug for SauronArgs {
             )
             .field("router_internal_base_url", &"<redacted>")
             .field("router_detector_api_key", &"<redacted>")
-            .field("electrum_http_server_url", &"<redacted>")
-            .field("bitcoin_rpc_url", &"<redacted>")
-            .field("bitcoin_rpc_auth", &"<redacted>")
-            .field("bitcoin_zmq_rawtx_endpoint", &"<redacted>")
-            .field("bitcoin_zmq_sequence_endpoint", &"<redacted>")
+            .field(
+                "bitcoin_indexer_url",
+                &self.bitcoin_indexer_url.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "bitcoin_receipt_watcher_url",
+                &self
+                    .bitcoin_receipt_watcher_url
+                    .as_ref()
+                    .map(|_| "<redacted>"),
+            )
             .field("ethereum_mainnet_rpc_url", &"<redacted>")
             .field(
                 "ethereum_token_indexer_url",
@@ -214,10 +284,21 @@ impl fmt::Debug for SauronArgs {
                     .as_ref()
                     .map(|_| "<redacted>"),
             )
+            .field(
+                "ethereum_receipt_watcher_url",
+                &self
+                    .ethereum_receipt_watcher_url
+                    .as_ref()
+                    .map(|_| "<redacted>"),
+            )
             .field("base_rpc_url", &"<redacted>")
             .field(
                 "base_token_indexer_url",
                 &self.base_token_indexer_url.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "base_receipt_watcher_url",
+                &self.base_receipt_watcher_url.as_ref().map(|_| "<redacted>"),
             )
             .field("arbitrum_rpc_url", &"<redacted>")
             .field(
@@ -226,6 +307,53 @@ impl fmt::Debug for SauronArgs {
                     .arbitrum_token_indexer_url
                     .as_ref()
                     .map(|_| "<redacted>"),
+            )
+            .field(
+                "arbitrum_receipt_watcher_url",
+                &self
+                    .arbitrum_receipt_watcher_url
+                    .as_ref()
+                    .map(|_| "<redacted>"),
+            )
+            .field(
+                "hl_shim_indexer_url",
+                &self.hl_shim_indexer_url.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "hyperunit_api_url",
+                &self.hyperunit_api_url.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "hyperunit_proxy_url",
+                &self.hyperunit_proxy_url.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "sauron_hl_bridge_match_window_seconds",
+                &self.sauron_hl_bridge_match_window_seconds,
+            )
+            .field(
+                "sauron_hyperunit_observer_concurrency",
+                &self.sauron_hyperunit_observer_concurrency,
+            )
+            .field(
+                "sauron_hu_poll_fast_millis",
+                &self.sauron_hu_poll_fast_millis,
+            )
+            .field(
+                "sauron_hu_poll_medium_millis",
+                &self.sauron_hu_poll_medium_millis,
+            )
+            .field(
+                "sauron_hu_poll_slow_millis",
+                &self.sauron_hu_poll_slow_millis,
+            )
+            .field(
+                "sauron_hyperliquid_observer_concurrency",
+                &self.sauron_hyperliquid_observer_concurrency,
+            )
+            .field(
+                "sauron_evm_receipt_observer_concurrency",
+                &self.sauron_evm_receipt_observer_concurrency,
             )
             .field(
                 "token_indexer_api_key",
@@ -259,19 +387,6 @@ pub fn normalize_router_detector_api_key(value: &str) -> Option<&str> {
     Some(value)
 }
 
-fn parse_auth(s: &str) -> Result<Auth, String> {
-    if s.eq_ignore_ascii_case("none") {
-        Ok(Auth::None)
-    } else if fs::exists(s).map_err(|error| error.to_string())? {
-        Ok(Auth::CookieFile(PathBuf::from(s)))
-    } else {
-        let mut split = s.splitn(2, ':');
-        let user = split.next().ok_or("Invalid auth string")?;
-        let password = split.next().ok_or("Invalid auth string")?;
-        Ok(Auth::UserPass(user.to_string(), password.to_string()))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,24 +406,39 @@ mod tests {
             sauron_cdc_idle_wakeup_interval_ms: 10_000,
             router_internal_base_url: "https://router.internal/api-key-path".to_string(),
             router_detector_api_key: "detector-secret-00000000000000000000".to_string(),
-            electrum_http_server_url: "https://electrum.example/token-secret".to_string(),
-            bitcoin_rpc_url: "http://bitcoin-rpc.example/rpc-secret".to_string(),
-            bitcoin_rpc_auth: Auth::UserPass(
-                "bitcoin-user".to_string(),
-                "bitcoin-pass".to_string(),
+            bitcoin_indexer_url: Some("https://bitcoin-indexer.example/token-secret".to_string()),
+            bitcoin_receipt_watcher_url: Some(
+                "https://bitcoin-receipts.example/token-secret".to_string(),
             ),
-            bitcoin_zmq_rawtx_endpoint: "tcp://bitcoin-zmq-secret:28332".to_string(),
-            bitcoin_zmq_sequence_endpoint: "tcp://bitcoin-zmq-secret:28333".to_string(),
             ethereum_mainnet_rpc_url: "https://eth.example/rpc-secret".to_string(),
             ethereum_token_indexer_url: Some(
                 "https://eth-indexer.example/token-secret".to_string(),
             ),
+            ethereum_receipt_watcher_url: Some(
+                "https://eth-receipts.example/receipt-secret".to_string(),
+            ),
             base_rpc_url: "https://base.example/rpc-secret".to_string(),
             base_token_indexer_url: Some("https://base-indexer.example/token-secret".to_string()),
+            base_receipt_watcher_url: Some(
+                "https://base-receipts.example/receipt-secret".to_string(),
+            ),
             arbitrum_rpc_url: "https://arb.example/rpc-secret".to_string(),
             arbitrum_token_indexer_url: Some(
                 "https://arb-indexer.example/token-secret".to_string(),
             ),
+            arbitrum_receipt_watcher_url: Some(
+                "https://arb-receipts.example/receipt-secret".to_string(),
+            ),
+            hl_shim_indexer_url: Some("https://hl-shim.example/token-secret".to_string()),
+            hyperunit_api_url: Some("https://hyperunit.example/token-secret".to_string()),
+            hyperunit_proxy_url: Some("socks5://hyperunit-proxy-secret:1080".to_string()),
+            sauron_hl_bridge_match_window_seconds: 1_800,
+            sauron_hyperunit_observer_concurrency: 64,
+            sauron_hu_poll_fast_millis: 5_000,
+            sauron_hu_poll_medium_millis: 10_000,
+            sauron_hu_poll_slow_millis: 20_000,
+            sauron_hyperliquid_observer_concurrency: 128,
+            sauron_evm_receipt_observer_concurrency: 128,
             token_indexer_api_key: Some("token-indexer-api-key-secret".to_string()),
             sauron_reconcile_interval_seconds: 3600,
             sauron_bitcoin_scan_interval_seconds: 15,
@@ -325,11 +455,12 @@ mod tests {
             "detector-secret",
             "api-key-path",
             "token-secret",
+            "receipt-secret",
             "token-indexer-api-key-secret",
             "rpc-secret",
             "bitcoin-user",
             "bitcoin-pass",
-            "bitcoin-zmq-secret",
+            "hyperunit-proxy-secret",
         ] {
             assert!(
                 !rendered.contains(secret),

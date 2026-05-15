@@ -1,7 +1,7 @@
-use crate::protocol::ChainId;
 use chainalysis_address_screener::{
     ChainalysisAddressScreener, Error as ChainalysisError, RiskLevel,
 };
+use router_core::protocol::ChainId;
 use snafu::Snafu;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

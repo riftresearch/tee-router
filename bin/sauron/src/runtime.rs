@@ -7,14 +7,13 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
+use evm_token_indexer_client::TokenIndexerClient;
+use hl_shim_client::HlShimClient;
 use pgwire_replication::ReplicationEvent;
-use router_server::{
-    api::{
-        ProviderOperationHintRequest, ProviderOperationObserveRequest, MAX_HINT_IDEMPOTENCY_KEY_LEN,
-    },
-    models::{ProviderOperationHintKind, PROVIDER_OPERATION_OBSERVATION_HINT_SOURCE},
-    services::action_providers::ProviderOperationObservation,
+use router_core::models::{
+    ProviderOperationHintKind, ProviderOperationType, PROVIDER_OPERATION_OBSERVATION_HINT_SOURCE,
 };
+use router_server::api::{ProviderOperationHintRequest, MAX_HINT_IDEMPOTENCY_KEY_LEN};
 use sha2::{Digest, Sha256};
 use snafu::ResultExt;
 use sqlx_postgres::{PgPool, PgPoolOptions};
@@ -30,10 +29,14 @@ use crate::{
     config::{normalize_router_detector_api_key, SauronArgs, MIN_TOKEN_INDEXER_API_KEY_LEN},
     cursor::CursorRepository,
     discovery::{
-        bitcoin::BitcoinDiscoveryBackend, evm_erc20::EvmErc20DiscoveryBackend, run_backends,
-        DiscoveryBackend, DiscoveryContext,
+        btc::{BitcoinClients, BitcoinDiscoveryBackend},
+        evm_indexer::EvmIndexerDiscoveryBackend,
+        hyperliquid::run_hyperliquid_observer_loop,
+        hyperunit::{run_hyperunit_observer_loop, HyperUnitObserverOptions},
+        run_backends, DiscoveryBackend, DiscoveryContext,
     },
     error::{Error, ReplicaDatabaseConnectionSnafu, Result, StateDatabaseConnectionSnafu},
+    provider_evm_receipts::{run_evm_receipt_observer_loop, EvmReceiptObserverClients},
     provider_operations::{
         full_provider_operation_reconcile, ProviderOperationWatchEntry,
         ProviderOperationWatchRepository, ProviderOperationWatchStore,
@@ -46,7 +49,7 @@ use crate::{
 
 const PROVIDER_OPERATION_OBSERVE_INTERVAL: Duration = Duration::from_secs(5);
 const PROVIDER_OPERATION_OBSERVE_CONCURRENCY: usize = 32;
-const PROVIDER_OPERATION_OBSERVE_TIMEOUT: Duration = Duration::from_secs(10);
+const PROVIDER_OPERATION_HINT_SUBMIT_TIMEOUT: Duration = Duration::from_secs(10);
 const PROVIDER_OPERATION_OBSERVATION_RESUBMIT_INTERVAL: Duration = Duration::from_secs(30);
 const CDC_RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(1);
 const CDC_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
@@ -68,7 +71,8 @@ pub async fn run(args: SauronArgs) -> Result<()> {
     let router_client = RouterClient::new(&args)?;
     let store = WatchStore::default();
     let provider_operation_store = ProviderOperationWatchStore::default();
-    let backends = build_backends(&args).await?;
+    let bitcoin_clients = BitcoinClients::from_args(&args)?;
+    let backends = build_backends(&args, bitcoin_clients.clone()).await?;
 
     full_reconcile(&store, &repository).await?;
     full_provider_operation_reconcile(&provider_operation_store, &provider_operation_repository)
@@ -106,6 +110,22 @@ pub async fn run(args: SauronArgs) -> Result<()> {
         router_client.clone(),
         PROVIDER_OPERATION_OBSERVE_INTERVAL,
     );
+    let hyperliquid_observer_task = build_hyperliquid_observer_task(
+        &args,
+        provider_operation_store.clone(),
+        router_client.clone(),
+    )?;
+    let evm_receipt_observer_task = build_evm_receipt_observer_task(
+        &args,
+        provider_operation_store.clone(),
+        router_client.clone(),
+    )?;
+    let hyperunit_observer_task = build_hyperunit_observer_task(
+        &args,
+        provider_operation_store.clone(),
+        router_client.clone(),
+        bitcoin_clients,
+    )?;
     let discovery_task = run_backends(
         backends,
         DiscoveryContext {
@@ -120,6 +140,9 @@ pub async fn run(args: SauronArgs) -> Result<()> {
         full_reconcile_task,
         expiration_prune_task,
         provider_operation_observer_task,
+        hyperliquid_observer_task,
+        evm_receipt_observer_task,
+        hyperunit_observer_task,
         discovery_task
     )?;
     Ok(())
@@ -142,6 +165,35 @@ fn validate_runtime_config(args: &SauronArgs) -> Result<()> {
         args.sauron_evm_indexed_lookup_concurrency,
         "SAURON_EVM_INDEXED_LOOKUP_CONCURRENCY",
     )?;
+    validate_positive_usize(
+        args.sauron_hyperunit_observer_concurrency,
+        "SAURON_HYPERUNIT_OBSERVER_CONCURRENCY",
+    )?;
+    validate_positive_seconds(
+        args.sauron_hu_poll_fast_millis,
+        "SAURON_HU_POLL_FAST_MILLIS",
+    )?;
+    validate_positive_seconds(
+        args.sauron_hu_poll_medium_millis,
+        "SAURON_HU_POLL_MEDIUM_MILLIS",
+    )?;
+    validate_positive_seconds(
+        args.sauron_hu_poll_slow_millis,
+        "SAURON_HU_POLL_SLOW_MILLIS",
+    )?;
+    validate_positive_usize(
+        args.sauron_hyperliquid_observer_concurrency,
+        "SAURON_HYPERLIQUID_OBSERVER_CONCURRENCY",
+    )?;
+    validate_positive_usize(
+        args.sauron_evm_receipt_observer_concurrency,
+        "SAURON_EVM_RECEIPT_OBSERVER_CONCURRENCY",
+    )?;
+    if args.sauron_hl_bridge_match_window_seconds <= 0 {
+        return Err(Error::InvalidConfiguration {
+            message: "SAURON_HL_BRIDGE_MATCH_WINDOW_SECONDS must be positive".to_string(),
+        });
+    }
     validate_router_internal_base_url(&args.router_internal_base_url)?;
     validate_router_detector_api_key(&args.router_detector_api_key)?;
     validate_token_indexer_api_key(args)?;
@@ -254,18 +306,167 @@ fn cdc_config_from_args(args: &SauronArgs) -> Result<CdcConfig> {
     Ok(config)
 }
 
-async fn build_backends(args: &SauronArgs) -> Result<Vec<Arc<dyn DiscoveryBackend>>> {
-    let bitcoin = BitcoinDiscoveryBackend::new(args).await?;
-    let ethereum = EvmErc20DiscoveryBackend::new_ethereum(args).await?;
-    let arbitrum = EvmErc20DiscoveryBackend::new_arbitrum(args).await?;
-    let base = EvmErc20DiscoveryBackend::new_base(args).await?;
+async fn build_backends(
+    args: &SauronArgs,
+    bitcoin_clients: Option<BitcoinClients>,
+) -> Result<Vec<Arc<dyn DiscoveryBackend>>> {
+    let mut backends: Vec<Arc<dyn DiscoveryBackend>> = Vec::new();
+    if let Some(bitcoin_clients) = bitcoin_clients {
+        backends.push(Arc::new(BitcoinDiscoveryBackend::new(
+            bitcoin_clients,
+            args,
+        )));
+    } else {
+        warn!("BITCOIN_INDEXER_URL is not configured; Bitcoin discovery backend is disabled");
+    }
+    if let Some(ethereum) = EvmIndexerDiscoveryBackend::maybe_ethereum(args)? {
+        backends.push(Arc::new(ethereum));
+    } else {
+        warn!("ETHEREUM_TOKEN_INDEXER_URL is not configured; Ethereum ERC-20 discovery backend is disabled");
+    }
+    if let Some(arbitrum) = EvmIndexerDiscoveryBackend::maybe_arbitrum(args)? {
+        backends.push(Arc::new(arbitrum));
+    } else {
+        warn!("ARBITRUM_TOKEN_INDEXER_URL is not configured; Arbitrum ERC-20 discovery backend is disabled");
+    }
+    if let Some(base) = EvmIndexerDiscoveryBackend::maybe_base(args)? {
+        backends.push(Arc::new(base));
+    } else {
+        warn!(
+            "BASE_TOKEN_INDEXER_URL is not configured; Base ERC-20 discovery backend is disabled"
+        );
+    }
+    Ok(backends)
+}
 
-    Ok(vec![
-        Arc::new(bitcoin),
-        Arc::new(ethereum),
-        Arc::new(arbitrum),
-        Arc::new(base),
-    ])
+fn build_hyperliquid_observer_task(
+    args: &SauronArgs,
+    provider_operation_store: ProviderOperationWatchStore,
+    router_client: RouterClient,
+) -> Result<BoxedSauronTask> {
+    let Some(url) = args.hl_shim_indexer_url.as_deref() else {
+        warn!(
+            missing = ?["HL_SHIM_INDEXER_URL"],
+            "HyperLiquid observer disabled; required configuration missing. Set the listed env vars to enable observation."
+        );
+        return Ok(disabled_observer_task());
+    };
+    let hl_client = HlShimClient::new(url).map_err(|source| Error::HlShim { source })?;
+    let arbitrum_token_indexer = match args.arbitrum_token_indexer_url.as_deref() {
+        Some(url) => Some(Arc::new(
+            TokenIndexerClient::new_with_api_key(url, args.token_indexer_api_key.clone())
+                .map_err(|source| Error::EvmTokenIndexer { source })?,
+        )),
+        None => None,
+    };
+    Ok(Box::pin(run_hyperliquid_observer_loop(
+        provider_operation_store,
+        router_client,
+        hl_client,
+        arbitrum_token_indexer,
+        args.sauron_hl_bridge_match_window_seconds,
+        args.sauron_hyperliquid_observer_concurrency,
+    )))
+}
+
+fn build_evm_receipt_observer_task(
+    args: &SauronArgs,
+    provider_operation_store: ProviderOperationWatchStore,
+    router_client: RouterClient,
+) -> Result<BoxedSauronTask> {
+    let Some(clients) = EvmReceiptObserverClients::from_args(args)? else {
+        warn!(
+            missing = ?[
+                "ETHEREUM_RECEIPT_WATCHER_URL",
+                "BASE_RECEIPT_WATCHER_URL",
+                "ARBITRUM_RECEIPT_WATCHER_URL",
+            ],
+            "EVM receipt observer disabled; no receipt watcher URLs configured. Set at least one listed env var to enable observation."
+        );
+        return Ok(disabled_observer_task());
+    };
+    Ok(Box::pin(run_evm_receipt_observer_loop(
+        clients,
+        provider_operation_store,
+        router_client,
+        args.sauron_evm_receipt_observer_concurrency,
+    )))
+}
+
+fn build_hyperunit_observer_task(
+    args: &SauronArgs,
+    provider_operation_store: ProviderOperationWatchStore,
+    router_client: RouterClient,
+    bitcoin_clients: Option<BitcoinClients>,
+) -> Result<BoxedSauronTask> {
+    let missing = [
+        ("HYPERUNIT_API_URL", args.hyperunit_api_url.is_none()),
+        ("HL_SHIM_INDEXER_URL", args.hl_shim_indexer_url.is_none()),
+        (
+            "BITCOIN_RPC_URL (or BitcoinClients init)",
+            bitcoin_clients.is_none(),
+        ),
+    ];
+    let missing_names = missing_config_names(&missing);
+    if !missing_names.is_empty() {
+        warn!(
+            missing = ?missing_names,
+            "HyperUnit observer disabled; required configuration missing. Orders using HyperUnit (e.g. *->BTC, BTC->*) will stall at unit_withdrawal/unit_deposit. Set the listed env vars to enable observation."
+        );
+        return Ok(disabled_observer_task());
+    }
+
+    let hyperunit_url = args
+        .hyperunit_api_url
+        .as_deref()
+        .expect("checked HyperUnit API URL is configured");
+    let hl_url = args
+        .hl_shim_indexer_url
+        .as_deref()
+        .expect("checked HyperLiquid shim URL is configured");
+    let bitcoin_clients = bitcoin_clients.expect("checked Bitcoin clients are configured");
+    let evm_receipt_clients = EvmReceiptObserverClients::from_args(args)?;
+    if evm_receipt_clients.is_none() {
+        warn!(
+            missing = ?[
+                "ETHEREUM_RECEIPT_WATCHER_URL",
+                "BASE_RECEIPT_WATCHER_URL",
+                "ARBITRUM_RECEIPT_WATCHER_URL",
+            ],
+            "HyperUnit observer started without EVM receipt watcher clients; EVM-source deposits and EVM-destination withdrawals will only emit preliminary hints."
+        );
+    }
+    let unit_client = hyperunit_client::HyperUnitClient::new_with_proxy_url(
+        hyperunit_url,
+        args.hyperunit_proxy_url.clone(),
+    )
+    .map_err(|source| Error::HyperUnit { source })?;
+    let hl_client = HlShimClient::new(hl_url).map_err(|source| Error::HlShim { source })?;
+    Ok(Box::pin(run_hyperunit_observer_loop(
+        provider_operation_store,
+        router_client,
+        unit_client,
+        hl_client,
+        bitcoin_clients,
+        evm_receipt_clients,
+        HyperUnitObserverOptions {
+            concurrency_limit: args.sauron_hyperunit_observer_concurrency,
+            poll_fast_interval: Duration::from_millis(args.sauron_hu_poll_fast_millis),
+            poll_medium_interval: Duration::from_millis(args.sauron_hu_poll_medium_millis),
+            poll_slow_interval: Duration::from_millis(args.sauron_hu_poll_slow_millis),
+        },
+    )))
+}
+
+fn disabled_observer_task() -> BoxedSauronTask {
+    Box::pin(async { std::future::pending::<Result<()>>().await })
+}
+
+fn missing_config_names<'a>(missing: &'a [(&'a str, bool)]) -> Vec<&'a str> {
+    missing
+        .iter()
+        .filter_map(|(name, is_missing)| if *is_missing { Some(*name) } else { None })
+        .collect()
 }
 
 async fn run_cdc_loop(
@@ -452,14 +653,14 @@ fn merge_valid_router_cdc_message(content: &[u8], pending_plan: &mut CdcRefreshP
                 schema = %message.schema,
                 table = %message.table,
                 op = %message.op,
-                "Ignoring unsupported Sauron CDC logical message"
+                "Ignoring unsupported Sauron CDC message"
             );
         }
         Err(error) => {
             pending_plan.collapse_to_full_reconcile();
             warn!(
                 error = %error,
-                "Malformed Sauron CDC logical message; requiring full reconcile for this commit"
+                "Malformed Sauron CDC message; requiring full reconcile for this commit"
             );
         }
     }
@@ -469,9 +670,7 @@ fn merge_valid_router_cdc_message(content: &[u8], pending_plan: &mut CdcRefreshP
 #[cfg(test)]
 mod tests {
     use super::*;
-    use router_server::{
-        models::ProviderOperationStatus, services::action_providers::ProviderOperationObservation,
-    };
+    use router_core::models::{ProviderOperationStatus, ProviderOperationType};
 
     #[test]
     fn cdc_reconnect_delay_backs_off_and_caps() {
@@ -572,6 +771,21 @@ mod tests {
     }
 
     #[test]
+    fn hyperunit_observer_missing_config_preserves_disabled_fallback() {
+        let args = test_sauron_args();
+        let router_client = RouterClient::new(&args).expect("test router client should build");
+
+        let result = build_hyperunit_observer_task(
+            &args,
+            ProviderOperationWatchStore::default(),
+            router_client,
+            None,
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
     fn runtime_config_rejects_invalid_router_internal_base_urls() {
         assert!(matches!(
             validate_router_internal_base_url("not a url"),
@@ -616,17 +830,27 @@ mod tests {
             sauron_cdc_idle_wakeup_interval_ms: 10_000,
             router_internal_base_url: "http://router-api:4522".to_string(),
             router_detector_api_key: "detector-api-key-0000000000000000".to_string(),
-            electrum_http_server_url: "http://electrum:3000".to_string(),
-            bitcoin_rpc_url: "http://bitcoin:8332".to_string(),
-            bitcoin_rpc_auth: bitcoincore_rpc_async::Auth::None,
-            bitcoin_zmq_rawtx_endpoint: "tcp://bitcoin:28332".to_string(),
-            bitcoin_zmq_sequence_endpoint: "tcp://bitcoin:28333".to_string(),
+            bitcoin_indexer_url: Some("http://bitcoin-indexer:8080".to_string()),
+            bitcoin_receipt_watcher_url: Some("http://bitcoin-receipts:8080".to_string()),
             ethereum_mainnet_rpc_url: "http://ethereum:8545".to_string(),
             ethereum_token_indexer_url: None,
+            ethereum_receipt_watcher_url: None,
             base_rpc_url: "http://base:8545".to_string(),
             base_token_indexer_url: None,
+            base_receipt_watcher_url: None,
             arbitrum_rpc_url: "http://arbitrum:8545".to_string(),
             arbitrum_token_indexer_url: None,
+            arbitrum_receipt_watcher_url: None,
+            hl_shim_indexer_url: None,
+            hyperunit_api_url: None,
+            hyperunit_proxy_url: None,
+            sauron_hl_bridge_match_window_seconds: 1_800,
+            sauron_hyperunit_observer_concurrency: 64,
+            sauron_hu_poll_fast_millis: 5_000,
+            sauron_hu_poll_medium_millis: 10_000,
+            sauron_hu_poll_slow_millis: 20_000,
+            sauron_hyperliquid_observer_concurrency: 128,
+            sauron_evm_receipt_observer_concurrency: 128,
             token_indexer_api_key: None,
             sauron_reconcile_interval_seconds: 3600,
             sauron_bitcoin_scan_interval_seconds: 15,
@@ -764,41 +988,81 @@ mod tests {
     }
 
     #[test]
-    fn provider_operation_observation_fingerprint_is_stable_and_status_sensitive() {
-        let waiting = ProviderOperationObservation {
+    fn provider_operation_hint_fingerprint_is_stable_and_status_sensitive() {
+        let waiting = ProviderOperationWatchEntry {
+            operation_id: uuid::Uuid::now_v7(),
+            execution_step_id: router_temporal::WorkflowStepId::from(uuid::Uuid::now_v7()),
+            provider: "velora".to_string(),
+            operation_type: ProviderOperationType::UniversalRouterSwap,
             status: ProviderOperationStatus::WaitingExternal,
             provider_ref: Some("provider-ref-1".to_string()),
+            request: serde_json::json!({ "amount_in": "100" }),
+            response: serde_json::json!({}),
             observed_state: serde_json::json!({ "state": "pending" }),
-            response: None,
-            tx_hash: None,
-            error: None,
+            execution_step_request: serde_json::json!({}),
+            updated_at: DateTime::parse_from_rfc3339("2026-05-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
         };
-        let completed = ProviderOperationObservation {
+        let completed = ProviderOperationWatchEntry {
             status: ProviderOperationStatus::Completed,
-            provider_ref: Some("provider-ref-1".to_string()),
+            response: serde_json::json!({ "amount_out": "100" }),
             observed_state: serde_json::json!({ "state": "filled" }),
-            response: Some(serde_json::json!({ "amount_out": "100" })),
-            tx_hash: Some("0xabc".to_string()),
-            error: None,
+            updated_at: DateTime::parse_from_rfc3339("2026-05-01T00:00:01Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            ..waiting.clone()
         };
 
-        let first = provider_operation_observation_fingerprint(&waiting)
-            .expect("fingerprint waiting observation");
-        let second = provider_operation_observation_fingerprint(&waiting)
-            .expect("fingerprint waiting observation again");
-        let third = provider_operation_observation_fingerprint(&completed)
-            .expect("fingerprint completed observation");
+        let first =
+            provider_operation_hint_fingerprint(&waiting).expect("fingerprint waiting operation");
+        let second = provider_operation_hint_fingerprint(&waiting)
+            .expect("fingerprint waiting operation again");
+        let third = provider_operation_hint_fingerprint(&completed)
+            .expect("fingerprint completed operation");
 
         assert_eq!(first, second);
         assert_ne!(first, third);
     }
 
     #[test]
-    fn provider_operation_observation_hint_idempotency_key_is_bounded_token_text() {
+    fn provider_operation_hint_request_carries_execution_step_id() {
+        let operation = ProviderOperationWatchEntry {
+            operation_id: uuid::Uuid::now_v7(),
+            execution_step_id: router_temporal::WorkflowStepId::from(uuid::Uuid::now_v7()),
+            provider: "velora".to_string(),
+            operation_type: ProviderOperationType::UniversalRouterSwap,
+            status: ProviderOperationStatus::WaitingExternal,
+            provider_ref: Some("provider-ref-1".to_string()),
+            request: serde_json::json!({ "amount_in": "100" }),
+            response: serde_json::json!({}),
+            observed_state: serde_json::json!({ "state": "pending" }),
+            execution_step_request: serde_json::json!({}),
+            updated_at: DateTime::parse_from_rfc3339("2026-05-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+
+        let request = provider_operation_hint_request(&operation, "fingerprint", 2);
+
+        assert_eq!(request.provider_operation_id, operation.operation_id);
+        assert_eq!(request.execution_step_id, operation.execution_step_id);
+        assert_eq!(
+            request.evidence.get("execution_step_id"),
+            Some(&serde_json::json!(operation.execution_step_id))
+        );
+        assert_eq!(
+            request.evidence.get("submission_index"),
+            Some(&serde_json::json!(2_u64))
+        );
+    }
+
+    #[test]
+    fn provider_operation_hint_idempotency_key_is_bounded_token_text() {
         let operation_id = uuid::Uuid::now_v7();
         let fingerprint = "a".repeat(64);
 
-        let key = provider_operation_observation_hint_idempotency_key(operation_id, &fingerprint);
+        let key = provider_operation_hint_idempotency_key(operation_id, &fingerprint, 7);
 
         assert!(key.len() <= MAX_HINT_IDEMPOTENCY_KEY_LEN);
         assert!(key.bytes().all(|byte| matches!(
@@ -807,40 +1071,59 @@ mod tests {
         )));
         assert_eq!(
             key,
-            format!("sauron:op-observe:{operation_id}:{fingerprint}")
+            format!("sauron:op-observe:{operation_id}:{fingerprint}:7")
         );
     }
 
     #[test]
-    fn provider_operation_observation_submission_is_throttled_not_suppressed_forever() {
+    fn provider_operation_hint_submission_is_throttled_not_suppressed_forever() {
         let now = Instant::now();
-        let recent = SubmittedProviderOperationObservation {
+        let recent = SubmittedProviderOperationHint {
             fingerprint: "same".to_string(),
+            submission_index: 0,
             submitted_at: now - (PROVIDER_OPERATION_OBSERVATION_RESUBMIT_INTERVAL / 2),
         };
-        let stale = SubmittedProviderOperationObservation {
+        let stale = SubmittedProviderOperationHint {
             fingerprint: "same".to_string(),
+            submission_index: 0,
             submitted_at: now - PROVIDER_OPERATION_OBSERVATION_RESUBMIT_INTERVAL,
         };
 
-        assert!(should_submit_provider_operation_observation(
-            None, "same", now
-        ));
-        assert!(!should_submit_provider_operation_observation(
+        assert!(should_submit_provider_operation_hint(None, "same", now));
+        assert!(!should_submit_provider_operation_hint(
             Some(&recent),
             "same",
             now
         ));
-        assert!(should_submit_provider_operation_observation(
+        assert!(should_submit_provider_operation_hint(
             Some(&recent),
             "changed",
             now
         ));
-        assert!(should_submit_provider_operation_observation(
+        assert!(should_submit_provider_operation_hint(
             Some(&stale),
             "same",
             now
         ));
+    }
+
+    #[test]
+    fn provider_operation_hint_submission_index_advances_for_resubmission() {
+        let last = SubmittedProviderOperationHint {
+            fingerprint: "same".to_string(),
+            submission_index: 3,
+            submitted_at: Instant::now(),
+        };
+
+        assert_eq!(provider_operation_hint_submission_index(None, "same"), 0);
+        assert_eq!(
+            provider_operation_hint_submission_index(Some(&last), "changed"),
+            0
+        );
+        assert_eq!(
+            provider_operation_hint_submission_index(Some(&last), "same"),
+            4
+        );
     }
 
     #[test]
@@ -856,6 +1139,23 @@ mod tests {
         assert_eq!(plan.watch_ids.len(), 1);
         assert!(plan.watch_ids.contains_key(&watch_id));
         assert!(plan.provider_operation_ids.is_empty());
+    }
+
+    #[test]
+    fn cdc_refresh_plan_keeps_provider_operation_refreshes_targeted() {
+        let order_id = uuid::Uuid::now_v7();
+        let provider_operation_id = uuid::Uuid::now_v7();
+        let plan = cdc_refresh_plan([
+            test_provider_operation_cdc_message(order_id, provider_operation_id),
+            test_provider_operation_cdc_message(order_id, provider_operation_id),
+        ]);
+
+        assert!(plan.order_ids.is_empty());
+        assert!(plan.watch_ids.is_empty());
+        assert_eq!(plan.provider_operation_ids.len(), 1);
+        assert!(plan
+            .provider_operation_ids
+            .contains_key(&provider_operation_id));
     }
 
     #[test]
@@ -909,6 +1209,20 @@ mod tests {
         unsupported.version = 2;
 
         let plan = cdc_refresh_plan([unsupported]);
+
+        assert!(plan.order_ids.is_empty());
+        assert!(plan.watch_ids.is_empty());
+        assert!(plan.provider_operation_ids.is_empty());
+    }
+
+    #[test]
+    fn cdc_refresh_plan_ignores_unrelated_tables() {
+        let order_id = uuid::Uuid::now_v7();
+        let message = RouterCdcMessage {
+            table: "unrelated_table".to_string(),
+            ..test_cdc_message(Some(order_id), None, None)
+        };
+        let plan = cdc_refresh_plan([message]);
 
         assert!(plan.order_ids.is_empty());
         assert!(plan.watch_ids.is_empty());
@@ -983,7 +1297,7 @@ async fn refresh_from_cdc_plan(
         store
             .replace_order(order_id, watches, source_updated_at)
             .await;
-        info!(
+        debug!(
             order_id = %order_id,
             "Refreshed Sauron order watch set from CDC message batch"
         );
@@ -1096,11 +1410,11 @@ async fn refresh_watch(
     match repository.load_watch(watch_id).await? {
         Some(watch) => {
             store.upsert(watch).await;
-            info!(watch_id = %watch_id, "Refreshed Sauron chain-deposit watch from CDC message");
+            debug!(watch_id = %watch_id, "Refreshed Sauron chain-deposit watch from CDC message");
         }
         None => {
             store.remove_with_source(watch_id, source_updated_at).await;
-            info!(watch_id = %watch_id, "Removed Sauron chain-deposit watch from CDC message");
+            debug!(watch_id = %watch_id, "Removed Sauron chain-deposit watch from CDC message");
         }
     }
     Ok(())
@@ -1115,13 +1429,13 @@ async fn refresh_provider_operation(
     match repository.load_watch(operation_id).await? {
         Some(watch) => {
             store.upsert(watch).await;
-            info!(operation_id = %operation_id, "Refreshed Sauron provider-operation watch from CDC message");
+            debug!(operation_id = %operation_id, "Refreshed Sauron provider-operation watch from CDC message");
         }
         None => {
             store
                 .remove_with_source(operation_id, source_updated_at)
                 .await;
-            info!(operation_id = %operation_id, "Removed Sauron provider-operation watch from CDC message");
+            debug!(operation_id = %operation_id, "Removed Sauron provider-operation watch from CDC message");
         }
     }
     Ok(())
@@ -1145,10 +1459,8 @@ async fn run_provider_operation_observer_loop(
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     ticker.tick().await;
-    let mut last_observation_submissions: HashMap<
-        uuid::Uuid,
-        SubmittedProviderOperationObservation,
-    > = HashMap::new();
+    let mut last_hint_submissions: HashMap<uuid::Uuid, SubmittedProviderOperationHint> =
+        HashMap::new();
 
     loop {
         let operations = store.snapshot().await;
@@ -1156,13 +1468,12 @@ async fn run_provider_operation_observer_loop(
             .iter()
             .map(|operation| operation.operation_id)
             .collect::<HashSet<_>>();
-        last_observation_submissions
-            .retain(|operation_id, _| active_operation_ids.contains(operation_id));
+        last_hint_submissions.retain(|operation_id, _| active_operation_ids.contains(operation_id));
 
         observe_provider_operations(
             operations,
             router_client.clone(),
-            &mut last_observation_submissions,
+            &mut last_hint_submissions,
         )
         .await;
 
@@ -1173,19 +1484,20 @@ async fn run_provider_operation_observer_loop(
 #[derive(Debug)]
 struct ProviderOperationObserveOutcome {
     operation_id: uuid::Uuid,
-    submitted_observation: Option<SubmittedProviderOperationObservation>,
+    submitted_hint: Option<SubmittedProviderOperationHint>,
 }
 
 #[derive(Debug, Clone)]
-struct SubmittedProviderOperationObservation {
+struct SubmittedProviderOperationHint {
     fingerprint: String,
+    submission_index: u64,
     submitted_at: Instant,
 }
 
 async fn observe_provider_operations(
     operations: Vec<SharedProviderOperationWatchEntry>,
     router_client: RouterClient,
-    last_observation_submissions: &mut HashMap<uuid::Uuid, SubmittedProviderOperationObservation>,
+    last_hint_submissions: &mut HashMap<uuid::Uuid, SubmittedProviderOperationHint>,
 ) {
     let mut operations = operations.into_iter();
     let mut tasks = tokio::task::JoinSet::new();
@@ -1196,9 +1508,7 @@ async fn observe_provider_operations(
                 break;
             };
             let router_client = router_client.clone();
-            let last_submission = last_observation_submissions
-                .get(&operation.operation_id)
-                .cloned();
+            let last_submission = last_hint_submissions.get(&operation.operation_id).cloned();
             tasks.spawn(async move {
                 observe_provider_operation_once(router_client, operation, last_submission).await
             });
@@ -1210,8 +1520,8 @@ async fn observe_provider_operations(
 
         match tasks.join_next().await {
             Some(Ok(outcome)) => {
-                if let Some(submission) = outcome.submitted_observation {
-                    last_observation_submissions.insert(outcome.operation_id, submission);
+                if let Some(submission) = outcome.submitted_hint {
+                    last_hint_submissions.insert(outcome.operation_id, submission);
                 }
             }
             Some(Err(error)) => {
@@ -1228,60 +1538,16 @@ async fn observe_provider_operations(
 async fn observe_provider_operation_once(
     router_client: RouterClient,
     operation: SharedProviderOperationWatchEntry,
-    last_submission: Option<SubmittedProviderOperationObservation>,
+    last_submission: Option<SubmittedProviderOperationHint>,
 ) -> ProviderOperationObserveOutcome {
-    let observe_request = ProviderOperationObserveRequest {
-        hint_evidence: provider_operation_observe_evidence(operation.as_ref()),
-    };
     let operation_id = operation.operation_id;
-    let observation = match timeout(
-        PROVIDER_OPERATION_OBSERVE_TIMEOUT,
-        router_client.observe_provider_operation(operation_id, &observe_request),
-    )
-    .await
-    {
-        Ok(Ok(Some(observation))) => observation,
-        Ok(Ok(None)) => {
-            debug!(
-                operation_id = %operation_id,
-                provider = %operation.provider,
-                operation_type = %operation.operation_type.to_db_string(),
-                "Provider-operation observe proxy returned no observation"
-            );
-            return ProviderOperationObserveOutcome {
-                operation_id,
-                submitted_observation: None,
-            };
-        }
-        Ok(Err(error)) => {
-            warn!(
-                operation_id = %operation_id,
-                provider = %operation.provider,
-                operation_type = %operation.operation_type.to_db_string(),
-                %error,
-                "Failed to observe provider operation through router proxy"
-            );
-            return ProviderOperationObserveOutcome {
-                operation_id,
-                submitted_observation: None,
-            };
-        }
-        Err(_) => {
-            warn!(
-                operation_id = %operation_id,
-                provider = %operation.provider,
-                operation_type = %operation.operation_type.to_db_string(),
-                timeout_ms = PROVIDER_OPERATION_OBSERVE_TIMEOUT.as_millis(),
-                "Timed out observing provider operation through router proxy"
-            );
-            return ProviderOperationObserveOutcome {
-                operation_id,
-                submitted_observation: None,
-            };
-        }
-    };
-
-    let fingerprint = match provider_operation_observation_fingerprint(&observation) {
+    if uses_typed_venue_observer(operation.operation_type) {
+        return ProviderOperationObserveOutcome {
+            operation_id,
+            submitted_hint: None,
+        };
+    }
+    let fingerprint = match provider_operation_hint_fingerprint(operation.as_ref()) {
         Ok(fingerprint) => fingerprint,
         Err(error) => {
             warn!(
@@ -1289,47 +1555,38 @@ async fn observe_provider_operation_once(
                 provider = %operation.provider,
                 operation_type = %operation.operation_type.to_db_string(),
                 %error,
-                "Failed to fingerprint provider-operation observation"
+                "Failed to fingerprint provider-operation hint"
             );
             return ProviderOperationObserveOutcome {
                 operation_id,
-                submitted_observation: None,
+                submitted_hint: None,
             };
         }
     };
     let now = Instant::now();
-    if !should_submit_provider_operation_observation(last_submission.as_ref(), &fingerprint, now) {
+    if !should_submit_provider_operation_hint(last_submission.as_ref(), &fingerprint, now) {
         return ProviderOperationObserveOutcome {
             operation_id,
-            submitted_observation: None,
+            submitted_hint: None,
         };
     }
 
-    let request = ProviderOperationHintRequest {
-        provider_operation_id: operation_id,
-        source: PROVIDER_OPERATION_OBSERVATION_HINT_SOURCE.to_string(),
-        hint_kind: ProviderOperationHintKind::PossibleProgress,
-        evidence: provider_operation_observation_hint_evidence(
-            operation.as_ref(),
-            &observation,
-            &fingerprint,
-        ),
-        idempotency_key: Some(provider_operation_observation_hint_idempotency_key(
-            operation_id,
-            &fingerprint,
-        )),
-    };
+    let submission_index =
+        provider_operation_hint_submission_index(last_submission.as_ref(), &fingerprint);
+    let request =
+        provider_operation_hint_request(operation.as_ref(), &fingerprint, submission_index);
 
     match timeout(
-        PROVIDER_OPERATION_OBSERVE_TIMEOUT,
+        PROVIDER_OPERATION_HINT_SUBMIT_TIMEOUT,
         router_client.submit_provider_operation_hint(&request),
     )
     .await
     {
         Ok(Ok(_)) => ProviderOperationObserveOutcome {
             operation_id,
-            submitted_observation: Some(SubmittedProviderOperationObservation {
+            submitted_hint: Some(SubmittedProviderOperationHint {
                 fingerprint,
+                submission_index,
                 submitted_at: Instant::now(),
             }),
         },
@@ -1343,7 +1600,7 @@ async fn observe_provider_operation_once(
             );
             ProviderOperationObserveOutcome {
                 operation_id,
-                submitted_observation: None,
+                submitted_hint: None,
             }
         }
         Err(_) => {
@@ -1351,19 +1608,33 @@ async fn observe_provider_operation_once(
                 operation_id = %operation_id,
                 provider = %operation.provider,
                 operation_type = %operation.operation_type.to_db_string(),
-                timeout_ms = PROVIDER_OPERATION_OBSERVE_TIMEOUT.as_millis(),
+                timeout_ms = PROVIDER_OPERATION_HINT_SUBMIT_TIMEOUT.as_millis(),
                 "Timed out submitting provider-operation observation hint"
             );
             ProviderOperationObserveOutcome {
                 operation_id,
-                submitted_observation: None,
+                submitted_hint: None,
             }
         }
     }
 }
 
-fn should_submit_provider_operation_observation(
-    last_submission: Option<&SubmittedProviderOperationObservation>,
+fn uses_typed_venue_observer(operation_type: ProviderOperationType) -> bool {
+    matches!(
+        operation_type,
+        ProviderOperationType::CctpReceive
+            | ProviderOperationType::UniversalRouterSwap
+            | ProviderOperationType::UnitDeposit
+            | ProviderOperationType::UnitWithdrawal
+            | ProviderOperationType::HyperliquidTrade
+            | ProviderOperationType::HyperliquidLimitOrder
+            | ProviderOperationType::HyperliquidBridgeDeposit
+            | ProviderOperationType::HyperliquidBridgeWithdrawal
+    )
+}
+
+fn should_submit_provider_operation_hint(
+    last_submission: Option<&SubmittedProviderOperationHint>,
     fingerprint: &str,
     now: Instant,
 ) -> bool {
@@ -1375,47 +1646,83 @@ fn should_submit_provider_operation_observation(
             >= PROVIDER_OPERATION_OBSERVATION_RESUBMIT_INTERVAL
 }
 
-fn provider_operation_observe_evidence(
-    operation: &ProviderOperationWatchEntry,
-) -> serde_json::Value {
-    serde_json::json!({
-        "source": "sauron_provider_operation_observer",
-        "provider": &operation.provider,
-        "operation_type": operation.operation_type.to_db_string(),
-        "provider_ref": &operation.provider_ref,
-        "observed_at": chrono::Utc::now(),
-    })
-}
-
-fn provider_operation_observation_hint_evidence(
-    operation: &ProviderOperationWatchEntry,
-    observation: &ProviderOperationObservation,
+fn provider_operation_hint_submission_index(
+    last_submission: Option<&SubmittedProviderOperationHint>,
     fingerprint: &str,
+) -> u64 {
+    last_submission
+        .filter(|submission| submission.fingerprint == fingerprint)
+        .map(|submission| submission.submission_index.saturating_add(1))
+        .unwrap_or(0)
+}
+
+fn provider_operation_progress_hint_evidence(
+    operation: &ProviderOperationWatchEntry,
+    fingerprint: &str,
+    submission_index: u64,
 ) -> serde_json::Value {
     serde_json::json!({
         "source": "sauron_provider_operation_observer",
         "provider": &operation.provider,
         "operation_type": operation.operation_type.to_db_string(),
+        "execution_step_id": operation.execution_step_id,
         "provider_ref": &operation.provider_ref,
-        "observation_fingerprint": fingerprint,
-        "provider_observation": observation,
+        "operation_status": operation.status.to_db_string(),
+        "operation_updated_at": operation.updated_at,
+        "operation_fingerprint": fingerprint,
+        "submission_index": submission_index,
         "observed_at": chrono::Utc::now(),
     })
 }
 
-fn provider_operation_observation_fingerprint(
-    observation: &ProviderOperationObservation,
+fn provider_operation_hint_request(
+    operation: &ProviderOperationWatchEntry,
+    fingerprint: &str,
+    submission_index: u64,
+) -> ProviderOperationHintRequest {
+    ProviderOperationHintRequest {
+        provider_operation_id: operation.operation_id,
+        execution_step_id: operation.execution_step_id,
+        source: PROVIDER_OPERATION_OBSERVATION_HINT_SOURCE.to_string(),
+        hint_kind: ProviderOperationHintKind::PossibleProgress,
+        evidence: provider_operation_progress_hint_evidence(
+            operation,
+            fingerprint,
+            submission_index,
+        ),
+        idempotency_key: Some(provider_operation_hint_idempotency_key(
+            operation.operation_id,
+            fingerprint,
+            submission_index,
+        )),
+    }
+}
+
+fn provider_operation_hint_fingerprint(
+    operation: &ProviderOperationWatchEntry,
 ) -> std::result::Result<String, serde_json::Error> {
-    let bytes = serde_json::to_vec(observation)?;
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "provider": &operation.provider,
+        "operation_type": operation.operation_type.to_db_string(),
+        "execution_step_id": operation.execution_step_id,
+        "provider_ref": &operation.provider_ref,
+        "status": operation.status.to_db_string(),
+        "request": &operation.request,
+        "response": &operation.response,
+        "observed_state": &operation.observed_state,
+        "updated_at": operation.updated_at,
+    }))?;
     let digest = Sha256::digest(bytes);
     Ok(alloy::hex::encode(digest))
 }
 
-fn provider_operation_observation_hint_idempotency_key(
+fn provider_operation_hint_idempotency_key(
     operation_id: Uuid,
     fingerprint: &str,
+    submission_index: u64,
 ) -> String {
-    let idempotency_key = format!("sauron:op-observe:{operation_id}:{fingerprint}");
+    let idempotency_key =
+        format!("sauron:op-observe:{operation_id}:{fingerprint}:{submission_index}");
     debug_assert!(idempotency_key.len() <= MAX_HINT_IDEMPOTENCY_KEY_LEN);
     idempotency_key
 }

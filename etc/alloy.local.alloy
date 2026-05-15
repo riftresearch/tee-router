@@ -1,0 +1,94 @@
+logging {
+  level  = "info"
+  format = "logfmt"
+}
+
+prometheus.scrape "router" {
+  targets = [
+    {"__address__" = "router-api:9100", "job" = "router-api"},
+    {"__address__" = "router-worker:9101", "job" = "router-worker"},
+    {"__address__" = "sauron:9102", "job" = "sauron"},
+    {"__address__" = "temporal-worker:9103", "job" = "temporal-worker"},
+    {"__address__" = "hl-shim-indexer:9104", "job" = "hl-shim-indexer"},
+    {"__address__" = "temporal:9090", "job" = "temporal-frontend"},
+    {"__address__" = "temporal-history:9090", "job" = "temporal-history"},
+    {"__address__" = "temporal-matching:9090", "job" = "temporal-matching"},
+    {"__address__" = "temporal-internal-worker:9090", "job" = "temporal-internal-worker"},
+    {"__address__" = "bitcoin-indexer:8080", "job" = "bitcoin-indexer"},
+    {"__address__" = "bitcoin-receipt-watcher:8080", "job" = "bitcoin-receipt-watcher"},
+    {"__address__" = "evm-receipt-watcher-ethereum:8080", "job" = "evm-receipt-watcher-ethereum"},
+    {"__address__" = "evm-receipt-watcher-base:8080", "job" = "evm-receipt-watcher-base"},
+    {"__address__" = "evm-receipt-watcher-arbitrum:8080", "job" = "evm-receipt-watcher-arbitrum"},
+    {"__address__" = "devnet:50104", "job" = "evm-token-indexer-ethereum"},
+    {"__address__" = "devnet:50105", "job" = "evm-token-indexer-base"},
+    {"__address__" = "devnet:50106", "job" = "evm-token-indexer-arbitrum"},
+  ]
+
+  scrape_interval = "5s"
+  scrape_timeout  = "4s"
+  forward_to      = [prometheus.remote_write.victoriametrics.receiver]
+}
+
+prometheus.remote_write "victoriametrics" {
+  endpoint {
+    url = "http://victoriametrics:8428/api/v1/write"
+  }
+}
+
+otelcol.receiver.otlp "router" {
+  grpc {
+    endpoint = "0.0.0.0:4317"
+  }
+
+  http {
+    endpoint = "0.0.0.0:4318"
+  }
+
+  output {
+    logs    = [otelcol.processor.batch.router.input]
+    metrics = [otelcol.processor.batch.router.input]
+  }
+}
+
+otelcol.processor.batch "router" {
+  output {
+    logs    = [otelcol.exporter.loki.router.input]
+    metrics = [otelcol.exporter.prometheus.router.input]
+  }
+}
+
+otelcol.exporter.loki "router" {
+  forward_to = [loki.process.router.receiver]
+}
+
+loki.process "router" {
+  forward_to = [loki.write.local.receiver]
+
+  stage.json {
+    expressions = {
+      body     = "body",
+      severity = "severity",
+      order_id = "attributes.order_id",
+      error    = "attributes.error",
+    }
+  }
+
+  stage.template {
+    source   = "message"
+    template = "{{ .severity }} {{ .body }}{{ with .order_id }} order={{ . }}{{ end }}{{ with .error }} error={{ . }}{{ end }}"
+  }
+
+  stage.output {
+    source = "message"
+  }
+}
+
+loki.write "local" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}
+
+otelcol.exporter.prometheus "router" {
+  forward_to = [prometheus.remote_write.victoriametrics.receiver]
+}

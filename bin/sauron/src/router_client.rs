@@ -4,10 +4,8 @@ use metrics::histogram;
 use reqwest::StatusCode;
 use router_server::api::{
     DetectorHintEnvelope, DetectorHintRequest, ProviderOperationHintEnvelope,
-    ProviderOperationHintRequest, ProviderOperationObserveRequest, VaultFundingHintEnvelope,
-    VaultFundingHintRequest,
+    ProviderOperationHintRequest, VaultFundingHintEnvelope, VaultFundingHintRequest,
 };
-use router_server::services::action_providers::ProviderOperationObservation;
 use snafu::ResultExt;
 use uuid::Uuid;
 
@@ -50,24 +48,26 @@ impl RouterClient {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_for_test(base_url: &str) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("test router client should build");
+        Self {
+            client,
+            base_url: normalize_router_internal_base_url(base_url)
+                .expect("test router base URL should be valid"),
+            detector_api_key: "test-detector-secret-000000000000".to_string(),
+        }
+    }
+
     pub async fn submit_provider_operation_hint(
         &self,
         request: &ProviderOperationHintRequest,
     ) -> Result<ProviderOperationHintEnvelope> {
         self.submit_hint("/api/v1/provider-operations/hints", request)
             .await
-    }
-
-    pub async fn observe_provider_operation(
-        &self,
-        operation_id: Uuid,
-        request: &ProviderOperationObserveRequest,
-    ) -> Result<Option<ProviderOperationObservation>> {
-        self.submit_hint(
-            &format!("/api/v1/provider-operations/{operation_id}/observe"),
-            request,
-        )
-        .await
     }
 
     pub async fn submit_detector_hint(

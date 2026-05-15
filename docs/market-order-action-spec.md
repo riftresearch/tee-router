@@ -149,9 +149,11 @@ pending_funding
 funded
 executing
 completed
+refund_required
 refunding
 refunded
-failed
+manual_intervention_required
+refund_manual_intervention_required
 expired
 ```
 
@@ -163,13 +165,18 @@ transitions.
 
 ### Exact Input
 
-The user fixes `amount_in` and supplies `slippage_bps`. The router first
-discovers an expected `amount_out`, then derives `min_amount_out` from that
-expected output and the requested slippage.
+The user fixes `amount_in` and may supply `slippage_bps`. The router first
+discovers an expected `amount_out`. If slippage is supplied, it derives
+`min_amount_out` from that expected output and the requested slippage. If
+slippage is omitted, `min_amount_out` remains unset and provider execution uses a
+fresh quote amount for each stale venue leg.
 
 Required user constraints:
 
 - `amount_in`
+
+Optional user constraints:
+
 - `slippage_bps`
 
 Selection rule:
@@ -178,18 +185,23 @@ Selection rule:
 
 Execution invariant:
 
-- The worker must not complete the action if the settled output would be below
-  `min_amount_out`.
+- If `min_amount_out` is set, the worker must not complete the action if the
+  settled output would be below it.
 
 ### Exact Output
 
-The user fixes `amount_out` and supplies `slippage_bps`. The router first
-discovers an expected `amount_in`, then derives `max_amount_in` from that
-expected input and the requested slippage.
+The user fixes `amount_out` and may supply `slippage_bps`. The router first
+discovers an expected `amount_in`. If slippage is supplied, it derives
+`max_amount_in` from that expected input and the requested slippage. If slippage
+is omitted, `max_amount_in` remains unset and provider execution uses a fresh
+quote amount for each stale venue leg.
 
 Required user constraints:
 
 - `amount_out`
+
+Optional user constraints:
+
 - `slippage_bps`
 
 Selection rule:
@@ -198,7 +210,7 @@ Selection rule:
 
 Execution invariant:
 
-- The worker must not spend more than `max_amount_in`.
+- If `max_amount_in` is set, the worker must not spend more than it.
 
 If no provider supports exact-output for the requested route, the quote endpoint
 returns a typed no-route error. It must not silently downgrade to exact-input.
@@ -325,7 +337,7 @@ The persisted quote must include:
 - `order_id`
 - order kind
 - exact amount constraint
-- derived minimum or maximum amount constraint
+- optional derived minimum or maximum amount constraint
 - selected provider
 - quote expiration
 - provider quote payload or opaque route handle
@@ -344,17 +356,17 @@ MarketOrder(MarketOrderAction)
 enum MarketOrderKind {
     ExactIn {
         amount_in: String,
-        min_amount_out: String,
+        min_amount_out: Option<String>,
     },
     ExactOut {
         amount_out: String,
-        max_amount_in: String,
+        max_amount_in: Option<String>,
     },
 }
 
 struct MarketOrderAction {
     order_kind: MarketOrderKind,
-    slippage_bps: u64,
+    slippage_bps: Option<u64>,
 }
 ```
 
@@ -386,10 +398,13 @@ not contain the order ID.
 9. Vault creation links the funding vault to the order and moves the order to
    `pending_funding`.
 10. Worker observes the funded vault and moves the order to `executing`.
-11. Worker tries to execute the original selected quote if it is still valid.
-12. If the quote expired, worker may request a replacement route.
-13. Replacement routes are valid only if they satisfy the user's original
-    amount constraints.
+11. Worker executes the selected route. The original quote expiry is no longer
+    relevant after order creation succeeds.
+12. If a provider venue quote is stale before its leg starts, the worker requests
+    a refreshed quote for that remaining route suffix and creates a new execution
+    attempt.
+13. Refreshed attempts are valid only if they satisfy the user's original amount
+    constraints.
 14. If no valid executable route is found before the action timeout, worker
     transitions the order and its funding vault to `refunding`.
 15. Worker executes the provider route.

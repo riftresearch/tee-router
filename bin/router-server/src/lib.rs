@@ -6,11 +6,7 @@ use snafu::{prelude::*, Whatever};
 
 pub mod api;
 pub mod app;
-pub mod config;
-pub mod db;
 pub mod error;
-pub mod models;
-pub mod protocol;
 pub mod query_api;
 pub mod runtime;
 pub mod server;
@@ -61,7 +57,7 @@ pub struct RouterServerArgs {
     pub database_url: String,
 
     /// Database max connections
-    #[arg(long, env = "DB_MAX_CONNECTIONS", default_value = "32")]
+    #[arg(long, env = "DB_MAX_CONNECTIONS", default_value = "100")]
     pub db_max_connections: u32,
 
     /// Database min connections
@@ -233,6 +229,26 @@ pub struct RouterServerArgs {
     #[arg(long, env = "HYPERLIQUID_PAYMASTER_PRIVATE_KEY")]
     pub hyperliquid_paymaster_private_key: Option<String>,
 
+    /// Temporal frontend URL used by router-worker to start order workflows
+    #[arg(
+        long,
+        env = "TEMPORAL_ADDRESS",
+        default_value = "http://127.0.0.1:7233"
+    )]
+    pub temporal_address: String,
+
+    /// Temporal namespace used by router-worker for order workflows
+    #[arg(long, env = "TEMPORAL_NAMESPACE", default_value = "default")]
+    pub temporal_namespace: String,
+
+    /// Temporal task queue consumed by temporal-worker for order execution
+    #[arg(
+        long,
+        env = "ORDER_EXECUTION_TEMPORAL_TASK_QUEUE",
+        default_value_t = router_temporal::DEFAULT_TASK_QUEUE.to_string()
+    )]
+    pub temporal_task_queue: String,
+
     /// Bearer API key accepted from Sauron on internal detector callbacks
     #[arg(long, env = "ROUTER_DETECTOR_API_KEY")]
     pub router_detector_api_key: Option<String>,
@@ -257,36 +273,16 @@ pub struct RouterServerArgs {
         default_value = "mainnet",
         value_parser = parse_hyperliquid_network,
     )]
-    pub hyperliquid_network: services::custody_action_executor::HyperliquidCallNetwork,
+    pub hyperliquid_network: router_core::services::custody_action_executor::HyperliquidCallNetwork,
 
     /// Timeout for Hyperliquid resting orders before the router arms the
     /// exchange-side dead-man switch to cancel them, in milliseconds.
     #[arg(long, env = "HYPERLIQUID_ORDER_TIMEOUT_MS", default_value = "30000")]
     pub hyperliquid_order_timeout_ms: u64,
 
-    /// Stable worker identity for the router-worker database lease
+    /// Stable worker identity for router-worker records
     #[arg(long, env = "ROUTER_WORKER_ID")]
     pub worker_id: Option<String>,
-
-    /// Global worker lease name
-    #[arg(
-        long,
-        env = "ROUTER_WORKER_LEASE_NAME",
-        default_value = "global-router-worker"
-    )]
-    pub worker_lease_name: Option<String>,
-
-    /// Worker leadership lease duration, in seconds
-    #[arg(long, env = "ROUTER_WORKER_LEASE_SECONDS", default_value = "300")]
-    pub worker_lease_seconds: u64,
-
-    /// Worker leadership lease renewal interval, in seconds
-    #[arg(long, env = "ROUTER_WORKER_LEASE_RENEW_SECONDS", default_value = "30")]
-    pub worker_lease_renew_seconds: u64,
-
-    /// Standby worker poll interval for trying to acquire leadership, in seconds
-    #[arg(long, env = "ROUTER_WORKER_STANDBY_POLL_SECONDS", default_value = "5")]
-    pub worker_standby_poll_seconds: u64,
 
     /// Vault work safety-sweep interval. LISTEN/NOTIFY drives normal funding and
     /// refund wakeups, but this periodic pass recovers missed wakeups and stale
@@ -328,6 +324,46 @@ pub struct RouterServerArgs {
     )]
     pub provider_health_timeout_seconds: u64,
 
+    /// Order maintenance rows to process per router-worker global pass
+    #[arg(
+        long,
+        env = "ROUTER_WORKER_ORDER_MAINTENANCE_PASS_LIMIT",
+        default_value = "100"
+    )]
+    pub worker_order_maintenance_pass_limit: u32,
+
+    /// Orders to plan per router-worker global planning pass
+    #[arg(
+        long,
+        env = "ROUTER_WORKER_ORDER_PLANNING_PASS_LIMIT",
+        default_value = "100"
+    )]
+    pub worker_order_planning_pass_limit: u32,
+
+    /// Ready orders to execute per router-worker global execution pass
+    #[arg(
+        long,
+        env = "ROUTER_WORKER_ORDER_EXECUTION_PASS_LIMIT",
+        default_value = "25"
+    )]
+    pub worker_order_execution_pass_limit: u32,
+
+    /// Ready orders to execute concurrently within each router-worker execution pass
+    #[arg(
+        long,
+        env = "ROUTER_WORKER_ORDER_EXECUTION_CONCURRENCY",
+        default_value = "64"
+    )]
+    pub worker_order_execution_concurrency: u32,
+
+    /// Vault funding hints to claim per router-worker vault pass
+    #[arg(
+        long,
+        env = "ROUTER_WORKER_VAULT_FUNDING_HINT_PASS_LIMIT",
+        default_value = "100"
+    )]
+    pub worker_vault_funding_hint_pass_limit: u32,
+
     /// Coinbase unauthenticated price API base URL used by route-cost pricing refresh
     #[arg(
         long,
@@ -349,8 +385,11 @@ impl RouterServerArgs {
 
 fn parse_hyperliquid_network(
     s: &str,
-) -> std::result::Result<services::custody_action_executor::HyperliquidCallNetwork, String> {
-    use services::custody_action_executor::HyperliquidCallNetwork;
+) -> std::result::Result<
+    router_core::services::custody_action_executor::HyperliquidCallNetwork,
+    String,
+> {
+    use router_core::services::custody_action_executor::HyperliquidCallNetwork;
     match s.to_ascii_lowercase().as_str() {
         "mainnet" => Ok(HyperliquidCallNetwork::Mainnet),
         "testnet" => Ok(HyperliquidCallNetwork::Testnet),

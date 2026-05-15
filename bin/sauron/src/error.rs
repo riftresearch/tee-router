@@ -52,12 +52,14 @@ pub enum Error {
     #[snafu(display("Failed to initialize discovery backend {backend}: {message}"))]
     DiscoveryBackendInit { backend: String, message: String },
 
-    #[snafu(display("Bitcoin esplora request failed"))]
-    BitcoinEsplora { source: esplora_client::Error },
+    #[snafu(display("Bitcoin indexer request failed"))]
+    BitcoinIndexer {
+        source: bitcoin_indexer_client::Error,
+    },
 
-    #[snafu(display("Bitcoin RPC request failed"))]
-    BitcoinRpc {
-        source: bitcoincore_rpc_async::Error,
+    #[snafu(display("Bitcoin receipt watcher request failed"))]
+    BitcoinReceiptWatcher {
+        source: bitcoin_receipt_watcher_client::Error,
     },
 
     #[snafu(display("EVM RPC request failed: {source}"))]
@@ -77,6 +79,22 @@ pub enum Error {
     #[snafu(display("EVM token indexer request failed"))]
     EvmTokenIndexer {
         source: evm_token_indexer_client::Error,
+    },
+
+    #[snafu(display("EVM indexer request failed"))]
+    EvmIndexer { source: evm_indexer_client::Error },
+
+    #[snafu(display("EVM receipt watcher request failed"))]
+    EvmReceiptWatcher {
+        source: evm_receipt_watcher_client::Error,
+    },
+
+    #[snafu(display("HL shim indexer request failed"))]
+    HlShim { source: hl_shim_client::Error },
+
+    #[snafu(display("HyperUnit request failed"))]
+    HyperUnit {
+        source: hyperunit_client::HyperUnitClientError,
     },
 
     #[snafu(display("ROUTER request failed"))]

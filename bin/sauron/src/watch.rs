@@ -5,6 +5,7 @@ use bitcoin::Address as BitcoinAddress;
 use chrono::{DateTime, Months, Utc};
 use metrics::{counter, gauge, histogram};
 use router_primitives::{normalize_evm_address, ChainType, TokenIdentifier};
+use router_temporal::WorkflowStepId;
 use snafu::ResultExt;
 use sqlx_core::row::Row;
 use sqlx_postgres::PgPool;
@@ -18,6 +19,7 @@ const FULL_WATCH_QUERY: &str = r#"
 SELECT
   'provider_operation' AS watch_target,
   opo.id::text AS watch_id,
+  opo.execution_step_id::text AS execution_step_id,
   opo.order_id::text AS order_id,
   opa.chain_id AS chain_id,
   opa.asset_id AS asset_id,
@@ -25,7 +27,7 @@ SELECT
   COALESCE(opo.request_json->>'expected_amount', oes.amount_in, '1') AS min_amount,
   '115792089237316195423570985008687907853269984665640564039457584007913129639935' AS max_amount,
   COALESCE(opo.request_json->>'expected_amount', oes.amount_in, '1') AS required_amount,
-  COALESCE(opa.expires_at, ro.action_timeout_at, opa.created_at + INTERVAL '15 months') AS deposit_deadline,
+  opa.created_at + INTERVAL '15 months' AS deposit_deadline,
   opa.created_at AS created_at,
   GREATEST(
     opa.updated_at,
@@ -36,15 +38,17 @@ SELECT
 FROM public.order_provider_addresses opa
 JOIN public.order_provider_operations opo ON opo.id = opa.provider_operation_id
 JOIN public.router_orders ro ON ro.id = opo.order_id
-LEFT JOIN public.order_execution_steps oes ON oes.id = opo.execution_step_id
+JOIN public.order_execution_steps oes ON oes.id = opo.execution_step_id
 WHERE opa.role = 'unit_deposit'
   AND opo.operation_type = 'unit_deposit'
   AND opo.status IN ('submitted', 'waiting_external')
+  AND oes.status IN ('running', 'waiting')
   AND opa.created_at >= $1
 UNION ALL
 SELECT
   'funding_vault' AS watch_target,
   dv.id::text AS watch_id,
+  NULL::text AS execution_step_id,
   cv.order_id::text AS order_id,
   cv.chain_id AS chain_id,
   cv.asset_id AS asset_id,
@@ -87,6 +91,7 @@ const TARGETED_WATCH_QUERY: &str = r#"
 SELECT
   'provider_operation' AS watch_target,
   opo.id::text AS watch_id,
+  opo.execution_step_id::text AS execution_step_id,
   opo.order_id::text AS order_id,
   opa.chain_id AS chain_id,
   opa.asset_id AS asset_id,
@@ -94,7 +99,7 @@ SELECT
   COALESCE(opo.request_json->>'expected_amount', oes.amount_in, '1') AS min_amount,
   '115792089237316195423570985008687907853269984665640564039457584007913129639935' AS max_amount,
   COALESCE(opo.request_json->>'expected_amount', oes.amount_in, '1') AS required_amount,
-  COALESCE(opa.expires_at, ro.action_timeout_at, opa.created_at + INTERVAL '15 months') AS deposit_deadline,
+  opa.created_at + INTERVAL '15 months' AS deposit_deadline,
   opa.created_at AS created_at,
   GREATEST(
     opa.updated_at,
@@ -105,16 +110,18 @@ SELECT
 FROM public.order_provider_addresses opa
 JOIN public.order_provider_operations opo ON opo.id = opa.provider_operation_id
 JOIN public.router_orders ro ON ro.id = opo.order_id
-LEFT JOIN public.order_execution_steps oes ON oes.id = opo.execution_step_id
+JOIN public.order_execution_steps oes ON oes.id = opo.execution_step_id
 WHERE opo.id = $1::uuid
   AND opa.role = 'unit_deposit'
   AND opo.operation_type = 'unit_deposit'
   AND opo.status IN ('submitted', 'waiting_external')
+  AND oes.status IN ('running', 'waiting')
   AND opa.created_at >= $2
 UNION ALL
 SELECT
   'funding_vault' AS watch_target,
   dv.id::text AS watch_id,
+  NULL::text AS execution_step_id,
   cv.order_id::text AS order_id,
   cv.chain_id AS chain_id,
   cv.asset_id AS asset_id,
@@ -157,6 +164,7 @@ const ORDER_WATCH_QUERY: &str = r#"
 SELECT
   'provider_operation' AS watch_target,
   opo.id::text AS watch_id,
+  opo.execution_step_id::text AS execution_step_id,
   opo.order_id::text AS order_id,
   opa.chain_id AS chain_id,
   opa.asset_id AS asset_id,
@@ -164,7 +172,7 @@ SELECT
   COALESCE(opo.request_json->>'expected_amount', oes.amount_in, '1') AS min_amount,
   '115792089237316195423570985008687907853269984665640564039457584007913129639935' AS max_amount,
   COALESCE(opo.request_json->>'expected_amount', oes.amount_in, '1') AS required_amount,
-  COALESCE(opa.expires_at, ro.action_timeout_at, opa.created_at + INTERVAL '15 months') AS deposit_deadline,
+  opa.created_at + INTERVAL '15 months' AS deposit_deadline,
   opa.created_at AS created_at,
   GREATEST(
     opa.updated_at,
@@ -175,16 +183,18 @@ SELECT
 FROM public.order_provider_addresses opa
 JOIN public.order_provider_operations opo ON opo.id = opa.provider_operation_id
 JOIN public.router_orders ro ON ro.id = opo.order_id
-LEFT JOIN public.order_execution_steps oes ON oes.id = opo.execution_step_id
+JOIN public.order_execution_steps oes ON oes.id = opo.execution_step_id
 WHERE opo.order_id = $1::uuid
   AND opa.role = 'unit_deposit'
   AND opo.operation_type = 'unit_deposit'
   AND opo.status IN ('submitted', 'waiting_external')
+  AND oes.status IN ('running', 'waiting')
   AND opa.created_at >= $2
 UNION ALL
 SELECT
   'funding_vault' AS watch_target,
   dv.id::text AS watch_id,
+  NULL::text AS execution_step_id,
   cv.order_id::text AS order_id,
   cv.chain_id AS chain_id,
   cv.asset_id AS asset_id,
@@ -261,6 +271,7 @@ impl WatchTarget {
 pub struct WatchEntry {
     pub watch_target: WatchTarget,
     pub watch_id: Uuid,
+    pub execution_step_id: Option<WorkflowStepId>,
     pub order_id: Uuid,
     pub source_chain: ChainType,
     pub source_token: TokenIdentifier,
@@ -642,6 +653,36 @@ fn parse_watch_row(row: sqlx_postgres::PgRow) -> Result<WatchEntry> {
             message: format!("watch {watch_id} had unsupported watch_target {watch_target_raw}"),
         }
     })?;
+    let execution_step_id_raw: Option<String> =
+        row.try_get("execution_step_id")
+            .map_err(|_| crate::error::Error::InvalidWatchRow {
+                message: format!("watch {watch_id} missing execution_step_id"),
+            })?;
+    let execution_step_id = match (watch_target, execution_step_id_raw) {
+        (WatchTarget::ProviderOperation, Some(value)) => {
+            let step_id = Uuid::parse_str(&value).map_err(|_| {
+                crate::error::Error::InvalidWatchRow {
+                    message: format!(
+                        "provider-operation watch {watch_id} execution_step_id {value} was not a valid UUID"
+                    ),
+                }
+            })?;
+            Some(WorkflowStepId::from(step_id))
+        }
+        (WatchTarget::ProviderOperation, None) => {
+            return Err(crate::error::Error::InvalidWatchRow {
+                message: format!("provider-operation watch {watch_id} missing execution_step_id"),
+            });
+        }
+        (WatchTarget::FundingVault, Some(value)) => {
+            return Err(crate::error::Error::InvalidWatchRow {
+                message: format!(
+                    "funding-vault watch {watch_id} unexpectedly had execution_step_id {value}"
+                ),
+            });
+        }
+        (WatchTarget::FundingVault, None) => None,
+    };
 
     let chain_id_raw: String =
         row.try_get("chain_id")
@@ -694,6 +735,7 @@ fn parse_watch_row(row: sqlx_postgres::PgRow) -> Result<WatchEntry> {
     Ok(WatchEntry {
         watch_target,
         watch_id,
+        execution_step_id,
         order_id,
         source_chain,
         source_token: source_token.normalize(),
@@ -821,13 +863,14 @@ fn deposit_vault_watch_cutoff() -> Result<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_watch_address, parse_positive_watch_amount,
+        is_watch_active, normalize_watch_address, parse_positive_watch_amount,
         token_identifier_from_router_asset_id, validate_watch_amount_bounds, WatchEntry,
-        WatchStore, WatchTarget,
+        WatchStore, WatchTarget, FULL_WATCH_QUERY, ORDER_WATCH_QUERY, TARGETED_WATCH_QUERY,
     };
     use alloy::primitives::U256;
     use chrono::Duration;
     use router_primitives::{ChainType, TokenIdentifier};
+    use router_temporal::WorkflowStepId;
     use uuid::Uuid;
 
     fn watch_entry(
@@ -839,6 +882,7 @@ mod tests {
         WatchEntry {
             watch_target: WatchTarget::ProviderOperation,
             watch_id,
+            execution_step_id: Some(WorkflowStepId::from(watch_id)),
             order_id: watch_id,
             source_chain,
             source_token: match source_chain {
@@ -857,6 +901,45 @@ mod tests {
             deposit_deadline,
             created_at: utc::now(),
             updated_at: utc::now(),
+        }
+    }
+
+    fn funding_vault_watch_entry(
+        watch_id: Uuid,
+        source_chain: ChainType,
+        address: &str,
+        deposit_deadline: chrono::DateTime<chrono::Utc>,
+    ) -> WatchEntry {
+        WatchEntry {
+            watch_target: WatchTarget::FundingVault,
+            execution_step_id: None,
+            ..watch_entry(watch_id, source_chain, address, deposit_deadline)
+        }
+    }
+
+    #[test]
+    fn provider_operation_deposit_watch_queries_select_step_and_filter_terminal_steps() {
+        for query in [FULL_WATCH_QUERY, TARGETED_WATCH_QUERY, ORDER_WATCH_QUERY] {
+            assert!(query.contains("opo.execution_step_id::text AS execution_step_id"));
+            assert!(query.contains("JOIN public.order_execution_steps oes"));
+            assert!(query.contains("oes.status IN ('running', 'waiting')"));
+        }
+    }
+
+    #[test]
+    fn provider_operation_deposit_watch_queries_use_provider_operation_lifetime_for_deadline() {
+        let operation_expiry_column = ["opa", ".expires_at"].concat();
+        for query in [FULL_WATCH_QUERY, TARGETED_WATCH_QUERY, ORDER_WATCH_QUERY] {
+            assert!(query.contains("opa.created_at + INTERVAL '15 months' AS deposit_deadline"));
+            assert!(!query.contains("ro.action_timeout_at"));
+            assert!(!query.contains(&operation_expiry_column));
+        }
+    }
+
+    #[test]
+    fn funding_vault_watch_queries_use_cancel_after_for_deadline() {
+        for query in [FULL_WATCH_QUERY, TARGETED_WATCH_QUERY, ORDER_WATCH_QUERY] {
+            assert!(query.contains("dv.cancel_after AS deposit_deadline"));
         }
     }
 
@@ -1260,6 +1343,94 @@ mod tests {
 
         assert_eq!(pruned, 1);
         assert_eq!(store.len().await, 1);
+        assert!(store.snapshot_for_chain(ChainType::Base).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn prune_expired_keeps_provider_watch_when_operation_expired_but_order_alive() {
+        let store = WatchStore::default();
+        let now = utc::now();
+        let operation_expires_at = now - Duration::minutes(1);
+        let provider_operation_deadline = now + Duration::minutes(5);
+        assert!(operation_expires_at < now);
+
+        store
+            .replace_all(vec![watch_entry(
+                Uuid::now_v7(),
+                ChainType::Base,
+                "0x0000000000000000000000000000000000000004",
+                provider_operation_deadline,
+            )])
+            .await;
+
+        let pruned = store.prune_expired().await;
+
+        assert_eq!(pruned, 0);
+        assert_eq!(store.len().await, 1);
+        assert_eq!(store.snapshot_for_chain(ChainType::Base).await.len(), 1);
+    }
+
+    #[test]
+    fn provider_operation_watch_survives_action_timeout() {
+        let now = utc::now();
+        let action_timeout_at = now - Duration::minutes(1);
+        let created_at = now - Duration::minutes(10);
+        let provider_operation_deadline = created_at
+            .checked_add_months(chrono::Months::new(15))
+            .expect("provider-operation TTL should be representable");
+        assert!(action_timeout_at < now);
+        assert!(provider_operation_deadline > now);
+
+        let mut watch = watch_entry(
+            Uuid::now_v7(),
+            ChainType::Base,
+            "0x0000000000000000000000000000000000000005",
+            provider_operation_deadline,
+        );
+        watch.created_at = created_at;
+
+        assert!(is_watch_active(&watch, now));
+    }
+
+    #[tokio::test]
+    async fn funding_vault_watch_respects_cancel_after() {
+        let store = WatchStore::default();
+        let now = utc::now();
+
+        store
+            .replace_all(vec![funding_vault_watch_entry(
+                Uuid::now_v7(),
+                ChainType::Base,
+                "0x0000000000000000000000000000000000000006",
+                now - Duration::minutes(1),
+            )])
+            .await;
+
+        let pruned = store.prune_expired().await;
+
+        assert_eq!(pruned, 1);
+        assert_eq!(store.len().await, 0);
+        assert!(store.snapshot_for_chain(ChainType::Base).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn prune_expired_removes_provider_watch_after_provider_deadline() {
+        let store = WatchStore::default();
+        let now = utc::now();
+
+        store
+            .replace_all(vec![watch_entry(
+                Uuid::now_v7(),
+                ChainType::Base,
+                "0x0000000000000000000000000000000000000007",
+                now - Duration::minutes(1),
+            )])
+            .await;
+
+        let pruned = store.prune_expired().await;
+
+        assert_eq!(pruned, 1);
+        assert_eq!(store.len().await, 0);
         assert!(store.snapshot_for_chain(ChainType::Base).await.is_empty());
     }
 }

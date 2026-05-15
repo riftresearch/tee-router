@@ -16,9 +16,6 @@ pub fn init_tracing(
         observability::init_otlp_from_env(service_name).map_err(|err| Error::Generic {
             source: Whatever::without_source(err),
         })?;
-    let otlp_trace_layer = otlp_telemetry
-        .trace_layer(service_name)
-        .map(|layer| layer.with_filter(EnvFilter::new(&args.log_level)));
     let otlp_log_layer = otlp_telemetry
         .log_layer()
         .map(|layer| layer.with_filter(EnvFilter::new(&args.log_level)));
@@ -40,7 +37,6 @@ pub fn init_tracing(
                     Ok((loki_layer, task)) => {
                         let filtered_loki_layer = loki_layer.with_filter(loki_env_filter);
                         tracing_subscriber::registry()
-                            .with(otlp_trace_layer)
                             .with(otlp_log_layer)
                             .with(fmt_layer)
                             .with(filtered_loki_layer)
@@ -59,7 +55,6 @@ pub fn init_tracing(
                             err
                         );
                         tracing_subscriber::registry()
-                            .with(otlp_trace_layer)
                             .with(otlp_log_layer)
                             .with(fmt_layer)
                             .init();
@@ -70,7 +65,6 @@ pub fn init_tracing(
             Err(err) => {
                 eprintln!("Invalid LOKI_URL: {}, continuing without Loki", err);
                 tracing_subscriber::registry()
-                    .with(otlp_trace_layer)
                     .with(otlp_log_layer)
                     .with(fmt_layer)
                     .init();
@@ -79,7 +73,6 @@ pub fn init_tracing(
         }
     } else {
         tracing_subscriber::registry()
-            .with(otlp_trace_layer)
             .with(otlp_log_layer)
             .with(fmt_layer)
             .init();
@@ -90,9 +83,9 @@ pub fn init_tracing(
         tracing::info!("Loki logging not configured (set LOKI_URL to enable)");
     }
     if otlp_telemetry.is_enabled() {
-        tracing::info!("OpenTelemetry OTLP logs/traces enabled");
+        tracing::info!("OpenTelemetry OTLP logs enabled");
     } else {
-        tracing::info!("OpenTelemetry OTLP logs/traces not configured");
+        tracing::info!("OpenTelemetry OTLP logs not configured");
     }
 
     observability::init_prometheus_metrics_from_env(service_name).map_err(|err| {

@@ -59,6 +59,34 @@ impl From<sqlx_core::migrate::MigrateError> for RouterServerError {
     }
 }
 
+impl From<router_core::error::RouterCoreError> for RouterServerError {
+    fn from(err: router_core::error::RouterCoreError) -> Self {
+        match err {
+            router_core::error::RouterCoreError::DatabaseQuery { source } => {
+                Self::DatabaseQuery { source }
+            }
+            router_core::error::RouterCoreError::NotFound => Self::NotFound,
+            router_core::error::RouterCoreError::InvalidData { message } => {
+                Self::InvalidData { message }
+            }
+            router_core::error::RouterCoreError::Migration { source } => Self::Migration { source },
+            router_core::error::RouterCoreError::Validation { message } => {
+                Self::Validation { message }
+            }
+            router_core::error::RouterCoreError::Conflict { message } => Self::Conflict { message },
+            router_core::error::RouterCoreError::Unauthorized { message } => {
+                Self::Unauthorized { message }
+            }
+            router_core::error::RouterCoreError::Forbidden { message } => {
+                Self::Forbidden { message }
+            }
+            router_core::error::RouterCoreError::NoRoute { message } => Self::NoRoute { message },
+            router_core::error::RouterCoreError::NotReady { message } => Self::NotReady { message },
+            router_core::error::RouterCoreError::Internal { message } => Self::Internal { message },
+        }
+    }
+}
+
 impl IntoResponse for RouterServerError {
     fn into_response(self) -> Response {
         let status = self.status_code();
@@ -86,7 +114,7 @@ impl RouterServerError {
             Self::Validation { .. } => StatusCode::BAD_REQUEST,
             Self::Conflict { .. } => StatusCode::CONFLICT,
             Self::NoRoute { .. } => StatusCode::UNPROCESSABLE_ENTITY,
-            Self::NotReady { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            Self::NotReady { .. } => StatusCode::TOO_EARLY,
             Self::InvalidData { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::DatabaseQuery { .. } | Self::Migration { .. } | Self::Internal { .. } => {
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -280,6 +308,20 @@ mod tests {
 
         assert_eq!(error.status_code(), StatusCode::BAD_REQUEST);
         assert_eq!(error.public_message(), "Validation error: bad input");
+    }
+
+    #[test]
+    fn not_ready_is_retryable_without_being_a_server_error() {
+        let error = RouterServerError::NotReady {
+            message: "backend observation is still catching up".to_string(),
+        };
+
+        assert_eq!(error.status_code(), StatusCode::TOO_EARLY);
+        assert!(!error.status_code().is_server_error());
+        assert_eq!(
+            error.public_message(),
+            "Not ready: backend observation is still catching up"
+        );
     }
 
     #[test]

@@ -143,7 +143,7 @@ impl RouterCdcRepository {
             info!(
                 slot_name = %self.config.slot_name,
                 publication = %self.config.publication_name,
-                "Sauron CDC logical replication slot already exists"
+                "Sauron CDC decoding slot already exists"
             );
             return Ok(());
         }
@@ -212,7 +212,7 @@ async fn create_cdc_slot(pool: &PgPool, slot_name: &str) -> Result<()> {
 
     info!(
         slot_name = %slot_name,
-        "Created Sauron CDC logical replication slot"
+        "Created Sauron CDC decoding slot"
     );
     Ok(())
 }
@@ -221,7 +221,7 @@ async fn recreate_cdc_slot(pool: &PgPool, slot_name: &str, reason: &str) -> Resu
     warn!(
         slot_name = %slot_name,
         reason = %reason,
-        "Sauron CDC logical replication slot is invalid; recreating"
+        "Sauron CDC decoding slot is invalid; recreating"
     );
     sqlx_core::query::query(
         r#"

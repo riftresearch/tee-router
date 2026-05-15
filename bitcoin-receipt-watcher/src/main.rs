@@ -1,0 +1,59 @@
+use bitcoin_receipt_watcher::{
+    build_router, AppState, Config, Error, PendingWatches, ReceiptPubSub, Watcher,
+};
+use clap::Parser;
+use metrics_exporter_prometheus::PrometheusBuilder;
+use snafu::ResultExt;
+use tokio::net::TcpListener;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_tracing();
+
+    let config = Config::parse();
+    config.validate()?;
+
+    let metrics = PrometheusBuilder::new()
+        .add_global_label("service", "bitcoin-receipt-watcher")
+        .add_global_label("chain", config.chain.clone())
+        .install_recorder()
+        .map_err(|source| Error::Metrics {
+            message: source.to_string(),
+        })?;
+
+    let pending = PendingWatches::new(config.chain.clone(), config.max_pending);
+    let pubsub = ReceiptPubSub::new(config.max_subscriber_lag);
+    let watcher = Watcher::new(&config, pending.clone(), pubsub.clone()).await?;
+    let rpc = watcher.rpc_client();
+    watcher.clone().run().await;
+
+    let app = build_router(AppState {
+        chain: config.chain.clone(),
+        pending,
+        pubsub,
+        rpc,
+        metrics: Some(metrics),
+    });
+
+    let listener = TcpListener::bind(config.bind)
+        .await
+        .context(bitcoin_receipt_watcher::error::HttpServerSnafu)?;
+    tracing::info!(
+        bind = %config.bind,
+        chain = config.chain,
+        "Bitcoin receipt watcher listening"
+    );
+    axum::serve(listener, app)
+        .await
+        .context(bitcoin_receipt_watcher::error::HttpServerSnafu)?;
+    Ok(())
+}
+
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+}

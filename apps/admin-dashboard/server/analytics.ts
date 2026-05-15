@@ -25,7 +25,7 @@ import {
 } from './numeric'
 import { logError } from './logging'
 
-export type VolumeBucketSize = 'minute' | 'hour' | 'day'
+export type VolumeBucketSize = 'five_minute' | 'minute' | 'hour' | 'day'
 export type VolumeOrderTypeFilter = 'all' | OrderTypeFilter
 
 export type VolumeBucketRow = {
@@ -111,8 +111,8 @@ const ACTIVE_ORDER_STATUSES = new Set([
   'refunding'
 ])
 const NEEDS_ATTENTION_ORDER_STATUSES = new Set([
-  'failed',
-  'expired',
+  'refund_required',
+  'refunding',
   'manual_intervention_required',
   'refund_manual_intervention_required'
 ])
@@ -283,6 +283,56 @@ export class VolumeAnalyticsRuntime {
     orderType: VolumeOrderTypeFilter
   }): Promise<VolumeBucketRow[]> {
     await this.ready
+    if (bucketSize === 'five_minute') {
+      const result =
+        orderType === 'all'
+          ? await this.pool.query<VolumeBucketDbRow>(
+              `
+              SELECT
+                (
+                  date_trunc('hour', bucket_start)
+                  + floor(date_part('minute', bucket_start) / 5) * interval '5 minutes'
+                ) AS bucket_start,
+                SUM(volume_usd_micro)::text AS volume_usd_micro,
+                SUM(order_count)::text AS order_count
+              FROM admin_volume_buckets
+              WHERE bucket_size = 'minute'
+                AND bucket_start < $2
+                AND bucket_start + interval '1 minute' > $1
+              GROUP BY 1
+              ORDER BY 1 ASC
+              `,
+              [from, to]
+            )
+          : await this.pool.query<VolumeBucketDbRow>(
+              `
+              SELECT
+                (
+                  date_trunc('hour', bucket_start)
+                  + floor(date_part('minute', bucket_start) / 5) * interval '5 minutes'
+                ) AS bucket_start,
+                SUM(volume_usd_micro)::text AS volume_usd_micro,
+                SUM(order_count)::text AS order_count
+              FROM admin_volume_buckets
+              WHERE bucket_size = 'minute'
+                AND order_type = $1
+                AND bucket_start < $3
+                AND bucket_start + interval '1 minute' > $2
+              GROUP BY 1
+              ORDER BY 1 ASC
+              `,
+              [orderType, from, to]
+            )
+
+      return result.rows.map((row) => ({
+        bucketStart: row.bucket_start.toISOString(),
+        bucketSize,
+        orderType,
+        volumeUsdMicro: row.volume_usd_micro,
+        orderCount: parseNonNegativeSafeInteger(row.order_count, 'volume bucket order_count')
+      }))
+    }
+
     const result =
       orderType === 'all'
         ? await this.pool.query<VolumeBucketDbRow>(
@@ -293,8 +343,12 @@ export class VolumeAnalyticsRuntime {
               SUM(order_count)::text AS order_count
             FROM admin_volume_buckets
             WHERE bucket_size = $1
-              AND bucket_start >= $2
               AND bucket_start < $3
+              AND bucket_start + CASE
+                WHEN bucket_size = 'minute' THEN interval '1 minute'
+                WHEN bucket_size = 'hour' THEN interval '1 hour'
+                ELSE interval '1 day'
+              END > $2
             GROUP BY bucket_start
             ORDER BY bucket_start ASC
             `,
@@ -309,8 +363,12 @@ export class VolumeAnalyticsRuntime {
             FROM admin_volume_buckets
             WHERE bucket_size = $1
               AND order_type = $2
-              AND bucket_start >= $3
               AND bucket_start < $4
+              AND bucket_start + CASE
+                WHEN bucket_size = 'minute' THEN interval '1 minute'
+                WHEN bucket_size = 'hour' THEN interval '1 hour'
+                ELSE interval '1 day'
+              END > $3
             GROUP BY bucket_start
             ORDER BY bucket_start ASC
             `,
@@ -1633,7 +1691,7 @@ function valuationForAmount(
   const amounts = asRecord(valuation?.amounts)
   if (!amounts) return undefined
 
-  const priced = asRecord(amounts.actualInput)
+  const priced = asRecord(amounts.actualInput) ?? asRecord(amounts.plannedInput)
   if (!priced || !sameAsset(priced.asset, asset)) return undefined
   const exact = stringField(priced, 'raw') === rawAmount ? priced : undefined
 
@@ -1665,6 +1723,7 @@ function bucketStart(value: Date, bucketSize: VolumeBucketSize) {
 
 function bucketEnd(value: Date, bucketSize: VolumeBucketSize) {
   const end = new Date(value)
+  if (bucketSize === 'five_minute') end.setUTCMinutes(end.getUTCMinutes() + 5)
   if (bucketSize === 'minute') end.setUTCMinutes(end.getUTCMinutes() + 1)
   if (bucketSize === 'hour') end.setUTCHours(end.getUTCHours() + 1)
   if (bucketSize === 'day') end.setUTCDate(end.getUTCDate() + 1)

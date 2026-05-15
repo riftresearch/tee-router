@@ -9,7 +9,8 @@ This document tracks the remaining gap between the mocked router integration tes
 - The worker has a funding detector that can move a vault from `pending_funding` to `funded` after observing enough on-chain balance.
 - Market-order planning and execution are modeled as provider-specific steps.
 - Mock Across, Unit, and Hyperliquid services are stateful and exercise the provider trait boundary.
-- The ignored live harness in `bin/router-server/tests/live_market_order_e2e.rs` talks to real providers directly, but it is not yet a full router API plus router worker system test.
+- Provider-specific live tests are tracked in [`docs/live-provider-differential-tests.md`](live-provider-differential-tests.md).
+- There is no composed direct-provider market-order live harness; the next composed live-money test should drive the router API and worker.
 
 ## Not Yet Ready For Real Funds
 
@@ -19,7 +20,7 @@ The execution path also does not yet perform all required custody-side chain act
 
 - Unit deposit execution can request or model a Unit deposit address, but the router does not yet sign and send the source vault funds to that Unit deposit address in the production execution path.
 - Across bridge execution can model an Across step, but the router does not yet construct/sign/send the real Across transaction from the router-derived source vault.
-- Hyperliquid execution is represented in mocks and in the direct live harness helper, but the production provider adapter is not yet wired to the real Hyperliquid SDK/API.
+- Hyperliquid execution is represented in mocks and provider/client live lifecycle tests, but the production provider adapter is not yet wired to the real Hyperliquid SDK/API.
 - EVM action gas funding is incomplete for live actions. The existing paymaster actor handles EVM token refund gas; it does not yet generally fund EVM vaults for provider actions such as Across deposits or native Unit deposits.
 - Across-to-Unit quote/execution needs concrete recipient and refund custody addresses. The current quote lifecycle creates orders and funding vaults after quote acceptance, so live Across executable quote construction needs a clear pre-execution custody-address strategy.
 

@@ -1,24 +1,19 @@
 use crate::{
     api::{
         CreateOrderCancellationRequest, CreateOrderRequest, CreateQuoteRequest, CreateVaultRequest,
-        DetectorHintEnvelope, DetectorHintRequest, DetectorHintTarget, ProviderHealthEnvelope,
-        ProviderOperationHintEnvelope, ProviderOperationHintRequest,
-        ProviderOperationObserveRequest, ProviderPolicyEnvelope, ProviderPolicyListEnvelope,
+        DetectorHintEnvelope, DetectorHintRequest, DetectorHintTarget,
+        ManualInterventionActionEnvelope, ManualInterventionActionRequest,
+        ManualInterventionOrderEnvelope, ManualInterventionOrdersEnvelope,
+        ManualTriggerRefundRequest, ProviderHealthEnvelope, ProviderOperationHintEnvelope,
+        ProviderOperationHintRequest, ProviderPolicyEnvelope, ProviderPolicyListEnvelope,
         UpdateProviderPolicyRequest, VaultFundingHintEnvelope, VaultFundingHintRequest,
         MAX_HINT_IDEMPOTENCY_KEY_LEN,
     },
     app::{initialize_components, PaymasterMode, RouterComponents},
     error::{RouterServerError, RouterServerResult},
-    models::{
-        DepositRequirements, DepositVault, DepositVaultEnvelope, DepositVaultFundingHint,
-        OrderProviderOperationHint, ProviderOperationHintStatus, RouterOrder, RouterOrderEnvelope,
-        RouterOrderQuoteEnvelope, StatusResponse, VaultAction,
-    },
-    protocol::{backend_chain_for_id, supported_chain_ids, ChainId},
     services::{
-        action_providers::ProviderOperationObservation, asset_registry::ProviderId,
-        AddressScreeningPurpose, AddressScreeningService, OrderExecutionManager, OrderManager,
-        ProviderHealthService, ProviderPolicyService, VaultManager,
+        AddressScreeningPurpose, AddressScreeningService, OrderManager, ProviderHealthService,
+        ProviderPolicyService, VaultManager,
     },
     Error, Result, RouterServerArgs,
 };
@@ -27,7 +22,8 @@ use axum::{
     body::Body,
     extract::{
         rejection::{JsonRejection, PathRejection},
-        DefaultBodyLimit, FromRequest, FromRequestParts, MatchedPath, Path as AxumPath, State,
+        DefaultBodyLimit, FromRequest, FromRequestParts, MatchedPath, Path as AxumPath, Query,
+        State,
     },
     http::{header, request::Parts, HeaderMap, Request, StatusCode},
     middleware::{self, Next},
@@ -37,6 +33,23 @@ use axum::{
 };
 use chains::ChainRegistry;
 use chrono::Utc;
+use router_core::{
+    models::{
+        DepositRequirements, DepositVault, DepositVaultEnvelope, DepositVaultFundingHint,
+        OrderExecutionAttempt, OrderExecutionAttemptKind, OrderProviderOperation,
+        OrderProviderOperationHint, ProviderOperationHintStatus, ProviderOperationType,
+        RouterOrder, RouterOrderEnvelope, RouterOrderQuoteEnvelope, StatusResponse, VaultAction,
+    },
+    protocol::{backend_chain_for_id, supported_chain_ids, ChainId},
+    services::asset_registry::ProviderId,
+};
+use router_temporal::{
+    boxed as boxed_temporal_error, AcknowledgeUnrecoverableSignal, ManualReleaseSignal,
+    ManualTriggerRefundSignal, OrderWorkflowClient, ProviderHintKind, ProviderKind,
+    ProviderOperationHintEvidence, ProviderOperationHintSignal, RouterTemporalError,
+    TemporalConnection, UnitDepositHintEvidence, WorkflowAttemptId, WorkflowHintId,
+    WorkflowOrderId, WorkflowProviderOperationId, WorkflowStepId,
+};
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use snafu::{FromString, ResultExt, Whatever};
@@ -45,11 +58,8 @@ use std::{
     sync::Arc,
     time::Instant,
 };
-use tower_http::{
-    cors::{AllowOrigin, CorsLayer},
-    trace::{DefaultMakeSpan, TraceLayer},
-};
-use tracing::{info, warn, Level};
+use tower_http::cors::{AllowOrigin, CorsLayer};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 const MIN_INTERNAL_API_KEY_LEN: usize = 32;
@@ -63,6 +73,8 @@ const MAX_HINT_EVIDENCE_JSON_BYTES: usize = 16 * 1024;
 pub const MAX_ROUTER_JSON_BODY_BYTES: usize = 256 * 1024;
 const _: () = assert!(MAX_ROUTER_JSON_BODY_BYTES >= MAX_HINT_EVIDENCE_JSON_BYTES * 2);
 const _: () = assert!(MAX_ROUTER_JSON_BODY_BYTES <= 1024 * 1024);
+const DEFAULT_MANUAL_INTERVENTION_ORDER_LIMIT: i64 = 50;
+const MAX_MANUAL_INTERVENTION_ORDER_LIMIT: i64 = 500;
 
 struct RouterJson<T>(T);
 struct RouterPath<T>(T);
@@ -158,14 +170,14 @@ impl AdminApiAuth {
 
 #[derive(Clone)]
 pub struct AppState {
-    pub db: crate::db::Database,
+    pub db: router_core::db::Database,
     pub vault_manager: Arc<VaultManager>,
     pub order_manager: Arc<OrderManager>,
-    pub order_execution_manager: Arc<OrderExecutionManager>,
     pub provider_health: Arc<ProviderHealthService>,
     pub provider_policies: Arc<ProviderPolicyService>,
     pub address_screener: Option<Arc<AddressScreeningService>>,
     pub chain_registry: Arc<ChainRegistry>,
+    pub order_workflow_client: Option<Arc<OrderWorkflowClient>>,
     pub internal_api_auth: Option<InternalApiAuth>,
     pub gateway_api_auth: Option<GatewayApiAuth>,
     pub admin_api_auth: Option<AdminApiAuth>,
@@ -180,15 +192,30 @@ pub async fn run_api(args: RouterServerArgs) -> Result<()> {
 
 async fn serve_api(args: RouterServerArgs, components: RouterComponents) -> Result<()> {
     let addr = SocketAddr::from((args.host, args.port));
+    let order_workflow_client = Arc::new(
+        OrderWorkflowClient::connect(
+            &TemporalConnection {
+                temporal_address: args.temporal_address.clone(),
+                namespace: args.temporal_namespace.clone(),
+            },
+            args.temporal_task_queue.clone(),
+        )
+        .await
+        .map_err(|source| Error::Generic {
+            source: Whatever::without_source(format!(
+                "failed to initialize Temporal order workflow client: {source}"
+            )),
+        })?,
+    );
     let state = AppState {
         db: components.db,
         vault_manager: components.vault_manager,
         order_manager: components.order_manager,
-        order_execution_manager: components.order_execution_manager,
         provider_health: components.provider_health,
         provider_policies: components.provider_policies,
         address_screener: components.address_screener,
         chain_registry: components.chain_registry,
+        order_workflow_client: Some(order_workflow_client),
         internal_api_auth: InternalApiAuth::from_args(&args),
         gateway_api_auth: GatewayApiAuth::from_args(&args),
         admin_api_auth: AdminApiAuth::from_args(&args),
@@ -228,10 +255,6 @@ pub fn build_api_router(state: AppState, cors_domain: Option<String>) -> Router 
             post(record_vault_funding_hint),
         )
         .route(
-            "/api/v1/provider-operations/:id/observe",
-            post(observe_provider_operation),
-        )
-        .route(
             "/internal/v1/provider-policies",
             get(list_provider_policies),
         )
@@ -239,16 +262,29 @@ pub fn build_api_router(state: AppState, cors_domain: Option<String>) -> Router 
             "/internal/v1/provider-policies/:provider",
             put(update_provider_policy),
         )
+        .route(
+            "/internal/v1/orders/manual-interventions",
+            get(list_manual_intervention_orders),
+        )
+        .route(
+            "/internal/v1/orders/:id/manual-intervention",
+            get(get_manual_intervention_order),
+        )
+        .route(
+            "/internal/v1/orders/:id/manual-intervention/release",
+            post(release_manual_intervention_order),
+        )
+        .route(
+            "/internal/v1/orders/:id/manual-intervention/trigger-refund",
+            post(trigger_manual_intervention_refund),
+        )
+        .route(
+            "/internal/v1/orders/:id/manual-intervention/acknowledge-unrecoverable",
+            post(acknowledge_manual_intervention_unrecoverable),
+        )
         .route("/internal/v1/orders/:id/flow", get(get_order_flow))
         .route("/api/v1/chains/:chain/tip", get(get_chain_tip))
         .with_state(state)
-        .layer(
-            TraceLayer::new_for_http().make_span_with(
-                DefaultMakeSpan::new()
-                    .level(Level::INFO)
-                    .include_headers(false),
-            ),
-        )
         .layer(DefaultBodyLimit::max(MAX_ROUTER_JSON_BODY_BYTES))
         .layer(middleware::from_fn(track_http_metrics));
 
@@ -444,15 +480,6 @@ async fn create_order(
         .order_manager
         .create_order_from_quote(request.clone())
         .await?;
-    let cancel_after = match &quote {
-        crate::models::RouterOrderQuote::MarketOrder(quote) => request
-            .cancel_after
-            .map(|requested_cancel_after| requested_cancel_after.min(quote.expires_at))
-            .unwrap_or(quote.expires_at),
-        crate::models::RouterOrderQuote::LimitOrder(_) => {
-            request.cancel_after.unwrap_or(order.action_timeout_at)
-        }
-    };
     if let Some(vault_id) = order.funding_vault_id {
         let vault = state.vault_manager.get_vault(vault_id).await?;
         ensure_recoverable_cancellation_secret(&vault, &cancellation.commitment)?;
@@ -467,7 +494,7 @@ async fn create_order(
         action: VaultAction::Null,
         recovery_address: request.refund_address,
         cancellation_commitment: cancellation.commitment,
-        cancel_after: Some(cancel_after),
+        cancel_after: None,
         metadata: request.metadata,
     };
     let vault = match state.vault_manager.create_vault(vault_request).await {
@@ -608,11 +635,15 @@ async fn record_detector_hint(
 ) -> RouterServerResult<Json<DetectorHintEnvelope>> {
     authorize_internal_api_request(&state, &headers)?;
     match request.target {
-        DetectorHintTarget::ProviderOperation { id } => {
+        DetectorHintTarget::ProviderOperation {
+            id,
+            execution_step_id,
+        } => {
             let hint = record_provider_operation_hint_inner(
                 state,
                 ProviderOperationHintRequest {
                     provider_operation_id: id,
+                    execution_step_id,
                     source: request.source,
                     hint_kind: request.hint_kind,
                     evidence: request.evidence,
@@ -654,16 +685,30 @@ async fn record_provider_operation_hint_inner(
     state: AppState,
     request: ProviderOperationHintRequest,
 ) -> RouterServerResult<OrderProviderOperationHint> {
-    let now = chrono::Utc::now();
+    let order_workflow_client =
+        state
+            .order_workflow_client
+            .as_ref()
+            .ok_or_else(|| RouterServerError::NotReady {
+                message: "Temporal order workflow client is not configured".to_string(),
+            })?;
+    let evidence = normalize_hint_evidence(request.evidence)?;
+    let operation = state
+        .db
+        .orders()
+        .get_provider_operation(request.provider_operation_id)
+        .await?;
+    let now = Utc::now();
     let hint = state
-        .order_execution_manager
-        .record_provider_operation_hint(OrderProviderOperationHint {
+        .db
+        .orders()
+        .create_provider_operation_hint(&OrderProviderOperationHint {
             id: Uuid::now_v7(),
             provider_operation_id: request.provider_operation_id,
             source: normalize_hint_source(request.source)?,
             hint_kind: request.hint_kind,
-            evidence: normalize_hint_evidence(request.evidence)?,
-            status: ProviderOperationHintStatus::Pending,
+            evidence,
+            status: ProviderOperationHintStatus::Processing,
             idempotency_key: normalize_hint_idempotency_key(request.idempotency_key)?,
             error: serde_json::json!({}),
             claimed_at: None,
@@ -672,7 +717,404 @@ async fn record_provider_operation_hint_inner(
             updated_at: now,
         })
         .await?;
-    Ok(hint)
+    record_provider_operation_hint_event(
+        &state,
+        operation.order_id,
+        &hint,
+        &operation,
+        "provider_operation.hint_recorded",
+    )
+    .await;
+
+    if hint.status != ProviderOperationHintStatus::Processing {
+        return Ok(hint);
+    }
+
+    let attempt = load_provider_operation_attempt(&state, &operation).await?;
+    let signal = provider_operation_hint_signal(&operation, request.execution_step_id, &hint)?;
+    match signal_provider_operation_hint(
+        order_workflow_client,
+        &attempt,
+        operation.order_id,
+        signal,
+    )
+    .await
+    {
+        Ok(()) => {
+            let completed = state
+                .db
+                .orders()
+                .complete_provider_operation_hint(
+                    hint.id,
+                    hint.claimed_at,
+                    ProviderOperationHintStatus::Processed,
+                    serde_json::json!({}),
+                    Utc::now(),
+                )
+                .await?;
+            record_provider_operation_hint_event(
+                &state,
+                operation.order_id,
+                &completed,
+                &operation,
+                "provider_operation.hint_signaled",
+            )
+            .await;
+            Ok(completed)
+        }
+        Err(RouterTemporalError::WorkflowSignalUnavailable {
+            workflow_id,
+            message,
+        }) => {
+            let ignored = state
+                .db
+                .orders()
+                .complete_provider_operation_hint(
+                    hint.id,
+                    hint.claimed_at,
+                    ProviderOperationHintStatus::Ignored,
+                    serde_json::json!({
+                        "reason": "workflow_unavailable",
+                        "workflow_id": workflow_id,
+                        "message": message,
+                    }),
+                    Utc::now(),
+                )
+                .await?;
+            record_provider_operation_hint_event(
+                &state,
+                operation.order_id,
+                &ignored,
+                &operation,
+                "provider_operation.hint_ignored_workflow_unavailable",
+            )
+            .await;
+            Ok(ignored)
+        }
+        Err(source) => {
+            let _ = state
+                .db
+                .orders()
+                .complete_provider_operation_hint(
+                    hint.id,
+                    hint.claimed_at,
+                    ProviderOperationHintStatus::Failed,
+                    serde_json::json!({
+                        "reason": "temporal_signal_failed",
+                        "error": source.to_string(),
+                    }),
+                    Utc::now(),
+                )
+                .await;
+            Err(RouterServerError::NotReady {
+                message: format!("failed to signal provider-operation hint workflow: {source}"),
+            })
+        }
+    }
+}
+
+async fn load_provider_operation_attempt(
+    state: &AppState,
+    operation: &OrderProviderOperation,
+) -> RouterServerResult<OrderExecutionAttempt> {
+    let Some(attempt_id) = operation.execution_attempt_id else {
+        return Err(RouterServerError::InvalidData {
+            message: format!(
+                "provider operation {} is not attached to an execution attempt",
+                operation.id
+            ),
+        });
+    };
+    Ok(state.db.orders().get_execution_attempt(attempt_id).await?)
+}
+
+fn provider_operation_hint_signal(
+    operation: &OrderProviderOperation,
+    requested_step_id: WorkflowStepId,
+    hint: &OrderProviderOperationHint,
+) -> RouterServerResult<ProviderOperationHintSignal> {
+    let (provider, hint_kind) =
+        provider_hint_shape_for_hint(operation.operation_type, hint.hint_kind);
+    let execution_step_id =
+        operation
+            .execution_step_id
+            .ok_or_else(|| RouterServerError::InvalidData {
+                message: format!(
+                    "provider operation {} is not attached to an execution step",
+                    operation.id
+                ),
+            })?;
+    if requested_step_id.inner() != execution_step_id {
+        return Err(RouterServerError::Validation {
+            message: format!(
+                "provider operation {} belongs to step {}, not requested step {}",
+                operation.id, execution_step_id, requested_step_id
+            ),
+        });
+    }
+    Ok(ProviderOperationHintSignal {
+        order_id: WorkflowOrderId::from(operation.order_id),
+        execution_step_id: requested_step_id,
+        hint_id: WorkflowHintId::from(hint.id),
+        provider_operation_id: Some(WorkflowProviderOperationId::from(operation.id)),
+        provider,
+        hint_kind,
+        provider_ref: operation.provider_ref.clone(),
+        evidence: provider_hint_evidence_for_signal(hint_kind, &hint.evidence)?,
+    })
+}
+
+fn provider_hint_shape_for_hint(
+    operation_type: ProviderOperationType,
+    hint_kind: router_core::models::ProviderOperationHintKind,
+) -> (ProviderKind, ProviderHintKind) {
+    match hint_kind {
+        router_core::models::ProviderOperationHintKind::PossibleProgress => {
+            provider_hint_shape_for_operation(operation_type)
+        }
+        router_core::models::ProviderOperationHintKind::BtcDepositObserved => {
+            (ProviderKind::Unit, ProviderHintKind::BtcDepositObserved)
+        }
+        router_core::models::ProviderOperationHintKind::AcrossDestinationFilled => (
+            ProviderKind::Bridge,
+            ProviderHintKind::AcrossDestinationFilled,
+        ),
+        router_core::models::ProviderOperationHintKind::CctpReceiveObserved => {
+            (ProviderKind::Bridge, ProviderHintKind::CctpReceiveObserved)
+        }
+        router_core::models::ProviderOperationHintKind::VeloraSwapSettled => {
+            (ProviderKind::Exchange, ProviderHintKind::VeloraSwapSettled)
+        }
+        router_core::models::ProviderOperationHintKind::HyperUnitDepositCredited => (
+            ProviderKind::Unit,
+            ProviderHintKind::HyperUnitDepositCredited,
+        ),
+        router_core::models::ProviderOperationHintKind::HyperUnitWithdrawalAcknowledged => (
+            ProviderKind::Unit,
+            ProviderHintKind::HyperUnitWithdrawalAcknowledged,
+        ),
+        router_core::models::ProviderOperationHintKind::HyperUnitWithdrawalSettled => (
+            ProviderKind::Unit,
+            ProviderHintKind::HyperUnitWithdrawalSettled,
+        ),
+        router_core::models::ProviderOperationHintKind::HlTradeFilled => {
+            (ProviderKind::Exchange, ProviderHintKind::HlTradeFilled)
+        }
+        router_core::models::ProviderOperationHintKind::HlTradeCanceled => {
+            (ProviderKind::Exchange, ProviderHintKind::HlTradeCanceled)
+        }
+        router_core::models::ProviderOperationHintKind::HlBridgeDepositObserved => (
+            ProviderKind::Bridge,
+            ProviderHintKind::HlBridgeDepositObserved,
+        ),
+        router_core::models::ProviderOperationHintKind::HlBridgeDepositCredited => (
+            ProviderKind::Bridge,
+            ProviderHintKind::HlBridgeDepositCredited,
+        ),
+        router_core::models::ProviderOperationHintKind::HlWithdrawalAcknowledged => (
+            ProviderKind::Bridge,
+            ProviderHintKind::HlWithdrawalAcknowledged,
+        ),
+        router_core::models::ProviderOperationHintKind::HlWithdrawalSettled => {
+            (ProviderKind::Bridge, ProviderHintKind::HlWithdrawalSettled)
+        }
+    }
+}
+
+fn provider_hint_shape_for_operation(
+    operation_type: ProviderOperationType,
+) -> (ProviderKind, ProviderHintKind) {
+    match operation_type {
+        ProviderOperationType::AcrossBridge => (ProviderKind::Bridge, ProviderHintKind::AcrossFill),
+        ProviderOperationType::CctpBridge => {
+            (ProviderKind::Bridge, ProviderHintKind::CctpAttestation)
+        }
+        ProviderOperationType::CctpReceive => {
+            (ProviderKind::Bridge, ProviderHintKind::CctpReceiveObserved)
+        }
+        ProviderOperationType::UnitDeposit => (ProviderKind::Unit, ProviderHintKind::UnitDeposit),
+        ProviderOperationType::HyperliquidTrade | ProviderOperationType::HyperliquidLimitOrder => {
+            (ProviderKind::Exchange, ProviderHintKind::HyperliquidTrade)
+        }
+        ProviderOperationType::UnitWithdrawal => {
+            (ProviderKind::Unit, ProviderHintKind::ProviderObservation)
+        }
+        ProviderOperationType::HyperliquidBridgeDeposit
+        | ProviderOperationType::HyperliquidBridgeWithdrawal => {
+            (ProviderKind::Bridge, ProviderHintKind::ProviderObservation)
+        }
+        ProviderOperationType::UniversalRouterSwap => {
+            (ProviderKind::Exchange, ProviderHintKind::VeloraSwapSettled)
+        }
+    }
+}
+
+fn provider_hint_evidence_for_signal(
+    hint_kind: ProviderHintKind,
+    evidence: &serde_json::Value,
+) -> RouterServerResult<Option<ProviderOperationHintEvidence>> {
+    match hint_kind {
+        ProviderHintKind::BtcDepositObserved => {
+            return typed_hint_evidence(evidence)
+                .map(|e| Some(ProviderOperationHintEvidence::BtcDepositObserved(e)));
+        }
+        ProviderHintKind::HyperUnitDepositCredited => {
+            return typed_hint_evidence(evidence)
+                .map(|e| Some(ProviderOperationHintEvidence::HyperUnitDepositCredited(e)));
+        }
+        ProviderHintKind::HyperUnitWithdrawalAcknowledged => {
+            return typed_hint_evidence(evidence)
+                .map(|e| Some(ProviderOperationHintEvidence::HyperUnitWithdrawalAcknowledged(e)));
+        }
+        ProviderHintKind::HyperUnitWithdrawalSettled => {
+            return typed_hint_evidence(evidence)
+                .map(|e| Some(ProviderOperationHintEvidence::HyperUnitWithdrawalSettled(e)));
+        }
+        ProviderHintKind::HlTradeFilled => {
+            return typed_hint_evidence(evidence)
+                .map(|e| Some(ProviderOperationHintEvidence::HlTradeFilled(e)));
+        }
+        ProviderHintKind::HlTradeCanceled => {
+            return typed_hint_evidence(evidence)
+                .map(|e| Some(ProviderOperationHintEvidence::HlTradeCanceled(e)));
+        }
+        ProviderHintKind::HlBridgeDepositObserved => {
+            return typed_hint_evidence(evidence)
+                .map(|e| Some(ProviderOperationHintEvidence::HlBridgeDepositObserved(e)));
+        }
+        ProviderHintKind::HlBridgeDepositCredited => {
+            return typed_hint_evidence(evidence)
+                .map(|e| Some(ProviderOperationHintEvidence::HlBridgeDepositCredited(e)));
+        }
+        ProviderHintKind::HlWithdrawalAcknowledged => {
+            return typed_hint_evidence(evidence)
+                .map(|e| Some(ProviderOperationHintEvidence::HlWithdrawalAcknowledged(e)));
+        }
+        ProviderHintKind::HlWithdrawalSettled => {
+            return typed_hint_evidence(evidence)
+                .map(|e| Some(ProviderOperationHintEvidence::HlWithdrawalSettled(e)));
+        }
+        ProviderHintKind::VeloraSwapSettled => {
+            return typed_hint_evidence(evidence)
+                .map(|e| Some(ProviderOperationHintEvidence::VeloraSwapSettled(e)));
+        }
+        ProviderHintKind::CctpReceiveObserved => {
+            return typed_hint_evidence(evidence)
+                .map(|e| Some(ProviderOperationHintEvidence::CctpReceiveObserved(e)));
+        }
+        ProviderHintKind::CctpAttestation
+        | ProviderHintKind::AcrossFill
+        | ProviderHintKind::AcrossDestinationFilled
+        | ProviderHintKind::UnitDeposit
+        | ProviderHintKind::ProviderObservation
+        | ProviderHintKind::HyperliquidTrade => {}
+    }
+
+    let tx_hash = evidence
+        .get("tx_hash")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let address = evidence
+        .get("address")
+        .or_else(|| evidence.get("recipient_address"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let transfer_index = evidence
+        .get("transfer_index")
+        .or_else(|| evidence.get("vout"))
+        .and_then(json_u64_or_string);
+
+    match (tx_hash, address, transfer_index) {
+        (Some(tx_hash), Some(address), Some(transfer_index)) => {
+            let amount = evidence.get("amount").and_then(|value| match value {
+                serde_json::Value::String(value) => Some(value.clone()),
+                serde_json::Value::Number(value) => Some(value.to_string()),
+                _ => None,
+            });
+            Ok(Some(ProviderOperationHintEvidence::UnitDeposit(
+                UnitDepositHintEvidence {
+                    tx_hash,
+                    address,
+                    transfer_index,
+                    amount,
+                },
+            )))
+        }
+        (None, None, None) => Ok(None),
+        _ if hint_kind != ProviderHintKind::UnitDeposit => Ok(None),
+        _ => Err(RouterServerError::Validation {
+            message:
+                "UnitDeposit provider-operation hints require tx_hash, address, and transfer_index"
+                    .to_string(),
+        }),
+    }
+}
+
+fn typed_hint_evidence<T>(evidence: &serde_json::Value) -> RouterServerResult<T>
+where
+    T: DeserializeOwned,
+{
+    serde_json::from_value(evidence.clone()).map_err(|source| RouterServerError::Validation {
+        message: format!("invalid typed provider-operation hint evidence: {source}"),
+    })
+}
+
+fn json_u64_or_string(value: &serde_json::Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+}
+
+async fn signal_provider_operation_hint(
+    order_workflow_client: &OrderWorkflowClient,
+    attempt: &OrderExecutionAttempt,
+    order_id: Uuid,
+    signal: ProviderOperationHintSignal,
+) -> std::result::Result<(), RouterTemporalError> {
+    match attempt.attempt_kind {
+        OrderExecutionAttemptKind::PrimaryExecution
+        | OrderExecutionAttemptKind::RetryExecution
+        | OrderExecutionAttemptKind::RefreshedExecution => {
+            order_workflow_client
+                .signal_provider_hint(WorkflowOrderId::from(order_id), signal)
+                .await
+        }
+        OrderExecutionAttemptKind::RefundRecovery => {
+            let parent_attempt_id = attempt
+                .failure_reason
+                .get("failed_attempt_id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| value.parse::<Uuid>().ok())
+                .ok_or_else(|| RouterTemporalError::Temporal {
+                    action: "resolve RefundWorkflow parent attempt",
+                    source: boxed_temporal_error(format!(
+                        "RefundRecovery attempt {} is missing failure_reason.failed_attempt_id",
+                        attempt.id
+                    )),
+                })?;
+            order_workflow_client
+                .signal_refund_provider_hint(
+                    WorkflowOrderId::from(order_id),
+                    WorkflowAttemptId::from(parent_attempt_id),
+                    signal,
+                )
+                .await
+        }
+    }
+}
+
+async fn record_provider_operation_hint_event(
+    state: &AppState,
+    order_id: Uuid,
+    hint: &OrderProviderOperationHint,
+    operation: &OrderProviderOperation,
+    event: &'static str,
+) {
+    if let Ok(order) = state.db.orders().get(order_id).await {
+        crate::telemetry::record_provider_operation_hint_workflow_event(
+            &order, hint, operation, event,
+        );
+    }
 }
 
 async fn record_vault_funding_hint_inner(
@@ -711,21 +1153,6 @@ async fn record_vault_funding_hint_inner(
     Ok(hint)
 }
 
-async fn observe_provider_operation(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    RouterPath(id): RouterPath<Uuid>,
-    RouterJson(request): RouterJson<ProviderOperationObserveRequest>,
-) -> RouterServerResult<Json<Option<ProviderOperationObservation>>> {
-    authorize_internal_api_request(&state, &headers)?;
-    let hint_evidence = normalize_hint_evidence(request.hint_evidence)?;
-    let observation = state
-        .order_execution_manager
-        .observe_provider_operation(id, hint_evidence)
-        .await?;
-    Ok(Json(observation))
-}
-
 async fn list_provider_policies(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -742,7 +1169,7 @@ async fn get_provider_health(
     authorize_gateway_api_request(&state, &headers)?;
     let providers = state.provider_health.list().await?;
     Ok(Json(ProviderHealthEnvelope {
-        status: crate::models::ProviderHealthSummaryStatus::from_checks(&providers),
+        status: router_core::models::ProviderHealthSummaryStatus::from_checks(&providers),
         timestamp: Utc::now(),
         providers,
     }))
@@ -778,6 +1205,247 @@ async fn get_order_flow(
 ) -> RouterServerResult<Json<crate::api::OrderFlowEnvelope>> {
     authorize_admin_api_request(&state, &headers)?;
     Ok(Json(crate::query_api::get_order_flow(&state.db, id).await?))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ManualInterventionOrdersQuery {
+    limit: Option<i64>,
+}
+
+async fn list_manual_intervention_orders(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ManualInterventionOrdersQuery>,
+) -> RouterServerResult<Json<ManualInterventionOrdersEnvelope>> {
+    authorize_admin_api_request(&state, &headers)?;
+    let limit = normalized_manual_intervention_order_limit(query.limit)?;
+    Ok(Json(
+        crate::query_api::list_manual_intervention_orders(&state.db, limit).await?,
+    ))
+}
+
+async fn get_manual_intervention_order(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RouterPath(id): RouterPath<Uuid>,
+) -> RouterServerResult<Json<ManualInterventionOrderEnvelope>> {
+    authorize_admin_api_request(&state, &headers)?;
+    Ok(Json(
+        crate::query_api::get_manual_intervention_order(&state.db, id).await?,
+    ))
+}
+
+async fn release_manual_intervention_order(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RouterPath(id): RouterPath<Uuid>,
+    RouterJson(request): RouterJson<ManualInterventionActionRequest>,
+) -> RouterServerResult<Json<ManualInterventionActionEnvelope>> {
+    authorize_admin_api_request(&state, &headers)?;
+    let reason = normalize_manual_action_reason(request.reason)?;
+    let signal = ManualReleaseSignal {
+        reason,
+        operator_id: request.operator_id,
+        requested_at: Utc::now(),
+    };
+    signal_manual_intervention_action(&state, id, ManualInterventionAction::Release(signal)).await
+}
+
+async fn trigger_manual_intervention_refund(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RouterPath(id): RouterPath<Uuid>,
+    RouterJson(request): RouterJson<ManualTriggerRefundRequest>,
+) -> RouterServerResult<Json<ManualInterventionActionEnvelope>> {
+    authorize_admin_api_request(&state, &headers)?;
+    let reason = normalize_manual_action_reason(request.reason)?;
+    let signal = ManualTriggerRefundSignal {
+        reason,
+        operator_id: request.operator_id,
+        requested_at: Utc::now(),
+        refund_kind_hint: request.refund_kind_hint,
+    };
+    signal_manual_intervention_action(&state, id, ManualInterventionAction::TriggerRefund(signal))
+        .await
+}
+
+async fn acknowledge_manual_intervention_unrecoverable(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RouterPath(id): RouterPath<Uuid>,
+    RouterJson(request): RouterJson<ManualInterventionActionRequest>,
+) -> RouterServerResult<Json<ManualInterventionActionEnvelope>> {
+    authorize_admin_api_request(&state, &headers)?;
+    let reason = normalize_manual_action_reason(request.reason)?;
+    let signal = AcknowledgeUnrecoverableSignal {
+        reason,
+        operator_id: request.operator_id,
+        requested_at: Utc::now(),
+    };
+    signal_manual_intervention_action(
+        &state,
+        id,
+        ManualInterventionAction::AcknowledgeUnrecoverable(signal),
+    )
+    .await
+}
+
+fn normalized_manual_intervention_order_limit(limit: Option<i64>) -> RouterServerResult<i64> {
+    let limit = limit.unwrap_or(DEFAULT_MANUAL_INTERVENTION_ORDER_LIMIT);
+    if !(1..=MAX_MANUAL_INTERVENTION_ORDER_LIMIT).contains(&limit) {
+        return Err(RouterServerError::Validation {
+            message: format!("limit must be between 1 and {MAX_MANUAL_INTERVENTION_ORDER_LIMIT}"),
+        });
+    }
+    Ok(limit)
+}
+
+enum ManualInterventionAction {
+    Release(ManualReleaseSignal),
+    TriggerRefund(ManualTriggerRefundSignal),
+    AcknowledgeUnrecoverable(AcknowledgeUnrecoverableSignal),
+}
+
+impl ManualInterventionAction {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Release(_) => "manual_release",
+            Self::TriggerRefund(_) => "manual_trigger_refund",
+            Self::AcknowledgeUnrecoverable(_) => "acknowledge_unrecoverable",
+        }
+    }
+}
+
+async fn signal_manual_intervention_action(
+    state: &AppState,
+    order_id: Uuid,
+    action: ManualInterventionAction,
+) -> RouterServerResult<Json<ManualInterventionActionEnvelope>> {
+    let order_workflow_client =
+        state
+            .order_workflow_client
+            .as_ref()
+            .ok_or_else(|| RouterServerError::NotReady {
+                message: "Temporal order workflow client is not configured".to_string(),
+            })?;
+    let target =
+        crate::query_api::get_manual_intervention_signal_target(&state.db, order_id).await?;
+    let action_name = action.name().to_string();
+    let workflow_id = match (&target, action) {
+        (
+            crate::query_api::ManualInterventionSignalTarget::OrderWorkflow { workflow_id },
+            ManualInterventionAction::Release(signal),
+        ) => {
+            order_workflow_client
+                .signal_manual_release(WorkflowOrderId::from(order_id), signal)
+                .await
+                .map_err(manual_signal_error)?;
+            workflow_id.clone()
+        }
+        (
+            crate::query_api::ManualInterventionSignalTarget::OrderWorkflow { workflow_id },
+            ManualInterventionAction::TriggerRefund(signal),
+        ) => {
+            order_workflow_client
+                .signal_manual_trigger_refund(WorkflowOrderId::from(order_id), signal)
+                .await
+                .map_err(manual_signal_error)?;
+            workflow_id.clone()
+        }
+        (
+            crate::query_api::ManualInterventionSignalTarget::OrderWorkflow { workflow_id },
+            ManualInterventionAction::AcknowledgeUnrecoverable(signal),
+        ) => {
+            order_workflow_client
+                .signal_acknowledge_unrecoverable(WorkflowOrderId::from(order_id), signal)
+                .await
+                .map_err(manual_signal_error)?;
+            workflow_id.clone()
+        }
+        (
+            crate::query_api::ManualInterventionSignalTarget::RefundWorkflow {
+                workflow_id,
+                parent_attempt_id,
+            },
+            ManualInterventionAction::Release(signal),
+        ) => {
+            order_workflow_client
+                .signal_refund_manual_release(
+                    WorkflowOrderId::from(order_id),
+                    WorkflowAttemptId::from(*parent_attempt_id),
+                    signal,
+                )
+                .await
+                .map_err(manual_signal_error)?;
+            workflow_id.clone()
+        }
+        (
+            crate::query_api::ManualInterventionSignalTarget::RefundWorkflow {
+                workflow_id,
+                parent_attempt_id,
+            },
+            ManualInterventionAction::TriggerRefund(signal),
+        ) => {
+            order_workflow_client
+                .signal_refund_manual_trigger_refund(
+                    WorkflowOrderId::from(order_id),
+                    WorkflowAttemptId::from(*parent_attempt_id),
+                    signal,
+                )
+                .await
+                .map_err(manual_signal_error)?;
+            workflow_id.clone()
+        }
+        (
+            crate::query_api::ManualInterventionSignalTarget::RefundWorkflow {
+                workflow_id,
+                parent_attempt_id,
+            },
+            ManualInterventionAction::AcknowledgeUnrecoverable(signal),
+        ) => {
+            order_workflow_client
+                .signal_refund_acknowledge_unrecoverable(
+                    WorkflowOrderId::from(order_id),
+                    WorkflowAttemptId::from(*parent_attempt_id),
+                    signal,
+                )
+                .await
+                .map_err(manual_signal_error)?;
+            workflow_id.clone()
+        }
+    };
+
+    Ok(Json(ManualInterventionActionEnvelope {
+        order_id,
+        workflow_id,
+        action: action_name,
+    }))
+}
+
+fn normalize_manual_action_reason(reason: String) -> RouterServerResult<String> {
+    let reason = reason.trim().to_string();
+    if reason.is_empty() {
+        return Err(RouterServerError::Validation {
+            message: "reason is required".to_string(),
+        });
+    }
+    Ok(reason)
+}
+
+fn manual_signal_error(source: RouterTemporalError) -> RouterServerError {
+    match source {
+        RouterTemporalError::WorkflowSignalUnavailable {
+            workflow_id,
+            message,
+        } => RouterServerError::NotReady {
+            message: format!(
+                "manual-intervention workflow {workflow_id} is unavailable: {message}"
+            ),
+        },
+        source => RouterServerError::NotReady {
+            message: format!("failed to signal manual-intervention workflow: {source}"),
+        },
+    }
 }
 
 fn authorize_internal_api_request(state: &AppState, headers: &HeaderMap) -> RouterServerResult<()> {
@@ -1188,11 +1856,24 @@ mod tests {
     }
 
     #[test]
+    fn create_order_request_rejects_cancel_after() {
+        let request = serde_json::json!({
+            "quote_id": Uuid::now_v7(),
+            "refund_address": "refund-address",
+            "cancel_after": "2026-05-06T00:00:00Z"
+        });
+
+        let error = serde_json::from_value::<CreateOrderRequest>(request)
+            .expect_err("cancel_after should not be accepted for router orders");
+
+        assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
     fn create_order_requires_idempotency_key() {
         let request = CreateOrderRequest {
             quote_id: Uuid::now_v7(),
             refund_address: "refund-address".to_string(),
-            cancel_after: None,
             idempotency_key: None,
             metadata: serde_json::json!({}),
         };
@@ -1208,7 +1889,6 @@ mod tests {
         let request = CreateOrderRequest {
             quote_id: Uuid::now_v7(),
             refund_address: "refund-address".to_string(),
-            cancel_after: None,
             idempotency_key: Some("short-key".to_string()),
             metadata: serde_json::json!({}),
         };
@@ -1225,7 +1905,6 @@ mod tests {
         let request = CreateOrderRequest {
             quote_id: Uuid::now_v7(),
             refund_address: "refund-address".to_string(),
-            cancel_after: None,
             idempotency_key: Some("market-order key/with/slashes".to_string()),
             metadata: serde_json::json!({}),
         };
@@ -1465,6 +2144,67 @@ mod tests {
         ));
     }
 
+    fn test_provider_operation(
+        order_id: Uuid,
+        operation_id: Uuid,
+        step_id: Uuid,
+    ) -> OrderProviderOperation {
+        let now = Utc::now();
+        OrderProviderOperation {
+            id: operation_id,
+            order_id,
+            execution_attempt_id: Some(Uuid::now_v7()),
+            execution_step_id: Some(step_id),
+            provider: "across".to_string(),
+            operation_type: ProviderOperationType::AcrossBridge,
+            provider_ref: Some("provider-ref".to_string()),
+            idempotency_key: None,
+            status: router_core::models::ProviderOperationStatus::WaitingExternal,
+            request: serde_json::json!({}),
+            response: serde_json::json!({}),
+            observed_state: serde_json::json!({}),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn test_provider_operation_hint(operation_id: Uuid) -> OrderProviderOperationHint {
+        let now = Utc::now();
+        OrderProviderOperationHint {
+            id: Uuid::now_v7(),
+            provider_operation_id: operation_id,
+            source: "sauron".to_string(),
+            hint_kind: router_core::models::ProviderOperationHintKind::PossibleProgress,
+            evidence: serde_json::json!({}),
+            status: ProviderOperationHintStatus::Processing,
+            idempotency_key: None,
+            error: serde_json::json!({}),
+            claimed_at: None,
+            processed_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn provider_operation_hint_signal_carries_and_validates_step_id() {
+        let order_id = Uuid::now_v7();
+        let operation_id = Uuid::now_v7();
+        let step_id = Uuid::now_v7();
+        let operation = test_provider_operation(order_id, operation_id, step_id);
+        let hint = test_provider_operation_hint(operation_id);
+
+        let signal =
+            provider_operation_hint_signal(&operation, WorkflowStepId::from(step_id), &hint)
+                .expect("matching step should build signal");
+        assert_eq!(signal.execution_step_id, WorkflowStepId::from(step_id));
+
+        let err =
+            provider_operation_hint_signal(&operation, WorkflowStepId::from(Uuid::now_v7()), &hint)
+                .expect_err("mismatched step should be rejected");
+        assert!(matches!(err, RouterServerError::Validation { .. }));
+    }
+
     #[test]
     fn address_validation_is_available_without_screening_provider() {
         let mut registry = ChainRegistry::new();
@@ -1612,6 +2352,37 @@ mod tests {
             auth.verify_headers(&wrong_key),
             Err(RouterServerError::Unauthorized { .. })
         ));
+    }
+
+    #[test]
+    fn manual_intervention_order_limit_is_bounded() {
+        assert_eq!(
+            normalized_manual_intervention_order_limit(None).unwrap(),
+            DEFAULT_MANUAL_INTERVENTION_ORDER_LIMIT
+        );
+        assert_eq!(
+            normalized_manual_intervention_order_limit(Some(1)).unwrap(),
+            1
+        );
+        assert_eq!(
+            normalized_manual_intervention_order_limit(Some(MAX_MANUAL_INTERVENTION_ORDER_LIMIT))
+                .unwrap(),
+            MAX_MANUAL_INTERVENTION_ORDER_LIMIT
+        );
+        assert!(normalized_manual_intervention_order_limit(Some(0)).is_err());
+        assert!(normalized_manual_intervention_order_limit(Some(
+            MAX_MANUAL_INTERVENTION_ORDER_LIMIT + 1
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn manual_intervention_action_reason_is_required() {
+        assert_eq!(
+            normalize_manual_action_reason("  operator fixed liquidity  ".to_string()).unwrap(),
+            "operator fixed liquidity"
+        );
+        assert!(normalize_manual_action_reason("  ".to_string()).is_err());
     }
 
     #[test]

@@ -8,8 +8,8 @@ RUN apt-get update -qq \
     stunnel4 \
   && rm -rf /var/lib/apt/lists/*
 
-COPY stunnel.conf.template /etc/stunnel/stunnel.conf.template
-COPY entrypoint.sh /entrypoint.sh
+COPY railway/router-replica-stunnel/stunnel.conf.template /etc/stunnel/stunnel.conf.template
+COPY railway/router-replica-stunnel/entrypoint.sh /entrypoint.sh
 
 RUN chmod 0755 /entrypoint.sh
 

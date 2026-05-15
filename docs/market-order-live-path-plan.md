@@ -27,8 +27,9 @@ route running through `router-api` + `router-worker`. Updated as assumptions cha
    gas sponsorship. Partial fills disabled.
 3. Real Unit adapter — fetch real Unit deposit address, sign/send source-vault
    funds to it, wire real status polling.
-4. Real Hyperliquid adapter — wire the real SDK/API. Reference pattern exists in
-   `bin/router-server/tests/live_market_order_e2e.rs`.
+4. Real Hyperliquid adapter — wire the real SDK/API. Reference patterns live in
+   the provider/client live lifecycle tests listed in
+   `docs/live-provider-differential-tests.md`.
 5. E2E live test driving through `router-api` + `router-worker` (not direct
    provider calls); balance invariants; spend guards.
 6. **EIP-7702 batched same-chain funding** — optimization. After first green run.
@@ -140,14 +141,14 @@ Concrete shape:
 
 ### Phase 4 — Real Hyperliquid adapter
 - Extract the real SDK/API call pattern from
-  `bin/router-server/tests/live_market_order_e2e.rs`. Wire into the production
-  `ExchangeProvider` implementation.
+  `crates/hyperliquid-client/tests/live_differential.rs`. Wire into the
+  production `ExchangeProvider` implementation.
 - Hyperliquid subaccount ↔ deposit vault is 1:1 (user decision). Subaccount
   provisioning either eager at vault creation or lazy at first trade — pick lazy
   unless there's a reason to eager-provision.
 
 ### Phase 5 — Live E2E test
-- Migrate `live_market_order_e2e.rs` to drive the full stack:
+- Add a new full-stack live E2E test that drives the production router path:
   boot `initialize_components`, spawn `router-api`, spawn `router-worker`, call
   `POST /api/v1/quotes`, `POST /api/v1/orders`, fund the returned deposit vault
   with dust from a throwaway key, let the worker execute, assert final DB state +

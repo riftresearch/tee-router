@@ -14,15 +14,11 @@ async fn main() -> Result<()> {
         .with_filter(fmt_env_filter);
     let otlp_telemetry = observability::init_otlp_from_env("sauron")
         .map_err(|message| sauron::Error::Observability { message })?;
-    let otlp_trace_layer = otlp_telemetry
-        .trace_layer("sauron")
-        .map(|layer| layer.with_filter(EnvFilter::new(&args.log_level)));
     let otlp_log_layer = otlp_telemetry
         .log_layer()
         .map(|layer| layer.with_filter(EnvFilter::new(&args.log_level)));
 
     tracing_subscriber::registry()
-        .with(otlp_trace_layer)
         .with(otlp_log_layer)
         .with(fmt_layer)
         .init();
@@ -31,9 +27,9 @@ async fn main() -> Result<()> {
         .map_err(|message| sauron::Error::Observability { message })?;
 
     if otlp_telemetry.is_enabled() {
-        tracing::info!("OpenTelemetry OTLP logs/traces enabled");
+        tracing::info!("OpenTelemetry OTLP logs enabled");
     } else {
-        tracing::info!("OpenTelemetry OTLP logs/traces not configured");
+        tracing::info!("OpenTelemetry OTLP logs not configured");
     }
 
     let result = tokio::select! {

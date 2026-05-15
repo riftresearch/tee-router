@@ -15,7 +15,7 @@ use alloy::{
     signers::local::PrivateKeySigner,
     sol,
 };
-use router_server::{
+use router_core::{
     models::MarketOrderKind,
     protocol::{AssetId, ChainId, DepositAsset},
     services::{
@@ -23,7 +23,8 @@ use router_server::{
             ExchangeExecutionRequest, ExchangeProvider, ExchangeQuote, ExchangeQuoteRequest,
             VeloraProvider,
         },
-        ChainCall, CustodyAction, ProviderExecutionIntent,
+        custody_action_executor::{ChainCall, CustodyAction},
+        ProviderExecutionIntent,
     },
 };
 use serde_json::{json, Value};
@@ -31,7 +32,7 @@ use url::Url;
 use uuid::Uuid;
 
 mod support;
-use support::{box_error, retry_rpc, wait_for_successful_receipt};
+use support::{assert_raw_amount_string, box_error, retry_rpc, wait_for_successful_receipt};
 
 type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -91,6 +92,8 @@ async fn live_velora_base_eth_usdc_quote_transcript() -> TestResult<()> {
     let provider = live_velora_provider()?;
     let quote = quote_base_eth_to_usdc(&provider, user, amount_in, "1".to_string()).await?;
     let raw_price_route = fetch_raw_price_route(user, amount_in).await?;
+    assert_velora_quote_amount_format(&quote);
+    assert_velora_price_route_amount_format(&raw_price_route);
 
     emit_transcript(
         "velora.base_eth_usdc_quote",
@@ -156,8 +159,10 @@ async fn live_velora_base_eth_to_usdc_swap_transcript_spends_funds() -> TestResu
 
     let velora = live_velora_provider()?;
     let loose_quote = quote_base_eth_to_usdc(&velora, user, amount_in, "1".to_string()).await?;
+    assert_velora_quote_amount_format(&loose_quote);
     let min_amount_out = apply_slippage_bps(&loose_quote.amount_out, slippage_bps)?;
     let quote = quote_base_eth_to_usdc(&velora, user, amount_in, min_amount_out).await?;
+    assert_velora_quote_amount_format(&quote);
     let step_request = velora_step_request(user, &quote);
     let step_request = ExchangeExecutionRequest::universal_router_swap_from_value(&step_request)?;
     let execution = velora
@@ -232,7 +237,7 @@ async fn quote_base_eth_to_usdc(
             output_decimals: Some(6),
             order_kind: MarketOrderKind::ExactIn {
                 amount_in: amount_in.to_string(),
-                min_amount_out,
+                min_amount_out: Some(min_amount_out),
             },
             sender_address: Some(format!("{user:#x}")),
             recipient_address: format!("{user:#x}"),
@@ -354,6 +359,32 @@ fn summarize_quote(quote: &ExchangeQuote) -> Value {
         "expires_at": quote.expires_at.to_rfc3339(),
         "provider_quote": quote.provider_quote,
     })
+}
+
+fn assert_velora_quote_amount_format(quote: &ExchangeQuote) {
+    assert_raw_amount_string("velora quote amount_in", &quote.amount_in);
+    assert_raw_amount_string("velora quote amount_out", &quote.amount_out);
+    if let Some(min_amount_out) = quote.min_amount_out.as_deref() {
+        assert_raw_amount_string("velora quote min_amount_out", min_amount_out);
+    }
+    if let Some(max_amount_in) = quote.max_amount_in.as_deref() {
+        assert_raw_amount_string("velora quote max_amount_in", max_amount_in);
+    }
+    let price_route = quote
+        .provider_quote
+        .get("price_route")
+        .expect("Velora quote should preserve price_route");
+    assert_velora_price_route_amount_format(price_route);
+}
+
+fn assert_velora_price_route_amount_format(price_route: &Value) {
+    for field in ["srcAmount", "destAmount"] {
+        let value = price_route
+            .get(field)
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("Velora priceRoute.{field} missing"));
+        assert_raw_amount_string(&format!("Velora priceRoute.{field}"), value);
+    }
 }
 
 fn configured_amount_in() -> TestResult<U256> {

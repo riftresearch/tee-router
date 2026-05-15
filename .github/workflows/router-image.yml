@@ -16,6 +16,7 @@ permissions:
 
 env:
   IMAGE_NAME: ghcr.io/riftresearch/tee-router
+  TEMPORAL_WORKER_IMAGE_NAME: ghcr.io/riftresearch/tee-router-temporal-worker
 
 jobs:
   build:
@@ -74,7 +75,17 @@ jobs:
             type=ref,event=branch
             type=semver,pattern={{version}}
 
-      - name: Build and optionally push
+      - name: Extract temporal-worker metadata
+        id: temporal-worker-meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.TEMPORAL_WORKER_IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+
+      - name: Build and optionally push router image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -82,5 +93,16 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and optionally push temporal-worker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: etc/Dockerfile.temporal-worker
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.temporal-worker-meta.outputs.tags }}
+          labels: ${{ steps.temporal-worker-meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

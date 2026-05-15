@@ -4,16 +4,18 @@ use alloy::consensus::Transaction as _;
 use alloy::network::{EthereumWallet, TransactionBuilder};
 use alloy::primitives::{Address, Bytes, TxHash, U256};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
-use alloy::rpc::types::{Log as RpcLog, TransactionReceipt, TransactionRequest};
+use alloy::rpc::types::{Filter, Log as RpcLog, TransactionReceipt, TransactionRequest};
 use alloy::signers::local::{LocalSigner, PrivateKeySigner};
 use alloy::{hex, sol};
 use async_trait::async_trait;
 use blockchain_utils::create_transfer_with_authorization_execution;
 use eip3009_erc20_contract::GenericEIP3009ERC20::GenericEIP3009ERC20Instance;
+use eip7702_paymaster::{Paymaster, PaymasterError, PaymasterFundingRequest, PaymasterHandle};
 use metrics::{counter, gauge, histogram};
 use router_primitives::{
     ChainType, ConfirmedTxStatus, Currency, Lot, PendingTxStatus, TokenIdentifier, TxStatus, Wallet,
 };
+use serde::{Deserialize, Serialize};
 use snafu::location;
 use std::{
     fmt,
@@ -23,11 +25,16 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::{
+        mpsc::{self, error::TryRecvError},
+        oneshot,
+    },
     task::{JoinError, JoinSet},
     time::sleep,
 };
 use tracing::{debug, info, warn};
+
+pub use eip7702_paymaster::PaymasterBatchConfig as EvmPaymasterBatchConfig;
 
 sol! {
     #[derive(Debug)]
@@ -41,7 +48,15 @@ const EVM_RECEIPT_TIMEOUT: Duration = Duration::from_secs(300);
 const EVM_RPC_RETRY_ATTEMPTS: usize = 6;
 const EVM_RPC_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(500);
 const EVM_CALL_ESTIMATE_GAS_CAP: u64 = 1_000_000;
-const WEI_PER_GWEI: f64 = 1_000_000_000.0;
+const FLASHBOTS_ETHEREUM_RPC_URL: &str = "https://rpc.flashbots.net";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvmBroadcastPolicy {
+    #[default]
+    Standard,
+    FlashbotsIfEthereum,
+}
 
 pub struct EvmChain {
     provider: DynProvider,
@@ -70,7 +85,7 @@ impl fmt::Debug for EvmGasSponsorConfig {
 }
 
 struct EvmGasSponsor {
-    actor: EvmPaymasterActor,
+    app_actor: EvmPaymasterAppActor,
     actor_runtime: Mutex<Option<EvmPaymasterRuntime>>,
     chain_type: ChainType,
 }
@@ -81,11 +96,12 @@ struct EvmPaymasterRuntime {
 }
 
 #[derive(Clone)]
-struct EvmPaymasterActor {
+struct EvmPaymasterAppActor {
     provider: DynProvider,
     wallet_provider: DynProvider,
-    sponsor_address: Address,
+    sponsor_signer: PrivateKeySigner,
     vault_gas_buffer_wei: U256,
+    batch_config: EvmPaymasterBatchConfig,
     chain_type: ChainType,
 }
 
@@ -224,6 +240,31 @@ impl EvmChain {
         .await
         .map_err(|e| crate::Error::DumpToAddress {
             message: format!("Failed to get token decimals: {e}"),
+        })
+    }
+
+    pub async fn transaction_receipt(&self, tx_hash: &str) -> Result<Option<TransactionReceipt>> {
+        let tx_hash = TxHash::from_str(tx_hash).map_err(|_| crate::Error::Serialization {
+            message: "Invalid transaction hash".to_string(),
+        })?;
+        retry_evm_rpc(self.chain_type, "get_transaction_receipt", || async {
+            self.provider.get_transaction_receipt(tx_hash).await
+        })
+        .await
+        .map_err(|e| crate::Error::EVMRpcError {
+            source: e,
+            loc: location!(),
+        })
+    }
+
+    pub async fn logs(&self, filter: &Filter) -> Result<Vec<RpcLog>> {
+        retry_evm_rpc(self.chain_type, "get_logs", || async {
+            self.provider.get_logs(filter).await
+        })
+        .await
+        .map_err(|e| crate::Error::EVMRpcError {
+            source: e,
+            loc: location!(),
         })
     }
 
@@ -776,6 +817,24 @@ impl EvmChain {
         value: U256,
         calldata: Bytes,
     ) -> Result<EvmCallOutcome> {
+        self.send_call_with_broadcast_policy(
+            private_key,
+            to_address,
+            value,
+            calldata,
+            EvmBroadcastPolicy::Standard,
+        )
+        .await
+    }
+
+    pub async fn send_call_with_broadcast_policy(
+        &self,
+        private_key: &str,
+        to_address: &str,
+        value: U256,
+        calldata: Bytes,
+        broadcast_policy: EvmBroadcastPolicy,
+    ) -> Result<EvmCallOutcome> {
         let sender_signer =
             LocalSigner::from_str(private_key).map_err(|_| crate::Error::DumpToAddress {
                 message: "Invalid private key".to_string(),
@@ -836,11 +895,11 @@ impl EvmChain {
             native_balance
         };
 
-        let url = self
-            .rpc_url
+        let broadcast_rpc_url = self.broadcast_rpc_url(broadcast_policy);
+        let url = broadcast_rpc_url
             .parse()
             .map_err(|_| crate::Error::Serialization {
-                message: "Invalid RPC URL".to_string(),
+                message: "Invalid EVM broadcast RPC URL".to_string(),
             })?;
         let wallet_provider = ProviderBuilder::new()
             .wallet(EthereumWallet::new(sender_signer))
@@ -864,13 +923,48 @@ impl EvmChain {
                 loc: location!(),
             })?;
         let tx_hash = *pending_tx.tx_hash();
-        let receipt = wait_for_evm_receipt(&wallet_provider, self.chain_type, tx_hash).await?;
+        let receipt = wait_for_evm_receipt(&self.provider, self.chain_type, tx_hash).await?;
 
         Ok(EvmCallOutcome {
             tx_hash: tx_hash.to_string(),
             logs: receipt.logs().to_vec(),
         })
     }
+
+    fn broadcast_rpc_url(&self, broadcast_policy: EvmBroadcastPolicy) -> &str {
+        select_broadcast_rpc_url(&self.rpc_url, self.chain_type, broadcast_policy)
+    }
+}
+
+fn select_broadcast_rpc_url(
+    rpc_url: &str,
+    chain_type: ChainType,
+    broadcast_policy: EvmBroadcastPolicy,
+) -> &str {
+    if matches!(broadcast_policy, EvmBroadcastPolicy::FlashbotsIfEthereum)
+        && chain_type == ChainType::Ethereum
+        && !is_local_evm_rpc_url(rpc_url)
+    {
+        FLASHBOTS_ETHEREUM_RPC_URL
+    } else {
+        rpc_url
+    }
+}
+
+fn is_local_evm_rpc_url(rpc_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(rpc_url) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.to_ascii_lowercase();
+    host == "localhost"
+        || host == "devnet"
+        || host == "host.docker.internal"
+        || host.starts_with("127.")
+        || host == "0.0.0.0"
+        || host == "::1"
 }
 
 /// Result of a custody-controlled EVM call. Includes the receipt's logs so that
@@ -894,29 +988,30 @@ impl EvmGasSponsor {
                 message: "Invalid gas sponsor private key".to_string(),
             }
         })?;
-        let sponsor_address = signer.address();
         let url = rpc_url.parse().map_err(|_| crate::Error::Serialization {
             message: "Invalid RPC URL".to_string(),
         })?;
         let wallet_provider = ProviderBuilder::new()
-            .wallet(EthereumWallet::new(signer))
+            .wallet(EthereumWallet::new(signer.clone()))
             .connect_http(url)
             .erased();
+        let batch_config = EvmPaymasterBatchConfig::from_env();
         let (command_tx, command_rx) = mpsc::channel(EVM_PAYMASTER_COMMAND_BUFFER);
         let mut actor_tasks = JoinSet::new();
-        let actor = EvmPaymasterActor {
+        let app_actor = EvmPaymasterAppActor {
             provider,
             wallet_provider,
-            sponsor_address,
+            sponsor_signer: signer,
             vault_gas_buffer_wei: config.vault_gas_buffer_wei,
+            batch_config,
             chain_type,
         };
-        actor_tasks.spawn(run_evm_paymaster_actor(actor.clone(), command_rx));
+        actor_tasks.spawn(run_evm_paymaster_app_actor(app_actor.clone(), command_rx));
         record_paymaster_actor_start(chain_type, "initial");
         record_paymaster_queue_depth(chain_type, &command_tx);
 
         Ok(Self {
-            actor,
+            app_actor,
             actor_runtime: Mutex::new(Some(EvmPaymasterRuntime {
                 command_tx,
                 actor_tasks,
@@ -966,7 +1061,10 @@ impl EvmGasSponsor {
     ) -> mpsc::Sender<EvmPaymasterCommand> {
         let (command_tx, command_rx) = mpsc::channel(EVM_PAYMASTER_COMMAND_BUFFER);
         let mut actor_tasks = JoinSet::new();
-        actor_tasks.spawn(run_evm_paymaster_actor(self.actor.clone(), command_rx));
+        actor_tasks.spawn(run_evm_paymaster_app_actor(
+            self.app_actor.clone(),
+            command_rx,
+        ));
         record_paymaster_actor_start(self.chain_type, "restart");
         record_paymaster_queue_depth(self.chain_type, &command_tx);
 
@@ -1254,55 +1352,6 @@ fn record_paymaster_command_processed(
     .record(duration.as_secs_f64());
 }
 
-fn record_paymaster_gas_estimate(chain_type: ChainType, operation: &'static str, gas_units: u64) {
-    histogram!(
-        "tee_router_paymaster_estimated_gas_units",
-        "chain" => chain_label(chain_type),
-        "operation" => operation,
-    )
-    .record(gas_units as f64);
-}
-
-fn record_paymaster_balance_gwei(chain_type: ChainType, wallet_kind: &'static str, balance: U256) {
-    gauge!(
-        "tee_router_paymaster_balance_gwei",
-        "chain" => chain_label(chain_type),
-        "wallet_kind" => wallet_kind,
-    )
-    .set(u256_to_gwei_f64(balance));
-}
-
-fn record_paymaster_funding_skipped(chain_type: ChainType, reason: &'static str) {
-    counter!(
-        "tee_router_paymaster_funding_skipped_total",
-        "chain" => chain_label(chain_type),
-        "reason" => reason,
-    )
-    .increment(1);
-}
-
-fn record_paymaster_funding_failed(chain_type: ChainType, failure_kind: &'static str) {
-    counter!(
-        "tee_router_paymaster_funding_failed_total",
-        "chain" => chain_label(chain_type),
-        "failure_kind" => failure_kind,
-    )
-    .increment(1);
-}
-
-fn record_paymaster_funding_sent(chain_type: ChainType, top_up_amount: U256) {
-    counter!(
-        "tee_router_paymaster_funding_tx_sent_total",
-        "chain" => chain_label(chain_type),
-    )
-    .increment(1);
-    histogram!(
-        "tee_router_paymaster_funding_amount_gwei",
-        "chain" => chain_label(chain_type),
-    )
-    .record(u256_to_gwei_f64(top_up_amount));
-}
-
 fn success_status(success: bool) -> &'static str {
     if success {
         "success"
@@ -1315,253 +1364,201 @@ fn chain_label(chain_type: ChainType) -> String {
     chain_type.to_db_string().to_string()
 }
 
-fn u256_to_gwei_f64(value: U256) -> f64 {
-    value.to_string().parse::<f64>().unwrap_or(f64::MAX) / WEI_PER_GWEI
+struct PendingPaymasterAppResponse {
+    response_tx: oneshot::Sender<Result<Option<String>>>,
+    command: &'static str,
+    started: Instant,
 }
 
-async fn run_evm_paymaster_actor(
-    actor: EvmPaymasterActor,
+async fn run_evm_paymaster_app_actor(
+    actor: EvmPaymasterAppActor,
     mut command_rx: mpsc::Receiver<EvmPaymasterCommand>,
 ) {
-    while let Some(command) = command_rx.recv().await {
+    let paymaster = Paymaster::spawn(
+        actor.provider.clone(),
+        actor.wallet_provider.clone(),
+        actor.sponsor_signer.clone(),
+        actor.vault_gas_buffer_wei,
+        actor.chain_type.to_db_string(),
+        actor.batch_config,
+    );
+
+    while let Some(batch) =
+        drain_evm_paymaster_app_commands(&mut command_rx, actor.batch_config.max_size).await
+    {
+        process_evm_paymaster_app_batch(actor.chain_type, &actor.provider, &paymaster, batch).await;
+    }
+}
+
+async fn drain_evm_paymaster_app_commands(
+    command_rx: &mut mpsc::Receiver<EvmPaymasterCommand>,
+    max_size: usize,
+) -> Option<Vec<EvmPaymasterCommand>> {
+    let max_size = max_size.max(1);
+    let first_command = command_rx.recv().await?;
+    let mut batch = Vec::with_capacity(max_size.min(EVM_PAYMASTER_COMMAND_BUFFER));
+    batch.push(first_command);
+
+    while batch.len() < max_size {
+        match command_rx.try_recv() {
+            Ok(command) => batch.push(command),
+            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+        }
+    }
+
+    Some(batch)
+}
+
+async fn process_evm_paymaster_app_batch(
+    chain_type: ChainType,
+    provider: &DynProvider,
+    paymaster: &PaymasterHandle,
+    commands: Vec<EvmPaymasterCommand>,
+) {
+    let mut requests = Vec::with_capacity(commands.len());
+    let mut pending_responses = Vec::with_capacity(commands.len());
+
+    for command in commands {
         match command {
             EvmPaymasterCommand::FundVaultAction {
                 request,
                 response_tx,
             } => {
                 let started = Instant::now();
-                record_paymaster_command_started(actor.chain_type, "fund_vault_action");
-                let result = actor.fund_vault_action(request).await;
-                record_paymaster_command_processed(
-                    actor.chain_type,
-                    "fund_vault_action",
-                    result.is_ok(),
-                    started.elapsed(),
-                );
-                let _ = response_tx.send(result);
+                let command_name = "fund_vault_action";
+                record_paymaster_command_started(chain_type, command_name);
+                requests.push(vault_action_funding_request(provider, request));
+                pending_responses.push(PendingPaymasterAppResponse {
+                    response_tx,
+                    command: command_name,
+                    started,
+                });
             }
             EvmPaymasterCommand::FundEvmTransaction {
                 request,
                 response_tx,
             } => {
                 let started = Instant::now();
-                record_paymaster_command_started(actor.chain_type, "fund_evm_transaction");
-                let result = actor.fund_evm_transaction(request).await;
+                let command_name = "fund_evm_transaction";
+                record_paymaster_command_started(chain_type, command_name);
+                requests.push(evm_transaction_funding_request(request));
+                pending_responses.push(PendingPaymasterAppResponse {
+                    response_tx,
+                    command: command_name,
+                    started,
+                });
+            }
+        }
+    }
+
+    match paymaster.fund_transaction_submissions(requests).await {
+        Ok(submissions) => {
+            let mut response_tasks = JoinSet::new();
+            for (pending, submission) in pending_responses.into_iter().zip(submissions) {
+                response_tasks.spawn(async move {
+                    let result = submission
+                        .wait()
+                        .await
+                        .map(|tx_hash| tx_hash.map(|tx_hash| tx_hash.to_string()))
+                        .map_err(|error| paymaster_error_to_chain_error(chain_type, error));
+                    record_paymaster_command_processed(
+                        chain_type,
+                        pending.command,
+                        result.is_ok(),
+                        pending.started.elapsed(),
+                    );
+                    let _ = pending.response_tx.send(result);
+                });
+            }
+            while response_tasks.join_next().await.is_some() {
+                // Drain all forwarding tasks before accepting the next application batch.
+            }
+        }
+        Err(error) => {
+            let message = error.to_string();
+            for pending in pending_responses {
                 record_paymaster_command_processed(
-                    actor.chain_type,
-                    "fund_evm_transaction",
-                    result.is_ok(),
-                    started.elapsed(),
+                    chain_type,
+                    pending.command,
+                    false,
+                    pending.started.elapsed(),
                 );
-                let _ = response_tx.send(result);
+                let _ = pending.response_tx.send(Err(crate::Error::PaymasterActor {
+                    chain: chain_type,
+                    message: message.clone(),
+                }));
             }
         }
     }
 }
 
-impl EvmPaymasterActor {
-    async fn fund_vault_action(&self, request: FundVaultAction) -> Result<Option<String>> {
-        let FundVaultAction {
-            token_address,
-            vault_address,
-            recipient_address,
-            token_amount,
-        } = request;
+fn vault_action_funding_request(
+    provider: &DynProvider,
+    request: FundVaultAction,
+) -> PaymasterFundingRequest {
+    let FundVaultAction {
+        token_address,
+        vault_address,
+        recipient_address,
+        token_amount,
+    } = request;
 
-        debug!(
-            chain = self.chain_type.to_db_string(),
-            %token_address,
-            %vault_address,
-            %recipient_address,
-            %token_amount,
-            "EVM paymaster actor processing vault action funding request"
-        );
+    debug!(
+        %token_address,
+        %vault_address,
+        %recipient_address,
+        %token_amount,
+        "EVM paymaster actor processing vault action funding request"
+    );
 
-        let token_contract = GenericEIP3009ERC20Instance::new(token_address, &self.provider);
-        let transfer_calldata = token_contract
-            .transfer(recipient_address, token_amount)
-            .calldata()
-            .clone();
-        self.fund_evm_transaction(FundEvmTransactionAction {
-            vault_address,
-            target_address: token_address,
-            value: U256::ZERO,
-            calldata: transfer_calldata,
-            operation: "erc20_transfer",
-        })
-        .await
+    let token_contract = GenericEIP3009ERC20Instance::new(token_address, provider);
+    let transfer_calldata = token_contract
+        .transfer(recipient_address, token_amount)
+        .calldata()
+        .clone();
+
+    PaymasterFundingRequest {
+        vault_address,
+        target_address: token_address,
+        value: U256::ZERO,
+        calldata: transfer_calldata,
+        operation: "erc20_transfer",
     }
+}
 
-    async fn fund_evm_transaction(
-        &self,
-        request: FundEvmTransactionAction,
-    ) -> Result<Option<String>> {
-        let FundEvmTransactionAction {
-            vault_address,
-            target_address,
-            value,
-            calldata,
-            operation,
-        } = request;
+fn evm_transaction_funding_request(request: FundEvmTransactionAction) -> PaymasterFundingRequest {
+    PaymasterFundingRequest {
+        vault_address: request.vault_address,
+        target_address: request.target_address,
+        value: request.value,
+        calldata: request.calldata,
+        operation: request.operation,
+    }
+}
 
-        debug!(
-            chain = self.chain_type.to_db_string(),
-            %vault_address,
-            %target_address,
-            %value,
-            operation,
-            "EVM paymaster actor processing transaction funding request"
-        );
-
-        let action_estimate_request = TransactionRequest::default()
-            .with_from(vault_address)
-            .with_to(target_address)
-            .with_value(value)
-            .with_gas_limit(EVM_CALL_ESTIMATE_GAS_CAP)
-            .with_input(calldata);
-        let action_gas_limit = estimate_evm_gas_or_cap(
-            &self.provider,
-            self.chain_type,
-            action_estimate_request,
-            operation,
-        )
-        .await?;
-        record_paymaster_gas_estimate(self.chain_type, operation, action_gas_limit);
-        let fee_estimate = retry_evm_rpc(self.chain_type, "estimate_eip1559_fees", || async {
-            self.provider.estimate_eip1559_fees().await
-        })
-        .await
-        .map_err(|e| crate::Error::EVMRpcError {
-            source: e,
+fn paymaster_error_to_chain_error(chain_type: ChainType, error: PaymasterError) -> crate::Error {
+    match error {
+        PaymasterError::EVMRpcError { source, .. } => crate::Error::EVMRpcError {
+            source,
             loc: location!(),
-        })?;
-        let action_max_fee_per_gas = max_fee_per_gas_with_headroom(fee_estimate.max_fee_per_gas)?;
-        let action_reserved_fee = checked_gas_fee(
-            action_gas_limit,
-            action_max_fee_per_gas,
-            "paymaster action gas reservation",
-        )?;
-        let required_vault_balance = checked_u256_add(
-            value,
-            action_reserved_fee,
-            "paymaster vault required balance",
-        )?;
-        let required_vault_balance = checked_u256_add(
-            required_vault_balance,
-            self.vault_gas_buffer_wei,
-            "paymaster vault gas buffer",
-        )?;
-
-        let current_balance = retry_evm_rpc(self.chain_type, "get_balance", || async {
-            self.provider.get_balance(vault_address).await
-        })
-        .await
-        .map_err(|e| crate::Error::EVMRpcError {
-            source: e,
-            loc: location!(),
-        })?;
-        record_paymaster_balance_gwei(self.chain_type, "vault", current_balance);
-        if current_balance < value {
-            record_paymaster_funding_failed(self.chain_type, "insufficient_action_value");
-            return Err(crate::Error::InsufficientBalance {
-                required: value,
-                available: current_balance,
-            });
+        },
+        PaymasterError::TransactionReverted { tx_hash } => {
+            crate::Error::TransactionReverted { tx_hash }
         }
-        if current_balance >= required_vault_balance {
-            record_paymaster_funding_skipped(self.chain_type, "already_funded");
-            return Ok(None);
-        }
-
-        let top_up_amount = checked_u256_sub(
-            required_vault_balance,
-            current_balance,
-            "paymaster vault top-up amount",
-        )?;
-        let sponsor_balance = retry_evm_rpc(self.chain_type, "get_balance", || async {
-            self.provider.get_balance(self.sponsor_address).await
-        })
-        .await
-        .map_err(|e| crate::Error::EVMRpcError {
-            source: e,
-            loc: location!(),
-        })?;
-        record_paymaster_balance_gwei(self.chain_type, "sponsor", sponsor_balance);
-
-        let estimate_request = TransactionRequest::default()
-            .with_from(self.sponsor_address)
-            .with_to(vault_address)
-            .with_value(top_up_amount);
-        let gas_limit = retry_evm_rpc(self.chain_type, "estimate_gas", || async {
-            self.provider.estimate_gas(estimate_request.clone()).await
-        })
-        .await
-        .map_err(|e| crate::Error::EVMRpcError {
-            source: e,
-            loc: location!(),
-        })?;
-        record_paymaster_gas_estimate(self.chain_type, "native_top_up", gas_limit);
-        let fee_estimate = retry_evm_rpc(self.chain_type, "estimate_eip1559_fees", || async {
-            self.provider.estimate_eip1559_fees().await
-        })
-        .await
-        .map_err(|e| crate::Error::EVMRpcError {
-            source: e,
-            loc: location!(),
-        })?;
-        let max_fee_per_gas = max_fee_per_gas_with_headroom(fee_estimate.max_fee_per_gas)?;
-        let reserved_fee = checked_gas_fee(
-            gas_limit,
-            max_fee_per_gas,
-            "paymaster top-up gas reservation",
-        )?;
-        let required_balance = checked_u256_add(
-            top_up_amount,
-            reserved_fee,
-            "paymaster sponsor required balance",
-        )?;
-        if sponsor_balance < required_balance {
-            record_paymaster_funding_failed(self.chain_type, "insufficient_balance");
-            return Err(crate::Error::InsufficientBalance {
-                required: required_balance,
-                available: sponsor_balance,
-            });
-        }
-
-        let nonce = retry_evm_rpc(self.chain_type, "get_transaction_count_pending", || async {
-            self.provider
-                .get_transaction_count(self.sponsor_address)
-                .pending()
-                .await
-        })
-        .await
-        .map_err(|e| crate::Error::EVMRpcError {
-            source: e,
-            loc: location!(),
-        })?;
-
-        let transaction_request = TransactionRequest::default()
-            .with_from(self.sponsor_address)
-            .with_to(vault_address)
-            .with_value(top_up_amount)
-            .with_nonce(nonce)
-            .with_gas_limit(gas_limit)
-            .with_max_fee_per_gas(max_fee_per_gas)
-            .with_max_priority_fee_per_gas(fee_estimate.max_priority_fee_per_gas);
-
-        let pending_tx = self
-            .wallet_provider
-            .send_transaction(transaction_request)
-            .await
-            .map_err(|e| crate::Error::EVMRpcError {
-                source: e,
-                loc: location!(),
-            })?;
-        let tx_hash = *pending_tx.tx_hash();
-        wait_for_evm_receipt(&self.wallet_provider, self.chain_type, tx_hash).await?;
-
-        record_paymaster_funding_sent(self.chain_type, top_up_amount);
-        Ok(Some(tx_hash.to_string()))
+        PaymasterError::InsufficientBalance {
+            required,
+            available,
+        } => crate::Error::InsufficientBalance {
+            required,
+            available,
+        },
+        PaymasterError::NumericOverflow { context } => crate::Error::NumericOverflow { context },
+        PaymasterError::Serialization { message } => crate::Error::Serialization { message },
+        PaymasterError::DumpToAddress { message } => crate::Error::DumpToAddress { message },
+        PaymasterError::Actor { message } => crate::Error::PaymasterActor {
+            chain: chain_type,
+            message,
+        },
     }
 }
 
@@ -1676,7 +1673,9 @@ async fn estimate_evm_gas_or_cap(
 
 fn is_balance_bound_estimate_error<E: std::fmt::Display>(err: &E) -> bool {
     let message = err.to_string().to_ascii_lowercase();
-    message.contains("insufficient funds") || message.contains("insufficient balance")
+    message.contains("insufficient funds")
+        || message.contains("insufficient balance")
+        || message.contains("transfer amount exceeds balance")
 }
 
 fn is_retryable_evm_rpc_error<E: std::fmt::Display>(err: &E) -> bool {
@@ -1689,7 +1688,9 @@ fn is_retryable_evm_rpc_error<E: std::fmt::Display>(err: &E) -> bool {
 
 fn classify_evm_rpc_error<E: std::fmt::Display>(err: &E) -> &'static str {
     let message = err.to_string().to_ascii_lowercase();
-    if message.contains("429")
+    if is_evm_execution_revert(&message) {
+        "execution_reverted"
+    } else if contains_status_code(&message, "429")
         || message.contains("rate limit")
         || message.contains("rate-limited")
         || message.contains("too many requests")
@@ -1701,10 +1702,10 @@ fn classify_evm_rpc_error<E: std::fmt::Display>(err: &E) -> &'static str {
         || message.contains("temporary internal error")
         || message.contains("incorrect response body")
         || message.contains("wrong json-rpc response")
-        || message.contains("502")
-        || message.contains("503")
-        || message.contains("504")
-        || message.contains("500")
+        || contains_status_code(&message, "502")
+        || contains_status_code(&message, "503")
+        || contains_status_code(&message, "504")
+        || contains_status_code(&message, "500")
     {
         "upstream_unavailable"
     } else if message.contains("connection reset")
@@ -1717,6 +1718,22 @@ fn classify_evm_rpc_error<E: std::fmt::Display>(err: &E) -> &'static str {
     } else {
         "other"
     }
+}
+
+fn is_evm_execution_revert(message: &str) -> bool {
+    message.contains("execution reverted")
+        || message.contains("transaction reverted")
+        || message.contains("revert reason")
+        || message.contains("evm revert")
+}
+
+fn contains_status_code(message: &str, code: &str) -> bool {
+    message.match_indices(code).any(|(idx, _)| {
+        let before = message[..idx].chars().next_back();
+        let after = message[idx + code.len()..].chars().next();
+        before.is_none_or(|ch| !ch.is_ascii_alphanumeric())
+            && after.is_none_or(|ch| !ch.is_ascii_alphanumeric())
+    })
 }
 
 fn record_evm_rpc_retry(chain_type: ChainType, rpc_method: &'static str, error_kind: &'static str) {
@@ -2291,6 +2308,39 @@ mod tests {
     }
 
     #[test]
+    fn erc20_transfer_amount_exceeds_balance_revert_is_not_retryable() {
+        let error = "server returned an error response: error code 3: execution reverted: ERC20: transfer amount exceeds balance, data: 0x08c379a00000000000000000000000000000000000000000000000000000000000000204524332303a207472616e7366657220616d6f756e7420657863656564732062616c616e6365";
+
+        assert_eq!(classify_evm_rpc_error(&error), "execution_reverted");
+        assert!(!is_retryable_evm_rpc_error(&error));
+        assert!(is_balance_bound_estimate_error(&error));
+    }
+
+    #[test]
+    fn revert_data_containing_status_digits_is_not_upstream_unavailable() {
+        let error = "server returned an error response: error code 3: execution reverted: ERC20: transfer amount exceeds balance, data: 0x0000000000000000000000000000000000000000000000000000000000050000";
+
+        assert_eq!(classify_evm_rpc_error(&error), "execution_reverted");
+        assert!(!is_retryable_evm_rpc_error(&error));
+    }
+
+    #[test]
+    fn delimited_http_status_code_is_retryable() {
+        let error = "upstream responded with HTTP 500";
+
+        assert_eq!(classify_evm_rpc_error(&error), "upstream_unavailable");
+        assert!(is_retryable_evm_rpc_error(&error));
+    }
+
+    #[test]
+    fn status_digits_embedded_in_payload_are_not_http_status_codes() {
+        let error = "bad rpc payload 0x0000000000050000";
+
+        assert_eq!(classify_evm_rpc_error(&error), "other");
+        assert!(!is_retryable_evm_rpc_error(&error));
+    }
+
+    #[test]
     fn reverted_evm_tx_status_is_failed_not_confirmed() {
         assert_eq!(
             evm_tx_status_from_receipt_fields(false, Some(10), 12).unwrap(),
@@ -2332,5 +2382,41 @@ mod tests {
                 if context == "evm confirmation count"
         ));
         assert!(evm_tx_status_from_receipt_fields(true, Some(12), 11).is_err());
+    }
+
+    #[test]
+    fn flashbots_policy_only_selects_flashbots_for_non_local_ethereum() {
+        assert_eq!(
+            select_broadcast_rpc_url(
+                "https://ethereum-mainnet.example",
+                ChainType::Ethereum,
+                EvmBroadcastPolicy::FlashbotsIfEthereum,
+            ),
+            FLASHBOTS_ETHEREUM_RPC_URL
+        );
+        assert_eq!(
+            select_broadcast_rpc_url(
+                "https://base-mainnet.example",
+                ChainType::Base,
+                EvmBroadcastPolicy::FlashbotsIfEthereum,
+            ),
+            "https://base-mainnet.example"
+        );
+        assert_eq!(
+            select_broadcast_rpc_url(
+                "http://localhost:50101",
+                ChainType::Ethereum,
+                EvmBroadcastPolicy::FlashbotsIfEthereum,
+            ),
+            "http://localhost:50101"
+        );
+        assert_eq!(
+            select_broadcast_rpc_url(
+                "https://ethereum-mainnet.example",
+                ChainType::Ethereum,
+                EvmBroadcastPolicy::Standard,
+            ),
+            "https://ethereum-mainnet.example"
+        );
     }
 }

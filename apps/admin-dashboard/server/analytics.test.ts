@@ -87,9 +87,9 @@ test('completed order volume contribution requires actual input amount evidence'
   expect(completedOrderContribution(order)).toBeUndefined()
 })
 
-test('completed order volume contribution ignores planned input valuation', () => {
+test('completed order volume contribution falls back to planned input unit pricing', () => {
   const order = completedOrder({
-    rawAmount: '1000000',
+    rawAmount: '999999',
     amountUsdMicro: '1000000',
     completedAt: '2026-05-04T06:00:12.345Z'
   })
@@ -108,7 +108,9 @@ test('completed order volume contribution ignores planned input valuation', () =
     }
   }
 
-  expect(completedOrderContribution(order)).toBeUndefined()
+  expect(completedOrderContribution(order)).toMatchObject({
+    volumeUsdMicro: 999999n
+  })
 })
 
 test('analytics runtime close wakes a sleeping backfill retry loop', async () => {

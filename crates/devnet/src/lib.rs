@@ -870,26 +870,27 @@ impl RiftDevnetBuilder {
         // 5) Ethereum side (chain ID 31337, default port)
         let ethereum_start = Instant::now();
 
-        let ethereum_devnet = crate::evm_devnet::EthDevnet::setup(
-            deploy_mode.clone(),
-            devnet_cache.clone(),
-            self.token_indexer_database_url.clone(),
-            token_indexer_api_key.clone(),
-            self.interactive,
-            1, // Ethereum chain ID
-            if self.interactive {
-                Some(DEVNET_ETHEREUM_RPC_PORT)
-            } else {
-                None
-            },
-            if self.interactive {
-                Some(DEVNET_ETHEREUM_TOKEN_INDEXER_PORT)
-            } else {
-                None
-            },
-        )
-        .await
-        .map_err(|e| eyre::eyre!("[devnet builder] Failed to setup Ethereum devnet: {}", e))?;
+        let ethereum_devnet =
+            crate::evm_devnet::EthDevnet::setup(crate::evm_devnet::EthDevnetSetup {
+                deploy_mode: deploy_mode.clone(),
+                devnet_cache: devnet_cache.clone(),
+                token_indexer_database_url: self.token_indexer_database_url.clone(),
+                token_indexer_api_key: token_indexer_api_key.clone(),
+                interactive: self.interactive,
+                chain_id: 1, // Ethereum chain ID
+                port: if self.interactive {
+                    Some(DEVNET_ETHEREUM_RPC_PORT)
+                } else {
+                    None
+                },
+                token_indexer_port: if self.interactive {
+                    Some(DEVNET_ETHEREUM_TOKEN_INDEXER_PORT)
+                } else {
+                    None
+                },
+            })
+            .await
+            .map_err(|e| eyre::eyre!("[devnet builder] Failed to setup Ethereum devnet: {}", e))?;
 
         info!(
             "[Devnet Builder] Ethereum devnet setup took {:?}",
@@ -899,24 +900,24 @@ impl RiftDevnetBuilder {
         // 6) Base side (chain ID 8453, port 50102 in interactive mode)
         let base_start = Instant::now();
 
-        let base_devnet = crate::evm_devnet::EthDevnet::setup(
-            deploy_mode.clone(),
-            devnet_cache.clone(), // Use cache for Base
-            self.token_indexer_database_url.clone(),
-            token_indexer_api_key.clone(),
-            self.interactive,
-            8453, // Base chain ID
-            if self.interactive {
+        let base_devnet = crate::evm_devnet::EthDevnet::setup(crate::evm_devnet::EthDevnetSetup {
+            deploy_mode: deploy_mode.clone(),
+            devnet_cache: devnet_cache.clone(), // Use cache for Base
+            token_indexer_database_url: self.token_indexer_database_url.clone(),
+            token_indexer_api_key: token_indexer_api_key.clone(),
+            interactive: self.interactive,
+            chain_id: 8453, // Base chain ID
+            port: if self.interactive {
                 Some(DEVNET_BASE_RPC_PORT)
             } else {
                 None
             },
-            if self.interactive {
+            token_indexer_port: if self.interactive {
                 Some(DEVNET_BASE_TOKEN_INDEXER_PORT)
             } else {
                 None
             },
-        )
+        })
         .await
         .map_err(|e| eyre::eyre!("[devnet builder] Failed to setup Base devnet: {}", e))?;
 
@@ -928,26 +929,27 @@ impl RiftDevnetBuilder {
         // 7) Arbitrum side (chain ID 42161, port 50103 in interactive mode)
         let arbitrum_start = Instant::now();
 
-        let arbitrum_devnet = crate::evm_devnet::EthDevnet::setup(
-            deploy_mode,
-            devnet_cache.clone(),
-            self.token_indexer_database_url.clone(),
-            token_indexer_api_key,
-            self.interactive,
-            42161, // Arbitrum chain ID
-            if self.interactive {
-                Some(DEVNET_ARBITRUM_RPC_PORT)
-            } else {
-                None
-            },
-            if self.interactive {
-                Some(DEVNET_ARBITRUM_TOKEN_INDEXER_PORT)
-            } else {
-                None
-            },
-        )
-        .await
-        .map_err(|e| eyre::eyre!("[devnet builder] Failed to setup Arbitrum devnet: {}", e))?;
+        let arbitrum_devnet =
+            crate::evm_devnet::EthDevnet::setup(crate::evm_devnet::EthDevnetSetup {
+                deploy_mode,
+                devnet_cache: devnet_cache.clone(),
+                token_indexer_database_url: self.token_indexer_database_url.clone(),
+                token_indexer_api_key,
+                interactive: self.interactive,
+                chain_id: 42161, // Arbitrum chain ID
+                port: if self.interactive {
+                    Some(DEVNET_ARBITRUM_RPC_PORT)
+                } else {
+                    None
+                },
+                token_indexer_port: if self.interactive {
+                    Some(DEVNET_ARBITRUM_TOKEN_INDEXER_PORT)
+                } else {
+                    None
+                },
+            })
+            .await
+            .map_err(|e| eyre::eyre!("[devnet builder] Failed to setup Arbitrum devnet: {}", e))?;
 
         info!(
             "[Devnet Builder] Arbitrum devnet setup took {:?}",
@@ -1182,6 +1184,15 @@ impl RiftDevnetBuilder {
             .with_across_chain(
                 arbitrum_devnet.anvil.chain_id(),
                 MOCK_ACROSS_SPOKE_POOL_ADDRESS,
+                arbitrum_devnet.anvil.endpoint(),
+            )
+            .with_mock_service_evm_chain(
+                ethereum_devnet.anvil.chain_id(),
+                ethereum_devnet.anvil.endpoint(),
+            )
+            .with_mock_service_evm_chain(base_devnet.anvil.chain_id(), base_devnet.anvil.endpoint())
+            .with_mock_service_evm_chain(
+                arbitrum_devnet.anvil.chain_id(),
                 arbitrum_devnet.anvil.endpoint(),
             )
             .with_across_auth("devnet-across", "rift-devnet")

@@ -1,0 +1,47 @@
+[package]
+name = "temporal-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Required by temporalio-macros 0.4.0 expansion; spike-owned errors still use snafu.
+anyhow = "1.0"
+alloy = { workspace = true }
+bitcoin = { workspace = true }
+bitcoincore-rpc-async = { workspace = true }
+chains = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+futures = "0.3"
+futures-util = "0.3"
+metrics = { workspace = true }
+market-pricing = { workspace = true }
+observability = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+snafu = { workspace = true }
+router-core = { workspace = true }
+router-primitives = { workspace = true }
+router-temporal = { workspace = true }
+temporalio-client = { workspace = true }
+temporalio-common = { workspace = true }
+temporalio-macros = { workspace = true }
+temporalio-sdk = { workspace = true }
+temporalio-sdk-core = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+devnet = { workspace = true }
+eip3009-erc20-contract = { workspace = true }
+hyperunit-client = { workspace = true }
+router-server = { path = "../router-server" }
+sqlx-core = { workspace = true }
+sqlx-postgres = { workspace = true }
+tempfile = { workspace = true }
+testcontainers = "0.27.2"

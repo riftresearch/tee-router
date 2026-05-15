@@ -2,8 +2,6 @@ import {
   Activity,
   ArrowRight,
   BarChart3,
-  ChevronDown,
-  ChevronRight,
   Check,
   CircleAlert,
   Clock3,
@@ -38,6 +36,7 @@ import type {
   OrderExecutionStep,
   OrderFirehoseRow,
   OrderMetrics,
+  OrderProgress,
   OrderTypeFilter,
   UsdAmountValuation,
   UsdValuation,
@@ -47,30 +46,128 @@ import type {
 } from './types'
 
 type StreamState = 'idle' | 'connecting' | 'live' | 'closed' | 'error'
+type OrderListState = {
+  orders: OrderFirehoseRow[]
+  nextCursor?: string
+}
 
 const ORDER_LIMIT = 100
+const LIVE_ORDER_RETAINED_PAGES = 2
+export const LIVE_ORDER_RENDER_LIMIT = ORDER_LIMIT * LIVE_ORDER_RETAINED_PAGES
+const LIVE_ORDER_PRUNE_SCROLL_Y = 240
 const SHOW_USD_VALUES = true
 const MAX_VOLUME_CHART_BUCKETS = 1500
+const VOLUME_ANALYTICS_REFRESH_THROTTLE_MS = 2_000
 const WAIT_FOR_DEPOSIT_STEP_TYPE = 'wait_for_deposit'
 const ACTIVE_STEP_STATUSES = new Set(['ready', 'running', 'waiting', 'submitted'])
 const FAILED_STEP_STATUSES = new Set(['failed', 'cancelled'])
+const TERMINAL_STEP_STATUSES = new Set([
+  'completed',
+  'failed',
+  'skipped',
+  'cancelled',
+  'superseded'
+])
+type StatusTone = 'success' | 'danger' | 'active' | 'waiting' | 'neutral'
+type StatusDisplay = {
+  label: string
+  tone: StatusTone
+  title?: string
+}
+type ProgressSegmentState = 'complete' | 'active' | 'failed' | 'pending'
+type ProgressSegment = {
+  index: number
+  label: string
+  state: ProgressSegmentState
+}
+type TimerHandle = ReturnType<typeof window.setTimeout>
+type CoalescedAsyncRefresh = {
+  request: () => void
+  cancel: () => void
+}
+type CoalescedAsyncRefreshOptions = {
+  run: () => Promise<void>
+  onError: (error: unknown) => void
+  minIntervalMs?: number
+  now?: () => number
+  setTimer?: (callback: () => void, delayMs: number) => TimerHandle
+  clearTimer?: (handle: TimerHandle) => void
+}
+const ORDER_STATUS_DISPLAY: Record<string, StatusDisplay> = {
+  quoted: {
+    label: 'Quoted',
+    tone: 'waiting',
+    title: 'Order exists from a quote; funding vault is not attached'
+  },
+  pending_funding: {
+    label: 'Pending Funding',
+    tone: 'waiting',
+    title: 'Funding vault exists and is waiting for deposit'
+  },
+  funded: {
+    label: 'Funded',
+    tone: 'active',
+    title: 'Deposit was observed; execution has not started'
+  },
+  executing: {
+    label: 'Executing',
+    tone: 'active',
+    title: 'Venue execution is in progress'
+  },
+  completed: {
+    label: 'Completed',
+    tone: 'success',
+    title: 'Execution finished successfully'
+  },
+  refund_required: {
+    label: 'Refund Required',
+    tone: 'danger',
+    title: 'Execution cannot complete; automated refund recovery is queued'
+  },
+  refunding: {
+    label: 'Refunding',
+    tone: 'active',
+    title: 'Automated refund recovery is running'
+  },
+  refunded: {
+    label: 'Refunded',
+    tone: 'neutral',
+    title: 'Refund finished'
+  },
+  manual_intervention_required: {
+    label: 'Manual Intervention',
+    tone: 'danger',
+    title: 'Execution state needs operator inspection'
+  },
+  refund_manual_intervention_required: {
+    label: 'Manual Refund',
+    tone: 'danger',
+    title: 'Refund recovery needs operator action'
+  },
+  expired: {
+    label: 'Expired',
+    tone: 'danger',
+    title: 'Funding deadline passed before valid funding was observed'
+  }
+}
 const ORDER_TABS: Array<{ type: OrderTypeFilter; label: string }> = [
   { type: 'market_order', label: 'Market Orders' },
   { type: 'limit_order', label: 'Limit Orders' }
 ]
 const ORDER_FILTERS: Array<{ value: OrderLifecycleFilter; label: string }> = [
-  { value: 'firehose', label: 'Firehose' },
+  { value: 'firehose', label: 'All Orders' },
   { value: 'in_progress', label: 'In Progress' },
-  { value: 'failed', label: 'Failed' },
-  { value: 'refunded', label: 'Refunded' },
-  { value: 'manual_refund', label: 'Manual Refund' }
+  { value: 'needs_attention', label: 'Needs Attention' },
+  { value: 'expired', label: 'Expired' },
+  { value: 'refunded', label: 'Refunded' }
 ]
 const VOLUME_WINDOWS = [
+  { value: '1h', label: '1H' },
+  { value: '6h', label: '6H' },
   { value: '24h', label: '24H' },
   { value: '7d', label: '7D' },
   { value: '30d', label: '30D' },
-  { value: '90d', label: '90D' },
-  { value: 'custom', label: 'Custom' }
+  { value: '90d', label: '90D' }
 ] as const
 type VolumeWindow = (typeof VOLUME_WINDOWS)[number]['value']
 const CHAIN_DISPLAY_NAMES: Record<string, string> = {
@@ -145,7 +242,9 @@ const ASSET_DECIMALS: Record<string, number> = {
 
 export function App() {
   const [me, setMe] = useState<MeResponse | null>(null)
-  const [orders, setOrders] = useState<OrderFirehoseRow[]>([])
+  const [orderList, setOrderList] = useState<OrderListState>(() => ({
+    orders: []
+  }))
   const [orderTab, setOrderTab] = useState<OrderTypeFilter>('market_order')
   const [orderFilter, setOrderFilter] =
     useState<OrderLifecycleFilter>('firehose')
@@ -153,17 +252,10 @@ export function App() {
   const [searchedOrder, setSearchedOrder] = useState<OrderFirehoseRow | null>(
     null
   )
-  const [nextCursor, setNextCursor] = useState<string | undefined>()
   const [metrics, setMetrics] = useState<OrderMetrics | null>(null)
   const [volumeAnalytics, setVolumeAnalytics] =
     useState<VolumeAnalyticsResponse | null>(null)
   const [volumeWindow, setVolumeWindow] = useState<VolumeWindow>('24h')
-  const [customVolumeFrom, setCustomVolumeFrom] = useState(() =>
-    datetimeLocalValue(hoursAgo(24))
-  )
-  const [customVolumeTo, setCustomVolumeTo] = useState(() =>
-    datetimeLocalValue(new Date())
-  )
   const [volumeBucketSize, setVolumeBucketSize] =
     useState<VolumeBucketSize>('hour')
   const [volumeOrderType, setVolumeOrderType] =
@@ -179,14 +271,31 @@ export function App() {
   const [streamState, setStreamState] = useState<StreamState>('idle')
   const [streamRefreshKey, setStreamRefreshKey] = useState(0)
   const [loading, setLoading] = useState(true)
+  const [ordersLoading, setOrdersLoading] = useState(false)
   const [loadingMore, setLoadingMore] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const loadMoreRef = useRef<HTMLDivElement | null>(null)
   const expandedOrderIdRef = useRef<string | null>(null)
   const loadOrderDetailsRef = useRef<(orderId: string) => void>(() => undefined)
   const loadVolumeAnalyticsRef = useRef<() => Promise<void>>(async () => undefined)
+  const volumeRefreshSchedulerRef = useRef<CoalescedAsyncRefresh | undefined>(
+    undefined
+  )
   const copiedOrderTimeoutRef = useRef<number | undefined>(undefined)
   const rowFlashTimeoutsRef = useRef<Map<string, number>>(new Map())
+
+  const orders = orderList.orders
+  const nextCursor = orderList.nextCursor
+
+  const pruneLiveOrderList = useCallback((state: OrderListState): OrderListState => {
+    const nextOrders = state.orders
+    const pruned = liveOrderPruneResult(nextOrders, expandedOrderIdRef.current)
+    if (!pruned) return state
+    return {
+      orders: pruned.orders,
+      nextCursor: pruned.nextCursor
+    }
+  }, [])
 
   const loadSession = useCallback(async () => {
     setError(null)
@@ -196,7 +305,7 @@ export function App() {
   }, [])
 
   const loadVolumeAnalytics = useCallback(async () => {
-    const range = volumeDateRange(volumeWindow, customVolumeFrom, customVolumeTo)
+    const range = volumeDateRange(volumeWindow)
     const response = await fetchVolumeAnalytics({
       bucketSize: volumeBucketSize,
       orderType: volumeOrderType,
@@ -204,7 +313,7 @@ export function App() {
       to: range.to.toISOString()
     })
     setVolumeAnalytics(response)
-  }, [customVolumeFrom, customVolumeTo, volumeBucketSize, volumeOrderType, volumeWindow])
+  }, [volumeBucketSize, volumeOrderType, volumeWindow])
 
   const loadMoreOrders = useCallback(async () => {
     if (!nextCursor || loadingMore || searchedOrder) return
@@ -219,8 +328,10 @@ export function App() {
         orderFilter,
         false
       )
-      setOrders((current) => mergeOrders(current, response.orders))
-      setNextCursor(response.nextCursor)
+      setOrderList((current) => ({
+        orders: mergeOrders(current.orders, response.orders),
+        nextCursor: response.nextCursor
+      }))
       if (response.metrics) setMetrics(response.metrics)
     } catch (loadError) {
       setError(errorMessage(loadError))
@@ -266,7 +377,10 @@ export function App() {
     })
     try {
       const response = await fetchOrderById(orderId)
-      setOrders((current) => upsertOrder(current, response.order))
+      setOrderList((current) => ({
+        ...current,
+        orders: upsertOrder(current.orders, response.order)
+      }))
       setSearchedOrder((current) =>
         current?.id === orderId ? response.order : current
       )
@@ -309,6 +423,10 @@ export function App() {
 
   const refreshOrderStream = useCallback(() => {
     setStreamRefreshKey((current) => current + 1)
+  }, [])
+
+  const requestVolumeAnalyticsRefresh = useCallback(() => {
+    volumeRefreshSchedulerRef.current?.request()
   }, [])
 
   const copyOrderId = useCallback(async (orderId: string) => {
@@ -362,6 +480,25 @@ export function App() {
   }, [loadVolumeAnalytics])
 
   useEffect(() => {
+    volumeRefreshSchedulerRef.current?.cancel()
+    volumeRefreshSchedulerRef.current = undefined
+    if (!me?.authorized || !me.analyticsConfigured) return
+
+    const scheduler = createCoalescedAsyncRefresh({
+      run: () => loadVolumeAnalyticsRef.current(),
+      onError: (loadError) => setError(errorMessage(loadError))
+    })
+    volumeRefreshSchedulerRef.current = scheduler
+
+    return () => {
+      scheduler.cancel()
+      if (volumeRefreshSchedulerRef.current === scheduler) {
+        volumeRefreshSchedulerRef.current = undefined
+      }
+    }
+  }, [me?.analyticsConfigured, me?.authorized])
+
+  useEffect(() => {
     let cancelled = false
 
     const load = async () => {
@@ -389,7 +526,7 @@ export function App() {
 
     const load = async () => {
       try {
-        const range = volumeDateRange(volumeWindow, customVolumeFrom, customVolumeTo)
+        const range = volumeDateRange(volumeWindow)
         const response = await fetchVolumeAnalytics({
           bucketSize: volumeBucketSize,
           orderType: volumeOrderType,
@@ -407,8 +544,6 @@ export function App() {
      cancelled = true
    }
  }, [
-    customVolumeFrom,
-    customVolumeTo,
     me?.analyticsConfigured,
     me?.authorized,
     volumeBucketSize,
@@ -419,15 +554,52 @@ export function App() {
   useEffect(() => {
     if (!me?.authorized) return
 
+    let cancelled = false
     setStreamState('connecting')
-    setOrders([])
-    setNextCursor(undefined)
+    setOrdersLoading(true)
+    setOrderList({ orders: [] })
     setExpandedOrderId(null)
     setLoadingMore(false)
     setError(null)
+
+    const loadInitialOrders = async () => {
+      try {
+        const response = await fetchOrders(
+          ORDER_LIMIT,
+          undefined,
+          orderTab,
+          orderFilter,
+          true
+        )
+        if (cancelled) return
+        setOrderList((current) =>
+          pruneLiveOrderList({
+            orders: mergeOrders(current.orders, response.orders),
+            nextCursor: response.nextCursor
+          })
+        )
+        if (response.metrics) setMetrics(response.metrics)
+        if (expandedOrderIdRef.current) {
+          const expandedSummary = response.orders.find(
+            (order) => order.id === expandedOrderIdRef.current
+          )
+          if (expandedSummary && expandedSummary.detailLevel !== 'full') {
+            loadOrderDetailsRef.current(expandedSummary.id)
+          }
+        }
+      } catch (loadError) {
+        if (!cancelled) setError(errorMessage(loadError))
+      } finally {
+        if (!cancelled) setOrdersLoading(false)
+      }
+    }
+
+    void loadInitialOrders()
+
     const params = new URLSearchParams({
       limit: String(ORDER_LIMIT),
-      orderType: orderTab
+      orderType: orderTab,
+      snapshot: 'false'
     })
     if (orderFilter !== 'firehose') params.set('filter', orderFilter)
     const source = new EventSource(`/api/orders/events?${params.toString()}`, {
@@ -444,10 +616,22 @@ export function App() {
     source.addEventListener('snapshot', (event) => {
       try {
         const snapshot = parseSnapshotEvent(event as MessageEvent<string>)
-        setOrders(sortOrders(snapshot.orders))
-        setNextCursor(snapshot.nextCursor)
+        setOrderList((current) =>
+          pruneLiveOrderList({
+            orders: mergeSnapshotOrders(current.orders, snapshot.orders),
+            nextCursor: snapshot.nextCursor
+          })
+        )
         if (snapshot.metrics) setMetrics(snapshot.metrics)
         setStreamState('live')
+        if (expandedOrderIdRef.current) {
+          const expandedSummary = snapshot.orders.find(
+            (order) => order.id === expandedOrderIdRef.current
+          )
+          if (expandedSummary && expandedSummary.detailLevel !== 'full') {
+            loadOrderDetailsRef.current(expandedSummary.id)
+          }
+        }
       } catch (streamError) {
         rejectStreamEvent(streamError)
       }
@@ -457,7 +641,12 @@ export function App() {
         const { order, metrics: nextMetrics, analyticsChanged } = parseUpsertEvent(
           event as MessageEvent<string>
         )
-        setOrders((current) => upsertVisibleOrder(current, order))
+        setOrderList((current) =>
+          pruneLiveOrderList({
+            ...current,
+            orders: upsertVisibleOrder(current.orders, order)
+          })
+        )
         setSearchedOrder((current) => (current?.id === order.id ? order : current))
         if (nextMetrics) setMetrics(nextMetrics)
         markOrderFlashed(order.id)
@@ -468,9 +657,7 @@ export function App() {
           (analyticsChanged || order.status === 'completed') &&
           me.analyticsConfigured
         ) {
-          void loadVolumeAnalyticsRef
-            .current()
-            .catch((loadError) => setError(errorMessage(loadError)))
+          requestVolumeAnalyticsRefresh()
         }
       } catch (streamError) {
         rejectStreamEvent(streamError)
@@ -481,13 +668,14 @@ export function App() {
         const { id, metrics: nextMetrics, analyticsChanged } = parseRemoveEvent(
           event as MessageEvent<string>
         )
-        setOrders((current) => current.filter((order) => order.id !== id))
+        setOrderList((current) => ({
+          ...current,
+          orders: current.orders.filter((order) => order.id !== id)
+        }))
         setSearchedOrder((current) => (current?.id === id ? null : current))
         if (nextMetrics) setMetrics(nextMetrics)
         if (analyticsChanged && me.analyticsConfigured) {
-          void loadVolumeAnalyticsRef
-            .current()
-            .catch((loadError) => setError(errorMessage(loadError)))
+          requestVolumeAnalyticsRefresh()
         }
       } catch (streamError) {
         rejectStreamEvent(streamError)
@@ -500,9 +688,7 @@ export function App() {
         )
         if (nextMetrics) setMetrics(nextMetrics)
         if (analyticsChanged && me.analyticsConfigured) {
-          void loadVolumeAnalyticsRef
-            .current()
-            .catch((loadError) => setError(errorMessage(loadError)))
+          requestVolumeAnalyticsRefresh()
         }
       } catch (streamError) {
         rejectStreamEvent(streamError)
@@ -513,6 +699,7 @@ export function App() {
     })
 
     return () => {
+      cancelled = true
       source.close()
       setStreamState('closed')
     }
@@ -522,6 +709,8 @@ export function App() {
     me?.authorized,
     orderFilter,
     orderTab,
+    pruneLiveOrderList,
+    requestVolumeAnalyticsRefresh,
     streamRefreshKey
   ])
 
@@ -536,6 +725,28 @@ export function App() {
       rowFlashTimeoutsRef.current.clear()
     }
   }, [])
+
+  useEffect(() => {
+    if (!me?.authorized || typeof window === 'undefined') return
+
+    let animationFrame: number | undefined
+    const pruneIfPinned = () => {
+      if (!isLiveOrderPruningAllowed() || animationFrame !== undefined) return
+      animationFrame = window.requestAnimationFrame(() => {
+        animationFrame = undefined
+        setOrderList((current) => pruneLiveOrderList(current))
+      })
+    }
+
+    window.addEventListener('scroll', pruneIfPinned, { passive: true })
+    pruneIfPinned()
+    return () => {
+      window.removeEventListener('scroll', pruneIfPinned)
+      if (animationFrame !== undefined) {
+        window.cancelAnimationFrame(animationFrame)
+      }
+    }
+  }, [me?.authorized, pruneLiveOrderList])
 
   useEffect(() => {
     if (!me?.authorized || !nextCursor) return
@@ -606,11 +817,7 @@ export function App() {
             window={volumeWindow}
             bucketSize={volumeBucketSize}
             orderType={volumeOrderType}
-            customFrom={customVolumeFrom}
-            customTo={customVolumeTo}
             onWindowChange={setVolumeWindow}
-            onCustomFromChange={setCustomVolumeFrom}
-            onCustomToChange={setCustomVolumeTo}
             onBucketSizeChange={setVolumeBucketSize}
             onOrderTypeChange={setVolumeOrderType}
           />
@@ -640,46 +847,47 @@ export function App() {
 
         <section className="orders-surface" aria-label="Orders">
           <div className="table-toolbar">
-            <div>
-              <h2>Orders</h2>
-              <p>created_at DESC</p>
+            <div className="table-toolbar-left">
+              <OrderSearch
+                value={searchInput}
+                active={Boolean(searchedOrder)}
+                onChange={setSearchInput}
+                onSearch={searchOrder}
+                onClear={clearSearch}
+              />
             </div>
-            <div className="table-toolbar-actions">
+            <div className="table-toolbar-center">
               <OrderTabs active={orderTab} onChange={changeOrderTab} />
+            </div>
+            <div className="table-toolbar-right">
+              <OrderFilterButtons active={orderFilter} onChange={changeOrderFilter} />
               <StreamBadge state={streamState} />
             </div>
-          </div>
-
-          <div className="table-controls">
-            <OrderSearch
-              value={searchInput}
-              active={Boolean(searchedOrder)}
-              onChange={setSearchInput}
-              onSearch={searchOrder}
-              onClear={clearSearch}
-            />
-            <OrderFilterButtons active={orderFilter} onChange={changeOrderFilter} />
           </div>
 
           <div className="table-scroll">
             <table className="orders-table">
               <thead>
                 <tr>
-                  <th aria-label="Expand"></th>
+                  <th>Order ID</th>
                   <th>Created</th>
-                  <th>Order</th>
                   <th>Route</th>
-                  <th>{orderTab === 'limit_order' ? 'Limit State' : 'Kind'}</th>
                   <th>Quote</th>
                   <th>Executed</th>
+                  <th>{orderTab === 'limit_order' ? 'Limit State' : 'Kind'}</th>
                   <th>{orderTab === 'limit_order' ? 'Backend Status' : 'Status'}</th>
-                  <th>Venue Progress</th>
                 </tr>
               </thead>
               <tbody>
-                {displayedOrders.length === 0 ? (
+                {ordersLoading && displayedOrders.length === 0 ? (
                   <tr>
-                    <td className="empty" colSpan={9}>
+                    <td className="empty" colSpan={7}>
+                      Loading orders
+                    </td>
+                  </tr>
+                ) : displayedOrders.length === 0 ? (
+                  <tr>
+                    <td className="empty" colSpan={7}>
                       No orders found
                     </td>
                   </tr>
@@ -730,17 +938,38 @@ function Shell({
   return (
     <div className="app-shell">
       <header className="topbar">
-        <div className="brand">
-          <span className="brand-mark">R</span>
-          <div>
-            <h1>Rift Admin</h1>
-            <p>TEE Router</p>
-          </div>
+        <div className="topbar-inner">
+          <button
+            type="button"
+            className="brand brand-logo-button"
+            onClick={() => window.location.reload()}
+            aria-label="Reload Rift Admin"
+          >
+            <RiftWordmark />
+          </button>
+          {right}
         </div>
-        {right}
       </header>
       {children}
     </div>
+  )
+}
+
+function RiftWordmark() {
+  return (
+    <svg
+      width="110"
+      height="28"
+      viewBox="0 0 3190 674"
+      fill="none"
+      xmlns="http://www.w3.org/2000/svg"
+      aria-hidden="true"
+    >
+      <path
+        d="M362.16 0.509766L708.992 1.01953C764.583 1.01988 854.441 35.3784 899.254 66.0684C946.209 98.2244 976.303 137.703 991.728 187.377C998.545 209.335 999.065 270.158 992.616 291.358C977.097 342.374 948.466 381.798 903.368 414.254C880.445 430.753 849.028 447.137 821.983 456.698C811.159 460.525 802.305 464.051 802.305 464.535C802.324 465.034 855.943 511.837 921.476 568.554C987.014 625.277 1040.64 672.038 1040.65 672.471C1040.65 672.896 989.297 673.212 926.534 673.17L812.423 673.096L709.3 578.507L606.177 483.921H326.44L231.556 373.886H462.542C577.817 373.886 657.812 373.229 672.215 372.168C764.603 365.355 822.541 317.06 822.541 246.859C822.541 191.068 785.958 148.878 721.28 130.076C691.254 121.348 696.678 121.509 432.987 121.479L188.463 121.451V673.246H0.960938V58.8457C0.960938 26.3598 27.3199 0.0372334 59.8057 0.0830078L362.16 0.509766ZM1358.4 673.242H1171.9V0H1358.4V673.242ZM2215.9 134.838H1680.88V269.92H2094.76L1997.96 382.709H1680.88V673.242H1493.72V67.4189C1493.72 48.8748 1502.88 33.0017 1521.21 19.8008C1539.53 6.60022 1561.56 5.19057e-05 1587.3 0H2337.08L2215.9 134.838ZM3189.12 134.834H2869.77V673.242H2697.47V134.834H2363.92L2485.05 0H3189.12V134.834Z"
+        fill="#eeeeee"
+      />
+    </svg>
   )
 }
 
@@ -769,7 +998,6 @@ function LoginPanel() {
           <ShieldCheck size={30} />
         </div>
         <h2>Rift Admin</h2>
-        <p>cliff@rift.trade, samee@rift.trade, tristan@rift.trade</p>
         <button className="primary-button" onClick={() => void signIn()}>
           {signingIn ? <RefreshCw size={18} className="spin" /> : <LogIn size={18} />}
           Google Sign-In
@@ -958,11 +1186,7 @@ function VolumePanel({
   window,
   bucketSize,
   orderType,
-  customFrom,
-  customTo,
   onWindowChange,
-  onCustomFromChange,
-  onCustomToChange,
   onBucketSizeChange,
   onOrderTypeChange
 }: {
@@ -970,11 +1194,7 @@ function VolumePanel({
   window: VolumeWindow
   bucketSize: VolumeBucketSize
   orderType: VolumeOrderTypeFilter
-  customFrom: string
-  customTo: string
   onWindowChange: (value: VolumeWindow) => void
-  onCustomFromChange: (value: string) => void
-  onCustomToChange: (value: string) => void
   onBucketSizeChange: (value: VolumeBucketSize) => void
   onOrderTypeChange: (value: VolumeOrderTypeFilter) => void
 }) {
@@ -1001,23 +1221,6 @@ function VolumePanel({
             options={VOLUME_WINDOWS}
             onChange={onWindowChange}
           />
-          {window === 'custom' ? (
-            <div className="custom-volume-window">
-              <input
-                type="datetime-local"
-                value={customFrom}
-                onChange={(event) => onCustomFromChange(event.target.value)}
-                aria-label="Volume from"
-              />
-              <span>to</span>
-              <input
-                type="datetime-local"
-                value={customTo}
-                onChange={(event) => onCustomToChange(event.target.value)}
-                aria-label="Volume to"
-              />
-            </div>
-          ) : null}
           <select
             value={bucketSize}
             onChange={(event) =>
@@ -1025,7 +1228,7 @@ function VolumePanel({
             }
             aria-label="Volume bucket size"
           >
-            <option value="minute">Minute</option>
+            <option value="five_minute">5 Minute</option>
             <option value="hour">Hour</option>
             <option value="day">Day</option>
           </select>
@@ -1079,6 +1282,28 @@ function VolumeChart({
 }: {
   analytics: VolumeAnalyticsResponse | null
 }) {
+  const chartRef = useRef<HTMLDivElement | null>(null)
+  const [measuredWidth, setMeasuredWidth] = useState(1100)
+
+  useEffect(() => {
+    const node = chartRef.current
+    if (!node) return
+
+    const updateWidth = (width: number) => {
+      setMeasuredWidth(Math.max(640, Math.round(width)))
+    }
+
+    updateWidth(node.getBoundingClientRect().width)
+    if (typeof ResizeObserver === 'undefined') return
+
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0]
+      if (entry) updateWidth(entry.contentRect.width)
+    })
+    observer.observe(node)
+    return () => observer.disconnect()
+  }, [analytics])
+
   if (!analytics) {
     return <div className="volume-empty">Loading volume buckets</div>
   }
@@ -1088,9 +1313,9 @@ function VolumeChart({
     return <div className="volume-empty">No completed volume in this window</div>
   }
 
-  const width = 720
-  const height = 176
-  const padding = { top: 18, right: 18, bottom: 24, left: 48 }
+  const width = measuredWidth
+  const height = 238
+  const padding = { top: 22, right: 94, bottom: 54, left: 24 }
   const chartWidth = width - padding.left - padding.right
   const chartHeight = height - padding.top - padding.bottom
   const maxVolumeUsdMicro = buckets.reduce(
@@ -1099,45 +1324,143 @@ function VolumeChart({
     0n
   )
   const maxVolume = maxVolumeUsdMicro > 0n ? maxVolumeUsdMicro : 1n
-  const barGap = 3
-  const barWidth = Math.max(chartWidth / buckets.length - barGap, 1)
+  const slotWidth = chartWidth / buckets.length
+  const barGap = buckets.length > 180 ? 1 : 3
+  const barWidth = Math.min(Math.max(slotWidth - barGap, 2), 42)
+  const barRadius = Math.min(15, barWidth / 2)
+  const yTicks = volumeYAxisTicks(maxVolume, 4)
+  const xTicks = volumeXAxisTicks(
+    buckets,
+    volumeXAxisTickLimit(chartWidth, analytics.bucketSize)
+  )
 
   return (
-    <div className="volume-chart-wrap">
+    <div ref={chartRef} className="volume-chart-wrap">
       <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Volume chart">
-        <line
-          x1={padding.left}
-          y1={height - padding.bottom}
-          x2={width - padding.right}
-          y2={height - padding.bottom}
-          className="volume-axis"
-        />
-        <text x={padding.left} y={14} className="volume-axis-label">
-          {formatUsdMicro(maxVolume.toString())}
-        </text>
+        <defs>
+          <linearGradient id="volume-bar-gradient" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="5%" stopColor="#ffb276" />
+            <stop offset="68%" stopColor="#e55a1c" />
+            <stop offset="89%" stopColor="#913d08" />
+            <stop offset="100%" stopColor="#76371a" />
+          </linearGradient>
+        </defs>
+        {yTicks.map((tick) => {
+          const y =
+            height -
+            padding.bottom -
+            volumeBarHeight(tick.value, maxVolume, chartHeight)
+          return (
+            <g key={tick.key}>
+              <line
+                x1={padding.left}
+                y1={y}
+                x2={width - padding.right}
+                y2={y}
+                className="volume-grid"
+              />
+              <text
+                x={width - padding.right + 12}
+                y={y}
+                className="volume-y-label"
+                textAnchor="start"
+                dominantBaseline="middle"
+              >
+                {formatUsdMicro(tick.value.toString())}
+              </text>
+            </g>
+          )
+        })}
+        {xTicks.map((tick) => {
+          const x = padding.left + tick.index * slotWidth + slotWidth / 2
+          const labelLines = formatVolumeAxisDate(
+            tick.bucket.bucketStart,
+            analytics.bucketSize
+          )
+          const textAnchor =
+            tick.index === 0
+              ? 'start'
+              : tick.index === buckets.length - 1
+                ? 'end'
+                : 'middle'
+          return (
+            <g key={tick.bucket.bucketStart}>
+              <text
+                x={x}
+                y={height - 26}
+                className="volume-x-label"
+                textAnchor={textAnchor}
+              >
+                {labelLines.map((line, lineIndex) => (
+                  <tspan key={line} x={x} dy={lineIndex === 0 ? 0 : 12}>
+                    {line}
+                  </tspan>
+                ))}
+              </text>
+            </g>
+          )
+        })}
         {buckets.map((bucket, index) => {
           const barHeight = volumeBarHeight(
             bucket.volumeUsdMicro,
             maxVolume,
             chartHeight
           )
-          const x = padding.left + index * (barWidth + barGap)
+          const slotX = padding.left + index * slotWidth
+          const x = slotX + Math.max((slotWidth - barWidth) / 2, 0)
           const y = height - padding.bottom - barHeight
+          const tooltip = volumeTooltipLayout(
+            x + barWidth / 2,
+            y,
+            padding,
+            width
+          )
+          const label = `${formatDate(bucket.bucketStart)}, ${formatUsdMicro(
+            bucket.volumeUsdMicro.toString()
+          )}, ${formatCount(bucket.orderCount)} orders`
           return (
-            <rect
+            <g
               key={bucket.bucketStart}
-              className="volume-bar"
-              x={x}
-              y={y}
-              width={barWidth}
-              height={barHeight}
-              rx={3}
+              className="volume-bucket"
+              tabIndex={0}
+              aria-label={label}
             >
-              <title>
-                {formatDate(bucket.bucketStart)} ·{' '}
-                {formatUsdMicro(bucket.volumeUsdMicro.toString())}
-              </title>
-            </rect>
+              <rect
+                className="volume-hit-area"
+                x={slotX}
+                y={padding.top}
+                width={slotWidth}
+                height={chartHeight}
+              />
+              <rect
+                className="volume-bar"
+                x={x}
+                y={y}
+                width={barWidth}
+                height={barHeight}
+                rx={barRadius}
+              />
+              <g
+                className="volume-tooltip"
+                transform={`translate(${tooltip.x} ${tooltip.y})`}
+              >
+                <rect width={tooltip.width} height={tooltip.height} rx={6} />
+                <text x={10} y={17} className="volume-tooltip-value">
+                  {formatUsdMicro(bucket.volumeUsdMicro.toString())}
+                </text>
+                <text x={10} y={33} className="volume-tooltip-meta">
+                  {formatDate(bucket.bucketStart)}
+                </text>
+                <text
+                  x={tooltip.width - 10}
+                  y={33}
+                  className="volume-tooltip-meta"
+                  textAnchor="end"
+                >
+                  {formatCount(bucket.orderCount)}
+                </text>
+              </g>
+            </g>
           )
         })}
       </svg>
@@ -1187,24 +1510,11 @@ function OrderRows({
   onToggle: () => void
   onCopyOrderId: () => void
 }) {
+  const showVenueTimeline = shouldShowVenueProgress(order)
+
   return (
     <>
       <tr className={`order-row ${flashing ? 'flash' : ''}`} onClick={onToggle}>
-        <td>
-          <button
-            className="expand-button"
-            aria-label={expanded ? 'Collapse order' : 'Expand order'}
-            onClick={(event) => {
-              event.stopPropagation()
-              onToggle()
-            }}
-          >
-            {expanded ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
-          </button>
-        </td>
-        <td>
-          <time dateTime={order.createdAt}>{formatDate(order.createdAt)}</time>
-        </td>
         <td>
           <CopyableOrderId
             orderId={order.id}
@@ -1213,7 +1523,16 @@ function OrderRows({
           />
         </td>
         <td>
+          <time dateTime={order.createdAt}>{formatDate(order.createdAt)}</time>
+        </td>
+        <td>
           <RouteCell order={order} />
+        </td>
+        <td>
+          <QuoteCell order={order} />
+        </td>
+        <td>
+          <ExecutedCell order={order} />
         </td>
         <td>
           {order.orderType === 'limit_order' ? (
@@ -1223,21 +1542,19 @@ function OrderRows({
           )}
         </td>
         <td>
-          <QuoteCell order={order} />
-        </td>
-        <td>
-          <ExecutedCell order={order} />
-        </td>
-        <td>
           <StatusPill status={order.status} />
         </td>
-        <td>
-          <ProgressCell order={order} />
-        </td>
       </tr>
+      {showVenueTimeline ? (
+        <tr className="mini-timeline-row" onClick={onToggle}>
+          <td colSpan={7}>
+            <MiniOrderTimeline order={order} />
+          </td>
+        </tr>
+      ) : null}
       {expanded ? (
         <tr className="details-row">
-          <td colSpan={9}>
+          <td colSpan={7}>
             {loadingDetails ? <DetailsLoading /> : <OrderDetails order={order} />}
           </td>
         </tr>
@@ -1452,6 +1769,7 @@ function ExecutedCell({ order }: { order: OrderFirehoseRow }) {
 
 function ProgressCell({ order }: { order: OrderFirehoseRow }) {
   const progress = order.progress
+  const segments = progressSegments(order)
   const activeVenue = progressVenueLabel(order)
   const tone =
     progress.failedStages > 0
@@ -1462,24 +1780,108 @@ function ProgressCell({ order }: { order: OrderFirehoseRow }) {
 
   return (
     <div className="progress-cell">
-      <div className={`progress-bar ${tone}`}>
-        <span
-          style={{
-            width:
-              progress.totalStages === 0
-                ? '0%'
-                : `${Math.round((progress.completedStages / progress.totalStages) * 100)}%`
-          }}
-        />
+      <div className={`progress-segments ${tone}`}>
+        {segments.length === 0 ? (
+          <span className="progress-empty-track" />
+        ) : (
+          segments.map((segment) => (
+            <span
+              key={`${segment.index}-${segment.label}`}
+              className={`progress-segment ${segment.state}`}
+              title={segment.label}
+            />
+          ))
+        )}
       </div>
-      <span>
-        {progress.totalStages === 0
-          ? 'No stages'
-          : `${progress.completedStages}/${progress.totalStages}`}
-      </span>
+      <span>{progressStageCountLabel(progress)}</span>
       {activeVenue ? <em>{activeVenue}</em> : null}
     </div>
   )
+}
+
+export function progressStageCountLabel(progress: OrderProgress) {
+  return `${progress.completedStages}/${progress.totalStages}`
+}
+
+function MiniOrderTimeline({ order }: { order: OrderFirehoseRow }) {
+  const legs = miniTimelineLegs(order)
+  if (legs.length === 0) {
+    return (
+      <div className="mini-timeline-shell">
+        <div className="mini-timeline-empty">No route materialized</div>
+        <ProgressCell order={order} />
+      </div>
+    )
+  }
+
+  return (
+    <div className="mini-timeline-shell">
+      <div className="mini-timeline" aria-label="Mini order timeline">
+        {legs.map((leg) => (
+          <MiniTimelineLegCard key={leg.key} leg={leg} />
+        ))}
+      </div>
+      <ProgressCell order={order} />
+    </div>
+  )
+}
+
+function MiniTimelineLegCard({ leg }: { leg: TimelineLeg }) {
+  const state = timelineState(leg.status)
+  const txStep = miniTimelineTx(leg)
+
+  return (
+    <div className={`mini-timeline-leg ${state}`} title={`${humanize(leg.provider)} ${humanize(leg.kind)}`}>
+      <div className="mini-timeline-leg-header">
+        <strong>{humanize(leg.provider)}</strong>
+        <span>{humanize(leg.kind)}</span>
+      </div>
+      <div className="mini-timeline-route">
+        <span>{miniAssetLabel(leg.inputAsset)}</span>
+        <ArrowRight size={12} aria-hidden="true" />
+        <span>{miniAssetLabel(leg.outputAsset)}</span>
+      </div>
+      <div className="mini-timeline-tx">
+        {txStep.txHash ? (
+          <TimelineLinkedValue
+            chainId={txStep.chainId}
+            value={txStep.txHash}
+            kind="tx"
+          />
+        ) : (
+          <span>{state === 'complete' ? 'No tx hash' : 'No tx yet'}</span>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function miniTimelineTx(leg: TimelineLeg) {
+  const step = [...leg.steps]
+    .reverse()
+    .find((step) => Boolean(step.txHash))
+  if (step?.txHash) {
+    return {
+      txHash: step.txHash,
+      chainId: stepTransactionChain(step)
+    }
+  }
+  return {
+    txHash: leg.txHash,
+    chainId: leg.txChainId
+  }
+}
+
+function miniTimelineLegs(order: OrderFirehoseRow): TimelineLeg[] {
+  const progressLegs = progressStageLegs(order)
+  if (progressLegs.length > 0) return progressLegs
+  return timelineLegs(order)
+}
+
+function miniAssetLabel(asset?: AssetRef) {
+  if (!asset) return 'Unknown'
+  const assetName = assetDisplayName(asset)
+  return `${chainDisplayName(asset.chainId)} ${assetName}`
 }
 
 function OrderDetails({ order }: { order: OrderFirehoseRow }) {
@@ -1493,6 +1895,7 @@ function OrderDetails({ order }: { order: OrderFirehoseRow }) {
 
 type TimelineLeg = {
   key: string
+  executionAttemptId?: string
   index: number
   provider: string
   kind: string
@@ -1510,8 +1913,15 @@ type TimelineLeg = {
   minAmountOut?: string
   maxAmountIn?: string
   updatedAt?: string
+  txHash?: string
+  txChainId?: string
   steps: OrderExecutionStep[]
   references: TimelineReference[]
+}
+
+type TimelineSupersededStats = {
+  hiddenLegs: number
+  attempts: number
 }
 
 type TimelineReference = {
@@ -1524,6 +1934,7 @@ type TimelineReference = {
 
 function OrderTimelinePanel({ order }: { order: OrderFirehoseRow }) {
   const legs = timelineLegs(order)
+  const superseded = timelineSupersededStats(order)
 
   return (
     <div className="detail-block timeline-block">
@@ -1532,7 +1943,10 @@ function OrderTimelinePanel({ order }: { order: OrderFirehoseRow }) {
           <h3>Order Timeline</h3>
           <p>{chainDisplayName(order.source.chainId)} to {chainDisplayName(order.destination.chainId)}</p>
         </div>
-        <StatusPill status={order.status} />
+        <div className="timeline-header-actions">
+          {superseded.hiddenLegs > 0 ? <SupersededTimelineBadge stats={superseded} /> : null}
+          <StatusPill status={order.status} />
+        </div>
       </div>
       <div className="timeline-list">
         <FundingTimelineItem order={order} />
@@ -1546,17 +1960,30 @@ function OrderTimelinePanel({ order }: { order: OrderFirehoseRow }) {
   )
 }
 
+function SupersededTimelineBadge({ stats }: { stats: TimelineSupersededStats }) {
+  const refreshLabel = stats.attempts === 1 ? '1 refresh' : `${stats.attempts} refreshes`
+  const hiddenLabel = stats.hiddenLegs === 1 ? '1 hidden leg' : `${stats.hiddenLegs} hidden legs`
+
+  return (
+    <span className="timeline-superseded-badge" title="Superseded route history">
+      {stats.attempts > 0 ? `${refreshLabel}, ` : null}
+      {hiddenLabel}
+    </span>
+  )
+}
+
 function FundingTimelineItem({ order }: { order: OrderFirehoseRow }) {
   const fundingDeposit = fundingDepositFlow(order)
   const waitStep = order.executionSteps.find((step) => step.stepType === 'wait_for_deposit')
   const completed = waitStep?.status === 'completed'
+  const state = timelineState(waitStep?.status ?? 'planned')
 
   return (
-    <div className="timeline-item root">
+    <div className={`timeline-item root ${state}`}>
       <div className="timeline-rail">
-        <span className="timeline-dot root" />
+        <span className={`timeline-dot root ${state}`} />
       </div>
-      <div className="timeline-card root">
+      <div className={`timeline-card root ${state}`}>
         <div className="timeline-card-header">
           <div>
             <strong>Funding</strong>
@@ -1604,13 +2031,14 @@ function TimelineLegItem({ leg }: { leg: TimelineLeg }) {
   const outputDelta = amountDelta(leg.quotedOutput, leg.executedOutput)
   const inputDelta = amountDelta(leg.quotedInput, leg.executedInput)
   const primaryDelta = outputDelta ?? inputDelta
+  const state = timelineState(leg.status)
 
   return (
-    <div className="timeline-item">
+    <div className={`timeline-item ${state}`}>
       <div className="timeline-rail">
-        <span className="timeline-dot">#{leg.index}</span>
+        <span className={`timeline-dot ${state}`}>#{leg.index}</span>
       </div>
-      <div className="timeline-card">
+      <div className={`timeline-card ${state}`}>
         <div className="timeline-card-header">
           <div>
             <strong>{humanize(leg.provider)}</strong>
@@ -1662,11 +2090,20 @@ function TimelineLegItem({ leg }: { leg: TimelineLeg }) {
                   }
                 : undefined
             }
-            placeholder={leg.executedInput || leg.executedOutput ? undefined : 'Not executed yet'}
+            placeholder={
+              leg.executedInput || leg.executedOutput
+                ? undefined
+                : timelineExecutionPlaceholder(leg)
+            }
           />
         </div>
         <div className="timeline-card-footer">
           <div className="timeline-card-summary">
+            {leg.executionAttemptId ? (
+              <span className="timeline-reference">
+                Attempt <code title={leg.executionAttemptId}>{shortId(leg.executionAttemptId)}</code>
+              </span>
+            ) : null}
             {primaryDelta ? <DeltaPill delta={primaryDelta} /> : null}
             <TimelineGuardrails leg={leg} />
           </div>
@@ -1711,6 +2148,14 @@ function TimelineAmountRow({ side }: { side: AmountPairSide }) {
       <UsdValue valuation={side.usdValuation} />
     </div>
   )
+}
+
+export function timelineExecutionPlaceholder(leg: TimelineLeg) {
+  const hasSubmittedTx = leg.steps.some(
+    (step) => Boolean(step.txHash) && !TERMINAL_STEP_STATUSES.has(step.status)
+  )
+  if (hasSubmittedTx) return 'Transaction submitted, awaiting settlement'
+  return 'Not executed yet'
 }
 
 function TimelineGuardrails({ leg }: { leg: TimelineLeg }) {
@@ -1967,6 +2412,8 @@ function OrderMetadataPanel({ order }: { order: OrderFirehoseRow }) {
         <dd>
           <code title={order.quoteId}>{order.quoteId ?? 'none'}</code>
         </dd>
+        <dt>Slippage</dt>
+        <dd>{formatSlippageBps(order.slippageBps)}</dd>
         <dt>Trace</dt>
         <dd>
           <code title={order.workflowTraceId}>{order.workflowTraceId ?? 'none'}</code>
@@ -1974,6 +2421,15 @@ function OrderMetadataPanel({ order }: { order: OrderFirehoseRow }) {
       </dl>
     </div>
   )
+}
+
+function formatSlippageBps(slippageBps: string | undefined) {
+  if (slippageBps === undefined) return 'none'
+  if (!/^\d+$/.test(slippageBps)) return slippageBps
+  const bps = BigInt(slippageBps)
+  const whole = bps / 100n
+  const fraction = (bps % 100n).toString().padStart(2, '0')
+  return `${whole}.${fraction}% (${slippageBps} bps)`
 }
 
 function StreamBadge({
@@ -1995,7 +2451,12 @@ function StreamBadge({
 }
 
 function StatusPill({ status }: { status: string }) {
-  return <span className={`status-pill ${statusTone(status)}`}>{humanize(status)}</span>
+  const display = statusDisplay(status)
+  return (
+    <span className={`status-pill ${display.tone}`} title={display.title ?? status}>
+      {display.label}
+    </span>
+  )
 }
 
 type QuoteFlowLegUsdValuation = NonNullable<UsdValuation['legs']>[number]
@@ -2143,39 +2604,42 @@ export function timelineLegs(order: OrderFirehoseRow): TimelineLeg[] {
   }
 
   if (order.executionLegs.length > 0) {
-    return [...order.executionLegs]
-      .sort(
-        (left, right) =>
-          left.legIndex - right.legIndex ||
-          left.createdAt.localeCompare(right.createdAt) ||
-          left.id.localeCompare(right.id)
-      )
+    const sortedLegs = [...order.executionLegs].sort(compareExecutionLegs)
+    const quoteLegsByLogicalKey = originalQuoteLegsByLogicalKey(sortedLegs)
+
+    return sortedLegs
+      .filter((leg) => leg.status !== 'superseded')
       .map((leg) => {
         const steps = stepsByLegId.get(leg.id) ?? []
-        const quoteValuation = quoteUsdValuationForExecutionLeg(order, leg)
+        const progressStage = progressStageForLeg(order, leg)
+        const quoteLeg = quoteLegsByLogicalKey.get(logicalExecutionLegKey(leg)) ?? leg
+        const quoteValuation = quoteUsdValuationForExecutionLeg(order, quoteLeg)
         const executedInput = leg.actualAmountIn
         const executedOutput = leg.actualAmountOut
         return {
           key: leg.id,
+          executionAttemptId: leg.executionAttemptId,
           index: leg.legIndex,
           provider: leg.provider,
           kind: leg.legType,
           status: leg.status,
           inputAsset: leg.input,
           outputAsset: leg.output,
-          quotedInput: leg.amountIn,
-          quotedOutput: leg.expectedAmountOut,
+          quotedInput: quoteLeg.amountIn,
+          quotedOutput: quoteLeg.expectedAmountOut,
           executedInput,
           executedOutput,
           quotedInputUsd:
-            valuationForAmount(leg.amountIn, leg.input, leg.usdValuation, ['plannedInput']) ??
-            valuationForAmount(leg.amountIn, leg.input, quoteValuation, ['input']),
+            valuationForAmount(quoteLeg.amountIn, quoteLeg.input, quoteLeg.usdValuation, [
+              'plannedInput'
+            ]) ??
+            valuationForAmount(quoteLeg.amountIn, quoteLeg.input, quoteValuation, ['input']),
           quotedOutputUsd:
-            valuationForAmount(leg.expectedAmountOut, leg.output, leg.usdValuation, [
+            valuationForAmount(quoteLeg.expectedAmountOut, quoteLeg.output, quoteLeg.usdValuation, [
               'plannedOutput',
               'plannedMinOutput'
             ]) ??
-            valuationForAmount(leg.expectedAmountOut, leg.output, quoteValuation, [
+            valuationForAmount(quoteLeg.expectedAmountOut, quoteLeg.output, quoteValuation, [
               'output',
               'minOutput'
             ]),
@@ -2197,15 +2661,20 @@ export function timelineLegs(order: OrderFirehoseRow): TimelineLeg[] {
                 { allowDerived: false }
               )
             : undefined,
-          minAmountOut: leg.minAmountOut,
+          minAmountOut: quoteLeg.minAmountOut,
           updatedAt: leg.updatedAt,
+          txHash: progressStage?.txHash,
+          txChainId: progressStage?.txChainId,
           steps,
           references: timelineReferences(leg.input, leg.output, steps)
         }
       })
   }
 
-  return quoteFlowLegs(order).map((leg) => ({
+  const quoteLegs = quoteFlowLegs(order)
+  if (quoteLegs.length === 0) return progressStageLegs(order)
+
+  return quoteLegs.map((leg) => ({
     key: leg.key,
     index: leg.index,
     provider: leg.provider,
@@ -2222,6 +2691,98 @@ export function timelineLegs(order: OrderFirehoseRow): TimelineLeg[] {
     steps: [],
     references: []
   }))
+}
+
+export function timelineSupersededStats(order: OrderFirehoseRow): TimelineSupersededStats {
+  const supersededLegs = order.executionLegs.filter((leg) => leg.status === 'superseded')
+  const attempts = new Set(
+    supersededLegs
+      .map((leg) => leg.executionAttemptId)
+      .filter((attemptId): attemptId is string => Boolean(attemptId))
+  )
+
+  return {
+    hiddenLegs: supersededLegs.length,
+    attempts: attempts.size
+  }
+}
+
+function compareExecutionLegs(left: OrderExecutionLeg, right: OrderExecutionLeg) {
+  return (
+    left.legIndex - right.legIndex ||
+    left.createdAt.localeCompare(right.createdAt) ||
+    left.id.localeCompare(right.id)
+  )
+}
+
+function originalQuoteLegsByLogicalKey(legs: OrderExecutionLeg[]) {
+  const quoteLegs = new Map<string, OrderExecutionLeg>()
+  for (const leg of legs) {
+    const key = logicalExecutionLegKey(leg)
+    if (!quoteLegs.has(key)) {
+      quoteLegs.set(key, leg)
+    }
+  }
+  return quoteLegs
+}
+
+function logicalExecutionLegKey(leg: OrderExecutionLeg) {
+  return (
+    leg.transitionDeclId ??
+    [
+      leg.legIndex,
+      providerKey(leg.provider),
+      leg.legType,
+      assetKey(leg.input),
+      assetKey(leg.output)
+    ].join(':')
+  )
+}
+
+function assetKey(asset: AssetRef) {
+  return `${asset.chainId}:${asset.assetId}`
+}
+
+function progressStageForLeg(order: OrderFirehoseRow, leg: OrderExecutionLeg) {
+  return order.progress.stages?.find(
+    (stage, index) =>
+      index === leg.legIndex ||
+      providerKey(stage.label) === providerKey(leg.provider)
+  )
+}
+
+function progressStageLegs(order: OrderFirehoseRow): TimelineLeg[] {
+  const stages = order.progress.stages
+  if (!stages || stages.length === 0) return []
+  const segments = progressSegments(order)
+  return stages.map((stage, index) => {
+    const segmentState = segments[index]?.state
+    const status = segmentStateToStageStatus(segmentState, stage.status)
+    return {
+      key: `${index}-${stage.label}`,
+      index,
+      provider: stage.label,
+      kind: 'stage',
+      status,
+      inputAsset: stage.input,
+      outputAsset: stage.output,
+      txHash: stage.txHash,
+      txChainId: stage.txChainId,
+      steps: [],
+      references: []
+    }
+  })
+}
+
+function segmentStateToStageStatus(
+  segmentState: 'complete' | 'active' | 'failed' | 'pending' | undefined,
+  fallback: string
+) {
+  if (segmentState === 'complete') return 'completed'
+  if (segmentState === 'active') return 'running'
+  if (segmentState === 'failed') return 'failed'
+  if (segmentState === 'pending') return 'planned'
+  return fallback
 }
 
 function quoteUsdValuationForExecutionLeg(
@@ -2820,6 +3381,70 @@ function mergeOrders(current: OrderFirehoseRow[], incoming: OrderFirehoseRow[]) 
   return sortOrders([...byId.values()])
 }
 
+function liveOrderPruneResult(
+  orders: OrderFirehoseRow[],
+  retainOrderId?: string | null
+) {
+  if (!isLiveOrderPruningAllowed()) return undefined
+  const retained = retainLiveOrderWindow(orders, retainOrderId ?? undefined)
+  if (retained.length === orders.length) return undefined
+  return {
+    orders: retained,
+    nextCursor: liveOrderWindowCursor(retained)
+  }
+}
+
+export function retainLiveOrderWindow(
+  orders: OrderFirehoseRow[],
+  retainOrderId?: string
+) {
+  if (orders.length <= LIVE_ORDER_RENDER_LIMIT) return orders
+
+  const retained = orders.slice(0, LIVE_ORDER_RENDER_LIMIT)
+  if (!retainOrderId || retained.some((order) => order.id === retainOrderId)) {
+    return retained
+  }
+
+  const retainedOrder = orders.find((order) => order.id === retainOrderId)
+  return retainedOrder ? [...retained, retainedOrder] : retained
+}
+
+function liveOrderWindowCursor(orders: OrderFirehoseRow[]) {
+  const oldestContiguousOrder =
+    orders[Math.min(orders.length, LIVE_ORDER_RENDER_LIMIT) - 1]
+  return orderCursor(oldestContiguousOrder)
+}
+
+function orderCursor(order: OrderFirehoseRow | undefined) {
+  if (!order) return undefined
+  return toBase64Url(
+    JSON.stringify({
+      createdAt: order.createdAt,
+      id: order.id
+    })
+  )
+}
+
+function isLiveOrderPruningAllowed() {
+  if (typeof window === 'undefined') return true
+  const scrollY = typeof window.scrollY === 'number' ? window.scrollY : 0
+  return scrollY <= LIVE_ORDER_PRUNE_SCROLL_Y
+}
+
+function toBase64Url(value: string) {
+  return btoa(value).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/u, '')
+}
+
+export function mergeSnapshotOrders(
+  current: OrderFirehoseRow[],
+  snapshot: OrderFirehoseRow[]
+) {
+  const currentById = new Map(current.map((order) => [order.id, order]))
+  return sortOrders(
+    snapshot.map((order) => preferredOrder(currentById.get(order.id), order))
+  )
+}
+
 function preferredOrder(
   existing: OrderFirehoseRow | undefined,
   incoming: OrderFirehoseRow
@@ -2832,14 +3457,12 @@ function preferredOrder(
   }
   if (
     existing.detailLevel === 'full' &&
-    incoming.detailLevel !== 'full' &&
-    incomingUpdatedAt === existingUpdatedAt
+    incoming.detailLevel !== 'full'
   ) {
     return {
       ...incoming,
       detailLevel: 'full' as const,
       providerQuote: existing.providerQuote,
-      executionLegs: existing.executionLegs,
       executionSteps: existing.executionSteps,
       providerOperations: existing.providerOperations
     }
@@ -2929,12 +3552,10 @@ export function normalizedVolumeBuckets(analytics: VolumeAnalyticsResponse) {
   const starts = bucketStarts(
     new Date(analytics.from),
     new Date(analytics.to),
-    analytics.bucketSize,
-    MAX_VOLUME_CHART_BUCKETS
+    analytics.bucketSize
   )
 
-  const buckets = starts
-    ? starts.map((bucketStart) => {
+  const buckets = starts.map((bucketStart) => {
         const key = bucketStart.toISOString()
         const bucket = bucketsByStart.get(key)
         return {
@@ -2943,13 +3564,6 @@ export function normalizedVolumeBuckets(analytics: VolumeAnalyticsResponse) {
           orderCount: bucket?.orderCount ?? 0
         }
       })
-    : analytics.buckets
-        .map((bucket) => ({
-          bucketStart: bucket.bucketStart,
-          volumeUsdMicro: BigInt(bucket.volumeUsdMicro),
-          orderCount: bucket.orderCount
-        }))
-        .sort((left, right) => left.bucketStart.localeCompare(right.bucketStart))
 
   return downsampleVolumeBuckets(buckets, MAX_VOLUME_CHART_BUCKETS)
 }
@@ -2957,15 +3571,13 @@ export function normalizedVolumeBuckets(analytics: VolumeAnalyticsResponse) {
 function bucketStarts(
   from: Date,
   to: Date,
-  bucketSize: VolumeBucketSize,
-  maxBuckets: number
+  bucketSize: VolumeBucketSize
 ) {
   const starts: Date[] = []
-  const cursor = alignDateToBucket(from, bucketSize)
+    const cursor = alignDateToBucket(from, bucketSize)
   while (cursor < to) {
-    if (starts.length >= maxBuckets) return undefined
     starts.push(new Date(cursor))
-    if (bucketSize === 'minute') cursor.setUTCMinutes(cursor.getUTCMinutes() + 1)
+    if (bucketSize === 'five_minute') cursor.setUTCMinutes(cursor.getUTCMinutes() + 5)
     if (bucketSize === 'hour') cursor.setUTCHours(cursor.getUTCHours() + 1)
     if (bucketSize === 'day') cursor.setUTCDate(cursor.getUTCDate() + 1)
   }
@@ -3013,29 +3625,94 @@ export function volumeBarHeight(
   return (Number(scaledRatio) / Number(scale)) * chartHeight
 }
 
+export function volumeYAxisTicks(maxVolumeUsdMicro: bigint, segments: number) {
+  const safeSegments = Math.max(1, Math.floor(segments))
+  const ticks: Array<{ key: string; value: bigint }> = []
+  for (let index = 0; index <= safeSegments; index += 1) {
+    const value = (maxVolumeUsdMicro * BigInt(index)) / BigInt(safeSegments)
+    ticks.push({ key: `${index}-${value.toString()}`, value })
+  }
+  return ticks
+}
+
+export function volumeXAxisTicks<T extends { bucketStart: string }>(
+  buckets: T[],
+  maxTicks: number
+) {
+  if (buckets.length === 0) return []
+  const tickCount = Math.min(Math.max(2, Math.floor(maxTicks)), buckets.length)
+  if (tickCount === 1) return [{ index: 0, bucket: buckets[0] }]
+
+  const indexes = new Set<number>()
+  for (let tick = 0; tick < tickCount; tick += 1) {
+    indexes.add(Math.round((tick * (buckets.length - 1)) / (tickCount - 1)))
+  }
+  return [...indexes]
+    .sort((left, right) => left - right)
+    .map((index) => ({ index, bucket: buckets[index] }))
+}
+
+function volumeXAxisTickLimit(chartWidth: number, bucketSize: VolumeBucketSize) {
+  const targetSpacing = bucketSize === 'day' ? 150 : 190
+  return clampNumber(Math.floor(chartWidth / targetSpacing), 2, 5)
+}
+
+function volumeTooltipLayout(
+  anchorX: number,
+  anchorY: number,
+  padding: { top: number; right: number; bottom: number; left: number },
+  chartWidth: number
+) {
+  const width = 156
+  const height = 44
+  return {
+    width,
+    height,
+    x: clampNumber(anchorX - width / 2, padding.left, chartWidth - padding.right - width),
+    y: Math.max(padding.top, anchorY - height - 8)
+  }
+}
+
+function formatVolumeAxisDate(value: string, bucketSize: VolumeBucketSize) {
+  const date = new Date(value)
+  if (bucketSize === 'day') {
+    return [
+      new Intl.DateTimeFormat(undefined, {
+        month: 'short',
+        day: '2-digit'
+      }).format(date)
+    ]
+  }
+  const dateLabel = new Intl.DateTimeFormat(undefined, {
+    month: 'short',
+    day: '2-digit'
+  }).format(date)
+  const timeLabel = new Intl.DateTimeFormat(undefined, {
+    hour: 'numeric'
+  }).format(date)
+  return [dateLabel, timeLabel]
+}
+
+function clampNumber(value: number, min: number, max: number) {
+  return Math.min(Math.max(value, min), max)
+}
+
 function alignDateToBucket(value: Date, bucketSize: VolumeBucketSize) {
   const aligned = new Date(value)
   aligned.setUTCSeconds(0, 0)
+  if (bucketSize === 'five_minute') {
+    aligned.setUTCMinutes(Math.floor(aligned.getUTCMinutes() / 5) * 5)
+  }
   if (bucketSize === 'hour' || bucketSize === 'day') aligned.setUTCMinutes(0)
   if (bucketSize === 'day') aligned.setUTCHours(0)
   return aligned
 }
 
-function volumeDateRange(
-  window: VolumeWindow,
-  customFrom?: string,
-  customTo?: string
-) {
-  if (window === 'custom') {
-    const from = customFrom ? new Date(customFrom) : hoursAgo(24)
-    const to = customTo ? new Date(customTo) : new Date()
-    if (Number.isFinite(from.getTime()) && Number.isFinite(to.getTime()) && from < to) {
-      return { from, to }
-    }
-  }
-
-  const to = new Date()
+export function volumeDateRange(window: VolumeWindow, now = new Date()) {
+  const to = new Date(now)
   const from = new Date(to)
+  if (window === '1h') from.setUTCHours(from.getUTCHours() - 1)
+  if (window === '6h') from.setUTCHours(from.getUTCHours() - 6)
   if (window === '24h') from.setUTCHours(from.getUTCHours() - 24)
   if (window === '7d') from.setUTCDate(from.getUTCDate() - 7)
   if (window === '30d') from.setUTCDate(from.getUTCDate() - 30)
@@ -3043,15 +3720,69 @@ function volumeDateRange(
   return { from, to }
 }
 
-function hoursAgo(hours: number) {
-  const date = new Date()
-  date.setHours(date.getHours() - hours)
-  return date
-}
+export function createCoalescedAsyncRefresh({
+  run,
+  onError,
+  minIntervalMs = VOLUME_ANALYTICS_REFRESH_THROTTLE_MS,
+  now = () => Date.now(),
+  setTimer = (callback, delayMs) => window.setTimeout(callback, delayMs),
+  clearTimer = (handle) => window.clearTimeout(handle)
+}: CoalescedAsyncRefreshOptions): CoalescedAsyncRefresh {
+  let timer: TimerHandle | undefined
+  let inFlight = false
+  let pending = false
+  let cancelled = false
+  let lastStartedAt = 0
 
-function datetimeLocalValue(value: Date) {
-  const offsetMs = value.getTimezoneOffset() * 60_000
-  return new Date(value.getTime() - offsetMs).toISOString().slice(0, 16)
+  const start = () => {
+    if (cancelled) return
+    timer = undefined
+    if (inFlight) {
+      pending = true
+      return
+    }
+
+    inFlight = true
+    pending = false
+    lastStartedAt = now()
+    run()
+      .catch(onError)
+      .finally(() => {
+        inFlight = false
+        if (pending && !cancelled) schedule()
+      })
+  }
+
+  const schedule = () => {
+    if (cancelled) return
+    if (timer !== undefined) {
+      pending = true
+      return
+    }
+
+    const elapsedMs = now() - lastStartedAt
+    const delayMs =
+      lastStartedAt === 0 ? 0 : Math.max(0, minIntervalMs - elapsedMs)
+    if (delayMs === 0) {
+      start()
+      return
+    }
+
+    pending = true
+    timer = setTimer(start, delayMs)
+  }
+
+  return {
+    request: schedule,
+    cancel: () => {
+      cancelled = true
+      pending = false
+      if (timer !== undefined) {
+        clearTimer(timer)
+        timer = undefined
+      }
+    }
+  }
 }
 
 function shortId(value: string) {
@@ -3064,8 +3795,18 @@ function shortOrderId(value: string) {
   return `${value.slice(0, 4)}...${value.slice(-4)}`
 }
 
-function statusTone(status: string) {
+export function statusDisplay(status: string): StatusDisplay {
+  return (
+    ORDER_STATUS_DISPLAY[status] ?? {
+      label: humanize(status),
+      tone: statusTone(status)
+    }
+  )
+}
+
+function statusTone(status: string): StatusTone {
   if (['completed', 'processed', 'skipped'].includes(status)) return 'success'
+  if (status === 'superseded') return 'neutral'
   if (
     [
       'failed',
@@ -3084,8 +3825,9 @@ function statusTone(status: string) {
   return 'waiting'
 }
 
-function progressVenueLabel(order: OrderFirehoseRow) {
+export function progressVenueLabel(order: OrderFirehoseRow) {
   const progress = order.progress
+  if (!shouldShowVenueProgress(order)) return undefined
   if (progress.totalStages === 0) return undefined
   if (progress.completedStages === progress.totalStages && progress.failedStages === 0) {
     return undefined
@@ -3096,9 +3838,9 @@ function progressVenueLabel(order: OrderFirehoseRow) {
     : undefined
   if (failedLeg) return providerDisplayName(failedLeg.provider)
 
-  const activeLeg =
-    order.executionLegs.find((leg) => ACTIVE_STEP_STATUSES.has(leg.status)) ??
-    order.executionLegs.find((leg) => leg.status === 'planned')
+  const activeLeg = order.executionLegs.find((leg) =>
+    ACTIVE_STEP_STATUSES.has(leg.status)
+  )
   if (activeLeg) return providerDisplayName(activeLeg.provider)
 
   const activeStep =
@@ -3107,24 +3849,134 @@ function progressVenueLabel(order: OrderFirehoseRow) {
     ) ??
     order.executionSteps.find(
       (step) => !isWaitForDepositStep(step) && FAILED_STEP_STATUSES.has(step.status)
-    ) ??
-    order.executionSteps.find((step) => !isWaitForDepositStep(step) && step.status === 'planned')
+    )
   if (activeStep) return providerDisplayName(activeStep.provider)
 
-  const waitStep = order.executionSteps.find(isWaitForDepositStep)
-  if (waitStep && ACTIVE_STEP_STATUSES.has(waitStep.status)) return 'Funding deposit'
-
-  return progress.activeStage ? cleanProgressStage(progress.activeStage) : undefined
+  return progress.activeStage ? activeProgressStageVenue(progress.activeStage) : undefined
 }
 
-function cleanProgressStage(stage: string) {
-  const [venue] = stage.split(/[/:,]/)
+export function shouldShowVenueProgress(order: OrderFirehoseRow) {
+  const progress = order.progress
+  if (progress.completedStages > 0 || progress.failedStages > 0) return true
+
+  const materializedLeg = order.executionLegs.some(
+    (leg) => leg.status !== 'planned' && leg.status !== 'superseded'
+  )
+  if (materializedLeg) return true
+
+  const materializedStep = order.executionSteps.some(
+    (step) =>
+      !isWaitForDepositStep(step) &&
+      step.status !== 'planned' &&
+      step.status !== 'superseded'
+  )
+  if (materializedStep) return true
+
+  const activeStageStatus = progress.activeStage
+    ? providerKey(progress.activeStage.split('/')[1] ?? '')
+    : undefined
+  if (activeStageStatus === 'waiting') return order.status === 'executing'
+  return Boolean(
+    activeStageStatus &&
+      activeStageStatus !== 'planned' &&
+      activeStageStatus !== 'waiting'
+  )
+}
+
+function progressSegments(order: OrderFirehoseRow): ProgressSegment[] {
+  const progress = order.progress
+  if (!shouldShowVenueProgress(order)) return []
+  if (progress.totalStages === 0) return []
+
+  const completed = progress.completedStages
+  const failedIndex = progress.failedStages > 0 ? Math.max(completed, 0) : -1
+  const isComplete =
+    progress.failedStages === 0 &&
+    progress.totalStages > 0 &&
+    completed >= progress.totalStages
+  const labels = progressStageLabels(order)
+
+  return Array.from({ length: progress.totalStages }, (_, index) => {
+    const label = labels[index] ?? `Step ${index + 1}`
+    const state: ProgressSegmentState =
+      failedIndex === index
+        ? 'failed'
+        : isComplete || index < completed
+          ? 'complete'
+          : index === completed
+            ? 'active'
+            : 'pending'
+
+    return { index, label, state }
+  })
+}
+
+function progressStageLabels(order: OrderFirehoseRow) {
+  const legLabels = [...order.executionLegs]
+    .sort((left, right) => left.legIndex - right.legIndex)
+    .map((leg) => providerDisplayName(leg.provider))
+
+  if (legLabels.length > 0) return legLabels
+
+  const stepLabels = order.executionSteps
+    .filter((step) => !isWaitForDepositStep(step))
+    .sort((left, right) => left.stepIndex - right.stepIndex)
+    .map((step) => providerDisplayName(step.provider))
+
+  if (stepLabels.length > 0) return stepLabels
+
+  const activeVenue = progressVenueLabel(order)
+  return activeVenue ? [activeVenue] : []
+}
+
+function timelineState(status: string) {
+  if (['completed', 'settled', 'filled', 'processed', 'skipped'].includes(status)) {
+    return 'complete'
+  }
+  if (FAILED_STEP_STATUSES.has(status)) return 'failed'
+  if (ACTIVE_STEP_STATUSES.has(status) || ['funded', 'executing'].includes(status)) {
+    return 'active'
+  }
+  return 'pending'
+}
+
+function activeProgressStageVenue(stage: string) {
+  const [venue, status] = stage.split('/')
+  const normalizedStatus = status ? providerKey(status) : undefined
+  if (!normalizedStatus) return undefined
+  if (
+    !ACTIVE_STEP_STATUSES.has(normalizedStatus) &&
+    !FAILED_STEP_STATUSES.has(normalizedStatus) &&
+    normalizedStatus !== 'waiting_external' &&
+    normalizedStatus !== 'executing'
+  ) {
+    return undefined
+  }
   return venue ? providerDisplayName(venue.trim()) : undefined
 }
 
 function providerDisplayName(provider: string) {
-  const normalized = provider.trim().toLowerCase()
-  return PROVIDER_DISPLAY_NAMES[normalized] ?? humanize(normalized)
+  const normalized = providerKey(provider)
+  return (
+    PROVIDER_DISPLAY_NAMES[normalized] ??
+    knownProviderPrefix(normalized) ??
+    humanize(normalized)
+  )
+}
+
+function knownProviderPrefix(normalized: string) {
+  const provider = Object.keys(PROVIDER_DISPLAY_NAMES).find(
+    (key) => normalized.startsWith(`${key}_`)
+  )
+  return provider ? PROVIDER_DISPLAY_NAMES[provider] : undefined
+}
+
+function providerKey(provider: string) {
+  return provider
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
 }
 
 function humanize(value: string) {

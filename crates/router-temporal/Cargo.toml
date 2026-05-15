@@ -1,0 +1,15 @@
+[package]
+name = "router-temporal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+chrono = { workspace = true }
+serde = { workspace = true }
+snafu = { workspace = true }
+temporalio-common = { workspace = true }
+tonic = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }

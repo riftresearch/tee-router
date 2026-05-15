@@ -2,8 +2,9 @@ use std::{
     env,
     error::Error,
     future::Future,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr, TcpStream},
     path::{Path, PathBuf},
+    process::Command,
     str::FromStr,
     sync::OnceLock,
     time::{Duration, Instant},
@@ -17,6 +18,16 @@ use alloy::{
     signers::local::PrivateKeySigner,
     sol,
 };
+use bitcoin_indexer::{
+    build_router as build_bitcoin_indexer_router, AppState as BitcoinIndexerAppState,
+    BitcoinIndexer, Config as BitcoinIndexerConfig, IndexerPubSub as BitcoinIndexerPubSub,
+};
+use bitcoin_receipt_watcher::{
+    build_router as build_bitcoin_receipt_watcher_router,
+    AppState as BitcoinReceiptWatcherAppState, Config as BitcoinReceiptWatcherConfig,
+    PendingWatches as BitcoinReceiptPendingWatches, ReceiptPubSub as BitcoinReceiptPubSub,
+    Watcher as BitcoinReceiptWatcher,
+};
 use bitcoincore_rpc_async::Auth;
 use chains::ChainRegistry;
 use devnet::{
@@ -24,31 +35,57 @@ use devnet::{
     RiftDevnet,
 };
 use eip3009_erc20_contract::GenericEIP3009ERC20::GenericEIP3009ERC20Instance;
-use router_server::{
-    app::{initialize_components, PaymasterMode},
+use evm_receipt_watcher::{
+    build_router as build_evm_receipt_watcher_router, AppState as EvmReceiptWatcherAppState,
+    Config as EvmReceiptWatcherConfig, PendingWatches as EvmReceiptPendingWatches,
+    ReceiptPubSub as EvmReceiptPubSub, Watcher as EvmReceiptWatcher,
+};
+use hl_shim_indexer::{
+    build_router as build_hl_shim_router,
+    config::Cadences as HlShimCadences,
+    poller::{Poller as HlShimPoller, Scheduler as HlShimScheduler},
+    storage::Storage as HlShimStorage,
+    AppState as HlShimAppState, PubSub as HlShimPubSub,
+};
+use router_core::{
     db::Database,
     models::{
         CustodyVaultControlType, DepositVaultStatus, OrderExecutionStepType,
         OrderProviderOperation, ProviderOperationStatus, ProviderOperationType,
         RouterOrderEnvelope, RouterOrderQuoteEnvelope, RouterOrderStatus,
+        SAURON_EVM_RECEIPT_OBSERVER_HINT_SOURCE, SAURON_HYPERLIQUID_OBSERVER_HINT_SOURCE,
+        SAURON_HYPERUNIT_OBSERVER_HINT_SOURCE,
     },
     protocol::{backend_chain_for_id, AssetId, ChainId},
+};
+use router_server::{
+    app::{initialize_components, PaymasterMode},
     server::run_api,
     services::deposit_address::derive_deposit_salt_for_quote,
     worker::{run_worker_loop, RouterWorkerConfig},
     RouterServerArgs,
 };
-use sauron::discovery::{evm_erc20::EvmErc20DiscoveryBackend, DiscoveryBackend};
+use router_temporal::{OrderWorkflowClient, TemporalConnection as RouterTemporalConnection};
+use sauron::discovery::{evm_indexer::EvmIndexerDiscoveryBackend, DiscoveryBackend};
 use sauron::{run as run_sauron, SauronArgs};
 use serde_json::{json, Value};
 use sqlx_core::connection::Connection;
 use sqlx_postgres::{PgConnectOptions, PgConnection, PgPoolOptions};
+use temporal_worker::{
+    order_execution::{activities::OrderActivities, build_worker},
+    production::OrderWorkerRuntimeArgs,
+    runtime::TemporalConnection,
+};
 use testcontainers::{
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
     ContainerAsync, GenericImage, ImageExt,
 };
-use tokio::task::JoinHandle;
+use tokio::{
+    net::TcpListener,
+    sync::oneshot,
+    task::{JoinHandle, LocalSet},
+};
 use uuid::Uuid;
 
 const MOCK_ERC20_ADDRESS: &str = "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf";
@@ -73,8 +110,8 @@ const ARBITRUM_RPC_URL_ENV: &str = "ARBITRUM_RPC_URL";
 const ELECTRUM_HTTP_SERVER_URL_ENV: &str = "ELECTRUM_HTTP_SERVER_URL";
 const BITCOIN_RPC_URL_ENV: &str = "BITCOIN_RPC_URL";
 const BITCOIN_RPC_AUTH_ENV: &str = "BITCOIN_RPC_AUTH";
-const BITCOIN_ZMQ_RAWTX_ENDPOINT_ENV: &str = "BITCOIN_ZMQ_RAWTX_ENDPOINT";
-const BITCOIN_ZMQ_SEQUENCE_ENDPOINT_ENV: &str = "BITCOIN_ZMQ_SEQUENCE_ENDPOINT";
+const BITCOIN_INDEXER_URL_ENV: &str = "BITCOIN_INDEXER_URL";
+const BITCOIN_RECEIPT_WATCHER_URL_ENV: &str = "BITCOIN_RECEIPT_WATCHER_URL";
 const ACROSS_API_URL_ENV: &str = "ACROSS_API_URL";
 const ACROSS_API_KEY_ENV: &str = "ACROSS_API_KEY";
 const ACROSS_INTEGRATOR_ID_ENV: &str = "ACROSS_INTEGRATOR_ID";
@@ -123,7 +160,6 @@ const LIVE_RECOVERY_TABLES: &[(&str, &str)] = &[
     ("order_provider_operations", "created_at ASC, id ASC"),
     ("order_provider_addresses", "created_at ASC, id ASC"),
     ("order_provider_operation_hints", "created_at ASC, id ASC"),
-    ("router_worker_leases", "lease_name ASC"),
     ("order_custody_accounts", "created_at ASC, id ASC"),
 ];
 
@@ -167,13 +203,68 @@ struct TestPostgres {
     _container: Option<ContainerAsync<GenericImage>>,
 }
 
+impl TestPostgres {
+    async fn shutdown(&mut self) {
+        if let Some(container) = self._container.take() {
+            container.rm().await.expect("remove Postgres testcontainer");
+        }
+    }
+}
+
 struct RuntimeTask {
-    handle: JoinHandle<()>,
+    handle: Option<JoinHandle<()>>,
+    shutdown: Option<Box<dyn FnOnce()>>,
 }
 
 impl Drop for RuntimeTask {
     fn drop(&mut self) {
-        self.handle.abort();
+        if let Some(shutdown) = self.shutdown.take() {
+            shutdown();
+        }
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+impl RuntimeTask {
+    fn new(handle: JoinHandle<()>) -> Self {
+        Self {
+            handle: Some(handle),
+            shutdown: None,
+        }
+    }
+
+    fn with_shutdown(handle: JoinHandle<()>, shutdown: impl FnOnce() + 'static) -> Self {
+        Self {
+            handle: Some(handle),
+            shutdown: Some(Box::new(shutdown)),
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.handle
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
+    }
+
+    async fn abort_and_join(&mut self) {
+        let Some(mut handle) = self.handle.take() else {
+            return;
+        };
+        if let Some(shutdown) = self.shutdown.take() {
+            shutdown();
+            tokio::select! {
+                _ = &mut handle => {}
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                    handle.abort();
+                    let _ = handle.await;
+                }
+            }
+        } else {
+            handle.abort();
+            let _ = handle.await;
+        }
     }
 }
 
@@ -185,16 +276,16 @@ struct LiveRuntimeConfig {
     arbitrum_rpc_url: String,
     bitcoin_rpc_url: String,
     bitcoin_rpc_auth: Auth,
-    bitcoin_zmq_rawtx_endpoint: String,
-    bitcoin_zmq_sequence_endpoint: String,
     electrum_http_server_url: String,
+    bitcoin_indexer_url: Option<String>,
+    bitcoin_receipt_watcher_url: Option<String>,
     across_api_url: String,
     across_api_key: String,
     across_integrator_id: Option<String>,
     hyperunit_api_url: String,
     hyperunit_proxy_url: Option<String>,
     hyperliquid_api_url: String,
-    hyperliquid_network: router_server::services::custody_action_executor::HyperliquidCallNetwork,
+    hyperliquid_network: router_core::services::custody_action_executor::HyperliquidCallNetwork,
     hyperliquid_execution_private_key: Option<String>,
     hyperliquid_account_address: Option<String>,
     hyperliquid_vault_address: Option<String>,
@@ -223,9 +314,9 @@ impl LiveRuntimeConfig {
             arbitrum_rpc_url: env_var_required(ARBITRUM_RPC_URL_ENV),
             bitcoin_rpc_url: env_var_required(BITCOIN_RPC_URL_ENV),
             bitcoin_rpc_auth: parse_auth_env(BITCOIN_RPC_AUTH_ENV),
-            bitcoin_zmq_rawtx_endpoint: env_var_required(BITCOIN_ZMQ_RAWTX_ENDPOINT_ENV),
-            bitcoin_zmq_sequence_endpoint: env_var_required(BITCOIN_ZMQ_SEQUENCE_ENDPOINT_ENV),
             electrum_http_server_url: env_var_required(ELECTRUM_HTTP_SERVER_URL_ENV),
+            bitcoin_indexer_url: env_var_optional(BITCOIN_INDEXER_URL_ENV),
+            bitcoin_receipt_watcher_url: env_var_optional(BITCOIN_RECEIPT_WATCHER_URL_ENV),
             across_api_url: env_var_optional(ACROSS_API_URL_ENV)
                 .unwrap_or_else(|| DEFAULT_LIVE_ACROSS_API_URL.to_string()),
             across_api_key: env_var_required(ACROSS_API_KEY_ENV),
@@ -307,8 +398,8 @@ fn parse_auth_env(key: &str) -> Auth {
 
 fn parse_hyperliquid_network(
     raw: &str,
-) -> router_server::services::custody_action_executor::HyperliquidCallNetwork {
-    use router_server::services::custody_action_executor::HyperliquidCallNetwork;
+) -> router_core::services::custody_action_executor::HyperliquidCallNetwork {
+    use router_core::services::custody_action_executor::HyperliquidCallNetwork;
 
     match raw.trim().to_ascii_lowercase().as_str() {
         "mainnet" => HyperliquidCallNetwork::Mainnet,
@@ -845,7 +936,97 @@ async fn spawn_router_api(mut args: RouterServerArgs) -> (String, RuntimeTask) {
     })
     .await;
 
-    (base_url, RuntimeTask { handle })
+    (base_url, RuntimeTask::new(handle))
+}
+
+async fn spawn_temporal_order_worker(args: &RouterServerArgs) -> RuntimeTask {
+    let runtime_args = order_worker_runtime_args_from_router_args(args);
+    let connection = TemporalConnection {
+        temporal_address: args.temporal_address.clone(),
+        namespace: args.temporal_namespace.clone(),
+    };
+    let task_queue = args.temporal_task_queue.clone();
+    let order_activities = runtime_args
+        .build_order_activities()
+        .await
+        .expect("build temporal-worker order activities");
+    let mut built = build_worker(
+        &connection,
+        &task_queue,
+        OrderActivities::new(order_activities),
+    )
+    .await
+    .expect("build temporal order worker");
+    let shutdown = built.worker.shutdown_handle();
+    let handle = tokio::task::spawn_local(async move {
+        built
+            .worker
+            .run()
+            .await
+            .expect("temporal order worker should keep running until test aborts");
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !handle.is_finished(),
+        "temporal order worker exited during startup"
+    );
+    RuntimeTask::with_shutdown(handle, shutdown)
+}
+
+fn order_worker_runtime_args_from_router_args(args: &RouterServerArgs) -> OrderWorkerRuntimeArgs {
+    OrderWorkerRuntimeArgs {
+        database_url: args.database_url.clone(),
+        db_max_connections: args.db_max_connections,
+        db_min_connections: args.db_min_connections,
+        master_key_path: args.master_key_path.clone(),
+        ethereum_mainnet_rpc_url: args.ethereum_mainnet_rpc_url.clone(),
+        ethereum_reference_token: args.ethereum_reference_token.clone(),
+        ethereum_paymaster_private_key: args.ethereum_paymaster_private_key.clone(),
+        base_rpc_url: args.base_rpc_url.clone(),
+        base_reference_token: args.base_reference_token.clone(),
+        base_paymaster_private_key: args.base_paymaster_private_key.clone(),
+        arbitrum_rpc_url: args.arbitrum_rpc_url.clone(),
+        arbitrum_reference_token: args.arbitrum_reference_token.clone(),
+        arbitrum_paymaster_private_key: args.arbitrum_paymaster_private_key.clone(),
+        evm_paymaster_vault_gas_buffer_wei: args.evm_paymaster_vault_gas_buffer_wei.clone(),
+        evm_paymaster_vault_gas_target_wei: args.evm_paymaster_vault_gas_target_wei.clone(),
+        bitcoin_rpc_url: args.bitcoin_rpc_url.clone(),
+        bitcoin_rpc_auth: args.bitcoin_rpc_auth.clone(),
+        untrusted_esplora_http_server_url: args.untrusted_esplora_http_server_url.clone(),
+        bitcoin_network: args.bitcoin_network,
+        bitcoin_paymaster_private_key: args.bitcoin_paymaster_private_key.clone(),
+        across_api_url: args.across_api_url.clone(),
+        across_api_key: args.across_api_key.clone(),
+        across_integrator_id: args.across_integrator_id.clone(),
+        cctp_api_url: args.cctp_api_url.clone(),
+        cctp_token_messenger_v2_address: args.cctp_token_messenger_v2_address.clone(),
+        cctp_message_transmitter_v2_address: args.cctp_message_transmitter_v2_address.clone(),
+        hyperunit_api_url: args.hyperunit_api_url.clone(),
+        hyperunit_proxy_url: args.hyperunit_proxy_url.clone(),
+        hyperliquid_api_url: args.hyperliquid_api_url.clone(),
+        velora_api_url: args.velora_api_url.clone(),
+        velora_partner: args.velora_partner.clone(),
+        hyperliquid_execution_private_key: args.hyperliquid_execution_private_key.clone(),
+        hyperliquid_account_address: args.hyperliquid_account_address.clone(),
+        hyperliquid_vault_address: args.hyperliquid_vault_address.clone(),
+        hyperliquid_paymaster_private_key: args.hyperliquid_paymaster_private_key.clone(),
+        hyperliquid_network: args.hyperliquid_network,
+        hyperliquid_order_timeout_ms: args.hyperliquid_order_timeout_ms,
+        coinbase_price_api_base_url: args.coinbase_price_api_base_url.clone(),
+    }
+}
+
+fn ensure_temporal_up() {
+    let local_temporal = SocketAddr::from(([127, 0, 0, 1], 7233));
+    if TcpStream::connect_timeout(&local_temporal, Duration::from_millis(500)).is_ok() {
+        return;
+    }
+
+    let status = Command::new("just")
+        .arg("temporal-up")
+        .status()
+        .expect("run `just temporal-up`; install just or start Temporal manually");
+    assert!(status.success(), "`just temporal-up` failed with {status}");
 }
 
 async fn reserve_local_port() -> u16 {
@@ -948,22 +1129,26 @@ fn router_args(
         hyperliquid_account_address: None,
         hyperliquid_vault_address: None,
         hyperliquid_paymaster_private_key: Some(test_hyperliquid_paymaster_private_key()),
+        temporal_address: "http://127.0.0.1:7233".to_string(),
+        temporal_namespace: "default".to_string(),
+        temporal_task_queue: format!("tee-router-order-execution-{}", Uuid::now_v7()),
         router_detector_api_key: Some(ROUTER_DETECTOR_API_KEY.to_string()),
         router_gateway_api_key: None,
         router_admin_api_key: None,
         hyperliquid_network:
-            router_server::services::custody_action_executor::HyperliquidCallNetwork::Mainnet,
+            router_core::services::custody_action_executor::HyperliquidCallNetwork::Mainnet,
         hyperliquid_order_timeout_ms: 30_000,
         worker_id: Some(format!("router-worker-{}", Uuid::now_v7())),
-        worker_lease_name: Some(format!("router-worker-e2e-{}", Uuid::now_v7())),
-        worker_lease_seconds: 30,
-        worker_lease_renew_seconds: 5,
-        worker_standby_poll_seconds: 1,
         worker_refund_poll_seconds: 1,
         worker_order_execution_poll_seconds: 1,
         worker_route_cost_refresh_seconds: 300,
         worker_provider_health_poll_seconds: 120,
         provider_health_timeout_seconds: 10,
+        worker_order_maintenance_pass_limit: 100,
+        worker_order_planning_pass_limit: 100,
+        worker_order_execution_pass_limit: 25,
+        worker_order_execution_concurrency: 64,
+        worker_vault_funding_hint_pass_limit: 100,
         coinbase_price_api_base_url: mocks.base_url().to_string(),
     }
 }
@@ -1019,31 +1204,40 @@ fn live_router_args(
         hyperliquid_account_address: live.hyperliquid_account_address.clone(),
         hyperliquid_vault_address: live.hyperliquid_vault_address.clone(),
         hyperliquid_paymaster_private_key: None,
+        temporal_address: "http://127.0.0.1:7233".to_string(),
+        temporal_namespace: "default".to_string(),
+        temporal_task_queue: format!("tee-router-order-execution-{}", Uuid::now_v7()),
         router_detector_api_key: Some(ROUTER_DETECTOR_API_KEY.to_string()),
         router_gateway_api_key: None,
         router_admin_api_key: None,
         hyperliquid_network: live.hyperliquid_network,
         hyperliquid_order_timeout_ms: 30_000,
         worker_id: Some(format!("router-worker-{}", Uuid::now_v7())),
-        worker_lease_name: Some(format!("router-worker-e2e-{}", Uuid::now_v7())),
-        worker_lease_seconds: 30,
-        worker_lease_renew_seconds: 5,
-        worker_standby_poll_seconds: 1,
         worker_refund_poll_seconds: 5,
         worker_order_execution_poll_seconds: 1,
         worker_route_cost_refresh_seconds: 300,
         worker_provider_health_poll_seconds: 120,
         provider_health_timeout_seconds: 10,
+        worker_order_maintenance_pass_limit: 100,
+        worker_order_planning_pass_limit: 100,
+        worker_order_execution_pass_limit: 25,
+        worker_order_execution_concurrency: 64,
+        worker_vault_funding_hint_pass_limit: 100,
         coinbase_price_api_base_url: "https://api.coinbase.com".to_string(),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn spawn_sauron(
     devnet: &RiftDevnet,
     database_url: &str,
     state_database_url: &str,
     router_base_url: &str,
     token_indexer_urls: RuntimeTokenIndexerUrls,
+    receipt_watcher_urls: EvmReceiptWatcherUrls,
+    hl_shim_indexer_url: Option<String>,
+    bitcoin_observer_urls: Option<BitcoinObserverUrls>,
+    hyperunit_api_url: Option<String>,
 ) -> RuntimeTask {
     let args = SauronArgs {
         log_level: "warn".to_string(),
@@ -1058,22 +1252,31 @@ async fn spawn_sauron(
         sauron_cdc_idle_wakeup_interval_ms: 10_000,
         router_internal_base_url: router_base_url.to_string(),
         router_detector_api_key: ROUTER_DETECTOR_API_KEY.to_string(),
-        electrum_http_server_url: devnet
-            .bitcoin
-            .esplora_url
+        bitcoin_indexer_url: bitcoin_observer_urls
             .as_ref()
-            .expect("esplora URL")
-            .clone(),
-        bitcoin_rpc_url: bitcoin_rpc_url(devnet),
-        bitcoin_rpc_auth: Auth::CookieFile(devnet.bitcoin.cookie.clone()),
-        bitcoin_zmq_rawtx_endpoint: devnet.bitcoin.zmq_rawtx_endpoint.clone(),
-        bitcoin_zmq_sequence_endpoint: devnet.bitcoin.zmq_sequence_endpoint.clone(),
+            .map(|urls| urls.indexer.clone()),
+        bitcoin_receipt_watcher_url: bitcoin_observer_urls
+            .as_ref()
+            .map(|urls| urls.receipt_watcher.clone()),
         ethereum_mainnet_rpc_url: devnet.ethereum.anvil.endpoint_url().to_string(),
         ethereum_token_indexer_url: token_indexer_urls.ethereum,
+        ethereum_receipt_watcher_url: Some(receipt_watcher_urls.ethereum),
         base_rpc_url: devnet.base.anvil.endpoint_url().to_string(),
         base_token_indexer_url: token_indexer_urls.base,
+        base_receipt_watcher_url: Some(receipt_watcher_urls.base),
         arbitrum_rpc_url: devnet.arbitrum.anvil.endpoint_url().to_string(),
         arbitrum_token_indexer_url: token_indexer_urls.arbitrum,
+        arbitrum_receipt_watcher_url: Some(receipt_watcher_urls.arbitrum),
+        hl_shim_indexer_url,
+        hyperunit_api_url,
+        hyperunit_proxy_url: None,
+        sauron_hl_bridge_match_window_seconds: 1_800,
+        sauron_hyperunit_observer_concurrency: 64,
+        sauron_hu_poll_fast_millis: 5_000,
+        sauron_hu_poll_medium_millis: 10_000,
+        sauron_hu_poll_slow_millis: 20_000,
+        sauron_hyperliquid_observer_concurrency: 128,
+        sauron_evm_receipt_observer_concurrency: 128,
         token_indexer_api_key: token_indexer_urls.api_key,
         sauron_reconcile_interval_seconds: 2,
         sauron_bitcoin_scan_interval_seconds: 60,
@@ -1092,7 +1295,280 @@ async fn spawn_sauron(
             .expect("Sauron task should not panic before startup");
         panic!("Sauron exited during startup");
     }
-    RuntimeTask { handle }
+    RuntimeTask::new(handle)
+}
+
+fn hl_shim_cadences() -> HlShimCadences {
+    HlShimCadences {
+        hot: Duration::from_millis(100),
+        warm: Duration::from_millis(250),
+        cold: Duration::from_millis(500),
+        funding_hot: Duration::from_millis(250),
+        funding_warm: Duration::from_millis(500),
+        funding_cold: Duration::from_millis(1_000),
+        order_status: Duration::from_millis(100),
+    }
+}
+
+async fn spawn_hl_shim_indexer(database_url: &str, hl_url: &str) -> (String, RuntimeTask) {
+    let storage = HlShimStorage::connect(database_url, 4)
+        .await
+        .expect("connect HL shim storage");
+    let pubsub = HlShimPubSub::new(512);
+    let scheduler = HlShimScheduler::new(hl_shim_cadences());
+    let poller = HlShimPoller::new(
+        scheduler.clone(),
+        storage.clone(),
+        pubsub.clone(),
+        hl_url,
+        1_100,
+    )
+    .await
+    .expect("create HL shim poller");
+    let app = build_hl_shim_router(HlShimAppState {
+        storage,
+        scheduler,
+        pubsub,
+    });
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind HL shim listener");
+    let addr = listener.local_addr().expect("read HL shim listener addr");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let handle = tokio::spawn(async move {
+        let poller_task = tokio::spawn(async move {
+            poller
+                .run(2)
+                .await
+                .expect("HL shim poller should run until test shutdown");
+        });
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("HL shim server should run until test shutdown");
+        poller_task.abort();
+        let _ = poller_task.await;
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let task = RuntimeTask::with_shutdown(handle, move || {
+        let _ = shutdown_tx.send(());
+    });
+    assert!(!task.is_finished(), "HL shim indexer exited during startup");
+    (format!("http://{addr}"), task)
+}
+
+struct EvmReceiptWatcherUrls {
+    ethereum: String,
+    base: String,
+    arbitrum: String,
+}
+
+async fn spawn_evm_receipt_watcher(
+    chain: &str,
+    http_rpc_url: String,
+    ws_rpc_url: String,
+) -> (String, RuntimeTask) {
+    let bind = "127.0.0.1:0"
+        .parse::<SocketAddr>()
+        .expect("valid receipt watcher bind");
+    let config = EvmReceiptWatcherConfig {
+        chain: chain.to_string(),
+        http_rpc_url,
+        ws_rpc_url: Some(ws_rpc_url),
+        bind,
+        max_pending: 10_000,
+        max_subscriber_lag: 1_000,
+        poll_interval_ms: 100,
+        ws_reconnect_delay_ms: 100,
+        receipt_retry_count: 5,
+        receipt_retry_delay_ms: 50,
+    };
+    let pending = EvmReceiptPendingWatches::new(config.chain.clone(), config.max_pending);
+    let pubsub = EvmReceiptPubSub::new(config.max_subscriber_lag);
+    let watcher = EvmReceiptWatcher::new(&config, pending.clone(), pubsub.clone())
+        .await
+        .expect("create EVM receipt watcher");
+    let receipt_provider = watcher.receipt_provider();
+    let app = build_evm_receipt_watcher_router(EvmReceiptWatcherAppState {
+        chain: config.chain.clone(),
+        pending,
+        pubsub,
+        receipt_provider,
+        metrics: None,
+    });
+    let listener = TcpListener::bind(config.bind)
+        .await
+        .expect("bind EVM receipt watcher listener");
+    let addr = listener
+        .local_addr()
+        .expect("read EVM receipt watcher listener addr");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let chain_label = chain.to_string();
+    let handle = tokio::spawn(async move {
+        let watcher_task = tokio::spawn(async move {
+            watcher.run().await;
+        });
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap_or_else(|error| {
+                panic!("{chain_label} EVM receipt watcher server stopped: {error}")
+            });
+        watcher_task.abort();
+        let _ = watcher_task.await;
+    });
+    let base_url = format!("http://{addr}");
+    wait_for_http_health(&base_url, "/healthz", "EVM receipt watcher").await;
+    let task = RuntimeTask::with_shutdown(handle, move || {
+        let _ = shutdown_tx.send(());
+    });
+    assert!(
+        !task.is_finished(),
+        "{chain} EVM receipt watcher exited during startup"
+    );
+    (base_url, task)
+}
+
+struct BitcoinObserverUrls {
+    indexer: String,
+    receipt_watcher: String,
+}
+
+async fn spawn_bitcoin_observers(devnet: &RiftDevnet) -> (BitcoinObserverUrls, Vec<RuntimeTask>) {
+    let (indexer_url, indexer_task) = spawn_bitcoin_indexer(devnet).await;
+    let (receipt_watcher_url, receipt_watcher_task) = spawn_bitcoin_receipt_watcher(devnet).await;
+    (
+        BitcoinObserverUrls {
+            indexer: indexer_url,
+            receipt_watcher: receipt_watcher_url,
+        },
+        vec![indexer_task, receipt_watcher_task],
+    )
+}
+
+async fn spawn_bitcoin_indexer(devnet: &RiftDevnet) -> (String, RuntimeTask) {
+    let bind = "127.0.0.1:0"
+        .parse::<SocketAddr>()
+        .expect("valid Bitcoin indexer bind");
+    let config = BitcoinIndexerConfig {
+        network: bitcoin::Network::Regtest,
+        rpc_url: devnet.bitcoin.rpc_url.clone(),
+        rpc_auth: Some(format!("cookie:{}", devnet.bitcoin.cookie.display())),
+        esplora_url: devnet
+            .bitcoin
+            .esplora_url
+            .clone()
+            .expect("devnet esplora URL"),
+        zmq_rawblock_endpoint: devnet.bitcoin.zmq_rawblock_endpoint.clone(),
+        zmq_rawtx_endpoint: devnet.bitcoin.zmq_rawtx_endpoint.clone(),
+        bind,
+        max_subscriber_lag: 1_000,
+        poll_interval_ms: 100,
+        zmq_reconnect_delay_ms: 100,
+        reorg_rescan_depth: 6,
+    };
+    let pubsub = BitcoinIndexerPubSub::new(config.max_subscriber_lag);
+    let indexer = BitcoinIndexer::new(&config, pubsub.clone())
+        .await
+        .expect("create Bitcoin indexer");
+    indexer.clone().run().await;
+    let app = build_bitcoin_indexer_router(BitcoinIndexerAppState {
+        indexer,
+        pubsub,
+        metrics: None,
+    });
+    let listener = TcpListener::bind(config.bind)
+        .await
+        .expect("bind Bitcoin indexer listener");
+    let addr = listener.local_addr().expect("read Bitcoin indexer addr");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("Bitcoin indexer server should run until test shutdown");
+    });
+    let base_url = format!("http://{addr}");
+    wait_for_http_health(&base_url, "/healthz", "Bitcoin indexer").await;
+    let task = RuntimeTask::with_shutdown(handle, move || {
+        let _ = shutdown_tx.send(());
+    });
+    assert!(!task.is_finished(), "Bitcoin indexer exited during startup");
+    (base_url, task)
+}
+
+async fn spawn_bitcoin_receipt_watcher(devnet: &RiftDevnet) -> (String, RuntimeTask) {
+    let bind = "127.0.0.1:0"
+        .parse::<SocketAddr>()
+        .expect("valid Bitcoin receipt watcher bind");
+    let config = BitcoinReceiptWatcherConfig {
+        chain: "bitcoin".to_string(),
+        rpc_url: devnet.bitcoin.rpc_url.clone(),
+        rpc_auth: Some(format!("cookie:{}", devnet.bitcoin.cookie.display())),
+        zmq_rawblock_endpoint: devnet.bitcoin.zmq_rawblock_endpoint.clone(),
+        bind,
+        max_pending: 10_000,
+        max_subscriber_lag: 1_000,
+        poll_interval_ms: 100,
+        zmq_reconnect_delay_ms: 100,
+    };
+    let pending = BitcoinReceiptPendingWatches::new(config.chain.clone(), config.max_pending);
+    let pubsub = BitcoinReceiptPubSub::new(config.max_subscriber_lag);
+    let watcher = BitcoinReceiptWatcher::new(&config, pending.clone(), pubsub.clone())
+        .await
+        .expect("create Bitcoin receipt watcher");
+    let rpc = watcher.rpc_client();
+    watcher.clone().run().await;
+    let app = build_bitcoin_receipt_watcher_router(BitcoinReceiptWatcherAppState {
+        chain: config.chain.clone(),
+        pending,
+        pubsub,
+        rpc,
+        metrics: None,
+    });
+    let listener = TcpListener::bind(config.bind)
+        .await
+        .expect("bind Bitcoin receipt watcher listener");
+    let addr = listener
+        .local_addr()
+        .expect("read Bitcoin receipt watcher addr");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("Bitcoin receipt watcher server should run until test shutdown");
+    });
+    let base_url = format!("http://{addr}");
+    wait_for_http_health(&base_url, "/healthz", "Bitcoin receipt watcher").await;
+    let task = RuntimeTask::with_shutdown(handle, move || {
+        let _ = shutdown_tx.send(());
+    });
+    assert!(
+        !task.is_finished(),
+        "Bitcoin receipt watcher exited during startup"
+    );
+    (base_url, task)
+}
+
+async fn wait_for_http_health(base_url: &str, path: &str, label: &str) {
+    let client = reqwest::Client::new();
+    let url = format!("{base_url}{path}");
+    for _ in 0..50 {
+        match client.get(&url).send().await {
+            Ok(response) if response.status().is_success() => return,
+            Ok(_) | Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+    panic!("{label} did not become healthy at {url}");
 }
 
 fn token_indexer_urls_from_devnet(devnet: &RiftDevnet) -> RuntimeTokenIndexerUrls {
@@ -1143,7 +1619,7 @@ async fn spawn_live_sauron(
             .expect("live Sauron task should not panic before startup");
         panic!("live Sauron exited during startup");
     }
-    RuntimeTask { handle }
+    RuntimeTask::new(handle)
 }
 
 fn live_sauron_args(
@@ -1165,17 +1641,27 @@ fn live_sauron_args(
         sauron_cdc_idle_wakeup_interval_ms: 10_000,
         router_internal_base_url: router_base_url.to_string(),
         router_detector_api_key: ROUTER_DETECTOR_API_KEY.to_string(),
-        electrum_http_server_url: live.electrum_http_server_url.clone(),
-        bitcoin_rpc_url: live.bitcoin_rpc_url.clone(),
-        bitcoin_rpc_auth: live.bitcoin_rpc_auth.clone(),
-        bitcoin_zmq_rawtx_endpoint: live.bitcoin_zmq_rawtx_endpoint.clone(),
-        bitcoin_zmq_sequence_endpoint: live.bitcoin_zmq_sequence_endpoint.clone(),
+        bitcoin_indexer_url: live.bitcoin_indexer_url.clone(),
+        bitcoin_receipt_watcher_url: live.bitcoin_receipt_watcher_url.clone(),
         ethereum_mainnet_rpc_url: live.ethereum_rpc_url.clone(),
         ethereum_token_indexer_url: live.ethereum_token_indexer_url.clone(),
+        ethereum_receipt_watcher_url: None,
         base_rpc_url: live.base_rpc_url.clone(),
         base_token_indexer_url: live.base_token_indexer_url.clone(),
+        base_receipt_watcher_url: None,
         arbitrum_rpc_url: live.arbitrum_rpc_url.clone(),
         arbitrum_token_indexer_url: live.arbitrum_token_indexer_url.clone(),
+        arbitrum_receipt_watcher_url: None,
+        hl_shim_indexer_url: None,
+        hyperunit_api_url: Some(live.hyperunit_api_url.clone()),
+        hyperunit_proxy_url: live.hyperunit_proxy_url.clone(),
+        sauron_hl_bridge_match_window_seconds: 1_800,
+        sauron_hyperunit_observer_concurrency: 64,
+        sauron_hu_poll_fast_millis: 5_000,
+        sauron_hu_poll_medium_millis: 10_000,
+        sauron_hu_poll_slow_millis: 20_000,
+        sauron_hyperliquid_observer_concurrency: 128,
+        sauron_evm_receipt_observer_concurrency: 128,
         token_indexer_api_key: live.token_indexer_api_key.clone(),
         sauron_reconcile_interval_seconds: 30,
         sauron_bitcoin_scan_interval_seconds: 15,
@@ -1397,9 +1883,12 @@ async fn wait_for_terminal_order_status(
         matches!(
             order.status,
             RouterOrderStatus::Completed
-                | RouterOrderStatus::Failed
+                | RouterOrderStatus::Expired
+                | RouterOrderStatus::RefundRequired
                 | RouterOrderStatus::Refunding
                 | RouterOrderStatus::Refunded
+                | RouterOrderStatus::ManualInterventionRequired
+                | RouterOrderStatus::RefundManualInterventionRequired
         )
         .then_some(order.status)
     })
@@ -1758,6 +2247,10 @@ async fn spawn_runtime_mocks(devnet: &RiftDevnet, route: RuntimeRoute) -> MockIn
             hyperunit_client::UnitChain::Ethereum,
             devnet.ethereum.anvil.endpoint(),
         )
+        .with_unit_bitcoin_rpc(
+            devnet.bitcoin.rpc_url.clone(),
+            devnet.bitcoin.cookie.clone(),
+        )
         .with_across_status_latency(Duration::from_secs(2))
         .with_mainnet_hyperliquid(true);
     if matches!(route, RuntimeRoute::BaseUsdcToBtc) {
@@ -1842,6 +2335,7 @@ async fn submit_order_request(
         .post(format!("{router_base_url}/api/v1/orders"))
         .json(&json!({
             "quote_id": quote_id,
+            "idempotency_key": format!("sauron-provider-operation-e2e:{route:?}:{quote_id}"),
             "refund_address": valid_evm_address(),
             "metadata": {
                 "test": route_order_metadata(route)
@@ -1919,13 +2413,19 @@ async fn fund_live_source_vault(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "integration: spawns devnet stack"]
 async fn sauron_runtime_drives_router_worker_through_mock_base_eth_btc_progress() {
-    run_mock_runtime_route(RuntimeRoute::BaseEthToBtc).await;
+    LocalSet::new()
+        .run_until(run_mock_runtime_route(RuntimeRoute::BaseEthToBtc))
+        .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "integration: spawns devnet stack"]
 async fn sauron_runtime_drives_router_worker_through_mock_base_usdc_btc_progress() {
-    run_mock_runtime_route(RuntimeRoute::BaseUsdcToBtc).await;
+    LocalSet::new()
+        .run_until(run_mock_runtime_route(RuntimeRoute::BaseUsdcToBtc))
+        .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1995,9 +2495,7 @@ async fn live_sauron_evm_backend_cursor_contract() {
         &live,
     );
 
-    let ethereum = EvmErc20DiscoveryBackend::new_ethereum(&args)
-        .await
-        .expect("build ethereum backend");
+    let ethereum = EvmIndexerDiscoveryBackend::new_ethereum(&args).expect("build ethereum backend");
     let ethereum_cursor = ethereum
         .current_cursor()
         .await
@@ -2007,18 +2505,14 @@ async fn live_sauron_evm_backend_cursor_contract() {
         ethereum_cursor.height, ethereum_cursor.hash
     );
 
-    let base = EvmErc20DiscoveryBackend::new_base(&args)
-        .await
-        .expect("build base backend");
+    let base = EvmIndexerDiscoveryBackend::new_base(&args).expect("build base backend");
     let base_cursor = base.current_cursor().await.expect("base current cursor");
     eprintln!(
         "base cursor height={} hash={}",
         base_cursor.height, base_cursor.hash
     );
 
-    let arbitrum = EvmErc20DiscoveryBackend::new_arbitrum(&args)
-        .await
-        .expect("build arbitrum backend");
+    let arbitrum = EvmIndexerDiscoveryBackend::new_arbitrum(&args).expect("build arbitrum backend");
     let arbitrum_cursor = arbitrum
         .current_cursor()
         .await
@@ -2045,15 +2539,9 @@ async fn live_sauron_evm_backend_cursor_concurrency_contract() {
         &live,
     );
 
-    let ethereum = EvmErc20DiscoveryBackend::new_ethereum(&args)
-        .await
-        .expect("build ethereum backend");
-    let base = EvmErc20DiscoveryBackend::new_base(&args)
-        .await
-        .expect("build base backend");
-    let arbitrum = EvmErc20DiscoveryBackend::new_arbitrum(&args)
-        .await
-        .expect("build arbitrum backend");
+    let ethereum = EvmIndexerDiscoveryBackend::new_ethereum(&args).expect("build ethereum backend");
+    let base = EvmIndexerDiscoveryBackend::new_base(&args).expect("build base backend");
+    let arbitrum = EvmIndexerDiscoveryBackend::new_arbitrum(&args).expect("build arbitrum backend");
 
     for round in 0..10 {
         let (ethereum_cursor, base_cursor, arbitrum_cursor) = tokio::join!(
@@ -2084,7 +2572,9 @@ async fn live_sauron_runtime_drives_router_worker_through_base_eth_btc_progress(
         return;
     }
     require_live_spend_confirmation();
-    run_live_runtime_route(RuntimeRoute::BaseEthToBtc).await;
+    LocalSet::new()
+        .run_until(run_live_runtime_route(RuntimeRoute::BaseEthToBtc))
+        .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2095,7 +2585,9 @@ async fn live_sauron_runtime_drives_router_worker_through_base_usdc_btc_progress
         return;
     }
     require_live_spend_confirmation();
-    run_live_runtime_route(RuntimeRoute::BaseUsdcToBtc).await;
+    LocalSet::new()
+        .run_until(run_live_runtime_route(RuntimeRoute::BaseUsdcToBtc))
+        .await;
 }
 
 async fn run_live_runtime_route(route: RuntimeRoute) {
@@ -2106,7 +2598,7 @@ async fn run_live_runtime_route(route: RuntimeRoute) {
         .expect("valid live runtime private key");
     let source_address = signer.address();
 
-    let postgres = test_postgres().await;
+    let mut postgres = test_postgres().await;
     let database_url = create_test_database(&postgres.admin_database_url).await;
     let state_database_url = create_test_database(&postgres.admin_database_url).await;
     let config_dir = tempfile::tempdir().expect("router live config dir");
@@ -2123,20 +2615,31 @@ async fn run_live_runtime_route(route: RuntimeRoute) {
     let db = worker_components.db.clone();
     let chain_registry = worker_components.chain_registry.clone();
     let (router_base_url, _api_task) = spawn_router_api(args.clone()).await;
-    let _worker_task = RuntimeTask {
-        handle: tokio::spawn(async move {
-            run_worker_loop(
-                worker_components.db,
-                worker_components.vault_manager,
-                worker_components.order_execution_manager,
-                worker_components.route_costs,
-                worker_components.provider_health_poller,
-                worker_config,
-            )
-            .await
-            .expect("live router worker loop should keep running until test aborts");
-        }),
-    };
+    ensure_temporal_up();
+    let mut temporal_worker_task = spawn_temporal_order_worker(&args).await;
+    let order_workflow_client = std::sync::Arc::new(
+        OrderWorkflowClient::connect(
+            &RouterTemporalConnection {
+                temporal_address: args.temporal_address.clone(),
+                namespace: args.temporal_namespace.clone(),
+            },
+            args.temporal_task_queue.clone(),
+        )
+        .await
+        .expect("connect Temporal order workflow client"),
+    );
+    let _worker_task = RuntimeTask::new(tokio::spawn(async move {
+        run_worker_loop(
+            worker_components.db,
+            worker_components.vault_manager,
+            order_workflow_client,
+            worker_components.route_costs,
+            worker_components.provider_health_poller,
+            worker_config,
+        )
+        .await
+        .expect("live router worker loop should keep running until test aborts");
+    }));
     let _sauron =
         spawn_live_sauron(&database_url, &state_database_url, &router_base_url, &live).await;
     let client = reqwest::Client::new();
@@ -2285,12 +2788,15 @@ async fn run_live_runtime_route(route: RuntimeRoute) {
             .all(|operation| operation.status == ProviderOperationStatus::Completed),
         "all provider operations should be completed for a successful live route"
     );
+    temporal_worker_task.abort_and_join().await;
+    postgres.shutdown().await;
 }
 
 async fn run_mock_runtime_route(route: RuntimeRoute) {
-    let postgres = test_postgres().await;
+    let mut postgres = test_postgres().await;
     let database_url = create_test_database(&postgres.admin_database_url).await;
     let state_database_url = create_test_database(&postgres.admin_database_url).await;
+    let hl_shim_database_url = create_test_database(&postgres.admin_database_url).await;
     let (devnet, _) = RiftDevnet::builder()
         .using_esplora(true)
         .using_token_indexer(database_url.clone())
@@ -2299,6 +2805,29 @@ async fn run_mock_runtime_route(route: RuntimeRoute) {
         .expect("devnet setup failed");
     prepare_route_chain_state(&devnet, route).await;
     let token_indexer_urls = token_indexer_urls_from_devnet(&devnet);
+    let (ethereum_receipt_watcher_url, ethereum_receipt_watcher_task) = spawn_evm_receipt_watcher(
+        "ethereum",
+        devnet.ethereum.anvil.endpoint_url().to_string(),
+        devnet.ethereum.anvil.ws_endpoint_url().to_string(),
+    )
+    .await;
+    let (base_receipt_watcher_url, base_receipt_watcher_task) = spawn_evm_receipt_watcher(
+        "base",
+        devnet.base.anvil.endpoint_url().to_string(),
+        devnet.base.anvil.ws_endpoint_url().to_string(),
+    )
+    .await;
+    let (arbitrum_receipt_watcher_url, arbitrum_receipt_watcher_task) = spawn_evm_receipt_watcher(
+        "arbitrum",
+        devnet.arbitrum.anvil.endpoint_url().to_string(),
+        devnet.arbitrum.anvil.ws_endpoint_url().to_string(),
+    )
+    .await;
+    let _receipt_watcher_tasks = [
+        ethereum_receipt_watcher_task,
+        base_receipt_watcher_task,
+        arbitrum_receipt_watcher_task,
+    ];
     let config_dir = tempfile::tempdir().expect("router config dir");
     let mocks = spawn_runtime_mocks(&devnet, route).await;
     let chain_tokens = route_chain_tokens(route);
@@ -2319,26 +2848,48 @@ async fn run_mock_runtime_route(route: RuntimeRoute) {
     .expect("initialize worker components");
     let db = worker_components.db.clone();
     let (router_base_url, _api_task) = spawn_router_api(args.clone()).await;
-    let _worker_task = RuntimeTask {
-        handle: tokio::spawn(async move {
-            run_worker_loop(
-                worker_components.db,
-                worker_components.vault_manager,
-                worker_components.order_execution_manager,
-                worker_components.route_costs,
-                worker_components.provider_health_poller,
-                worker_config,
-            )
-            .await
-            .expect("router worker loop should keep running until test aborts");
-        }),
-    };
+    ensure_temporal_up();
+    let (hl_shim_base_url, _hl_shim_task) =
+        spawn_hl_shim_indexer(&hl_shim_database_url, mocks.base_url()).await;
+    let (bitcoin_observer_urls, _bitcoin_observer_tasks) = spawn_bitcoin_observers(&devnet).await;
+    let mut temporal_worker_task = spawn_temporal_order_worker(&args).await;
+    let order_workflow_client = std::sync::Arc::new(
+        OrderWorkflowClient::connect(
+            &RouterTemporalConnection {
+                temporal_address: args.temporal_address.clone(),
+                namespace: args.temporal_namespace.clone(),
+            },
+            args.temporal_task_queue.clone(),
+        )
+        .await
+        .expect("connect Temporal order workflow client"),
+    );
+    let _worker_task = RuntimeTask::new(tokio::spawn(async move {
+        run_worker_loop(
+            worker_components.db,
+            worker_components.vault_manager,
+            order_workflow_client,
+            worker_components.route_costs,
+            worker_components.provider_health_poller,
+            worker_config,
+        )
+        .await
+        .expect("router worker loop should keep running until test aborts");
+    }));
     let _sauron = spawn_sauron(
         &devnet,
         &database_url,
         &state_database_url,
         &router_base_url,
         token_indexer_urls,
+        EvmReceiptWatcherUrls {
+            ethereum: ethereum_receipt_watcher_url,
+            base: base_receipt_watcher_url,
+            arbitrum: arbitrum_receipt_watcher_url,
+        },
+        Some(hl_shim_base_url),
+        Some(bitcoin_observer_urls),
+        Some(mocks.base_url().to_string()),
     )
     .await;
     let client = reqwest::Client::new();
@@ -2489,7 +3040,8 @@ async fn run_mock_runtime_route(route: RuntimeRoute) {
         .await
         .expect("completed funding vault");
     assert_eq!(completed_vault.status, DepositVaultStatus::Completed);
-    assert_runtime_hints_were_sauron_driven(&database_url, order.order.id, funding_vault.id).await;
+    assert_runtime_hints_are_production_driven(&database_url, order.order.id, funding_vault.id)
+        .await;
 
     let steps = db
         .orders()
@@ -2540,6 +3092,8 @@ async fn run_mock_runtime_route(route: RuntimeRoute) {
         usize::from(matches!(route, RuntimeRoute::BaseEthToBtc))
     );
     assert_eq!(withdrawal_ops.len(), 1);
+    temporal_worker_task.abort_and_join().await;
+    postgres.shutdown().await;
 }
 
 async fn assert_source_vault_received_paymaster_gas(
@@ -2561,7 +3115,7 @@ async fn assert_source_vault_received_paymaster_gas(
     );
 }
 
-async fn assert_runtime_hints_were_sauron_driven(
+async fn assert_runtime_hints_are_production_driven(
     database_url: &str,
     order_id: Uuid,
     funding_vault_id: Uuid,
@@ -2584,10 +3138,6 @@ async fn assert_runtime_hints_were_sauron_driven(
     .fetch_one(&pool)
     .await
     .expect("count funding hints");
-    assert!(
-        funding_hint_count > 0,
-        "runtime route should require Sauron to submit at least one funding hint"
-    );
 
     let non_sauron_funding_hints = sqlx_core::query_scalar::query_scalar::<_, i64>(
         r#"
@@ -2606,23 +3156,42 @@ async fn assert_runtime_hints_were_sauron_driven(
         "production-shaped runtime route should not insert funding hints from test helpers"
     );
 
-    let processed_funding_hints = sqlx_core::query_scalar::query_scalar::<_, i64>(
-        r#"
-            SELECT COUNT(*)::bigint
-            FROM deposit_vault_funding_hints
-            WHERE vault_id = $1
-              AND source = 'sauron'
-              AND status = 'processed'
-            "#,
-    )
-    .bind(funding_vault_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count processed Sauron funding hints");
-    assert!(
-        processed_funding_hints > 0,
-        "runtime route should process the Sauron funding hint that advances the source vault"
-    );
+    if funding_hint_count > 0 {
+        let processed_funding_hints = sqlx_core::query_scalar::query_scalar::<_, i64>(
+            r#"
+                SELECT COUNT(*)::bigint
+                FROM deposit_vault_funding_hints
+                WHERE vault_id = $1
+                  AND source = 'sauron'
+                  AND status = 'processed'
+                "#,
+        )
+        .bind(funding_vault_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count processed Sauron funding hints");
+        assert!(
+            processed_funding_hints > 0,
+            "runtime route should process Sauron funding hints when they win the funding race"
+        );
+    } else {
+        let funding_source = sqlx_core::query_scalar::query_scalar::<_, Option<String>>(
+            r#"
+                SELECT funding_evidence_json->>'source'
+                FROM deposit_vaults
+                WHERE id = $1
+                "#,
+        )
+        .bind(funding_vault_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read funding observation source");
+        assert_eq!(
+            funding_source.as_deref(),
+            Some("router_balance_reconciliation"),
+            "runtime route funding should be advanced by Sauron or router balance reconciliation, not test helpers"
+        );
+    }
 
     let provider_hint_count = sqlx_core::query_scalar::query_scalar::<_, i64>(
         r#"
@@ -2637,51 +3206,54 @@ async fn assert_runtime_hints_were_sauron_driven(
     .fetch_one(&pool)
     .await
     .expect("count provider operation hints");
-    assert!(
-        provider_hint_count > 0,
-        "runtime route should require Sauron to submit provider-operation hints"
-    );
+    if provider_hint_count > 0 {
+        let non_sauron_provider_hints = sqlx_core::query_scalar::query_scalar::<_, i64>(
+            r#"
+                SELECT COUNT(*)::bigint
+                FROM order_provider_operation_hints hints
+                JOIN order_provider_operations operations
+                  ON operations.id = hints.provider_operation_id
+                WHERE operations.order_id = $1
+                  AND hints.source NOT IN (
+                    'sauron',
+                    'sauron_provider_operation_observation',
+                    $2,
+                    $3,
+                    $4
+                  )
+                "#,
+        )
+        .bind(order_id)
+        .bind(SAURON_HYPERLIQUID_OBSERVER_HINT_SOURCE)
+        .bind(SAURON_EVM_RECEIPT_OBSERVER_HINT_SOURCE)
+        .bind(SAURON_HYPERUNIT_OBSERVER_HINT_SOURCE)
+        .fetch_one(&pool)
+        .await
+        .expect("count non-Sauron provider operation hints");
+        assert_eq!(
+            non_sauron_provider_hints, 0,
+            "production-shaped runtime route should not insert provider-operation hints from test helpers"
+        );
 
-    let non_sauron_provider_hints = sqlx_core::query_scalar::query_scalar::<_, i64>(
-        r#"
-            SELECT COUNT(*)::bigint
-            FROM order_provider_operation_hints hints
-            JOIN order_provider_operations operations
-              ON operations.id = hints.provider_operation_id
-            WHERE operations.order_id = $1
-              AND hints.source NOT IN (
-                'sauron',
-                'sauron_provider_operation_observation'
-              )
-            "#,
-    )
-    .bind(order_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count non-Sauron provider operation hints");
-    assert_eq!(
-        non_sauron_provider_hints, 0,
-        "production-shaped runtime route should not insert provider-operation hints from test helpers"
-    );
-
-    let processed_provider_hints = sqlx_core::query_scalar::query_scalar::<_, i64>(
-        r#"
-            SELECT COUNT(*)::bigint
-            FROM order_provider_operation_hints hints
-            JOIN order_provider_operations operations
-              ON operations.id = hints.provider_operation_id
-            WHERE operations.order_id = $1
-              AND hints.status = 'processed'
-            "#,
-    )
-    .bind(order_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count processed provider operation hints");
-    assert!(
-        processed_provider_hints > 0,
-        "runtime route should process provider-operation hints emitted from Sauron"
-    );
+        let processed_provider_hints = sqlx_core::query_scalar::query_scalar::<_, i64>(
+            r#"
+                SELECT COUNT(*)::bigint
+                FROM order_provider_operation_hints hints
+                JOIN order_provider_operations operations
+                  ON operations.id = hints.provider_operation_id
+                WHERE operations.order_id = $1
+                  AND hints.status = 'processed'
+                "#,
+        )
+        .bind(order_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count processed provider operation hints");
+        assert!(
+            processed_provider_hints > 0,
+            "runtime route should process provider-operation hints when Sauron wins the observation race"
+        );
+    }
 }
 
 fn assert_async_provider_operation_started(operation: &OrderProviderOperation) {

@@ -1,0 +1,113 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [
+    {
+      "asDropdown": true,
+      "icon": "external link",
+      "includeVars": false,
+      "keepTime": true,
+      "tags": ["tee-router"],
+      "targetBlank": false,
+      "title": "Tee Router dashboards",
+      "type": "dashboards"
+    }
+  ],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+      "description": "Is Sauron's scrape target reachable?",
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {"options": {"0": {"color": "red", "text": "DOWN"}}, "type": "value"},
+            {"options": {"1": {"color": "green", "text": "UP"}}, "type": "value"}
+          ],
+          "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]},
+          "unit": "none"
+        }
+      },
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+      "id": 1,
+      "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "value_and_name"},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "victoriametrics"}, "editorMode": "code", "expr": "up{job=\"sauron\"}", "legendFormat": "{{instance}}", "refId": "A"}],
+      "title": "Sauron Scrape Health",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+      "description": "Active watches Sauron is currently tracking, by kind. A 'watch' = an address+amount Sauron is observing for an incoming deposit. Two kinds: provider_operation (tied to an execution step) and funding_vault (vault funding).",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisLabel": "watches", "drawStyle": "line", "fillOpacity": 25, "lineWidth": 2, "showPoints": "never", "stacking": {"group": "A", "mode": "normal"}}, "unit": "short"}},
+      "gridPos": {"h": 8, "w": 9, "x": 6, "y": 0},
+      "id": 2,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "victoriametrics"}, "editorMode": "code", "expr": "sauron_watch_count", "legendFormat": "funding_vault", "refId": "A"},
+        {"datasource": {"type": "prometheus", "uid": "victoriametrics"}, "editorMode": "code", "expr": "sauron_provider_operation_watch_count", "legendFormat": "provider_operation", "refId": "B"}
+      ],
+      "title": "Active Watches",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+      "description": "Postgres CDC events Sauron is decoding. Two counters: all replication events (raw, includes protocol overhead) and logical messages (filtered to rift.router.change prefix — the actual table changes Sauron acts on).",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisLabel": "events/s", "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never"}, "unit": "eps"}},
+      "gridPos": {"h": 8, "w": 9, "x": 15, "y": 0},
+      "id": 3,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "victoriametrics"}, "editorMode": "code", "expr": "rate(sauron_cdc_events_total[1m])", "legendFormat": "raw events", "refId": "A"},
+        {"datasource": {"type": "prometheus", "uid": "victoriametrics"}, "editorMode": "code", "expr": "rate(sauron_cdc_logical_messages_total[1m])", "legendFormat": "logical messages", "refId": "B"}
+      ],
+      "title": "CDC Event Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+      "description": "Outbound requests Sauron makes to sidecar indexers and trading venues. The 418/sec to evm_token_indexer the user previously flagged shows up here. Sauron has no direct chain RPC — it routes through the receipt-watcher / token-indexer sidecars.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisLabel": "req/s", "drawStyle": "line", "fillOpacity": 25, "lineWidth": 2, "showPoints": "never", "stacking": {"group": "A", "mode": "normal"}}, "unit": "reqps"}},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 8},
+      "id": 4,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "victoriametrics"}, "editorMode": "code", "expr": "sum by (kind, service) (rate(tee_router_upstream_requests_total{job=\"sauron\"}[1m]))", "legendFormat": "{{kind}}/{{service}}", "refId": "A"}],
+      "title": "Sauron Outbound Request Rate (by upstream)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "loki"},
+      "description": "Recent Sauron logs.",
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 16},
+      "id": 6,
+      "options": {"dedupStrategy": "none", "enableLogDetails": true, "prettifyLogMessage": false, "showCommonLabels": false, "showLabels": false, "showTime": true, "sortOrder": "Descending", "wrapLogMessage": false},
+      "targets": [{"datasource": {"type": "loki", "uid": "loki"}, "editorMode": "code", "expr": "{service_name=\"tee-router/sauron\"} | json", "queryType": "range", "refId": "A"}],
+      "title": "Recent Logs",
+      "type": "logs"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["tee-router", "sauron"],
+  "templating": {"list": []},
+  "time": {"from": "now-30m", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Tee Router — Sauron",
+  "uid": "tee-router-sauron",
+  "version": 1
+}

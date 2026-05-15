@@ -152,6 +152,28 @@ test('/api/orders rejects pagination cursors with non-canonical timestamps', asy
   }
 })
 
+test('/api/orders rejects retired lifecycle filters', async () => {
+  const consoleError = console.error
+  console.error = () => undefined
+  const runtime = createApp(
+    testConfig({
+      replicaDatabaseUrl: 'postgres://postgres:postgres@127.0.0.1:1/postgres',
+      cdcSlotName: `admin_dashboard_orders_cdc_filter_test_${Date.now()}`
+    })
+  )
+
+  try {
+    for (const filter of ['failed', 'manual_refund']) {
+      const response = await runtime.app.request(`/api/orders?filter=${filter}`)
+      expect(response.status).toBe(400)
+      expect(await response.json()).toEqual({ error: 'invalid_order_filter' })
+    }
+  } finally {
+    console.error = consoleError
+    await runtime.close()
+  }
+})
+
 test('order SSE queues lifecycle-filter removes that race with the initial snapshot', async () => {
   const controller = new AbortController()
   const orderId = '019df1c4-8d87-7c20-89a4-e76883e94a0f'
@@ -329,7 +351,11 @@ test('order SSE forwards analytics change hints even when updated status is not 
       queueMicrotask(() => {
         void next({
           kind: 'upsert',
-          order: order({ id: orderId, status: 'failed', orderType: 'market_order' }),
+          order: order({
+            id: orderId,
+            status: 'manual_intervention_required',
+            orderType: 'market_order'
+          }),
           total: 7,
           metrics: {
             total: 7,
@@ -604,18 +630,36 @@ test('fetchOrderPage falls back to replica metrics when analytics metrics fail',
   }
 })
 
-test('parseAnalyticsRange rejects oversized bucket windows', async () => {
-  const accepted = parseAnalyticsRange(
-    '2026-05-01T00:00:00.000Z',
-    '2026-05-08T00:00:00.000Z',
-    'minute'
-  )
-  expect(accepted).not.toBeInstanceOf(Response)
+test('parseAnalyticsRange accepts every fixed dashboard window and bucket size', () => {
+  const to = new Date('2026-05-05T00:00:00.000Z')
+  const windows = [
+    { amount: 6, unit: 'hour' },
+    { amount: 1, unit: 'day' },
+    { amount: 7, unit: 'day' },
+    { amount: 30, unit: 'day' },
+    { amount: 90, unit: 'day' }
+  ] as const
+  const bucketSizes = ['five_minute', 'hour', 'day'] as const
 
+  for (const window of windows) {
+    const from = new Date(to)
+    if (window.unit === 'hour') from.setUTCHours(from.getUTCHours() - window.amount)
+    else if (window.amount === 1) from.setUTCHours(from.getUTCHours() - 24)
+    else from.setUTCDate(from.getUTCDate() - window.amount)
+
+    for (const bucketSize of bucketSizes) {
+      expect(
+        parseAnalyticsRange(from.toISOString(), to.toISOString(), bucketSize)
+      ).not.toBeInstanceOf(Response)
+    }
+  }
+})
+
+test('parseAnalyticsRange rejects oversized bucket windows', async () => {
   const rejected = parseAnalyticsRange(
     '2026-05-01T00:00:00.000Z',
-    '2026-06-01T00:00:00.000Z',
-    'minute'
+    '2027-08-01T00:01:00.000Z',
+    'five_minute'
   )
   expect(rejected).toBeInstanceOf(Response)
   expect((rejected as Response).status).toBe(400)
@@ -652,14 +696,14 @@ test('parseAnalyticsRange rejects non-canonical timestamp strings', async () => 
   })
 })
 
-test('lifecycle filters keep refunded orders out of the failed tab', () => {
+test('lifecycle filters keep refunded orders out of the needs-attention tab', () => {
   expect(
     orderMatchesLifecycleFilter(
       order({
         id: '019df446-096f-7290-bf84-dc9dac9dd8ab',
         status: 'refunded'
       }),
-      'failed'
+      'needs_attention'
     )
   ).toBe(false)
   expect(
@@ -677,26 +721,36 @@ test('lifecycle filters keep refunded orders out of the failed tab', () => {
         id: '019df446-096f-7290-bf84-dc9dac9dd8ac',
         status: 'refund_required'
       }),
-      'failed'
+      'needs_attention'
     )
   ).toBe(true)
 })
 
-test('lifecycle filters treat generic manual intervention as needs-attention but not manual refund', () => {
+test('lifecycle filters treat manual intervention as needs-attention', () => {
   const manualInterventionOrder = order({
     id: '019df446-096f-7290-bf84-dc9dac9dd8ad',
     status: 'manual_intervention_required'
   })
 
   expect(
-    orderMatchesLifecycleFilter(manualInterventionOrder, 'failed')
+    orderMatchesLifecycleFilter(manualInterventionOrder, 'needs_attention')
   ).toBe(true)
   expect(
     orderMatchesLifecycleFilter(manualInterventionOrder, 'in_progress')
   ).toBe(false)
+})
+
+test('lifecycle filters keep expired orders in the dedicated expired tab', () => {
+  const expiredOrder = order({
+    id: '019df446-096f-7290-bf84-dc9dac9dd8ae',
+    status: 'expired'
+  })
+
   expect(
-    orderMatchesLifecycleFilter(manualInterventionOrder, 'manual_refund')
+    orderMatchesLifecycleFilter(expiredOrder, 'needs_attention')
   ).toBe(false)
+  expect(orderMatchesLifecycleFilter(expiredOrder, 'expired')).toBe(true)
+  expect(orderMatchesLifecycleFilter(expiredOrder, 'in_progress')).toBe(false)
 })
 
 async function readUntil(response: Response, expected: string) {

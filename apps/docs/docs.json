@@ -24,8 +24,7 @@
               "what-is-rift",
               "multichain-smart-contracts",
               "use-cases",
-              "security-model",
-              "frequently-asked-questions"
+              "security-model"
             ]
           },
           {
@@ -58,7 +57,7 @@
   "footer": {
     "socials": {
       "x": "https://x.com/riftdex",
-      "github": "https://github.com/riftresearch/tee-router"
+      "github": "https://github.com/riftresearch"
     }
   },
   "api": {

@@ -134,7 +134,7 @@ Touchpoints:
 
 - `bin/router-server/src/models.rs`
 - `bin/router-server/src/db/order_repo.rs`
-- `bin/router-server/migrations/*.sql`
+- `crates/router-core/migrations/*.sql`
 - `docs/market-order-action-spec.md`
 
 Required work:
@@ -200,6 +200,11 @@ Required work:
    - provider minimums
    - expiry
    - deterministic provider quote descriptor
+   - explicit amount-format contract for every provider field:
+     - router quote/order/leg amounts must be raw base-unit integer strings
+     - provider action payloads may use human decimal strings only when the
+       provider API requires them
+     - raw and human decimal fields must not reuse the same JSON key name
 
 3. Implement execution intent generation.
    - `CustodyAction`
@@ -235,6 +240,7 @@ Required work:
    - execution intent shape
    - provider operation observation
    - exact-in/exact-out math
+   - raw base-unit versus human decimal amount conversion
    - unsupported route errors
    - auth/header/query construction
 
@@ -274,7 +280,18 @@ Required work:
    - gas reimbursement plan
    - retention actions if any
 
-5. Make sure arbitrary-asset entry/exit behavior is explicit.
+5. Verify quote amount formats.
+   - Top-level `amount_in`, `amount_out`, `min_amount_out`, and
+     `max_amount_in` must be raw base-unit integer strings.
+   - Every `provider_quote.legs[*]` amount field must be a raw base-unit
+     integer string.
+   - If a provider requires human decimal strings for execution, store those
+     only in provider-specific request/action fields with explicit names such
+     as `amount_decimal`.
+   - Add tests that fail on decimal points, exponents, commas, whitespace, or
+     other non-raw formats in router-visible amount fields.
+
+6. Make sure arbitrary-asset entry/exit behavior is explicit.
    - Universal routers should only appear on the edge unless deliberately
      allowed in the core graph.
    - Fixed-pair venues should never guess unsupported tokens.
@@ -361,7 +378,7 @@ Required work:
    - transaction reverted
    - provider operation failed
    - provider status unknown
-   - quote expired before submission
+   - provider venue quote expired before submission
    - insufficient source/intermediate balance
    - partial fill/delivery
 
@@ -521,25 +538,41 @@ Completion criteria:
 Touchpoints:
 
 - provider/client crate live differential tests
+- `bin/router-server/tests/live_*_provider_differential.rs`
 - `bin/router-server/tests/live_quote_probes.rs`
 - provider-specific ignored tests
+- `docs/live-provider-differential-tests.md`
 - `docs/provider-mock-parity.md`
 
 Required work:
 
 1. Add a read-only live differential test when possible.
+   - use one provider-specific test target, named
+     `live_<venue>_provider_differential.rs`
+   - live provider call and local mock provider call from the same normalized
+     request
    - quote request
    - provider response transcript
    - parsed normalized quote
+   - mock-vs-live contract comparison for required fields, optional fields,
+     timestamps, token identity, calldata/action shape, and operation status
+   - amount-format assertions proving which live fields are raw base-unit
+     strings and which provider-only fields are human decimal strings
 
 2. Add a real-funds live differential test when the venue submits transactions.
+   - keep it separate from the read-only differential target
    - explicit env gates
    - explicit spend confirmation env var
    - small bounded notional
    - transcript logging
    - final balance/status verification
+   - provider operation amount-format assertions when operation status includes
+     amount fields
 
 3. Verify the mock was built from observed real provider shapes.
+   - A mock-only integration test is not sufficient. The read-only live layer
+     must fail when the mock omits a live field that the router treats as part
+     of the contract.
 
 4. Keep brittle market values out of assertions. Assert shape, lifecycle, and
    invariants.
@@ -617,16 +650,19 @@ Minimum test set:
 5. Quote test for exact-out or explicit unsupported exact-out.
 6. Quote expiry/slippage hard-bound test when the venue participates in
    slippage.
-7. Planner materialization test.
-8. Custody role validation test.
-9. Provider policy block test.
-10. Mock provider quote/execute/observe unit tests.
-11. Local integration test that completes a forward route through the venue.
-12. Failure test that sends the order to retry or refund.
-13. Refund route test if the venue can be part of refund routing.
-14. Worker restart recovery test for async operations.
-15. Sauron hint/detection test when Sauron is involved.
-16. Live differential test.
+7. Amount-format tests proving router-visible amounts are raw base-unit integer
+   strings and provider-only human decimals are isolated behind explicit field
+   names.
+8. Planner materialization test.
+9. Custody role validation test.
+10. Provider policy block test.
+11. Mock provider quote/execute/observe unit tests.
+12. Local integration test that completes a forward route through the venue.
+13. Failure test that sends the order to retry or refund.
+14. Refund route test if the venue can be part of refund routing.
+15. Worker restart recovery test for async operations.
+16. Sauron hint/detection test when Sauron is involved.
+17. Live differential test.
 
 Before merge, run at least:
 

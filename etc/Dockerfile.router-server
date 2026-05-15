@@ -1,16 +1,20 @@
-FROM rust:1.90.0-trixie AS chef
-RUN cargo install cargo-chef --locked
+# syntax=docker/dockerfile:1.7
+FROM rust:1.90.0-trixie AS builder
+ENV RUSTUP_TOOLCHAIN=1.90.0-x86_64-unknown-linux-gnu
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libprotobuf-dev \
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
-
-FROM chef AS planner
 COPY . .
-RUN cargo chef prepare --recipe-path recipe.json
-
-FROM chef AS builder
-COPY --from=planner /app/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json
-COPY . .
-RUN cargo build --release -p router-server --bin router-api --bin router-worker
+RUN --mount=type=cache,id=tee-router-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=tee-router-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=tee-router-target,target=/app/target,sharing=locked \
+    cargo build --release -p router-server --bin router-api --bin router-worker \
+    && install -Dm0755 /app/target/release/router-api /app/out/router-api \
+    && install -Dm0755 /app/target/release/router-worker /app/out/router-worker
 
 FROM debian:trixie
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -18,8 +22,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-COPY --from=builder /app/target/release/router-api /usr/local/bin/router-api
-COPY --from=builder /app/target/release/router-worker /usr/local/bin/router-worker
-COPY --from=builder /app/bin/router-server/migrations /app/migrations
+COPY --from=builder /app/out/router-api /usr/local/bin/router-api
+COPY --from=builder /app/out/router-worker /usr/local/bin/router-worker
+COPY --from=builder /app/crates/router-core/migrations /app/migrations
 ENV ROUTER_MIGRATIONS_DIR=/app/migrations
 CMD ["router-api", "--host", "0.0.0.0", "--port", "4522"]

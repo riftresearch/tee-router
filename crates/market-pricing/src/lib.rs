@@ -3,7 +3,7 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use snafu::Snafu;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use url::Url;
 
@@ -156,9 +156,9 @@ impl MarketPricingOracle {
             self.coinbase_spot_usd_micro("ETH-USD"),
             self.coinbase_spot_usd_micro("BTC-USD"),
             self.coinbase_spot_usd_micro("USDC-USD"),
-            self.evm_gas_price_wei(&self.config.ethereum_rpc_url),
-            self.evm_gas_price_wei(&self.config.arbitrum_rpc_url),
-            self.evm_gas_price_wei(&self.config.base_rpc_url),
+            self.evm_gas_price_wei("ethereum", &self.config.ethereum_rpc_url),
+            self.evm_gas_price_wei("arbitrum", &self.config.arbitrum_rpc_url),
+            self.evm_gas_price_wei("base", &self.config.base_rpc_url),
         )?;
 
         Ok(MarketPricingSnapshot {
@@ -193,7 +193,14 @@ impl MarketPricingOracle {
     async fn coinbase_spot_usd_micro_once(&self, product_id: &str) -> MarketPricingResult<u64> {
         let path = format!("/v2/prices/{product_id}/spot");
         let url = join_url(&self.config.coinbase_api_base_url, &path)?;
-        let response: CoinbaseSpotPriceResponse = get_json(&self.http, url.clone()).await?;
+        let response: CoinbaseSpotPriceResponse = get_json(
+            &self.http,
+            url.clone(),
+            "coinbase",
+            "GET",
+            "/v2/prices/:product_id/spot",
+        )
+        .await?;
         if response.data.currency != "USD" {
             return Err(MarketPricingError::UnexpectedCurrency {
                 product_id: product_id.to_string(),
@@ -204,11 +211,15 @@ impl MarketPricingOracle {
         Ok(value)
     }
 
-    async fn evm_gas_price_wei(&self, rpc_url: &Url) -> MarketPricingResult<u64> {
+    async fn evm_gas_price_wei(
+        &self,
+        chain: &'static str,
+        rpc_url: &Url,
+    ) -> MarketPricingResult<u64> {
         let mut delay = PRICING_RETRY_INITIAL_DELAY;
         let mut attempt = 1;
         loop {
-            match self.evm_gas_price_wei_once(rpc_url).await {
+            match self.evm_gas_price_wei_once(chain, rpc_url).await {
                 Ok(value) => return Ok(value),
                 Err(error) if attempt < PRICING_RETRY_ATTEMPTS && error.is_retryable() => {
                     sleep(delay).await;
@@ -220,28 +231,49 @@ impl MarketPricingOracle {
         }
     }
 
-    async fn evm_gas_price_wei_once(&self, rpc_url: &Url) -> MarketPricingResult<u64> {
+    async fn evm_gas_price_wei_once(
+        &self,
+        chain: &'static str,
+        rpc_url: &Url,
+    ) -> MarketPricingResult<u64> {
         let body = json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "eth_gasPrice",
             "params": [],
         });
-        let response = self
-            .http
-            .post(rpc_url.clone())
-            .json(&body)
-            .send()
-            .await
-            .map_err(|source| MarketPricingError::Http {
-                source: source.without_url(),
-            })?;
+        let started = Instant::now();
+        let response = match self.http.post(rpc_url.clone()).json(&body).send().await {
+            Ok(response) => response,
+            Err(source) => {
+                record_chain_rpc_request(
+                    chain,
+                    "eth_gasPrice",
+                    "transport_error",
+                    started.elapsed(),
+                );
+                return Err(MarketPricingError::Http {
+                    source: source.without_url(),
+                });
+            }
+        };
         let sanitized_rpc_url = sanitized_parsed_url_for_error(rpc_url);
         let status = response.status();
-        let body =
-            read_limited_response_text(response, MARKET_PRICING_MAX_RESPONSE_BODY_BYTES, rpc_url)
-                .await?;
+        let body = match read_limited_response_text(
+            response,
+            MARKET_PRICING_MAX_RESPONSE_BODY_BYTES,
+            rpc_url,
+        )
+        .await
+        {
+            Ok(body) => body,
+            Err(error) => {
+                record_chain_rpc_request(chain, "eth_gasPrice", "body_error", started.elapsed());
+                return Err(error);
+            }
+        };
         if !status.is_success() {
+            record_chain_rpc_request(chain, "eth_gasPrice", "http_error", started.elapsed());
             return Err(MarketPricingError::HttpStatus {
                 url: sanitized_rpc_url,
                 status,
@@ -255,6 +287,7 @@ impl MarketPricingOracle {
                 body: error_text_preview(&body),
             })?;
         if let Some(error) = value.error {
+            record_chain_rpc_request(chain, "eth_gasPrice", "rpc_error", started.elapsed());
             return Err(MarketPricingError::RpcError {
                 url: sanitized_rpc_url,
                 error: error_text_preview(&error.to_string()),
@@ -276,6 +309,7 @@ impl MarketPricingOracle {
             body: error_text_preview(&body),
         })?;
         ensure_positive_price(&format!("rpc gas price {sanitized_rpc_url}"), value)?;
+        record_chain_rpc_request(chain, "eth_gasPrice", "success", started.elapsed());
         Ok(value)
     }
 }
@@ -297,19 +331,41 @@ struct JsonRpcResponse {
     error: Option<Value>,
 }
 
-async fn get_json<T>(http: &reqwest::Client, url: Url) -> MarketPricingResult<T>
+async fn get_json<T>(
+    http: &reqwest::Client,
+    url: Url,
+    venue: &'static str,
+    method: &'static str,
+    endpoint: &'static str,
+) -> MarketPricingResult<T>
 where
     T: for<'de> Deserialize<'de>,
 {
-    let response =
-        http.get(url.clone())
-            .send()
-            .await
-            .map_err(|source| MarketPricingError::Http {
+    let started = Instant::now();
+    let response = match http.get(url.clone()).send().await {
+        Ok(response) => response,
+        Err(source) => {
+            record_venue_request(
+                venue,
+                method,
+                endpoint,
+                "transport_error",
+                started.elapsed(),
+            );
+            return Err(MarketPricingError::Http {
                 source: source.without_url(),
-            })?;
+            });
+        }
+    };
     let sanitized_url = sanitized_parsed_url_for_error(&url);
     let status = response.status();
+    record_venue_request(
+        venue,
+        method,
+        endpoint,
+        status_class(status),
+        started.elapsed(),
+    );
     let body =
         read_limited_response_text(response, MARKET_PRICING_MAX_RESPONSE_BODY_BYTES, &url).await?;
     if !status.is_success() {
@@ -324,6 +380,56 @@ where
         source,
         body: error_text_preview(&body),
     })
+}
+
+fn record_venue_request(
+    venue: &'static str,
+    method: &'static str,
+    endpoint: &'static str,
+    status_class: &'static str,
+    duration: Duration,
+) {
+    observability::upstream::record_upstream_request(
+        observability::upstream::UpstreamKind::TradingVenue,
+        venue,
+        method,
+        endpoint,
+        status_class,
+        duration,
+    );
+}
+
+fn record_chain_rpc_request(
+    chain: &'static str,
+    rpc_method: &'static str,
+    status: &'static str,
+    duration: Duration,
+) {
+    metrics::counter!(
+        "tee_router_chain_rpc_requests_total",
+        "chain" => chain,
+        "rpc_method" => rpc_method,
+        "status" => status,
+    )
+    .increment(1);
+    metrics::histogram!(
+        "tee_router_chain_rpc_request_duration_seconds",
+        "chain" => chain,
+        "rpc_method" => rpc_method,
+        "status" => status,
+    )
+    .record(duration.as_secs_f64());
+}
+
+fn status_class(status: StatusCode) -> &'static str {
+    match status.as_u16() {
+        100..=199 => "1xx",
+        200..=299 => "2xx",
+        300..=399 => "3xx",
+        400..=499 => "4xx",
+        500..=599 => "5xx",
+        _ => "unknown",
+    }
 }
 
 async fn read_limited_response_text(
@@ -360,8 +466,7 @@ fn append_limited_body_chunk(body: &mut Vec<u8>, chunk: &[u8], max_bytes: usize)
 
 fn error_text_preview(value: &str) -> String {
     let mut end = 0;
-    let mut count = 0;
-    for (index, ch) in value.char_indices() {
+    for (count, (index, ch)) in value.char_indices().enumerate() {
         if count == MARKET_PRICING_MAX_ERROR_PREVIEW_CHARS {
             return format!(
                 "{}...<truncated {} chars>",
@@ -370,7 +475,6 @@ fn error_text_preview(value: &str) -> String {
             );
         }
         end = index + ch.len_utf8();
-        count += 1;
     }
     value.to_string()
 }
