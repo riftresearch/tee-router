@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use temporalio_common::protos::temporal::api::common::v1::RetryPolicy;
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityOptions, ChildWorkflowOptions, SyncWorkflowContext, WorkflowContext,
+    ActivityOptions, CancellableFuture, ChildWorkflowOptions, SyncWorkflowContext, WorkflowContext,
     WorkflowContextView, WorkflowResult,
 };
 use uuid::Uuid;
