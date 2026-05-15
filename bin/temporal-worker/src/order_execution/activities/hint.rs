@@ -39,10 +39,16 @@ impl ProviderObservationActivities {
     ) -> Result<ProviderOperationHintVerified, ActivityError> {
         record_activity("verify_across_fill_hint", async move {
             let deps = self.deps()?;
-            run_hint_verify(&deps, input, ExpectedHintKinds::Either(
-                ProviderHintKind::AcrossFill,
-                ProviderHintKind::AcrossDestinationFilled,
-            ), verify_across_fill_hint).await
+            run_hint_verify(
+                &deps,
+                input,
+                ExpectedHintKinds::Either(
+                    ProviderHintKind::AcrossFill,
+                    ProviderHintKind::AcrossDestinationFilled,
+                ),
+                verify_across_fill_hint,
+            )
+            .await
         })
         .await
     }
@@ -148,16 +154,19 @@ impl ProviderObservationActivities {
         _ctx: ActivityContext,
         input: VerifyProviderOperationHintInput,
     ) -> Result<ProviderOperationHintVerified, ActivityError> {
-        record_activity("verify_hyperunit_withdrawal_acknowledged_hint", async move {
-            let deps = self.deps()?;
-            run_hint_verify(
-                &deps,
-                input,
-                ExpectedHintKinds::Single(ProviderHintKind::HyperUnitWithdrawalAcknowledged),
-                verify_hyperunit_withdrawal_acknowledged_hint,
-            )
-            .await
-        })
+        record_activity(
+            "verify_hyperunit_withdrawal_acknowledged_hint",
+            async move {
+                let deps = self.deps()?;
+                run_hint_verify(
+                    &deps,
+                    input,
+                    ExpectedHintKinds::Single(ProviderHintKind::HyperUnitWithdrawalAcknowledged),
+                    verify_hyperunit_withdrawal_acknowledged_hint,
+                )
+                .await
+            },
+        )
         .await
     }
 

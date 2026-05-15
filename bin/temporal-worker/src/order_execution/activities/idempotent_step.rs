@@ -85,8 +85,14 @@ where
     let operation_type = executor.operation_type();
     let idempotency_key = step_idempotency_key(step, operation_type);
 
-    if let Some(operation) = lookup_existing_operation(deps, step, operation_type, &idempotency_key).await? {
-        return Ok(existing_operation_completion(step, operation, idempotency_key));
+    if let Some(operation) =
+        lookup_existing_operation(deps, step, operation_type, &idempotency_key).await?
+    {
+        return Ok(existing_operation_completion(
+            step,
+            operation,
+            idempotency_key,
+        ));
     }
 
     let mut intent = executor.build_intent(deps, step, &idempotency_key).await?;
@@ -95,7 +101,11 @@ where
     if let Some(operation) =
         persist_intent_before_side_effect(deps, step, &intent, operation_type).await?
     {
-        return Ok(existing_operation_completion(step, operation, idempotency_key));
+        return Ok(existing_operation_completion(
+            step,
+            operation,
+            idempotency_key,
+        ));
     }
 
     Ok(StepDispatchResult::ProviderIntent(intent))
@@ -105,7 +115,10 @@ where
 /// because retry attempts re-create the step with the same `step_index`. We
 /// include the step_type tag for human readability and as a defence against
 /// operator confusion (e.g. comparing keys across step types in a SQL prompt).
-fn step_idempotency_key(step: &OrderExecutionStep, operation_type: ProviderOperationType) -> String {
+fn step_idempotency_key(
+    step: &OrderExecutionStep,
+    operation_type: ProviderOperationType,
+) -> String {
     format!(
         "order:{}:{}:step:{}",
         step.order_id,
@@ -225,7 +238,10 @@ fn existing_operation_completion(
         }),
         addresses: Vec::new(),
     };
-    let response_kind = format!("{}_idempotency_reuse", operation.operation_type.to_db_string());
+    let response_kind = format!(
+        "{}_idempotency_reuse",
+        operation.operation_type.to_db_string()
+    );
     StepDispatchResult::Complete(StepCompletion {
         response: json!({
             "kind": response_kind,
@@ -241,4 +257,3 @@ fn existing_operation_completion(
         outcome,
     })
 }
-

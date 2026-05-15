@@ -576,13 +576,13 @@ impl Poller {
     async fn poll_funding(&self, user: Address) -> Result<()> {
         let cursor = self.storage.cursor(user, CursorEndpoint::Funding).await?;
         let start = cursor.saturating_sub(CURSOR_SAFETY_WINDOW_MS).max(0) as u64;
-        let fundings = self
-            .hl
-            .user_funding(user, start, None)
-            .await
-            .context(HyperliquidRequestSnafu {
-                endpoint: "userFunding",
-            })?;
+        let fundings =
+            self.hl
+                .user_funding(user, start, None)
+                .await
+                .context(HyperliquidRequestSnafu {
+                    endpoint: "userFunding",
+                })?;
         telemetry::record_hl_request("userFunding", "ok", PollEndpoint::Funding.weight());
         let max_time = fundings
             .iter()

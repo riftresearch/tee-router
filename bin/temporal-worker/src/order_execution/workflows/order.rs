@@ -1004,9 +1004,9 @@ enum ManualInterventionResolution {
 #[macro_export]
 macro_rules! dispatch_step_activity {
     ($ctx:expr, $step_type:expr, $input:expr, $options:expr) => {{
+        use ::futures_util::FutureExt;
         use $crate::order_execution::activities::OrderActivities;
         use $crate::order_execution::types::OrderExecutionStepType;
-        use ::futures_util::FutureExt;
         let __dispatch_future: ::futures_util::future::LocalBoxFuture<
             '_,
             ::std::result::Result<
@@ -1015,13 +1015,21 @@ macro_rules! dispatch_step_activity {
             >,
         > = match $step_type {
             OrderExecutionStepType::AcrossBridge => $ctx
-                .start_activity(OrderActivities::dispatch_across_bridge_step, $input, $options)
+                .start_activity(
+                    OrderActivities::dispatch_across_bridge_step,
+                    $input,
+                    $options,
+                )
                 .boxed_local(),
             OrderExecutionStepType::CctpBurn => $ctx
                 .start_activity(OrderActivities::dispatch_cctp_burn_step, $input, $options)
                 .boxed_local(),
             OrderExecutionStepType::CctpReceive => $ctx
-                .start_activity(OrderActivities::dispatch_cctp_receive_step, $input, $options)
+                .start_activity(
+                    OrderActivities::dispatch_cctp_receive_step,
+                    $input,
+                    $options,
+                )
                 .boxed_local(),
             OrderExecutionStepType::HyperliquidBridgeDeposit => $ctx
                 .start_activity(
@@ -1059,7 +1067,11 @@ macro_rules! dispatch_step_activity {
                 )
                 .boxed_local(),
             OrderExecutionStepType::UnitDeposit => $ctx
-                .start_activity(OrderActivities::dispatch_unit_deposit_step, $input, $options)
+                .start_activity(
+                    OrderActivities::dispatch_unit_deposit_step,
+                    $input,
+                    $options,
+                )
                 .boxed_local(),
             OrderExecutionStepType::UnitWithdrawal => $ctx
                 .start_activity(
@@ -1095,9 +1107,9 @@ macro_rules! dispatch_step_activity {
 #[macro_export]
 macro_rules! verify_hint_activity {
     ($ctx:expr, $hint_kind:expr, $input:expr, $options:expr) => {{
+        use ::futures_util::FutureExt;
         use $crate::order_execution::activities::ProviderObservationActivities;
         use $crate::order_execution::types::ProviderHintKind;
-        use ::futures_util::FutureExt;
         let __verify_future: ::futures_util::future::LocalBoxFuture<
             '_,
             ::std::result::Result<
@@ -1307,7 +1319,6 @@ async fn dispatch_step_with_stale_running_timer(
         }
     }
 }
-
 
 async fn run_refund_child(
     ctx: &mut WorkflowContext<OrderWorkflow>,
