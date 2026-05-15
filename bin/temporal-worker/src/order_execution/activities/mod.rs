@@ -65,28 +65,25 @@ use super::{
     error::OrderActivityError,
     types::{
         AcknowledgeManualInterventionInput, AcknowledgeReason, AcrossOnchainLogRecovered,
-        BoundaryPersisted, CheckPreExecutionStaleQuoteInput, ClassifyStaleRunningStepInput,
-        ClassifyStepFailureInput, ComposeRefreshedQuoteAttemptInput,
-        DiscoverSingleRefundPositionInput, ExecuteStepInput, ExecutionPlan,
-        FailedAttemptSnapshotWritten, FinalizeOrderOrRefundInput, FinalizedOrder,
-        HyperUnitWithdrawalSettledEvidence, InputCustodySnapshot,
+        BoundaryPersisted, ClassifyStaleRunningStepInput, ClassifyStepFailureInput,
+        ComposeRefreshedQuoteAttemptInput, DiscoverSingleRefundPositionInput, DispatchOutcome,
+        DispatchStepInput, ExecutionPlan, FailedAttemptSnapshotWritten, FinalizeOrderOrRefundInput,
+        FinalizedOrder, HyperUnitWithdrawalSettledEvidence, InputCustodySnapshot,
         LoadManualInterventionContextInput, LoadOrderExecutionStateInput, ManualInterventionScope,
         ManualInterventionWorkflowContext, ManualResolutionSignalKind, MarkOrderCompletedInput,
         MaterializeExecutionAttemptInput, MaterializeRefreshedAttemptInput,
         MaterializeRefundPlanInput, MaterializeRetryAttemptInput, MaterializedExecutionAttempt,
         OrderCompleted, OrderExecutionState, OrderTerminalStatus, OrderWorkflowPhase,
-        PersistProviderOperationStatusInput, PersistProviderReceiptInput, PersistStepFailedInput,
-        PersistStepReadyToFireInput, PersistenceBoundary, PreExecutionStaleQuoteCheck,
-        PrepareManualInterventionRefundInput, PrepareManualInterventionRetryInput,
-        ProviderHintKind, ProviderOperationHintDecision, ProviderOperationHintEvidence,
-        ProviderOperationHintSignal, ProviderOperationHintVerified, RawAmount,
-        RecoverAcrossOnchainLogInput, RecoverablePositionKind, RefreshedAttemptMaterialized,
-        RefreshedQuoteAttemptOutcome, RefreshedQuoteAttemptShape, RefreshedQuoteFailureReason,
-        RefreshedQuoteSupersededReason, RefundPlanOutcome, RefundPlanShape, RefundUntenableReason,
-        ReleaseRefundManualInterventionInput, SettleProviderStepInput, SingleRefundPosition,
-        SingleRefundPositionDiscovery, SingleRefundPositionOutcome,
+        PersistStepFailedInput, PersistenceBoundary, PrepareManualInterventionRefundInput,
+        PrepareManualInterventionRetryInput, ProviderHintKind, ProviderOperationHintDecision,
+        ProviderOperationHintEvidence, ProviderOperationHintSignal, ProviderOperationHintVerified,
+        RawAmount, RecoverAcrossOnchainLogInput, RecoverablePositionKind,
+        RefreshedAttemptMaterialized, RefreshedQuoteAttemptOutcome, RefreshedQuoteAttemptShape,
+        RefreshedQuoteFailureReason, RefreshedQuoteSupersededReason, RefundPlanOutcome,
+        RefundPlanShape, RefundUntenableReason, ReleaseRefundManualInterventionInput,
+        SingleRefundPosition, SingleRefundPositionDiscovery, SingleRefundPositionOutcome,
         StaleQuoteRefreshUntenableReason, StaleRunningStepClassified, StaleRunningStepDecision,
-        StepExecuted, StepExecutionOutcome, StepFailureDecision, UnitDepositHintEvidence,
+        StepDispatched, StepExecutionOutcome, StepFailureDecision, UnitDepositHintEvidence,
         VerifyProviderOperationHintInput, WorkflowExecutionStep, WriteFailedAttemptSnapshotInput,
     },
 };
@@ -378,6 +375,8 @@ pub use self::refresh::QuoteRefreshActivities;
 pub use self::refund::RefundActivities;
 
 use self::execution::*;
+#[cfg(test)]
+use self::hint::*;
 use self::hydration::*;
 use self::idempotent_step::*;
 use self::refresh::*;

@@ -124,6 +124,7 @@ impl RefundActivities {
                         .map(|step| WorkflowExecutionStep {
                             step_id: step.id.into(),
                             step_index: step.step_index,
+                            step_type: step.step_type,
                         })
                         .collect(),
                 },
@@ -820,6 +821,7 @@ fn materialized_refund_plan_shape(
                 .map(|step| WorkflowExecutionStep {
                     step_id: step.id.into(),
                     step_index: step.step_index,
+                    step_type: step.step_type,
                 })
                 .collect(),
         },

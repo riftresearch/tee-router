@@ -1,7 +1,8 @@
+pub use router_core::models::OrderExecutionStepType;
 use router_core::{
     models::{OrderExecutionLeg, OrderExecutionStep, RouterOrder},
     protocol::DepositAsset,
-    services::{asset_registry::CanonicalAsset, ProviderExecutionState},
+    services::asset_registry::CanonicalAsset,
 };
 pub use router_temporal::{
     AcknowledgeUnrecoverableSignal, BtcDepositObservedEvidence, HlBridgeDepositCreditedEvidence,
@@ -108,24 +109,6 @@ pub struct ExecutionPlan {
     pub transition_decl_ids: Vec<String>,
     pub legs: Vec<OrderExecutionLeg>,
     pub steps: Vec<OrderExecutionStep>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecuteStepInput {
-    pub order_id: WorkflowOrderId,
-    pub attempt_id: WorkflowAttemptId,
-    pub step_id: WorkflowStepId,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StepExecuted {
-    pub order_id: WorkflowOrderId,
-    pub attempt_id: WorkflowAttemptId,
-    pub step_id: WorkflowStepId,
-    pub response: Value,
-    pub tx_hash: Option<String>,
-    pub provider_state: ProviderExecutionState,
-    pub outcome: StepExecutionOutcome,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -254,13 +237,10 @@ pub struct MaterializeRetryAttemptInput {
 pub struct WorkflowExecutionStep {
     pub step_id: WorkflowStepId,
     pub step_index: i32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PersistStepReadyToFireInput {
-    pub order_id: WorkflowOrderId,
-    pub attempt_id: WorkflowAttemptId,
-    pub step_id: WorkflowStepId,
+    /// Carried alongside the id so the workflow can statically dispatch to the
+    /// matching `dispatch_<step_type>_step` activity without re-reading the
+    /// step from the database.
+    pub step_type: OrderExecutionStepType,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -272,23 +252,50 @@ pub struct PersistStepFailedInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PersistProviderReceiptInput {
-    pub execution: StepExecuted,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PersistProviderOperationStatusInput {
-    pub execution: StepExecuted,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SettleProviderStepInput {
-    pub execution: StepExecuted,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BoundaryPersisted {
     pub boundary: PersistenceBoundary,
+}
+
+/// Input shared by every per-step `dispatch_<step_type>_step` activity. The
+/// activity body absorbs the previous boundary chain (ready-to-fire, stale-quote
+/// check, side-effect checkpoint, execute, persist receipt, persist status,
+/// settle) into a single Temporal round-trip.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DispatchStepInput {
+    pub order_id: WorkflowOrderId,
+    pub attempt_id: WorkflowAttemptId,
+    pub step_id: WorkflowStepId,
+}
+
+/// Result of a `dispatch_<step_type>_step` activity. The workflow uses
+/// [`DispatchOutcome`] to decide whether to wait on a provider hint, treat the
+/// step as already complete, or trigger the stale-quote refresh / refund branch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StepDispatched {
+    pub order_id: WorkflowOrderId,
+    pub attempt_id: WorkflowAttemptId,
+    pub step_id: WorkflowStepId,
+    pub outcome: DispatchOutcome,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DispatchOutcome {
+    /// The step ran synchronously and the provider operation (if any) is
+    /// already terminal. The workflow advances to the next step.
+    Completed,
+    /// The step fired a side effect that requires an out-of-band provider hint
+    /// to complete. The workflow signal-waits for the hint and routes it to the
+    /// matching `verify_<hint_kind>_hint` activity.
+    Waiting,
+    /// The leg's provider quote was stale before any side effect fired. The
+    /// workflow either runs quote refresh or starts refund based on
+    /// `should_refund` (which encodes the per-attempt refresh budget decision).
+    StaleQuoteDetected {
+        should_refund: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<Value>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -403,6 +410,7 @@ pub struct FinalizedOrder {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerifyProviderOperationHintInput {
     pub order_id: WorkflowOrderId,
+    pub attempt_id: WorkflowAttemptId,
     pub step_id: WorkflowStepId,
     pub signal: ProviderOperationHintSignal,
 }
@@ -515,22 +523,6 @@ pub struct ComposeRefreshedQuoteAttemptInput {
     pub order_id: WorkflowOrderId,
     pub stale_attempt_id: WorkflowAttemptId,
     pub failed_step_id: WorkflowStepId,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CheckPreExecutionStaleQuoteInput {
-    pub order_id: WorkflowOrderId,
-    pub attempt_id: WorkflowAttemptId,
-    pub step_id: WorkflowStepId,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PreExecutionStaleQuoteCheck {
-    pub should_refresh: bool,
-    #[serde(default)]
-    pub should_refund: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

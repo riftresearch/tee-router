@@ -113,30 +113,20 @@ impl RefundWorkflow {
             };
 
             for step in steps {
-                let _ready = ctx
-                    .start_activity(
-                        OrderActivities::persist_step_ready_to_fire,
-                        PersistStepReadyToFireInput {
-                            order_id: input.order_id,
-                            attempt_id: refund_attempt_id,
-                            step_id: step.step_id,
-                        },
-                        db_activity_options.clone(),
-                    )
-                    .await?;
-                let executed = match ctx
-                    .start_activity(
-                        OrderActivities::execute_step,
-                        ExecuteStepInput {
-                            order_id: input.order_id,
-                            attempt_id: refund_attempt_id,
-                            step_id: step.step_id,
-                        },
-                        refund_execute_activity_options.clone(),
-                    )
-                    .await
+                let dispatch_input = DispatchStepInput {
+                    order_id: input.order_id,
+                    attempt_id: refund_attempt_id,
+                    step_id: step.step_id,
+                };
+                let dispatched = match crate::dispatch_step_activity!(
+                    ctx,
+                    step.step_type,
+                    dispatch_input,
+                    refund_execute_activity_options.clone()
+                )
+                .await
                 {
-                    Ok(executed) => executed,
+                    Ok(dispatched) => dispatched,
                     Err(source) => {
                         let failure_reason = source.to_string();
                         drop(source);
@@ -184,57 +174,40 @@ impl RefundWorkflow {
                         }
                     }
                 };
-                let _receipt = ctx
-                    .start_activity(
-                        OrderActivities::persist_provider_receipt,
-                        PersistProviderReceiptInput {
-                            execution: executed.clone(),
-                        },
-                        db_activity_options.clone(),
-                    )
-                    .await?;
-                let _provider_status = ctx
-                    .start_activity(
-                        OrderActivities::persist_provider_operation_status,
-                        PersistProviderOperationStatusInput {
-                            execution: executed.clone(),
-                        },
-                        db_activity_options.clone(),
-                    )
-                    .await?;
-                let _settled = ctx
-                    .start_activity(
-                        OrderActivities::settle_provider_step,
-                        SettleProviderStepInput {
-                            execution: executed.clone(),
-                        },
-                        db_activity_options.clone(),
-                    )
-                    .await?;
-                if executed.outcome == StepExecutionOutcome::Waiting {
-                    match wait_for_refund_provider_completion_hint(
-                        ctx,
-                        input.order_id,
-                        step.step_id,
-                        executed,
-                        db_activity_options.clone(),
-                    )
-                    .await?
-                    {
-                        RefundProviderCompletionWait::Completed => {}
-                        RefundProviderCompletionWait::RefundManualInterventionRequired {
-                            resolution,
-                        } => match resolution {
-                            RefundManualInterventionResolution::Continue => continue 'refund,
-                            RefundManualInterventionResolution::Terminal(finalized) => {
-                                return refund_workflow_output(
-                                    ctx,
-                                    workflow_started_at,
-                                    input.order_id,
-                                    refund_terminal_status(finalized.terminal_status),
-                                );
-                            }
-                        },
+                match dispatched.outcome {
+                    DispatchOutcome::Completed => {}
+                    DispatchOutcome::Waiting => {
+                        match wait_for_refund_provider_completion_hint(
+                            ctx,
+                            input.order_id,
+                            refund_attempt_id,
+                            step.step_id,
+                            db_activity_options.clone(),
+                        )
+                        .await?
+                        {
+                            RefundProviderCompletionWait::Completed => {}
+                            RefundProviderCompletionWait::RefundManualInterventionRequired {
+                                resolution,
+                            } => match resolution {
+                                RefundManualInterventionResolution::Continue => continue 'refund,
+                                RefundManualInterventionResolution::Terminal(finalized) => {
+                                    return refund_workflow_output(
+                                        ctx,
+                                        workflow_started_at,
+                                        input.order_id,
+                                        refund_terminal_status(finalized.terminal_status),
+                                    );
+                                }
+                            },
+                        }
+                    }
+                    DispatchOutcome::StaleQuoteDetected { .. } => {
+                        return Err(anyhow::anyhow!(
+                            "RefundWorkflow does not handle stale-quote refresh: step {} produced StaleQuoteDetected",
+                            step.step_id
+                        )
+                        .into());
                     }
                 }
             }
@@ -368,21 +341,6 @@ enum RefundProviderCompletionWait {
 enum RefundManualInterventionResolution {
     Continue,
     Terminal(FinalizedOrder),
-}
-
-async fn settle_refund_provider_completion(
-    ctx: &mut WorkflowContext<RefundWorkflow>,
-    execution: StepExecuted,
-    db_activity_options: ActivityOptions,
-) -> WorkflowResult<()> {
-    let _settled = ctx
-        .start_activity(
-            OrderActivities::settle_provider_step,
-            SettleProviderStepInput { execution },
-            db_activity_options,
-        )
-        .await?;
-    Ok(())
 }
 
 async fn finalize_refund_provider_hint_manual_intervention(
@@ -592,8 +550,8 @@ async fn acknowledge_refund_manual_intervention_terminal(
 async fn wait_for_refund_provider_completion_hint(
     ctx: &mut WorkflowContext<RefundWorkflow>,
     order_id: WorkflowOrderId,
+    attempt_id: WorkflowAttemptId,
     step_id: WorkflowStepId,
-    execution: StepExecuted,
     db_activity_options: ActivityOptions,
 ) -> WorkflowResult<RefundProviderCompletionWait> {
     let wait_started_at = provider_hint_wait_started(ctx);
@@ -604,21 +562,23 @@ async fn wait_for_refund_provider_completion_hint(
                 let signal = ctx
                     .state_mut(|state| state.pop_provider_operation_hint(order_id, step_id))
                     .expect("refund provider operation hint condition was satisfied");
-                let verified = ctx
-                    .start_activity(
-                        ProviderObservationActivities::verify_provider_operation_hint,
-                        VerifyProviderOperationHintInput {
-                            order_id,
-                            step_id,
-                            signal,
-                        },
-                        db_activity_options.clone(),
-                    )
-                    .await?;
+                let hint_kind = signal.hint_kind;
+                let verify_input = VerifyProviderOperationHintInput {
+                    order_id,
+                    attempt_id,
+                    step_id,
+                    signal,
+                };
+                let verified = crate::verify_hint_activity!(
+                    ctx,
+                    hint_kind,
+                    verify_input,
+                    db_activity_options.clone()
+                )
+                .await?;
 
                 match verified.decision {
                     ProviderOperationHintDecision::Accept => {
-                        settle_refund_provider_completion(ctx, execution.clone(), db_activity_options.clone()).await?;
                         record_provider_hint_wait(
                             ctx,
                             REFUND_WORKFLOW_TYPE,
@@ -631,6 +591,7 @@ async fn wait_for_refund_provider_completion_hint(
                         tracing::info!(
                             order_id = %order_id,
                             step_id = %step_id,
+                            hint_kind = ?hint_kind,
                             provider_operation_id = ?verified.provider_operation_id,
                             decision = ?verified.decision,
                             reason = ?verified.reason,
@@ -644,7 +605,7 @@ async fn wait_for_refund_provider_completion_hint(
                 finalize_refund_provider_hint_manual_intervention(
                     ctx,
                     order_id,
-                    execution.attempt_id,
+                    attempt_id,
                     step_id,
                     json!({
                         "reason": "provider_operation_hint_wait_timeout",
@@ -656,7 +617,7 @@ async fn wait_for_refund_provider_completion_hint(
                 let resolution = wait_for_refund_manual_intervention_resolution(
                     ctx,
                     order_id,
-                    Some(execution.attempt_id),
+                    Some(attempt_id),
                     Some(step_id),
                     db_activity_options.clone(),
                 )
@@ -672,3 +633,4 @@ async fn wait_for_refund_provider_completion_hint(
         }
     }
 }
+

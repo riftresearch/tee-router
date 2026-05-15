@@ -31,74 +31,191 @@ pub(super) fn stale_quote_step_failure_decision(
 
 #[activities]
 impl OrderActivities {
-    /// Scar tissue: §13 step type dispatch provider trait family mapping.
+    // ─── per-step venue-specific dispatch activities ───────────────────────
+    //
+    // Each `dispatch_<step_type>_step` activity collapses what used to be six
+    // separate Temporal round-trips (persist ready-to-fire → check stale quote
+    // → execute → persist receipt → persist op status → settle) into a single
+    // body. The thin wrappers exist so Temporal UI shows the venue-specific
+    // activity name (e.g. `OrderActivities::dispatch_cctp_burn_step`); the
+    // shared body lives in [`run_step_dispatch`]. The `Refund` step type goes
+    // through `dispatch_refund_step` because the refund workflow walks steps
+    // exactly the same way the order workflow does. `WaitForDeposit` has no
+    // dispatch_* — it is not provider-executable.
+
     #[activity]
-    pub async fn execute_step(
+    pub async fn dispatch_across_bridge_step(
         self: Arc<Self>,
         _ctx: ActivityContext,
-        input: ExecuteStepInput,
-    ) -> Result<StepExecuted, ActivityError> {
-        record_activity("execute_step", async move {
+        input: DispatchStepInput,
+    ) -> Result<StepDispatched, ActivityError> {
+        record_activity("dispatch_across_bridge_step", async move {
             let deps = self.deps()?;
-            let step = deps
-                .db
-                .orders()
-                .get_execution_step(input.step_id.inner())
-                .await
-                .map_err(OrderActivityError::db_query)?;
-            if step.order_id != input.order_id.inner()
-                || step.execution_attempt_id != Some(input.attempt_id.inner())
-            {
-                return Err(OrderActivityError::invariant(
-                    "step_belongs_to_order_attempt",
-                    format!(
-                        "step {} does not belong to order {} attempt {}",
-                        step.id,
-                        input.order_id.inner(),
-                        input.attempt_id.inner()
-                    ),
-                ));
-            }
-            if step.status != OrderExecutionStepStatus::Running {
-                return Err(OrderActivityError::invariant(
-                    "step_running_before_provider_execution",
-                    format!(
-                        "step {} must be running before provider execution, got {}",
-                        step.id,
-                        step.status.to_db_string()
-                    ),
-                ));
-            }
-            let checkpoint = json!({
-                "kind": "provider_side_effect_about_to_fire",
-                "reason": "about_to_fire_provider_side_effect",
-                "step_id": step.id,
-                "attempt_id": input.attempt_id.inner(),
-                "recorded_at": Utc::now().to_rfc3339(),
-                "scar_tissue": "§6"
-            });
-            let step = deps
-                .db
-                .orders()
-                .record_execution_step_provider_side_effect_checkpoint(
-                    input.order_id.inner(),
-                    input.attempt_id.inner(),
-                    input.step_id.inner(),
-                    checkpoint,
-                    Utc::now(),
+            run_step_dispatch(&deps, input, OrderExecutionStepType::AcrossBridge).await
+        })
+        .await
+    }
+
+    #[activity]
+    pub async fn dispatch_cctp_burn_step(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: DispatchStepInput,
+    ) -> Result<StepDispatched, ActivityError> {
+        record_activity("dispatch_cctp_burn_step", async move {
+            let deps = self.deps()?;
+            run_step_dispatch(&deps, input, OrderExecutionStepType::CctpBurn).await
+        })
+        .await
+    }
+
+    #[activity]
+    pub async fn dispatch_cctp_receive_step(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: DispatchStepInput,
+    ) -> Result<StepDispatched, ActivityError> {
+        record_activity("dispatch_cctp_receive_step", async move {
+            let deps = self.deps()?;
+            run_step_dispatch(&deps, input, OrderExecutionStepType::CctpReceive).await
+        })
+        .await
+    }
+
+    #[activity]
+    pub async fn dispatch_hyperliquid_bridge_deposit_step(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: DispatchStepInput,
+    ) -> Result<StepDispatched, ActivityError> {
+        record_activity("dispatch_hyperliquid_bridge_deposit_step", async move {
+            let deps = self.deps()?;
+            run_step_dispatch(
+                &deps,
+                input,
+                OrderExecutionStepType::HyperliquidBridgeDeposit,
+            )
+            .await
+        })
+        .await
+    }
+
+    #[activity]
+    pub async fn dispatch_hyperliquid_bridge_withdrawal_step(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: DispatchStepInput,
+    ) -> Result<StepDispatched, ActivityError> {
+        record_activity(
+            "dispatch_hyperliquid_bridge_withdrawal_step",
+            async move {
+                let deps = self.deps()?;
+                run_step_dispatch(
+                    &deps,
+                    input,
+                    OrderExecutionStepType::HyperliquidBridgeWithdrawal,
                 )
                 .await
-                .map_err(OrderActivityError::db_query)?;
-            let completion = execute_running_step(&deps, &step).await?;
-            Ok(StepExecuted {
-                order_id: input.order_id,
-                attempt_id: input.attempt_id,
-                step_id: input.step_id,
-                response: completion.response,
-                tx_hash: completion.tx_hash,
-                provider_state: completion.provider_state,
-                outcome: completion.outcome,
-            })
+            },
+        )
+        .await
+    }
+
+    #[activity]
+    pub async fn dispatch_hyperliquid_clearinghouse_to_spot_step(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: DispatchStepInput,
+    ) -> Result<StepDispatched, ActivityError> {
+        record_activity(
+            "dispatch_hyperliquid_clearinghouse_to_spot_step",
+            async move {
+                let deps = self.deps()?;
+                run_step_dispatch(
+                    &deps,
+                    input,
+                    OrderExecutionStepType::HyperliquidClearinghouseToSpot,
+                )
+                .await
+            },
+        )
+        .await
+    }
+
+    #[activity]
+    pub async fn dispatch_hyperliquid_limit_order_step(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: DispatchStepInput,
+    ) -> Result<StepDispatched, ActivityError> {
+        record_activity("dispatch_hyperliquid_limit_order_step", async move {
+            let deps = self.deps()?;
+            run_step_dispatch(&deps, input, OrderExecutionStepType::HyperliquidLimitOrder).await
+        })
+        .await
+    }
+
+    #[activity]
+    pub async fn dispatch_hyperliquid_trade_step(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: DispatchStepInput,
+    ) -> Result<StepDispatched, ActivityError> {
+        record_activity("dispatch_hyperliquid_trade_step", async move {
+            let deps = self.deps()?;
+            run_step_dispatch(&deps, input, OrderExecutionStepType::HyperliquidTrade).await
+        })
+        .await
+    }
+
+    #[activity]
+    pub async fn dispatch_unit_deposit_step(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: DispatchStepInput,
+    ) -> Result<StepDispatched, ActivityError> {
+        record_activity("dispatch_unit_deposit_step", async move {
+            let deps = self.deps()?;
+            run_step_dispatch(&deps, input, OrderExecutionStepType::UnitDeposit).await
+        })
+        .await
+    }
+
+    #[activity]
+    pub async fn dispatch_unit_withdrawal_step(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: DispatchStepInput,
+    ) -> Result<StepDispatched, ActivityError> {
+        record_activity("dispatch_unit_withdrawal_step", async move {
+            let deps = self.deps()?;
+            run_step_dispatch(&deps, input, OrderExecutionStepType::UnitWithdrawal).await
+        })
+        .await
+    }
+
+    #[activity]
+    pub async fn dispatch_universal_router_swap_step(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: DispatchStepInput,
+    ) -> Result<StepDispatched, ActivityError> {
+        record_activity("dispatch_universal_router_swap_step", async move {
+            let deps = self.deps()?;
+            run_step_dispatch(&deps, input, OrderExecutionStepType::UniversalRouterSwap).await
+        })
+        .await
+    }
+
+    #[activity]
+    pub async fn dispatch_refund_step(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: DispatchStepInput,
+    ) -> Result<StepDispatched, ActivityError> {
+        record_activity("dispatch_refund_step", async move {
+            let deps = self.deps()?;
+            run_step_dispatch(&deps, input, OrderExecutionStepType::Refund).await
         })
         .await
     }
@@ -351,6 +468,7 @@ impl OrderActivities {
                     .map(|step| WorkflowExecutionStep {
                         step_id: step.id.into(),
                         step_index: step.step_index,
+                        step_type: step.step_type,
                     })
                     .collect(),
             })
@@ -394,43 +512,9 @@ impl OrderActivities {
                     .map(|step| WorkflowExecutionStep {
                         step_id: step.id.into(),
                         step_index: step.step_index,
+                        step_type: step.step_type,
                     })
                     .collect(),
-            })
-        })
-        .await
-    }
-
-    /// Scar tissue: §2.1 `AfterExecutionLegsPersisted`.
-    #[activity]
-    pub async fn persist_step_ready_to_fire(
-        self: Arc<Self>,
-        _ctx: ActivityContext,
-        input: PersistStepReadyToFireInput,
-    ) -> Result<BoundaryPersisted, ActivityError> {
-        record_activity("persist_step_ready_to_fire", async move {
-            let deps = self.deps()?;
-            let step = deps
-                .db
-                .orders()
-                .persist_execution_step_ready_to_fire(
-                    input.order_id.inner(),
-                    input.attempt_id.inner(),
-                    input.step_id.inner(),
-                    Utc::now(),
-                )
-                .await
-                .map_err(OrderActivityError::db_query)?;
-            tracing::info!(
-                order_id = %input.order_id.inner(),
-                attempt_id = %input.attempt_id.inner(),
-                step_id = %step.id,
-                step_index = step.step_index,
-                event_name = "execution_step.started",
-                "execution_step.started"
-            );
-            Ok(BoundaryPersisted {
-                boundary: PersistenceBoundary::AfterExecutionLegsPersisted,
             })
         })
         .await
@@ -467,159 +551,6 @@ impl OrderActivities {
             record_step_terminal_latency_metrics(&deps, step.id).await;
             Ok(BoundaryPersisted {
                 boundary: PersistenceBoundary::AfterStepMarkedFailed,
-            })
-        })
-        .await
-    }
-
-    /// Scar tissue: §2 boundary 4, `AfterProviderReceiptPersisted`.
-    #[activity]
-    pub async fn persist_provider_receipt(
-        self: Arc<Self>,
-        _ctx: ActivityContext,
-        input: PersistProviderReceiptInput,
-    ) -> Result<BoundaryPersisted, ActivityError> {
-        record_activity("persist_provider_receipt", async move {
-            let deps = self.deps()?;
-            let step = deps
-                .db
-                .orders()
-                .get_execution_step(input.execution.step_id.inner())
-                .await
-                .map_err(OrderActivityError::db_query)?;
-            let (operation, mut addresses) = provider_state_records(
-                &step,
-                &input.execution.provider_state,
-                &input.execution.response,
-            )
-            .map_err(|source| provider_execute_error(&step.provider, source))?;
-            if let Some(mut operation) = operation {
-                operation.status = receipt_boundary_status(operation.status);
-                let provider_operation_id = deps
-                    .db
-                    .orders()
-                    .upsert_provider_operation(&operation)
-                    .await
-                    .map_err(OrderActivityError::db_query)?;
-                for address in &mut addresses {
-                    address.provider_operation_id = Some(provider_operation_id);
-                    deps.db
-                        .orders()
-                        .upsert_provider_address(address)
-                        .await
-                        .map_err(OrderActivityError::db_query)?;
-                }
-                tracing::info!(
-                    order_id = %input.execution.order_id.inner(),
-                    provider_operation_id = %provider_operation_id,
-                    event_name = "provider_operation.persisted",
-                    "provider_operation.persisted"
-                );
-            }
-            Ok(BoundaryPersisted {
-                boundary: PersistenceBoundary::AfterProviderReceiptPersisted,
-            })
-        })
-        .await
-    }
-
-    /// Scar tissue: §2 boundary 5, `AfterProviderOperationStatusPersisted`.
-    #[activity]
-    pub async fn persist_provider_operation_status(
-        self: Arc<Self>,
-        _ctx: ActivityContext,
-        input: PersistProviderOperationStatusInput,
-    ) -> Result<BoundaryPersisted, ActivityError> {
-        record_activity("persist_provider_operation_status", async move {
-            let deps = self.deps()?;
-            let step = deps
-                .db
-                .orders()
-                .get_execution_step(input.execution.step_id.inner())
-                .await
-                .map_err(OrderActivityError::db_query)?;
-            let (operation, _) = provider_state_records(
-                &step,
-                &input.execution.provider_state,
-                &input.execution.response,
-            )
-            .map_err(|source| provider_execute_error(&step.provider, source))?;
-            if let Some(operation) = operation {
-                let provider_operation_id = deps
-                    .db
-                    .orders()
-                    .upsert_provider_operation(&operation)
-                    .await
-                    .map_err(OrderActivityError::db_query)?;
-                let _ = deps
-                    .db
-                    .orders()
-                    .update_provider_operation_status(
-                        provider_operation_id,
-                        operation.status,
-                        operation.provider_ref,
-                        operation.observed_state,
-                        Some(operation.response),
-                        Utc::now(),
-                    )
-                    .await
-                    .map_err(OrderActivityError::db_query)?;
-            }
-            Ok(BoundaryPersisted {
-                boundary: PersistenceBoundary::AfterProviderOperationStatusPersisted,
-            })
-        })
-        .await
-    }
-
-    /// Scar tissue: §2 boundary 6, `AfterProviderStepSettlement`.
-    #[activity]
-    pub async fn settle_provider_step(
-        self: Arc<Self>,
-        _ctx: ActivityContext,
-        input: SettleProviderStepInput,
-    ) -> Result<BoundaryPersisted, ActivityError> {
-        record_activity("settle_provider_step", async move {
-            let deps = self.deps()?;
-            if input.execution.outcome == StepExecutionOutcome::Waiting {
-                settle_waiting_provider_step(&deps, &input.execution).await?;
-                return Ok(BoundaryPersisted {
-                    boundary: PersistenceBoundary::AfterProviderStepSettlement,
-                });
-            }
-            let step = deps
-                .db
-                .orders()
-                .get_execution_step(input.execution.step_id.inner())
-                .await
-                .map_err(OrderActivityError::db_query)?;
-            let response = input.execution.response;
-            let usd_valuation =
-                execution_step_usd_valuation_for_response(&deps, &step, &response).await;
-            let record = deps
-                .db
-                .orders()
-                .persist_execution_step_completion(PersistStepCompletionRecord {
-                    step_id: input.execution.step_id.inner(),
-                    operation: None,
-                    addresses: Vec::new(),
-                    response,
-                    tx_hash: input.execution.tx_hash,
-                    usd_valuation,
-                    completed_at: Utc::now(),
-                })
-                .await
-                .map_err(OrderActivityError::db_query)?;
-            tracing::info!(
-                order_id = %input.execution.order_id.inner(),
-                attempt_id = %input.execution.attempt_id.inner(),
-                step_id = %record.step.id,
-                event_name = "execution_step.completed",
-                "execution_step.completed"
-            );
-            record_step_terminal_latency_metrics(&deps, record.step.id).await;
-            Ok(BoundaryPersisted {
-                boundary: PersistenceBoundary::AfterProviderStepSettlement,
             })
         })
         .await
@@ -739,189 +670,6 @@ impl OrderActivities {
             "execution_step.failure_classified"
         );
         Ok(decision)
-        })
-        .await
-    }
-
-    /// Scar tissue: §7 stale quote refresh. This mirrors the legacy
-    /// refresh-before-step boundary: an expired, unstarted market-order leg
-    /// refreshes before any external side effect is fired.
-    #[activity]
-    pub async fn check_pre_execution_stale_quote(
-        self: Arc<Self>,
-        _ctx: ActivityContext,
-        input: CheckPreExecutionStaleQuoteInput,
-    ) -> Result<PreExecutionStaleQuoteCheck, ActivityError> {
-        record_activity("check_pre_execution_stale_quote", async move {
-            let deps = self.deps()?;
-            let attempt = deps
-                .db
-                .orders()
-                .get_execution_attempt(input.attempt_id.inner())
-                .await
-                .map_err(OrderActivityError::db_query)?;
-            if attempt.order_id != input.order_id.inner() {
-                return Err(OrderActivityError::invariant(
-                    "attempt_belongs_to_order",
-                    format!(
-                        "attempt {} does not belong to order {}",
-                        attempt.id,
-                        input.order_id.inner()
-                    ),
-                ));
-            }
-            if attempt.status != OrderExecutionAttemptStatus::Active
-                || attempt.attempt_kind == OrderExecutionAttemptKind::RefundRecovery
-            {
-                return Ok(PreExecutionStaleQuoteCheck {
-                    should_refresh: false,
-                    should_refund: false,
-                    reason: None,
-                });
-            }
-            let order_quote = deps
-                .db
-                .orders()
-                .get_router_order_quote(input.order_id.inner())
-                .await
-                .map_err(OrderActivityError::db_query)?;
-            if !matches!(order_quote, RouterOrderQuote::MarketOrder(_)) {
-                return Ok(PreExecutionStaleQuoteCheck {
-                    should_refresh: false,
-                    should_refund: false,
-                    reason: None,
-                });
-            }
-            let refreshed_attempt_count = deps
-                .db
-                .orders()
-                .get_execution_attempts(input.order_id.inner())
-                .await
-                .map_err(OrderActivityError::db_query)?
-                .into_iter()
-                .filter(|attempt| {
-                    attempt.attempt_kind == OrderExecutionAttemptKind::RefreshedExecution
-                })
-                .count();
-            let step = deps
-                .db
-                .orders()
-                .get_execution_step(input.step_id.inner())
-                .await
-                .map_err(OrderActivityError::db_query)?;
-            if step.order_id != input.order_id.inner()
-                || step.execution_attempt_id != Some(input.attempt_id.inner())
-            {
-                return Err(OrderActivityError::invariant(
-                    "step_belongs_to_order_attempt",
-                    format!(
-                        "step {} does not belong to order {} attempt {}",
-                        step.id,
-                        input.order_id.inner(),
-                        input.attempt_id.inner()
-                    ),
-                ));
-            }
-            let provider_operations = deps
-                .db
-                .orders()
-                .get_provider_operations(input.order_id.inner())
-                .await
-                .map_err(OrderActivityError::db_query)?;
-            let provider_side_effect_started =
-                step_provider_side_effect_started(&step, &provider_operations);
-            if step.status != OrderExecutionStepStatus::Running || provider_side_effect_started {
-                return Ok(PreExecutionStaleQuoteCheck {
-                    should_refresh: false,
-                    should_refund: false,
-                    reason: None,
-                });
-            }
-            let attempt_steps = deps
-                .db
-                .orders()
-                .get_execution_steps_for_attempt(input.attempt_id.inner())
-                .await
-                .map_err(OrderActivityError::db_query)?;
-            if leg_already_crossed_provider_boundary(&step, &attempt_steps, &provider_operations) {
-                return Ok(PreExecutionStaleQuoteCheck {
-                    should_refresh: false,
-                    should_refund: false,
-                    reason: None,
-                });
-            }
-            let Some(leg_id) = step.execution_leg_id else {
-                return Ok(PreExecutionStaleQuoteCheck {
-                    should_refresh: false,
-                    should_refund: false,
-                    reason: None,
-                });
-            };
-            let legs = deps
-                .db
-                .orders()
-                .get_execution_legs_for_attempt(input.attempt_id.inner())
-                .await
-                .map_err(OrderActivityError::db_query)?;
-            let Some(leg) = legs.into_iter().find(|leg| leg.id == leg_id) else {
-                return Ok(PreExecutionStaleQuoteCheck {
-                    should_refresh: false,
-                    should_refund: false,
-                    reason: None,
-                });
-            };
-            let Some(provider_quote_expires_at) = leg.provider_quote_expires_at else {
-                return Ok(PreExecutionStaleQuoteCheck {
-                    should_refresh: false,
-                    should_refund: false,
-                    reason: None,
-                });
-            };
-            if provider_quote_expires_at >= Utc::now() {
-                return Ok(PreExecutionStaleQuoteCheck {
-                    should_refresh: false,
-                    should_refund: false,
-                    reason: None,
-                });
-            }
-            let reason = json!({
-                "reason": "pre_execution_stale_provider_quote",
-                "step_id": step.id,
-                "execution_leg_id": leg.id,
-                "provider_quote_expires_at": provider_quote_expires_at.to_rfc3339(),
-                "refreshed_attempt_count": refreshed_attempt_count,
-                "quote_refresh_max_attempts": deps.quote_refresh_max_attempts,
-            });
-            tracing::info!(
-                order_id = %input.order_id.inner(),
-                attempt_id = %input.attempt_id.inner(),
-                step_id = %step.id,
-                execution_leg_id = %leg.id,
-                provider_quote_expires_at = %provider_quote_expires_at,
-                event_name = "execution_step.pre_execution_stale_quote_detected",
-                "execution_step.pre_execution_stale_quote_detected"
-            );
-            match stale_quote_refresh_budget_decision(
-                refreshed_attempt_count,
-                deps.quote_refresh_max_attempts,
-            ) {
-                StaleQuoteRefreshBudgetDecision::Refresh => {
-                    telemetry::record_stale_quote_refresh("pre_execution_detected");
-                    Ok(PreExecutionStaleQuoteCheck {
-                        should_refresh: true,
-                        should_refund: false,
-                        reason: Some(reason),
-                    })
-                }
-                StaleQuoteRefreshBudgetDecision::RefundRequired => {
-                    telemetry::record_stale_quote_refresh_cap_hit();
-                    Ok(PreExecutionStaleQuoteCheck {
-                        should_refresh: false,
-                        should_refund: true,
-                        reason: Some(reason),
-                    })
-                }
-            }
         })
         .await
     }
@@ -1373,6 +1121,550 @@ impl OrderActivities {
     }
 }
 
+/// Shared body for every venue-specific `dispatch_<step_type>_step` activity.
+///
+/// Collapses the historic six-activity boundary chain into a single body:
+///
+/// 1. Validate the step belongs to `(order_id, attempt_id)` and is `Running`.
+/// 2. Persist `step ready to fire` (latency/event boundary).
+/// 3. Pre-execution stale-quote check — short-circuits with
+///    `DispatchOutcome::StaleQuoteDetected` if the leg's provider quote
+///    expired before any side effect fired.
+/// 4. Write the side-effect about-to-fire checkpoint (so the stale-running
+///    classifier can disambiguate a worker crash mid-side-effect).
+/// 5. Run the step through `execute_running_step`, which routes through
+///    [`super::idempotent_step::execute_idempotent_step`] for every step type
+///    that produces a `ProviderExecutionIntent` — that is the Tier 1 retry
+///    safety guarantee. (`HyperliquidClearinghouseToSpot` is intentionally
+///    not behind that guard; idempotency for it is upstream via the
+///    side-effect checkpoint.)
+/// 6. Persist the provider receipt (operation row + addresses).
+/// 7. Update the provider operation status to its post-execution status.
+/// 8. Settle the step into `waiting_external` (if `Waiting`) or `completed`
+///    (if synchronous).
+///
+/// `expected_step_type` is used as a defence-in-depth check that the workflow
+/// dispatched to the correct venue-specific activity for the persisted step's
+/// type — a workflow code drift would surface as a clean invariant error here
+/// rather than silent execution under the wrong dispatcher.
+pub(super) async fn run_step_dispatch(
+    deps: &OrderActivityDeps,
+    input: DispatchStepInput,
+    expected_step_type: OrderExecutionStepType,
+) -> Result<StepDispatched, OrderActivityError> {
+    // 1. Persist `running` and validate the step.
+    let step = deps
+        .db
+        .orders()
+        .persist_execution_step_ready_to_fire(
+            input.order_id.inner(),
+            input.attempt_id.inner(),
+            input.step_id.inner(),
+            Utc::now(),
+        )
+        .await
+        .map_err(OrderActivityError::db_query)?;
+    if step.step_type != expected_step_type {
+        return Err(invariant_error(
+            "dispatch_activity_matches_step_type",
+            format!(
+                "step {} has type {} but was dispatched as {}",
+                step.id,
+                step.step_type.to_db_string(),
+                expected_step_type.to_db_string(),
+            ),
+        ));
+    }
+    tracing::info!(
+        order_id = %input.order_id.inner(),
+        attempt_id = %input.attempt_id.inner(),
+        step_id = %step.id,
+        step_index = step.step_index,
+        event_name = "execution_step.started",
+        "execution_step.started"
+    );
+
+    // 2. Pre-execution stale-quote check. Short-circuit before side effects.
+    if let Some(stale) = pre_execution_stale_quote_check(deps, &input, &step).await? {
+        return Ok(StepDispatched {
+            order_id: input.order_id,
+            attempt_id: input.attempt_id,
+            step_id: input.step_id,
+            outcome: DispatchOutcome::StaleQuoteDetected {
+                should_refund: stale.should_refund,
+                reason: stale.reason,
+            },
+        });
+    }
+
+    // 3. Side-effect checkpoint (scar §6).
+    let checkpoint = json!({
+        "kind": "provider_side_effect_about_to_fire",
+        "reason": "about_to_fire_provider_side_effect",
+        "step_id": step.id,
+        "attempt_id": input.attempt_id.inner(),
+        "recorded_at": Utc::now().to_rfc3339(),
+        "scar_tissue": "§6"
+    });
+    let step = deps
+        .db
+        .orders()
+        .record_execution_step_provider_side_effect_checkpoint(
+            input.order_id.inner(),
+            input.attempt_id.inner(),
+            input.step_id.inner(),
+            checkpoint,
+            Utc::now(),
+        )
+        .await
+        .map_err(OrderActivityError::db_query)?;
+
+    // 4. Execute through the idempotent guard.
+    let completion = execute_running_step(deps, &step).await?;
+
+    // 5. Persist provider receipt + status + settle. The earlier
+    // `persist_provider_receipt` and `persist_provider_operation_status`
+    // boundaries each upserted the operation; here we collapse into a single
+    // upsert (with the status set to the post-execution status directly) plus
+    // the post-receipt status update that downstream readers expect.
+    persist_step_provider_records(deps, &step, &completion).await?;
+
+    // 6. Settle into waiting_external or completed.
+    let outcome = settle_dispatched_step(deps, &input, &step, completion).await?;
+
+    Ok(StepDispatched {
+        order_id: input.order_id,
+        attempt_id: input.attempt_id,
+        step_id: input.step_id,
+        outcome,
+    })
+}
+
+/// Collapsed equivalent of the legacy `persist_provider_receipt` +
+/// `persist_provider_operation_status` boundaries: one upsert at the
+/// post-execution status plus the post-receipt status update that historical
+/// downstream readers expect (it carries the response payload).
+async fn persist_step_provider_records(
+    deps: &OrderActivityDeps,
+    step: &OrderExecutionStep,
+    completion: &StepCompletion,
+) -> Result<(), OrderActivityError> {
+    let (operation, mut addresses) =
+        provider_state_records(step, &completion.provider_state, &completion.response)
+            .map_err(|source| provider_execute_error(&step.provider, source))?;
+    let Some(operation) = operation else {
+        return Ok(());
+    };
+    let provider_operation_id = deps
+        .db
+        .orders()
+        .upsert_provider_operation(&operation)
+        .await
+        .map_err(OrderActivityError::db_query)?;
+    for address in &mut addresses {
+        address.provider_operation_id = Some(provider_operation_id);
+        deps.db
+            .orders()
+            .upsert_provider_address(address)
+            .await
+            .map_err(OrderActivityError::db_query)?;
+    }
+    let _ = deps
+        .db
+        .orders()
+        .update_provider_operation_status(
+            provider_operation_id,
+            operation.status,
+            operation.provider_ref,
+            operation.observed_state,
+            Some(operation.response),
+            Utc::now(),
+        )
+        .await
+        .map_err(OrderActivityError::db_query)?;
+    tracing::info!(
+        order_id = %step.order_id,
+        provider_operation_id = %provider_operation_id,
+        event_name = "provider_operation.persisted",
+        "provider_operation.persisted"
+    );
+    Ok(())
+}
+
+/// Drive the step into its terminal-for-this-leg-of-the-workflow status.
+/// `Waiting` returns `DispatchOutcome::Waiting` (the workflow signal-waits for
+/// a hint); `Completed` returns `DispatchOutcome::Completed`.
+async fn settle_dispatched_step(
+    deps: &OrderActivityDeps,
+    input: &DispatchStepInput,
+    step: &OrderExecutionStep,
+    completion: StepCompletion,
+) -> Result<DispatchOutcome, OrderActivityError> {
+    match completion.outcome {
+        StepExecutionOutcome::Waiting => {
+            settle_waiting_step_after_execute(
+                deps,
+                input.order_id.inner(),
+                input.attempt_id.inner(),
+                input.step_id.inner(),
+                completion.response,
+                completion.tx_hash,
+            )
+            .await?;
+            Ok(DispatchOutcome::Waiting)
+        }
+        StepExecutionOutcome::Completed => {
+            let usd_valuation =
+                execution_step_usd_valuation_for_response(deps, step, &completion.response).await;
+            let record = deps
+                .db
+                .orders()
+                .persist_execution_step_completion(PersistStepCompletionRecord {
+                    step_id: input.step_id.inner(),
+                    operation: None,
+                    addresses: Vec::new(),
+                    response: completion.response,
+                    tx_hash: completion.tx_hash,
+                    usd_valuation,
+                    completed_at: Utc::now(),
+                })
+                .await
+                .map_err(OrderActivityError::db_query)?;
+            tracing::info!(
+                order_id = %input.order_id.inner(),
+                attempt_id = %input.attempt_id.inner(),
+                step_id = %record.step.id,
+                event_name = "execution_step.completed",
+                "execution_step.completed"
+            );
+            record_step_terminal_latency_metrics(deps, record.step.id).await;
+            Ok(DispatchOutcome::Completed)
+        }
+    }
+}
+
+/// `Waiting` outcome settle path. Mirrors the historic `settle_provider_step`
+/// behaviour but skips the `StepExecuted`-shaped argument shuffle (we already
+/// have the response/tx_hash inline from the dispatch body). Also reused by
+/// the `verify_<hint_kind>_hint` activities on Accept — the hint update has
+/// already touched the provider operation, so we just need to drive the step
+/// itself into `completed`/`failed` (or back to `waiting` for non-terminal
+/// hint kinds like `HlBridgeDepositObserved`).
+pub(super) async fn settle_waiting_step_after_execute(
+    deps: &OrderActivityDeps,
+    order_id: Uuid,
+    attempt_id: Uuid,
+    step_id: Uuid,
+    response: Value,
+    tx_hash: Option<String>,
+) -> Result<(), OrderActivityError> {
+    let operations = deps
+        .db
+        .orders()
+        .get_provider_operations(order_id)
+        .await
+        .map_err(OrderActivityError::db_query)?;
+    let operation = operations
+        .iter()
+        .filter(|operation| operation.execution_step_id == Some(step_id))
+        .max_by_key(|operation| (operation.updated_at, operation.created_at, operation.id));
+
+    match operation.map(|operation| operation.status) {
+        Some(ProviderOperationStatus::Completed) => {
+            let operation = operation.expect("checked completed operation above");
+            let step = deps
+                .db
+                .orders()
+                .get_execution_step(step_id)
+                .await
+                .map_err(OrderActivityError::db_query)?;
+            let response = provider_operation_step_response(operation);
+            let usd_valuation =
+                execution_step_usd_valuation_for_response(deps, &step, &response).await;
+            let completed = deps
+                .db
+                .orders()
+                .complete_observed_execution_step(
+                    step_id,
+                    response,
+                    provider_operation_tx_hash(operation),
+                    usd_valuation,
+                    Utc::now(),
+                )
+                .await;
+            match completed {
+                Ok(step) => {
+                    record_step_terminal_latency_metrics(deps, step.id).await;
+                    tracing::info!(
+                        order_id = %order_id,
+                        attempt_id = %attempt_id,
+                        step_id = %step_id,
+                        provider_operation_id = %operation.id,
+                        event_name = "execution_step.completed",
+                        "execution_step.completed"
+                    );
+                }
+                Err(RouterCoreError::NotFound) => {
+                    let current = deps
+                        .db
+                        .orders()
+                        .get_execution_step(step_id)
+                        .await
+                        .map_err(OrderActivityError::db_query)?;
+                    if current.status != OrderExecutionStepStatus::Completed {
+                        return Err(invariant_error(
+                            "completed_provider_operation_settlement_status",
+                            format!(
+                                "completed provider operation {} could not settle step {} in status {}",
+                                operation.id,
+                                step_id,
+                                current.status.to_db_string()
+                            ),
+                        ));
+                    }
+                }
+                Err(source) => return Err(OrderActivityError::db_query(source)),
+            }
+        }
+        Some(ProviderOperationStatus::Failed | ProviderOperationStatus::Expired) => {
+            let operation = operation.expect("checked failed operation above");
+            let step = deps
+                .db
+                .orders()
+                .fail_observed_execution_step(
+                    step_id,
+                    json!({
+                        "kind": "provider_status_update",
+                        "provider": &operation.provider,
+                        "operation_id": operation.id,
+                        "provider_ref": &operation.provider_ref,
+                        "status": operation.status.to_db_string(),
+                        "observed_state": &operation.observed_state,
+                    }),
+                    Utc::now(),
+                )
+                .await;
+            match step {
+                Ok(step) => {
+                    record_step_terminal_latency_metrics(deps, step.id).await;
+                }
+                Err(RouterCoreError::NotFound) => {
+                    let current = deps
+                        .db
+                        .orders()
+                        .get_execution_step(step_id)
+                        .await
+                        .map_err(OrderActivityError::db_query)?;
+                    if current.status != OrderExecutionStepStatus::Failed {
+                        return Err(invariant_error(
+                            "failed_provider_step_status",
+                            format!(
+                                "failed provider step {} is in unexpected status {}",
+                                step_id,
+                                current.status.to_db_string()
+                            ),
+                        ));
+                    }
+                }
+                Err(source) => return Err(OrderActivityError::db_query(source)),
+            }
+        }
+        Some(
+            ProviderOperationStatus::Planned
+            | ProviderOperationStatus::Submitted
+            | ProviderOperationStatus::WaitingExternal,
+        )
+        | None => {
+            let waiting = deps
+                .db
+                .orders()
+                .wait_execution_step(step_id, response, tx_hash, Utc::now())
+                .await;
+            match waiting {
+                Ok(step) => {
+                    tracing::info!(
+                        order_id = %order_id,
+                        attempt_id = %attempt_id,
+                        step_id = %step_id,
+                        event_name = "execution_step.waiting_external",
+                        "execution_step.waiting_external"
+                    );
+                    record_step_waiting_external_latency_metrics(deps, step.id).await;
+                }
+                Err(RouterCoreError::NotFound) => {
+                    let current = deps
+                        .db
+                        .orders()
+                        .get_execution_step(step_id)
+                        .await
+                        .map_err(OrderActivityError::db_query)?;
+                    if !matches!(
+                        current.status,
+                        OrderExecutionStepStatus::Waiting | OrderExecutionStepStatus::Completed
+                    ) {
+                        return Err(invariant_error(
+                            "waiting_provider_step_status",
+                            format!(
+                                "waiting provider step {} is in unexpected status {}",
+                                step_id,
+                                current.status.to_db_string()
+                            ),
+                        ));
+                    }
+                }
+                Err(source) => return Err(OrderActivityError::db_query(source)),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Internal return type for [`pre_execution_stale_quote_check`]. `Some` means
+/// the leg's quote expired; the caller should short-circuit dispatch with
+/// [`DispatchOutcome::StaleQuoteDetected`].
+struct PreExecutionStaleQuote {
+    should_refund: bool,
+    reason: Option<Value>,
+}
+
+/// Pre-execution stale-quote check absorbed from the standalone
+/// `check_pre_execution_stale_quote` activity. Returns `None` if the dispatch
+/// should proceed; `Some` if the leg's provider quote expired before any side
+/// effect fired and the workflow should refresh the quote (or refund, if the
+/// per-attempt refresh budget is exhausted).
+async fn pre_execution_stale_quote_check(
+    deps: &OrderActivityDeps,
+    input: &DispatchStepInput,
+    step: &OrderExecutionStep,
+) -> Result<Option<PreExecutionStaleQuote>, OrderActivityError> {
+    let attempt = deps
+        .db
+        .orders()
+        .get_execution_attempt(input.attempt_id.inner())
+        .await
+        .map_err(OrderActivityError::db_query)?;
+    if attempt.order_id != input.order_id.inner() {
+        return Err(invariant_error(
+            "attempt_belongs_to_order",
+            format!(
+                "attempt {} does not belong to order {}",
+                attempt.id,
+                input.order_id.inner()
+            ),
+        ));
+    }
+    if attempt.status != OrderExecutionAttemptStatus::Active
+        || attempt.attempt_kind == OrderExecutionAttemptKind::RefundRecovery
+    {
+        return Ok(None);
+    }
+    let order_quote = match deps
+        .db
+        .orders()
+        .get_router_order_quote(input.order_id.inner())
+        .await
+    {
+        Ok(quote) => quote,
+        // No persisted quote → there is nothing for the stale-quote refresh
+        // path to refresh; let dispatch proceed. Mirrors how the legacy
+        // `check_pre_execution_stale_quote` activity behaved when callers
+        // pre-validated the order had a quote — under the consolidated
+        // dispatch the call sites can no longer guarantee that, so we treat
+        // a missing quote as "not stale" and let `execute_running_step`
+        // surface any real misconfiguration.
+        Err(RouterCoreError::NotFound) => return Ok(None),
+        Err(source) => return Err(OrderActivityError::db_query(source)),
+    };
+    if !matches!(order_quote, RouterOrderQuote::MarketOrder(_)) {
+        return Ok(None);
+    }
+    let provider_operations = deps
+        .db
+        .orders()
+        .get_provider_operations(input.order_id.inner())
+        .await
+        .map_err(OrderActivityError::db_query)?;
+    if step.status != OrderExecutionStepStatus::Running
+        || step_provider_side_effect_started(step, &provider_operations)
+    {
+        return Ok(None);
+    }
+    let attempt_steps = deps
+        .db
+        .orders()
+        .get_execution_steps_for_attempt(input.attempt_id.inner())
+        .await
+        .map_err(OrderActivityError::db_query)?;
+    if leg_already_crossed_provider_boundary(step, &attempt_steps, &provider_operations) {
+        return Ok(None);
+    }
+    let Some(leg_id) = step.execution_leg_id else {
+        return Ok(None);
+    };
+    let legs = deps
+        .db
+        .orders()
+        .get_execution_legs_for_attempt(input.attempt_id.inner())
+        .await
+        .map_err(OrderActivityError::db_query)?;
+    let Some(leg) = legs.into_iter().find(|leg| leg.id == leg_id) else {
+        return Ok(None);
+    };
+    let Some(provider_quote_expires_at) = leg.provider_quote_expires_at else {
+        return Ok(None);
+    };
+    if provider_quote_expires_at >= Utc::now() {
+        return Ok(None);
+    }
+    let refreshed_attempt_count = deps
+        .db
+        .orders()
+        .get_execution_attempts(input.order_id.inner())
+        .await
+        .map_err(OrderActivityError::db_query)?
+        .into_iter()
+        .filter(|attempt| attempt.attempt_kind == OrderExecutionAttemptKind::RefreshedExecution)
+        .count();
+    let reason = json!({
+        "reason": "pre_execution_stale_provider_quote",
+        "step_id": step.id,
+        "execution_leg_id": leg.id,
+        "provider_quote_expires_at": provider_quote_expires_at.to_rfc3339(),
+        "refreshed_attempt_count": refreshed_attempt_count,
+        "quote_refresh_max_attempts": deps.quote_refresh_max_attempts,
+    });
+    tracing::info!(
+        order_id = %input.order_id.inner(),
+        attempt_id = %input.attempt_id.inner(),
+        step_id = %step.id,
+        execution_leg_id = %leg.id,
+        provider_quote_expires_at = %provider_quote_expires_at,
+        event_name = "execution_step.pre_execution_stale_quote_detected",
+        "execution_step.pre_execution_stale_quote_detected"
+    );
+    Ok(Some(
+        match stale_quote_refresh_budget_decision(
+            refreshed_attempt_count,
+            deps.quote_refresh_max_attempts,
+        ) {
+            StaleQuoteRefreshBudgetDecision::Refresh => {
+                telemetry::record_stale_quote_refresh("pre_execution_detected");
+                PreExecutionStaleQuote {
+                    should_refund: false,
+                    reason: Some(reason),
+                }
+            }
+            StaleQuoteRefreshBudgetDecision::RefundRequired => {
+                telemetry::record_stale_quote_refresh_cap_hit();
+                PreExecutionStaleQuote {
+                    should_refund: true,
+                    reason: Some(reason),
+                }
+            }
+        },
+    ))
+}
+
 pub(super) async fn classify_stale_running_step_for_deps(
     deps: &OrderActivityDeps,
     input: ClassifyStaleRunningStepInput,
@@ -1624,185 +1916,6 @@ pub(super) async fn finalize_execution_manual_intervention(
         .mark_order_manual_intervention_required(order_id, now)
         .await
         .map_err(OrderActivityError::db_query)
-}
-
-pub(super) async fn settle_waiting_provider_step(
-    deps: &OrderActivityDeps,
-    execution: &StepExecuted,
-) -> Result<(), OrderActivityError> {
-    let operations = deps
-        .db
-        .orders()
-        .get_provider_operations(execution.order_id.inner())
-        .await
-        .map_err(OrderActivityError::db_query)?;
-    let operation = operations
-        .iter()
-        .filter(|operation| operation.execution_step_id == Some(execution.step_id.inner()))
-        .max_by_key(|operation| (operation.updated_at, operation.created_at, operation.id));
-
-    match operation.map(|operation| operation.status) {
-        Some(ProviderOperationStatus::Completed) => {
-            let operation = operation.expect("checked completed operation above");
-            let completed = complete_observed_provider_step(deps, execution, operation).await?;
-            tracing::info!(
-                order_id = %execution.order_id.inner(),
-                attempt_id = %execution.attempt_id.inner(),
-                step_id = %execution.step_id.inner(),
-                provider_operation_id = %operation.id,
-                event_name = "execution_step.completed",
-                "execution_step.completed"
-            );
-            record_step_terminal_latency_metrics(deps, completed.id).await;
-        }
-        Some(ProviderOperationStatus::Failed | ProviderOperationStatus::Expired) => {
-            let operation = operation.expect("checked failed operation above");
-            let step = deps
-                .db
-                .orders()
-                .fail_observed_execution_step(
-                    execution.step_id.inner(),
-                    json!({
-                        "kind": "provider_status_update",
-                        "provider": &operation.provider,
-                        "operation_id": operation.id,
-                        "provider_ref": &operation.provider_ref,
-                        "status": operation.status.to_db_string(),
-                        "observed_state": &operation.observed_state,
-                    }),
-                    Utc::now(),
-                )
-                .await;
-            match step {
-                Ok(step) => {
-                    record_step_terminal_latency_metrics(deps, step.id).await;
-                }
-                Err(RouterCoreError::NotFound) => {
-                    let current = deps
-                        .db
-                        .orders()
-                        .get_execution_step(execution.step_id.inner())
-                        .await
-                        .map_err(OrderActivityError::db_query)?;
-                    if current.status != OrderExecutionStepStatus::Failed {
-                        return Err(invariant_error(
-                            "failed_provider_step_status",
-                            format!(
-                                "failed provider step {} is in unexpected status {}",
-                                execution.step_id.inner(),
-                                current.status.to_db_string()
-                            ),
-                        ));
-                    }
-                }
-                Err(source) => return Err(OrderActivityError::db_query(source)),
-            }
-        }
-        Some(
-            ProviderOperationStatus::Planned
-            | ProviderOperationStatus::Submitted
-            | ProviderOperationStatus::WaitingExternal,
-        )
-        | None => {
-            let waiting = deps
-                .db
-                .orders()
-                .wait_execution_step(
-                    execution.step_id.inner(),
-                    execution.response.clone(),
-                    execution.tx_hash.clone(),
-                    Utc::now(),
-                )
-                .await;
-            match waiting {
-                Ok(step) => {
-                    tracing::info!(
-                        order_id = %execution.order_id.inner(),
-                        attempt_id = %execution.attempt_id.inner(),
-                        step_id = %execution.step_id.inner(),
-                        event_name = "execution_step.waiting_external",
-                        "execution_step.waiting_external"
-                    );
-                    record_step_waiting_external_latency_metrics(deps, step.id).await;
-                }
-                Err(RouterCoreError::NotFound) => {
-                    let current = deps
-                        .db
-                        .orders()
-                        .get_execution_step(execution.step_id.inner())
-                        .await
-                        .map_err(OrderActivityError::db_query)?;
-                    if !matches!(
-                        current.status,
-                        OrderExecutionStepStatus::Waiting | OrderExecutionStepStatus::Completed
-                    ) {
-                        return Err(invariant_error(
-                            "waiting_provider_step_status",
-                            format!(
-                                "waiting provider step {} is in unexpected status {}",
-                                execution.step_id.inner(),
-                                current.status.to_db_string()
-                            ),
-                        ));
-                    }
-                }
-                Err(source) => return Err(OrderActivityError::db_query(source)),
-            }
-        }
-    }
-
-    Ok(())
-}
-
-pub(super) async fn complete_observed_provider_step(
-    deps: &OrderActivityDeps,
-    execution: &StepExecuted,
-    operation: &OrderProviderOperation,
-) -> Result<OrderExecutionStep, OrderActivityError> {
-    let step = deps
-        .db
-        .orders()
-        .get_execution_step(execution.step_id.inner())
-        .await
-        .map_err(OrderActivityError::db_query)?;
-    let response = provider_operation_step_response(operation);
-    let usd_valuation = execution_step_usd_valuation_for_response(deps, &step, &response).await;
-    let completed = deps
-        .db
-        .orders()
-        .complete_observed_execution_step(
-            execution.step_id.inner(),
-            response,
-            provider_operation_tx_hash(operation),
-            usd_valuation,
-            Utc::now(),
-        )
-        .await;
-    match completed {
-        Ok(step) => Ok(step),
-        Err(RouterCoreError::NotFound) => {
-            let current = deps
-                .db
-                .orders()
-                .get_execution_step(execution.step_id.inner())
-                .await
-                .map_err(OrderActivityError::db_query)?;
-            if current.status == OrderExecutionStepStatus::Completed {
-                Ok(current)
-            } else {
-                Err(invariant_error(
-                    "completed_provider_operation_settlement_status",
-                    format!(
-                        "completed provider operation {} could not settle step {} in status {}",
-                        operation.id,
-                        execution.step_id.inner(),
-                        current.status.to_db_string()
-                    ),
-                ))
-            }
-        }
-        Err(source) => Err(OrderActivityError::db_query(source)),
-    }
 }
 
 pub(super) fn provider_operation_step_response(operation: &OrderProviderOperation) -> Value {
@@ -2583,15 +2696,6 @@ pub(super) fn provider_operation_outcome(
                 message: "provider returned a terminal failure operation state".to_string(),
             })
         }
-    }
-}
-
-pub(super) fn receipt_boundary_status(status: ProviderOperationStatus) -> ProviderOperationStatus {
-    match status {
-        ProviderOperationStatus::Completed
-        | ProviderOperationStatus::Failed
-        | ProviderOperationStatus::Expired => ProviderOperationStatus::Submitted,
-        status => status,
     }
 }
 

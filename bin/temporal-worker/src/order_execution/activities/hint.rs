@@ -22,79 +22,331 @@ impl ProviderObservationActivities {
 
 #[activities]
 impl ProviderObservationActivities {
-    /// Scar tissue: §10 provider operation hint flow and verifier dispatch.
+    // ─── per-hint-kind verify activities ───────────────────────────────────
+    //
+    // Each `verify_<hint_kind>_hint` activity is a thin wrapper around the
+    // existing `verify_*_hint` helper plus the settle step that used to live
+    // in the workflow as a separate `settle_provider_step` round-trip. The
+    // activity name surfaces in Temporal UI; the shared body lives in
+    // [`run_hint_verify`]. The previous monolithic `verify_provider_operation_hint`
+    // activity is gone.
+
     #[activity]
-    pub async fn verify_provider_operation_hint(
+    pub async fn verify_across_fill_hint(
         self: Arc<Self>,
         _ctx: ActivityContext,
         input: VerifyProviderOperationHintInput,
     ) -> Result<ProviderOperationHintVerified, ActivityError> {
-        record_activity("verify_provider_operation_hint", async move {
+        record_activity("verify_across_fill_hint", async move {
             let deps = self.deps()?;
-            if input.signal.execution_step_id != input.step_id {
-                return Ok(ProviderOperationHintVerified {
-                    provider_operation_id: input.signal.provider_operation_id,
-                    decision: ProviderOperationHintDecision::Reject,
-                    reason: Some(format!(
-                        "hint targets step {}, not {}",
-                        input.signal.execution_step_id, input.step_id
-                    )),
-                });
-            }
-            deps.db
-                .orders()
-                .record_execution_step_hint_arrival(input.step_id.inner(), Utc::now())
-                .await
-                .map_err(OrderActivityError::db_query)?;
-            match input.signal.hint_kind {
-                ProviderHintKind::AcrossFill | ProviderHintKind::AcrossDestinationFilled => {
-                    verify_across_fill_hint(&deps, input).await
-                }
-                ProviderHintKind::CctpAttestation => {
-                    verify_cctp_attestation_hint(&deps, input).await
-                }
-                ProviderHintKind::CctpReceiveObserved => {
-                    verify_cctp_receive_observed_hint(&deps, input).await
-                }
-                ProviderHintKind::BtcDepositObserved => {
-                    verify_btc_deposit_observed_hint(&deps, input).await
-                }
-                ProviderHintKind::UnitDeposit => verify_unit_deposit_hint(&deps, input).await,
-                ProviderHintKind::HyperUnitDepositCredited => {
-                    verify_hyperunit_deposit_credited_hint(&deps, input).await
-                }
-                ProviderHintKind::HyperUnitWithdrawalAcknowledged => {
-                    verify_hyperunit_withdrawal_acknowledged_hint(&deps, input).await
-                }
-                ProviderHintKind::HyperUnitWithdrawalSettled => {
-                    verify_hyperunit_withdrawal_settled_hint(&deps, input).await
-                }
-                ProviderHintKind::ProviderObservation => {
-                    verify_provider_observation_hint(&deps, input).await
-                }
-                ProviderHintKind::VeloraSwapSettled => {
-                    verify_velora_swap_settled_hint(&deps, input).await
-                }
-                ProviderHintKind::HyperliquidTrade => {
-                    verify_hyperliquid_trade_hint(&deps, input).await
-                }
-                ProviderHintKind::HlTradeFilled => verify_hl_trade_filled_hint(&deps, input).await,
-                ProviderHintKind::HlTradeCanceled => {
-                    verify_hl_trade_canceled_hint(&deps, input).await
-                }
-                ProviderHintKind::HlBridgeDepositObserved => {
-                    verify_hl_bridge_deposit_observed_hint(&deps, input).await
-                }
-                ProviderHintKind::HlBridgeDepositCredited => {
-                    verify_hl_bridge_deposit_credited_hint(&deps, input).await
-                }
-                ProviderHintKind::HlWithdrawalAcknowledged => {
-                    verify_hl_withdrawal_acknowledged_hint(&deps, input).await
-                }
-                ProviderHintKind::HlWithdrawalSettled => {
-                    verify_hl_withdrawal_settled_hint(&deps, input).await
-                }
-            }
+            run_hint_verify(&deps, input, ExpectedHintKinds::Either(
+                ProviderHintKind::AcrossFill,
+                ProviderHintKind::AcrossDestinationFilled,
+            ), verify_across_fill_hint).await
+        })
+        .await
+    }
+
+    #[activity]
+    pub async fn verify_cctp_attestation_hint(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: VerifyProviderOperationHintInput,
+    ) -> Result<ProviderOperationHintVerified, ActivityError> {
+        record_activity("verify_cctp_attestation_hint", async move {
+            let deps = self.deps()?;
+            run_hint_verify(
+                &deps,
+                input,
+                ExpectedHintKinds::Single(ProviderHintKind::CctpAttestation),
+                verify_cctp_attestation_hint,
+            )
+            .await
+        })
+        .await
+    }
+
+    #[activity]
+    pub async fn verify_cctp_receive_observed_hint(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: VerifyProviderOperationHintInput,
+    ) -> Result<ProviderOperationHintVerified, ActivityError> {
+        record_activity("verify_cctp_receive_observed_hint", async move {
+            let deps = self.deps()?;
+            run_hint_verify(
+                &deps,
+                input,
+                ExpectedHintKinds::Single(ProviderHintKind::CctpReceiveObserved),
+                verify_cctp_receive_observed_hint,
+            )
+            .await
+        })
+        .await
+    }
+
+    #[activity]
+    pub async fn verify_btc_deposit_observed_hint(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: VerifyProviderOperationHintInput,
+    ) -> Result<ProviderOperationHintVerified, ActivityError> {
+        record_activity("verify_btc_deposit_observed_hint", async move {
+            let deps = self.deps()?;
+            run_hint_verify(
+                &deps,
+                input,
+                ExpectedHintKinds::Single(ProviderHintKind::BtcDepositObserved),
+                verify_btc_deposit_observed_hint,
+            )
+            .await
+        })
+        .await
+    }
+
+    #[activity]
+    pub async fn verify_unit_deposit_hint(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: VerifyProviderOperationHintInput,
+    ) -> Result<ProviderOperationHintVerified, ActivityError> {
+        record_activity("verify_unit_deposit_hint", async move {
+            let deps = self.deps()?;
+            run_hint_verify(
+                &deps,
+                input,
+                ExpectedHintKinds::Single(ProviderHintKind::UnitDeposit),
+                verify_unit_deposit_hint,
+            )
+            .await
+        })
+        .await
+    }
+
+    #[activity]
+    pub async fn verify_hyperunit_deposit_credited_hint(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: VerifyProviderOperationHintInput,
+    ) -> Result<ProviderOperationHintVerified, ActivityError> {
+        record_activity("verify_hyperunit_deposit_credited_hint", async move {
+            let deps = self.deps()?;
+            run_hint_verify(
+                &deps,
+                input,
+                ExpectedHintKinds::Single(ProviderHintKind::HyperUnitDepositCredited),
+                verify_hyperunit_deposit_credited_hint,
+            )
+            .await
+        })
+        .await
+    }
+
+    #[activity]
+    pub async fn verify_hyperunit_withdrawal_acknowledged_hint(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: VerifyProviderOperationHintInput,
+    ) -> Result<ProviderOperationHintVerified, ActivityError> {
+        record_activity("verify_hyperunit_withdrawal_acknowledged_hint", async move {
+            let deps = self.deps()?;
+            run_hint_verify(
+                &deps,
+                input,
+                ExpectedHintKinds::Single(ProviderHintKind::HyperUnitWithdrawalAcknowledged),
+                verify_hyperunit_withdrawal_acknowledged_hint,
+            )
+            .await
+        })
+        .await
+    }
+
+    #[activity]
+    pub async fn verify_hyperunit_withdrawal_settled_hint(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: VerifyProviderOperationHintInput,
+    ) -> Result<ProviderOperationHintVerified, ActivityError> {
+        record_activity("verify_hyperunit_withdrawal_settled_hint", async move {
+            let deps = self.deps()?;
+            run_hint_verify(
+                &deps,
+                input,
+                ExpectedHintKinds::Single(ProviderHintKind::HyperUnitWithdrawalSettled),
+                verify_hyperunit_withdrawal_settled_hint,
+            )
+            .await
+        })
+        .await
+    }
+
+    #[activity]
+    pub async fn verify_provider_observation_hint(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: VerifyProviderOperationHintInput,
+    ) -> Result<ProviderOperationHintVerified, ActivityError> {
+        record_activity("verify_provider_observation_hint", async move {
+            let deps = self.deps()?;
+            run_hint_verify(
+                &deps,
+                input,
+                ExpectedHintKinds::Single(ProviderHintKind::ProviderObservation),
+                verify_provider_observation_hint,
+            )
+            .await
+        })
+        .await
+    }
+
+    #[activity]
+    pub async fn verify_velora_swap_settled_hint(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: VerifyProviderOperationHintInput,
+    ) -> Result<ProviderOperationHintVerified, ActivityError> {
+        record_activity("verify_velora_swap_settled_hint", async move {
+            let deps = self.deps()?;
+            run_hint_verify(
+                &deps,
+                input,
+                ExpectedHintKinds::Single(ProviderHintKind::VeloraSwapSettled),
+                verify_velora_swap_settled_hint,
+            )
+            .await
+        })
+        .await
+    }
+
+    #[activity]
+    pub async fn verify_hyperliquid_trade_hint(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: VerifyProviderOperationHintInput,
+    ) -> Result<ProviderOperationHintVerified, ActivityError> {
+        record_activity("verify_hyperliquid_trade_hint", async move {
+            let deps = self.deps()?;
+            run_hint_verify(
+                &deps,
+                input,
+                ExpectedHintKinds::Single(ProviderHintKind::HyperliquidTrade),
+                verify_hyperliquid_trade_hint,
+            )
+            .await
+        })
+        .await
+    }
+
+    #[activity]
+    pub async fn verify_hl_trade_filled_hint(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: VerifyProviderOperationHintInput,
+    ) -> Result<ProviderOperationHintVerified, ActivityError> {
+        record_activity("verify_hl_trade_filled_hint", async move {
+            let deps = self.deps()?;
+            run_hint_verify(
+                &deps,
+                input,
+                ExpectedHintKinds::Single(ProviderHintKind::HlTradeFilled),
+                verify_hl_trade_filled_hint,
+            )
+            .await
+        })
+        .await
+    }
+
+    #[activity]
+    pub async fn verify_hl_trade_canceled_hint(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: VerifyProviderOperationHintInput,
+    ) -> Result<ProviderOperationHintVerified, ActivityError> {
+        record_activity("verify_hl_trade_canceled_hint", async move {
+            let deps = self.deps()?;
+            run_hint_verify(
+                &deps,
+                input,
+                ExpectedHintKinds::Single(ProviderHintKind::HlTradeCanceled),
+                verify_hl_trade_canceled_hint,
+            )
+            .await
+        })
+        .await
+    }
+
+    #[activity]
+    pub async fn verify_hl_bridge_deposit_observed_hint(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: VerifyProviderOperationHintInput,
+    ) -> Result<ProviderOperationHintVerified, ActivityError> {
+        record_activity("verify_hl_bridge_deposit_observed_hint", async move {
+            let deps = self.deps()?;
+            run_hint_verify(
+                &deps,
+                input,
+                ExpectedHintKinds::Single(ProviderHintKind::HlBridgeDepositObserved),
+                verify_hl_bridge_deposit_observed_hint,
+            )
+            .await
+        })
+        .await
+    }
+
+    #[activity]
+    pub async fn verify_hl_bridge_deposit_credited_hint(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: VerifyProviderOperationHintInput,
+    ) -> Result<ProviderOperationHintVerified, ActivityError> {
+        record_activity("verify_hl_bridge_deposit_credited_hint", async move {
+            let deps = self.deps()?;
+            run_hint_verify(
+                &deps,
+                input,
+                ExpectedHintKinds::Single(ProviderHintKind::HlBridgeDepositCredited),
+                verify_hl_bridge_deposit_credited_hint,
+            )
+            .await
+        })
+        .await
+    }
+
+    #[activity]
+    pub async fn verify_hl_withdrawal_acknowledged_hint(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: VerifyProviderOperationHintInput,
+    ) -> Result<ProviderOperationHintVerified, ActivityError> {
+        record_activity("verify_hl_withdrawal_acknowledged_hint", async move {
+            let deps = self.deps()?;
+            run_hint_verify(
+                &deps,
+                input,
+                ExpectedHintKinds::Single(ProviderHintKind::HlWithdrawalAcknowledged),
+                verify_hl_withdrawal_acknowledged_hint,
+            )
+            .await
+        })
+        .await
+    }
+
+    #[activity]
+    pub async fn verify_hl_withdrawal_settled_hint(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: VerifyProviderOperationHintInput,
+    ) -> Result<ProviderOperationHintVerified, ActivityError> {
+        record_activity("verify_hl_withdrawal_settled_hint", async move {
+            let deps = self.deps()?;
+            run_hint_verify(
+                &deps,
+                input,
+                ExpectedHintKinds::Single(ProviderHintKind::HlWithdrawalSettled),
+                verify_hl_withdrawal_settled_hint,
+            )
+            .await
         })
         .await
     }
@@ -406,6 +658,97 @@ pub(super) async fn recover_across_deposit_from_origin_logs(
     }
 
     Ok(None)
+}
+
+/// Compile-time check that a venue-specific `verify_<hint_kind>_hint` activity
+/// is only invoked for the hint kind(s) it actually verifies. Without this the
+/// workflow could route a stray hint to the wrong activity (e.g. a workflow
+/// code drift after adding a new hint kind), and the verify body might pass
+/// the wrong evidence shape to the wrong validator.
+pub(super) enum ExpectedHintKinds {
+    Single(ProviderHintKind),
+    Either(ProviderHintKind, ProviderHintKind),
+}
+
+impl ExpectedHintKinds {
+    fn matches(&self, kind: ProviderHintKind) -> bool {
+        match self {
+            Self::Single(expected) => *expected == kind,
+            Self::Either(a, b) => *a == kind || *b == kind,
+        }
+    }
+}
+
+/// Shared body for every venue-specific `verify_<hint_kind>_hint` activity.
+///
+/// 1. Validate the hint targets the expected step.
+/// 2. Validate the hint kind is one this activity is allowed to handle (a
+///    workflow drift surfaces as a clean reject here rather than executing the
+///    wrong validator).
+/// 3. Record hint arrival latency.
+/// 4. Run the hint kind's verifier (which in turn updates the underlying
+///    `provider_operation` row when the hint is accepted; see
+///    [`complete_provider_operation_from_typed_hint`]).
+/// 5. On `Accept`: settle the step into `completed`/`failed`/back-to-`waiting`
+///    by re-using [`super::execution::settle_waiting_step_after_execute`].
+///    The legacy workflow used to follow every Accept with a separate
+///    `settle_provider_step` activity round-trip; we collapse that here.
+pub(super) async fn run_hint_verify<F>(
+    deps: &OrderActivityDeps,
+    input: VerifyProviderOperationHintInput,
+    expected_kinds: ExpectedHintKinds,
+    verifier: F,
+) -> Result<ProviderOperationHintVerified, OrderActivityError>
+where
+    F: for<'a> AsyncFnOnce(
+        &'a OrderActivityDeps,
+        VerifyProviderOperationHintInput,
+    ) -> Result<ProviderOperationHintVerified, OrderActivityError>,
+{
+    if input.signal.execution_step_id != input.step_id {
+        return Ok(ProviderOperationHintVerified {
+            provider_operation_id: input.signal.provider_operation_id,
+            decision: ProviderOperationHintDecision::Reject,
+            reason: Some(format!(
+                "hint targets step {}, not {}",
+                input.signal.execution_step_id, input.step_id
+            )),
+        });
+    }
+    if !expected_kinds.matches(input.signal.hint_kind) {
+        return Ok(ProviderOperationHintVerified {
+            provider_operation_id: input.signal.provider_operation_id,
+            decision: ProviderOperationHintDecision::Reject,
+            reason: Some(format!(
+                "hint kind {:?} routed to wrong verify activity",
+                input.signal.hint_kind
+            )),
+        });
+    }
+    deps.db
+        .orders()
+        .record_execution_step_hint_arrival(input.step_id.inner(), Utc::now())
+        .await
+        .map_err(OrderActivityError::db_query)?;
+
+    let order_id = input.order_id;
+    let attempt_id = input.attempt_id;
+    let step_id = input.step_id;
+    let verified = verifier(deps, input).await?;
+
+    if verified.decision == ProviderOperationHintDecision::Accept {
+        super::execution::settle_waiting_step_after_execute(
+            deps,
+            order_id.inner(),
+            attempt_id.inner(),
+            step_id.inner(),
+            json!({}),
+            None,
+        )
+        .await?;
+    }
+
+    Ok(verified)
 }
 
 pub(super) async fn verify_across_fill_hint(
