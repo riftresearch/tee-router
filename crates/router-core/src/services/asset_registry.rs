@@ -1890,4 +1890,260 @@ mod tests {
             ProviderAssetCapability::UnitDeposit,
         ));
     }
+
+    // ---------------------------------------------------------------------
+    // Scratch route-selection tracer.
+    //
+    // These tests mirror the production route-selection pipeline from
+    // `bin/router-server/src/services/order_manager.rs::best_provider_quote`
+    // for offline auditing:
+    //
+    //   1. BFS enumerate candidate transition paths
+    //      (`AssetRegistry::select_transition_paths`)
+    //   2. Filter to executable terminals + runtime-asset anchored bridges
+    //      (mirror of `is_executable_transition_path`)
+    //   3. Prefer same-chain EVM paths when source/destination share an EVM
+    //      chain (mirror of `prefer_same_chain_evm_paths`)
+    //   4. Rank by structural cost in bps + latency
+    //      (`route_costs::rank_transition_paths_structurally`)
+    //
+    // The provider-configured filter (`path_has_configured_provider_set`)
+    // is intentionally skipped because it requires a live
+    // `ActionProviderRegistry`. Production additionally calls each ranked
+    // path's HTTP provider quote API and picks the highest `amount_out`
+    // (or lowest `amount_in`); that stage cannot be exercised offline.
+    //
+    // Run with `--nocapture` to see the trace, e.g.:
+    //   cargo test -p router-core trace_route_base_usdc_to_btc -- --nocapture
+    //
+    // To audit a new pair, copy one of the tests below and edit the
+    // source/destination assets.
+    // ---------------------------------------------------------------------
+
+    use crate::services::route_costs::{
+        rank_transition_paths_structurally, structural_path_score,
+    };
+
+    const TRACE_ROUTE_MAX_DEPTH: usize = 5;
+
+    /// Run the offline route-selection pipeline for a given pair and print a
+    /// human-readable trace of every stage to stderr. Returns the final
+    /// ranked path list so callers can assert on it.
+    fn trace_route(
+        label: &str,
+        source: &DepositAsset,
+        destination: &DepositAsset,
+    ) -> Vec<TransitionPath> {
+        let registry = AssetRegistry::default();
+        let pricing = crate::services::pricing::PricingSnapshot::static_bootstrap(
+            chrono::Utc::now(),
+        );
+
+        eprintln!("\n=== trace_route: {label} ===");
+        eprintln!(
+            "source:      chain={} asset={}",
+            source.chain.as_str(),
+            source.asset.as_str()
+        );
+        eprintln!(
+            "destination: chain={} asset={}",
+            destination.chain.as_str(),
+            destination.asset.as_str()
+        );
+
+        let bfs = registry.select_transition_paths(source, destination, TRACE_ROUTE_MAX_DEPTH);
+        eprintln!(
+            "[1] BFS enumerated {} paths (max_depth={})",
+            bfs.len(),
+            TRACE_ROUTE_MAX_DEPTH
+        );
+        print_paths(&bfs, &pricing);
+
+        let executable: Vec<_> = bfs
+            .iter()
+            .filter(|p| is_executable_path_for_trace(&registry, p))
+            .cloned()
+            .collect();
+        eprintln!(
+            "[2] executable-terminal filter: {} -> {}",
+            bfs.len(),
+            executable.len()
+        );
+        print_paths(&executable, &pricing);
+
+        let mut same_chain_preferred = executable.clone();
+        prefer_same_chain_evm_paths_for_trace(source, destination, &mut same_chain_preferred);
+        eprintln!(
+            "[3] same-chain-EVM preference: {} -> {}",
+            executable.len(),
+            same_chain_preferred.len()
+        );
+        print_paths(&same_chain_preferred, &pricing);
+
+        let mut ranked = same_chain_preferred;
+        rank_transition_paths_structurally(&mut ranked);
+        eprintln!("[4] structural ranking ({} paths, lowest cost first):", ranked.len());
+        print_paths(&ranked, &pricing);
+
+        eprintln!("=== end trace: {label} ===\n");
+        ranked
+    }
+
+    /// Mirror of `bin/router-server/src/services/order_manager.rs::
+    /// is_executable_transition_path`. Kept in sync manually; if the
+    /// production rule changes, update this too.
+    fn is_executable_path_for_trace(registry: &AssetRegistry, path: &TransitionPath) -> bool {
+        if path.transitions.is_empty() {
+            return false;
+        }
+        let last_kind = path.transitions.last().map(|t| t.kind);
+        matches!(last_kind, Some(MarketOrderTransitionKind::UnitWithdrawal))
+            || matches!(last_kind, Some(MarketOrderTransitionKind::UniversalRouterSwap))
+            || (matches!(
+                last_kind,
+                Some(MarketOrderTransitionKind::AcrossBridge | MarketOrderTransitionKind::CctpBridge)
+            ) && path_contains_runtime_asset_for_trace(registry, path))
+    }
+
+    fn path_contains_runtime_asset_for_trace(
+        registry: &AssetRegistry,
+        path: &TransitionPath,
+    ) -> bool {
+        path.transitions.iter().any(|t| {
+            registry.chain_asset(&t.input.asset).is_none()
+                || registry.chain_asset(&t.output.asset).is_none()
+        })
+    }
+
+    /// Mirror of `bin/router-server/src/services/order_manager.rs::
+    /// prefer_same_chain_evm_paths`.
+    fn prefer_same_chain_evm_paths_for_trace(
+        source: &DepositAsset,
+        destination: &DepositAsset,
+        paths: &mut Vec<TransitionPath>,
+    ) {
+        if source.chain != destination.chain || !source.chain.as_str().starts_with("evm:") {
+            return;
+        }
+        let chain = &source.chain;
+        let same_chain_paths: Vec<_> = paths
+            .iter()
+            .filter(|p| {
+                p.transitions.iter().all(|t| {
+                    t.input.asset.chain == *chain && t.output.asset.chain == *chain
+                })
+            })
+            .cloned()
+            .collect();
+        if !same_chain_paths.is_empty() {
+            *paths = same_chain_paths;
+        }
+    }
+
+    fn print_paths(paths: &[TransitionPath], pricing: &crate::services::pricing::PricingSnapshot) {
+        if paths.is_empty() {
+            eprintln!("    (no paths)");
+            return;
+        }
+        for (i, path) in paths.iter().enumerate() {
+            let score = structural_path_score(path, pricing);
+            let hops: Vec<String> = path
+                .transitions
+                .iter()
+                .map(|t| {
+                    format!(
+                        "{:?}/{}[{}:{}->{}:{}]",
+                        t.kind,
+                        t.provider.as_str(),
+                        t.input.asset.chain.as_str(),
+                        t.input.asset.asset.as_str(),
+                        t.output.asset.chain.as_str(),
+                        t.output.asset.asset.as_str(),
+                    )
+                })
+                .collect();
+            eprintln!(
+                "    [{i}] hops={} cost_bps={} latency_ms={} id={}",
+                path.transitions.len(),
+                score.total_effective_cost_bps,
+                score.total_latency_ms,
+                path.id,
+            );
+            for (j, hop) in hops.iter().enumerate() {
+                eprintln!("        ({j}) {hop}");
+            }
+        }
+    }
+
+    // -- Example traces. Copy/edit these to audit a new pair. -------------
+
+    #[test]
+    fn trace_route_base_usdc_to_btc() {
+        let source = asset(
+            "evm:8453",
+            AssetId::reference("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
+        );
+        let destination = asset("bitcoin", AssetId::Native);
+        let ranked = trace_route("Base.USDC -> Bitcoin", &source, &destination);
+        assert!(!ranked.is_empty(), "expected at least one route for Base.USDC -> BTC");
+    }
+
+    #[test]
+    fn trace_route_ethereum_eth_to_btc() {
+        let source = asset("evm:1", AssetId::Native);
+        let destination = asset("bitcoin", AssetId::Native);
+        let ranked = trace_route("Ethereum.ETH -> Bitcoin", &source, &destination);
+        assert!(!ranked.is_empty(), "expected at least one route for ETH -> BTC");
+    }
+
+    #[test]
+    fn trace_route_btc_to_random_base_token() {
+        let source = asset("bitcoin", AssetId::Native);
+        let destination = asset(
+            "evm:8453",
+            AssetId::reference("0x2222222222222222222222222222222222222222"),
+        );
+        let ranked = trace_route("Bitcoin -> Base.<random ERC20>", &source, &destination);
+        assert!(!ranked.is_empty(), "expected at least one route for BTC -> arbitrary Base token");
+    }
+
+    #[test]
+    fn trace_route_same_chain_base_swap() {
+        let source = asset(
+            "evm:8453",
+            AssetId::reference("0x3333333333333333333333333333333333333333"),
+        );
+        let destination = asset(
+            "evm:8453",
+            AssetId::reference("0x4444444444444444444444444444444444444444"),
+        );
+        let ranked = trace_route("Base.<rand A> -> Base.<rand B>", &source, &destination);
+        assert!(
+            !ranked.is_empty(),
+            "expected at least one same-chain route on Base"
+        );
+        assert!(
+            ranked.iter().all(|p| {
+                p.transitions
+                    .iter()
+                    .all(|t| t.input.asset.chain.as_str() == "evm:8453"
+                        && t.output.asset.chain.as_str() == "evm:8453")
+            }),
+            "same-chain preference should restrict ranked paths to evm:8453"
+        );
+    }
+
+    #[test]
+    fn trace_route_base_usdc_to_arbitrum_usdc() {
+        let source = asset(
+            "evm:8453",
+            AssetId::reference("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
+        );
+        let destination = asset(
+            "evm:42161",
+            AssetId::reference("0xaf88d065e77c8cc2239327c5edb3a432268e5831"),
+        );
+        let ranked = trace_route("Base.USDC -> Arbitrum.USDC", &source, &destination);
+        assert!(!ranked.is_empty(), "expected at least one route Base.USDC -> Arbitrum.USDC");
+    }
 }

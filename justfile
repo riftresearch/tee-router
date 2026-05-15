@@ -150,11 +150,10 @@ router-loadgen count='100' concurrency='64' rps='5' min_raw_amount='100000000' m
     just _router-loadgen-host {{count}} {{concurrency}} {{rps}} {{min_raw_amount}} {{max_raw_amount}} {{order_type}}
 
 # Run the high-volume random router loadgen profile from the host cargo binary.
-router-loadgen-fast count='10000' concurrency='64' rps='5' min_raw_amount='100000000' max_raw_amount='250000000' order_type='market':
+router-loadgen-slow count='10000' concurrency='64' rps='5' min_raw_amount='100000000' max_raw_amount='250000000' order_type='market':
     just _router-loadgen-host {{count}} {{concurrency}} {{rps}} {{min_raw_amount}} {{max_raw_amount}} {{order_type}}
 
-# Run the slow random router loadgen profile from the host cargo binary.
-router-loadgen-slow count='600' concurrency='64' rps='0.1666666667' min_raw_amount='100000000' max_raw_amount='250000000' order_type='market':
+router-loadgen-one count='1' concurrency='64' rps='5' min_raw_amount='100000000' max_raw_amount='250000000' order_type='market':
     just _router-loadgen-host {{count}} {{concurrency}} {{rps}} {{min_raw_amount}} {{max_raw_amount}} {{order_type}}
 
 _router-loadgen-host count concurrency rps min_raw_amount max_raw_amount order_type:

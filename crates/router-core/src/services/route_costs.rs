@@ -465,7 +465,11 @@ fn path_score_with_structural_fallback(
     }
 }
 
-fn structural_path_score(path: &TransitionPath, pricing: &PricingSnapshot) -> RoutePathCostScore {
+#[must_use]
+pub fn structural_path_score(
+    path: &TransitionPath,
+    pricing: &PricingSnapshot,
+) -> RoutePathCostScore {
     path_score_with_structural_fallback(path, &HashMap::new(), pricing)
 }
 

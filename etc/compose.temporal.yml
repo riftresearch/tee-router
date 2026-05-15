@@ -273,7 +273,7 @@ services:
       SERVICES: frontend
     ports:
       - "7233:7233"
-      - "9090:9090"
+      - "19090:9090"
     healthcheck:
       test: ["CMD", "nc", "-z", "localhost", "7233"]
       interval: 5s
