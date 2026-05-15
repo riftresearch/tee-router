@@ -76,7 +76,7 @@ The watched recipient may be reused across orders (recipients are user-provided)
 | Failure | Mitigation |
 |---|---|
 | Swap tx reverts mid-route | `eth_getTransactionReceipt` returns `status = 0`; verifier emits failure; T-router routes to refund |
-| Output amount below `min_amount_out` (slippage exceeded) | Velora's executor enforces `min_amount_out` and reverts the whole tx if violated. Defensive check: verifier compares the realized amount in the Transfer log against expected min |
+| Output amount below `min_amount_out` (provider bound exceeded) | Velora's executor enforces `min_amount_out` and reverts the whole tx if violated. Defensive check: verifier compares the realized amount in the Transfer log against expected min |
 | `priceRoute` invalidated between quote and tx (Velora's quote went stale) | `POST /transactions` rejects with an error before submission; T-router triggers stale-quote refresh (PR5c). This is pre-submission; not an observation problem |
 | Tx never gets mined (gas too low, mempool eviction) | Verifier observes "no receipt after deadline"; T-router resubmits with higher gas (existing retry policy) |
 | Velora API unavailable for *quote* (pre-submission) | Quote-time failure; T-router routes to alternate venue if available, else refund. Not an observation problem |

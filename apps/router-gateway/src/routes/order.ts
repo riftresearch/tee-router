@@ -40,6 +40,8 @@ import {
   RefundModeSchema
 } from './schemas'
 
+const LIMIT_ORDERS_DISABLED_MESSAGE = 'limit orders are currently disabled'
+
 export const OrderMarketRequestSchema = z
   .object({
     quoteId: z.string().uuid(),
@@ -282,6 +284,11 @@ export function createOrderMarketHandler(
       const refundMode = request.refundMode ?? 'evmSignature'
       const routerClient = routerClientFor(config, deps)
       const quoteEnvelope = await routerClient.getQuote(request.quoteId)
+      if (quoteEnvelope.quote.type === 'limit_order') {
+        throw new GatewayValidationError(LIMIT_ORDERS_DISABLED_MESSAGE, {
+          quoteId: request.quoteId
+        })
+      }
       const quote = routerQuoteFromEnvelope(quoteEnvelope)
       assertAddressMatchesChain(
         quote.source_asset.chain,

@@ -320,7 +320,7 @@ describeWithDatabase('VolumeAnalyticsRuntime', () => {
 
       await runtime.ingestOrder({
         ...baseOrder,
-        status: 'manual_intervention_required',
+        status: 'refund_required',
         updatedAt: '2026-05-04T06:02:00.000Z'
       })
       await expectOrderMetrics(runtime, {
@@ -349,7 +349,7 @@ describeWithDatabase('VolumeAnalyticsRuntime', () => {
 
       await runtime.ingestOrder({
         ...baseOrder,
-        status: 'manual_intervention_required',
+        status: 'refund_required',
         updatedAt: '2026-05-04T06:02:30.000Z'
       })
       await expectOrderMetrics(runtime, {
@@ -1250,17 +1250,12 @@ function completedOrderDbRow({
     destination_asset_id: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913',
     recipient_address: '0x1111111111111111111111111111111111111111',
     refund_address: '0x1111111111111111111111111111111111111111',
-    action_timeout_at: completedAt,
     workflow_trace_id: null,
     workflow_parent_span_id: null,
     quote_id: null,
     quote_provider_id: null,
-    order_kind: 'exact_in',
     quoted_amount_in: rawAmount,
-    quoted_amount_out: rawAmount,
-    min_amount_out: rawAmount,
-    max_amount_in: null,
-    slippage_bps: '100',
+    estimated_amount_out: rawAmount,
     quote_expires_at: completedAt,
     provider_quote: {},
     quote_usd_valuation: {},
@@ -1281,7 +1276,7 @@ function completedOrderDbRow({
           assetId: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913'
         },
         amountIn: rawAmount,
-        expectedAmountOut: rawAmount,
+        estimatedAmountOut: rawAmount,
         actualAmountIn: rawAmount,
         actualAmountOut: rawAmount,
         completedAt: completedAt.toISOString(),
@@ -1392,7 +1387,6 @@ function completedOrder({
     },
     recipientAddress: '0x1111111111111111111111111111111111111111',
     refundAddress: '0x1111111111111111111111111111111111111111',
-    actionTimeoutAt: '2026-05-04T07:00:00.000Z',
     executionLegs: [
       {
         id: '019df1c4-a8ac-7731-b596-a24603580d4f',
@@ -1409,7 +1403,7 @@ function completedOrder({
           assetId: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913'
         },
         amountIn: rawAmount,
-        expectedAmountOut: rawAmount,
+        estimatedAmountOut: rawAmount,
         actualAmountIn: actualAmountIn ?? rawAmount,
         actualAmountOut: rawAmount,
         completedAt,

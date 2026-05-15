@@ -1,7 +1,7 @@
 use alloy::primitives::U256;
 use chrono::{DateTime, Utc};
 use router_core::{
-    models::MarketOrderKind,
+    models::ProviderOrderKind,
     protocol::{AssetId, DepositAsset},
     services::{
         action_providers::{
@@ -546,7 +546,7 @@ async fn quote_exchange_exact_out(
             output_asset: output_asset.clone(),
             input_decimals,
             output_decimals,
-            order_kind: MarketOrderKind::ExactOut {
+            order_kind: ProviderOrderKind::ExactOut {
                 amount_out: amount_out.to_string(),
                 max_amount_in: Some(exact_out_cap_for_asset(input_asset).to_string()),
             },
@@ -582,7 +582,7 @@ async fn quote_bridge_exact_out(
         .quote_bridge(BridgeQuoteRequest {
             source_asset: source_asset.clone(),
             destination_asset: destination_asset.clone(),
-            order_kind: MarketOrderKind::ExactOut {
+            order_kind: ProviderOrderKind::ExactOut {
                 amount_out: amount_out.to_string(),
                 max_amount_in: Some(exact_out_cap_for_asset(source_asset).to_string()),
             },

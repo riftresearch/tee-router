@@ -1,7 +1,7 @@
 use crate::{
     db::Database,
     error::{RouterCoreError, RouterCoreResult},
-    models::MarketOrderKind,
+    models::ProviderOrderKind,
     protocol::DepositAsset,
     services::{
         action_providers::{ActionProviderRegistry, BridgeQuoteRequest},
@@ -294,7 +294,7 @@ impl RouteCostService {
         let request = BridgeQuoteRequest {
             source_asset: transition.input.asset.clone(),
             destination_asset: transition.output.asset.clone(),
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: ProviderOrderKind::ExactIn {
                 amount_in: amount_in.to_string(),
                 min_amount_out: Some("1".to_string()),
             },

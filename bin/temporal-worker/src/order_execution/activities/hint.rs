@@ -1332,16 +1332,16 @@ pub(super) async fn verify_velora_swap_settled_hint(
             token_address,
         )?;
     }
-    let expected_amount_out = operation
+    let estimated_amount_out = operation
         .request
         .get("min_amount_out")
         .and_then(Value::as_str)
         .or_else(|| operation.request.get("amount_out").and_then(Value::as_str));
-    if let Some(expected_amount_out) = expected_amount_out {
+    if let Some(estimated_amount_out) = estimated_amount_out {
         validate_decimal_gte(
             "VeloraSwapSettled amount_out",
             &evidence.amount_out,
-            expected_amount_out,
+            estimated_amount_out,
         )?;
     }
 

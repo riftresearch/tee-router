@@ -605,7 +605,6 @@ function parseOrderLifecycleFilter(
   if (
     value === 'in_progress' ||
     value === 'needs_attention' ||
-    value === 'expired' ||
     value === 'refunded'
   ) {
     return value

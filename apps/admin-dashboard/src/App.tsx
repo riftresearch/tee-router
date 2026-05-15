@@ -84,7 +84,7 @@ type ProgressSegment = {
   label: string
   state: ProgressSegmentState
 }
-type TimerHandle = ReturnType<typeof window.setTimeout>
+type TimerHandle = number
 type CoalescedAsyncRefresh = {
   request: () => void
   cancel: () => void
@@ -138,20 +138,10 @@ const ORDER_STATUS_DISPLAY: Record<string, StatusDisplay> = {
     tone: 'neutral',
     title: 'Refund finished'
   },
-  manual_intervention_required: {
-    label: 'Manual Intervention',
-    tone: 'danger',
-    title: 'Execution state needs operator inspection'
-  },
-  refund_manual_intervention_required: {
-    label: 'Manual Refund',
-    tone: 'danger',
-    title: 'Refund recovery needs operator action'
-  },
   expired: {
     label: 'Expired',
     tone: 'danger',
-    title: 'Funding deadline passed before valid funding was observed'
+    title: 'Provider operation expired'
   }
 }
 const ORDER_TABS: Array<{ type: OrderTypeFilter; label: string }> = [
@@ -162,7 +152,6 @@ const ORDER_FILTERS: Array<{ value: OrderLifecycleFilter; label: string }> = [
   { value: 'firehose', label: 'All Orders' },
   { value: 'in_progress', label: 'In Progress' },
   { value: 'needs_attention', label: 'Needs Attention' },
-  { value: 'expired', label: 'Expired' },
   { value: 'refunded', label: 'Refunded' }
 ]
 const VOLUME_WINDOWS = [
@@ -1611,7 +1600,7 @@ function OrderRows({
           {order.orderType === 'limit_order' ? (
             <LimitStateCell order={order} />
           ) : (
-            <span className="kind-pill">{formatKind(order.orderKind)}</span>
+            <span className="kind-pill">Market</span>
           )}
         </td>
         <td>
@@ -1648,7 +1637,7 @@ function DetailsLoading() {
 function LimitStateCell({ order }: { order: OrderFirehoseRow }) {
   const limitStatus = order.limitStatus
   if (!limitStatus) {
-    return <span className="kind-pill">{formatKind(order.orderKind)}</span>
+    return <span className="kind-pill">Limit</span>
   }
 
   return (
@@ -1808,7 +1797,7 @@ function QuoteCell({ order }: { order: OrderFirehoseRow }) {
       }}
       output={{
         label: 'out',
-        amount: order.quotedOutputAmount,
+        amount: order.estimatedOutputAmount,
         asset: order.destination,
         usdValuation: order.quoteUsdValuation?.amounts?.output
       }}
@@ -1983,8 +1972,6 @@ type TimelineLeg = {
   quotedOutputUsd?: UsdAmountValuation
   executedInputUsd?: UsdAmountValuation
   executedOutputUsd?: UsdAmountValuation
-  minAmountOut?: string
-  maxAmountIn?: string
   updatedAt?: string
   txHash?: string
   txChainId?: string
@@ -2178,7 +2165,6 @@ function TimelineLegItem({ leg }: { leg: TimelineLeg }) {
               </span>
             ) : null}
             {primaryDelta ? <DeltaPill delta={primaryDelta} /> : null}
-            <TimelineGuardrails leg={leg} />
           </div>
           <TimelineActions steps={leg.steps} />
         </div>
@@ -2229,41 +2215,6 @@ export function timelineExecutionPlaceholder(leg: TimelineLeg) {
   )
   if (hasSubmittedTx) return 'Transaction submitted, awaiting settlement'
   return 'Not executed yet'
-}
-
-function TimelineGuardrails({ leg }: { leg: TimelineLeg }) {
-  const guardrails = [
-    leg.minAmountOut && leg.outputAsset
-      ? {
-          label: 'min out',
-          amount: leg.minAmountOut,
-          asset: leg.outputAsset
-        }
-      : undefined,
-    leg.maxAmountIn && leg.inputAsset
-      ? {
-          label: 'max in',
-          amount: leg.maxAmountIn,
-          asset: leg.inputAsset
-        }
-      : undefined
-  ].filter((guardrail): guardrail is { label: string; amount: string; asset: AssetRef } =>
-    Boolean(guardrail)
-  )
-
-  if (guardrails.length === 0) return null
-
-  return (
-    <div className="timeline-guardrails">
-      {guardrails.map((guardrail) => (
-        <span key={guardrail.label}>
-          {guardrail.label} <code title={rawAmountTitle(guardrail.amount, guardrail.asset)}>
-            {formatAmount(guardrail.amount, guardrail.asset)}
-          </code>
-        </span>
-      ))}
-    </div>
-  )
 }
 
 function TimelineActions({ steps }: { steps: OrderExecutionStep[] }) {
@@ -2459,10 +2410,6 @@ function OrderMetadataPanel({ order }: { order: OrderFirehoseRow }) {
         <dd>
           <time dateTime={order.updatedAt}>{formatDate(order.updatedAt)}</time>
         </dd>
-        <dt>Action Timeout</dt>
-        <dd>
-          <time dateTime={order.actionTimeoutAt}>{formatDate(order.actionTimeoutAt)}</time>
-        </dd>
         <dt>Recipient</dt>
         <dd>
           <ExplorerValue
@@ -2485,8 +2432,6 @@ function OrderMetadataPanel({ order }: { order: OrderFirehoseRow }) {
         <dd>
           <code title={order.quoteId}>{order.quoteId ?? 'none'}</code>
         </dd>
-        <dt>Slippage</dt>
-        <dd>{formatSlippageBps(order.slippageBps)}</dd>
         <dt>Trace</dt>
         <dd>
           <code title={order.workflowTraceId}>{order.workflowTraceId ?? 'none'}</code>
@@ -2494,15 +2439,6 @@ function OrderMetadataPanel({ order }: { order: OrderFirehoseRow }) {
       </dl>
     </div>
   )
-}
-
-function formatSlippageBps(slippageBps: string | undefined) {
-  if (slippageBps === undefined) return 'none'
-  if (!/^\d+$/.test(slippageBps)) return slippageBps
-  const bps = BigInt(slippageBps)
-  const whole = bps / 100n
-  const fraction = (bps % 100n).toString().padStart(2, '0')
-  return `${whole}.${fraction}% (${slippageBps} bps)`
 }
 
 function StreamBadge({
@@ -2544,8 +2480,6 @@ type QuoteFlowLeg = {
   outputAsset?: AssetRef
   amountIn?: string
   amountOut?: string
-  minAmountOut?: string
-  maxAmountIn?: string
   inputUsdValuation?: UsdAmountValuation
   outputUsdValuation?: UsdAmountValuation
 }
@@ -2555,10 +2489,8 @@ type JsonRecord = Record<string, unknown>
 function fundingDepositFlow(order: OrderFirehoseRow) {
   return {
     asset: order.source,
-    amount: order.quotedInputAmount ?? order.maxAmountIn,
-    usdValuation: order.quotedInputAmount
-      ? order.quoteUsdValuation?.amounts?.input
-      : order.quoteUsdValuation?.amounts?.maxInput
+    amount: order.quotedInputAmount,
+    usdValuation: order.quoteUsdValuation?.amounts?.input
   }
 }
 
@@ -2572,10 +2504,9 @@ function quoteFlowLegs(order: OrderFirehoseRow): QuoteFlowLeg[] {
       inputAsset: leg.input,
       outputAsset: leg.output,
       amountIn: leg.amountIn,
-      amountOut: leg.expectedAmountOut,
-      minAmountOut: leg.minAmountOut,
+      amountOut: leg.estimatedAmountOut,
       inputUsdValuation: leg.usdValuation?.amounts?.plannedInput,
-      outputUsdValuation: leg.usdValuation?.amounts?.plannedMinOutput
+      outputUsdValuation: leg.usdValuation?.amounts?.plannedOutput
     }))
   }
 
@@ -2651,16 +2582,10 @@ function quoteFlowLegs(order: OrderFirehoseRow): QuoteFlowLeg[] {
       amountOut:
         stringField(lastLeg, 'amount_out') ??
         stringField(lastRaw, 'amount_out') ??
+        stringField(lastLeg, 'estimated_amount_out') ??
+        stringField(lastRaw, 'estimated_amount_out') ??
         stringField(lastRaw, 'expectedOutputAmount') ??
         stringField(lastRaw, 'destAmount'),
-      minAmountOut:
-        stringField(lastRaw, 'min_amount_out') ??
-        stringField(lastRaw, 'minOutputAmount') ??
-        stringField(lastLeg, 'min_amount_out'),
-      maxAmountIn:
-        stringField(firstRaw, 'max_amount_in') ??
-        stringField(firstRaw, 'maxInputAmount') ??
-        stringField(firstLeg, 'max_amount_in'),
       inputUsdValuation: first.usdValuation?.amounts?.input,
       outputUsdValuation: last.usdValuation?.amounts?.output
     }
@@ -2699,7 +2624,7 @@ export function timelineLegs(order: OrderFirehoseRow): TimelineLeg[] {
           inputAsset: leg.input,
           outputAsset: leg.output,
           quotedInput: quoteLeg.amountIn,
-          quotedOutput: quoteLeg.expectedAmountOut,
+          quotedOutput: quoteLeg.estimatedAmountOut,
           executedInput,
           executedOutput,
           quotedInputUsd:
@@ -2708,13 +2633,11 @@ export function timelineLegs(order: OrderFirehoseRow): TimelineLeg[] {
             ]) ??
             valuationForAmount(quoteLeg.amountIn, quoteLeg.input, quoteValuation, ['input']),
           quotedOutputUsd:
-            valuationForAmount(quoteLeg.expectedAmountOut, quoteLeg.output, quoteLeg.usdValuation, [
-              'plannedOutput',
-              'plannedMinOutput'
+            valuationForAmount(quoteLeg.estimatedAmountOut, quoteLeg.output, quoteLeg.usdValuation, [
+              'plannedOutput'
             ]) ??
-            valuationForAmount(quoteLeg.expectedAmountOut, quoteLeg.output, quoteValuation, [
-              'output',
-              'minOutput'
+            valuationForAmount(quoteLeg.estimatedAmountOut, quoteLeg.output, quoteValuation, [
+              'output'
             ]),
           executedInputUsd: executedInput
             ? valuationForAmount(
@@ -2734,7 +2657,6 @@ export function timelineLegs(order: OrderFirehoseRow): TimelineLeg[] {
                 { allowDerived: false }
               )
             : undefined,
-          minAmountOut: quoteLeg.minAmountOut,
           updatedAt: leg.updatedAt,
           txHash: progressStage?.txHash,
           txChainId: progressStage?.txChainId,
@@ -2759,8 +2681,6 @@ export function timelineLegs(order: OrderFirehoseRow): TimelineLeg[] {
     quotedOutput: leg.amountOut,
     quotedInputUsd: leg.inputUsdValuation,
     quotedOutputUsd: leg.outputUsdValuation,
-    minAmountOut: leg.minAmountOut,
-    maxAmountIn: leg.maxAmountIn,
     steps: [],
     references: []
   }))
@@ -2892,9 +2812,7 @@ function quoteUsdValuationForExecutionLeg(
     pricing: quoteUsdValuation.pricing,
     amounts: {
       input: first?.amounts?.input,
-      output: last?.amounts?.output,
-      minOutput: last?.amounts?.minOutput,
-      maxInput: first?.amounts?.maxInput
+      output: last?.amounts?.output
     }
   }
 }
@@ -3558,14 +3476,6 @@ function formatDate(value: string) {
   }).format(new Date(value))
 }
 
-function formatKind(kind: string | undefined) {
-  if (!kind) return 'Unknown'
-  if (kind === 'exact_in') return 'Exact In'
-  if (kind === 'exact_out') return 'Exact Out'
-  if (kind === 'limit') return 'Limit'
-  return humanize(kind)
-}
-
 function formatAmount(value: string | undefined, asset?: AssetRef) {
   if (!value) return '-'
   const decimals = assetDecimals(asset)
@@ -3885,9 +3795,7 @@ function statusTone(status: string): StatusTone {
       'failed',
       'expired',
       'cancelled',
-      'refund_required',
-      'manual_intervention_required',
-      'refund_manual_intervention_required'
+      'refund_required'
     ].includes(status)
   ) {
     return 'danger'

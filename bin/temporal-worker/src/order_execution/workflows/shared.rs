@@ -1,11 +1,5 @@
 use super::*;
 
-pub(super) enum ManualInterventionSignal {
-    Release(ManualReleaseSignal),
-    TriggerRefund(ManualTriggerRefundSignal),
-    AcknowledgeUnrecoverable(AcknowledgeUnrecoverableSignal),
-}
-
 pub(super) fn provider_operation_hint_targets_step(
     signal: &ProviderOperationHintSignal,
     order_id: WorkflowOrderId,
@@ -75,19 +69,13 @@ pub(super) fn order_terminal_status_label(status: OrderTerminalStatus) -> &'stat
         OrderTerminalStatus::Completed => "completed",
         OrderTerminalStatus::RefundRequired => "refund_required",
         OrderTerminalStatus::Refunded => "refunded",
-        OrderTerminalStatus::ManualInterventionRequired => "manual_intervention_required",
-        OrderTerminalStatus::RefundManualInterventionRequired => {
-            "refund_manual_intervention_required"
-        }
     }
 }
 
 pub(super) fn refund_terminal_status_label(status: RefundTerminalStatus) -> &'static str {
     match status {
         RefundTerminalStatus::Refunded => "refunded",
-        RefundTerminalStatus::RefundManualInterventionRequired => {
-            "refund_manual_intervention_required"
-        }
+        RefundTerminalStatus::RefundRequired => "refund_required",
     }
 }
 
@@ -98,31 +86,6 @@ pub(super) fn maybe_record_signal<W>(
 ) {
     if !ctx.is_replaying() {
         telemetry::record_signal(workflow_type, signal_name);
-    }
-}
-
-pub(super) fn manual_wait_started<W>(
-    ctx: &WorkflowContext<W>,
-    workflow_type: &'static str,
-) -> Option<SystemTime> {
-    if !ctx.is_replaying() {
-        telemetry::record_manual_intervention_wait_started(workflow_type);
-    }
-    ctx.workflow_time()
-}
-
-pub(super) fn record_manual_wait_completed<W>(
-    ctx: &WorkflowContext<W>,
-    workflow_type: &'static str,
-    started_at: Option<SystemTime>,
-    resolution: &'static str,
-) {
-    if !ctx.is_replaying() {
-        telemetry::record_manual_intervention_wait_completed(
-            workflow_type,
-            resolution,
-            workflow_duration(ctx, started_at),
-        );
     }
 }
 
@@ -152,21 +115,12 @@ pub(super) fn json_reason(reason: &'static str, step_id: WorkflowStepId) -> Valu
     })
 }
 
-pub(super) fn zombie_cleanup_signal() -> AcknowledgeUnrecoverableSignal {
-    AcknowledgeUnrecoverableSignal {
-        reason: "zombie_cleanup_after_manual_intervention_timeout".to_string(),
-        operator_id: Some("temporal-worker".to_string()),
-        requested_at: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
-    }
-}
-
 pub(super) fn refund_terminal_status(status: OrderTerminalStatus) -> RefundTerminalStatus {
     match status {
         OrderTerminalStatus::Refunded => RefundTerminalStatus::Refunded,
-        OrderTerminalStatus::RefundManualInterventionRequired
-        | OrderTerminalStatus::ManualInterventionRequired
-        | OrderTerminalStatus::RefundRequired
-        | OrderTerminalStatus::Completed => RefundTerminalStatus::RefundManualInterventionRequired,
+        OrderTerminalStatus::RefundRequired | OrderTerminalStatus::Completed => {
+            RefundTerminalStatus::RefundRequired
+        }
     }
 }
 
@@ -203,7 +157,7 @@ pub(super) fn refund_child_options(
 ) -> ChildWorkflowOptions {
     ChildWorkflowOptions {
         workflow_id: refund_workflow_id(order_id, parent_attempt_id),
-        run_timeout: Some(MANUAL_INTERVENTION_WAIT_TIMEOUT + Duration::from_secs(60 * 60)),
+        run_timeout: Some(Duration::from_secs(24 * 60 * 60)),
         task_timeout: Some(Duration::from_secs(30)),
         ..Default::default()
     }

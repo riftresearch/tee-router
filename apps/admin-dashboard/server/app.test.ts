@@ -353,7 +353,7 @@ test('order SSE forwards analytics change hints even when updated status is not 
           kind: 'upsert',
           order: order({
             id: orderId,
-            status: 'manual_intervention_required',
+            status: 'refund_required',
             orderType: 'market_order'
           }),
           total: 7,
@@ -726,33 +726,6 @@ test('lifecycle filters keep refunded orders out of the needs-attention tab', ()
   ).toBe(true)
 })
 
-test('lifecycle filters treat manual intervention as needs-attention', () => {
-  const manualInterventionOrder = order({
-    id: '019df446-096f-7290-bf84-dc9dac9dd8ad',
-    status: 'manual_intervention_required'
-  })
-
-  expect(
-    orderMatchesLifecycleFilter(manualInterventionOrder, 'needs_attention')
-  ).toBe(true)
-  expect(
-    orderMatchesLifecycleFilter(manualInterventionOrder, 'in_progress')
-  ).toBe(false)
-})
-
-test('lifecycle filters keep expired orders in the dedicated expired tab', () => {
-  const expiredOrder = order({
-    id: '019df446-096f-7290-bf84-dc9dac9dd8ae',
-    status: 'expired'
-  })
-
-  expect(
-    orderMatchesLifecycleFilter(expiredOrder, 'needs_attention')
-  ).toBe(false)
-  expect(orderMatchesLifecycleFilter(expiredOrder, 'expired')).toBe(true)
-  expect(orderMatchesLifecycleFilter(expiredOrder, 'in_progress')).toBe(false)
-})
-
 async function readUntil(response: Response, expected: string) {
   const reader = response.body?.getReader()
   if (!reader) throw new Error('missing response body')
@@ -828,17 +801,12 @@ function orderRow({
     destination_asset_id: 'native',
     recipient_address: '0x1111111111111111111111111111111111111111',
     refund_address: '0x2222222222222222222222222222222222222222',
-    action_timeout_at: now,
     workflow_trace_id: null,
     workflow_parent_span_id: null,
     quote_id: null,
     quote_provider_id: null,
-    order_kind: null,
     quoted_amount_in: null,
-    quoted_amount_out: null,
-    min_amount_out: null,
-    max_amount_in: null,
-    slippage_bps: null,
+    estimated_amount_out: null,
     quote_expires_at: null,
     provider_quote: {},
     quote_usd_valuation: {},
@@ -889,7 +857,6 @@ function order(input: {
     },
     recipientAddress: row.recipient_address,
     refundAddress: row.refund_address,
-    actionTimeoutAt: row.action_timeout_at.toISOString(),
     executionLegs: [],
     executionSteps: row.execution_steps,
     providerOperations: [],

@@ -1,13 +1,10 @@
 use crate::{
     api::{
         CreateOrderCancellationRequest, CreateOrderRequest, CreateQuoteRequest, CreateVaultRequest,
-        DetectorHintEnvelope, DetectorHintRequest, DetectorHintTarget,
-        ManualInterventionActionEnvelope, ManualInterventionActionRequest,
-        ManualInterventionOrderEnvelope, ManualInterventionOrdersEnvelope,
-        ManualTriggerRefundRequest, ProviderHealthEnvelope, ProviderOperationHintEnvelope,
-        ProviderOperationHintRequest, ProviderPolicyEnvelope, ProviderPolicyListEnvelope,
-        UpdateProviderPolicyRequest, VaultFundingHintEnvelope, VaultFundingHintRequest,
-        MAX_HINT_IDEMPOTENCY_KEY_LEN,
+        DetectorHintEnvelope, DetectorHintRequest, DetectorHintTarget, ProviderHealthEnvelope,
+        ProviderOperationHintEnvelope, ProviderOperationHintRequest, ProviderPolicyEnvelope,
+        ProviderPolicyListEnvelope, UpdateProviderPolicyRequest, VaultFundingHintEnvelope,
+        VaultFundingHintRequest, MAX_HINT_IDEMPOTENCY_KEY_LEN,
     },
     app::{initialize_components, PaymasterMode, RouterComponents},
     error::{RouterServerError, RouterServerResult},
@@ -22,8 +19,7 @@ use axum::{
     body::Body,
     extract::{
         rejection::{JsonRejection, PathRejection},
-        DefaultBodyLimit, FromRequest, FromRequestParts, MatchedPath, Path as AxumPath, Query,
-        State,
+        DefaultBodyLimit, FromRequest, FromRequestParts, MatchedPath, Path as AxumPath, State,
     },
     http::{header, request::Parts, HeaderMap, Request, StatusCode},
     middleware::{self, Next},
@@ -44,8 +40,7 @@ use router_core::{
     services::asset_registry::ProviderId,
 };
 use router_temporal::{
-    boxed as boxed_temporal_error, AcknowledgeUnrecoverableSignal, ManualReleaseSignal,
-    ManualTriggerRefundSignal, OrderWorkflowClient, ProviderHintKind, ProviderKind,
+    boxed as boxed_temporal_error, OrderWorkflowClient, ProviderHintKind, ProviderKind,
     ProviderOperationHintEvidence, ProviderOperationHintSignal, RouterTemporalError,
     TemporalConnection, UnitDepositHintEvidence, WorkflowAttemptId, WorkflowHintId,
     WorkflowOrderId, WorkflowProviderOperationId, WorkflowStepId,
@@ -73,8 +68,7 @@ const MAX_HINT_EVIDENCE_JSON_BYTES: usize = 16 * 1024;
 pub const MAX_ROUTER_JSON_BODY_BYTES: usize = 256 * 1024;
 const _: () = assert!(MAX_ROUTER_JSON_BODY_BYTES >= MAX_HINT_EVIDENCE_JSON_BYTES * 2);
 const _: () = assert!(MAX_ROUTER_JSON_BODY_BYTES <= 1024 * 1024);
-const DEFAULT_MANUAL_INTERVENTION_ORDER_LIMIT: i64 = 50;
-const MAX_MANUAL_INTERVENTION_ORDER_LIMIT: i64 = 500;
+const LIMIT_ORDERS_DISABLED_MESSAGE: &str = "limit orders are currently disabled";
 
 struct RouterJson<T>(T);
 struct RouterPath<T>(T);
@@ -262,26 +256,6 @@ pub fn build_api_router(state: AppState, cors_domain: Option<String>) -> Router 
             "/internal/v1/provider-policies/:provider",
             put(update_provider_policy),
         )
-        .route(
-            "/internal/v1/orders/manual-interventions",
-            get(list_manual_intervention_orders),
-        )
-        .route(
-            "/internal/v1/orders/:id/manual-intervention",
-            get(get_manual_intervention_order),
-        )
-        .route(
-            "/internal/v1/orders/:id/manual-intervention/release",
-            post(release_manual_intervention_order),
-        )
-        .route(
-            "/internal/v1/orders/:id/manual-intervention/trigger-refund",
-            post(trigger_manual_intervention_refund),
-        )
-        .route(
-            "/internal/v1/orders/:id/manual-intervention/acknowledge-unrecoverable",
-            post(acknowledge_manual_intervention_unrecoverable),
-        )
         .route("/internal/v1/orders/:id/flow", get(get_order_flow))
         .route("/api/v1/chains/:chain/tip", get(get_chain_tip))
         .with_state(state)
@@ -426,15 +400,8 @@ async fn create_quote(
             .await?;
             state.order_manager.quote_market_order(market_order).await?
         }
-        CreateQuoteRequest::LimitOrder(limit_order) => {
-            screen_user_address(
-                &state,
-                AddressScreeningPurpose::Recipient,
-                &limit_order.to_asset.chain,
-                &limit_order.recipient_address,
-            )
-            .await?;
-            state.order_manager.quote_limit_order(limit_order).await?
+        CreateQuoteRequest::LimitOrder(_limit_order) => {
+            return Err(limit_orders_disabled_error());
         }
     };
     Ok((StatusCode::CREATED, Json(envelope)))
@@ -458,6 +425,9 @@ async fn create_order(
     authorize_gateway_api_request(&state, &headers)?;
     require_order_idempotency_key(&request)?;
     let quote_for_screening = state.order_manager.get_quote(request.quote_id).await?;
+    if quote_for_screening.as_limit_order().is_some() {
+        return Err(limit_orders_disabled_error());
+    }
     let cancellation = state
         .vault_manager
         .order_cancellation_material(request.quote_id);
@@ -596,6 +566,12 @@ fn require_order_idempotency_key(request: &CreateOrderRequest) -> RouterServerRe
         });
     }
     Ok(())
+}
+
+fn limit_orders_disabled_error() -> RouterServerError {
+    RouterServerError::Validation {
+        message: LIMIT_ORDERS_DISABLED_MESSAGE.to_string(),
+    }
 }
 
 fn ensure_recoverable_cancellation_secret(
@@ -1207,247 +1183,6 @@ async fn get_order_flow(
     Ok(Json(crate::query_api::get_order_flow(&state.db, id).await?))
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct ManualInterventionOrdersQuery {
-    limit: Option<i64>,
-}
-
-async fn list_manual_intervention_orders(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<ManualInterventionOrdersQuery>,
-) -> RouterServerResult<Json<ManualInterventionOrdersEnvelope>> {
-    authorize_admin_api_request(&state, &headers)?;
-    let limit = normalized_manual_intervention_order_limit(query.limit)?;
-    Ok(Json(
-        crate::query_api::list_manual_intervention_orders(&state.db, limit).await?,
-    ))
-}
-
-async fn get_manual_intervention_order(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    RouterPath(id): RouterPath<Uuid>,
-) -> RouterServerResult<Json<ManualInterventionOrderEnvelope>> {
-    authorize_admin_api_request(&state, &headers)?;
-    Ok(Json(
-        crate::query_api::get_manual_intervention_order(&state.db, id).await?,
-    ))
-}
-
-async fn release_manual_intervention_order(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    RouterPath(id): RouterPath<Uuid>,
-    RouterJson(request): RouterJson<ManualInterventionActionRequest>,
-) -> RouterServerResult<Json<ManualInterventionActionEnvelope>> {
-    authorize_admin_api_request(&state, &headers)?;
-    let reason = normalize_manual_action_reason(request.reason)?;
-    let signal = ManualReleaseSignal {
-        reason,
-        operator_id: request.operator_id,
-        requested_at: Utc::now(),
-    };
-    signal_manual_intervention_action(&state, id, ManualInterventionAction::Release(signal)).await
-}
-
-async fn trigger_manual_intervention_refund(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    RouterPath(id): RouterPath<Uuid>,
-    RouterJson(request): RouterJson<ManualTriggerRefundRequest>,
-) -> RouterServerResult<Json<ManualInterventionActionEnvelope>> {
-    authorize_admin_api_request(&state, &headers)?;
-    let reason = normalize_manual_action_reason(request.reason)?;
-    let signal = ManualTriggerRefundSignal {
-        reason,
-        operator_id: request.operator_id,
-        requested_at: Utc::now(),
-        refund_kind_hint: request.refund_kind_hint,
-    };
-    signal_manual_intervention_action(&state, id, ManualInterventionAction::TriggerRefund(signal))
-        .await
-}
-
-async fn acknowledge_manual_intervention_unrecoverable(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    RouterPath(id): RouterPath<Uuid>,
-    RouterJson(request): RouterJson<ManualInterventionActionRequest>,
-) -> RouterServerResult<Json<ManualInterventionActionEnvelope>> {
-    authorize_admin_api_request(&state, &headers)?;
-    let reason = normalize_manual_action_reason(request.reason)?;
-    let signal = AcknowledgeUnrecoverableSignal {
-        reason,
-        operator_id: request.operator_id,
-        requested_at: Utc::now(),
-    };
-    signal_manual_intervention_action(
-        &state,
-        id,
-        ManualInterventionAction::AcknowledgeUnrecoverable(signal),
-    )
-    .await
-}
-
-fn normalized_manual_intervention_order_limit(limit: Option<i64>) -> RouterServerResult<i64> {
-    let limit = limit.unwrap_or(DEFAULT_MANUAL_INTERVENTION_ORDER_LIMIT);
-    if !(1..=MAX_MANUAL_INTERVENTION_ORDER_LIMIT).contains(&limit) {
-        return Err(RouterServerError::Validation {
-            message: format!("limit must be between 1 and {MAX_MANUAL_INTERVENTION_ORDER_LIMIT}"),
-        });
-    }
-    Ok(limit)
-}
-
-enum ManualInterventionAction {
-    Release(ManualReleaseSignal),
-    TriggerRefund(ManualTriggerRefundSignal),
-    AcknowledgeUnrecoverable(AcknowledgeUnrecoverableSignal),
-}
-
-impl ManualInterventionAction {
-    fn name(&self) -> &'static str {
-        match self {
-            Self::Release(_) => "manual_release",
-            Self::TriggerRefund(_) => "manual_trigger_refund",
-            Self::AcknowledgeUnrecoverable(_) => "acknowledge_unrecoverable",
-        }
-    }
-}
-
-async fn signal_manual_intervention_action(
-    state: &AppState,
-    order_id: Uuid,
-    action: ManualInterventionAction,
-) -> RouterServerResult<Json<ManualInterventionActionEnvelope>> {
-    let order_workflow_client =
-        state
-            .order_workflow_client
-            .as_ref()
-            .ok_or_else(|| RouterServerError::NotReady {
-                message: "Temporal order workflow client is not configured".to_string(),
-            })?;
-    let target =
-        crate::query_api::get_manual_intervention_signal_target(&state.db, order_id).await?;
-    let action_name = action.name().to_string();
-    let workflow_id = match (&target, action) {
-        (
-            crate::query_api::ManualInterventionSignalTarget::OrderWorkflow { workflow_id },
-            ManualInterventionAction::Release(signal),
-        ) => {
-            order_workflow_client
-                .signal_manual_release(WorkflowOrderId::from(order_id), signal)
-                .await
-                .map_err(manual_signal_error)?;
-            workflow_id.clone()
-        }
-        (
-            crate::query_api::ManualInterventionSignalTarget::OrderWorkflow { workflow_id },
-            ManualInterventionAction::TriggerRefund(signal),
-        ) => {
-            order_workflow_client
-                .signal_manual_trigger_refund(WorkflowOrderId::from(order_id), signal)
-                .await
-                .map_err(manual_signal_error)?;
-            workflow_id.clone()
-        }
-        (
-            crate::query_api::ManualInterventionSignalTarget::OrderWorkflow { workflow_id },
-            ManualInterventionAction::AcknowledgeUnrecoverable(signal),
-        ) => {
-            order_workflow_client
-                .signal_acknowledge_unrecoverable(WorkflowOrderId::from(order_id), signal)
-                .await
-                .map_err(manual_signal_error)?;
-            workflow_id.clone()
-        }
-        (
-            crate::query_api::ManualInterventionSignalTarget::RefundWorkflow {
-                workflow_id,
-                parent_attempt_id,
-            },
-            ManualInterventionAction::Release(signal),
-        ) => {
-            order_workflow_client
-                .signal_refund_manual_release(
-                    WorkflowOrderId::from(order_id),
-                    WorkflowAttemptId::from(*parent_attempt_id),
-                    signal,
-                )
-                .await
-                .map_err(manual_signal_error)?;
-            workflow_id.clone()
-        }
-        (
-            crate::query_api::ManualInterventionSignalTarget::RefundWorkflow {
-                workflow_id,
-                parent_attempt_id,
-            },
-            ManualInterventionAction::TriggerRefund(signal),
-        ) => {
-            order_workflow_client
-                .signal_refund_manual_trigger_refund(
-                    WorkflowOrderId::from(order_id),
-                    WorkflowAttemptId::from(*parent_attempt_id),
-                    signal,
-                )
-                .await
-                .map_err(manual_signal_error)?;
-            workflow_id.clone()
-        }
-        (
-            crate::query_api::ManualInterventionSignalTarget::RefundWorkflow {
-                workflow_id,
-                parent_attempt_id,
-            },
-            ManualInterventionAction::AcknowledgeUnrecoverable(signal),
-        ) => {
-            order_workflow_client
-                .signal_refund_acknowledge_unrecoverable(
-                    WorkflowOrderId::from(order_id),
-                    WorkflowAttemptId::from(*parent_attempt_id),
-                    signal,
-                )
-                .await
-                .map_err(manual_signal_error)?;
-            workflow_id.clone()
-        }
-    };
-
-    Ok(Json(ManualInterventionActionEnvelope {
-        order_id,
-        workflow_id,
-        action: action_name,
-    }))
-}
-
-fn normalize_manual_action_reason(reason: String) -> RouterServerResult<String> {
-    let reason = reason.trim().to_string();
-    if reason.is_empty() {
-        return Err(RouterServerError::Validation {
-            message: "reason is required".to_string(),
-        });
-    }
-    Ok(reason)
-}
-
-fn manual_signal_error(source: RouterTemporalError) -> RouterServerError {
-    match source {
-        RouterTemporalError::WorkflowSignalUnavailable {
-            workflow_id,
-            message,
-        } => RouterServerError::NotReady {
-            message: format!(
-                "manual-intervention workflow {workflow_id} is unavailable: {message}"
-            ),
-        },
-        source => RouterServerError::NotReady {
-            message: format!("failed to signal manual-intervention workflow: {source}"),
-        },
-    }
-}
-
 fn authorize_internal_api_request(state: &AppState, headers: &HeaderMap) -> RouterServerResult<()> {
     let Some(auth) = state.internal_api_auth.as_ref() else {
         return Err(RouterServerError::Unauthorized {
@@ -1882,6 +1617,12 @@ mod tests {
             require_order_idempotency_key(&request),
             Err(RouterServerError::Validation { .. })
         ));
+    }
+
+    #[test]
+    fn limit_orders_disabled_error_returns_validation_status() {
+        let response = limit_orders_disabled_error().into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
@@ -2352,37 +2093,6 @@ mod tests {
             auth.verify_headers(&wrong_key),
             Err(RouterServerError::Unauthorized { .. })
         ));
-    }
-
-    #[test]
-    fn manual_intervention_order_limit_is_bounded() {
-        assert_eq!(
-            normalized_manual_intervention_order_limit(None).unwrap(),
-            DEFAULT_MANUAL_INTERVENTION_ORDER_LIMIT
-        );
-        assert_eq!(
-            normalized_manual_intervention_order_limit(Some(1)).unwrap(),
-            1
-        );
-        assert_eq!(
-            normalized_manual_intervention_order_limit(Some(MAX_MANUAL_INTERVENTION_ORDER_LIMIT))
-                .unwrap(),
-            MAX_MANUAL_INTERVENTION_ORDER_LIMIT
-        );
-        assert!(normalized_manual_intervention_order_limit(Some(0)).is_err());
-        assert!(normalized_manual_intervention_order_limit(Some(
-            MAX_MANUAL_INTERVENTION_ORDER_LIMIT + 1
-        ))
-        .is_err());
-    }
-
-    #[test]
-    fn manual_intervention_action_reason_is_required() {
-        assert_eq!(
-            normalize_manual_action_reason("  operator fixed liquidity  ".to_string()).unwrap(),
-            "operator fixed liquidity"
-        );
-        assert!(normalize_manual_action_reason("  ".to_string()).is_err());
     }
 
     #[test]

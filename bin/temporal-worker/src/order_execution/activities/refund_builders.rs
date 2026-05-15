@@ -483,7 +483,7 @@ pub(super) async fn refund_bridge_quote_transition(
         .quote_bridge(BridgeQuoteRequest {
             source_asset: transition.input.asset.clone(),
             destination_asset: transition.output.asset.clone(),
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: ProviderOrderKind::ExactIn {
                 amount_in: cursor_amount.to_string(),
                 min_amount_out: Some("1".to_string()),
             },
@@ -519,7 +519,7 @@ pub(super) async fn refund_universal_router_quote_transition(
             output_asset: transition.output.asset.clone(),
             input_decimals: refund_asset_decimals(deps, &transition.input.asset),
             output_decimals: refund_asset_decimals(deps, &transition.output.asset),
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: ProviderOrderKind::ExactIn {
                 amount_in: cursor_amount.to_string(),
                 min_amount_out: Some("1".to_string()),
             },
@@ -558,7 +558,7 @@ pub(super) async fn refund_hyperliquid_trade_quote_transition(
             output_asset: transition.output.asset.clone(),
             input_decimals: None,
             output_decimals: None,
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: ProviderOrderKind::ExactIn {
                 amount_in: cursor_amount.to_string(),
                 min_amount_out: Some("1".to_string()),
             },
@@ -953,7 +953,6 @@ pub(super) fn refund_transition_across_bridge_step(
         input_asset: Some(transition.input.asset.clone()),
         output_asset: Some(transition.output.asset.clone()),
         amount_in: Some(amount_in.clone()),
-        min_amount_out: None,
         provider_ref: Some(format!("order:{}:external-refund", order.id)),
         request: json!({
             "order_id": order.id,
@@ -1110,7 +1109,6 @@ fn refund_transition_cctp_burn_step(
         input_asset: Some(transition.input.asset.clone()),
         output_asset: Some(transition.output.asset.clone()),
         amount_in: Some(amount_in.clone()),
-        min_amount_out: None,
         provider_ref: Some(format!("order:{}:external-refund:cctp", order.id)),
         request: json!({
             "order_id": order.id,
@@ -1161,7 +1159,6 @@ fn refund_transition_cctp_receive_step(
         input_asset: Some(transition.output.asset.clone()),
         output_asset: Some(transition.output.asset.clone()),
         amount_in: Some(amount_out.clone()),
-        min_amount_out: None,
         provider_ref: Some(format!("order:{}:external-refund:cctp", order.id)),
         request: json!({
             "order_id": order.id,
@@ -1266,7 +1263,6 @@ pub(super) fn refund_transition_universal_router_swap_step(
         input_asset: Some(input_asset.clone()),
         output_asset: Some(output_asset.clone()),
         amount_in: Some(amount_in.to_string()),
-        min_amount_out: min_amount_out.clone(),
         provider_ref: Some(format!("order:{}:external-refund:swap", order.id)),
         request: json!({
             "order_id": order.id,
@@ -1350,7 +1346,6 @@ pub(super) fn refund_transition_unit_deposit_step(
         input_asset: Some(transition.input.asset.clone()),
         output_asset: None,
         amount_in: Some(amount_in.clone()),
-        min_amount_out: None,
         provider_ref: None,
         request: json!({
             "order_id": order.id,
@@ -1419,7 +1414,6 @@ pub(super) fn refund_transition_hyperliquid_bridge_deposit_step(
         input_asset: Some(transition.input.asset.clone()),
         output_asset: Some(transition.output.asset.clone()),
         amount_in: Some(amount_in.clone()),
-        min_amount_out: None,
         provider_ref: None,
         request: json!({
             "order_id": order.id,
@@ -1458,7 +1452,6 @@ pub(super) fn refund_transition_hyperliquid_bridge_withdrawal_step(
 ) -> Result<OrderExecutionStep, OrderActivityError> {
     let provider = refund_leg_provider(leg, transition)?.as_str().to_string();
     let amount_in = leg.amount_in.clone();
-    let amount_out = leg.amount_out.clone();
     let (vault_id, vault_address, vault_role, vault_chain_id, vault_asset_id) =
         hyperliquid_binding_request_parts(custody);
     let transfer_from_spot = hyperliquid_binding_transfers_from_spot(custody);
@@ -1472,7 +1465,6 @@ pub(super) fn refund_transition_hyperliquid_bridge_withdrawal_step(
         input_asset: Some(transition.input.asset.clone()),
         output_asset: Some(transition.output.asset.clone()),
         amount_in: Some(amount_in.clone()),
-        min_amount_out: Some(amount_out),
         provider_ref: None,
         request: json!({
             "order_id": order.id,
@@ -1678,7 +1670,6 @@ pub(super) struct RefundPlannedStepSpec {
     input_asset: Option<DepositAsset>,
     output_asset: Option<DepositAsset>,
     amount_in: Option<String>,
-    min_amount_out: Option<String>,
     provider_ref: Option<String>,
     request: Value,
     details: Value,
@@ -1733,7 +1724,6 @@ pub(super) fn refund_transition_hyperliquid_trade_step(
         input_asset: Some(input_asset),
         output_asset: Some(output_asset),
         amount_in: Some(amount_in.to_string()),
-        min_amount_out: min_amount_out.clone(),
         provider_ref: Some(format!("refund-quote-{refund_quote_id}")),
         request: json!({
             "order_id": order.id,
@@ -1796,7 +1786,6 @@ pub(super) fn refund_transition_unit_withdrawal_step(
         input_asset: Some(transition.input.asset.clone()),
         output_asset: Some(transition.output.asset.clone()),
         amount_in: Some(amount_in),
-        min_amount_out: Some("0".to_string()),
         provider_ref: None,
         request: json!({
             "order_id": order.id,
@@ -1842,7 +1831,6 @@ pub(super) fn refund_planned_step(spec: RefundPlannedStepSpec) -> OrderExecution
         input_asset: spec.input_asset,
         output_asset: spec.output_asset,
         amount_in: spec.amount_in,
-        min_amount_out: spec.min_amount_out,
         tx_hash: None,
         provider_ref: spec.provider_ref,
         idempotency_key: None,
@@ -1893,12 +1881,6 @@ pub(super) fn refund_execution_leg_from_quote_legs(
         .reduce(|first, next| if first == next { first } else { "multi" })
         .unwrap_or("unknown")
         .to_string();
-    let min_amount_out = last
-        .raw
-        .get("min_amount_out")
-        .and_then(Value::as_str)
-        .map(ToString::to_string);
-
     Ok(OrderExecutionLeg {
         id: Uuid::now_v7(),
         order_id: order.id,
@@ -1911,8 +1893,7 @@ pub(super) fn refund_execution_leg_from_quote_legs(
         input_asset,
         output_asset,
         amount_in: first.amount_in.clone(),
-        expected_amount_out: last.amount_out.clone(),
-        min_amount_out,
+        estimated_amount_out: last.amount_out.clone(),
         actual_amount_in: None,
         actual_amount_out: None,
         started_at: None,
@@ -2156,6 +2137,5 @@ pub(super) fn decimal_string_to_raw_digits(value: &str, decimals: u8) -> Result<
 // Refund-side stale quote refresh is intentionally not implemented. Scar §7
 // preserves the legacy rule that RefundRecovery attempts never stale-refresh:
 // partial-execution funds may be mid-flight during a refund, so re-quoting is
-// unsafe. A stale refund quote routes to RefundManualInterventionRequired via
-// the existing classify_step_failure path, matching
-// bin/router-server/src/services/order_executor.rs.
+// unsafe. A stale refund quote routes to refund-required via the existing
+// classify_step_failure path.

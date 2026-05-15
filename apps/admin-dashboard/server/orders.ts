@@ -18,7 +18,6 @@ export type OrderExecutionStep = {
   input?: AssetRef
   output?: AssetRef
   amountIn?: string
-  minAmountOut?: string
   txHash?: string
   providerRef?: string
   startedAt?: string
@@ -55,8 +54,7 @@ export type OrderExecutionLeg = {
   input: AssetRef
   output: AssetRef
   amountIn: string
-  expectedAmountOut: string
-  minAmountOut?: string
+  estimatedAmountOut: string
   actualAmountIn?: string
   actualAmountOut?: string
   startedAt?: string
@@ -109,7 +107,6 @@ export type OrderLifecycleFilter =
   | 'firehose'
   | 'in_progress'
   | 'needs_attention'
-  | 'expired'
   | 'refunded'
 
 export type OrderFirehoseRow = {
@@ -124,13 +121,8 @@ export type OrderFirehoseRow = {
   destination: AssetRef
   recipientAddress: string
   refundAddress: string
-  actionTimeoutAt: string
-  orderKind?: string
   quotedInputAmount?: string
-  quotedOutputAmount?: string
-  minAmountOut?: string
-  maxAmountIn?: string
-  slippageBps?: string
+  estimatedOutputAmount?: string
   quoteId?: string
   quoteProviderId?: string
   quoteExpiresAt?: string
@@ -158,8 +150,7 @@ export type LimitOrderStatus = {
     | 'filled'
     | 'completed'
     | 'refunded'
-    | 'manual_intervention'
-    | 'manual_refund'
+    | 'refund_required'
     | 'failed'
     | 'expired'
   label: string
@@ -202,17 +193,12 @@ type OrderFirehoseDbRow = {
   destination_asset_id: string
   recipient_address: string
   refund_address: string
-  action_timeout_at: Date | string
   workflow_trace_id: string | null
   workflow_parent_span_id: string | null
   quote_id: string | null
   quote_provider_id: string | null
-  order_kind: string | null
   quoted_amount_in: string | null
-  quoted_amount_out: string | null
-  min_amount_out: string | null
-  max_amount_in: string | null
-  slippage_bps: string | number | null
+  estimated_amount_out: string | null
   quote_expires_at: Date | string | null
   provider_quote: unknown
   quote_usd_valuation: unknown
@@ -278,8 +264,7 @@ const COMPLETED_ORDERS_FOR_ANALYTICS_SQL = `
           'input', jsonb_build_object('chainId', l.input_chain_id, 'assetId', l.input_asset_id),
           'output', jsonb_build_object('chainId', l.output_chain_id, 'assetId', l.output_asset_id),
           'amountIn', l.amount_in,
-          'expectedAmountOut', l.expected_amount_out,
-          'minAmountOut', l.min_amount_out,
+          'estimatedAmountOut', l.estimated_amount_out,
           'actualAmountIn', l.actual_amount_in,
           'actualAmountOut', l.actual_amount_out,
           'startedAt', l.started_at,
@@ -389,20 +374,12 @@ SELECT
   ro.destination_asset_id,
   ro.recipient_address,
   ro.refund_address,
-  ro.action_timeout_at,
   ro.workflow_trace_id,
   ro.workflow_parent_span_id,
   COALESCE(moq.id, loq.id)::text AS quote_id,
   COALESCE(moq.provider_id, loq.provider_id) AS quote_provider_id,
-  CASE
-    WHEN ro.order_type = 'limit_order' THEN 'limit'
-    ELSE COALESCE(moa.order_kind, moq.order_kind)
-  END AS order_kind,
   COALESCE(moa.amount_in, moq.amount_in, loa.input_amount, loq.input_amount) AS quoted_amount_in,
-  COALESCE(moa.amount_out, moq.amount_out, loa.output_amount, loq.output_amount) AS quoted_amount_out,
-  COALESCE(moa.min_amount_out, moq.min_amount_out) AS min_amount_out,
-  COALESCE(moa.max_amount_in, moq.max_amount_in) AS max_amount_in,
-  COALESCE(moa.slippage_bps, moq.slippage_bps) AS slippage_bps,
+  COALESCE(moq.estimated_amount_out, loa.output_amount, loq.output_amount) AS estimated_amount_out,
   COALESCE(moq.expires_at, loq.expires_at) AS quote_expires_at,
   COALESCE(moq.provider_quote, loq.provider_quote) AS provider_quote,
   COALESCE(moq.usd_valuation_json, loq.usd_valuation_json, '{}'::jsonb) AS quote_usd_valuation,
@@ -438,8 +415,7 @@ LEFT JOIN LATERAL (
         'input', jsonb_build_object('chainId', l.input_chain_id, 'assetId', l.input_asset_id),
         'output', jsonb_build_object('chainId', l.output_chain_id, 'assetId', l.output_asset_id),
         'amountIn', l.amount_in,
-        'expectedAmountOut', l.expected_amount_out,
-        'minAmountOut', l.min_amount_out,
+        'estimatedAmountOut', l.estimated_amount_out,
         'actualAmountIn', l.actual_amount_in,
         'actualAmountOut', l.actual_amount_out,
         'startedAt', l.started_at,
@@ -555,20 +531,12 @@ SELECT
   ro.destination_asset_id,
   ro.recipient_address,
   ro.refund_address,
-  ro.action_timeout_at,
   ro.workflow_trace_id,
   ro.workflow_parent_span_id,
   COALESCE(moq.id, loq.id)::text AS quote_id,
   COALESCE(moq.provider_id, loq.provider_id) AS quote_provider_id,
-  CASE
-    WHEN ro.order_type = 'limit_order' THEN 'limit'
-    ELSE COALESCE(moa.order_kind, moq.order_kind)
-  END AS order_kind,
   COALESCE(moa.amount_in, moq.amount_in, loa.input_amount, loq.input_amount) AS quoted_amount_in,
-  COALESCE(moa.amount_out, moq.amount_out, loa.output_amount, loq.output_amount) AS quoted_amount_out,
-  COALESCE(moa.min_amount_out, moq.min_amount_out) AS min_amount_out,
-  COALESCE(moa.max_amount_in, moq.max_amount_in) AS max_amount_in,
-  COALESCE(moa.slippage_bps, moq.slippage_bps) AS slippage_bps,
+  COALESCE(moq.estimated_amount_out, loa.output_amount, loq.output_amount) AS estimated_amount_out,
   COALESCE(moq.expires_at, loq.expires_at) AS quote_expires_at,
   COALESCE(moq.provider_quote, loq.provider_quote) AS provider_quote,
   COALESCE(moq.usd_valuation_json, loq.usd_valuation_json, '{}'::jsonb) AS quote_usd_valuation,
@@ -604,8 +572,7 @@ LEFT JOIN LATERAL (
         'input', jsonb_build_object('chainId', l.input_chain_id, 'assetId', l.input_asset_id),
         'output', jsonb_build_object('chainId', l.output_chain_id, 'assetId', l.output_asset_id),
         'amountIn', l.amount_in,
-        'expectedAmountOut', l.expected_amount_out,
-        'minAmountOut', l.min_amount_out,
+        'estimatedAmountOut', l.estimated_amount_out,
         'actualAmountIn', l.actual_amount_in,
         'actualAmountOut', l.actual_amount_out,
         'startedAt', l.started_at,
@@ -640,7 +607,6 @@ LEFT JOIN LATERAL (
         ELSE jsonb_build_object('chainId', s.output_chain_id, 'assetId', s.output_asset_id)
       END,
       'amountIn', s.amount_in,
-      'minAmountOut', s.min_amount_out,
       'txHash', COALESCE(s.tx_hash, funding_vault.funding_tx_hash),
       'providerRef', s.provider_ref,
       'startedAt', s.started_at,
@@ -922,9 +888,7 @@ function orderLifecycleSqlPredicate(
       ro.status NOT IN (
         'completed',
         'refunded',
-        'expired',
-        'manual_intervention_required',
-        'refund_manual_intervention_required'
+        'refund_required'
       )
       AND EXISTS (
         SELECT 1
@@ -939,15 +903,9 @@ function orderLifecycleSqlPredicate(
   }
   if (lifecycleFilter === 'needs_attention') {
     return `
-      ro.status IN (
-        'refund_required',
-        'refunding',
-        'manual_intervention_required',
-        'refund_manual_intervention_required'
-      )
+      ro.status = 'refund_required'
     `
   }
-  if (lifecycleFilter === 'expired') return `ro.status = 'expired'`
   if (lifecycleFilter === 'refunded') return `ro.status = 'refunded'`
   return assertNeverOrderLifecycleFilter(lifecycleFilter)
 }
@@ -975,10 +933,7 @@ export async function fetchOrderMetrics(pool: Pool): Promise<OrderMetrics> {
       )::text AS active,
       COUNT(*) FILTER (
         WHERE status IN (
-          'refund_required',
-          'refunding',
-          'manual_intervention_required',
-          'refund_manual_intervention_required'
+          'refund_required'
         )
       )::text AS needs_attention
     FROM public.router_orders
@@ -1147,16 +1102,8 @@ function mapOrderRow(
     },
     recipientAddress: row.recipient_address,
     refundAddress: row.refund_address,
-    actionTimeoutAt: toIso(row.action_timeout_at),
-    orderKind: row.order_kind ?? undefined,
     quotedInputAmount: row.quoted_amount_in ?? undefined,
-    quotedOutputAmount: row.quoted_amount_out ?? undefined,
-    minAmountOut: row.min_amount_out ?? undefined,
-    maxAmountIn: row.max_amount_in ?? undefined,
-    slippageBps:
-      row.slippage_bps === null || row.slippage_bps === undefined
-        ? undefined
-        : String(row.slippage_bps),
+    estimatedOutputAmount: row.estimated_amount_out ?? undefined,
     quoteId: row.quote_id ?? undefined,
     quoteProviderId: row.quote_provider_id ?? undefined,
     quoteExpiresAt: row.quote_expires_at
@@ -1168,9 +1115,7 @@ function mapOrderRow(
         ? row.quote_usd_valuation ?? undefined
         : summarizeUsdValuationForList(row.quote_usd_valuation, [
             'input',
-            'output',
-            'minOutput',
-            'maxInput'
+            'output'
           ]),
     workflowTraceId: row.workflow_trace_id ?? undefined,
     workflowParentSpanId: row.workflow_parent_span_id ?? undefined,
@@ -1206,8 +1151,7 @@ function summarizeExecutionLegsForList(
       input: leg.input,
       output: leg.output,
       amountIn: leg.amountIn,
-      expectedAmountOut: leg.expectedAmountOut,
-      minAmountOut: leg.minAmountOut,
+      estimatedAmountOut: leg.estimatedAmountOut,
       actualAmountIn: leg.actualAmountIn,
       actualAmountOut: leg.actualAmountOut,
       startedAt: leg.startedAt,
@@ -1219,8 +1163,7 @@ function summarizeExecutionLegsForList(
         'actualInput',
         'actualOutput',
         'plannedInput',
-        'plannedOutput',
-        'plannedMinOutput'
+        'plannedOutput'
       ])
     }))
 }
@@ -1277,9 +1220,7 @@ export function orderMatchesLifecycleFilter(
       ![
         'completed',
         'refunded',
-        'expired',
-        'manual_intervention_required',
-        'refund_manual_intervention_required'
+        'refund_required'
       ].includes(order.status) &&
       (Boolean(order.fundingTxHash) ||
         order.executionSteps.some(
@@ -1287,14 +1228,8 @@ export function orderMatchesLifecycleFilter(
         ))
     )
   }
-  if (filter === 'expired') return order.status === 'expired'
   if (filter === 'refunded') return order.status === 'refunded'
-  return [
-    'refund_required',
-    'refunding',
-    'manual_intervention_required',
-    'refund_manual_intervention_required'
-  ].includes(order.status)
+  return order.status === 'refund_required'
 }
 
 function summarizeLimitOrderStatus(
@@ -1318,36 +1253,11 @@ function summarizeLimitOrderStatus(
       tone: 'neutral'
     }
   }
-  if (
-    orderStatus === 'manual_intervention_required' ||
-    orderStatus === 'refund_manual_intervention_required'
-  ) {
-    return {
-      phase:
-        orderStatus === 'refund_manual_intervention_required'
-          ? 'manual_refund'
-          : 'manual_intervention',
-      label:
-        orderStatus === 'refund_manual_intervention_required'
-          ? 'Manual Refund'
-          : 'Manual Intervention',
-      detail: 'Operator action required',
-      tone: 'danger'
-    }
-  }
   if (orderStatus === 'refund_required') {
     return {
-      phase: 'manual_intervention',
+      phase: 'refund_required',
       label: 'Refund Required',
       detail: 'Execution did not finish cleanly',
-      tone: 'danger'
-    }
-  }
-  if (orderStatus === 'expired') {
-    return {
-      phase: 'expired',
-      label: 'Expired',
-      detail: 'Order deadline passed',
       tone: 'danger'
     }
   }
@@ -1658,8 +1568,7 @@ function isFailedStatus(status: string): boolean {
     status === 'failed' ||
     status === 'expired' ||
     status === 'cancelled' ||
-    status === 'manual_intervention_required' ||
-    status === 'refund_manual_intervention_required'
+    status === 'refund_required'
   )
 }
 

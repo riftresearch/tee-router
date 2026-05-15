@@ -1210,9 +1210,7 @@ async fn submit_exact_in_quote(
             "from_asset": route_case.from.to_json(),
             "to_asset": route_case.to.to_json(),
             "recipient_address": recipient_address_for(route_case.to),
-            "kind": "exact_in",
-            "amount_in": route_case.amount_in,
-            "slippage_bps": 100
+            "amount_in": route_case.amount_in
         }))
         .send()
         .await
@@ -1340,11 +1338,8 @@ fn is_terminal_order_status(status: RouterOrderStatus) -> bool {
     matches!(
         status,
         RouterOrderStatus::Completed
-            | RouterOrderStatus::Expired
             | RouterOrderStatus::RefundRequired
             | RouterOrderStatus::Refunded
-            | RouterOrderStatus::ManualInterventionRequired
-            | RouterOrderStatus::RefundManualInterventionRequired
     )
 }
 

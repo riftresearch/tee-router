@@ -804,11 +804,11 @@ impl VaultManager {
                 warn!(vault_id = %vault.id, error = %message, "Router-server refund attempt did not complete");
                 telemetry::record_refund_failure(&vault, "chain_error", refund_started.elapsed());
                 let failed_at = Utc::now();
-                if refund_error_requires_manual_intervention(&message) {
+                if refund_error_requires_admin_resolution(&message) {
                     match self
                         .db
                         .vaults()
-                        .mark_refund_manual_intervention_required(
+                        .mark_refund_required(
                             vault.id,
                             failed_at,
                             &message,
@@ -830,7 +830,7 @@ impl VaultManager {
                                 vault_id = %vault.id,
                                 worker_id = %self.worker_id,
                                 claimed_until = %claimed_until,
-                                "Refund manual-intervention transition lost its processing lease; leaving current refund owner to finish it"
+                                "Refund-required transition lost its processing lease; leaving current refund owner to finish it"
                             );
                             return Ok(vault);
                         }
@@ -1173,20 +1173,7 @@ impl VaultManager {
 
         match &vault.action {
             VaultAction::Null => Ok(U256::from(1)),
-            VaultAction::MarketOrder(action) => match &action.order_kind {
-                router_core::models::MarketOrderKind::ExactIn { amount_in, .. } => {
-                    parse_positive_u256("amount_in", amount_in)
-                }
-                router_core::models::MarketOrderKind::ExactOut { max_amount_in, .. } => {
-                    let Some(max_amount_in) = max_amount_in.as_deref() else {
-                        return Err(VaultError::InvalidOrderBinding {
-                            reason: "exact-out market order funding requires max_amount_in"
-                                .to_string(),
-                        });
-                    };
-                    parse_positive_u256("max_amount_in", max_amount_in)
-                }
-            },
+            VaultAction::MarketOrder(action) => parse_positive_u256("amount_in", &action.amount_in),
             VaultAction::LimitOrder(action) => {
                 parse_positive_u256("limit_order.input_amount", &action.input_amount)
             }
@@ -1358,19 +1345,11 @@ impl VaultManager {
             DepositVaultStatus::Refunded => Err(VaultError::RefundNotAllowed {
                 reason: "refunded vaults cannot be cancelled".to_string(),
             }),
-            DepositVaultStatus::ManualInterventionRequired => Err(VaultError::RefundNotAllowed {
-                reason: "manual-intervention vaults cannot be cancelled".to_string(),
-            }),
-            DepositVaultStatus::RefundManualInterventionRequired => {
-                Err(VaultError::RefundNotAllowed {
-                    reason: "manual-refund vaults cannot be cancelled".to_string(),
-                })
-            }
         }
     }
 }
 
-fn refund_error_requires_manual_intervention(message: &str) -> bool {
+fn refund_error_requires_admin_resolution(message: &str) -> bool {
     message.contains("Observed bitcoin outpoint")
         && (message.contains(" is not spendable")
             || message.contains(" did not match expected ")

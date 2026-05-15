@@ -1,7 +1,6 @@
 import {
   assetIdentifierFromInternal,
   formatPositiveAmount,
-  formatSlippage,
   type AmountFormat
 } from './assets'
 import { GatewayValidationError } from './errors'
@@ -18,11 +17,7 @@ export type PublicQuoteResponse = {
   from: string
   to: string
   expiry: string
-  expectedOut: string
-  expectedSlippage?: string
-  minOut?: string
-  maxIn?: string
-  maxSlippage?: string
+  estimatedOut: string
   fees?: PublicQuoteFee[]
   amountFormat: AmountFormat
 }
@@ -51,7 +46,7 @@ export type PublicLimitOrderResponse = {
   to: string
   status: string
   expiry: string
-  minOut: string
+  outputAmount: string
   amountFormat: AmountFormat
   cancellationSecret?: string
 }
@@ -71,7 +66,7 @@ export function presentOrderEnvelope(
   const source = assetIdentifierFromInternal(quote.source_asset)
   const amountToSendRaw =
     envelope.quote.type === 'market_order'
-      ? envelope.quote.payload.max_amount_in ?? envelope.quote.payload.amount_in
+      ? envelope.quote.payload.amount_in
       : envelope.quote.payload.input_amount
   const orderAddress = envelope.funding_vault?.vault.deposit_vault_address
 
@@ -84,7 +79,7 @@ export function presentOrderEnvelope(
     orderId: envelope.order.id,
     orderAddress,
     amountToSend: formatPositiveAmount(amountToSendRaw, source, amountFormat),
-    status: envelope.order.status
+    status: presentOrderStatus(envelope.order.status)
   }
 }
 
@@ -119,9 +114,9 @@ export function presentLimitOrderEnvelope(
     quoteId: quote.id,
     from: source.id,
     to: destination.id,
-    status: envelope.order.status,
+    status: presentOrderStatus(envelope.order.status),
     expiry: quote.expires_at,
-    minOut: formatPositiveAmount(quote.output_amount, destination, amountFormat),
+    outputAmount: formatPositiveAmount(quote.output_amount, destination, amountFormat),
     amountFormat,
     ...(envelope.cancellation_secret
       ? { cancellationSecret: envelope.cancellation_secret }
@@ -168,25 +163,14 @@ function presentQuote(
       from: source.id,
       to: destination.id,
       expiry: quote.expires_at,
-      expectedOut: formatPositiveAmount(
+      estimatedOut: formatPositiveAmount(
         quote.output_amount,
         destination,
         amountFormat
       ),
-      maxIn: formatPositiveAmount(quote.input_amount, source, amountFormat),
-      maxSlippage: formatSlippage(0, amountFormat),
       amountFormat
     }
   }
-
-  const minOut =
-    quote.min_amount_out === null || quote.min_amount_out === undefined
-      ? undefined
-      : formatPositiveAmount(quote.min_amount_out, destination, amountFormat)
-  const maxIn =
-    quote.max_amount_in === null || quote.max_amount_in === undefined
-      ? undefined
-      : formatPositiveAmount(quote.max_amount_in, source, amountFormat)
 
   return {
     quoteId: quote.id,
@@ -194,15 +178,21 @@ function presentQuote(
     from: source.id,
     to: destination.id,
     expiry: quote.expires_at,
-    expectedOut: formatPositiveAmount(quote.amount_out, destination, amountFormat),
-    ...(minOut === undefined ? {} : { minOut }),
-    ...(maxIn === undefined ? {} : { maxIn }),
-    ...(quote.slippage_bps === null || quote.slippage_bps === undefined
-      ? {}
-      : { maxSlippage: formatSlippage(quote.slippage_bps, amountFormat) }),
+    estimatedOut: formatPositiveAmount(
+      quote.estimated_amount_out,
+      destination,
+      amountFormat
+    ),
     ...quoteFees(quote.provider_quote, amountFormat),
     amountFormat
   }
+}
+
+function presentOrderStatus(status: string): string {
+  if (status === 'refund_required' || status === 'refunding') {
+    return 'refund_pending'
+  }
+  return status
 }
 
 function quoteFees(

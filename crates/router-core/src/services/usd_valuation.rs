@@ -50,30 +50,8 @@ pub fn quote_usd_valuation(
         asset_registry,
         pricing,
         &quote.destination_asset,
-        &quote.amount_out,
+        &quote.estimated_amount_out,
     );
-    if let Some(min_amount_out) = &quote.min_amount_out {
-        insert_amount(
-            &mut amounts,
-            &mut errors,
-            "minOutput",
-            asset_registry,
-            pricing,
-            &quote.destination_asset,
-            min_amount_out,
-        );
-    }
-    if let Some(max_amount_in) = &quote.max_amount_in {
-        insert_amount(
-            &mut amounts,
-            &mut errors,
-            "maxInput",
-            asset_registry,
-            pricing,
-            &quote.source_asset,
-            max_amount_in,
-        );
-    }
 
     json!({
         "schemaVersion": USD_VALUATION_SCHEMA_VERSION,
@@ -148,17 +126,6 @@ pub fn execution_step_usd_valuation(
             amount,
         );
     }
-    if let (Some(asset), Some(amount)) = (&step.output_asset, &step.min_amount_out) {
-        insert_amount(
-            &mut amounts,
-            &mut errors,
-            "plannedMinOutput",
-            asset_registry,
-            pricing,
-            asset,
-            amount,
-        );
-    }
     if let Some(response) = response {
         insert_observed_amounts(&mut amounts, &mut errors, asset_registry, pricing, response);
     }
@@ -200,18 +167,7 @@ pub fn execution_leg_usd_valuation(
         asset_registry,
         pricing,
         &leg.output_asset,
-        &leg.expected_amount_out,
-    );
-    insert_amount(
-        &mut amounts,
-        &mut errors,
-        "plannedMinOutput",
-        asset_registry,
-        pricing,
-        &leg.output_asset,
-        leg.min_amount_out
-            .as_deref()
-            .unwrap_or(&leg.expected_amount_out),
+        &leg.estimated_amount_out,
     );
     if let Some(actual_amount_in) = &leg.actual_amount_in {
         insert_amount(
@@ -272,10 +228,7 @@ pub fn execution_leg_actual_usd_valuation(
 
     if amounts.get("actualOutput").is_none() {
         if let Some(actual_amount_out) = actual_amount_out {
-            let planned_output = amounts
-                .get("plannedOutput")
-                .or_else(|| amounts.get("plannedMinOutput"));
-            if let Some(actual_output) = planned_output.and_then(|planned_output| {
+            if let Some(actual_output) = amounts.get("plannedOutput").and_then(|planned_output| {
                 actual_amount_from_planned(actual_amount_out, output_asset, planned_output)
             }) {
                 amounts.insert("actualOutput".to_string(), actual_output);
@@ -626,7 +579,7 @@ mod tests {
     use super::*;
     use crate::{
         models::{
-            LimitOrderResidualPolicy, MarketOrderKindType, OrderExecutionLeg, OrderExecutionStep,
+            LimitOrderResidualPolicy, OrderExecutionLeg, OrderExecutionStep,
             OrderExecutionStepStatus, OrderExecutionStepType,
         },
         services::pricing::{PricingSnapshot, USD_MICRO},
@@ -712,12 +665,8 @@ mod tests {
             },
             recipient_address: "bcrt1qrecipient".to_string(),
             provider_id: "hyperliquid".to_string(),
-            order_kind: MarketOrderKindType::ExactIn,
             amount_in: "100000000".to_string(),
-            amount_out: "100000".to_string(),
-            min_amount_out: Some("99000".to_string()),
-            max_amount_in: None,
-            slippage_bps: Some(100),
+            estimated_amount_out: "100000".to_string(),
             provider_quote: json!({ "legs": [{ "not": "a quote leg" }] }),
             usd_valuation: empty_usd_valuation(),
             expires_at: Utc::now(),
@@ -752,7 +701,6 @@ mod tests {
             input_asset: None,
             output_asset: None,
             amount_in: None,
-            min_amount_out: None,
             tx_hash: None,
             provider_ref: None,
             idempotency_key: None,
@@ -818,8 +766,7 @@ mod tests {
                 asset: AssetId::Native,
             },
             amount_in: "100000000".to_string(),
-            expected_amount_out: "100000".to_string(),
-            min_amount_out: Some("99000".to_string()),
+            estimated_amount_out: "100000".to_string(),
             actual_amount_in: Some("100000000".to_string()),
             actual_amount_out: Some("100000".to_string()),
             started_at: Some(now),
@@ -939,8 +886,7 @@ mod tests {
             "schemaVersion": 1,
             "amounts": {
                 "plannedInput": planned_input,
-                "plannedOutput": planned_output,
-                "plannedMinOutput": planned_output
+                "plannedOutput": planned_output
             },
             "legs": []
         });
@@ -960,10 +906,6 @@ mod tests {
         assert_eq!(
             merged["amounts"]["plannedOutput"],
             valuation["amounts"]["plannedOutput"]
-        );
-        assert_eq!(
-            merged["amounts"]["plannedMinOutput"],
-            valuation["amounts"]["plannedMinOutput"]
         );
         assert!(merged["amounts"]["actualInput"].is_object());
         assert!(merged["amounts"]["actualOutput"].is_object());
@@ -1019,7 +961,6 @@ mod tests {
                 asset: AssetId::Native,
             }),
             amount_in: Some("100000000".to_string()),
-            min_amount_out: Some("99000".to_string()),
             tx_hash: None,
             provider_ref: None,
             idempotency_key: None,
@@ -1066,7 +1007,6 @@ mod tests {
         );
 
         assert_eq!(valuation["amounts"]["plannedInput"]["canonical"], "usdc");
-        assert_eq!(valuation["amounts"]["plannedMinOutput"]["canonical"], "btc");
         assert_eq!(
             valuation["amounts"]["actualInput"]["amountUsdMicro"],
             "100000000"

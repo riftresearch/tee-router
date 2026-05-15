@@ -11,8 +11,6 @@ const MAX_INTERNAL_ADDRESS_LENGTH = 128
 const MAX_INTERNAL_AMOUNT_LENGTH = 96
 const MAX_INTERNAL_DATETIME_LENGTH = 64
 const MAX_INTERNAL_SECRET_LENGTH = 512
-const MAX_UINT256 =
-  115792089237316195423570985008687907853269984665640564039457584007913129639935n
 const INTEGER_STRING_PATTERN = /^[0-9]+$/
 
 export type FetchLike = (
@@ -64,12 +62,8 @@ export type InternalMarketOrderQuote = {
   destination_asset: InternalDepositAsset
   recipient_address: string
   provider_id: string
-  order_kind: 'exact_in' | 'exact_out'
   amount_in: string
-  amount_out: string
-  min_amount_out?: string | null
-  max_amount_in?: string | null
-  slippage_bps?: number | null
+  estimated_amount_out: string
   provider_quote?: unknown
   expires_at: string
   created_at: string
@@ -91,23 +85,13 @@ export type InternalLimitOrderQuote = {
 }
 
 export type CreateQuoteRequest =
-  | ({
+  | {
       type: 'market_order'
       from_asset: InternalDepositAsset
       to_asset: InternalDepositAsset
       recipient_address: string
-    } & (
-      | {
-          kind: 'exact_in'
-          amount_in: string
-          slippage_bps?: number
-        }
-      | {
-          kind: 'exact_out'
-          amount_out: string
-          slippage_bps?: number
-        }
-    ))
+      amount_in: string
+    }
   | {
       type: 'limit_order'
       from_asset: InternalDepositAsset
@@ -307,9 +291,6 @@ function isMarketQuote(
 ): value is InternalMarketOrderQuote {
   if (!isObject(value)) return false
   const amount = options.strictAmounts ? isRawUint256String : isBoundedAmountString
-  const optionalAmount = options.strictAmounts
-    ? optionalRawUint256String
-    : optionalBoundedAmountString
   return (
     isBoundedString(value.id, MAX_INTERNAL_ID_LENGTH) &&
     optionalBoundedString(value.order_id, MAX_INTERNAL_ID_LENGTH) &&
@@ -317,12 +298,8 @@ function isMarketQuote(
     isDepositAsset(value.destination_asset) &&
     isBoundedString(value.recipient_address, MAX_INTERNAL_ADDRESS_LENGTH) &&
     isBoundedString(value.provider_id, MAX_INTERNAL_PROVIDER_ID_LENGTH) &&
-    (value.order_kind === 'exact_in' || value.order_kind === 'exact_out') &&
     amount(value.amount_in) &&
-    amount(value.amount_out) &&
-    optionalAmount(value.min_amount_out) &&
-    optionalAmount(value.max_amount_in) &&
-    optionalSlippageBps(value.slippage_bps) &&
+    amount(value.estimated_amount_out) &&
     isBoundedString(value.expires_at, MAX_INTERNAL_DATETIME_LENGTH) &&
     isBoundedString(value.created_at, MAX_INTERNAL_DATETIME_LENGTH)
   )
@@ -376,25 +353,7 @@ function optionalBoundedAmountString(value: unknown): boolean {
 function isRawUint256String(value: unknown): value is string {
   if (!isBoundedAmountString(value)) return false
   if (!INTEGER_STRING_PATTERN.test(value)) return false
-  const raw = BigInt(value)
-  return raw > 0n && raw <= MAX_UINT256
-}
-
-function optionalRawUint256String(value: unknown): boolean {
-  return value === undefined || value === null || isRawUint256String(value)
-}
-
-function isSlippageBps(value: unknown): value is number {
-  return (
-    typeof value === 'number' &&
-    Number.isSafeInteger(value) &&
-    value >= 0 &&
-    value <= 10_000
-  )
-}
-
-function optionalSlippageBps(value: unknown): boolean {
-  return value === undefined || value === null || isSlippageBps(value)
+  return BigInt(value) > 0n
 }
 
 async function readResponseBody(response: Response): Promise<unknown> {

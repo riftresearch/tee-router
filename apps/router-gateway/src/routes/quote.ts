@@ -1,132 +1,124 @@
-import { createRoute, z } from "@hono/zod-openapi";
+import { createRoute, z } from '@hono/zod-openapi'
 
 import {
   assertAddressMatchesChain,
   parseAmount,
-  parseSlippageBps,
   resolveAssetIdentifier,
-  type AmountFormat,
-} from "../assets";
-import type { GatewayConfig } from "../config";
-import { normalizeError } from "../errors";
-import { presentQuoteEnvelope } from "../presenters";
-import { routerClientFor, type GatewayDeps } from "./deps";
+  type AmountFormat
+} from '../assets'
+import type { GatewayConfig } from '../config'
+import { normalizeError } from '../errors'
+import { presentQuoteEnvelope } from '../presenters'
+import { routerClientFor, type GatewayDeps } from './deps'
 import {
   AmountFormatSchema,
   AddressSchema,
   AmountStringSchema,
   AssetIdentifierSchema,
   ErrorResponses,
-  QuoteResponseSchema,
-  SlippageStringSchema,
-} from "./schemas";
+  QuoteResponseSchema
+} from './schemas'
 
 export const QuoteRequestSchema = z
   .object({
     from: AssetIdentifierSchema.openapi({
-      example: "Bitcoin.BTC",
+      example: 'Bitcoin.BTC'
     }),
     to: AssetIdentifierSchema.openapi({
-      example: "Ethereum.USDC",
+      example: 'Ethereum.USDC'
     }),
     amountFormat: AmountFormatSchema.optional(),
     toAddress: AddressSchema.openapi({
       description:
-        "Current Rust router quote bridge field. The upstream router requires a recipient address at quote time.",
-      example: "0x1111111111111111111111111111111111111111",
+        'Current Rust router quote bridge field. The upstream router requires a recipient address at quote time.',
+      example: '0x1111111111111111111111111111111111111111'
     }),
     orderType: z
-      .enum(["market_order", "market", "limit_order", "limit"])
+      .enum([
+        'market_order',
+        'market',
+        // Limit orders are temporarily disabled at the gateway.
+        // 'limit_order',
+        // 'limit'
+      ])
       .optional()
       .openapi({
-        description: "Order type. Defaults to market_order.",
-        example: "market_order",
+        description: 'Order type. Defaults to market_order.',
+        example: 'market_order'
       }),
     fromAmount: AmountStringSchema.optional().openapi({
-      example: "10",
-    }),
-    toAmount: AmountStringSchema.optional().openapi({
-      example: "100000",
-    }),
-    maxSlippage: SlippageStringSchema.optional().openapi({
-      example: "1.5",
-    }),
+      example: '10'
+    })
   })
   .strict()
   .superRefine((value, ctx) => {
-    const orderType = normalizeOrderType(value.orderType);
-    const amountFields = [value.fromAmount, value.toAmount].filter(
-      (amount) => amount !== undefined,
-    );
-    if (orderType === "market_order" && amountFields.length !== 1) {
+    const orderType = normalizeOrderType(value.orderType)
+    if (orderType === 'market_order' && value.fromAmount === undefined) {
       ctx.addIssue({
-        code: "custom",
-        message: "exactly one of fromAmount or toAmount is required",
-        path: ["fromAmount"],
-      });
+        code: 'custom',
+        message: 'fromAmount is required',
+        path: ['fromAmount']
+      })
     }
-    if (
-      orderType === "limit_order" &&
-      (value.fromAmount === undefined || value.toAmount === undefined)
-    ) {
+    if (orderType === 'limit_order' && value.fromAmount === undefined) {
       ctx.addIssue({
-        code: "custom",
-        message: "fromAmount and toAmount are required for limit orders",
-        path: ["fromAmount"],
-      });
+        code: 'custom',
+        message: 'fromAmount is required',
+        path: ['fromAmount']
+      })
     }
   })
-  .openapi("QuoteRequest");
+  .openapi('QuoteRequest')
 
 export const quoteRoute = createRoute({
-  method: "post",
-  path: "/quote",
-  tags: ["Quotes"],
-  summary: "Get a quote",
+  method: 'post',
+  path: '/quote',
+  tags: ['Quotes'],
+  summary: 'Create a quote for a market order',
   request: {
     body: {
       required: true,
       content: {
-        "application/json": {
-          schema: QuoteRequestSchema,
-        },
-      },
-    },
+        'application/json': {
+          schema: QuoteRequestSchema
+        }
+      }
+    }
   },
   responses: {
     201: {
-      description: "Quote created by the internal router API.",
+      description: 'Market quote created by the internal router API.',
       content: {
-        "application/json": {
-          schema: QuoteResponseSchema,
-        },
-      },
+        'application/json': {
+          schema: QuoteResponseSchema
+        }
+      }
     },
-    ...ErrorResponses,
-  },
-});
+    ...ErrorResponses
+  }
+})
 
 export function createQuoteHandler(
   config: GatewayConfig,
-  deps: GatewayDeps = {},
+  deps: GatewayDeps = {}
 ) {
   return async (c: any) => {
     try {
-      const request = c.req.valid("json");
-      const amountFormat: AmountFormat = request.amountFormat ?? "readable";
-      const source = resolveAssetIdentifier(request.from);
-      const destination = resolveAssetIdentifier(request.to);
-      const orderType = normalizeOrderType(request.orderType);
+      const request = c.req.valid('json')
+      const amountFormat: AmountFormat = request.amountFormat ?? 'readable'
+      const source = resolveAssetIdentifier(request.from)
+      const destination = resolveAssetIdentifier(request.to)
+      const orderType = normalizeOrderType(request.orderType)
       assertAddressMatchesChain(
         destination.internal.chain,
         request.toAddress,
-        "toAddress",
-        { bitcoinAddressNetworks: config.bitcoinAddressNetworks },
-      );
+        'toAddress',
+        { bitcoinAddressNetworks: config.bitcoinAddressNetworks }
+      )
 
-      if (orderType === "limit_order") {
+      if (orderType === 'limit_order') {
         const envelope = await routerClientFor(config, deps).createQuote({
-          type: "limit_order",
+          type: 'limit_order',
           from_asset: source.internal,
           to_asset: destination.internal,
           recipient_address: request.toAddress,
@@ -134,69 +126,41 @@ export function createQuoteHandler(
             request.fromAmount as string,
             source,
             amountFormat,
-            "fromAmount",
+            'fromAmount'
           ),
           output_amount: parseAmount(
-            request.toAmount as string,
+            request.fromAmount as string,
             destination,
             amountFormat,
-            "toAmount",
-          ),
-        });
+            'fromAmount'
+          )
+        })
 
-        return c.json(presentQuoteEnvelope(envelope, amountFormat), 201);
+        return c.json(presentQuoteEnvelope(envelope, amountFormat), 201)
       }
 
-      const slippageBps =
-        request.maxSlippage === undefined
-          ? undefined
-          : parseSlippageBps(request.maxSlippage, amountFormat);
-      const orderKind =
-        request.fromAmount !== undefined
-          ? {
-              kind: "exact_in" as const,
-              amount_in: parseAmount(
-                request.fromAmount,
-                source,
-                amountFormat,
-                "fromAmount",
-              ),
-              ...(slippageBps === undefined
-                ? {}
-                : { slippage_bps: slippageBps }),
-            }
-          : {
-              kind: "exact_out" as const,
-              amount_out: parseAmount(
-                request.toAmount as string,
-                destination,
-                amountFormat,
-                "toAmount",
-              ),
-              ...(slippageBps === undefined
-                ? {}
-                : { slippage_bps: slippageBps }),
-            };
-
       const envelope = await routerClientFor(config, deps).createQuote({
-        type: "market_order",
+        type: 'market_order',
         from_asset: source.internal,
         to_asset: destination.internal,
         recipient_address: request.toAddress,
-        ...orderKind,
-      });
+        amount_in: parseAmount(
+          request.fromAmount as string,
+          source,
+          amountFormat,
+          'fromAmount'
+        )
+      })
 
-      return c.json(presentQuoteEnvelope(envelope, amountFormat), 201);
+      return c.json(presentQuoteEnvelope(envelope, amountFormat), 201)
     } catch (error) {
-      const normalized = normalizeError(error);
-      return c.json(normalized.body, normalized.status);
+      const normalized = normalizeError(error)
+      return c.json(normalized.body, normalized.status)
     }
-  };
+  }
 }
 
-function normalizeOrderType(
-  value: string | undefined,
-): "market_order" | "limit_order" {
-  if (value === "limit" || value === "limit_order") return "limit_order";
-  return "market_order";
+function normalizeOrderType(value: string | undefined): 'market_order' | 'limit_order' {
+  if (value === 'limit' || value === 'limit_order') return 'limit_order'
+  return 'market_order'
 }

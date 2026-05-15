@@ -556,17 +556,6 @@ pub(super) fn provider_operation_has_checkpoint(operation: &OrderProviderOperati
         || json_object_non_empty(&operation.observed_state)
 }
 
-pub(super) fn manual_context_step_rank(status: OrderExecutionStepStatus) -> u8 {
-    match status {
-        OrderExecutionStepStatus::Failed => 5,
-        OrderExecutionStepStatus::Running | OrderExecutionStepStatus::Waiting => 4,
-        OrderExecutionStepStatus::Ready | OrderExecutionStepStatus::Planned => 3,
-        OrderExecutionStepStatus::Completed => 2,
-        OrderExecutionStepStatus::Cancelled | OrderExecutionStepStatus::Skipped => 1,
-        OrderExecutionStepStatus::Superseded => 0,
-    }
-}
-
 pub(super) fn json_object_non_empty(value: &Value) -> bool {
     value.as_object().is_some_and(|object| !object.is_empty())
 }

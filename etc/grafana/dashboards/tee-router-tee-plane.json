@@ -1734,13 +1734,13 @@
             "uid": "victoriametrics"
           },
           "editorMode": "code",
-          "expr": "tee_router_operator_order_status_depth{service=\"router-worker\",status=\"manual_intervention_required\"}",
-          "legendFormat": "manual_intervention_required",
+          "expr": "tee_router_operator_order_status_depth{service=\"router-worker\",status=\"refund_required\"}",
+          "legendFormat": "refund_required",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Manual Intervention Orders",
+      "title": "Refund Required Orders",
       "type": "stat"
     },
     {
@@ -1802,13 +1802,13 @@
             "uid": "victoriametrics"
           },
           "editorMode": "code",
-          "expr": "tee_router_operator_order_status_depth{service=\"router-worker\",status=\"refund_manual_intervention_required\"}",
-          "legendFormat": "refund_manual_intervention_required",
+          "expr": "tee_router_operator_order_status_depth{service=\"router-worker\",status=\"refund_refund_required\"}",
+          "legendFormat": "refund_refund_required",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Refund Manual Intervention Orders",
+      "title": "Refund Refund Required Orders",
       "type": "stat"
     },
     {
@@ -1894,12 +1894,12 @@
             "type": "loki",
             "uid": "loki"
           },
-          "expr": "sum(count_over_time({service_name=~\"tee-router/.+\"} |= \"manual_intervention_required\" [5m]))",
+          "expr": "sum(count_over_time({service_name=~\"tee-router/.+\"} |= \"refund_required\" [5m]))",
           "queryType": "range",
           "refId": "A"
         }
       ],
-      "title": "Manual Intervention Log Events",
+      "title": "Refund Required Log Events",
       "type": "timeseries"
     },
     {
@@ -2985,13 +2985,13 @@
             "uid": "victoriametrics"
           },
           "editorMode": "code",
-          "expr": "tee_router_temporal_worker_manual_intervention_wait_duration_seconds{service=\"temporal-worker\", quantile=\"0.95\"}",
+          "expr": "tee_router_temporal_worker_provider_hint_wait_duration_seconds{service=\"temporal-worker\", quantile=\"0.95\"}",
           "legendFormat": "{{workflow_type}} {{resolution}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Manual Intervention Wait p95",
+      "title": "Provider Hint Wait p95",
       "type": "timeseries"
     },
     {

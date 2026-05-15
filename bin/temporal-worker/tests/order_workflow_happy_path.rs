@@ -25,7 +25,6 @@ use eip3009_erc20_contract::GenericEIP3009ERC20::GenericEIP3009ERC20Instance;
 use router_core::{
     config::Settings,
     db::Database,
-    db::ExecutionAttemptPlan,
     models::{
         CustodyVaultRole, CustodyVaultVisibility, DepositVaultStatus, OrderExecutionAttempt,
         OrderExecutionAttemptKind, OrderExecutionAttemptStatus, OrderExecutionStepStatus,
@@ -43,7 +42,7 @@ use router_core::{
 };
 use router_primitives::ChainType;
 use router_server::{
-    api::{CreateOrderRequest, CreateVaultRequest, MarketOrderQuoteKind, MarketOrderQuoteRequest},
+    api::{CreateOrderRequest, CreateVaultRequest, MarketOrderQuoteRequest},
     services::{order_manager::OrderManager, vault_manager::VaultManager},
 };
 use router_temporal::{CctpReceiveObservedEvidence, VeloraSwapSettledEvidence};
@@ -56,11 +55,10 @@ use temporal_worker::{
         activities::{OrderActivities, OrderActivityDeps},
         build_worker, order_workflow_id, refund_workflow_id,
         types::{
-            AcknowledgeUnrecoverableSignal, HlBridgeDepositCreditedEvidence,
-            HyperUnitDepositCreditedEvidence, HyperUnitWithdrawalSettledEvidence,
-            ManualReleaseSignal, ManualTriggerRefundSignal, OrderTerminalStatus,
-            OrderWorkflowInput, OrderWorkflowOutput, ProviderHintKind, ProviderKind,
-            ProviderOperationHintEvidence, ProviderOperationHintSignal,
+            HlBridgeDepositCreditedEvidence, HyperUnitDepositCreditedEvidence,
+            HyperUnitWithdrawalSettledEvidence, OrderTerminalStatus, OrderWorkflowInput,
+            OrderWorkflowOutput, ProviderHintKind, ProviderKind, ProviderOperationHintEvidence,
+            ProviderOperationHintSignal,
         },
         workflow_start_options,
         workflows::{OrderWorkflow, RefundWorkflow},
@@ -112,19 +110,11 @@ struct WorkflowRun {
 enum WorkflowRoute {
     #[default]
     VeloraBaseEthToBaseUsdc,
-    VeloraBaseEthToBaseUsdcExactOut,
     AcrossBaseEthToEthereumUsdc,
     CctpBaseUsdcToArbitrumEth,
     CctpBaseUsdcToBitcoin,
     HyperliquidArbitrumUsdcToBitcoin,
     UnitBitcoinToBaseEth,
-}
-
-#[derive(Clone, Copy)]
-enum ManualInterventionTestAction {
-    Release,
-    TriggerRefund,
-    AcknowledgeUnrecoverable,
 }
 
 #[derive(Default)]
@@ -141,14 +131,13 @@ struct WorkflowOptions {
     expect_external_custody_velora_refund: bool,
     expect_external_custody_across_then_velora_refund: bool,
     simulate_across_lost_intent_checkpoint: bool,
-    manual_intervention_action: Option<ManualInterventionTestAction>,
 }
 
 fn assert_refund_child_terminal_status(status: OrderTerminalStatus) {
     assert!(
         matches!(
             status,
-            OrderTerminalStatus::Refunded | OrderTerminalStatus::RefundManualInterventionRequired
+            OrderTerminalStatus::Refunded | OrderTerminalStatus::RefundRequired
         ),
         "refund-required workflow paths must exit through the refund child, got {status:?}"
     );
@@ -158,7 +147,7 @@ fn assert_refund_child_order_status(status: RouterOrderStatus) {
     assert!(
         matches!(
             status,
-            RouterOrderStatus::Refunded | RouterOrderStatus::RefundManualInterventionRequired
+            RouterOrderStatus::Refunded | RouterOrderStatus::RefundRequired
         ),
         "refund-required workflow paths must not leave the order refund_required, got {status:?}"
     );
@@ -191,97 +180,6 @@ async fn order_workflow_completes_funded_single_step_order() {
         .await
         .expect("load completed order");
     assert_eq!(completed.status, RouterOrderStatus::Completed);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "integration: spawns devnet stack"]
-async fn order_workflow_manual_intervention_release_resumes_and_completes() {
-    let run = run_order_workflow(WorkflowOptions {
-        manual_intervention_action: Some(ManualInterventionTestAction::Release),
-        ..WorkflowOptions::default()
-    })
-    .await;
-
-    assert_eq!(run.output.terminal_status, OrderTerminalStatus::Completed);
-    let completed = run
-        .db
-        .orders()
-        .get(run.order_id)
-        .await
-        .expect("load completed order after manual release");
-    assert_eq!(completed.status, RouterOrderStatus::Completed);
-    let attempts = run
-        .db
-        .orders()
-        .get_execution_attempts(run.order_id)
-        .await
-        .expect("load attempts after manual release");
-    assert!(
-        attempts.iter().any(|attempt| attempt.attempt_index == 2),
-        "manual release should resume through a retry attempt"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "integration: spawns devnet stack"]
-async fn order_workflow_manual_intervention_trigger_refund_reaches_refunded() {
-    let run = run_order_workflow(WorkflowOptions {
-        manual_intervention_action: Some(ManualInterventionTestAction::TriggerRefund),
-        ..WorkflowOptions::default()
-    })
-    .await;
-
-    assert_eq!(run.output.terminal_status, OrderTerminalStatus::Refunded);
-    let refunded = run
-        .db
-        .orders()
-        .get(run.order_id)
-        .await
-        .expect("load refunded order after manual trigger");
-    assert_eq!(refunded.status, RouterOrderStatus::Refunded);
-    assert!(
-        run.refund_address_balance >= U256::from_str(ORDER_AMOUNT_IN_WEI).expect("amount in wei"),
-        "manual trigger refund should return the funding vault balance"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "integration: spawns devnet stack"]
-async fn order_workflow_manual_intervention_acknowledge_unrecoverable_stays_terminal() {
-    let run = run_order_workflow(WorkflowOptions {
-        manual_intervention_action: Some(ManualInterventionTestAction::AcknowledgeUnrecoverable),
-        ..WorkflowOptions::default()
-    })
-    .await;
-
-    assert_eq!(
-        run.output.terminal_status,
-        OrderTerminalStatus::ManualInterventionRequired
-    );
-    let acknowledged = run
-        .db
-        .orders()
-        .get(run.order_id)
-        .await
-        .expect("load acknowledged manual intervention order");
-    assert_eq!(
-        acknowledged.status,
-        RouterOrderStatus::ManualInterventionRequired
-    );
-    let attempt = run
-        .db
-        .orders()
-        .get_latest_execution_attempt(run.order_id)
-        .await
-        .expect("load latest attempt")
-        .expect("manual intervention attempt");
-    assert!(
-        attempt
-            .failure_reason
-            .get("manual_intervention_terminal_ack")
-            .is_some(),
-        "acknowledge signal should persist terminal acknowledgement"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -896,81 +794,6 @@ async fn order_workflow_refreshes_stale_quote_then_completes() {
         "stale attempt failed suffix should be superseded by quote refresh"
     );
 }
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "integration: spawns devnet stack"]
-async fn order_workflow_refreshes_exact_out_stale_quote_then_completes() {
-    let run = run_order_workflow(WorkflowOptions {
-        route: WorkflowRoute::VeloraBaseEthToBaseUsdcExactOut,
-        expire_quote_legs: true,
-        ..WorkflowOptions::default()
-    })
-    .await;
-
-    assert_eq!(run.output.terminal_status, OrderTerminalStatus::Completed);
-    let completed = run
-        .db
-        .orders()
-        .get(run.order_id)
-        .await
-        .expect("load completed ExactOut order");
-    assert_eq!(completed.status, RouterOrderStatus::Completed);
-
-    let original_quote = match run
-        .db
-        .orders()
-        .get_router_order_quote(run.order_id)
-        .await
-        .expect("load ExactOut order quote")
-    {
-        RouterOrderQuote::MarketOrder(quote) => quote,
-        RouterOrderQuote::LimitOrder(_) => panic!("expected market quote"),
-    };
-    assert_eq!(original_quote.order_kind.to_db_string(), "exact_out");
-
-    let attempts = run
-        .db
-        .orders()
-        .get_execution_attempts(run.order_id)
-        .await
-        .expect("load ExactOut refresh attempts");
-    assert_eq!(attempts.len(), 2);
-    assert_eq!(
-        attempts[1].attempt_kind,
-        OrderExecutionAttemptKind::RefreshedExecution
-    );
-    assert_eq!(attempts[1].status, OrderExecutionAttemptStatus::Completed);
-
-    let refreshed_legs = run
-        .db
-        .orders()
-        .get_execution_legs_for_attempt(attempts[1].id)
-        .await
-        .expect("load refreshed ExactOut legs");
-    assert_eq!(refreshed_legs.len(), 1);
-    assert_eq!(
-        refreshed_legs[0].expected_amount_out,
-        original_quote.amount_out
-    );
-    assert_eq!(refreshed_legs[0].amount_in, original_quote.amount_in);
-
-    let refreshed_steps = run
-        .db
-        .orders()
-        .get_execution_steps_for_attempt(attempts[1].id)
-        .await
-        .expect("load refreshed ExactOut steps");
-    assert_eq!(refreshed_steps.len(), 1);
-    assert_eq!(
-        refreshed_steps[0].step_type,
-        OrderExecutionStepType::UniversalRouterSwap
-    );
-    assert_eq!(
-        refreshed_steps[0].status,
-        OrderExecutionStepStatus::Completed
-    );
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "integration: spawns devnet stack"]
 async fn order_workflow_refreshes_stale_quote_multi_leg_then_completes() {
@@ -1631,24 +1454,7 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
                 chain_registry.clone(),
                 action_providers.clone(),
                 &devnet,
-                MarketOrderQuoteKind::ExactIn {
-                    amount_in: ORDER_AMOUNT_IN_WEI.to_string(),
-                    slippage_bps: Some(100),
-                },
-            )
-            .await
-        }
-        WorkflowRoute::VeloraBaseEthToBaseUsdcExactOut => {
-            seed_funded_single_step_order(
-                &db,
-                settings.clone(),
-                chain_registry.clone(),
-                action_providers.clone(),
-                &devnet,
-                MarketOrderQuoteKind::ExactOut {
-                    amount_out: ORDER_USDC_AMOUNT_RAW.to_string(),
-                    slippage_bps: Some(100),
-                },
+                ORDER_AMOUNT_IN_WEI.to_string(),
             )
             .await
         }
@@ -1756,9 +1562,6 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
         chain_registry.clone(),
         Arc::new(RouteCostService::new(db.clone(), action_providers)),
     );
-    if options.manual_intervention_action.is_some() {
-        seed_manual_intervention_state(&db, &activity_deps, order_id).await;
-    }
     let database_url_for_workflow = database_url.clone();
 
     let local = tokio::task::LocalSet::new();
@@ -1793,62 +1596,10 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
                 )
                 .await
                 .expect("start OrderWorkflow");
-            if let Some(action) = options.manual_intervention_action {
-                let signal_result = match action {
-                    ManualInterventionTestAction::Release => {
-                        handle
-                            .signal(
-                                OrderWorkflow::manual_intervention_release,
-                                ManualReleaseSignal {
-                                    reason: "operator fixed manual release test".to_string(),
-                                    operator_id: Some("temporal-test".to_string()),
-                                    requested_at: Utc::now(),
-                                },
-                                WorkflowSignalOptions::default(),
-                            )
-                            .await
-                    }
-                    ManualInterventionTestAction::TriggerRefund => {
-                        handle
-                            .signal(
-                                OrderWorkflow::manual_refund_trigger,
-                                ManualTriggerRefundSignal {
-                                    reason: "operator requested refund in manual test".to_string(),
-                                    operator_id: Some("temporal-test".to_string()),
-                                    requested_at: Utc::now(),
-                                    refund_kind_hint: None,
-                                },
-                                WorkflowSignalOptions::default(),
-                            )
-                            .await
-                    }
-                    ManualInterventionTestAction::AcknowledgeUnrecoverable => {
-                        handle
-                            .signal(
-                                OrderWorkflow::acknowledge_unrecoverable,
-                                AcknowledgeUnrecoverableSignal {
-                                    reason: "operator acknowledged unrecoverable test".to_string(),
-                                    operator_id: Some("temporal-test".to_string()),
-                                    requested_at: Utc::now(),
-                                },
-                                WorkflowSignalOptions::default(),
-                            )
-                            .await
-                    }
-                };
-                assert_signal_sent_or_workflow_completed(
-                    signal_result,
-                    "send manual intervention signal",
-                );
-            }
             let should_signal_primary_velora =
                 should_signal_primary_velora_settled_hint(&options);
             if should_signal_primary_velora
-                && matches!(
-                    options.route,
-                    WorkflowRoute::VeloraBaseEthToBaseUsdc
-                        | WorkflowRoute::VeloraBaseEthToBaseUsdcExactOut
-                )
+                && matches!(options.route, WorkflowRoute::VeloraBaseEthToBaseUsdc)
             {
                 signal_order_velora_settled(
                     &client,
@@ -2118,81 +1869,6 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
     }
 }
 
-async fn seed_manual_intervention_state(
-    db: &Database,
-    activity_deps: &OrderActivityDeps,
-    order_id: Uuid,
-) {
-    let order = db.orders().get(order_id).await.expect("load order");
-    let funding_vault_id = order.funding_vault_id.expect("order funding vault");
-    let source_vault = db
-        .vaults()
-        .get(funding_vault_id)
-        .await
-        .expect("load funding vault");
-    let quote = db
-        .orders()
-        .get_router_order_quote(order_id)
-        .await
-        .expect("load order quote");
-    let route = match quote {
-        RouterOrderQuote::MarketOrder(quote) => activity_deps
-            .planner
-            .plan(&order, &source_vault, &quote, Utc::now())
-            .expect("plan manual intervention seed"),
-        RouterOrderQuote::LimitOrder(_) => panic!("manual intervention seed expects market order"),
-    };
-    let materialized = db
-        .orders()
-        .materialize_primary_execution_attempt(
-            order_id,
-            ExecutionAttemptPlan {
-                legs: route.legs,
-                steps: route.steps,
-            },
-            Utc::now(),
-        )
-        .await
-        .expect("materialize manual intervention seed attempt");
-    let step = materialized
-        .steps
-        .first()
-        .expect("materialized manual intervention step")
-        .clone();
-    let now = Utc::now();
-    db.orders()
-        .persist_execution_step_ready_to_fire(order_id, materialized.attempt.id, step.id, now)
-        .await
-        .expect("mark manual intervention seed step running");
-    db.orders()
-        .fail_execution_step(
-            step.id,
-            json!({
-                "error": "seeded manual intervention test failure",
-                "reason": "seeded_manual_intervention",
-            }),
-            now,
-        )
-        .await
-        .expect("fail manual intervention seed step");
-    db.orders()
-        .mark_execution_attempt_manual_intervention_required(
-            materialized.attempt.id,
-            json!({
-                "reason": "seeded_manual_intervention",
-                "step_id": step.id,
-            }),
-            json!({}),
-            now,
-        )
-        .await
-        .expect("mark manual intervention seed attempt");
-    db.orders()
-        .mark_order_manual_intervention_required(order_id, now)
-        .await
-        .expect("mark manual intervention seed order");
-}
-
 async fn test_postgres() -> TestPostgres {
     if let Ok(admin_database_url) = std::env::var(ROUTER_TEST_DATABASE_URL_ENV) {
         return TestPostgres {
@@ -2376,7 +2052,6 @@ fn test_action_providers(
         velora: matches!(
             route,
             WorkflowRoute::VeloraBaseEthToBaseUsdc
-                | WorkflowRoute::VeloraBaseEthToBaseUsdcExactOut
                 | WorkflowRoute::AcrossBaseEthToEthereumUsdc
                 | WorkflowRoute::CctpBaseUsdcToArbitrumEth
         )
@@ -2401,10 +2076,7 @@ async fn spawn_mocks(devnet: &RiftDevnet, options: &WorkflowOptions) -> MockInte
             WorkflowRoute::HyperliquidArbitrumUsdcToBitcoin
         )
         || options.expect_hyperliquid_spot_unit_refund;
-    if matches!(
-        options.route,
-        WorkflowRoute::VeloraBaseEthToBaseUsdc | WorkflowRoute::VeloraBaseEthToBaseUsdcExactOut
-    ) {
+    if matches!(options.route, WorkflowRoute::VeloraBaseEthToBaseUsdc) {
         config = config.with_velora_swap_contract_address(
             devnet.base.anvil.chain_id(),
             format!("{:#x}", devnet.base.mock_velora_swap_contract.address()),
@@ -2709,19 +2381,9 @@ fn should_signal_primary_velora_settled_hint(options: &WorkflowOptions) -> bool 
     if options.velora_transaction_failures >= EXECUTE_STEP_TEMPORAL_ATTEMPTS * 2 {
         return false;
     }
-    if matches!(
-        options.manual_intervention_action,
-        Some(
-            ManualInterventionTestAction::TriggerRefund
-                | ManualInterventionTestAction::AcknowledgeUnrecoverable
-        )
-    ) {
-        return false;
-    }
     matches!(
         options.route,
         WorkflowRoute::VeloraBaseEthToBaseUsdc
-            | WorkflowRoute::VeloraBaseEthToBaseUsdcExactOut
             | WorkflowRoute::AcrossBaseEthToEthereumUsdc
             | WorkflowRoute::CctpBaseUsdcToArbitrumEth
     )
@@ -4134,7 +3796,7 @@ async fn seed_funded_single_step_order(
     chain_registry: Arc<ChainRegistry>,
     action_providers: Arc<ActionProviderRegistry>,
     devnet: &RiftDevnet,
-    order_kind: MarketOrderQuoteKind,
+    amount_in: String,
 ) -> SeededOrder {
     let order_manager = OrderManager::with_action_providers(
         db.clone(),
@@ -4156,7 +3818,7 @@ async fn seed_funded_single_step_order(
             from_asset: source_asset.clone(),
             to_asset: destination_asset,
             recipient_address: valid_evm_address(),
-            order_kind,
+            amount_in,
         })
         .await
         .expect("quote single-step order");
@@ -4253,10 +3915,7 @@ async fn seed_funded_across_order(
             from_asset: source_asset.clone(),
             to_asset: destination_asset,
             recipient_address: valid_evm_address(),
-            order_kind: MarketOrderQuoteKind::ExactIn {
-                amount_in: ORDER_AMOUNT_IN_WEI.to_string(),
-                slippage_bps: Some(100),
-            },
+            amount_in: ORDER_AMOUNT_IN_WEI.to_string(),
         })
         .await
         .expect("quote Across order");
@@ -4354,10 +4013,7 @@ async fn seed_funded_cctp_order(
             from_asset: source_asset.clone(),
             to_asset: destination_asset,
             recipient_address: valid_evm_address(),
-            order_kind: MarketOrderQuoteKind::ExactIn {
-                amount_in: ORDER_USDC_AMOUNT_RAW.to_string(),
-                slippage_bps: Some(100),
-            },
+            amount_in: ORDER_USDC_AMOUNT_RAW.to_string(),
         })
         .await
         .expect("quote CCTP order");
@@ -4456,10 +4112,7 @@ async fn seed_funded_cctp_hyperliquid_unit_order(
             from_asset: source_asset.clone(),
             to_asset: destination_asset,
             recipient_address: devnet.bitcoin.miner_address.to_string(),
-            order_kind: MarketOrderQuoteKind::ExactIn {
-                amount_in: ORDER_USDC_AMOUNT_RAW.to_string(),
-                slippage_bps: Some(100),
-            },
+            amount_in: ORDER_USDC_AMOUNT_RAW.to_string(),
         })
         .await
         .expect("quote CCTP + Hyperliquid + Unit order");
@@ -4562,10 +4215,7 @@ async fn seed_funded_arbitrum_hyperliquid_unit_order(
             from_asset: source_asset.clone(),
             to_asset: destination_asset,
             recipient_address: devnet.bitcoin.miner_address.to_string(),
-            order_kind: MarketOrderQuoteKind::ExactIn {
-                amount_in: ORDER_USDC_AMOUNT_RAW.to_string(),
-                slippage_bps: Some(100),
-            },
+            amount_in: ORDER_USDC_AMOUNT_RAW.to_string(),
         })
         .await
         .expect("quote Arbitrum USDC + Hyperliquid + Unit order");
@@ -4670,10 +4320,7 @@ async fn seed_funded_unit_order(
             from_asset: source_asset.clone(),
             to_asset: destination_asset,
             recipient_address: valid_evm_address(),
-            order_kind: MarketOrderQuoteKind::ExactIn {
-                amount_in: ORDER_BTC_AMOUNT_SATS.to_string(),
-                slippage_bps: Some(100),
-            },
+            amount_in: ORDER_BTC_AMOUNT_SATS.to_string(),
         })
         .await
         .expect("quote Unit order");

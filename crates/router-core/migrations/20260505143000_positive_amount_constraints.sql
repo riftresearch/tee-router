@@ -6,11 +6,7 @@ BEGIN
         ADD CONSTRAINT market_order_quotes_positive_amounts
         CHECK (
             amount_in ~ '^0*[1-9][0-9]*$'
-            AND amount_out ~ '^0*[1-9][0-9]*$'
-            AND (
-                max_amount_in IS NULL
-                OR max_amount_in ~ '^0*[1-9][0-9]*$'
-            )
+            AND estimated_amount_out ~ '^0*[1-9][0-9]*$'
         );
 
     ALTER TABLE public.market_order_actions
@@ -18,18 +14,7 @@ BEGIN
     ALTER TABLE public.market_order_actions
         ADD CONSTRAINT market_order_actions_positive_amounts
         CHECK (
-            (
-                amount_in IS NULL
-                OR amount_in ~ '^0*[1-9][0-9]*$'
-            )
-            AND (
-                amount_out IS NULL
-                OR amount_out ~ '^0*[1-9][0-9]*$'
-            )
-            AND (
-                max_amount_in IS NULL
-                OR max_amount_in ~ '^0*[1-9][0-9]*$'
-            )
+            amount_in ~ '^0*[1-9][0-9]*$'
         );
 
     ALTER TABLE public.limit_order_quotes
@@ -60,7 +45,7 @@ BEGIN
         ADD CONSTRAINT order_execution_legs_positive_amounts
         CHECK (
             amount_in ~ '^0*[1-9][0-9]*$'
-            AND expected_amount_out ~ '^0*[1-9][0-9]*$'
+            AND estimated_amount_out ~ '^0*[1-9][0-9]*$'
             AND (
                 actual_amount_in IS NULL
                 OR actual_amount_in ~ '^0*[1-9][0-9]*$'

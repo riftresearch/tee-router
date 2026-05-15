@@ -1872,12 +1872,9 @@ async fn wait_for_terminal_order_status(
         matches!(
             order.status,
             RouterOrderStatus::Completed
-                | RouterOrderStatus::Expired
                 | RouterOrderStatus::RefundRequired
                 | RouterOrderStatus::Refunding
                 | RouterOrderStatus::Refunded
-                | RouterOrderStatus::ManualInterventionRequired
-                | RouterOrderStatus::RefundManualInterventionRequired
         )
         .then_some(order.status)
     })
@@ -2301,9 +2298,7 @@ async fn submit_quote_request_custom(
                 "asset": "native"
             },
             "recipient_address": recipient_address,
-            "kind": "exact_in",
-            "amount_in": amount_in,
-            "slippage_bps": 100
+            "amount_in": amount_in
         }))
         .send()
         .await

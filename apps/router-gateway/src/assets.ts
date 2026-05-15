@@ -207,45 +207,6 @@ export function formatPositiveAmount(
   return formatAmount(value, asset, format)
 }
 
-export function parseSlippageBps(value: string, format: AmountFormat): number {
-  if (format === 'raw') {
-    assertIntegerString(value, 'maxSlippage')
-    const normalized = stripLeadingZeros(value)
-    if (normalized.length > 5) {
-      throw new GatewayValidationError('maxSlippage raw value must be 0 through 10000 bps')
-    }
-    const bps = Number(normalized)
-    if (!Number.isSafeInteger(bps) || bps < 0 || bps > 10_000) {
-      throw new GatewayValidationError('maxSlippage raw value must be 0 through 10000 bps')
-    }
-    return bps
-  }
-
-  if (!DECIMAL_STRING_PATTERN.test(value)) {
-    throw new GatewayValidationError(
-      'maxSlippage must be a decimal percentage string without separators or %'
-    )
-  }
-
-  const [whole, fractional = ''] = value.split('.')
-  const normalizedWhole = stripLeadingZeros(whole)
-  if (normalizedWhole.length > 3) {
-    throw new GatewayValidationError('maxSlippage must be 0 through 100 percent')
-  }
-  if (fractional.length > 2) {
-    throw new GatewayValidationError(
-      'maxSlippage readable values support at most two decimal places'
-    )
-  }
-
-  const bps = Number(normalizedWhole) * 100 + Number(fractional.padEnd(2, '0'))
-  if (!Number.isSafeInteger(bps) || bps < 0 || bps > 10_000) {
-    throw new GatewayValidationError('maxSlippage must be 0 through 100 percent')
-  }
-
-  return bps
-}
-
 export function assertAddressMatchesChain(
   chainId: string,
   address: string,
@@ -282,14 +243,6 @@ export function assertAddressMatchesChain(
       }
     )
   }
-}
-
-export function formatSlippage(bps: number, format: AmountFormat): string {
-  if (format === 'raw') return String(bps)
-
-  const whole = Math.floor(bps / 100)
-  const fractional = String(bps % 100).padStart(2, '0').replace(/0+$/, '')
-  return fractional ? `${whole}.${fractional}` : String(whole)
 }
 
 function decimalToRaw(value: string, decimals: number, field: string): string {

@@ -17,7 +17,7 @@ use alloy::{
     sol_types::SolCall,
 };
 use router_core::{
-    models::{MarketOrderKind, ProviderOperationStatus, ProviderOperationType},
+    models::{ProviderOperationStatus, ProviderOperationType, ProviderOrderKind},
     protocol::{AssetId, ChainId, DepositAsset},
     services::action_providers::{
         BridgeProvider, BridgeQuoteRequest, CctpProvider, ProviderOperationObservationRequest,
@@ -102,7 +102,7 @@ async fn live_cctp_base_usdc_to_arbitrum_usdc_quote_and_observer_transcript() ->
         .quote_bridge(BridgeQuoteRequest {
             source_asset: base_usdc_asset(),
             destination_asset: arbitrum_usdc_asset(),
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: ProviderOrderKind::ExactIn {
                 amount_in: amount.to_string(),
                 min_amount_out: Some("1".to_string()),
             },

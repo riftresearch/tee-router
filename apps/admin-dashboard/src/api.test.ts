@@ -251,7 +251,6 @@ function orderEvent() {
     },
     recipientAddress: '0x1111111111111111111111111111111111111111',
     refundAddress: '0x2222222222222222222222222222222222222222',
-    actionTimeoutAt: '2026-05-04T00:10:00.000Z',
     executionLegs: [],
     executionSteps: [],
     providerOperations: [],

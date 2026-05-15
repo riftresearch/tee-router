@@ -23,12 +23,11 @@ use router_core::{
     },
     error::{RouterCoreError, RouterCoreResult},
     models::{
-        CustodyVault, CustodyVaultRole, CustodyVaultVisibility, DepositVault, MarketOrderKind,
-        MarketOrderKindType, MarketOrderQuote, OrderExecutionAttempt, OrderExecutionAttemptKind,
-        OrderExecutionAttemptStatus, OrderExecutionLeg, OrderExecutionStep,
-        OrderExecutionStepStatus, OrderExecutionStepType, OrderProviderAddress,
-        OrderProviderOperation, ProviderAddressRole, ProviderOperationStatus,
-        ProviderOperationType, RouterOrder, RouterOrderQuote,
+        CustodyVault, CustodyVaultRole, CustodyVaultVisibility, DepositVault, MarketOrderQuote,
+        OrderExecutionAttempt, OrderExecutionAttemptKind, OrderExecutionAttemptStatus,
+        OrderExecutionLeg, OrderExecutionStep, OrderExecutionStepStatus, OrderExecutionStepType,
+        OrderProviderAddress, OrderProviderOperation, ProviderAddressRole, ProviderOperationStatus,
+        ProviderOperationType, ProviderOrderKind, RouterOrder, RouterOrderQuote,
     },
     protocol::{backend_chain_for_id, AssetId, ChainId, DepositAsset},
     services::{
@@ -64,24 +63,21 @@ use crate::telemetry;
 use super::{
     error::OrderActivityError,
     types::{
-        AcknowledgeManualInterventionInput, AcknowledgeReason, AcrossOnchainLogRecovered,
-        BoundaryPersisted, ClassifyStaleRunningStepInput, ClassifyStepFailureInput,
-        ComposeRefreshedQuoteAttemptInput, DiscoverSingleRefundPositionInput, DispatchOutcome,
-        DispatchStepInput, ExecutionPlan, FailedAttemptSnapshotWritten, FinalizeOrderOrRefundInput,
-        FinalizedOrder, HyperUnitWithdrawalSettledEvidence, InputCustodySnapshot,
-        LoadManualInterventionContextInput, LoadOrderExecutionStateInput, ManualInterventionScope,
-        ManualInterventionWorkflowContext, ManualResolutionSignalKind, MarkOrderCompletedInput,
-        MaterializeExecutionAttemptInput, MaterializeRefreshedAttemptInput,
-        MaterializeRefundPlanInput, MaterializeRetryAttemptInput, MaterializedExecutionAttempt,
-        OrderCompleted, OrderExecutionState, OrderTerminalStatus, OrderWorkflowPhase,
-        PersistStepFailedInput, PersistenceBoundary, PrepareManualInterventionRefundInput,
-        PrepareManualInterventionRetryInput, ProviderHintKind, ProviderOperationHintDecision,
-        ProviderOperationHintEvidence, ProviderOperationHintSignal, ProviderOperationHintVerified,
-        RawAmount, RecoverAcrossOnchainLogInput, RecoverablePositionKind,
-        RefreshedAttemptMaterialized, RefreshedQuoteAttemptOutcome, RefreshedQuoteAttemptShape,
-        RefreshedQuoteFailureReason, RefreshedQuoteSupersededReason, RefundPlanOutcome,
-        RefundPlanShape, RefundUntenableReason, ReleaseRefundManualInterventionInput,
-        SingleRefundPosition, SingleRefundPositionDiscovery, SingleRefundPositionOutcome,
+        AcrossOnchainLogRecovered, BoundaryPersisted, ClassifyStaleRunningStepInput,
+        ClassifyStepFailureInput, ComposeRefreshedQuoteAttemptInput,
+        DiscoverSingleRefundPositionInput, DispatchOutcome, DispatchStepInput, ExecutionPlan,
+        FailedAttemptSnapshotWritten, FinalizeOrderOrRefundInput, FinalizedOrder,
+        HyperUnitWithdrawalSettledEvidence, InputCustodySnapshot, LoadOrderExecutionStateInput,
+        MarkOrderCompletedInput, MaterializeExecutionAttemptInput,
+        MaterializeRefreshedAttemptInput, MaterializeRefundPlanInput, MaterializeRetryAttemptInput,
+        MaterializedExecutionAttempt, OrderCompleted, OrderExecutionState, OrderTerminalStatus,
+        OrderWorkflowPhase, PersistStepFailedInput, PersistenceBoundary, ProviderHintKind,
+        ProviderOperationHintDecision, ProviderOperationHintEvidence, ProviderOperationHintSignal,
+        ProviderOperationHintVerified, RawAmount, RecoverAcrossOnchainLogInput,
+        RecoverablePositionKind, RefreshedAttemptMaterialized, RefreshedQuoteAttemptOutcome,
+        RefreshedQuoteAttemptShape, RefreshedQuoteFailureReason, RefreshedQuoteSupersededReason,
+        RefundPlanOutcome, RefundPlanShape, RefundUntenableReason, SingleRefundPosition,
+        SingleRefundPositionDiscovery, SingleRefundPositionOutcome,
         StaleQuoteRefreshUntenableReason, StaleRunningStepClassified, StaleRunningStepDecision,
         StepDispatched, StepExecutionOutcome, StepFailureDecision, UnitDepositHintEvidence,
         VerifyProviderOperationHintInput, WorkflowExecutionStep, WriteFailedAttemptSnapshotInput,
@@ -95,7 +91,6 @@ const REFUND_HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW: u64 = 1_000_000;
 const REFRESH_HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW: u64 =
     REFUND_HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW;
 const REFRESH_BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_BPS: u64 = 12_500;
-const REFRESH_PROBE_MAX_AMOUNT_IN: &str = "340282366920938463463374607431768211455";
 
 async fn record_activity<T, F>(activity_name: &'static str, activity: F) -> Result<T, ActivityError>
 where

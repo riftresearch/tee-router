@@ -423,7 +423,6 @@ function isOrderFirehoseRow(value: unknown): boolean {
     isAssetRef(value.destination) &&
     typeof value.recipientAddress === 'string' &&
     typeof value.refundAddress === 'string' &&
-    isIsoTimestamp(value.actionTimeoutAt) &&
     Array.isArray(value.executionLegs) &&
     Array.isArray(value.executionSteps) &&
     Array.isArray(value.providerOperations) &&

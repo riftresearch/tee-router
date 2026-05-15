@@ -10,14 +10,12 @@ use router_core::{
 use std::time::Duration;
 use tracing::info;
 
-const OPERATOR_ORDER_STATUSES: [RouterOrderStatus; 7] = [
+const OPERATOR_ORDER_STATUSES: [RouterOrderStatus; 5] = [
     RouterOrderStatus::PendingFunding,
     RouterOrderStatus::Funded,
     RouterOrderStatus::Executing,
     RouterOrderStatus::RefundRequired,
     RouterOrderStatus::Refunding,
-    RouterOrderStatus::ManualInterventionRequired,
-    RouterOrderStatus::RefundManualInterventionRequired,
 ];
 
 pub fn record_http_response(route: &str, method: &str, status: u16, duration: Duration) {

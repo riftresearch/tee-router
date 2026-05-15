@@ -16,7 +16,7 @@ use alloy::{
     sol,
 };
 use router_core::{
-    models::MarketOrderKind,
+    models::ProviderOrderKind,
     protocol::{AssetId, ChainId, DepositAsset},
     services::{
         action_providers::{
@@ -235,7 +235,7 @@ async fn quote_base_eth_to_usdc(
             output_asset: base_usdc_asset(),
             input_decimals: Some(18),
             output_decimals: Some(6),
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: ProviderOrderKind::ExactIn {
                 amount_in: amount_in.to_string(),
                 min_amount_out: Some(min_amount_out),
             },
