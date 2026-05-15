@@ -556,10 +556,29 @@ async fn wait_for_refund_provider_completion_hint(
 ) -> WorkflowResult<RefundProviderCompletionWait> {
     let wait_started_at = provider_hint_wait_started(ctx);
 
-    loop {
-        temporalio_sdk::workflows::select! {
-            _ = ctx.wait_condition(move |state: &RefundWorkflow| state.has_provider_operation_hint(order_id, step_id)) => {
-                let signal = ctx
+    // Single-timer restructure: see the detailed rationale on the analogous
+    // `wait_for_provider_completion_hint` in order.rs. The old shape armed a
+    // fresh 2h timer per deferred hint (2-4 per step) that the SDK never
+    // dropped/cancelled. We now arm one timer, run the deferred-hint loop
+    // inside the work arm of a single `select!`, and explicitly `.cancel()`
+    // the timer on Accept (zero leak on the happy path). All work-loop calls
+    // take `&self` on the SDK context, so the shared borrow does not collide
+    // with the timer future's held `&ctx` borrow.
+    // The timer + select + Accept handling are scoped to an inner block so the
+    // `ctx.timer()` future's held `&ctx` borrow is released before the
+    // `&mut ctx` timeout escalation runs. See order.rs for the full rationale.
+    let wait_outcome = {
+        let hint_timeout = ctx.timer(PROVIDER_HINT_WAIT_TIMEOUT);
+        futures_util::pin_mut!(hint_timeout);
+        let ctx_ref: &WorkflowContext<RefundWorkflow> = ctx;
+        let hint_work = async {
+            loop {
+                ctx_ref
+                    .wait_condition(move |state: &RefundWorkflow| {
+                        state.has_provider_operation_hint(order_id, step_id)
+                    })
+                    .await;
+                let signal = ctx_ref
                     .state_mut(|state| state.pop_provider_operation_hint(order_id, step_id))
                     .expect("refund provider operation hint condition was satisfied");
                 let hint_kind = signal.hint_kind;
@@ -570,7 +589,7 @@ async fn wait_for_refund_provider_completion_hint(
                     signal,
                 };
                 let verified = crate::verify_hint_activity!(
-                    ctx,
+                    ctx_ref,
                     hint_kind,
                     verify_input,
                     db_activity_options.clone()
@@ -579,15 +598,10 @@ async fn wait_for_refund_provider_completion_hint(
 
                 match verified.decision {
                     ProviderOperationHintDecision::Accept => {
-                        record_provider_hint_wait(
-                            ctx,
-                            REFUND_WORKFLOW_TYPE,
-                            wait_started_at,
-                            "signal_accept",
-                        );
-                        return Ok(RefundProviderCompletionWait::Completed);
+                        return WorkflowResult::<()>::Ok(());
                     }
-                    ProviderOperationHintDecision::Reject | ProviderOperationHintDecision::Defer => {
+                    ProviderOperationHintDecision::Reject
+                    | ProviderOperationHintDecision::Defer => {
                         tracing::info!(
                             order_id = %order_id,
                             step_id = %step_id,
@@ -598,39 +612,70 @@ async fn wait_for_refund_provider_completion_hint(
                             event_name = "provider_operation_hint.ignored",
                             "provider_operation_hint.ignored"
                         );
+                        // SAME timer: no new timer armed on a deferred hint.
                     }
                 }
             }
-            _ = ctx.timer(PROVIDER_HINT_WAIT_TIMEOUT) => {
-                finalize_refund_provider_hint_manual_intervention(
-                    ctx,
-                    order_id,
-                    attempt_id,
-                    step_id,
-                    json!({
-                        "reason": "provider_operation_hint_wait_timeout",
-                        "step_id": step_id,
-                    }),
-                    db_activity_options.clone(),
-                )
-                .await?;
-                let resolution = wait_for_refund_manual_intervention_resolution(
-                    ctx,
-                    order_id,
-                    Some(attempt_id),
-                    Some(step_id),
-                    db_activity_options.clone(),
-                )
-                .await?;
+        };
+        use futures_util::FutureExt;
+        let hint_work = hint_work.fuse();
+        futures_util::pin_mut!(hint_work);
+        let outcome = temporalio_sdk::workflows::select! {
+            _ = hint_timeout.as_mut() => RefundHintWaitOutcome::TimedOut,
+            res = hint_work => RefundHintWaitOutcome::Accepted(res),
+        };
+        match outcome {
+            RefundHintWaitOutcome::Accepted(res) => {
+                res?;
+                hint_timeout.cancel();
                 record_provider_hint_wait(
                     ctx,
                     REFUND_WORKFLOW_TYPE,
                     wait_started_at,
-                    "timeout_manual_intervention",
+                    "signal_accept",
                 );
-                return Ok(RefundProviderCompletionWait::RefundManualInterventionRequired { resolution });
+                RefundHintWaitOutcome::Accepted(Ok(()))
             }
+            RefundHintWaitOutcome::TimedOut => RefundHintWaitOutcome::TimedOut,
+        }
+    };
+
+    match wait_outcome {
+        RefundHintWaitOutcome::Accepted(_) => Ok(RefundProviderCompletionWait::Completed),
+        RefundHintWaitOutcome::TimedOut => {
+            finalize_refund_provider_hint_manual_intervention(
+                ctx,
+                order_id,
+                attempt_id,
+                step_id,
+                json!({
+                    "reason": "provider_operation_hint_wait_timeout",
+                    "step_id": step_id,
+                }),
+                db_activity_options.clone(),
+            )
+            .await?;
+            let resolution = wait_for_refund_manual_intervention_resolution(
+                ctx,
+                order_id,
+                Some(attempt_id),
+                Some(step_id),
+                db_activity_options.clone(),
+            )
+            .await?;
+            record_provider_hint_wait(
+                ctx,
+                REFUND_WORKFLOW_TYPE,
+                wait_started_at,
+                "timeout_manual_intervention",
+            );
+            Ok(RefundProviderCompletionWait::RefundManualInterventionRequired { resolution })
         }
     }
+}
+
+enum RefundHintWaitOutcome {
+    Accepted(WorkflowResult<()>),
+    TimedOut,
 }
 
