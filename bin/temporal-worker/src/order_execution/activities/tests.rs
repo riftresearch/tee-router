@@ -1,4 +1,5 @@
 use super::*;
+use crate::order_execution::types::{ProviderKind, WorkflowHintId};
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1142,6 +1143,223 @@ async fn unit_deposit_idempotency_key_collapses_retry_attempts_onto_same_operati
     assert_eq!(
         first_operation.provider_ref.as_deref(),
         Some("0x0000000000000000000000000000000000000001")
+    );
+}
+
+/// Tier 1's `execute_idempotent_step` retry guard must still hold after the
+/// Tier 2 consolidation that wraps everything in `run_step_dispatch`. We
+/// invoke the consolidated dispatch body directly with two attempts that share
+/// `(order_id, step_index)` and assert the provider's `/gen` call count stays
+/// at 1 — the second attempt must short-circuit on the first attempt's
+/// persisted `order_provider_operations` row instead of re-firing the side
+/// effect.
+///
+/// Uses `unit_withdrawal` because its provider returns
+/// `ProviderExecutionIntent::ProviderOnly` (no custody-action side effect to
+/// stage in test infrastructure), keeping the test focused on the idempotency
+/// guard rather than the custody executor wiring.
+#[tokio::test]
+async fn dispatch_step_retry_short_circuits_on_persisted_operation() {
+    let test_db = test_database().await;
+    let exchange_server = TestHyperliquidExchangeServer::spawn().await;
+    let (unit_provider, gen_calls) =
+        CountingUnitWithdrawalProvider::new(exchange_server.base_url.clone());
+    let action_providers = Arc::new(ActionProviderRegistry::new(
+        vec![],
+        vec![Arc::new(unit_provider)],
+        vec![],
+    ));
+    let settings = test_settings();
+    let derivation_salt = [0x55_u8; 32];
+    let hyperliquid_chain = Arc::new(HyperliquidChain::new(
+        b"hyperliquid-wallet",
+        1,
+        std::time::Duration::from_secs(1),
+    ));
+    let vault_address = hyperliquid_chain
+        .derive_wallet(&settings.master_key_bytes(), &derivation_salt)
+        .expect("derive test Hyperliquid wallet")
+        .address
+        .clone();
+    let mut chain_registry = ChainRegistry::new();
+    chain_registry.register(ChainType::Hyperliquid, hyperliquid_chain);
+    let deps = test_deps_with_action_providers_and_chain_registry(
+        test_db.db.clone(),
+        action_providers,
+        Some(exchange_server.base_url.clone()),
+        Arc::new(chain_registry),
+    );
+    let (first_step, retry_step) = seed_unit_withdrawal_retry_steps(
+        &test_db.db,
+        &test_db.pool,
+        Uuid::now_v7(),
+        vault_address,
+        derivation_salt,
+    )
+    .await;
+
+    let first = run_step_dispatch(
+        &deps,
+        DispatchStepInput {
+            order_id: first_step.order_id.into(),
+            attempt_id: first_step
+                .execution_attempt_id
+                .expect("first step has attempt id")
+                .into(),
+            step_id: first_step.id.into(),
+        },
+        OrderExecutionStepType::UnitWithdrawal,
+    )
+    .await
+    .expect("first dispatch_unit_withdrawal_step");
+    assert!(matches!(first.outcome, DispatchOutcome::Waiting));
+
+    // Mark the first step superseded so the retry can re-enter dispatch on a
+    // fresh row (mirrors how `materialize_retry_attempt` re-creates the step).
+    sqlx_core::query::query(
+        r#"
+        UPDATE order_execution_steps
+        SET status = 'superseded',
+            completed_at = $2,
+            updated_at = $2
+        WHERE id = $1
+        "#,
+    )
+    .bind(first_step.id)
+    .bind(Utc::now())
+    .execute(&test_db.pool)
+    .await
+    .expect("mark first unit withdrawal step superseded");
+
+    let retry = run_step_dispatch(
+        &deps,
+        DispatchStepInput {
+            order_id: retry_step.order_id.into(),
+            attempt_id: retry_step
+                .execution_attempt_id
+                .expect("retry step has attempt id")
+                .into(),
+            step_id: retry_step.id.into(),
+        },
+        OrderExecutionStepType::UnitWithdrawal,
+    )
+    .await
+    .expect("retry dispatch_unit_withdrawal_step");
+    assert!(matches!(retry.outcome, DispatchOutcome::Waiting));
+
+    assert_eq!(
+        gen_calls.load(Ordering::SeqCst),
+        1,
+        "consolidated dispatch must keep the Tier 1 idempotency guard intact: \
+         a retry sharing (order_id, step_index) cannot re-fire HyperUnit /gen"
+    );
+    assert_eq!(
+        exchange_server.send_asset_call_count(),
+        1,
+        "consolidated dispatch must not re-fire the Hyperliquid sendAsset side effect on retry"
+    );
+}
+
+/// After Tier 2, the `verify_<hint_kind>_hint` activities own the step
+/// completion settle that previously lived as a separate `settle_provider_step`
+/// round-trip in the workflow. This test seeds a step in `waiting` with a
+/// `Completed` provider operation and asserts that running through
+/// `run_hint_verify` (with a stub verifier that mimics the venue helper's
+/// "update operation row + return Accept" behaviour) drives the step to
+/// `completed`.
+#[tokio::test]
+async fn run_hint_verify_settles_step_to_completed_on_accept() {
+    let test_db = test_database().await;
+    let seeded = seed_running_step(&test_db.pool, false, false).await;
+
+    // Transition the step into `waiting` so the hint-verify settle path's
+    // `complete_observed_execution_step` branch is the one we exercise.
+    test_db
+        .db
+        .orders()
+        .wait_execution_step(seeded.step_id, json!({"kind": "waiting"}), None, Utc::now())
+        .await
+        .expect("seed waiting step");
+
+    // Insert a completed provider operation linked to the step. The settle
+    // path reads back the latest operation for the step and uses its status to
+    // pick `complete_observed_execution_step` vs `wait_execution_step`.
+    let provider_operation_id = Uuid::now_v7();
+    sqlx_core::query::query(
+        r#"
+        INSERT INTO order_provider_operations (
+            id, order_id, execution_attempt_id, execution_step_id,
+            provider, operation_type, provider_ref, idempotency_key,
+            status, request_json, response_json, observed_state_json,
+            created_at, updated_at
+        )
+        VALUES (
+            $1, $2, $3, $4, 'velora', 'universal_router_swap', '0xfeed',
+            'order:test:run_hint_verify_settles', 'completed',
+            '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, $5, $5
+        )
+        "#,
+    )
+    .bind(provider_operation_id)
+    .bind(seeded.order_id)
+    .bind(seeded.attempt_id)
+    .bind(seeded.step_id)
+    .bind(Utc::now())
+    .execute(&test_db.pool)
+    .await
+    .expect("insert completed provider operation");
+
+    let deps = test_deps(test_db.db.clone());
+
+    // Stub verifier: mimics a typed verifier returning Accept without further
+    // mutating the operation (the operation row already says completed). The
+    // settle in `run_hint_verify` is the behaviour under test.
+    async fn stub_accept_verifier(
+        _deps: &OrderActivityDeps,
+        _input: VerifyProviderOperationHintInput,
+    ) -> Result<ProviderOperationHintVerified, OrderActivityError> {
+        Ok(ProviderOperationHintVerified {
+            provider_operation_id: None,
+            decision: ProviderOperationHintDecision::Accept,
+            reason: None,
+        })
+    }
+
+    let verified = run_hint_verify(
+        &deps,
+        VerifyProviderOperationHintInput {
+            order_id: seeded.order_id.into(),
+            attempt_id: seeded.attempt_id.into(),
+            step_id: seeded.step_id.into(),
+            signal: ProviderOperationHintSignal {
+                hint_id: WorkflowHintId::from(Uuid::now_v7()),
+                order_id: seeded.order_id.into(),
+                provider_operation_id: Some(provider_operation_id.into()),
+                execution_step_id: seeded.step_id.into(),
+                hint_kind: ProviderHintKind::VeloraSwapSettled,
+                provider: ProviderKind::Exchange,
+                provider_ref: Some("0xfeed".to_string()),
+                evidence: None,
+            },
+        },
+        ExpectedHintKinds::Single(ProviderHintKind::VeloraSwapSettled),
+        stub_accept_verifier,
+    )
+    .await
+    .expect("run_hint_verify should accept and settle");
+
+    assert_eq!(verified.decision, ProviderOperationHintDecision::Accept);
+
+    let step = test_db
+        .db
+        .orders()
+        .get_execution_step(seeded.step_id)
+        .await
+        .expect("load step after hint settle");
+    assert_eq!(
+        step.status,
+        OrderExecutionStepStatus::Completed,
+        "verify_*_hint Accept must settle the step to completed"
     );
 }
 

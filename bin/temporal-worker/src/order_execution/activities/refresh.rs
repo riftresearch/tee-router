@@ -1670,6 +1670,7 @@ impl QuoteRefreshActivities {
                     .map(|step| WorkflowExecutionStep {
                         step_id: step.id.into(),
                         step_index: step.step_index,
+                        step_type: step.step_type,
                     })
                     .collect(),
             })
