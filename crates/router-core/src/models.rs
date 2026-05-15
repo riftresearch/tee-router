@@ -63,9 +63,6 @@ pub enum RouterOrderStatus {
     RefundRequired,
     Refunding,
     Refunded,
-    ManualInterventionRequired,
-    RefundManualInterventionRequired,
-    Expired,
 }
 
 impl RouterOrderStatus {
@@ -80,9 +77,6 @@ impl RouterOrderStatus {
             Self::RefundRequired => "refund_required",
             Self::Refunding => "refunding",
             Self::Refunded => "refunded",
-            Self::ManualInterventionRequired => "manual_intervention_required",
-            Self::RefundManualInterventionRequired => "refund_manual_intervention_required",
-            Self::Expired => "expired",
         }
     }
 
@@ -96,9 +90,6 @@ impl RouterOrderStatus {
             "refund_required" => Some(Self::RefundRequired),
             "refunding" => Some(Self::Refunding),
             "refunded" => Some(Self::Refunded),
-            "manual_intervention_required" => Some(Self::ManualInterventionRequired),
-            "refund_manual_intervention_required" => Some(Self::RefundManualInterventionRequired),
-            "expired" => Some(Self::Expired),
             _ => None,
         }
     }
@@ -113,14 +104,12 @@ pub enum RouterOrderAction {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MarketOrderAction {
-    #[serde(flatten)]
-    pub order_kind: MarketOrderKind,
-    pub slippage_bps: Option<u64>,
+    pub amount_in: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum MarketOrderKind {
+pub enum ProviderOrderKind {
     ExactIn {
         amount_in: String,
         min_amount_out: Option<String>,
@@ -129,41 +118,6 @@ pub enum MarketOrderKind {
         amount_out: String,
         max_amount_in: Option<String>,
     },
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum MarketOrderKindType {
-    ExactIn,
-    ExactOut,
-}
-
-impl MarketOrderKindType {
-    #[must_use]
-    pub fn to_db_string(self) -> &'static str {
-        match self {
-            Self::ExactIn => "exact_in",
-            Self::ExactOut => "exact_out",
-        }
-    }
-
-    pub fn from_db_string(value: &str) -> Option<Self> {
-        match value {
-            "exact_in" => Some(Self::ExactIn),
-            "exact_out" => Some(Self::ExactOut),
-            _ => None,
-        }
-    }
-}
-
-impl MarketOrderKind {
-    #[must_use]
-    pub fn kind_type(&self) -> MarketOrderKindType {
-        match self {
-            Self::ExactIn { .. } => MarketOrderKindType::ExactIn,
-            Self::ExactOut { .. } => MarketOrderKindType::ExactOut,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -206,7 +160,6 @@ pub struct RouterOrder {
     pub recipient_address: String,
     pub refund_address: String,
     pub action: RouterOrderAction,
-    pub action_timeout_at: DateTime<Utc>,
     pub idempotency_key: Option<String>,
     pub workflow_trace_id: String,
     pub workflow_parent_span_id: String,
@@ -222,12 +175,8 @@ pub struct MarketOrderQuote {
     pub destination_asset: DepositAsset,
     pub recipient_address: String,
     pub provider_id: String,
-    pub order_kind: MarketOrderKindType,
     pub amount_in: String,
-    pub amount_out: String,
-    pub min_amount_out: Option<String>,
-    pub max_amount_in: Option<String>,
-    pub slippage_bps: Option<u64>,
+    pub estimated_amount_out: String,
     pub provider_quote: Value,
     pub usd_valuation: Value,
     pub expires_at: DateTime<Utc>,
@@ -1084,7 +1033,6 @@ pub enum OrderExecutionAttemptStatus {
     Completed,
     Failed,
     RefundRequired,
-    ManualInterventionRequired,
     Superseded,
 }
 
@@ -1097,7 +1045,6 @@ impl OrderExecutionAttemptStatus {
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::RefundRequired => "refund_required",
-            Self::ManualInterventionRequired => "manual_intervention_required",
             Self::Superseded => "superseded",
         }
     }
@@ -1109,7 +1056,6 @@ impl OrderExecutionAttemptStatus {
             "completed" => Some(Self::Completed),
             "failed" => Some(Self::Failed),
             "refund_required" => Some(Self::RefundRequired),
-            "manual_intervention_required" => Some(Self::ManualInterventionRequired),
             "superseded" => Some(Self::Superseded),
             _ => None,
         }
@@ -1324,7 +1270,6 @@ pub struct OrderExecutionStep {
     pub input_asset: Option<DepositAsset>,
     pub output_asset: Option<DepositAsset>,
     pub amount_in: Option<String>,
-    pub min_amount_out: Option<String>,
     pub tx_hash: Option<String>,
     pub provider_ref: Option<String>,
     pub idempotency_key: Option<String>,
@@ -1354,8 +1299,7 @@ pub struct OrderExecutionLeg {
     pub input_asset: DepositAsset,
     pub output_asset: DepositAsset,
     pub amount_in: String,
-    pub expected_amount_out: String,
-    pub min_amount_out: Option<String>,
+    pub estimated_amount_out: String,
     pub actual_amount_in: Option<String>,
     pub actual_amount_out: Option<String>,
     pub started_at: Option<DateTime<Utc>>,
@@ -1377,8 +1321,6 @@ pub enum DepositVaultStatus {
     RefundRequired,
     Refunding,
     Refunded,
-    ManualInterventionRequired,
-    RefundManualInterventionRequired,
 }
 
 impl DepositVaultStatus {
@@ -1392,8 +1334,6 @@ impl DepositVaultStatus {
             Self::RefundRequired => "refund_required",
             Self::Refunding => "refunding",
             Self::Refunded => "refunded",
-            Self::ManualInterventionRequired => "manual_intervention_required",
-            Self::RefundManualInterventionRequired => "refund_manual_intervention_required",
         }
     }
 
@@ -1406,8 +1346,6 @@ impl DepositVaultStatus {
             "refund_required" => Some(Self::RefundRequired),
             "refunding" => Some(Self::Refunding),
             "refunded" => Some(Self::Refunded),
-            "manual_intervention_required" => Some(Self::ManualInterventionRequired),
-            "refund_manual_intervention_required" => Some(Self::RefundManualInterventionRequired),
             _ => None,
         }
     }

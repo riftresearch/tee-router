@@ -1130,7 +1130,7 @@ impl VaultRepository {
         self.map_row(&row)
     }
 
-    pub async fn mark_refund_manual_intervention_required(
+    pub async fn mark_refund_required(
         &self,
         id: Uuid,
         updated_at: DateTime<Utc>,
@@ -1144,7 +1144,7 @@ impl VaultRepository {
             WITH updated AS (
             UPDATE deposit_vaults
             SET
-                status = 'refund_manual_intervention_required',
+                status = 'refund_required',
                 last_refund_error = $3,
                 refund_next_attempt_at = NULL,
                 refund_claimed_by = NULL,
@@ -1169,7 +1169,7 @@ impl VaultRepository {
         .fetch_one(&self.pool)
         .await;
         telemetry::record_db_query(
-            "vault.mark_refund_manual_intervention_required",
+            "vault.mark_refund_required",
             result.is_ok(),
             started.elapsed(),
         );

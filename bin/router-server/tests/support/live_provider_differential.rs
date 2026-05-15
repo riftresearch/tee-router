@@ -21,7 +21,7 @@ use hyperunit_client::{
     UnitOperation, UnitOperationsRequest, UnitOperationsResponse,
 };
 use router_core::{
-    models::MarketOrderKind,
+    models::ProviderOrderKind,
     protocol::{AssetId, ChainId, DepositAsset},
     services::{
         across_client::{AcrossClient, AcrossSwapApprovalRequest, AcrossSwapApprovalResponse},
@@ -207,7 +207,7 @@ pub async fn live_vs_mock_velora_quote_contract() -> TestResult<()> {
         output_asset: deposit_asset("evm:8453", AssetId::reference(format!("{BASE_USDC:#x}"))),
         input_decimals: Some(18),
         output_decimals: Some(6),
-        order_kind: MarketOrderKind::ExactIn {
+        order_kind: ProviderOrderKind::ExactIn {
             amount_in: amount_in.to_string(),
             min_amount_out: Some("1".to_string()),
         },
@@ -268,7 +268,7 @@ pub async fn live_vs_mock_hyperliquid_quote_contract() -> TestResult<()> {
         output_asset: deposit_asset("hyperliquid", AssetId::reference("UBTC")),
         input_decimals: None,
         output_decimals: None,
-        order_kind: MarketOrderKind::ExactIn {
+        order_kind: ProviderOrderKind::ExactIn {
             amount_in: amount_in.clone(),
             min_amount_out: Some("1".to_string()),
         },
@@ -604,8 +604,8 @@ fn assert_cctp_quote_contract(
 ) -> TestResult<BridgeContract> {
     assert_eq!(quote.provider_id, "cctp", "{label} provider_id");
     let request_amount = match &request.order_kind {
-        MarketOrderKind::ExactIn { amount_in, .. } => amount_in.as_str(),
-        MarketOrderKind::ExactOut { .. } => {
+        ProviderOrderKind::ExactIn { amount_in, .. } => amount_in.as_str(),
+        ProviderOrderKind::ExactOut { .. } => {
             return Err(format!("{label} CCTP differential expects exact-in request").into())
         }
     };
@@ -833,8 +833,8 @@ fn assert_exchange_quote_contract(
     request: &ExchangeQuoteRequest,
 ) -> TestResult<ExchangeContract> {
     let requested_amount_in = match &request.order_kind {
-        MarketOrderKind::ExactIn { amount_in, .. } => amount_in.as_str(),
-        MarketOrderKind::ExactOut { .. } => {
+        ProviderOrderKind::ExactIn { amount_in, .. } => amount_in.as_str(),
+        ProviderOrderKind::ExactOut { .. } => {
             return Err(format!("{label} differential expects exact-in request").into())
         }
     };
@@ -903,7 +903,7 @@ fn cctp_quote_request(amount: U256) -> BridgeQuoteRequest {
             "evm:42161",
             AssetId::reference(format!("{ARBITRUM_USDC:#x}")),
         ),
-        order_kind: MarketOrderKind::ExactIn {
+        order_kind: ProviderOrderKind::ExactIn {
             amount_in: amount.to_string(),
             min_amount_out: Some("1".to_string()),
         },

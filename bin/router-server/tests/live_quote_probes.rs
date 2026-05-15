@@ -5,7 +5,7 @@ use chains::{bitcoin::BitcoinChain, evm::EvmChain, hyperliquid::HyperliquidChain
 use router_core::{
     config::Settings,
     db::Database,
-    models::{MarketOrderKind, MarketOrderQuote},
+    models::{MarketOrderQuote, ProviderOrderKind},
     protocol::{AssetId, ChainId, DepositAsset},
     services::{
         action_providers::{
@@ -18,10 +18,7 @@ use router_core::{
     },
 };
 use router_primitives::ChainType;
-use router_server::{
-    api::{MarketOrderQuoteKind, MarketOrderQuoteRequest},
-    services::order_manager::OrderManager,
-};
+use router_server::{api::MarketOrderQuoteRequest, services::order_manager::OrderManager};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 use testcontainers::{
@@ -86,7 +83,7 @@ async fn live_hyperliquid_ueth_ubtc_quote_probe() -> TestResult<()> {
             output_asset: deposit_asset("hyperliquid", AssetId::reference("UBTC")),
             input_decimals: None,
             output_decimals: None,
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: ProviderOrderKind::ExactIn {
                 amount_in: DEFAULT_ETH_AMOUNT_IN_WEI.to_string(),
                 min_amount_out: Some("1".to_string()),
             },
@@ -131,10 +128,7 @@ async fn live_router_quote_probe_base_usdc_to_bitcoin() -> TestResult<()> {
             from_asset: source_asset.clone(),
             to_asset: destination_asset.clone(),
             recipient_address,
-            order_kind: MarketOrderQuoteKind::ExactIn {
-                amount_in: amount_in.clone(),
-                slippage_bps: Some(100),
-            },
+            amount_in: amount_in.clone(),
         })
         .await
         .map_err(|error| format!("router Base USDC->BTC live quote failed: {error}"))?;
@@ -162,7 +156,7 @@ async fn live_router_quote_probe_base_usdc_to_bitcoin() -> TestResult<()> {
         quote.id,
         quote.provider_id,
         quote.amount_in,
-        quote.amount_out,
+        quote.estimated_amount_out,
         quote.provider_quote["path_id"].as_str().unwrap_or("<missing>")
     );
 
@@ -192,10 +186,7 @@ async fn live_router_quote_probe_base_usdc_to_hyperliquid_ubtc_paths() -> TestRe
                     from_asset: source_asset.clone(),
                     to_asset: destination_asset.clone(),
                     recipient_address: recipient_address.clone(),
-                    order_kind: MarketOrderQuoteKind::ExactIn {
-                        amount_in: amount_in.clone(),
-                        slippage_bps: Some(100),
-                    },
+                    amount_in: amount_in.clone(),
                 })
                 .await;
             match result {
@@ -325,10 +316,7 @@ async fn live_router_quote_probe_bitcoin_to_base_eth() -> TestResult<()> {
             from_asset: source_asset.clone(),
             to_asset: destination_asset.clone(),
             recipient_address,
-            order_kind: MarketOrderQuoteKind::ExactIn {
-                amount_in: amount_in.clone(),
-                slippage_bps: Some(100),
-            },
+            amount_in: amount_in.clone(),
         })
         .await
         .map_err(|error| format!("router BTC->Base ETH live quote failed: {error}"))?;
@@ -351,7 +339,7 @@ async fn live_router_quote_probe_bitcoin_to_base_eth() -> TestResult<()> {
         quote.id,
         quote.provider_id,
         quote.amount_in,
-        quote.amount_out,
+        quote.estimated_amount_out,
         quote.provider_quote["path_id"].as_str().unwrap_or("<missing>")
     );
 
@@ -383,10 +371,7 @@ async fn live_router_quote_probe_ethereum_eth_to_bitcoin() -> TestResult<()> {
             from_asset: source_asset.clone(),
             to_asset: destination_asset.clone(),
             recipient_address,
-            order_kind: MarketOrderQuoteKind::ExactIn {
-                amount_in: amount_in.clone(),
-                slippage_bps: Some(100),
-            },
+            amount_in: amount_in.clone(),
         })
         .await
         .map_err(|error| format!("router Ethereum ETH->BTC live quote failed: {error}"))?;
@@ -409,7 +394,7 @@ async fn live_router_quote_probe_ethereum_eth_to_bitcoin() -> TestResult<()> {
         quote.id,
         quote.provider_id,
         quote.amount_in,
-        quote.amount_out,
+        quote.estimated_amount_out,
         quote.provider_quote["path_id"].as_str().unwrap_or("<missing>")
     );
 
@@ -441,10 +426,7 @@ async fn live_router_quote_probe_arbitrum_usdc_to_bitcoin() -> TestResult<()> {
             from_asset: source_asset.clone(),
             to_asset: destination_asset.clone(),
             recipient_address,
-            order_kind: MarketOrderQuoteKind::ExactIn {
-                amount_in: amount_in.clone(),
-                slippage_bps: Some(100),
-            },
+            amount_in: amount_in.clone(),
         })
         .await
         .map_err(|error| format!("router Arbitrum USDC->BTC live quote failed: {error}"))?;
@@ -471,7 +453,7 @@ async fn live_router_quote_probe_arbitrum_usdc_to_bitcoin() -> TestResult<()> {
         quote.id,
         quote.provider_id,
         quote.amount_in,
-        quote.amount_out,
+        quote.estimated_amount_out,
         quote.provider_quote["path_id"].as_str().unwrap_or("<missing>")
     );
 
@@ -750,7 +732,7 @@ async fn quote_bridge_exact_in(
         .quote_bridge(BridgeQuoteRequest {
             source_asset,
             destination_asset,
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: ProviderOrderKind::ExactIn {
                 amount_in: amount_in.to_string(),
                 min_amount_out: Some("1".to_string()),
             },
@@ -777,7 +759,7 @@ async fn quote_trade_exact_in(
             output_asset,
             input_decimals,
             output_decimals,
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: ProviderOrderKind::ExactIn {
                 amount_in: amount_in.to_string(),
                 min_amount_out: Some("1".to_string()),
             },
@@ -825,8 +807,8 @@ fn bridge_step_summary(
         "destination": asset_summary(destination, Some(output_decimals)),
         "amount_in_raw": quote.amount_in,
         "amount_in": format_units_str(&quote.amount_in, input_decimals),
-        "amount_out_raw": quote.amount_out,
-        "amount_out": format_units_str(&quote.amount_out, output_decimals),
+        "estimated_amount_out_raw": quote.amount_out,
+        "estimated_amount_out": format_units_str(&quote.amount_out, output_decimals),
         "provider_quote_kind": quote.provider_quote.get("kind").and_then(Value::as_str),
         "expires_at": quote.expires_at.to_rfc3339(),
     })
@@ -848,8 +830,8 @@ fn exchange_step_summary(
         "output": asset_summary(output, Some(output_decimals)),
         "amount_in_raw": quote.amount_in,
         "amount_in": format_units_str(&quote.amount_in, input_decimals),
-        "amount_out_raw": quote.amount_out,
-        "amount_out": format_units_str(&quote.amount_out, output_decimals),
+        "estimated_amount_out_raw": quote.amount_out,
+        "estimated_amount_out": format_units_str(&quote.amount_out, output_decimals),
         "provider_quote_kind": quote.provider_quote.get("kind").and_then(Value::as_str),
         "expires_at": quote.expires_at.to_rfc3339(),
     })
@@ -872,8 +854,8 @@ fn passthrough_step_summary(
         "output": asset_summary(output, Some(output_decimals)),
         "amount_in_raw": amount,
         "amount_in": format_units_str(amount, input_decimals),
-        "amount_out_raw": amount,
-        "amount_out": format_units_str(amount, output_decimals),
+        "estimated_amount_out_raw": amount,
+        "estimated_amount_out": format_units_str(amount, output_decimals),
     })
 }
 
@@ -890,9 +872,9 @@ fn market_quote_summary(name: &str, quote: &MarketOrderQuote) -> Value {
         "amount_in": asset_display_decimals(&quote.source_asset)
             .map(|decimals| format_units_str(&quote.amount_in, decimals))
             .unwrap_or_else(|| quote.amount_in.clone()),
-        "amount_out_raw": quote.amount_out,
-        "amount_out": format_units_str(&quote.amount_out, output_decimals),
-        "effective_usdc_per_ubtc": effective_usdc_per_btc(&quote.amount_in, &quote.amount_out),
+        "estimated_amount_out_raw": quote.estimated_amount_out,
+        "estimated_amount_out": format_units_str(&quote.estimated_amount_out, output_decimals),
+        "effective_usdc_per_ubtc": effective_usdc_per_btc(&quote.amount_in, &quote.estimated_amount_out),
         "path_id": quote.provider_quote.get("path_id").and_then(Value::as_str),
         "transitions": transition_summaries(&quote.provider_quote),
     })
@@ -910,7 +892,7 @@ fn transition_summaries(provider_quote: &Value) -> Value {
                     "kind": transition.get("kind").and_then(Value::as_str),
                     "provider": transition.get("provider").and_then(Value::as_str),
                     "amount_in": transition.get("amount_in"),
-                    "amount_out": transition.get("amount_out"),
+                    "estimated_amount_out": transition.get("estimated_amount_out"),
                 })
             })
             .collect(),
@@ -1224,13 +1206,10 @@ fn assert_any_transition_kind(provider_quote: &Value, expected_kinds: &[&str]) {
 
 fn assert_market_quote_amount_format(quote: &MarketOrderQuote) {
     assert_raw_amount_string("market quote amount_in", &quote.amount_in);
-    assert_raw_amount_string("market quote amount_out", &quote.amount_out);
-    if let Some(min_amount_out) = quote.min_amount_out.as_deref() {
-        assert_raw_amount_string("market quote min_amount_out", min_amount_out);
-    }
-    if let Some(max_amount_in) = quote.max_amount_in.as_deref() {
-        assert_raw_amount_string("market quote max_amount_in", max_amount_in);
-    }
+    assert_raw_amount_string(
+        "market quote estimated_amount_out",
+        &quote.estimated_amount_out,
+    );
     assert_provider_quote_leg_amounts_are_raw(&quote.provider_quote);
 }
 

@@ -18,30 +18,11 @@ test('fetchOrderFirehose emits explicit lifecycle predicates for indexed tabs', 
 
   expect(capturedValues).toEqual([50, null, null, 'market_order'])
   expect(capturedSql).toContain('ro.order_type = $4::text')
-  expect(capturedSql).toContain("ro.status IN (\n        'refund_required'")
-  expect(capturedSql).not.toContain("'expired'")
-  expect(capturedSql).toContain("'manual_intervention_required'")
+  expect(capturedSql).toContain("ro.status = 'refund_required'")
+  expect(capturedSql).not.toContain('manual_intervention_required')
   expect(capturedSql).not.toContain("ro.status IN (\n        'failed'")
   expect(capturedSql).not.toContain('$5::text')
   expect(capturedSql).not.toContain("OR $5::text = 'needs_attention'")
-})
-
-test('fetchOrderFirehose emits dedicated expired lifecycle predicate', async () => {
-  let capturedSql = ''
-  let capturedValues: unknown[] = []
-  const pool = {
-    query: async (sql: string, values: unknown[]) => {
-      capturedSql = sql
-      capturedValues = values
-      return { rows: [orderRow()] }
-    }
-  } as unknown as Pool
-
-  await fetchOrderFirehose(pool, 50, undefined, 'market_order', 'expired')
-
-  expect(capturedValues).toEqual([50, null, null, 'market_order'])
-  expect(capturedSql).toContain("ro.status = 'expired'")
-  expect(capturedSql).not.toContain("'refund_required'")
 })
 
 test('fetchOrderFirehose keeps firehose scans free of lifecycle OR predicates', async () => {
@@ -130,7 +111,7 @@ test('fetchOrderFirehose keeps displayed quote terms anchored to the original or
     'COALESCE(moa.amount_in, moq.amount_in, loa.input_amount, loq.input_amount) AS quoted_amount_in'
   )
   expect(capturedSql).toContain(
-    'COALESCE(moa.amount_out, moq.amount_out, loa.output_amount, loq.output_amount) AS quoted_amount_out'
+    'COALESCE(moq.estimated_amount_out, loa.output_amount, loq.output_amount) AS estimated_amount_out'
   )
 })
 
@@ -160,7 +141,7 @@ test('fetchOrderFirehose preserves execution attempt ids on execution legs', asy
                   assetId: 'usdc'
                 },
                 amountIn: '10000000',
-                expectedAmountOut: '10000000',
+                estimatedAmountOut: '10000000',
                 startedAt: now.toISOString(),
                 completedAt: now.toISOString(),
                 createdAt: now.toISOString(),
@@ -185,7 +166,6 @@ test('fetchOrderFirehose keeps summary rows lightweight', async () => {
   const actualOutput = usdAmount('10000000', 'evm:42161', 'usdc')
   const plannedInput = usdAmount('10000000', 'evm:8453', 'usdc')
   const plannedOutput = usdAmount('10000000', 'evm:42161', 'usdc')
-  const plannedMinOutput = usdAmount('9900000', 'evm:42161', 'usdc')
   const pool = {
     query: async () => {
       return {
@@ -216,8 +196,7 @@ test('fetchOrderFirehose keeps summary rows lightweight', async () => {
                     actualInput,
                     actualOutput,
                     plannedInput,
-                    plannedOutput,
-                    plannedMinOutput
+                    plannedOutput
                   },
                   legs: [{ index: 0, amounts: { actualInput } }]
                 }
@@ -255,7 +234,6 @@ test('fetchOrderFirehose keeps summary rows lightweight', async () => {
     'actualInput',
     'actualOutput',
     'plannedInput',
-    'plannedMinOutput',
     'plannedOutput'
   ])
 })
@@ -359,7 +337,7 @@ test('fetchOrderMetrics rejects unsafe count values', async () => {
   )
 })
 
-test('fetchOrderMetrics excludes expired orders from needs-attention counts', async () => {
+test('fetchOrderMetrics counts only refund-required orders as needs-attention', async () => {
   let capturedSql = ''
   const pool = {
     query: async (sql: string) => {
@@ -382,7 +360,7 @@ test('fetchOrderMetrics excludes expired orders from needs-attention counts', as
     needsAttention: 0
   })
   expect(capturedSql).toContain("WHERE status IN (\n          'refund_required'")
-  expect(capturedSql).not.toContain("'expired'")
+  expect(capturedSql).not.toContain('manual_intervention_required')
 })
 
 test('fetchOrderMetrics rejects oversized count strings before numeric coercion', async () => {
@@ -419,17 +397,12 @@ function orderRow(overrides: Record<string, unknown> = {}) {
     destination_asset_id: 'native',
     recipient_address: '0x1111111111111111111111111111111111111111',
     refund_address: '0x2222222222222222222222222222222222222222',
-    action_timeout_at: now,
     workflow_trace_id: null,
     workflow_parent_span_id: null,
     quote_id: null,
     quote_provider_id: null,
-    order_kind: null,
     quoted_amount_in: null,
-    quoted_amount_out: null,
-    min_amount_out: null,
-    max_amount_in: null,
-    slippage_bps: null,
+    estimated_amount_out: null,
     quote_expires_at: null,
     provider_quote: {},
     quote_usd_valuation: {},
@@ -460,8 +433,7 @@ function executionLeg(overrides: Record<string, unknown> = {}) {
       assetId: 'usdc'
     },
     amountIn: '10000000',
-    expectedAmountOut: '10000000',
-    minAmountOut: null,
+    estimatedAmountOut: '10000000',
     actualAmountIn: null,
     actualAmountOut: null,
     startedAt: null,

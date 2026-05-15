@@ -42,7 +42,6 @@ const RANDOM_ROUTES: &[RandomRoute] = &[
         RandomAddressKind::Evm,
         LimitAsset::Usdc,
         LimitAsset::Usdc,
-        true,
     ),
     RandomRoute::new(
         "Ethereum.USDC",
@@ -51,7 +50,6 @@ const RANDOM_ROUTES: &[RandomRoute] = &[
         RandomAddressKind::Evm,
         LimitAsset::Usdc,
         LimitAsset::Usdc,
-        true,
     ),
     RandomRoute::new(
         "Base.USDC",
@@ -60,7 +58,6 @@ const RANDOM_ROUTES: &[RandomRoute] = &[
         RandomAddressKind::Evm,
         LimitAsset::Usdc,
         LimitAsset::Usdc,
-        true,
     ),
     RandomRoute::new(
         "Base.USDC",
@@ -69,7 +66,6 @@ const RANDOM_ROUTES: &[RandomRoute] = &[
         RandomAddressKind::Evm,
         LimitAsset::Usdc,
         LimitAsset::Usdc,
-        true,
     ),
     RandomRoute::new(
         "Arbitrum.USDC",
@@ -78,7 +74,6 @@ const RANDOM_ROUTES: &[RandomRoute] = &[
         RandomAddressKind::Evm,
         LimitAsset::Usdc,
         LimitAsset::Usdc,
-        true,
     ),
     RandomRoute::new(
         "Arbitrum.USDC",
@@ -87,7 +82,6 @@ const RANDOM_ROUTES: &[RandomRoute] = &[
         RandomAddressKind::Evm,
         LimitAsset::Usdc,
         LimitAsset::Usdc,
-        true,
     ),
     RandomRoute::new(
         "Ethereum.ETH",
@@ -96,7 +90,6 @@ const RANDOM_ROUTES: &[RandomRoute] = &[
         RandomAddressKind::Bitcoin,
         LimitAsset::Eth,
         LimitAsset::Btc,
-        false,
     ),
     RandomRoute::new(
         "Ethereum.USDC",
@@ -105,7 +98,6 @@ const RANDOM_ROUTES: &[RandomRoute] = &[
         RandomAddressKind::Bitcoin,
         LimitAsset::Usdc,
         LimitAsset::Btc,
-        false,
     ),
     RandomRoute::new(
         "Base.USDC",
@@ -114,7 +106,6 @@ const RANDOM_ROUTES: &[RandomRoute] = &[
         RandomAddressKind::Bitcoin,
         LimitAsset::Usdc,
         LimitAsset::Btc,
-        false,
     ),
     RandomRoute::new(
         "Arbitrum.USDC",
@@ -123,7 +114,6 @@ const RANDOM_ROUTES: &[RandomRoute] = &[
         RandomAddressKind::Bitcoin,
         LimitAsset::Usdc,
         LimitAsset::Btc,
-        false,
     ),
     RandomRoute::new(
         "Bitcoin.BTC",
@@ -132,7 +122,6 @@ const RANDOM_ROUTES: &[RandomRoute] = &[
         RandomAddressKind::Evm,
         LimitAsset::Btc,
         LimitAsset::Eth,
-        false,
     ),
     RandomRoute::new(
         "Bitcoin.BTC",
@@ -141,7 +130,6 @@ const RANDOM_ROUTES: &[RandomRoute] = &[
         RandomAddressKind::Evm,
         LimitAsset::Btc,
         LimitAsset::Usdc,
-        false,
     ),
     RandomRoute::new(
         "Bitcoin.BTC",
@@ -150,7 +138,6 @@ const RANDOM_ROUTES: &[RandomRoute] = &[
         RandomAddressKind::Evm,
         LimitAsset::Btc,
         LimitAsset::Eth,
-        false,
     ),
     RandomRoute::new(
         "Base.ETH",
@@ -159,7 +146,6 @@ const RANDOM_ROUTES: &[RandomRoute] = &[
         RandomAddressKind::Evm,
         LimitAsset::Eth,
         LimitAsset::Usdc,
-        true,
     ),
     RandomRoute::new(
         "Base.USDC",
@@ -168,7 +154,6 @@ const RANDOM_ROUTES: &[RandomRoute] = &[
         RandomAddressKind::Evm,
         LimitAsset::Usdc,
         LimitAsset::Eth,
-        true,
     ),
     RandomRoute::new(
         "Base.ETH",
@@ -177,7 +162,6 @@ const RANDOM_ROUTES: &[RandomRoute] = &[
         RandomAddressKind::Evm,
         LimitAsset::Eth,
         LimitAsset::Usdc,
-        false,
     ),
     RandomRoute::new(
         "Base.USDC",
@@ -186,10 +170,10 @@ const RANDOM_ROUTES: &[RandomRoute] = &[
         RandomAddressKind::Evm,
         LimitAsset::Usdc,
         LimitAsset::Eth,
-        false,
     ),
 ];
 
+#[allow(dead_code)]
 const RANDOM_LIMIT_ROUTES: &[RandomLimitRoute] = &[
     RandomLimitRoute::new(
         "Ethereum.USDC",
@@ -281,7 +265,6 @@ struct RandomRoute {
     destination_kind: RandomAddressKind,
     input_asset: LimitAsset,
     output_asset: LimitAsset,
-    allow_exact_out: bool,
 }
 
 impl RandomRoute {
@@ -292,7 +275,6 @@ impl RandomRoute {
         destination_kind: RandomAddressKind,
         input_asset: LimitAsset,
         output_asset: LimitAsset,
-        allow_exact_out: bool,
     ) -> Self {
         Self {
             from,
@@ -301,11 +283,11 @@ impl RandomRoute {
             destination_kind,
             input_asset,
             output_asset,
-            allow_exact_out,
         }
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RandomLimitRoute {
     from: &'static str,
@@ -317,6 +299,7 @@ struct RandomLimitRoute {
 }
 
 impl RandomLimitRoute {
+    #[allow(dead_code)]
     const fn new(
         from: &'static str,
         to: &'static str,
@@ -468,14 +451,6 @@ struct QuoteInput {
     #[arg(long)]
     from_amount: Option<String>,
 
-    /// Exact-output amount.
-    #[arg(long)]
-    to_amount: Option<String>,
-
-    /// Max slippage. Interpreted as bps when amount-format is raw.
-    #[arg(long, default_value = "100")]
-    max_slippage: String,
-
     /// Gateway amount format.
     #[arg(long, value_enum, default_value_t = AmountFormat::Raw)]
     amount_format: AmountFormat,
@@ -493,8 +468,6 @@ struct ResolvedQuoteInput {
     to: String,
     to_address: String,
     from_amount: Option<String>,
-    to_amount: Option<String>,
-    max_slippage: String,
     amount_format: AmountFormat,
     from_address: Option<String>,
 }
@@ -610,9 +583,6 @@ struct QuoteRequest<'a> {
     to_address: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     from_amount: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    to_amount: Option<&'a str>,
-    max_slippage: &'a str,
     amount_format: &'static str,
 }
 
@@ -625,14 +595,7 @@ struct QuoteResponse {
     from: String,
     to: String,
     expiry: String,
-    expected_out: String,
-    #[serde(default)]
-    expected_slippage: Option<String>,
-    #[serde(default)]
-    min_out: Option<String>,
-    #[serde(default)]
-    max_in: Option<String>,
-    max_slippage: String,
+    estimated_out: String,
     amount_format: String,
 }
 
@@ -663,14 +626,7 @@ struct OrderResponse {
     to: String,
     status: String,
     expiry: String,
-    expected_out: String,
-    #[serde(default)]
-    expected_slippage: Option<String>,
-    #[serde(default)]
-    min_out: Option<String>,
-    #[serde(default)]
-    max_in: Option<String>,
-    max_slippage: String,
+    estimated_out: String,
     amount_format: String,
     #[serde(default)]
     refund_mode: Option<String>,
@@ -857,12 +813,11 @@ async fn create_order_and_maybe_fund(
     funding_mode: FundingMode,
 ) -> Result<LoadgenResult> {
     let task_label = format!(
-        "task {index} {:?} {} -> {} from_amount={} to_amount={}",
+        "task {index} {:?} {} -> {} from_amount={}",
         quote_input.order_type,
         quote_input.from,
         quote_input.to,
-        quote_input.from_amount.as_deref().unwrap_or("-"),
-        quote_input.to_amount.as_deref().unwrap_or("-")
+        quote_input.from_amount.as_deref().unwrap_or("-")
     );
     let quote = create_quote(runtime, quote_input)
         .await
@@ -898,8 +853,6 @@ async fn create_quote(
         to: &input.to,
         to_address: &input.to_address,
         from_amount: input.from_amount.as_deref(),
-        to_amount: input.to_amount.as_deref(),
-        max_slippage: &input.max_slippage,
         amount_format: input.amount_format.as_gateway_str(),
     };
     post_json(&runtime.http, url, &request).await
@@ -1238,26 +1191,18 @@ fn resolve_static_quote_input(input: &QuoteInput) -> Result<ResolvedQuoteInput> 
             .ok_or_else(|| eyre!("--to is required unless --random is enabled"))?,
         to_address: input.to_address.clone(),
         from_amount: input.from_amount.clone(),
-        to_amount: input.to_amount.clone(),
-        max_slippage: input.max_slippage.clone(),
         amount_format: input.amount_format,
         from_address: input.from_address.clone(),
     })
 }
 
 fn validate_resolved_quote_input(input: &ResolvedQuoteInput) -> Result<()> {
-    let amount_count =
-        usize::from(input.from_amount.is_some()) + usize::from(input.to_amount.is_some());
     match input.order_type {
-        OrderType::Market if amount_count != 1 => {
-            return Err(eyre!(
-                "exactly one of --from-amount or --to-amount is required for market orders"
-            ));
+        OrderType::Market if input.from_amount.is_none() => {
+            return Err(eyre!("--from-amount is required for market orders"));
         }
-        OrderType::Limit if amount_count != 2 => {
-            return Err(eyre!(
-                "--from-amount and --to-amount are required for limit orders"
-            ));
+        OrderType::Limit => {
+            return Err(eyre!("limit orders are disabled"));
         }
         _ => {}
     }
@@ -1274,7 +1219,7 @@ fn quote_input_for_task(
     }
 
     if command.quote.order_type == OrderType::Limit {
-        return random_limit_quote_input(command, random_context, rng);
+        return Err(eyre!("limit orders are disabled"));
     }
 
     let route = RANDOM_ROUTES
@@ -1283,8 +1228,7 @@ fn quote_input_for_task(
         .to_owned();
     let notional_usdc_raw =
         rng.gen_range(command.random_min_raw_amount..=command.random_max_raw_amount);
-    let exact_out = route.allow_exact_out && rng.gen_bool(0.5);
-    let amount = market_random_amount(route, notional_usdc_raw, exact_out)?;
+    let amount = market_random_amount(route, notional_usdc_raw, false)?;
     let (to_address, from_address) = random_route_addresses(
         route.source_kind,
         route.destination_kind,
@@ -1298,47 +1242,13 @@ fn quote_input_for_task(
         from: route.from.to_string(),
         to: route.to.to_string(),
         to_address,
-        from_amount: (!exact_out).then(|| amount.clone()),
-        to_amount: exact_out.then_some(amount),
-        max_slippage: command.quote.max_slippage.clone(),
+        from_amount: Some(amount),
         amount_format: AmountFormat::Raw,
         from_address,
     })
 }
 
-fn random_limit_quote_input(
-    command: &CreateAndFundCommand,
-    random_context: &RandomContext,
-    rng: &mut StdRng,
-) -> Result<ResolvedQuoteInput> {
-    let route = RANDOM_LIMIT_ROUTES
-        .choose(rng)
-        .ok_or_else(|| eyre!("random limit route list is empty"))?
-        .to_owned();
-    let notional_usdc_raw =
-        rng.gen_range(command.random_min_raw_amount..=command.random_max_raw_amount);
-    let (from_amount, to_amount) = marketable_limit_amounts(route, notional_usdc_raw)?;
-    let (to_address, from_address) = random_route_addresses(
-        route.source_kind,
-        route.destination_kind,
-        &command.quote.to_address,
-        command.quote.from_address.as_deref(),
-        random_context.bitcoin_address.as_deref(),
-    )?;
-
-    Ok(ResolvedQuoteInput {
-        order_type: OrderType::Limit,
-        from: route.from.to_string(),
-        to: route.to.to_string(),
-        to_address,
-        from_amount: Some(from_amount),
-        to_amount: Some(to_amount),
-        max_slippage: command.quote.max_slippage.clone(),
-        amount_format: AmountFormat::Raw,
-        from_address,
-    })
-}
-
+#[allow(dead_code)]
 fn marketable_limit_amounts(
     route: RandomLimitRoute,
     notional_usdc_raw: u64,
@@ -1558,7 +1468,6 @@ mod tests {
             RandomAddressKind::Bitcoin,
             LimitAsset::Eth,
             LimitAsset::Btc,
-            false,
         );
 
         assert_eq!(
@@ -1658,9 +1567,7 @@ mod tests {
             "to": "Ethereum.USDC",
             "status": "pending_funding",
             "expiry": "2026-05-05T00:00:00Z",
-            "expectedOut": "990",
-            "minOut": "980",
-            "maxSlippage": "100",
+            "estimatedOut": "990",
             "amountFormat": "raw",
             "refundMode": "token",
             "refundToken": "secret-cancellation-token"

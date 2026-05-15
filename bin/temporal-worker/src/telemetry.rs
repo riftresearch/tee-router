@@ -60,35 +60,6 @@ pub fn record_signal(workflow_type: &'static str, signal_name: &'static str) {
     .increment(1);
 }
 
-pub fn record_manual_intervention_wait_started(workflow_type: &'static str) {
-    counter!(
-        "tee_router_temporal_worker_manual_intervention_wait_started_total",
-        "workflow_type" => workflow_type,
-    )
-    .increment(1);
-}
-
-pub fn record_manual_intervention_wait_completed(
-    workflow_type: &'static str,
-    resolution: &'static str,
-    duration: Option<Duration>,
-) {
-    counter!(
-        "tee_router_temporal_worker_manual_intervention_wait_completed_total",
-        "workflow_type" => workflow_type,
-        "resolution" => resolution,
-    )
-    .increment(1);
-    if let Some(duration) = duration {
-        histogram!(
-            "tee_router_temporal_worker_manual_intervention_wait_duration_seconds",
-            "workflow_type" => workflow_type,
-            "resolution" => resolution,
-        )
-        .record(duration.as_secs_f64());
-    }
-}
-
 pub fn record_provider_hint_wait(
     workflow_type: &'static str,
     outcome: &'static str,

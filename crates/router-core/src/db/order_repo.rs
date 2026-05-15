@@ -3,14 +3,13 @@ use crate::{
     models::{
         CustodyVault, CustodyVaultControlType, CustodyVaultRole, CustodyVaultStatus,
         CustodyVaultVisibility, DepositVaultStatus, LimitOrderAction, LimitOrderQuote,
-        LimitOrderResidualPolicy, MarketOrderKind, MarketOrderKindType, MarketOrderQuote,
-        OrderExecutionAttempt, OrderExecutionAttemptKind, OrderExecutionAttemptStatus,
-        OrderExecutionLeg, OrderExecutionStep, OrderExecutionStepStatus, OrderExecutionStepType,
-        OrderProviderAddress, OrderProviderOperation, OrderProviderOperationHint,
-        ProviderAddressRole, ProviderOperationHintKind, ProviderOperationHintStatus,
-        ProviderOperationStatus, ProviderOperationType, RouterOrder, RouterOrderAction,
-        RouterOrderQuote, RouterOrderStatus, RouterOrderType,
-        PROVIDER_OPERATION_OBSERVATION_HINT_SOURCE,
+        LimitOrderResidualPolicy, MarketOrderQuote, OrderExecutionAttempt,
+        OrderExecutionAttemptKind, OrderExecutionAttemptStatus, OrderExecutionLeg,
+        OrderExecutionStep, OrderExecutionStepStatus, OrderExecutionStepType, OrderProviderAddress,
+        OrderProviderOperation, OrderProviderOperationHint, ProviderAddressRole,
+        ProviderOperationHintKind, ProviderOperationHintStatus, ProviderOperationStatus,
+        ProviderOperationType, RouterOrder, RouterOrderAction, RouterOrderQuote, RouterOrderStatus,
+        RouterOrderType, PROVIDER_OPERATION_OBSERVATION_HINT_SOURCE,
     },
     protocol::{AssetId, ChainId, DepositAsset},
     telemetry,
@@ -32,18 +31,12 @@ const ORDER_SELECT_COLUMNS: &str = r#"
     ro.destination_asset_id,
     ro.recipient_address,
     ro.refund_address,
-    ro.action_timeout_at,
     ro.idempotency_key,
     ro.workflow_trace_id,
     ro.workflow_parent_span_id,
     ro.created_at,
     ro.updated_at,
-    moa.order_kind AS market_order_kind,
     moa.amount_in AS market_order_amount_in,
-    moa.min_amount_out AS market_order_min_amount_out,
-    moa.amount_out AS market_order_amount_out,
-    moa.max_amount_in AS market_order_max_amount_in,
-    moa.slippage_bps AS market_order_slippage_bps,
     loa.input_amount AS limit_order_input_amount,
     loa.output_amount AS limit_order_output_amount,
     loa.residual_policy AS limit_order_residual_policy
@@ -58,12 +51,8 @@ const QUOTE_SELECT_COLUMNS: &str = r#"
     destination_asset_id,
     recipient_address,
     provider_id,
-    order_kind,
     amount_in,
-    amount_out,
-    min_amount_out,
-    max_amount_in,
-    slippage_bps,
+    estimated_amount_out,
     provider_quote,
     usd_valuation_json,
     expires_at,
@@ -184,7 +173,6 @@ const EXECUTION_STEP_SELECT_COLUMNS: &str = r#"
     output_chain_id,
     output_asset_id,
     amount_in,
-    min_amount_out,
     tx_hash,
     provider_ref,
     idempotency_key,
@@ -215,8 +203,7 @@ const EXECUTION_LEG_SELECT_COLUMNS: &str = r#"
     output_chain_id,
     output_asset_id,
     amount_in,
-    expected_amount_out,
-    min_amount_out,
+    estimated_amount_out,
     actual_amount_in,
     actual_amount_out,
     started_at,
@@ -242,8 +229,7 @@ const EXECUTION_LEG_RETURNING_COLUMNS: &str = r#"
     leg.output_chain_id,
     leg.output_asset_id,
     leg.amount_in,
-    leg.expected_amount_out,
-    leg.min_amount_out,
+    leg.estimated_amount_out,
     leg.actual_amount_in,
     leg.actual_amount_out,
     leg.started_at,
@@ -402,12 +388,8 @@ impl OrderRepository {
                 destination_asset_id,
                 recipient_address,
                 provider_id,
-                order_kind,
                 amount_in,
-                amount_out,
-                min_amount_out,
-                max_amount_in,
-                slippage_bps,
+                estimated_amount_out,
                 provider_quote,
                 usd_valuation_json,
                 expires_at,
@@ -415,7 +397,7 @@ impl OrderRepository {
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8,
-                $9, $10, $11, $12, $13, $14, $15, $16, $17, $18
+                $9, $10, $11, $12, $13, $14
             )
             "#,
         )
@@ -427,12 +409,8 @@ impl OrderRepository {
         .bind(quote.destination_asset.asset.as_str())
         .bind(&quote.recipient_address)
         .bind(&quote.provider_id)
-        .bind(quote.order_kind.to_db_string())
         .bind(&quote.amount_in)
-        .bind(&quote.amount_out)
-        .bind(quote.min_amount_out.clone())
-        .bind(quote.max_amount_in.clone())
-        .bind(optional_slippage_bps_i64(quote.slippage_bps, "quote")?)
+        .bind(&quote.estimated_amount_out)
         .bind(quote.provider_quote.clone())
         .bind(quote.usd_valuation.clone())
         .bind(quote.expires_at)
@@ -524,7 +502,6 @@ impl OrderRepository {
                     destination_asset_id,
                     recipient_address,
                     refund_address,
-                    action_timeout_at,
                     idempotency_key,
                     workflow_trace_id,
                     workflow_parent_span_id,
@@ -533,7 +510,7 @@ impl OrderRepository {
                 )
                 VALUES (
                     $1, $2, $3, $4, $5, $6, $7, $8, $9,
-                    $10, $11, $12, $13, $14, $15, $16
+                    $10, $11, $12, $13, $14, $15
                 )
                 "#,
             )
@@ -547,7 +524,6 @@ impl OrderRepository {
             .bind(order.destination_asset.asset.as_str())
             .bind(&order.recipient_address)
             .bind(&order.refund_address)
-            .bind(order.action_timeout_at)
             .bind(order.idempotency_key.clone())
             .bind(&order.workflow_trace_id)
             .bind(&order.workflow_parent_span_id)
@@ -560,28 +536,15 @@ impl OrderRepository {
                 r#"
                 INSERT INTO market_order_actions (
                     order_id,
-                    order_kind,
                     amount_in,
-                    min_amount_out,
-                    amount_out,
-                    max_amount_in,
-                    slippage_bps,
                     created_at,
                     updated_at
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                VALUES ($1, $2, $3, $4)
                 "#,
             )
             .bind(order.id)
-            .bind(market_action.order_kind.to_db_string())
             .bind(market_action.amount_in)
-            .bind(market_action.min_amount_out)
-            .bind(market_action.amount_out)
-            .bind(market_action.max_amount_in)
-            .bind(optional_slippage_bps_i64(
-                market_action.slippage_bps,
-                "order",
-            )?)
             .bind(order.created_at)
             .bind(order.updated_at)
             .execute(&mut *tx)
@@ -641,7 +604,6 @@ impl OrderRepository {
                     destination_asset_id,
                     recipient_address,
                     refund_address,
-                    action_timeout_at,
                     idempotency_key,
                     workflow_trace_id,
                     workflow_parent_span_id,
@@ -650,7 +612,7 @@ impl OrderRepository {
                 )
                 VALUES (
                     $1, $2, $3, $4, $5, $6, $7, $8, $9,
-                    $10, $11, $12, $13, $14, $15, $16
+                    $10, $11, $12, $13, $14, $15
                 )
                 "#,
             )
@@ -664,7 +626,6 @@ impl OrderRepository {
             .bind(order.destination_asset.asset.as_str())
             .bind(&order.recipient_address)
             .bind(&order.refund_address)
-            .bind(order.action_timeout_at)
             .bind(order.idempotency_key.clone())
             .bind(&order.workflow_trace_id)
             .bind(&order.workflow_parent_span_id)
@@ -827,9 +788,7 @@ impl OrderRepository {
                 'funded',
                 'executing',
                 'refund_required',
-                'refunding',
-                'manual_intervention_required',
-                'refund_manual_intervention_required'
+                'refunding'
             )
             GROUP BY status
             "#,
@@ -865,38 +824,6 @@ impl OrderRepository {
                 })
             })
             .collect()
-    }
-
-    pub async fn list_manual_intervention_orders(
-        &self,
-        limit: i64,
-    ) -> RouterCoreResult<Vec<RouterOrder>> {
-        let started = Instant::now();
-        let result = sqlx_core::query::query(&format!(
-            r#"
-            SELECT {ORDER_SELECT_COLUMNS}
-            FROM router_orders ro
-            LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
-            LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
-            WHERE ro.status IN (
-                'manual_intervention_required',
-                'refund_manual_intervention_required'
-            )
-            ORDER BY ro.updated_at DESC, ro.id DESC
-            LIMIT $1
-            "#
-        ))
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await;
-        telemetry::record_db_query(
-            "order.list_manual_intervention_orders",
-            result.is_ok(),
-            started.elapsed(),
-        );
-        let rows = result?;
-
-        rows.iter().map(|row| self.map_order_row(row)).collect()
     }
 
     pub async fn transition_status(
@@ -991,106 +918,18 @@ impl OrderRepository {
 
     pub async fn expire_unfunded_order(
         &self,
-        id: Uuid,
-        now: DateTime<Utc>,
+        _id: Uuid,
+        _now: DateTime<Utc>,
     ) -> RouterCoreResult<Option<RouterOrder>> {
-        let started = Instant::now();
-        let result = sqlx_core::query::query(&format!(
-            r#"
-            WITH updated AS (
-                UPDATE router_orders ro
-                SET
-                    status = 'expired',
-                    updated_at = $2
-                WHERE ro.id = $1
-                  AND ro.status IN ('quoted', 'pending_funding')
-                  AND ro.action_timeout_at <= $2
-                  AND (
-                      ro.funding_vault_id IS NULL
-                      OR EXISTS (
-                          SELECT 1
-                          FROM deposit_vaults funding_vault
-                          WHERE funding_vault.id = ro.funding_vault_id
-                            AND funding_vault.status = 'pending_funding'
-                            AND funding_vault.funding_observed_amount IS NULL
-                      )
-                  )
-                RETURNING ro.*
-            )
-            SELECT {ORDER_SELECT_COLUMNS}
-            FROM updated ro
-            LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
-            LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
-            "#
-        ))
-        .bind(id)
-        .bind(now)
-        .fetch_optional(&self.pool)
-        .await;
-        telemetry::record_db_query(
-            "order.expire_unfunded_order",
-            result.is_ok(),
-            started.elapsed(),
-        );
-        let row = result?;
-
-        row.map(|row| self.map_order_row(&row)).transpose()
+        Ok(None)
     }
 
     pub async fn expire_unfunded_orders(
         &self,
-        now: DateTime<Utc>,
-        limit: i64,
+        _now: DateTime<Utc>,
+        _limit: i64,
     ) -> RouterCoreResult<Vec<RouterOrder>> {
-        let started = Instant::now();
-        let result = sqlx_core::query::query(&format!(
-            r#"
-            WITH candidates AS (
-                SELECT ro.id
-                FROM router_orders ro
-                WHERE ro.status IN ('quoted', 'pending_funding')
-                  AND ro.action_timeout_at <= $1
-                  AND (
-                      ro.funding_vault_id IS NULL
-                      OR EXISTS (
-                          SELECT 1
-                          FROM deposit_vaults funding_vault
-                          WHERE funding_vault.id = ro.funding_vault_id
-                            AND funding_vault.status = 'pending_funding'
-                            AND funding_vault.funding_observed_amount IS NULL
-                      )
-                  )
-                ORDER BY ro.action_timeout_at ASC, ro.id ASC
-                LIMIT $2
-                FOR UPDATE SKIP LOCKED
-            ),
-            updated AS (
-                UPDATE router_orders ro
-                SET
-                    status = 'expired',
-                    updated_at = $1
-                FROM candidates
-                WHERE ro.id = candidates.id
-                RETURNING ro.*
-            )
-            SELECT {ORDER_SELECT_COLUMNS}
-            FROM updated ro
-            LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
-            LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
-            "#
-        ))
-        .bind(now)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await;
-        telemetry::record_db_query(
-            "order.expire_unfunded_orders",
-            result.is_ok(),
-            started.elapsed(),
-        );
-        let rows = result?;
-
-        rows.iter().map(|row| self.map_order_row(row)).collect()
+        Ok(Vec::new())
     }
 
     pub async fn find_unstarted_orders_with_refunded_funding_vault(
@@ -1105,19 +944,12 @@ impl OrderRepository {
             LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
             LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
             JOIN deposit_vaults dv ON dv.id = ro.funding_vault_id
-            WHERE (
-                ro.status IN (
-                    'pending_funding',
-                    'funded',
-                    'refund_required',
-                    'refunding'
-                )
-                OR (
-                    ro.status = 'expired'
-                    AND dv.funding_observed_at IS NOT NULL
-                    AND dv.funding_observed_at <= ro.action_timeout_at
-                )
-              )
+            WHERE ro.status IN (
+                'pending_funding',
+                'funded',
+                'refund_required',
+                'refunding'
+            )
               AND dv.status = 'refunded'
               AND NOT EXISTS (
                   SELECT 1
@@ -1756,8 +1588,7 @@ impl OrderRepository {
                             output_chain_id,
                             output_asset_id,
                             amount_in,
-                            expected_amount_out,
-                            min_amount_out,
+                            estimated_amount_out,
                             actual_amount_in,
                             actual_amount_out,
                             started_at,
@@ -1770,7 +1601,7 @@ impl OrderRepository {
                         )
                         VALUES (
                             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                            $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24
+                            $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23
                         )
                         ON CONFLICT (execution_attempt_id, leg_index)
                         WHERE execution_attempt_id IS NOT NULL DO NOTHING
@@ -1799,8 +1630,7 @@ impl OrderRepository {
                 .bind(leg.output_asset.chain.as_str())
                 .bind(leg.output_asset.asset.as_str())
                 .bind(&leg.amount_in)
-                .bind(&leg.expected_amount_out)
-                .bind(leg.min_amount_out.clone())
+                .bind(&leg.estimated_amount_out)
                 .bind(leg.actual_amount_in.clone())
                 .bind(leg.actual_amount_out.clone())
                 .bind(leg.started_at)
@@ -1869,7 +1699,6 @@ impl OrderRepository {
                             output_chain_id,
                             output_asset_id,
                             amount_in,
-                            min_amount_out,
                             tx_hash,
                             provider_ref,
                             idempotency_key,
@@ -1888,7 +1717,7 @@ impl OrderRepository {
                         VALUES (
                             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
                             $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
-                            $23, $24, $25, $26, $27, $28, $29
+                            $23, $24, $25, $26, $27, $28
                         )
                         ON CONFLICT (execution_attempt_id, step_index)
                         WHERE execution_attempt_id IS NOT NULL DO NOTHING
@@ -1918,7 +1747,6 @@ impl OrderRepository {
                 .bind(step.output_asset.as_ref().map(|asset| asset.chain.as_str()))
                 .bind(step.output_asset.as_ref().map(|asset| asset.asset.as_str()))
                 .bind(step.amount_in.clone())
-                .bind(step.min_amount_out.clone())
                 .bind(step.tx_hash.clone())
                 .bind(step.provider_ref.clone())
                 .bind(step.idempotency_key.clone())
@@ -3050,10 +2878,7 @@ impl OrderRepository {
             };
             if matches!(
                 vault_status,
-                DepositVaultStatus::Completed
-                    | DepositVaultStatus::Refunded
-                    | DepositVaultStatus::ManualInterventionRequired
-                    | DepositVaultStatus::RefundManualInterventionRequired
+                DepositVaultStatus::Completed | DepositVaultStatus::Refunded
             ) {
                 return Err(RouterCoreError::Conflict {
                     message: format!(
@@ -3194,8 +3019,7 @@ impl OrderRepository {
                 input_asset: order.source_asset.clone(),
                 output_asset: order.source_asset.clone(),
                 amount_in: plan.amount.clone(),
-                expected_amount_out: plan.amount.clone(),
-                min_amount_out: None,
+                estimated_amount_out: plan.amount.clone(),
                 actual_amount_in: None,
                 actual_amount_out: None,
                 started_at: None,
@@ -3226,7 +3050,6 @@ impl OrderRepository {
                 input_asset: Some(order.source_asset.clone()),
                 output_asset: Some(order.source_asset.clone()),
                 amount_in: Some(plan.amount.clone()),
-                min_amount_out: None,
                 tx_hash: None,
                 provider_ref: None,
                 idempotency_key: Some(format!("order:{order_id}:refund:0")),
@@ -3945,639 +3768,6 @@ impl OrderRepository {
         result
     }
 
-    pub async fn mark_order_manual_intervention_required(
-        &self,
-        order_id: Uuid,
-        now: DateTime<Utc>,
-    ) -> RouterCoreResult<RouterOrder> {
-        let started = Instant::now();
-        let result = async {
-            let mut tx = self.pool.begin().await?;
-            let order_row = sqlx_core::query::query(&format!(
-                r#"
-                SELECT {ORDER_SELECT_COLUMNS}
-                FROM router_orders ro
-                LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
-                LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
-                WHERE ro.id = $1
-                FOR UPDATE OF ro
-                "#
-            ))
-            .bind(order_id)
-            .fetch_one(&mut *tx)
-            .await?;
-            let locked_order = self.map_order_row(&order_row)?;
-
-            if let Some(funding_vault_id) = locked_order.funding_vault_id {
-                sqlx_core::query::query(
-                    r#"
-                    UPDATE deposit_vaults
-                    SET status = $2, updated_at = $3
-                    WHERE id = $1
-                      AND status = ANY($4)
-                    "#,
-                )
-                .bind(funding_vault_id)
-                .bind(DepositVaultStatus::ManualInterventionRequired.to_db_string())
-                .bind(now)
-                .bind(vec![
-                    DepositVaultStatus::Funded.to_db_string(),
-                    DepositVaultStatus::Executing.to_db_string(),
-                    DepositVaultStatus::RefundRequired.to_db_string(),
-                    DepositVaultStatus::Refunding.to_db_string(),
-                ])
-                .execute(&mut *tx)
-                .await?;
-            }
-
-            let order_row = sqlx_core::query::query(&format!(
-                r#"
-                WITH updated AS (
-                    UPDATE router_orders
-                    SET status = $2, updated_at = $3
-                    WHERE id = $1
-                      AND status = ANY($4)
-                    RETURNING *
-                )
-                SELECT {ORDER_SELECT_COLUMNS}
-                FROM updated ro
-                LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
-                LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
-                UNION ALL
-                SELECT {ORDER_SELECT_COLUMNS}
-                FROM router_orders ro
-                LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
-                LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
-                WHERE ro.id = $1
-                  AND ro.status = $2
-                LIMIT 1
-                "#
-            ))
-            .bind(order_id)
-            .bind(RouterOrderStatus::ManualInterventionRequired.to_db_string())
-            .bind(now)
-            .bind(vec![
-                RouterOrderStatus::Funded.to_db_string(),
-                RouterOrderStatus::Executing.to_db_string(),
-                RouterOrderStatus::RefundRequired.to_db_string(),
-                RouterOrderStatus::Refunding.to_db_string(),
-            ])
-            .fetch_one(&mut *tx)
-            .await?;
-            let order = self.map_order_row(&order_row)?;
-
-            tx.commit().await?;
-            Ok::<RouterOrder, RouterCoreError>(order)
-        }
-        .await;
-        telemetry::record_db_query(
-            "order.mark_order_manual_intervention_required",
-            result.is_ok(),
-            started.elapsed(),
-        );
-        result
-    }
-
-    pub async fn mark_order_refund_manual_intervention_required(
-        &self,
-        order_id: Uuid,
-        now: DateTime<Utc>,
-    ) -> RouterCoreResult<RouterOrder> {
-        let started = Instant::now();
-        let result = async {
-            let mut tx = self.pool.begin().await?;
-            let order_row = sqlx_core::query::query(&format!(
-                r#"
-                SELECT {ORDER_SELECT_COLUMNS}
-                FROM router_orders ro
-                LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
-                LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
-                WHERE ro.id = $1
-                FOR UPDATE OF ro
-                "#
-            ))
-            .bind(order_id)
-            .fetch_one(&mut *tx)
-            .await?;
-            let locked_order = self.map_order_row(&order_row)?;
-
-            if let Some(funding_vault_id) = locked_order.funding_vault_id {
-                sqlx_core::query::query(
-                    r#"
-                    UPDATE deposit_vaults
-                    SET status = $2, updated_at = $3
-                    WHERE id = $1
-                      AND status = ANY($4)
-                    "#,
-                )
-                .bind(funding_vault_id)
-                .bind(DepositVaultStatus::RefundManualInterventionRequired.to_db_string())
-                .bind(now)
-                .bind(vec![
-                    DepositVaultStatus::Funded.to_db_string(),
-                    DepositVaultStatus::Executing.to_db_string(),
-                    DepositVaultStatus::RefundRequired.to_db_string(),
-                    DepositVaultStatus::Refunding.to_db_string(),
-                ])
-                .execute(&mut *tx)
-                .await?;
-            }
-
-            let order_row = sqlx_core::query::query(&format!(
-                r#"
-                WITH updated AS (
-                    UPDATE router_orders
-                    SET status = $2, updated_at = $3
-                    WHERE id = $1
-                      AND status = ANY($4)
-                    RETURNING *
-                )
-                SELECT {ORDER_SELECT_COLUMNS}
-                FROM updated ro
-                LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
-                LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
-                UNION ALL
-                SELECT {ORDER_SELECT_COLUMNS}
-                FROM router_orders ro
-                LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
-                LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
-                WHERE ro.id = $1
-                  AND ro.status = $2
-                LIMIT 1
-                "#
-            ))
-            .bind(order_id)
-            .bind(RouterOrderStatus::RefundManualInterventionRequired.to_db_string())
-            .bind(now)
-            .bind(vec![
-                RouterOrderStatus::Executing.to_db_string(),
-                RouterOrderStatus::RefundRequired.to_db_string(),
-                RouterOrderStatus::Refunding.to_db_string(),
-            ])
-            .fetch_one(&mut *tx)
-            .await?;
-            let order = self.map_order_row(&order_row)?;
-
-            tx.commit().await?;
-            Ok::<RouterOrder, RouterCoreError>(order)
-        }
-        .await;
-        telemetry::record_db_query(
-            "order.mark_order_refund_manual_intervention_required",
-            result.is_ok(),
-            started.elapsed(),
-        );
-        result
-    }
-
-    pub async fn prepare_manual_intervention_retry(
-        &self,
-        order_id: Uuid,
-        attempt_id: Uuid,
-        step_id: Uuid,
-        resolution: serde_json::Value,
-        now: DateTime<Utc>,
-    ) -> RouterCoreResult<RouterOrder> {
-        let started = Instant::now();
-        let result = async {
-            let mut tx = self.pool.begin().await?;
-            let order = self.lock_order_tx(&mut tx, order_id).await?;
-            if !matches!(
-                order.status,
-                RouterOrderStatus::ManualInterventionRequired | RouterOrderStatus::Executing
-            ) {
-                return Err(RouterCoreError::Conflict {
-                    message: format!(
-                        "order {} cannot release manual intervention from {}",
-                        order.id,
-                        order.status.to_db_string()
-                    ),
-                });
-            }
-            lock_attempt_step_for_manual_resolution(
-                self,
-                &mut tx,
-                order_id,
-                attempt_id,
-                Some(step_id),
-                OrderExecutionAttemptKind::PrimaryExecution,
-            )
-            .await?;
-
-            if let Some(funding_vault_id) = order.funding_vault_id {
-                sqlx_core::query::query(
-                    r#"
-                    UPDATE deposit_vaults
-                    SET status = $2, updated_at = $3
-                    WHERE id = $1
-                      AND status IN ('manual_intervention_required', 'executing')
-                    "#,
-                )
-                .bind(funding_vault_id)
-                .bind(DepositVaultStatus::Executing.to_db_string())
-                .bind(now)
-                .execute(&mut *tx)
-                .await?;
-            }
-
-            sqlx_core::query::query(
-                r#"
-                UPDATE order_execution_steps
-                SET
-                    details_json = jsonb_set(
-                        details_json,
-                        '{manual_intervention_resolution}',
-                        $2::jsonb,
-                        true
-                    ),
-                    updated_at = $3
-                WHERE id = $1
-                "#,
-            )
-            .bind(step_id)
-            .bind(resolution.clone())
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
-            sqlx_core::query::query(
-                r#"
-                UPDATE order_execution_attempts
-                SET
-                    status = 'failed',
-                    failure_reason_json = jsonb_set(
-                        failure_reason_json,
-                        '{manual_intervention_resolution}',
-                        $2::jsonb,
-                        true
-                    ),
-                    updated_at = $3
-                WHERE id = $1
-                  AND status IN ('manual_intervention_required', 'failed')
-                "#,
-            )
-            .bind(attempt_id)
-            .bind(resolution)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
-
-            let order = self
-                .transition_order_status_tx(
-                    &mut tx,
-                    order_id,
-                    RouterOrderStatus::ManualInterventionRequired,
-                    RouterOrderStatus::Executing,
-                    now,
-                )
-                .await?;
-            tx.commit().await?;
-            Ok::<RouterOrder, RouterCoreError>(order)
-        }
-        .await;
-        telemetry::record_db_query(
-            "order.prepare_manual_intervention_retry",
-            result.is_ok(),
-            started.elapsed(),
-        );
-        result
-    }
-
-    pub async fn prepare_manual_intervention_refund(
-        &self,
-        order_id: Uuid,
-        attempt_id: Uuid,
-        step_id: Uuid,
-        resolution: serde_json::Value,
-        now: DateTime<Utc>,
-    ) -> RouterCoreResult<RouterOrder> {
-        let started = Instant::now();
-        let result = async {
-            let mut tx = self.pool.begin().await?;
-            let order = self.lock_order_tx(&mut tx, order_id).await?;
-            if !matches!(
-                order.status,
-                RouterOrderStatus::ManualInterventionRequired
-                    | RouterOrderStatus::RefundRequired
-                    | RouterOrderStatus::Executing
-            ) {
-                return Err(RouterCoreError::Conflict {
-                    message: format!(
-                        "order {} cannot trigger refund from {}",
-                        order.id,
-                        order.status.to_db_string()
-                    ),
-                });
-            }
-            lock_attempt_step_for_manual_resolution(
-                self,
-                &mut tx,
-                order_id,
-                attempt_id,
-                Some(step_id),
-                OrderExecutionAttemptKind::PrimaryExecution,
-            )
-            .await?;
-
-            if let Some(funding_vault_id) = order.funding_vault_id {
-                sqlx_core::query::query(
-                    r#"
-                    UPDATE deposit_vaults
-                    SET status = $2, updated_at = $3
-                    WHERE id = $1
-                      AND status IN (
-                          'funded',
-                          'executing',
-                          'refund_required',
-                          'manual_intervention_required'
-                      )
-                    "#,
-                )
-                .bind(funding_vault_id)
-                .bind(DepositVaultStatus::RefundRequired.to_db_string())
-                .bind(now)
-                .execute(&mut *tx)
-                .await?;
-            }
-
-            sqlx_core::query::query(
-                r#"
-                UPDATE order_execution_steps
-                SET
-                    details_json = jsonb_set(
-                        details_json,
-                        '{manual_intervention_resolution}',
-                        $2::jsonb,
-                        true
-                    ),
-                    updated_at = $3
-                WHERE id = $1
-                "#,
-            )
-            .bind(step_id)
-            .bind(resolution.clone())
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
-            sqlx_core::query::query(
-                r#"
-                UPDATE order_execution_attempts
-                SET
-                    status = 'failed',
-                    failure_reason_json = jsonb_set(
-                        failure_reason_json,
-                        '{manual_intervention_resolution}',
-                        $2::jsonb,
-                        true
-                    ),
-                    updated_at = $3
-                WHERE id = $1
-                  AND status IN ('manual_intervention_required', 'failed')
-                "#,
-            )
-            .bind(attempt_id)
-            .bind(resolution)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
-
-            let order = self
-                .transition_order_status_tx(
-                    &mut tx,
-                    order_id,
-                    RouterOrderStatus::ManualInterventionRequired,
-                    RouterOrderStatus::RefundRequired,
-                    now,
-                )
-                .await?;
-            tx.commit().await?;
-            Ok::<RouterOrder, RouterCoreError>(order)
-        }
-        .await;
-        telemetry::record_db_query(
-            "order.prepare_manual_intervention_refund",
-            result.is_ok(),
-            started.elapsed(),
-        );
-        result
-    }
-
-    pub async fn release_refund_manual_intervention(
-        &self,
-        order_id: Uuid,
-        refund_attempt_id: Option<Uuid>,
-        step_id: Option<Uuid>,
-        resolution: serde_json::Value,
-        now: DateTime<Utc>,
-    ) -> RouterCoreResult<RouterOrder> {
-        let started = Instant::now();
-        let result = async {
-            let mut tx = self.pool.begin().await?;
-            let order = self.lock_order_tx(&mut tx, order_id).await?;
-            if !matches!(
-                order.status,
-                RouterOrderStatus::RefundManualInterventionRequired | RouterOrderStatus::Refunding
-            ) {
-                return Err(RouterCoreError::Conflict {
-                    message: format!(
-                        "order {} cannot release refund manual intervention from {}",
-                        order.id,
-                        order.status.to_db_string()
-                    ),
-                });
-            }
-
-            if let Some(attempt_id) = refund_attempt_id {
-                lock_attempt_step_for_manual_resolution(
-                    self,
-                    &mut tx,
-                    order_id,
-                    attempt_id,
-                    step_id,
-                    OrderExecutionAttemptKind::RefundRecovery,
-                )
-                .await?;
-                sqlx_core::query::query(
-                    r#"
-                    UPDATE order_execution_attempts
-                    SET
-                        status = 'active',
-                        failure_reason_json = jsonb_set(
-                            failure_reason_json,
-                            '{manual_intervention_resolution}',
-                            $2::jsonb,
-                            true
-                        ),
-                        updated_at = $3
-                    WHERE id = $1
-                      AND status IN ('manual_intervention_required', 'failed', 'active')
-                    "#,
-                )
-                .bind(attempt_id)
-                .bind(resolution.clone())
-                .bind(now)
-                .execute(&mut *tx)
-                .await?;
-            }
-
-            if let Some(step_id) = step_id {
-                sqlx_core::query::query(
-                    r#"
-                    UPDATE order_execution_steps
-                    SET
-                        status = 'planned',
-                        tx_hash = NULL,
-                        provider_ref = NULL,
-                        started_at = NULL,
-                        completed_at = NULL,
-                        response_json = '{}'::jsonb,
-                        error_json = '{}'::jsonb,
-                        details_json = jsonb_set(
-                            details_json,
-                            '{manual_intervention_resolution}',
-                            $2::jsonb,
-                            true
-                        ),
-                        updated_at = $3
-                    WHERE id = $1
-                      AND status IN ('failed', 'planned', 'ready')
-                    "#,
-                )
-                .bind(step_id)
-                .bind(resolution.clone())
-                .bind(now)
-                .execute(&mut *tx)
-                .await?;
-            }
-
-            if let Some(funding_vault_id) = order.funding_vault_id {
-                sqlx_core::query::query(
-                    r#"
-                    UPDATE deposit_vaults
-                    SET status = $2, updated_at = $3
-                    WHERE id = $1
-                      AND status IN (
-                          'refund_manual_intervention_required',
-                          'refund_required',
-                          'refunding'
-                      )
-                    "#,
-                )
-                .bind(funding_vault_id)
-                .bind(DepositVaultStatus::Refunding.to_db_string())
-                .bind(now)
-                .execute(&mut *tx)
-                .await?;
-            }
-
-            let order = self
-                .transition_order_status_tx(
-                    &mut tx,
-                    order_id,
-                    RouterOrderStatus::RefundManualInterventionRequired,
-                    RouterOrderStatus::Refunding,
-                    now,
-                )
-                .await?;
-            tx.commit().await?;
-            Ok::<RouterOrder, RouterCoreError>(order)
-        }
-        .await;
-        telemetry::record_db_query(
-            "order.release_refund_manual_intervention",
-            result.is_ok(),
-            started.elapsed(),
-        );
-        result
-    }
-
-    pub async fn acknowledge_manual_intervention_terminal(
-        &self,
-        order_id: Uuid,
-        attempt_id: Option<Uuid>,
-        step_id: Option<Uuid>,
-        refund_manual: bool,
-        resolution: serde_json::Value,
-        now: DateTime<Utc>,
-    ) -> RouterCoreResult<RouterOrder> {
-        let started = Instant::now();
-        let result = async {
-            let mut tx = self.pool.begin().await?;
-            let order = self.lock_order_tx(&mut tx, order_id).await?;
-            let expected_status = if refund_manual {
-                RouterOrderStatus::RefundManualInterventionRequired
-            } else {
-                RouterOrderStatus::ManualInterventionRequired
-            };
-            if order.status != expected_status {
-                return Err(RouterCoreError::Conflict {
-                    message: format!(
-                        "order {} cannot acknowledge {} from {}",
-                        order.id,
-                        expected_status.to_db_string(),
-                        order.status.to_db_string()
-                    ),
-                });
-            }
-
-            if let Some(attempt_id) = attempt_id {
-                sqlx_core::query::query(
-                    r#"
-                    UPDATE order_execution_attempts
-                    SET
-                        failure_reason_json = jsonb_set(
-                            failure_reason_json,
-                            '{manual_intervention_terminal_ack}',
-                            $2::jsonb,
-                            true
-                        ),
-                        updated_at = $3
-                    WHERE id = $1
-                      AND order_id = $4
-                    "#,
-                )
-                .bind(attempt_id)
-                .bind(resolution.clone())
-                .bind(now)
-                .bind(order_id)
-                .execute(&mut *tx)
-                .await?;
-            }
-            if let Some(step_id) = step_id {
-                sqlx_core::query::query(
-                    r#"
-                    UPDATE order_execution_steps
-                    SET
-                        details_json = jsonb_set(
-                            details_json,
-                            '{manual_intervention_terminal_ack}',
-                            $2::jsonb,
-                            true
-                        ),
-                        updated_at = $3
-                    WHERE id = $1
-                      AND order_id = $4
-                    "#,
-                )
-                .bind(step_id)
-                .bind(resolution)
-                .bind(now)
-                .bind(order_id)
-                .execute(&mut *tx)
-                .await?;
-            }
-
-            tx.commit().await?;
-            Ok::<RouterOrder, RouterCoreError>(order)
-        }
-        .await;
-        telemetry::record_db_query(
-            "order.acknowledge_manual_intervention_terminal",
-            result.is_ok(),
-            started.elapsed(),
-        );
-        result
-    }
-
     pub async fn create_refreshed_execution_attempt(
         &self,
         active_attempt_id: Uuid,
@@ -4853,44 +4043,6 @@ impl OrderRepository {
         self.map_execution_attempt_row(&row)
     }
 
-    pub async fn mark_execution_attempt_manual_intervention_required(
-        &self,
-        id: Uuid,
-        failure_reason: serde_json::Value,
-        input_custody_snapshot: serde_json::Value,
-        updated_at: DateTime<Utc>,
-    ) -> RouterCoreResult<OrderExecutionAttempt> {
-        let started = Instant::now();
-        let result = sqlx_core::query::query(&format!(
-            r#"
-            UPDATE order_execution_attempts
-            SET
-                status = $2,
-                failure_reason_json = $3,
-                input_custody_snapshot_json = $4,
-                updated_at = $5
-            WHERE id = $1
-              AND status IN ('planning', 'active', 'failed', 'refund_required')
-            RETURNING {EXECUTION_ATTEMPT_SELECT_COLUMNS}
-            "#
-        ))
-        .bind(id)
-        .bind(OrderExecutionAttemptStatus::ManualInterventionRequired.to_db_string())
-        .bind(failure_reason)
-        .bind(input_custody_snapshot)
-        .bind(updated_at)
-        .fetch_one(&self.pool)
-        .await;
-        telemetry::record_db_query(
-            "order.mark_execution_attempt_manual_intervention_required",
-            result.is_ok(),
-            started.elapsed(),
-        );
-        let row = result?;
-
-        self.map_execution_attempt_row(&row)
-    }
-
     pub async fn find_orders_pending_refund_planning(
         &self,
         limit: i64,
@@ -4966,120 +4118,6 @@ impl OrderRepository {
         .await;
         telemetry::record_db_query(
             "order.find_refunding_orders_pending_direct_refund_finalization",
-            result.is_ok(),
-            started.elapsed(),
-        );
-        let rows = result?;
-
-        rows.iter().map(|row| self.map_order_row(row)).collect()
-    }
-
-    pub async fn find_orders_pending_manual_refund_vault_alignment(
-        &self,
-        limit: i64,
-    ) -> RouterCoreResult<Vec<RouterOrder>> {
-        let started = Instant::now();
-        let result = sqlx_core::query::query(&format!(
-            r#"
-            SELECT DISTINCT {ORDER_SELECT_COLUMNS}
-            FROM router_orders ro
-            LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
-            LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
-            JOIN deposit_vaults dv ON dv.id = ro.funding_vault_id
-            WHERE ro.status = 'refund_manual_intervention_required'
-              AND dv.status IN ('refund_required', 'refunding')
-            ORDER BY ro.updated_at ASC, ro.id ASC
-            LIMIT $1
-            "#
-        ))
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await;
-        telemetry::record_db_query(
-            "order.find_orders_pending_manual_refund_vault_alignment",
-            result.is_ok(),
-            started.elapsed(),
-        );
-        let rows = result?;
-
-        rows.iter().map(|row| self.map_order_row(row)).collect()
-    }
-
-    pub async fn find_orders_with_manual_refund_funding_vault(
-        &self,
-        limit: i64,
-    ) -> RouterCoreResult<Vec<RouterOrder>> {
-        let started = Instant::now();
-        let result = sqlx_core::query::query(&format!(
-            r#"
-            SELECT DISTINCT {ORDER_SELECT_COLUMNS}
-            FROM router_orders ro
-            LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
-            LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
-            JOIN deposit_vaults dv ON dv.id = ro.funding_vault_id
-            WHERE ro.status IN ('refund_required', 'refunding')
-              AND dv.status = 'refund_manual_intervention_required'
-            ORDER BY ro.updated_at ASC, ro.id ASC
-            LIMIT $1
-            "#
-        ))
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await;
-        telemetry::record_db_query(
-            "order.find_orders_with_manual_refund_funding_vault",
-            result.is_ok(),
-            started.elapsed(),
-        );
-        let rows = result?;
-
-        rows.iter().map(|row| self.map_order_row(row)).collect()
-    }
-
-    pub async fn find_orders_pending_retry_or_refund_decision(
-        &self,
-        limit: i64,
-    ) -> RouterCoreResult<Vec<RouterOrder>> {
-        let started = Instant::now();
-        let result = sqlx_core::query::query(&format!(
-            r#"
-            SELECT {ORDER_SELECT_COLUMNS}
-            FROM router_orders ro
-            LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
-            LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
-            WHERE ro.status IN ('funded', 'executing', 'refunding')
-              AND (
-                    EXISTS (
-                        SELECT 1
-                        FROM order_execution_attempts active_attempt
-                        JOIN order_execution_steps failed_step
-                          ON failed_step.execution_attempt_id = active_attempt.id
-                        WHERE active_attempt.order_id = ro.id
-                          AND active_attempt.status IN ('planning', 'active')
-                          AND failed_step.status = 'failed'
-                    )
-                    OR EXISTS (
-                        SELECT 1
-                        FROM order_execution_attempts failed_attempt
-                        WHERE failed_attempt.order_id = ro.id
-                          AND failed_attempt.status = 'failed'
-                          AND NOT EXISTS (
-                              SELECT 1
-                              FROM order_execution_attempts newer
-                              WHERE newer.order_id = ro.id
-                                AND newer.attempt_index > failed_attempt.attempt_index
-                          )
-                    )
-              )
-            ORDER BY ro.updated_at ASC, ro.id ASC
-            LIMIT $1
-            "#
-        ))
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await;
-        telemetry::record_db_query(
-            "order.find_orders_pending_retry_or_refund_decision",
             result.is_ok(),
             started.elapsed(),
         );
@@ -5301,9 +4339,7 @@ impl OrderRepository {
             WHERE ro.status IN (
                 'completed',
                 'refunded',
-                'manual_intervention_required',
-                'refund_manual_intervention_required',
-                'expired'
+                'refund_required'
             )
               AND EXISTS (
                     SELECT 1
@@ -5721,7 +4757,6 @@ impl OrderRepository {
                 oes.output_chain_id,
                 oes.output_asset_id,
                 oes.amount_in,
-                oes.min_amount_out,
                 oes.tx_hash,
                 oes.provider_ref,
                 oes.idempotency_key,
@@ -6293,8 +5328,7 @@ impl OrderRepository {
                         output_chain_id,
                         output_asset_id,
                         amount_in,
-                        expected_amount_out,
-                        min_amount_out,
+                        estimated_amount_out,
                         actual_amount_in,
                         actual_amount_out,
                         started_at,
@@ -6307,7 +5341,7 @@ impl OrderRepository {
                     )
                     VALUES (
                         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                        $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24
+                        $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23
                     )
                     ON CONFLICT (execution_attempt_id, leg_index)
                     WHERE execution_attempt_id IS NOT NULL DO NOTHING
@@ -6328,8 +5362,7 @@ impl OrderRepository {
                         output_chain_id,
                         output_asset_id,
                         amount_in,
-                        expected_amount_out,
-                        min_amount_out,
+                        estimated_amount_out,
                         actual_amount_in,
                         actual_amount_out,
                         started_at,
@@ -6342,7 +5375,7 @@ impl OrderRepository {
                     )
                     VALUES (
                         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                        $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24
+                        $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23
                     )
                     ON CONFLICT (order_id, leg_index)
                     WHERE execution_attempt_id IS NULL DO NOTHING
@@ -6362,8 +5395,7 @@ impl OrderRepository {
                     .bind(leg.output_asset.chain.as_str())
                     .bind(leg.output_asset.asset.as_str())
                     .bind(&leg.amount_in)
-                    .bind(&leg.expected_amount_out)
-                    .bind(leg.min_amount_out.clone())
+                    .bind(&leg.estimated_amount_out)
                     .bind(leg.actual_amount_in.clone())
                     .bind(leg.actual_amount_out.clone())
                     .bind(leg.started_at)
@@ -6461,7 +5493,6 @@ impl OrderRepository {
                 output_chain_id,
                 output_asset_id,
                 amount_in,
-                min_amount_out,
                 tx_hash,
                 provider_ref,
                 idempotency_key,
@@ -6480,7 +5511,7 @@ impl OrderRepository {
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
                 $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
-                $23, $24, $25, $26, $27, $28, $29
+                $23, $24, $25, $26, $27, $28
             )
             "#,
         )
@@ -6498,7 +5529,6 @@ impl OrderRepository {
         .bind(step.output_asset.as_ref().map(|asset| asset.chain.as_str()))
         .bind(step.output_asset.as_ref().map(|asset| asset.asset.as_str()))
         .bind(step.amount_in.clone())
-        .bind(step.min_amount_out.clone())
         .bind(step.tx_hash.clone())
         .bind(step.provider_ref.clone())
         .bind(step.idempotency_key.clone())
@@ -6551,7 +5581,6 @@ impl OrderRepository {
                         output_chain_id,
                         output_asset_id,
                         amount_in,
-                        min_amount_out,
                         tx_hash,
                         provider_ref,
                         idempotency_key,
@@ -6570,7 +5599,7 @@ impl OrderRepository {
                     VALUES (
                         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
                         $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
-                        $23, $24, $25, $26, $27, $28, $29
+                        $23, $24, $25, $26, $27, $28
                     )
                     ON CONFLICT (execution_attempt_id, step_index)
                     WHERE execution_attempt_id IS NOT NULL DO NOTHING
@@ -6592,7 +5621,6 @@ impl OrderRepository {
                         output_chain_id,
                         output_asset_id,
                         amount_in,
-                        min_amount_out,
                         tx_hash,
                         provider_ref,
                         idempotency_key,
@@ -6611,7 +5639,7 @@ impl OrderRepository {
                     VALUES (
                         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
                         $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
-                        $23, $24, $25, $26, $27, $28, $29
+                        $23, $24, $25, $26, $27, $28
                     )
                     ON CONFLICT (order_id, step_index)
                     WHERE execution_attempt_id IS NULL DO NOTHING
@@ -6632,7 +5660,6 @@ impl OrderRepository {
                     .bind(step.output_asset.as_ref().map(|asset| asset.chain.as_str()))
                     .bind(step.output_asset.as_ref().map(|asset| asset.asset.as_str()))
                     .bind(step.amount_in.clone())
-                    .bind(step.min_amount_out.clone())
                     .bind(step.tx_hash.clone())
                     .bind(step.provider_ref.clone())
                     .bind(step.idempotency_key.clone())
@@ -7076,8 +6103,7 @@ impl OrderRepository {
                 SELECT
                     response_json,
                     request_json,
-                    amount_in,
-                    min_amount_out
+                    amount_in
                 FROM current_actions
                 WHERE status IN ('completed', 'skipped')
                 ORDER BY step_index DESC, updated_at DESC, id DESC
@@ -7114,8 +6140,7 @@ impl OrderRepository {
                     first_success_action.amount_in AS first_amount_in,
                     last_success_action.response_json AS last_response_json,
                     last_success_action.request_json AS last_request_json,
-                    last_success_action.amount_in AS last_amount_in,
-                    last_success_action.min_amount_out AS last_min_amount_out
+                    last_success_action.amount_in AS last_amount_in
                 FROM action_summary
                 LEFT JOIN first_success_action ON true
                 LEFT JOIN last_success_action ON true
@@ -7291,7 +6316,6 @@ impl OrderRepository {
                                 THEN rolled_up.last_request_json->>'amount'
                         END,
                         rolled_up.last_request_json #>> '{{price_route,destAmount}}',
-                        rolled_up.last_min_amount_out,
                         CASE
                             WHEN leg.leg_type = 'unit_deposit'
                              AND (rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,destination_amount}}') ~ '^[0-9]+$'
@@ -7795,7 +6819,7 @@ impl OrderRepository {
                         SELECT
                             leg.id,
                             COALESCE(leg.actual_amount_in, leg.amount_in) AS actual_amount_in,
-                            COALESCE(leg.actual_amount_out, leg.expected_amount_out) AS actual_amount_out,
+                            COALESCE(leg.actual_amount_out, leg.estimated_amount_out) AS actual_amount_out,
                             leg.input_chain_id,
                             leg.input_asset_id,
                             leg.output_chain_id,
@@ -8365,67 +7389,6 @@ impl OrderRepository {
         Ok(step)
     }
 
-    async fn lock_order_tx(
-        &self,
-        tx: &mut sqlx_core::transaction::Transaction<'_, Postgres>,
-        order_id: Uuid,
-    ) -> RouterCoreResult<RouterOrder> {
-        let row = sqlx_core::query::query(&format!(
-            r#"
-            SELECT {ORDER_SELECT_COLUMNS}
-            FROM router_orders ro
-            LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
-            LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
-            WHERE ro.id = $1
-            FOR UPDATE OF ro
-            "#
-        ))
-        .bind(order_id)
-        .fetch_one(&mut **tx)
-        .await?;
-        self.map_order_row(&row)
-    }
-
-    async fn transition_order_status_tx(
-        &self,
-        tx: &mut sqlx_core::transaction::Transaction<'_, Postgres>,
-        order_id: Uuid,
-        from_status: RouterOrderStatus,
-        to_status: RouterOrderStatus,
-        updated_at: DateTime<Utc>,
-    ) -> RouterCoreResult<RouterOrder> {
-        let row = sqlx_core::query::query(&format!(
-            r#"
-            WITH updated AS (
-                UPDATE router_orders
-                SET status = $2, updated_at = $3
-                WHERE id = $1
-                  AND status = $4
-                RETURNING *
-            )
-            SELECT {ORDER_SELECT_COLUMNS}
-            FROM updated ro
-            LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
-            LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
-            UNION ALL
-            SELECT {ORDER_SELECT_COLUMNS}
-            FROM router_orders ro
-            LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
-            LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
-            WHERE ro.id = $1
-              AND ro.status = $2
-            LIMIT 1
-            "#
-        ))
-        .bind(order_id)
-        .bind(to_status.to_db_string())
-        .bind(updated_at)
-        .bind(from_status.to_db_string())
-        .fetch_one(&mut **tx)
-        .await?;
-        self.map_order_row(&row)
-    }
-
     fn map_order_row(&self, row: &sqlx_postgres::PgRow) -> RouterCoreResult<RouterOrder> {
         let order_type = row.get::<String, _>("order_type");
         let order_type = RouterOrderType::from_db_string(&order_type).ok_or_else(|| {
@@ -8466,7 +7429,6 @@ impl OrderRepository {
             recipient_address: row.get("recipient_address"),
             refund_address: row.get("refund_address"),
             action,
-            action_timeout_at: row.get("action_timeout_at"),
             idempotency_key: row.get("idempotency_key"),
             workflow_trace_id: row.get("workflow_trace_id"),
             workflow_parent_span_id: row.get("workflow_parent_span_id"),
@@ -8481,44 +7443,11 @@ impl OrderRepository {
         row: &sqlx_postgres::PgRow,
     ) -> RouterCoreResult<RouterOrderAction> {
         match order_type {
-            RouterOrderType::MarketOrder => {
-                let order_kind = row
-                    .get::<Option<String>, _>("market_order_kind")
-                    .ok_or_else(|| RouterCoreError::InvalidData {
-                        message: "market order row is missing market_order_actions".to_string(),
-                    })?;
-                let order_kind =
-                    MarketOrderKindType::from_db_string(&order_kind).ok_or_else(|| {
-                        RouterCoreError::InvalidData {
-                            message: format!("unsupported market order kind: {order_kind}"),
-                        }
-                    })?;
-                let order_kind = match order_kind {
-                    MarketOrderKindType::ExactIn => MarketOrderKind::ExactIn {
-                        amount_in: required_action_amount(row, "market_order_amount_in")?,
-                        min_amount_out: row.get("market_order_min_amount_out"),
-                    },
-                    MarketOrderKindType::ExactOut => MarketOrderKind::ExactOut {
-                        amount_out: required_action_amount(row, "market_order_amount_out")?,
-                        max_amount_in: row.get("market_order_max_amount_in"),
-                    },
-                };
-                let slippage_bps = row
-                    .get::<Option<i64>, _>("market_order_slippage_bps")
-                    .map(|value| {
-                        u64::try_from(value).map_err(|err| RouterCoreError::InvalidData {
-                            message: format!("invalid market order slippage_bps: {err}"),
-                        })
-                    })
-                    .transpose()?;
-
-                Ok(RouterOrderAction::MarketOrder(
-                    crate::models::MarketOrderAction {
-                        order_kind,
-                        slippage_bps,
-                    },
-                ))
-            }
+            RouterOrderType::MarketOrder => Ok(RouterOrderAction::MarketOrder(
+                crate::models::MarketOrderAction {
+                    amount_in: required_action_amount(row, "market_order_amount_in")?,
+                },
+            )),
             RouterOrderType::LimitOrder => {
                 let residual_policy = row
                     .get::<Option<String>, _>("limit_order_residual_policy")
@@ -8542,12 +7471,6 @@ impl OrderRepository {
     }
 
     fn map_quote_row(&self, row: &sqlx_postgres::PgRow) -> RouterCoreResult<MarketOrderQuote> {
-        let order_kind = row.get::<String, _>("order_kind");
-        let order_kind = MarketOrderKindType::from_db_string(&order_kind).ok_or_else(|| {
-            RouterCoreError::InvalidData {
-                message: format!("unsupported market order kind: {order_kind}"),
-            }
-        })?;
         let source_chain = parse_chain_id(row.get::<String, _>("source_chain_id"), "quote source")?;
         let source_asset = parse_asset_id(row.get::<String, _>("source_asset_id"), "quote source")?;
         let destination_chain = parse_chain_id(
@@ -8572,19 +7495,8 @@ impl OrderRepository {
             },
             recipient_address: row.get("recipient_address"),
             provider_id: row.get("provider_id"),
-            order_kind,
             amount_in: row.get("amount_in"),
-            amount_out: row.get("amount_out"),
-            min_amount_out: row.get("min_amount_out"),
-            max_amount_in: row.get("max_amount_in"),
-            slippage_bps: row
-                .get::<Option<i64>, _>("slippage_bps")
-                .map(|value| {
-                    u64::try_from(value).map_err(|err| RouterCoreError::InvalidData {
-                        message: format!("invalid quote slippage_bps: {err}"),
-                    })
-                })
-                .transpose()?,
+            estimated_amount_out: row.get("estimated_amount_out"),
             provider_quote: row.get("provider_quote"),
             usd_valuation: row.get("usd_valuation_json"),
             expires_at: row.get("expires_at"),
@@ -8831,7 +7743,6 @@ impl OrderRepository {
                 "output",
             )?,
             amount_in: row.get("amount_in"),
-            min_amount_out: row.get("min_amount_out"),
             tx_hash: row.get("tx_hash"),
             provider_ref: row.get("provider_ref"),
             idempotency_key: row.get("idempotency_key"),
@@ -8915,8 +7826,7 @@ impl OrderRepository {
                 asset: output_asset,
             },
             amount_in: row.get("amount_in"),
-            expected_amount_out: row.get("expected_amount_out"),
-            min_amount_out: row.get("min_amount_out"),
+            estimated_amount_out: row.get("estimated_amount_out"),
             actual_amount_in: row.get("actual_amount_in"),
             actual_amount_out: row.get("actual_amount_out"),
             started_at: row.get("started_at"),
@@ -8963,71 +7873,6 @@ impl OrderRepository {
     }
 }
 
-async fn lock_attempt_step_for_manual_resolution(
-    repo: &OrderRepository,
-    tx: &mut sqlx_core::transaction::Transaction<'_, Postgres>,
-    order_id: Uuid,
-    attempt_id: Uuid,
-    step_id: Option<Uuid>,
-    expected_kind: OrderExecutionAttemptKind,
-) -> RouterCoreResult<()> {
-    let attempt_row = sqlx_core::query::query(&format!(
-        r#"
-        SELECT {EXECUTION_ATTEMPT_SELECT_COLUMNS}
-        FROM order_execution_attempts
-        WHERE id = $1
-        FOR UPDATE
-        "#
-    ))
-    .bind(attempt_id)
-    .fetch_one(&mut **tx)
-    .await?;
-    let attempt = repo.map_execution_attempt_row(&attempt_row)?;
-    if attempt.order_id != order_id {
-        return Err(RouterCoreError::Conflict {
-            message: format!(
-                "manual-intervention attempt {} does not belong to order {}",
-                attempt.id, order_id
-            ),
-        });
-    }
-    if attempt.attempt_kind != expected_kind {
-        return Err(RouterCoreError::Conflict {
-            message: format!(
-                "manual-intervention attempt {} is {} instead of {}",
-                attempt.id,
-                attempt.attempt_kind.to_db_string(),
-                expected_kind.to_db_string()
-            ),
-        });
-    }
-
-    if let Some(step_id) = step_id {
-        let step_row = sqlx_core::query::query(&format!(
-            r#"
-            SELECT {EXECUTION_STEP_SELECT_COLUMNS}
-            FROM order_execution_steps
-            WHERE id = $1
-            FOR UPDATE
-            "#
-        ))
-        .bind(step_id)
-        .fetch_one(&mut **tx)
-        .await?;
-        let step = repo.map_execution_step_row(&step_row)?;
-        if step.order_id != order_id || step.execution_attempt_id != Some(attempt.id) {
-            return Err(RouterCoreError::Conflict {
-                message: format!(
-                    "manual-intervention step {} does not belong to order {} attempt {}",
-                    step.id, order_id, attempt.id
-                ),
-            });
-        }
-    }
-
-    Ok(())
-}
-
 async fn insert_execution_leg_tx(
     tx: &mut sqlx_core::transaction::Transaction<'_, Postgres>,
     leg: &OrderExecutionLeg,
@@ -9048,8 +7893,7 @@ async fn insert_execution_leg_tx(
             output_chain_id,
             output_asset_id,
             amount_in,
-            expected_amount_out,
-            min_amount_out,
+            estimated_amount_out,
             actual_amount_in,
             actual_amount_out,
             started_at,
@@ -9062,7 +7906,7 @@ async fn insert_execution_leg_tx(
         )
         VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-            $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24
+            $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23
         )
         "#,
     )
@@ -9079,8 +7923,7 @@ async fn insert_execution_leg_tx(
     .bind(leg.output_asset.chain.as_str())
     .bind(leg.output_asset.asset.as_str())
     .bind(&leg.amount_in)
-    .bind(&leg.expected_amount_out)
-    .bind(leg.min_amount_out.clone())
+    .bind(&leg.estimated_amount_out)
     .bind(leg.actual_amount_in.clone())
     .bind(leg.actual_amount_out.clone())
     .bind(leg.started_at)
@@ -9116,7 +7959,6 @@ async fn insert_execution_step_tx(
             output_chain_id,
             output_asset_id,
             amount_in,
-            min_amount_out,
             tx_hash,
             provider_ref,
             idempotency_key,
@@ -9135,7 +7977,7 @@ async fn insert_execution_step_tx(
         VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
             $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
-            $23, $24, $25, $26, $27, $28, $29
+            $23, $24, $25, $26, $27, $28
         )
         "#,
     )
@@ -9153,7 +7995,6 @@ async fn insert_execution_step_tx(
     .bind(step.output_asset.as_ref().map(|asset| asset.chain.as_str()))
     .bind(step.output_asset.as_ref().map(|asset| asset.asset.as_str()))
     .bind(step.amount_in.clone())
-    .bind(step.min_amount_out.clone())
     .bind(step.tx_hash.clone())
     .bind(step.provider_ref.clone())
     .bind(step.idempotency_key.clone())
@@ -9211,11 +8052,8 @@ fn ensure_execution_leg_plan_matches(
     if existing.amount_in != planned.amount_in {
         mismatches.push("amount_in");
     }
-    if existing.expected_amount_out != planned.expected_amount_out {
-        mismatches.push("expected_amount_out");
-    }
-    if existing.min_amount_out != planned.min_amount_out {
-        mismatches.push("min_amount_out");
+    if existing.estimated_amount_out != planned.estimated_amount_out {
+        mismatches.push("estimated_amount_out");
     }
     if !same_timestamptz_at_db_precision(
         existing.provider_quote_expires_at,
@@ -9287,9 +8125,6 @@ fn ensure_execution_step_plan_matches(
     if existing.amount_in != planned.amount_in {
         mismatches.push("amount_in");
     }
-    if existing.min_amount_out != planned.min_amount_out {
-        mismatches.push("min_amount_out");
-    }
     if existing.provider_ref != planned.provider_ref {
         mismatches.push("provider_ref");
     }
@@ -9344,59 +8179,20 @@ fn parse_optional_deposit_asset(
 }
 
 struct MarketOrderActionFields {
-    order_kind: MarketOrderKindType,
-    amount_in: Option<String>,
-    min_amount_out: Option<String>,
-    amount_out: Option<String>,
-    max_amount_in: Option<String>,
-    slippage_bps: Option<u64>,
+    amount_in: String,
 }
 
 fn market_order_action_fields(
     action: &RouterOrderAction,
 ) -> RouterCoreResult<MarketOrderActionFields> {
     match action {
-        RouterOrderAction::MarketOrder(action) => match &action.order_kind {
-            MarketOrderKind::ExactIn {
-                amount_in,
-                min_amount_out,
-            } => Ok(MarketOrderActionFields {
-                order_kind: MarketOrderKindType::ExactIn,
-                amount_in: Some(amount_in.clone()),
-                min_amount_out: min_amount_out.clone(),
-                amount_out: None,
-                max_amount_in: None,
-                slippage_bps: action.slippage_bps,
-            }),
-            MarketOrderKind::ExactOut {
-                amount_out,
-                max_amount_in,
-            } => Ok(MarketOrderActionFields {
-                order_kind: MarketOrderKindType::ExactOut,
-                amount_in: None,
-                min_amount_out: None,
-                amount_out: Some(amount_out.clone()),
-                max_amount_in: max_amount_in.clone(),
-                slippage_bps: action.slippage_bps,
-            }),
-        },
+        RouterOrderAction::MarketOrder(action) => Ok(MarketOrderActionFields {
+            amount_in: action.amount_in.clone(),
+        }),
         RouterOrderAction::LimitOrder(_) => Err(RouterCoreError::InvalidData {
             message: "expected market order action".to_string(),
         }),
     }
-}
-
-fn optional_slippage_bps_i64(
-    slippage_bps: Option<u64>,
-    owner: &str,
-) -> RouterCoreResult<Option<i64>> {
-    slippage_bps
-        .map(|value| {
-            i64::try_from(value).map_err(|err| RouterCoreError::Validation {
-                message: format!("{owner} slippage_bps does not fit i64: {err}"),
-            })
-        })
-        .transpose()
 }
 
 fn limit_order_action_fields(action: &RouterOrderAction) -> RouterCoreResult<LimitOrderAction> {

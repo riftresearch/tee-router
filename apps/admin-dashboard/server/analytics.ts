@@ -110,12 +110,7 @@ const ACTIVE_ORDER_STATUSES = new Set([
   'refund_required',
   'refunding'
 ])
-const NEEDS_ATTENTION_ORDER_STATUSES = new Set([
-  'refund_required',
-  'refunding',
-  'manual_intervention_required',
-  'refund_manual_intervention_required'
-])
+const NEEDS_ATTENTION_ORDER_STATUSES = new Set(['refund_required'])
 
 export class VolumeAnalyticsRuntime {
   private readonly pool: Pool

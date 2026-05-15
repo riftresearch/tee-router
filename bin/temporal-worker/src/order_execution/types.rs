@@ -5,11 +5,10 @@ use router_core::{
     services::asset_registry::CanonicalAsset,
 };
 pub use router_temporal::{
-    AcknowledgeUnrecoverableSignal, BtcDepositObservedEvidence, HlBridgeDepositCreditedEvidence,
-    HlBridgeDepositObservedEvidence, HlTradeCanceledEvidence, HlTradeFilledEvidence,
-    HlWithdrawalAcknowledgedEvidence, HlWithdrawalSettledEvidence,
-    HyperUnitDepositCreditedEvidence, HyperUnitWithdrawalAcknowledgedEvidence,
-    HyperUnitWithdrawalSettledEvidence, ManualReleaseSignal, ManualTriggerRefundSignal,
+    BtcDepositObservedEvidence, HlBridgeDepositCreditedEvidence, HlBridgeDepositObservedEvidence,
+    HlTradeCanceledEvidence, HlTradeFilledEvidence, HlWithdrawalAcknowledgedEvidence,
+    HlWithdrawalSettledEvidence, HyperUnitDepositCreditedEvidence,
+    HyperUnitWithdrawalAcknowledgedEvidence, HyperUnitWithdrawalSettledEvidence,
     OrderWorkflowInput, ProviderHintKind, ProviderKind, ProviderOperationHintEvidence,
     ProviderOperationHintSignal, UnitDepositHintEvidence, WorkflowAttemptId, WorkflowHintId,
     WorkflowOrderId, WorkflowProviderOperationId, WorkflowStepId, WorkflowVaultId,
@@ -203,18 +202,6 @@ pub struct OrderExecutionState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LoadManualInterventionContextInput {
-    pub order_id: WorkflowOrderId,
-    pub scope: ManualInterventionScope,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ManualInterventionWorkflowContext {
-    pub attempt_id: Option<WorkflowAttemptId>,
-    pub step_id: Option<WorkflowStepId>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MaterializeExecutionAttemptInput {
     pub order_id: WorkflowOrderId,
     pub plan: ExecutionPlan,
@@ -342,63 +329,6 @@ pub struct FinalizeOrderOrRefundInput {
     pub reason: Option<Value>,
     #[serde(default)]
     pub funded_to_workflow_start_seconds: Option<f64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PrepareManualInterventionRetryInput {
-    pub order_id: WorkflowOrderId,
-    pub attempt_id: WorkflowAttemptId,
-    pub step_id: WorkflowStepId,
-    pub signal: ManualReleaseSignal,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PrepareManualInterventionRefundInput {
-    pub order_id: WorkflowOrderId,
-    pub attempt_id: WorkflowAttemptId,
-    pub step_id: WorkflowStepId,
-    pub signal: ManualTriggerRefundSignal,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReleaseRefundManualInterventionInput {
-    pub order_id: WorkflowOrderId,
-    pub refund_attempt_id: Option<WorkflowAttemptId>,
-    pub step_id: Option<WorkflowStepId>,
-    pub signal_kind: ManualResolutionSignalKind,
-    pub reason: String,
-    pub operator_id: Option<String>,
-    pub requested_at: chrono::DateTime<chrono::Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AcknowledgeManualInterventionInput {
-    pub order_id: WorkflowOrderId,
-    pub attempt_id: Option<WorkflowAttemptId>,
-    pub step_id: Option<WorkflowStepId>,
-    pub scope: ManualInterventionScope,
-    pub signal: AcknowledgeUnrecoverableSignal,
-    pub reason: AcknowledgeReason,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ManualInterventionScope {
-    OrderAttempt,
-    RefundAttempt,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AcknowledgeReason {
-    OperatorTerminal,
-    ZombieCleanup,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ManualResolutionSignalKind {
-    Release,
-    TriggerRefund,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -623,7 +553,6 @@ pub struct InputCustodySnapshot {
     pub failed_step_index: i32,
     pub failed_step_type: String,
     pub amount_in: Option<String>,
-    pub min_amount_out: Option<String>,
     pub source_asset: InputCustodySnapshotAsset,
     pub source_custody_vault_id: Option<Value>,
     pub source_custody_vault_role: Option<Value>,
@@ -666,7 +595,6 @@ impl InputCustodySnapshot {
             failed_step_index: failed_step.step_index,
             failed_step_type: failed_step.step_type.to_db_string().to_string(),
             amount_in: failed_step.amount_in.clone(),
-            min_amount_out: failed_step.min_amount_out.clone(),
             source_asset: InputCustodySnapshotAsset {
                 chain: source_asset.chain.as_str().to_string(),
                 asset: source_asset.asset.as_str().to_string(),
@@ -767,29 +695,13 @@ pub struct RefreshedAttemptMaterialized {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum StaleQuoteRefreshUntenableReason {
-    RefreshedExactInOutputBelowMinAmountOut {
-        amount_out: String,
-        min_amount_out: String,
-    },
-    RefreshedExactOutInputAboveAvailableAmount {
-        amount_in: String,
-        available_amount: String,
-    },
-    StaleProviderQuoteRefreshUntenable {
-        message: String,
-    },
+    StaleProviderQuoteRefreshUntenable { message: String },
 }
 
 impl StaleQuoteRefreshUntenableReason {
     #[must_use]
     pub fn reason_str(&self) -> &'static str {
         match self {
-            Self::RefreshedExactInOutputBelowMinAmountOut { .. } => {
-                "refreshed_exact_in_output_below_min_amount_out"
-            }
-            Self::RefreshedExactOutInputAboveAvailableAmount { .. } => {
-                "refreshed_exact_out_input_above_available_amount"
-            }
             Self::StaleProviderQuoteRefreshUntenable { .. } => {
                 "stale_provider_quote_refresh_untenable"
             }
@@ -803,7 +715,6 @@ pub enum OrderWorkflowPhase {
     Executing,
     RefreshingQuote,
     Refunding,
-    WaitingForManualIntervention,
     Finalizing,
 }
 
@@ -812,20 +723,17 @@ pub enum OrderTerminalStatus {
     Completed,
     RefundRequired,
     Refunded,
-    ManualInterventionRequired,
-    RefundManualInterventionRequired,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RefundTerminalStatus {
     Refunded,
-    RefundManualInterventionRequired,
+    RefundRequired,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RefundTrigger {
     FailedAttempt,
-    ManualRefund,
     VaultAlreadyRefunded,
 }
 
@@ -854,7 +762,6 @@ pub enum StepFailureDecision {
     RetryNewAttempt,
     RefreshQuote,
     StartRefund,
-    ManualIntervention,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -991,7 +898,6 @@ mod tests {
             "failed_step_index": 1,
             "failed_step_type": "across_bridge",
             "amount_in": "1000000",
-            "min_amount_out": "990000",
             "source_asset": {
                 "chain": "base",
                 "asset": "usdc"

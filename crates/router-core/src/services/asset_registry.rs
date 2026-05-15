@@ -1920,9 +1920,7 @@ mod tests {
     // source/destination assets.
     // ---------------------------------------------------------------------
 
-    use crate::services::route_costs::{
-        rank_transition_paths_structurally, structural_path_score,
-    };
+    use crate::services::route_costs::{rank_transition_paths_structurally, structural_path_score};
 
     const TRACE_ROUTE_MAX_DEPTH: usize = 5;
 
@@ -1935,9 +1933,8 @@ mod tests {
         destination: &DepositAsset,
     ) -> Vec<TransitionPath> {
         let registry = AssetRegistry::default();
-        let pricing = crate::services::pricing::PricingSnapshot::static_bootstrap(
-            chrono::Utc::now(),
-        );
+        let pricing =
+            crate::services::pricing::PricingSnapshot::static_bootstrap(chrono::Utc::now());
 
         eprintln!("\n=== trace_route: {label} ===");
         eprintln!(
@@ -1982,7 +1979,10 @@ mod tests {
 
         let mut ranked = same_chain_preferred;
         rank_transition_paths_structurally(&mut ranked);
-        eprintln!("[4] structural ranking ({} paths, lowest cost first):", ranked.len());
+        eprintln!(
+            "[4] structural ranking ({} paths, lowest cost first):",
+            ranked.len()
+        );
         print_paths(&ranked, &pricing);
 
         eprintln!("=== end trace: {label} ===\n");
@@ -1998,10 +1998,15 @@ mod tests {
         }
         let last_kind = path.transitions.last().map(|t| t.kind);
         matches!(last_kind, Some(MarketOrderTransitionKind::UnitWithdrawal))
-            || matches!(last_kind, Some(MarketOrderTransitionKind::UniversalRouterSwap))
+            || matches!(
+                last_kind,
+                Some(MarketOrderTransitionKind::UniversalRouterSwap)
+            )
             || (matches!(
                 last_kind,
-                Some(MarketOrderTransitionKind::AcrossBridge | MarketOrderTransitionKind::CctpBridge)
+                Some(
+                    MarketOrderTransitionKind::AcrossBridge | MarketOrderTransitionKind::CctpBridge
+                )
             ) && path_contains_runtime_asset_for_trace(registry, path))
     }
 
@@ -2029,9 +2034,9 @@ mod tests {
         let same_chain_paths: Vec<_> = paths
             .iter()
             .filter(|p| {
-                p.transitions.iter().all(|t| {
-                    t.input.asset.chain == *chain && t.output.asset.chain == *chain
-                })
+                p.transitions
+                    .iter()
+                    .all(|t| t.input.asset.chain == *chain && t.output.asset.chain == *chain)
             })
             .cloned()
             .collect();
@@ -2085,7 +2090,10 @@ mod tests {
         );
         let destination = asset("bitcoin", AssetId::Native);
         let ranked = trace_route("Base.USDC -> Bitcoin", &source, &destination);
-        assert!(!ranked.is_empty(), "expected at least one route for Base.USDC -> BTC");
+        assert!(
+            !ranked.is_empty(),
+            "expected at least one route for Base.USDC -> BTC"
+        );
     }
 
     #[test]
@@ -2093,7 +2101,10 @@ mod tests {
         let source = asset("evm:1", AssetId::Native);
         let destination = asset("bitcoin", AssetId::Native);
         let ranked = trace_route("Ethereum.ETH -> Bitcoin", &source, &destination);
-        assert!(!ranked.is_empty(), "expected at least one route for ETH -> BTC");
+        assert!(
+            !ranked.is_empty(),
+            "expected at least one route for ETH -> BTC"
+        );
     }
 
     #[test]
@@ -2104,7 +2115,10 @@ mod tests {
             AssetId::reference("0x2222222222222222222222222222222222222222"),
         );
         let ranked = trace_route("Bitcoin -> Base.<random ERC20>", &source, &destination);
-        assert!(!ranked.is_empty(), "expected at least one route for BTC -> arbitrary Base token");
+        assert!(
+            !ranked.is_empty(),
+            "expected at least one route for BTC -> arbitrary Base token"
+        );
     }
 
     #[test]
@@ -2124,10 +2138,10 @@ mod tests {
         );
         assert!(
             ranked.iter().all(|p| {
-                p.transitions
-                    .iter()
-                    .all(|t| t.input.asset.chain.as_str() == "evm:8453"
-                        && t.output.asset.chain.as_str() == "evm:8453")
+                p.transitions.iter().all(|t| {
+                    t.input.asset.chain.as_str() == "evm:8453"
+                        && t.output.asset.chain.as_str() == "evm:8453"
+                })
             }),
             "same-chain preference should restrict ranked paths to evm:8453"
         );
@@ -2144,6 +2158,9 @@ mod tests {
             AssetId::reference("0xaf88d065e77c8cc2239327c5edb3a432268e5831"),
         );
         let ranked = trace_route("Base.USDC -> Arbitrum.USDC", &source, &destination);
-        assert!(!ranked.is_empty(), "expected at least one route Base.USDC -> Arbitrum.USDC");
+        assert!(
+            !ranked.is_empty(),
+            "expected at least one route Base.USDC -> Arbitrum.USDC"
+        );
     }
 }

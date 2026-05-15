@@ -42,12 +42,8 @@ test('RouterClient strips trailing slashes before appending API paths', async ()
           },
           recipient_address: '0x1111111111111111111111111111111111111111',
           provider_id: 'test-provider',
-          order_kind: 'exact_in',
           amount_in: '1000000',
-          amount_out: '999000',
-          min_amount_out: '989010',
-          max_amount_in: null,
-          slippage_bps: 100,
+          estimated_amount_out: '999000',
           expires_at: '2026-05-05T00:00:00Z',
           created_at: '2026-05-05T00:00:00Z'
         }

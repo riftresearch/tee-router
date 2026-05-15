@@ -38,7 +38,6 @@ export type OrderExecutionStep = {
   input?: AssetRef
   output?: AssetRef
   amountIn?: string
-  minAmountOut?: string
   txHash?: string
   providerRef?: string
   startedAt?: string
@@ -75,8 +74,7 @@ export type OrderExecutionLeg = {
   input: AssetRef
   output: AssetRef
   amountIn: string
-  expectedAmountOut: string
-  minAmountOut?: string
+  estimatedAmountOut: string
   actualAmountIn?: string
   actualAmountOut?: string
   startedAt?: string
@@ -126,8 +124,7 @@ export type LimitOrderStatus = {
     | 'filled'
     | 'completed'
     | 'refunded'
-    | 'manual_intervention'
-    | 'manual_refund'
+    | 'refund_required'
     | 'failed'
     | 'expired'
   label: string
@@ -153,13 +150,8 @@ export type OrderFirehoseRow = {
   destination: AssetRef
   recipientAddress: string
   refundAddress: string
-  actionTimeoutAt: string
-  orderKind?: string
   quotedInputAmount?: string
-  quotedOutputAmount?: string
-  minAmountOut?: string
-  maxAmountIn?: string
-  slippageBps?: string
+  estimatedOutputAmount?: string
   quoteId?: string
   quoteProviderId?: string
   quoteExpiresAt?: string
@@ -179,7 +171,6 @@ export type OrderLifecycleFilter =
   | 'firehose'
   | 'in_progress'
   | 'needs_attention'
-  | 'expired'
   | 'refunded'
 export type VolumeBucketSize = 'five_minute' | 'hour' | 'day'
 export type VolumeOrderTypeFilter = 'all' | OrderTypeFilter

@@ -299,8 +299,8 @@ impl router_core::services::action_providers::BridgeProvider for TestHyperliquid
     ) -> ProviderFuture<'a, Option<BridgeQuote>> {
         Box::pin(async move {
             let amount_in = match &request.order_kind {
-                MarketOrderKind::ExactIn { amount_in, .. } => amount_in.clone(),
-                MarketOrderKind::ExactOut { amount_out, .. } => amount_out.clone(),
+                ProviderOrderKind::ExactIn { amount_in, .. } => amount_in.clone(),
+                ProviderOrderKind::ExactOut { amount_out, .. } => amount_out.clone(),
             };
             Ok(Some(BridgeQuote {
                 provider_id: ProviderId::HyperliquidBridge.as_str().to_string(),
@@ -336,8 +336,8 @@ impl ExchangeProvider for TestHyperliquidExchangeProvider {
     ) -> ProviderFuture<'a, Option<ExchangeQuote>> {
         Box::pin(async move {
             let amount_in = match &request.order_kind {
-                MarketOrderKind::ExactIn { amount_in, .. } => amount_in.clone(),
-                MarketOrderKind::ExactOut { amount_out, .. } => amount_out.clone(),
+                ProviderOrderKind::ExactIn { amount_in, .. } => amount_in.clone(),
+                ProviderOrderKind::ExactOut { amount_out, .. } => amount_out.clone(),
             };
             let amount_out = if request.output_asset.chain.as_str() == "hyperliquid"
                 && request.output_asset.asset.as_str() == "UBTC"
@@ -365,7 +365,10 @@ impl ExchangeProvider for TestHyperliquidExchangeProvider {
                         "output_asset": QuoteLegAsset::from_deposit_asset(&request.output_asset),
                         "amount_in": amount_in,
                         "amount_out": amount_out,
-                        "order_kind": request.order_kind.kind_type().to_db_string(),
+                        "order_kind": match &request.order_kind {
+                            ProviderOrderKind::ExactIn { .. } => "exact_in",
+                            ProviderOrderKind::ExactOut { .. } => "exact_out",
+                        },
                         "min_amount_out": "1",
                     }],
                 }),
@@ -1389,7 +1392,7 @@ async fn hyperliquid_bridge_quotes_build_refund_quote_leg_shapes() {
         .quote_bridge(BridgeQuoteRequest {
             source_asset: external_usdc.clone(),
             destination_asset: hl_usdc.clone(),
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: ProviderOrderKind::ExactIn {
                 amount_in: "150000000".to_string(),
                 min_amount_out: Some("1".to_string()),
             },
@@ -1414,7 +1417,7 @@ async fn hyperliquid_bridge_quotes_build_refund_quote_leg_shapes() {
         .quote_bridge(BridgeQuoteRequest {
             source_asset: hl_usdc,
             destination_asset: external_usdc,
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: ProviderOrderKind::ExactIn {
                 amount_in: "150000000".to_string(),
                 min_amount_out: Some("1".to_string()),
             },
@@ -1496,7 +1499,6 @@ fn external_custody_hyperliquid_bridge_path_materializes_steps() {
     assert_eq!(steps[1].input_asset, Some(hl_usdc));
     assert_eq!(steps[1].output_asset, Some(external_usdc.clone()));
     assert_eq!(steps[1].amount_in.as_deref(), Some("150000000"));
-    assert_eq!(steps[1].min_amount_out.as_deref(), Some("149000000"));
     assert_eq!(
         steps[1].request.get("hyperliquid_custody_vault_id"),
         Some(&json!(vault.id))
@@ -1704,7 +1706,6 @@ fn external_custody_unit_path_materializes_deposit_and_withdrawal_steps() {
     assert_eq!(steps[1].input_asset, Some(hl_btc));
     assert_eq!(steps[1].output_asset, Some(btc));
     assert_eq!(steps[1].amount_in.as_deref(), Some("30000"));
-    assert_eq!(steps[1].min_amount_out.as_deref(), Some("0"));
     assert_eq!(
         steps[1].request.get("hyperliquid_custody_vault_id"),
         Some(&Value::Null)
@@ -2876,18 +2877,9 @@ fn refresh_hyperliquid_spot_send_reserve_math_matches_legacy() {
             .expect("subtract reserve"),
         "1"
     );
-    assert_eq!(
-        refresh_add_hyperliquid_spot_send_quote_gas_reserve("amount_in", "1").expect("add reserve"),
-        "1000001"
-    );
     assert!(
         refresh_reserve_hyperliquid_spot_send_quote_gas("amount_in", "1000000").is_err(),
         "amount must strictly exceed the reserve"
-    );
-    assert!(
-        refresh_add_hyperliquid_spot_send_quote_gas_reserve("amount_in", &U256::MAX.to_string(),)
-            .is_err(),
-        "addition must reject overflow"
     );
 }
 
@@ -3046,13 +3038,8 @@ fn test_order(source_asset: DepositAsset, now: chrono::DateTime<Utc>) -> RouterO
         recipient_address: test_address(9),
         refund_address: test_address(8),
         action: RouterOrderAction::MarketOrder(MarketOrderAction {
-            order_kind: MarketOrderKind::ExactIn {
-                amount_in: "150000000".to_string(),
-                min_amount_out: Some("1".to_string()),
-            },
-            slippage_bps: Some(100),
+            amount_in: "150000000".to_string(),
         }),
-        action_timeout_at: now + chrono::Duration::hours(1),
         idempotency_key: None,
         workflow_trace_id: Uuid::now_v7().simple().to_string(),
         workflow_parent_span_id: "0000000000000000".to_string(),
@@ -3307,7 +3294,7 @@ fn hyperliquid_trade_quote_leg(
         expires_at,
         raw: json!({
             "kind": "spot_cross_token",
-            "order_kind": MarketOrderKindType::ExactIn.to_db_string(),
+            "order_kind": "exact_in",
             "min_amount_out": "1",
             "input_asset": QuoteLegAsset::from_deposit_asset(&transition.input.asset),
             "output_asset": QuoteLegAsset::from_deposit_asset(&transition.output.asset),
@@ -3331,12 +3318,8 @@ fn test_market_order_quote(
         destination_asset,
         recipient_address: test_address(1),
         provider_id: "path:test".to_string(),
-        order_kind: MarketOrderKindType::ExactIn,
         amount_in: "100000".to_string(),
-        amount_out: "100000".to_string(),
-        min_amount_out: Some("1".to_string()),
-        max_amount_in: None,
-        slippage_bps: Some(100),
+        estimated_amount_out: "100000".to_string(),
         provider_quote: json!({ "legs": legs }),
         usd_valuation: json!({}),
         expires_at,
@@ -3365,7 +3348,6 @@ fn test_execution_step(
         input_asset: None,
         output_asset: None,
         amount_in: Some("1000".to_string()),
-        min_amount_out: Some("1".to_string()),
         tx_hash: None,
         provider_ref: None,
         idempotency_key: Some(format!("test-step-{step_index}")),
@@ -3421,27 +3403,6 @@ async fn seed_hyperliquid_spot_refund_order(
     let RouterOrderAction::MarketOrder(action) = &order.action else {
         panic!("test refund order must be a market order")
     };
-    let (amount_in, min_amount_out, amount_out, max_amount_in) = match &action.order_kind {
-        MarketOrderKind::ExactIn {
-            amount_in,
-            min_amount_out,
-        } => (
-            Some(amount_in.as_str()),
-            min_amount_out.as_deref(),
-            None,
-            None,
-        ),
-        MarketOrderKind::ExactOut {
-            amount_out,
-            max_amount_in,
-        } => (
-            None,
-            None,
-            Some(amount_out.as_str()),
-            max_amount_in.as_deref(),
-        ),
-    };
-
     sqlx_core::query::query(
         r#"
             INSERT INTO router_orders (
@@ -3455,14 +3416,13 @@ async fn seed_hyperliquid_spot_refund_order(
                 destination_asset_id,
                 recipient_address,
                 refund_address,
-                action_timeout_at,
                 idempotency_key,
                 workflow_trace_id,
                 workflow_parent_span_id,
                 created_at,
                 updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
             "#,
     )
     .bind(order.id)
@@ -3475,7 +3435,6 @@ async fn seed_hyperliquid_spot_refund_order(
     .bind(order.destination_asset.asset.as_str())
     .bind(&order.recipient_address)
     .bind(&order.refund_address)
-    .bind(order.action_timeout_at)
     .bind(order.idempotency_key.clone())
     .bind(&order.workflow_trace_id)
     .bind(&order.workflow_parent_span_id)
@@ -3489,30 +3448,16 @@ async fn seed_hyperliquid_spot_refund_order(
         r#"
             INSERT INTO market_order_actions (
                 order_id,
-                order_kind,
                 amount_in,
-                min_amount_out,
-                amount_out,
-                max_amount_in,
                 created_at,
-                updated_at,
-                slippage_bps
+                updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8)
+            VALUES ($1, $2, $3, $3)
             "#,
     )
     .bind(order.id)
-    .bind(action.order_kind.kind_type().to_db_string())
-    .bind(amount_in)
-    .bind(min_amount_out)
-    .bind(amount_out)
-    .bind(max_amount_in)
+    .bind(action.amount_in.as_str())
     .bind(order.created_at)
-    .bind(
-        action
-            .slippage_bps
-            .map(|bps| i64::try_from(bps).expect("test slippage bps fits i64")),
-    )
     .execute(pool)
     .await
     .expect("insert refund test market action");
@@ -3586,7 +3531,6 @@ async fn seed_running_step(
                 destination_asset_id,
                 recipient_address,
                 refund_address,
-                action_timeout_at,
                 workflow_trace_id,
                 workflow_parent_span_id,
                 created_at,
@@ -3596,12 +3540,11 @@ async fn seed_running_step(
                 $1, 'market_order', 'executing', 'evm:8453', 'native',
                 'evm:8453', 'native', '0x0000000000000000000000000000000000000001',
                 '0x0000000000000000000000000000000000000002',
-                $2, $3, $4, $5, $5
+                $2, $3, $4, $4
             )
             "#,
     )
     .bind(order_id)
-    .bind(now + chrono::Duration::hours(1))
     .bind(trace_id)
     .bind(parent_span_id)
     .bind(now)
@@ -3613,16 +3556,11 @@ async fn seed_running_step(
         r#"
             INSERT INTO market_order_actions (
                 order_id,
-                order_kind,
                 amount_in,
-                min_amount_out,
-                amount_out,
-                max_amount_in,
                 created_at,
-                updated_at,
-                slippage_bps
+                updated_at
             )
-            VALUES ($1, 'exact_in', '100', '1', NULL, NULL, $2, $2, 100)
+            VALUES ($1, '100', $2, $2)
             "#,
     )
     .bind(order_id)
@@ -3670,7 +3608,7 @@ async fn seed_running_step(
                 output_chain_id,
                 output_asset_id,
                 amount_in,
-                expected_amount_out,
+                estimated_amount_out,
                 min_amount_out,
                 started_at,
                 details_json,
@@ -3849,7 +3787,6 @@ async fn seed_unit_deposit_retry_steps(
                 destination_asset_id,
                 recipient_address,
                 refund_address,
-                action_timeout_at,
                 workflow_trace_id,
                 workflow_parent_span_id,
                 created_at,
@@ -3857,14 +3794,13 @@ async fn seed_unit_deposit_retry_steps(
             )
             VALUES (
                 $1, 'market_order', 'executing', 'evm:8453', 'native',
-                'hyperliquid', 'UETH', $2, $3, $4, $5, $6, $7, $7
+                'hyperliquid', 'UETH', $2, $3, $4, $5, $6, $6
             )
             "#,
     )
     .bind(order_id)
     .bind(test_address(5))
     .bind(test_address(6))
-    .bind(now + chrono::Duration::hours(1))
     .bind(trace_id)
     .bind(parent_span_id)
     .bind(now)
@@ -3876,16 +3812,11 @@ async fn seed_unit_deposit_retry_steps(
         r#"
             INSERT INTO market_order_actions (
                 order_id,
-                order_kind,
                 amount_in,
-                min_amount_out,
-                amount_out,
-                max_amount_in,
                 created_at,
-                updated_at,
-                slippage_bps
+                updated_at
             )
-            VALUES ($1, 'exact_in', '100', '1', NULL, NULL, $2, $2, 100)
+            VALUES ($1, '100', $2, $2)
             "#,
     )
     .bind(order_id)
@@ -3972,7 +3903,7 @@ async fn seed_unit_deposit_retry_steps(
                     output_chain_id,
                     output_asset_id,
                     amount_in,
-                    expected_amount_out,
+                    estimated_amount_out,
                     min_amount_out,
                     started_at,
                     details_json,
@@ -4110,7 +4041,6 @@ async fn seed_unit_withdrawal_retry_steps(
                 destination_asset_id,
                 recipient_address,
                 refund_address,
-                action_timeout_at,
                 workflow_trace_id,
                 workflow_parent_span_id,
                 created_at,
@@ -4118,14 +4048,13 @@ async fn seed_unit_withdrawal_retry_steps(
             )
             VALUES (
                 $1, 'market_order', 'executing', 'hyperliquid', 'UETH',
-                'evm:8453', 'native', $2, $3, $4, $5, $6, $7, $7
+                'evm:8453', 'native', $2, $3, $4, $5, $6, $6
             )
             "#,
     )
     .bind(order_id)
     .bind(test_address(3))
     .bind(test_address(4))
-    .bind(now + chrono::Duration::hours(1))
     .bind(trace_id)
     .bind(parent_span_id)
     .bind(now)
@@ -4137,16 +4066,11 @@ async fn seed_unit_withdrawal_retry_steps(
         r#"
             INSERT INTO market_order_actions (
                 order_id,
-                order_kind,
                 amount_in,
-                min_amount_out,
-                amount_out,
-                max_amount_in,
                 created_at,
-                updated_at,
-                slippage_bps
+                updated_at
             )
-            VALUES ($1, 'exact_in', '39000000000000000', '1', NULL, NULL, $2, $2, 100)
+            VALUES ($1, '39000000000000000', $2, $2)
             "#,
     )
     .bind(order_id)
@@ -4247,7 +4171,7 @@ async fn seed_unit_withdrawal_retry_steps(
                     output_chain_id,
                     output_asset_id,
                     amount_in,
-                    expected_amount_out,
+                    estimated_amount_out,
                     min_amount_out,
                     started_at,
                     details_json,

@@ -20,6 +20,13 @@
             "type": "string",
             "example": "00000000-0000-4000-8000-000000000001"
           },
+          "orderType": {
+            "type": "string",
+            "enum": [
+              "market_order"
+            ],
+            "example": "market_order"
+          },
           "from": {
             "type": "string",
             "example": "Bitcoin.BTC"
@@ -32,25 +39,44 @@
             "type": "string",
             "example": "2026-05-04T12:10:00Z"
           },
-          "expectedOut": {
+          "estimatedOut": {
             "type": "string",
             "example": "100000"
           },
-          "expectedSlippage": {
-            "type": "string",
-            "example": "0.2"
-          },
-          "minOut": {
-            "type": "string",
-            "example": "99000"
-          },
-          "maxIn": {
-            "type": "string",
-            "example": "10.1"
-          },
-          "maxSlippage": {
-            "type": "string",
-            "example": "1.5"
+          "fees": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "example": "hyperliquid_core_activation_fee"
+                },
+                "label": {
+                  "type": "string",
+                  "example": "Hyperliquid activation fee"
+                },
+                "asset": {
+                  "type": "string",
+                  "example": "Hyperliquid.USDC"
+                },
+                "amount": {
+                  "type": "string",
+                  "example": "1"
+                },
+                "amountRaw": {
+                  "type": "string",
+                  "example": "1000000"
+                }
+              },
+              "required": [
+                "kind",
+                "label",
+                "asset",
+                "amount",
+                "amountRaw"
+              ]
+            }
           },
           "amountFormat": {
             "$ref": "#/components/schemas/AmountFormat"
@@ -58,11 +84,11 @@
         },
         "required": [
           "quoteId",
+          "orderType",
           "from",
           "to",
           "expiry",
-          "expectedOut",
-          "maxSlippage"
+          "estimatedOut"
         ]
       },
       "AmountFormat": {
@@ -110,11 +136,13 @@
           "from": {
             "type": "string",
             "minLength": 1,
+            "maxLength": 96,
             "example": "Bitcoin.BTC"
           },
           "to": {
             "type": "string",
             "minLength": 1,
+            "maxLength": 96,
             "example": "Ethereum.USDC"
           },
           "amountFormat": {
@@ -123,30 +151,30 @@
           "toAddress": {
             "type": "string",
             "minLength": 1,
+            "maxLength": 128,
             "description": "Current Rust router quote bridge field. The upstream router requires a recipient address at quote time.",
             "example": "0x1111111111111111111111111111111111111111"
+          },
+          "orderType": {
+            "type": "string",
+            "enum": [
+              "market_order",
+              "market"
+            ],
+            "description": "Order type. Defaults to market_order.",
+            "example": "market_order"
           },
           "fromAmount": {
             "type": "string",
             "minLength": 1,
+            "maxLength": 96,
             "example": "10"
-          },
-          "toAmount": {
-            "type": "string",
-            "minLength": 1,
-            "example": "100000"
-          },
-          "maxSlippage": {
-            "type": "string",
-            "minLength": 1,
-            "example": "1.5"
           }
         },
         "required": [
           "from",
           "to",
-          "toAddress",
-          "maxSlippage"
+          "toAddress"
         ],
         "additionalProperties": false
       },
@@ -169,6 +197,13 @@
             "type": "string",
             "example": "00000000-0000-4000-8000-000000000001"
           },
+          "orderType": {
+            "type": "string",
+            "enum": [
+              "market_order"
+            ],
+            "example": "market_order"
+          },
           "from": {
             "type": "string",
             "example": "Bitcoin.BTC"
@@ -185,25 +220,44 @@
             "type": "string",
             "example": "2026-05-04T12:10:00Z"
           },
-          "expectedOut": {
+          "estimatedOut": {
             "type": "string",
             "example": "100000"
           },
-          "expectedSlippage": {
-            "type": "string",
-            "example": "0.2"
-          },
-          "minOut": {
-            "type": "string",
-            "example": "99000"
-          },
-          "maxIn": {
-            "type": "string",
-            "example": "10.1"
-          },
-          "maxSlippage": {
-            "type": "string",
-            "example": "1.5"
+          "fees": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "example": "hyperliquid_core_activation_fee"
+                },
+                "label": {
+                  "type": "string",
+                  "example": "Hyperliquid activation fee"
+                },
+                "asset": {
+                  "type": "string",
+                  "example": "Hyperliquid.USDC"
+                },
+                "amount": {
+                  "type": "string",
+                  "example": "1"
+                },
+                "amountRaw": {
+                  "type": "string",
+                  "example": "1000000"
+                }
+              },
+              "required": [
+                "kind",
+                "label",
+                "asset",
+                "amount",
+                "amountRaw"
+              ]
+            }
           },
           "amountFormat": {
             "$ref": "#/components/schemas/AmountFormat"
@@ -228,12 +282,12 @@
           "orderAddress",
           "amountToSend",
           "quoteId",
+          "orderType",
           "from",
           "to",
           "status",
           "expiry",
-          "expectedOut",
-          "maxSlippage"
+          "estimatedOut"
         ]
       },
       "RefundMode": {
@@ -250,26 +304,33 @@
         "properties": {
           "quoteId": {
             "type": "string",
-            "format": "uuid",
-            "example": "00000000-0000-4000-8000-000000000001"
-          },
-          "amountFormat": {
-            "$ref": "#/components/schemas/AmountFormat"
+            "format": "uuid"
           },
           "fromAddress": {
             "type": "string",
             "minLength": 1,
-            "example": "bc1qexample000000000000000000000000000000"
+            "maxLength": 128
           },
           "toAddress": {
             "type": "string",
             "minLength": 1,
-            "example": "0x1111111111111111111111111111111111111111"
+            "maxLength": 128
           },
           "refundAddress": {
             "type": "string",
             "minLength": 1,
-            "example": "bc1qrefund0000000000000000000000000000000"
+            "maxLength": 128
+          },
+          "integrator": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "idempotencyKey": {
+            "type": "string",
+            "minLength": 16,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9._:-]+$"
           },
           "refundMode": {
             "$ref": "#/components/schemas/RefundMode"
@@ -280,32 +341,22 @@
               "null"
             ],
             "minLength": 1,
-            "example": "0x2222222222222222222222222222222222222222"
+            "maxLength": 128
           },
-          "integrator": {
-            "type": "string",
-            "minLength": 1,
-            "example": "partner-a"
-          },
-          "idempotencyKey": {
-            "type": "string",
-            "minLength": 1,
-            "example": "partner-a-market-order-0001"
-          },
-          "cancelAfter": {
-            "type": "string",
-            "format": "date-time",
-            "example": "2026-05-04T13:00:00Z"
+          "amountFormat": {
+            "$ref": "#/components/schemas/AmountFormat"
           }
         },
         "required": [
           "quoteId",
           "fromAddress",
-          "toAddress"
+          "toAddress",
+          "idempotencyKey",
+          "refundAuthorizer"
         ],
         "additionalProperties": false
       },
-      "LimitOrderResponse": {
+      "OrderCancellationResponse": {
         "type": "object",
         "properties": {
           "orderId": {
@@ -322,7 +373,14 @@
           },
           "quoteId": {
             "type": "string",
-            "example": "00000000-0000-4000-8000-000000000003"
+            "example": "00000000-0000-4000-8000-000000000001"
+          },
+          "orderType": {
+            "type": "string",
+            "enum": [
+              "market_order"
+            ],
+            "example": "market_order"
           },
           "from": {
             "type": "string",
@@ -340,9 +398,44 @@
             "type": "string",
             "example": "2026-05-04T12:10:00Z"
           },
-          "minOut": {
+          "estimatedOut": {
             "type": "string",
             "example": "100000"
+          },
+          "fees": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "example": "hyperliquid_core_activation_fee"
+                },
+                "label": {
+                  "type": "string",
+                  "example": "Hyperliquid activation fee"
+                },
+                "asset": {
+                  "type": "string",
+                  "example": "Hyperliquid.USDC"
+                },
+                "amount": {
+                  "type": "string",
+                  "example": "1"
+                },
+                "amountRaw": {
+                  "type": "string",
+                  "example": "1000000"
+                }
+              },
+              "required": [
+                "kind",
+                "label",
+                "asset",
+                "amount",
+                "amountRaw"
+              ]
+            }
           },
           "amountFormat": {
             "$ref": "#/components/schemas/AmountFormat"
@@ -367,128 +460,33 @@
           "orderAddress",
           "amountToSend",
           "quoteId",
+          "orderType",
           "from",
           "to",
           "status",
           "expiry",
-          "minOut"
-        ]
-      },
-      "OrderLimitRequest": {
-        "type": "object",
-        "properties": {
-          "from": {
-            "type": "string",
-            "minLength": 1,
-            "example": "Bitcoin.BTC"
-          },
-          "to": {
-            "type": "string",
-            "minLength": 1,
-            "example": "Ethereum.USDC"
-          },
-          "amountFormat": {
-            "$ref": "#/components/schemas/AmountFormat"
-          },
-          "fromAddress": {
-            "type": "string",
-            "minLength": 1,
-            "example": "bc1qexample000000000000000000000000000000"
-          },
-          "toAddress": {
-            "type": "string",
-            "minLength": 1,
-            "example": "0x1111111111111111111111111111111111111111"
-          },
-          "fromAmount": {
-            "type": "string",
-            "minLength": 1,
-            "description": "Source amount. Provide exactly two of fromAmount, toAmount, and price; Rift computes the omitted value from the other two.",
-            "example": "10"
-          },
-          "toAmount": {
-            "type": "string",
-            "minLength": 1,
-            "description": "Destination amount. Provide exactly two of fromAmount, toAmount, and price; Rift computes the omitted value from the other two.",
-            "example": "1000000"
-          },
-          "price": {
-            "type": "string",
-            "minLength": 1,
-            "description": "Readable destination asset amount per one readable source asset. For Bitcoin.BTC to Ethereum.USDC, \"100000\" means 100,000 USDC per 1 BTC. Provide exactly two of fromAmount, toAmount, and price; Rift computes the omitted value from the other two.",
-            "example": "100000"
-          },
-          "expiration": {
-            "type": "string",
-            "format": "date-time",
-            "example": "2026-05-04T13:00:00Z"
-          },
-          "refundAddress": {
-            "type": "string",
-            "minLength": 1,
-            "example": "bc1qrefund0000000000000000000000000000000"
-          },
-          "refundMode": {
-            "$ref": "#/components/schemas/RefundMode"
-          },
-          "refundAuthorizer": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "minLength": 1,
-            "example": "0x2222222222222222222222222222222222222222"
-          },
-          "integrator": {
-            "type": "string",
-            "minLength": 1,
-            "example": "partner-a"
-          },
-          "idempotencyKey": {
-            "type": "string",
-            "minLength": 1,
-            "example": "partner-a-limit-order-0001"
-          }
-        },
-        "required": [
-          "from",
-          "to",
-          "fromAddress",
-          "toAddress"
-        ],
-        "additionalProperties": false,
-        "description": "Limit orders require exactly two of fromAmount, toAmount, and price. Price is a readable destination-per-source ratio; for example, Bitcoin.BTC to Ethereum.USDC with price \"100000\" means 100,000 USDC per 1 BTC. amountFormat applies to fromAmount and toAmount, not to price."
-      },
-      "OrderCancellationResponse": {
-        "anyOf": [
-          {
-            "$ref": "#/components/schemas/OrderResponse"
-          },
-          {
-            "$ref": "#/components/schemas/LimitOrderResponse"
-          }
+          "estimatedOut"
         ]
       },
       "OrderCancelRequest": {
         "type": "object",
         "properties": {
-          "amountFormat": {
-            "$ref": "#/components/schemas/AmountFormat"
-          },
           "refundToken": {
             "type": "string",
             "minLength": 1,
-            "example": "rgt_abcdefghijklmnopqrstuvwxyz"
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9_-]+$"
           },
           "refundSignature": {
             "type": "string",
-            "pattern": "^0x[a-fA-F0-9]+$",
-            "example": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+            "pattern": "^0x[a-fA-F0-9]{130}$"
           },
           "refundSignatureDeadline": {
             "type": "integer",
-            "exclusiveMinimum": 0,
-            "example": 1777899600
+            "exclusiveMinimum": 0
+          },
+          "amountFormat": {
+            "$ref": "#/components/schemas/AmountFormat"
           }
         },
         "additionalProperties": false
@@ -576,7 +574,7 @@
         "tags": [
           "Quotes"
         ],
-        "summary": "Get a quote",
+        "summary": "Create a quote for a market order",
         "requestBody": {
           "required": true,
           "content": {
@@ -589,7 +587,7 @@
         },
         "responses": {
           "201": {
-            "description": "Quote created by the internal router API.",
+            "description": "Market quote created by the internal router API.",
             "content": {
               "application/json": {
                 "schema": {
@@ -610,6 +608,26 @@
           },
           "401": {
             "description": "Gateway authentication failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Gateway request conflicts with an in-progress or completed operation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Gateway request body is too large.",
             "content": {
               "application/json": {
                 "schema": {
@@ -640,6 +658,16 @@
           },
           "503": {
             "description": "Gateway is not configured for this operation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Internal router API timed out.",
             "content": {
               "application/json": {
                 "schema": {
@@ -698,8 +726,8 @@
               }
             }
           },
-          "500": {
-            "description": "Unexpected gateway error.",
+          "409": {
+            "description": "Gateway request conflicts with an in-progress or completed operation.",
             "content": {
               "application/json": {
                 "schema": {
@@ -708,68 +736,8 @@
               }
             }
           },
-          "502": {
-            "description": "Internal router API error.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "503": {
-            "description": "Gateway is not configured for this operation.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/order/limit": {
-      "post": {
-        "tags": [
-          "Orders"
-        ],
-        "summary": "Create a limit order",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/OrderLimitRequest"
-              }
-            }
-          }
-        },
-        "responses": {
-          "201": {
-            "description": "Limit order created by the internal router API.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/LimitOrderResponse"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid gateway request.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Gateway authentication failed.",
+          "413": {
+            "description": "Gateway request body is too large.",
             "content": {
               "application/json": {
                 "schema": {
@@ -800,6 +768,16 @@
           },
           "503": {
             "description": "Gateway is not configured for this operation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Internal router API timed out.",
             "content": {
               "application/json": {
                 "schema": {
@@ -816,7 +794,7 @@
         "tags": [
           "Orders"
         ],
-        "summary": "Cancel a limit order",
+        "summary": "Cancel an order via specified authentication",
         "parameters": [
           {
             "schema": {
@@ -870,6 +848,26 @@
               }
             }
           },
+          "409": {
+            "description": "Gateway request conflicts with an in-progress or completed operation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Gateway request body is too large.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Unexpected gateway error.",
             "content": {
@@ -892,6 +890,16 @@
           },
           "503": {
             "description": "Gateway is not configured for this operation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Internal router API timed out.",
             "content": {
               "application/json": {
                 "schema": {

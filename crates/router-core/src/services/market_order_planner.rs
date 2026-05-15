@@ -1,8 +1,8 @@
 use crate::{
     models::{
-        CustodyVaultRole, DepositVault, LimitOrderQuote, MarketOrderKindType, MarketOrderQuote,
-        OrderExecutionLeg, OrderExecutionStep, OrderExecutionStepStatus, OrderExecutionStepType,
-        RouterOrder, RouterOrderAction,
+        CustodyVaultRole, DepositVault, LimitOrderQuote, MarketOrderQuote, OrderExecutionLeg,
+        OrderExecutionStep, OrderExecutionStepStatus, OrderExecutionStepType, RouterOrder,
+        RouterOrderAction,
     },
     protocol::DepositAsset,
     services::asset_registry::{
@@ -216,12 +216,8 @@ impl MarketOrderRoutePlanner {
             destination_asset: quote.destination_asset.clone(),
             recipient_address: quote.recipient_address.clone(),
             provider_id: quote.provider_id.clone(),
-            order_kind: MarketOrderKindType::ExactIn,
             amount_in: quote.input_amount.clone(),
-            amount_out: quote.output_amount.clone(),
-            min_amount_out: Some(quote.output_amount.clone()),
-            max_amount_in: None,
-            slippage_bps: Some(0),
+            estimated_amount_out: quote.output_amount.clone(),
             provider_quote: quote.provider_quote.clone(),
             usd_valuation: json!({}),
             expires_at: quote.expires_at,
@@ -777,7 +773,6 @@ fn materialize_transition_steps_range(
                     hyperliquid_custody_for_withdrawal(&path.transitions, transition_index)?;
                 let transition_steps = vec![unit_withdrawal_step(UnitWithdrawalStepSpec {
                     order,
-                    quote,
                     leg: &leg,
                     unit_provider: leg_provider(&leg, transition)?,
                     hyperliquid_custody: custody,
@@ -929,7 +924,7 @@ fn push_execution_leg(
 
 fn execution_leg_from_quote_legs(
     order: &RouterOrder,
-    quote: &MarketOrderQuote,
+    _quote: &MarketOrderQuote,
     transition: &TransitionDecl,
     quote_legs: &[QuoteLeg],
     leg_index: i32,
@@ -977,22 +972,6 @@ fn execution_leg_from_quote_legs(
         .reduce(|first, next| if first == next { first } else { "multi" })
         .unwrap_or("unknown")
         .to_string();
-    let min_amount_out = last
-        .raw
-        .get("min_amount_out")
-        .and_then(Value::as_str)
-        .map(ToString::to_string)
-        .or_else(|| {
-            if output_asset == order.destination_asset {
-                match quote.order_kind {
-                    MarketOrderKindType::ExactIn => quote.min_amount_out.clone(),
-                    MarketOrderKindType::ExactOut => Some(quote.amount_out.clone()),
-                }
-            } else {
-                None
-            }
-        });
-
     Ok(OrderExecutionLeg {
         id: Uuid::now_v7(),
         order_id: order.id,
@@ -1005,8 +984,7 @@ fn execution_leg_from_quote_legs(
         input_asset,
         output_asset,
         amount_in: first.amount_in.clone(),
-        expected_amount_out: last.amount_out.clone(),
-        min_amount_out,
+        estimated_amount_out: last.amount_out.clone(),
         actual_amount_in: None,
         actual_amount_out: None,
         started_at: None,
@@ -1033,7 +1011,6 @@ fn execution_leg_from_quote_legs(
 
 struct UnitWithdrawalStepSpec<'a> {
     order: &'a RouterOrder,
-    quote: &'a MarketOrderQuote,
     leg: &'a QuoteLeg,
     unit_provider: ProviderId,
     hyperliquid_custody: HyperliquidCustodySpec,
@@ -1048,7 +1025,6 @@ fn unit_withdrawal_step(
 ) -> MarketOrderRoutePlanResult<OrderExecutionStep> {
     let UnitWithdrawalStepSpec {
         order,
-        quote,
         leg,
         unit_provider,
         hyperliquid_custody,
@@ -1073,14 +1049,7 @@ fn unit_withdrawal_step(
             ),
         }
     })?;
-    let min_amount_out = if output_asset == order.destination_asset {
-        match quote.order_kind {
-            MarketOrderKindType::ExactIn => quote.min_amount_out.clone(),
-            MarketOrderKindType::ExactOut => Some(quote.amount_out.clone()),
-        }
-    } else {
-        Some(leg.amount_out.clone())
-    };
+    let min_amount_out = Some(leg.amount_out.clone());
     let recipient_address = leg
         .raw
         .get("recipient_address")
@@ -1105,7 +1074,6 @@ fn unit_withdrawal_step(
         input_asset: Some(input_asset.clone()),
         output_asset: Some(output_asset.clone()),
         amount_in: Some(amount_in.clone()),
-        min_amount_out: min_amount_out.clone(),
         provider_ref: None,
         idempotency_key: idempotency_key(order.id, provider, step_index),
         // The HyperUnitProvider will resolve `dst_chain_id`/`asset_id` to the
@@ -1162,7 +1130,6 @@ struct StepSpec {
     input_asset: Option<DepositAsset>,
     output_asset: Option<DepositAsset>,
     amount_in: Option<String>,
-    min_amount_out: Option<String>,
     provider_ref: Option<String>,
     idempotency_key: Option<String>,
     request: serde_json::Value,
@@ -1312,7 +1279,6 @@ fn step(spec: StepSpec) -> OrderExecutionStep {
         input_asset: spec.input_asset,
         output_asset: spec.output_asset,
         amount_in: spec.amount_in,
-        min_amount_out: spec.min_amount_out,
         tx_hash: None,
         provider_ref: spec.provider_ref,
         idempotency_key: spec.idempotency_key,
@@ -1511,7 +1477,6 @@ fn hyperliquid_trade_step(
         input_asset: Some(input_asset),
         output_asset: Some(output_asset),
         amount_in: Some(amount_in.to_string()),
-        min_amount_out: min_amount_out.clone(),
         provider_ref: None,
         idempotency_key: idempotency_key(order.id, provider, step_index),
         request,
@@ -1602,7 +1567,6 @@ fn hyperliquid_limit_order_step(
         input_asset: Some(input_asset),
         output_asset: Some(output_asset),
         amount_in: Some(amount_in.to_string()),
-        min_amount_out: Some(amount_out.to_string()),
         provider_ref: None,
         idempotency_key: idempotency_key(order.id, provider, step_index),
         request,
@@ -1694,7 +1658,6 @@ fn universal_router_swap_step(
         input_asset: Some(input_asset.clone()),
         output_asset: Some(output_asset.clone()),
         amount_in: Some(amount_in.to_string()),
-        min_amount_out: min_amount_out.clone(),
         provider_ref: None,
         idempotency_key: idempotency_key(order.id, &provider, step_index),
         request: json!({
@@ -1958,7 +1921,6 @@ fn across_bridge_step(
         input_asset: Some(transition.input.asset.clone()),
         output_asset: Some(transition.output.asset.clone()),
         amount_in: Some(amount_in.clone()),
-        min_amount_out: None,
         provider_ref: Some(format!("quote-{}", quote.id)),
         idempotency_key: idempotency_key(order.id, &provider, step_index),
         request: json!({
@@ -2078,7 +2040,6 @@ fn cctp_bridge_steps(
         input_asset: Some(transition.input.asset.clone()),
         output_asset: Some(transition.output.asset.clone()),
         amount_in: Some(amount_in.clone()),
-        min_amount_out: None,
         provider_ref: None,
         idempotency_key: idempotency_key(order.id, &provider, step_index),
         request: json!({
@@ -2118,7 +2079,6 @@ fn cctp_bridge_steps(
         input_asset: Some(transition.output.asset.clone()),
         output_asset: Some(transition.output.asset.clone()),
         amount_in: Some(amount_out.clone()),
-        min_amount_out: None,
         provider_ref: None,
         idempotency_key: idempotency_key(order.id, provider_id.as_str(), step_index + 1),
         request: json!({
@@ -2178,7 +2138,6 @@ fn unit_deposit_step(
         input_asset: Some(transition.input.asset.clone()),
         output_asset: Some(output_asset.clone()),
         amount_in: Some(expected_amount.clone()),
-        min_amount_out: None,
         provider_ref: None,
         idempotency_key: idempotency_key(order.id, &provider, step_index),
         request: unit_deposit_request(UnitDepositRequestSpec {
@@ -2243,7 +2202,6 @@ fn hyperliquid_bridge_deposit_step(
         input_asset: Some(transition.input.asset.clone()),
         output_asset: Some(transition.output.asset.clone()),
         amount_in: Some(amount_in.clone()),
-        min_amount_out: None,
         provider_ref: None,
         idempotency_key: idempotency_key(order.id, &provider, step_index),
         request: json!({
@@ -2292,7 +2250,6 @@ fn hyperliquid_bridge_withdrawal_step(
     let provider_id = leg_provider(leg, transition)?;
     let provider = provider_id.as_str().to_string();
     let amount_in = leg.amount_in.as_str();
-    let amount_out = leg.amount_out.as_str();
     let recipient_address = if is_final {
         json!(order.recipient_address)
     } else {
@@ -2315,7 +2272,6 @@ fn hyperliquid_bridge_withdrawal_step(
         input_asset: Some(transition.input.asset.clone()),
         output_asset: Some(transition.output.asset.clone()),
         amount_in: Some(amount_in.to_string()),
-        min_amount_out: Some(amount_out.to_string()),
         provider_ref: Some(format!("quote-{}", quote.id)),
         idempotency_key: idempotency_key(order.id, &provider, step_index),
         request: json!({
@@ -2370,11 +2326,11 @@ fn validate_step_materialization(steps: &[OrderExecutionStep]) -> MarketOrderRou
 
 fn validate_leg_materialization(legs: &[OrderExecutionLeg]) -> MarketOrderRoutePlanResult<()> {
     for leg in legs {
-        if leg.amount_in.is_empty() || leg.expected_amount_out.is_empty() {
+        if leg.amount_in.is_empty() || leg.estimated_amount_out.is_empty() {
             return Err(MarketOrderRoutePlanError::StepMaterializationInvariant {
                 step_index: leg.leg_index,
                 step_type: "execution_leg",
-                reason: "missing amount_in or expected_amount_out".to_string(),
+                reason: "missing amount_in or estimated_amount_out".to_string(),
             });
         }
     }
@@ -2568,8 +2524,7 @@ fn maybe_require_request_role(
 mod tests {
     use super::*;
     use crate::models::{
-        DepositVaultStatus, MarketOrderAction, MarketOrderKind, RouterOrderStatus, RouterOrderType,
-        VaultAction,
+        DepositVaultStatus, MarketOrderAction, RouterOrderStatus, RouterOrderType, VaultAction,
     };
     use crate::protocol::{AssetId, ChainId};
     use crate::services::asset_registry::AssetSlot;
@@ -2592,7 +2547,6 @@ mod tests {
             input_asset: None,
             output_asset: None,
             amount_in: None,
-            min_amount_out: None,
             tx_hash: None,
             provider_ref: None,
             idempotency_key: None,
@@ -2728,12 +2682,8 @@ mod tests {
             destination_asset,
             recipient_address: "0x5555555555555555555555555555555555555555".to_string(),
             provider_id: "path:test".to_string(),
-            order_kind: MarketOrderKindType::ExactIn,
             amount_in: "1000".to_string(),
-            amount_out: "990".to_string(),
-            min_amount_out: Some("980".to_string()),
-            max_amount_in: None,
-            slippage_bps: Some(100),
+            estimated_amount_out: "990".to_string(),
             provider_quote: json!({ "legs": legs }),
             usd_valuation: json!({}),
             expires_at: now + chrono::Duration::minutes(5),
@@ -2757,13 +2707,8 @@ mod tests {
             recipient_address: "0x5555555555555555555555555555555555555555".to_string(),
             refund_address: "0x6666666666666666666666666666666666666666".to_string(),
             action: RouterOrderAction::MarketOrder(MarketOrderAction {
-                order_kind: MarketOrderKind::ExactIn {
-                    amount_in: "1000".to_string(),
-                    min_amount_out: Some("900".to_string()),
-                },
-                slippage_bps: Some(100),
+                amount_in: "1000".to_string(),
             }),
-            action_timeout_at: now + chrono::Duration::minutes(10),
             idempotency_key: None,
             workflow_trace_id: order_id.simple().to_string(),
             workflow_parent_span_id: "1111111111111111".to_string(),
@@ -2928,12 +2873,8 @@ mod tests {
             destination_asset,
             recipient_address: order.recipient_address.clone(),
             provider_id: "path:malformed-transition-ids".to_string(),
-            order_kind: MarketOrderKindType::ExactIn,
             amount_in: "1000".to_string(),
-            amount_out: "990".to_string(),
-            min_amount_out: Some("980".to_string()),
-            max_amount_in: None,
-            slippage_bps: Some(100),
+            estimated_amount_out: "990".to_string(),
             provider_quote: json!({
                 "transition_decl_ids": ["single:bridge", 7],
                 "transitions": [transition],
@@ -3080,13 +3021,8 @@ mod tests {
             recipient_address: "0x5555555555555555555555555555555555555555".to_string(),
             refund_address: "0x6666666666666666666666666666666666666666".to_string(),
             action: RouterOrderAction::MarketOrder(MarketOrderAction {
-                order_kind: MarketOrderKind::ExactIn {
-                    amount_in: "1000000000000000000".to_string(),
-                    min_amount_out: Some("1".to_string()),
-                },
-                slippage_bps: Some(100),
+                amount_in: "1000000000000000000".to_string(),
             }),
-            action_timeout_at: now + chrono::Duration::minutes(10),
             idempotency_key: None,
             workflow_trace_id: order_id.simple().to_string(),
             workflow_parent_span_id: "1111111111111111".to_string(),
@@ -3120,12 +3056,8 @@ mod tests {
             destination_asset: destination_asset.clone(),
             recipient_address: order.recipient_address.clone(),
             provider_id: "path:runtime-velora".to_string(),
-            order_kind: MarketOrderKindType::ExactIn,
             amount_in: "1000000000000000000".to_string(),
-            amount_out: "999000000000000000".to_string(),
-            min_amount_out: Some("1".to_string()),
-            max_amount_in: None,
-            slippage_bps: Some(100),
+            estimated_amount_out: "999000000000000000".to_string(),
             provider_quote: json!({
                 "path_id": path.id,
                 "transition_decl_ids": transition_ids,
@@ -3212,13 +3144,8 @@ mod tests {
             recipient_address: "0x5555555555555555555555555555555555555555".to_string(),
             refund_address: "0x6666666666666666666666666666666666666666".to_string(),
             action: RouterOrderAction::MarketOrder(MarketOrderAction {
-                order_kind: MarketOrderKind::ExactIn {
-                    amount_in: "1000000000000000000".to_string(),
-                    min_amount_out: Some("900000000000000000".to_string()),
-                },
-                slippage_bps: Some(100),
+                amount_in: "1000000000000000000".to_string(),
             }),
-            action_timeout_at: now + chrono::Duration::minutes(10),
             idempotency_key: None,
             workflow_trace_id: order_id.simple().to_string(),
             workflow_parent_span_id: "1111111111111111".to_string(),
@@ -3293,12 +3220,8 @@ mod tests {
             destination_asset: destination_asset.clone(),
             recipient_address: order.recipient_address.clone(),
             provider_id: "path:velora".to_string(),
-            order_kind: MarketOrderKindType::ExactIn,
             amount_in: "1000000000000000000".to_string(),
-            amount_out: "950000000000000000".to_string(),
-            min_amount_out: Some("900000000000000000".to_string()),
-            max_amount_in: None,
-            slippage_bps: Some(526),
+            estimated_amount_out: "950000000000000000".to_string(),
             provider_quote: json!({
                 "path_id": path.id,
                 "transition_decl_ids": transition_ids,
@@ -3377,13 +3300,8 @@ mod tests {
             recipient_address: "0x5555555555555555555555555555555555555555".to_string(),
             refund_address: "0x6666666666666666666666666666666666666666".to_string(),
             action: RouterOrderAction::MarketOrder(MarketOrderAction {
-                order_kind: MarketOrderKind::ExactIn {
-                    amount_in: "1000000".to_string(),
-                    min_amount_out: Some("990000".to_string()),
-                },
-                slippage_bps: Some(100),
+                amount_in: "1000000".to_string(),
             }),
-            action_timeout_at: now + chrono::Duration::minutes(10),
             idempotency_key: None,
             workflow_trace_id: order_id.simple().to_string(),
             workflow_parent_span_id: "1111111111111111".to_string(),
@@ -3470,12 +3388,8 @@ mod tests {
             destination_asset: destination_asset.clone(),
             recipient_address: order.recipient_address.clone(),
             provider_id: "path:cctp".to_string(),
-            order_kind: MarketOrderKindType::ExactIn,
             amount_in: "1000000".to_string(),
-            amount_out: "1000000".to_string(),
-            min_amount_out: Some("990000".to_string()),
-            max_amount_in: None,
-            slippage_bps: Some(100),
+            estimated_amount_out: "1000000".to_string(),
             provider_quote: json!({
                 "path_id": path.id,
                 "transition_decl_ids": transition_ids,
@@ -3513,7 +3427,7 @@ mod tests {
         assert_eq!(plan.legs[0].input_asset, source_asset);
         assert_eq!(plan.legs[0].output_asset, destination_asset);
         assert_eq!(plan.legs[0].amount_in, "1000000");
-        assert_eq!(plan.legs[0].expected_amount_out, "1000000");
+        assert_eq!(plan.legs[0].estimated_amount_out, "1000000");
         assert_eq!(plan.steps[0].execution_leg_id, Some(plan.legs[0].id));
         assert_eq!(plan.steps[1].execution_leg_id, Some(plan.legs[0].id));
 

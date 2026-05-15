@@ -3,7 +3,6 @@ import { z } from '@hono/zod-openapi'
 export const MAX_ASSET_IDENTIFIER_LENGTH = 96
 export const MAX_ADDRESS_LENGTH = 128
 export const MAX_AMOUNT_LENGTH = 96
-export const MAX_SLIPPAGE_LENGTH = 16
 export const MAX_INTEGRATOR_LENGTH = 128
 export const MIN_IDEMPOTENCY_KEY_LENGTH = 16
 export const MAX_IDEMPOTENCY_KEY_LENGTH = 128
@@ -15,7 +14,6 @@ const REFUND_TOKEN_PATTERN = /^[A-Za-z0-9_-]+$/
 export const AssetIdentifierSchema = z.string().min(1).max(MAX_ASSET_IDENTIFIER_LENGTH)
 export const AddressSchema = z.string().min(1).max(MAX_ADDRESS_LENGTH)
 export const AmountStringSchema = z.string().min(1).max(MAX_AMOUNT_LENGTH)
-export const SlippageStringSchema = z.string().min(1).max(MAX_SLIPPAGE_LENGTH)
 export const IntegratorSchema = z.string().min(1).max(MAX_INTEGRATOR_LENGTH)
 export const IdempotencyKeySchema = z
   .string()
@@ -72,7 +70,12 @@ export const QuoteResponseSchema = z
     quoteId: z.string().openapi({
       example: '00000000-0000-4000-8000-000000000001'
     }),
-    orderType: z.enum(['market_order', 'limit_order']).openapi({
+    orderType: z.enum([
+      'market_order',
+      // Limit-order response shapes are intentionally not advertised while
+      // limit-order creation is disabled.
+      // 'limit_order'
+    ]).openapi({
       example: 'market_order'
     }),
     from: z.string().openapi({
@@ -84,20 +87,8 @@ export const QuoteResponseSchema = z
     expiry: z.string().openapi({
       example: '2026-05-04T12:10:00Z'
     }),
-    expectedOut: z.string().openapi({
+    estimatedOut: z.string().openapi({
       example: '100000'
-    }),
-    expectedSlippage: z.string().optional().openapi({
-      example: '0.2'
-    }),
-    minOut: z.string().optional().openapi({
-      example: '99000'
-    }),
-    maxIn: z.string().optional().openapi({
-      example: '10.1'
-    }),
-    maxSlippage: z.string().optional().openapi({
-      example: '1.5'
     }),
     fees: z
       .array(
@@ -138,7 +129,12 @@ export const OrderResponseSchema = z
     quoteId: z.string().openapi({
       example: '00000000-0000-4000-8000-000000000001'
     }),
-    orderType: z.enum(['market_order', 'limit_order']).openapi({
+    orderType: z.enum([
+      'market_order',
+      // Limit-order response shapes are intentionally not advertised while
+      // limit-order creation is disabled.
+      // 'limit_order'
+    ]).openapi({
       example: 'market_order'
     }),
     from: z.string().openapi({
@@ -153,20 +149,8 @@ export const OrderResponseSchema = z
     expiry: z.string().openapi({
       example: '2026-05-04T12:10:00Z'
     }),
-    expectedOut: z.string().openapi({
+    estimatedOut: z.string().openapi({
       example: '100000'
-    }),
-    expectedSlippage: z.string().optional().openapi({
-      example: '0.2'
-    }),
-    minOut: z.string().optional().openapi({
-      example: '99000'
-    }),
-    maxIn: z.string().optional().openapi({
-      example: '10.1'
-    }),
-    maxSlippage: z.string().optional().openapi({
-      example: '1.5'
     }),
     fees: z
       .array(

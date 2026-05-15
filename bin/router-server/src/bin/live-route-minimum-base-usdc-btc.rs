@@ -2,7 +2,7 @@ use alloy::{
     primitives::Address, providers::ProviderBuilder, signers::local::PrivateKeySigner, sol,
 };
 use router_core::{
-    models::MarketOrderKind,
+    models::ProviderOrderKind,
     protocol::{AssetId, ChainId, DepositAsset},
     services::{
         action_providers::{
@@ -227,7 +227,7 @@ async fn probe_route(
         .quote_bridge(BridgeQuoteRequest {
             source_asset: source_asset.clone(),
             destination_asset: unit_ingress_asset.clone(),
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: ProviderOrderKind::ExactIn {
                 amount_in: amount_in.clone(),
                 min_amount_out: Some("1".to_string()),
             },
@@ -258,7 +258,7 @@ async fn probe_route(
         .quote_bridge(BridgeQuoteRequest {
             source_asset: unit_ingress_asset,
             destination_asset: exchange_input_asset.clone(),
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: ProviderOrderKind::ExactIn {
                 amount_in: across_quote.amount_out.clone(),
                 min_amount_out: Some(across_quote.amount_out.clone()),
             },
@@ -284,7 +284,7 @@ async fn probe_route(
             output_asset: destination_asset,
             input_decimals: None,
             output_decimals: None,
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: ProviderOrderKind::ExactIn {
                 amount_in: bridge_quote.amount_out.clone(),
                 min_amount_out: Some("1".to_string()),
             },

@@ -535,7 +535,7 @@ impl CustodyActionExecutor {
                         };
                         evm_chain
                             .ensure_native_gas_for_erc20_transfer(
-                                token_address,
+                                &token_address,
                                 &vault.address,
                                 &to_address,
                                 amount,
@@ -544,7 +544,7 @@ impl CustodyActionExecutor {
                             .map_err(|source| CustodyActionError::Chain { source })?;
                         evm_chain
                             .transfer_erc20_amount(
-                                token_address,
+                                &token_address,
                                 wallet.private_key(),
                                 &to_address,
                                 amount,

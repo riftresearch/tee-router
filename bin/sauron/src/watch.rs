@@ -931,7 +931,6 @@ mod tests {
         let operation_expiry_column = ["opa", ".expires_at"].concat();
         for query in [FULL_WATCH_QUERY, TARGETED_WATCH_QUERY, ORDER_WATCH_QUERY] {
             assert!(query.contains("opa.created_at + INTERVAL '15 months' AS deposit_deadline"));
-            assert!(!query.contains("ro.action_timeout_at"));
             assert!(!query.contains(&operation_expiry_column));
         }
     }
@@ -1371,14 +1370,12 @@ mod tests {
     }
 
     #[test]
-    fn provider_operation_watch_survives_action_timeout() {
+    fn provider_operation_watch_uses_provider_lifetime_not_order_lifetime() {
         let now = utc::now();
-        let action_timeout_at = now - Duration::minutes(1);
         let created_at = now - Duration::minutes(10);
         let provider_operation_deadline = created_at
             .checked_add_months(chrono::Months::new(15))
             .expect("provider-operation TTL should be representable");
-        assert!(action_timeout_at < now);
         assert!(provider_operation_deadline > now);
 
         let mut watch = watch_entry(

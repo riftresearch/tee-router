@@ -195,7 +195,7 @@ Required work:
 2. Implement quote behavior.
    - exact-in support
    - exact-out support or explicit unsupported error
-   - slippage-bound propagation
+   - provider execution-bound propagation
    - provider fees
    - provider minimums
    - expiry
@@ -265,7 +265,7 @@ Required work:
 1. Add path-quote composition for the transition kind.
    - quote leg input/output
    - intermediate min/max propagation
-   - final slippage-derived hard bound
+   - final provider-derived hard bound
    - exact-in and exact-out behavior
 
 2. Ensure quote filtering skips providers blocked by provider policy.
@@ -648,8 +648,7 @@ Minimum test set:
 3. Route-minimum test.
 4. Quote test for exact-in.
 5. Quote test for exact-out or explicit unsupported exact-out.
-6. Quote expiry/slippage hard-bound test when the venue participates in
-   slippage.
+6. Provider quote expiry and hard-bound test when the venue uses provider-native bounds.
 7. Amount-format tests proving router-visible amounts are raw base-unit integer
    strings and provider-only human decimals are isolated behind explicit field
    names.

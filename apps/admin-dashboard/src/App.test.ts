@@ -131,7 +131,7 @@ test('volume analytics refreshes are coalesced under live order bursts', async (
   expect(timers.size).toBe(0)
 })
 
-test('order status display names every recovery and intervention state', async () => {
+test('order status display names recovery states', async () => {
   const { statusDisplay } = await appHelpers()
 
   expect(statusDisplay('refund_required')).toMatchObject({
@@ -141,14 +141,6 @@ test('order status display names every recovery and intervention state', async (
   expect(statusDisplay('refunding')).toMatchObject({
     label: 'Refunding',
     tone: 'active'
-  })
-  expect(statusDisplay('manual_intervention_required')).toMatchObject({
-    label: 'Manual Intervention',
-    tone: 'danger'
-  })
-  expect(statusDisplay('refund_manual_intervention_required')).toMatchObject({
-    label: 'Manual Refund',
-    tone: 'danger'
   })
 })
 
@@ -203,8 +195,7 @@ test('execution timeline hides superseded legs while preserving original quoted 
     input: USDC,
     output: USDC,
     amountIn: '100',
-    expectedAmountOut: '90',
-    minAmountOut: '88',
+    estimatedAmountOut: '90',
     createdAt: now,
     updatedAt: now,
     details: {},
@@ -222,8 +213,7 @@ test('execution timeline hides superseded legs while preserving original quoted 
     executionAttemptId: 'attempt-refreshed',
     status: 'completed',
     amountIn: '105',
-    expectedAmountOut: '91',
-    minAmountOut: '89',
+    estimatedAmountOut: '91',
     actualAmountIn: '105',
     actualAmountOut: '91',
     createdAt: '2026-05-05T00:01:00.000Z',
@@ -240,7 +230,6 @@ test('execution timeline hides superseded legs while preserving original quoted 
   expect(legs[0].key).toBe('leg-refreshed')
   expect(legs[0].quotedInput).toBe('100')
   expect(legs[0].quotedOutput).toBe('90')
-  expect(legs[0].minAmountOut).toBe('88')
   expect(legs[0].executedInput).toBe('105')
   expect(legs[0].executedOutput).toBe('91')
   expect(legs[0].quotedInputUsd?.raw).toBe('100')
@@ -515,7 +504,7 @@ function completedOrder(legOverrides: Partial<OrderExecutionLeg>): OrderFirehose
     input: USDC,
     output: USDC,
     amountIn: '100',
-    expectedAmountOut: '90',
+    estimatedAmountOut: '90',
     actualAmountIn: '99',
     actualAmountOut: '89',
     createdAt: now,
@@ -534,7 +523,6 @@ function completedOrder(legOverrides: Partial<OrderExecutionLeg>): OrderFirehose
     destination: USDC,
     recipientAddress: '0x1111111111111111111111111111111111111111',
     refundAddress: '0x1111111111111111111111111111111111111111',
-    actionTimeoutAt: now,
     executionLegs: [leg],
     executionSteps: [],
     providerOperations: [],

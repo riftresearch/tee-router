@@ -50,12 +50,11 @@ describe('router gateway routes', () => {
     expect(body.paths['/status']).toBeUndefined()
     expect(body.paths['/quote']).toBeDefined()
     expect(body.paths['/order/market']).toBeDefined()
-    expect(body.paths['/order/limit']).toBeDefined()
+    expect(body.paths['/order/limit']).toBeUndefined()
     expect(body.paths['/order/{orderId}/cancel']).toBeDefined()
     expect(Object.keys(body.paths)).toEqual([
       '/quote',
       '/order/market',
-      '/order/limit',
       '/order/{orderId}/cancel',
       '/health',
       '/providers'
@@ -66,9 +65,11 @@ describe('router gateway routes', () => {
       'amountFormat',
       'toAddress',
       'orderType',
-      'fromAmount',
-      'toAmount',
-      'maxSlippage'
+      'fromAmount'
+    ])
+    expect(body.components.schemas.QuoteRequest.properties.orderType.enum).toEqual([
+      'market_order',
+      'market'
     ])
     expect(
       Object.keys(body.components.schemas.OrderMarketRequest.properties)
@@ -83,24 +84,7 @@ describe('router gateway routes', () => {
       'refundAuthorizer',
       'amountFormat'
     ])
-    expect(Object.keys(body.components.schemas.OrderLimitRequest.properties)).toEqual([
-      'from',
-      'to',
-      'amountFormat',
-      'fromAddress',
-      'toAddress',
-      'fromAmount',
-      'toAmount',
-      'price',
-      'refundAddress',
-      'refundMode',
-      'refundAuthorizer',
-      'integrator',
-      'idempotencyKey'
-    ])
-    expect(
-      body.components.schemas.OrderLimitRequest.properties.refundAuthorizer.example
-    ).toBe('0x2222222222222222222222222222222222222222')
+    expect(body.components.schemas.OrderLimitRequest).toBeUndefined()
     expect(body.components.schemas.HealthResponse.properties.status.example).toBe(
       'ok'
     )
@@ -330,7 +314,6 @@ describe('router gateway routes', () => {
       to: 'Ethereum.USDC',
       toAddress: TO_ADDRESS,
       fromAmount: '1',
-      maxSlippage: '1',
       padding: 'x'.repeat(MAX_GATEWAY_JSON_BODY_BYTES)
     })
     const response = await app.request('/quote', {
@@ -387,13 +370,13 @@ describe('router gateway routes', () => {
 
     expect(response.status).toBe(400)
     expect(body.error.code).toBe('VALIDATION_ERROR')
-    expect(body.error.message).toBe('exactly one of fromAmount or toAmount is required')
+    expect(body.error.message).toBe('fromAmount is required')
     expect(body.error.details).toEqual({
       target: 'json',
       issues: [
         {
           path: 'fromAmount',
-          message: 'exactly one of fromAmount or toAmount is required'
+          message: 'fromAmount is required'
         }
       ]
     })
@@ -417,7 +400,6 @@ describe('router gateway routes', () => {
         to: 'Ethereum.USDC',
         toAddress: TO_ADDRESS,
         fromAmount: '1',
-        maxSlippage: '1',
         amountFormat: 'readable'
       })
     })
@@ -449,7 +431,6 @@ describe('router gateway routes', () => {
         to: 'Ethereum.USDC',
         toAddress: TO_ADDRESS,
         fromAmount: '1',
-        maxSlippage: '1',
         amountFormat: 'readable'
       })
     })
@@ -468,7 +449,7 @@ describe('router gateway routes', () => {
     const app = createApp(testConfig(), {
       fetch: mockFetch(calls, async () => {
         const quote = internalQuote()
-        quote.quote.payload.amount_out = '1'.repeat(97)
+        quote.quote.payload.estimated_amount_out = '1'.repeat(97)
         return Response.json(quote)
       })
     })
@@ -481,7 +462,6 @@ describe('router gateway routes', () => {
         to: 'Ethereum.USDC',
         toAddress: TO_ADDRESS,
         fromAmount: '1',
-        maxSlippage: '1',
         amountFormat: 'readable'
       })
     })
@@ -514,7 +494,6 @@ describe('router gateway routes', () => {
         to: 'Ethereum.USDC',
         toAddress: TO_ADDRESS,
         fromAmount: '1',
-        maxSlippage: '1',
         amountFormat: 'readable'
       })
     })
@@ -524,15 +503,12 @@ describe('router gateway routes', () => {
     expect(body.quoteId).toBe(QUOTE_ID)
   })
 
-  test('accepts long routed upstream provider ids for limit quotes', async () => {
+  test('rejects limit quote shorthand before calling the router API', async () => {
     const calls: RecordedCall[] = []
     const app = createApp(testConfig(), {
-      fetch: mockFetch(calls, async () => {
-        const quote = internalLimitQuote()
-        quote.quote.payload.provider_id =
-          'path:' + 'unit_deposit:unit:bitcoin:native->hyperliquid:UBTC|hyperliquid_trade:hyperliquid|'.repeat(8)
-        return Response.json(quote, { status: 201 })
-      })
+      fetch: mockFetch(calls, async () =>
+        Response.json({ message: 'unexpected' }, { status: 500 })
+      )
     })
 
     const response = await app.request('/quote', {
@@ -548,10 +524,9 @@ describe('router gateway routes', () => {
         amountFormat: 'readable'
       })
     })
-    const body = await response.json()
 
-    expect(response.status).toBe(201)
-    expect(body.quoteId).toBe(LIMIT_QUOTE_ID)
+    expect(response.status).toBe(400)
+    expect(calls).toHaveLength(0)
   })
 
   test('rejects zero upstream quote amounts as controlled upstream errors', async () => {
@@ -559,7 +534,7 @@ describe('router gateway routes', () => {
     const app = createApp(testConfig(), {
       fetch: mockFetch(calls, async () => {
         const quote = internalQuote()
-        quote.quote.payload.amount_out = '0'
+        quote.quote.payload.estimated_amount_out = '0'
         return Response.json(quote)
       })
     })
@@ -572,39 +547,6 @@ describe('router gateway routes', () => {
         to: 'Ethereum.USDC',
         toAddress: TO_ADDRESS,
         fromAmount: '1',
-        maxSlippage: '1',
-        amountFormat: 'readable'
-      })
-    })
-    const body = await response.json()
-
-    expect(response.status).toBe(502)
-    expect(body.error.code).toBe('UPSTREAM_ERROR')
-    expect(body.error.message).toBe(
-      'internal router API returned malformed quote response'
-    )
-    expect(body.error.details).toEqual({ upstreamStatus: 502 })
-  })
-
-  test('rejects upstream quote slippage outside the public bps range', async () => {
-    const calls: RecordedCall[] = []
-    const app = createApp(testConfig(), {
-      fetch: mockFetch(calls, async () => {
-        const quote = internalQuote()
-        quote.quote.payload.slippage_bps = 10_001
-        return Response.json(quote)
-      })
-    })
-
-    const response = await app.request('/quote', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        from: 'Bitcoin.BTC',
-        to: 'Ethereum.USDC',
-        toAddress: TO_ADDRESS,
-        fromAmount: '1',
-        maxSlippage: '1',
         amountFormat: 'readable'
       })
     })
@@ -632,7 +574,6 @@ describe('router gateway routes', () => {
         to: 'Ethereum.USDC',
         toAddress: 'b'.repeat(129),
         fromAmount: '1',
-        maxSlippage: '1',
         amountFormat: 'readable'
       })
     })
@@ -766,7 +707,6 @@ describe('router gateway routes', () => {
         to: 'Ethereum.USDC',
         toAddress: 'not-an-evm-address',
         fromAmount: '1',
-        maxSlippage: '1',
         amountFormat: 'readable'
       })
     })
@@ -791,7 +731,6 @@ describe('router gateway routes', () => {
         to: 'Bitcoin.BTC',
         toAddress: TO_ADDRESS,
         fromAmount: '100000000',
-        maxSlippage: '100',
         amountFormat: 'raw'
       })
     })
@@ -819,7 +758,6 @@ describe('router gateway routes', () => {
         to: 'Bitcoin.BTC',
         toAddress: BTC_ADDRESS,
         fromAmount: '100000000',
-        maxSlippage: '100',
         amountFormat: 'raw'
       })
     })
@@ -830,13 +768,11 @@ describe('router gateway routes', () => {
     expect(calls).toHaveLength(0)
   })
 
-  test('allows market quotes without maxSlippage', async () => {
+  test('creates exact-in market quotes', async () => {
     const calls: RecordedCall[] = []
     const app = createApp(testConfig(), {
       fetch: mockFetch(calls, async () => {
         const quote = internalQuote()
-        quote.quote.payload.min_amount_out = null as any
-        quote.quote.payload.slippage_bps = null as any
         return Response.json(quote, { status: 201 })
       })
     })
@@ -857,12 +793,9 @@ describe('router gateway routes', () => {
     expect(response.status).toBe(201)
     expect(calls[0]?.body).toMatchObject({
       type: 'market_order',
-      kind: 'exact_in',
       amount_in: '100000000'
     })
-    expect(calls[0]?.body).not.toHaveProperty('slippage_bps')
-    expect(body).not.toHaveProperty('maxSlippage')
-    expect(body).not.toHaveProperty('minOut')
+    expect(calls[0]?.body).not.toHaveProperty('kind')
   })
 
   test('rejects invalid EVM order refund addresses before creating orders', async () => {
@@ -870,7 +803,7 @@ describe('router gateway routes', () => {
     const app = createApp(testConfig(), {
       fetch: mockFetch(calls, async (path) => {
         if (path === `/api/v1/quotes/${QUOTE_ID}`) {
-          return Response.json(internalBaseToBitcoinLimitQuote())
+          return Response.json(internalBaseToBitcoinQuote())
         }
 
         return Response.json({ message: 'unexpected' }, { status: 500 })
@@ -903,7 +836,7 @@ describe('router gateway routes', () => {
     const app = createApp(testConfig(), {
       fetch: mockFetch(calls, async (path) => {
         if (path === `/api/v1/quotes/${QUOTE_ID}`) {
-          return Response.json(internalBaseToBitcoinLimitQuote())
+          return Response.json(internalBaseToBitcoinQuote())
         }
 
         return Response.json({ message: 'unexpected' }, { status: 500 })
@@ -996,7 +929,6 @@ describe('router gateway routes', () => {
         to: 'Ethereum.USDC',
         toAddress: TO_ADDRESS,
         fromAmount: '1',
-        maxSlippage: '1',
         amountFormat: 'readable'
       })
     })
@@ -1024,7 +956,6 @@ describe('router gateway routes', () => {
         to: 'Ethereum.USDC',
         toAddress: TO_ADDRESS,
         fromAmount: '1',
-        maxSlippage: '1',
         amountFormat: 'readable'
       })
     })
@@ -1069,7 +1000,6 @@ describe('router gateway routes', () => {
         to: 'Ethereum.USDC',
         toAddress: TO_ADDRESS,
         fromAmount: '1',
-        maxSlippage: '1',
         amountFormat: 'readable'
       })
     })
@@ -1100,7 +1030,6 @@ describe('router gateway routes', () => {
         to: 'Ethereum.USDC',
         toAddress: TO_ADDRESS,
         fromAmount: '1.25',
-        maxSlippage: '1.5',
         amountFormat: 'readable'
       })
     })
@@ -1119,9 +1048,7 @@ describe('router gateway routes', () => {
         asset: '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48'
       },
       recipient_address: TO_ADDRESS,
-      kind: 'exact_in',
       amount_in: '125000000',
-      slippage_bps: 150
     })
 
     const body = await response.json()
@@ -1129,9 +1056,7 @@ describe('router gateway routes', () => {
       quoteId: QUOTE_ID,
       from: 'Bitcoin.BTC',
       to: 'Ethereum.USDC',
-      expectedOut: '100',
-      minOut: '99',
-      maxSlippage: '1.5',
+      estimatedOut: '100',
       amountFormat: 'readable'
     })
   })
@@ -1177,7 +1102,6 @@ describe('router gateway routes', () => {
         to: 'Ethereum.USDC',
         toAddress: TO_ADDRESS,
         fromAmount: '1.25',
-        maxSlippage: '1.5',
         amountFormat: 'readable'
       })
     })
@@ -1212,16 +1136,12 @@ describe('router gateway routes', () => {
     ).toBe(expectedAuthorization)
   })
 
-  test('translates a raw limit quote request to the internal router API', async () => {
+  test('rejects raw limit quote requests before calling the router API', async () => {
     const calls: RecordedCall[] = []
     const app = createApp(testConfig(), {
-      fetch: mockFetch(calls, async (path) => {
-        if (path === '/api/v1/quotes') {
-          return Response.json(internalBaseToBitcoinLimitQuote(), { status: 201 })
-        }
-
-        return Response.json({ message: 'not found' }, { status: 404 })
-      })
+      fetch: mockFetch(calls, async () =>
+        Response.json({ message: 'unexpected' }, { status: 500 })
+      )
     })
 
     const response = await app.request('/quote', {
@@ -1238,33 +1158,8 @@ describe('router gateway routes', () => {
       })
     })
 
-    expect(response.status).toBe(201)
-    expect(calls[0]?.body).toEqual({
-      type: 'limit_order',
-      from_asset: {
-        chain: 'evm:8453',
-        asset: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913'
-      },
-      to_asset: {
-        chain: 'bitcoin',
-        asset: 'native'
-      },
-      recipient_address: BTC_ADDRESS,
-      input_amount: '100000000',
-      output_amount: '100000'
-    })
-
-    const body = await response.json()
-    expect(body).toMatchObject({
-      quoteId: QUOTE_ID,
-      orderType: 'limit_order',
-      from: 'Base.USDC',
-      to: 'Bitcoin.BTC',
-      expectedOut: '100000',
-      maxIn: '101219825',
-      maxSlippage: '0',
-      amountFormat: 'raw'
-    })
+    expect(response.status).toBe(400)
+    expect(calls).toHaveLength(0)
   })
 
   test('creates a market order and defaults refundAddress to fromAddress', async () => {
@@ -1496,7 +1391,7 @@ describe('router gateway routes', () => {
 
         if (path === '/api/v1/orders') {
           const order = internalOrder()
-          order.quote.payload.amount_out = '0'
+          order.quote.payload.estimated_amount_out = '0'
           return Response.json(order, { status: 201 })
         }
 
@@ -1579,7 +1474,7 @@ describe('router gateway routes', () => {
     await expect(store.findRefundAuthorization(ORDER_ID)).resolves.toBeUndefined()
   })
 
-  test('creates a limit order from a limit quote', async () => {
+  test('rejects creating an order from a limit quote', async () => {
     const calls: RecordedCall[] = []
     const store = new InMemoryRefundAuthorizationStore()
     const app = createApp(testConfig(), {
@@ -1612,32 +1507,15 @@ describe('router gateway routes', () => {
       })
     })
 
-    expect(response.status).toBe(201)
-    expect(calls[1]?.path).toBe('/api/v1/orders')
-    expect(calls[1]?.body).toEqual({
-      quote_id: LIMIT_QUOTE_ID,
-      refund_address: FROM_ADDRESS,
-      idempotency_key: IDEMPOTENCY_KEY,
-      metadata: {
-        integrator: 'limit-loadgen',
-        from_address: FROM_ADDRESS,
-        to_address: TO_ADDRESS,
-        gateway: 'router-gateway'
-      }
-    })
-
     const body = await response.json()
-    expect(body).toMatchObject({
-      orderId: ORDER_ID,
-      orderType: 'limit_order',
-      amountToSend: '125000000',
-      maxIn: '125000000',
-      expectedOut: '100000000000',
-      refundMode: 'token'
-    })
+    expect(response.status).toBe(400)
+    expect(body.error.message).toBe('limit orders are currently disabled')
+    expect(calls.map((call) => call.path)).toEqual([
+      `/api/v1/quotes/${LIMIT_QUOTE_ID}`
+    ])
   })
 
-  test('creates a limit order with explicit input and output amounts', async () => {
+  test('does not register the limit order endpoint', async () => {
     const calls: RecordedCall[] = []
     const store = new InMemoryRefundAuthorizationStore()
     const app = createApp(testConfig(), {
@@ -1671,55 +1549,11 @@ describe('router gateway routes', () => {
       })
     })
 
-    expect(response.status).toBe(201)
-    expect(calls[0]?.method).toBe('POST')
-    expect(calls[0]?.path).toBe('/api/v1/quotes')
-    expect(calls[0]?.body).toEqual({
-      type: 'limit_order',
-      from_asset: {
-        chain: 'bitcoin',
-        asset: 'native'
-      },
-      to_asset: {
-        chain: 'evm:1',
-        asset: '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48'
-      },
-      recipient_address: TO_ADDRESS,
-      input_amount: '125000000',
-      output_amount: '100000000000'
-    })
-    expect(calls[1]?.body).toEqual({
-      quote_id: LIMIT_QUOTE_ID,
-      refund_address: FROM_ADDRESS,
-      idempotency_key: IDEMPOTENCY_KEY,
-      metadata: {
-        integrator: 'partner-a',
-        from_address: FROM_ADDRESS,
-        to_address: TO_ADDRESS,
-        gateway: 'router-gateway',
-        order_type: 'limit_order'
-      }
-    })
-
-    const body = await response.json()
-    expect(body).toMatchObject({
-      orderId: ORDER_ID,
-      orderAddress: 'bc1qorderaddress0000000000000000000000000',
-      orderType: 'limit_order',
-      amountToSend: '1.25',
-      quoteId: LIMIT_QUOTE_ID,
-      from: 'Bitcoin.BTC',
-      to: 'Ethereum.USDC',
-      expectedOut: '100000',
-      maxIn: '1.25',
-      maxSlippage: '0',
-      refundMode: 'evmSignature',
-      refundAuthorizer: REFUND_ACCOUNT.address
-    })
-    expect(body.cancellationSecret).toBeUndefined()
+    expect(response.status).toBe(404)
+    expect(calls).toHaveLength(0)
   })
 
-  test('creates a limit order by deriving output from a readable price', async () => {
+  test('does not register limit orders with derived output amounts', async () => {
     const calls: RecordedCall[] = []
     const app = createApp(testConfig(), {
       refundAuthorizationService: testRefundAuthorizationService(
@@ -1753,14 +1587,11 @@ describe('router gateway routes', () => {
       })
     })
 
-    expect(response.status).toBe(201)
-    expect(calls[0]?.body).toMatchObject({
-      input_amount: '200000000',
-      output_amount: '200000000000'
-    })
+    expect(response.status).toBe(404)
+    expect(calls).toHaveLength(0)
   })
 
-  test('creates a limit order by deriving input from a readable price', async () => {
+  test('does not register limit orders with derived input amounts', async () => {
     const calls: RecordedCall[] = []
     const app = createApp(testConfig(), {
       refundAuthorizationService: testRefundAuthorizationService(
@@ -1794,14 +1625,11 @@ describe('router gateway routes', () => {
       })
     })
 
-    expect(response.status).toBe(201)
-    expect(calls[0]?.body).toMatchObject({
-      input_amount: '200000000',
-      output_amount: '200000000000'
-    })
+    expect(response.status).toBe(404)
+    expect(calls).toHaveLength(0)
   })
 
-  test('rejects numeric limit order amounts before calling the router API', async () => {
+  test('does not register limit orders with invalid amount shapes', async () => {
     const calls: RecordedCall[] = []
     const app = createApp(testConfig(), {
       fetch: mockFetch(calls, async () =>
@@ -1824,7 +1652,7 @@ describe('router gateway routes', () => {
       })
     })
 
-    expect(response.status).toBe(400)
+    expect(response.status).toBe(404)
     expect(calls).toHaveLength(0)
   })
 
@@ -2110,7 +1938,7 @@ describe('router gateway routes', () => {
 
         if (path === `/api/v1/orders/${ORDER_ID}/cancellations`) {
           const order = internalOrder({ status: 'refunding' })
-          order.quote.payload.amount_out = '0'
+          order.quote.payload.estimated_amount_out = '0'
           return Response.json(order)
         }
 
@@ -2328,17 +2156,10 @@ describe('router gateway routes', () => {
   test('cancels token-authorized limit orders with the limit response shape', async () => {
     const calls: RecordedCall[] = []
     const store = new InMemoryRefundAuthorizationStore()
+    const refundAuthorizationService = testRefundAuthorizationService(store)
     const app = createApp(testConfig(), {
-      refundAuthorizationService: testRefundAuthorizationService(store),
+      refundAuthorizationService,
       fetch: mockFetch(calls, async (path) => {
-        if (path === '/api/v1/quotes') {
-          return Response.json(internalLimitQuote(), { status: 201 })
-        }
-
-        if (path === '/api/v1/orders') {
-          return Response.json(internalLimitOrder(), { status: 201 })
-        }
-
         if (path === `/api/v1/orders/${ORDER_ID}/cancellations`) {
           return Response.json(internalLimitOrder({ status: 'refunding' }))
         }
@@ -2347,28 +2168,19 @@ describe('router gateway routes', () => {
       })
     })
 
-    const orderResponse = await app.request('/order/limit', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        from: 'Bitcoin.BTC',
-        to: 'Ethereum.USDC',
-        fromAddress: FROM_ADDRESS,
-        toAddress: TO_ADDRESS,
-        fromAmount: '1.25',
-        toAmount: '100000',
-        refundMode: 'token',
-        refundAuthorizer: null,
-        idempotencyKey: IDEMPOTENCY_KEY
-      })
+    const authorization = await refundAuthorizationService.createRefundAuthorization({
+      routerOrderId: ORDER_ID,
+      cancellationSecret:
+        '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      refundMode: 'token',
+      refundAuthorizer: null
     })
-    const orderBody = await orderResponse.json()
 
     const cancelResponse = await app.request(`/order/${ORDER_ID}/cancel`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        refundToken: orderBody.refundToken
+        refundToken: authorization.refundToken as string
       })
     })
     const cancelBody = await cancelResponse.json()
@@ -2376,12 +2188,10 @@ describe('router gateway routes', () => {
     expect(cancelResponse.status).toBe(200)
     expect(cancelBody).toMatchObject({
       orderId: ORDER_ID,
-      status: 'refunding',
+      status: 'refund_pending',
       quoteId: LIMIT_QUOTE_ID,
       orderType: 'limit_order',
-      expectedOut: '100000',
-      maxIn: '1.25',
-      maxSlippage: '0'
+      estimatedOut: '100000',
     })
   })
 
@@ -2451,7 +2261,7 @@ describe('router gateway routes', () => {
     })
 
     const body = await response.json()
-    expect(body.status).toBe('refunding')
+    expect(body.status).toBe('refund_pending')
   })
 
   test('rejects EIP-712 refund signatures with excessive future deadlines', async () => {
@@ -2820,12 +2630,8 @@ function internalQuote() {
         },
         recipient_address: TO_ADDRESS,
         provider_id: 'unit',
-        order_kind: 'exact_in',
         amount_in: '125000000',
-        amount_out: '100000000',
-        min_amount_out: '99000000',
-        max_amount_in: null,
-        slippage_bps: 150,
+        estimated_amount_out: '100000000',
         provider_quote: {},
         expires_at: '2026-04-30T12:00:00Z',
         created_at: '2026-04-30T11:59:00Z'
@@ -2860,6 +2666,22 @@ function internalLimitQuote() {
       }
     }
   }
+}
+
+function internalBaseToBitcoinQuote() {
+  const quote = internalQuote()
+  quote.quote.payload.source_asset = {
+    chain: 'evm:8453',
+    asset: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913'
+  }
+  quote.quote.payload.destination_asset = {
+    chain: 'bitcoin',
+    asset: 'native'
+  }
+  quote.quote.payload.recipient_address = BTC_ADDRESS
+  quote.quote.payload.amount_in = '101219825'
+  quote.quote.payload.estimated_amount_out = '100000'
+  return quote
 }
 
 function internalBaseToBitcoinLimitQuote() {

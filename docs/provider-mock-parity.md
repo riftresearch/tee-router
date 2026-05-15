@@ -169,7 +169,7 @@ Important semantic gaps:
   modeled by the Velora mock transaction.
 - Native input value handling is only modeled to the extent the router needs
   transaction-shape coverage.
-- Real Velora route quality, exchange selection, gas estimates, slippage, and
+- Real Velora route quality, exchange selection, gas estimates, execution tolerance, and
   calldata semantics must be validated through live differential tests.
 
 ## Live Differential Tests

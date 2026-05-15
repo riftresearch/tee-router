@@ -5,9 +5,6 @@ use super::*;
 pub struct OrderWorkflow {
     state: OrderWorkflowState,
     provider_operation_hints: Vec<ProviderOperationHintSignal>,
-    manual_releases: Vec<ManualReleaseSignal>,
-    manual_refund_triggers: Vec<ManualTriggerRefundSignal>,
-    acknowledge_unrecoverables: Vec<AcknowledgeUnrecoverableSignal>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -17,7 +14,6 @@ enum OrderWorkflowState {
     Executing(ExecutingState),
     RefreshingQuote(RefreshingQuoteState),
     Refunding(RefundingState),
-    WaitingForManualIntervention(WaitingForManualInterventionState),
     Finalizing(FinalizingState),
 }
 
@@ -44,13 +40,6 @@ struct RefreshingQuoteState {
 struct RefundingState {
     order_id: WorkflowOrderId,
     parent_attempt_id: WorkflowAttemptId,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct WaitingForManualInterventionState {
-    order_id: WorkflowOrderId,
-    attempt_id: WorkflowAttemptId,
-    step_id: WorkflowStepId,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -108,18 +97,6 @@ impl OrderWorkflowState {
         })
     }
 
-    fn waiting_for_manual_intervention(
-        order_id: WorkflowOrderId,
-        attempt_id: WorkflowAttemptId,
-        step_id: WorkflowStepId,
-    ) -> Self {
-        Self::WaitingForManualIntervention(WaitingForManualInterventionState {
-            order_id,
-            attempt_id,
-            step_id,
-        })
-    }
-
     fn finalizing(order_id: WorkflowOrderId, terminal_status: Option<OrderTerminalStatus>) -> Self {
         Self::Finalizing(FinalizingState {
             order_id,
@@ -133,9 +110,6 @@ impl OrderWorkflowState {
             Self::Executing(_) => OrderWorkflowPhase::Executing,
             Self::RefreshingQuote(_) => OrderWorkflowPhase::RefreshingQuote,
             Self::Refunding(_) => OrderWorkflowPhase::Refunding,
-            Self::WaitingForManualIntervention(_) => {
-                OrderWorkflowPhase::WaitingForManualIntervention
-            }
             Self::Finalizing(state) => {
                 let _terminal_status = state.terminal_status;
                 OrderWorkflowPhase::Finalizing
@@ -150,7 +124,6 @@ impl OrderWorkflowState {
             Self::Executing(state) => Some(state.order_id),
             Self::RefreshingQuote(state) => Some(state.order_id),
             Self::Refunding(state) => Some(state.order_id),
-            Self::WaitingForManualIntervention(state) => Some(state.order_id),
             Self::Finalizing(state) => Some(state.order_id),
         }
     }
@@ -160,7 +133,6 @@ impl OrderWorkflowState {
             Self::Executing(state) => Some(state.attempt_id),
             Self::RefreshingQuote(state) => Some(state.stale_attempt_id),
             Self::Refunding(state) => Some(state.parent_attempt_id),
-            Self::WaitingForManualIntervention(state) => Some(state.attempt_id),
             Self::NotStarted | Self::WaitingForFunding(_) | Self::Finalizing(_) => None,
         }
     }
@@ -169,7 +141,6 @@ impl OrderWorkflowState {
         match self {
             Self::Executing(state) => state.active_step_id,
             Self::RefreshingQuote(state) => Some(state.failed_step_id),
-            Self::WaitingForManualIntervention(state) => Some(state.step_id),
             Self::NotStarted
             | Self::WaitingForFunding(_)
             | Self::Refunding(_)
@@ -190,9 +161,6 @@ impl Default for OrderWorkflow {
         Self {
             state: OrderWorkflowState::NotStarted,
             provider_operation_hints: Vec::new(),
-            manual_releases: Vec::new(),
-            manual_refund_triggers: Vec::new(),
-            acknowledge_unrecoverables: Vec::new(),
         }
     }
 }
@@ -273,87 +241,8 @@ impl OrderWorkflow {
             .await?;
         let funded_to_workflow_start_seconds = execution_state.funded_to_workflow_start_seconds;
 
-        let mut resumed_manual_attempt = None;
-        if execution_state.order.status == RouterOrderStatus::ManualInterventionRequired {
-            let context = ctx
-                .start_activity(
-                    OrderActivities::load_manual_intervention_context,
-                    LoadManualInterventionContextInput {
-                        order_id: input.order_id,
-                        scope: ManualInterventionScope::OrderAttempt,
-                    },
-                    db_activity_options.clone(),
-                )
-                .await?;
-            let attempt_id = context.attempt_id.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "manual-intervention order {} has no execution attempt context",
-                    input.order_id
-                )
-            })?;
-            let step_id = context.step_id.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "manual-intervention order {} has no execution step context",
-                    input.order_id
-                )
-            })?;
-            match wait_for_manual_intervention_resolution(
-                ctx,
-                input.order_id,
-                attempt_id,
-                step_id,
-                json_reason("workflow_started_in_manual_intervention", step_id),
-                db_activity_options.clone(),
-                funded_to_workflow_start_seconds,
-            )
-            .await?
-            {
-                ManualInterventionResolution::Release => {
-                    let execution_attempt = ctx
-                        .start_activity(
-                            OrderActivities::materialize_retry_attempt,
-                            MaterializeRetryAttemptInput {
-                                order_id: input.order_id,
-                                failed_attempt_id: attempt_id,
-                                failed_step_id: step_id,
-                            },
-                            db_activity_options.clone(),
-                        )
-                        .await?;
-                    set_order_workflow_executing(ctx, input.order_id, execution_attempt.attempt_id);
-                    resumed_manual_attempt = Some(execution_attempt);
-                }
-                ManualInterventionResolution::TriggerRefund => {
-                    set_order_workflow_refunding(ctx, input.order_id, attempt_id);
-                    let terminal_status = run_refund_child(
-                        ctx,
-                        input.order_id,
-                        attempt_id,
-                        funded_to_workflow_start_seconds,
-                    )
-                    .await?;
-                    return order_workflow_output(
-                        ctx,
-                        workflow_started_at,
-                        input.order_id,
-                        terminal_status,
-                    );
-                }
-                ManualInterventionResolution::Terminal(finalized) => {
-                    return order_workflow_output(
-                        ctx,
-                        workflow_started_at,
-                        input.order_id,
-                        finalized.terminal_status,
-                    );
-                }
-            }
-        }
-
-        let mut execution_attempt = if let Some(execution_attempt) = resumed_manual_attempt {
-            execution_attempt
-        } else {
-            ctx.start_activity(
+        let mut execution_attempt = ctx
+            .start_activity(
                 OrderActivities::materialize_execution_attempt,
                 MaterializeExecutionAttemptInput {
                     order_id: input.order_id,
@@ -361,8 +250,7 @@ impl OrderWorkflow {
                 },
                 db_activity_options.clone(),
             )
-            .await?
-        };
+            .await?;
         set_order_workflow_executing(ctx, input.order_id, execution_attempt.attempt_id);
 
         'attempts: loop {
@@ -508,132 +396,25 @@ impl OrderWorkflow {
                                     }
                                 }
                             }
-                            StepFailureDecision::ManualIntervention => {
-                                match wait_for_manual_intervention_resolution(
-                                    ctx,
-                                    input.order_id,
-                                    execution_attempt.attempt_id,
-                                    step.step_id,
-                                    json_reason(
-                                        "execution_step_failure_manual_intervention",
-                                        step.step_id,
-                                    ),
-                                    db_activity_options.clone(),
-                                    funded_to_workflow_start_seconds,
-                                )
-                                .await?
-                                {
-                                    ManualInterventionResolution::Release => {
-                                        execution_attempt = ctx
-                                            .start_activity(
-                                                OrderActivities::materialize_retry_attempt,
-                                                MaterializeRetryAttemptInput {
-                                                    order_id: input.order_id,
-                                                    failed_attempt_id: execution_attempt.attempt_id,
-                                                    failed_step_id: step.step_id,
-                                                },
-                                                db_activity_options.clone(),
-                                            )
-                                            .await?;
-                                        set_order_workflow_executing(
-                                            ctx,
-                                            input.order_id,
-                                            execution_attempt.attempt_id,
-                                        );
-                                        continue 'attempts;
-                                    }
-                                    ManualInterventionResolution::TriggerRefund => {
-                                        set_order_workflow_refunding(
-                                            ctx,
-                                            input.order_id,
-                                            execution_attempt.attempt_id,
-                                        );
-                                        let terminal_status = run_refund_child(
-                                            ctx,
-                                            input.order_id,
-                                            execution_attempt.attempt_id,
-                                            funded_to_workflow_start_seconds,
-                                        )
-                                        .await?;
-                                        return order_workflow_output(
-                                            ctx,
-                                            workflow_started_at,
-                                            input.order_id,
-                                            terminal_status,
-                                        );
-                                    }
-                                    ManualInterventionResolution::Terminal(finalized) => {
-                                        return order_workflow_output(
-                                            ctx,
-                                            workflow_started_at,
-                                            input.order_id,
-                                            finalized.terminal_status,
-                                        );
-                                    }
-                                }
-                            }
                         }
                     }
-                    StepExecutionProgress::ManualInterventionRequired { classified } => {
-                        match wait_for_manual_intervention_resolution(
+                    StepExecutionProgress::RefundRequired { classified } => {
+                        let finalized = finalize_refund_required(
                             ctx,
                             input.order_id,
-                            execution_attempt.attempt_id,
-                            step.step_id,
-                            classified.reason,
+                            Some(execution_attempt.attempt_id),
+                            Some(step.step_id),
+                            Some(classified.reason),
                             db_activity_options.clone(),
                             funded_to_workflow_start_seconds,
                         )
-                        .await?
-                        {
-                            ManualInterventionResolution::Release => {
-                                execution_attempt = ctx
-                                    .start_activity(
-                                        OrderActivities::materialize_retry_attempt,
-                                        MaterializeRetryAttemptInput {
-                                            order_id: input.order_id,
-                                            failed_attempt_id: execution_attempt.attempt_id,
-                                            failed_step_id: step.step_id,
-                                        },
-                                        db_activity_options.clone(),
-                                    )
-                                    .await?;
-                                set_order_workflow_executing(
-                                    ctx,
-                                    input.order_id,
-                                    execution_attempt.attempt_id,
-                                );
-                                continue 'attempts;
-                            }
-                            ManualInterventionResolution::TriggerRefund => {
-                                set_order_workflow_refunding(
-                                    ctx,
-                                    input.order_id,
-                                    execution_attempt.attempt_id,
-                                );
-                                let terminal_status = run_refund_child(
-                                    ctx,
-                                    input.order_id,
-                                    execution_attempt.attempt_id,
-                                    funded_to_workflow_start_seconds,
-                                )
-                                .await?;
-                                return order_workflow_output(
-                                    ctx,
-                                    workflow_started_at,
-                                    input.order_id,
-                                    terminal_status,
-                                );
-                            }
-                            ManualInterventionResolution::Terminal(finalized) => {
-                                return order_workflow_output(
-                                    ctx,
-                                    workflow_started_at,
-                                    input.order_id,
-                                    finalized.terminal_status,
-                                );
-                            }
-                        }
+                        .await?;
+                        return order_workflow_output(
+                            ctx,
+                            workflow_started_at,
+                            input.order_id,
+                            finalized.terminal_status,
+                        );
                     }
                 };
                 match dispatched.outcome {
@@ -645,61 +426,27 @@ impl OrderWorkflow {
                             execution_attempt.attempt_id,
                             step.step_id,
                             db_activity_options.clone(),
-                            funded_to_workflow_start_seconds,
                         )
                         .await?
                         {
                             ProviderCompletionWait::Completed => {}
-                            ProviderCompletionWait::ManualInterventionRequired { resolution } => {
-                                match resolution {
-                                    ManualInterventionResolution::Release => {
-                                        execution_attempt = ctx
-                                            .start_activity(
-                                                OrderActivities::materialize_retry_attempt,
-                                                MaterializeRetryAttemptInput {
-                                                    order_id: input.order_id,
-                                                    failed_attempt_id: execution_attempt.attempt_id,
-                                                    failed_step_id: step.step_id,
-                                                },
-                                                db_activity_options.clone(),
-                                            )
-                                            .await?;
-                                        set_order_workflow_executing(
-                                            ctx,
-                                            input.order_id,
-                                            execution_attempt.attempt_id,
-                                        );
-                                        continue 'attempts;
-                                    }
-                                    ManualInterventionResolution::TriggerRefund => {
-                                        set_order_workflow_refunding(
-                                            ctx,
-                                            input.order_id,
-                                            execution_attempt.attempt_id,
-                                        );
-                                        let terminal_status = run_refund_child(
-                                            ctx,
-                                            input.order_id,
-                                            execution_attempt.attempt_id,
-                                            funded_to_workflow_start_seconds,
-                                        )
-                                        .await?;
-                                        return order_workflow_output(
-                                            ctx,
-                                            workflow_started_at,
-                                            input.order_id,
-                                            terminal_status,
-                                        );
-                                    }
-                                    ManualInterventionResolution::Terminal(finalized) => {
-                                        return order_workflow_output(
-                                            ctx,
-                                            workflow_started_at,
-                                            input.order_id,
-                                            finalized.terminal_status,
-                                        );
-                                    }
-                                }
+                            ProviderCompletionWait::RefundRequired { reason } => {
+                                let finalized = finalize_refund_required(
+                                    ctx,
+                                    input.order_id,
+                                    Some(execution_attempt.attempt_id),
+                                    Some(step.step_id),
+                                    Some(reason),
+                                    db_activity_options.clone(),
+                                    funded_to_workflow_start_seconds,
+                                )
+                                .await?;
+                                return order_workflow_output(
+                                    ctx,
+                                    workflow_started_at,
+                                    input.order_id,
+                                    finalized.terminal_status,
+                                );
                             }
                         }
                     }
@@ -856,41 +603,6 @@ impl OrderWorkflow {
         }
     }
 
-    /// Scar tissue: §3 phases 8-10 and §8 refund position discovery.
-    #[signal]
-    pub fn manual_refund_trigger(
-        &mut self,
-        ctx: &mut SyncWorkflowContext<Self>,
-        signal: ManualTriggerRefundSignal,
-    ) {
-        maybe_record_signal(ctx, ORDER_WORKFLOW_TYPE, "manual_trigger_refund");
-        self.manual_refund_triggers.push(signal);
-    }
-
-    /// Scar tissue: §6 manual-intervention state. Exception: the release transport is a new
-    /// Temporal signal surface, but it targets the manual-intervention state §6 requires.
-    #[signal]
-    pub fn manual_intervention_release(
-        &mut self,
-        ctx: &mut SyncWorkflowContext<Self>,
-        signal: ManualReleaseSignal,
-    ) {
-        maybe_record_signal(ctx, ORDER_WORKFLOW_TYPE, "manual_release");
-        self.manual_releases.push(signal);
-    }
-
-    /// Scar tissue: §6 manual-intervention state. This is the only operator signal that
-    /// intentionally closes a manually paused workflow without further execution.
-    #[signal]
-    pub fn acknowledge_unrecoverable(
-        &mut self,
-        ctx: &mut SyncWorkflowContext<Self>,
-        signal: AcknowledgeUnrecoverableSignal,
-    ) {
-        maybe_record_signal(ctx, ORDER_WORKFLOW_TYPE, "acknowledge_unrecoverable");
-        self.acknowledge_unrecoverables.push(signal);
-    }
-
     /// Scar tissue: §3 phase-pass visibility. Exception: this operator-only Temporal query is a
     /// new debug surface, replacing lease-worker pass introspection without changing business
     /// state.
@@ -930,31 +642,6 @@ impl OrderWorkflow {
             .position(|signal| provider_operation_hint_targets_step(signal, order_id, step_id))?;
         Some(self.provider_operation_hints.remove(index))
     }
-
-    fn has_manual_resolution(&self) -> bool {
-        !self.manual_releases.is_empty()
-            || !self.manual_refund_triggers.is_empty()
-            || !self.acknowledge_unrecoverables.is_empty()
-    }
-
-    fn pop_manual_resolution(&mut self) -> Option<ManualInterventionSignal> {
-        if !self.manual_releases.is_empty() {
-            return Some(ManualInterventionSignal::Release(
-                self.manual_releases.remove(0),
-            ));
-        }
-        if !self.manual_refund_triggers.is_empty() {
-            return Some(ManualInterventionSignal::TriggerRefund(
-                self.manual_refund_triggers.remove(0),
-            ));
-        }
-        if !self.acknowledge_unrecoverables.is_empty() {
-            return Some(ManualInterventionSignal::AcknowledgeUnrecoverable(
-                self.acknowledge_unrecoverables.remove(0),
-            ));
-        }
-        None
-    }
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -963,22 +650,14 @@ enum StepExecutionProgress {
     ActivityFailed {
         failure_reason: String,
     },
-    ManualInterventionRequired {
+    RefundRequired {
         classified: StaleRunningStepClassified,
     },
 }
 
 enum ProviderCompletionWait {
     Completed,
-    ManualInterventionRequired {
-        resolution: ManualInterventionResolution,
-    },
-}
-
-enum ManualInterventionResolution {
-    Release,
-    TriggerRefund,
-    Terminal(FinalizedOrder),
+    RefundRequired { reason: Value },
 }
 
 /// Fires the venue-specific `dispatch_<step_type>_step` activity for the given
@@ -1310,9 +989,7 @@ async fn dispatch_step_with_stale_running_timer(
                     }
                     StaleRunningStepDecision::AmbiguousExternalSideEffectWindow
                     | StaleRunningStepDecision::StaleRunningStepWithoutCheckpoint => {
-                        return Ok(StepExecutionProgress::ManualInterventionRequired {
-                            classified,
-                        });
+                        return Ok(StepExecutionProgress::RefundRequired { classified });
                     }
                 }
             }
@@ -1341,18 +1018,16 @@ async fn run_refund_child(
     let refunded = child.result().await?;
     Ok(match refunded.terminal_status {
         RefundTerminalStatus::Refunded => OrderTerminalStatus::Refunded,
-        RefundTerminalStatus::RefundManualInterventionRequired => {
-            OrderTerminalStatus::RefundManualInterventionRequired
-        }
+        RefundTerminalStatus::RefundRequired => OrderTerminalStatus::RefundRequired,
     })
 }
 
-async fn finalize_manual_intervention(
+async fn finalize_refund_required(
     ctx: &mut WorkflowContext<OrderWorkflow>,
     order_id: WorkflowOrderId,
-    attempt_id: WorkflowAttemptId,
-    step_id: WorkflowStepId,
-    reason: Value,
+    attempt_id: Option<WorkflowAttemptId>,
+    step_id: Option<WorkflowStepId>,
+    reason: Option<Value>,
     db_activity_options: ActivityOptions,
     funded_to_workflow_start_seconds: Option<f64>,
 ) -> WorkflowResult<FinalizedOrder> {
@@ -1361,159 +1036,11 @@ async fn finalize_manual_intervention(
             OrderActivities::finalize_order_or_refund,
             FinalizeOrderOrRefundInput {
                 order_id,
-                attempt_id: Some(attempt_id),
-                step_id: Some(step_id),
-                terminal_status: OrderTerminalStatus::ManualInterventionRequired,
-                reason: Some(reason),
-                funded_to_workflow_start_seconds,
-            },
-            db_activity_options,
-        )
-        .await?)
-}
-
-#[allow(clippy::never_loop)]
-async fn wait_for_manual_intervention_resolution(
-    ctx: &mut WorkflowContext<OrderWorkflow>,
-    order_id: WorkflowOrderId,
-    attempt_id: WorkflowAttemptId,
-    step_id: WorkflowStepId,
-    reason: Value,
-    db_activity_options: ActivityOptions,
-    funded_to_workflow_start_seconds: Option<f64>,
-) -> WorkflowResult<ManualInterventionResolution> {
-    ctx.state_mut(|workflow| {
-        workflow.state =
-            OrderWorkflowState::waiting_for_manual_intervention(order_id, attempt_id, step_id);
-    });
-    let wait_started_at = manual_wait_started(ctx, ORDER_WORKFLOW_TYPE);
-    let _paused = finalize_manual_intervention(
-        ctx,
-        order_id,
-        attempt_id,
-        step_id,
-        reason,
-        db_activity_options.clone(),
-        funded_to_workflow_start_seconds,
-    )
-    .await?;
-
-    loop {
-        temporalio_sdk::workflows::select! {
-            _ = ctx.wait_condition(|state: &OrderWorkflow| state.has_manual_resolution()) => {
-                let signal = ctx
-                    .state_mut(|state| state.pop_manual_resolution())
-                    .expect("manual-intervention condition was satisfied");
-                match signal {
-                    ManualInterventionSignal::Release(signal) => {
-                        let _ = ctx
-                            .start_activity(
-                                OrderActivities::prepare_manual_intervention_retry,
-                                PrepareManualInterventionRetryInput {
-                                    order_id,
-                                    attempt_id,
-                                    step_id,
-                                    signal: signal.clone(),
-                                },
-                                db_activity_options.clone(),
-                            )
-                            .await?;
-                        record_manual_wait_completed(
-                            ctx,
-                            ORDER_WORKFLOW_TYPE,
-                            wait_started_at,
-                            "release",
-                        );
-                        return Ok(ManualInterventionResolution::Release);
-                    }
-                    ManualInterventionSignal::TriggerRefund(signal) => {
-                        let _ = ctx
-                            .start_activity(
-                                OrderActivities::prepare_manual_intervention_refund,
-                                PrepareManualInterventionRefundInput {
-                                    order_id,
-                                    attempt_id,
-                                    step_id,
-                                    signal: signal.clone(),
-                                },
-                                db_activity_options.clone(),
-                            )
-                            .await?;
-                        record_manual_wait_completed(
-                            ctx,
-                            ORDER_WORKFLOW_TYPE,
-                            wait_started_at,
-                            "trigger_refund",
-                        );
-                        return Ok(ManualInterventionResolution::TriggerRefund);
-                    }
-                    ManualInterventionSignal::AcknowledgeUnrecoverable(signal) => {
-                        let finalized = acknowledge_manual_intervention_terminal(
-                            ctx,
-                            order_id,
-                            Some(attempt_id),
-                            Some(step_id),
-                            ManualInterventionScope::OrderAttempt,
-                            signal,
-                            AcknowledgeReason::OperatorTerminal,
-                            db_activity_options.clone(),
-                        )
-                        .await?;
-                        record_manual_wait_completed(
-                            ctx,
-                            ORDER_WORKFLOW_TYPE,
-                            wait_started_at,
-                            "acknowledge_unrecoverable",
-                        );
-                        return Ok(ManualInterventionResolution::Terminal(finalized));
-                    }
-                }
-            }
-            _ = ctx.timer(MANUAL_INTERVENTION_WAIT_TIMEOUT) => {
-                let finalized = acknowledge_manual_intervention_terminal(
-                    ctx,
-                    order_id,
-                    Some(attempt_id),
-                    Some(step_id),
-                    ManualInterventionScope::OrderAttempt,
-                    zombie_cleanup_signal(),
-                    AcknowledgeReason::ZombieCleanup,
-                    db_activity_options.clone(),
-                )
-                .await?;
-                record_manual_wait_completed(
-                    ctx,
-                    ORDER_WORKFLOW_TYPE,
-                    wait_started_at,
-                    "zombie_cleanup",
-                );
-                return Ok(ManualInterventionResolution::Terminal(finalized));
-            }
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn acknowledge_manual_intervention_terminal(
-    ctx: &mut WorkflowContext<OrderWorkflow>,
-    order_id: WorkflowOrderId,
-    attempt_id: Option<WorkflowAttemptId>,
-    step_id: Option<WorkflowStepId>,
-    scope: ManualInterventionScope,
-    signal: AcknowledgeUnrecoverableSignal,
-    reason: AcknowledgeReason,
-    db_activity_options: ActivityOptions,
-) -> WorkflowResult<FinalizedOrder> {
-    Ok(ctx
-        .start_activity(
-            OrderActivities::acknowledge_manual_intervention_terminal,
-            AcknowledgeManualInterventionInput {
-                order_id,
                 attempt_id,
                 step_id,
-                scope,
-                signal,
+                terminal_status: OrderTerminalStatus::RefundRequired,
                 reason,
+                funded_to_workflow_start_seconds,
             },
             db_activity_options,
         )
@@ -1526,7 +1053,6 @@ async fn wait_for_provider_completion_hint(
     attempt_id: WorkflowAttemptId,
     step_id: WorkflowStepId,
     db_activity_options: ActivityOptions,
-    funded_to_workflow_start_seconds: Option<f64>,
 ) -> WorkflowResult<ProviderCompletionWait> {
     let wait_started_at = provider_hint_wait_started(ctx);
 
@@ -1638,28 +1164,19 @@ async fn wait_for_provider_completion_hint(
     match wait_outcome {
         HintWaitOutcome::Accepted(_) => Ok(ProviderCompletionWait::Completed),
         HintWaitOutcome::TimedOut => {
-            // Timer future was dropped at the inner block's end, so its `&ctx`
-            // borrow is released here and the `&mut ctx` escalation is allowed.
-            let resolution = wait_for_manual_intervention_resolution(
-                ctx,
-                order_id,
-                attempt_id,
-                step_id,
-                json!({
-                    "reason": "provider_operation_hint_wait_timeout",
-                    "step_id": step_id,
-                }),
-                db_activity_options.clone(),
-                funded_to_workflow_start_seconds,
-            )
-            .await?;
             record_provider_hint_wait(
                 ctx,
                 ORDER_WORKFLOW_TYPE,
                 wait_started_at,
-                "timeout_manual_intervention",
+                "timeout_refund_required",
             );
-            Ok(ProviderCompletionWait::ManualInterventionRequired { resolution })
+            Ok(ProviderCompletionWait::RefundRequired {
+                reason: json!({
+                    "reason": "provider_operation_hint_wait_timeout",
+                    "step_id": step_id,
+                    "attempt_id": attempt_id,
+                }),
+            })
         }
     }
 }

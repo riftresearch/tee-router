@@ -1,5 +1,5 @@
 use crate::{
-    models::MarketOrderKind,
+    models::ProviderOrderKind,
     models::{ProviderAddressRole, ProviderOperationStatus, ProviderOperationType},
     protocol::{AssetId, ChainId, DepositAsset},
     services::{
@@ -127,7 +127,7 @@ pub struct BridgeQuoteRequest {
     pub source_asset: DepositAsset,
     pub destination_asset: DepositAsset,
     #[serde(flatten)]
-    pub order_kind: MarketOrderKind,
+    pub order_kind: ProviderOrderKind,
     pub recipient_address: String,
     pub depositor_address: String,
     pub partial_fills_enabled: bool,
@@ -196,7 +196,7 @@ pub struct ExchangeQuoteRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_decimals: Option<u8>,
     #[serde(flatten)]
-    pub order_kind: MarketOrderKind,
+    pub order_kind: ProviderOrderKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_address: Option<String>,
     pub recipient_address: String,
@@ -918,8 +918,8 @@ impl BridgeProvider for AcrossProvider {
                 return Ok(None);
             };
             let amount_in = match &request.order_kind {
-                MarketOrderKind::ExactIn { amount_in, .. } => amount_in.clone(),
-                MarketOrderKind::ExactOut { .. } => response
+                ProviderOrderKind::ExactIn { amount_in, .. } => amount_in.clone(),
+                ProviderOrderKind::ExactOut { .. } => response
                     .max_input_amount
                     .clone()
                     .or_else(|| response.input_amount.clone())
@@ -1409,12 +1409,12 @@ fn build_across_swap_approval_request(
         .map_err(|err| format!("across quote: invalid depositor_address: {err}"))?;
     let refund_address = depositor;
     let (trade_type, amount) = match &request.order_kind {
-        MarketOrderKind::ExactIn { amount_in, .. } => (
+        ProviderOrderKind::ExactIn { amount_in, .. } => (
             "exactInput".to_string(),
             U256::from_str_radix(amount_in, 10)
                 .map_err(|err| format!("across quote: invalid amount_in {amount_in}: {err}"))?,
         ),
-        MarketOrderKind::ExactOut { amount_out, .. } => (
+        ProviderOrderKind::ExactOut { amount_out, .. } => (
             "exactOutput".to_string(),
             U256::from_str_radix(amount_out, 10)
                 .map_err(|err| format!("across quote: invalid amount_out {amount_out}: {err}"))?,
@@ -2244,7 +2244,7 @@ impl BridgeProvider for HyperliquidBridgeProvider {
             }
 
             let (amount_in, amount_out) = match &request.order_kind {
-                MarketOrderKind::ExactIn { amount_in, .. } => {
+                ProviderOrderKind::ExactIn { amount_in, .. } => {
                     let amount_raw = U256::from_str_radix(amount_in, 10)
                         .map_err(|err| format!("invalid amount: {err}"))?;
                     if is_withdrawal {
@@ -2260,7 +2260,7 @@ impl BridgeProvider for HyperliquidBridgeProvider {
                         (amount_in.clone(), amount_in.clone())
                     }
                 }
-                MarketOrderKind::ExactOut { amount_out, .. } => {
+                ProviderOrderKind::ExactOut { amount_out, .. } => {
                     let amount_raw = U256::from_str_radix(amount_out, 10)
                         .map_err(|err| format!("invalid amount: {err}"))?;
                     if is_withdrawal {
@@ -3188,7 +3188,7 @@ struct CctpQuoteAmounts {
 }
 
 fn cctp_quote_amounts(
-    order_kind: &MarketOrderKind,
+    order_kind: &ProviderOrderKind,
     fee_bps_micros: u128,
 ) -> ProviderResult<Option<CctpQuoteAmounts>> {
     let denominator = U256::from(10_000_000_000_u128);
@@ -3197,7 +3197,7 @@ fn cctp_quote_amounts(
         return Err("cctp fee must be below 10000 bps".to_string());
     }
     match order_kind {
-        MarketOrderKind::ExactIn { amount_in, .. } => {
+        ProviderOrderKind::ExactIn { amount_in, .. } => {
             let amount_in = U256::from_str_radix(amount_in, 10)
                 .map_err(|err| format!("invalid cctp amount_in {amount_in}: {err}"))?;
             if amount_in.is_zero() {
@@ -3216,7 +3216,7 @@ fn cctp_quote_amounts(
                 max_fee,
             }))
         }
-        MarketOrderKind::ExactOut { amount_out, .. } => {
+        ProviderOrderKind::ExactOut { amount_out, .. } => {
             let amount_out = U256::from_str_radix(amount_out, 10)
                 .map_err(|err| format!("invalid cctp amount_out {amount_out}: {err}"))?;
             if amount_out.is_zero() {
@@ -3865,7 +3865,7 @@ impl HyperliquidProvider {
         }
 
         let (leg1_in, leg1_out, leg2_in, leg2_out) = match &request.order_kind {
-            MarketOrderKind::ExactIn {
+            ProviderOrderKind::ExactIn {
                 amount_in,
                 min_amount_out,
             } => {
@@ -3875,7 +3875,7 @@ impl HyperliquidProvider {
                     input_decimals,
                     usdc_decimals,
                     input_base_meta.sz_decimals,
-                    &MarketOrderKind::ExactIn {
+                    &ProviderOrderKind::ExactIn {
                         amount_in: amount_in.clone(),
                         // The intermediate slippage bound is enforced by the
                         // outer user bound on the final output.
@@ -3889,7 +3889,7 @@ impl HyperliquidProvider {
                     usdc_decimals,
                     output_decimals,
                     output_base_meta.sz_decimals,
-                    &MarketOrderKind::ExactIn {
+                    &ProviderOrderKind::ExactIn {
                         amount_in: usdc_from_leg1.clone(),
                         min_amount_out: min_amount_out.clone(),
                     },
@@ -3902,7 +3902,7 @@ impl HyperliquidProvider {
                     output_from_leg2,
                 )
             }
-            MarketOrderKind::ExactOut {
+            ProviderOrderKind::ExactOut {
                 amount_out,
                 max_amount_in,
             } => {
@@ -3912,7 +3912,7 @@ impl HyperliquidProvider {
                     usdc_decimals,
                     output_decimals,
                     output_base_meta.sz_decimals,
-                    &MarketOrderKind::ExactOut {
+                    &ProviderOrderKind::ExactOut {
                         amount_out: amount_out.clone(),
                         max_amount_in: Some(PRACTICAL_USDC_MAX_WIRE_STR.to_string()),
                     },
@@ -3924,7 +3924,7 @@ impl HyperliquidProvider {
                     input_decimals,
                     usdc_decimals,
                     input_base_meta.sz_decimals,
-                    &MarketOrderKind::ExactOut {
+                    &ProviderOrderKind::ExactOut {
                         amount_out: usdc_for_leg2.clone(),
                         max_amount_in: max_amount_in.clone(),
                     },
@@ -3940,21 +3940,21 @@ impl HyperliquidProvider {
         };
 
         let leg1_kind = match &request.order_kind {
-            MarketOrderKind::ExactIn { .. } => MarketOrderKind::ExactIn {
+            ProviderOrderKind::ExactIn { .. } => ProviderOrderKind::ExactIn {
                 amount_in: leg1_in.clone(),
                 min_amount_out: Some("1".to_string()),
             },
-            MarketOrderKind::ExactOut { .. } => MarketOrderKind::ExactOut {
+            ProviderOrderKind::ExactOut { .. } => ProviderOrderKind::ExactOut {
                 amount_out: leg1_out.clone(),
                 max_amount_in: Some(leg1_in.clone()),
             },
         };
         let leg2_kind = match &request.order_kind {
-            MarketOrderKind::ExactIn { min_amount_out, .. } => MarketOrderKind::ExactIn {
+            ProviderOrderKind::ExactIn { min_amount_out, .. } => ProviderOrderKind::ExactIn {
                 amount_in: leg2_in.clone(),
                 min_amount_out: min_amount_out.clone(),
             },
-            MarketOrderKind::ExactOut { amount_out, .. } => MarketOrderKind::ExactOut {
+            ProviderOrderKind::ExactOut { amount_out, .. } => ProviderOrderKind::ExactOut {
                 amount_out: amount_out.clone(),
                 max_amount_in: Some(leg2_in.clone()),
             },
@@ -4188,8 +4188,8 @@ impl VeloraProvider {
         network: u64,
     ) -> ProviderResult<Option<Value>> {
         let (side, amount) = match &request.order_kind {
-            MarketOrderKind::ExactIn { amount_in, .. } => ("SELL", amount_in.clone()),
-            MarketOrderKind::ExactOut { amount_out, .. } => ("BUY", amount_out.clone()),
+            ProviderOrderKind::ExactIn { amount_in, .. } => ("SELL", amount_in.clone()),
+            ProviderOrderKind::ExactOut { amount_out, .. } => ("BUY", amount_out.clone()),
         };
         let mut query = vec![
             ("srcToken", src_token.to_string()),
@@ -5143,10 +5143,10 @@ fn velora_quote_descriptor(spec: VeloraQuoteDescriptorSpec<'_>) -> Value {
         amount_out,
     } = spec;
     let (order_kind, min_amount_out, max_amount_in) = match &request.order_kind {
-        MarketOrderKind::ExactIn { min_amount_out, .. } => {
+        ProviderOrderKind::ExactIn { min_amount_out, .. } => {
             ("exact_in", min_amount_out.clone(), None)
         }
-        MarketOrderKind::ExactOut { max_amount_in, .. } => {
+        ProviderOrderKind::ExactOut { max_amount_in, .. } => {
             ("exact_out", None, max_amount_in.clone())
         }
     };
@@ -5346,10 +5346,11 @@ fn validate_velora_price_route(expected: VeloraPriceRouteExpectations<'_>) -> Pr
         "velora priceRoute destAmount",
         &velora_price_route_string(price_route, "destAmount")?,
     )?;
-    let expected_amount_out = parse_u256_decimal_or_hex("velora execution amount_out", amount_out)?;
-    if route_amount_out != expected_amount_out {
+    let estimated_amount_out =
+        parse_u256_decimal_or_hex("velora execution amount_out", amount_out)?;
+    if route_amount_out != estimated_amount_out {
         return Err(format!(
-            "velora priceRoute destAmount {route_amount_out} does not match execution amount_out {expected_amount_out}"
+            "velora priceRoute destAmount {route_amount_out} does not match execution amount_out {estimated_amount_out}"
         ));
     }
 
@@ -5380,12 +5381,12 @@ fn encode_erc20_approve(spender: &str, amount: &str) -> ProviderResult<String> {
 }
 
 fn velora_slippage_bps(
-    order_kind: &MarketOrderKind,
+    order_kind: &ProviderOrderKind,
     amount_in: &str,
     amount_out: &str,
 ) -> ProviderResult<Option<u64>> {
     match order_kind {
-        MarketOrderKind::ExactIn { min_amount_out, .. } => {
+        ProviderOrderKind::ExactIn { min_amount_out, .. } => {
             let Some(min_amount_out) = min_amount_out.as_deref() else {
                 return Ok(Some(VELORA_DEFAULT_SLIPPAGE_BPS));
             };
@@ -5399,7 +5400,7 @@ fn velora_slippage_bps(
             }
             ratio_to_capped_bps(quoted_out - min_out, quoted_out).map(Some)
         }
-        MarketOrderKind::ExactOut { max_amount_in, .. } => {
+        ProviderOrderKind::ExactOut { max_amount_in, .. } => {
             let Some(max_amount_in) = max_amount_in.as_deref() else {
                 return Ok(Some(VELORA_DEFAULT_SLIPPAGE_BPS));
             };
@@ -5508,7 +5509,7 @@ fn simulate_leg(
     input_decimals: u8,
     output_decimals: u8,
     base_sz_decimals: u8,
-    order_kind: &MarketOrderKind,
+    order_kind: &ProviderOrderKind,
     book: &L2BookSnapshot,
 ) -> ProviderResult<(String, String)> {
     let side: &[L2Level] = if is_buy { book.asks() } else { book.bids() };
@@ -5517,7 +5518,7 @@ fn simulate_leg(
     }
 
     match order_kind {
-        MarketOrderKind::ExactIn {
+        ProviderOrderKind::ExactIn {
             amount_in,
             min_amount_out,
         } => {
@@ -5540,7 +5541,7 @@ fn simulate_leg(
             }
             Ok((amount_in.clone(), amount_out_raw.to_string()))
         }
-        MarketOrderKind::ExactOut {
+        ProviderOrderKind::ExactOut {
             amount_out,
             max_amount_in,
         } => {
@@ -6052,7 +6053,7 @@ fn u512_to_u256(value: U512, context: &'static str) -> ProviderResult<U256> {
 fn hl_leg_descriptor(
     input_asset: &DepositAsset,
     output_asset: &DepositAsset,
-    order_kind: &MarketOrderKind,
+    order_kind: &ProviderOrderKind,
     amount_in_wire: &str,
     amount_out_wire: &str,
 ) -> Value {
@@ -6061,8 +6062,8 @@ fn hl_leg_descriptor(
         // limit price for this specific leg. Use the simulated leg amounts,
         // not the outer route slippage fields, because the outer fields may
         // be intentionally loose and can otherwise produce invalid HL prices.
-        MarketOrderKind::ExactIn { .. } => ("exact_in", Some(amount_out_wire.to_string()), None),
-        MarketOrderKind::ExactOut { .. } => ("exact_out", None, Some(amount_in_wire.to_string())),
+        ProviderOrderKind::ExactIn { .. } => ("exact_in", Some(amount_out_wire.to_string()), None),
+        ProviderOrderKind::ExactOut { .. } => ("exact_out", None, Some(amount_in_wire.to_string())),
     };
     json!({
         "order_kind": kind_str,
@@ -6081,10 +6082,12 @@ fn hl_leg_descriptor(
     })
 }
 
-fn slippage_bounds_from_request(order_kind: &MarketOrderKind) -> (Option<String>, Option<String>) {
+fn slippage_bounds_from_request(
+    order_kind: &ProviderOrderKind,
+) -> (Option<String>, Option<String>) {
     match order_kind {
-        MarketOrderKind::ExactIn { min_amount_out, .. } => (min_amount_out.clone(), None),
-        MarketOrderKind::ExactOut { max_amount_in, .. } => (None, max_amount_in.clone()),
+        ProviderOrderKind::ExactIn { min_amount_out, .. } => (min_amount_out.clone(), None),
+        ProviderOrderKind::ExactOut { max_amount_in, .. } => (None, max_amount_in.clone()),
     }
 }
 
@@ -6491,7 +6494,7 @@ fn hyperliquid_no_op_quote(
     token: &str,
 ) -> ExchangeQuote {
     let (amount_in, amount_out, min_amount_out, max_amount_in) = match &request.order_kind {
-        MarketOrderKind::ExactIn {
+        ProviderOrderKind::ExactIn {
             amount_in,
             min_amount_out,
         } => (
@@ -6500,7 +6503,7 @@ fn hyperliquid_no_op_quote(
             min_amount_out.clone(),
             None,
         ),
-        MarketOrderKind::ExactOut {
+        ProviderOrderKind::ExactOut {
             amount_out,
             max_amount_in,
         } => (
@@ -6633,7 +6636,7 @@ mod hyperliquid_math_tests {
         VELORA_DEFAULT_SLIPPAGE_BPS,
     };
     use crate::{
-        models::{MarketOrderKind, ProviderOperationStatus, ProviderOperationType},
+        models::{ProviderOperationStatus, ProviderOperationType, ProviderOrderKind},
         protocol::{AssetId, ChainId, DepositAsset},
         services::{
             custody_action_executor::CustodyActionReceipt, AssetRegistry, CanonicalAsset,
@@ -7117,7 +7120,7 @@ mod hyperliquid_math_tests {
 
     #[test]
     fn velora_slippage_bps_exact_in_uses_requested_min_output() {
-        let order_kind = MarketOrderKind::ExactIn {
+        let order_kind = ProviderOrderKind::ExactIn {
             amount_in: "1000".to_string(),
             min_amount_out: Some("950".to_string()),
         };
@@ -7130,7 +7133,7 @@ mod hyperliquid_math_tests {
 
     #[test]
     fn velora_slippage_bps_exact_out_uses_requested_max_input() {
-        let order_kind = MarketOrderKind::ExactOut {
+        let order_kind = ProviderOrderKind::ExactOut {
             amount_out: "1000".to_string(),
             max_amount_in: Some("1100".to_string()),
         };
@@ -7143,11 +7146,11 @@ mod hyperliquid_math_tests {
 
     #[test]
     fn velora_slippage_bps_defaults_missing_user_bound_to_one_percent() {
-        let exact_in = MarketOrderKind::ExactIn {
+        let exact_in = ProviderOrderKind::ExactIn {
             amount_in: "1000".to_string(),
             min_amount_out: None,
         };
-        let exact_out = MarketOrderKind::ExactOut {
+        let exact_out = ProviderOrderKind::ExactOut {
             amount_out: "1000".to_string(),
             max_amount_in: None,
         };
@@ -7166,7 +7169,7 @@ mod hyperliquid_math_tests {
     fn velora_slippage_bps_handles_huge_amounts_without_overflow() {
         let quoted_out = U256::MAX;
         let min_out = quoted_out / U256::from(2_u64);
-        let exact_in = MarketOrderKind::ExactIn {
+        let exact_in = ProviderOrderKind::ExactIn {
             amount_in: "1".to_string(),
             min_amount_out: Some(min_out.to_string()),
         };
@@ -7177,7 +7180,7 @@ mod hyperliquid_math_tests {
 
         let quoted_in = U256::MAX / U256::from(2_u64);
         let max_in = quoted_in + quoted_in / U256::from(10_u64);
-        let exact_out = MarketOrderKind::ExactOut {
+        let exact_out = ProviderOrderKind::ExactOut {
             amount_out: "1".to_string(),
             max_amount_in: Some(max_in.to_string()),
         };
@@ -7242,7 +7245,7 @@ mod hyperliquid_math_tests {
 
     #[test]
     fn cctp_exact_in_quote_deducts_circle_fee() {
-        let order_kind = MarketOrderKind::ExactIn {
+        let order_kind = ProviderOrderKind::ExactIn {
             amount_in: "1000000".to_string(),
             min_amount_out: Some("1".to_string()),
         };
@@ -7259,7 +7262,7 @@ mod hyperliquid_math_tests {
 
     #[test]
     fn cctp_exact_out_quote_grosses_up_circle_fee() {
-        let order_kind = MarketOrderKind::ExactOut {
+        let order_kind = ProviderOrderKind::ExactOut {
             amount_out: "999870".to_string(),
             max_amount_in: Some("1000000".to_string()),
         };
@@ -7276,7 +7279,7 @@ mod hyperliquid_math_tests {
 
     #[test]
     fn cctp_quote_math_uses_wide_intermediates_and_rejects_true_overflow() {
-        let fee_free = MarketOrderKind::ExactOut {
+        let fee_free = ProviderOrderKind::ExactOut {
             amount_out: U256::MAX.to_string(),
             max_amount_in: Some(U256::MAX.to_string()),
         };
@@ -7289,7 +7292,7 @@ mod hyperliquid_math_tests {
             })
         );
 
-        let fee_bearing = MarketOrderKind::ExactOut {
+        let fee_bearing = ProviderOrderKind::ExactOut {
             amount_out: U256::MAX.to_string(),
             max_amount_in: Some(U256::MAX.to_string()),
         };
@@ -7367,7 +7370,7 @@ mod hyperliquid_math_tests {
             8,
             6,
             5,
-            &MarketOrderKind::ExactIn {
+            &ProviderOrderKind::ExactIn {
                 amount_in: "120930796".to_string(),
                 min_amount_out: Some("1".to_string()),
             },
@@ -7440,7 +7443,7 @@ mod hyperliquid_math_tests {
             6,
             18,
             4,
-            &MarketOrderKind::ExactIn {
+            &ProviderOrderKind::ExactIn {
                 amount_in: "98577278".to_string(),
                 min_amount_out: Some("1".to_string()),
             },
@@ -7459,7 +7462,7 @@ mod hyperliquid_math_tests {
             6,
             8,
             8,
-            &MarketOrderKind::ExactOut {
+            &ProviderOrderKind::ExactOut {
                 amount_out: "1".to_string(),
                 max_amount_in: Some("1".to_string()),
             },
@@ -7478,7 +7481,7 @@ mod hyperliquid_math_tests {
             8,
             6,
             5,
-            &MarketOrderKind::ExactOut {
+            &ProviderOrderKind::ExactOut {
                 amount_out: "1000000".to_string(),
                 max_amount_in: Some("2000".to_string()),
             },
@@ -7561,7 +7564,7 @@ mod hyperliquid_math_tests {
                 chain: ChainId::parse("evm:8453").unwrap(),
                 asset: AssetId::reference("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
             },
-            order_kind: MarketOrderKind::ExactIn {
+            order_kind: ProviderOrderKind::ExactIn {
                 amount_in: "1000000".to_string(),
                 min_amount_out: Some("990000".to_string()),
             },
@@ -7574,7 +7577,7 @@ mod hyperliquid_math_tests {
     #[test]
     fn across_quote_request_rejects_malformed_amount_and_depositor() {
         let mut malformed_amount = across_quote_request();
-        malformed_amount.order_kind = MarketOrderKind::ExactIn {
+        malformed_amount.order_kind = ProviderOrderKind::ExactIn {
             amount_in: "not-raw".to_string(),
             min_amount_out: Some("990000".to_string()),
         };
@@ -7626,7 +7629,7 @@ mod hyperliquid_math_tests {
                     chain: ChainId::parse("evm:42161").unwrap(),
                     asset: AssetId::reference("0xaf88d065e77c8cc2239327c5edb3a432268e5831"),
                 },
-                order_kind: MarketOrderKind::ExactIn {
+                order_kind: ProviderOrderKind::ExactIn {
                     amount_in: "101000000".to_string(),
                     min_amount_out: Some("1".to_string()),
                 },
@@ -7671,7 +7674,7 @@ mod hyperliquid_math_tests {
                     chain: ChainId::parse("evm:42161").unwrap(),
                     asset: AssetId::reference("0xaf88d065e77c8cc2239327c5edb3a432268e5831"),
                 },
-                order_kind: MarketOrderKind::ExactOut {
+                order_kind: ProviderOrderKind::ExactOut {
                     amount_out: "100000000".to_string(),
                     max_amount_in: Some(U256::MAX.to_string()),
                 },
@@ -7705,7 +7708,7 @@ mod hyperliquid_math_tests {
                     chain: ChainId::parse("evm:42161").unwrap(),
                     asset: AssetId::reference("0xaf88d065e77c8cc2239327c5edb3a432268e5831"),
                 },
-                order_kind: MarketOrderKind::ExactOut {
+                order_kind: ProviderOrderKind::ExactOut {
                     amount_out: U256::MAX.to_string(),
                     max_amount_in: Some(U256::MAX.to_string()),
                 },
@@ -7731,7 +7734,7 @@ mod hyperliquid_math_tests {
         let leg = hl_leg_descriptor(
             &usdc,
             &btc,
-            &MarketOrderKind::ExactIn {
+            &ProviderOrderKind::ExactIn {
                 amount_in: "59984517".to_string(),
                 min_amount_out: Some("1".to_string()),
             },
@@ -7757,7 +7760,7 @@ mod hyperliquid_math_tests {
         let leg = hl_leg_descriptor(
             &usdc,
             &btc,
-            &MarketOrderKind::ExactOut {
+            &ProviderOrderKind::ExactOut {
                 amount_out: "77000".to_string(),
                 max_amount_in: Some("100000000".to_string()),
             },

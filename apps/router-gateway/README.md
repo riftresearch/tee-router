@@ -66,7 +66,6 @@ The gateway automatically monitors configured router upstreams:
 - `GET /providers`
 - `POST /quote`
 - `POST /order/market`
-- `POST /order/limit`
 - `POST /order/{orderId}/cancel`
 - `GET /openapi.json`
 
@@ -91,10 +90,9 @@ the long-term public API aims to make quotes addressless.
 
 The public gateway API never returns the raw router cancellation secret.
 
-`POST /order/limit` creates the internal limit quote and router order in one
-request. It supports exactly two of `fromAmount`, `toAmount`, and `price`.
-`price` is interpreted as destination readable units per one source readable
-unit, while `amountFormat` controls only `fromAmount` and `toAmount`.
+Limit orders are temporarily disabled in the public gateway. The limit-order
+route and handler code remain in the source tree, but `/order/limit` is not
+registered in the live Hono/OpenAPI route registry.
 
 ## Railway Deployment
 

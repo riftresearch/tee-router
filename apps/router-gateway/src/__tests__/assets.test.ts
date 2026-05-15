@@ -3,9 +3,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   assertAddressMatchesChain,
   formatAmount,
-  formatSlippage,
   parseAmount,
-  parseSlippageBps,
   resolveAssetIdentifier
 } from '../assets'
 
@@ -91,25 +89,6 @@ describe('asset and amount helpers', () => {
 
     expect(() => parseAmount('1_000', btc, 'readable', 'fromAmount')).toThrow()
     expect(() => parseAmount('1,000', btc, 'readable', 'fromAmount')).toThrow()
-    expect(() => parseSlippageBps('1.5%', 'readable')).toThrow()
-  })
-
-  test('converts slippage between readable percent and raw bps', () => {
-    expect(parseSlippageBps('1.5', 'readable')).toBe(150)
-    expect(parseSlippageBps('150', 'raw')).toBe(150)
-    expect(formatSlippage(150, 'readable')).toBe('1.5')
-    expect(formatSlippage(150, 'raw')).toBe('150')
-  })
-
-  test('rejects oversized slippage digit strings before numeric parsing', () => {
-    const oversized = '1'.repeat(10_000)
-
-    expect(() => parseSlippageBps(oversized, 'raw')).toThrow(
-      'maxSlippage raw value must be 0 through 10000 bps'
-    )
-    expect(() => parseSlippageBps(oversized, 'readable')).toThrow(
-      'maxSlippage must be 0 through 100 percent'
-    )
   })
 
   test('validates Bitcoin recipient addresses with checksum enforcement', () => {
