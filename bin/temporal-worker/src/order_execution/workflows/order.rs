@@ -1253,8 +1253,19 @@ async fn dispatch_step_with_stale_running_timer(
     futures_util::pin_mut!(dispatch_future);
 
     loop {
+        // Re-armed each iteration: the watchdog is meant to fire, classify, and
+        // (on durable progress) start a fresh window. When the dispatch wins the
+        // select instead, the pending timer MUST be cancelled — dropping the
+        // future does not emit a CancelTimer (the SDK has no Drop hook), so an
+        // un-cancelled 2h timer would sit armed in Temporal mutable state until
+        // the workflow closes. This arm only touches `&ctx` (classify via
+        // start_activity), so binding the timer here does not collide with the
+        // `&mut ctx` helper calls elsewhere.
+        let stale_watchdog = ctx.timer(STALE_RUNNING_STEP_RECOVERY_AFTER);
+        futures_util::pin_mut!(stale_watchdog);
         temporalio_sdk::workflows::select! {
             result = dispatch_future => {
+                stale_watchdog.cancel();
                 return Ok(match result {
                     Ok(dispatched) => StepExecutionProgress::Executed(dispatched),
                     Err(source) => StepExecutionProgress::ActivityFailed {
@@ -1262,7 +1273,7 @@ async fn dispatch_step_with_stale_running_timer(
                     },
                 });
             }
-            _ = ctx.timer(STALE_RUNNING_STEP_RECOVERY_AFTER) => {
+            _ = stale_watchdog => {
                 let classified = ctx
                     .start_activity(
                         OrderActivities::classify_stale_running_step,
