@@ -46,6 +46,7 @@ export type OrderExecutionActionAddresses = {
 
 export type OrderExecutionLeg = {
   id: string
+  executionAttemptId?: string
   transitionDeclId?: string
   legIndex: number
   legType: string
@@ -85,6 +86,16 @@ export type OrderProgress = {
   completedStages: number
   failedStages: number
   activeStage?: string
+  stages?: OrderProgressStage[]
+}
+
+export type OrderProgressStage = {
+  label: string
+  status: string
+  input?: AssetRef
+  output?: AssetRef
+  txHash?: string
+  txChainId?: string
 }
 
 export type OrderMetrics = {
@@ -97,9 +108,9 @@ export type OrderTypeFilter = 'market_order' | 'limit_order'
 export type OrderLifecycleFilter =
   | 'firehose'
   | 'in_progress'
-  | 'failed'
+  | 'needs_attention'
+  | 'expired'
   | 'refunded'
-  | 'manual_refund'
 
 export type OrderFirehoseRow = {
   id: string
@@ -147,6 +158,7 @@ export type LimitOrderStatus = {
     | 'filled'
     | 'completed'
     | 'refunded'
+    | 'manual_intervention'
     | 'manual_refund'
     | 'failed'
     | 'expired'
@@ -245,8 +257,11 @@ const COMPLETED_ORDERS_FOR_ANALYTICS_SQL = `
     ro.id::text,
     ro.order_type,
     ro.status,
-    ro.created_at,
-    GREATEST(ro.updated_at, COALESCE(legs.updated_at, ro.updated_at)) AS updated_at,
+    to_char(ro.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at,
+    to_char(
+      GREATEST(ro.updated_at, COALESCE(legs.updated_at, ro.updated_at)) AT TIME ZONE 'UTC',
+      'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+    ) AS updated_at,
     COALESCE(legs.execution_legs, '[]'::jsonb) AS execution_legs
   FROM public.router_orders ro
   LEFT JOIN LATERAL (
@@ -254,6 +269,7 @@ const COMPLETED_ORDERS_FOR_ANALYTICS_SQL = `
       jsonb_agg(
         jsonb_build_object(
           'id', l.id::text,
+          'executionAttemptId', l.execution_attempt_id::text,
           'transitionDeclId', l.transition_decl_id,
           'legIndex', l.leg_index,
           'legType', l.leg_type,
@@ -294,7 +310,7 @@ const COMPLETED_ORDERS_FOR_ANALYTICS_SQL = `
 
 const COMPLETED_ORDER_ANALYTICS_UPPER_BOUND_SQL = `
   SELECT
-    ro.created_at,
+    to_char(ro.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at,
     ro.id::text
   FROM public.router_orders ro
   WHERE ro.status = 'completed'
@@ -306,8 +322,8 @@ const ORDER_STATUS_FOR_ANALYTICS_SQL = `
   SELECT
     ro.id::text,
     ro.status,
-    ro.created_at,
-    ro.updated_at
+    to_char(ro.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at,
+    to_char(ro.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at
   FROM public.router_orders ro
   WHERE (
       $2::timestamptz IS NULL
@@ -323,7 +339,7 @@ const ORDER_STATUS_FOR_ANALYTICS_SQL = `
 
 const ORDER_STATUS_ANALYTICS_UPPER_BOUND_SQL = `
   SELECT
-    ro.created_at,
+    to_char(ro.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at,
     ro.id::text
   FROM public.router_orders ro
   ORDER BY ro.created_at DESC, ro.id DESC
@@ -335,150 +351,19 @@ function orderSummaryRowsSql(selectedOrdersSql: string): string {
 WITH selected_orders AS (
 ${selectedOrdersSql.trimEnd()}
 ),
-latest_quotes AS (
+initial_quotes AS (
   SELECT DISTINCT ON (moq.order_id)
     moq.*
   FROM public.market_order_quotes moq
   WHERE moq.order_id IN (SELECT id FROM selected_orders)
-  ORDER BY moq.order_id, moq.created_at DESC, moq.id DESC
+  ORDER BY moq.order_id, moq.created_at ASC, moq.id ASC
 ),
-latest_limit_quotes AS (
+initial_limit_quotes AS (
   SELECT DISTINCT ON (loq.order_id)
     loq.*
   FROM public.limit_order_quotes loq
   WHERE loq.order_id IN (SELECT id FROM selected_orders)
-  ORDER BY loq.order_id, loq.created_at DESC, loq.id DESC
-)
-SELECT
-  ro.id::text,
-	  ro.order_type,
-	  ro.status,
-	  ro.created_at,
-	  GREATEST(
-	    ro.updated_at,
-	    COALESCE(funding_vault.updated_at, ro.updated_at),
-	    COALESCE(funding_step.updated_at, ro.updated_at),
-	    COALESCE(moq.created_at, ro.updated_at),
-	    COALESCE(loq.created_at, ro.updated_at),
-	    COALESCE(moa.updated_at, ro.updated_at),
-	    COALESCE(loa.updated_at, ro.updated_at),
-	    COALESCE(legs.updated_at, ro.updated_at),
-	    COALESCE(ops.updated_at, ro.updated_at)
-	  ) AS updated_at,
-  COALESCE(funding_step.tx_hash, funding_vault.funding_tx_hash) AS funding_tx_hash,
-  ro.source_chain_id,
-  ro.source_asset_id,
-  ro.destination_chain_id,
-  ro.destination_asset_id,
-  ro.recipient_address,
-  ro.refund_address,
-  ro.action_timeout_at,
-  ro.workflow_trace_id,
-  ro.workflow_parent_span_id,
-  COALESCE(moq.id, loq.id)::text AS quote_id,
-  COALESCE(moq.provider_id, loq.provider_id) AS quote_provider_id,
-  CASE
-    WHEN ro.order_type = 'limit_order' THEN 'limit'
-    ELSE COALESCE(moq.order_kind, moa.order_kind)
-  END AS order_kind,
-  COALESCE(moq.amount_in, moa.amount_in, loq.input_amount, loa.input_amount) AS quoted_amount_in,
-  COALESCE(moq.amount_out, moa.amount_out, loq.output_amount, loa.output_amount) AS quoted_amount_out,
-  COALESCE(moq.min_amount_out, moa.min_amount_out) AS min_amount_out,
-  COALESCE(moq.max_amount_in, moa.max_amount_in) AS max_amount_in,
-  COALESCE(moq.slippage_bps, moa.slippage_bps) AS slippage_bps,
-  COALESCE(moq.expires_at, loq.expires_at) AS quote_expires_at,
-  NULL::jsonb AS provider_quote,
-  COALESCE(moq.usd_valuation_json, loq.usd_valuation_json, '{}'::jsonb) AS quote_usd_valuation,
-  COALESCE(legs.execution_legs, '[]'::jsonb) AS execution_legs,
-  '[]'::jsonb AS execution_steps,
-  COALESCE(ops.provider_operations, '[]'::jsonb) AS provider_operations
-FROM selected_orders ro
-LEFT JOIN public.deposit_vaults funding_vault ON funding_vault.id = ro.funding_vault_id
-LEFT JOIN LATERAL (
-  SELECT s.tx_hash, s.updated_at
-  FROM public.order_execution_steps s
-  WHERE s.order_id = ro.id
-    AND s.step_type = 'wait_for_deposit'
-    AND s.tx_hash IS NOT NULL
-  ORDER BY s.updated_at DESC, s.id DESC
-  LIMIT 1
-) funding_step ON true
-LEFT JOIN latest_quotes moq ON moq.order_id = ro.id
-LEFT JOIN latest_limit_quotes loq ON loq.order_id = ro.id
-LEFT JOIN public.market_order_actions moa ON moa.order_id = ro.id
-LEFT JOIN public.limit_order_actions loa ON loa.order_id = ro.id
-LEFT JOIN LATERAL (
-  SELECT jsonb_agg(
-    jsonb_build_object(
-      'id', l.id::text,
-      'transitionDeclId', l.transition_decl_id,
-      'legIndex', l.leg_index,
-      'legType', l.leg_type,
-      'provider', l.provider,
-      'status', l.status,
-      'input', jsonb_build_object('chainId', l.input_chain_id, 'assetId', l.input_asset_id),
-      'output', jsonb_build_object('chainId', l.output_chain_id, 'assetId', l.output_asset_id),
-      'amountIn', l.amount_in,
-      'expectedAmountOut', l.expected_amount_out,
-      'minAmountOut', l.min_amount_out,
-      'actualAmountIn', l.actual_amount_in,
-      'actualAmountOut', l.actual_amount_out,
-      'startedAt', l.started_at,
-      'completedAt', l.completed_at,
-      'createdAt', l.created_at,
-      'updatedAt', l.updated_at,
-      'details', '{}'::jsonb,
-      'usdValuation', l.usd_valuation_json
-    )
-    ORDER BY l.leg_index ASC, l.created_at ASC, l.id ASC
-	  ) AS execution_legs
-	    , MAX(l.updated_at) AS updated_at
-	  FROM public.order_execution_legs l
-	  WHERE l.order_id = ro.id
-	) legs ON true
-LEFT JOIN LATERAL (
-  SELECT jsonb_agg(
-    jsonb_build_object(
-      'id', opo.id::text,
-      'executionStepId', opo.execution_step_id::text,
-      'provider', opo.provider,
-      'operationType', opo.operation_type,
-      'providerRef', opo.provider_ref,
-      'status', opo.status,
-      'createdAt', opo.created_at,
-      'updatedAt', opo.updated_at,
-      'request', '{}'::jsonb,
-      'response', '{}'::jsonb,
-      'observedState', '{}'::jsonb
-    )
-    ORDER BY opo.created_at ASC, opo.id ASC
-	  ) AS provider_operations
-	    , MAX(opo.updated_at) AS updated_at
-	  FROM public.order_provider_operations opo
-	  WHERE opo.order_id = ro.id
-	) ops ON true
-ORDER BY ro.created_at DESC, ro.id DESC
-`
-}
-
-function orderRowsSql(selectedOrdersSql: string): string {
-  return `
-WITH selected_orders AS (
-${selectedOrdersSql.trimEnd()}
-),
-latest_quotes AS (
-  SELECT DISTINCT ON (moq.order_id)
-    moq.*
-  FROM public.market_order_quotes moq
-  WHERE moq.order_id IN (SELECT id FROM selected_orders)
-  ORDER BY moq.order_id, moq.created_at DESC, moq.id DESC
-),
-latest_limit_quotes AS (
-  SELECT DISTINCT ON (loq.order_id)
-    loq.*
-  FROM public.limit_order_quotes loq
-  WHERE loq.order_id IN (SELECT id FROM selected_orders)
-  ORDER BY loq.order_id, loq.created_at DESC, loq.id DESC
+  ORDER BY loq.order_id, loq.created_at ASC, loq.id ASC
 )
 SELECT
   ro.id::text,
@@ -511,13 +396,13 @@ SELECT
   COALESCE(moq.provider_id, loq.provider_id) AS quote_provider_id,
   CASE
     WHEN ro.order_type = 'limit_order' THEN 'limit'
-    ELSE COALESCE(moq.order_kind, moa.order_kind)
+    ELSE COALESCE(moa.order_kind, moq.order_kind)
   END AS order_kind,
-  COALESCE(moq.amount_in, moa.amount_in, loq.input_amount, loa.input_amount) AS quoted_amount_in,
-  COALESCE(moq.amount_out, moa.amount_out, loq.output_amount, loa.output_amount) AS quoted_amount_out,
-  COALESCE(moq.min_amount_out, moa.min_amount_out) AS min_amount_out,
-  COALESCE(moq.max_amount_in, moa.max_amount_in) AS max_amount_in,
-  COALESCE(moq.slippage_bps, moa.slippage_bps) AS slippage_bps,
+  COALESCE(moa.amount_in, moq.amount_in, loa.input_amount, loq.input_amount) AS quoted_amount_in,
+  COALESCE(moa.amount_out, moq.amount_out, loa.output_amount, loq.output_amount) AS quoted_amount_out,
+  COALESCE(moa.min_amount_out, moq.min_amount_out) AS min_amount_out,
+  COALESCE(moa.max_amount_in, moq.max_amount_in) AS max_amount_in,
+  COALESCE(moa.slippage_bps, moq.slippage_bps) AS slippage_bps,
   COALESCE(moq.expires_at, loq.expires_at) AS quote_expires_at,
   COALESCE(moq.provider_quote, loq.provider_quote) AS provider_quote,
   COALESCE(moq.usd_valuation_json, loq.usd_valuation_json, '{}'::jsonb) AS quote_usd_valuation,
@@ -535,39 +420,207 @@ LEFT JOIN LATERAL (
   ORDER BY s.updated_at DESC, s.id DESC
   LIMIT 1
 ) funding_step ON true
-LEFT JOIN latest_quotes moq ON moq.order_id = ro.id
-LEFT JOIN latest_limit_quotes loq ON loq.order_id = ro.id
+LEFT JOIN initial_quotes moq ON moq.order_id = ro.id
+LEFT JOIN initial_limit_quotes loq ON loq.order_id = ro.id
 LEFT JOIN public.market_order_actions moa ON moa.order_id = ro.id
 LEFT JOIN public.limit_order_actions loa ON loa.order_id = ro.id
 LEFT JOIN LATERAL (
+  SELECT
+    jsonb_agg(
+      jsonb_build_object(
+        'id', l.id::text,
+        'executionAttemptId', l.execution_attempt_id::text,
+        'transitionDeclId', l.transition_decl_id,
+        'legIndex', l.leg_index,
+        'legType', l.leg_type,
+        'provider', l.provider,
+        'status', l.status,
+        'input', jsonb_build_object('chainId', l.input_chain_id, 'assetId', l.input_asset_id),
+        'output', jsonb_build_object('chainId', l.output_chain_id, 'assetId', l.output_asset_id),
+        'amountIn', l.amount_in,
+        'expectedAmountOut', l.expected_amount_out,
+        'minAmountOut', l.min_amount_out,
+        'actualAmountIn', l.actual_amount_in,
+        'actualAmountOut', l.actual_amount_out,
+        'startedAt', l.started_at,
+        'completedAt', l.completed_at,
+        'createdAt', l.created_at,
+        'updatedAt', l.updated_at,
+        'details', '{}'::jsonb,
+        'usdValuation', l.usd_valuation_json
+      )
+      ORDER BY l.leg_index ASC, l.created_at ASC, l.id ASC
+    ) AS execution_legs,
+    MAX(l.updated_at) AS updated_at
+  FROM public.order_execution_legs l
+  WHERE l.order_id = ro.id
+) legs ON true
+LEFT JOIN LATERAL (
+  SELECT jsonb_agg(
+    jsonb_strip_nulls(jsonb_build_object(
+      'id', s.id::text,
+      'executionLegId', s.execution_leg_id::text,
+      'transitionDeclId', s.transition_decl_id,
+      'stepIndex', s.step_index,
+      'stepType', s.step_type,
+      'provider', s.provider,
+      'status', s.status,
+      'input', CASE
+        WHEN s.input_chain_id IS NULL OR s.input_asset_id IS NULL THEN NULL
+        ELSE jsonb_build_object('chainId', s.input_chain_id, 'assetId', s.input_asset_id)
+      END,
+      'output', CASE
+        WHEN s.output_chain_id IS NULL OR s.output_asset_id IS NULL THEN NULL
+        ELSE jsonb_build_object('chainId', s.output_chain_id, 'assetId', s.output_asset_id)
+      END,
+      'txHash', s.tx_hash,
+      'createdAt', s.created_at,
+      'updatedAt', s.updated_at,
+      'details', '{}'::jsonb,
+      'request', '{}'::jsonb,
+      'response', '{}'::jsonb,
+      'error', '{}'::jsonb
+    ))
+    ORDER BY s.step_index ASC, s.created_at ASC, s.id ASC
+  ) AS execution_steps,
+  MAX(s.updated_at) AS updated_at
+  FROM public.order_execution_steps s
+  WHERE s.order_id = ro.id
+) steps ON true
+LEFT JOIN LATERAL (
   SELECT jsonb_agg(
     jsonb_build_object(
-      'id', l.id::text,
-      'transitionDeclId', l.transition_decl_id,
-      'legIndex', l.leg_index,
-      'legType', l.leg_type,
-      'provider', l.provider,
-      'status', l.status,
-      'input', jsonb_build_object('chainId', l.input_chain_id, 'assetId', l.input_asset_id),
-      'output', jsonb_build_object('chainId', l.output_chain_id, 'assetId', l.output_asset_id),
-      'amountIn', l.amount_in,
-      'expectedAmountOut', l.expected_amount_out,
-      'minAmountOut', l.min_amount_out,
-      'actualAmountIn', l.actual_amount_in,
-      'actualAmountOut', l.actual_amount_out,
-      'startedAt', l.started_at,
-      'completedAt', l.completed_at,
-      'createdAt', l.created_at,
-      'updatedAt', l.updated_at,
-      'details', l.details_json,
-      'usdValuation', l.usd_valuation_json
+      'id', opo.id::text,
+      'executionStepId', opo.execution_step_id::text,
+      'provider', opo.provider,
+      'operationType', opo.operation_type,
+      'providerRef', opo.provider_ref,
+      'status', opo.status,
+      'createdAt', opo.created_at,
+      'updatedAt', opo.updated_at,
+      'request', '{}'::jsonb,
+      'response', '{}'::jsonb,
+      'observedState', '{}'::jsonb
     )
-    ORDER BY l.leg_index ASC, l.created_at ASC, l.id ASC
-	  ) AS execution_legs
-	    , MAX(l.updated_at) AS updated_at
-	  FROM public.order_execution_legs l
-	  WHERE l.order_id = ro.id
-	) legs ON true
+    ORDER BY opo.created_at ASC, opo.id ASC
+	  ) AS provider_operations
+	    , MAX(opo.updated_at) AS updated_at
+	  FROM public.order_provider_operations opo
+	  WHERE opo.order_id = ro.id
+	) ops ON true
+ORDER BY ro.created_at DESC, ro.id DESC
+`
+}
+
+function orderRowsSql(selectedOrdersSql: string): string {
+  return `
+WITH selected_orders AS (
+${selectedOrdersSql.trimEnd()}
+),
+initial_quotes AS (
+  SELECT DISTINCT ON (moq.order_id)
+    moq.*
+  FROM public.market_order_quotes moq
+  WHERE moq.order_id IN (SELECT id FROM selected_orders)
+  ORDER BY moq.order_id, moq.created_at ASC, moq.id ASC
+),
+initial_limit_quotes AS (
+  SELECT DISTINCT ON (loq.order_id)
+    loq.*
+  FROM public.limit_order_quotes loq
+  WHERE loq.order_id IN (SELECT id FROM selected_orders)
+  ORDER BY loq.order_id, loq.created_at ASC, loq.id ASC
+)
+SELECT
+  ro.id::text,
+	  ro.order_type,
+	  ro.status,
+	  ro.created_at,
+	  GREATEST(
+	    ro.updated_at,
+	    COALESCE(funding_vault.updated_at, ro.updated_at),
+	    COALESCE(funding_step.updated_at, ro.updated_at),
+	    COALESCE(moq.created_at, ro.updated_at),
+	    COALESCE(loq.created_at, ro.updated_at),
+	    COALESCE(moa.updated_at, ro.updated_at),
+	    COALESCE(loa.updated_at, ro.updated_at),
+	    COALESCE(legs.updated_at, ro.updated_at),
+	    COALESCE(steps.updated_at, ro.updated_at),
+	    COALESCE(ops.updated_at, ro.updated_at)
+	  ) AS updated_at,
+  COALESCE(funding_step.tx_hash, funding_vault.funding_tx_hash) AS funding_tx_hash,
+  ro.source_chain_id,
+  ro.source_asset_id,
+  ro.destination_chain_id,
+  ro.destination_asset_id,
+  ro.recipient_address,
+  ro.refund_address,
+  ro.action_timeout_at,
+  ro.workflow_trace_id,
+  ro.workflow_parent_span_id,
+  COALESCE(moq.id, loq.id)::text AS quote_id,
+  COALESCE(moq.provider_id, loq.provider_id) AS quote_provider_id,
+  CASE
+    WHEN ro.order_type = 'limit_order' THEN 'limit'
+    ELSE COALESCE(moa.order_kind, moq.order_kind)
+  END AS order_kind,
+  COALESCE(moa.amount_in, moq.amount_in, loa.input_amount, loq.input_amount) AS quoted_amount_in,
+  COALESCE(moa.amount_out, moq.amount_out, loa.output_amount, loq.output_amount) AS quoted_amount_out,
+  COALESCE(moa.min_amount_out, moq.min_amount_out) AS min_amount_out,
+  COALESCE(moa.max_amount_in, moq.max_amount_in) AS max_amount_in,
+  COALESCE(moa.slippage_bps, moq.slippage_bps) AS slippage_bps,
+  COALESCE(moq.expires_at, loq.expires_at) AS quote_expires_at,
+  COALESCE(moq.provider_quote, loq.provider_quote) AS provider_quote,
+  COALESCE(moq.usd_valuation_json, loq.usd_valuation_json, '{}'::jsonb) AS quote_usd_valuation,
+  COALESCE(legs.execution_legs, '[]'::jsonb) AS execution_legs,
+  COALESCE(steps.execution_steps, '[]'::jsonb) AS execution_steps,
+  COALESCE(ops.provider_operations, '[]'::jsonb) AS provider_operations
+FROM selected_orders ro
+LEFT JOIN public.deposit_vaults funding_vault ON funding_vault.id = ro.funding_vault_id
+LEFT JOIN LATERAL (
+  SELECT s.tx_hash, s.updated_at
+  FROM public.order_execution_steps s
+  WHERE s.order_id = ro.id
+    AND s.step_type = 'wait_for_deposit'
+    AND s.tx_hash IS NOT NULL
+  ORDER BY s.updated_at DESC, s.id DESC
+  LIMIT 1
+) funding_step ON true
+LEFT JOIN initial_quotes moq ON moq.order_id = ro.id
+LEFT JOIN initial_limit_quotes loq ON loq.order_id = ro.id
+LEFT JOIN public.market_order_actions moa ON moa.order_id = ro.id
+LEFT JOIN public.limit_order_actions loa ON loa.order_id = ro.id
+LEFT JOIN LATERAL (
+  SELECT
+    jsonb_agg(
+      jsonb_build_object(
+        'id', l.id::text,
+        'executionAttemptId', l.execution_attempt_id::text,
+        'transitionDeclId', l.transition_decl_id,
+        'legIndex', l.leg_index,
+        'legType', l.leg_type,
+        'provider', l.provider,
+        'status', l.status,
+        'input', jsonb_build_object('chainId', l.input_chain_id, 'assetId', l.input_asset_id),
+        'output', jsonb_build_object('chainId', l.output_chain_id, 'assetId', l.output_asset_id),
+        'amountIn', l.amount_in,
+        'expectedAmountOut', l.expected_amount_out,
+        'minAmountOut', l.min_amount_out,
+        'actualAmountIn', l.actual_amount_in,
+        'actualAmountOut', l.actual_amount_out,
+        'startedAt', l.started_at,
+        'completedAt', l.completed_at,
+        'createdAt', l.created_at,
+        'updatedAt', l.updated_at,
+        'details', l.details_json,
+        'usdValuation', l.usd_valuation_json
+      )
+      ORDER BY l.leg_index ASC, l.created_at ASC, l.id ASC
+    ) AS execution_legs,
+    MAX(l.updated_at) AS updated_at
+  FROM public.order_execution_legs l
+  WHERE l.order_id = ro.id
+) legs ON true
 LEFT JOIN LATERAL (
   SELECT jsonb_agg(
     jsonb_build_object(
@@ -869,7 +922,6 @@ function orderLifecycleSqlPredicate(
       ro.status NOT IN (
         'completed',
         'refunded',
-        'failed',
         'expired',
         'manual_intervention_required',
         'refund_manual_intervention_required'
@@ -885,11 +937,9 @@ function orderLifecycleSqlPredicate(
       )
     `
   }
-  if (lifecycleFilter === 'failed') {
+  if (lifecycleFilter === 'needs_attention') {
     return `
       ro.status IN (
-        'failed',
-        'expired',
         'refund_required',
         'refunding',
         'manual_intervention_required',
@@ -897,10 +947,8 @@ function orderLifecycleSqlPredicate(
       )
     `
   }
+  if (lifecycleFilter === 'expired') return `ro.status = 'expired'`
   if (lifecycleFilter === 'refunded') return `ro.status = 'refunded'`
-  if (lifecycleFilter === 'manual_refund') {
-    return `ro.status = 'refund_manual_intervention_required'`
-  }
   return assertNeverOrderLifecycleFilter(lifecycleFilter)
 }
 
@@ -927,8 +975,8 @@ export async function fetchOrderMetrics(pool: Pool): Promise<OrderMetrics> {
       )::text AS active,
       COUNT(*) FILTER (
         WHERE status IN (
-          'failed',
-          'expired',
+          'refund_required',
+          'refunding',
           'manual_intervention_required',
           'refund_manual_intervention_required'
         )
@@ -1015,7 +1063,7 @@ export async function fetchCompletedOrderAnalyticsUpperBound(
   const row = result.rows[0]
   if (!row) return undefined
   return {
-    createdAt: toIso(row.created_at),
+    createdAt: toAnalyticsCursorIso(row.created_at),
     id: row.id
   }
 }
@@ -1041,8 +1089,8 @@ export async function fetchOrderStatusesForAnalytics(
   return result.rows.map((row) => ({
     id: row.id,
     status: row.status,
-    createdAt: toIso(row.created_at),
-    updatedAt: toIso(row.updated_at)
+    createdAt: toAnalyticsCursorIso(row.created_at),
+    updatedAt: toAnalyticsCursorIso(row.updated_at)
   }))
 }
 
@@ -1055,7 +1103,7 @@ export async function fetchOrderStatusAnalyticsUpperBound(
   const row = result.rows[0]
   if (!row) return undefined
   return {
-    createdAt: toIso(row.created_at),
+    createdAt: toAnalyticsCursorIso(row.created_at),
     id: row.id
   }
 }
@@ -1064,7 +1112,7 @@ function mapOrderRow(
   row: OrderFirehoseDbRow,
   detailLevel: 'summary' | 'full'
 ): OrderFirehoseRow {
-  const executionLegs = normalizeJsonArray<OrderExecutionLeg>(
+  const fullExecutionLegs = normalizeJsonArray<OrderExecutionLeg>(
     row.execution_legs,
     'execution_legs'
   )
@@ -1076,6 +1124,10 @@ function mapOrderRow(
     row.provider_operations,
     'provider_operations'
   )
+  const executionLegs =
+    detailLevel === 'full'
+      ? fullExecutionLegs
+      : summarizeExecutionLegsForList(fullExecutionLegs)
 
   return {
     id: row.id,
@@ -1111,7 +1163,15 @@ function mapOrderRow(
       ? toIso(row.quote_expires_at)
       : undefined,
     providerQuote: detailLevel === 'full' ? row.provider_quote ?? undefined : undefined,
-    quoteUsdValuation: row.quote_usd_valuation ?? undefined,
+    quoteUsdValuation:
+      detailLevel === 'full'
+        ? row.quote_usd_valuation ?? undefined
+        : summarizeUsdValuationForList(row.quote_usd_valuation, [
+            'input',
+            'output',
+            'minOutput',
+            'maxInput'
+          ]),
     workflowTraceId: row.workflow_trace_id ?? undefined,
     workflowParentSpanId: row.workflow_parent_span_id ?? undefined,
     executionLegs,
@@ -1119,7 +1179,8 @@ function mapOrderRow(
     providerOperations: detailLevel === 'full' ? providerOperations : [],
     progress: summarizeProgress(
       row.provider_quote,
-      executionLegs,
+      fullExecutionLegs,
+      executionSteps,
       providerOperations
     ),
     limitStatus:
@@ -1129,13 +1190,76 @@ function mapOrderRow(
   }
 }
 
+function summarizeExecutionLegsForList(
+  legs: OrderExecutionLeg[]
+): OrderExecutionLeg[] {
+  return legs
+    .filter((leg) => leg.status !== 'superseded')
+    .map((leg) => ({
+      id: leg.id,
+      executionAttemptId: leg.executionAttemptId,
+      transitionDeclId: leg.transitionDeclId,
+      legIndex: leg.legIndex,
+      legType: leg.legType,
+      provider: leg.provider,
+      status: leg.status,
+      input: leg.input,
+      output: leg.output,
+      amountIn: leg.amountIn,
+      expectedAmountOut: leg.expectedAmountOut,
+      minAmountOut: leg.minAmountOut,
+      actualAmountIn: leg.actualAmountIn,
+      actualAmountOut: leg.actualAmountOut,
+      startedAt: leg.startedAt,
+      completedAt: leg.completedAt,
+      createdAt: leg.createdAt,
+      updatedAt: leg.updatedAt,
+      details: {},
+      usdValuation: summarizeUsdValuationForList(leg.usdValuation, [
+        'actualInput',
+        'actualOutput',
+        'plannedInput',
+        'plannedOutput',
+        'plannedMinOutput'
+      ])
+    }))
+}
+
+function summarizeUsdValuationForList(
+  valuation: unknown,
+  amountKeys: string[]
+): unknown {
+  const record = asRecord(valuation)
+  if (!record) return undefined
+  const amounts = asRecord(record.amounts)
+  const summarizedAmounts: Record<string, unknown> = {}
+  if (amounts) {
+    for (const key of amountKeys) {
+      if (amounts[key] !== undefined) summarizedAmounts[key] = amounts[key]
+    }
+  }
+
+  const summarized: Record<string, unknown> = {}
+  if (record.schemaVersion !== undefined) {
+    summarized.schemaVersion = record.schemaVersion
+  }
+  if (record.pricing !== undefined) {
+    summarized.pricing = record.pricing
+  }
+  if (Object.keys(summarizedAmounts).length > 0) {
+    summarized.amounts = summarizedAmounts
+  }
+
+  return Object.keys(summarized).length > 0 ? summarized : undefined
+}
+
 function mapOrderAnalyticsRow(row: OrderAnalyticsDbRow): OrderAnalyticsRow {
   return {
     id: row.id,
     orderType: row.order_type,
     status: row.status,
-    createdAt: toIso(row.created_at),
-    updatedAt: toIso(row.updated_at),
+    createdAt: toAnalyticsCursorIso(row.created_at),
+    updatedAt: toAnalyticsCursorIso(row.updated_at),
     executionLegs: normalizeJsonArray<OrderExecutionLeg>(
       row.execution_legs,
       'execution_legs'
@@ -1153,7 +1277,6 @@ export function orderMatchesLifecycleFilter(
       ![
         'completed',
         'refunded',
-        'failed',
         'expired',
         'manual_intervention_required',
         'refund_manual_intervention_required'
@@ -1164,13 +1287,9 @@ export function orderMatchesLifecycleFilter(
         ))
     )
   }
+  if (filter === 'expired') return order.status === 'expired'
   if (filter === 'refunded') return order.status === 'refunded'
-  if (filter === 'manual_refund') {
-    return order.status === 'refund_manual_intervention_required'
-  }
   return [
-    'failed',
-    'expired',
     'refund_required',
     'refunding',
     'manual_intervention_required',
@@ -1207,7 +1326,7 @@ function summarizeLimitOrderStatus(
       phase:
         orderStatus === 'refund_manual_intervention_required'
           ? 'manual_refund'
-          : 'failed',
+          : 'manual_intervention',
       label:
         orderStatus === 'refund_manual_intervention_required'
           ? 'Manual Refund'
@@ -1216,10 +1335,10 @@ function summarizeLimitOrderStatus(
       tone: 'danger'
     }
   }
-  if (orderStatus === 'failed' || orderStatus === 'refund_required') {
+  if (orderStatus === 'refund_required') {
     return {
-      phase: 'failed',
-      label: orderStatus === 'refund_required' ? 'Refund Required' : 'Failed',
+      phase: 'manual_intervention',
+      label: 'Refund Required',
       detail: 'Execution did not finish cleanly',
       tone: 'danger'
     }
@@ -1312,32 +1431,51 @@ function toIso(value: Date | string): string {
   return new Date(value).toISOString()
 }
 
+function toAnalyticsCursorIso(value: Date | string): string {
+  if (value instanceof Date) return value.toISOString()
+  return value
+}
+
 function summarizeProgress(
   providerQuote: unknown,
   legs: OrderExecutionLeg[],
+  steps: OrderExecutionStep[],
   operations: ProviderOperation[]
 ): OrderProgress {
   const plannedStages = extractPlannedStages(providerQuote)
   const operationStages = operations.map((operation) => ({
     transitionDeclId: undefined,
     transitionMatchIds: [],
-    label: `${humanize(operation.provider)} ${humanize(operation.operationType)}`,
-    status: operation.status
+    label: humanize(operation.provider),
+    status: operation.status,
+    input: undefined,
+    output: undefined,
+    txHash: undefined,
+    txChainId: undefined
   }))
-  const actualStages = legs.map((leg) => ({
-    transitionDeclId: leg.transitionDeclId,
-    transitionMatchIds: leg.transitionDeclId ? [leg.transitionDeclId] : [],
-    label: `${humanize(leg.provider)} ${humanize(leg.legType)}`,
-    status: leg.status
-  }))
+  const actualStages = legs
+    .filter((leg) => leg.status !== 'superseded')
+    .map((leg) => ({
+      transitionDeclId: leg.transitionDeclId,
+      transitionMatchIds: leg.transitionDeclId ? [leg.transitionDeclId] : [],
+      label: humanize(leg.provider),
+      status: leg.status,
+      input: leg.input,
+      output: leg.output,
+      ...progressTxFields(latestStepForLeg(steps, leg))
+    }))
   const stages =
     actualStages.length > 0
       ? actualStages
       : plannedStages.length > 0
       ? plannedStages.map((planned) => {
+          const matchedStep = latestMatchingStep(steps, planned.transitionMatchIds)
           return {
             ...planned,
-            status: 'planned'
+            status: matchedStep?.status ?? 'planned',
+            input: matchedStep?.input ?? planned.input,
+            output: matchedStep?.output ?? planned.output,
+            ...progressTxFields(matchedStep)
           }
         })
       : operationStages
@@ -1356,8 +1494,50 @@ function summarizeProgress(
     failedStages: Math.min(failedStages, stages.length),
     activeStage: activeStage
       ? `${stageLabel(activeStage)} / ${humanize(activeStage.status)}`
-      : undefined
+      : undefined,
+    stages: stages.map((stage) => ({
+      label: stageLabel(stage),
+      status: stage.status,
+      ...(stage.input ? { input: stage.input } : {}),
+      ...(stage.output ? { output: stage.output } : {}),
+      ...(stage.txHash ? { txHash: stage.txHash } : {}),
+      ...(stage.txChainId ? { txChainId: stage.txChainId } : {})
+    }))
   }
+}
+
+function latestStepForLeg(
+  steps: OrderExecutionStep[],
+  leg: OrderExecutionLeg
+): OrderExecutionStep | undefined {
+  const legSteps = steps.filter((step) => step.executionLegId === leg.id)
+  if (legSteps.length > 0) return latestStep(legSteps)
+  if (!leg.transitionDeclId) return undefined
+  return latestMatchingStep(steps, [leg.transitionDeclId])
+}
+
+function latestStep(steps: OrderExecutionStep[]): OrderExecutionStep | undefined {
+  return [...steps].sort(
+    (left, right) =>
+      right.stepIndex - left.stepIndex ||
+      right.updatedAt.localeCompare(left.updatedAt) ||
+      right.id.localeCompare(left.id)
+  )[0]
+}
+
+function progressTxFields(step: OrderExecutionStep | undefined) {
+  if (!step?.txHash) return {}
+  return {
+    txHash: step.txHash,
+    txChainId: stepTransactionChain(step)
+  }
+}
+
+function stepTransactionChain(step: OrderExecutionStep) {
+  if (['across_bridge', 'cctp_receive', 'unit_withdrawal'].includes(step.stepType)) {
+    return step.output?.chainId ?? step.input?.chainId
+  }
+  return step.input?.chainId ?? step.output?.chainId
 }
 
 function latestStepsByStage(steps: OrderExecutionStep[]): OrderExecutionStep[] {
@@ -1378,6 +1558,10 @@ type ProgressStage = {
   transitionMatchIds: string[]
   label: string
   status: string
+  input?: AssetRef
+  output?: AssetRef
+  txHash?: string
+  txChainId?: string
 }
 
 function latestMatchingStep(
@@ -1410,9 +1594,9 @@ function extractPlannedStages(providerQuote: unknown): ProgressStage[] {
     if (!record) continue
     const provider = stringField(record.provider)
     const transitionKind = stringField(record.transition_kind)
-    const executionStepType = stringField(record.execution_step_type)
     const transitionDeclId = stringField(record.transition_decl_id)
     const transitionParentDeclId = stringField(record.transition_parent_decl_id)
+    const raw = asRecord(record.raw)
     if (!provider || !transitionKind) continue
     const transitionMatchIds = uniqueStrings([
       transitionDeclId,
@@ -1421,11 +1605,29 @@ function extractPlannedStages(providerQuote: unknown): ProgressStage[] {
     stages.push({
       ...(transitionDeclId ? { transitionDeclId } : {}),
       transitionMatchIds,
-      label: `${humanize(provider)} ${humanize(executionStepType ?? transitionKind)}`,
-      status: 'planned'
+      label: humanize(provider),
+      status: 'planned',
+      input: assetRef(record.input_asset) ?? assetRef(raw?.input_asset),
+      output: assetRef(record.output_asset) ?? assetRef(raw?.output_asset)
     })
   }
   return stages
+}
+
+function assetRef(value: unknown): AssetRef | undefined {
+  const record = asRecord(value)
+  if (!record) return undefined
+  const chainId =
+    stringField(record.chainId) ??
+    stringField(record.chain_id) ??
+    stringField(record.chain)
+  const assetId =
+    stringField(record.assetId) ??
+    stringField(record.asset_id) ??
+    stringField(record.asset) ??
+    stringField(record.address) ??
+    stringField(record.token)
+  return chainId && assetId ? { chainId, assetId } : undefined
 }
 
 function uniqueStrings(values: (string | undefined)[]): string[] {
@@ -1434,7 +1636,7 @@ function uniqueStrings(values: (string | undefined)[]): string[] {
 
 function stageLabel(stage: ProgressStage | OrderExecutionStep): string {
   if ('label' in stage) return stage.label
-  return `${humanize(stage.provider)} ${humanize(stage.stepType)}`
+  return humanize(stage.provider)
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -1462,7 +1664,7 @@ function isFailedStatus(status: string): boolean {
 }
 
 function isTerminalStatus(status: string): boolean {
-  return isCompletedStatus(status) || isFailedStatus(status)
+  return isCompletedStatus(status) || isFailedStatus(status) || status === 'superseded'
 }
 
 function humanize(value: string): string {

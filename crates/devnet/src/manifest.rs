@@ -11,8 +11,14 @@ use crate::{
     },
     MultichainAccount, Result, RiftDevnet,
 };
+use alloy::primitives::U256;
 
 pub const DEVNET_DEMO_ACCOUNT_SALT: u32 = 110_101;
+pub const SALT_MOCK_HYPERUNIT: u32 = 800_001;
+pub const SALT_MOCK_HYPERLIQUID_BRIDGE: u32 = 800_002;
+pub const SALT_MOCK_ACROSS: u32 = 800_003;
+pub const MOCK_SERVICE_NATIVE_BALANCE_WEI: U256 =
+    U256::from_limbs([0xb34b_9f10_0000_0000, 0x00c0_97ce_7bc9_0715, 0, 0]);
 pub const DEVNET_BITCOIN_RPC_PORT: u16 = 50_100;
 pub const DEVNET_ETHEREUM_RPC_PORT: u16 = 50_101;
 pub const DEVNET_BASE_RPC_PORT: u16 = 50_102;
@@ -25,6 +31,7 @@ pub const DEVNET_MANIFEST_PORT: u16 = 50_108;
 pub const DEVNET_ESPLORA_PORT: u16 = 50_110;
 pub const DEVNET_BITCOIN_ZMQ_RAWTX_PORT: u16 = 50_111;
 pub const DEVNET_BITCOIN_ZMQ_SEQUENCE_PORT: u16 = 50_112;
+pub const DEVNET_BITCOIN_ZMQ_RAWBLOCK_PORT: u16 = 50_118;
 pub const DEVNET_BITCOIN_RPC_USER: &str = "devnet";
 pub const DEVNET_BITCOIN_RPC_PASSWORD: &str = "devnet";
 pub const DEVNET_LOADGEN_ACCOUNT_SALT_START: u32 = 220_000;
@@ -99,6 +106,7 @@ pub struct DevnetServices {
     pub manifest_compose_url: String,
     pub bitcoin_esplora_host_url: String,
     pub bitcoin_esplora_compose_url: String,
+    pub bitcoin_zmq_rawblock_compose_endpoint: String,
     pub bitcoin_zmq_rawtx_compose_endpoint: String,
     pub bitcoin_zmq_sequence_compose_endpoint: String,
     pub ethereum_token_indexer_compose_url: Option<String>,
@@ -175,6 +183,9 @@ impl DevnetManifest {
                 manifest_compose_url: format!("http://devnet:{DEVNET_MANIFEST_PORT}"),
                 bitcoin_esplora_host_url: format!("http://127.0.0.1:{DEVNET_ESPLORA_PORT}"),
                 bitcoin_esplora_compose_url: format!("http://devnet:{DEVNET_ESPLORA_PORT}"),
+                bitcoin_zmq_rawblock_compose_endpoint: format!(
+                    "tcp://devnet:{DEVNET_BITCOIN_ZMQ_RAWBLOCK_PORT}"
+                ),
                 bitcoin_zmq_rawtx_compose_endpoint: format!(
                     "tcp://devnet:{DEVNET_BITCOIN_ZMQ_RAWTX_PORT}"
                 ),

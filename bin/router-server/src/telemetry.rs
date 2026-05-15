@@ -1,14 +1,24 @@
-use crate::{
+use crate::services::vault_manager::VaultError;
+use metrics::{counter, gauge, histogram};
+use router_core::{
     models::{
         DepositVault, DepositVaultStatus, OrderExecutionStep, OrderProviderOperation,
-        OrderProviderOperationHint, RouterOrder,
+        OrderProviderOperationHint, RouterOrder, RouterOrderStatus,
     },
     protocol::{AssetId, ChainId, DepositAsset},
-    services::vault_manager::VaultError,
 };
-use metrics::{counter, gauge, histogram};
 use std::time::Duration;
 use tracing::info;
+
+const OPERATOR_ORDER_STATUSES: [RouterOrderStatus; 7] = [
+    RouterOrderStatus::PendingFunding,
+    RouterOrderStatus::Funded,
+    RouterOrderStatus::Executing,
+    RouterOrderStatus::RefundRequired,
+    RouterOrderStatus::Refunding,
+    RouterOrderStatus::ManualInterventionRequired,
+    RouterOrderStatus::RefundManualInterventionRequired,
+];
 
 pub fn record_http_response(route: &str, method: &str, status: u16, duration: Duration) {
     let status_class = status_class(status);
@@ -45,16 +55,13 @@ pub fn record_db_query(operation: &'static str, success: bool, duration: Duratio
 }
 
 pub fn record_order_workflow_event(order: &RouterOrder, event: &'static str) {
-    let span = order_workflow_span(order, event);
-    span.in_scope(|| {
-        info!(
-            order_id = %order.id,
-            order_status = order.status.to_db_string(),
-            workflow_trace_id = %order.workflow_trace_id,
-            workflow_event = event,
-            "Router order workflow event",
-        );
-    });
+    info!(
+        order_id = %order.id,
+        order_status = order.status.to_db_string(),
+        workflow_trace_id = %order.workflow_trace_id,
+        workflow_event = event,
+        "Router order workflow event",
+    );
 }
 
 pub fn record_execution_step_workflow_event(
@@ -62,21 +69,18 @@ pub fn record_execution_step_workflow_event(
     step: &OrderExecutionStep,
     event: &'static str,
 ) {
-    let span = order_workflow_span(order, event);
-    span.in_scope(|| {
-        info!(
-            order_id = %order.id,
-            step_id = %step.id,
-            execution_attempt_id = %step.execution_attempt_id.map(|id| id.to_string()).unwrap_or_default(),
-            step_index = step.step_index,
-            step_type = step.step_type.to_db_string(),
-            step_status = step.status.to_db_string(),
-            provider = %step.provider,
-            workflow_trace_id = %order.workflow_trace_id,
-            workflow_event = event,
-            "Router order execution-step workflow event",
-        );
-    });
+    info!(
+        order_id = %order.id,
+        step_id = %step.id,
+        execution_attempt_id = %step.execution_attempt_id.map(|id| id.to_string()).unwrap_or_default(),
+        step_index = step.step_index,
+        step_type = step.step_type.to_db_string(),
+        step_status = step.status.to_db_string(),
+        provider = %step.provider,
+        workflow_trace_id = %order.workflow_trace_id,
+        workflow_event = event,
+        "Router order execution-step workflow event",
+    );
 }
 
 pub fn record_provider_operation_workflow_event(
@@ -84,22 +88,19 @@ pub fn record_provider_operation_workflow_event(
     operation: &OrderProviderOperation,
     event: &'static str,
 ) {
-    let span = order_workflow_span(order, event);
-    span.in_scope(|| {
-        info!(
-            order_id = %order.id,
-            provider_operation_id = %operation.id,
-            execution_attempt_id = %operation.execution_attempt_id.map(|id| id.to_string()).unwrap_or_default(),
-            execution_step_id = %operation.execution_step_id.map(|id| id.to_string()).unwrap_or_default(),
-            provider = %operation.provider,
-            provider_operation_type = operation.operation_type.to_db_string(),
-            provider_operation_status = operation.status.to_db_string(),
-            provider_ref = operation.provider_ref.as_deref().unwrap_or_default(),
-            workflow_trace_id = %order.workflow_trace_id,
-            workflow_event = event,
-            "Router provider-operation workflow event",
-        );
-    });
+    info!(
+        order_id = %order.id,
+        provider_operation_id = %operation.id,
+        execution_attempt_id = %operation.execution_attempt_id.map(|id| id.to_string()).unwrap_or_default(),
+        execution_step_id = %operation.execution_step_id.map(|id| id.to_string()).unwrap_or_default(),
+        provider = %operation.provider,
+        provider_operation_type = operation.operation_type.to_db_string(),
+        provider_operation_status = operation.status.to_db_string(),
+        provider_ref = operation.provider_ref.as_deref().unwrap_or_default(),
+        workflow_trace_id = %order.workflow_trace_id,
+        workflow_event = event,
+        "Router provider-operation workflow event",
+    );
 }
 
 pub fn record_provider_operation_hint_workflow_event(
@@ -108,37 +109,18 @@ pub fn record_provider_operation_hint_workflow_event(
     operation: &OrderProviderOperation,
     event: &'static str,
 ) {
-    let span = order_workflow_span(order, event);
-    span.in_scope(|| {
-        info!(
-            order_id = %order.id,
-            provider_operation_id = %operation.id,
-            provider_operation_hint_id = %hint.id,
-            provider = %operation.provider,
-            provider_operation_type = operation.operation_type.to_db_string(),
-            hint_source = %hint.source,
-            hint_status = hint.status.to_db_string(),
-            workflow_trace_id = %order.workflow_trace_id,
-            workflow_event = event,
-            "Router provider-operation hint workflow event",
-        );
-    });
-}
-
-fn order_workflow_span(order: &RouterOrder, event: &'static str) -> tracing::Span {
-    let span = tracing::info_span!(
-        "router.order.workflow",
+    info!(
         order_id = %order.id,
-        order_status = order.status.to_db_string(),
+        provider_operation_id = %operation.id,
+        provider_operation_hint_id = %hint.id,
+        provider = %operation.provider,
+        provider_operation_type = operation.operation_type.to_db_string(),
+        hint_source = %hint.source,
+        hint_status = hint.status.to_db_string(),
         workflow_trace_id = %order.workflow_trace_id,
         workflow_event = event,
+        "Router provider-operation hint workflow event",
     );
-    let context = observability::WorkflowTraceContext {
-        trace_id: order.workflow_trace_id.clone(),
-        parent_span_id: order.workflow_parent_span_id.clone(),
-    };
-    let _ = observability::set_workflow_parent(&span, &context);
-    span
 }
 
 pub fn record_vault_created(vault: &DepositVault) {
@@ -267,17 +249,26 @@ pub fn record_worker_tick(worker: &'static str, duration: Duration) {
     .record(duration.as_secs_f64());
 }
 
-pub fn record_worker_lease_event(event: &'static str, status: &'static str) {
-    counter!(
-        "tee_router_worker_lease_events_total",
-        "event" => event,
-        "status" => status,
-    )
-    .increment(1);
-}
+pub fn record_operator_order_status_depth(status_counts: &[(RouterOrderStatus, u64)]) {
+    let mut total = 0_u64;
+    for status in OPERATOR_ORDER_STATUSES {
+        let count = status_counts
+            .iter()
+            .find_map(|(count_status, count)| (*count_status == status).then_some(*count))
+            .unwrap_or(0);
+        total = total.saturating_add(count);
+        gauge!(
+            "tee_router_operator_order_status_depth",
+            "status" => status.to_db_string(),
+        )
+        .set(count as f64);
+    }
 
-pub fn record_worker_active(active: bool) {
-    gauge!("tee_router_worker_active").set(if active { 1.0 } else { 0.0 });
+    gauge!(
+        "tee_router_operator_order_status_depth",
+        "status" => "all",
+    )
+    .set(total as f64);
 }
 
 pub fn record_market_order_quote_requested(source_asset: &DepositAsset) {

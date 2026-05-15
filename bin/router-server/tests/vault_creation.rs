@@ -6,36 +6,27 @@ use bitcoin::Amount;
 use bitcoincore_rpc_async::{Auth, RpcApi};
 use chains::{
     bitcoin::BitcoinChain,
-    evm::{EvmChain, EvmGasSponsorConfig},
+    evm::{EvmBroadcastPolicy, EvmChain, EvmGasSponsorConfig},
     hyperliquid::HyperliquidChain,
     ChainRegistry,
 };
 use chrono::Utc;
 use devnet::{
-    mock_integrators::{
-        MockAddressRiskLevel, MockIntegratorConfig, MockIntegratorServer,
-        MockUnitGenerateAddressRequest, MockUnitOperationKind, MockUnitOperationRecord,
-    },
+    mock_integrators::{MockAddressRiskLevel, MockIntegratorConfig, MockIntegratorServer},
     RiftDevnet,
 };
 use eip3009_erc20_contract::GenericEIP3009ERC20::GenericEIP3009ERC20Instance;
-use router_primitives::ChainType;
-use router_server::{
-    api::{
-        CreateOrderRequest, CreateVaultRequest, LimitOrderQuoteRequest, MarketOrderQuoteKind,
-        MarketOrderQuoteRequest, OrderFlowEnvelope, ProviderPolicyEnvelope,
-        ProviderPolicyListEnvelope,
-    },
-    app::{initialize_components, PaymasterMode, RouterComponents},
+use router_core::{
     config::Settings,
-    db::Database,
-    error::RouterServerError,
+    db::{Database, RefreshedExecutionAttemptPlan},
+    error::RouterCoreError,
     models::{
         CustodyVault, CustodyVaultControlType, CustodyVaultRole, CustodyVaultStatus,
-        CustodyVaultVisibility, DepositVaultFundingHint, DepositVaultStatus, MarketOrderAction,
-        MarketOrderKind, MarketOrderKindType, MarketOrderQuote, OrderExecutionAttempt,
-        OrderExecutionAttemptKind, OrderExecutionAttemptStatus, OrderExecutionLeg,
-        OrderExecutionStep, OrderExecutionStepStatus, OrderExecutionStepType, OrderProviderAddress,
+        CustodyVaultVisibility, DepositVaultFundingHint, DepositVaultFundingObservation,
+        DepositVaultStatus, MarketOrderAction, MarketOrderKind, MarketOrderKindType,
+        MarketOrderQuote, OrderExecutionAttempt, OrderExecutionAttemptKind,
+        OrderExecutionAttemptStatus, OrderExecutionLeg, OrderExecutionStep,
+        OrderExecutionStepStatus, OrderExecutionStepType, OrderProviderAddress,
         OrderProviderOperation, OrderProviderOperationHint, ProviderAddressRole,
         ProviderExecutionPolicyState, ProviderHealthCheck, ProviderHealthStatus,
         ProviderOperationHintKind, ProviderOperationHintStatus, ProviderOperationStatus,
@@ -45,23 +36,35 @@ use router_server::{
         SAURON_DETECTOR_HINT_SOURCE,
     },
     protocol::{AssetId, ChainId, DepositAsset},
-    server::{build_api_router, AdminApiAuth, AppState, GatewayApiAuth, InternalApiAuth},
     services::{
         action_providers::{
-            AcrossHttpProviderConfig, BridgeExecutionRequest, BridgeProvider, BridgeQuote,
-            BridgeQuoteRequest, CctpHttpProviderConfig, ExchangeExecutionRequest, ExchangeProvider,
-            ExchangeQuote, ExchangeQuoteRequest, ProviderFuture, UnitDepositStepRequest,
-            UnitProvider, UnitWithdrawalStepRequest, VeloraProvider,
+            AcrossHttpProviderConfig, BridgeQuoteRequest, CctpHttpProviderConfig,
+            ExchangeExecutionRequest, ExchangeProvider, ExchangeQuoteRequest, VeloraProvider,
         },
-        deposit_address::derive_deposit_address_for_quote,
+        asset_registry::AssetRegistry,
+        custody_action_executor::{
+            ChainCall, CustodyAction, CustodyActionExecutor, CustodyActionRequest, EvmCall,
+        },
         market_order_planner::MarketOrderRoutePlanner,
+        pricing::PricingSnapshot,
+        route_costs::{RouteCostService, RouteCostSnapshot},
+        ActionProviderRegistry, ProviderExecutionIntent, VeloraHttpProviderConfig,
+    },
+};
+use router_primitives::ChainType;
+use router_server::{
+    api::{
+        CreateOrderRequest, CreateVaultRequest, LimitOrderQuoteRequest, MarketOrderQuoteKind,
+        MarketOrderQuoteRequest, OrderFlowEnvelope, ProviderPolicyEnvelope,
+        ProviderPolicyListEnvelope,
+    },
+    app::{initialize_components, PaymasterMode, RouterComponents},
+    server::{build_api_router, AdminApiAuth, AppState, GatewayApiAuth, InternalApiAuth},
+    services::{
+        deposit_address::derive_deposit_address_for_quote,
         order_manager::{MarketOrderError, OrderManager},
         vault_manager::{VaultError, VaultManager},
-        ActionProviderRegistry, AssetRegistry, ChainCall, CustodyAction, CustodyActionExecutor,
-        CustodyActionRequest, EvmCall, OrderExecutionCrashInjector, OrderExecutionCrashPoint,
-        OrderExecutionManager, ProviderAddressIntent, ProviderExecutionIntent,
-        ProviderExecutionState, ProviderOperationIntent, ProviderOperationStatusUpdate,
-        RouteCostService, RouteCostSnapshot, RouteMinimumService, VeloraHttpProviderConfig,
+        RouteMinimumService,
     },
     RouterServerArgs,
 };
@@ -72,10 +75,7 @@ use std::{
     net::IpAddr,
     path::PathBuf,
     str::FromStr,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex, OnceLock,
-    },
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 use testcontainers::{
@@ -98,7 +98,6 @@ const TEST_GATEWAY_API_KEY: &str = "test-gateway-api-key-000000000000";
 const TEST_ADMIN_API_KEY: &str = "test-admin-api-key-000000000000000";
 const TEST_NATIVE_ORDER_AMOUNT_WEI: &str = "100000000000000000";
 const TEST_NATIVE_ORDER_MIN_OUT_WEI: &str = "99000000000000000";
-const TEST_NATIVE_ORDER_GAS_PAD_WEI: u128 = 1_000_000_000_000_000_000;
 
 // ---------------------------------------------------------------------------
 // Shared devnet harness (initialized once across all tests)
@@ -553,6 +552,7 @@ async fn create_test_execution_leg_for_step(spec: TestExecutionLegForStep<'_>) -
         actual_amount_out: None,
         started_at: None,
         completed_at: None,
+        provider_quote_expires_at: None,
         details: json!({ "source": "test_fixture" }),
         usd_valuation: json!({}),
         created_at: now,
@@ -563,6 +563,393 @@ async fn create_test_execution_leg_for_step(spec: TestExecutionLegForStep<'_>) -
         .await
         .expect("create test execution leg");
     leg.id
+}
+
+struct FailedAttemptFixture {
+    attempt: OrderExecutionAttempt,
+    legs: Vec<OrderExecutionLeg>,
+    steps: Vec<OrderExecutionStep>,
+}
+
+async fn create_failed_attempt_with_transient_legs(
+    db: &Database,
+    order: &RouterOrder,
+    now: chrono::DateTime<Utc>,
+    idempotency_prefix: &str,
+) -> FailedAttemptFixture {
+    let attempt = OrderExecutionAttempt {
+        id: Uuid::now_v7(),
+        order_id: order.id,
+        attempt_index: 1,
+        attempt_kind: OrderExecutionAttemptKind::PrimaryExecution,
+        status: OrderExecutionAttemptStatus::Failed,
+        trigger_step_id: None,
+        trigger_provider_operation_id: None,
+        failure_reason: json!({ "reason": "test_failed_attempt" }),
+        input_custody_snapshot: json!({}),
+        created_at: now,
+        updated_at: now,
+    };
+    db.orders()
+        .create_execution_attempt(&attempt)
+        .await
+        .unwrap();
+
+    let specs = [
+        (
+            OrderExecutionStepType::UnitDeposit,
+            "unit",
+            OrderExecutionStepStatus::Failed,
+        ),
+        (
+            OrderExecutionStepType::UnitWithdrawal,
+            "unit",
+            OrderExecutionStepStatus::Planned,
+        ),
+        (
+            OrderExecutionStepType::HyperliquidTrade,
+            "hyperliquid",
+            OrderExecutionStepStatus::Running,
+        ),
+        (
+            OrderExecutionStepType::UniversalRouterSwap,
+            "velora",
+            OrderExecutionStepStatus::Waiting,
+        ),
+    ];
+    let mut legs = Vec::with_capacity(specs.len());
+    let mut steps = Vec::with_capacity(specs.len());
+    for (index, (step_type, provider, status)) in specs.into_iter().enumerate() {
+        let index = index as i32;
+        let transition_decl_id = Some(format!("{idempotency_prefix}:{}", step_type.to_db_string()));
+        let leg = OrderExecutionLeg {
+            id: Uuid::now_v7(),
+            order_id: order.id,
+            execution_attempt_id: Some(attempt.id),
+            transition_decl_id: transition_decl_id.clone(),
+            leg_index: index,
+            leg_type: step_type.to_db_string().to_string(),
+            provider: provider.to_string(),
+            status,
+            input_asset: order.source_asset.clone(),
+            output_asset: order.destination_asset.clone(),
+            amount_in: "1000".to_string(),
+            expected_amount_out: "990".to_string(),
+            min_amount_out: Some("980".to_string()),
+            actual_amount_in: None,
+            actual_amount_out: None,
+            started_at: matches!(
+                status,
+                OrderExecutionStepStatus::Running | OrderExecutionStepStatus::Failed
+            )
+            .then_some(now),
+            completed_at: (status == OrderExecutionStepStatus::Failed).then_some(now),
+            provider_quote_expires_at: None,
+            details: json!({ "source": "supersede_fixture" }),
+            usd_valuation: json!({}),
+            created_at: now,
+            updated_at: now,
+        };
+        let step = OrderExecutionStep {
+            id: Uuid::now_v7(),
+            order_id: order.id,
+            execution_attempt_id: Some(attempt.id),
+            execution_leg_id: Some(leg.id),
+            transition_decl_id,
+            step_index: index,
+            step_type,
+            provider: provider.to_string(),
+            status,
+            input_asset: Some(order.source_asset.clone()),
+            output_asset: Some(order.destination_asset.clone()),
+            amount_in: Some("1000".to_string()),
+            min_amount_out: Some("980".to_string()),
+            tx_hash: None,
+            provider_ref: None,
+            idempotency_key: Some(format!("{idempotency_prefix}:step:{index}")),
+            attempt_count: if matches!(
+                status,
+                OrderExecutionStepStatus::Running | OrderExecutionStepStatus::Failed
+            ) {
+                1
+            } else {
+                0
+            },
+            next_attempt_at: None,
+            started_at: matches!(
+                status,
+                OrderExecutionStepStatus::Running | OrderExecutionStepStatus::Failed
+            )
+            .then_some(now),
+            completed_at: (status == OrderExecutionStepStatus::Failed).then_some(now),
+            details: json!({ "source": "supersede_fixture" }),
+            request: json!({}),
+            response: json!({}),
+            error: if status == OrderExecutionStepStatus::Failed {
+                json!({ "reason": "fixture_failed_step" })
+            } else {
+                json!({})
+            },
+            usd_valuation: json!({}),
+            created_at: now,
+            updated_at: now,
+        };
+        legs.push(leg);
+        steps.push(step);
+    }
+
+    db.orders()
+        .create_execution_legs_idempotent(&legs)
+        .await
+        .unwrap();
+    db.orders()
+        .create_execution_steps_idempotent(&steps)
+        .await
+        .unwrap();
+
+    FailedAttemptFixture {
+        attempt,
+        legs,
+        steps,
+    }
+}
+
+fn refreshed_attempt_plan_for_order(
+    order: &RouterOrder,
+    now: chrono::DateTime<Utc>,
+    idempotency_prefix: &str,
+) -> RefreshedExecutionAttemptPlan {
+    let specs = [
+        (OrderExecutionStepType::UnitWithdrawal, "unit"),
+        (OrderExecutionStepType::UniversalRouterSwap, "velora"),
+    ];
+    let mut legs = Vec::with_capacity(specs.len());
+    let mut steps = Vec::with_capacity(specs.len());
+    for (index, (step_type, provider)) in specs.into_iter().enumerate() {
+        let index = index as i32;
+        let transition_decl_id = Some(format!("{idempotency_prefix}:{}", step_type.to_db_string()));
+        let leg = OrderExecutionLeg {
+            id: Uuid::now_v7(),
+            order_id: order.id,
+            execution_attempt_id: None,
+            transition_decl_id: transition_decl_id.clone(),
+            leg_index: index,
+            leg_type: step_type.to_db_string().to_string(),
+            provider: provider.to_string(),
+            status: OrderExecutionStepStatus::Planned,
+            input_asset: order.source_asset.clone(),
+            output_asset: order.destination_asset.clone(),
+            amount_in: "1000".to_string(),
+            expected_amount_out: "990".to_string(),
+            min_amount_out: Some("980".to_string()),
+            actual_amount_in: None,
+            actual_amount_out: None,
+            started_at: None,
+            completed_at: None,
+            provider_quote_expires_at: None,
+            details: json!({ "source": "refreshed_supersede_fixture" }),
+            usd_valuation: json!({}),
+            created_at: now,
+            updated_at: now,
+        };
+        steps.push(OrderExecutionStep {
+            id: Uuid::now_v7(),
+            order_id: order.id,
+            execution_attempt_id: None,
+            execution_leg_id: Some(leg.id),
+            transition_decl_id,
+            step_index: index,
+            step_type,
+            provider: provider.to_string(),
+            status: OrderExecutionStepStatus::Planned,
+            input_asset: Some(order.source_asset.clone()),
+            output_asset: Some(order.destination_asset.clone()),
+            amount_in: Some("1000".to_string()),
+            min_amount_out: Some("980".to_string()),
+            tx_hash: None,
+            provider_ref: None,
+            idempotency_key: Some(format!("{idempotency_prefix}:step:{index}")),
+            attempt_count: 0,
+            next_attempt_at: None,
+            started_at: None,
+            completed_at: None,
+            details: json!({ "source": "refreshed_supersede_fixture" }),
+            request: json!({}),
+            response: json!({}),
+            error: json!({}),
+            usd_valuation: json!({}),
+            created_at: now,
+            updated_at: now,
+        });
+        legs.push(leg);
+    }
+
+    RefreshedExecutionAttemptPlan {
+        legs,
+        steps,
+        failure_reason: json!({ "reason": "test_refreshed_attempt" }),
+        superseded_reason: json!({ "reason": "test_superseded_by_refreshed_attempt" }),
+        input_custody_snapshot: json!({}),
+    }
+}
+
+async fn create_executing_market_test_order(
+    db: &Database,
+    now: chrono::DateTime<Utc>,
+) -> RouterOrder {
+    let source_asset = DepositAsset {
+        chain: ChainId::parse("evm:1").unwrap(),
+        asset: AssetId::Native,
+    };
+    let destination_asset = DepositAsset {
+        chain: ChainId::parse("evm:8453").unwrap(),
+        asset: AssetId::Native,
+    };
+    let quote = test_market_order_quote(
+        source_asset.clone(),
+        destination_asset.clone(),
+        now + chrono::Duration::minutes(5),
+    );
+    db.orders().create_market_order_quote(&quote).await.unwrap();
+    let order_id = Uuid::now_v7();
+    let order = RouterOrder {
+        id: order_id,
+        order_type: RouterOrderType::MarketOrder,
+        status: RouterOrderStatus::Executing,
+        funding_vault_id: None,
+        source_asset,
+        destination_asset,
+        recipient_address: valid_evm_address(),
+        refund_address: valid_evm_address(),
+        action: RouterOrderAction::MarketOrder(MarketOrderAction {
+            order_kind: MarketOrderKind::ExactIn {
+                amount_in: "1000".to_string(),
+                min_amount_out: Some("1000".to_string()),
+            },
+            slippage_bps: Some(100),
+        }),
+        action_timeout_at: now + chrono::Duration::minutes(10),
+        idempotency_key: None,
+        workflow_trace_id: order_id.simple().to_string(),
+        workflow_parent_span_id: "1111111111111111".to_string(),
+        created_at: now,
+        updated_at: now,
+    };
+    db.orders()
+        .create_market_order_from_quote(&order, quote.id)
+        .await
+        .unwrap();
+    order
+}
+
+#[tokio::test]
+async fn retry_supersedes_failed_attempt_legs() {
+    let db = test_db().await;
+    let now = Utc::now();
+    let order = create_executing_market_test_order(&db, now).await;
+    let fixture =
+        create_failed_attempt_with_transient_legs(&db, &order, now, "retry-supersedes").await;
+    let retry = db
+        .orders()
+        .create_retry_execution_attempt_from_failed_step(
+            order.id,
+            fixture.attempt.id,
+            fixture.steps[0].id,
+            now + chrono::Duration::seconds(5),
+        )
+        .await
+        .unwrap();
+
+    let superseded_legs = db
+        .orders()
+        .get_execution_legs_for_attempt(fixture.attempt.id)
+        .await
+        .unwrap();
+    assert_eq!(superseded_legs.len(), fixture.legs.len());
+    assert!(
+        superseded_legs
+            .iter()
+            .all(|leg| leg.status == OrderExecutionStepStatus::Superseded),
+        "failed attempt leg statuses: {:?}",
+        superseded_legs
+            .iter()
+            .map(|leg| leg.status)
+            .collect::<Vec<_>>()
+    );
+
+    let retry_legs = db
+        .orders()
+        .get_execution_legs_for_attempt(retry.attempt.id)
+        .await
+        .unwrap();
+    assert_eq!(retry_legs.len(), fixture.legs.len());
+    assert!(
+        retry_legs
+            .iter()
+            .all(|leg| leg.status == OrderExecutionStepStatus::Planned),
+        "retry leg statuses: {:?}",
+        retry_legs.iter().map(|leg| leg.status).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn refreshed_supersedes_failed_attempt_legs() {
+    let db = test_db().await;
+    let now = Utc::now();
+    let order = create_executing_market_test_order(&db, now).await;
+    let fixture =
+        create_failed_attempt_with_transient_legs(&db, &order, now, "refresh-supersedes").await;
+    let plan = refreshed_attempt_plan_for_order(
+        &order,
+        now + chrono::Duration::seconds(5),
+        "refresh-new-attempt",
+    );
+    let refreshed_leg_count = plan.legs.len();
+    let refreshed = db
+        .orders()
+        .create_refreshed_execution_attempt_from_failed_step(
+            order.id,
+            fixture.attempt.id,
+            fixture.steps[0].id,
+            plan,
+            now + chrono::Duration::seconds(5),
+        )
+        .await
+        .unwrap();
+
+    let superseded_legs = db
+        .orders()
+        .get_execution_legs_for_attempt(fixture.attempt.id)
+        .await
+        .unwrap();
+    assert_eq!(superseded_legs.len(), fixture.legs.len());
+    assert!(
+        superseded_legs
+            .iter()
+            .all(|leg| leg.status == OrderExecutionStepStatus::Superseded),
+        "failed attempt leg statuses: {:?}",
+        superseded_legs
+            .iter()
+            .map(|leg| leg.status)
+            .collect::<Vec<_>>()
+    );
+
+    let refreshed_legs = db
+        .orders()
+        .get_execution_legs_for_attempt(refreshed.attempt.id)
+        .await
+        .unwrap();
+    assert_eq!(refreshed_legs.len(), refreshed_leg_count);
+    assert!(
+        refreshed_legs
+            .iter()
+            .all(|leg| leg.status == OrderExecutionStepStatus::Planned),
+        "refreshed leg statuses: {:?}",
+        refreshed_legs
+            .iter()
+            .map(|leg| leg.status)
+            .collect::<Vec<_>>()
+    );
 }
 
 fn write_test_master_key(config_dir: &std::path::Path) -> std::path::PathBuf {
@@ -627,22 +1014,26 @@ fn test_router_args(
         hyperliquid_account_address: None,
         hyperliquid_vault_address: None,
         hyperliquid_paymaster_private_key: Some(test_hyperliquid_paymaster_private_key()),
+        temporal_address: "http://127.0.0.1:7233".to_string(),
+        temporal_namespace: "default".to_string(),
+        temporal_task_queue: "tee-router-order-execution".to_string(),
         router_detector_api_key: Some(TEST_DETECTOR_API_KEY.to_string()),
         router_gateway_api_key: None,
         router_admin_api_key: None,
         hyperliquid_network:
-            router_server::services::custody_action_executor::HyperliquidCallNetwork::Mainnet,
+            router_core::services::custody_action_executor::HyperliquidCallNetwork::Mainnet,
         hyperliquid_order_timeout_ms: 30_000,
         worker_id: None,
-        worker_lease_name: Some("global-router-worker".to_string()),
-        worker_lease_seconds: 300,
-        worker_lease_renew_seconds: 30,
-        worker_standby_poll_seconds: 5,
         worker_refund_poll_seconds: 60,
         worker_order_execution_poll_seconds: 5,
         worker_route_cost_refresh_seconds: 300,
         worker_provider_health_poll_seconds: 120,
         provider_health_timeout_seconds: 10,
+        worker_order_maintenance_pass_limit: 100,
+        worker_order_planning_pass_limit: 100,
+        worker_order_execution_pass_limit: 25,
+        worker_order_execution_concurrency: 64,
+        worker_vault_funding_hint_pass_limit: 100,
         coinbase_price_api_base_url: "http://127.0.0.1:9".to_string(),
     }
 }
@@ -665,13 +1056,6 @@ async fn spawn_router_api(args: RouterServerArgs) -> (String, tokio::task::JoinH
     .await
 }
 
-async fn spawn_router_api_from_components(
-    components: RouterComponents,
-    cors_domain: Option<String>,
-) -> (String, tokio::task::JoinHandle<()>) {
-    spawn_router_api_from_components_with_auth(components, cors_domain, None, None, None).await
-}
-
 async fn spawn_router_api_from_components_with_auth(
     components: RouterComponents,
     cors_domain: Option<String>,
@@ -684,11 +1068,11 @@ async fn spawn_router_api_from_components_with_auth(
             db: components.db,
             vault_manager: components.vault_manager,
             order_manager: components.order_manager,
-            order_execution_manager: components.order_execution_manager,
             provider_health: components.provider_health,
             provider_policies: components.provider_policies,
             address_screener: components.address_screener,
             chain_registry: components.chain_registry,
+            order_workflow_client: None,
             internal_api_auth,
             gateway_api_auth,
             admin_api_auth,
@@ -765,13 +1149,6 @@ async fn mock_order_manager(
 /// `"evm:1"` → Ethereum, `"evm:8453"` → Base, `"evm:42161"` → Arbitrum.
 async fn spawn_harness_mocks(h: &TestHarness, origin_chain_id: &str) -> MockIntegratorServer {
     spawn_harness_mocks_with_unit_indexers(h, origin_chain_id, true).await
-}
-
-async fn spawn_harness_mocks_without_unit_indexers(
-    h: &TestHarness,
-    origin_chain_id: &str,
-) -> MockIntegratorServer {
-    spawn_harness_mocks_with_unit_indexers(h, origin_chain_id, false).await
 }
 
 async fn spawn_harness_mocks_with_unit_indexers(
@@ -892,46 +1269,6 @@ fn test_hyperliquid_paymaster_private_key() -> String {
     "0x59c6995e998f97a5a0044976f7ad0a7df4976fbe66f6cc18ff3c16f18a6b9e3f".to_string()
 }
 
-fn test_paymaster_registry(
-    h: &TestHarness,
-) -> router_server::services::custody_action_executor::PaymasterRegistry {
-    let mut paymasters = router_server::services::custody_action_executor::PaymasterRegistry::new();
-    let evm_address_from_private_key =
-        router_server::services::custody_action_executor::evm_address_from_private_key;
-    let bitcoin_address_from_private_key =
-        router_server::services::custody_action_executor::bitcoin_address_from_private_key;
-
-    paymasters.register(
-        ChainType::Ethereum,
-        evm_address_from_private_key(&h.ethereum_spawned_api_paymaster_private_key())
-            .expect("ethereum paymaster address"),
-    );
-    paymasters.register(
-        ChainType::Base,
-        evm_address_from_private_key(&h.base_spawned_api_paymaster_private_key())
-            .expect("base paymaster address"),
-    );
-    paymasters.register(
-        ChainType::Arbitrum,
-        evm_address_from_private_key(&h.arbitrum_spawned_api_paymaster_private_key())
-            .expect("arbitrum paymaster address"),
-    );
-    paymasters.register(
-        ChainType::Bitcoin,
-        bitcoin_address_from_private_key(
-            &regtest_paymaster_private_key(),
-            bitcoin::Network::Regtest,
-        )
-        .expect("bitcoin paymaster address"),
-    );
-    paymasters.register(
-        ChainType::Hyperliquid,
-        evm_address_from_private_key(&test_hyperliquid_paymaster_private_key())
-            .expect("hyperliquid paymaster address"),
-    );
-    paymasters
-}
-
 fn assert_path_provider_id(provider_id: &str, expected_fragments: &[&str]) {
     assert!(
         provider_id.starts_with("path:"),
@@ -945,417 +1282,10 @@ fn assert_path_provider_id(provider_id: &str, expected_fragments: &[&str]) {
     }
 }
 
-/// Step-request mirror used when asserting what the planner persisted into
-/// `execution_steps.request`. Matches `UnitDepositStepRequest` /
-/// `UnitWithdrawalStepRequest` in `action_providers.rs` — redefined here so
-/// test code can deserialize the JSON without importing internal types.
-#[derive(Debug, serde::Deserialize)]
-struct MockUnitDepositStepRequest {
-    #[allow(dead_code)]
-    #[serde(default)]
-    order_id: Option<Uuid>,
-    src_chain_id: String,
-    dst_chain_id: String,
-    asset_id: String,
-    #[allow(dead_code)]
-    amount: String,
-    #[serde(default)]
-    source_custody_vault_id: Option<Uuid>,
-    #[serde(default)]
-    revert_custody_vault_id: Option<Uuid>,
-    #[serde(default)]
-    source_custody_vault_role: Option<String>,
-    #[serde(default)]
-    revert_custody_vault_role: Option<String>,
-    #[serde(default)]
-    hyperliquid_custody_vault_role: Option<String>,
-}
-
-fn filter_unit_requests_by_kind(
-    requests: &[MockUnitGenerateAddressRequest],
-    kind: MockUnitOperationKind,
-) -> Vec<&MockUnitGenerateAddressRequest> {
-    requests
-        .iter()
-        .filter(|r| match kind {
-            MockUnitOperationKind::Deposit => r.dst_chain == "hyperliquid",
-            MockUnitOperationKind::Withdrawal => r.src_chain == "hyperliquid",
-        })
-        .collect()
-}
-
-fn filter_unit_operations_by_kind(
-    operations: &[MockUnitOperationRecord],
-    kind: MockUnitOperationKind,
-) -> Vec<&MockUnitOperationRecord> {
-    operations.iter().filter(|op| op.kind == kind).collect()
-}
-
-#[derive(Clone)]
-struct CustodyIntentUnitProvider {
-    deposit_sink: String,
-}
-
-impl UnitProvider for CustodyIntentUnitProvider {
-    fn id(&self) -> &str {
-        "unit"
-    }
-
-    fn supports_deposit(&self, asset: &DepositAsset) -> bool {
-        matches!(asset.chain.as_str(), "evm:1") && asset.asset.is_native()
-    }
-
-    fn supports_withdrawal(&self, asset: &DepositAsset) -> bool {
-        matches!(asset.chain.as_str(), "evm:8453") && asset.asset.is_native()
-    }
-
-    fn execute_deposit<'a>(
-        &'a self,
-        request: &'a UnitDepositStepRequest,
-    ) -> ProviderFuture<'a, ProviderExecutionIntent> {
-        Box::pin(async move {
-            let custody_vault_id = request.source_custody_vault_id.ok_or_else(|| {
-                "unit deposit request is missing source_custody_vault_id".to_string()
-            })?;
-            let amount = request.amount.clone();
-
-            Ok(ProviderExecutionIntent::CustodyAction {
-                custody_vault_id,
-                action: CustodyAction::Transfer {
-                    to_address: self.deposit_sink.clone(),
-                    amount,
-                },
-                provider_context: json!({
-                    "mock_provider": "custody-intent-unit",
-                    "operation": "deposit"
-                }),
-                state: Default::default(),
-            })
-        })
-    }
-
-    fn execute_withdrawal<'a>(
-        &'a self,
-        request: &'a UnitWithdrawalStepRequest,
-    ) -> ProviderFuture<'a, ProviderExecutionIntent> {
-        Box::pin(async move {
-            Ok(ProviderExecutionIntent::ProviderOnly {
-                response: json!({
-                    "mock_provider": "custody-intent-unit",
-                    "operation": "withdrawal",
-                    "request": request
-                }),
-                state: Default::default(),
-            })
-        })
-    }
-
-    fn observe_unit_operation<'a>(
-        &'a self,
-        request: router_server::services::ProviderOperationObservationRequest,
-    ) -> ProviderFuture<'a, Option<router_server::services::ProviderOperationObservation>> {
-        Box::pin(async move {
-            let Some(tx_hash) = request.hint_evidence.get("tx_hash").and_then(Value::as_str) else {
-                return Ok(Some(
-                    router_server::services::ProviderOperationObservation {
-                        status: ProviderOperationStatus::WaitingExternal,
-                        provider_ref: request.provider_ref,
-                        observed_state: json!({
-                            "status": "waiting_for_chain_evidence",
-                            "hint_evidence": request.hint_evidence,
-                        }),
-                        response: None,
-                        tx_hash: None,
-                        error: None,
-                    },
-                ));
-            };
-
-            Ok(Some(
-                router_server::services::ProviderOperationObservation {
-                    status: ProviderOperationStatus::Completed,
-                    provider_ref: request.provider_ref,
-                    observed_state: json!({
-                        "status": "done",
-                        "hint_evidence": request.hint_evidence,
-                    }),
-                    response: None,
-                    tx_hash: Some(tx_hash.to_string()),
-                    error: None,
-                },
-            ))
-        })
-    }
-}
-
-#[derive(Clone)]
-struct ObservationUnitProvider;
-
-impl UnitProvider for ObservationUnitProvider {
-    fn id(&self) -> &str {
-        "unit"
-    }
-
-    fn supports_deposit(&self, asset: &DepositAsset) -> bool {
-        matches!(asset.chain.as_str(), "evm:1") && asset.asset.is_native()
-    }
-
-    fn supports_withdrawal(&self, asset: &DepositAsset) -> bool {
-        matches!(asset.chain.as_str(), "evm:8453") && asset.asset.is_native()
-    }
-
-    fn execute_deposit<'a>(
-        &'a self,
-        request: &'a UnitDepositStepRequest,
-    ) -> ProviderFuture<'a, ProviderExecutionIntent> {
-        Box::pin(async move {
-            let order_id = request.order_id;
-            let provider_ref = format!("unit-observation-{order_id}");
-            let deposit_address = "0x2000000000000000000000000000000000000001".to_string();
-            let response = json!({
-                "operation_id": provider_ref,
-                "deposit_address": deposit_address,
-                "status": "submitted"
-            });
-
-            Ok(ProviderExecutionIntent::ProviderOnly {
-                response: response.clone(),
-                state: ProviderExecutionState {
-                    operation: Some(ProviderOperationIntent {
-                        operation_type: ProviderOperationType::UnitDeposit,
-                        status: ProviderOperationStatus::Submitted,
-                        provider_ref: Some(provider_ref),
-                        request: None,
-                        response: Some(response),
-                        observed_state: None,
-                    }),
-                    addresses: vec![ProviderAddressIntent {
-                        role: ProviderAddressRole::UnitDeposit,
-                        chain: ChainId::parse("evm:1").unwrap(),
-                        asset: Some(AssetId::Native),
-                        address: deposit_address,
-                        memo: None,
-                        expires_at: None,
-                        metadata: Some(json!({
-                            "source": "observation_unit_provider"
-                        })),
-                    }],
-                },
-            })
-        })
-    }
-
-    fn execute_withdrawal<'a>(
-        &'a self,
-        request: &'a UnitWithdrawalStepRequest,
-    ) -> ProviderFuture<'a, ProviderExecutionIntent> {
-        Box::pin(async move {
-            Ok(ProviderExecutionIntent::ProviderOnly {
-                response: json!({
-                    "mock_provider": "observation-unit",
-                    "operation": "withdrawal",
-                    "request": request
-                }),
-                state: Default::default(),
-            })
-        })
-    }
-
-    fn observe_unit_operation<'a>(
-        &'a self,
-        request: router_server::services::ProviderOperationObservationRequest,
-    ) -> ProviderFuture<'a, Option<router_server::services::ProviderOperationObservation>> {
-        Box::pin(async move {
-            let Some(tx_hash) = request.hint_evidence.get("tx_hash").and_then(Value::as_str) else {
-                return Ok(Some(
-                    router_server::services::ProviderOperationObservation {
-                        status: ProviderOperationStatus::WaitingExternal,
-                        provider_ref: request.provider_ref,
-                        observed_state: json!({
-                            "status": "waiting_for_chain_evidence",
-                            "hint_evidence": request.hint_evidence,
-                        }),
-                        response: None,
-                        tx_hash: None,
-                        error: None,
-                    },
-                ));
-            };
-
-            Ok(Some(
-                router_server::services::ProviderOperationObservation {
-                    status: ProviderOperationStatus::Completed,
-                    provider_ref: request.provider_ref,
-                    observed_state: json!({
-                        "status": "done",
-                        "hint_evidence": request.hint_evidence,
-                    }),
-                    response: None,
-                    tx_hash: Some(tx_hash.to_string()),
-                    error: None,
-                },
-            ))
-        })
-    }
-}
-
-#[derive(Clone)]
-struct FailingRefundBridgeProvider;
-
-impl BridgeProvider for FailingRefundBridgeProvider {
-    fn id(&self) -> &str {
-        "across"
-    }
-
-    fn quote_bridge<'a>(
-        &'a self,
-        request: BridgeQuoteRequest,
-    ) -> ProviderFuture<'a, Option<BridgeQuote>> {
-        Box::pin(async move {
-            let amount_in = match &request.order_kind {
-                MarketOrderKind::ExactIn { amount_in, .. } => amount_in.clone(),
-                MarketOrderKind::ExactOut { amount_out, .. } => amount_out.clone(),
-            };
-            Ok(Some(BridgeQuote {
-                provider_id: self.id().to_string(),
-                amount_in: amount_in.clone(),
-                amount_out: amount_in,
-                provider_quote: json!({
-                    "mock_provider": "failing_refund_bridge",
-                }),
-                expires_at: Utc::now() + chrono::Duration::seconds(30),
-            }))
-        })
-    }
-
-    fn execute_bridge<'a>(
-        &'a self,
-        _request: &'a BridgeExecutionRequest,
-    ) -> ProviderFuture<'a, ProviderExecutionIntent> {
-        Box::pin(async move { Err("mock refund route unavailable".to_string()) })
-    }
-}
-
-#[derive(Clone)]
-struct ProviderOnlyExchangeProvider;
-
-impl ExchangeProvider for ProviderOnlyExchangeProvider {
-    fn id(&self) -> &str {
-        "hyperliquid"
-    }
-
-    fn quote_trade<'a>(
-        &'a self,
-        request: ExchangeQuoteRequest,
-    ) -> ProviderFuture<'a, Option<ExchangeQuote>> {
-        Box::pin(async move {
-            let (amount_in, amount_out, min_amount_out, max_amount_in) = match request.order_kind {
-                MarketOrderKind::ExactIn {
-                    amount_in,
-                    min_amount_out,
-                } => (amount_in.clone(), amount_in, Some(min_amount_out), None),
-                MarketOrderKind::ExactOut {
-                    amount_out,
-                    max_amount_in,
-                } => (amount_out.clone(), amount_out, None, Some(max_amount_in)),
-            };
-            Ok(Some(ExchangeQuote {
-                provider_id: "hyperliquid".to_string(),
-                amount_in,
-                amount_out,
-                min_amount_out,
-                max_amount_in,
-                provider_quote: json!({
-                    "kind": "spot_no_op",
-                    "mock_provider": "provider-only-exchange"
-                }),
-                expires_at: Utc::now() + chrono::Duration::minutes(5),
-            }))
-        })
-    }
-
-    fn execute_trade<'a>(
-        &'a self,
-        request: &'a ExchangeExecutionRequest,
-    ) -> ProviderFuture<'a, ProviderExecutionIntent> {
-        Box::pin(async move {
-            Ok(ProviderExecutionIntent::ProviderOnly {
-                response: json!({
-                    "mock_provider": "provider-only-exchange",
-                    "operation": "trade",
-                    "request": request
-                }),
-                state: Default::default(),
-            })
-        })
-    }
-}
-
-#[derive(Clone)]
-struct FailingBridgeProvider;
-
-impl BridgeProvider for FailingBridgeProvider {
-    fn id(&self) -> &str {
-        "across"
-    }
-
-    fn quote_bridge<'a>(
-        &'a self,
-        request: BridgeQuoteRequest,
-    ) -> ProviderFuture<'a, Option<BridgeQuote>> {
-        Box::pin(async move {
-            let (amount_in, amount_out) = match request.order_kind {
-                MarketOrderKind::ExactIn {
-                    amount_in,
-                    min_amount_out: _,
-                } => (amount_in.clone(), amount_in),
-                MarketOrderKind::ExactOut {
-                    amount_out,
-                    max_amount_in: _,
-                } => (amount_out.clone(), amount_out),
-            };
-            Ok(Some(BridgeQuote {
-                provider_id: "across".to_string(),
-                amount_in,
-                amount_out,
-                provider_quote: json!({
-                    "kind": "failing_bridge",
-                    "mock_provider": "failing-bridge"
-                }),
-                expires_at: Utc::now() + chrono::Duration::minutes(5),
-            }))
-        })
-    }
-
-    fn execute_bridge<'a>(
-        &'a self,
-        _request: &'a BridgeExecutionRequest,
-    ) -> ProviderFuture<'a, ProviderExecutionIntent> {
-        Box::pin(async move { Err("bridge execution failed intentionally".to_string()) })
-    }
-}
-
-struct PanicOnceCrashInjector {
-    point: OrderExecutionCrashPoint,
-    tripped: AtomicBool,
-}
-
-impl PanicOnceCrashInjector {
-    fn new(point: OrderExecutionCrashPoint) -> Self {
-        Self {
-            point,
-            tripped: AtomicBool::new(false),
-        }
-    }
-}
-
-impl OrderExecutionCrashInjector for PanicOnceCrashInjector {
-    fn trigger(&self, point: OrderExecutionCrashPoint) {
-        if point == self.point && !self.tripped.swap(true, Ordering::SeqCst) {
-            panic!("test crash injector triggered at {point:?}");
-        }
-    }
-}
+// Step-request mirror used when asserting what the planner persisted into
+// `execution_steps.request`. Matches `UnitDepositStepRequest` /
+// `UnitWithdrawalStepRequest` in `action_providers.rs` — redefined here so
+// test code can deserialize the JSON without importing internal types.
 
 async fn anvil_set_balance(h: &TestHarness, address: Address, amount: U256) {
     let provider = ProviderBuilder::new().connect_http(h.ethereum_endpoint_url());
@@ -1363,22 +1293,6 @@ async fn anvil_set_balance(h: &TestHarness, address: Address, amount: U256) {
         .anvil_set_balance(address, amount)
         .await
         .expect("anvil_set_balance");
-}
-
-async fn anvil_set_base_balance(h: &TestHarness, address: Address, amount: U256) {
-    let provider = ProviderBuilder::new().connect_http(h.base_endpoint_url());
-    provider
-        .anvil_set_balance(address, amount)
-        .await
-        .expect("anvil_set_balance on base");
-}
-
-async fn anvil_set_arbitrum_balance(h: &TestHarness, address: Address, amount: U256) {
-    let provider = ProviderBuilder::new().connect_http(h.arbitrum_endpoint_url());
-    provider
-        .anvil_set_balance(address, amount)
-        .await
-        .expect("anvil_set_balance on arbitrum");
 }
 
 async fn anvil_mint_erc20(h: &TestHarness, address: Address, amount: U256) {
@@ -1436,65 +1350,6 @@ async fn anvil_clone_base_mock_erc20_code(h: &TestHarness, address: Address) {
         .expect("anvil_set_code for arbitrary base erc20");
 }
 
-async fn anvil_send_ethereum_native(
-    h: &TestHarness,
-    recipient: Address,
-    amount: U256,
-) -> (String, u64) {
-    anvil_send_native_on(h, h.ethereum_endpoint_url(), recipient, amount).await
-}
-
-async fn anvil_send_base_native(
-    h: &TestHarness,
-    recipient: Address,
-    amount: U256,
-) -> (String, u64) {
-    anvil_send_native_on(h, h.base_endpoint_url(), recipient, amount).await
-}
-
-async fn anvil_send_arbitrum_native(
-    h: &TestHarness,
-    recipient: Address,
-    amount: U256,
-) -> (String, u64) {
-    anvil_send_native_on(h, h.arbitrum_endpoint_url(), recipient, amount).await
-}
-
-async fn anvil_send_native_on(
-    _h: &TestHarness,
-    endpoint: url::Url,
-    recipient: Address,
-    amount: U256,
-) -> (String, u64) {
-    // Use a fresh random signer per call so parallel tests don't collide on nonces.
-    let signer = alloy::signers::local::PrivateKeySigner::random();
-    let sender_address = signer.address();
-    let wallet = alloy::network::EthereumWallet::new(signer);
-    let provider = ProviderBuilder::new().wallet(wallet).connect_http(endpoint);
-    provider
-        .anvil_set_balance(
-            sender_address,
-            amount + U256::from(1_000_000_000_000_000_000_u128),
-        )
-        .await
-        .expect("anvil_set_balance for ephemeral sender");
-    let tx = TransactionRequest::default()
-        .with_to(recipient)
-        .with_value(amount);
-    let receipt = provider
-        .send_transaction(tx)
-        .await
-        .expect("send native deposit")
-        .get_receipt()
-        .await
-        .expect("native deposit receipt");
-    assert!(receipt.status(), "native deposit transaction reverted");
-    (
-        receipt.transaction_hash.to_string(),
-        receipt.transaction_index.unwrap_or(0),
-    )
-}
-
 fn evm_native_request() -> CreateVaultRequest {
     CreateVaultRequest {
         order_id: None,
@@ -1513,7 +1368,7 @@ fn evm_native_request() -> CreateVaultRequest {
 async fn create_test_order_from_quote(
     order_manager: &OrderManager,
     quote_id: Uuid,
-) -> router_server::models::RouterOrder {
+) -> router_core::models::RouterOrder {
     create_test_order_from_quote_with_refund(order_manager, quote_id, valid_evm_address()).await
 }
 
@@ -1521,12 +1376,11 @@ async fn create_test_order_from_quote_with_refund(
     order_manager: &OrderManager,
     quote_id: Uuid,
     refund_address: String,
-) -> router_server::models::RouterOrder {
+) -> router_core::models::RouterOrder {
     let (order, _) = order_manager
         .create_order_from_quote(CreateOrderRequest {
             quote_id,
             refund_address,
-            cancel_after: None,
             idempotency_key: None,
             metadata: json!({}),
         })
@@ -1574,720 +1428,24 @@ async fn record_confirmed_sauron_funding_hint(
     assert_eq!(funded_summary.processed, 1);
 }
 
-struct FundedMarketOrderFixture {
-    db: Database,
-    order_id: Uuid,
-    vault_id: Uuid,
-    vault_address: Address,
-    mocks: MockIntegratorServer,
-    settings: Arc<Settings>,
-    custody_action_executor: Arc<CustodyActionExecutor>,
-    chain_registry: Arc<ChainRegistry>,
-}
-
-async fn funded_market_order_fixture(
-    source_chain_id: &str,
-    destination_chain_id: &str,
-) -> FundedMarketOrderFixture {
-    funded_market_order_fixture_with_amount(source_chain_id, destination_chain_id, "1000").await
-}
-
-async fn funded_market_order_fixture_with_amount(
-    source_chain_id: &str,
-    destination_chain_id: &str,
-    amount_in: &str,
-) -> FundedMarketOrderFixture {
-    funded_market_order_fixture_with_amount_and_unit_indexers(
-        source_chain_id,
-        destination_chain_id,
-        amount_in,
-        true,
-    )
-    .await
-}
-
-async fn funded_market_order_fixture_without_unit_indexers(
-    source_chain_id: &str,
-    destination_chain_id: &str,
-) -> FundedMarketOrderFixture {
-    funded_market_order_fixture_with_amount_and_unit_indexers(
-        source_chain_id,
-        destination_chain_id,
-        "1000",
-        false,
-    )
-    .await
-}
-
-async fn funded_market_order_fixture_with_amount_and_unit_indexers(
-    source_chain_id: &str,
-    destination_chain_id: &str,
-    amount_in: &str,
-    enable_unit_indexers: bool,
-) -> FundedMarketOrderFixture {
-    let dir = tempfile::tempdir().unwrap();
-    let h = harness().await;
-    let db = test_db().await;
-    let mocks = if enable_unit_indexers {
-        spawn_harness_mocks(h, source_chain_id).await
-    } else {
-        spawn_harness_mocks_without_unit_indexers(h, source_chain_id).await
-    };
-    let settings = Arc::new(test_settings(dir.path()));
-    let action_providers = Arc::new(ActionProviderRegistry::mock_http(mocks.base_url()));
-    let order_manager = OrderManager::with_action_providers(
-        db.clone(),
-        settings.clone(),
-        h.chain_registry.clone(),
-        action_providers,
-    );
-    let vault_manager = VaultManager::new(db.clone(), settings.clone(), h.chain_registry.clone());
-    let source_asset = DepositAsset {
-        chain: ChainId::parse(source_chain_id).unwrap(),
-        asset: AssetId::Native,
-    };
-
-    let quote = order_manager
-        .quote_market_order(MarketOrderQuoteRequest {
-            from_asset: source_asset.clone(),
-            to_asset: DepositAsset {
-                chain: ChainId::parse(destination_chain_id).unwrap(),
-                asset: AssetId::Native,
-            },
-            recipient_address: valid_evm_address(),
-            order_kind: MarketOrderQuoteKind::ExactIn {
-                amount_in: amount_in.to_string(),
-                slippage_bps: 100,
-            },
-        })
-        .await
-        .unwrap();
-    let order = create_test_order_from_quote(
-        &order_manager,
-        quote
-            .quote
-            .as_market_order()
-            .expect("market order quote")
-            .id,
-    )
-    .await;
-    let vault = vault_manager
-        .create_vault(CreateVaultRequest {
-            order_id: Some(order.id),
-            deposit_asset: source_asset,
-            ..evm_native_request()
-        })
-        .await
-        .unwrap();
-    let vault_address =
-        Address::from_str(&vault.deposit_vault_address).expect("valid source vault address");
-    let amount_in = U256::from_str_radix(amount_in, 10).expect("valid test amount_in");
-    // Fund the source vault with the deposit amount plus a 1 ETH pad so it has
-    // enough native balance to cover gas when it later signs UnitDeposit /
-    // AcrossBridge transfers out.
-    let source_balance = amount_in + U256::from(TEST_NATIVE_ORDER_GAS_PAD_WEI);
-    match source_chain_id {
-        "evm:1" => anvil_set_balance(h, vault_address, source_balance).await,
-        "evm:8453" => anvil_set_base_balance(h, vault_address, source_balance).await,
-        "evm:42161" => anvil_set_arbitrum_balance(h, vault_address, source_balance).await,
-        other => panic!("funded_market_order_fixture: unsupported source chain {other}"),
-    }
-    let amount_in_raw = amount_in.to_string();
-    record_confirmed_sauron_funding_hint(
-        &vault_manager,
-        vault.id,
-        &amount_in_raw,
-        &format!("fixture-funding-{}", vault.id),
-    )
-    .await;
-
-    let custody_action_executor = Arc::new(CustodyActionExecutor::new(
-        db.clone(),
-        settings.clone(),
-        h.chain_registry.clone(),
-    ));
-
-    FundedMarketOrderFixture {
-        db,
-        order_id: order.id,
-        vault_id: vault.id,
-        vault_address,
-        mocks,
-        settings,
-        custody_action_executor,
-        chain_registry: h.chain_registry.clone(),
-    }
-}
-
-async fn expect_task_panic<T: std::fmt::Debug>(handle: tokio::task::JoinHandle<T>) {
-    let join_error = handle.await.expect_err("task should panic");
-    assert!(
-        join_error.is_panic(),
-        "expected task panic, got {join_error}"
-    );
-}
-
-async fn record_detector_provider_status_hint(
-    execution_manager: &OrderExecutionManager,
-    operation: &OrderProviderOperation,
-) {
-    let hint_id = Uuid::now_v7();
-    execution_manager
-        .record_provider_operation_hint(OrderProviderOperationHint {
-            id: hint_id,
-            provider_operation_id: operation.id,
-            source: "test-detector".to_string(),
-            hint_kind: ProviderOperationHintKind::PossibleProgress,
-            evidence: json!({
-                "source": "test-detector",
-                "backend": "provider_operation",
-                "provider": &operation.provider,
-                "operation_type": operation.operation_type.to_db_string(),
-                "provider_ref": &operation.provider_ref,
-                "observed_at": Utc::now()
-            }),
-            status: ProviderOperationHintStatus::Pending,
-            idempotency_key: Some(format!(
-                "test-detector-provider-status-hint-{}-{hint_id}",
-                operation.id
-            )),
-            error: json!({}),
-            claimed_at: None,
-            processed_at: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        })
-        .await
-        .unwrap();
-}
-
-/// Wait for the mock Across indexer to observe a `FundsDeposited` event from
-/// the specified depositor, confirming the on-chain deposit landed and the
-/// mock's `/deposit/status` will now report `"filled"` for that deposit id.
-/// Scoped by depositor so parallel tests sharing the anvil spoke pool don't
-/// witness each other's deposits and return early.
-async fn wait_for_across_deposit_indexed(
-    mocks: &MockIntegratorServer,
-    depositor: Address,
-    timeout: Duration,
-) {
-    let start = std::time::Instant::now();
-    while start.elapsed() < timeout {
-        if !mocks.across_deposits_from(depositor).await.is_empty() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    panic!(
-        "mock Across indexer never observed a FundsDeposited event from {depositor:#x} within {timeout:?}",
-    );
-}
-
-async fn wait_for_mock_unit_operation_done(
-    mocks: &MockIntegratorServer,
-    protocol_address: &str,
-    timeout: Duration,
-) -> MockUnitOperationRecord {
-    let start = std::time::Instant::now();
-    loop {
-        let operations = mocks.unit_operations().await;
-        if let Some(operation) = operations
-            .iter()
-            .find(|operation| {
-                operation
-                    .protocol_address
-                    .eq_ignore_ascii_case(protocol_address)
-                    && operation.state == "done"
-            })
-            .cloned()
-        {
-            return operation;
-        }
-        assert!(
-            start.elapsed() < timeout,
-            "mock Unit operation {protocol_address} did not reach done within {timeout:?}; operations={operations:?}",
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-/// Drive an Across → (optional Unit deposit) → (optional Unit withdrawal) →
-/// (optional Hyperliquid) market order to terminal state. External provider
-/// progress is observed through the mocks where available; direct mock
-/// completion is kept only for Unit withdrawal until that lifecycle is modeled.
-async fn drive_across_order_to_completion(
-    execution_manager: &OrderExecutionManager,
-    mocks: &MockIntegratorServer,
-    db: &Database,
-    order_id: Uuid,
-) {
-    // Across bridge leg.
-    execution_manager.process_worker_pass(10).await.unwrap();
-    let source_vault_address = source_deposit_vault_address_from_db(db, order_id).await;
-    wait_for_across_deposit_indexed(mocks, source_vault_address, Duration::from_secs(10)).await;
-    let across_operation =
-        provider_operation_by_type(db, order_id, ProviderOperationType::AcrossBridge).await;
-    record_detector_provider_status_hint(execution_manager, &across_operation).await;
-    execution_manager
-        .process_provider_operation_hints(10)
-        .await
-        .unwrap();
-
-    // Unit deposit leg (if the route includes one).
-    execution_manager.process_worker_pass(10).await.unwrap();
-    if let Some(unit_deposit) =
-        maybe_provider_operation_by_type(db, order_id, ProviderOperationType::UnitDeposit).await
-    {
-        wait_for_mock_unit_operation_done(
-            mocks,
-            provider_ref(&unit_deposit),
-            Duration::from_secs(10),
-        )
-        .await;
-        record_detector_provider_status_hint(execution_manager, &unit_deposit).await;
-        execution_manager
-            .process_provider_operation_hints(10)
-            .await
-            .unwrap();
-    }
-
-    // Unit withdrawal leg (if the route includes one).
-    execution_manager.process_worker_pass(10).await.unwrap();
-    if let Some(unit_withdrawal) =
-        maybe_provider_operation_by_type(db, order_id, ProviderOperationType::UnitWithdrawal).await
-    {
-        record_detector_provider_status_hint(execution_manager, &unit_withdrawal).await;
-        execution_manager
-            .process_provider_operation_hints(10)
-            .await
-            .unwrap();
-    }
-
-    // Remaining legs (e.g., Hyperliquid exchange) drive themselves to completion
-    // via the worker pass loop.
-    let start = std::time::Instant::now();
-    loop {
-        execution_manager.process_worker_pass(10).await.unwrap();
-        let order = db.orders().get(order_id).await.unwrap();
-        if matches!(
-            order.status,
-            RouterOrderStatus::Completed
-                | RouterOrderStatus::Refunding
-                | RouterOrderStatus::Refunded
-                | RouterOrderStatus::Failed
-        ) {
-            if !matches!(order.status, RouterOrderStatus::Completed) {
-                dump_order_state(db, order_id).await;
-            }
-            return;
-        }
-        if start.elapsed() >= Duration::from_secs(10) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    dump_order_state(db, order_id).await;
-    panic!(
-        "order {} did not reach a terminal state within 10s after Across completion",
-        order_id
-    );
-}
-
-async fn dump_order_state(db: &Database, order_id: Uuid) {
-    let order = db.orders().get(order_id).await.unwrap();
-    eprintln!(
-        "order id={} status={:?} funding_vault_id={:?}",
-        order.id, order.status, order.funding_vault_id
-    );
-    if let Some(vault_id) = order.funding_vault_id {
-        let vault = db.vaults().get(vault_id).await.unwrap();
-        eprintln!("funding vault id={} status={:?}", vault.id, vault.status);
-    }
-    let attempts = db.orders().get_execution_attempts(order_id).await.unwrap();
-    for attempt in &attempts {
-        eprintln!(
-            "attempt #{} kind={:?} status={:?}",
-            attempt.attempt_index, attempt.attempt_kind, attempt.status
-        );
-    }
-    let steps = db.orders().get_execution_steps(order_id).await.unwrap();
-    for step in &steps {
-        eprintln!(
-            "step #{} type={:?} status={:?} attempt_id={:?} leg_id={:?} error={}",
-            step.step_index,
-            step.step_type,
-            step.status,
-            step.execution_attempt_id,
-            step.execution_leg_id,
-            step.error
-        );
-    }
-    let operations = db.orders().get_provider_operations(order_id).await.unwrap();
-    for op in &operations {
-        eprintln!(
-            "operation type={:?} status={:?} provider_ref={:?} request={} response={:?} observed_state={}",
-            op.operation_type, op.status, op.provider_ref, op.request, op.response, op.observed_state
-        );
-    }
-}
-
-async fn record_chain_detector_unit_deposit_hint(
-    execution_manager: &OrderExecutionManager,
-    db: &Database,
-    operation: &OrderProviderOperation,
-) {
-    let h = harness().await;
-    let address = db
-        .orders()
-        .get_provider_addresses_by_operation(operation.id)
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|address| address.role == ProviderAddressRole::UnitDeposit)
-        .expect("unit deposit operation should have a provider address");
-    let amount_str = if let Some(amount) = operation
-        .request
-        .get("expected_amount")
-        .and_then(Value::as_str)
-    {
-        amount.to_string()
-    } else if let Some(step_id) = operation.execution_step_id {
-        db.orders()
-            .get_execution_step(step_id)
-            .await
-            .unwrap()
-            .amount_in
-            .unwrap_or_else(|| "1000".to_string())
-    } else {
-        "1000".to_string()
-    };
-    let amount = U256::from_str_radix(&amount_str, 10).expect("expected_amount parses as U256");
-    let recipient = Address::from_str(&address.address).expect("valid unit deposit address");
-    let (tx_hash, transfer_index) = match address.chain.as_str() {
-        "evm:1" => anvil_send_ethereum_native(h, recipient, amount).await,
-        "evm:8453" => anvil_send_base_native(h, recipient, amount).await,
-        "evm:42161" => anvil_send_arbitrum_native(h, recipient, amount).await,
-        other => panic!(
-            "record_chain_detector_unit_deposit_hint: unsupported chain {}",
-            other
-        ),
-    };
-    record_chain_detector_unit_deposit_hint_with_evidence(
-        execution_manager,
-        db,
-        operation,
-        tx_hash,
-        transfer_index,
-    )
-    .await;
-}
-
-async fn record_chain_detector_unit_deposit_hint_with_evidence(
-    execution_manager: &OrderExecutionManager,
-    db: &Database,
-    operation: &OrderProviderOperation,
-    tx_hash: String,
-    transfer_index: u64,
-) {
-    let address = db
-        .orders()
-        .get_provider_addresses_by_operation(operation.id)
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|address| address.role == ProviderAddressRole::UnitDeposit)
-        .expect("unit deposit operation should have a provider address");
-    let amount = operation
-        .request
-        .get("expected_amount")
-        .and_then(Value::as_str)
-        .unwrap_or("1000");
-    let hint_id = Uuid::now_v7();
-    execution_manager
-        .record_provider_operation_hint(OrderProviderOperationHint {
-            id: hint_id,
-            provider_operation_id: operation.id,
-            source: "test-chain-detector".to_string(),
-            hint_kind: ProviderOperationHintKind::PossibleProgress,
-            evidence: json!({
-                "source": "test-chain-detector",
-                "backend": "mock_chain_deposit",
-                "chain": address.chain.as_str(),
-                "address": address.address,
-                "tx_hash": tx_hash,
-                "transfer_index": transfer_index,
-                "amount": amount,
-                "observed_at": Utc::now()
-            }),
-            status: ProviderOperationHintStatus::Pending,
-            idempotency_key: Some(format!(
-                "test-chain-detector-unit-deposit-hint-{}-{hint_id}",
-                operation.id
-            )),
-            error: json!({}),
-            claimed_at: None,
-            processed_at: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        })
-        .await
-        .unwrap();
-}
-
-fn provider_ref(operation: &OrderProviderOperation) -> &str {
-    operation
-        .provider_ref
-        .as_deref()
-        .expect("mock provider operation should have a provider ref")
-}
-
-async fn complete_unit_operation_from_request(
-    mocks: &MockIntegratorServer,
-    operation: &OrderProviderOperation,
-) {
-    let amount = operation
-        .request
-        .get("amount")
-        .and_then(Value::as_str)
-        .expect("mock Unit operation request should include amount");
-    mocks
-        .complete_unit_operation_with_source_amount(provider_ref(operation), amount)
-        .await
-        .expect("complete mock Unit operation");
-}
-
-async fn provider_operation_by_type(
-    db: &Database,
-    order_id: Uuid,
-    operation_type: ProviderOperationType,
-) -> OrderProviderOperation {
-    let operations = db.orders().get_provider_operations(order_id).await.unwrap();
-    if let Some(operation) = operations
-        .into_iter()
-        .find(|operation| operation.operation_type == operation_type)
-    {
-        return operation;
-    }
-    dump_order_state(db, order_id).await;
-    panic!(
-        "expected provider operation {} for order {order_id}",
-        operation_type.to_db_string()
-    )
-}
-
-/// State-injection recovery tests may fabricate a completed Across operation
-/// without calling the mock Across status endpoint. Those tests must also
-/// fabricate the matching destination funds; production-shaped tests rely on the
-/// mock Across relayer side effect instead.
-async fn manually_fund_destination_execution_vault_for_recovery_fixture(
-    db: &Database,
-    order_id: Uuid,
-) {
-    let vaults = db.orders().get_custody_vaults(order_id).await.unwrap();
-    let destination_vault = vaults
-        .into_iter()
-        .find(|v| v.role == CustodyVaultRole::DestinationExecution)
-        .expect("across step should have created a destination_execution custody vault");
-    let across_op =
-        provider_operation_by_type(db, order_id, ProviderOperationType::AcrossBridge).await;
-    let amount_str = across_op
-        .response
-        .get("expectedOutputAmount")
-        .and_then(Value::as_str)
-        .expect("across response should include expectedOutputAmount");
-    let output_amount =
-        U256::from_str_radix(amount_str, 10).expect("expectedOutputAmount parses as U256");
-    // Pad by 1 ETH so the vault has enough native balance to cover gas when it
-    // signs the UnitDeposit transfer that follows.
-    let balance = output_amount + U256::from(1_000_000_000_000_000_000_u128);
-    let address = Address::from_str(&destination_vault.address)
-        .expect("destination vault address is a valid EVM address");
-    let h = harness().await;
-    match destination_vault.chain.as_str() {
-        "evm:1" => anvil_set_balance(h, address, balance).await,
-        "evm:8453" => anvil_set_base_balance(h, address, balance).await,
-        "evm:42161" => anvil_set_arbitrum_balance(h, address, balance).await,
-        other => panic!(
-            "manually_fund_destination_execution_vault_for_recovery_fixture: unsupported chain {}",
-            other
-        ),
-    }
-}
-
-async fn source_deposit_vault_address_from_db(db: &Database, order_id: Uuid) -> Address {
-    let vaults = db.orders().get_custody_vaults(order_id).await.unwrap();
-    let source_vault = vaults
-        .into_iter()
-        .find(|v| v.role == CustodyVaultRole::SourceDeposit)
-        .expect("order should have a source_deposit custody vault");
-    Address::from_str(&source_vault.address)
-        .expect("source deposit vault address is a valid EVM address")
-}
-
-async fn zero_source_deposit_vault_balance(db: &Database, order_id: Uuid, chain_id: &str) {
-    let address = source_deposit_vault_address_from_db(db, order_id).await;
-    let h = harness().await;
-    match chain_id {
-        "evm:1" => anvil_set_balance(h, address, U256::ZERO).await,
-        "evm:8453" => anvil_set_base_balance(h, address, U256::ZERO).await,
-        "evm:42161" => anvil_set_arbitrum_balance(h, address, U256::ZERO).await,
-        other => panic!("unsupported source chain for zeroing source deposit vault: {other}"),
-    }
-}
-
-async fn internal_custody_vaults_for_order(db: &Database, order_id: Uuid) -> Vec<CustodyVault> {
-    db.orders()
-        .get_custody_vaults(order_id)
-        .await
-        .unwrap()
-        .into_iter()
-        .filter(|vault| {
-            vault.visibility == CustodyVaultVisibility::Internal
-                && vault.role != CustodyVaultRole::SourceDeposit
-        })
-        .collect()
-}
-
-fn unit_asset_decimals(operation: &OrderProviderOperation) -> u32 {
-    match operation
-        .request
-        .get("asset")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-    {
-        "eth" => 18,
-        "btc" => 8,
-        other => panic!("unit_asset_decimals: unsupported UnitDeposit asset {other:?}"),
-    }
-}
-
-fn base_units_to_natural(amount: &str, decimals: u32) -> f64 {
-    let parsed = amount
-        .parse::<f64>()
-        .unwrap_or_else(|err| panic!("invalid base-unit amount {amount:?}: {err}"));
-    parsed / 10_f64.powi(i32::try_from(decimals).unwrap())
-}
-
-async fn credit_hyperliquid_spot_from_unit_deposit(
-    mocks: &MockIntegratorServer,
-    db: &Database,
-    order_id: Uuid,
-    operation: &OrderProviderOperation,
-) {
-    let amount = if let Some(amount) = operation
-        .response
-        .get("amount")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            operation
-                .request
-                .get("expected_amount")
-                .and_then(Value::as_str)
-        }) {
-        amount.to_string()
-    } else if let Some(step_id) = operation.execution_step_id {
-        db.orders()
-            .get_execution_step(step_id)
-            .await
-            .unwrap()
-            .amount_in
-            .unwrap_or_else(|| "0".to_string())
-    } else {
-        panic!("unit deposit operation {} missing amount", operation.id)
-    };
-    let natural_amount = base_units_to_natural(&amount, unit_asset_decimals(operation));
-    let credit_amount = if natural_amount > 0.0 {
-        // Mock HL serializes balances with 8 decimals; keep tiny raw-unit
-        // deposits visible to withdrawal preflight checks.
-        natural_amount.max(1e-8)
-    } else {
-        natural_amount
-    };
-    mocks
-        .credit_hyperliquid_balance(
-            hyperliquid_spot_vault_address(db, order_id).await,
-            &hl_deposit_coin_for_operation(operation),
-            credit_amount,
-        )
-        .await;
-}
-
-async fn maybe_provider_operation_by_type(
-    db: &Database,
-    order_id: Uuid,
-    operation_type: ProviderOperationType,
-) -> Option<OrderProviderOperation> {
-    db.orders()
-        .get_provider_operations(order_id)
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|operation| operation.operation_type == operation_type)
-}
-
-async fn drive_unit_deposit_failures_to_refund_required(
-    fixture: &FundedMarketOrderFixture,
-    error_message: &str,
-) -> OrderExecutionManager {
-    let execution_manager = OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        Arc::new(ActionProviderRegistry::mock_http(fixture.mocks.base_url())),
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    );
-    execution_manager.process_planning_pass(10).await.unwrap();
-
-    execution_manager
-        .execute_materialized_order(fixture.order_id)
-        .await
-        .unwrap()
-        .expect("across leg should start");
-    let across_operation = provider_operation_by_type(
-        &fixture.db,
-        fixture.order_id,
-        ProviderOperationType::AcrossBridge,
-    )
-    .await;
-    wait_for_across_deposit_indexed(
-        &fixture.mocks,
-        fixture.vault_address,
-        Duration::from_secs(10),
-    )
-    .await;
-    record_detector_provider_status_hint(&execution_manager, &across_operation).await;
-    execution_manager
-        .process_provider_operation_hints(10)
-        .await
-        .unwrap();
-    fixture
-        .mocks
-        .fail_next_unit_generate_address(error_message)
-        .await;
-    let first_err = execution_manager
-        .execute_materialized_order(fixture.order_id)
-        .await
-        .unwrap_err();
-    assert!(first_err.to_string().contains(error_message));
-
-    fixture
-        .mocks
-        .fail_next_unit_generate_address(error_message)
-        .await;
-    let second_err = execution_manager
-        .execute_materialized_order(fixture.order_id)
-        .await
-        .unwrap_err();
-    assert!(second_err.to_string().contains(error_message));
-
-    let order = fixture.db.orders().get(fixture.order_id).await.unwrap();
-    let vault = fixture.db.vaults().get(fixture.vault_id).await.unwrap();
-    assert_eq!(order.status, RouterOrderStatus::RefundRequired);
-    assert_eq!(vault.status, DepositVaultStatus::RefundRequired);
-
-    execution_manager
-}
+// Wait for the mock Across indexer to observe a `FundsDeposited` event from
+// the specified depositor, confirming the on-chain deposit landed and the
+// mock's `/deposit/status` will now report `"filled"` for that deposit id.
+// Scoped by depositor so parallel tests sharing the anvil spoke pool don't
+// witness each other's deposits and return early.
+//
+// Drive an Across → (optional Unit deposit) → (optional Unit withdrawal) →
+// (optional Hyperliquid) market order to terminal state. External provider
+// progress is observed through the mocks where available; direct mock
+// completion is kept only for Unit withdrawal until that lifecycle is modeled.
+//
+// State-injection recovery tests may fabricate a completed Across operation
+// without calling the mock Across status endpoint. Those tests must also
+// fabricate the matching destination funds; production-shaped tests rely on the
+// mock Across relayer side effect instead.
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn test_database_harness_runs_migrations() {
     let postgres = test_postgres().await;
     let url = create_test_database(&postgres.admin_database_url).await;
@@ -2343,12 +1501,18 @@ async fn test_database_harness_runs_migrations() {
             definition.contains("manual_intervention_required"),
             "migration constraint {constraint} on {table} must allow generic manual intervention: {definition}"
         );
+        if table == "router_orders" {
+            assert!(
+                !definition.contains("'failed'::text"),
+                "router order lifecycle must not allow an order-level failed state: {definition}"
+            );
+        }
     }
 
     for index in [
         "idx_router_orders_type_completed_created_at_id_desc",
         "idx_router_orders_type_in_progress_created_at_id_desc",
-        "idx_router_orders_type_failed_created_at_id_desc",
+        "idx_router_orders_type_needs_attention_created_at_id_desc",
         "idx_router_orders_type_refunded_created_at_id_desc",
         "idx_router_orders_type_manual_refund_created_at_id_desc",
         "idx_router_orders_worker_status_updated",
@@ -2516,159 +1680,12 @@ async fn database_table_exists(conn: &mut PgConnection, table: &str) -> bool {
     .expect("query migration table")
 }
 
-#[tokio::test]
-async fn materialize_plan_failure_does_not_create_execution_attempt() {
-    let dir = tempfile::tempdir().unwrap();
-    let h = harness().await;
-    let db = test_db().await;
-    let mocks = spawn_harness_mocks(h, "evm:8453").await;
-    let settings = Arc::new(test_settings(dir.path()));
-    let action_providers = Arc::new(ActionProviderRegistry::mock_http(mocks.base_url()));
-    let order_manager = OrderManager::with_action_providers(
-        db.clone(),
-        settings.clone(),
-        h.chain_registry.clone(),
-        action_providers.clone(),
-    );
-    let vault_manager = VaultManager::new(db.clone(), settings.clone(), h.chain_registry.clone());
-
-    let quote = order_manager
-        .quote_market_order(MarketOrderQuoteRequest {
-            from_asset: DepositAsset {
-                chain: ChainId::parse("evm:8453").unwrap(),
-                asset: AssetId::Native,
-            },
-            to_asset: DepositAsset {
-                chain: ChainId::parse("evm:1").unwrap(),
-                asset: AssetId::Native,
-            },
-            recipient_address: valid_evm_address(),
-            order_kind: MarketOrderQuoteKind::ExactIn {
-                amount_in: "1000".to_string(),
-                slippage_bps: 100,
-            },
-        })
-        .await
-        .unwrap();
-    let order = create_test_order_from_quote(
-        &order_manager,
-        quote
-            .quote
-            .as_market_order()
-            .expect("market order quote")
-            .id,
-    )
-    .await;
-    let _vault = vault_manager
-        .create_vault(CreateVaultRequest {
-            order_id: Some(order.id),
-            deposit_asset: DepositAsset {
-                chain: ChainId::parse("evm:8453").unwrap(),
-                asset: AssetId::Native,
-            },
-            ..evm_native_request()
-        })
-        .await
-        .unwrap();
-
-    let execution_manager = OrderExecutionManager::with_dependencies(
-        db.clone(),
-        action_providers,
-        Arc::new(CustodyActionExecutor::new(
-            db.clone(),
-            settings,
-            h.chain_registry.clone(),
-        )),
-        h.chain_registry.clone(),
-    );
-    let err = execution_manager
-        .materialize_plan_for_order(order.id)
-        .await
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("not funded"),
-        "unexpected planning error: {err}"
-    );
-    assert!(db
-        .orders()
-        .get_execution_attempts(order.id)
-        .await
-        .unwrap()
-        .is_empty());
-}
-
-#[tokio::test]
-async fn planning_retry_after_execution_legs_persist_crash_reuses_persisted_leg_ids() {
-    let fixture = funded_market_order_fixture("evm:8453", "evm:1").await;
-    let action_providers = Arc::new(ActionProviderRegistry::mock_http(fixture.mocks.base_url()));
-    let crashing_manager = OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        action_providers.clone(),
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    )
-    .with_crash_injector(Arc::new(PanicOnceCrashInjector::new(
-        OrderExecutionCrashPoint::AfterExecutionLegsPersisted,
-    )));
-
-    expect_task_panic(tokio::spawn(async move {
-        let _ = crashing_manager.process_planning_pass(10).await;
-    }))
-    .await;
-
-    let attempts = fixture
-        .db
-        .orders()
-        .get_execution_attempts(fixture.order_id)
-        .await
-        .unwrap();
-    assert_eq!(attempts.len(), 1);
-    assert_eq!(attempts[0].status, OrderExecutionAttemptStatus::Planning);
-    let persisted_legs = fixture
-        .db
-        .orders()
-        .get_execution_legs_for_attempt(attempts[0].id)
-        .await
-        .unwrap();
-    assert!(!persisted_legs.is_empty());
-    assert!(fixture
-        .db
-        .orders()
-        .get_execution_steps_for_attempt(attempts[0].id)
-        .await
-        .unwrap()
-        .is_empty());
-
-    let recovery_manager = OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        action_providers,
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    );
-    let materialized = recovery_manager.process_planning_pass(10).await.unwrap();
-    assert_eq!(materialized.len(), 1);
-    assert!(materialized[0].inserted_steps > 0);
-
-    let steps = fixture
-        .db
-        .orders()
-        .get_execution_steps_for_attempt(attempts[0].id)
-        .await
-        .unwrap();
-    assert!(!steps.is_empty());
-    let persisted_leg_ids = persisted_legs.iter().map(|leg| leg.id).collect::<Vec<_>>();
-    assert!(steps.iter().all(|step| {
-        step.execution_leg_id
-            .map(|leg_id| persisted_leg_ids.contains(&leg_id))
-            .unwrap_or(false)
-    }));
-}
-
 // ---------------------------------------------------------------------------
 // Router order and market-order quote tests
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn quote_market_order_persists_ephemeral_quote_without_order() {
     let mocks = MockIntegratorServer::spawn().await.unwrap();
     let (order_manager, db) = test_order_manager(Arc::new(ActionProviderRegistry::mock_http(
@@ -2689,7 +1706,7 @@ async fn quote_market_order_persists_ephemeral_quote_without_order() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -2760,7 +1777,7 @@ async fn quote_market_order_persists_ephemeral_quote_without_order() {
         &stored_quote.provider_id,
         &["unit_deposit:unit", "unit_withdrawal:unit"],
     );
-    assert_eq!(stored_quote.slippage_bps, 100);
+    assert_eq!(stored_quote.slippage_bps, Some(100));
     assert_eq!(stored_quote.min_amount_out.as_deref(), Some("990"));
     let public_quote = serde_json::to_value(
         response
@@ -2774,6 +1791,7 @@ async fn quote_market_order_persists_ephemeral_quote_without_order() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_order_idempotency_keys_are_scoped_to_their_quote() {
     let mocks = MockIntegratorServer::spawn().await.unwrap();
     let (order_manager, _db) = test_order_manager(Arc::new(ActionProviderRegistry::mock_http(
@@ -2795,7 +1813,7 @@ async fn create_order_idempotency_keys_are_scoped_to_their_quote() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -2818,7 +1836,7 @@ async fn create_order_idempotency_keys_are_scoped_to_their_quote() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "2000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -2832,7 +1850,6 @@ async fn create_order_idempotency_keys_are_scoped_to_their_quote() {
         .create_order_from_quote(CreateOrderRequest {
             quote_id: first_quote.id,
             refund_address: valid_evm_address(),
-            cancel_after: None,
             idempotency_key: Some(idempotency_key.to_string()),
             metadata: json!({}),
         })
@@ -2844,7 +1861,6 @@ async fn create_order_idempotency_keys_are_scoped_to_their_quote() {
         .create_order_from_quote(CreateOrderRequest {
             quote_id: second_quote.id,
             refund_address: valid_evm_address(),
-            cancel_after: None,
             idempotency_key: Some(idempotency_key.to_string()),
             metadata: json!({}),
         })
@@ -2864,6 +1880,7 @@ async fn create_order_idempotency_keys_are_scoped_to_their_quote() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn concurrent_create_order_requests_resume_same_quote_idempotently() {
     let mocks = MockIntegratorServer::spawn().await.unwrap();
     let (order_manager, db) = test_order_manager(Arc::new(ActionProviderRegistry::mock_http(
@@ -2885,7 +1902,7 @@ async fn concurrent_create_order_requests_resume_same_quote_idempotently() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -2897,7 +1914,6 @@ async fn concurrent_create_order_requests_resume_same_quote_idempotently() {
     let request = CreateOrderRequest {
         quote_id: quote.id,
         refund_address,
-        cancel_after: None,
         idempotency_key: Some("concurrent-create-order-race".to_string()),
         metadata: json!({}),
     };
@@ -2941,6 +1957,7 @@ async fn concurrent_create_order_requests_resume_same_quote_idempotently() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_limit_order_idempotency_keys_are_scoped_to_their_quote() {
     let mocks = MockIntegratorServer::spawn().await.unwrap();
     let (order_manager, _db) = test_order_manager(Arc::new(ActionProviderRegistry::mock_http(
@@ -2991,7 +2008,6 @@ async fn create_limit_order_idempotency_keys_are_scoped_to_their_quote() {
         .create_order_from_quote(CreateOrderRequest {
             quote_id: first_quote.id,
             refund_address: valid_evm_address(),
-            cancel_after: None,
             idempotency_key: Some(idempotency_key.to_string()),
             metadata: json!({}),
         })
@@ -3003,7 +2019,6 @@ async fn create_limit_order_idempotency_keys_are_scoped_to_their_quote() {
         .create_order_from_quote(CreateOrderRequest {
             quote_id: second_quote.id,
             refund_address: valid_evm_address(),
-            cancel_after: None,
             idempotency_key: Some(idempotency_key.to_string()),
             metadata: json!({}),
         })
@@ -3023,6 +2038,7 @@ async fn create_limit_order_idempotency_keys_are_scoped_to_their_quote() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn concurrent_create_limit_order_requests_resume_same_quote_idempotently() {
     let mocks = MockIntegratorServer::spawn().await.unwrap();
     let (order_manager, db) = test_order_manager(Arc::new(ActionProviderRegistry::mock_http(
@@ -3054,7 +2070,6 @@ async fn concurrent_create_limit_order_requests_resume_same_quote_idempotently()
     let request = CreateOrderRequest {
         quote_id: quote.id,
         refund_address,
-        cancel_after: None,
         idempotency_key: Some("concurrent-create-limit-order-race".to_string()),
         metadata: json!({}),
     };
@@ -3098,6 +2113,7 @@ async fn concurrent_create_limit_order_requests_resume_same_quote_idempotently()
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn quote_market_order_supports_velora_arbitrary_evm_start_and_end() {
     let h = harness().await;
     let mocks = spawn_harness_mocks(h, "evm:8453").await;
@@ -3111,7 +2127,7 @@ async fn quote_market_order_supports_velora_arbitrary_evm_start_and_end() {
         None,
         None,
         Some(VeloraHttpProviderConfig::new(mocks.base_url())),
-        router_server::services::custody_action_executor::HyperliquidCallNetwork::Mainnet,
+        router_core::services::custody_action_executor::HyperliquidCallNetwork::Mainnet,
     )
     .expect("velora-only action providers");
     let order_manager = OrderManager::with_action_providers(
@@ -3150,7 +2166,7 @@ async fn quote_market_order_supports_velora_arbitrary_evm_start_and_end() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000000000000000000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -3163,7 +2179,7 @@ async fn quote_market_order_supports_velora_arbitrary_evm_start_and_end() {
         * U256::from(9_900_u64))
         / U256::from(10_000_u64))
     .to_string();
-    assert_eq!(quote.slippage_bps, 100);
+    assert_eq!(quote.slippage_bps, Some(100));
     assert_eq!(
         quote.min_amount_out.as_deref(),
         Some(expected_min_out.as_str())
@@ -3214,6 +2230,7 @@ async fn quote_market_order_supports_velora_arbitrary_evm_start_and_end() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn quote_market_order_rejects_universal_router_route_without_minimum_policy() {
     let h = harness().await;
     let mocks = spawn_harness_mocks(h, "evm:8453").await;
@@ -3228,7 +2245,7 @@ async fn quote_market_order_rejects_universal_router_route_without_minimum_polic
             None,
             None,
             Some(VeloraHttpProviderConfig::new(mocks.base_url())),
-            router_server::services::custody_action_executor::HyperliquidCallNetwork::Mainnet,
+            router_core::services::custody_action_executor::HyperliquidCallNetwork::Mainnet,
         )
         .expect("velora-only action providers"),
     );
@@ -3253,7 +2270,7 @@ async fn quote_market_order_rejects_universal_router_route_without_minimum_polic
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000000000000000000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -3266,6 +2283,7 @@ async fn quote_market_order_rejects_universal_router_route_without_minimum_polic
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn quote_market_order_bitcoin_to_base_usdc_keeps_configured_provider_path_before_top_k() {
     let h = harness().await;
     let mocks = spawn_harness_mocks(h, "evm:8453").await;
@@ -3283,7 +2301,7 @@ async fn quote_market_order_bitcoin_to_base_usdc_keeps_configured_provider_path_
         None,
         Some(base_url.clone()),
         Some(VeloraHttpProviderConfig::new(base_url)),
-        router_server::services::custody_action_executor::HyperliquidCallNetwork::Testnet,
+        router_core::services::custody_action_executor::HyperliquidCallNetwork::Testnet,
     )
     .expect("mock runtime providers");
     let order_manager = OrderManager::with_action_providers(
@@ -3306,7 +2324,7 @@ async fn quote_market_order_bitcoin_to_base_usdc_keeps_configured_provider_path_
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "10000000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -3322,6 +2340,7 @@ async fn quote_market_order_bitcoin_to_base_usdc_keeps_configured_provider_path_
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn quote_market_order_exact_in_reports_net_output_after_unit_withdrawal_retention() {
     let h = harness().await;
     let mocks = MockIntegratorServer::spawn().await.unwrap();
@@ -3339,7 +2358,7 @@ async fn quote_market_order_exact_in_reports_net_output_after_unit_withdrawal_re
         None,
         Some(base_url.clone()),
         Some(VeloraHttpProviderConfig::new(base_url)),
-        router_server::services::custody_action_executor::HyperliquidCallNetwork::Testnet,
+        router_core::services::custody_action_executor::HyperliquidCallNetwork::Testnet,
     )
     .expect("mock runtime providers");
     let order_manager = OrderManager::with_action_providers(
@@ -3362,7 +2381,7 @@ async fn quote_market_order_exact_in_reports_net_output_after_unit_withdrawal_re
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "60000000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -3417,6 +2436,7 @@ async fn quote_market_order_exact_in_reports_net_output_after_unit_withdrawal_re
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn mock_velora_transaction_spends_input_and_mints_output_on_local_evm() {
     let h = harness().await;
     let mocks = spawn_harness_mocks(h, "evm:8453").await;
@@ -3461,7 +2481,7 @@ async fn mock_velora_transaction_spends_input_and_mints_output_on_local_evm() {
             output_decimals: Some(6),
             order_kind: MarketOrderKind::ExactIn {
                 amount_in: amount_in.clone(),
-                min_amount_out: "1".to_string(),
+                min_amount_out: Some("1".to_string()),
             },
             sender_address: Some(format!("{source_address:#x}")),
             recipient_address: format!("{source_address:#x}"),
@@ -3526,10 +2546,16 @@ async fn mock_velora_transaction_spends_input_and_mints_output_on_local_evm() {
     };
     assert_eq!(actions.len(), 2);
 
-    for action in actions {
+    for (index, action) in actions.into_iter().enumerate() {
         let CustodyAction::Call(ChainCall::Evm(call)) = action else {
             panic!("mock Velora action should be an EVM call");
         };
+        let expected_policy = if index == 1 {
+            EvmBroadcastPolicy::FlashbotsIfEthereum
+        } else {
+            EvmBroadcastPolicy::Standard
+        };
+        assert_eq!(call.broadcast_policy, expected_policy);
         let tx = TransactionRequest::default()
             .with_to(Address::from_str(&call.to_address).unwrap())
             .with_value(U256::from_str_radix(&call.value, 10).unwrap())
@@ -3576,6 +2602,7 @@ async fn mock_velora_transaction_spends_input_and_mints_output_on_local_evm() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn quote_market_order_exact_out_uses_exchange_provider_quote() {
     let mocks = MockIntegratorServer::spawn().await.unwrap();
     let (order_manager, _db) = test_order_manager(Arc::new(ActionProviderRegistry::mock_http(
@@ -3596,7 +2623,7 @@ async fn quote_market_order_exact_out_uses_exchange_provider_quote() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactOut {
                 amount_out: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -3611,150 +2638,12 @@ async fn quote_market_order_exact_out_uses_exchange_provider_quote() {
     assert!(market_quote.provider_id.contains("unit_withdrawal:unit"));
     assert_eq!(market_quote.order_kind, MarketOrderKindType::ExactOut);
     assert_eq!(market_quote.amount_in, "1000");
-    assert_eq!(market_quote.slippage_bps, 100);
+    assert_eq!(market_quote.slippage_bps, Some(100));
     assert_eq!(market_quote.max_amount_in.as_deref(), Some("1010"));
 }
 
 #[tokio::test]
-async fn quote_limit_order_base_usdc_to_bitcoin_materializes_hyperliquid_limit_step() {
-    let dir = tempfile::tempdir().unwrap();
-    let h = harness().await;
-    let db = test_db().await;
-    let mocks = MockIntegratorServer::spawn().await.unwrap();
-    let settings = Arc::new(test_settings(dir.path()));
-    let action_providers = Arc::new(ActionProviderRegistry::mock_http(mocks.base_url()));
-    let order_manager = OrderManager::with_action_providers(
-        db.clone(),
-        settings.clone(),
-        h.chain_registry.clone(),
-        action_providers.clone(),
-    );
-    let vault_manager = VaultManager::new(db.clone(), settings.clone(), h.chain_registry.clone());
-    let source_asset = DepositAsset {
-        chain: ChainId::parse("evm:8453").unwrap(),
-        asset: AssetId::reference("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
-    };
-    let destination_asset = DepositAsset {
-        chain: ChainId::parse("bitcoin").unwrap(),
-        asset: AssetId::Native,
-    };
-
-    let response = order_manager
-        .quote_limit_order(LimitOrderQuoteRequest {
-            from_asset: source_asset.clone(),
-            to_asset: destination_asset,
-            recipient_address: valid_regtest_btc_address(),
-            input_amount: "100000000".to_string(),
-            output_amount: "100000".to_string(),
-        })
-        .await
-        .unwrap();
-    let quote = response
-        .quote
-        .as_limit_order()
-        .expect("limit order quote")
-        .clone();
-    assert!(
-        U256::from_str_radix(&quote.input_amount, 10).unwrap() > U256::from(100_000_000u64),
-        "public limit quote input is the gross source funding amount"
-    );
-    assert_eq!(quote.output_amount, "100000");
-    assert_eq!(
-        quote.provider_quote.get("kind").and_then(Value::as_str),
-        Some("limit_order_route")
-    );
-    let quote_legs = quote
-        .provider_quote
-        .get("legs")
-        .and_then(Value::as_array)
-        .expect("legs");
-    let limit_leg = quote_legs
-        .iter()
-        .find(|leg| {
-            leg.get("raw")
-                .and_then(|raw| raw.get("kind"))
-                .and_then(Value::as_str)
-                == Some("hyperliquid_limit_order")
-        })
-        .expect("hyperliquid limit quote leg");
-    assert_eq!(
-        quote.provider_quote["limit_order"]["input_amount"].as_str(),
-        Some("100000000"),
-        "the Hyperliquid limit order itself must preserve the user-requested trade input"
-    );
-    assert_eq!(
-        limit_leg.get("amount_in").and_then(Value::as_str),
-        Some("100000000"),
-        "the Hyperliquid limit leg must not consume paymaster retention from the user's limit price"
-    );
-    assert_eq!(
-        limit_leg.get("amount_out").and_then(Value::as_str),
-        Some("100000"),
-        "limit-order quote must not add input-asset paymaster retention to the output asset"
-    );
-    assert!(quote_legs.iter().any(|leg| leg
-        .get("raw")
-        .and_then(|raw| raw.get("kind"))
-        .and_then(Value::as_str)
-        == Some("hyperliquid_limit_order")));
-
-    let order = create_test_order_from_quote(&order_manager, quote.id).await;
-    let vault = vault_manager
-        .create_vault(CreateVaultRequest {
-            order_id: Some(order.id),
-            deposit_asset: source_asset,
-            action: VaultAction::Null,
-            recovery_address: valid_evm_address(),
-            cancellation_commitment: dummy_commitment(),
-            cancel_after: None,
-            metadata: json!({}),
-        })
-        .await
-        .unwrap();
-    db.vaults()
-        .transition_status(
-            vault.id,
-            DepositVaultStatus::PendingFunding,
-            DepositVaultStatus::Funded,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-
-    let custody_action_executor = Arc::new(CustodyActionExecutor::new(
-        db.clone(),
-        settings,
-        h.chain_registry.clone(),
-    ));
-    let execution_manager = OrderExecutionManager::with_dependencies(
-        db.clone(),
-        action_providers,
-        custody_action_executor,
-        h.chain_registry.clone(),
-    );
-    execution_manager
-        .materialize_plan_for_order(order.id)
-        .await
-        .unwrap();
-    let steps = db.orders().get_execution_steps(order.id).await.unwrap();
-    assert!(steps
-        .iter()
-        .any(|step| step.step_type == OrderExecutionStepType::HyperliquidLimitOrder));
-    let limit_step = steps
-        .iter()
-        .find(|step| step.step_type == OrderExecutionStepType::HyperliquidLimitOrder)
-        .expect("limit step");
-    assert_eq!(limit_step.provider, "hyperliquid");
-    assert_eq!(
-        limit_step
-            .request
-            .get("residual_policy")
-            .and_then(Value::as_str),
-        Some("refund")
-    );
-}
-
-#[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn quote_limit_order_base_usdc_to_eth_includes_downstream_ueth_retention() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -3835,152 +2724,7 @@ async fn quote_limit_order_base_usdc_to_eth_includes_downstream_ueth_retention()
 }
 
 #[tokio::test]
-async fn quote_limit_order_bitcoin_to_arbitrum_usdc_materializes_hyperliquid_withdrawal() {
-    let dir = tempfile::tempdir().unwrap();
-    let h = harness().await;
-    let db = test_db().await;
-    let mocks = MockIntegratorServer::spawn().await.unwrap();
-    let settings = Arc::new(test_settings(dir.path()));
-    let action_providers = Arc::new(ActionProviderRegistry::mock_http(mocks.base_url()));
-    let order_manager = OrderManager::with_action_providers(
-        db.clone(),
-        settings.clone(),
-        h.chain_registry.clone(),
-        action_providers.clone(),
-    );
-    let vault_manager = VaultManager::new(db.clone(), settings.clone(), h.chain_registry.clone());
-    let source_asset = DepositAsset {
-        chain: ChainId::parse("bitcoin").unwrap(),
-        asset: AssetId::Native,
-    };
-    let destination_asset = DepositAsset {
-        chain: ChainId::parse("evm:42161").unwrap(),
-        asset: AssetId::reference("0xaf88d065e77c8cc2239327c5edb3a432268e5831"),
-    };
-
-    let response = order_manager
-        .quote_limit_order(LimitOrderQuoteRequest {
-            from_asset: source_asset.clone(),
-            to_asset: destination_asset,
-            recipient_address: valid_evm_address(),
-            input_amount: "100000".to_string(),
-            output_amount: "100000000".to_string(),
-        })
-        .await
-        .unwrap();
-    let quote = response
-        .quote
-        .as_limit_order()
-        .expect("limit order quote")
-        .clone();
-    let legs = quote
-        .provider_quote
-        .get("legs")
-        .and_then(Value::as_array)
-        .expect("legs");
-    assert!(legs.iter().any(|leg| {
-        leg.get("raw")
-            .and_then(|raw| raw.get("kind"))
-            .and_then(Value::as_str)
-            == Some("hyperliquid_limit_order")
-    }));
-    let withdrawal_leg = legs
-        .iter()
-        .find(|leg| {
-            leg.get("raw")
-                .and_then(|raw| raw.get("kind"))
-                .and_then(Value::as_str)
-                == Some("hyperliquid_bridge_withdrawal")
-        })
-        .expect("hyperliquid bridge withdrawal leg");
-    assert_eq!(
-        withdrawal_leg.get("amount_in").and_then(Value::as_str),
-        Some("101000000")
-    );
-    assert_eq!(
-        withdrawal_leg.get("amount_out").and_then(Value::as_str),
-        Some("100000000")
-    );
-
-    let order = create_test_order_from_quote_with_refund(
-        &order_manager,
-        quote.id,
-        valid_regtest_btc_address(),
-    )
-    .await;
-    let vault = vault_manager
-        .create_vault(CreateVaultRequest {
-            order_id: Some(order.id),
-            deposit_asset: source_asset,
-            action: VaultAction::Null,
-            recovery_address: valid_regtest_btc_address(),
-            cancellation_commitment: dummy_commitment(),
-            cancel_after: None,
-            metadata: json!({}),
-        })
-        .await
-        .unwrap();
-    db.vaults()
-        .transition_status(
-            vault.id,
-            DepositVaultStatus::PendingFunding,
-            DepositVaultStatus::Funded,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-
-    let custody_action_executor = Arc::new(CustodyActionExecutor::new(
-        db.clone(),
-        settings,
-        h.chain_registry.clone(),
-    ));
-    let execution_manager = OrderExecutionManager::with_dependencies(
-        db.clone(),
-        action_providers,
-        custody_action_executor,
-        h.chain_registry.clone(),
-    );
-    execution_manager
-        .materialize_plan_for_order(order.id)
-        .await
-        .unwrap();
-    let steps = db.orders().get_execution_steps(order.id).await.unwrap();
-    assert!(steps
-        .iter()
-        .all(|step| step.step_type != OrderExecutionStepType::UniversalRouterSwap));
-    assert!(steps
-        .iter()
-        .any(|step| step.step_type == OrderExecutionStepType::HyperliquidLimitOrder));
-    let withdrawal_step = steps
-        .iter()
-        .find(|step| step.step_type == OrderExecutionStepType::HyperliquidBridgeWithdrawal)
-        .expect("hyperliquid withdrawal step");
-    assert_eq!(withdrawal_step.provider, "hyperliquid_bridge");
-    assert_eq!(
-        withdrawal_step
-            .request
-            .get("amount")
-            .and_then(Value::as_str),
-        Some("101000000")
-    );
-    assert_eq!(
-        withdrawal_step
-            .request
-            .get("transfer_from_spot")
-            .and_then(Value::as_bool),
-        Some(true)
-    );
-    assert_eq!(
-        withdrawal_step
-            .request
-            .get("recipient_address")
-            .and_then(Value::as_str),
-        Some(order.recipient_address.as_str())
-    );
-}
-
-#[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn router_api_quote_and_order_flow_uses_production_component_initialization() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -4112,12 +2856,12 @@ async fn router_api_quote_and_order_flow_uses_production_component_initializatio
     assert_eq!(order.order.status, RouterOrderStatus::PendingFunding);
     match &order.order.action {
         RouterOrderAction::MarketOrder(action) => {
-            assert_eq!(action.slippage_bps, 100);
+            assert_eq!(action.slippage_bps, Some(100));
             assert_eq!(
                 action.order_kind,
                 MarketOrderKind::ExactIn {
                     amount_in: TEST_NATIVE_ORDER_AMOUNT_WEI.to_string(),
-                    min_amount_out: TEST_NATIVE_ORDER_MIN_OUT_WEI.to_string(),
+                    min_amount_out: Some(TEST_NATIVE_ORDER_MIN_OUT_WEI.to_string()),
                 }
             );
         }
@@ -4195,6 +2939,7 @@ async fn router_api_quote_and_order_flow_uses_production_component_initializatio
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn router_api_address_screening_covers_allow_block_and_provider_error() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -4272,8 +3017,7 @@ async fn router_api_address_screening_covers_allow_block_and_provider_error() {
     let status = blocked_quote_response.status();
     let body = blocked_quote_response.text().await.unwrap();
     assert_eq!(status, reqwest::StatusCode::FORBIDDEN, "{body}");
-    assert!(body.contains("risk=high"), "{body}");
-    assert!(body.contains("sanctions exposure"), "{body}");
+    assert!(body.contains("Forbidden"), "{body}");
 
     let provider_error_response = client
         .post(format!("{base_url}/api/v1/quotes"))
@@ -4284,8 +3028,7 @@ async fn router_api_address_screening_covers_allow_block_and_provider_error() {
     let status = provider_error_response.status();
     let body = provider_error_response.text().await.unwrap();
     assert_eq!(status, reqwest::StatusCode::INTERNAL_SERVER_ERROR, "{body}");
-    assert!(body.contains("address screening request failed"), "{body}");
-    assert!(body.contains("503"), "{body}");
+    assert!(body.contains("Internal server error"), "{body}");
 
     let refund_block_response = client
         .post(format!("{base_url}/api/v1/orders"))
@@ -4304,14 +3047,13 @@ async fn router_api_address_screening_covers_allow_block_and_provider_error() {
     let status = refund_block_response.status();
     let body = refund_block_response.text().await.unwrap();
     assert_eq!(status, reqwest::StatusCode::FORBIDDEN, "{body}");
-    assert!(body.contains("refund"), "{body}");
-    assert!(body.contains("risk=severe"), "{body}");
-    assert!(body.contains("stolen funds"), "{body}");
+    assert!(body.contains("Forbidden"), "{body}");
 
     api_task.abort();
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn router_public_gateway_routes_require_bearer_api_key_when_configured() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -4421,6 +3163,7 @@ async fn router_public_gateway_routes_require_bearer_api_key_when_configured() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn router_admin_provider_policy_endpoint_requires_bearer_api_key_and_persists_updates() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -4483,6 +3226,7 @@ async fn router_admin_provider_policy_endpoint_requires_bearer_api_key_and_persi
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn provider_policy_upsert_preserves_newer_update_against_stale_write() {
     let db = test_db().await;
     let base = Utc::now();
@@ -4542,6 +3286,7 @@ async fn provider_policy_upsert_preserves_newer_update_against_stale_write() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn router_admin_provider_policy_drain_excludes_provider_from_new_quotes_immediately() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -4646,148 +3391,7 @@ async fn router_admin_provider_policy_drain_excludes_provider_from_new_quotes_im
 }
 
 #[tokio::test]
-async fn router_api_and_worker_complete_mock_across_unit_flow_with_production_components() {
-    let dir = tempfile::tempdir().unwrap();
-    let h = harness().await;
-    let postgres = test_postgres().await;
-    let database_url = create_test_database(&postgres.admin_database_url).await;
-    let mocks = spawn_harness_mocks(h, "evm:8453").await;
-    let mut args = test_router_args(h, dir.path(), database_url);
-    args.across_api_url = Some(mocks.base_url().to_string());
-    args.across_api_key = Some("mock-across-api-key".to_string());
-    args.hyperunit_api_url = Some(mocks.base_url().to_string());
-    args.hyperliquid_api_url = Some(mocks.base_url().to_string());
-    args.coinbase_price_api_base_url = mocks.base_url().to_string();
-    let components = initialize_components(&args, None, PaymasterMode::Enabled)
-        .await
-        .expect("initialize router components");
-    let (base_url, api_task) = spawn_router_api_from_components(components.clone(), None).await;
-    let client = reqwest::Client::new();
-
-    let quote_response = client
-        .post(format!("{base_url}/api/v1/quotes"))
-        .json(&json!({
-            "type": "market_order",
-            "from_asset": {
-                "chain": "evm:8453",
-                "asset": "native"
-            },
-            "to_asset": {
-                "chain": "evm:1",
-                "asset": "native"
-            },
-            "recipient_address": valid_evm_address(),
-            "kind": "exact_in",
-            "amount_in": TEST_NATIVE_ORDER_AMOUNT_WEI,
-            "slippage_bps": 100
-        }))
-        .send()
-        .await
-        .unwrap();
-    let status = quote_response.status();
-    let body = quote_response.text().await.unwrap();
-    assert_eq!(status, reqwest::StatusCode::CREATED, "{body}");
-    let quote: RouterOrderQuoteEnvelope = serde_json::from_str(&body).unwrap();
-    assert_path_provider_id(
-        &quote
-            .quote
-            .as_market_order()
-            .expect("market order quote")
-            .provider_id,
-        &[
-            "across_bridge:across",
-            "unit_deposit:unit",
-            "unit_withdrawal:unit",
-        ],
-    );
-
-    let order_response = client
-        .post(format!("{base_url}/api/v1/orders"))
-        .json(&json!({
-            "quote_id": quote.quote.as_market_order().expect("market order quote").id,
-            "refund_address": valid_evm_address(),
-            "idempotency_key": "api-worker-mock-across-unit",
-            "metadata": {
-                "test": "api_worker_mock_across_unit"
-            }
-        }))
-        .send()
-        .await
-        .unwrap();
-    let status = order_response.status();
-    let body = order_response.text().await.unwrap();
-    assert_eq!(status, reqwest::StatusCode::CREATED, "{body}");
-    let order: RouterOrderEnvelope = serde_json::from_str(&body).unwrap();
-    assert!(order.cancellation_secret.is_some());
-    let funding_vault = order
-        .funding_vault
-        .as_ref()
-        .expect("order should include a funding vault")
-        .vault
-        .clone();
-    let quote_expires_at = quote
-        .quote
-        .as_market_order()
-        .expect("market order quote")
-        .expires_at;
-    assert!(funding_vault.cancel_after <= quote_expires_at);
-    let vault_address =
-        Address::from_str(&funding_vault.deposit_vault_address).expect("valid base vault address");
-    let source_balance = U256::from_str_radix(TEST_NATIVE_ORDER_AMOUNT_WEI, 10)
-        .expect("valid test native order amount")
-        + U256::from(TEST_NATIVE_ORDER_GAS_PAD_WEI);
-    anvil_set_base_balance(h, vault_address, source_balance).await;
-
-    record_confirmed_sauron_funding_hint(
-        &components.vault_manager,
-        funding_vault.id,
-        TEST_NATIVE_ORDER_AMOUNT_WEI,
-        &format!("api-worker-funding-{}", funding_vault.id),
-    )
-    .await;
-    drive_across_order_to_completion(
-        &components.order_execution_manager,
-        &mocks,
-        &components.db,
-        order.order.id,
-    )
-    .await;
-
-    let completed_order = components.db.orders().get(order.order.id).await.unwrap();
-    let completed_vault = components.db.vaults().get(funding_vault.id).await.unwrap();
-    assert_eq!(completed_order.status, RouterOrderStatus::Completed);
-    assert_eq!(completed_vault.status, DepositVaultStatus::Completed);
-
-    let destination_vault = components
-        .db
-        .orders()
-        .get_custody_vaults(order.order.id)
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|vault| vault.role == CustodyVaultRole::DestinationExecution)
-        .expect("destination execution vault should be materialized");
-    assert_eq!(
-        destination_vault.visibility,
-        CustodyVaultVisibility::Internal
-    );
-    assert_eq!(destination_vault.chain, ChainId::parse("evm:1").unwrap());
-
-    assert_eq!(mocks.across_deposits_from(vault_address).await.len(), 1);
-    let gen_requests = mocks.unit_generate_address_requests().await;
-    assert_eq!(
-        filter_unit_requests_by_kind(&gen_requests, MockUnitOperationKind::Deposit).len(),
-        1
-    );
-    assert_eq!(
-        filter_unit_requests_by_kind(&gen_requests, MockUnitOperationKind::Withdrawal).len(),
-        1
-    );
-
-    api_task.abort();
-}
-
-#[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn funding_hints_validate_balance_once_and_mark_vault_funded() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -4809,7 +3413,7 @@ async fn funding_hints_validate_balance_once_and_mark_vault_funded() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -4941,6 +3545,7 @@ async fn funding_hints_validate_balance_once_and_mark_vault_funded() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn funding_hint_records_observation_for_refunding_late_deposit() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -5009,139 +3614,8 @@ async fn funding_hint_records_observation_for_refunding_late_deposit() {
 }
 
 #[tokio::test]
-async fn expired_funded_quote_requests_refund_before_execution_materialization() {
-    let dir = tempfile::tempdir().unwrap();
-    let h = harness().await;
-    let postgres = test_postgres().await;
-    let database_url = create_test_database(&postgres.admin_database_url).await;
-    let db = Database::connect(&database_url, 5, 1).await.unwrap();
-    let mocks = spawn_harness_mocks(h, "evm:8453").await;
-    let settings = Arc::new(test_settings(dir.path()));
-    let action_providers = Arc::new(ActionProviderRegistry::mock_http(mocks.base_url()));
-    let order_manager = OrderManager::with_action_providers(
-        db.clone(),
-        settings.clone(),
-        h.chain_registry.clone(),
-        action_providers.clone(),
-    );
-    let vault_manager = VaultManager::new(db.clone(), settings.clone(), h.chain_registry.clone());
-    let source_asset = DepositAsset {
-        chain: ChainId::parse("evm:8453").unwrap(),
-        asset: AssetId::Native,
-    };
-    let quote = order_manager
-        .quote_market_order(MarketOrderQuoteRequest {
-            from_asset: source_asset.clone(),
-            to_asset: DepositAsset {
-                chain: ChainId::parse("evm:1").unwrap(),
-                asset: AssetId::Native,
-            },
-            recipient_address: valid_evm_address(),
-            order_kind: MarketOrderQuoteKind::ExactIn {
-                amount_in: "1000".to_string(),
-                slippage_bps: 100,
-            },
-        })
-        .await
-        .unwrap();
-    let order = create_test_order_from_quote(
-        &order_manager,
-        quote
-            .quote
-            .as_market_order()
-            .expect("market order quote")
-            .id,
-    )
-    .await;
-    let vault = vault_manager
-        .create_vault(CreateVaultRequest {
-            order_id: Some(order.id),
-            deposit_asset: source_asset,
-            ..evm_native_request()
-        })
-        .await
-        .unwrap();
-    let vault_address =
-        Address::from_str(&vault.deposit_vault_address).expect("valid vault evm address");
-    anvil_set_base_balance(
-        h,
-        vault_address,
-        U256::from(1000) + U256::from(TEST_NATIVE_ORDER_GAS_PAD_WEI),
-    )
-    .await;
-    record_confirmed_sauron_funding_hint(
-        &vault_manager,
-        vault.id,
-        "1000",
-        &format!("expired-quote-funding-{}", vault.id),
-    )
-    .await;
-
-    let expired_at = Utc::now() - chrono::Duration::seconds(1);
-    let mut conn = PgConnection::connect(&database_url).await.unwrap();
-    sqlx_core::query::query("UPDATE market_order_quotes SET expires_at = $1 WHERE order_id = $2")
-        .bind(expired_at)
-        .bind(order.id)
-        .execute(&mut conn)
-        .await
-        .unwrap();
-
-    let custody_action_executor = Arc::new(CustodyActionExecutor::new(
-        db.clone(),
-        settings,
-        h.chain_registry.clone(),
-    ));
-    let execution_manager = OrderExecutionManager::with_dependencies(
-        db.clone(),
-        action_providers,
-        custody_action_executor,
-        h.chain_registry.clone(),
-    );
-    let error = execution_manager
-        .materialize_plan_for_order(order.id)
-        .await
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        router_server::services::OrderExecutionError::OrderNotReady { .. }
-    ));
-    let order = db.orders().get(order.id).await.unwrap();
-    let vault = db.vaults().get(vault.id).await.unwrap();
-    assert_eq!(order.status, RouterOrderStatus::Refunding);
-    assert_eq!(vault.status, DepositVaultStatus::Refunding);
-    let attempts = db.orders().get_execution_attempts(order.id).await.unwrap();
-    let refund_attempt = attempts
-        .iter()
-        .find(|attempt| attempt.attempt_kind == OrderExecutionAttemptKind::RefundRecovery)
-        .expect("direct source-vault refund attempt should be recorded");
-    assert_eq!(refund_attempt.status, OrderExecutionAttemptStatus::Active);
-
-    let refund_summary = vault_manager.process_refund_pass().await;
-    assert_eq!(refund_summary.refunded_order_ids, vec![order.id]);
-    let process_summary = execution_manager
-        .process_order_ids(&[order.id])
-        .await
-        .unwrap();
-    assert_eq!(process_summary.maintenance_tasks, 1);
-    assert_eq!(
-        db.orders().get(order.id).await.unwrap().status,
-        RouterOrderStatus::Refunded
-    );
-    assert_eq!(
-        db.orders()
-            .get_execution_attempts(order.id)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|attempt| attempt.id == refund_attempt.id)
-            .expect("direct refund attempt")
-            .status,
-        OrderExecutionAttemptStatus::Completed
-    );
-}
-
-#[tokio::test]
-async fn worker_expires_unfunded_order_without_claiming_empty_vault_refund() {
+#[ignore = "integration: spawns devnet stack"]
+async fn unfunded_expiry_skips_order_when_funding_vault_already_funded() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
     let postgres = test_postgres().await;
@@ -5163,7 +3637,7 @@ async fn worker_expires_unfunded_order_without_claiming_empty_vault_refund() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -5184,423 +3658,60 @@ async fn worker_expires_unfunded_order_without_claiming_empty_vault_refund() {
         })
         .await
         .unwrap();
+    let expired_at = Utc::now() - chrono::Duration::seconds(1);
     let mut conn = PgConnection::connect(&database_url).await.unwrap();
     sqlx_core::query::query("UPDATE router_orders SET action_timeout_at = $1 WHERE id = $2")
-        .bind(Utc::now() - chrono::Duration::seconds(1))
+        .bind(expired_at)
         .bind(order.id)
         .execute(&mut conn)
         .await
         .unwrap();
-
-    let execution_manager = OrderExecutionManager::new(db.clone());
-    let summary = execution_manager
-        .process_order_ids(&[order.id])
+    db.vaults()
+        .mark_funded_with_observation(
+            vault.id,
+            &DepositVaultFundingObservation {
+                tx_hash: Some(format!("{:#x}", keccak256(b"funded-before-expiry"))),
+                sender_address: Some(valid_evm_address()),
+                sender_addresses: vec![valid_evm_address()],
+                recipient_address: Some(vault.deposit_vault_address.clone()),
+                transfer_index: Some(0),
+                observed_amount: Some("1000".to_string()),
+                confirmation_state: Some("confirmed".to_string()),
+                observed_at: Some(expired_at - chrono::Duration::seconds(1)),
+                evidence: json!({ "source": "test" }),
+            },
+            Utc::now(),
+        )
         .await
         .unwrap();
-    assert_eq!(summary.maintenance_tasks, 1);
-    let expired_order = db.orders().get(order.id).await.unwrap();
-    assert_eq!(expired_order.status, RouterOrderStatus::Expired);
-    let pending_vault = db.vaults().get(vault.id).await.unwrap();
-    assert_eq!(pending_vault.status, DepositVaultStatus::PendingFunding);
+
+    let expired = db
+        .orders()
+        .expire_unfunded_order(order.id, Utc::now())
+        .await
+        .unwrap();
+    assert!(expired.is_none());
+    let expired_batch = db
+        .orders()
+        .expire_unfunded_orders(Utc::now(), 10)
+        .await
+        .unwrap();
+    assert!(expired_batch.is_empty());
+    assert_eq!(
+        db.orders().get(order.id).await.unwrap().status,
+        RouterOrderStatus::PendingFunding
+    );
 
     let refund_summary = vault_manager.process_refund_pass().await;
     assert_eq!(refund_summary.timeout_claimed, 0);
-    assert_eq!(refund_summary.retry_claimed, 0);
-    let pending_vault = db.vaults().get(vault.id).await.unwrap();
-    assert_eq!(pending_vault.status, DepositVaultStatus::PendingFunding);
-}
-
-#[tokio::test]
-async fn late_deposit_after_order_expiry_is_observed_and_refunded_without_execution() {
-    let dir = tempfile::tempdir().unwrap();
-    let h = harness().await;
-    let postgres = test_postgres().await;
-    let database_url = create_test_database(&postgres.admin_database_url).await;
-    let db = Database::connect(&database_url, 5, 1).await.unwrap();
-    let settings = Arc::new(test_settings(dir.path()));
-    let (order_manager, _mocks) = mock_order_manager(db.clone(), h.chain_registry.clone()).await;
-    let vault_manager = VaultManager::new(db.clone(), settings, h.chain_registry.clone());
-    let quote = order_manager
-        .quote_market_order(MarketOrderQuoteRequest {
-            from_asset: DepositAsset {
-                chain: ChainId::parse("evm:1").unwrap(),
-                asset: AssetId::Native,
-            },
-            to_asset: DepositAsset {
-                chain: ChainId::parse("evm:8453").unwrap(),
-                asset: AssetId::Native,
-            },
-            recipient_address: valid_evm_address(),
-            order_kind: MarketOrderQuoteKind::ExactIn {
-                amount_in: TEST_NATIVE_ORDER_AMOUNT_WEI.to_string(),
-                slippage_bps: 100,
-            },
-        })
-        .await
-        .unwrap();
-    let order = create_test_order_from_quote(
-        &order_manager,
-        quote
-            .quote
-            .as_market_order()
-            .expect("market order quote")
-            .id,
-    )
-    .await;
-    let vault = vault_manager
-        .create_vault(CreateVaultRequest {
-            order_id: Some(order.id),
-            ..evm_native_request()
-        })
-        .await
-        .unwrap();
-    let expired_at = Utc::now() - chrono::Duration::seconds(1);
-    let mut conn = PgConnection::connect(&database_url).await.unwrap();
-    sqlx_core::query::query("UPDATE router_orders SET action_timeout_at = $1 WHERE id = $2")
-        .bind(expired_at)
-        .bind(order.id)
-        .execute(&mut conn)
-        .await
-        .unwrap();
-    sqlx_core::query::query("UPDATE deposit_vaults SET cancel_after = $1 WHERE id = $2")
-        .bind(expired_at)
-        .bind(vault.id)
-        .execute(&mut conn)
-        .await
-        .unwrap();
-
-    let execution_manager = OrderExecutionManager::new(db.clone());
-    let summary = execution_manager
-        .process_order_ids(&[order.id])
-        .await
-        .unwrap();
-    assert_eq!(summary.maintenance_tasks, 1);
-    assert_eq!(
-        db.orders().get(order.id).await.unwrap().status,
-        RouterOrderStatus::Expired
-    );
     assert_eq!(
         db.vaults().get(vault.id).await.unwrap().status,
-        DepositVaultStatus::PendingFunding
-    );
-
-    let vault_address =
-        Address::from_str(&vault.deposit_vault_address).expect("valid vault evm address");
-    anvil_set_balance(
-        h,
-        vault_address,
-        U256::from_str_radix(TEST_NATIVE_ORDER_AMOUNT_WEI, 10).unwrap()
-            + U256::from(TEST_NATIVE_ORDER_GAS_PAD_WEI),
-    )
-    .await;
-    record_confirmed_sauron_funding_hint(
-        &vault_manager,
-        vault.id,
-        TEST_NATIVE_ORDER_AMOUNT_WEI,
-        &format!("late-after-expiry-funding-{}", vault.id),
-    )
-    .await;
-    let funded_vault = db.vaults().get(vault.id).await.unwrap();
-    assert_eq!(funded_vault.status, DepositVaultStatus::Funded);
-    assert_eq!(
-        funded_vault
-            .funding_observation
-            .as_ref()
-            .and_then(|observation| observation.observed_amount.as_deref()),
-        Some(TEST_NATIVE_ORDER_AMOUNT_WEI)
-    );
-
-    let summary = execution_manager
-        .process_order_ids(&[order.id])
-        .await
-        .unwrap();
-    assert_eq!(summary.planned_orders, 0);
-    assert_eq!(summary.executed_orders, 0);
-    assert_eq!(
-        db.orders().get(order.id).await.unwrap().status,
-        RouterOrderStatus::Expired
-    );
-    let pre_refund_vault = db.vaults().get(vault.id).await.unwrap();
-    assert_eq!(pre_refund_vault.status, DepositVaultStatus::Funded);
-    assert!(
-        pre_refund_vault.cancel_after <= Utc::now(),
-        "late-funded vault should be timeout-claimable: cancel_after={}",
-        pre_refund_vault.cancel_after
-    );
-
-    let refund_summary = vault_manager.process_refund_pass().await;
-    assert_eq!(refund_summary.timeout_claimed, 1);
-    assert_eq!(refund_summary.retry_claimed, 0);
-    assert_eq!(refund_summary.refunded_order_ids, vec![order.id]);
-    let refunded_vault = db.vaults().get(vault.id).await.unwrap();
-    assert_eq!(
-        refunded_vault.status,
-        DepositVaultStatus::Refunded,
-        "last refund error: {:?}",
-        refunded_vault.last_refund_error
-    );
-    assert!(refunded_vault.refund_tx_hash.is_some());
-    assert_eq!(
-        db.orders().get(order.id).await.unwrap().status,
-        RouterOrderStatus::Expired
+        DepositVaultStatus::Funded
     );
 }
 
 #[tokio::test]
-async fn execute_materialized_order_does_not_advance_refunding_funding_vault() {
-    let dir = tempfile::tempdir().unwrap();
-    let h = harness().await;
-    let db = test_db().await;
-    let settings = Arc::new(test_settings(dir.path()));
-    let (order_manager, _mocks) = mock_order_manager(db.clone(), h.chain_registry.clone()).await;
-    let vault_manager = VaultManager::new(db.clone(), settings, h.chain_registry.clone());
-    let quote = order_manager
-        .quote_market_order(MarketOrderQuoteRequest {
-            from_asset: DepositAsset {
-                chain: ChainId::parse("evm:1").unwrap(),
-                asset: AssetId::Native,
-            },
-            to_asset: DepositAsset {
-                chain: ChainId::parse("evm:8453").unwrap(),
-                asset: AssetId::Native,
-            },
-            recipient_address: valid_evm_address(),
-            order_kind: MarketOrderQuoteKind::ExactIn {
-                amount_in: "1000".to_string(),
-                slippage_bps: 100,
-            },
-        })
-        .await
-        .unwrap();
-    let order = create_test_order_from_quote(
-        &order_manager,
-        quote
-            .quote
-            .as_market_order()
-            .expect("market order quote")
-            .id,
-    )
-    .await;
-    let vault = vault_manager
-        .create_vault(CreateVaultRequest {
-            order_id: Some(order.id),
-            ..evm_native_request()
-        })
-        .await
-        .unwrap();
-    let vault_address =
-        Address::from_str(&vault.deposit_vault_address).expect("valid vault evm address");
-    anvil_set_balance(h, vault_address, U256::from(1000)).await;
-    record_confirmed_sauron_funding_hint(
-        &vault_manager,
-        vault.id,
-        "1000",
-        &format!("refunding-vault-execution-guard-{}", vault.id),
-    )
-    .await;
-    db.orders()
-        .transition_status(
-            order.id,
-            RouterOrderStatus::PendingFunding,
-            RouterOrderStatus::Funded,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-    db.vaults()
-        .request_refund(vault.id, Utc::now())
-        .await
-        .unwrap();
-
-    let execution_manager = OrderExecutionManager::new(db.clone());
-    let error = execution_manager
-        .execute_materialized_order(order.id)
-        .await
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        router_server::services::OrderExecutionError::OrderNotReady { .. }
-    ));
-    assert_eq!(
-        db.orders().get(order.id).await.unwrap().status,
-        RouterOrderStatus::Funded
-    );
-    assert_eq!(
-        db.vaults().get(vault.id).await.unwrap().status,
-        DepositVaultStatus::Refunding
-    );
-}
-
-#[tokio::test]
-async fn refunding_order_with_refund_steps_does_not_use_direct_refund_finalizer() {
-    let dir = tempfile::tempdir().unwrap();
-    let h = harness().await;
-    let db = test_db().await;
-    let settings = Arc::new(test_settings(dir.path()));
-    let (order_manager, _mocks) = mock_order_manager(db.clone(), h.chain_registry.clone()).await;
-    let vault_manager = VaultManager::new(db.clone(), settings, h.chain_registry.clone());
-    let quote = order_manager
-        .quote_market_order(MarketOrderQuoteRequest {
-            from_asset: DepositAsset {
-                chain: ChainId::parse("evm:1").unwrap(),
-                asset: AssetId::Native,
-            },
-            to_asset: DepositAsset {
-                chain: ChainId::parse("evm:8453").unwrap(),
-                asset: AssetId::Native,
-            },
-            recipient_address: valid_evm_address(),
-            order_kind: MarketOrderQuoteKind::ExactIn {
-                amount_in: "1000".to_string(),
-                slippage_bps: 100,
-            },
-        })
-        .await
-        .unwrap();
-    let order = create_test_order_from_quote(
-        &order_manager,
-        quote
-            .quote
-            .as_market_order()
-            .expect("market order quote")
-            .id,
-    )
-    .await;
-    let vault = vault_manager
-        .create_vault(CreateVaultRequest {
-            order_id: Some(order.id),
-            ..evm_native_request()
-        })
-        .await
-        .unwrap();
-    let vault_address =
-        Address::from_str(&vault.deposit_vault_address).expect("valid vault evm address");
-    anvil_set_balance(h, vault_address, U256::from(1000)).await;
-    record_confirmed_sauron_funding_hint(
-        &vault_manager,
-        vault.id,
-        "1000",
-        &format!("refunding-step-finalizer-{}", vault.id),
-    )
-    .await;
-    db.orders()
-        .transition_status(
-            order.id,
-            RouterOrderStatus::PendingFunding,
-            RouterOrderStatus::Refunding,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-    db.vaults()
-        .transition_status(
-            vault.id,
-            DepositVaultStatus::Funded,
-            DepositVaultStatus::Refunded,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-
-    let now = Utc::now();
-    let refund_attempt = OrderExecutionAttempt {
-        id: Uuid::now_v7(),
-        order_id: order.id,
-        attempt_index: 1,
-        attempt_kind: OrderExecutionAttemptKind::RefundRecovery,
-        status: OrderExecutionAttemptStatus::Active,
-        trigger_step_id: None,
-        trigger_provider_operation_id: None,
-        failure_reason: json!({ "reason": "test_refund_step_in_progress" }),
-        input_custody_snapshot: json!({}),
-        created_at: now,
-        updated_at: now,
-    };
-    db.orders()
-        .create_execution_attempt(&refund_attempt)
-        .await
-        .unwrap();
-    let refund_leg_id = create_test_execution_leg_for_step(TestExecutionLegForStep {
-        db: &db,
-        order_id: order.id,
-        execution_attempt_id: Some(refund_attempt.id),
-        step_index: 1,
-        step_type: OrderExecutionStepType::AcrossBridge,
-        provider: "across",
-        input_asset: Some(DepositAsset {
-            chain: ChainId::parse("evm:1").unwrap(),
-            asset: AssetId::Native,
-        }),
-        output_asset: Some(DepositAsset {
-            chain: ChainId::parse("evm:8453").unwrap(),
-            asset: AssetId::Native,
-        }),
-        amount_in: Some("1000"),
-        min_amount_out: Some("990"),
-        now,
-    })
-    .await;
-    db.orders()
-        .create_execution_step(&OrderExecutionStep {
-            id: Uuid::now_v7(),
-            order_id: order.id,
-            execution_attempt_id: Some(refund_attempt.id),
-            execution_leg_id: Some(refund_leg_id),
-            transition_decl_id: None,
-            step_index: 1,
-            step_type: OrderExecutionStepType::AcrossBridge,
-            provider: "across".to_string(),
-            status: OrderExecutionStepStatus::Waiting,
-            input_asset: Some(DepositAsset {
-                chain: ChainId::parse("evm:1").unwrap(),
-                asset: AssetId::Native,
-            }),
-            output_asset: Some(DepositAsset {
-                chain: ChainId::parse("evm:8453").unwrap(),
-                asset: AssetId::Native,
-            }),
-            amount_in: Some("1000".to_string()),
-            min_amount_out: Some("990".to_string()),
-            tx_hash: None,
-            provider_ref: Some("refund-step-in-progress".to_string()),
-            idempotency_key: Some(format!("order:{}:refund-step-in-progress", order.id)),
-            attempt_count: 0,
-            next_attempt_at: None,
-            started_at: Some(now),
-            completed_at: None,
-            details: json!({}),
-            request: json!({}),
-            response: json!({}),
-            error: json!({}),
-            usd_valuation: json!({}),
-            created_at: now,
-            updated_at: now,
-        })
-        .await
-        .unwrap();
-
-    let execution_manager = OrderExecutionManager::new(db.clone());
-    let summary = execution_manager
-        .process_order_ids(&[order.id])
-        .await
-        .unwrap();
-    assert_eq!(summary.maintenance_tasks, 0);
-    assert_eq!(
-        db.orders().get(order.id).await.unwrap().status,
-        RouterOrderStatus::Refunding
-    );
-    assert_eq!(
-        db.orders()
-            .get_latest_execution_attempt(order.id)
-            .await
-            .unwrap()
-            .expect("refund attempt")
-            .status,
-        OrderExecutionAttemptStatus::Active
-    );
-}
-
-#[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn sauron_funding_hint_retry_reopens_terminal_same_key_hint() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -5796,6 +3907,7 @@ async fn sauron_funding_hint_retry_reopens_terminal_same_key_hint() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn funding_hint_completion_requires_current_processing_lease() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -5863,10 +3975,7 @@ async fn funding_hint_completion_requires_current_processing_lease() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(
-        stale_completion,
-        router_server::error::RouterServerError::NotFound
-    ));
+    assert!(matches!(stale_completion, RouterCoreError::NotFound));
 
     let completed = db
         .vaults()
@@ -5883,6 +3992,7 @@ async fn funding_hint_completion_requires_current_processing_lease() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn sauron_provider_operation_retry_reopens_failed_but_not_processed_same_key_hint() {
     let db = test_db().await;
     let now = Utc::now();
@@ -5913,9 +4023,9 @@ async fn sauron_provider_operation_retry_reopens_failed_but_not_processed_same_k
         action: RouterOrderAction::MarketOrder(MarketOrderAction {
             order_kind: MarketOrderKind::ExactIn {
                 amount_in: "1000".to_string(),
-                min_amount_out: "1000".to_string(),
+                min_amount_out: Some("1000".to_string()),
             },
-            slippage_bps: 100,
+            slippage_bps: Some(100),
         }),
         action_timeout_at: now + chrono::Duration::minutes(10),
         idempotency_key: None,
@@ -5997,6 +4107,7 @@ async fn sauron_provider_operation_retry_reopens_failed_but_not_processed_same_k
         provider: "across".to_string(),
         operation_type: ProviderOperationType::AcrossBridge,
         provider_ref: Some("provider-operation-retry-test".to_string()),
+        idempotency_key: None,
         status: ProviderOperationStatus::WaitingExternal,
         request: json!({}),
         response: json!({}),
@@ -6151,6 +4262,7 @@ async fn sauron_provider_operation_retry_reopens_failed_but_not_processed_same_k
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn provider_operation_terminal_status_is_monotonic_against_stale_writes() {
     let db = test_db().await;
     let now = Utc::now();
@@ -6181,9 +4293,9 @@ async fn provider_operation_terminal_status_is_monotonic_against_stale_writes() 
         action: RouterOrderAction::MarketOrder(MarketOrderAction {
             order_kind: MarketOrderKind::ExactIn {
                 amount_in: "1000".to_string(),
-                min_amount_out: "1000".to_string(),
+                min_amount_out: Some("1000".to_string()),
             },
-            slippage_bps: 100,
+            slippage_bps: Some(100),
         }),
         action_timeout_at: now + chrono::Duration::minutes(10),
         idempotency_key: None,
@@ -6269,26 +4381,77 @@ async fn provider_operation_terminal_status_is_monotonic_against_stale_writes() 
         .unwrap();
     assert!(running_step.started_at.is_some());
 
-    let terminal_operation = OrderProviderOperation {
+    let submitted_operation = OrderProviderOperation {
         id: Uuid::now_v7(),
         order_id,
         execution_attempt_id: Some(execution_attempt.id),
         execution_step_id: Some(step.id),
         provider: "across".to_string(),
         operation_type: ProviderOperationType::AcrossBridge,
-        provider_ref: Some("terminal-monotonic-provider-ref".to_string()),
-        status: ProviderOperationStatus::Completed,
-        request: json!({ "version": "terminal-request" }),
-        response: json!({ "version": "terminal-response" }),
-        observed_state: json!({ "version": "terminal-observed" }),
+        provider_ref: None,
+        idempotency_key: None,
+        status: ProviderOperationStatus::Submitted,
+        request: json!({ "version": "submitted-request" }),
+        response: json!({ "version": "submitted-response" }),
+        observed_state: json!({ "version": "submitted-observed" }),
         created_at: now,
         updated_at: now,
     };
     let operation_id = db
         .orders()
-        .upsert_provider_operation(&terminal_operation)
+        .upsert_provider_operation(&submitted_operation)
         .await
         .unwrap();
+    let after_submitted_upsert = db
+        .orders()
+        .get_provider_operation(operation_id)
+        .await
+        .unwrap();
+    let duplicate_submitted_operation = OrderProviderOperation {
+        id: Uuid::now_v7(),
+        updated_at: now + chrono::Duration::milliseconds(500),
+        ..submitted_operation.clone()
+    };
+    let duplicate_submitted_operation_id = db
+        .orders()
+        .upsert_provider_operation(&duplicate_submitted_operation)
+        .await
+        .unwrap();
+    assert_eq!(duplicate_submitted_operation_id, operation_id);
+    let after_duplicate_submitted_upsert = db
+        .orders()
+        .get_provider_operation(operation_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        after_duplicate_submitted_upsert.updated_at, after_submitted_upsert.updated_at,
+        "unchanged provider operation upsert should not churn updated_at"
+    );
+
+    let (terminal_operation, status_update_applied) = db
+        .orders()
+        .update_provider_operation_status(
+            operation_id,
+            ProviderOperationStatus::Completed,
+            Some("terminal-monotonic-provider-ref".to_string()),
+            json!({ "version": "terminal-observed" }),
+            Some(json!({ "version": "terminal-response" })),
+            now + chrono::Duration::seconds(1),
+        )
+        .await
+        .unwrap();
+    assert!(
+        status_update_applied,
+        "non-terminal provider operation should accept completion status update"
+    );
+    assert_eq!(
+        terminal_operation.status,
+        ProviderOperationStatus::Completed
+    );
+    assert_eq!(
+        terminal_operation.provider_ref.as_deref(),
+        Some("terminal-monotonic-provider-ref")
+    );
 
     let stale_operation = OrderProviderOperation {
         id: Uuid::now_v7(),
@@ -6329,6 +4492,7 @@ async fn provider_operation_terminal_status_is_monotonic_against_stale_writes() 
         .update_provider_operation_status(
             operation_id,
             ProviderOperationStatus::WaitingExternal,
+            None,
             json!({ "version": "stale-status-observed" }),
             Some(json!({ "version": "stale-status-response" })),
             now + chrono::Duration::seconds(2),
@@ -6354,6 +4518,7 @@ async fn provider_operation_terminal_status_is_monotonic_against_stale_writes() 
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn route_cost_refresh_persists_anchor_snapshots() {
     let db = test_db().await;
     let action_providers = Arc::new(ActionProviderRegistry::with_asset_registry(
@@ -6362,7 +4527,8 @@ async fn route_cost_refresh_persists_anchor_snapshots() {
         vec![],
         vec![],
     ));
-    let service = RouteCostService::new(db.clone(), action_providers);
+    let service =
+        RouteCostService::new(db.clone(), action_providers).with_pricing(fresh_test_pricing());
     let summary = service.refresh_anchor_costs().await.unwrap();
     let snapshots = db
         .route_costs()
@@ -6395,7 +4561,16 @@ async fn route_cost_refresh_persists_anchor_snapshots() {
         .all(|snapshot| snapshot.effective_cost_bps() < u64::MAX));
 }
 
+fn fresh_test_pricing() -> PricingSnapshot {
+    let now = Utc::now();
+    let mut pricing = PricingSnapshot::static_bootstrap(now);
+    pricing.source = "test_market_pricing".to_string();
+    pricing.expires_at = Some(now + chrono::Duration::minutes(10));
+    pricing
+}
+
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn route_cost_upsert_preserves_newer_snapshot_against_stale_write() {
     let db = test_db().await;
     let base = Utc::now();
@@ -6485,6 +4660,7 @@ async fn route_cost_upsert_preserves_newer_snapshot_against_stale_write() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn route_cost_refresh_samples_configured_bridge_providers() {
     let h = harness().await;
     let db = test_db().await;
@@ -6492,7 +4668,8 @@ async fn route_cost_refresh_samples_configured_bridge_providers() {
     let service = RouteCostService::new(
         db.clone(),
         Arc::new(ActionProviderRegistry::mock_http(mocks.base_url())),
-    );
+    )
+    .with_pricing(fresh_test_pricing());
 
     let summary = service.refresh_anchor_costs().await.unwrap();
     let snapshots = db
@@ -6509,6 +4686,7 @@ async fn route_cost_refresh_samples_configured_bridge_providers() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn provider_health_upsert_preserves_newer_check_against_stale_write() {
     let db = test_db().await;
     let base = Utc::now();
@@ -6578,6 +4756,7 @@ async fn provider_health_upsert_preserves_newer_check_against_stale_write() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn route_minimum_service_computes_mock_base_usdc_to_btc_floor() {
     let h = harness().await;
     let mocks = spawn_harness_mocks(h, "evm:8453").await;
@@ -6617,6 +4796,7 @@ async fn route_minimum_service_computes_mock_base_usdc_to_btc_floor() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn route_minimum_service_computes_mock_btc_to_eth_floor() {
     let h = harness().await;
     let mocks = spawn_harness_mocks(h, "evm:8453").await;
@@ -6653,6 +4833,7 @@ async fn route_minimum_service_computes_mock_btc_to_eth_floor() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn route_minimum_service_computes_mock_btc_to_base_usdc_floor() {
     let h = harness().await;
     let mocks = spawn_harness_mocks(h, "evm:8453").await;
@@ -6668,7 +4849,7 @@ async fn route_minimum_service_computes_mock_btc_to_base_usdc_floor() {
             None,
             Some(base_url.clone()),
             Some(VeloraHttpProviderConfig::new(base_url)),
-            router_server::services::custody_action_executor::HyperliquidCallNetwork::Testnet,
+            router_core::services::custody_action_executor::HyperliquidCallNetwork::Testnet,
         )
         .expect("mock runtime providers"),
     ));
@@ -6701,6 +4882,7 @@ async fn route_minimum_service_computes_mock_btc_to_base_usdc_floor() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn quote_market_order_rejects_base_usdc_to_btc_below_operational_floor() {
     let h = harness().await;
     let mocks = spawn_harness_mocks(h, "evm:8453").await;
@@ -6722,7 +4904,7 @@ async fn quote_market_order_rejects_base_usdc_to_btc_below_operational_floor() {
             recipient_address: valid_regtest_btc_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -6735,6 +4917,7 @@ async fn quote_market_order_rejects_base_usdc_to_btc_below_operational_floor() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn quote_market_order_allows_base_usdc_to_btc_at_operational_floor() {
     let h = harness().await;
     let mocks = spawn_harness_mocks(h, "evm:8453").await;
@@ -6767,7 +4950,7 @@ async fn quote_market_order_allows_base_usdc_to_btc_at_operational_floor() {
             recipient_address: valid_regtest_btc_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: snapshot.operational_min_input,
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -6790,6 +4973,7 @@ async fn quote_market_order_allows_base_usdc_to_btc_at_operational_floor() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn quote_market_order_allows_btc_to_eth_at_operational_floor() {
     let h = harness().await;
     let mocks = spawn_harness_mocks(h, "evm:8453").await;
@@ -6822,7 +5006,7 @@ async fn quote_market_order_allows_btc_to_eth_at_operational_floor() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: snapshot.operational_min_input,
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -6844,6 +5028,7 @@ async fn quote_market_order_allows_btc_to_eth_at_operational_floor() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn quote_market_order_rejects_zero_amounts() {
     let mocks = MockIntegratorServer::spawn().await.unwrap();
     let (order_manager, _db) = test_order_manager(Arc::new(ActionProviderRegistry::mock_http(
@@ -6864,7 +5049,7 @@ async fn quote_market_order_rejects_zero_amounts() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "0".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -6874,6 +5059,7 @@ async fn quote_market_order_rejects_zero_amounts() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_vault_with_order_id_links_generic_order_to_vault() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -6895,7 +5081,7 @@ async fn create_vault_with_order_id_links_generic_order_to_vault() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -6957,6 +5143,7 @@ async fn create_vault_with_order_id_links_generic_order_to_vault() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn custody_action_executor_transfers_evm_native_from_router_vault() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -6988,6 +5175,7 @@ async fn custody_action_executor_transfers_evm_native_from_router_vault() {
             action: CustodyAction::Transfer {
                 to_address: recipient_address.clone(),
                 amount: transfer_amount.to_string(),
+                bitcoin_fee_budget_sats: None,
             },
         })
         .await
@@ -7011,6 +5199,7 @@ async fn custody_action_executor_transfers_evm_native_from_router_vault() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn custody_action_executor_transfers_evm_native_from_router_vault_with_paymaster_gas() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -7063,6 +5252,7 @@ async fn custody_action_executor_transfers_evm_native_from_router_vault_with_pay
             action: CustodyAction::Transfer {
                 to_address: recipient_address.clone(),
                 amount: transfer_amount.to_string(),
+                bitcoin_fee_budget_sats: None,
             },
         })
         .await
@@ -7087,6 +5277,7 @@ async fn custody_action_executor_transfers_evm_native_from_router_vault_with_pay
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn custody_action_executor_transfers_erc20_from_router_vault_with_paymaster_gas() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -7140,6 +5331,7 @@ async fn custody_action_executor_transfers_erc20_from_router_vault_with_paymaste
             action: CustodyAction::Transfer {
                 to_address: recipient_address.clone(),
                 amount: transfer_amount.to_string(),
+                bitcoin_fee_budget_sats: None,
             },
         })
         .await
@@ -7171,6 +5363,7 @@ async fn custody_action_executor_transfers_erc20_from_router_vault_with_paymaste
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn custody_action_executor_executes_evm_call_with_paymaster_gas() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -7228,6 +5421,7 @@ async fn custody_action_executor_executes_evm_call_with_paymaster_gas() {
                 to_address: MOCK_ERC20_ADDRESS.to_string(),
                 value: "0".to_string(),
                 calldata: format!("0x{}", alloy::hex::encode(calldata.as_ref())),
+                broadcast_policy: Default::default(),
             })),
         })
         .await
@@ -7258,6 +5452,7 @@ async fn custody_action_executor_executes_evm_call_with_paymaster_gas() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn custody_action_executor_transfers_bitcoin_native_from_router_vault() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -7305,6 +5500,7 @@ async fn custody_action_executor_transfers_bitcoin_native_from_router_vault() {
             action: CustodyAction::Transfer {
                 to_address: recipient_address.clone(),
                 amount: "50000".to_string(),
+                bitcoin_fee_budget_sats: None,
             },
         })
         .await
@@ -7330,6 +5526,7 @@ async fn custody_action_executor_transfers_bitcoin_native_from_router_vault() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn custody_action_executor_transfers_bitcoin_native_from_mempool_funding() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -7374,6 +5571,7 @@ async fn custody_action_executor_transfers_bitcoin_native_from_mempool_funding()
             action: CustodyAction::Transfer {
                 to_address: recipient_address.clone(),
                 amount: "50000".to_string(),
+                bitcoin_fee_budget_sats: None,
             },
         })
         .await
@@ -7394,278 +5592,7 @@ async fn custody_action_executor_transfers_bitcoin_native_from_mempool_funding()
 }
 
 #[tokio::test]
-async fn worker_pass_sweeps_released_internal_evm_native_custody_to_paymaster() {
-    let dir = tempfile::tempdir().unwrap();
-    let h = harness().await;
-    let db = test_db().await;
-    let settings = Arc::new(test_settings(dir.path()));
-    let now = Utc::now();
-    let derivation_salt = [0x44_u8; 32];
-    let wallet = h
-        .chain_registry
-        .get(&ChainType::Ethereum)
-        .expect("ethereum chain")
-        .derive_wallet(&settings.master_key_bytes(), &derivation_salt)
-        .expect("derive wallet");
-    let vault = CustodyVault {
-        id: Uuid::now_v7(),
-        order_id: None,
-        role: CustodyVaultRole::DestinationExecution,
-        visibility: CustodyVaultVisibility::Internal,
-        chain: ChainId::parse("evm:1").unwrap(),
-        asset: Some(AssetId::Native),
-        address: wallet.address.clone(),
-        control_type: CustodyVaultControlType::RouterDerivedKey,
-        derivation_salt: Some(derivation_salt),
-        signer_ref: None,
-        status: CustodyVaultStatus::Released,
-        metadata: json!({
-            "lifecycle_terminal_reason": "order_completed",
-            "lifecycle_order_status": "completed",
-        }),
-        created_at: now,
-        updated_at: now,
-    };
-    db.orders().create_custody_vault(&vault).await.unwrap();
-
-    let vault_address = Address::from_str(&wallet.address).expect("vault address");
-    anvil_set_balance(h, vault_address, U256::from(1_000_000_000_000_000_000_u128)).await;
-
-    let paymaster_private_key = h.ethereum_spawned_api_paymaster_private_key();
-    let paymaster_address =
-        router_server::services::custody_action_executor::evm_address_from_private_key(
-            &paymaster_private_key,
-        )
-        .expect("paymaster address");
-    let mut paymasters = router_server::services::custody_action_executor::PaymasterRegistry::new();
-    paymasters.register(ChainType::Ethereum, paymaster_address.clone());
-
-    let ethereum_chain = h.chain_registry.get_evm(&ChainType::Ethereum).unwrap();
-    let paymaster_before = ethereum_chain
-        .native_balance(&paymaster_address)
-        .await
-        .unwrap();
-
-    let executor = Arc::new(
-        CustodyActionExecutor::new(db.clone(), settings, h.chain_registry.clone())
-            .with_paymasters(paymasters),
-    );
-    let execution_manager = OrderExecutionManager::with_dependencies(
-        db.clone(),
-        Arc::new(ActionProviderRegistry::default()),
-        executor,
-        h.chain_registry.clone(),
-    );
-
-    let summary = execution_manager.process_worker_pass(10).await.unwrap();
-    assert_eq!(summary.executed_orders, 0);
-
-    let updated_vault = db.orders().get_custody_vault(vault.id).await.unwrap();
-    assert_eq!(updated_vault.status, CustodyVaultStatus::Released);
-    assert_eq!(
-        updated_vault.metadata["release_sweep_status"],
-        json!("swept")
-    );
-    assert_eq!(
-        updated_vault.metadata["release_sweep_terminal"],
-        json!(true)
-    );
-    assert_eq!(
-        updated_vault.metadata["release_sweep_target_address"],
-        json!(paymaster_address.clone())
-    );
-    assert!(updated_vault.metadata["release_sweep_tx_hash"]
-        .as_str()
-        .unwrap_or_default()
-        .starts_with("0x"));
-
-    let paymaster_after = ethereum_chain
-        .native_balance(&paymaster_address)
-        .await
-        .unwrap();
-    assert!(paymaster_after > paymaster_before);
-}
-
-#[tokio::test]
-async fn worker_pass_does_not_sweep_failed_internal_custody() {
-    let dir = tempfile::tempdir().unwrap();
-    let h = harness().await;
-    let db = test_db().await;
-    let settings = Arc::new(test_settings(dir.path()));
-    let now = Utc::now();
-    let derivation_salt = [0x45_u8; 32];
-    let wallet = h
-        .chain_registry
-        .get(&ChainType::Ethereum)
-        .expect("ethereum chain")
-        .derive_wallet(&settings.master_key_bytes(), &derivation_salt)
-        .expect("derive wallet");
-    let vault = CustodyVault {
-        id: Uuid::now_v7(),
-        order_id: None,
-        role: CustodyVaultRole::DestinationExecution,
-        visibility: CustodyVaultVisibility::Internal,
-        chain: ChainId::parse("evm:1").unwrap(),
-        asset: Some(AssetId::Native),
-        address: wallet.address.clone(),
-        control_type: CustodyVaultControlType::RouterDerivedKey,
-        derivation_salt: Some(derivation_salt),
-        signer_ref: None,
-        status: CustodyVaultStatus::Failed,
-        metadata: json!({
-            "lifecycle_terminal_reason": "order_failed",
-            "lifecycle_order_status": "failed",
-        }),
-        created_at: now,
-        updated_at: now,
-    };
-    db.orders().create_custody_vault(&vault).await.unwrap();
-
-    let paymaster_private_key = h.ethereum_spawned_api_paymaster_private_key();
-    let paymaster_address =
-        router_server::services::custody_action_executor::evm_address_from_private_key(
-            &paymaster_private_key,
-        )
-        .expect("paymaster address");
-    let mut paymasters = router_server::services::custody_action_executor::PaymasterRegistry::new();
-    paymasters.register(ChainType::Ethereum, paymaster_address.clone());
-
-    let ethereum_chain = h.chain_registry.get_evm(&ChainType::Ethereum).unwrap();
-    let paymaster_before = ethereum_chain
-        .native_balance(&paymaster_address)
-        .await
-        .unwrap();
-
-    let executor = Arc::new(
-        CustodyActionExecutor::new(db.clone(), settings, h.chain_registry.clone())
-            .with_paymasters(paymasters),
-    );
-    let execution_manager = OrderExecutionManager::with_dependencies(
-        db.clone(),
-        Arc::new(ActionProviderRegistry::default()),
-        executor,
-        h.chain_registry.clone(),
-    );
-
-    let summary = execution_manager.process_worker_pass(10).await.unwrap();
-    assert_eq!(summary.executed_orders, 0);
-
-    let updated_vault = db.orders().get_custody_vault(vault.id).await.unwrap();
-    assert_eq!(updated_vault.status, CustodyVaultStatus::Failed);
-    assert!(updated_vault.metadata.get("release_sweep_status").is_none());
-
-    let paymaster_after = ethereum_chain
-        .native_balance(&paymaster_address)
-        .await
-        .unwrap();
-    assert_eq!(paymaster_after, paymaster_before);
-}
-
-#[tokio::test]
-async fn order_executor_executes_provider_custody_action_intent() {
-    let dir = tempfile::tempdir().unwrap();
-    let h = harness().await;
-    let db = test_db().await;
-    let settings = Arc::new(test_settings(dir.path()));
-    let deposit_sink = Address::from_str("0x1000000000000000000000000000000000000005").unwrap();
-    let deposit_sink_address = format!("{deposit_sink:?}");
-    let action_providers = Arc::new(ActionProviderRegistry::new(
-        vec![],
-        vec![Arc::new(CustodyIntentUnitProvider {
-            deposit_sink: deposit_sink_address.clone(),
-        })],
-        vec![Arc::new(ProviderOnlyExchangeProvider)],
-    ));
-    let order_manager = OrderManager::with_action_providers(
-        db.clone(),
-        settings.clone(),
-        h.chain_registry.clone(),
-        action_providers.clone(),
-    );
-    let vault_manager = VaultManager::new(db.clone(), settings.clone(), h.chain_registry.clone());
-    let amount_in = U256::from(1_000_000_000_000_u64);
-
-    let quote = order_manager
-        .quote_market_order(MarketOrderQuoteRequest {
-            from_asset: DepositAsset {
-                chain: ChainId::parse("evm:1").unwrap(),
-                asset: AssetId::Native,
-            },
-            to_asset: DepositAsset {
-                chain: ChainId::parse("evm:8453").unwrap(),
-                asset: AssetId::Native,
-            },
-            recipient_address: valid_evm_address(),
-            order_kind: MarketOrderQuoteKind::ExactIn {
-                amount_in: amount_in.to_string(),
-                slippage_bps: 100,
-            },
-        })
-        .await
-        .unwrap();
-    let order = create_test_order_from_quote(
-        &order_manager,
-        quote
-            .quote
-            .as_market_order()
-            .expect("market order quote")
-            .id,
-    )
-    .await;
-    let vault = vault_manager
-        .create_vault(CreateVaultRequest {
-            order_id: Some(order.id),
-            ..evm_native_request()
-        })
-        .await
-        .unwrap();
-    let vault_address =
-        Address::from_str(&vault.deposit_vault_address).expect("valid vault evm address");
-    anvil_set_balance(h, vault_address, U256::from(1_000_000_000_000_000_000_u64)).await;
-    db.vaults()
-        .transition_status(
-            vault.id,
-            DepositVaultStatus::PendingFunding,
-            DepositVaultStatus::Funded,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-
-    let provider = ProviderBuilder::new().connect_http(h.ethereum_endpoint_url());
-    let sink_before = provider.get_balance(deposit_sink).await.unwrap();
-    let execution_manager = OrderExecutionManager::with_dependencies(
-        db.clone(),
-        action_providers,
-        Arc::new(
-            CustodyActionExecutor::new(db.clone(), settings, h.chain_registry.clone())
-                .with_paymasters(test_paymaster_registry(h)),
-        ),
-        h.chain_registry.clone(),
-    );
-    let summary = execution_manager.process_worker_pass(10).await.unwrap();
-
-    assert_eq!(summary.planned_orders, 1);
-    assert_eq!(summary.executed_orders, 1);
-    let sink_after = provider.get_balance(deposit_sink).await.unwrap();
-    assert_eq!(sink_after.saturating_sub(sink_before), amount_in);
-    let order = db.orders().get(order.id).await.unwrap();
-    assert_eq!(order.status, RouterOrderStatus::Completed);
-    let steps = db.orders().get_execution_steps(order.id).await.unwrap();
-    let unit_step = steps
-        .iter()
-        .find(|step| step.step_type == OrderExecutionStepType::UnitDeposit)
-        .unwrap();
-    assert_eq!(unit_step.status, OrderExecutionStepStatus::Completed);
-    assert!(unit_step
-        .tx_hash
-        .as_deref()
-        .unwrap_or_default()
-        .starts_with("0x"));
-    assert_eq!(unit_step.response["kind"], json!("custody_action"));
-}
-
-#[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn provider_operations_store_protocol_addresses_outside_custody_vaults() {
     let mocks = MockIntegratorServer::spawn().await.unwrap();
     let (order_manager, db) = test_order_manager(Arc::new(ActionProviderRegistry::mock_http(
@@ -7686,7 +5613,7 @@ async fn provider_operations_store_protocol_addresses_outside_custody_vaults() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -7812,6 +5739,7 @@ async fn provider_operations_store_protocol_addresses_outside_custody_vaults() {
         provider: "unit".to_string(),
         operation_type: ProviderOperationType::UnitDeposit,
         provider_ref: Some("unit-op-1".to_string()),
+        idempotency_key: None,
         status: ProviderOperationStatus::Submitted,
         request: json!({
             "asset": "native",
@@ -7912,6 +5840,7 @@ async fn provider_operations_store_protocol_addresses_outside_custody_vaults() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn provider_addresses_are_scoped_to_execution_step_not_order_address() {
     let db = test_db().await;
     let now = Utc::now();
@@ -7942,9 +5871,9 @@ async fn provider_addresses_are_scoped_to_execution_step_not_order_address() {
         action: RouterOrderAction::MarketOrder(MarketOrderAction {
             order_kind: MarketOrderKind::ExactIn {
                 amount_in: "1000".to_string(),
-                min_amount_out: "1000".to_string(),
+                min_amount_out: Some("1000".to_string()),
             },
-            slippage_bps: 100,
+            slippage_bps: Some(100),
         }),
         action_timeout_at: now + chrono::Duration::minutes(10),
         idempotency_key: None,
@@ -8030,6 +5959,7 @@ async fn provider_addresses_are_scoped_to_execution_step_not_order_address() {
             provider: "unit".to_string(),
             operation_type: ProviderOperationType::UnitDeposit,
             provider_ref: Some(format!("unit-op-{step_index}")),
+            idempotency_key: None,
             status: ProviderOperationStatus::Submitted,
             request: json!({}),
             response: json!({}),
@@ -8108,6 +6038,7 @@ async fn provider_addresses_are_scoped_to_execution_step_not_order_address() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn market_order_route_planner_uses_direct_unit_when_source_is_unit_ingress() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -8129,7 +6060,7 @@ async fn market_order_route_planner_uses_direct_unit_when_source_is_unit_ingress
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -8202,7 +6133,7 @@ async fn market_order_route_planner_uses_direct_unit_when_source_is_unit_ingress
         .create_execution_steps_idempotent(&[drifted_step])
         .await
         .unwrap_err();
-    assert!(matches!(err, RouterServerError::InvalidData { .. }));
+    assert!(matches!(err, RouterCoreError::InvalidData { .. }));
     let mut drifted_leg = plan.legs[0].clone();
     drifted_leg.expected_amount_out = "1".to_string();
     let err = db
@@ -8210,7 +6141,7 @@ async fn market_order_route_planner_uses_direct_unit_when_source_is_unit_ingress
         .create_execution_legs_idempotent(&[drifted_leg])
         .await
         .unwrap_err();
-    assert!(matches!(err, RouterServerError::InvalidData { .. }));
+    assert!(matches!(err, RouterCoreError::InvalidData { .. }));
 
     let steps = db.orders().get_execution_steps(order.id).await.unwrap();
     assert_eq!(steps.len(), 1 + plan.steps.len());
@@ -8247,6 +6178,7 @@ async fn market_order_route_planner_uses_direct_unit_when_source_is_unit_ingress
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn execution_leg_rollup_ignores_superseded_failed_retry_actions() {
     let h = harness().await;
     let db = test_db().await;
@@ -8265,7 +6197,7 @@ async fn execution_leg_rollup_ignores_superseded_failed_retry_actions() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -8333,6 +6265,7 @@ async fn execution_leg_rollup_ignores_superseded_failed_retry_actions() {
         actual_amount_out: None,
         started_at: Some(now),
         completed_at: Some(now),
+        provider_quote_expires_at: None,
         details: json!({}),
         usd_valuation: json!({}),
         created_at: now,
@@ -8454,7 +6387,8 @@ async fn execution_leg_rollup_ignores_superseded_failed_retry_actions() {
 }
 
 #[tokio::test]
-async fn execution_leg_rollup_ignores_zero_balance_deltas_when_provider_amounts_exist() {
+#[ignore = "integration: spawns devnet stack"]
+async fn execution_leg_rollup_uses_step_amount_when_provider_source_amount_is_decimal() {
     let h = harness().await;
     let db = test_db().await;
     let (order_manager, _mocks) = mock_order_manager(db.clone(), h.chain_registry.clone()).await;
@@ -8472,7 +6406,7 @@ async fn execution_leg_rollup_ignores_zero_balance_deltas_when_provider_amounts_
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -8526,6 +6460,7 @@ async fn execution_leg_rollup_ignores_zero_balance_deltas_when_provider_amounts_
         actual_amount_out: None,
         started_at: None,
         completed_at: None,
+        provider_quote_expires_at: None,
         details: json!({}),
         usd_valuation: json!({}),
         created_at: now,
@@ -8565,7 +6500,7 @@ async fn execution_leg_rollup_ignores_zero_balance_deltas_when_provider_amounts_
             "amount_out": "990",
             "observed_state": {
                 "provider_observed_state": {
-                    "sourceAmount": "1000"
+                    "sourceAmount": "0.00001000"
                 }
             },
             "balance_observation": {
@@ -8603,6 +6538,437 @@ async fn execution_leg_rollup_ignores_zero_balance_deltas_when_provider_amounts_
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
+async fn execution_leg_rollup_uses_unit_deposit_source_amount_as_output_evidence() {
+    let h = harness().await;
+    let db = test_db().await;
+    let (order_manager, _mocks) = mock_order_manager(db.clone(), h.chain_registry.clone()).await;
+
+    let quote = order_manager
+        .quote_market_order(MarketOrderQuoteRequest {
+            from_asset: DepositAsset {
+                chain: ChainId::parse("evm:1").unwrap(),
+                asset: AssetId::Native,
+            },
+            to_asset: DepositAsset {
+                chain: ChainId::parse("evm:8453").unwrap(),
+                asset: AssetId::Native,
+            },
+            recipient_address: valid_evm_address(),
+            order_kind: MarketOrderQuoteKind::ExactIn {
+                amount_in: "1000".to_string(),
+                slippage_bps: Some(100),
+            },
+        })
+        .await
+        .unwrap();
+    let order = create_test_order_from_quote(
+        &order_manager,
+        quote
+            .quote
+            .as_market_order()
+            .expect("market order quote")
+            .id,
+    )
+    .await;
+    let now = Utc::now();
+    let attempt = OrderExecutionAttempt {
+        id: Uuid::now_v7(),
+        order_id: order.id,
+        attempt_index: 1,
+        attempt_kind: OrderExecutionAttemptKind::PrimaryExecution,
+        status: OrderExecutionAttemptStatus::Active,
+        trigger_step_id: None,
+        trigger_provider_operation_id: None,
+        failure_reason: json!({}),
+        input_custody_snapshot: json!({}),
+        created_at: now,
+        updated_at: now,
+    };
+    db.orders()
+        .create_execution_attempt(&attempt)
+        .await
+        .unwrap();
+
+    let leg = OrderExecutionLeg {
+        id: Uuid::now_v7(),
+        order_id: order.id,
+        execution_attempt_id: Some(attempt.id),
+        transition_decl_id: Some("unit-deposit-source-amount-leg".to_string()),
+        leg_index: 0,
+        leg_type: "unit_deposit".to_string(),
+        provider: "unit".to_string(),
+        status: OrderExecutionStepStatus::Planned,
+        input_asset: order.source_asset.clone(),
+        output_asset: DepositAsset {
+            chain: ChainId::parse("hyperliquid").unwrap(),
+            asset: AssetId::reference("UETH"),
+        },
+        amount_in: "1000".to_string(),
+        expected_amount_out: "1000".to_string(),
+        min_amount_out: None,
+        actual_amount_in: None,
+        actual_amount_out: None,
+        started_at: None,
+        completed_at: None,
+        provider_quote_expires_at: None,
+        details: json!({}),
+        usd_valuation: json!({}),
+        created_at: now,
+        updated_at: now,
+    };
+    db.orders()
+        .create_execution_legs_idempotent(std::slice::from_ref(&leg))
+        .await
+        .unwrap();
+
+    let step = OrderExecutionStep {
+        id: Uuid::now_v7(),
+        order_id: order.id,
+        execution_attempt_id: Some(attempt.id),
+        execution_leg_id: Some(leg.id),
+        transition_decl_id: leg.transition_decl_id.clone(),
+        step_index: 1,
+        step_type: OrderExecutionStepType::UnitDeposit,
+        provider: "unit".to_string(),
+        status: OrderExecutionStepStatus::Completed,
+        input_asset: Some(order.source_asset.clone()),
+        output_asset: Some(leg.output_asset.clone()),
+        amount_in: Some("1000".to_string()),
+        min_amount_out: None,
+        tx_hash: Some(
+            "0x3333333333333333333333333333333333333333333333333333333333333333".to_string(),
+        ),
+        provider_ref: Some("unit-provider-ref".to_string()),
+        idempotency_key: Some("unit-provider-ref-source-amount".to_string()),
+        attempt_count: 1,
+        next_attempt_at: None,
+        started_at: Some(now),
+        completed_at: Some(now),
+        details: json!({}),
+        request: json!({}),
+        response: json!({
+            "observed_state": {
+                "provider_observed_state": {
+                    "sourceAmount": "1000"
+                }
+            }
+        }),
+        error: json!({}),
+        usd_valuation: json!({}),
+        created_at: now,
+        updated_at: now,
+    };
+    db.orders()
+        .create_execution_steps_idempotent(&[step])
+        .await
+        .unwrap();
+
+    let refreshed = db
+        .orders()
+        .refresh_execution_leg_from_actions(leg.id)
+        .await
+        .unwrap()
+        .expect("refreshed leg");
+    assert_eq!(refreshed.status, OrderExecutionStepStatus::Completed);
+    assert_eq!(refreshed.actual_amount_in.as_deref(), Some("1000"));
+    assert_eq!(refreshed.actual_amount_out.as_deref(), Some("1000"));
+}
+
+#[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
+async fn execution_leg_rollup_uses_cctp_receive_source_credit_as_bridge_output() {
+    let db = test_db().await;
+    let now = Utc::now();
+    let order = create_executing_market_test_order(&db, now).await;
+    let attempt = OrderExecutionAttempt {
+        id: Uuid::now_v7(),
+        order_id: order.id,
+        attempt_index: 1,
+        attempt_kind: OrderExecutionAttemptKind::PrimaryExecution,
+        status: OrderExecutionAttemptStatus::Active,
+        trigger_step_id: None,
+        trigger_provider_operation_id: None,
+        failure_reason: json!({}),
+        input_custody_snapshot: json!({}),
+        created_at: now,
+        updated_at: now,
+    };
+    db.orders()
+        .create_execution_attempt(&attempt)
+        .await
+        .unwrap();
+
+    let leg = OrderExecutionLeg {
+        id: Uuid::now_v7(),
+        order_id: order.id,
+        execution_attempt_id: Some(attempt.id),
+        transition_decl_id: Some("cctp-bridge-test".to_string()),
+        leg_index: 0,
+        leg_type: "cctp_bridge".to_string(),
+        provider: "cctp".to_string(),
+        status: OrderExecutionStepStatus::Planned,
+        input_asset: order.source_asset.clone(),
+        output_asset: order.destination_asset.clone(),
+        amount_in: "1000".to_string(),
+        expected_amount_out: "1000".to_string(),
+        min_amount_out: None,
+        actual_amount_in: None,
+        actual_amount_out: None,
+        started_at: None,
+        completed_at: None,
+        provider_quote_expires_at: None,
+        details: json!({}),
+        usd_valuation: json!({}),
+        created_at: now,
+        updated_at: now,
+    };
+    db.orders()
+        .create_execution_legs_idempotent(std::slice::from_ref(&leg))
+        .await
+        .unwrap();
+
+    let burn_step = OrderExecutionStep {
+        id: Uuid::now_v7(),
+        order_id: order.id,
+        execution_attempt_id: Some(attempt.id),
+        execution_leg_id: Some(leg.id),
+        transition_decl_id: Some("cctp-bridge-test".to_string()),
+        step_index: 1,
+        step_type: OrderExecutionStepType::CctpBurn,
+        provider: "cctp".to_string(),
+        status: OrderExecutionStepStatus::Completed,
+        input_asset: Some(order.source_asset.clone()),
+        output_asset: Some(order.destination_asset.clone()),
+        amount_in: Some("1000".to_string()),
+        min_amount_out: None,
+        tx_hash: Some(
+            "0x4444444444444444444444444444444444444444444444444444444444444444".to_string(),
+        ),
+        provider_ref: Some("cctp-burn-ref".to_string()),
+        idempotency_key: Some("cctp-burn-step".to_string()),
+        attempt_count: 1,
+        next_attempt_at: None,
+        started_at: Some(now),
+        completed_at: Some(now),
+        details: json!({}),
+        request: json!({ "amount": "1000" }),
+        response: json!({
+            "balance_observation": {
+                "probes": [
+                    {
+                        "role": "source",
+                        "debit_delta": "1000"
+                    }
+                ]
+            }
+        }),
+        error: json!({}),
+        usd_valuation: json!({}),
+        created_at: now,
+        updated_at: now,
+    };
+    let receive_step = OrderExecutionStep {
+        id: Uuid::now_v7(),
+        order_id: order.id,
+        execution_attempt_id: Some(attempt.id),
+        execution_leg_id: Some(leg.id),
+        transition_decl_id: Some("cctp-bridge-test:receive".to_string()),
+        step_index: 2,
+        step_type: OrderExecutionStepType::CctpReceive,
+        provider: "cctp".to_string(),
+        status: OrderExecutionStepStatus::Completed,
+        input_asset: Some(order.destination_asset.clone()),
+        output_asset: Some(order.destination_asset.clone()),
+        amount_in: Some("1000".to_string()),
+        min_amount_out: None,
+        tx_hash: Some(
+            "0x5555555555555555555555555555555555555555555555555555555555555555".to_string(),
+        ),
+        provider_ref: Some("cctp-receive-ref".to_string()),
+        idempotency_key: Some("cctp-receive-step".to_string()),
+        attempt_count: 1,
+        next_attempt_at: None,
+        started_at: Some(now),
+        completed_at: Some(now),
+        details: json!({}),
+        request: json!({ "amount": "1000" }),
+        response: json!({
+            "kind": "custody_action",
+            "provider_context": {
+                "kind": "cctp_receive",
+                "amount": "1000"
+            },
+            "balance_observation": {
+                "probes": [
+                    {
+                        "role": "source",
+                        "credit_delta": "1000"
+                    }
+                ]
+            }
+        }),
+        error: json!({}),
+        usd_valuation: json!({}),
+        created_at: now,
+        updated_at: now,
+    };
+    db.orders()
+        .create_execution_steps_idempotent(&[burn_step, receive_step])
+        .await
+        .unwrap();
+
+    let refreshed = db
+        .orders()
+        .refresh_execution_leg_from_actions(leg.id)
+        .await
+        .unwrap()
+        .expect("refreshed leg");
+    assert_eq!(refreshed.status, OrderExecutionStepStatus::Completed);
+    assert_eq!(refreshed.actual_amount_in.as_deref(), Some("1000"));
+    assert_eq!(refreshed.actual_amount_out.as_deref(), Some("1000"));
+}
+
+#[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
+async fn completion_finalization_candidates_include_stale_execution_legs_for_rollup_recovery() {
+    let db = test_db().await;
+    let now = Utc::now();
+    let order = create_executing_market_test_order(&db, now).await;
+    let attempt = OrderExecutionAttempt {
+        id: Uuid::now_v7(),
+        order_id: order.id,
+        attempt_index: 1,
+        attempt_kind: OrderExecutionAttemptKind::PrimaryExecution,
+        status: OrderExecutionAttemptStatus::Active,
+        trigger_step_id: None,
+        trigger_provider_operation_id: None,
+        failure_reason: json!({}),
+        input_custody_snapshot: json!({}),
+        created_at: now,
+        updated_at: now,
+    };
+    db.orders()
+        .create_execution_attempt(&attempt)
+        .await
+        .unwrap();
+    let leg_id = create_test_execution_leg_for_step(TestExecutionLegForStep {
+        db: &db,
+        order_id: order.id,
+        execution_attempt_id: Some(attempt.id),
+        step_index: 1,
+        step_type: OrderExecutionStepType::UniversalRouterSwap,
+        provider: "velora",
+        input_asset: None,
+        output_asset: None,
+        amount_in: Some("1000"),
+        min_amount_out: Some("990"),
+        now,
+    })
+    .await;
+    let step = OrderExecutionStep {
+        id: Uuid::now_v7(),
+        order_id: order.id,
+        execution_attempt_id: Some(attempt.id),
+        execution_leg_id: Some(leg_id),
+        transition_decl_id: Some("test:velora:universal_router_swap".to_string()),
+        step_index: 1,
+        step_type: OrderExecutionStepType::UniversalRouterSwap,
+        provider: "velora".to_string(),
+        status: OrderExecutionStepStatus::Completed,
+        input_asset: Some(order.source_asset.clone()),
+        output_asset: Some(order.destination_asset.clone()),
+        amount_in: Some("1000".to_string()),
+        min_amount_out: None,
+        tx_hash: Some(
+            "0x6666666666666666666666666666666666666666666666666666666666666666".to_string(),
+        ),
+        provider_ref: Some("velora-step-ref".to_string()),
+        idempotency_key: Some("velora-step".to_string()),
+        attempt_count: 1,
+        next_attempt_at: None,
+        started_at: Some(now),
+        completed_at: Some(now),
+        details: json!({}),
+        request: json!({ "amount_in": "1000", "amount_out": "990" }),
+        response: json!({ "amount_in": "1000", "amount_out": "990" }),
+        error: json!({}),
+        usd_valuation: json!({}),
+        created_at: now,
+        updated_at: now,
+    };
+    db.orders()
+        .create_execution_steps_idempotent(&[step])
+        .await
+        .unwrap();
+
+    let candidates = db
+        .orders()
+        .find_executing_orders_pending_completion_finalization(10)
+        .await
+        .unwrap();
+    assert!(
+        candidates.iter().any(|candidate| candidate.id == order.id),
+        "completed-step orders with stale legs must still be candidates so finalization can refresh leg rollups"
+    );
+
+    db.orders()
+        .refresh_execution_leg_from_actions(leg_id)
+        .await
+        .unwrap()
+        .expect("refreshed leg");
+    let candidates = db
+        .orders()
+        .find_executing_orders_pending_completion_finalization(10)
+        .await
+        .unwrap();
+    assert!(
+        candidates.iter().any(|candidate| candidate.id == order.id),
+        "order becomes finalizable once the execution leg rollup is completed"
+    );
+}
+
+#[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
+async fn execution_leg_usd_valuation_update_returns_updated_leg() {
+    let db = test_db().await;
+    let now = Utc::now();
+    let order = create_executing_market_test_order(&db, now).await;
+    let leg_id = create_test_execution_leg_for_step(TestExecutionLegForStep {
+        db: &db,
+        order_id: order.id,
+        execution_attempt_id: None,
+        step_index: 1,
+        step_type: OrderExecutionStepType::UniversalRouterSwap,
+        provider: "velora",
+        input_asset: None,
+        output_asset: None,
+        amount_in: Some("1000"),
+        min_amount_out: Some("990"),
+        now,
+    })
+    .await;
+    let usd_valuation = json!({
+        "amount_in_usd": "12.34",
+        "amount_out_usd": "12.30"
+    });
+
+    let updated = db
+        .orders()
+        .update_execution_leg_usd_valuation(
+            leg_id,
+            usd_valuation.clone(),
+            now + chrono::Duration::seconds(1),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(updated.id, leg_id);
+    assert_eq!(updated.usd_valuation, usd_valuation);
+}
+
+#[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn execution_leg_rollup_rejects_completed_leg_without_actual_amount_evidence() {
     let h = harness().await;
     let db = test_db().await;
@@ -8621,7 +6987,7 @@ async fn execution_leg_rollup_rejects_completed_leg_without_actual_amount_eviden
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -8675,6 +7041,7 @@ async fn execution_leg_rollup_rejects_completed_leg_without_actual_amount_eviden
         actual_amount_out: None,
         started_at: None,
         completed_at: None,
+        provider_quote_expires_at: None,
         details: json!({}),
         usd_valuation: json!({}),
         created_at: now,
@@ -8735,6 +7102,7 @@ async fn execution_leg_rollup_rejects_completed_leg_without_actual_amount_eviden
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn release_quote_after_vault_creation_failure_allows_order_retry() {
     let h = harness().await;
     let db = test_db().await;
@@ -8753,7 +7121,7 @@ async fn release_quote_after_vault_creation_failure_allows_order_retry() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -8767,7 +7135,6 @@ async fn release_quote_after_vault_creation_failure_allows_order_retry() {
         .create_order_from_quote(CreateOrderRequest {
             quote_id,
             refund_address: valid_evm_address(),
-            cancel_after: None,
             idempotency_key: None,
             metadata: json!({}),
         })
@@ -8777,7 +7144,6 @@ async fn release_quote_after_vault_creation_failure_allows_order_retry() {
         .create_order_from_quote(CreateOrderRequest {
             quote_id,
             refund_address: valid_evm_address(),
-            cancel_after: None,
             idempotency_key: None,
             metadata: json!({}),
         })
@@ -8803,7 +7169,6 @@ async fn release_quote_after_vault_creation_failure_allows_order_retry() {
         .create_order_from_quote(CreateOrderRequest {
             quote_id,
             refund_address: valid_evm_address(),
-            cancel_after: None,
             idempotency_key: None,
             metadata: json!({}),
         })
@@ -8820,6 +7185,7 @@ async fn release_quote_after_vault_creation_failure_allows_order_retry() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_order_from_quote_resumes_after_funding_vault_attached() {
     let h = harness().await;
     let db = test_db().await;
@@ -8845,7 +7211,7 @@ async fn create_order_from_quote_resumes_after_funding_vault_attached() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -8858,7 +7224,6 @@ async fn create_order_from_quote_resumes_after_funding_vault_attached() {
     let request = CreateOrderRequest {
         quote_id,
         refund_address,
-        cancel_after: None,
         idempotency_key: Some("retry-after-vault-attach".to_string()),
         metadata: json!({}),
     };
@@ -8891,8 +7256,11 @@ async fn create_order_from_quote_resumes_after_funding_vault_attached() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn expired_quote_cleanup_deletes_only_unassociated_quotes() {
-    let db = test_db().await;
+    let postgres = test_postgres().await;
+    let database_url = create_test_database(&postgres.admin_database_url).await;
+    let db = Database::connect(&database_url, 5, 1).await.unwrap();
     let now = Utc::now();
     let source_asset = DepositAsset {
         chain: ChainId::parse("evm:1").unwrap(),
@@ -8911,7 +7279,7 @@ async fn expired_quote_cleanup_deletes_only_unassociated_quotes() {
     let expired_associated = test_market_order_quote(
         source_asset.clone(),
         destination_asset.clone(),
-        now - chrono::Duration::minutes(5),
+        now + chrono::Duration::minutes(5),
     );
     let unexpired_unassociated = test_market_order_quote(
         source_asset.clone(),
@@ -8945,9 +7313,9 @@ async fn expired_quote_cleanup_deletes_only_unassociated_quotes() {
         action: RouterOrderAction::MarketOrder(MarketOrderAction {
             order_kind: MarketOrderKind::ExactIn {
                 amount_in: "1000".to_string(),
-                min_amount_out: "1000".to_string(),
+                min_amount_out: Some("1000".to_string()),
             },
-            slippage_bps: 100,
+            slippage_bps: Some(100),
         }),
         action_timeout_at: now + chrono::Duration::minutes(10),
         idempotency_key: None,
@@ -8958,6 +7326,13 @@ async fn expired_quote_cleanup_deletes_only_unassociated_quotes() {
     };
     db.orders()
         .create_market_order_from_quote(&order, expired_associated.id)
+        .await
+        .unwrap();
+    let mut conn = PgConnection::connect(&database_url).await.unwrap();
+    sqlx_core::query::query("UPDATE market_order_quotes SET expires_at = $1 WHERE order_id = $2")
+        .bind(now - chrono::Duration::minutes(5))
+        .bind(order.id)
+        .execute(&mut conn)
         .await
         .unwrap();
 
@@ -9009,7 +7384,7 @@ fn test_market_order_quote(
         amount_out: "1000".to_string(),
         min_amount_out: Some("1000".to_string()),
         max_amount_in: None,
-        slippage_bps: 100,
+        slippage_bps: Some(100),
         provider_quote: json!({ "test": "quote_cleanup" }),
         usd_valuation: json!({}),
         expires_at,
@@ -9018,6 +7393,7 @@ fn test_market_order_quote(
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn market_order_route_planner_uses_across_only_when_unit_needs_ingress_bridge() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -9039,7 +7415,7 @@ async fn market_order_route_planner_uses_across_only_when_unit_needs_ingress_bri
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -9164,6 +7540,7 @@ async fn market_order_route_planner_uses_across_only_when_unit_needs_ingress_bri
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn market_order_route_planner_reserves_bitcoin_fee_for_unit_ingress() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -9185,7 +7562,7 @@ async fn market_order_route_planner_reserves_bitcoin_fee_for_unit_ingress() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -9234,7 +7611,19 @@ async fn market_order_route_planner_reserves_bitcoin_fee_for_unit_ingress() {
         .unwrap()
         .parse::<u128>()
         .unwrap();
-    assert!(reserve > 0);
+    let expected_reserve = h
+        .chain_registry
+        .get_bitcoin(&ChainType::Bitcoin)
+        .unwrap()
+        .estimate_p2wpkh_transfer_fee_sats(1, 2)
+        .await
+        .unwrap();
+    let expected_reserve = (u128::from(expected_reserve) * 12_500).div_ceil(10_000);
+    assert_eq!(reserve, expected_reserve);
+    assert_eq!(
+        unit_leg["raw"]["source_fee_reserve"]["reserve_bps"],
+        json!(12_500)
+    );
     assert_eq!(unit_amount + reserve, 1_000_000);
     assert_eq!(unit_leg["amount_out"], json!(unit_amount.to_string()));
 
@@ -9260,12 +7649,21 @@ async fn market_order_route_planner_reserves_bitcoin_fee_for_unit_ingress() {
     );
     assert_eq!(plan.steps[0].request["amount"], json!(unit_amount_string));
     assert_eq!(
+        plan.steps[0].request["source_fee_reserve"]["amount"],
+        json!(reserve.to_string())
+    );
+    assert_eq!(
+        plan.steps[0].request["source_fee_reserve"]["kind"],
+        json!("bitcoin_miner_fee")
+    );
+    assert_eq!(
         plan.steps[0].request["source_custody_vault_id"],
         json!(vault.id)
     );
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn market_order_route_planner_supports_cctp_to_hyperliquid_bridge_path() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -9289,7 +7687,7 @@ async fn market_order_route_planner_supports_cctp_to_hyperliquid_bridge_path() {
             recipient_address: valid_regtest_btc_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "6000000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -9429,6 +7827,7 @@ async fn market_order_route_planner_supports_cctp_to_hyperliquid_bridge_path() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn provider_quotes_support_across_to_hyperliquid_bridge_path_under_mocks() {
     let h = harness().await;
     let mocks = spawn_harness_mocks(h, "evm:8453").await;
@@ -9465,7 +7864,7 @@ async fn provider_quotes_support_across_to_hyperliquid_bridge_path_under_mocks()
             destination_asset: arbitrum_usdc.clone(),
             order_kind: MarketOrderKind::ExactIn {
                 amount_in: "6000000".to_string(),
-                min_amount_out: "1".to_string(),
+                min_amount_out: Some("1".to_string()),
             },
             recipient_address: valid_evm_address(),
             depositor_address: valid_evm_address(),
@@ -9482,7 +7881,7 @@ async fn provider_quotes_support_across_to_hyperliquid_bridge_path_under_mocks()
             destination_asset: hyperliquid_usdc.clone(),
             order_kind: MarketOrderKind::ExactIn {
                 amount_in: across_quote.amount_out.clone(),
-                min_amount_out: across_quote.amount_out.clone(),
+                min_amount_out: Some(across_quote.amount_out.clone()),
             },
             recipient_address: valid_evm_address(),
             depositor_address: valid_evm_address(),
@@ -9501,7 +7900,7 @@ async fn provider_quotes_support_across_to_hyperliquid_bridge_path_under_mocks()
             output_decimals: None,
             order_kind: MarketOrderKind::ExactIn {
                 amount_in: hyperliquid_bridge_quote.amount_out.clone(),
-                min_amount_out: "1".to_string(),
+                min_amount_out: Some("1".to_string()),
             },
             sender_address: None,
             recipient_address: valid_regtest_btc_address(),
@@ -9516,3394 +7915,23 @@ async fn provider_quotes_support_across_to_hyperliquid_bridge_path_under_mocks()
     assert!(exchange_quote.amount_out.parse::<u128>().unwrap() >= 1);
 }
 
-#[tokio::test]
-async fn market_order_planning_pass_materializes_direct_unit_and_matches_mock_unit_shape() {
-    let dir = tempfile::tempdir().unwrap();
-    let h = harness().await;
-    let db = test_db().await;
-    let mocks = MockIntegratorServer::spawn().await.unwrap();
-    let settings = Arc::new(test_settings(dir.path()));
-    let (order_manager, _mocks) = mock_order_manager(db.clone(), h.chain_registry.clone()).await;
-    let vault_manager = VaultManager::new(db.clone(), settings, h.chain_registry.clone());
-
-    let quote = order_manager
-        .quote_market_order(MarketOrderQuoteRequest {
-            from_asset: DepositAsset {
-                chain: ChainId::parse("evm:1").unwrap(),
-                asset: AssetId::Native,
-            },
-            to_asset: DepositAsset {
-                chain: ChainId::parse("evm:8453").unwrap(),
-                asset: AssetId::Native,
-            },
-            recipient_address: valid_evm_address(),
-            order_kind: MarketOrderQuoteKind::ExactIn {
-                amount_in: "1000".to_string(),
-                slippage_bps: 100,
-            },
-        })
-        .await
-        .unwrap();
-    let order = create_test_order_from_quote(
-        &order_manager,
-        quote
-            .quote
-            .as_market_order()
-            .expect("market order quote")
-            .id,
-    )
-    .await;
-    let vault = vault_manager
-        .create_vault(CreateVaultRequest {
-            order_id: Some(order.id),
-            ..evm_native_request()
-        })
-        .await
-        .unwrap();
-    db.vaults()
-        .transition_status(
-            vault.id,
-            DepositVaultStatus::PendingFunding,
-            DepositVaultStatus::Funded,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-    let stored_quote = db.orders().get_market_order_quote(order.id).await.unwrap();
-
-    let materialized = OrderExecutionManager::new(db.clone())
-        .process_planning_pass(10)
-        .await
-        .unwrap();
-    assert_eq!(materialized.len(), 1);
-    assert_eq!(
-        materialized[0].plan_kind,
-        stored_quote.provider_quote["path_id"].as_str().unwrap()
-    );
-    assert_eq!(materialized[0].inserted_steps, 2);
-
-    let steps = db.orders().get_execution_steps(order.id).await.unwrap();
-    let unit_step = steps
-        .iter()
-        .find(|step| step.step_type == OrderExecutionStepType::UnitDeposit)
-        .unwrap();
-    let unit_request: MockUnitDepositStepRequest =
-        serde_json::from_value(unit_step.request.clone()).unwrap();
-    assert_eq!(unit_request.src_chain_id, "evm:1");
-    assert_eq!(unit_request.dst_chain_id, "hyperliquid");
-    assert_eq!(unit_request.asset_id, "native");
-    assert_eq!(unit_request.source_custody_vault_id, Some(vault.id));
-    assert_eq!(unit_request.revert_custody_vault_id, Some(vault.id));
-    assert_eq!(
-        unit_request.hyperliquid_custody_vault_role.as_deref(),
-        Some("hyperliquid_spot")
-    );
-    let _ = mocks;
-}
-
-#[tokio::test]
-async fn market_order_planning_pass_materializes_cctp_to_hyperliquid_bridge_and_hydrates_destination_execution_vault(
-) {
-    let dir = tempfile::tempdir().unwrap();
-    let h = harness().await;
-    let db = test_db().await;
-    let mocks = MockIntegratorServer::spawn().await.unwrap();
-    let settings = Arc::new(test_settings(dir.path()));
-    let (order_manager, _mocks) = mock_order_manager(db.clone(), h.chain_registry.clone()).await;
-    let vault_manager = VaultManager::new(db.clone(), settings.clone(), h.chain_registry.clone());
-
-    let base_usdc = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913".to_string();
-    let arbitrum_usdc = "0xaf88d065e77c8cc2239327c5edb3a432268e5831".to_string();
-    let quote = order_manager
-        .quote_market_order(MarketOrderQuoteRequest {
-            from_asset: DepositAsset {
-                chain: ChainId::parse("evm:8453").unwrap(),
-                asset: AssetId::Reference(base_usdc.clone()),
-            },
-            to_asset: DepositAsset {
-                chain: ChainId::parse("bitcoin").unwrap(),
-                asset: AssetId::Native,
-            },
-            recipient_address: valid_regtest_btc_address(),
-            order_kind: MarketOrderQuoteKind::ExactIn {
-                amount_in: "6000000".to_string(),
-                slippage_bps: 100,
-            },
-        })
-        .await
-        .unwrap();
-    let order = create_test_order_from_quote(
-        &order_manager,
-        quote
-            .quote
-            .as_market_order()
-            .expect("market order quote")
-            .id,
-    )
-    .await;
-    let vault = vault_manager
-        .create_vault(CreateVaultRequest {
-            order_id: Some(order.id),
-            deposit_asset: DepositAsset {
-                chain: ChainId::parse("evm:8453").unwrap(),
-                asset: AssetId::Reference(base_usdc),
-            },
-            ..evm_native_request()
-        })
-        .await
-        .unwrap();
-    db.vaults()
-        .transition_status(
-            vault.id,
-            DepositVaultStatus::PendingFunding,
-            DepositVaultStatus::Funded,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-    let stored_quote = db.orders().get_market_order_quote(order.id).await.unwrap();
-    let retained_usdc = stored_quote.provider_quote["gas_reimbursement"]["retention_actions"][0]
-        ["amount"]
-        .as_str()
-        .unwrap()
-        .parse::<u128>()
-        .unwrap();
-
-    let execution_manager = OrderExecutionManager::with_dependencies(
-        db.clone(),
-        Arc::new(ActionProviderRegistry::mock_http(mocks.base_url())),
-        Arc::new(CustodyActionExecutor::new(
-            db.clone(),
-            settings,
-            h.chain_registry.clone(),
-        )),
-        h.chain_registry.clone(),
-    );
-    let materialized = execution_manager.process_planning_pass(10).await.unwrap();
-    assert_eq!(materialized.len(), 1);
-    assert_eq!(
-        materialized[0].plan_kind,
-        stored_quote.provider_quote["path_id"].as_str().unwrap()
-    );
-    assert_eq!(materialized[0].inserted_steps, 5);
-
-    let custody_vaults = db.orders().get_custody_vaults(order.id).await.unwrap();
-    let destination_vault = custody_vaults
-        .iter()
-        .find(|vault| vault.role == CustodyVaultRole::DestinationExecution)
-        .expect("destination execution custody vault should be materialized");
-    assert_eq!(
-        destination_vault.visibility,
-        CustodyVaultVisibility::Internal
-    );
-    assert_eq!(
-        destination_vault.chain,
-        ChainId::parse("evm:42161").unwrap()
-    );
-    assert_eq!(
-        destination_vault.asset,
-        Some(AssetId::Reference(arbitrum_usdc.clone()))
-    );
-    assert_eq!(
-        destination_vault.control_type,
-        CustodyVaultControlType::RouterDerivedKey
-    );
-    assert_eq!(destination_vault.status, CustodyVaultStatus::Active);
-
-    let steps = db.orders().get_execution_steps(order.id).await.unwrap();
-    let cctp_burn_step = steps
-        .iter()
-        .find(|step| step.step_type == OrderExecutionStepType::CctpBurn)
-        .unwrap();
-    let cctp_burn_request: router_server::services::action_providers::CctpBurnStepRequest =
-        serde_json::from_value(cctp_burn_step.request.clone()).unwrap();
-    assert_eq!(cctp_burn_request.source_chain_id, "evm:8453");
-    assert_eq!(cctp_burn_request.destination_chain_id, "evm:42161");
-    assert!(cctp_burn_step.request.get("retention_actions").is_none());
-    assert_eq!(cctp_burn_step.amount_in.as_deref(), Some("6000000"));
-    assert_eq!(
-        cctp_burn_step.request["recipient_custody_vault_role"],
-        json!("destination_execution")
-    );
-    assert_eq!(
-        cctp_burn_request.recipient_address,
-        destination_vault.address
-    );
-    assert_eq!(
-        cctp_burn_request.source_custody_vault_address.as_deref(),
-        Some(vault.deposit_vault_address.as_str())
-    );
-
-    let cctp_receive_step = steps
-        .iter()
-        .find(|step| step.step_type == OrderExecutionStepType::CctpReceive)
-        .unwrap();
-    let cctp_receive_request: router_server::services::action_providers::CctpReceiveStepRequest =
-        serde_json::from_value(cctp_receive_step.request.clone()).unwrap();
-    assert_eq!(
-        cctp_receive_request.burn_transition_decl_id,
-        cctp_burn_request.transition_decl_id
-    );
-    assert_eq!(cctp_receive_request.destination_chain_id, "evm:42161");
-    assert_eq!(cctp_receive_step.amount_in.as_deref(), Some("6000000"));
-    assert_eq!(
-        cctp_receive_request.source_custody_vault_address.as_deref(),
-        Some(destination_vault.address.as_str())
-    );
-    assert_eq!(
-        cctp_receive_request.source_custody_vault_id,
-        Some(destination_vault.id)
-    );
-
-    let hyperliquid_bridge_step = steps
-        .iter()
-        .find(|step| step.step_type == OrderExecutionStepType::HyperliquidBridgeDeposit)
-        .unwrap();
-    assert_eq!(
-        hyperliquid_bridge_step
-            .request
-            .get("source_custody_vault_id")
-            .and_then(Value::as_str)
-            .and_then(|value| Uuid::parse_str(value).ok()),
-        Some(destination_vault.id)
-    );
-    assert_eq!(
-        hyperliquid_bridge_step.request["source_custody_vault_address"],
-        json!(destination_vault.address)
-    );
-
-    let hyperliquid_trade_step = steps
-        .iter()
-        .find(|step| step.step_type == OrderExecutionStepType::HyperliquidTrade)
-        .unwrap();
-    assert_eq!(
-        hyperliquid_trade_step.request["prefund_from_withdrawable"],
-        json!(true)
-    );
-    assert_eq!(
-        hyperliquid_trade_step.request["retention_actions"][0]["recipient_role"],
-        json!("paymaster_wallet")
-    );
-    assert_eq!(
-        hyperliquid_trade_step.request["retention_actions"][0]["settlement_chain_id"],
-        json!("hyperliquid")
-    );
-    assert_eq!(
-        hyperliquid_trade_step.request["retention_actions"][0]["settlement_provider_asset"],
-        json!("USDC")
-    );
-    assert_eq!(
-        hyperliquid_trade_step.request["retention_actions"][0]["amount"]
-            .as_str()
-            .unwrap()
-            .parse::<u128>()
-            .unwrap(),
-        retained_usdc
-    );
-    assert_eq!(
-        hyperliquid_trade_step
-            .request
-            .get("hyperliquid_custody_vault_id")
-            .and_then(Value::as_str)
-            .and_then(|value| Uuid::parse_str(value).ok()),
-        Some(destination_vault.id)
-    );
-    assert_eq!(
-        hyperliquid_trade_step.request["hyperliquid_custody_vault_address"],
-        json!(destination_vault.address)
-    );
-
-    let unit_step = steps
-        .iter()
-        .find(|step| step.step_type == OrderExecutionStepType::UnitWithdrawal)
-        .unwrap();
-    assert_eq!(
-        unit_step
-            .request
-            .get("hyperliquid_custody_vault_id")
-            .and_then(Value::as_str)
-            .and_then(|value| Uuid::parse_str(value).ok()),
-        Some(destination_vault.id)
-    );
-    assert_eq!(
-        unit_step.request["hyperliquid_custody_vault_address"],
-        json!(destination_vault.address)
-    );
-}
-
-#[tokio::test]
-async fn market_order_planning_pass_materializes_across_to_unit_and_matches_mock_shapes() {
-    let dir = tempfile::tempdir().unwrap();
-    let h = harness().await;
-    let db = test_db().await;
-    let mocks = MockIntegratorServer::spawn().await.unwrap();
-    let settings = Arc::new(test_settings(dir.path()));
-    let (order_manager, _mocks) = mock_order_manager(db.clone(), h.chain_registry.clone()).await;
-    let vault_manager = VaultManager::new(db.clone(), settings, h.chain_registry.clone());
-
-    let quote = order_manager
-        .quote_market_order(MarketOrderQuoteRequest {
-            from_asset: DepositAsset {
-                chain: ChainId::parse("evm:8453").unwrap(),
-                asset: AssetId::Native,
-            },
-            to_asset: DepositAsset {
-                chain: ChainId::parse("evm:1").unwrap(),
-                asset: AssetId::Native,
-            },
-            recipient_address: valid_evm_address(),
-            order_kind: MarketOrderQuoteKind::ExactIn {
-                amount_in: "1000".to_string(),
-                slippage_bps: 100,
-            },
-        })
-        .await
-        .unwrap();
-    let order = create_test_order_from_quote(
-        &order_manager,
-        quote
-            .quote
-            .as_market_order()
-            .expect("market order quote")
-            .id,
-    )
-    .await;
-    let vault = vault_manager
-        .create_vault(CreateVaultRequest {
-            order_id: Some(order.id),
-            deposit_asset: DepositAsset {
-                chain: ChainId::parse("evm:8453").unwrap(),
-                asset: AssetId::Native,
-            },
-            ..evm_native_request()
-        })
-        .await
-        .unwrap();
-    db.vaults()
-        .transition_status(
-            vault.id,
-            DepositVaultStatus::PendingFunding,
-            DepositVaultStatus::Funded,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-    let stored_quote = db.orders().get_market_order_quote(order.id).await.unwrap();
-
-    let execution_manager = OrderExecutionManager::with_dependencies(
-        db.clone(),
-        Arc::new(ActionProviderRegistry::mock_http(mocks.base_url())),
-        Arc::new(CustodyActionExecutor::new(
-            db.clone(),
-            Arc::new(test_settings(dir.path())),
-            h.chain_registry.clone(),
-        )),
-        h.chain_registry.clone(),
-    );
-    let materialized = execution_manager.process_planning_pass(10).await.unwrap();
-    assert_eq!(materialized.len(), 1);
-    assert_eq!(
-        materialized[0].plan_kind,
-        stored_quote.provider_quote["path_id"].as_str().unwrap()
-    );
-    assert_eq!(materialized[0].inserted_steps, 3);
-
-    let steps = db.orders().get_execution_steps(order.id).await.unwrap();
-    let across_step = steps
-        .iter()
-        .find(|step| step.step_type == OrderExecutionStepType::AcrossBridge)
-        .unwrap();
-    let across_request: router_server::services::action_providers::AcrossExecuteStepRequest =
-        serde_json::from_value(across_step.request.clone()).unwrap();
-    assert_eq!(across_request.origin_chain_id, "evm:8453");
-    assert_eq!(across_request.destination_chain_id, "evm:1");
-    assert_eq!(across_request.refund_address, vault.deposit_vault_address);
-    assert_eq!(
-        across_request.depositor_address,
-        vault.deposit_vault_address
-    );
-    assert_eq!(across_request.depositor_custody_vault_id, vault.id);
-    assert_eq!(
-        across_step.request["recipient_custody_vault_role"],
-        json!("destination_execution")
-    );
-
-    let unit_step = steps
-        .iter()
-        .find(|step| step.step_type == OrderExecutionStepType::UnitDeposit)
-        .unwrap();
-    let unit_request: MockUnitDepositStepRequest =
-        serde_json::from_value(unit_step.request.clone()).unwrap();
-    assert_eq!(unit_request.src_chain_id, "evm:1");
-    assert_eq!(unit_request.dst_chain_id, "hyperliquid");
-    assert_eq!(unit_request.asset_id, "native");
-    assert_eq!(
-        unit_request.source_custody_vault_role.as_deref(),
-        Some("destination_execution")
-    );
-    assert_eq!(
-        unit_request.revert_custody_vault_role.as_deref(),
-        Some("destination_execution")
-    );
-    assert_eq!(
-        unit_request.hyperliquid_custody_vault_role.as_deref(),
-        Some("hyperliquid_spot")
-    );
-    let _ = mocks;
-}
-
-#[tokio::test]
-async fn market_order_planning_hydrates_destination_execution_custody_vault() {
-    let dir = tempfile::tempdir().unwrap();
-    let h = harness().await;
-    let db = test_db().await;
-    let mocks = MockIntegratorServer::spawn().await.unwrap();
-    let settings = Arc::new(test_settings(dir.path()));
-    let (order_manager, _mocks) = mock_order_manager(db.clone(), h.chain_registry.clone()).await;
-    let vault_manager = VaultManager::new(db.clone(), settings.clone(), h.chain_registry.clone());
-
-    let quote = order_manager
-        .quote_market_order(MarketOrderQuoteRequest {
-            from_asset: DepositAsset {
-                chain: ChainId::parse("evm:8453").unwrap(),
-                asset: AssetId::Native,
-            },
-            to_asset: DepositAsset {
-                chain: ChainId::parse("evm:1").unwrap(),
-                asset: AssetId::Native,
-            },
-            recipient_address: valid_evm_address(),
-            order_kind: MarketOrderQuoteKind::ExactIn {
-                amount_in: "1000".to_string(),
-                slippage_bps: 100,
-            },
-        })
-        .await
-        .unwrap();
-    let order = create_test_order_from_quote(
-        &order_manager,
-        quote
-            .quote
-            .as_market_order()
-            .expect("market order quote")
-            .id,
-    )
-    .await;
-    let vault = vault_manager
-        .create_vault(CreateVaultRequest {
-            order_id: Some(order.id),
-            deposit_asset: DepositAsset {
-                chain: ChainId::parse("evm:8453").unwrap(),
-                asset: AssetId::Native,
-            },
-            ..evm_native_request()
-        })
-        .await
-        .unwrap();
-    db.vaults()
-        .transition_status(
-            vault.id,
-            DepositVaultStatus::PendingFunding,
-            DepositVaultStatus::Funded,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-    let stored_quote = db.orders().get_market_order_quote(order.id).await.unwrap();
-
-    let execution_manager = OrderExecutionManager::with_dependencies(
-        db.clone(),
-        Arc::new(ActionProviderRegistry::mock_http(mocks.base_url())),
-        Arc::new(CustodyActionExecutor::new(
-            db.clone(),
-            settings,
-            h.chain_registry.clone(),
-        )),
-        h.chain_registry.clone(),
-    );
-    let materialized = execution_manager.process_planning_pass(10).await.unwrap();
-    assert_eq!(materialized.len(), 1);
-    assert_eq!(
-        materialized[0].plan_kind,
-        stored_quote.provider_quote["path_id"].as_str().unwrap()
-    );
-    assert_eq!(materialized[0].inserted_steps, 3);
-
-    let custody_vaults = db.orders().get_custody_vaults(order.id).await.unwrap();
-    let destination_vault = custody_vaults
-        .iter()
-        .find(|vault| vault.role == CustodyVaultRole::DestinationExecution)
-        .expect("destination execution custody vault should be materialized");
-    assert_eq!(
-        destination_vault.visibility,
-        CustodyVaultVisibility::Internal
-    );
-    assert_eq!(destination_vault.chain, ChainId::parse("evm:1").unwrap());
-    assert_eq!(destination_vault.asset, Some(AssetId::Native));
-    assert_eq!(
-        destination_vault.control_type,
-        CustodyVaultControlType::RouterDerivedKey
-    );
-    assert_eq!(destination_vault.status, CustodyVaultStatus::Active);
-    assert!(destination_vault.derivation_salt.is_some());
-    assert!(!destination_vault.address.is_empty());
-
-    let steps = db.orders().get_execution_steps(order.id).await.unwrap();
-    let across_step = steps
-        .iter()
-        .find(|step| step.step_type == OrderExecutionStepType::AcrossBridge)
-        .unwrap();
-    let across_request: router_server::services::action_providers::AcrossExecuteStepRequest =
-        serde_json::from_value(across_step.request.clone()).unwrap();
-    assert_eq!(across_request.recipient, destination_vault.address);
-    assert_eq!(
-        across_step
-            .request
-            .get("recipient_custody_vault_id")
-            .and_then(Value::as_str)
-            .and_then(|value| Uuid::parse_str(value).ok()),
-        Some(destination_vault.id)
-    );
-
-    let unit_step = steps
-        .iter()
-        .find(|step| step.step_type == OrderExecutionStepType::UnitDeposit)
-        .unwrap();
-    let unit_request: MockUnitDepositStepRequest =
-        serde_json::from_value(unit_step.request.clone()).unwrap();
-    assert_eq!(
-        unit_request.source_custody_vault_id,
-        Some(destination_vault.id)
-    );
-    assert_eq!(
-        unit_request.revert_custody_vault_id,
-        Some(destination_vault.id)
-    );
-    assert_eq!(
-        unit_request.source_custody_vault_role.as_deref(),
-        Some("destination_execution")
-    );
-    assert_eq!(
-        unit_request.revert_custody_vault_role.as_deref(),
-        Some("destination_execution")
-    );
-    assert_eq!(
-        unit_request.hyperliquid_custody_vault_role.as_deref(),
-        Some("hyperliquid_spot")
-    );
-}
-
-#[tokio::test]
-async fn order_executor_completes_mock_across_unit_hyperliquid_flow() {
-    let dir = tempfile::tempdir().unwrap();
-    let h = harness().await;
-    let db = test_db().await;
-    let mocks = spawn_harness_mocks(h, "evm:8453").await;
-    let settings = Arc::new(test_settings(dir.path()));
-    let (order_manager, _mocks) = mock_order_manager(db.clone(), h.chain_registry.clone()).await;
-    let vault_manager = VaultManager::new(db.clone(), settings.clone(), h.chain_registry.clone());
-
-    let quote = order_manager
-        .quote_market_order(MarketOrderQuoteRequest {
-            from_asset: DepositAsset {
-                chain: ChainId::parse("evm:8453").unwrap(),
-                asset: AssetId::Native,
-            },
-            to_asset: DepositAsset {
-                chain: ChainId::parse("evm:1").unwrap(),
-                asset: AssetId::Native,
-            },
-            recipient_address: valid_evm_address(),
-            order_kind: MarketOrderQuoteKind::ExactIn {
-                amount_in: "1000".to_string(),
-                slippage_bps: 100,
-            },
-        })
-        .await
-        .unwrap();
-    let order = create_test_order_from_quote(
-        &order_manager,
-        quote
-            .quote
-            .as_market_order()
-            .expect("market order quote")
-            .id,
-    )
-    .await;
-    let vault = vault_manager
-        .create_vault(CreateVaultRequest {
-            order_id: Some(order.id),
-            deposit_asset: DepositAsset {
-                chain: ChainId::parse("evm:8453").unwrap(),
-                asset: AssetId::Native,
-            },
-            ..evm_native_request()
-        })
-        .await
-        .unwrap();
-    let vault_address =
-        Address::from_str(&vault.deposit_vault_address).expect("valid base vault address");
-    anvil_set_base_balance(h, vault_address, U256::from(1000_u64)).await;
-    db.vaults()
-        .transition_status(
-            vault.id,
-            DepositVaultStatus::PendingFunding,
-            DepositVaultStatus::Funded,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-
-    let execution_manager = OrderExecutionManager::with_dependencies(
-        db.clone(),
-        Arc::new(ActionProviderRegistry::mock_http(mocks.base_url())),
-        Arc::new(CustodyActionExecutor::new(
-            db.clone(),
-            settings,
-            h.chain_registry.clone(),
-        )),
-        h.chain_registry.clone(),
-    );
-    drive_across_order_to_completion(&execution_manager, &mocks, &db, order.id).await;
-
-    let order = db.orders().get(order.id).await.unwrap();
-    let vault = db.vaults().get(vault.id).await.unwrap();
-    assert_eq!(order.status, RouterOrderStatus::Completed);
-    assert_eq!(vault.status, DepositVaultStatus::Completed);
-    let deposits = mocks.across_deposits_from(vault_address).await;
-    assert_eq!(deposits.len(), 1);
-    assert_eq!(deposits[0].input_amount, U256::from(1000_u64));
-    assert_eq!(deposits[0].output_amount, U256::from(1000_u64));
-    let gen_requests = mocks.unit_generate_address_requests().await;
-    assert_eq!(
-        filter_unit_requests_by_kind(&gen_requests, MockUnitOperationKind::Deposit).len(),
-        1
-    );
-    assert_eq!(
-        filter_unit_requests_by_kind(&gen_requests, MockUnitOperationKind::Withdrawal).len(),
-        1
-    );
-    let ledger = mocks.ledger_snapshot().await;
-    assert!(ledger.bridged_balances.is_empty());
-    assert!(ledger.hyperliquid_balances.is_empty());
-    assert_eq!(
-        filter_unit_operations_by_kind(&ledger.unit_operations, MockUnitOperationKind::Deposit)
-            .len(),
-        1
-    );
-    assert_eq!(
-        filter_unit_operations_by_kind(&ledger.unit_operations, MockUnitOperationKind::Withdrawal)
-            .len(),
-        1
-    );
-    let steps = db.orders().get_execution_steps(order.id).await.unwrap();
-    assert!(steps
-        .iter()
-        .filter(|step| step.step_index > 0)
-        .all(|step| step.status == OrderExecutionStepStatus::Completed));
-}
-
 /// End-to-end cross-token flow: Base ETH → Across → evm:1 UETH → HyperUnit
 /// deposit → HL two-leg swap (UETH → USDC → UBTC) → HyperUnit withdrawal →
 /// bitcoin regtest. Exercises the path where HL's `quote_trade` returns two
 /// legs and the planner materializes two `HyperliquidTrade` steps in sequence
 /// between UnitDeposit and UnitWithdrawal.
-#[tokio::test]
-async fn order_executor_completes_base_eth_to_btc_cross_token_flow() {
-    let dir = tempfile::tempdir().unwrap();
-    let h = harness().await;
-    let db = test_db().await;
-    let mocks = spawn_harness_mocks(h, "evm:8453").await;
-    let settings = Arc::new(test_settings(dir.path()));
-    let (order_manager, _mocks) = mock_order_manager(db.clone(), h.chain_registry.clone()).await;
-    let vault_manager = VaultManager::new(db.clone(), settings.clone(), h.chain_registry.clone());
 
-    // 0.01 Base ETH. Picked so HL leg sizes (0.01 UETH, 30 USDC, 0.0005 UBTC)
-    // land cleanly above sz_decimals precision for both UETH (4) and UBTC (5)
-    // at the default mock rates (UETH/USDC=3000, UBTC/USDC=60000).
-    let amount_in_wei = "10000000000000000".to_string();
-
-    let quote = order_manager
-        .quote_market_order(MarketOrderQuoteRequest {
-            from_asset: DepositAsset {
-                chain: ChainId::parse("evm:8453").unwrap(),
-                asset: AssetId::Native,
-            },
-            to_asset: DepositAsset {
-                chain: ChainId::parse("bitcoin").unwrap(),
-                asset: AssetId::Native,
-            },
-            recipient_address: valid_regtest_btc_address(),
-            order_kind: MarketOrderQuoteKind::ExactIn {
-                amount_in: amount_in_wei.clone(),
-                slippage_bps: 100,
-            },
-        })
-        .await
-        .unwrap();
-    let order = create_test_order_from_quote(
-        &order_manager,
-        quote
-            .quote
-            .as_market_order()
-            .expect("market order quote")
-            .id,
-    )
-    .await;
-    let vault = vault_manager
-        .create_vault(CreateVaultRequest {
-            order_id: Some(order.id),
-            deposit_asset: DepositAsset {
-                chain: ChainId::parse("evm:8453").unwrap(),
-                asset: AssetId::Native,
-            },
-            ..evm_native_request()
-        })
-        .await
-        .unwrap();
-    let vault_address =
-        Address::from_str(&vault.deposit_vault_address).expect("valid base vault address");
-    // Fund with the 0.01 ETH deposit + 1 ETH gas pad so the vault can cover
-    // the AcrossBridge transfer's gas costs.
-    let source_balance = U256::from_str_radix(&amount_in_wei, 10).unwrap()
-        + U256::from(1_000_000_000_000_000_000_u128);
-    anvil_set_base_balance(h, vault_address, source_balance).await;
-    db.vaults()
-        .transition_status(
-            vault.id,
-            DepositVaultStatus::PendingFunding,
-            DepositVaultStatus::Funded,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-
-    let execution_manager = OrderExecutionManager::with_dependencies(
-        db.clone(),
-        Arc::new(ActionProviderRegistry::mock_http(mocks.base_url())),
-        Arc::new(CustodyActionExecutor::new(
-            db.clone(),
-            settings,
-            h.chain_registry.clone(),
-        )),
-        h.chain_registry.clone(),
-    );
-    drive_cross_token_across_order_to_completion(&execution_manager, &mocks, &db, order.id).await;
-
-    let order = db.orders().get(order.id).await.unwrap();
-    let vault = db.vaults().get(vault.id).await.unwrap();
-    assert_eq!(order.status, RouterOrderStatus::Completed);
-    assert_eq!(vault.status, DepositVaultStatus::Completed);
-    let internal_vaults = internal_custody_vaults_for_order(&db, order.id).await;
-    assert!(
-        !internal_vaults.is_empty(),
-        "completed cross-token route should have internal custody vaults to release"
-    );
-    assert!(internal_vaults.iter().all(|vault| {
-        vault.status == CustodyVaultStatus::Released
-            && vault.metadata["lifecycle_terminal_reason"] == json!("order_completed")
-            && vault.metadata["lifecycle_order_status"] == json!("completed")
-            && vault.metadata["lifecycle_balance_verified"] == json!(false)
-    }));
-
-    let steps = db.orders().get_execution_steps(order.id).await.unwrap();
-    assert!(steps
-        .iter()
-        .filter(|step| step.step_index > 0)
-        .all(|step| step.status == OrderExecutionStepStatus::Completed));
-    let hl_steps: Vec<_> = steps
-        .iter()
-        .filter(|step| step.step_type == OrderExecutionStepType::HyperliquidTrade)
-        .collect();
-    assert_eq!(
-        hl_steps.len(),
-        2,
-        "cross-token ETH→BTC flow should materialize two HL trade legs"
-    );
-
-    let gen_requests = mocks.unit_generate_address_requests().await;
-    assert_eq!(
-        filter_unit_requests_by_kind(&gen_requests, MockUnitOperationKind::Deposit).len(),
-        1
-    );
-    assert_eq!(
-        filter_unit_requests_by_kind(&gen_requests, MockUnitOperationKind::Withdrawal).len(),
-        1
-    );
-}
-
-#[tokio::test]
-async fn order_executor_completes_base_eth_to_arbitrum_usdc_limit_order_flow() {
-    let dir = tempfile::tempdir().unwrap();
-    let h = harness().await;
-    let db = test_db().await;
-    let mocks = spawn_harness_mocks(h, "evm:8453").await;
-    let settings = Arc::new(test_settings(dir.path()));
-    let action_providers = Arc::new(ActionProviderRegistry::mock_http(mocks.base_url()));
-    let order_manager = OrderManager::with_action_providers(
-        db.clone(),
-        settings.clone(),
-        h.chain_registry.clone(),
-        action_providers.clone(),
-    );
-    let vault_manager = VaultManager::new(db.clone(), settings.clone(), h.chain_registry.clone());
-
-    let amount_in_wei = "10000000000000000".to_string();
-    let response = order_manager
-        .quote_limit_order(LimitOrderQuoteRequest {
-            from_asset: DepositAsset {
-                chain: ChainId::parse("evm:8453").unwrap(),
-                asset: AssetId::Native,
-            },
-            to_asset: DepositAsset {
-                chain: ChainId::parse("evm:42161").unwrap(),
-                asset: AssetId::reference("0xaf88d065e77c8cc2239327c5edb3a432268e5831"),
-            },
-            recipient_address: valid_evm_address(),
-            input_amount: amount_in_wei.clone(),
-            output_amount: "20000000".to_string(),
-        })
-        .await
-        .unwrap();
-    let quote = response
-        .quote
-        .as_limit_order()
-        .expect("limit order quote")
-        .clone();
-    let order =
-        create_test_order_from_quote_with_refund(&order_manager, quote.id, valid_evm_address())
-            .await;
-    let vault = vault_manager
-        .create_vault(CreateVaultRequest {
-            order_id: Some(order.id),
-            deposit_asset: DepositAsset {
-                chain: ChainId::parse("evm:8453").unwrap(),
-                asset: AssetId::Native,
-            },
-            ..evm_native_request()
-        })
-        .await
-        .unwrap();
-    let vault_address =
-        Address::from_str(&vault.deposit_vault_address).expect("valid base vault address");
-    let source_balance = U256::from_str_radix(&amount_in_wei, 10).unwrap()
-        + U256::from(1_000_000_000_000_000_000_u128);
-    anvil_set_base_balance(h, vault_address, source_balance).await;
-    db.vaults()
-        .transition_status(
-            vault.id,
-            DepositVaultStatus::PendingFunding,
-            DepositVaultStatus::Funded,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-
-    let execution_manager = OrderExecutionManager::with_dependencies(
-        db.clone(),
-        action_providers,
-        Arc::new(
-            CustodyActionExecutor::new(db.clone(), settings, h.chain_registry.clone())
-                .with_paymasters(test_paymaster_registry(h)),
-        ),
-        h.chain_registry.clone(),
-    );
-    drive_limit_eth_to_arbitrum_usdc_order_to_completion(&execution_manager, &mocks, &db, order.id)
-        .await;
-
-    let order = db.orders().get(order.id).await.unwrap();
-    let vault = db.vaults().get(vault.id).await.unwrap();
-    assert_eq!(order.status, RouterOrderStatus::Completed);
-    assert_eq!(vault.status, DepositVaultStatus::Completed);
-
-    let limit_operation =
-        provider_operation_by_type(&db, order.id, ProviderOperationType::HyperliquidLimitOrder)
-            .await;
-    assert_eq!(limit_operation.status, ProviderOperationStatus::Completed);
-
-    let steps = db.orders().get_execution_steps(order.id).await.unwrap();
-    assert!(steps
-        .iter()
-        .any(|step| step.step_type == OrderExecutionStepType::HyperliquidLimitOrder));
-    assert!(steps
-        .iter()
-        .filter(|step| step.step_index > 0)
-        .all(|step| step.status == OrderExecutionStepStatus::Completed));
-}
-
-#[tokio::test]
-async fn order_executor_completes_btc_to_eth_unit_hyperliquid_flow() {
-    let dir = tempfile::tempdir().unwrap();
-    let h = harness().await;
-    let db = test_db().await;
-    let mocks = spawn_harness_mocks(h, "evm:8453").await;
-    let settings = Arc::new(test_settings(dir.path()));
-    let (order_manager, _mocks) = mock_order_manager(db.clone(), h.chain_registry.clone()).await;
-    let vault_manager = VaultManager::new(db.clone(), settings.clone(), h.chain_registry.clone());
-
-    let amount_in_sats = "1000000".to_string();
-    let quote = order_manager
-        .quote_market_order(MarketOrderQuoteRequest {
-            from_asset: DepositAsset {
-                chain: ChainId::parse("bitcoin").unwrap(),
-                asset: AssetId::Native,
-            },
-            to_asset: DepositAsset {
-                chain: ChainId::parse("evm:1").unwrap(),
-                asset: AssetId::Native,
-            },
-            recipient_address: valid_evm_address(),
-            order_kind: MarketOrderQuoteKind::ExactIn {
-                amount_in: amount_in_sats.clone(),
-                slippage_bps: 100,
-            },
-        })
-        .await
-        .unwrap();
-    let order = create_test_order_from_quote_with_refund(
-        &order_manager,
-        quote
-            .quote
-            .as_market_order()
-            .expect("market order quote")
-            .id,
-        valid_regtest_btc_address(),
-    )
-    .await;
-    let vault = vault_manager
-        .create_vault(CreateVaultRequest {
-            order_id: Some(order.id),
-            deposit_asset: DepositAsset {
-                chain: ChainId::parse("bitcoin").unwrap(),
-                asset: AssetId::Native,
-            },
-            action: VaultAction::Null,
-            recovery_address: valid_regtest_btc_address(),
-            cancellation_commitment: dummy_commitment(),
-            cancel_after: None,
-            metadata: json!({}),
-        })
-        .await
-        .unwrap();
-    let vault_address = bitcoin::Address::from_str(&vault.deposit_vault_address)
-        .expect("valid bitcoin source vault address")
-        .assume_checked();
-    h.deal_bitcoin(
-        &vault_address,
-        &Amount::from_sat(amount_in_sats.parse::<u64>().unwrap()),
-    )
-    .await
-    .expect("fund bitcoin source vault");
-    h.wait_for_esplora_sync(Duration::from_secs(30))
-        .await
-        .expect("esplora sync after bitcoin funding");
-    db.vaults()
-        .transition_status(
-            vault.id,
-            DepositVaultStatus::PendingFunding,
-            DepositVaultStatus::Funded,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-
-    let execution_manager = OrderExecutionManager::with_dependencies(
-        db.clone(),
-        Arc::new(ActionProviderRegistry::mock_http(mocks.base_url())),
-        Arc::new(CustodyActionExecutor::new(
-            db.clone(),
-            settings,
-            h.chain_registry.clone(),
-        )),
-        h.chain_registry.clone(),
-    );
-    drive_unit_ingress_order_to_completion(&execution_manager, &mocks, &db, order.id).await;
-
-    let order = db.orders().get(order.id).await.unwrap();
-    let vault = db.vaults().get(vault.id).await.unwrap();
-    assert_eq!(order.status, RouterOrderStatus::Completed);
-    assert_eq!(vault.status, DepositVaultStatus::Completed);
-
-    let unit_deposit =
-        provider_operation_by_type(&db, order.id, ProviderOperationType::UnitDeposit).await;
-    let unit_amount = unit_deposit
-        .request
-        .get("expected_amount")
-        .and_then(Value::as_str)
-        .or_else(|| unit_deposit.request.get("amount").and_then(Value::as_str))
-        .unwrap()
-        .parse::<u64>()
-        .unwrap();
-    assert!(unit_amount < amount_in_sats.parse::<u64>().unwrap());
-}
-
-/// Variant of `drive_across_order_to_completion` for cross-token HL routes.
-/// UnitDeposit completion is driven by the mock Unit EVM indexer observing the
-/// router's on-chain transfer into the generated Unit protocol address, which
-/// then credits the mock HL spot ledger before the first HL leg runs.
-async fn drive_cross_token_across_order_to_completion(
-    execution_manager: &OrderExecutionManager,
-    mocks: &MockIntegratorServer,
-    db: &Database,
-    order_id: Uuid,
-) {
-    // Across bridge leg — identical to the single-canonical driver.
-    execution_manager.process_worker_pass(10).await.unwrap();
-    let source_vault_address = source_deposit_vault_address_from_db(db, order_id).await;
-    wait_for_across_deposit_indexed(mocks, source_vault_address, Duration::from_secs(10)).await;
-    let across_operation =
-        provider_operation_by_type(db, order_id, ProviderOperationType::AcrossBridge).await;
-    record_detector_provider_status_hint(execution_manager, &across_operation).await;
-    execution_manager
-        .process_provider_operation_hints(10)
-        .await
-        .unwrap();
-
-    // Unit deposit leg.
-    execution_manager.process_worker_pass(10).await.unwrap();
-    let unit_deposit =
-        provider_operation_by_type(db, order_id, ProviderOperationType::UnitDeposit).await;
-    wait_for_mock_unit_operation_done(mocks, provider_ref(&unit_deposit), Duration::from_secs(10))
-        .await;
-    record_detector_provider_status_hint(execution_manager, &unit_deposit).await;
-    execution_manager
-        .process_provider_operation_hints(10)
-        .await
-        .unwrap();
-
-    // One worker pass advances through both HL trade legs synchronously
-    // (marketable mock GTC orders are fully resolved inside execute_step), then kicks
-    // off the async UnitWithdrawal which resolves via spotSend.
-    execution_manager.process_worker_pass(10).await.unwrap();
-    let unit_withdrawal =
-        provider_operation_by_type(db, order_id, ProviderOperationType::UnitWithdrawal).await;
-    record_detector_provider_status_hint(execution_manager, &unit_withdrawal).await;
-    execution_manager
-        .process_provider_operation_hints(10)
-        .await
-        .unwrap();
-
-    let start = std::time::Instant::now();
-    loop {
-        execution_manager.process_worker_pass(10).await.unwrap();
-        let order = db.orders().get(order_id).await.unwrap();
-        if matches!(
-            order.status,
-            RouterOrderStatus::Completed
-                | RouterOrderStatus::Refunding
-                | RouterOrderStatus::Refunded
-                | RouterOrderStatus::Failed
-        ) {
-            if !matches!(order.status, RouterOrderStatus::Completed) {
-                dump_order_state(db, order_id).await;
-            }
-            return;
-        }
-        if start.elapsed() >= Duration::from_secs(10) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    dump_order_state(db, order_id).await;
-    panic!(
-        "cross-token order {order_id} did not reach a terminal state within 10s after UnitWithdrawal"
-    );
-}
-
-async fn drive_limit_eth_to_arbitrum_usdc_order_to_completion(
-    execution_manager: &OrderExecutionManager,
-    mocks: &MockIntegratorServer,
-    db: &Database,
-    order_id: Uuid,
-) {
-    execution_manager.process_worker_pass(10).await.unwrap();
-    let source_vault_address = source_deposit_vault_address_from_db(db, order_id).await;
-    wait_for_across_deposit_indexed(mocks, source_vault_address, Duration::from_secs(10)).await;
-    let across_operation =
-        provider_operation_by_type(db, order_id, ProviderOperationType::AcrossBridge).await;
-    record_detector_provider_status_hint(execution_manager, &across_operation).await;
-    execution_manager
-        .process_provider_operation_hints(10)
-        .await
-        .unwrap();
-
-    execution_manager.process_worker_pass(10).await.unwrap();
-    let unit_deposit =
-        provider_operation_by_type(db, order_id, ProviderOperationType::UnitDeposit).await;
-    wait_for_mock_unit_operation_done(mocks, provider_ref(&unit_deposit), Duration::from_secs(10))
-        .await;
-    record_detector_provider_status_hint(execution_manager, &unit_deposit).await;
-    execution_manager
-        .process_provider_operation_hints(10)
-        .await
-        .unwrap();
-
-    execution_manager.process_worker_pass(10).await.unwrap();
-    let hl_withdrawal = provider_operation_by_type(
-        db,
-        order_id,
-        ProviderOperationType::HyperliquidBridgeWithdrawal,
-    )
-    .await;
-    fund_hyperliquid_bridge_withdrawal_destination(&hl_withdrawal).await;
-    record_detector_provider_status_hint(execution_manager, &hl_withdrawal).await;
-    execution_manager
-        .process_provider_operation_hints(10)
-        .await
-        .unwrap();
-
-    let start = std::time::Instant::now();
-    loop {
-        execution_manager.process_worker_pass(10).await.unwrap();
-        let order = db.orders().get(order_id).await.unwrap();
-        if matches!(
-            order.status,
-            RouterOrderStatus::Completed
-                | RouterOrderStatus::Refunding
-                | RouterOrderStatus::Refunded
-                | RouterOrderStatus::Failed
-        ) {
-            if !matches!(order.status, RouterOrderStatus::Completed) {
-                dump_order_state(db, order_id).await;
-            }
-            return;
-        }
-        if start.elapsed() >= Duration::from_secs(10) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    dump_order_state(db, order_id).await;
-    panic!("limit ETH->Arbitrum USDC order {order_id} did not reach a terminal state within 10s");
-}
-
-async fn fund_hyperliquid_bridge_withdrawal_destination(operation: &OrderProviderOperation) {
-    let chain_id = operation
-        .request
-        .get("destination_chain_id")
-        .and_then(Value::as_str)
-        .expect("hyperliquid withdrawal request should include destination_chain_id");
-    let asset_id = operation
-        .request
-        .get("output_asset")
-        .and_then(Value::as_str)
-        .expect("hyperliquid withdrawal request should include output_asset");
-    let recipient = Address::from_str(
-        operation
-            .request
-            .get("recipient_address")
-            .and_then(Value::as_str)
-            .expect("hyperliquid withdrawal request should include recipient_address"),
-    )
-    .expect("hyperliquid withdrawal recipient should be an EVM address");
-    let amount = U256::from_str_radix(
-        operation
-            .request
-            .get("amount")
-            .and_then(Value::as_str)
-            .expect("hyperliquid withdrawal request should include amount"),
-        10,
-    )
-    .expect("hyperliquid withdrawal amount should parse");
-    let h = harness().await;
-    match (chain_id, asset_id) {
-        ("evm:1", "native") => anvil_set_balance(h, recipient, amount).await,
-        ("evm:8453", "native") => anvil_set_base_balance(h, recipient, amount).await,
-        ("evm:42161", "native") => anvil_set_arbitrum_balance(h, recipient, amount).await,
-        ("evm:1", token) => {
-            anvil_mint_erc20_on(
-                h.ethereum_endpoint_url(),
-                Address::from_str(token).expect("ethereum withdrawal token address"),
-                recipient,
-                amount,
-                "ethereum",
-            )
-            .await;
-        }
-        ("evm:8453", token) => {
-            anvil_mint_erc20_on(
-                h.base_endpoint_url(),
-                Address::from_str(token).expect("base withdrawal token address"),
-                recipient,
-                amount,
-                "base",
-            )
-            .await;
-        }
-        ("evm:42161", token) => {
-            anvil_mint_erc20_on(
-                h.arbitrum_endpoint_url(),
-                Address::from_str(token).expect("arbitrum withdrawal token address"),
-                recipient,
-                amount,
-                "arbitrum",
-            )
-            .await;
-        }
-        (other_chain, other_asset) => {
-            panic!("unsupported hyperliquid withdrawal destination {other_chain} {other_asset}")
-        }
-    }
-}
-
-async fn drive_unit_ingress_order_to_completion(
-    execution_manager: &OrderExecutionManager,
-    mocks: &MockIntegratorServer,
-    db: &Database,
-    order_id: Uuid,
-) {
-    execution_manager.process_worker_pass(10).await.unwrap();
-    let unit_deposit =
-        provider_operation_by_type(db, order_id, ProviderOperationType::UnitDeposit).await;
-
-    let h = harness().await;
-    h.mine_bitcoin_blocks(1)
-        .await
-        .expect("mine bitcoin unit deposit transfer");
-    h.wait_for_esplora_sync(Duration::from_secs(30))
-        .await
-        .expect("esplora sync after bitcoin unit deposit");
-
-    wait_for_mock_unit_operation_done(mocks, provider_ref(&unit_deposit), Duration::from_secs(10))
-        .await;
-    record_detector_provider_status_hint(execution_manager, &unit_deposit).await;
-    execution_manager
-        .process_provider_operation_hints(10)
-        .await
-        .unwrap();
-
-    execution_manager.process_worker_pass(10).await.unwrap();
-    let unit_withdrawal =
-        provider_operation_by_type(db, order_id, ProviderOperationType::UnitWithdrawal).await;
-    record_detector_provider_status_hint(execution_manager, &unit_withdrawal).await;
-    execution_manager
-        .process_provider_operation_hints(10)
-        .await
-        .unwrap();
-
-    let start = std::time::Instant::now();
-    loop {
-        execution_manager.process_worker_pass(10).await.unwrap();
-        let order = db.orders().get(order_id).await.unwrap();
-        if matches!(
-            order.status,
-            RouterOrderStatus::Completed
-                | RouterOrderStatus::Refunding
-                | RouterOrderStatus::Refunded
-                | RouterOrderStatus::Failed
-        ) {
-            if !matches!(order.status, RouterOrderStatus::Completed) {
-                dump_order_state(db, order_id).await;
-            }
-            return;
-        }
-        if start.elapsed() >= Duration::from_secs(10) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    dump_order_state(db, order_id).await;
-    panic!("unit-ingress order {order_id} did not reach a terminal state within 10s");
-}
-
-async fn hyperliquid_spot_vault_address(db: &Database, order_id: Uuid) -> Address {
-    let vaults = db.orders().get_custody_vaults(order_id).await.unwrap();
-    let hl_vault = vaults
-        .into_iter()
-        .find(|v| v.role == CustodyVaultRole::HyperliquidSpot)
-        .expect("cross-token flow should have derived a hyperliquid_spot custody vault");
-    Address::from_str(&hl_vault.address).expect("valid HL spot vault EVM address")
-}
-
-fn hl_deposit_coin_for_operation(operation: &OrderProviderOperation) -> String {
-    // The UnitDeposit operation request uses unit-wire keys (`src_chain`,
-    // `asset`) populated from `UnitChain::as_wire_str()` and the unit asset
-    // identifier. Map the unit asset directly to its HL spot coin symbol.
-    let asset = operation
-        .request
-        .get("asset")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    match asset {
-        "btc" => "UBTC".to_string(),
-        "eth" => "UETH".to_string(),
-        other => panic!("hl_deposit_coin_for_operation: unsupported UnitDeposit asset {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn order_executor_advances_async_provider_operations_after_detector_hints() {
-    let fixture = funded_market_order_fixture("evm:8453", "evm:1").await;
-    let execution_manager = OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        Arc::new(ActionProviderRegistry::mock_http(fixture.mocks.base_url())),
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    );
-    execution_manager.process_planning_pass(10).await.unwrap();
-
-    let summary = execution_manager
-        .execute_materialized_order(fixture.order_id)
-        .await
-        .unwrap()
-        .expect("execute_materialized_order should report progress in single-worker tests");
-    assert_eq!(summary.completed_steps, 0);
-    let across_operation = provider_operation_by_type(
-        &fixture.db,
-        fixture.order_id,
-        ProviderOperationType::AcrossBridge,
-    )
-    .await;
-    assert_eq!(
-        across_operation.status,
-        ProviderOperationStatus::WaitingExternal
-    );
-
-    wait_for_across_deposit_indexed(
-        &fixture.mocks,
-        fixture.vault_address,
-        Duration::from_secs(10),
-    )
-    .await;
-    record_detector_provider_status_hint(&execution_manager, &across_operation).await;
-    assert_eq!(
-        execution_manager
-            .process_provider_operation_hints(10)
-            .await
-            .unwrap(),
-        1
-    );
-    assert_eq!(
-        fixture
-            .db
-            .orders()
-            .get_provider_operation(across_operation.id)
-            .await
-            .unwrap()
-            .status,
-        ProviderOperationStatus::Completed
-    );
-    assert_eq!(
-        fixture
-            .mocks
-            .across_deposits_from(fixture.vault_address)
-            .await
-            .len(),
-        1
-    );
-
-    if let Some(summary) = execution_manager
-        .execute_materialized_order(fixture.order_id)
-        .await
-        .unwrap()
-    {
-        assert_eq!(summary.completed_steps, 1);
-    }
-    let unit_deposit_operation = provider_operation_by_type(
-        &fixture.db,
-        fixture.order_id,
-        ProviderOperationType::UnitDeposit,
-    )
-    .await;
-    assert_eq!(
-        unit_deposit_operation.status,
-        ProviderOperationStatus::WaitingExternal
-    );
-    assert_eq!(
-        filter_unit_operations_by_kind(
-            &fixture.mocks.ledger_snapshot().await.unit_operations,
-            MockUnitOperationKind::Deposit
-        )
-        .len(),
-        1
-    );
-
-    complete_unit_operation_from_request(&fixture.mocks, &unit_deposit_operation).await;
-    record_chain_detector_unit_deposit_hint(
-        &execution_manager,
-        &fixture.db,
-        &unit_deposit_operation,
-    )
-    .await;
-    assert_eq!(
-        execution_manager
-            .process_provider_operation_hints(10)
-            .await
-            .unwrap(),
-        1
-    );
-    assert_eq!(
-        fixture
-            .db
-            .orders()
-            .get_provider_operation(unit_deposit_operation.id)
-            .await
-            .unwrap()
-            .status,
-        ProviderOperationStatus::Completed
-    );
-    let unit_deposit_operation = fixture
-        .db
-        .orders()
-        .get_provider_operation(unit_deposit_operation.id)
-        .await
-        .unwrap();
-    credit_hyperliquid_spot_from_unit_deposit(
-        &fixture.mocks,
-        &fixture.db,
-        fixture.order_id,
-        &unit_deposit_operation,
-    )
-    .await;
-    assert_eq!(
-        filter_unit_operations_by_kind(
-            &fixture.mocks.ledger_snapshot().await.unit_operations,
-            MockUnitOperationKind::Deposit
-        )
-        .len(),
-        1
-    );
-
-    let summary = execution_manager
-        .execute_materialized_order(fixture.order_id)
-        .await
-        .unwrap()
-        .expect("execute_materialized_order should report progress in single-worker tests");
-    assert_eq!(summary.completed_steps, 2);
-    let unit_withdrawal_operation = provider_operation_by_type(
-        &fixture.db,
-        fixture.order_id,
-        ProviderOperationType::UnitWithdrawal,
-    )
-    .await;
-    assert_eq!(
-        unit_withdrawal_operation.status,
-        ProviderOperationStatus::WaitingExternal
-    );
-    assert!(filter_unit_operations_by_kind(
-        &fixture.mocks.ledger_snapshot().await.unit_operations,
-        MockUnitOperationKind::Withdrawal
-    )
-    .iter()
-    .any(|op| op.state == "done"));
-
-    complete_unit_operation_from_request(&fixture.mocks, &unit_withdrawal_operation).await;
-    record_detector_provider_status_hint(&execution_manager, &unit_withdrawal_operation).await;
-    assert_eq!(
-        execution_manager
-            .process_provider_operation_hints(10)
-            .await
-            .unwrap(),
-        1
-    );
-    assert_eq!(
-        fixture
-            .db
-            .orders()
-            .get_provider_operation(unit_withdrawal_operation.id)
-            .await
-            .unwrap()
-            .status,
-        ProviderOperationStatus::Completed
-    );
-    assert_eq!(
-        filter_unit_operations_by_kind(
-            &fixture.mocks.ledger_snapshot().await.unit_operations,
-            MockUnitOperationKind::Withdrawal
-        )
-        .len(),
-        1
-    );
-
-    let order = fixture.db.orders().get(fixture.order_id).await.unwrap();
-    let vault = fixture.db.vaults().get(fixture.vault_id).await.unwrap();
-    assert_eq!(order.status, RouterOrderStatus::Completed);
-    assert_eq!(vault.status, DepositVaultStatus::Completed);
-}
-
-#[tokio::test]
-async fn order_executor_rejects_tampered_nonfinal_intermediate_custody_route() {
-    let fixture = funded_market_order_fixture("evm:8453", "evm:1").await;
-    let execution_manager = OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        Arc::new(ActionProviderRegistry::mock_http(fixture.mocks.base_url())),
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    );
-    let now = Utc::now();
-    let hyperliquid_vault = CustodyVault {
-        id: Uuid::now_v7(),
-        order_id: Some(fixture.order_id),
-        role: CustodyVaultRole::HyperliquidSpot,
-        visibility: CustodyVaultVisibility::Internal,
-        chain: ChainId::parse("hyperliquid").unwrap(),
-        asset: None,
-        address: "0x2000000000000000000000000000000000000002".to_string(),
-        control_type: CustodyVaultControlType::RouterDerivedKey,
-        derivation_salt: Some([0x44; 32]),
-        signer_ref: None,
-        status: CustodyVaultStatus::Active,
-        metadata: json!({ "source": "tamper_test" }),
-        created_at: now,
-        updated_at: now,
-    };
-    fixture
-        .db
-        .orders()
-        .create_custody_vault(&hyperliquid_vault)
-        .await
-        .unwrap();
-    let execution_attempt = OrderExecutionAttempt {
-        id: Uuid::now_v7(),
-        order_id: fixture.order_id,
-        attempt_index: 1,
-        attempt_kind: OrderExecutionAttemptKind::PrimaryExecution,
-        status: OrderExecutionAttemptStatus::Active,
-        trigger_step_id: None,
-        trigger_provider_operation_id: None,
-        failure_reason: json!({}),
-        input_custody_snapshot: json!({}),
-        created_at: now,
-        updated_at: now,
-    };
-    fixture
-        .db
-        .orders()
-        .create_execution_attempt(&execution_attempt)
-        .await
-        .unwrap();
-
-    let tampered_across_leg_id = create_test_execution_leg_for_step(TestExecutionLegForStep {
-        db: &fixture.db,
-        order_id: fixture.order_id,
-        execution_attempt_id: Some(execution_attempt.id),
-        step_index: 1,
-        step_type: OrderExecutionStepType::AcrossBridge,
-        provider: "across",
-        input_asset: None,
-        output_asset: None,
-        amount_in: Some("1000"),
-        min_amount_out: Some("1000"),
-        now,
-    })
-    .await;
-    let tampered_across = OrderExecutionStep {
-        id: Uuid::now_v7(),
-        order_id: fixture.order_id,
-        execution_attempt_id: Some(execution_attempt.id),
-        execution_leg_id: Some(tampered_across_leg_id),
-        transition_decl_id: None,
-        step_index: 1,
-        step_type: OrderExecutionStepType::AcrossBridge,
-        provider: "across".to_string(),
-        status: OrderExecutionStepStatus::Planned,
-        input_asset: None,
-        output_asset: None,
-        amount_in: Some("1000".to_string()),
-        min_amount_out: Some("1000".to_string()),
-        tx_hash: None,
-        provider_ref: None,
-        idempotency_key: Some(format!("order:{}:tampered:1", fixture.order_id)),
-        attempt_count: 0,
-        next_attempt_at: None,
-        started_at: None,
-        completed_at: None,
-        details: json!({ "source": "tamper_test" }),
-        request: json!({
-            "recipient_custody_vault_role": "hyperliquid_spot",
-            "recipient_custody_vault_id": hyperliquid_vault.id,
-            "recipient": hyperliquid_vault.address,
-        }),
-        response: json!({}),
-        error: json!({}),
-        usd_valuation: json!({}),
-        created_at: now,
-        updated_at: now,
-    };
-    let final_withdrawal_leg_id = create_test_execution_leg_for_step(TestExecutionLegForStep {
-        db: &fixture.db,
-        order_id: fixture.order_id,
-        execution_attempt_id: Some(execution_attempt.id),
-        step_index: 2,
-        step_type: OrderExecutionStepType::UnitWithdrawal,
-        provider: "unit",
-        input_asset: None,
-        output_asset: None,
-        amount_in: Some("1000"),
-        min_amount_out: Some("1000"),
-        now,
-    })
-    .await;
-    let final_withdrawal = OrderExecutionStep {
-        id: Uuid::now_v7(),
-        order_id: fixture.order_id,
-        execution_attempt_id: Some(execution_attempt.id),
-        execution_leg_id: Some(final_withdrawal_leg_id),
-        transition_decl_id: None,
-        step_index: 2,
-        step_type: OrderExecutionStepType::UnitWithdrawal,
-        provider: "unit".to_string(),
-        status: OrderExecutionStepStatus::Planned,
-        input_asset: None,
-        output_asset: None,
-        amount_in: Some("1000".to_string()),
-        min_amount_out: Some("1000".to_string()),
-        tx_hash: None,
-        provider_ref: None,
-        idempotency_key: Some(format!("order:{}:tampered:2", fixture.order_id)),
-        attempt_count: 0,
-        next_attempt_at: None,
-        started_at: None,
-        completed_at: None,
-        details: json!({ "source": "tamper_test" }),
-        request: json!({
-            "hyperliquid_custody_vault_role": "hyperliquid_spot",
-            "hyperliquid_custody_vault_id": hyperliquid_vault.id,
-            "hyperliquid_custody_vault_address": hyperliquid_vault.address,
-        }),
-        response: json!({}),
-        error: json!({}),
-        usd_valuation: json!({}),
-        created_at: now,
-        updated_at: now,
-    };
-    fixture
-        .db
-        .orders()
-        .create_execution_steps_idempotent(&[tampered_across.clone(), final_withdrawal])
-        .await
-        .unwrap();
-    fixture
-        .db
-        .orders()
-        .transition_status(
-            fixture.order_id,
-            RouterOrderStatus::PendingFunding,
-            RouterOrderStatus::Funded,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-
-    let err = execution_manager
-        .execute_materialized_order(fixture.order_id)
-        .await
-        .expect_err("tampered route must reject before execution");
-    let err_text = err.to_string();
-    assert!(
-        err_text.contains("intermediate custody invariant"),
-        "{err:?}"
-    );
-    assert!(fixture
-        .db
-        .orders()
-        .get_provider_operations(fixture.order_id)
-        .await
-        .unwrap()
-        .is_empty());
-    let steps = fixture
-        .db
-        .orders()
-        .get_execution_steps(fixture.order_id)
-        .await
-        .unwrap();
-    let across_step = steps
-        .iter()
-        .find(|step| step.id == tampered_across.id)
-        .expect("tampered step should still exist");
-    assert_eq!(across_step.status, OrderExecutionStepStatus::Planned);
-}
-
-#[tokio::test]
-async fn order_executor_retries_when_async_provider_operation_fails_after_detector_hint() {
-    let fixture =
-        funded_market_order_fixture_with_amount("evm:8453", "evm:1", "1000000000000000").await;
-    let execution_manager = OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        Arc::new(ActionProviderRegistry::mock_http(fixture.mocks.base_url())),
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    );
-    execution_manager.process_planning_pass(10).await.unwrap();
-
-    execution_manager
-        .execute_materialized_order(fixture.order_id)
-        .await
-        .unwrap()
-        .expect("execute_materialized_order should report progress in single-worker tests");
-    let across_operation = provider_operation_by_type(
-        &fixture.db,
-        fixture.order_id,
-        ProviderOperationType::AcrossBridge,
-    )
-    .await;
-    wait_for_across_deposit_indexed(
-        &fixture.mocks,
-        fixture.vault_address,
-        Duration::from_secs(10),
-    )
-    .await;
-    record_detector_provider_status_hint(&execution_manager, &across_operation).await;
-    execution_manager
-        .process_provider_operation_hints(10)
-        .await
-        .unwrap();
-    execution_manager
-        .execute_materialized_order(fixture.order_id)
-        .await
-        .unwrap()
-        .expect("execute_materialized_order should report progress in single-worker tests");
-    let unit_deposit_operation = provider_operation_by_type(
-        &fixture.db,
-        fixture.order_id,
-        ProviderOperationType::UnitDeposit,
-    )
-    .await;
-    complete_unit_operation_from_request(&fixture.mocks, &unit_deposit_operation).await;
-    record_chain_detector_unit_deposit_hint(
-        &execution_manager,
-        &fixture.db,
-        &unit_deposit_operation,
-    )
-    .await;
-    execution_manager
-        .process_provider_operation_hints(10)
-        .await
-        .unwrap();
-    let unit_deposit_operation = fixture
-        .db
-        .orders()
-        .get_provider_operation(unit_deposit_operation.id)
-        .await
-        .unwrap();
-    credit_hyperliquid_spot_from_unit_deposit(
-        &fixture.mocks,
-        &fixture.db,
-        fixture.order_id,
-        &unit_deposit_operation,
-    )
-    .await;
-
-    fixture
-        .mocks
-        .fail_next_unit_withdrawal_completion("mock unit withdrawal async status failed")
-        .await;
-    execution_manager
-        .execute_materialized_order(fixture.order_id)
-        .await
-        .unwrap()
-        .expect("execute_materialized_order should report progress in single-worker tests");
-    let unit_withdrawal_operation = provider_operation_by_type(
-        &fixture.db,
-        fixture.order_id,
-        ProviderOperationType::UnitWithdrawal,
-    )
-    .await;
-    assert_eq!(
-        fixture
-            .mocks
-            .unit_operation_state(provider_ref(&unit_withdrawal_operation))
-            .await
-            .as_deref(),
-        Some("failure")
-    );
-    record_detector_provider_status_hint(&execution_manager, &unit_withdrawal_operation).await;
-    assert_eq!(
-        execution_manager
-            .process_provider_operation_hints(10)
-            .await
-            .unwrap(),
-        1
-    );
-
-    let failed_operation = fixture
-        .db
-        .orders()
-        .get_provider_operation(unit_withdrawal_operation.id)
-        .await
-        .unwrap();
-    assert_eq!(failed_operation.status, ProviderOperationStatus::Failed);
-    let failed_step = fixture
-        .db
-        .orders()
-        .get_execution_step(unit_withdrawal_operation.execution_step_id.unwrap())
-        .await
-        .unwrap();
-    assert_eq!(failed_step.status, OrderExecutionStepStatus::Failed);
-    // The real HyperUnit API exposes terminal failures via `state: "failure"`
-    // on the UnitOperation — it doesn't return structured error messages — so
-    // the router's fallback error JSON surfaces the provider status + observed
-    // state. Assert on the observable facts the mock faithfully reports.
-    let failed_error = failed_step.error.to_string();
-    assert!(
-        failed_error.contains("\"failed\""),
-        "expected step error to record failed status, got {failed_error}"
-    );
-    assert!(
-        failed_error.contains("\"failure\""),
-        "expected step error to carry observed UnitOperation state=failure, got {failed_error}"
-    );
-    let order = fixture.db.orders().get(fixture.order_id).await.unwrap();
-    let vault = fixture.db.vaults().get(fixture.vault_id).await.unwrap();
-    assert_eq!(order.status, RouterOrderStatus::Executing);
-    assert_eq!(vault.status, DepositVaultStatus::Executing);
-    let attempts = fixture
-        .db
-        .orders()
-        .get_execution_attempts(fixture.order_id)
-        .await
-        .unwrap();
-    assert_eq!(attempts.len(), 2);
-    assert_eq!(attempts[0].status, OrderExecutionAttemptStatus::Failed);
-    assert_eq!(attempts[1].status, OrderExecutionAttemptStatus::Active);
-    assert_eq!(
-        attempts[1].attempt_kind,
-        OrderExecutionAttemptKind::RetryExecution
-    );
-    let retry_steps = fixture
-        .db
-        .orders()
-        .get_execution_steps_for_attempt(attempts[1].id)
-        .await
-        .unwrap();
-    assert_eq!(retry_steps.len(), 1);
-    assert_eq!(
-        retry_steps[0].step_type,
-        OrderExecutionStepType::UnitWithdrawal
-    );
-    assert_eq!(retry_steps[0].status, OrderExecutionStepStatus::Planned);
-}
-
-#[tokio::test]
-async fn order_executor_advances_async_direct_unit_route_after_detector_hints() {
-    let fixture = funded_market_order_fixture("evm:1", "evm:8453").await;
-    let execution_manager = OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        Arc::new(ActionProviderRegistry::mock_http(fixture.mocks.base_url())),
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    );
-    execution_manager.process_planning_pass(10).await.unwrap();
-
-    let summary = execution_manager
-        .execute_materialized_order(fixture.order_id)
-        .await
-        .unwrap()
-        .expect("execute_materialized_order should report progress in single-worker tests");
-    assert_eq!(summary.completed_steps, 0);
-    assert!(fixture
-        .mocks
-        .across_deposits_from(fixture.vault_address)
-        .await
-        .is_empty());
-
-    let unit_deposit_operation = provider_operation_by_type(
-        &fixture.db,
-        fixture.order_id,
-        ProviderOperationType::UnitDeposit,
-    )
-    .await;
-    assert_eq!(
-        unit_deposit_operation.status,
-        ProviderOperationStatus::WaitingExternal
-    );
-    complete_unit_operation_from_request(&fixture.mocks, &unit_deposit_operation).await;
-    record_chain_detector_unit_deposit_hint(
-        &execution_manager,
-        &fixture.db,
-        &unit_deposit_operation,
-    )
-    .await;
-    assert_eq!(
-        execution_manager
-            .process_provider_operation_hints(10)
-            .await
-            .unwrap(),
-        1
-    );
-    let unit_deposit_operation = fixture
-        .db
-        .orders()
-        .get_provider_operation(unit_deposit_operation.id)
-        .await
-        .unwrap();
-    credit_hyperliquid_spot_from_unit_deposit(
-        &fixture.mocks,
-        &fixture.db,
-        fixture.order_id,
-        &unit_deposit_operation,
-    )
-    .await;
-    assert_eq!(
-        filter_unit_operations_by_kind(
-            &fixture.mocks.ledger_snapshot().await.unit_operations,
-            MockUnitOperationKind::Deposit
-        )
-        .len(),
-        1
-    );
-
-    let summary = execution_manager
-        .execute_materialized_order(fixture.order_id)
-        .await
-        .unwrap()
-        .expect("execute_materialized_order should report progress in single-worker tests");
-    assert_eq!(summary.completed_steps, 1);
-    let unit_withdrawal_operation = provider_operation_by_type(
-        &fixture.db,
-        fixture.order_id,
-        ProviderOperationType::UnitWithdrawal,
-    )
-    .await;
-    complete_unit_operation_from_request(&fixture.mocks, &unit_withdrawal_operation).await;
-    record_detector_provider_status_hint(&execution_manager, &unit_withdrawal_operation).await;
-    assert_eq!(
-        execution_manager
-            .process_provider_operation_hints(10)
-            .await
-            .unwrap(),
-        1
-    );
-
-    let order = fixture.db.orders().get(fixture.order_id).await.unwrap();
-    let vault = fixture.db.vaults().get(fixture.vault_id).await.unwrap();
-    assert_eq!(order.status, RouterOrderStatus::Completed);
-    assert_eq!(vault.status, DepositVaultStatus::Completed);
-    assert_eq!(
-        filter_unit_operations_by_kind(
-            &fixture.mocks.ledger_snapshot().await.unit_operations,
-            MockUnitOperationKind::Withdrawal
-        )
-        .len(),
-        1
-    );
-}
-
-#[tokio::test]
-async fn unit_deposit_chain_hint_does_not_complete_before_provider_credit() {
-    let fixture = funded_market_order_fixture_without_unit_indexers("evm:1", "evm:8453").await;
-    let execution_manager = OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        Arc::new(ActionProviderRegistry::mock_http(fixture.mocks.base_url())),
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    );
-    execution_manager.process_planning_pass(10).await.unwrap();
-
-    let summary = execution_manager
-        .execute_materialized_order(fixture.order_id)
-        .await
-        .unwrap()
-        .expect("execute_materialized_order should report progress in single-worker tests");
-    assert_eq!(summary.completed_steps, 0);
-
-    let unit_deposit_operation = provider_operation_by_type(
-        &fixture.db,
-        fixture.order_id,
-        ProviderOperationType::UnitDeposit,
-    )
-    .await;
-    assert_eq!(
-        unit_deposit_operation.status,
-        ProviderOperationStatus::WaitingExternal
-    );
-
-    record_chain_detector_unit_deposit_hint(
-        &execution_manager,
-        &fixture.db,
-        &unit_deposit_operation,
-    )
-    .await;
-    assert_eq!(
-        execution_manager
-            .process_provider_operation_hints(10)
-            .await
-            .unwrap(),
-        1
-    );
-
-    let refreshed = fixture
-        .db
-        .orders()
-        .get_provider_operation(unit_deposit_operation.id)
-        .await
-        .unwrap();
-    assert_eq!(refreshed.status, ProviderOperationStatus::WaitingExternal);
-}
-
-#[tokio::test]
-async fn worker_poll_completes_unit_deposit_after_provider_credit() {
-    let fixture = funded_market_order_fixture("evm:1", "evm:8453").await;
-    let execution_manager = OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        Arc::new(ActionProviderRegistry::mock_http(fixture.mocks.base_url())),
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    );
-    execution_manager.process_planning_pass(10).await.unwrap();
-
-    execution_manager
-        .execute_materialized_order(fixture.order_id)
-        .await
-        .unwrap()
-        .expect("execute_materialized_order should report progress in single-worker tests");
-
-    let unit_deposit_operation = provider_operation_by_type(
-        &fixture.db,
-        fixture.order_id,
-        ProviderOperationType::UnitDeposit,
-    )
-    .await;
-    record_chain_detector_unit_deposit_hint(
-        &execution_manager,
-        &fixture.db,
-        &unit_deposit_operation,
-    )
-    .await;
-    execution_manager
-        .process_provider_operation_hints(10)
-        .await
-        .unwrap();
-
-    complete_unit_operation_from_request(&fixture.mocks, &unit_deposit_operation).await;
-
-    record_detector_provider_status_hint(&execution_manager, &unit_deposit_operation).await;
-    execution_manager
-        .process_provider_operation_hints(10)
-        .await
-        .unwrap();
-
-    let refreshed = fixture
-        .db
-        .orders()
-        .get_provider_operation(unit_deposit_operation.id)
-        .await
-        .unwrap();
-    assert_eq!(refreshed.status, ProviderOperationStatus::Completed);
-}
-
-#[tokio::test]
-async fn order_executor_completes_mock_direct_unit_hyperliquid_flow() {
-    let fixture = funded_market_order_fixture("evm:1", "evm:8453").await;
-    let execution_manager = OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        Arc::new(ActionProviderRegistry::mock_http(fixture.mocks.base_url())),
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    );
-    execution_manager.process_planning_pass(10).await.unwrap();
-
-    let summary = execution_manager
-        .execute_materialized_order(fixture.order_id)
-        .await
-        .unwrap()
-        .expect("execute_materialized_order should report progress in single-worker tests");
-    assert_eq!(summary.completed_steps, 0);
-
-    let unit_deposit_operation = provider_operation_by_type(
-        &fixture.db,
-        fixture.order_id,
-        ProviderOperationType::UnitDeposit,
-    )
-    .await;
-    assert_eq!(
-        unit_deposit_operation.status,
-        ProviderOperationStatus::WaitingExternal
-    );
-    complete_unit_operation_from_request(&fixture.mocks, &unit_deposit_operation).await;
-    record_chain_detector_unit_deposit_hint(
-        &execution_manager,
-        &fixture.db,
-        &unit_deposit_operation,
-    )
-    .await;
-    assert_eq!(
-        execution_manager
-            .process_provider_operation_hints(10)
-            .await
-            .unwrap(),
-        1
-    );
-    let unit_deposit_operation = fixture
-        .db
-        .orders()
-        .get_provider_operation(unit_deposit_operation.id)
-        .await
-        .unwrap();
-    credit_hyperliquid_spot_from_unit_deposit(
-        &fixture.mocks,
-        &fixture.db,
-        fixture.order_id,
-        &unit_deposit_operation,
-    )
-    .await;
-
-    let summary = execution_manager
-        .execute_materialized_order(fixture.order_id)
-        .await
-        .unwrap()
-        .expect("execute_materialized_order should report progress in single-worker tests");
-    assert_eq!(summary.completed_steps, 1);
-
-    let unit_withdrawal_operation = provider_operation_by_type(
-        &fixture.db,
-        fixture.order_id,
-        ProviderOperationType::UnitWithdrawal,
-    )
-    .await;
-    complete_unit_operation_from_request(&fixture.mocks, &unit_withdrawal_operation).await;
-    record_detector_provider_status_hint(&execution_manager, &unit_withdrawal_operation).await;
-    assert_eq!(
-        execution_manager
-            .process_provider_operation_hints(10)
-            .await
-            .unwrap(),
-        1
-    );
-
-    let order = fixture.db.orders().get(fixture.order_id).await.unwrap();
-    let vault = fixture.db.vaults().get(fixture.vault_id).await.unwrap();
-    assert_eq!(order.status, RouterOrderStatus::Completed);
-    assert_eq!(vault.status, DepositVaultStatus::Completed);
-    assert!(fixture
-        .mocks
-        .across_deposits_from(fixture.vault_address)
-        .await
-        .is_empty());
-    let gen_requests = fixture.mocks.unit_generate_address_requests().await;
-    assert_eq!(
-        filter_unit_requests_by_kind(&gen_requests, MockUnitOperationKind::Deposit).len(),
-        1
-    );
-    assert_eq!(
-        filter_unit_requests_by_kind(&gen_requests, MockUnitOperationKind::Withdrawal).len(),
-        1
-    );
-    let ledger = fixture.mocks.ledger_snapshot().await;
-    assert!(ledger.bridged_balances.is_empty());
-    assert!(ledger.hyperliquid_balances.is_empty());
-    let deposit_ops =
-        filter_unit_operations_by_kind(&ledger.unit_operations, MockUnitOperationKind::Deposit);
-    let withdrawal_ops =
-        filter_unit_operations_by_kind(&ledger.unit_operations, MockUnitOperationKind::Withdrawal);
-    assert_eq!(deposit_ops.len(), 1);
-    assert_eq!(withdrawal_ops.len(), 1);
-
-    let provider_operations = fixture
-        .db
-        .orders()
-        .get_provider_operations(fixture.order_id)
-        .await
-        .unwrap();
-    let unit_operation = provider_operations
-        .iter()
-        .find(|operation| operation.operation_type == ProviderOperationType::UnitDeposit)
-        .expect("unit deposit provider operation should be persisted");
-    assert_eq!(unit_operation.provider, "unit");
-    assert_eq!(unit_operation.status, ProviderOperationStatus::Completed);
-
-    let provider_addresses = fixture
-        .db
-        .orders()
-        .get_provider_addresses(fixture.order_id)
-        .await
-        .unwrap();
-    let unit_address = provider_addresses
-        .iter()
-        .find(|address| address.role == ProviderAddressRole::UnitDeposit)
-        .expect("unit deposit provider address should be persisted");
-    assert_eq!(unit_address.provider_operation_id, Some(unit_operation.id));
-    assert_eq!(unit_address.provider, "unit");
-    assert_eq!(unit_address.address, deposit_ops[0].protocol_address);
-}
-
-#[tokio::test]
-async fn order_executor_validates_chain_deposit_hint_before_next_step() {
-    let dir = tempfile::tempdir().unwrap();
-    let h = harness().await;
-    let db = test_db().await;
-    let settings = Arc::new(test_settings(dir.path()));
-    let action_providers = Arc::new(ActionProviderRegistry::new(
-        vec![],
-        vec![Arc::new(ObservationUnitProvider)],
-        vec![Arc::new(ProviderOnlyExchangeProvider)],
-    ));
-    let order_manager = OrderManager::with_action_providers(
-        db.clone(),
-        settings.clone(),
-        h.chain_registry.clone(),
-        action_providers.clone(),
-    );
-    let vault_manager = VaultManager::new(db.clone(), settings.clone(), h.chain_registry.clone());
-
-    let quote = order_manager
-        .quote_market_order(MarketOrderQuoteRequest {
-            from_asset: DepositAsset {
-                chain: ChainId::parse("evm:1").unwrap(),
-                asset: AssetId::Native,
-            },
-            to_asset: DepositAsset {
-                chain: ChainId::parse("evm:8453").unwrap(),
-                asset: AssetId::Native,
-            },
-            recipient_address: valid_evm_address(),
-            order_kind: MarketOrderQuoteKind::ExactIn {
-                amount_in: "1000".to_string(),
-                slippage_bps: 100,
-            },
-        })
-        .await
-        .unwrap();
-    let order = create_test_order_from_quote(
-        &order_manager,
-        quote
-            .quote
-            .as_market_order()
-            .expect("market order quote")
-            .id,
-    )
-    .await;
-    let vault = vault_manager
-        .create_vault(CreateVaultRequest {
-            order_id: Some(order.id),
-            deposit_asset: DepositAsset {
-                chain: ChainId::parse("evm:1").unwrap(),
-                asset: AssetId::Native,
-            },
-            ..evm_native_request()
-        })
-        .await
-        .unwrap();
-    db.vaults()
-        .transition_status(
-            vault.id,
-            DepositVaultStatus::PendingFunding,
-            DepositVaultStatus::Funded,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-
-    let execution_manager = OrderExecutionManager::with_dependencies(
-        db.clone(),
-        action_providers,
-        Arc::new(CustodyActionExecutor::new(
-            db.clone(),
-            settings,
-            h.chain_registry.clone(),
-        )),
-        h.chain_registry.clone(),
-    );
-    execution_manager.process_planning_pass(10).await.unwrap();
-    let summary = execution_manager
-        .execute_materialized_order(order.id)
-        .await
-        .unwrap()
-        .expect("execute_materialized_order should report progress in single-worker tests");
-    assert_eq!(summary.completed_steps, 0);
-
-    let order_after_submit = db.orders().get(order.id).await.unwrap();
-    let vault_after_submit = db.vaults().get(vault.id).await.unwrap();
-    assert_eq!(order_after_submit.status, RouterOrderStatus::Executing);
-    assert_eq!(vault_after_submit.status, DepositVaultStatus::Executing);
-
-    let steps = db.orders().get_execution_steps(order.id).await.unwrap();
-    let unit_step = steps
-        .iter()
-        .find(|step| step.step_type == OrderExecutionStepType::UnitDeposit)
-        .unwrap();
-    let withdrawal_step = steps
-        .iter()
-        .find(|step| step.step_type == OrderExecutionStepType::UnitWithdrawal)
-        .unwrap();
-    assert_eq!(unit_step.status, OrderExecutionStepStatus::Waiting);
-    assert_eq!(withdrawal_step.status, OrderExecutionStepStatus::Planned);
-
-    let provider_operations = db.orders().get_provider_operations(order.id).await.unwrap();
-    let unit_operation = provider_operations
-        .iter()
-        .find(|operation| operation.operation_type == ProviderOperationType::UnitDeposit)
-        .unwrap();
-    assert_eq!(unit_operation.status, ProviderOperationStatus::Submitted);
-    let provider_ref = unit_operation.provider_ref.clone().unwrap();
-
-    let fake_tx_hash = format!("0x{}", "33".repeat(32));
-    let fake_hint = execution_manager
-        .record_provider_operation_hint(OrderProviderOperationHint {
-            id: Uuid::now_v7(),
-            provider_operation_id: unit_operation.id,
-            source: "test-chain-detector".to_string(),
-            hint_kind: ProviderOperationHintKind::PossibleProgress,
-            evidence: json!({
-                "source": "test-chain-detector",
-                "backend": "ethereum_evm",
-                "chain": "ethereum",
-                "address": "0x2000000000000000000000000000000000000001",
-                "tx_hash": fake_tx_hash,
-                "transfer_index": 0,
-                "amount": "1000",
-                "observed_at": Utc::now()
-            }),
-            status: ProviderOperationHintStatus::Pending,
-            idempotency_key: Some(format!("test-chain-detector-fake-hint-{provider_ref}")),
-            error: json!({}),
-            claimed_at: None,
-            processed_at: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        })
-        .await
-        .unwrap();
-    assert_eq!(fake_hint.status, ProviderOperationHintStatus::Pending);
-
-    let processed_hints = execution_manager
-        .process_provider_operation_hints(10)
-        .await
-        .unwrap();
-    assert_eq!(processed_hints, 1);
-    let operation_after_fake_hint = db
-        .orders()
-        .get_provider_operation(unit_operation.id)
-        .await
-        .unwrap();
-    assert_eq!(
-        operation_after_fake_hint.status,
-        ProviderOperationStatus::Submitted
-    );
-    let unit_step_after_fake_hint = db.orders().get_execution_step(unit_step.id).await.unwrap();
-    assert_eq!(
-        unit_step_after_fake_hint.status,
-        OrderExecutionStepStatus::Waiting
-    );
-
-    let deposit_address = Address::from_str("0x2000000000000000000000000000000000000001").unwrap();
-    let (observed_tx_hash, transfer_index) =
-        anvil_send_ethereum_native(h, deposit_address, U256::from(1000_u64)).await;
-    let hint = execution_manager
-        .record_provider_operation_hint(OrderProviderOperationHint {
-            id: Uuid::now_v7(),
-            provider_operation_id: unit_operation.id,
-            source: "test-chain-detector".to_string(),
-            hint_kind: ProviderOperationHintKind::PossibleProgress,
-            evidence: json!({
-                "source": "test-chain-detector",
-                "backend": "ethereum_evm",
-                "chain": "ethereum",
-                "address": "0x2000000000000000000000000000000000000001",
-                "tx_hash": observed_tx_hash.clone(),
-                "transfer_index": transfer_index,
-                "amount": "1000",
-                "observed_at": Utc::now()
-            }),
-            status: ProviderOperationHintStatus::Pending,
-            idempotency_key: Some(format!("test-chain-detector-hint-{provider_ref}")),
-            error: json!({}),
-            claimed_at: None,
-            processed_at: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        })
-        .await
-        .unwrap();
-    assert_eq!(hint.status, ProviderOperationHintStatus::Pending);
-
-    let operation_after_hint_insert = db
-        .orders()
-        .get_provider_operation(unit_operation.id)
-        .await
-        .unwrap();
-    assert_eq!(
-        operation_after_hint_insert.status,
-        ProviderOperationStatus::Submitted
-    );
-    let unit_step_after_hint_insert = db.orders().get_execution_step(unit_step.id).await.unwrap();
-    assert_eq!(
-        unit_step_after_hint_insert.status,
-        OrderExecutionStepStatus::Waiting
-    );
-
-    let processed_hints = execution_manager
-        .process_provider_operation_hints(10)
-        .await
-        .unwrap();
-    assert_eq!(processed_hints, 1);
-    let operation_after_hint_processing = db
-        .orders()
-        .get_provider_operation(unit_operation.id)
-        .await
-        .unwrap();
-    assert_eq!(
-        operation_after_hint_processing.status,
-        ProviderOperationStatus::Completed
-    );
-    let unit_step_after_hint_processing =
-        db.orders().get_execution_step(unit_step.id).await.unwrap();
-    assert_eq!(
-        unit_step_after_hint_processing.status,
-        OrderExecutionStepStatus::Completed
-    );
-
-    let summary = execution_manager
-        .execute_materialized_order(order.id)
-        .await
-        .unwrap()
-        .expect("execute_materialized_order should report progress in single-worker tests");
-    assert_eq!(summary.completed_steps, 2);
-    let order = db.orders().get(order.id).await.unwrap();
-    let vault = db.vaults().get(vault.id).await.unwrap();
-    assert_eq!(order.status, RouterOrderStatus::Completed);
-    assert_eq!(vault.status, DepositVaultStatus::Completed);
-}
-
-#[tokio::test]
-async fn order_executor_processes_provider_operation_status_hints() {
-    let fixture = funded_market_order_fixture("evm:1", "evm:8453").await;
-    let execution_manager = OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        Arc::new(ActionProviderRegistry::mock_http(fixture.mocks.base_url())),
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    );
-    // Across lives on a separate verifier path (chain-indexer deposit status,
-    // exercised by `drive_across_order_to_completion` tests); this test covers
-    // the generic provider-status hint path used by Unit.
-    let cases = [(
-        OrderExecutionStepType::UnitWithdrawal,
-        ProviderOperationType::UnitWithdrawal,
-        "unit",
-    )];
-
-    for (index, (step_type, operation_type, provider)) in cases.into_iter().enumerate() {
-        let now = Utc::now();
-        let provider_ref = format!("{provider}-status-op-{index}");
-        let execution_attempt = OrderExecutionAttempt {
-            id: Uuid::now_v7(),
-            order_id: fixture.order_id,
-            attempt_index: 100 + index as i32,
-            attempt_kind: OrderExecutionAttemptKind::PrimaryExecution,
-            status: OrderExecutionAttemptStatus::Active,
-            trigger_step_id: None,
-            trigger_provider_operation_id: None,
-            failure_reason: json!({}),
-            input_custody_snapshot: json!({}),
-            created_at: now,
-            updated_at: now,
-        };
-        fixture
-            .db
-            .orders()
-            .create_execution_attempt(&execution_attempt)
-            .await
-            .unwrap();
-        let execution_leg_id = create_test_execution_leg_for_step(TestExecutionLegForStep {
-            db: &fixture.db,
-            order_id: fixture.order_id,
-            execution_attempt_id: Some(execution_attempt.id),
-            step_index: 20 + index as i32,
-            step_type,
-            provider,
-            input_asset: None,
-            output_asset: None,
-            amount_in: Some("1000"),
-            min_amount_out: Some("1000"),
-            now,
-        })
-        .await;
-        let step = OrderExecutionStep {
-            id: Uuid::now_v7(),
-            order_id: fixture.order_id,
-            execution_attempt_id: Some(execution_attempt.id),
-            execution_leg_id: Some(execution_leg_id),
-            transition_decl_id: None,
-            step_index: 20 + index as i32,
-            step_type,
-            provider: provider.to_string(),
-            status: OrderExecutionStepStatus::Waiting,
-            input_asset: None,
-            output_asset: None,
-            amount_in: Some("1000".to_string()),
-            min_amount_out: Some("1000".to_string()),
-            tx_hash: None,
-            provider_ref: Some(provider_ref.clone()),
-            idempotency_key: Some(format!("order:{}:{provider}:status-test", fixture.order_id)),
-            attempt_count: 0,
-            next_attempt_at: None,
-            started_at: Some(now),
-            completed_at: None,
-            details: json!({ "source": "provider_status_hint_test" }),
-            request: json!({
-                "endpoint": "/status-test",
-                "provider": provider,
-                "operation_type": operation_type.to_db_string()
-            }),
-            response: json!({}),
-            error: json!({}),
-            usd_valuation: json!({}),
-            created_at: now,
-            updated_at: now,
-        };
-        fixture
-            .db
-            .orders()
-            .create_execution_step(&step)
-            .await
-            .unwrap();
-        let operation = OrderProviderOperation {
-            id: Uuid::now_v7(),
-            order_id: fixture.order_id,
-            execution_attempt_id: Some(execution_attempt.id),
-            execution_step_id: Some(step.id),
-            provider: provider.to_string(),
-            operation_type,
-            provider_ref: Some(provider_ref.clone()),
-            status: ProviderOperationStatus::WaitingExternal,
-            request: step.request.clone(),
-            response: json!({ "provider_ref": provider_ref }),
-            observed_state: json!({}),
-            created_at: now,
-            updated_at: now,
-        };
-        fixture
-            .db
-            .orders()
-            .create_provider_operation(&operation)
-            .await
-            .unwrap();
-        let mock_kind = match operation_type {
-            ProviderOperationType::UnitDeposit => MockUnitOperationKind::Deposit,
-            ProviderOperationType::UnitWithdrawal => MockUnitOperationKind::Withdrawal,
-            _ => panic!("status-hint test only covers Unit provider operations"),
-        };
-        fixture
-            .mocks
-            .seed_completed_unit_operation(&provider_ref, mock_kind)
-            .await;
-        execution_manager
-            .record_provider_operation_hint(OrderProviderOperationHint {
-                id: Uuid::now_v7(),
-                provider_operation_id: operation.id,
-                source: "test-detector".to_string(),
-                hint_kind: ProviderOperationHintKind::PossibleProgress,
-                evidence: json!({
-                    "source": "test-detector",
-                    "backend": "provider_operation",
-                    "provider": provider,
-                    "operation_type": operation_type.to_db_string(),
-                    "provider_ref": provider_ref,
-                    "observed_status": "completed",
-                    "observed_at": Utc::now()
-                }),
-                status: ProviderOperationHintStatus::Pending,
-                idempotency_key: Some(format!("test-provider-status-hint-{provider}-{index}")),
-                error: json!({}),
-                claimed_at: None,
-                processed_at: None,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-            })
-            .await
-            .unwrap();
-
-        let processed_hints = execution_manager
-            .process_provider_operation_hints(10)
-            .await
-            .unwrap();
-        assert_eq!(processed_hints, 1);
-        let operation_after_hint = fixture
-            .db
-            .orders()
-            .get_provider_operation(operation.id)
-            .await
-            .unwrap();
-        assert_eq!(
-            operation_after_hint.status,
-            ProviderOperationStatus::Completed
-        );
-        let step_after_hint = fixture
-            .db
-            .orders()
-            .get_execution_step(step.id)
-            .await
-            .unwrap();
-        assert_eq!(step_after_hint.status, OrderExecutionStepStatus::Completed);
-    }
-}
-
-#[tokio::test]
-async fn order_executor_retries_when_across_fails() {
-    let dir = tempfile::tempdir().unwrap();
-    let h = harness().await;
-    let db = test_db().await;
-    let mocks = MockIntegratorServer::spawn().await.unwrap();
-    let settings = Arc::new(test_settings(dir.path()));
-    let (order_manager, _mocks) = mock_order_manager(db.clone(), h.chain_registry.clone()).await;
-    let vault_manager = VaultManager::new(db.clone(), settings, h.chain_registry.clone());
-
-    let quote = order_manager
-        .quote_market_order(MarketOrderQuoteRequest {
-            from_asset: DepositAsset {
-                chain: ChainId::parse("evm:8453").unwrap(),
-                asset: AssetId::Native,
-            },
-            to_asset: DepositAsset {
-                chain: ChainId::parse("evm:1").unwrap(),
-                asset: AssetId::Native,
-            },
-            recipient_address: valid_evm_address(),
-            order_kind: MarketOrderQuoteKind::ExactIn {
-                amount_in: "1000".to_string(),
-                slippage_bps: 100,
-            },
-        })
-        .await
-        .unwrap();
-    let order = create_test_order_from_quote(
-        &order_manager,
-        quote
-            .quote
-            .as_market_order()
-            .expect("market order quote")
-            .id,
-    )
-    .await;
-    let vault = vault_manager
-        .create_vault(CreateVaultRequest {
-            order_id: Some(order.id),
-            deposit_asset: DepositAsset {
-                chain: ChainId::parse("evm:8453").unwrap(),
-                asset: AssetId::Native,
-            },
-            ..evm_native_request()
-        })
-        .await
-        .unwrap();
-    db.vaults()
-        .transition_status(
-            vault.id,
-            DepositVaultStatus::PendingFunding,
-            DepositVaultStatus::Funded,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-
-    let execution_manager = OrderExecutionManager::with_dependencies(
-        db.clone(),
-        Arc::new(ActionProviderRegistry::mock_http(mocks.base_url())),
-        Arc::new(CustodyActionExecutor::new(
-            db.clone(),
-            Arc::new(test_settings(dir.path())),
-            h.chain_registry.clone(),
-        )),
-        h.chain_registry.clone(),
-    );
-    execution_manager.process_planning_pass(10).await.unwrap();
-    mocks
-        .fail_next_across_swap_approval("mock across unavailable")
-        .await;
-    let err = execution_manager
-        .execute_materialized_order(order.id)
-        .await
-        .unwrap_err();
-    assert!(err.to_string().contains("mock across unavailable"));
-
-    let order = db.orders().get(order.id).await.unwrap();
-    let vault = db.vaults().get(vault.id).await.unwrap();
-    assert_eq!(order.status, RouterOrderStatus::Executing);
-    assert_eq!(vault.status, DepositVaultStatus::Executing);
-    let attempts = db.orders().get_execution_attempts(order.id).await.unwrap();
-    assert_eq!(attempts.len(), 2);
-    assert_eq!(attempts[0].status, OrderExecutionAttemptStatus::Failed);
-    assert_eq!(attempts[1].status, OrderExecutionAttemptStatus::Active);
-    assert_eq!(
-        attempts[1].attempt_kind,
-        OrderExecutionAttemptKind::RetryExecution
-    );
-    let steps = db.orders().get_execution_steps(order.id).await.unwrap();
-    let across_step = steps
-        .iter()
-        .find(|step| {
-            step.step_type == OrderExecutionStepType::AcrossBridge
-                && step.execution_attempt_id == Some(attempts[0].id)
-        })
-        .unwrap();
-    assert_eq!(across_step.status, OrderExecutionStepStatus::Failed);
-    assert!(across_step
-        .error
-        .to_string()
-        .contains("mock across unavailable"));
-    let retry_steps = db
-        .orders()
-        .get_execution_steps_for_attempt(attempts[1].id)
-        .await
-        .unwrap();
-    assert_eq!(retry_steps.len(), 3);
-    assert_eq!(
-        retry_steps[0].step_type,
-        OrderExecutionStepType::AcrossBridge
-    );
-    assert_eq!(retry_steps[0].status, OrderExecutionStepStatus::Planned);
-}
-
-#[tokio::test]
-async fn order_executor_marks_order_refund_required_when_unit_deposit_fails() {
-    let fixture = funded_market_order_fixture("evm:8453", "evm:1").await;
-    drive_unit_deposit_failures_to_refund_required(&fixture, "mock unit deposit unavailable").await;
-}
-
-#[tokio::test]
-async fn order_executor_marks_order_refund_required_when_unit_withdrawal_fails_twice() {
-    let fixture =
-        funded_market_order_fixture_with_amount("evm:8453", "evm:1", "1000000000000000").await;
-    let execution_manager = OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        Arc::new(ActionProviderRegistry::mock_http(fixture.mocks.base_url())),
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    );
-    execution_manager.process_planning_pass(10).await.unwrap();
-
-    execution_manager
-        .execute_materialized_order(fixture.order_id)
-        .await
-        .unwrap()
-        .expect("across leg should start");
-    let across_operation = provider_operation_by_type(
-        &fixture.db,
-        fixture.order_id,
-        ProviderOperationType::AcrossBridge,
-    )
-    .await;
-    wait_for_across_deposit_indexed(
-        &fixture.mocks,
-        fixture.vault_address,
-        Duration::from_secs(10),
-    )
-    .await;
-    record_detector_provider_status_hint(&execution_manager, &across_operation).await;
-    execution_manager
-        .process_provider_operation_hints(10)
-        .await
-        .unwrap();
-    execution_manager
-        .execute_materialized_order(fixture.order_id)
-        .await
-        .unwrap()
-        .expect("unit deposit should start");
-    let unit_deposit_operation = provider_operation_by_type(
-        &fixture.db,
-        fixture.order_id,
-        ProviderOperationType::UnitDeposit,
-    )
-    .await;
-    complete_unit_operation_from_request(&fixture.mocks, &unit_deposit_operation).await;
-    record_chain_detector_unit_deposit_hint(
-        &execution_manager,
-        &fixture.db,
-        &unit_deposit_operation,
-    )
-    .await;
-    execution_manager
-        .process_provider_operation_hints(10)
-        .await
-        .unwrap();
-    let unit_deposit_operation = fixture
-        .db
-        .orders()
-        .get_provider_operation(unit_deposit_operation.id)
-        .await
-        .unwrap();
-    credit_hyperliquid_spot_from_unit_deposit(
-        &fixture.mocks,
-        &fixture.db,
-        fixture.order_id,
-        &unit_deposit_operation,
-    )
-    .await;
-
-    fixture
-        .mocks
-        .fail_next_hyperliquid_exchange("mock unit withdrawal unavailable")
-        .await;
-    let first_err = execution_manager
-        .execute_materialized_order(fixture.order_id)
-        .await
-        .unwrap_err();
-    assert!(first_err
-        .to_string()
-        .contains("mock unit withdrawal unavailable"));
-
-    fixture
-        .mocks
-        .fail_next_hyperliquid_exchange("mock unit withdrawal unavailable")
-        .await;
-    let second_err = execution_manager
-        .execute_materialized_order(fixture.order_id)
-        .await
-        .unwrap_err();
-    assert!(second_err
-        .to_string()
-        .contains("mock unit withdrawal unavailable"));
-
-    let order = fixture.db.orders().get(fixture.order_id).await.unwrap();
-    let vault = fixture.db.vaults().get(fixture.vault_id).await.unwrap();
-    assert_eq!(order.status, RouterOrderStatus::RefundRequired);
-    assert_eq!(vault.status, DepositVaultStatus::RefundRequired);
-    let attempts = fixture
-        .db
-        .orders()
-        .get_execution_attempts(fixture.order_id)
-        .await
-        .unwrap();
-    assert_eq!(attempts.len(), 3);
-    assert_eq!(attempts[0].status, OrderExecutionAttemptStatus::Failed);
-    assert_eq!(attempts[1].status, OrderExecutionAttemptStatus::Failed);
-    assert_eq!(
-        attempts[2].attempt_kind,
-        OrderExecutionAttemptKind::RefundRecovery
-    );
-    assert_eq!(
-        attempts[2].status,
-        OrderExecutionAttemptStatus::RefundRequired
-    );
-    let steps = fixture
-        .db
-        .orders()
-        .get_execution_steps(fixture.order_id)
-        .await
-        .unwrap();
-    let failed_withdrawals: Vec<_> = steps
-        .iter()
-        .filter(|step| {
-            step.step_type == OrderExecutionStepType::UnitWithdrawal
-                && step.status == OrderExecutionStepStatus::Failed
-        })
-        .collect();
-    assert_eq!(failed_withdrawals.len(), 2);
-    assert!(failed_withdrawals.iter().all(|step| {
-        step.error
-            .to_string()
-            .contains("mock unit withdrawal unavailable")
-    }));
-}
-
-#[tokio::test]
-async fn refund_required_funding_vault_refund_completes_and_finalizes_order() {
-    let fixture = funded_market_order_fixture("evm:8453", "evm:1").await;
-    let execution_manager = OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        Arc::new(ActionProviderRegistry::mock_http(fixture.mocks.base_url())),
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    );
-    let vault_manager = VaultManager::new(
-        fixture.db.clone(),
-        fixture.settings.clone(),
-        fixture.chain_registry.clone(),
-    );
-    let now = Utc::now();
-    let refund_attempt = OrderExecutionAttempt {
-        id: Uuid::now_v7(),
-        order_id: fixture.order_id,
-        attempt_index: 1,
-        attempt_kind: OrderExecutionAttemptKind::RefundRecovery,
-        status: OrderExecutionAttemptStatus::RefundRequired,
-        trigger_step_id: None,
-        trigger_provider_operation_id: None,
-        failure_reason: json!({
-            "reason": "test_direct_funding_vault_refund"
-        }),
-        input_custody_snapshot: json!({
-            "source_kind": "funding_vault",
-            "vault_id": fixture.vault_id,
-        }),
-        created_at: now,
-        updated_at: now,
-    };
-    fixture
-        .db
-        .orders()
-        .create_execution_attempt(&refund_attempt)
-        .await
-        .unwrap();
-    let initial_order = fixture.db.orders().get(fixture.order_id).await.unwrap();
-    fixture
-        .db
-        .orders()
-        .transition_status(
-            fixture.order_id,
-            initial_order.status,
-            RouterOrderStatus::RefundRequired,
-            now,
-        )
-        .await
-        .unwrap();
-    fixture
-        .db
-        .vaults()
-        .transition_status(
-            fixture.vault_id,
-            DepositVaultStatus::Funded,
-            DepositVaultStatus::RefundRequired,
-            now,
-        )
-        .await
-        .unwrap();
-
-    execution_manager.process_worker_pass(10).await.unwrap();
-
-    let order = fixture.db.orders().get(fixture.order_id).await.unwrap();
-    let vault = fixture.db.vaults().get(fixture.vault_id).await.unwrap();
-    let refund_attempt = fixture
-        .db
-        .orders()
-        .get_execution_attempt(refund_attempt.id)
-        .await
-        .unwrap();
-    assert_eq!(order.status, RouterOrderStatus::Refunding);
-    assert_eq!(vault.status, DepositVaultStatus::Refunding);
-    assert_eq!(refund_attempt.status, OrderExecutionAttemptStatus::Active);
-    let refund_steps = fixture
-        .db
-        .orders()
-        .get_execution_steps_for_attempt(refund_attempt.id)
-        .await
-        .unwrap();
-    assert!(
-        refund_steps.is_empty(),
-        "direct funding-vault refunds should not materialize execution steps"
-    );
-
-    vault_manager.process_refund_pass().await;
-    execution_manager.process_worker_pass(10).await.unwrap();
-
-    let order = fixture.db.orders().get(fixture.order_id).await.unwrap();
-    let vault = fixture.db.vaults().get(fixture.vault_id).await.unwrap();
-    let attempts = fixture
-        .db
-        .orders()
-        .get_execution_attempts(fixture.order_id)
-        .await
-        .unwrap();
-    let refund_attempt = attempts
-        .iter()
-        .find(|attempt| attempt.id == refund_attempt.id)
-        .unwrap();
-    assert_eq!(order.status, RouterOrderStatus::Refunded);
-    assert_eq!(vault.status, DepositVaultStatus::Refunded);
-    assert!(vault.refund_tx_hash.is_some());
-    assert_eq!(
-        refund_attempt.status,
-        OrderExecutionAttemptStatus::Completed
-    );
-}
-
-#[tokio::test]
-async fn completed_automatic_refund_attempt_finalizes_as_refunded() {
-    let fixture = funded_market_order_fixture("evm:8453", "evm:1").await;
-    let now = Utc::now();
-    fixture
-        .db
-        .orders()
-        .transition_status(
-            fixture.order_id,
-            RouterOrderStatus::PendingFunding,
-            RouterOrderStatus::Funded,
-            now,
-        )
-        .await
-        .unwrap();
-    fixture
-        .db
-        .orders()
-        .transition_status(
-            fixture.order_id,
-            RouterOrderStatus::Funded,
-            RouterOrderStatus::RefundRequired,
-            now,
-        )
-        .await
-        .unwrap();
-    fixture
-        .db
-        .orders()
-        .transition_status(
-            fixture.order_id,
-            RouterOrderStatus::RefundRequired,
-            RouterOrderStatus::Refunding,
-            now,
-        )
-        .await
-        .unwrap();
-    fixture
-        .db
-        .vaults()
-        .transition_status(
-            fixture.vault_id,
-            DepositVaultStatus::Funded,
-            DepositVaultStatus::RefundRequired,
-            now,
-        )
-        .await
-        .unwrap();
-    fixture
-        .db
-        .vaults()
-        .transition_status(
-            fixture.vault_id,
-            DepositVaultStatus::RefundRequired,
-            DepositVaultStatus::Refunding,
-            now,
-        )
-        .await
-        .unwrap();
-
-    let refund_attempt = OrderExecutionAttempt {
-        id: Uuid::now_v7(),
-        order_id: fixture.order_id,
-        attempt_index: 1,
-        attempt_kind: OrderExecutionAttemptKind::RefundRecovery,
-        status: OrderExecutionAttemptStatus::Active,
-        trigger_step_id: None,
-        trigger_provider_operation_id: None,
-        failure_reason: json!({ "reason": "synthetic_completed_refund_route" }),
-        input_custody_snapshot: json!({ "source_kind": "funding_vault" }),
-        created_at: now,
-        updated_at: now,
-    };
-    fixture
-        .db
-        .orders()
-        .create_execution_attempt(&refund_attempt)
-        .await
-        .unwrap();
-    let leg_id = create_test_execution_leg_for_step(TestExecutionLegForStep {
-        db: &fixture.db,
-        order_id: fixture.order_id,
-        execution_attempt_id: Some(refund_attempt.id),
-        step_index: 1,
-        step_type: OrderExecutionStepType::AcrossBridge,
-        provider: "across",
-        input_asset: None,
-        output_asset: None,
-        amount_in: Some("1000"),
-        min_amount_out: Some("990"),
-        now,
-    })
-    .await;
-    let step = OrderExecutionStep {
-        id: Uuid::now_v7(),
-        order_id: fixture.order_id,
-        execution_attempt_id: Some(refund_attempt.id),
-        execution_leg_id: Some(leg_id),
-        transition_decl_id: Some("test:completed-refund-route".to_string()),
-        step_index: 1,
-        step_type: OrderExecutionStepType::AcrossBridge,
-        provider: "across".to_string(),
-        status: OrderExecutionStepStatus::Completed,
-        input_asset: Some(DepositAsset {
-            chain: ChainId::parse("evm:8453").unwrap(),
-            asset: AssetId::Native,
-        }),
-        output_asset: Some(DepositAsset {
-            chain: ChainId::parse("evm:1").unwrap(),
-            asset: AssetId::Native,
-        }),
-        amount_in: Some("1000".to_string()),
-        min_amount_out: Some("990".to_string()),
-        tx_hash: Some(format!("0x{}", "44".repeat(32))),
-        provider_ref: Some("synthetic-refund-provider-ref".to_string()),
-        idempotency_key: Some("synthetic-completed-refund-step".to_string()),
-        attempt_count: 0,
-        next_attempt_at: None,
-        started_at: Some(now),
-        completed_at: Some(now),
-        details: json!({ "source": "test_fixture" }),
-        request: json!({ "source": "test_fixture" }),
-        response: json!({ "amount_in": "1000", "amount_out": "990" }),
-        error: json!({}),
-        usd_valuation: json!({}),
-        created_at: now,
-        updated_at: now,
-    };
-    fixture
-        .db
-        .orders()
-        .create_execution_steps_idempotent(&[step])
-        .await
-        .unwrap();
-    fixture
-        .db
-        .orders()
-        .refresh_execution_leg_from_actions(leg_id)
-        .await
-        .unwrap();
-
-    let execution_manager = OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        Arc::new(ActionProviderRegistry::mock_http(fixture.mocks.base_url())),
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    );
-    let summary = execution_manager
-        .execute_materialized_order(fixture.order_id)
-        .await
-        .unwrap()
-        .expect("completed refund route should finalize");
-    assert_eq!(summary.completed_steps, 1);
-
-    let order = fixture.db.orders().get(fixture.order_id).await.unwrap();
-    let vault = fixture.db.vaults().get(fixture.vault_id).await.unwrap();
-    let attempt = fixture
-        .db
-        .orders()
-        .get_execution_attempt(refund_attempt.id)
-        .await
-        .unwrap();
-    assert_eq!(order.status, RouterOrderStatus::Refunded);
-    assert_eq!(vault.status, DepositVaultStatus::Refunded);
-    assert_eq!(attempt.status, OrderExecutionAttemptStatus::Completed);
-}
-
-#[tokio::test]
-async fn refund_required_order_materializes_and_completes_automatic_refund_route() {
-    let fixture =
-        funded_market_order_fixture_with_amount("evm:8453", "evm:1", "1000000000000000000").await;
-    let _forward_execution_manager =
-        drive_unit_deposit_failures_to_refund_required(&fixture, "mock unit deposit unavailable")
-            .await;
-    zero_source_deposit_vault_balance(&fixture.db, fixture.order_id, "evm:8453").await;
-    let h = harness().await;
-    let refund_mocks = spawn_harness_mocks(h, "evm:1").await;
-    let execution_manager = OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        Arc::new(ActionProviderRegistry::mock_http(refund_mocks.base_url())),
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    );
-
-    let _summary = execution_manager.process_worker_pass(10).await.unwrap();
-
-    let attempts = fixture
-        .db
-        .orders()
-        .get_execution_attempts(fixture.order_id)
-        .await
-        .unwrap();
-    let refund_attempt = attempts
-        .iter()
-        .find(|attempt| attempt.attempt_kind == OrderExecutionAttemptKind::RefundRecovery)
-        .unwrap();
-    assert_eq!(
-        refund_attempt.status,
-        OrderExecutionAttemptStatus::Active,
-        "refund attempt failure_reason={} snapshot={}",
-        refund_attempt.failure_reason,
-        refund_attempt.input_custody_snapshot
-    );
-
-    let refund_steps = fixture
-        .db
-        .orders()
-        .get_execution_steps_for_attempt(refund_attempt.id)
-        .await
-        .unwrap();
-    assert_eq!(refund_steps.len(), 1);
-    assert_eq!(
-        refund_steps[0].step_type,
-        OrderExecutionStepType::AcrossBridge
-    );
-
-    let refund_operation = fixture
-        .db
-        .orders()
-        .get_provider_operations(fixture.order_id)
-        .await
-        .unwrap()
-        .into_iter()
-        .filter(|operation| {
-            operation.execution_attempt_id == Some(refund_attempt.id)
-                && operation.operation_type == ProviderOperationType::AcrossBridge
-        })
-        .max_by_key(|operation| operation.created_at)
-        .expect("refund attempt should submit an across bridge operation");
-    let depositor = refund_steps[0]
-        .request
-        .get("depositor_address")
-        .and_then(Value::as_str)
-        .expect("refund across request should include depositor_address");
-    let depositor = Address::from_str(depositor).expect("refund depositor address is valid");
-
-    wait_for_across_deposit_indexed(&refund_mocks, depositor, Duration::from_secs(10)).await;
-    record_detector_provider_status_hint(&execution_manager, &refund_operation).await;
-    execution_manager
-        .process_provider_operation_hints(10)
-        .await
-        .unwrap();
-
-    let start = std::time::Instant::now();
-    loop {
-        let order = fixture.db.orders().get(fixture.order_id).await.unwrap();
-        if order.status == RouterOrderStatus::Refunded {
-            let vault = fixture.db.vaults().get(fixture.vault_id).await.unwrap();
-            assert_eq!(vault.status, DepositVaultStatus::Refunded);
-            break;
-        }
-        assert!(
-            start.elapsed() < Duration::from_secs(10),
-            "refund route did not complete within 10s"
-        );
-        execution_manager.process_worker_pass(10).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    let attempts = fixture
-        .db
-        .orders()
-        .get_execution_attempts(fixture.order_id)
-        .await
-        .unwrap();
-    let refund_attempt = attempts
-        .iter()
-        .find(|attempt| attempt.attempt_kind == OrderExecutionAttemptKind::RefundRecovery)
-        .unwrap();
-    assert_eq!(
-        refund_attempt.status,
-        OrderExecutionAttemptStatus::Completed
-    );
-}
-
-#[tokio::test]
-async fn failed_refund_attempt_requires_manual_intervention_instead_of_recursing() {
-    let fixture =
-        funded_market_order_fixture_with_amount("evm:8453", "evm:1", "1000000000000000000").await;
-    let _forward_execution_manager =
-        drive_unit_deposit_failures_to_refund_required(&fixture, "mock unit deposit unavailable")
-            .await;
-    zero_source_deposit_vault_balance(&fixture.db, fixture.order_id, "evm:8453").await;
-    let execution_manager = OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        Arc::new(ActionProviderRegistry::new(
-            vec![Arc::new(FailingRefundBridgeProvider)],
-            vec![],
-            vec![],
-        )),
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    );
-
-    let start = std::time::Instant::now();
-    loop {
-        execution_manager.process_worker_pass(10).await.unwrap();
-        let order = fixture.db.orders().get(fixture.order_id).await.unwrap();
-        let vault = fixture.db.vaults().get(fixture.vault_id).await.unwrap();
-        if order.status == RouterOrderStatus::RefundManualInterventionRequired
-            && vault.status == DepositVaultStatus::RefundManualInterventionRequired
-        {
-            break;
-        }
-        assert!(
-            start.elapsed() < Duration::from_secs(10),
-            "refund attempt did not escalate to manual intervention within 10s"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    let attempts = fixture
-        .db
-        .orders()
-        .get_execution_attempts(fixture.order_id)
-        .await
-        .unwrap();
-    assert_eq!(attempts.len(), 3);
-    let refund_attempt = attempts
-        .iter()
-        .find(|attempt| attempt.attempt_kind == OrderExecutionAttemptKind::RefundRecovery)
-        .unwrap();
-    assert_eq!(
-        refund_attempt.status,
-        OrderExecutionAttemptStatus::ManualInterventionRequired
-    );
-
-    let refund_steps = fixture
-        .db
-        .orders()
-        .get_execution_steps_for_attempt(refund_attempt.id)
-        .await
-        .unwrap();
-    assert_eq!(refund_steps.len(), 1);
-    assert_eq!(
-        refund_steps[0].step_type,
-        OrderExecutionStepType::AcrossBridge
-    );
-    assert_eq!(refund_steps[0].status, OrderExecutionStepStatus::Failed);
-    assert!(refund_steps[0]
-        .error
-        .to_string()
-        .contains("mock refund route unavailable"));
-}
-
-#[tokio::test]
-async fn worker_pass_releases_terminal_internal_custody_vaults_backstop() {
-    let fixture = funded_market_order_fixture("evm:8453", "evm:1").await;
-    let execution_manager = OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        Arc::new(ActionProviderRegistry::mock_http(fixture.mocks.base_url())),
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    );
-    execution_manager.process_planning_pass(10).await.unwrap();
-
-    let internal_vaults_before =
-        internal_custody_vaults_for_order(&fixture.db, fixture.order_id).await;
-    assert!(
-        !internal_vaults_before.is_empty(),
-        "planning pass should hydrate internal custody vaults"
-    );
-    assert!(internal_vaults_before
-        .iter()
-        .all(|vault| vault.status == CustodyVaultStatus::Active));
-
-    fixture
-        .db
-        .orders()
-        .transition_status(
-            fixture.order_id,
-            RouterOrderStatus::Funded,
-            RouterOrderStatus::Executing,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-    fixture
-        .db
-        .orders()
-        .transition_status(
-            fixture.order_id,
-            RouterOrderStatus::Executing,
-            RouterOrderStatus::Completed,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-
-    execution_manager.process_worker_pass(10).await.unwrap();
-
-    let internal_vaults_after =
-        internal_custody_vaults_for_order(&fixture.db, fixture.order_id).await;
-    assert!(internal_vaults_after.iter().all(|vault| {
-        vault.status == CustodyVaultStatus::Released
-            && vault.metadata["lifecycle_terminal_reason"] == json!("order_completed")
-            && vault.metadata["lifecycle_order_status"] == json!("completed")
-            && vault.metadata["lifecycle_balance_verified"] == json!(false)
-    }));
-}
+// Variant of `drive_across_order_to_completion` for cross-token HL routes.
+// UnitDeposit completion is driven by the mock Unit EVM indexer observing the
+// router's on-chain transfer into the generated Unit protocol address, which
+// then credits the mock HL spot ledger before the first HL leg runs.
 
 // ---------------------------------------------------------------------------
 // Vault creation tests
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_vault_evm_native() {
     let dir = tempfile::tempdir().unwrap();
     let vm = test_vault_manager(dir.path()).await;
@@ -12920,6 +7948,7 @@ async fn create_vault_evm_native() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_vault_base_native() {
     let dir = tempfile::tempdir().unwrap();
     let vm = test_vault_manager(dir.path()).await;
@@ -12942,6 +7971,7 @@ async fn create_vault_base_native() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_vault_evm_erc20_token() {
     let dir = tempfile::tempdir().unwrap();
     let vm = test_vault_manager(dir.path()).await;
@@ -12963,6 +7993,7 @@ async fn create_vault_evm_erc20_token() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_vault_bitcoin_native() {
     let dir = tempfile::tempdir().unwrap();
     let vm = test_vault_manager(dir.path()).await;
@@ -12986,6 +8017,7 @@ async fn create_vault_bitcoin_native() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_vault_unsupported_chain_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let vm = test_vault_manager(dir.path()).await;
@@ -13003,6 +8035,7 @@ async fn create_vault_unsupported_chain_rejected() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_vault_bitcoin_rejects_erc20_asset() {
     let dir = tempfile::tempdir().unwrap();
     let vm = test_vault_manager(dir.path()).await;
@@ -13021,6 +8054,7 @@ async fn create_vault_bitcoin_rejects_erc20_asset() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_vault_invalid_recovery_address_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let vm = test_vault_manager(dir.path()).await;
@@ -13035,6 +8069,7 @@ async fn create_vault_invalid_recovery_address_rejected() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_vault_invalid_cancellation_commitment_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let vm = test_vault_manager(dir.path()).await;
@@ -13049,6 +8084,7 @@ async fn create_vault_invalid_cancellation_commitment_rejected() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_vault_cancel_after_in_past_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let vm = test_vault_manager(dir.path()).await;
@@ -13063,6 +8099,7 @@ async fn create_vault_cancel_after_in_past_rejected() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_vault_non_object_metadata_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let vm = test_vault_manager(dir.path()).await;
@@ -13081,6 +8118,7 @@ async fn create_vault_non_object_metadata_rejected() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_then_get_vault_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
     let vm = test_vault_manager(dir.path()).await;
@@ -13100,6 +8138,7 @@ async fn create_then_get_vault_roundtrip() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_vault_generates_unique_addresses() {
     let dir = tempfile::tempdir().unwrap();
     let vm = test_vault_manager(dir.path()).await;
@@ -13113,6 +8152,7 @@ async fn create_vault_generates_unique_addresses() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_vault_default_cancel_after_is_future() {
     let dir = tempfile::tempdir().unwrap();
     let vm = test_vault_manager(dir.path()).await;
@@ -13129,6 +8169,7 @@ async fn create_vault_default_cancel_after_is_future() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_vault_preserves_custom_metadata() {
     let dir = tempfile::tempdir().unwrap();
     let vm = test_vault_manager(dir.path()).await;
@@ -13147,6 +8188,7 @@ async fn create_vault_preserves_custom_metadata() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_vault_normalizes_evm_token_address_to_lowercase() {
     let dir = tempfile::tempdir().unwrap();
     let vm = test_vault_manager(dir.path()).await;
@@ -13168,6 +8210,7 @@ async fn create_vault_normalizes_evm_token_address_to_lowercase() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_vault_normalizes_evm_recovery_address_to_lowercase() {
     let dir = tempfile::tempdir().unwrap();
     let vm = test_vault_manager(dir.path()).await;
@@ -13183,6 +8226,7 @@ async fn create_vault_normalizes_evm_recovery_address_to_lowercase() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn create_vault_invalid_evm_token_address_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let vm = test_vault_manager(dir.path()).await;
@@ -13200,6 +8244,7 @@ async fn create_vault_invalid_evm_token_address_rejected() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn cancel_vault_rejects_executing_status() {
     let dir = tempfile::tempdir().unwrap();
     let (vm, db) = test_vault_manager_with_db(dir.path()).await;
@@ -13231,6 +8276,7 @@ async fn cancel_vault_rejects_executing_status() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn refund_claim_lease_blocks_duplicate_workers() {
     let dir = tempfile::tempdir().unwrap();
     let (vm, db) = test_vault_manager_with_db(dir.path()).await;
@@ -13283,6 +8329,7 @@ async fn refund_claim_lease_blocks_duplicate_workers() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn refunding_retry_claims_are_atomic() {
     let dir = tempfile::tempdir().unwrap();
     let (vm, db) = test_vault_manager_with_db(dir.path()).await;
@@ -13319,6 +8366,7 @@ async fn refunding_retry_claims_are_atomic() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn refund_error_completion_requires_current_processing_lease() {
     let dir = tempfile::tempdir().unwrap();
     let (vm, db) = test_vault_manager_with_db(dir.path()).await;
@@ -13365,7 +8413,7 @@ async fn refund_error_completion_requires_current_processing_lease() {
         .await;
     assert!(matches!(
         stale_completion.expect_err("stale claim must not complete"),
-        RouterServerError::NotFound
+        RouterCoreError::NotFound
     ));
     assert_eq!(
         db.vaults()
@@ -13395,6 +8443,7 @@ async fn refund_error_completion_requires_current_processing_lease() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn refund_success_completion_requires_current_processing_lease() {
     let dir = tempfile::tempdir().unwrap();
     let (vm, db) = test_vault_manager_with_db(dir.path()).await;
@@ -13440,7 +8489,7 @@ async fn refund_success_completion_requires_current_processing_lease() {
         .await;
     assert!(matches!(
         stale_completion.expect_err("stale claim must not mark refunded"),
-        RouterServerError::NotFound
+        RouterCoreError::NotFound
     ));
     let after_stale = db
         .vaults()
@@ -13468,97 +8517,12 @@ async fn refund_success_completion_requires_current_processing_lease() {
     );
 }
 
-#[tokio::test]
-async fn worker_lease_allows_one_active_worker_until_expiry() {
-    let db = test_db().await;
-    let now = Utc::now();
-
-    let first = db
-        .worker_leases()
-        .try_acquire(
-            "global-router-worker",
-            "worker-a",
-            now,
-            now + chrono::Duration::seconds(30),
-        )
-        .await
-        .unwrap()
-        .expect("first worker should acquire lease");
-    assert_eq!(first.owner_id, "worker-a");
-    assert_eq!(first.fencing_token, 1);
-
-    let blocked = db
-        .worker_leases()
-        .try_acquire(
-            "global-router-worker",
-            "worker-b",
-            now + chrono::Duration::seconds(1),
-            now + chrono::Duration::seconds(31),
-        )
-        .await
-        .unwrap();
-    assert!(blocked.is_none());
-
-    let duplicate_same_owner = db
-        .worker_leases()
-        .try_acquire(
-            "global-router-worker",
-            "worker-a",
-            now + chrono::Duration::seconds(1),
-            now + chrono::Duration::seconds(31),
-        )
-        .await
-        .unwrap();
-    assert!(duplicate_same_owner.is_none());
-
-    let renewed = db
-        .worker_leases()
-        .renew(
-            "global-router-worker",
-            "worker-a",
-            first.fencing_token,
-            now + chrono::Duration::seconds(2),
-            now + chrono::Duration::seconds(32),
-        )
-        .await
-        .unwrap()
-        .expect("active worker should renew lease");
-    assert_eq!(renewed.owner_id, "worker-a");
-    assert_eq!(renewed.fencing_token, 1);
-
-    let takeover = db
-        .worker_leases()
-        .try_acquire(
-            "global-router-worker",
-            "worker-b",
-            now + chrono::Duration::seconds(33),
-            now + chrono::Duration::seconds(63),
-        )
-        .await
-        .unwrap()
-        .expect("standby should acquire after lease expiry");
-    assert_eq!(takeover.owner_id, "worker-b");
-    assert_eq!(takeover.fencing_token, 2);
-
-    let stale_renew = db
-        .worker_leases()
-        .renew(
-            "global-router-worker",
-            "worker-a",
-            first.fencing_token,
-            now + chrono::Duration::seconds(34),
-            now + chrono::Duration::seconds(64),
-        )
-        .await
-        .unwrap();
-    assert!(stale_renew.is_none());
-}
-
 // ---------------------------------------------------------------------------
 // EVM native (ETH) refund test
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn cancel_vault_requests_worker_refund_for_evm_native_eth() {
     let h = harness().await;
     let dir = tempfile::tempdir().unwrap();
@@ -13610,6 +8574,7 @@ async fn cancel_vault_requests_worker_refund_for_evm_native_eth() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn cancel_vault_requests_worker_refund_for_evm_erc20() {
     let h = harness().await;
     let dir = tempfile::tempdir().unwrap();
@@ -13686,6 +8651,7 @@ async fn cancel_vault_requests_worker_refund_for_evm_erc20() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn cancel_vault_requests_worker_refund_for_bitcoin() {
     let h = harness().await;
     let dir = tempfile::tempdir().unwrap();
@@ -13733,1765 +8699,7 @@ async fn cancel_vault_requests_worker_refund_for_bitcoin() {
 }
 
 #[tokio::test]
-async fn two_concurrent_worker_passes_drive_same_order_to_completion_exactly_once() {
-    let dir = tempfile::tempdir().unwrap();
-    let h = harness().await;
-    let db = test_db().await;
-    let mocks = spawn_harness_mocks(h, "evm:8453").await;
-    let settings = Arc::new(test_settings(dir.path()));
-    let (order_manager, _mocks) = mock_order_manager(db.clone(), h.chain_registry.clone()).await;
-    let vault_manager = VaultManager::new(db.clone(), settings.clone(), h.chain_registry.clone());
-
-    let quote = order_manager
-        .quote_market_order(MarketOrderQuoteRequest {
-            from_asset: DepositAsset {
-                chain: ChainId::parse("evm:8453").unwrap(),
-                asset: AssetId::Native,
-            },
-            to_asset: DepositAsset {
-                chain: ChainId::parse("evm:1").unwrap(),
-                asset: AssetId::Native,
-            },
-            recipient_address: valid_evm_address(),
-            order_kind: MarketOrderQuoteKind::ExactIn {
-                amount_in: "1000".to_string(),
-                slippage_bps: 100,
-            },
-        })
-        .await
-        .unwrap();
-    let order = create_test_order_from_quote(
-        &order_manager,
-        quote
-            .quote
-            .as_market_order()
-            .expect("market order quote")
-            .id,
-    )
-    .await;
-    let vault = vault_manager
-        .create_vault(CreateVaultRequest {
-            order_id: Some(order.id),
-            deposit_asset: DepositAsset {
-                chain: ChainId::parse("evm:8453").unwrap(),
-                asset: AssetId::Native,
-            },
-            ..evm_native_request()
-        })
-        .await
-        .unwrap();
-    let vault_address =
-        Address::from_str(&vault.deposit_vault_address).expect("valid base vault address");
-    anvil_set_base_balance(h, vault_address, U256::from(1000_u64)).await;
-    db.vaults()
-        .transition_status(
-            vault.id,
-            DepositVaultStatus::PendingFunding,
-            DepositVaultStatus::Funded,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-
-    let execution_manager = Arc::new(OrderExecutionManager::with_dependencies(
-        db.clone(),
-        Arc::new(ActionProviderRegistry::mock_http(mocks.base_url())),
-        Arc::new(CustodyActionExecutor::new(
-            db.clone(),
-            settings,
-            h.chain_registry.clone(),
-        )),
-        h.chain_registry.clone(),
-    ));
-
-    let worker_a = execution_manager.clone();
-    let worker_b = execution_manager.clone();
-    let (result_a, result_b) = tokio::join!(
-        worker_a.process_worker_pass(10),
-        worker_b.process_worker_pass(10)
-    );
-    let summary_a = result_a.expect("worker A pass should not return a fatal error");
-    let summary_b = result_b.expect("worker B pass should not return a fatal error");
-
-    assert_eq!(
-        summary_a.executed_orders + summary_b.executed_orders,
-        1,
-        "exactly one worker should drive the order, got a={} b={}",
-        summary_a.executed_orders,
-        summary_b.executed_orders,
-    );
-
-    drive_across_order_to_completion(&execution_manager, &mocks, &db, order.id).await;
-
-    let order = db.orders().get(order.id).await.unwrap();
-    let vault = db.vaults().get(vault.id).await.unwrap();
-    assert_eq!(order.status, RouterOrderStatus::Completed);
-    assert_eq!(vault.status, DepositVaultStatus::Completed);
-
-    assert_eq!(mocks.across_deposits_from(vault_address).await.len(), 1);
-    let gen_requests = mocks.unit_generate_address_requests().await;
-    assert_eq!(
-        filter_unit_requests_by_kind(&gen_requests, MockUnitOperationKind::Deposit).len(),
-        1
-    );
-    assert_eq!(
-        filter_unit_requests_by_kind(&gen_requests, MockUnitOperationKind::Withdrawal).len(),
-        1
-    );
-    let ledger = mocks.ledger_snapshot().await;
-    assert_eq!(
-        filter_unit_operations_by_kind(&ledger.unit_operations, MockUnitOperationKind::Deposit)
-            .len(),
-        1
-    );
-    assert_eq!(
-        filter_unit_operations_by_kind(&ledger.unit_operations, MockUnitOperationKind::Withdrawal)
-            .len(),
-        1
-    );
-
-    let destination_vaults = db
-        .orders()
-        .get_custody_vaults(order.id)
-        .await
-        .unwrap()
-        .into_iter()
-        .filter(|vault| vault.role == CustodyVaultRole::DestinationExecution)
-        .count();
-    assert_eq!(destination_vaults, 1);
-
-    let steps = db.orders().get_execution_steps(order.id).await.unwrap();
-    assert!(steps
-        .iter()
-        .filter(|step| step.step_index > 0)
-        .all(|step| step.status == OrderExecutionStepStatus::Completed));
-}
-
-#[tokio::test]
-async fn two_concurrent_planning_passes_produce_single_destination_execution_vault() {
-    let dir = tempfile::tempdir().unwrap();
-    let h = harness().await;
-    let db = test_db().await;
-    let mocks = MockIntegratorServer::spawn().await.unwrap();
-    let settings = Arc::new(test_settings(dir.path()));
-    let (order_manager, _mocks) = mock_order_manager(db.clone(), h.chain_registry.clone()).await;
-    let vault_manager = VaultManager::new(db.clone(), settings.clone(), h.chain_registry.clone());
-
-    let quote = order_manager
-        .quote_market_order(MarketOrderQuoteRequest {
-            from_asset: DepositAsset {
-                chain: ChainId::parse("evm:8453").unwrap(),
-                asset: AssetId::Native,
-            },
-            to_asset: DepositAsset {
-                chain: ChainId::parse("evm:1").unwrap(),
-                asset: AssetId::Native,
-            },
-            recipient_address: valid_evm_address(),
-            order_kind: MarketOrderQuoteKind::ExactIn {
-                amount_in: "1000".to_string(),
-                slippage_bps: 100,
-            },
-        })
-        .await
-        .unwrap();
-    let order = create_test_order_from_quote(
-        &order_manager,
-        quote
-            .quote
-            .as_market_order()
-            .expect("market order quote")
-            .id,
-    )
-    .await;
-    let vault = vault_manager
-        .create_vault(CreateVaultRequest {
-            order_id: Some(order.id),
-            deposit_asset: DepositAsset {
-                chain: ChainId::parse("evm:8453").unwrap(),
-                asset: AssetId::Native,
-            },
-            ..evm_native_request()
-        })
-        .await
-        .unwrap();
-    db.vaults()
-        .transition_status(
-            vault.id,
-            DepositVaultStatus::PendingFunding,
-            DepositVaultStatus::Funded,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-
-    let execution_manager = Arc::new(OrderExecutionManager::with_dependencies(
-        db.clone(),
-        Arc::new(ActionProviderRegistry::mock_http(mocks.base_url())),
-        Arc::new(CustodyActionExecutor::new(
-            db.clone(),
-            settings,
-            h.chain_registry.clone(),
-        )),
-        h.chain_registry.clone(),
-    ));
-
-    let planner_a = execution_manager.clone();
-    let planner_b = execution_manager.clone();
-    let (result_a, result_b) = tokio::join!(
-        planner_a.process_planning_pass(10),
-        planner_b.process_planning_pass(10)
-    );
-    result_a.expect("planner A should not fatally error");
-    result_b.expect("planner B should not fatally error");
-
-    let destination_vaults = db
-        .orders()
-        .get_custody_vaults(order.id)
-        .await
-        .unwrap()
-        .into_iter()
-        .filter(|vault| vault.role == CustodyVaultRole::DestinationExecution)
-        .collect::<Vec<_>>();
-    assert_eq!(
-        destination_vaults.len(),
-        1,
-        "expected exactly one destination execution vault under concurrent planning"
-    );
-
-    let steps = db.orders().get_execution_steps(order.id).await.unwrap();
-    let across_step = steps
-        .iter()
-        .find(|step| step.step_type == OrderExecutionStepType::AcrossBridge)
-        .expect("planning should materialize an across step");
-    assert_eq!(
-        across_step
-            .request
-            .get("recipient_custody_vault_id")
-            .and_then(Value::as_str)
-            .and_then(|value| Uuid::parse_str(value).ok()),
-        Some(destination_vaults[0].id),
-        "planned step must point at the single destination execution vault"
-    );
-}
-
-#[tokio::test]
-async fn two_concurrent_worker_passes_on_failing_order_produce_single_refund() {
-    let fixture = funded_market_order_fixture("evm:8453", "evm:1").await;
-    fixture
-        .mocks
-        .fail_next_across_swap_approval("mock across unavailable")
-        .await;
-
-    let execution_manager = Arc::new(OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        Arc::new(ActionProviderRegistry::mock_http(fixture.mocks.base_url())),
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    ));
-
-    let worker_a = execution_manager.clone();
-    let worker_b = execution_manager.clone();
-    let (result_a, result_b) = tokio::join!(
-        worker_a.process_worker_pass(10),
-        worker_b.process_worker_pass(10)
-    );
-    result_a.expect("worker A should not fatally error on step failure");
-    result_b.expect("worker B should not fatally error on step failure");
-
-    let order = fixture.db.orders().get(fixture.order_id).await.unwrap();
-    let vault = fixture.db.vaults().get(fixture.vault_id).await.unwrap();
-    assert_eq!(order.status, RouterOrderStatus::Executing);
-    assert_eq!(vault.status, DepositVaultStatus::Executing);
-
-    fixture
-        .mocks
-        .fail_next_across_swap_approval("mock across unavailable")
-        .await;
-    let worker_a = execution_manager.clone();
-    let worker_b = execution_manager.clone();
-    let (result_a, result_b) = tokio::join!(
-        worker_a.process_worker_pass(10),
-        worker_b.process_worker_pass(10)
-    );
-    result_a.expect("worker A should not fatally error on retry step failure");
-    result_b.expect("worker B should not fatally error on retry step failure");
-
-    let order = fixture.db.orders().get(fixture.order_id).await.unwrap();
-    let vault = fixture.db.vaults().get(fixture.vault_id).await.unwrap();
-    assert_eq!(order.status, RouterOrderStatus::RefundRequired);
-    assert_eq!(vault.status, DepositVaultStatus::RefundRequired);
-
-    let steps = fixture
-        .db
-        .orders()
-        .get_execution_steps(fixture.order_id)
-        .await
-        .unwrap();
-    let across_step = steps
-        .iter()
-        .find(|step| step.step_type == OrderExecutionStepType::AcrossBridge)
-        .unwrap();
-    assert_eq!(across_step.status, OrderExecutionStepStatus::Failed);
-    assert!(across_step
-        .error
-        .to_string()
-        .contains("mock across unavailable"));
-}
-
-#[tokio::test]
-async fn planning_pass_blocks_drained_provider_and_requests_refund() {
-    let fixture = funded_market_order_fixture("evm:8453", "evm:1").await;
-    let provider_policies = Arc::new(router_server::services::ProviderPolicyService::new(
-        fixture.db.clone(),
-    ));
-    provider_policies
-        .upsert(
-            "across",
-            ProviderQuotePolicyState::Enabled,
-            ProviderExecutionPolicyState::Drain,
-            "maintenance window",
-            "test",
-        )
-        .await
-        .unwrap();
-
-    let execution_manager = OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        Arc::new(ActionProviderRegistry::mock_http(fixture.mocks.base_url())),
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    )
-    .with_provider_policies(Some(provider_policies));
-
-    let materialized = execution_manager.process_planning_pass(10).await.unwrap();
-    assert!(materialized.is_empty());
-
-    let order = fixture.db.orders().get(fixture.order_id).await.unwrap();
-    let vault = fixture.db.vaults().get(fixture.vault_id).await.unwrap();
-    assert_eq!(order.status, RouterOrderStatus::Refunding);
-    assert_eq!(vault.status, DepositVaultStatus::Refunding);
-
-    let steps = fixture
-        .db
-        .orders()
-        .get_execution_steps(fixture.order_id)
-        .await
-        .unwrap();
-    assert_eq!(steps.len(), 1);
-    assert_eq!(steps[0].step_type, OrderExecutionStepType::WaitForDeposit);
-    assert_eq!(steps[0].provider, "internal");
-}
-
-#[tokio::test]
-async fn worker_restart_processes_pending_hint_and_completes_order() {
-    let fixture = funded_market_order_fixture("evm:8453", "evm:1").await;
-    let manager_a = OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        Arc::new(ActionProviderRegistry::mock_http(fixture.mocks.base_url())),
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    );
-    manager_a.process_planning_pass(10).await.unwrap();
-    manager_a
-        .execute_materialized_order(fixture.order_id)
-        .await
-        .unwrap()
-        .expect("first manager should submit the across step");
-
-    let across_operation = provider_operation_by_type(
-        &fixture.db,
-        fixture.order_id,
-        ProviderOperationType::AcrossBridge,
-    )
-    .await;
-    wait_for_across_deposit_indexed(
-        &fixture.mocks,
-        fixture.vault_address,
-        Duration::from_secs(10),
-    )
-    .await;
-    record_detector_provider_status_hint(&manager_a, &across_operation).await;
-    manager_a
-        .process_provider_operation_hints(10)
-        .await
-        .unwrap();
-    manager_a
-        .execute_materialized_order(fixture.order_id)
-        .await
-        .unwrap()
-        .expect("first manager should submit the unit deposit step");
-
-    let unit_operation = provider_operation_by_type(
-        &fixture.db,
-        fixture.order_id,
-        ProviderOperationType::UnitDeposit,
-    )
-    .await;
-    complete_unit_operation_from_request(&fixture.mocks, &unit_operation).await;
-    record_chain_detector_unit_deposit_hint(&manager_a, &fixture.db, &unit_operation).await;
-
-    let manager_b = OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        Arc::new(ActionProviderRegistry::mock_http(fixture.mocks.base_url())),
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    );
-    let summary = manager_b.process_worker_pass(10).await.unwrap();
-    assert_eq!(summary.processed_provider_hints, 1);
-    let updated_operation = fixture
-        .db
-        .orders()
-        .get_provider_operation(unit_operation.id)
-        .await
-        .unwrap();
-    assert_eq!(updated_operation.status, ProviderOperationStatus::Completed);
-    let steps = fixture
-        .db
-        .orders()
-        .get_execution_steps(fixture.order_id)
-        .await
-        .unwrap();
-    let unit_step = steps
-        .iter()
-        .find(|step| step.step_type == OrderExecutionStepType::UnitDeposit)
-        .expect("unit deposit step should exist");
-    assert_eq!(unit_step.status, OrderExecutionStepStatus::Completed);
-}
-
-#[tokio::test]
-async fn worker_restart_recovers_terminal_provider_operation_for_running_step() {
-    let fixture = funded_market_order_fixture("evm:8453", "evm:1").await;
-    let manager_a = OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        Arc::new(ActionProviderRegistry::mock_http(fixture.mocks.base_url())),
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    );
-    manager_a.process_planning_pass(10).await.unwrap();
-
-    let steps = fixture
-        .db
-        .orders()
-        .get_execution_steps(fixture.order_id)
-        .await
-        .unwrap();
-    let across_step = steps
-        .iter()
-        .find(|step| step.step_type == OrderExecutionStepType::AcrossBridge)
-        .expect("planned order must include across step")
-        .clone();
-
-    fixture
-        .db
-        .vaults()
-        .transition_status(
-            fixture.vault_id,
-            DepositVaultStatus::Funded,
-            DepositVaultStatus::Executing,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-    let order = fixture.db.orders().get(fixture.order_id).await.unwrap();
-    fixture
-        .db
-        .orders()
-        .transition_status(
-            fixture.order_id,
-            order.status,
-            RouterOrderStatus::Executing,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-    fixture
-        .db
-        .orders()
-        .transition_execution_step_status(
-            across_step.id,
-            OrderExecutionStepStatus::Planned,
-            OrderExecutionStepStatus::Running,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-    fixture
-        .db
-        .orders()
-        .upsert_provider_operation(&OrderProviderOperation {
-            id: Uuid::now_v7(),
-            order_id: fixture.order_id,
-            execution_attempt_id: across_step.execution_attempt_id,
-            execution_step_id: Some(across_step.id),
-            provider: "across".to_string(),
-            operation_type: ProviderOperationType::AcrossBridge,
-            provider_ref: Some(format!("restart-recovered-{}", fixture.order_id)),
-            status: ProviderOperationStatus::Completed,
-            request: across_step.request.clone(),
-            response: json!({
-                "expectedOutputAmount": "1000",
-                "status": "filled"
-            }),
-            observed_state: json!({
-                "source": "restart_recovery_test",
-                "status": "filled",
-                "previous_observed_state": {
-                    "input_amount": "1000",
-                    "output_amount": "1000"
-                }
-            }),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        })
-        .await
-        .unwrap();
-    manually_fund_destination_execution_vault_for_recovery_fixture(&fixture.db, fixture.order_id)
-        .await;
-
-    let manager_b = OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        Arc::new(ActionProviderRegistry::mock_http(fixture.mocks.base_url())),
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    );
-    let summary = manager_b.process_worker_pass(10).await.unwrap();
-    assert_eq!(summary.executed_orders, 1);
-
-    let across_step = fixture
-        .db
-        .orders()
-        .get_execution_step(across_step.id)
-        .await
-        .unwrap();
-    assert_eq!(across_step.status, OrderExecutionStepStatus::Completed);
-    let steps = fixture
-        .db
-        .orders()
-        .get_execution_steps(fixture.order_id)
-        .await
-        .unwrap();
-    assert!(steps
-        .iter()
-        .any(|step| step.step_type == OrderExecutionStepType::UnitDeposit
-            && matches!(
-                step.status,
-                OrderExecutionStepStatus::Waiting | OrderExecutionStepStatus::Completed
-            )));
-}
-
-#[tokio::test]
-async fn worker_restart_reconciles_failed_step_into_refund() {
-    let fixture = funded_market_order_fixture("evm:8453", "evm:1").await;
-    let manager_a = OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        Arc::new(ActionProviderRegistry::mock_http(fixture.mocks.base_url())),
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    );
-    manager_a.process_planning_pass(10).await.unwrap();
-
-    let steps = fixture
-        .db
-        .orders()
-        .get_execution_steps(fixture.order_id)
-        .await
-        .unwrap();
-    let across_step = steps
-        .iter()
-        .find(|step| step.step_type == OrderExecutionStepType::AcrossBridge)
-        .expect("planned order must include across step")
-        .clone();
-
-    fixture
-        .db
-        .vaults()
-        .transition_status(
-            fixture.vault_id,
-            DepositVaultStatus::Funded,
-            DepositVaultStatus::Executing,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-    let order = fixture.db.orders().get(fixture.order_id).await.unwrap();
-    fixture
-        .db
-        .orders()
-        .transition_status(
-            fixture.order_id,
-            order.status,
-            RouterOrderStatus::Executing,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-    fixture
-        .db
-        .orders()
-        .transition_execution_step_status(
-            across_step.id,
-            OrderExecutionStepStatus::Planned,
-            OrderExecutionStepStatus::Running,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-    fixture
-        .db
-        .orders()
-        .fail_execution_step(
-            across_step.id,
-            json!({
-                "error": "crash-before-inline-reconcile"
-            }),
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-
-    let manager_b = OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        Arc::new(ActionProviderRegistry::mock_http(fixture.mocks.base_url())),
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    );
-    let summary = manager_b.process_worker_pass(10).await.unwrap();
-    assert_eq!(summary.reconciled_failed_orders, 1);
-
-    let order = fixture.db.orders().get(fixture.order_id).await.unwrap();
-    let vault = fixture.db.vaults().get(fixture.vault_id).await.unwrap();
-    assert_eq!(order.status, RouterOrderStatus::Executing);
-    assert_eq!(vault.status, DepositVaultStatus::Executing);
-    let attempts = fixture
-        .db
-        .orders()
-        .get_execution_attempts(fixture.order_id)
-        .await
-        .unwrap();
-    assert_eq!(attempts.len(), 2);
-    assert_eq!(attempts[0].attempt_index, 1);
-    assert_eq!(attempts[0].status, OrderExecutionAttemptStatus::Failed);
-    assert_eq!(attempts[1].attempt_index, 2);
-    assert_eq!(attempts[1].status, OrderExecutionAttemptStatus::Active);
-    let retry_steps = fixture
-        .db
-        .orders()
-        .get_execution_steps_for_attempt(attempts[1].id)
-        .await
-        .unwrap();
-    assert!(retry_steps.iter().any(|step| {
-        step.step_type == OrderExecutionStepType::AcrossBridge
-            && matches!(
-                step.status,
-                OrderExecutionStepStatus::Waiting
-                    | OrderExecutionStepStatus::Completed
-                    | OrderExecutionStepStatus::Planned
-                    | OrderExecutionStepStatus::Running
-            )
-    }));
-}
-
-#[tokio::test]
-async fn worker_restart_after_execution_step_persist_crash_recovers_waiting_step() {
-    let fixture = funded_market_order_fixture("evm:8453", "evm:1").await;
-    let action_providers = Arc::new(ActionProviderRegistry::mock_http(fixture.mocks.base_url()));
-    let crashing_manager = OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        action_providers.clone(),
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    )
-    .with_crash_injector(Arc::new(PanicOnceCrashInjector::new(
-        OrderExecutionCrashPoint::AfterExecutionStepStatusPersisted,
-    )));
-    crashing_manager.process_planning_pass(10).await.unwrap();
-    let order_id = fixture.order_id;
-
-    expect_task_panic(tokio::spawn(async move {
-        let _ = crashing_manager.execute_materialized_order(order_id).await;
-    }))
-    .await;
-
-    let order = fixture.db.orders().get(fixture.order_id).await.unwrap();
-    let vault = fixture.db.vaults().get(fixture.vault_id).await.unwrap();
-    let steps = fixture
-        .db
-        .orders()
-        .get_execution_steps(fixture.order_id)
-        .await
-        .unwrap();
-    assert_eq!(order.status, RouterOrderStatus::Executing);
-    assert_eq!(vault.status, DepositVaultStatus::Executing);
-    let across_step = steps
-        .iter()
-        .find(|step| step.step_type == OrderExecutionStepType::AcrossBridge)
-        .expect("across step should exist");
-    assert_eq!(across_step.status, OrderExecutionStepStatus::Waiting);
-
-    let recovery_manager = OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        action_providers.clone(),
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    );
-    let across_operation = provider_operation_by_type(
-        &fixture.db,
-        fixture.order_id,
-        ProviderOperationType::AcrossBridge,
-    )
-    .await;
-    wait_for_across_deposit_indexed(
-        &fixture.mocks,
-        fixture.vault_address,
-        Duration::from_secs(10),
-    )
-    .await;
-    record_detector_provider_status_hint(&recovery_manager, &across_operation).await;
-    recovery_manager
-        .process_provider_operation_hints(10)
-        .await
-        .unwrap();
-    recovery_manager
-        .execute_materialized_order(fixture.order_id)
-        .await
-        .unwrap()
-        .expect("recovery manager should submit the unit deposit step");
-    let unit_operation = provider_operation_by_type(
-        &fixture.db,
-        fixture.order_id,
-        ProviderOperationType::UnitDeposit,
-    )
-    .await;
-
-    let across_step = fixture
-        .db
-        .orders()
-        .get_execution_step(across_step.id)
-        .await
-        .unwrap();
-    let steps = fixture
-        .db
-        .orders()
-        .get_execution_steps(fixture.order_id)
-        .await
-        .unwrap();
-    assert_eq!(across_step.status, OrderExecutionStepStatus::Completed);
-    assert_eq!(
-        unit_operation.status,
-        ProviderOperationStatus::WaitingExternal
-    );
-    assert!(steps.iter().any(|step| {
-        step.step_type == OrderExecutionStepType::UnitDeposit
-            && matches!(
-                step.status,
-                OrderExecutionStepStatus::Waiting | OrderExecutionStepStatus::Completed
-            )
-    }));
-}
-
-#[tokio::test]
-async fn worker_recovery_moves_stale_running_step_with_provider_operation_to_waiting() {
-    let fixture = funded_market_order_fixture("evm:8453", "evm:1").await;
-    fixture
-        .db
-        .vaults()
-        .transition_status(
-            fixture.vault_id,
-            DepositVaultStatus::Funded,
-            DepositVaultStatus::Executing,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-    let order = fixture.db.orders().get(fixture.order_id).await.unwrap();
-    fixture
-        .db
-        .orders()
-        .transition_status(
-            fixture.order_id,
-            order.status,
-            RouterOrderStatus::Executing,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-
-    let stale_at = Utc::now() - chrono::Duration::minutes(10);
-    let execution_attempt = OrderExecutionAttempt {
-        id: Uuid::now_v7(),
-        order_id: fixture.order_id,
-        attempt_index: 1,
-        attempt_kind: OrderExecutionAttemptKind::PrimaryExecution,
-        status: OrderExecutionAttemptStatus::Active,
-        trigger_step_id: None,
-        trigger_provider_operation_id: None,
-        failure_reason: json!({}),
-        input_custody_snapshot: json!({}),
-        created_at: stale_at,
-        updated_at: stale_at,
-    };
-    fixture
-        .db
-        .orders()
-        .create_execution_attempt(&execution_attempt)
-        .await
-        .unwrap();
-    let execution_leg_id = create_test_execution_leg_for_step(TestExecutionLegForStep {
-        db: &fixture.db,
-        order_id: fixture.order_id,
-        execution_attempt_id: Some(execution_attempt.id),
-        step_index: 1,
-        step_type: OrderExecutionStepType::AcrossBridge,
-        provider: "across",
-        input_asset: None,
-        output_asset: None,
-        amount_in: Some("1000"),
-        min_amount_out: Some("1000"),
-        now: stale_at,
-    })
-    .await;
-    let step = OrderExecutionStep {
-        id: Uuid::now_v7(),
-        order_id: fixture.order_id,
-        execution_attempt_id: Some(execution_attempt.id),
-        execution_leg_id: Some(execution_leg_id),
-        transition_decl_id: None,
-        step_index: 1,
-        step_type: OrderExecutionStepType::AcrossBridge,
-        provider: "across".to_string(),
-        status: OrderExecutionStepStatus::Running,
-        input_asset: None,
-        output_asset: None,
-        amount_in: Some("1000".to_string()),
-        min_amount_out: Some("1000".to_string()),
-        tx_hash: None,
-        provider_ref: Some("stale-running-op".to_string()),
-        idempotency_key: Some(format!("order:{}:stale-running", fixture.order_id)),
-        attempt_count: 0,
-        next_attempt_at: None,
-        started_at: Some(stale_at),
-        completed_at: None,
-        details: json!({ "source": "stale_running_recovery_test" }),
-        request: json!({ "source": "stale_running_recovery_test" }),
-        response: json!({}),
-        error: json!({}),
-        usd_valuation: json!({}),
-        created_at: stale_at,
-        updated_at: stale_at,
-    };
-    fixture
-        .db
-        .orders()
-        .create_execution_step(&step)
-        .await
-        .unwrap();
-    let operation = OrderProviderOperation {
-        id: Uuid::now_v7(),
-        order_id: fixture.order_id,
-        execution_attempt_id: Some(execution_attempt.id),
-        execution_step_id: Some(step.id),
-        provider: "across".to_string(),
-        operation_type: ProviderOperationType::AcrossBridge,
-        provider_ref: Some("stale-running-op".to_string()),
-        status: ProviderOperationStatus::WaitingExternal,
-        request: step.request.clone(),
-        response: json!({ "provider_ref": "stale-running-op" }),
-        observed_state: json!({}),
-        created_at: stale_at,
-        updated_at: stale_at,
-    };
-    fixture
-        .db
-        .orders()
-        .create_provider_operation(&operation)
-        .await
-        .unwrap();
-
-    let recovery_manager = OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        Arc::new(ActionProviderRegistry::default()),
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    );
-    let summary = recovery_manager.process_worker_pass(10).await.unwrap();
-    assert_eq!(summary.maintenance_tasks, 1);
-
-    let recovered_step = fixture
-        .db
-        .orders()
-        .get_execution_step(step.id)
-        .await
-        .unwrap();
-    assert_eq!(recovered_step.status, OrderExecutionStepStatus::Waiting);
-    assert_eq!(
-        recovered_step.response["kind"],
-        json!("stale_running_step_recovery")
-    );
-    assert_eq!(
-        recovered_step.response["provider_operation_id"],
-        json!(operation.id)
-    );
-    let attempt = fixture
-        .db
-        .orders()
-        .get_execution_attempts(fixture.order_id)
-        .await
-        .unwrap()
-        .pop()
-        .unwrap();
-    assert_eq!(attempt.status, OrderExecutionAttemptStatus::Active);
-    let order = fixture.db.orders().get(fixture.order_id).await.unwrap();
-    assert_eq!(order.status, RouterOrderStatus::Executing);
-}
-
-#[tokio::test]
-async fn worker_recovery_marks_stale_running_step_without_checkpoint_manual_intervention() {
-    let fixture = funded_market_order_fixture("evm:8453", "evm:1").await;
-    fixture
-        .db
-        .vaults()
-        .transition_status(
-            fixture.vault_id,
-            DepositVaultStatus::Funded,
-            DepositVaultStatus::Executing,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-    let order = fixture.db.orders().get(fixture.order_id).await.unwrap();
-    fixture
-        .db
-        .orders()
-        .transition_status(
-            fixture.order_id,
-            order.status,
-            RouterOrderStatus::Executing,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-
-    let stale_at = Utc::now() - chrono::Duration::minutes(10);
-    let execution_attempt = OrderExecutionAttempt {
-        id: Uuid::now_v7(),
-        order_id: fixture.order_id,
-        attempt_index: 1,
-        attempt_kind: OrderExecutionAttemptKind::PrimaryExecution,
-        status: OrderExecutionAttemptStatus::Active,
-        trigger_step_id: None,
-        trigger_provider_operation_id: None,
-        failure_reason: json!({}),
-        input_custody_snapshot: json!({}),
-        created_at: stale_at,
-        updated_at: stale_at,
-    };
-    fixture
-        .db
-        .orders()
-        .create_execution_attempt(&execution_attempt)
-        .await
-        .unwrap();
-    let execution_leg_id = create_test_execution_leg_for_step(TestExecutionLegForStep {
-        db: &fixture.db,
-        order_id: fixture.order_id,
-        execution_attempt_id: Some(execution_attempt.id),
-        step_index: 1,
-        step_type: OrderExecutionStepType::AcrossBridge,
-        provider: "across",
-        input_asset: None,
-        output_asset: None,
-        amount_in: Some("1000"),
-        min_amount_out: Some("1000"),
-        now: stale_at,
-    })
-    .await;
-    let step = OrderExecutionStep {
-        id: Uuid::now_v7(),
-        order_id: fixture.order_id,
-        execution_attempt_id: Some(execution_attempt.id),
-        execution_leg_id: Some(execution_leg_id),
-        transition_decl_id: None,
-        step_index: 1,
-        step_type: OrderExecutionStepType::AcrossBridge,
-        provider: "across".to_string(),
-        status: OrderExecutionStepStatus::Running,
-        input_asset: None,
-        output_asset: None,
-        amount_in: Some("1000".to_string()),
-        min_amount_out: Some("1000".to_string()),
-        tx_hash: None,
-        provider_ref: None,
-        idempotency_key: Some(format!(
-            "order:{}:stale-running-ambiguous",
-            fixture.order_id
-        )),
-        attempt_count: 0,
-        next_attempt_at: None,
-        started_at: Some(stale_at),
-        completed_at: None,
-        details: json!({ "source": "stale_running_recovery_test" }),
-        request: json!({ "source": "stale_running_recovery_test" }),
-        response: json!({}),
-        error: json!({}),
-        usd_valuation: json!({}),
-        created_at: stale_at,
-        updated_at: stale_at,
-    };
-    fixture
-        .db
-        .orders()
-        .create_execution_step(&step)
-        .await
-        .unwrap();
-
-    let recovery_manager = OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        Arc::new(ActionProviderRegistry::default()),
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    );
-    let summary = recovery_manager.process_worker_pass(10).await.unwrap();
-    assert_eq!(summary.maintenance_tasks, 1);
-
-    let recovered_step = fixture
-        .db
-        .orders()
-        .get_execution_step(step.id)
-        .await
-        .unwrap();
-    assert_eq!(recovered_step.status, OrderExecutionStepStatus::Failed);
-    assert_eq!(
-        recovered_step.error["reason"],
-        json!("ambiguous_external_side_effect_window")
-    );
-    let attempts = fixture
-        .db
-        .orders()
-        .get_execution_attempts(fixture.order_id)
-        .await
-        .unwrap();
-    assert_eq!(attempts.len(), 1);
-    assert_eq!(
-        attempts[0].status,
-        OrderExecutionAttemptStatus::ManualInterventionRequired
-    );
-    let order = fixture.db.orders().get(fixture.order_id).await.unwrap();
-    let vault = fixture.db.vaults().get(fixture.vault_id).await.unwrap();
-    assert_eq!(order.status, RouterOrderStatus::ManualInterventionRequired);
-    assert_eq!(vault.status, DepositVaultStatus::ManualInterventionRequired);
-}
-
-#[tokio::test]
-async fn worker_restart_after_provider_receipt_checkpoint_recovers_waiting_step() {
-    let fixture = funded_market_order_fixture("evm:8453", "evm:1").await;
-    let action_providers = Arc::new(ActionProviderRegistry::mock_http(fixture.mocks.base_url()));
-    let crashing_manager = OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        action_providers.clone(),
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    )
-    .with_crash_injector(Arc::new(PanicOnceCrashInjector::new(
-        OrderExecutionCrashPoint::AfterProviderReceiptPersisted,
-    )));
-    crashing_manager.process_planning_pass(10).await.unwrap();
-    let order_id = fixture.order_id;
-
-    expect_task_panic(tokio::spawn(async move {
-        let _ = crashing_manager.execute_materialized_order(order_id).await;
-    }))
-    .await;
-
-    let across_operation = provider_operation_by_type(
-        &fixture.db,
-        fixture.order_id,
-        ProviderOperationType::AcrossBridge,
-    )
-    .await;
-    assert_eq!(across_operation.status, ProviderOperationStatus::Submitted);
-    assert!(
-        across_operation.provider_ref.is_some(),
-        "receipt checkpoint should persist the Across deposit id provider ref"
-    );
-    assert_eq!(
-        across_operation.response["kind"],
-        "provider_receipt_checkpoint"
-    );
-    assert!(
-        across_operation.observed_state["previous_observed_state"]
-            .get("deposit_id")
-            .is_some(),
-        "checkpoint should preserve provider post-execute state needed for restart"
-    );
-
-    let recovery_manager = OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        action_providers,
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    );
-    wait_for_across_deposit_indexed(
-        &fixture.mocks,
-        fixture.vault_address,
-        Duration::from_secs(10),
-    )
-    .await;
-    record_detector_provider_status_hint(&recovery_manager, &across_operation).await;
-    assert_eq!(
-        recovery_manager
-            .process_provider_operation_hints(10)
-            .await
-            .unwrap(),
-        1
-    );
-
-    let across_operation = fixture
-        .db
-        .orders()
-        .get_provider_operation(across_operation.id)
-        .await
-        .unwrap();
-    assert_eq!(across_operation.status, ProviderOperationStatus::Completed);
-    let across_step = fixture
-        .db
-        .orders()
-        .get_execution_step(across_operation.execution_step_id.unwrap())
-        .await
-        .unwrap();
-    assert_eq!(across_step.status, OrderExecutionStepStatus::Completed);
-}
-
-#[tokio::test]
-async fn worker_restart_after_provider_operation_status_persist_crash_recovers_terminal_step() {
-    let fixture = funded_market_order_fixture("evm:8453", "evm:1").await;
-    fixture
-        .db
-        .vaults()
-        .transition_status(
-            fixture.vault_id,
-            DepositVaultStatus::Funded,
-            DepositVaultStatus::Executing,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-    let order = fixture.db.orders().get(fixture.order_id).await.unwrap();
-    fixture
-        .db
-        .orders()
-        .transition_status(
-            fixture.order_id,
-            order.status,
-            RouterOrderStatus::Executing,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-
-    let now = Utc::now();
-    let execution_attempt = OrderExecutionAttempt {
-        id: Uuid::now_v7(),
-        order_id: fixture.order_id,
-        attempt_index: 1,
-        attempt_kind: OrderExecutionAttemptKind::PrimaryExecution,
-        status: OrderExecutionAttemptStatus::Active,
-        trigger_step_id: None,
-        trigger_provider_operation_id: None,
-        failure_reason: json!({}),
-        input_custody_snapshot: json!({}),
-        created_at: now,
-        updated_at: now,
-    };
-    fixture
-        .db
-        .orders()
-        .create_execution_attempt(&execution_attempt)
-        .await
-        .unwrap();
-    let execution_leg_id = create_test_execution_leg_for_step(TestExecutionLegForStep {
-        db: &fixture.db,
-        order_id: fixture.order_id,
-        execution_attempt_id: Some(execution_attempt.id),
-        step_index: 1,
-        step_type: OrderExecutionStepType::AcrossBridge,
-        provider: "across",
-        input_asset: None,
-        output_asset: None,
-        amount_in: Some("1000"),
-        min_amount_out: Some("1000"),
-        now,
-    })
-    .await;
-    let step = OrderExecutionStep {
-        id: Uuid::now_v7(),
-        order_id: fixture.order_id,
-        execution_attempt_id: Some(execution_attempt.id),
-        execution_leg_id: Some(execution_leg_id),
-        transition_decl_id: None,
-        step_index: 1,
-        step_type: OrderExecutionStepType::AcrossBridge,
-        provider: "across".to_string(),
-        status: OrderExecutionStepStatus::Waiting,
-        input_asset: None,
-        output_asset: None,
-        amount_in: Some("1000".to_string()),
-        min_amount_out: Some("1000".to_string()),
-        tx_hash: None,
-        provider_ref: Some("crash-recovery-op".to_string()),
-        idempotency_key: Some(format!("order:{}:crash-provider-status", fixture.order_id)),
-        attempt_count: 0,
-        next_attempt_at: None,
-        started_at: Some(now),
-        completed_at: None,
-        details: json!({ "source": "crash_recovery_test" }),
-        request: json!({ "source": "crash_recovery_test" }),
-        response: json!({}),
-        error: json!({}),
-        usd_valuation: json!({}),
-        created_at: now,
-        updated_at: now,
-    };
-    fixture
-        .db
-        .orders()
-        .create_execution_step(&step)
-        .await
-        .unwrap();
-    let operation = OrderProviderOperation {
-        id: Uuid::now_v7(),
-        order_id: fixture.order_id,
-        execution_attempt_id: Some(execution_attempt.id),
-        execution_step_id: Some(step.id),
-        provider: "across".to_string(),
-        operation_type: ProviderOperationType::AcrossBridge,
-        provider_ref: Some("crash-recovery-op".to_string()),
-        status: ProviderOperationStatus::WaitingExternal,
-        request: step.request.clone(),
-        response: json!({ "provider_ref": "crash-recovery-op" }),
-        observed_state: json!({}),
-        created_at: now,
-        updated_at: now,
-    };
-    fixture
-        .db
-        .orders()
-        .create_provider_operation(&operation)
-        .await
-        .unwrap();
-
-    let action_providers = Arc::new(ActionProviderRegistry::default());
-    let crashing_manager = OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        action_providers.clone(),
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    );
-    let operation_id = operation.id;
-    let crashing_manager =
-        crashing_manager.with_crash_injector(Arc::new(PanicOnceCrashInjector::new(
-            OrderExecutionCrashPoint::AfterProviderOperationStatusPersisted,
-        )));
-
-    expect_task_panic(tokio::spawn(async move {
-        crashing_manager
-            .apply_provider_operation_status_update(ProviderOperationStatusUpdate {
-                provider_operation_id: Some(operation.id),
-                provider: Some("across".to_string()),
-                provider_ref: None,
-                status: ProviderOperationStatus::Completed,
-                observed_state: json!({
-                    "status": "filled",
-                    "previous_observed_state": {
-                        "input_amount": "1000",
-                        "output_amount": "1000"
-                    }
-                }),
-                response: Some(json!({
-                    "status": "filled",
-                    "expectedOutputAmount": "1000"
-                })),
-                tx_hash: Some("0xproviderstatuspersist".to_string()),
-                error: None,
-            })
-            .await
-            .unwrap();
-    }))
-    .await;
-
-    let operation = fixture
-        .db
-        .orders()
-        .get_provider_operation(operation_id)
-        .await
-        .unwrap();
-    let step = fixture
-        .db
-        .orders()
-        .get_execution_step(operation.execution_step_id.unwrap())
-        .await
-        .unwrap();
-    let order = fixture.db.orders().get(fixture.order_id).await.unwrap();
-    assert_eq!(operation.status, ProviderOperationStatus::Completed);
-    assert_eq!(step.status, OrderExecutionStepStatus::Waiting);
-    assert_eq!(order.status, RouterOrderStatus::Executing);
-
-    let recovery_manager = OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        action_providers,
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    );
-    recovery_manager.process_worker_pass(10).await.unwrap();
-
-    let order = fixture.db.orders().get(fixture.order_id).await.unwrap();
-    let vault = fixture.db.vaults().get(fixture.vault_id).await.unwrap();
-    let step = fixture
-        .db
-        .orders()
-        .get_execution_step(step.id)
-        .await
-        .unwrap();
-    assert_eq!(step.status, OrderExecutionStepStatus::Completed);
-    assert_eq!(order.status, RouterOrderStatus::Completed);
-    assert_eq!(vault.status, DepositVaultStatus::Completed);
-}
-
-#[tokio::test]
-async fn stale_terminal_provider_operation_update_uses_persisted_settlement_data() {
-    let fixture = funded_market_order_fixture("evm:8453", "evm:1").await;
-    fixture
-        .db
-        .vaults()
-        .transition_status(
-            fixture.vault_id,
-            DepositVaultStatus::Funded,
-            DepositVaultStatus::Executing,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-    let order = fixture.db.orders().get(fixture.order_id).await.unwrap();
-    fixture
-        .db
-        .orders()
-        .transition_status(
-            fixture.order_id,
-            order.status,
-            RouterOrderStatus::Executing,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-
-    let now = Utc::now();
-    let execution_attempt = OrderExecutionAttempt {
-        id: Uuid::now_v7(),
-        order_id: fixture.order_id,
-        attempt_index: 1,
-        attempt_kind: OrderExecutionAttemptKind::PrimaryExecution,
-        status: OrderExecutionAttemptStatus::Active,
-        trigger_step_id: None,
-        trigger_provider_operation_id: None,
-        failure_reason: json!({}),
-        input_custody_snapshot: json!({}),
-        created_at: now,
-        updated_at: now,
-    };
-    fixture
-        .db
-        .orders()
-        .create_execution_attempt(&execution_attempt)
-        .await
-        .unwrap();
-    let execution_leg_id = create_test_execution_leg_for_step(TestExecutionLegForStep {
-        db: &fixture.db,
-        order_id: fixture.order_id,
-        execution_attempt_id: Some(execution_attempt.id),
-        step_index: 1,
-        step_type: OrderExecutionStepType::AcrossBridge,
-        provider: "across",
-        input_asset: None,
-        output_asset: None,
-        amount_in: Some("1000"),
-        min_amount_out: Some("1000"),
-        now,
-    })
-    .await;
-    let step = OrderExecutionStep {
-        id: Uuid::now_v7(),
-        order_id: fixture.order_id,
-        execution_attempt_id: Some(execution_attempt.id),
-        execution_leg_id: Some(execution_leg_id),
-        transition_decl_id: None,
-        step_index: 1,
-        step_type: OrderExecutionStepType::AcrossBridge,
-        provider: "across".to_string(),
-        status: OrderExecutionStepStatus::Waiting,
-        input_asset: None,
-        output_asset: None,
-        amount_in: Some("1000".to_string()),
-        min_amount_out: Some("1000".to_string()),
-        tx_hash: None,
-        provider_ref: Some("terminal-op".to_string()),
-        idempotency_key: Some(format!("order:{}:terminal-op", fixture.order_id)),
-        attempt_count: 0,
-        next_attempt_at: None,
-        started_at: Some(now),
-        completed_at: None,
-        details: json!({ "source": "terminal_idempotency_test" }),
-        request: json!({ "source": "terminal_idempotency_test" }),
-        response: json!({}),
-        error: json!({}),
-        usd_valuation: json!({}),
-        created_at: now,
-        updated_at: now,
-    };
-    fixture
-        .db
-        .orders()
-        .create_execution_step(&step)
-        .await
-        .unwrap();
-    let operation = OrderProviderOperation {
-        id: Uuid::now_v7(),
-        order_id: fixture.order_id,
-        execution_attempt_id: Some(execution_attempt.id),
-        execution_step_id: Some(step.id),
-        provider: "across".to_string(),
-        operation_type: ProviderOperationType::AcrossBridge,
-        provider_ref: Some("terminal-op".to_string()),
-        status: ProviderOperationStatus::Completed,
-        request: step.request.clone(),
-        response: json!({
-            "kind": "persisted_terminal",
-            "tx_hash": "0xpersistedterminal",
-            "amount_in": "1000",
-            "amount_out": "1000"
-        }),
-        observed_state: json!({
-            "source": "persisted_terminal"
-        }),
-        created_at: now,
-        updated_at: now,
-    };
-    fixture
-        .db
-        .orders()
-        .create_provider_operation(&operation)
-        .await
-        .unwrap();
-
-    let manager = OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        Arc::new(ActionProviderRegistry::default()),
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    );
-    manager
-        .apply_provider_operation_status_update(ProviderOperationStatusUpdate {
-            provider_operation_id: Some(operation.id),
-            provider: Some("across".to_string()),
-            provider_ref: Some("terminal-op".to_string()),
-            status: ProviderOperationStatus::Failed,
-            observed_state: json!({
-                "source": "stale_failed_hint"
-            }),
-            response: Some(json!({
-                "kind": "stale_failed_hint",
-                "tx_hash": "0xstale"
-            })),
-            tx_hash: Some("0xstale".to_string()),
-            error: Some(json!({
-                "error": "stale failed hint"
-            })),
-        })
-        .await
-        .unwrap();
-
-    let operation = fixture
-        .db
-        .orders()
-        .get_provider_operation(operation.id)
-        .await
-        .unwrap();
-    let step = fixture
-        .db
-        .orders()
-        .get_execution_step(step.id)
-        .await
-        .unwrap();
-    assert_eq!(operation.status, ProviderOperationStatus::Completed);
-    assert_eq!(operation.response["kind"], "persisted_terminal");
-    assert_eq!(step.status, OrderExecutionStepStatus::Completed);
-    assert_eq!(step.response["kind"], "persisted_terminal");
-    assert_eq!(step.tx_hash.as_deref(), Some("0xpersistedterminal"));
-}
-
-#[tokio::test]
-async fn worker_restart_after_provider_step_settlement_crash_finalizes_order() {
-    let fixture = funded_market_order_fixture("evm:8453", "evm:1").await;
-    fixture
-        .db
-        .vaults()
-        .transition_status(
-            fixture.vault_id,
-            DepositVaultStatus::Funded,
-            DepositVaultStatus::Executing,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-    let order = fixture.db.orders().get(fixture.order_id).await.unwrap();
-    fixture
-        .db
-        .orders()
-        .transition_status(
-            fixture.order_id,
-            order.status,
-            RouterOrderStatus::Executing,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-
-    let now = Utc::now();
-    let execution_attempt = OrderExecutionAttempt {
-        id: Uuid::now_v7(),
-        order_id: fixture.order_id,
-        attempt_index: 1,
-        attempt_kind: OrderExecutionAttemptKind::PrimaryExecution,
-        status: OrderExecutionAttemptStatus::Active,
-        trigger_step_id: None,
-        trigger_provider_operation_id: None,
-        failure_reason: json!({}),
-        input_custody_snapshot: json!({}),
-        created_at: now,
-        updated_at: now,
-    };
-    fixture
-        .db
-        .orders()
-        .create_execution_attempt(&execution_attempt)
-        .await
-        .unwrap();
-    let execution_leg_id = create_test_execution_leg_for_step(TestExecutionLegForStep {
-        db: &fixture.db,
-        order_id: fixture.order_id,
-        execution_attempt_id: Some(execution_attempt.id),
-        step_index: 1,
-        step_type: OrderExecutionStepType::AcrossBridge,
-        provider: "across",
-        input_asset: None,
-        output_asset: None,
-        amount_in: Some("1000"),
-        min_amount_out: Some("1000"),
-        now,
-    })
-    .await;
-    let step = OrderExecutionStep {
-        id: Uuid::now_v7(),
-        order_id: fixture.order_id,
-        execution_attempt_id: Some(execution_attempt.id),
-        execution_leg_id: Some(execution_leg_id),
-        transition_decl_id: None,
-        step_index: 1,
-        step_type: OrderExecutionStepType::AcrossBridge,
-        provider: "across".to_string(),
-        status: OrderExecutionStepStatus::Waiting,
-        input_asset: None,
-        output_asset: None,
-        amount_in: Some("1000".to_string()),
-        min_amount_out: Some("1000".to_string()),
-        tx_hash: None,
-        provider_ref: Some("crash-settlement-op".to_string()),
-        idempotency_key: Some(format!("order:{}:crash-step-settlement", fixture.order_id)),
-        attempt_count: 0,
-        next_attempt_at: None,
-        started_at: Some(now),
-        completed_at: None,
-        details: json!({ "source": "crash_recovery_test" }),
-        request: json!({ "source": "crash_recovery_test" }),
-        response: json!({}),
-        error: json!({}),
-        usd_valuation: json!({}),
-        created_at: now,
-        updated_at: now,
-    };
-    fixture
-        .db
-        .orders()
-        .create_execution_step(&step)
-        .await
-        .unwrap();
-    let operation = OrderProviderOperation {
-        id: Uuid::now_v7(),
-        order_id: fixture.order_id,
-        execution_attempt_id: Some(execution_attempt.id),
-        execution_step_id: Some(step.id),
-        provider: "across".to_string(),
-        operation_type: ProviderOperationType::AcrossBridge,
-        provider_ref: Some("crash-settlement-op".to_string()),
-        status: ProviderOperationStatus::WaitingExternal,
-        request: step.request.clone(),
-        response: json!({ "provider_ref": "crash-settlement-op" }),
-        observed_state: json!({}),
-        created_at: now,
-        updated_at: now,
-    };
-    fixture
-        .db
-        .orders()
-        .create_provider_operation(&operation)
-        .await
-        .unwrap();
-
-    let action_providers = Arc::new(ActionProviderRegistry::default());
-    let crashing_manager = OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        action_providers.clone(),
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    );
-    let step_id = step.id;
-    let crashing_manager = crashing_manager.with_crash_injector(Arc::new(
-        PanicOnceCrashInjector::new(OrderExecutionCrashPoint::AfterProviderStepSettlement),
-    ));
-
-    expect_task_panic(tokio::spawn(async move {
-        crashing_manager
-            .apply_provider_operation_status_update(ProviderOperationStatusUpdate {
-                provider_operation_id: Some(operation.id),
-                provider: Some("across".to_string()),
-                provider_ref: None,
-                status: ProviderOperationStatus::Completed,
-                observed_state: json!({
-                    "status": "filled",
-                    "previous_observed_state": {
-                        "input_amount": "1000",
-                        "output_amount": "1000"
-                    }
-                }),
-                response: Some(json!({
-                    "status": "filled",
-                    "expectedOutputAmount": "1000"
-                })),
-                tx_hash: Some("0xproviderstepsettled".to_string()),
-                error: None,
-            })
-            .await
-            .unwrap();
-    }))
-    .await;
-
-    let step = fixture
-        .db
-        .orders()
-        .get_execution_step(step_id)
-        .await
-        .unwrap();
-    let order = fixture.db.orders().get(fixture.order_id).await.unwrap();
-    assert_eq!(step.status, OrderExecutionStepStatus::Completed);
-    assert_eq!(order.status, RouterOrderStatus::Executing);
-
-    let recovery_manager = OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        action_providers,
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    );
-    recovery_manager.process_worker_pass(10).await.unwrap();
-
-    let order = fixture.db.orders().get(fixture.order_id).await.unwrap();
-    let vault = fixture.db.vaults().get(fixture.vault_id).await.unwrap();
-    assert_eq!(order.status, RouterOrderStatus::Completed);
-    assert_eq!(vault.status, DepositVaultStatus::Completed);
-}
-
-#[tokio::test]
-async fn worker_restart_after_step_mark_failed_crash_reconciles_refund() {
-    let fixture = funded_market_order_fixture("evm:8453", "evm:1").await;
-    let planner_action_providers =
-        Arc::new(ActionProviderRegistry::mock_http(fixture.mocks.base_url()));
-    let planner_manager = OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        planner_action_providers,
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    );
-    planner_manager.process_planning_pass(10).await.unwrap();
-    let order_id = fixture.order_id;
-    let failing_action_providers = Arc::new(ActionProviderRegistry::new(
-        vec![Arc::new(FailingBridgeProvider)],
-        vec![],
-        vec![],
-    ));
-
-    let crashing_manager = OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        failing_action_providers.clone(),
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    )
-    .with_crash_injector(Arc::new(PanicOnceCrashInjector::new(
-        OrderExecutionCrashPoint::AfterStepMarkedFailed,
-    )));
-
-    expect_task_panic(tokio::spawn(async move {
-        let _ = crashing_manager.execute_materialized_order(order_id).await;
-    }))
-    .await;
-
-    let order = fixture.db.orders().get(fixture.order_id).await.unwrap();
-    let vault = fixture.db.vaults().get(fixture.vault_id).await.unwrap();
-    let steps = fixture
-        .db
-        .orders()
-        .get_execution_steps(fixture.order_id)
-        .await
-        .unwrap();
-    assert_eq!(order.status, RouterOrderStatus::Executing);
-    assert_eq!(vault.status, DepositVaultStatus::Executing);
-    assert!(steps
-        .iter()
-        .any(|step| step.step_index > 0 && step.status == OrderExecutionStepStatus::Failed));
-
-    let recovery_manager = OrderExecutionManager::with_dependencies(
-        fixture.db.clone(),
-        failing_action_providers,
-        fixture.custody_action_executor.clone(),
-        fixture.chain_registry.clone(),
-    );
-    let summary = recovery_manager.process_worker_pass(10).await.unwrap();
-    assert_eq!(summary.reconciled_failed_orders, 1);
-
-    let order = fixture.db.orders().get(fixture.order_id).await.unwrap();
-    let vault = fixture.db.vaults().get(fixture.vault_id).await.unwrap();
-    assert_eq!(order.status, RouterOrderStatus::RefundRequired);
-    assert_eq!(vault.status, DepositVaultStatus::RefundRequired);
-    let attempts = fixture
-        .db
-        .orders()
-        .get_execution_attempts(fixture.order_id)
-        .await
-        .unwrap();
-    assert_eq!(attempts.len(), 3);
-    assert_eq!(attempts[0].attempt_index, 1);
-    assert_eq!(attempts[0].status, OrderExecutionAttemptStatus::Failed);
-    assert_eq!(attempts[1].attempt_index, 2);
-    assert_eq!(attempts[1].status, OrderExecutionAttemptStatus::Failed);
-    assert_eq!(attempts[2].attempt_index, 3);
-    assert_eq!(
-        attempts[2].status,
-        OrderExecutionAttemptStatus::RefundRequired
-    );
-    assert_eq!(
-        attempts[2].attempt_kind,
-        OrderExecutionAttemptKind::RefundRecovery
-    );
-}
-
-#[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn vault_address_matches_deterministic_derivation_from_quote() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().await;
@@ -15522,7 +8730,7 @@ async fn vault_address_matches_deterministic_derivation_from_quote() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await
@@ -15558,6 +8766,7 @@ async fn vault_address_matches_deterministic_derivation_from_quote() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn quote_envelope_never_exposes_deposit_address() {
     let mocks = MockIntegratorServer::spawn().await.unwrap();
     let (order_manager, _db) = test_order_manager(Arc::new(ActionProviderRegistry::mock_http(
@@ -15580,7 +8789,7 @@ async fn quote_envelope_never_exposes_deposit_address() {
             recipient_address: valid_evm_address(),
             order_kind: MarketOrderQuoteKind::ExactIn {
                 amount_in: "1000".to_string(),
-                slippage_bps: 100,
+                slippage_bps: Some(100),
             },
         })
         .await

@@ -1,0 +1,32 @@
+[package]
+name = "bitcoin-receipt-watcher"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "bitcoin-receipt-watcher"
+path = "src/main.rs"
+
+[dependencies]
+axum = { workspace = true }
+bitcoin = { workspace = true }
+bitcoin-receipt-watcher-client = { workspace = true }
+bitcoincore-rpc-async = { workspace = true }
+clap = { workspace = true }
+futures-util = "0.3"
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+snafu = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+url = { workspace = true }
+zeromq = { workspace = true }
+
+[dev-dependencies]
+devnet = { workspace = true }
+reqwest = { workspace = true }

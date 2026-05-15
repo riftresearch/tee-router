@@ -65,3 +65,4 @@ rift-api/
 .reference/
 .worktrees/
 incoming
+artifacts/

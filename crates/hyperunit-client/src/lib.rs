@@ -1,7 +1,11 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::Snafu;
-use std::{collections::BTreeSet, fmt, time::Duration};
+use std::{
+    collections::BTreeSet,
+    fmt,
+    time::{Duration, Instant},
+};
 use url::Url;
 
 pub type HyperUnitResult<T> = Result<T, HyperUnitClientError>;
@@ -442,11 +446,50 @@ impl HyperUnitClient {
         self.get_json(&path).await
     }
 
+    pub async fn deposit_operation(
+        &self,
+        operation_id: impl AsRef<str>,
+    ) -> HyperUnitResult<UnitOperation> {
+        let operation_id = validated_path_segment("operation_id", operation_id.as_ref())?;
+        self.get_json(&format!("/v2/operations/deposit/{operation_id}"))
+            .await
+    }
+
+    pub async fn withdrawal_operation(
+        &self,
+        operation_id: impl AsRef<str>,
+    ) -> HyperUnitResult<UnitOperation> {
+        let operation_id = validated_path_segment("operation_id", operation_id.as_ref())?;
+        self.get_json(&format!("/v2/operations/withdrawal/{operation_id}"))
+            .await
+    }
+
+    pub async fn estimate_fees(&self) -> HyperUnitResult<Value> {
+        self.get_json("/v2/estimate-fees").await
+    }
+
     async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> HyperUnitResult<T> {
         let endpoint = build_endpoint(&self.base_url, path)?;
-        let response = self.http.get(endpoint).send().await?;
+        let endpoint_label = hyperunit_endpoint_label(path);
+        let started = Instant::now();
+        let response = match self.http.get(endpoint).send().await {
+            Ok(response) => response,
+            Err(err) => {
+                record_venue_request("GET", endpoint_label, "transport_error", started.elapsed());
+                return Err(err.into());
+            }
+        };
         let status = response.status();
-        let body = read_limited_response_text(response, HYPERUNIT_MAX_RESPONSE_BODY_BYTES).await?;
+        let status_class = status_class(status.as_u16());
+        let body =
+            match read_limited_response_text(response, HYPERUNIT_MAX_RESPONSE_BODY_BYTES).await {
+                Ok(body) => body,
+                Err(err) => {
+                    record_venue_request("GET", endpoint_label, status_class, started.elapsed());
+                    return Err(err.into());
+                }
+            };
+        record_venue_request("GET", endpoint_label, status_class, started.elapsed());
         if body.truncated {
             return Err(HyperUnitClientError::ResponseBodyTooLarge {
                 max_bytes: HYPERUNIT_MAX_RESPONSE_BODY_BYTES,
@@ -461,6 +504,50 @@ impl HyperUnitClient {
         }
         serde_json::from_str(&body)
             .map_err(|source| HyperUnitClientError::InvalidBody { source, body })
+    }
+}
+
+fn record_venue_request(
+    method: &'static str,
+    endpoint: &'static str,
+    status_class: &'static str,
+    duration: Duration,
+) {
+    observability::upstream::record_upstream_request(
+        observability::upstream::UpstreamKind::TradingVenue,
+        "unit",
+        method,
+        endpoint,
+        status_class,
+        duration,
+    );
+}
+
+fn hyperunit_endpoint_label(path: &str) -> &'static str {
+    if path.starts_with("/gen/") {
+        "/gen/:src/:dst/:asset/:dst_addr"
+    } else if path.starts_with("/operations/") {
+        "/operations/:address"
+    } else if path.starts_with("/v2/operations/deposit/") {
+        "/v2/operations/deposit/:id"
+    } else if path.starts_with("/v2/operations/withdrawal/") {
+        "/v2/operations/withdrawal/:id"
+    } else {
+        match path {
+            "/v2/estimate-fees" => "/v2/estimate-fees",
+            _ => "unknown",
+        }
+    }
+}
+
+fn status_class(status: u16) -> &'static str {
+    match status {
+        100..=199 => "1xx",
+        200..=299 => "2xx",
+        300..=399 => "3xx",
+        400..=499 => "4xx",
+        500..=599 => "5xx",
+        _ => "unknown",
     }
 }
 
@@ -635,6 +722,20 @@ mod tests {
         assert_eq!(
             request.into_path().expect("valid path"),
             "/gen/bitcoin/hyperliquid/btc/0x1111111111111111111111111111111111111111"
+        );
+    }
+
+    #[test]
+    fn generate_address_request_builds_path_for_hyperliquid_bitcoin_withdrawal() {
+        let request = UnitGenerateAddressRequest {
+            src_chain: UnitChain::Hyperliquid,
+            dst_chain: UnitChain::Bitcoin,
+            asset: UnitAsset::Btc,
+            dst_addr: "bc1qk4m6mpxulnlufegdh3w40kayhx9m722am38apn".to_string(),
+        };
+        assert_eq!(
+            request.into_path().expect("valid path"),
+            "/gen/hyperliquid/bitcoin/btc/bc1qk4m6mpxulnlufegdh3w40kayhx9m722am38apn"
         );
     }
 

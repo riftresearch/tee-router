@@ -93,7 +93,8 @@ Current shape:
 4. enumerate transition paths from source asset to destination asset
 5. drop non-executable paths
 6. probe the ranked paths to discover expected input/output
-7. derive `min_amount_out` or `max_amount_in` from user `slippage_bps`
+7. derive `min_amount_out` or `max_amount_in` only when the user supplied
+   `slippage_bps`
 8. re-quote the chosen provider path with the derived hard bound
 9. persist the selected quote
 
@@ -101,8 +102,9 @@ Important detail:
 
 - The persisted quote contains `path_id`, `transition_decl_ids`, and a
   transition-leg quote chain.
-- The request stores the user-facing `slippage_bps`; the persisted quote and
-  order store both that value and the derived hard amount bound.
+- The request stores the optional user-facing `slippage_bps`; the persisted
+  quote and order store that nullable value plus the derived hard amount bound
+  only when one exists.
 - The worker does not rediscover the route template later.
 - The quote is the source of truth for the forward execution path.
 

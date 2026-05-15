@@ -180,7 +180,24 @@ Live-provider tests are intentionally ignored and gated:
 - Use `-- --ignored --nocapture` so the provider transcripts are printed.
 - Spending tests require an additional explicit confirmation env var.
 
+Read-only live-vs-mock parity tests are provider-specific:
+
+| Venue | Read-only differential target |
+| --- | --- |
+| Across | [`bin/router-server/tests/live_across_provider_differential.rs`](../bin/router-server/tests/live_across_provider_differential.rs) |
+| CCTP | [`bin/router-server/tests/live_cctp_provider_differential.rs`](../bin/router-server/tests/live_cctp_provider_differential.rs) |
+| Velora | [`bin/router-server/tests/live_velora_provider_differential.rs`](../bin/router-server/tests/live_velora_provider_differential.rs) |
+| Hyperliquid | [`bin/router-server/tests/live_hyperliquid_provider_differential.rs`](../bin/router-server/tests/live_hyperliquid_provider_differential.rs) |
+| Unit | [`bin/router-server/tests/live_unit_provider_differential.rs`](../bin/router-server/tests/live_unit_provider_differential.rs) |
+
+Real-funds lifecycle tests are separate from the read-only parity targets. They
+must have an additional spend confirmation, dust-sized hard limits, transcript
+artifacts, and final balance/status assertions.
+
 The tests are designed to record provider transcripts first, not to assert a
 large number of brittle market-data values. The useful output is the exact API
 shape and lifecycle sequence observed while using our clients against real
-providers.
+providers. Read-only differentials write artifacts under
+`$ROUTER_LIVE_RECOVERY_DIR/provider-differentials`. See
+[`docs/live-provider-differential-tests.md`](live-provider-differential-tests.md)
+for the current matrix and run commands.

@@ -32,11 +32,16 @@ type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 const LIVE_PROVIDER_TESTS: &str = "LIVE_PROVIDER_TESTS";
 const LIVE_TEST_PRIVATE_KEY: &str = "LIVE_TEST_PRIVATE_KEY";
 const HYPERUNIT_BASE_URL: &str = "HYPERUNIT_LIVE_BASE_URL";
+const HYPERUNIT_FALLBACK_BASE_URL: &str = "HYPERUNIT_API_URL";
 const HYPERUNIT_PROXY_URL: &str = "HYPERUNIT_LIVE_PROXY_URL";
+const HYPERUNIT_FALLBACK_PROXY_URL: &str = "HYPERUNIT_PROXY_URL";
 const HYPERUNIT_PRIVATE_KEY: &str = "HYPERUNIT_LIVE_PRIVATE_KEY";
 const HYPERUNIT_ETHEREUM_RPC_URL: &str = "HYPERUNIT_LIVE_ETHEREUM_RPC_URL";
 const HYPERUNIT_DEPOSIT_AMOUNT_WEI: &str = "HYPERUNIT_LIVE_ETH_DEPOSIT_AMOUNT_WEI";
 const HYPERUNIT_WITHDRAW_AMOUNT_ETH: &str = "HYPERUNIT_LIVE_ETH_WITHDRAW_AMOUNT";
+const HYPERUNIT_WITHDRAW_AMOUNT_BTC: &str = "HYPERUNIT_LIVE_BTC_WITHDRAW_AMOUNT";
+const HYPERUNIT_BTC_WITHDRAW_ADDRESS: &str = "HYPERUNIT_LIVE_BTC_WITHDRAW_ADDRESS";
+const ROUTER_LIVE_BTC_RECIPIENT_ADDRESS: &str = "ROUTER_LIVE_BTC_RECIPIENT_ADDRESS";
 const HYPERUNIT_WITHDRAW_FUNDING_AMOUNT_WEI: &str =
     "HYPERUNIT_LIVE_ETH_WITHDRAW_FUNDING_AMOUNT_WEI";
 const HYPERUNIT_SPEND_CONFIRMATION: &str = "HYPERUNIT_LIVE_I_UNDERSTAND_THIS_SENDS_REAL_FUNDS";
@@ -48,6 +53,7 @@ const DEFAULT_HYPERUNIT_BASE_URL: &str = "https://api.hyperunit.xyz";
 const DEFAULT_HYPERLIQUID_BASE_URL: &str = "https://api.hyperliquid.xyz";
 const DEFAULT_HYPERUNIT_DEPOSIT_AMOUNT_WEI: &str = "10000000000000000";
 const DEFAULT_HYPERUNIT_WITHDRAW_AMOUNT_ETH: &str = "0.008";
+const DEFAULT_HYPERUNIT_WITHDRAW_AMOUNT_BTC: &str = "0.0003";
 const DEFAULT_HYPERUNIT_WITHDRAW_FUNDING_AMOUNT_WEI: &str = "12000000000000000";
 const DEFAULT_UNIT_POLL_INTERVAL: Duration = Duration::from_secs(15);
 const DEFAULT_UNIT_TIMEOUT: Duration = Duration::from_secs(60 * 60);
@@ -82,6 +88,7 @@ async fn live_hyperunit_generate_address_smoke() -> TestResult<()> {
             address: generated.address.clone(),
         })
         .await?;
+    assert_unit_operations_contract("HyperUnit generate-address smoke", &operations)?;
 
     emit_transcript(
         "hyperunit.generate_address_smoke",
@@ -172,6 +179,10 @@ async fn live_hyperunit_eth_deposit_to_hyperliquid_transcript_spends_funds() -> 
         &seen_operation_fingerprints,
     )
     .await?;
+    assert_unit_operation_contract(
+        "HyperUnit ETH deposit terminal operation",
+        &terminal_operation,
+    )?;
 
     if !unit_tx_hash_matches_submitted(
         terminal_operation.source_tx_hash.as_deref(),
@@ -308,13 +319,20 @@ async fn live_hyperunit_eth_withdraw_from_hyperliquid_to_ethereum_transcript_spe
         .collect::<Vec<_>>();
 
     let exchange_response = hl_exchange
-        .spot_send(
+        .send_asset(
             generated.address.clone(),
+            "spot".to_string(),
+            "spot".to_string(),
             ueth_token_wire.clone(),
             withdraw_amount.clone(),
             current_time_ms(),
         )
         .await?;
+    eprintln!("Hyperliquid ETH withdrawal sendAsset response: {exchange_response}");
+    assert_hyperliquid_exchange_ok(
+        "HyperUnit ETH withdrawal Hyperliquid sendAsset",
+        &exchange_response,
+    )?;
 
     let (terminal_operation, lifecycle_samples) = wait_for_terminal_unit_operation(
         &unit,
@@ -324,6 +342,10 @@ async fn live_hyperunit_eth_withdraw_from_hyperliquid_to_ethereum_transcript_spe
         &seen_operation_fingerprints,
     )
     .await?;
+    assert_unit_operation_contract(
+        "HyperUnit ETH withdrawal terminal operation",
+        &terminal_operation,
+    )?;
 
     let (after_spot, spot_balance_samples) =
         poll_spot_balance_decrease(&hl_info, user, "UETH", before_ueth - withdraw_amount_f64)
@@ -379,6 +401,192 @@ async fn live_hyperunit_eth_withdraw_from_hyperliquid_to_ethereum_transcript_spe
     Ok(())
 }
 
+#[tokio::test]
+#[ignore = "SPENDS REAL FUNDS by withdrawing Hyperliquid UBTC to Bitcoin through live HyperUnit"]
+async fn live_hyperunit_btc_withdraw_from_hyperliquid_to_bitcoin_transcript_spends_funds(
+) -> TestResult<()> {
+    if !live_enabled() {
+        return Ok(());
+    }
+    require_confirmation(
+        HYPERUNIT_SPEND_CONFIRMATION,
+        "YES",
+        "refusing to submit a live HyperUnit BTC withdrawal",
+    )?;
+
+    let private_key = required_private_key()?;
+    let signer = private_key.parse::<PrivateKeySigner>()?;
+    let user = signer.address();
+    let user_str = format!("{user:#x}");
+    let unit = live_unit_client()?;
+    let mut hl_info = live_hyperliquid_info_client()?;
+    let hl_exchange = live_hyperliquid_exchange_client(signer)?;
+    let btc_recipient = env_var_any(&[
+        HYPERUNIT_BTC_WITHDRAW_ADDRESS,
+        ROUTER_LIVE_BTC_RECIPIENT_ADDRESS,
+    ])
+    .ok_or_else(|| {
+        format!(
+            "missing required env var {HYPERUNIT_BTC_WITHDRAW_ADDRESS} or {ROUTER_LIVE_BTC_RECIPIENT_ADDRESS}"
+        )
+    })?;
+
+    let spot_meta = hl_info.refresh_spot_meta().await?;
+    let ubtc_token_wire = hl_info.spot_token_wire("UBTC")?;
+    let withdraw_amount = env::var(HYPERUNIT_WITHDRAW_AMOUNT_BTC)
+        .unwrap_or_else(|_| DEFAULT_HYPERUNIT_WITHDRAW_AMOUNT_BTC.to_string());
+    let withdraw_amount_f64 = withdraw_amount.parse::<f64>()?;
+
+    let before_spot = hl_info.spot_clearinghouse_state(user).await?;
+    let before_ubtc = parse_spot_balance(&before_spot, "UBTC");
+    if before_ubtc + 1e-12 < withdraw_amount_f64 {
+        return Err(format!(
+            "insufficient Hyperliquid UBTC balance: have {before_ubtc}, need {withdraw_amount_f64}"
+        )
+        .into());
+    }
+
+    let generate_request = UnitGenerateAddressRequest {
+        src_chain: UnitChain::Hyperliquid,
+        dst_chain: UnitChain::Bitcoin,
+        asset: UnitAsset::Btc,
+        dst_addr: btc_recipient.clone(),
+    };
+    let generated = unit.generate_address(generate_request.clone()).await?;
+    let operations_before_by_protocol = unit
+        .operations(UnitOperationsRequest {
+            address: generated.address.clone(),
+        })
+        .await?;
+    let operations_before_by_destination = unit
+        .operations(UnitOperationsRequest {
+            address: btc_recipient.clone(),
+        })
+        .await?;
+    let seen_operation_fingerprints = observed_unit_operation_fingerprints(
+        &operations_before_by_protocol,
+        &operations_before_by_destination,
+        &generated.address,
+    );
+
+    let before_destination_receipt = operations_before_by_destination
+        .operations
+        .iter()
+        .filter(|op| op.matches_protocol_address(&generated.address))
+        .filter_map(|op| op.destination_tx_hash.clone())
+        .collect::<Vec<_>>();
+
+    let fee_estimate_before_spot_send = unit.estimate_fees().await?;
+
+    let exchange_response = hl_exchange
+        .send_asset(
+            generated.address.clone(),
+            "spot".to_string(),
+            "spot".to_string(),
+            ubtc_token_wire.clone(),
+            withdraw_amount.clone(),
+            current_time_ms(),
+        )
+        .await?;
+    eprintln!("Hyperliquid BTC withdrawal sendAsset response: {exchange_response}");
+    if let Err(err) = assert_hyperliquid_exchange_ok(
+        "HyperUnit BTC withdrawal Hyperliquid sendAsset",
+        &exchange_response,
+    ) {
+        emit_transcript(
+            "hyperunit.btc_withdraw_from_hyperliquid_to_bitcoin.rejected",
+            json!({
+                "unit_base_url": unit.base_url(),
+                "hyperliquid_base_url": hl_exchange.http().base_url(),
+                "hyperliquid_network": format!("{:?}", hl_exchange.network()),
+                "user": user_str,
+                "btc_recipient": btc_recipient,
+                "spot_meta_token_wire": {
+                    "symbol": "UBTC",
+                    "wire": ubtc_token_wire,
+                    "tokens_sample": spot_meta.tokens.iter().take(5).collect::<Vec<_>>(),
+                },
+                "generate_request": {
+                    "src_chain": generate_request.src_chain.as_wire_str(),
+                    "dst_chain": generate_request.dst_chain.as_wire_str(),
+                    "asset": generate_request.asset.as_wire_str(),
+                    "dst_addr": generate_request.dst_addr,
+                },
+                "generate_response": generated,
+                "operations_before_spot_send": {
+                    "by_protocol_address": operations_before_by_protocol,
+                    "by_destination_address": operations_before_by_destination,
+                    "matching_destination_tx_hashes": before_destination_receipt,
+                },
+                "unit_fee_estimate_before_spot_send": fee_estimate_before_spot_send,
+                "hyperliquid_spot_before": before_spot,
+                "hyperliquid_exchange_response": exchange_response,
+            }),
+        );
+        return Err(err);
+    }
+
+    let (terminal_operation, lifecycle_samples) = wait_for_terminal_unit_operation(
+        &unit,
+        &btc_recipient,
+        &generated.address,
+        "HyperUnit BTC withdrawal",
+        &seen_operation_fingerprints,
+    )
+    .await?;
+    assert_unit_operation_contract(
+        "HyperUnit BTC withdrawal terminal operation",
+        &terminal_operation,
+    )?;
+
+    let (after_spot, spot_balance_samples) =
+        poll_spot_balance_decrease(&hl_info, user, "UBTC", before_ubtc - withdraw_amount_f64)
+            .await?;
+
+    let destination_tx_hash = terminal_operation
+        .destination_tx_hash
+        .clone()
+        .ok_or("HyperUnit BTC withdrawal terminal operation is missing destination_tx_hash")?;
+
+    emit_transcript(
+        "hyperunit.btc_withdraw_from_hyperliquid_to_bitcoin",
+        json!({
+            "unit_base_url": unit.base_url(),
+            "hyperliquid_base_url": hl_exchange.http().base_url(),
+            "hyperliquid_network": format!("{:?}", hl_exchange.network()),
+            "user": user_str,
+            "btc_recipient": btc_recipient,
+            "spot_meta_token_wire": {
+                "symbol": "UBTC",
+                "wire": ubtc_token_wire,
+                "tokens_sample": spot_meta.tokens.iter().take(5).collect::<Vec<_>>(),
+            },
+            "generate_request": {
+                "src_chain": generate_request.src_chain.as_wire_str(),
+                "dst_chain": generate_request.dst_chain.as_wire_str(),
+                "asset": generate_request.asset.as_wire_str(),
+                "dst_addr": generate_request.dst_addr,
+            },
+            "generate_response": generated,
+            "operations_before_spot_send": {
+                "by_protocol_address": operations_before_by_protocol,
+                "by_destination_address": operations_before_by_destination,
+                "matching_destination_tx_hashes": before_destination_receipt,
+            },
+            "unit_fee_estimate_before_spot_send": fee_estimate_before_spot_send,
+            "hyperliquid_spot_before": before_spot,
+            "hyperliquid_exchange_response": exchange_response,
+            "unit_lifecycle_samples": lifecycle_samples,
+            "terminal_operation": terminal_operation,
+            "hyperliquid_spot_balance_samples": spot_balance_samples,
+            "hyperliquid_spot_after": after_spot,
+            "bitcoin_destination_tx_hash": destination_tx_hash,
+        }),
+    );
+
+    Ok(())
+}
+
 async fn ensure_hyperliquid_ueth_balance<P>(
     unit: &HyperUnitClient,
     hl_info: &HyperliquidInfoClient,
@@ -423,6 +631,10 @@ where
         &BTreeSet::new(),
     )
     .await?;
+    assert_unit_operation_contract(
+        "HyperUnit ETH funding deposit terminal operation",
+        &terminal_operation,
+    )?;
     let (after_spot, spot_balance_samples) =
         poll_spot_balance_increase(hl_info, user, "UETH", before_ueth).await?;
 
@@ -676,6 +888,91 @@ fn matching_operations(
         .collect()
 }
 
+fn assert_unit_operations_contract(
+    label: &str,
+    response: &UnitOperationsResponse,
+) -> TestResult<()> {
+    for (index, operation) in response.operations.iter().enumerate() {
+        assert_unit_operation_contract(&format!("{label} operations[{index}]"), operation)?;
+    }
+    Ok(())
+}
+
+fn assert_unit_operation_contract(label: &str, operation: &UnitOperation) -> TestResult<()> {
+    for (field, value) in [
+        ("sourceAmount", operation.source_amount.as_deref()),
+        (
+            "destinationFeeAmount",
+            operation.destination_fee_amount.as_deref(),
+        ),
+        ("sweepFeeAmount", operation.sweep_fee_amount.as_deref()),
+    ] {
+        if let Some(value) = value {
+            assert_decimal_compatible_amount_string(&format!("{label} {field}"), value)?;
+        }
+    }
+    for (field, value) in [
+        ("sourceTxHash", operation.source_tx_hash.as_deref()),
+        (
+            "destinationTxHash",
+            operation.destination_tx_hash.as_deref(),
+        ),
+    ] {
+        if let Some(value) = value {
+            assert!(
+                !value.trim().is_empty(),
+                "{label} {field} must not be empty"
+            );
+        }
+    }
+    if let Some(state) = operation.state.as_deref() {
+        assert!(!state.trim().is_empty(), "{label} state must not be empty");
+    }
+    Ok(())
+}
+
+fn assert_hyperliquid_exchange_ok(label: &str, response: &Value) -> TestResult<()> {
+    match response.get("status").and_then(Value::as_str) {
+        Some(status) if status.eq_ignore_ascii_case("ok") => Ok(()),
+        Some(_) => Err(format!("{label} returned non-ok response: {response}").into()),
+        None => Err(format!("{label} response missing status: {response}").into()),
+    }
+}
+
+fn assert_decimal_compatible_amount_string(label: &str, value: &str) -> TestResult<()> {
+    assert!(!value.is_empty(), "{label} must not be empty");
+    assert_eq!(
+        value.trim(),
+        value,
+        "{label} must not contain surrounding whitespace: {value:?}"
+    );
+    let dot_count = value.bytes().filter(|byte| *byte == b'.').count();
+    assert!(
+        dot_count <= 1,
+        "{label} must contain at most one decimal point"
+    );
+    assert!(
+        value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.'),
+        "{label} must be a decimal-compatible numeric string, got {value:?}"
+    );
+    let mut parts = value.split('.');
+    let whole = parts.next().unwrap_or_default();
+    let fractional = parts.next();
+    assert!(
+        !whole.is_empty() && whole.bytes().all(|byte| byte.is_ascii_digit()),
+        "{label} must include whole-number digits, got {value:?}"
+    );
+    if let Some(fractional) = fractional {
+        assert!(
+            !fractional.is_empty() && fractional.bytes().all(|byte| byte.is_ascii_digit()),
+            "{label} must include fractional digits after '.', got {value:?}"
+        );
+    }
+    Ok(())
+}
+
 fn observed_unit_operation_fingerprints(
     protocol_response: &UnitOperationsResponse,
     destination_response: &UnitOperationsResponse,
@@ -707,8 +1004,9 @@ fn unit_tx_hash_matches_submitted(observed: Option<&str>, submitted: &str) -> bo
 
 fn live_unit_client() -> TestResult<HyperUnitClient> {
     HyperUnitClient::new_with_proxy_url(
-        env::var(HYPERUNIT_BASE_URL).unwrap_or_else(|_| DEFAULT_HYPERUNIT_BASE_URL.to_string()),
-        env::var(HYPERUNIT_PROXY_URL).ok(),
+        env_var_any(&[HYPERUNIT_BASE_URL, HYPERUNIT_FALLBACK_BASE_URL])
+            .unwrap_or_else(|| DEFAULT_HYPERUNIT_BASE_URL.to_string()),
+        env_var_any(&[HYPERUNIT_PROXY_URL, HYPERUNIT_FALLBACK_PROXY_URL]),
     )
     .map_err(Into::into)
 }
@@ -808,6 +1106,15 @@ fn required_private_key() -> TestResult<String> {
 
 fn required_env(key: &str) -> TestResult<String> {
     env::var(key).map_err(|_| format!("missing required env var {key}").into())
+}
+
+fn env_var_any(keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        env::var(key)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
 }
 
 fn require_confirmation(key: &str, expected: &str, context: &str) -> TestResult<()> {

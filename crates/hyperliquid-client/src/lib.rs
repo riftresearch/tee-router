@@ -18,7 +18,7 @@ pub mod wire;
 
 pub use actions::{
     Actions, BulkCancel, BulkOrder, CancelRequest, Limit, Order, OrderRequest, ScheduleCancel,
-    SpotSend, Tif, UsdClassTransfer, Withdraw3,
+    SendAsset, SpotSend, Tif, UsdClassTransfer, Withdraw3,
 };
 pub use bridge::{
     bridge_address, build_bridge_deposit_tx, build_bridge_deposit_tx_to, minimum_bridge_deposit,
@@ -33,7 +33,9 @@ pub use error::{Error, Result};
 pub use http::HttpClient;
 pub use info::{
     BasicOrderInfo, ClearinghouseState, L2BookSnapshot, L2Level, MarginSummary, OpenOrder,
-    OrderInfoEnvelope, OrderStatusResponse, SpotBalance, SpotClearinghouseState, UserFill,
+    OrderInfoEnvelope, OrderStatusResponse, PerpAssetMeta, PerpMeta, SpotBalance,
+    SpotClearinghouseState, UserFill, UserFunding, UserNonFundingLedgerDelta,
+    UserNonFundingLedgerUpdate, UserRateLimit,
 };
 pub use meta::{
     spot_wire_asset_index, SpotAssetMeta, SpotMeta, TokenInfo, SPOT_ASSET_INDEX_OFFSET,

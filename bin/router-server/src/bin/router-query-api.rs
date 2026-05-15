@@ -7,16 +7,15 @@ use axum::{
     Json, Router,
 };
 use clap::Parser;
+use router_core::db::Database;
 use router_server::{
-    db::Database,
     error::{RouterServerError, RouterServerResult},
     query_api, Error, Result,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use snafu::{FromString, Whatever};
-use tower_http::trace::{DefaultMakeSpan, TraceLayer};
-use tracing::{info, Level};
+use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 use uuid::Uuid;
 
@@ -42,7 +41,7 @@ struct RouterQueryApiArgs {
     database_url: String,
 
     /// Database max connections
-    #[arg(long, env = "DB_MAX_CONNECTIONS", default_value = "16")]
+    #[arg(long, env = "DB_MAX_CONNECTIONS", default_value = "100")]
     db_max_connections: u32,
 
     /// Database min connections
@@ -81,20 +80,15 @@ async fn run(args: RouterQueryApiArgs) -> Result<()> {
         args.db_min_connections,
     )
     .await
-    .map_err(|source| Error::DatabaseInit { source })?;
+    .map_err(|source| Error::DatabaseInit {
+        source: source.into(),
+    })?;
 
     let addr = SocketAddr::from((args.host, args.port));
     let app = Router::new()
         .route("/status", get(status_handler))
         .route("/internal/v1/orders/:id/flow", get(get_order_flow))
-        .with_state(QueryApiState { db, query_api_key })
-        .layer(
-            TraceLayer::new_for_http().make_span_with(
-                DefaultMakeSpan::new()
-                    .level(Level::INFO)
-                    .include_headers(false),
-            ),
-        );
+        .with_state(QueryApiState { db, query_api_key });
 
     info!("Listening on {}", addr);
     let listener = tokio::net::TcpListener::bind(addr)

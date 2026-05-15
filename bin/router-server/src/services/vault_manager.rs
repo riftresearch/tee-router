@@ -1,13 +1,6 @@
 use crate::{
     api::CreateVaultRequest,
-    config::Settings,
-    db::Database,
     error::RouterServerError,
-    models::{
-        DepositVault, DepositVaultFundingHint, DepositVaultFundingObservation, DepositVaultStatus,
-        ProviderOperationHintStatus, RouterOrderQuote, RouterOrderStatus, VaultAction,
-    },
-    protocol::{backend_chain_for_id, AssetId, ChainId, DepositAsset},
     services::deposit_address::{derive_deposit_address_for_quote, DepositAddressError},
     telemetry,
 };
@@ -16,6 +9,17 @@ use blockchain_utils::MempoolEsploraFeeExt;
 use chains::ChainRegistry;
 use chrono::{DateTime, Duration, Utc};
 use hkdf::Hkdf;
+use router_core::{
+    config::Settings,
+    db::Database,
+    error::RouterCoreError,
+    models::{
+        DepositVault, DepositVaultFundingHint, DepositVaultFundingObservation, DepositVaultStatus,
+        ProviderOperationHintStatus, RouterOrderQuote, RouterOrderStatus, VaultAction,
+    },
+    protocol::{backend_chain_for_id, AssetId, ChainId, DepositAsset},
+    services::bitcoin_funding::observed_bitcoin_outpoint,
+};
 use router_primitives::{ChainType, TokenIdentifier};
 use serde_json::{json, Value};
 use sha2::Sha256;
@@ -123,9 +127,9 @@ impl VaultError {
         }
     }
 
-    fn database(source: RouterServerError) -> Self {
+    fn database(source: impl Into<RouterServerError>) -> Self {
         Self::Database {
-            source: Box::new(source),
+            source: Box::new(source.into()),
         }
     }
 }
@@ -438,6 +442,67 @@ impl VaultManager {
         Ok(summary)
     }
 
+    pub async fn reconcile_pending_funding_balances(&self, limit: i64) -> VaultResult<Vec<Uuid>> {
+        let vaults = self
+            .db
+            .vaults()
+            .find_pending_funding_without_observation(limit)
+            .await
+            .map_err(VaultError::database)?;
+        let mut funded_order_ids = Vec::new();
+
+        for vault in vaults {
+            if !self.vault_supports_balance_reconciliation(&vault) {
+                continue;
+            }
+
+            let required_amount = self.required_funding_amount(&vault).await?;
+            let visible_balance = self.vault_visible_balance(&vault).await?;
+            if visible_balance < required_amount {
+                continue;
+            }
+
+            let now = Utc::now();
+            let observation =
+                funding_observation_from_balance_reconciliation(&vault, visible_balance, now);
+            let funded_vault = match self
+                .db
+                .vaults()
+                .mark_funded_with_observation(vault.id, &observation, now)
+                .await
+            {
+                Ok(funded_vault) => funded_vault,
+                Err(RouterCoreError::NotFound) => continue,
+                Err(source) => return Err(VaultError::database(source)),
+            };
+            telemetry::record_vault_transition(
+                &funded_vault,
+                DepositVaultStatus::PendingFunding,
+                DepositVaultStatus::Funded,
+            );
+            info!(
+                vault_id = %funded_vault.id,
+                chain = %funded_vault.deposit_asset.chain,
+                asset_kind = if funded_vault.deposit_asset.asset.is_native() { "native" } else { "reference" },
+                visible_balance = %visible_balance,
+                required_amount = %required_amount,
+                "Router worker reconciled vault funding from chain balance"
+            );
+            if let Some(order_id) = funded_vault.order_id {
+                funded_order_ids.push(order_id);
+            }
+        }
+
+        Ok(funded_order_ids)
+    }
+
+    fn vault_supports_balance_reconciliation(&self, vault: &DepositVault) -> bool {
+        matches!(
+            backend_chain_for_id(&vault.deposit_asset.chain),
+            Some(ChainType::Ethereum | ChainType::Arbitrum | ChainType::Base)
+        )
+    }
+
     async fn complete_claimed_funding_hint(
         &self,
         hint: &DepositVaultFundingHint,
@@ -451,7 +516,7 @@ impl VaultManager {
             .await
         {
             Ok(_) => Ok(true),
-            Err(RouterServerError::NotFound) => {
+            Err(RouterCoreError::NotFound) => {
                 warn!(
                     hint_id = %hint.id,
                     claimed_at = ?hint.claimed_at,
@@ -512,7 +577,7 @@ impl VaultManager {
                 .await
             {
                 Ok(observed_vault) => observed_vault,
-                Err(RouterServerError::NotFound) => {
+                Err(RouterCoreError::NotFound) => {
                     return Ok(FundingHintDisposition::Ignored {
                         reason: "refunding vault observation was already recorded".to_string(),
                     });
@@ -531,7 +596,7 @@ impl VaultManager {
             .await
         {
             Ok(funded_vault) => funded_vault,
-            Err(RouterServerError::NotFound) => {
+            Err(RouterCoreError::NotFound) => {
                 return Ok(FundingHintDisposition::Ignored {
                     reason: "vault funding transition was already claimed".to_string(),
                 });
@@ -714,7 +779,7 @@ impl VaultManager {
                     .await
                 {
                     Ok(vault) => vault,
-                    Err(RouterServerError::NotFound) => {
+                    Err(RouterCoreError::NotFound) => {
                         warn!(
                             vault_id = %vault.id,
                             worker_id = %self.worker_id,
@@ -739,6 +804,39 @@ impl VaultManager {
                 warn!(vault_id = %vault.id, error = %message, "Router-server refund attempt did not complete");
                 telemetry::record_refund_failure(&vault, "chain_error", refund_started.elapsed());
                 let failed_at = Utc::now();
+                if refund_error_requires_manual_intervention(&message) {
+                    match self
+                        .db
+                        .vaults()
+                        .mark_refund_manual_intervention_required(
+                            vault.id,
+                            failed_at,
+                            &message,
+                            &self.worker_id,
+                            claimed_until,
+                        )
+                        .await
+                    {
+                        Ok(vault) => {
+                            telemetry::record_vault_transition(
+                                &vault,
+                                DepositVaultStatus::Refunding,
+                                vault.status,
+                            );
+                            return Ok(vault);
+                        }
+                        Err(RouterCoreError::NotFound) => {
+                            warn!(
+                                vault_id = %vault.id,
+                                worker_id = %self.worker_id,
+                                claimed_until = %claimed_until,
+                                "Refund manual-intervention transition lost its processing lease; leaving current refund owner to finish it"
+                            );
+                            return Ok(vault);
+                        }
+                        Err(source) => return Err(VaultError::database(source)),
+                    }
+                }
                 match self
                     .db
                     .vaults()
@@ -753,7 +851,7 @@ impl VaultManager {
                     .await
                 {
                     Ok(vault) => Ok(vault),
-                    Err(RouterServerError::NotFound) => {
+                    Err(RouterCoreError::NotFound) => {
                         warn!(
                             vault_id = %vault.id,
                             worker_id = %self.worker_id,
@@ -780,6 +878,28 @@ impl VaultManager {
                     .ok_or_else(|| "Bitcoin chain is not configured".to_string())?,
             )
             .ok_or_else(|| "Bitcoin chain is not configured".to_string())?;
+        if let Some(outpoint) = observed_bitcoin_outpoint(vault.funding_observation.as_ref())? {
+            let fee = bitcoin_chain
+                .estimate_p2wpkh_transfer_fee_sats(1, 1)
+                .await
+                .map_err(|err| err.to_string())?;
+            let tx_data = bitcoin_chain
+                .dump_to_address_from_outpoint(
+                    &token_identifier(&vault.deposit_asset.asset),
+                    private_key,
+                    &vault.recovery_address,
+                    U256::from(fee),
+                    &outpoint.tx_hash,
+                    outpoint.vout,
+                    outpoint.amount_sats,
+                )
+                .await
+                .map_err(|err| err.to_string())?;
+            return bitcoin_chain
+                .broadcast_signed_transaction(&tx_data)
+                .await
+                .map_err(|err| err.to_string());
+        }
         let balance = bitcoin_chain
             .address_balance_sats(&vault.deposit_vault_address)
             .await
@@ -1054,10 +1174,16 @@ impl VaultManager {
         match &vault.action {
             VaultAction::Null => Ok(U256::from(1)),
             VaultAction::MarketOrder(action) => match &action.order_kind {
-                crate::models::MarketOrderKind::ExactIn { amount_in, .. } => {
+                router_core::models::MarketOrderKind::ExactIn { amount_in, .. } => {
                     parse_positive_u256("amount_in", amount_in)
                 }
-                crate::models::MarketOrderKind::ExactOut { max_amount_in, .. } => {
+                router_core::models::MarketOrderKind::ExactOut { max_amount_in, .. } => {
+                    let Some(max_amount_in) = max_amount_in.as_deref() else {
+                        return Err(VaultError::InvalidOrderBinding {
+                            reason: "exact-out market order funding requires max_amount_in"
+                                .to_string(),
+                        });
+                    };
                     parse_positive_u256("max_amount_in", max_amount_in)
                 }
             },
@@ -1244,6 +1370,13 @@ impl VaultManager {
     }
 }
 
+fn refund_error_requires_manual_intervention(message: &str) -> bool {
+    message.contains("Observed bitcoin outpoint")
+        && (message.contains(" is not spendable")
+            || message.contains(" did not match expected ")
+            || message.contains(" does not pay the signer address"))
+}
+
 fn funding_observation_from_hint(
     vault: &DepositVault,
     hint: &DepositVaultFundingHint,
@@ -1267,6 +1400,32 @@ fn funding_observation_from_hint(
         observed_at: observed_at_from_hint(&evidence)?,
         evidence,
     })
+}
+
+fn funding_observation_from_balance_reconciliation(
+    vault: &DepositVault,
+    visible_balance: U256,
+    observed_at: DateTime<Utc>,
+) -> DepositVaultFundingObservation {
+    DepositVaultFundingObservation {
+        tx_hash: None,
+        sender_address: None,
+        sender_addresses: Vec::new(),
+        recipient_address: Some(vault.deposit_vault_address.clone()),
+        transfer_index: None,
+        observed_amount: Some(visible_balance.to_string()),
+        confirmation_state: Some("confirmed".to_string()),
+        observed_at: Some(observed_at),
+        evidence: json!({
+            "source": "router_balance_reconciliation",
+            "chain_id": vault.deposit_asset.chain.as_str(),
+            "asset_id": vault.deposit_asset.asset.as_str(),
+            "address": &vault.deposit_vault_address,
+            "amount": visible_balance.to_string(),
+            "confirmation_state": "confirmed",
+            "observed_at": observed_at.to_rfc3339(),
+        }),
+    }
 }
 
 fn funding_sender_addresses(evidence: &Value) -> VaultResult<Vec<String>> {
@@ -1356,9 +1515,9 @@ fn token_identifier(asset_id: &AssetId) -> TokenIdentifier {
     }
 }
 
-fn map_create_vault_error(source: RouterServerError) -> VaultError {
+fn map_create_vault_error(source: RouterCoreError) -> VaultError {
     match source {
-        RouterServerError::Validation { message } => {
+        RouterCoreError::Validation { message } => {
             VaultError::InvalidOrderBinding { reason: message }
         }
         source => VaultError::database(source),
@@ -1638,7 +1797,7 @@ mod tests {
             id: Uuid::now_v7(),
             vault_id: Uuid::now_v7(),
             source: "sauron".to_string(),
-            hint_kind: crate::models::ProviderOperationHintKind::PossibleProgress,
+            hint_kind: router_core::models::ProviderOperationHintKind::PossibleProgress,
             evidence: serde_json::json!({ "vout": 7 }),
             status: ProviderOperationHintStatus::Pending,
             idempotency_key: None,
@@ -1660,7 +1819,7 @@ mod tests {
             id: Uuid::now_v7(),
             vault_id: Uuid::now_v7(),
             source: "sauron".to_string(),
-            hint_kind: crate::models::ProviderOperationHintKind::PossibleProgress,
+            hint_kind: router_core::models::ProviderOperationHintKind::PossibleProgress,
             evidence: serde_json::json!({ "vout": "7" }),
             status: ProviderOperationHintStatus::Pending,
             idempotency_key: None,
@@ -1688,7 +1847,7 @@ mod tests {
             id: Uuid::now_v7(),
             vault_id: Uuid::now_v7(),
             source: "sauron".to_string(),
-            hint_kind: crate::models::ProviderOperationHintKind::PossibleProgress,
+            hint_kind: router_core::models::ProviderOperationHintKind::PossibleProgress,
             evidence: serde_json::json!({ "confirmation_state": "Mempool" }),
             status: ProviderOperationHintStatus::Pending,
             idempotency_key: None,
@@ -1749,7 +1908,7 @@ mod tests {
             id: Uuid::now_v7(),
             vault_id: vault.id,
             source: "sauron".to_string(),
-            hint_kind: crate::models::ProviderOperationHintKind::PossibleProgress,
+            hint_kind: router_core::models::ProviderOperationHintKind::PossibleProgress,
             evidence: serde_json::json!({
                 "tx_hash": "abc123",
                 "sender_address": "sender-a",
@@ -1784,6 +1943,51 @@ mod tests {
     }
 
     #[test]
+    fn funding_observation_from_balance_reconciliation_records_chain_truth_without_tx_hash() {
+        let now = Utc::now();
+        let vault = DepositVault {
+            id: Uuid::now_v7(),
+            order_id: Some(Uuid::now_v7()),
+            deposit_asset: DepositAsset {
+                chain: ChainId::parse("evm:8453").unwrap(),
+                asset: AssetId::parse("native").unwrap(),
+            },
+            action: VaultAction::Null,
+            metadata: serde_json::json!({}),
+            deposit_vault_salt: [7; 32],
+            deposit_vault_address: "0x1111111111111111111111111111111111111111".to_string(),
+            recovery_address: "0x2222222222222222222222222222222222222222".to_string(),
+            cancellation_commitment:
+                "0x1111111111111111111111111111111111111111111111111111111111111111".to_string(),
+            cancel_after: now + Duration::minutes(10),
+            status: DepositVaultStatus::PendingFunding,
+            refund_requested_at: None,
+            refunded_at: None,
+            refund_tx_hash: None,
+            last_refund_error: None,
+            funding_observation: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let observation =
+            funding_observation_from_balance_reconciliation(&vault, U256::from(42_u64), now);
+
+        assert!(observation.tx_hash.is_none());
+        assert_eq!(observation.sender_addresses, Vec::<String>::new());
+        assert_eq!(
+            observation.recipient_address.as_deref(),
+            Some("0x1111111111111111111111111111111111111111")
+        );
+        assert_eq!(observation.observed_amount.as_deref(), Some("42"));
+        assert_eq!(observation.confirmation_state.as_deref(), Some("confirmed"));
+        assert_eq!(
+            observation.evidence["source"],
+            serde_json::json!("router_balance_reconciliation")
+        );
+    }
+
+    #[test]
     fn funding_observation_from_hint_rejects_malformed_sender_addresses() {
         let now = Utc::now();
         let vault = DepositVault {
@@ -1814,7 +2018,7 @@ mod tests {
             id: Uuid::now_v7(),
             vault_id: vault.id,
             source: "sauron".to_string(),
-            hint_kind: crate::models::ProviderOperationHintKind::PossibleProgress,
+            hint_kind: router_core::models::ProviderOperationHintKind::PossibleProgress,
             evidence: serde_json::json!({
                 "sender_addresses": ["sender-a", 7],
             }),
@@ -1886,7 +2090,7 @@ mod tests {
             id: Uuid::now_v7(),
             vault_id: vault.id,
             source: "sauron".to_string(),
-            hint_kind: crate::models::ProviderOperationHintKind::PossibleProgress,
+            hint_kind: router_core::models::ProviderOperationHintKind::PossibleProgress,
             evidence: serde_json::json!({
                 "observed_at": "definitely not a timestamp",
             }),
@@ -1933,7 +2137,7 @@ mod tests {
             id: Uuid::now_v7(),
             vault_id: vault.id,
             source: "sauron".to_string(),
-            hint_kind: crate::models::ProviderOperationHintKind::PossibleProgress,
+            hint_kind: router_core::models::ProviderOperationHintKind::PossibleProgress,
             evidence: serde_json::json!({
                 "amount": "not-a-number",
             }),

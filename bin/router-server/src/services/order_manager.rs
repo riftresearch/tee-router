@@ -2,9 +2,22 @@ use crate::{
     api::{
         CreateOrderRequest, LimitOrderQuoteRequest, MarketOrderQuoteKind, MarketOrderQuoteRequest,
     },
+    error::RouterServerError,
+    services::{
+        deposit_address::{derive_deposit_address_for_quote, DepositAddressError},
+        provider_health::ProviderHealthService,
+        provider_policy::ProviderPolicyService,
+        route_minimums::{RouteMinimumError, RouteMinimumService},
+    },
+    telemetry,
+};
+use alloy::primitives::U256;
+use chains::ChainRegistry;
+use chrono::{Duration as ChronoDuration, Utc};
+use router_core::{
     config::Settings,
     db::Database,
-    error::RouterServerError,
+    error::RouterCoreError,
     models::{
         LimitOrderAction, LimitOrderQuote, LimitOrderResidualPolicy, MarketOrderAction,
         MarketOrderKind, MarketOrderKindType, MarketOrderQuote, OrderExecutionStepType,
@@ -21,26 +34,18 @@ use crate::{
             AssetRegistry, CanonicalAsset, MarketOrderNode, MarketOrderTransitionKind, ProviderId,
             TransitionDecl, TransitionPath,
         },
-        deposit_address::{derive_deposit_address_for_quote, DepositAddressError},
         gas_reimbursement::{
             optimized_paymaster_reimbursement_plan,
             optimized_paymaster_reimbursement_plan_with_pricing, try_transition_retention_amount,
             GasReimbursementError, GasReimbursementPlan,
         },
-        provider_health::ProviderHealthService,
-        provider_policy::ProviderPolicyService,
         quote_legs::{
             execution_step_type_for_transition_kind, QuoteLeg, QuoteLegAsset, QuoteLegSpec,
         },
         route_costs::{rank_transition_paths_structurally, RouteCostService},
-        route_minimums::{RouteMinimumError, RouteMinimumService},
         usd_valuation::{empty_usd_valuation, limit_quote_usd_valuation, quote_usd_valuation},
     },
-    telemetry,
 };
-use alloy::primitives::U256;
-use chains::ChainRegistry;
-use chrono::{Duration as ChronoDuration, Utc};
 use router_primitives::ChainType;
 use serde_json::{json, Value};
 use snafu::Snafu;
@@ -57,11 +62,14 @@ const MARKET_ORDER_ACTION_TIMEOUT: ChronoDuration = ChronoDuration::minutes(10);
 // semantics.
 const LIMIT_ORDER_ACTION_TIMEOUT: ChronoDuration = ChronoDuration::days(3650);
 const MARKET_ORDER_PROVIDER_TIMEOUT: Duration = Duration::from_secs(10);
+// HyperCore charges one quote token when the destination HyperCore account is
+// not yet activated. Unit withdrawal protocol addresses are often fresh, so
+// quote paths that end with Hyperliquid -> Unit need to leave 1 USDC available.
 const HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW: u64 = 1_000_000;
-const BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_INPUTS: usize = 2;
+const HYPERLIQUID_CORE_ACTIVATION_FEE_RAW: u64 = HYPERLIQUID_SPOT_SEND_QUOTE_GAS_RESERVE_RAW;
+const BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_INPUTS: usize = 1;
 const BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_OUTPUTS: usize = 2;
 const BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_BPS: u64 = 12_500;
-const BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_FALLBACK_SATS: u64 = 25_000;
 const PROBE_MAX_AMOUNT_IN: &str = "340282366920938463463374607431768211455";
 const MAX_U256_DECIMAL_DIGITS: usize = 78;
 
@@ -146,9 +154,9 @@ impl MarketOrderError {
         }
     }
 
-    fn database(source: RouterServerError) -> Self {
+    fn database(source: impl Into<RouterServerError>) -> Self {
         Self::Database {
-            source: Box::new(source),
+            source: Box::new(source.into()),
         }
     }
 }
@@ -388,7 +396,9 @@ impl OrderManager {
         })
     }
 
-    async fn usd_pricing_snapshot(&self) -> Option<crate::services::PricingSnapshot> {
+    async fn usd_pricing_snapshot(
+        &self,
+    ) -> Option<router_core::services::pricing::PricingSnapshot> {
         self.route_costs
             .as_ref()?
             .current_or_refresh_live_pricing_snapshot()
@@ -483,8 +493,7 @@ impl OrderManager {
         }
         let now = Utc::now();
         let order_id = Uuid::now_v7();
-        let workflow_trace = observability::current_workflow_trace_context()
-            .unwrap_or_else(|| fallback_workflow_trace_context(order_id));
+        let (workflow_trace_id, workflow_parent_span_id) = fallback_workflow_trace_ids(order_id);
         let refund_address = self.validate_and_normalize_refund_address(
             &quote.source_asset.chain,
             &request.refund_address,
@@ -499,13 +508,13 @@ impl OrderManager {
             recipient_address: quote.recipient_address.clone(),
             refund_address,
             action: RouterOrderAction::MarketOrder(MarketOrderAction {
-                order_kind: market_order_kind_from_quote(&quote)?,
+                order_kind: market_order_kind_from_quote(&quote),
                 slippage_bps: quote.slippage_bps,
             }),
-            action_timeout_at: (now + MARKET_ORDER_ACTION_TIMEOUT).min(quote.expires_at),
+            action_timeout_at: now + MARKET_ORDER_ACTION_TIMEOUT,
             idempotency_key: normalize_idempotency_key(request.idempotency_key.clone())?,
-            workflow_trace_id: workflow_trace.trace_id,
-            workflow_parent_span_id: workflow_trace.parent_span_id,
+            workflow_trace_id,
+            workflow_parent_span_id,
             created_at: now,
             updated_at: now,
         };
@@ -517,7 +526,7 @@ impl OrderManager {
             .await;
         let quote = match result {
             Ok(quote) => quote,
-            Err(RouterServerError::Conflict { .. }) => {
+            Err(RouterCoreError::Conflict { .. }) => {
                 return self
                     .resume_market_order_after_create_conflict(request, quote.id)
                     .await;
@@ -539,8 +548,7 @@ impl OrderManager {
         }
         let now = Utc::now();
         let order_id = Uuid::now_v7();
-        let workflow_trace = observability::current_workflow_trace_context()
-            .unwrap_or_else(|| fallback_workflow_trace_context(order_id));
+        let (workflow_trace_id, workflow_parent_span_id) = fallback_workflow_trace_ids(order_id);
         let refund_address = self.validate_and_normalize_refund_address(
             &quote.source_asset.chain,
             &request.refund_address,
@@ -561,8 +569,8 @@ impl OrderManager {
             }),
             action_timeout_at: now + LIMIT_ORDER_ACTION_TIMEOUT,
             idempotency_key: normalize_idempotency_key(request.idempotency_key.clone())?,
-            workflow_trace_id: workflow_trace.trace_id,
-            workflow_parent_span_id: workflow_trace.parent_span_id,
+            workflow_trace_id,
+            workflow_parent_span_id,
             created_at: now,
             updated_at: now,
         };
@@ -574,7 +582,7 @@ impl OrderManager {
             .await;
         let quote = match result {
             Ok(quote) => quote,
-            Err(RouterServerError::Conflict { .. }) => {
+            Err(RouterCoreError::Conflict { .. }) => {
                 return self
                     .resume_limit_order_after_create_conflict(request, quote.id)
                     .await;
@@ -1047,12 +1055,12 @@ impl OrderManager {
                 recipient_address: request.recipient_address.clone(),
                 order_kind: MarketOrderQuoteKind::ExactOut {
                     amount_out: request.output_amount.clone(),
-                    slippage_bps: 0,
+                    slippage_bps: Some(0),
                 },
             };
             let suffix_order_kind = MarketOrderKind::ExactOut {
                 amount_out: request.output_amount.clone(),
-                max_amount_in: U256::MAX.to_string(),
+                max_amount_in: Some(U256::MAX.to_string()),
             };
             let quote = self
                 .compose_transition_path_quote(ComposeTransitionPathQuoteRequest {
@@ -1104,12 +1112,12 @@ impl OrderManager {
                     .quote_address_for_chain(quote_id, &limit_transition.input.asset.chain)?,
                 order_kind: MarketOrderQuoteKind::ExactOut {
                     amount_out: required_limit_input_amount.clone(),
-                    slippage_bps: 0,
+                    slippage_bps: Some(0),
                 },
             };
             let prefix_order_kind = MarketOrderKind::ExactOut {
                 amount_out: required_limit_input_amount,
-                max_amount_in: U256::MAX.to_string(),
+                max_amount_in: Some(U256::MAX.to_string()),
             };
             let quote = self
                 .compose_transition_path_quote(ComposeTransitionPathQuoteRequest {
@@ -1461,7 +1469,7 @@ impl OrderManager {
                                     destination_asset: transition.output.asset.clone(),
                                     order_kind: MarketOrderKind::ExactIn {
                                         amount_in: provider_amount_in.clone(),
-                                        min_amount_out: "1".to_string(),
+                                        min_amount_out: Some("1".to_string()),
                                     },
                                     recipient_address: self.bridge_quote_recipient_address(
                                         request, quote_id, path, index, transition,
@@ -1637,9 +1645,7 @@ impl OrderManager {
                                 amount_in: &provider_amount_in,
                                 amount_out: &provider_amount_in,
                                 expires_at,
-                                raw: json!({
-                                    "recipient_address": recipient_address,
-                                }),
+                                raw: unit_withdrawal_quote_raw(&recipient_address),
                             }));
                             cursor_amount = provider_amount_in;
                         }
@@ -1656,7 +1662,7 @@ impl OrderManager {
                     provider_id,
                     amount_in: amount_in.clone(),
                     amount_out: cursor_amount,
-                    min_amount_out: Some(min_amount_out.clone()),
+                    min_amount_out: min_amount_out.clone(),
                     max_amount_in: None,
                     provider_quote: transition_path_quote_blob(
                         path,
@@ -1690,9 +1696,7 @@ impl OrderManager {
                                 amount_in: &required_output,
                                 amount_out: &required_output,
                                 expires_at,
-                                raw: json!({
-                                    "recipient_address": recipient_address,
-                                }),
+                                raw: unit_withdrawal_quote_raw(&recipient_address),
                             }));
                         }
                         MarketOrderTransitionKind::HyperliquidTrade => {
@@ -1707,7 +1711,7 @@ impl OrderManager {
                             let max_in_cap = if index == 0 {
                                 max_amount_in.clone()
                             } else {
-                                practical_max_input_for_asset(&transition.input.asset)
+                                Some(practical_max_input_for_asset(&transition.input.asset))
                             };
                             let exchange_quote = quote_exchange(
                                 exchange.as_ref(),
@@ -1759,7 +1763,7 @@ impl OrderManager {
                             let max_in_cap = if index == 0 {
                                 max_amount_in.clone()
                             } else {
-                                practical_max_input_for_asset(&transition.input.asset)
+                                Some(practical_max_input_for_asset(&transition.input.asset))
                             };
                             let input_decimals = self
                                 .exchange_asset_decimals(&transition.input.asset)
@@ -1825,7 +1829,7 @@ impl OrderManager {
                             let max_input = if index == 0 {
                                 max_amount_in.clone()
                             } else {
-                                practical_max_input_for_asset(&transition.input.asset)
+                                Some(practical_max_input_for_asset(&transition.input.asset))
                             };
                             let bridge_quote = quote_bridge(
                                 bridge.as_ref(),
@@ -1906,7 +1910,7 @@ impl OrderManager {
                     amount_in: required_output,
                     amount_out: amount_out.clone(),
                     min_amount_out: None,
-                    max_amount_in: Some(max_amount_in.clone()),
+                    max_amount_in: max_amount_in.clone(),
                     provider_quote: transition_path_quote_blob(
                         path,
                         &legs,
@@ -2257,21 +2261,14 @@ impl OrderManager {
                         reason: "provider exact-in quote changed amount_in".to_string(),
                     });
                 }
-                let quoted_amount_out = parse_amount("amount_out", &quote.amount_out)?;
-                let requested_min_out = parse_amount(
-                    "min_amount_out",
-                    quote
-                        .min_amount_out
-                        .as_deref()
-                        .ok_or(MarketOrderError::InvalidAmount {
-                            field: "min_amount_out",
-                            reason: "exact-in quote is missing min_amount_out".to_string(),
-                        })?,
-                )?;
-                if quoted_amount_out < requested_min_out {
-                    return Err(MarketOrderError::NoRoute {
-                        reason: "provider exact-in quote is below min_amount_out".to_string(),
-                    });
+                if let Some(min_amount_out) = quote.min_amount_out.as_deref() {
+                    let quoted_amount_out = parse_amount("amount_out", &quote.amount_out)?;
+                    let requested_min_out = parse_amount("min_amount_out", min_amount_out)?;
+                    if quoted_amount_out < requested_min_out {
+                        return Err(MarketOrderError::NoRoute {
+                            reason: "provider exact-in quote is below min_amount_out".to_string(),
+                        });
+                    }
                 }
             }
             MarketOrderQuoteKind::ExactOut { amount_out, .. } => {
@@ -2280,21 +2277,14 @@ impl OrderManager {
                         reason: "provider exact-out quote changed amount_out".to_string(),
                     });
                 }
-                let quoted_amount_in = parse_amount("amount_in", &quote.amount_in)?;
-                let requested_max_in = parse_amount(
-                    "max_amount_in",
-                    quote
-                        .max_amount_in
-                        .as_deref()
-                        .ok_or(MarketOrderError::InvalidAmount {
-                            field: "max_amount_in",
-                            reason: "exact-out quote is missing max_amount_in".to_string(),
-                        })?,
-                )?;
-                if quoted_amount_in > requested_max_in {
-                    return Err(MarketOrderError::NoRoute {
-                        reason: "provider exact-out quote is above max_amount_in".to_string(),
-                    });
+                if let Some(max_amount_in) = quote.max_amount_in.as_deref() {
+                    let quoted_amount_in = parse_amount("amount_in", &quote.amount_in)?;
+                    let requested_max_in = parse_amount("max_amount_in", max_amount_in)?;
+                    if quoted_amount_in > requested_max_in {
+                        return Err(MarketOrderError::NoRoute {
+                            reason: "provider exact-out quote is above max_amount_in".to_string(),
+                        });
+                    }
                 }
             }
         }
@@ -2319,25 +2309,16 @@ impl OrderManager {
             .ok_or_else(|| MarketOrderError::NoRoute {
                 reason: "bitcoin chain is required to estimate Unit deposit miner fee".to_string(),
             })?;
-        let estimated_fee = match bitcoin_chain
+        let estimated_fee = bitcoin_chain
             .estimate_p2wpkh_transfer_fee_sats(
                 BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_INPUTS,
                 BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_OUTPUTS,
             )
             .await
-        {
-            Ok(estimated_fee) => estimated_fee,
-            Err(err) => {
-                warn!(
-                    error = %err,
-                    fallback_sats = BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_FALLBACK_SATS,
-                    "falling back to static bitcoin Unit deposit miner fee reserve"
-                );
-                BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_FALLBACK_SATS
-            }
-        };
-        let reserved_fee = apply_bps_u64(estimated_fee, BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_BPS)?
-            .max(BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_FALLBACK_SATS);
+            .map_err(|err| MarketOrderError::NoRoute {
+                reason: format!("failed to estimate bitcoin Unit deposit miner fee: {err}"),
+            })?;
+        let reserved_fee = apply_bps_u64(estimated_fee, BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_BPS)?;
         Ok(Some(U256::from(reserved_fee)))
     }
 }
@@ -2972,12 +2953,12 @@ fn practical_max_input_for_asset(_asset: &DepositAsset) -> String {
 fn transition_min_amount_out(
     path: &TransitionPath,
     index: usize,
-    final_min_amount_out: &str,
-) -> String {
+    final_min_amount_out: &Option<String>,
+) -> Option<String> {
     if index + 1 == path.transitions.len() {
-        final_min_amount_out.to_string()
+        final_min_amount_out.clone()
     } else {
-        "1".to_string()
+        Some("1".to_string())
     }
 }
 
@@ -3048,6 +3029,23 @@ fn add_hyperliquid_spot_send_quote_gas_reserve(
         .map(|amount| amount.to_string())
 }
 
+fn unit_withdrawal_quote_raw(recipient_address: &str) -> Value {
+    json!({
+        "recipient_address": recipient_address,
+        "hyperliquid_core_activation_fee": hyperliquid_core_activation_fee_quote_json(),
+    })
+}
+
+fn hyperliquid_core_activation_fee_quote_json() -> Value {
+    json!({
+        "kind": "first_transfer_to_new_hypercore_destination",
+        "quote_asset": "USDC",
+        "amount_raw": HYPERLIQUID_CORE_ACTIVATION_FEE_RAW.to_string(),
+        "amount_decimal": "1",
+        "source": "hyperliquid_activation_gas_fee",
+    })
+}
+
 fn choose_better_quote(
     request: &NormalizedMarketOrderQuoteRequest,
     candidate: ComposedMarketOrderQuote,
@@ -3087,7 +3085,7 @@ impl MarketOrderQuoteKind {
     }
 
     #[must_use]
-    fn slippage_bps(&self) -> u64 {
+    fn slippage_bps(&self) -> Option<u64> {
         match self {
             Self::ExactIn { slippage_bps, .. } | Self::ExactOut { slippage_bps, .. } => {
                 *slippage_bps
@@ -3099,11 +3097,11 @@ impl MarketOrderQuoteKind {
         match self {
             Self::ExactIn { amount_in, .. } => MarketOrderKind::ExactIn {
                 amount_in: amount_in.clone(),
-                min_amount_out: "1".to_string(),
+                min_amount_out: Some("1".to_string()),
             },
             Self::ExactOut { amount_out, .. } => MarketOrderKind::ExactOut {
                 amount_out: amount_out.clone(),
-                max_amount_in: PROBE_MAX_AMOUNT_IN.to_string(),
+                max_amount_in: Some(PROBE_MAX_AMOUNT_IN.to_string()),
             },
         }
     }
@@ -3118,48 +3116,37 @@ impl MarketOrderQuoteKind {
                 slippage_bps,
             } => Ok(MarketOrderKind::ExactIn {
                 amount_in: amount_in.clone(),
-                min_amount_out: apply_slippage_floor(
-                    "amount_out",
-                    &probe_quote.amount_out,
-                    *slippage_bps,
-                )?,
+                min_amount_out: slippage_bps
+                    .map(|slippage_bps| {
+                        apply_slippage_floor("amount_out", &probe_quote.amount_out, slippage_bps)
+                    })
+                    .transpose()?,
             }),
             Self::ExactOut {
                 amount_out,
                 slippage_bps,
             } => Ok(MarketOrderKind::ExactOut {
                 amount_out: amount_out.clone(),
-                max_amount_in: apply_slippage_ceiling(
-                    "amount_in",
-                    &probe_quote.amount_in,
-                    *slippage_bps,
-                )?,
+                max_amount_in: slippage_bps
+                    .map(|slippage_bps| {
+                        apply_slippage_ceiling("amount_in", &probe_quote.amount_in, slippage_bps)
+                    })
+                    .transpose()?,
             }),
         }
     }
 }
 
-fn market_order_kind_from_quote(quote: &MarketOrderQuote) -> MarketOrderResult<MarketOrderKind> {
+fn market_order_kind_from_quote(quote: &MarketOrderQuote) -> MarketOrderKind {
     match quote.order_kind {
-        MarketOrderKindType::ExactIn => Ok(MarketOrderKind::ExactIn {
+        MarketOrderKindType::ExactIn => MarketOrderKind::ExactIn {
             amount_in: quote.amount_in.clone(),
-            min_amount_out: quote.min_amount_out.clone().ok_or(
-                MarketOrderError::InvalidAmount {
-                    field: "min_amount_out",
-                    reason: "quote is missing min_amount_out".to_string(),
-                },
-            )?,
-        }),
-        MarketOrderKindType::ExactOut => Ok(MarketOrderKind::ExactOut {
+            min_amount_out: quote.min_amount_out.clone(),
+        },
+        MarketOrderKindType::ExactOut => MarketOrderKind::ExactOut {
             amount_out: quote.amount_out.clone(),
-            max_amount_in: quote
-                .max_amount_in
-                .clone()
-                .ok_or(MarketOrderError::InvalidAmount {
-                    field: "max_amount_in",
-                    reason: "quote is missing max_amount_in".to_string(),
-                })?,
-        }),
+            max_amount_in: quote.max_amount_in.clone(),
+        },
     }
 }
 
@@ -3170,14 +3157,18 @@ fn validate_market_order_quote_kind(order_kind: &MarketOrderQuoteKind) -> Market
             slippage_bps,
         } => {
             validate_positive_amount("amount_in", amount_in)?;
-            validate_slippage_bps(*slippage_bps)?;
+            if let Some(slippage_bps) = slippage_bps {
+                validate_slippage_bps(*slippage_bps)?;
+            }
         }
         MarketOrderQuoteKind::ExactOut {
             amount_out,
             slippage_bps,
         } => {
             validate_positive_amount("amount_out", amount_out)?;
-            validate_slippage_bps(*slippage_bps)?;
+            if let Some(slippage_bps) = slippage_bps {
+                validate_slippage_bps(*slippage_bps)?;
+            }
         }
     }
 
@@ -3331,17 +3322,14 @@ fn is_protocol_token(value: &str) -> bool {
     })
 }
 
-fn fallback_workflow_trace_context(order_id: Uuid) -> observability::WorkflowTraceContext {
+fn fallback_workflow_trace_ids(order_id: Uuid) -> (String, String) {
     let trace_id = order_id.simple().to_string();
     let mut parent_span_id = trace_id[16..32].to_string();
     if parent_span_id == "0000000000000000" {
         parent_span_id = "0000000000000001".to_string();
     }
 
-    observability::WorkflowTraceContext {
-        trace_id,
-        parent_span_id,
-    }
+    (trace_id, parent_span_id)
 }
 
 fn is_better_quote(
@@ -3396,7 +3384,7 @@ mod tests {
     fn exact_out_probe_uses_provider_parseable_max_input() {
         let probe = MarketOrderQuoteKind::ExactOut {
             amount_out: "1000".to_string(),
-            slippage_bps: 100,
+            slippage_bps: Some(100),
         }
         .probe_order_kind();
 
@@ -3404,6 +3392,7 @@ mod tests {
             panic!("exact-out quote request must produce exact-out probe");
         };
 
+        let max_amount_in = max_amount_in.expect("exact-out probe must have max input");
         assert_eq!(max_amount_in, PROBE_MAX_AMOUNT_IN);
         assert!(max_amount_in.parse::<u128>().is_ok());
         assert_ne!(max_amount_in, U256::MAX.to_string());
@@ -3442,25 +3431,68 @@ mod tests {
     }
 
     #[test]
+    fn bounded_order_kind_keeps_slippage_bounds_optional() {
+        let probe_quote = ComposedMarketOrderQuote {
+            provider_id: "test-provider".to_string(),
+            amount_in: "1000".to_string(),
+            amount_out: "2000".to_string(),
+            min_amount_out: None,
+            max_amount_in: None,
+            provider_quote: json!({}),
+            expires_at: Utc::now(),
+        };
+
+        let exact_in = MarketOrderQuoteKind::ExactIn {
+            amount_in: "1000".to_string(),
+            slippage_bps: None,
+        }
+        .bounded_order_kind(&probe_quote)
+        .unwrap();
+        assert!(matches!(
+            exact_in,
+            MarketOrderKind::ExactIn {
+                min_amount_out: None,
+                ..
+            }
+        ));
+
+        let exact_out = MarketOrderQuoteKind::ExactOut {
+            amount_out: "2000".to_string(),
+            slippage_bps: None,
+        }
+        .bounded_order_kind(&probe_quote)
+        .unwrap();
+        assert!(matches!(
+            exact_out,
+            MarketOrderKind::ExactOut {
+                max_amount_in: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn reserve_additions_reject_overflow_instead_of_saturating() {
         let plan = GasReimbursementPlan {
             schema_version: 1,
             policy: "test".to_string(),
             quote_safety_multiplier_bps: 10_000,
             debts: vec![],
-            retention_actions: vec![crate::services::gas_reimbursement::GasRetentionAction {
-                id: "retention-1".to_string(),
-                transition_decl_id: "transition-1".to_string(),
-                settlement_chain_id: "evm:1".to_string(),
-                settlement_asset_id: "native".to_string(),
-                settlement_decimals: 18,
-                settlement_provider_asset: None,
-                amount: "1".to_string(),
-                estimated_usd_micro: "1".to_string(),
-                recipient_role: "paymaster_wallet".to_string(),
-                timing: "before_provider_action".to_string(),
-                debt_ids: vec![],
-            }],
+            retention_actions: vec![
+                router_core::services::gas_reimbursement::GasRetentionAction {
+                    id: "retention-1".to_string(),
+                    transition_decl_id: "transition-1".to_string(),
+                    settlement_chain_id: "evm:1".to_string(),
+                    settlement_asset_id: "native".to_string(),
+                    settlement_decimals: 18,
+                    settlement_provider_asset: None,
+                    amount: "1".to_string(),
+                    estimated_usd_micro: "1".to_string(),
+                    recipient_role: "paymaster_wallet".to_string(),
+                    timing: "before_provider_action".to_string(),
+                    debt_ids: vec![],
+                },
+            ],
         };
 
         assert!(add_bitcoin_fee_reserve(&U256::MAX.to_string(), U256::from(1_u64)).is_err());

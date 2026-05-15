@@ -7,6 +7,8 @@ repository.workspace = true
 
 [dependencies]
 alloy = {workspace = true}
+metrics = { workspace = true }
+observability = { workspace = true }
 tracing = { workspace = true }
 snafu = { workspace = true }
 reqwest = { workspace = true }

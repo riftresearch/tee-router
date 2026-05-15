@@ -50,7 +50,7 @@ const RECEIPT_POLL_ATTEMPTS: usize = 90;
 const RECEIPT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const HYPERLIQUID_MIN_ORDER_NOTIONAL_USDC: f64 = 10.1;
 const HYPERLIQUID_BRIDGE_WITHDRAW_FEE_USDC: f64 = 1.0;
-const DEFAULT_HYPERLIQUID_CLASS_TRANSFER_USDC: f64 = 25.0;
+const DEFAULT_HYPERLIQUID_CLASS_TRANSFER_USDC: f64 = 10.5;
 const DEFAULT_HYPERLIQUID_MARKET_BUY_USDC: f64 = 10.5;
 const DEFAULT_HYPERLIQUID_WITHDRAW_USDC: f64 = 5.0;
 
@@ -237,15 +237,17 @@ async fn live_hyperliquid_bridge_deposit_transcript_spends_funds() -> TestResult
         .unwrap_or(DEFAULT_ARBITRUM_USDC);
     let amount = U256::from_str_radix(&required_env(HYPERLIQUID_BRIDGE_DEPOSIT_AMOUNT)?, 10)?;
 
-    let before_balances = client.clearinghouse_state(user).await?;
-    let before_withdrawable = parse_decimal_balance(&before_balances.withdrawable);
+    let before_clearinghouse = client.clearinghouse_state(user).await?;
+    let before_spot = client.spot_clearinghouse_state(user).await?;
+    let before_spot_usdc = parse_balance(&before_spot, DEFAULT_USDC_TOKEN);
     let deposit = client.build_usdc_bridge_deposit(usdc, amount)?;
     let pending = provider.send_transaction(deposit.tx).await?;
     let tx_hash = *pending.tx_hash();
     wait_for_successful_receipt(&provider, tx_hash, "Hyperliquid bridge deposit").await?;
 
-    let expected_after = before_withdrawable + raw_usdc_to_natural(amount)?;
-    let after_balances = poll_withdrawable_balance(&client, user, expected_after).await?;
+    let expected_after = before_spot_usdc + raw_usdc_to_natural(amount)?;
+    let after_spot = poll_spot_balance(&client, user, DEFAULT_USDC_TOKEN, expected_after).await?;
+    let after_clearinghouse = client.clearinghouse_state(user).await?;
 
     emit_transcript(
         "hyperliquid.bridge_deposit",
@@ -255,8 +257,10 @@ async fn live_hyperliquid_bridge_deposit_transcript_spends_funds() -> TestResult
             "usdc_token": format!("{:#x}", usdc),
             "amount_raw": amount.to_string(),
             "tx_hash": format!("{tx_hash:#x}"),
-            "before_clearinghouse": before_balances,
-            "after_clearinghouse": after_balances,
+            "before_spot": before_spot,
+            "before_clearinghouse": before_clearinghouse,
+            "after_spot": after_spot,
+            "after_clearinghouse": after_clearinghouse,
         }),
     );
 

@@ -23,7 +23,8 @@ use eip3009_erc20_contract::GenericEIP3009ERC20::GenericEIP3009ERC20Instance;
 use hyperliquid_client::{
     client::Network, CancelRequest, ClearinghouseState, HyperliquidClient,
     HyperliquidExchangeClient, HyperliquidInfoClient, Limit, Order, OrderRequest,
-    SpotClearinghouseState, MINIMUM_BRIDGE_DEPOSIT_USDC,
+    SpotClearinghouseState, UserFill, UserFunding, UserNonFundingLedgerDelta,
+    UserNonFundingLedgerUpdate, MINIMUM_BRIDGE_DEPOSIT_USDC,
 };
 use std::time::Duration;
 use url::Url;
@@ -74,7 +75,11 @@ async fn bridge_fixture_with_config(
     GenericEIP3009ERC20Instance<DynProvider>,
     Address,
 ) {
-    let anvil = Anvil::new().block_time(1).try_spawn().expect("anvil spawn");
+    let anvil = Anvil::new()
+        .prague()
+        .block_time(1)
+        .try_spawn()
+        .expect("anvil spawn");
     let rpc_url: Url = anvil.endpoint_url();
     let private_key: [u8; 32] = anvil.keys()[0].clone().to_bytes().into();
     let signer = format!("0x{}", hex::encode(private_key))
@@ -106,7 +111,8 @@ async fn bridge_fixture_with_config(
     let config = MockIntegratorConfig::default()
         .with_hyperliquid_bridge_address(format!("{bridge_address:#x}"))
         .with_hyperliquid_evm_rpc_url(rpc_url.to_string())
-        .with_hyperliquid_usdc_token_address(format!("{:#x}", token.address()));
+        .with_hyperliquid_usdc_token_address(format!("{:#x}", token.address()))
+        .with_mock_service_evm_chain(anvil.chain_id(), rpc_url.to_string());
     let server = MockIntegratorServer::spawn_with_config(configure(config))
         .await
         .expect("spawn mock integrator");
@@ -132,6 +138,25 @@ fn parse_withdrawable(state: &ClearinghouseState) -> f64 {
         .withdrawable
         .parse::<f64>()
         .expect("withdrawable parses as f64")
+}
+
+fn sample_indexer_fill(time: u64) -> UserFill {
+    UserFill {
+        coin: "UBTC/USDC".to_string(),
+        px: "60000".to_string(),
+        sz: "0.001".to_string(),
+        side: "B".to_string(),
+        time,
+        start_position: "0".to_string(),
+        dir: "Buy".to_string(),
+        closed_pnl: "0".to_string(),
+        hash: format!("0x{}", "ab".repeat(32)),
+        oid: 9001,
+        crossed: true,
+        fee: "0.00001".to_string(),
+        tid: 7001,
+        fee_token: "UBTC".to_string(),
+    }
 }
 
 #[tokio::test]
@@ -178,6 +203,80 @@ async fn split_info_and_exchange_clients_work_against_mock() {
     let status = info.order_status(user, oid).await.expect("order status");
     assert_eq!(status.status, "order");
     assert_eq!(status.order.expect("filled envelope").status, "filled");
+}
+
+#[tokio::test]
+async fn info_client_decodes_indexer_info_endpoints_against_mock() {
+    let server = MockIntegratorServer::spawn()
+        .await
+        .expect("spawn mock integrator");
+    let wallet = PrivateKeySigner::random();
+    let user = wallet.address();
+    server
+        .record_hyperliquid_fill(user, sample_indexer_fill(1_700_000_000_000))
+        .await;
+    server
+        .record_hyperliquid_ledger_update(
+            user,
+            UserNonFundingLedgerUpdate {
+                time: 1_700_000_000_100,
+                hash: format!("0x{}", "cd".repeat(32)),
+                delta: UserNonFundingLedgerDelta::SpotTransfer {
+                    token: "UBTC:0x11111111111111111111111111111111".to_string(),
+                    amount: "0.001".to_string(),
+                    usdc_value: "60".to_string(),
+                    user: format!("{user:#x}"),
+                    destination: "0x2222222222222222222222222222222222222222".to_string(),
+                    fee: "0".to_string(),
+                    native_token_fee: "0.00001".to_string(),
+                    nonce: 11,
+                },
+            },
+        )
+        .await;
+    server
+        .record_hyperliquid_funding(
+            user,
+            UserFunding {
+                time: 1_700_000_000_200,
+                coin: "ETH".to_string(),
+                usdc: "-0.0123".to_string(),
+                szi: "1.25".to_string(),
+                funding_rate: "0.0000125".to_string(),
+            },
+        )
+        .await;
+
+    let info = HyperliquidInfoClient::new(server.base_url()).expect("info client");
+    let meta = info.fetch_perp_meta().await.expect("perp meta");
+    assert!(meta.universe.iter().any(|asset| asset.name == "BTC"));
+
+    let fills = info
+        .user_fills_by_time(user, 1_699_999_999_999, None, false)
+        .await
+        .expect("fills by time");
+    assert_eq!(fills.len(), 1);
+    assert_eq!(fills[0].tid, 7001);
+
+    let ledger = info
+        .user_non_funding_ledger_updates(user, 1_700_000_000_000, None)
+        .await
+        .expect("ledger updates");
+    assert_eq!(ledger.len(), 1);
+    assert!(matches!(
+        ledger[0].delta,
+        UserNonFundingLedgerDelta::SpotTransfer { .. }
+    ));
+
+    let funding = info
+        .user_funding(user, 1_700_000_000_000, None)
+        .await
+        .expect("funding");
+    assert_eq!(funding.len(), 1);
+    assert_eq!(funding[0].funding_rate, "0.0000125");
+
+    let rate_limit = info.user_rate_limit(user).await.expect("rate limit");
+    assert_eq!(rate_limit.n_requests_cap, 1200);
 }
 
 async fn wait_for_hyperliquid_clearinghouse_balance(
@@ -648,6 +747,7 @@ async fn native_bridge_deposit_credit_can_be_delayed_by_mock() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn native_bridge_deposit_credit_can_fail_deterministically() {
     let amount_raw = U256::from(6_000_000u64);
     let (_anvil, server, client, user, token, bridge_address) =
@@ -704,6 +804,7 @@ async fn usd_class_transfer_moves_withdrawable_usdc_into_spot() {
 }
 
 #[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
 async fn withdraw3_deducts_gross_amount_and_releases_net_usdc() {
     let minted_raw = U256::from(12_000_000u64);
     let deposit_raw = U256::from(6_000_000u64);

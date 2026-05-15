@@ -87,7 +87,7 @@ type RouterCdcMessage = {
   id: string
   orderId: string
   orderUpdatedAt?: string | null
-  eventUpdatedAt: string
+  eventUpdatedAt?: string | null
   watchId?: string | null
   providerOperationId?: string | null
 }
@@ -812,6 +812,8 @@ function parseRouterCdcMessage(
   const payload = new TextDecoder().decode(message.content)
   const parsed = parseJson(payload)
   if (!isRecord(parsed)) return malformedRouterCdcMessage('message content is not JSON object')
+  const hasOrderUpdatedAt = Object.hasOwn(parsed, 'orderUpdatedAt')
+  const hasEventUpdatedAt = Object.hasOwn(parsed, 'eventUpdatedAt')
   const version = parsed.version
   const schema = optionalBoundedString(parsed.schema)
   const table = optionalBoundedString(parsed.table)
@@ -822,6 +824,8 @@ function parseRouterCdcMessage(
   const eventUpdatedAt = optionalTimestampString(parsed.eventUpdatedAt)
   const watchId = optionalUuidString(parsed.watchId)
   const providerOperationId = optionalUuidString(parsed.providerOperationId)
+  const orderUpdatedAtInvalid = hasOrderUpdatedAt && orderUpdatedAt === undefined
+  const eventUpdatedAtInvalid = hasEventUpdatedAt && eventUpdatedAt === undefined
   if (
     version === 1 &&
     schema === 'public' &&
@@ -832,7 +836,7 @@ function parseRouterCdcMessage(
     id !== undefined &&
     id !== null &&
     orderId === null &&
-    eventUpdatedAt !== undefined &&
+    !eventUpdatedAtInvalid &&
     NULL_ORDER_ID_IGNORED_TABLES.has(table)
   ) {
     return { kind: 'ignore' }
@@ -848,10 +852,10 @@ function parseRouterCdcMessage(
     id === null ||
     orderId === undefined ||
     orderId === null ||
-    orderUpdatedAt === undefined ||
-    (table === 'router_orders' && orderUpdatedAt === null) ||
-    eventUpdatedAt === undefined ||
-    eventUpdatedAt === null ||
+    orderUpdatedAtInvalid ||
+    (table === 'router_orders' && hasOrderUpdatedAt && orderUpdatedAt === null) ||
+    eventUpdatedAtInvalid ||
+    (hasEventUpdatedAt && eventUpdatedAt === null) ||
     watchId === undefined ||
     providerOperationId === undefined
   ) {

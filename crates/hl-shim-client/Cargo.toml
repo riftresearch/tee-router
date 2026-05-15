@@ -1,0 +1,20 @@
+[package]
+name = "hl-shim-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+alloy = { workspace = true }
+async-trait = { workspace = true }
+futures-util = "0.3"
+hl-shim-indexer = { path = "../../hl-shim-indexer" }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+snafu = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-webpki-roots"] }
+url = { workspace = true }
+uuid = { workspace = true }

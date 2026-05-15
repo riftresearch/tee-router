@@ -9,11 +9,19 @@ publish = false
 [dependencies]
 devnet = { workspace = true }
 eip3009-erc20-contract = { workspace = true }
+bitcoin-indexer = { path = "../bitcoin-indexer" }
+bitcoin-receipt-watcher = { path = "../bitcoin-receipt-watcher" }
+evm-receipt-watcher = { path = "../evm-receipt-watcher" }
 hyperunit-client = { workspace = true }
+hl-shim-indexer = { workspace = true }
+router-core = { workspace = true }
+router-temporal = { workspace = true }
 router-server = { path = "../bin/router-server" }
 sauron = { path = "../bin/sauron" }
+temporal-worker = { path = "../bin/temporal-worker" }
 
 alloy = { workspace = true }
+axum = { workspace = true }
 bitcoin = { workspace = true }
 bitcoincore-rpc-async = { workspace = true }
 reqwest = { workspace = true }

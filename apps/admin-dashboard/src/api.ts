@@ -293,7 +293,7 @@ function isVolumeBucket(value: unknown): boolean {
 }
 
 function isVolumeBucketSize(value: unknown): value is VolumeBucketSize {
-  return value === 'minute' || value === 'hour' || value === 'day'
+  return value === 'five_minute' || value === 'hour' || value === 'day'
 }
 
 function isVolumeOrderType(value: unknown): value is VolumeOrderTypeFilter {
@@ -342,7 +342,21 @@ function isOrderProgress(value: unknown): boolean {
     isNonNegativeSafeInteger(value.failedStages) &&
     value.completedStages <= value.totalStages &&
     value.failedStages <= value.totalStages &&
-    (value.activeStage === undefined || typeof value.activeStage === 'string')
+    (value.activeStage === undefined || typeof value.activeStage === 'string') &&
+    (value.stages === undefined ||
+      (Array.isArray(value.stages) && value.stages.every(isOrderProgressStage)))
+  )
+}
+
+function isOrderProgressStage(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    typeof value.label === 'string' &&
+    typeof value.status === 'string' &&
+    (value.input === undefined || isAssetRef(value.input)) &&
+    (value.output === undefined || isAssetRef(value.output)) &&
+    (value.txHash === undefined || typeof value.txHash === 'string') &&
+    (value.txChainId === undefined || typeof value.txChainId === 'string')
   )
 }
 

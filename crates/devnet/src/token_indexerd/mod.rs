@@ -37,17 +37,29 @@ pub struct TokenIndexerInstance {
     stderr_task: Option<JoinHandle<()>>,
 }
 
+pub struct TokenIndexerConfig<'a> {
+    pub interactive: bool,
+    pub rpc_url: &'a str,
+    pub ws_url: &'a str,
+    pub pipe_output: bool,
+    pub chain_id: u64,
+    pub database_url: String,
+    pub api_key: String,
+    pub interactive_port: Option<u16>,
+}
+
 impl TokenIndexerInstance {
-    pub async fn new(
-        interactive: bool,
-        rpc_url: &str,
-        ws_url: &str,
-        pipe_output: bool,
-        chain_id: u64,
-        database_url: String,
-        api_key: String,
-        interactive_port: Option<u16>,
-    ) -> std::io::Result<Self> {
+    pub async fn new(config: TokenIndexerConfig<'_>) -> std::io::Result<Self> {
+        let TokenIndexerConfig {
+            interactive,
+            rpc_url,
+            ws_url,
+            pipe_output,
+            chain_id,
+            database_url,
+            api_key,
+            interactive_port,
+        } = config;
         let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("."));

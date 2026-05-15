@@ -123,7 +123,7 @@ test('REST fetchers reject invalid successful payload shapes', async () => {
   const originalFetch = globalThis.fetch
   globalThis.fetch = (async () =>
     Response.json({
-      bucketSize: 'minute',
+      bucketSize: 'five_minute',
       orderType: 'all',
       from: '2026-05-04T00:00:00.000Z',
       to: '2026-05-05T00:00:00.000Z',
@@ -133,12 +133,70 @@ test('REST fetchers reject invalid successful payload shapes', async () => {
   try {
     await expect(
       fetchVolumeAnalytics({
-        bucketSize: 'minute',
+        bucketSize: 'five_minute',
         orderType: 'all',
         from: '2026-05-04T00:00:00.000Z',
         to: '2026-05-05T00:00:00.000Z'
       })
     ).rejects.toThrow('Invalid volume analytics response payload')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('volume analytics fetcher calls API for every fixed window and bucket size', async () => {
+  const originalFetch = globalThis.fetch
+  const urls: string[] = []
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    urls.push(String(input))
+    const url = new URL(String(input), 'http://localhost')
+    return Response.json({
+      bucketSize: url.searchParams.get('bucketSize'),
+      orderType: url.searchParams.get('orderType'),
+      from: url.searchParams.get('from'),
+      to: url.searchParams.get('to'),
+      buckets: []
+    })
+  }) as unknown as typeof fetch
+
+  const to = new Date('2026-05-05T00:00:00.000Z')
+  const windows = [
+    { amount: 6, unit: 'hour' },
+    { amount: 1, unit: 'day' },
+    { amount: 7, unit: 'day' },
+    { amount: 30, unit: 'day' },
+    { amount: 90, unit: 'day' }
+  ] as const
+  const bucketSizes = ['five_minute', 'hour', 'day'] as const
+
+  try {
+    for (const window of windows) {
+      const from = new Date(to)
+      if (window.unit === 'hour') from.setUTCHours(from.getUTCHours() - window.amount)
+      else if (window.amount === 1) from.setUTCHours(from.getUTCHours() - 24)
+      else from.setUTCDate(from.getUTCDate() - window.amount)
+
+      for (const bucketSize of bucketSizes) {
+        await expect(
+          fetchVolumeAnalytics({
+            bucketSize,
+            orderType: 'all',
+            from: from.toISOString(),
+            to: to.toISOString()
+          })
+        ).resolves.toMatchObject({
+          bucketSize,
+          orderType: 'all',
+          from: from.toISOString(),
+          to: to.toISOString(),
+          buckets: []
+        })
+      }
+    }
+
+    expect(urls).toHaveLength(15)
+    expect(urls.some((url) => url.includes('bucketSize=hour'))).toBe(true)
+    expect(urls.some((url) => url.includes('bucketSize=five_minute'))).toBe(true)
   } finally {
     globalThis.fetch = originalFetch
   }

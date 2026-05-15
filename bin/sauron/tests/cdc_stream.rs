@@ -14,16 +14,18 @@ use testcontainers::{
 use uuid::Uuid;
 
 const POSTGRES_PORT: u16 = 5432;
-const ROUTER_CDC_MIGRATION: &str =
-    include_str!("../../router-server/migrations/20260502120000_router_cdc_logical_messages.sql");
-const ROUTER_CDC_DELETE_SAFE_MIGRATION: &str =
-    include_str!("../../router-server/migrations/20260504183000_router_cdc_delete_safe.sql");
+const ROUTER_CDC_MIGRATION: &str = include_str!(
+    "../../../crates/router-core/migrations/20260502120000_router_cdc_logical_messages.sql"
+);
+const ROUTER_CDC_DELETE_SAFE_MIGRATION: &str = include_str!(
+    "../../../crates/router-core/migrations/20260504183000_router_cdc_delete_safe.sql"
+);
 const ROUTER_CDC_MESSAGE_ONLY_PUBLICATION_MIGRATION: &str = include_str!(
-    "../../router-server/migrations/20260504190000_router_cdc_message_only_publication.sql"
+    "../../../crates/router-core/migrations/20260504190000_router_cdc_message_only_publication.sql"
 );
 
 #[tokio::test]
-async fn streams_router_logical_messages_from_pgoutput_slot() {
+async fn streams_router_cdc_messages_from_pgoutput_slot() {
     let image = GenericImage::new("postgres", "18-alpine")
         .with_exposed_port(POSTGRES_PORT.tcp())
         .with_wait_for(WaitFor::message_on_stderr(
@@ -129,7 +131,7 @@ async fn streams_router_logical_messages_from_pgoutput_slot() {
         }
     })
     .await
-    .expect("receive router CDC logical message");
+    .expect("receive router CDC message");
 
     assert_eq!(message.table, "router_orders");
     assert_eq!(message.op, "INSERT");

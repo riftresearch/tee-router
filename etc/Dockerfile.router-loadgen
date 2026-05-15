@@ -1,8 +1,14 @@
+# syntax=docker/dockerfile:1.7
 FROM rust:1.90.0-trixie AS builder
+ENV RUSTUP_TOOLCHAIN=1.90.0-x86_64-unknown-linux-gnu
 
 WORKDIR /app
 COPY . .
-RUN cargo build --release -p router-loadgen
+RUN --mount=type=cache,id=tee-router-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=tee-router-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=tee-router-target,target=/app/target,sharing=locked \
+    cargo build --release -p router-loadgen \
+    && install -Dm0755 /app/target/release/router-loadgen /app/out/router-loadgen
 
 FROM debian:trixie
 
@@ -10,6 +16,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/router-loadgen /usr/local/bin/router-loadgen
+COPY --from=builder /app/out/router-loadgen /usr/local/bin/router-loadgen
 
 ENTRYPOINT ["router-loadgen"]

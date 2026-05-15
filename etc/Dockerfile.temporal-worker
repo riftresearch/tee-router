@@ -1,0 +1,29 @@
+# syntax=docker/dockerfile:1.7
+FROM rust:1.90.0-trixie AS builder
+ENV RUSTUP_TOOLCHAIN=1.90.0-x86_64-unknown-linux-gnu
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libprotobuf-dev \
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY . .
+RUN --mount=type=cache,id=tee-router-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=tee-router-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=tee-router-target,target=/app/target,sharing=locked \
+    cargo build --release -p temporal-worker \
+    && install -Dm0755 /app/target/release/temporal-worker /app/out/temporal-worker
+
+FROM debian:trixie
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY --from=builder /app/out/temporal-worker /usr/local/bin/temporal-worker
+COPY --from=builder /app/crates/router-core/migrations /app/migrations
+ENV ROUTER_MIGRATIONS_DIR=/app/migrations
+
+ENTRYPOINT ["temporal-worker"]
+CMD ["worker"]

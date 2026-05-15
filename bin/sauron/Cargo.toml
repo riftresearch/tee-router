@@ -16,12 +16,19 @@ harness = false
 [dependencies]
 async-trait = { workspace = true }
 blockchain-utils = { workspace = true }
-bitcoincore-rpc-async = { workspace = true }
-esplora-client = { workspace = true }
+bitcoin-indexer-client = { workspace = true }
+bitcoin-receipt-watcher-client = { workspace = true }
+evm-indexer-client = { workspace = true }
+evm-receipt-watcher-client = { workspace = true }
 evm-token-indexer-client = { workspace = true }
+hl-shim-client = { workspace = true }
+hyperliquid-client = { workspace = true }
+hyperunit-client = { workspace = true }
 observability = { workspace = true }
+router-core = { workspace = true }
 router-primitives = { workspace = true }
 router-server = { path = "../router-server" }
+router-temporal = { workspace = true }
 utc = { workspace = true }
 
 alloy = { workspace = true }
@@ -43,14 +50,19 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
-zeromq = "0.6.0-pre.1"
 
 [dev-dependencies]
+axum = { workspace = true }
+bitcoin-indexer = { path = "../../bitcoin-indexer" }
+bitcoin-receipt-watcher = { path = "../../bitcoin-receipt-watcher" }
+bitcoincore-rpc-async = { workspace = true }
 chains = { workspace = true }
 criterion = "0.5"
 devnet = { workspace = true }
 eip3009-erc20-contract = { workspace = true }
 dotenvy = { workspace = true }
-hyperunit-client = { workspace = true }
+evm-receipt-watcher = { path = "../../evm-receipt-watcher" }
+hl-shim-indexer = { workspace = true }
+temporal-worker = { path = "../temporal-worker" }
 tempfile = { workspace = true }
 testcontainers = "0.27.2"

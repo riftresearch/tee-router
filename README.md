@@ -4,7 +4,9 @@ Cross-chain vault router infrastructure intended to run inside a TEE.
 ## Components
 
 - `router-api` - Stateless deposit-vault HTTP API. It validates requests, creates vault rows, accepts cancellation/refund requests, and returns status handles.
-- `router-worker` - Stateful background processor. Exactly one worker should hold the PostgreSQL leadership lease and process refunds/actions at a time.
+- `router-worker` - Stateful maintenance process. It reconciles funding/refund vault work and starts Temporal order workflows after funding.
+- `temporal-worker` - Temporal worker process that executes order workflows and activities. Temporal owns workflow state and per-order execution ownership; Postgres remains the canonical business-state store.
+- Temporal Server - Self-hosted workflow engine used by `router-worker`, `router-api`, and `temporal-worker`.
 - Bitcoin full node for Bitcoin state validation
 - EVM RPC endpoints for supported `evm:<chain_id>` networks
 
@@ -45,7 +47,13 @@ Run the worker node with:
 cargo run -p router-server --bin router-worker -- --config-dir ./config
 ```
 
-`router-api` disables paymaster signing during chain setup. Refund side effects run only in `router-worker`. Worker leadership uses the `router_worker_leases` PostgreSQL table with `owner_id`, `expires_at`, and a monotonic `fencing_token`; tune it with `ROUTER_WORKER_ID`, `ROUTER_WORKER_LEASE_SECONDS`, `ROUTER_WORKER_LEASE_RENEW_SECONDS`, `ROUTER_WORKER_STANDBY_POLL_SECONDS`, and `ROUTER_WORKER_REFUND_POLL_SECONDS`.
+Run the Temporal order-execution worker with:
+
+```bash
+cargo run -p temporal-worker -- worker
+```
+
+`router-api` disables paymaster signing during chain setup. `router-worker` performs maintenance passes and starts `OrderWorkflow` after funding, while `temporal-worker` performs the order/refund side effects through Temporal activities. Configure all three router processes with the same `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`, and `ORDER_EXECUTION_TEMPORAL_TASK_QUEUE`/`TEMPORAL_TASK_QUEUE` value so workflow starts, signals, and task polling meet on the same queue.
 
 ## Action Providers
 

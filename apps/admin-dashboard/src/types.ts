@@ -66,6 +66,7 @@ export type OrderExecutionActionAddresses = {
 
 export type OrderExecutionLeg = {
   id: string
+  executionAttemptId?: string
   transitionDeclId?: string
   legIndex: number
   legType: string
@@ -105,6 +106,16 @@ export type OrderProgress = {
   completedStages: number
   failedStages: number
   activeStage?: string
+  stages?: OrderProgressStage[]
+}
+
+export type OrderProgressStage = {
+  label: string
+  status: string
+  input?: AssetRef
+  output?: AssetRef
+  txHash?: string
+  txChainId?: string
 }
 
 export type LimitOrderStatus = {
@@ -115,6 +126,7 @@ export type LimitOrderStatus = {
     | 'filled'
     | 'completed'
     | 'refunded'
+    | 'manual_intervention'
     | 'manual_refund'
     | 'failed'
     | 'expired'
@@ -166,10 +178,10 @@ export type OrderTypeFilter = 'market_order' | 'limit_order'
 export type OrderLifecycleFilter =
   | 'firehose'
   | 'in_progress'
-  | 'failed'
+  | 'needs_attention'
+  | 'expired'
   | 'refunded'
-  | 'manual_refund'
-export type VolumeBucketSize = 'minute' | 'hour' | 'day'
+export type VolumeBucketSize = 'five_minute' | 'hour' | 'day'
 export type VolumeOrderTypeFilter = 'all' | OrderTypeFilter
 
 export type VolumeBucket = {

@@ -530,7 +530,12 @@ post-ingress recovery policy:
 - Balance reconciliation: every worker retry must start by querying current
   vault, HyperEVM, HyperCore, Unit, and Across state.
 - Activation fees: new HyperCore accounts can require a one-time quote-token fee
-  before sending CoreWriter actions.
+  before sending CoreWriter actions. In live Unit BTC withdrawal testing, the
+  first `sendAsset` to a fresh Unit HyperCore protocol address consumed `1 USDC`
+  from the sender's spot wallet. Router quotes must reserve and expose this as
+  a venue fee for Hyperliquid -> Unit withdrawal paths; it is separate from
+  Unit's Bitcoin/network fee estimate and from Hyperliquid Bridge2's recurring
+  `1 USDC` USDC withdrawal gas fee.
 - HyperEVM gas: `999` routes can create HYPE gas requirements that are separate
   from source/destination token balances.
 - Address validation: BTC, EVM, Hyperliquid/Core, HyperEVM, and Unit protocol

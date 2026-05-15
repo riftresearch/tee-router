@@ -576,7 +576,7 @@
         "tags": [
           "Quotes"
         ],
-        "summary": "Create a quote",
+        "summary": "Create a quote for a market order",
         "requestBody": {
           "required": true,
           "content": {
@@ -589,7 +589,7 @@
         },
         "responses": {
           "201": {
-            "description": "Quote created by the internal router API.",
+            "description": "Market quote created by the internal router API.",
             "content": {
               "application/json": {
                 "schema": {
@@ -656,7 +656,7 @@
         "tags": [
           "Orders"
         ],
-        "summary": "Create a market order",
+        "summary": "Create a market order from a quote",
         "requestBody": {
           "required": true,
           "content": {
@@ -669,7 +669,7 @@
         },
         "responses": {
           "201": {
-            "description": "Order created by the internal router API.",
+            "description": "Market order created by the internal router API.",
             "content": {
               "application/json": {
                 "schema": {

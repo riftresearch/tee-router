@@ -1,85 +1,215 @@
+# Standard postgres tuning for non-source-of-truth databases. Trades durability
+# (synchronous_commit=off — can lose ~few seconds of writes on crash) for write
+# throughput (no per-commit fsync stall on the WAL lock). Safe for any DB whose
+# data is reconstructible: indexer cursors, observation snapshots, analytics
+# rollups, etc. NOT applied to router-postgres which holds the source of truth.
+x-postgres-reconstructible-command: &postgres-reconstructible-command
+  - postgres
+  - -c
+  - max_connections=400
+  - -c
+  - shared_buffers=1GB
+  - -c
+  - effective_cache_size=4GB
+  - -c
+  - work_mem=16MB
+  - -c
+  - maintenance_work_mem=256MB
+  - -c
+  - max_wal_size=2GB
+  - -c
+  - checkpoint_completion_target=0.9
+  - -c
+  - random_page_cost=1.1
+  - -c
+  - effective_io_concurrency=200
+  - -c
+  - synchronous_commit=off
+
+x-temporal-server-base: &temporal-server-base
+  image: temporalio/server:1.31.0
+  depends_on:
+    temporal-schema:
+      condition: service_completed_successfully
+  environment: &temporal-server-env
+    DB: postgres12
+    DB_PORT: 5432
+    POSTGRES_USER: temporal
+    POSTGRES_PWD: temporal
+    POSTGRES_SEEDS: temporal-postgres
+    BIND_ON_IP: 0.0.0.0
+    DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/development-sql.yaml
+    NUM_HISTORY_SHARDS: "512"
+    # Per Temporal community: SQL_MAX_CONNS is per-service. With 4 services
+    # (frontend, history, matching, internal-worker) at 200 each, peak ~800
+    # connections to temporal-postgres. max_connections below sized accordingly.
+    SQL_MAX_CONNS: "200"
+    SQL_MAX_IDLE_CONNS: "200"
+    SQL_MAX_CONN_TIME: "30m"
+    PROMETHEUS_ENDPOINT: 0.0.0.0:9090
+  configs:
+    - source: temporal-dynamic-config
+      target: /etc/temporal/config/dynamicconfig/development-sql.yaml
+  entrypoint: ["/bin/sh", "-c"]
+  command:
+    - |
+      set -e
+      TEMPORAL_BROADCAST_ADDRESS="$$(getent hosts $$(hostname) | awk '{print $$1}')"
+      export TEMPORAL_BROADCAST_ADDRESS
+      echo "Resolved TEMPORAL_BROADCAST_ADDRESS=$$TEMPORAL_BROADCAST_ADDRESS for $$(hostname)"
+      exec /etc/temporal/entrypoint.sh
+
 configs:
+  router-postgres-hba:
+    content: |
+      local all all trust
+      host all all 127.0.0.1/32 scram-sha-256
+      host all all ::1/128 scram-sha-256
+      host all all all scram-sha-256
+      host replication replicator all scram-sha-256
+
   router-postgres-init:
     content: |
       #!/bin/sh
       set -eu
 
       psql -v ON_ERROR_STOP=1 --username "$$POSTGRES_USER" --dbname "$$POSTGRES_DB" <<-SQL
-        CREATE ROLE replicator LOGIN REPLICATION PASSWORD 'replicator';
-        CREATE PUBLICATION router_all_tables FOR ALL TABLES;
-
-        GRANT USAGE ON SCHEMA public TO replicator;
-        GRANT SELECT ON ALL TABLES IN SCHEMA public TO replicator;
-        GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO replicator;
-        ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO replicator;
-        ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE ON SEQUENCES TO replicator;
+        DO \$\$
+        BEGIN
+          IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'replicator') THEN
+            CREATE ROLE replicator LOGIN REPLICATION PASSWORD 'replicator';
+          ELSE
+            ALTER ROLE replicator WITH LOGIN REPLICATION PASSWORD 'replicator';
+          END IF;
+        END
+        \$\$;
       SQL
 
-  local-replica-setup:
+  temporal-dynamic-config:
     content: |
-      #!/usr/bin/env bash
-      set -euo pipefail
+      limit.maxIDLength:
+        - value: 255
+          constraints: {}
+      system.forceSearchAttributesCacheRefreshOnRead:
+        - value: true
+          constraints: {}
 
-      PRIMARY_CONN="postgresql://replicator:replicator@router-postgres:5432/router_db?sslmode=disable"
-      PRIMARY_ADMIN_CONN="postgresql://router_app:router_app@router-postgres:5432/router_db?sslmode=disable"
-      REPLICA_ADMIN_CONN="postgresql://postgres:postgres@router-postgres-replica:5432/postgres?sslmode=disable"
-      REPLICA_DB_CONN="postgresql://postgres:postgres@router-postgres-replica:5432/router_db?sslmode=disable"
+      # Throughput ceilings -- raise from defaults (frontend 2400 / matching 1200 / history 3000)
+      frontend.rps:
+        - value: 4800
+          constraints: {}
+      matching.rps:
+        - value: 2400
+          constraints: {}
+      history.rps:
+        - value: 6000
+          constraints: {}
 
-      until psql "$${PRIMARY_CONN}" -c '\q' 2>/dev/null; do
-        echo "waiting for local router primary"
-        sleep 2
-      done
+      # Persistence QPS ceilings -- raise from defaults (frontend 2000 / matching+history 9000)
+      frontend.persistenceMaxQPS:
+        - value: 4000
+          constraints: {}
+      matching.persistenceMaxQPS:
+        - value: 18000
+          constraints: {}
+      history.persistenceMaxQPS:
+        - value: 18000
+          constraints: {}
 
-      until psql "$${REPLICA_ADMIN_CONN}" -c '\q' 2>/dev/null; do
-        echo "waiting for local router replica"
-        sleep 2
-      done
+      # Task queue partitions -- raise from default 4 to match poller concurrency (~64-128)
+      matching.numTaskqueueReadPartitions:
+        - value: 16
+          constraints: {}
+      matching.numTaskqueueWritePartitions:
+        - value: 16
+          constraints: {}
 
-      REPLICA_DB_EXISTS=$$(psql "$${REPLICA_ADMIN_CONN}" -tAc "SELECT COUNT(*) FROM pg_database WHERE datname = 'router_db';")
-      if [ "$${REPLICA_DB_EXISTS}" -eq "1" ]; then
-        SUB_EXISTS=$$(psql "$${REPLICA_DB_CONN}" -tAc "SELECT COUNT(*) FROM pg_subscription WHERE subname = 'router_local_subscription';")
-        if [ "$${SUB_EXISTS}" -eq "1" ]; then
-          psql -v ON_ERROR_STOP=1 "$${REPLICA_DB_CONN}" \
-            -c "ALTER SUBSCRIPTION router_local_subscription DISABLE;" \
-            -c "ALTER SUBSCRIPTION router_local_subscription SET (slot_name = NONE);" \
-            -c "DROP SUBSCRIPTION router_local_subscription;"
+      # Host-level history cache (entries). Was history.cacheMaxSize pre-1.27.
+      # Default is 128000; bumping to 256000 to reduce shard reload churn under sustained load.
+      history.hostLevelCacheMaxSize:
+        - value: 256000
+          constraints: {}
+      history.eventsCacheMaxSizeBytes:
+        - value: 1073741824   # 1 GiB
+          constraints: {}
+
+  temporal-setup-postgres:
+    content: |
+      #!/bin/sh
+      set -eu
+
+      : "$${POSTGRES_SEEDS:?POSTGRES_SEEDS is required}"
+      : "$${POSTGRES_USER:?POSTGRES_USER is required}"
+
+      echo "Waiting for PostgreSQL port..."
+      nc -z -w 10 "$${POSTGRES_SEEDS}" "$${DB_PORT:-5432}"
+      echo "PostgreSQL port is available"
+
+      temporal-sql-tool --plugin postgres12 --ep "$${POSTGRES_SEEDS}" -u "$${POSTGRES_USER}" -p "$${DB_PORT:-5432}" --db temporal create
+      temporal-sql-tool --plugin postgres12 --ep "$${POSTGRES_SEEDS}" -u "$${POSTGRES_USER}" -p "$${DB_PORT:-5432}" --db temporal setup-schema -v 0.0
+      temporal-sql-tool --plugin postgres12 --ep "$${POSTGRES_SEEDS}" -u "$${POSTGRES_USER}" -p "$${DB_PORT:-5432}" --db temporal update-schema -d /etc/temporal/schema/postgresql/v12/temporal/versioned
+
+      temporal-sql-tool --plugin postgres12 --ep "$${POSTGRES_SEEDS}" -u "$${POSTGRES_USER}" -p "$${DB_PORT:-5432}" --db temporal_visibility create
+      temporal-sql-tool --plugin postgres12 --ep "$${POSTGRES_SEEDS}" -u "$${POSTGRES_USER}" -p "$${DB_PORT:-5432}" --db temporal_visibility setup-schema -v 0.0
+      temporal-sql-tool --plugin postgres12 --ep "$${POSTGRES_SEEDS}" -u "$${POSTGRES_USER}" -p "$${DB_PORT:-5432}" --db temporal_visibility update-schema -d /etc/temporal/schema/postgresql/v12/visibility/versioned
+
+      echo "PostgreSQL schema setup complete"
+
+  temporal-create-namespace:
+    content: |
+      #!/bin/sh
+      set -eu
+
+      namespace="$${DEFAULT_NAMESPACE:-default}"
+      temporal_address="$${TEMPORAL_ADDRESS:-temporal:7233}"
+      max_attempts="$${TEMPORAL_HEALTH_CHECK_MAX_ATTEMPTS:-30}"
+      sleep_seconds="$${TEMPORAL_HEALTH_CHECK_SLEEP_SECONDS:-5}"
+      server_host="$$(echo "$${temporal_address}" | cut -d: -f1)"
+      server_port="$$(echo "$${temporal_address}" | cut -d: -f2)"
+
+      echo "Waiting for Temporal server port..."
+      attempt=1
+      while ! nc -z -w 10 "$${server_host}" "$${server_port}"; do
+        if [ "$${attempt}" -ge "$${max_attempts}" ]; then
+          echo "Temporal server port did not become available after $${max_attempts} attempts"
+          exit 1
         fi
-      fi
+        echo "Temporal server port not ready yet, waiting... (attempt $${attempt}/$${max_attempts})"
+        attempt="$$(($${attempt} + 1))"
+        sleep "$${sleep_seconds}"
+      done
 
-      for attempt in $$(seq 1 20); do
-        psql -v ON_ERROR_STOP=1 "$${REPLICA_ADMIN_CONN}" \
-          -c "SELECT pg_terminate_backend(active_pid) FROM pg_catalog.pg_replication_slots WHERE database = 'router_db' AND active_pid IS NOT NULL;" \
-          -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_catalog.pg_replication_slots WHERE database = 'router_db' AND active_pid IS NULL;"
+      echo "Waiting for Temporal server health..."
+      attempt=1
+      while ! temporal operator cluster health --address "$${temporal_address}"; do
+        if [ "$${attempt}" -ge "$${max_attempts}" ]; then
+          echo "Temporal server did not become healthy after $${max_attempts} attempts"
+          exit 1
+        fi
+        echo "Temporal server not healthy yet, waiting... (attempt $${attempt}/$${max_attempts})"
+        attempt="$$(($${attempt} + 1))"
+        sleep "$${sleep_seconds}"
+      done
 
-        REMAINING_SLOTS=$$(psql "$${REPLICA_ADMIN_CONN}" -tAc "SELECT COUNT(*) FROM pg_catalog.pg_replication_slots WHERE database = 'router_db';")
-        if [ "$${REMAINING_SLOTS}" -eq "0" ]; then
+      echo "Ensuring Temporal namespace '$${namespace}' exists..."
+      attempt=1
+      while :; do
+        if temporal operator namespace describe --namespace "$${namespace}" --address "$${temporal_address}" >/dev/null 2>&1; then
+          echo "Namespace '$${namespace}' already exists"
           break
         fi
-        if [ "$${attempt}" -eq "20" ]; then
-          echo "timed out waiting for local replica replication slots to close" >&2
-          exit 3
+        if temporal operator namespace create --namespace "$${namespace}" --address "$${temporal_address}" >/dev/null 2>&1; then
+          echo "Namespace '$${namespace}' created"
+          break
         fi
-        sleep 0.2
+        if [ "$${attempt}" -ge "$${max_attempts}" ]; then
+          echo "Failed to create namespace '$${namespace}' after $${max_attempts} attempts"
+          exit 1
+        fi
+        echo "Namespace operation not ready yet, waiting... (attempt $${attempt}/$${max_attempts})"
+        attempt="$$(($${attempt} + 1))"
+        sleep "$${sleep_seconds}"
       done
-
-      psql -v ON_ERROR_STOP=1 "$${REPLICA_ADMIN_CONN}" \
-        -c "DROP DATABASE IF EXISTS router_db WITH (FORCE);" \
-        -c "CREATE DATABASE router_db;"
-
-      psql "$${PRIMARY_ADMIN_CONN}" -c "SELECT pg_terminate_backend(active_pid) FROM pg_catalog.pg_replication_slots WHERE slot_name = 'router_local_subscription' AND active_pid IS NOT NULL;"
-      SLOT_EXISTS=$$(psql "$${PRIMARY_ADMIN_CONN}" -tAc "SELECT COUNT(*) FROM pg_replication_slots WHERE slot_name = 'router_local_subscription';")
-      if [ "$${SLOT_EXISTS}" -eq "1" ]; then
-        psql "$${PRIMARY_ADMIN_CONN}" -c "SELECT pg_drop_replication_slot('router_local_subscription');"
-      fi
-
-      pg_dump "$${PRIMARY_CONN}" --schema-only --no-owner --no-privileges --no-publications --no-subscriptions | \
-        psql "$${REPLICA_DB_CONN}"
-
-      psql "$${REPLICA_DB_CONN}" -c "CREATE PUBLICATION router_cdc_publication;"
-
-      psql "$${REPLICA_DB_CONN}" -c "CREATE SUBSCRIPTION router_local_subscription CONNECTION 'host=router-postgres port=5432 dbname=router_db user=replicator password=replicator sslmode=disable' PUBLICATION router_all_tables WITH (copy_data = true, create_slot = true);"
-
-      echo "local router replica is ready"
 
 services:
   router-master-key-init:
@@ -99,7 +229,7 @@ services:
     restart: "no"
 
   router-postgres:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     command:
       - postgres
       - -c
@@ -108,6 +238,34 @@ services:
       - max_wal_senders=10
       - -c
       - max_replication_slots=10
+      - -c
+      - max_connections=400
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
+      - -c
+      - synchronous_commit=on
+      - -c
+      - shared_buffers=2GB
+      - -c
+      - effective_cache_size=6GB
+      - -c
+      - work_mem=32MB
+      - -c
+      - maintenance_work_mem=256MB
+      - -c
+      - checkpoint_timeout=15min
+      - -c
+      - max_wal_size=4GB
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=200
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=200
     environment:
       POSTGRES_USER: router_app
       POSTGRES_PASSWORD: router_app
@@ -118,16 +276,175 @@ services:
       - source: router-postgres-init
         target: /docker-entrypoint-initdb.d/001-router-init.sh
         mode: 0755
+      - source: router-postgres-hba
+        target: /etc/postgresql/pg_hba.conf
     volumes:
-      - router_local_postgres:/var/lib/postgresql/data
+      - router_local_postgres_primary:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U router_app -d router_db"]
       interval: 5s
       timeout: 5s
       retries: 20
 
+  # numHistoryShards is fixed at first server start; changing it requires resetting the Temporal Postgres volume.
+  temporal-postgres:
+    image: postgres:16-alpine
+    command:
+      - postgres
+      - -c
+      - max_connections=1200
+      - -c
+      - shared_buffers=4GB
+      - -c
+      - effective_cache_size=12GB
+      - -c
+      - work_mem=32MB
+      - -c
+      - maintenance_work_mem=512MB
+      - -c
+      - max_wal_size=4GB
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - wal_compression=on
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=200
+      - -c
+      - synchronous_commit=off
+    environment:
+      POSTGRES_PASSWORD: temporal
+      POSTGRES_USER: temporal
+    ports:
+      - "55435:5432"
+    volumes:
+      - router_local_temporal_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+
+  temporal-schema:
+    image: temporalio/admin-tools:1.31.0
+    restart: "no"
+    depends_on:
+      temporal-postgres:
+        condition: service_healthy
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: temporal
+      POSTGRES_PWD: temporal
+      POSTGRES_SEEDS: temporal-postgres
+      SQL_PASSWORD: temporal
+    configs:
+      - source: temporal-setup-postgres
+        target: /scripts/setup-postgres.sh
+        mode: 0555
+    entrypoint: ["/bin/sh"]
+    command: /scripts/setup-postgres.sh
+
+  temporal-history:
+    <<: *temporal-server-base
+    environment:
+      <<: *temporal-server-env
+      SERVICES: history
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "7234"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "13"
+
+  temporal-matching:
+    <<: *temporal-server-base
+    environment:
+      <<: *temporal-server-env
+      SERVICES: matching
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "7235"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "8"
+
+  # This is Temporal's internal worker service, distinct from the app's Rust temporal-worker.
+  temporal-internal-worker:
+    <<: *temporal-server-base
+    environment:
+      <<: *temporal-server-env
+      SERVICES: worker
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "7239"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "3"
+
+  temporal:
+    <<: *temporal-server-base
+    environment:
+      <<: *temporal-server-env
+      SERVICES: frontend
+    ports:
+      - "7233:7233"
+      - "9090:9090"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "7233"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "8"
+
+  temporal-create-namespace:
+    image: temporalio/admin-tools:1.31.0
+    restart: on-failure:5
+    depends_on:
+      temporal:
+        condition: service_healthy
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      DEFAULT_NAMESPACE: default
+    configs:
+      - source: temporal-create-namespace
+        target: /scripts/create-namespace.sh
+        mode: 0555
+    entrypoint: ["/bin/sh"]
+    command: /scripts/create-namespace.sh
+
+  temporal-ui:
+    image: temporalio/ui:2.49.1
+    depends_on:
+      temporal:
+        condition: service_healthy
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: http://localhost:3000
+    ports:
+      - "8080:8080"
+
   token-indexer-db:
     image: postgres:16-alpine
+    command: *postgres-reconstructible-command
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -141,6 +458,8 @@ services:
       retries: 20
 
   devnet:
+    # electrsd bundles a linux x86_64 electrs binary, so keep this image on amd64.
+    platform: linux/amd64
     build:
       context: ..
       dockerfile: etc/Dockerfile.devnet
@@ -171,6 +490,7 @@ services:
       - "50110:50110"
       - "50111:50111"
       - "50112:50112"
+      - "50118:50118"
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:50108/status >/dev/null"]
       interval: 10s
@@ -188,11 +508,18 @@ services:
         condition: service_completed_successfully
       router-postgres:
         condition: service_healthy
+      temporal-create-namespace:
+        condition: service_completed_successfully
       devnet:
         condition: service_healthy
     environment: &router_env
       RUST_LOG: info
       DATABASE_URL: postgres://router_app:router_app@router-postgres:5432/router_db
+      DB_MAX_CONNECTIONS: "100"
+      SAURON_TEMPORAL_DB_MAX_CONNECTIONS: "200"
+      SAURON_TEMPORAL_TARGET_MEM_USAGE: "0.8"
+      SAURON_TEMPORAL_TARGET_CPU_USAGE: "0.9"
+      SAURON_TEMPORAL_MAX_CACHED_WORKFLOWS: "2000"
       ROUTER_MASTER_KEY_PATH: /run/router-secrets/router-master-key.hex
       ETH_RPC_URL: http://devnet:50101
       BASE_RPC_URL: http://devnet:50102
@@ -201,9 +528,11 @@ services:
       BITCOIN_RPC_AUTH: devnet:devnet
       ELECTRUM_HTTP_SERVER_URL: http://devnet:50110
       BITCOIN_NETWORK: regtest
-      ETHEREUM_PAYMASTER_PRIVATE_KEY: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-      BASE_PAYMASTER_PRIVATE_KEY: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-      ARBITRUM_PAYMASTER_PRIVATE_KEY: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+      # Anvil account #9. Keep router paymasters off account #0 because the
+      # devnet deployer, mocks, and loadgen helpers submit from account #0.
+      ETHEREUM_PAYMASTER_PRIVATE_KEY: "0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6"
+      BASE_PAYMASTER_PRIVATE_KEY: "0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6"
+      ARBITRUM_PAYMASTER_PRIVATE_KEY: "0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6"
       HYPERLIQUID_PAYMASTER_PRIVATE_KEY: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
       ROUTER_DETECTOR_API_KEY: devnet-detector-key-000000000000
       ROUTER_GATEWAY_API_KEY: devnet-gateway-key-0000000000000000
@@ -219,6 +548,10 @@ services:
       HYPERLIQUID_NETWORK: testnet
       VELORA_API_URL: http://devnet:50107
       COINBASE_PRICE_API_BASE_URL: http://devnet:50107
+      TEMPORAL_ADDRESS: http://temporal:7233
+      TEMPORAL_NAMESPACE: default
+      ORDER_EXECUTION_TEMPORAL_TASK_QUEUE: tee-router-order-execution
+      TEMPORAL_TASK_QUEUE: tee-router-order-execution
       CORS_DOMAIN: "*"
     volumes:
       - router_local_master_key:/run/router-secrets:ro
@@ -241,53 +574,77 @@ services:
     environment:
       <<: *router_env
       ROUTER_WORKER_ID: local-router-worker
-      ROUTER_WORKER_LEASE_SECONDS: 30
-      ROUTER_WORKER_LEASE_RENEW_SECONDS: 5
-      ROUTER_WORKER_STANDBY_POLL_SECONDS: 2
       ROUTER_WORKER_ROUTE_COST_REFRESH_SECONDS: 30
     volumes:
       - router_local_master_key:/run/router-secrets:ro
 
-  router-postgres-replica:
-    image: postgres:16-alpine
-    command:
-      - postgres
-      - -c
-      - wal_level=logical
-      - -c
-      - max_wal_senders=10
-      - -c
-      - max_replication_slots=10
+  temporal-worker:
+    build:
+      context: ..
+      dockerfile: etc/Dockerfile.temporal-worker
+    command: ["worker"]
+    depends_on:
+      router-master-key-init:
+        condition: service_completed_successfully
+      router-postgres:
+        condition: service_healthy
+      temporal-create-namespace:
+        condition: service_completed_successfully
+      devnet:
+        condition: service_healthy
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: router_db
+      <<: *router_env
+      RUST_LOG: info
+      ROUTER_PAYMASTER_BATCH_MAX_SIZE: 64
+      ROUTER_TEMPORAL_ACTIVITY_POLLERS: "128"
+      ROUTER_TEMPORAL_WORKFLOW_POLLERS: "32"
+      ROUTER_TEMPORAL_ACTIVITY_SLOT_MIN: "64"
+      ROUTER_TEMPORAL_ACTIVITY_SLOT_MAX: "2000"
+      ROUTER_TEMPORAL_WORKFLOW_SLOT_MIN: "16"
+      ROUTER_TEMPORAL_WORKFLOW_SLOT_MAX: "2000"
+    volumes:
+      - router_local_master_key:/run/router-secrets:ro
+    expose:
+      - "9103"
+
+  router-postgres-replica:
+    build:
+      context: ../railway/router-physical-standby
+      dockerfile: Dockerfile
+    depends_on:
+      router-postgres:
+        condition: service_healthy
+    environment:
+      PRIMARY_DB_HOST: router-postgres
+      PRIMARY_DB_PORT: 5432
+      PRIMARY_DB_NAME: router_db
+      PRIMARY_DB_USER: replicator
+      PRIMARY_DB_PASSWORD: replicator
+      PRIMARY_DB_SSLMODE: disable
+      PRIMARY_REPLICATION_SLOT: router_local_physical_standby
+      STANDBY_APPLICATION_NAME: router-local-physical-standby
+      STANDBY_MAX_CONNECTIONS: 400
+      PGDATA: /var/lib/postgresql/18/docker
     ports:
       - "55433:5432"
     volumes:
-      - router_local_postgres_replica:/var/lib/postgresql/data
+      - router_local_physical_standby:/var/lib/postgresql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d router_db"]
+      # Verify replication has caught up enough that downstream consumers (Sauron)
+      # can find the tables they query at startup. `pg_isready` alone marks the
+      # replica healthy as soon as Postgres accepts connections, which races
+      # ahead of the streamed schema and crashes Sauron.
+      test:
+        - CMD-SHELL
+        - pg_isready -U router_app -d router_db && psql -U router_app -d router_db -tAc "SELECT to_regclass('public.limit_order_quotes') IS NOT NULL" | grep -qx t
       interval: 5s
       timeout: 5s
-      retries: 20
-
-  router-replica-setup:
-    image: postgres:16
-    depends_on:
-      router-api:
-        condition: service_healthy
-      router-postgres-replica:
-        condition: service_healthy
-    configs:
-      - source: local-replica-setup
-        target: /setup.sh
-        mode: 0755
-    command: ["/setup.sh"]
-    restart: "no"
+      retries: 60
+      start_period: 30s
 
   sauron-state-db:
     image: postgres:16-alpine
+    command: *postgres-reconstructible-command
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -304,16 +661,29 @@ services:
     build:
       context: ..
       dockerfile: etc/Dockerfile.sauron
+    restart: on-failure
     depends_on:
-      router-replica-setup:
-        condition: service_completed_successfully
+      router-postgres-replica:
+        condition: service_healthy
       sauron-state-db:
         condition: service_healthy
       devnet:
         condition: service_healthy
+      hl-shim-indexer:
+        condition: service_started
+      evm-receipt-watcher-ethereum:
+        condition: service_started
+      evm-receipt-watcher-base:
+        condition: service_started
+      evm-receipt-watcher-arbitrum:
+        condition: service_started
+      bitcoin-indexer:
+        condition: service_started
+      bitcoin-receipt-watcher:
+        condition: service_started
     environment:
       RUST_LOG: info
-      ROUTER_REPLICA_DATABASE_URL: postgres://postgres:postgres@router-postgres-replica:5432/router_db
+      ROUTER_REPLICA_DATABASE_URL: postgres://router_app:router_app@router-postgres-replica:5432/router_db
       SAURON_STATE_DATABASE_URL: postgres://postgres:postgres@sauron-state-db:5432/sauron_state
       SAURON_REPLICA_EVENT_SOURCE: cdc
       SAURON_CDC_SLOT_NAME: sauron_watch_cdc
@@ -325,6 +695,7 @@ services:
       ELECTRUM_HTTP_SERVER_URL: http://devnet:50110
       BITCOIN_RPC_URL: http://devnet:50100
       BITCOIN_RPC_AUTH: devnet:devnet
+      BITCOIN_ZMQ_RAWBLOCK_ENDPOINT: tcp://devnet:50118
       BITCOIN_ZMQ_RAWTX_ENDPOINT: tcp://devnet:50111
       BITCOIN_ZMQ_SEQUENCE_ENDPOINT: tcp://devnet:50112
       ETH_RPC_URL: http://devnet:50101
@@ -333,10 +704,172 @@ services:
       ETHEREUM_TOKEN_INDEXER_URL: http://devnet:50104
       BASE_TOKEN_INDEXER_URL: http://devnet:50105
       ARBITRUM_TOKEN_INDEXER_URL: http://devnet:50106
+      ETHEREUM_RECEIPT_WATCHER_URL: http://evm-receipt-watcher-ethereum:8080
+      BASE_RECEIPT_WATCHER_URL: http://evm-receipt-watcher-base:8080
+      ARBITRUM_RECEIPT_WATCHER_URL: http://evm-receipt-watcher-arbitrum:8080
+      BITCOIN_INDEXER_URL: http://bitcoin-indexer:8080
+      BITCOIN_RECEIPT_WATCHER_URL: http://bitcoin-receipt-watcher:8080
       TOKEN_INDEXER_API_KEY: local-token-indexer-api-key-000000000
+      HL_SHIM_INDEXER_URL: http://hl-shim-indexer:8080
+      HYPERUNIT_API_URL: http://devnet:50107
+      SAURON_HL_BRIDGE_MATCH_WINDOW_SECONDS: 1800
+      SAURON_HU_POLL_FAST_MILLIS: 500
+      SAURON_HU_POLL_MEDIUM_MILLIS: 500
+      SAURON_HU_POLL_SLOW_MILLIS: 500
+
+  hl-shim-db:
+    image: postgres:16-alpine
+    command: *postgres-reconstructible-command
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: hl_shim
+    volumes:
+      - router_local_hl_shim_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d hl_shim"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  hl-shim-indexer:
+    build:
+      context: ..
+      dockerfile: etc/Dockerfile.hl-shim-indexer
+    restart: on-failure
+    depends_on:
+      hl-shim-db:
+        condition: service_healthy
+      devnet:
+        condition: service_healthy
+    environment:
+      RUST_LOG: info
+      HL_SHIM_DATABASE_URL: postgres://postgres:postgres@hl-shim-db:5432/hl_shim
+      HL_SHIM_INFO_URL: http://devnet:50107
+      HL_SHIM_BIND: 0.0.0.0:8080
+      METRICS_BIND_ADDR: 0.0.0.0:9104
+      # Devnet override: no real HL rate limit, push hard
+      HL_SHIM_HOT_CADENCE_MS: 1000
+      HL_SHIM_WARM_CADENCE_MS: 2000
+      HL_SHIM_COLD_CADENCE_MS: 5000
+      HL_SHIM_FUNDING_HOT_CADENCE_MS: 2000
+      HL_SHIM_FUNDING_WARM_CADENCE_MS: 5000
+      HL_SHIM_FUNDING_COLD_CADENCE_MS: 10000
+      HL_SHIM_ORDER_STATUS_CADENCE_MS: 1000
+      HL_SHIM_WEIGHT_BUDGET_PER_MIN: 100000
+      HL_SHIM_WORKER_COUNT: 128
+      HL_SHIM_MAX_DB_CONNECTIONS: 200
+    expose:
+      - "8080"
+      - "9104"
+
+  evm-receipt-watcher-ethereum:
+    build:
+      context: ..
+      dockerfile: etc/Dockerfile.evm-receipt-watcher
+    restart: on-failure
+    depends_on:
+      devnet:
+        condition: service_healthy
+    environment:
+      RUST_LOG: info
+      EVM_RECEIPT_WATCHER_CHAIN: ethereum
+      EVM_RECEIPT_WATCHER_HTTP_RPC_URL: http://devnet:50101
+      EVM_RECEIPT_WATCHER_WS_RPC_URL: ws://devnet:50101
+      EVM_RECEIPT_WATCHER_BIND: 0.0.0.0:8080
+      EVM_RECEIPT_WATCHER_POLL_INTERVAL_MS: 1000
+    ports:
+      - "50113:8080"
+    expose:
+      - "8080"
+
+  evm-receipt-watcher-base:
+    build:
+      context: ..
+      dockerfile: etc/Dockerfile.evm-receipt-watcher
+    restart: on-failure
+    depends_on:
+      devnet:
+        condition: service_healthy
+    environment:
+      RUST_LOG: info
+      EVM_RECEIPT_WATCHER_CHAIN: base
+      EVM_RECEIPT_WATCHER_HTTP_RPC_URL: http://devnet:50102
+      EVM_RECEIPT_WATCHER_WS_RPC_URL: ws://devnet:50102
+      EVM_RECEIPT_WATCHER_BIND: 0.0.0.0:8080
+      EVM_RECEIPT_WATCHER_POLL_INTERVAL_MS: 1000
+    ports:
+      - "50114:8080"
+    expose:
+      - "8080"
+
+  evm-receipt-watcher-arbitrum:
+    build:
+      context: ..
+      dockerfile: etc/Dockerfile.evm-receipt-watcher
+    restart: on-failure
+    depends_on:
+      devnet:
+        condition: service_healthy
+    environment:
+      RUST_LOG: info
+      EVM_RECEIPT_WATCHER_CHAIN: arbitrum
+      EVM_RECEIPT_WATCHER_HTTP_RPC_URL: http://devnet:50103
+      EVM_RECEIPT_WATCHER_WS_RPC_URL: ws://devnet:50103
+      EVM_RECEIPT_WATCHER_BIND: 0.0.0.0:8080
+      EVM_RECEIPT_WATCHER_POLL_INTERVAL_MS: 1000
+    ports:
+      - "50115:8080"
+    expose:
+      - "8080"
+
+  bitcoin-indexer:
+    build:
+      context: ..
+      dockerfile: etc/Dockerfile.bitcoin-indexer
+    restart: on-failure
+    depends_on:
+      devnet:
+        condition: service_healthy
+    environment:
+      RUST_LOG: info
+      BITCOIN_INDEXER_NETWORK: regtest
+      BITCOIN_INDEXER_RPC_URL: http://devnet:50100
+      BITCOIN_INDEXER_RPC_AUTH: devnet:devnet
+      BITCOIN_INDEXER_ESPLORA_URL: http://devnet:50110
+      BITCOIN_INDEXER_ZMQ_RAWBLOCK_ENDPOINT: tcp://devnet:50118
+      BITCOIN_INDEXER_ZMQ_RAWTX_ENDPOINT: tcp://devnet:50111
+      BITCOIN_INDEXER_BIND: 0.0.0.0:8080
+      BITCOIN_INDEXER_POLL_INTERVAL_MS: 1000
+    ports:
+      - "50116:8080"
+    expose:
+      - "8080"
+
+  bitcoin-receipt-watcher:
+    build:
+      context: ..
+      dockerfile: etc/Dockerfile.bitcoin-receipt-watcher
+    restart: on-failure
+    depends_on:
+      devnet:
+        condition: service_healthy
+    environment:
+      RUST_LOG: info
+      BITCOIN_RECEIPT_WATCHER_CHAIN: bitcoin
+      BITCOIN_RECEIPT_WATCHER_RPC_URL: http://devnet:50100
+      BITCOIN_RECEIPT_WATCHER_RPC_AUTH: devnet:devnet
+      BITCOIN_RECEIPT_WATCHER_ZMQ_RAWBLOCK_ENDPOINT: tcp://devnet:50118
+      BITCOIN_RECEIPT_WATCHER_BIND: 0.0.0.0:8080
+      BITCOIN_RECEIPT_WATCHER_POLL_INTERVAL_MS: 1000
+    ports:
+      - "50117:8080"
+    expose:
+      - "8080"
 
   router-gateway-db:
     image: postgres:16-alpine
+    command: *postgres-reconstructible-command
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -377,6 +910,7 @@ services:
 
   admin-dashboard-auth-db:
     image: postgres:16-alpine
+    command: *postgres-reconstructible-command
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -391,6 +925,7 @@ services:
 
   admin-dashboard-analytics-db:
     image: postgres:16-alpine
+    command: *postgres-reconstructible-command
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -410,8 +945,8 @@ services:
       context: ..
       dockerfile: railway/admin-dashboard/Dockerfile
     depends_on:
-      router-replica-setup:
-        condition: service_completed_successfully
+      router-postgres-replica:
+        condition: service_healthy
       admin-dashboard-auth-db:
         condition: service_healthy
       admin-dashboard-analytics-db:
@@ -425,7 +960,7 @@ services:
       BETTER_AUTH_URL: http://localhost:3000
       ADMIN_DASHBOARD_WEB_ORIGIN: http://localhost:3000
       ADMIN_DASHBOARD_AUTH_DATABASE_URL: postgres://postgres:postgres@admin-dashboard-auth-db:5432/admin_dashboard_auth
-      ADMIN_DASHBOARD_REPLICA_DATABASE_URL: postgres://postgres:postgres@router-postgres-replica:5432/router_db
+      ADMIN_DASHBOARD_REPLICA_DATABASE_URL: postgres://router_app:router_app@router-postgres-replica:5432/router_db
       ADMIN_DASHBOARD_ANALYTICS_DATABASE_URL: postgres://postgres:postgres@admin-dashboard-analytics-db:5432/admin_dashboard_analytics
       ADMIN_DASHBOARD_CDC_SLOT_NAME: admin_dashboard_orders_cdc
       ROUTER_CDC_PUBLICATION_NAME: router_cdc_publication
@@ -475,10 +1010,12 @@ services:
 
 volumes:
   router_local_master_key:
-  router_local_postgres:
+  router_local_postgres_primary:
+  router_local_temporal_postgres:
   router_local_token_indexer_db:
-  router_local_postgres_replica:
+  router_local_physical_standby:
   router_local_sauron_state_db:
+  router_local_hl_shim_db:
   router_local_gateway_db:
   router_local_admin_auth_db:
   router_local_admin_analytics_db:

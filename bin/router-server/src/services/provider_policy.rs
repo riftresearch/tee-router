@@ -1,9 +1,9 @@
-use crate::{
+use crate::error::{RouterServerError, RouterServerResult};
+use chrono::Utc;
+use router_core::{
     db::Database,
-    error::RouterServerResult,
     models::{ProviderExecutionPolicyState, ProviderPolicy, ProviderQuotePolicyState},
 };
-use chrono::Utc;
 use std::{collections::HashMap, sync::Arc, time::Duration, time::Instant};
 use tokio::sync::RwLock;
 
@@ -61,7 +61,12 @@ impl ProviderPolicyService {
             }
         }
 
-        let policies = self.db.provider_policies().list().await?;
+        let policies = self
+            .db
+            .provider_policies()
+            .list()
+            .await
+            .map_err(RouterServerError::from)?;
         let snapshot = ProviderPolicySnapshot {
             policies: policies
                 .into_iter()
@@ -99,7 +104,12 @@ impl ProviderPolicyService {
             updated_by: updated_by.into(),
             updated_at: Utc::now(),
         };
-        let stored = self.db.provider_policies().upsert(&policy).await?;
+        let stored = self
+            .db
+            .provider_policies()
+            .upsert(&policy)
+            .await
+            .map_err(RouterServerError::from)?;
         let mut cache = self.cache.write().await;
         *cache = None;
         Ok(stored)

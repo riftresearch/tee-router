@@ -7,6 +7,8 @@ repository.workspace = true
 
 [dependencies]
 chrono = { workspace = true }
+metrics = { workspace = true }
+observability = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

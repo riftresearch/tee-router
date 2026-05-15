@@ -4,6 +4,7 @@ import { readLimitedResponseText } from './http-body'
 const MAX_UPSTREAM_SUCCESS_BODY_BYTES = 1024 * 1024
 const MAX_UPSTREAM_ERROR_BODY_BYTES = 64 * 1024
 const MAX_INTERNAL_ID_LENGTH = 128
+const MAX_INTERNAL_PROVIDER_ID_LENGTH = 2048
 const MAX_INTERNAL_STATUS_LENGTH = 64
 const MAX_INTERNAL_ASSET_FIELD_LENGTH = 128
 const MAX_INTERNAL_ADDRESS_LENGTH = 128
@@ -68,7 +69,8 @@ export type InternalMarketOrderQuote = {
   amount_out: string
   min_amount_out?: string | null
   max_amount_in?: string | null
-  slippage_bps: number
+  slippage_bps?: number | null
+  provider_quote?: unknown
   expires_at: string
   created_at: string
 }
@@ -98,12 +100,12 @@ export type CreateQuoteRequest =
       | {
           kind: 'exact_in'
           amount_in: string
-          slippage_bps: number
+          slippage_bps?: number
         }
       | {
           kind: 'exact_out'
           amount_out: string
-          slippage_bps: number
+          slippage_bps?: number
         }
     ))
   | {
@@ -118,7 +120,6 @@ export type CreateQuoteRequest =
 export type CreateOrderRequest = {
   quote_id: string
   refund_address: string
-  cancel_after?: string
   idempotency_key: string
   metadata?: Record<string, unknown>
 }
@@ -315,13 +316,13 @@ function isMarketQuote(
     isDepositAsset(value.source_asset) &&
     isDepositAsset(value.destination_asset) &&
     isBoundedString(value.recipient_address, MAX_INTERNAL_ADDRESS_LENGTH) &&
-    isBoundedString(value.provider_id, MAX_INTERNAL_ID_LENGTH) &&
+    isBoundedString(value.provider_id, MAX_INTERNAL_PROVIDER_ID_LENGTH) &&
     (value.order_kind === 'exact_in' || value.order_kind === 'exact_out') &&
     amount(value.amount_in) &&
     amount(value.amount_out) &&
     optionalAmount(value.min_amount_out) &&
     optionalAmount(value.max_amount_in) &&
-    isSlippageBps(value.slippage_bps) &&
+    optionalSlippageBps(value.slippage_bps) &&
     isBoundedString(value.expires_at, MAX_INTERNAL_DATETIME_LENGTH) &&
     isBoundedString(value.created_at, MAX_INTERNAL_DATETIME_LENGTH)
   )
@@ -339,7 +340,7 @@ function isLimitQuote(
     isDepositAsset(value.source_asset) &&
     isDepositAsset(value.destination_asset) &&
     isBoundedString(value.recipient_address, MAX_INTERNAL_ADDRESS_LENGTH) &&
-    isBoundedString(value.provider_id, MAX_INTERNAL_ID_LENGTH) &&
+    isBoundedString(value.provider_id, MAX_INTERNAL_PROVIDER_ID_LENGTH) &&
     amount(value.input_amount) &&
     amount(value.output_amount) &&
     value.residual_policy === 'refund' &&
@@ -390,6 +391,10 @@ function isSlippageBps(value: unknown): value is number {
     value >= 0 &&
     value <= 10_000
   )
+}
+
+function optionalSlippageBps(value: unknown): boolean {
+  return value === undefined || value === null || isSlippageBps(value)
 }
 
 async function readResponseBody(response: Response): Promise<unknown> {

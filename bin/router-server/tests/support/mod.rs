@@ -1,6 +1,14 @@
+#![allow(dead_code)]
+
 use std::{error::Error, future::Future, time::Duration};
 
-use alloy::{primitives::B256, providers::Provider};
+use alloy::{
+    primitives::{B256, U256},
+    providers::Provider,
+};
+use serde_json::Value;
+
+pub mod live_provider_differential;
 
 pub type LiveTestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -65,6 +73,43 @@ where
     }
 
     Err(format!("{label} transaction {tx_hash} was not mined before timeout").into())
+}
+
+pub fn assert_raw_amount_string(label: &str, value: &str) {
+    assert!(!value.is_empty(), "{label} must not be empty");
+    assert_eq!(
+        value.trim(),
+        value,
+        "{label} must not contain surrounding whitespace: {value:?}"
+    );
+    assert!(
+        value.bytes().all(|byte| byte.is_ascii_digit()),
+        "{label} must be a raw base-unit integer string, got {value:?}"
+    );
+    U256::from_str_radix(value, 10)
+        .unwrap_or_else(|err| panic!("{label} must fit uint256, got {value:?}: {err}"));
+}
+
+pub fn assert_provider_quote_leg_amounts_are_raw(provider_quote: &Value) {
+    let legs = provider_quote
+        .get("legs")
+        .and_then(Value::as_array)
+        .expect("provider_quote.legs must be present for routed market quotes");
+    assert!(!legs.is_empty(), "provider_quote.legs must not be empty");
+    for (index, leg) in legs.iter().enumerate() {
+        for field in ["amount_in", "amount_out"] {
+            let value = leg
+                .get(field)
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("provider_quote.legs[{index}].{field} is missing"));
+            assert_raw_amount_string(&format!("provider_quote.legs[{index}].{field}"), value);
+        }
+        for field in ["min_amount_out", "max_amount_in"] {
+            if let Some(value) = leg.get(field).and_then(Value::as_str) {
+                assert_raw_amount_string(&format!("provider_quote.legs[{index}].{field}"), value);
+            }
+        }
+    }
 }
 
 fn is_retryable_rpc_error(error: &(dyn Error + 'static)) -> bool {

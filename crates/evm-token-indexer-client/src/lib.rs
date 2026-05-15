@@ -2,7 +2,7 @@ use alloy::primitives::{Address, B256, U256};
 use reqwest::{Client, RequestBuilder, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const TOKEN_INDEXER_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const TOKEN_INDEXER_MAX_RESPONSE_BODY_BYTES: usize = 4 * 1024 * 1024;
@@ -202,10 +202,12 @@ impl TokenIndexerClient {
         }
 
         let response = self
-            .authorize(self.client.get(url))
-            .send()
+            .send_request(
+                "GET",
+                "/transfers/to/:address",
+                self.authorize(self.client.get(url)),
+            )
             .await
-            .map_err(reqwest::Error::without_url)
             .context(RequestSnafu)?;
         read_json_response(response).await
     }
@@ -216,11 +218,13 @@ impl TokenIndexerClient {
     ) -> Result<SyncWatchesResponse> {
         let url = self.base_url.join("watches").context(InvalidUrlSnafu)?;
         let response = self
-            .authorize(self.client.put(url))
-            .json(&SyncWatchesRequest { watches })
-            .send()
+            .send_request(
+                "PUT",
+                "/watches",
+                self.authorize(self.client.put(url))
+                    .json(&SyncWatchesRequest { watches }),
+            )
             .await
-            .map_err(reqwest::Error::without_url)
             .context(RequestSnafu)?;
         read_json_response(response).await
     }
@@ -230,14 +234,16 @@ impl TokenIndexerClient {
             .base_url
             .join("candidates/materialize")
             .context(InvalidUrlSnafu)?;
-        self.authorize(self.client.post(url))
-            .send()
-            .await
-            .map_err(reqwest::Error::without_url)
-            .context(RequestSnafu)?
-            .error_for_status()
-            .map_err(reqwest::Error::without_url)
-            .context(RequestSnafu)?;
+        self.send_request(
+            "POST",
+            "/candidates/materialize",
+            self.authorize(self.client.post(url)),
+        )
+        .await
+        .context(RequestSnafu)?
+        .error_for_status()
+        .map_err(reqwest::Error::without_url)
+        .context(RequestSnafu)?;
         Ok(())
     }
 
@@ -251,10 +257,12 @@ impl TokenIndexerClient {
                 .append_pair("limit", &limit.to_string());
         }
         let response = self
-            .authorize(self.client.get(url))
-            .send()
+            .send_request(
+                "GET",
+                "/candidates/pending",
+                self.authorize(self.client.get(url)),
+            )
             .await
-            .map_err(reqwest::Error::without_url)
             .context(RequestSnafu)?;
         let response = read_json_response::<PendingCandidatesResponse>(response).await?;
         Ok(response.candidates)
@@ -262,42 +270,48 @@ impl TokenIndexerClient {
 
     pub async fn mark_candidate_submitted(&self, candidate_id: &str) -> Result<()> {
         let url = self.candidate_action_url(candidate_id, "mark-submitted")?;
-        self.authorize(self.client.post(url))
-            .send()
-            .await
-            .map_err(reqwest::Error::without_url)
-            .context(RequestSnafu)?
-            .error_for_status()
-            .map_err(reqwest::Error::without_url)
-            .context(RequestSnafu)?;
+        self.send_request(
+            "POST",
+            "/candidates/:candidate_id/mark-submitted",
+            self.authorize(self.client.post(url)),
+        )
+        .await
+        .context(RequestSnafu)?
+        .error_for_status()
+        .map_err(reqwest::Error::without_url)
+        .context(RequestSnafu)?;
         Ok(())
     }
 
     pub async fn release_candidate(&self, candidate_id: &str, error: Option<String>) -> Result<()> {
         let url = self.candidate_action_url(candidate_id, "release")?;
-        self.authorize(self.client.post(url))
-            .json(&ReleaseCandidateRequest { error })
-            .send()
-            .await
-            .map_err(reqwest::Error::without_url)
-            .context(RequestSnafu)?
-            .error_for_status()
-            .map_err(reqwest::Error::without_url)
-            .context(RequestSnafu)?;
+        self.send_request(
+            "POST",
+            "/candidates/:candidate_id/release",
+            self.authorize(self.client.post(url))
+                .json(&ReleaseCandidateRequest { error }),
+        )
+        .await
+        .context(RequestSnafu)?
+        .error_for_status()
+        .map_err(reqwest::Error::without_url)
+        .context(RequestSnafu)?;
         Ok(())
     }
 
     pub async fn discard_candidate(&self, candidate_id: &str, error: Option<String>) -> Result<()> {
         let url = self.candidate_action_url(candidate_id, "discard")?;
-        self.authorize(self.client.post(url))
-            .json(&ReleaseCandidateRequest { error })
-            .send()
-            .await
-            .map_err(reqwest::Error::without_url)
-            .context(RequestSnafu)?
-            .error_for_status()
-            .map_err(reqwest::Error::without_url)
-            .context(RequestSnafu)?;
+        self.send_request(
+            "POST",
+            "/candidates/:candidate_id/discard",
+            self.authorize(self.client.post(url))
+                .json(&ReleaseCandidateRequest { error }),
+        )
+        .await
+        .context(RequestSnafu)?
+        .error_for_status()
+        .map_err(reqwest::Error::without_url)
+        .context(RequestSnafu)?;
         Ok(())
     }
 
@@ -317,6 +331,57 @@ impl TokenIndexerClient {
             Some(api_key) => request.bearer_auth(api_key),
             None => request,
         }
+    }
+
+    async fn send_request(
+        &self,
+        method: &'static str,
+        endpoint: &'static str,
+        request: RequestBuilder,
+    ) -> std::result::Result<reqwest::Response, reqwest::Error> {
+        let started = Instant::now();
+        match request.send().await.map_err(reqwest::Error::without_url) {
+            Ok(response) => {
+                record_upstream_request(
+                    method,
+                    endpoint,
+                    status_class(response.status()),
+                    started.elapsed(),
+                );
+                Ok(response)
+            }
+            Err(error) => {
+                record_upstream_request(method, endpoint, "transport_error", started.elapsed());
+                Err(error)
+            }
+        }
+    }
+}
+
+fn record_upstream_request(
+    method: &'static str,
+    endpoint: &'static str,
+    status_class: &'static str,
+    duration: Duration,
+) {
+    observability::upstream::record_upstream_request(
+        observability::upstream::UpstreamKind::SidecarService,
+        "evm_token_indexer",
+        method,
+        endpoint,
+        status_class,
+        duration,
+    );
+}
+
+fn status_class(status: StatusCode) -> &'static str {
+    match status.as_u16() {
+        100..=199 => "1xx",
+        200..=299 => "2xx",
+        300..=399 => "3xx",
+        400..=499 => "4xx",
+        500..=599 => "5xx",
+        _ => "unknown",
     }
 }
 

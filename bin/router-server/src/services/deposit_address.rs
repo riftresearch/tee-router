@@ -1,6 +1,6 @@
-use crate::protocol::{backend_chain_for_id, ChainId};
 use alloy::primitives::keccak256;
 use chains::ChainRegistry;
+use router_core::protocol::{backend_chain_for_id, ChainId};
 use snafu::Snafu;
 use uuid::Uuid;
 

@@ -12,6 +12,8 @@ reqwest = { version = "0.12.23", default-features = false, features = [
     "http2",
     "rustls-tls-webpki-roots",
 ] }
+metrics = { workspace = true }
+observability = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 snafu = { workspace = true }

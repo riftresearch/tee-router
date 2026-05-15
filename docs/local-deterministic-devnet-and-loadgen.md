@@ -45,7 +45,8 @@ docker compose -f etc/compose.local-full.yml down
 - The load generator should support quote-only, order-only, create-and-fund,
   rate-limited, and concurrent order creation flows.
 - Funding behavior should be configurable so the dashboard can show
-  `pending_funding`, funded/executing, completed, failed, and delayed states.
+  `pending_funding`, funded/executing, completed, manual intervention, refund,
+  expired, and delayed states.
 - Forced provider outcomes belong in provider mock configuration/state, not in
   hidden devnet scenario commands.
 - The admin dashboard should read the replica and display router orders sorted
@@ -112,6 +113,9 @@ The interactive devnet should reserve the following ports:
 - `devnet`
 - `router-postgres`
 - `router-postgres-replica`
+- `temporal-postgres`
+- `temporal`
+- `temporal-worker`
 - `router-api`
 - `router-worker`
 - `sauron-state-db`
@@ -130,6 +134,9 @@ The compose file should configure router services with local URLs:
 - `BITCOIN_RPC_URL=http://devnet:50100`
 - `ELECTRUM_HTTP_SERVER_URL=http://devnet:50110`
 - provider API URLs pointed at `http://devnet:50107`
+- `TEMPORAL_ADDRESS=http://temporal:7233`
+- shared order-execution task queue env for router-worker, router-api, and
+  temporal-worker
 - replica/admin URLs pointed at the local logical replica
 
 ## Load generator initial command shape
@@ -193,7 +200,8 @@ router-loadgen create-and-fund \
   we need the same private-key-only mode for Bitcoin that EVM already has.
 - The direct devnet server allocates a deterministic local-only EVM key pool for
   loadgen and exposes it in `accounts.loadgen_evm_accounts` in the manifest.
-  Loadgen should consume that pool instead of the Anvil/paymaster key.
+  Loadgen should consume that pool instead of the Anvil default key or the
+  router paymaster key.
 - Local state coverage starts with `pending_funding` and funded orders. Provider
   failure/delay coverage should be added by extending the provider mock state
   controls, not by adding devnet scenario commands.

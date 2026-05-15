@@ -45,18 +45,19 @@ type AppBindings = {
 const LOCAL_DEV_ADMIN_EMAIL = ALLOWED_ADMIN_EMAILS[0]
 const MAX_ORDER_LIMIT = 500
 const MAX_ORDER_CURSOR_LENGTH = 512
-const MAX_ANALYTICS_RANGE_BUCKETS = 20_000
+const MAX_ANALYTICS_RANGE_BUCKETS = 130_000
 const MAX_ANALYTICS_TIMESTAMP_LENGTH = 64
 export const MAX_SSE_PENDING_EVENTS = 1_000
 export const MAX_SSE_BACKPRESSURE_CHUNKS = 256
 const ORDER_CURSOR_BASE64URL_PATTERN = /^[A-Za-z0-9_-]+$/
 const ORDER_CURSOR_CREATED_AT_MAX_LENGTH = 64
 const ANALYTICS_BUCKET_SIZE_MS: Record<VolumeBucketSize, number> = {
+  five_minute: 5 * 60_000,
   minute: 60_000,
   hour: 60 * 60_000,
   day: 24 * 60 * 60_000
 }
-const SSE_HEARTBEAT_MS = 15_000
+const SSE_HEARTBEAT_MS = 5_000
 
 type OrderStreamMetricsEvent = {
   kind: 'metrics'
@@ -541,9 +542,9 @@ function parseOrderLifecycleFilter(
   if (!value || value === 'firehose') return undefined
   if (
     value === 'in_progress' ||
-    value === 'failed' ||
-    value === 'refunded' ||
-    value === 'manual_refund'
+    value === 'needs_attention' ||
+    value === 'expired' ||
+    value === 'refunded'
   ) {
     return value
   }
@@ -563,7 +564,7 @@ function parseBooleanQuery(
 function parseVolumeBucketSize(
   value: string | undefined
 ): VolumeBucketSize | Response {
-  if (value === 'minute' || value === 'hour' || value === 'day') return value
+  if (value === 'five_minute' || value === 'hour' || value === 'day') return value
   return Response.json({ error: 'invalid_volume_bucket_size' }, { status: 400 })
 }
 
@@ -691,8 +692,9 @@ export function createOrderEventStream(
     resolveClosed = resolve
   })
 
-  const stream = new ReadableStream<Uint8Array>({
-    start(controller) {
+  const stream = new ReadableStream<Uint8Array>(
+    {
+      start(controller) {
       const close = () => {
         if (closed) return
         closed = true
@@ -861,23 +863,28 @@ export function createOrderEventStream(
       }
 
       void loop()
+      },
+      cancel() {
+        if (!closed) {
+          closed = true
+          resolveClosed()
+        }
+        unsubscribe?.()
+        if (heartbeat) {
+          clearInterval(heartbeat)
+          heartbeat = undefined
+        }
+        if (abortListener) {
+          signal.removeEventListener('abort', abortListener)
+          abortListener = undefined
+        }
+      }
     },
-    cancel() {
-      if (!closed) {
-        closed = true
-        resolveClosed()
-      }
-      unsubscribe?.()
-      if (heartbeat) {
-        clearInterval(heartbeat)
-        heartbeat = undefined
-      }
-      if (abortListener) {
-        signal.removeEventListener('abort', abortListener)
-        abortListener = undefined
-      }
+    {
+      highWaterMark: 1,
+      size: () => 1
     }
-  })
+  )
 
   return new Response(stream, {
     headers: {
