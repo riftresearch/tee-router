@@ -1519,10 +1519,49 @@ async fn wait_for_provider_completion_hint(
 ) -> WorkflowResult<ProviderCompletionWait> {
     let wait_started_at = provider_hint_wait_started(ctx);
 
-    loop {
-        temporalio_sdk::workflows::select! {
-            _ = ctx.wait_condition(move |state: &OrderWorkflow| state.has_provider_operation_hint(order_id, step_id)) => {
-                let signal = ctx
+    // Single-timer restructure (see also the analogous refund site). The old
+    // shape was `loop { select! { hint_arm, _ = ctx.timer(T) => timeout } }`,
+    // which armed a NEW 2h timer on every loop iteration. The hint loop
+    // iterates once per *deferred* hint (the observe->credit / acknowledged->
+    // settled two-phase pattern produces 2-4 deferred hints per step), and the
+    // SDK has no Drop hook, so every abandoned timer stayed armed in Temporal
+    // mutable state until workflow close: a ~2-4x per-step timer leak.
+    //
+    // We now arm the timer exactly ONCE and run the deferred-hint loop inside
+    // the work arm of a single `select!`. The inner `continue` on Defer/Reject
+    // stays inside the inner async loop, so it never re-enters `select!` and
+    // never arms a new timer. Every call inside the work loop
+    // (`wait_condition`, `state_mut`, the `start_activity` the
+    // `verify_hint_activity!` macro expands to) takes `&self` on the SDK
+    // context (verified against temporalio-sdk 0.4.0 workflow_context.rs), so
+    // the inner future can borrow `&*ctx` shared without colliding with the
+    // timer future's held `&ctx` borrow. On Accept the timer is still in scope
+    // and is explicitly `.cancel()`ed -> emits CancelTimer, server frees it
+    // immediately: ZERO leak on the happy path. On timeout the timer future is
+    // consumed by `select!` and its `&ctx` borrow released before the timeout
+    // handler runs, so the `&mut ctx` escalation helper is allowed.
+    //
+    // The timer + `select!` + Accept handling live in an inner block. The
+    // `ctx.timer()` future holds a `&ctx` borrow for its whole lifetime (the
+    // SDK signature lacks a precise-capturing bound). Scoping it to this block
+    // means: on Accept we `.cancel()` and the timer drops at block end
+    // (CancelTimer emitted, zero leak); on timeout the block returns and the
+    // timer future is dropped HERE, releasing the `&ctx` borrow *before* the
+    // `&mut ctx` escalation helper runs below. The Accept path only needs
+    // shared `&ctx` (`record_provider_hint_wait`), so it completes entirely
+    // inside the block.
+    let wait_outcome = {
+        let hint_timeout = ctx.timer(PROVIDER_HINT_WAIT_TIMEOUT);
+        futures_util::pin_mut!(hint_timeout);
+        let ctx_ref: &WorkflowContext<OrderWorkflow> = ctx;
+        let hint_work = async {
+            loop {
+                ctx_ref
+                    .wait_condition(move |state: &OrderWorkflow| {
+                        state.has_provider_operation_hint(order_id, step_id)
+                    })
+                    .await;
+                let signal = ctx_ref
                     .state_mut(|state| state.pop_provider_operation_hint(order_id, step_id))
                     .expect("provider operation hint condition was satisfied");
                 let hint_kind = signal.hint_kind;
@@ -1533,7 +1572,7 @@ async fn wait_for_provider_completion_hint(
                     signal,
                 };
                 let verified = crate::verify_hint_activity!(
-                    ctx,
+                    ctx_ref,
                     hint_kind,
                     verify_input,
                     db_activity_options.clone()
@@ -1542,15 +1581,10 @@ async fn wait_for_provider_completion_hint(
 
                 match verified.decision {
                     ProviderOperationHintDecision::Accept => {
-                        record_provider_hint_wait(
-                            ctx,
-                            ORDER_WORKFLOW_TYPE,
-                            wait_started_at,
-                            "signal_accept",
-                        );
-                        return Ok(ProviderCompletionWait::Completed);
+                        return WorkflowResult::<()>::Ok(());
                     }
-                    ProviderOperationHintDecision::Reject | ProviderOperationHintDecision::Defer => {
+                    ProviderOperationHintDecision::Reject
+                    | ProviderOperationHintDecision::Defer => {
                         tracing::info!(
                             order_id = %order_id,
                             step_id = %step_id,
@@ -1561,33 +1595,67 @@ async fn wait_for_provider_completion_hint(
                             event_name = "provider_operation_hint.ignored",
                             "provider_operation_hint.ignored"
                         );
+                        // SAME timer: no new timer armed on a deferred hint.
                     }
                 }
             }
-            _ = ctx.timer(PROVIDER_HINT_WAIT_TIMEOUT) => {
-                let resolution = wait_for_manual_intervention_resolution(
-                    ctx,
-                    order_id,
-                    attempt_id,
-                    step_id,
-                    json!({
-                        "reason": "provider_operation_hint_wait_timeout",
-                        "step_id": step_id,
-                    }),
-                    db_activity_options.clone(),
-                    funded_to_workflow_start_seconds,
-                )
-                .await?;
+        };
+        use futures_util::FutureExt;
+        let hint_work = hint_work.fuse();
+        futures_util::pin_mut!(hint_work);
+        let outcome = temporalio_sdk::workflows::select! {
+            _ = hint_timeout.as_mut() => HintWaitOutcome::TimedOut,
+            res = hint_work => HintWaitOutcome::Accepted(res),
+        };
+        match outcome {
+            HintWaitOutcome::Accepted(res) => {
+                res?;
+                // Timer still in scope -> emit CancelTimer (zero leak on accept).
+                hint_timeout.cancel();
                 record_provider_hint_wait(
                     ctx,
                     ORDER_WORKFLOW_TYPE,
                     wait_started_at,
-                    "timeout_manual_intervention",
+                    "signal_accept",
                 );
-                return Ok(ProviderCompletionWait::ManualInterventionRequired { resolution });
+                HintWaitOutcome::Accepted(Ok(()))
             }
+            HintWaitOutcome::TimedOut => HintWaitOutcome::TimedOut,
+        }
+    };
+
+    match wait_outcome {
+        HintWaitOutcome::Accepted(_) => Ok(ProviderCompletionWait::Completed),
+        HintWaitOutcome::TimedOut => {
+            // Timer future was dropped at the inner block's end, so its `&ctx`
+            // borrow is released here and the `&mut ctx` escalation is allowed.
+            let resolution = wait_for_manual_intervention_resolution(
+                ctx,
+                order_id,
+                attempt_id,
+                step_id,
+                json!({
+                    "reason": "provider_operation_hint_wait_timeout",
+                    "step_id": step_id,
+                }),
+                db_activity_options.clone(),
+                funded_to_workflow_start_seconds,
+            )
+            .await?;
+            record_provider_hint_wait(
+                ctx,
+                ORDER_WORKFLOW_TYPE,
+                wait_started_at,
+                "timeout_manual_intervention",
+            );
+            Ok(ProviderCompletionWait::ManualInterventionRequired { resolution })
         }
     }
+}
+
+enum HintWaitOutcome {
+    Accepted(WorkflowResult<()>),
+    TimedOut,
 }
 
 #[cfg(test)]
@@ -1691,6 +1759,54 @@ mod tests {
                 branch,
             );
         }
+    }
+
+    /// Guards the single-timer hint-wait invariant. The available test harness
+    /// has no in-process command-stream introspection (the only integration
+    /// test is a full-devnet happy path; the lib tests are source/pure-logic),
+    /// so this asserts the structural guarantee that produces the
+    /// "one TimerStarted + one CancelTimer per wait" command shape: the
+    /// `PROVIDER_HINT_WAIT_TIMEOUT` timer is armed exactly once and OUTSIDE the
+    /// deferred-hint loop (the old per-iteration arming was the leak), and the
+    /// accept path explicitly `.cancel()`s it.
+    #[test]
+    fn hint_wait_arms_timer_once_outside_loop_and_cancels_on_accept() {
+        let source = workflow_implementation_source();
+        let (_, after) = source
+            .split_once("async fn wait_for_provider_completion_hint(")
+            .expect("wait_for_provider_completion_hint should be present");
+        // This is the last async fn before the cfg(test) module, so the
+        // function body runs to the end of the (test-stripped) source.
+        let fn_body = after
+            .split_once("\nasync fn ")
+            .map(|(body, _)| body)
+            .unwrap_or(after);
+
+        let timer_arms = fn_body
+            .matches("ctx.timer(PROVIDER_HINT_WAIT_TIMEOUT)")
+            .count();
+        assert_eq!(
+            timer_arms, 1,
+            "hint-wait must arm exactly one PROVIDER_HINT_WAIT_TIMEOUT timer (was per-deferred-hint)"
+        );
+
+        // The timer must be created before the deferred-hint loop, not inside
+        // it. The inner work loop body starts at `let hint_work = async {`;
+        // there must be no timer arming anywhere from there onward.
+        let work_loop_offset = fn_body
+            .find("let hint_work = async {")
+            .expect("deferred-hint work loop present");
+        let after_loop = &fn_body[work_loop_offset..];
+        assert!(
+            !after_loop.contains("ctx.timer(PROVIDER_HINT_WAIT_TIMEOUT)"),
+            "the single timer must be armed BEFORE the deferred-hint loop, never inside it"
+        );
+
+        // Accept path must explicitly cancel the still-in-scope timer.
+        assert!(
+            fn_body.contains("hint_timeout.cancel()"),
+            "accept path must cancel the timer to emit CancelTimer (zero leak on accept)"
+        );
     }
 
     fn workflow_implementation_source() -> &'static str {
