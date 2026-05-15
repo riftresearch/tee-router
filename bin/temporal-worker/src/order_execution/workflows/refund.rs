@@ -678,4 +678,3 @@ enum RefundHintWaitOutcome {
     Accepted(WorkflowResult<()>),
     TimedOut,
 }
-

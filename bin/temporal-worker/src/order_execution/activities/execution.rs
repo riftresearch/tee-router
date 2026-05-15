@@ -106,18 +106,15 @@ impl OrderActivities {
         _ctx: ActivityContext,
         input: DispatchStepInput,
     ) -> Result<StepDispatched, ActivityError> {
-        record_activity(
-            "dispatch_hyperliquid_bridge_withdrawal_step",
-            async move {
-                let deps = self.deps()?;
-                run_step_dispatch(
-                    &deps,
-                    input,
-                    OrderExecutionStepType::HyperliquidBridgeWithdrawal,
-                )
-                .await
-            },
-        )
+        record_activity("dispatch_hyperliquid_bridge_withdrawal_step", async move {
+            let deps = self.deps()?;
+            run_step_dispatch(
+                &deps,
+                input,
+                OrderExecutionStepType::HyperliquidBridgeWithdrawal,
+            )
+            .await
+        })
         .await
     }
 

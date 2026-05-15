@@ -26,7 +26,14 @@ pub fn record_upstream_http_status(
     status: u16,
     duration: Duration,
 ) {
-    record_upstream_request(kind, service, method, endpoint, status_class(status), duration);
+    record_upstream_request(
+        kind,
+        service,
+        method,
+        endpoint,
+        status_class(status),
+        duration,
+    );
 }
 
 pub fn record_upstream_transport_error(
