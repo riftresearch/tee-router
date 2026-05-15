@@ -1102,37 +1102,46 @@ async fn unit_deposit_retry_reuses_existing_protocol_address_without_second_gen_
 }
 
 #[tokio::test]
-async fn unit_deposit_different_source_vaults_use_different_idempotency_keys() {
+async fn unit_deposit_idempotency_key_collapses_retry_attempts_onto_same_operation() {
+    // Under the uniform `(order_id, step_type, step_index)` key shape, a retry
+    // attempt re-enters with a different `step_id` / `attempt_id` but the same
+    // `(order_id, step_index)` and therefore the same idempotency key. This is
+    // the whole point of the guard: the second dispatch must short-circuit on
+    // the first attempt's persisted operation rather than fire a second `/gen`
+    // and a second on-chain transfer — even if other request fields (like the
+    // source custody vault id) happen to differ.
     let test_db = test_database().await;
     let first_vault_id = Uuid::now_v7();
-    let second_vault_id = Uuid::now_v7();
-    let (first_step, second_step) =
-        seed_unit_deposit_retry_steps(&test_db.db, &test_db.pool, first_vault_id, second_vault_id)
+    let retry_vault_id = Uuid::now_v7();
+    let (first_step, retry_step) =
+        seed_unit_deposit_retry_steps(&test_db.db, &test_db.pool, first_vault_id, retry_vault_id)
             .await;
     let (deps, gen_calls, transfer_actions_built) =
         unit_deposit_idempotency_test_deps(test_db.db.clone());
     let first_key = unit_deposit_expected_idempotency_key(&first_step, first_vault_id);
-    let second_key = unit_deposit_expected_idempotency_key(&second_step, second_vault_id);
+    let retry_key = unit_deposit_expected_idempotency_key(&retry_step, retry_vault_id);
+
+    assert_eq!(
+        first_key, retry_key,
+        "uniform key shape must collapse retries onto the same idempotency key"
+    );
 
     execute_unit_deposit_step(&deps, &first_step)
         .await
         .expect("execute first unit deposit dispatch");
-    execute_unit_deposit_step(&deps, &second_step)
+    let retry_result = execute_unit_deposit_step(&deps, &retry_step)
         .await
-        .expect("execute second unit deposit dispatch");
+        .expect("execute retry unit deposit dispatch");
 
-    assert_ne!(first_key, second_key);
-    assert_eq!(gen_calls.load(Ordering::SeqCst), 2);
-    assert_eq!(transfer_actions_built.load(Ordering::SeqCst), 2);
+    assert_eq!(gen_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(transfer_actions_built.load(Ordering::SeqCst), 1);
+    let StepDispatchResult::Complete(_) = retry_result else {
+        panic!("retry dispatch must short-circuit on the first attempt's operation");
+    };
     let first_operation = load_unit_deposit_operation(&test_db.db, &first_key).await;
-    let second_operation = load_unit_deposit_operation(&test_db.db, &second_key).await;
     assert_eq!(
         first_operation.provider_ref.as_deref(),
         Some("0x0000000000000000000000000000000000000001")
-    );
-    assert_eq!(
-        second_operation.provider_ref.as_deref(),
-        Some("0x0000000000000000000000000000000000000002")
     );
 }
 
@@ -3571,10 +3580,10 @@ fn unit_deposit_idempotency_test_deps(
     (deps, gen_calls, transfer_actions_built)
 }
 
-fn unit_deposit_expected_idempotency_key(step: &OrderExecutionStep, vault_id: Uuid) -> String {
+fn unit_deposit_expected_idempotency_key(step: &OrderExecutionStep, _vault_id: Uuid) -> String {
     format!(
-        "order:{}:unit_deposit:step:{}:source_custody_vault:{}",
-        step.order_id, step.step_index, vault_id
+        "order:{}:unit_deposit:step:{}",
+        step.order_id, step.step_index,
     )
 }
 

@@ -365,6 +365,7 @@ impl OrderActivities {
 mod execution;
 mod hint;
 mod hydration;
+mod idempotent_step;
 mod refresh;
 mod refund;
 mod refund_builders;
@@ -378,6 +379,7 @@ pub use self::refund::RefundActivities;
 
 use self::execution::*;
 use self::hydration::*;
+use self::idempotent_step::*;
 use self::refresh::*;
 use self::refund::*;
 use self::refund_builders::*;
