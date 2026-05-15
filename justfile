@@ -196,6 +196,13 @@ router-loadgen-limit count='100' concurrency='64' rps='5' min_raw_amount='100000
       --bitcoin-rpc-url http://localhost:50100/wallet/alice \
       --bitcoin-rpc-auth devnet:devnet
 
+
+test-stack:
+  just dc down -v
+  just dc up -d --build
+  just router-loadgen 1
+
+
 # Inspect test-wallet balances across local EVM chains, Hyperliquid, and Bitcoin.
 # Examples:
 #   just wallet-balance --address 0x1111111111111111111111111111111111111111
