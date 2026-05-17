@@ -60,5 +60,3 @@ cargo run -p temporal-worker -- worker
 Market-order quoting and execution are composed from provider-specific adapters inside the router. Configure provider base URLs with `ACROSS_API_URL`, `HYPERUNIT_API_URL`, and `HYPERLIQUID_API_URL`.
 
 The current HTTP adapters and mock integrators exercise the router provider contract. They are not yet sufficient to point directly at real money provider APIs. Track the live-money readiness checklist in `docs/live-real-money-readiness.md` before running a funded route.
-
-Temporary remote rewrite test marker.
