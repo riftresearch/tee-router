@@ -1,10 +1,4 @@
-use std::{
-    net::{SocketAddr, TcpStream},
-    process::Command,
-    str::FromStr,
-    sync::Arc,
-    time::Duration,
-};
+use std::{str::FromStr, sync::Arc, time::Duration};
 
 use alloy::{
     network::{EthereumWallet, TransactionBuilder},
@@ -53,6 +47,7 @@ use router_server::{
     services::{order_manager::OrderManager, vault_manager::VaultManager},
 };
 use router_temporal::{CctpReceiveObservedEvidence, VeloraSwapSettledEvidence};
+use router_test_support::temporal::TestTemporal;
 use serde_json::{json, Value};
 use sqlx_core::connection::Connection;
 use sqlx_postgres::{PgConnectOptions, PgConnection, PgPool};
@@ -1536,7 +1531,7 @@ async fn order_workflow_refresh_multi_leg_untenable_routes_to_refund() {
 }
 
 async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
-    ensure_temporal_up();
+    let mut temporal = TestTemporal::start().await;
 
     let postgres = test_postgres().await;
     let database_url = create_test_database(&postgres.admin_database_url).await;
@@ -1751,7 +1746,7 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
 
     let task_queue = format!("{DEFAULT_TASK_QUEUE}-{}", Uuid::now_v7());
     let connection = TemporalConnection {
-        temporal_address: "http://127.0.0.1:7233".to_string(),
+        temporal_address: temporal.temporal_address().to_string(),
         namespace: "default".to_string(),
     };
     let activity_deps = OrderActivityDeps::new(
@@ -2111,6 +2106,7 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
         Address::from_str(&valid_evm_address()).expect("valid refund address"),
     )
     .await;
+    temporal.shutdown().await;
 
     WorkflowRun {
         _postgres: postgres,
@@ -2195,19 +2191,6 @@ async fn seed_manual_intervention_state(
         .mark_order_manual_intervention_required(order_id, now)
         .await
         .expect("mark manual intervention seed order");
-}
-
-fn ensure_temporal_up() {
-    let local_temporal = SocketAddr::from(([127, 0, 0, 1], 7233));
-    if TcpStream::connect_timeout(&local_temporal, Duration::from_millis(500)).is_ok() {
-        return;
-    }
-
-    let status = Command::new("just")
-        .arg("temporal-up")
-        .status()
-        .expect("run `just temporal-up`; install just or start Temporal manually");
-    assert!(status.success(), "`just temporal-up` failed with {status}");
 }
 
 async fn test_postgres() -> TestPostgres {

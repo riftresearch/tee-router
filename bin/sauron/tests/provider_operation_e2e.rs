@@ -2,9 +2,8 @@ use std::{
     env,
     error::Error,
     future::Future,
-    net::{IpAddr, SocketAddr, TcpStream},
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
-    process::Command,
     str::FromStr,
     sync::OnceLock,
     time::{Duration, Instant},
@@ -66,6 +65,7 @@ use router_server::{
     RouterServerArgs,
 };
 use router_temporal::{OrderWorkflowClient, TemporalConnection as RouterTemporalConnection};
+use router_test_support::temporal::TestTemporal;
 use sauron::discovery::{evm_indexer::EvmIndexerDiscoveryBackend, DiscoveryBackend};
 use sauron::{run as run_sauron, SauronArgs};
 use serde_json::{json, Value};
@@ -1016,19 +1016,6 @@ fn order_worker_runtime_args_from_router_args(args: &RouterServerArgs) -> OrderW
     }
 }
 
-fn ensure_temporal_up() {
-    let local_temporal = SocketAddr::from(([127, 0, 0, 1], 7233));
-    if TcpStream::connect_timeout(&local_temporal, Duration::from_millis(500)).is_ok() {
-        return;
-    }
-
-    let status = Command::new("just")
-        .arg("temporal-up")
-        .status()
-        .expect("run `just temporal-up`; install just or start Temporal manually");
-    assert!(status.success(), "`just temporal-up` failed with {status}");
-}
-
 async fn reserve_local_port() -> u16 {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -1073,6 +1060,7 @@ fn router_args(
     config_dir: &std::path::Path,
     database_url: String,
     chain_tokens: RuntimeChainTokens,
+    temporal_address: &str,
     mocks: &MockIntegratorServer,
 ) -> RouterServerArgs {
     RouterServerArgs {
@@ -1129,7 +1117,7 @@ fn router_args(
         hyperliquid_account_address: None,
         hyperliquid_vault_address: None,
         hyperliquid_paymaster_private_key: Some(test_hyperliquid_paymaster_private_key()),
-        temporal_address: "http://127.0.0.1:7233".to_string(),
+        temporal_address: temporal_address.to_string(),
         temporal_namespace: "default".to_string(),
         temporal_task_queue: format!("tee-router-order-execution-{}", Uuid::now_v7()),
         router_detector_api_key: Some(ROUTER_DETECTOR_API_KEY.to_string()),
@@ -1157,6 +1145,7 @@ fn live_router_args(
     config_dir: &std::path::Path,
     database_url: String,
     chain_tokens: RuntimeChainTokens,
+    temporal_address: &str,
     live: &LiveRuntimeConfig,
 ) -> RouterServerArgs {
     RouterServerArgs {
@@ -1204,7 +1193,7 @@ fn live_router_args(
         hyperliquid_account_address: live.hyperliquid_account_address.clone(),
         hyperliquid_vault_address: live.hyperliquid_vault_address.clone(),
         hyperliquid_paymaster_private_key: None,
-        temporal_address: "http://127.0.0.1:7233".to_string(),
+        temporal_address: temporal_address.to_string(),
         temporal_namespace: "default".to_string(),
         temporal_task_queue: format!("tee-router-order-execution-{}", Uuid::now_v7()),
         router_detector_api_key: Some(ROUTER_DETECTOR_API_KEY.to_string()),
@@ -2603,7 +2592,14 @@ async fn run_live_runtime_route(route: RuntimeRoute) {
     let state_database_url = create_test_database(&postgres.admin_database_url).await;
     let config_dir = tempfile::tempdir().expect("router live config dir");
     let chain_tokens = live_route_chain_tokens(route);
-    let args = live_router_args(config_dir.path(), database_url.clone(), chain_tokens, &live);
+    let mut temporal = TestTemporal::start().await;
+    let args = live_router_args(
+        config_dir.path(),
+        database_url.clone(),
+        chain_tokens,
+        temporal.temporal_address(),
+        &live,
+    );
     let worker_config = RouterWorkerConfig::from_args(&args).expect("live worker config");
     let worker_components = initialize_components(
         &args,
@@ -2615,7 +2611,6 @@ async fn run_live_runtime_route(route: RuntimeRoute) {
     let db = worker_components.db.clone();
     let chain_registry = worker_components.chain_registry.clone();
     let (router_base_url, _api_task) = spawn_router_api(args.clone()).await;
-    ensure_temporal_up();
     let mut temporal_worker_task = spawn_temporal_order_worker(&args).await;
     let order_workflow_client = std::sync::Arc::new(
         OrderWorkflowClient::connect(
@@ -2789,6 +2784,7 @@ async fn run_live_runtime_route(route: RuntimeRoute) {
         "all provider operations should be completed for a successful live route"
     );
     temporal_worker_task.abort_and_join().await;
+    temporal.shutdown().await;
     postgres.shutdown().await;
 }
 
@@ -2831,11 +2827,13 @@ async fn run_mock_runtime_route(route: RuntimeRoute) {
     let config_dir = tempfile::tempdir().expect("router config dir");
     let mocks = spawn_runtime_mocks(&devnet, route).await;
     let chain_tokens = route_chain_tokens(route);
+    let mut temporal = TestTemporal::start().await;
     let args = router_args(
         &devnet,
         config_dir.path(),
         database_url.clone(),
         chain_tokens,
+        temporal.temporal_address(),
         &mocks,
     );
     let worker_config = RouterWorkerConfig::from_args(&args).expect("worker config");
@@ -2848,7 +2846,6 @@ async fn run_mock_runtime_route(route: RuntimeRoute) {
     .expect("initialize worker components");
     let db = worker_components.db.clone();
     let (router_base_url, _api_task) = spawn_router_api(args.clone()).await;
-    ensure_temporal_up();
     let (hl_shim_base_url, _hl_shim_task) =
         spawn_hl_shim_indexer(&hl_shim_database_url, mocks.base_url()).await;
     let (bitcoin_observer_urls, _bitcoin_observer_tasks) = spawn_bitcoin_observers(&devnet).await;
@@ -3093,6 +3090,7 @@ async fn run_mock_runtime_route(route: RuntimeRoute) {
     );
     assert_eq!(withdrawal_ops.len(), 1);
     temporal_worker_task.abort_and_join().await;
+    temporal.shutdown().await;
     postgres.shutdown().await;
 }
 

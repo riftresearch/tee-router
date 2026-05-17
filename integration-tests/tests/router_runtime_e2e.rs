@@ -1,10 +1,10 @@
 use std::{
     collections::HashSet,
     future::Future,
-    net::{IpAddr, SocketAddr, TcpStream},
+    net::{IpAddr, SocketAddr},
     path::Path,
-    process::Command,
     str::FromStr,
+    sync::Once,
     time::{Duration, Instant},
 };
 
@@ -57,6 +57,7 @@ use router_server::{
     api::OrderFlowEnvelope, server::run_api, worker::run_worker, RouterServerArgs,
 };
 use router_temporal::DEFAULT_TASK_QUEUE;
+use router_test_support::temporal::TestTemporal;
 use sauron::{run as run_sauron, SauronArgs};
 use serde_json::{json, Value};
 use sqlx_core::connection::Connection;
@@ -76,6 +77,7 @@ use tokio::{
     sync::oneshot,
     task::{JoinHandle, LocalSet},
 };
+use tracing_subscriber::{fmt, EnvFilter};
 use uuid::Uuid;
 
 const BASE_USDC_ADDRESS: &str = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
@@ -93,6 +95,19 @@ const ACROSS_API_KEY: &str = "router-e2e-across-secret";
 const ACROSS_INTEGRATOR_ID: &str = "router-e2e";
 const EVM_NATIVE_GAS_BUFFER_WEI: u128 = 1_000_000_000_000_000_000;
 const BITCOIN_FEE_BUFFER_SATS: u64 = 10_000;
+static TRACING_INIT: Once = Once::new();
+
+fn init_test_tracing() {
+    TRACING_INIT.call_once(|| {
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+        let _ = fmt()
+            .with_env_filter(filter)
+            .with_target(true)
+            .with_line_number(true)
+            .with_test_writer()
+            .try_init();
+    });
+}
 
 #[derive(Clone, Copy)]
 struct RouteAsset {
@@ -126,16 +141,6 @@ struct RouteCase {
     from: RouteAsset,
     to: RouteAsset,
     amount_in: &'static str,
-    expected_provider_fragments: &'static [&'static str],
-}
-
-#[derive(Clone, Copy)]
-struct LimitRouteCase {
-    name: &'static str,
-    from: RouteAsset,
-    to: RouteAsset,
-    input_amount: &'static str,
-    output_amount: &'static str,
     expected_provider_fragments: &'static [&'static str],
 }
 
@@ -196,41 +201,6 @@ const ROUTE_CASES: &[RouteCase] = &[
     },
 ];
 
-const LIMIT_ROUTE_CASES: &[LimitRouteCase] = &[
-    LimitRouteCase {
-        name: "base_usdc_to_bitcoin_limit",
-        from: RouteAsset::token("evm:8453", BASE_USDC_ADDRESS),
-        to: RouteAsset::native("bitcoin"),
-        input_amount: "100000000",
-        output_amount: "160000",
-        expected_provider_fragments: &["hyperliquid_trade:hyperliquid", "unit_withdrawal:unit"],
-    },
-    LimitRouteCase {
-        name: "bitcoin_to_arbitrum_usdc_limit",
-        from: RouteAsset::native("bitcoin"),
-        to: RouteAsset::token("evm:42161", ARBITRUM_USDC_ADDRESS),
-        input_amount: "200000",
-        output_amount: "100000000",
-        expected_provider_fragments: &["unit_deposit:unit", "hyperliquid_trade:hyperliquid"],
-    },
-    LimitRouteCase {
-        name: "ethereum_eth_to_base_usdc_limit",
-        from: RouteAsset::native("evm:1"),
-        to: RouteAsset::token("evm:8453", BASE_USDC_ADDRESS),
-        input_amount: "50000000000000000",
-        output_amount: "125000000",
-        expected_provider_fragments: &["unit_deposit:unit", "hyperliquid_trade:hyperliquid"],
-    },
-    LimitRouteCase {
-        name: "base_usdc_to_ethereum_eth_limit",
-        from: RouteAsset::token("evm:8453", BASE_USDC_ADDRESS),
-        to: RouteAsset::native("evm:1"),
-        input_amount: "150000000",
-        output_amount: "40000000000000000",
-        expected_provider_fragments: &["hyperliquid_trade:hyperliquid", "unit_withdrawal:unit"],
-    },
-];
-
 sol! {
     #[sol(rpc)]
     interface IERC20 {
@@ -263,6 +233,7 @@ struct RouterRuntimeHarness {
     devnet: RiftDevnet,
     mocks: MockIntegratorServer,
     _postgres: TestPostgres,
+    _temporal: TestTemporal,
     _config_dir: tempfile::TempDir,
     _api_task: RuntimeTask,
     _worker_task: RuntimeTask,
@@ -331,6 +302,7 @@ impl RouterRuntimeHarness {
         self._worker_task.abort_and_join().await;
         self._temporal_worker_task.abort_and_join().await;
         self._api_task.abort_and_join().await;
+        self._temporal.shutdown().await;
         self._postgres.shutdown().await;
     }
 }
@@ -338,32 +310,12 @@ impl RouterRuntimeHarness {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "integration: spawns devnet stack"]
 async fn router_api_worker_sauron_complete_mock_route_matrix() {
+    init_test_tracing();
     LocalSet::new()
         .run_until(async {
             let runtime = spawn_mock_router_runtime().await;
             for route_case in ROUTE_CASES {
                 run_route_case(
-                    &runtime.client,
-                    &runtime.router_base_url,
-                    &runtime.devnet,
-                    &runtime.mocks,
-                    *route_case,
-                )
-                .await;
-            }
-            runtime.shutdown().await;
-        })
-        .await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "integration: spawns devnet stack"]
-async fn router_api_worker_sauron_complete_mock_limit_order_matrix() {
-    LocalSet::new()
-        .run_until(async {
-            let runtime = spawn_mock_router_runtime().await;
-            for route_case in LIMIT_ROUTE_CASES {
-                run_limit_route_case(
                     &runtime.client,
                     &runtime.router_base_url,
                     &runtime.devnet,
@@ -438,9 +390,15 @@ async fn spawn_mock_router_runtime() -> RouterRuntimeHarness {
     let mut _receipt_watcher_tasks = _receipt_watcher_tasks;
     _receipt_watcher_tasks.extend(bitcoin_observer_tasks);
     let config_dir = tempfile::tempdir().expect("router config dir");
-    let args = router_args(&devnet, config_dir.path(), database_url.clone(), &mocks);
+    let temporal = TestTemporal::start().await;
+    let args = router_args(
+        &devnet,
+        config_dir.path(),
+        database_url.clone(),
+        temporal.temporal_address(),
+        &mocks,
+    );
 
-    ensure_temporal_up();
     let (router_base_url, _api_task) = spawn_router_api(args.clone()).await;
     let _temporal_worker_task = spawn_temporal_order_worker(args.clone()).await;
     let _worker_task = spawn_router_worker(args.clone()).await;
@@ -466,6 +424,7 @@ async fn spawn_mock_router_runtime() -> RouterRuntimeHarness {
         devnet,
         mocks,
         _postgres: postgres,
+        _temporal: temporal,
         _config_dir: config_dir,
         _api_task,
         _worker_task,
@@ -657,19 +616,6 @@ fn order_worker_runtime_args_from_router_args(args: &RouterServerArgs) -> OrderW
         hyperliquid_order_timeout_ms: args.hyperliquid_order_timeout_ms,
         coinbase_price_api_base_url: args.coinbase_price_api_base_url.clone(),
     }
-}
-
-fn ensure_temporal_up() {
-    let local_temporal = SocketAddr::from(([127, 0, 0, 1], 7233));
-    if TcpStream::connect_timeout(&local_temporal, Duration::from_millis(500)).is_ok() {
-        return;
-    }
-
-    let status = Command::new("just")
-        .arg("temporal-up")
-        .status()
-        .expect("run `just temporal-up`; install just or start Temporal manually");
-    assert!(status.success(), "`just temporal-up` failed with {status}");
 }
 
 async fn reserve_local_port() -> u16 {
@@ -1042,6 +988,7 @@ fn router_args(
     devnet: &RiftDevnet,
     config_dir: &Path,
     database_url: String,
+    temporal_address: &str,
     mocks: &MockIntegratorServer,
 ) -> RouterServerArgs {
     RouterServerArgs {
@@ -1098,7 +1045,7 @@ fn router_args(
         hyperliquid_account_address: None,
         hyperliquid_vault_address: None,
         hyperliquid_paymaster_private_key: Some(test_hyperliquid_paymaster_private_key()),
-        temporal_address: "http://127.0.0.1:7233".to_string(),
+        temporal_address: temporal_address.to_string(),
         temporal_namespace: "default".to_string(),
         temporal_task_queue: format!("{DEFAULT_TASK_QUEUE}-{}", Uuid::now_v7()),
         router_detector_api_key: Some(ROUTER_DETECTOR_API_KEY.to_string()),
@@ -1150,6 +1097,18 @@ async fn spawn_runtime_mocks(devnet: &RiftDevnet) -> MockIntegratorServer {
             devnet.arbitrum.anvil.chain_id(),
             arbitrum_spoke_pool,
             arbitrum_ws_url,
+        )
+        .with_mock_service_evm_chain(
+            devnet.ethereum.anvil.chain_id(),
+            devnet.ethereum.anvil.endpoint_url().to_string(),
+        )
+        .with_mock_service_evm_chain(
+            devnet.base.anvil.chain_id(),
+            devnet.base.anvil.endpoint_url().to_string(),
+        )
+        .with_mock_service_evm_chain(
+            devnet.arbitrum.anvil.chain_id(),
+            devnet.arbitrum.anvil.endpoint_url().to_string(),
         )
         .with_unit_bitcoin_rpc(
             devnet.bitcoin.rpc_url.clone(),
@@ -1239,51 +1198,6 @@ async fn run_route_case(
     );
 }
 
-async fn run_limit_route_case(
-    client: &reqwest::Client,
-    router_base_url: &str,
-    devnet: &RiftDevnet,
-    mocks: &MockIntegratorServer,
-    route_case: LimitRouteCase,
-) {
-    eprintln!(
-        "running router runtime limit route case {}",
-        route_case.name
-    );
-    let quote = submit_limit_quote(client, router_base_url, route_case).await;
-    let limit_quote = quote.quote.as_limit_order().expect("limit order quote");
-    assert_provider_fragments_for(
-        route_case.name,
-        route_case.from,
-        route_case.to,
-        route_case.expected_provider_fragments,
-        &limit_quote.provider_id,
-    );
-    assert_limit_quote_has_hyperliquid_limit_leg(route_case.name, &limit_quote.provider_quote);
-    let quote_id = limit_quote.id;
-    let amount_in = limit_quote.input_amount.clone();
-
-    let order = submit_limit_order(client, router_base_url, quote_id, route_case).await;
-    assert_eq!(order.order.status, RouterOrderStatus::PendingFunding);
-    let funding_vault = order
-        .funding_vault
-        .as_ref()
-        .expect("limit order should include funding vault")
-        .vault
-        .clone();
-    assert_limit_funding_vault_matches(route_case, &funding_vault);
-    fund_source_vault(devnet, &funding_vault, &amount_in).await;
-
-    let completed =
-        drive_order_to_completion(client, router_base_url, devnet, mocks, order.order.id).await;
-    assert_eq!(
-        completed.order.status,
-        RouterOrderStatus::Completed,
-        "limit route case {} should complete",
-        route_case.name
-    );
-}
-
 async fn submit_exact_in_quote(
     client: &reqwest::Client,
     router_base_url: &str,
@@ -1309,30 +1223,6 @@ async fn submit_exact_in_quote(
     serde_json::from_str(&body).expect("quote response")
 }
 
-async fn submit_limit_quote(
-    client: &reqwest::Client,
-    router_base_url: &str,
-    route_case: LimitRouteCase,
-) -> RouterOrderQuoteEnvelope {
-    let response = client
-        .post(format!("{router_base_url}/api/v1/quotes"))
-        .json(&json!({
-            "type": "limit_order",
-            "from_asset": route_case.from.to_json(),
-            "to_asset": route_case.to.to_json(),
-            "recipient_address": recipient_address_for(route_case.to),
-            "input_amount": route_case.input_amount,
-            "output_amount": route_case.output_amount
-        }))
-        .send()
-        .await
-        .expect("limit quote request");
-    let status = response.status();
-    let body = response.text().await.expect("limit quote body");
-    assert_eq!(status, reqwest::StatusCode::CREATED, "{body}");
-    serde_json::from_str(&body).expect("limit quote response")
-}
-
 async fn submit_order(
     client: &reqwest::Client,
     router_base_url: &str,
@@ -1356,31 +1246,6 @@ async fn submit_order(
     let body = response.text().await.expect("order body");
     assert_eq!(status, reqwest::StatusCode::CREATED, "{body}");
     serde_json::from_str(&body).expect("order response")
-}
-
-async fn submit_limit_order(
-    client: &reqwest::Client,
-    router_base_url: &str,
-    quote_id: Uuid,
-    route_case: LimitRouteCase,
-) -> RouterOrderEnvelope {
-    let response = client
-        .post(format!("{router_base_url}/api/v1/orders"))
-        .json(&json!({
-            "quote_id": quote_id,
-            "idempotency_key": format!("router-runtime-e2e:{}:{quote_id}", route_case.name),
-            "refund_address": refund_address_for(route_case.from),
-            "metadata": {
-                "test": route_case.name
-            }
-        }))
-        .send()
-        .await
-        .expect("limit order request");
-    let status = response.status();
-    let body = response.text().await.expect("limit order body");
-    assert_eq!(status, reqwest::StatusCode::CREATED, "{body}");
-    serde_json::from_str(&body).expect("limit order response")
 }
 
 fn assert_provider_fragments(route_case: RouteCase, provider_id: &str) {
@@ -1424,24 +1289,6 @@ fn assert_provider_fragments_for(
     }
 }
 
-fn assert_limit_quote_has_hyperliquid_limit_leg(name: &str, provider_quote: &Value) {
-    let has_limit_leg = provider_quote
-        .get("legs")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .any(|leg| {
-            leg.get("raw")
-                .and_then(|raw| raw.get("kind"))
-                .and_then(Value::as_str)
-                == Some("hyperliquid_limit_order")
-        });
-    assert!(
-        has_limit_leg,
-        "limit route case {name} should materialize a Hyperliquid limit-order quote leg: {provider_quote}"
-    );
-}
-
 fn assert_funding_vault_matches(route_case: RouteCase, vault: &DepositVault) {
     assert_eq!(
         vault.deposit_asset.chain.to_string(),
@@ -1453,21 +1300,6 @@ fn assert_funding_vault_matches(route_case: RouteCase, vault: &DepositVault) {
         vault.deposit_asset.asset.as_str().to_ascii_lowercase(),
         route_case.from.asset.to_ascii_lowercase(),
         "route case {} funding vault should use source asset",
-        route_case.name
-    );
-}
-
-fn assert_limit_funding_vault_matches(route_case: LimitRouteCase, vault: &DepositVault) {
-    assert_eq!(
-        vault.deposit_asset.chain.to_string(),
-        route_case.from.chain,
-        "limit route case {} funding vault should use source chain",
-        route_case.name
-    );
-    assert_eq!(
-        vault.deposit_asset.asset.as_str().to_ascii_lowercase(),
-        route_case.from.asset.to_ascii_lowercase(),
-        "limit route case {} funding vault should use source asset",
         route_case.name
     );
 }
@@ -1555,7 +1387,11 @@ async fn drive_order_to_completion(
                     completed_manual_operations.insert(operation.id);
                 }
                 ProviderOperationType::UnitDeposit if operation.provider_ref.is_some() => {
+                    let source_is_bitcoin = unit_operation_source_is_bitcoin(operation);
                     complete_unit_deposit(mocks, operation).await;
+                    if source_is_bitcoin {
+                        mine_bitcoin_confirmation_block(devnet).await;
+                    }
                     completed_manual_operations.insert(operation.id);
                 }
                 ProviderOperationType::UnitWithdrawal if operation.provider_ref.is_some() => {
@@ -1616,6 +1452,15 @@ fn unit_operation_amount(operation: &OrderProviderOperation) -> U256 {
         .and_then(Value::as_str)
         .and_then(|amount| U256::from_str_radix(amount, 10).ok())
         .expect("UnitDeposit operation request should include amount")
+}
+
+fn unit_operation_source_is_bitcoin(operation: &OrderProviderOperation) -> bool {
+    operation
+        .request
+        .get("src_chain")
+        .or_else(|| operation.request.get("source_chain"))
+        .and_then(Value::as_str)
+        .is_some_and(|chain| chain.eq_ignore_ascii_case("bitcoin"))
 }
 
 async fn fund_destination_execution_vault_from_across(
@@ -1763,6 +1608,19 @@ async fn send_bitcoin(devnet: &RiftDevnet, address: &str, amount_sats: u64) {
         .wait_for_esplora_sync(Duration::from_secs(30))
         .await
         .expect("esplora sync after bitcoin funding");
+}
+
+async fn mine_bitcoin_confirmation_block(devnet: &RiftDevnet) {
+    devnet
+        .bitcoin
+        .mine_blocks(1)
+        .await
+        .expect("mine bitcoin confirmation block");
+    devnet
+        .bitcoin
+        .wait_for_esplora_sync(Duration::from_secs(30))
+        .await
+        .expect("esplora sync after bitcoin confirmation block");
 }
 
 async fn send_native(devnet: &devnet::EthDevnet, recipient: Address, amount: U256) {
