@@ -33,8 +33,6 @@
             "pages": [
               "POST /quote",
               "POST /order/market",
-              "POST /order/limit",
-              "POST /order/{orderId}/cancel",
               "GET /health",
               "GET /providers"
             ]
