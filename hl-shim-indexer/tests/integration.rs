@@ -190,7 +190,7 @@ async fn build_test_app(
 }
 
 #[tokio::test]
-async fn storage_dedups_transfers_and_cursor_advances_after_poll() {
+async fn hl_shim_integration_edges_share_one_database() {
     let postgres = test_postgres().await;
     let database_url = create_test_database(&postgres.admin_database_url).await;
     let hl = MockIntegratorServer::spawn().await.expect("spawn HL mock");
@@ -200,8 +200,10 @@ async fn storage_dedups_transfers_and_cursor_advances_after_poll() {
     hl.record_hyperliquid_fill(user, sample_fill(1_700_000_001_000, 2))
         .await;
 
-    let (_base_url, poller, _scheduler, storage, _pubsub) =
+    let (base_url, poller, scheduler, storage, _pubsub) =
         build_test_app(&database_url, hl.base_url()).await;
+    let client = reqwest::Client::new();
+
     poller
         .poll_once(ScheduledPoll {
             user,
@@ -231,19 +233,8 @@ async fn storage_dedups_transfers_and_cursor_advances_after_poll() {
         .insert_transfer(&duplicate)
         .await
         .expect("duplicate insert"));
-}
 
-#[tokio::test]
-async fn order_watch_endpoint_registers_and_removes_pending_oid() {
-    let postgres = test_postgres().await;
-    let database_url = create_test_database(&postgres.admin_database_url).await;
-    let hl = MockIntegratorServer::spawn().await.expect("spawn HL mock");
-    let user = sample_user();
-    let (base_url, _poller, scheduler, _storage, _pubsub) =
-        build_test_app(&database_url, hl.base_url()).await;
-    let client = reqwest::Client::new();
-
-    let response: serde_json::Value = client
+    let watch_response: serde_json::Value = client
         .post(format!("{base_url}/orders/watch"))
         .json(&serde_json::json!({
             "user": format!("{user:?}"),
@@ -257,7 +248,7 @@ async fn order_watch_endpoint_registers_and_removes_pending_oid() {
         .json()
         .await
         .expect("watch json");
-    assert_eq!(response["oid"], 77);
+    assert_eq!(watch_response["oid"], 77);
     assert_eq!(scheduler.pending_orders().await, vec![(user, 77)]);
 
     client
@@ -268,22 +259,6 @@ async fn order_watch_endpoint_registers_and_removes_pending_oid() {
         .error_for_status()
         .expect("delete status");
     assert!(scheduler.pending_orders().await.is_empty());
-}
-
-#[tokio::test]
-async fn websocket_subscription_receives_matching_transfer_but_not_other_user_order() {
-    let postgres = test_postgres().await;
-    let database_url = create_test_database(&postgres.admin_database_url).await;
-    let hl = MockIntegratorServer::spawn().await.expect("spawn HL mock");
-    let user = sample_user();
-    hl.record_hyperliquid_fill(user, sample_fill(1_700_000_000_000, 9))
-        .await;
-
-    let (base_url, poller, _scheduler, _storage, _pubsub) =
-        build_test_app(&database_url, hl.base_url()).await;
-    tokio::spawn(async move {
-        let _ = poller.run(1).await;
-    });
 
     let ws_url = base_url.replace("http://", "ws://") + "/subscribe";
     let (mut ws, _) = connect_async(ws_url).await.expect("connect ws");
@@ -306,6 +281,17 @@ async fn websocket_subscription_receives_matching_transfer_but_not_other_user_or
         .expect("ack message");
     assert!(ack.into_text().expect("ack text").contains("subscribed"));
 
+    hl.record_hyperliquid_fill(user, sample_fill(1_700_000_003_000, 9))
+        .await;
+    poller
+        .poll_once(ScheduledPoll {
+            user,
+            endpoint: PollEndpoint::Fills,
+            deadline: Instant::now(),
+        })
+        .await
+        .expect("poll fills for websocket");
+
     let message = timeout(Duration::from_secs(5), ws.next())
         .await
         .expect("event timeout")
@@ -315,38 +301,30 @@ async fn websocket_subscription_receives_matching_transfer_but_not_other_user_or
         .expect("event text");
     assert!(message.contains("\"kind\":\"transfer\""));
     assert!(message.contains("\"tid\":9"));
-}
+    drop(ws);
 
-#[tokio::test]
-async fn rest_transfers_paginates_and_prune_removes_irrelevant_users() {
-    let postgres = test_postgres().await;
-    let database_url = create_test_database(&postgres.admin_database_url).await;
-    let hl = MockIntegratorServer::spawn().await.expect("spawn HL mock");
-    let user = sample_user();
-    let other = other_user();
-    let (base_url, _poller, _scheduler, storage, _pubsub) =
-        build_test_app(&database_url, hl.base_url()).await;
-
+    let rest_user = Address::repeat_byte(0x33);
+    let rest_other = Address::repeat_byte(0x44);
     storage
         .insert_transfer(&test_transfer(
-            user,
-            1_700_000_000_000,
+            rest_user,
+            1_700_010_000_000,
             HlTransferKind::Withdraw { nonce: 1 },
         ))
         .await
         .expect("insert user");
     storage
         .insert_transfer(&test_transfer(
-            other,
-            1_700_000_000_000,
+            rest_other,
+            1_700_010_000_000,
             HlTransferKind::Withdraw { nonce: 2 },
         ))
         .await
         .expect("insert other");
 
-    let response: serde_json::Value = reqwest::Client::new()
+    let response: serde_json::Value = client
         .get(format!(
-            "{base_url}/transfers?user={user:?}&from_time=0&limit=1"
+            "{base_url}/transfers?user={rest_user:?}&from_time=0&limit=1"
         ))
         .send()
         .await
@@ -357,11 +335,11 @@ async fn rest_transfers_paginates_and_prune_removes_irrelevant_users() {
     assert_eq!(response["events"].as_array().expect("events").len(), 1);
     assert!(!response["has_more"].as_bool().expect("has_more"));
 
-    reqwest::Client::new()
+    client
         .post(format!("{base_url}/prune"))
         .json(&json!({
-            "relevant_users": [format!("{user:?}")],
-            "before_time_ms": 1_700_000_000_001_i64
+            "relevant_users": [format!("{rest_user:?}")],
+            "before_time_ms": 1_700_010_000_001_i64
         }))
         .send()
         .await

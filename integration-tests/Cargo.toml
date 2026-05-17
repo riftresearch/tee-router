@@ -16,6 +16,7 @@ hyperunit-client = { workspace = true }
 hl-shim-indexer = { workspace = true }
 router-core = { workspace = true }
 router-temporal = { workspace = true }
+router-test-support = { path = "../crates/test-support" }
 router-server = { path = "../bin/router-server" }
 sauron = { path = "../bin/sauron" }
 temporal-worker = { path = "../bin/temporal-worker" }
@@ -33,3 +34,4 @@ tokio = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
 testcontainers = "0.27.2"
+tracing-subscriber = { workspace = true, features = ["env-filter"] }

@@ -6334,6 +6334,7 @@ dependencies = [
  "router-core",
  "router-server",
  "router-temporal",
+ "router-test-support",
  "sauron",
  "serde_json",
  "sqlx-core",
@@ -6342,6 +6343,7 @@ dependencies = [
  "temporal-worker",
  "testcontainers",
  "tokio",
+ "tracing-subscriber",
  "url",
  "uuid",
 ]
@@ -6435,6 +6437,14 @@ dependencies = [
  "tonic 0.14.5",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "router-test-support"
+version = "0.1.8"
+dependencies = [
+ "testcontainers",
+ "tokio",
 ]
 
 [[package]]
@@ -6691,6 +6701,7 @@ dependencies = [
  "router-primitives",
  "router-server",
  "router-temporal",
+ "router-test-support",
  "serde",
  "serde_json",
  "sha2",
@@ -7475,6 +7486,7 @@ dependencies = [
  "router-primitives",
  "router-server",
  "router-temporal",
+ "router-test-support",
  "serde",
  "serde_json",
  "snafu",

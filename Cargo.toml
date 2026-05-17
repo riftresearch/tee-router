@@ -35,6 +35,7 @@ members = [
     "crates/router-core",
     "crates/router-primitives",
     "crates/router-temporal",
+    "crates/test-support",
     "crates/utc",
 ]
 
