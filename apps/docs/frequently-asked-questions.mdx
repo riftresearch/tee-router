@@ -1,0 +1,75 @@
+---
+title: "Frequently Asked Questions"
+---
+
+## How does integrating Rift make me more money?
+
+We aggregate routes to guarantee you're paying the lowest rate execution for these assets. The business model of every other aggregator is to charge a spread on top of the route that they are giving you.
+
+So you are paying an extra fee to the middleman just for doing the routing. By using Rift, you are not paying this extra fee. You can capture this fee, making you more revenue per swap, or pass on the savings to users, making the offering more compelling to end users.
+
+Rift also opens up new order flow and order types that the existing aggregators do not offer. This includes multichain routes, routes with very large trade size, and stateful orders, such as limit orders or deposits into vaults.
+
+## How do I know I'm getting the best rate when I use Rift?
+
+The Rift router does not charge any additional fees on the route that's being passed to you, so you get the same rate as the underlying execution provider. Since Rift aggregates the routes, you know that you're getting a strictly better rate than just using one of the providers directly.
+
+The router code is run inside a TEE, and open source, so it is verifiable that there is no additional fee being charged, unlike most aggregators which have closed source code and monetize by charging a spread.
+
+## What's the difference between Rift and &lt;my favorite aggregator&gt;?
+
+Rift has two unique features: no fees and multichain execution.
+
+No fees means the underlying execution provider rate is exactly what you will pay.
+
+Multichain execution means we can aggregate liquidity and execute order types that nobody else can. This enables much larger swap sizes as well as complex order types like limit orders.
+
+## So is Rift competitive with &lt;my favorite aggregator&gt;?
+
+Every aggregator obviously wants order flow, making us competitive with any trading API from an integrator point of view. However, our core value prop is to provide routes that nobody else can. Because of this, we actually work with many aggregators so they can grow their user base by offering larger size, more assets, and order types. Our goal is fundamentally to make all our partners more money, whether they view themselves as a competitor or not.
+
+## If Rift doesn't charge fees, how do you make money?
+
+We make money by sourcing liquidity from market makers and providing OTC execution for popular routes. We only make money if our execution is a better rate than all of the existing providers. If we are not the best execution provider for a swap, we simply pass you to the best execution provider and take no fees. Fundamentally, we believe we should only make money when we're creating new value for our users.
+
+## Who has integrated Rift so far?
+
+Our first integration with [SatsTerminal](https://x.com/riftdex/status/2041286945259888890?s=20) went live a few weeks ago.
+
+We have a couple other exciting integrations in progress that are going live soon.
+
+## How much volume has been traded so far on Rift?
+
+Total volume so far is $3.3 million. You can see a live tracker of our total volume here.
+
+## What's the max swap?
+
+The maximum swap depends on the route, but for major pairs such as Bitcoin/USDC and ETH/USDC, Rift can do $100m+ in a single clip.
+
+## What chains and assets are supported?
+
+We currently support Bitcoin, Ethereum, Base, and Arbitrum, and all major assets on these chains. You can find the full list in [Supported assets](/what-is-rift#supported-assets).
+
+We're actively adding new chains and assets, and are prioritizing support for new assets based on spot trading volume and integrator demand.
+
+## How do I know Rift is bug-free?
+
+Rift has been heavily tested by our own team and is fully open source for anyone to inspect and audit for themselves.
+
+No formal audit has taken place yet.
+
+## Is Rift a bridge?
+
+Bridge is a loaded word in the multichain space. In our view, a bridge is a synthetic asset issuer.
+
+We've warned against this design for years, as there is risk in perpetuity of this asset exploding and going to zero as it's held and issued by the bridge provider.
+
+Instead, Rift focuses on native asset swaps, where the risk window for a user is during the duration of the trade, not in perpetuity.
+
+## Is Rift controlled by a multisig?
+
+The Rift protocol runs in TEEs. Code upgrades are gated by a multisig controlled by the Rift team with hardware keys, gated behind a 7 day time lock. We allow institutional partner deployments to join the multisig that controls protocol upgrades for additional security.
+
+The Rift team has no ability to change the code running or have any control over the TEE without going through the onchain upgrade process. So a malicious upgrade would still leave users the ability to withdraw funds as long as there is at least one node online.
+
+If Rift turned off all nodes, all active orders would be locked until at least one node came back online. To prevent this, we will be supporting institutional partners running their own nodes to maximize system uptime.
