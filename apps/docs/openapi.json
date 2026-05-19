@@ -576,7 +576,7 @@
         "tags": [
           "Quotes"
         ],
-        "summary": "Create a quote",
+        "summary": "Get a quote",
         "requestBody": {
           "required": true,
           "content": {
@@ -816,7 +816,7 @@
         "tags": [
           "Orders"
         ],
-        "summary": "Cancel an order via specified authentication",
+        "summary": "Cancel a limit order",
         "parameters": [
           {
             "schema": {
@@ -908,7 +908,7 @@
         "tags": [
           "Status"
         ],
-        "summary": "Get Rift online status",
+        "summary": "Check Rift online status",
         "description": "Returns the online status of the Rift API.",
         "responses": {
           "200": {
@@ -929,7 +929,7 @@
         "tags": [
           "Status"
         ],
-        "summary": "Get execution provider online status",
+        "summary": "Check execution provider online status",
         "description": "Returns cached execution provider online checks from the router worker.",
         "responses": {
           "200": {

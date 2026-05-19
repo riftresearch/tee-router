@@ -1,94 +1,93 @@
-import { createRoute, z } from '@hono/zod-openapi'
-import type { RouteHandler } from '@hono/zod-openapi'
+import { createRoute, z } from "@hono/zod-openapi";
+import type { RouteHandler } from "@hono/zod-openapi";
 
-import type { DependencyHealthMonitor } from '../health'
+import type { DependencyHealthMonitor } from "../health";
 
 export const HealthResponseSchema = z
   .object({
-    status: z.literal('ok').openapi({
-      example: 'ok'
+    status: z.literal("ok").openapi({
+      example: "ok",
     }),
     timestamp: z.string().datetime().openapi({
-      example: '2026-05-04T12:00:00.000Z'
-    })
+      example: "2026-05-04T12:00:00.000Z",
+    }),
   })
-  .openapi('HealthResponse')
+  .openapi("HealthResponse");
 
 export const DependencyHealthResponseSchema = z
   .object({
-    status: z.enum(['ok', 'degraded']).openapi({
-      example: 'ok'
+    status: z.enum(["ok", "degraded"]).openapi({
+      example: "ok",
     }),
     timestamp: z.string().datetime().openapi({
-      example: '2026-05-04T12:00:00.000Z'
+      example: "2026-05-04T12:00:00.000Z",
     }),
     dependencies: z.array(
       z.object({
         name: z.string().openapi({
-          example: 'hyperliquid'
+          example: "hyperliquid",
         }),
-        status: z.enum(['reachable', 'unreachable', 'unknown']).openapi({
-          example: 'reachable'
+        status: z.enum(["reachable", "unreachable", "unknown"]).openapi({
+          example: "reachable",
         }),
         checkedAt: z.string().datetime().optional().openapi({
-          example: '2026-05-04T12:00:00.000Z'
-        })
-      })
-    )
+          example: "2026-05-04T12:00:00.000Z",
+        }),
+      }),
+    ),
   })
-  .openapi('DependencyHealthResponse')
+  .openapi("DependencyHealthResponse");
 
 export const healthRoute = createRoute({
-  method: 'get',
-  path: '/health',
-  tags: ['Status'],
-  summary: 'Get Rift online status',
-  description: 'Returns the online status of the Rift API.',
+  method: "get",
+  path: "/health",
+  tags: ["Status"],
+  summary: "Check Rift online status",
+  description: "Returns the online status of the Rift API.",
   responses: {
     200: {
-      description: 'Rift online status response',
+      description: "Rift online status response",
       content: {
-        'application/json': {
-          schema: HealthResponseSchema
-        }
-      }
-    }
-  }
-})
+        "application/json": {
+          schema: HealthResponseSchema,
+        },
+      },
+    },
+  },
+});
 
 export const dependencyHealthRoute = createRoute({
-  method: 'get',
-  path: '/providers',
-  tags: ['Status'],
-  summary: 'Get execution provider online status',
+  method: "get",
+  path: "/providers",
+  tags: ["Status"],
+  summary: "Check execution provider online status",
   description:
-    'Returns cached execution provider online checks from the router worker.',
+    "Returns cached execution provider online checks from the router worker.",
   responses: {
     200: {
-      description: 'Cached execution provider online status response',
+      description: "Cached execution provider online status response",
       content: {
-        'application/json': {
-          schema: DependencyHealthResponseSchema
-        }
-      }
-    }
-  }
-})
+        "application/json": {
+          schema: DependencyHealthResponseSchema,
+        },
+      },
+    },
+  },
+});
 
 export function createHealthHandler(): RouteHandler<typeof healthRoute> {
   return (c) =>
     c.json(
       {
-        status: 'ok',
-        timestamp: new Date().toISOString()
+        status: "ok",
+        timestamp: new Date().toISOString(),
       },
-      200
-    )
+      200,
+    );
 }
 
 export function createDependencyHealthHandler(
-  monitor: DependencyHealthMonitor
+  monitor: DependencyHealthMonitor,
 ): RouteHandler<typeof dependencyHealthRoute> {
-  return (c) =>
-    c.json(monitor.snapshot(), 200)
+  return (c) => c.json(monitor.snapshot(), 200);
 }
