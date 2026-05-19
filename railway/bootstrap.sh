@@ -90,6 +90,7 @@ REPO_SERVICES=(
   "alloy-v3|railway/alloy/Dockerfile|[\"etc/alloy.railway.alloy\",\"railway/alloy/**\"]"
   "loki-v3|railway/loki/Dockerfile|[\"etc/loki.railway.yml\",\"railway/loki/**\"]"
   "grafana-v3|railway/grafana/Dockerfile|[\"etc/grafana/**\",\"railway/grafana/**\"]"
+  "sauron-bitcoin-rathole-broker-v3|etc/Dockerfile.rathole-broker|[\"etc/Dockerfile.rathole-broker\",\"deploy/railway/sauron/**\"]"
 )
 
 for row in "${REPO_SERVICES[@]}"; do
@@ -121,6 +122,26 @@ if ! svc_exists victoriametrics-v3; then
 fi
 railway environment edit --service-config victoriametrics-v3 deploy.startCommand \
   '-storageDataPath=/victoria-metrics-data -retentionPeriod=30d -httpListenAddr=[::]:8428' || true
+
+# --- HyperUnit SOCKS5 proxy (managed, Europe) --------------------------------
+# Dedicated egress proxy for HyperUnit only (see deploy/railway/hyperunit-socks5
+# for the original helper this supersedes). Image: serjs/go-socks5-proxy,
+# auth required, port 1080, pinned to Railway Europe (EU-West Metal / AMS).
+# NOTE: a GENERAL/fallback upstream proxy (services without a dedicated one)
+# is the feat/upstream-proxy work — NOT in main; add its managed entry when
+# that branch merges.
+if ! svc_exists hyperunit-socks5-proxy-v3; then
+  log "creating hyperunit-socks5-proxy-v3 (image, Europe)"
+  railway add --service hyperunit-socks5-proxy-v3 --image serjs/go-socks5-proxy:latest  # VERIFY
+fi
+# PROXY_USER/PROXY_PASSWORD from railway/env/hyperunit-socks5-proxy.env;
+# REQUIRE_AUTH enforces username/password as the access boundary.
+set_var hyperunit-socks5-proxy-v3 "REQUIRE_AUTH=true"
+set_var hyperunit-socks5-proxy-v3 "PROXY_PORT=1080"
+# Pin to Railway Europe (Netherlands / EU-West).  VERIFY: region id current.
+railway environment edit --service-config hyperunit-socks5-proxy-v3 \
+  deploy.multiRegionConfig '{"europe-west4-drams3a":{"numReplicas":1}}' || \
+  warn "set hyperunit-socks5-proxy-v3 region to Europe manually"
 
 # --- Shared variables (fan out to many services) -----------------------------
 # These are read by multiple services via ${{shared.NAME}}. Values must be
@@ -155,7 +176,10 @@ done
 # Public domains. alloy-v3 is included: the Phala in-TEE sidecar reaches it
 # from OUTSIDE Railway's private network, so it needs a public, bearer-
 # authenticated endpoint (the others are user-facing UIs/APIs).
-for pub in router-gateway-v3 admin-dashboard-v3 explorer-v3 grafana-v3 alloy-v3; do
+# sauron-bitcoin-rathole-broker-v3 also gets a public domain: the rathole
+# CLIENT on the isolated bitcoin host dials the broker's websocket control
+# plane over the public domain. The 3 feed ports (40031/2/3) stay private.
+for pub in router-gateway-v3 admin-dashboard-v3 explorer-v3 grafana-v3 alloy-v3 sauron-bitcoin-rathole-broker-v3; do
   railway domain --service "$pub" >/dev/null 2>&1 || warn "set a domain for $pub manually if needed"
 done
 
