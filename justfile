@@ -237,8 +237,8 @@ test-all:
 # ALLOY_V3_OTLP_URL — see docs/devops-deployment-plan.md secret table).
 #
 # CVM is referenced by name; override if yours differs:
-#   just phala-upgrade phala_cvm=tee-router-v3
-phala_cvm     := "tee-router"
+#   just phala-upgrade phala_cvm=some-other-cvm
+phala_cvm     := "tee-router-demo"
 phala_env     := ".secrets/phala.env"
 phala_compose := "etc/compose.phala.yml"
 
