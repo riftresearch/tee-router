@@ -44,6 +44,10 @@ etc/compose.electrs.rathole.env
 .env.prod
 .secrets/
 
+# Railway per-service + shared env (secrets — never commit).
+# Only the actual *.env files are ignored; *.example + README stay tracked.
+railway/env/*.env
+
 # Temporary files
 *.swp
 *.swo
