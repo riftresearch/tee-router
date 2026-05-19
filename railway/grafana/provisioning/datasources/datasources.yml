@@ -1,0 +1,17 @@
+apiVersion: 1
+
+# alloy-v3 fans metrics into VictoriaMetrics and logs into Loki; both are
+# Railway-private. Grafana reads them over private DNS.
+datasources:
+  - name: VictoriaMetrics
+    type: prometheus
+    access: proxy
+    url: http://victoriametrics-v3.railway.internal:8428
+    isDefault: true
+    jsonData:
+      timeInterval: "15s"
+
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki-v3.railway.internal:3100

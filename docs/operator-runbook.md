@@ -4,6 +4,23 @@ This runbook covers day-to-day order execution operations after the Temporal
 cutover. Postgres remains the canonical business-state store. Temporal owns
 workflow history and replay.
 
+## Temporal Topology
+
+The Phala deployment runs the Temporal server split into four role
+containers (do not expect a single `temporal` process):
+
+- `temporal` — frontend role; this is the gRPC endpoint (`:7233`) clients,
+  `temporal-worker`, and `temporal operator` commands talk to.
+- `temporal-history` — history role (health `:7234`).
+- `temporal-matching` — matching role (health `:7235`).
+- `temporal-internal-worker` — Temporal's own internal worker role
+  (health `:7239`); distinct from the app's Rust `temporal-worker` service.
+
+All four share one `temporal-postgres` (sized for ~800 peak connections).
+Namespace creation and health checks target the `temporal` frontend. If
+workflows stall with the frontend healthy, check `temporal-history` /
+`temporal-matching` are up before any out-of-band action.
+
 ## When an Order Looks Stuck
 
 1. Check the router dashboard.
