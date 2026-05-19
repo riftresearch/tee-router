@@ -297,8 +297,8 @@ Notes:
   deploying. **Commit that tag bump** so the deployed revision is recorded
   in git (the pinned tag in `compose.phala.yml` is the source of truth for
   what's running).
-- CVM is referenced by name (`phala_cvm`, default `tee-router`); override
-  per-invocation: `just phala-deploy 0.2.0 phala_cvm=tee-router-v3`.
+- CVM is referenced by name (`phala_cvm`, default `tee-router-demo`);
+  override per-invocation: `just phala-deploy 0.2.0 phala_cvm=other-cvm`.
 - The `phala cvms upgrade` env-file flag is marked `VERIFY` in the justfile
   — confirm against `phala cvms upgrade --help` on the installed CLI before
   the first real run (CLI surface shifts between versions).
