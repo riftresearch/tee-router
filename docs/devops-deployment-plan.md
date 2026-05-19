@@ -262,6 +262,48 @@ Phala can deploy either a semver tag for human readability or a SHA tag for
 the exact source revision. For alpha, prefer pinning a semver release tag
 after the matching SHA has been smoke tested.
 
+## Phala Upgrade Flow
+
+There is deliberately **no CI/CD for Phala**. The GHCR image workflow still
+builds + pushes `tee-router{,-temporal-worker}` on every commit/tag, so the
+image you want already exists in GHCR. Upgrading the TEE is then a
+one-command `just` action against the existing CVM — Phala restarts the
+CVM, pulls the pinned images, and starts with the new config.
+
+One-time setup:
+
+- `just phala-login` (device flow; `phala login --manual` for an API token)
+- Create `.secrets/phala.env` (gitignored) containing every required
+  compose variable — the `${VAR:?}` secret set plus `OBS_INGEST_TOKEN` and
+  `ALLOY_V3_OTLP_URL` (see the secret-bootstrap table in the Deployment
+  Runbook).
+
+Normal upgrade (one command):
+
+```sh
+just phala-deploy 0.2.0      # pins both GHCR images to :0.2.0, redeploys CVM
+```
+
+Config-only redeploy (no image bump — e.g. compose/secret edit):
+
+```sh
+just phala-upgrade
+```
+
+Notes:
+
+- `phala-deploy` rewrites the two `ghcr.io/riftresearch/tee-router*` tags in
+  `etc/compose.phala.yml` in place and validates the compose before
+  deploying. **Commit that tag bump** so the deployed revision is recorded
+  in git (the pinned tag in `compose.phala.yml` is the source of truth for
+  what's running).
+- CVM is referenced by name (`phala_cvm`, default `tee-router`); override
+  per-invocation: `just phala-deploy 0.2.0 phala_cvm=tee-router-v3`.
+- The `phala cvms upgrade` env-file flag is marked `VERIFY` in the justfile
+  — confirm against `phala cvms upgrade --help` on the installed CLI before
+  the first real run (CLI surface shifts between versions).
+- Rollback = `just phala-deploy <previous-tag>`.
+
 ## Primary Postgres In Phala
 
 The router primary database lives inside the Phala compose file.

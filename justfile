@@ -226,3 +226,47 @@ test-integration:
 # that touch order workflow / Sauron observation / hint verification.
 test-all:
     cargo nextest run --workspace --run-ignored=all
+
+# --- Phala (TEE) deploy -----------------------------------------------------
+# No CI/CD for Phala by design. Images are built+pushed to GHCR by the
+# existing image workflow (tags: `X.Y.Z` semver or `sha-<gitsha>`); these
+# recipes only (re)deploy etc/compose.phala.yml to the existing CVM.
+#
+# One-time: `just phala-login`, and create .secrets/phala.env (gitignored)
+# holding every required compose var (the ${VAR:?} set + OBS_INGEST_TOKEN +
+# ALLOY_V3_OTLP_URL — see docs/devops-deployment-plan.md secret table).
+#
+# CVM is referenced by name; override if yours differs:
+#   just phala-upgrade phala_cvm=tee-router-v3
+phala_cvm     := "tee-router"
+phala_env     := ".secrets/phala.env"
+phala_compose := "etc/compose.phala.yml"
+
+# One-time auth to Phala Cloud (device flow; `phala login --manual` for an
+# API token instead).
+phala-login:
+    phala login
+
+# Push an upgrade: pin both GHCR images to TAG, then redeploy the CVM.
+# Phala restarts the CVM, pulls the new images, starts with new config.
+# Normal one-command upgrade. Example: just phala-deploy 0.2.0
+phala-deploy TAG:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    test -f "{{phala_env}}" || { echo "missing {{phala_env}} (gitignored secret env)"; exit 1; }
+    sed -i -E 's#(ghcr\.io/riftresearch/tee-router(-temporal-worker)?:)[^"[:space:]]+#\1{{TAG}}#g' "{{phala_compose}}"
+    echo "pinned ghcr images to {{TAG}}:"
+    grep -n 'ghcr.io/riftresearch/tee-router' "{{phala_compose}}"
+    docker compose -f "{{phala_compose}}" config --no-interpolate >/dev/null
+    # VERIFY: confirm `cvms upgrade` env-file flag against `phala cvms upgrade --help`
+    phala cvms upgrade {{phala_cvm}} -c "{{phala_compose}}" -e "{{phala_env}}"
+    echo "Deployed {{TAG}} to Phala CVM {{phala_cvm}}. Commit the compose tag bump to record the deployed revision."
+
+# Redeploy the CURRENT compose.phala.yml as-is (config-only change; no image
+# tag bump). Use after editing compose/secrets without changing the release.
+phala-upgrade:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    test -f "{{phala_env}}" || { echo "missing {{phala_env}}"; exit 1; }
+    docker compose -f "{{phala_compose}}" config --no-interpolate >/dev/null
+    phala cvms upgrade {{phala_cvm}} -c "{{phala_compose}}" -e "{{phala_env}}"
