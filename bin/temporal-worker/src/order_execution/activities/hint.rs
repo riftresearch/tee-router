@@ -1287,6 +1287,86 @@ fn typed_evidence_state<T: serde::Serialize>(
     }))
 }
 
+fn operation_request_amount(
+    label: &'static str,
+    operation: &OrderProviderOperation,
+) -> Result<String, OrderActivityError> {
+    operation
+        .request
+        .get("amount")
+        .and_then(Value::as_str)
+        .filter(|amount| !amount.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| {
+            OrderActivityError::hint_verification(label, "operation request missing amount")
+        })
+}
+
+fn hl_bridge_deposit_credited_response(
+    operation: &OrderProviderOperation,
+    evidence: &HlBridgeDepositCreditedEvidence,
+) -> Result<Value, OrderActivityError> {
+    let amount = operation_request_amount("HlBridgeDepositCredited", operation)?;
+    Ok(json!({
+        "kind": "hl_bridge_deposit_credited",
+        "amount_in": amount.clone(),
+        "amount_out": amount,
+        "hl_credit_hash": &evidence.hl_credit_hash,
+    }))
+}
+
+fn hl_withdrawal_settled_response(
+    operation: &OrderProviderOperation,
+    evidence: &HlWithdrawalSettledEvidence,
+) -> Result<Value, OrderActivityError> {
+    let amount_in = operation_request_amount("HlWithdrawalSettled", operation)?;
+    let amount_out = hl_withdrawal_payout_raw_amount(operation)?;
+    Ok(json!({
+        "kind": "hl_withdrawal_settled",
+        "amount_in": amount_in,
+        "amount_out": amount_out,
+        "arb_payout_tx_hash": &evidence.arb_payout_tx_hash,
+    }))
+}
+
+fn hyperunit_deposit_credited_response(
+    operation: &OrderProviderOperation,
+    evidence: &HyperUnitDepositCreditedEvidence,
+) -> Result<Value, OrderActivityError> {
+    let amount = operation_request_amount("HyperUnitDepositCredited", operation)?;
+    Ok(json!({
+        "kind": "hyperunit_deposit_credited",
+        "amount_in": amount.clone(),
+        "amount_out": amount,
+        "protocol_address": &evidence.protocol_address,
+        "btc_tx_hash": &evidence.btc_tx_hash,
+        "btc_vout": evidence.btc_vout,
+        "hl_credit_hash": &evidence.hl_credit_hash,
+    }))
+}
+
+fn hyperunit_withdrawal_settled_response(
+    operation: &OrderProviderOperation,
+    evidence: &HyperUnitWithdrawalSettledEvidence,
+    tx_hash: &str,
+) -> Result<Value, OrderActivityError> {
+    let amount_in = operation_request_amount("HyperUnitWithdrawalSettled", operation)?;
+    let amount_out = evidence.amount.clone().unwrap_or_else(|| amount_in.clone());
+    Ok(json!({
+        "kind": "hyperunit_withdrawal_settled",
+        "amount_in": amount_in,
+        "amount_out": amount_out,
+        "protocol_address": &evidence.protocol_address,
+        "destination_chain": &evidence.destination_chain,
+        "destination_tx_hash": tx_hash,
+        "btc_tx_hash": &evidence.btc_tx_hash,
+        "btc_vout": evidence.btc_vout,
+        "evm_chain_id": &evidence.evm_chain_id,
+        "evm_tx_hash": &evidence.evm_tx_hash,
+        "destination_address": &evidence.destination_address,
+    }))
+}
+
 pub(super) async fn verify_velora_swap_settled_hint(
     deps: &OrderActivityDeps,
     input: VerifyProviderOperationHintInput,
@@ -2142,6 +2222,7 @@ pub(super) async fn verify_hl_bridge_deposit_credited_hint(
     }
     validate_hl_bridge_user(&operation, &evidence.user)?;
     validate_hl_bridge_usdc_amount(&operation, &evidence.usdc)?;
+    let response = hl_bridge_deposit_credited_response(&operation, evidence)?;
     complete_provider_operation_from_typed_hint(
         deps,
         &input,
@@ -2150,7 +2231,7 @@ pub(super) async fn verify_hl_bridge_deposit_credited_hint(
             status: ProviderOperationStatus::Completed,
             provider_ref: Some(evidence.user.clone()),
             observed_state: typed_evidence_state("hl_bridge_deposit_credited", evidence)?,
-            response: None,
+            response: Some(response),
             tx_hash: Some(evidence.hl_credit_hash.clone()),
         },
     )
@@ -2221,6 +2302,7 @@ pub(super) async fn verify_hl_withdrawal_settled_hint(
     validate_hl_withdrawal_user(&operation, &evidence.user)?;
     validate_hl_withdrawal_payout_usdc_amount(&operation, &evidence.usdc)?;
     validate_hl_withdrawal_settlement_nonce(&operation, evidence.time_window_match_to_nonce)?;
+    let response = hl_withdrawal_settled_response(&operation, evidence)?;
     complete_provider_operation_from_typed_hint(
         deps,
         &input,
@@ -2229,7 +2311,7 @@ pub(super) async fn verify_hl_withdrawal_settled_hint(
             status: ProviderOperationStatus::Completed,
             provider_ref: Some(evidence.arb_payout_tx_hash.clone()),
             observed_state: typed_evidence_state("hl_withdrawal_settled", evidence)?,
-            response: None,
+            response: Some(response),
             tx_hash: Some(evidence.arb_payout_tx_hash.clone()),
         },
     )
@@ -2299,6 +2381,7 @@ pub(super) async fn verify_hyperunit_deposit_credited_hint(
         .or_else(|| evidence.hyperunit_source_tx_hash.clone())
         .or_else(|| evidence.btc_tx_hash.clone())
         .unwrap_or_else(|| evidence.hl_credit_hash.clone());
+    let response = hyperunit_deposit_credited_response(&operation, evidence)?;
     complete_provider_operation_from_typed_hint(
         deps,
         &input,
@@ -2307,13 +2390,7 @@ pub(super) async fn verify_hyperunit_deposit_credited_hint(
             status: ProviderOperationStatus::Completed,
             provider_ref: Some(evidence.protocol_address.clone()),
             observed_state: typed_evidence_state("hyperunit_deposit_credited", evidence)?,
-            response: Some(json!({
-                "kind": "hyperunit_deposit_credited",
-                "protocol_address": &evidence.protocol_address,
-                "btc_tx_hash": &evidence.btc_tx_hash,
-                "btc_vout": evidence.btc_vout,
-                "hl_credit_hash": &evidence.hl_credit_hash,
-            })),
+            response: Some(response),
             tx_hash: Some(tx_hash),
         },
     )
@@ -2420,6 +2497,7 @@ pub(super) async fn verify_hyperunit_withdrawal_settled_hint(
         )?;
     }
     let tx_hash = hyperunit_withdrawal_settlement_tx_hash(evidence)?;
+    let response = hyperunit_withdrawal_settled_response(&operation, evidence, &tx_hash)?;
     complete_provider_operation_from_typed_hint(
         deps,
         &input,
@@ -2428,17 +2506,7 @@ pub(super) async fn verify_hyperunit_withdrawal_settled_hint(
             status: ProviderOperationStatus::Completed,
             provider_ref: Some(evidence.protocol_address.clone()),
             observed_state: typed_evidence_state("hyperunit_withdrawal_settled", evidence)?,
-            response: Some(json!({
-                "kind": "hyperunit_withdrawal_settled",
-                "protocol_address": &evidence.protocol_address,
-                "destination_chain": &evidence.destination_chain,
-                "destination_tx_hash": &tx_hash,
-                "btc_tx_hash": &evidence.btc_tx_hash,
-                "btc_vout": evidence.btc_vout,
-                "evm_chain_id": &evidence.evm_chain_id,
-                "evm_tx_hash": &evidence.evm_tx_hash,
-                "destination_address": &evidence.destination_address,
-            })),
+            response: Some(response),
             tx_hash: Some(tx_hash),
         },
     )
@@ -3392,4 +3460,90 @@ pub(super) fn provider_operation_tx_hash_from_value(value: &Value) -> Option<Str
                 .get("provider_observed_state")
                 .and_then(provider_operation_tx_hash_from_value)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn operation_with_request(
+        operation_type: ProviderOperationType,
+        request: Value,
+    ) -> OrderProviderOperation {
+        let now = Utc::now();
+        OrderProviderOperation {
+            id: Uuid::now_v7(),
+            order_id: Uuid::now_v7(),
+            execution_attempt_id: Some(Uuid::now_v7()),
+            execution_step_id: Some(Uuid::now_v7()),
+            provider: "test".to_string(),
+            operation_type,
+            provider_ref: None,
+            idempotency_key: None,
+            status: ProviderOperationStatus::WaitingExternal,
+            request,
+            response: json!({}),
+            observed_state: json!({}),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn hyperunit_withdrawal_settlement_response_records_actual_amount_out() {
+        let operation = operation_with_request(
+            ProviderOperationType::UnitWithdrawal,
+            json!({ "amount": "100", "dst_addr": "0xrecipient" }),
+        );
+        let evidence = HyperUnitWithdrawalSettledEvidence {
+            protocol_address: "0xprotocol".to_string(),
+            hyperunit_operation_id: None,
+            hyperunit_status: Some("done".to_string()),
+            destination_address: "0xrecipient".to_string(),
+            amount: Some("105".to_string()),
+            destination_chain: Some("base".to_string()),
+            destination_tx_hash: Some("0xsettled".to_string()),
+            btc_tx_hash: None,
+            btc_vout: None,
+            btc_amount: None,
+            btc_confirmations: None,
+            evm_chain_id: Some("evm:8453".to_string()),
+            evm_tx_hash: Some("0xsettled".to_string()),
+            evm_block_number: None,
+            evm_block_hash: None,
+            evm_status: Some(true),
+        };
+
+        let response =
+            hyperunit_withdrawal_settled_response(&operation, &evidence, "0xsettled").unwrap();
+
+        assert_eq!(response["amount_in"], json!("100"));
+        assert_eq!(response["amount_out"], json!("105"));
+        assert_eq!(response["destination_tx_hash"], json!("0xsettled"));
+    }
+
+    #[test]
+    fn hyperliquid_withdrawal_settlement_response_records_net_amount_out() {
+        let operation = operation_with_request(
+            ProviderOperationType::HyperliquidBridgeWithdrawal,
+            json!({
+                "amount": "1000000",
+                "withdraw_fee_raw": "1000",
+            }),
+        );
+        let evidence = HlWithdrawalSettledEvidence {
+            user: "0xuser".to_string(),
+            usdc: "0.999".to_string(),
+            arb_payout_tx_hash: "0xpayout".to_string(),
+            log_index: 0,
+            block_number: 1,
+            time_window_match_to_nonce: 7,
+        };
+
+        let response = hl_withdrawal_settled_response(&operation, &evidence).unwrap();
+
+        assert_eq!(response["amount_in"], json!("1000000"));
+        assert_eq!(response["amount_out"], json!("999000"));
+        assert_eq!(response["arb_payout_tx_hash"], json!("0xpayout"));
+    }
 }

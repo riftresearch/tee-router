@@ -12,10 +12,11 @@ use uuid::Uuid;
 use super::activities::{OrderActivities, QuoteRefreshActivities, RefundActivities};
 use super::refund_workflow_id;
 use super::types::{
-    ClassifyStaleRunningStepInput, ClassifyStepFailureInput, ComposeRefreshedQuoteAttemptInput,
-    DiscoverSingleRefundPositionInput, DispatchOutcome, DispatchStepInput,
-    FinalizeOrderOrRefundInput, FinalizedOrder, FundingVaultFundedSignal,
-    LoadOrderExecutionStateInput, MarkOrderCompletedInput, MaterializeExecutionAttemptInput,
+    ClassifyStaleRunningStepInput, ClassifyStepFailureInput, ComposeLegBoundaryRequoteInput,
+    ComposeRefreshedQuoteAttemptInput, DiscoverSingleRefundPositionInput, DispatchOutcome,
+    DispatchStepInput, FinalizeOrderOrRefundInput, FinalizedOrder, FundingVaultFundedSignal,
+    LegBoundaryRequoteAttemptOutcome, LoadOrderExecutionStateInput, MarkOrderCompletedInput,
+    MaterializeExecutionAttemptInput, MaterializeLegBoundaryRequoteInput,
     MaterializeRefreshedAttemptInput, MaterializeRefundPlanInput, MaterializeRetryAttemptInput,
     MaterializedExecutionAttempt, OrderTerminalStatus, OrderWorkflowDebugCursor,
     OrderWorkflowInput, OrderWorkflowOutput, OrderWorkflowPhase, PersistStepFailedInput,

@@ -6,7 +6,7 @@
 //! 1. Derives a deterministic idempotency key from `(order_id, step_type, step_index)`.
 //!    Those three fields uniquely identify the logical work the step represents
 //!    across retries (a retry-attempt step shares the same `(order_id, step_index)`
-//!    as the original step it supersedes), so the key collapses retries onto the
+//!    as the original step it replaces), so the key collapses retries onto the
 //!    same provider operation row.
 //! 2. Looks up `order_provider_operations` by `(provider, operation_type, key)` —
 //!    if found, short-circuits with [`existing_operation_completion`] *before*

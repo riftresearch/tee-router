@@ -249,7 +249,7 @@ impl OrderFlowProgress {
         let executable_steps: Vec<&OrderExecutionStep> = steps
             .iter()
             .filter(|step| {
-                step.step_index > 0 && step.status != OrderExecutionStepStatus::Superseded
+                step.step_index > 0 && step.status != OrderExecutionStepStatus::Cancelled
             })
             .collect();
         let total_steps = executable_steps.len();

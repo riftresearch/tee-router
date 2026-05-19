@@ -1139,7 +1139,7 @@ function summarizeExecutionLegsForList(
   legs: OrderExecutionLeg[]
 ): OrderExecutionLeg[] {
   return legs
-    .filter((leg) => leg.status !== 'superseded')
+    .filter((leg) => leg.status !== 'cancelled')
     .map((leg) => ({
       id: leg.id,
       executionAttemptId: leg.executionAttemptId,
@@ -1364,7 +1364,7 @@ function summarizeProgress(
     txChainId: undefined
   }))
   const actualStages = legs
-    .filter((leg) => leg.status !== 'superseded')
+    .filter((leg) => leg.status !== 'cancelled')
     .map((leg) => ({
       transitionDeclId: leg.transitionDeclId,
       transitionMatchIds: leg.transitionDeclId ? [leg.transitionDeclId] : [],
@@ -1573,7 +1573,7 @@ function isFailedStatus(status: string): boolean {
 }
 
 function isTerminalStatus(status: string): boolean {
-  return isCompletedStatus(status) || isFailedStatus(status) || status === 'superseded'
+  return isCompletedStatus(status) || isFailedStatus(status)
 }
 
 function humanize(value: string): string {

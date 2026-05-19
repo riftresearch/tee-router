@@ -69,7 +69,7 @@ Velora's `priceRoute` can split a single user swap across multiple underlying DE
 
 `provider_ref = tx_hash` is the strongest disambiguator — one tx hash maps to exactly one step.
 
-The watched recipient may be reused across orders (recipients are user-provided), so `(tx_hash, log_index)` is the unique fingerprint. Same cross-cutting requirement as `audit.md` §B: the watch entry must carry `execution_step_id` so the emitted hint references the right step even when two superseded steps share a recipient.
+The watched recipient may be reused across orders (recipients are user-provided), so `(tx_hash, log_index)` is the unique fingerprint. Same cross-cutting requirement as `audit.md` §B: the watch entry must carry `execution_step_id` so the emitted hint references the right step even when two cancelled/replaced steps share a recipient.
 
 ## Failure modes and backstops
 

@@ -57,7 +57,7 @@ Polling Esplora repeatedly per address is *acceptable at the Sauron level* but s
 
 Per-address watches in Bitcoin are nearly unambiguous because HyperUnit issues *fresh* deposit addresses per request. The address itself maps 1:1 to a step.
 
-Cross-cutting fix needed (per `audit.md` §B): the watch entry must carry `execution_step_id` so the emitted hint references the correct step ID even when address reuse happens (e.g., if HyperUnit ever recycles addresses across superseded refresh attempts, or for funding vaults where the same vault may be re-funded across multiple orders).
+Cross-cutting fix needed (per `audit.md` §B): the watch entry must carry `execution_step_id` so the emitted hint references the correct step ID even when address reuse happens (e.g., if HyperUnit ever recycles addresses across cancelled refresh attempts, or for funding vaults where the same vault may be re-funded across multiple orders).
 
 ## Failure modes and backstops
 

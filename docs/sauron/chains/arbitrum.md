@@ -55,7 +55,7 @@ This requires:
 
 ## Step-ID disambiguation
 
-Same cross-cutting requirement as `audit.md` §B. Arbitrum-specific note: HL bridge deposits use the user's vault as the depositor; the same vault may have several superseded operations attached. Hint emission must include `execution_step_id` so the verifier routes correctly.
+Same cross-cutting requirement as `audit.md` §B. Arbitrum-specific note: HL bridge deposits use the user's vault as the depositor; the same vault may have several cancelled/replaced operations attached. Hint emission must include `execution_step_id` so the verifier routes correctly.
 
 ## Failure modes and backstops
 

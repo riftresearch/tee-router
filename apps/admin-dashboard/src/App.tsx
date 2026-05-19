@@ -69,8 +69,7 @@ const TERMINAL_STEP_STATUSES = new Set([
   'completed',
   'failed',
   'skipped',
-  'cancelled',
-  'superseded'
+  'cancelled'
 ])
 type StatusTone = 'success' | 'danger' | 'active' | 'waiting' | 'neutral'
 type StatusDisplay = {
@@ -1979,7 +1978,7 @@ type TimelineLeg = {
   references: TimelineReference[]
 }
 
-type TimelineSupersededStats = {
+type TimelineCancelledStats = {
   hiddenLegs: number
   attempts: number
 }
@@ -1994,7 +1993,7 @@ type TimelineReference = {
 
 function OrderTimelinePanel({ order }: { order: OrderFirehoseRow }) {
   const legs = timelineLegs(order)
-  const superseded = timelineSupersededStats(order)
+  const cancelled = timelineCancelledStats(order)
 
   return (
     <div className="detail-block timeline-block">
@@ -2004,7 +2003,7 @@ function OrderTimelinePanel({ order }: { order: OrderFirehoseRow }) {
           <p>{chainDisplayName(order.source.chainId)} to {chainDisplayName(order.destination.chainId)}</p>
         </div>
         <div className="timeline-header-actions">
-          {superseded.hiddenLegs > 0 ? <SupersededTimelineBadge stats={superseded} /> : null}
+          {cancelled.hiddenLegs > 0 ? <CancelledTimelineBadge stats={cancelled} /> : null}
           <StatusPill status={order.status} />
         </div>
       </div>
@@ -2020,12 +2019,12 @@ function OrderTimelinePanel({ order }: { order: OrderFirehoseRow }) {
   )
 }
 
-function SupersededTimelineBadge({ stats }: { stats: TimelineSupersededStats }) {
+function CancelledTimelineBadge({ stats }: { stats: TimelineCancelledStats }) {
   const refreshLabel = stats.attempts === 1 ? '1 refresh' : `${stats.attempts} refreshes`
   const hiddenLabel = stats.hiddenLegs === 1 ? '1 hidden leg' : `${stats.hiddenLegs} hidden legs`
 
   return (
-    <span className="timeline-superseded-badge" title="Superseded route history">
+    <span className="timeline-cancelled-badge" title="Cancelled route history">
       {stats.attempts > 0 ? `${refreshLabel}, ` : null}
       {hiddenLabel}
     </span>
@@ -2606,7 +2605,7 @@ export function timelineLegs(order: OrderFirehoseRow): TimelineLeg[] {
     const quoteLegsByLogicalKey = originalQuoteLegsByLogicalKey(sortedLegs)
 
     return sortedLegs
-      .filter((leg) => leg.status !== 'superseded')
+      .filter((leg) => leg.status !== 'cancelled')
       .map((leg) => {
         const steps = stepsByLegId.get(leg.id) ?? []
         const progressStage = progressStageForLeg(order, leg)
@@ -2686,16 +2685,16 @@ export function timelineLegs(order: OrderFirehoseRow): TimelineLeg[] {
   }))
 }
 
-export function timelineSupersededStats(order: OrderFirehoseRow): TimelineSupersededStats {
-  const supersededLegs = order.executionLegs.filter((leg) => leg.status === 'superseded')
+export function timelineCancelledStats(order: OrderFirehoseRow): TimelineCancelledStats {
+  const cancelledLegs = order.executionLegs.filter((leg) => leg.status === 'cancelled')
   const attempts = new Set(
-    supersededLegs
+    cancelledLegs
       .map((leg) => leg.executionAttemptId)
       .filter((attemptId): attemptId is string => Boolean(attemptId))
   )
 
   return {
-    hiddenLegs: supersededLegs.length,
+    hiddenLegs: cancelledLegs.length,
     attempts: attempts.size
   }
 }
@@ -3789,12 +3788,11 @@ export function statusDisplay(status: string): StatusDisplay {
 
 function statusTone(status: string): StatusTone {
   if (['completed', 'processed', 'skipped'].includes(status)) return 'success'
-  if (status === 'superseded') return 'neutral'
+  if (status === 'cancelled') return 'neutral'
   if (
     [
       'failed',
       'expired',
-      'cancelled',
       'refund_required'
     ].includes(status)
   ) {
@@ -3841,7 +3839,7 @@ export function shouldShowVenueProgress(order: OrderFirehoseRow) {
   if (progress.completedStages > 0 || progress.failedStages > 0) return true
 
   const materializedLeg = order.executionLegs.some(
-    (leg) => leg.status !== 'planned' && leg.status !== 'superseded'
+    (leg) => leg.status !== 'planned' && leg.status !== 'cancelled'
   )
   if (materializedLeg) return true
 
@@ -3849,7 +3847,7 @@ export function shouldShowVenueProgress(order: OrderFirehoseRow) {
     (step) =>
       !isWaitForDepositStep(step) &&
       step.status !== 'planned' &&
-      step.status !== 'superseded'
+      step.status !== 'cancelled'
   )
   if (materializedStep) return true
 

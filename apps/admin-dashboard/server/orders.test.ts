@@ -203,7 +203,7 @@ test('fetchOrderFirehose keeps summary rows lightweight', async () => {
               }),
               executionLeg({
                 id: 'leg-2',
-                status: 'superseded',
+                status: 'cancelled',
                 createdAt: '2026-05-04T00:01:00.000Z',
                 updatedAt: '2026-05-04T00:01:00.000Z'
               })
@@ -258,7 +258,7 @@ test('fetchOrderById preserves full order detail payloads', async () => {
             execution_legs: [
               executionLeg({
                 id: 'leg-1',
-                status: 'superseded',
+                status: 'cancelled',
                 usdValuation: quoteUsdValuation
               })
             ]

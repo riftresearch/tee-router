@@ -51,7 +51,7 @@ Today, Sauron polls `eth_getLogs` in 128-block windows. This costs RPC requests 
 
 ## Step-ID disambiguation
 
-Same cross-cutting requirement as `audit.md` §B: emitted `DetectorHint` must include `execution_step_id` so T-router's verifier can route the hint to the right step even when address/topic match is ambiguous (e.g., a vault is reused across orders, or two superseded steps share an output recipient).
+Same cross-cutting requirement as `audit.md` §B: emitted `DetectorHint` must include `execution_step_id` so T-router's verifier can route the hint to the right step even when address/topic match is ambiguous (e.g., a vault is reused across orders, or two cancelled/replaced steps share an output recipient).
 
 For Ethereum specifically:
 - **`Transfer` to a vault address** is unambiguous *only* if the vault is single-use (one order). For reusable vaults (rare for our use case, but possible), the watch entry must carry the `execution_step_id` of the active step the watch was registered for.

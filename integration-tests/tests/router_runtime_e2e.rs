@@ -313,8 +313,15 @@ async fn router_api_worker_sauron_complete_mock_route_matrix() {
     init_test_tracing();
     LocalSet::new()
         .run_until(async {
+            let _t_total = std::time::Instant::now();
+            let _t_harness = std::time::Instant::now();
             let runtime = spawn_mock_router_runtime().await;
+            eprintln!(
+                "[[TIMING]] phase=harness_total_bringup elapsed_ms={}",
+                _t_harness.elapsed().as_millis()
+            );
             for route_case in ROUTE_CASES {
+                let _t_case = std::time::Instant::now();
                 run_route_case(
                     &runtime.client,
                     &runtime.router_base_url,
@@ -323,23 +330,57 @@ async fn router_api_worker_sauron_complete_mock_route_matrix() {
                     *route_case,
                 )
                 .await;
+                eprintln!(
+                    "[[TIMING]] phase=route_case name={} elapsed_ms={}",
+                    route_case.name,
+                    _t_case.elapsed().as_millis()
+                );
             }
+            let _t_shutdown = std::time::Instant::now();
             runtime.shutdown().await;
+            eprintln!(
+                "[[TIMING]] phase=shutdown elapsed_ms={}",
+                _t_shutdown.elapsed().as_millis()
+            );
+            eprintln!(
+                "[[TIMING]] phase=test_total elapsed_ms={}",
+                _t_total.elapsed().as_millis()
+            );
         })
         .await;
 }
 
+macro_rules! timing_log {
+    ($label:expr, $t:expr) => {
+        eprintln!(
+            "[[TIMING]] phase={} elapsed_ms={}",
+            $label,
+            $t.elapsed().as_millis()
+        );
+    };
+}
+
 async fn spawn_mock_router_runtime() -> RouterRuntimeHarness {
+    let _t = std::time::Instant::now();
     let postgres = test_postgres().await;
+    timing_log!("postgres_container", _t);
+
+    let _t = std::time::Instant::now();
     let database_url = create_test_database(&postgres.admin_database_url).await;
     let sauron_state_database_url = create_test_database(&postgres.admin_database_url).await;
     let hl_shim_database_url = create_test_database(&postgres.admin_database_url).await;
+    timing_log!("create_test_databases", _t);
+
+    let _t = std::time::Instant::now();
     let (devnet, _) = RiftDevnet::builder()
         .using_esplora(true)
         .using_token_indexer(database_url.clone())
         .build()
         .await
         .expect("devnet setup failed");
+    timing_log!("devnet_build", _t);
+
+    let _t = std::time::Instant::now();
     install_mock_usdc_clone(
         &devnet.ethereum,
         ETHEREUM_USDC_ADDRESS
@@ -359,38 +400,62 @@ async fn spawn_mock_router_runtime() -> RouterRuntimeHarness {
             .expect("valid Arbitrum USDC address"),
     )
     .await;
+    timing_log!("install_mock_usdc_x3", _t);
 
+    let _t = std::time::Instant::now();
     let mocks = spawn_runtime_mocks(&devnet).await;
+    timing_log!("spawn_runtime_mocks", _t);
+
+    let _t = std::time::Instant::now();
     let (hl_shim_base_url, _hl_shim_task) =
         spawn_hl_shim_indexer(&hl_shim_database_url, mocks.base_url()).await;
+    timing_log!("spawn_hl_shim_indexer", _t);
+
+    let _t = std::time::Instant::now();
     let (ethereum_receipt_watcher_url, ethereum_receipt_watcher_task) = spawn_evm_receipt_watcher(
         "ethereum",
         devnet.ethereum.anvil.endpoint_url().to_string(),
         devnet.ethereum.anvil.ws_endpoint_url().to_string(),
     )
     .await;
+    timing_log!("spawn_evm_receipt_watcher_ethereum", _t);
+
+    let _t = std::time::Instant::now();
     let (base_receipt_watcher_url, base_receipt_watcher_task) = spawn_evm_receipt_watcher(
         "base",
         devnet.base.anvil.endpoint_url().to_string(),
         devnet.base.anvil.ws_endpoint_url().to_string(),
     )
     .await;
+    timing_log!("spawn_evm_receipt_watcher_base", _t);
+
+    let _t = std::time::Instant::now();
     let (arbitrum_receipt_watcher_url, arbitrum_receipt_watcher_task) = spawn_evm_receipt_watcher(
         "arbitrum",
         devnet.arbitrum.anvil.endpoint_url().to_string(),
         devnet.arbitrum.anvil.ws_endpoint_url().to_string(),
     )
     .await;
+    timing_log!("spawn_evm_receipt_watcher_arbitrum", _t);
+
     let _receipt_watcher_tasks = vec![
         ethereum_receipt_watcher_task,
         base_receipt_watcher_task,
         arbitrum_receipt_watcher_task,
     ];
+
+    let _t = std::time::Instant::now();
     let (bitcoin_observer_urls, bitcoin_observer_tasks) = spawn_bitcoin_observers(&devnet).await;
+    timing_log!("spawn_bitcoin_observers", _t);
+
     let mut _receipt_watcher_tasks = _receipt_watcher_tasks;
     _receipt_watcher_tasks.extend(bitcoin_observer_tasks);
     let config_dir = tempfile::tempdir().expect("router config dir");
+
+    let _t = std::time::Instant::now();
     let temporal = TestTemporal::start().await;
+    timing_log!("temporal_start", _t);
+
     let args = router_args(
         &devnet,
         config_dir.path(),
@@ -399,9 +464,19 @@ async fn spawn_mock_router_runtime() -> RouterRuntimeHarness {
         &mocks,
     );
 
+    let _t = std::time::Instant::now();
     let (router_base_url, _api_task) = spawn_router_api(args.clone()).await;
+    timing_log!("spawn_router_api", _t);
+
+    let _t = std::time::Instant::now();
     let _temporal_worker_task = spawn_temporal_order_worker(args.clone()).await;
+    timing_log!("spawn_temporal_order_worker", _t);
+
+    let _t = std::time::Instant::now();
     let _worker_task = spawn_router_worker(args.clone()).await;
+    timing_log!("spawn_router_worker", _t);
+
+    let _t = std::time::Instant::now();
     let _sauron_task = spawn_sauron(
         &devnet,
         &database_url,
@@ -417,6 +492,7 @@ async fn spawn_mock_router_runtime() -> RouterRuntimeHarness {
         mocks.base_url().to_string(),
     )
     .await;
+    timing_log!("spawn_sauron", _t);
 
     RouterRuntimeHarness {
         client: reqwest::Client::new(),

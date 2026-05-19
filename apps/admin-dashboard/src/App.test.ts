@@ -181,17 +181,17 @@ test('executed USD values require actual valuation entries', async () => {
   expect(executed.output.usdValuation?.raw).toBe('89')
 })
 
-test('execution timeline hides superseded legs while preserving original quoted amounts', async () => {
-  const { timelineLegs, timelineSupersededStats } = await appHelpers()
+test('execution timeline hides cancelled legs while preserving original quoted amounts', async () => {
+  const { timelineLegs, timelineCancelledStats } = await appHelpers()
   const now = '2026-05-05T00:00:00.000Z'
-  const supersededLeg: OrderExecutionLeg = {
+  const cancelledLeg: OrderExecutionLeg = {
     id: 'leg-original',
     executionAttemptId: 'attempt-original',
     transitionDeclId: 'transition-1',
     legIndex: 0,
     legType: 'hyperliquid_trade',
     provider: 'hyperliquid',
-    status: 'superseded',
+    status: 'cancelled',
     input: USDC,
     output: USDC,
     amountIn: '100',
@@ -208,7 +208,7 @@ test('execution timeline hides superseded legs while preserving original quoted 
     }
   }
   const refreshedLeg: OrderExecutionLeg = {
-    ...supersededLeg,
+    ...cancelledLeg,
     id: 'leg-refreshed',
     executionAttemptId: 'attempt-refreshed',
     status: 'completed',
@@ -221,7 +221,7 @@ test('execution timeline hides superseded legs while preserving original quoted 
   }
   const order: OrderFirehoseRow = {
     ...completedOrder({}),
-    executionLegs: [supersededLeg, refreshedLeg]
+    executionLegs: [cancelledLeg, refreshedLeg]
   }
 
   const legs = timelineLegs(order)
@@ -233,7 +233,7 @@ test('execution timeline hides superseded legs while preserving original quoted 
   expect(legs[0].executedInput).toBe('105')
   expect(legs[0].executedOutput).toBe('91')
   expect(legs[0].quotedInputUsd?.raw).toBe('100')
-  expect(timelineSupersededStats(order)).toEqual({
+  expect(timelineCancelledStats(order)).toEqual({
     hiddenLegs: 1,
     attempts: 1
   })

@@ -66,6 +66,9 @@ async fn hydrate_source_deposit_role(
     ) {
         return Ok(());
     }
+    if hyperliquid_custody_vault_is_bound(step) {
+        return Ok(());
+    }
     let asset = hyperliquid_vault_asset(step, "source_deposit")?;
     let vault = ensure_source_deposit_vault(deps, order_id, &asset, cache).await?;
     write_hyperliquid_vault_fields(step, &vault);
@@ -83,6 +86,9 @@ async fn hydrate_hyperliquid_spot_role(
         "hyperliquid_custody_vault_role",
         CustodyVaultRole::HyperliquidSpot.to_db_string(),
     ) {
+        return Ok(());
+    }
+    if hyperliquid_custody_vault_is_bound(step) {
         return Ok(());
     }
     let vault = ensure_hyperliquid_spot_vault(deps, order_id, cache).await?;
@@ -224,6 +230,9 @@ async fn hydrate_destination_hyperliquid(
     ) {
         return Ok(());
     }
+    if hyperliquid_custody_vault_is_bound(step) {
+        return Ok(());
+    }
     let asset = hyperliquid_vault_asset(step, "destination_execution")?;
     let vault = ensure_destination_execution_vault(deps, order_id, &asset, cache).await?;
     write_hyperliquid_vault_fields(step, &vault);
@@ -276,6 +285,18 @@ fn hyperliquid_vault_asset(
             )
         })?,
     })
+}
+
+fn hyperliquid_custody_vault_is_bound(step: &OrderExecutionStep) -> bool {
+    step.request
+        .get("hyperliquid_custody_vault_id")
+        .and_then(Value::as_str)
+        .is_some()
+        && step
+            .request
+            .get("hyperliquid_custody_vault_address")
+            .and_then(Value::as_str)
+            .is_some()
 }
 
 fn hyperliquid_vault_asset_field<'a>(
