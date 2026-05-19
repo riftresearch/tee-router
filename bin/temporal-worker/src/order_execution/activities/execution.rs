@@ -558,7 +558,7 @@ impl OrderActivities {
             .await
             .map_err(OrderActivityError::db_query)?
             .into_iter()
-            .filter(|attempt| attempt.attempt_kind == OrderExecutionAttemptKind::RefreshedExecution)
+            .filter(|attempt| stale_quote_refresh_attempt(attempt))
             .count();
         let stale_quote_refresh_eligible = matches!(&order_quote, RouterOrderQuote::MarketOrder(_))
             // Scar §7: RefundRecovery attempts never stale-refresh. Funds may be
@@ -1305,7 +1305,7 @@ async fn pre_execution_stale_quote_check(
         .await
         .map_err(OrderActivityError::db_query)?
         .into_iter()
-        .filter(|attempt| attempt.attempt_kind == OrderExecutionAttemptKind::RefreshedExecution)
+        .filter(|attempt| stale_quote_refresh_attempt(attempt))
         .count();
     let reason = json!({
         "reason": "pre_execution_stale_provider_quote",
@@ -1345,6 +1345,12 @@ async fn pre_execution_stale_quote_check(
             }
         },
     ))
+}
+
+fn stale_quote_refresh_attempt(attempt: &OrderExecutionAttempt) -> bool {
+    attempt.attempt_kind == OrderExecutionAttemptKind::RefreshedExecution
+        && attempt.failure_reason.get("reason").and_then(Value::as_str)
+            == Some("stale_provider_quote_refresh")
 }
 
 pub(super) async fn classify_stale_running_step_for_deps(

@@ -110,7 +110,7 @@ This is *Sauron-level* polling — it's still inside Sauron's process, never cro
 Critical here because:
 - One HL account address may have many simultaneous orders/operations.
 - A `hyperliquid_trade` operation may have multiple fills (partials).
-- A bridge deposit operation may be superseded across refresh cycles, so the same address has both an old and new operation.
+- A bridge deposit operation may be cancelled and replaced across refresh cycles, so the same address has both an old and new operation.
 
 Required: emit hints with `execution_step_id` from the watch entry. For trades specifically, the `oid` is the strongest disambiguator since HL assigns a unique `oid` per submission — match `oid` against `provider_ref`.
 

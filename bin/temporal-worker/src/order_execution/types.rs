@@ -466,8 +466,8 @@ pub struct RefreshedQuoteFailureReason {
     pub trace: String,
     pub stale_attempt_id: WorkflowAttemptId,
     pub failed_step_id: WorkflowStepId,
-    pub superseded_attempt_id: WorkflowAttemptId,
-    pub superseded_attempt_index: i32,
+    pub replaced_attempt_id: WorkflowAttemptId,
+    pub replaced_attempt_index: i32,
     pub stale_step_id: WorkflowStepId,
     pub stale_execution_leg_id: Uuid,
     pub provider_quote_expires_at: String,
@@ -478,7 +478,7 @@ impl RefreshedQuoteFailureReason {
     #[must_use]
     pub fn stale_provider_quote_refresh(
         stale_attempt_id: Uuid,
-        superseded_attempt_index: i32,
+        replaced_attempt_index: i32,
         failed_step_id: Uuid,
         stale_execution_leg_id: Uuid,
         provider_quote_expires_at: chrono::DateTime<chrono::Utc>,
@@ -489,8 +489,8 @@ impl RefreshedQuoteFailureReason {
             trace: "quote_refresh_workflow".to_string(),
             stale_attempt_id: stale_attempt_id.into(),
             failed_step_id: failed_step_id.into(),
-            superseded_attempt_id: stale_attempt_id.into(),
-            superseded_attempt_index,
+            replaced_attempt_id: stale_attempt_id.into(),
+            replaced_attempt_index,
             stale_step_id: failed_step_id.into(),
             stale_execution_leg_id,
             provider_quote_expires_at: provider_quote_expires_at.to_rfc3339(),
@@ -500,7 +500,7 @@ impl RefreshedQuoteFailureReason {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RefreshedQuoteSupersededReason {
+pub struct RefreshedQuoteCancelledReason {
     pub reason: String,
     pub stale_attempt_id: WorkflowAttemptId,
     pub failed_step_id: WorkflowStepId,
@@ -510,7 +510,7 @@ pub struct RefreshedQuoteSupersededReason {
     pub refreshed_quote_id: Uuid,
 }
 
-impl RefreshedQuoteSupersededReason {
+impl RefreshedQuoteCancelledReason {
     #[must_use]
     pub fn stale_provider_quote_refresh(
         stale_attempt_id: Uuid,
@@ -520,7 +520,7 @@ impl RefreshedQuoteSupersededReason {
         refreshed_quote_id: Uuid,
     ) -> Self {
         Self {
-            reason: "superseded_by_stale_provider_quote_refresh".to_string(),
+            reason: "cancelled_by_stale_provider_quote_refresh".to_string(),
             stale_attempt_id: stale_attempt_id.into(),
             failed_step_id: failed_step_id.into(),
             stale_step_id: failed_step_id.into(),
@@ -648,9 +648,9 @@ impl From<RefreshedQuoteFailureReason> for Value {
     }
 }
 
-impl From<RefreshedQuoteSupersededReason> for Value {
-    fn from(value: RefreshedQuoteSupersededReason) -> Self {
-        serde_json::to_value(value).expect("refreshed quote superseded reason serializes to JSON")
+impl From<RefreshedQuoteCancelledReason> for Value {
+    fn from(value: RefreshedQuoteCancelledReason) -> Self {
+        serde_json::to_value(value).expect("refreshed quote cancelled reason serializes to JSON")
     }
 }
 
@@ -669,7 +669,7 @@ pub enum RefreshedQuoteAttemptOutcome {
         failed_step_id: WorkflowStepId,
         plan: ExecutionPlan,
         failure_reason: RefreshedQuoteFailureReason,
-        superseded_reason: RefreshedQuoteSupersededReason,
+        cancelled_reason: RefreshedQuoteCancelledReason,
         input_custody_snapshot: InputCustodySnapshot,
     },
     Untenable {
@@ -688,6 +688,56 @@ pub struct MaterializeRefreshedAttemptInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefreshedAttemptMaterialized {
+    pub attempt_id: WorkflowAttemptId,
+    pub steps: Vec<WorkflowExecutionStep>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComposeLegBoundaryRequoteInput {
+    pub order_id: WorkflowOrderId,
+    pub source_attempt_id: WorkflowAttemptId,
+    pub completed_step_id: WorkflowStepId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LegBoundaryRequoteAttemptShape {
+    pub outcome: LegBoundaryRequoteAttemptOutcome,
+}
+
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum LegBoundaryRequoteAttemptOutcome {
+    Requoted {
+        order_id: WorkflowOrderId,
+        source_attempt_id: WorkflowAttemptId,
+        completed_step_id: WorkflowStepId,
+        completed_leg_id: Uuid,
+        plan: ExecutionPlan,
+        reason: Value,
+        input_custody_snapshot: Value,
+    },
+    NotNeeded {
+        order_id: WorkflowOrderId,
+        source_attempt_id: WorkflowAttemptId,
+        completed_step_id: WorkflowStepId,
+        reason: Value,
+    },
+    Untenable {
+        order_id: WorkflowOrderId,
+        source_attempt_id: WorkflowAttemptId,
+        completed_step_id: WorkflowStepId,
+        reason: StaleQuoteRefreshUntenableReason,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaterializeLegBoundaryRequoteInput {
+    pub order_id: WorkflowOrderId,
+    pub requote_attempt: LegBoundaryRequoteAttemptShape,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LegBoundaryRequoteMaterialized {
     pub attempt_id: WorkflowAttemptId,
     pub steps: Vec<WorkflowExecutionStep>,
 }
@@ -794,8 +844,8 @@ pub enum RecoverablePositionKind {
 #[cfg(test)]
 mod tests {
     use super::{
-        InputCustodySnapshot, RawAmount, RawAmountError, RefreshedQuoteFailureReason,
-        RefreshedQuoteSupersededReason,
+        InputCustodySnapshot, RawAmount, RawAmountError, RefreshedQuoteCancelledReason,
+        RefreshedQuoteFailureReason,
     };
     use serde_json::json;
 
@@ -858,8 +908,8 @@ mod tests {
             "trace": "quote_refresh_workflow",
             "stale_attempt_id": "018f13e1-0000-7000-8000-000000000001",
             "failed_step_id": "018f13e1-0000-7000-8000-000000000002",
-            "superseded_attempt_id": "018f13e1-0000-7000-8000-000000000001",
-            "superseded_attempt_index": 1,
+            "replaced_attempt_id": "018f13e1-0000-7000-8000-000000000001",
+            "replaced_attempt_index": 1,
             "stale_step_id": "018f13e1-0000-7000-8000-000000000002",
             "stale_execution_leg_id": "018f13e1-0000-7000-8000-000000000003",
             "provider_quote_expires_at": "2026-05-10T12:00:00+00:00",
@@ -872,9 +922,9 @@ mod tests {
     }
 
     #[test]
-    fn refreshed_quote_superseded_reason_preserves_json_wire_shape() {
+    fn refreshed_quote_cancelled_reason_preserves_json_wire_shape() {
         let value = json!({
-            "reason": "superseded_by_stale_provider_quote_refresh",
+            "reason": "cancelled_by_stale_provider_quote_refresh",
             "stale_attempt_id": "018f13e1-0000-7000-8000-000000000001",
             "failed_step_id": "018f13e1-0000-7000-8000-000000000002",
             "stale_step_id": "018f13e1-0000-7000-8000-000000000002",
@@ -883,8 +933,7 @@ mod tests {
             "refreshed_quote_id": "018f13e1-0000-7000-8000-000000000004",
         });
 
-        let decoded: RefreshedQuoteSupersededReason =
-            serde_json::from_value(value.clone()).unwrap();
+        let decoded: RefreshedQuoteCancelledReason = serde_json::from_value(value.clone()).unwrap();
 
         assert_eq!(serde_json::to_value(decoded).unwrap(), value);
     }

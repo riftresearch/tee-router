@@ -251,8 +251,6 @@ const EXECUTION_ATTEMPT_SELECT_COLUMNS: &str = r#"
     trigger_provider_operation_id,
     failure_reason_json,
     input_custody_snapshot_json,
-    superseded_by_attempt_id,
-    superseded_reason_json,
     created_at,
     updated_at
 "#;
@@ -274,7 +272,15 @@ pub struct RefreshedExecutionAttemptPlan {
     pub legs: Vec<OrderExecutionLeg>,
     pub steps: Vec<OrderExecutionStep>,
     pub failure_reason: serde_json::Value,
-    pub superseded_reason: serde_json::Value,
+    pub cancelled_reason: serde_json::Value,
+    pub input_custody_snapshot: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct BoundaryRequoteExecutionAttemptPlan {
+    pub legs: Vec<OrderExecutionLeg>,
+    pub steps: Vec<OrderExecutionStep>,
+    pub reason: serde_json::Value,
     pub input_custody_snapshot: serde_json::Value,
 }
 
@@ -1335,12 +1341,10 @@ impl OrderRepository {
                 trigger_provider_operation_id,
                 failure_reason_json,
                 input_custody_snapshot_json,
-                superseded_by_attempt_id,
-                superseded_reason_json,
                 created_at,
                 updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             "#,
         )
         .bind(attempt.id)
@@ -1352,8 +1356,6 @@ impl OrderRepository {
         .bind(attempt.trigger_provider_operation_id)
         .bind(attempt.failure_reason.clone())
         .bind(attempt.input_custody_snapshot.clone())
-        .bind(Option::<Uuid>::None)
-        .bind(serde_json::json!({}))
         .bind(attempt.created_at)
         .bind(attempt.updated_at)
         .execute(&self.pool)
@@ -1536,12 +1538,10 @@ impl OrderRepository {
                         trigger_provider_operation_id,
                         failure_reason_json,
                         input_custody_snapshot_json,
-                        superseded_by_attempt_id,
-                        superseded_reason_json,
                         created_at,
                         updated_at
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, '{{}}'::jsonb, $10, $11)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                     RETURNING {EXECUTION_ATTEMPT_SELECT_COLUMNS}
                     "#
                 ))
@@ -2006,7 +2006,7 @@ impl OrderRepository {
             WHERE id = $1
               AND order_id = $2
               AND execution_attempt_id = $3
-              AND status IN ('failed', 'superseded')
+              AND status IN ('failed', 'cancelled')
               AND NOT EXISTS (SELECT 1 FROM failed)
             LIMIT 1
             "#
@@ -2199,12 +2199,10 @@ impl OrderRepository {
                     trigger_provider_operation_id,
                     failure_reason_json,
                     input_custody_snapshot_json,
-                    superseded_by_attempt_id,
-                    superseded_reason_json,
                     created_at,
                     updated_at
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, '{{}}'::jsonb, $10, $11)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                 RETURNING {EXECUTION_ATTEMPT_SELECT_COLUMNS}
                 "#
             ))
@@ -2371,8 +2369,8 @@ impl OrderRepository {
                 retry_steps.push(step);
             }
 
-            let superseded_reason = serde_json::json!({
-                "reason": "superseded_by_retry_attempt",
+            let cancelled_reason = serde_json::json!({
+                "reason": "cancelled_by_retry_attempt",
                 "retry_attempt_id": retry_attempt.id,
                 "retry_attempt_index": retry_attempt.attempt_index,
             });
@@ -2380,18 +2378,18 @@ impl OrderRepository {
                 r#"
                 UPDATE order_execution_steps
                 SET
-                    status = 'superseded',
+                    status = 'cancelled',
                     error_json = $3,
                     completed_at = COALESCE(completed_at, $4),
                     updated_at = $4
                 WHERE execution_attempt_id = $1
                   AND step_index >= $2
-                  AND status IN ('failed', 'planned', 'ready', 'waiting', 'running')
+                  AND status IN ('planned', 'ready', 'waiting', 'running')
                 "#,
             )
             .bind(failed_attempt.id)
             .bind(failed_step.step_index)
-            .bind(superseded_reason.clone())
+            .bind(cancelled_reason.clone())
             .bind(now)
             .execute(&mut *tx)
             .await?;
@@ -2399,29 +2397,13 @@ impl OrderRepository {
                 r#"
                 UPDATE order_execution_legs
                 SET
-                    status = 'superseded',
+                    status = 'cancelled',
                     updated_at = $2
                 WHERE execution_attempt_id = $1
-                  AND status IN ('failed', 'planned', 'ready', 'waiting', 'running')
+                  AND status IN ('planned', 'ready', 'waiting', 'running')
                 "#,
             )
             .bind(failed_attempt.id)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
-            sqlx_core::query::query(
-                r#"
-                UPDATE order_execution_attempts
-                SET
-                    superseded_by_attempt_id = $2,
-                    superseded_reason_json = $3,
-                    updated_at = $4
-                WHERE id = $1
-                "#,
-            )
-            .bind(failed_attempt.id)
-            .bind(retry_attempt.id)
-            .bind(superseded_reason)
             .bind(now)
             .execute(&mut *tx)
             .await?;
@@ -2628,12 +2610,10 @@ impl OrderRepository {
                     trigger_provider_operation_id,
                     failure_reason_json,
                     input_custody_snapshot_json,
-                    superseded_by_attempt_id,
-                    superseded_reason_json,
                     created_at,
                     updated_at
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, '{{}}'::jsonb, $10, $11)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                 RETURNING {EXECUTION_ATTEMPT_SELECT_COLUMNS}
                 "#
             ))
@@ -2728,18 +2708,18 @@ impl OrderRepository {
                 r#"
                 UPDATE order_execution_steps
                 SET
-                    status = 'superseded',
+                    status = 'cancelled',
                     error_json = $3,
                     completed_at = COALESCE(completed_at, $4),
                     updated_at = $4
                 WHERE execution_attempt_id = $1
-                  AND step_index >= $2
-                  AND status IN ('failed', 'planned', 'ready', 'waiting', 'running')
+                  AND step_index > $2
+                  AND status IN ('planned', 'ready', 'waiting', 'running')
                 "#,
             )
             .bind(stale_attempt.id)
             .bind(failed_step.step_index)
-            .bind(plan.superseded_reason.clone())
+            .bind(plan.cancelled_reason.clone())
             .bind(now)
             .execute(&mut *tx)
             .await?;
@@ -2747,29 +2727,13 @@ impl OrderRepository {
                 r#"
                 UPDATE order_execution_legs
                 SET
-                    status = 'superseded',
+                    status = 'cancelled',
                     updated_at = $2
                 WHERE execution_attempt_id = $1
-                  AND status IN ('failed', 'planned', 'ready', 'waiting', 'running')
+                  AND status IN ('planned', 'ready', 'waiting', 'running')
                 "#,
             )
             .bind(stale_attempt.id)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
-            sqlx_core::query::query(
-                r#"
-                UPDATE order_execution_attempts
-                SET
-                    superseded_by_attempt_id = $2,
-                    superseded_reason_json = $3,
-                    updated_at = $4
-                WHERE id = $1
-                "#,
-            )
-            .bind(stale_attempt.id)
-            .bind(refreshed_attempt.id)
-            .bind(plan.superseded_reason)
             .bind(now)
             .execute(&mut *tx)
             .await?;
@@ -2787,6 +2751,406 @@ impl OrderRepository {
         .await;
         telemetry::record_db_query(
             "order.create_refreshed_execution_attempt_from_failed_step",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        result
+    }
+
+    pub async fn create_boundary_requote_execution_attempt(
+        &self,
+        order_id: Uuid,
+        source_attempt_id: Uuid,
+        completed_step_id: Uuid,
+        completed_leg_id: Uuid,
+        plan: BoundaryRequoteExecutionAttemptPlan,
+        now: DateTime<Utc>,
+    ) -> RouterCoreResult<ExecutionAttemptMaterializationRecord> {
+        let started = Instant::now();
+        let result = async {
+            let mut tx = self.pool.begin().await?;
+
+            let order_row = sqlx_core::query::query(&format!(
+                r#"
+                SELECT {ORDER_SELECT_COLUMNS}
+                FROM router_orders ro
+                LEFT JOIN market_order_actions moa ON moa.order_id = ro.id
+                LEFT JOIN limit_order_actions loa ON loa.order_id = ro.id
+                WHERE ro.id = $1
+                FOR UPDATE OF ro
+                "#
+            ))
+            .bind(order_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let order = self.map_order_row(&order_row)?;
+
+            let source_attempt_row = sqlx_core::query::query(&format!(
+                r#"
+                SELECT {EXECUTION_ATTEMPT_SELECT_COLUMNS}
+                FROM order_execution_attempts
+                WHERE id = $1
+                FOR UPDATE
+                "#
+            ))
+            .bind(source_attempt_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let source_attempt = self.map_execution_attempt_row(&source_attempt_row)?;
+            if source_attempt.order_id != order_id {
+                return Err(RouterCoreError::Conflict {
+                    message: format!(
+                        "attempt {} does not belong to order {}",
+                        source_attempt.id, order_id
+                    ),
+                });
+            }
+
+            let requote_attempt_index = source_attempt.attempt_index + 1;
+            if let Some(existing_row) = sqlx_core::query::query(&format!(
+                r#"
+                SELECT {EXECUTION_ATTEMPT_SELECT_COLUMNS}
+                FROM order_execution_attempts
+                WHERE order_id = $1
+                  AND attempt_index = $2
+                ORDER BY created_at ASC, id ASC
+                LIMIT 1
+                FOR UPDATE
+                "#
+            ))
+            .bind(order_id)
+            .bind(requote_attempt_index)
+            .fetch_optional(&mut *tx)
+            .await?
+            {
+                let attempt = self.map_execution_attempt_row(&existing_row)?;
+                if attempt.attempt_kind != OrderExecutionAttemptKind::RefreshedExecution
+                    || attempt.trigger_step_id != Some(completed_step_id)
+                {
+                    return Err(RouterCoreError::Conflict {
+                        message: format!(
+                            "order {} attempt_index {} already materialized as {} from trigger {:?}",
+                            order_id,
+                            requote_attempt_index,
+                            attempt.attempt_kind.to_db_string(),
+                            attempt.trigger_step_id
+                        ),
+                    });
+                }
+                let leg_rows = sqlx_core::query::query(&format!(
+                    r#"
+                    SELECT {EXECUTION_LEG_SELECT_COLUMNS}
+                    FROM order_execution_legs
+                    WHERE execution_attempt_id = $1
+                    ORDER BY leg_index ASC, created_at ASC, id ASC
+                    "#
+                ))
+                .bind(attempt.id)
+                .fetch_all(&mut *tx)
+                .await?;
+                let legs = leg_rows
+                    .iter()
+                    .map(|row| self.map_execution_leg_row(row))
+                    .collect::<RouterCoreResult<Vec<_>>>()?;
+                let step_rows = sqlx_core::query::query(&format!(
+                    r#"
+                    SELECT {EXECUTION_STEP_SELECT_COLUMNS}
+                    FROM order_execution_steps
+                    WHERE execution_attempt_id = $1
+                    ORDER BY step_index ASC, created_at ASC, id ASC
+                    "#
+                ))
+                .bind(attempt.id)
+                .fetch_all(&mut *tx)
+                .await?;
+                let steps = step_rows
+                    .iter()
+                    .map(|row| self.map_execution_step_row(row))
+                    .collect::<RouterCoreResult<Vec<_>>>()?;
+                tx.commit().await?;
+                return Ok::<ExecutionAttemptMaterializationRecord, RouterCoreError>(
+                    ExecutionAttemptMaterializationRecord {
+                        order,
+                        attempt,
+                        legs,
+                        steps,
+                    },
+                );
+            }
+
+            if source_attempt.status != OrderExecutionAttemptStatus::Active {
+                return Err(RouterCoreError::Conflict {
+                    message: format!(
+                        "attempt {} cannot be requoted from {}",
+                        source_attempt.id,
+                        source_attempt.status.to_db_string()
+                    ),
+                });
+            }
+
+            let completed_step_row = sqlx_core::query::query(&format!(
+                r#"
+                SELECT {EXECUTION_STEP_SELECT_COLUMNS}
+                FROM order_execution_steps
+                WHERE id = $1
+                FOR UPDATE
+                "#
+            ))
+            .bind(completed_step_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let completed_step = self.map_execution_step_row(&completed_step_row)?;
+            if completed_step.order_id != order_id
+                || completed_step.execution_attempt_id != Some(source_attempt.id)
+                || completed_step.execution_leg_id != Some(completed_leg_id)
+            {
+                return Err(RouterCoreError::Conflict {
+                    message: format!(
+                        "step {} does not belong to order {} attempt {} leg {}",
+                        completed_step.id, order_id, source_attempt.id, completed_leg_id
+                    ),
+                });
+            }
+            if completed_step.status != OrderExecutionStepStatus::Completed {
+                return Err(RouterCoreError::Conflict {
+                    message: format!(
+                        "step {} cannot trigger boundary requote from {}",
+                        completed_step.id,
+                        completed_step.status.to_db_string()
+                    ),
+                });
+            }
+
+            let completed_leg_row = sqlx_core::query::query(&format!(
+                r#"
+                SELECT {EXECUTION_LEG_SELECT_COLUMNS}
+                FROM order_execution_legs
+                WHERE id = $1
+                FOR UPDATE
+                "#
+            ))
+            .bind(completed_leg_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let completed_leg = self.map_execution_leg_row(&completed_leg_row)?;
+            if completed_leg.order_id != order_id
+                || completed_leg.execution_attempt_id != Some(source_attempt.id)
+            {
+                return Err(RouterCoreError::Conflict {
+                    message: format!(
+                        "leg {} does not belong to order {} attempt {}",
+                        completed_leg.id, order_id, source_attempt.id
+                    ),
+                });
+            }
+            if completed_leg.status != OrderExecutionStepStatus::Completed {
+                return Err(RouterCoreError::Conflict {
+                    message: format!(
+                        "leg {} cannot trigger boundary requote from {}",
+                        completed_leg.id,
+                        completed_leg.status.to_db_string()
+                    ),
+                });
+            }
+
+            if plan.steps.is_empty() {
+                return Err(RouterCoreError::InvalidData {
+                    message: format!("boundary requote for order {} has no execution steps", order_id),
+                });
+            }
+
+            sqlx_core::query::query(
+                r#"
+                UPDATE order_execution_steps
+                SET
+                    status = 'cancelled',
+                    error_json = $3,
+                    completed_at = COALESCE(completed_at, $4),
+                    updated_at = $4
+                WHERE execution_attempt_id = $1
+                  AND step_index > $2
+                  AND status IN ('planned', 'ready')
+                "#,
+            )
+            .bind(source_attempt.id)
+            .bind(completed_step.step_index)
+            .bind(plan.reason.clone())
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            sqlx_core::query::query(
+                r#"
+                UPDATE order_execution_legs
+                SET
+                    status = 'cancelled',
+                    updated_at = $3
+                WHERE execution_attempt_id = $1
+                  AND leg_index > $2
+                  AND status IN ('planned', 'ready')
+                "#,
+            )
+            .bind(source_attempt.id)
+            .bind(completed_leg.leg_index)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            sqlx_core::query::query(&format!(
+                r#"
+                UPDATE order_execution_attempts
+                SET
+                    status = $2,
+                    failure_reason_json = $3,
+                    updated_at = $4
+                WHERE id = $1
+                  AND status = $5
+                RETURNING {EXECUTION_ATTEMPT_SELECT_COLUMNS}
+                "#
+            ))
+            .bind(source_attempt.id)
+            .bind(OrderExecutionAttemptStatus::Cancelled.to_db_string())
+            .bind(plan.reason.clone())
+            .bind(now)
+            .bind(OrderExecutionAttemptStatus::Active.to_db_string())
+            .fetch_one(&mut *tx)
+            .await?;
+
+            let requote_attempt = OrderExecutionAttempt {
+                id: Uuid::now_v7(),
+                order_id,
+                attempt_index: requote_attempt_index,
+                attempt_kind: OrderExecutionAttemptKind::RefreshedExecution,
+                status: OrderExecutionAttemptStatus::Active,
+                trigger_step_id: Some(completed_step.id),
+                trigger_provider_operation_id: source_attempt.trigger_provider_operation_id,
+                failure_reason: plan.reason.clone(),
+                input_custody_snapshot: plan.input_custody_snapshot.clone(),
+                created_at: now,
+                updated_at: now,
+            };
+            let requote_attempt_row = sqlx_core::query::query(&format!(
+                r#"
+                INSERT INTO order_execution_attempts (
+                    id,
+                    order_id,
+                    attempt_index,
+                    attempt_kind,
+                    status,
+                    trigger_step_id,
+                    trigger_provider_operation_id,
+                    failure_reason_json,
+                    input_custody_snapshot_json,
+                    created_at,
+                    updated_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                RETURNING {EXECUTION_ATTEMPT_SELECT_COLUMNS}
+                "#
+            ))
+            .bind(requote_attempt.id)
+            .bind(requote_attempt.order_id)
+            .bind(requote_attempt.attempt_index)
+            .bind(requote_attempt.attempt_kind.to_db_string())
+            .bind(requote_attempt.status.to_db_string())
+            .bind(requote_attempt.trigger_step_id)
+            .bind(requote_attempt.trigger_provider_operation_id)
+            .bind(requote_attempt.failure_reason.clone())
+            .bind(requote_attempt.input_custody_snapshot.clone())
+            .bind(requote_attempt.created_at)
+            .bind(requote_attempt.updated_at)
+            .fetch_one(&mut *tx)
+            .await?;
+            let requote_attempt = self.map_execution_attempt_row(&requote_attempt_row)?;
+
+            let mut requote_legs = Vec::with_capacity(plan.legs.len());
+            for mut leg in plan.legs {
+                leg.order_id = order_id;
+                leg.execution_attempt_id = Some(requote_attempt.id);
+                leg.status = OrderExecutionStepStatus::Planned;
+                leg.actual_amount_in = None;
+                leg.actual_amount_out = None;
+                leg.started_at = None;
+                leg.completed_at = None;
+                leg.created_at = now;
+                leg.updated_at = now;
+                set_json_value(
+                    &mut leg.details,
+                    "requoted_from_attempt_id",
+                    serde_json::json!(source_attempt.id),
+                );
+                set_json_value(
+                    &mut leg.details,
+                    "requoted_from_execution_leg_id",
+                    serde_json::json!(completed_leg.id),
+                );
+                insert_execution_leg_tx(&mut tx, &leg).await?;
+                requote_legs.push(leg);
+            }
+
+            let known_leg_ids = requote_legs
+                .iter()
+                .map(|leg| leg.id)
+                .collect::<std::collections::BTreeSet<_>>();
+            let mut requote_steps = Vec::with_capacity(plan.steps.len());
+            for mut step in plan.steps {
+                if let Some(execution_leg_id) = step.execution_leg_id {
+                    if !known_leg_ids.contains(&execution_leg_id) {
+                        return Err(RouterCoreError::InvalidData {
+                            message: format!(
+                                "requoted step {} references unmaterialized execution leg {}",
+                                step.id, execution_leg_id
+                            ),
+                        });
+                    }
+                }
+                step.order_id = order_id;
+                step.execution_attempt_id = Some(requote_attempt.id);
+                step.status = OrderExecutionStepStatus::Planned;
+                step.tx_hash = None;
+                step.provider_ref = None;
+                step.idempotency_key = Some(format!(
+                    "order:{order_id}:attempt:{requote_attempt_index}:{}:{}",
+                    step.provider, step.step_index
+                ));
+                step.attempt_count = 0;
+                step.next_attempt_at = None;
+                step.started_at = None;
+                step.completed_at = None;
+                step.response = serde_json::json!({});
+                step.error = serde_json::json!({});
+                step.created_at = now;
+                step.updated_at = now;
+                set_json_value(
+                    &mut step.details,
+                    "requoted_from_attempt_id",
+                    serde_json::json!(source_attempt.id),
+                );
+                set_json_value(
+                    &mut step.details,
+                    "requoted_from_step_id",
+                    serde_json::json!(completed_step.id),
+                );
+                set_json_value(
+                    &mut step.details,
+                    "requoted_from_execution_leg_id",
+                    serde_json::json!(completed_leg.id),
+                );
+                insert_execution_step_tx(&mut tx, &step).await?;
+                requote_steps.push(step);
+            }
+
+            tx.commit().await?;
+            Ok::<ExecutionAttemptMaterializationRecord, RouterCoreError>(
+                ExecutionAttemptMaterializationRecord {
+                    order,
+                    attempt: requote_attempt,
+                    legs: requote_legs,
+                    steps: requote_steps,
+                },
+            )
+        }
+        .await;
+        telemetry::record_db_query(
+            "order.create_boundary_requote_execution_attempt",
             result.is_ok(),
             started.elapsed(),
         );
@@ -2847,15 +3211,15 @@ impl OrderRepository {
                     ),
                 });
             }
-            if failed_attempt.status != OrderExecutionAttemptStatus::Failed {
-                return Err(RouterCoreError::Conflict {
-                    message: format!(
-                        "attempt {} cannot start refund from {}",
-                        failed_attempt.id,
-                        failed_attempt.status.to_db_string()
-                    ),
-                });
-            }
+            let failed_attempt = self
+                .ensure_attempt_failed_for_refund(
+                    &mut tx,
+                    failed_attempt,
+                    &plan.failure_reason,
+                    &plan.input_custody_snapshot,
+                    now,
+                )
+                .await?;
 
             let vault_status = sqlx_core::query_scalar::query_scalar::<_, String>(
                 r#"
@@ -2983,12 +3347,10 @@ impl OrderRepository {
                     trigger_provider_operation_id,
                     failure_reason_json,
                     input_custody_snapshot_json,
-                    superseded_by_attempt_id,
-                    superseded_reason_json,
                     created_at,
                     updated_at
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, '{{}}'::jsonb, $10, $11)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                 RETURNING {EXECUTION_ATTEMPT_SELECT_COLUMNS}
                 "#
             ))
@@ -3148,15 +3510,15 @@ impl OrderRepository {
                     ),
                 });
             }
-            if failed_attempt.status != OrderExecutionAttemptStatus::Failed {
-                return Err(RouterCoreError::Conflict {
-                    message: format!(
-                        "attempt {} cannot start refund from {}",
-                        failed_attempt.id,
-                        failed_attempt.status.to_db_string()
-                    ),
-                });
-            }
+            let failed_attempt = self
+                .ensure_attempt_failed_for_refund(
+                    &mut tx,
+                    failed_attempt,
+                    &plan.failure_reason,
+                    &plan.input_custody_snapshot,
+                    now,
+                )
+                .await?;
 
             let source_vault_row = sqlx_core::query::query(&format!(
                 r#"
@@ -3273,12 +3635,10 @@ impl OrderRepository {
                     trigger_provider_operation_id,
                     failure_reason_json,
                     input_custody_snapshot_json,
-                    superseded_by_attempt_id,
-                    superseded_reason_json,
                     created_at,
                     updated_at
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, '{{}}'::jsonb, $10, $11)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                 RETURNING {EXECUTION_ATTEMPT_SELECT_COLUMNS}
                 "#
             ))
@@ -3386,15 +3746,15 @@ impl OrderRepository {
                     ),
                 });
             }
-            if failed_attempt.status != OrderExecutionAttemptStatus::Failed {
-                return Err(RouterCoreError::Conflict {
-                    message: format!(
-                        "attempt {} cannot start refund from {}",
-                        failed_attempt.id,
-                        failed_attempt.status.to_db_string()
-                    ),
-                });
-            }
+            let failed_attempt = self
+                .ensure_attempt_failed_for_refund(
+                    &mut tx,
+                    failed_attempt,
+                    &plan.failure_reason,
+                    &plan.input_custody_snapshot,
+                    now,
+                )
+                .await?;
 
             let source_vault_row = sqlx_core::query::query(&format!(
                 r#"
@@ -3418,11 +3778,13 @@ impl OrderRepository {
             }
             if !matches!(
                 source_vault.role,
-                CustodyVaultRole::HyperliquidSpot | CustodyVaultRole::SourceDeposit
+                CustodyVaultRole::HyperliquidSpot
+                    | CustodyVaultRole::SourceDeposit
+                    | CustodyVaultRole::DestinationExecution
             ) {
                 return Err(RouterCoreError::Conflict {
                     message: format!(
-                        "custody vault {} is {}, not hyperliquid_spot or source_deposit",
+                        "custody vault {} is {}, not hyperliquid_spot, source_deposit, or destination_execution",
                         source_vault.id,
                         source_vault.role.to_db_string()
                     ),
@@ -3523,12 +3885,10 @@ impl OrderRepository {
                     trigger_provider_operation_id,
                     failure_reason_json,
                     input_custody_snapshot_json,
-                    superseded_by_attempt_id,
-                    superseded_reason_json,
                     created_at,
                     updated_at
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, '{{}}'::jsonb, $10, $11)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                 RETURNING {EXECUTION_ATTEMPT_SELECT_COLUMNS}
                 "#
             ))
@@ -3768,96 +4128,6 @@ impl OrderRepository {
         result
     }
 
-    pub async fn create_refreshed_execution_attempt(
-        &self,
-        active_attempt_id: Uuid,
-        refreshed_attempt: &OrderExecutionAttempt,
-        superseded_reason: serde_json::Value,
-        updated_at: DateTime<Utc>,
-    ) -> RouterCoreResult<OrderExecutionAttempt> {
-        let started = Instant::now();
-        let result = async {
-            let mut tx = self.pool.begin().await?;
-            let superseded_row = sqlx_core::query::query(
-                r#"
-                UPDATE order_execution_attempts
-                SET
-                    status = 'superseded',
-                    superseded_reason_json = $2,
-                    updated_at = $3
-                WHERE id = $1
-                  AND status IN ('planning', 'active')
-                RETURNING id
-                "#,
-            )
-            .bind(active_attempt_id)
-            .bind(superseded_reason.clone())
-            .bind(updated_at)
-            .fetch_optional(&mut *tx)
-            .await?;
-            if superseded_row.is_none() {
-                return Err(RouterCoreError::NotFound);
-            }
-
-            let inserted = sqlx_core::query::query(&format!(
-                r#"
-                INSERT INTO order_execution_attempts (
-                    id,
-                    order_id,
-                    attempt_index,
-                    attempt_kind,
-                    status,
-                    trigger_step_id,
-                    trigger_provider_operation_id,
-                    failure_reason_json,
-                    input_custody_snapshot_json,
-                    superseded_by_attempt_id,
-                    superseded_reason_json,
-                    created_at,
-                    updated_at
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, '{{}}'::jsonb, $10, $11)
-                RETURNING {EXECUTION_ATTEMPT_SELECT_COLUMNS}
-                "#
-            ))
-            .bind(refreshed_attempt.id)
-            .bind(refreshed_attempt.order_id)
-            .bind(refreshed_attempt.attempt_index)
-            .bind(refreshed_attempt.attempt_kind.to_db_string())
-            .bind(refreshed_attempt.status.to_db_string())
-            .bind(refreshed_attempt.trigger_step_id)
-            .bind(refreshed_attempt.trigger_provider_operation_id)
-            .bind(refreshed_attempt.failure_reason.clone())
-            .bind(refreshed_attempt.input_custody_snapshot.clone())
-            .bind(refreshed_attempt.created_at)
-            .bind(refreshed_attempt.updated_at)
-            .fetch_one(&mut *tx)
-            .await?;
-
-            sqlx_core::query::query(
-                r#"
-                UPDATE order_execution_attempts
-                SET superseded_by_attempt_id = $2
-                WHERE id = $1
-                "#,
-            )
-            .bind(active_attempt_id)
-            .bind(refreshed_attempt.id)
-            .execute(&mut *tx)
-            .await?;
-
-            tx.commit().await?;
-            self.map_execution_attempt_row(&inserted)
-        }
-        .await;
-        telemetry::record_db_query(
-            "order.create_refreshed_execution_attempt",
-            result.is_ok(),
-            started.elapsed(),
-        );
-        result
-    }
-
     pub async fn get_execution_attempt(&self, id: Uuid) -> RouterCoreResult<OrderExecutionAttempt> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
@@ -4041,6 +4311,50 @@ impl OrderRepository {
         let row = result?;
 
         self.map_execution_attempt_row(&row)
+    }
+
+    async fn ensure_attempt_failed_for_refund(
+        &self,
+        tx: &mut sqlx_core::transaction::Transaction<'_, Postgres>,
+        attempt: OrderExecutionAttempt,
+        failure_reason: &serde_json::Value,
+        input_custody_snapshot: &serde_json::Value,
+        updated_at: DateTime<Utc>,
+    ) -> RouterCoreResult<OrderExecutionAttempt> {
+        match attempt.status {
+            OrderExecutionAttemptStatus::Failed => Ok(attempt),
+            OrderExecutionAttemptStatus::Active => {
+                let row = sqlx_core::query::query(&format!(
+                    r#"
+                    UPDATE order_execution_attempts
+                    SET
+                        status = $2,
+                        failure_reason_json = $3,
+                        input_custody_snapshot_json = $4,
+                        updated_at = $5
+                    WHERE id = $1
+                      AND status = $6
+                    RETURNING {EXECUTION_ATTEMPT_SELECT_COLUMNS}
+                    "#
+                ))
+                .bind(attempt.id)
+                .bind(OrderExecutionAttemptStatus::Failed.to_db_string())
+                .bind(failure_reason.clone())
+                .bind(input_custody_snapshot.clone())
+                .bind(updated_at)
+                .bind(OrderExecutionAttemptStatus::Active.to_db_string())
+                .fetch_one(&mut **tx)
+                .await?;
+                self.map_execution_attempt_row(&row)
+            }
+            status => Err(RouterCoreError::Conflict {
+                message: format!(
+                    "attempt {} cannot start refund from {}",
+                    attempt.id,
+                    status.to_db_string()
+                ),
+            }),
+        }
     }
 
     pub async fn find_orders_pending_refund_planning(
@@ -4485,7 +4799,7 @@ impl OrderRepository {
                               SELECT 1
                               FROM order_execution_steps current_step
                               WHERE current_step.id = order_provider_operations.execution_step_id
-                                AND current_step.status IN ('superseded', 'failed', 'cancelled')
+                                AND current_step.status IN ('failed', 'cancelled')
                           )
                         THEN EXCLUDED.execution_attempt_id
                         ELSE order_provider_operations.execution_attempt_id
@@ -4497,7 +4811,7 @@ impl OrderRepository {
                               SELECT 1
                               FROM order_execution_steps current_step
                               WHERE current_step.id = order_provider_operations.execution_step_id
-                                AND current_step.status IN ('superseded', 'failed', 'cancelled')
+                                AND current_step.status IN ('failed', 'cancelled')
                           )
                         THEN EXCLUDED.execution_step_id
                         ELSE order_provider_operations.execution_step_id
@@ -6079,12 +6393,11 @@ impl OrderRepository {
                     COUNT(*) AS total_actions,
                     BOOL_OR(status = 'failed') AS has_failed,
                     BOOL_OR(status = 'cancelled') AS has_cancelled,
-                    BOOL_OR(status = 'superseded') AS has_superseded,
                     BOOL_OR(status = 'running') AS has_running,
                     BOOL_OR(status = 'waiting') AS has_waiting,
                     BOOL_OR(status = 'ready') AS has_ready,
                     COUNT(*) FILTER (WHERE status = 'completed') AS completed_actions,
-                    COUNT(*) FILTER (WHERE status IN ('completed', 'skipped', 'superseded')) AS terminal_actions,
+                    COUNT(*) FILTER (WHERE status IN ('completed', 'skipped', 'cancelled')) AS terminal_actions,
                     MIN(started_at) FILTER (WHERE started_at IS NOT NULL) AS first_started_at,
                     MAX(completed_at) FILTER (WHERE completed_at IS NOT NULL) AS last_completed_at
                 FROM current_actions
@@ -6117,10 +6430,6 @@ impl OrderRepository {
                         WHEN action_summary.total_actions > 0
                              AND action_summary.completed_actions = action_summary.total_actions
                             THEN 'completed'
-                        WHEN action_summary.total_actions > 0
-                             AND action_summary.terminal_actions = action_summary.total_actions
-                             AND action_summary.has_superseded
-                            THEN 'superseded'
                         WHEN action_summary.total_actions > 0
                              AND action_summary.terminal_actions = action_summary.total_actions
                             THEN 'skipped'
@@ -6425,7 +6734,7 @@ impl OrderRepository {
         Ok(())
     }
 
-    pub async fn supersede_execution_steps_after_index(
+    pub async fn cancel_execution_steps_after_index(
         &self,
         execution_attempt_id: Uuid,
         after_step_index: i32,
@@ -6435,9 +6744,9 @@ impl OrderRepository {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(
             r#"
-            UPDATE order_execution_steps
-            SET
-                status = 'superseded',
+                UPDATE order_execution_steps
+                SET
+                status = 'cancelled',
                 error_json = $3,
                 completed_at = COALESCE(completed_at, $4),
                 updated_at = $4
@@ -6454,7 +6763,7 @@ impl OrderRepository {
         .fetch_all(&self.pool)
         .await;
         telemetry::record_db_query(
-            "order.supersede_execution_steps_after_index",
+            "order.cancel_execution_steps_after_index",
             result.is_ok(),
             started.elapsed(),
         );

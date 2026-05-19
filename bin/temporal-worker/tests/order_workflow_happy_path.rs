@@ -346,8 +346,8 @@ async fn order_workflow_retries_failed_step_then_completes() {
     assert!(
         first_attempt_steps
             .iter()
-            .any(|step| step.status == OrderExecutionStepStatus::Superseded),
-        "first attempt failed suffix should be superseded"
+            .any(|step| step.status == OrderExecutionStepStatus::Cancelled),
+        "first attempt failed suffix should be cancelled"
     );
     let retry_attempt_steps = run
         .db
@@ -416,8 +416,8 @@ async fn order_workflow_refunds_after_retry_exhaustion() {
     assert!(
         first_attempt_steps
             .iter()
-            .any(|step| step.status == OrderExecutionStepStatus::Superseded),
-        "first attempt failed suffix should be superseded"
+            .any(|step| step.status == OrderExecutionStepStatus::Cancelled),
+        "first attempt failed suffix should be cancelled"
     );
     let second_attempt_steps = run
         .db
@@ -787,11 +787,14 @@ async fn order_workflow_refreshes_stale_quote_then_completes() {
         .expect("load stale attempt steps");
     assert!(
         stale_attempt_steps.iter().any(|step| {
-            step.status == OrderExecutionStepStatus::Superseded
-                && step.error.get("reason").and_then(serde_json::Value::as_str)
-                    == Some("superseded_by_stale_provider_quote_refresh")
+            step.status == OrderExecutionStepStatus::Failed
+                && step
+                    .error
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|reason| reason.contains("pre_execution_stale_provider_quote"))
         }),
-        "stale attempt failed suffix should be superseded by quote refresh"
+        "stale attempt trigger step should remain failed after quote refresh"
     );
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -846,18 +849,8 @@ async fn order_workflow_refreshes_stale_quote_multi_leg_then_completes() {
     let stale_velora_step = stale_attempt_steps
         .iter()
         .find(|step| step.step_type == OrderExecutionStepType::UniversalRouterSwap)
-        .expect("stale attempt should contain the superseded Velora step");
-    assert_eq!(
-        stale_velora_step.status,
-        OrderExecutionStepStatus::Superseded
-    );
-    assert_eq!(
-        stale_velora_step
-            .error
-            .get("reason")
-            .and_then(serde_json::Value::as_str),
-        Some("superseded_by_stale_provider_quote_refresh")
-    );
+        .expect("stale attempt should contain the failed Velora step");
+    assert_eq!(stale_velora_step.status, OrderExecutionStepStatus::Failed);
 
     let stale_attempt_legs = run
         .db
@@ -1079,8 +1072,8 @@ async fn order_workflow_refreshes_hyperliquid_bridge_quote_then_completes() {
     assert!(
         primary_steps.iter().any(|step| step.step_type
             == OrderExecutionStepType::HyperliquidBridgeDeposit
-            && step.status == OrderExecutionStepStatus::Superseded),
-        "primary HL bridge step should be superseded by stale-quote refresh"
+            && step.status == OrderExecutionStepStatus::Failed),
+        "primary HL bridge step should remain failed after stale-quote refresh"
     );
 
     let refreshed_steps = run
@@ -1158,9 +1151,9 @@ async fn order_workflow_refreshes_hyperliquid_trade_quote_then_completes() {
     assert!(
         primary_steps.iter().any(
             |step| step.step_type == OrderExecutionStepType::HyperliquidTrade
-                && step.status == OrderExecutionStepStatus::Superseded
+                && step.status == OrderExecutionStepStatus::Failed
         ),
-        "primary HL trade step should be superseded by stale-quote refresh"
+        "primary HL trade step should remain failed after stale-quote refresh"
     );
 
     let primary_legs = run

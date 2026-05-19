@@ -38,9 +38,9 @@ When T-router creates an execution step, it inserts an `order_execution_steps` r
 1. **CDC (preferred, real-time)** — `run_cdc_stream_once` (`runtime.rs:305-361`) decodes the logical message, queues a targeted refresh in `CdcRefreshPlan` (`runtime.rs:1048-1055`), then on the next `Commit` event calls `refresh_provider_operation` (line 1000-1006) to reload the single row and upsert into the store. Latency: <1s normally.
 2. **Periodic full reconcile** — `run_full_reconcile_loop` (line 375-410) re-queries everything in `('submitted', 'waiting_external')` and revision-guarded replaces. Configurable interval. Exists as a CDC-gap backstop.
 
-### THE BUG: step supersede is invisible to Sauron
+### THE BUG: step replacement is invisible to Sauron
 
-When `QuoteRefreshWorkflow` supersedes a step (e.g., on `pre_execution_stale_provider_quote`):
+When `QuoteRefreshWorkflow` cancels a stale route suffix and creates replacement steps (e.g., on `pre_execution_stale_provider_quote`):
 
 1. Old step → terminal status; old `order_provider_operations.status` may stay `'submitted'`.
 2. New step + new `order_provider_operations` row inserted, also `'submitted'`.

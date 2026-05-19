@@ -209,31 +209,33 @@ pub(super) async fn discover_single_refund_position_with_deps(
                 }
             }
             CustodyVaultRole::DestinationExecution => {
-                if let Some(asset_id) = vault.asset.clone() {
-                    let amount = deps
-                        .custody_action_executor
-                        .custody_vault_balance_raw(&vault)
-                        .await
-                        .map_err(|source| {
-                            custody_action_error("read external custody refund balance", source)
-                        })?;
-                    if raw_amount_is_positive(&amount, "external custody refund balance")? {
-                        positions.push(SingleRefundPosition {
-                            position_kind: RecoverablePositionKind::ExternalCustody,
-                            owning_step_id: None,
-                            funding_vault_id: None,
-                            custody_vault_id: Some(vault.id.into()),
-                            asset: DepositAsset {
-                                chain: vault.chain.clone(),
-                                asset: asset_id,
-                            },
-                            amount: RawAmount::new(amount).map_err(|source| {
-                                amount_parse_error("external custody refund balance", source)
-                            })?,
-                            hyperliquid_coin: None,
-                            hyperliquid_canonical: None,
-                            requires_clearinghouse_unwrap: false,
-                        });
+                if external_custody_direct_balance_supported(&vault.chain) {
+                    if let Some(asset_id) = vault.asset.clone() {
+                        let amount = deps
+                            .custody_action_executor
+                            .custody_vault_balance_raw(&vault)
+                            .await
+                            .map_err(|source| {
+                                custody_action_error("read external custody refund balance", source)
+                            })?;
+                        if raw_amount_is_positive(&amount, "external custody refund balance")? {
+                            positions.push(SingleRefundPosition {
+                                position_kind: RecoverablePositionKind::ExternalCustody,
+                                owning_step_id: None,
+                                funding_vault_id: None,
+                                custody_vault_id: Some(vault.id.into()),
+                                asset: DepositAsset {
+                                    chain: vault.chain.clone(),
+                                    asset: asset_id,
+                                },
+                                amount: RawAmount::new(amount).map_err(|source| {
+                                    amount_parse_error("external custody refund balance", source)
+                                })?,
+                                hyperliquid_coin: None,
+                                hyperliquid_canonical: None,
+                                requires_clearinghouse_unwrap: false,
+                            });
+                        }
                     }
                 }
                 positions.extend(
@@ -272,12 +274,23 @@ pub(super) async fn discover_single_refund_position_with_deps(
     ))
 }
 
+fn external_custody_direct_balance_supported(chain: &ChainId) -> bool {
+    matches!(
+        backend_chain_for_id(chain),
+        Some(ChainType::Bitcoin | ChainType::Ethereum | ChainType::Arbitrum | ChainType::Base)
+    )
+}
+
 async fn hyperliquid_spot_refund_positions_for_vault(
     deps: &OrderActivityDeps,
     order: &RouterOrder,
     vault: &CustodyVault,
     position_asset: Option<DepositAsset>,
 ) -> Result<Vec<SingleRefundPosition>, OrderActivityError> {
+    if vault.role != CustodyVaultRole::HyperliquidSpot && Address::from_str(&vault.address).is_err()
+    {
+        return Ok(Vec::new());
+    }
     let balances = deps
         .custody_action_executor
         .inspect_hyperliquid_spot_balances(vault)
@@ -530,6 +543,9 @@ async fn load_external_custody_refund_source(
             ),
         ));
     }
+    if !external_custody_direct_balance_supported(&vault.chain) {
+        return Ok(None);
+    }
     let Some(asset_id) = vault.asset.clone() else {
         return Ok(None);
     };
@@ -613,7 +629,7 @@ pub(super) async fn materialize_hyperliquid_spot_refund_plan(
     };
 
     let now = Utc::now();
-    let Some((mut legs, steps)) = hyperliquid_spot_refund_back_steps(
+    let Some((mut legs, mut steps)) = hyperliquid_spot_refund_back_steps(
         deps,
         &source.order,
         &source.vault,
@@ -633,6 +649,7 @@ pub(super) async fn materialize_hyperliquid_spot_refund_plan(
         .and_then(|leg| leg.transition_decl_id.as_deref())
         .unwrap_or("unknown")
         .to_string();
+    steps = hydrate_destination_execution_steps(deps, input.order_id.inner(), steps).await?;
     apply_execution_leg_usd_valuations(deps, &mut legs).await;
     let (refund_attempt_id, steps) =
         create_hyperliquid_spot_refund_attempt(deps, &input, &source, legs, steps, now).await?;
@@ -743,12 +760,14 @@ fn validate_hyperliquid_spot_refund_vault(
     }
     if !matches!(
         vault.role,
-        CustodyVaultRole::HyperliquidSpot | CustodyVaultRole::SourceDeposit
+        CustodyVaultRole::HyperliquidSpot
+            | CustodyVaultRole::SourceDeposit
+            | CustodyVaultRole::DestinationExecution
     ) {
         return Err(invariant_error(
             "hyperliquid_spot_vault_role",
             format!(
-                "custody vault {} is {}, not hyperliquid_spot or source_deposit",
+                "custody vault {} is {}, not hyperliquid_spot, source_deposit, or destination_execution",
                 vault.id,
                 vault.role.to_db_string()
             ),

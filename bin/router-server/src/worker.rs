@@ -970,7 +970,7 @@ mod tests {
     }
 
     #[test]
-    fn workflow_start_queue_global_work_supersedes_targeted_ids() {
+    fn workflow_start_queue_global_work_replaces_targeted_ids() {
         let first = Uuid::now_v7();
         let second = Uuid::now_v7();
         let mut queue = WorkflowStartQueue::default();

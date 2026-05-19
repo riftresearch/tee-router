@@ -142,10 +142,10 @@ CREATE TABLE public.order_execution_attempts (
     created_at timestamp with time zone NOT NULL,
     updated_at timestamp with time zone NOT NULL,
     CONSTRAINT order_execution_attempts_attempt_index_positive CHECK ((attempt_index > 0)),
-    CONSTRAINT order_execution_attempts_attempt_kind_check CHECK ((attempt_kind = ANY (ARRAY['primary_execution'::text, 'retry_execution'::text, 'refund_recovery'::text]))),
+    CONSTRAINT order_execution_attempts_attempt_kind_check CHECK ((attempt_kind = ANY (ARRAY['primary_execution'::text, 'retry_execution'::text, 'refreshed_execution'::text, 'refund_recovery'::text]))),
     CONSTRAINT order_execution_attempts_failure_reason_object CHECK ((jsonb_typeof(failure_reason_json) = 'object'::text)),
     CONSTRAINT order_execution_attempts_input_custody_snapshot_object CHECK ((jsonb_typeof(input_custody_snapshot_json) = 'object'::text)),
-    CONSTRAINT order_execution_attempts_status_check CHECK ((status = ANY (ARRAY['planning'::text, 'active'::text, 'completed'::text, 'failed'::text, 'refund_required'::text])))
+    CONSTRAINT order_execution_attempts_status_check CHECK ((status = ANY (ARRAY['planning'::text, 'active'::text, 'completed'::text, 'failed'::text, 'refund_required'::text, 'cancelled'::text])))
 );
 
 
@@ -775,5 +775,3 @@ ALTER TABLE ONLY public.paymaster_gas_ledger
 
 ALTER TABLE ONLY public.router_orders
     ADD CONSTRAINT router_orders_funding_vault_id_fkey FOREIGN KEY (funding_vault_id) REFERENCES public.deposit_vaults(id);
-
-

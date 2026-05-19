@@ -640,7 +640,7 @@ async fn create_failed_attempt_with_transient_legs(
             .then_some(now),
             completed_at: (status == OrderExecutionStepStatus::Failed).then_some(now),
             provider_quote_expires_at: None,
-            details: json!({ "source": "supersede_fixture" }),
+            details: json!({ "source": "cancel_fixture" }),
             usd_valuation: json!({}),
             created_at: now,
             updated_at: now,
@@ -676,7 +676,7 @@ async fn create_failed_attempt_with_transient_legs(
             )
             .then_some(now),
             completed_at: (status == OrderExecutionStepStatus::Failed).then_some(now),
-            details: json!({ "source": "supersede_fixture" }),
+            details: json!({ "source": "cancel_fixture" }),
             request: json!({}),
             response: json!({}),
             error: if status == OrderExecutionStepStatus::Failed {
@@ -740,7 +740,7 @@ fn refreshed_attempt_plan_for_order(
             started_at: None,
             completed_at: None,
             provider_quote_expires_at: None,
-            details: json!({ "source": "refreshed_supersede_fixture" }),
+            details: json!({ "source": "refreshed_cancel_fixture" }),
             usd_valuation: json!({}),
             created_at: now,
             updated_at: now,
@@ -765,7 +765,7 @@ fn refreshed_attempt_plan_for_order(
             next_attempt_at: None,
             started_at: None,
             completed_at: None,
-            details: json!({ "source": "refreshed_supersede_fixture" }),
+            details: json!({ "source": "refreshed_cancel_fixture" }),
             request: json!({}),
             response: json!({}),
             error: json!({}),
@@ -780,7 +780,7 @@ fn refreshed_attempt_plan_for_order(
         legs,
         steps,
         failure_reason: json!({ "reason": "test_refreshed_attempt" }),
-        superseded_reason: json!({ "reason": "test_superseded_by_refreshed_attempt" }),
+        cancelled_reason: json!({ "reason": "test_cancelled_by_refreshed_attempt" }),
         input_custody_snapshot: json!({}),
     }
 }
@@ -830,12 +830,12 @@ async fn create_executing_market_test_order(
 }
 
 #[tokio::test]
-async fn retry_supersedes_failed_attempt_legs() {
+async fn retry_cancels_failed_attempt_legs() {
     let db = test_db().await;
     let now = Utc::now();
     let order = create_executing_market_test_order(&db, now).await;
     let fixture =
-        create_failed_attempt_with_transient_legs(&db, &order, now, "retry-supersedes").await;
+        create_failed_attempt_with_transient_legs(&db, &order, now, "retry-cancels").await;
     let retry = db
         .orders()
         .create_retry_execution_attempt_from_failed_step(
@@ -847,18 +847,26 @@ async fn retry_supersedes_failed_attempt_legs() {
         .await
         .unwrap();
 
-    let superseded_legs = db
+    let cancelled_legs = db
         .orders()
         .get_execution_legs_for_attempt(fixture.attempt.id)
         .await
         .unwrap();
-    assert_eq!(superseded_legs.len(), fixture.legs.len());
-    assert!(
-        superseded_legs
+    assert_eq!(cancelled_legs.len(), fixture.legs.len());
+    assert_eq!(
+        cancelled_legs
             .iter()
-            .all(|leg| leg.status == OrderExecutionStepStatus::Superseded),
+            .find(|leg| leg.leg_index == 0)
+            .map(|leg| leg.status),
+        Some(OrderExecutionStepStatus::Failed)
+    );
+    assert!(
+        cancelled_legs
+            .iter()
+            .filter(|leg| leg.leg_index > 0)
+            .all(|leg| leg.status == OrderExecutionStepStatus::Cancelled),
         "failed attempt leg statuses: {:?}",
-        superseded_legs
+        cancelled_legs
             .iter()
             .map(|leg| leg.status)
             .collect::<Vec<_>>()
@@ -880,12 +888,12 @@ async fn retry_supersedes_failed_attempt_legs() {
 }
 
 #[tokio::test]
-async fn refreshed_supersedes_failed_attempt_legs() {
+async fn refreshed_cancels_failed_attempt_legs() {
     let db = test_db().await;
     let now = Utc::now();
     let order = create_executing_market_test_order(&db, now).await;
     let fixture =
-        create_failed_attempt_with_transient_legs(&db, &order, now, "refresh-supersedes").await;
+        create_failed_attempt_with_transient_legs(&db, &order, now, "refresh-cancels").await;
     let plan = refreshed_attempt_plan_for_order(
         &order,
         now + chrono::Duration::seconds(5),
@@ -904,18 +912,26 @@ async fn refreshed_supersedes_failed_attempt_legs() {
         .await
         .unwrap();
 
-    let superseded_legs = db
+    let cancelled_legs = db
         .orders()
         .get_execution_legs_for_attempt(fixture.attempt.id)
         .await
         .unwrap();
-    assert_eq!(superseded_legs.len(), fixture.legs.len());
-    assert!(
-        superseded_legs
+    assert_eq!(cancelled_legs.len(), fixture.legs.len());
+    assert_eq!(
+        cancelled_legs
             .iter()
-            .all(|leg| leg.status == OrderExecutionStepStatus::Superseded),
+            .find(|leg| leg.leg_index == 0)
+            .map(|leg| leg.status),
+        Some(OrderExecutionStepStatus::Failed)
+    );
+    assert!(
+        cancelled_legs
+            .iter()
+            .filter(|leg| leg.leg_index > 0)
+            .all(|leg| leg.status == OrderExecutionStepStatus::Cancelled),
         "failed attempt leg statuses: {:?}",
-        superseded_legs
+        cancelled_legs
             .iter()
             .map(|leg| leg.status)
             .collect::<Vec<_>>()
@@ -5958,7 +5974,7 @@ async fn market_order_route_planner_uses_direct_unit_when_source_is_unit_ingress
 
 #[tokio::test]
 #[ignore = "integration: spawns devnet stack"]
-async fn execution_leg_rollup_ignores_superseded_failed_retry_actions() {
+async fn execution_leg_rollup_ignores_cancelled_failed_retry_actions() {
     let h = harness().await;
     let db = test_db().await;
     let (order_manager, _mocks) = mock_order_manager(db.clone(), h.chain_registry.clone()).await;

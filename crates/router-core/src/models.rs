@@ -1033,7 +1033,7 @@ pub enum OrderExecutionAttemptStatus {
     Completed,
     Failed,
     RefundRequired,
-    Superseded,
+    Cancelled,
 }
 
 impl OrderExecutionAttemptStatus {
@@ -1045,7 +1045,7 @@ impl OrderExecutionAttemptStatus {
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::RefundRequired => "refund_required",
-            Self::Superseded => "superseded",
+            Self::Cancelled => "cancelled",
         }
     }
 
@@ -1056,7 +1056,7 @@ impl OrderExecutionAttemptStatus {
             "completed" => Some(Self::Completed),
             "failed" => Some(Self::Failed),
             "refund_required" => Some(Self::RefundRequired),
-            "superseded" => Some(Self::Superseded),
+            "cancelled" => Some(Self::Cancelled),
             _ => None,
         }
     }
@@ -1221,7 +1221,6 @@ pub enum OrderExecutionStepStatus {
     Failed,
     Skipped,
     Cancelled,
-    Superseded,
 }
 
 impl OrderExecutionStepStatus {
@@ -1236,7 +1235,6 @@ impl OrderExecutionStepStatus {
             Self::Failed => "failed",
             Self::Skipped => "skipped",
             Self::Cancelled => "cancelled",
-            Self::Superseded => "superseded",
         }
     }
 
@@ -1250,7 +1248,6 @@ impl OrderExecutionStepStatus {
             "failed" => Some(Self::Failed),
             "skipped" => Some(Self::Skipped),
             "cancelled" => Some(Self::Cancelled),
-            "superseded" => Some(Self::Superseded),
             _ => None,
         }
     }

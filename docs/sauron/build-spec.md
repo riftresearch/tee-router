@@ -357,13 +357,13 @@ The MultiSource is itself an `EventSource<E>` and composes. Consumers see one st
 
 ### a) `execution_step_id` propagation through watches and hints
 
-**Problem:** today, `ProviderOperationWatchEntry` (`bin/sauron/src/provider_operations.rs:58`) does not store `execution_step_id`. When a step is superseded and a new step takes its place, both old and new operations end up in the watch store sharing the same address; emitted hints are tagged with the operation ID, not the step ID, causing T-router's verifier to reject hints with "belongs to step A, not B." This is the root cause of the 127-order stall observed in the 2026-05-11 loadgen run.
+**Problem:** today, `ProviderOperationWatchEntry` (`bin/sauron/src/provider_operations.rs:58`) does not store `execution_step_id`. When a step is cancelled and a replacement step takes its place, both old and new operations end up in the watch store sharing the same address; emitted hints are tagged with the operation ID, not the step ID, causing T-router's verifier to reject hints with "belongs to step A, not B." This is the root cause of the 127-order stall observed in the 2026-05-11 loadgen run.
 
 **Fix:**
 - Add `execution_step_id` column to the watch query (`provider_operations.rs:16-31`).
 - Add `execution_step_id` field to `ProviderOperationWatchEntry`.
 - Propagate `execution_step_id` through every emitted hint (Sauron-side `DetectorHint` carries it; T-router's verifier matches against the live step).
-- When a step is superseded (status change observable via CDC), Sauron drops the watch for the old step and registers for the new.
+- When a step is cancelled (status change observable via CDC), Sauron drops the watch for the old step and registers for the new.
 
 **Scope:** Sauron-side change only; touches watch entry, query, and hint emission. T-router's verifier already uses `execution_step_id` as the routing key — this fix just feeds it the correct value.
 
@@ -501,7 +501,7 @@ API + ingestion semantics finalized (component §3 + `docs/sauron/hyperliquid-ap
 
 When this spec is fully built, the following are true:
 
-1. Loadgen-fast 10k drains to 100% with zero false-positive refunds and zero MIR caused by missed hints. (Today: 98.7% drain with 127 stalls due to step-supersede + missing HL backend.)
+1. Loadgen-fast 10k drains to 100% with zero false-positive refunds and zero MIR caused by missed hints. (Today: 98.7% drain with 127 stalls due to cancelled-step replacement + missing HL backend.)
 2. Sauron LOC drops from 5,051 to ~1,500 (target — actual TBD after refactor).
 3. Adding a new EVM chain requires zero Sauron code change — just stand up an indexer + receipt watcher instance.
 4. Adding a new venue requires composing existing typed clients in a new `Observer` struct in Sauron — no transport plumbing.

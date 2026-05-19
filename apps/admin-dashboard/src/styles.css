@@ -1254,7 +1254,7 @@ code,
   flex-wrap: wrap;
 }
 
-.timeline-superseded-badge {
+.timeline-cancelled-badge {
   display: inline-flex;
   align-items: center;
   min-height: 24px;

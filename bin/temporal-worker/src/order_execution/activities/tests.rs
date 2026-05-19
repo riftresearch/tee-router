@@ -286,6 +286,8 @@ impl UnitProvider for CountingUnitWithdrawalProvider {
 
 struct TestHyperliquidExchangeProvider;
 
+struct TestVeloraExchangeProvider;
+
 struct TestHyperliquidBridgeProvider;
 
 impl router_core::services::action_providers::BridgeProvider for TestHyperliquidBridgeProvider {
@@ -384,6 +386,68 @@ impl ExchangeProvider for TestHyperliquidExchangeProvider {
         Box::pin(async {
             Ok(ProviderExecutionIntent::ProviderOnly {
                 response: json!({ "kind": "test_hyperliquid_trade" }),
+                state: ProviderExecutionState::default(),
+            })
+        })
+    }
+}
+
+impl ExchangeProvider for TestVeloraExchangeProvider {
+    fn id(&self) -> &str {
+        ProviderId::Velora.as_str()
+    }
+
+    fn quote_trade<'a>(
+        &'a self,
+        request: ExchangeQuoteRequest,
+    ) -> ProviderFuture<'a, Option<ExchangeQuote>> {
+        Box::pin(async move {
+            let amount_in = match &request.order_kind {
+                ProviderOrderKind::ExactIn { amount_in, .. } => amount_in.clone(),
+                ProviderOrderKind::ExactOut { amount_out, .. } => amount_out.clone(),
+            };
+            let amount_out = if request.output_asset.asset.is_native() {
+                amount_in.clone()
+            } else {
+                "1000000".to_string()
+            };
+
+            Ok(Some(ExchangeQuote {
+                provider_id: self.id().to_string(),
+                amount_in: amount_in.clone(),
+                amount_out: amount_out.clone(),
+                min_amount_out: Some("1".to_string()),
+                max_amount_in: None,
+                provider_quote: json!({
+                    "schema_version": 1,
+                    "kind": "universal_router_swap",
+                    "input_asset": QuoteLegAsset::from_deposit_asset(&request.input_asset),
+                    "output_asset": QuoteLegAsset::from_deposit_asset(&request.output_asset),
+                    "order_kind": match &request.order_kind {
+                        ProviderOrderKind::ExactIn { .. } => "exact_in",
+                        ProviderOrderKind::ExactOut { .. } => "exact_out",
+                    },
+                    "amount_in": amount_in,
+                    "amount_out": amount_out,
+                    "min_amount_out": "1",
+                    "src_decimals": request.input_decimals.unwrap_or(18),
+                    "dest_decimals": request.output_decimals.unwrap_or(6),
+                    "price_route": {
+                        "kind": "test_velora_route",
+                    },
+                }),
+                expires_at: Utc::now() + chrono::Duration::minutes(10),
+            }))
+        })
+    }
+
+    fn execute_trade<'a>(
+        &'a self,
+        _request: &'a ExchangeExecutionRequest,
+    ) -> ProviderFuture<'a, ProviderExecutionIntent> {
+        Box::pin(async {
+            Ok(ProviderExecutionIntent::ProviderOnly {
+                response: json!({ "kind": "test_velora_swap" }),
                 state: ProviderExecutionState::default(),
             })
         })
@@ -1217,12 +1281,12 @@ async fn dispatch_step_retry_short_circuits_on_persisted_operation() {
     .expect("first dispatch_unit_withdrawal_step");
     assert!(matches!(first.outcome, DispatchOutcome::Waiting));
 
-    // Mark the first step superseded so the retry can re-enter dispatch on a
+    // Mark the first step cancelled so the retry can re-enter dispatch on a
     // fresh row (mirrors how `materialize_retry_attempt` re-creates the step).
     sqlx_core::query::query(
         r#"
         UPDATE order_execution_steps
-        SET status = 'superseded',
+        SET status = 'cancelled',
             completed_at = $2,
             updated_at = $2
         WHERE id = $1
@@ -1232,7 +1296,7 @@ async fn dispatch_step_retry_short_circuits_on_persisted_operation() {
     .bind(Utc::now())
     .execute(&test_db.pool)
     .await
-    .expect("mark first unit withdrawal step superseded");
+    .expect("mark first unit withdrawal step cancelled");
 
     let retry = run_step_dispatch(
         &deps,
@@ -1876,6 +1940,129 @@ async fn hyperliquid_spot_refund_plan_to_bitcoin_is_quotable_and_materialized() 
             .get("recipient_address")
             .and_then(Value::as_str),
         Some(order.refund_address.as_str())
+    );
+}
+
+#[tokio::test]
+async fn hyperliquid_spot_refund_plan_hydrates_nonfinal_unit_withdrawal_recipient() {
+    let test_db = test_database().await;
+    let hyperliquid_info = TestHyperliquidInfoServer::spawn().await;
+    let (unit_provider, _gen_calls) =
+        CountingUnitWithdrawalProvider::new(hyperliquid_info.base_url.clone());
+    let action_providers = Arc::new(ActionProviderRegistry::new(
+        vec![],
+        vec![Arc::new(unit_provider) as Arc<dyn UnitProvider>],
+        vec![
+            Arc::new(TestHyperliquidExchangeProvider) as Arc<dyn ExchangeProvider>,
+            Arc::new(TestVeloraExchangeProvider) as Arc<dyn ExchangeProvider>,
+        ],
+    ));
+    let deps = test_deps_with_action_providers(
+        test_db.db.clone(),
+        action_providers,
+        Some(hyperliquid_info.base_url.clone()),
+    );
+    let planned_at = Utc::now();
+    let source_usdc = test_asset("evm:8453", "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913");
+    let native_base = test_asset("evm:8453", "native");
+    let hl_eth = test_asset("hyperliquid", "UETH");
+    let mut order = test_order(source_usdc.clone(), planned_at);
+    order.workflow_parent_span_id = order.workflow_trace_id[..16].to_string();
+    let failed_attempt_id = Uuid::now_v7();
+    let vault = test_custody_vault(&order, CustodyVaultRole::DestinationExecution, &source_usdc);
+    let mut native_base_vault =
+        test_custody_vault(&order, CustodyVaultRole::DestinationExecution, &native_base);
+    native_base_vault.address = test_address(10);
+    seed_hyperliquid_spot_refund_order(
+        &test_db.db,
+        &test_db.pool,
+        &order,
+        failed_attempt_id,
+        &vault,
+    )
+    .await;
+    test_db
+        .db
+        .orders()
+        .create_custody_vault(&native_base_vault)
+        .await
+        .expect("insert native Base destination execution vault");
+
+    let shape = materialize_hyperliquid_spot_refund_plan(
+        &deps,
+        MaterializeRefundPlanInput {
+            order_id: order.id.into(),
+            failed_attempt_id: failed_attempt_id.into(),
+            position: SingleRefundPosition {
+                position_kind: RecoverablePositionKind::HyperliquidSpot,
+                owning_step_id: None,
+                funding_vault_id: None,
+                custody_vault_id: Some(vault.id.into()),
+                asset: hl_eth.clone(),
+                amount: RawAmount::new("1000000000000000000").expect("valid raw amount"),
+                hyperliquid_coin: Some("UETH".to_string()),
+                hyperliquid_canonical: Some(CanonicalAsset::Eth),
+                requires_clearinghouse_unwrap: false,
+            },
+        },
+    )
+    .await
+    .expect("materialize HyperliquidSpot refund plan");
+
+    let refund_attempt_id = match shape.outcome {
+        RefundPlanOutcome::Materialized {
+            refund_attempt_id, ..
+        } => refund_attempt_id,
+        RefundPlanOutcome::Untenable { reason } => {
+            panic!("expected materialized refund plan, got {reason:?}")
+        }
+    };
+    let persisted_steps = deps
+        .db
+        .orders()
+        .get_execution_steps_for_attempt(refund_attempt_id.inner())
+        .await
+        .expect("load persisted refund steps");
+    let unit_withdrawal = persisted_steps
+        .iter()
+        .find(|step| step.step_type == OrderExecutionStepType::UnitWithdrawal)
+        .expect("non-final Unit withdrawal refund step");
+    assert_eq!(unit_withdrawal.output_asset, Some(native_base.clone()));
+    UnitWithdrawalStepRequest::from_value(&unit_withdrawal.request)
+        .expect("hydrated Unit withdrawal request decodes");
+    let recipient_address = unit_withdrawal
+        .request
+        .get("recipient_address")
+        .and_then(Value::as_str)
+        .expect("hydrated recipient address");
+    let recipient_vault_id = unit_withdrawal
+        .request
+        .get("recipient_custody_vault_id")
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .expect("hydrated recipient vault id");
+    let recipient_vault = deps
+        .db
+        .orders()
+        .get_custody_vault(recipient_vault_id)
+        .await
+        .expect("load hydrated recipient vault");
+    assert_eq!(recipient_vault.role, CustodyVaultRole::DestinationExecution);
+    assert_eq!(recipient_vault.chain, native_base.chain);
+    assert_eq!(recipient_vault.asset.as_ref(), Some(&native_base.asset));
+    assert_eq!(recipient_vault.address, recipient_address);
+
+    let swap = persisted_steps
+        .iter()
+        .find(|step| step.step_type == OrderExecutionStepType::UniversalRouterSwap)
+        .expect("final refund swap step");
+    assert_eq!(
+        swap.request.get("source_custody_vault_id"),
+        unit_withdrawal.request.get("recipient_custody_vault_id")
+    );
+    assert_eq!(
+        swap.request.get("source_custody_vault_address"),
+        unit_withdrawal.request.get("recipient_address")
     );
 }
 
@@ -3830,7 +4017,7 @@ async fn seed_unit_deposit_retry_steps(
             first_attempt_id,
             1_i32,
             OrderExecutionAttemptKind::PrimaryExecution,
-            OrderExecutionAttemptStatus::Superseded,
+            OrderExecutionAttemptStatus::Cancelled,
         ),
         (
             retry_attempt_id,
@@ -4084,7 +4271,7 @@ async fn seed_unit_withdrawal_retry_steps(
             first_attempt_id,
             1_i32,
             OrderExecutionAttemptKind::PrimaryExecution,
-            OrderExecutionAttemptStatus::Superseded,
+            OrderExecutionAttemptStatus::Cancelled,
         ),
         (
             retry_attempt_id,
@@ -4304,7 +4491,7 @@ async fn run_unit_withdrawal_retry_idempotency_scenario() -> (usize, usize) {
     sqlx_core::query::query(
         r#"
         UPDATE order_execution_steps
-        SET status = 'superseded',
+        SET status = 'cancelled',
             completed_at = $2,
             updated_at = $2
         WHERE id = $1
@@ -4314,7 +4501,7 @@ async fn run_unit_withdrawal_retry_idempotency_scenario() -> (usize, usize) {
     .bind(Utc::now())
     .execute(&test_db.pool)
     .await
-    .expect("mark first unit withdrawal step superseded");
+    .expect("mark first unit withdrawal step cancelled");
 
     execute_running_step(&deps, &retry_step)
         .await
