@@ -1,0 +1,76 @@
+// In-TEE Alloy sidecar — runs inside compose.phala.yml.
+//
+// Push-out only. It scrapes the Phala core stack over the compose-internal
+// network and receives OTLP logs from the Phala services locally, then makes
+// a SINGLE authenticated OTLP egress to alloy-v3 on Railway. No published
+// ports — zero inbound to the TEE.
+
+logging {
+  level  = "info"
+  format = "logfmt"
+}
+
+// ---- Single authenticated egress to alloy-v3 -------------------------------
+
+otelcol.auth.bearer "egress" {
+  // OBS_INGEST_TOKEN: injected from Phala secret material; must equal the
+  // value alloy-v3 validates.
+  token = sys.env("OBS_INGEST_TOKEN")
+}
+
+otelcol.exporter.otlphttp "egress" {
+  client {
+    // ALLOY_V3_OTLP_URL: alloy-v3's public Railway endpoint, e.g.
+    // https://alloy-v3-production.up.railway.app
+    endpoint = sys.env("ALLOY_V3_OTLP_URL")
+    auth     = otelcol.auth.bearer.egress.handler
+  }
+}
+
+otelcol.processor.batch "egress" {
+  output {
+    metrics = [otelcol.exporter.otlphttp.egress.input]
+    logs    = [otelcol.exporter.otlphttp.egress.input]
+  }
+}
+
+// ---- Scrape Phala core services (compose-internal DNS) ---------------------
+
+prometheus.scrape "phala_core" {
+  targets = [
+    {"__address__" = "router-api:9100", "job" = "router-api"},
+    {"__address__" = "router-worker:9101", "job" = "router-worker"},
+    {"__address__" = "temporal-worker:9103", "job" = "temporal-worker"},
+    {"__address__" = "temporal:9090", "job" = "temporal-frontend"},
+    {"__address__" = "temporal-history:9090", "job" = "temporal-history"},
+    {"__address__" = "temporal-matching:9090", "job" = "temporal-matching"},
+    {"__address__" = "temporal-internal-worker:9090", "job" = "temporal-internal-worker"},
+  ]
+
+  scrape_interval = "15s"
+  scrape_timeout  = "10s"
+  forward_to      = [otelcol.receiver.prometheus.phala_core.receiver]
+}
+
+// Convert scraped Prometheus metrics into the OTLP pipeline so a single
+// authenticated OTLP channel carries both metrics and logs.
+otelcol.receiver.prometheus "phala_core" {
+  output {
+    metrics = [otelcol.processor.batch.egress.input]
+  }
+}
+
+// ---- Receive OTLP logs from the Phala services (compose network only) ------
+
+otelcol.receiver.otlp "phala_logs" {
+  http {
+    endpoint = "0.0.0.0:4318"
+  }
+  grpc {
+    endpoint = "0.0.0.0:4317"
+  }
+
+  output {
+    logs = [otelcol.processor.batch.egress.input]
+  }
+}

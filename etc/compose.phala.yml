@@ -10,11 +10,14 @@ configs:
       max_wal_senders = 10
       max_replication_slots = 10
       hot_standby = on
+      # Source-of-truth DB: synchronous_commit stays ON (durability). Only the
+      # non-durability tuning from a391849 (buffers/cache/pool) is applied here;
+      # the reconstructible-DB synchronous_commit=off profile is deliberately NOT.
       synchronous_commit = on
-      shared_buffers = 256MB
-      effective_cache_size = 1GB
+      shared_buffers = 1GB
+      effective_cache_size = 4GB
       work_mem = 16MB
-      maintenance_work_mem = 128MB
+      maintenance_work_mem = 256MB
       checkpoint_timeout = 15min
       max_wal_size = 2GB
       random_page_cost = 1.1
@@ -69,6 +72,45 @@ configs:
           constraints: {}
       system.forceSearchAttributesCacheRefreshOnRead:
         - value: true
+          constraints: {}
+
+      # Throughput ceilings -- raise from defaults (frontend 2400 / matching 1200 / history 3000)
+      frontend.rps:
+        - value: 4800
+          constraints: {}
+      matching.rps:
+        - value: 2400
+          constraints: {}
+      history.rps:
+        - value: 6000
+          constraints: {}
+
+      # Persistence QPS ceilings -- raise from defaults (frontend 2000 / matching+history 9000)
+      frontend.persistenceMaxQPS:
+        - value: 4000
+          constraints: {}
+      matching.persistenceMaxQPS:
+        - value: 18000
+          constraints: {}
+      history.persistenceMaxQPS:
+        - value: 18000
+          constraints: {}
+
+      # Task queue partitions -- raise from default 4 to match poller concurrency (~64-128)
+      matching.numTaskqueueReadPartitions:
+        - value: 16
+          constraints: {}
+      matching.numTaskqueueWritePartitions:
+        - value: 16
+          constraints: {}
+
+      # Host-level history cache (entries). Was history.cacheMaxSize pre-1.27.
+      # Default is 128000; bumping to 256000 to reduce shard reload churn under sustained load.
+      history.hostLevelCacheMaxSize:
+        - value: 256000
+          constraints: {}
+      history.eventsCacheMaxSizeBytes:
+        - value: 1073741824   # 1 GiB
           constraints: {}
 
   temporal-setup-postgres:
@@ -149,6 +191,67 @@ configs:
         sleep "$${sleep_seconds}"
       done
 
+  # In-TEE Alloy sidecar config. Source of truth: etc/alloy.phala.alloy —
+  # kept inline here so compose.phala.yml stays self-contained (no repo
+  # bind mounts). Keep the two in sync.
+  phala-alloy-config:
+    content: |
+      logging {
+        level  = "info"
+        format = "logfmt"
+      }
+
+      otelcol.auth.bearer "egress" {
+        token = sys.env("OBS_INGEST_TOKEN")
+      }
+
+      otelcol.exporter.otlphttp "egress" {
+        client {
+          endpoint = sys.env("ALLOY_V3_OTLP_URL")
+          auth     = otelcol.auth.bearer.egress.handler
+        }
+      }
+
+      otelcol.processor.batch "egress" {
+        output {
+          metrics = [otelcol.exporter.otlphttp.egress.input]
+          logs    = [otelcol.exporter.otlphttp.egress.input]
+        }
+      }
+
+      prometheus.scrape "phala_core" {
+        targets = [
+          {"__address__" = "router-api:9100", "job" = "router-api"},
+          {"__address__" = "router-worker:9101", "job" = "router-worker"},
+          {"__address__" = "temporal-worker:9103", "job" = "temporal-worker"},
+          {"__address__" = "temporal:9090", "job" = "temporal-frontend"},
+          {"__address__" = "temporal-history:9090", "job" = "temporal-history"},
+          {"__address__" = "temporal-matching:9090", "job" = "temporal-matching"},
+          {"__address__" = "temporal-internal-worker:9090", "job" = "temporal-internal-worker"},
+        ]
+        scrape_interval = "15s"
+        scrape_timeout  = "10s"
+        forward_to      = [otelcol.receiver.prometheus.phala_core.receiver]
+      }
+
+      otelcol.receiver.prometheus "phala_core" {
+        output {
+          metrics = [otelcol.processor.batch.egress.input]
+        }
+      }
+
+      otelcol.receiver.otlp "phala_logs" {
+        http {
+          endpoint = "0.0.0.0:4318"
+        }
+        grpc {
+          endpoint = "0.0.0.0:4317"
+        }
+        output {
+          logs = [otelcol.processor.batch.egress.input]
+        }
+      }
+
 x-router-environment: &router-environment
   - RUST_LOG=${RUST_LOG:-info}
   - DEPLOYMENT_ENVIRONMENT=${DEPLOYMENT_ENVIRONMENT:-alpha}
@@ -199,6 +302,47 @@ x-router-environment: &router-environment
   - TEMPORAL_NAMESPACE=${TEMPORAL_NAMESPACE:-default}
   - ORDER_EXECUTION_TEMPORAL_TASK_QUEUE=${ORDER_EXECUTION_TEMPORAL_TASK_QUEUE:-tee-router-order-execution}
   - TEMPORAL_TASK_QUEUE=${ORDER_EXECUTION_TEMPORAL_TASK_QUEUE:-tee-router-order-execution}
+  # OTLP logs egress to the in-TEE Alloy sidecar (compose-internal only).
+  - OTEL_EXPORTER_OTLP_ENDPOINT=http://alloy:4318
+  - OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://alloy:4318/v1/logs
+
+# Temporal server is split into frontend/history/matching/internal-worker roles
+# (mirrors compose.local-full.yml; introduced in b54bdf0). All roles share this
+# base; each overrides only SERVICES + its health port.
+x-temporal-server-base: &temporal-server-base
+  image: temporalio/server:1.31.0
+  restart: unless-stopped
+  depends_on:
+    temporal-schema:
+      condition: service_completed_successfully
+  environment: &temporal-server-env
+    DB: postgres12
+    DB_PORT: 5432
+    POSTGRES_USER: temporal
+    POSTGRES_PWD: ${TEMPORAL_POSTGRES_PASSWORD:?set TEMPORAL_POSTGRES_PASSWORD}
+    POSTGRES_SEEDS: temporal-postgres
+    BIND_ON_IP: 0.0.0.0
+    DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/development-sql.yaml
+    NUM_HISTORY_SHARDS: "512"
+    # SQL_MAX_CONNS is per-service. 4 roles x 200 => ~800 peak connections to
+    # temporal-postgres; its max_connections is sized accordingly below.
+    SQL_MAX_CONNS: "200"
+    SQL_MAX_IDLE_CONNS: "200"
+    SQL_MAX_CONN_TIME: "30m"
+    PROMETHEUS_ENDPOINT: 0.0.0.0:9090
+  configs:
+    - source: temporal-dynamic-config
+      target: /etc/temporal/config/dynamicconfig/development-sql.yaml
+  entrypoint: ["/bin/sh", "-c"]
+  command:
+    - |
+      set -e
+      TEMPORAL_BROADCAST_ADDRESS="$$(getent hosts $$(hostname) | awk '{print $$1}')"
+      export TEMPORAL_BROADCAST_ADDRESS
+      echo "Resolved TEMPORAL_BROADCAST_ADDRESS=$$TEMPORAL_BROADCAST_ADDRESS for $$(hostname)"
+      exec /etc/temporal/entrypoint.sh
+  networks:
+    - router-network
 
 services:
   pg-secret-generator:
@@ -325,6 +469,26 @@ services:
     environment:
       POSTGRES_PASSWORD: ${TEMPORAL_POSTGRES_PASSWORD:?set TEMPORAL_POSTGRES_PASSWORD}
       POSTGRES_USER: temporal
+    # 4 Temporal roles x SQL_MAX_CONNS=200 => ~800 peak connections; the image
+    # default max_connections=100 would be exhausted by the split topology.
+    command:
+      - postgres
+      - -c
+      - max_connections=1000
+      - -c
+      - shared_buffers=1GB
+      - -c
+      - effective_cache_size=4GB
+      - -c
+      - maintenance_work_mem=256MB
+      - -c
+      - max_wal_size=2GB
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=200
     volumes:
       - temporal_postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -360,35 +524,60 @@ services:
       - router-network
 
   temporal:
-    image: temporalio/server:1.31.0
+    <<: *temporal-server-base
     container_name: temporal
-    restart: unless-stopped
-    depends_on:
-      temporal-schema:
-        condition: service_completed_successfully
     environment:
-      DB: postgres12
-      DB_PORT: 5432
-      POSTGRES_USER: temporal
-      POSTGRES_PWD: ${TEMPORAL_POSTGRES_PASSWORD:?set TEMPORAL_POSTGRES_PASSWORD}
-      POSTGRES_SEEDS: temporal-postgres
-      BIND_ON_IP: 0.0.0.0
-      DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/development-sql.yaml
-      PROMETHEUS_ENDPOINT: 0.0.0.0:9090
+      <<: *temporal-server-env
+      SERVICES: frontend
     expose:
       - "7233"
       - "9090"
-    configs:
-      - source: temporal-dynamic-config
-        target: /etc/temporal/config/dynamicconfig/development-sql.yaml
     healthcheck:
       test: ["CMD", "nc", "-z", "localhost", "7233"]
       interval: 10s
       timeout: 3s
       retries: 20
       start_period: 30s
-    networks:
-      - router-network
+
+  temporal-history:
+    <<: *temporal-server-base
+    container_name: temporal-history
+    environment:
+      <<: *temporal-server-env
+      SERVICES: history
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "7234"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+      start_period: 30s
+
+  temporal-matching:
+    <<: *temporal-server-base
+    container_name: temporal-matching
+    environment:
+      <<: *temporal-server-env
+      SERVICES: matching
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "7235"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+      start_period: 30s
+
+  # Temporal's own internal worker role (distinct from the app's Rust temporal-worker service).
+  temporal-internal-worker:
+    <<: *temporal-server-base
+    container_name: temporal-internal-worker
+    environment:
+      <<: *temporal-server-env
+      SERVICES: worker
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "7239"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+      start_period: 30s
 
   temporal-create-namespace:
     image: temporalio/admin-tools:1.31.0
@@ -481,6 +670,13 @@ services:
         DB_PASS="$$(tr -d '\n\r' < /run/postgres-secrets/app_password.txt)"
         export DATABASE_URL="postgres://$${DB_USER}:$${DB_PASS}@postgres:5432/router_db"
         export METRICS_BIND_ADDR=0.0.0.0:9103
+        export ROUTER_PAYMASTER_BATCH_MAX_SIZE=64
+        export ROUTER_TEMPORAL_ACTIVITY_POLLERS=128
+        export ROUTER_TEMPORAL_WORKFLOW_POLLERS=32
+        export ROUTER_TEMPORAL_ACTIVITY_SLOT_MIN=64
+        export ROUTER_TEMPORAL_ACTIVITY_SLOT_MAX=2000
+        export ROUTER_TEMPORAL_WORKFLOW_SLOT_MIN=16
+        export ROUTER_TEMPORAL_WORKFLOW_SLOT_MAX=2000
         exec /usr/local/bin/temporal-worker worker
     expose:
       - "9103"
@@ -494,6 +690,27 @@ services:
         condition: service_completed_successfully
       router-master-key-init:
         condition: service_completed_successfully
+    networks:
+      - router-network
+
+  # In-TEE telemetry sidecar. Scrapes the core stack over the internal
+  # compose network and receives OTLP logs from the Phala services, then
+  # makes a single authenticated OTLP egress to alloy-v3 on Railway.
+  # Egress only: no published ports, zero inbound to the TEE.
+  alloy:
+    image: grafana/alloy:latest  # TODO(hardening): pin a digest for prod
+    container_name: router-alloy-sidecar
+    restart: unless-stopped
+    environment:
+      - OBS_INGEST_TOKEN=${OBS_INGEST_TOKEN:?set OBS_INGEST_TOKEN}
+      - ALLOY_V3_OTLP_URL=${ALLOY_V3_OTLP_URL:?set ALLOY_V3_OTLP_URL}
+    configs:
+      - source: phala-alloy-config
+        target: /etc/alloy/config.alloy
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - /etc/alloy/config.alloy
     networks:
       - router-network
 

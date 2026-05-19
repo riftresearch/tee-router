@@ -1,0 +1,90 @@
+// alloy-v3 — production observability ingress on Railway.
+//
+// Two input paths:
+//   1. Scrape Railway-resident services directly over private DNS
+//      (*.railway.internal). No auth needed: Railway private net + Wireguard.
+//   2. Receive an authenticated OTLP stream (metrics + logs) from the
+//      in-TEE Alloy sidecar that runs inside compose.phala.yml. The Phala
+//      core stack is NOT on Railway's network, so it pushes out to this
+//      service's public endpoint, bearer-authenticated.
+//
+// Fan-out: metrics -> victoriametrics-v3, logs -> loki-v3 (both Railway
+// private-only services).
+
+logging {
+  level  = "info"
+  format = "logfmt"
+}
+
+// ---- Outputs (Railway private network) -------------------------------------
+
+prometheus.remote_write "victoriametrics" {
+  endpoint {
+    url = "http://victoriametrics-v3.railway.internal:8428/api/v1/write"
+  }
+}
+
+loki.write "store" {
+  endpoint {
+    url = "http://loki-v3.railway.internal:3100/loki/api/v1/push"
+  }
+}
+
+// ---- Path 1: scrape Railway-resident services ------------------------------
+// Phala-resident services (router-api/worker, temporal-worker, the four
+// Temporal roles) are NOT scraped here — they arrive via the authenticated
+// OTLP path below from the in-TEE sidecar.
+
+prometheus.scrape "railway" {
+  targets = [
+    {"__address__" = "sauron-worker-v3.railway.internal:9102", "job" = "sauron"},
+    {"__address__" = "hl-shim-indexer-v3.railway.internal:9104", "job" = "hl-shim-indexer"},
+    {"__address__" = "evm-receipt-watcher-ethereum-v3.railway.internal:8080", "job" = "evm-receipt-watcher-ethereum"},
+    {"__address__" = "evm-receipt-watcher-base-v3.railway.internal:8080", "job" = "evm-receipt-watcher-base"},
+    {"__address__" = "evm-receipt-watcher-arbitrum-v3.railway.internal:8080", "job" = "evm-receipt-watcher-arbitrum"},
+    {"__address__" = "bitcoin-indexer-v3.railway.internal:8080", "job" = "bitcoin-indexer"},
+    {"__address__" = "bitcoin-receipt-watcher-v3.railway.internal:8080", "job" = "bitcoin-receipt-watcher"},
+    {"__address__" = "evm-token-indexer-ethereum-v3.railway.internal:4001", "job" = "evm-token-indexer-ethereum"},
+    {"__address__" = "evm-token-indexer-base-v3.railway.internal:4001", "job" = "evm-token-indexer-base"},
+    {"__address__" = "evm-token-indexer-arbitrum-v3.railway.internal:4001", "job" = "evm-token-indexer-arbitrum"},
+  ]
+
+  scrape_interval = "15s"
+  scrape_timeout  = "10s"
+  forward_to      = [prometheus.remote_write.victoriametrics.receiver]
+}
+
+// ---- Path 2: authenticated OTLP from the in-TEE Phala sidecar ---------------
+
+otelcol.auth.bearer "phala" {
+  // OBS_INGEST_TOKEN is a project shared variable; the same value is set as
+  // Phala secret material and presented by the in-TEE sidecar.
+  token = sys.env("OBS_INGEST_TOKEN")
+}
+
+otelcol.receiver.otlp "phala" {
+  http {
+    endpoint = "[::]:4318"
+    auth     = otelcol.auth.bearer.phala.handler
+  }
+
+  output {
+    metrics = [otelcol.processor.batch.phala.input]
+    logs    = [otelcol.processor.batch.phala.input]
+  }
+}
+
+otelcol.processor.batch "phala" {
+  output {
+    metrics = [otelcol.exporter.prometheus.phala.input]
+    logs    = [otelcol.exporter.loki.phala.input]
+  }
+}
+
+otelcol.exporter.prometheus "phala" {
+  forward_to = [prometheus.remote_write.victoriametrics.receiver]
+}
+
+otelcol.exporter.loki "phala" {
+  forward_to = [loki.write.store.receiver]
+}

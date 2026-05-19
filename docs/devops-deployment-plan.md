@@ -19,9 +19,15 @@ Phala runs the security-critical router execution stack. Everything in
   consumers on the physical standby can decode router events
 - `postgres-replication-gateway` (socat sidecar exposing `:5432` for the
   Railway physical standby)
-- `temporal-postgres`
+- `temporal-postgres` (tuned for the split topology: `max_connections=1000`,
+  ~800 peak from 4 roles × `SQL_MAX_CONNS=200`)
 - `temporal-schema` (one-shot)
-- `temporal` — Temporal server, metrics on `:9090`
+- `temporal` — Temporal server **frontend** role, gRPC `:7233`, metrics
+  on `:9090` (this is the endpoint clients/workers connect to)
+- `temporal-history` — Temporal **history** role (health `:7234`)
+- `temporal-matching` — Temporal **matching** role (health `:7235`)
+- `temporal-internal-worker` — Temporal's **internal worker** role
+  (health `:7239`); distinct from the app's `temporal-worker`
 - `temporal-create-namespace` (one-shot)
 - `router-api` — `ghcr.io/riftresearch/tee-router`, port `4522`, metrics on
   `:9100`
@@ -61,8 +67,11 @@ Railway runs every observer, indexer, watcher, and operator-facing service:
   `admin-dashboard-analytics-db-v3` — operator dashboard and its supporting
   DBs
 - `explorer-v3` — public explorer UI
-- `betterstack-otel-collector-v3` — OTLP log collector that forwards to
-  Better Stack
+- `alloy-v3` — Grafana Alloy: scrapes `/metrics`, receives OTLP logs,
+  `remote_write`s to VictoriaMetrics, forwards logs to Loki
+- `victoriametrics-v3` — sole metrics TSDB
+- `loki-v3` — log store
+- `grafana-v3` — observability UI (VictoriaMetrics + Loki datasources)
 - `hyperunit-socks5-proxy` — existing service, exposed for the Phala
   router-worker
 - `sauron-bitcoin-rathole-broker` — existing service, reused for the v3
@@ -82,8 +91,11 @@ called out here. The current exceptions are `hyperunit-socks5-proxy` and
 |---|---|---|---|
 | postgres (primary) | Phala | `postgres:18-alpine` | Router business state; CDC source |
 | postgres-replication-gateway | Phala | `alpine:3.22.1` + socat | Exposes :5432 for the Railway standby |
-| temporal-postgres | Phala | `postgres:16-alpine` | Temporal workflow history |
-| temporal | Phala | `temporalio/server:1.31.0` | Workflow engine |
+| temporal-postgres | Phala | `postgres:16-alpine` | Temporal workflow history (max_connections=1000) |
+| temporal | Phala | `temporalio/server:1.31.0` | Temporal **frontend** role (gRPC :7233) |
+| temporal-history | Phala | `temporalio/server:1.31.0` | Temporal **history** role |
+| temporal-matching | Phala | `temporalio/server:1.31.0` | Temporal **matching** role |
+| temporal-internal-worker | Phala | `temporalio/server:1.31.0` | Temporal **internal worker** role |
 | temporal-schema, temporal-create-namespace | Phala | `temporalio/admin-tools` | One-shot setup |
 | router-master-key-init, pg-secret-generator | Phala | `alpine:3.22.1` | One-shot key/secret material |
 | router-api | Phala | `ghcr.io/riftresearch/tee-router` | Public API (behind router-gateway) |
@@ -104,7 +116,10 @@ called out here. The current exceptions are `hyperunit-socks5-proxy` and
 | admin-dashboard-v3 | Railway | `railway/admin-dashboard/` (Bun) | Operator dashboard |
 | admin-dashboard-auth-db-v3, admin-dashboard-analytics-db-v3 | Railway | Managed Postgres | Dashboard auth + analytics buckets |
 | explorer-v3 | Railway | `railway/explorer/` (Bun) | Public explorer UI |
-| betterstack-otel-collector-v3 | Railway | `railway/betterstack-otel-collector/` | OTLP logs → Better Stack |
+| alloy-v3 | Railway | `grafana/alloy` + `railway/alloy/` | Scrape /metrics + OTLP logs ingest (to build) |
+| victoriametrics-v3 | Railway | `victoriametrics/victoria-metrics` | Metrics TSDB (to build) |
+| loki-v3 | Railway | `grafana/loki` | Log store (to build) |
+| grafana-v3 | Railway | `grafana/grafana` | Observability UI (to build) |
 | hyperunit-socks5-proxy | Railway | existing | SOCKS5 egress for HyperUnit calls |
 | sauron-bitcoin-rathole-broker | Railway | existing | Bitcoin RPC/ZMQ transport for Sauron |
 
@@ -150,6 +165,48 @@ ports:
 Do not rely on environment-variable interpolation for Phala port declarations;
 the dashboard/API may fail to materialize public endpoints from interpolated
 port values.
+
+## Temporal Performance Topology
+
+The Phala Temporal server is **split into four single-responsibility role
+containers** (frontend / history / matching / internal-worker) rather than a
+single all-in-one server. All four share the `*temporal-server-base` anchor in
+`etc/compose.phala.yml` and differ only by `SERVICES=` and health port. This
+mirrors `etc/compose.local-full.yml` and is the topology the perf/loadgen work
+was validated against.
+
+Key server config (inline in the compose `configs:` / base anchor):
+
+- `NUM_HISTORY_SHARDS=512` — set on every role; must be identical across roles
+  and immutable for the life of the `temporal-postgres` data. Changing it
+  requires a fresh Temporal DB.
+- `SQL_MAX_CONNS=200` / `SQL_MAX_IDLE_CONNS=200` per role → ~800 peak
+  connections; `temporal-postgres` runs `max_connections=1000` accordingly.
+- Expanded `temporal-dynamic-config`: raised `frontend/matching/history` `rps`
+  and `persistenceMaxQPS` ceilings, `matching.numTaskqueue{Read,Write}Partitions=16`,
+  and `history.hostLevelCacheMaxSize=256000` (the post-1.27 replacement for the
+  old `history.cacheMaxSize`) + `history.eventsCacheMaxSizeBytes=1GiB`.
+
+The app's Rust `temporal-worker` is tuned via env (exported in its compose
+command): `ROUTER_TEMPORAL_ACTIVITY_POLLERS=128`,
+`ROUTER_TEMPORAL_WORKFLOW_POLLERS=32`, `ROUTER_TEMPORAL_ACTIVITY_SLOT_MIN=64`,
+`ROUTER_TEMPORAL_ACTIVITY_SLOT_MAX=2000`,
+`ROUTER_TEMPORAL_WORKFLOW_SLOT_MIN=16`, `ROUTER_TEMPORAL_WORKFLOW_SLOT_MAX=2000`,
+`ROUTER_PAYMASTER_BATCH_MAX_SIZE=64`. These are baked into the prod compose; to
+re-tune, change the `export` lines in the `temporal-worker` service.
+
+> Sizing note: `compose.local-full.yml` additionally sets
+> `deploy.resources.limits.cpus` per Temporal role (≈32 cores total) for the
+> loadgen host. Those limits are **intentionally not** carried into
+> `compose.phala.yml` — they are loadgen-box sizing, are ignored by plain
+> `docker compose up`, and must be sized to the actual Phala TEE host before
+> relying on them.
+
+Source-of-truth Postgres (`postgres`) also received the durability-safe half of
+the `a391849` tuning (`shared_buffers=1GB`, `effective_cache_size=4GB`,
+`maintenance_work_mem=256MB`); `synchronous_commit` stays `on`. The
+reconstructible-DB `synchronous_commit=off` profile is deliberately **not**
+applied to the router primary.
 
 ## Router Gateway
 
@@ -619,19 +676,24 @@ Spans and distributed tracing are not used. The previous Tempo / OTel trace
 pipeline was removed in commit `3b09b8b` to avoid the CPU cost of
 per-request span allocation. Only logs and metrics are produced.
 
+The production observability design is Alloy + VictoriaMetrics + Loki +
+Grafana on Railway (see below).
+
 ### Logs
 
 Each Rust service emits structured logs via `tracing::info!/warn!/error!`.
 `opentelemetry-appender-tracing` bridges these into the OTLP logs export
-path. Destinations:
+path. The export is disabled unless `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` is set
+by the deployment. There is no trace exporter (removed in `3b09b8b`).
 
-- **Local**: services emit OTLP logs to `alloy`, which forwards to Loki.
-  Grafana queries Loki for the log viewer.
-- **Production**: services emit OTLP logs to `betterstack-otel-collector-v3`
-  on Railway, which forwards to Better Stack (formerly Logtail).
-
-The OTLP log export is disabled unless `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` is
-set by the deployment. There is no trace exporter.
+- **Local**: services emit OTLP logs to `alloy`, which forwards to Loki;
+  Grafana queries Loki.
+- **Production (design)**: services emit OTLP logs to `alloy-v3` on Railway,
+  which forwards to `loki-v3`; `grafana-v3` queries it.
+- **Production (actual status)**: **not wired.** `etc/compose.phala.yml` sets
+  no `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`, so prod log export is currently
+  disabled. It becomes live only once the Railway observability stack exists
+  and the endpoint is injected into the Phala/Railway services.
 
 ### Metrics
 
@@ -673,14 +735,72 @@ Prometheus protocols. There is **no separate Prometheus server**.
 VictoriaMetrics is the sole TSDB and serves Grafana queries through its
 Prometheus-compatible read API.
 
-**Production metrics destination**: TBD. The current options:
+**Production metrics destination (DECIDED)**: the local topology is promoted
+to Railway services — Alloy scrapes every service's `/metrics` and
+`remote_write`s to VictoriaMetrics; Grafana reads VictoriaMetrics (metrics)
+and Loki (logs). This is no longer TBD.
 
-1. Run VictoriaMetrics on Railway and have Sauron / indexers / receipt
-   watchers ship metrics to it via Alloy or a remote_write client.
-2. Use Better Stack metrics ingestion (some plans support it).
-3. Defer metrics in prod until needed.
+**Production (actual status)**: **not built.** `railway/` has no
+alloy/victoriametrics/grafana service, there is no prod Alloy config (only
+`etc/alloy.local.alloy`, hardcoded to compose-internal hostnames), and
+`compose.phala.yml` only *exposes* `/metrics` ports — nothing scrapes them.
+Prod metrics and logs are effectively dark until the stack below is built.
 
-This needs a decision before the alpha cutover.
+### Production Observability Stack (to build)
+
+Target Railway services (mirror the local stack, `-v3` suffix):
+
+| Service | Source | Role |
+|---|---|---|
+| `alloy-v3` | `grafana/alloy` + new `railway/alloy/config.alloy` | **Sole public, authenticated observability ingress.** Scrapes Railway services over `*.railway.internal`; accepts authenticated `remote_write` + OTLP from the Phala-side agent; fans out to VictoriaMetrics + Loki over Railway private net |
+| `victoriametrics-v3` | `victoriametrics/victoria-metrics` | Sole metrics TSDB (`:8428`), Railway-private only |
+| `loki-v3` | `grafana/loki` | Log store (`:3100`), Railway-private only |
+| `grafana-v3` | `grafana/grafana` | UI; datasources = VictoriaMetrics + Loki |
+
+#### Decided transport: Phala → Railway
+
+The TEE is **not** on Railway's private network. The decided model
+(push-out, never scrape-in):
+
+- **No `/metrics` port on the Phala stack is ever exposed publicly.** Zero
+  inbound to the TEE.
+- A small **`alloy` sidecar runs inside `etc/compose.phala.yml`**. It scrapes
+  the Phala core services over the internal compose network and makes a
+  **single authenticated TLS egress** to `alloy-v3` (`remote_write` metrics +
+  forward OTLP logs).
+- `alloy-v3` is the **only public, authenticated** observability endpoint
+  (bearer token for alpha; token stored as Phala secret material; mTLS is a
+  later hardening). `victoriametrics-v3` / `loki-v3` are Railway-private and
+  never publicly reachable.
+- Railway-side services (sauron, indexers, watchers, hl-shim) stay on the
+  Railway private network and are scraped by `alloy-v3` directly — unchanged.
+- **Follow-up (non-blocking):** add a label/line scrub allowlist in the
+  Phala-side Alloy so telemetry leaving the TEE boundary cannot carry
+  sensitive labels or log content. Tracked, not required for first cutover.
+
+Implementation tasks:
+
+1. Author `railway/alloy/config.alloy` (the `alloy-v3` config) from
+   `etc/alloy.local.alloy`: `*.railway.internal` scrape targets for every
+   Railway metrics endpoint — sauron `:9102`, hl-shim-indexer `:9104`, the
+   receipt-watcher / bitcoin-indexer ports (assign and record them —
+   currently TBD); an authenticated `remote_write` + OTLP receiver for the
+   Phala-side agent; fan-out to `victoriametrics-v3` / `loki-v3`.
+2. Add an `alloy` sidecar service to `etc/compose.phala.yml` with an inline
+   `configs:` Alloy config that scrapes the Phala core services over the
+   compose network (router-api `:9100`, router-worker `:9101`,
+   temporal-worker `:9103`, the four Temporal roles `:9090`) and
+   `remote_write`s + forwards OTLP outward to `alloy-v3` using a bearer
+   token from Phala secret material. Egress only — no published ports.
+3. Inject `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` (and base
+   `OTEL_EXPORTER_OTLP_ENDPOINT`): Phala services → the in-TEE `alloy`
+   sidecar; Railway Rust services → `alloy-v3` over the private network.
+4. Persistent volumes for `victoriametrics-v3` and `loki-v3`; set retention.
+5. `grafana-v3`: provision VictoriaMetrics + Loki datasources and import the
+   existing dashboards under `etc/grafana/`.
+6. Confirm the Railway IPv6 listener behavior (below) for every Railway
+   service scraped by `alloy-v3` via `*.railway.internal`.
+7. Follow-up: implement the Phala-side Alloy label/line scrub allowlist.
 
 ### IPv6 listener note
 
@@ -689,7 +809,198 @@ observability helper keeps the operator-facing `METRICS_BIND_ADDR=0.0.0.0:9102`
 setting but binds it as `[::]:9102` when Railway runtime metadata is present,
 so private scrapers can reach the endpoint through `*.railway.internal`.
 
-## Implementation Checklist
+## Railway Build Plan (GitHub-connected, auto-redeploy)
+
+### Model
+
+- **One Railway project**, one `production` environment. (Add `staging`
+  later by environment-duplicate; out of scope for alpha.)
+- Every app service is **GitHub-sourced** from `riftresearch/tee-router` on
+  a fixed deploy branch. A push to that branch auto-deploys **only the
+  services whose `watchPatterns` match the changed paths**.
+- This is a **shared monorepo** (one Rust workspace + repo-root
+  Dockerfiles). Do **not** use Railway `rootDirectory` isolation — it hides
+  the workspace and breaks Rust builds. Use the **Dockerfile builder** with
+  full repo context and a per-service `dockerfilePath`.
+- **No official Railway Terraform provider exists.** Reproducible topology =
+  (a) a per-service `railway.json` checked into the repo + (b) one
+  idempotent bootstrap script (`railway/bootstrap.sh`, Railway CLI/GraphQL
+  `serviceCreate` + config patch). Those two together are the IaC.
+
+### Per-service `railway.json`
+
+Each service gets a `railway.json` at a stable path in the repo (e.g.
+`railway/<service>/railway.json`) declaring at minimum:
+
+```json
+{
+  "build": {
+    "builder": "DOCKERFILE",
+    "dockerfilePath": "<path to that service's Dockerfile>",
+    "watchPatterns": ["<the service's source subtree>", "<shared deps>"]
+  },
+  "deploy": {
+    "healthcheckPath": "<if HTTP>",
+    "restartPolicyType": "ON_FAILURE",
+    "numReplicas": 1
+  }
+}
+```
+
+`watchPatterns` is **mandatory** — without it every push rebuilds all
+services. Scope each to its own subtree **plus** shared Rust crates it
+depends on (a `crates/**` change must redeploy every Rust service that
+links it; accept that fan-out, it is correct).
+
+### Service source / build matrix
+
+All Dockerfiles below **exist and are verified**. Each repo-sourced service
+has a committed `railway/<svc>/railway.json` (builder/dockerfilePath/
+watchPatterns/restart); `railway/bootstrap.sh` reconciles the topology into
+the existing `tee-router` Railway project and applies the equivalent config
+via CLI patches.
+
+| Service | Source | Builder / Dockerfile | railway.json |
+|---|---|---|---|
+| router-physical-standby-v3 | repo | `railway/router-physical-standby/Dockerfile` | `railway/router-physical-standby/railway.json` |
+| router-replica-stunnel-v3 | repo | `railway/router-replica-stunnel/Dockerfile` | `railway/router-replica-stunnel/railway.json` |
+| sauron-worker-v3 | repo | `etc/Dockerfile.sauron` | `railway/sauron/railway.json` |
+| sauron-state-db-v3 | **managed Postgres** | n/a | n/a |
+| evm-token-indexer-{eth,base,arb}-v3 | repo | `evm-token-indexer/Dockerfile.index` | `railway/evm-token-indexer/railway.json` |
+| evm-receipt-watcher-{eth,base,arb}-v3 | repo | `etc/Dockerfile.evm-receipt-watcher` | `railway/evm-receipt-watcher/railway.json` |
+| bitcoin-indexer-v3 | repo | `etc/Dockerfile.bitcoin-indexer` | `railway/bitcoin-indexer/railway.json` |
+| bitcoin-receipt-watcher-v3 | repo | `etc/Dockerfile.bitcoin-receipt-watcher` | `railway/bitcoin-receipt-watcher/railway.json` |
+| hl-shim-indexer-v3 | repo | `etc/Dockerfile.hl-shim-indexer` | `railway/hl-shim-indexer/railway.json` |
+| hl-shim-db-v3 | **managed Postgres** | n/a | n/a |
+| router-gateway-v3 | repo | `railway/router-gateway/Dockerfile` | `railway/router-gateway/railway.json` |
+| admin-dashboard-v3 | repo | `railway/admin-dashboard/Dockerfile` | `railway/admin-dashboard/railway.json` |
+| admin-dashboard-auth-db-v3 | **managed Postgres** | n/a | n/a |
+| admin-dashboard-analytics-db-v3 | **managed Postgres** | n/a | n/a |
+| explorer-v3 | repo | `railway/explorer/Dockerfile` | `railway/explorer/railway.json` |
+| alloy-v3 | repo | `railway/alloy/Dockerfile` (+ `etc/alloy.railway.alloy`) | `railway/alloy/railway.json` |
+| loki-v3 | repo | `railway/loki/Dockerfile` (+ `etc/loki.railway.yml`) | `railway/loki/railway.json` |
+| grafana-v3 | repo | `railway/grafana/Dockerfile` (+ `etc/grafana/**`, datasource provisioning) | `railway/grafana/railway.json` |
+| victoriametrics-v3 | image `victoriametrics/victoria-metrics` | image + start args (set by bootstrap) | n/a |
+
+> Gap: `router-replica-setup` (one-shot standby bootstrap helper) has no
+> `railway/router-replica-setup/` Dockerfile in the repo. Standby bring-up
+> currently relies on `railway/router-physical-standby/entrypoint.sh`.
+> Confirm whether a separate setup service is still needed; if so it must be
+> authored. (Not created here — flagged rather than invented.)
+
+### Wiring (no hardcoded URLs)
+
+- Managed Postgres → consumers via reference variables, e.g.
+  `SAURON_STATE_DATABASE_URL=${{sauron-state-db-v3.DATABASE_URL}}`.
+- Service→service via private DNS:
+  `HL_SHIM_INDEXER_URL=http://${{hl-shim-indexer-v3.RAILWAY_PRIVATE_DOMAIN}}:${{hl-shim-indexer-v3.PORT}}`.
+- Cross-cutting secrets/keys (`ROUTER_DETECTOR_API_KEY`,
+  `TOKEN_INDEXER_API_KEY`, observability bearer token) as **project shared
+  variables**, referenced as `${{shared.NAME}}` so one value fans out.
+- Every Railway Rust service must bind its listener on `[::]` (IPv6
+  wildcard) or private DNS + healthchecks fail — same rule the observability
+  helper already applies to metrics.
+
+### Gotchas
+
+- `watchPatterns` omitted ⇒ all services rebuild on every commit.
+- `rootDirectory` + shared workspace ⇒ broken Rust build (use Dockerfile
+  builder, full context).
+- Phala TEE is **not** on Railway's network — its only Railway links are the
+  DB replication gateway and the decided alloy push-out. Do not attempt
+  Railway private DNS from Phala.
+- Config-as-code is **per service**; topology creation/teardown is the
+  bootstrap script's job, not a single manifest.
+
+## Deployment Runbook
+
+### Pre-deploy blockers (must be true before "deploy everything")
+
+Done (in repo):
+
+- ✅ Observability stack built: `etc/alloy.railway.alloy` (alloy-v3),
+  `etc/alloy.phala.alloy` + in-TEE `alloy` sidecar in `compose.phala.yml`,
+  `etc/loki.railway.yml`, `railway/{alloy,loki,grafana}/Dockerfile`, Grafana
+  datasource/dashboard provisioning.
+- ✅ All service Dockerfiles exist and are verified.
+- ✅ `railway/<svc>/railway.json` committed for every repo-sourced service.
+- ✅ `railway/bootstrap.sh` written (idempotent; targets the existing
+  `tee-router` project, never creates one), `bash -n` clean.
+
+Still required before a real run:
+
+1. Receipt-watcher / bitcoin-indexer **metrics ports confirmed** (the
+   alloy-v3 scrape config assumes `:8080`; verify each binary's
+   `METRICS_BIND_ADDR` and that it binds `[::]`).
+2. EVM token-indexer **RPC/WS URLs provisioned as Railway vars**.
+3. Secret bootstrap complete (next subsection), incl. `OBS_INGEST_TOKEN`
+   and `ALLOY_V3_OTLP_URL` for the Phala↔alloy-v3 channel.
+4. `bootstrap.sh` lines marked `# VERIFY:` checked against the installed
+   Railway CLI; GitHub App connected to the Railway account.
+5. `router-replica-setup` gap resolved (see matrix note).
+
+### Secret bootstrap (do first, once)
+
+| Secret | Generated how | Lives where |
+|---|---|---|
+| Paymaster keys ×5 (BTC/ETH/BASE/ARB/HL) | operator-generated, funded | Phala secret store |
+| `POSTGRES_REPLICA_PASSWORD` | generate once | Phala secret store **and** mirrored to Railway stunnel/standby (must match) |
+| `TEMPORAL_POSTGRES_PASSWORD` | generate once | Phala secret store |
+| `CHAINALYSIS_TOKEN`, `ACROSS_API_KEY` | from provider | Phala secret store |
+| `ROUTER_DETECTOR_API_KEY`, `ROUTER_GATEWAY_API_KEY`, `ROUTER_ADMIN_API_KEY` | generate | Phala secret + Railway shared var (consumers: sauron, gateway, dashboard) |
+| Observability bearer token | generate | Phala secret + Railway shared var |
+| Router master key, app DB password | **generated in-TEE** by one-shot init | Phala persistent volumes (never injected) |
+| RPC/Electrum/HyperUnit-proxy endpoints | from providers | Phala env / Railway vars (proxy URL is credential-bearing) |
+
+The replica password and TLS material are the only **cross-platform**
+secrets — generate once, set identically on both sides.
+
+### Ordered bring-up (health-gated)
+
+1. **Phala**: deploy `compose.phala.yml`. Gate: `pg-secret-generator` +
+   `router-master-key-init` complete → `postgres` healthy → `temporal-*`
+   healthy → `router-api` `/status` 200, `router-worker` /
+   `temporal-worker` polling.
+2. **Phala public endpoints**: confirm literal `4522:4522` mapping resolves;
+   confirm replication gateway `:5432` reachable.
+3. **Railway data path**: `router-replica-stunnel-v3` →
+   `router-physical-standby-v3` (run `router-replica-setup`). Gate:
+   standby replay caught up + CDC slots present.
+4. **Railway managed DBs**: `sauron-state-db-v3`, `hl-shim-db-v3`,
+   `admin-dashboard-{auth,analytics}-db-v3`.
+5. **Railway indexers/watchers**: token-indexers, receipt-watchers,
+   bitcoin-indexer/receipt-watcher, hl-shim-indexer. Gate: each healthy and
+   reachable on private DNS.
+6. **Railway sauron-worker-v3**: wire all URLs (matrix below). Gate: CDC
+   slot/checkpoint healthy, watch sync, hint POST to Phala `router-api` 200.
+7. **Railway public**: `router-gateway-v3`, `admin-dashboard-v3`,
+   `explorer-v3`.
+8. **Observability**: `victoriametrics-v3`, `loki-v3`, `alloy-v3`,
+   `grafana-v3`; add in-TEE alloy sidecar; inject `OTEL_EXPORTER_OTLP_*`.
+   Gate: metrics in VM, logs in Loki, dashboards render.
+9. **Validate**: run the smoke-test list (below). Then a dust-sized live
+   route. Then the 10k loadgen-fast replay.
+
+### Inter-service wiring order
+
+Set wiring **after** the producer service exists (its
+`RAILWAY_PRIVATE_DOMAIN`/`DATABASE_URL` only resolve post-create):
+
+- standby ready → set `ROUTER_REPLICA_DATABASE_URL` on sauron + dashboard
+- state/shim DBs ready → set `SAURON_STATE_DATABASE_URL`,
+  `HL_SHIM_DATABASE_URL`
+- indexers/watchers ready → set per-chain
+  `*_TOKEN_INDEXER_URL` / `*_RECEIPT_WATCHER_URL` / bitcoin / hl-shim URLs
+  on sauron
+- Phala `router-api` public URL → `ROUTER_INTERNAL_BASE_URL` on sauron
+- alloy-v3 endpoint + bearer → `OTEL_EXPORTER_OTLP_*` on every service
+
+### Rollback
+
+Per service: `railway down --service <svc>` reverts to the prior
+deployment (does not delete). Phala: redeploy the previous pinned image tag
+(semver/SHA). The router-master-key and primary-DB volumes are **never**
+torn down on rollback — treat as protected state.
 
 Completed:
 
@@ -722,9 +1033,12 @@ Still to do:
 - [ ] Deploy `router-gateway-v3` (public LB).
 - [ ] Deploy `admin-dashboard-v3` + auth-db + analytics-db.
 - [ ] Deploy `explorer-v3`.
-- [ ] Deploy `betterstack-otel-collector-v3` and point all services'
-      `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` at it.
-- [ ] Decide and implement the production metrics destination.
+- [ ] Build the production observability stack (see "Production
+      Observability Stack (to build)"): `alloy-v3`, `victoriametrics-v3`,
+      `loki-v3`, `grafana-v3`; author `railway/alloy/config.alloy`; add the
+      in-TEE `alloy` sidecar to `compose.phala.yml` (decided push-out
+      transport, bearer auth); inject `OTEL_EXPORTER_OTLP_*` into all
+      services; provision Grafana datasources + dashboards.
 - [ ] Publicly expose and lock down the existing HyperUnit SOCKS5 proxy
       (no `ALLOWED_IPS`).
 - [ ] Reuse the existing Railway `sauron-bitcoin-rathole-broker` for v3
@@ -744,7 +1058,8 @@ Still to do:
   - router-gateway reachable from public internet
   - admin-dashboard CDC backfill + live ingest
   - Sauron hint submission to Phala router API
-  - log shipping via betterstack-otel-collector
+  - log shipping via alloy-v3 → loki-v3; metrics scrape → victoriametrics-v3;
+    grafana-v3 dashboards render
 - [ ] Run a dust-sized live route only after the smoke checks pass.
 - [ ] Replay the 10k loadgen-fast scenario that originally surfaced the
       stall-class bug; verify Sauron architectural fixes hold at scale.
