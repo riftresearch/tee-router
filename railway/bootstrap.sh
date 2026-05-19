@@ -152,11 +152,42 @@ for c in ethereum base arbitrum; do
   set_var sauron-worker-v3 "$(printf '%s_TOKEN_INDEXER_URL=http://${{evm-token-indexer-%s-v3.RAILWAY_PRIVATE_DOMAIN}}:4001' "$(echo "$c" | tr a-z A-Z)" "$c")"
 done
 
-# Public domains for the user-facing services.
-for pub in router-gateway-v3 admin-dashboard-v3 explorer-v3 grafana-v3; do
+# Public domains. alloy-v3 is included: the Phala in-TEE sidecar reaches it
+# from OUTSIDE Railway's private network, so it needs a public, bearer-
+# authenticated endpoint (the others are user-facing UIs/APIs).
+for pub in router-gateway-v3 admin-dashboard-v3 explorer-v3 grafana-v3 alloy-v3; do
   railway domain --service "$pub" >/dev/null 2>&1 || warn "set a domain for $pub manually if needed"
 done
 
-log "bootstrap pass complete. Re-run once more so all reference variables"
-log "resolve against now-created producers, then follow the Deployment"
-log "Runbook ordered bring-up + per-service secret/env injection."
+# Emit alloy-v3's resolved public URL — this is the value of ALLOY_V3_OTLP_URL
+# that must go into .env.phala.prod BEFORE Phala is brought up (Railway-first).
+ALLOY_DOMAIN="$(railway domain --service alloy-v3 --json 2>/dev/null \
+  | python3 -c 'import sys,json
+try:
+  d=json.load(sys.stdin)
+  def f(o):
+    if isinstance(o,dict):
+      if o.get("domain"): print(o["domain"]); raise SystemExit
+      for v in o.values(): f(v)
+    elif isinstance(o,list):
+      for v in o: f(v)
+  f(d)
+except SystemExit: pass
+except Exception: pass' || true)"
+if [ -n "${ALLOY_DOMAIN:-}" ]; then
+  log "alloy-v3 public endpoint: https://${ALLOY_DOMAIN}"
+  log ">>> Set this in .env.phala.prod, then deploy Phala:"
+  log ">>>   ALLOY_V3_OTLP_URL=https://${ALLOY_DOMAIN}"
+else
+  warn "could not resolve alloy-v3 domain automatically — read it from the Railway"
+  warn "dashboard and set ALLOY_V3_OTLP_URL=https://<domain> in .env.phala.prod"
+fi
+
+log "bootstrap pass complete (Railway-first deploy order)."
+log "1) Re-run this script once more so reference variables resolve against"
+log "   now-created producers."
+log "2) Put ALLOY_V3_OTLP_URL (above) + the matching OBS_INGEST_TOKEN into"
+log "   .env.phala.prod, then bring up Phala (just phala-deploy <tag>)."
+log "3) AFTER Phala primary is up, complete the replica/sauron tail (stunnel"
+log "   -> standby -> sauron wiring) per the Deployment Runbook — those Railway"
+log "   services depend on the Phala primary and cannot precede it."

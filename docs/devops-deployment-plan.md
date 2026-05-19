@@ -987,11 +987,10 @@ Still required before a real run:
 |---|---|---|
 | Paymaster keys ×5 (BTC/ETH/BASE/ARB/HL) | operator-generated, funded | Phala secret store |
 | `POSTGRES_REPLICA_PASSWORD` | generate once | Phala secret store **and** mirrored to Railway stunnel/standby (must match) |
-| `TEMPORAL_POSTGRES_PASSWORD` | generate once | Phala secret store |
 | `CHAINALYSIS_TOKEN`, `ACROSS_API_KEY` | from provider | Phala secret store |
 | `ROUTER_DETECTOR_API_KEY`, `ROUTER_GATEWAY_API_KEY`, `ROUTER_ADMIN_API_KEY` | generate | Phala secret + Railway shared var (consumers: sauron, gateway, dashboard) |
 | Observability bearer token | generate | Phala secret + Railway shared var |
-| Router master key, app DB password | **generated in-TEE** by one-shot init | Phala persistent volumes (never injected) |
+| Router master key, app DB password, **Temporal Postgres password** | **generated in-TEE** by one-shot init (`router-master-key-init`, `pg-secret-generator`, `temporal-pg-secret-generator`) | Phala persistent volumes (never injected) |
 | RPC/Electrum/HyperUnit-proxy endpoints | from providers | Phala env / Railway vars (proxy URL is credential-bearing) |
 
 The replica password and TLS material are the only **cross-platform**
@@ -999,29 +998,40 @@ secrets — generate once, set identically on both sides.
 
 ### Ordered bring-up (health-gated)
 
-1. **Phala**: deploy `compose.phala.yml`. Gate: `pg-secret-generator` +
-   `router-master-key-init` complete → `postgres` healthy → `temporal-*`
-   healthy → `router-api` `/status` 200, `router-worker` /
-   `temporal-worker` polling.
-2. **Phala public endpoints**: confirm literal `4522:4522` mapping resolves;
-   confirm replication gateway `:5432` reachable.
-3. **Railway data path**: `router-replica-stunnel-v3` →
-   `router-physical-standby-v3` (run `router-replica-setup`). Gate:
-   standby replay caught up + CDC slots present.
-4. **Railway managed DBs**: `sauron-state-db-v3`, `hl-shim-db-v3`,
+**Railway-first.** Everything Phala-independent comes up before Phala, so
+`alloy-v3`'s public URL exists before the in-TEE sidecar needs it. The
+**only** unavoidable interleave: the replica/standby/sauron tail streams WAL
+from / posts hints to the Phala primary, so it physically cannot precede
+Phala — it is the last stage.
+
+1. **Railway project + topology**: run `railway/bootstrap.sh` (idempotent;
+   creates all services into the existing `tee-router` project).
+2. **Railway observability**: `victoriametrics-v3`, `loki-v3`, `alloy-v3`
+   (+ public domain), `grafana-v3`. Gate: `alloy-v3` public endpoint
+   resolves. **Capture `alloy-v3`'s URL** (bootstrap prints it).
+3. **Railway managed DBs**: `sauron-state-db-v3`, `hl-shim-db-v3`,
    `admin-dashboard-{auth,analytics}-db-v3`.
-5. **Railway indexers/watchers**: token-indexers, receipt-watchers,
-   bitcoin-indexer/receipt-watcher, hl-shim-indexer. Gate: each healthy and
-   reachable on private DNS.
-6. **Railway sauron-worker-v3**: wire all URLs (matrix below). Gate: CDC
-   slot/checkpoint healthy, watch sync, hint POST to Phala `router-api` 200.
-7. **Railway public**: `router-gateway-v3`, `admin-dashboard-v3`,
+4. **Railway indexers/watchers** (Phala-independent — they watch chains, not
+   the router): token-indexers, evm/bitcoin receipt-watchers,
+   bitcoin-indexer, hl-shim-indexer. Gate: each healthy on private DNS.
+5. **Railway public UIs**: `router-gateway-v3`, `admin-dashboard-v3`,
    `explorer-v3`.
-8. **Observability**: `victoriametrics-v3`, `loki-v3`, `alloy-v3`,
-   `grafana-v3`; add in-TEE alloy sidecar; inject `OTEL_EXPORTER_OTLP_*`.
-   Gate: metrics in VM, logs in Loki, dashboards render.
-9. **Validate**: run the smoke-test list (below). Then a dust-sized live
-   route. Then the 10k loadgen-fast replay.
+6. **Secrets handoff to Phala**: put the captured
+   `ALLOY_V3_OTLP_URL=https://<alloy-v3 domain>` and the matching
+   `OBS_INGEST_TOKEN` (same value as the Railway shared var) into
+   `.env.phala.prod`.
+7. **Phala**: `just phala-deploy <tag>`. Gate: `pg-secret-generator` +
+   `temporal-pg-secret-generator` + `router-master-key-init` complete →
+   `postgres` healthy → `temporal-*` healthy → `router-api` `/status` 200,
+   `router-worker` / `temporal-worker` polling, `alloy` sidecar pushing to
+   `alloy-v3`. Confirm literal `4522:4522` + replication gateway `:5432`.
+8. **Railway replica/sauron tail** (now that the Phala primary exists):
+   `router-replica-stunnel-v3` → `router-physical-standby-v3` (standby
+   replay caught up + CDC slots), then wire + start `sauron-worker-v3`
+   (URL matrix below). Gate: CDC slot/checkpoint healthy, watch sync, hint
+   POST to Phala `router-api` 200.
+9. **Validate**: smoke-test list (below) → dust-sized live route → 10k
+   loadgen-fast replay.
 
 ### Inter-service wiring order
 
