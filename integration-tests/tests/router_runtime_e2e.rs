@@ -4,7 +4,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::Path,
     str::FromStr,
-    sync::Once,
+    sync::{Arc, Once},
     time::{Duration, Instant},
 };
 
@@ -38,6 +38,7 @@ use evm_receipt_watcher::{
     Config as EvmReceiptWatcherConfig, PendingWatches as EvmReceiptPendingWatches,
     ReceiptPubSub as EvmReceiptPubSub, Watcher as EvmReceiptWatcher,
 };
+use futures_util::future::join_all;
 use hl_shim_indexer::{
     build_router as build_hl_shim_router,
     config::Cadences as HlShimCadences,
@@ -47,8 +48,10 @@ use hl_shim_indexer::{
 };
 use router_core::{
     models::{
-        CustodyVaultRole, DepositVault, OrderProviderOperation, ProviderOperationStatus,
-        ProviderOperationType, RouterOrderEnvelope, RouterOrderQuoteEnvelope, RouterOrderStatus,
+        CustodyVaultRole, DepositVault, OrderExecutionAttemptKind, OrderExecutionAttemptStatus,
+        OrderExecutionStepStatus, OrderExecutionStepType, OrderProviderOperation,
+        ProviderOperationStatus, ProviderOperationType, RouterOrderEnvelope,
+        RouterOrderQuoteEnvelope, RouterOrderStatus,
     },
     protocol::AssetId,
     services::custody_action_executor::HyperliquidCallNetwork,
@@ -74,7 +77,7 @@ use testcontainers::{
 };
 use tokio::{
     net::TcpListener,
-    sync::oneshot,
+    sync::{oneshot, Mutex},
     task::{JoinHandle, LocalSet},
 };
 use tracing_subscriber::{fmt, EnvFilter};
@@ -95,6 +98,14 @@ const ACROSS_API_KEY: &str = "router-e2e-across-secret";
 const ACROSS_INTEGRATOR_ID: &str = "router-e2e";
 const EVM_NATIVE_GAS_BUFFER_WEI: u128 = 1_000_000_000_000_000_000;
 const BITCOIN_FEE_BUFFER_SATS: u64 = 10_000;
+const BITCOIN_CONFIRMATION_MINING_INTERVAL: Duration = Duration::from_millis(500);
+// Mirrors the order workflow's execution activity retry budget. The mock must
+// fail every provider call inside both route-level execution attempts to force
+// the workflow into refund recovery.
+const EXECUTION_STEP_ACTIVITY_MAX_ATTEMPTS: usize = 3;
+const ROUTE_EXECUTION_ATTEMPTS_BEFORE_REFUND: usize = 2;
+const PROVIDER_FAILURES_TO_FORCE_REFUND: usize =
+    EXECUTION_STEP_ACTIVITY_MAX_ATTEMPTS * ROUTE_EXECUTION_ATTEMPTS_BEFORE_REFUND;
 static TRACING_INIT: Once = Once::new();
 
 fn init_test_tracing() {
@@ -142,6 +153,20 @@ struct RouteCase {
     to: RouteAsset,
     amount_in: &'static str,
     expected_provider_fragments: &'static [&'static str],
+}
+
+#[derive(Clone, Copy)]
+enum RefundFailureKind {
+    VeloraTransactionFailures,
+    VeloraStaleQuoteFailures,
+}
+
+#[derive(Clone, Copy)]
+struct RefundFailureRouteCase {
+    name: &'static str,
+    route_case_name: &'static str,
+    failure: RefundFailureKind,
+    failed_step_type: OrderExecutionStepType,
 }
 
 const ROUTE_CASES: &[RouteCase] = &[
@@ -201,6 +226,21 @@ const ROUTE_CASES: &[RouteCase] = &[
     },
 ];
 
+const REFUND_FAILURE_ROUTE_CASES: &[RefundFailureRouteCase] = &[
+    RefundFailureRouteCase {
+        name: "velora_single_chain_failure_refunds_funding_vault",
+        route_case_name: "eth_to_usdc_single_chain",
+        failure: RefundFailureKind::VeloraTransactionFailures,
+        failed_step_type: OrderExecutionStepType::UniversalRouterSwap,
+    },
+    RefundFailureRouteCase {
+        name: "velora_stale_quote_failure_refunds_erc20_funding_vault",
+        route_case_name: "usdc_to_eth_single_chain",
+        failure: RefundFailureKind::VeloraStaleQuoteFailures,
+        failed_step_type: OrderExecutionStepType::UniversalRouterSwap,
+    },
+];
+
 sol! {
     #[sol(rpc)]
     interface IERC20 {
@@ -227,10 +267,18 @@ struct RuntimeTask {
     shutdown: Option<Box<dyn FnOnce()>>,
 }
 
+#[derive(Clone)]
+struct FundingLocks {
+    bitcoin: Arc<Mutex<()>>,
+    ethereum: Arc<Mutex<()>>,
+    base: Arc<Mutex<()>>,
+    arbitrum: Arc<Mutex<()>>,
+}
+
 struct RouterRuntimeHarness {
     client: reqwest::Client,
     router_base_url: String,
-    devnet: RiftDevnet,
+    devnet: Arc<RiftDevnet>,
     mocks: MockIntegratorServer,
     _postgres: TestPostgres,
     _temporal: TestTemporal,
@@ -292,6 +340,49 @@ impl RuntimeTask {
     }
 }
 
+impl FundingLocks {
+    fn new() -> Self {
+        Self {
+            bitcoin: Arc::new(Mutex::new(())),
+            ethereum: Arc::new(Mutex::new(())),
+            base: Arc::new(Mutex::new(())),
+            arbitrum: Arc::new(Mutex::new(())),
+        }
+    }
+
+    fn lock_for_chain(&self, chain: &str) -> Arc<Mutex<()>> {
+        match chain {
+            "bitcoin" => Arc::clone(&self.bitcoin),
+            "evm:1" => Arc::clone(&self.ethereum),
+            "evm:8453" => Arc::clone(&self.base),
+            "evm:42161" => Arc::clone(&self.arbitrum),
+            other => panic!("unsupported funding chain {other}"),
+        }
+    }
+}
+
+fn spawn_bitcoin_confirmation_miner(devnet: Arc<RiftDevnet>) -> RuntimeTask {
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+    let handle = tokio::task::spawn_local(async move {
+        let mut ticker = tokio::time::interval(BITCOIN_CONFIRMATION_MINING_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                _ = ticker.tick() => {
+                    if let Err(error) = mine_bitcoin_confirmation_block(devnet.as_ref()).await {
+                        eprintln!("background bitcoin confirmation miner failed: {error}");
+                    }
+                }
+            }
+        }
+    });
+    RuntimeTask::with_shutdown(handle, move || {
+        let _ = shutdown_tx.send(());
+    })
+}
+
 impl RouterRuntimeHarness {
     async fn shutdown(mut self) {
         self._sauron_task.abort_and_join().await;
@@ -320,22 +411,36 @@ async fn router_api_worker_sauron_complete_mock_route_matrix() {
                 "[[TIMING]] phase=harness_total_bringup elapsed_ms={}",
                 _t_harness.elapsed().as_millis()
             );
-            for route_case in ROUTE_CASES {
-                let _t_case = std::time::Instant::now();
-                run_route_case(
-                    &runtime.client,
-                    &runtime.router_base_url,
-                    &runtime.devnet,
-                    &runtime.mocks,
-                    *route_case,
-                )
-                .await;
-                eprintln!(
-                    "[[TIMING]] phase=route_case name={} elapsed_ms={}",
-                    route_case.name,
-                    _t_case.elapsed().as_millis()
-                );
-            }
+
+            let funding_locks = FundingLocks::new();
+            let mut bitcoin_miner = spawn_bitcoin_confirmation_miner(Arc::clone(&runtime.devnet));
+            let client = &runtime.client;
+            let router_base_url = runtime.router_base_url.as_str();
+            let devnet = runtime.devnet.as_ref();
+            let mocks = &runtime.mocks;
+            join_all(ROUTE_CASES.iter().copied().map(|route_case| {
+                let funding_locks = funding_locks.clone();
+                async move {
+                    let _t_case = std::time::Instant::now();
+                    run_route_case(
+                        client,
+                        router_base_url,
+                        devnet,
+                        mocks,
+                        funding_locks,
+                        route_case,
+                    )
+                    .await;
+                    eprintln!(
+                        "[[TIMING]] phase=route_case name={} elapsed_ms={}",
+                        route_case.name,
+                        _t_case.elapsed().as_millis()
+                    );
+                }
+            }))
+            .await;
+            bitcoin_miner.abort_and_join().await;
+
             let _t_shutdown = std::time::Instant::now();
             runtime.shutdown().await;
             eprintln!(
@@ -344,6 +449,55 @@ async fn router_api_worker_sauron_complete_mock_route_matrix() {
             );
             eprintln!(
                 "[[TIMING]] phase=test_total elapsed_ms={}",
+                _t_total.elapsed().as_millis()
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "integration: spawns devnet stack"]
+async fn router_api_worker_sauron_refunds_failed_mock_routes() {
+    init_test_tracing();
+    LocalSet::new()
+        .run_until(async {
+            let _t_total = std::time::Instant::now();
+            let _t_harness = std::time::Instant::now();
+            let runtime = spawn_mock_router_runtime().await;
+            eprintln!(
+                "[[TIMING]] phase=refund_harness_total_bringup elapsed_ms={}",
+                _t_harness.elapsed().as_millis()
+            );
+
+            let funding_locks = FundingLocks::new();
+            let mut bitcoin_miner = spawn_bitcoin_confirmation_miner(Arc::clone(&runtime.devnet));
+            for refund_case in REFUND_FAILURE_ROUTE_CASES {
+                let _t_case = std::time::Instant::now();
+                run_refund_failure_route_case(
+                    &runtime.client,
+                    &runtime.router_base_url,
+                    runtime.devnet.as_ref(),
+                    &runtime.mocks,
+                    funding_locks.clone(),
+                    *refund_case,
+                )
+                .await;
+                eprintln!(
+                    "[[TIMING]] phase=refund_route_case name={} elapsed_ms={}",
+                    refund_case.name,
+                    _t_case.elapsed().as_millis()
+                );
+            }
+            bitcoin_miner.abort_and_join().await;
+
+            let _t_shutdown = std::time::Instant::now();
+            runtime.shutdown().await;
+            eprintln!(
+                "[[TIMING]] phase=refund_shutdown elapsed_ms={}",
+                _t_shutdown.elapsed().as_millis()
+            );
+            eprintln!(
+                "[[TIMING]] phase=refund_test_total elapsed_ms={}",
                 _t_total.elapsed().as_millis()
             );
         })
@@ -378,6 +532,7 @@ async fn spawn_mock_router_runtime() -> RouterRuntimeHarness {
         .build()
         .await
         .expect("devnet setup failed");
+    let devnet = Arc::new(devnet);
     timing_log!("devnet_build", _t);
 
     let _t = std::time::Instant::now();
@@ -1244,16 +1399,29 @@ async fn run_route_case(
     router_base_url: &str,
     devnet: &RiftDevnet,
     mocks: &MockIntegratorServer,
+    funding_locks: FundingLocks,
     route_case: RouteCase,
 ) {
     eprintln!("running router runtime route case {}", route_case.name);
+    let _t = std::time::Instant::now();
     let quote = submit_exact_in_quote(client, router_base_url, route_case).await;
+    eprintln!(
+        "[[TIMING]] sub route={} step=quote ms={}",
+        route_case.name,
+        _t.elapsed().as_millis()
+    );
     let market_quote = quote.quote.as_market_order().expect("market order quote");
     assert_provider_fragments(route_case, &market_quote.provider_id);
     let quote_id = market_quote.id;
     let amount_in = market_quote.amount_in.clone();
 
+    let _t = std::time::Instant::now();
     let order = submit_order(client, router_base_url, quote_id, route_case).await;
+    eprintln!(
+        "[[TIMING]] sub route={} step=submit_order ms={}",
+        route_case.name,
+        _t.elapsed().as_millis()
+    );
     assert_eq!(order.order.status, RouterOrderStatus::PendingFunding);
     let funding_vault = order
         .funding_vault
@@ -1262,15 +1430,166 @@ async fn run_route_case(
         .vault
         .clone();
     assert_funding_vault_matches(route_case, &funding_vault);
+    let _t = std::time::Instant::now();
+    let funding_guard = funding_locks
+        .lock_for_chain(funding_vault.deposit_asset.chain.as_str())
+        .lock_owned()
+        .await;
     fund_source_vault(devnet, &funding_vault, &amount_in).await;
+    drop(funding_guard);
+    eprintln!(
+        "[[TIMING]] sub route={} step=fund_source_vault ms={}",
+        route_case.name,
+        _t.elapsed().as_millis()
+    );
 
-    let completed =
-        drive_order_to_completion(client, router_base_url, devnet, mocks, order.order.id).await;
+    let completed = drive_order_to_completion(
+        client,
+        router_base_url,
+        devnet,
+        mocks,
+        funding_locks,
+        order.order.id,
+        route_case.name,
+    )
+    .await;
     assert_eq!(
         completed.order.status,
         RouterOrderStatus::Completed,
         "route case {} should complete",
         route_case.name
+    );
+}
+
+async fn run_refund_failure_route_case(
+    client: &reqwest::Client,
+    router_base_url: &str,
+    devnet: &RiftDevnet,
+    mocks: &MockIntegratorServer,
+    funding_locks: FundingLocks,
+    refund_case: RefundFailureRouteCase,
+) {
+    let route_case = route_case_by_name(refund_case.route_case_name);
+    eprintln!(
+        "running router runtime refund route case {} via {}",
+        refund_case.name, route_case.name
+    );
+    let _t = std::time::Instant::now();
+    let quote = submit_exact_in_quote(client, router_base_url, route_case).await;
+    eprintln!(
+        "[[TIMING]] sub route={} step=quote ms={}",
+        refund_case.name,
+        _t.elapsed().as_millis()
+    );
+    let market_quote = quote.quote.as_market_order().expect("market order quote");
+    assert_provider_fragments(route_case, &market_quote.provider_id);
+    let quote_id = market_quote.id;
+    let amount_in = market_quote.amount_in.clone();
+
+    let _t = std::time::Instant::now();
+    let order = submit_order(client, router_base_url, quote_id, route_case).await;
+    eprintln!(
+        "[[TIMING]] sub route={} step=submit_order ms={}",
+        refund_case.name,
+        _t.elapsed().as_millis()
+    );
+    assert_eq!(order.order.status, RouterOrderStatus::PendingFunding);
+    configure_refund_failure(mocks, refund_case.failure).await;
+
+    let funding_vault = order
+        .funding_vault
+        .as_ref()
+        .expect("order should include funding vault")
+        .vault
+        .clone();
+    assert_funding_vault_matches(route_case, &funding_vault);
+    let _t = std::time::Instant::now();
+    let funding_guard = funding_locks
+        .lock_for_chain(funding_vault.deposit_asset.chain.as_str())
+        .lock_owned()
+        .await;
+    fund_source_vault(devnet, &funding_vault, &amount_in).await;
+    drop(funding_guard);
+    eprintln!(
+        "[[TIMING]] sub route={} step=fund_source_vault ms={}",
+        refund_case.name,
+        _t.elapsed().as_millis()
+    );
+
+    let refunded = drive_order_to_status(
+        client,
+        router_base_url,
+        devnet,
+        mocks,
+        funding_locks,
+        order.order.id,
+        refund_case.name,
+        RouterOrderStatus::Refunded,
+    )
+    .await;
+    assert_eq!(
+        refunded.order.status,
+        RouterOrderStatus::Refunded,
+        "refund route case {} should finish refunded",
+        refund_case.name
+    );
+    let flow = get_order_flow(client, router_base_url, order.order.id).await;
+    assert_refund_flow(refund_case, &flow);
+}
+
+fn route_case_by_name(name: &str) -> RouteCase {
+    *ROUTE_CASES
+        .iter()
+        .find(|route_case| route_case.name == name)
+        .unwrap_or_else(|| panic!("missing route case {name}"))
+}
+
+async fn configure_refund_failure(mocks: &MockIntegratorServer, failure: RefundFailureKind) {
+    match failure {
+        RefundFailureKind::VeloraTransactionFailures => {
+            mocks
+                .set_velora_transaction_fail_next_n(PROVIDER_FAILURES_TO_FORCE_REFUND)
+                .await;
+        }
+        RefundFailureKind::VeloraStaleQuoteFailures => {
+            mocks
+                .set_velora_transaction_stale_quote_fail_next_n(PROVIDER_FAILURES_TO_FORCE_REFUND)
+                .await;
+        }
+    }
+}
+
+fn assert_refund_flow(refund_case: RefundFailureRouteCase, flow: &OrderFlowEnvelope) {
+    assert_eq!(
+        flow.flow.order.status,
+        RouterOrderStatus::Refunded,
+        "refund route case {} should expose refunded order status in flow",
+        refund_case.name
+    );
+    assert!(
+        flow.flow.attempts.iter().any(|attempt| {
+            attempt.attempt_kind == OrderExecutionAttemptKind::RefundRecovery
+                && attempt.status == OrderExecutionAttemptStatus::Completed
+        }),
+        "refund route case {} should create a completed refund recovery attempt",
+        refund_case.name
+    );
+    assert!(
+        flow.flow.steps.iter().any(|step| {
+            step.step_type == refund_case.failed_step_type
+                && step.status == OrderExecutionStepStatus::Failed
+        }),
+        "refund route case {} should record a failed {:?} step",
+        refund_case.name,
+        refund_case.failed_step_type
+    );
+    assert!(
+        flow.flow.steps.iter().any(|step| {
+            step.step_type == OrderExecutionStepType::Refund
+                && step.status == OrderExecutionStepStatus::Completed
+        }),
+        "refund route case {} should complete a refund transfer step",
+        refund_case.name
     );
 }
 
@@ -1424,21 +1743,84 @@ async fn drive_order_to_completion(
     router_base_url: &str,
     devnet: &RiftDevnet,
     mocks: &MockIntegratorServer,
+    funding_locks: FundingLocks,
     order_id: Uuid,
+    label: &str,
+) -> RouterOrderEnvelope {
+    drive_order_to_status(
+        client,
+        router_base_url,
+        devnet,
+        mocks,
+        funding_locks,
+        order_id,
+        label,
+        RouterOrderStatus::Completed,
+    )
+    .await
+}
+
+async fn drive_order_to_status(
+    client: &reqwest::Client,
+    router_base_url: &str,
+    devnet: &RiftDevnet,
+    mocks: &MockIntegratorServer,
+    funding_locks: FundingLocks,
+    order_id: Uuid,
+    label: &str,
+    expected_status: RouterOrderStatus,
 ) -> RouterOrderEnvelope {
     let started = Instant::now();
     let mut completed_manual_operations = HashSet::new();
 
+    // sub-phase instrumentation (temporary)
+    let mut polls: u64 = 0;
+    let mut last_status: Option<RouterOrderStatus> = None;
+    let mut status_since = Instant::now();
+    let mut across_fund_ms: u128 = 0;
+    let mut unit_deposit_ms: u128 = 0;
+    let bitcoin_mine_ms: u128 = 0;
+    let mut unit_withdrawal_ms: u128 = 0;
+    macro_rules! emit_summary {
+        () => {
+            eprintln!(
+                "[[TIMING]] drive_summary route={} polls={} across_fund_ms={} unit_deposit_ms={} bitcoin_mine_ms={} unit_withdrawal_ms={}",
+                label, polls, across_fund_ms, unit_deposit_ms, bitcoin_mine_ms, unit_withdrawal_ms
+            );
+        };
+    }
+
     loop {
+        polls += 1;
         let order = get_order_http(client, router_base_url, order_id).await;
-        if order.order.status == RouterOrderStatus::Completed {
+        if last_status != Some(order.order.status) {
+            if let Some(prev) = last_status {
+                eprintln!(
+                    "[[TIMING]] drive route={} status={:?} held_ms={}",
+                    label,
+                    prev,
+                    status_since.elapsed().as_millis()
+                );
+            }
+            last_status = Some(order.order.status);
+            status_since = Instant::now();
+        }
+        if order.order.status == expected_status {
+            eprintln!(
+                "[[TIMING]] drive route={} status={:?} held_ms={}",
+                label,
+                expected_status,
+                status_since.elapsed().as_millis()
+            );
+            emit_summary!();
             return order;
         }
         if is_terminal_order_status(order.order.status) {
+            emit_summary!();
             dump_order_flow(client, router_base_url, order_id).await;
             panic!(
-                "order {order_id} reached terminal status {:?}, expected completion",
-                order.order.status
+                "order {order_id} reached terminal status {:?}, expected {:?}",
+                order.order.status, expected_status
             );
         }
 
@@ -1454,18 +1836,32 @@ async fn drive_order_to_completion(
                 ProviderOperationType::AcrossBridge
                     if operation.status == ProviderOperationStatus::WaitingExternal =>
                 {
+                    let _m = Instant::now();
+                    let destination_chain = flow
+                        .flow
+                        .custody_vaults
+                        .iter()
+                        .find(|vault| vault.role == CustodyVaultRole::DestinationExecution)
+                        .expect("Across step should create destination execution custody vault")
+                        .chain
+                        .as_str();
+                    let funding_guard = funding_locks
+                        .lock_for_chain(destination_chain)
+                        .lock_owned()
+                        .await;
                     fund_destination_execution_vault_from_across(devnet, &flow, operation).await;
+                    drop(funding_guard);
+                    across_fund_ms += _m.elapsed().as_millis();
                     completed_manual_operations.insert(operation.id);
                 }
                 ProviderOperationType::UnitDeposit if operation.provider_ref.is_some() => {
-                    let source_is_bitcoin = unit_operation_source_is_bitcoin(operation);
+                    let _m = Instant::now();
                     complete_unit_deposit(mocks, operation).await;
-                    if source_is_bitcoin {
-                        mine_bitcoin_confirmation_block(devnet).await;
-                    }
+                    unit_deposit_ms += _m.elapsed().as_millis();
                     completed_manual_operations.insert(operation.id);
                 }
                 ProviderOperationType::UnitWithdrawal if operation.provider_ref.is_some() => {
+                    let _m = Instant::now();
                     mocks
                         .complete_unit_operation_with_source_amount(
                             operation
@@ -1476,6 +1872,7 @@ async fn drive_order_to_completion(
                         )
                         .await
                         .expect("complete mock Unit withdrawal operation");
+                    unit_withdrawal_ms += _m.elapsed().as_millis();
                     completed_manual_operations.insert(operation.id);
                 }
                 _ => {}
@@ -1483,8 +1880,9 @@ async fn drive_order_to_completion(
         }
 
         if started.elapsed() >= Duration::from_secs(240) {
+            emit_summary!();
             dump_order_flow(client, router_base_url, order_id).await;
-            panic!("timed out waiting for order {order_id} to complete");
+            panic!("timed out waiting for order {order_id} to reach {expected_status:?}");
         }
 
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -1523,15 +1921,6 @@ fn unit_operation_amount(operation: &OrderProviderOperation) -> U256 {
         .and_then(Value::as_str)
         .and_then(|amount| U256::from_str_radix(amount, 10).ok())
         .expect("UnitDeposit operation request should include amount")
-}
-
-fn unit_operation_source_is_bitcoin(operation: &OrderProviderOperation) -> bool {
-    operation
-        .request
-        .get("src_chain")
-        .or_else(|| operation.request.get("source_chain"))
-        .and_then(Value::as_str)
-        .is_some_and(|chain| chain.eq_ignore_ascii_case("bitcoin"))
 }
 
 async fn fund_destination_execution_vault_from_across(
@@ -1681,17 +2070,18 @@ async fn send_bitcoin(devnet: &RiftDevnet, address: &str, amount_sats: u64) {
         .expect("esplora sync after bitcoin funding");
 }
 
-async fn mine_bitcoin_confirmation_block(devnet: &RiftDevnet) {
+async fn mine_bitcoin_confirmation_block(devnet: &RiftDevnet) -> Result<(), String> {
     devnet
         .bitcoin
         .mine_blocks(1)
         .await
-        .expect("mine bitcoin confirmation block");
+        .map_err(|error| format!("mine bitcoin confirmation block: {error}"))?;
     devnet
         .bitcoin
         .wait_for_esplora_sync(Duration::from_secs(30))
         .await
-        .expect("esplora sync after bitcoin confirmation block");
+        .map_err(|error| format!("esplora sync after bitcoin confirmation block: {error}"))?;
+    Ok(())
 }
 
 async fn send_native(devnet: &devnet::EthDevnet, recipient: Address, amount: U256) {

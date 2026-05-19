@@ -6328,6 +6328,7 @@ dependencies = [
  "devnet",
  "eip3009-erc20-contract",
  "evm-receipt-watcher",
+ "futures-util",
  "hl-shim-indexer",
  "hyperunit-client",
  "reqwest",

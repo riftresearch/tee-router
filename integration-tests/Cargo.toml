@@ -12,6 +12,7 @@ eip3009-erc20-contract = { workspace = true }
 bitcoin-indexer = { path = "../bitcoin-indexer" }
 bitcoin-receipt-watcher = { path = "../bitcoin-receipt-watcher" }
 evm-receipt-watcher = { path = "../evm-receipt-watcher" }
+futures-util = "0.3"
 hyperunit-client = { workspace = true }
 hl-shim-indexer = { workspace = true }
 router-core = { workspace = true }
