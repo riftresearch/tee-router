@@ -10,6 +10,12 @@ import {
   type VolumeOrderTypeFilter
 } from './analytics'
 import {
+  appendAdminMessage,
+  ChatProxyError,
+  getAdminThread,
+  listAdminChats
+} from './chats'
+import {
   ALLOWED_ADMIN_EMAILS,
   type AdminDashboardConfig,
   isAllowedAdminEmail,
@@ -210,6 +216,10 @@ export function createApp(
     })
   )
 
+  const chatAdminConfigured = Boolean(
+    config.supabaseChatAdminSecret && config.supabaseAnonKey
+  )
+
   app.get('/api/me', async (c) => {
     if (!config.production) {
       return c.json({
@@ -225,6 +235,7 @@ export function createApp(
         allowedEmails: ALLOWED_ADMIN_EMAILS,
         routerAdminKeyConfigured: Boolean(config.routerAdminApiKey),
         analyticsConfigured: Boolean(volumeAnalyticsRuntime),
+        chatAdminConfigured,
         authMode: 'development_bypass'
       })
     }
@@ -269,6 +280,7 @@ export function createApp(
         ? Boolean(config.routerAdminApiKey)
         : undefined,
       analyticsConfigured: Boolean(volumeAnalyticsRuntime),
+      chatAdminConfigured: authorized ? chatAdminConfigured : undefined,
       authMode: 'google'
     })
   })
@@ -396,6 +408,56 @@ export function createApp(
       to: range.to.toISOString(),
       buckets
     })
+  })
+
+  app.get('/api/chats', async (c) => {
+    const admin = await requireAdmin(c, config, authRuntime)
+    if (admin instanceof Response) return admin
+
+    try {
+      const chats = await listAdminChats(config)
+      return c.json({ chats })
+    } catch (error) {
+      return chatErrorResponse(c, error, 'list_chats_failed')
+    }
+  })
+
+  app.get('/api/chats/:id', async (c) => {
+    const admin = await requireAdmin(c, config, authRuntime)
+    if (admin instanceof Response) return admin
+
+    try {
+      const thread = await getAdminThread(config, c.req.param('id'))
+      return c.json({ thread })
+    } catch (error) {
+      return chatErrorResponse(c, error, 'get_thread_failed')
+    }
+  })
+
+  app.post('/api/chats/:id/messages', async (c) => {
+    const admin = await requireAdmin(c, config, authRuntime)
+    if (admin instanceof Response) return admin
+
+    let body: unknown
+    try {
+      body = await c.req.json()
+    } catch (_error) {
+      return c.json({ error: 'invalid_json_body' }, 400)
+    }
+    const parsed = parseChatReplyBody(body)
+    if (parsed instanceof Response) return parsed
+
+    try {
+      const result = await appendAdminMessage(
+        config,
+        c.req.param('id'),
+        parsed.address,
+        parsed.message
+      )
+      return c.json({ ok: true, result })
+    } catch (error) {
+      return chatErrorResponse(c, error, 'append_message_failed')
+    }
   })
 
   if (config.serveStatic) {
@@ -660,6 +722,36 @@ function isUuid(value: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
     value
   )
+}
+
+function parseChatReplyBody(
+  value: unknown
+): { address: string; message: string } | Response {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return Response.json({ error: 'invalid_body' }, { status: 400 })
+  }
+  const body = value as Record<string, unknown>
+  if (typeof body.address !== 'string' || typeof body.message !== 'string') {
+    return Response.json({ error: 'invalid_body' }, { status: 400 })
+  }
+  return { address: body.address, message: body.message }
+}
+
+function chatErrorResponse(
+  c: Context<AppBindings>,
+  error: unknown,
+  fallbackCode: string
+): Response {
+  if (error instanceof ChatProxyError) {
+    logError(`admin dashboard chat proxy ${fallbackCode}`, error)
+    const payload: Record<string, unknown> = { error: error.message }
+    if (error.upstreamStatus !== undefined) {
+      payload.upstreamStatus = error.upstreamStatus
+    }
+    return c.json(payload, error.status as never)
+  }
+  logError(`admin dashboard chat proxy ${fallbackCode}`, error)
+  return c.json({ error: fallbackCode }, 502)
 }
 
 function toBase64Url(value: string): string {

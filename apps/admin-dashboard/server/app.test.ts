@@ -800,6 +800,8 @@ function testConfig(overrides: Partial<AdminDashboardConfig> = {}): AdminDashboa
     serveStatic: false,
     version: 'test',
     missingAuthConfig: [],
+    supabaseChatsUrl:
+      'https://ookzpviwfhzfarouusah.supabase.co/functions/v1/chats',
     ...overrides
   }
 }

@@ -1883,5 +1883,7 @@ const testConfig: AdminDashboardConfig = {
   allowInsecureDevAuthBypass: false,
   serveStatic: false,
   version: 'test',
-  missingAuthConfig: []
+  missingAuthConfig: [],
+  supabaseChatsUrl:
+    'https://ookzpviwfhzfarouusah.supabase.co/functions/v1/chats'
 }

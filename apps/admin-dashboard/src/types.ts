@@ -215,8 +215,43 @@ export type MeResponse = {
   allowedEmails: string[]
   routerAdminKeyConfigured?: boolean
   analyticsConfigured?: boolean
+  chatAdminConfigured?: boolean
   missingAuthConfig?: string[]
   authMode?: 'google' | 'development_bypass'
+}
+
+export type ChatMessageRole = 'user' | 'admin'
+
+export type ChatMessage = {
+  role: ChatMessageRole
+  message: string
+  ts: string
+}
+
+export type ChatThread = {
+  id: string
+  user_eth_address: string
+  meta?: unknown
+  last_message_at: string
+  created_at?: string
+  updated_at?: string
+  last_admin_msg_at?: string
+  user_unread_count?: number
+  has_unread?: boolean
+  messages: ChatMessage[]
+}
+
+export type ChatListResponse = {
+  chats: ChatThread[]
+}
+
+export type ChatThreadResponse = {
+  thread: ChatThread
+}
+
+export type ChatReplyResponse = {
+  ok: boolean
+  result?: unknown
 }
 
 export type OrdersResponse = {
