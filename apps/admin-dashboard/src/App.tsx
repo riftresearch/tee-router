@@ -6,8 +6,10 @@ import {
   CircleAlert,
   Clock3,
   Copy,
+  ListChecks,
   LogIn,
   LogOut,
+  MessageSquare,
   RefreshCw,
   Search,
   ShieldCheck,
@@ -16,6 +18,8 @@ import {
   X
 } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
+
+import { ChatsView } from './Chats'
 
 import {
   fetchMe,
@@ -240,8 +244,11 @@ const ASSET_DECIMALS: Record<string, number> = {
   'hyperliquid|ueth': 18
 }
 
+type DashboardView = 'orders' | 'chats'
+
 export function App() {
   const [me, setMe] = useState<MeResponse | null>(null)
+  const [view, setView] = useState<DashboardView>('orders')
   const [orderList, setOrderList] = useState<OrderListState>(() => ({
     orders: []
   }))
@@ -800,6 +807,24 @@ export function App() {
 
   const displayedOrders = searchedOrder ? [searchedOrder] : orders
 
+  if (view === 'chats') {
+    return (
+      <Shell
+        right={
+          <UserMenu
+            me={me}
+            streamState={streamState}
+            onRefresh={refreshOrderStream}
+            view={view}
+            onViewChange={setView}
+          />
+        }
+      >
+        <ChatsView configured={me.chatAdminConfigured ?? false} />
+      </Shell>
+    )
+  }
+
   return (
     <Shell
       right={
@@ -807,6 +832,8 @@ export function App() {
           me={me}
           streamState={streamState}
           onRefresh={refreshOrderStream}
+          view={view}
+          onViewChange={setView}
         />
       }
     >
@@ -1069,18 +1096,31 @@ function LoadingPanel() {
 function UserMenu({
   me,
   streamState,
-  onRefresh
+  onRefresh,
+  view,
+  onViewChange
 }: {
   me: MeResponse
   streamState: StreamState
   onRefresh: () => void
+  view: DashboardView
+  onViewChange: (view: DashboardView) => void
 }) {
   return (
     <div className="user-menu">
-      <StreamBadge state={streamState} compact />
-      <button className="icon-button" onClick={onRefresh} aria-label="Refresh orders">
-        <RefreshCw size={17} />
-      </button>
+      <ViewSwitcher active={view} onChange={onViewChange} />
+      {view === 'orders' ? (
+        <>
+          <StreamBadge state={streamState} compact />
+          <button
+            className="icon-button"
+            onClick={onRefresh}
+            aria-label="Refresh orders"
+          >
+            <RefreshCw size={17} />
+          </button>
+        </>
+      ) : null}
       <div className="user-chip">
         <span>{me.user?.email}</span>
       </div>
@@ -1090,6 +1130,39 @@ function UserMenu({
         aria-label="Sign out"
       >
         <LogOut size={17} />
+      </button>
+    </div>
+  )
+}
+
+function ViewSwitcher({
+  active,
+  onChange
+}: {
+  active: DashboardView
+  onChange: (view: DashboardView) => void
+}) {
+  return (
+    <div className="view-switcher" role="tablist" aria-label="Dashboard view">
+      <button
+        type="button"
+        role="tab"
+        aria-selected={active === 'orders'}
+        className={active === 'orders' ? 'active' : undefined}
+        onClick={() => onChange('orders')}
+      >
+        <ListChecks size={14} />
+        <span>Orders</span>
+      </button>
+      <button
+        type="button"
+        role="tab"
+        aria-selected={active === 'chats'}
+        className={active === 'chats' ? 'active' : undefined}
+        onClick={() => onChange('chats')}
+      >
+        <MessageSquare size={14} />
+        <span>Chats</span>
       </button>
     </div>
   )

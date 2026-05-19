@@ -28,6 +28,9 @@ export type AdminDashboardConfig = {
   serveStatic: boolean
   version: string
   missingAuthConfig: string[]
+  supabaseChatsUrl: string
+  supabaseAnonKey?: string
+  supabaseChatAdminSecret?: string
 }
 
 type Env = Record<string, string | undefined>
@@ -43,6 +46,8 @@ const DEFAULT_CDC_MESSAGE_PREFIX = 'rift.router.change'
 const DEV_AUTH_SECRET = 'rift-admin-dashboard-development-secret-change-me'
 const MIN_PRODUCTION_AUTH_SECRET_LENGTH = 32
 const MIN_ROUTER_ADMIN_API_KEY_LENGTH = 32
+const DEFAULT_SUPABASE_CHATS_URL =
+  'https://ookzpviwfhzfarouusah.supabase.co/functions/v1/chats'
 const MAX_POSTGRES_IDENTIFIER_BYTES = 63
 const POSTGRES_IDENTIFIER_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
 const POSITIVE_DECIMAL_INTEGER_PATTERN = /^[1-9][0-9]{0,14}$/
@@ -146,7 +151,34 @@ export function loadConfig(env: Env = Bun.env as Env): AdminDashboardConfig {
     ),
     serveStatic: env.ADMIN_DASHBOARD_SERVE_STATIC !== 'false',
     version: env.npm_package_version ?? '0.1.0',
-    missingAuthConfig
+    missingAuthConfig,
+    supabaseChatsUrl: normalizeSupabaseChatsUrl(
+      env.SUPABASE_CHATS_URL ?? DEFAULT_SUPABASE_CHATS_URL
+    ),
+    supabaseAnonKey: normalizeOptionalSecret(env.SUPABASE_ANON_KEY),
+    supabaseChatAdminSecret: normalizeOptionalSecret(
+      env.SUPABASE_CHAT_ADMIN_SECRET
+    )
+  }
+}
+
+function normalizeSupabaseChatsUrl(value: string): string {
+  const trimmed = value.trim().replace(/\/+$/, '')
+  try {
+    const parsed = new URL(trimmed)
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+      throw new Error('expected http or https')
+    }
+    if (parsed.username || parsed.password) {
+      throw new Error('URL credentials are not allowed')
+    }
+    if (parsed.search || parsed.hash) {
+      throw new Error('query strings and fragments are not allowed')
+    }
+    return parsed.toString().replace(/\/+$/, '')
+  } catch (error) {
+    const reason = error instanceof Error ? `: ${error.message}` : ''
+    throw new Error(`Invalid SUPABASE_CHATS_URL${reason}`)
   }
 }
 

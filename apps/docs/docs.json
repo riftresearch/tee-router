@@ -49,8 +49,8 @@
     "links": [],
     "primary": {
       "type": "button",
-      "label": "Chat with team",
-      "href": "https://t.me/samee_rift"
+      "label": "Get Support",
+      "href": "/?chat=open"
     }
   },
   "footer": {

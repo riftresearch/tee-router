@@ -1,4 +1,9 @@
 import type {
+  ChatListResponse,
+  ChatMessage,
+  ChatReplyResponse,
+  ChatThread,
+  ChatThreadResponse,
   MeResponse,
   MetricsEvent,
   OrderLifecycleFilter,
@@ -104,6 +109,67 @@ export async function fetchVolumeAnalytics({
     throw new Error('Invalid volume analytics response payload')
   }
   return payload
+}
+
+export async function fetchChatList(): Promise<ChatThread[]> {
+  const response = await fetch('/api/chats', { credentials: 'include' })
+  if (!response.ok) {
+    throw new Error(await readErrorBody(response, 'chats'))
+  }
+  const payload = await readJsonResponse(response, 'chats')
+  if (!isChatListResponse(payload)) {
+    throw new Error('Invalid chats response payload')
+  }
+  return payload.chats
+}
+
+export async function fetchChatThread(chatId: string): Promise<ChatThread> {
+  const response = await fetch(`/api/chats/${encodeURIComponent(chatId)}`, {
+    credentials: 'include'
+  })
+  if (!response.ok) {
+    throw new Error(await readErrorBody(response, 'chat thread'))
+  }
+  const payload = await readJsonResponse(response, 'chat thread')
+  if (!isChatThreadResponse(payload)) {
+    throw new Error('Invalid chat thread response payload')
+  }
+  return payload.thread
+}
+
+export async function sendChatReply(
+  chatId: string,
+  userAddress: string,
+  message: string
+): Promise<ChatReplyResponse> {
+  const response = await fetch(
+    `/api/chats/${encodeURIComponent(chatId)}/messages`,
+    {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ address: userAddress, message })
+    }
+  )
+  if (!response.ok) {
+    throw new Error(await readErrorBody(response, 'chat reply'))
+  }
+  const payload = await readJsonResponse(response, 'chat reply')
+  if (!isRecord(payload) || typeof payload.ok !== 'boolean') {
+    throw new Error('Invalid chat reply response payload')
+  }
+  return payload as ChatReplyResponse
+}
+
+async function readErrorBody(response: Response, label: string) {
+  let suffix = ''
+  try {
+    const text = await response.text()
+    if (text) suffix = `: ${text.slice(0, 200)}`
+  } catch (_error) {
+    // ignore
+  }
+  return `Failed to load ${label}: HTTP ${response.status}${suffix}`
 }
 
 export function parseSnapshotEvent(event: MessageEvent<string>): SnapshotEvent {
@@ -233,12 +299,51 @@ function isMeResponse(value: unknown): value is MeResponse {
       typeof value.routerAdminKeyConfigured === 'boolean') &&
     (value.analyticsConfigured === undefined ||
       typeof value.analyticsConfigured === 'boolean') &&
+    (value.chatAdminConfigured === undefined ||
+      typeof value.chatAdminConfigured === 'boolean') &&
     (value.missingAuthConfig === undefined ||
       (Array.isArray(value.missingAuthConfig) &&
         value.missingAuthConfig.every((entry) => typeof entry === 'string'))) &&
     (value.authMode === undefined ||
       value.authMode === 'google' ||
       value.authMode === 'development_bypass')
+  )
+}
+
+function isChatListResponse(value: unknown): value is ChatListResponse {
+  return (
+    isRecord(value) &&
+    Array.isArray(value.chats) &&
+    value.chats.every(isChatThread)
+  )
+}
+
+function isChatThreadResponse(value: unknown): value is ChatThreadResponse {
+  return isRecord(value) && isChatThread(value.thread)
+}
+
+function isChatThread(value: unknown): value is ChatThread {
+  if (!isRecord(value)) return false
+  if (typeof value.id !== 'string') return false
+  if (typeof value.user_eth_address !== 'string') return false
+  if (typeof value.last_message_at !== 'string') return false
+  if (!Array.isArray(value.messages)) return false
+  if (!value.messages.every(isChatMessage)) return false
+  if (
+    value.user_unread_count !== undefined &&
+    !isNonNegativeSafeInteger(value.user_unread_count)
+  ) {
+    return false
+  }
+  return true
+}
+
+function isChatMessage(value: unknown): value is ChatMessage {
+  return (
+    isRecord(value) &&
+    (value.role === 'user' || value.role === 'admin') &&
+    typeof value.message === 'string' &&
+    typeof value.ts === 'string'
   )
 }
 
