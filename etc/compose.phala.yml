@@ -61,6 +61,17 @@ configs:
           END IF;
         END
         \$\$;
+
+        -- Sauron + admin-dashboard read the standby as $${REPLICA_USER}; grant
+        -- the read surface they need (SELECT on existing + future public tables,
+        -- plus logical decoding so the CDC slot can be opened).
+        GRANT USAGE ON SCHEMA public TO $${REPLICA_USER};
+        GRANT SELECT ON ALL TABLES IN SCHEMA public TO $${REPLICA_USER};
+        GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO $${REPLICA_USER};
+        ALTER DEFAULT PRIVILEGES FOR ROLE $$POSTGRES_USER IN SCHEMA public
+          GRANT SELECT ON TABLES TO $${REPLICA_USER};
+        ALTER DEFAULT PRIVILEGES FOR ROLE $$POSTGRES_USER IN SCHEMA public
+          GRANT SELECT ON SEQUENCES TO $${REPLICA_USER};
       SQL
 
       echo "Router Postgres init complete"
