@@ -55,6 +55,16 @@ write_standby_hba() {
   fi
 }
 
+clear_active_initialization_slot() {
+  local active_pid
+  active_pid="$(psql "${PRIMARY_CONNINFO}" -tAc "SELECT active_pid FROM pg_replication_slots WHERE slot_name = '${PRIMARY_REPLICATION_SLOT}' AND active_pid IS NOT NULL;")"
+  if [ -n "${active_pid}" ]; then
+    echo "Terminating active replication backend ${active_pid} for slot '${PRIMARY_REPLICATION_SLOT}' before basebackup"
+    psql "${PRIMARY_CONNINFO}" -c "SELECT pg_terminate_backend(${active_pid});"
+    sleep 2
+  fi
+}
+
 echo "=== Router v3 Physical Standby ==="
 echo "primary=${PRIMARY_DB_HOST}:${PRIMARY_DB_PORT}/${PRIMARY_DB_NAME}"
 echo "slot=${PRIMARY_REPLICATION_SLOT}"
@@ -77,6 +87,8 @@ if [ ! -s "${PGDATA}/PG_VERSION" ]; then
   else
     echo "Physical replication slot '${PRIMARY_REPLICATION_SLOT}' already exists"
   fi
+
+  clear_active_initialization_slot
 
   pg_basebackup \
     --pgdata="${PGDATA}" \

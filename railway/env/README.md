@@ -30,6 +30,7 @@ reference vars it wires automatically.
 | `TOKEN_INDEXER_API_KEY` | **generate** (== each indexer's `EVM_TOKEN_INDEXER_API_KEY`) | sauron, evm-token-indexers |
 | `HL_SHIM_API_KEY` | **generate** | sauron, hl-shim-indexer |
 | `POSTGRES_REPLICA_PASSWORD` | from `.env.phala.prod` | router-physical-standby |
+| `POSTGRES_REPLICA_PASSWORD_URLENCODED` | derived by `bootstrap.sh` from `POSTGRES_REPLICA_PASSWORD` | router-physical-standby `DATABASE_URL` |
 | `ETH_RPC_URL` `BASE_RPC_URL` `ARBITRUM_RPC_URL` | from .env.phala.prod | sauron, receipt-watchers, ponder (HTTP) |
 | `ETH_WS_RPC_URL` `BASE_WS_RPC_URL` `ARBITRUM_WS_RPC_URL` | **PROCURE** (none on hand) | receipt-watchers, ponder |
 | `BITCOIN_RPC_URL` | managed rathole broker v3 | sauron, bitcoin-indexer/-receipt-watcher |
@@ -45,6 +46,7 @@ reference vars it wires automatically.
 `SAURON_STATE_DATABASE_URL`, `HL_SHIM_DATABASE_URL`,
 `ROUTER_GATEWAY_DATABASE_URL`, token-indexer `DATABASE_URL`,
 `ADMIN_DASHBOARD_{AUTH,ANALYTICS}_DATABASE_URL`,
+`router-physical-standby-v3.DATABASE_URL`,
 `(ADMIN_DASHBOARD_)?ROUTER_REPLICA_DATABASE_URL`, `HYPERUNIT_PROXY_URL`, and
 every inter-service `*_INDEXER_URL` / `*_RECEIPT_WATCHER_URL` /
 `HL_SHIM_INDEXER_URL`.
