@@ -400,6 +400,21 @@ apply_shared_env_file() {
   iter_env_file "$file" apply_shared_env_pair "$file"
 }
 
+apply_derived_shared_vars() {
+  local file="${ENV_DIR}/_shared.env" password encoded
+  if [ ! -f "$file" ]; then
+    return 0
+  fi
+  if ! password="$(read_env_value "$file" POSTGRES_REPLICA_PASSWORD)"; then
+    return 0
+  fi
+  if is_placeholder_value "$password"; then
+    return 0
+  fi
+  encoded="$(printf '%s' "$password" | python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.stdin.read(), safe=""))')"
+  apply_shared_env_pair POSTGRES_REPLICA_PASSWORD_URLENCODED "$encoded" "derived:${file}"
+}
+
 set_shared_ref() {  # <service> <service-var> <shared-var>
   set_var "$1" "$2=\${{shared.$3}}"
 }
@@ -510,6 +525,7 @@ pin_service_region hyperunit-socks5-proxy-v3 "europe-west4-drams3a" || \
 # are skipped with warnings so deploy-time values can be filled later.
 log "applying shared variables from ${ENV_DIR}/_shared.env"
 apply_shared_env_file
+apply_derived_shared_vars
 
 SERVICE_ENV_FILES=(
   "sauron-worker-v3|sauron.env"
@@ -576,6 +592,9 @@ set_shared_ref admin-dashboard-v3 ROUTER_CDC_PUBLICATION_NAME ROUTER_CDC_PUBLICA
 set_shared_ref admin-dashboard-v3 ROUTER_CDC_MESSAGE_PREFIX ROUTER_CDC_MESSAGE_PREFIX
 set_shared_ref router-physical-standby-v3 PRIMARY_DB_PASSWORD POSTGRES_REPLICA_PASSWORD
 
+set_var router-replica-stunnel-v3 "PORT=5432"
+set_var router-physical-standby-v3 "PORT=5432"
+set_var router-physical-standby-v3 "DATABASE_URL=postgres://replicator:\${{shared.POSTGRES_REPLICA_PASSWORD_URLENCODED}}@router-physical-standby-v3.railway.internal:5432/router_db?sslmode=disable"
 set_var sauron-worker-v3      "SAURON_STATE_DATABASE_URL=\${{sauron-state-db-v3.DATABASE_URL}}"
 set_var sauron-worker-v3      "ROUTER_REPLICA_DATABASE_URL=\${{router-physical-standby-v3.DATABASE_URL}}"
 set_shared_ref sauron-worker-v3 ETH_RPC_URL ETH_RPC_URL
