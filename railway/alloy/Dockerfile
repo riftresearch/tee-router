@@ -4,8 +4,8 @@ FROM grafana/alloy:latest
 
 COPY etc/alloy.railway.alloy /etc/alloy/config.alloy
 
-# Railway injects PORT for the public endpoint; Alloy's OTLP HTTP receiver
-# binds [::]:4318 (see config). The server UI binds 12345.
+# Bootstrap creates the public Railway domain on port 4318 for the OTLP HTTP
+# receiver. Alloy's admin UI binds 12345 and should stay internal.
 EXPOSE 4318 12345
 ENTRYPOINT ["/bin/alloy"]
 CMD ["run", "--server.http.listen-addr=0.0.0.0:12345", "/etc/alloy/config.alloy"]

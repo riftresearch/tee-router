@@ -10,14 +10,16 @@ require_env() {
 }
 
 require_env "RATHOLE_BITCOIN_RPC_TOKEN"
+require_env "RATHOLE_ZMQ_RAWBLOCK_TOKEN"
 require_env "RATHOLE_ZMQ_RAWTX_TOKEN"
 require_env "RATHOLE_ZMQ_SEQUENCE_TOKEN"
 
-control_port="${RATHOLE_CONTROL_PORT:-${PORT:-2333}}"
+control_port="${PORT:-${RATHOLE_CONTROL_PORT:-2333}}"
 transport_type="${RATHOLE_TRANSPORT_TYPE:-websocket}"
 rpc_bind_port="${RATHOLE_BITCOIN_RPC_BIND_PORT:-40031}"
 rawtx_bind_port="${RATHOLE_ZMQ_RAWTX_BIND_PORT:-40032}"
 sequence_bind_port="${RATHOLE_ZMQ_SEQUENCE_BIND_PORT:-40033}"
+rawblock_bind_port="${RATHOLE_ZMQ_RAWBLOCK_BIND_PORT:-40034}"
 websocket_tls="${RATHOLE_WEBSOCKET_TLS:-false}"
 private_bind_host="${RATHOLE_PRIVATE_BIND_HOST:-0.0.0.0}"
 # Keep the IPv6 bridge pointed at loopback even when rathole binds 0.0.0.0.
@@ -48,6 +50,10 @@ tls = ${websocket_tls}
 bind_addr = "${private_bind_host}:${rpc_bind_port}"
 token = "${RATHOLE_BITCOIN_RPC_TOKEN}"
 
+[server.services.zmq_rawblock]
+bind_addr = "${private_bind_host}:${rawblock_bind_port}"
+token = "${RATHOLE_ZMQ_RAWBLOCK_TOKEN}"
+
 [server.services.zmq_rawtx]
 bind_addr = "${private_bind_host}:${rawtx_bind_port}"
 token = "${RATHOLE_ZMQ_RAWTX_TOKEN}"
@@ -64,10 +70,12 @@ echo "  websocket tls: ${websocket_tls}"
 echo "  private bind host: ${private_bind_host}"
 echo "  bridge target host: ${bridge_target_host}"
 echo "  bitcoin_rpc bind port: ${rpc_bind_port}"
+echo "  zmq_rawblock bind port: ${rawblock_bind_port}"
 echo "  zmq_rawtx bind port: ${rawtx_bind_port}"
 echo "  zmq_sequence bind port: ${sequence_bind_port}"
 
 start_ipv6_bridge "${rpc_bind_port}"
+start_ipv6_bridge "${rawblock_bind_port}"
 start_ipv6_bridge "${rawtx_bind_port}"
 start_ipv6_bridge "${sequence_bind_port}"
 

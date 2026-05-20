@@ -1,20 +1,21 @@
 # Use Node.js 20 Alpine for smaller image size
 FROM node:20-alpine
 
-# Install pnpm globally
-RUN npm install -g pnpm@latest
+# Install a pnpm major that supports Node 20.
+RUN npm install -g pnpm@10
 
 # Set working directory
 WORKDIR /app
 
-# Copy package files
-COPY package.json pnpm-lock.yaml ./
+# Railway builds this Dockerfile from the repository root.
+# Copy package files from the monorepo subdirectory.
+COPY evm-token-indexer/package.json evm-token-indexer/pnpm-lock.yaml ./
 
 # Install dependencies
 RUN pnpm install --frozen-lockfile
 
-# Copy application source
-COPY . .
+# Copy application source from the monorepo subdirectory.
+COPY evm-token-indexer/ .
 
 # Create .ponder directory and ensure node user owns everything
 RUN mkdir -p .ponder && chown -R node:node /app

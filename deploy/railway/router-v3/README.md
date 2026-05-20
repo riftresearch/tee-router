@@ -15,12 +15,6 @@ Create new services with `-v3` suffix:
 - `evm-token-indexer-base-v3`
 - `evm-token-indexer-arbitrum-v3`
 
-Exception:
-
-- Reuse the existing `sauron-bitcoin-rathole-broker`.
-- Reconfigure the existing `hyperunit-socks5-proxy` to expose an authenticated
-  Railway TCP proxy reachable by Phala.
-
 ## Sauron v3
 
 `sauron-worker-v3` should build from this repository using:
@@ -33,15 +27,16 @@ It connects to:
 
 - Railway replica Postgres through `ROUTER_REPLICA_DATABASE_URL`
 - public Phala router API through `ROUTER_INTERNAL_BASE_URL`
-- existing Bitcoin rathole broker over Railway private networking
+- managed Bitcoin rathole broker over Railway private networking
 - new v3 Ponder indexers over Railway private networking
 
 Bitcoin transport:
 
 ```env
-BITCOIN_RPC_URL=http://sauron-bitcoin-rathole-broker.railway.internal:40031
-BITCOIN_ZMQ_RAWTX_ENDPOINT=tcp://sauron-bitcoin-rathole-broker.railway.internal:40032
-BITCOIN_ZMQ_SEQUENCE_ENDPOINT=tcp://sauron-bitcoin-rathole-broker.railway.internal:40033
+BITCOIN_RPC_URL=http://sauron-bitcoin-rathole-broker-v3.railway.internal:40031
+BITCOIN_ZMQ_RAWBLOCK_ENDPOINT=tcp://sauron-bitcoin-rathole-broker-v3.railway.internal:40034
+BITCOIN_ZMQ_RAWTX_ENDPOINT=tcp://sauron-bitcoin-rathole-broker-v3.railway.internal:40032
+BITCOIN_ZMQ_SEQUENCE_ENDPOINT=tcp://sauron-bitcoin-rathole-broker-v3.railway.internal:40033
 ```
 
 Do not commit credentialed `BITCOIN_RPC_AUTH` values.
