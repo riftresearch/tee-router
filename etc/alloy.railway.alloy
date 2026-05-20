@@ -64,7 +64,10 @@ otelcol.auth.bearer "phala" {
 
 otelcol.receiver.otlp "phala" {
   http {
-    endpoint = "[::]:4318"
+    // Railway's public proxy reaches the container over IPv4, so bind
+    // dual-stack on 0.0.0.0 — [::] alone leaves Railway's ingress unable
+    // to reach the receiver and the public domain returns 502.
+    endpoint = "0.0.0.0:4318"
     auth     = otelcol.auth.bearer.phala.handler
   }
 
