@@ -88,28 +88,17 @@ CREATE TABLE public.deposit_vaults (
     refund_claimed_by text,
     refund_claimed_until timestamp with time zone,
     CONSTRAINT deposit_vault_cancellation_commitment_len CHECK ((octet_length(cancellation_commitment) = 32)),
-    CONSTRAINT deposit_vault_status_check CHECK ((status = ANY (ARRAY['pending_funding'::text, 'funded'::text, 'executing'::text, 'completed'::text, 'refund_required'::text, 'refunding'::text, 'refunded'::text, 'refund_manual_intervention_required'::text])))
+    CONSTRAINT deposit_vault_status_check CHECK ((status = ANY (ARRAY['pending_funding'::text, 'funded'::text, 'executing'::text, 'completed'::text, 'refund_required'::text, 'refunding'::text, 'refunded'::text])))
 );
 
 
 
 CREATE TABLE public.market_order_actions (
     order_id uuid NOT NULL,
-    order_kind text NOT NULL,
-    amount_in text,
-    min_amount_out text,
-    amount_out text,
-    max_amount_in text,
+    amount_in text NOT NULL,
     created_at timestamp with time zone NOT NULL,
     updated_at timestamp with time zone NOT NULL,
-    slippage_bps bigint NOT NULL,
-    CONSTRAINT market_order_actions_amount_in_digits CHECK (((amount_in IS NULL) OR (amount_in ~ '^[0-9]+$'::text))),
-    CONSTRAINT market_order_actions_amount_out_digits CHECK (((amount_out IS NULL) OR (amount_out ~ '^[0-9]+$'::text))),
-    CONSTRAINT market_order_actions_max_amount_in_digits CHECK (((max_amount_in IS NULL) OR (max_amount_in ~ '^[0-9]+$'::text))),
-    CONSTRAINT market_order_actions_min_amount_out_digits CHECK (((min_amount_out IS NULL) OR (min_amount_out ~ '^[0-9]+$'::text))),
-    CONSTRAINT market_order_actions_order_kind_check CHECK ((order_kind = ANY (ARRAY['exact_in'::text, 'exact_out'::text]))),
-    CONSTRAINT market_order_actions_shape_check CHECK ((((order_kind = 'exact_in'::text) AND (amount_in IS NOT NULL) AND (min_amount_out IS NOT NULL) AND (amount_out IS NULL) AND (max_amount_in IS NULL)) OR ((order_kind = 'exact_out'::text) AND (amount_in IS NULL) AND (min_amount_out IS NULL) AND (amount_out IS NOT NULL) AND (max_amount_in IS NOT NULL)))),
-    CONSTRAINT market_order_actions_slippage_bps_check CHECK (((slippage_bps >= 0) AND (slippage_bps <= 10000)))
+    CONSTRAINT market_order_actions_amount_in_digits CHECK ((amount_in ~ '^[0-9]+$'::text))
 );
 
 
@@ -118,11 +107,8 @@ CREATE TABLE public.market_order_quotes (
     id uuid NOT NULL,
     order_id uuid,
     provider_id text NOT NULL,
-    order_kind text NOT NULL,
     amount_in text NOT NULL,
-    amount_out text NOT NULL,
-    min_amount_out text,
-    max_amount_in text,
+    estimated_amount_out text NOT NULL,
     provider_quote jsonb DEFAULT '{}'::jsonb NOT NULL,
     expires_at timestamp with time zone NOT NULL,
     created_at timestamp with time zone NOT NULL,
@@ -131,17 +117,12 @@ CREATE TABLE public.market_order_quotes (
     destination_chain_id text NOT NULL,
     destination_asset_id text NOT NULL,
     recipient_address text NOT NULL,
-    slippage_bps bigint NOT NULL,
     CONSTRAINT market_order_quotes_amount_in_digits CHECK ((amount_in ~ '^[0-9]+$'::text)),
-    CONSTRAINT market_order_quotes_amount_out_digits CHECK ((amount_out ~ '^[0-9]+$'::text)),
+    CONSTRAINT market_order_quotes_estimated_amount_out_digits CHECK ((estimated_amount_out ~ '^[0-9]+$'::text)),
     CONSTRAINT market_order_quotes_destination_asset_not_empty CHECK ((destination_asset_id <> ''::text)),
     CONSTRAINT market_order_quotes_destination_chain_not_empty CHECK ((destination_chain_id <> ''::text)),
-    CONSTRAINT market_order_quotes_max_amount_in_digits CHECK (((max_amount_in IS NULL) OR (max_amount_in ~ '^[0-9]+$'::text))),
-    CONSTRAINT market_order_quotes_min_amount_out_digits CHECK (((min_amount_out IS NULL) OR (min_amount_out ~ '^[0-9]+$'::text))),
-    CONSTRAINT market_order_quotes_order_kind_check CHECK ((order_kind = ANY (ARRAY['exact_in'::text, 'exact_out'::text]))),
     CONSTRAINT market_order_quotes_provider_id_not_empty CHECK ((provider_id <> ''::text)),
     CONSTRAINT market_order_quotes_recipient_address_not_empty CHECK ((recipient_address <> ''::text)),
-    CONSTRAINT market_order_quotes_slippage_bps_check CHECK (((slippage_bps >= 0) AND (slippage_bps <= 10000))),
     CONSTRAINT market_order_quotes_source_asset_not_empty CHECK ((source_asset_id <> ''::text)),
     CONSTRAINT market_order_quotes_source_chain_not_empty CHECK ((source_chain_id <> ''::text))
 );
@@ -161,10 +142,10 @@ CREATE TABLE public.order_execution_attempts (
     created_at timestamp with time zone NOT NULL,
     updated_at timestamp with time zone NOT NULL,
     CONSTRAINT order_execution_attempts_attempt_index_positive CHECK ((attempt_index > 0)),
-    CONSTRAINT order_execution_attempts_attempt_kind_check CHECK ((attempt_kind = ANY (ARRAY['primary_execution'::text, 'retry_execution'::text, 'refund_recovery'::text]))),
+    CONSTRAINT order_execution_attempts_attempt_kind_check CHECK ((attempt_kind = ANY (ARRAY['primary_execution'::text, 'retry_execution'::text, 'refreshed_execution'::text, 'refund_recovery'::text]))),
     CONSTRAINT order_execution_attempts_failure_reason_object CHECK ((jsonb_typeof(failure_reason_json) = 'object'::text)),
     CONSTRAINT order_execution_attempts_input_custody_snapshot_object CHECK ((jsonb_typeof(input_custody_snapshot_json) = 'object'::text)),
-    CONSTRAINT order_execution_attempts_status_check CHECK ((status = ANY (ARRAY['planning'::text, 'active'::text, 'completed'::text, 'failed'::text, 'refund_required'::text, 'manual_intervention_required'::text])))
+    CONSTRAINT order_execution_attempts_status_check CHECK ((status = ANY (ARRAY['planning'::text, 'active'::text, 'completed'::text, 'failed'::text, 'refund_required'::text, 'cancelled'::text])))
 );
 
 
@@ -182,7 +163,6 @@ CREATE TABLE public.order_execution_steps (
     output_chain_id text,
     output_asset_id text,
     amount_in text,
-    min_amount_out text,
     tx_hash text,
     provider_ref text,
     idempotency_key text,
@@ -204,7 +184,6 @@ CREATE TABLE public.order_execution_steps (
     CONSTRAINT order_execution_steps_idempotency_key_not_empty CHECK (((idempotency_key IS NULL) OR (idempotency_key <> ''::text))),
     CONSTRAINT order_execution_steps_input_asset_pair CHECK ((((input_chain_id IS NULL) AND (input_asset_id IS NULL)) OR ((input_chain_id IS NOT NULL) AND (input_asset_id IS NOT NULL)))),
     CONSTRAINT order_execution_steps_lifecycle_timestamps CHECK (((completed_at IS NULL) OR (started_at IS NULL) OR (completed_at >= started_at))),
-    CONSTRAINT order_execution_steps_min_amount_out_digits CHECK (((min_amount_out IS NULL) OR (min_amount_out ~ '^[0-9]+$'::text))),
     CONSTRAINT order_execution_steps_output_asset_pair CHECK ((((output_chain_id IS NULL) AND (output_asset_id IS NULL)) OR ((output_chain_id IS NOT NULL) AND (output_asset_id IS NOT NULL)))),
     CONSTRAINT order_execution_steps_provider_not_empty CHECK ((provider <> ''::text)),
     CONSTRAINT order_execution_steps_provider_ref_not_empty CHECK (((provider_ref IS NULL) OR (provider_ref <> ''::text))),
@@ -352,7 +331,6 @@ CREATE TABLE public.router_orders (
     destination_asset_id text NOT NULL,
     recipient_address text NOT NULL,
     refund_address text NOT NULL,
-    action_timeout_at timestamp with time zone NOT NULL,
     idempotency_key text,
     created_at timestamp with time zone NOT NULL,
     updated_at timestamp with time zone NOT NULL,
@@ -364,7 +342,7 @@ CREATE TABLE public.router_orders (
     CONSTRAINT router_orders_refund_address_not_empty CHECK ((refund_address <> ''::text)),
     CONSTRAINT router_orders_source_asset_not_empty CHECK ((source_asset_id <> ''::text)),
     CONSTRAINT router_orders_source_chain_not_empty CHECK ((source_chain_id <> ''::text)),
-    CONSTRAINT router_orders_status_check CHECK ((status = ANY (ARRAY['quoted'::text, 'pending_funding'::text, 'funded'::text, 'executing'::text, 'completed'::text, 'refund_required'::text, 'refunding'::text, 'refunded'::text, 'refund_manual_intervention_required'::text, 'failed'::text, 'expired'::text])))
+    CONSTRAINT router_orders_status_check CHECK ((status = ANY (ARRAY['quoted'::text, 'pending_funding'::text, 'funded'::text, 'executing'::text, 'completed'::text, 'refund_required'::text, 'refunding'::text, 'refunded'::text])))
 );
 
 
@@ -639,7 +617,7 @@ CREATE UNIQUE INDEX idx_router_orders_idempotency_key ON public.router_orders US
 
 
 
-CREATE INDEX idx_router_orders_status_timeout ON public.router_orders USING btree (status, action_timeout_at);
+CREATE INDEX idx_router_orders_status_updated_at ON public.router_orders USING btree (status, updated_at);
 
 
 
@@ -797,7 +775,3 @@ ALTER TABLE ONLY public.paymaster_gas_ledger
 
 ALTER TABLE ONLY public.router_orders
     ADD CONSTRAINT router_orders_funding_vault_id_fkey FOREIGN KEY (funding_vault_id) REFERENCES public.deposit_vaults(id);
-
-
-
-
