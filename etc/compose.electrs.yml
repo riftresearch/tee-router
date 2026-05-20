@@ -61,10 +61,11 @@ configs:
       # Required env vars when the profile is enabled:
       #   RATHOLE_REMOTE_ADDR
       #   RATHOLE_BITCOIN_RPC_TOKEN
+      #   RATHOLE_ZMQ_RAWBLOCK_TOKEN
       #   RATHOLE_ZMQ_RAWTX_TOKEN
       #   RATHOLE_ZMQ_SEQUENCE_TOKEN
       # Recommended Railway broker endpoint:
-      #   RATHOLE_REMOTE_ADDR=sauron-bitcoin-rathole-broker-production.up.railway.app:443
+      #   RATHOLE_REMOTE_ADDR=<sauron-bitcoin-rathole-broker-v3-public-domain>:443
       [client]
       remote_addr = "${RATHOLE_REMOTE_ADDR:-}"
 
@@ -84,6 +85,10 @@ configs:
       [client.services.bitcoin_rpc]
       local_addr = "bitcoin-core:8332"
       token = "${RATHOLE_BITCOIN_RPC_TOKEN:-}"
+
+      [client.services.zmq_rawblock]
+      local_addr = "bitcoin-core:28332"
+      token = "${RATHOLE_ZMQ_RAWBLOCK_TOKEN:-}"
 
       [client.services.zmq_rawtx]
       local_addr = "bitcoin-core:28333"
