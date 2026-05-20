@@ -1,5 +1,6 @@
 # alloy-v3 — production observability ingress.
 # Build context = repo root (Railway monorepo: dockerfilePath set per service).
+# rev: force-rebuild after 0.0.0.0:4318 bind fix
 FROM grafana/alloy:latest
 
 COPY etc/alloy.railway.alloy /etc/alloy/config.alloy
