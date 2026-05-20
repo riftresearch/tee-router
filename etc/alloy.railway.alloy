@@ -1,4 +1,4 @@
-// alloy-v3 — production observability ingress on Railway.
+// alloy-v3 — production observability ingress on Railway. (rev:2)
 //
 // Two input paths:
 //   1. Scrape Railway-resident services directly over private DNS
