@@ -238,7 +238,7 @@ test-all:
 #
 # CVM is referenced by name; override if yours differs:
 #   just phala-upgrade phala_cvm=some-other-cvm
-phala_cvm     := "tee-router-demo"
+phala_cvm     := "tee-router-v3-alpha"
 phala_env     := ".secrets/phala.env"
 phala_compose := "etc/compose.phala.yml"
 

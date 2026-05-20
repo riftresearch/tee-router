@@ -125,12 +125,16 @@ configs:
       nc -z -w 10 "$${POSTGRES_SEEDS}" "$${DB_PORT:-5432}"
       echo "PostgreSQL port is available"
 
-      temporal-sql-tool --plugin postgres12 --ep "$${POSTGRES_SEEDS}" -u "$${POSTGRES_USER}" -p "$${DB_PORT:-5432}" --db temporal create
-      temporal-sql-tool --plugin postgres12 --ep "$${POSTGRES_SEEDS}" -u "$${POSTGRES_USER}" -p "$${DB_PORT:-5432}" --db temporal setup-schema -v 0.0
+      temporal-sql-tool --plugin postgres12 --ep "$${POSTGRES_SEEDS}" -u "$${POSTGRES_USER}" -p "$${DB_PORT:-5432}" --db temporal create \
+        || echo "Temporal database may already exist; continuing"
+      temporal-sql-tool --plugin postgres12 --ep "$${POSTGRES_SEEDS}" -u "$${POSTGRES_USER}" -p "$${DB_PORT:-5432}" --db temporal setup-schema -v 0.0 \
+        || echo "Temporal schema may already be initialized; continuing"
       temporal-sql-tool --plugin postgres12 --ep "$${POSTGRES_SEEDS}" -u "$${POSTGRES_USER}" -p "$${DB_PORT:-5432}" --db temporal update-schema -d /etc/temporal/schema/postgresql/v12/temporal/versioned
 
-      temporal-sql-tool --plugin postgres12 --ep "$${POSTGRES_SEEDS}" -u "$${POSTGRES_USER}" -p "$${DB_PORT:-5432}" --db temporal_visibility create
-      temporal-sql-tool --plugin postgres12 --ep "$${POSTGRES_SEEDS}" -u "$${POSTGRES_USER}" -p "$${DB_PORT:-5432}" --db temporal_visibility setup-schema -v 0.0
+      temporal-sql-tool --plugin postgres12 --ep "$${POSTGRES_SEEDS}" -u "$${POSTGRES_USER}" -p "$${DB_PORT:-5432}" --db temporal_visibility create \
+        || echo "Temporal visibility database may already exist; continuing"
+      temporal-sql-tool --plugin postgres12 --ep "$${POSTGRES_SEEDS}" -u "$${POSTGRES_USER}" -p "$${DB_PORT:-5432}" --db temporal_visibility setup-schema -v 0.0 \
+        || echo "Temporal visibility schema may already be initialized; continuing"
       temporal-sql-tool --plugin postgres12 --ep "$${POSTGRES_SEEDS}" -u "$${POSTGRES_USER}" -p "$${DB_PORT:-5432}" --db temporal_visibility update-schema -d /etc/temporal/schema/postgresql/v12/visibility/versioned
 
       echo "PostgreSQL schema setup complete"
@@ -392,12 +396,13 @@ services:
           umask 077
           tmp="$$(mktemp /secrets/temporal_password.txt.XXXXXX)"
           openssl rand -hex 32 | tr -d '\n' > "$$tmp"
-          chmod 600 "$$tmp"
+          chmod 644 "$$tmp"
           mv "$$tmp" /secrets/temporal_password.txt
           echo "Generated Temporal Postgres password"
         else
           echo "Temporal Postgres password already exists"
         fi
+        chmod 644 /secrets/temporal_password.txt
     volumes:
       - temporal_postgres_secrets:/secrets
     restart: "no"
@@ -643,7 +648,7 @@ services:
       - router-network
 
   router-api:
-    image: ghcr.io/riftresearch/tee-router:0.1.8
+    image: ghcr.io/riftresearch/tee-router:0.2.1
     container_name: router-api
     restart: unless-stopped
     environment: *router-environment
@@ -674,7 +679,7 @@ services:
       - router-network
 
   router-worker:
-    image: ghcr.io/riftresearch/tee-router:0.1.8
+    image: ghcr.io/riftresearch/tee-router:0.2.1
     container_name: router-worker
     restart: unless-stopped
     environment: *router-environment
@@ -703,7 +708,7 @@ services:
       - router-network
 
   temporal-worker:
-    image: ghcr.io/riftresearch/tee-router-temporal-worker:0.1.8
+    image: ghcr.io/riftresearch/tee-router-temporal-worker:0.2.1
     container_name: temporal-worker
     restart: unless-stopped
     environment: *router-environment
