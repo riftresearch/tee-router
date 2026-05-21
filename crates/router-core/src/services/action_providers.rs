@@ -4313,23 +4313,51 @@ impl VeloraProvider {
         }
 
         let url = format!("{}/prices", self.base_url);
+        // VELORA-DIAG: log the exact request being sent + a unique id so the
+        // START/DONE pair can be matched in logs. Remove once the Velora hang
+        // is diagnosed.
+        let diag_id = Utc::now().timestamp_micros();
+        let diag_query = query
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        tracing::warn!(
+            target: "velora_diag",
+            diag_id,
+            "VELORA-DIAG send START url={}?{}",
+            url,
+            diag_query
+        );
         let started = Instant::now();
         let response = match self.http.get(&url).query(&query).send().await {
             Ok(response) => response,
             Err(err) => {
+                let err_msg = err.without_url().to_string();
+                tracing::warn!(
+                    target: "velora_diag",
+                    diag_id,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "VELORA-DIAG send ERROR: {}",
+                    err_msg
+                );
                 telemetry::record_trading_venue_transport_error(
                     "velora",
                     "GET",
                     "/prices",
                     started.elapsed(),
                 );
-                return Err(format!(
-                    "velora price request failed: {}",
-                    err.without_url()
-                ));
+                return Err(format!("velora price request failed: {err_msg}"));
             }
         };
         let status = response.status();
+        tracing::warn!(
+            target: "velora_diag",
+            diag_id,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            status = status.as_u16(),
+            "VELORA-DIAG send DONE (headers received)"
+        );
         telemetry::record_trading_venue_http_status(
             "velora",
             "GET",
