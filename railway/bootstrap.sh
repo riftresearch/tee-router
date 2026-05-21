@@ -500,6 +500,13 @@ fi
 apply_service_cfg victoriametrics-v3 \
   '{"deploy":{"startCommand":"/victoria-metrics-prod -storageDataPath=/victoria-metrics-data -retentionPeriod=30d -httpListenAddr=[::]:8428"}}' || true
 
+# --- alloy-v3 public-domain port ---------------------------------------------
+# alloy listens on both 4318 (OTLP HTTP) and 12345 (admin UI). Railway's public
+# proxy auto-detects only one and defaults to the admin port — the OTLP path
+# from the Phala sidecar then returns 502. PORT=4318 forces the public domain
+# to target the OTLP receiver.
+set_var alloy-v3 "PORT=4318"
+
 # --- HyperUnit SOCKS5 proxy (managed, Europe) --------------------------------
 # Dedicated egress proxy for HyperUnit only (see deploy/railway/hyperunit-socks5
 # for the original helper this supersedes). Image: serjs/go-socks5-proxy,
