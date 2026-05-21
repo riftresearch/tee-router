@@ -1,0 +1,23 @@
+[package]
+name = "router-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "router-cli"
+path = "src/main.rs"
+
+[dependencies]
+router-gateway-sdk = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+alloy = { workspace = true }
+bitcoin = { workspace = true }
+reqwest = { workspace = true }
+hex = { workspace = true }
+eyre = { workspace = true }

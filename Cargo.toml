@@ -4,6 +4,7 @@ members = [
     "bin/api-key-gen",
     "bin/devnet-cli",
     "bin/router-loadgen",
+    "bin/router-cli",
     "bin/rand-wallet",
     "bin/router-server",
     "bin/sauron",
@@ -33,6 +34,7 @@ members = [
     "crates/observability",
     "crates/otc-models",
     "crates/router-core",
+    "crates/router-gateway-sdk",
     "crates/router-primitives",
     "crates/router-temporal",
     "crates/test-support",
@@ -50,6 +52,7 @@ repository = "https://github.com/riftresearch/tee-router"
 router-primitives = { path = "crates/router-primitives" }
 router-temporal = { path = "crates/router-temporal" }
 router-core = { path = "crates/router-core" }
+router-gateway-sdk = { path = "crates/router-gateway-sdk" }
 chains = { path = "crates/chains" }
 hyperliquid-client = { path = "crates/hyperliquid-client" }
 hl-shim-client = { path = "crates/hl-shim-client" }

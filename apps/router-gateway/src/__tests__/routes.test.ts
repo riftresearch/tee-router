@@ -51,10 +51,12 @@ describe('router gateway routes', () => {
     expect(body.paths['/quote']).toBeDefined()
     expect(body.paths['/order/market']).toBeDefined()
     expect(body.paths['/order/limit']).toBeUndefined()
+    expect(body.paths['/order/{orderId}']).toBeDefined()
     expect(body.paths['/order/{orderId}/cancel']).toBeDefined()
     expect(Object.keys(body.paths)).toEqual([
       '/quote',
       '/order/market',
+      '/order/{orderId}',
       '/order/{orderId}/cancel',
       '/health',
       '/providers'
