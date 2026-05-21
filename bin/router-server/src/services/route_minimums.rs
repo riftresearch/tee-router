@@ -16,7 +16,12 @@ use router_core::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use snafu::Snafu;
-use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    str::FromStr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::sync::{Mutex, RwLock};
 
 const DEFAULT_TTL: Duration = Duration::from_secs(60);
@@ -540,7 +545,16 @@ async fn quote_exchange_exact_out(
     amount_out: &U256,
     recipient_address: &str,
 ) -> RouteMinimumResult<router_core::services::action_providers::ExchangeQuote> {
-    exchange
+    // VELORA-DIAG: log each exchange-provider call so a hang can be pinned to
+    // a specific provider/leg. Remove once the Velora hang is diagnosed.
+    tracing::warn!(
+        target: "velora_diag",
+        provider = exchange.id(),
+        "VELORA-DIAG exchange quote_trade START {} {} -> {} {} (exact_out {})",
+        input_asset.chain, input_asset.asset, output_asset.chain, output_asset.asset, amount_out
+    );
+    let diag_started = Instant::now();
+    let result = exchange
         .quote_trade(ExchangeQuoteRequest {
             input_asset: input_asset.clone(),
             output_asset: output_asset.clone(),
@@ -553,7 +567,15 @@ async fn quote_exchange_exact_out(
             sender_address: None,
             recipient_address: recipient_address.to_string(),
         })
-        .await
+        .await;
+    tracing::warn!(
+        target: "velora_diag",
+        provider = exchange.id(),
+        elapsed_ms = diag_started.elapsed().as_millis() as u64,
+        ok = result.is_ok(),
+        "VELORA-DIAG exchange quote_trade DONE"
+    );
+    result
         .map_err(|message| RouteMinimumError::Provider {
             provider: exchange.id().to_string(),
             message,
@@ -578,7 +600,15 @@ async fn quote_bridge_exact_out(
     recipient_address: &str,
     depositor_address: &str,
 ) -> RouteMinimumResult<router_core::services::action_providers::BridgeQuote> {
-    bridge
+    // VELORA-DIAG: log each bridge-provider call too, for the same reason.
+    tracing::warn!(
+        target: "velora_diag",
+        provider = bridge.id(),
+        "VELORA-DIAG bridge quote_bridge START {} {} -> {} {} (exact_out {})",
+        source_asset.chain, source_asset.asset, destination_asset.chain, destination_asset.asset, amount_out
+    );
+    let diag_started = Instant::now();
+    let result = bridge
         .quote_bridge(BridgeQuoteRequest {
             source_asset: source_asset.clone(),
             destination_asset: destination_asset.clone(),
@@ -590,7 +620,15 @@ async fn quote_bridge_exact_out(
             depositor_address: depositor_address.to_string(),
             partial_fills_enabled: false,
         })
-        .await
+        .await;
+    tracing::warn!(
+        target: "velora_diag",
+        provider = bridge.id(),
+        elapsed_ms = diag_started.elapsed().as_millis() as u64,
+        ok = result.is_ok(),
+        "VELORA-DIAG bridge quote_bridge DONE"
+    );
+    result
         .map_err(|message| RouteMinimumError::Provider {
             provider: bridge.id().to_string(),
             message,
