@@ -256,6 +256,84 @@ pub async fn live_vs_mock_velora_quote_contract() -> TestResult<()> {
     Ok(())
 }
 
+// Production hits Velora at quote time with sender_address=None (the deposit
+// vault doesn't exist yet) but recipient_address=Some(toAddress). Real Velora
+// rejects "receiver without userAddress" with 400; the mock used to accept it
+// silently. This covers that path against both stacks so future drift is
+// caught in CI rather than at deploy time.
+pub async fn live_vs_mock_velora_quote_contract_no_sender() -> TestResult<()> {
+    if !live_enabled() {
+        return Ok(());
+    }
+
+    let user = configured_evm_address()?;
+    let amount_in = U256::from_str_radix(
+        &env_var_any(&[VELORA_AMOUNT_IN_WEI])
+            .unwrap_or_else(|| DEFAULT_VELORA_AMOUNT_IN_WEI.to_string()),
+        10,
+    )?;
+    let request = ExchangeQuoteRequest {
+        input_asset: deposit_asset("evm:8453", AssetId::Native),
+        output_asset: deposit_asset("evm:8453", AssetId::reference(format!("{BASE_USDC:#x}"))),
+        input_decimals: Some(18),
+        output_decimals: Some(6),
+        order_kind: ProviderOrderKind::ExactIn {
+            amount_in: amount_in.to_string(),
+            min_amount_out: Some("1".to_string()),
+        },
+        sender_address: None,
+        recipient_address: format!("{user:#x}"),
+    };
+
+    let live_base_url = live_velora_base_url();
+    let live_provider = VeloraProvider::new(live_base_url.clone(), env_var_any(&[VELORA_PARTNER]))?;
+    let live_quote = live_provider
+        .quote_trade(request.clone())
+        .await?
+        .ok_or("live Velora quote (no sender) returned None")?;
+    let live_price_route = fetch_velora_price_route(&live_base_url, user, amount_in).await?;
+    let live_contract = assert_velora_quote_contract(
+        "live Velora (no sender)",
+        &live_quote,
+        &live_price_route,
+        &request,
+    )?;
+
+    let mock = MockIntegratorServer::spawn_with_config(
+        MockIntegratorConfig::default()
+            .with_velora_swap_contract_address(BASE_CHAIN_ID, DEFAULT_EVM_ADDRESS),
+    )
+    .await?;
+    let mock_provider = VeloraProvider::new(mock.base_url(), None)?;
+    let mock_quote = mock_provider
+        .quote_trade(request.clone())
+        .await?
+        .ok_or("mock Velora quote (no sender) returned None")?;
+    let mock_price_route = fetch_velora_price_route(mock.base_url(), user, amount_in).await?;
+    let mock_contract = assert_velora_quote_contract(
+        "mock Velora (no sender)",
+        &mock_quote,
+        &mock_price_route,
+        &request,
+    )?;
+
+    assert_eq!(
+        live_contract, mock_contract,
+        "Velora mock quote contract (no sender) drifted from live provider"
+    );
+    write_differential_artifact(
+        "velora_no_sender",
+        json!({
+            "live_contract": live_contract,
+            "mock_contract": mock_contract,
+            "live_price_route": live_price_route,
+            "mock_price_route": mock_price_route,
+        }),
+    );
+
+    Ok(())
+}
+
 pub async fn live_vs_mock_hyperliquid_quote_contract() -> TestResult<()> {
     if !live_enabled() {
         return Ok(());

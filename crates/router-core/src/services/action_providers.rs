@@ -1310,6 +1310,74 @@ mod velora_price_route_tests {
         validate_velora_price_route(expectations(&price_route)).expect("matching route");
     }
 
+    fn quote_request(sender: Option<&str>, recipient: &str) -> ExchangeQuoteRequest {
+        ExchangeQuoteRequest {
+            input_asset: native_base_asset(),
+            output_asset: base_erc20_asset(),
+            input_decimals: Some(18),
+            output_decimals: Some(6),
+            order_kind: ProviderOrderKind::ExactIn {
+                amount_in: "1000000000000000000".to_string(),
+                min_amount_out: Some("1".to_string()),
+            },
+            sender_address: sender.map(String::from),
+            recipient_address: recipient.to_string(),
+        }
+    }
+
+    #[test]
+    fn velora_price_route_addresses_uses_recipient_when_sender_absent() {
+        let request = quote_request(None, "0x1111111111111111111111111111111111111111");
+
+        let (user_address, receiver) = velora_price_route_addresses(&request);
+
+        assert_eq!(
+            user_address,
+            Some("0x1111111111111111111111111111111111111111"),
+            "userAddress must fall back to recipient so Velora doesn't 400"
+        );
+        assert_eq!(receiver, Some("0x1111111111111111111111111111111111111111"));
+    }
+
+    #[test]
+    fn velora_price_route_addresses_prefers_sender_when_present() {
+        let request = quote_request(
+            Some("0x2222222222222222222222222222222222222222"),
+            "0x1111111111111111111111111111111111111111",
+        );
+
+        let (user_address, receiver) = velora_price_route_addresses(&request);
+
+        assert_eq!(user_address, Some("0x2222222222222222222222222222222222222222"));
+        assert_eq!(receiver, Some("0x1111111111111111111111111111111111111111"));
+    }
+
+    #[test]
+    fn velora_price_route_addresses_omits_both_when_no_recipient() {
+        let request = quote_request(None, "   ");
+
+        let (user_address, receiver) = velora_price_route_addresses(&request);
+
+        // No recipient → no receiver, and no sender to fall back to.
+        // Real Velora is happy when both are absent.
+        assert_eq!(user_address, None);
+        assert_eq!(receiver, None);
+    }
+
+    #[test]
+    fn velora_price_route_addresses_ignores_whitespace_only_sender() {
+        let request = quote_request(Some("   "), "0x1111111111111111111111111111111111111111");
+
+        let (user_address, receiver) = velora_price_route_addresses(&request);
+
+        assert_eq!(
+            user_address,
+            Some("0x1111111111111111111111111111111111111111"),
+            "whitespace-only sender must fall back to recipient"
+        );
+        assert_eq!(receiver, Some("0x1111111111111111111111111111111111111111"));
+    }
+
     #[test]
     fn velora_price_route_validation_rejects_wrong_network() {
         let mut price_route = valid_price_route();
@@ -4167,6 +4235,36 @@ pub struct VeloraProvider {
     http: reqwest::Client,
 }
 
+/// Pick `(userAddress, receiver)` for Velora's `/prices` request.
+///
+/// Velora rejects requests where `receiver` is set without `userAddress`
+/// (the `/prices` endpoint returns 400 with `"If receiver is defined
+/// userAddress should also be defined"`). At quote time the router has no
+/// `sender_address` yet — the deposit vault is created post-quote — but
+/// `recipient_address` is always populated. Fall back to recipient as the
+/// `userAddress` so the constraint is satisfied at both quote and
+/// execution time.
+fn velora_price_route_addresses(
+    request: &ExchangeQuoteRequest,
+) -> (Option<&str>, Option<&str>) {
+    let recipient = trimmed_non_empty(&request.recipient_address);
+    let sender = request
+        .sender_address
+        .as_deref()
+        .and_then(trimmed_non_empty);
+    let user_address = sender.or(recipient);
+    (user_address, recipient)
+}
+
+fn trimmed_non_empty(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
 impl VeloraProvider {
     pub fn new(base_url: impl Into<String>, partner: Option<String>) -> Result<Self, String> {
         Ok(Self {
@@ -4203,11 +4301,12 @@ impl VeloraProvider {
             ("ignoreBadUsdPrice", "true".to_string()),
             ("excludeRFQ", "true".to_string()),
         ];
-        if let Some(sender) = request.sender_address.as_ref() {
-            query.push(("userAddress", sender.clone()));
+        let (user_address, receiver) = velora_price_route_addresses(request);
+        if let Some(value) = user_address {
+            query.push(("userAddress", value.to_string()));
         }
-        if !request.recipient_address.trim().is_empty() {
-            query.push(("receiver", request.recipient_address.clone()));
+        if let Some(value) = receiver {
+            query.push(("receiver", value.to_string()));
         }
         if let Some(partner) = self.partner.as_ref() {
             query.push(("partner", partner.clone()));

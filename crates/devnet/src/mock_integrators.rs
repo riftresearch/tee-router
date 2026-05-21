@@ -1717,9 +1717,7 @@ struct MockVeloraPricesQuery {
     ignore_bad_usd_price: Option<bool>,
     #[allow(dead_code)]
     exclude_rfq: Option<bool>,
-    #[allow(dead_code)]
     user_address: Option<String>,
-    #[allow(dead_code)]
     receiver: Option<String>,
     #[allow(dead_code)]
     partner: Option<String>,
@@ -1772,6 +1770,27 @@ async fn mock_velora_prices(
     State(state): State<Arc<MockIntegratorState>>,
     Query(query): Query<MockVeloraPricesQuery>,
 ) -> impl IntoResponse {
+    // Mirror real Velora's pair constraint: if `receiver` is set, `userAddress`
+    // must also be set. Production hit a 400 here because the router pushed
+    // `receiver` without `userAddress` at quote time and the mock silently
+    // accepted it. The mock must reject the same way real Velora does.
+    let receiver_present = query
+        .receiver
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty());
+    let user_address_present = query
+        .user_address
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty());
+    if receiver_present && !user_address_present {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "If receiver is defined userAddress should also be defined",
+            })),
+        )
+            .into_response();
+    }
     let amount = match parse_amount("amount", &query.amount) {
         Ok(amount) => amount,
         Err(error) => {
@@ -8063,6 +8082,50 @@ mod tests {
 
         assert_eq!(body["priceRoute"]["srcAmount"], "1000000000000000000");
         assert_eq!(body["priceRoute"]["destAmount"], "1000000");
+    }
+
+    #[tokio::test]
+    async fn mock_velora_prices_rejects_receiver_without_user_address() {
+        // Mirror real Velora: if `receiver` is set, `userAddress` must be set
+        // too. The router used to pass receiver alone at quote time and the
+        // mock silently succeeded — this guards against the regression.
+        let server = spawn_mock_velora_server().await;
+        let url = format!(
+            "{}/prices?srcToken={}&destToken=0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48&srcDecimals=18&destDecimals=6&amount=1000000000000000000&side=SELL&network=1&receiver=0x1111111111111111111111111111111111111111",
+            server.base_url(),
+            VELORA_NATIVE_TOKEN,
+        );
+        let response = reqwest::get(&url).await.expect("http get");
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        let body: Value = response.json().await.expect("json body");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("userAddress"),
+            "expected error mentioning userAddress, got {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_velora_prices_accepts_receiver_with_user_address() {
+        // Both fields set → request succeeds (production "execution time" or
+        // post-fallback quote shape).
+        let server = spawn_mock_velora_server().await;
+        let url = format!(
+            "{}/prices?srcToken={}&destToken=0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48&srcDecimals=18&destDecimals=6&amount=1000000000000000000&side=SELL&network=1&receiver=0x1111111111111111111111111111111111111111&userAddress=0x1111111111111111111111111111111111111111",
+            server.base_url(),
+            VELORA_NATIVE_TOKEN,
+        );
+        let body: Value = reqwest::get(&url)
+            .await
+            .expect("http get")
+            .error_for_status()
+            .expect("200 ok")
+            .json()
+            .await
+            .expect("json body");
+        assert_eq!(body["priceRoute"]["srcAmount"], "1000000000000000000");
     }
 
     #[tokio::test]
