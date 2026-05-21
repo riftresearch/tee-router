@@ -2,7 +2,7 @@ use crate::{
     error::RouterServerError,
     services::{
         AddressScreeningService, OrderManager, ProviderHealthPoller, ProviderHealthProbe,
-        ProviderHealthService, ProviderPolicyService, RouteMinimumService, VaultManager,
+        ProviderHealthService, ProviderPolicyService, VaultManager,
     },
     Result, RouterServerArgs,
 };
@@ -106,7 +106,6 @@ pub async fn initialize_components_with_action_providers(
         db.clone(),
         action_providers.clone(),
     )?);
-    let route_minimums = Arc::new(RouteMinimumService::new(action_providers.clone()));
     let address_screener = initialize_address_screener(args)?;
     let order_manager = Arc::new(
         OrderManager::with_action_providers(
@@ -115,7 +114,6 @@ pub async fn initialize_components_with_action_providers(
             chain_registry.clone(),
             action_providers.clone(),
         )
-        .with_route_minimums(Some(route_minimums))
         .with_route_costs(Some(route_costs.clone()))
         .with_provider_policies(Some(provider_policies.clone()))
         .with_provider_health(Some(provider_health.clone())),
