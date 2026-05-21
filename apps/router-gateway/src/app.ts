@@ -7,9 +7,11 @@ import { type GatewayConfig, loadConfig } from './config'
 import { errorBody } from './errors'
 import {
   createOrderCancelHandler,
+  createOrderGetHandler,
   // createOrderLimitHandler,
   createOrderMarketHandler,
   orderCancelRoute,
+  orderGetRoute,
   // orderLimitRoute,
   orderMarketRoute
 } from './routes/order'
@@ -91,6 +93,7 @@ export function createApp(
   // These handlers also return the error responses declared on each route.
   app.openapi(quoteRoute, createQuoteHandler(config, deps) as never)
   app.openapi(orderMarketRoute, createOrderMarketHandler(config, deps) as never)
+  app.openapi(orderGetRoute, createOrderGetHandler(config, deps) as never)
   // Limit orders are temporarily disabled. Keep the route and handler code in
   // routes/order.ts, but do not register it in the live OpenAPI route registry.
   // app.openapi(orderLimitRoute, createOrderLimitHandler(config, deps) as never)

@@ -16,6 +16,7 @@ import {
 } from '../errors'
 import {
   limitQuoteFromEnvelope,
+  presentAnyOrderEnvelope,
   presentOrderEnvelope,
   routerQuoteFromEnvelope
 } from '../presenters'
@@ -239,6 +240,34 @@ export const OrderCancelRequestSchema = z
     }
   })
   .openapi('OrderCancelRequest')
+
+export const orderGetRoute = createRoute({
+  method: 'get',
+  path: '/order/{orderId}',
+  tags: ['Orders'],
+  summary: 'Get an order by id',
+  request: {
+    params: z.object({
+      orderId: z.string().uuid().openapi({
+        example: '00000000-0000-4000-8000-000000000002'
+      })
+    }),
+    query: z.object({
+      amountFormat: AmountFormatSchema.optional()
+    })
+  },
+  responses: {
+    200: {
+      description: 'Order fetched from the internal router API.',
+      content: {
+        'application/json': {
+          schema: OrderResponseSchema
+        }
+      }
+    },
+    ...ErrorResponses
+  }
+})
 
 export const orderCancelRoute = createRoute({
   method: 'post',
@@ -504,6 +533,29 @@ export function createOrderLimitHandler(
         },
         201
       )
+    } catch (error) {
+      const normalized = normalizeError(error)
+      return c.json(normalized.body, normalized.status)
+    }
+  }
+}
+
+export function createOrderGetHandler(
+  config: GatewayConfig,
+  deps: GatewayDeps = {}
+) {
+  return async (c: any) => {
+    try {
+      const orderId = c.req.valid('param').orderId
+      const amountFormat: AmountFormat = c.req.valid('query').amountFormat ?? 'readable'
+      const envelope = await routerClientFor(config, deps).getOrder(orderId)
+      let response!: ReturnType<typeof presentAnyOrderEnvelope>
+      try {
+        response = presentAnyOrderEnvelope(envelope, amountFormat)
+      } catch (presentationError) {
+        throw malformedOrderPresentationError(presentationError)
+      }
+      return c.json(response, 200)
     } catch (error) {
       const normalized = normalizeError(error)
       return c.json(normalized.body, normalized.status)

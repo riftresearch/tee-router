@@ -150,6 +150,12 @@ export class RouterClient {
     )
   }
 
+  async getOrder(orderId: string): Promise<InternalOrderEnvelope> {
+    return requireOrderEnvelope(
+      await this.request('GET', `/api/v1/orders/${encodeURIComponent(orderId)}`)
+    )
+  }
+
   cancelOrder(
     orderId: string,
     request: CreateOrderCancellationRequest
