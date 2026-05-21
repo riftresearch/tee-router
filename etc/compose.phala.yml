@@ -267,6 +267,19 @@ configs:
         }
       }
 
+  # Caddy reverse proxy that fronts the internal Temporal Web UI with HTTP
+  # basic auth. The bcrypt password hash is injected via the
+  # TEMPORAL_UI_PW_HASH env var (see .secrets/phala.env) and substituted by
+  # Caddy at load time, so no credential material lives in this file.
+  temporal-ui-caddyfile:
+    content: |
+      :8080 {
+        basic_auth {
+          admin {$$TEMPORAL_UI_PW_HASH}
+        }
+        reverse_proxy temporal-ui:8080
+      }
+
 x-router-environment: &router-environment
   - RUST_LOG=${RUST_LOG:-info}
   - DEPLOYMENT_ENVIRONMENT=${DEPLOYMENT_ENVIRONMENT:-alpha}
@@ -771,6 +784,40 @@ services:
       - run
       - --server.http.listen-addr=0.0.0.0:12345
       - /etc/alloy/config.alloy
+    networks:
+      - router-network
+
+  # Temporal Web UI — internal only; reached through the basic-auth proxy.
+  temporal-ui:
+    image: temporalio/ui:2.49.1
+    container_name: temporal-ui
+    restart: unless-stopped
+    depends_on:
+      temporal:
+        condition: service_healthy
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_UI_PORT: "8080"
+    expose:
+      - "8080"
+    networks:
+      - router-network
+
+  # The only publicly exposed surface for the UI: Caddy enforcing HTTP basic
+  # auth in front of temporal-ui.
+  temporal-ui-proxy:
+    image: caddy:2
+    container_name: temporal-ui-proxy
+    restart: unless-stopped
+    depends_on:
+      - temporal-ui
+    environment:
+      - TEMPORAL_UI_PW_HASH=${TEMPORAL_UI_PW_HASH:?set TEMPORAL_UI_PW_HASH}
+    configs:
+      - source: temporal-ui-caddyfile
+        target: /etc/caddy/Caddyfile
+    ports:
+      - "8080:8080"
     networks:
       - router-network
 
