@@ -5,7 +5,6 @@ use crate::{
         deposit_address::{derive_deposit_address_for_quote, DepositAddressError},
         provider_health::ProviderHealthService,
         provider_policy::ProviderPolicyService,
-        route_minimums::{RouteMinimumError, RouteMinimumService},
     },
     telemetry,
 };
@@ -94,27 +93,18 @@ pub enum MarketOrderError {
     NoRoute { reason: String },
 
     #[snafu(display(
-        "Input amount {} is below operational route minimum {} (hard minimum {}) for {} {} to {} {}",
-        amount_in,
-        operational_min_input,
-        hard_min_input,
-        source_chain,
-        source_asset,
+        "Estimated output {} is below the viable floor {} for {} {} (the order is too small to clear route fees)",
+        estimated_amount_out,
+        output_floor,
         destination_chain,
         destination_asset
     ))]
-    InputBelowRouteMinimum {
-        amount_in: String,
-        operational_min_input: String,
-        hard_min_input: String,
-        source_chain: Box<ChainId>,
-        source_asset: Box<AssetId>,
+    OutputBelowFloor {
+        estimated_amount_out: String,
+        output_floor: String,
         destination_chain: Box<ChainId>,
         destination_asset: Box<AssetId>,
     },
-
-    #[snafu(display("Route minimum check failed: {}", reason))]
-    RouteMinimum { reason: String },
 
     #[snafu(display("Gas reimbursement planning failed: {}", source))]
     GasReimbursement { source: Box<GasReimbursementError> },
@@ -202,7 +192,6 @@ pub struct OrderManager {
     chain_registry: Arc<ChainRegistry>,
     asset_registry: Arc<AssetRegistry>,
     action_providers: Arc<ActionProviderRegistry>,
-    route_minimums: Option<Arc<RouteMinimumService>>,
     route_costs: Option<Arc<RouteCostService>>,
     provider_policies: Option<Arc<ProviderPolicyService>>,
     provider_health: Option<Arc<ProviderHealthService>>,
@@ -233,17 +222,10 @@ impl OrderManager {
             chain_registry,
             asset_registry,
             action_providers,
-            route_minimums: None,
             route_costs: None,
             provider_policies: None,
             provider_health: None,
         }
-    }
-
-    #[must_use]
-    pub fn with_route_minimums(mut self, route_minimums: Option<Arc<RouteMinimumService>>) -> Self {
-        self.route_minimums = route_minimums;
-        self
     }
 
     #[must_use]
@@ -287,9 +269,6 @@ impl OrderManager {
         )
         .map_err(MarketOrderError::deposit_address)?;
 
-        self.validate_route_minimum(&normalized_request, &depositor_address)
-            .await?;
-
         let provider_quote = match self
             .best_provider_quote(&normalized_request, quote_id, &depositor_address)
             .await
@@ -305,6 +284,33 @@ impl OrderManager {
             }
             Err(err) => return Err(err),
         };
+
+        // Economic-viability gate. Reject orders whose estimated output is
+        // below the route's dust floor — too small to clear route fees, so the
+        // depositor would receive dust (or strand funds on a deposit-then-
+        // execute route). This replaces the old live route-minimum fan-out: it
+        // reuses the quote we already computed instead of a separate
+        // exact-out walk across every candidate path. Assets with no defined
+        // floor are not gated, matching the previous lenient behaviour.
+        if let Some(output_floor) =
+            route_output_floor(&self.asset_registry, &normalized_request.destination_asset)
+        {
+            let estimated_out =
+                parse_amount("estimated_amount_out", &provider_quote.estimated_amount_out)?;
+            if estimated_out < output_floor {
+                return Err(MarketOrderError::OutputBelowFloor {
+                    estimated_amount_out: provider_quote.estimated_amount_out.clone(),
+                    output_floor: output_floor.to_string(),
+                    destination_chain: Box::new(
+                        normalized_request.destination_asset.chain.clone(),
+                    ),
+                    destination_asset: Box::new(
+                        normalized_request.destination_asset.asset.clone(),
+                    ),
+                });
+            }
+        }
+
         let now = Utc::now();
         let mut quote = MarketOrderQuote {
             id: quote_id,
@@ -1160,75 +1166,6 @@ impl OrderManager {
             provider_quote,
             expires_at,
         }))
-    }
-
-    async fn validate_route_minimum(
-        &self,
-        request: &NormalizedMarketOrderQuoteRequest,
-        depositor_address: &str,
-    ) -> MarketOrderResult<()> {
-        let Some(route_minimums) = &self.route_minimums else {
-            return Ok(());
-        };
-        let amount_in_u256 = parse_amount("amount_in", &request.amount_in)?;
-        let snapshot = match tokio::time::timeout(
-            MARKET_ORDER_PROVIDER_TIMEOUT,
-            route_minimums.floor_for_route(
-                &request.source_asset,
-                &request.destination_asset,
-                &request.recipient_address,
-                depositor_address,
-            ),
-        )
-        .await
-        {
-            Ok(Ok(snapshot)) => snapshot,
-            Ok(Err(RouteMinimumError::Unsupported { reason })) => {
-                if route_has_configured_universal_router_path(
-                    self.asset_registry.as_ref(),
-                    self.action_providers.as_ref(),
-                    &request.source_asset,
-                    &request.destination_asset,
-                ) {
-                    return Err(MarketOrderError::RouteMinimum {
-                        reason: format!("universal-router route minimum unsupported: {reason}"),
-                    });
-                }
-                return Ok(());
-            }
-            Ok(Err(err)) => {
-                return Err(MarketOrderError::RouteMinimum {
-                    reason: err.to_string(),
-                });
-            }
-            Err(_) => {
-                return Err(MarketOrderError::RouteMinimum {
-                    reason: "route minimum check timed out".to_string(),
-                });
-            }
-        };
-        let operational_min_input = snapshot.operational_min_input_u256().ok_or_else(|| {
-            MarketOrderError::RouteMinimum {
-                reason: format!(
-                    "cached operational minimum was invalid: {}",
-                    snapshot.operational_min_input
-                ),
-            }
-        })?;
-
-        if amount_in_u256 < operational_min_input {
-            return Err(MarketOrderError::InputBelowRouteMinimum {
-                amount_in: request.amount_in.clone(),
-                operational_min_input: snapshot.operational_min_input,
-                hard_min_input: snapshot.hard_min_input,
-                source_chain: Box::new(request.source_asset.chain.clone()),
-                source_asset: Box::new(request.source_asset.asset.clone()),
-                destination_chain: Box::new(request.destination_asset.chain.clone()),
-                destination_asset: Box::new(request.destination_asset.asset.clone()),
-            });
-        }
-
-        Ok(())
     }
 
     async fn quote_transition_path(
@@ -2353,24 +2290,6 @@ fn path_has_configured_provider_set(
         })
 }
 
-fn route_has_configured_universal_router_path(
-    registry: &AssetRegistry,
-    action_providers: &ActionProviderRegistry,
-    source_asset: &DepositAsset,
-    destination_asset: &DepositAsset,
-) -> bool {
-    registry
-        .select_transition_paths(source_asset, destination_asset, 5)
-        .into_iter()
-        .filter(|path| is_executable_transition_path(registry, path))
-        .filter(|path| path_has_configured_provider_set(action_providers, path))
-        .any(|path| {
-            path.transitions
-                .iter()
-                .any(|transition| transition.kind == MarketOrderTransitionKind::UniversalRouterSwap)
-        })
-}
-
 fn transition_leg(spec: QuoteLegSpec<'_>) -> QuoteLeg {
     QuoteLeg::new(spec)
 }
@@ -2998,6 +2917,27 @@ fn validate_positive_amount(field: &'static str, value: &str) -> MarketOrderResu
     Ok(())
 }
 
+/// Dust floors per canonical destination asset — the smallest output below
+/// which a market order isn't economically viable (the fees would eat it).
+const ROUTE_OUTPUT_FLOOR_BTC_SATS: u64 = 30_000;
+const ROUTE_OUTPUT_FLOOR_ETH_WEI: u128 = 7_000_000_000_000_000;
+const ROUTE_OUTPUT_FLOOR_STABLECOIN_RAW: u64 = 1_000_000;
+
+/// The minimum viable output for a route, by destination asset. `None` for
+/// assets with no defined floor (e.g. HYPE) — those routes are not gated.
+fn route_output_floor(registry: &AssetRegistry, destination_asset: &DepositAsset) -> Option<U256> {
+    match registry.canonical_for(destination_asset)? {
+        CanonicalAsset::Btc | CanonicalAsset::Cbbtc => {
+            Some(U256::from(ROUTE_OUTPUT_FLOOR_BTC_SATS))
+        }
+        CanonicalAsset::Eth => Some(U256::from(ROUTE_OUTPUT_FLOOR_ETH_WEI)),
+        CanonicalAsset::Usdc | CanonicalAsset::Usdt => {
+            Some(U256::from(ROUTE_OUTPUT_FLOOR_STABLECOIN_RAW))
+        }
+        CanonicalAsset::Hype => None,
+    }
+}
+
 fn parse_amount(field: &'static str, value: &str) -> MarketOrderResult<U256> {
     if value.is_empty() {
         return Err(MarketOrderError::InvalidAmount {
@@ -3106,6 +3046,55 @@ fn quote_hop_count(quote: &ComposedMarketOrderQuote) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn floor_asset(chain: &str, asset: AssetId) -> DepositAsset {
+        DepositAsset {
+            chain: ChainId::parse(chain).expect("valid static chain id"),
+            asset,
+        }
+    }
+
+    #[test]
+    fn route_output_floor_resolves_canonical_destination_assets() {
+        let registry = AssetRegistry::default();
+        assert_eq!(
+            route_output_floor(&registry, &floor_asset("bitcoin", AssetId::Native)),
+            Some(U256::from(ROUTE_OUTPUT_FLOOR_BTC_SATS))
+        );
+        assert_eq!(
+            route_output_floor(&registry, &floor_asset("evm:1", AssetId::Native)),
+            Some(U256::from(ROUTE_OUTPUT_FLOOR_ETH_WEI))
+        );
+        assert_eq!(
+            route_output_floor(&registry, &floor_asset("evm:8453", AssetId::Native)),
+            Some(U256::from(ROUTE_OUTPUT_FLOOR_ETH_WEI))
+        );
+        assert_eq!(
+            route_output_floor(
+                &registry,
+                &floor_asset(
+                    "evm:8453",
+                    AssetId::reference("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
+                ),
+            ),
+            Some(U256::from(ROUTE_OUTPUT_FLOOR_STABLECOIN_RAW))
+        );
+    }
+
+    #[test]
+    fn route_output_floor_is_none_for_unknown_destination_asset() {
+        // An asset the registry can't canonicalize is not gated.
+        assert_eq!(
+            route_output_floor(
+                &AssetRegistry::default(),
+                &floor_asset(
+                    "evm:1",
+                    AssetId::reference("0x000000000000000000000000000000000000dead"),
+                ),
+            ),
+            None
+        );
+    }
 
     #[test]
     fn amount_parser_rejects_oversized_decimal_strings_before_u256_parse() {

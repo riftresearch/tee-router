@@ -3,7 +3,6 @@ pub mod deposit_address;
 pub mod order_manager;
 pub mod provider_health;
 pub mod provider_policy;
-pub mod route_minimums;
 pub mod vault_manager;
 
 pub use address_screening::{AddressScreeningPurpose, AddressScreeningService};
@@ -13,5 +12,4 @@ pub use provider_health::{
     ProviderHealthSnapshot,
 };
 pub use provider_policy::{ProviderPolicyService, ProviderPolicySnapshot};
-pub use route_minimums::{RouteMinimumError, RouteMinimumService, RouteMinimumSnapshot};
 pub use vault_manager::VaultManager;

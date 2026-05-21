@@ -243,20 +243,16 @@ impl From<crate::services::order_manager::MarketOrderError> for RouterServerErro
                 Self::Validation { message: reason }
             }
             MarketOrderError::NoRoute { reason } => Self::NoRoute { message: reason },
-            MarketOrderError::InputBelowRouteMinimum {
-                amount_in,
-                operational_min_input,
-                hard_min_input,
-                source_chain,
-                source_asset,
+            MarketOrderError::OutputBelowFloor {
+                estimated_amount_out,
+                output_floor,
                 destination_chain,
                 destination_asset,
             } => Self::Validation {
                 message: format!(
-                    "Input amount {amount_in} is below operational route minimum {operational_min_input} (hard minimum {hard_min_input}) for {source_chain} {source_asset} to {destination_chain} {destination_asset}"
+                    "Estimated output {estimated_amount_out} is below the viable floor {output_floor} for {destination_chain} {destination_asset} — the order is too small to clear route fees"
                 ),
             },
-            MarketOrderError::RouteMinimum { reason } => Self::Internal { message: reason },
             MarketOrderError::GasReimbursement { source } => Self::Internal {
                 message: source.to_string(),
             },
