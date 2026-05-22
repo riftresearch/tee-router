@@ -3,9 +3,7 @@
 use std::io::{self, Write};
 
 use eyre::{eyre, Result, WrapErr};
-use router_gateway_sdk::{
-    AmountFormat, CreateOrderRequest, GatewayClient, QuoteRequest, RefundMode,
-};
+use router_gateway_sdk::{AmountFormat, CreateOrderRequest, GatewayClient, QuoteRequest};
 use uuid::Uuid;
 
 use crate::assets::{self, SourceChain};
@@ -65,8 +63,7 @@ pub async fn run(args: SwapArgs) -> Result<()> {
         return Ok(());
     }
 
-    // 3. Create the order. Token-mode refunds are chain-agnostic, so this path
-    //    works whether the source chain is EVM or Bitcoin.
+    // 3. Create the order.
     let order = client
         .create_market_order(&CreateOrderRequest {
             quote_id: quote.quote_id.clone(),
@@ -74,8 +71,6 @@ pub async fn run(args: SwapArgs) -> Result<()> {
             to_address: args.to_address.clone(),
             refund_address: Some(from_address.clone()),
             idempotency_key: format!("router-cli-{}", Uuid::now_v7()),
-            refund_mode: Some(RefundMode::Token),
-            refund_authorizer: None,
             amount_format: Some(AmountFormat::Raw),
         })
         .await
@@ -113,9 +108,6 @@ pub async fn run(args: SwapArgs) -> Result<()> {
     println!("  order id:     {}", order.order_id);
     println!("  deposit tx:   {txid}");
     println!("  status:       {}", order.status);
-    if let Some(token) = &order.refund_token {
-        println!("  refund token: {token}");
-    }
     println!();
     println!(
         "Track it:  router-cli status {} --gateway-url {}",
