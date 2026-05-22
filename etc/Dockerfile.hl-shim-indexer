@@ -9,10 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 COPY . .
-RUN --mount=type=cache,id=tee-router-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,id=tee-router-cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=tee-router-target,target=/app/target,sharing=locked \
-    cargo build --release -p hl-shim-indexer \
+RUN cargo build --release -p hl-shim-indexer \
     && install -Dm0755 /app/target/release/hl-shim-indexer /app/out/hl-shim-indexer
 
 FROM debian:trixie

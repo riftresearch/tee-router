@@ -9,10 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 COPY . .
-RUN --mount=type=cache,id=tee-router-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,id=tee-router-cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=tee-router-target,target=/app/target,sharing=locked \
-    cargo build --release -p evm-receipt-watcher \
+RUN cargo build --release -p evm-receipt-watcher \
     && install -Dm0755 /app/target/release/evm-receipt-watcher /app/out/evm-receipt-watcher
 
 FROM debian:trixie
