@@ -174,6 +174,27 @@ pub struct OrderFlowEnvelope {
     pub flow: OrderFlow,
 }
 
+/// Response body for the admin manual-refund endpoint
+/// (`POST /internal/v1/orders/:id/refund`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderRefundEnvelope {
+    pub order_id: Uuid,
+    /// Workflow id of the standalone `RefundWorkflow` — watch it in the
+    /// Temporal UI.
+    pub workflow_id: String,
+    pub outcome: OrderRefundOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrderRefundOutcome {
+    /// A new manual `RefundWorkflow` run was started.
+    RefundStarted,
+    /// A manual `RefundWorkflow` for this order was already running; the
+    /// repeated trigger was a no-op (idempotent).
+    RefundAlreadyInProgress,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderFlow {
     pub order: RouterOrder,

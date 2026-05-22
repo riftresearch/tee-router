@@ -1,10 +1,10 @@
 use crate::{
     api::{
         CreateOrderRequest, CreateQuoteRequest, CreateVaultRequest, DetectorHintEnvelope,
-        DetectorHintRequest, DetectorHintTarget, ProviderHealthEnvelope,
-        ProviderOperationHintEnvelope, ProviderOperationHintRequest, ProviderPolicyEnvelope,
-        ProviderPolicyListEnvelope, UpdateProviderPolicyRequest, VaultFundingHintEnvelope,
-        VaultFundingHintRequest, MAX_HINT_IDEMPOTENCY_KEY_LEN,
+        DetectorHintRequest, DetectorHintTarget, OrderRefundEnvelope, OrderRefundOutcome,
+        ProviderHealthEnvelope, ProviderOperationHintEnvelope, ProviderOperationHintRequest,
+        ProviderPolicyEnvelope, ProviderPolicyListEnvelope, UpdateProviderPolicyRequest,
+        VaultFundingHintEnvelope, VaultFundingHintRequest, MAX_HINT_IDEMPOTENCY_KEY_LEN,
     },
     app::{initialize_components, PaymasterMode, RouterComponents},
     error::{RouterServerError, RouterServerResult},
@@ -34,7 +34,8 @@ use router_core::{
         DepositRequirements, DepositVault, DepositVaultEnvelope, DepositVaultFundingHint,
         OrderExecutionAttempt, OrderExecutionAttemptKind, OrderProviderOperation,
         OrderProviderOperationHint, ProviderOperationHintStatus, ProviderOperationType,
-        RouterOrder, RouterOrderEnvelope, RouterOrderQuoteEnvelope, StatusResponse, VaultAction,
+        RouterOrder, RouterOrderEnvelope, RouterOrderQuoteEnvelope, RouterOrderStatus,
+        StatusResponse, VaultAction,
     },
     protocol::{backend_chain_for_id, supported_chain_ids, ChainId},
     services::asset_registry::ProviderId,
@@ -42,8 +43,8 @@ use router_core::{
 use router_temporal::{
     boxed as boxed_temporal_error, OrderWorkflowClient, ProviderHintKind, ProviderKind,
     ProviderOperationHintEvidence, ProviderOperationHintSignal, RouterTemporalError,
-    TemporalConnection, UnitDepositHintEvidence, WorkflowAttemptId, WorkflowHintId,
-    WorkflowOrderId, WorkflowProviderOperationId, WorkflowStepId,
+    StartRefundWorkflowOutcome, TemporalConnection, UnitDepositHintEvidence, WorkflowAttemptId,
+    WorkflowHintId, WorkflowOrderId, WorkflowProviderOperationId, WorkflowStepId,
 };
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
@@ -259,6 +260,7 @@ pub fn build_api_router(state: AppState, cors_domain: Option<String>) -> Router 
             put(update_provider_policy),
         )
         .route("/internal/v1/orders/:id/flow", get(get_order_flow))
+        .route("/internal/v1/orders/:id/refund", post(trigger_order_refund))
         .route("/api/v1/chains/:chain/tip", get(get_chain_tip))
         .with_state(state)
         .layer(DefaultBodyLimit::max(MAX_ROUTER_JSON_BODY_BYTES))
@@ -1130,6 +1132,69 @@ async fn get_order_flow(
     Ok(Json(crate::query_api::get_order_flow(&state.db, id).await?))
 }
 
+/// Admin-only endpoint to manually trigger a refund for an order stuck in
+/// `RefundRequired`. When an execution times out the `OrderWorkflow` finalizes
+/// the order to `RefundRequired` but never executes a refund, leaving funds in
+/// the funding vault; this endpoint starts a standalone `RefundWorkflow` to
+/// recover them.
+async fn trigger_order_refund(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RouterPath(id): RouterPath<Uuid>,
+) -> RouterServerResult<Json<OrderRefundEnvelope>> {
+    authorize_admin_api_request(&state, &headers)?;
+
+    // A missing order surfaces as `RouterCoreError::NotFound` -> 404.
+    let order = state.db.orders().get(id).await?;
+    require_refundable_order_status(order.status)?;
+
+    let order_workflow_client =
+        state
+            .order_workflow_client
+            .as_ref()
+            .ok_or_else(|| RouterServerError::NotReady {
+                message: "Temporal order workflow client is not configured".to_string(),
+            })?;
+
+    let outcome = order_workflow_client
+        .start_refund_workflow(WorkflowOrderId::from(id))
+        .await
+        .map_err(|source| RouterServerError::Internal {
+            message: format!("failed to start manual RefundWorkflow: {source}"),
+        })?;
+
+    let (outcome, workflow_id) = match outcome {
+        StartRefundWorkflowOutcome::Started { workflow_id } => {
+            (OrderRefundOutcome::RefundStarted, workflow_id)
+        }
+        StartRefundWorkflowOutcome::AlreadyStarted { workflow_id } => {
+            (OrderRefundOutcome::RefundAlreadyInProgress, workflow_id)
+        }
+    };
+    Ok(Json(OrderRefundEnvelope {
+        order_id: id,
+        workflow_id,
+        outcome,
+    }))
+}
+
+/// Guards the manual-refund endpoint: a refund may only be triggered for an
+/// order in `RefundRequired`. Rejecting every other status — including
+/// `Refunded` and `Completed` (double-refund guard) and `Executing`
+/// (in-flight order guard) — with a message naming the actual status.
+fn require_refundable_order_status(status: RouterOrderStatus) -> RouterServerResult<()> {
+    if status == RouterOrderStatus::RefundRequired {
+        return Ok(());
+    }
+    Err(RouterServerError::Conflict {
+        message: format!(
+            "order status is '{}'; a manual refund may only be triggered for an order in '{}'",
+            status.to_db_string(),
+            RouterOrderStatus::RefundRequired.to_db_string(),
+        ),
+    })
+}
+
 fn authorize_internal_api_request(state: &AppState, headers: &HeaderMap) -> RouterServerResult<()> {
     let Some(auth) = state.internal_api_auth.as_ref() else {
         return Err(RouterServerError::Unauthorized {
@@ -1569,6 +1634,41 @@ mod tests {
     fn limit_orders_disabled_error_returns_validation_status() {
         let response = limit_orders_disabled_error().into_response();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn manual_refund_allows_refund_required_orders() {
+        assert!(require_refundable_order_status(RouterOrderStatus::RefundRequired).is_ok());
+    }
+
+    #[test]
+    fn manual_refund_rejects_non_refund_required_orders() {
+        for status in [
+            RouterOrderStatus::Quoted,
+            RouterOrderStatus::PendingFunding,
+            RouterOrderStatus::Funded,
+            RouterOrderStatus::Executing,
+            RouterOrderStatus::Completed,
+            RouterOrderStatus::Refunding,
+            RouterOrderStatus::Refunded,
+        ] {
+            let error = require_refundable_order_status(status)
+                .expect_err("non-RefundRequired status must be rejected");
+            assert!(
+                matches!(error, RouterServerError::Conflict { .. }),
+                "expected a conflict error for status {status:?}, got {error:?}"
+            );
+            // The rejection names the actual status so the operator knows why.
+            assert!(error.to_string().contains(status.to_db_string()));
+        }
+    }
+
+    #[test]
+    fn manual_refund_status_rejection_maps_to_conflict_response() {
+        let response = require_refundable_order_status(RouterOrderStatus::Refunded)
+            .expect_err("a refunded order must be rejected")
+            .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
     #[test]

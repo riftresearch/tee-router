@@ -22,17 +22,36 @@ impl RefundWorkflow {
             state.order_id = Some(input.order_id);
         });
         let workflow_started_at = workflow_start_time(ctx, REFUND_WORKFLOW_TYPE);
-        if input.trigger != RefundTrigger::FailedAttempt {
-            return Err(anyhow::anyhow!(
-                "PR6a RefundWorkflow only handles failed-attempt triggers"
-            )
-            .into());
-        }
-        let failed_attempt_id = input.parent_attempt_id.ok_or_else(|| {
-            anyhow::anyhow!("failed-attempt RefundWorkflow requires parent_attempt_id")
-        })?;
         let db_activity_options = db_activity_options();
         let refund_execute_activity_options = refund_execute_activity_options();
+
+        // Resolve the failed attempt id that drives `discover_single_refund_position`.
+        // A child refund (`FailedAttempt`) inherits it from its parent
+        // `OrderWorkflow`; a standalone admin refund (`Manual`) has no parent,
+        // so it resolves the order's most recent execution attempt via an
+        // activity. `VaultAlreadyRefunded` is not an executable trigger.
+        let failed_attempt_id = match input.trigger {
+            RefundTrigger::FailedAttempt => input.parent_attempt_id.ok_or_else(|| {
+                anyhow::anyhow!("failed-attempt RefundWorkflow requires parent_attempt_id")
+            })?,
+            RefundTrigger::Manual => {
+                ctx.start_activity(
+                    RefundActivities::resolve_latest_execution_attempt,
+                    ResolveLatestExecutionAttemptInput {
+                        order_id: input.order_id,
+                    },
+                    db_activity_options.clone(),
+                )
+                .await?
+                .attempt_id
+            }
+            RefundTrigger::VaultAlreadyRefunded => {
+                return Err(anyhow::anyhow!(
+                    "RefundWorkflow does not handle the VaultAlreadyRefunded trigger"
+                )
+                .into());
+            }
+        };
 
         loop {
             let discovery = ctx

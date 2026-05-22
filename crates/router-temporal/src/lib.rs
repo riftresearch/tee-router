@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 pub const DEFAULT_TASK_QUEUE: &str = "tee-router-order-execution";
 pub const ORDER_WORKFLOW_TYPE: &str = "OrderWorkflow";
+pub const REFUND_WORKFLOW_TYPE: &str = "RefundWorkflow";
 pub const ORDER_WORKFLOW_PROVIDER_HINT_SIGNAL: &str = "provider_operation_hint";
 
 pub type BoxError = Box<dyn StdError + Send + Sync + 'static>;
@@ -131,6 +132,26 @@ pub struct TemporalConnection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderWorkflowInput {
     pub order_id: WorkflowOrderId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefundWorkflowInput {
+    pub order_id: WorkflowOrderId,
+    pub parent_attempt_id: Option<WorkflowAttemptId>,
+    pub trigger: RefundTrigger,
+    #[serde(default)]
+    pub funded_to_workflow_start_seconds: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RefundTrigger {
+    /// Refund started as a child of the `OrderWorkflow` after a failed
+    /// execution attempt; `parent_attempt_id` carries the failed attempt.
+    FailedAttempt,
+    /// Refund started standalone by the admin refund endpoint for an order
+    /// stuck in `RefundRequired`; the failed attempt is resolved by activity.
+    Manual,
+    VaultAlreadyRefunded,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -439,6 +460,28 @@ pub enum RouterTemporalError {
 
 pub type RouterTemporalResult<T> = Result<T, RouterTemporalError>;
 
+/// Outcome of [`OrderWorkflowClient::start_refund_workflow`]. The
+/// already-started case is a normal, non-fatal result so the admin refund
+/// endpoint can report "a manual refund is already in progress" rather than
+/// surfacing a 500.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartRefundWorkflowOutcome {
+    /// A new standalone `RefundWorkflow` run was started.
+    Started { workflow_id: String },
+    /// A standalone `RefundWorkflow` for this order is already running; the
+    /// deterministic workflow id collided with the in-flight run.
+    AlreadyStarted { workflow_id: String },
+}
+
+impl StartRefundWorkflowOutcome {
+    #[must_use]
+    pub fn workflow_id(&self) -> &str {
+        match self {
+            Self::Started { workflow_id } | Self::AlreadyStarted { workflow_id } => workflow_id,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct OrderWorkflowClient {
     client: WorkflowServiceClient<Channel>,
@@ -516,6 +559,57 @@ impl OrderWorkflowClient {
                 }
             })?;
         Ok(response.into_inner().run_id)
+    }
+
+    /// Starts a standalone `RefundWorkflow` for an order stuck in
+    /// `RefundRequired`. The workflow id is deterministic
+    /// ([`manual_refund_workflow_id`]) so a repeated trigger collides with the
+    /// in-flight run and is reported as
+    /// [`StartRefundWorkflowOutcome::AlreadyStarted`] rather than starting a
+    /// duplicate refund.
+    pub async fn start_refund_workflow(
+        &self,
+        order_id: WorkflowOrderId,
+    ) -> RouterTemporalResult<StartRefundWorkflowOutcome> {
+        let workflow_id = manual_refund_workflow_id(order_id);
+        let input = payloads(&RefundWorkflowInput {
+            order_id,
+            parent_attempt_id: None,
+            trigger: RefundTrigger::Manual,
+            funded_to_workflow_start_seconds: None,
+        });
+        let result = self
+            .client
+            .clone()
+            .start_workflow_execution(StartWorkflowExecutionRequest {
+                namespace: self.namespace.clone(),
+                workflow_id: workflow_id.clone(),
+                workflow_type: Some(WorkflowType {
+                    name: REFUND_WORKFLOW_TYPE.to_owned(),
+                }),
+                task_queue: Some(TaskQueue {
+                    name: self.task_queue.clone(),
+                    kind: TaskQueueKind::Unspecified as i32,
+                    normal_name: String::new(),
+                }),
+                input: Some(input),
+                identity: self.identity.clone(),
+                request_id: Uuid::now_v7().to_string(),
+                workflow_id_reuse_policy: WorkflowIdReusePolicy::AllowDuplicateFailedOnly as i32,
+                workflow_id_conflict_policy: WorkflowIdConflictPolicy::Fail as i32,
+                ..Default::default()
+            })
+            .await;
+        match result {
+            Ok(_) => Ok(StartRefundWorkflowOutcome::Started { workflow_id }),
+            Err(source) if source.code() == Code::AlreadyExists => {
+                Ok(StartRefundWorkflowOutcome::AlreadyStarted { workflow_id })
+            }
+            Err(source) => Err(RouterTemporalError::Temporal {
+                action: "start RefundWorkflow",
+                source: boxed(source),
+            }),
+        }
     }
 
     pub async fn signal_provider_hint(
@@ -620,6 +714,14 @@ pub fn refund_workflow_id(
     parent_attempt_id: WorkflowAttemptId,
 ) -> String {
     format!("order:{order_id}:refund:{parent_attempt_id}")
+}
+
+/// Deterministic workflow id for an admin-triggered standalone refund. Using a
+/// fixed suffix makes a repeated trigger for the same order idempotent — the
+/// second call collides with the in-flight run instead of starting a new one.
+#[must_use]
+pub fn manual_refund_workflow_id(order_id: WorkflowOrderId) -> String {
+    format!("order:{order_id}:refund:manual")
 }
 
 #[must_use]
