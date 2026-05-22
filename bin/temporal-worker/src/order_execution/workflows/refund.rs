@@ -24,6 +24,7 @@ impl RefundWorkflow {
         let workflow_started_at = workflow_start_time(ctx, REFUND_WORKFLOW_TYPE);
         let db_activity_options = db_activity_options();
         let refund_execute_activity_options = refund_execute_activity_options();
+        let refund_planning_activity_options = refund_planning_activity_options();
 
         // Resolve the failed attempt id that drives `discover_single_refund_position`.
         // A child refund (`FailedAttempt`) inherits it from its parent
@@ -61,7 +62,7 @@ impl RefundWorkflow {
                         order_id: input.order_id,
                         failed_attempt_id,
                     },
-                    db_activity_options.clone(),
+                    refund_planning_activity_options.clone(),
                 )
                 .await?;
             let position = match discovery.outcome {
@@ -93,7 +94,7 @@ impl RefundWorkflow {
                         failed_attempt_id,
                         position,
                     },
-                    db_activity_options.clone(),
+                    refund_planning_activity_options.clone(),
                 )
                 .await?;
             let (refund_attempt_id, steps) = match plan.outcome {
