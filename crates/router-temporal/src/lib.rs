@@ -633,6 +633,16 @@ impl OrderWorkflowClient {
             .await
     }
 
+    pub async fn signal_manual_refund_provider_hint(
+        &self,
+        order_id: WorkflowOrderId,
+        signal: ProviderOperationHintSignal,
+    ) -> RouterTemporalResult<()> {
+        let workflow_id = manual_refund_workflow_id(order_id);
+        self.signal_provider_hint_to_workflow(workflow_id, signal)
+            .await
+    }
+
     async fn signal_provider_hint_to_workflow(
         &self,
         workflow_id: String,
