@@ -1017,13 +1017,38 @@ async fn signal_provider_operation_hint(
                         attempt.id
                     )),
                 })?;
-            order_workflow_client
+            // Try the child refund workflow first (order:{id}:refund:{parent_attempt_id}).
+            // If unavailable, fall back to the manual refund workflow
+            // (order:{id}:refund:manual). Admin-triggered refunds use the manual
+            // workflow ID, not the UUID-based child workflow ID, so the child
+            // signal will hit a nonexistent workflow — the fallback catches that.
+            let child_result = order_workflow_client
                 .signal_refund_provider_hint(
                     WorkflowOrderId::from(order_id),
                     WorkflowAttemptId::from(parent_attempt_id),
-                    signal,
+                    signal.clone(),
                 )
-                .await
+                .await;
+            match child_result {
+                Ok(()) => Ok(()),
+                Err(RouterTemporalError::WorkflowSignalUnavailable {
+                    workflow_id,
+                    ..
+                }) => {
+                    tracing::debug!(
+                        %workflow_id,
+                        %order_id,
+                        "child refund workflow unavailable, falling back to manual refund workflow"
+                    );
+                    order_workflow_client
+                        .signal_manual_refund_provider_hint(
+                            WorkflowOrderId::from(order_id),
+                            signal,
+                        )
+                        .await
+                }
+                Err(source) => Err(source),
+            }
         }
     }
 }
