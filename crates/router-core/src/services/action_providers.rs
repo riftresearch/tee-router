@@ -3150,6 +3150,10 @@ impl CctpProvider {
             "amount": step.amount,
             "recipient_address": step.recipient_address,
             "message_transmitter_v2": format!("{:#x}", self.message_transmitter_v2_address),
+            // The receive observer matches the real CCTP v2 `MintAndWithdraw`
+            // event, which is emitted by the TokenMessengerV2 (not the message
+            // transmitter), so the emitter check needs this address.
+            "token_messenger_v2": format!("{:#x}", self.token_messenger_v2_address),
         });
         Ok(ProviderExecutionIntent::CustodyAction {
             custody_vault_id: source_custody_vault_id,

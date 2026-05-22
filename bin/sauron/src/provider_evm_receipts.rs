@@ -36,17 +36,34 @@ sol! {
     #[derive(Debug)]
     event Transfer(address indexed from, address indexed to, uint256 value);
 
+    // Real CCTP v2 `MintAndWithdraw`, emitted by the TokenMessengerV2 from
+    // `_mintAndWithdraw` when `receiveMessage` mints the bridged USDC.
+    // topic0 = keccak256("MintAndWithdraw(address,uint256,address,uint256)")
+    //        = 0x50c55e915134d457debfa58eb6f4342956f8b0616d51a89a3659360178e1ab63
     #[derive(Debug)]
-    event MessageReceived(address indexed token, address indexed recipient, uint256 amount);
+    event MintAndWithdraw(
+        address indexed mintRecipient,
+        uint256 amount,
+        address indexed mintToken,
+        uint256 feeCollected
+    );
 
+    // Real Velora (ParaSwap) `SwappedV3`, emitted by the Augustus router on a
+    // settled sell-side swap.
+    // topic0 = keccak256("SwappedV3(bytes16,address,uint256,address,address,address,address,uint256,uint256,uint256)")
+    //        = 0xe00361d207b252a464323eb23d45d42583e391f2031acdd2e9fa36efddd43cb0
     #[derive(Debug)]
-    event Swap(
-        address indexed sender,
-        address indexed recipient,
-        address srcToken,
-        address destToken,
+    event SwappedV3(
+        bytes16 uuid,
+        address partner,
+        uint256 feePercent,
+        address initiator,
+        address indexed beneficiary,
+        address indexed srcToken,
+        address indexed destToken,
         uint256 srcAmount,
-        uint256 destAmount
+        uint256 receivedAmount,
+        uint256 expectedAmount
     );
 }
 
@@ -306,11 +323,11 @@ async fn velora_swap_settled_hint(
         if log.removed {
             continue;
         }
-        let Ok(decoded) = log.log_decode::<Swap>() else {
+        let Ok(decoded) = log.log_decode::<SwappedV3>() else {
             continue;
         };
         if let Some(recipient) = recipient {
-            if decoded.inner.data.recipient != recipient {
+            if decoded.inner.data.beneficiary != recipient {
                 continue;
             }
         }
@@ -320,7 +337,7 @@ async fn velora_swap_settled_hint(
             }
         }
         if let Some(expected_min) = expected_min {
-            if decoded.inner.data.destAmount < expected_min {
+            if decoded.inner.data.receivedAmount < expected_min {
                 continue;
             }
         }
@@ -333,9 +350,9 @@ async fn velora_swap_settled_hint(
             velora_swap_settled_evidence(
                 format!("{tx_hash:?}"),
                 log_index,
-                decoded.inner.data.destAmount.to_string(),
-                format!("{:#x}", decoded.inner.data.recipient),
-                Some(format!("{:#x}", decoded.inner.data.sender)),
+                decoded.inner.data.receivedAmount.to_string(),
+                format!("{:#x}", decoded.inner.data.beneficiary),
+                Some(format!("{:#x}", decoded.inner.data.initiator)),
                 (decoded.inner.data.destToken != Address::ZERO)
                     .then(|| format!("{:#x}", decoded.inner.data.destToken)),
                 decoded.block_number,
@@ -419,9 +436,11 @@ async fn cctp_receive_observed_hint(
     if !receipt.status() {
         return Ok(None);
     }
-    let expected_transmitter = operation
+    // `MintAndWithdraw` is emitted by the TokenMessengerV2, not the message
+    // transmitter, so pin the emitter check to `token_messenger_v2`.
+    let expected_token_messenger = operation
         .request
-        .get("message_transmitter_v2")
+        .get("token_messenger_v2")
         .and_then(Value::as_str)
         .and_then(|value| Address::from_str(value).ok());
     let expected_recipient = operation
@@ -444,21 +463,21 @@ async fn cctp_receive_observed_hint(
         if log.removed {
             continue;
         }
-        let Ok(decoded) = log.log_decode::<MessageReceived>() else {
+        let Ok(decoded) = log.log_decode::<MintAndWithdraw>() else {
             continue;
         };
-        if let Some(expected_transmitter) = expected_transmitter {
-            if decoded.address() != expected_transmitter {
+        if let Some(expected_token_messenger) = expected_token_messenger {
+            if decoded.address() != expected_token_messenger {
                 continue;
             }
         }
         if let Some(expected_recipient) = expected_recipient {
-            if decoded.inner.data.recipient != expected_recipient {
+            if decoded.inner.data.mintRecipient != expected_recipient {
                 continue;
             }
         }
         if let Some(expected_token) = expected_token {
-            if decoded.inner.data.token != expected_token {
+            if decoded.inner.data.mintToken != expected_token {
                 continue;
             }
         }
@@ -476,8 +495,8 @@ async fn cctp_receive_observed_hint(
             cctp_receive_observed_evidence(
                 format!("{tx_hash:?}"),
                 log_index,
-                format!("{:#x}", decoded.inner.data.token),
-                format!("{:#x}", decoded.inner.data.recipient),
+                format!("{:#x}", decoded.inner.data.mintToken),
+                format!("{:#x}", decoded.inner.data.mintRecipient),
                 decoded.inner.data.amount.to_string(),
                 decoded.block_number,
             ),

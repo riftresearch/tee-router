@@ -861,7 +861,11 @@ pub struct MockAcrossDepositRecord {
 pub struct MockCctpBurnRecord {
     pub source_domain: u32,
     pub destination_domain: u32,
-    pub nonce: u64,
+    /// CCTP v2 event nonce. The real `DepositForBurn` event carries no nonce
+    /// (the nonce lives in the message body and is surfaced by Circle's Iris
+    /// API as a hex-string `eventNonce`), so the mock derives a deterministic
+    /// nonce from the burn transaction hash.
+    pub nonce: String,
     pub burn_token: Address,
     pub destination_token: Address,
     pub depositor: Address,
@@ -3248,7 +3252,7 @@ async fn mock_cctp_messages(
     } else if let Some(nonce) = query.nonce.as_deref() {
         burns
             .values()
-            .find(|record| record.nonce.to_string() == nonce)
+            .find(|record| record.nonce == nonce)
             .cloned()
     } else {
         return error_response(
@@ -3285,7 +3289,7 @@ async fn mock_cctp_messages(
                 "messages": [{
                     "message": message_hex,
                     "attestation": null,
-                    "eventNonce": record.nonce.to_string(),
+                    "eventNonce": record.nonce.clone(),
                     "cctpVersion": 2,
                     "status": "failed",
                     "error": reason,
@@ -3307,7 +3311,7 @@ async fn mock_cctp_messages(
                 "messages": [{
                     "message": message_hex,
                     "attestation": null,
-                    "eventNonce": record.nonce.to_string(),
+                    "eventNonce": record.nonce.clone(),
                     "cctpVersion": 2,
                     "status": "pending_confirmations",
                     "decodedMessageBody": decoded_message_body
@@ -3322,7 +3326,7 @@ async fn mock_cctp_messages(
             "messages": [{
                 "message": message_hex,
                 "attestation": format!("0x{}", "11".repeat(65)),
-                "eventNonce": record.nonce.to_string(),
+                "eventNonce": record.nonce.clone(),
                 "cctpVersion": 2,
                 "status": "complete",
                 "decodedMessageBody": decoded_message_body
@@ -3742,7 +3746,7 @@ async fn run_cctp_burn_indexer(
             let record = MockCctpBurnRecord {
                 source_domain,
                 destination_domain: event.destinationDomain,
-                nonce: event.nonce,
+                nonce: burn_tx_hash.clone(),
                 burn_token: event.burnToken,
                 destination_token: destination_token_address,
                 depositor: event.depositor,
@@ -8191,7 +8195,7 @@ mod tests {
         MockCctpBurnRecord {
             source_domain: 0,
             destination_domain: 3,
-            nonce: 7,
+            nonce: "0xburn".to_string(),
             burn_token: Address::repeat_byte(0x11),
             destination_token: Address::repeat_byte(0x22),
             depositor: Address::repeat_byte(0x33),

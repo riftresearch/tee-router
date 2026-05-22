@@ -17,7 +17,7 @@ use chains::{
 };
 use chrono::Utc;
 use devnet::{
-    evm_devnet::{MOCK_CCTP_MESSAGE_TRANSMITTER_V2_ADDRESS, MOCK_CCTP_TOKEN_MESSENGER_V2_ADDRESS},
+    evm_devnet::MOCK_CCTP_TOKEN_MESSENGER_V2_ADDRESS,
     mock_integrators::{MockIntegratorConfig, MockIntegratorServer, MockUnitOperationRecord},
     RiftDevnet,
 };
@@ -4524,11 +4524,14 @@ async fn install_mock_usdc_clone(devnet: &devnet::EthDevnet, token_address: Addr
         .get_receipt()
         .await
         .expect("mock USDC initialize receipt");
+    // CCTP v2 mints the bridged token from the TokenMessengerV2 (the message
+    // transmitter dispatches `receiveMessage` into it), so the token messenger
+    // is the contract that needs minting rights on the mock USDC.
     let minters = [
         admin,
         *devnet.mock_velora_swap_contract.address(),
-        Address::from_str(MOCK_CCTP_MESSAGE_TRANSMITTER_V2_ADDRESS)
-            .expect("valid mock CCTP MessageTransmitterV2 address"),
+        Address::from_str(MOCK_CCTP_TOKEN_MESSENGER_V2_ADDRESS)
+            .expect("valid mock CCTP TokenMessengerV2 address"),
     ];
     for minter in minters {
         token
