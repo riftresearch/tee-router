@@ -48,7 +48,6 @@ export type PublicLimitOrderResponse = {
   expiry: string
   outputAmount: string
   amountFormat: AmountFormat
-  cancellationSecret?: string
 }
 
 export function presentQuoteEnvelope(
@@ -117,10 +116,7 @@ export function presentLimitOrderEnvelope(
     status: presentOrderStatus(envelope.order.status),
     expiry: quote.expires_at,
     outputAmount: formatPositiveAmount(quote.output_amount, destination, amountFormat),
-    amountFormat,
-    ...(envelope.cancellation_secret
-      ? { cancellationSecret: envelope.cancellation_secret }
-      : {})
+    amountFormat
   }
 }
 

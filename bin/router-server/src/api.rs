@@ -12,7 +12,6 @@ use router_core::{
 use router_temporal::WorkflowStepId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::fmt;
 use uuid::Uuid;
 
 pub const MAX_HINT_IDEMPOTENCY_KEY_LEN: usize = 128;
@@ -33,20 +32,6 @@ pub struct CreateVaultRequest {
     pub metadata: Value,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CancelVaultRequest {
-    pub cancellation_secret: String,
-}
-
-impl fmt::Debug for CancelVaultRequest {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CancelVaultRequest")
-            .field("cancellation_secret", &"<redacted>")
-            .finish()
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CreateQuoteRequest {
@@ -63,20 +48,6 @@ pub struct CreateOrderRequest {
     pub idempotency_key: Option<String>,
     #[serde(default = "empty_metadata")]
     pub metadata: Value,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CreateOrderCancellationRequest {
-    pub cancellation_secret: String,
-}
-
-impl fmt::Debug for CreateOrderCancellationRequest {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CreateOrderCancellationRequest")
-            .field("cancellation_secret", &"<redacted>")
-            .finish()
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -346,65 +317,12 @@ mod tests {
     use chrono::Utc;
     use router_core::{
         models::{
-            MarketOrderAction, MarketOrderQuote, ProviderOperationStatus, ProviderOperationType,
-            RouterOrderAction, RouterOrderEnvelope, RouterOrderQuote, RouterOrderType,
+            MarketOrderAction, ProviderOperationStatus, ProviderOperationType, RouterOrderAction,
+            RouterOrderType,
         },
         protocol::{AssetId, ChainId},
     };
     use serde_json::json;
-
-    #[test]
-    fn cancellation_request_debug_redacts_secret_values() {
-        let secret = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-
-        let cancel_vault = CancelVaultRequest {
-            cancellation_secret: secret.to_string(),
-        };
-        let rendered = format!("{cancel_vault:?}");
-        assert!(rendered.contains("cancellation_secret"));
-        assert!(rendered.contains("<redacted>"));
-        assert!(!rendered.contains(secret));
-
-        let cancel_order = CreateOrderCancellationRequest {
-            cancellation_secret: secret.to_string(),
-        };
-        let rendered = format!("{cancel_order:?}");
-        assert!(rendered.contains("cancellation_secret"));
-        assert!(rendered.contains("<redacted>"));
-        assert!(!rendered.contains(secret));
-    }
-
-    #[test]
-    fn order_envelope_debug_redacts_cancellation_secret() {
-        let order_id = Uuid::now_v7();
-        let order = test_order(order_id, RouterOrderStatus::PendingFunding);
-        let quote = RouterOrderQuote::MarketOrder(MarketOrderQuote {
-            id: Uuid::now_v7(),
-            order_id: Some(order_id),
-            source_asset: order.source_asset.clone(),
-            destination_asset: order.destination_asset.clone(),
-            recipient_address: order.recipient_address.clone(),
-            provider_id: "test".to_string(),
-            amount_in: "1000".to_string(),
-            estimated_amount_out: "900".to_string(),
-            provider_quote: json!({}),
-            usd_valuation: json!({}),
-            expires_at: order.created_at + chrono::Duration::minutes(1),
-            created_at: order.created_at,
-        });
-        let secret = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        let envelope = RouterOrderEnvelope {
-            order,
-            quote,
-            funding_vault: None,
-            cancellation_secret: Some(secret.to_string()),
-        };
-
-        let rendered = format!("{envelope:?}");
-        assert!(rendered.contains("cancellation_secret"));
-        assert!(rendered.contains("<redacted>"));
-        assert!(!rendered.contains(secret));
-    }
 
     #[test]
     fn create_quote_request_deserializes_market_order_shape() {

@@ -10,7 +10,6 @@ const MAX_INTERNAL_ASSET_FIELD_LENGTH = 128
 const MAX_INTERNAL_ADDRESS_LENGTH = 128
 const MAX_INTERNAL_AMOUNT_LENGTH = 96
 const MAX_INTERNAL_DATETIME_LENGTH = 64
-const MAX_INTERNAL_SECRET_LENGTH = 512
 const INTEGER_STRING_PATTERN = /^[0-9]+$/
 
 export type FetchLike = (
@@ -42,7 +41,6 @@ export type InternalOrderEnvelope = {
       deposit_vault_address: string
     }
   } | null
-  cancellation_secret?: string
 }
 
 export type InternalRouterOrderQuote =
@@ -108,10 +106,6 @@ export type CreateOrderRequest = {
   metadata?: Record<string, unknown>
 }
 
-export type CreateOrderCancellationRequest = {
-  cancellation_secret: string
-}
-
 export type RouterClientOptions = {
   baseUrl: string
   apiKey?: string
@@ -154,17 +148,6 @@ export class RouterClient {
     return requireOrderEnvelope(
       await this.request('GET', `/api/v1/orders/${encodeURIComponent(orderId)}`)
     )
-  }
-
-  cancelOrder(
-    orderId: string,
-    request: CreateOrderCancellationRequest
-  ): Promise<InternalOrderEnvelope> {
-    return this.request(
-      'POST',
-      `/api/v1/orders/${encodeURIComponent(orderId)}/cancellations`,
-      request
-    ).then(requireOrderEnvelope)
   }
 
   private async request(
@@ -272,8 +255,7 @@ function isOrderEnvelope(value: unknown): value is InternalOrderEnvelope {
     isBoundedString(
       value.funding_vault.vault.deposit_vault_address,
       MAX_INTERNAL_ADDRESS_LENGTH
-    ) &&
-    optionalBoundedString(value.cancellation_secret, MAX_INTERNAL_SECRET_LENGTH)
+    )
   )
 }
 

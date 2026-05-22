@@ -140,24 +140,6 @@ pub fn record_vault_create_failed(request: &DepositAsset, error: &VaultError) {
     .increment(1);
 }
 
-pub fn record_vault_cancel_requested(vault: &DepositVault) {
-    counter!(
-        "tee_router_vault_cancel_requested_total",
-        "chain" => vault.deposit_asset.chain.as_str().to_string(),
-        "asset_kind" => asset_kind(&vault.deposit_asset.asset),
-        "status" => vault.status.to_db_string(),
-    )
-    .increment(1);
-}
-
-pub fn record_vault_cancel_failed(error: &VaultError) {
-    counter!(
-        "tee_router_vault_cancel_failed_total",
-        "error_kind" => vault_error_kind(error),
-    )
-    .increment(1);
-}
-
 pub fn record_vault_transition(
     vault: &DepositVault,
     from_status: DepositVaultStatus,
@@ -387,7 +369,6 @@ fn vault_error_kind(error: &VaultError) -> &'static str {
         VaultError::InvalidRecoveryAddress { .. } => "invalid_recovery_address",
         VaultError::InvalidMetadata { .. } => "invalid_metadata",
         VaultError::InvalidCancellationCommitment { .. } => "invalid_cancellation_commitment",
-        VaultError::InvalidCancellationSecret => "invalid_cancellation_secret",
         VaultError::RefundNotAllowed { .. } => "refund_not_allowed",
         VaultError::InvalidOrderBinding { .. } => "invalid_order_binding",
         VaultError::InvalidFundingAmount { .. } => "invalid_funding_amount",

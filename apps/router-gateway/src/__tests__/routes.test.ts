@@ -1,25 +1,6 @@
 import { describe, expect, test } from 'bun:test'
-import { privateKeyToAccount } from 'viem/accounts'
 
 import { MAX_GATEWAY_JSON_BODY_BYTES, createApp } from '../app'
-import {
-  RouterCancellationSecretBox,
-  hashRefundToken
-} from '../cancellations/crypto'
-import {
-  DEFAULT_REFUND_SIGNATURE_GATEWAY,
-  REFUND_EIP712_DOMAIN,
-  REFUND_EIP712_TYPES,
-  MAX_REFUND_SIGNATURE_DEADLINE_SECONDS,
-  RefundAuthorizationService,
-  refundEip712Domain
-} from '../cancellations/service'
-import type {
-  ClaimRefundAuthorizationExpectation,
-  RefundAuthorizationStore,
-  SaveRefundAuthorizationInput,
-  StoredRefundAuthorization
-} from '../cancellations/store'
 import type { GatewayConfig } from '../config'
 import { createDependencyHealthMonitor } from '../health'
 import type { FetchLike } from '../internal/router-client'
@@ -32,9 +13,6 @@ const TO_ADDRESS = '0x1111111111111111111111111111111111111111'
 const FROM_ADDRESS = 'bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh'
 const BTC_ADDRESS = 'bcrt1q2pfqp8a574jxyszmk0h5rxf02wwkpaf4hd8009'
 const ROUTER_GATEWAY_API_KEY = 'gateway-secret-00000000000000000'
-const REFUND_ACCOUNT = privateKeyToAccount(
-  '0x1000000000000000000000000000000000000000000000000000000000000001'
-)
 
 describe('router gateway routes', () => {
   test('serves OpenAPI 3.1 from the live route registry', async () => {
@@ -52,12 +30,11 @@ describe('router gateway routes', () => {
     expect(body.paths['/order/market']).toBeDefined()
     expect(body.paths['/order/limit']).toBeUndefined()
     expect(body.paths['/order/{orderId}']).toBeDefined()
-    expect(body.paths['/order/{orderId}/cancel']).toBeDefined()
+    expect(body.paths['/order/{orderId}/cancel']).toBeUndefined()
     expect(Object.keys(body.paths)).toEqual([
       '/quote',
       '/order/market',
       '/order/{orderId}',
-      '/order/{orderId}/cancel',
       '/health',
       '/providers'
     ])
@@ -82,8 +59,6 @@ describe('router gateway routes', () => {
       'refundAddress',
       'integrator',
       'idempotencyKey',
-      'refundMode',
-      'refundAuthorizer',
       'amountFormat'
     ])
     expect(body.components.schemas.OrderLimitRequest).toBeUndefined()
@@ -584,7 +559,7 @@ describe('router gateway routes', () => {
     expect(calls).toHaveLength(0)
   })
 
-  test('rejects market-order cancelAfter before routing upstream', async () => {
+  test('rejects unknown market-order fields before routing upstream', async () => {
     const calls: RecordedCall[] = []
     const app = createApp(testConfig(), {
       fetch: mockFetch(calls, async () => Response.json({ message: 'unexpected' }))
@@ -598,7 +573,6 @@ describe('router gateway routes', () => {
         idempotencyKey: IDEMPOTENCY_KEY,
         fromAddress: FROM_ADDRESS,
         toAddress: TO_ADDRESS,
-        refundAuthorizer: REFUND_ACCOUNT.address,
         cancelAfter: '2026-05-05T00:00:00.000Z'
       })
     })
@@ -619,8 +593,7 @@ describe('router gateway routes', () => {
       body: JSON.stringify({
         quoteId: QUOTE_ID,
         fromAddress: FROM_ADDRESS,
-        toAddress: TO_ADDRESS,
-        refundAuthorizer: REFUND_ACCOUNT.address
+        toAddress: TO_ADDRESS
       })
     })
 
@@ -641,8 +614,7 @@ describe('router gateway routes', () => {
         quoteId: QUOTE_ID,
         idempotencyKey: 'short-key',
         fromAddress: FROM_ADDRESS,
-        toAddress: TO_ADDRESS,
-        refundAuthorizer: REFUND_ACCOUNT.address
+        toAddress: TO_ADDRESS
       })
     })
 
@@ -663,8 +635,7 @@ describe('router gateway routes', () => {
         quoteId: QUOTE_ID,
         idempotencyKey: 'gateway key with spaces',
         fromAddress: FROM_ADDRESS,
-        toAddress: TO_ADDRESS,
-        refundAuthorizer: REFUND_ACCOUNT.address
+        toAddress: TO_ADDRESS
       })
     })
     const body = await response.json()
@@ -674,25 +645,6 @@ describe('router gateway routes', () => {
       'idempotencyKey must contain only letters, numbers, dot, underscore, colon, or hyphen'
     )
     expect(calls).toHaveLength(0)
-  })
-
-  test('rejects non-base64url refund tokens before resolving cancellation auth', async () => {
-    const app = createApp(testConfig(), {
-      fetch: mockFetch([], async () => Response.json({ message: 'unexpected' }))
-    })
-
-    const response = await app.request(`/order/${ORDER_ID}/cancel`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        refundToken: 'token with spaces',
-        amountFormat: 'raw'
-      })
-    })
-    const body = await response.json()
-
-    expect(response.status).toBe(400)
-    expect(body.error.message).toBe('refundToken must be base64url text')
   })
 
   test('rejects invalid EVM quote recipient addresses before routing upstream', async () => {
@@ -821,8 +773,6 @@ describe('router gateway routes', () => {
         fromAddress: '0x2222222222222222222222222222222222222222',
         toAddress: BTC_ADDRESS,
         refundAddress: 'not-an-evm-address',
-        refundMode: 'token',
-        refundAuthorizer: null,
         amountFormat: 'raw'
       })
     })
@@ -853,8 +803,6 @@ describe('router gateway routes', () => {
         idempotencyKey: IDEMPOTENCY_KEY,
         fromAddress: '0x2222222222222222222222222222222222222222',
         toAddress: TO_ADDRESS,
-        refundMode: 'token',
-        refundAuthorizer: null,
         amountFormat: 'raw'
       })
     })
@@ -890,8 +838,6 @@ describe('router gateway routes', () => {
         idempotencyKey: IDEMPOTENCY_KEY,
         fromAddress: TO_ADDRESS,
         toAddress: TO_ADDRESS,
-        refundMode: 'token',
-        refundAuthorizer: null,
         amountFormat: 'raw'
       })
     })
@@ -1067,9 +1013,6 @@ describe('router gateway routes', () => {
     const calls: RecordedCall[] = []
     const authorizations = new Map<string, string | null>()
     const app = createApp(testConfig(), {
-      refundAuthorizationService: testRefundAuthorizationService(
-        failingRefundAuthorizationStore()
-      ),
       fetch: mockFetch(calls, async (path, request) => {
         authorizations.set(
           `${request.method} ${path}`,
@@ -1088,8 +1031,8 @@ describe('router gateway routes', () => {
           return Response.json(internalOrder(), { status: 201 })
         }
 
-        if (path === `/api/v1/orders/${ORDER_ID}/cancellations`) {
-          return Response.json(internalOrder({ status: 'refunding' }))
+        if (path === `/api/v1/orders/${ORDER_ID}`) {
+          return Response.json(internalOrder())
         }
 
         return Response.json({ message: 'not found' }, { status: 404 })
@@ -1108,24 +1051,18 @@ describe('router gateway routes', () => {
       })
     })
 
-    const consoleError = console.error
-    console.error = () => undefined
-    try {
-      await app.request('/order/market', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          quoteId: QUOTE_ID,
-          idempotencyKey: IDEMPOTENCY_KEY,
-          fromAddress: FROM_ADDRESS,
-          toAddress: TO_ADDRESS,
-          refundMode: 'token',
-          refundAuthorizer: null
-        })
+    await app.request('/order/market', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        quoteId: QUOTE_ID,
+        idempotencyKey: IDEMPOTENCY_KEY,
+        fromAddress: FROM_ADDRESS,
+        toAddress: TO_ADDRESS
       })
-    } finally {
-      console.error = consoleError
-    }
+    })
+
+    await app.request(`/order/${ORDER_ID}`)
 
     const expectedAuthorization = `Bearer ${ROUTER_GATEWAY_API_KEY}`
     expect(authorizations.get('POST /api/v1/quotes')).toBe(expectedAuthorization)
@@ -1133,9 +1070,9 @@ describe('router gateway routes', () => {
       expectedAuthorization
     )
     expect(authorizations.get('POST /api/v1/orders')).toBe(expectedAuthorization)
-    expect(
-      authorizations.get(`POST /api/v1/orders/${ORDER_ID}/cancellations`)
-    ).toBe(expectedAuthorization)
+    expect(authorizations.get(`GET /api/v1/orders/${ORDER_ID}`)).toBe(
+      expectedAuthorization
+    )
   })
 
   test('rejects raw limit quote requests before calling the router API', async () => {
@@ -1166,9 +1103,7 @@ describe('router gateway routes', () => {
 
   test('creates a market order and defaults refundAddress to fromAddress', async () => {
     const calls: RecordedCall[] = []
-    const store = new InMemoryRefundAuthorizationStore()
     const app = createApp(testConfig(), {
-      refundAuthorizationService: testRefundAuthorizationService(store),
       fetch: mockFetch(calls, async (path) => {
         if (path === `/api/v1/quotes/${QUOTE_ID}`) {
           return Response.json(internalQuote())
@@ -1190,7 +1125,6 @@ describe('router gateway routes', () => {
         idempotencyKey: IDEMPOTENCY_KEY,
         fromAddress: FROM_ADDRESS,
         toAddress: TO_ADDRESS,
-        refundAuthorizer: REFUND_ACCOUNT.address,
         integrator: 'partner-a'
       })
     })
@@ -1215,23 +1149,13 @@ describe('router gateway routes', () => {
       orderId: ORDER_ID,
       orderAddress: 'bc1qorderaddress0000000000000000000000000',
       amountToSend: '1.25',
-      quoteId: QUOTE_ID,
-      refundMode: 'evmSignature',
-      refundAuthorizer: REFUND_ACCOUNT.address
+      quoteId: QUOTE_ID
     })
-    expect(body.cancellationSecret).toBeUndefined()
-
-    const stored = await store.findRefundAuthorization(ORDER_ID)
-    expect(stored?.refundMode).toBe('evmSignature')
-    expect(stored?.refundAuthorizer).toBe(REFUND_ACCOUNT.address)
   })
 
-  test('cancels the upstream order when refund authorization persistence fails', async () => {
+  test('forwards an explicit order refundAddress to the internal router API', async () => {
     const calls: RecordedCall[] = []
     const app = createApp(testConfig(), {
-      refundAuthorizationService: testRefundAuthorizationService(
-        failingRefundAuthorizationStore()
-      ),
       fetch: mockFetch(calls, async (path) => {
         if (path === `/api/v1/quotes/${QUOTE_ID}`) {
           return Response.json(internalQuote())
@@ -1241,51 +1165,31 @@ describe('router gateway routes', () => {
           return Response.json(internalOrder(), { status: 201 })
         }
 
-        if (path === `/api/v1/orders/${ORDER_ID}/cancellations`) {
-          return Response.json(internalOrder({ status: 'refunding' }))
-        }
-
         return Response.json({ message: 'not found' }, { status: 404 })
       })
     })
-    const consoleError = console.error
-    console.error = () => undefined
 
-    try {
-      const response = await app.request('/order/market', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          quoteId: QUOTE_ID,
-          idempotencyKey: IDEMPOTENCY_KEY,
-          fromAddress: FROM_ADDRESS,
-          toAddress: TO_ADDRESS,
-          refundMode: 'token',
-          refundAuthorizer: null
-        })
+    const response = await app.request('/order/market', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        quoteId: QUOTE_ID,
+        idempotencyKey: IDEMPOTENCY_KEY,
+        fromAddress: FROM_ADDRESS,
+        toAddress: TO_ADDRESS,
+        refundAddress: BTC_ADDRESS
       })
-      const body = await response.json()
+    })
 
-      expect(response.status).toBe(500)
-      expect(body.error.message).toBe('Unexpected gateway error')
-      expect(calls.at(-1)).toEqual({
-        method: 'POST',
-        path: `/api/v1/orders/${ORDER_ID}/cancellations`,
-        body: {
-          cancellation_secret:
-            '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
-        }
-      })
-    } finally {
-      console.error = consoleError
-    }
+    expect(response.status).toBe(201)
+    expect(calls[1]?.body).toMatchObject({
+      refund_address: BTC_ADDRESS
+    })
   })
 
-  test('cancels the upstream order when the created order response is malformed', async () => {
+  test('reports malformed created order responses as upstream errors', async () => {
     const calls: RecordedCall[] = []
-    const store = new InMemoryRefundAuthorizationStore()
     const app = createApp(testConfig(), {
-      refundAuthorizationService: testRefundAuthorizationService(store),
       fetch: mockFetch(calls, async (path) => {
         if (path === `/api/v1/quotes/${QUOTE_ID}`) {
           return Response.json(internalQuote())
@@ -1297,10 +1201,6 @@ describe('router gateway routes', () => {
           return Response.json(order, { status: 201 })
         }
 
-        if (path === `/api/v1/orders/${ORDER_ID}/cancellations`) {
-          return Response.json(internalOrder({ status: 'refunding' }))
-        }
-
         return Response.json({ message: 'not found' }, { status: 404 })
       })
     })
@@ -1312,9 +1212,7 @@ describe('router gateway routes', () => {
         quoteId: QUOTE_ID,
         idempotencyKey: IDEMPOTENCY_KEY,
         fromAddress: FROM_ADDRESS,
-        toAddress: TO_ADDRESS,
-        refundMode: 'token',
-        refundAuthorizer: null
+        toAddress: TO_ADDRESS
       })
     })
     const body = await response.json()
@@ -1323,34 +1221,13 @@ describe('router gateway routes', () => {
     expect(body.error.message).toBe(
       'internal router API returned malformed order response'
     )
-    expect(calls.at(-1)).toEqual({
-      method: 'POST',
-      path: `/api/v1/orders/${ORDER_ID}/cancellations`,
-      body: {
-        cancellation_secret:
-          '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
-      }
-    })
-    await expect(store.findRefundAuthorization(ORDER_ID)).resolves.toBeUndefined()
   })
 
-  test('rejects malformed created order amounts even when public response uses raw amounts', async () => {
+  test('fetches an order by id with the market response shape', async () => {
     const calls: RecordedCall[] = []
-    const store = new InMemoryRefundAuthorizationStore()
     const app = createApp(testConfig(), {
-      refundAuthorizationService: testRefundAuthorizationService(store),
       fetch: mockFetch(calls, async (path) => {
-        if (path === `/api/v1/quotes/${QUOTE_ID}`) {
-          return Response.json(internalQuote())
-        }
-
-        if (path === '/api/v1/orders') {
-          const order = internalOrder()
-          order.quote.payload.amount_in = 'not-a-raw-amount'
-          return Response.json(order, { status: 201 })
-        }
-
-        if (path === `/api/v1/orders/${ORDER_ID}/cancellations`) {
+        if (path === `/api/v1/orders/${ORDER_ID}`) {
           return Response.json(internalOrder({ status: 'refunding' }))
         }
 
@@ -1358,129 +1235,49 @@ describe('router gateway routes', () => {
       })
     })
 
-    const response = await app.request('/order/market', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        quoteId: QUOTE_ID,
-        idempotencyKey: IDEMPOTENCY_KEY,
-        fromAddress: FROM_ADDRESS,
-        toAddress: TO_ADDRESS,
-        refundMode: 'token',
-        refundAuthorizer: null,
-        amountFormat: 'raw'
-      })
-    })
+    const response = await app.request(`/order/${ORDER_ID}`)
     const body = await response.json()
 
-    expect(response.status).toBe(502)
-    expect(body.error.message).toBe(
-      'internal router API returned malformed order response'
-    )
-    expect(calls.at(-1)?.path).toBe(`/api/v1/orders/${ORDER_ID}/cancellations`)
-    await expect(store.findRefundAuthorization(ORDER_ID)).resolves.toBeUndefined()
+    expect(response.status).toBe(200)
+    expect(calls[0]?.method).toBe('GET')
+    expect(calls[0]?.path).toBe(`/api/v1/orders/${ORDER_ID}`)
+    expect(body).toMatchObject({
+      orderId: ORDER_ID,
+      status: 'refund_pending',
+      quoteId: QUOTE_ID,
+      orderType: 'market_order'
+    })
   })
 
-  test('cancels the upstream order when the created order has zero display amounts', async () => {
+  test('fetches a limit order by id with the limit response shape', async () => {
     const calls: RecordedCall[] = []
-    const store = new InMemoryRefundAuthorizationStore()
     const app = createApp(testConfig(), {
-      refundAuthorizationService: testRefundAuthorizationService(store),
       fetch: mockFetch(calls, async (path) => {
-        if (path === `/api/v1/quotes/${QUOTE_ID}`) {
-          return Response.json(internalQuote())
-        }
-
-        if (path === '/api/v1/orders') {
-          const order = internalOrder()
-          order.quote.payload.estimated_amount_out = '0'
-          return Response.json(order, { status: 201 })
-        }
-
-        if (path === `/api/v1/orders/${ORDER_ID}/cancellations`) {
-          return Response.json(internalOrder({ status: 'refunding' }))
+        if (path === `/api/v1/orders/${ORDER_ID}`) {
+          return Response.json(internalLimitOrder({ status: 'refunding' }))
         }
 
         return Response.json({ message: 'not found' }, { status: 404 })
       })
     })
 
-    const response = await app.request('/order/market', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        quoteId: QUOTE_ID,
-        idempotencyKey: IDEMPOTENCY_KEY,
-        fromAddress: FROM_ADDRESS,
-        toAddress: TO_ADDRESS,
-        refundMode: 'token',
-        refundAuthorizer: null
-      })
-    })
+    const response = await app.request(`/order/${ORDER_ID}`)
     const body = await response.json()
 
-    expect(response.status).toBe(502)
-    expect(body.error.code).toBe('UPSTREAM_ERROR')
-    expect(body.error.message).toBe(
-      'internal router API returned malformed order response'
-    )
-    expect(calls.at(-1)).toEqual({
-      method: 'POST',
-      path: `/api/v1/orders/${ORDER_ID}/cancellations`,
-      body: {
-        cancellation_secret:
-          '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
-      }
+    expect(response.status).toBe(200)
+    expect(body).toMatchObject({
+      orderId: ORDER_ID,
+      status: 'refund_pending',
+      quoteId: LIMIT_QUOTE_ID,
+      from: 'Bitcoin.BTC',
+      to: 'Ethereum.USDC',
+      outputAmount: '100000'
     })
-    await expect(store.findRefundAuthorization(ORDER_ID)).resolves.toBeUndefined()
-  })
-
-  test('rejects create-order responses that omit the cancellation secret as upstream errors', async () => {
-    const calls: RecordedCall[] = []
-    const store = new InMemoryRefundAuthorizationStore()
-    const app = createApp(testConfig(), {
-      refundAuthorizationService: testRefundAuthorizationService(store),
-      fetch: mockFetch(calls, async (path) => {
-        if (path === `/api/v1/quotes/${QUOTE_ID}`) {
-          return Response.json(internalQuote())
-        }
-
-        if (path === '/api/v1/orders') {
-          const order = internalOrder()
-          delete (order as { cancellation_secret?: string }).cancellation_secret
-          return Response.json(order, { status: 201 })
-        }
-
-        return Response.json({ message: 'not found' }, { status: 404 })
-      })
-    })
-
-    const response = await app.request('/order/market', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        quoteId: QUOTE_ID,
-        idempotencyKey: IDEMPOTENCY_KEY,
-        fromAddress: FROM_ADDRESS,
-        toAddress: TO_ADDRESS,
-        refundMode: 'token',
-        refundAuthorizer: null
-      })
-    })
-    const body = await response.json()
-
-    expect(response.status).toBe(502)
-    expect(body.error.message).toBe(
-      'internal router API returned order response without cancellation secret'
-    )
-    await expect(store.findRefundAuthorization(ORDER_ID)).resolves.toBeUndefined()
   })
 
   test('rejects creating an order from a limit quote', async () => {
     const calls: RecordedCall[] = []
-    const store = new InMemoryRefundAuthorizationStore()
     const app = createApp(testConfig(), {
-      refundAuthorizationService: testRefundAuthorizationService(store),
       fetch: mockFetch(calls, async (path) => {
         if (path === `/api/v1/quotes/${LIMIT_QUOTE_ID}`) {
           return Response.json(internalLimitQuote())
@@ -1502,8 +1299,6 @@ describe('router gateway routes', () => {
         idempotencyKey: IDEMPOTENCY_KEY,
         fromAddress: FROM_ADDRESS,
         toAddress: TO_ADDRESS,
-        refundMode: 'token',
-        refundAuthorizer: null,
         integrator: 'limit-loadgen',
         amountFormat: 'raw'
       })
@@ -1519,9 +1314,7 @@ describe('router gateway routes', () => {
 
   test('does not register the limit order endpoint', async () => {
     const calls: RecordedCall[] = []
-    const store = new InMemoryRefundAuthorizationStore()
     const app = createApp(testConfig(), {
-      refundAuthorizationService: testRefundAuthorizationService(store),
       fetch: mockFetch(calls, async (path) => {
         if (path === '/api/v1/quotes') {
           return Response.json(internalLimitQuote(), { status: 201 })
@@ -1545,7 +1338,6 @@ describe('router gateway routes', () => {
         toAddress: TO_ADDRESS,
         fromAmount: '1.25',
         toAmount: '100000',
-        refundAuthorizer: REFUND_ACCOUNT.address,
         integrator: 'partner-a',
         idempotencyKey: IDEMPOTENCY_KEY
       })
@@ -1554,1006 +1346,12 @@ describe('router gateway routes', () => {
     expect(response.status).toBe(404)
     expect(calls).toHaveLength(0)
   })
-
-  test('does not register limit orders with derived output amounts', async () => {
-    const calls: RecordedCall[] = []
-    const app = createApp(testConfig(), {
-      refundAuthorizationService: testRefundAuthorizationService(
-        new InMemoryRefundAuthorizationStore()
-      ),
-      fetch: mockFetch(calls, async (path) => {
-        if (path === '/api/v1/quotes') {
-          return Response.json(internalLimitQuote(), { status: 201 })
-        }
-
-        if (path === '/api/v1/orders') {
-          return Response.json(internalLimitOrder(), { status: 201 })
-        }
-
-        return Response.json({ message: 'not found' }, { status: 404 })
-      })
-    })
-
-    const response = await app.request('/order/limit', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        from: 'Bitcoin.BTC',
-        to: 'Ethereum.USDC',
-        fromAddress: FROM_ADDRESS,
-        toAddress: TO_ADDRESS,
-        fromAmount: '2',
-        price: '100000',
-        refundAuthorizer: REFUND_ACCOUNT.address,
-        idempotencyKey: IDEMPOTENCY_KEY
-      })
-    })
-
-    expect(response.status).toBe(404)
-    expect(calls).toHaveLength(0)
-  })
-
-  test('does not register limit orders with derived input amounts', async () => {
-    const calls: RecordedCall[] = []
-    const app = createApp(testConfig(), {
-      refundAuthorizationService: testRefundAuthorizationService(
-        new InMemoryRefundAuthorizationStore()
-      ),
-      fetch: mockFetch(calls, async (path) => {
-        if (path === '/api/v1/quotes') {
-          return Response.json(internalLimitQuote(), { status: 201 })
-        }
-
-        if (path === '/api/v1/orders') {
-          return Response.json(internalLimitOrder(), { status: 201 })
-        }
-
-        return Response.json({ message: 'not found' }, { status: 404 })
-      })
-    })
-
-    const response = await app.request('/order/limit', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        from: 'Bitcoin.BTC',
-        to: 'Ethereum.USDC',
-        fromAddress: FROM_ADDRESS,
-        toAddress: TO_ADDRESS,
-        toAmount: '200000',
-        price: '100000',
-        refundAuthorizer: REFUND_ACCOUNT.address,
-        idempotencyKey: IDEMPOTENCY_KEY
-      })
-    })
-
-    expect(response.status).toBe(404)
-    expect(calls).toHaveLength(0)
-  })
-
-  test('does not register limit orders with invalid amount shapes', async () => {
-    const calls: RecordedCall[] = []
-    const app = createApp(testConfig(), {
-      fetch: mockFetch(calls, async () =>
-        Response.json({ message: 'unexpected' }, { status: 500 })
-      )
-    })
-
-    const response = await app.request('/order/limit', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        from: 'Bitcoin.BTC',
-        to: 'Ethereum.USDC',
-        fromAddress: FROM_ADDRESS,
-        toAddress: TO_ADDRESS,
-        fromAmount: 1.25,
-        toAmount: '100000',
-        refundAuthorizer: REFUND_ACCOUNT.address,
-        idempotencyKey: IDEMPOTENCY_KEY
-      })
-    })
-
-    expect(response.status).toBe(404)
-    expect(calls).toHaveLength(0)
-  })
-
-  test('stores cancellation secrets and returns a refund token in token mode', async () => {
-    const calls: RecordedCall[] = []
-    const store = new InMemoryRefundAuthorizationStore()
-    const app = createApp(testConfig(), {
-      refundAuthorizationService: testRefundAuthorizationService(store),
-      fetch: mockFetch(calls, async (path) => {
-        if (path === `/api/v1/quotes/${QUOTE_ID}`) {
-          return Response.json(internalQuote())
-        }
-
-        if (path === '/api/v1/orders') {
-          return Response.json(internalOrder(), { status: 201 })
-        }
-
-        if (path === `/api/v1/orders/${ORDER_ID}/cancellations`) {
-          return Response.json(internalOrder({ status: 'refunding' }))
-        }
-
-        return Response.json({ message: 'not found' }, { status: 404 })
-      })
-    })
-
-    const orderResponse = await app.request('/order/market', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        quoteId: QUOTE_ID,
-        idempotencyKey: IDEMPOTENCY_KEY,
-        fromAddress: FROM_ADDRESS,
-        toAddress: TO_ADDRESS,
-        refundMode: 'token',
-        refundAuthorizer: null
-      })
-    })
-    const orderBody = await orderResponse.json()
-
-    expect(orderResponse.status).toBe(201)
-    expect(orderBody.refundMode).toBe('token')
-    expect(orderBody.refundAuthorizer).toBeNull()
-    expect(orderBody.refundToken.startsWith('rgt_')).toBe(true)
-    expect(orderBody.cancellationSecret).toBeUndefined()
-
-    const stored = await store.findRefundAuthorization(ORDER_ID)
-    expect(stored?.encryptedCancellationSecret.startsWith('v2:')).toBe(true)
-    expect(stored?.encryptedCancellationSecret).not.toContain(
-      '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
-    )
-
-    const cancelResponse = await app.request(`/order/${ORDER_ID}/cancel`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        refundToken: orderBody.refundToken
-      })
-    })
-
-    expect(cancelResponse.status).toBe(200)
-    const cancelBody = await cancelResponse.json()
-    expect(cancelBody.cancellationSecret).toBeUndefined()
-    expect(calls.at(-1)?.body).toEqual({
-      cancellation_secret:
-        '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
-    })
-    expect(
-      (await store.findRefundAuthorization(ORDER_ID))?.cancellationRequestedAt
-    ).toBeDefined()
-
-    const callsAfterFirstCancellation = calls.length
-    const replayResponse = await app.request(`/order/${ORDER_ID}/cancel`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        refundToken: orderBody.refundToken
-      })
-    })
-    const replayBody = await replayResponse.json()
-
-    expect(replayResponse.status).toBe(401)
-    expect(replayBody.error.message).toBe('refund authorization already used')
-    expect(calls).toHaveLength(callsAfterFirstCancellation)
-
-    const callsBeforeCreateRetry = calls.length
-    const createRetryResponse = await app.request('/order/market', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        quoteId: QUOTE_ID,
-        idempotencyKey: IDEMPOTENCY_KEY,
-        fromAddress: FROM_ADDRESS,
-        toAddress: TO_ADDRESS,
-        refundMode: 'token',
-        refundAuthorizer: null
-      })
-    })
-    const createRetryBody = await createRetryResponse.json()
-    expect(createRetryResponse.status).toBe(409)
-    expect(createRetryBody.error.message).toBe(
-      'refund authorization already used or in progress'
-    )
-    expect(calls).toHaveLength(callsBeforeCreateRetry + 2)
-    expect(calls.at(-2)?.path).toBe(`/api/v1/quotes/${QUOTE_ID}`)
-    expect(calls.at(-1)?.path).toBe('/api/v1/orders')
-  })
-
-  test('returns the same refund token on create-order retries before cancellation', async () => {
-    const calls: RecordedCall[] = []
-    const store = new InMemoryRefundAuthorizationStore()
-    const app = createApp(testConfig(), {
-      refundAuthorizationService: testRefundAuthorizationService(store),
-      fetch: mockFetch(calls, async (path) => {
-        if (path === `/api/v1/quotes/${QUOTE_ID}`) {
-          return Response.json(internalQuote())
-        }
-
-        if (path === '/api/v1/orders') {
-          return Response.json(internalOrder(), { status: 201 })
-        }
-
-        if (path === `/api/v1/orders/${ORDER_ID}/cancellations`) {
-          return Response.json(internalOrder({ status: 'refunding' }))
-        }
-
-        return Response.json({ message: 'not found' }, { status: 404 })
-      })
-    })
-
-    const createBody = {
-      quoteId: QUOTE_ID,
-      idempotencyKey: IDEMPOTENCY_KEY,
-      fromAddress: FROM_ADDRESS,
-      toAddress: TO_ADDRESS,
-      refundMode: 'token',
-      refundAuthorizer: null
-    }
-    const firstResponse = await app.request('/order/market', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(createBody)
-    })
-    const firstBody = await firstResponse.json()
-    expect(firstResponse.status).toBe(201)
-    expect(firstBody.refundToken.startsWith('rgt_')).toBe(true)
-
-    const retryResponse = await app.request('/order/market', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(createBody)
-    })
-    const retryBody = await retryResponse.json()
-    expect(retryResponse.status).toBe(201)
-    expect(retryBody.refundToken).toBe(firstBody.refundToken)
-    expect(retryBody.orderId).toBe(ORDER_ID)
-
-    const cancelResponse = await app.request(`/order/${ORDER_ID}/cancel`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        refundToken: retryBody.refundToken
-      })
-    })
-    expect(cancelResponse.status).toBe(200)
-    expect(
-      (await store.findRefundAuthorization(ORDER_ID))?.cancellationRequestedAt
-    ).toBeDefined()
-    expect(calls.at(-1)?.path).toBe(`/api/v1/orders/${ORDER_ID}/cancellations`)
-  })
-
-  test('keeps evm-signature refund authorization idempotent on create-order retries before cancellation', async () => {
-    const calls: RecordedCall[] = []
-    const store = new InMemoryRefundAuthorizationStore()
-    const app = createApp(testConfig(), {
-      refundAuthorizationService: testRefundAuthorizationService(store),
-      fetch: mockFetch(calls, async (path) => {
-        if (path === `/api/v1/quotes/${QUOTE_ID}`) {
-          return Response.json(internalQuote())
-        }
-
-        if (path === '/api/v1/orders') {
-          return Response.json(internalOrder(), { status: 201 })
-        }
-
-        return Response.json({ message: 'not found' }, { status: 404 })
-      })
-    })
-
-    const createBody = {
-      quoteId: QUOTE_ID,
-      idempotencyKey: IDEMPOTENCY_KEY,
-      fromAddress: FROM_ADDRESS,
-      toAddress: TO_ADDRESS,
-      refundMode: 'evmSignature',
-      refundAuthorizer: REFUND_ACCOUNT.address
-    }
-    const firstResponse = await app.request('/order/market', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(createBody)
-    })
-    const firstBody = await firstResponse.json()
-    expect(firstResponse.status).toBe(201)
-    expect(firstBody.refundAuthorizer).toBe(REFUND_ACCOUNT.address)
-    expect(firstBody.refundToken).toBeUndefined()
-
-    const retryResponse = await app.request('/order/market', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(createBody)
-    })
-    const retryBody = await retryResponse.json()
-
-    expect(retryResponse.status).toBe(201)
-    expect(retryBody.orderId).toBe(ORDER_ID)
-    expect(retryBody.refundAuthorizer).toBe(REFUND_ACCOUNT.address)
-    expect(retryBody.refundToken).toBeUndefined()
-  })
-
-  test('does not consume refund authorization when upstream cancellation fails', async () => {
-    const calls: RecordedCall[] = []
-    const store = new InMemoryRefundAuthorizationStore()
-    const app = createApp(testConfig(), {
-      refundAuthorizationService: testRefundAuthorizationService(store),
-      fetch: mockFetch(calls, async (path) => {
-        if (path === `/api/v1/quotes/${QUOTE_ID}`) {
-          return Response.json(internalQuote())
-        }
-
-        if (path === '/api/v1/orders') {
-          return Response.json(internalOrder(), { status: 201 })
-        }
-
-        if (path === `/api/v1/orders/${ORDER_ID}/cancellations`) {
-          return Response.json({ message: 'router unavailable' }, { status: 500 })
-        }
-
-        return Response.json({ message: 'not found' }, { status: 404 })
-      })
-    })
-
-    const orderResponse = await app.request('/order/market', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        quoteId: QUOTE_ID,
-        idempotencyKey: IDEMPOTENCY_KEY,
-        fromAddress: FROM_ADDRESS,
-        toAddress: TO_ADDRESS,
-        refundMode: 'token',
-        refundAuthorizer: null
-      })
-    })
-    const orderBody = await orderResponse.json()
-
-    const cancelResponse = await app.request(`/order/${ORDER_ID}/cancel`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        refundToken: orderBody.refundToken
-      })
-    })
-
-    expect(cancelResponse.status).toBe(502)
-    expect(
-      (await store.findRefundAuthorization(ORDER_ID))?.cancellationRequestedAt
-    ).toBeUndefined()
-  })
-
-  test('classifies malformed upstream cancellation responses as upstream errors', async () => {
-    const calls: RecordedCall[] = []
-    const store = new InMemoryRefundAuthorizationStore()
-    const app = createApp(testConfig(), {
-      refundAuthorizationService: testRefundAuthorizationService(store),
-      fetch: mockFetch(calls, async (path) => {
-        if (path === `/api/v1/quotes/${QUOTE_ID}`) {
-          return Response.json(internalQuote())
-        }
-
-        if (path === '/api/v1/orders') {
-          return Response.json(internalOrder(), { status: 201 })
-        }
-
-        if (path === `/api/v1/orders/${ORDER_ID}/cancellations`) {
-          const order = internalOrder({ status: 'refunding' })
-          order.quote.payload.estimated_amount_out = '0'
-          return Response.json(order)
-        }
-
-        return Response.json({ message: 'not found' }, { status: 404 })
-      })
-    })
-
-    const orderResponse = await app.request('/order/market', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        quoteId: QUOTE_ID,
-        idempotencyKey: IDEMPOTENCY_KEY,
-        fromAddress: FROM_ADDRESS,
-        toAddress: TO_ADDRESS,
-        refundMode: 'token',
-        refundAuthorizer: null
-      })
-    })
-    const orderBody = await orderResponse.json()
-
-    const cancelResponse = await app.request(`/order/${ORDER_ID}/cancel`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        refundToken: orderBody.refundToken
-      })
-    })
-    const cancelBody = await cancelResponse.json()
-
-    expect(cancelResponse.status).toBe(502)
-    expect(cancelBody.error.code).toBe('UPSTREAM_ERROR')
-    expect(cancelBody.error.message).toBe(
-      'internal router API returned malformed order response'
-    )
-    expect(calls.at(-1)?.path).toBe(`/api/v1/orders/${ORDER_ID}/cancellations`)
-    expect(
-      (await store.findRefundAuthorization(ORDER_ID))?.cancellationRequestedAt
-    ).toBeDefined()
-  })
-
-  test('rejects stale token claims if refund authorization changes before claim', async () => {
-    const store = new InMemoryRefundAuthorizationStore()
-    const service = new RefundAuthorizationService(
-      {
-        saveRefundAuthorization: (...args) => store.saveRefundAuthorization(...args),
-        findRefundAuthorization: (...args) => store.findRefundAuthorization(...args),
-        claimCancellationAttempt: async () => false,
-        releaseCancellationAttempt: (...args) =>
-          store.releaseCancellationAttempt(...args),
-        markCancellationRequested: (...args) =>
-          store.markCancellationRequested(...args)
-      },
-      new RouterCancellationSecretBox(Buffer.alloc(32, 7))
-    )
-
-    const authorization = await service.createRefundAuthorization({
-      routerOrderId: ORDER_ID,
-      cancellationSecret:
-        '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-      refundMode: 'token',
-      refundAuthorizer: null
-    })
-
-    await expect(
-      service.resolveTokenCancellationSecret(
-        ORDER_ID,
-        authorization.refundToken as string
-      )
-    ).rejects.toThrow('refund authorization already used or in progress')
-  })
-
-  test('does not claim refund authorization when stored cancellation secret cannot decrypt', async () => {
-    const refundToken = 'rgt_test-token'
-    let claimCalled = false
-    const service = new RefundAuthorizationService(
-      {
-        saveRefundAuthorization: async (input) => ({
-          routerOrderId: input.routerOrderId,
-          refundMode: input.refundMode,
-          refundAuthorizer: input.refundAuthorizer,
-          encryptedCancellationSecret: input.encryptedCancellationSecret,
-          cancellationSecretHash: input.cancellationSecretHash,
-          ...(input.refundTokenHash ? { refundTokenHash: input.refundTokenHash } : {}),
-          ...(input.encryptedRefundToken
-            ? { encryptedRefundToken: input.encryptedRefundToken }
-            : {}),
-          createdAt: '2026-05-04T00:00:00.000Z',
-          updatedAt: '2026-05-04T00:00:00.000Z'
-        }),
-        findRefundAuthorization: async () => ({
-          routerOrderId: ORDER_ID,
-          refundMode: 'token',
-          refundAuthorizer: null,
-          encryptedCancellationSecret: 'v2:bad:bad:bad',
-          cancellationSecretHash:
-            'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-          refundTokenHash: hashRefundToken(refundToken),
-          createdAt: '2026-05-04T00:00:00.000Z',
-          updatedAt: '2026-05-04T00:00:00.000Z'
-        }),
-        claimCancellationAttempt: async () => {
-          claimCalled = true
-          return true
-        },
-        releaseCancellationAttempt: async () => undefined,
-        markCancellationRequested: async () => false
-      },
-      new RouterCancellationSecretBox(Buffer.alloc(32, 7))
-    )
-
-    await expect(
-      service.resolveTokenCancellationSecret(ORDER_ID, refundToken)
-    ).rejects.toThrow('invalid encrypted cancellation secret iv')
-    expect(claimCalled).toBe(false)
-  })
-
-  test('allows only one in-flight refund cancellation attempt per order', async () => {
-    const calls: RecordedCall[] = []
-    const store = new InMemoryRefundAuthorizationStore()
-    const releaseCancellation = deferred<Response>()
-    let cancellationCalls = 0
-    const app = createApp(testConfig(), {
-      refundAuthorizationService: testRefundAuthorizationService(store),
-      fetch: mockFetch(calls, async (path) => {
-        if (path === `/api/v1/quotes/${QUOTE_ID}`) {
-          return Response.json(internalQuote())
-        }
-
-        if (path === '/api/v1/orders') {
-          return Response.json(internalOrder(), { status: 201 })
-        }
-
-        if (path === `/api/v1/orders/${ORDER_ID}/cancellations`) {
-          cancellationCalls += 1
-          if (cancellationCalls > 1) {
-            return Response.json(internalOrder({ status: 'refunding' }))
-          }
-          return releaseCancellation.promise
-        }
-
-        return Response.json({ message: 'not found' }, { status: 404 })
-      })
-    })
-
-    const orderResponse = await app.request('/order/market', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        quoteId: QUOTE_ID,
-        idempotencyKey: IDEMPOTENCY_KEY,
-        fromAddress: FROM_ADDRESS,
-        toAddress: TO_ADDRESS,
-        refundMode: 'token',
-        refundAuthorizer: null
-      })
-    })
-    const orderBody = await orderResponse.json()
-
-    const firstCancellation = app.request(`/order/${ORDER_ID}/cancel`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        refundToken: orderBody.refundToken
-      })
-    })
-    await eventually(() => {
-      expect(cancellationCalls).toBe(1)
-    })
-
-    const callsBeforeRetry = calls.length
-    const retriedOrderResponse = await app.request('/order/market', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        quoteId: QUOTE_ID,
-        idempotencyKey: IDEMPOTENCY_KEY,
-        fromAddress: FROM_ADDRESS,
-        toAddress: TO_ADDRESS,
-        refundMode: 'token',
-        refundAuthorizer: null
-      })
-    })
-    const retriedOrderBody = await retriedOrderResponse.json()
-    expect(retriedOrderResponse.status).toBe(409)
-    expect(retriedOrderBody.error.message).toBe(
-      'refund authorization already used or in progress'
-    )
-    expect(calls).toHaveLength(callsBeforeRetry + 2)
-    expect(calls.at(-2)?.path).toBe(`/api/v1/quotes/${QUOTE_ID}`)
-    expect(calls.at(-1)?.path).toBe('/api/v1/orders')
-
-    const secondCancellation = await app.request(`/order/${ORDER_ID}/cancel`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        refundToken: orderBody.refundToken
-      })
-    })
-    const secondBody = await secondCancellation.json()
-
-    expect(secondCancellation.status).toBe(401)
-    expect(secondBody.error.message).toBe(
-      'refund authorization already used or in progress'
-    )
-    expect(cancellationCalls).toBe(1)
-
-    releaseCancellation.resolve(Response.json(internalOrder({ status: 'refunding' })))
-    expect((await firstCancellation).status).toBe(200)
-    expect(
-      (await store.findRefundAuthorization(ORDER_ID))?.cancellationRequestedAt
-    ).toBeDefined()
-  })
-
-  test('cancels token-authorized limit orders with the limit response shape', async () => {
-    const calls: RecordedCall[] = []
-    const store = new InMemoryRefundAuthorizationStore()
-    const refundAuthorizationService = testRefundAuthorizationService(store)
-    const app = createApp(testConfig(), {
-      refundAuthorizationService,
-      fetch: mockFetch(calls, async (path) => {
-        if (path === `/api/v1/orders/${ORDER_ID}/cancellations`) {
-          return Response.json(internalLimitOrder({ status: 'refunding' }))
-        }
-
-        return Response.json({ message: 'not found' }, { status: 404 })
-      })
-    })
-
-    const authorization = await refundAuthorizationService.createRefundAuthorization({
-      routerOrderId: ORDER_ID,
-      cancellationSecret:
-        '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-      refundMode: 'token',
-      refundAuthorizer: null
-    })
-
-    const cancelResponse = await app.request(`/order/${ORDER_ID}/cancel`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        refundToken: authorization.refundToken as string
-      })
-    })
-    const cancelBody = await cancelResponse.json()
-
-    expect(cancelResponse.status).toBe(200)
-    expect(cancelBody).toMatchObject({
-      orderId: ORDER_ID,
-      status: 'refund_pending',
-      quoteId: LIMIT_QUOTE_ID,
-      orderType: 'limit_order',
-      estimatedOut: '100000',
-    })
-  })
-
-  test('verifies EIP-712 refund signatures before forwarding cancellation', async () => {
-    const calls: RecordedCall[] = []
-    const store = new InMemoryRefundAuthorizationStore()
-    const app = createApp(testConfig(), {
-      refundAuthorizationService: testRefundAuthorizationService(store),
-      fetch: mockFetch(calls, async (path) => {
-        if (path === `/api/v1/quotes/${QUOTE_ID}`) {
-          return Response.json(internalQuote())
-        }
-
-        if (path === '/api/v1/orders') {
-          return Response.json(internalOrder(), { status: 201 })
-        }
-
-        if (path === `/api/v1/orders/${ORDER_ID}/cancellations`) {
-          return Response.json(internalOrder({ status: 'refunding' }))
-        }
-
-        return Response.json({ message: 'not found' }, { status: 404 })
-      })
-    })
-
-    const orderResponse = await app.request('/order/market', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        quoteId: QUOTE_ID,
-        idempotencyKey: IDEMPOTENCY_KEY,
-        fromAddress: FROM_ADDRESS,
-        toAddress: TO_ADDRESS,
-        refundMode: 'evmSignature',
-        refundAuthorizer: REFUND_ACCOUNT.address
-      })
-    })
-    expect(orderResponse.status).toBe(201)
-
-    const refundSignatureDeadline = Math.floor(Date.now() / 1000) + 600
-    const refundSignature = await REFUND_ACCOUNT.signTypedData({
-      domain: REFUND_EIP712_DOMAIN,
-      types: REFUND_EIP712_TYPES,
-      primaryType: 'CancelOrder',
-      message: {
-        orderId: ORDER_ID,
-        gateway: DEFAULT_REFUND_SIGNATURE_GATEWAY,
-        deadline: BigInt(refundSignatureDeadline)
-      }
-    })
-
-    const response = await app.request(`/order/${ORDER_ID}/cancel`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        refundSignature,
-        refundSignatureDeadline
-      })
-    })
-
-    expect(response.status).toBe(200)
-    expect(calls.at(-1)?.method).toBe('POST')
-    expect(calls.at(-1)?.path).toBe(`/api/v1/orders/${ORDER_ID}/cancellations`)
-    expect(calls.at(-1)?.body).toEqual({
-      cancellation_secret:
-        '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
-    })
-
-    const body = await response.json()
-    expect(body.status).toBe('refund_pending')
-  })
-
-  test('rejects EIP-712 refund signatures with excessive future deadlines', async () => {
-    const calls: RecordedCall[] = []
-    const store = new InMemoryRefundAuthorizationStore()
-    const app = createApp(testConfig(), {
-      refundAuthorizationService: testRefundAuthorizationService(store),
-      fetch: mockFetch(calls, async (path) => {
-        if (path === `/api/v1/quotes/${QUOTE_ID}`) {
-          return Response.json(internalQuote())
-        }
-
-        if (path === '/api/v1/orders') {
-          return Response.json(internalOrder(), { status: 201 })
-        }
-
-        if (path === `/api/v1/orders/${ORDER_ID}/cancellations`) {
-          return Response.json(internalOrder({ status: 'refunding' }))
-        }
-
-        return Response.json({ message: 'not found' }, { status: 404 })
-      })
-    })
-
-    const orderResponse = await app.request('/order/market', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        quoteId: QUOTE_ID,
-        idempotencyKey: IDEMPOTENCY_KEY,
-        fromAddress: FROM_ADDRESS,
-        toAddress: TO_ADDRESS,
-        refundMode: 'evmSignature',
-        refundAuthorizer: REFUND_ACCOUNT.address
-      })
-    })
-    expect(orderResponse.status).toBe(201)
-
-    const callsBeforeCancel = calls.length
-    const refundSignatureDeadline =
-      Math.floor(Date.now() / 1000) + MAX_REFUND_SIGNATURE_DEADLINE_SECONDS + 1
-    const refundSignature = await REFUND_ACCOUNT.signTypedData({
-      domain: REFUND_EIP712_DOMAIN,
-      types: REFUND_EIP712_TYPES,
-      primaryType: 'CancelOrder',
-      message: {
-        orderId: ORDER_ID,
-        gateway: DEFAULT_REFUND_SIGNATURE_GATEWAY,
-        deadline: BigInt(refundSignatureDeadline)
-      }
-    })
-
-    const response = await app.request(`/order/${ORDER_ID}/cancel`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        refundSignature,
-        refundSignatureDeadline
-      })
-    })
-    const body = await response.json()
-
-    expect(response.status).toBe(401)
-    expect(body.error.message).toBe(
-      `refund signature deadline must be within ${MAX_REFUND_SIGNATURE_DEADLINE_SECONDS} seconds`
-    )
-    expect(calls).toHaveLength(callsBeforeCancel)
-  })
-
-  test('rejects EIP-712 refund signatures scoped to a different gateway', async () => {
-    const calls: RecordedCall[] = []
-    const store = new InMemoryRefundAuthorizationStore()
-    const app = createApp(testConfig(), {
-      refundAuthorizationService: testRefundAuthorizationService(store, {
-        publicBaseUrl: 'https://gateway.example.com'
-      }),
-      fetch: mockFetch(calls, async (path) => {
-        if (path === `/api/v1/quotes/${QUOTE_ID}`) {
-          return Response.json(internalQuote())
-        }
-
-        if (path === '/api/v1/orders') {
-          return Response.json(internalOrder(), { status: 201 })
-        }
-
-        if (path === `/api/v1/orders/${ORDER_ID}/cancellations`) {
-          return Response.json(internalOrder({ status: 'refunding' }))
-        }
-
-        return Response.json({ message: 'not found' }, { status: 404 })
-      })
-    })
-
-    const orderResponse = await app.request('/order/market', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        quoteId: QUOTE_ID,
-        idempotencyKey: IDEMPOTENCY_KEY,
-        fromAddress: FROM_ADDRESS,
-        toAddress: TO_ADDRESS,
-        refundMode: 'evmSignature',
-        refundAuthorizer: REFUND_ACCOUNT.address
-      })
-    })
-    expect(orderResponse.status).toBe(201)
-
-    const callsBeforeCancel = calls.length
-    const refundSignatureDeadline = Math.floor(Date.now() / 1000) + 600
-    const refundSignature = await REFUND_ACCOUNT.signTypedData({
-      domain: refundEip712Domain('https://other-gateway.example.com'),
-      types: REFUND_EIP712_TYPES,
-      primaryType: 'CancelOrder',
-      message: {
-        orderId: ORDER_ID,
-        gateway: 'https://other-gateway.example.com',
-        deadline: BigInt(refundSignatureDeadline)
-      }
-    })
-
-    const response = await app.request(`/order/${ORDER_ID}/cancel`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        refundSignature,
-        refundSignatureDeadline
-      })
-    })
-    const body = await response.json()
-
-    expect(response.status).toBe(401)
-    expect(body.error.message).toBe('invalid refund signature')
-    expect(calls).toHaveLength(callsBeforeCancel)
-  })
-
-  test('rejects credentialed gateway URLs for refund signature domains', () => {
-    expect(() => refundEip712Domain('https://user:pass@gateway.example.com')).toThrow(
-      'refund signature gateway URL must be an absolute HTTP(S) URL without credentials, query string, or fragment'
-    )
-  })
-
-  test('rejects query strings and fragments in gateway URLs for refund signature domains', () => {
-    expect(() =>
-      refundEip712Domain('https://gateway.example.com?token=secret')
-    ).toThrow(
-      'refund signature gateway URL must be an absolute HTTP(S) URL without credentials, query string, or fragment'
-    )
-    expect(() => refundEip712Domain('https://gateway.example.com#tenant')).toThrow(
-      'refund signature gateway URL must be an absolute HTTP(S) URL without credentials, query string, or fragment'
-    )
-  })
 })
 
 type RecordedCall = {
   method: string
   path: string
   body?: unknown
-}
-
-class InMemoryRefundAuthorizationStore implements RefundAuthorizationStore {
-  private readonly records = new Map<string, StoredRefundAuthorization>()
-  private readonly claims = new Map<string, { claimId: string; claimedAt: number }>()
-
-  async saveRefundAuthorization(
-    input: SaveRefundAuthorizationInput,
-    claimTimeoutMs: number
-  ): Promise<StoredRefundAuthorization | undefined> {
-    const existing = this.records.get(input.routerOrderId)
-    const nowMs = Date.now()
-    if (existing) {
-      if (existing.cancellationRequestedAt) return undefined
-
-      const existingClaim = this.claims.get(input.routerOrderId)
-      if (existingClaim && nowMs - existingClaim.claimedAt < claimTimeoutMs) {
-        return undefined
-      }
-
-      if (!authorizationMatches(existing, input)) return undefined
-
-      this.claims.delete(input.routerOrderId)
-      const next = {
-        ...existing,
-        updatedAt: new Date().toISOString()
-      }
-      this.records.set(input.routerOrderId, next)
-      return next
-    }
-
-    const now = new Date().toISOString()
-    const record = {
-      routerOrderId: input.routerOrderId,
-      refundMode: input.refundMode,
-      refundAuthorizer: input.refundAuthorizer,
-      encryptedCancellationSecret: input.encryptedCancellationSecret,
-      cancellationSecretHash: input.cancellationSecretHash,
-      ...(input.refundTokenHash ? { refundTokenHash: input.refundTokenHash } : {}),
-      ...(input.encryptedRefundToken
-        ? { encryptedRefundToken: input.encryptedRefundToken }
-        : {}),
-      createdAt: now,
-      updatedAt: now
-    }
-    this.records.set(input.routerOrderId, record)
-    return record
-  }
-
-  async findRefundAuthorization(
-    routerOrderId: string
-  ): Promise<StoredRefundAuthorization | undefined> {
-    return this.records.get(routerOrderId)
-  }
-
-  async claimCancellationAttempt(
-    routerOrderId: string,
-    claimId: string,
-    claimTimeoutMs: number,
-    expected: ClaimRefundAuthorizationExpectation
-  ): Promise<boolean> {
-    const record = this.records.get(routerOrderId)
-    if (!record || record.cancellationRequestedAt) return false
-    if (!authorizationMatches(record, expected)) return false
-
-    const existing = this.claims.get(routerOrderId)
-    const now = Date.now()
-    if (existing && now - existing.claimedAt < claimTimeoutMs) return false
-
-    this.claims.set(routerOrderId, { claimId, claimedAt: now })
-    return true
-  }
-
-  async releaseCancellationAttempt(
-    routerOrderId: string,
-    claimId: string
-  ): Promise<void> {
-    if (this.claims.get(routerOrderId)?.claimId === claimId) {
-      this.claims.delete(routerOrderId)
-    }
-  }
-
-  async markCancellationRequested(
-    routerOrderId: string,
-    claimId: string
-  ): Promise<boolean> {
-    const record = this.records.get(routerOrderId)
-    if (!record) return false
-    if (this.claims.get(routerOrderId)?.claimId !== claimId) return false
-
-    this.records.set(routerOrderId, {
-      ...record,
-      cancellationRequestedAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
-    })
-    this.claims.delete(routerOrderId)
-    return true
-  }
-}
-
-function authorizationMatches(
-  record: StoredRefundAuthorization,
-  expected: ClaimRefundAuthorizationExpectation
-) {
-  return (
-    record.routerOrderId === expected.routerOrderId &&
-    record.refundMode === expected.refundMode &&
-    record.refundAuthorizer === expected.refundAuthorizer &&
-    record.cancellationSecretHash === expected.cancellationSecretHash
-  )
-}
-
-function testRefundAuthorizationService(
-  store: RefundAuthorizationStore,
-  options: { publicBaseUrl?: string } = {}
-): RefundAuthorizationService {
-  return new RefundAuthorizationService(
-    store,
-    new RouterCancellationSecretBox(Buffer.alloc(32, 7)),
-    options
-  )
-}
-
-function failingRefundAuthorizationStore(): RefundAuthorizationStore {
-  return {
-    saveRefundAuthorization: async () => {
-      throw new Error('refund authorization database unavailable')
-    },
-    findRefundAuthorization: async () => undefined,
-    claimCancellationAttempt: async () => false,
-    releaseCancellationAttempt: async () => undefined,
-    markCancellationRequested: async () => false
-  }
 }
 
 function testConfig(): GatewayConfig {
@@ -2587,32 +1385,6 @@ function mockFetch(
 
     return handler(url.pathname, request)
   }
-}
-
-function deferred<T>() {
-  let resolve!: (value: T | PromiseLike<T>) => void
-  let reject!: (reason?: unknown) => void
-  const promise = new Promise<T>((promiseResolve, promiseReject) => {
-    resolve = promiseResolve
-    reject = promiseReject
-  })
-  return { promise, resolve, reject }
-}
-
-async function eventually(assertion: () => void, timeoutMs = 1_000) {
-  const deadline = Date.now() + timeoutMs
-  let lastError: unknown
-  while (Date.now() < deadline) {
-    try {
-      assertion()
-      return
-    } catch (error) {
-      lastError = error
-      await new Promise((resolve) => setTimeout(resolve, 10))
-    }
-  }
-  if (lastError) throw lastError
-  assertion()
 }
 
 function internalQuote() {
@@ -2686,23 +1458,6 @@ function internalBaseToBitcoinQuote() {
   return quote
 }
 
-function internalBaseToBitcoinLimitQuote() {
-  const quote = internalLimitQuote()
-  quote.quote.payload.id = QUOTE_ID
-  quote.quote.payload.source_asset = {
-    chain: 'evm:8453',
-    asset: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913'
-  }
-  quote.quote.payload.destination_asset = {
-    chain: 'bitcoin',
-    asset: 'native'
-  }
-  quote.quote.payload.recipient_address = BTC_ADDRESS
-  quote.quote.payload.input_amount = '101219825'
-  quote.quote.payload.output_amount = '100000'
-  return quote
-}
-
 function internalOrder(overrides: { status?: string } = {}) {
   return {
     order: {
@@ -2724,9 +1479,7 @@ function internalOrder(overrides: { status?: string } = {}) {
       vault: {
         deposit_vault_address: 'bc1qorderaddress0000000000000000000000000'
       }
-    },
-    cancellation_secret:
-      '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    }
   }
 }
 
@@ -2751,8 +1504,6 @@ function internalLimitOrder(overrides: { status?: string } = {}) {
       vault: {
         deposit_vault_address: 'bc1qorderaddress0000000000000000000000000'
       }
-    },
-    cancellation_secret:
-      '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    }
   }
 }

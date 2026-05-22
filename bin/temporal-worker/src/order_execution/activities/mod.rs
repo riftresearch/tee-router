@@ -109,7 +109,9 @@ where
     F: Future<Output = Result<T, OrderActivityError>>,
 {
     let started = Instant::now();
-    let result = activity.await.map_err(ActivityError::from);
+    let result = activity
+        .await
+        .map_err(OrderActivityError::into_activity_error);
     telemetry::record_activity(activity_name, result.is_ok(), started.elapsed());
     result
 }

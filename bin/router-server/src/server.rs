@@ -1,7 +1,7 @@
 use crate::{
     api::{
-        CreateOrderCancellationRequest, CreateOrderRequest, CreateQuoteRequest, CreateVaultRequest,
-        DetectorHintEnvelope, DetectorHintRequest, DetectorHintTarget, ProviderHealthEnvelope,
+        CreateOrderRequest, CreateQuoteRequest, CreateVaultRequest, DetectorHintEnvelope,
+        DetectorHintRequest, DetectorHintTarget, ProviderHealthEnvelope,
         ProviderOperationHintEnvelope, ProviderOperationHintRequest, ProviderPolicyEnvelope,
         ProviderPolicyListEnvelope, UpdateProviderPolicyRequest, VaultFundingHintEnvelope,
         VaultFundingHintRequest, MAX_HINT_IDEMPOTENCY_KEY_LEN,
@@ -69,6 +69,12 @@ pub const MAX_ROUTER_JSON_BODY_BYTES: usize = 256 * 1024;
 const _: () = assert!(MAX_ROUTER_JSON_BODY_BYTES >= MAX_HINT_EVIDENCE_JSON_BYTES * 2);
 const _: () = assert!(MAX_ROUTER_JSON_BODY_BYTES <= 1024 * 1024);
 const LIMIT_ORDERS_DISABLED_MESSAGE: &str = "limit orders are currently disabled";
+/// Placeholder cancellation commitment stamped onto router-order funding
+/// vaults. User-initiated cancellation has been removed, so funding vaults no
+/// longer carry a meaningful commitment; the `deposit_vaults.cancellation_commitment`
+/// column is retained for the shared schema and still requires a 32-byte hex value.
+const NULL_CANCELLATION_COMMITMENT: &str =
+    "0x0000000000000000000000000000000000000000000000000000000000000000";
 
 struct RouterJson<T>(T);
 struct RouterPath<T>(T);
@@ -235,10 +241,6 @@ pub fn build_api_router(state: AppState, cors_domain: Option<String>) -> Router 
         .route("/api/v1/orders", post(create_order))
         .route("/api/v1/orders/:id", get(get_order))
         .route("/api/v1/provider-health", get(get_provider_health))
-        .route(
-            "/api/v1/orders/:id/cancellations",
-            post(create_order_cancellation),
-        )
         .route(
             "/api/v1/provider-operations/hints",
             post(record_provider_operation_hint),
@@ -428,9 +430,6 @@ async fn create_order(
     if quote_for_screening.as_limit_order().is_some() {
         return Err(limit_orders_disabled_error());
     }
-    let cancellation = state
-        .vault_manager
-        .order_cancellation_material(request.quote_id);
     screen_user_address(
         &state,
         AddressScreeningPurpose::Recipient,
@@ -452,9 +451,7 @@ async fn create_order(
         .await?;
     if let Some(vault_id) = order.funding_vault_id {
         let vault = state.vault_manager.get_vault(vault_id).await?;
-        ensure_recoverable_cancellation_secret(&vault, &cancellation.commitment)?;
-        let mut response = order_response(state.clone(), order, Some(vault)).await?;
-        response.cancellation_secret = Some(cancellation.secret);
+        let response = order_response(state.clone(), order, Some(vault)).await?;
         return Ok((StatusCode::OK, Json(response)));
     }
 
@@ -463,7 +460,7 @@ async fn create_order(
         deposit_asset: order.source_asset.clone(),
         action: VaultAction::Null,
         recovery_address: request.refund_address,
-        cancellation_commitment: cancellation.commitment,
+        cancellation_commitment: NULL_CANCELLATION_COMMITMENT.to_string(),
         cancel_after: None,
         metadata: request.metadata,
     };
@@ -488,8 +485,7 @@ async fn create_order(
     };
     let order = state.order_manager.get_order(order.id).await?;
     crate::telemetry::record_order_workflow_event(&order, "order.funding_vault_created");
-    let mut response = order_response(state.clone(), order, Some(vault)).await?;
-    response.cancellation_secret = Some(cancellation.secret);
+    let response = order_response(state.clone(), order, Some(vault)).await?;
     Ok((StatusCode::CREATED, Json(response)))
 }
 
@@ -501,35 +497,6 @@ async fn get_order(
     authorize_gateway_api_request(&state, &headers)?;
     let order = state.order_manager.get_order(id).await?;
     let response = order_response(state, order, None).await?;
-    Ok(Json(response))
-}
-
-async fn create_order_cancellation(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    RouterPath(id): RouterPath<Uuid>,
-    RouterJson(request): RouterJson<CreateOrderCancellationRequest>,
-) -> RouterServerResult<Json<RouterOrderEnvelope>> {
-    authorize_gateway_api_request(&state, &headers)?;
-    let order = state.order_manager.get_order(id).await?;
-    let Some(vault_id) = order.funding_vault_id else {
-        return Err(RouterServerError::Validation {
-            message: "order does not have a funding vault".to_string(),
-        });
-    };
-    let vault = match state
-        .vault_manager
-        .cancel_vault(vault_id, &request.cancellation_secret)
-        .await
-    {
-        Ok(vault) => vault,
-        Err(err) => {
-            crate::telemetry::record_vault_cancel_failed(&err);
-            return Err(err.into());
-        }
-    };
-    let order = state.order_manager.mark_order_refunding(&order).await?;
-    let response = order_response(state, order, Some(vault)).await?;
     Ok(Json(response))
 }
 
@@ -572,26 +539,6 @@ fn limit_orders_disabled_error() -> RouterServerError {
     RouterServerError::Validation {
         message: LIMIT_ORDERS_DISABLED_MESSAGE.to_string(),
     }
-}
-
-fn ensure_recoverable_cancellation_secret(
-    vault: &DepositVault,
-    expected_commitment: &str,
-) -> RouterServerResult<()> {
-    if vault.cancellation_commitment == expected_commitment {
-        return Ok(());
-    }
-
-    Err(RouterServerError::Internal {
-        message: format!(
-            "order {} has funding vault {} with unrecoverable cancellation commitment",
-            vault
-                .order_id
-                .map(|id| id.to_string())
-                .unwrap_or_else(|| "<unbound>".to_string()),
-            vault.id
-        ),
-    })
 }
 
 async fn record_provider_operation_hint(
@@ -1562,7 +1509,6 @@ async fn order_response(
         order,
         quote,
         funding_vault,
-        cancellation_secret: None,
     })
 }
 

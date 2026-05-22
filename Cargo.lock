@@ -6427,7 +6427,6 @@ dependencies = [
  "devnet",
  "eip3009-erc20-contract",
  "getrandom 0.2.16",
- "hkdf",
  "hyperliquid-client",
  "hyperunit-client",
  "market-pricing",

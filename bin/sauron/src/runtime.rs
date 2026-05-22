@@ -22,6 +22,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::{
+    cctp_iris::CctpIrisClient,
     cdc::{
         cdc_event_seen, cdc_logical_message_seen, connect_stream, parse_router_cdc_message,
         recv_stream_event, validate_cdc_config, CdcConfig, RouterCdcMessage, RouterCdcRepository,
@@ -36,6 +37,7 @@ use crate::{
         run_backends, DiscoveryBackend, DiscoveryContext,
     },
     error::{Error, ReplicaDatabaseConnectionSnafu, Result, StateDatabaseConnectionSnafu},
+    provider_cctp_attestation::run_cctp_attestation_observer_loop,
     provider_evm_receipts::{run_evm_receipt_observer_loop, EvmReceiptObserverClients},
     provider_operations::{
         full_provider_operation_reconcile, ProviderOperationWatchEntry,
@@ -120,6 +122,11 @@ pub async fn run(args: SauronArgs) -> Result<()> {
         provider_operation_store.clone(),
         router_client.clone(),
     )?;
+    let cctp_attestation_observer_task = build_cctp_attestation_observer_task(
+        &args,
+        provider_operation_store.clone(),
+        router_client.clone(),
+    )?;
     let hyperunit_observer_task = build_hyperunit_observer_task(
         &args,
         provider_operation_store.clone(),
@@ -142,6 +149,7 @@ pub async fn run(args: SauronArgs) -> Result<()> {
         provider_operation_observer_task,
         hyperliquid_observer_task,
         evm_receipt_observer_task,
+        cctp_attestation_observer_task,
         hyperunit_observer_task,
         discovery_task
     )?;
@@ -197,7 +205,16 @@ fn validate_runtime_config(args: &SauronArgs) -> Result<()> {
     validate_router_internal_base_url(&args.router_internal_base_url)?;
     validate_router_detector_api_key(&args.router_detector_api_key)?;
     validate_token_indexer_api_key(args)?;
+    validate_cctp_api_url(&args.cctp_api_url)?;
     Ok(())
+}
+
+fn validate_cctp_api_url(value: &str) -> Result<()> {
+    CctpIrisClient::new(value).map(|_| ()).map_err(|source| {
+        Error::InvalidConfiguration {
+            message: format!("invalid CCTP_API_URL: {source}"),
+        }
+    })
 }
 
 fn validate_router_internal_base_url(value: &str) -> Result<()> {
@@ -390,6 +407,23 @@ fn build_evm_receipt_observer_task(
         provider_operation_store,
         router_client,
         args.sauron_evm_receipt_observer_concurrency,
+    )))
+}
+
+fn build_cctp_attestation_observer_task(
+    args: &SauronArgs,
+    provider_operation_store: ProviderOperationWatchStore,
+    router_client: RouterClient,
+) -> Result<BoxedSauronTask> {
+    let iris_client = CctpIrisClient::new(args.cctp_api_url.clone()).map_err(|source| {
+        Error::InvalidConfiguration {
+            message: format!("invalid CCTP_API_URL: {source}"),
+        }
+    })?;
+    Ok(Box::pin(run_cctp_attestation_observer_loop(
+        iris_client,
+        provider_operation_store,
+        router_client,
     )))
 }
 
@@ -844,6 +878,7 @@ mod tests {
             hl_shim_indexer_url: None,
             hyperunit_api_url: None,
             hyperunit_proxy_url: None,
+            cctp_api_url: crate::cctp_iris::CCTP_IRIS_DEFAULT_BASE_URL.to_string(),
             sauron_hl_bridge_match_window_seconds: 1_800,
             sauron_hyperunit_observer_concurrency: 64,
             sauron_hu_poll_fast_millis: 5_000,
@@ -1622,7 +1657,8 @@ async fn observe_provider_operation_once(
 fn uses_typed_venue_observer(operation_type: ProviderOperationType) -> bool {
     matches!(
         operation_type,
-        ProviderOperationType::CctpReceive
+        ProviderOperationType::CctpBridge
+            | ProviderOperationType::CctpReceive
             | ProviderOperationType::UniversalRouterSwap
             | ProviderOperationType::UnitDeposit
             | ProviderOperationType::UnitWithdrawal

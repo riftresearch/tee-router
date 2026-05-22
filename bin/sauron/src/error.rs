@@ -97,6 +97,9 @@ pub enum Error {
         source: hyperunit_client::HyperUnitClientError,
     },
 
+    #[snafu(display("CCTP Iris attestation request failed: {message}"))]
+    CctpIris { message: String },
+
     #[snafu(display("ROUTER request failed"))]
     RouterRequest { source: reqwest::Error },
 

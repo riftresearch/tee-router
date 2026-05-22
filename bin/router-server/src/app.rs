@@ -6,7 +6,6 @@ use crate::{
     },
     Result, RouterServerArgs,
 };
-use alloy::primitives::U256;
 use chains::{
     bitcoin::BitcoinChain,
     evm::{EvmChain, EvmGasSponsorConfig},
@@ -250,12 +249,6 @@ async fn initialize_chain_registry(
     paymaster_mode: PaymasterMode,
 ) -> Result<ChainRegistry> {
     let mut chain_registry = ChainRegistry::new();
-    let evm_paymaster_vault_gas_buffer_wei = parse_u256_arg(
-        args.evm_paymaster_vault_gas_target_wei
-            .as_ref()
-            .unwrap_or(&args.evm_paymaster_vault_gas_buffer_wei),
-        "EVM paymaster vault gas buffer",
-    )?;
 
     let bitcoin_chain = BitcoinChain::new(
         &args.bitcoin_rpc_url,
@@ -278,11 +271,7 @@ async fn initialize_chain_registry(
             b"router-ethereum-wallet",
             4,
             Duration::from_secs(12),
-            gas_sponsor_config(
-                args.ethereum_paymaster_private_key.as_ref(),
-                evm_paymaster_vault_gas_buffer_wei,
-                paymaster_mode,
-            ),
+            gas_sponsor_config(args.ethereum_paymaster_private_key.as_ref(), paymaster_mode),
         )
         .await
         .map_err(|err| crate::Error::DatabaseInit {
@@ -301,11 +290,7 @@ async fn initialize_chain_registry(
             b"router-base-wallet",
             2,
             Duration::from_secs(2),
-            gas_sponsor_config(
-                args.base_paymaster_private_key.as_ref(),
-                evm_paymaster_vault_gas_buffer_wei,
-                paymaster_mode,
-            ),
+            gas_sponsor_config(args.base_paymaster_private_key.as_ref(), paymaster_mode),
         )
         .await
         .map_err(|err| crate::Error::DatabaseInit {
@@ -324,11 +309,7 @@ async fn initialize_chain_registry(
             b"router-arbitrum-wallet",
             2,
             Duration::from_secs(2),
-            gas_sponsor_config(
-                args.arbitrum_paymaster_private_key.as_ref(),
-                evm_paymaster_vault_gas_buffer_wei,
-                paymaster_mode,
-            ),
+            gas_sponsor_config(args.arbitrum_paymaster_private_key.as_ref(), paymaster_mode),
         )
         .await
         .map_err(|err| crate::Error::DatabaseInit {
@@ -490,17 +471,8 @@ fn invalid_config(message: impl Into<String>) -> crate::Error {
     }
 }
 
-fn parse_u256_arg(value: &str, name: &str) -> Result<U256> {
-    U256::from_str_radix(value, 10).map_err(|err| crate::Error::DatabaseInit {
-        source: RouterServerError::InvalidData {
-            message: format!("invalid {name}: {err}"),
-        },
-    })
-}
-
 fn gas_sponsor_config(
     private_key: Option<&String>,
-    vault_gas_buffer_wei: U256,
     paymaster_mode: PaymasterMode,
 ) -> Option<EvmGasSponsorConfig> {
     if paymaster_mode == PaymasterMode::Disabled {
@@ -511,7 +483,6 @@ fn gas_sponsor_config(
 
     Some(EvmGasSponsorConfig {
         private_key: private_key.clone(),
-        vault_gas_buffer_wei,
     })
 }
 
@@ -540,8 +511,6 @@ mod tests {
             arbitrum_rpc_url: "https://arb.example".to_string(),
             arbitrum_reference_token: "0x0000000000000000000000000000000000000000".to_string(),
             arbitrum_paymaster_private_key: None,
-            evm_paymaster_vault_gas_buffer_wei: "0".to_string(),
-            evm_paymaster_vault_gas_target_wei: None,
             bitcoin_rpc_url: "http://btc.example".to_string(),
             bitcoin_rpc_auth: Auth::None,
             untrusted_esplora_http_server_url: "https://esplora.example".to_string(),

@@ -12,7 +12,6 @@ The gateway intentionally uses fully permissive CORS headers.
 
 ```sh
 bun run router-gateway:dev
-bun run router-gateway:migrate
 bun run router-gateway:test
 bun run router-gateway:typecheck
 ```
@@ -23,16 +22,11 @@ bun run router-gateway:typecheck
 - `HOST`: public gateway listen host. Defaults to `0.0.0.0`.
 - `ROUTER_INTERNAL_BASE_URL`: upstream Rust router API base URL.
 - `ROUTER_GATEWAY_API_KEY`: shared bearer secret sent to the upstream router
-  API for quote, order, cancellation, and provider-health requests. Must match
-  the router-api `ROUTER_GATEWAY_API_KEY`.
+  API for quote, order, and provider-health requests. Must match the router-api
+  `ROUTER_GATEWAY_API_KEY`.
 - `ROUTER_QUERY_API_BASE_URL`: optional internal query/status API base URL.
 - `ROUTER_GATEWAY_PUBLIC_BASE_URL`: public gateway base URL emitted in
-  `/openapi.json` `servers` and used to domain-separate EIP-712 refund
-  cancellation signatures.
-- `ROUTER_GATEWAY_DATABASE_URL`: gateway-owned Postgres database URL.
-- `ROUTER_GATEWAY_CANCELLATION_SECRET_KEY`: 32-byte hex or base64url AES key
-  used to encrypt stored router cancellation secrets. Ciphertexts are
-  AES-256-GCM authenticated and bound to the router order ID.
+  `/openapi.json` `servers`.
 - `ROUTER_GATEWAY_REQUEST_TIMEOUT_MS`: upstream request timeout. Defaults to
   `30000`.
 - `ROUTER_GATEWAY_HEALTH_TARGETS`: optional JSON array of extra dependency
@@ -47,12 +41,9 @@ bun run router-gateway:typecheck
   `mainnet`.
 
 When `HOST` is not loopback, the gateway refuses to start unless
-`ROUTER_INTERNAL_BASE_URL`, `ROUTER_GATEWAY_API_KEY`,
-`ROUTER_GATEWAY_DATABASE_URL`, `ROUTER_GATEWAY_PUBLIC_BASE_URL`, and a valid
-32-byte `ROUTER_GATEWAY_CANCELLATION_SECRET_KEY` are configured. This keeps the
-public order routes from serving in a partial runtime state, prevents accidental
-direct exposure of router-api cancellation secrets, and prevents refund
-cancellation signatures from replaying across gateway deployments.
+`ROUTER_INTERNAL_BASE_URL`, `ROUTER_GATEWAY_API_KEY`, and
+`ROUTER_GATEWAY_PUBLIC_BASE_URL` are configured. This keeps the public order
+routes from serving in a partial runtime state.
 
 The gateway automatically monitors configured router upstreams:
 
@@ -66,7 +57,7 @@ The gateway automatically monitors configured router upstreams:
 - `GET /providers`
 - `POST /quote`
 - `POST /order/market`
-- `POST /order/{orderId}/cancel`
+- `GET /order/{orderId}`
 - `GET /openapi.json`
 
 `GET /openapi.json` is served directly from the live Hono route registry using
@@ -81,14 +72,8 @@ the long-term public API aims to make quotes addressless.
 - `idempotencyKey`: required, 16-128 bytes. Treat it as a private create/retry
   capability for the quote; retries without the same key are rejected before the
   router can return an existing order.
-- `refundMode = "evmSignature"`: default mode. `refundAuthorizer` must be the
-  EVM address allowed to cancel/refund the order with an EIP-712 signature. The
-  signature deadline must be within 10 minutes of the gateway's current time.
-- `refundMode = "token"`: `refundAuthorizer` must be `null`. The gateway stores
-  the router cancellation secret encrypted in Postgres with authentication bound
-  to the router order ID and returns an opaque `refundToken`.
-
-The public gateway API never returns the raw router cancellation secret.
+- `refundAddress`: optional source-chain address that receives an automatic
+  refund on the order failure path. Defaults to `fromAddress` when omitted.
 
 Limit orders are temporarily disabled in the public gateway. The limit-order
 route and handler code remain in the source tree, but `/order/limit` is not
@@ -120,29 +105,11 @@ HOST=0.0.0.0
 ROUTER_INTERNAL_BASE_URL=https://<internal-router-api-base-url>
 ROUTER_GATEWAY_API_KEY=<shared-gateway-to-router-bearer-key>
 ROUTER_GATEWAY_PUBLIC_BASE_URL=https://<gateway-domain>
-ROUTER_GATEWAY_DATABASE_URL=postgres://<gateway-postgres-url>
-ROUTER_GATEWAY_CANCELLATION_SECRET_KEY=<64-char-hex-or-base64url-32-byte-key>
 ROUTER_GATEWAY_REQUEST_TIMEOUT_MS=30000
 ROUTER_GATEWAY_BITCOIN_ADDRESS_NETWORKS=mainnet
 ```
 
 Railway provides `PORT`; do not hard-code it unless Railway is not injecting one.
-
-Generate the cancellation encryption key with:
-
-```sh
-openssl rand -hex 32
-```
-
-The gateway runs pending database migrations automatically on startup before it
-binds its HTTP port. Startup migrations use a Postgres advisory transaction lock
-so concurrent replicas do not race.
-
-The manual migration command is still available as an operational escape hatch:
-
-```sh
-bun run router-gateway:migrate
-```
 
 Post-deploy checks:
 

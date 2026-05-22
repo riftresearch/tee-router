@@ -517,6 +517,24 @@ pub(crate) fn checked_gas_fee(
         .ok_or(PaymasterError::NumericOverflow { context })
 }
 
+/// Percentage headroom applied to a vault's native-gas funding reservation.
+///
+/// `estimate_gas` and `estimate_eip1559_fees` are sampled when the funding tx
+/// is *prepared*, but the funded action's burn tx executes later — by which
+/// time the network gas price may have drifted up. A vault funded to exactly
+/// the sampled `gas * price + value` can then have its burn rejected with
+/// `insufficient funds for gas * price + value`. This 25% multiplier on the
+/// gas-fee reservation absorbs that drift.
+pub(crate) fn gas_reservation_with_headroom(
+    reserved_fee: U256,
+    context: &'static str,
+) -> Result<U256> {
+    reserved_fee
+        .checked_mul(U256::from(5))
+        .map(|value| value.div_ceil(U256::from(4)))
+        .ok_or(PaymasterError::NumericOverflow { context })
+}
+
 pub(crate) fn checked_u256_add(left: U256, right: U256, context: &'static str) -> Result<U256> {
     left.checked_add(right)
         .ok_or(PaymasterError::NumericOverflow { context })

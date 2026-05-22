@@ -1,9 +1,11 @@
 pub mod benchmarks;
+pub mod cctp_iris;
 pub mod cdc;
 pub mod config;
 pub mod cursor;
 pub mod discovery;
 pub mod error;
+pub mod provider_cctp_attestation;
 pub mod provider_evm_receipts;
 pub mod provider_operations;
 pub mod router_client;

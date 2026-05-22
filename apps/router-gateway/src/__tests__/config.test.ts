@@ -2,8 +2,6 @@ import { expect, test } from 'bun:test'
 
 import { loadConfig, validateGatewayRuntimeConfig } from '../config'
 
-const STRONG_CANCELLATION_KEY =
-  '1111111111111111111111111111111111111111111111111111111111111111'
 const STRONG_ROUTER_GATEWAY_API_KEY = 'gateway-secret-00000000000000000'
 
 test('loadConfig normalizes HTTP service URLs', () => {
@@ -183,52 +181,16 @@ test('validateGatewayRuntimeConfig requires order dependencies on public binds',
         ROUTER_GATEWAY_API_KEY: STRONG_ROUTER_GATEWAY_API_KEY
       })
     )
-  ).toThrow('ROUTER_GATEWAY_DATABASE_URL must be configured')
-  expect(() =>
-    validateGatewayRuntimeConfig(
-      loadConfig({
-        HOST: '0.0.0.0',
-        ROUTER_INTERNAL_BASE_URL: 'http://router.internal',
-        ROUTER_GATEWAY_API_KEY: STRONG_ROUTER_GATEWAY_API_KEY,
-        ROUTER_GATEWAY_DATABASE_URL: 'postgres://postgres:postgres@db/gateway'
-      })
-    )
-  ).toThrow('ROUTER_GATEWAY_CANCELLATION_SECRET_KEY must be configured')
-  expect(() =>
-    validateGatewayRuntimeConfig(
-      loadConfig({
-        HOST: '0.0.0.0',
-        ROUTER_INTERNAL_BASE_URL: 'http://router.internal',
-        ROUTER_GATEWAY_API_KEY: STRONG_ROUTER_GATEWAY_API_KEY,
-        ROUTER_GATEWAY_DATABASE_URL: 'postgres://postgres:postgres@db/gateway',
-        ROUTER_GATEWAY_CANCELLATION_SECRET_KEY: STRONG_CANCELLATION_KEY
-      })
-    )
   ).toThrow('ROUTER_GATEWAY_PUBLIC_BASE_URL must be configured')
 })
 
-test('validateGatewayRuntimeConfig validates cancellation key material before serving', () => {
+test('validateGatewayRuntimeConfig accepts a fully configured public bind', () => {
   expect(() =>
     validateGatewayRuntimeConfig(
       loadConfig({
         HOST: '0.0.0.0',
         ROUTER_INTERNAL_BASE_URL: 'http://router.internal',
         ROUTER_GATEWAY_API_KEY: STRONG_ROUTER_GATEWAY_API_KEY,
-        ROUTER_GATEWAY_DATABASE_URL: 'postgres://postgres:postgres@db/gateway',
-        ROUTER_GATEWAY_CANCELLATION_SECRET_KEY: 'short',
-        ROUTER_GATEWAY_PUBLIC_BASE_URL: 'https://gateway.example.com'
-      })
-    )
-  ).toThrow('ROUTER_GATEWAY_CANCELLATION_SECRET_KEY must decode to 32 bytes')
-
-  expect(() =>
-    validateGatewayRuntimeConfig(
-      loadConfig({
-        HOST: '0.0.0.0',
-        ROUTER_INTERNAL_BASE_URL: 'http://router.internal',
-        ROUTER_GATEWAY_API_KEY: STRONG_ROUTER_GATEWAY_API_KEY,
-        ROUTER_GATEWAY_DATABASE_URL: 'postgres://postgres:postgres@db/gateway',
-        ROUTER_GATEWAY_CANCELLATION_SECRET_KEY: STRONG_CANCELLATION_KEY,
         ROUTER_GATEWAY_PUBLIC_BASE_URL: 'https://gateway.example.com'
       })
     )

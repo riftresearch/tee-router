@@ -41,7 +41,7 @@ test('logError writes sanitized summaries instead of raw error objects', () => {
   }
   try {
     const error = new Error('failed with api_key=top-secret')
-    ;(error as Error & { cancellationSecret: string }).cancellationSecret =
+    ;(error as Error & { internalSecret: string }).internalSecret =
       'do-not-log-this-property'
 
     logError('test failure', error)

@@ -1327,6 +1327,127 @@ async fn dispatch_step_retry_short_circuits_on_persisted_operation() {
     );
 }
 
+/// FIX A part 2: when a prior attempt's `order_provider_operations` row was
+/// marked `Failed` (its side effect failed to land), the retry's
+/// `execute_idempotent_step` must NOT route it through
+/// `existing_operation_completion` — that would yield a `Waiting` outcome and
+/// the workflow would wait forever for an external event that never arrives.
+/// Instead the retry must surface a non-retryable `ProviderOperationLost`
+/// error so `classify_step_failure` routes the order to a refund.
+#[tokio::test]
+async fn idempotent_step_retry_surfaces_failed_operation_as_non_retryable() {
+    let test_db = test_database().await;
+    let exchange_server = TestHyperliquidExchangeServer::spawn().await;
+    let (unit_provider, _gen_calls) =
+        CountingUnitWithdrawalProvider::new(exchange_server.base_url.clone());
+    let action_providers = Arc::new(ActionProviderRegistry::new(
+        vec![],
+        vec![Arc::new(unit_provider)],
+        vec![],
+    ));
+    let settings = test_settings();
+    let derivation_salt = [0x66_u8; 32];
+    let hyperliquid_chain = Arc::new(HyperliquidChain::new(
+        b"hyperliquid-wallet",
+        1,
+        std::time::Duration::from_secs(1),
+    ));
+    let vault_address = hyperliquid_chain
+        .derive_wallet(&settings.master_key_bytes(), &derivation_salt)
+        .expect("derive test Hyperliquid wallet")
+        .address
+        .clone();
+    let mut chain_registry = ChainRegistry::new();
+    chain_registry.register(ChainType::Hyperliquid, hyperliquid_chain);
+    let deps = test_deps_with_action_providers_and_chain_registry(
+        test_db.db.clone(),
+        action_providers,
+        Some(exchange_server.base_url.clone()),
+        Arc::new(chain_registry),
+    );
+    let (first_step, retry_step) = seed_unit_withdrawal_retry_steps(
+        &test_db.db,
+        &test_db.pool,
+        Uuid::now_v7(),
+        vault_address,
+        derivation_salt,
+    )
+    .await;
+
+    // First dispatch persists the provider operation row and waits.
+    let first = run_step_dispatch(
+        &deps,
+        DispatchStepInput {
+            order_id: first_step.order_id.into(),
+            attempt_id: first_step
+                .execution_attempt_id
+                .expect("first step has attempt id")
+                .into(),
+            step_id: first_step.id.into(),
+        },
+        OrderExecutionStepType::UnitWithdrawal,
+    )
+    .await
+    .expect("first dispatch_unit_withdrawal_step");
+    assert!(matches!(first.outcome, DispatchOutcome::Waiting));
+
+    // Simulate FIX A part 1's outcome: the side effect failed to land, so the
+    // persisted operation row was marked `Failed`.
+    sqlx_core::query::query(
+        r#"
+        UPDATE order_provider_operations
+        SET status = 'failed', updated_at = $2
+        WHERE order_id = $1
+        "#,
+    )
+    .bind(first_step.order_id)
+    .bind(Utc::now())
+    .execute(&test_db.pool)
+    .await
+    .expect("mark provider operation failed");
+
+    // The retry must surface the dead operation as a non-retryable failure.
+    let retry_result = execute_idempotent_step(
+        &deps,
+        &retry_step,
+        BridgeOrUnitNoop, // unused: lookup short-circuits before build_intent
+    )
+    .await;
+    let retry_error = match retry_result {
+        Ok(_) => panic!("retry must fail when the prior operation is Failed"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(retry_error, OrderActivityError::ProviderOperationLost { .. }),
+        "expected ProviderOperationLost, got {retry_error:?}"
+    );
+    assert!(
+        retry_error.is_non_retryable(),
+        "ProviderOperationLost must be non-retryable so the workflow refunds"
+    );
+}
+
+/// A no-op `IdempotentStepExecutor` whose `operation_type` matches the unit
+/// withdrawal row. `build_intent` is unreachable in the test above because the
+/// `Failed`-row lookup short-circuits first; it panics to make any regression
+/// (lookup no longer short-circuiting) loud rather than silent.
+struct BridgeOrUnitNoop;
+
+impl IdempotentStepExecutor for BridgeOrUnitNoop {
+    fn operation_type(&self) -> ProviderOperationType {
+        ProviderOperationType::UnitWithdrawal
+    }
+
+    async fn build_intent(
+        self,
+        _deps: &OrderActivityDeps,
+        _step: &OrderExecutionStep,
+        _idempotency_key: &str,
+    ) -> Result<ProviderExecutionIntent, OrderActivityError> {
+        panic!("build_intent must not run: the Failed-row lookup short-circuits first");
+    }
+}
+
 /// After Tier 2, the `verify_<hint_kind>_hint` activities own the step
 /// completion settle that previously lived as a separate `settle_provider_step`
 /// round-trip in the workflow. This test seeds a step in `waiting` with a
@@ -3796,7 +3917,6 @@ async fn seed_running_step(
                 output_asset_id,
                 amount_in,
                 estimated_amount_out,
-                min_amount_out,
                 started_at,
                 details_json,
                 usd_valuation_json,
@@ -3806,7 +3926,7 @@ async fn seed_running_step(
             VALUES (
                 $1, $2, $3, 'test-transition', 0, 'swap', 'velora',
                 'running', 'evm:8453', 'native', 'evm:8453', 'native',
-                '100', '100', '1', $4, '{}'::jsonb, '{}'::jsonb, $5, $5
+                '100', '100', $4, '{}'::jsonb, '{}'::jsonb, $5, $5
             )
             "#,
     )
@@ -3836,7 +3956,6 @@ async fn seed_running_step(
                 output_chain_id,
                 output_asset_id,
                 amount_in,
-                min_amount_out,
                 idempotency_key,
                 attempt_count,
                 started_at,
@@ -3851,7 +3970,7 @@ async fn seed_running_step(
             VALUES (
                 $1, $2, $3, $4, 'test-transition', 0, 'universal_router_swap',
                 'velora', 'running', 'evm:8453', 'native', 'evm:8453', 'native',
-                '100', '1', $5, 1, $6, $7, '{}'::jsonb, '{}'::jsonb,
+                '100', $5, 1, $6, $7, '{}'::jsonb, '{}'::jsonb,
                 '{}'::jsonb, '{}'::jsonb, $8, $8
             )
             "#,
@@ -4091,7 +4210,6 @@ async fn seed_unit_deposit_retry_steps(
                     output_asset_id,
                     amount_in,
                     estimated_amount_out,
-                    min_amount_out,
                     started_at,
                     details_json,
                     usd_valuation_json,
@@ -4101,7 +4219,7 @@ async fn seed_unit_deposit_retry_steps(
                 VALUES (
                     $1, $2, $3, 'unit-deposit', 5, 'unit_deposit',
                     'unit', 'running', 'evm:8453', 'native', 'hyperliquid', 'UETH',
-                    '100', '100', '1', $4, $5, '{}'::jsonb, $4, $4
+                    '100', '100', $4, $5, '{}'::jsonb, $4, $4
                 )
                 "#,
         )
@@ -4140,7 +4258,6 @@ async fn seed_unit_deposit_retry_steps(
                     output_chain_id,
                     output_asset_id,
                     amount_in,
-                    min_amount_out,
                     idempotency_key,
                     attempt_count,
                     started_at,
@@ -4155,7 +4272,7 @@ async fn seed_unit_deposit_retry_steps(
                 VALUES (
                     $1, $2, $3, $4, 'unit-deposit', 5, 'unit_deposit',
                     'unit', 'running', 'evm:8453', 'native', 'hyperliquid', 'UETH',
-                    '100', '1', $5, 1, $6, $7, $8,
+                    '100', $5, 1, $6, $7, $8,
                     '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, $6, $6
                 )
                 "#,
@@ -4359,7 +4476,6 @@ async fn seed_unit_withdrawal_retry_steps(
                     output_asset_id,
                     amount_in,
                     estimated_amount_out,
-                    min_amount_out,
                     started_at,
                     details_json,
                     usd_valuation_json,
@@ -4369,7 +4485,7 @@ async fn seed_unit_withdrawal_retry_steps(
                 VALUES (
                     $1, $2, $3, 'unit-withdrawal', 5, 'unit_withdrawal',
                     'unit', 'running', 'hyperliquid', 'UETH', 'evm:8453', 'native',
-                    '39000000000000000', '39000000000000000', '1', $4, $5,
+                    '39000000000000000', '39000000000000000', $4, $5,
                     '{}'::jsonb, $4, $4
                 )
                 "#,
@@ -4400,7 +4516,6 @@ async fn seed_unit_withdrawal_retry_steps(
                     output_chain_id,
                     output_asset_id,
                     amount_in,
-                    min_amount_out,
                     idempotency_key,
                     attempt_count,
                     started_at,
@@ -4415,7 +4530,7 @@ async fn seed_unit_withdrawal_retry_steps(
                 VALUES (
                     $1, $2, $3, $4, 'unit-withdrawal', 5, 'unit_withdrawal',
                     'unit', 'running', 'hyperliquid', 'UETH', 'evm:8453', 'native',
-                    '39000000000000000', '1', $5, 1, $6, $7, $8,
+                    '39000000000000000', $5, 1, $6, $7, $8,
                     '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, $6, $6
                 )
                 "#,

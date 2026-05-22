@@ -144,6 +144,18 @@ pub struct SauronArgs {
     #[arg(long, env = "HYPERUNIT_PROXY_URL")]
     pub hyperunit_proxy_url: Option<String>,
 
+    /// Circle CCTP Iris attestation API base URL.
+    ///
+    /// Used by the typed CCTP burn attestation observer to poll whether a burn
+    /// attestation is ready. Defaults to Circle's production Iris endpoint;
+    /// keep this default in sync with the temporal worker's `CCTP_API_URL`.
+    #[arg(
+        long,
+        env = "CCTP_API_URL",
+        default_value = crate::cctp_iris::CCTP_IRIS_DEFAULT_BASE_URL
+    )]
+    pub cctp_api_url: String,
+
     /// HL bridge Arbitrum/HL ledger correlation window, in seconds
     #[arg(
         long,
@@ -327,6 +339,7 @@ impl fmt::Debug for SauronArgs {
                 "hyperunit_proxy_url",
                 &self.hyperunit_proxy_url.as_ref().map(|_| "<redacted>"),
             )
+            .field("cctp_api_url", &self.cctp_api_url)
             .field(
                 "sauron_hl_bridge_match_window_seconds",
                 &self.sauron_hl_bridge_match_window_seconds,
@@ -432,6 +445,7 @@ mod tests {
             hl_shim_indexer_url: Some("https://hl-shim.example/token-secret".to_string()),
             hyperunit_api_url: Some("https://hyperunit.example/token-secret".to_string()),
             hyperunit_proxy_url: Some("socks5://hyperunit-proxy-secret:1080".to_string()),
+            cctp_api_url: "https://iris-api.circle.com".to_string(),
             sauron_hl_bridge_match_window_seconds: 1_800,
             sauron_hyperunit_observer_concurrency: 64,
             sauron_hu_poll_fast_millis: 5_000,

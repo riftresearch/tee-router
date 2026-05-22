@@ -1640,10 +1640,110 @@ pub(super) async fn execute_running_step(
 ) -> Result<StepCompletion, OrderActivityError> {
     match step_dispatch(step.step_type).execute(deps, step).await? {
         StepDispatchResult::ProviderIntent(intent) => {
-            prepare_provider_completion(deps, step, intent).await
+            // `execute_idempotent_step` has already persisted the operation row
+            // (status `Planned`) before this point — the side effect fires
+            // inside `prepare_provider_completion`. Capture the persisted row's
+            // `(operation_type, idempotency_key)` *before* `intent` is consumed
+            // so that, if the fire fails cleanly, we can mark the row `Failed`.
+            // A retry then surfaces that failure to the workflow instead of
+            // re-reading a `Planned` row and silently waiting forever.
+            let persisted_operation = intent_state(&intent)
+                .operation
+                .as_ref()
+                .and_then(|operation| {
+                    operation
+                        .idempotency_key
+                        .clone()
+                        .map(|idempotency_key| (operation.operation_type, idempotency_key))
+                });
+            match prepare_provider_completion(deps, step, intent).await {
+                Ok(completion) => Ok(completion),
+                Err(error) => {
+                    if let Some((operation_type, idempotency_key)) = persisted_operation {
+                        fail_planned_provider_operation(
+                            deps,
+                            step,
+                            operation_type,
+                            &idempotency_key,
+                        )
+                        .await;
+                    }
+                    Err(error)
+                }
+            }
         }
         StepDispatchResult::Complete(completion) => Ok(completion),
     }
+}
+
+/// Best-effort: after a provider side effect failed to fire, mark the
+/// pre-side-effect operation row `Planned → Failed` so a retry surfaces the
+/// failure rather than re-reading the `Planned` row as a `Waiting` outcome.
+///
+/// Strictly best-effort — any error looking up or updating the row is logged
+/// and swallowed, because the caller still propagates the original side-effect
+/// error. The update is gated on the row still being `Planned`: `Submitted` /
+/// `WaitingExternal` rows mean the side effect did make durable progress and
+/// must be left for the stale-running-step mechanism to adjudicate.
+async fn fail_planned_provider_operation(
+    deps: &OrderActivityDeps,
+    step: &OrderExecutionStep,
+    operation_type: ProviderOperationType,
+    idempotency_key: &str,
+) {
+    let lookup = deps
+        .db
+        .orders()
+        .get_provider_operation_by_idempotency_key(&step.provider, operation_type, idempotency_key)
+        .await;
+    let operation = match lookup {
+        Ok(Some(operation)) => operation,
+        Ok(None) => return,
+        Err(source) => {
+            tracing::warn!(
+                order_id = %step.order_id,
+                step_id = %step.id,
+                provider = %step.provider,
+                operation_type = %operation_type.to_db_string(),
+                idempotency_key,
+                error = %source,
+                "failed to look up provider operation while marking a failed side effect"
+            );
+            return;
+        }
+    };
+    if operation.status != ProviderOperationStatus::Planned {
+        return;
+    }
+    if let Err(source) = deps
+        .db
+        .orders()
+        .update_provider_operation_status(
+            operation.id,
+            ProviderOperationStatus::Failed,
+            operation.provider_ref.clone(),
+            operation.observed_state.clone(),
+            Some(operation.response.clone()),
+            Utc::now(),
+        )
+        .await
+    {
+        tracing::warn!(
+            order_id = %step.order_id,
+            step_id = %step.id,
+            provider_operation_id = %operation.id,
+            error = %source,
+            "failed to mark provider operation Failed after a failed side effect"
+        );
+        return;
+    }
+    tracing::warn!(
+        order_id = %step.order_id,
+        step_id = %step.id,
+        provider_operation_id = %operation.id,
+        event_name = "provider_operation.marked_failed_after_side_effect_error",
+        "provider_operation.marked_failed_after_side_effect_error"
+    );
 }
 
 fn execute_wait_for_deposit_step<'a>(

@@ -1,4 +1,3 @@
-import { RouterCancellationSecretBox } from './cancellations/crypto'
 import { GatewayConfigurationError } from './errors'
 import type { BitcoinAddressNetwork } from './assets'
 
@@ -18,8 +17,6 @@ export type GatewayConfig = {
   routerInternalApiKey?: string
   routerQueryApiBaseUrl?: string
   publicBaseUrl?: string
-  gatewayDatabaseUrl?: string
-  cancellationSecretKey?: string
   requestTimeoutMs: number
   healthTargets: HealthTargetConfig[]
   healthPollIntervalMs: number
@@ -75,10 +72,6 @@ export function loadConfig(env: Env = Bun.env as Env): GatewayConfig {
       env.ROUTER_GATEWAY_PUBLIC_BASE_URL,
       'ROUTER_GATEWAY_PUBLIC_BASE_URL'
     ),
-    gatewayDatabaseUrl: normalizeOptionalSecret(env.ROUTER_GATEWAY_DATABASE_URL),
-    cancellationSecretKey: normalizeOptionalSecret(
-      env.ROUTER_GATEWAY_CANCELLATION_SECRET_KEY
-    ),
     requestTimeoutMs: parsePositiveInteger(
       env.ROUTER_GATEWAY_REQUEST_TIMEOUT_MS,
       DEFAULT_REQUEST_TIMEOUT_MS,
@@ -111,9 +104,6 @@ export function loadConfig(env: Env = Bun.env as Env): GatewayConfig {
 
 export function validateGatewayRuntimeConfig(config: GatewayConfig): void {
   if (isLoopbackHost(config.host)) {
-    if (config.cancellationSecretKey) {
-      RouterCancellationSecretBox.fromKeyMaterial(config.cancellationSecretKey)
-    }
     return
   }
 
@@ -127,22 +117,11 @@ export function validateGatewayRuntimeConfig(config: GatewayConfig): void {
       'ROUTER_GATEWAY_API_KEY must be configured when router-gateway binds a non-loopback host'
     )
   }
-  if (!config.gatewayDatabaseUrl) {
-    throw new GatewayConfigurationError(
-      'ROUTER_GATEWAY_DATABASE_URL must be configured when router-gateway binds a non-loopback host'
-    )
-  }
-  if (!config.cancellationSecretKey) {
-    throw new GatewayConfigurationError(
-      'ROUTER_GATEWAY_CANCELLATION_SECRET_KEY must be configured when router-gateway binds a non-loopback host'
-    )
-  }
   if (!config.publicBaseUrl) {
     throw new GatewayConfigurationError(
       'ROUTER_GATEWAY_PUBLIC_BASE_URL must be configured when router-gateway binds a non-loopback host'
     )
   }
-  RouterCancellationSecretBox.fromKeyMaterial(config.cancellationSecretKey)
 }
 
 function parsePort(value: string | undefined): number {
