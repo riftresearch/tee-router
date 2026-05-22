@@ -10,8 +10,9 @@ pub use router_temporal::{
     HlWithdrawalSettledEvidence, HyperUnitDepositCreditedEvidence,
     HyperUnitWithdrawalAcknowledgedEvidence, HyperUnitWithdrawalSettledEvidence,
     OrderWorkflowInput, ProviderHintKind, ProviderKind, ProviderOperationHintEvidence,
-    ProviderOperationHintSignal, UnitDepositHintEvidence, WorkflowAttemptId, WorkflowHintId,
-    WorkflowOrderId, WorkflowProviderOperationId, WorkflowStepId, WorkflowVaultId,
+    ProviderOperationHintSignal, RefundTrigger, RefundWorkflowInput, UnitDepositHintEvidence,
+    WorkflowAttemptId, WorkflowHintId, WorkflowOrderId, WorkflowProviderOperationId,
+    WorkflowStepId, WorkflowVaultId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -128,15 +129,6 @@ pub struct MarkOrderCompletedInput {
 pub struct OrderCompleted {
     pub order_id: WorkflowOrderId,
     pub attempt_id: WorkflowAttemptId,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RefundWorkflowInput {
-    pub order_id: WorkflowOrderId,
-    pub parent_attempt_id: Option<WorkflowAttemptId>,
-    pub trigger: RefundTrigger,
-    #[serde(default)]
-    pub funded_to_workflow_start_seconds: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -374,6 +366,16 @@ pub struct AcrossOnchainLogRecovered {
 pub struct DiscoverSingleRefundPositionInput {
     pub order_id: WorkflowOrderId,
     pub failed_attempt_id: WorkflowAttemptId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolveLatestExecutionAttemptInput {
+    pub order_id: WorkflowOrderId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LatestExecutionAttemptResolved {
+    pub attempt_id: WorkflowAttemptId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -779,12 +781,6 @@ pub enum OrderTerminalStatus {
 pub enum RefundTerminalStatus {
     Refunded,
     RefundRequired,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum RefundTrigger {
-    FailedAttempt,
-    VaultAlreadyRefunded,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

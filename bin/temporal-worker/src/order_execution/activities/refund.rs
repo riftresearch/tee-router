@@ -132,6 +132,50 @@ impl RefundActivities {
         })
         .await
     }
+
+    /// Resolves the most recent execution attempt for an order. Used by the
+    /// standalone (`Manual`-triggered) `RefundWorkflow` to recover the failed
+    /// attempt id that a child refund would have received from its parent. An
+    /// order with no execution attempts fails cleanly so the operator sees a
+    /// clear cause rather than a downstream invariant violation.
+    #[activity]
+    pub async fn resolve_latest_execution_attempt(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: ResolveLatestExecutionAttemptInput,
+    ) -> Result<LatestExecutionAttemptResolved, ActivityError> {
+        record_activity("resolve_latest_execution_attempt", async move {
+            let deps = self.deps()?;
+            resolve_latest_execution_attempt_with_deps(&deps, input).await
+        })
+        .await
+    }
+}
+
+pub(super) async fn resolve_latest_execution_attempt_with_deps(
+    deps: &OrderActivityDeps,
+    input: ResolveLatestExecutionAttemptInput,
+) -> Result<LatestExecutionAttemptResolved, OrderActivityError> {
+    let attempts = deps
+        .db
+        .orders()
+        .get_execution_attempts(input.order_id.inner())
+        .await
+        .map_err(OrderActivityError::db_query)?;
+    // `get_execution_attempts` orders by `attempt_index ASC, created_at ASC,
+    // id ASC`, so the last row is the most recent attempt.
+    let attempt = attempts.into_iter().next_back().ok_or_else(|| {
+        invariant_error(
+            "manual_refund_requires_execution_attempt",
+            format!(
+                "order {} has no execution attempts to refund",
+                input.order_id.inner()
+            ),
+        )
+    })?;
+    Ok(LatestExecutionAttemptResolved {
+        attempt_id: attempt.id.into(),
+    })
 }
 
 pub(super) async fn discover_single_refund_position_with_deps(

@@ -2729,6 +2729,124 @@ fn refund_position_discovery_zero_positions_is_untenable() {
     }
 }
 
+/// Seeds a `router_orders` row plus the given execution attempts (each tuple
+/// is `(attempt_id, attempt_index)`) and returns the order id. Used by the
+/// `resolve_latest_execution_attempt` tests.
+async fn seed_order_with_execution_attempts(
+    pool: &PgPool,
+    attempts: &[(Uuid, i32)],
+) -> Uuid {
+    let order_id = Uuid::now_v7();
+    let now = Utc::now();
+    let trace_id = order_id.simple().to_string();
+    let parent_span_id = trace_id[..16].to_string();
+
+    sqlx_core::query::query(
+        r#"
+            INSERT INTO router_orders (
+                id, order_type, status, source_chain_id, source_asset_id,
+                destination_chain_id, destination_asset_id, recipient_address,
+                refund_address, workflow_trace_id, workflow_parent_span_id,
+                created_at, updated_at
+            )
+            VALUES (
+                $1, 'market_order', 'refund_required', 'evm:8453', 'native',
+                'evm:8453', 'native', '0x0000000000000000000000000000000000000001',
+                '0x0000000000000000000000000000000000000002', $2, $3, $4, $4
+            )
+            "#,
+    )
+    .bind(order_id)
+    .bind(trace_id)
+    .bind(parent_span_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert order for execution-attempt resolution test");
+
+    sqlx_core::query::query(
+        r#"
+            INSERT INTO market_order_actions (order_id, amount_in, created_at, updated_at)
+            VALUES ($1, '100', $2, $2)
+            "#,
+    )
+    .bind(order_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert market order action for execution-attempt resolution test");
+
+    for (attempt_id, attempt_index) in attempts {
+        sqlx_core::query::query(
+            r#"
+                INSERT INTO order_execution_attempts (
+                    id, order_id, attempt_index, attempt_kind, status,
+                    failure_reason_json, input_custody_snapshot_json,
+                    created_at, updated_at
+                )
+                VALUES ($1, $2, $3, 'primary_execution', 'cancelled',
+                        '{}'::jsonb, '{}'::jsonb, $4, $4)
+                "#,
+        )
+        .bind(attempt_id)
+        .bind(order_id)
+        .bind(attempt_index)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert execution attempt for resolution test");
+    }
+
+    order_id
+}
+
+#[tokio::test]
+async fn resolve_latest_execution_attempt_picks_most_recent_attempt() {
+    let test_db = test_database().await;
+    let deps = test_deps(test_db.db.clone());
+    let first_attempt = Uuid::now_v7();
+    let latest_attempt = Uuid::now_v7();
+    let order_id = seed_order_with_execution_attempts(
+        &test_db.pool,
+        &[(first_attempt, 1), (latest_attempt, 2)],
+    )
+    .await;
+
+    let resolved = resolve_latest_execution_attempt_with_deps(
+        &deps,
+        ResolveLatestExecutionAttemptInput {
+            order_id: order_id.into(),
+        },
+    )
+    .await
+    .expect("resolve latest execution attempt");
+
+    assert_eq!(resolved.attempt_id.inner(), latest_attempt);
+}
+
+#[tokio::test]
+async fn resolve_latest_execution_attempt_fails_cleanly_without_attempts() {
+    let test_db = test_database().await;
+    let deps = test_deps(test_db.db.clone());
+    let order_id = seed_order_with_execution_attempts(&test_db.pool, &[]).await;
+
+    let error = resolve_latest_execution_attempt_with_deps(
+        &deps,
+        ResolveLatestExecutionAttemptInput {
+            order_id: order_id.into(),
+        },
+    )
+    .await
+    .expect_err("an order with no execution attempts must fail cleanly");
+
+    assert!(
+        error
+            .to_string()
+            .contains("manual_refund_requires_execution_attempt"),
+        "expected a clear no-attempts error, got: {error}"
+    );
+}
+
 #[test]
 fn refund_position_discovery_single_position_still_returns_position() {
     let discovery = refund_position_discovery_from_positions(
