@@ -40,18 +40,6 @@ pub enum AmountFormat {
     Raw,
 }
 
-/// Refund authorization mode for an order.
-///
-/// `Token` is chain-agnostic (the gateway issues an opaque refund token) and is
-/// the only mode usable when the source chain is not EVM.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum RefundMode {
-    #[serde(rename = "evmSignature")]
-    EvmSignature,
-    #[serde(rename = "token")]
-    Token,
-}
-
 /// Request body for `POST /quote`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -107,10 +95,6 @@ pub struct CreateOrderRequest {
     pub refund_address: Option<String>,
     pub idempotency_key: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub refund_mode: Option<RefundMode>,
-    /// Required field; serialized as JSON `null` for token-mode refunds.
-    pub refund_authorizer: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub amount_format: Option<AmountFormat>,
 }
 
@@ -132,12 +116,6 @@ pub struct OrderResponse {
     #[serde(default)]
     pub fees: Option<Vec<Fee>>,
     pub amount_format: AmountFormat,
-    #[serde(default)]
-    pub refund_mode: Option<RefundMode>,
-    #[serde(default)]
-    pub refund_authorizer: Option<String>,
-    #[serde(default)]
-    pub refund_token: Option<String>,
 }
 
 /// Async client for the router gateway.
@@ -252,20 +230,17 @@ mod tests {
     }
 
     #[test]
-    fn token_refund_mode_serializes_authorizer_as_null() {
+    fn create_order_request_omits_refund_address_when_none() {
         let request = CreateOrderRequest {
             quote_id: "q".to_string(),
             from_address: "a".to_string(),
             to_address: "b".to_string(),
             refund_address: None,
             idempotency_key: "router-cli-0000000000000000".to_string(),
-            refund_mode: Some(RefundMode::Token),
-            refund_authorizer: None,
             amount_format: Some(AmountFormat::Raw),
         };
         let json = serde_json::to_value(&request).expect("serialize");
-        assert_eq!(json["refundMode"], "token");
-        assert!(json["refundAuthorizer"].is_null());
         assert!(json.get("refundAddress").is_none());
+        assert_eq!(json["amountFormat"], "raw");
     }
 }
