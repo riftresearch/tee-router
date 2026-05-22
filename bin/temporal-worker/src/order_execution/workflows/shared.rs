@@ -151,6 +151,19 @@ pub(super) fn refund_execute_activity_options() -> ActivityOptions {
         .build()
 }
 
+pub(super) fn refund_planning_activity_options() -> ActivityOptions {
+    // `discover_single_refund_position` and `materialize_refund_plan` do
+    // on-chain balance reads, refund-route building, and pricing for mid-route
+    // (ExternalCustody / HyperliquidSpot) positions, which overruns the 30s
+    // `db_activity_options` window and times out forever. Give it headroom.
+    ActivityOptions::with_start_to_close_timeout(Duration::from_secs(120))
+        .retry_policy(RetryPolicy {
+            maximum_attempts: 5,
+            ..Default::default()
+        })
+        .build()
+}
+
 pub(super) fn refund_child_options(
     order_id: WorkflowOrderId,
     parent_attempt_id: WorkflowAttemptId,
