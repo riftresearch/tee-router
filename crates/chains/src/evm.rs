@@ -72,14 +72,12 @@ pub struct EvmChain {
 #[derive(Clone)]
 pub struct EvmGasSponsorConfig {
     pub private_key: String,
-    pub vault_gas_buffer_wei: U256,
 }
 
 impl fmt::Debug for EvmGasSponsorConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EvmGasSponsorConfig")
             .field("private_key", &"<redacted>")
-            .field("vault_gas_buffer_wei", &self.vault_gas_buffer_wei)
             .finish()
     }
 }
@@ -100,7 +98,6 @@ struct EvmPaymasterAppActor {
     provider: DynProvider,
     wallet_provider: DynProvider,
     sponsor_signer: PrivateKeySigner,
-    vault_gas_buffer_wei: U256,
     batch_config: EvmPaymasterBatchConfig,
     chain_type: ChainType,
 }
@@ -1002,7 +999,6 @@ impl EvmGasSponsor {
             provider,
             wallet_provider,
             sponsor_signer: signer,
-            vault_gas_buffer_wei: config.vault_gas_buffer_wei,
             batch_config,
             chain_type,
         };
@@ -1378,7 +1374,6 @@ async fn run_evm_paymaster_app_actor(
         actor.provider.clone(),
         actor.wallet_provider.clone(),
         actor.sponsor_signer.clone(),
-        actor.vault_gas_buffer_wei,
         actor.chain_type.to_db_string(),
         actor.batch_config,
     );
@@ -2273,14 +2268,12 @@ mod tests {
         let config = EvmGasSponsorConfig {
             private_key: "0x59c6995e998f97a5a0044976f7ad0a7df4976fbe66f6cc18ff3c16f18a6b9e3f"
                 .to_string(),
-            vault_gas_buffer_wei: U256::from(10),
         };
 
         let rendered = format!("{config:?}");
         assert!(rendered.contains("private_key"));
         assert!(rendered.contains("<redacted>"));
         assert!(!rendered.contains("59c6995e"));
-        assert!(rendered.contains("vault_gas_buffer_wei"));
     }
 
     #[test]

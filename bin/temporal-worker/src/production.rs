@@ -1,6 +1,5 @@
 use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 
-use alloy::primitives::U256;
 use bitcoincore_rpc_async::Auth;
 use chains::{
     bitcoin::BitcoinChain,
@@ -108,14 +107,6 @@ pub struct OrderWorkerRuntimeArgs {
     /// Arbitrum paymaster private key used to top up EVM token vault gas
     #[arg(long, env = "ARBITRUM_PAYMASTER_PRIVATE_KEY")]
     pub arbitrum_paymaster_private_key: Option<String>,
-
-    /// Extra native balance to leave in EVM token vaults after action gas estimate, in wei
-    #[arg(long, env = "EVM_PAYMASTER_VAULT_GAS_BUFFER_WEI", default_value = "0")]
-    pub evm_paymaster_vault_gas_buffer_wei: String,
-
-    /// Deprecated alias for EVM_PAYMASTER_VAULT_GAS_BUFFER_WEI
-    #[arg(long, env = "EVM_PAYMASTER_VAULT_GAS_TARGET_WEI", hide = true)]
-    pub evm_paymaster_vault_gas_target_wei: Option<String>,
 
     /// Bitcoin RPC URL
     #[arg(long, env = "BITCOIN_RPC_URL")]
@@ -285,12 +276,6 @@ fn load_settings(master_key_path: &str) -> WorkerResult<Settings> {
 
 async fn initialize_chain_registry(args: &OrderWorkerRuntimeArgs) -> WorkerResult<ChainRegistry> {
     let mut chain_registry = ChainRegistry::new();
-    let evm_paymaster_vault_gas_buffer_wei = parse_u256_arg(
-        args.evm_paymaster_vault_gas_target_wei
-            .as_ref()
-            .unwrap_or(&args.evm_paymaster_vault_gas_buffer_wei),
-        "EVM paymaster vault gas buffer",
-    )?;
 
     let bitcoin_chain = BitcoinChain::new(
         &args.bitcoin_rpc_url,
@@ -309,10 +294,7 @@ async fn initialize_chain_registry(args: &OrderWorkerRuntimeArgs) -> WorkerResul
             b"router-ethereum-wallet",
             4,
             Duration::from_secs(12),
-            gas_sponsor_config(
-                args.ethereum_paymaster_private_key.as_ref(),
-                evm_paymaster_vault_gas_buffer_wei,
-            ),
+            gas_sponsor_config(args.ethereum_paymaster_private_key.as_ref()),
         )
         .await
         .map_err(|source| config_error(format!("failed to initialize ethereum chain: {source}")))?,
@@ -327,10 +309,7 @@ async fn initialize_chain_registry(args: &OrderWorkerRuntimeArgs) -> WorkerResul
             b"router-base-wallet",
             2,
             Duration::from_secs(2),
-            gas_sponsor_config(
-                args.base_paymaster_private_key.as_ref(),
-                evm_paymaster_vault_gas_buffer_wei,
-            ),
+            gas_sponsor_config(args.base_paymaster_private_key.as_ref()),
         )
         .await
         .map_err(|source| config_error(format!("failed to initialize base chain: {source}")))?,
@@ -345,10 +324,7 @@ async fn initialize_chain_registry(args: &OrderWorkerRuntimeArgs) -> WorkerResul
             b"router-arbitrum-wallet",
             2,
             Duration::from_secs(2),
-            gas_sponsor_config(
-                args.arbitrum_paymaster_private_key.as_ref(),
-                evm_paymaster_vault_gas_buffer_wei,
-            ),
+            gas_sponsor_config(args.arbitrum_paymaster_private_key.as_ref()),
         )
         .await
         .map_err(|source| config_error(format!("failed to initialize arbitrum chain: {source}")))?,
@@ -461,13 +437,9 @@ fn paymaster_registry(args: &OrderWorkerRuntimeArgs) -> WorkerResult<PaymasterRe
     Ok(registry)
 }
 
-fn gas_sponsor_config(
-    private_key: Option<&String>,
-    vault_gas_buffer_wei: U256,
-) -> Option<EvmGasSponsorConfig> {
+fn gas_sponsor_config(private_key: Option<&String>) -> Option<EvmGasSponsorConfig> {
     Some(EvmGasSponsorConfig {
         private_key: private_key?.clone(),
-        vault_gas_buffer_wei,
     })
 }
 
@@ -549,11 +521,6 @@ fn normalize_optional_string(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
-}
-
-fn parse_u256_arg(value: &str, name: &str) -> WorkerResult<U256> {
-    U256::from_str_radix(value, 10)
-        .map_err(|source| config_error(format!("invalid {name}: {source}")))
 }
 
 fn parse_auth(value: &str) -> Result<Auth, String> {

@@ -1,5 +1,6 @@
 use router_core::error::RouterCoreError;
 use snafu::Snafu;
+use temporalio_common::error::ApplicationFailure;
 use temporalio_sdk::activities::ActivityError;
 
 use super::types::WorkflowStepId;
@@ -103,6 +104,14 @@ pub enum OrderActivityError {
         current: String,
         expected: &'static str,
     },
+
+    /// A prior attempt persisted a provider operation row but its side effect
+    /// never landed (the row reached `Failed`). Retrying the activity would
+    /// only re-discover the same dead row, so this is surfaced as a
+    /// non-retryable failure that routes the workflow straight to refund
+    /// classification.
+    #[snafu(display("provider operation did not land on a prior attempt: {detail}"))]
+    ProviderOperationLost { detail: String },
 
     #[allow(dead_code)]
     #[snafu(display("{message}"))]
@@ -237,8 +246,30 @@ impl OrderActivityError {
     }
 
     #[must_use]
+    pub fn provider_operation_lost(detail: impl Into<String>) -> Self {
+        Self::ProviderOperationLost {
+            detail: detail.into(),
+        }
+    }
+
+    /// Whether Temporal should stop retrying the activity on this error.
+    ///
+    /// Only [`Self::ProviderOperationLost`] is non-retryable today: a retry
+    /// would just re-discover the same dead provider operation row, so the
+    /// failure is surfaced to the workflow's `classify_step_failure` path
+    /// (→ refund) immediately rather than after the retry budget drains.
+    #[must_use]
+    pub fn is_non_retryable(&self) -> bool {
+        matches!(self, Self::ProviderOperationLost { .. })
+    }
+
+    #[must_use]
     pub fn into_activity_error(self) -> ActivityError {
-        self.into()
+        if self.is_non_retryable() {
+            ActivityError::application(ApplicationFailure::non_retryable(anyhow::Error::new(self)))
+        } else {
+            self.into()
+        }
     }
 }
 

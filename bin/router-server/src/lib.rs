@@ -120,14 +120,6 @@ pub struct RouterServerArgs {
     #[arg(long, env = "ARBITRUM_PAYMASTER_PRIVATE_KEY")]
     pub arbitrum_paymaster_private_key: Option<String>,
 
-    /// Extra native balance to leave in EVM token vaults after action gas estimate, in wei
-    #[arg(long, env = "EVM_PAYMASTER_VAULT_GAS_BUFFER_WEI", default_value = "0")]
-    pub evm_paymaster_vault_gas_buffer_wei: String,
-
-    /// Deprecated alias for EVM_PAYMASTER_VAULT_GAS_BUFFER_WEI
-    #[arg(long, env = "EVM_PAYMASTER_VAULT_GAS_TARGET_WEI", hide = true)]
-    pub evm_paymaster_vault_gas_target_wei: Option<String>,
-
     /// Bitcoin RPC URL
     #[arg(long, env = "BITCOIN_RPC_URL")]
     pub bitcoin_rpc_url: String,
@@ -255,7 +247,7 @@ pub struct RouterServerArgs {
 
     /// Bearer API key accepted from the public router gateway for quote/order
     /// endpoints. Required when router-api binds a non-loopback host because
-    /// create-order responses contain raw cancellation secrets.
+    /// these endpoints create custodial vaults and orders.
     #[arg(long, env = "ROUTER_GATEWAY_API_KEY")]
     pub router_gateway_api_key: Option<String>,
 

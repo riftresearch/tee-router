@@ -52,9 +52,6 @@ pub const MOCK_VELORA_NATIVE_RESERVE_WEI: u128 = 1_000_000_000_000_000_000_000_0
 pub const MOCK_CCTP_TOKEN_MESSENGER_V2_ADDRESS: &str = "0xcccccccccccccccccccccccccccccccccccc0001";
 pub const MOCK_CCTP_MESSAGE_TRANSMITTER_V2_ADDRESS: &str =
     "0xcccccccccccccccccccccccccccccccccccc0002";
-const MOCK_SERVICE_PAYMASTER_VAULT_GAS_BUFFER_WEI: U256 =
-    U256::from_limbs([100_000_000_000_000_000, 0, 0, 0]);
-
 /// Holds all Ethereum-related devnet state.
 pub struct EthDevnet {
     pub anvil: Arc<AnvilInstance>,
@@ -323,7 +320,6 @@ pub async fn setup_mock_service_paymasters(
                 provider.clone(),
                 wallet_provider,
                 service_signer,
-                MOCK_SERVICE_PAYMASTER_VAULT_GAS_BUFFER_WEI,
                 metric_label,
                 PaymasterBatchConfig::default(),
             );

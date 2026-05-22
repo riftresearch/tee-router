@@ -2,7 +2,6 @@ use crate::protocol::{AssetId, ChainId, DepositAsset};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::fmt;
 use uuid::Uuid;
 
 pub fn empty_metadata() -> Value {
@@ -274,27 +273,11 @@ pub struct RouterOrderQuoteEnvelope {
     pub quote: RouterOrderQuote,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterOrderEnvelope {
     pub order: RouterOrder,
     pub quote: RouterOrderQuote,
     pub funding_vault: Option<DepositVaultEnvelope>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cancellation_secret: Option<String>,
-}
-
-impl fmt::Debug for RouterOrderEnvelope {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RouterOrderEnvelope")
-            .field("order", &self.order)
-            .field("quote", &self.quote)
-            .field("funding_vault", &self.funding_vault)
-            .field(
-                "cancellation_secret",
-                &self.cancellation_secret.as_ref().map(|_| "<redacted>"),
-            )
-            .finish()
-    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

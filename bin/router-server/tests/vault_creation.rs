@@ -84,7 +84,6 @@ use uuid::Uuid;
 
 const CANCELLATION_COMMITMENT_DOMAIN: &[u8] = b"router-server-cancel-v1";
 const MOCK_ERC20_ADDRESS: &str = "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf";
-const EVM_PAYMASTER_VAULT_GAS_BUFFER_WEI: u64 = 100_000_000_000_000;
 const POSTGRES_PORT: u16 = 5432;
 const POSTGRES_USER: &str = "postgres";
 const POSTGRES_PASSWORD: &str = "password";
@@ -280,7 +279,6 @@ async fn harness() -> &'static TestHarness {
                 Duration::from_secs(12),
                 Some(EvmGasSponsorConfig {
                     private_key: anvil_paymaster_private_key(&devnet.ethereum),
-                    vault_gas_buffer_wei: U256::from(EVM_PAYMASTER_VAULT_GAS_BUFFER_WEI),
                 }),
             )
             .await
@@ -296,7 +294,6 @@ async fn harness() -> &'static TestHarness {
                 Duration::from_secs(2),
                 Some(EvmGasSponsorConfig {
                     private_key: anvil_paymaster_private_key(&devnet.base),
-                    vault_gas_buffer_wei: U256::from(EVM_PAYMASTER_VAULT_GAS_BUFFER_WEI),
                 }),
             )
             .await
@@ -312,7 +309,6 @@ async fn harness() -> &'static TestHarness {
                 Duration::from_secs(2),
                 Some(EvmGasSponsorConfig {
                     private_key: anvil_paymaster_private_key(&devnet.arbitrum),
-                    vault_gas_buffer_wei: U256::from(EVM_PAYMASTER_VAULT_GAS_BUFFER_WEI),
                 }),
             )
             .await
@@ -990,8 +986,6 @@ fn test_router_args(
         arbitrum_rpc_url: harness.arbitrum_endpoint_url().to_string(),
         arbitrum_reference_token: MOCK_ERC20_ADDRESS.to_string(),
         arbitrum_paymaster_private_key: Some(harness.arbitrum_spawned_api_paymaster_private_key()),
-        evm_paymaster_vault_gas_buffer_wei: EVM_PAYMASTER_VAULT_GAS_BUFFER_WEI.to_string(),
-        evm_paymaster_vault_gas_target_wei: None,
         bitcoin_rpc_url: harness.bitcoin_rpc_url(),
         bitcoin_rpc_auth: harness.bitcoin_auth(),
         untrusted_esplora_http_server_url: harness.esplora_url(),
@@ -2729,7 +2723,6 @@ async fn router_api_quote_and_order_flow_uses_production_component_initializatio
     let body = order_response.text().await.unwrap();
     assert_eq!(status, reqwest::StatusCode::CREATED, "{body}");
     let order: RouterOrderEnvelope = serde_json::from_str(&body).unwrap();
-    assert!(order.cancellation_secret.is_some());
     assert_eq!(
         order
             .quote
@@ -2777,7 +2770,6 @@ async fn router_api_quote_and_order_flow_uses_production_component_initializatio
         retry_order.funding_vault.as_ref().unwrap().vault.id,
         funding_vault.vault.id
     );
-    assert_eq!(retry_order.cancellation_secret, order.cancellation_secret);
 
     let fetched_order: RouterOrderEnvelope = client
         .get(format!("{base_url}/api/v1/orders/{}", order.order.id))
@@ -3019,19 +3011,6 @@ async fn router_public_gateway_routes_require_bearer_api_key_when_configured() {
         .unwrap();
     assert_eq!(
         unauthenticated_order.status(),
-        reqwest::StatusCode::UNAUTHORIZED
-    );
-
-    let unauthenticated_cancel = client
-        .post(format!("{base_url}/api/v1/orders/{order_id}/cancellations"))
-        .json(&json!({
-            "cancellation_secret": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        unauthenticated_cancel.status(),
         reqwest::StatusCode::UNAUTHORIZED
     );
 
@@ -3432,8 +3411,8 @@ async fn funding_hint_records_observation_for_refunding_late_deposit() {
     let h = harness().await;
     let db = test_db().await;
     let settings = Arc::new(test_settings(dir.path()));
-    let vault_manager = VaultManager::new(db, settings, h.chain_registry.clone());
-    let (secret_hex, commitment_hex) = make_cancellation_pair();
+    let vault_manager = VaultManager::new(db.clone(), settings, h.chain_registry.clone());
+    let (_, commitment_hex) = make_cancellation_pair();
     let vault = vault_manager
         .create_vault(CreateVaultRequest {
             recovery_address: format!("{:?}", h.ethereum_funded_address()),
@@ -3452,8 +3431,9 @@ async fn funding_hint_records_observation_for_refunding_late_deposit() {
         U256::from_str_radix(deposit_amount, 10).unwrap(),
     )
     .await;
-    let refunding = vault_manager
-        .cancel_vault(vault.id, &secret_hex)
+    let refunding = db
+        .vaults()
+        .request_refund(vault.id, Utc::now())
         .await
         .unwrap();
     assert_eq!(refunding.status, DepositVaultStatus::Refunding);
@@ -7677,38 +7657,6 @@ async fn create_vault_invalid_evm_token_address_rejected() {
 
 #[tokio::test]
 #[ignore = "integration: spawns devnet stack"]
-async fn cancel_vault_rejects_executing_status() {
-    let dir = tempfile::tempdir().unwrap();
-    let (vm, db) = test_vault_manager_with_db(dir.path()).await;
-    let (secret_hex, commitment_hex) = make_cancellation_pair();
-
-    let request = CreateVaultRequest {
-        cancellation_commitment: commitment_hex,
-        ..evm_native_request()
-    };
-    let vault = vm.create_vault(request).await.unwrap();
-    let executing = db
-        .vaults()
-        .transition_status(
-            vault.id,
-            DepositVaultStatus::PendingFunding,
-            DepositVaultStatus::Executing,
-            Utc::now(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(executing.status, DepositVaultStatus::Executing);
-
-    let err = vm.cancel_vault(vault.id, &secret_hex).await.unwrap_err();
-    assert!(err.to_string().contains("executing"));
-
-    let fetched = vm.get_vault(vault.id).await.unwrap();
-    assert_eq!(fetched.status, DepositVaultStatus::Executing);
-    assert!(fetched.refund_requested_at.is_none());
-}
-
-#[tokio::test]
-#[ignore = "integration: spawns devnet stack"]
 async fn refund_claim_lease_blocks_duplicate_workers() {
     let dir = tempfile::tempdir().unwrap();
     let (vm, db) = test_vault_manager_with_db(dir.path()).await;
@@ -7955,12 +7903,12 @@ async fn refund_success_completion_requires_current_processing_lease() {
 
 #[tokio::test]
 #[ignore = "integration: spawns devnet stack"]
-async fn cancel_vault_requests_worker_refund_for_evm_native_eth() {
+async fn refund_pass_returns_funds_for_evm_native_eth() {
     let h = harness().await;
     let dir = tempfile::tempdir().unwrap();
-    let vm = test_vault_manager(dir.path()).await;
+    let (vm, db) = test_vault_manager_with_db(dir.path()).await;
 
-    let (secret_hex, commitment_hex) = make_cancellation_pair();
+    let (_, commitment_hex) = make_cancellation_pair();
     let recovery_address = h.ethereum_funded_address();
 
     let request = CreateVaultRequest {
@@ -7984,7 +7932,11 @@ async fn cancel_vault_requests_worker_refund_for_evm_native_eth() {
     let deposit_amount = U256::from(1_000_000_000_000_000_000u128); // 1 ETH
     anvil_set_balance(h, vault_address, deposit_amount).await;
 
-    let requested = vm.cancel_vault(vault.id, &secret_hex).await.unwrap();
+    let requested = db
+        .vaults()
+        .request_refund(vault.id, Utc::now())
+        .await
+        .unwrap();
     assert_eq!(requested.status, DepositVaultStatus::Refunding);
     assert!(requested.refund_requested_at.is_some());
 
@@ -8007,12 +7959,12 @@ async fn cancel_vault_requests_worker_refund_for_evm_native_eth() {
 
 #[tokio::test]
 #[ignore = "integration: spawns devnet stack"]
-async fn cancel_vault_requests_worker_refund_for_evm_erc20() {
+async fn refund_pass_returns_funds_for_evm_erc20() {
     let h = harness().await;
     let dir = tempfile::tempdir().unwrap();
-    let vm = test_vault_manager(dir.path()).await;
+    let (vm, db) = test_vault_manager_with_db(dir.path()).await;
 
-    let (secret_hex, commitment_hex) = make_cancellation_pair();
+    let (_, commitment_hex) = make_cancellation_pair();
     let recovery_address = h.ethereum_funded_address();
 
     let request = CreateVaultRequest {
@@ -8045,7 +7997,11 @@ async fn cancel_vault_requests_worker_refund_for_evm_erc20() {
         U256::ZERO
     );
 
-    let requested = vm.cancel_vault(vault.id, &secret_hex).await.unwrap();
+    let requested = db
+        .vaults()
+        .request_refund(vault.id, Utc::now())
+        .await
+        .unwrap();
     assert_eq!(requested.status, DepositVaultStatus::Refunding);
     assert!(requested.refund_requested_at.is_some());
 
@@ -8084,12 +8040,12 @@ async fn cancel_vault_requests_worker_refund_for_evm_erc20() {
 
 #[tokio::test]
 #[ignore = "integration: spawns devnet stack"]
-async fn cancel_vault_requests_worker_refund_for_bitcoin() {
+async fn refund_pass_returns_funds_for_bitcoin() {
     let h = harness().await;
     let dir = tempfile::tempdir().unwrap();
-    let vm = test_vault_manager(dir.path()).await;
+    let (vm, db) = test_vault_manager_with_db(dir.path()).await;
 
-    let (secret_hex, commitment_hex) = make_cancellation_pair();
+    let (_, commitment_hex) = make_cancellation_pair();
 
     let request = CreateVaultRequest {
         order_id: None,
@@ -8118,7 +8074,11 @@ async fn cancel_vault_requests_worker_refund_for_bitcoin() {
         .await
         .expect("esplora sync");
 
-    let requested = vm.cancel_vault(vault.id, &secret_hex).await.unwrap();
+    let requested = db
+        .vaults()
+        .request_refund(vault.id, Utc::now())
+        .await
+        .unwrap();
     assert_eq!(requested.status, DepositVaultStatus::Refunding);
     assert!(requested.refund_requested_at.is_some());
 

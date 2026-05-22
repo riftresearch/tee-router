@@ -88,6 +88,22 @@ where
     if let Some(operation) =
         lookup_existing_operation(deps, step, operation_type, &idempotency_key).await?
     {
+        // A `Failed` row means a prior attempt persisted the operation but its
+        // side effect never landed (see `fail_planned_provider_operation` in
+        // `execution.rs`). Re-reading it through `existing_operation_completion`
+        // would map it to a `Waiting` outcome and the workflow would wait
+        // forever for an external event that will never arrive. Surface it as a
+        // non-retryable failure so `classify_step_failure` routes to a refund.
+        // `Planned` / `Submitted` / `WaitingExternal` are genuinely ambiguous
+        // (a worker may have crashed mid-broadcast leaving a real in-flight tx)
+        // and stay on the existing short-circuit path — that case is owned by
+        // the separate stale-running-step mechanism.
+        if operation.status == ProviderOperationStatus::Failed {
+            return Err(OrderActivityError::provider_operation_lost(format!(
+                "provider operation {} for step {} did not land on a prior attempt",
+                operation.id, step.id
+            )));
+        }
         return Ok(existing_operation_completion(
             step,
             operation,
@@ -201,7 +217,7 @@ async fn persist_intent_before_side_effect(
         .map_err(OrderActivityError::db_query)
 }
 
-fn intent_state(intent: &ProviderExecutionIntent) -> &ProviderExecutionState {
+pub(super) fn intent_state(intent: &ProviderExecutionIntent) -> &ProviderExecutionState {
     match intent {
         ProviderExecutionIntent::ProviderOnly { state, .. }
         | ProviderExecutionIntent::CustodyAction { state, .. }

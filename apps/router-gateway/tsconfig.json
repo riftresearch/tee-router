@@ -4,7 +4,6 @@
     "rootDir": "."
   },
   "include": [
-    "src/**/*.ts",
-    "scripts/**/*.ts"
+    "src/**/*.ts"
   ]
 }

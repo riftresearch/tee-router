@@ -59,7 +59,6 @@ pub(crate) struct PaymasterActor {
     pub(crate) wallet_provider: DynProvider,
     pub(crate) sponsor_signer: PrivateKeySigner,
     pub(crate) sponsor_address: Address,
-    pub(crate) vault_gas_buffer_wei: U256,
     pub(crate) batch_config: PaymasterBatchConfig,
     pub(crate) metric_label: &'static str,
 }
@@ -110,7 +109,6 @@ impl Paymaster {
         provider: DynProvider,
         wallet_provider: DynProvider,
         sponsor_signer: PrivateKeySigner,
-        vault_gas_buffer_wei: U256,
         metric_label: &'static str,
         config: PaymasterBatchConfig,
     ) -> PaymasterHandle {
@@ -119,7 +117,6 @@ impl Paymaster {
             wallet_provider,
             sponsor_address: sponsor_signer.address(),
             sponsor_signer,
-            vault_gas_buffer_wei,
             batch_config: config,
             metric_label,
         };
@@ -459,15 +456,17 @@ impl PaymasterActor {
             action_max_fee_per_gas,
             "paymaster action gas reservation",
         )?;
+        // Apply percentage headroom so the funded vault still covers the burn
+        // tx's `gas * price + value` if the network gas price drifts up between
+        // this estimate and the funded action's execution.
+        let action_reserved_fee = crate::batched_tx::gas_reservation_with_headroom(
+            action_reserved_fee,
+            "paymaster action gas reservation headroom",
+        )?;
         let required_vault_balance = checked_u256_add(
             value,
             action_reserved_fee,
             "paymaster vault required balance",
-        )?;
-        let required_vault_balance = checked_u256_add(
-            required_vault_balance,
-            self.vault_gas_buffer_wei,
-            "paymaster vault gas buffer",
         )?;
 
         let effective_balance = match virtual_vault_balances.entry(vault_address) {
@@ -601,6 +600,31 @@ mod tests {
         assert_eq!(prepared.execution.target, vault_address);
         assert_eq!(prepared.execution.value, U256::from(60));
         assert!(prepared.execution.callData.is_empty());
+    }
+
+    #[test]
+    fn gas_reservation_headroom_applies_twenty_five_percent_ceiling() {
+        use crate::batched_tx::gas_reservation_with_headroom;
+
+        // 25% headroom via checked ceiling math: `* 5 / 4`.
+        assert_eq!(
+            gas_reservation_with_headroom(U256::ZERO, "test").unwrap(),
+            U256::ZERO
+        );
+        assert_eq!(
+            gas_reservation_with_headroom(U256::from(1), "test").unwrap(),
+            U256::from(2)
+        );
+        assert_eq!(
+            gas_reservation_with_headroom(U256::from(100), "test").unwrap(),
+            U256::from(125)
+        );
+        // The 0.16% gas-price drift from the bug report (have 680649200000,
+        // want 681768939253) is comfortably inside the 25% headroom.
+        assert!(
+            gas_reservation_with_headroom(U256::from(680_649_200_000_u64), "test").unwrap()
+                >= U256::from(681_768_939_253_u64)
+        );
     }
 
     #[test]

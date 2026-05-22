@@ -1953,7 +1953,6 @@ async fn test_chain_registry(
                 "0x{}",
                 alloy::hex::encode(devnet.base.anvil.keys()[0].to_bytes())
             ),
-            vault_gas_buffer_wei: U256::from(EVM_NATIVE_GAS_BUFFER_WEI),
         }),
     )
     .await
@@ -1973,7 +1972,6 @@ async fn test_chain_registry(
                     "0x{}",
                     alloy::hex::encode(devnet.ethereum.anvil.keys()[0].to_bytes())
                 ),
-                vault_gas_buffer_wei: U256::from(EVM_NATIVE_GAS_BUFFER_WEI),
             }),
         )
         .await
@@ -1993,7 +1991,6 @@ async fn test_chain_registry(
                     "0x{}",
                     alloy::hex::encode(devnet.arbitrum.anvil.keys()[0].to_bytes())
                 ),
-                vault_gas_buffer_wei: U256::from(EVM_NATIVE_GAS_BUFFER_WEI),
             }),
         )
         .await

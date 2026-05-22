@@ -988,8 +988,6 @@ fn order_worker_runtime_args_from_router_args(args: &RouterServerArgs) -> OrderW
         arbitrum_rpc_url: args.arbitrum_rpc_url.clone(),
         arbitrum_reference_token: args.arbitrum_reference_token.clone(),
         arbitrum_paymaster_private_key: args.arbitrum_paymaster_private_key.clone(),
-        evm_paymaster_vault_gas_buffer_wei: args.evm_paymaster_vault_gas_buffer_wei.clone(),
-        evm_paymaster_vault_gas_target_wei: args.evm_paymaster_vault_gas_target_wei.clone(),
         bitcoin_rpc_url: args.bitcoin_rpc_url.clone(),
         bitcoin_rpc_auth: args.bitcoin_rpc_auth.clone(),
         untrusted_esplora_http_server_url: args.untrusted_esplora_http_server_url.clone(),
@@ -1082,8 +1080,6 @@ fn router_args(
         arbitrum_rpc_url: devnet.arbitrum.anvil.endpoint_url().to_string(),
         arbitrum_reference_token: chain_tokens.arbitrum_reference_token.to_string(),
         arbitrum_paymaster_private_key: Some(anvil_private_key(&devnet.arbitrum)),
-        evm_paymaster_vault_gas_buffer_wei: "100000000000000".to_string(),
-        evm_paymaster_vault_gas_target_wei: None,
         bitcoin_rpc_url: bitcoin_rpc_url(devnet),
         bitcoin_rpc_auth: Auth::CookieFile(devnet.bitcoin.cookie.clone()),
         untrusted_esplora_http_server_url: devnet
@@ -1167,8 +1163,6 @@ fn live_router_args(
         arbitrum_rpc_url: live.arbitrum_rpc_url.clone(),
         arbitrum_reference_token: chain_tokens.arbitrum_reference_token.to_string(),
         arbitrum_paymaster_private_key: live.arbitrum_paymaster_private_key.clone(),
-        evm_paymaster_vault_gas_buffer_wei: "100000000000000".to_string(),
-        evm_paymaster_vault_gas_target_wei: None,
         bitcoin_rpc_url: live.bitcoin_rpc_url.clone(),
         bitcoin_rpc_auth: live.bitcoin_rpc_auth.clone(),
         untrusted_esplora_http_server_url: live.electrum_http_server_url.clone(),
@@ -1227,6 +1221,7 @@ async fn spawn_sauron(
     hl_shim_indexer_url: Option<String>,
     bitcoin_observer_urls: Option<BitcoinObserverUrls>,
     hyperunit_api_url: Option<String>,
+    cctp_api_url: String,
 ) -> RuntimeTask {
     let args = SauronArgs {
         log_level: "warn".to_string(),
@@ -1259,6 +1254,7 @@ async fn spawn_sauron(
         hl_shim_indexer_url,
         hyperunit_api_url,
         hyperunit_proxy_url: None,
+        cctp_api_url,
         sauron_hl_bridge_match_window_seconds: 1_800,
         sauron_hyperunit_observer_concurrency: 64,
         sauron_hu_poll_fast_millis: 5_000,
@@ -1644,6 +1640,7 @@ fn live_sauron_args(
         hl_shim_indexer_url: None,
         hyperunit_api_url: Some(live.hyperunit_api_url.clone()),
         hyperunit_proxy_url: live.hyperunit_proxy_url.clone(),
+        cctp_api_url: sauron::cctp_iris::CCTP_IRIS_DEFAULT_BASE_URL.to_string(),
         sauron_hl_bridge_match_window_seconds: 1_800,
         sauron_hyperunit_observer_concurrency: 64,
         sauron_hu_poll_fast_millis: 5_000,
@@ -2882,6 +2879,7 @@ async fn run_mock_runtime_route(route: RuntimeRoute) {
         Some(hl_shim_base_url),
         Some(bitcoin_observer_urls),
         Some(mocks.base_url().to_string()),
+        mocks.base_url().to_string(),
     )
     .await;
     let client = reqwest::Client::new();

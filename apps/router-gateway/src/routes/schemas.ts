@@ -6,10 +6,8 @@ export const MAX_AMOUNT_LENGTH = 96
 export const MAX_INTEGRATOR_LENGTH = 128
 export const MIN_IDEMPOTENCY_KEY_LENGTH = 16
 export const MAX_IDEMPOTENCY_KEY_LENGTH = 128
-export const MAX_REFUND_TOKEN_LENGTH = 128
 export const MAX_DATETIME_LENGTH = 64
 const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9._:-]+$/
-const REFUND_TOKEN_PATTERN = /^[A-Za-z0-9_-]+$/
 
 export const AssetIdentifierSchema = z.string().min(1).max(MAX_ASSET_IDENTIFIER_LENGTH)
 export const AddressSchema = z.string().min(1).max(MAX_ADDRESS_LENGTH)
@@ -23,11 +21,6 @@ export const IdempotencyKeySchema = z
     IDEMPOTENCY_KEY_PATTERN,
     'idempotencyKey must contain only letters, numbers, dot, underscore, colon, or hyphen'
   )
-export const RefundTokenSchema = z
-  .string()
-  .min(1)
-  .max(MAX_REFUND_TOKEN_LENGTH)
-  .regex(REFUND_TOKEN_PATTERN, 'refundToken must be base64url text')
 export const DateTimeSchema = z.string().max(MAX_DATETIME_LENGTH).datetime()
 export const EvmSignatureSchema = z
   .string()
@@ -38,13 +31,6 @@ export const AmountFormatSchema = z
   .default('readable')
   .openapi('AmountFormat', {
     example: 'readable'
-  })
-
-export const RefundModeSchema = z
-  .enum(['evmSignature', 'token'])
-  .default('evmSignature')
-  .openapi('RefundMode', {
-    example: 'evmSignature'
   })
 
 export const ErrorResponseSchema = z
@@ -173,20 +159,9 @@ export const OrderResponseSchema = z
         })
       )
       .optional(),
-    amountFormat: AmountFormatSchema,
-    refundMode: RefundModeSchema.optional(),
-    refundAuthorizer: z.string().nullable().optional().openapi({
-      example: '0x2222222222222222222222222222222222222222'
-    }),
-    refundToken: z.string().optional().openapi({
-      example: 'rgt_abcdefghijklmnopqrstuvwxyz'
-    })
+    amountFormat: AmountFormatSchema
   })
   .openapi('OrderResponse')
-
-export const OrderCancellationResponseSchema = OrderResponseSchema.openapi(
-  'OrderCancellationResponse'
-)
 
 export const ErrorResponses = {
   400: {

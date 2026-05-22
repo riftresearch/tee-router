@@ -4,11 +4,10 @@ use crate::{
     services::deposit_address::{derive_deposit_address_for_quote, DepositAddressError},
     telemetry,
 };
-use alloy::primitives::{keccak256, U256};
+use alloy::primitives::U256;
 use blockchain_utils::MempoolEsploraFeeExt;
 use chains::ChainRegistry;
 use chrono::{DateTime, Duration, Utc};
-use hkdf::Hkdf;
 use router_core::{
     config::Settings,
     db::Database,
@@ -22,34 +21,16 @@ use router_core::{
 };
 use router_primitives::{ChainType, TokenIdentifier};
 use serde_json::{json, Value};
-use sha2::Sha256;
 use snafu::Snafu;
-use std::{collections::HashSet, fmt, sync::Arc, time::Instant};
+use std::{collections::HashSet, sync::Arc, time::Instant};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-const CANCELLATION_COMMITMENT_DOMAIN: &[u8] = b"router-server-cancel-v1";
-const ORDER_CANCELLATION_SECRET_DOMAIN: &[u8] = b"router-order-cancel-secret-v1";
 const DEFAULT_CANCEL_AFTER: Duration = Duration::hours(24);
 const REFUND_PASS_LIMIT: i64 = 100;
 const REFUND_LEASE_DURATION: Duration = Duration::minutes(5);
 const REFUND_RETRY_DELAY: Duration = Duration::seconds(30);
 const BITCOIN_REFUND_FEE_VBYTES: f64 = 125.0;
-
-#[derive(Clone, PartialEq, Eq)]
-pub struct OrderCancellationMaterial {
-    pub commitment: String,
-    pub secret: String,
-}
-
-impl fmt::Debug for OrderCancellationMaterial {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("OrderCancellationMaterial")
-            .field("commitment", &self.commitment)
-            .field("secret", &"<redacted>")
-            .finish()
-    }
-}
 
 #[derive(Debug, Snafu)]
 pub enum VaultError {
@@ -71,9 +52,6 @@ pub enum VaultError {
 
     #[snafu(display("Invalid cancellation commitment: {}", reason))]
     InvalidCancellationCommitment { reason: String },
-
-    #[snafu(display("Invalid cancellation secret"))]
-    InvalidCancellationSecret,
 
     #[snafu(display("Refund not allowed: {}", reason))]
     RefundNotAllowed { reason: String },
@@ -302,44 +280,6 @@ impl VaultManager {
 
     pub async fn get_vault(&self, id: Uuid) -> VaultResult<DepositVault> {
         self.db.vaults().get(id).await.map_err(VaultError::database)
-    }
-
-    #[must_use]
-    pub fn order_cancellation_material(&self, quote_id: Uuid) -> OrderCancellationMaterial {
-        let secret_bytes =
-            derive_order_cancellation_secret(&self.settings.master_key_bytes(), quote_id);
-        OrderCancellationMaterial {
-            commitment: compute_cancellation_commitment_hex(&secret_bytes),
-            secret: format!("0x{}", alloy::hex::encode(secret_bytes)),
-        }
-    }
-
-    pub async fn cancel_vault(
-        &self,
-        id: Uuid,
-        cancellation_secret: &str,
-    ) -> VaultResult<DepositVault> {
-        let vault = self.get_vault(id).await?;
-        telemetry::record_vault_cancel_requested(&vault);
-        self.verify_cancellation_secret(cancellation_secret, &vault.cancellation_commitment)?;
-        self.ensure_refund_allowed(&vault)?;
-
-        let now = Utc::now();
-        let requested_vault = self
-            .db
-            .vaults()
-            .request_refund(id, now)
-            .await
-            .map_err(VaultError::database)?;
-        if requested_vault.status != vault.status {
-            telemetry::record_vault_transition(
-                &requested_vault,
-                vault.status,
-                requested_vault.status,
-            );
-        }
-
-        Ok(requested_vault)
     }
 
     pub async fn record_funding_hint(
@@ -1310,43 +1250,6 @@ impl VaultManager {
         })
     }
 
-    fn verify_cancellation_secret(
-        &self,
-        cancellation_secret: &str,
-        expected_commitment: &str,
-    ) -> VaultResult<()> {
-        let secret_bytes = decode_hex_32(cancellation_secret)
-            .map_err(|_| VaultError::InvalidCancellationSecret)?;
-        let expected_commitment = decode_hex_32(expected_commitment)
-            .map_err(|_| VaultError::InvalidCancellationSecret)?;
-        let actual_commitment = compute_cancellation_commitment(&secret_bytes);
-
-        if actual_commitment == expected_commitment {
-            Ok(())
-        } else {
-            Err(VaultError::InvalidCancellationSecret)
-        }
-    }
-
-    fn ensure_refund_allowed(&self, vault: &DepositVault) -> VaultResult<()> {
-        match vault.status {
-            DepositVaultStatus::PendingFunding
-            | DepositVaultStatus::Funded
-            | DepositVaultStatus::Refunding => Ok(()),
-            DepositVaultStatus::Executing => Err(VaultError::RefundNotAllowed {
-                reason: "executing vaults cannot be cancelled".to_string(),
-            }),
-            DepositVaultStatus::RefundRequired => Err(VaultError::RefundNotAllowed {
-                reason: "refund-required vaults cannot be cancelled".to_string(),
-            }),
-            DepositVaultStatus::Completed => Err(VaultError::RefundNotAllowed {
-                reason: "completed vaults cannot be cancelled".to_string(),
-            }),
-            DepositVaultStatus::Refunded => Err(VaultError::RefundNotAllowed {
-                reason: "refunded vaults cannot be cancelled".to_string(),
-            }),
-        }
-    }
 }
 
 fn refund_error_requires_admin_resolution(message: &str) -> bool {
@@ -1600,24 +1503,6 @@ fn bitcoin_refund_fee_sats(next_block_fee_rate_sat_per_vb: f64) -> Result<u64, S
     Ok(fee as u64)
 }
 
-pub(crate) fn compute_cancellation_commitment(secret_bytes: &[u8; 32]) -> [u8; 32] {
-    keccak256([CANCELLATION_COMMITMENT_DOMAIN, secret_bytes].concat()).into()
-}
-
-pub(crate) fn compute_cancellation_commitment_hex(secret_bytes: &[u8; 32]) -> String {
-    format!(
-        "0x{}",
-        alloy::hex::encode(compute_cancellation_commitment(secret_bytes))
-    )
-}
-
-fn derive_order_cancellation_secret(master_key: &[u8; 64], quote_id: Uuid) -> [u8; 32] {
-    let hkdf = Hkdf::<Sha256>::new(Some(ORDER_CANCELLATION_SECRET_DOMAIN), master_key);
-    let mut secret = [0_u8; 32];
-    hkdf.expand(quote_id.as_bytes(), &mut secret)
-        .expect("router order cancellation secret length is valid for HKDF-SHA256");
-    secret
-}
 
 fn normalize_hex_32(value: &str) -> Result<String, String> {
     let bytes = decode_hex_32(value)?;
@@ -1635,25 +1520,6 @@ fn decode_hex_32(value: &str) -> Result<[u8; 32], String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn test_secret() -> [u8; 32] {
-        [0xab; 32]
-    }
-
-    #[test]
-    fn order_cancellation_material_debug_redacts_secret() {
-        let material = OrderCancellationMaterial {
-            commitment: "0xcommitment".to_string(),
-            secret: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                .to_string(),
-        };
-
-        let rendered = format!("{material:?}");
-        assert!(rendered.contains("0xcommitment"));
-        assert!(rendered.contains("secret"));
-        assert!(rendered.contains("<redacted>"));
-        assert!(!rendered.contains("aaaaaaaaaaaaaaaa"));
-    }
 
     #[test]
     fn decode_hex_32_with_0x_prefix() {
@@ -1690,69 +1556,6 @@ mod tests {
     #[test]
     fn normalize_hex_32_rejects_bad_length() {
         assert!(normalize_hex_32("0xdead").is_err());
-    }
-
-    #[test]
-    fn cancellation_commitment_is_deterministic() {
-        let secret = test_secret();
-        let c1 = compute_cancellation_commitment(&secret);
-        let c2 = compute_cancellation_commitment(&secret);
-        assert_eq!(c1, c2);
-    }
-
-    #[test]
-    fn cancellation_commitment_uses_domain_separation() {
-        let secret = test_secret();
-        let commitment = compute_cancellation_commitment(&secret);
-        let raw_hash: [u8; 32] = keccak256(secret).into();
-        assert_ne!(commitment, raw_hash);
-    }
-
-    #[test]
-    fn cancellation_commitment_differs_for_different_secrets() {
-        let c1 = compute_cancellation_commitment(&[0xaa; 32]);
-        let c2 = compute_cancellation_commitment(&[0xbb; 32]);
-        assert_ne!(c1, c2);
-    }
-
-    #[test]
-    fn order_cancellation_secret_is_recoverable_by_quote_and_master_key() {
-        let master_key = [0x42_u8; 64];
-        let quote_id = Uuid::parse_str("019557a1-0000-7000-8000-000000000001").unwrap();
-        let secret = derive_order_cancellation_secret(&master_key, quote_id);
-
-        assert_eq!(
-            secret,
-            derive_order_cancellation_secret(&master_key, quote_id)
-        );
-        assert_ne!(
-            secret,
-            derive_order_cancellation_secret(
-                &master_key,
-                Uuid::parse_str("019557a1-0000-7000-8000-000000000002").unwrap()
-            )
-        );
-        assert_ne!(
-            secret,
-            derive_order_cancellation_secret(&[0x43_u8; 64], quote_id)
-        );
-    }
-
-    #[test]
-    fn order_cancellation_material_matches_commitment() {
-        let master_key = [0x42_u8; 64];
-        let quote_id = Uuid::parse_str("019557a1-0000-7000-8000-000000000001").unwrap();
-        let secret = derive_order_cancellation_secret(&master_key, quote_id);
-        let material = OrderCancellationMaterial {
-            commitment: compute_cancellation_commitment_hex(&secret),
-            secret: format!("0x{}", alloy::hex::encode(secret)),
-        };
-
-        assert_eq!(material.secret.len(), 66);
-        assert_eq!(
-            material.commitment,
-            compute_cancellation_commitment_hex(&secret)
-        );
     }
 
     #[test]

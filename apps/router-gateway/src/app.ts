@@ -6,11 +6,9 @@ import { HTTPException } from 'hono/http-exception'
 import { type GatewayConfig, loadConfig } from './config'
 import { errorBody } from './errors'
 import {
-  createOrderCancelHandler,
   createOrderGetHandler,
   // createOrderLimitHandler,
   createOrderMarketHandler,
-  orderCancelRoute,
   orderGetRoute,
   // orderLimitRoute,
   orderMarketRoute
@@ -97,7 +95,6 @@ export function createApp(
   // Limit orders are temporarily disabled. Keep the route and handler code in
   // routes/order.ts, but do not register it in the live OpenAPI route registry.
   // app.openapi(orderLimitRoute, createOrderLimitHandler(config, deps) as never)
-  app.openapi(orderCancelRoute, createOrderCancelHandler(config, deps) as never)
   app.openapi(healthRoute, createHealthHandler())
   app.openapi(
     dependencyHealthRoute,

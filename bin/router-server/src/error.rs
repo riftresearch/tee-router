@@ -188,9 +188,6 @@ impl From<crate::services::vault_manager::VaultError> for RouterServerError {
             VaultError::InvalidCancellationCommitment { reason } => {
                 Self::Validation { message: reason }
             }
-            VaultError::InvalidCancellationSecret => Self::Validation {
-                message: "Invalid cancellation secret".to_string(),
-            },
             VaultError::RefundNotAllowed { reason } => Self::Validation { message: reason },
             VaultError::InvalidOrderBinding { reason } => Self::Validation { message: reason },
             VaultError::InvalidFundingAmount { field, reason } => Self::Validation {
