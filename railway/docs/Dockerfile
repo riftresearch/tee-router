@@ -1,6 +1,8 @@
+# syntax=docker/dockerfile:1.7
 FROM node:22-alpine
 
-RUN apk add --no-cache socat \
+RUN --mount=type=cache,id=tee-router-npm-cache,target=/root/.npm,sharing=locked \
+    apk add --no-cache socat \
   && npm install -g mint@latest
 
 WORKDIR /app

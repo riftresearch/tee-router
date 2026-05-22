@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 FROM oven/bun:1.3.8-alpine
 
 WORKDIR /app
@@ -7,7 +8,8 @@ RUN apk add --no-cache nodejs
 COPY package.json bun.lock tsconfig.base.json ./
 COPY apps/explorer/package.json ./apps/explorer/package.json
 
-RUN bun install
+RUN --mount=type=cache,id=tee-router-bun-cache,target=/root/.bun/install/cache,sharing=locked \
+    bun install
 
 COPY apps/explorer ./apps/explorer
 

@@ -2,12 +2,8 @@ name: Router Image
 
 on:
   push:
-    branches:
-      - main
-      - master
     tags:
       - "v*.*.*"
-  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -21,7 +17,7 @@ env:
 jobs:
   build:
     name: Build router image
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, tee-router-builder]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -56,6 +52,11 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          # Persistent named builder on the self-hosted runner so the
+          # Dockerfiles' `RUN --mount=type=cache` survives between builds.
+          name: tee-router-cache
+          cleanup: false
 
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
@@ -93,8 +94,7 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Build cache persists in the self-hosted runner's named BuildKit builder.
 
       - name: Build and optionally push temporal-worker image
         uses: docker/build-push-action@v6
@@ -104,5 +104,4 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.temporal-worker-meta.outputs.tags }}
           labels: ${{ steps.temporal-worker-meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Build cache persists in the self-hosted runner's named BuildKit builder.

@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 # Use Node.js 20 Alpine for smaller image size
 FROM node:20-alpine
 
@@ -12,7 +13,8 @@ WORKDIR /app
 COPY evm-token-indexer/package.json evm-token-indexer/pnpm-lock.yaml ./
 
 # Install dependencies
-RUN pnpm install --frozen-lockfile
+RUN --mount=type=cache,id=tee-router-pnpm-store,target=/root/.local/share/pnpm/store,sharing=locked \
+    pnpm install --frozen-lockfile
 
 # Copy application source from the monorepo subdirectory.
 COPY evm-token-indexer/ .
