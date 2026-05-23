@@ -303,12 +303,14 @@ mod tests {
     /// 0x2d77d9667cc326816cd0ddc736a2222829e2087c7073362f16e0043141e43c96).
     /// Pins the on-the-wire shape so a future field rename / re-nesting fails
     /// loudly instead of silently no-op'ing the receive-amount invariant.
+    ///
+    /// Fixture lives in the shared `venue-fixtures` crate so every venue's
+    /// pinned real responses live in one place.
     #[test]
     fn real_iris_response_deserializes_with_nested_decoded_message_body() {
-        let body: serde_json::Value = serde_json::from_str(include_str!(
-            "../tests/fixtures/cctp/iris_v2_complete_real.json"
-        ))
-        .expect("fixture parses");
+        let body: serde_json::Value =
+            serde_json::from_str(venue_fixtures::cctp::IRIS_V2_COMPLETE_REAL)
+                .expect("fixture parses");
         let parsed: CctpMessagesResponse =
             serde_json::from_value(body).expect("real iris response decodes");
         assert_eq!(
