@@ -1,0 +1,15 @@
+Quote
+  send:          40 Base.USDC
+  estimated out: 0.00051 Bitcoin.BTC
+  fee:           1 Hyperliquid.USDC (Hyperliquid activation fee)
+  quote id:      019e5650-745c-7f91-aa90-516d059c7b85
+  expires:       2026-05-23T19:30:03.937940623Z
+
+Broadcasting deposit of 40000000 (raw units) to 0x845ca1723d8661f3bdf6c9560d7bc6a328ceb2c0 ...
+
+Order created.
+  order id:     019e5650-75fd-7c91-afe9-faa07a997697
+  deposit tx:   0x502238360c656cf8cef59bc6a910310c17930a30f8b97d371ed0bbe54cb45f03
+  status:       pending_funding
+
+Track it:  router-cli status 019e5650-75fd-7c91-afe9-faa07a997697 --gateway-url https://router-gateway-v3-production.up.railway.app

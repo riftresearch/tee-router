@@ -1,0 +1,7 @@
+wallet: 0x33F65788aCa48D733c2C2444Ac9F79B18206aa92
+btc_destination: bc1qk4m6mpxulnlufegdh3w40kayhx9m722am38apn
+gateway: https://router-gateway-v3-production.up.railway.app
+backend_release: 0.2.14
+phala_cvm: app_a8542ad1a740d4ef3efb4b4cb9ea4c1ce5977d3c
+test_amount_in: 40 USDC (Base)
+test_amount_format: readable

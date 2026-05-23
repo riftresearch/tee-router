@@ -23,11 +23,11 @@ RUN mkdir -p .ponder && chown -R node:node /app
 # Switch to non-root user
 USER node
 
-# Expose the port (can be overridden by PONDER_PORT)
+# Expose the port. Railway's PORT wins when present; PONDER_PORT is the local fallback.
 EXPOSE 4001
 
-# Health check - uses environment variable if available
+# Health check - uses the same port selection as the start command.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=40s --retries=3 \
-  CMD wget --no-verbose --tries=1 --spider http://localhost:${PONDER_PORT:-4001}/health || exit 1
+  CMD wget --no-verbose --tries=1 --spider http://localhost:${PORT:-${PONDER_PORT:-4001}}/health || exit 1
 
-CMD ["sh", "-c", "pnpm start --port ${PONDER_PORT:-4001}"]
+CMD ["sh", "-c", "pnpm start --port ${PORT:-${PONDER_PORT:-4001}}"]
