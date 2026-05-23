@@ -160,6 +160,11 @@ struct CctpMessageEntry {
     #[serde(default)]
     #[allow(dead_code)]
     decoded_message: Option<CctpDecodedMessage>,
+    /// Iris V2 `delayReason` — present when status is `pending_confirmations`
+    /// and the burn is stalled. `AmountAboveMax` is terminal; the others are
+    /// retryable. See `router-core`'s `CctpDelayReason` for the same enum.
+    #[serde(default)]
+    delay_reason: Option<CctpDelayReason>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -170,13 +175,35 @@ struct CctpDecodedMessage {
     decoded_message_body: Option<Value>,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CctpDelayReason {
+    AmountAboveMax,
+    InsufficientFee,
+    InsufficientAllowanceAvailable,
+}
+
+impl CctpDelayReason {
+    fn is_terminal(self) -> bool {
+        matches!(self, CctpDelayReason::AmountAboveMax)
+    }
+}
+
 /// Reduces a set of Iris message entries to a single readiness verdict.
 ///
-/// A `failed` entry wins (terminal); otherwise a `complete` entry with
-/// non-empty `message` and `attestation` is `Ready`; anything else is
-/// `Pending`. Matches `CctpProvider::observe_bridge_operation`'s logic.
+/// A message with `delayReason == AmountAboveMax` is terminal (`Failed`);
+/// otherwise a `complete` entry with non-empty `message` + `attestation`
+/// is `Ready`; anything else is `Pending`. Matches the same semantics in
+/// `router-core::action_providers::CctpProvider`.
+///
+/// Real Iris V2 only emits two `status` values: `complete` and
+/// `pending_confirmations`. The legacy `"failed"|"failure"|"error"` string
+/// check was a fabrication that never fires against real Iris.
 fn classify_messages(messages: &[CctpMessageEntry]) -> CctpAttestationStatus {
-    if messages.iter().any(|message| status_is_failed(&message.status)) {
+    if messages
+        .iter()
+        .any(|message| message.delay_reason.is_some_and(CctpDelayReason::is_terminal))
+    {
         return CctpAttestationStatus::Failed;
     }
     let ready = messages.iter().any(|message| {
@@ -197,15 +224,6 @@ fn classify_messages(messages: &[CctpMessageEntry]) -> CctpAttestationStatus {
     }
 }
 
-/// Iris terminal failure statuses. Mirrors `cctp_message_status_is_failed` in
-/// `router-core`.
-fn status_is_failed(status: &str) -> bool {
-    matches!(
-        status.to_ascii_lowercase().as_str(),
-        "failed" | "failure" | "error"
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,6 +235,18 @@ mod tests {
             status: status.to_string(),
             event_nonce: None,
             decoded_message: None,
+            delay_reason: None,
+        }
+    }
+
+    fn pending_with_delay(reason: CctpDelayReason) -> CctpMessageEntry {
+        CctpMessageEntry {
+            message: None,
+            attestation: None,
+            status: "pending_confirmations".to_string(),
+            event_nonce: None,
+            decoded_message: None,
+            delay_reason: Some(reason),
         }
     }
 
@@ -244,22 +274,37 @@ mod tests {
     }
 
     #[test]
-    fn failed_message_wins_over_complete() {
+    fn amount_above_max_delay_reason_wins_over_complete() {
+        // Terminal: a pending entry with delayReason=amount_above_max means
+        // Iris will never attest this burn (e.g. amount > Circle per-tx max).
         let messages = vec![
             entry("complete", Some("0xmsg"), Some("0xatt")),
-            entry("failed", None, None),
+            pending_with_delay(CctpDelayReason::AmountAboveMax),
         ];
         assert_eq!(classify_messages(&messages), CctpAttestationStatus::Failed);
     }
 
     #[test]
-    fn iris_failure_statuses_are_terminal() {
-        for status in ["failed", "FAILURE", "Error"] {
-            assert!(status_is_failed(status));
+    fn non_terminal_delay_reasons_remain_pending() {
+        // Insufficient fee / allowance is retryable per Circle's spec.
+        for retryable in [
+            CctpDelayReason::InsufficientFee,
+            CctpDelayReason::InsufficientAllowanceAvailable,
+        ] {
+            let messages = vec![pending_with_delay(retryable)];
+            assert_eq!(classify_messages(&messages), CctpAttestationStatus::Pending);
         }
-        for status in ["complete", "pending", "pending_confirmations"] {
-            assert!(!status_is_failed(status));
-        }
+    }
+
+    #[test]
+    fn delay_reason_enum_deserializes_iris_snake_case() {
+        let v: CctpDelayReason = serde_json::from_str(r#""amount_above_max""#).unwrap();
+        assert_eq!(v, CctpDelayReason::AmountAboveMax);
+        let v: CctpDelayReason = serde_json::from_str(r#""insufficient_fee""#).unwrap();
+        assert_eq!(v, CctpDelayReason::InsufficientFee);
+        let v: CctpDelayReason =
+            serde_json::from_str(r#""insufficient_allowance_available""#).unwrap();
+        assert_eq!(v, CctpDelayReason::InsufficientAllowanceAvailable);
     }
 
     #[test]

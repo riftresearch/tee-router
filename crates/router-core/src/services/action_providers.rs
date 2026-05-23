@@ -2957,7 +2957,7 @@ impl BridgeProvider for CctpProvider {
             let failed = messages_response
                 .messages
                 .iter()
-                .find(|message| cctp_message_status_is_failed(&message.status));
+                .find(|message| message.is_terminally_failed());
             if let Some(message) = failed {
                 return Ok(Some(ProviderOperationObservation {
                     status: ProviderOperationStatus::Failed,
@@ -2969,6 +2969,7 @@ impl BridgeProvider for CctpProvider {
                         "attestation": message.attestation,
                         "event_nonce": message.event_nonce,
                         "decoded_message_body": message.decoded_message_body(),
+                        "delay_reason": message.delay_reason,
                     }),
                     response: Some(serde_json::to_value(&messages_response).map_err(|err| {
                         format!("cctp observe: serialize messages response: {err}")
@@ -2976,7 +2977,7 @@ impl BridgeProvider for CctpProvider {
                     tx_hash: Some(burn_tx_hash.to_string()),
                     error: Some(json!({
                         "status": message.status,
-                        "error": message.error,
+                        "delay_reason": message.delay_reason,
                     })),
                 }));
             }
@@ -3239,8 +3240,11 @@ struct CctpMessageEntry {
     /// (`messages[].decodedMessage.decodedMessageBody`).
     #[serde(default)]
     decoded_message: Option<CctpDecodedMessage>,
+    /// Iris V2 `delayReason` — present when status is `pending_confirmations`
+    /// and the burn is stalled for a known reason. The only terminal reason
+    /// is `AmountAboveMax`; the others are retryable.
     #[serde(default)]
-    error: Option<Value>,
+    delay_reason: Option<CctpDelayReason>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -3250,19 +3254,40 @@ struct CctpDecodedMessage {
     decoded_message_body: Option<Value>,
 }
 
+/// Iris V2 `delayReason` enum. Values come from Circle's spec:
+/// `insufficient_fee`, `amount_above_max`, `insufficient_allowance_available`.
+/// Only `AmountAboveMax` is terminal — the others mean Iris is waiting on
+/// fee bumps or daily-allowance windows and will eventually attest.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CctpDelayReason {
+    AmountAboveMax,
+    InsufficientFee,
+    InsufficientAllowanceAvailable,
+}
+
+impl CctpDelayReason {
+    fn is_terminal(self) -> bool {
+        matches!(self, CctpDelayReason::AmountAboveMax)
+    }
+}
+
 impl CctpMessageEntry {
     fn decoded_message_body(&self) -> Option<&Value> {
         self.decoded_message
             .as_ref()
             .and_then(|dm| dm.decoded_message_body.as_ref())
     }
-}
 
-fn cctp_message_status_is_failed(status: &str) -> bool {
-    matches!(
-        status.to_ascii_lowercase().as_str(),
-        "failed" | "failure" | "error"
-    )
+    /// Real Iris V2 only emits two status values: `complete` and
+    /// `pending_confirmations`. Terminal failure is signalled by
+    /// `delayReason == amount_above_max` (with status still
+    /// `pending_confirmations`). The legacy hand-rolled string check for
+    /// `"failed" | "failure" | "error"` was a fabrication that never fires
+    /// against real Iris.
+    fn is_terminally_failed(&self) -> bool {
+        self.delay_reason.is_some_and(CctpDelayReason::is_terminal)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6731,7 +6756,7 @@ pub fn ethereum_native_asset() -> DepositAsset {
 #[cfg(test)]
 mod hyperliquid_math_tests {
     use super::{
-        build_across_swap_approval_request, cctp_message_status_is_failed, cctp_provider_address,
+        build_across_swap_approval_request, cctp_provider_address,
         cctp_provider_domain, cctp_quote_amounts, cctp_source_domain_from_request,
         checked_timeout_at_ms, classify_hl_leg, compute_base_sz, compute_limit_px,
         decimal_bps_string, encode_erc20_approve, format_hl_spot_price, format_hyperliquid_amount,
@@ -7416,12 +7441,25 @@ mod hyperliquid_math_tests {
     }
 
     #[test]
-    fn cctp_failed_iris_statuses_are_terminal_failures() {
-        for status in ["failed", "failure", "error", "FAILED"] {
-            assert!(cctp_message_status_is_failed(status));
-        }
-        for status in ["complete", "pending", "pending_confirmations"] {
-            assert!(!cctp_message_status_is_failed(status));
+    fn cctp_terminal_failure_is_signalled_by_amount_above_max_delay_reason() {
+        // Real Iris V2 only emits status `complete` or `pending_confirmations`.
+        // Terminal failure is conveyed by `delayReason: amount_above_max`
+        // (status stays `pending_confirmations` per Circle's spec).
+        let parse =
+            |s: &str| -> super::CctpMessageEntry { serde_json::from_str(s).expect("parses") };
+        // Terminal: amount above the per-tx max
+        let terminal = parse(
+            r#"{"status":"pending_confirmations","delayReason":"amount_above_max"}"#,
+        );
+        assert!(terminal.is_terminally_failed());
+        // Retryable: insufficient fee / allowance, plus the no-delay-reason case
+        for body in [
+            r#"{"status":"pending_confirmations","delayReason":"insufficient_fee"}"#,
+            r#"{"status":"pending_confirmations","delayReason":"insufficient_allowance_available"}"#,
+            r#"{"status":"pending_confirmations"}"#,
+            r#"{"status":"complete"}"#,
+        ] {
+            assert!(!parse(body).is_terminally_failed(), "body should be non-terminal: {body}");
         }
     }
 
