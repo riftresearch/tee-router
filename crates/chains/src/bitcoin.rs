@@ -1280,12 +1280,18 @@ impl ChainOperations for BitcoinChain {
         let tx_verbose_result = self.rpc_client.get_raw_transaction_verbose(&txid).await;
         let tx = match tx_verbose_result {
             Ok(tx_verbose) => tx_verbose,
+            // bitcoind's documented RPC code for "tx not found in mempool or
+            // chain" is `-5` (RPC_INVALID_ADDRESS_OR_KEY). Matching by code is
+            // version-stable; the previous string match against
+            // "No such mempool or blockchain transaction" depends on bitcoind's
+            // prose, which has changed between versions. Consistent with
+            // `verify_user_deposit_candidate`'s handling above.
+            Err(bitcoincore_rpc_async::Error::JsonRpc(jsonrpc::Error::Rpc(rpc_err)))
+                if rpc_err.code == -5 =>
+            {
+                return Ok(TxStatus::NotFound);
+            }
             Err(e) => {
-                if e.to_string()
-                    .contains("No such mempool or blockchain transaction")
-                {
-                    return Ok(TxStatus::NotFound);
-                }
                 return Err(crate::Error::BitcoinRpcError {
                     source: e,
                     loc: location!(),
@@ -1500,13 +1506,19 @@ impl ChainOperations for BitcoinChain {
             return Ok(UserDepositCandidateStatus::TransferNotFound);
         };
 
-        let output_address =
-            match bitcoin::Address::from_script(&output.script_pubkey, self.network) {
-                Ok(address) => address,
+        // Compare by script_pubkey rather than by address string. BIP-173
+        // allows uppercase bech32, P2WSH/P2TR can have multiple textual
+        // representations that map to the same script, and address strings
+        // can carry network prefixes that differ from `self.network` even
+        // when the underlying script is identical. The script_pubkey is the
+        // ground truth — see `spendable_output_from_outpoint` above for the
+        // same pattern.
+        let expected_script_pubkey =
+            match parse_bitcoin_address_for_network(recipient_address, self.network) {
+                Ok(addr) => addr.script_pubkey(),
                 Err(_) => return Ok(UserDepositCandidateStatus::TransferNotFound),
             };
-
-        if output_address.to_string() != recipient_address {
+        if output.script_pubkey != expected_script_pubkey {
             return Ok(UserDepositCandidateStatus::TransferNotFound);
         }
 
