@@ -92,7 +92,10 @@ impl UnitChain {
     }
 
     pub fn parse(raw: &str) -> Option<Self> {
-        match raw {
+        // Real Hyperunit returns lowercase on `sourceChain`/`destinationChain`,
+        // but accept any case so a future API change to mixed-case (or callers
+        // building wire values from a Display) doesn't silently mismatch.
+        match raw.to_ascii_lowercase().as_str() {
             "bitcoin" => Some(Self::Bitcoin),
             "ethereum" => Some(Self::Ethereum),
             "base" => Some(Self::Base),
@@ -444,24 +447,6 @@ impl HyperUnitClient {
     ) -> HyperUnitResult<UnitOperationsResponse> {
         let path = request.into_path()?;
         self.get_json(&path).await
-    }
-
-    pub async fn deposit_operation(
-        &self,
-        operation_id: impl AsRef<str>,
-    ) -> HyperUnitResult<UnitOperation> {
-        let operation_id = validated_path_segment("operation_id", operation_id.as_ref())?;
-        self.get_json(&format!("/v2/operations/deposit/{operation_id}"))
-            .await
-    }
-
-    pub async fn withdrawal_operation(
-        &self,
-        operation_id: impl AsRef<str>,
-    ) -> HyperUnitResult<UnitOperation> {
-        let operation_id = validated_path_segment("operation_id", operation_id.as_ref())?;
-        self.get_json(&format!("/v2/operations/withdrawal/{operation_id}"))
-            .await
     }
 
     pub async fn estimate_fees(&self) -> HyperUnitResult<Value> {
@@ -1015,10 +1000,18 @@ mod tests {
             UnitChain::parse("hyperliquid"),
             Some(UnitChain::Hyperliquid)
         );
+        // Real Hyperunit emits lowercase but we accept any case so a future
+        // shape change (mixed-case wire value, Display round-trip with a typo)
+        // doesn't silently miss matching.
         assert_eq!(
             UnitChain::parse("Ethereum"),
-            None,
-            "parse is case-sensitive"
+            Some(UnitChain::Ethereum),
+            "parse is case-insensitive"
+        );
+        assert_eq!(
+            UnitChain::parse("HYPERLIQUID"),
+            Some(UnitChain::Hyperliquid),
+            "parse is case-insensitive"
         );
         assert_eq!(UnitChain::parse("solana"), None, "solana unsupported today");
 

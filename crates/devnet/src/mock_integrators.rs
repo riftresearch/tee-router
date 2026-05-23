@@ -1103,14 +1103,6 @@ impl MockIntegratorServer {
                 get(mock_unit_gen),
             )
             .route("/operations/:address", get(mock_unit_operations))
-            .route(
-                "/v2/operations/deposit/:operation_id",
-                get(mock_unit_deposit_operation),
-            )
-            .route(
-                "/v2/operations/withdrawal/:operation_id",
-                get(mock_unit_withdrawal_operation),
-            )
             .route("/v2/messages/:source_domain", get(mock_cctp_messages))
             .route(
                 "/v2/burn/USDC/fees/:source_domain/:destination_domain",
@@ -4406,47 +4398,14 @@ async fn mock_unit_operations(
     Json(response).into_response()
 }
 
-async fn mock_unit_deposit_operation(
-    State(state): State<Arc<MockIntegratorState>>,
-    Path(operation_id): Path<String>,
-) -> impl IntoResponse {
-    mock_unit_operation_by_id(state, MockUnitOperationKind::Deposit, operation_id).await
-}
-
-async fn mock_unit_withdrawal_operation(
-    State(state): State<Arc<MockIntegratorState>>,
-    Path(operation_id): Path<String>,
-) -> impl IntoResponse {
-    mock_unit_operation_by_id(state, MockUnitOperationKind::Withdrawal, operation_id).await
-}
-
-async fn mock_unit_operation_by_id(
-    state: Arc<MockIntegratorState>,
-    kind: MockUnitOperationKind,
-    operation_id: String,
-) -> axum::response::Response {
-    let operations = state.unit_operations.lock().await;
-    let operation = operations
-        .values()
-        .flat_map(|entries| entries.iter())
-        .filter(|entry| entry.visible)
-        .find(|entry| entry.kind == kind && unit_operation_matches_identifier(entry, &operation_id))
-        .map(|entry| entry.operation.clone());
-    match operation {
-        Some(operation) => Json(operation).into_response(),
-        None => error_response(
-            StatusCode::NOT_FOUND,
-            format!(
-                "mock Unit /v2/operations/{}/{} not found",
-                match kind {
-                    MockUnitOperationKind::Deposit => "deposit",
-                    MockUnitOperationKind::Withdrawal => "withdrawal",
-                },
-                operation_id
-            ),
-        ),
-    }
-}
+// NOTE: previously this file had mock handlers for
+// `/v2/operations/deposit/{id}` and `/v2/operations/withdrawal/{id}`, but
+// those endpoints are NOT documented by Hyperunit and probing the real API
+// shows they return HTTP 200 with empty body for synthetic IDs — they
+// don't actually serve operation data. All production callers route through
+// `/operations/:address` (`mock_unit_operations` above), so the handlers
+// and their helpers (`mock_unit_operation_by_id`,
+// `unit_operation_matches_identifier`) have been removed.
 
 fn unit_operation_matches_query(entry: &MockUnitOperationEntry, query: &str) -> bool {
     entry
@@ -4455,25 +4414,6 @@ fn unit_operation_matches_query(entry: &MockUnitOperationEntry, query: &str) -> 
         .as_deref()
         .is_some_and(|protocol_address| addresses_match(protocol_address, query))
         || addresses_match(&entry.dst_addr, query)
-}
-
-fn unit_operation_matches_identifier(entry: &MockUnitOperationEntry, query: &str) -> bool {
-    unit_operation_matches_query(entry, query)
-        || entry
-            .operation
-            .operation_id
-            .as_deref()
-            .is_some_and(|value| value.eq_ignore_ascii_case(query))
-        || entry
-            .operation
-            .source_tx_hash
-            .as_deref()
-            .is_some_and(|value| value.eq_ignore_ascii_case(query))
-        || entry
-            .operation
-            .destination_tx_hash
-            .as_deref()
-            .is_some_and(|value| value.eq_ignore_ascii_case(query))
 }
 
 fn mock_unit_signatures(kind: MockUnitOperationKind) -> Value {

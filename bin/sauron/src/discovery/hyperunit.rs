@@ -993,11 +993,11 @@ fn is_hyperunit_operation(operation_type: ProviderOperationType) -> bool {
 }
 
 fn hyperunit_deposit_is_credited(operation: &UnitOperation) -> bool {
+    // Real Hyperunit terminal-success state is `done` (per the documented
+    // lifecycle: sourceTxDiscovered → … → done). The legacy `"credited"`
+    // synonym was carry-over from an internal naming that never appears
+    // on the wire — dropped.
     operation.classified_state().is_terminal_success()
-        || operation
-            .state
-            .as_deref()
-            .is_some_and(|state| state.eq_ignore_ascii_case("credited"))
 }
 
 fn expected_hl_credit_amount(operation: &UnitOperation) -> Option<String> {
