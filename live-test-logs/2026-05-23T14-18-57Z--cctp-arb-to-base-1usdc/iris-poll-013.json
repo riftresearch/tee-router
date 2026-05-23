@@ -1,0 +1,17 @@
+{
+  "body": {
+    "messages": [
+      {
+        "attestation": "PENDING",
+        "cctpVersion": 2,
+        "decodedMessage": null,
+        "delayReason": null,
+        "eventNonce": "0xb6944efe0f349c9a510742febec412f571cc565a32b5b6e1811b8d94d21b7a3a",
+        "message": null,
+        "status": "pending_confirmations"
+      }
+    ]
+  },
+  "http_status": 200,
+  "polled_at": "2026-05-23T14:22:29Z"
+}
