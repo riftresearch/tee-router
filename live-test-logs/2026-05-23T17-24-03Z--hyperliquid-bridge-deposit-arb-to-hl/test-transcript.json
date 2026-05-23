@@ -1,0 +1,146 @@
+{
+  "created_at_ms": 1779557063732,
+  "kind": "live_provider_transcript",
+  "label": "hyperliquid.bridge_deposit",
+  "private_key_env_candidates": [
+    "LIVE_TEST_PRIVATE_KEY",
+    "HYPERLIQUID_LIVE_PRIVATE_KEY"
+  ],
+  "provider": "hyperliquid",
+  "schema_version": 1,
+  "transcript": {
+    "after_clearinghouse": {
+      "assetPositions": [],
+      "crossMaintenanceMarginUsed": "0.0",
+      "crossMarginSummary": {
+        "accountValue": "0.0",
+        "totalMarginUsed": "0.0",
+        "totalNtlPos": "0.0",
+        "totalRawUsd": "0.0"
+      },
+      "marginSummary": {
+        "accountValue": "0.0",
+        "totalMarginUsed": "0.0",
+        "totalNtlPos": "0.0",
+        "totalRawUsd": "0.0"
+      },
+      "time": 1779557063469,
+      "withdrawable": "0.0"
+    },
+    "after_spot": {
+      "balances": [
+        {
+          "coin": "USDC",
+          "entryNtl": "0.0",
+          "hold": "0.0",
+          "token": 0,
+          "total": "5.79326119"
+        },
+        {
+          "coin": "UBTC",
+          "entryNtl": "9.01060033",
+          "hold": "0.0",
+          "token": 197,
+          "total": "0.0001192584"
+        },
+        {
+          "coin": "UETH",
+          "entryNtl": "14.53738053",
+          "hold": "0.0",
+          "token": 221,
+          "total": "0.00603319"
+        },
+        {
+          "coin": "USDE",
+          "entryNtl": "0.0",
+          "hold": "0.0",
+          "token": 235,
+          "total": "0.0"
+        },
+        {
+          "coin": "USDT0",
+          "entryNtl": "0.0",
+          "hold": "0.0",
+          "token": 268,
+          "total": "0.0"
+        },
+        {
+          "coin": "USDH",
+          "entryNtl": "0.0",
+          "hold": "0.0",
+          "token": 360,
+          "total": "0.0"
+        }
+      ]
+    },
+    "amount_raw": "5000000",
+    "before_clearinghouse": {
+      "assetPositions": [],
+      "crossMaintenanceMarginUsed": "0.0",
+      "crossMarginSummary": {
+        "accountValue": "0.0",
+        "totalMarginUsed": "0.0",
+        "totalNtlPos": "0.0",
+        "totalRawUsd": "0.0"
+      },
+      "marginSummary": {
+        "accountValue": "0.0",
+        "totalMarginUsed": "0.0",
+        "totalNtlPos": "0.0",
+        "totalRawUsd": "0.0"
+      },
+      "time": 1779557050036,
+      "withdrawable": "0.0"
+    },
+    "before_spot": {
+      "balances": [
+        {
+          "coin": "USDC",
+          "entryNtl": "0.0",
+          "hold": "0.0",
+          "token": 0,
+          "total": "0.79326119"
+        },
+        {
+          "coin": "UBTC",
+          "entryNtl": "9.01060033",
+          "hold": "0.0",
+          "token": 197,
+          "total": "0.0001192584"
+        },
+        {
+          "coin": "UETH",
+          "entryNtl": "14.53738053",
+          "hold": "0.0",
+          "token": 221,
+          "total": "0.00603319"
+        },
+        {
+          "coin": "USDE",
+          "entryNtl": "0.0",
+          "hold": "0.0",
+          "token": 235,
+          "total": "0.0"
+        },
+        {
+          "coin": "USDT0",
+          "entryNtl": "0.0",
+          "hold": "0.0",
+          "token": 268,
+          "total": "0.0"
+        },
+        {
+          "coin": "USDH",
+          "entryNtl": "0.0",
+          "hold": "0.0",
+          "token": 360,
+          "total": "0.0"
+        }
+      ]
+    },
+    "bridge": "0x2df1c51e09aecf9cacb7bc98cb1742757f163df7",
+    "tx_hash": "0x1345501afc0960cb67be28f97677d72925103916e6ae50ca6cbd581b00514e89",
+    "usdc_token": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+    "user": "0x33f65788aca48d733c2c2444ac9f79b18206aa92"
+  }
+}
