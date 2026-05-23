@@ -348,6 +348,10 @@ pub struct HlTradeFilledEvidence {
     pub crossed: bool,
     pub hash: String,
     pub time_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

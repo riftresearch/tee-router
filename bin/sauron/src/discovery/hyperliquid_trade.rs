@@ -86,6 +86,8 @@ fn hl_trade_filled_evidence(
         crossed: fill.crossed,
         hash: fill.hash,
         time_ms: fill.time_ms,
+        fee: fill.fee,
+        fee_token: fill.fee_token,
     })
 }
 
@@ -116,6 +118,8 @@ struct FillEvidence {
     crossed: bool,
     hash: String,
     time_ms: i64,
+    fee: Option<String>,
+    fee_token: Option<String>,
 }
 
 async fn filled_transfer_for_oid(
@@ -149,6 +153,8 @@ async fn filled_transfer_for_oid(
             crossed,
             hash: event.hash,
             time_ms: event.time_ms,
+            fee: event.fee.map(|fee| fee.to_string()),
+            fee_token: event.fee_token,
         })
     }))
 }
@@ -214,13 +220,26 @@ mod tests {
                 crossed: true,
                 hash: "0xfill".to_string(),
                 time_ms: 1_778_522_898_534,
+                fee: Some("0.00000035".to_string()),
+                fee_token: Some("UBTC".to_string()),
             },
         );
 
         assert_typed_evidence::<HlTradeFilledEvidence>(
             &evidence,
             &[
-                "user", "oid", "tid", "coin", "side", "px", "sz", "crossed", "hash", "time_ms",
+                "user",
+                "oid",
+                "tid",
+                "coin",
+                "side",
+                "px",
+                "sz",
+                "crossed",
+                "hash",
+                "time_ms",
+                "fee",
+                "fee_token",
             ],
         );
     }

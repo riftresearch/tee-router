@@ -4968,12 +4968,58 @@ impl ExchangeProvider for HyperliquidProvider {
                     "avg_px": filled.get("avgPx").cloned().unwrap_or(Value::Null),
                     "tx_hash": &receipt.tx_hash,
                 });
-                if let Some(amounts) = hyperliquid_filled_actual_amounts(provider_context, filled)?
-                {
+                let mut fees = hyperliquid_fill_fees_from_value(filled);
+                if fees.is_empty() {
+                    match self
+                        .hyperliquid_fill_fees_for_oid(provider_context, oid)
+                        .await
+                    {
+                        Ok(Some(fetched_fees)) if !fetched_fees.is_empty() => {
+                            fees = fetched_fees;
+                            observed_state["fee_source"] = json!("userFills");
+                        }
+                        Ok(Some(_)) => {
+                            observed_state["fee_source"] = json!("userFills");
+                            observed_state["fee_lookup_status"] = json!("no_matching_fill");
+                            return Ok(ProviderExecutionStatePatch {
+                                provider_ref: Some(receipt.tx_hash.clone()),
+                                observed_state: Some(observed_state),
+                                response: None,
+                                status: Some(ProviderOperationStatus::WaitingExternal),
+                            });
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            observed_state["fee_source"] = json!("userFills");
+                            observed_state["fee_lookup_error"] = json!(error);
+                            return Ok(ProviderExecutionStatePatch {
+                                provider_ref: Some(receipt.tx_hash.clone()),
+                                observed_state: Some(observed_state),
+                                response: None,
+                                status: Some(ProviderOperationStatus::WaitingExternal),
+                            });
+                        }
+                    }
+                } else {
+                    observed_state["fee_source"] = json!("order_response");
+                }
+                if let (Some(total_sz), Some(avg_px)) = (
+                    filled.get("totalSz").and_then(Value::as_str),
+                    filled.get("avgPx").and_then(Value::as_str),
+                ) {
+                    let amounts = hyperliquid_filled_actual_amounts_from_values(
+                        provider_context,
+                        total_sz,
+                        avg_px,
+                        &fees,
+                    )?;
                     observed_state["amount_in"] = json!(amounts.amount_in);
                     observed_state["amount_out"] = json!(amounts.amount_out);
                     observed_state["base_amount"] = json!(amounts.base_amount);
                     observed_state["quote_amount"] = json!(amounts.quote_amount);
+                    observed_state["gross_amount_in"] = json!(amounts.gross_amount_in);
+                    observed_state["gross_amount_out"] = json!(amounts.gross_amount_out);
+                    observed_state["fees"] = json!(amounts.fees);
                 }
                 return Ok(ProviderExecutionStatePatch {
                     provider_ref: Some(receipt.tx_hash.clone()),
@@ -5129,6 +5175,40 @@ fn hyperliquid_order_lifecycle_status(status: &str) -> ProviderResult<ProviderOp
 }
 
 impl HyperliquidProvider {
+    async fn hyperliquid_fill_fees_for_oid(
+        &self,
+        provider_context: &Value,
+        oid: u64,
+    ) -> ProviderResult<Option<Vec<HyperliquidFillFee>>> {
+        let Some(user_str) = provider_context.get("user").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        let user = Address::from_str(user_str).map_err(|err| {
+            format!("hyperliquid fill fee lookup: invalid user address {user_str}: {err}")
+        })?;
+        let req = json!({
+            "type": "userFills",
+            "user": format!("{user:?}"),
+        });
+        let fills: Vec<UserFill> = self
+            .http
+            .post_json("/info", &req)
+            .await
+            .map_err(|err| format!("hyperliquid /info userFills: {err}"))?;
+
+        Ok(Some(
+            fills
+                .into_iter()
+                .filter(|fill| fill.oid == oid)
+                .filter(|fill| !fill.fee.is_empty() && !fill.fee_token.is_empty())
+                .map(|fill| HyperliquidFillFee {
+                    amount: fill.fee,
+                    token: fill.fee_token,
+                })
+                .collect(),
+        ))
+    }
+
     async fn hyperliquid_fill_hash_for_oid(
         &self,
         user: Address,
@@ -6232,31 +6312,46 @@ fn slippage_bounds_from_request(
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct HyperliquidFilledActualAmounts {
-    amount_in: String,
-    amount_out: String,
-    base_amount: String,
-    quote_amount: String,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HyperliquidAppliedFillFee {
+    pub token: String,
+    pub amount: String,
+    pub amount_raw: Option<String>,
+    pub asset_role: Option<String>,
 }
 
-fn hyperliquid_filled_actual_amounts(
-    provider_context: &Value,
-    filled: &Value,
-) -> ProviderResult<Option<HyperliquidFilledActualAmounts>> {
-    let Some(is_buy) = provider_context.get("is_buy").and_then(Value::as_bool) else {
-        return Ok(None);
-    };
-    let Some(total_sz) = filled.get("totalSz").and_then(Value::as_str) else {
-        return Ok(None);
-    };
-    let Some(avg_px) = filled.get("avgPx").and_then(Value::as_str) else {
-        return Ok(None);
-    };
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HyperliquidFillFee {
+    pub amount: String,
+    pub token: String,
+}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HyperliquidFilledActualAmounts {
+    pub amount_in: String,
+    pub amount_out: String,
+    pub base_amount: String,
+    pub quote_amount: String,
+    pub gross_amount_in: String,
+    pub gross_amount_out: String,
+    pub fees: Vec<HyperliquidAppliedFillFee>,
+}
+
+pub fn hyperliquid_filled_actual_amounts_from_values(
+    provider_context: &Value,
+    total_sz: &str,
+    avg_px: &str,
+    fees: &[HyperliquidFillFee],
+) -> ProviderResult<HyperliquidFilledActualAmounts> {
+    let is_buy = provider_context
+        .get("is_buy")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| "hyperliquid fill: provider_context missing is_buy".to_string())?;
     let base_decimals = json_u8_field(provider_context, "base_decimals", "hyperliquid fill")?;
     let quote_decimals = json_u8_field(provider_context, "quote_decimals", "hyperliquid fill")?;
     let base_sz_decimals = json_u8_field(provider_context, "base_sz_decimals", "hyperliquid fill")?;
+    let input_decimals = json_u8_field(provider_context, "input_decimals", "hyperliquid fill")?;
+    let output_decimals = json_u8_field(provider_context, "output_decimals", "hyperliquid fill")?;
     let base_raw = parse_decimal_to_raw_units(total_sz, base_decimals)
         .map_err(|err| format!("hyperliquid fill: invalid totalSz {total_sz:?}: {err}"))?;
     let price_raw = parse_decimal_to_raw_units(avg_px, HL_PRICE_DECIMALS)
@@ -6270,18 +6365,146 @@ fn hyperliquid_filled_actual_amounts(
 
     let base_amount = base_raw.to_string();
     let quote_amount = quote_raw.to_string();
-    let (amount_in, amount_out) = if is_buy {
-        (quote_amount.clone(), base_amount.clone())
+    let (gross_amount_in, gross_amount_out) = if is_buy {
+        (quote_raw, base_raw)
     } else {
-        (base_amount.clone(), quote_amount.clone())
+        (base_raw, quote_raw)
     };
+    let mut amount_in = gross_amount_in;
+    let mut amount_out = gross_amount_out;
+    let mut applied_fees = Vec::new();
 
-    Ok(Some(HyperliquidFilledActualAmounts {
-        amount_in,
-        amount_out,
+    for fee in fees {
+        let Some((asset_role, decimals)) = hyperliquid_fee_asset_role(
+            provider_context,
+            &fee.token,
+            input_decimals,
+            output_decimals,
+        ) else {
+            applied_fees.push(HyperliquidAppliedFillFee {
+                token: fee.token.clone(),
+                amount: fee.amount.clone(),
+                amount_raw: None,
+                asset_role: None,
+            });
+            continue;
+        };
+        let fee_raw = parse_decimal_to_raw_units_floor(&fee.amount, decimals).map_err(|err| {
+            format!(
+                "hyperliquid fill: invalid fee {:?} for token {}: {err}",
+                fee.amount, fee.token
+            )
+        })?;
+        match asset_role {
+            "input" => {
+                amount_in = amount_in.checked_add(fee_raw).ok_or_else(|| {
+                    "hyperliquid fill: input-token fee overflowed amount_in".to_string()
+                })?;
+            }
+            "output" => {
+                amount_out = amount_out.checked_sub(fee_raw).ok_or_else(|| {
+                    "hyperliquid fill: output-token fee exceeded amount_out".to_string()
+                })?;
+            }
+            _ => {}
+        }
+        applied_fees.push(HyperliquidAppliedFillFee {
+            token: fee.token.clone(),
+            amount: fee.amount.clone(),
+            amount_raw: Some(fee_raw.to_string()),
+            asset_role: Some(asset_role.to_string()),
+        });
+    }
+
+    Ok(HyperliquidFilledActualAmounts {
+        amount_in: amount_in.to_string(),
+        amount_out: amount_out.to_string(),
         base_amount,
         quote_amount,
-    }))
+        gross_amount_in: gross_amount_in.to_string(),
+        gross_amount_out: gross_amount_out.to_string(),
+        fees: applied_fees,
+    })
+}
+
+#[cfg(test)]
+fn hyperliquid_filled_actual_amounts(
+    provider_context: &Value,
+    filled: &Value,
+) -> ProviderResult<Option<HyperliquidFilledActualAmounts>> {
+    if provider_context
+        .get("is_buy")
+        .and_then(Value::as_bool)
+        .is_none()
+    {
+        return Ok(None);
+    };
+    let Some(total_sz) = filled.get("totalSz").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let Some(avg_px) = filled.get("avgPx").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let fees = hyperliquid_fill_fees_from_value(filled);
+    hyperliquid_filled_actual_amounts_from_values(provider_context, total_sz, avg_px, &fees)
+        .map(Some)
+}
+
+fn hyperliquid_fill_fees_from_value(value: &Value) -> Vec<HyperliquidFillFee> {
+    let amount = value.get("fee").and_then(Value::as_str);
+    let token = value
+        .get("feeToken")
+        .or_else(|| value.get("fee_token"))
+        .and_then(Value::as_str);
+    match (amount, token) {
+        (Some(amount), Some(token)) if !amount.is_empty() && !token.is_empty() => {
+            vec![HyperliquidFillFee {
+                amount: amount.to_string(),
+                token: token.to_string(),
+            }]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn hyperliquid_fee_asset_role(
+    provider_context: &Value,
+    fee_token: &str,
+    input_decimals: u8,
+    output_decimals: u8,
+) -> Option<(&'static str, u8)> {
+    let input_token = provider_context.get("input_token").and_then(Value::as_str);
+    let output_token = provider_context.get("output_token").and_then(Value::as_str);
+    let base_token = provider_context.get("base_token").and_then(Value::as_str);
+    let quote_token = provider_context.get("quote_token").and_then(Value::as_str);
+    let is_buy = provider_context.get("is_buy").and_then(Value::as_bool)?;
+
+    if token_symbol_eq(Some(fee_token), input_token) {
+        return Some(("input", input_decimals));
+    }
+    if token_symbol_eq(Some(fee_token), output_token) {
+        return Some(("output", output_decimals));
+    }
+    if token_symbol_eq(Some(fee_token), base_token) {
+        if is_buy {
+            return Some(("output", output_decimals));
+        }
+        return Some(("input", input_decimals));
+    }
+    if token_symbol_eq(Some(fee_token), quote_token) {
+        if is_buy {
+            return Some(("input", input_decimals));
+        }
+        return Some(("output", output_decimals));
+    }
+    None
+}
+
+fn token_symbol_eq(left: Option<&str>, right: Option<&str>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left.trim().eq_ignore_ascii_case(right.trim()),
+        _ => false,
+    }
 }
 
 fn json_u8_field(value: &Value, key: &'static str, context: &'static str) -> ProviderResult<u8> {
@@ -7587,6 +7810,70 @@ mod hyperliquid_math_tests {
         assert_eq!(amounts.amount_out, "56200000000000000");
         assert_eq!(amounts.base_amount, "56200000000000000");
         assert_eq!(amounts.quote_amount, "168600000");
+    }
+
+    #[test]
+    fn hyperliquid_filled_amounts_buy_subtract_output_token_fee() {
+        let provider_context = json!({
+            "is_buy": true,
+            "input_token": "USDC",
+            "output_token": "UBTC",
+            "base_token": "UBTC",
+            "quote_token": "USDC",
+            "input_decimals": 6,
+            "output_decimals": 8,
+            "base_decimals": 8,
+            "quote_decimals": 6,
+            "base_sz_decimals": 5,
+        });
+        let filled = json!({
+            "totalSz": "0.0005",
+            "avgPx": "80000",
+            "fee": "0.00000035",
+            "feeToken": "UBTC",
+        });
+
+        let amounts = hyperliquid_filled_actual_amounts(&provider_context, &filled)
+            .unwrap()
+            .expect("filled amount derivation should use context");
+
+        assert_eq!(amounts.gross_amount_out, "50000");
+        assert_eq!(amounts.amount_out, "49965");
+        assert_eq!(amounts.amount_in, "40000000");
+        assert_eq!(amounts.fees[0].amount_raw.as_deref(), Some("35"));
+        assert_eq!(amounts.fees[0].asset_role.as_deref(), Some("output"));
+    }
+
+    #[test]
+    fn hyperliquid_filled_amounts_sell_add_input_token_fee() {
+        let provider_context = json!({
+            "is_buy": false,
+            "input_token": "UBTC",
+            "output_token": "USDC",
+            "base_token": "UBTC",
+            "quote_token": "USDC",
+            "input_decimals": 8,
+            "output_decimals": 6,
+            "base_decimals": 8,
+            "quote_decimals": 6,
+            "base_sz_decimals": 5,
+        });
+        let filled = json!({
+            "totalSz": "0.0005",
+            "avgPx": "80000",
+            "fee": "0.00000035",
+            "feeToken": "UBTC",
+        });
+
+        let amounts = hyperliquid_filled_actual_amounts(&provider_context, &filled)
+            .unwrap()
+            .expect("filled amount derivation should use context");
+
+        assert_eq!(amounts.gross_amount_in, "50000");
+        assert_eq!(amounts.amount_in, "50035");
+        assert_eq!(amounts.amount_out, "40000000");
+        assert_eq!(amounts.fees[0].amount_raw.as_deref(), Some("35"));
+        assert_eq!(amounts.fees[0].asset_role.as_deref(), Some("input"));
     }
 
     #[test]

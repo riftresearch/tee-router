@@ -1146,6 +1146,40 @@ pub(super) async fn verify_hl_trade_filled_hint(
     validate_hl_trade_user(&operation, &evidence.user)?;
     validate_hl_trade_oid(&operation, evidence.oid)?;
     validate_hl_trade_size(&operation, &evidence.sz)?;
+    let Some(fee) = evidence.fee.as_deref().filter(|fee| !fee.is_empty()) else {
+        return Ok(provider_hint_deferred(
+            Some(operation.id),
+            "HlTradeFilled hint missing fee evidence",
+        ));
+    };
+    let Some(fee_token) = evidence
+        .fee_token
+        .as_deref()
+        .filter(|fee_token| !fee_token.is_empty())
+    else {
+        return Ok(provider_hint_deferred(
+            Some(operation.id),
+            "HlTradeFilled hint missing fee token evidence",
+        ));
+    };
+    let amounts = hyperliquid_filled_actual_amounts_from_values(
+        &operation.request,
+        &evidence.sz,
+        &evidence.px,
+        &[HyperliquidFillFee {
+            amount: fee.to_string(),
+            token: fee_token.to_string(),
+        }],
+    )
+    .map_err(|source| OrderActivityError::hint_verification("HlTradeFilled", source))?;
+    let mut observed_state = typed_evidence_state("hl_trade_filled", evidence)?;
+    observed_state["amount_in"] = json!(amounts.amount_in);
+    observed_state["amount_out"] = json!(amounts.amount_out);
+    observed_state["base_amount"] = json!(amounts.base_amount);
+    observed_state["quote_amount"] = json!(amounts.quote_amount);
+    observed_state["gross_amount_in"] = json!(amounts.gross_amount_in);
+    observed_state["gross_amount_out"] = json!(amounts.gross_amount_out);
+    observed_state["fees"] = json!(amounts.fees);
     complete_provider_operation_from_typed_hint(
         deps,
         &input,
@@ -1157,7 +1191,7 @@ pub(super) async fn verify_hl_trade_filled_hint(
                 .provider_ref
                 .clone()
                 .or_else(|| Some(evidence.hash.clone())),
-            observed_state: typed_evidence_state("hl_trade_filled", evidence)?,
+            observed_state,
             response: None,
             tx_hash: Some(evidence.hash.clone()),
         },
