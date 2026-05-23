@@ -25,7 +25,7 @@ use base64::Engine as _;
 use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
 use snafu::Snafu;
 
-use crate::{UnitAsset, UnitChain, UnitGenerateAddressRequest, UnitGenerateAddressResponse};
+use crate::{UnitAsset, UnitGenerateAddressRequest, UnitGenerateAddressResponse};
 
 /// Hyperunit network the response was fetched from. Determines which set of
 /// pinned guardian public keys to verify against.
@@ -193,16 +193,37 @@ pub fn verify_generate_address(
             }
         };
 
-        // 5. construct the canonical payload string and verify
-        let payload = construct_payload(node_id, request, &response.address);
-        if verifying_key
-            .verify(payload.as_bytes(), &signature)
-            .is_ok()
-        {
+        // 5. construct candidate payload strings and verify against any.
+        //
+        // Hyperunit's reference verifier (see
+        // github.com/lifinance/contracts/script/demoScripts/demoUnit.ts)
+        // tries the "new" EVM template first when the proposal's coinType
+        // is "ethereum", and tries the "legacy" template otherwise — with
+        // a fallback to the other template if the first doesn't verify.
+        //
+        // Empirically, every /gen and /operations.addresses entry observed
+        // against api.hyperunit.xyz uses the NEW template with `coinType`
+        // hardcoded to "ethereum" — even for BTC withdrawal addresses,
+        // /operations reports `sourceCoinType: "ethereum"`. So we always
+        // try that first; we still fall back to the legacy template so a
+        // future Hyperunit deployment that re-introduces per-coin-type
+        // signing doesn't break.
+        let candidates = candidate_payloads(node_id, request, &response.address);
+        let mut verified = false;
+        for payload in &candidates {
+            if verifying_key
+                .verify(payload.as_bytes(), &signature)
+                .is_ok()
+            {
+                verified = true;
+                break;
+            }
+        }
+        if verified {
             valid_count += 1;
         } else {
             errors.push(format!(
-                "{node_id}: signature did not verify against payload {payload:?}"
+                "{node_id}: signature did not verify against any candidate; tried: {candidates:?}"
             ));
         }
     }
@@ -218,52 +239,56 @@ pub fn verify_generate_address(
     }
 }
 
-/// Build the canonical payload string each guardian signs.
+/// Build the candidate payload strings each guardian might have signed,
+/// in order of likelihood.
 ///
-/// Two branches per the spec: a "legacy" form for non-EVM assets
-/// (BTC, SOL, …) and a "newer" form for EVM coin types (ETH, etc).
-fn construct_payload(
+/// Hyperunit has two documented payload templates:
+///   - **New (EVM):** `{nodeId}:user-{coinType}-{destinationChain}-{destinationAddress}-{address}`
+///   - **Legacy:** `{nodeId}:{destinationAddress}-{destinationChain}-{asset}-{address}-{sourceChain}-deposit`
+///
+/// The trigger documented in the reference verifier is
+/// `proposal.coinType === 'ethereum'` → new; otherwise legacy with new
+/// as fallback. **Empirically, every /gen + /operations response
+/// observed against api.hyperunit.xyz today reports
+/// `sourceCoinType: "ethereum"` regardless of asset** — including BTC
+/// withdrawal addresses — so the new template with that hardcoded
+/// coinType is always the one that verifies in practice. We still
+/// emit the legacy candidate as a fallback for forward-compat with
+/// possible future Hyperunit deployments.
+fn candidate_payloads(
     node_id: &str,
     request: &UnitGenerateAddressRequest,
     address: &str,
-) -> String {
-    match request.asset {
-        UnitAsset::Eth => format!(
-            // {nodeId}:user-{coinType}-{destinationChain}-{destinationAddress}-{address}
+) -> Vec<String> {
+    let dst_chain = request.dst_chain.as_wire_str();
+    let src_chain = request.src_chain.as_wire_str();
+    let asset = request.asset.as_wire_str();
+    let dst_addr = &request.dst_addr;
+    vec![
+        // 1. NEW EVM template with coinType = "ethereum" (the only one
+        //    observed against the live API as of 2026-05-23). Always tried
+        //    first because /operations responses confirm coinType is
+        //    hardcoded ethereum for this Hyperunit deployment.
+        format!("{node_id}:user-ethereum-{dst_chain}-{dst_addr}-{address}"),
+        // 2. NEW EVM template with coinType derived from the asset, for a
+        //    future Hyperunit deployment that respects per-asset coinType.
+        format!(
             "{node_id}:user-{coin_type}-{dst_chain}-{dst_addr}-{address}",
-            coin_type = evm_coin_type(request.src_chain),
-            dst_chain = request.dst_chain.as_wire_str(),
-            dst_addr = request.dst_addr,
+            coin_type = match request.asset {
+                UnitAsset::Eth => "ethereum",
+                UnitAsset::Btc => "bitcoin",
+            },
         ),
-        UnitAsset::Btc => format!(
-            // {nodeId}:{destinationAddress}-{destinationChain}-{asset}-{address}-{sourceChain}-deposit
-            "{node_id}:{dst_addr}-{dst_chain}-{asset}-{address}-{src_chain}-deposit",
-            dst_addr = request.dst_addr,
-            dst_chain = request.dst_chain.as_wire_str(),
-            asset = request.asset.as_wire_str(),
-            src_chain = request.src_chain.as_wire_str(),
-        ),
-    }
-}
-
-/// `coinType` value used in the EVM-asset payload template. The spec
-/// snippet `proposal.coinType === 'ethereum'` is the canonical
-/// example; the value appears to track the source-chain wire name
-/// for EVM bridges.
-fn evm_coin_type(src_chain: UnitChain) -> &'static str {
-    match src_chain {
-        UnitChain::Ethereum => "ethereum",
-        UnitChain::Base => "base",
-        UnitChain::Hyperliquid => "hyperliquid",
-        // Non-EVM source paired with ETH asset is unusual but covered
-        // for completeness.
-        UnitChain::Bitcoin => "bitcoin",
-    }
+        // 3. LEGACY template, matching the lifinance reference verifier's
+        //    second branch.
+        format!("{node_id}:{dst_addr}-{dst_chain}-{asset}-{address}-{src_chain}-deposit"),
+    ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::UnitChain;
 
     #[test]
     fn network_inference_from_base_url() {
@@ -312,29 +337,43 @@ mod tests {
     }
 
     #[test]
-    fn legacy_payload_template_for_btc() {
+    fn candidate_payloads_for_btc_withdrawal() {
+        // HL → BTC withdrawal — same shape as the 2026-05-23 funded test
+        // that initially revealed Hyperunit hardcodes coinType=ethereum.
         let request = UnitGenerateAddressRequest {
-            src_chain: UnitChain::Bitcoin,
-            dst_chain: UnitChain::Hyperliquid,
+            src_chain: UnitChain::Hyperliquid,
+            dst_chain: UnitChain::Bitcoin,
             asset: UnitAsset::Btc,
-            dst_addr: "0xfedcba".to_string(),
+            dst_addr: "bc1qk4m6mpxulnlufegdh3w40kayhx9m722am38apn".to_string(),
         };
-        let payload = construct_payload("hl-node", &request, "bc1qabc");
+        let candidates =
+            candidate_payloads("hl-node", &request, "0xa0756aF705a4C587511a33912AeFbd249b49e2Cc");
+        // First candidate must be the one that actually verifies against
+        // production responses.
         assert_eq!(
-            payload,
-            "hl-node:0xfedcba-hyperliquid-btc-bc1qabc-bitcoin-deposit"
+            candidates[0],
+            "hl-node:user-ethereum-bitcoin-bc1qk4m6mpxulnlufegdh3w40kayhx9m722am38apn-0xa0756aF705a4C587511a33912AeFbd249b49e2Cc"
         );
+        // Second candidate is the alternate coinType (forward-compat).
+        assert!(candidates[1].contains("user-bitcoin-bitcoin-"));
+        // Third candidate is the legacy template.
+        assert!(candidates[2].ends_with("-hyperliquid-deposit"));
     }
 
     #[test]
-    fn new_payload_template_for_eth() {
+    fn candidate_payloads_for_eth_deposit() {
+        // ETH → HL deposit, matching the production /operations entry the
+        // tier-1 test exercises.
         let request = UnitGenerateAddressRequest {
             src_chain: UnitChain::Ethereum,
             dst_chain: UnitChain::Hyperliquid,
             asset: UnitAsset::Eth,
             dst_addr: "0xfedcba".to_string(),
         };
-        let payload = construct_payload("unit-node", &request, "0x12345");
-        assert_eq!(payload, "unit-node:user-ethereum-hyperliquid-0xfedcba-0x12345");
+        let candidates = candidate_payloads("unit-node", &request, "0x12345");
+        assert_eq!(
+            candidates[0],
+            "unit-node:user-ethereum-hyperliquid-0xfedcba-0x12345"
+        );
     }
 }
