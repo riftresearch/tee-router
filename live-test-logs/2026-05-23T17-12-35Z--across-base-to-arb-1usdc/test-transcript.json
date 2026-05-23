@@ -1,0 +1,71 @@
+{
+  "created_at_ms": 1779556395927,
+  "kind": "live_provider_transcript",
+  "label": "across.swap.lifecycle",
+  "private_key_env_candidates": [
+    "LIVE_TEST_PRIVATE_KEY",
+    "ACROSS_LIVE_PRIVATE_KEY"
+  ],
+  "provider": "across",
+  "schema_version": 1,
+  "transcript": {
+    "base_url": "https://app.across.to/api",
+    "deposit_status_samples": [
+      {
+        "body": {
+          "error": "DepositNotFoundException",
+          "message": "Deposit not found given the provided constraints"
+        },
+        "error": "DepositNotFoundException",
+        "status": "not_found"
+      },
+      {
+        "depositId": "5704439",
+        "depositTxnRef": "0xe76914dab43a31329dba7b2e113c5e7e23f7b86ee1d4377abb2a2519070c5c6d",
+        "destinationChainId": 42161,
+        "fillTxnRef": "0x1ca340d3c7e4646ea89d03c99bf37d3e2a747a26a4bb3fe855f783d86f63ced2",
+        "originChainId": 8453,
+        "pagination": {
+          "currentIndex": 0,
+          "maxIndex": 0
+        },
+        "status": "filled"
+      }
+    ],
+    "deposit_txn_ref": "0xe76914dab43a31329dba7b2e113c5e7e23f7b86ee1d4377abb2a2519070c5c6d",
+    "request": {
+      "amount": "1000000",
+      "depositor": "0x33f65788aca48d733c2c2444ac9f79b18206aa92",
+      "destination_chain_id": 42161,
+      "input_token": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+      "integrator_id": "0x010e",
+      "origin_chain_id": 8453,
+      "output_token": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+      "recipient": "0x33f65788aca48d733c2c2444ac9f79b18206aa92",
+      "refund_address": "0x33f65788aca48d733c2c2444ac9f79b18206aa92",
+      "refund_on_origin": true,
+      "slippage": null,
+      "strict_trade_type": true,
+      "trade_type": "exactInput"
+    },
+    "submitted_tx_hashes": [
+      "0xe76914dab43a31329dba7b2e113c5e7e23f7b86ee1d4377abb2a2519070c5c6d"
+    ],
+    "swap_approval": {
+      "expectedOutputAmount": "993951",
+      "id": "jtxb8-1779556388180-84f173d874bb",
+      "inputAmount": "1000000",
+      "maxInputAmount": "1000000",
+      "minOutputAmount": "993951",
+      "quoteExpiryTimestamp": 1779559847,
+      "swapTx": {
+        "chainId": 8453,
+        "data": "0xad5425c600000000000000000000000033f65788aca48d733c2c2444ac9f79b18206aa9200000000000000000000000033f65788aca48d733c2c2444ac9f79b18206aa92000000000000000000000000833589fcd6edb6e08f4c7c32d4f71b54bda02913000000000000000000000000af88d065e77c8cc2239327c5edb3a432268e583100000000000000000000000000000000000000000000000000000000000f424000000000000000000000000000000000000000000000000000000000000f2a9f000000000000000000000000000000000000000000000000000000000000a4b1000000000000000000000000394311a6aaa0d8e3411d8b62de4578d41322d1bd000000000000000000000000000000000000000000000000000000006a11df97000000000000000000000000000000000000000000000000000000006a11fbb70000000000000000000000000000000000000000000000000000000000000005000000000000000000000000000000000000000000000000000000000000018000000000000000000000000000000000000000000000000000000000000000001dc0de010e73c0de",
+        "gas": "84816",
+        "maxFeePerGas": "13500000",
+        "maxPriorityFeePerGas": "1000000",
+        "to": "0x09aea4b2242abC8bb4BB78D537A67a245A7bEC64"
+      }
+    }
+  }
+}
