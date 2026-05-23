@@ -349,6 +349,30 @@ pub enum MockAddressScreeningRule {
     },
 }
 
+/// Iris V2 `delayReason` values the mock can simulate. Real Iris emits one of
+/// these on a `pending_confirmations` response when a burn is stalled.
+///
+/// `AmountAboveMax` is the only terminal reason (the burn amount exceeds
+/// Circle's per-tx max); the others mean Iris is still waiting on fee bumps
+/// or daily-allowance windows and will eventually attest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MockCctpDelayReason {
+    AmountAboveMax,
+    InsufficientFee,
+    InsufficientAllowanceAvailable,
+}
+
+impl MockCctpDelayReason {
+    /// Snake-case wire string matching Circle's `delayReason` enum.
+    pub fn as_iris_str(self) -> &'static str {
+        match self {
+            Self::AmountAboveMax => "amount_above_max",
+            Self::InsufficientFee => "insufficient_fee",
+            Self::InsufficientAllowanceAvailable => "insufficient_allowance_available",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MockIntegratorConfig {
     /// TCP address the mock HTTP server should bind.
@@ -435,8 +459,10 @@ pub struct MockIntegratorConfig {
     /// Artificial delay between indexing a burn and returning a completed Iris
     /// attestation.
     pub cctp_attestation_latency: Duration,
-    /// When set, every indexed CCTP burn returns a failed Iris message.
-    pub cctp_attestation_failure_reason: Option<String>,
+    /// When set, every indexed CCTP burn returns an Iris response carrying
+    /// this `delayReason`. `AmountAboveMax` is terminal (router treats it as
+    /// `Failed`); the others stay `Pending` per Circle's spec.
+    pub cctp_attestation_delay_reason: Option<MockCctpDelayReason>,
     /// Chainalysis-compatible local address-screening responses keyed by
     /// normalized address. Addresses absent from this map default to Low risk.
     pub address_screening_rules: BTreeMap<String, MockAddressScreeningRule>,
@@ -494,7 +520,7 @@ impl Default for MockIntegratorConfig {
             cctp_chains: BTreeMap::new(),
             cctp_destination_token_addresses: BTreeMap::new(),
             cctp_attestation_latency: Duration::ZERO,
-            cctp_attestation_failure_reason: None,
+            cctp_attestation_delay_reason: None,
             address_screening_rules: BTreeMap::new(),
             velora_swap_contract_addresses: BTreeMap::new(),
             velora_transaction_fail_next_n: 0,
@@ -694,8 +720,8 @@ impl MockIntegratorConfig {
     }
 
     #[must_use]
-    pub fn with_cctp_attestation_failure(mut self, reason: impl Into<String>) -> Self {
-        self.cctp_attestation_failure_reason = Some(reason.into());
+    pub fn with_cctp_attestation_delay_reason(mut self, reason: MockCctpDelayReason) -> Self {
+        self.cctp_attestation_delay_reason = Some(reason);
         self
     }
 
@@ -816,7 +842,7 @@ struct MockIntegratorState {
     across_destination_credit_tx_hashes: Mutex<BTreeMap<AcrossDepositKey, String>>,
     cctp_burns: Mutex<BTreeMap<String, MockCctpBurnRecord>>,
     cctp_attestation_latency: Duration,
-    cctp_attestation_failure_reason: Option<String>,
+    cctp_attestation_delay_reason: Option<MockCctpDelayReason>,
     hyperliquid_exchange_submissions: Mutex<Vec<Value>>,
     hyperliquid: Mutex<HyperliquidMockState>,
     velora_usd_prices: Mutex<BTreeMap<String, u128>>,
@@ -1485,7 +1511,7 @@ impl MockIntegratorState {
             across_destination_credit_tx_hashes: Mutex::default(),
             cctp_burns: Mutex::default(),
             cctp_attestation_latency: config.cctp_attestation_latency,
-            cctp_attestation_failure_reason: config.cctp_attestation_failure_reason.clone(),
+            cctp_attestation_delay_reason: config.cctp_attestation_delay_reason,
             hyperliquid_exchange_submissions: Mutex::default(),
             hyperliquid: Mutex::new(HyperliquidMockState::new()),
             velora_usd_prices: Mutex::new(default_velora_usd_prices()),
@@ -3284,7 +3310,11 @@ async fn mock_cctp_messages(
             "messageSender": format!("{:#x}", record.depositor)
         }
     });
-    if let Some(reason) = state.cctp_attestation_failure_reason.as_deref() {
+    if let Some(reason) = state.cctp_attestation_delay_reason {
+        // Real Iris V2 leaves the status as `pending_confirmations` and signals
+        // failure via `delayReason`. The only terminal reason is
+        // `amount_above_max`; the others mean Iris is still waiting on fee
+        // bumps or daily-allowance windows and may eventually attest.
         return (
             StatusCode::OK,
             Json(json!({
@@ -3293,8 +3323,8 @@ async fn mock_cctp_messages(
                     "attestation": null,
                     "eventNonce": record.nonce.clone(),
                     "cctpVersion": 2,
-                    "status": "failed",
-                    "error": reason,
+                    "status": "pending_confirmations",
+                    "delayReason": reason.as_iris_str(),
                     "decodedMessage": decoded_message
                 }]
             })),
@@ -7989,9 +8019,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mock_cctp_messages_can_return_failed_attestation() {
+    async fn mock_cctp_messages_can_return_amount_above_max_delay_reason() {
         let state = Arc::new(MockIntegratorState::new(
-            &MockIntegratorConfig::default().with_cctp_attestation_failure("iris rejected burn"),
+            &MockIntegratorConfig::default()
+                .with_cctp_attestation_delay_reason(MockCctpDelayReason::AmountAboveMax),
         ));
         state
             .cctp_burns
@@ -7999,10 +8030,14 @@ mod tests {
             .await
             .insert("0xburn".to_string(), mock_cctp_burn_record(Utc::now()));
 
-        let failed = mock_cctp_message_body(state, "0xburn").await;
-        assert_eq!(failed["messages"][0]["status"], "failed");
-        assert_eq!(failed["messages"][0]["error"], "iris rejected burn");
-        assert!(failed["messages"][0]["attestation"].is_null());
+        let body = mock_cctp_message_body(state, "0xburn").await;
+        // Real Iris V2 keeps status as `pending_confirmations` and surfaces
+        // terminal failure via `delayReason: amount_above_max`.
+        assert_eq!(body["messages"][0]["status"], "pending_confirmations");
+        assert_eq!(body["messages"][0]["delayReason"], "amount_above_max");
+        assert!(body["messages"][0]["attestation"].is_null());
+        // The legacy free-form `error` field is no longer emitted.
+        assert!(body["messages"][0].get("error").is_none());
     }
 
     #[tokio::test]
