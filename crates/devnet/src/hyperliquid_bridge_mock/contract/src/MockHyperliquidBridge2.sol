@@ -17,18 +17,32 @@ interface IERC20PermitMinimal {
 }
 
 /// @notice Minimal Bridge2-compatible mock for devnet/testing.
-/// Real Hyperliquid deposits are usually plain ERC20 transfers to the bridge
-/// address, so this contract mostly serves as the receiving address plus the
-/// `batchedDepositWithPermit` ABI. The mock server watches ERC20 `Transfer`
-/// logs into this contract to credit Hyperliquid balances. Permit-based
-/// deposits also emit `Deposit` directly from the bridge.
+///
+/// Event and struct shapes mirror Hyperliquid's real `Bridge2.sol` (at
+/// `0x2df1c51e09aecf9cacb7bc98cb1742757f163df7` mainnet) byte-for-byte so
+/// observers exercise the same ABI they see on mainnet:
+///   - `Signature { uint256 r; uint256 s; uint8 v; }`  (r, s, v field order)
+///   - `FailedPermitDeposit(address user, uint64 usd, uint32 errorCode)`
+///   - `RequestedWithdrawal(address indexed user, address destination,
+///       uint64 usd, uint64 nonce, bytes32 message, uint64 requestedTime)`
+///   - `FinalizedWithdrawal(address indexed user, address destination,
+///       uint64 usd, uint64 nonce, bytes32 message)`
+///
+/// Note: real `Bridge2` declares `Deposit(address indexed user, uint64 usd)`
+/// but **never emits it** — successful deposits are silent at the Bridge2
+/// layer; observers credit balances from the USDC `Transfer` log into the
+/// bridge address. The mock previously emitted `Deposit` on permit success
+/// (a fabrication); now it matches reality and emits nothing on success.
 contract MockHyperliquidBridge2 {
     IERC20PermitMinimal public immutable usdcToken;
 
+    /// Field order matches `Bridge2`'s `Signature.sol` exactly: (r, s, v).
+    /// The previous mock had (v, r, s) which would deserialize wrong against
+    /// any code that consumed the real ABI.
     struct Signature {
-        uint8 v;
         uint256 r;
         uint256 s;
+        uint8 v;
     }
 
     struct DepositWithPermit {
@@ -38,9 +52,25 @@ contract MockHyperliquidBridge2 {
         Signature signature;
     }
 
-    event Deposit(address indexed user, uint64 usd);
     event FailedPermitDeposit(address user, uint64 usd, uint32 errorCode);
-    event Withdrawal(address indexed user, uint64 usd);
+    event RequestedWithdrawal(
+        address indexed user,
+        address destination,
+        uint64 usd,
+        uint64 nonce,
+        bytes32 message,
+        uint64 requestedTime
+    );
+    event FinalizedWithdrawal(
+        address indexed user,
+        address destination,
+        uint64 usd,
+        uint64 nonce,
+        bytes32 message
+    );
+
+    /// Mock-only counter to give each withdrawal a unique synthetic nonce.
+    uint64 private nextWithdrawalNonce;
 
     constructor(address usdcAddress) {
         usdcToken = IERC20PermitMinimal(usdcAddress);
@@ -59,22 +89,29 @@ contract MockHyperliquidBridge2 {
                 bytes32(deposit.signature.s)
             ) {
                 bool transferred = usdcToken.transferFrom(deposit.user, address(this), deposit.usd);
-                if (transferred) {
-                    emit Deposit(deposit.user, deposit.usd);
-                } else {
+                if (!transferred) {
                     emit FailedPermitDeposit(deposit.user, deposit.usd, 1);
                 }
+                // Real Bridge2 emits nothing on success — observers credit
+                // balances from the USDC Transfer log. Stay silent here too.
             } catch {
                 emit FailedPermitDeposit(deposit.user, deposit.usd, 0);
             }
         }
     }
 
-    /// @notice Mock-only withdrawal release path. Real Hyperliquid Bridge2
-    /// payouts are validator-driven, but devnet needs an on-chain effect the
-    /// mock server can trigger after a `withdraw3` request is accepted.
+    /// Mock-only withdrawal payout path. Real Hyperliquid Bridge2 payouts
+    /// are validator-driven: `batchedRequestWithdrawals` emits
+    /// `RequestedWithdrawal`, then after a dispute period validators call
+    /// `finalizeWithdrawals` which emits `FinalizedWithdrawal`. The devnet
+    /// mock compresses both steps into one call so the mock server has a
+    /// single trigger for the on-chain effect, but emits BOTH real events
+    /// so observers see the same event sequence they'd see on mainnet.
     function release(address user, uint64 usd) external {
         require(usdcToken.transfer(user, usd), "transfer failed");
-        emit Withdrawal(user, usd);
+        uint64 nonce = ++nextWithdrawalNonce;
+        bytes32 message = keccak256(abi.encodePacked(user, usd, nonce));
+        emit RequestedWithdrawal(user, user, usd, nonce, message, uint64(block.timestamp));
+        emit FinalizedWithdrawal(user, user, usd, nonce, message);
     }
 }
