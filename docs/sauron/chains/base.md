@@ -7,7 +7,7 @@ Base is an Optimistic L2 (OP Stack). Observation patterns are nearly identical t
 Same events as Ethereum (`chains/ethereum.md`):
 - ERC-20 `Transfer` to watched recipients (USDC primarily, since Base USDC is a major liquidity hub).
 - CCTP `MessageSent` from TokenMessenger on Base.
-- Across `V3FundsDeposited` from Base SpokePool.
+- Across `FundsDeposited` from Base SpokePool.
 - Velora swap settlement Transfers from Velora's executor to recipient (the on-chain leg of `universal_router_swap` steps — see `venues/velora.md`).
 
 ## Native push mechanisms

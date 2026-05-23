@@ -7,7 +7,7 @@ Arbitrum is an Optimistic L2 (Arbitrum Nitro). Same observation patterns as Ethe
 Same general events as Ethereum/Base:
 - ERC-20 `Transfer` to watched recipients (USDC primarily on Arbitrum One).
 - CCTP `MessageSent` from TokenMessenger on Arbitrum.
-- Across `V3FundsDeposited` from Arbitrum SpokePool.
+- Across `FundsDeposited` from Arbitrum SpokePool.
 - Velora swap settlement Transfers (the on-chain leg of `universal_router_swap` steps — see `venues/velora.md`).
 
 **Arbitrum-specific events that matter to us:**

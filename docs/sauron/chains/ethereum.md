@@ -4,7 +4,7 @@
 
 - **ERC-20 `Transfer(from, to, value)` events** to watched addresses for: funding-vault detection, `unit_deposit` (when source asset is on Ethereum), `cctp_burn` source-side observation, `across_bridge` origin-side observation, and Velora swap settlement (the on-chain leg of any `universal_router_swap` step — see `venues/velora.md`).
 - **CCTP `MessageSent` events** from the TokenMessenger on-chain (Circle CCTP source leg).
-- **Across `V3FundsDeposited` events** on Across SpokePool (origin leg of an Across bridge).
+- **Across `FundsDeposited` events** on Across SpokePool (origin leg of an Across bridge).
 - **Reorgs** within `EVM_REORG_RESCAN_DEPTH = 32` blocks (uniform constant — overkill for L2s, appropriate for L1).
 
 We do *not* care about general blockchain state — only logs at known contract addresses with known topics, indexed by the topic that names the recipient (or the depositor for outbound bridge events).
@@ -34,9 +34,9 @@ Today, Sauron polls `eth_getLogs` in 128-block windows. This costs RPC requests 
 **Primary path (push):**
 1. Open a WebSocket connection to the Ethereum RPC endpoint (Alchemy/Infura/own node).
 2. Subscribe to `newHeads` → drives the head cursor.
-3. Subscribe to `eth_subscribe('logs', { address: [...watched_contracts], topics: [[Transfer.topic0, MessageSent.topic0, V3FundsDeposited.topic0]] })`.
+3. Subscribe to `eth_subscribe('logs', { address: [...watched_contracts], topics: [[Transfer.topic0, MessageSent.topic0, FundsDeposited.topic0]] })`.
    - One subscription per topic-set is fine; or one per topic with per-topic filtering — both work.
-   - Filter `address` by the union of: USDC, USDT, WETH (for `Transfer`); CCTP TokenMessenger (for `MessageSent`); Across SpokePool (for `V3FundsDeposited`).
+   - Filter `address` by the union of: USDC, USDT, WETH (for `Transfer`); CCTP TokenMessenger (for `MessageSent`); Across SpokePool (for `FundsDeposited`).
 4. On each log received:
    - Match against the appropriate watch table (recipient for Transfers; depositor for outbound bridge events).
    - Emit `DetectorHint` tagged with venue-appropriate metadata (token, amount, log index, block hash).
@@ -56,7 +56,7 @@ Same cross-cutting requirement as `audit.md` §B: emitted `DetectorHint` must in
 For Ethereum specifically:
 - **`Transfer` to a vault address** is unambiguous *only* if the vault is single-use (one order). For reusable vaults (rare for our use case, but possible), the watch entry must carry the `execution_step_id` of the active step the watch was registered for.
 - **`MessageSent` (CCTP)** carries a `nonce` field that we should index — pair `(nonce, source_chain)` is globally unique across CCTP and should be the disambiguator.
-- **`V3FundsDeposited` (Across)** carries a `depositId` we should match against the operation's `provider_ref`.
+- **`FundsDeposited` (Across)** carries a `depositId` we should match against the operation's `provider_ref`.
 
 ## Failure modes and backstops
 
