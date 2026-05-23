@@ -8,6 +8,9 @@ use std::{
 };
 use url::Url;
 
+pub mod guardian;
+pub use guardian::{verify_generate_address, GuardianNetwork, GuardianVerifyError};
+
 pub type HyperUnitResult<T> = Result<T, HyperUnitClientError>;
 const HYPERUNIT_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const HYPERUNIT_MAX_RESPONSE_BODY_BYTES: usize = 256 * 1024;
@@ -55,6 +58,13 @@ pub enum HyperUnitClientError {
     InvalidBody {
         source: serde_json::Error,
         body: String,
+    },
+    #[snafu(display(
+        "Hyperunit guardian-signature verification failed on {endpoint}: {source}"
+    ))]
+    GuardianVerification {
+        endpoint: String,
+        source: GuardianVerifyError,
     },
 }
 
@@ -385,6 +395,10 @@ impl UnitOperationState {
 pub struct HyperUnitClient {
     http: reqwest::Client,
     base_url: String,
+    /// Which set of pinned guardian pubkeys to verify `/gen/...` responses
+    /// against. Inferred from `base_url` by default; override explicitly via
+    /// [`HyperUnitClient::new_with_network`] for custom deployments.
+    network: GuardianNetwork,
 }
 
 impl fmt::Debug for HyperUnitClient {
@@ -392,6 +406,7 @@ impl fmt::Debug for HyperUnitClient {
         f.debug_struct("HyperUnitClient")
             .field("http", &"<reqwest client>")
             .field("base_url", &redacted_url_for_debug(&self.base_url))
+            .field("network", &self.network)
             .finish()
     }
 }
@@ -407,6 +422,28 @@ impl HyperUnitClient {
     ) -> HyperUnitResult<Self> {
         let base_url = normalize_base_url(base_url);
         validate_base_url(&base_url)?;
+        let network = GuardianNetwork::from_base_url(&base_url);
+        Self::build_with_network(base_url, proxy_url, network)
+    }
+
+    /// Construct a client with an explicit guardian network. Use this when
+    /// the API URL doesn't match the canonical `api.hyperunit.xyz` /
+    /// `api.hyperunit-testnet.xyz` hosts (e.g. via a proxy or custom DNS)
+    /// and you still need guardian-signature verification.
+    pub fn new_with_network(
+        base_url: impl Into<String>,
+        network: GuardianNetwork,
+    ) -> HyperUnitResult<Self> {
+        let base_url = normalize_base_url(base_url);
+        validate_base_url(&base_url)?;
+        Self::build_with_network(base_url, None, network)
+    }
+
+    fn build_with_network(
+        base_url: String,
+        proxy_url: Option<String>,
+        network: GuardianNetwork,
+    ) -> HyperUnitResult<Self> {
         // Pin this client to Rustls + the vendored Mozilla root set from
         // `webpki-roots` so proxy and direct connections share one
         // deterministic trust boundary instead of inheriting host OS CAs.
@@ -425,7 +462,11 @@ impl HyperUnitClient {
         let http = builder
             .build()
             .map_err(|source| HyperUnitClientError::HttpClientBuild { source })?;
-        Ok(Self { http, base_url })
+        Ok(Self {
+            http,
+            base_url,
+            network,
+        })
     }
 
     #[must_use]
@@ -433,12 +474,27 @@ impl HyperUnitClient {
         &self.base_url
     }
 
+    /// The guardian network this client was configured against — determines
+    /// whether `generate_address` verifies signatures and which pinned key
+    /// set is used.
+    #[must_use]
+    pub fn network(&self) -> GuardianNetwork {
+        self.network
+    }
+
     pub async fn generate_address(
         &self,
         request: UnitGenerateAddressRequest,
     ) -> HyperUnitResult<UnitGenerateAddressResponse> {
         let path = request.into_path()?;
-        self.get_json(&path).await
+        let response: UnitGenerateAddressResponse = self.get_json(&path).await?;
+        verify_generate_address(&request, &response, self.network).map_err(|source| {
+            HyperUnitClientError::GuardianVerification {
+                endpoint: "/gen".to_string(),
+                source,
+            }
+        })?;
+        Ok(response)
     }
 
     pub async fn operations(
