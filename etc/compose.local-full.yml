@@ -473,13 +473,19 @@ services:
     command: /scripts/create-namespace.sh
 
   temporal-ui:
-    image: temporalio/ui:2.49.1
+    image: ghcr.io/riftresearch/tee-router-temporal-ui:local
+    build:
+      context: ..
+      dockerfile: etc/Dockerfile.temporal-ui
+      args:
+        TEMPORAL_UI_VERSION: 2.50.0
     depends_on:
       temporal:
         condition: service_healthy
     environment:
       TEMPORAL_ADDRESS: temporal:7233
       TEMPORAL_CORS_ORIGINS: http://localhost:3000
+      TEMPORAL_CODEC_DECODE_EVENT_HISTORY_DOWNLOAD: "true"
     ports:
       - "8080:8080"
 
