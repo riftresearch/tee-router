@@ -99,24 +99,20 @@ sol! {
     }
 }
 
+// CCTP V2 contract bindings generated from vendored Etherscan-verified ABIs.
+// Replaces the previous hand-rolled `interface` declarations that incorrectly
+// declared `depositForBurn` as `returns (uint64)` (V1 leakage — real V2
+// returns nothing). See `vendor/cctp/PROVENANCE.md` for source provenance.
 sol! {
-    interface ICircleTokenMessengerV2 {
-        function depositForBurn(
-            uint256 amount,
-            uint32 destinationDomain,
-            bytes32 mintRecipient,
-            address burnToken,
-            bytes32 destinationCaller,
-            uint256 maxFee,
-            uint32 minFinalityThreshold
-        ) external returns (uint64);
-    }
+    #[derive(Debug)]
+    ICircleTokenMessengerV2,
+    "../../vendor/cctp/TokenMessengerV2.abi.json",
 }
 
 sol! {
-    interface ICircleMessageTransmitterV2 {
-        function receiveMessage(bytes calldata message, bytes calldata attestation) external returns (bool);
-    }
+    #[derive(Debug)]
+    ICircleMessageTransmitterV2,
+    "../../vendor/cctp/MessageTransmitterV2.abi.json",
 }
 
 pub type ProviderResult<T> = Result<T, String>;
