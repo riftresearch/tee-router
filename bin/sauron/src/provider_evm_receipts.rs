@@ -35,28 +35,21 @@ const EVM_RECEIPT_LOOKUP_TIMEOUT: Duration = Duration::from_secs(20);
 sol! {
     #[derive(Debug)]
     event Transfer(address indexed from, address indexed to, uint256 value);
-
-    // Real Velora (ParaSwap) `SwappedV3`, emitted by the Augustus router on a
-    // settled sell-side swap.
-    // topic0 = keccak256("SwappedV3(bytes16,address,uint256,address,address,address,address,uint256,uint256,uint256)")
-    //        = 0xe00361d207b252a464323eb23d45d42583e391f2031acdd2e9fa36efddd43cb0
-    //
-    // NOTE: Augustus V6 (production) emits NO standard `SwappedV3` event — this
-    // pins the V5 shape. Velora venue audit follow-up PRs will fix this.
-    #[derive(Debug)]
-    event SwappedV3(
-        bytes16 uuid,
-        address partner,
-        uint256 feePercent,
-        address initiator,
-        address indexed beneficiary,
-        address indexed srcToken,
-        address indexed destToken,
-        uint256 srcAmount,
-        uint256 receivedAmount,
-        uint256 expectedAmount
-    );
 }
+
+/// Canonical Velora **AugustusV6** address — same CREATE2 deployment on
+/// Ethereum mainnet, Base, and Arbitrum (verified `AugustusV6` source on
+/// each Etherscan family chain explorer). V6 is the only production version
+/// our code emits transactions for (`VELORA_API_VERSION = "6.2"`); the
+/// legacy V5 router at `0xDEF171Fe48CF0115B1d80b88dc8eAB59176FEe57` is
+/// never reached.
+///
+/// Real V6 emits **no** swap event — only `DiamondCut` /
+/// `OwnershipTransferred`. So the only on-chain evidence of a settled
+/// Velora swap is the destination ERC-20's `Transfer(_, recipient, amount)`
+/// log, gated on `receipt.to == AUGUSTUS_V6`.
+const AUGUSTUS_V6: alloy::primitives::Address =
+    alloy::primitives::address!("6a000f20005980200259b80c5102003040001068");
 
 // CCTP V2 events consumed from the vendored Etherscan-verified ABI. The
 // generated module `CctpTokenMessengerV2` exposes `MintAndWithdraw` (used
@@ -303,6 +296,13 @@ async fn velora_swap_settled_hint(
     if !receipt.status() {
         return Ok(None);
     }
+    // Gate: a settled Velora V6 swap is a tx directed at AugustusV6. Any
+    // other Transfer in any other tx the recipient happens to be in would
+    // be a forgery vector if we matched on it. Audit finding (medium).
+    if receipt.to != Some(AUGUSTUS_V6) {
+        return Ok(None);
+    }
+
     let recipient = operation
         .request
         .get("recipient_address")
@@ -320,48 +320,9 @@ async fn velora_swap_settled_hint(
         .or_else(|| operation.request.get("amount_out").and_then(Value::as_str))
         .and_then(|amount| U256::from_str_radix(amount, 10).ok());
 
-    for log in &logs {
-        if log.removed {
-            continue;
-        }
-        let Ok(decoded) = log.log_decode::<SwappedV3>() else {
-            continue;
-        };
-        if let Some(recipient) = recipient {
-            if decoded.inner.data.beneficiary != recipient {
-                continue;
-            }
-        }
-        if let Some(expected_token) = expected_token {
-            if decoded.inner.data.destToken != expected_token {
-                continue;
-            }
-        }
-        if let Some(expected_min) = expected_min {
-            if decoded.inner.data.receivedAmount < expected_min {
-                continue;
-            }
-        }
-        let Some(log_index) = decoded.log_index else {
-            continue;
-        };
-        return Ok(Some(hint_request(
-            operation,
-            ProviderOperationHintKind::VeloraSwapSettled,
-            velora_swap_settled_evidence(
-                format!("{tx_hash:?}"),
-                log_index,
-                decoded.inner.data.receivedAmount.to_string(),
-                format!("{:#x}", decoded.inner.data.beneficiary),
-                Some(format!("{:#x}", decoded.inner.data.initiator)),
-                (decoded.inner.data.destToken != Address::ZERO)
-                    .then(|| format!("{:#x}", decoded.inner.data.destToken)),
-                decoded.block_number,
-            ),
-            log_index,
-        )));
-    }
-
+    // V6 emits no swap event of its own. Detect settlement via the destination
+    // ERC-20's `Transfer(_, recipient, value >= min)` log inside an
+    // AugustusV6-directed tx.
     for log in logs {
         if log.removed {
             continue;
@@ -395,8 +356,12 @@ async fn velora_swap_settled_hint(
                 log_index,
                 decoded.inner.data.value.to_string(),
                 format!("{:#x}", decoded.inner.data.to),
-                Some(format!("{:#x}", decoded.inner.data.from)),
-                Some(format!("{:#x}", decoded.address())),
+                // Initiator: the tx originator (the caller of AugustusV6),
+                // which is the executor we delegated to via the paymaster.
+                Some(format!("{:#x}", receipt.from)),
+                // Executor in the audit-trail sense: the Velora router that
+                // actually settled the swap. Always AugustusV6 by gate above.
+                Some(format!("{:#x}", AUGUSTUS_V6)),
                 decoded.block_number,
             ),
             log_index,

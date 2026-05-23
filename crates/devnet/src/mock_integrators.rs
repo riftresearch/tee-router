@@ -2174,12 +2174,25 @@ async fn mock_velora_transaction(
     } else {
         "0".to_string()
     };
-    let call = MockVeloraSwap::swapCall {
-        srcToken: src_token,
-        destToken: dest_token,
-        recipient: receiver,
-        srcAmount: U256::from(src_amount),
-        destAmount: U256::from(dest_amount),
+    // Encode real AugustusV6 `swapExactAmountIn` calldata. `executor`,
+    // `partnerAndFee`, `permit`, `executorData` are zeroed/empty — the mock
+    // ignores them but the signature must match V6 byte-for-byte so consumer
+    // code that decodes the calldata sees the same layout it would on
+    // mainnet/L2.
+    let call = MockVeloraSwap::swapExactAmountInCall {
+        _0: Address::ZERO, // executor
+        swapData: MockVeloraSwap::SwapData {
+            srcToken: src_token,
+            destToken: dest_token,
+            fromAmount: U256::from(src_amount),
+            toAmount: U256::from(dest_amount),
+            quotedAmount: U256::from(dest_amount),
+            metadata: FixedBytes::<32>::ZERO,
+            beneficiary: receiver,
+        },
+        _2: U256::ZERO,             // partnerAndFee
+        _3: Bytes::new(),           // permit
+        _4: Bytes::new(),           // executorData
     };
     Json(json!({
         "network": network,
