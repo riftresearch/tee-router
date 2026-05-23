@@ -143,6 +143,9 @@ struct CctpMessagesResponse {
 
 /// A single Iris message entry. Field shape mirrors `router-core`'s private
 /// `CctpMessageEntry` (camelCase, optional `message`/`attestation`).
+///
+/// `decoded_message_body` is nested inside `decoded_message` per the real Iris
+/// V2 response (`messages[].decodedMessage.decodedMessageBody`).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CctpMessageEntry {
@@ -156,6 +159,14 @@ struct CctpMessageEntry {
     event_nonce: Option<String>,
     #[serde(default)]
     #[allow(dead_code)]
+    decoded_message: Option<CctpDecodedMessage>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+struct CctpDecodedMessage {
+    #[serde(default)]
     decoded_message_body: Option<Value>,
 }
 
@@ -205,7 +216,7 @@ mod tests {
             attestation: attestation.map(str::to_string),
             status: status.to_string(),
             event_nonce: None,
-            decoded_message_body: None,
+            decoded_message: None,
         }
     }
 
@@ -253,13 +264,17 @@ mod tests {
 
     #[test]
     fn iris_messages_response_decodes_camelcase_iris_shape() {
+        // Mirrors the real Iris V2 response: decodedMessageBody is nested
+        // inside decodedMessage, not at the top level of the message entry.
         let body = serde_json::json!({
             "messages": [{
                 "message": "0xmsg",
                 "attestation": "0xatt",
                 "status": "complete",
                 "eventNonce": "0xnonce",
-                "decodedMessageBody": {"amount": "1000000"},
+                "decodedMessage": {
+                    "decodedMessageBody": {"amount": "1000000"},
+                },
             }]
         });
         let parsed: CctpMessagesResponse =
@@ -268,6 +283,12 @@ mod tests {
             classify_messages(&parsed.messages),
             CctpAttestationStatus::Ready
         );
+        let body = parsed.messages[0]
+            .decoded_message
+            .as_ref()
+            .and_then(|dm| dm.decoded_message_body.as_ref())
+            .expect("decodedMessageBody present");
+        assert_eq!(body.get("amount").and_then(Value::as_str), Some("1000000"));
     }
 
     #[test]
@@ -275,5 +296,40 @@ mod tests {
         assert!(CctpIrisClient::new("ftp://iris.example").is_err());
         assert!(CctpIrisClient::new("   ").is_err());
         assert!(CctpIrisClient::new("https://iris-api.circle.com/").is_ok());
+    }
+
+    /// Differential test: deserialize a real Iris V2 response captured from
+    /// production (Arbitrum domain 3 → Base domain 6, burn tx
+    /// 0x2d77d9667cc326816cd0ddc736a2222829e2087c7073362f16e0043141e43c96).
+    /// Pins the on-the-wire shape so a future field rename / re-nesting fails
+    /// loudly instead of silently no-op'ing the receive-amount invariant.
+    #[test]
+    fn real_iris_response_deserializes_with_nested_decoded_message_body() {
+        let body: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/cctp/iris_v2_complete_real.json"
+        ))
+        .expect("fixture parses");
+        let parsed: CctpMessagesResponse =
+            serde_json::from_value(body).expect("real iris response decodes");
+        assert_eq!(
+            classify_messages(&parsed.messages),
+            CctpAttestationStatus::Ready
+        );
+        let entry = &parsed.messages[0];
+        assert_eq!(entry.status, "complete");
+        let body = entry
+            .decoded_message
+            .as_ref()
+            .and_then(|dm| dm.decoded_message_body.as_ref())
+            .expect("decodedMessageBody present at the real nested path");
+        assert_eq!(
+            body.get("amount").and_then(Value::as_str),
+            Some("40000000"),
+            "real burn amount in the captured response"
+        );
+        assert_eq!(
+            body.get("mintRecipient").and_then(Value::as_str),
+            Some("0x33f65788aca48d733c2c2444ac9f79b18206aa92")
+        );
     }
 }
