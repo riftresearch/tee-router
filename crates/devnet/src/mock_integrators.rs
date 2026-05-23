@@ -3276,11 +3276,13 @@ async fn mock_cctp_messages(
     )
         .abi_encode();
     let message_hex = format!("0x{}", hex::encode(message));
-    let decoded_message_body = json!({
-        "burnToken": format!("{:#x}", record.burn_token),
-        "mintRecipient": format!("{:#x}", record.mint_recipient),
-        "amount": record.amount.to_string(),
-        "messageSender": format!("{:#x}", record.depositor)
+    let decoded_message = json!({
+        "decodedMessageBody": {
+            "burnToken": format!("{:#x}", record.burn_token),
+            "mintRecipient": format!("{:#x}", record.mint_recipient),
+            "amount": record.amount.to_string(),
+            "messageSender": format!("{:#x}", record.depositor)
+        }
     });
     if let Some(reason) = state.cctp_attestation_failure_reason.as_deref() {
         return (
@@ -3293,7 +3295,7 @@ async fn mock_cctp_messages(
                     "cctpVersion": 2,
                     "status": "failed",
                     "error": reason,
-                    "decodedMessageBody": decoded_message_body
+                    "decodedMessage": decoded_message
                 }]
             })),
         )
@@ -3314,7 +3316,7 @@ async fn mock_cctp_messages(
                     "eventNonce": record.nonce.clone(),
                     "cctpVersion": 2,
                     "status": "pending_confirmations",
-                    "decodedMessageBody": decoded_message_body
+                    "decodedMessage": decoded_message
                 }]
             })),
         )
@@ -3329,7 +3331,7 @@ async fn mock_cctp_messages(
                 "eventNonce": record.nonce.clone(),
                 "cctpVersion": 2,
                 "status": "complete",
-                "decodedMessageBody": decoded_message_body
+                "decodedMessage": decoded_message
             }]
         })),
     )

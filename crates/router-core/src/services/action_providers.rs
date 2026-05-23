@@ -2972,7 +2972,7 @@ impl BridgeProvider for CctpProvider {
                         "message": message.message,
                         "attestation": message.attestation,
                         "event_nonce": message.event_nonce,
-                        "decoded_message_body": message.decoded_message_body,
+                        "decoded_message_body": message.decoded_message_body(),
                     }),
                     response: Some(serde_json::to_value(&messages_response).map_err(|err| {
                         format!("cctp observe: serialize messages response: {err}")
@@ -2994,7 +2994,7 @@ impl BridgeProvider for CctpProvider {
                         "message": message.message,
                         "attestation": message.attestation,
                         "event_nonce": message.event_nonce,
-                        "decoded_message_body": message.decoded_message_body,
+                        "decoded_message_body": message.decoded_message_body(),
                         "cctp_version": message.cctp_version,
                     }),
                     response: Some(serde_json::to_value(&messages_response).map_err(|err| {
@@ -3239,10 +3239,27 @@ struct CctpMessageEntry {
     #[serde(default)]
     cctp_version: Option<u64>,
     status: String,
+    /// Nested per the real Iris V2 response
+    /// (`messages[].decodedMessage.decodedMessageBody`).
     #[serde(default)]
-    decoded_message_body: Option<Value>,
+    decoded_message: Option<CctpDecodedMessage>,
     #[serde(default)]
     error: Option<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CctpDecodedMessage {
+    #[serde(default)]
+    decoded_message_body: Option<Value>,
+}
+
+impl CctpMessageEntry {
+    fn decoded_message_body(&self) -> Option<&Value> {
+        self.decoded_message
+            .as_ref()
+            .and_then(|dm| dm.decoded_message_body.as_ref())
+    }
 }
 
 fn cctp_message_status_is_failed(status: &str) -> bool {
