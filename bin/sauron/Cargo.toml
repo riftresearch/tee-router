@@ -67,3 +67,4 @@ router-test-support = { path = "../../crates/test-support" }
 temporal-worker = { path = "../temporal-worker" }
 tempfile = { workspace = true }
 testcontainers = "0.27.2"
+venue-fixtures = { workspace = true }
