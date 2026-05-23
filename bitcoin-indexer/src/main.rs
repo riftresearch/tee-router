@@ -28,6 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         indexer,
         pubsub,
         metrics: Some(metrics),
+        network: config.network,
     });
 
     let listener = TcpListener::bind(config.bind)

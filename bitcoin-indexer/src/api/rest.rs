@@ -15,6 +15,7 @@ pub async fn healthz(State(state): State<Arc<AppState>>) -> Json<HealthResponse>
     Json(HealthResponse {
         ok: true,
         last_block_height: state.indexer.last_block_height().await,
+        network: state.network.to_string(),
     })
 }
 
@@ -69,6 +70,12 @@ pub struct TxOutputQueryParams {
 pub struct HealthResponse {
     pub ok: bool,
     pub last_block_height: Option<u64>,
+    /// Canonical Bitcoin network name (`bitcoin`, `testnet`, `signet`,
+    /// `regtest`) the indexer is configured against. Consumers should
+    /// verify this matches their own expected network at startup so a
+    /// misconfigured indexer can't silently produce wrong-network
+    /// addresses on `tx_outputs` / `/subscribe`.
+    pub network: String,
 }
 
 #[derive(Debug, Serialize)]

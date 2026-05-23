@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use bitcoin::{address::NetworkUnchecked, Address, BlockHash, Txid};
+use bitcoin::{address::NetworkUnchecked, Address, BlockHash, Network, Txid};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::{Client, RequestBuilder, StatusCode, Url};
 use serde::{Deserialize, Serialize};
@@ -72,6 +72,24 @@ pub enum Error {
 
     #[snafu(display("Bitcoin indexer websocket frame decode failed: {source}"))]
     WebSocketJson { source: serde_json::Error },
+
+    #[snafu(display("Bitcoin indexer /healthz failed to deserialize: {reason}"))]
+    HealthResponse { reason: String },
+
+    #[snafu(display(
+        "Bitcoin indexer network mismatch: expected {expected}, indexer reports {actual}"
+    ))]
+    NetworkMismatch { expected: String, actual: String },
+}
+
+/// Response body of `GET /healthz` on the bitcoin-indexer service.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthResponse {
+    pub ok: bool,
+    pub last_block_height: Option<u64>,
+    /// Canonical Bitcoin network name (`bitcoin`, `testnet`, `signet`,
+    /// `regtest`) the indexer is configured against.
+    pub network: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -176,6 +194,48 @@ impl BitcoinIndexerClient {
             .await
             .context(RequestSnafu)?;
         read_tx_output_page_response(response).await
+    }
+
+    /// Fetch `/healthz` — includes `ok`, `last_block_height`, and the
+    /// indexer's configured Bitcoin network. Consumers should call
+    /// [`Self::assert_network_matches`] at startup so a mis-configured
+    /// indexer can't silently produce wrong-network addresses on
+    /// `tx_outputs` / `/subscribe`.
+    pub async fn health(&self) -> Result<HealthResponse> {
+        let url = self.base_url.join("healthz").context(InvalidUrlSnafu)?;
+        let response = self
+            .send_request("GET", "/healthz", self.authorize(self.http.get(url)))
+            .await
+            .context(RequestSnafu)?;
+        response
+            .json::<HealthResponse>()
+            .await
+            .map_err(|source| Error::HealthResponse {
+                reason: source.to_string(),
+            })
+    }
+
+    /// Verify the indexer's configured network matches `expected`. Returns
+    /// an error if the indexer is on a different network (e.g. a regtest
+    /// indexer accidentally pointed at a mainnet consumer). Call at
+    /// startup; cheap (one HTTP GET).
+    pub async fn assert_network_matches(&self, expected: Network) -> Result<()> {
+        let resp = self.health().await?;
+        let reported = resp.network.parse::<Network>().map_err(|_| {
+            Error::HealthResponse {
+                reason: format!(
+                    "indexer returned unrecognized network {:?}",
+                    resp.network
+                ),
+            }
+        })?;
+        if reported != expected {
+            return Err(Error::NetworkMismatch {
+                expected: expected.to_string(),
+                actual: resp.network,
+            });
+        }
+        Ok(())
     }
 
     pub async fn subscribe(

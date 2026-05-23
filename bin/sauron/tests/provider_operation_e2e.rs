@@ -1465,6 +1465,7 @@ async fn spawn_bitcoin_indexer(devnet: &RiftDevnet) -> (String, RuntimeTask) {
         indexer,
         pubsub,
         metrics: None,
+        network: config.network,
     });
     let listener = TcpListener::bind(config.bind)
         .await

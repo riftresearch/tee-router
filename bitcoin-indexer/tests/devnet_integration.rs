@@ -40,6 +40,7 @@ async fn streams_and_queries_regtest_outputs() -> TestResult<()> {
         indexer,
         pubsub,
         metrics: None,
+        network: config.network,
     });
     let listener = TcpListener::bind(config.bind).await?;
     let addr = listener.local_addr()?;
@@ -154,6 +155,7 @@ async fn reorg_retracts_outputs_from_invalidated_regtest_block() -> TestResult<(
         indexer,
         pubsub,
         metrics: None,
+        network: config.network,
     });
     let listener = TcpListener::bind(config.bind).await?;
     let addr = listener.local_addr()?;
