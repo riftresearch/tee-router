@@ -36,22 +36,13 @@ sol! {
     #[derive(Debug)]
     event Transfer(address indexed from, address indexed to, uint256 value);
 
-    // Real CCTP v2 `MintAndWithdraw`, emitted by the TokenMessengerV2 from
-    // `_mintAndWithdraw` when `receiveMessage` mints the bridged USDC.
-    // topic0 = keccak256("MintAndWithdraw(address,uint256,address,uint256)")
-    //        = 0x50c55e915134d457debfa58eb6f4342956f8b0616d51a89a3659360178e1ab63
-    #[derive(Debug)]
-    event MintAndWithdraw(
-        address indexed mintRecipient,
-        uint256 amount,
-        address indexed mintToken,
-        uint256 feeCollected
-    );
-
     // Real Velora (ParaSwap) `SwappedV3`, emitted by the Augustus router on a
     // settled sell-side swap.
     // topic0 = keccak256("SwappedV3(bytes16,address,uint256,address,address,address,address,uint256,uint256,uint256)")
     //        = 0xe00361d207b252a464323eb23d45d42583e391f2031acdd2e9fa36efddd43cb0
+    //
+    // NOTE: Augustus V6 (production) emits NO standard `SwappedV3` event — this
+    // pins the V5 shape. Velora venue audit follow-up PRs will fix this.
     #[derive(Debug)]
     event SwappedV3(
         bytes16 uuid,
@@ -65,6 +56,16 @@ sol! {
         uint256 receivedAmount,
         uint256 expectedAmount
     );
+}
+
+// CCTP V2 events consumed from the vendored Etherscan-verified ABI. The
+// generated module `CctpTokenMessengerV2` exposes `MintAndWithdraw` (used
+// by the cctp_receive observer) and `DepositForBurn` (decoded for the
+// burn-side observability path). See `vendor/cctp/PROVENANCE.md`.
+sol! {
+    #[derive(Debug)]
+    CctpTokenMessengerV2,
+    "../../vendor/cctp/TokenMessengerV2.abi.json",
 }
 
 #[derive(Clone)]
@@ -463,7 +464,7 @@ async fn cctp_receive_observed_hint(
         if log.removed {
             continue;
         }
-        let Ok(decoded) = log.log_decode::<MintAndWithdraw>() else {
+        let Ok(decoded) = log.log_decode::<CctpTokenMessengerV2::MintAndWithdraw>() else {
             continue;
         };
         if let Some(expected_token_messenger) = expected_token_messenger {
