@@ -12,7 +12,7 @@ const LIVE_TEST_PRIVATE_KEY: &str = "LIVE_TEST_PRIVATE_KEY";
 const HYPERLIQUID_PRIVATE_KEY: &str = "HYPERLIQUID_LIVE_PRIVATE_KEY";
 
 #[derive(Parser)]
-#[command(about = "Sell a live Hyperliquid spot balance using a marketable IOC limit order")]
+#[command(about = "Buy or sell a live Hyperliquid spot balance using a marketable IOC limit order")]
 struct Args {
     #[arg(
         long,
@@ -30,13 +30,20 @@ struct Args {
     #[arg(long, default_value = "UBTC/USDC")]
     pair: String,
 
+    /// "sell" → marketable IOC against best bid; "buy" → against best ask.
+    #[arg(long, default_value = "sell")]
+    side: String,
+
     #[arg(
         long,
         help = "Base asset amount in Hyperliquid natural units, e.g. 0.00075"
     )]
     sz: String,
 
-    #[arg(long, default_value = "0.99")]
+    /// For sell: multiply best bid by this (e.g. 0.99). For buy: multiply
+    /// best ask by this (e.g. 1.01). Default of `0` triggers an automatic
+    /// side-appropriate pick (0.99 for sell, 1.01 for buy).
+    #[arg(long, default_value = "0")]
     limit_multiplier: f64,
 }
 
@@ -74,19 +81,42 @@ async fn main() -> CliResult<()> {
         .into());
     }
 
+    let side = args.side.to_ascii_lowercase();
+    let is_buy = match side.as_str() {
+        "sell" => false,
+        "buy" => true,
+        other => return Err(format!("unsupported --side {other:?} (use sell|buy)").into()),
+    };
+
     let book = client.l2_book(&args.pair).await?;
-    let best_bid_level = book
-        .best_bid()
-        .ok_or_else(|| format!("pair {} has no bid levels", args.pair))?;
-    let best_bid = best_bid_level.px.parse::<f64>()?;
-    let price_decimals = visible_decimal_places(&best_bid_level.px);
-    let limit_px = format_decimal_floor(best_bid * args.limit_multiplier, price_decimals);
+    let (reference_level, default_mult) = if is_buy {
+        (
+            book.best_ask()
+                .ok_or_else(|| format!("pair {} has no ask levels", args.pair))?,
+            1.01_f64,
+        )
+    } else {
+        (
+            book.best_bid()
+                .ok_or_else(|| format!("pair {} has no bid levels", args.pair))?,
+            0.99_f64,
+        )
+    };
+    let reference_px = reference_level.px.parse::<f64>()?;
+    let multiplier = if args.limit_multiplier == 0.0 {
+        default_mult
+    } else {
+        args.limit_multiplier
+    };
+    let price_decimals = visible_decimal_places(&reference_level.px);
+    let limit_px = format_decimal_floor(reference_px * multiplier, price_decimals);
+
     let before_spot = client.spot_clearinghouse_state(user).await?;
     let response = client
         .place_orders(
             vec![OrderRequest {
                 asset,
-                is_buy: false,
+                is_buy,
                 limit_px: limit_px.clone(),
                 sz: sz.clone(),
                 reduce_only: false,
@@ -109,7 +139,8 @@ async fn main() -> CliResult<()> {
             "user": format!("{user:#x}"),
             "pair": args.pair,
             "asset": asset,
-            "is_buy": false,
+            "side": side,
+            "is_buy": is_buy,
             "limit_px": limit_px,
             "sz": sz,
             "before_spot": before_spot,
