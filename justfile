@@ -254,7 +254,7 @@ phala-deploy TAG:
     #!/usr/bin/env bash
     set -euo pipefail
     test -f "{{phala_env}}" || { echo "missing {{phala_env}} (gitignored secret env)"; exit 1; }
-    sed -i -E 's#(ghcr\.io/riftresearch/tee-router(-temporal-worker)?:)[^"[:space:]]+#\1{{TAG}}#g' "{{phala_compose}}"
+    sed -i -E 's#(ghcr\.io/riftresearch/tee-router(-temporal-worker|-temporal-ui)?:)[^"[:space:]]+#\1{{TAG}}#g' "{{phala_compose}}"
     echo "pinned ghcr images to {{TAG}}:"
     grep -n 'ghcr.io/riftresearch/tee-router' "{{phala_compose}}"
     docker compose -f "{{phala_compose}}" config --no-interpolate >/dev/null

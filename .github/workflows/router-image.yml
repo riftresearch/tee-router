@@ -13,6 +13,7 @@ permissions:
 env:
   IMAGE_NAME: ghcr.io/riftresearch/tee-router
   TEMPORAL_WORKER_IMAGE_NAME: ghcr.io/riftresearch/tee-router-temporal-worker
+  TEMPORAL_UI_IMAGE_NAME: ghcr.io/riftresearch/tee-router-temporal-ui
 
 jobs:
   build:
@@ -86,6 +87,16 @@ jobs:
             type=ref,event=branch
             type=semver,pattern={{version}}
 
+      - name: Extract temporal-ui metadata
+        id: temporal-ui-meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.TEMPORAL_UI_IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+
       - name: Build and optionally push router image
         uses: docker/build-push-action@v6
         with:
@@ -104,4 +115,16 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.temporal-worker-meta.outputs.tags }}
           labels: ${{ steps.temporal-worker-meta.outputs.labels }}
+          # Build cache persists in the self-hosted runner's named BuildKit builder.
+
+      - name: Build and optionally push temporal-ui image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: etc/Dockerfile.temporal-ui
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.temporal-ui-meta.outputs.tags }}
+          labels: ${{ steps.temporal-ui-meta.outputs.labels }}
+          build-args: |
+            TEMPORAL_UI_VERSION=2.50.0
           # Build cache persists in the self-hosted runner's named BuildKit builder.
