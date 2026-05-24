@@ -567,10 +567,12 @@ impl OrderWorkflowClient {
 
     /// Starts a standalone `RefundWorkflow` for an order stuck in
     /// `RefundRequired`. The workflow id is deterministic
-    /// ([`manual_refund_workflow_id`]) so a repeated trigger collides with the
+    /// ([`manual_refund_workflow_id`]) so a repeated trigger collides with an
     /// in-flight run and is reported as
     /// [`StartRefundWorkflowOutcome::AlreadyStarted`] rather than starting a
-    /// duplicate refund.
+    /// duplicate refund. Once a prior manual refund workflow has closed, a new
+    /// run is allowed; the order status remains the guard against double
+    /// refunds.
     pub async fn start_refund_workflow(
         &self,
         order_id: WorkflowOrderId,
@@ -599,7 +601,7 @@ impl OrderWorkflowClient {
                 input: Some(input),
                 identity: self.identity.clone(),
                 request_id: Uuid::now_v7().to_string(),
-                workflow_id_reuse_policy: WorkflowIdReusePolicy::AllowDuplicateFailedOnly as i32,
+                workflow_id_reuse_policy: WorkflowIdReusePolicy::AllowDuplicate as i32,
                 workflow_id_conflict_policy: WorkflowIdConflictPolicy::Fail as i32,
                 ..Default::default()
             })
