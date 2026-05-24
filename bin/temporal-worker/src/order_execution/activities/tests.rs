@@ -1418,7 +1418,10 @@ async fn idempotent_step_retry_surfaces_failed_operation_as_non_retryable() {
         Err(error) => error,
     };
     assert!(
-        matches!(retry_error, OrderActivityError::ProviderOperationLost { .. }),
+        matches!(
+            retry_error,
+            OrderActivityError::ProviderOperationLost { .. }
+        ),
         "expected ProviderOperationLost, got {retry_error:?}"
     );
     assert!(
@@ -2732,9 +2735,29 @@ fn refund_position_discovery_zero_positions_is_untenable() {
 /// Seeds a `router_orders` row plus the given execution attempts (each tuple
 /// is `(attempt_id, attempt_index)`) and returns the order id. Used by the
 /// `resolve_latest_execution_attempt` tests.
-async fn seed_order_with_execution_attempts(
+async fn seed_order_with_execution_attempts(pool: &PgPool, attempts: &[(Uuid, i32)]) -> Uuid {
+    let specs = attempts
+        .iter()
+        .map(|(attempt_id, attempt_index)| {
+            (
+                *attempt_id,
+                *attempt_index,
+                OrderExecutionAttemptKind::PrimaryExecution,
+                OrderExecutionAttemptStatus::Cancelled,
+            )
+        })
+        .collect::<Vec<_>>();
+    seed_order_with_execution_attempt_specs(pool, &specs).await
+}
+
+async fn seed_order_with_execution_attempt_specs(
     pool: &PgPool,
-    attempts: &[(Uuid, i32)],
+    attempts: &[(
+        Uuid,
+        i32,
+        OrderExecutionAttemptKind,
+        OrderExecutionAttemptStatus,
+    )],
 ) -> Uuid {
     let order_id = Uuid::now_v7();
     let now = Utc::now();
@@ -2776,7 +2799,7 @@ async fn seed_order_with_execution_attempts(
     .await
     .expect("insert market order action for execution-attempt resolution test");
 
-    for (attempt_id, attempt_index) in attempts {
+    for (attempt_id, attempt_index, attempt_kind, status) in attempts {
         sqlx_core::query::query(
             r#"
                 INSERT INTO order_execution_attempts (
@@ -2784,13 +2807,15 @@ async fn seed_order_with_execution_attempts(
                     failure_reason_json, input_custody_snapshot_json,
                     created_at, updated_at
                 )
-                VALUES ($1, $2, $3, 'primary_execution', 'cancelled',
-                        '{}'::jsonb, '{}'::jsonb, $4, $4)
+                VALUES ($1, $2, $3, $4, $5,
+                        '{}'::jsonb, '{}'::jsonb, $6, $6)
                 "#,
         )
         .bind(attempt_id)
         .bind(order_id)
         .bind(attempt_index)
+        .bind(attempt_kind.to_db_string())
+        .bind(status.to_db_string())
         .bind(now)
         .execute(pool)
         .await
@@ -2822,6 +2847,120 @@ async fn resolve_latest_execution_attempt_picks_most_recent_attempt() {
     .expect("resolve latest execution attempt");
 
     assert_eq!(resolved.attempt_id.inner(), latest_attempt);
+}
+
+#[tokio::test]
+async fn resolve_latest_execution_attempt_skips_failed_refund_attempts() {
+    let test_db = test_database().await;
+    let deps = test_deps(test_db.db.clone());
+    let forward_attempt = Uuid::now_v7();
+    let failed_refund_attempt = Uuid::now_v7();
+    let order_id = seed_order_with_execution_attempt_specs(
+        &test_db.pool,
+        &[
+            (
+                forward_attempt,
+                4,
+                OrderExecutionAttemptKind::RefreshedExecution,
+                OrderExecutionAttemptStatus::Failed,
+            ),
+            (
+                failed_refund_attempt,
+                5,
+                OrderExecutionAttemptKind::RefundRecovery,
+                OrderExecutionAttemptStatus::Failed,
+            ),
+        ],
+    )
+    .await;
+
+    let resolved = resolve_latest_execution_attempt_with_deps(
+        &deps,
+        ResolveLatestExecutionAttemptInput {
+            order_id: order_id.into(),
+        },
+    )
+    .await
+    .expect("resolve latest forward execution attempt");
+
+    assert_eq!(resolved.attempt_id.inner(), forward_attempt);
+}
+
+#[tokio::test]
+async fn hyperliquid_refund_materialization_creates_fresh_attempt_after_failed_refund() {
+    let test_db = test_database().await;
+    let planned_at = Utc::now();
+    let source_usdc = test_asset("evm:8453", "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913");
+    let mut order = test_order(source_usdc.clone(), planned_at);
+    order.destination_asset = test_asset("bitcoin", "native");
+    order.workflow_parent_span_id = order.workflow_trace_id[..16].to_string();
+    let failed_attempt_id = Uuid::now_v7();
+    let hyperliquid_vault =
+        test_custody_vault(&order, CustodyVaultRole::HyperliquidSpot, &source_usdc);
+    seed_hyperliquid_spot_refund_order(
+        &test_db.db,
+        &test_db.pool,
+        &order,
+        failed_attempt_id,
+        &hyperliquid_vault,
+    )
+    .await;
+
+    let failed_refund_attempt_id = Uuid::now_v7();
+    sqlx_core::query::query(
+        r#"
+            INSERT INTO order_execution_attempts (
+                id, order_id, attempt_index, attempt_kind, status,
+                failure_reason_json, input_custody_snapshot_json,
+                created_at, updated_at
+            )
+            VALUES ($1, $2, 2, 'refund_recovery', 'failed',
+                    '{"reason":"prior_refund_failed"}'::jsonb, '{}'::jsonb, $3, $3)
+            "#,
+    )
+    .bind(failed_refund_attempt_id)
+    .bind(order.id)
+    .bind(planned_at)
+    .execute(&test_db.pool)
+    .await
+    .expect("insert failed prior refund attempt");
+
+    let leg_id = Uuid::now_v7();
+    let leg = test_execution_leg(
+        order.id,
+        leg_id,
+        0,
+        source_usdc.clone(),
+        source_usdc.clone(),
+    );
+    let step = test_execution_step(
+        order.id,
+        failed_refund_attempt_id,
+        leg_id,
+        0,
+        OrderExecutionStepStatus::Planned,
+    );
+    let record = test_db
+        .db
+        .orders()
+        .create_refund_attempt_from_hyperliquid_spot(
+            order.id,
+            failed_attempt_id,
+            HyperliquidSpotRefundAttemptPlan {
+                source_custody_vault_id: hyperliquid_vault.id,
+                legs: vec![leg],
+                steps: vec![step],
+                failure_reason: json!({"reason": "retry_refund"}),
+                input_custody_snapshot: json!({}),
+            },
+            planned_at,
+        )
+        .await
+        .expect("materialize fresh Hyperliquid refund attempt");
+
+    assert_eq!(record.attempt.attempt_index, 3);
+    assert_ne!(record.attempt.id, failed_refund_attempt_id);
+    assert_eq!(record.steps.len(), 1);
 }
 
 #[tokio::test]
@@ -2889,6 +3028,80 @@ fn refund_position_discovery_multiple_positions_selects_highest_priority() {
         }
         other => panic!("expected best-priority refund position, got {other:?}"),
     }
+}
+
+#[test]
+fn refund_position_discovery_prefers_expected_hyperliquid_asset_over_dust() {
+    let order_id = Uuid::now_v7();
+    let source_usdc = test_asset("evm:8453", "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913");
+    let expected_ubtc = test_asset("hyperliquid", "UBTC");
+    let mut usdc_dust = test_refund_position(RecoverablePositionKind::HyperliquidSpot, "463000");
+    usdc_dust.asset = source_usdc.clone();
+    usdc_dust.hyperliquid_coin = Some("USDC".to_string());
+    usdc_dust.hyperliquid_canonical = Some(CanonicalAsset::Usdc);
+    let mut ubtc_position = test_refund_position(RecoverablePositionKind::HyperliquidSpot, "49965");
+    ubtc_position.asset = source_usdc;
+    ubtc_position.hyperliquid_coin = Some("UBTC".to_string());
+    ubtc_position.hyperliquid_canonical = Some(CanonicalAsset::Btc);
+
+    let discovery = refund_position_discovery_from_positions_with_expected(
+        order_id,
+        vec![usdc_dust, ubtc_position],
+        Some(&expected_ubtc),
+        Some(CanonicalAsset::Btc),
+    );
+
+    match discovery.outcome {
+        SingleRefundPositionOutcome::Position(position) => {
+            assert_eq!(position.amount.as_str(), "49965");
+            assert_eq!(position.hyperliquid_coin.as_deref(), Some("UBTC"));
+            assert_eq!(position.hyperliquid_canonical, Some(CanonicalAsset::Btc));
+        }
+        other => panic!("expected expected-asset refund position, got {other:?}"),
+    }
+}
+
+#[test]
+fn refund_step_idempotency_key_includes_attempt_id() {
+    let order_id = Uuid::now_v7();
+    let attempt_id = Uuid::now_v7();
+    let leg_id = Uuid::now_v7();
+    let mut step = test_execution_step(
+        order_id,
+        attempt_id,
+        leg_id,
+        0,
+        OrderExecutionStepStatus::Planned,
+    );
+    step.details = json!({ "refund_kind": "transition_path" });
+
+    let key = step_idempotency_key(&step, ProviderOperationType::HyperliquidTrade);
+
+    assert_eq!(
+        key,
+        format!("order:{order_id}:attempt:{attempt_id}:hyperliquid_trade:step:0")
+    );
+}
+
+#[test]
+fn non_refund_step_idempotency_key_preserves_retry_scope() {
+    let order_id = Uuid::now_v7();
+    let attempt_id = Uuid::now_v7();
+    let leg_id = Uuid::now_v7();
+    let step = test_execution_step(
+        order_id,
+        attempt_id,
+        leg_id,
+        2,
+        OrderExecutionStepStatus::Planned,
+    );
+
+    let key = step_idempotency_key(&step, ProviderOperationType::UniversalRouterSwap);
+
+    assert_eq!(
+        key,
+        format!("order:{order_id}:universal_router_swap:step:2")
+    );
 }
 
 #[test]
@@ -3789,6 +4002,39 @@ fn test_execution_step(
         request: json!({}),
         response: json!({}),
         error: json!({}),
+        usd_valuation: json!({}),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+fn test_execution_leg(
+    order_id: Uuid,
+    leg_id: Uuid,
+    leg_index: i32,
+    input_asset: DepositAsset,
+    output_asset: DepositAsset,
+) -> OrderExecutionLeg {
+    let now = Utc::now();
+    OrderExecutionLeg {
+        id: leg_id,
+        order_id,
+        execution_attempt_id: None,
+        transition_decl_id: Some(format!("test-transition-{leg_index}")),
+        leg_index,
+        leg_type: "swap".to_string(),
+        provider: ProviderId::Velora.as_str().to_string(),
+        status: OrderExecutionStepStatus::Planned,
+        input_asset,
+        output_asset,
+        amount_in: "1000".to_string(),
+        estimated_amount_out: "1000".to_string(),
+        actual_amount_in: None,
+        actual_amount_out: None,
+        started_at: None,
+        completed_at: None,
+        provider_quote_expires_at: None,
+        details: json!({}),
         usd_valuation: json!({}),
         created_at: now,
         updated_at: now,

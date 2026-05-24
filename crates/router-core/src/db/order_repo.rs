@@ -367,6 +367,11 @@ impl OrderExecutorWaitTotal {
     }
 }
 
+enum RefundAttemptIndexResolution {
+    Reuse(OrderExecutionAttempt),
+    Create(i32),
+}
+
 #[derive(Clone)]
 pub struct OrderRepository {
     pool: PgPool,
@@ -3253,74 +3258,19 @@ impl OrderRepository {
                 });
             }
 
-            let refund_attempt_index = failed_attempt.attempt_index + 1;
-            if let Some(existing_refund_row) = sqlx_core::query::query(&format!(
-                r#"
-                SELECT {EXECUTION_ATTEMPT_SELECT_COLUMNS}
-                FROM order_execution_attempts
-                WHERE order_id = $1
-                  AND attempt_index = $2
-                ORDER BY created_at ASC, id ASC
-                LIMIT 1
-                FOR UPDATE
-                "#
-            ))
-            .bind(order_id)
-            .bind(refund_attempt_index)
-            .fetch_optional(&mut *tx)
-            .await?
+            let refund_attempt_index = match self
+                .resolve_refund_attempt_index(&mut tx, order_id, failed_attempt.attempt_index + 1)
+                .await?
             {
-                let attempt = self.map_execution_attempt_row(&existing_refund_row)?;
-                if attempt.attempt_kind != OrderExecutionAttemptKind::RefundRecovery {
-                    return Err(RouterCoreError::Conflict {
-                        message: format!(
-                            "order {} attempt_index {} already materialized as {}",
-                            order_id,
-                            refund_attempt_index,
-                            attempt.attempt_kind.to_db_string()
-                        ),
-                    });
+                RefundAttemptIndexResolution::Reuse(attempt) => {
+                    let record = self
+                        .load_execution_attempt_materialization_record_tx(&mut tx, order, attempt)
+                        .await?;
+                    tx.commit().await?;
+                    return Ok::<ExecutionAttemptMaterializationRecord, RouterCoreError>(record);
                 }
-                let leg_rows = sqlx_core::query::query(&format!(
-                    r#"
-                    SELECT {EXECUTION_LEG_SELECT_COLUMNS}
-                    FROM order_execution_legs
-                    WHERE execution_attempt_id = $1
-                    ORDER BY leg_index ASC, created_at ASC, id ASC
-                    "#
-                ))
-                .bind(attempt.id)
-                .fetch_all(&mut *tx)
-                .await?;
-                let legs = leg_rows
-                    .iter()
-                    .map(|row| self.map_execution_leg_row(row))
-                    .collect::<RouterCoreResult<Vec<_>>>()?;
-                let step_rows = sqlx_core::query::query(&format!(
-                    r#"
-                    SELECT {EXECUTION_STEP_SELECT_COLUMNS}
-                    FROM order_execution_steps
-                    WHERE execution_attempt_id = $1
-                    ORDER BY step_index ASC, created_at ASC, id ASC
-                    "#
-                ))
-                .bind(attempt.id)
-                .fetch_all(&mut *tx)
-                .await?;
-                let steps = step_rows
-                    .iter()
-                    .map(|row| self.map_execution_step_row(row))
-                    .collect::<RouterCoreResult<Vec<_>>>()?;
-                tx.commit().await?;
-                return Ok::<ExecutionAttemptMaterializationRecord, RouterCoreError>(
-                    ExecutionAttemptMaterializationRecord {
-                        order,
-                        attempt,
-                        legs,
-                        steps,
-                    },
-                );
-            }
+                RefundAttemptIndexResolution::Create(refund_attempt_index) => refund_attempt_index,
+            };
 
             let refund_attempt = OrderExecutionAttempt {
                 id: Uuid::now_v7(),
@@ -3541,74 +3491,19 @@ impl OrderRepository {
                 });
             }
 
-            let refund_attempt_index = failed_attempt.attempt_index + 1;
-            if let Some(existing_refund_row) = sqlx_core::query::query(&format!(
-                r#"
-                SELECT {EXECUTION_ATTEMPT_SELECT_COLUMNS}
-                FROM order_execution_attempts
-                WHERE order_id = $1
-                  AND attempt_index = $2
-                ORDER BY created_at ASC, id ASC
-                LIMIT 1
-                FOR UPDATE
-                "#
-            ))
-            .bind(order_id)
-            .bind(refund_attempt_index)
-            .fetch_optional(&mut *tx)
-            .await?
+            let refund_attempt_index = match self
+                .resolve_refund_attempt_index(&mut tx, order_id, failed_attempt.attempt_index + 1)
+                .await?
             {
-                let attempt = self.map_execution_attempt_row(&existing_refund_row)?;
-                if attempt.attempt_kind != OrderExecutionAttemptKind::RefundRecovery {
-                    return Err(RouterCoreError::Conflict {
-                        message: format!(
-                            "order {} attempt_index {} already materialized as {}",
-                            order_id,
-                            refund_attempt_index,
-                            attempt.attempt_kind.to_db_string()
-                        ),
-                    });
+                RefundAttemptIndexResolution::Reuse(attempt) => {
+                    let record = self
+                        .load_execution_attempt_materialization_record_tx(&mut tx, order, attempt)
+                        .await?;
+                    tx.commit().await?;
+                    return Ok::<ExecutionAttemptMaterializationRecord, RouterCoreError>(record);
                 }
-                let leg_rows = sqlx_core::query::query(&format!(
-                    r#"
-                    SELECT {EXECUTION_LEG_SELECT_COLUMNS}
-                    FROM order_execution_legs
-                    WHERE execution_attempt_id = $1
-                    ORDER BY leg_index ASC, created_at ASC, id ASC
-                    "#
-                ))
-                .bind(attempt.id)
-                .fetch_all(&mut *tx)
-                .await?;
-                let legs = leg_rows
-                    .iter()
-                    .map(|row| self.map_execution_leg_row(row))
-                    .collect::<RouterCoreResult<Vec<_>>>()?;
-                let step_rows = sqlx_core::query::query(&format!(
-                    r#"
-                    SELECT {EXECUTION_STEP_SELECT_COLUMNS}
-                    FROM order_execution_steps
-                    WHERE execution_attempt_id = $1
-                    ORDER BY step_index ASC, created_at ASC, id ASC
-                    "#
-                ))
-                .bind(attempt.id)
-                .fetch_all(&mut *tx)
-                .await?;
-                let steps = step_rows
-                    .iter()
-                    .map(|row| self.map_execution_step_row(row))
-                    .collect::<RouterCoreResult<Vec<_>>>()?;
-                tx.commit().await?;
-                return Ok::<ExecutionAttemptMaterializationRecord, RouterCoreError>(
-                    ExecutionAttemptMaterializationRecord {
-                        order,
-                        attempt,
-                        legs,
-                        steps,
-                    },
-                );
-            }
+                RefundAttemptIndexResolution::Create(refund_attempt_index) => refund_attempt_index,
+            };
 
             let refund_attempt = OrderExecutionAttempt {
                 id: Uuid::now_v7(),
@@ -3791,74 +3686,27 @@ impl OrderRepository {
                 });
             }
 
-            let refund_attempt_index = failed_attempt.attempt_index + 1;
-            if let Some(existing_refund_row) = sqlx_core::query::query(&format!(
-                r#"
-                SELECT {EXECUTION_ATTEMPT_SELECT_COLUMNS}
-                FROM order_execution_attempts
-                WHERE order_id = $1
-                  AND attempt_index = $2
-                ORDER BY created_at ASC, id ASC
-                LIMIT 1
-                FOR UPDATE
-                "#
-            ))
-            .bind(order_id)
-            .bind(refund_attempt_index)
-            .fetch_optional(&mut *tx)
-            .await?
+            let refund_attempt_index = match self
+                .resolve_refund_attempt_index(
+                    &mut tx,
+                    order_id,
+                    failed_attempt.attempt_index + 1,
+                )
+                .await?
             {
-                let attempt = self.map_execution_attempt_row(&existing_refund_row)?;
-                if attempt.attempt_kind != OrderExecutionAttemptKind::RefundRecovery {
-                    return Err(RouterCoreError::Conflict {
-                        message: format!(
-                            "order {} attempt_index {} already materialized as {}",
-                            order_id,
-                            refund_attempt_index,
-                            attempt.attempt_kind.to_db_string()
-                        ),
-                    });
+                RefundAttemptIndexResolution::Reuse(attempt) => {
+                    let record = self
+                        .load_execution_attempt_materialization_record_tx(
+                            &mut tx,
+                            order,
+                            attempt,
+                        )
+                        .await?;
+                    tx.commit().await?;
+                    return Ok::<ExecutionAttemptMaterializationRecord, RouterCoreError>(record);
                 }
-                let leg_rows = sqlx_core::query::query(&format!(
-                    r#"
-                    SELECT {EXECUTION_LEG_SELECT_COLUMNS}
-                    FROM order_execution_legs
-                    WHERE execution_attempt_id = $1
-                    ORDER BY leg_index ASC, created_at ASC, id ASC
-                    "#
-                ))
-                .bind(attempt.id)
-                .fetch_all(&mut *tx)
-                .await?;
-                let legs = leg_rows
-                    .iter()
-                    .map(|row| self.map_execution_leg_row(row))
-                    .collect::<RouterCoreResult<Vec<_>>>()?;
-                let step_rows = sqlx_core::query::query(&format!(
-                    r#"
-                    SELECT {EXECUTION_STEP_SELECT_COLUMNS}
-                    FROM order_execution_steps
-                    WHERE execution_attempt_id = $1
-                    ORDER BY step_index ASC, created_at ASC, id ASC
-                    "#
-                ))
-                .bind(attempt.id)
-                .fetch_all(&mut *tx)
-                .await?;
-                let steps = step_rows
-                    .iter()
-                    .map(|row| self.map_execution_step_row(row))
-                    .collect::<RouterCoreResult<Vec<_>>>()?;
-                tx.commit().await?;
-                return Ok::<ExecutionAttemptMaterializationRecord, RouterCoreError>(
-                    ExecutionAttemptMaterializationRecord {
-                        order,
-                        attempt,
-                        legs,
-                        steps,
-                    },
-                );
-            }
+                RefundAttemptIndexResolution::Create(refund_attempt_index) => refund_attempt_index,
+            };
 
             let refund_attempt = OrderExecutionAttempt {
                 id: Uuid::now_v7(),
@@ -4311,6 +4159,113 @@ impl OrderRepository {
         let row = result?;
 
         self.map_execution_attempt_row(&row)
+    }
+
+    async fn resolve_refund_attempt_index(
+        &self,
+        tx: &mut sqlx_core::transaction::Transaction<'_, Postgres>,
+        order_id: Uuid,
+        preferred_attempt_index: i32,
+    ) -> RouterCoreResult<RefundAttemptIndexResolution> {
+        if let Some(existing_refund_row) = sqlx_core::query::query(&format!(
+            r#"
+            SELECT {EXECUTION_ATTEMPT_SELECT_COLUMNS}
+            FROM order_execution_attempts
+            WHERE order_id = $1
+              AND attempt_index = $2
+            ORDER BY created_at ASC, id ASC
+            LIMIT 1
+            FOR UPDATE
+            "#
+        ))
+        .bind(order_id)
+        .bind(preferred_attempt_index)
+        .fetch_optional(&mut **tx)
+        .await?
+        {
+            let attempt = self.map_execution_attempt_row(&existing_refund_row)?;
+            if attempt.attempt_kind != OrderExecutionAttemptKind::RefundRecovery {
+                return Err(RouterCoreError::Conflict {
+                    message: format!(
+                        "order {} attempt_index {} already materialized as {}",
+                        order_id,
+                        preferred_attempt_index,
+                        attempt.attempt_kind.to_db_string()
+                    ),
+                });
+            }
+            if matches!(
+                attempt.status,
+                OrderExecutionAttemptStatus::Planning
+                    | OrderExecutionAttemptStatus::Active
+                    | OrderExecutionAttemptStatus::Completed
+            ) {
+                return Ok(RefundAttemptIndexResolution::Reuse(attempt));
+            }
+            // A failed/cancelled refund attempt is no longer an idempotent
+            // in-flight materialization. A manual recovery needs a fresh
+            // attempt so it can carry a corrected route and fresh step keys.
+            let next_attempt_index = sqlx_core::query_scalar::query_scalar::<_, i32>(
+                r#"
+                SELECT COALESCE(MAX(attempt_index), $2) + 1
+                FROM order_execution_attempts
+                WHERE order_id = $1
+                "#,
+            )
+            .bind(order_id)
+            .bind(preferred_attempt_index)
+            .fetch_one(&mut **tx)
+            .await?;
+            return Ok(RefundAttemptIndexResolution::Create(next_attempt_index));
+        }
+
+        Ok(RefundAttemptIndexResolution::Create(
+            preferred_attempt_index,
+        ))
+    }
+
+    async fn load_execution_attempt_materialization_record_tx(
+        &self,
+        tx: &mut sqlx_core::transaction::Transaction<'_, Postgres>,
+        order: RouterOrder,
+        attempt: OrderExecutionAttempt,
+    ) -> RouterCoreResult<ExecutionAttemptMaterializationRecord> {
+        let leg_rows = sqlx_core::query::query(&format!(
+            r#"
+            SELECT {EXECUTION_LEG_SELECT_COLUMNS}
+            FROM order_execution_legs
+            WHERE execution_attempt_id = $1
+            ORDER BY leg_index ASC, created_at ASC, id ASC
+            "#
+        ))
+        .bind(attempt.id)
+        .fetch_all(&mut **tx)
+        .await?;
+        let legs = leg_rows
+            .iter()
+            .map(|row| self.map_execution_leg_row(row))
+            .collect::<RouterCoreResult<Vec<_>>>()?;
+        let step_rows = sqlx_core::query::query(&format!(
+            r#"
+            SELECT {EXECUTION_STEP_SELECT_COLUMNS}
+            FROM order_execution_steps
+            WHERE execution_attempt_id = $1
+            ORDER BY step_index ASC, created_at ASC, id ASC
+            "#
+        ))
+        .bind(attempt.id)
+        .fetch_all(&mut **tx)
+        .await?;
+        let steps = step_rows
+            .iter()
+            .map(|row| self.map_execution_step_row(row))
+            .collect::<RouterCoreResult<Vec<_>>>()?;
+        Ok(ExecutionAttemptMaterializationRecord {
+            order,
+            attempt,
+            legs,
+            steps,
+        })
     }
 
     async fn ensure_attempt_failed_for_refund(

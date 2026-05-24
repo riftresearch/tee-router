@@ -5,9 +5,12 @@
 //!
 //! 1. Derives a deterministic idempotency key from `(order_id, step_type, step_index)`.
 //!    Those three fields uniquely identify the logical work the step represents
-//!    across retries (a retry-attempt step shares the same `(order_id, step_index)`
-//!    as the original step it replaces), so the key collapses retries onto the
-//!    same provider operation row.
+//!    across normal retries (a retry-attempt step shares the same
+//!    `(order_id, step_index)` as the original step it replaces), so the key
+//!    collapses retries onto the same provider operation row. Refund recovery
+//!    steps additionally include `execution_attempt_id`, because a later manual
+//!    refund may intentionally materialize a new route at the same step index
+//!    after a previous refund route failed.
 //! 2. Looks up `order_provider_operations` by `(provider, operation_type, key)` —
 //!    if found, short-circuits with [`existing_operation_completion`] *before*
 //!    contacting the venue, so retries never re-fire side effects.
@@ -127,20 +130,39 @@ where
     Ok(StepDispatchResult::ProviderIntent(intent))
 }
 
-/// `(order, step_type, step_index)` uniquely identifies a step across retries
-/// because retry attempts re-create the step with the same `step_index`. We
-/// include the step_type tag for human readability and as a defence against
-/// operator confusion (e.g. comparing keys across step types in a SQL prompt).
-fn step_idempotency_key(
+/// `(order, operation_type, step_index)` uniquely identifies normal retry work
+/// because retry attempts re-create the step with the same `step_index`.
+/// Refund recovery steps add the attempt id so a later recovery route does not
+/// inherit a stale provider operation from a failed refund route.
+pub(super) fn step_idempotency_key(
     step: &OrderExecutionStep,
     operation_type: ProviderOperationType,
 ) -> String {
+    if refund_recovery_step(step) {
+        if let Some(attempt_id) = step.execution_attempt_id {
+            return format!(
+                "order:{}:attempt:{}:{}:step:{}",
+                step.order_id,
+                attempt_id,
+                operation_type.to_db_string(),
+                step.step_index,
+            );
+        }
+    }
     format!(
         "order:{}:{}:step:{}",
         step.order_id,
         operation_type.to_db_string(),
         step.step_index,
     )
+}
+
+fn refund_recovery_step(step: &OrderExecutionStep) -> bool {
+    step.details.get("refund_kind").is_some()
+        || step
+            .provider_ref
+            .as_deref()
+            .is_some_and(|provider_ref| provider_ref.starts_with("refund-quote-"))
 }
 
 async fn lookup_existing_operation(

@@ -163,16 +163,21 @@ pub(super) async fn resolve_latest_execution_attempt_with_deps(
         .await
         .map_err(OrderActivityError::db_query)?;
     // `get_execution_attempts` orders by `attempt_index ASC, created_at ASC,
-    // id ASC`, so the last row is the most recent attempt.
-    let attempt = attempts.into_iter().next_back().ok_or_else(|| {
-        invariant_error(
-            "manual_refund_requires_execution_attempt",
-            format!(
-                "order {} has no execution attempts to refund",
-                input.order_id.inner()
-            ),
-        )
-    })?;
+    // id ASC`. Manual refunds recover the latest forward execution attempt;
+    // failed refund attempts are symptoms of recovery, not the source position.
+    let attempt = attempts
+        .into_iter()
+        .rev()
+        .find(|attempt| attempt.attempt_kind != OrderExecutionAttemptKind::RefundRecovery)
+        .ok_or_else(|| {
+            invariant_error(
+                "manual_refund_requires_execution_attempt",
+                format!(
+                    "order {} has no non-refund execution attempts to refund",
+                    input.order_id.inner()
+                ),
+            )
+        })?;
     Ok(LatestExecutionAttemptResolved {
         attempt_id: attempt.id.into(),
     })
@@ -204,6 +209,10 @@ pub(super) async fn discover_single_refund_position_with_deps(
         .get(input.order_id.inner())
         .await
         .map_err(OrderActivityError::db_query)?;
+    let expected_asset = expected_refund_position_asset(deps, &order, &failed_attempt).await?;
+    let expected_canonical = expected_asset
+        .as_ref()
+        .and_then(|asset| deps.action_providers.asset_registry().canonical_for(asset));
 
     let mut positions = Vec::new();
     if let Some(funding_vault_id) = order.funding_vault_id {
@@ -312,10 +321,64 @@ pub(super) async fn discover_single_refund_position_with_deps(
         );
     }
 
-    Ok(refund_position_discovery_from_positions(
+    Ok(refund_position_discovery_from_positions_with_expected(
         input.order_id.inner(),
         positions,
+        expected_asset.as_ref(),
+        expected_canonical,
     ))
+}
+
+async fn expected_refund_position_asset(
+    deps: &OrderActivityDeps,
+    order: &RouterOrder,
+    failed_attempt: &OrderExecutionAttempt,
+) -> Result<Option<DepositAsset>, OrderActivityError> {
+    if let Some(asset) = failed_attempt
+        .input_custody_snapshot
+        .get("source_asset")
+        .and_then(deposit_asset_from_value)
+    {
+        return Ok(Some(asset));
+    }
+
+    if let Some(step_id) = failed_attempt
+        .failure_reason
+        .get("step_id")
+        .or_else(|| failed_attempt.failure_reason.get("failed_step_id"))
+        .or_else(|| failed_attempt.failure_reason.get("stale_step_id"))
+        .and_then(uuid_from_json_string)
+    {
+        let step = deps
+            .db
+            .orders()
+            .get_execution_step(step_id)
+            .await
+            .map_err(OrderActivityError::db_query)?;
+        if step.order_id == order.id && step.execution_attempt_id == Some(failed_attempt.id) {
+            if let Some(asset) = step.input_asset.or(step.output_asset) {
+                return Ok(Some(asset));
+            }
+        }
+    }
+
+    if let Some(asset) = failed_attempt
+        .failure_reason
+        .get("current_asset")
+        .and_then(deposit_asset_from_value)
+    {
+        return Ok(Some(asset));
+    }
+
+    Ok(None)
+}
+
+fn deposit_asset_from_value(value: &Value) -> Option<DepositAsset> {
+    serde_json::from_value(value.clone()).ok()
+}
+
+fn uuid_from_json_string(value: &Value) -> Option<Uuid> {
+    value.as_str().and_then(|raw| Uuid::parse_str(raw).ok())
 }
 
 fn external_custody_direct_balance_supported(chain: &ChainId) -> bool {
@@ -402,9 +465,19 @@ async fn hyperliquid_spot_refund_positions_for_vault(
     Ok(positions)
 }
 
+#[cfg(test)]
 pub(super) fn refund_position_discovery_from_positions(
     order_id: Uuid,
+    positions: Vec<SingleRefundPosition>,
+) -> SingleRefundPositionDiscovery {
+    refund_position_discovery_from_positions_with_expected(order_id, positions, None, None)
+}
+
+pub(super) fn refund_position_discovery_from_positions_with_expected(
+    order_id: Uuid,
     mut positions: Vec<SingleRefundPosition>,
+    expected_asset: Option<&DepositAsset>,
+    expected_canonical: Option<CanonicalAsset>,
 ) -> SingleRefundPositionDiscovery {
     if positions.is_empty() {
         return refund_single_position_untenable(0, 0);
@@ -413,7 +486,14 @@ pub(super) fn refund_position_discovery_from_positions(
     let selected_index = positions
         .iter()
         .enumerate()
-        .min_by_key(|(_, position)| refund_position_priority(position.position_kind))
+        .min_by_key(|(index, position)| {
+            (
+                refund_position_expected_asset_priority(position, expected_asset),
+                refund_position_expected_canonical_priority(position, expected_canonical),
+                refund_position_priority(position.position_kind),
+                *index,
+            )
+        })
         .map(|(index, _)| index)
         .expect("positions is not empty");
     let selected = positions.remove(selected_index);
@@ -434,6 +514,52 @@ pub(super) fn refund_position_discovery_from_positions(
     SingleRefundPositionDiscovery {
         outcome: SingleRefundPositionOutcome::Position(selected),
     }
+}
+
+fn refund_position_expected_asset_priority(
+    position: &SingleRefundPosition,
+    expected_asset: Option<&DepositAsset>,
+) -> u8 {
+    match expected_asset {
+        Some(expected_asset) if refund_position_matches_asset(position, expected_asset) => 0,
+        Some(_) => 1,
+        None => 0,
+    }
+}
+
+fn refund_position_expected_canonical_priority(
+    position: &SingleRefundPosition,
+    expected_canonical: Option<CanonicalAsset>,
+) -> u8 {
+    match expected_canonical {
+        Some(expected_canonical) if position.hyperliquid_canonical == Some(expected_canonical) => 0,
+        Some(_) => 1,
+        None => 0,
+    }
+}
+
+fn refund_position_matches_asset(
+    position: &SingleRefundPosition,
+    expected_asset: &DepositAsset,
+) -> bool {
+    let position_is_hyperliquid = position.hyperliquid_coin.is_some();
+    if expected_asset.chain.as_str() != "hyperliquid" {
+        return !position_is_hyperliquid && position.asset == *expected_asset;
+    }
+    let expected_coin = expected_asset.asset.as_str();
+    if position
+        .hyperliquid_coin
+        .as_deref()
+        .is_some_and(|coin| coin.eq_ignore_ascii_case(expected_coin))
+    {
+        return true;
+    }
+    expected_asset.asset.is_native()
+        && (position.hyperliquid_canonical == Some(CanonicalAsset::Usdc)
+            || position
+                .hyperliquid_coin
+                .as_deref()
+                .is_some_and(|coin| coin.eq_ignore_ascii_case("USDC")))
 }
 
 fn refund_position_priority(position_kind: RecoverablePositionKind) -> u8 {
