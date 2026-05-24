@@ -351,12 +351,10 @@ async fn velora_swap_settled_hint(
                 log_index,
                 decoded.inner.data.value.to_string(),
                 format!("{:#x}", decoded.inner.data.to),
-                // Initiator: the tx originator (the caller of AugustusV6),
-                // which is the executor we delegated to via the paymaster.
-                Some(format!("{:#x}", receipt.from)),
                 // Executor in the audit-trail sense: the Velora router that
                 // actually settled the swap. Always AugustusV6 by gate above.
                 Some(format!("{:#x}", AUGUSTUS_V6)),
+                Some(format!("{:#x}", decoded.address())),
                 decoded.block_number,
             ),
             log_index,
@@ -609,6 +607,14 @@ mod tests {
                 "token_address",
                 "block_number",
             ],
+        );
+        assert_eq!(
+            evidence["executor"],
+            serde_json::json!("0x2222222222222222222222222222222222222222")
+        );
+        assert_eq!(
+            evidence["token_address"],
+            serde_json::json!("0x3333333333333333333333333333333333333333")
         );
     }
 
