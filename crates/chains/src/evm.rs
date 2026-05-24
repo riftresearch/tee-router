@@ -315,6 +315,29 @@ impl EvmChain {
             loc: location!(),
         })?;
         let max_fee_per_gas = max_fee_per_gas_with_headroom(fee_estimate.max_fee_per_gas)?;
+        let reserved_fee = checked_gas_fee(
+            gas_limit,
+            max_fee_per_gas,
+            "ERC-20 transfer gas reservation",
+        )?;
+        let native_balance = retry_evm_rpc(
+            self.chain_type,
+            "get_balance_before_erc20_transfer",
+            || async { self.provider.get_balance(sender).await },
+        )
+        .await
+        .map_err(|e| crate::Error::EVMRpcError {
+            source: e,
+            loc: location!(),
+        })?;
+        if native_balance < reserved_fee {
+            self.wait_for_native_balance_at_least(
+                sender,
+                reserved_fee,
+                "get_balance_after_erc20_transfer_funding",
+            )
+            .await?;
+        }
         let transaction_request = TransactionRequest::default()
             .with_from(sender)
             .with_to(token_address)
