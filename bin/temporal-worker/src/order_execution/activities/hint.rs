@@ -1,4 +1,5 @@
 use super::*;
+use router_temporal::VeloraSwapSettledEvidence;
 
 #[derive(Clone, Default)]
 pub struct ProviderObservationActivities {
@@ -1401,6 +1402,35 @@ fn hyperunit_withdrawal_settled_response(
     }))
 }
 
+fn velora_swap_settled_response(
+    operation: &OrderProviderOperation,
+    evidence: &VeloraSwapSettledEvidence,
+) -> Result<Value, OrderActivityError> {
+    let amount_in = operation
+        .request
+        .get("amount_in")
+        .and_then(Value::as_str)
+        .filter(|amount| !amount.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| {
+            OrderActivityError::hint_verification(
+                "VeloraSwapSettled",
+                "operation request missing amount_in",
+            )
+        })?;
+    Ok(json!({
+        "kind": "velora_swap_settled",
+        "amount_in": amount_in,
+        "amount_out": &evidence.amount_out,
+        "tx_hash": &evidence.tx_hash,
+        "log_index": evidence.log_index,
+        "recipient": &evidence.recipient,
+        "executor": &evidence.executor,
+        "token_address": &evidence.token_address,
+        "block_number": evidence.block_number,
+    }))
+}
+
 pub(super) async fn verify_velora_swap_settled_hint(
     deps: &OrderActivityDeps,
     input: VerifyProviderOperationHintInput,
@@ -1446,18 +1476,19 @@ pub(super) async fn verify_velora_swap_settled_hint(
             token_address,
         )?;
     }
-    let estimated_amount_out = operation
+    let min_amount_out = operation
         .request
         .get("min_amount_out")
         .and_then(Value::as_str)
-        .or_else(|| operation.request.get("amount_out").and_then(Value::as_str));
-    if let Some(estimated_amount_out) = estimated_amount_out {
+        .filter(|amount| !amount.is_empty());
+    if let Some(min_amount_out) = min_amount_out {
         validate_decimal_gte(
             "VeloraSwapSettled amount_out",
             &evidence.amount_out,
-            estimated_amount_out,
+            min_amount_out,
         )?;
     }
+    let response = velora_swap_settled_response(&operation, evidence)?;
 
     complete_provider_operation_from_typed_hint(
         deps,
@@ -1467,7 +1498,7 @@ pub(super) async fn verify_velora_swap_settled_hint(
             status: ProviderOperationStatus::Completed,
             provider_ref: Some(evidence.tx_hash.clone()),
             observed_state: typed_evidence_state("velora_swap_settled", evidence)?,
-            response: None,
+            response: Some(response),
             tx_hash: Some(evidence.tx_hash.clone()),
         },
     )
@@ -3554,6 +3585,32 @@ mod tests {
         assert_eq!(response["amount_in"], json!("100"));
         assert_eq!(response["amount_out"], json!("105"));
         assert_eq!(response["destination_tx_hash"], json!("0xsettled"));
+    }
+
+    #[test]
+    fn velora_swap_settlement_response_records_actual_amount_out() {
+        let operation = operation_with_request(
+            ProviderOperationType::UniversalRouterSwap,
+            json!({
+                "amount_in": "17555765813104590",
+                "amount_out": "37025460",
+            }),
+        );
+        let evidence = VeloraSwapSettledEvidence {
+            tx_hash: "0xswap".to_string(),
+            log_index: 5,
+            amount_out: "37025459".to_string(),
+            recipient: "0x22cbf543af01b2dfb31912561dee4804b54744ec".to_string(),
+            executor: Some("0x690ac053fb213e9e255807d8a62482f0862bf4d9".to_string()),
+            token_address: Some("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913".to_string()),
+            block_number: Some(46_421_177),
+        };
+
+        let response = velora_swap_settled_response(&operation, &evidence).unwrap();
+
+        assert_eq!(response["amount_in"], json!("17555765813104590"));
+        assert_eq!(response["amount_out"], json!("37025459"));
+        assert_eq!(response["tx_hash"], json!("0xswap"));
     }
 
     #[test]

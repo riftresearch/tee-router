@@ -4,21 +4,21 @@ use alloy::{
     primitives::{Address, TxHash, U256},
     sol,
 };
-use evm_receipt_watcher_client::{parse_tx_hash, ByIdLookup, EvmReceiptWatcherClient};
+use evm_receipt_watcher_client::{ByIdLookup, EvmReceiptWatcherClient, parse_tx_hash};
 use router_core::{
     models::{
         ProviderOperationHintKind, ProviderOperationType, SAURON_EVM_RECEIPT_OBSERVER_HINT_SOURCE,
     },
     protocol::{AssetId, ChainId, DepositAsset},
 };
-use router_server::api::{ProviderOperationHintRequest, MAX_HINT_IDEMPOTENCY_KEY_LEN};
+use router_server::api::{MAX_HINT_IDEMPOTENCY_KEY_LEN, ProviderOperationHintRequest};
 use router_temporal::{CctpReceiveObservedEvidence, VeloraSwapSettledEvidence};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::{
     sync::Mutex,
     task::JoinSet,
-    time::{timeout, MissedTickBehavior},
+    time::{MissedTickBehavior, timeout},
 };
 use tracing::{debug, warn};
 
@@ -313,12 +313,7 @@ async fn velora_swap_settled_hint(
         .pointer("/output_asset/asset")
         .and_then(Value::as_str)
         .and_then(|asset| normalized_reference_asset(chain_id, asset));
-    let expected_min = operation
-        .request
-        .get("min_amount_out")
-        .and_then(Value::as_str)
-        .or_else(|| operation.request.get("amount_out").and_then(Value::as_str))
-        .and_then(|amount| U256::from_str_radix(amount, 10).ok());
+    let expected_min = velora_swap_expected_min_amount(&operation.request);
 
     // V6 emits no swap event of its own. Detect settlement via the destination
     // ERC-20's `Transfer(_, recipient, value >= min)` log inside an
@@ -492,6 +487,14 @@ fn velora_swap_settled_evidence(
     })
 }
 
+fn velora_swap_expected_min_amount(request: &Value) -> Option<U256> {
+    request
+        .get("min_amount_out")
+        .and_then(Value::as_str)
+        .filter(|amount| !amount.is_empty())
+        .and_then(|amount| U256::from_str_radix(amount, 10).ok())
+}
+
 fn cctp_receive_observed_evidence(
     tx_hash: String,
     log_index: u64,
@@ -606,6 +609,26 @@ mod tests {
                 "token_address",
                 "block_number",
             ],
+        );
+    }
+
+    #[test]
+    fn velora_swap_expected_min_amount_ignores_quote_estimate() {
+        let request = serde_json::json!({
+            "amount_out": "37025460",
+            "min_amount_out": null,
+        });
+
+        assert_eq!(velora_swap_expected_min_amount(&request), None);
+
+        let request = serde_json::json!({
+            "amount_out": "37025460",
+            "min_amount_out": "36000000",
+        });
+
+        assert_eq!(
+            velora_swap_expected_min_amount(&request),
+            Some(U256::from(36_000_000_u64))
         );
     }
 

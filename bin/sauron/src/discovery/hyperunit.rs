@@ -788,7 +788,7 @@ fn hyperunit_withdrawal_btc_settled_evidence(
         hyperunit_operation_id: status.operation_id.clone(),
         hyperunit_status: status.state.clone(),
         destination_address: destination_address.to_string(),
-        amount: status.source_amount.clone(),
+        amount: Some(amount_sats.to_string()),
         destination_chain: Some(HyperUnitChain::Bitcoin.as_hyperunit_str().to_string()),
         destination_tx_hash: status.destination_tx_hash.clone(),
         btc_tx_hash: status.destination_tx_hash.clone(),
@@ -815,7 +815,7 @@ fn hyperunit_withdrawal_evm_settled_evidence(
         hyperunit_operation_id: status.operation_id.clone(),
         hyperunit_status: status.state.clone(),
         destination_address: destination_address.to_string(),
-        amount: status.source_amount.clone(),
+        amount: hyperunit_withdrawal_net_amount(status).or_else(|| status.source_amount.clone()),
         destination_chain: Some(destination_chain.as_hyperunit_str().to_string()),
         destination_tx_hash: status.destination_tx_hash.clone(),
         btc_tx_hash: None,
@@ -1021,6 +1021,26 @@ fn expected_hl_credit_amount(operation: &UnitOperation) -> Option<String> {
         &expected,
         usize::from(hyperliquid_client::wire::WIRE_DECIMALS),
     ))
+}
+
+fn hyperunit_withdrawal_net_amount(operation: &UnitOperation) -> Option<String> {
+    let source = u128::from_str(operation.source_amount.as_deref()?).ok()?;
+    let destination_fee = operation
+        .destination_fee_amount
+        .as_deref()
+        .and_then(|value| u128::from_str(value).ok())
+        .unwrap_or(0);
+    let sweep_fee = operation
+        .sweep_fee_amount
+        .as_deref()
+        .and_then(|value| u128::from_str(value).ok())
+        .unwrap_or(0);
+    Some(
+        source
+            .saturating_sub(destination_fee)
+            .saturating_sub(sweep_fee)
+            .to_string(),
+    )
 }
 
 fn unit_asset_decimals(asset: &str) -> u8 {
@@ -1674,7 +1694,7 @@ mod tests {
         let protocol_address = "0x73c1d4b7add80c7cfea60a997c615064a424a844";
         let destination = "0x2222222222222222222222222222222222222222";
         let tx_hash = "0xb4b0ef0fc686e5b300337b27ca6432bcd1e0879ca825c5c0bbe637dba62190ef";
-        let status = unit_operation_with_tx_hashes(
+        let mut status = unit_operation_with_tx_hashes(
             "withdrawal-ethereum",
             protocol_address,
             "hyperliquid",
@@ -1683,6 +1703,9 @@ mod tests {
             Some(tx_hash),
             Some(destination),
         );
+        status.source_amount = Some("17687610000000000".to_string());
+        status.destination_fee_amount = Some("128234531250000".to_string());
+        status.sweep_fee_amount = Some("0".to_string());
         let unit_server = spawn_hyperunit_operations_server(
             protocol_address,
             StatusCode::OK,
@@ -1719,6 +1742,7 @@ mod tests {
             ProviderOperationHintKind::HyperUnitWithdrawalSettled,
         );
         assert_eq!(settled["destination_chain"], "ethereum");
+        assert_eq!(settled["amount"], "17559375468750000");
         assert_eq!(settled["evm_chain_id"], "evm:1");
     }
 
