@@ -1077,15 +1077,6 @@ fn builtin_provider_assets() -> Vec<ProviderAsset> {
             ],
         ),
         provider_asset(
-            ProviderId::Unit,
-            CanonicalAsset::Eth,
-            "evm:8453",
-            "base",
-            "eth",
-            18,
-            &[ProviderAssetCapability::UnitWithdrawal],
-        ),
-        provider_asset(
             ProviderId::Cctp,
             CanonicalAsset::Usdc,
             "evm:1",
@@ -1638,6 +1629,7 @@ mod tests {
         let declarations = registry.transition_declarations();
         let hl_usdc = asset("hyperliquid", AssetId::Native);
         let hl_eth = asset("hyperliquid", AssetId::reference("UETH"));
+        let ethereum_eth = asset("evm:1", AssetId::Native);
         let base_eth = asset("evm:8453", AssetId::Native);
 
         assert!(declarations.iter().any(|transition| {
@@ -1646,6 +1638,11 @@ mod tests {
                 && transition.output.asset == hl_eth
         }));
         assert!(declarations.iter().any(|transition| {
+            transition.kind == MarketOrderTransitionKind::UnitWithdrawal
+                && transition.input.asset == hl_eth
+                && transition.output.asset == ethereum_eth
+        }));
+        assert!(!declarations.iter().any(|transition| {
             transition.kind == MarketOrderTransitionKind::UnitWithdrawal
                 && transition.input.asset == hl_eth
                 && transition.output.asset == base_eth
@@ -1854,16 +1851,28 @@ mod tests {
     }
 
     #[test]
-    fn unit_support_distinguishes_deposit_from_withdrawal() {
+    fn unit_eth_support_is_limited_to_ethereum_not_base() {
         let registry = AssetRegistry::default();
         let base_eth = asset("evm:8453", AssetId::Native);
+        let ethereum_eth = asset("evm:1", AssetId::Native);
+
+        assert!(registry.supports_provider_capability(
+            ProviderId::Unit,
+            &ethereum_eth,
+            ProviderAssetCapability::UnitDeposit,
+        ));
+        assert!(registry.supports_provider_capability(
+            ProviderId::Unit,
+            &ethereum_eth,
+            ProviderAssetCapability::UnitWithdrawal,
+        ));
 
         assert!(!registry.supports_provider_capability(
             ProviderId::Unit,
             &base_eth,
             ProviderAssetCapability::UnitDeposit,
         ));
-        assert!(registry.supports_provider_capability(
+        assert!(!registry.supports_provider_capability(
             ProviderId::Unit,
             &base_eth,
             ProviderAssetCapability::UnitWithdrawal,

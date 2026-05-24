@@ -327,6 +327,48 @@ impl router_core::services::action_providers::BridgeProvider for TestHyperliquid
     }
 }
 
+struct TestBridgeProvider {
+    provider_id: ProviderId,
+}
+
+impl router_core::services::action_providers::BridgeProvider for TestBridgeProvider {
+    fn id(&self) -> &str {
+        self.provider_id.as_str()
+    }
+
+    fn quote_bridge<'a>(
+        &'a self,
+        request: BridgeQuoteRequest,
+    ) -> ProviderFuture<'a, Option<BridgeQuote>> {
+        let provider_id = self.provider_id;
+        Box::pin(async move {
+            let amount_in = match &request.order_kind {
+                ProviderOrderKind::ExactIn { amount_in, .. } => amount_in.clone(),
+                ProviderOrderKind::ExactOut { amount_out, .. } => amount_out.clone(),
+            };
+            Ok(Some(BridgeQuote {
+                provider_id: provider_id.as_str().to_string(),
+                amount_in: amount_in.clone(),
+                amount_out: amount_in,
+                provider_quote: json!({ "kind": "test_bridge", "provider": provider_id.as_str() }),
+                expires_at: Utc::now() + chrono::Duration::minutes(10),
+            }))
+        })
+    }
+
+    fn execute_bridge<'a>(
+        &'a self,
+        _request: &'a BridgeExecutionRequest,
+    ) -> ProviderFuture<'a, ProviderExecutionIntent> {
+        Box::pin(async {
+            Ok(ProviderExecutionIntent::ProviderOnly {
+                response: json!({ "kind": "test_bridge" }),
+                state: ProviderExecutionState::default(),
+            })
+        })
+    }
+}
+
 impl ExchangeProvider for TestHyperliquidExchangeProvider {
     fn id(&self) -> &str {
         ProviderId::Hyperliquid.as_str()
@@ -2074,7 +2116,14 @@ async fn hyperliquid_spot_refund_plan_hydrates_nonfinal_unit_withdrawal_recipien
     let (unit_provider, _gen_calls) =
         CountingUnitWithdrawalProvider::new(hyperliquid_info.base_url.clone());
     let action_providers = Arc::new(ActionProviderRegistry::new(
-        vec![],
+        vec![
+            Arc::new(TestBridgeProvider {
+                provider_id: ProviderId::Across,
+            }) as Arc<dyn router_core::services::action_providers::BridgeProvider>,
+            Arc::new(TestBridgeProvider {
+                provider_id: ProviderId::Cctp,
+            }) as Arc<dyn router_core::services::action_providers::BridgeProvider>,
+        ],
         vec![Arc::new(unit_provider) as Arc<dyn UnitProvider>],
         vec![
             Arc::new(TestHyperliquidExchangeProvider) as Arc<dyn ExchangeProvider>,
@@ -2088,15 +2137,19 @@ async fn hyperliquid_spot_refund_plan_hydrates_nonfinal_unit_withdrawal_recipien
     );
     let planned_at = Utc::now();
     let source_usdc = test_asset("evm:8453", "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913");
+    let native_ethereum = test_asset("evm:1", "native");
     let native_base = test_asset("evm:8453", "native");
     let hl_eth = test_asset("hyperliquid", "UETH");
     let mut order = test_order(source_usdc.clone(), planned_at);
     order.workflow_parent_span_id = order.workflow_trace_id[..16].to_string();
     let failed_attempt_id = Uuid::now_v7();
     let vault = test_custody_vault(&order, CustodyVaultRole::DestinationExecution, &source_usdc);
+    let mut native_ethereum_vault =
+        test_custody_vault(&order, CustodyVaultRole::DestinationExecution, &native_ethereum);
+    native_ethereum_vault.address = test_address(10);
     let mut native_base_vault =
         test_custody_vault(&order, CustodyVaultRole::DestinationExecution, &native_base);
-    native_base_vault.address = test_address(10);
+    native_base_vault.address = test_address(11);
     seed_hyperliquid_spot_refund_order(
         &test_db.db,
         &test_db.pool,
@@ -2105,6 +2158,12 @@ async fn hyperliquid_spot_refund_plan_hydrates_nonfinal_unit_withdrawal_recipien
         &vault,
     )
     .await;
+    test_db
+        .db
+        .orders()
+        .create_custody_vault(&native_ethereum_vault)
+        .await
+        .expect("insert native Ethereum destination execution vault");
     test_db
         .db
         .orders()
@@ -2151,7 +2210,7 @@ async fn hyperliquid_spot_refund_plan_hydrates_nonfinal_unit_withdrawal_recipien
         .iter()
         .find(|step| step.step_type == OrderExecutionStepType::UnitWithdrawal)
         .expect("non-final Unit withdrawal refund step");
-    assert_eq!(unit_withdrawal.output_asset, Some(native_base.clone()));
+    assert_eq!(unit_withdrawal.output_asset, Some(native_ethereum.clone()));
     UnitWithdrawalStepRequest::from_value(&unit_withdrawal.request)
         .expect("hydrated Unit withdrawal request decodes");
     let recipient_address = unit_withdrawal
@@ -2172,20 +2231,20 @@ async fn hyperliquid_spot_refund_plan_hydrates_nonfinal_unit_withdrawal_recipien
         .await
         .expect("load hydrated recipient vault");
     assert_eq!(recipient_vault.role, CustodyVaultRole::DestinationExecution);
-    assert_eq!(recipient_vault.chain, native_base.chain);
-    assert_eq!(recipient_vault.asset.as_ref(), Some(&native_base.asset));
+    assert_eq!(recipient_vault.chain, native_ethereum.chain);
+    assert_eq!(recipient_vault.asset.as_ref(), Some(&native_ethereum.asset));
     assert_eq!(recipient_vault.address, recipient_address);
 
-    let swap = persisted_steps
+    let bridge = persisted_steps
         .iter()
-        .find(|step| step.step_type == OrderExecutionStepType::UniversalRouterSwap)
-        .expect("final refund swap step");
+        .find(|step| step.step_type == OrderExecutionStepType::AcrossBridge)
+        .expect("bridge step after non-final Unit withdrawal");
     assert_eq!(
-        swap.request.get("source_custody_vault_id"),
+        bridge.request.get("depositor_custody_vault_id"),
         unit_withdrawal.request.get("recipient_custody_vault_id")
     );
     assert_eq!(
-        swap.request.get("source_custody_vault_address"),
+        bridge.request.get("depositor_address"),
         unit_withdrawal.request.get("recipient_address")
     );
 }
