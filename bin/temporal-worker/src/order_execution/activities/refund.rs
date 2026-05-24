@@ -367,6 +367,7 @@ pub(super) async fn discover_single_refund_position_with_deps(
     Ok(refund_position_discovery_from_positions_with_expected(
         input.order_id.inner(),
         positions,
+        Some(&order.source_asset),
         expected_asset.as_ref(),
         expected_canonical,
     ))
@@ -513,12 +514,13 @@ pub(super) fn refund_position_discovery_from_positions(
     order_id: Uuid,
     positions: Vec<SingleRefundPosition>,
 ) -> SingleRefundPositionDiscovery {
-    refund_position_discovery_from_positions_with_expected(order_id, positions, None, None)
+    refund_position_discovery_from_positions_with_expected(order_id, positions, None, None, None)
 }
 
 pub(super) fn refund_position_discovery_from_positions_with_expected(
     order_id: Uuid,
     mut positions: Vec<SingleRefundPosition>,
+    refund_asset: Option<&DepositAsset>,
     expected_asset: Option<&DepositAsset>,
     expected_canonical: Option<CanonicalAsset>,
 ) -> SingleRefundPositionDiscovery {
@@ -531,6 +533,7 @@ pub(super) fn refund_position_discovery_from_positions_with_expected(
         .enumerate()
         .min_by_key(|(index, position)| {
             (
+                refund_position_expected_asset_priority(position, refund_asset),
                 refund_position_expected_asset_priority(position, expected_asset),
                 refund_position_expected_canonical_priority(position, expected_canonical),
                 refund_position_priority(position.position_kind),

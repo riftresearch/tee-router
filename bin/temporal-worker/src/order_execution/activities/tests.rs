@@ -3198,6 +3198,7 @@ fn refund_position_discovery_prefers_expected_hyperliquid_asset_over_dust() {
     let discovery = refund_position_discovery_from_positions_with_expected(
         order_id,
         vec![usdc_dust, ubtc_position],
+        None,
         Some(&expected_ubtc),
         Some(CanonicalAsset::Btc),
     );
@@ -3209,6 +3210,34 @@ fn refund_position_discovery_prefers_expected_hyperliquid_asset_over_dust() {
             assert_eq!(position.hyperliquid_canonical, Some(CanonicalAsset::Btc));
         }
         other => panic!("expected expected-asset refund position, got {other:?}"),
+    }
+}
+
+#[test]
+fn refund_position_discovery_prefers_original_refund_asset_over_stale_expected_dust() {
+    let order_id = Uuid::now_v7();
+    let source_usdc = test_asset("evm:8453", "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913");
+    let stale_expected_eth = test_asset("evm:1", "native");
+    let mut eth_dust =
+        test_refund_position(RecoverablePositionKind::ExternalCustody, "42544910985380");
+    eth_dust.asset = stale_expected_eth.clone();
+    let mut base_usdc = test_refund_position(RecoverablePositionKind::ExternalCustody, "37025459");
+    base_usdc.asset = source_usdc.clone();
+
+    let discovery = refund_position_discovery_from_positions_with_expected(
+        order_id,
+        vec![eth_dust, base_usdc],
+        Some(&source_usdc),
+        Some(&stale_expected_eth),
+        None,
+    );
+
+    match discovery.outcome {
+        SingleRefundPositionOutcome::Position(position) => {
+            assert_eq!(position.asset, source_usdc);
+            assert_eq!(position.amount.as_str(), "37025459");
+        }
+        other => panic!("expected original refund asset position, got {other:?}"),
     }
 }
 
