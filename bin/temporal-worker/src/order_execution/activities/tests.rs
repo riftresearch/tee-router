@@ -2887,6 +2887,98 @@ async fn resolve_latest_execution_attempt_skips_failed_refund_attempts() {
 }
 
 #[tokio::test]
+async fn resolve_latest_execution_attempt_uses_side_effectful_failed_refund_attempt() {
+    let test_db = test_database().await;
+    let deps = test_deps(test_db.db.clone());
+    let forward_attempt = Uuid::now_v7();
+    let failed_refund_attempt = Uuid::now_v7();
+    let order_id = seed_order_with_execution_attempt_specs(
+        &test_db.pool,
+        &[
+            (
+                forward_attempt,
+                4,
+                OrderExecutionAttemptKind::RefreshedExecution,
+                OrderExecutionAttemptStatus::Failed,
+            ),
+            (
+                failed_refund_attempt,
+                5,
+                OrderExecutionAttemptKind::RefundRecovery,
+                OrderExecutionAttemptStatus::Failed,
+            ),
+        ],
+    )
+    .await;
+    let now = Utc::now();
+    let leg_id = Uuid::now_v7();
+    let step_id = Uuid::now_v7();
+    sqlx_core::query::query(
+        r#"
+            INSERT INTO order_execution_legs (
+                id, order_id, execution_attempt_id, transition_decl_id,
+                leg_index, leg_type, provider, status,
+                input_chain_id, input_asset_id, output_chain_id, output_asset_id,
+                amount_in, estimated_amount_out, completed_at,
+                details_json, usd_valuation_json, created_at, updated_at
+            )
+            VALUES (
+                $1, $2, $3, 'refund-transition', 0, 'swap', 'hyperliquid',
+                'completed', 'hyperliquid', 'UBTC', 'hyperliquid', 'native',
+                '49965', '37585582', $4, '{}'::jsonb, '{}'::jsonb, $4, $4
+            )
+            "#,
+    )
+    .bind(leg_id)
+    .bind(order_id)
+    .bind(failed_refund_attempt)
+    .bind(now)
+    .execute(&test_db.pool)
+    .await
+    .expect("insert side-effectful refund leg");
+    sqlx_core::query::query(
+        r#"
+            INSERT INTO order_execution_steps (
+                id, order_id, execution_attempt_id, execution_leg_id,
+                transition_decl_id, step_index, step_type, provider, status,
+                input_chain_id, input_asset_id, output_chain_id, output_asset_id,
+                amount_in, idempotency_key, attempt_count, started_at, completed_at,
+                details_json, request_json, response_json, error_json,
+                usd_valuation_json, created_at, updated_at
+            )
+            VALUES (
+                $1, $2, $3, $4, 'refund-transition', 0, 'hyperliquid_trade',
+                'hyperliquid', 'completed', 'hyperliquid', 'UBTC',
+                'hyperliquid', 'native', '49965', 'refund-step', 1, $5, $5,
+                '{"refund_kind":"transition_path"}'::jsonb,
+                '{"amount_in":"49965"}'::jsonb,
+                '{"observed_state":{"amount_out":"37585582"}}'::jsonb,
+                '{}'::jsonb, '{}'::jsonb, $5, $5
+            )
+            "#,
+    )
+    .bind(step_id)
+    .bind(order_id)
+    .bind(failed_refund_attempt)
+    .bind(leg_id)
+    .bind(now)
+    .execute(&test_db.pool)
+    .await
+    .expect("insert completed refund step");
+
+    let resolved = resolve_latest_execution_attempt_with_deps(
+        &deps,
+        ResolveLatestExecutionAttemptInput {
+            order_id: order_id.into(),
+        },
+    )
+    .await
+    .expect("resolve latest side-effectful refund attempt");
+
+    assert_eq!(resolved.attempt_id.inner(), failed_refund_attempt);
+}
+
+#[tokio::test]
 async fn hyperliquid_refund_materialization_creates_fresh_attempt_after_failed_refund() {
     let test_db = test_database().await;
     let planned_at = Utc::now();

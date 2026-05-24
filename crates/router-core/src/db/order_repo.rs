@@ -6078,6 +6078,71 @@ impl OrderRepository {
         self.map_execution_step_row(&row)
     }
 
+    pub async fn update_execution_step_amount_and_request(
+        &self,
+        id: Uuid,
+        amount_in: &str,
+        estimated_amount_out: Option<&str>,
+        request: serde_json::Value,
+        updated_at: DateTime<Utc>,
+    ) -> RouterCoreResult<OrderExecutionStep> {
+        let started = Instant::now();
+        let result = async {
+            let mut tx = self.pool.begin().await?;
+            let row = sqlx_core::query::query(&format!(
+                r#"
+                UPDATE order_execution_steps
+                SET
+                    amount_in = $2,
+                    request_json = $3,
+                    updated_at = $4
+                WHERE id = $1
+                  AND status IN ('planned', 'ready', 'running')
+                RETURNING {EXECUTION_STEP_SELECT_COLUMNS}
+                "#
+            ))
+            .bind(id)
+            .bind(amount_in)
+            .bind(request)
+            .bind(updated_at)
+            .fetch_one(&mut *tx)
+            .await?;
+            let step = self.map_execution_step_row(&row)?;
+
+            if let Some(execution_leg_id) = step.execution_leg_id {
+                let _ = sqlx_core::query::query(
+                    r#"
+                    UPDATE order_execution_legs
+                    SET
+                        amount_in = $2,
+                        estimated_amount_out = COALESCE($3, estimated_amount_out),
+                        updated_at = $4
+                    WHERE id = $1
+                      AND status IN ('planned', 'ready', 'running')
+                    "#,
+                )
+                .bind(execution_leg_id)
+                .bind(amount_in)
+                .bind(estimated_amount_out)
+                .bind(updated_at)
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            tx.commit().await?;
+            Ok::<OrderExecutionStep, RouterCoreError>(step)
+        }
+        .await;
+        telemetry::record_db_query(
+            "order.update_execution_step_amount_and_request",
+            result.is_ok(),
+            started.elapsed(),
+        );
+        let step = result?;
+        self.refresh_execution_leg_for_step(&step).await?;
+        Ok(step)
+    }
+
     pub async fn get_execution_legs_for_attempt(
         &self,
         execution_attempt_id: Uuid,

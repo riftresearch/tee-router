@@ -866,6 +866,8 @@ pub(super) async fn run_step_dispatch(
         "execution_step.started"
     );
 
+    let step = refresh_refund_step_request_if_needed(deps, step).await?;
+
     // 2. Pre-execution stale-quote check. Short-circuit before side effects.
     if let Some(stale) = pre_execution_stale_quote_check(deps, &input, &step).await? {
         return Ok(StepDispatched {
@@ -1020,6 +1022,7 @@ async fn settle_dispatched_step(
                 "execution_step.completed"
             );
             record_step_terminal_latency_metrics(deps, record.step.id).await;
+            propagate_refund_completed_step_amount_out(deps, &record.step).await?;
             Ok(DispatchOutcome::Completed)
         }
     }
@@ -1077,6 +1080,7 @@ pub(super) async fn settle_waiting_step_after_execute(
             match completed {
                 Ok(step) => {
                     record_step_terminal_latency_metrics(deps, step.id).await;
+                    propagate_refund_completed_step_amount_out(deps, &step).await?;
                     tracing::info!(
                         order_id = %order_id,
                         attempt_id = %attempt_id,
@@ -1199,6 +1203,324 @@ pub(super) async fn settle_waiting_step_after_execute(
         }
     }
     Ok(())
+}
+
+async fn propagate_refund_completed_step_amount_out(
+    deps: &OrderActivityDeps,
+    completed_step: &OrderExecutionStep,
+) -> Result<(), OrderActivityError> {
+    if !refund_recovery_step(completed_step) {
+        return Ok(());
+    }
+    let Some(attempt_id) = completed_step.execution_attempt_id else {
+        return Ok(());
+    };
+    let amount_out = match completed_step_amount_out(completed_step) {
+        Some(amount_out) => amount_out,
+        None => return Ok(()),
+    };
+    let steps = deps
+        .db
+        .orders()
+        .get_execution_steps_for_attempt(attempt_id)
+        .await
+        .map_err(OrderActivityError::db_query)?;
+    let Some(next_step) = steps
+        .iter()
+        .filter(|step| step.step_index > completed_step.step_index)
+        .min_by_key(|step| (step.step_index, step.created_at, step.id))
+    else {
+        return Ok(());
+    };
+    if !matches!(
+        next_step.status,
+        OrderExecutionStepStatus::Planned | OrderExecutionStepStatus::Ready
+    ) {
+        return Ok(());
+    }
+    if let (Some(output_asset), Some(input_asset)) =
+        (&completed_step.output_asset, &next_step.input_asset)
+    {
+        if output_asset != input_asset {
+            return Ok(());
+        }
+    }
+
+    let request = patch_refund_step_request_amount(next_step, &amount_out);
+    let updated = deps
+        .db
+        .orders()
+        .update_execution_step_amount_and_request(
+            next_step.id,
+            &amount_out,
+            None,
+            request,
+            Utc::now(),
+        )
+        .await
+        .map_err(OrderActivityError::db_query)?;
+    tracing::info!(
+        order_id = %completed_step.order_id,
+        attempt_id = %attempt_id,
+        completed_step_id = %completed_step.id,
+        next_step_id = %updated.id,
+        amount_out = %amount_out,
+        event_name = "refund_step.amount_propagated",
+        "refund_step.amount_propagated"
+    );
+    Ok(())
+}
+
+fn completed_step_amount_out(step: &OrderExecutionStep) -> Option<String> {
+    let response = &step.response;
+    for pointer in [
+        "/amount_out",
+        "/amountOut",
+        "/output_amount",
+        "/outputAmount",
+        "/observed_state/amount_out",
+        "/observed_state/amountOut",
+        "/observed_state/actual_amount_out",
+        "/observed_state/actualAmountOut",
+        "/observed_state/output_amount",
+        "/observed_state/outputAmount",
+        "/observed_state/provider_observed_state/amount_out",
+        "/observed_state/provider_observed_state/amountOut",
+        "/observed_state/provider_observed_state/output_amount",
+        "/observed_state/provider_observed_state/outputAmount",
+        "/provider_context/amount_out",
+        "/provider_context/amountOut",
+        "/provider_context/output_amount",
+        "/provider_context/outputAmount",
+    ] {
+        if let Some(amount) = response.pointer(pointer).and_then(decimal_string) {
+            return Some(amount.to_string());
+        }
+    }
+    response
+        .pointer("/balance_observation/probes")
+        .and_then(Value::as_array)
+        .and_then(|probes| {
+            probes.iter().find_map(|probe| {
+                let role = probe.get("role").and_then(Value::as_str)?;
+                if role != "destination" {
+                    return None;
+                }
+                probe.get("credit_delta").and_then(decimal_string)
+            })
+        })
+        .map(str::to_string)
+}
+
+fn decimal_string(value: &Value) -> Option<&str> {
+    value
+        .as_str()
+        .filter(|raw| !raw.is_empty() && raw.chars().all(|ch| ch.is_ascii_digit()))
+}
+
+async fn refresh_refund_step_request_if_needed(
+    deps: &OrderActivityDeps,
+    step: OrderExecutionStep,
+) -> Result<OrderExecutionStep, OrderActivityError> {
+    if !refund_recovery_step(&step) {
+        return Ok(step);
+    }
+    let Some(amount_in) = step.amount_in.clone() else {
+        return Ok(step);
+    };
+    if refund_step_request_amount(&step).as_deref() == Some(amount_in.as_str()) {
+        return Ok(step);
+    }
+    let (request, estimated_amount_out) =
+        refreshed_refund_step_request(deps, &step, &amount_in).await?;
+    let updated = deps
+        .db
+        .orders()
+        .update_execution_step_amount_and_request(
+            step.id,
+            &amount_in,
+            estimated_amount_out.as_deref(),
+            request,
+            Utc::now(),
+        )
+        .await
+        .map_err(OrderActivityError::db_query)?;
+    tracing::info!(
+        order_id = %updated.order_id,
+        step_id = %updated.id,
+        amount_in = %amount_in,
+        step_type = %updated.step_type.to_db_string(),
+        event_name = "refund_step.request_refreshed",
+        "refund_step.request_refreshed"
+    );
+    Ok(updated)
+}
+
+async fn refreshed_refund_step_request(
+    deps: &OrderActivityDeps,
+    step: &OrderExecutionStep,
+    amount_in: &str,
+) -> Result<(Value, Option<String>), OrderActivityError> {
+    match step.step_type {
+        OrderExecutionStepType::HyperliquidTrade | OrderExecutionStepType::UniversalRouterSwap => {
+            refresh_refund_exchange_step_request(deps, step, amount_in).await
+        }
+        _ => Ok((patch_refund_step_request_amount(step, amount_in), None)),
+    }
+}
+
+async fn refresh_refund_exchange_step_request(
+    deps: &OrderActivityDeps,
+    step: &OrderExecutionStep,
+    amount_in: &str,
+) -> Result<(Value, Option<String>), OrderActivityError> {
+    let input_asset = step.input_asset.clone().ok_or_else(|| {
+        invariant_error(
+            "refund_exchange_step_input_asset",
+            format!("refund exchange step {} has no input asset", step.id),
+        )
+    })?;
+    let output_asset = step.output_asset.clone().ok_or_else(|| {
+        invariant_error(
+            "refund_exchange_step_output_asset",
+            format!("refund exchange step {} has no output asset", step.id),
+        )
+    })?;
+    let exchange = deps
+        .action_providers
+        .exchange(&step.provider)
+        .ok_or_else(|| provider_not_configured(step))?;
+    let quote = exchange
+        .quote_trade(ExchangeQuoteRequest {
+            input_asset: input_asset.clone(),
+            output_asset: output_asset.clone(),
+            input_decimals: refund_exchange_step_decimals(
+                deps,
+                step,
+                "input_decimals",
+                &input_asset,
+            ),
+            output_decimals: refund_exchange_step_decimals(
+                deps,
+                step,
+                "output_decimals",
+                &output_asset,
+            ),
+            order_kind: ProviderOrderKind::ExactIn {
+                amount_in: amount_in.to_string(),
+                min_amount_out: Some("1".to_string()),
+            },
+            sender_address: step
+                .request
+                .get("source_custody_vault_address")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            recipient_address: step
+                .request
+                .get("recipient_address")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        })
+        .await
+        .map_err(|source| provider_quote_error(&step.provider, source))?
+        .ok_or_else(|| {
+            provider_quote_error(
+                &step.provider,
+                format!("refund step {} has no refreshed quote", step.id),
+            )
+        })?;
+
+    let mut request = patch_refund_step_request_amount(step, amount_in);
+    set_request_string_field(&mut request, "amount_out", quote.amount_out.as_str());
+    set_request_optional_string_field(
+        &mut request,
+        "min_amount_out",
+        quote.min_amount_out.as_deref(),
+    );
+    set_request_optional_string_field(
+        &mut request,
+        "max_amount_in",
+        quote.max_amount_in.as_deref(),
+    );
+    if step.step_type == OrderExecutionStepType::UniversalRouterSwap {
+        set_request_value_field(&mut request, "price_route", quote.provider_quote);
+    }
+    set_request_value_field(&mut request, "quote_id", json!(Uuid::now_v7()));
+    Ok((request, Some(quote.amount_out)))
+}
+
+fn refund_exchange_step_decimals(
+    deps: &OrderActivityDeps,
+    step: &OrderExecutionStep,
+    field: &'static str,
+    asset: &DepositAsset,
+) -> Option<u8> {
+    if step.step_type == OrderExecutionStepType::HyperliquidTrade {
+        return None;
+    }
+    step.request
+        .get(field)
+        .and_then(Value::as_u64)
+        .and_then(|value| u8::try_from(value).ok())
+        .or_else(|| refund_asset_decimals(deps, asset))
+}
+
+fn refund_step_request_amount(step: &OrderExecutionStep) -> Option<String> {
+    let field = refund_step_request_amount_field(step.step_type);
+    step.request
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn patch_refund_step_request_amount(step: &OrderExecutionStep, amount: &str) -> Value {
+    let mut request = step.request.clone();
+    set_request_string_field(
+        &mut request,
+        refund_step_request_amount_field(step.step_type),
+        amount,
+    );
+    request
+}
+
+fn refund_step_request_amount_field(step_type: OrderExecutionStepType) -> &'static str {
+    match step_type {
+        OrderExecutionStepType::HyperliquidTrade
+        | OrderExecutionStepType::HyperliquidLimitOrder
+        | OrderExecutionStepType::UniversalRouterSwap => "amount_in",
+        _ => "amount",
+    }
+}
+
+fn set_request_string_field(request: &mut Value, field: &'static str, value: &str) {
+    set_request_value_field(request, field, json!(value));
+}
+
+fn set_request_optional_string_field(
+    request: &mut Value,
+    field: &'static str,
+    value: Option<&str>,
+) {
+    set_request_value_field(
+        request,
+        field,
+        value.map_or(Value::Null, |value| json!(value)),
+    );
+}
+
+fn set_request_value_field(request: &mut Value, field: &'static str, value: Value) {
+    if let Some(object) = request.as_object_mut() {
+        object.insert(field.to_string(), value);
+    }
+}
+
+fn refund_recovery_step(step: &OrderExecutionStep) -> bool {
+    step.details.get("refund_kind").is_some()
+        || step
+            .provider_ref
+            .as_deref()
+            .is_some_and(|provider_ref| provider_ref.starts_with("refund-quote-"))
 }
 
 /// Internal return type for [`pre_execution_stale_quote_check`]. `Some` means
@@ -1647,15 +1969,16 @@ pub(super) async fn execute_running_step(
             // so that, if the fire fails cleanly, we can mark the row `Failed`.
             // A retry then surfaces that failure to the workflow instead of
             // re-reading a `Planned` row and silently waiting forever.
-            let persisted_operation = intent_state(&intent)
-                .operation
-                .as_ref()
-                .and_then(|operation| {
-                    operation
-                        .idempotency_key
-                        .clone()
-                        .map(|idempotency_key| (operation.operation_type, idempotency_key))
-                });
+            let persisted_operation =
+                intent_state(&intent)
+                    .operation
+                    .as_ref()
+                    .and_then(|operation| {
+                        operation
+                            .idempotency_key
+                            .clone()
+                            .map(|idempotency_key| (operation.operation_type, idempotency_key))
+                    });
             match prepare_provider_completion(deps, step, intent).await {
                 Ok(completion) => Ok(completion),
                 Err(error) => {

@@ -163,21 +163,38 @@ pub(super) async fn resolve_latest_execution_attempt_with_deps(
         .await
         .map_err(OrderActivityError::db_query)?;
     // `get_execution_attempts` orders by `attempt_index ASC, created_at ASC,
-    // id ASC`. Manual refunds recover the latest forward execution attempt;
-    // failed refund attempts are symptoms of recovery, not the source position.
-    let attempt = attempts
-        .into_iter()
-        .rev()
-        .find(|attempt| attempt.attempt_kind != OrderExecutionAttemptKind::RefundRecovery)
-        .ok_or_else(|| {
-            invariant_error(
-                "manual_refund_requires_execution_attempt",
-                format!(
-                    "order {} has no non-refund execution attempts to refund",
-                    input.order_id.inner()
-                ),
-            )
-        })?;
+    // id ASC`. Manual refunds normally recover the latest forward execution
+    // attempt; a failed refund attempt only becomes the recovery source after
+    // it completed at least one step and therefore may have moved funds.
+    let mut selected = None;
+    for attempt in attempts.into_iter().rev() {
+        if attempt.attempt_kind != OrderExecutionAttemptKind::RefundRecovery {
+            selected = Some(attempt);
+            break;
+        }
+        let steps = deps
+            .db
+            .orders()
+            .get_execution_steps_for_attempt(attempt.id)
+            .await
+            .map_err(OrderActivityError::db_query)?;
+        if steps
+            .iter()
+            .any(|step| step.status == OrderExecutionStepStatus::Completed)
+        {
+            selected = Some(attempt);
+            break;
+        }
+    }
+    let attempt = selected.ok_or_else(|| {
+        invariant_error(
+            "manual_refund_requires_execution_attempt",
+            format!(
+                "order {} has no execution attempt with recoverable funds",
+                input.order_id.inner()
+            ),
+        )
+    })?;
     Ok(LatestExecutionAttemptResolved {
         attempt_id: attempt.id.into(),
     })
