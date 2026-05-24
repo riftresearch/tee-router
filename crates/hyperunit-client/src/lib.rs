@@ -59,9 +59,7 @@ pub enum HyperUnitClientError {
         source: serde_json::Error,
         body: String,
     },
-    #[snafu(display(
-        "Hyperunit guardian-signature verification failed on {endpoint}: {source}"
-    ))]
+    #[snafu(display("Hyperunit guardian-signature verification failed on {endpoint}: {source}"))]
     GuardianVerification {
         endpoint: String,
         source: GuardianVerifyError,
