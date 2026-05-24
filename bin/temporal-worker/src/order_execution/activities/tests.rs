@@ -3154,6 +3154,17 @@ fn refund_position_discovery_prefers_expected_hyperliquid_asset_over_dust() {
 }
 
 #[test]
+fn hyperliquid_refund_balance_parser_floors_overprecision_decimal_dust() {
+    let amount = hyperliquid_refund_balance_amount_raw("0.50688167", "0.0", 6)
+        .expect("over-precision Hyperliquid USDC dust should parse");
+    assert_eq!(amount.as_deref(), Some("506881"));
+
+    let sub_raw_unit = hyperliquid_refund_balance_amount_raw("0.00000067", "0", 6)
+        .expect("sub-raw-unit Hyperliquid dust should parse");
+    assert_eq!(sub_raw_unit, None);
+}
+
+#[test]
 fn refund_step_idempotency_key_includes_attempt_id() {
     let order_id = Uuid::now_v7();
     let attempt_id = Uuid::now_v7();

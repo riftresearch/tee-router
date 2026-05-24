@@ -2125,11 +2125,16 @@ pub(super) fn decimal_string_to_raw_digits(value: &str, decimals: u8) -> Result<
         || whole.is_empty()
         || !whole.chars().all(|ch| ch.is_ascii_digit())
         || !frac.chars().all(|ch| ch.is_ascii_digit())
-        || frac.len() > usize::from(decimals)
     {
         return Err(format!("invalid decimal amount {value:?}"));
     }
-    let combined = format!("{whole}{:0<width$}", frac, width = usize::from(decimals));
+    let decimals = usize::from(decimals);
+    let frac = if frac.len() > decimals {
+        &frac[..decimals]
+    } else {
+        frac
+    };
+    let combined = format!("{whole}{:0<width$}", frac, width = decimals);
     let digits = combined.trim_start_matches('0');
     Ok(if digits.is_empty() { "0" } else { digits }.to_string())
 }
