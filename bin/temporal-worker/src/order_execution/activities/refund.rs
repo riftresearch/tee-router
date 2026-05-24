@@ -195,6 +195,15 @@ pub(super) async fn resolve_latest_execution_attempt_with_deps(
             ),
         )
     })?;
+    tracing::info!(
+        order_id = %input.order_id.inner(),
+        attempt_id = %attempt.id,
+        attempt_index = attempt.attempt_index,
+        attempt_kind = attempt.attempt_kind.to_db_string(),
+        attempt_status = attempt.status.to_db_string(),
+        event_name = "order.refund_latest_attempt_resolved",
+        "order.refund_latest_attempt_resolved"
+    );
     Ok(LatestExecutionAttemptResolved {
         attempt_id: attempt.id.into(),
     })
@@ -337,6 +346,23 @@ pub(super) async fn discover_single_refund_position_with_deps(
             .await?,
         );
     }
+
+    tracing::info!(
+        order_id = %input.order_id.inner(),
+        failed_attempt_id = %input.failed_attempt_id.inner(),
+        position_count = positions.len(),
+        expected_asset_chain = expected_asset
+            .as_ref()
+            .map(|asset| asset.chain.as_str())
+            .unwrap_or(""),
+        expected_asset = expected_asset
+            .as_ref()
+            .map(|asset| asset.asset.as_str())
+            .unwrap_or(""),
+        expected_canonical = expected_canonical.map(|asset| asset.as_str()).unwrap_or(""),
+        event_name = "order.refund_position_discovery_candidates",
+        "order.refund_position_discovery_candidates"
+    );
 
     Ok(refund_position_discovery_from_positions_with_expected(
         input.order_id.inner(),
@@ -514,6 +540,23 @@ pub(super) fn refund_position_discovery_from_positions_with_expected(
         .map(|(index, _)| index)
         .expect("positions is not empty");
     let selected = positions.remove(selected_index);
+
+    tracing::info!(
+        order_id = %order_id,
+        selected_position_kind = recoverable_position_kind_label(selected.position_kind),
+        selected_asset_chain = %selected.asset.chain,
+        selected_asset = %selected.asset.asset,
+        selected_amount = %selected.amount,
+        selected_hyperliquid_coin = selected.hyperliquid_coin.as_deref().unwrap_or(""),
+        selected_hyperliquid_canonical = selected
+            .hyperliquid_canonical
+            .map(|asset| asset.as_str())
+            .unwrap_or(""),
+        requires_clearinghouse_unwrap = selected.requires_clearinghouse_unwrap,
+        remaining_position_count = positions.len(),
+        event_name = "order.refund_position_selected",
+        "order.refund_position_selected"
+    );
 
     for dropped in &positions {
         let dropped_position_kind = recoverable_position_kind_label(dropped.position_kind);
@@ -810,10 +853,30 @@ pub(super) async fn materialize_hyperliquid_spot_refund_plan(
     input: MaterializeRefundPlanInput,
 ) -> Result<RefundPlanShape, OrderActivityError> {
     let Some(source) = load_hyperliquid_spot_refund_source(deps, &input).await? else {
+        tracing::warn!(
+            order_id = %input.order_id.inner(),
+            failed_attempt_id = %input.failed_attempt_id.inner(),
+            event_name = "order.refund_hyperliquid_source_missing",
+            "order.refund_hyperliquid_source_missing"
+        );
         return Ok(refund_plan_untenable(
             RefundUntenableReason::RefundRecoverablePositionDisappearedAfterValidation,
         ));
     };
+    tracing::info!(
+        order_id = %input.order_id.inner(),
+        failed_attempt_id = %input.failed_attempt_id.inner(),
+        custody_vault_id = %source.vault.id,
+        custody_vault_role = source.vault.role.to_db_string(),
+        source_asset_chain = %source.asset.chain,
+        source_asset = %source.asset.asset,
+        amount = source.amount,
+        hyperliquid_coin = source.coin,
+        hyperliquid_canonical = source.canonical.as_str(),
+        requires_clearinghouse_unwrap = source.requires_clearinghouse_unwrap,
+        event_name = "order.refund_hyperliquid_source_loaded",
+        "order.refund_hyperliquid_source_loaded"
+    );
 
     let now = Utc::now();
     let Some((mut legs, mut steps)) = hyperliquid_spot_refund_back_steps(
@@ -827,6 +890,17 @@ pub(super) async fn materialize_hyperliquid_spot_refund_plan(
     )
     .await?
     else {
+        tracing::warn!(
+            order_id = %input.order_id.inner(),
+            failed_attempt_id = %input.failed_attempt_id.inner(),
+            source_asset_chain = %source.asset.chain,
+            source_asset = %source.asset.asset,
+            amount = source.amount,
+            hyperliquid_coin = source.coin,
+            hyperliquid_canonical = source.canonical.as_str(),
+            event_name = "order.refund_hyperliquid_plan_unavailable",
+            "order.refund_hyperliquid_plan_unavailable"
+        );
         return Ok(refund_plan_untenable(
             RefundUntenableReason::RefundRecoverablePositionDisappearedAfterValidation,
         ));

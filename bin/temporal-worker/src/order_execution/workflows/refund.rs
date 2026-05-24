@@ -68,6 +68,13 @@ impl RefundWorkflow {
             let position = match discovery.outcome {
                 SingleRefundPositionOutcome::Position(position) => position,
                 SingleRefundPositionOutcome::Untenable { reason } => {
+                    tracing::warn!(
+                        order_id = %input.order_id.inner(),
+                        failed_attempt_id = %failed_attempt_id.inner(),
+                        reason = ?reason,
+                        event_name = "order.refund_position_discovery_untenable",
+                        "order.refund_position_discovery_untenable"
+                    );
                     let finalized = finalize_refund_required(
                         ctx,
                         input.order_id,
@@ -103,6 +110,13 @@ impl RefundWorkflow {
                     steps,
                 } => (refund_attempt_id, steps),
                 RefundPlanOutcome::Untenable { reason } => {
+                    tracing::warn!(
+                        order_id = %input.order_id.inner(),
+                        failed_attempt_id = %failed_attempt_id.inner(),
+                        reason = ?reason,
+                        event_name = "order.refund_plan_untenable",
+                        "order.refund_plan_untenable"
+                    );
                     let finalized = finalize_refund_required(
                         ctx,
                         input.order_id,
