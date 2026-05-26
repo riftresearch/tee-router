@@ -185,6 +185,10 @@ single all-in-one server. All four share the `*temporal-server-base` anchor in
 `etc/compose.phala.yml` and differ only by `SERVICES=` and health port. This
 mirrors the split local compose topology in `etc/compose.local-infra.yml` and is
 the topology the perf/loadgen work was validated against.
+The local-only `etc/compose.local-devnet-ports.yml` overlay is a host-port
+remap used by `just dc` so deterministic devnet can coexist with
+`tee-router-live-local`; it is not part of the Phala deployment topology and
+should not be copied into `compose.phala.yml`.
 
 Key server config (inline in the compose `configs:` / base anchor):
 

@@ -87,33 +87,40 @@ Provider mocks:
 - observe local devnet contracts where appropriate, so execution still follows
   real router code paths
 
-## Deterministic local ports
+## Direct devnet ports vs compose host ports
 
-The interactive devnet should reserve the following ports:
+The `devnet` binary and compose-internal service URLs keep the deterministic
+`501xx` ports. The local compose deployment published by `just dc` applies
+`etc/compose.local-devnet-ports.yml` last, remapping host ports away from the
+historical live-local ports so deterministic devnet can run alongside
+`tee-router-live-local`.
 
-| Surface | Host port |
-| --- | ---: |
-| Bitcoin RPC | 50100 |
-| Ethereum Anvil RPC/WS | 50101 |
-| Base Anvil RPC/WS | 50102 |
-| Arbitrum Anvil RPC/WS | 50103 |
-| Ethereum token indexer | 50104 |
-| Base token indexer | 50105 |
-| Arbitrum token indexer | 50106 |
-| Provider mock API | 50107 |
-| Devnet manifest API | 50108 |
-| Bitcoin Esplora API | 50110 |
-| Bitcoin ZMQ rawtx | 50111 |
-| Bitcoin ZMQ sequence | 50112 |
+| Surface | Direct/internal port | `just dc` host port |
+| --- | ---: | ---: |
+| Bitcoin RPC | 50100 | 56100 |
+| Ethereum Anvil RPC/WS | 50101 | 56101 |
+| Base Anvil RPC/WS | 50102 | 56102 |
+| Arbitrum Anvil RPC/WS | 50103 | 56103 |
+| Ethereum token indexer | 50104 | 56104 |
+| Base token indexer | 50105 | 56105 |
+| Arbitrum token indexer | 50106 | 56106 |
+| Provider mock API | 50107 | 56107 |
+| Devnet manifest API | 50108 | 56108 |
+| Bitcoin Esplora API | 50110 | 56110 |
+| Bitcoin ZMQ rawtx | 50111 | 56111 |
+| Bitcoin ZMQ sequence | 50112 | 56112 |
+| Bitcoin ZMQ rawblock | 50118 | 56118 |
 
 ## Local compose shape
 
-Local compose is split into shared infrastructure plus a devnet overlay:
+Local compose is split into shared infrastructure plus overlays:
 
 - `etc/compose.local-infra.yml` owns shared process lifecycle
 - `etc/compose.local-devnet.yml` owns fake chains, mock providers, fake keys,
-  and loadgen wiring
+  and compose-internal devnet wiring
 - `etc/compose.local-observability.yml` adds metrics/logging
+- `etc/compose.local-devnet-ports.yml` owns devnet-only host port remaps and
+  must stay last in `just dc` composition
 
 Together they run:
 
