@@ -100,7 +100,11 @@ fn benchmark_created_at() -> DateTime<Utc> {
 fn benchmark_token(chain: ChainType) -> TokenIdentifier {
     match chain {
         ChainType::Bitcoin => TokenIdentifier::Native,
-        ChainType::Ethereum | ChainType::Arbitrum | ChainType::Base | ChainType::Hyperliquid => {
+        ChainType::Ethereum
+        | ChainType::Arbitrum
+        | ChainType::Base
+        | ChainType::Hyperevm
+        | ChainType::Hyperliquid => {
             TokenIdentifier::address("0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf")
         }
     }
@@ -109,7 +113,11 @@ fn benchmark_token(chain: ChainType) -> TokenIdentifier {
 fn benchmark_address(chain: ChainType, index: usize, offset: usize) -> String {
     match chain {
         ChainType::Bitcoin => format!("btc-bench-address-{index:06}"),
-        ChainType::Ethereum | ChainType::Arbitrum | ChainType::Base | ChainType::Hyperliquid => {
+        ChainType::Ethereum
+        | ChainType::Arbitrum
+        | ChainType::Base
+        | ChainType::Hyperevm
+        | ChainType::Hyperliquid => {
             format!("0x{:040x}", index + offset)
         }
     }

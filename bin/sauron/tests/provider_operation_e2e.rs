@@ -988,6 +988,11 @@ fn order_worker_runtime_args_from_router_args(args: &RouterServerArgs) -> OrderW
         arbitrum_rpc_url: args.arbitrum_rpc_url.clone(),
         arbitrum_reference_token: args.arbitrum_reference_token.clone(),
         arbitrum_paymaster_private_key: args.arbitrum_paymaster_private_key.clone(),
+        hyperevm_rpc_url: args.hyperevm_rpc_url.clone(),
+        hyperevm_reference_token: args.hyperevm_reference_token.clone(),
+        hyperevm_paymaster_private_key: args.hyperevm_paymaster_private_key.clone(),
+        hyperevm_min_confirmations: args.hyperevm_min_confirmations,
+        hyperevm_estimated_block_time_ms: args.hyperevm_estimated_block_time_ms,
         bitcoin_rpc_url: args.bitcoin_rpc_url.clone(),
         bitcoin_rpc_auth: args.bitcoin_rpc_auth.clone(),
         untrusted_esplora_http_server_url: args.untrusted_esplora_http_server_url.clone(),
@@ -1011,9 +1016,9 @@ fn order_worker_runtime_args_from_router_args(args: &RouterServerArgs) -> OrderW
         hyperliquid_network: args.hyperliquid_network,
         hyperliquid_order_timeout_ms: args.hyperliquid_order_timeout_ms,
         coinbase_price_api_base_url: args.coinbase_price_api_base_url.clone(),
-    }
 }
 
+}
 async fn reserve_local_port() -> u16 {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -1080,6 +1085,11 @@ fn router_args(
         arbitrum_rpc_url: devnet.arbitrum.anvil.endpoint_url().to_string(),
         arbitrum_reference_token: chain_tokens.arbitrum_reference_token.to_string(),
         arbitrum_paymaster_private_key: Some(anvil_private_key(&devnet.arbitrum)),
+        hyperevm_rpc_url: Some(devnet.base.anvil.endpoint_url().to_string()),
+        hyperevm_reference_token: Some("0xb88339cb7199b77e23db6e890353e22632ba630f".to_string()),
+        hyperevm_paymaster_private_key: Some(anvil_private_key(&devnet.base)),
+        hyperevm_min_confirmations: Some(4),
+        hyperevm_estimated_block_time_ms: Some(1_000),
         bitcoin_rpc_url: bitcoin_rpc_url(devnet),
         bitcoin_rpc_auth: Auth::CookieFile(devnet.bitcoin.cookie.clone()),
         untrusted_esplora_http_server_url: devnet
@@ -1163,6 +1173,11 @@ fn live_router_args(
         arbitrum_rpc_url: live.arbitrum_rpc_url.clone(),
         arbitrum_reference_token: chain_tokens.arbitrum_reference_token.to_string(),
         arbitrum_paymaster_private_key: live.arbitrum_paymaster_private_key.clone(),
+        hyperevm_rpc_url: Some(live.base_rpc_url.clone()),
+        hyperevm_reference_token: Some("0xb88339cb7199b77e23db6e890353e22632ba630f".to_string()),
+        hyperevm_paymaster_private_key: live.base_paymaster_private_key.clone(),
+        hyperevm_min_confirmations: Some(4),
+        hyperevm_estimated_block_time_ms: Some(1_000),
         bitcoin_rpc_url: live.bitcoin_rpc_url.clone(),
         bitcoin_rpc_auth: live.bitcoin_rpc_auth.clone(),
         untrusted_esplora_http_server_url: live.electrum_http_server_url.clone(),
@@ -1251,6 +1266,9 @@ async fn spawn_sauron(
         arbitrum_rpc_url: devnet.arbitrum.anvil.endpoint_url().to_string(),
         arbitrum_token_indexer_url: token_indexer_urls.arbitrum,
         arbitrum_receipt_watcher_url: Some(receipt_watcher_urls.arbitrum),
+        hyperevm_rpc_url: Some(devnet.base.anvil.endpoint_url().to_string()),
+        hyperevm_token_indexer_url: None,
+        hyperevm_receipt_watcher_url: None,
         hl_shim_indexer_url,
         hyperunit_api_url,
         hyperunit_proxy_url: None,
@@ -1638,6 +1656,9 @@ fn live_sauron_args(
         arbitrum_rpc_url: live.arbitrum_rpc_url.clone(),
         arbitrum_token_indexer_url: live.arbitrum_token_indexer_url.clone(),
         arbitrum_receipt_watcher_url: None,
+        hyperevm_rpc_url: Some(live.base_rpc_url.clone()),
+        hyperevm_token_indexer_url: None,
+        hyperevm_receipt_watcher_url: None,
         hl_shim_indexer_url: None,
         hyperunit_api_url: Some(live.hyperunit_api_url.clone()),
         hyperunit_proxy_url: live.hyperunit_proxy_url.clone(),

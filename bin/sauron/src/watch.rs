@@ -806,7 +806,11 @@ fn normalize_watch_address(watch_id: Uuid, chain: ChainType, address: &str) -> R
                     "watch {watch_id} had invalid Bitcoin watch address {address}: {reason}"
                 ),
             }),
-        ChainType::Ethereum | ChainType::Arbitrum | ChainType::Base | ChainType::Hyperliquid => {
+        ChainType::Ethereum
+        | ChainType::Arbitrum
+        | ChainType::Base
+        | ChainType::Hyperevm
+        | ChainType::Hyperliquid => {
             normalize_evm_address(address).map_err(|reason| crate::error::Error::InvalidWatchRow {
                 message: format!(
                     "watch {watch_id} had invalid EVM watch address {address}: {reason}"
@@ -822,6 +826,7 @@ fn chain_type_from_router_chain_id(chain_id: &str) -> Option<ChainType> {
         "evm:1" | "ethereum" => Some(ChainType::Ethereum),
         "evm:42161" | "arbitrum" => Some(ChainType::Arbitrum),
         "evm:8453" | "base" => Some(ChainType::Base),
+        "evm:999" | "hyperevm" => Some(ChainType::Hyperevm),
         _ => None,
     }
 }
@@ -840,6 +845,7 @@ fn token_identifier_from_router_asset_id(
             ChainType::Ethereum
             | ChainType::Arbitrum
             | ChainType::Base
+            | ChainType::Hyperevm
             | ChainType::Hyperliquid => normalize_evm_address(asset_id)
                 .map(TokenIdentifier::Address)
                 .map_err(|reason| crate::error::Error::InvalidWatchRow {
@@ -890,6 +896,7 @@ mod tests {
                 ChainType::Ethereum
                 | ChainType::Arbitrum
                 | ChainType::Base
+                | ChainType::Hyperevm
                 | ChainType::Hyperliquid => {
                     TokenIdentifier::address("0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf")
                 }
@@ -950,10 +957,20 @@ mod tests {
             Some("0xCbB7C0000aB88B473b1f5aFd9ef808440eed33Bf"),
         )
         .unwrap();
+        let hyperevm_token = token_identifier_from_router_asset_id(
+            Uuid::now_v7(),
+            ChainType::Hyperevm,
+            Some("0xB88339CB7199B77E23DB6E890353E22632Ba630f"),
+        )
+        .unwrap();
 
         assert_eq!(
             token,
             TokenIdentifier::Address("0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf".to_string())
+        );
+        assert_eq!(
+            hyperevm_token,
+            TokenIdentifier::Address("0xb88339cb7199b77e23db6e890353e22632ba630f".to_string())
         );
     }
 
@@ -980,6 +997,15 @@ mod tests {
             )
             .unwrap(),
             "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf"
+        );
+        assert_eq!(
+            normalize_watch_address(
+                watch_id,
+                ChainType::Hyperevm,
+                "0xB88339CB7199B77E23DB6E890353E22632Ba630f"
+            )
+            .unwrap(),
+            "0xb88339cb7199b77e23db6e890353e22632ba630f"
         );
 
         let evm_err =

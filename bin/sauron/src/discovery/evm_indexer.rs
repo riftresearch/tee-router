@@ -106,10 +106,22 @@ impl EvmIndexerDiscoveryBackend {
     }
 
     pub fn new_arbitrum(args: &SauronArgs) -> Result<Self> {
-        let url = required_indexer_url("arbitrum_evm", args.arbitrum_token_indexer_url.as_deref())?;
+        let url =
+            required_indexer_url("arbitrum_evm", args.arbitrum_token_indexer_url.as_deref())?;
         Self::new(
             "arbitrum_evm",
             ChainType::Arbitrum,
+            url,
+            args.token_indexer_api_key.clone(),
+            args.sauron_evm_indexed_lookup_concurrency,
+        )
+    }
+
+    pub fn new_hyperevm(args: &SauronArgs) -> Result<Self> {
+        let url = required_indexer_url("hyperevm_evm", args.hyperevm_token_indexer_url.as_deref())?;
+        Self::new(
+            "hyperevm_evm",
+            ChainType::Hyperevm,
             url,
             args.token_indexer_api_key.clone(),
             args.sauron_evm_indexed_lookup_concurrency,
@@ -170,6 +182,13 @@ impl EvmIndexerDiscoveryBackend {
         args.arbitrum_token_indexer_url
             .as_ref()
             .map(|_| Self::new_arbitrum(args))
+            .transpose()
+    }
+
+    pub fn maybe_hyperevm(args: &SauronArgs) -> Result<Option<Self>> {
+        args.hyperevm_token_indexer_url
+            .as_ref()
+            .map(|_| Self::new_hyperevm(args))
             .transpose()
     }
 
@@ -521,6 +540,7 @@ fn evm_chain_id(chain: ChainType) -> Option<u64> {
         ChainType::Ethereum => Some(1),
         ChainType::Arbitrum => Some(42_161),
         ChainType::Base => Some(8_453),
+        ChainType::Hyperevm => Some(999),
         ChainType::Bitcoin | ChainType::Hyperliquid => None,
     }
 }

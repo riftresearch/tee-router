@@ -2090,6 +2090,7 @@ mod tests {
             ethereum: (chain == HyperUnitChain::Ethereum).then(|| client.clone()),
             base: (chain == HyperUnitChain::Base).then(|| client.clone()),
             arbitrum: (chain == HyperUnitChain::Arbitrum).then_some(client),
+            hyperevm: None,
         }
     }
 
@@ -2098,6 +2099,7 @@ mod tests {
             ethereum: None,
             base: None,
             arbitrum: None,
+            hyperevm: None,
         }
     }
 

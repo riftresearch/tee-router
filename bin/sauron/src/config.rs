@@ -132,6 +132,18 @@ pub struct SauronArgs {
     #[arg(long, env = "ARBITRUM_RECEIPT_WATCHER_URL")]
     pub arbitrum_receipt_watcher_url: Option<String>,
 
+    /// HyperEVM RPC URL
+    #[arg(long, env = "HYPEREVM_RPC_URL")]
+    pub hyperevm_rpc_url: Option<String>,
+
+    /// HyperEVM Token Indexer URL
+    #[arg(long, env = "HYPEREVM_TOKEN_INDEXER_URL")]
+    pub hyperevm_token_indexer_url: Option<String>,
+
+    /// HyperEVM Receipt Watcher URL
+    #[arg(long, env = "HYPEREVM_RECEIPT_WATCHER_URL")]
+    pub hyperevm_receipt_watcher_url: Option<String>,
+
     /// Hyperliquid shim indexer URL
     #[arg(long, env = "HL_SHIM_INDEXER_URL")]
     pub hl_shim_indexer_url: Option<String>,
@@ -327,6 +339,21 @@ impl fmt::Debug for SauronArgs {
                     .as_ref()
                     .map(|_| "<redacted>"),
             )
+            .field("hyperevm_rpc_url", &"<redacted>")
+            .field(
+                "hyperevm_token_indexer_url",
+                &self
+                    .hyperevm_token_indexer_url
+                    .as_ref()
+                    .map(|_| "<redacted>"),
+            )
+            .field(
+                "hyperevm_receipt_watcher_url",
+                &self
+                    .hyperevm_receipt_watcher_url
+                    .as_ref()
+                    .map(|_| "<redacted>"),
+            )
             .field(
                 "hl_shim_indexer_url",
                 &self.hl_shim_indexer_url.as_ref().map(|_| "<redacted>"),
@@ -441,6 +468,13 @@ mod tests {
             ),
             arbitrum_receipt_watcher_url: Some(
                 "https://arb-receipts.example/receipt-secret".to_string(),
+            ),
+            hyperevm_rpc_url: Some("https://hyperevm.example/rpc-secret".to_string()),
+            hyperevm_token_indexer_url: Some(
+                "https://hyperevm-indexer.example/token-secret".to_string(),
+            ),
+            hyperevm_receipt_watcher_url: Some(
+                "https://hyperevm-receipts.example/receipt-secret".to_string(),
             ),
             hl_shim_indexer_url: Some("https://hl-shim.example/token-secret".to_string()),
             hyperunit_api_url: Some("https://hyperunit.example/token-secret".to_string()),

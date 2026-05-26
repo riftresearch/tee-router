@@ -353,6 +353,13 @@ async fn build_backends(
             "BASE_TOKEN_INDEXER_URL is not configured; Base ERC-20 discovery backend is disabled"
         );
     }
+    if let Some(hyperevm) = EvmIndexerDiscoveryBackend::maybe_hyperevm(args)? {
+        backends.push(Arc::new(hyperevm));
+    } else {
+        warn!(
+            "HYPEREVM_TOKEN_INDEXER_URL is not configured; HyperEVM ERC-20 discovery backend is disabled"
+        );
+    }
     Ok(backends)
 }
 
@@ -397,6 +404,7 @@ fn build_evm_receipt_observer_task(
                 "ETHEREUM_RECEIPT_WATCHER_URL",
                 "BASE_RECEIPT_WATCHER_URL",
                 "ARBITRUM_RECEIPT_WATCHER_URL",
+                "HYPEREVM_RECEIPT_WATCHER_URL",
             ],
             "EVM receipt observer disabled; no receipt watcher URLs configured. Set at least one listed env var to enable observation."
         );
@@ -466,6 +474,7 @@ fn build_hyperunit_observer_task(
                 "ETHEREUM_RECEIPT_WATCHER_URL",
                 "BASE_RECEIPT_WATCHER_URL",
                 "ARBITRUM_RECEIPT_WATCHER_URL",
+                "HYPEREVM_RECEIPT_WATCHER_URL",
             ],
             "HyperUnit observer started without EVM receipt watcher clients; EVM-source deposits and EVM-destination withdrawals will only emit preliminary hints."
         );
@@ -875,6 +884,9 @@ mod tests {
             arbitrum_rpc_url: "http://arbitrum:8545".to_string(),
             arbitrum_token_indexer_url: None,
             arbitrum_receipt_watcher_url: None,
+            hyperevm_rpc_url: Some("http://hyperevm:8545".to_string()),
+            hyperevm_token_indexer_url: None,
+            hyperevm_receipt_watcher_url: None,
             hl_shim_indexer_url: None,
             hyperunit_api_url: None,
             hyperunit_proxy_url: None,
