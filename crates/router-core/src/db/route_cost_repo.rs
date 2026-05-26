@@ -19,6 +19,7 @@ const ROUTE_COST_SELECT_COLUMNS: &str = r#"
     destination_chain,
     destination_asset,
     estimated_fee_bps,
+    estimated_fee_usd_micros,
     estimated_gas_usd_micros,
     estimated_latency_ms,
     sample_amount_usd_micros,
@@ -54,6 +55,7 @@ impl RouteCostRepository {
                     destination_chain,
                     destination_asset,
                     estimated_fee_bps,
+                    estimated_fee_usd_micros,
                     estimated_gas_usd_micros,
                     estimated_latency_ms,
                     sample_amount_usd_micros,
@@ -61,7 +63,7 @@ impl RouteCostRepository {
                     refreshed_at,
                     expires_at
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
                 ON CONFLICT (transition_id, amount_bucket) DO UPDATE
                 SET provider = EXCLUDED.provider,
                     edge_kind = EXCLUDED.edge_kind,
@@ -70,6 +72,7 @@ impl RouteCostRepository {
                     destination_chain = EXCLUDED.destination_chain,
                     destination_asset = EXCLUDED.destination_asset,
                     estimated_fee_bps = EXCLUDED.estimated_fee_bps,
+                    estimated_fee_usd_micros = EXCLUDED.estimated_fee_usd_micros,
                     estimated_gas_usd_micros = EXCLUDED.estimated_gas_usd_micros,
                     estimated_latency_ms = EXCLUDED.estimated_latency_ms,
                     sample_amount_usd_micros = EXCLUDED.sample_amount_usd_micros,
@@ -88,6 +91,10 @@ impl RouteCostRepository {
             .bind(snapshot.destination_asset.chain.as_str())
             .bind(snapshot.destination_asset.asset.as_str())
             .bind(u64_to_i64(snapshot.estimated_fee_bps, "estimated_fee_bps")?)
+            .bind(u64_to_i64(
+                snapshot.estimated_fee_usd_micros,
+                "estimated_fee_usd_micros",
+            )?)
             .bind(u64_to_i64(
                 snapshot.estimated_gas_usd_micros,
                 "estimated_gas_usd_micros",
@@ -155,6 +162,10 @@ fn map_route_cost_snapshot(row: &sqlx_postgres::PgRow) -> RouterCoreResult<Route
             asset: parse_asset(row.get::<String, _>("destination_asset"))?,
         },
         estimated_fee_bps: i64_to_u64(row.get("estimated_fee_bps"), "estimated_fee_bps")?,
+        estimated_fee_usd_micros: i64_to_u64(
+            row.get("estimated_fee_usd_micros"),
+            "estimated_fee_usd_micros",
+        )?,
         estimated_gas_usd_micros: i64_to_u64(
             row.get("estimated_gas_usd_micros"),
             "estimated_gas_usd_micros",

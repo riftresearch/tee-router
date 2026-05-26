@@ -24,9 +24,11 @@ pub struct PricingSnapshot {
     pub stable_usd_micro: u64,
     pub eth_usd_micro: u64,
     pub btc_usd_micro: u64,
+    pub hype_usd_micro: Option<u64>,
     pub ethereum_gas_price_wei: u64,
     pub arbitrum_gas_price_wei: u64,
     pub base_gas_price_wei: u64,
+    pub hyperevm_gas_price_wei: Option<u64>,
 }
 
 impl PricingSnapshot {
@@ -39,9 +41,11 @@ impl PricingSnapshot {
             stable_usd_micro: USD_MICRO,
             eth_usd_micro: 3_000 * USD_MICRO,
             btc_usd_micro: 100_000 * USD_MICRO,
+            hype_usd_micro: None,
             ethereum_gas_price_wei: 25_000_000_000,
             arbitrum_gas_price_wei: 100_000_000,
             base_gas_price_wei: 20_000_000,
+            hyperevm_gas_price_wei: None,
         }
     }
 
@@ -54,9 +58,11 @@ impl PricingSnapshot {
             stable_usd_micro: snapshot.stable_usd_micro,
             eth_usd_micro: snapshot.eth_usd_micro,
             btc_usd_micro: snapshot.btc_usd_micro,
+            hype_usd_micro: snapshot.hype_usd_micro,
             ethereum_gas_price_wei: snapshot.ethereum_gas_price_wei,
             arbitrum_gas_price_wei: snapshot.arbitrum_gas_price_wei,
             base_gas_price_wei: snapshot.base_gas_price_wei,
+            hyperevm_gas_price_wei: snapshot.hyperevm_gas_price_wei,
         }
     }
 
@@ -71,24 +77,50 @@ impl PricingSnapshot {
             CanonicalAsset::Usdc | CanonicalAsset::Usdt => Some(self.stable_usd_micro),
             CanonicalAsset::Eth => Some(self.eth_usd_micro),
             CanonicalAsset::Btc | CanonicalAsset::Cbbtc => Some(self.btc_usd_micro),
-            CanonicalAsset::Hype => None,
+            CanonicalAsset::Hype => self.hype_usd_micro,
         }
     }
 
     #[must_use]
     pub fn chain_gas_price_wei(&self, chain: &ChainId) -> U256 {
+        self.try_chain_gas_price_wei(chain).unwrap_or(U256::ZERO)
+    }
+
+    #[must_use]
+    pub fn try_chain_gas_price_wei(&self, chain: &ChainId) -> Option<U256> {
         match backend_chain_for_id(chain) {
-            Some(ChainType::Ethereum) => U256::from(self.ethereum_gas_price_wei),
-            Some(ChainType::Arbitrum) => U256::from(self.arbitrum_gas_price_wei),
-            Some(ChainType::Base) => U256::from(self.base_gas_price_wei),
-            _ => U256::ZERO,
+            Some(ChainType::Ethereum) => Some(U256::from(self.ethereum_gas_price_wei)),
+            Some(ChainType::Arbitrum) => Some(U256::from(self.arbitrum_gas_price_wei)),
+            Some(ChainType::Base) => Some(U256::from(self.base_gas_price_wei)),
+            Some(ChainType::Hyperevm) => self.hyperevm_gas_price_wei.map(U256::from),
+            _ => None,
         }
     }
 
     #[must_use]
-    pub fn checked_wei_to_usd_micro(&self, wei: U256) -> Option<U256> {
+    pub fn chain_native_asset_usd_micro(&self, chain: &ChainId) -> Option<u64> {
+        match backend_chain_for_id(chain) {
+            Some(ChainType::Ethereum | ChainType::Arbitrum | ChainType::Base) => {
+                Some(self.eth_usd_micro)
+            }
+            Some(ChainType::Hyperevm) => self.hype_usd_micro,
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn supports_chain_gas_pricing(&self, chain: &ChainId) -> bool {
+        self.try_chain_gas_price_wei(chain).is_some() && self.chain_native_asset_usd_micro(chain).is_some()
+    }
+
+    #[must_use]
+    pub fn checked_native_gas_wei_to_usd_micro(
+        &self,
+        chain: &ChainId,
+        wei: U256,
+    ) -> Option<U256> {
         div_ceil_checked(
-            wei.checked_mul(U256::from(self.eth_usd_micro))?,
+            wei.checked_mul(U256::from(self.chain_native_asset_usd_micro(chain)?))?,
             checked_pow10(18)?,
         )
     }
@@ -169,6 +201,8 @@ mod tests {
             pricing.canonical_asset_usd_micro(CanonicalAsset::Btc),
             Some(100_000 * USD_MICRO)
         );
+        assert_eq!(pricing.canonical_asset_usd_micro(CanonicalAsset::Hype), None);
+        assert!(!pricing.supports_chain_gas_pricing(&ChainId::parse("evm:999").unwrap()));
     }
 
     #[test]
@@ -187,7 +221,24 @@ mod tests {
             pricing.usd_micro_to_asset_raw(U256::from(1_u64), CanonicalAsset::Btc, u8::MAX),
             None
         );
-        assert_eq!(pricing.checked_wei_to_usd_micro(U256::MAX), None);
+        assert_eq!(
+            pricing.checked_native_gas_wei_to_usd_micro(&ChainId::parse("evm:1").unwrap(), U256::MAX),
+            None
+        );
         assert_eq!(apply_bps_multiplier(U256::MAX, 2), None);
+    }
+    #[test]
+    fn hyperevm_gas_pricing_uses_hype_usd() {
+        let mut pricing = PricingSnapshot::static_bootstrap(Utc::now());
+        pricing.hype_usd_micro = Some(50 * USD_MICRO);
+        pricing.hyperevm_gas_price_wei = Some(100_000_000);
+
+        let chain = ChainId::parse("evm:999").unwrap();
+        assert!(pricing.supports_chain_gas_pricing(&chain));
+        assert_eq!(pricing.chain_native_asset_usd_micro(&chain), Some(50 * USD_MICRO));
+        assert_eq!(
+            pricing.checked_native_gas_wei_to_usd_micro(&chain, U256::from(1_000_000_000_000_000_000_u128)),
+            Some(U256::from(50 * USD_MICRO))
+        );
     }
 }

@@ -38,6 +38,7 @@ pub struct RouteCostSnapshot {
     pub source_asset: DepositAsset,
     pub destination_asset: DepositAsset,
     pub estimated_fee_bps: u64,
+    pub estimated_fee_usd_micros: u64,
     pub estimated_gas_usd_micros: u64,
     pub estimated_latency_ms: u64,
     pub sample_amount_usd_micros: u64,
@@ -53,18 +54,20 @@ impl RouteCostSnapshot {
     }
 
     #[must_use]
+    pub fn effective_cost_usd_micros(&self) -> u64 {
+        capped_add_u64(self.estimated_fee_usd_micros, self.estimated_gas_usd_micros)
+    }
+
+    #[must_use]
     pub fn effective_cost_bps(&self) -> u64 {
-        capped_add_u64(
-            self.estimated_fee_bps,
-            gas_cost_bps(self.estimated_gas_usd_micros, self.sample_amount_usd_micros),
-        )
+        usd_cost_bps(self.effective_cost_usd_micros(), self.sample_amount_usd_micros)
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoutePathCostScore {
     pub missing_edges: usize,
-    pub total_effective_cost_bps: u64,
+    pub total_effective_cost_usd_micros: u64,
     pub total_latency_ms: u64,
 }
 
@@ -146,6 +149,10 @@ impl RouteCostService {
     pub async fn current_or_refresh_live_pricing_snapshot(&self) -> Option<PricingSnapshot> {
         let pricing = self.current_or_refresh_pricing_snapshot().await;
         pricing_snapshot_is_fresh(&pricing, Utc::now(), self.ttl).then_some(pricing)
+    }
+    pub async fn force_refresh_pricing_snapshot(&self) -> PricingSnapshot {
+        let _guard = self.pricing_refresh.lock().await;
+        self.refresh_pricing_snapshot().await
     }
 
     pub async fn refresh_anchor_costs(&self) -> RouterCoreResult<RouteCostRefreshSummary> {
@@ -258,6 +265,7 @@ impl RouteCostService {
             MarketOrderTransitionKind::AcrossBridge
             | MarketOrderTransitionKind::CctpBridge
             | MarketOrderTransitionKind::HyperliquidBridgeDeposit
+            | MarketOrderTransitionKind::HypercoreBridgeDeposit
             | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
                 self.live_bridge_cost_snapshot(transition, refreshed_at, expires_at, pricing)
                     .await
@@ -328,7 +336,23 @@ impl RouteCostService {
                     )
                 }
             };
+        let quoted_fee_usd_micros = match quote_value_loss_usd_micros(
+            amount_in,
+            input_asset,
+            amount_out,
+            output_asset,
+            pricing,
+        ) {
+            Some(value) => value,
+            None => {
+                return LiveCostSnapshotOutcome::Failed(
+                    "could not convert provider value loss to usd micros".to_string(),
+                )
+            }
+        };
         let estimated_fee_bps = quoted_fee_bps.max(estimate.estimated_fee_bps);
+        let estimated_fee_usd_micros =
+            quoted_fee_usd_micros.max(estimate.estimated_fee_usd_micros);
 
         LiveCostSnapshotOutcome::Succeeded(Box::new(RouteCostSnapshot {
             transition_id: transition.id.clone(),
@@ -338,6 +362,7 @@ impl RouteCostService {
             source_asset: transition.input.asset.clone(),
             destination_asset: transition.output.asset.clone(),
             estimated_fee_bps,
+            estimated_fee_usd_micros,
             estimated_gas_usd_micros: estimate.estimated_gas_usd_micros,
             estimated_latency_ms: estimate.estimated_latency_ms,
             sample_amount_usd_micros: DEFAULT_SAMPLE_AMOUNT_USD_MICROS,
@@ -409,24 +434,27 @@ pub fn path_score(
     snapshots: &HashMap<String, RouteCostSnapshot>,
 ) -> RoutePathCostScore {
     let mut missing_edges = 0_usize;
-    let mut total_effective_cost_bps = 0_u64;
+    let mut total_effective_cost_usd_micros = 0_u64;
     let mut total_latency_ms = 0_u64;
 
     for transition in &path.transitions {
         if let Some(snapshot) = snapshots.get(&transition.id) {
-            total_effective_cost_bps =
-                capped_add_u64(total_effective_cost_bps, snapshot.effective_cost_bps());
+            total_effective_cost_usd_micros = capped_add_u64(
+                total_effective_cost_usd_micros,
+                snapshot.effective_cost_usd_micros(),
+            );
             total_latency_ms = capped_add_u64(total_latency_ms, snapshot.estimated_latency_ms);
         } else {
             missing_edges = missing_edges.saturating_add(1);
-            total_effective_cost_bps = capped_add_u64(total_effective_cost_bps, u64::MAX / 4);
+            total_effective_cost_usd_micros =
+                capped_add_u64(total_effective_cost_usd_micros, u64::MAX / 4);
             total_latency_ms = capped_add_u64(total_latency_ms, u64::MAX / 4);
         }
     }
 
     RoutePathCostScore {
         missing_edges,
-        total_effective_cost_bps,
+        total_effective_cost_usd_micros,
         total_latency_ms,
     }
 }
@@ -436,23 +464,24 @@ fn path_score_with_structural_fallback(
     snapshots: &HashMap<String, RouteCostSnapshot>,
     pricing: &PricingSnapshot,
 ) -> RoutePathCostScore {
-    let mut total_effective_cost_bps = 0_u64;
+    let mut total_effective_cost_usd_micros = 0_u64;
     let mut total_latency_ms = 0_u64;
 
     for transition in &path.transitions {
         if let Some(snapshot) = snapshots.get(&transition.id) {
-            total_effective_cost_bps =
-                capped_add_u64(total_effective_cost_bps, snapshot.effective_cost_bps());
+            total_effective_cost_usd_micros = capped_add_u64(
+                total_effective_cost_usd_micros,
+                snapshot.effective_cost_usd_micros(),
+            );
             total_latency_ms = capped_add_u64(total_latency_ms, snapshot.estimated_latency_ms);
         } else {
             let estimate = structural_cost_estimate(transition, pricing);
-            let gas_bps = gas_cost_bps(
-                estimate.estimated_gas_usd_micros,
-                DEFAULT_SAMPLE_AMOUNT_USD_MICROS,
-            );
-            total_effective_cost_bps = capped_add_u64(
-                total_effective_cost_bps,
-                capped_add_u64(estimate.estimated_fee_bps, gas_bps),
+            total_effective_cost_usd_micros = capped_add_u64(
+                total_effective_cost_usd_micros,
+                capped_add_u64(
+                    estimate.estimated_fee_usd_micros,
+                    estimate.estimated_gas_usd_micros,
+                ),
             );
             total_latency_ms = capped_add_u64(total_latency_ms, estimate.estimated_latency_ms);
         }
@@ -460,7 +489,7 @@ fn path_score_with_structural_fallback(
 
     RoutePathCostScore {
         missing_edges: 0,
-        total_effective_cost_bps,
+        total_effective_cost_usd_micros,
         total_latency_ms,
     }
 }
@@ -481,13 +510,13 @@ fn compare_path_scores(
 ) -> std::cmp::Ordering {
     (
         left_score.missing_edges,
-        left_score.total_effective_cost_bps,
+        left_score.total_effective_cost_usd_micros,
         left_score.total_latency_ms,
         left_len,
     )
         .cmp(&(
             right_score.missing_edges,
-            right_score.total_effective_cost_bps,
+            right_score.total_effective_cost_usd_micros,
             right_score.total_latency_ms,
             right_len,
         ))
@@ -508,6 +537,7 @@ fn structural_cost_snapshot(
         source_asset: transition.input.asset.clone(),
         destination_asset: transition.output.asset.clone(),
         estimated_fee_bps: estimate.estimated_fee_bps,
+        estimated_fee_usd_micros: estimate.estimated_fee_usd_micros,
         estimated_gas_usd_micros: estimate.estimated_gas_usd_micros,
         estimated_latency_ms: estimate.estimated_latency_ms,
         sample_amount_usd_micros: DEFAULT_SAMPLE_AMOUNT_USD_MICROS,
@@ -520,6 +550,7 @@ fn structural_cost_snapshot(
 #[derive(Debug, Clone, Copy)]
 struct StructuralCostEstimate {
     estimated_fee_bps: u64,
+    estimated_fee_usd_micros: u64,
     estimated_gas_usd_micros: u64,
     estimated_latency_ms: u64,
     quote_source: &'static str,
@@ -532,6 +563,10 @@ fn structural_cost_estimate(
     match transition.kind {
         MarketOrderTransitionKind::AcrossBridge => StructuralCostEstimate {
             estimated_fee_bps: 6,
+            estimated_fee_usd_micros: fee_usd_micros_from_bps(
+                6,
+                DEFAULT_SAMPLE_AMOUNT_USD_MICROS,
+            ),
             estimated_gas_usd_micros: structural_gas_usd_micros(
                 pricing,
                 &transition.input.asset.chain,
@@ -542,6 +577,7 @@ fn structural_cost_estimate(
         },
         MarketOrderTransitionKind::CctpBridge => StructuralCostEstimate {
             estimated_fee_bps: 0,
+            estimated_fee_usd_micros: 0,
             estimated_gas_usd_micros: capped_add_u64(
                 structural_gas_usd_micros(pricing, &transition.input.asset.chain, 300_000),
                 structural_gas_usd_micros(pricing, &transition.output.asset.chain, 300_000),
@@ -552,26 +588,37 @@ fn structural_cost_estimate(
         MarketOrderTransitionKind::UnitDeposit | MarketOrderTransitionKind::UnitWithdrawal => {
             StructuralCostEstimate {
                 estimated_fee_bps: 0,
+                estimated_fee_usd_micros: 0,
                 estimated_gas_usd_micros: 0,
                 estimated_latency_ms: 60_000,
                 quote_source: "static_unit_anchor_seed",
             }
         }
         MarketOrderTransitionKind::HyperliquidBridgeDeposit
+        | MarketOrderTransitionKind::HypercoreBridgeDeposit
         | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => StructuralCostEstimate {
             estimated_fee_bps: 0,
+            estimated_fee_usd_micros: 0,
             estimated_gas_usd_micros: 0,
             estimated_latency_ms: 30_000,
             quote_source: "static_hyperliquid_bridge_seed",
         },
         MarketOrderTransitionKind::HyperliquidTrade => StructuralCostEstimate {
             estimated_fee_bps: 4,
+            estimated_fee_usd_micros: fee_usd_micros_from_bps(
+                4,
+                DEFAULT_SAMPLE_AMOUNT_USD_MICROS,
+            ),
             estimated_gas_usd_micros: 0,
             estimated_latency_ms: 1_500,
             quote_source: "static_hyperliquid_spot_seed",
         },
         MarketOrderTransitionKind::UniversalRouterSwap => StructuralCostEstimate {
             estimated_fee_bps: 25,
+            estimated_fee_usd_micros: fee_usd_micros_from_bps(
+                25,
+                DEFAULT_SAMPLE_AMOUNT_USD_MICROS,
+            ),
             estimated_gas_usd_micros: structural_gas_usd_micros(
                 pricing,
                 &transition.input.asset.chain,
@@ -611,10 +658,14 @@ fn structural_gas_usd_micros(
     chain: &crate::protocol::ChainId,
     gas_units: u64,
 ) -> u64 {
+    let Some(gas_price_wei) = pricing.try_chain_gas_price_wei(chain) else {
+        return u64::MAX;
+    };
     pricing
-        .checked_wei_to_usd_micro(
+        .checked_native_gas_wei_to_usd_micro(
+            chain,
             U256::from(gas_units)
-                .checked_mul(pricing.chain_gas_price_wei(chain))
+                .checked_mul(gas_price_wei)
                 .unwrap_or(U256::MAX),
         )
         .and_then(|value| value.try_into().ok())
@@ -633,6 +684,18 @@ fn quote_value_loss_bps(
     loss_bps(input_usd_micro, output_usd_micro)
 }
 
+fn quote_value_loss_usd_micros(
+    amount_in: U256,
+    input_asset: &ChainAsset,
+    amount_out: U256,
+    output_asset: &ChainAsset,
+    pricing: &PricingSnapshot,
+) -> Option<u64> {
+    let input_usd_micro = raw_amount_usd_micros(amount_in, input_asset, pricing)?;
+    let output_usd_micro = raw_amount_usd_micros(amount_out, output_asset, pricing)?;
+    loss_usd_micros(input_usd_micro, output_usd_micro)
+}
+
 fn raw_amount_usd_micros(
     raw_amount: U256,
     chain_asset: &ChainAsset,
@@ -640,6 +703,14 @@ fn raw_amount_usd_micros(
 ) -> Option<U256> {
     let asset_usd_micro = U256::from(pricing.canonical_asset_usd_micro(chain_asset.canonical)?);
     Some(raw_amount.checked_mul(asset_usd_micro)? / checked_pow10(chain_asset.decimals)?)
+}
+
+fn loss_usd_micros(value_in: U256, value_out: U256) -> Option<u64> {
+    if value_out >= value_in {
+        return Some(0);
+    }
+    let loss = value_in.checked_sub(value_out)?;
+    u256_to_u64_saturating(loss)
 }
 
 fn loss_bps(value_in: U256, value_out: U256) -> Option<u64> {
@@ -657,13 +728,22 @@ fn loss_bps(value_in: U256, value_out: U256) -> Option<u64> {
     .map(|bps| bps.min(BPS_DENOMINATOR))
 }
 
-fn gas_cost_bps(gas_usd_micros: u64, sample_amount_usd_micros: u64) -> u64 {
+fn fee_usd_micros_from_bps(fee_bps: u64, sample_amount_usd_micros: u64) -> u64 {
     div_ceil_u512_to_u64(
-        U512::from(gas_usd_micros) * U512::from(BPS_DENOMINATOR),
+        U512::from(sample_amount_usd_micros) * U512::from(fee_bps),
+        U512::from(BPS_DENOMINATOR),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+fn usd_cost_bps(cost_usd_micros: u64, sample_amount_usd_micros: u64) -> u64 {
+    div_ceil_u512_to_u64(
+        U512::from(cost_usd_micros) * U512::from(BPS_DENOMINATOR),
         U512::from(sample_amount_usd_micros),
     )
     .unwrap_or(u64::MAX)
 }
+
 
 fn div_ceil_u512_to_u64(numerator: U512, denominator: U512) -> Option<u64> {
     if denominator.is_zero() {
@@ -674,6 +754,13 @@ fn div_ceil_u512_to_u64(numerator: U512, denominator: U512) -> Option<u64> {
     }
     let value = (numerator - U512::from(1_u64)) / denominator + U512::from(1_u64);
     if value > U512::from(u64::MAX) {
+        return Some(u64::MAX);
+    }
+    value.to_string().parse::<u64>().ok()
+}
+
+fn u256_to_u64_saturating(value: U256) -> Option<u64> {
+    if value > U256::from(u64::MAX) {
         return Some(u64::MAX);
     }
     value.to_string().parse::<u64>().ok()
@@ -706,8 +793,13 @@ mod tests {
                 MarketOrderTransitionKind::HyperliquidTrade => ProviderId::Hyperliquid,
                 MarketOrderTransitionKind::UniversalRouterSwap => ProviderId::Velora,
                 MarketOrderTransitionKind::HyperliquidBridgeDeposit
+                | MarketOrderTransitionKind::HypercoreBridgeDeposit
                 | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
-                    ProviderId::HyperliquidBridge
+                    if kind == MarketOrderTransitionKind::HypercoreBridgeDeposit {
+                        ProviderId::HypercoreBridge
+                    } else {
+                        ProviderId::HyperliquidBridge
+                    }
                 }
                 MarketOrderTransitionKind::UnitDeposit
                 | MarketOrderTransitionKind::UnitWithdrawal => ProviderId::Unit,
@@ -744,6 +836,7 @@ mod tests {
             source_asset: asset("evm:1"),
             destination_asset: asset("evm:8453"),
             estimated_fee_bps: 5,
+            estimated_fee_usd_micros: 500_000,
             estimated_gas_usd_micros: 1_000_000,
             estimated_latency_ms: 1,
             sample_amount_usd_micros: 1_000_000_000,
@@ -752,6 +845,7 @@ mod tests {
             expires_at: Utc::now(),
         };
 
+        assert_eq!(snapshot.effective_cost_usd_micros(), 1_500_000);
         assert_eq!(snapshot.effective_cost_bps(), 15);
     }
 
@@ -765,6 +859,7 @@ mod tests {
             source_asset: asset("evm:1"),
             destination_asset: asset("evm:8453"),
             estimated_fee_bps: 5,
+            estimated_fee_usd_micros: 1,
             estimated_gas_usd_micros: u64::MAX,
             estimated_latency_ms: 1,
             sample_amount_usd_micros: 1,
@@ -793,6 +888,7 @@ mod tests {
                 source_asset: expensive.input.asset.clone(),
                 destination_asset: expensive.output.asset.clone(),
                 estimated_fee_bps: 20,
+                estimated_fee_usd_micros: 2_000_000,
                 estimated_gas_usd_micros: 0,
                 estimated_latency_ms: 1,
                 sample_amount_usd_micros: DEFAULT_SAMPLE_AMOUNT_USD_MICROS,
@@ -812,6 +908,7 @@ mod tests {
                     source_asset: transition.input.asset.clone(),
                     destination_asset: transition.output.asset.clone(),
                     estimated_fee_bps: 4,
+                    estimated_fee_usd_micros: 400_000,
                     estimated_gas_usd_micros: 0,
                     estimated_latency_ms: 1,
                     sample_amount_usd_micros: DEFAULT_SAMPLE_AMOUNT_USD_MICROS,
@@ -826,8 +923,149 @@ mod tests {
         let two_hop = path("two_hop", vec![cheap_a, cheap_b]);
 
         assert!(
-            path_score(&two_hop, &snapshots).total_effective_cost_bps
-                < path_score(&one_hop, &snapshots).total_effective_cost_bps
+            path_score(&two_hop, &snapshots).total_effective_cost_usd_micros
+                < path_score(&one_hop, &snapshots).total_effective_cost_usd_micros
+        );
+    }
+    #[test]
+    fn path_score_prefers_hyperevm_route_when_micro_usd_costs_are_lower() {
+        let cctp_arb = transition("cctp_to_arb", MarketOrderTransitionKind::CctpBridge);
+        let hl_bridge = transition(
+            "arb_hl_bridge",
+            MarketOrderTransitionKind::HyperliquidBridgeDeposit,
+        );
+        let cctp_hyperevm = transition("cctp_to_hyperevm", MarketOrderTransitionKind::CctpBridge);
+        let hypercore_bridge = transition(
+            "hyperevm_hypercore_bridge",
+            MarketOrderTransitionKind::HypercoreBridgeDeposit,
+        );
+        let trade = transition("trade", MarketOrderTransitionKind::HyperliquidTrade);
+        let withdraw = transition("withdraw", MarketOrderTransitionKind::UnitWithdrawal);
+        let now = Utc::now();
+        let mut snapshots = HashMap::new();
+        snapshots.insert(
+            cctp_arb.id.clone(),
+            RouteCostSnapshot {
+                transition_id: cctp_arb.id.clone(),
+                amount_bucket: DEFAULT_AMOUNT_BUCKET.to_string(),
+                provider: "cctp".to_string(),
+                edge_kind: "cross_chain_transfer".to_string(),
+                source_asset: cctp_arb.input.asset.clone(),
+                destination_asset: cctp_arb.output.asset.clone(),
+                estimated_fee_bps: 0,
+                estimated_fee_usd_micros: 0,
+                estimated_gas_usd_micros: 16_663,
+                estimated_latency_ms: 60_000,
+                sample_amount_usd_micros: DEFAULT_SAMPLE_AMOUNT_USD_MICROS,
+                quote_source: "test".to_string(),
+                refreshed_at: now,
+                expires_at: now,
+            },
+        );
+        snapshots.insert(
+            hl_bridge.id.clone(),
+            RouteCostSnapshot {
+                transition_id: hl_bridge.id.clone(),
+                amount_bucket: DEFAULT_AMOUNT_BUCKET.to_string(),
+                provider: "hyperliquid_bridge".to_string(),
+                edge_kind: "cross_chain_transfer".to_string(),
+                source_asset: hl_bridge.input.asset.clone(),
+                destination_asset: hl_bridge.output.asset.clone(),
+                estimated_fee_bps: 0,
+                estimated_fee_usd_micros: 0,
+                estimated_gas_usd_micros: 0,
+                estimated_latency_ms: 30_000,
+                sample_amount_usd_micros: DEFAULT_SAMPLE_AMOUNT_USD_MICROS,
+                quote_source: "test".to_string(),
+                refreshed_at: now,
+                expires_at: now,
+            },
+        );
+        snapshots.insert(
+            cctp_hyperevm.id.clone(),
+            RouteCostSnapshot {
+                transition_id: cctp_hyperevm.id.clone(),
+                amount_bucket: DEFAULT_AMOUNT_BUCKET.to_string(),
+                provider: "cctp".to_string(),
+                edge_kind: "cross_chain_transfer".to_string(),
+                source_asset: cctp_hyperevm.input.asset.clone(),
+                destination_asset: cctp_hyperevm.output.asset.clone(),
+                estimated_fee_bps: 0,
+                estimated_fee_usd_micros: 0,
+                estimated_gas_usd_micros: 8_264,
+                estimated_latency_ms: 60_000,
+                sample_amount_usd_micros: DEFAULT_SAMPLE_AMOUNT_USD_MICROS,
+                quote_source: "test".to_string(),
+                refreshed_at: now,
+                expires_at: now,
+            },
+        );
+        snapshots.insert(
+            hypercore_bridge.id.clone(),
+            RouteCostSnapshot {
+                transition_id: hypercore_bridge.id.clone(),
+                amount_bucket: DEFAULT_AMOUNT_BUCKET.to_string(),
+                provider: "hypercore_bridge".to_string(),
+                edge_kind: "cross_chain_transfer".to_string(),
+                source_asset: hypercore_bridge.input.asset.clone(),
+                destination_asset: hypercore_bridge.output.asset.clone(),
+                estimated_fee_bps: 0,
+                estimated_fee_usd_micros: 0,
+                estimated_gas_usd_micros: 0,
+                estimated_latency_ms: 30_000,
+                sample_amount_usd_micros: DEFAULT_SAMPLE_AMOUNT_USD_MICROS,
+                quote_source: "test".to_string(),
+                refreshed_at: now,
+                expires_at: now,
+            },
+        );
+        for transition in [&trade, &withdraw] {
+            snapshots.insert(
+                transition.id.clone(),
+                RouteCostSnapshot {
+                    transition_id: transition.id.clone(),
+                    amount_bucket: DEFAULT_AMOUNT_BUCKET.to_string(),
+                    provider: transition.provider.as_str().to_string(),
+                    edge_kind: transition.route_edge_kind().as_str().to_string(),
+                    source_asset: transition.input.asset.clone(),
+                    destination_asset: transition.output.asset.clone(),
+                    estimated_fee_bps: if transition.kind == MarketOrderTransitionKind::HyperliquidTrade {
+                        4
+                    } else {
+                        0
+                    },
+                    estimated_fee_usd_micros: if transition.kind
+                        == MarketOrderTransitionKind::HyperliquidTrade
+                    {
+                        400_000
+                    } else {
+                        0
+                    },
+                    estimated_gas_usd_micros: 0,
+                    estimated_latency_ms: if transition.kind
+                        == MarketOrderTransitionKind::HyperliquidTrade
+                    {
+                        1_500
+                    } else {
+                        60_000
+                    },
+                    sample_amount_usd_micros: DEFAULT_SAMPLE_AMOUNT_USD_MICROS,
+                    quote_source: "test".to_string(),
+                    refreshed_at: now,
+                    expires_at: now,
+                },
+            );
+        }
+
+        let arb_path = path("arb", vec![cctp_arb, hl_bridge, trade.clone(), withdraw.clone()]);
+        let hyperevm_path = path(
+            "hyperevm",
+            vec![cctp_hyperevm, hypercore_bridge, trade, withdraw],
+        );
+
+        assert!(
+            path_score(&hyperevm_path, &snapshots).total_effective_cost_usd_micros
+                < path_score(&arb_path, &snapshots).total_effective_cost_usd_micros
         );
     }
 
@@ -862,8 +1100,8 @@ mod tests {
             .expect("Across route should exist");
 
         assert!(
-            structural_path_score(cctp_path, &pricing).total_effective_cost_bps
-                < structural_path_score(across_path, &pricing).total_effective_cost_bps
+            structural_path_score(cctp_path, &pricing).total_effective_cost_usd_micros
+                < structural_path_score(across_path, &pricing).total_effective_cost_usd_micros
         );
     }
 
@@ -1012,7 +1250,7 @@ mod tests {
             .into_iter()
             .find(|path| path.transitions.len() == 1 && path.transitions[0].kind == kind)
             .unwrap_or_else(|| panic!("missing direct {kind:?} path"));
-        structural_path_score(&path, pricing).total_effective_cost_bps
+        structural_path_score(&path, pricing).total_effective_cost_usd_micros
     }
 
     #[test]

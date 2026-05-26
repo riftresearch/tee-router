@@ -3,7 +3,10 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use snafu::Snafu;
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 use tokio::time::sleep;
 use url::Url;
 
@@ -14,6 +17,7 @@ const PRICING_RETRY_ATTEMPTS: usize = 4;
 const PRICING_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(250);
 const MARKET_PRICING_MAX_RESPONSE_BODY_BYTES: usize = 256 * 1024;
 const MARKET_PRICING_MAX_ERROR_PREVIEW_CHARS: usize = 4 * 1024;
+const HYPERLIQUID_INFO_DEFAULT_BASE_URL: &str = "https://api.hyperliquid.xyz";
 
 #[derive(Debug, Snafu)]
 pub enum MarketPricingError {
@@ -90,9 +94,11 @@ pub struct MarketPricingSnapshot {
     pub stable_usd_micro: u64,
     pub eth_usd_micro: u64,
     pub btc_usd_micro: u64,
+    pub hype_usd_micro: Option<u64>,
     pub ethereum_gas_price_wei: u64,
     pub arbitrum_gas_price_wei: u64,
     pub base_gas_price_wei: u64,
+    pub hyperevm_gas_price_wei: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +107,8 @@ pub struct MarketPricingOracleConfig {
     pub ethereum_rpc_url: Url,
     pub arbitrum_rpc_url: Url,
     pub base_rpc_url: Url,
+    pub hyperevm_rpc_url: Option<Url>,
+    pub hyperliquid_api_base_url: Url,
     pub timeout: Duration,
 }
 
@@ -110,12 +118,18 @@ impl MarketPricingOracleConfig {
         ethereum_rpc_url: impl AsRef<str>,
         arbitrum_rpc_url: impl AsRef<str>,
         base_rpc_url: impl AsRef<str>,
+        hyperevm_rpc_url: Option<&str>,
+        hyperliquid_api_base_url: Option<&str>,
     ) -> MarketPricingResult<Self> {
         Ok(Self {
             coinbase_api_base_url: parse_http_url(coinbase_api_base_url.as_ref())?,
             ethereum_rpc_url: parse_http_url(ethereum_rpc_url.as_ref())?,
             arbitrum_rpc_url: parse_http_url(arbitrum_rpc_url.as_ref())?,
             base_rpc_url: parse_http_url(base_rpc_url.as_ref())?,
+            hyperevm_rpc_url: hyperevm_rpc_url.map(parse_http_url).transpose()?,
+            hyperliquid_api_base_url: parse_http_url(
+                hyperliquid_api_base_url.unwrap_or(HYPERLIQUID_INFO_DEFAULT_BASE_URL),
+            )?,
             timeout: Duration::from_secs(10),
         })
     }
@@ -160,17 +174,23 @@ impl MarketPricingOracle {
             self.evm_gas_price_wei("arbitrum", &self.config.arbitrum_rpc_url),
             self.evm_gas_price_wei("base", &self.config.base_rpc_url),
         )?;
+        let (hype_usd_micro, hyperevm_gas_price_wei) = tokio::join!(
+            self.optional_hyperliquid_hype_usd_micro(),
+            self.optional_hyperevm_gas_price_wei(),
+        );
 
         Ok(MarketPricingSnapshot {
-            source: "coinbase_spot_plus_rpc_eth_gas_price_v1".to_string(),
+            source: "coinbase_spot_plus_rpc_gas_with_optional_hyperevm_hype_v1".to_string(),
             captured_at,
             expires_at: None,
             stable_usd_micro,
             eth_usd_micro,
             btc_usd_micro,
+            hype_usd_micro,
             ethereum_gas_price_wei,
             arbitrum_gas_price_wei,
             base_gas_price_wei,
+            hyperevm_gas_price_wei,
         })
     }
 
@@ -209,6 +229,36 @@ impl MarketPricingOracle {
         let value = parse_usd_micro(&response.data.amount)?;
         ensure_positive_price(&format!("coinbase {product_id}"), value)?;
         Ok(value)
+    }
+
+    async fn optional_hyperliquid_hype_usd_micro(&self) -> Option<u64> {
+        self.hyperliquid_hype_usd_micro().await.ok()
+    }
+
+    async fn hyperliquid_hype_usd_micro(&self) -> MarketPricingResult<u64> {
+        let url = join_url(&self.config.hyperliquid_api_base_url, "/info")?;
+        let response: HashMap<String, String> = post_json(
+            &self.http,
+            url,
+            &json!({ "type": "allMids" }),
+            "hyperliquid",
+            "POST",
+            "/info",
+        )
+        .await?;
+        let raw = response.get("HYPE").ok_or_else(|| MarketPricingError::InvalidRpc {
+            url: sanitized_parsed_url_for_error(&self.config.hyperliquid_api_base_url),
+            reason: "allMids response missing HYPE".to_string(),
+            body: error_text_preview(&serde_json::to_string(&response).unwrap_or_default()),
+        })?;
+        let value = parse_usd_micro(raw)?;
+        ensure_positive_price("hyperliquid HYPE", value)?;
+        Ok(value)
+    }
+
+    async fn optional_hyperevm_gas_price_wei(&self) -> Option<u64> {
+        let rpc_url = self.config.hyperevm_rpc_url.as_ref()?;
+        self.evm_gas_price_wei("hyperevm", rpc_url).await.ok()
     }
 
     async fn evm_gas_price_wei(
@@ -329,6 +379,57 @@ struct CoinbaseSpotPriceData {
 struct JsonRpcResponse {
     result: Option<Value>,
     error: Option<Value>,
+}
+async fn post_json<T>(
+    http: &reqwest::Client,
+    url: Url,
+    request_body: &impl Serialize,
+    venue: &'static str,
+    method: &'static str,
+    endpoint: &'static str,
+) -> MarketPricingResult<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let started = Instant::now();
+    let response = match http.post(url.clone()).json(request_body).send().await {
+        Ok(response) => response,
+        Err(source) => {
+            record_venue_request(
+                venue,
+                method,
+                endpoint,
+                "transport_error",
+                started.elapsed(),
+            );
+            return Err(MarketPricingError::Http {
+                source: source.without_url(),
+            });
+        }
+    };
+    let sanitized_url = sanitized_parsed_url_for_error(&url);
+    let status = response.status();
+    record_venue_request(
+        venue,
+        method,
+        endpoint,
+        status_class(status),
+        started.elapsed(),
+    );
+    let body =
+        read_limited_response_text(response, MARKET_PRICING_MAX_RESPONSE_BODY_BYTES, &url).await?;
+    if !status.is_success() {
+        return Err(MarketPricingError::HttpStatus {
+            url: sanitized_url,
+            status,
+            body: error_text_preview(&body),
+        });
+    }
+    serde_json::from_str(&body).map_err(|source| MarketPricingError::InvalidJson {
+        url: sanitized_url,
+        source,
+        body: error_text_preview(&body),
+    })
 }
 
 async fn get_json<T>(
@@ -650,6 +751,8 @@ mod tests {
             "https://eth.example.com",
             "https://arb.example.com",
             "https://base.example.com",
+            Some("https://hyperevm.example.com"),
+            None,
         )
         .unwrap_err();
         assert!(
@@ -662,6 +765,8 @@ mod tests {
             "https://user:pass@eth.example.com",
             "https://arb.example.com",
             "https://base.example.com",
+            Some("https://hyperevm.example.com"),
+            None,
         )
         .unwrap_err();
         assert!(
@@ -682,6 +787,8 @@ mod tests {
             "https://eth.example.com",
             "https://arb.example.com",
             "https://base.example.com",
+            Some("https://hyperevm.example.com"),
+            None,
         )
         .unwrap_err();
         assert!(
@@ -812,6 +919,8 @@ mod tests {
             ethereum_rpc_url,
             env::var("ARBITRUM_RPC_URL").expect("ARBITRUM_RPC_URL"),
             env::var("BASE_RPC_URL").expect("BASE_RPC_URL"),
+            Some(&env::var("HYPEREVM_RPC_URL").expect("HYPEREVM_RPC_URL")),
+            None,
         )
         .unwrap();
         let snapshot = MarketPricingOracle::new(config)
@@ -823,8 +932,10 @@ mod tests {
         assert!(snapshot.eth_usd_micro > 0);
         assert!(snapshot.btc_usd_micro > 0);
         assert!(snapshot.stable_usd_micro > 0);
+        assert!(snapshot.hype_usd_micro.is_some_and(|value| value > 0));
         assert!(snapshot.ethereum_gas_price_wei > 0);
         assert!(snapshot.arbitrum_gas_price_wei > 0);
         assert!(snapshot.base_gas_price_wei > 0);
-    }
+        assert!(snapshot.hyperevm_gas_price_wei.is_some_and(|value| value > 0));
+}
 }
