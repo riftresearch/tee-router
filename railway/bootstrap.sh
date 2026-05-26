@@ -509,20 +509,30 @@ apply_service_cfg victoriametrics-v3 \
 set_var alloy-v3 "PORT=4318"
 set_var grafana-v3 "PORT=3000"
 
-# --- Upstream SOCKS5 proxy (managed, Europe) ---------------------------------
-# Shared fallback egress proxy for router upstreams. The service name is legacy
-# from the original HyperUnit-only proxy path; keep it stable unless doing an
-# explicit Railway migration. Image: serjs/go-socks5-proxy, auth required, port
-# 1080, pinned to Railway Europe (EU-West Metal / AMS).
+# --- SOCKS5 proxies -----------------------------------------------------------
+# General fallback egress proxy for router upstreams. Image: serjs/go-socks5-proxy,
+# auth required, port 1080, normal Railway region.
+if ! svc_exists upstream-socks5-proxy-v3; then
+  log "creating upstream-socks5-proxy-v3 (image)"
+  railway add --service upstream-socks5-proxy-v3 --image serjs/go-socks5-proxy:latest  # VERIFY
+  remember_svc upstream-socks5-proxy-v3
+fi
+# PROXY_USER/PROXY_PASSWORD from railway/env/upstream-socks5-proxy.env;
+# REQUIRE_AUTH enforces username/password as the access boundary. Phala consumes
+# this service's public TCP proxy as UPSTREAM_PROXY_URL.
+set_var upstream-socks5-proxy-v3 "REQUIRE_AUTH=true"
+set_var upstream-socks5-proxy-v3 "PROXY_PORT=1080"
+
+# Dedicated HyperUnit egress proxy. Keep this Europe-pinned and do not use it as
+# the general UPSTREAM_PROXY_URL fallback.
 if ! svc_exists hyperunit-socks5-proxy-v3; then
   log "creating hyperunit-socks5-proxy-v3 (image, Europe)"
   railway add --service hyperunit-socks5-proxy-v3 --image serjs/go-socks5-proxy:latest  # VERIFY
   remember_svc hyperunit-socks5-proxy-v3
 fi
 # PROXY_USER/PROXY_PASSWORD from railway/env/hyperunit-socks5-proxy.env;
-# REQUIRE_AUTH enforces username/password as the access boundary. Phala consumes
-# the public TCP proxy as UPSTREAM_PROXY_URL; sauron-worker-v3 still consumes the
-# same service as HYPERUNIT_PROXY_URL for its HyperUnit observer.
+# REQUIRE_AUTH enforces username/password as the access boundary. Phala and
+# sauron-worker-v3 consume this service as HYPERUNIT_PROXY_URL.
 set_var hyperunit-socks5-proxy-v3 "REQUIRE_AUTH=true"
 set_var hyperunit-socks5-proxy-v3 "PROXY_PORT=1080"
 # Pin to Railway Europe (Netherlands / EU-West).  VERIFY: region id current.
@@ -552,6 +562,7 @@ SERVICE_ENV_FILES=(
   "explorer-v3|explorer.env"
   "router-physical-standby-v3|router-physical-standby.env"
   "router-replica-stunnel-v3|router-replica-stunnel.env"
+  "upstream-socks5-proxy-v3|upstream-socks5-proxy.env"
   "hyperunit-socks5-proxy-v3|hyperunit-socks5-proxy.env"
   "sauron-bitcoin-rathole-broker-v3|sauron-bitcoin-rathole-broker.env"
 )

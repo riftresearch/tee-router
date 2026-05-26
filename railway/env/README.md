@@ -61,7 +61,8 @@ file. Services: `sauron`, `hl-shim-indexer`,
 `bitcoin-receipt-watcher`, `evm-token-indexer-{ethereum,base,arbitrum}`,
 `router-gateway`, `admin-dashboard`, `explorer`,
 `router-physical-standby`, `router-replica-stunnel`,
-`hyperunit-socks5-proxy`, `sauron-bitcoin-rathole-broker`.
+`upstream-socks5-proxy`, `hyperunit-socks5-proxy`,
+`sauron-bitcoin-rathole-broker`.
 
 ## Procurement status (truly-external, cannot generate)
 
