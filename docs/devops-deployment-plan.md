@@ -74,12 +74,12 @@ Railway runs every observer, indexer, watcher, and operator-facing service:
 - `victoriametrics-v3` — sole metrics TSDB
 - `loki-v3` — log store
 - `grafana-v3` — observability UI (VictoriaMetrics + Loki datasources)
-- `hyperunit-socks5-proxy-v3` — **managed** dedicated SOCKS5 egress proxy
-  for HyperUnit only, image `serjs/go-socks5-proxy`, auth-required, port
-  1080, **pinned to Railway Europe** (EU-West Metal / Amsterdam). Created by
-  `bootstrap.sh`. (NB: a *general/fallback* upstream proxy for services
-  without a dedicated one is the `feat/upstream-proxy` work — not in `main`;
-  its managed entry is added when that branch merges.)
+- `hyperunit-socks5-proxy-v3` — **managed** SOCKS5 egress proxy, image
+  `serjs/go-socks5-proxy`, auth-required, port 1080, **pinned to Railway
+  Europe** (EU-West Metal / Amsterdam). The service name is legacy from the
+  original HyperUnit-only path, but the router now treats it as the shared
+  fallback upstream proxy via `UPSTREAM_PROXY_URL`; provider-specific
+  `*_PROXY_URL` values override it when needed.
 - `sauron-bitcoin-rathole-broker-v3` — **managed** rathole broker (repo
   `etc/Dockerfile.rathole-broker`) brokering Bitcoin RPC/ZMQ for Sauron.
   Public domain = rathole websocket control plane; data ports 40031/2/3/4 stay
@@ -91,8 +91,8 @@ canvas group, but the group metadata is not required by runtime config and is
 not currently visible through the Railway CLI.
 
 Every v3 service is managed by `bootstrap.sh` — **there are no
-reuse-an-existing-Railway-service exceptions**. (Both the HyperUnit proxy
-and the Sauron Bitcoin rathole broker are now managed v3 services:
+reuse-an-existing-Railway-service exceptions**. (Both the upstream SOCKS5 proxy
+and the Sauron Bitcoin rathole broker are managed v3 services:
 `hyperunit-socks5-proxy-v3`, `sauron-bitcoin-rathole-broker-v3`.)
 
 ## Service Topology Overview
@@ -131,7 +131,7 @@ and the Sauron Bitcoin rathole broker are now managed v3 services:
 | victoriametrics-v3 | Railway | `victoriametrics/victoria-metrics` | Metrics TSDB |
 | loki-v3 | Railway | `grafana/loki` | Log store |
 | grafana-v3 | Railway | `grafana/grafana` | Observability UI |
-| hyperunit-socks5-proxy-v3 | Railway (Europe) | image `serjs/go-socks5-proxy` | Managed dedicated SOCKS5 egress for HyperUnit (auth, :1080) |
+| hyperunit-socks5-proxy-v3 | Railway (Europe) | image `serjs/go-socks5-proxy` | Shared SOCKS5 egress fallback for router upstreams (`UPSTREAM_PROXY_URL`), plus HyperUnit override |
 | sauron-bitcoin-rathole-broker-v3 | Railway | repo `etc/Dockerfile.rathole-broker` | Managed rathole broker — Bitcoin RPC/ZMQ transport for Sauron |
 
 ## Router API And Worker
@@ -646,12 +646,24 @@ explorer UI. It is read-only and consumes router state through whatever
 public surface is appropriate (TBD: confirm whether it talks directly to
 router-api, to router-gateway, or to the standby).
 
-## HyperUnit SOCKS5 Proxy
+## Upstream SOCKS5 Proxy
 
 `hyperunit-socks5-proxy-v3` is a **managed** Railway service (created by
-`bootstrap.sh`, image `serjs/go-socks5-proxy`, pinned to Europe). It is the
-**dedicated** egress for HyperUnit only. A general/fallback proxy for other
-upstreams is separate (`feat/upstream-proxy`, not in `main`).
+`bootstrap.sh`, image `serjs/go-socks5-proxy`, pinned to Europe). It started as
+the dedicated HyperUnit egress path, but the router now has a generalized
+upstream proxy layer. Treat this service as the shared production fallback
+proxy unless a provider needs a dedicated egress endpoint.
+
+Router API and router-worker resolve proxies in this order:
+
+1. Provider/chain-specific override, e.g. `CCTP_PROXY_URL`,
+   `BASE_RPC_PROXY_URL`, or `COINBASE_PROXY_URL`.
+2. Shared fallback `UPSTREAM_PROXY_URL`.
+3. No proxy.
+
+With `PRODUCTION=true`, startup rejects any configured upstream that has neither
+a specific proxy nor `UPSTREAM_PROXY_URL`. This includes RPCs, Esplora, provider
+APIs, Chainalysis, Coinbase pricing, and optional HyperEVM if enabled.
 
 Requirements:
 
@@ -665,13 +677,38 @@ Requirements:
 - generate a fresh random proxy password during deployment and store it only
   as Railway/Phala secret material
 
-Router-worker uses:
+Primary Phala secret:
 
 ```text
-HYPERUNIT_PROXY_URL=socks5://<user>:<password>@<public-proxy-host>:<port>
+UPSTREAM_PROXY_URL=socks5://<user>:<password>@<public-proxy-host>:<port>
 ```
 
-The router expects `socks5://`, not `socks5h://`.
+Supported router-specific overrides:
+
+```text
+ETH_RPC_PROXY_URL
+BASE_RPC_PROXY_URL
+ARBITRUM_RPC_PROXY_URL
+HYPEREVM_RPC_PROXY_URL
+BITCOIN_RPC_PROXY_URL
+ESPLORA_PROXY_URL
+ACROSS_PROXY_URL
+CCTP_PROXY_URL
+HYPERUNIT_PROXY_URL
+HYPERLIQUID_PROXY_URL
+VELORA_PROXY_URL
+CHAINALYSIS_PROXY_URL
+COINBASE_PROXY_URL
+```
+
+Set an override only when that upstream needs a different egress path from the
+shared fallback. The router expects `socks5://`, not `socks5h://`; proxy URLs
+must include host and port and must not include path, query, or fragment
+components.
+
+Sauron still has its own HyperUnit client path; set `HYPERUNIT_PROXY_URL` for
+`sauron-worker-v3` to the same proxy unless it intentionally uses a dedicated
+one.
 
 ## Bitcoin RPC/ZMQ Transport
 
@@ -722,7 +759,13 @@ Router API and worker need the same core config:
 - `ACROSS_API_URL`, `ACROSS_API_KEY`, `ACROSS_INTEGRATOR_ID`
 - `CCTP_API_URL` if overriding Circle Iris default,
   `CCTP_TOKEN_MESSENGER_V2_ADDRESS`, `CCTP_MESSAGE_TRANSMITTER_V2_ADDRESS`
-- `HYPERUNIT_API_URL`, `HYPERUNIT_PROXY_URL`
+- `UPSTREAM_PROXY_URL` shared SOCKS5 fallback, plus optional per-upstream
+  overrides: `ETH_RPC_PROXY_URL`, `BASE_RPC_PROXY_URL`,
+  `ARBITRUM_RPC_PROXY_URL`, `HYPEREVM_RPC_PROXY_URL`,
+  `BITCOIN_RPC_PROXY_URL`, `ESPLORA_PROXY_URL`, `ACROSS_PROXY_URL`,
+  `CCTP_PROXY_URL`, `HYPERUNIT_PROXY_URL`, `HYPERLIQUID_PROXY_URL`,
+  `VELORA_PROXY_URL`, `CHAINALYSIS_PROXY_URL`, `COINBASE_PROXY_URL`
+- `HYPERUNIT_API_URL`
 - `HYPERLIQUID_API_URL`, `HYPERLIQUID_NETWORK`,
   `HYPERLIQUID_ORDER_TIMEOUT_MS`
 - `VELORA_API_URL`, `VELORA_PARTNER`
@@ -1114,7 +1157,9 @@ Still to do:
       `victoriametrics-v3`, `loki-v3`, `grafana-v3`; capture the public
       `alloy-v3` URL; verify Railway scrapes and Phala OTLP push.
 - [ ] Set `hyperunit-socks5-proxy-v3` `PROXY_USER`/`PROXY_PASSWORD`
-      (railway/env), confirm Europe region pin + auth-only access boundary.
+      (railway/env), confirm Europe region pin + auth-only access boundary,
+      and wire Phala `UPSTREAM_PROXY_URL` plus any required per-upstream
+      `*_PROXY_URL` overrides.
 - [ ] Deploy `sauron-bitcoin-rathole-broker-v3`; set its 4 `RATHOLE_*`
       tokens (railway/env) and run the matching rathole client on the
       isolated Bitcoin host with identical tokens.

@@ -509,20 +509,20 @@ apply_service_cfg victoriametrics-v3 \
 set_var alloy-v3 "PORT=4318"
 set_var grafana-v3 "PORT=3000"
 
-# --- HyperUnit SOCKS5 proxy (managed, Europe) --------------------------------
-# Dedicated egress proxy for HyperUnit only (see deploy/railway/hyperunit-socks5
-# for the original helper this supersedes). Image: serjs/go-socks5-proxy,
-# auth required, port 1080, pinned to Railway Europe (EU-West Metal / AMS).
-# NOTE: a GENERAL/fallback upstream proxy (services without a dedicated one)
-# is the feat/upstream-proxy work — NOT in main; add its managed entry when
-# that branch merges.
+# --- Upstream SOCKS5 proxy (managed, Europe) ---------------------------------
+# Shared fallback egress proxy for router upstreams. The service name is legacy
+# from the original HyperUnit-only proxy path; keep it stable unless doing an
+# explicit Railway migration. Image: serjs/go-socks5-proxy, auth required, port
+# 1080, pinned to Railway Europe (EU-West Metal / AMS).
 if ! svc_exists hyperunit-socks5-proxy-v3; then
   log "creating hyperunit-socks5-proxy-v3 (image, Europe)"
   railway add --service hyperunit-socks5-proxy-v3 --image serjs/go-socks5-proxy:latest  # VERIFY
   remember_svc hyperunit-socks5-proxy-v3
 fi
 # PROXY_USER/PROXY_PASSWORD from railway/env/hyperunit-socks5-proxy.env;
-# REQUIRE_AUTH enforces username/password as the access boundary.
+# REQUIRE_AUTH enforces username/password as the access boundary. Phala consumes
+# the public TCP proxy as UPSTREAM_PROXY_URL; sauron-worker-v3 still consumes the
+# same service as HYPERUNIT_PROXY_URL for its HyperUnit observer.
 set_var hyperunit-socks5-proxy-v3 "REQUIRE_AUTH=true"
 set_var hyperunit-socks5-proxy-v3 "PROXY_PORT=1080"
 # Pin to Railway Europe (Netherlands / EU-West).  VERIFY: region id current.
