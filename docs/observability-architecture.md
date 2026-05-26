@@ -123,23 +123,24 @@ docker compose \
   -f etc/compose.local-infra.yml \
   -f etc/compose.local-devnet.yml \
   -f etc/compose.local-observability.yml \
+  -f etc/compose.local-devnet-ports.yml \
   up -d
 ```
 
 Local ports:
 
-- Grafana: `http://localhost:3002`
-- Temporal UI: `http://localhost:8080`
-- VictoriaMetrics: `http://localhost:8428`
-- Loki: `http://localhost:3100`
-- Alloy UI: `http://localhost:12345`
-- Alloy OTLP gRPC: `localhost:4317`
-- Alloy OTLP HTTP: `localhost:4318`
+- Grafana: `http://localhost:13002`
+- Temporal UI: `http://localhost:18080`
+- VictoriaMetrics: `http://localhost:18428`
+- Loki: `http://localhost:13100`
+- Alloy UI: `http://localhost:22345`
+- Alloy OTLP gRPC: `localhost:14317`
+- Alloy OTLP HTTP: `localhost:14318`
 
 The main local Grafana dashboard is:
 
 ```text
-http://localhost:3002/d/tee-router-local-overview/tee-router-local-overview
+http://localhost:13002/d/tee-router-local-overview/tee-router-local-overview
 ```
 
 The dashboard includes router metrics, recent router logs, and temporal-worker

@@ -89,6 +89,7 @@ services:
       devnet:
         condition: service_healthy
     environment: &devnet_router_env
+      PRODUCTION: "false"
       ETH_RPC_URL: http://devnet:50101
       BASE_RPC_URL: http://devnet:50102
       ARBITRUM_RPC_URL: http://devnet:50103
@@ -154,6 +155,7 @@ services:
       TOKEN_INDEXER_API_KEY: local-token-indexer-api-key-000000000
       HL_SHIM_INDEXER_URL: http://hl-shim-indexer:8080
       HYPERUNIT_API_URL: http://devnet:50107
+      CCTP_API_URL: http://devnet:50107
 
   hl-shim-indexer:
     depends_on:

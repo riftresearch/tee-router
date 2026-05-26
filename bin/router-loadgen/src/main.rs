@@ -125,14 +125,6 @@ const RANDOM_ROUTES: &[RandomRoute] = &[
     ),
     RandomRoute::new(
         "Bitcoin.BTC",
-        "Base.USDC",
-        RandomAddressKind::Bitcoin,
-        RandomAddressKind::Evm,
-        LimitAsset::Btc,
-        LimitAsset::Usdc,
-    ),
-    RandomRoute::new(
-        "Bitcoin.BTC",
         "Base.ETH",
         RandomAddressKind::Bitcoin,
         RandomAddressKind::Evm,
@@ -608,8 +600,6 @@ struct OrderRequest<'a> {
     refund_address: &'a str,
     integrator: &'a str,
     idempotency_key: String,
-    refund_mode: &'a str,
-    refund_authorizer: Option<&'a str>,
     amount_format: &'static str,
 }
 
@@ -872,8 +862,6 @@ async fn create_order(
         refund_address: from_address,
         integrator: "router-loadgen",
         idempotency_key: format!("router-loadgen-{}", Uuid::now_v7()),
-        refund_mode: "token",
-        refund_authorizer: None,
         amount_format: input.amount_format.as_gateway_str(),
     };
     post_json(&runtime.http, url, &request).await

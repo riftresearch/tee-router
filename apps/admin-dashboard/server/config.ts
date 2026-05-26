@@ -153,7 +153,7 @@ export function loadConfig(env: Env = Bun.env as Env): AdminDashboardConfig {
     version: env.npm_package_version ?? '0.1.0',
     missingAuthConfig,
     supabaseChatsUrl: normalizeSupabaseChatsUrl(
-      env.SUPABASE_CHATS_URL ?? DEFAULT_SUPABASE_CHATS_URL
+      normalizeOptionalSecret(env.SUPABASE_CHATS_URL) ?? DEFAULT_SUPABASE_CHATS_URL
     ),
     supabaseAnonKey: normalizeOptionalSecret(env.SUPABASE_ANON_KEY),
     supabaseChatAdminSecret: normalizeOptionalSecret(

@@ -1,4 +1,4 @@
-local_devnet_compose := "docker compose --env-file .env.admin -p tee-router-local-full-test -f etc/compose.local-infra.yml -f etc/compose.local-devnet.yml -f etc/compose.local-observability.yml"
+local_devnet_compose := "docker compose --env-file .env.admin -p tee-router-local-full-test -f etc/compose.local-infra.yml -f etc/compose.local-devnet.yml -f etc/compose.local-observability.yml -f etc/compose.local-devnet-ports.yml"
 live_local_compose := "docker compose --env-file .env.live-local -p tee-router-live-local -f etc/compose.local-infra.yml -f etc/compose.local-observability.yml -f etc/compose.live-local.yml"
 temporal_compose := "docker compose -p tee-router-temporal -f etc/compose.temporal.yml"
 
@@ -200,7 +200,7 @@ router-loadgen-one count='1' concurrency='64' rps='5' min_raw_amount='100000000'
 
 _router-loadgen-host count concurrency rps min_raw_amount max_raw_amount order_type:
     cargo run --release -p router-loadgen -- create-and-fund \
-      --gateway-url http://localhost:3001 \
+      --gateway-url http://localhost:13001 \
       --random \
       --order-type {{order_type}} \
       --random-min-raw-amount {{min_raw_amount}} \
@@ -210,17 +210,17 @@ _router-loadgen-host count concurrency rps min_raw_amount max_raw_amount order_t
       --count {{count}} \
       --concurrency {{concurrency}} \
       --rps {{rps}} \
-      --evm-rpc evm:1=http://localhost:50101 \
-      --evm-rpc evm:8453=http://localhost:50102 \
-      --evm-rpc evm:42161=http://localhost:50103 \
-      --devnet-manifest-url http://localhost:50108/manifest.json \
-      --bitcoin-rpc-url http://localhost:50100/wallet/alice \
+      --evm-rpc evm:1=http://localhost:56101 \
+      --evm-rpc evm:8453=http://localhost:56102 \
+      --evm-rpc evm:42161=http://localhost:56103 \
+      --devnet-manifest-url http://localhost:56108/manifest.json \
+      --bitcoin-rpc-url http://localhost:56100/wallet/alice \
       --bitcoin-rpc-auth devnet:devnet
 
 # Run random router loadgen from the host cargo binary
 router-loadgen-limit count='100' concurrency='64' rps='5' min_raw_amount='100000000' max_raw_amount='250000000' order_type='limit':
     cargo run --release -p router-loadgen -- create-and-fund \
-      --gateway-url http://localhost:3001 \
+      --gateway-url http://localhost:13001 \
       --random \
       --order-type {{order_type}} \
       --random-min-raw-amount {{min_raw_amount}} \
@@ -230,11 +230,11 @@ router-loadgen-limit count='100' concurrency='64' rps='5' min_raw_amount='100000
       --count {{count}} \
       --concurrency {{concurrency}} \
       --rps {{rps}} \
-      --evm-rpc evm:1=http://localhost:50101 \
-      --evm-rpc evm:8453=http://localhost:50102 \
-      --evm-rpc evm:42161=http://localhost:50103 \
-      --devnet-manifest-url http://localhost:50108/manifest.json \
-      --bitcoin-rpc-url http://localhost:50100/wallet/alice \
+      --evm-rpc evm:1=http://localhost:56101 \
+      --evm-rpc evm:8453=http://localhost:56102 \
+      --evm-rpc evm:42161=http://localhost:56103 \
+      --devnet-manifest-url http://localhost:56108/manifest.json \
+      --bitcoin-rpc-url http://localhost:56100/wallet/alice \
       --bitcoin-rpc-auth devnet:devnet
 
 

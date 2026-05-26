@@ -26,6 +26,7 @@ const DEFAULT_REFRESH_TTL: Duration = Duration::from_secs(600);
 const DEFAULT_AMOUNT_BUCKET: &str = "usd_1000";
 const DEFAULT_SAMPLE_AMOUNT_USD_MICROS: u64 = 1_000_000_000;
 const ROUTE_COST_PROVIDER_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_STORED_ROUTE_COST_USD_MICROS: u64 = i64::MAX as u64;
 const DUMMY_EVM_DEPOSITOR: &str = "0x1111111111111111111111111111111111111111";
 const DUMMY_EVM_RECIPIENT: &str = "0x2222222222222222222222222222222222222222";
 
@@ -60,7 +61,10 @@ impl RouteCostSnapshot {
 
     #[must_use]
     pub fn effective_cost_bps(&self) -> u64 {
-        usd_cost_bps(self.effective_cost_usd_micros(), self.sample_amount_usd_micros)
+        usd_cost_bps(
+            self.effective_cost_usd_micros(),
+            self.sample_amount_usd_micros,
+        )
     }
 }
 
@@ -351,8 +355,7 @@ impl RouteCostService {
             }
         };
         let estimated_fee_bps = quoted_fee_bps.max(estimate.estimated_fee_bps);
-        let estimated_fee_usd_micros =
-            quoted_fee_usd_micros.max(estimate.estimated_fee_usd_micros);
+        let estimated_fee_usd_micros = quoted_fee_usd_micros.max(estimate.estimated_fee_usd_micros);
 
         LiveCostSnapshotOutcome::Succeeded(Box::new(RouteCostSnapshot {
             transition_id: transition.id.clone(),
@@ -563,10 +566,7 @@ fn structural_cost_estimate(
     match transition.kind {
         MarketOrderTransitionKind::AcrossBridge => StructuralCostEstimate {
             estimated_fee_bps: 6,
-            estimated_fee_usd_micros: fee_usd_micros_from_bps(
-                6,
-                DEFAULT_SAMPLE_AMOUNT_USD_MICROS,
-            ),
+            estimated_fee_usd_micros: fee_usd_micros_from_bps(6, DEFAULT_SAMPLE_AMOUNT_USD_MICROS),
             estimated_gas_usd_micros: structural_gas_usd_micros(
                 pricing,
                 &transition.input.asset.chain,
@@ -578,7 +578,7 @@ fn structural_cost_estimate(
         MarketOrderTransitionKind::CctpBridge => StructuralCostEstimate {
             estimated_fee_bps: 0,
             estimated_fee_usd_micros: 0,
-            estimated_gas_usd_micros: capped_add_u64(
+            estimated_gas_usd_micros: capped_add_stored_route_cost_usd_micros(
                 structural_gas_usd_micros(pricing, &transition.input.asset.chain, 300_000),
                 structural_gas_usd_micros(pricing, &transition.output.asset.chain, 300_000),
             ),
@@ -605,20 +605,14 @@ fn structural_cost_estimate(
         },
         MarketOrderTransitionKind::HyperliquidTrade => StructuralCostEstimate {
             estimated_fee_bps: 4,
-            estimated_fee_usd_micros: fee_usd_micros_from_bps(
-                4,
-                DEFAULT_SAMPLE_AMOUNT_USD_MICROS,
-            ),
+            estimated_fee_usd_micros: fee_usd_micros_from_bps(4, DEFAULT_SAMPLE_AMOUNT_USD_MICROS),
             estimated_gas_usd_micros: 0,
             estimated_latency_ms: 1_500,
             quote_source: "static_hyperliquid_spot_seed",
         },
         MarketOrderTransitionKind::UniversalRouterSwap => StructuralCostEstimate {
             estimated_fee_bps: 25,
-            estimated_fee_usd_micros: fee_usd_micros_from_bps(
-                25,
-                DEFAULT_SAMPLE_AMOUNT_USD_MICROS,
-            ),
+            estimated_fee_usd_micros: fee_usd_micros_from_bps(25, DEFAULT_SAMPLE_AMOUNT_USD_MICROS),
             estimated_gas_usd_micros: structural_gas_usd_micros(
                 pricing,
                 &transition.input.asset.chain,
@@ -659,7 +653,7 @@ fn structural_gas_usd_micros(
     gas_units: u64,
 ) -> u64 {
     let Some(gas_price_wei) = pricing.try_chain_gas_price_wei(chain) else {
-        return u64::MAX;
+        return MAX_STORED_ROUTE_COST_USD_MICROS;
     };
     pricing
         .checked_native_gas_wei_to_usd_micro(
@@ -669,7 +663,7 @@ fn structural_gas_usd_micros(
                 .unwrap_or(U256::MAX),
         )
         .and_then(|value| value.try_into().ok())
-        .unwrap_or(u64::MAX)
+        .unwrap_or(MAX_STORED_ROUTE_COST_USD_MICROS)
 }
 
 fn quote_value_loss_bps(
@@ -744,7 +738,6 @@ fn usd_cost_bps(cost_usd_micros: u64, sample_amount_usd_micros: u64) -> u64 {
     .unwrap_or(u64::MAX)
 }
 
-
 fn div_ceil_u512_to_u64(numerator: U512, denominator: U512) -> Option<u64> {
     if denominator.is_zero() {
         return None;
@@ -768,6 +761,11 @@ fn u256_to_u64_saturating(value: U256) -> Option<u64> {
 
 fn capped_add_u64(left: u64, right: u64) -> u64 {
     left.saturating_add(right)
+}
+
+fn capped_add_stored_route_cost_usd_micros(left: u64, right: u64) -> u64 {
+    left.saturating_add(right)
+        .min(MAX_STORED_ROUTE_COST_USD_MICROS)
 }
 
 #[cfg(test)]
@@ -869,6 +867,21 @@ mod tests {
         };
 
         assert_eq!(snapshot.effective_cost_bps(), u64::MAX);
+    }
+    #[test]
+    fn structural_gas_cost_for_unpriced_chain_fits_persisted_range() {
+        let pricing = PricingSnapshot::static_bootstrap(Utc::now());
+        let cost = structural_gas_usd_micros(&pricing, &ChainId::parse("bitcoin").unwrap(), 1);
+
+        assert_eq!(cost, MAX_STORED_ROUTE_COST_USD_MICROS);
+        assert!(i64::try_from(cost).is_ok());
+    }
+    #[test]
+    fn stored_route_cost_add_caps_to_persisted_range() {
+        let cost = capped_add_stored_route_cost_usd_micros(MAX_STORED_ROUTE_COST_USD_MICROS, 1);
+
+        assert_eq!(cost, MAX_STORED_ROUTE_COST_USD_MICROS);
+        assert!(i64::try_from(cost).is_ok());
     }
 
     #[test]
@@ -1029,7 +1042,9 @@ mod tests {
                     edge_kind: transition.route_edge_kind().as_str().to_string(),
                     source_asset: transition.input.asset.clone(),
                     destination_asset: transition.output.asset.clone(),
-                    estimated_fee_bps: if transition.kind == MarketOrderTransitionKind::HyperliquidTrade {
+                    estimated_fee_bps: if transition.kind
+                        == MarketOrderTransitionKind::HyperliquidTrade
+                    {
                         4
                     } else {
                         0
@@ -1057,7 +1072,10 @@ mod tests {
             );
         }
 
-        let arb_path = path("arb", vec![cctp_arb, hl_bridge, trade.clone(), withdraw.clone()]);
+        let arb_path = path(
+            "arb",
+            vec![cctp_arb, hl_bridge, trade.clone(), withdraw.clone()],
+        );
         let hyperevm_path = path(
             "hyperevm",
             vec![cctp_hyperevm, hypercore_bridge, trade, withdraw],

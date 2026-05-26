@@ -4,21 +4,21 @@ use alloy::{
     primitives::{Address, TxHash, U256},
     sol,
 };
-use evm_receipt_watcher_client::{ByIdLookup, EvmReceiptWatcherClient, parse_tx_hash};
+use evm_receipt_watcher_client::{parse_tx_hash, ByIdLookup, EvmReceiptWatcherClient};
 use router_core::{
     models::{
         ProviderOperationHintKind, ProviderOperationType, SAURON_EVM_RECEIPT_OBSERVER_HINT_SOURCE,
     },
     protocol::{AssetId, ChainId, DepositAsset},
 };
-use router_server::api::{MAX_HINT_IDEMPOTENCY_KEY_LEN, ProviderOperationHintRequest};
+use router_server::api::{ProviderOperationHintRequest, MAX_HINT_IDEMPOTENCY_KEY_LEN};
 use router_temporal::{CctpReceiveObservedEvidence, VeloraSwapSettledEvidence};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::{
     sync::Mutex,
     task::JoinSet,
-    time::{MissedTickBehavior, timeout},
+    time::{timeout, MissedTickBehavior},
 };
 use tracing::{debug, warn};
 
@@ -47,7 +47,9 @@ sol! {
 /// Real V6 emits **no** swap event — only `DiamondCut` /
 /// `OwnershipTransferred`. So the only on-chain evidence of a settled
 /// Velora swap is the destination ERC-20's `Transfer(_, recipient, amount)`
-/// log, gated on `receipt.to == AUGUSTUS_V6`.
+/// log, gated on the exact transaction executor Velora returned for the
+/// operation. In production that executor is AugustusV6; in deterministic
+/// devnet it is the mock Velora contract embedded in the operation response.
 const AUGUSTUS_V6: alloy::primitives::Address =
     alloy::primitives::address!("6a000f20005980200259b80c5102003040001068");
 
@@ -300,10 +302,17 @@ async fn velora_swap_settled_hint(
     if !receipt.status() {
         return Ok(None);
     }
-    // Gate: a settled Velora V6 swap is a tx directed at AugustusV6. Any
-    // other Transfer in any other tx the recipient happens to be in would
-    // be a forgery vector if we matched on it. Audit finding (medium).
-    if receipt.to != Some(AUGUSTUS_V6) {
+    let Some(expected_executor) =
+        velora_swap_expected_executor(&operation.request, &operation.response)
+    else {
+        return Ok(None);
+    };
+    // Gate: a settled Velora swap is a tx directed at the executor returned by
+    // Velora for this operation. Any other Transfer in any other tx the
+    // recipient happens to be in would be a forgery vector if we matched on it.
+    // Production responses point at AugustusV6; devnet responses point at the
+    // deterministic mock Velora router.
+    if receipt.to != Some(expected_executor) {
         return Ok(None);
     }
 
@@ -319,9 +328,9 @@ async fn velora_swap_settled_hint(
         .and_then(|asset| normalized_reference_asset(chain_id, asset));
     let expected_min = velora_swap_expected_min_amount(&operation.request);
 
-    // V6 emits no swap event of its own. Detect settlement via the destination
-    // ERC-20's `Transfer(_, recipient, value >= min)` log inside an
-    // AugustusV6-directed tx.
+    // V6 emits no swap event of its own. Detect ERC-20 settlement via the
+    // destination token's `Transfer(_, recipient, value >= min)` log inside an
+    // executor-directed tx.
     for log in logs {
         if log.removed {
             continue;
@@ -356,12 +365,34 @@ async fn velora_swap_settled_hint(
                 decoded.inner.data.value.to_string(),
                 format!("{:#x}", decoded.inner.data.to),
                 // Executor in the audit-trail sense: the Velora router that
-                // actually settled the swap. Always AugustusV6 by gate above.
-                Some(format!("{:#x}", AUGUSTUS_V6)),
+                // actually settled the swap.
+                Some(format!("{:#x}", expected_executor)),
                 Some(format!("{:#x}", decoded.address())),
                 decoded.block_number,
             ),
             log_index,
+        )));
+    }
+    if velora_swap_output_is_native(chain_id, &operation.request) {
+        let Some(recipient) = recipient else {
+            return Ok(None);
+        };
+        let Some(amount_out) = velora_swap_native_amount_out(&operation.request) else {
+            return Ok(None);
+        };
+        return Ok(Some(hint_request(
+            operation,
+            ProviderOperationHintKind::VeloraSwapSettled,
+            velora_swap_settled_evidence(
+                format!("{tx_hash:?}"),
+                0,
+                amount_out,
+                format!("{recipient:#x}"),
+                Some(format!("{expected_executor:#x}")),
+                None,
+                receipt.block_number,
+            ),
+            0,
         )));
     }
     Ok(None)
@@ -495,6 +526,74 @@ fn velora_swap_expected_min_amount(request: &Value) -> Option<U256> {
         .and_then(Value::as_str)
         .filter(|amount| !amount.is_empty())
         .and_then(|amount| U256::from_str_radix(amount, 10).ok())
+}
+
+fn velora_swap_output_is_native(chain_id: &str, request: &Value) -> bool {
+    let Some(asset) = request
+        .pointer("/output_asset/asset")
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    let Some(chain) = ChainId::parse(chain_id).ok() else {
+        return false;
+    };
+    let Some(asset) = AssetId::parse(asset).ok() else {
+        return false;
+    };
+    let Ok(deposit_asset) = (DepositAsset { chain, asset }).normalized_asset_identity() else {
+        return false;
+    };
+    matches!(deposit_asset.asset, AssetId::Native)
+}
+
+fn velora_swap_native_amount_out(request: &Value) -> Option<String> {
+    request
+        .get("min_amount_out")
+        .and_then(Value::as_str)
+        .filter(|amount| !amount.is_empty())
+        .or_else(|| {
+            request
+                .get("amount_out")
+                .and_then(Value::as_str)
+                .filter(|amount| !amount.is_empty())
+        })
+        .map(ToOwned::to_owned)
+}
+fn velora_swap_expected_executor(request: &Value, response: &Value) -> Option<Address> {
+    let response_to = json_address(response.get("to"));
+    let request_contract = json_address(request.pointer("/price_route/contractAddress"));
+    let response_contract = json_address(response.pointer("/request/priceRoute/contractAddress"));
+
+    if response_to
+        .zip(request_contract)
+        .is_some_and(|(left, right)| left != right)
+    {
+        return None;
+    }
+    if response_to
+        .zip(response_contract)
+        .is_some_and(|(left, right)| left != right)
+    {
+        return None;
+    }
+    if request_contract
+        .zip(response_contract)
+        .is_some_and(|(left, right)| left != right)
+    {
+        return None;
+    }
+
+    response_to
+        .or(request_contract)
+        .or(response_contract)
+        .or(Some(AUGUSTUS_V6))
+}
+
+fn json_address(value: Option<&Value>) -> Option<Address> {
+    value
+        .and_then(Value::as_str)
+        .and_then(|value| Address::from_str(value).ok())
 }
 
 fn cctp_receive_observed_evidence(
@@ -640,6 +739,71 @@ mod tests {
             velora_swap_expected_min_amount(&request),
             Some(U256::from(36_000_000_u64))
         );
+    }
+
+    #[test]
+    fn velora_swap_native_amount_prefers_enforced_minimum() {
+        let request = serde_json::json!({
+            "amount_out": "37025460",
+            "min_amount_out": "36000000",
+        });
+
+        assert_eq!(
+            velora_swap_native_amount_out(&request),
+            Some("36000000".to_string())
+        );
+    }
+
+    #[test]
+    fn velora_swap_output_is_native_after_normalization() {
+        let request = serde_json::json!({
+            "output_asset": {
+                "chain_id": "evm:8453",
+                "asset": "native",
+            }
+        });
+
+        assert!(velora_swap_output_is_native("evm:8453", &request));
+    }
+    #[test]
+    fn velora_swap_expected_executor_uses_operation_transaction_target() {
+        let request = serde_json::json!({
+            "price_route": {
+                "contractAddress": "0xcf7ed3acca5a467e9e704c703e8d87f634fb0fc9"
+            }
+        });
+        let response = serde_json::json!({
+            "to": "0xcf7ed3acca5a467e9e704c703e8d87f634fb0fc9",
+            "request": {
+                "priceRoute": {
+                    "contractAddress": "0xcf7ed3acca5a467e9e704c703e8d87f634fb0fc9"
+                }
+            }
+        });
+
+        assert_eq!(
+            velora_swap_expected_executor(&request, &response),
+            Some(Address::from_str("0xcf7ed3acca5a467e9e704c703e8d87f634fb0fc9").unwrap())
+        );
+    }
+
+    #[test]
+    fn velora_swap_expected_executor_rejects_conflicting_contracts() {
+        let request = serde_json::json!({
+            "price_route": {
+                "contractAddress": "0xcf7ed3acca5a467e9e704c703e8d87f634fb0fc9"
+            }
+        });
+        let response = serde_json::json!({
+            "to": "0x6a000f20005980200259b80c5102003040001068",
+            "request": {
+                "priceRoute": {
+                    "contractAddress": "0xcf7ed3acca5a467e9e704c703e8d87f634fb0fc9"
+                }
+            }
+        });
+
+        assert_eq!(velora_swap_expected_executor(&request, &response), None);
     }
 
     #[test]

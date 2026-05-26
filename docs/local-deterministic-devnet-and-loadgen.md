@@ -150,7 +150,7 @@ The compose file should configure router services with local URLs:
 
 ```sh
 router-loadgen quote \
-  --gateway-url http://localhost:3001 \
+  --gateway-url http://localhost:13001 \
   --from Base.USDC \
   --to Ethereum.USDC \
   --from-amount 10000000 \
@@ -158,7 +158,7 @@ router-loadgen quote \
   --to-address 0x1111111111111111111111111111111111111111
 
 router-loadgen create-and-fund \
-  --gateway-url http://localhost:3001 \
+  --gateway-url http://localhost:13001 \
   --from Base.USDC \
   --to Ethereum.USDC \
   --from-amount 10000000 \
@@ -166,8 +166,8 @@ router-loadgen create-and-fund \
   --to-address 0x1111111111111111111111111111111111111111 \
   --count 25 \
   --rps 5 \
-  --evm-rpc evm:8453=http://localhost:50102 \
-  --devnet-manifest-url http://localhost:50108/manifest.json
+  --evm-rpc evm:8453=http://localhost:56102 \
+  --devnet-manifest-url http://localhost:56108/manifest.json
 ```
 
 For compose-internal execution, the same command should swap only URLs:

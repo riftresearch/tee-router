@@ -1,0 +1,122 @@
+# Devnet-only host port remaps.
+#
+# The live-local real-funds stack intentionally uses the historical localhost
+# ports from compose.local-infra.yml / compose.local-observability.yml. Keep this
+# overlay last in local_devnet_compose so deterministic devnet can run at the same
+# time without stopping tee-router-live-local containers.
+
+services:
+  devnet:
+    ports: !override
+      - "56100:50100"
+      - "56101:50101"
+      - "56102:50102"
+      - "56103:50103"
+      - "56104:50104"
+      - "56105:50105"
+      - "56106:50106"
+      - "56107:50107"
+      - "56108:50108"
+      - "56110:50110"
+      - "56111:50111"
+      - "56112:50112"
+      - "56118:50118"
+
+  router-postgres:
+    ports: !override
+      - "56432:5432"
+
+  temporal-postgres:
+    ports: !override
+      - "56435:5432"
+
+  temporal:
+    ports: !override
+      - "17233:7233"
+      - "29090:9090"
+
+  temporal-ui:
+    environment:
+      TEMPORAL_CORS_ORIGINS: http://localhost:13000
+    ports: !override
+      - "18080:8080"
+
+  router-api:
+    ports: !override
+      - "14522:4522"
+      - "19100:9100"
+
+  router-worker:
+    ports: !override
+      - "19101:9101"
+
+  temporal-worker:
+    ports: !override
+      - "19103:9103"
+
+  router-postgres-replica:
+    ports: !override
+      - "56433:5432"
+
+  sauron:
+    ports: !override
+      - "19102:9102"
+
+  hl-shim-indexer:
+    ports: !override
+      - "19104:9104"
+
+  evm-receipt-watcher-ethereum:
+    ports: !override
+      - "57113:8080"
+
+  evm-receipt-watcher-base:
+    ports: !override
+      - "57114:8080"
+
+  evm-receipt-watcher-arbitrum:
+    ports: !override
+      - "57115:8080"
+
+  bitcoin-indexer:
+    ports: !override
+      - "57116:8080"
+
+  bitcoin-receipt-watcher:
+    ports: !override
+      - "57117:8080"
+
+  router-gateway:
+    environment:
+      ROUTER_GATEWAY_PUBLIC_BASE_URL: http://localhost:13001
+    ports: !override
+      - "13001:3000"
+
+  admin-dashboard-analytics-db:
+    ports: !override
+      - "56434:5432"
+
+  admin-dashboard:
+    environment:
+      BETTER_AUTH_URL: http://localhost:13000
+      ADMIN_DASHBOARD_WEB_ORIGIN: http://localhost:13000
+    ports: !override
+      - "13000:3000"
+
+  alloy:
+    ports: !override
+      - "22345:12345"
+      - "14317:4317"
+      - "14318:4318"
+
+  victoriametrics:
+    ports: !override
+      - "18428:8428"
+
+  loki:
+    ports: !override
+      - "13100:3100"
+
+  grafana:
+    ports: !override
+      - "13002:3000"
