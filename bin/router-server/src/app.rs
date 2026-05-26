@@ -19,15 +19,16 @@ use router_core::{
     services::{
         action_providers::{
             AcrossHttpProviderConfig, ActionProviderHttpOptions, ActionProviderRegistry,
-            CctpHttpProviderConfig, VeloraHttpProviderConfig,
+            CctpHttpProviderConfig, CctpTransferMode, VeloraHttpProviderConfig,
         },
         asset_registry::ProviderId,
+        custody_action_executor::{evm_address_from_private_key, PaymasterRegistry},
         route_costs::RouteCostService,
     },
 };
 use router_primitives::ChainType;
 use snafu::ResultExt;
-use std::{sync::Arc, time::Duration};
+use std::{str::FromStr, sync::Arc, time::Duration};
 use tracing::warn;
 use url::Url;
 
@@ -115,7 +116,8 @@ pub async fn initialize_components_with_action_providers(
         )
         .with_route_costs(Some(route_costs.clone()))
         .with_provider_policies(Some(provider_policies.clone()))
-        .with_provider_health(Some(provider_health.clone())),
+        .with_provider_health(Some(provider_health.clone()))
+        .with_paymasters(quote_paymaster_registry(args)?),
     );
     let vault_manager = Arc::new(match worker_id {
         Some(worker_id) => VaultManager::with_worker_id(
@@ -228,6 +230,8 @@ fn initialize_route_costs(
         &args.ethereum_mainnet_rpc_url,
         &args.arbitrum_rpc_url,
         &args.base_rpc_url,
+        args.hyperevm_rpc_url.as_deref(),
+        args.hyperliquid_api_url.as_deref(),
     )
     .map_err(|err| crate::Error::DatabaseInit {
         source: RouterServerError::InvalidData {
@@ -320,6 +324,44 @@ async fn initialize_chain_registry(
     );
     chain_registry.register_evm(ChainType::Arbitrum, arbitrum_chain);
 
+    let hyperevm_config = match (
+        args.hyperevm_rpc_url.as_deref(),
+        args.hyperevm_reference_token.as_deref(),
+        args.hyperevm_paymaster_private_key.as_deref(),
+        args.hyperevm_min_confirmations,
+        args.hyperevm_estimated_block_time_ms,
+    ) {
+        (None, None, None, None, None) => None,
+        (Some(rpc_url), Some(reference_token), Some(_), Some(min_confirmations), Some(block_time_ms)) => {
+            Some((rpc_url, reference_token, min_confirmations, block_time_ms))
+        }
+        _ => {
+            return Err(invalid_config(
+                "HyperEVM requires HYPEREVM_RPC_URL, HYPEREVM_ALLOWED_TOKEN, HYPEREVM_PAYMASTER_PRIVATE_KEY, HYPEREVM_MIN_CONFIRMATIONS, and HYPEREVM_ESTIMATED_BLOCK_TIME_MS together",
+            ));
+        }
+    };
+    if let Some((rpc_url, reference_token, min_confirmations, block_time_ms)) = hyperevm_config {
+        let hyperevm_chain = Arc::new(
+            EvmChain::new_with_gas_sponsor(
+                rpc_url,
+                reference_token,
+                ChainType::Hyperevm,
+                b"router-hyperevm-wallet",
+                min_confirmations,
+                Duration::from_millis(block_time_ms),
+                gas_sponsor_config(args.hyperevm_paymaster_private_key.as_ref(), paymaster_mode),
+            )
+            .await
+            .map_err(|err| crate::Error::DatabaseInit {
+                source: RouterServerError::InvalidData {
+                    message: format!("failed to initialize hyperevm chain: {err}"),
+                },
+            })?,
+        );
+        chain_registry.register_evm(ChainType::Hyperevm, hyperevm_chain);
+    }
+
     let hyperliquid_chain = Arc::new(HyperliquidChain::new(
         b"router-hyperliquid-wallet",
         1,
@@ -350,11 +392,14 @@ fn initialize_action_providers(args: &RouterServerArgs) -> Result<ActionProvider
         });
     let cctp_base_url = normalize_optional_url(args.cctp_api_url.as_deref(), "CCTP API URL")?
         .unwrap_or_else(|| CCTP_IRIS_DEFAULT_BASE_URL_FOR_CONFIG.to_string());
+    let cctp_transfer_mode = cctp_transfer_mode_for_config(args.cctp_transfer_mode.as_deref())?;
     let cctp = Some(
-        CctpHttpProviderConfig::new(cctp_base_url).with_contract_addresses(
-            normalize_optional_string(args.cctp_token_messenger_v2_address.as_deref()),
-            normalize_optional_string(args.cctp_message_transmitter_v2_address.as_deref()),
-        ),
+        CctpHttpProviderConfig::new(cctp_base_url)
+            .with_contract_addresses(
+                normalize_optional_string(args.cctp_token_messenger_v2_address.as_deref()),
+                normalize_optional_string(args.cctp_message_transmitter_v2_address.as_deref()),
+            )
+            .with_transfer_mode(cctp_transfer_mode),
     );
     let registry = ActionProviderRegistry::http_from_options(ActionProviderHttpOptions {
         across,
@@ -371,6 +416,7 @@ fn initialize_action_providers(args: &RouterServerArgs) -> Result<ActionProvider
         velora,
         hyperliquid_network: args.hyperliquid_network,
         hyperliquid_order_timeout_ms: args.hyperliquid_order_timeout_ms,
+        hypercore_bridge_enabled: args.hyperevm_rpc_url.is_some(),
     })
     .map_err(invalid_config)?;
     if registry.is_empty() {
@@ -396,6 +442,13 @@ fn required_across_api_key(value: Option<&str>) -> Result<String> {
         ));
     }
     Ok(trimmed.to_string())
+}
+
+fn cctp_transfer_mode_for_config(value: Option<&str>) -> Result<CctpTransferMode> {
+    let Some(value) = value else {
+        return Ok(CctpTransferMode::Standard);
+    };
+    CctpTransferMode::from_str(value).map_err(|message| invalid_config(message))
 }
 
 fn normalize_optional_url(value: Option<&str>, name: &str) -> Result<Option<String>> {
@@ -470,6 +523,35 @@ fn invalid_config(message: impl Into<String>) -> crate::Error {
         },
     }
 }
+fn quote_paymaster_registry(args: &RouterServerArgs) -> Result<PaymasterRegistry> {
+    let mut registry = PaymasterRegistry::new();
+    if let Some(private_key) = normalize_optional_string(args.ethereum_paymaster_private_key.as_deref())
+    {
+        let address =
+            evm_address_from_private_key(&private_key).map_err(|source| invalid_config(source.to_string()))?;
+        registry.register(ChainType::Ethereum, address);
+    }
+    if let Some(private_key) = normalize_optional_string(args.base_paymaster_private_key.as_deref()) {
+        let address =
+            evm_address_from_private_key(&private_key).map_err(|source| invalid_config(source.to_string()))?;
+        registry.register(ChainType::Base, address);
+    }
+    if let Some(private_key) =
+        normalize_optional_string(args.arbitrum_paymaster_private_key.as_deref())
+    {
+        let address =
+            evm_address_from_private_key(&private_key).map_err(|source| invalid_config(source.to_string()))?;
+        registry.register(ChainType::Arbitrum, address);
+    }
+    if let Some(private_key) =
+        normalize_optional_string(args.hyperevm_paymaster_private_key.as_deref())
+    {
+        let address =
+            evm_address_from_private_key(&private_key).map_err(|source| invalid_config(source.to_string()))?;
+        registry.register(ChainType::Hyperevm, address);
+    }
+    Ok(registry)
+}
 
 fn gas_sponsor_config(
     private_key: Option<&String>,
@@ -511,6 +593,15 @@ mod tests {
             arbitrum_rpc_url: "https://arb.example".to_string(),
             arbitrum_reference_token: "0x0000000000000000000000000000000000000000".to_string(),
             arbitrum_paymaster_private_key: None,
+            hyperevm_rpc_url: Some("https://hyperevm.example".to_string()),
+            hyperevm_reference_token: Some(
+                "0xb88339cb7199b77e23db6e890353e22632ba630f".to_string(),
+            ),
+            hyperevm_paymaster_private_key: Some(
+                "0x1111111111111111111111111111111111111111111111111111111111111111".to_string(),
+            ),
+            hyperevm_min_confirmations: Some(4),
+            hyperevm_estimated_block_time_ms: Some(1_000),
             bitcoin_rpc_url: "http://btc.example".to_string(),
             bitcoin_rpc_auth: Auth::None,
             untrusted_esplora_http_server_url: "https://esplora.example".to_string(),
@@ -526,6 +617,7 @@ mod tests {
             cctp_api_url: None,
             cctp_token_messenger_v2_address: None,
             cctp_message_transmitter_v2_address: None,
+            cctp_transfer_mode: None,
             hyperunit_api_url: None,
             hyperunit_proxy_url: None,
             hyperliquid_api_url: None,

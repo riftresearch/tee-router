@@ -865,6 +865,7 @@ fn provider_hint_shape_for_operation(
             (ProviderKind::Unit, ProviderHintKind::ProviderObservation)
         }
         ProviderOperationType::HyperliquidBridgeDeposit
+        | ProviderOperationType::HypercoreBridgeDeposit
         | ProviderOperationType::HyperliquidBridgeWithdrawal => {
             (ProviderKind::Bridge, ProviderHintKind::ProviderObservation)
         }

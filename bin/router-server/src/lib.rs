@@ -120,6 +120,26 @@ pub struct RouterServerArgs {
     #[arg(long, env = "ARBITRUM_PAYMASTER_PRIVATE_KEY")]
     pub arbitrum_paymaster_private_key: Option<String>,
 
+    /// HyperEVM RPC URL
+    #[arg(long, env = "HYPEREVM_RPC_URL")]
+    pub hyperevm_rpc_url: Option<String>,
+
+    /// HyperEVM native USDC contract address
+    #[arg(long, env = "HYPEREVM_ALLOWED_TOKEN")]
+    pub hyperevm_reference_token: Option<String>,
+
+    /// HyperEVM paymaster private key used to top up HYPE gas for token vaults
+    #[arg(long, env = "HYPEREVM_PAYMASTER_PRIVATE_KEY")]
+    pub hyperevm_paymaster_private_key: Option<String>,
+
+    /// HyperEVM minimum confirmations required before the router treats a tx as final
+    #[arg(long, env = "HYPEREVM_MIN_CONFIRMATIONS")]
+    pub hyperevm_min_confirmations: Option<u32>,
+
+    /// HyperEVM estimated block time in milliseconds used for UX hints and polling cadence
+    #[arg(long, env = "HYPEREVM_ESTIMATED_BLOCK_TIME_MS")]
+    pub hyperevm_estimated_block_time_ms: Option<u64>,
+
     /// Bitcoin RPC URL
     #[arg(long, env = "BITCOIN_RPC_URL")]
     pub bitcoin_rpc_url: String,
@@ -181,6 +201,9 @@ pub struct RouterServerArgs {
     #[arg(long, env = "CCTP_MESSAGE_TRANSMITTER_V2_ADDRESS")]
     pub cctp_message_transmitter_v2_address: Option<String>,
 
+    /// CCTP transfer mode (`standard` or `fast`)
+    #[arg(long, env = "CCTP_TRANSFER_MODE")]
+    pub cctp_transfer_mode: Option<String>,
     /// HyperUnit API base URL
     #[arg(long, env = "HYPERUNIT_API_URL")]
     pub hyperunit_api_url: Option<String>,

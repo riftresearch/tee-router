@@ -31,11 +31,13 @@ use router_core::{
             AssetRegistry, CanonicalAsset, MarketOrderNode, MarketOrderTransitionKind, ProviderId,
             TransitionDecl, TransitionPath,
         },
+        custody_action_executor::PaymasterRegistry,
         gas_reimbursement::{
             optimized_paymaster_reimbursement_plan,
             optimized_paymaster_reimbursement_plan_with_pricing, try_transition_retention_amount,
             GasReimbursementError, GasReimbursementPlan,
         },
+        pricing::apply_bps_multiplier,
         quote_legs::{
             execution_step_type_for_transition_kind, QuoteLeg, QuoteLegAsset, QuoteLegSpec,
         },
@@ -47,6 +49,7 @@ use router_primitives::ChainType;
 use serde_json::{json, Value};
 use snafu::Snafu;
 use std::{
+    collections::HashMap,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -64,6 +67,7 @@ const BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_OUTPUTS: usize = 2;
 const BITCOIN_UNIT_DEPOSIT_FEE_RESERVE_BPS: u64 = 12_500;
 const PROBE_MAX_AMOUNT_IN: &str = "340282366920938463463374607431768211455";
 const MAX_U256_DECIMAL_DIGITS: usize = 78;
+const PAYMASTER_QUOTE_BALANCE_SAFETY_MULTIPLIER_BPS: u64 = 12_500;
 
 #[derive(Debug, Snafu)]
 pub enum MarketOrderError {
@@ -195,6 +199,7 @@ pub struct OrderManager {
     route_costs: Option<Arc<RouteCostService>>,
     provider_policies: Option<Arc<ProviderPolicyService>>,
     provider_health: Option<Arc<ProviderHealthService>>,
+    paymasters: PaymasterRegistry,
 }
 
 impl OrderManager {
@@ -225,6 +230,7 @@ impl OrderManager {
             route_costs: None,
             provider_policies: None,
             provider_health: None,
+            paymasters: PaymasterRegistry::default(),
         }
     }
 
@@ -249,6 +255,11 @@ impl OrderManager {
         provider_health: Option<Arc<ProviderHealthService>>,
     ) -> Self {
         self.provider_health = provider_health;
+        self
+    }
+    #[must_use]
+    pub fn with_paymasters(mut self, paymasters: PaymasterRegistry) -> Self {
+        self.paymasters = paymasters;
         self
     }
 
@@ -397,6 +408,65 @@ impl OrderManager {
             .current_or_refresh_live_pricing_snapshot()
             .await
     }
+    async fn ensure_paymasters_can_fund_path(
+        &self,
+        gas_reimbursement_plan: &GasReimbursementPlan,
+    ) -> MarketOrderResult<()> {
+        let required_by_chain = required_paymaster_native_balances(gas_reimbursement_plan)?;
+        for (chain, required_balance) in required_by_chain {
+            let backend_chain =
+                backend_chain_for_id(&chain).ok_or(MarketOrderError::ChainNotSupported {
+                    chain: chain.clone(),
+                })?;
+            let paymaster_address = self
+                .paymasters
+                .address_for(backend_chain)
+                .ok_or_else(|| MarketOrderError::NoRoute {
+                    reason: format!("missing paymaster for {}", chain),
+                })?;
+            let evm_chain =
+                self.chain_registry
+                    .get_evm(&backend_chain)
+                    .ok_or_else(|| MarketOrderError::NoRoute {
+                        reason: format!("no EVM chain implementation is configured for {}", chain),
+                    })?;
+            let balance = evm_chain
+                .native_balance(paymaster_address)
+                .await
+                .map_err(|err| MarketOrderError::NoRoute {
+                    reason: format!(
+                        "failed to read paymaster balance on {} for {}: {err}",
+                        chain, paymaster_address
+                    ),
+                })?;
+            if balance < required_balance {
+                return Err(MarketOrderError::NoRoute {
+                    reason: format!(
+                        "paymaster {} on {} is underfunded: balance {} below required {}",
+                        paymaster_address, chain, balance, required_balance
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+    async fn filter_unpriceable_hyperevm_paths(&self, paths: &mut Vec<TransitionPath>) -> bool {
+        if !paths.iter().any(path_uses_hyperevm) {
+            return false;
+        }
+        let Some(route_costs) = self.route_costs.as_ref() else {
+            paths.retain(|path| !path_uses_hyperevm(path));
+            return true;
+        };
+        let pricing = route_costs.force_refresh_pricing_snapshot().await;
+        let hyperevm_chain = ChainId::parse("evm:999").expect("static HyperEVM chain id");
+        if pricing.supports_chain_gas_pricing(&hyperevm_chain) {
+            return false;
+        }
+        paths.retain(|path| !path_uses_hyperevm(path));
+        true
+    }
+
 
     pub async fn get_quote(&self, quote_id: Uuid) -> MarketOrderResult<RouterOrderQuote> {
         self.db
@@ -705,16 +775,21 @@ impl OrderManager {
         );
         paths.retain(|path| is_executable_transition_path(self.asset_registry.as_ref(), path));
         paths.retain(|path| path_has_configured_provider_set(self.action_providers.as_ref(), path));
+        let hyperevm_paths_filtered = self.filter_unpriceable_hyperevm_paths(&mut paths).await;
         prefer_same_chain_evm_paths(request, &mut paths);
         if paths.is_empty() {
             return Err(MarketOrderError::NoRoute {
-                reason: format!(
-                    "no executable transition path from {} {} to {} {}",
-                    request.source_asset.chain,
-                    request.source_asset.asset,
-                    request.destination_asset.chain,
-                    request.destination_asset.asset
-                ),
+                reason: if hyperevm_paths_filtered {
+                    "live HyperEVM gas pricing is unavailable".to_string()
+                } else {
+                    format!(
+                        "no executable transition path from {} {} to {} {}",
+                        request.source_asset.chain,
+                        request.source_asset.asset,
+                        request.destination_asset.chain,
+                        request.destination_asset.asset
+                    )
+                },
             });
         }
         if let Some(route_costs) = self.route_costs.as_ref() {
@@ -833,15 +908,20 @@ impl OrderManager {
                 .iter()
                 .all(|transition| transition.kind != MarketOrderTransitionKind::UniversalRouterSwap)
         });
+        let hyperevm_paths_filtered = self.filter_unpriceable_hyperevm_paths(&mut paths).await;
         if paths.is_empty() {
             return Err(MarketOrderError::NoRoute {
-                reason: format!(
-                    "no V1 limit-order route from {} {} to {} {}; V1 supports BTC/USDC and ETH/USDC routes without universal-router hops",
-                    request.source_asset.chain,
-                    request.source_asset.asset,
-                    request.destination_asset.chain,
-                    request.destination_asset.asset
-                ),
+                reason: if hyperevm_paths_filtered {
+                    "live HyperEVM gas pricing is unavailable".to_string()
+                } else {
+                    format!(
+                        "no V1 limit-order route from {} {} to {} {}; V1 supports BTC/USDC and ETH/USDC routes without universal-router hops",
+                        request.source_asset.chain,
+                        request.source_asset.asset,
+                        request.destination_asset.chain,
+                        request.destination_asset.asset
+                    )
+                },
             });
         }
         if let Some(route_costs) = self.route_costs.as_ref() {
@@ -1077,8 +1157,11 @@ impl OrderManager {
             &limit_input_amount,
         )?;
         if limit_index > 0
-            && path.transitions[limit_index - 1].kind
-                == MarketOrderTransitionKind::HyperliquidBridgeDeposit
+            && matches!(
+                path.transitions[limit_index - 1].kind,
+                MarketOrderTransitionKind::HyperliquidBridgeDeposit
+                    | MarketOrderTransitionKind::HypercoreBridgeDeposit
+            )
         {
             required_limit_input_amount = add_hyperliquid_spot_send_quote_gas_reserve(
                 "limit_order.required_input_amount",
@@ -1309,6 +1392,8 @@ impl OrderManager {
             };
             plan
         };
+        self.ensure_paymasters_can_fund_path(&gas_reimbursement_plan)
+            .await?;
 
         match order_kind {
             ProviderOrderKind::ExactIn {
@@ -1327,6 +1412,7 @@ impl OrderManager {
                         MarketOrderTransitionKind::AcrossBridge
                         | MarketOrderTransitionKind::CctpBridge
                         | MarketOrderTransitionKind::HyperliquidBridgeDeposit
+                        | MarketOrderTransitionKind::HypercoreBridgeDeposit
                         | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
                             let bridge_id = transition.provider.as_str();
                             if !provider_allowed_for_new_routes(
@@ -1417,8 +1503,11 @@ impl OrderManager {
                             };
                             let mut quote_amount_in = provider_amount_in.clone();
                             if index > 0
-                                && path.transitions[index - 1].kind
-                                    == MarketOrderTransitionKind::HyperliquidBridgeDeposit
+                                && matches!(
+                                    path.transitions[index - 1].kind,
+                                    MarketOrderTransitionKind::HyperliquidBridgeDeposit
+                                        | MarketOrderTransitionKind::HypercoreBridgeDeposit
+                                )
                             {
                                 quote_amount_in = reserve_hyperliquid_spot_send_quote_gas(
                                     "hyperliquid_trade.amount_in",
@@ -1615,8 +1704,11 @@ impl OrderManager {
                             expires_at = expires_at.min(exchange_quote.expires_at);
                             let mut next_required = exchange_quote.amount_in.clone();
                             if index > 0
-                                && path.transitions[index - 1].kind
-                                    == MarketOrderTransitionKind::HyperliquidBridgeDeposit
+                                && matches!(
+                                    path.transitions[index - 1].kind,
+                                    MarketOrderTransitionKind::HyperliquidBridgeDeposit
+                                        | MarketOrderTransitionKind::HypercoreBridgeDeposit
+                                )
                             {
                                 next_required = add_hyperliquid_spot_send_quote_gas_reserve(
                                     "hyperliquid_trade.amount_in",
@@ -1689,6 +1781,7 @@ impl OrderManager {
                         MarketOrderTransitionKind::AcrossBridge
                         | MarketOrderTransitionKind::CctpBridge
                         | MarketOrderTransitionKind::HyperliquidBridgeDeposit
+                        | MarketOrderTransitionKind::HypercoreBridgeDeposit
                         | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
                             let bridge_id = transition.provider.as_str();
                             if !provider_allowed_for_new_routes(
@@ -1917,7 +2010,10 @@ impl OrderManager {
                 )?;
                 if !matches!(
                     backend_chain,
-                    ChainType::Ethereum | ChainType::Arbitrum | ChainType::Base
+                    ChainType::Ethereum
+                        | ChainType::Arbitrum
+                        | ChainType::Base
+                        | ChainType::Hyperevm
                 ) {
                     return Ok(None);
                 }
@@ -2036,7 +2132,10 @@ impl OrderManager {
                     reason: "bitcoin only supports the native asset".to_string(),
                 }),
             },
-            ChainType::Ethereum | ChainType::Arbitrum | ChainType::Base => match &asset.asset {
+            ChainType::Ethereum
+            | ChainType::Arbitrum
+            | ChainType::Base
+            | ChainType::Hyperevm => match &asset.asset {
                 AssetId::Native => Ok(asset.clone()),
                 AssetId::Reference(asset_id) => {
                     asset.normalized_asset_identity().map_err(|reason| {
@@ -2262,6 +2361,12 @@ fn unit_path_compatible(unit: &dyn UnitProvider, path: &TransitionPath) -> bool 
         })
 }
 
+fn path_uses_hyperevm(path: &TransitionPath) -> bool {
+    path.transitions.iter().any(|transition| {
+        transition.input.asset.chain.as_str() == "evm:999"
+            || transition.output.asset.chain.as_str() == "evm:999"
+    })
+}
 fn path_has_configured_provider_set(
     action_providers: &ActionProviderRegistry,
     path: &TransitionPath,
@@ -2284,6 +2389,7 @@ fn path_has_configured_provider_set(
             MarketOrderTransitionKind::AcrossBridge
             | MarketOrderTransitionKind::CctpBridge
             | MarketOrderTransitionKind::HyperliquidBridgeDeposit
+            | MarketOrderTransitionKind::HypercoreBridgeDeposit
             | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => action_providers
                 .bridge(transition.provider.as_str())
                 .is_some(),
@@ -2541,6 +2647,41 @@ fn transition_exchange_provider_ids(path: &TransitionPath) -> Vec<&str> {
     providers
 }
 
+fn required_paymaster_native_balances(
+    gas_reimbursement_plan: &GasReimbursementPlan,
+) -> MarketOrderResult<HashMap<ChainId, U256>> {
+    let mut required_by_chain = HashMap::<ChainId, U256>::new();
+    for debt in &gas_reimbursement_plan.debts {
+        let chain =
+            ChainId::parse(&debt.spend_chain_id).map_err(|reason| MarketOrderError::NoRoute {
+                reason: format!(
+                    "paymaster reimbursement plan has invalid spend chain {}: {reason}",
+                    debt.spend_chain_id
+                ),
+            })?;
+        let required = parse_amount("estimated_native_gas_wei", &debt.estimated_native_gas_wei)?;
+        let entry = required_by_chain.entry(chain).or_insert(U256::ZERO);
+        *entry = entry
+            .checked_add(required)
+            .ok_or_else(|| {
+                MarketOrderError::gas_reimbursement(GasReimbursementError::NumericOverflow {
+                    context: "paymaster quote native gas aggregation",
+                })
+            })?;
+    }
+    for required in required_by_chain.values_mut() {
+        *required = apply_bps_multiplier(
+            *required,
+            PAYMASTER_QUOTE_BALANCE_SAFETY_MULTIPLIER_BPS,
+        )
+        .ok_or_else(|| {
+            MarketOrderError::gas_reimbursement(GasReimbursementError::NumericOverflow {
+                context: "paymaster quote native gas safety multiplier",
+            })
+        })?;
+    }
+    Ok(required_by_chain)
+}
 fn transition_path_quote_blob(
     path: &TransitionPath,
     legs: &[QuoteLeg],
@@ -3217,6 +3358,54 @@ mod tests {
             pricing,
             Err(MarketOrderError::GasReimbursement { .. })
         ));
+    }
+    #[test]
+    fn required_paymaster_native_balances_aggregate_per_chain_with_safety_margin() {
+        let plan = GasReimbursementPlan {
+            schema_version: 1,
+            policy: "test".to_string(),
+            quote_safety_multiplier_bps: 10_000,
+            debts: vec![
+                router_core::services::gas_reimbursement::GasReimbursementDebt {
+                    id: "debt-1".to_string(),
+                    transition_decl_id: "transition-1".to_string(),
+                    transition_kind: "cctp_bridge".to_string(),
+                    spend_chain_id: "evm:999".to_string(),
+                    payment_model: router_core::services::gas_reimbursement::GasPaymentModel::PaymasterAdvanced,
+                    estimated_native_gas_wei: "100".to_string(),
+                    estimated_usd_micro: "1".to_string(),
+                },
+                router_core::services::gas_reimbursement::GasReimbursementDebt {
+                    id: "debt-2".to_string(),
+                    transition_decl_id: "transition-2".to_string(),
+                    transition_kind: "hypercore_bridge_deposit".to_string(),
+                    spend_chain_id: "evm:999".to_string(),
+                    payment_model: router_core::services::gas_reimbursement::GasPaymentModel::PaymasterAdvanced,
+                    estimated_native_gas_wei: "60".to_string(),
+                    estimated_usd_micro: "1".to_string(),
+                },
+                router_core::services::gas_reimbursement::GasReimbursementDebt {
+                    id: "debt-3".to_string(),
+                    transition_decl_id: "transition-3".to_string(),
+                    transition_kind: "cctp_bridge".to_string(),
+                    spend_chain_id: "evm:8453".to_string(),
+                    payment_model: router_core::services::gas_reimbursement::GasPaymentModel::PaymasterAdvanced,
+                    estimated_native_gas_wei: "40".to_string(),
+                    estimated_usd_micro: "1".to_string(),
+                },
+            ],
+            retention_actions: vec![],
+        };
+
+        let required = required_paymaster_native_balances(&plan).unwrap();
+        assert_eq!(
+            required.get(&ChainId::parse("evm:999").unwrap()),
+            Some(&U256::from(200_u64))
+        );
+        assert_eq!(
+            required.get(&ChainId::parse("evm:8453").unwrap()),
+            Some(&U256::from(50_u64))
+        );
     }
 
     #[test]

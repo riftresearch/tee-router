@@ -439,7 +439,7 @@ impl VaultManager {
     fn vault_supports_balance_reconciliation(&self, vault: &DepositVault) -> bool {
         matches!(
             backend_chain_for_id(&vault.deposit_asset.chain),
-            Some(ChainType::Ethereum | ChainType::Arbitrum | ChainType::Base)
+            Some(ChainType::Ethereum | ChainType::Arbitrum | ChainType::Base | ChainType::Hyperevm)
         )
     }
 
@@ -695,9 +695,10 @@ impl VaultManager {
                 self.refund_bitcoin(&vault, deposit_wallet.private_key())
                     .await
             }
-            ChainType::Ethereum | ChainType::Arbitrum | ChainType::Base => {
-                self.refund_evm(&vault, deposit_wallet.private_key()).await
-            }
+            ChainType::Ethereum
+            | ChainType::Arbitrum
+            | ChainType::Base
+            | ChainType::Hyperevm => self.refund_evm(&vault, deposit_wallet.private_key()).await,
             ChainType::Hyperliquid => {
                 Err("hyperliquid vaults are never user-funded so have no refund path".to_string())
             }
@@ -954,7 +955,10 @@ impl VaultManager {
                         })?,
                 ))
             }
-            ChainType::Ethereum | ChainType::Arbitrum | ChainType::Base => {
+            ChainType::Ethereum
+            | ChainType::Arbitrum
+            | ChainType::Base
+            | ChainType::Hyperevm => {
                 let evm_chain = self.chain_registry.get_evm(&backend_chain).ok_or(
                     VaultError::ChainNotSupported {
                         chain: vault.deposit_asset.chain.clone(),
@@ -1137,7 +1141,10 @@ impl VaultManager {
                     reason: "bitcoin vaults only support the native asset".to_string(),
                 }),
             },
-            ChainType::Ethereum | ChainType::Arbitrum | ChainType::Base => {
+            ChainType::Ethereum
+            | ChainType::Arbitrum
+            | ChainType::Base
+            | ChainType::Hyperevm => {
                 match &deposit_asset.asset {
                     AssetId::Native => Ok(deposit_asset.clone()),
                     AssetId::Reference(asset) => {
