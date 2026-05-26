@@ -206,6 +206,7 @@ pub fn supported_chain_ids() -> Vec<ChainId> {
         ChainId::from_trusted_static("evm:1"),
         ChainId::from_trusted_static("evm:42161"),
         ChainId::from_trusted_static("evm:8453"),
+        ChainId::from_trusted_static("evm:999"),
     ]
 }
 
@@ -216,6 +217,7 @@ pub fn backend_chain_for_id(chain_id: &ChainId) -> Option<ChainType> {
         "evm:1" => Some(ChainType::Ethereum),
         "evm:42161" => Some(ChainType::Arbitrum),
         "evm:8453" => Some(ChainType::Base),
+        "evm:999" => Some(ChainType::Hyperevm),
         "hyperliquid" => Some(ChainType::Hyperliquid),
         _ => None,
     }
@@ -274,7 +276,7 @@ mod tests {
     #[test]
     fn maps_supported_router_chain_ids_to_backends() {
         let supported = supported_chain_ids();
-        assert_eq!(supported.len(), 4);
+        assert_eq!(supported.len(), 5);
         assert_eq!(
             backend_chain_for_id(&ChainId::parse("bitcoin").unwrap()),
             Some(ChainType::Bitcoin)
@@ -290,6 +292,10 @@ mod tests {
         assert_eq!(
             backend_chain_for_id(&ChainId::parse("evm:8453").unwrap()),
             Some(ChainType::Base)
+        );
+        assert_eq!(
+            backend_chain_for_id(&ChainId::parse("evm:999").unwrap()),
+            Some(ChainType::Hyperevm)
         );
     }
 

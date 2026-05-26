@@ -460,7 +460,10 @@ impl CustodyActionExecutor {
                 })?;
                 let tx_hash = match asset {
                     AssetId::Native => match backend_chain {
-                        ChainType::Ethereum | ChainType::Arbitrum | ChainType::Base => {
+                        ChainType::Ethereum
+                        | ChainType::Arbitrum
+                        | ChainType::Base
+                        | ChainType::Hyperevm => {
                             let Some(evm_chain) = self.chain_registry.get_evm(&backend_chain)
                             else {
                                 return Err(CustodyActionError::UnsupportedAction {
@@ -592,6 +595,7 @@ impl CustodyActionExecutor {
                     ChainType::Ethereum
                         | ChainType::Arbitrum
                         | ChainType::Base
+                        | ChainType::Hyperevm
                         | ChainType::Hyperliquid
                 ) {
                     return Err(CustodyActionError::UnsupportedAction {
@@ -808,7 +812,10 @@ impl CustodyActionExecutor {
         };
 
         match backend_chain {
-            ChainType::Ethereum | ChainType::Arbitrum | ChainType::Base => {
+            ChainType::Ethereum
+            | ChainType::Arbitrum
+            | ChainType::Base
+            | ChainType::Hyperevm => {
                 self.sweep_released_evm_vault(vault, backend_chain, paymaster_address, attempted_at)
                     .await
             }

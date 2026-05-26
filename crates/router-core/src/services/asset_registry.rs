@@ -34,6 +34,7 @@ pub enum ProviderId {
     Cctp,
     Unit,
     HyperliquidBridge,
+    HypercoreBridge,
     Hyperliquid,
     Velora,
 }
@@ -45,6 +46,7 @@ impl ProviderId {
             "cctp" => Some(Self::Cctp),
             "unit" => Some(Self::Unit),
             "hyperliquid_bridge" => Some(Self::HyperliquidBridge),
+            "hypercore_bridge" => Some(Self::HypercoreBridge),
             "hyperliquid" => Some(Self::Hyperliquid),
             "velora" => Some(Self::Velora),
             _ => None,
@@ -58,6 +60,7 @@ impl ProviderId {
             Self::Cctp => "cctp",
             Self::Unit => "unit",
             Self::HyperliquidBridge => "hyperliquid_bridge",
+            Self::HypercoreBridge => "hypercore_bridge",
             Self::Hyperliquid => "hyperliquid",
             Self::Velora => "velora",
         }
@@ -66,9 +69,11 @@ impl ProviderId {
     #[must_use]
     pub fn venue_kind(self) -> ProviderVenueKind {
         match self {
-            Self::Across | Self::Cctp | Self::Unit | Self::HyperliquidBridge => {
-                ProviderVenueKind::CrossChain
-            }
+            Self::Across
+            | Self::Cctp
+            | Self::Unit
+            | Self::HyperliquidBridge
+            | Self::HypercoreBridge => ProviderVenueKind::CrossChain,
             Self::Hyperliquid => ProviderVenueKind::MonoChain {
                 mono_chain_kind: MonoChainVenueKind::FixedPairExchange,
             },
@@ -82,9 +87,11 @@ impl ProviderId {
     pub fn asset_support_model(self) -> AssetSupportModel {
         match self {
             Self::Across => AssetSupportModel::RuntimeEnumerated,
-            Self::Cctp | Self::Unit | Self::HyperliquidBridge | Self::Hyperliquid => {
-                AssetSupportModel::StaticDeclared
-            }
+            Self::Cctp
+            | Self::Unit
+            | Self::HyperliquidBridge
+            | Self::HypercoreBridge
+            | Self::Hyperliquid => AssetSupportModel::StaticDeclared,
             Self::Velora => AssetSupportModel::OpenAddressQuote,
         }
     }
@@ -193,6 +200,7 @@ pub enum MarketOrderTransitionKind {
     CctpBridge,
     UnitDeposit,
     HyperliquidBridgeDeposit,
+    HypercoreBridgeDeposit,
     HyperliquidBridgeWithdrawal,
     HyperliquidTrade,
     UniversalRouterSwap,
@@ -207,6 +215,7 @@ impl MarketOrderTransitionKind {
             Self::CctpBridge => "cctp_bridge",
             Self::UnitDeposit => "unit_deposit",
             Self::HyperliquidBridgeDeposit => "hyperliquid_bridge_deposit",
+            Self::HypercoreBridgeDeposit => "hypercore_bridge_deposit",
             Self::HyperliquidBridgeWithdrawal => "hyperliquid_bridge_withdrawal",
             Self::HyperliquidTrade => "hyperliquid_trade",
             Self::UniversalRouterSwap => "universal_router_swap",
@@ -221,6 +230,7 @@ impl MarketOrderTransitionKind {
             | Self::CctpBridge
             | Self::UnitDeposit
             | Self::HyperliquidBridgeDeposit
+            | Self::HypercoreBridgeDeposit
             | Self::HyperliquidBridgeWithdrawal
             | Self::UnitWithdrawal => RouteEdgeKind::CrossChainTransfer,
             Self::HyperliquidTrade => RouteEdgeKind::FixedPairSwap,
@@ -502,6 +512,20 @@ impl AssetRegistry {
                 transitions.push(MarketOrderTransition {
                     kind: MarketOrderTransitionKind::HyperliquidBridgeDeposit,
                     provider: ProviderId::HyperliquidBridge,
+                    from: MarketOrderNode::External(source_asset.clone()),
+                    to: hyperliquid_venue(source.canonical),
+                });
+            }
+
+            if self.supports_provider_capability(
+                ProviderId::HypercoreBridge,
+                &source_asset,
+                ProviderAssetCapability::BridgeInput,
+            ) && self.has_hyperliquid_venue(source.canonical)
+            {
+                transitions.push(MarketOrderTransition {
+                    kind: MarketOrderTransitionKind::HypercoreBridgeDeposit,
+                    provider: ProviderId::HypercoreBridge,
                     from: MarketOrderNode::External(source_asset.clone()),
                     to: hyperliquid_venue(source.canonical),
                 });
@@ -932,6 +956,10 @@ fn required_roles_for_transition_kind(
             RequiredCustodyRole::IntermediateExecution,
             RequiredCustodyRole::IntermediateExecution,
         ),
+        MarketOrderTransitionKind::HypercoreBridgeDeposit => (
+            RequiredCustodyRole::IntermediateExecution,
+            RequiredCustodyRole::IntermediateExecution,
+        ),
         MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => (
             RequiredCustodyRole::HyperliquidSpot,
             RequiredCustodyRole::IntermediateExecution,
@@ -1014,6 +1042,12 @@ fn builtin_chain_assets() -> Vec<ChainAsset> {
             CanonicalAsset::Usdc,
             "evm:8453",
             AssetId::reference("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
+            6,
+        ),
+        chain_asset(
+            CanonicalAsset::Usdc,
+            "evm:999",
+            AssetId::reference("0xb88339cb7199b77e23db6e890353e22632ba630f"),
             6,
         ),
         chain_asset(
@@ -1106,6 +1140,18 @@ fn builtin_provider_assets() -> Vec<ProviderAsset> {
             "evm:8453",
             "6",
             "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+            6,
+            &[
+                ProviderAssetCapability::BridgeInput,
+                ProviderAssetCapability::BridgeOutput,
+            ],
+        ),
+        provider_asset(
+            ProviderId::Cctp,
+            CanonicalAsset::Usdc,
+            "evm:999",
+            "19",
+            "0xb88339cb7199b77e23db6e890353e22632ba630f",
             6,
             &[
                 ProviderAssetCapability::BridgeInput,
@@ -1255,6 +1301,15 @@ fn builtin_provider_assets() -> Vec<ProviderAsset> {
                 ProviderAssetCapability::BridgeInput,
                 ProviderAssetCapability::BridgeOutput,
             ],
+        ),
+        provider_asset(
+            ProviderId::HypercoreBridge,
+            CanonicalAsset::Usdc,
+            "evm:999",
+            "hypercore",
+            "USDC",
+            6,
+            &[ProviderAssetCapability::BridgeInput],
         ),
         provider_asset(
             ProviderId::Hyperliquid,
@@ -1425,6 +1480,10 @@ mod tests {
             ProviderVenueKind::CrossChain
         );
         assert_eq!(
+            ProviderId::HypercoreBridge.venue_kind(),
+            ProviderVenueKind::CrossChain
+        );
+        assert_eq!(
             ProviderId::Hyperliquid.venue_kind(),
             ProviderVenueKind::MonoChain {
                 mono_chain_kind: MonoChainVenueKind::FixedPairExchange,
@@ -1454,6 +1513,10 @@ mod tests {
         );
         assert_eq!(
             ProviderId::HyperliquidBridge.asset_support_model(),
+            AssetSupportModel::StaticDeclared
+        );
+        assert_eq!(
+            ProviderId::HypercoreBridge.asset_support_model(),
             AssetSupportModel::StaticDeclared
         );
         assert_eq!(
@@ -1497,6 +1560,10 @@ mod tests {
             RouteEdgeKind::FixedPairSwap
         );
         assert_eq!(
+            MarketOrderTransitionKind::HypercoreBridgeDeposit.route_edge_kind(),
+            RouteEdgeKind::CrossChainTransfer
+        );
+        assert_eq!(
             MarketOrderTransitionKind::UniversalRouterSwap.route_edge_kind(),
             RouteEdgeKind::UniversalRouterSwap
         );
@@ -1537,6 +1604,7 @@ mod tests {
                 | MarketOrderTransitionKind::CctpBridge
                 | MarketOrderTransitionKind::UnitDeposit
                 | MarketOrderTransitionKind::HyperliquidBridgeDeposit
+                | MarketOrderTransitionKind::HypercoreBridgeDeposit
                 | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal
                 | MarketOrderTransitionKind::UnitWithdrawal => {
                     assert_eq!(
@@ -1592,12 +1660,42 @@ mod tests {
                 && transition.to == hyperliquid_venue(CanonicalAsset::Usdc)
         }));
         assert!(transitions.iter().any(|transition| {
+            transition.kind == MarketOrderTransitionKind::HypercoreBridgeDeposit
+                && transition.from
+                    == MarketOrderNode::External(asset(
+                        "evm:999",
+                        AssetId::reference("0xb88339cb7199b77e23db6e890353e22632ba630f"),
+                    ))
+                && transition.to == hyperliquid_venue(CanonicalAsset::Usdc)
+        }));
+        assert!(transitions.iter().any(|transition| {
             transition.kind == MarketOrderTransitionKind::UnitDeposit
                 && transition.from == MarketOrderNode::External(asset("bitcoin", AssetId::Native))
         }));
         assert!(transitions.iter().any(|transition| {
             transition.kind == MarketOrderTransitionKind::UnitWithdrawal
-                && transition.to == MarketOrderNode::External(asset("evm:8453", AssetId::Native))
+                && transition.to == MarketOrderNode::External(asset("evm:1", AssetId::Native))
+        }));
+    }
+    #[test]
+    fn base_usdc_to_bitcoin_btc_includes_hypercore_bridge_candidate_path() {
+        let registry = AssetRegistry::default();
+        let paths = registry.select_transition_paths(
+            &asset(
+                "evm:8453",
+                AssetId::reference("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
+            ),
+            &asset("bitcoin", AssetId::Native),
+            5,
+        );
+
+        assert!(paths.iter().any(|path| {
+            path.transitions
+                .iter()
+                .any(|transition| transition.kind == MarketOrderTransitionKind::HypercoreBridgeDeposit)
+                && path.transitions.iter().any(|transition| {
+                    transition.kind == MarketOrderTransitionKind::UnitWithdrawal
+                })
         }));
     }
 
@@ -2077,9 +2175,9 @@ mod tests {
                 })
                 .collect();
             eprintln!(
-                "    [{i}] hops={} cost_bps={} latency_ms={} id={}",
+                "    [{i}] hops={} cost_usd_micros={} latency_ms={} id={}",
                 path.transitions.len(),
-                score.total_effective_cost_bps,
+                score.total_effective_cost_usd_micros,
                 score.total_latency_ms,
                 path.id,
             );

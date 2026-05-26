@@ -71,6 +71,7 @@ const CCTP_MESSAGE_TRANSMITTER_V2_ADDRESS: &str = "0x81D40F21F12A8F0E3252Bccb954
 const MOCK_CCTP_TOKEN_MESSENGER_V2_ADDRESS: &str = "0xcccccccccccccccccccccccccccccccccccc0001";
 const MOCK_CCTP_MESSAGE_TRANSMITTER_V2_ADDRESS: &str = "0xcccccccccccccccccccccccccccccccccccc0002";
 const CCTP_STANDARD_FINALITY_THRESHOLD: u32 = 2_000;
+const CCTP_FAST_FINALITY_THRESHOLD: u32 = 1_000;
 
 // Canonical Across V3 `FundsDeposited` event — field order, types, and indexed
 // topics match the real SpokePool ABI so logs emitted by real Across (and by
@@ -114,6 +115,11 @@ sol! {
     ICircleMessageTransmitterV2,
     "../../vendor/cctp/MessageTransmitterV2.abi.json",
 }
+sol! {
+    interface ICoreDepositWallet {
+        function deposit(uint256 amount, uint32 destinationDex) external;
+    }
+}
 
 pub type ProviderResult<T> = Result<T, String>;
 pub type ProviderFuture<'a, T> = Pin<Box<dyn Future<Output = ProviderResult<T>> + Send + 'a>>;
@@ -145,6 +151,7 @@ pub enum BridgeExecutionRequest {
     CctpBurn(CctpBurnStepRequest),
     CctpReceive(CctpReceiveStepRequest),
     HyperliquidBridgeDeposit(HyperliquidBridgeDepositStepRequest),
+    HypercoreBridgeDeposit(HypercoreBridgeDepositStepRequest),
     HyperliquidBridgeWithdrawal(HyperliquidBridgeWithdrawalStepRequest),
 }
 
@@ -166,6 +173,11 @@ impl BridgeExecutionRequest {
             .map(Self::HyperliquidBridgeDeposit)
     }
 
+    pub fn hypercore_bridge_deposit_from_value(value: &Value) -> ProviderResult<Self> {
+        decode_step_request(value, "hypercore bridge step request")
+            .map(Self::HypercoreBridgeDeposit)
+    }
+
     pub fn hyperliquid_bridge_withdrawal_from_value(value: &Value) -> ProviderResult<Self> {
         decode_step_request(value, "hyperliquid bridge withdrawal step request")
             .map(Self::HyperliquidBridgeWithdrawal)
@@ -178,6 +190,7 @@ impl BridgeExecutionRequest {
             Self::CctpBurn(_) => "cctp_burn",
             Self::CctpReceive(_) => "cctp_receive",
             Self::HyperliquidBridgeDeposit(_) => "hyperliquid_bridge_deposit",
+            Self::HypercoreBridgeDeposit(_) => "hypercore_bridge_deposit",
             Self::HyperliquidBridgeWithdrawal(_) => "hyperliquid_bridge_withdrawal",
         }
     }
@@ -486,11 +499,47 @@ pub struct AcrossHttpProviderConfig {
     pub integrator_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CctpTransferMode {
+    Standard,
+    Fast,
+}
+
+impl CctpTransferMode {
+    pub const fn min_finality_threshold(self) -> u32 {
+        match self {
+            Self::Standard => CCTP_STANDARD_FINALITY_THRESHOLD,
+            Self::Fast => CCTP_FAST_FINALITY_THRESHOLD,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Fast => "fast",
+        }
+    }
+}
+
+impl FromStr for CctpTransferMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "standard" => Ok(Self::Standard),
+            "fast" => Ok(Self::Fast),
+            other => Err(format!("unsupported CCTP transfer mode {other:?}; expected standard or fast")),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct CctpHttpProviderConfig {
     pub base_url: String,
     pub token_messenger_v2_address: String,
     pub message_transmitter_v2_address: String,
+    pub transfer_mode: CctpTransferMode,
 }
 
 #[derive(Clone)]
@@ -509,6 +558,7 @@ pub struct ActionProviderHttpOptions {
     pub velora: Option<VeloraHttpProviderConfig>,
     pub hyperliquid_network: HyperliquidCallNetwork,
     pub hyperliquid_order_timeout_ms: u64,
+    pub hypercore_bridge_enabled: bool,
 }
 
 impl fmt::Debug for AcrossHttpProviderConfig {
@@ -533,6 +583,7 @@ impl fmt::Debug for CctpHttpProviderConfig {
                 "message_transmitter_v2_address",
                 &self.message_transmitter_v2_address,
             )
+            .field("transfer_mode", &self.transfer_mode)
             .finish()
     }
 }
@@ -575,6 +626,7 @@ impl fmt::Debug for ActionProviderHttpOptions {
                 "hyperliquid_order_timeout_ms",
                 &self.hyperliquid_order_timeout_ms,
             )
+            .field("hypercore_bridge_enabled", &self.hypercore_bridge_enabled)
             .finish()
     }
 }
@@ -620,6 +672,7 @@ impl CctpHttpProviderConfig {
             base_url: base_url.into(),
             token_messenger_v2_address: CCTP_TOKEN_MESSENGER_V2_ADDRESS.to_string(),
             message_transmitter_v2_address: CCTP_MESSAGE_TRANSMITTER_V2_ADDRESS.to_string(),
+            transfer_mode: CctpTransferMode::Standard,
         }
     }
 
@@ -629,6 +682,7 @@ impl CctpHttpProviderConfig {
             base_url: base_url.into(),
             token_messenger_v2_address: MOCK_CCTP_TOKEN_MESSENGER_V2_ADDRESS.to_string(),
             message_transmitter_v2_address: MOCK_CCTP_MESSAGE_TRANSMITTER_V2_ADDRESS.to_string(),
+            transfer_mode: CctpTransferMode::Standard,
         }
     }
 
@@ -644,6 +698,11 @@ impl CctpHttpProviderConfig {
         if let Some(address) = message_transmitter_v2_address {
             self.message_transmitter_v2_address = address;
         }
+        self
+    }
+    #[must_use]
+    pub fn with_transfer_mode(mut self, transfer_mode: CctpTransferMode) -> Self {
+        self.transfer_mode = transfer_mode;
         self
     }
 }
@@ -738,6 +797,7 @@ impl ActionProviderRegistry {
             velora,
             hyperliquid_network,
             hyperliquid_order_timeout_ms: DEFAULT_HYPERLIQUID_ORDER_TIMEOUT_MS,
+            hypercore_bridge_enabled: false,
         })
     }
 
@@ -751,6 +811,7 @@ impl ActionProviderRegistry {
             velora,
             hyperliquid_network,
             hyperliquid_order_timeout_ms,
+            hypercore_bridge_enabled,
         } = options;
         let asset_registry = Arc::new(AssetRegistry::default());
         let mut bridges = Vec::<Arc<dyn BridgeProvider>>::new();
@@ -762,19 +823,27 @@ impl ActionProviderRegistry {
             bridges.push(Arc::new(provider));
         }
         if let Some(config) = cctp {
-            bridges.push(Arc::new(CctpProvider::new(
+            bridges.push(Arc::new(CctpProvider::new_with_transfer_mode(
                 config.base_url,
                 config.token_messenger_v2_address,
                 config.message_transmitter_v2_address,
+                config.transfer_mode,
                 asset_registry.clone(),
             )?));
         }
         if let Some(base_url) = hyperliquid_base_url.clone() {
             bridges.push(Arc::new(HyperliquidBridgeProvider::new(
-                base_url,
+                base_url.clone(),
                 hyperliquid_network,
                 asset_registry.clone(),
             )?));
+            if hypercore_bridge_enabled {
+                bridges.push(Arc::new(HypercoreBridgeProvider::new(
+                    base_url,
+                    hyperliquid_network,
+                    asset_registry.clone(),
+                )?));
+            }
         }
         let hyperliquid_target_base_url = hyperliquid_base_url.clone();
         let units = hyperunit_base_url
@@ -1344,7 +1413,10 @@ mod velora_price_route_tests {
 
         let (user_address, receiver) = velora_price_route_addresses(&request);
 
-        assert_eq!(user_address, Some("0x2222222222222222222222222222222222222222"));
+        assert_eq!(
+            user_address,
+            Some("0x2222222222222222222222222222222222222222")
+        );
         assert_eq!(receiver, Some("0x1111111111111111111111111111111111111111"));
     }
 
@@ -2119,6 +2191,315 @@ fn seen_operation_fingerprints_from_request(request: &Value) -> ProviderResult<B
 }
 
 #[derive(Clone)]
+pub struct HypercoreBridgeProvider {
+    network: HyperliquidCallNetwork,
+    asset_registry: Arc<AssetRegistry>,
+    http: HyperliquidHttpClient,
+    target_base_url: String,
+    core_deposit_wallet: Address,
+}
+
+const HYPERCORE_SPOT_DESTINATION_DEX: u32 = u32::MAX;
+const HYPERCORE_SPOT_SYMBOL: &str = "USDC";
+const HYPERCORE_CORE_DEPOSIT_WALLET_MAINNET: &str = "0x6b9e773128f453f5c2c60935ee2de2cbc5390a24";
+const HYPERCORE_CORE_DEPOSIT_WALLET_TESTNET: &str = "0x0b80659a4076e9e93c7dbe0f10675a16a3e5c206";
+
+impl HypercoreBridgeProvider {
+    pub fn new(
+        base_url: impl Into<String>,
+        network: HyperliquidCallNetwork,
+        asset_registry: Arc<AssetRegistry>,
+    ) -> Result<Self, String> {
+        let target_base_url = normalize_base_url(base_url)?;
+        let http = HyperliquidHttpClient::new(rustls_http_client()?, target_base_url.clone());
+        let core_deposit_wallet = Address::from_str(hypercore_core_deposit_wallet_address(
+            hyperliquid_api_network(network),
+        ))
+        .map_err(|err| format!("invalid HyperCore CoreDepositWallet address: {err}"))?;
+        Ok(Self {
+            network,
+            asset_registry,
+            http,
+            target_base_url,
+            core_deposit_wallet,
+        })
+    }
+
+    fn resolve_bridge_input(&self, asset: &DepositAsset) -> ProviderResult<u8> {
+        self.asset_registry
+            .provider_asset(
+                ProviderId::HypercoreBridge,
+                asset,
+                ProviderAssetCapability::BridgeInput,
+            )
+            .map(|entry| entry.decimals)
+            .ok_or_else(|| {
+                format!(
+                    "hypercore bridge does not register {} on {} as a bridge input",
+                    asset.asset, asset.chain
+                )
+            })
+    }
+
+    async fn spot_clearinghouse_state(&self, user: &str) -> ProviderResult<SpotClearinghouseState> {
+        let req = json!({
+            "type": "spotClearinghouseState",
+            "user": user,
+        });
+        self.http
+            .post_json("/info", &req)
+            .await
+            .map_err(|err| format!("hypercore bridge /info spotClearinghouseState: {err}"))
+    }
+}
+
+impl BridgeProvider for HypercoreBridgeProvider {
+    fn id(&self) -> &str {
+        "hypercore_bridge"
+    }
+
+    fn quote_bridge<'a>(
+        &'a self,
+        request: BridgeQuoteRequest,
+    ) -> ProviderFuture<'a, Option<BridgeQuote>> {
+        Box::pin(async move {
+            let is_deposit = request.source_asset.chain.as_str() == "evm:999"
+                && request.destination_asset.chain.as_str() == "hyperliquid"
+                && request.destination_asset.asset.is_native()
+                && self
+                    .asset_registry
+                    .canonical_assets_match(&request.source_asset, &request.destination_asset)
+                && self.resolve_bridge_input(&request.source_asset).is_ok();
+            if !is_deposit {
+                return Ok(None);
+            }
+
+            let (amount_in, amount_out) = match &request.order_kind {
+                ProviderOrderKind::ExactIn { amount_in, .. } => (amount_in.clone(), amount_in.clone()),
+                ProviderOrderKind::ExactOut { amount_out, .. } => (amount_out.clone(), amount_out.clone()),
+            };
+
+            Ok(Some(BridgeQuote {
+                provider_id: self.id().to_string(),
+                amount_in,
+                amount_out,
+                provider_quote: json!({
+                    "kind": "hypercore_bridge_deposit",
+                    "core_deposit_wallet": format!("{:#x}", self.core_deposit_wallet),
+                    "destination_dex": HYPERCORE_SPOT_DESTINATION_DEX,
+                    "destination_asset": HYPERCORE_SPOT_SYMBOL,
+                }),
+                expires_at: Utc::now() + chrono::Duration::seconds(30),
+            }))
+        })
+    }
+
+    fn execute_bridge<'a>(
+        &'a self,
+        request: &'a BridgeExecutionRequest,
+    ) -> ProviderFuture<'a, ProviderExecutionIntent> {
+        Box::pin(async move {
+            let BridgeExecutionRequest::HypercoreBridgeDeposit(step) = request else {
+                return Err(format!(
+                    "hypercore bridge cannot execute bridge request kind {}",
+                    request.kind()
+                ));
+            };
+            let source_chain = ChainId::parse(&step.source_chain_id)
+                .map_err(|err| format!("invalid source_chain_id: {err}"))?;
+            let input_asset_id = AssetId::parse(&step.input_asset)
+                .map_err(|err| format!("invalid input_asset: {err}"))?;
+            let source_asset = DepositAsset {
+                chain: source_chain,
+                asset: input_asset_id,
+            };
+            let decimals = self.resolve_bridge_input(&source_asset)?;
+            let amount = U256::from_str_radix(&step.amount, 10)
+                .map_err(|err| format!("invalid amount {}: {err}", step.amount))?;
+            let source_custody_vault_id = step.source_custody_vault_id.ok_or_else(|| {
+                "hypercore bridge: source_custody_vault_id must be hydrated".to_string()
+            })?;
+            let hyperliquid_user = step.source_custody_vault_address.clone().ok_or_else(|| {
+                "hypercore bridge: source_custody_vault_address must be hydrated".to_string()
+            })?;
+            let before_state = self.spot_clearinghouse_state(&hyperliquid_user).await?;
+            let before_spot_balance_raw =
+                parse_decimal_to_raw_units(before_state.balance_of(HYPERCORE_SPOT_SYMBOL), decimals)?;
+            let activation_fee_raw = hypercore_activation_fee_raw(before_spot_balance_raw, amount);
+            let expected_output_raw = amount
+                .checked_sub(activation_fee_raw)
+                .ok_or_else(|| "hypercore bridge expected output underflowed".to_string())?;
+            let expected_spot_balance_raw = before_spot_balance_raw
+                .checked_add(expected_output_raw)
+                .ok_or_else(|| "hypercore bridge expected spot balance overflowed".to_string())?;
+
+            let approve = CustodyAction::Call(ChainCall::Evm(EvmCall {
+                to_address: step.input_asset.clone(),
+                value: "0".to_string(),
+                calldata: encode_erc20_approve(
+                    &format!("{:#x}", self.core_deposit_wallet),
+                    &step.amount,
+                )?,
+                broadcast_policy: Default::default(),
+            }));
+            let deposit = ICoreDepositWallet::depositCall {
+                amount,
+                destinationDex: HYPERCORE_SPOT_DESTINATION_DEX,
+            };
+            let deposit_action = CustodyAction::Call(ChainCall::Evm(EvmCall {
+                to_address: format!("{:#x}", self.core_deposit_wallet),
+                value: "0".to_string(),
+                calldata: format!("0x{}", hex::encode(deposit.abi_encode())),
+                broadcast_policy: Default::default(),
+            }));
+            let operation_request = json!({
+                "source_chain_id": step.source_chain_id,
+                "input_asset": step.input_asset,
+                "amount": step.amount,
+                "hyperliquid_user": hyperliquid_user,
+                "before_spot_balance_raw": before_spot_balance_raw.to_string(),
+                "activation_fee_raw": activation_fee_raw.to_string(),
+                "expected_output_raw": expected_output_raw.to_string(),
+                "expected_spot_balance_raw": expected_spot_balance_raw.to_string(),
+                "core_deposit_wallet": format!("{:#x}", self.core_deposit_wallet),
+                "destination_dex": HYPERCORE_SPOT_DESTINATION_DEX,
+                "spot_symbol": HYPERCORE_SPOT_SYMBOL,
+                "target_base_url": self.target_base_url,
+                "network": self.network,
+            });
+
+            Ok(ProviderExecutionIntent::CustodyActions {
+                custody_vault_id: source_custody_vault_id,
+                actions: vec![approve, deposit_action],
+                provider_context: operation_request.clone(),
+                state: ProviderExecutionState {
+                    operation: Some(ProviderOperationIntent {
+                        operation_type: ProviderOperationType::HypercoreBridgeDeposit,
+                        status: ProviderOperationStatus::Submitted,
+                        provider_ref: Some(hyperliquid_user.clone()),
+                        idempotency_key: None,
+                        request: Some(operation_request),
+                        response: Some(json!({
+                            "kind": "hypercore_bridge_deposit_submitted",
+                            "before_spot_clearinghouse_state": before_state,
+                        })),
+                        observed_state: None,
+                    }),
+                    addresses: vec![],
+                },
+            })
+        })
+    }
+
+    fn post_execute<'a>(
+        &'a self,
+        provider_context: &'a Value,
+        receipts: &'a [CustodyActionReceipt],
+    ) -> ProviderFuture<'a, ProviderExecutionStatePatch> {
+        Box::pin(async move {
+            let deposit_receipt = receipts
+                .last()
+                .ok_or_else(|| "hypercore bridge post_execute: no custody action receipts".to_string())?;
+            let user = provider_context
+                .get("hyperliquid_user")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    "hypercore bridge post_execute: provider_context missing hyperliquid_user"
+                        .to_string()
+                })?;
+            let expected = hypercore_expected_balances(provider_context)?;
+            let expected_spot_balance_raw = expected.expected_spot_balance_raw;
+            let state = self.spot_clearinghouse_state(user).await?;
+            let observed_spot_balance_raw =
+                parse_decimal_to_raw_units(state.balance_of(HYPERCORE_SPOT_SYMBOL), 6)?;
+            let status = if observed_spot_balance_raw >= expected_spot_balance_raw {
+                ProviderOperationStatus::Completed
+            } else {
+                ProviderOperationStatus::WaitingExternal
+            };
+            let response = if status == ProviderOperationStatus::Completed {
+                Some(hypercore_bridge_deposit_completion_response(
+                    provider_context,
+                    &state,
+                    observed_spot_balance_raw,
+                )?)
+            } else {
+                None
+            };
+            Ok(ProviderExecutionStatePatch {
+                provider_ref: Some(user.to_string()),
+                observed_state: Some(json!({
+                    "deposit_tx_hash": deposit_receipt.tx_hash,
+                    "spot_clearinghouse_state": state,
+                    "observed_spot_balance_raw": observed_spot_balance_raw.to_string(),
+                    "expected_spot_balance_raw": expected_spot_balance_raw.to_string(),
+                    "submitted_at": Utc::now(),
+                })),
+                response,
+                status: Some(status),
+            })
+        })
+    }
+
+    fn observe_bridge_operation<'a>(
+        &'a self,
+        request: ProviderOperationObservationRequest,
+    ) -> ProviderFuture<'a, Option<ProviderOperationObservation>> {
+        Box::pin(async move {
+            if request.operation_type != ProviderOperationType::HypercoreBridgeDeposit {
+                return Ok(None);
+            }
+            let user = request.provider_ref.as_deref().ok_or_else(|| {
+                "hypercore bridge observe: provider_ref (hyperliquid user) is required"
+                    .to_string()
+            })?;
+            let expected = hypercore_expected_balances(&request.request)?;
+            let expected_spot_balance_raw = expected.expected_spot_balance_raw;
+            let state = self.spot_clearinghouse_state(user).await?;
+            let observed_spot_balance_raw =
+                parse_decimal_to_raw_units(state.balance_of(HYPERCORE_SPOT_SYMBOL), 6)?;
+            let status = if observed_spot_balance_raw >= expected_spot_balance_raw {
+                ProviderOperationStatus::Completed
+            } else {
+                ProviderOperationStatus::WaitingExternal
+            };
+            let response = if status == ProviderOperationStatus::Completed {
+                Some(hypercore_bridge_deposit_completion_response(
+                    &request.request,
+                    &state,
+                    observed_spot_balance_raw,
+                )?)
+            } else {
+                None
+            };
+
+            Ok(Some(ProviderOperationObservation {
+                status,
+                provider_ref: Some(user.to_string()),
+                observed_state: json!({
+                    "spot_clearinghouse_state": state,
+                    "observed_spot_balance_raw": observed_spot_balance_raw.to_string(),
+                    "expected_spot_balance_raw": expected_spot_balance_raw.to_string(),
+                }),
+                response,
+                tx_hash: request
+                    .observed_state
+                    .get("deposit_tx_hash")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                error: None,
+            }))
+        })
+    }
+}
+
+fn hypercore_core_deposit_wallet_address(network: HyperliquidApiNetwork) -> &'static str {
+    match network {
+        HyperliquidApiNetwork::Mainnet => HYPERCORE_CORE_DEPOSIT_WALLET_MAINNET,
+        HyperliquidApiNetwork::Testnet => HYPERCORE_CORE_DEPOSIT_WALLET_TESTNET,
+    }
+}
+#[derive(Clone)]
 pub struct HyperliquidBridgeProvider {
     network: HyperliquidCallNetwork,
     asset_registry: Arc<AssetRegistry>,
@@ -2277,6 +2658,96 @@ impl HyperliquidBridgeProvider {
             },
         })
     }
+}
+#[derive(Debug, Clone, Copy)]
+struct HypercoreExpectedBalances {
+    amount_raw: U256,
+    before_spot_balance_raw: U256,
+    activation_fee_raw: U256,
+    expected_output_raw: U256,
+    expected_spot_balance_raw: U256,
+}
+
+const HYPERCORE_ACTIVATION_FEE_RAW_U64: u64 = HYPERLIQUID_CORE_ACTIVATION_FEE_RAW;
+
+fn hypercore_activation_fee_raw(before_spot_balance_raw: U256, amount_raw: U256) -> U256 {
+    if before_spot_balance_raw.is_zero() {
+        amount_raw.min(U256::from(HYPERCORE_ACTIVATION_FEE_RAW_U64))
+    } else {
+        U256::ZERO
+    }
+}
+
+fn hypercore_expected_balances(request: &Value) -> ProviderResult<HypercoreExpectedBalances> {
+    let amount = request
+        .get("amount")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "hypercore bridge observe: request missing amount".to_string())?;
+    let amount_raw = U256::from_str_radix(amount, 10)
+        .map_err(|err| format!("hypercore bridge observe: invalid amount: {err}"))?;
+    let before_spot_balance_raw = request
+        .get("before_spot_balance_raw")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            "hypercore bridge observe: request missing before_spot_balance_raw".to_string()
+        })
+        .and_then(|raw| {
+            U256::from_str_radix(raw, 10).map_err(|err| {
+                format!("hypercore bridge observe: invalid before_spot_balance_raw: {err}")
+            })
+        })?;
+    let activation_fee_raw = request
+        .get("activation_fee_raw")
+        .and_then(Value::as_str)
+        .map(|raw| {
+            U256::from_str_radix(raw, 10)
+                .map_err(|err| format!("hypercore bridge observe: invalid activation_fee_raw: {err}"))
+        })
+        .transpose()?
+        .unwrap_or_else(|| hypercore_activation_fee_raw(before_spot_balance_raw, amount_raw));
+    let expected_output_raw = request
+        .get("expected_output_raw")
+        .and_then(Value::as_str)
+        .map(|raw| {
+            U256::from_str_radix(raw, 10)
+                .map_err(|err| format!("hypercore bridge observe: invalid expected_output_raw: {err}"))
+        })
+        .transpose()?
+        .unwrap_or_else(|| amount_raw.saturating_sub(activation_fee_raw));
+    let expected_spot_balance_raw = before_spot_balance_raw
+        .checked_add(expected_output_raw)
+        .ok_or_else(|| "hypercore bridge observe: expected spot balance overflowed".to_string())?;
+    Ok(HypercoreExpectedBalances {
+        amount_raw,
+        before_spot_balance_raw,
+        activation_fee_raw,
+        expected_output_raw,
+        expected_spot_balance_raw,
+    })
+}
+
+fn hypercore_bridge_deposit_completion_response(
+    request: &Value,
+    state: &SpotClearinghouseState,
+    observed_spot_balance_raw: U256,
+) -> ProviderResult<Value> {
+    let expected = hypercore_expected_balances(request)?;
+    let observed_delta_raw = observed_spot_balance_raw
+        .checked_sub(expected.before_spot_balance_raw)
+        .ok_or_else(|| "hypercore bridge observe: observed spot balance went backwards".to_string())?;
+
+    Ok(json!({
+        "kind": "hypercore_bridge_deposit",
+        "amount_in": expected.amount_raw.to_string(),
+        "amount_out": observed_delta_raw.to_string(),
+        "before_spot_balance_raw": expected.before_spot_balance_raw.to_string(),
+        "activation_fee_raw": expected.activation_fee_raw.to_string(),
+        "expected_output_raw": expected.expected_output_raw.to_string(),
+        "expected_spot_balance_raw": expected.expected_spot_balance_raw.to_string(),
+        "observed_spot_balance_raw": observed_spot_balance_raw.to_string(),
+        "observed_spot_balance_delta_raw": observed_delta_raw.to_string(),
+        "spot_clearinghouse_state": state,
+    }))
 }
 
 impl BridgeProvider for HyperliquidBridgeProvider {
@@ -2622,6 +3093,7 @@ pub struct CctpProvider {
     asset_registry: Arc<AssetRegistry>,
     token_messenger_v2_address: Address,
     message_transmitter_v2_address: Address,
+    transfer_mode: CctpTransferMode,
 }
 
 impl CctpProvider {
@@ -2629,6 +3101,22 @@ impl CctpProvider {
         base_url: impl Into<String>,
         token_messenger_v2_address: impl AsRef<str>,
         message_transmitter_v2_address: impl AsRef<str>,
+        asset_registry: Arc<AssetRegistry>,
+    ) -> ProviderResult<Self> {
+        Self::new_with_transfer_mode(
+            base_url,
+            token_messenger_v2_address,
+            message_transmitter_v2_address,
+            CctpTransferMode::Standard,
+            asset_registry,
+        )
+    }
+
+    pub fn new_with_transfer_mode(
+        base_url: impl Into<String>,
+        token_messenger_v2_address: impl AsRef<str>,
+        message_transmitter_v2_address: impl AsRef<str>,
+        transfer_mode: CctpTransferMode,
         asset_registry: Arc<AssetRegistry>,
     ) -> ProviderResult<Self> {
         let token_messenger_v2_address = Address::from_str(token_messenger_v2_address.as_ref())
@@ -2642,6 +3130,7 @@ impl CctpProvider {
             asset_registry,
             token_messenger_v2_address,
             message_transmitter_v2_address,
+            transfer_mode,
         })
     }
 
@@ -2808,7 +3297,7 @@ impl CctpProvider {
         })
     }
 
-    async fn standard_burn_fee_bps_micros(
+    async fn burn_fee_bps_micros(
         &self,
         source_domain: u32,
         destination_domain: u32,
@@ -2816,13 +3305,15 @@ impl CctpProvider {
         let fees = self
             .fetch_burn_fees(source_domain, destination_domain)
             .await?;
+        let threshold = self.transfer_mode.min_finality_threshold();
         let entry = fees
             .iter()
-            .find(|fee| fee.finality_threshold == CCTP_STANDARD_FINALITY_THRESHOLD)
+            .find(|fee| fee.finality_threshold == threshold)
             .ok_or_else(|| {
                 format!(
-                    "cctp burn fees missing standard finality threshold {} for {source_domain}->{destination_domain}",
-                    CCTP_STANDARD_FINALITY_THRESHOLD
+                    "cctp burn fees missing {} finality threshold {} for {source_domain}->{destination_domain}",
+                    self.transfer_mode.as_str(),
+                    threshold,
                 )
             })?;
         parse_decimal_bps_to_micros(&entry.minimum_fee_bps)
@@ -2845,11 +3336,12 @@ impl BridgeProvider for CctpProvider {
                 return Ok(None);
             };
             let fee_bps_micros = self
-                .standard_burn_fee_bps_micros(assets.source_domain, assets.destination_domain)
+                .burn_fee_bps_micros(assets.source_domain, assets.destination_domain)
                 .await?;
             let Some(amounts) = cctp_quote_amounts(&request.order_kind, fee_bps_micros)? else {
                 return Ok(None);
             };
+            let min_finality_threshold = self.transfer_mode.min_finality_threshold();
 
             Ok(Some(BridgeQuote {
                 provider_id: self.id().to_string(),
@@ -2866,8 +3358,8 @@ impl BridgeProvider for CctpProvider {
                     "message_transmitter_v2": format!("{:#x}", self.message_transmitter_v2_address),
                     "fee_bps": decimal_bps_string(fee_bps_micros),
                     "max_fee": amounts.max_fee.to_string(),
-                    "min_finality_threshold": CCTP_STANDARD_FINALITY_THRESHOLD,
-                    "transfer_mode": "standard",
+                    "min_finality_threshold": min_finality_threshold,
+                    "transfer_mode": self.transfer_mode.as_str(),
                 }),
                 expires_at: Utc::now() + chrono::Duration::minutes(5),
             }))
@@ -3072,6 +3564,7 @@ impl CctpProvider {
             )?,
             broadcast_policy: Default::default(),
         }));
+        let min_finality_threshold = self.transfer_mode.min_finality_threshold();
         let call = ICircleTokenMessengerV2::depositForBurnCall {
             amount,
             destinationDomain: assets.destination_domain,
@@ -3079,7 +3572,7 @@ impl CctpProvider {
             burnToken: assets.burn_token,
             destinationCaller: FixedBytes::ZERO,
             maxFee: max_fee,
-            minFinalityThreshold: CCTP_STANDARD_FINALITY_THRESHOLD,
+            minFinalityThreshold: min_finality_threshold,
         };
         let burn = CustodyAction::Call(ChainCall::Evm(EvmCall {
             to_address: format!("{:#x}", self.token_messenger_v2_address),
@@ -3102,7 +3595,8 @@ impl CctpProvider {
             "token_messenger_v2": format!("{:#x}", self.token_messenger_v2_address),
             "message_transmitter_v2": format!("{:#x}", self.message_transmitter_v2_address),
             "max_fee": max_fee.to_string(),
-            "min_finality_threshold": CCTP_STANDARD_FINALITY_THRESHOLD,
+            "min_finality_threshold": min_finality_threshold,
+            "transfer_mode": self.transfer_mode.as_str(),
         });
 
         Ok(ProviderExecutionIntent::CustodyActions {
@@ -3602,6 +4096,17 @@ impl UnitWithdrawalStepRequest {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct HyperliquidBridgeDepositStepRequest {
+    pub order_id: Uuid,
+    pub source_chain_id: String,
+    pub input_asset: String,
+    pub amount: String,
+    #[serde(default)]
+    pub source_custody_vault_id: Option<Uuid>,
+    #[serde(default)]
+    pub source_custody_vault_address: Option<String>,
+}
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HypercoreBridgeDepositStepRequest {
     pub order_id: Uuid,
     pub source_chain_id: String,
     pub input_asset: String,
@@ -4286,9 +4791,7 @@ pub struct VeloraProvider {
 /// `recipient_address` is always populated. Fall back to recipient as the
 /// `userAddress` so the constraint is satisfied at both quote and
 /// execution time.
-fn velora_price_route_addresses(
-    request: &ExchangeQuoteRequest,
-) -> (Option<&str>, Option<&str>) {
+fn velora_price_route_addresses(request: &ExchangeQuoteRequest) -> (Option<&str>, Option<&str>) {
     let recipient = trimmed_non_empty(&request.recipient_address);
     let sender = request
         .sender_address
@@ -6979,11 +7482,11 @@ pub fn ethereum_native_asset() -> DepositAsset {
 #[cfg(test)]
 mod hyperliquid_math_tests {
     use super::{
-        build_across_swap_approval_request, cctp_provider_address,
-        cctp_provider_domain, cctp_quote_amounts, cctp_source_domain_from_request,
-        checked_timeout_at_ms, classify_hl_leg, compute_base_sz, compute_limit_px,
-        decimal_bps_string, encode_erc20_approve, format_hl_spot_price, format_hyperliquid_amount,
-        hl_leg_descriptor, hyperliquid_bridge_deposit_completion_response,
+        build_across_swap_approval_request, cctp_provider_address, cctp_provider_domain,
+        cctp_quote_amounts, cctp_source_domain_from_request, checked_timeout_at_ms,
+        classify_hl_leg, compute_base_sz, compute_limit_px, decimal_bps_string,
+        encode_erc20_approve, format_hl_spot_price, format_hyperliquid_amount, hl_leg_descriptor,
+        hypercore_bridge_deposit_completion_response, hyperliquid_bridge_deposit_completion_response,
         hyperliquid_filled_actual_amounts, hyperliquid_order_oid_from_observation_request,
         hyperliquid_order_status_provider_status, observed_unit_operation_fingerprints,
         parse_decimal_bps_to_micros, parse_decimal_to_raw_units, parse_decimal_to_raw_units_floor,
@@ -6992,8 +7495,9 @@ mod hyperliquid_math_tests {
         validated_unit_generate_address, velora_slippage_bps, AcrossHttpProviderConfig,
         ActionProviderHttpOptions, ActionProviderRegistry, BridgeExecutionRequest, BridgeProvider,
         BridgeQuoteRequest, CctpHttpProviderConfig, CctpMessagesResponse, CctpProvider,
-        CctpQuoteAmounts, ExchangeExecutionRequest, ExchangeProvider, HyperliquidBridgeProvider,
-        HyperliquidCallNetwork, HyperliquidProvider, HyperliquidTradeAssetRef,
+        CctpQuoteAmounts, CctpTransferMode, ExchangeExecutionRequest, ExchangeProvider, HypercoreBridgeProvider,
+        HyperliquidBridgeProvider, HyperliquidCallNetwork, HyperliquidProvider,
+        HyperliquidTradeAssetRef,
         HyperliquidTradeStepRequest, LimitPxInput, ProviderExecutionIntent,
         ProviderOperationObservationRequest, UniversalRouterAssetRef, VeloraHttpProviderConfig,
         VeloraProvider, DEFAULT_HYPERLIQUID_ORDER_TIMEOUT_MS, HYPERLIQUID_BRIDGE_WITHDRAW_FEE_RAW,
@@ -7008,7 +7512,7 @@ mod hyperliquid_math_tests {
         },
     };
     use alloy::primitives::U256;
-    use hyperliquid_client::info::{ClearinghouseState, L2BookSnapshot, L2Level};
+    use hyperliquid_client::info::{ClearinghouseState, L2BookSnapshot, L2Level, SpotBalance, SpotClearinghouseState};
     use hyperunit_client::{UnitChain, UnitGenerateAddressResponse};
     use serde_json::json;
     use std::sync::Arc;
@@ -7406,6 +7910,7 @@ mod hyperliquid_math_tests {
             )),
             hyperliquid_network: HyperliquidCallNetwork::Mainnet,
             hyperliquid_order_timeout_ms: DEFAULT_HYPERLIQUID_ORDER_TIMEOUT_MS,
+            hypercore_bridge_enabled: true,
         };
         let rendered = format!("{options:?}");
 
@@ -7608,6 +8113,28 @@ mod hyperliquid_math_tests {
     }
 
     #[test]
+    fn cctp_transfer_mode_parses_expected_values() {
+        assert_eq!("standard".parse::<CctpTransferMode>().unwrap(), CctpTransferMode::Standard);
+        assert_eq!("fast".parse::<CctpTransferMode>().unwrap(), CctpTransferMode::Fast);
+        assert!("turbo".parse::<CctpTransferMode>().is_err());
+    }
+
+    #[test]
+    fn cctp_fast_transfer_mode_sets_threshold_on_config() {
+        let config = CctpHttpProviderConfig::new("https://iris.example")
+            .with_transfer_mode(CctpTransferMode::Fast);
+        assert_eq!(config.transfer_mode, CctpTransferMode::Fast);
+        assert_eq!(config.transfer_mode.min_finality_threshold(), 1_000);
+    }
+
+    #[test]
+    fn cctp_default_transfer_mode_is_standard() {
+        let config = CctpHttpProviderConfig::new("https://iris.example");
+        assert_eq!(config.transfer_mode, CctpTransferMode::Standard);
+        assert_eq!(config.transfer_mode.min_finality_threshold(), 2_000);
+    }
+
+    #[test]
     fn cctp_exact_in_quote_deducts_circle_fee() {
         let order_kind = ProviderOrderKind::ExactIn {
             amount_in: "1000000".to_string(),
@@ -7671,9 +8198,8 @@ mod hyperliquid_math_tests {
         let parse =
             |s: &str| -> super::CctpMessageEntry { serde_json::from_str(s).expect("parses") };
         // Terminal: amount above the per-tx max
-        let terminal = parse(
-            r#"{"status":"pending_confirmations","delayReason":"amount_above_max"}"#,
-        );
+        let terminal =
+            parse(r#"{"status":"pending_confirmations","delayReason":"amount_above_max"}"#);
         assert!(terminal.is_terminally_failed());
         // Retryable: insufficient fee / allowance, plus the no-delay-reason case
         for body in [
@@ -7682,7 +8208,10 @@ mod hyperliquid_math_tests {
             r#"{"status":"pending_confirmations"}"#,
             r#"{"status":"complete"}"#,
         ] {
-            assert!(!parse(body).is_terminally_failed(), "body should be non-terminal: {body}");
+            assert!(
+                !parse(body).is_terminally_failed(),
+                "body should be non-terminal: {body}"
+            );
         }
     }
 
@@ -7710,6 +8239,107 @@ mod hyperliquid_math_tests {
         let error = BridgeExecutionRequest::cctp_burn_from_value(&request)
             .expect_err("missing CCTP max_fee must reject at request boundary");
         assert!(error.contains("max_fee"), "{error}");
+    }
+    #[tokio::test]
+    async fn hypercore_bridge_quote_is_one_to_one_for_hyperevm_usdc() {
+        let provider = HypercoreBridgeProvider::new(
+            "http://localhost:1",
+            HyperliquidCallNetwork::Mainnet,
+            Arc::new(AssetRegistry::default()),
+        )
+        .expect("provider");
+        let quote = provider
+            .quote_bridge(BridgeQuoteRequest {
+                source_asset: DepositAsset {
+                    chain: ChainId::parse("evm:999").unwrap(),
+                    asset: AssetId::reference("0xb88339cb7199b77e23db6e890353e22632ba630f"),
+                },
+                destination_asset: DepositAsset {
+                    chain: ChainId::parse("hyperliquid").unwrap(),
+                    asset: AssetId::Native,
+                },
+                order_kind: ProviderOrderKind::ExactIn {
+                    amount_in: "1234567".to_string(),
+                    min_amount_out: Some("1".to_string()),
+                },
+                recipient_address: "0x1111111111111111111111111111111111111111".to_string(),
+                depositor_address: "0x1111111111111111111111111111111111111111".to_string(),
+                partial_fills_enabled: false,
+            })
+            .await
+            .expect("quote result")
+            .expect("route");
+        assert_eq!(quote.provider_id, "hypercore_bridge");
+        assert_eq!(quote.amount_in, "1234567");
+        assert_eq!(quote.amount_out, "1234567");
+        assert_eq!(quote.provider_quote["kind"], "hypercore_bridge_deposit");
+        assert_eq!(
+            quote.provider_quote["core_deposit_wallet"],
+            "0x6b9e773128f453f5c2c60935ee2de2cbc5390a24"
+        );
+        assert_eq!(quote.provider_quote["destination_dex"], serde_json::json!(u32::MAX));
+    }
+    #[test]
+    fn hypercore_bridge_completion_response_reports_spot_balance_delta() {
+        let request = json!({
+            "amount": "2500000",
+            "before_spot_balance_raw": "1000000",
+            "expected_spot_balance_raw": "3500000",
+        });
+        let state = SpotClearinghouseState {
+            balances: vec![SpotBalance {
+                coin: "USDC".to_string(),
+                token: 0,
+                hold: "0".to_string(),
+                total: "3.5".to_string(),
+                entry_ntl: None,
+            }],
+        };
+
+        let response = hypercore_bridge_deposit_completion_response(
+            &request,
+            &state,
+            U256::from(3_500_000_u64),
+        )
+        .expect("completion response");
+
+        assert_eq!(response["kind"], "hypercore_bridge_deposit");
+        assert_eq!(response["amount_in"], "2500000");
+        assert_eq!(response["amount_out"], "2500000");
+        assert_eq!(response["observed_spot_balance_raw"], "3500000");
+        assert_eq!(response["observed_spot_balance_delta_raw"], "2500000");
+    }
+
+    #[test]
+    fn hypercore_bridge_completion_response_accounts_for_activation_fee_on_fresh_destination() {
+        let request = json!({
+            "amount": "39994800",
+            "before_spot_balance_raw": "0",
+            "expected_spot_balance_raw": "39994800",
+        });
+        let state = SpotClearinghouseState {
+            balances: vec![SpotBalance {
+                coin: "USDC".to_string(),
+                token: 0,
+                hold: "0".to_string(),
+                total: "38.9948".to_string(),
+                entry_ntl: None,
+            }],
+        };
+
+        let response = hypercore_bridge_deposit_completion_response(
+            &request,
+            &state,
+            U256::from(38_994_800_u64),
+        )
+        .expect("completion response");
+
+        assert_eq!(response["amount_in"], "39994800");
+        assert_eq!(response["amount_out"], "38994800");
+        assert_eq!(response["activation_fee_raw"], "1000000");
+        assert_eq!(response["expected_output_raw"], "38994800");
+        assert_eq!(response["expected_spot_balance_raw"], "38994800");
+        assert_eq!(response["observed_spot_balance_delta_raw"], "38994800");
     }
 
     #[test]

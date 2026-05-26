@@ -862,6 +862,37 @@ fn materialize_transition_steps_range(
                 leg_index += 1;
                 advance_step_index(&mut step_index, 1)?;
             }
+            MarketOrderTransitionKind::HypercoreBridgeDeposit => {
+                let leg = legs.take_one(&transition.id, transition.kind)?;
+                let transition_steps = vec![hypercore_bridge_deposit_step(
+                    order,
+                    source_vault,
+                    transition,
+                    &leg,
+                    input_custody_role_for_transition(
+                        &path.transitions,
+                        transition_index,
+                        range.initial_source_role,
+                    ),
+                    step_index,
+                    planned_at,
+                )?];
+                push_execution_leg(
+                    &mut execution_legs,
+                    &mut steps,
+                    ExecutionLegMaterializationSpec {
+                        order,
+                        quote,
+                        transition,
+                        quote_legs: &[leg],
+                        transition_steps,
+                        leg_index,
+                        planned_at,
+                    },
+                )?;
+                leg_index += 1;
+                advance_step_index(&mut step_index, 1)?;
+            }
             MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
                 let leg = legs.take_one(&transition.id, transition.kind)?;
                 let custody = hyperliquid_custody_for_withdrawal(
@@ -2100,6 +2131,21 @@ fn hyperliquid_custody_for_transition(
             prefund_first_trade: prior_trade_count == 0,
         });
     }
+    if prior_transitions
+        .iter()
+        .any(|transition| transition.kind == MarketOrderTransitionKind::HypercoreBridgeDeposit)
+    {
+        let custody = hyperliquid_custody_for_prior_bridge(
+            transitions,
+            transition_index,
+            initial_source_role,
+        )?;
+        return Ok(DerivedHyperliquidCustody {
+            role: custody.role,
+            asset: custody.asset,
+            prefund_first_trade: false,
+        });
+    }
     if let Some(custody) =
         initial_custody_after_hyperliquid_trade_prefix(prior_transitions, initial_custody)
     {
@@ -2138,6 +2184,16 @@ fn hyperliquid_custody_for_withdrawal(
     if prior_transitions
         .iter()
         .any(|transition| transition.kind == MarketOrderTransitionKind::HyperliquidBridgeDeposit)
+    {
+        return hyperliquid_custody_for_prior_bridge(
+            transitions,
+            transition_index,
+            initial_source_role,
+        );
+    }
+    if prior_transitions
+        .iter()
+        .any(|transition| transition.kind == MarketOrderTransitionKind::HypercoreBridgeDeposit)
     {
         return hyperliquid_custody_for_prior_bridge(
             transitions,
@@ -2189,7 +2245,11 @@ fn hyperliquid_custody_for_prior_bridge(
     let bridge_index = transitions[..transition_index]
         .iter()
         .rposition(|transition| {
-            transition.kind == MarketOrderTransitionKind::HyperliquidBridgeDeposit
+            matches!(
+                transition.kind,
+                MarketOrderTransitionKind::HyperliquidBridgeDeposit
+                    | MarketOrderTransitionKind::HypercoreBridgeDeposit
+            )
         })
         .ok_or_else(|| MarketOrderRoutePlanError::UnsupportedRoute {
             reason: "hyperliquid custody requested without a prior bridge deposit".to_string(),
@@ -2574,6 +2634,56 @@ fn hyperliquid_bridge_deposit_step(
         planned_at,
     }))
 }
+fn hypercore_bridge_deposit_step(
+    order: &RouterOrder,
+    source_vault: &DepositVault,
+    transition: &TransitionDecl,
+    leg: &QuoteLeg,
+    source_role: Option<CustodyVaultRole>,
+    step_index: i32,
+    planned_at: DateTime<Utc>,
+) -> MarketOrderRoutePlanResult<OrderExecutionStep> {
+    let provider_id = leg_provider(leg, transition)?;
+    let provider = provider_id.as_str().to_string();
+    let amount_in = leg.amount_in.clone();
+    let source_role_string = source_role.map(|role| role.to_db_string().to_string());
+    let (source_custody_vault_id, source_custody_vault_address) = if source_role.is_none() {
+        (
+            json!(source_vault.id),
+            json!(source_vault.deposit_vault_address.clone()),
+        )
+    } else {
+        (Value::Null, Value::Null)
+    };
+    Ok(step(StepSpec {
+        order_id: order.id,
+        transition_decl_id: Some(transition.id.clone()),
+        step_index,
+        step_type: OrderExecutionStepType::HypercoreBridgeDeposit,
+        provider: provider.clone(),
+        input_asset: Some(transition.input.asset.clone()),
+        output_asset: Some(transition.output.asset.clone()),
+        amount_in: Some(amount_in.clone()),
+        provider_ref: None,
+        idempotency_key: idempotency_key(order.id, &provider, step_index),
+        request: json!({
+            "order_id": order.id,
+            "source_chain_id": transition.input.asset.chain.as_str(),
+            "input_asset": transition.input.asset.asset.as_str(),
+            "amount": amount_in,
+            "source_custody_vault_id": source_custody_vault_id,
+            "source_custody_vault_role": source_role_string,
+            "source_custody_vault_address": source_custody_vault_address
+        }),
+        details: json!({
+            "schema_version": 1,
+            "transition_kind": transition.kind.as_str(),
+            "source_custody_vault_role": source_role.map(CustodyVaultRole::to_db_string),
+            "source_custody_vault_status": if source_role.is_some() { json!("pending_derivation") } else { json!("bound") }
+        }),
+        planned_at,
+    }))
+}
 
 struct HyperliquidBridgeWithdrawalStepSpec<'a> {
     order: &'a RouterOrder,
@@ -2759,6 +2869,11 @@ fn validate_intermediate_custody_plan(
                 &[CustodyVaultRole::HyperliquidSpot],
             )?,
             OrderExecutionStepType::HyperliquidBridgeDeposit => maybe_require_request_role(
+                step,
+                "source_custody_vault_role",
+                &[CustodyVaultRole::DestinationExecution],
+            )?,
+            OrderExecutionStepType::HypercoreBridgeDeposit => maybe_require_request_role(
                 step,
                 "source_custody_vault_role",
                 &[CustodyVaultRole::DestinationExecution],

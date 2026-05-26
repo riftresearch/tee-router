@@ -7,6 +7,7 @@ pub enum ChainType {
     Ethereum,
     Arbitrum,
     Base,
+    Hyperevm,
     Hyperliquid,
 }
 
@@ -18,6 +19,7 @@ impl ChainType {
             ChainType::Ethereum => "ethereum",
             ChainType::Arbitrum => "arbitrum",
             ChainType::Base => "base",
+            ChainType::Hyperevm => "hyperevm",
             ChainType::Hyperliquid => "hyperliquid",
         }
     }
@@ -29,6 +31,7 @@ impl ChainType {
             "ethereum" => Some(ChainType::Ethereum),
             "arbitrum" => Some(ChainType::Arbitrum),
             "base" => Some(ChainType::Base),
+            "hyperevm" => Some(ChainType::Hyperevm),
             "hyperliquid" => Some(ChainType::Hyperliquid),
             _ => None,
         }
