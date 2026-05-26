@@ -183,8 +183,8 @@ The Phala Temporal server is **split into four single-responsibility role
 containers** (frontend / history / matching / internal-worker) rather than a
 single all-in-one server. All four share the `*temporal-server-base` anchor in
 `etc/compose.phala.yml` and differ only by `SERVICES=` and health port. This
-mirrors `etc/compose.local-full.yml` and is the topology the perf/loadgen work
-was validated against.
+mirrors the split local compose topology in `etc/compose.local-infra.yml` and is
+the topology the perf/loadgen work was validated against.
 
 Key server config (inline in the compose `configs:` / base anchor):
 
@@ -206,7 +206,7 @@ command): `ROUTER_TEMPORAL_ACTIVITY_POLLERS=128`,
 `ROUTER_PAYMASTER_BATCH_MAX_SIZE=64`. These are baked into the prod compose; to
 re-tune, change the `export` lines in the `temporal-worker` service.
 
-> Sizing note: `compose.local-full.yml` additionally sets
+> Sizing note: `compose.local-infra.yml` additionally sets
 > `deploy.resources.limits.cpus` per Temporal role (≈32 cores total) for the
 > loadgen host. Those limits are **intentionally not** carried into
 > `compose.phala.yml` — they are loadgen-box sizing, are ignored by plain
@@ -779,7 +779,8 @@ code.
 
 ```sh
 docker compose \
-  -f etc/compose.local-full.yml \
+  -f etc/compose.local-infra.yml \
+  -f etc/compose.local-devnet.yml \
   -f etc/compose.local-observability.yml \
   up -d
 ```

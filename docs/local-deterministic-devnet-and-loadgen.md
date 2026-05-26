@@ -25,8 +25,8 @@ money, and no real third-party APIs:
 The normal developer entrypoint should be:
 
 ```sh
-docker compose -f etc/compose.local-full.yml up
-docker compose -f etc/compose.local-full.yml down
+just dc up-d
+just dc down
 ```
 
 ## Requirements
@@ -108,7 +108,14 @@ The interactive devnet should reserve the following ports:
 
 ## Local compose shape
 
-`etc/compose.local-full.yml` should own process lifecycle:
+Local compose is split into shared infrastructure plus a devnet overlay:
+
+- `etc/compose.local-infra.yml` owns shared process lifecycle
+- `etc/compose.local-devnet.yml` owns fake chains, mock providers, fake keys,
+  and loadgen wiring
+- `etc/compose.local-observability.yml` adds metrics/logging
+
+Together they run:
 
 - `devnet`
 - `router-postgres`

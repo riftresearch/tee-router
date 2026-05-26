@@ -120,7 +120,8 @@ Local development mirrors the endgame topology in one compose overlay:
 
 ```sh
 docker compose \
-  -f etc/compose.local-full.yml \
+  -f etc/compose.local-infra.yml \
+  -f etc/compose.local-devnet.yml \
   -f etc/compose.local-observability.yml \
   up -d
 ```

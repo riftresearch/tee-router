@@ -57,6 +57,7 @@ tmp/
 
 # Logs
 *.log
+live-test-logs/
 
 # SQLx offline mode data (should be committed)
 !.sqlx/
