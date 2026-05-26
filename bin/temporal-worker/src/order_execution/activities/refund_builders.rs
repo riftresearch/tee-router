@@ -124,11 +124,12 @@ fn materialize_external_custody_refund_transition(
                 order, source, transition, &leg, is_final, step_index, planned_at,
             )?])
         }
-        MarketOrderTransitionKind::HyperliquidBridgeDeposit => {
+        MarketOrderTransitionKind::HyperliquidBridgeDeposit
+        | MarketOrderTransitionKind::HypercoreBridgeDeposit => {
             let leg = external_refund_leg(
                 quoted_path,
                 transition,
-                OrderExecutionStepType::HyperliquidBridgeDeposit,
+                execution_step_type_for_transition_kind(transition.kind),
             )?;
             Ok(vec![refund_transition_hyperliquid_bridge_deposit_step(
                 order, source, transition, &leg, step_index, planned_at,
@@ -419,6 +420,7 @@ async fn quote_external_custody_refund_transition(
         MarketOrderTransitionKind::AcrossBridge
         | MarketOrderTransitionKind::CctpBridge
         | MarketOrderTransitionKind::HyperliquidBridgeDeposit
+        | MarketOrderTransitionKind::HypercoreBridgeDeposit
         | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
             refund_bridge_quote_transition(deps, order, transition, cursor_amount, &vault.address)
                 .await
@@ -456,8 +458,11 @@ fn external_custody_hyperliquid_trade_quote_amount(
     cursor_amount: &str,
 ) -> Result<String, OrderActivityError> {
     if transition_index > 0
-        && path.transitions[transition_index - 1].kind
-            == MarketOrderTransitionKind::HyperliquidBridgeDeposit
+        && matches!(
+            path.transitions[transition_index - 1].kind,
+            MarketOrderTransitionKind::HyperliquidBridgeDeposit
+                | MarketOrderTransitionKind::HypercoreBridgeDeposit
+        )
     {
         reserve_refund_hyperliquid_spot_send_quote_gas(
             "refund.hyperliquid_trade.amount_in",
@@ -741,6 +746,7 @@ pub(super) fn refund_bridge_quote_legs(
             Ok(vec![burn, receive])
         }
         MarketOrderTransitionKind::HyperliquidBridgeDeposit
+        | MarketOrderTransitionKind::HypercoreBridgeDeposit
         | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
             Ok(vec![QuoteLeg::new(QuoteLegSpec {
                 transition_decl_id: &transition.id,
@@ -1409,7 +1415,7 @@ pub(super) fn refund_transition_hyperliquid_bridge_deposit_step(
         order_id: order.id,
         transition_decl_id: Some(transition.id.clone()),
         step_index,
-        step_type: OrderExecutionStepType::HyperliquidBridgeDeposit,
+        step_type: execution_step_type_for_transition_kind(transition.kind),
         provider,
         input_asset: Some(transition.input.asset.clone()),
         output_asset: Some(transition.output.asset.clone()),
@@ -1520,11 +1526,15 @@ pub(super) fn external_refund_hyperliquid_binding(
         ))
     })?;
 
-    if transitions.first().map(|transition| transition.kind)
-        == Some(MarketOrderTransitionKind::HyperliquidBridgeDeposit)
-        && prior_transitions
-            .iter()
-            .all(|transition| transition.kind != MarketOrderTransitionKind::AcrossBridge)
+    if matches!(
+        transitions.first().map(|transition| transition.kind),
+        Some(
+            MarketOrderTransitionKind::HyperliquidBridgeDeposit
+                | MarketOrderTransitionKind::HypercoreBridgeDeposit
+        )
+    ) && prior_transitions
+        .iter()
+        .all(|transition| transition.kind != MarketOrderTransitionKind::AcrossBridge)
     {
         let asset_id = vault.asset.clone().ok_or_else(|| {
             refund_materialization_error(format!(
@@ -1552,14 +1562,19 @@ pub(super) fn external_refund_hyperliquid_binding(
 
     let Some(bridge_transition) = prior_transitions
         .iter()
-        .find(|transition| transition.kind == MarketOrderTransitionKind::HyperliquidBridgeDeposit)
+        .find(|transition| {
+            matches!(
+                transition.kind,
+                MarketOrderTransitionKind::HyperliquidBridgeDeposit
+                    | MarketOrderTransitionKind::HypercoreBridgeDeposit
+            )
+        })
     else {
         return Err(refund_materialization_error(format!(
             "refund transition {} has no preceding Hyperliquid custody source",
             transitions[transition_index].id
         )));
     };
-
     Ok(RefundHyperliquidBinding::DerivedDestinationExecution {
         asset: bridge_transition.input.asset.clone(),
     })

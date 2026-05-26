@@ -45,6 +45,9 @@ impl RefundActivities {
     ) -> Result<RefundPlanShape, ActivityError> {
         record_activity("materialize_refund_plan", async move {
             let deps = self.deps()?;
+            if input.position.position_kind == RecoverablePositionKind::CctpReceiveClaim {
+                return materialize_cctp_receive_claim_refund_plan(&deps, input).await;
+            }
             if input.position.position_kind == RecoverablePositionKind::ExternalCustody {
                 return materialize_external_custody_refund_plan(&deps, input).await;
             }
@@ -347,6 +350,8 @@ pub(super) async fn discover_single_refund_position_with_deps(
         );
     }
 
+    positions.extend(cctp_receive_claim_positions_for_attempt(deps, &failed_attempt).await?);
+
     tracing::info!(
         order_id = %input.order_id.inner(),
         failed_attempt_id = %input.failed_attempt_id.inner(),
@@ -378,6 +383,18 @@ async fn expected_refund_position_asset(
     order: &RouterOrder,
     failed_attempt: &OrderExecutionAttempt,
 ) -> Result<Option<DepositAsset>, OrderActivityError> {
+    if failed_attempt.attempt_kind == OrderExecutionAttemptKind::RefundRecovery {
+        let steps = deps
+            .db
+            .orders()
+            .get_execution_steps_for_attempt(failed_attempt.id)
+            .await
+            .map_err(OrderActivityError::db_query)?;
+        if let Some(asset) = latest_refund_recovery_progress_asset(&steps) {
+            return Ok(Some(asset));
+        }
+    }
+
     if let Some(asset) = failed_attempt
         .input_custody_snapshot
         .get("source_asset")
@@ -417,6 +434,143 @@ async fn expected_refund_position_asset(
     Ok(None)
 }
 
+pub(super) fn latest_refund_recovery_progress_asset(
+    steps: &[OrderExecutionStep],
+) -> Option<DepositAsset> {
+    steps
+        .iter()
+        .filter(|step| {
+            matches!(
+                step.status,
+                OrderExecutionStepStatus::Completed | OrderExecutionStepStatus::Waiting
+            )
+        })
+        .filter_map(|step| step.output_asset.clone().map(|asset| (step, asset)))
+        .max_by_key(|(step, _)| (step.step_index, step.created_at, step.id))
+        .map(|(_, asset)| asset)
+}
+
+async fn cctp_receive_claim_positions_for_attempt(
+    deps: &OrderActivityDeps,
+    failed_attempt: &OrderExecutionAttempt,
+) -> Result<Vec<SingleRefundPosition>, OrderActivityError> {
+    let steps = deps
+        .db
+        .orders()
+        .get_execution_steps_for_attempt(failed_attempt.id)
+        .await
+        .map_err(OrderActivityError::db_query)?;
+    let operations = deps
+        .db
+        .orders()
+        .get_provider_operations(failed_attempt.order_id)
+        .await
+        .map_err(OrderActivityError::db_query)?;
+    Ok(cctp_receive_claim_positions_from_steps_and_operations(
+        &steps,
+        &operations,
+    ))
+}
+
+pub(super) fn cctp_receive_claim_positions_from_steps_and_operations(
+    steps: &[OrderExecutionStep],
+    operations: &[OrderProviderOperation],
+) -> Vec<SingleRefundPosition> {
+    steps
+        .iter()
+        .filter(|step| step.step_type == OrderExecutionStepType::CctpReceive)
+        .filter(|step| {
+            matches!(
+                step.status,
+                OrderExecutionStepStatus::Planned
+                    | OrderExecutionStepStatus::Ready
+                    | OrderExecutionStepStatus::Failed
+            )
+        })
+        .filter_map(|step| {
+            let burn_transition_decl_id = step
+                .request
+                .get("burn_transition_decl_id")
+                .and_then(Value::as_str)?;
+            if cctp_receive_already_in_flight(operations, burn_transition_decl_id) {
+                return None;
+            }
+            let operation =
+                latest_completed_cctp_burn_operation(operations, burn_transition_decl_id)?;
+            let amount = cctp_attested_burn_amount(operation)?;
+            let asset = step
+                .output_asset
+                .clone()
+                .or_else(|| step.input_asset.clone())?;
+            let custody_vault_id = step
+                .request
+                .get("source_custody_vault_id")
+                .and_then(uuid_from_json_string)?;
+            Some(SingleRefundPosition {
+                position_kind: RecoverablePositionKind::CctpReceiveClaim,
+                owning_step_id: Some(step.id.into()),
+                funding_vault_id: None,
+                custody_vault_id: Some(custody_vault_id.into()),
+                asset,
+                amount: RawAmount::new(amount).ok()?,
+                hyperliquid_coin: None,
+                hyperliquid_canonical: None,
+                requires_clearinghouse_unwrap: false,
+            })
+        })
+        .collect()
+}
+
+fn latest_completed_cctp_burn_operation<'a>(
+    operations: &'a [OrderProviderOperation],
+    burn_transition_decl_id: &str,
+) -> Option<&'a OrderProviderOperation> {
+    operations
+        .iter()
+        .filter(|operation| {
+            operation.operation_type == ProviderOperationType::CctpBridge
+                && operation.status == ProviderOperationStatus::Completed
+                && operation
+                    .request
+                    .get("transition_decl_id")
+                    .and_then(Value::as_str)
+                    == Some(burn_transition_decl_id)
+        })
+        .max_by_key(|operation| (operation.updated_at, operation.created_at, operation.id))
+}
+
+fn cctp_receive_already_in_flight(
+    operations: &[OrderProviderOperation],
+    burn_transition_decl_id: &str,
+) -> bool {
+    operations.iter().any(|operation| {
+        operation.operation_type == ProviderOperationType::CctpReceive
+            && !matches!(
+                operation.status,
+                ProviderOperationStatus::Failed | ProviderOperationStatus::Expired
+            )
+            && operation
+                .request
+                .get("burn_transition_decl_id")
+                .and_then(Value::as_str)
+                == Some(burn_transition_decl_id)
+    })
+}
+
+pub(super) fn cctp_attested_burn_amount(operation: &OrderProviderOperation) -> Option<&str> {
+    operation
+        .observed_state
+        .pointer("/provider_observed_state/decoded_message_body/amount")
+        .and_then(decimal_string)
+        .or_else(|| {
+            operation
+                .response
+                .pointer("/messages/0/decodedMessage/decodedMessageBody/amount")
+                .and_then(decimal_string)
+        })
+        .or_else(|| operation.request.get("amount").and_then(decimal_string))
+}
+
 fn deposit_asset_from_value(value: &Value) -> Option<DepositAsset> {
     serde_json::from_value(value.clone()).ok()
 }
@@ -428,7 +582,13 @@ fn uuid_from_json_string(value: &Value) -> Option<Uuid> {
 fn external_custody_direct_balance_supported(chain: &ChainId) -> bool {
     matches!(
         backend_chain_for_id(chain),
-        Some(ChainType::Bitcoin | ChainType::Ethereum | ChainType::Arbitrum | ChainType::Base)
+        Some(
+            ChainType::Bitcoin
+                | ChainType::Ethereum
+                | ChainType::Arbitrum
+                | ChainType::Base
+                | ChainType::Hyperevm
+        )
     )
 }
 
@@ -627,6 +787,7 @@ fn refund_position_matches_asset(
 
 fn refund_position_priority(position_kind: RecoverablePositionKind) -> u8 {
     match position_kind {
+        RecoverablePositionKind::CctpReceiveClaim => 0,
         RecoverablePositionKind::FundingVault => 0,
         RecoverablePositionKind::ExternalCustody => 1,
         RecoverablePositionKind::HyperliquidSpot => 2,
@@ -668,6 +829,7 @@ pub(super) fn recoverable_position_kind_label(
         RecoverablePositionKind::FundingVault => "funding_vault",
         RecoverablePositionKind::ExternalCustody => "external_custody",
         RecoverablePositionKind::HyperliquidSpot => "hyperliquid_spot",
+        RecoverablePositionKind::CctpReceiveClaim => "cctp_receive_claim",
     }
 }
 
@@ -683,6 +845,215 @@ pub(super) fn raw_amount_is_positive(
         ));
     }
     Ok(trimmed.as_bytes().iter().any(|digit| *digit != b'0'))
+}
+
+async fn materialize_cctp_receive_claim_refund_plan(
+    deps: &OrderActivityDeps,
+    input: MaterializeRefundPlanInput,
+) -> Result<RefundPlanShape, OrderActivityError> {
+    let order = deps
+        .db
+        .orders()
+        .get(input.order_id.inner())
+        .await
+        .map_err(OrderActivityError::db_query)?;
+    let Some(step_id) = input.position.owning_step_id else {
+        return Err(refund_materialization_error(
+            "CCTP receive claim refund position is missing owning_step_id",
+        ));
+    };
+    let receive_step = deps
+        .db
+        .orders()
+        .get_execution_step(step_id.inner())
+        .await
+        .map_err(OrderActivityError::db_query)?;
+    if receive_step.order_id != input.order_id.inner()
+        || receive_step.execution_attempt_id != Some(input.failed_attempt_id.inner())
+    {
+        return Err(invariant_error(
+            "cctp_receive_claim_step_belongs_to_failed_attempt",
+            format!(
+                "CCTP receive claim step {} does not belong to order {} failed attempt {}",
+                receive_step.id,
+                input.order_id.inner(),
+                input.failed_attempt_id.inner()
+            ),
+        ));
+    }
+    if receive_step.step_type != OrderExecutionStepType::CctpReceive {
+        return Err(invariant_error(
+            "cctp_receive_claim_step_type",
+            format!(
+                "CCTP receive claim step {} has type {}",
+                receive_step.id,
+                receive_step.step_type.to_db_string()
+            ),
+        ));
+    }
+    let Some(source_vault_id) = input.position.custody_vault_id else {
+        return Err(refund_materialization_error(
+            "CCTP receive claim refund position is missing custody_vault_id",
+        ));
+    };
+    let source_vault = deps
+        .db
+        .orders()
+        .get_custody_vault(source_vault_id.inner())
+        .await
+        .map_err(OrderActivityError::db_query)?;
+    if source_vault.order_id != Some(input.order_id.inner()) {
+        return Err(invariant_error(
+            "cctp_receive_claim_vault_belongs_to_order",
+            format!(
+                "CCTP receive claim vault {} does not belong to order {}",
+                source_vault.id,
+                input.order_id.inner()
+            ),
+        ));
+    }
+
+    let amount = input.position.amount.as_str().to_string();
+    let asset = receive_step
+        .output_asset
+        .clone()
+        .or_else(|| receive_step.input_asset.clone())
+        .ok_or_else(|| {
+            refund_materialization_error(format!(
+                "CCTP receive claim step {} has no asset",
+                receive_step.id
+            ))
+        })?;
+    let burn_transition_decl_id = receive_step
+        .request
+        .get("burn_transition_decl_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            refund_materialization_error(format!(
+                "CCTP receive claim step {} missing burn_transition_decl_id",
+                receive_step.id
+            ))
+        })?
+        .to_string();
+    let now = Utc::now();
+    let mut request = receive_step.request.clone();
+    set_json_value(&mut request, "amount", json!(amount.clone()));
+    set_json_value(&mut request, "message", json!(""));
+    set_json_value(&mut request, "attestation", json!(""));
+    set_json_value(
+        &mut request,
+        "source_custody_vault_id",
+        json!(source_vault.id),
+    );
+    set_json_value(
+        &mut request,
+        "source_custody_vault_address",
+        json!(source_vault.address.clone()),
+    );
+    set_json_value(
+        &mut request,
+        "source_custody_vault_role",
+        json!(source_vault.role.to_db_string()),
+    );
+
+    let leg = OrderExecutionLeg {
+        id: Uuid::now_v7(),
+        order_id: order.id,
+        execution_attempt_id: None,
+        transition_decl_id: Some(burn_transition_decl_id.clone()),
+        leg_index: 0,
+        leg_type: MarketOrderTransitionKind::CctpBridge.as_str().to_string(),
+        provider: receive_step.provider.clone(),
+        status: OrderExecutionStepStatus::Planned,
+        input_asset: asset.clone(),
+        output_asset: asset.clone(),
+        amount_in: amount.clone(),
+        estimated_amount_out: amount.clone(),
+        actual_amount_in: None,
+        actual_amount_out: None,
+        started_at: None,
+        completed_at: None,
+        provider_quote_expires_at: None,
+        details: json!({
+            "schema_version": 1,
+            "refund_kind": "cctp_receive_claim",
+            "source_step_id": receive_step.id,
+            "burn_transition_decl_id": burn_transition_decl_id,
+        }),
+        usd_valuation: json!({}),
+        created_at: now,
+        updated_at: now,
+    };
+    let step = OrderExecutionStep {
+        id: Uuid::now_v7(),
+        order_id: order.id,
+        execution_attempt_id: None,
+        execution_leg_id: Some(leg.id),
+        transition_decl_id: receive_step.transition_decl_id.clone(),
+        step_index: 0,
+        step_type: OrderExecutionStepType::CctpReceive,
+        provider: receive_step.provider.clone(),
+        status: OrderExecutionStepStatus::Planned,
+        input_asset: Some(asset.clone()),
+        output_asset: Some(asset.clone()),
+        amount_in: Some(amount.clone()),
+        tx_hash: None,
+        provider_ref: Some(format!("order:{}:external-refund:cctp-claim", order.id)),
+        idempotency_key: None,
+        attempt_count: 0,
+        next_attempt_at: None,
+        started_at: None,
+        completed_at: None,
+        details: json!({
+            "schema_version": 1,
+            "refund_kind": "cctp_receive_claim",
+            "source_step_id": receive_step.id,
+            "source_custody_vault_role": source_vault.role.to_db_string(),
+            "source_custody_vault_status": "bound",
+        }),
+        request,
+        response: json!({}),
+        error: json!({}),
+        usd_valuation: json!({}),
+        created_at: now,
+        updated_at: now,
+    };
+
+    let record = deps
+        .db
+        .orders()
+        .create_refund_attempt_from_external_custody(
+            input.order_id.inner(),
+            input.failed_attempt_id.inner(),
+            ExternalCustodyRefundAttemptPlan {
+                source_custody_vault_id: source_vault.id,
+                legs: vec![leg],
+                steps: vec![step],
+                failure_reason: json!({
+                    "reason": "primary_execution_attempts_exhausted",
+                    "trace": "refund_workflow",
+                    "failed_attempt_id": input.failed_attempt_id.inner(),
+                }),
+                input_custody_snapshot: json!({
+                    "schema_version": 1,
+                    "source_kind": "cctp_receive_claim",
+                    "source_step_id": receive_step.id,
+                    "source_asset": {
+                        "chain": asset.chain.as_str(),
+                        "asset": asset.asset.as_str(),
+                    },
+                    "amount": amount,
+                }),
+            },
+            now,
+        )
+        .await
+        .map_err(OrderActivityError::db_query)?;
+    telemetry::record_refund_attempt_materialized("cctp_receive_claim", "cctp_receive");
+    Ok(materialized_refund_plan_shape(
+        record.attempt.id,
+        record.steps,
+    ))
 }
 
 pub(super) async fn materialize_external_custody_refund_plan(
@@ -1255,6 +1626,7 @@ pub(super) async fn best_hyperliquid_spot_refund_quote(
     }
     Ok(best)
 }
+const HYPERLIQUID_REFUND_SPOT_SEND_QUOTE_GAS_RESERVE_RAW: u64 = 1_000_000;
 
 pub(super) async fn quote_hyperliquid_spot_refund_path(
     deps: &OrderActivityDeps,
@@ -1265,9 +1637,18 @@ pub(super) async fn quote_hyperliquid_spot_refund_path(
     let mut cursor_amount = amount.to_string();
     let mut legs = Vec::new();
 
-    for transition in &path.transitions {
+    for (transition_index, transition) in path.transitions.iter().enumerate() {
+        let Some(quote_amount_in) = quote_amount_for_hyperliquid_spot_refund_transition(
+            &path,
+            transition_index,
+            transition,
+            &cursor_amount,
+        )?
+        else {
+            return Ok(None);
+        };
         let Some(quote) =
-            quote_hyperliquid_spot_refund_transition(deps, order, transition, &cursor_amount)
+            quote_hyperliquid_spot_refund_transition(deps, order, transition, &quote_amount_in)
                 .await?
         else {
             return Ok(None);
@@ -1299,6 +1680,7 @@ async fn quote_hyperliquid_spot_refund_transition(
         MarketOrderTransitionKind::AcrossBridge
         | MarketOrderTransitionKind::CctpBridge
         | MarketOrderTransitionKind::HyperliquidBridgeDeposit
+        | MarketOrderTransitionKind::HypercoreBridgeDeposit
         | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
             refund_bridge_quote_transition(
                 deps,
@@ -1319,6 +1701,34 @@ async fn quote_hyperliquid_spot_refund_transition(
     }
 }
 
+pub(super) fn quote_amount_for_hyperliquid_spot_refund_transition(
+    path: &TransitionPath,
+    transition_index: usize,
+    transition: &TransitionDecl,
+    cursor_amount: &str,
+) -> Result<Option<String>, OrderActivityError> {
+    if transition.kind != MarketOrderTransitionKind::HyperliquidTrade
+        || transition.input.asset.chain.as_str() != "hyperliquid"
+        || !transition.input.asset.asset.is_native()
+        || !path.transitions[transition_index + 1..]
+            .iter()
+            .any(|next| next.kind == MarketOrderTransitionKind::UnitWithdrawal)
+    {
+        return Ok(Some(cursor_amount.to_string()));
+    }
+    let amount = U256::from_str_radix(cursor_amount, 10).map_err(|source| {
+        amount_parse_error(
+            "hyperliquid_spot_refund.trade.amount_in",
+            format!("invalid Hyperliquid spot refund amount {cursor_amount}: {source}"),
+        )
+    })?;
+    let reserve = U256::from(HYPERLIQUID_REFUND_SPOT_SEND_QUOTE_GAS_RESERVE_RAW);
+    if amount <= reserve {
+        return Ok(None);
+    }
+    Ok(Some((amount - reserve).to_string()))
+}
+
 pub(super) fn refund_path_compatible_with_position(
     position_kind: RecoverablePositionKind,
     external_vault_role: Option<CustodyVaultRole>,
@@ -1328,13 +1738,15 @@ pub(super) fn refund_path_compatible_with_position(
         return false;
     };
     match position_kind {
+        RecoverablePositionKind::CctpReceiveClaim => false,
         RecoverablePositionKind::FundingVault => false,
         RecoverablePositionKind::ExternalCustody => match first.kind {
             MarketOrderTransitionKind::AcrossBridge | MarketOrderTransitionKind::CctpBridge => true,
             MarketOrderTransitionKind::UniversalRouterSwap => {
                 external_custody_universal_router_refund_is_supported_first_hop(path)
             }
-            MarketOrderTransitionKind::HyperliquidBridgeDeposit => {
+            MarketOrderTransitionKind::HyperliquidBridgeDeposit
+            | MarketOrderTransitionKind::HypercoreBridgeDeposit => {
                 external_vault_role == Some(CustodyVaultRole::DestinationExecution)
             }
             MarketOrderTransitionKind::UnitDeposit => true,
@@ -1556,6 +1968,7 @@ fn materialize_hyperliquid_spot_refund_transition(
         ),
         MarketOrderTransitionKind::AcrossBridge
         | MarketOrderTransitionKind::HyperliquidBridgeDeposit
+        | MarketOrderTransitionKind::HypercoreBridgeDeposit
         | MarketOrderTransitionKind::UniversalRouterSwap
         | MarketOrderTransitionKind::UnitDeposit => materialize_derived_external_refund_transition(
             order,
@@ -1610,7 +2023,8 @@ fn materialize_derived_external_refund_transition(
         MarketOrderTransitionKind::AcrossBridge => refund_transition_across_bridge_step(
             order, source, transition, &leg, is_final, step_index, planned_at,
         )?,
-        MarketOrderTransitionKind::HyperliquidBridgeDeposit => {
+        MarketOrderTransitionKind::HyperliquidBridgeDeposit
+        | MarketOrderTransitionKind::HypercoreBridgeDeposit => {
             refund_transition_hyperliquid_bridge_deposit_step(
                 order, source, transition, &leg, step_index, planned_at,
             )?
@@ -1828,4 +2242,19 @@ pub(super) fn external_custody_direct_refund_steps(
         updated_at: planned_at,
     };
     (vec![leg], vec![step])
+}
+#[cfg(test)]
+mod tests {
+    use super::external_custody_direct_balance_supported;
+    use router_core::protocol::ChainId;
+
+    #[test]
+    fn external_custody_direct_balance_supports_hyperevm() {
+        assert!(external_custody_direct_balance_supported(
+            &ChainId::parse("evm:999").expect("static HyperEVM chain id"),
+        ));
+        assert!(!external_custody_direct_balance_supported(
+            &ChainId::parse("hyperliquid").expect("static Hyperliquid chain id"),
+        ));
+    }
 }

@@ -16,10 +16,13 @@
 //!    contacting the venue, so retries never re-fire side effects.
 //! 3. Otherwise asks the per-step-type [`IdempotentStepExecutor`] to build the
 //!    intent (this may call the provider trait), stamps the key onto the intent's
-//!    operation, and persists the operation row *before* the side effect fires
-//!    (which happens later in `prepare_provider_completion`). On the unique-key
-//!    conflict path (a racing worker won) we re-read the persisted row and
-//!    short-circuit just like (2).
+//!    operation, and persists a **pre-side-effect** provider-operation row with
+//!    status `Planned` *before* the side effect fires (which happens later in
+//!    `prepare_provider_completion`). After a successful side effect, the later
+//!    persist path upserts the real post-fire status (`Submitted` /
+//!    `WaitingExternal` / `Completed`). On the unique-key conflict path (a
+//!    racing worker won) we re-read the persisted row and short-circuit just like
+//!    (2).
 //!
 //! The historical per-step `*_existing_operation_completion` and
 //! `persist_*_intent_before_side_effect` helpers (originally specialised for
@@ -27,6 +30,7 @@
 //! Per-step-type code shrinks to a single `IdempotentStepExecutor` impl whose
 //! body is dominated by the venue-specific intent build.
 
+use alloy::primitives::U256;
 use router_core::{
     models::{
         OrderExecutionStep, OrderProviderOperation, ProviderOperationStatus, ProviderOperationType,
@@ -38,7 +42,8 @@ use serde_json::json;
 use super::{
     execution::{
         provider_execute_error, provider_operation_tx_hash, provider_state_records,
-        set_provider_intent_operation_idempotency_key, StepCompletion, StepDispatchResult,
+        AuthoritativeOutputBalance, set_provider_intent_operation_idempotency_key, StepCompletion,
+        StepDispatchResult,
     },
     OrderActivityDeps, StepExecutionOutcome,
 };
@@ -102,6 +107,16 @@ where
         // and stay on the existing short-circuit path — that case is owned by
         // the separate stale-running-step mechanism.
         if operation.status == ProviderOperationStatus::Failed {
+            if let Some(completion) = recover_failed_cctp_receive_completion(
+                deps,
+                step,
+                &operation,
+                idempotency_key.clone(),
+            )
+            .await?
+            {
+                return Ok(StepDispatchResult::Complete(completion));
+            }
             return Err(OrderActivityError::provider_operation_lost(format!(
                 "provider operation {} for step {} did not land on a prior attempt",
                 operation.id, step.id
@@ -188,7 +203,7 @@ async fn persist_intent_before_side_effect(
     intent: &ProviderExecutionIntent,
     operation_type: ProviderOperationType,
 ) -> Result<Option<OrderProviderOperation>, OrderActivityError> {
-    let state = intent_state(intent);
+    let state = pre_side_effect_state(intent_state(intent));
     let Some(operation_intent) = state.operation.as_ref() else {
         return Ok(None);
     };
@@ -201,7 +216,7 @@ async fn persist_intent_before_side_effect(
         operation_type.to_db_string()
     );
     let (operation, mut addresses) =
-        provider_state_records(step, state, &json!({ "kind": response_kind }))
+        provider_state_records(step, &state, &json!({ "kind": response_kind }))
             .map_err(|source| provider_execute_error(&step.provider, source))?;
     let Some(operation) = operation else {
         return Ok(None);
@@ -246,6 +261,149 @@ pub(super) fn intent_state(intent: &ProviderExecutionIntent) -> &ProviderExecuti
         | ProviderExecutionIntent::CustodyActions { state, .. } => state,
     }
 }
+fn pre_side_effect_state(state: &ProviderExecutionState) -> ProviderExecutionState {
+    let mut state = state.clone();
+    if let Some(operation) = state.operation.as_mut() {
+        operation.status = ProviderOperationStatus::Planned;
+    }
+    state
+}
+
+async fn recover_failed_cctp_receive_completion(
+    deps: &OrderActivityDeps,
+    step: &OrderExecutionStep,
+    operation: &OrderProviderOperation,
+    idempotency_key: String,
+) -> Result<Option<StepCompletion>, OrderActivityError> {
+    if step.step_type != router_core::models::OrderExecutionStepType::CctpReceive {
+        return Ok(None);
+    }
+    let Some(output_asset) = step.output_asset.as_ref() else {
+        return Ok(None);
+    };
+    let expected_amount = operation
+        .request
+        .get("amount")
+        .and_then(decimal_string)
+        .or_else(|| step.request.get("amount").and_then(decimal_string))
+        .ok_or_else(|| {
+            provider_execute_error(&step.provider, "cctp receive amount is missing on failed operation")
+        })?;
+    let Some(source_custody_vault_id) = step
+        .request
+        .get("source_custody_vault_id")
+        .and_then(|value| value.as_str())
+    else {
+        return Ok(None);
+    };
+    let source_custody_vault_id = uuid::Uuid::parse_str(source_custody_vault_id).map_err(|source| {
+        provider_execute_error(
+            &step.provider,
+            format!("invalid cctp receive source_custody_vault_id: {source}"),
+        )
+    })?;
+    let vault = deps
+        .db
+        .orders()
+        .get_custody_vault(source_custody_vault_id)
+        .await
+        .map_err(OrderActivityError::db_query)?;
+    if vault.chain != output_asset.chain || vault.asset.as_ref() != Some(&output_asset.asset) {
+        return Ok(None);
+    }
+    let balance_amount = deps
+        .custody_action_executor
+        .custody_vault_balance_raw(&vault)
+        .await
+        .map_err(|source| {
+            OrderActivityError::custody_action("read cctp receive destination balance", source)
+        })?;
+    let observed = U256::from_str_radix(&balance_amount, 10).map_err(|source| {
+        provider_execute_error(
+            &step.provider,
+            format!("invalid destination balance {balance_amount:?}: {source}"),
+        )
+    })?;
+    let expected = U256::from_str_radix(expected_amount, 10).map_err(|source| {
+        provider_execute_error(
+            &step.provider,
+            format!("invalid expected cctp receive amount {expected_amount:?}: {source}"),
+        )
+    })?;
+    if observed < expected {
+        return Ok(None);
+    }
+    let balance = AuthoritativeOutputBalance {
+        amount: balance_amount,
+        location: "custody_vault",
+        custody_vault_id: Some(vault.id),
+        address: Some(vault.address.clone()),
+        chain_id: output_asset.chain.to_string(),
+        asset_id: output_asset.asset.to_string(),
+        details: json!({}),
+    };
+    let observed_state = json!({
+        "kind": "cctp_receive_already_claimed",
+        "reason": "destination_custody_vault_already_funded",
+        "recovered_from_failed_operation_id": operation.id,
+        "chain_id": balance.chain_id,
+        "asset_id": balance.asset_id,
+        "balance": balance.amount,
+        "address": balance.address,
+    });
+    let mut provider_state = provider_state_from_operation(operation, Some(idempotency_key));
+    if let Some(existing_operation) = provider_state.operation.as_mut() {
+        existing_operation.status = ProviderOperationStatus::Completed;
+        existing_operation.provider_ref =
+            Some(format!("cctp_receive_already_claimed:{}", step.id));
+        existing_operation.observed_state = Some(observed_state.clone());
+        existing_operation.response = Some(json!({
+            "kind": "cctp_receive_already_claimed",
+            "amount_out": balance.amount,
+        }));
+    }
+    Ok(Some(StepCompletion {
+        response: json!({
+            "kind": "cctp_receive_already_claimed",
+            "provider": &step.provider,
+            "step_id": step.id,
+            "custody_vault_id": vault.id,
+            "observed_state": observed_state,
+        }),
+        tx_hash: None,
+        provider_state,
+        outcome: StepExecutionOutcome::Completed,
+    }))
+}
+
+fn decimal_string(value: &serde_json::Value) -> Option<&str> {
+    value
+        .as_str()
+        .filter(|raw| !raw.is_empty() && raw.chars().all(|ch| ch.is_ascii_digit()))
+}
+
+fn provider_state_from_operation(
+    operation: &OrderProviderOperation,
+    fallback_idempotency_key: Option<String>,
+) -> ProviderExecutionState {
+    ProviderExecutionState {
+        operation: Some(ProviderOperationIntent {
+            operation_type: operation.operation_type,
+            status: operation.status,
+            provider_ref: operation.provider_ref.clone(),
+            idempotency_key: operation
+                .idempotency_key
+                .clone()
+                .or(fallback_idempotency_key),
+            request: Some(operation.request.clone()),
+            response: Some(operation.response.clone()),
+            observed_state: Some(operation.observed_state.clone()),
+        }),
+        addresses: Vec::new(),
+    }
+}
+
+
 
 /// Build the short-circuit `StepCompletion` for an existing provider operation
 /// row. Identical shape across all step types — the only thing that varies is
@@ -261,21 +419,7 @@ fn existing_operation_completion(
         StepExecutionOutcome::Waiting
     };
     let tx_hash = provider_operation_tx_hash(&operation);
-    let state = ProviderExecutionState {
-        operation: Some(ProviderOperationIntent {
-            operation_type: operation.operation_type,
-            status: operation.status,
-            provider_ref: operation.provider_ref.clone(),
-            idempotency_key: operation
-                .idempotency_key
-                .clone()
-                .or_else(|| Some(idempotency_key.clone())),
-            request: Some(operation.request.clone()),
-            response: Some(operation.response.clone()),
-            observed_state: Some(operation.observed_state.clone()),
-        }),
-        addresses: Vec::new(),
-    };
+    let state = provider_state_from_operation(&operation, Some(idempotency_key.clone()));
     let response_kind = format!(
         "{}_idempotency_reuse",
         operation.operation_type.to_db_string()
@@ -294,4 +438,39 @@ fn existing_operation_completion(
         provider_state: state,
         outcome,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use router_core::models::ProviderOperationType;
+    use serde_json::json;
+
+    #[test]
+    fn pre_side_effect_state_forces_planned_status() {
+        let state = ProviderExecutionState {
+            operation: Some(ProviderOperationIntent {
+                operation_type: ProviderOperationType::CctpReceive,
+                status: ProviderOperationStatus::Submitted,
+                provider_ref: Some("ref".to_string()),
+                idempotency_key: Some("key".to_string()),
+                request: Some(json!({"k":"v"})),
+                response: Some(json!({"kind":"submitted"})),
+                observed_state: Some(json!({"seen":true})),
+            }),
+            addresses: Vec::new(),
+        };
+
+        let persisted = pre_side_effect_state(&state);
+
+        assert_eq!(
+            persisted.operation.as_ref().map(|operation| operation.status),
+            Some(ProviderOperationStatus::Planned)
+        );
+        assert_eq!(
+            persisted.operation.as_ref().and_then(|operation| operation.provider_ref.as_deref()),
+            Some("ref")
+        );
+        assert_eq!(state.operation.as_ref().map(|operation| operation.status), Some(ProviderOperationStatus::Submitted));
+    }
 }

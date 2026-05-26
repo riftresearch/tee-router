@@ -29,40 +29,40 @@ use router_core::{
         OrderProviderAddress, OrderProviderOperation, ProviderAddressRole, ProviderOperationStatus,
         ProviderOperationType, ProviderOrderKind, RouterOrder, RouterOrderQuote,
     },
-    protocol::{backend_chain_for_id, AssetId, ChainId, DepositAsset},
+    protocol::{AssetId, ChainId, DepositAsset, backend_chain_for_id},
     services::{
+        ActionProviderRegistry, CustodyActionExecutor, CustodyActionReceipt,
+        MarketOrderRoutePlanner, PricingSnapshotProvider, ProviderExecutionIntent,
+        ProviderExecutionState, ProviderOperationIntent,
         action_providers::{
-            hyperliquid_filled_actual_amounts_from_values, unit_withdrawal_minimum_raw,
             BridgeExecutionRequest, BridgeQuote, BridgeQuoteRequest, ExchangeExecutionRequest,
             ExchangeQuote, ExchangeQuoteRequest, HyperliquidFillFee, ProviderExecutionStatePatch,
             ProviderOperationObservation, ProviderOperationObservationRequest,
             UnitDepositStepRequest, UnitProvider, UnitWithdrawalStepRequest,
+            hyperliquid_filled_actual_amounts_from_values, unit_withdrawal_minimum_raw,
         },
         asset_registry::{
-            AssetRegistry, CanonicalAsset, MarketOrderNode, MarketOrderTransitionKind, ProviderId,
-            RequiredCustodyRole, TransitionDecl, TransitionPath,
+            AssetRegistry, CanonicalAsset, MarketOrderNode, MarketOrderTransitionKind,
+            ProviderAssetCapability, ProviderId, RequiredCustodyRole, TransitionDecl,
+            TransitionPath,
         },
         custody_action_executor::{CustodyAction, CustodyActionError, CustodyActionRequest},
         gas_reimbursement::{
-            optimized_paymaster_reimbursement_plan,
+            GasReimbursementError, GasReimbursementPlan, optimized_paymaster_reimbursement_plan,
             optimized_paymaster_reimbursement_plan_with_pricing, try_transition_retention_amount,
-            GasReimbursementError, GasReimbursementPlan,
         },
         market_order_planner::{
             MarketOrderInitialHyperliquidCustody, MarketOrderPlanCurrentLocationStart,
             MarketOrderPlanRemainingStart,
         },
         quote_legs::{
-            execution_step_type_for_transition_kind, QuoteLeg, QuoteLegAsset, QuoteLegSpec,
+            QuoteLeg, QuoteLegAsset, QuoteLegSpec, execution_step_type_for_transition_kind,
         },
         usd_valuation::{execution_leg_usd_valuation, execution_step_usd_valuation},
-        ActionProviderRegistry, CustodyActionExecutor, CustodyActionReceipt,
-        MarketOrderRoutePlanner, PricingSnapshotProvider, ProviderExecutionIntent,
-        ProviderExecutionState, ProviderOperationIntent,
     },
 };
 use router_primitives::{ChainType, Currency, TokenIdentifier};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use temporalio_macros::activities;
 use temporalio_sdk::activities::{ActivityContext, ActivityError};
 use uuid::Uuid;
@@ -276,6 +276,7 @@ fn provider_operation_hint_kind_label(
         Some(
             ProviderOperationType::UnitWithdrawal
             | ProviderOperationType::HyperliquidBridgeDeposit
+            | ProviderOperationType::HypercoreBridgeDeposit
             | ProviderOperationType::HyperliquidBridgeWithdrawal,
         ) => "provider_observation",
         None => "unknown",

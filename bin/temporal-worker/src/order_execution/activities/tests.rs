@@ -3,7 +3,7 @@ use crate::order_execution::types::{ProviderKind, WorkflowHintId};
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use chains::{evm::EvmChain, hyperliquid::HyperliquidChain, ChainOperations, ChainRegistry};
+use chains::{ChainOperations, ChainRegistry, evm::EvmChain, hyperliquid::HyperliquidChain};
 use router_core::{
     config::Settings,
     models::{
@@ -11,21 +11,21 @@ use router_core::{
         RouterOrderStatus, RouterOrderType,
     },
     services::{
+        ActionProviderHttpOptions,
         action_providers::{ExchangeProvider, ProviderAddressIntent, ProviderFuture, UnitProvider},
         asset_registry::{AssetSlot, RequiredCustodyRole},
         custody_action_executor::{
             ChainCall, HyperliquidCall, HyperliquidCallNetwork, HyperliquidCallPayload,
             HyperliquidRuntimeConfig,
         },
-        ActionProviderHttpOptions,
     },
 };
 use router_primitives::ChainType;
 use sqlx_postgres::PgPool;
 use testcontainers::{
+    ContainerAsync, GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
-    ContainerAsync, GenericImage, ImageExt,
 };
 
 const POSTGRES_PORT: u16 = 5432;
@@ -1607,6 +1607,7 @@ async fn hyperliquid_bridge_quotes_build_refund_quote_leg_shapes() {
         velora: None,
         hyperliquid_network: HyperliquidCallNetwork::Testnet,
         hyperliquid_order_timeout_ms: 30_000,
+        hypercore_bridge_enabled: false,
     })
     .expect("hyperliquid bridge provider registry");
     let bridge = registry
@@ -2028,6 +2029,62 @@ fn hyperliquid_spot_refund_path_to_bitcoin_materializes_final_unit_withdrawal() 
     );
 }
 
+#[test]
+fn hyperliquid_spot_refund_quote_reserves_activation_fee_before_unit_withdrawal() {
+    let hl_usdc = test_asset("hyperliquid", "native");
+    let hl_eth = test_asset("hyperliquid", "UETH");
+    let eth = test_asset("evm:1", "native");
+    let trade = hyperliquid_trade_transition(
+        hl_usdc.clone(),
+        hl_eth.clone(),
+        CanonicalAsset::Usdc,
+        CanonicalAsset::Eth,
+    );
+    let withdrawal = unit_withdrawal_transition(hl_eth, eth, CanonicalAsset::Eth);
+    let path = TransitionPath {
+        id: "hl-usdc-to-ueth>unit-withdrawal".to_string(),
+        transitions: vec![trade.clone(), withdrawal],
+    };
+
+    let quoted = quote_amount_for_hyperliquid_spot_refund_transition(
+        &path,
+        0,
+        &trade,
+        "38994800",
+    )
+    .expect("quote reserve logic")
+    .expect("amount should remain quoteable");
+
+    assert_eq!(quoted, "37994800");
+}
+
+#[test]
+fn hyperliquid_spot_refund_quote_does_not_reserve_without_downstream_unit_withdrawal() {
+    let hl_usdc = test_asset("hyperliquid", "native");
+    let hl_eth = test_asset("hyperliquid", "UETH");
+    let trade = hyperliquid_trade_transition(
+        hl_usdc,
+        hl_eth.clone(),
+        CanonicalAsset::Usdc,
+        CanonicalAsset::Eth,
+    );
+    let path = TransitionPath {
+        id: "hl-usdc-to-ueth".to_string(),
+        transitions: vec![trade.clone()],
+    };
+
+    let quoted = quote_amount_for_hyperliquid_spot_refund_transition(
+        &path,
+        0,
+        &trade,
+        "38994800",
+    )
+    .expect("quote reserve logic")
+    .expect("amount should remain quoteable");
+
+    assert_eq!(quoted, "38994800");
+}
+
 #[tokio::test]
 async fn hyperliquid_spot_refund_plan_to_bitcoin_is_quotable_and_materialized() {
     let test_db = test_database().await;
@@ -2144,8 +2201,11 @@ async fn hyperliquid_spot_refund_plan_hydrates_nonfinal_unit_withdrawal_recipien
     order.workflow_parent_span_id = order.workflow_trace_id[..16].to_string();
     let failed_attempt_id = Uuid::now_v7();
     let vault = test_custody_vault(&order, CustodyVaultRole::DestinationExecution, &source_usdc);
-    let mut native_ethereum_vault =
-        test_custody_vault(&order, CustodyVaultRole::DestinationExecution, &native_ethereum);
+    let mut native_ethereum_vault = test_custody_vault(
+        &order,
+        CustodyVaultRole::DestinationExecution,
+        &native_ethereum,
+    );
     native_ethereum_vault.address = test_address(10);
     let mut native_base_vault =
         test_custody_vault(&order, CustodyVaultRole::DestinationExecution, &native_base);
@@ -3242,6 +3302,583 @@ fn refund_position_discovery_prefers_original_refund_asset_over_stale_expected_d
 }
 
 #[test]
+fn refund_recovery_progress_asset_prefers_latest_completed_or_waiting_output() {
+    let order_id = Uuid::now_v7();
+    let attempt_id = Uuid::now_v7();
+    let leg_id = Uuid::now_v7();
+    let ueth = test_asset("hyperliquid", "UETH");
+    let eth = test_asset("evm:1", "native");
+    let base_eth = test_asset("evm:8453", "native");
+
+    let mut completed_trade = test_execution_step(
+        order_id,
+        attempt_id,
+        leg_id,
+        1,
+        OrderExecutionStepStatus::Completed,
+    );
+    completed_trade.output_asset = Some(ueth);
+    let mut waiting_withdrawal = test_execution_step(
+        order_id,
+        attempt_id,
+        leg_id,
+        2,
+        OrderExecutionStepStatus::Waiting,
+    );
+    waiting_withdrawal.output_asset = Some(eth.clone());
+    let mut planned_next = test_execution_step(
+        order_id,
+        attempt_id,
+        leg_id,
+        3,
+        OrderExecutionStepStatus::Planned,
+    );
+    planned_next.output_asset = Some(base_eth);
+
+    assert_eq!(
+        latest_refund_recovery_progress_asset(&[completed_trade, waiting_withdrawal, planned_next]),
+        Some(eth)
+    );
+}
+
+#[test]
+fn completed_step_amount_out_extracts_cctp_claim_observation() {
+    let order_id = Uuid::now_v7();
+    let attempt_id = Uuid::now_v7();
+    let leg_id = Uuid::now_v7();
+    let mut step = test_execution_step(
+        order_id,
+        attempt_id,
+        leg_id,
+        1,
+        OrderExecutionStepStatus::Completed,
+    );
+    step.response = json!({
+        "kind": "custody_actions",
+        "claim_observation": {
+            "amount_out_source": "cctp_attested_message",
+            "claim_kind": "cctp_receive_claim",
+            "amount": "37111765"
+        }
+    });
+
+    assert_eq!(
+        completed_step_amount_out(&step).as_deref(),
+        Some("37111765")
+    );
+}
+
+#[test]
+fn completed_step_amount_out_prefers_balance_observation_over_provider_output() {
+    let order_id = Uuid::now_v7();
+    let attempt_id = Uuid::now_v7();
+    let leg_id = Uuid::now_v7();
+    let mut step = test_execution_step(
+        order_id,
+        attempt_id,
+        leg_id,
+        1,
+        OrderExecutionStepStatus::Completed,
+    );
+    step.response = json!({
+        "amount_out": "50000",
+        "observed_state": {
+            "amount_out": "50000"
+        },
+        "balance_observation": {
+            "output": {
+                "spendable_balance": "49965"
+            },
+            "probes": [{
+                "role": "destination",
+                "spendable_balance": "49965"
+            }]
+        }
+    });
+
+    assert_eq!(completed_step_amount_out(&step).as_deref(), Some("49965"));
+}
+
+#[test]
+fn completed_step_amount_out_ignores_provider_output_without_balance_observation() {
+    let order_id = Uuid::now_v7();
+    let attempt_id = Uuid::now_v7();
+    let leg_id = Uuid::now_v7();
+    let mut step = test_execution_step(
+        order_id,
+        attempt_id,
+        leg_id,
+        1,
+        OrderExecutionStepStatus::Completed,
+    );
+    step.response = json!({
+        "amount_out": "50000",
+        "observed_state": {
+            "amount_out": "50000",
+            "provider_observed_state": {
+                "actual_amount_out": "50000"
+            }
+        },
+        "provider_context": {
+            "amount_out": "50000"
+        }
+    });
+
+    assert_eq!(completed_step_amount_out(&step), None);
+}
+
+#[tokio::test]
+async fn completed_step_without_balance_observation_strips_provider_amount_out() {
+    let test_db = test_database().await;
+    let deps = test_deps(test_db.db.clone());
+    let mut step = test_execution_step(
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+        1,
+        OrderExecutionStepStatus::Running,
+    );
+    step.step_type = OrderExecutionStepType::UniversalRouterSwap;
+    step.provider = ProviderId::Velora.as_str().to_string();
+    step.output_asset = Some(test_asset("evm:8453", "native"));
+    step.request = json!({
+        "recipient_address": "0x0000000000000000000000000000000000000001",
+        "recipient_custody_vault_id": null
+    });
+    let completion = StepCompletion {
+        response: json!({
+            "amount_out": "50000",
+            "observed_state": {
+                "amount_out": "50000"
+            }
+        }),
+        tx_hash: None,
+        provider_state: ProviderExecutionState::default(),
+        outcome: StepExecutionOutcome::Completed,
+    };
+
+    let completion = apply_authoritative_output_balance(&deps, &step, completion)
+        .await
+        .expect("sanitize completion without authoritative balance");
+
+    assert!(completion.response.get("amount_out").is_none());
+    assert_eq!(
+        completion.response["provider_reported_output_amounts"]["amount_out"],
+        json!("50000")
+    );
+    assert_eq!(
+        completion.response["observed_state"]["amount_out"],
+        json!("50000"),
+        "venue output remains available for analysis"
+    );
+}
+
+#[tokio::test]
+async fn completed_cctp_burn_records_claim_observation_without_amount_out() {
+    let test_db = test_database().await;
+    let deps = test_deps(test_db.db.clone());
+    let mut step = test_execution_step(
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+        1,
+        OrderExecutionStepStatus::Running,
+    );
+    step.step_type = OrderExecutionStepType::CctpBurn;
+    step.provider = ProviderId::Cctp.as_str().to_string();
+    step.output_asset = Some(test_asset(
+        "evm:42161",
+        "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+    ));
+    let completion = StepCompletion {
+        response: json!({
+            "messages": [{
+                "decodedMessage": {
+                    "decodedMessageBody": {
+                        "amount": "37111765"
+                    }
+                }
+            }],
+            "amount_out": "37111765"
+        }),
+        tx_hash: None,
+        provider_state: ProviderExecutionState::default(),
+        outcome: StepExecutionOutcome::Completed,
+    };
+
+    let completion = apply_authoritative_output_balance(&deps, &step, completion)
+        .await
+        .expect("apply CCTP claim observation");
+
+    assert!(completion.response.get("amount_out").is_none());
+    assert_eq!(
+        completion.response["claim_observation"]["amount"],
+        json!("37111765")
+    );
+    assert_eq!(
+        completed_step_amount_out(&OrderExecutionStep {
+            response: completion.response,
+            ..step
+        })
+        .as_deref(),
+        Some("37111765")
+    );
+}
+
+#[tokio::test]
+async fn completed_hyperliquid_step_amount_out_uses_spendable_spot_balance() {
+    let test_db = test_database().await;
+    let hyperliquid_info =
+        TestHyperliquidInfoServer::spawn_with_balances(vec![test_hyperliquid_spot_balance(
+            "UBTC",
+            2,
+            "0.00050000",
+            "0.00000035",
+        )])
+        .await;
+    let action_providers = Arc::new(ActionProviderRegistry::new(vec![], vec![], vec![]));
+    let deps = test_deps_with_action_providers(
+        test_db.db.clone(),
+        action_providers,
+        Some(hyperliquid_info.base_url.clone()),
+    );
+    let hl_btc = test_asset("hyperliquid", "UBTC");
+    let now = Utc::now();
+    let order = test_order(test_asset("evm:8453", "native"), now);
+    let mut vault = test_custody_vault(&order, CustodyVaultRole::HyperliquidSpot, &hl_btc);
+    vault.order_id = None;
+    test_db
+        .db
+        .orders()
+        .create_custody_vault(&vault)
+        .await
+        .expect("insert Hyperliquid accounting vault");
+
+    let mut step = test_execution_step(
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+        1,
+        OrderExecutionStepStatus::Running,
+    );
+    step.step_type = OrderExecutionStepType::HyperliquidTrade;
+    step.provider = ProviderId::Hyperliquid.as_str().to_string();
+    step.output_asset = Some(hl_btc.clone());
+    step.request = json!({
+        "hyperliquid_custody_vault_id": vault.id,
+    });
+    let completion = StepCompletion {
+        response: json!({
+            "kind": "custody_actions",
+            "observed_state": {
+                "amount_out": "50000"
+            }
+        }),
+        tx_hash: None,
+        provider_state: ProviderExecutionState::default(),
+        outcome: StepExecutionOutcome::Completed,
+    };
+
+    let completion = apply_authoritative_output_balance(&deps, &step, completion)
+        .await
+        .expect("apply authoritative Hyperliquid output balance");
+
+    assert_eq!(completion.response["amount_out"], json!("49965"));
+    assert_eq!(
+        completion.response["observed_state"]["amount_out"],
+        json!("50000"),
+        "venue output remains available for analysis"
+    );
+    assert_eq!(
+        completion.response["balance_observation"]["output"]["spendable_balance"],
+        json!("49965")
+    );
+}
+
+#[tokio::test]
+async fn completed_hyperliquid_bridge_deposit_amount_out_uses_clearinghouse_balance() {
+    let test_db = test_database().await;
+    let hyperliquid_info =
+        TestHyperliquidInfoServer::spawn_with_balances_and_clearinghouse(vec![], "40").await;
+    let action_providers = Arc::new(ActionProviderRegistry::new(vec![], vec![], vec![]));
+    let deps = test_deps_with_action_providers(
+        test_db.db.clone(),
+        action_providers,
+        Some(hyperliquid_info.base_url.clone()),
+    );
+    let source_usdc = test_asset("evm:42161", "0xaf88d065e77c8cc2239327c5edb3a432268e5831");
+    let hl_usdc = test_asset("hyperliquid", "native");
+    let now = Utc::now();
+    let order = test_order(source_usdc.clone(), now);
+    let mut vault = test_custody_vault(&order, CustodyVaultRole::SourceDeposit, &source_usdc);
+    vault.order_id = None;
+    test_db
+        .db
+        .orders()
+        .create_custody_vault(&vault)
+        .await
+        .expect("insert Hyperliquid bridge accounting vault");
+
+    let mut step = test_execution_step(
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+        1,
+        OrderExecutionStepStatus::Running,
+    );
+    step.step_type = OrderExecutionStepType::HyperliquidBridgeDeposit;
+    step.provider = ProviderId::HyperliquidBridge.as_str().to_string();
+    step.output_asset = Some(hl_usdc);
+    step.request = json!({
+        "source_custody_vault_id": vault.id,
+    });
+    let completion = StepCompletion {
+        response: json!({
+            "kind": "provider_only",
+            "observed_state": {
+                "amount_out": "39999999"
+            }
+        }),
+        tx_hash: None,
+        provider_state: ProviderExecutionState::default(),
+        outcome: StepExecutionOutcome::Completed,
+    };
+
+    let completion = apply_authoritative_output_balance(&deps, &step, completion)
+        .await
+        .expect("apply authoritative Hyperliquid clearinghouse output balance");
+
+    assert_eq!(completion.response["amount_out"], json!("40000000"));
+    assert_eq!(
+        completion.response["balance_observation"]["output"]["location"],
+        json!("hyperliquid_clearinghouse")
+    );
+}
+
+#[tokio::test]
+async fn persisted_completion_rolls_up_balance_amount_out_to_leg() {
+    let test_db = test_database().await;
+    let seeded = seed_running_step(&test_db.pool, false, false).await;
+    test_db
+        .db
+        .orders()
+        .persist_execution_step_completion(PersistStepCompletionRecord {
+            step_id: seeded.step_id,
+            operation: None,
+            addresses: Vec::new(),
+            response: json!({
+                "amount_out": "100",
+                "observed_state": {
+                    "amount_out": "100"
+                },
+                "balance_observation": {
+                    "output": {
+                        "spendable_balance": "88"
+                    },
+                    "probes": [{
+                        "role": "destination",
+                        "spendable_balance": "88"
+                    }]
+                }
+            }),
+            tx_hash: None,
+            usd_valuation: json!({}),
+            completed_at: Utc::now(),
+        })
+        .await
+        .expect("persist completed step");
+
+    let legs = test_db
+        .db
+        .orders()
+        .get_execution_legs(seeded.order_id)
+        .await
+        .expect("load execution legs");
+    assert_eq!(legs.len(), 1);
+    assert_eq!(legs[0].actual_amount_out.as_deref(), Some("88"));
+}
+
+#[tokio::test]
+async fn persisted_completion_does_not_roll_up_provider_or_estimated_amount_out() {
+    let test_db = test_database().await;
+    let seeded = seed_running_step(&test_db.pool, false, false).await;
+    test_db
+        .db
+        .orders()
+        .persist_execution_step_completion(PersistStepCompletionRecord {
+            step_id: seeded.step_id,
+            operation: None,
+            addresses: Vec::new(),
+            response: json!({
+                "amount_out": "100",
+                "observed_state": {
+                    "amount_out": "100",
+                    "provider_observed_state": {
+                        "actual_amount_out": "100"
+                    }
+                },
+                "provider_context": {
+                    "amount_out": "100"
+                }
+            }),
+            tx_hash: None,
+            usd_valuation: json!({}),
+            completed_at: Utc::now(),
+        })
+        .await
+        .expect("persist completed step");
+
+    let legs = test_db
+        .db
+        .orders()
+        .get_execution_legs(seeded.order_id)
+        .await
+        .expect("load execution legs");
+    assert_eq!(legs.len(), 1);
+    assert_eq!(legs[0].actual_amount_out, None);
+}
+
+#[test]
+fn cctp_receive_claim_position_detects_failed_receive_after_attested_burn() {
+    let order_id = Uuid::now_v7();
+    let attempt_id = Uuid::now_v7();
+    let leg_id = Uuid::now_v7();
+    let vault_id = Uuid::now_v7();
+    let base_usdc = test_asset("evm:8453", "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913");
+    let mut receive_step = test_execution_step(
+        order_id,
+        attempt_id,
+        leg_id,
+        2,
+        OrderExecutionStepStatus::Failed,
+    );
+    receive_step.step_type = OrderExecutionStepType::CctpReceive;
+    receive_step.input_asset = Some(base_usdc.clone());
+    receive_step.output_asset = Some(base_usdc.clone());
+    receive_step.request = json!({
+        "burn_transition_decl_id": "cctp",
+        "amount": "37185782",
+        "source_custody_vault_id": vault_id,
+    });
+    let now = Utc::now();
+    let burn_operation = OrderProviderOperation {
+        id: Uuid::now_v7(),
+        order_id,
+        execution_attempt_id: Some(attempt_id),
+        execution_step_id: None,
+        provider: ProviderId::Cctp.as_str().to_string(),
+        operation_type: ProviderOperationType::CctpBridge,
+        provider_ref: Some("0xburn".to_string()),
+        idempotency_key: None,
+        status: ProviderOperationStatus::Completed,
+        request: json!({
+            "transition_decl_id": "cctp",
+            "amount": "37111765",
+        }),
+        response: json!({}),
+        observed_state: json!({
+            "provider_observed_state": {
+                "decoded_message_body": {
+                    "amount": "37111765"
+                }
+            }
+        }),
+        created_at: now,
+        updated_at: now,
+    };
+
+    let positions =
+        cctp_receive_claim_positions_from_steps_and_operations(&[receive_step], &[burn_operation]);
+
+    assert_eq!(positions.len(), 1);
+    assert_eq!(
+        positions[0].position_kind,
+        RecoverablePositionKind::CctpReceiveClaim
+    );
+    assert_eq!(positions[0].amount.as_str(), "37111765");
+    assert_eq!(positions[0].asset, base_usdc);
+    assert_eq!(positions[0].custody_vault_id, Some(vault_id.into()));
+}
+
+#[test]
+fn cctp_receive_existing_balance_completion_marks_operation_completed() {
+    let order_id = Uuid::now_v7();
+    let attempt_id = Uuid::now_v7();
+    let leg_id = Uuid::now_v7();
+    let vault_id = Uuid::now_v7();
+    let asset = test_asset(
+        "evm:999",
+        "0xb88339cb7199b77e23db6e890353e22632ba630f",
+    );
+    let mut step = test_execution_step(
+        order_id,
+        attempt_id,
+        leg_id,
+        2,
+        OrderExecutionStepStatus::Running,
+    );
+    step.step_type = OrderExecutionStepType::CctpReceive;
+    step.provider = ProviderId::Cctp.as_str().to_string();
+    step.output_asset = Some(asset.clone());
+    step.request = json!({ "amount": "40000000" });
+
+    let state = ProviderExecutionState {
+        operation: Some(ProviderOperationIntent {
+            operation_type: ProviderOperationType::CctpReceive,
+            status: ProviderOperationStatus::Submitted,
+            provider_ref: None,
+            idempotency_key: Some("receive-key".to_string()),
+            request: Some(json!({ "amount": "40000000" })),
+            response: None,
+            observed_state: None,
+        }),
+        addresses: Vec::new(),
+    };
+    let balance = AuthoritativeOutputBalance {
+        amount: "40000000".to_string(),
+        location: "custody_vault",
+        custody_vault_id: Some(vault_id),
+        address: Some(test_address(4)),
+        chain_id: asset.chain.to_string(),
+        asset_id: asset.asset.to_string(),
+        details: json!({}),
+    };
+
+    let completion = cctp_receive_existing_balance_completion(
+        &step,
+        vault_id,
+        &CustodyAction::Transfer {
+            to_address: test_address(5),
+            amount: "40000000".to_string(),
+            bitcoin_fee_budget_sats: None,
+        },
+        &json!({}),
+        state,
+        &balance,
+        "execution reverted: Nonce already used",
+    );
+
+    assert_eq!(completion.outcome, StepExecutionOutcome::Completed);
+    assert_eq!(completion.tx_hash, None);
+    let operation = completion
+        .provider_state
+        .operation
+        .expect("provider operation");
+    assert_eq!(operation.status, ProviderOperationStatus::Completed);
+    assert!(operation.provider_ref.as_deref().is_some_and(|provider_ref| {
+        provider_ref.starts_with("cctp_receive_already_claimed:")
+    }));
+    assert_eq!(
+        operation
+            .observed_state
+            .as_ref()
+            .and_then(|state| state.get("balance"))
+            .and_then(Value::as_str),
+        Some("40000000")
+    );
+}
+
+#[test]
 fn hyperliquid_refund_balance_parser_floors_overprecision_decimal_dust() {
     let amount = hyperliquid_refund_balance_amount_raw("0.50688167", "0.0", 6)
         .expect("over-precision Hyperliquid USDC dust should parse");
@@ -3765,6 +4402,7 @@ fn test_deps(db: Database) -> OrderActivityDeps {
             velora: None,
             hyperliquid_network: HyperliquidCallNetwork::Testnet,
             hyperliquid_order_timeout_ms: 30_000,
+            hypercore_bridge_enabled: false,
         })
         .expect("empty action provider registry"),
     );
@@ -3854,7 +4492,9 @@ fn test_asset(chain: &str, asset: &str) -> DepositAsset {
 }
 
 fn test_address(byte: u8) -> String {
-    format!("0x{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}")
+    format!(
+        "0x{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}{byte:02x}"
+    )
 }
 
 fn test_order(source_asset: DepositAsset, now: chrono::DateTime<Utc>) -> RouterOrder {
@@ -3908,9 +4548,9 @@ fn test_refund_position(
     let vault_id = Uuid::now_v7();
     let asset = match position_kind {
         RecoverablePositionKind::HyperliquidSpot => test_asset("hyperliquid", "UBTC"),
-        RecoverablePositionKind::FundingVault | RecoverablePositionKind::ExternalCustody => {
-            test_asset("bitcoin", "native")
-        }
+        RecoverablePositionKind::CctpReceiveClaim
+        | RecoverablePositionKind::FundingVault
+        | RecoverablePositionKind::ExternalCustody => test_asset("bitcoin", "native"),
     };
 
     SingleRefundPosition {

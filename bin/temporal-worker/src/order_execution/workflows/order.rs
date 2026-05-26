@@ -807,6 +807,13 @@ macro_rules! dispatch_step_activity {
                     $options,
                 )
                 .boxed_local(),
+            OrderExecutionStepType::HypercoreBridgeDeposit => $ctx
+                .start_activity(
+                    OrderActivities::dispatch_hypercore_bridge_deposit_step,
+                    $input,
+                    $options,
+                )
+                .boxed_local(),
             OrderExecutionStepType::HyperliquidBridgeWithdrawal => $ctx
                 .start_activity(
                     OrderActivities::dispatch_hyperliquid_bridge_withdrawal_step,

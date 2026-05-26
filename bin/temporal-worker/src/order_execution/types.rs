@@ -835,6 +835,7 @@ pub enum RecoverablePositionKind {
     FundingVault,
     ExternalCustody,
     HyperliquidSpot,
+    CctpReceiveClaim,
 }
 
 #[cfg(test)]

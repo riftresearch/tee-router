@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf, sync::Arc, time::Duration};
+use std::{fs, path::PathBuf, str::FromStr, sync::Arc, time::Duration};
 
 use bitcoincore_rpc_async::Auth;
 use chains::{
@@ -15,7 +15,7 @@ use router_core::{
     services::{
         action_providers::{
             AcrossHttpProviderConfig, ActionProviderHttpOptions, ActionProviderRegistry,
-            CctpHttpProviderConfig, VeloraHttpProviderConfig,
+            CctpHttpProviderConfig, CctpTransferMode, VeloraHttpProviderConfig,
         },
         custody_action_executor::{
             bitcoin_address_from_private_key, evm_address_from_private_key, CustodyActionExecutor,
@@ -108,6 +108,26 @@ pub struct OrderWorkerRuntimeArgs {
     #[arg(long, env = "ARBITRUM_PAYMASTER_PRIVATE_KEY")]
     pub arbitrum_paymaster_private_key: Option<String>,
 
+    /// HyperEVM RPC URL
+    #[arg(long, env = "HYPEREVM_RPC_URL")]
+    pub hyperevm_rpc_url: Option<String>,
+
+    /// HyperEVM native USDC contract address
+    #[arg(long, env = "HYPEREVM_ALLOWED_TOKEN")]
+    pub hyperevm_reference_token: Option<String>,
+
+    /// HyperEVM paymaster private key used to top up HYPE gas for token vaults
+    #[arg(long, env = "HYPEREVM_PAYMASTER_PRIVATE_KEY")]
+    pub hyperevm_paymaster_private_key: Option<String>,
+
+    /// HyperEVM minimum confirmations required before the worker treats a tx as final
+    #[arg(long, env = "HYPEREVM_MIN_CONFIRMATIONS")]
+    pub hyperevm_min_confirmations: Option<u32>,
+
+    /// HyperEVM estimated block time in milliseconds used for UX hints and polling cadence
+    #[arg(long, env = "HYPEREVM_ESTIMATED_BLOCK_TIME_MS")]
+    pub hyperevm_estimated_block_time_ms: Option<u64>,
+
     /// Bitcoin RPC URL
     #[arg(long, env = "BITCOIN_RPC_URL")]
     pub bitcoin_rpc_url: String,
@@ -151,6 +171,10 @@ pub struct OrderWorkerRuntimeArgs {
     /// CCTP MessageTransmitterV2 contract address override
     #[arg(long, env = "CCTP_MESSAGE_TRANSMITTER_V2_ADDRESS")]
     pub cctp_message_transmitter_v2_address: Option<String>,
+
+    /// CCTP transfer mode (`standard` or `fast`)
+    #[arg(long, env = "CCTP_TRANSFER_MODE")]
+    pub cctp_transfer_mode: Option<String>,
 
     /// HyperUnit API base URL
     #[arg(long, env = "HYPERUNIT_API_URL")]
@@ -253,6 +277,8 @@ fn initialize_pricing_provider(
         &args.ethereum_mainnet_rpc_url,
         &args.arbitrum_rpc_url,
         &args.base_rpc_url,
+        args.hyperevm_rpc_url.as_deref(),
+        args.hyperliquid_api_url.as_deref(),
     )
     .map_err(|source| config_error(format!("invalid USD pricing oracle config: {source}")))?;
     let pricing_oracle = Arc::new(MarketPricingOracle::new(oracle_config).map_err(|source| {
@@ -331,6 +357,40 @@ async fn initialize_chain_registry(args: &OrderWorkerRuntimeArgs) -> WorkerResul
     );
     chain_registry.register_evm(ChainType::Arbitrum, arbitrum_chain);
 
+    let hyperevm_config = match (
+        args.hyperevm_rpc_url.as_deref(),
+        args.hyperevm_reference_token.as_deref(),
+        args.hyperevm_paymaster_private_key.as_deref(),
+        args.hyperevm_min_confirmations,
+        args.hyperevm_estimated_block_time_ms,
+    ) {
+        (None, None, None, None, None) => None,
+        (Some(rpc_url), Some(reference_token), Some(_), Some(min_confirmations), Some(block_time_ms)) => {
+            Some((rpc_url, reference_token, min_confirmations, block_time_ms))
+        }
+        _ => {
+            return Err(config_error(
+                "HyperEVM requires HYPEREVM_RPC_URL, HYPEREVM_ALLOWED_TOKEN, HYPEREVM_PAYMASTER_PRIVATE_KEY, HYPEREVM_MIN_CONFIRMATIONS, and HYPEREVM_ESTIMATED_BLOCK_TIME_MS together",
+            ));
+        }
+    };
+    if let Some((rpc_url, reference_token, min_confirmations, block_time_ms)) = hyperevm_config {
+        let hyperevm_chain = Arc::new(
+            EvmChain::new_with_gas_sponsor(
+                rpc_url,
+                reference_token,
+                ChainType::Hyperevm,
+                b"router-hyperevm-wallet",
+                min_confirmations,
+                Duration::from_millis(block_time_ms),
+                gas_sponsor_config(args.hyperevm_paymaster_private_key.as_ref()),
+            )
+            .await
+            .map_err(|source| config_error(format!("failed to initialize hyperevm chain: {source}")))?,
+        );
+        chain_registry.register_evm(ChainType::Hyperevm, hyperevm_chain);
+    }
+
     let hyperliquid_chain = Arc::new(HyperliquidChain::new(
         b"router-hyperliquid-wallet",
         1,
@@ -361,11 +421,14 @@ fn initialize_action_providers(
         });
     let cctp_base_url = normalize_optional_url(args.cctp_api_url.as_deref(), "CCTP API URL")?
         .unwrap_or_else(|| CCTP_IRIS_DEFAULT_BASE_URL_FOR_CONFIG.to_string());
+    let cctp_transfer_mode = cctp_transfer_mode_for_config(args.cctp_transfer_mode.as_deref())?;
     let cctp = Some(
-        CctpHttpProviderConfig::new(cctp_base_url).with_contract_addresses(
-            normalize_optional_string(args.cctp_token_messenger_v2_address.as_deref()),
-            normalize_optional_string(args.cctp_message_transmitter_v2_address.as_deref()),
-        ),
+        CctpHttpProviderConfig::new(cctp_base_url)
+            .with_contract_addresses(
+                normalize_optional_string(args.cctp_token_messenger_v2_address.as_deref()),
+                normalize_optional_string(args.cctp_message_transmitter_v2_address.as_deref()),
+            )
+            .with_transfer_mode(cctp_transfer_mode),
     );
 
     ActionProviderRegistry::http_from_options(ActionProviderHttpOptions {
@@ -383,6 +446,7 @@ fn initialize_action_providers(
         velora,
         hyperliquid_network: args.hyperliquid_network,
         hyperliquid_order_timeout_ms: args.hyperliquid_order_timeout_ms,
+        hypercore_bridge_enabled: args.hyperevm_rpc_url.is_some(),
     })
     .map_err(|source| config_error(format!("failed to initialize action providers: {source}")))
 }
@@ -418,6 +482,13 @@ fn paymaster_registry(args: &OrderWorkerRuntimeArgs) -> WorkerResult<PaymasterRe
         let address = evm_address_from_private_key(&private_key)
             .map_err(|source| config_error(source.to_string()))?;
         registry.register(ChainType::Arbitrum, address);
+    }
+    if let Some(private_key) =
+        normalize_optional_string(args.hyperevm_paymaster_private_key.as_deref())
+    {
+        let address = evm_address_from_private_key(&private_key)
+            .map_err(|source| config_error(source.to_string()))?;
+        registry.register(ChainType::Hyperevm, address);
     }
     if let Some(private_key) =
         normalize_optional_string(args.bitcoin_paymaster_private_key.as_deref())
@@ -487,6 +558,12 @@ fn required_across_api_key(value: Option<&str>) -> WorkerResult<String> {
     Ok(trimmed.to_string())
 }
 
+fn cctp_transfer_mode_for_config(value: Option<&str>) -> Result<CctpTransferMode, WorkerError> {
+    let Some(value) = value else {
+        return Ok(CctpTransferMode::Standard);
+    };
+    CctpTransferMode::from_str(value).map_err(config_error)
+}
 fn normalize_optional_url(value: Option<&str>, name: &str) -> WorkerResult<Option<String>> {
     let Some(value) = value else {
         return Ok(None);

@@ -826,6 +826,7 @@ fn boundary_path_has_configured_provider_set(
             MarketOrderTransitionKind::AcrossBridge
             | MarketOrderTransitionKind::CctpBridge
             | MarketOrderTransitionKind::HyperliquidBridgeDeposit
+            | MarketOrderTransitionKind::HypercoreBridgeDeposit
             | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => action_providers
                 .bridge(transition.provider.as_str())
                 .is_some(),
@@ -1170,6 +1171,7 @@ async fn boundary_compose_transition_path_quote(
             MarketOrderTransitionKind::AcrossBridge
             | MarketOrderTransitionKind::CctpBridge
             | MarketOrderTransitionKind::HyperliquidBridgeDeposit
+            | MarketOrderTransitionKind::HypercoreBridgeDeposit
             | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
                 let bridge = deps
                     .action_providers
@@ -1249,8 +1251,11 @@ async fn boundary_compose_transition_path_quote(
                         .is_some_and(|custody| custody.prefund_first_trade);
                 if prefund_from_boundary
                     || (index > 0
-                        && path.transitions[index - 1].kind
-                            == MarketOrderTransitionKind::HyperliquidBridgeDeposit)
+                        && matches!(
+                            path.transitions[index - 1].kind,
+                            MarketOrderTransitionKind::HyperliquidBridgeDeposit
+                                | MarketOrderTransitionKind::HypercoreBridgeDeposit
+                        ))
                 {
                     quote_amount_in = refresh_reserve_hyperliquid_spot_send_quote_gas(
                         "hyperliquid_trade.amount_in",
@@ -1532,6 +1537,21 @@ async fn boundary_hyperliquid_current_location(
                 &["source_custody_vault_address", "depositor_address"],
             );
             (role, asset, true, source_address)
+        }
+        "hypercore_bridge_deposit" => {
+            let role = boundary_step_request_custody_role(
+                completed_leg_steps,
+                "source_custody_vault_role",
+            )
+            .unwrap_or(CustodyVaultRole::SourceDeposit);
+            let asset =
+                boundary_step_request_asset(completed_leg_steps, "source_chain_id", "input_asset")
+                    .or_else(|| Some(completed_leg.input_asset.clone()));
+            let source_address = boundary_step_request_string(
+                completed_leg_steps,
+                &["source_custody_vault_address", "depositor_address"],
+            );
+            (role, asset, false, source_address)
         }
         "unit_deposit" | "hyperliquid_trade" => {
             let (role, asset, source_address) =
@@ -1903,6 +1923,7 @@ impl QuoteRefreshActivities {
                         MarketOrderTransitionKind::AcrossBridge
                         | MarketOrderTransitionKind::CctpBridge
                         | MarketOrderTransitionKind::HyperliquidBridgeDeposit
+                        | MarketOrderTransitionKind::HypercoreBridgeDeposit
                         | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
                             let bridge = deps
                                 .action_providers
@@ -1996,8 +2017,11 @@ impl QuoteRefreshActivities {
                                 })?;
                             let mut quote_amount_in = cursor_amount.clone();
                             if index > 0
-                                && transitions[index - 1].kind
-                                    == MarketOrderTransitionKind::HyperliquidBridgeDeposit
+                                && matches!(
+                                    transitions[index - 1].kind,
+                                    MarketOrderTransitionKind::HyperliquidBridgeDeposit
+                                        | MarketOrderTransitionKind::HypercoreBridgeDeposit
+                                )
                             {
                                 quote_amount_in = refresh_reserve_hyperliquid_spot_send_quote_gas(
                                     "hyperliquid_trade.amount_in",

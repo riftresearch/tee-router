@@ -566,16 +566,18 @@ pub(super) async fn recover_across_deposit_from_origin_logs(
         )
     })?;
 
-    let BridgeExecutionRequest::Across(step_request) =
-        BridgeExecutionRequest::across_from_value(&step.request).map_err(|err| {
-            lost_intent_recovery_error(
-                "decoding Across step request",
-                format!(
+    let BridgeExecutionRequest::Across(step_request) = BridgeExecutionRequest::across_from_value(
+        &step.request,
+    )
+    .map_err(|err| {
+        lost_intent_recovery_error(
+            "decoding Across step request",
+            format!(
                 "Across checkpoint recovery could not decode step request for operation {}: {err}",
                 operation.id
-                ),
-            )
-        })?
+            ),
+        )
+    })?
     else {
         return Err(lost_intent_recovery_error(
             "validating Across step request",
@@ -1773,6 +1775,31 @@ fn validate_hyperunit_request_amount_gte(
     validate_decimal_gte(label, observed, expected)
 }
 
+fn validate_hyperunit_withdrawal_settled_amount(
+    label: &'static str,
+    operation: &OrderProviderOperation,
+    observed: &str,
+) -> Result<(), OrderActivityError> {
+    if normalize_decimal_string(observed)? == "0" {
+        return Err(OrderActivityError::hint_verification(
+            label,
+            "settled amount must be positive",
+        ));
+    }
+
+    let Some(requested) = operation.request.get("amount").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    if decimal_string_gte(requested, observed)? {
+        Ok(())
+    } else {
+        Err(OrderActivityError::hint_verification(
+            label,
+            format!("settled amount {observed} exceeds requested amount {requested}"),
+        ))
+    }
+}
+
 fn validate_expected_asset_token(
     label: &'static str,
     chain_id: Option<&str>,
@@ -2555,7 +2582,7 @@ pub(super) async fn verify_hyperunit_withdrawal_settled_hint(
     )?;
     validate_hyperunit_withdrawal_settlement_chain(&operation, evidence)?;
     if let Some(amount) = evidence.amount.as_deref() {
-        validate_hyperunit_request_amount_gte(
+        validate_hyperunit_withdrawal_settled_amount(
             "HyperUnitWithdrawalSettled amount",
             &operation,
             amount,
@@ -3077,6 +3104,7 @@ pub(super) async fn verify_provider_observation_hint(
         | ProviderOperationType::CctpBridge
         | ProviderOperationType::CctpReceive
         | ProviderOperationType::HyperliquidBridgeDeposit
+        | ProviderOperationType::HypercoreBridgeDeposit
         | ProviderOperationType::HyperliquidBridgeWithdrawal => {
             let provider = deps
                 .action_providers
@@ -3565,7 +3593,7 @@ mod tests {
             hyperunit_operation_id: None,
             hyperunit_status: Some("done".to_string()),
             destination_address: "0xrecipient".to_string(),
-            amount: Some("105".to_string()),
+            amount: Some("95".to_string()),
             destination_chain: Some("base".to_string()),
             destination_tx_hash: Some("0xsettled".to_string()),
             btc_tx_hash: None,
@@ -3583,8 +3611,47 @@ mod tests {
             hyperunit_withdrawal_settled_response(&operation, &evidence, "0xsettled").unwrap();
 
         assert_eq!(response["amount_in"], json!("100"));
-        assert_eq!(response["amount_out"], json!("105"));
+        assert_eq!(response["amount_out"], json!("95"));
         assert_eq!(response["destination_tx_hash"], json!("0xsettled"));
+    }
+
+    #[test]
+    fn hyperunit_withdrawal_settlement_amount_allows_net_after_fees() {
+        let operation = operation_with_request(
+            ProviderOperationType::UnitWithdrawal,
+            json!({ "amount": "17887471000000000" }),
+        );
+
+        validate_hyperunit_withdrawal_settled_amount(
+            "HyperUnitWithdrawalSettled amount",
+            &operation,
+            "17759236468750000",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn hyperunit_withdrawal_settlement_amount_rejects_zero_or_overstated_amounts() {
+        let operation = operation_with_request(
+            ProviderOperationType::UnitWithdrawal,
+            json!({ "amount": "100" }),
+        );
+
+        let zero = validate_hyperunit_withdrawal_settled_amount(
+            "HyperUnitWithdrawalSettled amount",
+            &operation,
+            "0",
+        )
+        .unwrap_err();
+        assert!(zero.to_string().contains("must be positive"));
+
+        let overstated = validate_hyperunit_withdrawal_settled_amount(
+            "HyperUnitWithdrawalSettled amount",
+            &operation,
+            "101",
+        )
+        .unwrap_err();
+        assert!(overstated.to_string().contains("exceeds requested amount"));
     }
 
     #[test]

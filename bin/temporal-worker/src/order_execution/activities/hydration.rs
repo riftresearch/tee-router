@@ -659,26 +659,10 @@ pub(super) async fn hydrate_cctp_receive_request(
         .observed_state
         .get("provider_observed_state")
         .unwrap_or(&operation.observed_state);
-    if let Some(decoded_amount) = cctp_state
-        .get("decoded_message_body")
-        .and_then(|body| body.get("amount"))
-        .and_then(Value::as_str)
-    {
-        let planned_amount = step.request.get("amount").and_then(Value::as_str).ok_or(
-            OrderActivityError::MissingHydration {
-                vault_role: "cctp_receive_amount",
-                step_id: step.id.into(),
-            },
-        )?;
-        if decoded_amount != planned_amount {
-            return Err(invariant_error(
-                "cctp_receive_amount_matches_attestation",
-                format!(
-                    "CCTP receive amount {planned_amount} does not match attested burn amount {decoded_amount}"
-                ),
-            ));
-        }
-    }
+    let decoded_amount = match cctp_state.get("decoded_message_body") {
+        Some(body) => attested_cctp_receive_amount(body)?,
+        None => None,
+    };
     let message = cctp_state.get("message").and_then(Value::as_str).ok_or(
         OrderActivityError::MissingHydration {
             vault_role: "cctp_attested_message",
@@ -693,6 +677,20 @@ pub(super) async fn hydrate_cctp_receive_request(
             step_id: step.id.into(),
         })?;
     let mut request = step.request.clone();
+    if let Some(decoded_amount) = decoded_amount {
+        if let Some(planned_amount) = step.request.get("amount").and_then(Value::as_str) {
+            if decoded_amount != planned_amount {
+                tracing::warn!(
+                    step_id = %step.id,
+                    planned_amount = %planned_amount,
+                    decoded_amount = %decoded_amount,
+                    event_name = "cctp_receive.attested_amount_override",
+                    "cctp_receive.attested_amount_override"
+                );
+            }
+        }
+        set_json_value(&mut request, "amount", json!(decoded_amount));
+    }
     set_json_value(&mut request, "message", json!(message));
     set_json_value(&mut request, "attestation", json!(attestation));
     set_json_value(
@@ -704,4 +702,36 @@ pub(super) async fn hydrate_cctp_receive_request(
         set_json_value(&mut request, "burn_tx_hash", json!(tx_hash));
     }
     Ok(request)
+}
+
+fn attested_cctp_receive_amount(body: &Value) -> Result<Option<String>, OrderActivityError> {
+    let Some(decoded_amount) = body.get("amount").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let amount = U256::from_str_radix(decoded_amount, 10).map_err(|source| {
+        OrderActivityError::hint_verification(
+            "cctp_attested_amount",
+            format!("invalid attested amount {decoded_amount:?}: {source}"),
+        )
+    })?;
+    let fee = body
+        .get("feeExecuted")
+        .and_then(Value::as_str)
+        .map(|value| {
+            U256::from_str_radix(value, 10).map_err(|source| {
+                OrderActivityError::hint_verification(
+                    "cctp_attested_fee",
+                    format!("invalid attested feeExecuted {value:?}: {source}"),
+                )
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
+    if fee > amount {
+        return Err(OrderActivityError::hint_verification(
+            "cctp_attested_fee",
+            format!("attested fee {fee} exceeds attested amount {amount}"),
+        ));
+    }
+    Ok(Some((amount - fee).to_string()))
 }

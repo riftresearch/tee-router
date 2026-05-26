@@ -6572,8 +6572,13 @@ impl OrderRepository {
                 END,
                 actual_amount_out = CASE
                     WHEN rolled_up.completed THEN COALESCE(
+                        rolled_up.last_response_json #>> '{{balance_observation,output,spendable_balance}}',
+                        rolled_up.last_response_json #>> '{{balance_observation,output,balance}}',
                         (
-                            SELECT probe.value->>'credit_delta'
+                            SELECT COALESCE(
+                                probe.value->>'spendable_balance',
+                                probe.value->>'balance'
+                            )
                             FROM jsonb_array_elements(
                                 CASE
                                     WHEN jsonb_typeof(rolled_up.last_response_json #> '{{balance_observation,probes}}') = 'array'
@@ -6582,112 +6587,16 @@ impl OrderRepository {
                                 END
                             ) AS probe(value)
                             WHERE probe.value->>'role' = 'destination'
-                              AND probe.value->>'credit_delta' ~ '^[0-9]+$'
-                              AND (probe.value->>'credit_delta')::numeric > 0
+                              AND COALESCE(
+                                    probe.value->>'spendable_balance',
+                                    probe.value->>'balance'
+                                  ) ~ '^[0-9]+$'
+                              AND COALESCE(
+                                    probe.value->>'spendable_balance',
+                                    probe.value->>'balance'
+                                  )::numeric > 0
                             LIMIT 1
-                        ),
-                        CASE
-                            WHEN leg.leg_type = 'cctp_bridge' THEN (
-                                SELECT probe.value->>'credit_delta'
-                                FROM jsonb_array_elements(
-                                    CASE
-                                        WHEN jsonb_typeof(rolled_up.last_response_json #> '{{balance_observation,probes}}') = 'array'
-                                            THEN rolled_up.last_response_json #> '{{balance_observation,probes}}'
-                                        ELSE '[]'::jsonb
-                                    END
-                                ) AS probe(value)
-                                WHERE probe.value->>'role' = 'source'
-                                  AND probe.value->>'credit_delta' ~ '^[0-9]+$'
-                                  AND (probe.value->>'credit_delta')::numeric > 0
-                                LIMIT 1
-                            )
-                        END,
-                        rolled_up.last_response_json->>'amount_out',
-                        rolled_up.last_response_json->>'amountOut',
-                        rolled_up.last_response_json->>'output_amount',
-                        rolled_up.last_response_json->>'outputAmount',
-                        rolled_up.last_response_json->>'expectedOutputAmount',
-                        rolled_up.last_response_json->>'minOutputAmount',
-                        rolled_up.last_response_json #>> '{{response,amount_out}}',
-                        rolled_up.last_response_json #>> '{{response,amountOut}}',
-                        rolled_up.last_response_json #>> '{{response,output_amount}}',
-                        rolled_up.last_response_json #>> '{{response,outputAmount}}',
-                        rolled_up.last_response_json #>> '{{response,expectedOutputAmount}}',
-                        rolled_up.last_response_json #>> '{{response,minOutputAmount}}',
-                        rolled_up.last_response_json #>> '{{observed_state,amount_out}}',
-                        rolled_up.last_response_json #>> '{{observed_state,amountOut}}',
-                        rolled_up.last_response_json #>> '{{observed_state,actual_amount_out}}',
-                        rolled_up.last_response_json #>> '{{observed_state,actualAmountOut}}',
-                        rolled_up.last_response_json #>> '{{observed_state,output_amount}}',
-                        rolled_up.last_response_json #>> '{{observed_state,outputAmount}}',
-                        rolled_up.last_response_json #>> '{{observed_state,previous_observed_state,amount_out}}',
-                        rolled_up.last_response_json #>> '{{observed_state,previous_observed_state,amountOut}}',
-                        rolled_up.last_response_json #>> '{{observed_state,previous_observed_state,actual_amount_out}}',
-                        rolled_up.last_response_json #>> '{{observed_state,previous_observed_state,actualAmountOut}}',
-                        rolled_up.last_response_json #>> '{{observed_state,previous_observed_state,output_amount}}',
-                        rolled_up.last_response_json #>> '{{observed_state,previous_observed_state,outputAmount}}',
-                        rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,amount_out}}',
-                        rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,amountOut}}',
-                        rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,actual_amount_out}}',
-                        rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,actualAmountOut}}',
-                        rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,output_amount}}',
-                        rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,outputAmount}}',
-                        rolled_up.last_response_json #>> '{{provider_context,amount_out}}',
-                        rolled_up.last_response_json #>> '{{provider_context,amountOut}}',
-                        rolled_up.last_response_json #>> '{{provider_context,output_amount}}',
-                        rolled_up.last_response_json #>> '{{provider_context,outputAmount}}',
-                        rolled_up.last_request_json->>'amount_out',
-                        rolled_up.last_request_json->>'amountOut',
-                        rolled_up.last_request_json->>'output_amount',
-                        rolled_up.last_request_json->>'outputAmount',
-                        CASE
-                            WHEN leg.leg_type = 'cctp_bridge'
-                                THEN rolled_up.last_request_json->>'amount'
-                        END,
-                        rolled_up.last_request_json #>> '{{price_route,destAmount}}',
-                        CASE
-                            WHEN leg.leg_type = 'unit_deposit'
-                             AND (rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,destination_amount}}') ~ '^[0-9]+$'
-                                THEN rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,destination_amount}}'
-                            WHEN leg.leg_type = 'unit_deposit'
-                             AND (rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,destinationAmount}}') ~ '^[0-9]+$'
-                                THEN rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,destinationAmount}}'
-                            WHEN leg.leg_type = 'unit_deposit'
-                             AND (rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,source_amount}}') ~ '^[0-9]+$'
-                                THEN rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,source_amount}}'
-                            WHEN leg.leg_type = 'unit_deposit'
-                             AND (rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,sourceAmount}}') ~ '^[0-9]+$'
-                                THEN rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,sourceAmount}}'
-                            WHEN leg.leg_type = 'unit_deposit'
-                             AND (rolled_up.last_response_json->>'amount') ~ '^[0-9]+$'
-                                THEN rolled_up.last_response_json->>'amount'
-                            WHEN leg.leg_type = 'unit_deposit'
-                             AND (rolled_up.last_response_json #>> '{{provider_context,amount}}') ~ '^[0-9]+$'
-                                THEN rolled_up.last_response_json #>> '{{provider_context,amount}}'
-                        END,
-                        rolled_up.last_response_json #>> '{{observed_state,amount_out}}',
-                        rolled_up.last_response_json #>> '{{observed_state,amountOut}}',
-                        rolled_up.last_response_json #>> '{{observed_state,output_amount}}',
-                        rolled_up.last_response_json #>> '{{observed_state,outputAmount}}',
-                        rolled_up.last_response_json #>> '{{observed_state,previous_observed_state,amount_out}}',
-                        rolled_up.last_response_json #>> '{{observed_state,previous_observed_state,amountOut}}',
-                        rolled_up.last_response_json #>> '{{observed_state,previous_observed_state,output_amount}}',
-                        rolled_up.last_response_json #>> '{{observed_state,previous_observed_state,outputAmount}}',
-                        rolled_up.last_response_json #>> '{{observed_state,previous_observed_state,previous_observed_state,output_amount}}',
-                        rolled_up.last_response_json #>> '{{observed_state,previous_observed_state,previous_observed_state,outputAmount}}',
-                        rolled_up.last_response_json #>> '{{observed_state,previous_observed_state,destination_amount}}',
-                        rolled_up.last_response_json #>> '{{observed_state,previous_observed_state,destinationAmount}}',
-                        rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,amount_out}}',
-                        rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,amountOut}}',
-                        rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,output_amount}}',
-                        rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,outputAmount}}',
-                        rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,decoded_message_body,amount}}',
-                        rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,destination_amount}}',
-                        rolled_up.last_response_json #>> '{{observed_state,provider_observed_state,destinationAmount}}',
-                        CASE
-                            WHEN leg.leg_type = 'cctp_bridge'
-                                THEN rolled_up.last_amount_in
-                        END
+                        )
                     )
                     ELSE NULL
                 END,
@@ -7148,7 +7057,33 @@ impl OrderRepository {
                         SELECT
                             leg.id,
                             COALESCE(leg.actual_amount_in, leg.amount_in) AS actual_amount_in,
-                            COALESCE(leg.actual_amount_out, leg.estimated_amount_out) AS actual_amount_out,
+                            COALESCE(
+                                last_step.response_json #>> '{balance_observation,output,spendable_balance}',
+                                last_step.response_json #>> '{balance_observation,output,balance}',
+                                (
+                                    SELECT COALESCE(
+                                        probe.value->>'spendable_balance',
+                                        probe.value->>'balance'
+                                    )
+                                    FROM jsonb_array_elements(
+                                        CASE
+                                            WHEN jsonb_typeof(last_step.response_json #> '{balance_observation,probes}') = 'array'
+                                                THEN last_step.response_json #> '{balance_observation,probes}'
+                                            ELSE '[]'::jsonb
+                                        END
+                                    ) AS probe(value)
+                                    WHERE probe.value->>'role' = 'destination'
+                                      AND COALESCE(
+                                            probe.value->>'spendable_balance',
+                                            probe.value->>'balance'
+                                          ) ~ '^[0-9]+$'
+                                      AND COALESCE(
+                                            probe.value->>'spendable_balance',
+                                            probe.value->>'balance'
+                                          )::numeric > 0
+                                    LIMIT 1
+                                )
+                            ) AS actual_amount_out,
                             leg.input_chain_id,
                             leg.input_asset_id,
                             leg.output_chain_id,
@@ -7173,7 +7108,7 @@ impl OrderRepository {
                             LIMIT 1
                         ) first_step ON true
                         LEFT JOIN LATERAL (
-                            SELECT step.usd_valuation_json
+                            SELECT step.usd_valuation_json, step.response_json
                             FROM order_execution_steps step
                             WHERE step.execution_leg_id = leg.id
                               AND step.status = 'completed'

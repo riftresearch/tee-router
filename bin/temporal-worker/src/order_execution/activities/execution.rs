@@ -99,6 +99,19 @@ impl OrderActivities {
         })
         .await
     }
+    #[activity]
+    pub async fn dispatch_hypercore_bridge_deposit_step(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: DispatchStepInput,
+    ) -> Result<StepDispatched, ActivityError> {
+        record_activity("dispatch_hypercore_bridge_deposit_step", async move {
+            let deps = self.deps()?;
+            run_step_dispatch(&deps, input, OrderExecutionStepType::HypercoreBridgeDeposit).await
+        })
+        .await
+    }
+
 
     #[activity]
     pub async fn dispatch_hyperliquid_bridge_withdrawal_step(
@@ -905,6 +918,7 @@ pub(super) async fn run_step_dispatch(
 
     // 4. Execute through the idempotent guard.
     let completion = execute_running_step(deps, &step).await?;
+    let completion = apply_authoritative_output_balance(deps, &step, completion).await?;
 
     // 5. Persist provider receipt + status + settle. The earlier
     // `persist_provider_receipt` and `persist_provider_operation_status`
@@ -1063,7 +1077,8 @@ pub(super) async fn settle_waiting_step_after_execute(
                 .get_execution_step(step_id)
                 .await
                 .map_err(OrderActivityError::db_query)?;
-            let response = provider_operation_step_response(operation);
+            let mut response = provider_operation_step_response(operation);
+            apply_authoritative_output_observation_to_response(deps, &step, &mut response).await?;
             let usd_valuation =
                 execution_step_usd_valuation_for_response(deps, &step, &response).await;
             let completed = deps
@@ -1271,30 +1286,24 @@ async fn propagate_refund_completed_step_amount_out(
     Ok(())
 }
 
-fn completed_step_amount_out(step: &OrderExecutionStep) -> Option<String> {
+pub(super) fn completed_step_amount_out(step: &OrderExecutionStep) -> Option<String> {
     let response = &step.response;
+    if let Some(amount_out) = balance_observation_amount_out(response) {
+        return Some(amount_out.to_string());
+    }
+    if let Some(amount_out) = claim_observation_amount_out(response) {
+        return Some(amount_out.to_string());
+    }
+    None
+}
+
+fn balance_observation_amount_out(response: &Value) -> Option<&str> {
     for pointer in [
-        "/amount_out",
-        "/amountOut",
-        "/output_amount",
-        "/outputAmount",
-        "/observed_state/amount_out",
-        "/observed_state/amountOut",
-        "/observed_state/actual_amount_out",
-        "/observed_state/actualAmountOut",
-        "/observed_state/output_amount",
-        "/observed_state/outputAmount",
-        "/observed_state/provider_observed_state/amount_out",
-        "/observed_state/provider_observed_state/amountOut",
-        "/observed_state/provider_observed_state/output_amount",
-        "/observed_state/provider_observed_state/outputAmount",
-        "/provider_context/amount_out",
-        "/provider_context/amountOut",
-        "/provider_context/output_amount",
-        "/provider_context/outputAmount",
+        "/balance_observation/output/spendable_balance",
+        "/balance_observation/output/balance",
     ] {
         if let Some(amount) = response.pointer(pointer).and_then(decimal_string) {
-            return Some(amount.to_string());
+            return Some(amount);
         }
     }
     response
@@ -1306,13 +1315,21 @@ fn completed_step_amount_out(step: &OrderExecutionStep) -> Option<String> {
                 if role != "destination" {
                     return None;
                 }
-                probe.get("credit_delta").and_then(decimal_string)
+                probe
+                    .get("spendable_balance")
+                    .or_else(|| probe.get("balance"))
+                    .and_then(decimal_string)
             })
         })
-        .map(str::to_string)
 }
 
-fn decimal_string(value: &Value) -> Option<&str> {
+fn claim_observation_amount_out(response: &Value) -> Option<&str> {
+    response
+        .pointer("/claim_observation/amount")
+        .and_then(decimal_string)
+}
+
+pub(super) fn decimal_string(value: &Value) -> Option<&str> {
     value
         .as_str()
         .filter(|raw| !raw.is_empty() && raw.chars().all(|ch| ch.is_ascii_digit()))
@@ -1892,6 +1909,10 @@ const CCTP_RECEIVE_DISPATCH: StepDispatch = StepDispatch {
 const HYPERLIQUID_BRIDGE_DEPOSIT_DISPATCH: StepDispatch = StepDispatch {
     execute: execute_hyperliquid_bridge_deposit_step,
 };
+const HYPERCORE_BRIDGE_DEPOSIT_DISPATCH: StepDispatch = StepDispatch {
+    execute: execute_hypercore_bridge_deposit_step,
+};
+
 const HYPERLIQUID_BRIDGE_WITHDRAWAL_DISPATCH: StepDispatch = StepDispatch {
     execute: execute_hyperliquid_bridge_withdrawal_step,
 };
@@ -1922,6 +1943,7 @@ fn step_dispatch(step_type: OrderExecutionStepType) -> &'static StepDispatch {
         OrderExecutionStepType::CctpBurn => &CCTP_BURN_DISPATCH,
         OrderExecutionStepType::CctpReceive => &CCTP_RECEIVE_DISPATCH,
         OrderExecutionStepType::HyperliquidBridgeDeposit => &HYPERLIQUID_BRIDGE_DEPOSIT_DISPATCH,
+        OrderExecutionStepType::HypercoreBridgeDeposit => &HYPERCORE_BRIDGE_DEPOSIT_DISPATCH,
         OrderExecutionStepType::HyperliquidBridgeWithdrawal => {
             &HYPERLIQUID_BRIDGE_WITHDRAWAL_DISPATCH
         }
@@ -2166,6 +2188,17 @@ fn execute_hyperliquid_bridge_deposit_step<'a>(
         step,
         ProviderOperationType::HyperliquidBridgeDeposit,
         BridgeExecutionRequest::hyperliquid_bridge_deposit_from_value,
+    )
+}
+fn execute_hypercore_bridge_deposit_step<'a>(
+    deps: &'a OrderActivityDeps,
+    step: &'a OrderExecutionStep,
+) -> StepDispatchFuture<'a> {
+    execute_idempotent_bridge_step(
+        deps,
+        step,
+        ProviderOperationType::HypercoreBridgeDeposit,
+        BridgeExecutionRequest::hypercore_bridge_deposit_from_value,
     )
 }
 
@@ -2492,16 +2525,36 @@ pub(super) async fn prepare_provider_completion(
             mut state,
         } => {
             let action_for_response = action.clone();
-            let receipt = deps
+            let receipt_result = deps
                 .custody_action_executor
                 .execute(CustodyActionRequest {
                     custody_vault_id,
                     action,
                 })
-                .await
-                .map_err(|source| {
-                    custody_action_error("execute provider custody action", source)
-                })?;
+                .await;
+            let receipt = match receipt_result {
+                Ok(receipt) => receipt,
+                Err(source) => {
+                    let source = source.to_string();
+                    if let Some(completion) = cctp_receive_already_claimed_completion(
+                        deps,
+                        step,
+                        custody_vault_id,
+                        &action_for_response,
+                        &provider_context,
+                        state,
+                        &source,
+                    )
+                    .await?
+                    {
+                        return Ok(completion);
+                    }
+                    return Err(custody_action_error(
+                        "execute provider custody action",
+                        source,
+                    ));
+                }
+            };
             if let Some(operation) = state.operation.as_mut() {
                 operation
                     .provider_ref
@@ -2610,6 +2663,538 @@ pub(super) async fn prepare_provider_completion(
             })
         }
     }
+}
+
+async fn cctp_receive_already_claimed_completion(
+    deps: &OrderActivityDeps,
+    step: &OrderExecutionStep,
+    custody_vault_id: Uuid,
+    action_for_response: &CustodyAction,
+    provider_context: &Value,
+    state: ProviderExecutionState,
+    source: &str,
+) -> Result<Option<StepCompletion>, OrderActivityError> {
+    if step.step_type != OrderExecutionStepType::CctpReceive {
+        return Ok(None);
+    }
+    let Some(output_asset) = step.output_asset.as_ref() else {
+        return Ok(None);
+    };
+    let Some(balance) = authoritative_external_output_balance(deps, step, output_asset).await?
+    else {
+        return Ok(None);
+    };
+    let Some(expected_amount) = cctp_receive_expected_amount(step, &state) else {
+        return Ok(None);
+    };
+    let observed = parse_raw_amount_for_provider(step, &balance.amount)?;
+    let expected = parse_raw_amount_for_provider(step, expected_amount)?;
+    if observed < expected {
+        return Ok(None);
+    }
+    Ok(Some(cctp_receive_existing_balance_completion(
+        step,
+        custody_vault_id,
+        action_for_response,
+        provider_context,
+        state,
+        &balance,
+        source,
+    )))
+}
+
+fn cctp_receive_expected_amount<'a>(
+    step: &'a OrderExecutionStep,
+    state: &'a ProviderExecutionState,
+) -> Option<&'a str> {
+    state
+        .operation
+        .as_ref()
+        .and_then(|operation| operation.request.as_ref())
+        .and_then(|request| request.get("amount"))
+        .and_then(decimal_string)
+        .or_else(|| step.request.get("amount").and_then(decimal_string))
+}
+
+fn parse_raw_amount_for_provider(
+    step: &OrderExecutionStep,
+    value: &str,
+) -> Result<U256, OrderActivityError> {
+    U256::from_str_radix(value, 10).map_err(|source| {
+        provider_execute_error(
+            &step.provider,
+            format!("invalid raw amount {value:?}: {source}"),
+        )
+    })
+}
+
+pub(super) fn cctp_receive_existing_balance_completion(
+    step: &OrderExecutionStep,
+    custody_vault_id: Uuid,
+    action_for_response: &CustodyAction,
+    provider_context: &Value,
+    mut state: ProviderExecutionState,
+    balance: &AuthoritativeOutputBalance,
+    source: &str,
+) -> StepCompletion {
+    let provider_ref = format!("cctp_receive_already_claimed:{}", step.id);
+    let observed_state = json!({
+        "kind": "cctp_receive_already_claimed",
+        "reason": "destination_custody_vault_already_funded",
+        "custody_vault_id": custody_vault_id,
+        "chain_id": balance.chain_id,
+        "asset_id": balance.asset_id,
+        "balance": balance.amount,
+        "address": balance.address,
+        "prior_error": source,
+    });
+    if let Some(operation) = state.operation.as_mut() {
+        operation.status = ProviderOperationStatus::Completed;
+        operation.provider_ref = Some(provider_ref);
+        operation.observed_state = Some(observed_state.clone());
+        operation.response = Some(json!({
+            "kind": "cctp_receive_already_claimed",
+            "amount_out": balance.amount,
+        }));
+    }
+    StepCompletion {
+        response: json!({
+            "kind": "cctp_receive_already_claimed",
+            "provider": &step.provider,
+            "step_id": step.id,
+            "custody_vault_id": custody_vault_id,
+            "action": action_for_response,
+            "provider_context": provider_context,
+            "observed_state": observed_state,
+        }),
+        tx_hash: None,
+        provider_state: state,
+        outcome: StepExecutionOutcome::Completed,
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct AuthoritativeOutputBalance {
+    pub(super) amount: String,
+    pub(super) location: &'static str,
+    pub(super) custody_vault_id: Option<Uuid>,
+    pub(super) address: Option<String>,
+    pub(super) chain_id: String,
+    pub(super) asset_id: String,
+    pub(super) details: Value,
+}
+
+pub(super) async fn apply_authoritative_output_balance(
+    deps: &OrderActivityDeps,
+    step: &OrderExecutionStep,
+    mut completion: StepCompletion,
+) -> Result<StepCompletion, OrderActivityError> {
+    if completion.outcome != StepExecutionOutcome::Completed {
+        return Ok(completion);
+    }
+    apply_authoritative_output_observation_to_response(deps, step, &mut completion.response)
+        .await?;
+    Ok(completion)
+}
+
+async fn apply_authoritative_output_observation_to_response(
+    deps: &OrderActivityDeps,
+    step: &OrderExecutionStep,
+    response: &mut Value,
+) -> Result<(), OrderActivityError> {
+    if let Some(balance) = authoritative_output_balance(deps, step).await? {
+        if balance.amount == "0" {
+            return Err(provider_execute_error(
+                &step.provider,
+                "authoritative output balance resolved to zero",
+            ));
+        }
+        apply_authoritative_output_balance_to_response(response, &balance);
+        return Ok(());
+    }
+
+    if let Some(claim_amount) = authoritative_claim_amount(step, response).map(str::to_owned) {
+        apply_authoritative_claim_observation_to_response(step, response, &claim_amount);
+    }
+    strip_provider_reported_output_amounts(response);
+    Ok(())
+}
+
+fn authoritative_claim_amount<'a>(
+    step: &OrderExecutionStep,
+    response: &'a Value,
+) -> Option<&'a str> {
+    if step.step_type != OrderExecutionStepType::CctpBurn {
+        return None;
+    }
+    cctp_claim_amount_from_response(response)
+}
+
+fn cctp_claim_amount_from_response(response: &Value) -> Option<&str> {
+    for pointer in [
+        "/claim_observation/amount",
+        "/observed_state/provider_observed_state/decoded_message_body/amount",
+        "/observed_state/decoded_message_body/amount",
+        "/messages/0/decodedMessage/decodedMessageBody/amount",
+    ] {
+        if let Some(amount) = response.pointer(pointer).and_then(decimal_string) {
+            return Some(amount);
+        }
+    }
+    None
+}
+
+fn apply_authoritative_claim_observation_to_response(
+    step: &OrderExecutionStep,
+    response: &mut Value,
+    amount: &str,
+) {
+    if !response.is_object() {
+        *response = json!({});
+    }
+    let output_asset = step.output_asset.as_ref();
+    let object = response.as_object_mut().expect("response is object");
+    object.insert(
+        "claim_observation".to_string(),
+        json!({
+            "amount_out_source": "cctp_attested_message",
+            "claim_kind": "cctp_receive_claim",
+            "amount": amount,
+            "chain_id": output_asset.map(|asset| asset.chain.to_string()),
+            "asset_id": output_asset.map(|asset| asset.asset.to_string()),
+        }),
+    );
+}
+
+fn strip_provider_reported_output_amounts(response: &mut Value) {
+    let Some(object) = response.as_object_mut() else {
+        return;
+    };
+    for key in [
+        "amount_out",
+        "amountOut",
+        "output_amount",
+        "outputAmount",
+        "expectedOutputAmount",
+        "minOutputAmount",
+    ] {
+        if let Some(value) = object.remove(key) {
+            let reported = object
+                .entry("provider_reported_output_amounts".to_string())
+                .or_insert_with(|| json!({}));
+            if !reported.is_object() {
+                *reported = json!({});
+            }
+            reported
+                .as_object_mut()
+                .expect("provider_reported_output_amounts is object")
+                .entry(key.to_string())
+                .or_insert(value);
+        }
+    }
+}
+
+async fn authoritative_output_balance(
+    deps: &OrderActivityDeps,
+    step: &OrderExecutionStep,
+) -> Result<Option<AuthoritativeOutputBalance>, OrderActivityError> {
+    if step.step_type == OrderExecutionStepType::CctpBurn {
+        return Ok(None);
+    }
+    let Some(output_asset) = step.output_asset.as_ref() else {
+        return Ok(None);
+    };
+    if output_asset.chain.as_str() == "hyperliquid" {
+        return authoritative_hyperliquid_output_balance(deps, step, output_asset).await;
+    }
+    authoritative_external_output_balance(deps, step, output_asset).await
+}
+
+async fn authoritative_hyperliquid_output_balance(
+    deps: &OrderActivityDeps,
+    step: &OrderExecutionStep,
+    output_asset: &DepositAsset,
+) -> Result<Option<AuthoritativeOutputBalance>, OrderActivityError> {
+    if step.step_type == OrderExecutionStepType::HyperliquidBridgeDeposit
+        && output_asset.asset == AssetId::Native
+    {
+        return authoritative_hyperliquid_clearinghouse_output_balance(deps, step, output_asset)
+            .await;
+    }
+    let Some(vault) = hyperliquid_output_custody_vault(deps, step, output_asset).await? else {
+        return Ok(None);
+    };
+    let registry = deps.action_providers.asset_registry();
+    let Some(provider_asset) = registry.provider_asset(
+        ProviderId::Hyperliquid,
+        output_asset,
+        ProviderAssetCapability::ExchangeOutput,
+    ) else {
+        return Ok(None);
+    };
+    let balances = deps
+        .custody_action_executor
+        .inspect_hyperliquid_spot_balances(&vault)
+        .await
+        .map_err(|source| custody_action_error("read Hyperliquid output balance", source))?;
+    let Some(balance) = balances
+        .into_iter()
+        .find(|balance| balance.coin == provider_asset.provider_asset)
+    else {
+        return Ok(None);
+    };
+    let total_raw =
+        decimal_amount_to_raw_u256(&balance.total, provider_asset.decimals).map_err(|reason| {
+            provider_execute_error(
+                &step.provider,
+                format!(
+                    "invalid Hyperliquid {} total balance: {reason}",
+                    provider_asset.provider_asset
+                ),
+            )
+        })?;
+    let hold_raw =
+        decimal_amount_to_raw_u256(&balance.hold, provider_asset.decimals).map_err(|reason| {
+            provider_execute_error(
+                &step.provider,
+                format!(
+                    "invalid Hyperliquid {} hold balance: {reason}",
+                    provider_asset.provider_asset
+                ),
+            )
+        })?;
+    if hold_raw > total_raw {
+        return Err(provider_execute_error(
+            &step.provider,
+            format!(
+                "Hyperliquid {} hold balance exceeds total balance",
+                provider_asset.provider_asset
+            ),
+        ));
+    }
+    let spendable_raw = total_raw - hold_raw;
+    Ok(Some(AuthoritativeOutputBalance {
+        amount: spendable_raw.to_string(),
+        location: "hyperliquid_spot",
+        custody_vault_id: Some(vault.id),
+        address: Some(vault.address),
+        chain_id: output_asset.chain.to_string(),
+        asset_id: output_asset.asset.to_string(),
+        details: json!({
+            "coin": provider_asset.provider_asset,
+            "total": balance.total,
+            "hold": balance.hold,
+            "decimals": provider_asset.decimals,
+        }),
+    }))
+}
+
+async fn authoritative_hyperliquid_clearinghouse_output_balance(
+    deps: &OrderActivityDeps,
+    step: &OrderExecutionStep,
+    output_asset: &DepositAsset,
+) -> Result<Option<AuthoritativeOutputBalance>, OrderActivityError> {
+    let Some(vault_id) = optional_request_uuid_field(step, "source_custody_vault_id")? else {
+        return Ok(None);
+    };
+    let vault = deps
+        .db
+        .orders()
+        .get_custody_vault(vault_id)
+        .await
+        .map_err(OrderActivityError::db_query)?;
+    let amount = deps
+        .custody_action_executor
+        .inspect_hyperliquid_clearinghouse_balance(&vault)
+        .await
+        .map_err(|source| {
+            custody_action_error("read Hyperliquid clearinghouse output balance", source)
+        })?;
+    Ok(Some(AuthoritativeOutputBalance {
+        amount: amount.to_string(),
+        location: "hyperliquid_clearinghouse",
+        custody_vault_id: Some(vault.id),
+        address: Some(vault.address),
+        chain_id: output_asset.chain.to_string(),
+        asset_id: output_asset.asset.to_string(),
+        details: json!({
+            "coin": "USDC",
+            "decimals": 6,
+        }),
+    }))
+}
+
+async fn hyperliquid_output_custody_vault(
+    deps: &OrderActivityDeps,
+    step: &OrderExecutionStep,
+    output_asset: &DepositAsset,
+) -> Result<Option<CustodyVault>, OrderActivityError> {
+    if let Some(vault_id) = optional_request_uuid_field(step, "hyperliquid_custody_vault_id")? {
+        return deps
+            .db
+            .orders()
+            .get_custody_vault(vault_id)
+            .await
+            .map(Some)
+            .map_err(OrderActivityError::db_query);
+    }
+    let Some(address) = step
+        .request
+        .get("hyperliquid_custody_vault_address")
+        .and_then(Value::as_str)
+    else {
+        return Ok(None);
+    };
+    let vaults = deps
+        .db
+        .orders()
+        .get_custody_vaults(step.order_id)
+        .await
+        .map_err(OrderActivityError::db_query)?;
+    Ok(vaults.into_iter().find(|vault| {
+        vault.address.eq_ignore_ascii_case(address)
+            && vault.chain == output_asset.chain
+            && vault.asset.as_ref() == Some(&output_asset.asset)
+    }))
+}
+
+async fn authoritative_external_output_balance(
+    deps: &OrderActivityDeps,
+    step: &OrderExecutionStep,
+    output_asset: &DepositAsset,
+) -> Result<Option<AuthoritativeOutputBalance>, OrderActivityError> {
+    let Some(vault_id) = output_custody_vault_id(step)? else {
+        return Ok(None);
+    };
+    let vault = deps
+        .db
+        .orders()
+        .get_custody_vault(vault_id)
+        .await
+        .map_err(OrderActivityError::db_query)?;
+    if vault.chain != output_asset.chain || vault.asset.as_ref() != Some(&output_asset.asset) {
+        return Ok(None);
+    }
+    let amount = deps
+        .custody_action_executor
+        .custody_vault_balance_raw(&vault)
+        .await
+        .map_err(|source| custody_action_error("read external output balance", source))?;
+    Ok(Some(AuthoritativeOutputBalance {
+        amount,
+        location: "custody_vault",
+        custody_vault_id: Some(vault.id),
+        address: Some(vault.address),
+        chain_id: output_asset.chain.to_string(),
+        asset_id: output_asset.asset.to_string(),
+        details: json!({}),
+    }))
+}
+
+fn output_custody_vault_id(step: &OrderExecutionStep) -> Result<Option<Uuid>, OrderActivityError> {
+    if let Some(vault_id) = optional_request_uuid_field(step, "recipient_custody_vault_id")? {
+        return Ok(Some(vault_id));
+    }
+    if step.step_type == OrderExecutionStepType::CctpReceive {
+        return optional_request_uuid_field(step, "source_custody_vault_id");
+    }
+    Ok(None)
+}
+
+fn optional_request_uuid_field(
+    step: &OrderExecutionStep,
+    field: &'static str,
+) -> Result<Option<Uuid>, OrderActivityError> {
+    let Some(value) = step.request.get(field) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let Some(raw) = value.as_str() else {
+        return Err(provider_execute_error(
+            &step.provider,
+            format!("step request field {field} must be a uuid string"),
+        ));
+    };
+    Uuid::parse_str(raw).map(Some).map_err(|source| {
+        provider_execute_error(
+            &step.provider,
+            format!("step request field {field} is not a uuid: {source}"),
+        )
+    })
+}
+
+fn decimal_amount_to_raw_u256(value: &str, decimals: u8) -> Result<U256, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("decimal amount must not be empty".to_string());
+    }
+    let mut parts = trimmed.split('.');
+    let whole = parts.next().unwrap_or_default();
+    let frac = parts.next().unwrap_or_default();
+    if parts.next().is_some()
+        || whole.is_empty()
+        || !whole.chars().all(|ch| ch.is_ascii_digit())
+        || !frac.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return Err(format!("invalid decimal amount {value:?}"));
+    }
+    let decimals = usize::from(decimals);
+    let frac = if frac.len() > decimals {
+        &frac[..decimals]
+    } else {
+        frac
+    };
+    let combined = format!("{whole}{:0<width$}", frac, width = decimals);
+    let normalized = combined.trim_start_matches('0');
+    let digits = if normalized.is_empty() {
+        "0"
+    } else {
+        normalized
+    };
+    U256::from_str_radix(digits, 10).map_err(|source| source.to_string())
+}
+
+fn apply_authoritative_output_balance_to_response(
+    response: &mut Value,
+    balance: &AuthoritativeOutputBalance,
+) {
+    if !response.is_object() {
+        *response = json!({});
+    }
+    strip_provider_reported_output_amounts(response);
+    let object = response.as_object_mut().expect("response is object");
+    object.insert("amount_out".to_string(), json!(balance.amount));
+    object.insert(
+        "balance_observation".to_string(),
+        json!({
+            "amount_out_source": "isolated_account_balance",
+            "output": {
+                "role": "destination",
+                "location": balance.location,
+                "chain_id": balance.chain_id,
+                "asset_id": balance.asset_id,
+                "custody_vault_id": balance.custody_vault_id,
+                "address": balance.address,
+                "balance": balance.amount,
+                "spendable_balance": balance.amount,
+                "details": balance.details,
+            },
+            "probes": [{
+                "role": "destination",
+                "location": balance.location,
+                "chain_id": balance.chain_id,
+                "asset_id": balance.asset_id,
+                "custody_vault_id": balance.custody_vault_id,
+                "address": balance.address,
+                "balance": balance.amount,
+                "spendable_balance": balance.amount,
+                "credit_delta": balance.amount,
+                "details": balance.details,
+            }],
+        }),
+    );
 }
 
 pub(super) fn provider_state_records(

@@ -322,6 +322,7 @@ x-router-environment: &router-environment
   - CCTP_API_URL
   - CCTP_TOKEN_MESSENGER_V2_ADDRESS
   - CCTP_MESSAGE_TRANSMITTER_V2_ADDRESS
+  - CCTP_TRANSFER_MODE=${CCTP_TRANSFER_MODE:-standard}
   - CORS_DOMAIN
   - VELORA_PARTNER
   - LOKI_URL
@@ -334,8 +335,8 @@ x-router-environment: &router-environment
   - OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://alloy:4318/v1/logs
 
 # Temporal server is split into frontend/history/matching/internal-worker roles
-# (mirrors compose.local-full.yml; introduced in b54bdf0). All roles share this
-# base; each overrides only SERVICES + its health port.
+# (mirrors compose.local-infra.yml; introduced in b54bdf0). All roles share
+# this base; each overrides only SERVICES + its health port.
 x-temporal-server-base: &temporal-server-base
   image: temporalio/server:1.31.0
   restart: unless-stopped
