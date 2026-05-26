@@ -374,7 +374,13 @@ async function readResponseBody(response: Response): Promise<unknown> {
   }
 }
 
-function upstreamErrorMessage(status: number, _body: unknown): string {
+function upstreamErrorMessage(status: number, body: unknown): string {
+  const message =
+    isObject(body) &&
+    isObject(body.error) &&
+    typeof body.error.message === 'string' &&
+    body.error.message.trim()
+  if (message) return body.error.message
   return `upstream router API returned ${status}`
 }
 

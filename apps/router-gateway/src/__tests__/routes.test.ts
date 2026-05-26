@@ -883,8 +883,43 @@ describe('router gateway routes', () => {
     const body = await response.json()
 
     expect(response.status).toBe(502)
-    expect(body.error.message).toBe('upstream router API returned 500')
+    expect(body.error.message).toBe('upstream quote failed')
     expect(body.error.details).toEqual({ upstreamStatus: 500 })
+  })
+  test('passes through actionable upstream 422 messages', async () => {
+    const app = createApp(testConfig(), {
+      fetch: mockFetch([], async () =>
+        Response.json(
+          {
+            error: {
+              code: 422,
+              message: 'balance 0 below required 40125000000000'
+            }
+          },
+          { status: 422 }
+        )
+      )
+    })
+
+    const response = await app.request('/quote', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        from: 'Bitcoin.BTC',
+        to: 'Ethereum.USDC',
+        toAddress: TO_ADDRESS,
+        fromAmount: '1',
+        amountFormat: 'readable'
+      })
+    })
+    const body = await response.json()
+
+    expect(response.status).toBe(422)
+    expect(body.error.code).toBe('UPSTREAM_ERROR')
+    expect(body.error.message).toBe(
+      'balance 0 below required 40125000000000'
+    )
+    expect(body.error.details).toEqual({ upstreamStatus: 422 })
   })
 
   test('sanitizes upstream transport failure messages', async () => {

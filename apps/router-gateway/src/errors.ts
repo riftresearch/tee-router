@@ -9,7 +9,7 @@ export type ErrorCode =
   | 'UPSTREAM_ERROR'
   | 'VALIDATION_ERROR'
 
-export type GatewayErrorStatus = 400 | 401 | 409 | 413 | 500 | 502 | 503 | 504
+export type GatewayErrorStatus = 400 | 401 | 409 | 413 | 422 | 500 | 502 | 503 | 504
 
 export type GatewayErrorBody = {
   error: {
@@ -58,6 +58,7 @@ export class UpstreamHttpError extends Error {
   }
 
   publicStatus(): GatewayErrorStatus {
+    if (this.upstreamStatus === 422) return 422
     if (this.upstreamStatus === 504) return 504
     return 502
   }

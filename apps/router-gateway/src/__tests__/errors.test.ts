@@ -3,6 +3,7 @@ import { expect, test } from 'bun:test'
 import {
   GatewayConflictError,
   GatewayValidationError,
+  UpstreamHttpError,
   normalizeError
 } from '../errors'
 
@@ -40,4 +41,18 @@ test('normalizeError maps conflict errors without leaking details', () => {
   expect(normalized.body.error.message).toBe(
     'refund authorization already used or in progress'
   )
+})
+test('normalizeError preserves actionable upstream 422 errors', () => {
+  const normalized = normalizeError(
+    new UpstreamHttpError(422, 'balance 0 below required 40125000000000', {
+      error: { message: 'balance 0 below required 40125000000000' }
+    })
+  )
+
+  expect(normalized.status).toBe(422)
+  expect(normalized.body.error.code).toBe('UPSTREAM_ERROR')
+  expect(normalized.body.error.message).toBe(
+    'balance 0 below required 40125000000000'
+  )
+  expect(normalized.body.error.details).toEqual({ upstreamStatus: 422 })
 })

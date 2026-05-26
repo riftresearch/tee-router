@@ -34,7 +34,8 @@ const CHAIN_ALIASES: Record<string, { chainId: string; display: string }> = {
   mainnet: { chainId: 'evm:1', display: 'Ethereum' },
   arbitrum: { chainId: 'evm:42161', display: 'Arbitrum' },
   arb: { chainId: 'evm:42161', display: 'Arbitrum' },
-  base: { chainId: 'evm:8453', display: 'Base' }
+  base: { chainId: 'evm:8453', display: 'Base' },
+  hyperevm: { chainId: 'evm:999', display: 'HyperEVM' }
 }
 
 const KNOWN_ASSETS: KnownAsset[] = [
@@ -49,7 +50,8 @@ const KNOWN_ASSETS: KnownAsset[] = [
   known('evm:8453', 'Base', 'ETH', 'native', 18),
   known('evm:8453', 'Base', 'USDC', '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913', 6),
   known('evm:8453', 'Base', 'USDT', '0xfde4c96c8593536e31f229ea8f37b2ada2699bb2', 6),
-  known('evm:8453', 'Base', 'CBBTC', '0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf', 8)
+  known('evm:8453', 'Base', 'CBBTC', '0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf', 8),
+  known('evm:999', 'HyperEVM', 'USDC', '0xb88339cb7199b77e23db6e890353e22632ba630f', 6)
 ]
 
 const KNOWN_BY_CHAIN_SYMBOL = new Map(

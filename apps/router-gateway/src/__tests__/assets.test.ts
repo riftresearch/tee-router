@@ -27,6 +27,15 @@ describe('asset and amount helpers', () => {
       decimals: 6
     })
 
+    expect(resolveAssetIdentifier('HyperEVM.USDC')).toEqual({
+      id: 'HyperEVM.USDC',
+      internal: {
+        chain: 'evm:999',
+        asset: '0xb88339cb7199b77e23db6e890353e22632ba630f'
+      },
+      decimals: 6
+    })
+
     expect(
       resolveAssetIdentifier('Ethereum.0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48')
     ).toEqual({
