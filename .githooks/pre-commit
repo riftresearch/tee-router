@@ -2,9 +2,20 @@
 set -eu
 
 if git diff --cached --name-only -- apps/docs | grep -q .; then
-  if [ "${SKIP_DOCS_HUMAN_CHECK:-}" = "1" ]; then
-    echo "SKIP_DOCS_HUMAN_CHECK=1 set; allowing docs commit." >&2
-    exit 0
+  # Store only the SHA-256 digest here, never the approval password itself.
+  # Generate a digest with:
+  #   printf '%s' 'your-human-only-password' | sha256sum | cut -d' ' -f1
+  DOCS_HUMAN_APPROVAL_SHA256="168ee09f96df4c38849d14d6b72b238995289c6014d8602d1c0b71f0db58c429"
+  DOCS_HUMAN_APPROVAL_SHA256_UNSET="__SET_DOCS_HUMAN_APPROVAL_SHA256__"
+
+  if [ "$DOCS_HUMAN_APPROVAL_SHA256" != "$DOCS_HUMAN_APPROVAL_SHA256_UNSET" ]; then
+    if [ -n "${DOCS_HUMAN_APPROVAL:-}" ]; then
+      provided_hash="$(printf '%s' "$DOCS_HUMAN_APPROVAL" | sha256sum | cut -d' ' -f1)"
+      if [ "$provided_hash" = "$DOCS_HUMAN_APPROVAL_SHA256" ]; then
+        echo "Docs approval password accepted; allowing docs commit." >&2
+        exit 0
+      fi
+    fi
   fi
 
   cat >&2 <<'EOF'
@@ -12,10 +23,9 @@ if git diff --cached --name-only -- apps/docs | grep -q .; then
 ERROR: This commit includes changes under apps/docs.
 
 A human must review and approve docs changes before committing.
-If you have approval, commit with:
+Set DOCS_HUMAN_APPROVAL to the human-only approval password before committing.
 
-  SKIP_DOCS_HUMAN_CHECK=1 git commit ...
-
+The hook must contain the SHA-256 hash of that password, not the password itself.
 EOF
 
   exit 1
