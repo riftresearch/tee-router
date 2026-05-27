@@ -41,6 +41,7 @@ import {
   type OrderPageCursor,
   type OrderTypeFilter
 } from './orders'
+import { fetchSwapTimeAverages } from './swap-times'
 
 type AppBindings = {
   Variables: {
@@ -445,6 +446,24 @@ export function createApp(
       from: range.from.toISOString(),
       to: range.to.toISOString(),
       buckets
+    })
+  })
+
+  app.get('/api/analytics/swap-times', async (c) => {
+    const admin = await requireAdmin(c, config, authRuntime)
+    if (admin instanceof Response) return admin
+
+    if (!replicaRuntime) {
+      return c.json({ error: 'replica_database_not_configured' }, 503)
+    }
+
+    const limit = parseLimit(c.req.query('limit'), 12)
+    if (limit instanceof Response) return limit
+
+    const averages = await fetchSwapTimeAverages(replicaRuntime.pool, limit)
+    return c.json({
+      averages,
+      sort: 'last_sample_at_desc'
     })
   })
 

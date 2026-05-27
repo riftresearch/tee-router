@@ -19,7 +19,7 @@ use router_core::{
         LimitOrderAction, LimitOrderQuote, LimitOrderResidualPolicy, MarketOrderAction,
         MarketOrderQuote, OrderExecutionStepType, ProviderOrderKind, RouterOrder,
         RouterOrderAction, RouterOrderQuote, RouterOrderQuoteEnvelope, RouterOrderStatus,
-        RouterOrderType,
+        RouterOrderType, SwapTimeRouteKey,
     },
     protocol::{backend_chain_for_id, AssetId, ChainId, DepositAsset},
     services::{
@@ -323,6 +323,9 @@ impl OrderManager {
         }
 
         let now = Utc::now();
+        let expected_swap_time_ms = self
+            .expected_swap_time_ms_for_provider_quote(&provider_quote.provider_quote)
+            .await?;
         let mut quote = MarketOrderQuote {
             id: quote_id,
             order_id: None,
@@ -334,6 +337,7 @@ impl OrderManager {
             estimated_amount_out: provider_quote.estimated_amount_out,
             provider_quote: provider_quote.provider_quote,
             usd_valuation: empty_usd_valuation(),
+            expected_swap_time_ms,
             expires_at: provider_quote.expires_at,
             created_at: now,
         };
@@ -370,6 +374,9 @@ impl OrderManager {
             .best_limit_order_quote(&normalized_request, quote_id, &depositor_address)
             .await?;
         let now = Utc::now();
+        let expected_swap_time_ms = self
+            .expected_swap_time_ms_for_provider_quote(&provider_quote.provider_quote)
+            .await?;
         let mut quote = LimitOrderQuote {
             id: quote_id,
             order_id: None,
@@ -382,6 +389,7 @@ impl OrderManager {
             residual_policy: LimitOrderResidualPolicy::Refund,
             provider_quote: provider_quote.provider_quote,
             usd_valuation: empty_usd_valuation(),
+            expected_swap_time_ms,
             expires_at: provider_quote.expires_at,
             created_at: now,
         };
@@ -467,6 +475,49 @@ impl OrderManager {
         true
     }
 
+
+    async fn expected_swap_time_ms_for_provider_quote(
+        &self,
+        provider_quote: &Value,
+    ) -> MarketOrderResult<Option<u64>> {
+        let keys = match swap_time_route_keys_from_provider_quote(provider_quote) {
+            Ok(keys) => keys,
+            Err(err) => {
+                warn!(error = %err, "unable to derive swap-time route keys for quote");
+                return Ok(None);
+            }
+        };
+        if keys.is_empty() {
+            return Ok(None);
+        }
+
+        let averages = self
+            .db
+            .swap_times()
+            .get_averages_for_keys(&keys)
+            .await
+            .map_err(MarketOrderError::database)?;
+        let averages_by_key = averages
+            .into_iter()
+            .map(|average| (average.key, average.avg_duration_ms))
+            .collect::<HashMap<_, _>>();
+
+        let mut expected_swap_time_ms = 0u64;
+        for key in &keys {
+            let Some(avg_duration_ms) = averages_by_key.get(key).copied() else {
+                return Ok(None);
+            };
+            expected_swap_time_ms = match expected_swap_time_ms.checked_add(avg_duration_ms) {
+                Some(value) => value,
+                None => {
+                    warn!("swap-time estimate exceeded u64 range");
+                    return Ok(None);
+                }
+            };
+        }
+
+        Ok(Some(expected_swap_time_ms))
+    }
 
     pub async fn get_quote(&self, quote_id: Uuid) -> MarketOrderResult<RouterOrderQuote> {
         self.db
@@ -2741,6 +2792,121 @@ fn quote_legs_from_provider_quote(provider_quote: &Value) -> MarketOrderResult<V
         .collect()
 }
 
+fn swap_time_route_keys_from_provider_quote(
+    provider_quote: &Value,
+) -> MarketOrderResult<Vec<SwapTimeRouteKey>> {
+    let transitions = provider_quote
+        .get("transitions")
+        .ok_or_else(|| MarketOrderError::NoRoute {
+            reason: "quoted route is missing provider_quote.transitions".to_string(),
+        })?
+        .as_array()
+        .ok_or_else(|| MarketOrderError::NoRoute {
+            reason: "quoted route provider_quote.transitions must be an array".to_string(),
+        })?
+        .iter()
+        .map(|value| {
+            serde_json::from_value::<TransitionDecl>(value.clone()).map_err(|err| {
+                MarketOrderError::NoRoute {
+                    reason: format!("quoted transition is invalid: {err}"),
+                }
+            })
+        })
+        .collect::<MarketOrderResult<Vec<_>>>()?;
+
+    let mut legs_by_transition_id: HashMap<String, Vec<QuoteLeg>> = HashMap::new();
+    for leg in quote_legs_from_provider_quote(provider_quote)? {
+        legs_by_transition_id
+            .entry(leg.parent_transition_id().to_string())
+            .or_default()
+            .push(leg);
+    }
+
+    let mut keys = Vec::with_capacity(transitions.len());
+    for transition in transitions {
+        let legs = legs_by_transition_id
+            .remove(&transition.id)
+            .ok_or_else(|| MarketOrderError::NoRoute {
+                reason: format!(
+                    "quoted transition {} ({}) has no legs for swap-time estimate",
+                    transition.id,
+                    transition.kind.as_str()
+                ),
+            })?;
+        keys.push(swap_time_route_key_from_transition_legs(
+            &transition,
+            &legs,
+        )?);
+    }
+
+    if !legs_by_transition_id.is_empty() {
+        let mut unconsumed = legs_by_transition_id.into_keys().collect::<Vec<_>>();
+        unconsumed.sort();
+        return Err(MarketOrderError::NoRoute {
+            reason: format!(
+                "quoted route has unconsumed legs for swap-time estimate: {}",
+                unconsumed.join(", ")
+            ),
+        });
+    }
+
+    Ok(keys)
+}
+
+fn swap_time_route_key_from_transition_legs(
+    transition: &TransitionDecl,
+    legs: &[QuoteLeg],
+) -> MarketOrderResult<SwapTimeRouteKey> {
+    let first = legs.first().ok_or_else(|| MarketOrderError::NoRoute {
+        reason: format!(
+            "quoted transition {} ({}) has no legs for swap-time estimate",
+            transition.id,
+            transition.kind.as_str()
+        ),
+    })?;
+    let last = legs.last().ok_or_else(|| MarketOrderError::NoRoute {
+        reason: format!(
+            "quoted transition {} ({}) has no legs for swap-time estimate",
+            transition.id,
+            transition.kind.as_str()
+        ),
+    })?;
+    let input_asset = first
+        .input_deposit_asset()
+        .map_err(|reason| MarketOrderError::NoRoute {
+            reason: format!(
+                "quoted transition {} ({}) has invalid swap-time input asset: {reason}",
+                transition.id,
+                transition.kind.as_str()
+            ),
+        })?;
+    let output_asset = last
+        .output_deposit_asset()
+        .map_err(|reason| MarketOrderError::NoRoute {
+            reason: format!(
+                "quoted transition {} ({}) has invalid swap-time output asset: {reason}",
+                transition.id,
+                transition.kind.as_str()
+            ),
+        })?;
+    let provider = legs
+        .iter()
+        .map(|leg| leg.provider.as_str())
+        .reduce(|first, next| if first == next { first } else { "multi" })
+        .unwrap_or("unknown")
+        .to_string();
+
+    Ok(SwapTimeRouteKey {
+        provider,
+        leg_type: transition.kind.as_str().to_string(),
+        transition_decl_id: transition.id.clone(),
+        input_chain_id: input_asset.chain.as_str().to_string(),
+        input_asset_id: input_asset.asset.as_str().to_string(),
+        output_chain_id: output_asset.chain.as_str().to_string(),
+        output_asset_id: output_asset.asset.as_str().to_string(),
+    })
+}
+
 fn v1_limit_order_pair_supported(source: CanonicalAsset, destination: CanonicalAsset) -> bool {
     matches!(
         (source, destination),
@@ -3328,6 +3494,83 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("missing amount_out"), "{error}");
+    }
+
+    #[test]
+    fn swap_time_route_key_groups_child_quote_legs_by_transition() {
+        use router_core::services::asset_registry::{AssetSlot, RequiredCustodyRole};
+
+        let now = Utc::now();
+        let input = DepositAsset {
+            chain: ChainId::parse("hyperliquid").unwrap(),
+            asset: AssetId::reference("USDC"),
+        };
+        let intermediate = DepositAsset {
+            chain: ChainId::parse("hyperliquid").unwrap(),
+            asset: AssetId::reference("HYPE"),
+        };
+        let output = DepositAsset {
+            chain: ChainId::parse("hyperliquid").unwrap(),
+            asset: AssetId::reference("UBTC"),
+        };
+        let transition = TransitionDecl {
+            id: "hl-trade".to_string(),
+            kind: MarketOrderTransitionKind::HyperliquidTrade,
+            provider: ProviderId::Hyperliquid,
+            input: AssetSlot {
+                asset: input.clone(),
+                required_custody_role: RequiredCustodyRole::HyperliquidSpot,
+            },
+            output: AssetSlot {
+                asset: output.clone(),
+                required_custody_role: RequiredCustodyRole::DestinationPayout,
+            },
+            from: MarketOrderNode::External(input.clone()),
+            to: MarketOrderNode::External(output.clone()),
+        };
+        let first_leg = QuoteLeg::new(QuoteLegSpec {
+            transition_decl_id: &transition.id,
+            transition_kind: transition.kind,
+            provider: transition.provider,
+            input_asset: &input,
+            output_asset: &intermediate,
+            amount_in: "100",
+            amount_out: "50",
+            expires_at: now,
+            raw: json!({}),
+        })
+        .with_child_transition_id("hl-trade:leg:0");
+        let second_leg = QuoteLeg::new(QuoteLegSpec {
+            transition_decl_id: &transition.id,
+            transition_kind: transition.kind,
+            provider: transition.provider,
+            input_asset: &intermediate,
+            output_asset: &output,
+            amount_in: "50",
+            amount_out: "25",
+            expires_at: now,
+            raw: json!({}),
+        })
+        .with_child_transition_id("hl-trade:leg:1");
+
+        let provider_quote = json!({
+            "transitions": [transition],
+            "legs": [first_leg, second_leg],
+        });
+
+        let keys = swap_time_route_keys_from_provider_quote(&provider_quote).unwrap();
+        assert_eq!(
+            keys,
+            vec![SwapTimeRouteKey {
+                provider: "hyperliquid".to_string(),
+                leg_type: "hyperliquid_trade".to_string(),
+                transition_decl_id: "hl-trade".to_string(),
+                input_chain_id: input.chain.as_str().to_string(),
+                input_asset_id: input.asset.as_str().to_string(),
+                output_chain_id: output.chain.as_str().to_string(),
+                output_asset_id: output.asset.as_str().to_string(),
+            }]
+        );
     }
 
     #[test]

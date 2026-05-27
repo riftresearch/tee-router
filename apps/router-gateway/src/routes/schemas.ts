@@ -97,6 +97,9 @@ export const QuoteResponseSchema = z
         })
       )
       .optional(),
+    expectedSwapTimeMs: z.number().int().nonnegative().optional().openapi({
+      example: 63000
+    }),
     amountFormat: AmountFormatSchema
   })
   .openapi('QuoteResponse')
@@ -159,6 +162,9 @@ export const OrderResponseSchema = z
         })
       )
       .optional(),
+    expectedSwapTimeMs: z.number().int().nonnegative().optional().openapi({
+      example: 63000
+    }),
     amountFormat: AmountFormatSchema
   })
   .openapi('OrderResponse')

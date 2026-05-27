@@ -33,5 +33,5 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 devnet = { workspace = true }
-testcontainers = "0.27.2"
+testcontainers = { version = "0.27.2", features = ["watchdog"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-webpki-roots"] }

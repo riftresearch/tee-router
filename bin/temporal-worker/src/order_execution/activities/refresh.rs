@@ -52,6 +52,7 @@ pub(super) fn refreshed_market_order_quote_exact_in(
             },
         }),
         usd_valuation: json!({}),
+        expected_swap_time_ms: original_quote.expected_swap_time_ms,
         expires_at,
         created_at,
     }
@@ -701,6 +702,7 @@ fn boundary_requoted_market_order_quote_exact_in(
         estimated_amount_out: quote.estimated_amount_out,
         provider_quote: quote.provider_quote,
         usd_valuation: json!({}),
+        expected_swap_time_ms: None,
         expires_at: quote.expires_at,
         created_at,
     }

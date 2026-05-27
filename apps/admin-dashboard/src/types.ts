@@ -191,6 +191,24 @@ export type VolumeAnalyticsResponse = {
   buckets: VolumeBucket[]
 }
 
+export type SwapTimeAverage = {
+  provider: string
+  legType: string
+  transitionDeclId: string
+  input: AssetRef
+  output: AssetRef
+  sampleCount: number
+  avgDurationMs: number
+  minDurationMs: number
+  maxDurationMs: number
+  lastSampleAt: string
+}
+
+export type SwapTimeAveragesResponse = {
+  averages: SwapTimeAverage[]
+  sort: 'last_sample_at_desc'
+}
+
 export type CurrentUser = {
   id: string
   name: string

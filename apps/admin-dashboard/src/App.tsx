@@ -26,6 +26,7 @@ import {
   fetchOrderById,
   fetchOrders,
   fetchSwitches,
+  fetchSwapTimeAverages,
   fetchVolumeAnalytics,
   parseMetricsEvent,
   parseRemoveEvent,
@@ -49,6 +50,7 @@ import type {
   ProviderPolicy,
   ProviderQuoteState,
   SwitchesResponse,
+  SwapTimeAveragesResponse,
   UsdAmountValuation,
   UsdValuation,
   VolumeAnalyticsResponse,
@@ -69,6 +71,7 @@ const LIVE_ORDER_PRUNE_SCROLL_Y = 240
 const SHOW_USD_VALUES = true
 const MAX_VOLUME_CHART_BUCKETS = 1500
 const VOLUME_ANALYTICS_REFRESH_THROTTLE_MS = 2_000
+const SWAP_TIME_AVERAGE_LIMIT = 12
 const WAIT_FOR_DEPOSIT_STEP_TYPE = 'wait_for_deposit'
 const ACTIVE_STEP_STATUSES = new Set(['ready', 'running', 'waiting', 'submitted'])
 const FAILED_STEP_STATUSES = new Set(['failed', 'cancelled'])
@@ -259,6 +262,8 @@ export function App() {
     useState<VolumeAnalyticsResponse | null>(null)
   const [switches, setSwitches] = useState<SwitchesResponse | null>(null)
   const [switchesLoading, setSwitchesLoading] = useState(false)
+  const [swapTimeAverages, setSwapTimeAverages] =
+    useState<SwapTimeAveragesResponse | null>(null)
   const [volumeWindow, setVolumeWindow] = useState<VolumeWindow>('24h')
   const [volumeBucketSize, setVolumeBucketSize] =
     useState<VolumeBucketSize>('hour')
@@ -383,6 +388,10 @@ export function App() {
     []
   )
 
+  const loadSwapTimeAverages = useCallback(async () => {
+    const response = await fetchSwapTimeAverages(SWAP_TIME_AVERAGE_LIMIT)
+    setSwapTimeAverages(response)
+  }, [])
 
   const loadMoreOrders = useCallback(async () => {
     if (!nextCursor || loadingMore || searchedOrder) return
@@ -589,9 +598,9 @@ export function App() {
     }
   }, [loadSession])
 
- useEffect(() => {
-   if (!me?.authorized || !me.analyticsConfigured) return
-   let cancelled = false
+  useEffect(() => {
+    if (!me?.authorized || !me.analyticsConfigured) return
+    let cancelled = false
 
     const load = async () => {
       try {
@@ -608,11 +617,11 @@ export function App() {
       }
     }
 
-   void load()
-   return () => {
-     cancelled = true
-   }
- }, [
+    void load()
+    return () => {
+      cancelled = true
+    }
+  }, [
     me?.analyticsConfigured,
     me?.authorized,
     volumeBucketSize,
@@ -624,6 +633,25 @@ export function App() {
     if (!me?.authorized) return
     void loadSwitches()
   }, [loadSwitches, me?.authorized])
+
+  useEffect(() => {
+    if (!me?.authorized) return
+    let cancelled = false
+
+    const load = async () => {
+      try {
+        const response = await fetchSwapTimeAverages(SWAP_TIME_AVERAGE_LIMIT)
+        if (!cancelled) setSwapTimeAverages(response)
+      } catch (loadError) {
+        if (!cancelled) setError(errorMessage(loadError))
+      }
+    }
+
+    void load()
+    return () => {
+      cancelled = true
+    }
+  }, [me?.authorized])
 
   useEffect(() => {
     if (!me?.authorized) return
@@ -733,6 +761,11 @@ export function App() {
         ) {
           requestVolumeAnalyticsRefresh()
         }
+        if (order.status === 'completed') {
+          void loadSwapTimeAverages().catch((loadError) =>
+            setError(errorMessage(loadError))
+          )
+        }
       } catch (streamError) {
         rejectStreamEvent(streamError)
       }
@@ -779,6 +812,7 @@ export function App() {
     }
   }, [
     markOrderFlashed,
+    loadSwapTimeAverages,
     me?.analyticsConfigured,
     me?.authorized,
     orderFilter,
@@ -965,6 +999,8 @@ export function App() {
             tone={metrics?.needsAttention ? 'danger' : 'neutral'}
           />
         </section>
+
+        <SwapTimePanel averages={swapTimeAverages} />
 
         {error ? <div className="notice error">{error}</div> : null}
 
@@ -1805,6 +1841,72 @@ function Metric({
         {detail ? <em>{detail}</em> : null}
       </div>
     </div>
+  )
+}
+
+function SwapTimePanel({
+  averages
+}: {
+  averages: SwapTimeAveragesResponse | null
+}) {
+  const rows = averages?.averages ?? []
+
+  return (
+    <section className="swap-time-panel" aria-label="Swap time averages">
+      <div className="swap-time-header">
+        <div>
+          <strong>Swap Time Averages</strong>
+          <span>{rows.length ? `${rows.length} route legs` : 'Route legs'}</span>
+        </div>
+        <Clock3 size={18} />
+      </div>
+      {!averages ? (
+        <div className="swap-time-empty">Loading swap time averages</div>
+      ) : rows.length === 0 ? (
+        <div className="swap-time-empty">No completed route legs yet</div>
+      ) : (
+        <div className="swap-time-scroll">
+          <table className="swap-time-table">
+            <thead>
+              <tr>
+                <th>Venue</th>
+                <th>Route</th>
+                <th>Average</th>
+                <th>Samples</th>
+                <th>Last Sample</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row) => (
+                <tr key={swapTimeAverageKey(row)}>
+                  <td>
+                    <div className="swap-time-venue">
+                      <strong>{providerDisplayName(row.provider)}</strong>
+                      <span>{humanize(row.legType)}</span>
+                    </div>
+                  </td>
+                  <td>
+                    <div className="swap-time-route">
+                      <AssetLabel asset={row.input} />
+                      <span className="route-arrow">to</span>
+                      <AssetLabel asset={row.output} />
+                      <code className="mono compact-id">{row.transitionDeclId}</code>
+                    </div>
+                  </td>
+                  <td>{formatDurationMs(row.avgDurationMs)}</td>
+                  <td>{row.sampleCount.toLocaleString()}</td>
+                  <td>
+                    <time dateTime={row.lastSampleAt}>
+                      {formatDate(row.lastSampleAt)}
+                    </time>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
   )
 }
 
@@ -3727,6 +3829,35 @@ function formatDate(value: string) {
     minute: '2-digit',
     second: '2-digit'
   }).format(new Date(value))
+}
+
+function formatDurationMs(value: number) {
+  if (value < 1000) return `${value}ms`
+  const totalSeconds = Math.round(value / 1000)
+  if (totalSeconds < 60) return `${totalSeconds}s`
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  return seconds === 0 ? `${minutes}m` : `${minutes}m ${seconds}s`
+}
+
+function swapTimeAverageKey(row: SwapTimeAveragesResponse['averages'][number]) {
+  return [
+    row.provider,
+    row.legType,
+    row.transitionDeclId,
+    row.input.chainId,
+    row.input.assetId,
+    row.output.chainId,
+    row.output.assetId
+  ].join('|')
+}
+
+function formatKind(kind: string | undefined) {
+  if (!kind) return 'Unknown'
+  if (kind === 'exact_in') return 'Exact In'
+  if (kind === 'exact_out') return 'Exact Out'
+  if (kind === 'limit') return 'Limit'
+  return humanize(kind)
 }
 
 function formatAmount(value: string | undefined, asset?: AssetRef) {

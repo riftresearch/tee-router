@@ -34,5 +34,5 @@ tempfile = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
-testcontainers = "0.27.2"
+testcontainers = { version = "0.27.2", features = ["watchdog"] }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }

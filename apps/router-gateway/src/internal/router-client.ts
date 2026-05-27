@@ -63,6 +63,7 @@ export type InternalMarketOrderQuote = {
   amount_in: string
   estimated_amount_out: string
   provider_quote?: unknown
+  expected_swap_time_ms?: number | null
   expires_at: string
   created_at: string
 }
@@ -78,6 +79,7 @@ export type InternalLimitOrderQuote = {
   output_amount: string
   residual_policy: 'refund'
   provider_quote?: unknown
+  expected_swap_time_ms?: number | null
   expires_at: string
   created_at: string
 }
@@ -286,8 +288,8 @@ function isMarketQuote(
     isDepositAsset(value.destination_asset) &&
     isBoundedString(value.recipient_address, MAX_INTERNAL_ADDRESS_LENGTH) &&
     isBoundedString(value.provider_id, MAX_INTERNAL_PROVIDER_ID_LENGTH) &&
-    amount(value.amount_in) &&
     amount(value.estimated_amount_out) &&
+    optionalNonNegativeSafeInteger(value.expected_swap_time_ms) &&
     isBoundedString(value.expires_at, MAX_INTERNAL_DATETIME_LENGTH) &&
     isBoundedString(value.created_at, MAX_INTERNAL_DATETIME_LENGTH)
   )
@@ -309,6 +311,7 @@ function isLimitQuote(
     amount(value.input_amount) &&
     amount(value.output_amount) &&
     value.residual_policy === 'refund' &&
+    optionalNonNegativeSafeInteger(value.expected_swap_time_ms) &&
     isBoundedString(value.expires_at, MAX_INTERNAL_DATETIME_LENGTH) &&
     isBoundedString(value.created_at, MAX_INTERNAL_DATETIME_LENGTH)
   )
@@ -344,6 +347,14 @@ function isRawUint256String(value: unknown): value is string {
   return BigInt(value) > 0n
 }
 
+function optionalNonNegativeSafeInteger(value: unknown): boolean {
+  return (
+    value === undefined ||
+    value === null ||
+    (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0)
+  )
+}
+
 async function readResponseBody(response: Response): Promise<unknown> {
   const maxBytes = response.ok
     ? MAX_UPSTREAM_SUCCESS_BODY_BYTES
@@ -375,12 +386,14 @@ async function readResponseBody(response: Response): Promise<unknown> {
 }
 
 function upstreamErrorMessage(status: number, body: unknown): string {
-  const message =
+  if (
     isObject(body) &&
     isObject(body.error) &&
-    typeof body.error.message === 'string' &&
-    body.error.message.trim()
-  if (message) return body.error.message
+    typeof body.error.message === 'string'
+  ) {
+    const message = body.error.message.trim()
+    if (message) return message
+  }
   return `upstream router API returned ${status}`
 }
 

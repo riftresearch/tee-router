@@ -222,6 +222,8 @@ pub struct MarketOrderQuote {
     pub estimated_amount_out: String,
     pub provider_quote: Value,
     pub usd_valuation: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_swap_time_ms: Option<u64>,
     pub expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
 }
@@ -239,6 +241,8 @@ pub struct LimitOrderQuote {
     pub residual_policy: LimitOrderResidualPolicy,
     pub provider_quote: Value,
     pub usd_valuation: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_swap_time_ms: Option<u64>,
     pub expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
 }
@@ -1343,6 +1347,27 @@ pub struct OrderExecutionLeg {
     pub usd_valuation: Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SwapTimeRouteKey {
+    pub provider: String,
+    pub leg_type: String,
+    pub transition_decl_id: String,
+    pub input_chain_id: String,
+    pub input_asset_id: String,
+    pub output_chain_id: String,
+    pub output_asset_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwapTimeAverage {
+    pub key: SwapTimeRouteKey,
+    pub sample_count: u64,
+    pub avg_duration_ms: u64,
+    pub min_duration_ms: u64,
+    pub max_duration_ms: u64,
+    pub last_sample_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
