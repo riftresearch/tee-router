@@ -1,0 +1,22 @@
+#!/bin/sh
+set -eu
+
+if git diff --cached --name-only -- apps/docs | grep -q .; then
+  if [ "${SKIP_DOCS_HUMAN_CHECK:-}" = "1" ]; then
+    echo "SKIP_DOCS_HUMAN_CHECK=1 set; allowing docs commit." >&2
+    exit 0
+  fi
+
+  cat >&2 <<'EOF'
+
+ERROR: This commit includes changes under apps/docs.
+
+A human must review and approve docs changes before committing.
+If you have approval, commit with:
+
+  SKIP_DOCS_HUMAN_CHECK=1 git commit ...
+
+EOF
+
+  exit 1
+fi
