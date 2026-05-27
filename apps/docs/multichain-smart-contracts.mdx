@@ -4,14 +4,6 @@ title: "Multichain smart contracts"
 
 Multichain smart contracts provide an execution environment for money to move automatically through protocols across different chains. That can mean native transfers on networks like Bitcoin or Ethereum, or calls into DeFi protocols. For example, imagine a multichain contract that accepts Bitcoin. The contract can bridge the BTC to Hyperliquid through Unit, execute a BTC/USDC spot trade on Hyperliquid, bridge the USDC out to Arbitrum through the native bridge, bridge that USDC to Ethereum through CCTP, trade the USDC for PEPE on Uniswap, and send the PEPE to the user's wallet.
 
-Under the hood, protocol nodes run Dstack to interface with TDX enclaves running docker images (the "contract" code) in Google data centers. The explicit tradeoff in this design is trusting the hardware provider and data center operator not to execute a hardware attack at the data center to extract keys. If you are willing to trust that this hardware behaves as expected, the result is a smart contract that can call any blockchain protocol and any API on the internet.
-
-Since chaining multiple protocol calls together is enforced by hardware, Rift can aggregate routes that involve synchronous operations across multiple chains and execution environments. To execute a market order, you send the asset you want to trade, and Rift finds the best execution across all integrated venues.
-
-Other routers cannot do this because they do not have a concept of system state across chains. A multichain smart contract can save state, such as a limit order to be executed at a venue at a specific price, and then operate on any code to make this happen, such as performing an order through a protocol's API. More generally, a contract can call any API on the internet and verify the response came from the domain's SSL certificate.
-
-## Universal interface
-
 The magical user experience comes from a universal interface. Conceptually, every smart contract is just a wallet that you send funds to. Once funds are sent, the contract executes the steps in the route to make your transaction happen.
 
 ```rust
@@ -32,6 +24,12 @@ Contract {
     { step: "Ethereum.USDC -> Ethereum.USDT", venue: "Uniswap" },
 ]
 ```
+
+Under the hood, protocol nodes run Dstack to interface with TDX enclaves running docker images (the "contract" code) in Google data centers. The explicit tradeoff in this design is trusting the hardware provider and data center operator not to execute a hardware attack at the data center to extract keys. If you are willing to trust that this hardware behaves as expected, the result is a smart contract that can call any blockchain protocol and any API on the internet.
+
+Since chaining multiple protocol calls together is enforced by hardware, Rift can aggregate routes that involve synchronous operations across multiple chains and execution environments. To execute a market order, you send the asset you want to trade, and Rift finds the best execution across all integrated venues.
+
+Other routers cannot do this because they do not have a concept of system state across chains. A multichain smart contract can save state, such as a limit order to be executed at a venue at a specific price, and then operate on any code to make this happen, such as performing an order through a protocol's API. More generally, a contract can call any API on the internet and verify the response came from the domain's SSL certificate.
 
 ## Operational security benefits
 
