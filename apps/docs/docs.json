@@ -25,7 +25,7 @@
               "multichain-smart-contracts",
               "use-cases",
               "security-model",
-              "frequently-asked-questions"
+              "faq"
             ]
           },
           {
@@ -33,7 +33,6 @@
             "pages": [
               "POST /quote",
               "POST /order/market",
-              "POST /order/{orderId}/cancel",
               "GET /health",
               "GET /providers"
             ]

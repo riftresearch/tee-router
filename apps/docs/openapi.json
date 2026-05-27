@@ -574,7 +574,7 @@
         "tags": [
           "Quotes"
         ],
-        "summary": "Create a quote for a market order",
+        "summary": "Get a market quote",
         "requestBody": {
           "required": true,
           "content": {

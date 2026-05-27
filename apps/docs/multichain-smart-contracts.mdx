@@ -6,24 +6,32 @@ Multichain smart contracts provide an execution environment for money to move au
 
 Under the hood, protocol nodes run Dstack to interface with TDX enclaves running docker images (the "contract" code) in Google data centers. The explicit tradeoff in this design is trusting the hardware provider and data center operator not to execute a hardware attack at the data center to extract keys. If you are willing to trust that this hardware behaves as expected, the result is a smart contract that can call any blockchain protocol and any API on the internet.
 
-## Universal interface
-
-The magical user experience comes from a universal interface: every smart contract is just a wallet that you send funds to.
-
-```ts
-interface Contract {
-  send // sender address
-  receive // receiving address
-  code // code that runs
-  change // state change on the send and receive chains
-  signers // signers who control upgrades to the contract
-  timelock // time before approved upgrade goes live
-}
-```
-
 Since chaining multiple protocol calls together is enforced by hardware, Rift can aggregate routes that involve synchronous operations across multiple chains and execution environments. To execute a market order, you send the asset you want to trade, and Rift finds the best execution across all integrated venues.
 
 Other routers cannot do this because they do not have a concept of system state across chains. A multichain smart contract can save state, such as a limit order to be executed at a venue at a specific price, and then operate on any code to make this happen, such as performing an order through a protocol's API. More generally, a contract can call any API on the internet and verify the response came from the domain's SSL certificate.
+
+## Universal interface
+
+The magical user experience comes from a universal interface. Conceptually, every smart contract is just a wallet that you send funds to. Once funds are sent, the contract executes the steps in the route to make your transaction happen.
+
+```rust
+Contract {
+    send: Address, // sender
+    receive: Address, // receiver
+    route: Router, // execution path
+    hash: String, // hash of docker image
+    signers: Address[], // signers who control upgrades to the contract
+    timelock: Timestamp,  // time before approved upgrade goes live
+}
+
+// example market order route
+[
+    { step: "Bitcoin.BTC -> Hyperliquid.BTC", venue: "Unit" },
+    { step: "Hyperliquid.BTC -> Hyperliquid.USDC", venue: "Hyperliquid" },
+    { step: "Hyperliquid.USDC -> Ethereum.USDC", venue: "CCTP" },
+    { step: "Ethereum.USDC -> Ethereum.USDT", venue: "Uniswap" },
+]
+```
 
 ## Operational security benefits
 
