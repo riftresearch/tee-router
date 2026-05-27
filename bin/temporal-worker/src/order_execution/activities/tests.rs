@@ -8,7 +8,7 @@ use router_core::{
     config::Settings,
     models::{
         CustodyVaultControlType, CustodyVaultStatus, MarketOrderAction, RouterOrderAction,
-        RouterOrderStatus, RouterOrderType,
+        RouterOrderStatus, RouterOrderType, RouterSwitch,
     },
     services::{
         action_providers::{ExchangeProvider, ProviderAddressIntent, ProviderFuture, UnitProvider},
@@ -1491,6 +1491,96 @@ impl IdempotentStepExecutor for BridgeOrUnitNoop {
     ) -> Result<ProviderExecutionIntent, OrderActivityError> {
         panic!("build_intent must not run: the Failed-row lookup short-circuits first");
     }
+}
+
+#[tokio::test]
+async fn refund_only_mode_diverts_before_provider_side_effect() {
+    let test_db = test_database().await;
+    let exchange_server = TestHyperliquidExchangeServer::spawn().await;
+    let (unit_provider, gen_calls) =
+        CountingUnitWithdrawalProvider::new(exchange_server.base_url.clone());
+    let action_providers = Arc::new(ActionProviderRegistry::new(
+        vec![],
+        vec![Arc::new(unit_provider)],
+        vec![],
+    ));
+    let settings = test_settings();
+    let derivation_salt = [0x55_u8; 32];
+    let hyperliquid_chain = Arc::new(HyperliquidChain::new(
+        b"hyperliquid-wallet",
+        1,
+        std::time::Duration::from_secs(1),
+    ));
+    let vault_address = hyperliquid_chain
+        .derive_wallet(&settings.master_key_bytes(), &derivation_salt)
+        .expect("derive test Hyperliquid wallet")
+        .address
+        .clone();
+    let mut chain_registry = ChainRegistry::new();
+    chain_registry.register(ChainType::Hyperliquid, hyperliquid_chain);
+    let deps = test_deps_with_action_providers_and_chain_registry(
+        test_db.db.clone(),
+        action_providers,
+        Some(exchange_server.base_url.clone()),
+        Arc::new(chain_registry),
+    );
+    test_db
+        .db
+        .router_switches()
+        .upsert(&RouterSwitch {
+            name: RouterSwitchName::RefundOnlyMode,
+            enabled: true,
+            reason: "incident".to_string(),
+            updated_by: "ops".to_string(),
+            updated_at: Utc::now(),
+        })
+        .await
+        .expect("enable refund-only mode");
+    let (_first_step, retry_step) = seed_unit_withdrawal_retry_steps(
+        &test_db.db,
+        &test_db.pool,
+        Uuid::now_v7(),
+        vault_address,
+        derivation_salt,
+    )
+    .await;
+
+    let dispatched = run_step_dispatch(
+        &deps,
+        DispatchStepInput {
+            order_id: retry_step.order_id.into(),
+            attempt_id: retry_step
+                .execution_attempt_id
+                .expect("retry step has attempt id")
+                .into(),
+            step_id: retry_step.id.into(),
+        },
+        OrderExecutionStepType::UnitWithdrawal,
+    )
+    .await
+    .expect("dispatch under refund-only mode");
+
+    let DispatchOutcome::StaleQuoteDetected {
+        should_refund,
+        reason,
+    } = dispatched.outcome
+    else {
+        panic!("refund-only mode should divert normal execution into refund");
+    };
+    assert!(should_refund);
+    assert_eq!(
+        reason.and_then(|value| value.get("reason").cloned()),
+        Some(json!("refund_only_mode_enabled"))
+    );
+    assert_eq!(gen_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(exchange_server.send_asset_call_count(), 0);
+    let provider_operations = test_db
+        .db
+        .orders()
+        .get_provider_operations(retry_step.order_id)
+        .await
+        .expect("load provider operations");
+    assert!(provider_operations.is_empty());
 }
 
 /// After Tier 2, the `verify_<hint_kind>_hint` activities own the step

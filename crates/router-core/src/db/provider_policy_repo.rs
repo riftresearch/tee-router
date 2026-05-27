@@ -43,6 +43,25 @@ impl ProviderPolicyRepository {
         rows.iter().map(map_provider_policy_row).collect()
     }
 
+    pub async fn get(&self, provider: &str) -> RouterCoreResult<Option<ProviderPolicy>> {
+        let started = Instant::now();
+        let result = sqlx_core::query::query(&format!(
+            r#"
+            SELECT {PROVIDER_POLICY_SELECT_COLUMNS}
+            FROM provider_policies
+            WHERE provider = $1
+            "#
+        ))
+        .bind(provider)
+        .fetch_optional(&self.pool)
+        .await;
+        telemetry::record_db_query("provider_policy.get", result.is_ok(), started.elapsed());
+        let Some(row) = result? else {
+            return Ok(None);
+        };
+        map_provider_policy_row(&row).map(Some)
+    }
+
     pub async fn upsert(&self, policy: &ProviderPolicy) -> RouterCoreResult<ProviderPolicy> {
         let started = Instant::now();
         let result = sqlx_core::query::query(&format!(

@@ -25,11 +25,14 @@ import {
   fetchMe,
   fetchOrderById,
   fetchOrders,
+  fetchSwitches,
   fetchVolumeAnalytics,
   parseMetricsEvent,
   parseRemoveEvent,
   parseSnapshotEvent,
-  parseUpsertEvent
+  parseUpsertEvent,
+  updateProviderPolicy,
+  updateRefundOnlyMode
 } from './api'
 import { authClient } from './auth-client'
 import type {
@@ -42,6 +45,10 @@ import type {
   OrderMetrics,
   OrderProgress,
   OrderTypeFilter,
+  ProviderExecutionState,
+  ProviderPolicy,
+  ProviderQuoteState,
+  SwitchesResponse,
   UsdAmountValuation,
   UsdValuation,
   VolumeAnalyticsResponse,
@@ -250,6 +257,8 @@ export function App() {
   const [metrics, setMetrics] = useState<OrderMetrics | null>(null)
   const [volumeAnalytics, setVolumeAnalytics] =
     useState<VolumeAnalyticsResponse | null>(null)
+  const [switches, setSwitches] = useState<SwitchesResponse | null>(null)
+  const [switchesLoading, setSwitchesLoading] = useState(false)
   const [volumeWindow, setVolumeWindow] = useState<VolumeWindow>('24h')
   const [volumeBucketSize, setVolumeBucketSize] =
     useState<VolumeBucketSize>('hour')
@@ -309,6 +318,71 @@ export function App() {
     })
     setVolumeAnalytics(response)
   }, [volumeBucketSize, volumeOrderType, volumeWindow])
+
+  const loadSwitches = useCallback(async () => {
+    if (!me?.routerAdminKeyConfigured || !me.routerInternalApiConfigured) return
+    setSwitchesLoading(true)
+    try {
+      setSwitches(await fetchSwitches())
+    } catch (loadError) {
+      setError(errorMessage(loadError))
+    } finally {
+      setSwitchesLoading(false)
+    }
+  }, [me?.routerAdminKeyConfigured, me?.routerInternalApiConfigured])
+  const setRefundOnlyMode = useCallback(
+    async (enabled: boolean) => {
+      setError(null)
+      const reason = enabled
+        ? 'operator enabled refund-only mode'
+        : 'operator cleared refund-only mode'
+      try {
+        const response = await updateRefundOnlyMode({ enabled, reason })
+        setSwitches((current) =>
+          current
+            ? { ...current, refund_only_mode: response.switch }
+            : {
+                refund_only_mode: response.switch,
+                provider_policies: []
+              }
+        )
+      } catch (updateError) {
+        setError(errorMessage(updateError))
+      }
+    },
+    []
+  )
+
+  const setProviderPolicy = useCallback(
+    async (
+      provider: string,
+      quoteState: ProviderQuoteState,
+      executionState: ProviderExecutionState
+    ) => {
+      setError(null)
+      try {
+        const response = await updateProviderPolicy({
+          provider,
+          quoteState,
+          executionState,
+          reason: 'operator updated provider switch'
+        })
+        setSwitches((current) => {
+          if (!current) return current
+          return {
+            ...current,
+            provider_policies: current.provider_policies.map((policy) =>
+              policy.provider === response.policy.provider ? response.policy : policy
+            )
+          }
+        })
+      } catch (updateError) {
+        setError(errorMessage(updateError))
+      }
+    },
+    []
+  )
+
 
   const loadMoreOrders = useCallback(async () => {
     if (!nextCursor || loadingMore || searchedOrder) return
@@ -545,6 +619,11 @@ export function App() {
     volumeOrderType,
     volumeWindow
   ])
+
+  useEffect(() => {
+    if (!me?.authorized) return
+    void loadSwitches()
+  }, [loadSwitches, me?.authorized])
 
   useEffect(() => {
     if (!me?.authorized) return
@@ -826,6 +905,17 @@ export function App() {
       }
     >
       <main className="dashboard">
+        <SwitchesPanel
+          me={me}
+          switches={switches}
+          loading={switchesLoading}
+          onRefresh={() => void loadSwitches()}
+          onRefundOnlyChange={(enabled) => void setRefundOnlyMode(enabled)}
+          onProviderPolicyChange={(provider, quoteState, executionState) =>
+            void setProviderPolicy(provider, quoteState, executionState)
+          }
+        />
+
         {me.analyticsConfigured ? (
           <VolumePanel
             analytics={volumeAnalytics}
@@ -1067,6 +1157,154 @@ function SystemDownToast() {
         <strong>System down</strong>
         <span>Router admin API key is not configured.</span>
       </div>
+    </div>
+  )
+}
+
+function SwitchesPanel({
+  me,
+  switches,
+  loading,
+  onRefresh,
+  onRefundOnlyChange,
+  onProviderPolicyChange
+}: {
+  me: MeResponse
+  switches: SwitchesResponse | null
+  loading: boolean
+  onRefresh: () => void
+  onRefundOnlyChange: (enabled: boolean) => void
+  onProviderPolicyChange: (
+    provider: string,
+    quoteState: ProviderQuoteState,
+    executionState: ProviderExecutionState
+  ) => void
+}) {
+  const configured = me.routerAdminKeyConfigured && me.routerInternalApiConfigured
+  const refundOnly = switches?.refund_only_mode.enabled ?? false
+  return (
+    <section className="switches-panel" aria-label="Router switches">
+      <div className="switches-header">
+        <div>
+          <span className="section-kicker">
+            <ShieldCheck size={14} />
+            Switches
+          </span>
+          <strong>{refundOnly ? 'Refund-only mode' : 'Normal intake'}</strong>
+        </div>
+        <button className="icon-button" onClick={onRefresh} aria-label="Refresh switches">
+          <RefreshCw size={17} className={loading ? 'spin' : undefined} />
+        </button>
+      </div>
+
+      {!configured ? (
+        <div className="switches-empty">Router admin API is not configured.</div>
+      ) : !switches ? (
+        <div className="switches-empty">Loading switches</div>
+      ) : (
+        <>
+          <div className={`global-switch ${refundOnly ? 'danger' : ''}`}>
+            <div>
+              <span>Refund Only Mode</span>
+              <div className="switch-state-lines">
+                <small>Configured: {refundOnly ? 'enabled' : 'disabled'}</small>
+                <small>
+                  Effective:{' '}
+                  {refundOnly
+                    ? 'quote and order intake blocked; active orders divert to refund'
+                    : 'normal quote, order, and execution paths enabled'}
+                </small>
+              </div>
+            </div>
+            <button
+              className={refundOnly ? 'secondary-button' : 'danger-button'}
+              onClick={() => onRefundOnlyChange(!refundOnly)}
+            >
+              {refundOnly ? 'Disable' : 'Enable'}
+            </button>
+          </div>
+          <div className="provider-switch-grid">
+            {switches.provider_policies.map((policy) => (
+              <ProviderSwitchRow
+                key={policy.provider}
+                policy={policy}
+                refundOnly={refundOnly}
+                onChange={onProviderPolicyChange}
+              />
+            ))}
+          </div>
+        </>
+      )}
+    </section>
+  )
+}
+
+function ProviderSwitchRow({
+  policy,
+  refundOnly,
+  onChange
+}: {
+  policy: ProviderPolicy
+  refundOnly: boolean
+  onChange: (
+    provider: string,
+    quoteState: ProviderQuoteState,
+    executionState: ProviderExecutionState
+  ) => void
+}) {
+  const effectiveRouting =
+    !refundOnly &&
+    policy.quote_state === 'enabled' &&
+    policy.execution_state === 'enabled'
+  const effectiveExecution = refundOnly
+    ? 'normal blocked'
+    : policy.execution_state === 'disabled'
+      ? 'blocked'
+      : policy.execution_state
+  return (
+    <div className="provider-switch-row">
+      <div className="provider-switch-name">
+        <strong>{humanize(policy.provider)}</strong>
+        <div className="provider-switch-state">
+          <span>
+            Configured: quotes {policy.quote_state}; execution{' '}
+            {policy.execution_state}
+          </span>
+          <span>
+            Effective: routing {effectiveRouting ? 'enabled' : 'blocked'}; execution{' '}
+            {effectiveExecution}
+          </span>
+        </div>
+      </div>
+      <select
+        value={policy.quote_state}
+        onChange={(event) =>
+          onChange(
+            policy.provider,
+            event.currentTarget.value as ProviderQuoteState,
+            policy.execution_state
+          )
+        }
+        aria-label={`${policy.provider} quote state`}
+      >
+        <option value="enabled">Quotes enabled</option>
+        <option value="disabled">Quotes disabled</option>
+      </select>
+      <select
+        value={policy.execution_state}
+        onChange={(event) =>
+          onChange(
+            policy.provider,
+            policy.quote_state,
+            event.currentTarget.value as ProviderExecutionState
+          )
+        }
+        aria-label={`${policy.provider} execution state`}
+      >
+        <option value="enabled">Execution enabled</option>
+        <option value="drain">Drain</option>
+        <option value="disabled">Execution disabled</option>
+      </select>
     </div>
   )
 }

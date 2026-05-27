@@ -31,7 +31,7 @@ use router_core::{
         ProviderOperationHintKind, ProviderOperationHintStatus, ProviderOperationStatus,
         ProviderOperationType, ProviderOrderKind, ProviderPolicy, ProviderQuotePolicyState,
         RouterOrder, RouterOrderAction, RouterOrderEnvelope, RouterOrderQuoteEnvelope,
-        RouterOrderStatus, RouterOrderType, VaultAction,
+        RouterOrderStatus, RouterOrderType, RouterSwitch, RouterSwitchName, VaultAction,
         PROVIDER_OPERATION_OBSERVATION_HINT_SOURCE, SAURON_DETECTOR_HINT_SOURCE,
     },
     protocol::{AssetId, ChainId, DepositAsset},
@@ -40,7 +40,7 @@ use router_core::{
             AcrossHttpProviderConfig, BridgeQuoteRequest, CctpHttpProviderConfig,
             ExchangeExecutionRequest, ExchangeProvider, ExchangeQuoteRequest, VeloraProvider,
         },
-        asset_registry::AssetRegistry,
+        asset_registry::{AssetRegistry, ProviderId},
         custody_action_executor::{
             ChainCall, CustodyAction, CustodyActionExecutor, CustodyActionRequest, EvmCall,
         },
@@ -55,6 +55,7 @@ use router_server::{
     api::{
         CreateOrderRequest, CreateVaultRequest, LimitOrderQuoteRequest, MarketOrderQuoteRequest,
         OrderFlowEnvelope, ProviderPolicyEnvelope, ProviderPolicyListEnvelope,
+        RouterSwitchEnvelope, RouterSwitchListEnvelope,
     },
     app::{initialize_components, PaymasterMode, RouterComponents},
     server::{build_api_router, AdminApiAuth, AppState, GatewayApiAuth, InternalApiAuth},
@@ -1087,6 +1088,7 @@ async fn spawn_router_api_from_components_with_auth(
             order_manager: components.order_manager,
             provider_health: components.provider_health,
             provider_policies: components.provider_policies,
+            router_switches: components.router_switches,
             address_screener: components.address_screener,
             chain_registry: components.chain_registry,
             order_workflow_client: None,
@@ -3104,9 +3106,136 @@ async fn router_admin_provider_policy_endpoint_requires_bearer_api_key_and_persi
     let body = list_response.text().await.unwrap();
     assert_eq!(status, reqwest::StatusCode::OK, "{body}");
     let policies: ProviderPolicyListEnvelope = serde_json::from_str(&body).unwrap();
-    assert_eq!(policies.policies.len(), 1);
-    assert_eq!(policies.policies[0].provider, "across");
-    assert_eq!(policies.policies[0].updated_by, "ops");
+    assert_eq!(policies.policies.len(), ProviderId::ALL.len());
+    let across = policies
+        .policies
+        .iter()
+        .find(|policy| policy.provider == "across")
+        .expect("across policy should be present");
+    assert_eq!(across.updated_by, "ops");
+
+    api_task.abort();
+}
+
+#[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
+async fn router_admin_refund_only_mode_endpoint_requires_bearer_api_key_and_blocks_intake() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = harness().await;
+    let postgres = test_postgres().await;
+    let database_url = create_test_database(&postgres.admin_database_url).await;
+    let mut args = test_router_args(h, dir.path(), database_url);
+    args.router_admin_api_key = Some(TEST_ADMIN_API_KEY.to_string());
+    args.router_gateway_api_key = Some(TEST_GATEWAY_API_KEY.to_string());
+    let (base_url, api_task) = spawn_router_api(args).await;
+    let client = reqwest::Client::new();
+
+    let unauthenticated = client
+        .get(format!("{base_url}/internal/v1/switches"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let initial_response = client
+        .get(format!("{base_url}/internal/v1/switches"))
+        .bearer_auth(TEST_ADMIN_API_KEY)
+        .send()
+        .await
+        .unwrap();
+    let status = initial_response.status();
+    let body = initial_response.text().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+    let switches: RouterSwitchListEnvelope = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        switches.refund_only_mode.name,
+        RouterSwitchName::RefundOnlyMode
+    );
+    assert!(!switches.refund_only_mode.enabled);
+    assert_eq!(switches.provider_policies.len(), ProviderId::ALL.len());
+
+    let unauthenticated_update = client
+        .put(format!("{base_url}/internal/v1/switches/refund-only-mode"))
+        .json(&json!({
+            "enabled": true,
+            "reason": "incident"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        unauthenticated_update.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+
+    let enable_response = client
+        .put(format!("{base_url}/internal/v1/switches/refund-only-mode"))
+        .bearer_auth(TEST_ADMIN_API_KEY)
+        .json(&json!({
+            "enabled": true,
+            "reason": "compromised venue",
+            "updated_by": "ops"
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = enable_response.status();
+    let body = enable_response.text().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+    let enabled: RouterSwitchEnvelope = serde_json::from_str(&body).unwrap();
+    assert!(enabled.switch.enabled);
+    assert_eq!(enabled.switch.reason, "compromised venue");
+    assert_eq!(enabled.switch.updated_by, "ops");
+
+    let quote_response = client
+        .post(format!("{base_url}/api/v1/quotes"))
+        .bearer_auth(TEST_GATEWAY_API_KEY)
+        .json(&json!({
+            "type": "market_order",
+            "from_asset": {
+                "chain": "evm:8453",
+                "asset": "native"
+            },
+            "to_asset": {
+                "chain": "evm:1",
+                "asset": "native"
+            },
+            "recipient_address": valid_evm_address(),
+            "amount_in": TEST_NATIVE_ORDER_AMOUNT_WEI
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(quote_response.status(), reqwest::StatusCode::CONFLICT);
+
+    let order_response = client
+        .post(format!("{base_url}/api/v1/orders"))
+        .bearer_auth(TEST_GATEWAY_API_KEY)
+        .json(&json!({
+            "quote_id": Uuid::now_v7(),
+            "refund_address": valid_evm_address(),
+            "idempotency_key": "refund-only-blocks-order-intake"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(order_response.status(), reqwest::StatusCode::CONFLICT);
+
+    let disable_response = client
+        .put(format!("{base_url}/internal/v1/switches/refund-only-mode"))
+        .bearer_auth(TEST_ADMIN_API_KEY)
+        .json(&json!({
+            "enabled": false,
+            "reason": "incident cleared"
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = disable_response.status();
+    let body = disable_response.text().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+    let disabled: RouterSwitchEnvelope = serde_json::from_str(&body).unwrap();
+    assert!(!disabled.switch.enabled);
 
     api_task.abort();
 }
@@ -3167,6 +3296,48 @@ async fn provider_policy_upsert_preserves_newer_update_against_stale_write() {
         stored_after_fresher.execution_state,
         ProviderExecutionPolicyState::Enabled
     );
+    assert_eq!(stored_after_fresher.reason, "resolved");
+    assert_eq!(stored_after_fresher.updated_by, "ops-fresh");
+}
+
+#[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
+async fn router_switch_upsert_preserves_newer_update_against_stale_write() {
+    let db = test_db().await;
+    let base = Utc::now();
+    let newer = RouterSwitch {
+        name: RouterSwitchName::RefundOnlyMode,
+        enabled: true,
+        reason: "active incident".to_string(),
+        updated_by: "ops-new".to_string(),
+        updated_at: base,
+    };
+    let stale = RouterSwitch {
+        name: RouterSwitchName::RefundOnlyMode,
+        enabled: false,
+        reason: "stale clear".to_string(),
+        updated_by: "ops-old".to_string(),
+        updated_at: base - chrono::Duration::seconds(30),
+    };
+
+    db.router_switches().upsert(&newer).await.unwrap();
+    let stored_after_stale = db.router_switches().upsert(&stale).await.unwrap();
+
+    assert_eq!(stored_after_stale.name, RouterSwitchName::RefundOnlyMode);
+    assert!(stored_after_stale.enabled);
+    assert_eq!(stored_after_stale.reason, "active incident");
+    assert_eq!(stored_after_stale.updated_by, "ops-new");
+
+    let fresher = RouterSwitch {
+        name: RouterSwitchName::RefundOnlyMode,
+        enabled: false,
+        reason: "resolved".to_string(),
+        updated_by: "ops-fresh".to_string(),
+        updated_at: base + chrono::Duration::seconds(30),
+    };
+    let stored_after_fresher = db.router_switches().upsert(&fresher).await.unwrap();
+
+    assert!(!stored_after_fresher.enabled);
     assert_eq!(stored_after_fresher.reason, "resolved");
     assert_eq!(stored_after_fresher.updated_by, "ops-fresh");
 }

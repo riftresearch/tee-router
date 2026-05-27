@@ -3,14 +3,15 @@ use crate::{
         CreateOrderRequest, CreateQuoteRequest, CreateVaultRequest, DetectorHintEnvelope,
         DetectorHintRequest, DetectorHintTarget, OrderRefundEnvelope, OrderRefundOutcome,
         ProviderHealthEnvelope, ProviderOperationHintEnvelope, ProviderOperationHintRequest,
-        ProviderPolicyEnvelope, ProviderPolicyListEnvelope, UpdateProviderPolicyRequest,
+        ProviderPolicyEnvelope, ProviderPolicyListEnvelope, RouterSwitchEnvelope,
+        RouterSwitchListEnvelope, UpdateProviderPolicyRequest, UpdateRouterSwitchRequest,
         VaultFundingHintEnvelope, VaultFundingHintRequest, MAX_HINT_IDEMPOTENCY_KEY_LEN,
     },
     app::{initialize_components, PaymasterMode, RouterComponents},
     error::{RouterServerError, RouterServerResult},
     services::{
         AddressScreeningPurpose, AddressScreeningService, OrderManager, ProviderHealthService,
-        ProviderPolicyService, VaultManager,
+        ProviderPolicyService, RouterSwitchService, VaultManager,
     },
     Error, Result, RouterServerArgs,
 };
@@ -62,6 +63,8 @@ const MIN_INTERNAL_API_KEY_LEN: usize = 32;
 const MAX_PROVIDER_POLICY_ID_LEN: usize = 64;
 const MAX_PROVIDER_POLICY_REASON_LEN: usize = 512;
 const MAX_PROVIDER_POLICY_UPDATED_BY_LEN: usize = 128;
+const MAX_ROUTER_SWITCH_REASON_LEN: usize = 512;
+const MAX_ROUTER_SWITCH_UPDATED_BY_LEN: usize = 128;
 const MIN_ORDER_IDEMPOTENCY_KEY_LEN: usize = 16;
 const MAX_ORDER_IDEMPOTENCY_KEY_LEN: usize = 128;
 const MAX_HINT_SOURCE_LEN: usize = 64;
@@ -176,6 +179,7 @@ pub struct AppState {
     pub order_manager: Arc<OrderManager>,
     pub provider_health: Arc<ProviderHealthService>,
     pub provider_policies: Arc<ProviderPolicyService>,
+    pub router_switches: Arc<RouterSwitchService>,
     pub address_screener: Option<Arc<AddressScreeningService>>,
     pub chain_registry: Arc<ChainRegistry>,
     pub order_workflow_client: Option<Arc<OrderWorkflowClient>>,
@@ -214,6 +218,7 @@ async fn serve_api(args: RouterServerArgs, components: RouterComponents) -> Resu
         order_manager: components.order_manager,
         provider_health: components.provider_health,
         provider_policies: components.provider_policies,
+        router_switches: components.router_switches,
         address_screener: components.address_screener,
         chain_registry: components.chain_registry,
         order_workflow_client: Some(order_workflow_client),
@@ -254,6 +259,11 @@ pub fn build_api_router(state: AppState, cors_domain: Option<String>) -> Router 
         .route(
             "/internal/v1/provider-policies",
             get(list_provider_policies),
+        )
+        .route("/internal/v1/switches", get(list_router_switches))
+        .route(
+            "/internal/v1/switches/refund-only-mode",
+            put(update_refund_only_mode),
         )
         .route(
             "/internal/v1/provider-policies/:provider",
@@ -393,6 +403,7 @@ async fn create_quote(
     RouterJson(request): RouterJson<CreateQuoteRequest>,
 ) -> RouterServerResult<(StatusCode, Json<RouterOrderQuoteEnvelope>)> {
     authorize_gateway_api_request(&state, &headers)?;
+    ensure_order_intake_enabled(&state).await?;
     let envelope = match request {
         CreateQuoteRequest::MarketOrder(market_order) => {
             screen_user_address(
@@ -428,6 +439,7 @@ async fn create_order(
 ) -> RouterServerResult<(StatusCode, Json<RouterOrderEnvelope>)> {
     authorize_gateway_api_request(&state, &headers)?;
     require_order_idempotency_key(&request)?;
+    ensure_order_intake_enabled(&state).await?;
     let quote_for_screening = state.order_manager.get_quote(request.quote_id).await?;
     if quote_for_screening.as_limit_order().is_some() {
         return Err(limit_orders_disabled_error());
@@ -502,6 +514,14 @@ async fn get_order(
     Ok(Json(response))
 }
 
+async fn ensure_order_intake_enabled(state: &AppState) -> RouterServerResult<()> {
+    if state.router_switches.refund_only_enabled().await? {
+        return Err(RouterServerError::Conflict {
+            message: "refund_only_mode is enabled; quote and order intake are blocked".to_string(),
+        });
+    }
+    Ok(())
+}
 fn require_order_idempotency_key(request: &CreateOrderRequest) -> RouterServerResult<()> {
     let Some(idempotency_key) = request.idempotency_key.as_deref() else {
         return Err(RouterServerError::Validation {
@@ -1032,20 +1052,14 @@ async fn signal_provider_operation_hint(
                 .await;
             match child_result {
                 Ok(()) => Ok(()),
-                Err(RouterTemporalError::WorkflowSignalUnavailable {
-                    workflow_id,
-                    ..
-                }) => {
+                Err(RouterTemporalError::WorkflowSignalUnavailable { workflow_id, .. }) => {
                     tracing::debug!(
                         %workflow_id,
                         %order_id,
                         "child refund workflow unavailable, falling back to manual refund workflow"
                     );
                     order_workflow_client
-                        .signal_manual_refund_provider_hint(
-                            WorkflowOrderId::from(order_id),
-                            signal,
-                        )
+                        .signal_manual_refund_provider_hint(WorkflowOrderId::from(order_id), signal)
                         .await
                 }
                 Err(source) => Err(source),
@@ -1111,6 +1125,36 @@ async fn list_provider_policies(
     authorize_admin_api_request(&state, &headers)?;
     let policies = state.provider_policies.list().await?;
     Ok(Json(ProviderPolicyListEnvelope { policies }))
+}
+
+async fn list_router_switches(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> RouterServerResult<Json<RouterSwitchListEnvelope>> {
+    authorize_admin_api_request(&state, &headers)?;
+    let (refund_only_mode, provider_policies) = tokio::try_join!(
+        state.router_switches.refund_only_mode(),
+        state.provider_policies.list()
+    )?;
+    Ok(Json(RouterSwitchListEnvelope {
+        refund_only_mode,
+        provider_policies,
+    }))
+}
+
+async fn update_refund_only_mode(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RouterJson(request): RouterJson<UpdateRouterSwitchRequest>,
+) -> RouterServerResult<Json<RouterSwitchEnvelope>> {
+    authorize_admin_api_request(&state, &headers)?;
+    let reason = normalized_router_switch_reason(&request.reason)?;
+    let updated_by = normalized_router_switch_updated_by(request.updated_by.as_deref())?;
+    let switch = state
+        .router_switches
+        .set_refund_only_mode(request.enabled, reason, updated_by)
+        .await?;
+    Ok(Json(RouterSwitchEnvelope { switch }))
 }
 
 async fn get_provider_health(
@@ -1406,6 +1450,33 @@ fn normalized_provider_policy_updated_by(updated_by: Option<&str>) -> RouterServ
         return Err(RouterServerError::Validation {
             message: format!(
                 "provider policy updated_by must be at most {MAX_PROVIDER_POLICY_UPDATED_BY_LEN} bytes"
+            ),
+        });
+    }
+    Ok(updated_by.to_string())
+}
+
+fn normalized_router_switch_reason(reason: &str) -> RouterServerResult<String> {
+    let reason = reason.trim();
+    if reason.len() > MAX_ROUTER_SWITCH_REASON_LEN {
+        return Err(RouterServerError::Validation {
+            message: format!(
+                "router switch reason must be at most {MAX_ROUTER_SWITCH_REASON_LEN} bytes"
+            ),
+        });
+    }
+    Ok(reason.to_string())
+}
+
+fn normalized_router_switch_updated_by(updated_by: Option<&str>) -> RouterServerResult<String> {
+    let updated_by = updated_by.map(str::trim).filter(|value| !value.is_empty());
+    let Some(updated_by) = updated_by else {
+        return Ok("internal_api".to_string());
+    };
+    if updated_by.len() > MAX_ROUTER_SWITCH_UPDATED_BY_LEN {
+        return Err(RouterServerError::Validation {
+            message: format!(
+                "router switch updated_by must be at most {MAX_ROUTER_SWITCH_UPDATED_BY_LEN} bytes"
             ),
         });
     }

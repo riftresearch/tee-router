@@ -205,6 +205,7 @@ export type MeResponse = {
   user: CurrentUser | null
   allowedEmails: string[]
   routerAdminKeyConfigured?: boolean
+  routerInternalApiConfigured?: boolean
   analyticsConfigured?: boolean
   chatAdminConfigured?: boolean
   missingAuthConfig?: string[]
@@ -243,6 +244,39 @@ export type ChatThreadResponse = {
 export type ChatReplyResponse = {
   ok: boolean
   result?: unknown
+}
+
+export type ProviderQuoteState = 'enabled' | 'disabled'
+export type ProviderExecutionState = 'enabled' | 'drain' | 'disabled'
+
+export type ProviderPolicy = {
+  provider: string
+  quote_state: ProviderQuoteState
+  execution_state: ProviderExecutionState
+  reason: string
+  updated_by: string
+  updated_at: string
+}
+
+export type RouterSwitch = {
+  name: 'refund_only_mode'
+  enabled: boolean
+  reason: string
+  updated_by: string
+  updated_at: string
+}
+
+export type SwitchesResponse = {
+  refund_only_mode: RouterSwitch
+  provider_policies: ProviderPolicy[]
+}
+
+export type RouterSwitchEnvelope = {
+  switch: RouterSwitch
+}
+
+export type ProviderPolicyEnvelope = {
+  policy: ProviderPolicy
 }
 
 export type OrdersResponse = {
