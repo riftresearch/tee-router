@@ -4782,6 +4782,7 @@ fn test_market_order_quote(
         estimated_amount_out: "100000".to_string(),
         provider_quote: json!({ "legs": legs }),
         usd_valuation: json!({}),
+        expected_swap_time_ms: None,
         expires_at,
         created_at,
     }

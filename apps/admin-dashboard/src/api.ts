@@ -12,6 +12,7 @@ import type {
   OrderTypeFilter,
   RemoveEvent,
   SnapshotEvent,
+  SwapTimeAveragesResponse,
   UpsertEvent,
   VolumeAnalyticsResponse,
   VolumeBucketSize,
@@ -107,6 +108,25 @@ export async function fetchVolumeAnalytics({
   const payload = await readJsonResponse(response, 'volume analytics')
   if (!isVolumeAnalyticsResponse(payload)) {
     throw new Error('Invalid volume analytics response payload')
+  }
+  return payload
+}
+
+export async function fetchSwapTimeAverages(
+  limit = 12
+): Promise<SwapTimeAveragesResponse> {
+  const params = new URLSearchParams({ limit: String(limit) })
+  const response = await fetch(`/api/analytics/swap-times?${params.toString()}`, {
+    credentials: 'include'
+  })
+
+  if (!response.ok) {
+    throw new Error(`Failed to load swap time averages: HTTP ${response.status}`)
+  }
+
+  const payload = await readJsonResponse(response, 'swap time averages')
+  if (!isSwapTimeAveragesResponse(payload)) {
+    throw new Error('Invalid swap time averages response payload')
   }
   return payload
 }
@@ -376,6 +396,17 @@ function isVolumeAnalyticsResponse(
   )
 }
 
+function isSwapTimeAveragesResponse(
+  value: unknown
+): value is SwapTimeAveragesResponse {
+  return (
+    isRecord(value) &&
+    value.sort === 'last_sample_at_desc' &&
+    Array.isArray(value.averages) &&
+    value.averages.every(isSwapTimeAverage)
+  )
+}
+
 function isMetrics(value: unknown): boolean {
   return (
     isRecord(value) &&
@@ -394,6 +425,22 @@ function isVolumeBucket(value: unknown): boolean {
     typeof value.volumeUsdMicro === 'string' &&
     /^\d+$/.test(value.volumeUsdMicro) &&
     isNonNegativeSafeInteger(value.orderCount)
+  )
+}
+
+function isSwapTimeAverage(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    typeof value.provider === 'string' &&
+    typeof value.legType === 'string' &&
+    typeof value.transitionDeclId === 'string' &&
+    isAssetRef(value.input) &&
+    isAssetRef(value.output) &&
+    isNonNegativeSafeInteger(value.sampleCount) &&
+    isNonNegativeSafeInteger(value.avgDurationMs) &&
+    isNonNegativeSafeInteger(value.minDurationMs) &&
+    isNonNegativeSafeInteger(value.maxDurationMs) &&
+    isIsoTimestamp(value.lastSampleAt)
   )
 }
 

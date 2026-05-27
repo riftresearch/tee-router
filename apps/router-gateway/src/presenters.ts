@@ -19,6 +19,7 @@ export type PublicQuoteResponse = {
   expiry: string
   estimatedOut: string
   fees?: PublicQuoteFee[]
+  expectedSwapTimeMs?: number
   amountFormat: AmountFormat
 }
 
@@ -164,6 +165,10 @@ function presentQuote(
         destination,
         amountFormat
       ),
+      ...(quote.expected_swap_time_ms === null ||
+      quote.expected_swap_time_ms === undefined
+        ? {}
+        : { expectedSwapTimeMs: quote.expected_swap_time_ms }),
       amountFormat
     }
   }
@@ -179,6 +184,10 @@ function presentQuote(
       destination,
       amountFormat
     ),
+    ...(quote.expected_swap_time_ms === null ||
+    quote.expected_swap_time_ms === undefined
+      ? {}
+      : { expectedSwapTimeMs: quote.expected_swap_time_ms }),
     ...quoteFees(quote.provider_quote, amountFormat),
     amountFormat
   }

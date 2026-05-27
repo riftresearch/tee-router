@@ -636,6 +636,7 @@ mod tests {
             residual_policy: LimitOrderResidualPolicy::Refund,
             provider_quote: json!({ "legs": [] }),
             usd_valuation: empty_usd_valuation(),
+            expected_swap_time_ms: None,
             expires_at: Utc::now(),
             created_at: Utc::now(),
         };
@@ -673,6 +674,7 @@ mod tests {
             estimated_amount_out: "100000".to_string(),
             provider_quote: json!({ "legs": [{ "not": "a quote leg" }] }),
             usd_valuation: empty_usd_valuation(),
+            expected_swap_time_ms: None,
             expires_at: Utc::now(),
             created_at: Utc::now(),
         };

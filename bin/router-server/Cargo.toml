@@ -62,4 +62,4 @@ devnet = { workspace = true }
 eip3009-erc20-contract = { workspace = true }
 alloy = { workspace = true }
 ctor = { workspace = true }
-testcontainers = "0.27.2"
+testcontainers = { version = "0.27.2", features = ["watchdog"] }

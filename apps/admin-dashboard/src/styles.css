@@ -341,6 +341,111 @@ code,
   font-size: 13px;
 }
 
+.swap-time-panel {
+  min-width: 0;
+  overflow: hidden;
+  padding: 14px 16px 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: 0 20px 80px rgba(0, 0, 0, 0.22);
+}
+
+.swap-time-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.swap-time-header strong,
+.swap-time-header span {
+  display: block;
+}
+
+.swap-time-header strong {
+  color: #eeeeee;
+  font-size: 16px;
+}
+
+.swap-time-header span {
+  margin-top: 3px;
+  color: #9aa6a0;
+  font-size: 12px;
+}
+
+.swap-time-header svg {
+  color: var(--accent);
+}
+
+.swap-time-scroll {
+  width: 100%;
+  overflow-x: auto;
+}
+
+.swap-time-table {
+  width: 100%;
+  min-width: 860px;
+  border-collapse: collapse;
+}
+
+.swap-time-table th,
+.swap-time-table td {
+  padding: 11px 10px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  text-align: left;
+  vertical-align: middle;
+}
+
+.swap-time-table th {
+  color: #77817b;
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.swap-time-table td {
+  color: #eeeeee;
+  font-size: 13px;
+}
+
+.swap-time-venue strong,
+.swap-time-venue span {
+  display: block;
+}
+
+.swap-time-venue span {
+  margin-top: 2px;
+  color: #9aa6a0;
+  font-size: 12px;
+}
+
+.swap-time-route {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.swap-time-route .compact-id {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.swap-time-empty {
+  display: grid;
+  min-height: 96px;
+  place-items: center;
+  border: 1px dashed rgba(140, 153, 145, 0.16);
+  border-radius: 8px;
+  color: #77817b;
+  font-size: 13px;
+}
+
 .metric {
   display: flex;
   align-items: center;
@@ -1889,6 +1994,7 @@ code,
 }
 
 .volume-panel,
+.swap-time-panel,
 .metric,
 .orders-surface,
 .auth-panel {
@@ -1920,6 +2026,10 @@ code,
 
 .volume-panel {
   padding: 20px;
+}
+
+.swap-time-panel {
+  padding: 18px 20px 20px;
 }
 
 .metric {
@@ -2084,6 +2194,10 @@ code,
 
   .auth-panel {
     padding: 26px 18px;
+  }
+
+  .swap-time-table {
+    min-width: 760px;
   }
 }
 

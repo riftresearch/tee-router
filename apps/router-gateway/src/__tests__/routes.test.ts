@@ -1040,6 +1040,7 @@ describe('router gateway routes', () => {
       from: 'Bitcoin.BTC',
       to: 'Ethereum.USDC',
       estimatedOut: '100',
+      expectedSwapTimeMs: 63000,
       amountFormat: 'readable'
     })
   })
@@ -1442,6 +1443,7 @@ function internalQuote() {
         amount_in: '125000000',
         estimated_amount_out: '100000000',
         provider_quote: {},
+        expected_swap_time_ms: 63000,
         expires_at: '2026-04-30T12:00:00Z',
         created_at: '2026-04-30T11:59:00Z'
       }
@@ -1470,6 +1472,7 @@ function internalLimitQuote() {
         output_amount: '100000000000',
         residual_policy: 'refund',
         provider_quote: {},
+        expected_swap_time_ms: 63000,
         expires_at: '2026-04-30T12:00:00Z',
         created_at: '2026-04-30T11:59:00Z'
       }

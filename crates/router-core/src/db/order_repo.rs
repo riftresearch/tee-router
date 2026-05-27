@@ -55,6 +55,7 @@ const QUOTE_SELECT_COLUMNS: &str = r#"
     estimated_amount_out,
     provider_quote,
     usd_valuation_json,
+    expected_swap_time_ms,
     expires_at,
     created_at
 "#;
@@ -73,6 +74,7 @@ const LIMIT_QUOTE_SELECT_COLUMNS: &str = r#"
     residual_policy,
     provider_quote,
     usd_valuation_json,
+    expected_swap_time_ms,
     expires_at,
     created_at
 "#;
@@ -403,12 +405,13 @@ impl OrderRepository {
                 estimated_amount_out,
                 provider_quote,
                 usd_valuation_json,
+                expected_swap_time_ms,
                 expires_at,
                 created_at
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8,
-                $9, $10, $11, $12, $13, $14
+                $9, $10, $11, $12, $13, $14, $15
             )
             "#,
         )
@@ -424,6 +427,10 @@ impl OrderRepository {
         .bind(&quote.estimated_amount_out)
         .bind(quote.provider_quote.clone())
         .bind(quote.usd_valuation.clone())
+        .bind(optional_u64_i64(
+            quote.expected_swap_time_ms,
+            "quote expected_swap_time_ms",
+        )?)
         .bind(quote.expires_at)
         .bind(quote.created_at)
         .execute(&self.pool)
@@ -455,12 +462,13 @@ impl OrderRepository {
                 residual_policy,
                 provider_quote,
                 usd_valuation_json,
+                expected_swap_time_ms,
                 expires_at,
                 created_at
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8,
-                $9, $10, $11, $12, $13, $14, $15
+                $9, $10, $11, $12, $13, $14, $15, $16
             )
             "#,
         )
@@ -477,6 +485,10 @@ impl OrderRepository {
         .bind(quote.residual_policy.to_db_string())
         .bind(quote.provider_quote.clone())
         .bind(quote.usd_valuation.clone())
+        .bind(optional_u64_i64(
+            quote.expected_swap_time_ms,
+            "limit quote expected_swap_time_ms",
+        )?)
         .bind(quote.expires_at)
         .bind(quote.created_at)
         .execute(&self.pool)
@@ -7763,6 +7775,14 @@ impl OrderRepository {
             estimated_amount_out: row.get("estimated_amount_out"),
             provider_quote: row.get("provider_quote"),
             usd_valuation: row.get("usd_valuation_json"),
+            expected_swap_time_ms: row
+                .get::<Option<i64>, _>("expected_swap_time_ms")
+                .map(|value| {
+                    u64::try_from(value).map_err(|_| RouterCoreError::InvalidData {
+                        message: "quote expected_swap_time_ms is negative".to_string(),
+                    })
+                })
+                .transpose()?,
             expires_at: row.get("expires_at"),
             created_at: row.get("created_at"),
         })
@@ -7803,6 +7823,14 @@ impl OrderRepository {
             residual_policy,
             provider_quote: row.get("provider_quote"),
             usd_valuation: row.get("usd_valuation_json"),
+            expected_swap_time_ms: row
+                .get::<Option<i64>, _>("expected_swap_time_ms")
+                .map(|value| {
+                    u64::try_from(value).map_err(|_| RouterCoreError::InvalidData {
+                        message: "limit quote expected_swap_time_ms is negative".to_string(),
+                    })
+                })
+                .transpose()?,
             expires_at: row.get("expires_at"),
             created_at: row.get("created_at"),
         })
@@ -8457,6 +8485,16 @@ fn market_order_action_fields(
             message: "expected market order action".to_string(),
         }),
     }
+}
+
+fn optional_u64_i64(value: Option<u64>, field: &str) -> RouterCoreResult<Option<i64>> {
+    value
+        .map(|value| {
+            i64::try_from(value).map_err(|err| RouterCoreError::Validation {
+                message: format!("{field} does not fit i64: {err}"),
+            })
+        })
+        .transpose()
 }
 
 fn limit_order_action_fields(action: &RouterOrderAction) -> RouterCoreResult<LimitOrderAction> {
