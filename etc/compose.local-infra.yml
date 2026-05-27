@@ -881,6 +881,7 @@ services:
       ADMIN_DASHBOARD_AUTH_DATABASE_URL: postgres://postgres:postgres@admin-dashboard-auth-db:5432/admin_dashboard_auth
       ADMIN_DASHBOARD_REPLICA_DATABASE_URL: postgres://router_app:router_app@router-postgres-replica:5432/router_db
       ADMIN_DASHBOARD_ANALYTICS_DATABASE_URL: postgres://postgres:postgres@admin-dashboard-analytics-db:5432/admin_dashboard_analytics
+      ROUTER_INTERNAL_BASE_URL: http://router-api:4522
       ADMIN_DASHBOARD_CDC_SLOT_NAME: admin_dashboard_orders_cdc
       ROUTER_CDC_PUBLICATION_NAME: router_cdc_publication
       ROUTER_CDC_MESSAGE_PREFIX: rift.router.change

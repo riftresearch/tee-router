@@ -239,7 +239,7 @@ const ASSET_DECIMALS: Record<string, number> = {
   'hyperliquid|ueth': 18
 }
 
-type DashboardView = 'orders' | 'chats'
+type DashboardView = 'orders' | 'switches' | 'chats'
 
 export function App() {
   const [me, setMe] = useState<MeResponse | null>(null)
@@ -874,6 +874,36 @@ export function App() {
 
   const displayedOrders = searchedOrder ? [searchedOrder] : orders
 
+  if (view === 'switches') {
+    return (
+      <Shell
+        right={
+          <UserMenu
+            me={me}
+            streamState={streamState}
+            onRefresh={refreshOrderStream}
+            view={view}
+            onViewChange={setView}
+          />
+        }
+      >
+        <main className="dashboard">
+          <SwitchesPanel
+            me={me}
+            switches={switches}
+            loading={switchesLoading}
+            onRefresh={() => void loadSwitches()}
+            onRefundOnlyChange={(enabled) => void setRefundOnlyMode(enabled)}
+            onProviderPolicyChange={(provider, quoteState, executionState) =>
+              void setProviderPolicy(provider, quoteState, executionState)
+            }
+          />
+          {error ? <div className="notice error">{error}</div> : null}
+        </main>
+      </Shell>
+    )
+  }
+
   if (view === 'chats') {
     return (
       <Shell
@@ -905,17 +935,6 @@ export function App() {
       }
     >
       <main className="dashboard">
-        <SwitchesPanel
-          me={me}
-          switches={switches}
-          loading={switchesLoading}
-          onRefresh={() => void loadSwitches()}
-          onRefundOnlyChange={(enabled) => void setRefundOnlyMode(enabled)}
-          onProviderPolicyChange={(provider, quoteState, executionState) =>
-            void setProviderPolicy(provider, quoteState, executionState)
-          }
-        />
-
         {me.analyticsConfigured ? (
           <VolumePanel
             analytics={volumeAnalytics}
@@ -947,7 +966,6 @@ export function App() {
           />
         </section>
 
-        {!me.routerAdminKeyConfigured ? <SystemDownToast /> : null}
         {error ? <div className="notice error">{error}</div> : null}
 
         <section className="orders-surface" aria-label="Orders">
@@ -1146,18 +1164,6 @@ function ConfigPanel({ missing }: { missing: string[] }) {
         </div>
       </section>
     </main>
-  )
-}
-
-function SystemDownToast() {
-  return (
-    <div className="system-toast" role="alert">
-      <CircleAlert size={17} />
-      <div>
-        <strong>System down</strong>
-        <span>Router admin API key is not configured.</span>
-      </div>
-    </div>
   )
 }
 
@@ -1379,6 +1385,16 @@ function ViewSwitcher({
       >
         <ListChecks size={14} />
         <span>Orders</span>
+      </button>
+      <button
+        type="button"
+        role="tab"
+        aria-selected={active === 'switches'}
+        className={active === 'switches' ? 'active' : undefined}
+        onClick={() => onChange('switches')}
+      >
+        <ShieldCheck size={14} />
+        <span>Switches</span>
       </button>
       <button
         type="button"
