@@ -3,6 +3,7 @@ use chrono::Utc;
 use router_core::{
     db::Database,
     models::{ProviderExecutionPolicyState, ProviderPolicy, ProviderQuotePolicyState},
+    services::asset_registry::ProviderId,
 };
 use std::{collections::HashMap, sync::Arc, time::Duration, time::Instant};
 use tokio::sync::RwLock;
@@ -83,7 +84,13 @@ impl ProviderPolicyService {
 
     pub async fn list(&self) -> RouterServerResult<Vec<ProviderPolicy>> {
         let snapshot = self.snapshot().await?;
-        let mut policies = snapshot.policies.into_values().collect::<Vec<_>>();
+        let mut by_provider = snapshot.policies;
+        for provider in ProviderId::ALL {
+            by_provider
+                .entry(provider.as_str().to_string())
+                .or_insert_with(|| ProviderPolicy::enabled(provider.as_str()));
+        }
+        let mut policies = by_provider.into_values().collect::<Vec<_>>();
         policies.sort_by(|left, right| left.provider.cmp(&right.provider));
         Ok(policies)
     }

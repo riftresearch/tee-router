@@ -10,8 +10,13 @@ import type {
   OrderLookupResponse,
   OrdersResponse,
   OrderTypeFilter,
+  ProviderExecutionState,
+  ProviderPolicyEnvelope,
+  ProviderQuoteState,
   RemoveEvent,
+  RouterSwitchEnvelope,
   SnapshotEvent,
+  SwitchesResponse,
   UpsertEvent,
   VolumeAnalyticsResponse,
   VolumeBucketSize,
@@ -161,6 +166,81 @@ export async function sendChatReply(
   return payload as ChatReplyResponse
 }
 
+export async function fetchSwitches(): Promise<SwitchesResponse> {
+  const response = await fetch('/api/switches', {
+    credentials: 'include'
+  })
+
+  if (!response.ok) {
+    throw new Error(`Failed to load switches: HTTP ${response.status}`)
+  }
+
+  const payload = await readJsonResponse(response, 'switches')
+  if (!isSwitchesResponse(payload)) throw new Error('Invalid switches response payload')
+  return payload
+}
+
+export async function updateRefundOnlyMode({
+  enabled,
+  reason
+}: {
+  enabled: boolean
+  reason: string
+}): Promise<RouterSwitchEnvelope> {
+  const response = await fetch('/api/switches/refund-only-mode', {
+    method: 'PUT',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled, reason })
+  })
+
+  if (!response.ok) {
+    throw new Error(`Failed to update refund-only mode: HTTP ${response.status}`)
+  }
+
+  const payload = await readJsonResponse(response, 'refund-only mode')
+  if (!isRouterSwitchEnvelope(payload)) {
+    throw new Error('Invalid refund-only mode response payload')
+  }
+  return payload
+}
+
+export async function updateProviderPolicy({
+  provider,
+  quoteState,
+  executionState,
+  reason
+}: {
+  provider: string
+  quoteState: ProviderQuoteState
+  executionState: ProviderExecutionState
+  reason: string
+}): Promise<ProviderPolicyEnvelope> {
+  const response = await fetch(
+    `/api/switches/providers/${encodeURIComponent(provider)}`,
+    {
+      method: 'PUT',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        quote_state: quoteState,
+        execution_state: executionState,
+        reason
+      })
+    }
+  )
+
+  if (!response.ok) {
+    throw new Error(`Failed to update provider policy: HTTP ${response.status}`)
+  }
+
+  const payload = await readJsonResponse(response, 'provider policy')
+  if (!isProviderPolicyEnvelope(payload)) {
+    throw new Error('Invalid provider policy response payload')
+  }
+  return payload
+}
+
 async function readErrorBody(response: Response, label: string) {
   let suffix = ''
   try {
@@ -297,6 +377,8 @@ function isMeResponse(value: unknown): value is MeResponse {
     value.allowedEmails.every((email) => typeof email === 'string') &&
     (value.routerAdminKeyConfigured === undefined ||
       typeof value.routerAdminKeyConfigured === 'boolean') &&
+    (value.routerInternalApiConfigured === undefined ||
+      typeof value.routerInternalApiConfigured === 'boolean') &&
     (value.analyticsConfigured === undefined ||
       typeof value.analyticsConfigured === 'boolean') &&
     (value.chatAdminConfigured === undefined ||
@@ -374,6 +456,58 @@ function isVolumeAnalyticsResponse(
     Array.isArray(value.buckets) &&
     value.buckets.every(isVolumeBucket)
   )
+}
+
+function isSwitchesResponse(value: unknown): value is SwitchesResponse {
+  return (
+    isRecord(value) &&
+    isRouterSwitch(value.refund_only_mode) &&
+    Array.isArray(value.provider_policies) &&
+    value.provider_policies.every(isProviderPolicy)
+  )
+}
+
+function isRouterSwitchEnvelope(value: unknown): value is RouterSwitchEnvelope {
+  return isRecord(value) && isRouterSwitch(value.switch)
+}
+
+function isProviderPolicyEnvelope(value: unknown): value is ProviderPolicyEnvelope {
+  return isRecord(value) && isProviderPolicy(value.policy)
+}
+
+function isRouterSwitch(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    value.name === 'refund_only_mode' &&
+    typeof value.enabled === 'boolean' &&
+    typeof value.reason === 'string' &&
+    typeof value.updated_by === 'string' &&
+    isParsableTimestamp(value.updated_at)
+  )
+}
+
+function isProviderPolicy(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    typeof value.provider === 'string' &&
+    isProviderQuoteState(value.quote_state) &&
+    isProviderExecutionState(value.execution_state) &&
+    typeof value.reason === 'string' &&
+    typeof value.updated_by === 'string' &&
+    isParsableTimestamp(value.updated_at)
+  )
+}
+
+function isProviderQuoteState(value: unknown): value is ProviderQuoteState {
+  return value === 'enabled' || value === 'disabled'
+}
+
+function isProviderExecutionState(value: unknown): value is ProviderExecutionState {
+  return value === 'enabled' || value === 'drain' || value === 'disabled'
+}
+
+function isParsableTimestamp(value: unknown): boolean {
+  return typeof value === 'string' && Number.isFinite(Date.parse(value))
 }
 
 function isMetrics(value: unknown): boolean {

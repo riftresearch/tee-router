@@ -2,7 +2,7 @@ use crate::{
     error::RouterServerError,
     services::{
         AddressScreeningService, OrderManager, ProviderHealthPoller, ProviderHealthProbe,
-        ProviderHealthService, ProviderPolicyService, VaultManager,
+        ProviderHealthService, ProviderPolicyService, RouterSwitchService, VaultManager,
     },
     Result, RouterServerArgs,
 };
@@ -48,6 +48,7 @@ pub struct RouterComponents {
     pub vault_manager: Arc<VaultManager>,
     pub order_manager: Arc<OrderManager>,
     pub provider_policies: Arc<ProviderPolicyService>,
+    pub router_switches: Arc<RouterSwitchService>,
     pub provider_health: Arc<ProviderHealthService>,
     pub provider_health_poller: Arc<ProviderHealthPoller>,
     pub route_costs: Arc<RouteCostService>,
@@ -100,6 +101,7 @@ pub async fn initialize_components_with_action_providers(
 
     let chain_registry = Arc::new(initialize_chain_registry(args, paymaster_mode).await?);
     let provider_policies = Arc::new(ProviderPolicyService::new(db.clone()));
+    let router_switches = Arc::new(RouterSwitchService::new(db.clone()));
     let provider_health = Arc::new(ProviderHealthService::new(db.clone()));
     let provider_health_poller = Arc::new(initialize_provider_health_poller(
         args,
@@ -140,6 +142,7 @@ pub async fn initialize_components_with_action_providers(
         vault_manager,
         order_manager,
         provider_policies,
+        router_switches,
         provider_health,
         provider_health_poller,
         route_costs,

@@ -112,7 +112,6 @@ impl OrderActivities {
         .await
     }
 
-
     #[activity]
     pub async fn dispatch_hyperliquid_bridge_withdrawal_step(
         self: Arc<Self>,
@@ -879,9 +878,24 @@ pub(super) async fn run_step_dispatch(
         "execution_step.started"
     );
 
+    // 2. Master switches and venue execution policy. Short-circuit before
+    // stale-quote refresh so refund-only mode cannot create fresh normal
+    // execution paths.
+    if let Some(blocked) = pre_execution_switch_check(deps, &input, &step).await? {
+        return Ok(StepDispatched {
+            order_id: input.order_id,
+            attempt_id: input.attempt_id,
+            step_id: input.step_id,
+            outcome: DispatchOutcome::StaleQuoteDetected {
+                should_refund: true,
+                reason: Some(blocked),
+            },
+        });
+    }
+
     let step = refresh_refund_step_request_if_needed(deps, step).await?;
 
-    // 2. Pre-execution stale-quote check. Short-circuit before side effects.
+    // 3. Pre-execution stale-quote check. Short-circuit before side effects.
     if let Some(stale) = pre_execution_stale_quote_check(deps, &input, &step).await? {
         return Ok(StepDispatched {
             order_id: input.order_id,
@@ -894,7 +908,7 @@ pub(super) async fn run_step_dispatch(
         });
     }
 
-    // 3. Side-effect checkpoint (scar §6).
+    // 4. Side-effect checkpoint (scar §6).
     let checkpoint = json!({
         "kind": "provider_side_effect_about_to_fire",
         "reason": "about_to_fire_provider_side_effect",
@@ -1546,6 +1560,75 @@ fn refund_recovery_step(step: &OrderExecutionStep) -> bool {
 struct PreExecutionStaleQuote {
     should_refund: bool,
     reason: Option<Value>,
+}
+
+async fn pre_execution_switch_check(
+    deps: &OrderActivityDeps,
+    input: &DispatchStepInput,
+    step: &OrderExecutionStep,
+) -> Result<Option<Value>, OrderActivityError> {
+    let attempt = deps
+        .db
+        .orders()
+        .get_execution_attempt(input.attempt_id.inner())
+        .await
+        .map_err(OrderActivityError::db_query)?;
+    if attempt.order_id != input.order_id.inner() {
+        return Err(invariant_error(
+            "attempt_belongs_to_order",
+            format!(
+                "attempt {} does not belong to order {}",
+                attempt.id,
+                input.order_id.inner()
+            ),
+        ));
+    }
+
+    let is_refund_attempt = attempt.attempt_kind == OrderExecutionAttemptKind::RefundRecovery;
+    if !is_refund_attempt
+        && deps
+            .db
+            .router_switches()
+            .get_or_default(RouterSwitchName::RefundOnlyMode)
+            .await
+            .map_err(OrderActivityError::db_query)?
+            .enabled
+    {
+        return Ok(Some(json!({
+            "reason": "refund_only_mode_enabled",
+            "step_id": step.id,
+            "attempt_id": attempt.id,
+            "provider": step.provider,
+        })));
+    }
+
+    if step.provider == "internal" {
+        return Ok(None);
+    }
+    let policy = deps
+        .db
+        .provider_policies()
+        .get(&step.provider)
+        .await
+        .map_err(OrderActivityError::db_query)?
+        .unwrap_or_else(|| ProviderPolicy::enabled(&step.provider));
+    if policy.execution_state != ProviderExecutionPolicyState::Disabled {
+        return Ok(None);
+    }
+
+    let reason = json!({
+        "reason": "provider_execution_disabled",
+        "step_id": step.id,
+        "attempt_id": attempt.id,
+        "provider": step.provider,
+        "policy_reason": policy.reason,
+        "policy_updated_by": policy.updated_by,
+        "policy_updated_at": policy.updated_at,
+    });
+    if is_refund_attempt {
+        return Err(provider_execute_error(&step.provider, reason.to_string()));
+    }
+    Ok(Some(reason))
 }
 
 /// Pre-execution stale-quote check absorbed from the standalone

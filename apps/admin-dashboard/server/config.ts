@@ -15,6 +15,7 @@ export type AdminDashboardConfig = {
   authDatabaseUrl?: string
   replicaDatabaseUrl?: string
   analyticsDatabaseUrl?: string
+  routerInternalBaseUrl?: string
   routerAdminApiKey?: string
   googleClientId?: string
   googleClientSecret?: string
@@ -120,6 +121,10 @@ export function loadConfig(env: Env = Bun.env as Env): AdminDashboardConfig {
     ),
     analyticsDatabaseUrl: normalizeOptionalSecret(
       env.ADMIN_DASHBOARD_ANALYTICS_DATABASE_URL
+    ),
+    routerInternalBaseUrl: normalizeOptionalUrl(
+      env.ADMIN_DASHBOARD_ROUTER_INTERNAL_BASE_URL ?? env.ROUTER_INTERNAL_BASE_URL,
+      'ROUTER_INTERNAL_BASE_URL'
     ),
     routerAdminApiKey: normalizeOptionalSecret(
       env.ROUTER_ADMIN_API_KEY,
@@ -372,6 +377,15 @@ function normalizeUrl(value: string, name: string): string {
     const reason = error instanceof Error ? `: ${error.message}` : ''
     throw new Error(`Invalid ${name}${reason}: ${sanitizeUrlForError(value)}`)
   }
+}
+
+function normalizeOptionalUrl(
+  value: string | undefined,
+  name: string
+): string | undefined {
+  const normalized = normalizeOptionalSecret(value)
+  if (!normalized) return undefined
+  return normalizeUrl(normalized, name)
 }
 
 function normalizeOrigin(value: string, name: string): string {

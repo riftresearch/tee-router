@@ -40,6 +40,15 @@ pub enum ProviderId {
 }
 
 impl ProviderId {
+    pub const ALL: [Self; 6] = [
+        Self::Across,
+        Self::Cctp,
+        Self::Unit,
+        Self::HyperliquidBridge,
+        Self::Hyperliquid,
+        Self::Velora,
+    ];
+
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "across" => Some(Self::Across),
@@ -1690,12 +1699,14 @@ mod tests {
         );
 
         assert!(paths.iter().any(|path| {
-            path.transitions
+            let has_hypercore_deposit = path.transitions.iter().any(|transition| {
+                transition.kind == MarketOrderTransitionKind::HypercoreBridgeDeposit
+            });
+            let has_unit_withdrawal = path
+                .transitions
                 .iter()
-                .any(|transition| transition.kind == MarketOrderTransitionKind::HypercoreBridgeDeposit)
-                && path.transitions.iter().any(|transition| {
-                    transition.kind == MarketOrderTransitionKind::UnitWithdrawal
-                })
+                .any(|transition| transition.kind == MarketOrderTransitionKind::UnitWithdrawal);
+            has_hypercore_deposit && has_unit_withdrawal
         }));
     }
 

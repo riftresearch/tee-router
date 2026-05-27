@@ -197,6 +197,19 @@ test('loadConfig treats weak router admin API keys as unconfigured', () => {
   expect(strong.routerAdminApiKey).toBe('router-admin-key-0000000000000000')
 })
 
+test('loadConfig reads router internal base URL for switch proxying', () => {
+  const config = loadConfig({
+    ROUTER_INTERNAL_BASE_URL: 'http://127.0.0.1:8080/'
+  })
+  const override = loadConfig({
+    ROUTER_INTERNAL_BASE_URL: 'http://127.0.0.1:8080',
+    ADMIN_DASHBOARD_ROUTER_INTERNAL_BASE_URL: 'https://router.internal'
+  })
+
+  expect(config.routerInternalBaseUrl).toBe('http://127.0.0.1:8080')
+  expect(override.routerInternalBaseUrl).toBe('https://router.internal')
+})
+
 test('loadConfig validates CDC postgres identifiers', () => {
   const config = loadConfig({
     ADMIN_DASHBOARD_CDC_SLOT_NAME: 'admin_dashboard_orders_cdc_test',

@@ -8,6 +8,50 @@ pub fn empty_metadata() -> Value {
     json!({})
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RouterSwitchName {
+    RefundOnlyMode,
+}
+
+impl RouterSwitchName {
+    #[must_use]
+    pub fn to_db_string(self) -> &'static str {
+        match self {
+            Self::RefundOnlyMode => "refund_only_mode",
+        }
+    }
+
+    pub fn from_db_string(value: &str) -> Option<Self> {
+        match value {
+            "refund_only_mode" => Some(Self::RefundOnlyMode),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RouterSwitch {
+    pub name: RouterSwitchName,
+    pub enabled: bool,
+    pub reason: String,
+    pub updated_by: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl RouterSwitch {
+    #[must_use]
+    pub fn disabled(name: RouterSwitchName) -> Self {
+        Self {
+            name,
+            enabled: false,
+            reason: String::new(),
+            updated_by: "default".to_string(),
+            updated_at: Utc::now(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum VaultAction {

@@ -176,7 +176,7 @@ export function createApp(
           : config.webOrigin,
       credentials: true,
       allowHeaders: ['Content-Type', 'Authorization'],
-      allowMethods: ['GET', 'POST', 'OPTIONS'],
+      allowMethods: ['GET', 'POST', 'PUT', 'OPTIONS'],
       exposeHeaders: ['Content-Length'],
       maxAge: 600
     })
@@ -234,6 +234,7 @@ export function createApp(
         },
         allowedEmails: ALLOWED_ADMIN_EMAILS,
         routerAdminKeyConfigured: Boolean(config.routerAdminApiKey),
+        routerInternalApiConfigured: Boolean(config.routerInternalBaseUrl),
         analyticsConfigured: Boolean(volumeAnalyticsRuntime),
         chatAdminConfigured,
         authMode: 'development_bypass'
@@ -279,10 +280,47 @@ export function createApp(
       routerAdminKeyConfigured: authorized
         ? Boolean(config.routerAdminApiKey)
         : undefined,
+      routerInternalApiConfigured: authorized
+        ? Boolean(config.routerInternalBaseUrl)
+        : undefined,
       analyticsConfigured: Boolean(volumeAnalyticsRuntime),
       chatAdminConfigured: authorized ? chatAdminConfigured : undefined,
       authMode: 'google'
     })
+  })
+
+  app.get('/api/switches', async (c) => {
+    const admin = await requireAdmin(c, config, authRuntime)
+    if (admin instanceof Response) return admin
+    return proxyRouterAdminJson(config, '/internal/v1/switches')
+  })
+
+  app.put('/api/switches/refund-only-mode', async (c) => {
+    const admin = await requireAdmin(c, config, authRuntime)
+    if (admin instanceof Response) return admin
+    const body = await c.req.json().catch(() => undefined)
+    return proxyRouterAdminJson(config, '/internal/v1/switches/refund-only-mode', {
+      method: 'PUT',
+      body
+    })
+  })
+
+  app.put('/api/switches/providers/:provider', async (c) => {
+    const admin = await requireAdmin(c, config, authRuntime)
+    if (admin instanceof Response) return admin
+    const provider = c.req.param('provider')
+    if (!/^[a-z0-9_]{1,64}$/i.test(provider)) {
+      return c.json({ error: 'invalid_provider' }, 400)
+    }
+    const body = await c.req.json().catch(() => undefined)
+    return proxyRouterAdminJson(
+      config,
+      `/internal/v1/provider-policies/${encodeURIComponent(provider)}`,
+      {
+        method: 'PUT',
+        body
+      }
+    )
   })
 
   app.get('/api/orders', async (c) => {
@@ -509,6 +547,33 @@ async function requireAdmin(
 
   c.set('adminEmail', email)
   return { email }
+}
+
+async function proxyRouterAdminJson(
+  config: AdminDashboardConfig,
+  path: string,
+  options: { method?: 'GET' | 'PUT'; body?: unknown } = {}
+): Promise<Response> {
+  if (!config.routerInternalBaseUrl || !config.routerAdminApiKey) {
+    return Response.json({ error: 'router_admin_api_not_configured' }, { status: 503 })
+  }
+
+  const method = options.method ?? 'GET'
+  const response = await fetch(`${config.routerInternalBaseUrl}${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${config.routerAdminApiKey}`,
+      ...(method === 'PUT' ? { 'Content-Type': 'application/json' } : {})
+    },
+    body: method === 'PUT' ? JSON.stringify(options.body ?? {}) : undefined
+  })
+  const text = await response.text()
+  return new Response(text, {
+    status: response.status,
+    headers: {
+      'Content-Type': response.headers.get('Content-Type') ?? 'application/json'
+    }
+  })
 }
 
 function parseLimit(value: string | undefined, defaultLimit: number): number | Response {

@@ -5,7 +5,8 @@ use router_core::{
         OrderExecutionLeg, OrderExecutionStep, OrderExecutionStepStatus, OrderProviderOperation,
         OrderProviderOperationHint, ProviderExecutionPolicyState, ProviderHealthCheck,
         ProviderHealthSummaryStatus, ProviderOperationHintKind, ProviderPolicy,
-        ProviderQuotePolicyState, RouterOrder, RouterOrderQuote, RouterOrderStatus, VaultAction,
+        ProviderQuotePolicyState, RouterOrder, RouterOrderQuote, RouterOrderStatus, RouterSwitch,
+        VaultAction,
     },
     protocol::DepositAsset,
 };
@@ -160,6 +161,27 @@ pub struct ProviderPolicyEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderPolicyListEnvelope {
     pub policies: Vec<ProviderPolicy>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateRouterSwitchRequest {
+    pub enabled: bool,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub updated_by: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouterSwitchEnvelope {
+    pub switch: RouterSwitch,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouterSwitchListEnvelope {
+    pub refund_only_mode: RouterSwitch,
+    pub provider_policies: Vec<ProviderPolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

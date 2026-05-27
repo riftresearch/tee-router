@@ -158,6 +158,122 @@ code,
   gap: 10px;
 }
 
+.switches-panel {
+  min-width: 0;
+  overflow: hidden;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.switches-header,
+.global-switch,
+.provider-switch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.switches-header {
+  margin-bottom: 12px;
+}
+
+.switches-header strong {
+  display: block;
+  margin-top: 5px;
+  color: #eeeeee;
+  font-size: 22px;
+  line-height: 1;
+}
+
+.switches-empty {
+  color: #9aa6a0;
+  font-size: 13px;
+}
+
+.global-switch {
+  margin-bottom: 12px;
+  padding: 12px;
+  border: 1px solid #2f3a34;
+  border-radius: 8px;
+  background: #101411;
+}
+
+.global-switch.danger {
+  border-color: rgba(248, 113, 113, 0.45);
+  background: rgba(127, 29, 29, 0.18);
+}
+
+.global-switch span,
+.provider-switch-name strong {
+  display: block;
+  color: #eeeeee;
+  font-weight: 800;
+}
+
+.global-switch small,
+.provider-switch-state span {
+  display: block;
+  margin-top: 4px;
+  color: #9aa6a0;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.switch-state-lines,
+.provider-switch-state {
+  margin-top: 5px;
+}
+
+.provider-switch-grid {
+  display: grid;
+  gap: 8px;
+}
+
+.provider-switch-row {
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid #262b28;
+  border-radius: 8px;
+  background: #0b0d0c;
+  flex-wrap: wrap;
+}
+
+.provider-switch-name {
+  min-width: 180px;
+  flex: 1 1 auto;
+}
+
+.provider-switch-row select {
+  min-height: 34px;
+  max-width: 180px;
+  padding: 0 28px 0 10px;
+  border: 1px solid #303832;
+  border-radius: 7px;
+  background: #090b0a;
+  color: #eeeeee;
+}
+
+.provider-switch-state {
+  max-width: 560px;
+}
+
+.danger-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 36px;
+  padding: 0 14px;
+  border: 1px solid rgba(248, 113, 113, 0.65);
+  border-radius: 7px;
+  background: rgba(153, 27, 27, 0.45);
+  color: #fee2e2;
+  font-weight: 800;
+  cursor: pointer;
+}
+
 .volume-panel {
   min-width: 0;
   overflow: hidden;
@@ -2058,6 +2174,17 @@ code,
 }
 
 @media (max-width: 720px) {
+  .global-switch,
+  .provider-switch-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .provider-switch-row select {
+    max-width: none;
+    width: 100%;
+  }
+
   .topbar-inner,
   .user-menu {
     align-items: flex-start;

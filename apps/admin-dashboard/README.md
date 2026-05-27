@@ -14,6 +14,7 @@ BETTER_AUTH_SECRET=...
 BETTER_AUTH_URL=https://admin.example.com
 GOOGLE_CLIENT_ID=...
 GOOGLE_CLIENT_SECRET=...
+ROUTER_INTERNAL_BASE_URL=https://router-api.example.com
 ROUTER_ADMIN_API_KEY=...
 ADMIN_DASHBOARD_CDC_SLOT_NAME=admin_dashboard_orders_cdc
 ROUTER_CDC_PUBLICATION_NAME=router_cdc_publication
@@ -22,6 +23,9 @@ ROUTER_CDC_MESSAGE_PREFIX=rift.router.change
 
 `ADMIN_DASHBOARD_REPLICA_DATABASE_URL` may be replaced with
 `ROUTER_REPLICA_DATABASE_URL`. Do not point either value at the Phala primary.
+`ADMIN_DASHBOARD_ROUTER_INTERNAL_BASE_URL` may be used instead of
+`ROUTER_INTERNAL_BASE_URL` when the dashboard needs a dashboard-specific router
+API origin.
 
 The auth database must be writable because Better Auth stores users, sessions,
 OAuth state, and PKCE there. The replica database is read by normal queries and

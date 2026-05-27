@@ -42,7 +42,7 @@ use serde_json::json;
 use super::{
     execution::{
         provider_execute_error, provider_operation_tx_hash, provider_state_records,
-        AuthoritativeOutputBalance, set_provider_intent_operation_idempotency_key, StepCompletion,
+        set_provider_intent_operation_idempotency_key, AuthoritativeOutputBalance, StepCompletion,
         StepDispatchResult,
     },
     OrderActivityDeps, StepExecutionOutcome,
@@ -287,7 +287,10 @@ async fn recover_failed_cctp_receive_completion(
         .and_then(decimal_string)
         .or_else(|| step.request.get("amount").and_then(decimal_string))
         .ok_or_else(|| {
-            provider_execute_error(&step.provider, "cctp receive amount is missing on failed operation")
+            provider_execute_error(
+                &step.provider,
+                "cctp receive amount is missing on failed operation",
+            )
         })?;
     let Some(source_custody_vault_id) = step
         .request
@@ -296,12 +299,13 @@ async fn recover_failed_cctp_receive_completion(
     else {
         return Ok(None);
     };
-    let source_custody_vault_id = uuid::Uuid::parse_str(source_custody_vault_id).map_err(|source| {
-        provider_execute_error(
-            &step.provider,
-            format!("invalid cctp receive source_custody_vault_id: {source}"),
-        )
-    })?;
+    let source_custody_vault_id =
+        uuid::Uuid::parse_str(source_custody_vault_id).map_err(|source| {
+            provider_execute_error(
+                &step.provider,
+                format!("invalid cctp receive source_custody_vault_id: {source}"),
+            )
+        })?;
     let vault = deps
         .db
         .orders()
@@ -354,8 +358,7 @@ async fn recover_failed_cctp_receive_completion(
     let mut provider_state = provider_state_from_operation(operation, Some(idempotency_key));
     if let Some(existing_operation) = provider_state.operation.as_mut() {
         existing_operation.status = ProviderOperationStatus::Completed;
-        existing_operation.provider_ref =
-            Some(format!("cctp_receive_already_claimed:{}", step.id));
+        existing_operation.provider_ref = Some(format!("cctp_receive_already_claimed:{}", step.id));
         existing_operation.observed_state = Some(observed_state.clone());
         existing_operation.response = Some(json!({
             "kind": "cctp_receive_already_claimed",
@@ -402,8 +405,6 @@ fn provider_state_from_operation(
         addresses: Vec::new(),
     }
 }
-
-
 
 /// Build the short-circuit `StepCompletion` for an existing provider operation
 /// row. Identical shape across all step types — the only thing that varies is
@@ -464,13 +465,22 @@ mod tests {
         let persisted = pre_side_effect_state(&state);
 
         assert_eq!(
-            persisted.operation.as_ref().map(|operation| operation.status),
+            persisted
+                .operation
+                .as_ref()
+                .map(|operation| operation.status),
             Some(ProviderOperationStatus::Planned)
         );
         assert_eq!(
-            persisted.operation.as_ref().and_then(|operation| operation.provider_ref.as_deref()),
+            persisted
+                .operation
+                .as_ref()
+                .and_then(|operation| operation.provider_ref.as_deref()),
             Some("ref")
         );
-        assert_eq!(state.operation.as_ref().map(|operation| operation.status), Some(ProviderOperationStatus::Submitted));
+        assert_eq!(
+            state.operation.as_ref().map(|operation| operation.status),
+            Some(ProviderOperationStatus::Submitted)
+        );
     }
 }
