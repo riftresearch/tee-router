@@ -12,6 +12,11 @@ pub enum SourceChain {
     Evm { chain_id: u64 },
     /// Bitcoin mainnet.
     Bitcoin,
+    /// Hyperliquid spot balance.
+    HyperliquidSpot {
+        token_symbol: &'static str,
+        decimals: u8,
+    },
 }
 
 /// Token kind for an EVM source asset.
@@ -112,6 +117,46 @@ const SOURCE_ASSETS: &[SourceAsset] = &[
             address: "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",
         },
     },
+    SourceAsset {
+        identifier: "Hyperliquid.UBTC",
+        chain: SourceChain::HyperliquidSpot {
+            token_symbol: "UBTC",
+            decimals: 8,
+        },
+        evm_token: EvmToken::Native,
+    },
+    SourceAsset {
+        identifier: "Hyperliquid.USDC",
+        chain: SourceChain::HyperliquidSpot {
+            token_symbol: "USDC",
+            decimals: 6,
+        },
+        evm_token: EvmToken::Native,
+    },
+    SourceAsset {
+        identifier: "Hyperliquid.USDT",
+        chain: SourceChain::HyperliquidSpot {
+            token_symbol: "USDT0",
+            decimals: 6,
+        },
+        evm_token: EvmToken::Native,
+    },
+    SourceAsset {
+        identifier: "Hyperliquid.UETH",
+        chain: SourceChain::HyperliquidSpot {
+            token_symbol: "UETH",
+            decimals: 18,
+        },
+        evm_token: EvmToken::Native,
+    },
+    SourceAsset {
+        identifier: "Hyperliquid.HYPE",
+        chain: SourceChain::HyperliquidSpot {
+            token_symbol: "HYPE",
+            decimals: 8,
+        },
+        evm_token: EvmToken::Native,
+    },
 ];
 
 /// Resolve a `--from` identifier (case-insensitive) to a known source asset.
@@ -129,4 +174,32 @@ pub fn resolve_source(identifier: &str) -> eyre::Result<SourceAsset> {
                 .join(", ");
             eyre::eyre!("unsupported source asset `{identifier}`. supported: {supported}")
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_source, SourceChain};
+
+    #[test]
+    fn resolves_hyperliquid_spot_sources() {
+        let source = resolve_source("hyperliquid.usdt").expect("Hyperliquid USDT source");
+        assert_eq!(source.identifier, "Hyperliquid.USDT");
+        assert_eq!(
+            source.chain,
+            SourceChain::HyperliquidSpot {
+                token_symbol: "USDT0",
+                decimals: 6
+            }
+        );
+
+        let hype = resolve_source("hyperliquid.hype").expect("Hyperliquid HYPE source");
+        assert_eq!(hype.identifier, "Hyperliquid.HYPE");
+        assert_eq!(
+            hype.chain,
+            SourceChain::HyperliquidSpot {
+                token_symbol: "HYPE",
+                decimals: 8
+            }
+        );
+    }
 }

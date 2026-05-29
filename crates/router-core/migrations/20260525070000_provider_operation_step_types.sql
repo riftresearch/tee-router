@@ -14,7 +14,6 @@ ALTER TABLE public.order_provider_operations
                     'hyperliquid_trade'::text,
                     'hyperliquid_limit_order'::text,
                     'hyperliquid_bridge_deposit'::text,
-                    'hypercore_bridge_deposit'::text,
                     'hyperliquid_bridge_withdrawal'::text,
                     'universal_router_swap'::text
                 ]
@@ -39,7 +38,6 @@ ALTER TABLE public.order_execution_steps
                     'hyperliquid_limit_order'::text,
                     'hyperliquid_clearinghouse_to_spot'::text,
                     'hyperliquid_bridge_deposit'::text,
-                    'hypercore_bridge_deposit'::text,
                     'hyperliquid_bridge_withdrawal'::text,
                     'universal_router_swap'::text,
                     'refund'::text

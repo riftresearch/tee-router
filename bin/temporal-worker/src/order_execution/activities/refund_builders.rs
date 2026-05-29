@@ -124,8 +124,7 @@ fn materialize_external_custody_refund_transition(
                 order, source, transition, &leg, is_final, step_index, planned_at,
             )?])
         }
-        MarketOrderTransitionKind::HyperliquidBridgeDeposit
-        | MarketOrderTransitionKind::HypercoreBridgeDeposit => {
+        MarketOrderTransitionKind::HyperliquidBridgeDeposit => {
             let leg = external_refund_leg(
                 quoted_path,
                 transition,
@@ -139,7 +138,7 @@ fn materialize_external_custody_refund_transition(
             let leg = external_refund_leg(
                 quoted_path,
                 transition,
-                OrderExecutionStepType::HyperliquidBridgeWithdrawal,
+                execution_step_type_for_transition_kind(transition.kind),
             )?;
             let custody = external_refund_hyperliquid_binding_for_transition(
                 vault,
@@ -353,10 +352,17 @@ pub(super) async fn best_external_custody_refund_quote(
     });
 
     let mut best = None;
+    let mut best_transition_count = None;
     for path in paths {
+        let transition_count = path.transitions.len();
+        if best_transition_count.is_some_and(|count| transition_count > count) {
+            break;
+        }
+
         let path_id = path.id.clone();
         match quote_external_custody_refund_path(deps, order, vault, amount, path).await {
             Ok(Some(quoted)) => {
+                best_transition_count.get_or_insert(transition_count);
                 best = choose_better_refund_quote(quoted, best)?;
             }
             Ok(None) => {}
@@ -420,7 +426,6 @@ async fn quote_external_custody_refund_transition(
         MarketOrderTransitionKind::AcrossBridge
         | MarketOrderTransitionKind::CctpBridge
         | MarketOrderTransitionKind::HyperliquidBridgeDeposit
-        | MarketOrderTransitionKind::HypercoreBridgeDeposit
         | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
             refund_bridge_quote_transition(deps, order, transition, cursor_amount, &vault.address)
                 .await
@@ -458,11 +463,8 @@ fn external_custody_hyperliquid_trade_quote_amount(
     cursor_amount: &str,
 ) -> Result<String, OrderActivityError> {
     if transition_index > 0
-        && matches!(
-            path.transitions[transition_index - 1].kind,
-            MarketOrderTransitionKind::HyperliquidBridgeDeposit
-                | MarketOrderTransitionKind::HypercoreBridgeDeposit
-        )
+        && path.transitions[transition_index - 1].kind
+            == MarketOrderTransitionKind::HyperliquidBridgeDeposit
     {
         reserve_refund_hyperliquid_spot_send_quote_gas(
             "refund.hyperliquid_trade.amount_in",
@@ -746,7 +748,6 @@ pub(super) fn refund_bridge_quote_legs(
             Ok(vec![burn, receive])
         }
         MarketOrderTransitionKind::HyperliquidBridgeDeposit
-        | MarketOrderTransitionKind::HypercoreBridgeDeposit
         | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
             Ok(vec![QuoteLeg::new(QuoteLegSpec {
                 transition_decl_id: &transition.id,
@@ -1457,16 +1458,18 @@ pub(super) fn refund_transition_hyperliquid_bridge_withdrawal_step(
     planned_at: chrono::DateTime<Utc>,
 ) -> Result<OrderExecutionStep, OrderActivityError> {
     let provider = refund_leg_provider(leg, transition)?.as_str().to_string();
+    let step_type = execution_step_type_for_transition_kind(transition.kind);
     let amount_in = leg.amount_in.clone();
     let (vault_id, vault_address, vault_role, vault_chain_id, vault_asset_id) =
         hyperliquid_binding_request_parts(custody);
-    let transfer_from_spot = hyperliquid_binding_transfers_from_spot(custody);
+    let transfer_from_spot = step_type == OrderExecutionStepType::HyperliquidBridgeWithdrawal
+        && hyperliquid_binding_transfers_from_spot(custody);
 
     Ok(refund_planned_step(RefundPlannedStepSpec {
         order_id: order.id,
         transition_decl_id: Some(transition.id.clone()),
         step_index,
-        step_type: OrderExecutionStepType::HyperliquidBridgeWithdrawal,
+        step_type,
         provider,
         input_asset: Some(transition.input.asset.clone()),
         output_asset: Some(transition.output.asset.clone()),
@@ -1528,10 +1531,7 @@ pub(super) fn external_refund_hyperliquid_binding(
 
     if matches!(
         transitions.first().map(|transition| transition.kind),
-        Some(
-            MarketOrderTransitionKind::HyperliquidBridgeDeposit
-                | MarketOrderTransitionKind::HypercoreBridgeDeposit
-        )
+        Some(MarketOrderTransitionKind::HyperliquidBridgeDeposit)
     ) && prior_transitions
         .iter()
         .all(|transition| transition.kind != MarketOrderTransitionKind::AcrossBridge)
@@ -1562,13 +1562,7 @@ pub(super) fn external_refund_hyperliquid_binding(
 
     let Some(bridge_transition) = prior_transitions
         .iter()
-        .find(|transition| {
-            matches!(
-                transition.kind,
-                MarketOrderTransitionKind::HyperliquidBridgeDeposit
-                    | MarketOrderTransitionKind::HypercoreBridgeDeposit
-            )
-        })
+        .find(|transition| transition.kind == MarketOrderTransitionKind::HyperliquidBridgeDeposit)
     else {
         return Err(refund_materialization_error(format!(
             "refund transition {} has no preceding Hyperliquid custody source",
@@ -1952,6 +1946,10 @@ pub(super) fn refund_exchange_quote_transition_legs(
             refund_universal_router_quote_leg(transition_decl_id, transition_kind, provider, quote)
                 .map(|leg| vec![leg])
         }
+        "spot_transfer" => {
+            refund_spot_transfer_quote_leg(transition_decl_id, transition_kind, provider, quote)
+                .map(|leg| vec![leg])
+        }
         "spot_cross_token" => refund_spot_cross_token_quote_legs(
             transition_decl_id,
             transition_kind,
@@ -1993,6 +1991,40 @@ fn refund_universal_router_quote_leg(
         amount_out: quote.amount_out.clone(),
         expires_at: quote.expires_at,
         raw: quote.provider_quote.clone(),
+    })
+}
+
+fn refund_spot_transfer_quote_leg(
+    transition_decl_id: &str,
+    transition_kind: MarketOrderTransitionKind,
+    provider: ProviderId,
+    quote: &ExchangeQuote,
+) -> Result<QuoteLeg, OrderActivityError> {
+    let leg = quote.provider_quote.get("leg").ok_or_else(|| {
+        refund_materialization_error("refund hyperliquid spot_transfer quote missing leg")
+    })?;
+    let input_asset = required_refund_quote_asset(
+        leg,
+        "input_asset",
+        "refund hyperliquid spot_transfer leg missing input_asset",
+    )?;
+    let output_asset = required_refund_quote_asset(
+        leg,
+        "output_asset",
+        "refund hyperliquid spot_transfer leg missing output_asset",
+    )?;
+    Ok(QuoteLeg {
+        transition_decl_id: transition_decl_id.to_string(),
+        transition_parent_decl_id: transition_decl_id.to_string(),
+        transition_kind,
+        execution_step_type: execution_step_type_for_transition_kind(transition_kind),
+        provider,
+        input_asset,
+        output_asset,
+        amount_in: required_refund_quote_leg_amount(leg, "amount_in")?,
+        amount_out: required_refund_quote_leg_amount(leg, "amount_out")?,
+        expires_at: quote.expires_at,
+        raw: leg.clone(),
     })
 }
 

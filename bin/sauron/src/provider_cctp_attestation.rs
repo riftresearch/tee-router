@@ -333,8 +333,7 @@ mod tests {
 
     #[test]
     fn burn_tx_hash_falls_back_to_observed_state() {
-        let operation =
-            cctp_operation(None, json!({}), json!({"burn_tx_hash": "0xfromstate"}));
+        let operation = cctp_operation(None, json!({}), json!({"burn_tx_hash": "0xfromstate"}));
         assert_eq!(cctp_burn_tx_hash(&operation), Some("0xfromstate"));
     }
 

@@ -20,4 +20,5 @@ alloy = { workspace = true }
 bitcoin = { workspace = true }
 reqwest = { workspace = true }
 hex = { workspace = true }
+hyperliquid-client = { workspace = true }
 eyre = { workspace = true }

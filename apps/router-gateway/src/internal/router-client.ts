@@ -22,6 +22,18 @@ export type InternalDepositAsset = {
   asset: string
 }
 
+export type InternalProviderId =
+  | 'across'
+  | 'cctp'
+  | 'unit'
+  | 'hyperliquid_bridge'
+  | 'hyperliquid'
+  | 'velora'
+
+export type InternalQuoteRouting = {
+  provider_sequence?: InternalProviderId[]
+}
+
 export type InternalQuoteEnvelope = {
   quote: InternalRouterOrderQuote
 }
@@ -89,6 +101,7 @@ export type CreateQuoteRequest =
       to_asset: InternalDepositAsset
       recipient_address: string
       amount_in: string
+      routing?: InternalQuoteRouting
     }
   | {
       type: 'limit_order'
@@ -375,12 +388,10 @@ async function readResponseBody(response: Response): Promise<unknown> {
 }
 
 function upstreamErrorMessage(status: number, body: unknown): string {
-  const message =
-    isObject(body) &&
-    isObject(body.error) &&
-    typeof body.error.message === 'string' &&
-    body.error.message.trim()
-  if (message) return body.error.message
+  if (isObject(body) && isObject(body.error)) {
+    const message = body.error.message
+    if (typeof message === 'string' && message.trim()) return message
+  }
   return `upstream router API returned ${status}`
 }
 

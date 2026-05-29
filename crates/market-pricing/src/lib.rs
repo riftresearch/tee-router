@@ -98,7 +98,6 @@ pub struct MarketPricingSnapshot {
     pub ethereum_gas_price_wei: u64,
     pub arbitrum_gas_price_wei: u64,
     pub base_gas_price_wei: u64,
-    pub hyperevm_gas_price_wei: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -107,7 +106,7 @@ pub struct MarketPricingOracleConfig {
     pub ethereum_rpc_url: Url,
     pub arbitrum_rpc_url: Url,
     pub base_rpc_url: Url,
-    pub hyperevm_rpc_url: Option<Url>,
+
     pub hyperliquid_api_base_url: Url,
     pub timeout: Duration,
 }
@@ -118,7 +117,7 @@ impl MarketPricingOracleConfig {
         ethereum_rpc_url: impl AsRef<str>,
         arbitrum_rpc_url: impl AsRef<str>,
         base_rpc_url: impl AsRef<str>,
-        hyperevm_rpc_url: Option<&str>,
+
         hyperliquid_api_base_url: Option<&str>,
     ) -> MarketPricingResult<Self> {
         Ok(Self {
@@ -126,7 +125,7 @@ impl MarketPricingOracleConfig {
             ethereum_rpc_url: parse_http_url(ethereum_rpc_url.as_ref())?,
             arbitrum_rpc_url: parse_http_url(arbitrum_rpc_url.as_ref())?,
             base_rpc_url: parse_http_url(base_rpc_url.as_ref())?,
-            hyperevm_rpc_url: hyperevm_rpc_url.map(parse_http_url).transpose()?,
+
             hyperliquid_api_base_url: parse_http_url(
                 hyperliquid_api_base_url.unwrap_or(HYPERLIQUID_INFO_DEFAULT_BASE_URL),
             )?,
@@ -174,13 +173,10 @@ impl MarketPricingOracle {
             self.evm_gas_price_wei("arbitrum", &self.config.arbitrum_rpc_url),
             self.evm_gas_price_wei("base", &self.config.base_rpc_url),
         )?;
-        let (hype_usd_micro, hyperevm_gas_price_wei) = tokio::join!(
-            self.optional_hyperliquid_hype_usd_micro(),
-            self.optional_hyperevm_gas_price_wei(),
-        );
+        let hype_usd_micro = self.optional_hyperliquid_hype_usd_micro().await;
 
         Ok(MarketPricingSnapshot {
-            source: "coinbase_spot_plus_rpc_gas_with_optional_hyperevm_hype_v1".to_string(),
+            source: "coinbase_spot_plus_rpc_gas_v1".to_string(),
             captured_at,
             expires_at: None,
             stable_usd_micro,
@@ -190,7 +186,6 @@ impl MarketPricingOracle {
             ethereum_gas_price_wei,
             arbitrum_gas_price_wei,
             base_gas_price_wei,
-            hyperevm_gas_price_wei,
         })
     }
 
@@ -246,19 +241,16 @@ impl MarketPricingOracle {
             "/info",
         )
         .await?;
-        let raw = response.get("HYPE").ok_or_else(|| MarketPricingError::InvalidRpc {
-            url: sanitized_parsed_url_for_error(&self.config.hyperliquid_api_base_url),
-            reason: "allMids response missing HYPE".to_string(),
-            body: error_text_preview(&serde_json::to_string(&response).unwrap_or_default()),
-        })?;
+        let raw = response
+            .get("HYPE")
+            .ok_or_else(|| MarketPricingError::InvalidRpc {
+                url: sanitized_parsed_url_for_error(&self.config.hyperliquid_api_base_url),
+                reason: "allMids response missing HYPE".to_string(),
+                body: error_text_preview(&serde_json::to_string(&response).unwrap_or_default()),
+            })?;
         let value = parse_usd_micro(raw)?;
         ensure_positive_price("hyperliquid HYPE", value)?;
         Ok(value)
-    }
-
-    async fn optional_hyperevm_gas_price_wei(&self) -> Option<u64> {
-        let rpc_url = self.config.hyperevm_rpc_url.as_ref()?;
-        self.evm_gas_price_wei("hyperevm", rpc_url).await.ok()
     }
 
     async fn evm_gas_price_wei(
@@ -751,7 +743,6 @@ mod tests {
             "https://eth.example.com",
             "https://arb.example.com",
             "https://base.example.com",
-            Some("https://hyperevm.example.com"),
             None,
         )
         .unwrap_err();
@@ -765,7 +756,6 @@ mod tests {
             "https://user:pass@eth.example.com",
             "https://arb.example.com",
             "https://base.example.com",
-            Some("https://hyperevm.example.com"),
             None,
         )
         .unwrap_err();
@@ -787,7 +777,6 @@ mod tests {
             "https://eth.example.com",
             "https://arb.example.com",
             "https://base.example.com",
-            Some("https://hyperevm.example.com"),
             None,
         )
         .unwrap_err();
@@ -919,7 +908,6 @@ mod tests {
             ethereum_rpc_url,
             env::var("ARBITRUM_RPC_URL").expect("ARBITRUM_RPC_URL"),
             env::var("BASE_RPC_URL").expect("BASE_RPC_URL"),
-            Some(&env::var("HYPEREVM_RPC_URL").expect("HYPEREVM_RPC_URL")),
             None,
         )
         .unwrap();
@@ -936,6 +924,5 @@ mod tests {
         assert!(snapshot.ethereum_gas_price_wei > 0);
         assert!(snapshot.arbitrum_gas_price_wei > 0);
         assert!(snapshot.base_gas_price_wei > 0);
-        assert!(snapshot.hyperevm_gas_price_wei.is_some_and(|value| value > 0));
-}
+    }
 }

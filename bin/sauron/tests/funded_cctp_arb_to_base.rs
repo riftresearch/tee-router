@@ -95,19 +95,24 @@ async fn cctp_arb_to_base_1usdc_round_trip() {
     }
 
     // --- resume mode ---
-    let resume_burn_tx = env::var("CCTP_RESUME_BURN_TX").ok().filter(|s| !s.is_empty());
-    let resume_log_dir = env::var("CCTP_RESUME_LOG_DIR").ok().filter(|s| !s.is_empty());
+    let resume_burn_tx = env::var("CCTP_RESUME_BURN_TX")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let resume_log_dir = env::var("CCTP_RESUME_LOG_DIR")
+        .ok()
+        .filter(|s| !s.is_empty());
 
     // --- log dir setup ---
     let timestamp = compact_utc_timestamp();
     let log_dir = match resume_log_dir.as_deref() {
         Some(path) => PathBuf::from(path),
-        None => repo_root_live_test_logs()
-            .join(format!("{timestamp}--cctp-arb-to-base-1usdc")),
+        None => repo_root_live_test_logs().join(format!("{timestamp}--cctp-arb-to-base-1usdc")),
     };
     fs::create_dir_all(&log_dir).expect("create log dir");
     let logger = Logger::open(log_dir.join("run.log"));
-    logger.log(&format!("starting CCTP Arb→Base 1-USDC round trip at {timestamp}"));
+    logger.log(&format!(
+        "starting CCTP Arb→Base 1-USDC round trip at {timestamp}"
+    ));
     logger.log(&format!("log dir: {}", log_dir.display()));
     if let Some(prior) = &resume_burn_tx {
         logger.log(&format!("RESUME mode — reusing prior burn tx: {prior}"));
@@ -235,7 +240,8 @@ async fn cctp_arb_to_base_1usdc_round_trip() {
 
     // --- step 4: redeem on Base via receiveMessage ---
     logger.log("calling receiveMessage on Base MessageTransmitterV2");
-    let message_transmitter = ICctpMessageTransmitterV2::new(MESSAGE_TRANSMITTER_V2, &base_provider);
+    let message_transmitter =
+        ICctpMessageTransmitterV2::new(MESSAGE_TRANSMITTER_V2, &base_provider);
     let receive_pending = message_transmitter
         .receiveMessage(Bytes::from(message_bytes), Bytes::from(attestation_bytes))
         .send()
@@ -270,7 +276,10 @@ async fn cctp_arb_to_base_1usdc_round_trip() {
     ));
 
     let total_elapsed = run_started.elapsed();
-    logger.log(&format!("total wall time: {:.1}s", total_elapsed.as_secs_f64()));
+    logger.log(&format!(
+        "total wall time: {:.1}s",
+        total_elapsed.as_secs_f64()
+    ));
 
     // --- assert balance deltas match expectations (only when not in resume mode;
     // in resume mode the pre-balances were captured AFTER the burn so the diff
@@ -355,7 +364,10 @@ This run validates the full CCTP V2 protocol contract against our types:
     );
     fs::write(log_dir.join("summary.md"), summary).expect("write summary.md");
 
-    logger.log(&format!("✓ run complete — artifacts in {}", log_dir.display()));
+    logger.log(&format!(
+        "✓ run complete — artifacts in {}",
+        log_dir.display()
+    ));
 }
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
@@ -456,8 +468,9 @@ async fn poll_iris_until_complete(
                     );
                     let message = hex::decode(message_hex.unwrap().trim_start_matches("0x"))
                         .expect("decode message hex");
-                    let attestation = hex::decode(attestation_hex.unwrap().trim_start_matches("0x"))
-                        .expect("decode attestation hex");
+                    let attestation =
+                        hex::decode(attestation_hex.unwrap().trim_start_matches("0x"))
+                            .expect("decode attestation hex");
                     return (message, attestation);
                 }
             }
@@ -501,11 +514,7 @@ struct Balances {
 }
 
 impl Balances {
-    async fn capture<P1: Provider, P2: Provider>(
-        arb: &P1,
-        base: &P2,
-        wallet: Address,
-    ) -> Self {
+    async fn capture<P1: Provider, P2: Provider>(arb: &P1, base: &P2, wallet: Address) -> Self {
         let arb_eth = arb.get_balance(wallet).await.expect("arb eth balance");
         let arb_usdc = IERC20::new(USDC_ARB, arb)
             .balanceOf(wallet)
@@ -572,8 +581,11 @@ impl Logger {
 }
 
 fn write_json(path: &Path, value: &Value) {
-    fs::write(path, serde_json::to_string_pretty(value).expect("serialize json"))
-        .expect("write json");
+    fs::write(
+        path,
+        serde_json::to_string_pretty(value).expect("serialize json"),
+    )
+    .expect("write json");
 }
 
 fn evm_address_to_bytes32(address: Address) -> FixedBytes<32> {
@@ -609,8 +621,8 @@ fn compact_utc_timestamp() -> String {
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_secs();
-    let datetime = chrono::DateTime::<chrono::Utc>::from_timestamp(secs as i64, 0)
-        .expect("valid timestamp");
+    let datetime =
+        chrono::DateTime::<chrono::Utc>::from_timestamp(secs as i64, 0).expect("valid timestamp");
     datetime.format("%Y-%m-%dT%H-%M-%SZ").to_string()
 }
 
@@ -619,8 +631,8 @@ fn utc_now_iso() -> String {
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_secs();
-    let datetime = chrono::DateTime::<chrono::Utc>::from_timestamp(secs as i64, 0)
-        .expect("valid timestamp");
+    let datetime =
+        chrono::DateTime::<chrono::Utc>::from_timestamp(secs as i64, 0).expect("valid timestamp");
     datetime.format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 

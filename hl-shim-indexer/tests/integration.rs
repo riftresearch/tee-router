@@ -250,6 +250,23 @@ async fn hl_shim_integration_edges_share_one_database() {
         .expect("watch json");
     assert_eq!(watch_response["oid"], 77);
     assert_eq!(scheduler.pending_orders().await, vec![(user, 77)]);
+    let rest_watch_user = Address::repeat_byte(0x55);
+    let user_watch: serde_json::Value = client
+        .post(format!("{base_url}/users/watch"))
+        .json(&serde_json::json!({
+            "user": format!("{rest_watch_user:?}"),
+        }))
+        .send()
+        .await
+        .expect("post user watch")
+        .error_for_status()
+        .expect("user watch status")
+        .json()
+        .await
+        .expect("user watch json");
+    assert_eq!(user_watch["user"], format!("{rest_watch_user:?}"));
+    assert_eq!(user_watch["watched"], true);
+    assert!(scheduler.users().await.contains(&rest_watch_user));
 
     client
         .delete(format!("{base_url}/orders/watch/77"))

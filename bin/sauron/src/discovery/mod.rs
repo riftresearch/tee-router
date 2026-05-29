@@ -2,6 +2,7 @@ pub mod btc;
 pub mod evm_indexer;
 pub mod hyperliquid;
 pub mod hyperliquid_bridge;
+pub mod hyperliquid_spot_funding;
 pub mod hyperliquid_spot_trade;
 pub mod hyperliquid_trade;
 pub mod hyperunit;
@@ -83,6 +84,7 @@ pub struct DetectedDeposit {
     pub execution_step_id: Option<WorkflowStepId>,
     pub source_chain: ChainType,
     pub source_token: TokenIdentifier,
+    pub source_asset_id: String,
     pub address: String,
     pub sender_addresses: Vec<String>,
     pub tx_hash: String,
@@ -951,6 +953,7 @@ fn build_detected_deposit_evidence(
             "execution_step_id": detected.execution_step_id,
             "chain": detected.source_chain.to_db_string(),
             "token": detected.source_token.clone(),
+            "asset_id": detected.source_asset_id,
             "address": detected.address,
             "recipient_address": detected.address,
             "sender_address": detected.sender_addresses.first().cloned(),
@@ -1211,6 +1214,7 @@ mod tests {
             execution_step_id: Some(WorkflowStepId::from(Uuid::now_v7())),
             source_chain: ChainType::Bitcoin,
             source_token: TokenIdentifier::Native,
+            source_asset_id: "native".to_string(),
             address: "btc-address".to_string(),
             sender_addresses: Vec::new(),
             tx_hash: "deadbeef".to_string(),
@@ -1449,6 +1453,7 @@ mod tests {
             order_id: watch_id,
             source_chain: ChainType::Bitcoin,
             source_token: TokenIdentifier::Native,
+            source_asset_id: "native".to_string(),
             address: "btc-address".to_string(),
             min_amount: U256::from(1_u64),
             max_amount: U256::from(10_u64),

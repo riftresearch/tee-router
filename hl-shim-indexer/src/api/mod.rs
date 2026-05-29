@@ -35,6 +35,7 @@ pub fn build_router(state: AppState) -> Router {
             "/orders/watch/:oid",
             axum::routing::delete(delete_order_watch),
         )
+        .route("/users/watch", post(post_user_watch))
         .route("/prune", post(post_prune))
         .route("/subscribe", get(ws_subscribe))
         .with_state(Arc::new(state))
@@ -97,6 +98,17 @@ async fn post_prune(
         }
     });
     Ok(Json(PruneResponse { accepted: true }))
+}
+async fn post_user_watch(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<UserWatchRequest>,
+) -> ApiResult<Json<UserWatchResponse>> {
+    let user = parse_address(&request.user)?;
+    state.scheduler.register_user(user).await;
+    Ok(Json(UserWatchResponse {
+        user: format!("{user:?}"),
+        watched: true,
+    }))
 }
 
 async fn post_order_watch(
@@ -163,6 +175,17 @@ struct EventQuery {
 struct PruneRequest {
     relevant_users: Vec<String>,
     before_time_ms: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct UserWatchRequest {
+    user: String,
+}
+
+#[derive(Debug, Serialize)]
+struct UserWatchResponse {
+    user: String,
+    watched: bool,
 }
 
 #[derive(Debug, Deserialize)]

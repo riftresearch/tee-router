@@ -16,10 +16,10 @@ use chains::{ChainRegistry, UserDepositCandidateStatus};
 use chrono::Utc;
 use router_core::{
     db::{
-        BoundaryRequoteExecutionAttemptPlan, Database, ExecutionAttemptPlan,
-        ExecutionStepLatencyRecord, ExternalCustodyRefundAttemptPlan,
-        FundingVaultRefundAttemptPlan, HyperliquidSpotRefundAttemptPlan,
-        PersistStepCompletionRecord, RefreshedExecutionAttemptPlan,
+        Database, ExecutionAttemptPlan, ExecutionStepLatencyRecord,
+        ExternalCustodyRefundAttemptPlan, FundingVaultRefundAttemptPlan,
+        HyperliquidSpotRefundAttemptPlan, PersistStepCompletionRecord,
+        RefreshedExecutionAttemptPlan,
     },
     error::{RouterCoreError, RouterCoreResult},
     models::{
@@ -29,40 +29,32 @@ use router_core::{
         OrderProviderAddress, OrderProviderOperation, ProviderAddressRole, ProviderOperationStatus,
         ProviderOperationType, ProviderOrderKind, RouterOrder, RouterOrderQuote,
     },
-    protocol::{AssetId, ChainId, DepositAsset, backend_chain_for_id},
+    protocol::{backend_chain_for_id, AssetId, ChainId, DepositAsset},
     services::{
-        ActionProviderRegistry, CustodyActionExecutor, CustodyActionReceipt,
-        MarketOrderRoutePlanner, PricingSnapshotProvider, ProviderExecutionIntent,
-        ProviderExecutionState, ProviderOperationIntent,
         action_providers::{
+            hyperliquid_filled_actual_amounts_from_values, unit_withdrawal_minimum_raw,
             BridgeExecutionRequest, BridgeQuote, BridgeQuoteRequest, ExchangeExecutionRequest,
             ExchangeQuote, ExchangeQuoteRequest, HyperliquidFillFee, ProviderExecutionStatePatch,
             ProviderOperationObservation, ProviderOperationObservationRequest,
-            UnitDepositStepRequest, UnitProvider, UnitWithdrawalStepRequest,
-            hyperliquid_filled_actual_amounts_from_values, unit_withdrawal_minimum_raw,
+            UnitDepositStepRequest, UnitWithdrawalStepRequest,
         },
         asset_registry::{
-            AssetRegistry, CanonicalAsset, MarketOrderNode, MarketOrderTransitionKind,
-            ProviderAssetCapability, ProviderId, RequiredCustodyRole, TransitionDecl,
-            TransitionPath,
+            CanonicalAsset, MarketOrderNode, MarketOrderTransitionKind, ProviderAssetCapability,
+            ProviderId, TransitionDecl, TransitionPath,
         },
         custody_action_executor::{CustodyAction, CustodyActionError, CustodyActionRequest},
-        gas_reimbursement::{
-            GasReimbursementError, GasReimbursementPlan, optimized_paymaster_reimbursement_plan,
-            optimized_paymaster_reimbursement_plan_with_pricing, try_transition_retention_amount,
-        },
-        market_order_planner::{
-            MarketOrderInitialHyperliquidCustody, MarketOrderPlanCurrentLocationStart,
-            MarketOrderPlanRemainingStart,
-        },
+        market_order_planner::MarketOrderPlanRemainingStart,
         quote_legs::{
-            QuoteLeg, QuoteLegAsset, QuoteLegSpec, execution_step_type_for_transition_kind,
+            execution_step_type_for_transition_kind, QuoteLeg, QuoteLegAsset, QuoteLegSpec,
         },
         usd_valuation::{execution_leg_usd_valuation, execution_step_usd_valuation},
+        ActionProviderRegistry, CustodyActionExecutor, CustodyActionReceipt,
+        MarketOrderRoutePlanner, PricingSnapshotProvider, ProviderExecutionIntent,
+        ProviderExecutionState, ProviderOperationIntent,
     },
 };
 use router_primitives::{ChainType, Currency, TokenIdentifier};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use temporalio_macros::activities;
 use temporalio_sdk::activities::{ActivityContext, ActivityError};
 use uuid::Uuid;
@@ -73,15 +65,13 @@ use super::{
     error::OrderActivityError,
     types::{
         AcrossOnchainLogRecovered, BoundaryPersisted, ClassifyStaleRunningStepInput,
-        ClassifyStepFailureInput, ComposeLegBoundaryRequoteInput,
-        ComposeRefreshedQuoteAttemptInput, DiscoverSingleRefundPositionInput, DispatchOutcome,
-        DispatchStepInput, ExecutionPlan, FailedAttemptSnapshotWritten, FinalizeOrderOrRefundInput,
-        FinalizedOrder, HlBridgeDepositCreditedEvidence, HlWithdrawalSettledEvidence,
+        ClassifyStepFailureInput, ComposeRefreshedQuoteAttemptInput,
+        DiscoverSingleRefundPositionInput, DispatchOutcome, DispatchStepInput, ExecutionPlan,
+        FailedAttemptSnapshotWritten, FinalizeOrderOrRefundInput, FinalizedOrder,
+        HlBridgeDepositCreditedEvidence, HlWithdrawalSettledEvidence,
         HyperUnitDepositCreditedEvidence, HyperUnitWithdrawalSettledEvidence, InputCustodySnapshot,
-        LatestExecutionAttemptResolved, LegBoundaryRequoteAttemptOutcome,
-        LegBoundaryRequoteAttemptShape, LegBoundaryRequoteMaterialized,
-        LoadOrderExecutionStateInput, MarkOrderCompletedInput, MaterializeExecutionAttemptInput,
-        MaterializeLegBoundaryRequoteInput, MaterializeRefreshedAttemptInput,
+        LatestExecutionAttemptResolved, LoadOrderExecutionStateInput, MarkOrderCompletedInput,
+        MaterializeExecutionAttemptInput, MaterializeRefreshedAttemptInput,
         MaterializeRefundPlanInput, MaterializeRetryAttemptInput, MaterializedExecutionAttempt,
         OrderCompleted, OrderExecutionState, OrderTerminalStatus, OrderWorkflowPhase,
         PersistStepFailedInput, PersistenceBoundary, ProviderHintKind,
@@ -276,7 +266,6 @@ fn provider_operation_hint_kind_label(
         Some(
             ProviderOperationType::UnitWithdrawal
             | ProviderOperationType::HyperliquidBridgeDeposit
-            | ProviderOperationType::HypercoreBridgeDeposit
             | ProviderOperationType::HyperliquidBridgeWithdrawal,
         ) => "provider_observation",
         None => "unknown",

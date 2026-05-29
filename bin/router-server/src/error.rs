@@ -239,6 +239,7 @@ impl From<crate::services::order_manager::MarketOrderError> for RouterServerErro
             MarketOrderError::InvalidIdempotencyKey { reason } => {
                 Self::Validation { message: reason }
             }
+            MarketOrderError::InvalidRouting { reason } => Self::Validation { message: reason },
             MarketOrderError::NoRoute { reason } => Self::NoRoute { message: reason },
             MarketOrderError::OutputBelowFloor {
                 estimated_amount_out,

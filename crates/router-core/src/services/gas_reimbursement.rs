@@ -394,7 +394,6 @@ fn transition_requires_evm_sender_gas(kind: MarketOrderTransitionKind) -> bool {
         MarketOrderTransitionKind::AcrossBridge
             | MarketOrderTransitionKind::CctpBridge
             | MarketOrderTransitionKind::HyperliquidBridgeDeposit
-            | MarketOrderTransitionKind::HypercoreBridgeDeposit
             | MarketOrderTransitionKind::UnitDeposit
             | MarketOrderTransitionKind::UniversalRouterSwap
     )
@@ -409,7 +408,6 @@ fn estimate_paymaster_native_cost_wei(
         MarketOrderTransitionKind::AcrossBridge => 450_000_u64,
         MarketOrderTransitionKind::CctpBridge => 300_000_u64,
         MarketOrderTransitionKind::HyperliquidBridgeDeposit => 180_000_u64,
-        MarketOrderTransitionKind::HypercoreBridgeDeposit => 200_000_u64,
         MarketOrderTransitionKind::UnitDeposit => 140_000_u64,
         MarketOrderTransitionKind::UniversalRouterSwap => 360_000_u64,
         MarketOrderTransitionKind::HyperliquidBridgeWithdrawal
@@ -434,11 +432,11 @@ fn estimate_erc20_collection_cost_wei(
     let gas_price_wei = pricing
         .try_chain_gas_price_wei(chain)
         .ok_or(GasReimbursementError::PricingUnavailable)?;
-    U256::from(65_000_u64)
-        .checked_mul(gas_price_wei)
-        .ok_or(GasReimbursementError::NumericOverflow {
+    U256::from(65_000_u64).checked_mul(gas_price_wei).ok_or(
+        GasReimbursementError::NumericOverflow {
             context: "erc20 settlement collection gas estimate",
-        })
+        },
+    )
 }
 
 fn is_supported_settlement_canonical(canonical: CanonicalAsset) -> bool {

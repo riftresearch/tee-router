@@ -137,7 +137,15 @@ impl Scheduler {
 
     pub async fn register_user(&self, user: Address) {
         let mut inner = self.inner.lock().await;
-        let inserted = inner.users.insert(
+        if let Some(state) = inner.users.get_mut(&user) {
+            state.last_activity_ms = now_ms();
+            if state.active_subscribers == 0 && state.bucket == Bucket::Cold {
+                state.bucket = Bucket::Warm;
+            }
+            return;
+        }
+
+        inner.users.insert(
             user,
             UserState {
                 bucket: Bucket::Warm,
@@ -145,24 +153,23 @@ impl Scheduler {
                 last_activity_ms: now_ms(),
             },
         );
-        if inserted.is_none() {
-            let now = Instant::now();
-            inner.heap.push(ScheduledPoll {
-                user,
-                endpoint: PollEndpoint::Fills,
-                deadline: now,
-            });
-            inner.heap.push(ScheduledPoll {
-                user,
-                endpoint: PollEndpoint::Ledger,
-                deadline: now,
-            });
-            inner.heap.push(ScheduledPoll {
-                user,
-                endpoint: PollEndpoint::Funding,
-                deadline: now,
-            });
-        }
+
+        let now = Instant::now();
+        inner.heap.push(ScheduledPoll {
+            user,
+            endpoint: PollEndpoint::Fills,
+            deadline: now,
+        });
+        inner.heap.push(ScheduledPoll {
+            user,
+            endpoint: PollEndpoint::Ledger,
+            deadline: now,
+        });
+        inner.heap.push(ScheduledPoll {
+            user,
+            endpoint: PollEndpoint::Funding,
+            deadline: now,
+        });
     }
 
     pub async fn add_subscriber(&self, user: Address) {

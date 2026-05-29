@@ -422,7 +422,7 @@ async fn hyperliquid_report(base_url: &str, owner: Address) -> Value {
     };
 
     let mut assets = Map::new();
-    for symbol in ["UETH", "UBTC", "USDC"] {
+    for symbol in ["UETH", "UBTC", "USDC", "USDT0", "HYPE"] {
         assets.insert(
             symbol.to_string(),
             hyperliquid_asset_json(&meta, &spot, symbol),

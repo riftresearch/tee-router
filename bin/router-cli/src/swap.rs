@@ -3,11 +3,13 @@
 use std::io::{self, Write};
 
 use eyre::{eyre, Result, WrapErr};
-use router_gateway_sdk::{AmountFormat, CreateOrderRequest, GatewayClient, QuoteRequest};
+use router_gateway_sdk::{
+    AmountFormat, CreateOrderRequest, GatewayClient, ProviderId, QuoteRequest, QuoteRouting,
+};
 use uuid::Uuid;
 
 use crate::assets::{self, SourceChain};
-use crate::{btc, evm};
+use crate::{btc, evm, hyperliquid};
 
 /// Inputs for a swap run.
 pub struct SwapArgs {
@@ -18,21 +20,27 @@ pub struct SwapArgs {
     pub to: String,
     pub from_amount: String,
     pub to_address: String,
+    pub provider_sequence: Option<String>,
     pub auto_accept: bool,
 }
 
 pub async fn run(args: SwapArgs) -> Result<()> {
     let source = assets::resolve_source(&args.from)?;
-    let client =
-        GatewayClient::new(args.gateway_url.clone()).wrap_err("invalid --gateway-url")?;
+    let client = GatewayClient::new(args.gateway_url.clone()).wrap_err("invalid --gateway-url")?;
 
     // The deposit is signed on the source chain, so the sender address is
     // derived from the private key per the source asset's chain family.
     let from_address = match source.chain {
         SourceChain::Evm { .. } => evm::address(&args.private_key)?,
         SourceChain::Bitcoin => btc::address(&args.private_key)?,
+        SourceChain::HyperliquidSpot { .. } => hyperliquid::address(&args.private_key)?,
     };
 
+    let routing = args
+        .provider_sequence
+        .as_deref()
+        .map(parse_provider_sequence)
+        .transpose()?;
     // 1. Quote.
     let quote = client
         .quote(&QuoteRequest {
@@ -41,6 +49,7 @@ pub async fn run(args: SwapArgs) -> Result<()> {
             amount_format: Some(AmountFormat::Readable),
             to_address: args.to_address.clone(),
             from_amount: args.from_amount.clone(),
+            routing,
         })
         .await
         .wrap_err("quote request failed")?;
@@ -50,7 +59,10 @@ pub async fn run(args: SwapArgs) -> Result<()> {
     println!("  estimated out: {} {}", quote.estimated_out, quote.to);
     if let Some(fees) = &quote.fees {
         for fee in fees {
-            println!("  fee:           {} {} ({})", fee.amount, fee.asset, fee.label);
+            println!(
+                "  fee:           {} {} ({})",
+                fee.amount, fee.asset, fee.label
+            );
         }
     }
     println!("  quote id:      {}", quote.quote_id);
@@ -94,11 +106,24 @@ pub async fn run(args: SwapArgs) -> Result<()> {
             .await?
         }
         SourceChain::Bitcoin => {
-            let sats = order.amount_to_send.parse::<u64>().map_err(|err| {
-                eyre!("invalid raw BTC amount `{}`: {err}", order.amount_to_send)
-            })?;
-            btc::send_deposit(&args.rpc_url, &args.private_key, &order.order_address, sats)
-                .await?
+            let sats = order
+                .amount_to_send
+                .parse::<u64>()
+                .map_err(|err| eyre!("invalid raw BTC amount `{}`: {err}", order.amount_to_send))?;
+            btc::send_deposit(&args.rpc_url, &args.private_key, &order.order_address, sats).await?
+        }
+        SourceChain::HyperliquidSpot {
+            token_symbol,
+            decimals,
+        } => {
+            hyperliquid::send_deposit(
+                &args.private_key,
+                &order.order_address,
+                token_symbol,
+                decimals,
+                &order.amount_to_send,
+            )
+            .await?
         }
     };
 
@@ -114,6 +139,38 @@ pub async fn run(args: SwapArgs) -> Result<()> {
         order.order_id, args.gateway_url
     );
     Ok(())
+}
+fn parse_provider_sequence(value: &str) -> Result<QuoteRouting> {
+    let mut providers = Vec::new();
+    for raw_provider in value.split(',') {
+        let provider = raw_provider.trim();
+        if provider.is_empty() {
+            return Err(eyre!("--provider-sequence contains an empty provider"));
+        }
+        providers.push(parse_provider_id(provider)?);
+    }
+    if providers.is_empty() {
+        return Err(eyre!(
+            "--provider-sequence must contain at least one provider"
+        ));
+    }
+    Ok(QuoteRouting {
+        provider_sequence: Some(providers),
+    })
+}
+
+fn parse_provider_id(value: &str) -> Result<ProviderId> {
+    match value {
+        "across" => Ok(ProviderId::Across),
+        "cctp" => Ok(ProviderId::Cctp),
+        "unit" => Ok(ProviderId::Unit),
+        "hyperliquid_bridge" => Ok(ProviderId::HyperliquidBridge),
+        "hyperliquid" => Ok(ProviderId::Hyperliquid),
+        "velora" => Ok(ProviderId::Velora),
+        _ => Err(eyre!(
+            "unknown provider `{value}`; expected one of: across, cctp, unit, hyperliquid_bridge, hyperliquid, velora"
+        )),
+    }
 }
 
 fn confirm(prompt: &str) -> Result<bool> {

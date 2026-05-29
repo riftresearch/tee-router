@@ -206,7 +206,7 @@ pub fn supported_chain_ids() -> Vec<ChainId> {
         ChainId::from_trusted_static("evm:1"),
         ChainId::from_trusted_static("evm:42161"),
         ChainId::from_trusted_static("evm:8453"),
-        ChainId::from_trusted_static("evm:999"),
+        ChainId::from_trusted_static("hyperliquid"),
     ]
 }
 
@@ -217,7 +217,6 @@ pub fn backend_chain_for_id(chain_id: &ChainId) -> Option<ChainType> {
         "evm:1" => Some(ChainType::Ethereum),
         "evm:42161" => Some(ChainType::Arbitrum),
         "evm:8453" => Some(ChainType::Base),
-        "evm:999" => Some(ChainType::Hyperevm),
         "hyperliquid" => Some(ChainType::Hyperliquid),
         _ => None,
     }
@@ -293,20 +292,16 @@ mod tests {
             backend_chain_for_id(&ChainId::parse("evm:8453").unwrap()),
             Some(ChainType::Base)
         );
-        assert_eq!(
-            backend_chain_for_id(&ChainId::parse("evm:999").unwrap()),
-            Some(ChainType::Hyperevm)
-        );
     }
 
     #[test]
-    fn maps_internal_backend_chain_ids_without_public_exposure() {
+    fn maps_hyperliquid_as_public_chain() {
         let supported = supported_chain_ids();
         assert!(
-            !supported
+            supported
                 .iter()
                 .any(|chain| chain.as_str() == "hyperliquid"),
-            "hyperliquid should remain an internal backend chain, not a public start/end chain"
+            "hyperliquid spot assets should be public"
         );
         assert_eq!(
             backend_chain_for_id(&ChainId::parse("hyperliquid").unwrap()),

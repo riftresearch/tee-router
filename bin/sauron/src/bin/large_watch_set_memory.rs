@@ -302,7 +302,6 @@ fn measure_indexed_lookup_backfill_schedule(
             ChainType::Ethereum => "indexed_lookup_schedule_ethereum",
             ChainType::Arbitrum => "indexed_lookup_schedule_arbitrum",
             ChainType::Base => "indexed_lookup_schedule_base",
-            ChainType::Hyperevm => "indexed_lookup_schedule_hyperevm",
             ChainType::Hyperliquid => "indexed_lookup_schedule_hyperliquid",
         },
         size,

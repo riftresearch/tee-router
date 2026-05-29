@@ -51,6 +51,15 @@ test('loadConfig defaults hosted railway environments to production', () => {
   expect(config.production).toBe(true)
   expect(config.missingAuthConfig).toContain('BETTER_AUTH_SECRET')
 })
+test('loadConfig treats empty Supabase chat URL as unset', () => {
+  const config = loadConfig({
+    SUPABASE_CHATS_URL: ''
+  })
+
+  expect(config.supabaseChatsUrl).toBe(
+    'https://ookzpviwfhzfarouusah.supabase.co/functions/v1/chats'
+  )
+})
 
 test('loadConfig rejects non-decimal numeric env values', () => {
   expect(() =>

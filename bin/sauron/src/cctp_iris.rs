@@ -200,10 +200,11 @@ impl CctpDelayReason {
 /// `pending_confirmations`. The legacy `"failed"|"failure"|"error"` string
 /// check was a fabrication that never fires against real Iris.
 fn classify_messages(messages: &[CctpMessageEntry]) -> CctpAttestationStatus {
-    if messages
-        .iter()
-        .any(|message| message.delay_reason.is_some_and(CctpDelayReason::is_terminal))
-    {
+    if messages.iter().any(|message| {
+        message
+            .delay_reason
+            .is_some_and(CctpDelayReason::is_terminal)
+    }) {
         return CctpAttestationStatus::Failed;
     }
     let ready = messages.iter().any(|message| {

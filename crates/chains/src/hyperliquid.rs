@@ -9,13 +9,14 @@ use std::{str::FromStr, time::Duration};
 use tracing::{debug, info};
 
 /// Hyperliquid "chain" — a custody layer where assets persist under an
-/// EVM-compatible address. Trading, withdrawal, and intra-HL transfer operations
-/// are EIP-712-signed REST API calls, not on-chain transactions; they live in
-/// the `HyperliquidProvider` action provider, not on this type.
+/// EVM-compatible address. Trading, withdrawals, and spot transfers are
+/// EIP-712-signed REST API calls handled by provider/custody actions rather
+/// than chain transactions.
 ///
-/// User-initiated deposits never land directly on HL: funds reach HL only via a
-/// provider (HyperUnit for BTC/ETH, Arbitrum Bridge2 for USDC).
-/// `verify_user_deposit_candidate` therefore always returns `TxNotFound`.
+/// User-initiated spot deposits are observed by Sauron's Hyperliquid transfer
+/// backend. This type is intentionally limited to deterministic address
+/// derivation and address validation, so `verify_user_deposit_candidate` returns
+/// `TxNotFound`.
 pub struct HyperliquidChain {
     chain_type: ChainType,
     wallet_seed_tag: Vec<u8>,

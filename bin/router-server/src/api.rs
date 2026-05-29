@@ -8,6 +8,7 @@ use router_core::{
         ProviderQuotePolicyState, RouterOrder, RouterOrderQuote, RouterOrderStatus, VaultAction,
     },
     protocol::DepositAsset,
+    services::asset_registry::ProviderId,
 };
 use router_temporal::WorkflowStepId;
 use serde::{Deserialize, Serialize};
@@ -35,7 +36,7 @@ pub struct CreateVaultRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CreateQuoteRequest {
-    MarketOrder(MarketOrderQuoteRequest),
+    MarketOrder(ApiMarketOrderQuoteRequest),
     LimitOrder(LimitOrderQuoteRequest),
 }
 
@@ -52,11 +53,44 @@ pub struct CreateOrderRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ApiMarketOrderQuoteRequest {
+    pub from_asset: DepositAsset,
+    pub to_asset: DepositAsset,
+    pub recipient_address: String,
+    pub amount_in: String,
+    #[serde(default)]
+    pub routing: QuoteRoutingRequest,
+}
+
+impl ApiMarketOrderQuoteRequest {
+    #[must_use]
+    pub fn into_parts(self) -> (MarketOrderQuoteRequest, QuoteRoutingRequest) {
+        (
+            MarketOrderQuoteRequest {
+                from_asset: self.from_asset,
+                to_asset: self.to_asset,
+                recipient_address: self.recipient_address,
+                amount_in: self.amount_in,
+            },
+            self.routing,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MarketOrderQuoteRequest {
     pub from_asset: DepositAsset,
     pub to_asset: DepositAsset,
     pub recipient_address: String,
     pub amount_in: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuoteRoutingRequest {
+    #[serde(default)]
+    pub provider_sequence: Option<Vec<ProviderId>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -362,6 +396,30 @@ mod tests {
         assert_eq!(request.from_asset.chain.as_str(), "evm:8453");
         assert_eq!(request.to_asset.chain.as_str(), "bitcoin");
         assert_eq!(request.amount_in, "1000");
+        assert!(request.routing.provider_sequence.is_none());
+    }
+
+    #[test]
+    fn create_quote_request_deserializes_provider_sequence_routing() {
+        let request: CreateQuoteRequest = serde_json::from_value(json!({
+            "type": "market_order",
+            "from_asset": {"chain": "evm:42161", "asset": "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9"},
+            "to_asset": {"chain": "evm:8453", "asset": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"},
+            "recipient_address": "0x1111111111111111111111111111111111111111",
+            "amount_in": "5000000",
+            "routing": {
+                "provider_sequence": ["velora", "cctp"]
+            }
+        }))
+        .expect("market order request with routing");
+
+        let CreateQuoteRequest::MarketOrder(request) = request else {
+            panic!("expected market order request");
+        };
+        assert_eq!(
+            request.routing.provider_sequence,
+            Some(vec![ProviderId::Velora, ProviderId::Cctp])
+        );
     }
 
     #[test]

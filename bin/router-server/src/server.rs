@@ -395,6 +395,7 @@ async fn create_quote(
     authorize_gateway_api_request(&state, &headers)?;
     let envelope = match request {
         CreateQuoteRequest::MarketOrder(market_order) => {
+            let (market_order, routing) = market_order.into_parts();
             screen_user_address(
                 &state,
                 AddressScreeningPurpose::Recipient,
@@ -402,7 +403,10 @@ async fn create_quote(
                 &market_order.recipient_address,
             )
             .await?;
-            state.order_manager.quote_market_order(market_order).await?
+            state
+                .order_manager
+                .quote_market_order_with_routing(market_order, routing)
+                .await?
         }
         CreateQuoteRequest::LimitOrder(_limit_order) => {
             return Err(limit_orders_disabled_error());
@@ -865,7 +869,6 @@ fn provider_hint_shape_for_operation(
             (ProviderKind::Unit, ProviderHintKind::ProviderObservation)
         }
         ProviderOperationType::HyperliquidBridgeDeposit
-        | ProviderOperationType::HypercoreBridgeDeposit
         | ProviderOperationType::HyperliquidBridgeWithdrawal => {
             (ProviderKind::Bridge, ProviderHintKind::ProviderObservation)
         }
@@ -1032,20 +1035,14 @@ async fn signal_provider_operation_hint(
                 .await;
             match child_result {
                 Ok(()) => Ok(()),
-                Err(RouterTemporalError::WorkflowSignalUnavailable {
-                    workflow_id,
-                    ..
-                }) => {
+                Err(RouterTemporalError::WorkflowSignalUnavailable { workflow_id, .. }) => {
                     tracing::debug!(
                         %workflow_id,
                         %order_id,
                         "child refund workflow unavailable, falling back to manual refund workflow"
                     );
                     order_workflow_client
-                        .signal_manual_refund_provider_hint(
-                            WorkflowOrderId::from(order_id),
-                            signal,
-                        )
+                        .signal_manual_refund_provider_hint(WorkflowOrderId::from(order_id), signal)
                         .await
                 }
                 Err(source) => Err(source),

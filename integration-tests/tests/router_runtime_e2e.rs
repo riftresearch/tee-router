@@ -832,6 +832,7 @@ fn order_worker_runtime_args_from_router_args(args: &RouterServerArgs) -> OrderW
         cctp_api_url: args.cctp_api_url.clone(),
         cctp_token_messenger_v2_address: args.cctp_token_messenger_v2_address.clone(),
         cctp_message_transmitter_v2_address: args.cctp_message_transmitter_v2_address.clone(),
+        cctp_transfer_mode: args.cctp_transfer_mode.clone(),
         hyperunit_api_url: args.hyperunit_api_url.clone(),
         hyperunit_proxy_url: args.hyperunit_proxy_url.clone(),
         hyperliquid_api_url: args.hyperliquid_api_url.clone(),
@@ -1265,6 +1266,7 @@ fn router_args(
         cctp_message_transmitter_v2_address: Some(
             devnet::evm_devnet::MOCK_CCTP_MESSAGE_TRANSMITTER_V2_ADDRESS.to_string(),
         ),
+        cctp_transfer_mode: None,
         hyperunit_api_url: Some(mocks.base_url().to_string()),
         hyperunit_proxy_url: None,
         hyperliquid_api_url: Some(mocks.base_url().to_string()),

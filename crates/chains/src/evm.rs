@@ -331,6 +331,13 @@ impl EvmChain {
             loc: location!(),
         })?;
         if native_balance < reserved_fee {
+            self.ensure_native_gas_for_erc20_transfer_addresses(
+                token_address,
+                sender,
+                recipient,
+                amount,
+            )
+            .await?;
             self.wait_for_native_balance_at_least(
                 sender,
                 reserved_fee,
@@ -338,24 +345,24 @@ impl EvmChain {
             )
             .await?;
         }
-        let transaction_request = TransactionRequest::default()
-            .with_from(sender)
-            .with_to(token_address)
-            .with_input(calldata)
-            .with_nonce(self.pending_nonce(sender).await?)
-            .with_gas_limit(gas_limit)
-            .with_max_fee_per_gas(max_fee_per_gas)
-            .with_max_priority_fee_per_gas(fee_estimate.max_priority_fee_per_gas);
-
-        let pending_tx = provider
-            .send_transaction(transaction_request)
-            .await
-            .map_err(|e| crate::Error::EVMRpcError {
-                source: e,
-                loc: location!(),
-            })?;
-        let tx_hash = *pending_tx.tx_hash();
-        wait_for_evm_receipt(provider, self.chain_type, tx_hash).await?;
+        let (tx_hash, _) = self
+            .send_transaction_with_nonce_retry(
+                provider,
+                provider,
+                sender,
+                |nonce| {
+                    TransactionRequest::default()
+                        .with_from(sender)
+                        .with_to(token_address)
+                        .with_input(calldata.clone())
+                        .with_nonce(nonce)
+                        .with_gas_limit(gas_limit)
+                        .with_max_fee_per_gas(max_fee_per_gas)
+                        .with_max_priority_fee_per_gas(fee_estimate.max_priority_fee_per_gas)
+                },
+                "erc20_transfer",
+            )
+            .await?;
 
         Ok(tx_hash.to_string())
     }
@@ -413,6 +420,158 @@ impl EvmChain {
             loc: location!(),
         })
     }
+    async fn send_transaction_with_nonce_retry<P, R, F>(
+        &self,
+        provider: &P,
+        receipt_provider: &R,
+        sender: Address,
+        mut build_request: F,
+        operation: &'static str,
+    ) -> Result<(TxHash, TransactionReceipt)>
+    where
+        P: Provider,
+        R: Provider,
+        F: FnMut(u64) -> TransactionRequest,
+    {
+        let mut delay = EVM_RPC_RETRY_INITIAL_DELAY;
+        for attempt in 1..=EVM_RPC_RETRY_ATTEMPTS {
+            let nonce = self.pending_nonce(sender).await?;
+            let pending_tx = provider.send_transaction(build_request(nonce)).await;
+            match pending_tx {
+                Ok(pending_tx) => {
+                    let tx_hash = *pending_tx.tx_hash();
+                    let receipt =
+                        wait_for_evm_receipt(receipt_provider, self.chain_type, tx_hash).await?;
+                    self.wait_for_submitted_nonce_visibility(sender, nonce, tx_hash, operation)
+                        .await;
+                    return Ok((tx_hash, receipt));
+                }
+                Err(error)
+                    if attempt < EVM_RPC_RETRY_ATTEMPTS
+                        && is_nonce_retryable_submission_error(&error) =>
+                {
+                    let required_nonce =
+                        nonce.checked_add(1).ok_or(crate::Error::NumericOverflow {
+                            context: "EVM nonce visibility increment",
+                        })?;
+                    warn!(
+                        chain = %self.chain_type.to_db_string(),
+                        operation,
+                        attempt,
+                        max_attempts = EVM_RPC_RETRY_ATTEMPTS,
+                        nonce,
+                        required_nonce,
+                        error = %error,
+                        "retrying EVM transaction after nonce submission conflict"
+                    );
+                    let _ = self
+                        .wait_for_pending_nonce_at_least(
+                            sender,
+                            required_nonce,
+                            "get_transaction_count_after_nonce_conflict",
+                        )
+                        .await;
+                    sleep(delay).await;
+                    delay = delay.saturating_mul(2);
+                }
+                Err(error) => {
+                    return Err(crate::Error::EVMRpcError {
+                        source: error,
+                        loc: location!(),
+                    });
+                }
+            }
+        }
+
+        Err(crate::Error::DumpToAddress {
+            message: format!("exhausted EVM transaction nonce retries for {operation}"),
+        })
+    }
+
+    async fn wait_for_submitted_nonce_visibility(
+        &self,
+        address: Address,
+        submitted_nonce: u64,
+        tx_hash: TxHash,
+        operation: &'static str,
+    ) {
+        let Some(required_nonce) = submitted_nonce.checked_add(1) else {
+            warn!(
+                chain = %self.chain_type.to_db_string(),
+                operation,
+                %tx_hash,
+                submitted_nonce,
+                "skipping EVM nonce visibility wait after nonce overflow"
+            );
+            return;
+        };
+
+        if !self
+            .wait_for_pending_nonce_at_least(
+                address,
+                required_nonce,
+                "get_transaction_count_after_receipt",
+            )
+            .await
+        {
+            warn!(
+                chain = %self.chain_type.to_db_string(),
+                operation,
+                %tx_hash,
+                submitted_nonce,
+                required_nonce,
+                "EVM transaction receipt observed before pending nonce advanced"
+            );
+        }
+    }
+
+    async fn wait_for_pending_nonce_at_least(
+        &self,
+        address: Address,
+        required_nonce: u64,
+        rpc_method: &'static str,
+    ) -> bool {
+        let mut delay = EVM_RPC_RETRY_INITIAL_DELAY;
+        for attempt in 1..=EVM_RPC_RETRY_ATTEMPTS {
+            let nonce = retry_evm_rpc(self.chain_type, rpc_method, || async {
+                self.provider.get_transaction_count(address).pending().await
+            })
+            .await;
+            match nonce {
+                Ok(nonce) if nonce >= required_nonce => return true,
+                Ok(nonce) => {
+                    if attempt < EVM_RPC_RETRY_ATTEMPTS {
+                        record_evm_rpc_retry(self.chain_type, rpc_method, "state_lag");
+                        warn!(
+                            chain = %self.chain_type.to_db_string(),
+                            rpc_method,
+                            attempt,
+                            max_attempts = EVM_RPC_RETRY_ATTEMPTS,
+                            required_nonce,
+                            observed_nonce = nonce,
+                            "waiting for pending nonce to advance after submitted transaction"
+                        );
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        chain = %self.chain_type.to_db_string(),
+                        rpc_method,
+                        attempt,
+                        max_attempts = EVM_RPC_RETRY_ATTEMPTS,
+                        required_nonce,
+                        error = %error,
+                        "failed to read pending nonce after submitted transaction"
+                    );
+                }
+            }
+
+            sleep(delay).await;
+            delay = delay.saturating_mul(2);
+        }
+
+        false
+    }
 
     pub async fn ensure_native_gas_for_erc20_refund(
         &self,
@@ -437,10 +596,6 @@ impl EvmChain {
         recipient_address: &str,
         token_amount: U256,
     ) -> Result<Option<String>> {
-        let Some(gas_sponsor) = &self.gas_sponsor else {
-            return Ok(None);
-        };
-
         let token_address =
             Address::from_str(token_address).map_err(|_| crate::Error::Serialization {
                 message: "Invalid token address".to_string(),
@@ -453,6 +608,26 @@ impl EvmChain {
             Address::from_str(recipient_address).map_err(|_| crate::Error::Serialization {
                 message: "Invalid recipient address".to_string(),
             })?;
+
+        self.ensure_native_gas_for_erc20_transfer_addresses(
+            token_address,
+            vault_address,
+            recipient_address,
+            token_amount,
+        )
+        .await
+    }
+
+    async fn ensure_native_gas_for_erc20_transfer_addresses(
+        &self,
+        token_address: Address,
+        vault_address: Address,
+        recipient_address: Address,
+        token_amount: U256,
+    ) -> Result<Option<String>> {
+        let Some(gas_sponsor) = &self.gas_sponsor else {
+            return Ok(None);
+        };
 
         gas_sponsor
             .fund_vault_action(FundVaultAction {
@@ -472,10 +647,6 @@ impl EvmChain {
         calldata: Bytes,
         operation: &'static str,
     ) -> Result<Option<String>> {
-        let Some(gas_sponsor) = &self.gas_sponsor else {
-            return Ok(None);
-        };
-
         let vault_address =
             Address::from_str(vault_address).map_err(|_| crate::Error::Serialization {
                 message: "Invalid address".to_string(),
@@ -484,6 +655,28 @@ impl EvmChain {
             Address::from_str(target_address).map_err(|_| crate::Error::Serialization {
                 message: "Invalid target address".to_string(),
             })?;
+
+        self.ensure_native_gas_for_transaction_addresses(
+            vault_address,
+            target_address,
+            value,
+            calldata,
+            operation,
+        )
+        .await
+    }
+
+    async fn ensure_native_gas_for_transaction_addresses(
+        &self,
+        vault_address: Address,
+        target_address: Address,
+        value: U256,
+        calldata: Bytes,
+        operation: &'static str,
+    ) -> Result<Option<String>> {
+        let Some(gas_sponsor) = &self.gas_sponsor else {
+            return Ok(None);
+        };
 
         gas_sponsor
             .fund_evm_transaction(FundEvmTransactionAction {
@@ -570,24 +763,26 @@ impl EvmChain {
                 let dump_value =
                     checked_u256_sub(native_balance, reserved_fee, "native dump transfer value")?;
 
-                let transaction_request = TransactionRequest::default()
-                    .with_from(sender_address)
-                    .with_to(recipient_address)
-                    .with_value(dump_value)
-                    .with_nonce(self.pending_nonce(sender_address).await?)
-                    .with_gas_limit(gas_limit)
-                    .with_max_fee_per_gas(max_fee_per_gas)
-                    .with_max_priority_fee_per_gas(fee_estimate.max_priority_fee_per_gas);
-
-                let pending_tx = wallet_provider
-                    .send_transaction(transaction_request)
-                    .await
-                    .map_err(|e| crate::Error::EVMRpcError {
-                        source: e,
-                        loc: location!(),
-                    })?;
-                let tx_hash = *pending_tx.tx_hash();
-                wait_for_evm_receipt(&wallet_provider, self.chain_type, tx_hash).await?;
+                let (tx_hash, _) = self
+                    .send_transaction_with_nonce_retry(
+                        &wallet_provider,
+                        &wallet_provider,
+                        sender_address,
+                        |nonce| {
+                            TransactionRequest::default()
+                                .with_from(sender_address)
+                                .with_to(recipient_address)
+                                .with_value(dump_value)
+                                .with_nonce(nonce)
+                                .with_gas_limit(gas_limit)
+                                .with_max_fee_per_gas(max_fee_per_gas)
+                                .with_max_priority_fee_per_gas(
+                                    fee_estimate.max_priority_fee_per_gas,
+                                )
+                        },
+                        "native_dump",
+                    )
+                    .await?;
 
                 Ok(tx_hash.to_string())
             }
@@ -690,6 +885,14 @@ impl EvmChain {
         let required_balance =
             checked_u256_add(amount, reserved_fee, "native transfer required balance")?;
         let _native_balance = if native_balance < required_balance {
+            self.ensure_native_gas_for_transaction_addresses(
+                sender_address,
+                recipient_address,
+                amount,
+                Bytes::new(),
+                "native_transfer",
+            )
+            .await?;
             self.wait_for_native_balance_at_least(
                 sender_address,
                 required_balance,
@@ -710,24 +913,24 @@ impl EvmChain {
             .wallet(EthereumWallet::new(sender_signer))
             .connect_http(url);
 
-        let transaction_request = TransactionRequest::default()
-            .with_from(sender_address)
-            .with_to(recipient_address)
-            .with_value(amount)
-            .with_nonce(self.pending_nonce(sender_address).await?)
-            .with_gas_limit(gas_limit)
-            .with_max_fee_per_gas(max_fee_per_gas)
-            .with_max_priority_fee_per_gas(fee_estimate.max_priority_fee_per_gas);
-
-        let pending_tx = wallet_provider
-            .send_transaction(transaction_request)
-            .await
-            .map_err(|e| crate::Error::EVMRpcError {
-                source: e,
-                loc: location!(),
-            })?;
-        let tx_hash = *pending_tx.tx_hash();
-        wait_for_evm_receipt(&wallet_provider, self.chain_type, tx_hash).await?;
+        let (tx_hash, _) = self
+            .send_transaction_with_nonce_retry(
+                &wallet_provider,
+                &wallet_provider,
+                sender_address,
+                |nonce| {
+                    TransactionRequest::default()
+                        .with_from(sender_address)
+                        .with_to(recipient_address)
+                        .with_value(amount)
+                        .with_nonce(nonce)
+                        .with_gas_limit(gas_limit)
+                        .with_max_fee_per_gas(max_fee_per_gas)
+                        .with_max_priority_fee_per_gas(fee_estimate.max_priority_fee_per_gas)
+                },
+                "native_transfer",
+            )
+            .await?;
 
         Ok(tx_hash.to_string())
     }
@@ -905,6 +1108,14 @@ impl EvmChain {
         let reserved_fee = checked_gas_fee(gas_limit, max_fee_per_gas, "EVM call gas reservation")?;
         let required_balance = checked_u256_add(value, reserved_fee, "EVM call required balance")?;
         let _native_balance = if native_balance < required_balance {
+            self.ensure_native_gas_for_transaction_addresses(
+                sender_address,
+                to_address,
+                value,
+                calldata.clone(),
+                "evm_call",
+            )
+            .await?;
             self.wait_for_native_balance_at_least(
                 sender_address,
                 required_balance,
@@ -925,25 +1136,25 @@ impl EvmChain {
             .wallet(EthereumWallet::new(sender_signer))
             .connect_http(url);
 
-        let transaction_request = TransactionRequest::default()
-            .with_from(sender_address)
-            .with_to(to_address)
-            .with_value(value)
-            .with_input(calldata)
-            .with_nonce(self.pending_nonce(sender_address).await?)
-            .with_gas_limit(gas_limit)
-            .with_max_fee_per_gas(max_fee_per_gas)
-            .with_max_priority_fee_per_gas(fee_estimate.max_priority_fee_per_gas);
-
-        let pending_tx = wallet_provider
-            .send_transaction(transaction_request)
-            .await
-            .map_err(|e| crate::Error::EVMRpcError {
-                source: e,
-                loc: location!(),
-            })?;
-        let tx_hash = *pending_tx.tx_hash();
-        let receipt = wait_for_evm_receipt(&self.provider, self.chain_type, tx_hash).await?;
+        let (tx_hash, receipt) = self
+            .send_transaction_with_nonce_retry(
+                &wallet_provider,
+                &self.provider,
+                sender_address,
+                |nonce| {
+                    TransactionRequest::default()
+                        .with_from(sender_address)
+                        .with_to(to_address)
+                        .with_value(value)
+                        .with_input(calldata.clone())
+                        .with_nonce(nonce)
+                        .with_gas_limit(gas_limit)
+                        .with_max_fee_per_gas(max_fee_per_gas)
+                        .with_max_priority_fee_per_gas(fee_estimate.max_priority_fee_per_gas)
+                },
+                "evm_call",
+            )
+            .await?;
 
         Ok(EvmCallOutcome {
             tx_hash: tx_hash.to_string(),
@@ -1737,6 +1948,13 @@ fn classify_evm_rpc_error<E: std::fmt::Display>(err: &E) -> &'static str {
         "other"
     }
 }
+fn is_nonce_retryable_submission_error<E: std::fmt::Display>(err: &E) -> bool {
+    let message = err.to_string().to_ascii_lowercase();
+    message.contains("nonce too low")
+        || message.contains("replacement transaction underpriced")
+        || message.contains("transaction underpriced")
+        || message.contains("already imported")
+}
 
 fn is_evm_execution_revert(message: &str) -> bool {
     message.contains("execution reverted")
@@ -2354,6 +2572,18 @@ mod tests {
 
         assert_eq!(classify_evm_rpc_error(&error), "other");
         assert!(!is_retryable_evm_rpc_error(&error));
+    }
+    #[test]
+    fn nonce_conflict_submission_errors_are_retryable() {
+        assert!(is_nonce_retryable_submission_error(
+            &"server returned an error response: nonce too low"
+        ));
+        assert!(is_nonce_retryable_submission_error(
+            &"replacement transaction underpriced"
+        ));
+        assert!(!is_nonce_retryable_submission_error(
+            &"execution reverted: ERC20: transfer amount exceeds balance"
+        ));
     }
 
     #[test]

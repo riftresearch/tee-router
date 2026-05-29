@@ -29,7 +29,6 @@ the right outer shape for this work:
   - https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/spot
   - https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/exchange-endpoint
   - https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/nonces-and-api-wallets
-  - https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/hyperevm/hypercore-less-than-greater-than-hyperevm-transfers
 - Unit / HyperUnit docs:
   - https://docs.hyperunit.xyz/developers/api
   - https://docs.hyperunit.xyz/developers/api/generate-address
@@ -73,19 +72,11 @@ Unit:
 
 Across:
 
-- `GET https://app.across.to/api/swap/chains` includes:
-  - HyperEVM chain ID `999`
-  - HyperCore chain ID `1337`
-- `GET https://app.across.to/api/available-routes` currently shows USDC/USDT
-  routes into and out of HyperEVM `999`, not HyperCore `1337`.
-- `GET /api/swap/approval` without an API key successfully quoted
-  Arbitrum USDT -> HyperEVM USDC with `destinationChainId=999`. The response
-  included `approvalTxns`, `swapTx`, `expectedOutputAmount`,
-  `minOutputAmount`, `expectedFillTime`, `fees`, and `quoteExpiryTimestamp`.
-- The same style request with `destinationChainId=1337` returned token-detail
-  404s for the public endpoint. Across docs still describe the HyperCore path as
-  `destinationChainId=1337` and say production requires an API key. Treat this as
-  unresolved until verified with an Across API key and `/swap/tokens`.
+- `GET https://app.across.to/api/swap/chains` includes HyperCore chain ID
+  `1337`.
+- Public route availability for direct HyperCore delivery was unresolved at the
+  time of this snapshot. Treat it as an integration risk until verified with an
+  Across API key and `/swap/tokens`.
 
 ## What Each System Should Do For Us
 
@@ -160,13 +151,8 @@ Important semantics:
   downgrade exact-output behavior.
 - Responses include `inputAmount`, `maxInputAmount`, `expectedOutputAmount`,
   `minOutputAmount`, fees, quote expiry, and expected fill time.
-- Across HyperCore docs say `destinationChainId=1337` should automatically
-  bridge into HyperCore, but the public route endpoint currently exposes
-  HyperEVM `999` routes. This difference matters for custody and isolation.
-- If Across lands funds on HyperEVM `999`, and not directly on HyperCore, we
-  must perform the HyperEVM -> HyperCore transfer ourselves by transferring the
-  EVM spot ERC20 to the token's HyperCore system address. That requires an EVM
-  private key and HYPE gas on HyperEVM.
+- Direct HyperCore delivery should stay behind explicit provider verification.
+  The primary plan should not depend on it.
 
 ## Deposit-Vault-Scoped Hyperliquid Subaccounts
 
@@ -259,15 +245,15 @@ Flow:
 This is simpler than the Across route, but only applies when the source chain
 and asset already line up with Unit's supported deposit surface.
 
-### HyperEVM / HyperCore Across Routes
+### Direct HyperCore Across Routes
 
-Across routes that land directly on HyperEVM `999` or HyperCore `1337` are not
-required for the primary ingress design above. They may still matter later for
-egress or for a direct EVM-stablecoin destination path.
+Across routes that land directly on HyperCore `1337` are not required for the
+primary ingress design above. They may still matter later for egress or for a
+direct stablecoin destination path.
 
-Keep the earlier `1337` vs `999` finding as an integration risk, but it should
-not block the primary plan of Across depositing into a Unit address on chain
-`X`.
+Keep the earlier `1337` availability finding as an integration risk, but it
+should not block the primary plan of Across depositing into a Unit address on
+chain `X`.
 
 ## Required Changes To Current Router
 
@@ -290,8 +276,6 @@ Likely config:
 - `ACROSS_API_URL`, default `https://app.across.to/api`
 - `ACROSS_API_KEY`
 - `ACROSS_INTEGRATOR_ID`
-- optional `HYPEREVM_RPC_URL`, default `https://rpc.hyperliquid.xyz/evm`, only
-  needed for future HyperEVM egress or direct HyperEVM routes
 
 ### Asset Model
 
@@ -301,8 +285,6 @@ an internal asset map:
 - External chain/asset: `bitcoin:native`, `evm:1:<token>`, `evm:8453:<token>`
 - Hyperliquid spot token: token name, token index, token ID, `weiDecimals`,
   `szDecimals`
-- HyperEVM spot token: chain ID `999`, ERC20 address, system address, extra EVM
-  decimals
 - Unit asset symbol: `btc`, `eth`, `sol`, etc.
 - Across token details: origin/destination chain ID, ERC20 address, decimals,
   symbol
@@ -410,8 +392,6 @@ be generalized for action execution:
 
 - Across approval transaction gas
 - Across swap transaction gas
-- HyperEVM ERC20 transfer-to-system-address gas
-- HyperEVM outbound Across transaction gas
 
 The current actor estimates gas for ERC20 refunds specifically. For market
 orders it should accept a concrete EVM transaction plan and fund only the amount
@@ -463,8 +443,8 @@ Cases:
   existing refund machinery.
 - Across approval submitted but swap not submitted: refund source asset from the
   vault after ensuring no spend happened.
-- Unit or Across ingress submitted: funds may now be on Unit, HyperCore, or
-  HyperEVM. A normal deposit-vault refund is no longer sufficient.
+- Unit or Across ingress submitted: funds may now be on Unit or HyperCore. A
+  normal deposit-vault refund is no longer sufficient.
 - Spot trade partially filled: refund requires unwinding or delivering the
   best valid asset to a recovery path.
 
@@ -487,8 +467,8 @@ post-ingress recovery policy:
      tokens once the endpoint/API key works.
 2. Add asset registry:
    - Hardcode a narrow allowlist first: BTC, ETH, USDC, USDT, HYPE, UBTC, UETH.
-   - Include token IDs, spot pair indexes, decimals, HyperEVM ERC20 addresses,
-     system addresses, and Unit symbols.
+   - Include token IDs, spot pair indexes, decimals, system addresses, and Unit
+     symbols.
 3. Add quote-only provider:
    - Start with Rift-vault -> Across -> Rift destination execution vault ->
      Unit routes where Across output exactly matches a Unit-supported deposit
@@ -510,8 +490,8 @@ post-ingress recovery policy:
    - Use testnet where possible, then tiny mainnet canary amounts.
 6. Execute Hyperliquid IOC spot from the vault-scoped subaccount.
 7. Add egress through Unit or another provider-specific path.
-8. Keep direct Across `999` / `1337` Hyperliquid routes as later optional
-   surfaces, not primary ingress.
+8. Keep direct Across HyperCore routes as later optional surfaces, not primary
+   ingress.
 
 ## Production Risks And Required Proofs
 
@@ -528,7 +508,7 @@ post-ingress recovery policy:
 - Unit minimums: docs disagree across pages; fail closed and test live.
 - Post-ingress refunds: define recovery before meaningful value.
 - Balance reconciliation: every worker retry must start by querying current
-  vault, HyperEVM, HyperCore, Unit, and Across state.
+  vault, HyperCore, Unit, and Across state.
 - Activation fees: new HyperCore accounts can require a one-time quote-token fee
   before sending CoreWriter actions. In live Unit BTC withdrawal testing, the
   first `sendAsset` to a fresh Unit HyperCore protocol address consumed `1 USDC`
@@ -536,10 +516,8 @@ post-ingress recovery policy:
   a venue fee for Hyperliquid -> Unit withdrawal paths; it is separate from
   Unit's Bitcoin/network fee estimate and from Hyperliquid Bridge2's recurring
   `1 USDC` USDC withdrawal gas fee.
-- HyperEVM gas: `999` routes can create HYPE gas requirements that are separate
-  from source/destination token balances.
-- Address validation: BTC, EVM, Hyperliquid/Core, HyperEVM, and Unit protocol
-  addresses need provider-specific validation.
+- Address validation: BTC, EVM, Hyperliquid/Core, and Unit protocol addresses
+  need provider-specific validation.
 
 ## Bottom Line
 
@@ -548,5 +526,5 @@ as one market-order provider with a normalized route plan. The primary ingress
 path should be Rift deposit vault -> Across -> Rift destination execution vault
 -> Unit deposit address -> vault-scoped Hyperliquid subaccount. This preserves
 the deposit-vault custody model while adding a Rift-controlled checkpoint before
-Unit. Direct Across routes into Unit, HyperEVM, or HyperCore are optional later
-surfaces, not the foundation of this design.
+Unit. Direct Across routes into Unit or HyperCore are optional later surfaces,
+not the foundation of this design.

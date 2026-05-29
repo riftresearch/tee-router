@@ -42,6 +42,7 @@ pub fn make_mixed_watch_entries(count: usize) -> Vec<WatchEntry> {
                 order_id: Uuid::from_u128((index + 1) as u128),
                 source_chain,
                 source_token,
+                source_asset_id: benchmark_asset_id(source_chain),
                 address,
                 min_amount: U256::from(1_u64),
                 max_amount: U256::from(100_000_u64),
@@ -75,6 +76,7 @@ pub fn make_single_chain_shared_watch_entries(
                 order_id: Uuid::from_u128((index + 1) as u128),
                 source_chain: chain,
                 source_token: source_token.clone(),
+                source_asset_id: benchmark_asset_id(chain),
                 address,
                 min_amount: U256::from(1_u64),
                 max_amount: U256::from(100_000_u64),
@@ -100,24 +102,26 @@ fn benchmark_created_at() -> DateTime<Utc> {
 fn benchmark_token(chain: ChainType) -> TokenIdentifier {
     match chain {
         ChainType::Bitcoin => TokenIdentifier::Native,
-        ChainType::Ethereum
-        | ChainType::Arbitrum
-        | ChainType::Base
-        | ChainType::Hyperevm
-        | ChainType::Hyperliquid => {
+        ChainType::Ethereum | ChainType::Arbitrum | ChainType::Base | ChainType::Hyperliquid => {
             TokenIdentifier::address("0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf")
         }
+    }
+}
+
+fn benchmark_asset_id(chain: ChainType) -> String {
+    match chain {
+        ChainType::Bitcoin => "native".to_string(),
+        ChainType::Ethereum | ChainType::Arbitrum | ChainType::Base => {
+            "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf".to_string()
+        }
+        ChainType::Hyperliquid => "UBTC".to_string(),
     }
 }
 
 fn benchmark_address(chain: ChainType, index: usize, offset: usize) -> String {
     match chain {
         ChainType::Bitcoin => format!("btc-bench-address-{index:06}"),
-        ChainType::Ethereum
-        | ChainType::Arbitrum
-        | ChainType::Base
-        | ChainType::Hyperevm
-        | ChainType::Hyperliquid => {
+        ChainType::Ethereum | ChainType::Arbitrum | ChainType::Base | ChainType::Hyperliquid => {
             format!("0x{:040x}", index + offset)
         }
     }

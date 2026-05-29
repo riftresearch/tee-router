@@ -122,7 +122,9 @@ async fn real_velora_v6_quote_and_transaction_match_vendored_abi() {
     );
 
     // ─── /transactions ────────────────────────────────────────────────────
-    let tx_url = format!("https://api.velora.xyz/transactions/{NETWORK_ID}?ignoreChecks=true&ignoreGasEstimate=true");
+    let tx_url = format!(
+        "https://api.velora.xyz/transactions/{NETWORK_ID}?ignoreChecks=true&ignoreGasEstimate=true"
+    );
     let tx_body = serde_json::json!({
         "srcToken": WETH_BASE,
         "srcDecimals": 18,
@@ -168,13 +170,12 @@ async fn real_velora_v6_quote_and_transaction_match_vendored_abi() {
     // and confirm the calldata's first 4 bytes match its selector. This
     // proves our vendored ABI knows the function Velora returned.
     let abi: JsonAbi = serde_json::from_str(AUGUSTUS_V6_ABI_JSON).expect("vendored ABI parses");
-    let funcs = abi
-        .functions
-        .get(contract_method)
-        .unwrap_or_else(|| panic!(
+    let funcs = abi.functions.get(contract_method).unwrap_or_else(|| {
+        panic!(
             "vendored AugustusV6 ABI has no function named {contract_method:?} — \
              Velora may have added a new entry point we haven't vendored yet"
-        ));
+        )
+    });
     let func = funcs
         .first()
         .expect("at least one overload of the function");

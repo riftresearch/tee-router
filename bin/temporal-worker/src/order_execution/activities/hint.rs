@@ -566,18 +566,16 @@ pub(super) async fn recover_across_deposit_from_origin_logs(
         )
     })?;
 
-    let BridgeExecutionRequest::Across(step_request) = BridgeExecutionRequest::across_from_value(
-        &step.request,
-    )
-    .map_err(|err| {
-        lost_intent_recovery_error(
-            "decoding Across step request",
-            format!(
+    let BridgeExecutionRequest::Across(step_request) =
+        BridgeExecutionRequest::across_from_value(&step.request).map_err(|err| {
+            lost_intent_recovery_error(
+                "decoding Across step request",
+                format!(
                 "Across checkpoint recovery could not decode step request for operation {}: {err}",
                 operation.id
             ),
-        )
-    })?
+            )
+        })?
     else {
         return Err(lost_intent_recovery_error(
             "validating Across step request",
@@ -1370,16 +1368,85 @@ fn hyperunit_deposit_credited_response(
     operation: &OrderProviderOperation,
     evidence: &HyperUnitDepositCreditedEvidence,
 ) -> Result<Value, OrderActivityError> {
-    let amount = operation_request_amount("HyperUnitDepositCredited", operation)?;
+    let amount_in = operation_request_amount("HyperUnitDepositCredited", operation)?;
+    let amount_out = hyperunit_deposit_credit_raw_amount(operation, evidence)?
+        .unwrap_or_else(|| amount_in.clone());
     Ok(json!({
         "kind": "hyperunit_deposit_credited",
-        "amount_in": amount.clone(),
-        "amount_out": amount,
+        "amount_in": amount_in,
+        "amount_out": amount_out,
         "protocol_address": &evidence.protocol_address,
         "btc_tx_hash": &evidence.btc_tx_hash,
         "btc_vout": evidence.btc_vout,
         "hl_credit_hash": &evidence.hl_credit_hash,
     }))
+}
+
+fn hyperunit_deposit_credit_raw_amount(
+    operation: &OrderProviderOperation,
+    evidence: &HyperUnitDepositCreditedEvidence,
+) -> Result<Option<String>, OrderActivityError> {
+    let Some(output_asset) = operation
+        .request
+        .get("output_asset")
+        .and_then(Value::as_str)
+    else {
+        return Ok(None);
+    };
+    let Some(decimals) = hyperunit_hl_asset_decimals(output_asset) else {
+        return Ok(None);
+    };
+    decimal_to_raw_floor(
+        "HyperUnitDepositCredited hl_amount",
+        &evidence.hl_amount,
+        decimals,
+    )
+    .map(Some)
+}
+
+fn hyperunit_hl_asset_decimals(asset: &str) -> Option<u8> {
+    if asset.eq_ignore_ascii_case("UBTC") || asset.eq_ignore_ascii_case("BTC") {
+        Some(8)
+    } else if asset.eq_ignore_ascii_case("UETH") || asset.eq_ignore_ascii_case("ETH") {
+        Some(18)
+    } else if asset.eq_ignore_ascii_case("USDC") {
+        Some(6)
+    } else {
+        None
+    }
+}
+
+fn decimal_to_raw_floor(
+    label: &'static str,
+    value: &str,
+    decimals: u8,
+) -> Result<String, OrderActivityError> {
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(OrderActivityError::hint_verification(
+            label,
+            format!("invalid decimal amount {value}"),
+        ));
+    }
+
+    let decimals = usize::from(decimals);
+    let mut raw = String::with_capacity(whole.len() + decimals);
+    raw.push_str(whole.trim_start_matches('0'));
+    let used_fraction = fraction.len().min(decimals);
+    raw.push_str(&fraction[..used_fraction]);
+    for _ in used_fraction..decimals {
+        raw.push('0');
+    }
+
+    let raw = raw.trim_start_matches('0');
+    Ok(if raw.is_empty() {
+        "0".to_string()
+    } else {
+        raw.to_string()
+    })
 }
 
 fn hyperunit_withdrawal_settled_response(
@@ -3104,7 +3171,6 @@ pub(super) async fn verify_provider_observation_hint(
         | ProviderOperationType::CctpBridge
         | ProviderOperationType::CctpReceive
         | ProviderOperationType::HyperliquidBridgeDeposit
-        | ProviderOperationType::HypercoreBridgeDeposit
         | ProviderOperationType::HyperliquidBridgeWithdrawal => {
             let provider = deps
                 .action_providers
@@ -3580,6 +3646,60 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    #[test]
+    fn hyperunit_deposit_credit_response_records_actual_hl_amount_out() {
+        let operation = operation_with_request(
+            ProviderOperationType::UnitDeposit,
+            json!({
+                "amount": "49471",
+                "output_asset": "UBTC",
+                "dst_addr": "0xc533864eeeda1b8dfcbe12342b050f2c20b18fb2"
+            }),
+        );
+        let evidence = HyperUnitDepositCreditedEvidence {
+            protocol_address: "bc1pxy3qzqvn5grln84mau68a64rs569yqdv2w28ravlux3rwzp7mydqz9dz7a"
+                .to_string(),
+            btc_tx_hash: Some(
+                "73046be15a770d1d12cde2639e3abc04be40eabdc705a639b4b3d8297e49dfd1".to_string(),
+            ),
+            btc_vout: Some(0),
+            btc_amount: Some("49471".to_string()),
+            btc_confirmations: Some(6),
+            btc_block_height: Some(951181),
+            btc_block_hash: None,
+            hyperunit_operation_id: Some(
+                "73046be15a770d1d12cde2639e3abc04be40eabdc705a639b4b3d8297e49dfd1:0".to_string(),
+            ),
+            hyperunit_status: Some("done".to_string()),
+            hyperunit_source_tx_hash: Some(
+                "73046be15a770d1d12cde2639e3abc04be40eabdc705a639b4b3d8297e49dfd1:0".to_string(),
+            ),
+            hyperunit_destination_tx_hash: Some(
+                "0x574bafce69d9411f662a433896e74e4f153096fa:1779838885438".to_string(),
+            ),
+            source_chain: Some("bitcoin".to_string()),
+            evm_source_chain_id: None,
+            evm_source_tx_hash: None,
+            evm_source_block_number: None,
+            evm_source_block_hash: None,
+            evm_source_status: None,
+            hl_user: "0xc533864eeeda1b8dfcbe12342b050f2c20b18fb2".to_string(),
+            hl_amount: "0.000469874600000000".to_string(),
+            hl_credit_hash: "0xdfb8f3ef0561cc5ee132043c4fe4710202a900d4a064eb3083819f41c465a649"
+                .to_string(),
+            hl_credit_time_ms: 1_779_838_897_370,
+        };
+
+        let response = hyperunit_deposit_credited_response(&operation, &evidence).unwrap();
+
+        assert_eq!(response["amount_in"], json!("49471"));
+        assert_eq!(response["amount_out"], json!("46987"));
+        assert_eq!(
+            response["hl_credit_hash"],
+            json!("0xdfb8f3ef0561cc5ee132043c4fe4710202a900d4a064eb3083819f41c465a649")
+        );
     }
 
     #[test]

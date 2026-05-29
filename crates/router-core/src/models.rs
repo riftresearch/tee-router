@@ -590,7 +590,7 @@ pub enum ProviderOperationType {
     CctpBridge,
     CctpReceive,
     HyperliquidBridgeDeposit,
-    HypercoreBridgeDeposit,
+
     HyperliquidBridgeWithdrawal,
     UnitDeposit,
     UnitWithdrawal,
@@ -607,7 +607,7 @@ impl ProviderOperationType {
             Self::CctpBridge => "cctp_bridge",
             Self::CctpReceive => "cctp_receive",
             Self::HyperliquidBridgeDeposit => "hyperliquid_bridge_deposit",
-            Self::HypercoreBridgeDeposit => "hypercore_bridge_deposit",
+
             Self::HyperliquidBridgeWithdrawal => "hyperliquid_bridge_withdrawal",
             Self::UnitDeposit => "unit_deposit",
             Self::UnitWithdrawal => "unit_withdrawal",
@@ -623,7 +623,7 @@ impl ProviderOperationType {
             "cctp_bridge" => Some(Self::CctpBridge),
             "cctp_receive" => Some(Self::CctpReceive),
             "hyperliquid_bridge_deposit" => Some(Self::HyperliquidBridgeDeposit),
-            "hypercore_bridge_deposit" => Some(Self::HypercoreBridgeDeposit),
+
             "hyperliquid_bridge_withdrawal" => Some(Self::HyperliquidBridgeWithdrawal),
             "unit_deposit" => Some(Self::UnitDeposit),
             "unit_withdrawal" => Some(Self::UnitWithdrawal),
@@ -1150,7 +1150,7 @@ pub enum OrderExecutionStepType {
     CctpBurn,
     CctpReceive,
     HyperliquidBridgeDeposit,
-    HypercoreBridgeDeposit,
+
     HyperliquidBridgeWithdrawal,
     UnitDeposit,
     UnitWithdrawal,
@@ -1170,7 +1170,7 @@ impl OrderExecutionStepType {
             Self::CctpBurn => "cctp_burn",
             Self::CctpReceive => "cctp_receive",
             Self::HyperliquidBridgeDeposit => "hyperliquid_bridge_deposit",
-            Self::HypercoreBridgeDeposit => "hypercore_bridge_deposit",
+
             Self::HyperliquidBridgeWithdrawal => "hyperliquid_bridge_withdrawal",
             Self::UnitDeposit => "unit_deposit",
             Self::UnitWithdrawal => "unit_withdrawal",
@@ -1189,7 +1189,6 @@ impl OrderExecutionStepType {
             "cctp_burn" => Some(Self::CctpBurn),
             "cctp_receive" => Some(Self::CctpReceive),
             "hyperliquid_bridge_deposit" => Some(Self::HyperliquidBridgeDeposit),
-            "hypercore_bridge_deposit" => Some(Self::HypercoreBridgeDeposit),
             "hyperliquid_bridge_withdrawal" => Some(Self::HyperliquidBridgeWithdrawal),
             "unit_deposit" => Some(Self::UnitDeposit),
             "unit_withdrawal" => Some(Self::UnitWithdrawal),

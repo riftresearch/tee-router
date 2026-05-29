@@ -95,10 +95,6 @@ services:
       ETH_RPC_URL: ${ETH_RPC_URL:?ETH_RPC_URL is required}
       BASE_RPC_URL: ${BASE_RPC_URL:?BASE_RPC_URL is required}
       ARBITRUM_RPC_URL: ${ARBITRUM_RPC_URL:?ARBITRUM_RPC_URL is required}
-      HYPEREVM_RPC_URL: ${HYPEREVM_RPC_URL:?HYPEREVM_RPC_URL is required}
-      HYPEREVM_ALLOWED_TOKEN: ${HYPEREVM_ALLOWED_TOKEN:?HYPEREVM_ALLOWED_TOKEN is required}
-      HYPEREVM_MIN_CONFIRMATIONS: ${HYPEREVM_MIN_CONFIRMATIONS:?HYPEREVM_MIN_CONFIRMATIONS is required}
-      HYPEREVM_ESTIMATED_BLOCK_TIME_MS: ${HYPEREVM_ESTIMATED_BLOCK_TIME_MS:?HYPEREVM_ESTIMATED_BLOCK_TIME_MS is required}
       BITCOIN_RPC_URL: ${BITCOIN_RPC_URL:?BITCOIN_RPC_URL is required}
       BITCOIN_RPC_AUTH: ${BITCOIN_RPC_AUTH:?BITCOIN_RPC_AUTH is required}
       ELECTRUM_HTTP_SERVER_URL: ${ELECTRUM_HTTP_SERVER_URL:?ELECTRUM_HTTP_SERVER_URL is required}
@@ -106,7 +102,6 @@ services:
       ETHEREUM_PAYMASTER_PRIVATE_KEY: ${ETHEREUM_PAYMASTER_PRIVATE_KEY:?ETHEREUM_PAYMASTER_PRIVATE_KEY is required}
       BASE_PAYMASTER_PRIVATE_KEY: ${BASE_PAYMASTER_PRIVATE_KEY:?BASE_PAYMASTER_PRIVATE_KEY is required}
       ARBITRUM_PAYMASTER_PRIVATE_KEY: ${ARBITRUM_PAYMASTER_PRIVATE_KEY:?ARBITRUM_PAYMASTER_PRIVATE_KEY is required}
-      HYPEREVM_PAYMASTER_PRIVATE_KEY: ${HYPEREVM_PAYMASTER_PRIVATE_KEY:?HYPEREVM_PAYMASTER_PRIVATE_KEY is required}
       HYPERLIQUID_PAYMASTER_PRIVATE_KEY: ${HYPERLIQUID_PAYMASTER_PRIVATE_KEY:?HYPERLIQUID_PAYMASTER_PRIVATE_KEY is required}
       BITCOIN_PAYMASTER_PRIVATE_KEY: ${BITCOIN_PAYMASTER_PRIVATE_KEY:-}
       ROUTER_DETECTOR_API_KEY: ${ROUTER_DETECTOR_API_KEY:?ROUTER_DETECTOR_API_KEY is required}
@@ -146,10 +141,6 @@ services:
         condition: service_healthy
       evm-token-indexer-arbitrum:
         condition: service_healthy
-      evm-token-indexer-hyperevm:
-        condition: service_healthy
-      evm-receipt-watcher-hyperevm:
-        condition: service_started
     environment:
       DEPLOYMENT_ENVIRONMENT: live-local
       TEE_ROUTER_LIVE_LOCAL_ACK: ${TEE_ROUTER_LIVE_LOCAL_ACK:?set TEE_ROUTER_LIVE_LOCAL_ACK=I_UNDERSTAND_THIS_USES_REAL_FUNDS}
@@ -163,15 +154,12 @@ services:
       ETH_RPC_URL: ${ETH_RPC_URL:?ETH_RPC_URL is required}
       BASE_RPC_URL: ${BASE_RPC_URL:?BASE_RPC_URL is required}
       ARBITRUM_RPC_URL: ${ARBITRUM_RPC_URL:?ARBITRUM_RPC_URL is required}
-      HYPEREVM_RPC_URL: ${HYPEREVM_RPC_URL:?HYPEREVM_RPC_URL is required}
       ETHEREUM_TOKEN_INDEXER_URL: http://evm-token-indexer-ethereum:4001
       BASE_TOKEN_INDEXER_URL: http://evm-token-indexer-base:4001
       ARBITRUM_TOKEN_INDEXER_URL: http://evm-token-indexer-arbitrum:4001
-      HYPEREVM_TOKEN_INDEXER_URL: http://evm-token-indexer-hyperevm:4001
       ETHEREUM_RECEIPT_WATCHER_URL: http://evm-receipt-watcher-ethereum:8080
       BASE_RECEIPT_WATCHER_URL: http://evm-receipt-watcher-base:8080
       ARBITRUM_RECEIPT_WATCHER_URL: http://evm-receipt-watcher-arbitrum:8080
-      HYPEREVM_RECEIPT_WATCHER_URL: http://evm-receipt-watcher-hyperevm:8080
       BITCOIN_INDEXER_URL: ${BITCOIN_INDEXER_URL:-http://bitcoin-indexer:8080}
       BITCOIN_RECEIPT_WATCHER_URL: ${BITCOIN_RECEIPT_WATCHER_URL:-http://bitcoin-receipt-watcher:8080}
       TOKEN_INDEXER_API_KEY: ${TOKEN_INDEXER_API_KEY:?TOKEN_INDEXER_API_KEY is required}
@@ -211,23 +199,6 @@ services:
       EVM_RECEIPT_WATCHER_HTTP_RPC_URL: ${ARBITRUM_RPC_URL:?ARBITRUM_RPC_URL is required}
       EVM_RECEIPT_WATCHER_WS_RPC_URL: ${ARBITRUM_WS_RPC_URL:?ARBITRUM_WS_RPC_URL is required}
       EVM_RECEIPT_WATCHER_POLL_INTERVAL_MS: ${EVM_RECEIPT_WATCHER_POLL_INTERVAL_MS:-2000}
-  evm-receipt-watcher-hyperevm:
-    build:
-      context: ..
-      dockerfile: etc/Dockerfile.evm-receipt-watcher
-    restart: on-failure
-    <<: *live-host-gateway
-    environment:
-      RUST_LOG: info
-      EVM_RECEIPT_WATCHER_CHAIN: hyperevm
-      EVM_RECEIPT_WATCHER_BIND: 0.0.0.0:8080
-      DEPLOYMENT_ENVIRONMENT: live-local
-      EVM_RECEIPT_WATCHER_HTTP_RPC_URL: ${HYPEREVM_RPC_URL:?HYPEREVM_RPC_URL is required}
-      EVM_RECEIPT_WATCHER_POLL_INTERVAL_MS: ${EVM_RECEIPT_WATCHER_POLL_INTERVAL_MS:-2000}
-    ports:
-      - "50118:8080"
-    expose:
-      - "8080"
 
   bitcoin-indexer:
     <<: *live-host-gateway
@@ -309,20 +280,6 @@ services:
       interval: 5s
       timeout: 5s
       retries: 20
-  evm-token-indexer-hyperevm-db:
-    image: postgres:16-alpine
-    command: *live-token-indexer-db-command
-    environment:
-      POSTGRES_USER: ponder
-      POSTGRES_PASSWORD: ponder
-      POSTGRES_DB: ponder
-    volumes:
-      - router_live_local_token_indexer_hyperevm_db:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ponder -d ponder"]
-      interval: 5s
-      timeout: 5s
-      retries: 20
 
 
   evm-token-indexer-ethereum:
@@ -372,24 +329,9 @@ services:
       PONDER_SCHEMA: tokens_arbitrum
     ports:
       - "4003:4001"
-  evm-token-indexer-hyperevm:
-    <<: *live-token-indexer-service
-    depends_on:
-      evm-token-indexer-hyperevm-db:
-        condition: service_healthy
-    environment:
-      <<: *live-token-indexer-env
-      PONDER_CHAIN_ID: "999"
-      PONDER_RPC_URL_HTTP: ${HYPEREVM_RPC_URL:?HYPEREVM_RPC_URL is required}
-      DATABASE_URL: postgres://ponder:ponder@evm-token-indexer-hyperevm-db:5432/ponder
-      DATABASE_SCHEMA: tokens_hyperevm
-      PONDER_SCHEMA: tokens_hyperevm
-    ports:
-      - "4004:4001"
 
 
 volumes:
   router_live_local_token_indexer_ethereum_db:
   router_live_local_token_indexer_base_db:
   router_live_local_token_indexer_arbitrum_db:
-  router_live_local_token_indexer_hyperevm_db:

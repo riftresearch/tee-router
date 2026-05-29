@@ -170,6 +170,7 @@ fn detected_from_output(watch: &WatchEntry, output: TxOutput) -> DetectedDeposit
         execution_step_id: watch.execution_step_id,
         source_chain: ChainType::Bitcoin,
         source_token: TokenIdentifier::Native,
+        source_asset_id: "native".to_string(),
         address: watch.address.clone(),
         sender_addresses: Vec::new(),
         tx_hash: output.txid.to_string(),

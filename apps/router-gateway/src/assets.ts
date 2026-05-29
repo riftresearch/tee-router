@@ -35,7 +35,8 @@ const CHAIN_ALIASES: Record<string, { chainId: string; display: string }> = {
   arbitrum: { chainId: 'evm:42161', display: 'Arbitrum' },
   arb: { chainId: 'evm:42161', display: 'Arbitrum' },
   base: { chainId: 'evm:8453', display: 'Base' },
-  hyperevm: { chainId: 'evm:999', display: 'HyperEVM' }
+  hyperliquid: { chainId: 'hyperliquid', display: 'Hyperliquid' },
+  hl: { chainId: 'hyperliquid', display: 'Hyperliquid' }
 }
 
 const KNOWN_ASSETS: KnownAsset[] = [
@@ -51,7 +52,11 @@ const KNOWN_ASSETS: KnownAsset[] = [
   known('evm:8453', 'Base', 'USDC', '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913', 6),
   known('evm:8453', 'Base', 'USDT', '0xfde4c96c8593536e31f229ea8f37b2ada2699bb2', 6),
   known('evm:8453', 'Base', 'CBBTC', '0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf', 8),
-  known('evm:999', 'HyperEVM', 'USDC', '0xb88339cb7199b77e23db6e890353e22632ba630f', 6)
+  known('hyperliquid', 'Hyperliquid', 'UBTC', 'UBTC', 8),
+  known('hyperliquid', 'Hyperliquid', 'UETH', 'UETH', 18),
+  known('hyperliquid', 'Hyperliquid', 'USDC', 'native', 6),
+  known('hyperliquid', 'Hyperliquid', 'USDT', 'USDT', 6),
+  known('hyperliquid', 'Hyperliquid', 'HYPE', 'HYPE', 8),
 ]
 
 const KNOWN_BY_CHAIN_SYMBOL = new Map(
@@ -215,7 +220,7 @@ export function assertAddressMatchesChain(
   field: string,
   options: AddressValidationOptions = {}
 ): void {
-  if (chainId.startsWith('evm:') && !isAddress(address)) {
+  if ((chainId.startsWith('evm:') || chainId === 'hyperliquid') && !isAddress(address)) {
     throw new GatewayValidationError(`${field} must be a valid EVM address`, {
       field,
       chain: chainId
@@ -236,7 +241,7 @@ export function assertAddressMatchesChain(
     })
   }
 
-  if (!chainId.startsWith('evm:') && chainId !== 'bitcoin') {
+  if (!chainId.startsWith('evm:') && chainId !== 'bitcoin' && chainId !== 'hyperliquid') {
     throw new GatewayValidationError(
       `${field} cannot be validated for unsupported chain`,
       {
@@ -340,11 +345,15 @@ function known(
   asset: string,
   decimals: number
 ): KnownAsset {
+  const normalizedAsset =
+    asset.startsWith('0x') || asset.toLowerCase() === 'native'
+      ? asset.toLowerCase()
+      : asset
   return {
     chainId,
     chainDisplay,
     symbol,
-    asset: asset.toLowerCase(),
+    asset: normalizedAsset,
     decimals
   }
 }

@@ -5,9 +5,8 @@ pub mod route_cost_repo;
 pub mod vault_repo;
 
 pub use order_repo::{
-    BoundaryRequoteExecutionAttemptPlan, CompletedExecutionOrder,
-    ExecutionAttemptMaterializationRecord, ExecutionAttemptPlan, ExecutionStepLatencyRecord,
-    ExternalCustodyRefundAttemptPlan, FundingVaultRefundAttemptPlan,
+    CompletedExecutionOrder, ExecutionAttemptMaterializationRecord, ExecutionAttemptPlan,
+    ExecutionStepLatencyRecord, ExternalCustodyRefundAttemptPlan, FundingVaultRefundAttemptPlan,
     HyperliquidSpotRefundAttemptPlan, OrderExecutorWaitTotal, OrderRepository,
     PersistStepCompletionRecord, RefreshedExecutionAttemptPlan, StepCompletionRecord,
 };

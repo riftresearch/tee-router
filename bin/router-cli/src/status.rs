@@ -15,8 +15,7 @@ pub struct StatusArgs {
 }
 
 pub async fn run(args: StatusArgs) -> Result<()> {
-    let client =
-        GatewayClient::new(args.gateway_url).wrap_err("invalid --gateway-url")?;
+    let client = GatewayClient::new(args.gateway_url).wrap_err("invalid --gateway-url")?;
     loop {
         let order = client
             .get_order(&args.order_id)
