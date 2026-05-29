@@ -357,7 +357,6 @@ fn chain_label(chain: &ChainId) -> &'static str {
         "evm:1" => "evm:1",
         "evm:42161" => "evm:42161",
         "evm:8453" => "evm:8453",
-        "evm:999" => "evm:999",
         "hyperliquid" => "hyperliquid",
         _ => "unsupported",
     }

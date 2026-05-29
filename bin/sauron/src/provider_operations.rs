@@ -448,6 +448,8 @@ mod tests {
             assert!(query.contains("opo.execution_step_id::text AS execution_step_id"));
             assert!(query.contains("JOIN public.order_execution_steps oes"));
             assert!(query.contains("oes.status IN ('running', 'waiting')"));
+            assert!(query.contains("hyperliquid_bridge_deposit"));
+            assert!(query.contains("hyperliquid_bridge_withdrawal"));
         }
     }
 

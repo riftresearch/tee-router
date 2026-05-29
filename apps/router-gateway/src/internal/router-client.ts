@@ -22,6 +22,18 @@ export type InternalDepositAsset = {
   asset: string
 }
 
+export type InternalProviderId =
+  | 'across'
+  | 'cctp'
+  | 'unit'
+  | 'hyperliquid_bridge'
+  | 'hyperliquid'
+  | 'velora'
+
+export type InternalQuoteRouting = {
+  provider_sequence?: InternalProviderId[]
+}
+
 export type InternalQuoteEnvelope = {
   quote: InternalRouterOrderQuote
 }
@@ -91,6 +103,7 @@ export type CreateQuoteRequest =
       to_asset: InternalDepositAsset
       recipient_address: string
       amount_in: string
+      routing?: InternalQuoteRouting
     }
   | {
       type: 'limit_order'

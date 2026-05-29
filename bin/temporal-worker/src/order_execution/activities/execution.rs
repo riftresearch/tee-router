@@ -99,18 +99,6 @@ impl OrderActivities {
         })
         .await
     }
-    #[activity]
-    pub async fn dispatch_hypercore_bridge_deposit_step(
-        self: Arc<Self>,
-        _ctx: ActivityContext,
-        input: DispatchStepInput,
-    ) -> Result<StepDispatched, ActivityError> {
-        record_activity("dispatch_hypercore_bridge_deposit_step", async move {
-            let deps = self.deps()?;
-            run_step_dispatch(&deps, input, OrderExecutionStepType::HypercoreBridgeDeposit).await
-        })
-        .await
-    }
 
     #[activity]
     pub async fn dispatch_hyperliquid_bridge_withdrawal_step(
@@ -1920,7 +1908,14 @@ pub(super) fn leg_already_crossed_provider_boundary(
 
 pub(super) fn provider_operation_step_response(operation: &OrderProviderOperation) -> Value {
     if !is_empty_json_object(&operation.response) {
-        return operation.response.clone();
+        let mut response = operation.response.clone();
+        if !is_empty_json_object(&operation.observed_state)
+            && response.is_object()
+            && response.get("observed_state").is_none()
+        {
+            response["observed_state"] = operation.observed_state.clone();
+        }
+        return response;
     }
     json!({
         "kind": "provider_status_update",
@@ -1992,10 +1987,6 @@ const CCTP_RECEIVE_DISPATCH: StepDispatch = StepDispatch {
 const HYPERLIQUID_BRIDGE_DEPOSIT_DISPATCH: StepDispatch = StepDispatch {
     execute: execute_hyperliquid_bridge_deposit_step,
 };
-const HYPERCORE_BRIDGE_DEPOSIT_DISPATCH: StepDispatch = StepDispatch {
-    execute: execute_hypercore_bridge_deposit_step,
-};
-
 const HYPERLIQUID_BRIDGE_WITHDRAWAL_DISPATCH: StepDispatch = StepDispatch {
     execute: execute_hyperliquid_bridge_withdrawal_step,
 };
@@ -2026,7 +2017,6 @@ fn step_dispatch(step_type: OrderExecutionStepType) -> &'static StepDispatch {
         OrderExecutionStepType::CctpBurn => &CCTP_BURN_DISPATCH,
         OrderExecutionStepType::CctpReceive => &CCTP_RECEIVE_DISPATCH,
         OrderExecutionStepType::HyperliquidBridgeDeposit => &HYPERLIQUID_BRIDGE_DEPOSIT_DISPATCH,
-        OrderExecutionStepType::HypercoreBridgeDeposit => &HYPERCORE_BRIDGE_DEPOSIT_DISPATCH,
         OrderExecutionStepType::HyperliquidBridgeWithdrawal => {
             &HYPERLIQUID_BRIDGE_WITHDRAWAL_DISPATCH
         }
@@ -2087,6 +2077,13 @@ pub(super) async fn execute_running_step(
             match prepare_provider_completion(deps, step, intent).await {
                 Ok(completion) => Ok(completion),
                 Err(error) => {
+                    tracing::warn!(
+                        order_id = %step.order_id,
+                        step_id = %step.id,
+                        provider = %step.provider,
+                        error = %error,
+                        "provider side effect failed before completion could be persisted"
+                    );
                     if let Some((operation_type, idempotency_key)) = persisted_operation {
                         fail_planned_provider_operation(
                             deps,
@@ -2271,17 +2268,6 @@ fn execute_hyperliquid_bridge_deposit_step<'a>(
         step,
         ProviderOperationType::HyperliquidBridgeDeposit,
         BridgeExecutionRequest::hyperliquid_bridge_deposit_from_value,
-    )
-}
-fn execute_hypercore_bridge_deposit_step<'a>(
-    deps: &'a OrderActivityDeps,
-    step: &'a OrderExecutionStep,
-) -> StepDispatchFuture<'a> {
-    execute_idempotent_bridge_step(
-        deps,
-        step,
-        ProviderOperationType::HypercoreBridgeDeposit,
-        BridgeExecutionRequest::hypercore_bridge_deposit_from_value,
     )
 }
 
@@ -2896,6 +2882,20 @@ async fn apply_authoritative_output_observation_to_response(
         return Ok(());
     }
 
+    if let Some(amount) =
+        cctp_receive_recipient_observation_amount(step, response).map(str::to_owned)
+    {
+        apply_authoritative_recipient_observation_to_response(step, response, &amount);
+        return Ok(());
+    }
+
+    if let Some(amount) =
+        hyperliquid_spot_transfer_recipient_observation_amount(step, response).map(str::to_owned)
+    {
+        apply_authoritative_recipient_observation_to_response(step, response, &amount);
+        return Ok(());
+    }
+
     if let Some(claim_amount) = authoritative_claim_amount(step, response).map(str::to_owned) {
         apply_authoritative_claim_observation_to_response(step, response, &claim_amount);
     }
@@ -2949,6 +2949,95 @@ fn apply_authoritative_claim_observation_to_response(
     );
 }
 
+fn cctp_receive_recipient_observation_amount<'a>(
+    step: &OrderExecutionStep,
+    response: &'a Value,
+) -> Option<&'a str> {
+    if step.step_type != OrderExecutionStepType::CctpReceive {
+        return None;
+    }
+    step.request
+        .get("recipient_address")
+        .and_then(Value::as_str)
+        .filter(|address| !address.is_empty())?;
+    for pointer in ["/observed_state/evidence/amount", "/evidence/amount"] {
+        if let Some(amount) = response.pointer(pointer).and_then(decimal_string) {
+            return Some(amount);
+        }
+    }
+    None
+}
+
+fn hyperliquid_spot_transfer_recipient_observation_amount<'a>(
+    step: &'a OrderExecutionStep,
+    response: &Value,
+) -> Option<&'a str> {
+    if !hyperliquid_spot_transfer_to_external_recipient(step) {
+        return None;
+    }
+    response
+        .pointer("/observed_state/kind")
+        .and_then(Value::as_str)
+        .filter(|kind| *kind == "spot_transfer")?;
+    response
+        .pointer("/observed_state/tx_hash")
+        .and_then(Value::as_str)
+        .filter(|tx_hash| !tx_hash.is_empty())?;
+    step.request.get("amount_out").and_then(decimal_string)
+}
+
+fn hyperliquid_spot_transfer_to_external_recipient(step: &OrderExecutionStep) -> bool {
+    if step.step_type != OrderExecutionStepType::HyperliquidTrade {
+        return false;
+    }
+    if step
+        .request
+        .get("recipient_address")
+        .and_then(Value::as_str)
+        .filter(|address| !address.is_empty())
+        .is_none()
+    {
+        return false;
+    }
+    let Some(input_asset) = step.input_asset.as_ref() else {
+        return false;
+    };
+    let Some(output_asset) = step.output_asset.as_ref() else {
+        return false;
+    };
+    input_asset.chain.as_str() == "hyperliquid"
+        && output_asset.chain.as_str() == "hyperliquid"
+        && input_asset.asset == output_asset.asset
+}
+
+fn apply_authoritative_recipient_observation_to_response(
+    step: &OrderExecutionStep,
+    response: &mut Value,
+    amount: &str,
+) {
+    if !response.is_object() {
+        *response = json!({});
+    }
+    strip_provider_reported_output_amounts(response);
+    let output_asset = step.output_asset.as_ref();
+    let object = response.as_object_mut().expect("response is object");
+    object.insert("amount_out".to_string(), json!(amount));
+    object.insert(
+        "balance_observation".to_string(),
+        json!({
+            "amount_out_source": "provider_observed_recipient_transfer",
+            "output": {
+                "role": "destination",
+                "location": "external_recipient",
+                "chain_id": output_asset.map(|asset| asset.chain.to_string()),
+                "asset_id": output_asset.map(|asset| asset.asset.to_string()),
+                "address": step.request.get("recipient_address").and_then(Value::as_str),
+                "balance": amount,
+                "spendable_balance": amount,
+            },
+        }),
+    );
+}
 fn strip_provider_reported_output_amounts(response: &mut Value) {
     let Some(object) = response.as_object_mut() else {
         return;
@@ -3112,6 +3201,9 @@ async fn hyperliquid_output_custody_vault(
     step: &OrderExecutionStep,
     output_asset: &DepositAsset,
 ) -> Result<Option<CustodyVault>, OrderActivityError> {
+    if hyperliquid_spot_transfer_to_external_recipient(step) {
+        return Ok(None);
+    }
     if let Some(vault_id) = optional_request_uuid_field(step, "hyperliquid_custody_vault_id")? {
         return deps
             .db
@@ -3178,7 +3270,14 @@ fn output_custody_vault_id(step: &OrderExecutionStep) -> Result<Option<Uuid>, Or
     if let Some(vault_id) = optional_request_uuid_field(step, "recipient_custody_vault_id")? {
         return Ok(Some(vault_id));
     }
-    if step.step_type == OrderExecutionStepType::CctpReceive {
+    if step.step_type == OrderExecutionStepType::CctpReceive
+        && step
+            .request
+            .get("recipient_address")
+            .and_then(Value::as_str)
+            .filter(|address| !address.is_empty())
+            .is_none()
+    {
         return optional_request_uuid_field(step, "source_custody_vault_id");
     }
     Ok(None)

@@ -68,7 +68,6 @@ pub struct EvmReceiptObserverClients {
     pub(crate) ethereum: Option<Arc<EvmReceiptWatcherClient>>,
     pub(crate) base: Option<Arc<EvmReceiptWatcherClient>>,
     pub(crate) arbitrum: Option<Arc<EvmReceiptWatcherClient>>,
-    pub(crate) hyperevm: Option<Arc<EvmReceiptWatcherClient>>,
 }
 
 impl EvmReceiptObserverClients {
@@ -76,15 +75,13 @@ impl EvmReceiptObserverClients {
         let ethereum = receipt_client("ethereum", args.ethereum_receipt_watcher_url.as_deref())?;
         let base = receipt_client("base", args.base_receipt_watcher_url.as_deref())?;
         let arbitrum = receipt_client("arbitrum", args.arbitrum_receipt_watcher_url.as_deref())?;
-        let hyperevm = receipt_client("hyperevm", args.hyperevm_receipt_watcher_url.as_deref())?;
-        if ethereum.is_none() && base.is_none() && arbitrum.is_none() && hyperevm.is_none() {
+        if ethereum.is_none() && base.is_none() && arbitrum.is_none() {
             return Ok(None);
         }
         Ok(Some(Self {
             ethereum,
             base,
             arbitrum,
-            hyperevm,
         }))
     }
 
@@ -93,7 +90,6 @@ impl EvmReceiptObserverClients {
             Some(1) => self.ethereum.clone(),
             Some(8453) => self.base.clone(),
             Some(42161) => self.arbitrum.clone(),
-            Some(999) => self.hyperevm.clone(),
             _ => None,
         }
     }

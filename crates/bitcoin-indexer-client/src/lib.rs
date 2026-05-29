@@ -221,14 +221,12 @@ impl BitcoinIndexerClient {
     /// startup; cheap (one HTTP GET).
     pub async fn assert_network_matches(&self, expected: Network) -> Result<()> {
         let resp = self.health().await?;
-        let reported = resp.network.parse::<Network>().map_err(|_| {
-            Error::HealthResponse {
-                reason: format!(
-                    "indexer returned unrecognized network {:?}",
-                    resp.network
-                ),
-            }
-        })?;
+        let reported = resp
+            .network
+            .parse::<Network>()
+            .map_err(|_| Error::HealthResponse {
+                reason: format!("indexer returned unrecognized network {:?}", resp.network),
+            })?;
         if reported != expected {
             return Err(Error::NetworkMismatch {
                 expected: expected.to_string(),

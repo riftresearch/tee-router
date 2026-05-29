@@ -2053,7 +2053,6 @@ fn test_action_providers(
         }),
         hyperliquid_network: HyperliquidCallNetwork::Testnet,
         hyperliquid_order_timeout_ms: 30_000,
-        hypercore_bridge_enabled: false,
     })
     .expect("action providers")
 }

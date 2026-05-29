@@ -19,6 +19,26 @@ import {
   QuoteResponseSchema
 } from './schemas'
 
+const ProviderIdSchema = z.enum([
+  'across',
+  'cctp',
+  'unit',
+  'hyperliquid_bridge',
+  'hyperliquid',
+  'velora'
+])
+
+const QuoteRoutingSchema = z
+  .object({
+    providerSequence: z.array(ProviderIdSchema).min(1).max(5).optional().openapi({
+      description:
+        'Exact provider sequence the selected transition path must use. This filters candidate routes before quote hydration; it does not bypass provider quoting or execution validation.',
+      example: ['velora', 'cctp']
+    })
+  })
+  .strict()
+  .openapi('QuoteRouting')
+
 export const QuoteRequestSchema = z
   .object({
     from: AssetIdentifierSchema.openapi({
@@ -48,6 +68,10 @@ export const QuoteRequestSchema = z
       }),
     fromAmount: AmountStringSchema.optional().openapi({
       example: '10'
+    }),
+    routing: QuoteRoutingSchema.optional().openapi({
+      description:
+        'Optional route-selection constraints. providerSequence is an exact transition-provider sequence.'
     })
   })
   .strict()
@@ -139,6 +163,13 @@ export function createQuoteHandler(
         return c.json(presentQuoteEnvelope(envelope, amountFormat), 201)
       }
 
+      const routing =
+        request.routing?.providerSequence === undefined
+          ? undefined
+          : {
+              provider_sequence: request.routing.providerSequence
+            }
+
       const envelope = await routerClientFor(config, deps).createQuote({
         type: 'market_order',
         from_asset: source.internal,
@@ -149,7 +180,8 @@ export function createQuoteHandler(
           source,
           amountFormat,
           'fromAmount'
-        )
+        ),
+        ...(routing === undefined ? {} : { routing })
       })
 
       return c.json(presentQuoteEnvelope(envelope, amountFormat), 201)

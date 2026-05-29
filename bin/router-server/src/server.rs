@@ -406,6 +406,7 @@ async fn create_quote(
     ensure_order_intake_enabled(&state).await?;
     let envelope = match request {
         CreateQuoteRequest::MarketOrder(market_order) => {
+            let (market_order, routing) = market_order.into_parts();
             screen_user_address(
                 &state,
                 AddressScreeningPurpose::Recipient,
@@ -413,7 +414,10 @@ async fn create_quote(
                 &market_order.recipient_address,
             )
             .await?;
-            state.order_manager.quote_market_order(market_order).await?
+            state
+                .order_manager
+                .quote_market_order_with_routing(market_order, routing)
+                .await?
         }
         CreateQuoteRequest::LimitOrder(_limit_order) => {
             return Err(limit_orders_disabled_error());
@@ -885,7 +889,6 @@ fn provider_hint_shape_for_operation(
             (ProviderKind::Unit, ProviderHintKind::ProviderObservation)
         }
         ProviderOperationType::HyperliquidBridgeDeposit
-        | ProviderOperationType::HypercoreBridgeDeposit
         | ProviderOperationType::HyperliquidBridgeWithdrawal => {
             (ProviderKind::Bridge, ProviderHintKind::ProviderObservation)
         }

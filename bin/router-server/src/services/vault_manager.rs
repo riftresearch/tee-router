@@ -439,7 +439,7 @@ impl VaultManager {
     fn vault_supports_balance_reconciliation(&self, vault: &DepositVault) -> bool {
         matches!(
             backend_chain_for_id(&vault.deposit_asset.chain),
-            Some(ChainType::Ethereum | ChainType::Arbitrum | ChainType::Base | ChainType::Hyperevm)
+            Some(ChainType::Ethereum | ChainType::Arbitrum | ChainType::Base)
         )
     }
 
@@ -695,10 +695,9 @@ impl VaultManager {
                 self.refund_bitcoin(&vault, deposit_wallet.private_key())
                     .await
             }
-            ChainType::Ethereum
-            | ChainType::Arbitrum
-            | ChainType::Base
-            | ChainType::Hyperevm => self.refund_evm(&vault, deposit_wallet.private_key()).await,
+            ChainType::Ethereum | ChainType::Arbitrum | ChainType::Base => {
+                self.refund_evm(&vault, deposit_wallet.private_key()).await
+            }
             ChainType::Hyperliquid => {
                 Err("hyperliquid vaults are never user-funded so have no refund path".to_string())
             }
@@ -955,10 +954,7 @@ impl VaultManager {
                         })?,
                 ))
             }
-            ChainType::Ethereum
-            | ChainType::Arbitrum
-            | ChainType::Base
-            | ChainType::Hyperevm => {
+            ChainType::Ethereum | ChainType::Arbitrum | ChainType::Base => {
                 let evm_chain = self.chain_registry.get_evm(&backend_chain).ok_or(
                     VaultError::ChainNotSupported {
                         chain: vault.deposit_asset.chain.clone(),
@@ -1031,6 +1027,9 @@ impl VaultManager {
             return self
                 .is_bitcoin_mempool_hint_spendable(vault, hint, required_amount)
                 .await;
+        }
+        if backend_chain == ChainType::Hyperliquid {
+            return is_hyperliquid_vault_funded_by_hint(vault, hint, required_amount);
         }
         let visible_balance = self.vault_visible_balance(vault).await?;
         if let Some(observed_amount) = funding_hint_observed_amount(hint)? {
@@ -1141,10 +1140,7 @@ impl VaultManager {
                     reason: "bitcoin vaults only support the native asset".to_string(),
                 }),
             },
-            ChainType::Ethereum
-            | ChainType::Arbitrum
-            | ChainType::Base
-            | ChainType::Hyperevm => {
+            ChainType::Ethereum | ChainType::Arbitrum | ChainType::Base => {
                 match &deposit_asset.asset {
                     AssetId::Native => Ok(deposit_asset.clone()),
                     AssetId::Reference(asset) => {
@@ -1158,9 +1154,15 @@ impl VaultManager {
                     }
                 }
             }
-            ChainType::Hyperliquid => Err(VaultError::ChainNotSupported {
-                chain: deposit_asset.chain.clone(),
-            }),
+            ChainType::Hyperliquid => {
+                validate_hyperliquid_spot_asset(deposit_asset).map_err(|reason| {
+                    VaultError::InvalidAssetId {
+                        asset: deposit_asset.asset.as_str().to_string(),
+                        chain: deposit_asset.chain.clone(),
+                        reason,
+                    }
+                })
+            }
         }
     }
 
@@ -1256,7 +1258,18 @@ impl VaultManager {
             reason: "metadata must be a JSON object".to_string(),
         })
     }
+}
 
+fn validate_hyperliquid_spot_asset(asset: &DepositAsset) -> Result<DepositAsset, String> {
+    if asset.chain.as_str() != "hyperliquid" {
+        return Err("expected hyperliquid chain".to_string());
+    }
+    match asset.asset.as_str() {
+        "native" | "UBTC" | "USDT" | "UETH" | "HYPE" => Ok(asset.clone()),
+        other => Err(format!(
+            "hyperliquid spot supports only UBTC, USDT, USDC, UETH, and HYPE, not {other}"
+        )),
+    }
 }
 
 fn refund_error_requires_admin_resolution(message: &str) -> bool {
@@ -1432,6 +1445,42 @@ fn funding_hint_observed_amount(hint: &DepositVaultFundingHint) -> VaultResult<O
     optional_decimal_u256_field(&hint.evidence, "amount")
 }
 
+fn is_hyperliquid_vault_funded_by_hint(
+    vault: &DepositVault,
+    hint: &DepositVaultFundingHint,
+    required_amount: U256,
+) -> VaultResult<bool> {
+    if vault.deposit_asset.chain.as_str() != "hyperliquid" {
+        return Ok(false);
+    }
+    let Some(observed_amount) = funding_hint_observed_amount(hint)? else {
+        return Ok(false);
+    };
+    if observed_amount < required_amount {
+        return Ok(false);
+    }
+    let recipient = optional_string_field(&hint.evidence, "recipient_address")?
+        .or(optional_string_field(&hint.evidence, "address")?)
+        .ok_or_else(|| VaultError::InvalidFundingHint {
+            reason: "hyperliquid funding hint missing recipient_address".to_string(),
+        })?;
+    if !recipient.eq_ignore_ascii_case(&vault.deposit_vault_address) {
+        return Ok(false);
+    }
+    let chain = optional_string_field(&hint.evidence, "chain")?;
+    if chain.as_deref().is_some_and(|chain| chain != "hyperliquid") {
+        return Ok(false);
+    }
+    let asset = optional_string_field(&hint.evidence, "asset_id")?;
+    if asset
+        .as_deref()
+        .is_some_and(|asset| asset != vault.deposit_asset.asset.as_str())
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 fn optional_decimal_u256_field(value: &Value, key: &'static str) -> VaultResult<Option<U256>> {
     let Some(raw) = value.get(key) else {
         return Ok(None);
@@ -1509,7 +1558,6 @@ fn bitcoin_refund_fee_sats(next_block_fee_rate_sat_per_vb: f64) -> Result<u64, S
     }
     Ok(fee as u64)
 }
-
 
 fn normalize_hex_32(value: &str) -> Result<String, String> {
     let bytes = decode_hex_32(value)?;

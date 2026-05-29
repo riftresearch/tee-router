@@ -2182,9 +2182,9 @@ async fn mock_velora_transaction(
             metadata: FixedBytes::<32>::ZERO,
             beneficiary: receiver,
         },
-        _2: U256::ZERO,             // partnerAndFee
-        _3: Bytes::new(),           // permit
-        _4: Bytes::new(),           // executorData
+        _2: U256::ZERO,   // partnerAndFee
+        _3: Bytes::new(), // permit
+        _4: Bytes::new(), // executorData
     };
     Json(json!({
         "network": network,
@@ -3281,10 +3281,7 @@ async fn mock_cctp_messages(
     let record = if let Some(tx_hash) = query.transaction_hash.as_deref() {
         burns.get(tx_hash).cloned()
     } else if let Some(nonce) = query.nonce.as_deref() {
-        burns
-            .values()
-            .find(|record| record.nonce == nonce)
-            .cloned()
+        burns.values().find(|record| record.nonce == nonce).cloned()
     } else {
         return error_response(
             StatusCode::BAD_REQUEST,

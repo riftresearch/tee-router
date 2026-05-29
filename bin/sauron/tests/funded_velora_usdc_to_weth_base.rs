@@ -61,11 +61,12 @@ async fn velora_v6_usdc_to_weth_base_swap() {
     }
 
     let timestamp = compact_utc_timestamp();
-    let log_dir = repo_root_live_test_logs()
-        .join(format!("{timestamp}--velora-usdc-to-weth-base"));
+    let log_dir = repo_root_live_test_logs().join(format!("{timestamp}--velora-usdc-to-weth-base"));
     fs::create_dir_all(&log_dir).expect("create log dir");
     let logger = Logger::open(log_dir.join("run.log"));
-    logger.log(&format!("starting Velora V6 1-USDC → WETH swap on Base at {timestamp}"));
+    logger.log(&format!(
+        "starting Velora V6 1-USDC → WETH swap on Base at {timestamp}"
+    ));
     logger.log(&format!("log dir: {}", log_dir.display()));
     let run_started = Instant::now();
 
@@ -114,7 +115,10 @@ async fn velora_v6_usdc_to_weth_base_swap() {
         .call()
         .await
         .expect("read USDC allowance");
-    logger.log(&format!("USDC allowance → AugustusV6: {}", format_usdc(&allowance)));
+    logger.log(&format!(
+        "USDC allowance → AugustusV6: {}",
+        format_usdc(&allowance)
+    ));
 
     if allowance < U256::from(SWAP_USDC_RAW) {
         logger.log("approving USDC → AugustusV6");
@@ -125,7 +129,10 @@ async fn velora_v6_usdc_to_weth_base_swap() {
             .expect("send approve tx");
         let approve_hash = *approve_pending.tx_hash();
         logger.log(&format!("approve tx: {approve_hash:?}"));
-        let approve_receipt = approve_pending.get_receipt().await.expect("approve receipt");
+        let approve_receipt = approve_pending
+            .get_receipt()
+            .await
+            .expect("approve receipt");
         write_json(
             &log_dir.join("approve-tx.json"),
             &serde_json::to_value(&approve_receipt).expect("serialize approve receipt"),
@@ -170,8 +177,7 @@ async fn velora_v6_usdc_to_weth_base_swap() {
         .get("destAmount")
         .and_then(|v| v.as_str())
         .expect("destAmount string");
-    let quote_dest_u256 =
-        U256::from_str_radix(quote_dest_amount, 10).expect("destAmount parses");
+    let quote_dest_u256 = U256::from_str_radix(quote_dest_amount, 10).expect("destAmount parses");
     let contract_method = price_route
         .get("contractMethod")
         .and_then(|v| v.as_str())
@@ -229,8 +235,15 @@ async fn velora_v6_usdc_to_weth_base_swap() {
     let calldata = alloy::hex::decode(tx_data_hex.trim_start_matches("0x")).expect("calldata hex");
 
     assert_eq!(tx_to, AUGUSTUS_V6, "tx.to mismatch (expected AugustusV6)");
-    assert_eq!(tx_value, U256::ZERO, "ERC-20 swap should not send native value");
-    logger.log(&format!("calldata: {} bytes, to: {tx_to:?}", calldata.len()));
+    assert_eq!(
+        tx_value,
+        U256::ZERO,
+        "ERC-20 swap should not send native value"
+    );
+    logger.log(&format!(
+        "calldata: {} bytes, to: {tx_to:?}",
+        calldata.len()
+    ));
 
     // ─── step 4: send the swap tx ────────────────────────────────────────
     // Velora's `/transactions` does not return a `gas` field when we pass
@@ -258,10 +271,7 @@ async fn velora_v6_usdc_to_weth_base_swap() {
         .expect("send swap tx");
     let swap_hash = *swap_pending.tx_hash();
     logger.log(&format!("swap tx: {swap_hash:?}"));
-    let swap_receipt = swap_pending
-        .get_receipt()
-        .await
-        .expect("swap tx receipt");
+    let swap_receipt = swap_pending.get_receipt().await.expect("swap tx receipt");
     write_json(
         &log_dir.join("swap-tx.json"),
         &serde_json::to_value(&swap_receipt).expect("serialize swap receipt"),
@@ -285,8 +295,8 @@ async fn velora_v6_usdc_to_weth_base_swap() {
 
     let usdc_delta = pre.usdc.saturating_sub(post.usdc);
     let weth_delta = post.weth.saturating_sub(pre.weth);
-    let min_acceptable = quote_dest_u256
-        - (quote_dest_u256 * U256::from(SLIPPAGE_BPS) / U256::from(10_000));
+    let min_acceptable =
+        quote_dest_u256 - (quote_dest_u256 * U256::from(SLIPPAGE_BPS) / U256::from(10_000));
     assert_eq!(
         usdc_delta,
         U256::from(SWAP_USDC_RAW),
@@ -359,7 +369,10 @@ End-to-end Velora V6 contract behavior matches the vendored ABI:
     );
     fs::write(log_dir.join("summary.md"), summary).expect("write summary.md");
 
-    logger.log(&format!("✓ run complete — artifacts in {}", log_dir.display()));
+    logger.log(&format!(
+        "✓ run complete — artifacts in {}",
+        log_dir.display()
+    ));
 }
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
@@ -462,8 +475,8 @@ fn compact_utc_timestamp() -> String {
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_secs();
-    let datetime = chrono::DateTime::<chrono::Utc>::from_timestamp(secs as i64, 0)
-        .expect("valid timestamp");
+    let datetime =
+        chrono::DateTime::<chrono::Utc>::from_timestamp(secs as i64, 0).expect("valid timestamp");
     datetime.format("%Y-%m-%dT%H-%M-%SZ").to_string()
 }
 
@@ -472,8 +485,8 @@ fn utc_now_iso() -> String {
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_secs();
-    let datetime = chrono::DateTime::<chrono::Utc>::from_timestamp(secs as i64, 0)
-        .expect("valid timestamp");
+    let datetime =
+        chrono::DateTime::<chrono::Utc>::from_timestamp(secs as i64, 0).expect("valid timestamp");
     datetime.format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 

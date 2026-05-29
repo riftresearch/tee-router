@@ -73,6 +73,7 @@ struct EvmWatchSnapshot {
     watch_id: Uuid,
     execution_step_id: Option<router_temporal::WorkflowStepId>,
     source_token: TokenIdentifier,
+    source_asset_id: String,
     address: String,
     token_address: Address,
     deposit_address: Address,
@@ -106,22 +107,10 @@ impl EvmIndexerDiscoveryBackend {
     }
 
     pub fn new_arbitrum(args: &SauronArgs) -> Result<Self> {
-        let url =
-            required_indexer_url("arbitrum_evm", args.arbitrum_token_indexer_url.as_deref())?;
+        let url = required_indexer_url("arbitrum_evm", args.arbitrum_token_indexer_url.as_deref())?;
         Self::new(
             "arbitrum_evm",
             ChainType::Arbitrum,
-            url,
-            args.token_indexer_api_key.clone(),
-            args.sauron_evm_indexed_lookup_concurrency,
-        )
-    }
-
-    pub fn new_hyperevm(args: &SauronArgs) -> Result<Self> {
-        let url = required_indexer_url("hyperevm_evm", args.hyperevm_token_indexer_url.as_deref())?;
-        Self::new(
-            "hyperevm_evm",
-            ChainType::Hyperevm,
             url,
             args.token_indexer_api_key.clone(),
             args.sauron_evm_indexed_lookup_concurrency,
@@ -185,13 +174,6 @@ impl EvmIndexerDiscoveryBackend {
             .transpose()
     }
 
-    pub fn maybe_hyperevm(args: &SauronArgs) -> Result<Option<Self>> {
-        args.hyperevm_token_indexer_url
-            .as_ref()
-            .map(|_| Self::new_hyperevm(args))
-            .transpose()
-    }
-
     fn watch_snapshot(&self, watch: &WatchEntry) -> Option<EvmWatchSnapshot> {
         let token_address = match &watch.source_token {
             TokenIdentifier::Native => return None,
@@ -228,6 +210,7 @@ impl EvmIndexerDiscoveryBackend {
             watch_id: watch.watch_id,
             execution_step_id: watch.execution_step_id,
             source_token: watch.source_token.clone(),
+            source_asset_id: watch.source_asset_id.clone(),
             address: watch.address.clone(),
             token_address,
             deposit_address,
@@ -467,6 +450,7 @@ impl EvmTransferMatcher {
             execution_step_id: watch.execution_step_id,
             source_chain: self.chain_type,
             source_token: watch.source_token.clone(),
+            source_asset_id: watch.source_asset_id.clone(),
             address: watch.address.clone(),
             sender_addresses: vec![transfer.from_address.to_string()],
             tx_hash: transfer.transaction_hash.to_string(),
@@ -540,7 +524,6 @@ fn evm_chain_id(chain: ChainType) -> Option<u64> {
         ChainType::Ethereum => Some(1),
         ChainType::Arbitrum => Some(42_161),
         ChainType::Base => Some(8_453),
-        ChainType::Hyperevm => Some(999),
         ChainType::Bitcoin | ChainType::Hyperliquid => None,
     }
 }
@@ -714,6 +697,7 @@ mod tests {
             order_id: Uuid::new_v4(),
             source_chain: ChainType::Base,
             source_token: token,
+            source_asset_id: "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf".to_string(),
             address: address.to_string(),
             min_amount: U256::from(1_u64),
             max_amount: U256::from(1_000_u64),

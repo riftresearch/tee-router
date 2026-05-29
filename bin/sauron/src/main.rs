@@ -3,8 +3,13 @@ use clap::Parser;
 use sauron::{run, Result, SauronArgs};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
+fn install_rustls_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    install_rustls_crypto_provider();
     let args = SauronArgs::parse();
 
     let fmt_env_filter = EnvFilter::new(&args.log_level);

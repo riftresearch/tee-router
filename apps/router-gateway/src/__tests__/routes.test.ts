@@ -44,7 +44,8 @@ describe('router gateway routes', () => {
       'amountFormat',
       'toAddress',
       'orderType',
-      'fromAmount'
+      'fromAmount',
+      'routing'
     ])
     expect(body.components.schemas.QuoteRequest.properties.orderType.enum).toEqual([
       'market_order',
@@ -752,6 +753,36 @@ describe('router gateway routes', () => {
     expect(calls[0]?.body).not.toHaveProperty('kind')
   })
 
+  test('forwards market quote provider sequence constraints', async () => {
+    const calls: RecordedCall[] = []
+    const app = createApp(testConfig(), {
+      fetch: mockFetch(calls, async () => Response.json(internalQuote(), { status: 201 }))
+    })
+
+    const response = await app.request('/quote', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        from: 'Arbitrum.USDT',
+        to: 'Base.USDC',
+        toAddress: TO_ADDRESS,
+        fromAmount: '5',
+        amountFormat: 'readable',
+        routing: {
+          providerSequence: ['velora', 'cctp']
+        }
+      })
+    })
+
+    expect(response.status).toBe(201)
+    expect(calls[0]?.body).toMatchObject({
+      type: 'market_order',
+      routing: {
+        provider_sequence: ['velora', 'cctp']
+      }
+    })
+  })
+
   test('rejects invalid EVM order refund addresses before creating orders', async () => {
     const calls: RecordedCall[] = []
     const app = createApp(testConfig(), {
@@ -817,8 +848,8 @@ describe('router gateway routes', () => {
     const calls: RecordedCall[] = []
     const unsupportedQuote = internalQuote()
     unsupportedQuote.quote.payload.source_asset = {
-      chain: 'hyperliquid',
-      asset: 'USDC'
+      chain: 'solana',
+      asset: 'native'
     }
     const app = createApp(testConfig(), {
       fetch: mockFetch(calls, async (path) => {
@@ -1043,6 +1074,99 @@ describe('router gateway routes', () => {
       expectedSwapTimeMs: 63000,
       amountFormat: 'readable'
     })
+  })
+  test('accepts Hyperliquid spot as a quote source', async () => {
+    const calls: RecordedCall[] = []
+    const quote = internalQuote()
+    quote.quote.payload.source_asset = {
+      chain: 'hyperliquid',
+      asset: 'UBTC'
+    }
+    quote.quote.payload.amount_in = '50000'
+    const app = createApp(testConfig(), {
+      fetch: mockFetch(calls, async (path) => {
+        if (path === '/api/v1/quotes') {
+          return Response.json(quote, { status: 201 })
+        }
+
+        return Response.json({ message: 'not found' }, { status: 404 })
+      })
+    })
+
+    const response = await app.request('/quote', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        from: 'Hyperliquid.UBTC',
+        to: 'Ethereum.USDC',
+        toAddress: TO_ADDRESS,
+        fromAmount: '0.0005',
+        amountFormat: 'readable'
+      })
+    })
+    const body = await response.json()
+
+    expect(response.status).toBe(201)
+    expect(calls[0]?.body).toMatchObject({
+      from_asset: {
+        chain: 'hyperliquid',
+        asset: 'UBTC'
+      },
+      amount_in: '50000'
+    })
+    expect(body.from).toBe('Hyperliquid.UBTC')
+  })
+  test('accepts Hyperliquid spot as a quote destination', async () => {
+    const calls: RecordedCall[] = []
+    const quote = internalQuote()
+    quote.quote.payload.source_asset = {
+      chain: 'evm:8453',
+      asset: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913'
+    }
+    quote.quote.payload.destination_asset = {
+      chain: 'hyperliquid',
+      asset: 'HYPE'
+    }
+    quote.quote.payload.amount_in = '40000000'
+    quote.quote.payload.estimated_amount_out = '100000000'
+    const app = createApp(testConfig(), {
+      fetch: mockFetch(calls, async (path) => {
+        if (path === '/api/v1/quotes') {
+          return Response.json(quote, { status: 201 })
+        }
+
+        return Response.json({ message: 'not found' }, { status: 404 })
+      })
+    })
+
+    const response = await app.request('/quote', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        from: 'Base.USDC',
+        to: 'Hyperliquid.HYPE',
+        toAddress: TO_ADDRESS,
+        fromAmount: '40',
+        amountFormat: 'readable'
+      })
+    })
+    const body = await response.json()
+
+    expect(response.status).toBe(201)
+    expect(calls[0]?.body).toEqual({
+      type: 'market_order',
+      from_asset: {
+        chain: 'evm:8453',
+        asset: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913'
+      },
+      to_asset: {
+        chain: 'hyperliquid',
+        asset: 'HYPE'
+      },
+      recipient_address: TO_ADDRESS,
+      amount_in: '40000000'
+    })
+    expect(body.to).toBe('Hyperliquid.HYPE')
   })
 
   test('sends the configured gateway bearer key to every internal router API request', async () => {

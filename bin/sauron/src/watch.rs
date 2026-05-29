@@ -275,6 +275,7 @@ pub struct WatchEntry {
     pub order_id: Uuid,
     pub source_chain: ChainType,
     pub source_token: TokenIdentifier,
+    pub source_asset_id: String,
     pub address: String,
     pub min_amount: U256,
     pub max_amount: U256,
@@ -702,6 +703,7 @@ fn parse_watch_row(row: sqlx_postgres::PgRow) -> Result<WatchEntry> {
     })?;
     let source_token =
         token_identifier_from_router_asset_id(watch_id, source_chain, asset_id.as_deref())?;
+    let source_asset_id = asset_id.as_deref().unwrap_or("native").to_string();
 
     let address_raw =
         row.try_get::<String, _>("address")
@@ -739,6 +741,7 @@ fn parse_watch_row(row: sqlx_postgres::PgRow) -> Result<WatchEntry> {
         order_id,
         source_chain,
         source_token: source_token.normalize(),
+        source_asset_id,
         address,
         min_amount,
         max_amount,
@@ -806,11 +809,7 @@ fn normalize_watch_address(watch_id: Uuid, chain: ChainType, address: &str) -> R
                     "watch {watch_id} had invalid Bitcoin watch address {address}: {reason}"
                 ),
             }),
-        ChainType::Ethereum
-        | ChainType::Arbitrum
-        | ChainType::Base
-        | ChainType::Hyperevm
-        | ChainType::Hyperliquid => {
+        ChainType::Ethereum | ChainType::Arbitrum | ChainType::Base | ChainType::Hyperliquid => {
             normalize_evm_address(address).map_err(|reason| crate::error::Error::InvalidWatchRow {
                 message: format!(
                     "watch {watch_id} had invalid EVM watch address {address}: {reason}"
@@ -826,7 +825,7 @@ fn chain_type_from_router_chain_id(chain_id: &str) -> Option<ChainType> {
         "evm:1" | "ethereum" => Some(ChainType::Ethereum),
         "evm:42161" | "arbitrum" => Some(ChainType::Arbitrum),
         "evm:8453" | "base" => Some(ChainType::Base),
-        "evm:999" | "hyperevm" => Some(ChainType::Hyperevm),
+        "hyperliquid" => Some(ChainType::Hyperliquid),
         _ => None,
     }
 }
@@ -842,17 +841,16 @@ fn token_identifier_from_router_asset_id(
             ChainType::Bitcoin => Err(crate::error::Error::InvalidWatchRow {
                 message: format!("watch {watch_id} had non-native Bitcoin asset_id {asset_id}"),
             }),
-            ChainType::Ethereum
-            | ChainType::Arbitrum
-            | ChainType::Base
-            | ChainType::Hyperevm
-            | ChainType::Hyperliquid => normalize_evm_address(asset_id)
-                .map(TokenIdentifier::Address)
-                .map_err(|reason| crate::error::Error::InvalidWatchRow {
-                    message: format!(
-                        "watch {watch_id} had invalid EVM asset_id {asset_id}: {reason}"
-                    ),
-                }),
+            ChainType::Ethereum | ChainType::Arbitrum | ChainType::Base => {
+                normalize_evm_address(asset_id)
+                    .map(TokenIdentifier::Address)
+                    .map_err(|reason| crate::error::Error::InvalidWatchRow {
+                        message: format!(
+                            "watch {watch_id} had invalid EVM asset_id {asset_id}: {reason}"
+                        ),
+                    })
+            }
+            ChainType::Hyperliquid => Ok(TokenIdentifier::Native),
         },
     }
 }
@@ -891,12 +889,18 @@ mod tests {
             execution_step_id: Some(WorkflowStepId::from(watch_id)),
             order_id: watch_id,
             source_chain,
+            source_asset_id: match source_chain {
+                ChainType::Bitcoin => "native".to_string(),
+                ChainType::Ethereum | ChainType::Arbitrum | ChainType::Base => {
+                    "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf".to_string()
+                }
+                ChainType::Hyperliquid => "UBTC".to_string(),
+            },
             source_token: match source_chain {
                 ChainType::Bitcoin => TokenIdentifier::Native,
                 ChainType::Ethereum
                 | ChainType::Arbitrum
                 | ChainType::Base
-                | ChainType::Hyperevm
                 | ChainType::Hyperliquid => {
                     TokenIdentifier::address("0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf")
                 }
@@ -957,20 +961,10 @@ mod tests {
             Some("0xCbB7C0000aB88B473b1f5aFd9ef808440eed33Bf"),
         )
         .unwrap();
-        let hyperevm_token = token_identifier_from_router_asset_id(
-            Uuid::now_v7(),
-            ChainType::Hyperevm,
-            Some("0xB88339CB7199B77E23DB6E890353E22632Ba630f"),
-        )
-        .unwrap();
 
         assert_eq!(
             token,
             TokenIdentifier::Address("0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf".to_string())
-        );
-        assert_eq!(
-            hyperevm_token,
-            TokenIdentifier::Address("0xb88339cb7199b77e23db6e890353e22632ba630f".to_string())
         );
     }
 
@@ -997,15 +991,6 @@ mod tests {
             )
             .unwrap(),
             "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf"
-        );
-        assert_eq!(
-            normalize_watch_address(
-                watch_id,
-                ChainType::Hyperevm,
-                "0xB88339CB7199B77E23DB6E890353E22632Ba630f"
-            )
-            .unwrap(),
-            "0xb88339cb7199b77e23db6e890353e22632ba630f"
         );
 
         let evm_err =

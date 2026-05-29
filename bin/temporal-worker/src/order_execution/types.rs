@@ -695,56 +695,6 @@ pub struct RefreshedAttemptMaterialized {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ComposeLegBoundaryRequoteInput {
-    pub order_id: WorkflowOrderId,
-    pub source_attempt_id: WorkflowAttemptId,
-    pub completed_step_id: WorkflowStepId,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LegBoundaryRequoteAttemptShape {
-    pub outcome: LegBoundaryRequoteAttemptOutcome,
-}
-
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum LegBoundaryRequoteAttemptOutcome {
-    Requoted {
-        order_id: WorkflowOrderId,
-        source_attempt_id: WorkflowAttemptId,
-        completed_step_id: WorkflowStepId,
-        completed_leg_id: Uuid,
-        plan: ExecutionPlan,
-        reason: Value,
-        input_custody_snapshot: Value,
-    },
-    NotNeeded {
-        order_id: WorkflowOrderId,
-        source_attempt_id: WorkflowAttemptId,
-        completed_step_id: WorkflowStepId,
-        reason: Value,
-    },
-    Untenable {
-        order_id: WorkflowOrderId,
-        source_attempt_id: WorkflowAttemptId,
-        completed_step_id: WorkflowStepId,
-        reason: StaleQuoteRefreshUntenableReason,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MaterializeLegBoundaryRequoteInput {
-    pub order_id: WorkflowOrderId,
-    pub requote_attempt: LegBoundaryRequoteAttemptShape,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LegBoundaryRequoteMaterialized {
-    pub attempt_id: WorkflowAttemptId,
-    pub steps: Vec<WorkflowExecutionStep>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum StaleQuoteRefreshUntenableReason {
     StaleProviderQuoteRefreshUntenable { message: String },

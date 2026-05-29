@@ -40,6 +40,26 @@ pub enum AmountFormat {
     Raw,
 }
 
+/// Provider identifiers accepted by route-selection constraints.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderId {
+    Across,
+    Cctp,
+    Unit,
+    HyperliquidBridge,
+    Hyperliquid,
+    Velora,
+}
+
+/// Optional route-selection constraints for `POST /quote`.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuoteRouting {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_sequence: Option<Vec<ProviderId>>,
+}
+
 /// Request body for `POST /quote`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -54,6 +74,8 @@ pub struct QuoteRequest {
     pub to_address: String,
     /// Source amount, interpreted per `amount_format`.
     pub from_amount: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing: Option<QuoteRouting>,
 }
 
 /// A single fee line item attached to a quote or order.
@@ -142,10 +164,7 @@ impl GatewayClient {
     }
 
     /// Create a market order. The response carries the deposit address.
-    pub async fn create_market_order(
-        &self,
-        request: &CreateOrderRequest,
-    ) -> Result<OrderResponse> {
+    pub async fn create_market_order(&self, request: &CreateOrderRequest) -> Result<OrderResponse> {
         self.post("/order/market", request).await
     }
 
@@ -221,12 +240,36 @@ mod tests {
             amount_format: Some(AmountFormat::Readable),
             to_address: "0x1111111111111111111111111111111111111111".to_string(),
             from_amount: "100".to_string(),
+            routing: None,
         };
         let json = serde_json::to_value(&request).expect("serialize");
         assert_eq!(json["from"], "Ethereum.USDC");
-        assert_eq!(json["toAddress"], "0x1111111111111111111111111111111111111111");
+        assert_eq!(
+            json["toAddress"],
+            "0x1111111111111111111111111111111111111111"
+        );
         assert_eq!(json["amountFormat"], "readable");
         assert_eq!(json["fromAmount"], "100");
+        assert!(json.get("routing").is_none());
+    }
+
+    #[test]
+    fn quote_request_serializes_provider_sequence_routing() {
+        let request = QuoteRequest {
+            from: "Arbitrum.USDT".to_string(),
+            to: "Base.USDC".to_string(),
+            amount_format: Some(AmountFormat::Readable),
+            to_address: "0x1111111111111111111111111111111111111111".to_string(),
+            from_amount: "5".to_string(),
+            routing: Some(QuoteRouting {
+                provider_sequence: Some(vec![ProviderId::Velora, ProviderId::Cctp]),
+            }),
+        };
+        let json = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(
+            json["routing"]["providerSequence"],
+            serde_json::json!(["velora", "cctp"])
+        );
     }
 
     #[test]

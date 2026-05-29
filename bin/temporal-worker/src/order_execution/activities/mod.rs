@@ -16,10 +16,10 @@ use chains::{ChainRegistry, UserDepositCandidateStatus};
 use chrono::Utc;
 use router_core::{
     db::{
-        BoundaryRequoteExecutionAttemptPlan, Database, ExecutionAttemptPlan,
-        ExecutionStepLatencyRecord, ExternalCustodyRefundAttemptPlan,
-        FundingVaultRefundAttemptPlan, HyperliquidSpotRefundAttemptPlan,
-        PersistStepCompletionRecord, RefreshedExecutionAttemptPlan,
+        Database, ExecutionAttemptPlan, ExecutionStepLatencyRecord,
+        ExternalCustodyRefundAttemptPlan, FundingVaultRefundAttemptPlan,
+        HyperliquidSpotRefundAttemptPlan, PersistStepCompletionRecord,
+        RefreshedExecutionAttemptPlan,
     },
     error::{RouterCoreError, RouterCoreResult},
     models::{
@@ -37,23 +37,14 @@ use router_core::{
             BridgeExecutionRequest, BridgeQuote, BridgeQuoteRequest, ExchangeExecutionRequest,
             ExchangeQuote, ExchangeQuoteRequest, HyperliquidFillFee, ProviderExecutionStatePatch,
             ProviderOperationObservation, ProviderOperationObservationRequest,
-            UnitDepositStepRequest, UnitProvider, UnitWithdrawalStepRequest,
+            UnitDepositStepRequest, UnitWithdrawalStepRequest,
         },
         asset_registry::{
-            AssetRegistry, CanonicalAsset, MarketOrderNode, MarketOrderTransitionKind,
-            ProviderAssetCapability, ProviderId, RequiredCustodyRole, TransitionDecl,
-            TransitionPath,
+            CanonicalAsset, MarketOrderNode, MarketOrderTransitionKind, ProviderAssetCapability,
+            ProviderId, TransitionDecl, TransitionPath,
         },
         custody_action_executor::{CustodyAction, CustodyActionError, CustodyActionRequest},
-        gas_reimbursement::{
-            optimized_paymaster_reimbursement_plan,
-            optimized_paymaster_reimbursement_plan_with_pricing, try_transition_retention_amount,
-            GasReimbursementError, GasReimbursementPlan,
-        },
-        market_order_planner::{
-            MarketOrderInitialHyperliquidCustody, MarketOrderPlanCurrentLocationStart,
-            MarketOrderPlanRemainingStart,
-        },
+        market_order_planner::MarketOrderPlanRemainingStart,
         quote_legs::{
             execution_step_type_for_transition_kind, QuoteLeg, QuoteLegAsset, QuoteLegSpec,
         },
@@ -75,15 +66,13 @@ use super::{
     error::OrderActivityError,
     types::{
         AcrossOnchainLogRecovered, BoundaryPersisted, ClassifyStaleRunningStepInput,
-        ClassifyStepFailureInput, ComposeLegBoundaryRequoteInput,
-        ComposeRefreshedQuoteAttemptInput, DiscoverSingleRefundPositionInput, DispatchOutcome,
-        DispatchStepInput, ExecutionPlan, FailedAttemptSnapshotWritten, FinalizeOrderOrRefundInput,
-        FinalizedOrder, HlBridgeDepositCreditedEvidence, HlWithdrawalSettledEvidence,
+        ClassifyStepFailureInput, ComposeRefreshedQuoteAttemptInput,
+        DiscoverSingleRefundPositionInput, DispatchOutcome, DispatchStepInput, ExecutionPlan,
+        FailedAttemptSnapshotWritten, FinalizeOrderOrRefundInput, FinalizedOrder,
+        HlBridgeDepositCreditedEvidence, HlWithdrawalSettledEvidence,
         HyperUnitDepositCreditedEvidence, HyperUnitWithdrawalSettledEvidence, InputCustodySnapshot,
-        LatestExecutionAttemptResolved, LegBoundaryRequoteAttemptOutcome,
-        LegBoundaryRequoteAttemptShape, LegBoundaryRequoteMaterialized,
-        LoadOrderExecutionStateInput, MarkOrderCompletedInput, MaterializeExecutionAttemptInput,
-        MaterializeLegBoundaryRequoteInput, MaterializeRefreshedAttemptInput,
+        LatestExecutionAttemptResolved, LoadOrderExecutionStateInput, MarkOrderCompletedInput,
+        MaterializeExecutionAttemptInput, MaterializeRefreshedAttemptInput,
         MaterializeRefundPlanInput, MaterializeRetryAttemptInput, MaterializedExecutionAttempt,
         OrderCompleted, OrderExecutionState, OrderTerminalStatus, OrderWorkflowPhase,
         PersistStepFailedInput, PersistenceBoundary, ProviderHintKind,
@@ -278,7 +267,6 @@ fn provider_operation_hint_kind_label(
         Some(
             ProviderOperationType::UnitWithdrawal
             | ProviderOperationType::HyperliquidBridgeDeposit
-            | ProviderOperationType::HypercoreBridgeDeposit
             | ProviderOperationType::HyperliquidBridgeWithdrawal,
         ) => "provider_observation",
         None => "unknown",

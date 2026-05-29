@@ -667,7 +667,7 @@ Router API and router-worker resolve proxies in this order:
 
 With `PRODUCTION=true`, startup rejects any configured upstream that has neither
 a specific proxy nor `UPSTREAM_PROXY_URL`. This includes RPCs, Esplora, provider
-APIs, Chainalysis, Coinbase pricing, and optional HyperEVM if enabled.
+APIs, Chainalysis, and Coinbase pricing.
 
 Requirements:
 
@@ -694,7 +694,7 @@ Supported router-specific overrides:
 ETH_RPC_PROXY_URL
 BASE_RPC_PROXY_URL
 ARBITRUM_RPC_PROXY_URL
-HYPEREVM_RPC_PROXY_URL
+
 BITCOIN_RPC_PROXY_URL
 ESPLORA_PROXY_URL
 ACROSS_PROXY_URL
@@ -768,7 +768,7 @@ Router API and worker need the same core config:
 - `UPSTREAM_PROXY_URL` general SOCKS5 fallback, `HYPERUNIT_PROXY_URL` dedicated
   Europe-pinned HyperUnit proxy, plus optional per-upstream overrides:
   `ETH_RPC_PROXY_URL`, `BASE_RPC_PROXY_URL`, `ARBITRUM_RPC_PROXY_URL`,
-  `HYPEREVM_RPC_PROXY_URL`, `BITCOIN_RPC_PROXY_URL`, `ESPLORA_PROXY_URL`,
+  `BITCOIN_RPC_PROXY_URL`, `ESPLORA_PROXY_URL`,
   `ACROSS_PROXY_URL`, `CCTP_PROXY_URL`, `HYPERLIQUID_PROXY_URL`,
   `VELORA_PROXY_URL`, `CHAINALYSIS_PROXY_URL`, `COINBASE_PROXY_URL`
 - `HYPERUNIT_API_URL`

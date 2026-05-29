@@ -15,7 +15,6 @@ Synthesizes the architectural decisions from the 2026-05-11 design conversation.
 
 - Becoming a general-purpose blockchain indexer for sale.
 - Replacing the Postgres CDC plumbing Sauron uses internally for watch reconciliation.
-- Building HyperEVM observation in this spec (when we touch HyperEVM contracts, it slots in as another EVM indexer instance).
 - Real-time push from Sauron to T-router (already exists; out of scope).
 
 ## Architecture: two tiers, uniform per chain
@@ -492,7 +491,6 @@ API + ingestion semantics finalized (component §3 + `docs/sauron/hyperliquid-ap
 
 ## Out-of-scope clarifications
 
-- **HyperEVM:** when we touch HyperEVM contracts, treat as another EVM chain — slot in another `EvmIndexerClient` and `EvmReceiptWatcherClient` instance. No spec change required.
 - **Solana / future chains:** same pattern (build chain-specific indexer + receipt watcher conforming to the uniform API).
 - **Replacing third-party off-chain APIs:** Circle attestation API, HyperUnit REST, HL REST `/info` — these stay external. Sauron-level polling against them is acceptable per the actor/observer split (polling is fine inside Sauron; never in T-router's hotpath).
 - **Building a managed indexer business:** out of scope; the architectural shape just happens to be one that could become one if we ever wanted.

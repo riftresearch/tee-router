@@ -53,12 +53,6 @@ enum QuoteRefreshContinuation {
     RefundRequired,
 }
 
-enum LegBoundaryRequoteContinuation {
-    ResumeExecution(MaterializedExecutionAttempt),
-    Continue,
-    RefundRequired,
-}
-
 fn quote_refresh_continuation(outcome: QuoteRefreshWorkflowOutcome) -> QuoteRefreshContinuation {
     match outcome {
         QuoteRefreshWorkflowOutcome::Refreshed { attempt_id, steps } => {
@@ -405,13 +399,23 @@ impl OrderWorkflow {
                         }
                     }
                     StepExecutionProgress::RefundRequired { classified } => {
-                        let finalized = finalize_refund_required(
+                        tracing::warn!(
+                            order_id = %input.order_id,
+                            attempt_id = %execution_attempt.attempt_id,
+                            step_id = %step.step_id,
+                            reason = ?classified.reason,
+                            event_name = "order.refund_required_stale_running_step",
+                            "order.refund_required_stale_running_step"
+                        );
+                        set_order_workflow_refunding(
                             ctx,
                             input.order_id,
-                            Some(execution_attempt.attempt_id),
-                            Some(step.step_id),
-                            Some(classified.reason),
-                            db_activity_options.clone(),
+                            execution_attempt.attempt_id,
+                        );
+                        let terminal_status = run_refund_child(
+                            ctx,
+                            input.order_id,
+                            execution_attempt.attempt_id,
                             funded_to_workflow_start_seconds,
                         )
                         .await?;
@@ -419,13 +423,14 @@ impl OrderWorkflow {
                             ctx,
                             workflow_started_at,
                             input.order_id,
-                            finalized.terminal_status,
+                            terminal_status,
                         );
                     }
                 };
                 match dispatched.outcome {
-                    DispatchOutcome::Completed => {
-                        match maybe_requote_after_completed_execution_leg(
+                    DispatchOutcome::Completed => {}
+                    DispatchOutcome::Waiting => {
+                        match wait_for_provider_completion_hint(
                             ctx,
                             input.order_id,
                             execution_attempt.attempt_id,
@@ -434,17 +439,16 @@ impl OrderWorkflow {
                         )
                         .await?
                         {
-                            LegBoundaryRequoteContinuation::ResumeExecution(requoted_attempt) => {
-                                execution_attempt = requoted_attempt;
-                                set_order_workflow_executing(
-                                    ctx,
-                                    input.order_id,
-                                    execution_attempt.attempt_id,
+                            ProviderCompletionWait::Completed => {}
+                            ProviderCompletionWait::RefundRequired { reason } => {
+                                tracing::warn!(
+                                    order_id = %input.order_id,
+                                    attempt_id = %execution_attempt.attempt_id,
+                                    step_id = %step.step_id,
+                                    reason = ?reason,
+                                    event_name = "order.refund_required_provider_completion_wait",
+                                    "order.refund_required_provider_completion_wait"
                                 );
-                                continue 'attempts;
-                            }
-                            LegBoundaryRequoteContinuation::Continue => {}
-                            LegBoundaryRequoteContinuation::RefundRequired => {
                                 set_order_workflow_refunding(
                                     ctx,
                                     input.order_id,
@@ -462,80 +466,6 @@ impl OrderWorkflow {
                                     workflow_started_at,
                                     input.order_id,
                                     terminal_status,
-                                );
-                            }
-                        }
-                    }
-                    DispatchOutcome::Waiting => {
-                        match wait_for_provider_completion_hint(
-                            ctx,
-                            input.order_id,
-                            execution_attempt.attempt_id,
-                            step.step_id,
-                            db_activity_options.clone(),
-                        )
-                        .await?
-                        {
-                            ProviderCompletionWait::Completed => {
-                                match maybe_requote_after_completed_execution_leg(
-                                    ctx,
-                                    input.order_id,
-                                    execution_attempt.attempt_id,
-                                    step.step_id,
-                                    db_activity_options.clone(),
-                                )
-                                .await?
-                                {
-                                    LegBoundaryRequoteContinuation::ResumeExecution(
-                                        requoted_attempt,
-                                    ) => {
-                                        execution_attempt = requoted_attempt;
-                                        set_order_workflow_executing(
-                                            ctx,
-                                            input.order_id,
-                                            execution_attempt.attempt_id,
-                                        );
-                                        continue 'attempts;
-                                    }
-                                    LegBoundaryRequoteContinuation::Continue => {}
-                                    LegBoundaryRequoteContinuation::RefundRequired => {
-                                        set_order_workflow_refunding(
-                                            ctx,
-                                            input.order_id,
-                                            execution_attempt.attempt_id,
-                                        );
-                                        let terminal_status = run_refund_child(
-                                            ctx,
-                                            input.order_id,
-                                            execution_attempt.attempt_id,
-                                            funded_to_workflow_start_seconds,
-                                        )
-                                        .await?;
-                                        return order_workflow_output(
-                                            ctx,
-                                            workflow_started_at,
-                                            input.order_id,
-                                            terminal_status,
-                                        );
-                                    }
-                                }
-                            }
-                            ProviderCompletionWait::RefundRequired { reason } => {
-                                let finalized = finalize_refund_required(
-                                    ctx,
-                                    input.order_id,
-                                    Some(execution_attempt.attempt_id),
-                                    Some(step.step_id),
-                                    Some(reason),
-                                    db_activity_options.clone(),
-                                    funded_to_workflow_start_seconds,
-                                )
-                                .await?;
-                                return order_workflow_output(
-                                    ctx,
-                                    workflow_started_at,
-                                    input.order_id,
-                                    finalized.terminal_status,
                                 );
                             }
                         }
@@ -803,13 +733,6 @@ macro_rules! dispatch_step_activity {
             OrderExecutionStepType::HyperliquidBridgeDeposit => $ctx
                 .start_activity(
                     OrderActivities::dispatch_hyperliquid_bridge_deposit_step,
-                    $input,
-                    $options,
-                )
-                .boxed_local(),
-            OrderExecutionStepType::HypercoreBridgeDeposit => $ctx
-                .start_activity(
-                    OrderActivities::dispatch_hypercore_bridge_deposit_step,
                     $input,
                     $options,
                 )
@@ -1119,76 +1042,6 @@ async fn run_refund_child(
     })
 }
 
-async fn maybe_requote_after_completed_execution_leg(
-    ctx: &mut WorkflowContext<OrderWorkflow>,
-    order_id: WorkflowOrderId,
-    source_attempt_id: WorkflowAttemptId,
-    completed_step_id: WorkflowStepId,
-    db_activity_options: ActivityOptions,
-) -> WorkflowResult<LegBoundaryRequoteContinuation> {
-    let requote_attempt = ctx
-        .start_activity(
-            QuoteRefreshActivities::compose_leg_boundary_requote_attempt,
-            ComposeLegBoundaryRequoteInput {
-                order_id,
-                source_attempt_id,
-                completed_step_id,
-            },
-            db_activity_options.clone(),
-        )
-        .await?;
-    match &requote_attempt.outcome {
-        LegBoundaryRequoteAttemptOutcome::NotNeeded { .. } => {
-            return Ok(LegBoundaryRequoteContinuation::Continue);
-        }
-        LegBoundaryRequoteAttemptOutcome::Untenable { .. } => {
-            return Ok(LegBoundaryRequoteContinuation::RefundRequired);
-        }
-        LegBoundaryRequoteAttemptOutcome::Requoted { .. } => {}
-    }
-    let materialized = ctx
-        .start_activity(
-            QuoteRefreshActivities::materialize_leg_boundary_requote_attempt,
-            MaterializeLegBoundaryRequoteInput {
-                order_id,
-                requote_attempt,
-            },
-            db_activity_options,
-        )
-        .await?;
-    Ok(LegBoundaryRequoteContinuation::ResumeExecution(
-        MaterializedExecutionAttempt {
-            attempt_id: materialized.attempt_id,
-            steps: materialized.steps,
-        },
-    ))
-}
-
-async fn finalize_refund_required(
-    ctx: &mut WorkflowContext<OrderWorkflow>,
-    order_id: WorkflowOrderId,
-    attempt_id: Option<WorkflowAttemptId>,
-    step_id: Option<WorkflowStepId>,
-    reason: Option<Value>,
-    db_activity_options: ActivityOptions,
-    funded_to_workflow_start_seconds: Option<f64>,
-) -> WorkflowResult<FinalizedOrder> {
-    Ok(ctx
-        .start_activity(
-            OrderActivities::finalize_order_or_refund,
-            FinalizeOrderOrRefundInput {
-                order_id,
-                attempt_id,
-                step_id,
-                terminal_status: OrderTerminalStatus::RefundRequired,
-                reason,
-                funded_to_workflow_start_seconds,
-            },
-            db_activity_options,
-        )
-        .await?)
-}
-
 async fn wait_for_provider_completion_hint(
     ctx: &mut WorkflowContext<OrderWorkflow>,
     order_id: WorkflowOrderId,
@@ -1406,8 +1259,8 @@ mod tests {
     fn refund_required_workflow_paths_start_refund_child() {
         let source = workflow_implementation_source();
         assert!(
-            !source.contains("OrderTerminalStatus::RefundRequired"),
-            "OrderWorkflow must not finalize or output RefundRequired directly"
+            !source.contains("terminal_status: OrderTerminalStatus::RefundRequired"),
+            "OrderWorkflow must not mark RefundRequired without first running RefundWorkflow"
         );
 
         // The consolidated dispatch surfaces a stale quote as

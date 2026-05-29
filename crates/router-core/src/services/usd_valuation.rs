@@ -599,7 +599,6 @@ mod tests {
             ethereum_gas_price_wei: 25_000_000_000,
             arbitrum_gas_price_wei: 100_000_000,
             base_gas_price_wei: 20_000_000,
-            hyperevm_gas_price_wei: None,
         }
     }
 
@@ -616,7 +615,6 @@ mod tests {
             ethereum_gas_price_wei: 25_000_000_000,
             arbitrum_gas_price_wei: 100_000_000,
             base_gas_price_wei: 20_000_000,
-            hyperevm_gas_price_wei: None,
         };
         let quote = LimitOrderQuote {
             id: Uuid::now_v7(),
@@ -1036,7 +1034,6 @@ mod tests {
             ethereum_gas_price_wei: 25_000_000_000,
             arbitrum_gas_price_wei: 100_000_000,
             base_gas_price_wei: 20_000_000,
-            hyperevm_gas_price_wei: None,
         };
         let asset = DepositAsset {
             chain: ChainId::parse("evm:8453").unwrap(),
@@ -1063,7 +1060,6 @@ mod tests {
             ethereum_gas_price_wei: 25_000_000_000,
             arbitrum_gas_price_wei: 100_000_000,
             base_gas_price_wei: 20_000_000,
-            hyperevm_gas_price_wei: None,
         };
         let asset = DepositAsset {
             chain: ChainId::parse("bitcoin").unwrap(),
@@ -1092,7 +1088,6 @@ mod tests {
             ethereum_gas_price_wei: 25_000_000_000,
             arbitrum_gas_price_wei: 100_000_000,
             base_gas_price_wei: 20_000_000,
-            hyperevm_gas_price_wei: None,
         };
         let registry = AssetRegistry::default();
         let mut asset = registry

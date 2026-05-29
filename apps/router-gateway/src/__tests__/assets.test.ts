@@ -27,14 +27,32 @@ describe('asset and amount helpers', () => {
       decimals: 6
     })
 
-    expect(resolveAssetIdentifier('HyperEVM.USDC')).toEqual({
-      id: 'HyperEVM.USDC',
+    expect(resolveAssetIdentifier('Hyperliquid.UBTC')).toEqual({
+      id: 'Hyperliquid.UBTC',
       internal: {
-        chain: 'evm:999',
-        asset: '0xb88339cb7199b77e23db6e890353e22632ba630f'
+        chain: 'hyperliquid',
+        asset: 'UBTC'
+      },
+      decimals: 8
+    })
+
+    expect(resolveAssetIdentifier('HL.USDC')).toEqual({
+      id: 'Hyperliquid.USDC',
+      internal: {
+        chain: 'hyperliquid',
+        asset: 'native'
       },
       decimals: 6
     })
+    expect(resolveAssetIdentifier('Hyperliquid.HYPE')).toEqual({
+      id: 'Hyperliquid.HYPE',
+      internal: {
+        chain: 'hyperliquid',
+        asset: 'HYPE'
+      },
+      decimals: 8
+    })
+
 
     expect(
       resolveAssetIdentifier('Ethereum.0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48')
@@ -51,8 +69,8 @@ describe('asset and amount helpers', () => {
     expect(() => resolveAssetIdentifier('Ethereum.0xdead')).toThrow(
       'address-form assets must be valid EVM addresses'
     )
-    expect(() => resolveAssetIdentifier('Hyperliquid.USDC')).toThrow(
-      'unsupported asset chain'
+    expect(() => resolveAssetIdentifier('Hyperliquid.UNKNOWN')).toThrow(
+      'unknown ticker for chain'
     )
   })
 
@@ -152,6 +170,9 @@ describe('asset and amount helpers', () => {
         '0x1111111111111111111111111111111111111111',
         'toAddress'
       )
-    ).toThrow('toAddress cannot be validated for unsupported chain')
+    ).not.toThrow()
+    expect(() =>
+      assertAddressMatchesChain('hyperliquid', 'not-an-address', 'toAddress')
+    ).toThrow('toAddress must be a valid EVM address')
   })
 })

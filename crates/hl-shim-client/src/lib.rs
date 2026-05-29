@@ -88,6 +88,25 @@ impl HlShimClient {
         self.get_json(url).await
     }
 
+    pub async fn watch_user(&self, user: Address) -> Result<UserWatchResponse> {
+        let url = self.base_url.join("users/watch").context(InvalidUrlSnafu {
+            url: self.base_url.to_string(),
+        })?;
+        self.http
+            .post(url)
+            .json(&UserWatchRequest {
+                user: format!("{user:?}"),
+            })
+            .send()
+            .await
+            .context(RequestSnafu)?
+            .error_for_status()
+            .context(RequestSnafu)?
+            .json()
+            .await
+            .context(ResponseSnafu)
+    }
+
     pub async fn watch_order(&self, user: Address, oid: u64) -> Result<OrderWatchResponse> {
         let url = self
             .base_url
@@ -240,6 +259,17 @@ pub struct OrdersResponse {
     pub orders: Vec<HlOrderEvent>,
     pub next_cursor: String,
     pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserWatchRequest {
+    pub user: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserWatchResponse {
+    pub user: String,
+    pub watched: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

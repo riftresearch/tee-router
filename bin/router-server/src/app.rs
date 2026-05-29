@@ -162,7 +162,7 @@ struct ResolvedUpstreamProxies {
     ethereum_rpc: Option<ProxyUrl>,
     base_rpc: Option<ProxyUrl>,
     arbitrum_rpc: Option<ProxyUrl>,
-    hyperevm_rpc: Option<ProxyUrl>,
+
     bitcoin_rpc: Option<ProxyUrl>,
     esplora: Option<ProxyUrl>,
 }
@@ -226,12 +226,7 @@ fn resolve_upstream_proxies(args: &RouterServerArgs) -> Result<ResolvedUpstreamP
             upstream,
         )
         .map_err(invalid_proxy_config)?,
-        hyperevm_rpc: effective_proxy(
-            args.hyperevm_rpc_proxy_url.as_deref(),
-            "HYPEREVM_RPC_PROXY_URL",
-            upstream,
-        )
-        .map_err(invalid_proxy_config)?,
+
         bitcoin_rpc: effective_proxy(
             args.bitcoin_rpc_proxy_url.as_deref(),
             "BITCOIN_RPC_PROXY_URL",
@@ -330,12 +325,7 @@ fn validate_upstream_config(args: &RouterServerArgs) -> Result<()> {
         "Flashbots RPC URL",
         args.flashbots_rpc_url.as_deref(),
     );
-    optional_http_url(
-        &mut errors,
-        "HYPEREVM_RPC_URL",
-        "HyperEVM RPC URL",
-        args.hyperevm_rpc_url.as_deref(),
-    );
+
 
     if args.production {
         require_http_url(
@@ -417,14 +407,7 @@ fn validate_upstream_config(args: &RouterServerArgs) -> Result<()> {
             "ARBITRUM_RPC_PROXY_URL",
             &proxies.arbitrum_rpc,
         );
-        if args.hyperevm_rpc_url.is_some() {
-            require_proxy(
-                &mut errors,
-                "HYPEREVM_RPC_URL",
-                "HYPEREVM_RPC_PROXY_URL",
-                &proxies.hyperevm_rpc,
-            );
-        }
+
         require_proxy(
             &mut errors,
             "BITCOIN_RPC_URL",
@@ -634,7 +617,7 @@ fn initialize_route_costs(
         &args.ethereum_mainnet_rpc_url,
         &args.arbitrum_rpc_url,
         &args.base_rpc_url,
-        args.hyperevm_rpc_url.as_deref(),
+
         args.hyperliquid_api_url.as_deref(),
     )
     .map_err(|err| crate::Error::DatabaseInit {
@@ -650,7 +633,7 @@ fn initialize_route_costs(
             proxies.arbitrum_rpc.as_ref().map(ProxyUrl::as_str),
             proxies.base_rpc.as_ref().map(ProxyUrl::as_str),
             proxies.hyperliquid.as_ref().map(ProxyUrl::as_str),
-            proxies.hyperevm_rpc.as_ref().map(ProxyUrl::as_str),
+
         )
         .map_err(|err| crate::Error::DatabaseInit {
             source: RouterServerError::InvalidData {
@@ -748,49 +731,6 @@ async fn initialize_chain_registry(
     );
     chain_registry.register_evm(ChainType::Arbitrum, arbitrum_chain);
 
-    let hyperevm_config = match (
-        args.hyperevm_rpc_url.as_deref(),
-        args.hyperevm_reference_token.as_deref(),
-        args.hyperevm_paymaster_private_key.as_deref(),
-        args.hyperevm_min_confirmations,
-        args.hyperevm_estimated_block_time_ms,
-    ) {
-        (None, None, None, None, None) => None,
-        (
-            Some(rpc_url),
-            Some(reference_token),
-            Some(_),
-            Some(min_confirmations),
-            Some(block_time_ms),
-        ) => Some((rpc_url, reference_token, min_confirmations, block_time_ms)),
-        _ => {
-            return Err(invalid_config(
-                "HyperEVM requires HYPEREVM_RPC_URL, HYPEREVM_ALLOWED_TOKEN, HYPEREVM_PAYMASTER_PRIVATE_KEY, HYPEREVM_MIN_CONFIRMATIONS, and HYPEREVM_ESTIMATED_BLOCK_TIME_MS together",
-            ));
-        }
-    };
-    if let Some((rpc_url, reference_token, min_confirmations, block_time_ms)) = hyperevm_config {
-        let hyperevm_chain = Arc::new(
-            EvmChain::new_with_gas_sponsor_and_proxy_urls(
-                rpc_url,
-                reference_token,
-                ChainType::Hyperevm,
-                b"router-hyperevm-wallet",
-                min_confirmations,
-                Duration::from_millis(block_time_ms),
-                gas_sponsor_config(args.hyperevm_paymaster_private_key.as_ref(), paymaster_mode),
-                proxies.hyperevm_rpc.as_ref().map(ProxyUrl::as_str),
-                None,
-            )
-            .await
-            .map_err(|err| crate::Error::DatabaseInit {
-                source: RouterServerError::InvalidData {
-                    message: format!("failed to initialize hyperevm chain: {err}"),
-                },
-            })?,
-        );
-        chain_registry.register_evm(ChainType::Hyperevm, hyperevm_chain);
-    }
 
     let hyperliquid_chain = Arc::new(HyperliquidChain::new(
         b"router-hyperliquid-wallet",
@@ -835,6 +775,7 @@ fn initialize_action_providers(args: &RouterServerArgs) -> Result<ActionProvider
             .with_transfer_mode(cctp_transfer_mode)
             .with_proxy_url(proxies.cctp.clone()),
     );
+
     let registry = ActionProviderRegistry::http_from_options(ActionProviderHttpOptions {
         across,
         cctp,
@@ -851,7 +792,6 @@ fn initialize_action_providers(args: &RouterServerArgs) -> Result<ActionProvider
         velora,
         hyperliquid_network: args.hyperliquid_network,
         hyperliquid_order_timeout_ms: args.hyperliquid_order_timeout_ms,
-        hypercore_bridge_enabled: args.hyperevm_rpc_url.is_some(),
     })
     .map_err(invalid_proxy_config)?;
     if registry.is_empty() {
@@ -985,13 +925,6 @@ fn quote_paymaster_registry(args: &RouterServerArgs) -> Result<PaymasterRegistry
             .map_err(|source| invalid_config(source.to_string()))?;
         registry.register(ChainType::Arbitrum, address);
     }
-    if let Some(private_key) =
-        normalize_optional_string(args.hyperevm_paymaster_private_key.as_deref())
-    {
-        let address = evm_address_from_private_key(&private_key)
-            .map_err(|source| invalid_config(source.to_string()))?;
-        registry.register(ChainType::Hyperevm, address);
-    }
     Ok(registry)
 }
 
@@ -1045,16 +978,6 @@ mod tests {
             arbitrum_rpc_proxy_url: None,
             arbitrum_reference_token: "0x0000000000000000000000000000000000000000".to_string(),
             arbitrum_paymaster_private_key: None,
-            hyperevm_rpc_url: Some("https://hyperevm.example".to_string()),
-            hyperevm_rpc_proxy_url: None,
-            hyperevm_reference_token: Some(
-                "0xb88339cb7199b77e23db6e890353e22632ba630f".to_string(),
-            ),
-            hyperevm_paymaster_private_key: Some(
-                "0x1111111111111111111111111111111111111111111111111111111111111111".to_string(),
-            ),
-            hyperevm_min_confirmations: Some(4),
-            hyperevm_estimated_block_time_ms: Some(1_000),
             bitcoin_rpc_url: "http://btc.example".to_string(),
             bitcoin_rpc_proxy_url: None,
             bitcoin_rpc_auth: Auth::None,

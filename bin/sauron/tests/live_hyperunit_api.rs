@@ -164,7 +164,9 @@ async fn real_hyperunit_guardian_signatures_verify_against_pinned_keys() {
         verified_count += 1;
     }
 
-    eprintln!("✓ verified {verified_count} real production address(es) against pinned guardian pubkeys");
+    eprintln!(
+        "✓ verified {verified_count} real production address(es) against pinned guardian pubkeys"
+    );
 }
 
 /// If a proxy is available, also exercise the *full* path: real /gen call +

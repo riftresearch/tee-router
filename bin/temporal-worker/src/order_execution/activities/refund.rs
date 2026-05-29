@@ -251,27 +251,29 @@ pub(super) async fn discover_single_refund_position_with_deps(
             Err(source) => return Err(OrderActivityError::db_query(source)),
         };
         if let Some(vault) = vault {
-            let amount = deps
-                .custody_action_executor
-                .deposit_vault_balance_raw(&vault)
-                .await
-                .map_err(|source| {
-                    custody_action_error("read funding vault refund balance", source)
-                })?;
-            if raw_amount_is_positive(&amount, "funding vault refund balance")? {
-                positions.push(SingleRefundPosition {
-                    position_kind: RecoverablePositionKind::FundingVault,
-                    owning_step_id: None,
-                    funding_vault_id: Some(funding_vault_id.into()),
-                    custody_vault_id: None,
-                    asset: vault.deposit_asset,
-                    amount: RawAmount::new(amount).map_err(|source| {
-                        amount_parse_error("funding vault refund balance", source)
-                    })?,
-                    hyperliquid_coin: None,
-                    hyperliquid_canonical: None,
-                    requires_clearinghouse_unwrap: false,
-                });
+            if external_custody_direct_balance_supported(&vault.deposit_asset.chain) {
+                let amount = deps
+                    .custody_action_executor
+                    .deposit_vault_balance_raw(&vault)
+                    .await
+                    .map_err(|source| {
+                        custody_action_error("read funding vault refund balance", source)
+                    })?;
+                if raw_amount_is_positive(&amount, "funding vault refund balance")? {
+                    positions.push(SingleRefundPosition {
+                        position_kind: RecoverablePositionKind::FundingVault,
+                        owning_step_id: None,
+                        funding_vault_id: Some(funding_vault_id.into()),
+                        custody_vault_id: None,
+                        asset: vault.deposit_asset,
+                        amount: RawAmount::new(amount).map_err(|source| {
+                            amount_parse_error("funding vault refund balance", source)
+                        })?,
+                        hyperliquid_coin: None,
+                        hyperliquid_canonical: None,
+                        requires_clearinghouse_unwrap: false,
+                    });
+                }
             }
         }
     }
@@ -582,14 +584,16 @@ fn uuid_from_json_string(value: &Value) -> Option<Uuid> {
 fn external_custody_direct_balance_supported(chain: &ChainId) -> bool {
     matches!(
         backend_chain_for_id(chain),
-        Some(
-            ChainType::Bitcoin
-                | ChainType::Ethereum
-                | ChainType::Arbitrum
-                | ChainType::Base
-                | ChainType::Hyperevm
-        )
+        Some(ChainType::Bitcoin | ChainType::Ethereum | ChainType::Arbitrum | ChainType::Base)
     )
+}
+fn external_custody_direct_refund_address_supported(chain: &ChainId, refund_address: &str) -> bool {
+    match backend_chain_for_id(chain) {
+        Some(ChainType::Ethereum | ChainType::Arbitrum | ChainType::Base) => {
+            Address::from_str(refund_address).is_ok()
+        }
+        Some(ChainType::Bitcoin | ChainType::Hyperliquid) | None => false,
+    }
 }
 
 async fn hyperliquid_spot_refund_positions_for_vault(
@@ -693,10 +697,10 @@ pub(super) fn refund_position_discovery_from_positions_with_expected(
         .enumerate()
         .min_by_key(|(index, position)| {
             (
+                refund_position_priority(position.position_kind),
                 refund_position_expected_asset_priority(position, refund_asset),
                 refund_position_expected_asset_priority(position, expected_asset),
                 refund_position_expected_canonical_priority(position, expected_canonical),
-                refund_position_priority(position.position_kind),
                 *index,
             )
         })
@@ -1067,7 +1071,11 @@ pub(super) async fn materialize_external_custody_refund_plan(
     };
 
     let now = Utc::now();
-    let maybe_plan = if source.asset == source.order.source_asset {
+    let maybe_plan = if source.asset == source.order.source_asset
+        || external_custody_direct_refund_address_supported(
+            &source.asset.chain,
+            &source.order.refund_address,
+        ) {
         Some(external_custody_direct_refund_steps(
             &source.order,
             &source.vault,
@@ -1607,10 +1615,17 @@ pub(super) async fn best_hyperliquid_spot_refund_quote(
     });
 
     let mut best = None;
+    let mut best_transition_count = None;
     for path in paths {
+        let transition_count = path.transitions.len();
+        if best_transition_count.is_some_and(|count| transition_count > count) {
+            break;
+        }
+
         let path_id = path.id.clone();
         match quote_hyperliquid_spot_refund_path(deps, order, amount, path).await {
             Ok(Some(quoted)) => {
+                best_transition_count.get_or_insert(transition_count);
                 best = choose_better_refund_quote(quoted, best)?;
             }
             Ok(None) => {}
@@ -1680,7 +1695,6 @@ async fn quote_hyperliquid_spot_refund_transition(
         MarketOrderTransitionKind::AcrossBridge
         | MarketOrderTransitionKind::CctpBridge
         | MarketOrderTransitionKind::HyperliquidBridgeDeposit
-        | MarketOrderTransitionKind::HypercoreBridgeDeposit
         | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
             refund_bridge_quote_transition(
                 deps,
@@ -1707,12 +1721,17 @@ pub(super) fn quote_amount_for_hyperliquid_spot_refund_transition(
     transition: &TransitionDecl,
     cursor_amount: &str,
 ) -> Result<Option<String>, OrderActivityError> {
-    if transition.kind != MarketOrderTransitionKind::HyperliquidTrade
-        || transition.input.asset.chain.as_str() != "hyperliquid"
-        || !transition.input.asset.asset.is_native()
-        || !path.transitions[transition_index + 1..]
+    let spends_hyperliquid_usdc = transition.input.asset.chain.as_str() == "hyperliquid"
+        && transition.input.asset.asset.is_native();
+    let reserve_for_current_transfer =
+        hyperliquid_spot_transfer_requires_gas_reserve(transition.kind);
+    let reserve_for_downstream_transfer = transition.kind
+        == MarketOrderTransitionKind::HyperliquidTrade
+        && path.transitions[transition_index + 1..]
             .iter()
-            .any(|next| next.kind == MarketOrderTransitionKind::UnitWithdrawal)
+            .any(|next| hyperliquid_spot_transfer_requires_gas_reserve(next.kind));
+    if !spends_hyperliquid_usdc
+        || !(reserve_for_current_transfer || reserve_for_downstream_transfer)
     {
         return Ok(Some(cursor_amount.to_string()));
     }
@@ -1727,6 +1746,13 @@ pub(super) fn quote_amount_for_hyperliquid_spot_refund_transition(
         return Ok(None);
     }
     Ok(Some((amount - reserve).to_string()))
+}
+fn hyperliquid_spot_transfer_requires_gas_reserve(kind: MarketOrderTransitionKind) -> bool {
+    matches!(
+        kind,
+        MarketOrderTransitionKind::HyperliquidBridgeWithdrawal
+            | MarketOrderTransitionKind::UnitWithdrawal
+    )
 }
 
 pub(super) fn refund_path_compatible_with_position(
@@ -1745,8 +1771,7 @@ pub(super) fn refund_path_compatible_with_position(
             MarketOrderTransitionKind::UniversalRouterSwap => {
                 external_custody_universal_router_refund_is_supported_first_hop(path)
             }
-            MarketOrderTransitionKind::HyperliquidBridgeDeposit
-            | MarketOrderTransitionKind::HypercoreBridgeDeposit => {
+            MarketOrderTransitionKind::HyperliquidBridgeDeposit => {
                 external_vault_role == Some(CustodyVaultRole::DestinationExecution)
             }
             MarketOrderTransitionKind::UnitDeposit => true,
@@ -1951,7 +1976,7 @@ fn materialize_hyperliquid_spot_refund_transition(
             let leg = hyperliquid_spot_refund_leg(
                 quoted_path,
                 transition,
-                OrderExecutionStepType::HyperliquidBridgeWithdrawal,
+                execution_step_type_for_transition_kind(transition.kind),
             )?;
             let custody = explicit_hyperliquid_spot_refund_binding(vault);
             Ok(vec![refund_transition_hyperliquid_bridge_withdrawal_step(
@@ -1968,7 +1993,6 @@ fn materialize_hyperliquid_spot_refund_transition(
         ),
         MarketOrderTransitionKind::AcrossBridge
         | MarketOrderTransitionKind::HyperliquidBridgeDeposit
-        | MarketOrderTransitionKind::HypercoreBridgeDeposit
         | MarketOrderTransitionKind::UniversalRouterSwap
         | MarketOrderTransitionKind::UnitDeposit => materialize_derived_external_refund_transition(
             order,
@@ -2023,8 +2047,7 @@ fn materialize_derived_external_refund_transition(
         MarketOrderTransitionKind::AcrossBridge => refund_transition_across_bridge_step(
             order, source, transition, &leg, is_final, step_index, planned_at,
         )?,
-        MarketOrderTransitionKind::HyperliquidBridgeDeposit
-        | MarketOrderTransitionKind::HypercoreBridgeDeposit => {
+        MarketOrderTransitionKind::HyperliquidBridgeDeposit => {
             refund_transition_hyperliquid_bridge_deposit_step(
                 order, source, transition, &leg, step_index, planned_at,
             )?
@@ -2245,16 +2268,31 @@ pub(super) fn external_custody_direct_refund_steps(
 }
 #[cfg(test)]
 mod tests {
-    use super::external_custody_direct_balance_supported;
+    use super::{
+        external_custody_direct_balance_supported, external_custody_direct_refund_address_supported,
+    };
     use router_core::protocol::ChainId;
 
     #[test]
-    fn external_custody_direct_balance_supports_hyperevm() {
+    fn external_custody_direct_balance_supports_evm_chains() {
         assert!(external_custody_direct_balance_supported(
-            &ChainId::parse("evm:999").expect("static HyperEVM chain id"),
+            &ChainId::parse("evm:8453").expect("static Base chain id"),
         ));
         assert!(!external_custody_direct_balance_supported(
             &ChainId::parse("hyperliquid").expect("static Hyperliquid chain id"),
+        ));
+    }
+
+    #[test]
+    fn external_custody_direct_refund_requires_evm_address_for_evm_chain() {
+        let base = ChainId::parse("evm:8453").expect("static Base chain id");
+        assert!(external_custody_direct_refund_address_supported(
+            &base,
+            "0x33F65788aCa48D733c2C2444Ac9F79B18206aa92",
+        ));
+        assert!(!external_custody_direct_refund_address_supported(
+            &base,
+            "bc1qk4m6mpxulnlufegdh3w40kayhx9m722am38apn",
         ));
     }
 }

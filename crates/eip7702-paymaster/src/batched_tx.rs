@@ -112,17 +112,10 @@ impl PaymasterActor {
             .with_max_fee_per_gas(max_fee_per_gas)
             .with_max_priority_fee_per_gas(fee_estimate.max_priority_fee_per_gas);
 
-        let pending_tx = self
-            .wallet_provider
-            .send_transaction(tx)
-            .await
-            .map_err(|source| PaymasterError::EVMRpcError {
-                source,
-                loc: snafu::location!(),
-            })?;
-        let tx_hash = *pending_tx.tx_hash();
+        let tx_hash = self
+            .send_paymaster_transaction_with_retry(tx, "eip7702_batch_top_up")
+            .await?;
         record_paymaster_batch_sent(self.metric_label, executions.len());
-        wait_for_evm_receipt(&self.wallet_provider, self.metric_label, tx_hash).await?;
         Ok(tx_hash)
     }
 
@@ -209,20 +202,58 @@ impl PaymasterActor {
             .with_max_fee_per_gas(max_fee_per_gas)
             .with_max_priority_fee_per_gas(fee_estimate.max_priority_fee_per_gas);
 
-        let pending_tx = self
-            .wallet_provider
-            .send_transaction(transaction_request)
-            .await
-            .map_err(|source| PaymasterError::EVMRpcError {
-                source,
-                loc: snafu::location!(),
-            })?;
-        let tx_hash = *pending_tx.tx_hash();
-        wait_for_evm_receipt(&self.wallet_provider, self.metric_label, tx_hash).await?;
+        let tx_hash = self
+            .send_paymaster_transaction_with_retry(transaction_request, "native_top_up")
+            .await?;
         Ok(tx_hash)
     }
-}
 
+    async fn send_paymaster_transaction_with_retry(
+        &self,
+        transaction_request: TransactionRequest,
+        operation: &'static str,
+    ) -> Result<TxHash> {
+        let mut delay = EVM_RPC_RETRY_INITIAL_DELAY;
+        for attempt in 1..=EVM_RPC_RETRY_ATTEMPTS {
+            let pending_tx = self
+                .wallet_provider
+                .send_transaction(transaction_request.clone())
+                .await;
+            match pending_tx {
+                Ok(pending_tx) => {
+                    let tx_hash = *pending_tx.tx_hash();
+                    wait_for_evm_receipt(&self.wallet_provider, self.metric_label, tx_hash).await?;
+                    return Ok(tx_hash);
+                }
+                Err(source)
+                    if attempt < EVM_RPC_RETRY_ATTEMPTS
+                        && is_retryable_paymaster_submission_error(&source) =>
+                {
+                    warn!(
+                        chain = self.metric_label,
+                        operation,
+                        attempt,
+                        max_attempts = EVM_RPC_RETRY_ATTEMPTS,
+                        error = %source,
+                        "retrying EIP-7702 paymaster transaction after delegated account in-flight limit"
+                    );
+                    sleep(delay).await;
+                    delay = delay.saturating_mul(2);
+                }
+                Err(source) => {
+                    return Err(PaymasterError::EVMRpcError {
+                        source,
+                        loc: snafu::location!(),
+                    });
+                }
+            }
+        }
+
+        Err(PaymasterError::Actor {
+            message: format!("exhausted EIP-7702 paymaster submission retries for {operation}"),
+        })
+    }
+}
 async fn estimate_batched_paymaster_gas(
     actor: &PaymasterActor,
     batch_tx: TransactionRequest,
@@ -438,6 +469,11 @@ fn classify_evm_rpc_error<E: std::fmt::Display>(err: &E) -> &'static str {
     }
 }
 
+fn is_retryable_paymaster_submission_error<E: std::fmt::Display>(err: &E) -> bool {
+    let message = err.to_string().to_ascii_lowercase();
+    message.contains("in-flight transaction limit reached for delegated accounts")
+}
+
 fn is_evm_execution_revert(message: &str) -> bool {
     message.contains("execution reverted")
         || message.contains("transaction reverted")
@@ -550,5 +586,20 @@ fn ensure_evm_receipt_success(tx_hash: TxHash, succeeded: bool) -> Result<()> {
         Ok(())
     } else {
         Err(tx_reverted(tx_hash))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delegated_account_in_flight_limit_is_retryable_submission_error() {
+        assert!(is_retryable_paymaster_submission_error(
+            &"server returned an error response: in-flight transaction limit reached for delegated accounts"
+        ));
+        assert!(!is_retryable_paymaster_submission_error(
+            &"execution reverted: ERC20: transfer amount exceeds balance"
+        ));
     }
 }

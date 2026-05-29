@@ -392,13 +392,21 @@ impl BitcoinIndexer {
     }
 
     async fn current_tip_height(&self) -> Result<u64> {
-        self.rpc
-            .get_block_count()
-            .await
-            .map_err(|source| Error::BitcoinRpc {
-                method: "getblockcount",
-                source,
-            })
+        match self.rpc.get_block_count().await {
+            Ok(height) => Ok(height),
+            Err(source) => {
+                tracing::warn!(
+                    method = "getblockcount",
+                    %source,
+                    "Bitcoin RPC tip lookup failed; falling back to Esplora tip height"
+                );
+                self.esplora
+                    .get_height()
+                    .await
+                    .map(u64::from)
+                    .map_err(|source| Error::Esplora { source })
+            }
+        }
     }
 
     async fn publish_transaction_outputs(&self, source: BitcoinEventSource, tx: &Transaction) {

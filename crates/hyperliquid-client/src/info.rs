@@ -213,7 +213,9 @@ pub struct UserNonFundingLedgerUpdate {
 
 /// Non-funding ledger delta shapes documented by Hyperliquid. Variants not
 /// needed by the router/shim v1 routes decode to [`Self::Unsupported`] so new
-/// Hyperliquid ledger variants do not crash indexer ingestion.
+/// Hyperliquid ledger variants do not crash indexer ingestion. Hyperliquid
+/// returns spot token transfers as either `spotTransfer` or `send`, depending
+/// on which transfer API produced the ledger entry.
 #[derive(Debug, Clone)]
 pub enum UserNonFundingLedgerDelta {
     Deposit {
@@ -312,7 +314,7 @@ impl<'de> Deserialize<'de> for UserNonFundingLedgerDelta {
                     to_perp: delta.to_perp,
                 })
             }
-            "spotTransfer" => {
+            "spotTransfer" | "send" => {
                 #[derive(Deserialize)]
                 #[serde(rename_all = "camelCase")]
                 struct Delta {
@@ -513,5 +515,47 @@ mod tests {
         };
         assert_eq!(type_name, "vaultDeposit");
         assert_eq!(raw["usdc"], "1.23");
+    }
+
+    #[test]
+    fn send_ledger_delta_decodes_as_spot_transfer() {
+        let delta: UserNonFundingLedgerDelta = serde_json::from_value(serde_json::json!({
+            "type": "send",
+            "user": "0x33f65788aca48d733c2c2444ac9f79b18206aa92",
+            "destination": "0x6b7d1d469885c1eb3607e0d9f0943354033a9659",
+            "sourceDex": "spot",
+            "destinationDex": "spot",
+            "token": "UBTC",
+            "amount": "0.00006735",
+            "usdcValue": "5.011042",
+            "fee": "1.0",
+            "nativeTokenFee": "0.0",
+            "nonce": 1779920240111_u64,
+            "feeToken": "USDC"
+        }))
+        .expect("send delta should decode");
+
+        let UserNonFundingLedgerDelta::SpotTransfer {
+            token,
+            amount,
+            usdc_value,
+            user,
+            destination,
+            fee,
+            native_token_fee,
+            nonce,
+        } = delta
+        else {
+            panic!("expected send delta to decode as spot transfer");
+        };
+
+        assert_eq!(token, "UBTC");
+        assert_eq!(amount, "0.00006735");
+        assert_eq!(usdc_value, "5.011042");
+        assert_eq!(user, "0x33f65788aca48d733c2c2444ac9f79b18206aa92");
+        assert_eq!(destination, "0x6b7d1d469885c1eb3607e0d9f0943354033a9659");
+        assert_eq!(fee, "1.0");
+        assert_eq!(native_token_fee, "0.0");
+        assert_eq!(nonce, 1779920240111);
     }
 }

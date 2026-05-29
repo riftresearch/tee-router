@@ -269,7 +269,6 @@ impl RouteCostService {
             MarketOrderTransitionKind::AcrossBridge
             | MarketOrderTransitionKind::CctpBridge
             | MarketOrderTransitionKind::HyperliquidBridgeDeposit
-            | MarketOrderTransitionKind::HypercoreBridgeDeposit
             | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
                 self.live_bridge_cost_snapshot(transition, refreshed_at, expires_at, pricing)
                     .await
@@ -595,7 +594,6 @@ fn structural_cost_estimate(
             }
         }
         MarketOrderTransitionKind::HyperliquidBridgeDeposit
-        | MarketOrderTransitionKind::HypercoreBridgeDeposit
         | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => StructuralCostEstimate {
             estimated_fee_bps: 0,
             estimated_fee_usd_micros: 0,
@@ -791,13 +789,8 @@ mod tests {
                 MarketOrderTransitionKind::HyperliquidTrade => ProviderId::Hyperliquid,
                 MarketOrderTransitionKind::UniversalRouterSwap => ProviderId::Velora,
                 MarketOrderTransitionKind::HyperliquidBridgeDeposit
-                | MarketOrderTransitionKind::HypercoreBridgeDeposit
                 | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
-                    if kind == MarketOrderTransitionKind::HypercoreBridgeDeposit {
-                        ProviderId::HypercoreBridge
-                    } else {
-                        ProviderId::HyperliquidBridge
-                    }
+                    ProviderId::HyperliquidBridge
                 }
                 MarketOrderTransitionKind::UnitDeposit
                 | MarketOrderTransitionKind::UnitWithdrawal => ProviderId::Unit,
@@ -940,153 +933,6 @@ mod tests {
                 < path_score(&one_hop, &snapshots).total_effective_cost_usd_micros
         );
     }
-    #[test]
-    fn path_score_prefers_hyperevm_route_when_micro_usd_costs_are_lower() {
-        let cctp_arb = transition("cctp_to_arb", MarketOrderTransitionKind::CctpBridge);
-        let hl_bridge = transition(
-            "arb_hl_bridge",
-            MarketOrderTransitionKind::HyperliquidBridgeDeposit,
-        );
-        let cctp_hyperevm = transition("cctp_to_hyperevm", MarketOrderTransitionKind::CctpBridge);
-        let hypercore_bridge = transition(
-            "hyperevm_hypercore_bridge",
-            MarketOrderTransitionKind::HypercoreBridgeDeposit,
-        );
-        let trade = transition("trade", MarketOrderTransitionKind::HyperliquidTrade);
-        let withdraw = transition("withdraw", MarketOrderTransitionKind::UnitWithdrawal);
-        let now = Utc::now();
-        let mut snapshots = HashMap::new();
-        snapshots.insert(
-            cctp_arb.id.clone(),
-            RouteCostSnapshot {
-                transition_id: cctp_arb.id.clone(),
-                amount_bucket: DEFAULT_AMOUNT_BUCKET.to_string(),
-                provider: "cctp".to_string(),
-                edge_kind: "cross_chain_transfer".to_string(),
-                source_asset: cctp_arb.input.asset.clone(),
-                destination_asset: cctp_arb.output.asset.clone(),
-                estimated_fee_bps: 0,
-                estimated_fee_usd_micros: 0,
-                estimated_gas_usd_micros: 16_663,
-                estimated_latency_ms: 60_000,
-                sample_amount_usd_micros: DEFAULT_SAMPLE_AMOUNT_USD_MICROS,
-                quote_source: "test".to_string(),
-                refreshed_at: now,
-                expires_at: now,
-            },
-        );
-        snapshots.insert(
-            hl_bridge.id.clone(),
-            RouteCostSnapshot {
-                transition_id: hl_bridge.id.clone(),
-                amount_bucket: DEFAULT_AMOUNT_BUCKET.to_string(),
-                provider: "hyperliquid_bridge".to_string(),
-                edge_kind: "cross_chain_transfer".to_string(),
-                source_asset: hl_bridge.input.asset.clone(),
-                destination_asset: hl_bridge.output.asset.clone(),
-                estimated_fee_bps: 0,
-                estimated_fee_usd_micros: 0,
-                estimated_gas_usd_micros: 0,
-                estimated_latency_ms: 30_000,
-                sample_amount_usd_micros: DEFAULT_SAMPLE_AMOUNT_USD_MICROS,
-                quote_source: "test".to_string(),
-                refreshed_at: now,
-                expires_at: now,
-            },
-        );
-        snapshots.insert(
-            cctp_hyperevm.id.clone(),
-            RouteCostSnapshot {
-                transition_id: cctp_hyperevm.id.clone(),
-                amount_bucket: DEFAULT_AMOUNT_BUCKET.to_string(),
-                provider: "cctp".to_string(),
-                edge_kind: "cross_chain_transfer".to_string(),
-                source_asset: cctp_hyperevm.input.asset.clone(),
-                destination_asset: cctp_hyperevm.output.asset.clone(),
-                estimated_fee_bps: 0,
-                estimated_fee_usd_micros: 0,
-                estimated_gas_usd_micros: 8_264,
-                estimated_latency_ms: 60_000,
-                sample_amount_usd_micros: DEFAULT_SAMPLE_AMOUNT_USD_MICROS,
-                quote_source: "test".to_string(),
-                refreshed_at: now,
-                expires_at: now,
-            },
-        );
-        snapshots.insert(
-            hypercore_bridge.id.clone(),
-            RouteCostSnapshot {
-                transition_id: hypercore_bridge.id.clone(),
-                amount_bucket: DEFAULT_AMOUNT_BUCKET.to_string(),
-                provider: "hypercore_bridge".to_string(),
-                edge_kind: "cross_chain_transfer".to_string(),
-                source_asset: hypercore_bridge.input.asset.clone(),
-                destination_asset: hypercore_bridge.output.asset.clone(),
-                estimated_fee_bps: 0,
-                estimated_fee_usd_micros: 0,
-                estimated_gas_usd_micros: 0,
-                estimated_latency_ms: 30_000,
-                sample_amount_usd_micros: DEFAULT_SAMPLE_AMOUNT_USD_MICROS,
-                quote_source: "test".to_string(),
-                refreshed_at: now,
-                expires_at: now,
-            },
-        );
-        for transition in [&trade, &withdraw] {
-            snapshots.insert(
-                transition.id.clone(),
-                RouteCostSnapshot {
-                    transition_id: transition.id.clone(),
-                    amount_bucket: DEFAULT_AMOUNT_BUCKET.to_string(),
-                    provider: transition.provider.as_str().to_string(),
-                    edge_kind: transition.route_edge_kind().as_str().to_string(),
-                    source_asset: transition.input.asset.clone(),
-                    destination_asset: transition.output.asset.clone(),
-                    estimated_fee_bps: if transition.kind
-                        == MarketOrderTransitionKind::HyperliquidTrade
-                    {
-                        4
-                    } else {
-                        0
-                    },
-                    estimated_fee_usd_micros: if transition.kind
-                        == MarketOrderTransitionKind::HyperliquidTrade
-                    {
-                        400_000
-                    } else {
-                        0
-                    },
-                    estimated_gas_usd_micros: 0,
-                    estimated_latency_ms: if transition.kind
-                        == MarketOrderTransitionKind::HyperliquidTrade
-                    {
-                        1_500
-                    } else {
-                        60_000
-                    },
-                    sample_amount_usd_micros: DEFAULT_SAMPLE_AMOUNT_USD_MICROS,
-                    quote_source: "test".to_string(),
-                    refreshed_at: now,
-                    expires_at: now,
-                },
-            );
-        }
-
-        let arb_path = path(
-            "arb",
-            vec![cctp_arb, hl_bridge, trade.clone(), withdraw.clone()],
-        );
-        let hyperevm_path = path(
-            "hyperevm",
-            vec![cctp_hyperevm, hypercore_bridge, trade, withdraw],
-        );
-
-        assert!(
-            path_score(&hyperevm_path, &snapshots).total_effective_cost_usd_micros
-                < path_score(&arb_path, &snapshots).total_effective_cost_usd_micros
-        );
-    }
-
     #[test]
     fn structural_route_ranking_prefers_cctp_for_base_usdc_to_bitcoin() {
         let registry = AssetRegistry::default();
