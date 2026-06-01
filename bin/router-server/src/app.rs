@@ -101,7 +101,11 @@ pub async fn initialize_components_with_action_providers(
 
     let chain_registry = Arc::new(initialize_chain_registry(args, paymaster_mode).await?);
     let provider_policies = Arc::new(ProviderPolicyService::new(db.clone()));
-    let router_switches = Arc::new(RouterSwitchService::new(db.clone()));
+    let router_switches = Arc::new(
+        RouterSwitchService::load(db.clone())
+            .await
+            .context(crate::DatabaseInitSnafu)?,
+    );
     let provider_health = Arc::new(ProviderHealthService::new(db.clone()));
     let provider_health_poller = Arc::new(initialize_provider_health_poller(
         args,
@@ -325,7 +329,6 @@ fn validate_upstream_config(args: &RouterServerArgs) -> Result<()> {
         "Flashbots RPC URL",
         args.flashbots_rpc_url.as_deref(),
     );
-
 
     if args.production {
         require_http_url(
@@ -617,7 +620,6 @@ fn initialize_route_costs(
         &args.ethereum_mainnet_rpc_url,
         &args.arbitrum_rpc_url,
         &args.base_rpc_url,
-
         args.hyperliquid_api_url.as_deref(),
     )
     .map_err(|err| crate::Error::DatabaseInit {
@@ -633,7 +635,6 @@ fn initialize_route_costs(
             proxies.arbitrum_rpc.as_ref().map(ProxyUrl::as_str),
             proxies.base_rpc.as_ref().map(ProxyUrl::as_str),
             proxies.hyperliquid.as_ref().map(ProxyUrl::as_str),
-
         )
         .map_err(|err| crate::Error::DatabaseInit {
             source: RouterServerError::InvalidData {
@@ -727,7 +728,6 @@ async fn initialize_chain_registry(
         })?,
     );
     chain_registry.register_evm(ChainType::Arbitrum, arbitrum_chain);
-
 
     let hyperliquid_chain = Arc::new(HyperliquidChain::new(
         b"router-hyperliquid-wallet",

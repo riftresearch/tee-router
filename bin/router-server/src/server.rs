@@ -403,7 +403,7 @@ async fn create_quote(
     RouterJson(request): RouterJson<CreateQuoteRequest>,
 ) -> RouterServerResult<(StatusCode, Json<RouterOrderQuoteEnvelope>)> {
     authorize_gateway_api_request(&state, &headers)?;
-    ensure_order_intake_enabled(&state).await?;
+    ensure_order_intake_enabled(&state)?;
     let envelope = match request {
         CreateQuoteRequest::MarketOrder(market_order) => {
             let (market_order, routing) = market_order.into_parts();
@@ -443,7 +443,7 @@ async fn create_order(
 ) -> RouterServerResult<(StatusCode, Json<RouterOrderEnvelope>)> {
     authorize_gateway_api_request(&state, &headers)?;
     require_order_idempotency_key(&request)?;
-    ensure_order_intake_enabled(&state).await?;
+    ensure_order_intake_enabled(&state)?;
     let quote_for_screening = state.order_manager.get_quote(request.quote_id).await?;
     if quote_for_screening.as_limit_order().is_some() {
         return Err(limit_orders_disabled_error());
@@ -518,8 +518,8 @@ async fn get_order(
     Ok(Json(response))
 }
 
-async fn ensure_order_intake_enabled(state: &AppState) -> RouterServerResult<()> {
-    if state.router_switches.refund_only_enabled().await? {
+fn ensure_order_intake_enabled(state: &AppState) -> RouterServerResult<()> {
+    if state.router_switches.refund_only_enabled() {
         return Err(RouterServerError::Conflict {
             message: "refund_only_mode is enabled; quote and order intake are blocked".to_string(),
         });
@@ -1135,10 +1135,8 @@ async fn list_router_switches(
     headers: HeaderMap,
 ) -> RouterServerResult<Json<RouterSwitchListEnvelope>> {
     authorize_admin_api_request(&state, &headers)?;
-    let (refund_only_mode, provider_policies) = tokio::try_join!(
-        state.router_switches.refund_only_mode(),
-        state.provider_policies.list()
-    )?;
+    let refund_only_mode = state.router_switches.refund_only_mode();
+    let provider_policies = state.provider_policies.list().await?;
     Ok(Json(RouterSwitchListEnvelope {
         refund_only_mode,
         provider_policies,
