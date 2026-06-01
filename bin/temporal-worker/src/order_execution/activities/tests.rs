@@ -4777,7 +4777,6 @@ async fn test_deps_with_arbitrum_evm_balance(
     let evm_chain = Arc::new(
         EvmChain::new(
             &evm_rpc.base_url,
-            "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
             ChainType::Arbitrum,
             b"arbitrum-wallet",
             1,

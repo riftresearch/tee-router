@@ -1943,7 +1943,6 @@ async fn test_chain_registry(
 ) -> ChainRegistry {
     let base_chain = EvmChain::new_with_gas_sponsor(
         &devnet.base.anvil.endpoint(),
-        BASE_USDC_ADDRESS,
         ChainType::Base,
         b"temporal-worker-base-wallet",
         1,
@@ -1962,7 +1961,6 @@ async fn test_chain_registry(
     if across_enabled {
         let ethereum_chain = EvmChain::new_with_gas_sponsor(
             &devnet.ethereum.anvil.endpoint(),
-            ETHEREUM_USDC_ADDRESS,
             ChainType::Ethereum,
             b"temporal-worker-ethereum-wallet",
             1,
@@ -1981,7 +1979,6 @@ async fn test_chain_registry(
     if arbitrum_enabled {
         let arbitrum_chain = EvmChain::new_with_gas_sponsor(
             &devnet.arbitrum.anvil.endpoint(),
-            ARBITRUM_USDC_ADDRESS,
             ChainType::Arbitrum,
             b"temporal-worker-arbitrum-wallet",
             1,

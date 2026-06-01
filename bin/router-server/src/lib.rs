@@ -97,14 +97,6 @@ pub struct RouterServerArgs {
     #[arg(long, env = "FLASHBOTS_RPC_URL")]
     pub flashbots_rpc_url: Option<String>,
 
-    /// Ethereum reference token address
-    #[arg(
-        long,
-        env = "ETHEREUM_ALLOWED_TOKEN",
-        default_value = "0x0000000000000000000000000000000000000000"
-    )]
-    pub ethereum_reference_token: String,
-
     /// Ethereum paymaster private key used to top up EVM token vault gas
     #[arg(long, env = "ETHEREUM_PAYMASTER_PRIVATE_KEY")]
     pub ethereum_paymaster_private_key: Option<String>,
@@ -117,14 +109,6 @@ pub struct RouterServerArgs {
     #[arg(long, env = "BASE_RPC_PROXY_URL")]
     pub base_rpc_proxy_url: Option<String>,
 
-    /// Base reference token address
-    #[arg(
-        long,
-        env = "BASE_ALLOWED_TOKEN",
-        default_value = "0x0000000000000000000000000000000000000000"
-    )]
-    pub base_reference_token: String,
-
     /// Base paymaster private key used to top up EVM token vault gas
     #[arg(long, env = "BASE_PAYMASTER_PRIVATE_KEY")]
     pub base_paymaster_private_key: Option<String>,
@@ -136,14 +120,6 @@ pub struct RouterServerArgs {
     /// Optional Arbitrum RPC SOCKS5 proxy URL
     #[arg(long, env = "ARBITRUM_RPC_PROXY_URL")]
     pub arbitrum_rpc_proxy_url: Option<String>,
-
-    /// Arbitrum reference token address
-    #[arg(
-        long,
-        env = "ARBITRUM_ALLOWED_TOKEN",
-        default_value = "0x0000000000000000000000000000000000000000"
-    )]
-    pub arbitrum_reference_token: String,
 
     /// Arbitrum paymaster private key used to top up EVM token vault gas
     #[arg(long, env = "ARBITRUM_PAYMASTER_PRIVATE_KEY")]

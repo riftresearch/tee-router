@@ -43,13 +43,6 @@ struct Args {
     #[arg(long, env = "ARBITRUM_RPC_URL")]
     arbitrum_rpc_url: String,
 
-    #[arg(
-        long,
-        env = "ARBITRUM_ALLOWED_TOKEN",
-        default_value = "0xaf88d065e77c8cc2239327c5edb3a432268e5831"
-    )]
-    arbitrum_reference_token: String,
-
     #[arg(long)]
     custody_vault_id: Uuid,
 
@@ -75,7 +68,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let arbitrum_chain = Arc::new(
         EvmChain::new(
             &args.arbitrum_rpc_url,
-            &args.arbitrum_reference_token,
             ChainType::Arbitrum,
             b"router-arbitrum-wallet",
             2,

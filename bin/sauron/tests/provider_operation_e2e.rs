@@ -88,7 +88,6 @@ use tokio::{
 };
 use uuid::Uuid;
 
-const MOCK_ERC20_ADDRESS: &str = "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf";
 const BASE_USDC_ADDRESS: &str = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
 const ARBITRUM_USDC_ADDRESS: &str = "0xaf88d065e77c8cc2239327c5edb3a432268e5831";
 const MAINNET_HYPERLIQUID_BRIDGE_ADDRESS: &str = "0x2df1c51e09aecf9cacb7bc98cb1742757f163df7";
@@ -146,7 +145,6 @@ const DEFAULT_LIVE_BASE_FUNDING_RPC_URL: &str = "https://mainnet.base.org";
 const DEFAULT_LIVE_BASE_ETH_AMOUNT_WEI: &str = "60000000000000000";
 const DEFAULT_LIVE_BASE_USDC_AMOUNT: &str = "60000000";
 const LIVE_TERMINAL_TIMEOUT: Duration = Duration::from_secs(45 * 60);
-const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 const LIVE_RPC_RETRY_ATTEMPTS: usize = 10;
 const LIVE_RPC_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(2);
 const LIVE_NATIVE_SOURCE_GAS_BUFFER_WEI: u128 = 1_200_000_000_000_000;
@@ -181,13 +179,6 @@ enum RuntimeRoute {
 enum RuntimeIngressBridge {
     Across,
     Cctp,
-}
-
-#[derive(Clone, Copy)]
-struct RuntimeChainTokens {
-    ethereum_reference_token: &'static str,
-    base_reference_token: &'static str,
-    arbitrum_reference_token: &'static str,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -984,15 +975,12 @@ fn order_worker_runtime_args_from_router_args(args: &RouterServerArgs) -> OrderW
         ethereum_mainnet_rpc_url: args.ethereum_mainnet_rpc_url.clone(),
         ethereum_mainnet_rpc_proxy_url: args.ethereum_mainnet_rpc_proxy_url.clone(),
         flashbots_rpc_url: args.flashbots_rpc_url.clone(),
-        ethereum_reference_token: args.ethereum_reference_token.clone(),
         ethereum_paymaster_private_key: args.ethereum_paymaster_private_key.clone(),
         base_rpc_url: args.base_rpc_url.clone(),
         base_rpc_proxy_url: args.base_rpc_proxy_url.clone(),
-        base_reference_token: args.base_reference_token.clone(),
         base_paymaster_private_key: args.base_paymaster_private_key.clone(),
         arbitrum_rpc_url: args.arbitrum_rpc_url.clone(),
         arbitrum_rpc_proxy_url: args.arbitrum_rpc_proxy_url.clone(),
-        arbitrum_reference_token: args.arbitrum_reference_token.clone(),
         arbitrum_paymaster_private_key: args.arbitrum_paymaster_private_key.clone(),
 
         bitcoin_rpc_url: args.bitcoin_rpc_url.clone(),
@@ -1038,41 +1026,10 @@ async fn reserve_local_port() -> u16 {
     port
 }
 
-fn route_chain_tokens(route: RuntimeRoute) -> RuntimeChainTokens {
-    match route {
-        RuntimeRoute::BaseEthToBtc => RuntimeChainTokens {
-            ethereum_reference_token: MOCK_ERC20_ADDRESS,
-            base_reference_token: MOCK_ERC20_ADDRESS,
-            arbitrum_reference_token: MOCK_ERC20_ADDRESS,
-        },
-        RuntimeRoute::BaseUsdcToBtc => RuntimeChainTokens {
-            ethereum_reference_token: MOCK_ERC20_ADDRESS,
-            base_reference_token: BASE_USDC_ADDRESS,
-            arbitrum_reference_token: ARBITRUM_USDC_ADDRESS,
-        },
-    }
-}
-
-fn live_route_chain_tokens(route: RuntimeRoute) -> RuntimeChainTokens {
-    match route {
-        RuntimeRoute::BaseEthToBtc => RuntimeChainTokens {
-            ethereum_reference_token: ZERO_ADDRESS,
-            base_reference_token: ZERO_ADDRESS,
-            arbitrum_reference_token: ZERO_ADDRESS,
-        },
-        RuntimeRoute::BaseUsdcToBtc => RuntimeChainTokens {
-            ethereum_reference_token: ZERO_ADDRESS,
-            base_reference_token: BASE_USDC_ADDRESS,
-            arbitrum_reference_token: ARBITRUM_USDC_ADDRESS,
-        },
-    }
-}
-
 fn router_args(
     devnet: &RiftDevnet,
     config_dir: &std::path::Path,
     database_url: String,
-    chain_tokens: RuntimeChainTokens,
     temporal_address: &str,
     mocks: &MockIntegratorServer,
 ) -> RouterServerArgs {
@@ -1091,15 +1048,12 @@ fn router_args(
         ethereum_mainnet_rpc_url: devnet.ethereum.anvil.endpoint_url().to_string(),
         ethereum_mainnet_rpc_proxy_url: None,
         flashbots_rpc_url: None,
-        ethereum_reference_token: chain_tokens.ethereum_reference_token.to_string(),
         ethereum_paymaster_private_key: Some(anvil_private_key(&devnet.ethereum)),
         base_rpc_url: devnet.base.anvil.endpoint_url().to_string(),
         base_rpc_proxy_url: None,
-        base_reference_token: chain_tokens.base_reference_token.to_string(),
         base_paymaster_private_key: Some(anvil_private_key(&devnet.base)),
         arbitrum_rpc_url: devnet.arbitrum.anvil.endpoint_url().to_string(),
         arbitrum_rpc_proxy_url: None,
-        arbitrum_reference_token: chain_tokens.arbitrum_reference_token.to_string(),
         arbitrum_paymaster_private_key: Some(anvil_private_key(&devnet.arbitrum)),
 
         bitcoin_rpc_url: bitcoin_rpc_url(devnet),
@@ -1171,7 +1125,6 @@ fn router_args(
 fn live_router_args(
     config_dir: &std::path::Path,
     database_url: String,
-    chain_tokens: RuntimeChainTokens,
     temporal_address: &str,
     live: &LiveRuntimeConfig,
 ) -> RouterServerArgs {
@@ -1190,15 +1143,12 @@ fn live_router_args(
         ethereum_mainnet_rpc_url: live.ethereum_rpc_url.clone(),
         ethereum_mainnet_rpc_proxy_url: None,
         flashbots_rpc_url: None,
-        ethereum_reference_token: chain_tokens.ethereum_reference_token.to_string(),
         ethereum_paymaster_private_key: live.ethereum_paymaster_private_key.clone(),
         base_rpc_url: live.base_rpc_url.clone(),
         base_rpc_proxy_url: None,
-        base_reference_token: chain_tokens.base_reference_token.to_string(),
         base_paymaster_private_key: live.base_paymaster_private_key.clone(),
         arbitrum_rpc_url: live.arbitrum_rpc_url.clone(),
         arbitrum_rpc_proxy_url: None,
-        arbitrum_reference_token: chain_tokens.arbitrum_reference_token.to_string(),
         arbitrum_paymaster_private_key: live.arbitrum_paymaster_private_key.clone(),
         bitcoin_rpc_url: live.bitcoin_rpc_url.clone(),
         bitcoin_rpc_proxy_url: None,
@@ -2630,12 +2580,10 @@ async fn run_live_runtime_route(route: RuntimeRoute) {
     let database_url = create_test_database(&postgres.admin_database_url).await;
     let state_database_url = create_test_database(&postgres.admin_database_url).await;
     let config_dir = tempfile::tempdir().expect("router live config dir");
-    let chain_tokens = live_route_chain_tokens(route);
     let mut temporal = TestTemporal::start().await;
     let args = live_router_args(
         config_dir.path(),
         database_url.clone(),
-        chain_tokens,
         temporal.temporal_address(),
         &live,
     );
@@ -2865,13 +2813,11 @@ async fn run_mock_runtime_route(route: RuntimeRoute) {
     ];
     let config_dir = tempfile::tempdir().expect("router config dir");
     let mocks = spawn_runtime_mocks(&devnet, route).await;
-    let chain_tokens = route_chain_tokens(route);
     let mut temporal = TestTemporal::start().await;
     let args = router_args(
         &devnet,
         config_dir.path(),
         database_url.clone(),
-        chain_tokens,
         temporal.temporal_address(),
         &mocks,
     );

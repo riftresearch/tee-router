@@ -33,13 +33,6 @@ struct Args {
     #[arg(long, env = "BASE_RPC_URL")]
     base_rpc_url: String,
 
-    #[arg(
-        long,
-        env = "BASE_ALLOWED_TOKEN",
-        default_value = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
-    )]
-    base_reference_token: String,
-
     #[arg(long, env = "BASE_PAYMASTER_PRIVATE_KEY")]
     base_paymaster_private_key: Option<String>,
 
@@ -65,7 +58,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Arc::new(
             EvmChain::new_with_gas_sponsor(
                 &args.base_rpc_url,
-                &args.base_reference_token,
                 ChainType::Base,
                 b"router-base-wallet",
                 2,

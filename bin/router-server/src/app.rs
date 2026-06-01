@@ -671,7 +671,6 @@ async fn initialize_chain_registry(
     let ethereum_chain = Arc::new(
         EvmChain::new_with_gas_sponsor_and_proxy_urls(
             &args.ethereum_mainnet_rpc_url,
-            &args.ethereum_reference_token,
             ChainType::Ethereum,
             b"router-ethereum-wallet",
             4,
@@ -692,7 +691,6 @@ async fn initialize_chain_registry(
     let base_chain = Arc::new(
         EvmChain::new_with_gas_sponsor_and_proxy_urls(
             &args.base_rpc_url,
-            &args.base_reference_token,
             ChainType::Base,
             b"router-base-wallet",
             2,
@@ -713,7 +711,6 @@ async fn initialize_chain_registry(
     let arbitrum_chain = Arc::new(
         EvmChain::new_with_gas_sponsor_and_proxy_urls(
             &args.arbitrum_rpc_url,
-            &args.arbitrum_reference_token,
             ChainType::Arbitrum,
             b"router-arbitrum-wallet",
             2,
@@ -968,15 +965,12 @@ mod tests {
             ethereum_mainnet_rpc_url: "https://eth.example".to_string(),
             ethereum_mainnet_rpc_proxy_url: None,
             flashbots_rpc_url: None,
-            ethereum_reference_token: "0x0000000000000000000000000000000000000000".to_string(),
             ethereum_paymaster_private_key: None,
             base_rpc_url: "https://base.example".to_string(),
             base_rpc_proxy_url: None,
-            base_reference_token: "0x0000000000000000000000000000000000000000".to_string(),
             base_paymaster_private_key: None,
             arbitrum_rpc_url: "https://arb.example".to_string(),
             arbitrum_rpc_proxy_url: None,
-            arbitrum_reference_token: "0x0000000000000000000000000000000000000000".to_string(),
             arbitrum_paymaster_private_key: None,
             bitcoin_rpc_url: "http://btc.example".to_string(),
             bitcoin_rpc_proxy_url: None,

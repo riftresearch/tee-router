@@ -117,7 +117,6 @@ Required work:
 
 1. If the chain is EVM-compatible, instantiate `EvmChain`.
    - RPC URL
-   - reference token address
    - `ChainType`
    - key-derivation domain separator
    - minimum confirmations
@@ -180,7 +179,6 @@ Required work:
 1. Add CLI/env args.
    - RPC URL
    - token indexer URL if used by Sauron
-   - reference token address if EVM
    - paymaster private key if router-funded actions are possible
    - chain-specific network selector if needed
    - confirmation/finality knobs if not hard-coded

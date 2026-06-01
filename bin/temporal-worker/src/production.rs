@@ -88,14 +88,6 @@ pub struct OrderWorkerRuntimeArgs {
     #[arg(long, env = "FLASHBOTS_RPC_URL")]
     pub flashbots_rpc_url: Option<String>,
 
-    /// Ethereum reference token address
-    #[arg(
-        long,
-        env = "ETHEREUM_ALLOWED_TOKEN",
-        default_value = "0x0000000000000000000000000000000000000000"
-    )]
-    pub ethereum_reference_token: String,
-
     /// Ethereum paymaster private key used to top up EVM token vault gas
     #[arg(long, env = "ETHEREUM_PAYMASTER_PRIVATE_KEY")]
     pub ethereum_paymaster_private_key: Option<String>,
@@ -108,14 +100,6 @@ pub struct OrderWorkerRuntimeArgs {
     #[arg(long, env = "BASE_RPC_PROXY_URL")]
     pub base_rpc_proxy_url: Option<String>,
 
-    /// Base reference token address
-    #[arg(
-        long,
-        env = "BASE_ALLOWED_TOKEN",
-        default_value = "0x0000000000000000000000000000000000000000"
-    )]
-    pub base_reference_token: String,
-
     /// Base paymaster private key used to top up EVM token vault gas
     #[arg(long, env = "BASE_PAYMASTER_PRIVATE_KEY")]
     pub base_paymaster_private_key: Option<String>,
@@ -127,14 +111,6 @@ pub struct OrderWorkerRuntimeArgs {
     /// Optional Arbitrum RPC SOCKS5 proxy URL
     #[arg(long, env = "ARBITRUM_RPC_PROXY_URL")]
     pub arbitrum_rpc_proxy_url: Option<String>,
-
-    /// Arbitrum reference token address
-    #[arg(
-        long,
-        env = "ARBITRUM_ALLOWED_TOKEN",
-        default_value = "0x0000000000000000000000000000000000000000"
-    )]
-    pub arbitrum_reference_token: String,
 
     /// Arbitrum paymaster private key used to top up EVM token vault gas
     #[arg(long, env = "ARBITRUM_PAYMASTER_PRIVATE_KEY")]
@@ -699,7 +675,6 @@ async fn initialize_chain_registry(args: &OrderWorkerRuntimeArgs) -> WorkerResul
     let ethereum_chain = Arc::new(
         EvmChain::new_with_gas_sponsor_and_proxy_urls(
             &args.ethereum_mainnet_rpc_url,
-            &args.ethereum_reference_token,
             ChainType::Ethereum,
             b"router-ethereum-wallet",
             4,
@@ -716,7 +691,6 @@ async fn initialize_chain_registry(args: &OrderWorkerRuntimeArgs) -> WorkerResul
     let base_chain = Arc::new(
         EvmChain::new_with_gas_sponsor_and_proxy_urls(
             &args.base_rpc_url,
-            &args.base_reference_token,
             ChainType::Base,
             b"router-base-wallet",
             2,
@@ -733,7 +707,6 @@ async fn initialize_chain_registry(args: &OrderWorkerRuntimeArgs) -> WorkerResul
     let arbitrum_chain = Arc::new(
         EvmChain::new_with_gas_sponsor_and_proxy_urls(
             &args.arbitrum_rpc_url,
-            &args.arbitrum_reference_token,
             ChainType::Arbitrum,
             b"router-arbitrum-wallet",
             2,

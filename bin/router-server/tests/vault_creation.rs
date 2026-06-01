@@ -273,7 +273,6 @@ async fn harness() -> &'static TestHarness {
             let eth_rpc = devnet.ethereum.anvil.endpoint();
             let ethereum_chain = EvmChain::new_with_gas_sponsor(
                 &eth_rpc,
-                MOCK_ERC20_ADDRESS,
                 ChainType::Ethereum,
                 b"router-ethereum-wallet",
                 4,
@@ -288,7 +287,6 @@ async fn harness() -> &'static TestHarness {
             let base_rpc = devnet.base.anvil.endpoint();
             let base_chain = EvmChain::new_with_gas_sponsor(
                 &base_rpc,
-                MOCK_ERC20_ADDRESS,
                 ChainType::Base,
                 b"router-base-wallet",
                 2,
@@ -303,7 +301,6 @@ async fn harness() -> &'static TestHarness {
             let arbitrum_rpc = devnet.arbitrum.anvil.endpoint();
             let arbitrum_chain = EvmChain::new_with_gas_sponsor(
                 &arbitrum_rpc,
-                MOCK_ERC20_ADDRESS,
                 ChainType::Arbitrum,
                 b"router-arbitrum-wallet",
                 2,
@@ -983,15 +980,12 @@ fn test_router_args(
         ethereum_mainnet_rpc_url: harness.ethereum_endpoint_url().to_string(),
         ethereum_mainnet_rpc_proxy_url: None,
         flashbots_rpc_url: None,
-        ethereum_reference_token: MOCK_ERC20_ADDRESS.to_string(),
         ethereum_paymaster_private_key: Some(harness.ethereum_spawned_api_paymaster_private_key()),
         base_rpc_url: harness.base_endpoint_url().to_string(),
         base_rpc_proxy_url: None,
-        base_reference_token: MOCK_ERC20_ADDRESS.to_string(),
         base_paymaster_private_key: Some(harness.base_spawned_api_paymaster_private_key()),
         arbitrum_rpc_url: harness.arbitrum_endpoint_url().to_string(),
         arbitrum_rpc_proxy_url: None,
-        arbitrum_reference_token: MOCK_ERC20_ADDRESS.to_string(),
         arbitrum_paymaster_private_key: Some(harness.arbitrum_spawned_api_paymaster_private_key()),
         bitcoin_rpc_url: harness.bitcoin_rpc_url(),
         bitcoin_rpc_proxy_url: None,

@@ -1107,7 +1107,6 @@ async fn live_quote_chain_registry() -> TestResult<ChainRegistry> {
         Arc::new(
             EvmChain::new(
                 "http://127.0.0.1:8545",
-                ETHEREUM_USDC,
                 ChainType::Ethereum,
                 b"router-ethereum-wallet",
                 4,
@@ -1121,7 +1120,6 @@ async fn live_quote_chain_registry() -> TestResult<ChainRegistry> {
         Arc::new(
             EvmChain::new(
                 "http://127.0.0.1:8547",
-                ARBITRUM_USDC,
                 ChainType::Arbitrum,
                 b"router-arbitrum-wallet",
                 2,
@@ -1135,7 +1133,6 @@ async fn live_quote_chain_registry() -> TestResult<ChainRegistry> {
         Arc::new(
             EvmChain::new(
                 "http://127.0.0.1:8546",
-                BASE_USDC,
                 ChainType::Base,
                 b"router-base-wallet",
                 2,

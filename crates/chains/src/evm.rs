@@ -62,7 +62,6 @@ pub struct EvmChain {
     rpc_url: String,
     rpc_proxy_url: Option<String>,
     flashbots_rpc_url: Option<String>,
-    allowed_token: Address,
     chain_type: ChainType,
     wallet_seed_tag: Vec<u8>,
     min_confirmations: u32,
@@ -134,7 +133,6 @@ enum EvmPaymasterCommand {
 impl EvmChain {
     pub async fn new(
         rpc_url: &str,
-        allowed_token: &str,
         chain_type: ChainType,
         wallet_seed_tag: &[u8],
         min_confirmations: u32,
@@ -142,7 +140,6 @@ impl EvmChain {
     ) -> Result<Self> {
         Self::new_with_gas_sponsor(
             rpc_url,
-            allowed_token,
             chain_type,
             wallet_seed_tag,
             min_confirmations,
@@ -154,7 +151,6 @@ impl EvmChain {
 
     pub async fn new_with_gas_sponsor(
         rpc_url: &str,
-        allowed_token: &str,
         chain_type: ChainType,
         wallet_seed_tag: &[u8],
         min_confirmations: u32,
@@ -163,7 +159,6 @@ impl EvmChain {
     ) -> Result<Self> {
         Self::new_with_gas_sponsor_and_proxy_urls(
             rpc_url,
-            allowed_token,
             chain_type,
             wallet_seed_tag,
             min_confirmations,
@@ -177,7 +172,6 @@ impl EvmChain {
 
     pub async fn new_with_gas_sponsor_and_proxy_urls(
         rpc_url: &str,
-        allowed_token: &str,
         chain_type: ChainType,
         wallet_seed_tag: &[u8],
         min_confirmations: u32,
@@ -198,10 +192,6 @@ impl EvmChain {
             .http_with_client(reqwest_client, url);
 
         let provider = ProviderBuilder::new().connect_client(client).erased();
-        let allowed_token =
-            Address::from_str(allowed_token).map_err(|_| crate::Error::Serialization {
-                message: "Invalid allowed token address".to_string(),
-            })?;
         let gas_sponsor = gas_sponsor
             .map(|config| {
                 EvmGasSponsor::start(
@@ -219,7 +209,6 @@ impl EvmChain {
             rpc_url: rpc_url.to_string(),
             rpc_proxy_url: rpc_proxy_url.map(str::to_string),
             flashbots_rpc_url: flashbots_rpc_url.map(str::to_string),
-            allowed_token,
             chain_type,
             wallet_seed_tag: wallet_seed_tag.to_vec(),
             min_confirmations,
@@ -2297,10 +2286,6 @@ impl ChainOperations for EvmChain {
                 message: "Invalid token address".to_string(),
             })?;
 
-        if token_address != self.allowed_token {
-            return Ok(UserDepositCandidateStatus::TransferNotFound);
-        }
-
         let recipient_address =
             Address::from_str(recipient_address).map_err(|_| crate::Error::Serialization {
                 message: "Invalid address".to_string(),
@@ -2335,7 +2320,7 @@ impl ChainOperations for EvmChain {
             extract_all_transfers_from_transaction_receipt(&transaction_receipt)
                 .into_iter()
                 .find(|transfer_log| {
-                    transfer_log.address() == self.allowed_token
+                    transfer_log.address() == token_address
                         && transfer_log.log_index == Some(transfer_index)
                         && transfer_log.inner.data.to == recipient_address
                 });

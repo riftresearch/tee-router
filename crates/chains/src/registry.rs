@@ -74,7 +74,6 @@ mod tests {
         let evm_chain = Arc::new(
             EvmChain::new(
                 "http://localhost:8545",
-                "0x0000000000000000000000000000000000000001",
                 ChainType::Ethereum,
                 b"ethereum-wallet",
                 4,
