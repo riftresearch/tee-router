@@ -407,13 +407,6 @@ async fn create_quote(
     let envelope = match request {
         CreateQuoteRequest::MarketOrder(market_order) => {
             let (market_order, routing) = market_order.into_parts();
-            screen_user_address(
-                &state,
-                AddressScreeningPurpose::Recipient,
-                &market_order.to_asset.chain,
-                &market_order.recipient_address,
-            )
-            .await?;
             state
                 .order_manager
                 .quote_market_order_with_routing(market_order, routing)
