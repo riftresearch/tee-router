@@ -48,6 +48,10 @@ pub struct RouterServerArgs {
     #[arg(short, long, default_value = "4522")]
     pub port: u16,
 
+    /// CORS domain to allow (supports wildcards like "*.example.com")
+    #[arg(long = "corsdomain", env = "CORS_DOMAIN")]
+    pub cors_domain: Option<String>,
+
     /// Database URL
     #[arg(
         long,
@@ -153,10 +157,6 @@ pub struct RouterServerArgs {
     /// released internal bitcoin custody
     #[arg(long, env = "BITCOIN_PAYMASTER_PRIVATE_KEY")]
     pub bitcoin_paymaster_private_key: Option<String>,
-
-    /// CORS domain to allow (supports wildcards like "*.example.com")
-    #[arg(long = "corsdomain", env = "CORS_DOMAIN")]
-    pub cors_domain: Option<String>,
 
     /// Chainalysis Address Screening API base URL
     #[arg(long, env = "CHAINALYSIS_HOST")]
