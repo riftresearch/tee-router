@@ -175,15 +175,15 @@ API v1.0.0`. Do not confuse the two.
 
 ## End-to-end live test (CLI)
 
-The `router-cli` binary runs the full flow: quote → create order → broadcast
+The `router-gateway-cli` binary runs the full flow: quote → create order → broadcast
 source-chain deposit → optionally watch status.
 
 ```bash
-cargo build --release --bin router-cli
+cargo build --release --bin router-gateway-cli
 
 set -a && . ./.env && set +a   # loads LIVE_TEST_PRIVATE_KEY etc.
 
-./target/release/router-cli swap \
+./target/release/router-gateway-cli swap \
   --gateway-url https://router-gateway-v3-production.up.railway.app \
   --rpc-url "$BASE_RPC_URL" \
   --private-key "$LIVE_TEST_PRIVATE_KEY" \
@@ -191,7 +191,7 @@ set -a && . ./.env && set +a   # loads LIVE_TEST_PRIVATE_KEY etc.
   --from-amount 40 --to-address "$ROUTER_LIVE_BTC_RECIPIENT_ADDRESS" \
   -y
 
-./target/release/router-cli status <orderId> \
+./target/release/router-gateway-cli status <orderId> \
   --gateway-url https://router-gateway-v3-production.up.railway.app --watch
 ```
 

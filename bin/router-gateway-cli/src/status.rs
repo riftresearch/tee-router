@@ -1,4 +1,4 @@
-//! `router-cli status` — read, or watch, an order's status.
+//! `router-gateway-cli status` — read, or watch, an order's status.
 
 use std::time::Duration;
 

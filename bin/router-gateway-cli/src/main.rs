@@ -1,4 +1,4 @@
-//! `router-cli` — a command-line client/SDK shim for the Rift router gateway.
+//! `router-gateway-cli` — a command-line client/SDK shim for the Rift router gateway.
 //!
 //! `swap` runs a full source-to-destination swap: quote, confirm, create the
 //! order, and broadcast the source-chain deposit. `status` reads (or watches)
@@ -16,7 +16,7 @@ use eyre::Result;
 
 #[derive(Parser)]
 #[command(
-    name = "router-cli",
+    name = "router-gateway-cli",
     about = "Command-line client for the Rift router gateway",
     version
 )]
@@ -42,7 +42,7 @@ struct SwapCmd {
     #[arg(long)]
     rpc_url: String,
     /// Source-chain private key (EVM hex, or Bitcoin WIF/hex).
-    #[arg(long, env = "ROUTER_CLI_PRIVATE_KEY", hide_env_values = true)]
+    #[arg(long, env = "ROUTER_GATEWAY_CLI_PRIVATE_KEY", hide_env_values = true)]
     private_key: String,
     /// Source asset, e.g. `Ethereum.USDC` or `Bitcoin.BTC`.
     #[arg(long)]

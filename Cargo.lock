@@ -6332,24 +6332,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "router-cli"
-version = "0.2.25"
-dependencies = [
- "alloy",
- "bitcoin",
- "clap",
- "eyre",
- "hex",
- "hyperliquid-client",
- "reqwest",
- "router-gateway-sdk",
- "serde",
- "serde_json",
- "tokio",
- "uuid",
-]
-
-[[package]]
 name = "router-core"
 version = "0.2.25"
 dependencies = [
@@ -6381,6 +6363,24 @@ dependencies = [
  "url",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "router-gateway-cli"
+version = "0.2.25"
+dependencies = [
+ "alloy",
+ "bitcoin",
+ "clap",
+ "eyre",
+ "hex",
+ "hyperliquid-client",
+ "reqwest",
+ "router-gateway-sdk",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

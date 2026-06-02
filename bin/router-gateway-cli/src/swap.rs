@@ -1,4 +1,4 @@
-//! `router-cli swap` — quote, confirm, create the order, broadcast the deposit.
+//! `router-gateway-cli swap` — quote, confirm, create the order, broadcast the deposit.
 
 use std::io::{self, Write};
 
@@ -82,7 +82,7 @@ pub async fn run(args: SwapArgs) -> Result<()> {
             from_address: from_address.clone(),
             to_address: args.to_address.clone(),
             refund_address: Some(from_address.clone()),
-            idempotency_key: format!("router-cli-{}", Uuid::now_v7()),
+            idempotency_key: format!("router-gateway-cli-{}", Uuid::now_v7()),
             amount_format: Some(AmountFormat::Raw),
         })
         .await
@@ -135,7 +135,7 @@ pub async fn run(args: SwapArgs) -> Result<()> {
     println!("  status:       {}", order.status);
     println!();
     println!(
-        "Track it:  router-cli status {} --gateway-url {}",
+        "Track it:  router-gateway-cli status {} --gateway-url {}",
         order.order_id, args.gateway_url
     );
     Ok(())

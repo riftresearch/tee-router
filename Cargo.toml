@@ -4,7 +4,7 @@ members = [
     "bin/api-key-gen",
     "bin/devnet-cli",
     "bin/router-loadgen",
-    "bin/router-cli",
+    "bin/router-gateway-cli",
     "bin/rand-wallet",
     "bin/router-server",
     "bin/sauron",

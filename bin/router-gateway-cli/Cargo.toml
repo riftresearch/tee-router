@@ -1,12 +1,12 @@
 [package]
-name = "router-cli"
+name = "router-gateway-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "router-cli"
+name = "router-gateway-cli"
 path = "src/main.rs"
 
 [dependencies]

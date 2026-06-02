@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 usage() {
   cat <<'USAGE'
-Run the live-local fast venue smoke suite with router-cli.
+Run the live-local fast venue smoke suite with router-gateway-cli.
 
 This spends real funds from LIVE_TEST_PRIVATE_KEY. It loads .env and
 .env.live-local from the current repo worktree and writes artifacts under
@@ -23,8 +23,8 @@ Options:
   --list                      list available swaps and exit without spending funds
   --gateway-url URL           router gateway URL (default: http://localhost:3001)
   --recipient ADDRESS         destination recipient (default: live local EVM wallet)
-  --router-cli PATH           router-cli path (default: ./target/release/router-cli)
-  --no-build                  do not run cargo build --release --bin router-cli first
+  --router-gateway-cli PATH   router-gateway-cli path (default: ./target/release/router-gateway-cli)
+  --no-build                  do not run cargo build --release --bin router-gateway-cli first
   -h, --help                  show this help
 
 Sequential default plan:
@@ -45,7 +45,7 @@ USAGE
 MODE="sequential"
 GATEWAY_URL="http://localhost:3001"
 RECIPIENT="0x33F65788aCa48D733c2C2444Ac9F79B18206aa92"
-ROUTER_CLI="./target/release/router-cli"
+ROUTER_GATEWAY_CLI="./target/release/router-gateway-cli"
 BUILD_CLI=1
 LIST_ONLY=0
 SELECTORS=()
@@ -84,9 +84,9 @@ while [[ $# -gt 0 ]]; do
       RECIPIENT="$2"
       shift 2
       ;;
-    --router-cli)
-      [[ $# -ge 2 ]] || { echo "--router-cli requires a path" >&2; exit 2; }
-      ROUTER_CLI="$2"
+    --router-gateway-cli)
+      [[ $# -ge 2 ]] || { echo "--router-gateway-cli requires a path" >&2; exit 2; }
+      ROUTER_GATEWAY_CLI="$2"
       shift 2
       ;;
     --no-build)
@@ -253,14 +253,14 @@ if [[ "${TEE_ROUTER_LIVE_LOCAL_ACK:-}" != "I_UNDERSTAND_THIS_USES_REAL_FUNDS" ]]
   echo "TEE_ROUTER_LIVE_LOCAL_ACK must be I_UNDERSTAND_THIS_USES_REAL_FUNDS" >&2
   exit 2
 fi
-export ROUTER_CLI_PRIVATE_KEY="$LIVE_TEST_PRIVATE_KEY"
+export ROUTER_GATEWAY_CLI_PRIVATE_KEY="$LIVE_TEST_PRIVATE_KEY"
 
 if [[ "$BUILD_CLI" -eq 1 ]]; then
-  cargo build --release --bin router-cli
+  cargo build --release --bin router-gateway-cli
 fi
 
-if [[ ! -x "$ROUTER_CLI" ]]; then
-  echo "router-cli is not executable: $ROUTER_CLI" >&2
+if [[ ! -x "$ROUTER_GATEWAY_CLI" ]]; then
+  echo "router-gateway-cli is not executable: $ROUTER_GATEWAY_CLI" >&2
   exit 2
 fi
 
@@ -321,7 +321,7 @@ run_swap() {
   local name="${NAMES[$i]}"
   local swap_log="$RUN_DIR/${name}.swap.log"
   echo "Starting $name"
-  "$ROUTER_CLI" swap \
+  "$ROUTER_GATEWAY_CLI" swap \
     --gateway-url "$GATEWAY_URL" \
     --rpc-url "${RPC_URLS[$i]}" \
     --from "${FROMS[$i]}" \
@@ -348,7 +348,7 @@ watch_swap() {
   [[ -f "$order_file" ]] || { echo "missing order id for $name" >&2; return 1; }
   local order_id
   order_id="$(<"$order_file")"
-  "$ROUTER_CLI" status "$order_id" \
+  "$ROUTER_GATEWAY_CLI" status "$order_id" \
     --gateway-url "$GATEWAY_URL" \
     --watch \
     > "$status_log" 2>&1

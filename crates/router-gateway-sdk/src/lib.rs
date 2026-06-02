@@ -279,7 +279,7 @@ mod tests {
             from_address: "a".to_string(),
             to_address: "b".to_string(),
             refund_address: None,
-            idempotency_key: "router-cli-0000000000000000".to_string(),
+            idempotency_key: "router-gateway-cli-0000000000000000".to_string(),
             amount_format: Some(AmountFormat::Raw),
         };
         let json = serde_json::to_value(&request).expect("serialize");
