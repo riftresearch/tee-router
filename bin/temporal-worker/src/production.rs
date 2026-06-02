@@ -18,7 +18,7 @@ use router_core::{
             CctpHttpProviderConfig, CctpTransferMode, VeloraHttpProviderConfig,
         },
         custody_action_executor::{
-            bitcoin_address_from_private_key, evm_address_from_private_key, CustodyActionExecutor,
+            evm_address_from_private_key, CustodyActionExecutor,
             HyperliquidCallNetwork, HyperliquidRuntimeConfig, PaymasterRegistry,
         },
         upstream_proxy::{
@@ -140,10 +140,6 @@ pub struct OrderWorkerRuntimeArgs {
     /// Bitcoin Network
     #[arg(long, env = "BITCOIN_NETWORK", default_value = "bitcoin")]
     pub bitcoin_network: bitcoin::Network,
-
-    /// Bitcoin paymaster private key used as the recovery/sweep destination for released custody
-    #[arg(long, env = "BITCOIN_PAYMASTER_PRIVATE_KEY")]
-    pub bitcoin_paymaster_private_key: Option<String>,
 
     /// Across API base URL
     #[arg(long, env = "ACROSS_API_URL")]
@@ -820,13 +816,6 @@ fn paymaster_registry(args: &OrderWorkerRuntimeArgs) -> WorkerResult<PaymasterRe
         let address = evm_address_from_private_key(&private_key)
             .map_err(|source| config_error(source.to_string()))?;
         registry.register(ChainType::Arbitrum, address);
-    }
-    if let Some(private_key) =
-        normalize_optional_string(args.bitcoin_paymaster_private_key.as_deref())
-    {
-        let address = bitcoin_address_from_private_key(&private_key, args.bitcoin_network)
-            .map_err(|source| config_error(source.to_string()))?;
-        registry.register(ChainType::Bitcoin, address);
     }
     if let Some(private_key) =
         normalize_optional_string(args.hyperliquid_paymaster_private_key.as_deref())

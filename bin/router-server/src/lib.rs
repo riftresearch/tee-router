@@ -153,11 +153,6 @@ pub struct RouterServerArgs {
     #[arg(long, env = "BITCOIN_NETWORK", default_value = "bitcoin")]
     pub bitcoin_network: bitcoin::Network,
 
-    /// Bitcoin paymaster private key used as the recovery/sweep destination for
-    /// released internal bitcoin custody
-    #[arg(long, env = "BITCOIN_PAYMASTER_PRIVATE_KEY")]
-    pub bitcoin_paymaster_private_key: Option<String>,
-
     /// Chainalysis Address Screening API base URL
     #[arg(long, env = "CHAINALYSIS_HOST")]
     pub chainalysis_host: Option<String>,

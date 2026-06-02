@@ -978,7 +978,6 @@ mod tests {
             untrusted_esplora_http_server_url: "https://esplora.example".to_string(),
             esplora_proxy_url: None,
             bitcoin_network: bitcoin::Network::Bitcoin,
-            bitcoin_paymaster_private_key: None,
             cors_domain: None,
             chainalysis_host: None,
             chainalysis_token: None,

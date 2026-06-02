@@ -993,7 +993,6 @@ fn test_router_args(
         untrusted_esplora_http_server_url: harness.esplora_url(),
         esplora_proxy_url: None,
         bitcoin_network: bitcoin::Network::Regtest,
-        bitcoin_paymaster_private_key: Some(regtest_paymaster_private_key()),
         cors_domain: None,
         chainalysis_host: None,
         chainalysis_token: None,
@@ -1265,11 +1264,6 @@ fn fresh_regtest_btc_address() -> String {
     let public_key =
         bitcoin::CompressedPublicKey::from_private_key(&secp, &private_key).expect("public key");
     bitcoin::Address::p2wpkh(&public_key, bitcoin::Network::Regtest).to_string()
-}
-
-fn regtest_paymaster_private_key() -> String {
-    let secret_key = bitcoin::secp256k1::SecretKey::from_slice(&[7_u8; 32]).expect("secret key");
-    bitcoin::PrivateKey::new(secret_key, bitcoin::Network::Regtest).to_wif()
 }
 
 fn test_hyperliquid_paymaster_private_key() -> String {

@@ -16,9 +16,7 @@ use alloy::{
     primitives::{keccak256, Address, Bytes, U256},
     signers::local::PrivateKeySigner,
 };
-use bitcoin::secp256k1::Secp256k1;
-use bitcoin::{CompressedPublicKey, PrivateKey};
-use chains::{evm::EvmBroadcastPolicy, ChainOperations, ChainRegistry};
+use chains::{evm::EvmBroadcastPolicy, ChainRegistry};
 use hyperliquid_client::{
     actions::Actions as HyperliquidActions, client::Network as HyperliquidNetwork,
     HyperliquidExchangeClient, HyperliquidInfoClient,
@@ -837,10 +835,9 @@ impl CustodyActionExecutor {
                 self.sweep_released_evm_vault(vault, backend_chain, paymaster_address, attempted_at)
                     .await
             }
-            ChainType::Bitcoin => {
-                self.sweep_released_bitcoin_vault(vault, paymaster_address, attempted_at)
-                    .await
-            }
+            ChainType::Bitcoin => Err(CustodyActionError::ChainNotSupported {
+                chain: vault.chain.clone(),
+            }),
             ChainType::Hyperliquid => {
                 self.sweep_released_hyperliquid_vault(vault, paymaster_address, attempted_at)
                     .await
@@ -1127,101 +1124,6 @@ impl CustodyActionExecutor {
         }
     }
 
-    async fn sweep_released_bitcoin_vault(
-        &self,
-        vault: &CustodyVault,
-        paymaster_address: &str,
-        attempted_at: String,
-    ) -> CustodyActionResult<ReleasedSweepResult> {
-        let Some(asset) = vault.asset.as_ref() else {
-            return Ok(ReleasedSweepResult::Skipped {
-                metadata_patch: json!({
-                    "release_sweep_status": "missing_asset",
-                    "release_sweep_terminal": true,
-                    "release_sweep_attempted_at": attempted_at,
-                    "release_sweep_target_address": paymaster_address,
-                }),
-            });
-        };
-        if !matches!(asset, AssetId::Native) {
-            return Ok(ReleasedSweepResult::Skipped {
-                metadata_patch: json!({
-                    "release_sweep_status": "unsupported_asset",
-                    "release_sweep_terminal": true,
-                    "release_sweep_attempted_at": attempted_at,
-                    "release_sweep_target_address": paymaster_address,
-                    "release_sweep_asset_id": asset.as_str(),
-                }),
-            });
-        }
-
-        let wallet = self.derive_wallet(vault)?;
-        let Some(chain) = self.chain_registry.get_bitcoin(&ChainType::Bitcoin) else {
-            return Err(CustodyActionError::ChainNotSupported {
-                chain: vault.chain.clone(),
-            });
-        };
-        let balance_sats = chain
-            .address_balance_sats(&vault.address)
-            .await
-            .map_err(|source| CustodyActionError::Chain { source })?;
-        if balance_sats == 0 {
-            return Ok(ReleasedSweepResult::Skipped {
-                metadata_patch: json!({
-                    "release_sweep_status": "empty",
-                    "release_sweep_terminal": true,
-                    "release_sweep_attempted_at": attempted_at,
-                    "release_sweep_target_address": paymaster_address,
-                    "release_sweep_asset_id": asset.as_str(),
-                }),
-            });
-        }
-
-        let fee_sats = chain
-            .estimate_full_balance_sweep_fee_sats(&vault.address)
-            .await
-            .map_err(|source| CustodyActionError::Chain { source })?;
-        if balance_sats <= fee_sats {
-            return Ok(ReleasedSweepResult::Skipped {
-                metadata_patch: json!({
-                    "release_sweep_status": "uneconomic",
-                    "release_sweep_terminal": true,
-                    "release_sweep_attempted_at": attempted_at,
-                    "release_sweep_target_address": paymaster_address,
-                    "release_sweep_balance": balance_sats.to_string(),
-                    "release_sweep_reserved_fee": fee_sats.to_string(),
-                }),
-            });
-        }
-
-        let sweep_amount_sats = checked_release_sweep_sats(balance_sats, fee_sats)?;
-        let raw_tx = chain
-            .dump_to_address(
-                &router_primitives::TokenIdentifier::Native,
-                wallet.private_key(),
-                paymaster_address,
-                U256::from(fee_sats),
-            )
-            .await
-            .map_err(|source| CustodyActionError::Chain { source })?;
-        let tx_hash = chain
-            .broadcast_signed_transaction(&raw_tx)
-            .await
-            .map_err(|source| CustodyActionError::Chain { source })?;
-        Ok(ReleasedSweepResult::Swept {
-            metadata_patch: json!({
-                "release_sweep_status": "swept",
-                "release_sweep_terminal": true,
-                "release_sweep_attempted_at": attempted_at,
-                "release_sweep_target_address": paymaster_address,
-                "release_sweep_asset_id": asset.as_str(),
-                "release_sweep_amount": sweep_amount_sats.to_string(),
-                "release_sweep_reserved_fee": fee_sats.to_string(),
-                "release_sweep_tx_hash": tx_hash,
-            }),
-        })
-    }
-
     async fn sweep_released_hyperliquid_vault(
         &self,
         vault: &CustodyVault,
@@ -1409,23 +1311,6 @@ pub fn evm_address_from_private_key(private_key: &str) -> CustodyActionResult<St
             reason: err.to_string(),
         })?;
     Ok(format!("{:#x}", signer.address()))
-}
-
-pub fn bitcoin_address_from_private_key(
-    private_key: &str,
-    network: bitcoin::Network,
-) -> CustodyActionResult<String> {
-    let private_key =
-        PrivateKey::from_wif(private_key).map_err(|err| CustodyActionError::InvalidAmount {
-            field: "bitcoin_paymaster_private_key",
-            reason: err.to_string(),
-        })?;
-    let public_key = CompressedPublicKey::from_private_key(&Secp256k1::new(), &private_key)
-        .map_err(|err| CustodyActionError::InvalidAmount {
-            field: "bitcoin_paymaster_private_key",
-            reason: err.to_string(),
-        })?;
-    Ok(bitcoin::Address::p2wpkh(&public_key, network).to_string())
 }
 
 fn parse_positive_u256(field: &'static str, value: &str) -> CustodyActionResult<U256> {
@@ -1776,15 +1661,6 @@ fn checked_release_sweep_amount(balance: U256, reserved_fee: U256) -> CustodyAct
         })
 }
 
-fn checked_release_sweep_sats(balance_sats: u64, fee_sats: u64) -> CustodyActionResult<u64> {
-    balance_sats
-        .checked_sub(fee_sats)
-        .ok_or_else(|| CustodyActionError::InvalidAmount {
-            field: "release_sweep_amount",
-            reason: "bitcoin balance minus reserved fee underflowed".to_string(),
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1960,7 +1836,5 @@ mod tests {
             "7"
         );
         assert!(checked_release_sweep_amount(U256::from(3_u64), U256::from(10_u64)).is_err());
-        assert_eq!(checked_release_sweep_sats(10, 3).unwrap(), 7);
-        assert!(checked_release_sweep_sats(3, 10).is_err());
     }
 }
