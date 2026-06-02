@@ -278,9 +278,10 @@ test-all:
 # holding every required compose var (the ${VAR:?} set + OBS_INGEST_TOKEN +
 # ALLOY_V3_OTLP_URL — see docs/devops-deployment-plan.md secret table).
 #
-# CVM is referenced by name; override if yours differs:
-#   just phala-upgrade phala_cvm=some-other-cvm
-phala_cvm     := "tee-router-demo"
+# CVM is referenced by name. No active deployment (the previous CVM was deleted
+# 2026-06-02), so there is no default — pass phala_cvm when deploying:
+#   just phala-deploy 0.2.0 phala_cvm=<your-cvm>
+phala_cvm     := ""
 phala_env     := ".secrets/phala.env"
 phala_compose := "etc/compose.phala.yml"
 

@@ -22,8 +22,13 @@ Skim this once at the start of any session involving deploys, live tests, or deb
 
 ## Topology in one paragraph
 
-The TEE runs on a **single Phala CVM** (`tee-router-demo`, app id
-`app_a8542ad1a740d4ef3efb4b4cb9ea4c1ce5977d3c`) which runs the whole
+> **⚠️ No active deployment.** The previous Phala CVM was deleted on 2026-06-02;
+> its concrete app id, dashboard, and per-port endpoints have been
+> removed from this doc. The deploy tooling below (`etc/compose.phala.yml`,
+> `just phala-deploy`) still works for standing up a fresh CVM — after which you
+> re-derive the live coordinates via `phala cvms` (see the Phala section).
+
+The TEE is designed to run on a **single Phala CVM** that runs the whole
 `etc/compose.phala.yml` stack: router-api, router-worker, temporal-worker,
 temporal cluster + temporal-ui, postgres, postgres-replication-gateway, alloy
 sidecars. **Railway** runs the public Bun gateway (`router-gateway-v3`) that
@@ -40,35 +45,35 @@ client → router-gateway-v3 (Railway/Bun) → router-api (Phala) → temporal-w
 
 **CLI**: `phala` (already authenticated in this env)
 
-**CVM**: `tee-router-demo` (app id `app_a8542ad1a740d4ef3efb4b4cb9ea4c1ce5977d3c`)
+**No CVM is currently deployed** (the previous one was deleted 2026-06-02; `phala
+cvms list` returns nothing). The steps below stand up a new CVM and recover its
+coordinates. Throughout, `<cvm>` is the name you deploy under.
 
-**Dashboard**: `https://cloud.phala.com/dashboard/cvms/app_a8542ad1a740d4ef3efb4b4cb9ea4c1ce5977d3c`
-
-**Public per-port endpoints** (auto-derived from app id + Phala gateway base):
-| Port | Service | URL |
-|---|---|---|
-| 4522 | router-api | `https://a8542ad1a740d4ef3efb4b4cb9ea4c1ce5977d3c-4522.dstack-pha-prod5.phala.network` |
-| 5432 | postgres-replication-gateway | `https://a8542ad1a740d4ef3efb4b4cb9ea4c1ce5977d3c-5432.dstack-pha-prod5.phala.network` |
-| 8080 | temporal-ui | `https://a8542ad1a740d4ef3efb4b4cb9ea4c1ce5977d3c-8080.dstack-pha-prod5.phala.network` |
-
-To re-derive the full endpoint list after a redeploy:
+After deploying, capture the CVM's name / app id and derive its public per-port
+endpoints:
 
 ```bash
-phala cvms get tee-router-demo -j | python3 -c 'import json,sys;[print(e["app"]) for e in json.load(sys.stdin).get("endpoints",[])]'
+phala cvms list                                   # find the CVM name / app id
+phala cvms get <cvm> -j | python3 -c 'import json,sys;[print(e["app"]) for e in json.load(sys.stdin).get("endpoints",[])]'
 ```
+
+The stack exposes **4522** router-api, **5432** postgres-replication-gateway, and
+**8080** temporal-ui; the public URL pattern is
+`https://<app-id>-<port>.<phala-gateway-base>` (the gateway base, e.g.
+`dstack-pha-prodN.phala.network`, depends on the node the CVM lands on).
 
 **Secrets file** (gitignored): `.secrets/phala.env` — every `${VAR:?}` referenced
 by `etc/compose.phala.yml` must be set here. Notably:
 - `HYPERUNIT_PROXY_URL=socks5://<user>:<pass>@<railway-tcp-proxy-host>:<port>`
 - `TEMPORAL_UI_PW_HASH` (bcrypt hash; plaintext is what the operator typed)
 
-**Deploy commands** (run from `.worktrees/main/`):
+**Deploy commands** (run from `.worktrees/main/`, pass your CVM name):
 
 ```bash
-just phala-deploy 0.2.X    # pin etc/compose.phala.yml to :0.2.X, redeploy CVM
-just phala-upgrade         # config-only redeploy (no version bump)
-phala cvms get tee-router-demo                 # status (text)
-phala cvms get tee-router-demo -j              # status (JSON, includes endpoints)
+just phala-deploy 0.2.X phala_cvm=<cvm>    # pin etc/compose.phala.yml to :0.2.X, redeploy CVM
+just phala-upgrade phala_cvm=<cvm>         # config-only redeploy (no version bump)
+phala cvms get <cvm>                       # status (text)
+phala cvms get <cvm> -j                    # status (JSON, includes endpoints)
 ```
 
 **Don't use `:main` image tags** in compose.phala.yml — always pinned versions.
@@ -84,8 +89,8 @@ phala cvms get tee-router-demo -j              # status (JSON, includes endpoint
    on the **self-hosted runner `tee-router-builder`**
 6. Wait for build (`gh run list --workflow=router-image.yml --limit 3`)
 7. Verify pushed: `docker manifest inspect ghcr.io/riftresearch/tee-router:0.2.X`
-8. `just phala-deploy 0.2.X`
-9. Poll until `phala cvms get tee-router-demo` shows `Status: running`
+8. `just phala-deploy 0.2.X phala_cvm=<cvm>`
+9. Poll until `phala cvms get <cvm>` shows `Status: running`
 10. Probe `https://router-gateway-v3-production.up.railway.app/providers` — expect
     `status: ok` with all 6 venues `reachable`
 
@@ -123,9 +128,9 @@ When the SOCKS5 endpoint rotates, update `HYPERUNIT_PROXY_URL` in
 
 ## Temporal
 
-**UI**: `https://a8542ad1a740d4ef3efb4b4cb9ea4c1ce5977d3c-8080.dstack-pha-prod5.phala.network`
-(HTTP basic auth, password set by operator; hash stored in
-`.secrets/phala.env` as `TEMPORAL_UI_PW_HASH`)
+**UI**: `<temporal-ui>` — port 8080 on the deployed CVM; derive the URL as in the
+Phala section. HTTP basic auth, password set by operator; hash stored in
+`.secrets/phala.env` as `TEMPORAL_UI_PW_HASH`.
 
 **Namespace**: `default`
 
@@ -387,17 +392,15 @@ curl -sm 10 https://router-gateway-v3-production.up.railway.app/providers
 For order id `<oid>`:
 
 ```bash
-# First triage: full Temporal history JSON. Requires the workflow runId.
-curl -sm 30 "https://a8542ad1a740d4ef3efb4b4cb9ea4c1ce5977d3c-8080.dstack-pha-prod5.phala.network/api/v1/namespaces/default/workflows/order%3A<oid>%3Aexecution/history?execution.runId=<runId>" | python3 -m json.tool
-
-# Example:
-curl -sm 30 "https://a8542ad1a740d4ef3efb4b4cb9ea4c1ce5977d3c-8080.dstack-pha-prod5.phala.network/api/v1/namespaces/default/workflows/order%3A019e5650-75fd-7c91-afe9-faa07a997697%3Aexecution/history?execution.runId=019e5650-96a9-76ae-a5fc-7dcaaeace728" | python3 -m json.tool
+# First triage: full Temporal history JSON (<temporal-ui> = port 8080 on the CVM,
+# derived as in the Phala section). Requires the workflow runId.
+curl -sm 30 "<temporal-ui>/api/v1/namespaces/default/workflows/order%3A<oid>%3Aexecution/history?execution.runId=<runId>" | python3 -m json.tool
 
 # Gateway view (just umbrella state)
 curl -sm 10 "https://router-gateway-v3-production.up.railway.app/order/<oid>" | python3 -m json.tool
 
-# Temporal workflow:
-echo "https://a8542ad1a740d4ef3efb4b4cb9ea4c1ce5977d3c-8080.dstack-pha-prod5.phala.network/namespaces/default/workflows/order:<oid>:execution"
+# Temporal workflow URL:
+echo "<temporal-ui>/namespaces/default/workflows/order:<oid>:execution"
 ```
 
 If gateway shows `executing` for 30+ min, walk on-chain:
