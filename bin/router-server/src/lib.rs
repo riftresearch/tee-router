@@ -232,21 +232,6 @@ pub struct RouterServerArgs {
     #[arg(long, env = "VELORA_PARTNER")]
     pub velora_partner: Option<String>,
 
-    /// Legacy shared Hyperliquid execution signer private key. Startup rejects
-    /// this because router execution must use per-order derived identities.
-    #[arg(long, env = "HYPERLIQUID_EXECUTION_PRIVATE_KEY")]
-    pub hyperliquid_execution_private_key: Option<String>,
-
-    /// Legacy shared Hyperliquid account/user address. Startup rejects this
-    /// because router execution must use per-order derived identities.
-    #[arg(long, env = "HYPERLIQUID_ACCOUNT_ADDRESS")]
-    pub hyperliquid_account_address: Option<String>,
-
-    /// Legacy shared Hyperliquid vault/subaccount address. Startup rejects
-    /// this because router execution must use per-order derived identities.
-    #[arg(long, env = "HYPERLIQUID_VAULT_ADDRESS")]
-    pub hyperliquid_vault_address: Option<String>,
-
     /// Hyperliquid paymaster private key used as the recovery/sweep destination
     /// for released internal Hyperliquid custody
     #[arg(long, env = "HYPERLIQUID_PAYMASTER_PRIVATE_KEY")]

@@ -118,14 +118,6 @@ const HYPERUNIT_API_URL_ENV: &str = "HYPERUNIT_API_URL";
 const HYPERUNIT_PROXY_URL_ENV: &str = "HYPERUNIT_PROXY_URL";
 const HYPERLIQUID_API_URL_ENV: &str = "HYPERLIQUID_API_URL";
 const HYPERLIQUID_NETWORK_ENV: &str = "HYPERLIQUID_NETWORK";
-const HYPERLIQUID_EXECUTION_PRIVATE_KEY_ENV: &str = "HYPERLIQUID_EXECUTION_PRIVATE_KEY";
-const HYPERLIQUID_ACCOUNT_ADDRESS_ENV: &str = "HYPERLIQUID_ACCOUNT_ADDRESS";
-const HYPERLIQUID_VAULT_ADDRESS_ENV: &str = "HYPERLIQUID_VAULT_ADDRESS";
-const ROUTER_LIVE_HYPERLIQUID_PRIVATE_KEY_ENV: &str = "ROUTER_LIVE_HYPERLIQUID_PRIVATE_KEY";
-const ROUTER_LIVE_HYPERLIQUID_DESTINATION_ADDRESS_ENV: &str =
-    "ROUTER_LIVE_HYPERLIQUID_DESTINATION_ADDRESS";
-const ROUTER_LIVE_HYPERLIQUID_ACCOUNT_ADDRESS_ENV: &str = "ROUTER_LIVE_HYPERLIQUID_ACCOUNT_ADDRESS";
-const ROUTER_LIVE_HYPERLIQUID_VAULT_ADDRESS_ENV: &str = "ROUTER_LIVE_HYPERLIQUID_VAULT_ADDRESS";
 const ETHEREUM_PAYMASTER_PRIVATE_KEY_ENV: &str = "ETHEREUM_PAYMASTER_PRIVATE_KEY";
 const BASE_PAYMASTER_PRIVATE_KEY_ENV: &str = "BASE_PAYMASTER_PRIVATE_KEY";
 const ARBITRUM_PAYMASTER_PRIVATE_KEY_ENV: &str = "ARBITRUM_PAYMASTER_PRIVATE_KEY";
@@ -277,9 +269,6 @@ struct LiveRuntimeConfig {
     hyperunit_proxy_url: Option<String>,
     hyperliquid_api_url: String,
     hyperliquid_network: router_core::services::custody_action_executor::HyperliquidCallNetwork,
-    hyperliquid_execution_private_key: Option<String>,
-    hyperliquid_account_address: Option<String>,
-    hyperliquid_vault_address: Option<String>,
     ethereum_paymaster_private_key: Option<String>,
     base_paymaster_private_key: Option<String>,
     arbitrum_paymaster_private_key: Option<String>,
@@ -320,19 +309,6 @@ impl LiveRuntimeConfig {
             hyperliquid_network: parse_hyperliquid_network(
                 &env_var_optional(HYPERLIQUID_NETWORK_ENV).unwrap_or_else(|| "mainnet".to_string()),
             ),
-            hyperliquid_execution_private_key: env_var_any(&[
-                HYPERLIQUID_EXECUTION_PRIVATE_KEY_ENV,
-                ROUTER_LIVE_HYPERLIQUID_PRIVATE_KEY_ENV,
-            ]),
-            hyperliquid_account_address: env_var_any(&[
-                HYPERLIQUID_ACCOUNT_ADDRESS_ENV,
-                ROUTER_LIVE_HYPERLIQUID_ACCOUNT_ADDRESS_ENV,
-                ROUTER_LIVE_HYPERLIQUID_DESTINATION_ADDRESS_ENV,
-            ]),
-            hyperliquid_vault_address: env_var_any(&[
-                HYPERLIQUID_VAULT_ADDRESS_ENV,
-                ROUTER_LIVE_HYPERLIQUID_VAULT_ADDRESS_ENV,
-            ]),
             ethereum_paymaster_private_key: env_var_optional(ETHEREUM_PAYMASTER_PRIVATE_KEY_ENV),
             base_paymaster_private_key: env_var_optional(BASE_PAYMASTER_PRIVATE_KEY_ENV),
             arbitrum_paymaster_private_key: env_var_optional(ARBITRUM_PAYMASTER_PRIVATE_KEY_ENV),
@@ -494,17 +470,10 @@ async fn try_write_live_recovery_snapshot(
                 "ethereum_paymaster": live.ethereum_paymaster_private_key.is_some(),
                 "base_paymaster": live.base_paymaster_private_key.is_some(),
                 "arbitrum_paymaster": live.arbitrum_paymaster_private_key.is_some(),
-                "hyperliquid_execution": live.hyperliquid_execution_private_key.is_some(),
             },
             "hyperliquid": {
                 "api_url": &live.hyperliquid_api_url,
                 "network": format!("{:?}", live.hyperliquid_network),
-                "execution_private_key_env_candidates": [
-                    HYPERLIQUID_EXECUTION_PRIVATE_KEY_ENV,
-                    ROUTER_LIVE_HYPERLIQUID_PRIVATE_KEY_ENV
-                ],
-                "account_address": &live.hyperliquid_account_address,
-                "vault_address": &live.hyperliquid_vault_address,
             },
             "providers": {
                 "across_api_url": &live.across_api_url,
@@ -1005,9 +974,6 @@ fn order_worker_runtime_args_from_router_args(args: &RouterServerArgs) -> OrderW
         velora_api_url: args.velora_api_url.clone(),
         velora_proxy_url: args.velora_proxy_url.clone(),
         velora_partner: args.velora_partner.clone(),
-        hyperliquid_execution_private_key: args.hyperliquid_execution_private_key.clone(),
-        hyperliquid_account_address: args.hyperliquid_account_address.clone(),
-        hyperliquid_vault_address: args.hyperliquid_vault_address.clone(),
         hyperliquid_paymaster_private_key: args.hyperliquid_paymaster_private_key.clone(),
         hyperliquid_network: args.hyperliquid_network,
         hyperliquid_order_timeout_ms: args.hyperliquid_order_timeout_ms,
@@ -1091,9 +1057,6 @@ fn router_args(
         velora_api_url: None,
         velora_proxy_url: None,
         velora_partner: None,
-        hyperliquid_execution_private_key: None,
-        hyperliquid_account_address: None,
-        hyperliquid_vault_address: None,
         hyperliquid_paymaster_private_key: Some(test_hyperliquid_paymaster_private_key()),
         temporal_address: temporal_address.to_string(),
         temporal_namespace: "default".to_string(),
@@ -1175,9 +1138,6 @@ fn live_router_args(
         velora_api_url: None,
         velora_proxy_url: None,
         velora_partner: None,
-        hyperliquid_execution_private_key: live.hyperliquid_execution_private_key.clone(),
-        hyperliquid_account_address: live.hyperliquid_account_address.clone(),
-        hyperliquid_vault_address: live.hyperliquid_vault_address.clone(),
         hyperliquid_paymaster_private_key: None,
         temporal_address: temporal_address.to_string(),
         temporal_namespace: "default".to_string(),

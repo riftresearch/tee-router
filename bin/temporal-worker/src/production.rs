@@ -205,18 +205,6 @@ pub struct OrderWorkerRuntimeArgs {
     #[arg(long, env = "VELORA_PARTNER")]
     pub velora_partner: Option<String>,
 
-    /// Legacy shared Hyperliquid execution signer private key.
-    #[arg(long, env = "HYPERLIQUID_EXECUTION_PRIVATE_KEY", hide = true)]
-    pub hyperliquid_execution_private_key: Option<String>,
-
-    /// Legacy shared Hyperliquid account/user address.
-    #[arg(long, env = "HYPERLIQUID_ACCOUNT_ADDRESS", hide = true)]
-    pub hyperliquid_account_address: Option<String>,
-
-    /// Legacy shared Hyperliquid vault/subaccount address.
-    #[arg(long, env = "HYPERLIQUID_VAULT_ADDRESS", hide = true)]
-    pub hyperliquid_vault_address: Option<String>,
-
     /// Hyperliquid paymaster private key used as the recovery/sweep destination for released custody
     #[arg(long, env = "HYPERLIQUID_PAYMASTER_PRIVATE_KEY")]
     pub hyperliquid_paymaster_private_key: Option<String>,
@@ -256,7 +244,6 @@ impl OrderWorkerRuntimeArgs {
         .map_err(|source| WorkerError::Configuration {
             message: format!("failed to connect to router database: {source}"),
         })?;
-        reject_shared_hyperliquid_execution_config(self)?;
         let chain_registry = Arc::new(initialize_chain_registry(self).await?);
         let action_providers = Arc::new(initialize_action_providers(self)?);
         let pricing_provider: Arc<dyn PricingSnapshotProvider> = Arc::new(
@@ -832,35 +819,6 @@ fn gas_sponsor_config(private_key: Option<&String>) -> Option<EvmGasSponsorConfi
     Some(EvmGasSponsorConfig {
         private_key: private_key?.clone(),
     })
-}
-
-fn reject_shared_hyperliquid_execution_config(args: &OrderWorkerRuntimeArgs) -> WorkerResult<()> {
-    let configured_fields = [
-        (
-            "HYPERLIQUID_EXECUTION_PRIVATE_KEY",
-            normalize_optional_string(args.hyperliquid_execution_private_key.as_deref()),
-        ),
-        (
-            "HYPERLIQUID_ACCOUNT_ADDRESS",
-            normalize_optional_string(args.hyperliquid_account_address.as_deref()),
-        ),
-        (
-            "HYPERLIQUID_VAULT_ADDRESS",
-            normalize_optional_string(args.hyperliquid_vault_address.as_deref()),
-        ),
-    ]
-    .into_iter()
-    .filter_map(|(name, value)| value.map(|_| name))
-    .collect::<Vec<_>>();
-
-    if configured_fields.is_empty() {
-        return Ok(());
-    }
-
-    Err(config_error(format!(
-        "shared Hyperliquid execution identities are no longer supported; remove {} and use per-order router-derived Hyperliquid custody",
-        configured_fields.join(", ")
-    )))
 }
 
 fn required_across_api_key(value: Option<&str>) -> WorkerResult<String> {
