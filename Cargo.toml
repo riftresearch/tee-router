@@ -44,7 +44,7 @@ members = [
 
 [workspace.package]
 edition = "2021"
-version = "0.2.25"
+version = "0.2.26"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/riftresearch/tee-router"
 
