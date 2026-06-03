@@ -1087,6 +1087,47 @@ impl BitcoinChain {
         )?))
     }
 
+    /// Sweep every spendable UTXO held at the signer's own address to
+    /// `recipient_address` (no change), sizing the fee to the *discovered*
+    /// input count. The Esplora-discovery sibling of
+    /// `dump_to_address_from_outpoints`, used for refunds when no funding
+    /// observation is available. Returns the signed-tx hex for the caller to
+    /// broadcast, or `None` when the address holds no spendable UTXOs.
+    pub async fn dump_to_address_for_address(
+        &self,
+        token: &TokenIdentifier,
+        private_key: &str,
+        recipient_address: &str,
+    ) -> Result<Option<String>> {
+        if token != &TokenIdentifier::Native {
+            return Err(crate::Error::DumpToAddress {
+                message: "Native token not supported".to_string(),
+            });
+        }
+        let private_key =
+            PrivateKey::from_wif(private_key).map_err(|e| crate::Error::DumpToAddress {
+                message: format!("Invalid signer private key: {e}"),
+            })?;
+        let recipient_address = parse_bitcoin_address_for_network(recipient_address, self.network)?;
+        let sender_address =
+            Address::p2wpkh(&compressed_public_key_for(&private_key)?, self.network);
+
+        let utxos = self.spendable_outputs_for_address(&sender_address, 1).await?;
+        if utxos.is_empty() {
+            return Ok(None);
+        }
+        // Fee from the discovered input count (single-output sweep). A fixed
+        // single-input estimate underpays a multi-UTXO sweep and is rejected
+        // for failing the minimum relay fee.
+        let fee_sats = self.estimate_p2wpkh_transfer_fee_sats(utxos.len(), 1).await?;
+        Ok(Some(self.build_signed_p2wpkh_sweep_from_outputs(
+            private_key,
+            recipient_address,
+            utxos,
+            fee_sats,
+        )?))
+    }
+
     async fn raw_transaction(&self, txid: &bitcoin::Txid) -> Result<Transaction> {
         let tx_hex = self
             .rpc_client

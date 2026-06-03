@@ -5,7 +5,6 @@ use crate::{
     telemetry,
 };
 use alloy::primitives::U256;
-use blockchain_utils::MempoolEsploraFeeExt;
 use chains::ChainRegistry;
 use chrono::{DateTime, Duration, Utc};
 use router_core::{
@@ -30,7 +29,6 @@ const DEFAULT_CANCEL_AFTER: Duration = Duration::hours(24);
 const REFUND_PASS_LIMIT: i64 = 100;
 const REFUND_LEASE_DURATION: Duration = Duration::minutes(5);
 const REFUND_RETRY_DELAY: Duration = Duration::seconds(30);
-const BITCOIN_REFUND_FEE_VBYTES: f64 = 125.0;
 
 #[derive(Debug, Snafu)]
 pub enum VaultError {
@@ -837,43 +835,23 @@ impl VaultManager {
             }
             // All observed outpoints are stale: fall through to Esplora discovery.
         }
-        let balance = bitcoin_chain
-            .address_balance_sats(&vault.deposit_vault_address)
-            .await
-            .map_err(|err| err.to_string())?;
-        if balance == 0 {
-            return Err("No bitcoin funds found yet for refund".to_string());
-        }
-
-        let chain = self
-            .chain_registry
-            .get(
-                &backend_chain_for_id(&vault.deposit_asset.chain)
-                    .ok_or_else(|| "Bitcoin chain is not configured".to_string())?,
-            )
-            .ok_or_else(|| "Bitcoin chain is not configured".to_string())?;
-        let esplora = chain
-            .esplora_client()
-            .ok_or_else(|| "Esplora client not available for bitcoin refund".to_string())?;
-        let next_block_fee_rate = esplora
-            .get_mempool_fee_estimate_next_block()
-            .await
-            .map_err(|err| format!("Failed to query bitcoin fee estimate: {err}"))?;
-        let fee = bitcoin_refund_fee_sats(next_block_fee_rate)?;
-
-        let tx_data = chain
-            .dump_to_address(
+        // No usable observation: discover the deposit address's UTXOs via
+        // Esplora and sweep them, sizing the fee to the discovered input count.
+        if let Some(tx_data) = bitcoin_chain
+            .dump_to_address_for_address(
                 &token_identifier(&vault.deposit_asset.asset),
                 private_key,
                 &vault.recovery_address,
-                U256::from(fee),
             )
             .await
-            .map_err(|err| err.to_string())?;
-        bitcoin_chain
-            .broadcast_signed_transaction(&tx_data)
-            .await
-            .map_err(|err| err.to_string())
+            .map_err(|err| err.to_string())?
+        {
+            return bitcoin_chain
+                .broadcast_signed_transaction(&tx_data)
+                .await
+                .map_err(|err| err.to_string());
+        }
+        Err("No bitcoin funds found yet for refund".to_string())
     }
 
     async fn refund_evm(&self, vault: &DepositVault, private_key: &str) -> Result<String, String> {
@@ -1540,22 +1518,6 @@ fn funding_hint_vout(hint: &DepositVaultFundingHint) -> VaultResult<Option<u32>>
         })
 }
 
-fn bitcoin_refund_fee_sats(next_block_fee_rate_sat_per_vb: f64) -> Result<u64, String> {
-    if !next_block_fee_rate_sat_per_vb.is_finite() || next_block_fee_rate_sat_per_vb <= 0.0 {
-        return Err(format!(
-            "bitcoin refund fee rate must be finite and positive: {next_block_fee_rate_sat_per_vb}"
-        ));
-    }
-
-    let fee = (next_block_fee_rate_sat_per_vb * BITCOIN_REFUND_FEE_VBYTES).ceil();
-    if !fee.is_finite() || fee >= u64::MAX as f64 {
-        return Err(format!(
-            "bitcoin refund fee exceeds u64 satoshi range: {fee}"
-        ));
-    }
-    Ok(fee as u64)
-}
-
 fn normalize_hex_32(value: &str) -> Result<String, String> {
     let bytes = decode_hex_32(value)?;
     Ok(format!("0x{}", alloy::hex::encode(bytes)))
@@ -1694,20 +1656,6 @@ mod tests {
         assert_eq!(
             funding_hint_confirmation_state(&hint).as_deref(),
             Some("mempool")
-        );
-    }
-
-    #[test]
-    fn bitcoin_refund_fee_sats_rejects_invalid_fee_rates() {
-        assert_eq!(bitcoin_refund_fee_sats(1.01).unwrap(), 127);
-        assert_eq!(bitcoin_refund_fee_sats(0.001).unwrap(), 1);
-
-        assert!(bitcoin_refund_fee_sats(0.0).is_err());
-        assert!(bitcoin_refund_fee_sats(-1.0).is_err());
-        assert!(bitcoin_refund_fee_sats(f64::NAN).is_err());
-        assert!(bitcoin_refund_fee_sats(f64::INFINITY).is_err());
-        assert!(
-            bitcoin_refund_fee_sats((u64::MAX as f64 / BITCOIN_REFUND_FEE_VBYTES) + 1.0).is_err()
         );
     }
 
