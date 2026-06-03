@@ -15,6 +15,20 @@ use tracing::{debug, info, warn};
 const EIP7702_DESIGNATOR_PREFIX: [u8; 3] = [0xef, 0x01, 0x00];
 const EIP7702_DESIGNATOR_LEN: usize = 23;
 
+/// Fixed gas limit for the EIP-7702 delegation set/revoke transactions.
+///
+/// Both txs have a fixed shape — a self-call carrying exactly one
+/// authorization — so we hardcode a generous overestimate instead of calling
+/// `estimate_gas`. Non-Pectra-aware RPCs undercount the per-authorization
+/// intrinsic surcharge (PER_AUTH_BASE_COST 12,500 + PER_EMPTY_ACCOUNT_COST
+/// 25,000) and return a limit *below* the ~46k intrinsic floor, so the chain
+/// rejects the tx with `intrinsic gas too low` (observed on Arbitrum). Real
+/// usage is ~50k L2 gas plus Arbitrum's variable L1 data component; 500k
+/// comfortably covers both. Only gas actually consumed is billed, so the
+/// overestimate is free. The fee *price* is still taken from the live market
+/// (`estimate_eip1559_fees`); only the gas *limit* is fixed here.
+const DELEGATION_TX_GAS_LIMIT: u64 = 500_000;
+
 pub async fn ensure_eip7702_delegation(
     provider: &DynProvider,
     sponsor_signer: &PrivateKeySigner,
@@ -105,21 +119,12 @@ pub(crate) async fn ensure_eip7702_delegation_with_wallet(
         .with_to(sponsor_address)
         .with_authorization_list(vec![signed_authorization]);
 
-    // Set explicit gas + fee fields. The previous code submitted the
-    // delegation tx without setting gas_limit / max_fee_per_gas /
-    // max_priority_fee_per_gas, relying on the provider filler. On
-    // non-Pectra-aware RPCs the auto-fill undercounts the
-    // PER_AUTH_BASE_COST (12,500) and PER_EMPTY_ACCOUNT_COST (25,000)
-    // surcharges and the tx underprices. Mirrors the steady-state path
-    // in `batched_tx.rs::send_batched_tx`.
-    let gas_limit = retry_evm_rpc(metric_label, "estimate_gas", || async {
-        wallet_provider.estimate_gas(base_tx.clone()).await
-    })
-    .await
-    .map_err(|source| PaymasterError::EVMRpcError {
-        source,
-        loc: snafu::location!(),
-    })?;
+    // Hardcode the gas limit instead of calling estimate_gas: this delegation
+    // tx is fixed-shape, and non-Pectra-aware RPCs undercount the EIP-7702
+    // intrinsic surcharge and return a limit below intrinsic, which the chain
+    // rejects as `intrinsic gas too low` (see DELEGATION_TX_GAS_LIMIT). The fee
+    // price is still estimated from the live market.
+    let gas_limit = DELEGATION_TX_GAS_LIMIT;
     let fee_estimate = retry_evm_rpc(metric_label, "estimate_eip1559_fees", || async {
         wallet_provider.estimate_eip1559_fees().await
     })
@@ -232,14 +237,10 @@ pub(crate) async fn revoke_eip7702_delegation_with_wallet(
         .with_to(sponsor_address)
         .with_authorization_list(vec![signed_authorization]);
 
-    let gas_limit = retry_evm_rpc(metric_label, "estimate_gas", || async {
-        wallet_provider.estimate_gas(base_tx.clone()).await
-    })
-    .await
-    .map_err(|source| PaymasterError::EVMRpcError {
-        source,
-        loc: snafu::location!(),
-    })?;
+    // Fixed gas limit (see DELEGATION_TX_GAS_LIMIT) — same fixed-shape 7702 tx
+    // as the set path, so estimate_gas is skipped to avoid the
+    // non-Pectra-aware-RPC `intrinsic gas too low` rejection.
+    let gas_limit = DELEGATION_TX_GAS_LIMIT;
     let fee_estimate = retry_evm_rpc(metric_label, "estimate_eip1559_fees", || async {
         wallet_provider.estimate_eip1559_fees().await
     })
