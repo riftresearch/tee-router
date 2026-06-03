@@ -467,6 +467,7 @@ REPO_SERVICES=(
   "explorer-v3|railway/explorer/Dockerfile|[\"railway/explorer/**\"]"
   "alloy-v3|railway/alloy/Dockerfile|[\"etc/alloy.railway.alloy\",\"railway/alloy/**\"]"
   "loki-v3|railway/loki/Dockerfile|[\"etc/loki.railway.yml\",\"railway/loki/**\"]"
+  "redis-v3|railway/redis/Dockerfile|[\"railway/redis/**\"]"
   "grafana-v3|railway/grafana/Dockerfile|[\"etc/grafana/**\",\"railway/grafana/**\"]"
   "sauron-bitcoin-rathole-broker-v3|etc/Dockerfile.rathole-broker|[\"etc/Dockerfile.rathole-broker\",\"deploy/railway/sauron/**\"]"
 )
@@ -635,6 +636,10 @@ set_shared_ref sauron-worker-v3 HYPERUNIT_API_URL HYPERUNIT_API_URL
 set_var sauron-worker-v3      "HYPERUNIT_PROXY_URL=socks5://\${{hyperunit-socks5-proxy-v3.PROXY_USER}}:\${{hyperunit-socks5-proxy-v3.PROXY_PASSWORD}}@\${{hyperunit-socks5-proxy-v3.RAILWAY_PRIVATE_DOMAIN}}:1080"
 set_var hl-shim-indexer-v3    "HL_SHIM_DATABASE_URL=\${{hl-shim-db-v3.DATABASE_URL}}"
 set_var router-gateway-v3     "ROUTER_GATEWAY_DATABASE_URL=\${{router-gateway-db-v3.DATABASE_URL}}"
+set_var router-gateway-v3     "REDIS_URL=redis://\${{redis-v3.RAILWAY_PRIVATE_DOMAIN}}:6379"
+set_shared_ref router-gateway-v3 ETH_RPC_URL ETH_RPC_URL
+set_shared_ref router-gateway-v3 BASE_RPC_URL BASE_RPC_URL
+set_shared_ref router-gateway-v3 ARBITRUM_RPC_URL ARBITRUM_RPC_URL
 set_var admin-dashboard-v3    "ADMIN_DASHBOARD_AUTH_DATABASE_URL=\${{admin-dashboard-auth-db-v3.DATABASE_URL}}"
 set_var admin-dashboard-v3    "ADMIN_DASHBOARD_ANALYTICS_DATABASE_URL=\${{admin-dashboard-analytics-db-v3.DATABASE_URL}}"
 set_var admin-dashboard-v3    "ADMIN_DASHBOARD_REPLICA_DATABASE_URL=\${{router-physical-standby-v3.DATABASE_URL}}"

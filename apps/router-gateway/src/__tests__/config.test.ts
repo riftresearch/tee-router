@@ -184,15 +184,47 @@ test('validateGatewayRuntimeConfig requires order dependencies on public binds',
   ).toThrow('ROUTER_GATEWAY_PUBLIC_BASE_URL must be configured')
 })
 
+const FULLY_CONFIGURED_PUBLIC_ENV: Record<string, string | undefined> = {
+  HOST: '0.0.0.0',
+  ROUTER_INTERNAL_BASE_URL: 'http://router.internal',
+  ROUTER_GATEWAY_API_KEY: STRONG_ROUTER_GATEWAY_API_KEY,
+  ROUTER_GATEWAY_PUBLIC_BASE_URL: 'https://gateway.example.com',
+  ETH_RPC_URL: 'https://eth.example.com',
+  BASE_RPC_URL: 'https://base.example.com',
+  ARBITRUM_RPC_URL: 'https://arb.example.com',
+  REDIS_URL: 'redis://redis:6379'
+}
+
 test('validateGatewayRuntimeConfig accepts a fully configured public bind', () => {
   expect(() =>
-    validateGatewayRuntimeConfig(
-      loadConfig({
-        HOST: '0.0.0.0',
-        ROUTER_INTERNAL_BASE_URL: 'http://router.internal',
-        ROUTER_GATEWAY_API_KEY: STRONG_ROUTER_GATEWAY_API_KEY,
-        ROUTER_GATEWAY_PUBLIC_BASE_URL: 'https://gateway.example.com'
-      })
-    )
+    validateGatewayRuntimeConfig(loadConfig({ ...FULLY_CONFIGURED_PUBLIC_ENV }))
   ).not.toThrow()
+})
+
+test('validateGatewayRuntimeConfig requires an RPC URL for every supported EVM chain', () => {
+  const env = { ...FULLY_CONFIGURED_PUBLIC_ENV }
+  delete env.BASE_RPC_URL
+  expect(() => validateGatewayRuntimeConfig(loadConfig(env))).toThrow(
+    'BASE_RPC_URL must be configured'
+  )
+})
+
+test('validateGatewayRuntimeConfig requires REDIS_URL on a public bind', () => {
+  const env = { ...FULLY_CONFIGURED_PUBLIC_ENV }
+  delete env.REDIS_URL
+  expect(() => validateGatewayRuntimeConfig(loadConfig(env))).toThrow(
+    'REDIS_URL must be configured'
+  )
+})
+
+test('loadConfig surfaces evmRpcUrls and redisUrl', () => {
+  const config = loadConfig({ ...FULLY_CONFIGURED_PUBLIC_ENV })
+  expect(config.evmRpcUrls['evm:8453']).toBe('https://base.example.com')
+  expect(config.redisUrl).toBe('redis://redis:6379')
+})
+
+test('loadConfig rejects a non-redis REDIS_URL', () => {
+  expect(() => loadConfig({ REDIS_URL: 'http://redis:6379' })).toThrow(
+    'Invalid REDIS_URL'
+  )
 })

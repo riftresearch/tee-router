@@ -22,7 +22,19 @@ export type GatewayConfig = {
   healthPollIntervalMs: number
   healthTargetTimeoutMs: number
   bitcoinAddressNetworks: BitcoinAddressNetwork[]
+  // EVM JSON-RPC URLs keyed by internal chain id (e.g. 'evm:8453'), used to read
+  // ERC-20 decimals() on-chain for tokens addressed by contract address.
+  evmRpcUrls: Record<string, string>
+  // Redis connection URL backing the forever (no-TTL) token-decimals cache.
+  redisUrl?: string
   version: string
+}
+
+// Supported EVM chains that must have a configured RPC URL, and the env var each reads.
+export const SUPPORTED_EVM_RPC_ENV: Record<string, string> = {
+  'evm:1': 'ETH_RPC_URL',
+  'evm:8453': 'BASE_RPC_URL',
+  'evm:42161': 'ARBITRUM_RPC_URL'
 }
 
 type Env = Record<string, string | undefined>
@@ -98,6 +110,8 @@ export function loadConfig(env: Env = Bun.env as Env): GatewayConfig {
     bitcoinAddressNetworks: parseBitcoinAddressNetworks(
       env.ROUTER_GATEWAY_BITCOIN_ADDRESS_NETWORKS
     ),
+    evmRpcUrls: loadEvmRpcUrls(env),
+    redisUrl: normalizeOptionalRedisUrl(env.REDIS_URL, 'REDIS_URL'),
     version: env.npm_package_version ?? DEFAULT_VERSION
   }
 }
@@ -122,6 +136,49 @@ export function validateGatewayRuntimeConfig(config: GatewayConfig): void {
       'ROUTER_GATEWAY_PUBLIC_BASE_URL must be configured when router-gateway binds a non-loopback host'
     )
   }
+  for (const [chainId, envName] of Object.entries(SUPPORTED_EVM_RPC_ENV)) {
+    if (!config.evmRpcUrls[chainId]) {
+      throw new GatewayConfigurationError(
+        `${envName} must be configured when router-gateway binds a non-loopback host (required to resolve on-chain token decimals for ${chainId})`
+      )
+    }
+  }
+  if (!config.redisUrl) {
+    throw new GatewayConfigurationError(
+      'REDIS_URL must be configured when router-gateway binds a non-loopback host (token-decimals cache)'
+    )
+  }
+}
+
+function loadEvmRpcUrls(env: Env): Record<string, string> {
+  const result: Record<string, string> = {}
+  for (const [chainId, envName] of Object.entries(SUPPORTED_EVM_RPC_ENV)) {
+    const url = normalizeOptionalHttpUrl(env[envName], envName)
+    if (url) result[chainId] = url
+  }
+  return result
+}
+
+function normalizeOptionalRedisUrl(
+  value: string | undefined,
+  name: string
+): string | undefined {
+  const trimmed = value?.trim()
+  if (!trimmed) return undefined
+  let url: URL
+  try {
+    url = new URL(trimmed)
+  } catch {
+    throw new GatewayConfigurationError(
+      `Invalid ${name}: expected a redis:// or rediss:// URL`
+    )
+  }
+  if (url.protocol !== 'redis:' && url.protocol !== 'rediss:') {
+    throw new GatewayConfigurationError(
+      `Invalid ${name}: expected a redis:// or rediss:// URL`
+    )
+  }
+  return trimmed
 }
 
 function parsePort(value: string | undefined): number {

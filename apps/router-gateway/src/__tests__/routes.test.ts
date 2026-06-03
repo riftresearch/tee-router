@@ -753,6 +753,44 @@ describe('router gateway routes', () => {
     expect(calls[0]?.body).not.toHaveProperty('kind')
   })
 
+  test('resolves decimals so readable amounts work for address-form tokens', async () => {
+    const calls: RecordedCall[] = []
+    const app = createApp(testConfig(), {
+      fetch: mockFetch(calls, async () =>
+        Response.json(internalQuote(), { status: 201 })
+      ),
+      decimalsResolver: {
+        ensure: async (asset) => {
+          if (
+            asset.decimals === undefined &&
+            asset.internal.asset.startsWith('0x')
+          ) {
+            asset.decimals = 18
+          }
+        }
+      }
+    })
+
+    const response = await app.request('/quote', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        from: 'Base.0xbaa5cc21fd487b8fcc2f632f3f4e8d37262a0842',
+        to: 'Ethereum.USDC',
+        toAddress: TO_ADDRESS,
+        fromAmount: '52',
+        amountFormat: 'readable'
+      })
+    })
+
+    expect(response.status).toBe(201)
+    // 52 readable * 10^18 (resolver-provided decimals) -> raw amount to the router
+    expect(calls[0]?.body).toMatchObject({
+      type: 'market_order',
+      amount_in: '52000000000000000000'
+    })
+  })
+
   test('forwards market quote provider sequence constraints', async () => {
     const calls: RecordedCall[] = []
     const app = createApp(testConfig(), {
@@ -1525,6 +1563,11 @@ function testConfig(): GatewayConfig {
     healthPollIntervalMs: 30_000,
     healthTargetTimeoutMs: 1_000,
     bitcoinAddressNetworks: ['mainnet', 'testnet', 'regtest'],
+    evmRpcUrls: {
+      'evm:1': 'https://eth.example.com',
+      'evm:8453': 'https://base.example.com',
+      'evm:42161': 'https://arb.example.com'
+    },
     version: 'test'
   }
 }

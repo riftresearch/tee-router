@@ -226,6 +226,10 @@ services:
       ROUTER_GATEWAY_API_KEY: devnet-gateway-key-0000000000000000
       ROUTER_GATEWAY_CANCELLATION_SECRET_KEY: "2222222222222222222222222222222222222222222222222222222222222222"
       ROUTER_GATEWAY_BITCOIN_ADDRESS_NETWORKS: regtest
+      # Devnet anvil RPCs — used to read ERC-20 decimals() for address-form tokens.
+      ETH_RPC_URL: http://devnet:50101
+      BASE_RPC_URL: http://devnet:50102
+      ARBITRUM_RPC_URL: http://devnet:50103
 
   admin-dashboard:
     environment:

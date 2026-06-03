@@ -240,6 +240,10 @@ services:
       ROUTER_GATEWAY_API_KEY: ${ROUTER_GATEWAY_API_KEY:?ROUTER_GATEWAY_API_KEY is required}
       ROUTER_GATEWAY_CANCELLATION_SECRET_KEY: ${ROUTER_GATEWAY_CANCELLATION_SECRET_KEY:?ROUTER_GATEWAY_CANCELLATION_SECRET_KEY is required}
       ROUTER_GATEWAY_BITCOIN_ADDRESS_NETWORKS: ${ROUTER_GATEWAY_BITCOIN_ADDRESS_NETWORKS:-mainnet}
+      # Real-network RPCs — used to read ERC-20 decimals() for address-form tokens.
+      ETH_RPC_URL: ${ETH_RPC_URL:?ETH_RPC_URL is required}
+      BASE_RPC_URL: ${BASE_RPC_URL:?BASE_RPC_URL is required}
+      ARBITRUM_RPC_URL: ${ARBITRUM_RPC_URL:?ARBITRUM_RPC_URL is required}
 
   admin-dashboard:
     <<: *live-host-gateway

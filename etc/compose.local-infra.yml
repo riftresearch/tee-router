@@ -813,12 +813,16 @@ services:
         condition: service_healthy
       router-gateway-db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
       HOST: 0.0.0.0
       PORT: 3000
       ROUTER_INTERNAL_BASE_URL: http://router-api:4522
       ROUTER_GATEWAY_PUBLIC_BASE_URL: http://localhost:3001
       ROUTER_GATEWAY_DATABASE_URL: postgres://postgres:postgres@router-gateway-db:5432/router_gateway
+      # Forever (no-TTL) cache for on-chain-resolved ERC-20 decimals.
+      REDIS_URL: redis://redis:6379
     ports:
       - "3001:3000"
     healthcheck:
@@ -826,6 +830,17 @@ services:
       interval: 5s
       timeout: 5s
       retries: 40
+
+  # Decimals cache for the router-gateway (forever / no-TTL keys). In-memory only
+  # locally; persistence isn't required since entries are re-derivable on-chain.
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   admin-dashboard-auth-db:
     image: postgres:16-alpine

@@ -2,6 +2,7 @@ import { createRoute, z } from '@hono/zod-openapi'
 
 import {
   assertAddressMatchesChain,
+  assetIdentifierFromInternal,
   parseAmount,
   resolveAssetIdentifier,
   type AmountFormat,
@@ -20,7 +21,7 @@ import {
   presentOrderEnvelope,
   routerQuoteFromEnvelope
 } from '../presenters'
-import { routerClientFor, type GatewayDeps } from './deps'
+import { decimalsResolverFor, routerClientFor, type GatewayDeps } from './deps'
 import {
   AddressSchema,
   AmountFormatSchema,
@@ -205,6 +206,17 @@ export function createOrderMarketHandler(
         })
       }
       const quote = routerQuoteFromEnvelope(quoteEnvelope)
+      // Readable output formatting needs decimals for address-form tokens; resolve
+      // them on-chain (cached) so the presenter can render readable amounts.
+      if (amountFormat === 'readable') {
+        const decimalsResolver = decimalsResolverFor(config, deps)
+        await decimalsResolver.ensure(
+          assetIdentifierFromInternal(quote.source_asset)
+        )
+        await decimalsResolver.ensure(
+          assetIdentifierFromInternal(quote.destination_asset)
+        )
+      }
       assertAddressMatchesChain(
         quote.source_asset.chain,
         request.fromAddress,
@@ -353,6 +365,18 @@ export function createOrderGetHandler(
       const orderId = c.req.valid('param').orderId
       const amountFormat: AmountFormat = c.req.valid('query').amountFormat ?? 'readable'
       const envelope = await routerClientFor(config, deps).getOrder(orderId)
+      // Resolve address-token decimals (cached) so readable formatting works even
+      // after a gateway restart where the process cache is cold.
+      if (amountFormat === 'readable') {
+        const quote = routerQuoteFromEnvelope({ quote: envelope.quote })
+        const decimalsResolver = decimalsResolverFor(config, deps)
+        await decimalsResolver.ensure(
+          assetIdentifierFromInternal(quote.source_asset)
+        )
+        await decimalsResolver.ensure(
+          assetIdentifierFromInternal(quote.destination_asset)
+        )
+      }
       let response!: ReturnType<typeof presentAnyOrderEnvelope>
       try {
         response = presentAnyOrderEnvelope(envelope, amountFormat)

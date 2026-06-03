@@ -9,7 +9,7 @@ import {
 import type { GatewayConfig } from '../config'
 import { normalizeError } from '../errors'
 import { presentQuoteEnvelope } from '../presenters'
-import { routerClientFor, type GatewayDeps } from './deps'
+import { decimalsResolverFor, routerClientFor, type GatewayDeps } from './deps'
 import {
   AmountFormatSchema,
   AddressSchema,
@@ -132,6 +132,14 @@ export function createQuoteHandler(
       const amountFormat: AmountFormat = request.amountFormat ?? 'readable'
       const source = resolveAssetIdentifier(request.from)
       const destination = resolveAssetIdentifier(request.to)
+      // Readable amounts need decimals for both sides (input parse + output
+      // formatting). For tokens addressed by contract address, resolve decimals
+      // on-chain (cached) so readable works without the caller knowing them.
+      if (amountFormat === 'readable') {
+        const decimalsResolver = decimalsResolverFor(config, deps)
+        await decimalsResolver.ensure(source)
+        await decimalsResolver.ensure(destination)
+      }
       const orderType = normalizeOrderType(request.orderType)
       assertAddressMatchesChain(
         destination.internal.chain,

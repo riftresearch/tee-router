@@ -98,6 +98,25 @@ const BASE58_VALUES = new Map(
   [...BASE58_ALPHABET].map((character, index) => [character, index])
 )
 
+// Process-local cache of on-chain-resolved decimals for address-form tokens,
+// keyed by `${chain}|${loweredAddress}`. Populated by the async decimals resolver
+// (which also persists to Redis) so that both request parsing and response
+// formatting — which independently rebuild assets via the functions below — see
+// the decimals without another lookup.
+const onchainDecimals = new Map<string, number>()
+
+function decimalsCacheKey(chain: string, address: string): string {
+  return `${chain}|${address.toLowerCase()}`
+}
+
+export function rememberDecimals(
+  chain: string,
+  address: string,
+  decimals: number
+): void {
+  onchainDecimals.set(decimalsCacheKey(chain, address), decimals)
+}
+
 export function resolveAssetIdentifier(identifier: string): ResolvedAsset {
   const parts = identifier.trim().split('.')
   if (parts.length !== 2 || !parts[0] || !parts[1]) {
@@ -148,6 +167,9 @@ export function resolveAssetIdentifier(identifier: string): ResolvedAsset {
   const normalizedAddress = getAddress(assetPart).toLowerCase()
   return {
     id: `${chain.display}.${normalizedAddress}`,
+    decimals: onchainDecimals.get(
+      decimalsCacheKey(chain.chainId, normalizedAddress)
+    ),
     internal: {
       chain: chain.chainId,
       asset: normalizedAddress
@@ -165,6 +187,7 @@ export function assetIdentifierFromInternal(asset: InternalDepositAsset): Resolv
   const display = chain?.display ?? asset.chain
   return {
     id: `${display}.${asset.asset}`,
+    decimals: onchainDecimals.get(decimalsCacheKey(asset.chain, asset.asset)),
     internal: asset
   }
 }
