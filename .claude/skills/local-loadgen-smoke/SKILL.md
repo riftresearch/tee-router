@@ -85,6 +85,16 @@ done < /tmp/oids.txt | sort | uniq -c
 
 A clean run is **all N `completed`, zero failures**.
 
+### 5. Tear down (leave a clean slate)
+
+Don't leave the stack running after a local test — wipe volumes so the next run
+(or a different stack, e.g. live-local) doesn't inherit dirty state (stale
+temporal metadata, a desynced postgres replica, etc.):
+
+```bash
+just dc down -v
+```
+
 ## Reference
 
 - **Ports** (host): gateway `13001`, router-api `14522` (metrics `19100`), temporal-ui
