@@ -71,11 +71,12 @@ Postgres data dirs + Temporal history growth).
 
 Scale up for sustained throughput: `tdx.2xlarge` (16/32) for comfortable
 headroom, `tdx.4xlarge` (32/64) to match the throughput tuning (the ≈32-core
-figure noted above). Override per-deploy without editing the justfile, e.g.:
+figure noted above). The CVM name is a positional arg; override the size
+per-deploy with `just --set` (not editing the justfile), e.g.:
 
 ```bash
-just phala-create 0.2.26 phala_cvm=tee-router-prod1 \
-  phala_instance_type=tdx.2xlarge phala_disk_size=80G
+just --set phala_instance_type tdx.2xlarge --set phala_disk_size 80G \
+  phala-create 0.2.26 tee-router-demo-v2
 ```
 
 ### Railway
@@ -354,11 +355,10 @@ Notes:
   deploying. **Commit that tag bump** so the deployed revision is recorded
   in git (the pinned tag in `compose.phala.yml` is the source of truth for
   what's running).
-- CVM is referenced by name (`phala_cvm`); there is no active deployment and no
-  default, so pass it per-invocation: `just phala-deploy 0.2.0 phala_cvm=<cvm>`.
-- The `phala cvms upgrade` env-file flag is marked `VERIFY` in the justfile
-  — confirm against `phala cvms upgrade --help` on the installed CLI before
-  the first real run (CLI surface shifts between versions).
+- The CVM (name or app-id) is a positional arg; there is no active-deployment
+  default, so pass it per-invocation: `just phala-deploy 0.2.26 tee-router-demo-v2`
+  (first time: `just phala-create 0.2.26 tee-router-demo-v2`). The recipes wrap
+  the unified `phala deploy` (`-c` compose, `-e` env file).
 - Rollback = `just phala-deploy <previous-tag>`.
 
 ## Primary Postgres In Phala

@@ -279,19 +279,18 @@ test-all:
 # holding every required compose var (the ${VAR:?} set + OBS_INGEST_TOKEN +
 # ALLOY_V3_OTLP_URL — see docs/devops-deployment-plan.md secret table).
 #
-# CVM is referenced by name/id. No active deployment (the previous CVM was
-# deleted 2026-06-02), so there is no default — pass phala_cvm explicitly:
-#   just phala-create 0.2.26 phala_cvm=<new-name>   # first time (creates the CVM)
-#   just phala-deploy  0.2.27 phala_cvm=<name|id>    # later (updates existing)
-phala_cvm           := ""
+# The CVM (name or app-id) is a positional arg — there is no active-deployment
+# default (the previous CVM was deleted 2026-06-02):
+#   just phala-create 0.2.26 tee-router-demo-v2   # first time (creates the CVM)
+#   just phala-deploy  0.2.27 tee-router-demo-v2   # later (updates existing)
 phala_env           := ".secrets/phala.env"
 phala_compose       := "etc/compose.phala.yml"
 # Machine size — applied by `phala-create` only (updates keep the CVM's existing
 # size). tdx.xlarge (8 vCPU / 16 GB) is the floor that fits the stack's two
 # Postgres (shared_buffers=1GB each) + the 4-role Temporal split; size up for
 # sustained load (tdx.2xlarge 16/32, tdx.4xlarge 32/64). See the sizing note in
-# docs/devops-deployment-plan.md. Override per-deploy, e.g.
-# `phala_instance_type=tdx.2xlarge phala_disk_size=80G`.
+# docs/devops-deployment-plan.md. Override per-deploy with `just --set`, e.g.
+# `just --set phala_instance_type tdx.2xlarge phala-create 0.2.26 <cvm>`.
 phala_instance_type := "tdx.xlarge"
 phala_disk_size     := "60G"
 
@@ -300,45 +299,43 @@ phala_disk_size     := "60G"
 phala-login:
     phala login
 
-# Create a NEW CVM from compose.phala.yml pinned to TAG, sized by
+# Create a NEW CVM named CVM from compose.phala.yml pinned to TAG, sized by
 # phala_instance_type / phala_disk_size. Use once (no CVM exists); afterwards
 # use phala-deploy to update it. Example:
-#   just phala-create 0.2.26 phala_cvm=tee-router-prod1
-phala-create TAG:
+#   just phala-create 0.2.26 tee-router-demo-v2
+phala-create TAG CVM:
     #!/usr/bin/env bash
     set -euo pipefail
-    test -n "{{phala_cvm}}" || { echo "pass phala_cvm=<new-name>"; exit 1; }
     test -f "{{phala_env}}" || { echo "missing {{phala_env}} (gitignored secret env)"; exit 1; }
     sed -i -E 's#(ghcr\.io/riftresearch/tee-router(-temporal-worker|-temporal-ui)?:)[^"[:space:]]+#\1{{TAG}}#g' "{{phala_compose}}"
     echo "pinned ghcr images to {{TAG}}:"
     grep -n 'ghcr.io/riftresearch/tee-router' "{{phala_compose}}"
     docker compose -f "{{phala_compose}}" config --no-interpolate >/dev/null
-    phala deploy --name "{{phala_cvm}}" -c "{{phala_compose}}" -e "{{phala_env}}" \
+    phala deploy --name "{{CVM}}" -c "{{phala_compose}}" -e "{{phala_env}}" \
       --instance-type "{{phala_instance_type}}" --disk-size "{{phala_disk_size}}"
-    echo "Created {{phala_cvm}} ({{phala_instance_type}}, {{phala_disk_size}}) at {{TAG}}."
-    echo "Capture app-id + endpoints: phala cvms get {{phala_cvm}} -j"
+    echo "Created {{CVM}} ({{phala_instance_type}}, {{phala_disk_size}}) at {{TAG}}."
+    echo "Capture app-id + endpoints: phala cvms get {{CVM}} -j"
 
-# Push an upgrade to an EXISTING CVM: pin both GHCR images to TAG, then
-# redeploy. Phala restarts the CVM, pulls the new images, starts with new
-# config. Example: just phala-deploy 0.2.27 phala_cvm=<name|id>
-phala-deploy TAG:
+# Push an upgrade to an EXISTING CVM (name or app-id): pin both GHCR images to
+# TAG, then redeploy. Phala restarts the CVM, pulls the new images, starts with
+# new config. Example: just phala-deploy 0.2.27 tee-router-demo-v2
+phala-deploy TAG CVM:
     #!/usr/bin/env bash
     set -euo pipefail
-    test -n "{{phala_cvm}}" || { echo "pass phala_cvm=<name|id>"; exit 1; }
     test -f "{{phala_env}}" || { echo "missing {{phala_env}} (gitignored secret env)"; exit 1; }
     sed -i -E 's#(ghcr\.io/riftresearch/tee-router(-temporal-worker|-temporal-ui)?:)[^"[:space:]]+#\1{{TAG}}#g' "{{phala_compose}}"
     echo "pinned ghcr images to {{TAG}}:"
     grep -n 'ghcr.io/riftresearch/tee-router' "{{phala_compose}}"
     docker compose -f "{{phala_compose}}" config --no-interpolate >/dev/null
-    phala deploy --cvm-id "{{phala_cvm}}" -c "{{phala_compose}}" -e "{{phala_env}}"
-    echo "Deployed {{TAG}} to Phala CVM {{phala_cvm}}. Commit the compose tag bump to record the deployed revision."
+    phala deploy --cvm-id "{{CVM}}" -c "{{phala_compose}}" -e "{{phala_env}}"
+    echo "Deployed {{TAG}} to Phala CVM {{CVM}}. Commit the compose tag bump to record the deployed revision."
 
-# Redeploy the CURRENT compose.phala.yml as-is (config-only change; no image
-# tag bump). Use after editing compose/secrets without changing the release.
-phala-upgrade:
+# Redeploy the CURRENT compose.phala.yml as-is to an EXISTING CVM (config-only
+# change; no image tag bump). Use after editing compose/secrets without changing
+# the release. Example: just phala-upgrade tee-router-demo-v2
+phala-upgrade CVM:
     #!/usr/bin/env bash
     set -euo pipefail
-    test -n "{{phala_cvm}}" || { echo "pass phala_cvm=<name|id>"; exit 1; }
     test -f "{{phala_env}}" || { echo "missing {{phala_env}}"; exit 1; }
     docker compose -f "{{phala_compose}}" config --no-interpolate >/dev/null
-    phala deploy --cvm-id "{{phala_cvm}}" -c "{{phala_compose}}" -e "{{phala_env}}"
+    phala deploy --cvm-id "{{CVM}}" -c "{{phala_compose}}" -e "{{phala_env}}"

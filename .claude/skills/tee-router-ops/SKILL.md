@@ -67,20 +67,21 @@ by `etc/compose.phala.yml` must be set here. Notably:
 - `HYPERUNIT_PROXY_URL=socks5://<user>:<pass>@<railway-tcp-proxy-host>:<port>`
 - `TEMPORAL_UI_PW_HASH` (bcrypt hash; plaintext is what the operator typed)
 
-**Deploy commands** (run from `.worktrees/main/`, pass your CVM name). All wrap
-the unified `phala deploy`; `phala cvms create/upgrade` are deprecated.
+**Deploy commands** (run from `.worktrees/main/`; the CVM name/app-id is a
+positional arg). All wrap the unified `phala deploy`; `phala cvms create/upgrade`
+are deprecated.
 
 ```bash
 # FIRST TIME — create the CVM (none exists). Sized by phala_instance_type,
 # default tdx.xlarge (8 vCPU/16 GB); see devops-deployment-plan.md "CVM sizing".
-# Override e.g. phala_instance_type=tdx.2xlarge phala_disk_size=80G:
-just phala-create 0.2.X phala_cvm=<cvm>
+# Override: just --set phala_instance_type tdx.2xlarge phala-create 0.2.X <cvm>
+just phala-create 0.2.X <cvm>
 
 # AFTERWARDS — update the existing CVM:
-just phala-deploy 0.2.X phala_cvm=<cvm>    # pin etc/compose.phala.yml to :0.2.X, redeploy
-just phala-upgrade phala_cvm=<cvm>         # config-only redeploy (no version bump)
+just phala-deploy 0.2.X <cvm>    # pin etc/compose.phala.yml to :0.2.X, redeploy
+just phala-upgrade <cvm>         # config-only redeploy (no version bump)
 
-phala cvms get <cvm> -j                    # status (JSON, includes endpoints)
+phala cvms get <cvm> -j          # status (JSON, includes endpoints)
 ```
 
 **Don't use `:main` image tags** in compose.phala.yml — always pinned versions.
@@ -96,8 +97,8 @@ phala cvms get <cvm> -j                    # status (JSON, includes endpoints)
    on the **self-hosted runner `tee-router-builder`**
 6. Wait for build (`gh run list --workflow=router-image.yml --limit 3`)
 7. Verify pushed: `docker manifest inspect ghcr.io/riftresearch/tee-router:0.2.X`
-8. Deploy: `just phala-create 0.2.X phala_cvm=<cvm>` (first CVM) or
-   `just phala-deploy 0.2.X phala_cvm=<cvm>` (existing CVM)
+8. Deploy: `just phala-create 0.2.X <cvm>` (first CVM) or
+   `just phala-deploy 0.2.X <cvm>` (existing CVM)
 9. Poll until `phala cvms get <cvm>` shows `Status: running`
 10. Probe `https://router-gateway-v3-production.up.railway.app/providers` — expect
     `status: ok` with all 6 venues `reachable`
