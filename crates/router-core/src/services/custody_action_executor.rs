@@ -1,5 +1,5 @@
 use super::{
-    bitcoin_funding::{observed_bitcoin_outpoint, ObservedBitcoinOutpoint},
+    bitcoin_funding::{bitcoin_outpoint_tuples, observed_bitcoin_utxos, ObservedBitcoinOutpoint},
     upstream_proxy::ProxyUrl,
 };
 use crate::{
@@ -506,23 +506,28 @@ impl CustodyActionExecutor {
                                     chain: vault.chain,
                                 });
                             };
-                            if let Some(outpoint) =
-                                self.observed_bitcoin_source_outpoint(&vault).await?
-                            {
+                            let observed_utxos =
+                                self.observed_bitcoin_source_utxos(&vault).await?;
+                            let observed_spend = if observed_utxos.is_empty() {
+                                None
+                            } else {
+                                // Spend the full observed UTXO set (each RPC-verified).
                                 bitcoin_chain
-                                    .transfer_native_amount_from_outpoint(
+                                    .transfer_native_amount_from_outpoints(
                                         wallet.private_key(),
                                         &to_address,
                                         amount,
                                         bitcoin_fee_budget,
-                                        &outpoint.tx_hash,
-                                        outpoint.vout,
-                                        outpoint.amount_sats,
+                                        &bitcoin_outpoint_tuples(&observed_utxos),
                                     )
                                     .await
                                     .map_err(|source| CustodyActionError::Chain { source })?
-                            } else {
-                                bitcoin_chain
+                            };
+                            match observed_spend {
+                                Some(txid) => txid,
+                                // No observed outpoints, or all of them stale:
+                                // discover the current UTXOs via Esplora.
+                                None => bitcoin_chain
                                     .transfer_native_amount(
                                         wallet.private_key(),
                                         &to_address,
@@ -530,7 +535,7 @@ impl CustodyActionExecutor {
                                         bitcoin_fee_budget,
                                     )
                                     .await
-                                    .map_err(|source| CustodyActionError::Chain { source })?
+                                    .map_err(|source| CustodyActionError::Chain { source })?,
                             }
                         }
                         ChainType::Hyperliquid => {
@@ -663,24 +668,38 @@ impl CustodyActionExecutor {
                         chain: vault.deposit_asset.chain.clone(),
                     });
                 };
-                if let Some(outpoint) =
-                    observed_bitcoin_outpoint(vault.funding_observation.as_ref()).map_err(
-                        |reason| CustodyActionError::InvalidBitcoinFundingObservation {
-                            vault_id: vault.id,
-                            reason,
-                        },
-                    )?
-                {
-                    return Ok(chain
-                        .spendable_outpoint_value_sats(
-                            &vault.deposit_vault_address,
-                            &outpoint.tx_hash,
-                            outpoint.vout,
-                            outpoint.amount_sats,
-                        )
-                        .await
-                        .map_err(|source| CustodyActionError::Chain { source })?
-                        .to_string());
+                let observed_utxos = observed_bitcoin_utxos(vault.funding_observation.as_ref())
+                    .map_err(|reason| CustodyActionError::InvalidBitcoinFundingObservation {
+                        vault_id: vault.id,
+                        reason,
+                    })?;
+                if !observed_utxos.is_empty() {
+                    // Sum the spendable value of each observed outpoint (RPC). A
+                    // spent/reorged outpoint contributes 0, so a stale snapshot
+                    // degrades gracefully rather than over-reporting.
+                    let mut total: u64 = 0;
+                    for outpoint in &observed_utxos {
+                        let value = chain
+                            .spendable_outpoint_value_sats(
+                                &vault.deposit_vault_address,
+                                &outpoint.tx_hash,
+                                outpoint.vout,
+                                outpoint.amount_sats,
+                            )
+                            .await
+                            .map_err(|source| CustodyActionError::Chain { source })?;
+                        total = total.checked_add(value).ok_or_else(|| {
+                            CustodyActionError::InvalidBitcoinFundingObservation {
+                                vault_id: vault.id,
+                                reason: "observed bitcoin balance overflow".to_string(),
+                            }
+                        })?;
+                    }
+                    if total > 0 {
+                        return Ok(total.to_string());
+                    }
+                    // Every observed outpoint is stale (value 0): fall back to the
+                    // live Esplora address balance below.
                 }
                 Ok(chain
                     .address_balance_sats(&vault.deposit_vault_address)
@@ -978,12 +997,15 @@ impl CustodyActionExecutor {
         }
     }
 
-    async fn observed_bitcoin_source_outpoint(
+    /// The full observed UTXO set for a SourceDeposit Bitcoin custody vault.
+    /// Empty for non-Bitcoin / non-source vaults or when nothing has been
+    /// observed yet (the caller then falls back to Esplora discovery).
+    async fn observed_bitcoin_source_utxos(
         &self,
         vault: &CustodyVault,
-    ) -> CustodyActionResult<Option<ObservedBitcoinOutpoint>> {
+    ) -> CustodyActionResult<Vec<ObservedBitcoinOutpoint>> {
         if vault.role != CustodyVaultRole::SourceDeposit || vault.chain.as_str() != "bitcoin" {
-            return Ok(None);
+            return Ok(Vec::new());
         }
         let deposit_vault = self
             .db
@@ -991,7 +1013,7 @@ impl CustodyActionExecutor {
             .get(vault.id)
             .await
             .map_err(|source| CustodyActionError::Database { source })?;
-        observed_bitcoin_outpoint(deposit_vault.funding_observation.as_ref()).map_err(|reason| {
+        observed_bitcoin_utxos(deposit_vault.funding_observation.as_ref()).map_err(|reason| {
             CustodyActionError::InvalidBitcoinFundingObservation {
                 vault_id: vault.id,
                 reason,

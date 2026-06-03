@@ -123,6 +123,15 @@ fn utxo_from_evidence_entry(entry: &Value) -> Result<Option<ObservedBitcoinOutpo
     }))
 }
 
+/// Convert observed outpoints into the `(tx_hash, vout, amount_sats)` tuples the
+/// `BitcoinChain` multi-outpoint spend/refund methods consume.
+pub fn bitcoin_outpoint_tuples(outpoints: &[ObservedBitcoinOutpoint]) -> Vec<(String, u32, u64)> {
+    outpoints
+        .iter()
+        .map(|outpoint| (outpoint.tx_hash.clone(), outpoint.vout, outpoint.amount_sats))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

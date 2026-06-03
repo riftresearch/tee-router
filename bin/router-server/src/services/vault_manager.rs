@@ -17,7 +17,7 @@ use router_core::{
         ProviderOperationHintStatus, RouterOrderQuote, RouterOrderStatus, VaultAction,
     },
     protocol::{backend_chain_for_id, AssetId, ChainId, DepositAsset},
-    services::bitcoin_funding::observed_bitcoin_outpoint,
+    services::bitcoin_funding::{bitcoin_outpoint_tuples, observed_bitcoin_utxos},
 };
 use router_primitives::{ChainType, TokenIdentifier};
 use serde_json::{json, Value};
@@ -818,27 +818,24 @@ impl VaultManager {
                     .ok_or_else(|| "Bitcoin chain is not configured".to_string())?,
             )
             .ok_or_else(|| "Bitcoin chain is not configured".to_string())?;
-        if let Some(outpoint) = observed_bitcoin_outpoint(vault.funding_observation.as_ref())? {
-            let fee = bitcoin_chain
-                .estimate_p2wpkh_transfer_fee_sats(1, 1)
-                .await
-                .map_err(|err| err.to_string())?;
-            let tx_data = bitcoin_chain
-                .dump_to_address_from_outpoint(
+        let observed_utxos = observed_bitcoin_utxos(vault.funding_observation.as_ref())?;
+        if !observed_utxos.is_empty() {
+            if let Some(tx_data) = bitcoin_chain
+                .dump_to_address_from_outpoints(
                     &token_identifier(&vault.deposit_asset.asset),
                     private_key,
                     &vault.recovery_address,
-                    U256::from(fee),
-                    &outpoint.tx_hash,
-                    outpoint.vout,
-                    outpoint.amount_sats,
+                    &bitcoin_outpoint_tuples(&observed_utxos),
                 )
                 .await
-                .map_err(|err| err.to_string())?;
-            return bitcoin_chain
-                .broadcast_signed_transaction(&tx_data)
-                .await
-                .map_err(|err| err.to_string());
+                .map_err(|err| err.to_string())?
+            {
+                return bitcoin_chain
+                    .broadcast_signed_transaction(&tx_data)
+                    .await
+                    .map_err(|err| err.to_string());
+            }
+            // All observed outpoints are stale: fall through to Esplora discovery.
         }
         let balance = bitcoin_chain
             .address_balance_sats(&vault.deposit_vault_address)
