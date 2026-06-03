@@ -106,7 +106,7 @@ const ETH_RPC_URL_ENV: &str = "ETH_RPC_URL";
 const BASE_RPC_URL_ENV: &str = "BASE_RPC_URL";
 const BASE_FUNDING_RPC_URL_ENV: &str = "ROUTER_LIVE_BASE_FUNDING_RPC_URL";
 const ARBITRUM_RPC_URL_ENV: &str = "ARBITRUM_RPC_URL";
-const ELECTRUM_HTTP_SERVER_URL_ENV: &str = "ELECTRUM_HTTP_SERVER_URL";
+const ESPLORA_HTTP_SERVER_URL_ENV: &str = "ESPLORA_HTTP_SERVER_URL";
 const BITCOIN_RPC_URL_ENV: &str = "BITCOIN_RPC_URL";
 const BITCOIN_RPC_AUTH_ENV: &str = "BITCOIN_RPC_AUTH";
 const BITCOIN_INDEXER_URL_ENV: &str = "BITCOIN_INDEXER_URL";
@@ -259,7 +259,7 @@ struct LiveRuntimeConfig {
     arbitrum_rpc_url: String,
     bitcoin_rpc_url: String,
     bitcoin_rpc_auth: Auth,
-    electrum_http_server_url: String,
+    esplora_http_server_url: String,
     bitcoin_indexer_url: Option<String>,
     bitcoin_receipt_watcher_url: Option<String>,
     across_api_url: String,
@@ -294,7 +294,7 @@ impl LiveRuntimeConfig {
             arbitrum_rpc_url: env_var_required(ARBITRUM_RPC_URL_ENV),
             bitcoin_rpc_url: env_var_required(BITCOIN_RPC_URL_ENV),
             bitcoin_rpc_auth: parse_auth_env(BITCOIN_RPC_AUTH_ENV),
-            electrum_http_server_url: env_var_required(ELECTRUM_HTTP_SERVER_URL_ENV),
+            esplora_http_server_url: env_var_required(ESPLORA_HTTP_SERVER_URL_ENV),
             bitcoin_indexer_url: env_var_optional(BITCOIN_INDEXER_URL_ENV),
             bitcoin_receipt_watcher_url: env_var_optional(BITCOIN_RECEIPT_WATCHER_URL_ENV),
             across_api_url: env_var_optional(ACROSS_API_URL_ENV)
@@ -1114,7 +1114,7 @@ fn live_router_args(
         bitcoin_rpc_url: live.bitcoin_rpc_url.clone(),
         bitcoin_rpc_proxy_url: None,
         bitcoin_rpc_auth: live.bitcoin_rpc_auth.clone(),
-        untrusted_esplora_http_server_url: live.electrum_http_server_url.clone(),
+        untrusted_esplora_http_server_url: live.esplora_http_server_url.clone(),
         esplora_proxy_url: None,
         bitcoin_network: bitcoin::Network::Bitcoin,
         cors_domain: None,

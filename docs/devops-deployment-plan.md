@@ -507,7 +507,7 @@ Required inputs:
 - Bitcoin indexer URL
 - Bitcoin receipt watcher URL
 - HL shim indexer URL
-- Bitcoin RPC/ZMQ/Electrum config (still consumed for some direct lookups)
+- Bitcoin RPC/ZMQ/Esplora config (still consumed for some direct lookups)
 
 Sauron posts non-authoritative hints to the router API. Router-worker still
 validates provider and chain state before executing state transitions.
@@ -800,7 +800,7 @@ Router API and worker need the same core config:
 - `ROUTER_MASTER_KEY_PATH`
 - `ETH_RPC_URL`, `BASE_RPC_URL`, `ARBITRUM_RPC_URL`
 - `BITCOIN_RPC_URL`, `BITCOIN_RPC_AUTH`
-- `ELECTRUM_HTTP_SERVER_URL`
+- `ESPLORA_HTTP_SERVER_URL`
 - `ACROSS_API_URL`, `ACROSS_API_KEY`, `ACROSS_INTEGRATOR_ID`
 - `CCTP_API_URL` if overriding Circle Iris default,
   `CCTP_TOKEN_MESSENGER_V2_ADDRESS`, `CCTP_MESSAGE_TRANSMITTER_V2_ADDRESS`
@@ -1093,7 +1093,7 @@ Still required before a real run:
 | `ROUTER_DETECTOR_API_KEY`, `ROUTER_GATEWAY_API_KEY`, `ROUTER_ADMIN_API_KEY` | generate | Phala secret + Railway shared var (consumers: sauron, gateway, dashboard) |
 | Observability bearer token | generate | Phala secret + Railway shared var |
 | Router master key, app DB password, **Temporal Postgres password** | **generated in-TEE** by one-shot init (`router-master-key-init`, `pg-secret-generator`, `temporal-pg-secret-generator`) | Phala persistent volumes (never injected) |
-| RPC/Electrum/HyperUnit-proxy endpoints | from providers | Phala env / Railway vars (proxy URL is credential-bearing) |
+| RPC/Esplora/HyperUnit-proxy endpoints | from providers | Phala env / Railway vars (proxy URL is credential-bearing) |
 
 The replica password and TLS material are the only **cross-platform**
 secrets — generate once, set identically on both sides.

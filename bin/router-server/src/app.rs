@@ -276,8 +276,8 @@ fn validate_upstream_config(args: &RouterServerArgs) -> Result<()> {
     );
     require_http_url(
         &mut errors,
-        "ELECTRUM_HTTP_SERVER_URL",
-        "Electrum HTTP Server URL",
+        "ESPLORA_HTTP_SERVER_URL",
+        "Esplora HTTP Server URL",
         Some(&args.untrusted_esplora_http_server_url),
     );
 
@@ -419,7 +419,7 @@ fn validate_upstream_config(args: &RouterServerArgs) -> Result<()> {
         );
         require_proxy(
             &mut errors,
-            "ELECTRUM_HTTP_SERVER_URL",
+            "ESPLORA_HTTP_SERVER_URL",
             "ESPLORA_PROXY_URL",
             &proxies.esplora,
         );

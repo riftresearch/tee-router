@@ -186,7 +186,7 @@ BITCOIN_RPC_AUTH=user:pass
 BITCOIN_ZMQ_RAWBLOCK_ENDPOINT=tcp://sauron-bitcoin-rathole-broker-v3.railway.internal:40034
 BITCOIN_ZMQ_RAWTX_ENDPOINT=tcp://sauron-bitcoin-rathole-broker-v3.railway.internal:40032
 BITCOIN_ZMQ_SEQUENCE_ENDPOINT=tcp://sauron-bitcoin-rathole-broker-v3.railway.internal:40033
-ELECTRUM_HTTP_SERVER_URL=https://your-esplora-http-endpoint
+ESPLORA_HTTP_SERVER_URL=https://your-esplora-http-endpoint
 ```
 
 Use fixed credentials here. Do not point Railway at a rotating bitcoind `.cookie`

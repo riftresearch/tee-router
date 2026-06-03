@@ -141,8 +141,8 @@ pub struct RouterServerArgs {
     #[arg(long, env = "BITCOIN_RPC_AUTH", default_value = "none", value_parser = parse_auth)]
     pub bitcoin_rpc_auth: Auth,
 
-    /// Electrum HTTP Server URL
-    #[arg(long, env = "ELECTRUM_HTTP_SERVER_URL")]
+    /// Esplora HTTP Server URL
+    #[arg(long, env = "ESPLORA_HTTP_SERVER_URL")]
     pub untrusted_esplora_http_server_url: String,
 
     /// Optional Esplora SOCKS5 proxy URL

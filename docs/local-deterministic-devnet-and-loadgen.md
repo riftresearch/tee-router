@@ -146,7 +146,7 @@ The compose file should configure router services with local URLs:
 - `BASE_RPC_URL=http://devnet:50102`
 - `ARBITRUM_RPC_URL=http://devnet:50103`
 - `BITCOIN_RPC_URL=http://devnet:50100`
-- `ELECTRUM_HTTP_SERVER_URL=http://devnet:50110`
+- `ESPLORA_HTTP_SERVER_URL=http://devnet:50110`
 - provider API URLs pointed at `http://devnet:50107`
 - `TEMPORAL_ADDRESS=http://temporal:7233`
 - shared order-execution task queue env for router-worker, router-api, and

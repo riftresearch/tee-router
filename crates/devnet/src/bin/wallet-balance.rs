@@ -74,7 +74,7 @@ struct Args {
     #[arg(long = "hyperliquid-base-url")]
     hyperliquid_base_url: Option<String>,
 
-    /// Bitcoin Esplora URL. Defaults to ELECTRUM_HTTP_SERVER_URL,
+    /// Bitcoin Esplora URL. Defaults to ESPLORA_HTTP_SERVER_URL,
     /// BITCOIN_ESPLORA_URL, or local devnet Esplora.
     #[arg(long = "bitcoin-esplora-url")]
     bitcoin_esplora_url: Option<String>,
@@ -224,7 +224,7 @@ async fn main() -> CliResult<()> {
     );
     let bitcoin_esplora_url = configured_value(
         args.bitcoin_esplora_url,
-        &["ELECTRUM_HTTP_SERVER_URL", "BITCOIN_ESPLORA_URL"],
+        &["ESPLORA_HTTP_SERVER_URL", "BITCOIN_ESPLORA_URL"],
         DEFAULT_BITCOIN_ESPLORA_URL,
     );
 

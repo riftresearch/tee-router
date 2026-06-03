@@ -95,7 +95,7 @@ services:
       ARBITRUM_RPC_URL: http://devnet:50103
       BITCOIN_RPC_URL: http://devnet:50100
       BITCOIN_RPC_AUTH: devnet:devnet
-      ELECTRUM_HTTP_SERVER_URL: http://devnet:50110
+      ESPLORA_HTTP_SERVER_URL: http://devnet:50110
       BITCOIN_NETWORK: regtest
       # Anvil account #9. Keep router paymasters off account #0 because the
       # devnet deployer, mocks, and loadgen helpers submit from account #0.
@@ -135,7 +135,7 @@ services:
         condition: service_healthy
     environment:
       ROUTER_DETECTOR_API_KEY: devnet-detector-key-000000000000
-      ELECTRUM_HTTP_SERVER_URL: http://devnet:50110
+      ESPLORA_HTTP_SERVER_URL: http://devnet:50110
       BITCOIN_RPC_URL: http://devnet:50100
       BITCOIN_RPC_AUTH: devnet:devnet
       BITCOIN_ZMQ_RAWBLOCK_ENDPOINT: tcp://devnet:50118

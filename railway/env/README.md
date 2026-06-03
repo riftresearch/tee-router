@@ -36,7 +36,7 @@ reference vars it wires automatically.
 | `BITCOIN_RPC_URL` | managed rathole broker v3 | sauron, bitcoin-indexer/-receipt-watcher |
 | `BITCOIN_RPC_AUTH` | from .env.phala.prod | sauron, bitcoin-indexer/-receipt-watcher |
 | `BITCOIN_ZMQ_RAWBLOCK/RAWTX/SEQUENCE_ENDPOINT` | managed rathole broker v3 | sauron, bitcoin-indexer/-receipt-watcher |
-| `ELECTRUM_HTTP_SERVER_URL` | from .env.phala.prod | sauron, bitcoin-indexer |
+| `ESPLORA_HTTP_SERVER_URL` | from .env.phala.prod | sauron, bitcoin-indexer |
 | `HYPERUNIT_API_URL` | fixed external endpoint (`https://api.hyperunit.xyz`) | sauron |
 | `ROUTER_CDC_PUBLICATION_NAME` `ROUTER_CDC_MESSAGE_PREFIX` | fixed convention | sauron, admin-dashboard |
 | `ROUTER_INTERNAL_BASE_URL` | **deploy-time** (Phala router-api public URL) | sauron, router-gateway |

@@ -264,7 +264,7 @@ mod tests {
             "--bitcoin-rpc-url",
             "http://bitcoin.example",
             "--untrusted-esplora-http-server-url",
-            "http://electrum.example",
+            "http://esplora.example",
         ]
     }
 

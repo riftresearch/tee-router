@@ -25,7 +25,7 @@ ZMQ is the canonical Bitcoin Core push mechanism; it is rock-solid in production
 
 | Mechanism | Use case | Notes |
 |---|---|---|
-| Esplora HTTP `/address/{addr}/utxo` and `/address/{addr}/txs` | **Catch-up** when Sauron starts cold or has been disconnected; **historical lookup** for a specific address that we just started watching | We have this (`ELECTRUM_HTTP_SERVER_URL`). 30s timeout, jittered exponential backoff |
+| Esplora HTTP `/address/{addr}/utxo` and `/address/{addr}/txs` | **Catch-up** when Sauron starts cold or has been disconnected; **historical lookup** for a specific address that we just started watching | We have this (`ESPLORA_HTTP_SERVER_URL`). 30s timeout, jittered exponential backoff |
 | Bitcoin Core RPC `getblock`, `getrawtransaction`, `getblockchaininfo` | **Verification** of a tx fingerprint after we've seen it via push; **reorg detection** (height mismatch) | We have this. RPC is the source of truth for confirmations |
 
 Polling Esplora repeatedly per address is *acceptable at the Sauron level* but should not be the primary trigger — push wins on latency and cost.

@@ -129,8 +129,8 @@ pub struct OrderWorkerRuntimeArgs {
     #[arg(long, env = "BITCOIN_RPC_AUTH", default_value = "none", value_parser = parse_auth)]
     pub bitcoin_rpc_auth: Auth,
 
-    /// Electrum HTTP Server URL
-    #[arg(long, env = "ELECTRUM_HTTP_SERVER_URL")]
+    /// Esplora HTTP Server URL
+    #[arg(long, env = "ESPLORA_HTTP_SERVER_URL")]
     pub untrusted_esplora_http_server_url: String,
 
     /// Optional Esplora SOCKS5 proxy URL
@@ -381,8 +381,8 @@ fn validate_upstream_config(args: &OrderWorkerRuntimeArgs) -> WorkerResult<()> {
     );
     require_http_url(
         &mut errors,
-        "ELECTRUM_HTTP_SERVER_URL",
-        "Electrum HTTP Server URL",
+        "ESPLORA_HTTP_SERVER_URL",
+        "Esplora HTTP Server URL",
         Some(&args.untrusted_esplora_http_server_url),
     );
 
@@ -506,7 +506,7 @@ fn validate_upstream_config(args: &OrderWorkerRuntimeArgs) -> WorkerResult<()> {
         );
         require_proxy(
             &mut errors,
-            "ELECTRUM_HTTP_SERVER_URL",
+            "ESPLORA_HTTP_SERVER_URL",
             "ESPLORA_PROXY_URL",
             &proxies.esplora,
         );

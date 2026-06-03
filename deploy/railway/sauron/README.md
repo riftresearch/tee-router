@@ -30,7 +30,7 @@ Required router environment:
 
 Required chain observer environment:
 
-- `ELECTRUM_HTTP_SERVER_URL`
+- `ESPLORA_HTTP_SERVER_URL`
 - `BITCOIN_RPC_URL`
 - `BITCOIN_RPC_AUTH`
 - `BITCOIN_ZMQ_RAWBLOCK_ENDPOINT`

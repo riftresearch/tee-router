@@ -72,7 +72,7 @@ This is the design defect the realignment exposed.
 ### Bitcoin backend (`discovery/bitcoin.rs`)
 
 - RPC client to `bitcoind` (`getblockheader`, `getblock`, `getrawtransaction`).
-- Esplora HTTP client (`ELECTRUM_HTTP_SERVER_URL`) for indexed lookups.
+- Esplora HTTP client (`ESPLORA_HTTP_SERVER_URL`) for indexed lookups.
 - ZMQ raw transaction stream (`bitcoin_zmq_rawtx_endpoint`) for mempool visibility.
 - Reorg depth: `BITCOIN_REORG_RESCAN_DEPTH = 6` (line 43).
 - Indexed lookup with 30s timeout, jittered exponential backoff retries.
