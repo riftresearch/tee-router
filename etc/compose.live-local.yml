@@ -95,6 +95,8 @@ services:
       ETH_RPC_URL: ${ETH_RPC_URL:?ETH_RPC_URL is required}
       BASE_RPC_URL: ${BASE_RPC_URL:?BASE_RPC_URL is required}
       ARBITRUM_RPC_URL: ${ARBITRUM_RPC_URL:?ARBITRUM_RPC_URL is required}
+      # Public Flashbots Protect endpoint; not a secret, hardcoded like the Phala stack.
+      FLASHBOTS_RPC_URL: https://rpc.flashbots.net/fast
       BITCOIN_RPC_URL: ${BITCOIN_RPC_URL:?BITCOIN_RPC_URL is required}
       BITCOIN_RPC_AUTH: ${BITCOIN_RPC_AUTH:?BITCOIN_RPC_AUTH is required}
       ELECTRUM_HTTP_SERVER_URL: ${ELECTRUM_HTTP_SERVER_URL:?ELECTRUM_HTTP_SERVER_URL is required}
