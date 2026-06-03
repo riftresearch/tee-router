@@ -40,6 +40,44 @@ Compose `configs:` blocks, all images are pulled from public registries, and
 there are no bind mounts of repo files. Phala can deploy it without a repo
 checkout.
 
+#### CVM sizing
+
+The CVM host tier is **not pinned by the stack** — it is an explicit operator
+choice. `compose.phala.yml` declares no `deploy.resources` limits (the ≈32-core
+per-role limits in `compose.local-infra.yml` are loadgen-box sizing; see the
+note under *Temporal Performance Topology*). `just phala-create` provisions the
+CVM with `phala_instance_type` / `phala_disk_size`; subsequent `just
+phala-deploy` / `phala-upgrade` keep the CVM's existing size.
+
+Full Phala TDX (CPU) catalog (`phala instance-types`):
+
+| Tier | vCPU | RAM | ~$/mo (730 h) |
+|---|---|---|---|
+| tdx.small | 1 | 2 GB | ~$42 |
+| tdx.medium | 2 | 4 GB | ~$85 |
+| tdx.large | 4 | 8 GB | ~$169 |
+| **tdx.xlarge** (default) | 8 | 16 GB | ~$339 |
+| tdx.2xlarge | 16 | 32 GB | ~$677 |
+| tdx.4xlarge | 32 | 64 GB | ~$1,355 |
+| tdx.8xlarge | 64 | 128 GB | ~$2,710 |
+
+**The floor is `tdx.xlarge` (8 vCPU / 16 GB)** — the `phala-create` default. The
+two Postgres each set `shared_buffers=1GB` (2 GB hard-allocated before any
+workload) with `effective_cache_size=4GB`, layered on the 4-role Temporal split
+plus the three Rust services (router-api, router-worker, temporal-worker). The
+≤8 GB tiers (small/medium/large) cannot hold that and will OOM/thrash. Disk
+defaults to `--disk-size 60G` (the tier default of 20 GB is too small for two
+Postgres data dirs + Temporal history growth).
+
+Scale up for sustained throughput: `tdx.2xlarge` (16/32) for comfortable
+headroom, `tdx.4xlarge` (32/64) to match the throughput tuning (the ≈32-core
+figure noted above). Override per-deploy without editing the justfile, e.g.:
+
+```bash
+just phala-create 0.2.26 phala_cvm=tee-router-prod1 \
+  phala_instance_type=tdx.2xlarge phala_disk_size=80G
+```
+
 ### Railway
 
 Railway runs every observer, indexer, watcher, and operator-facing service:
@@ -218,7 +256,8 @@ re-tune, change the `export` lines in the `temporal-worker` service.
 > loadgen host. Those limits are **intentionally not** carried into
 > `compose.phala.yml` — they are loadgen-box sizing, are ignored by plain
 > `docker compose up`, and must be sized to the actual Phala TEE host before
-> relying on them.
+> relying on them. See **CVM sizing** under *Phala Cloud (TEE)* for the host
+> tier `just phala-create` provisions (default `tdx.xlarge`).
 
 Source-of-truth Postgres (`postgres`) also received the durability-safe half of
 the `a391849` tuning (`shared_buffers=1GB`, `effective_cache_size=4GB`,
