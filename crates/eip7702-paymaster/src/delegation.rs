@@ -117,6 +117,12 @@ pub(crate) async fn ensure_eip7702_delegation_with_wallet(
     let base_tx = TransactionRequest::default()
         .with_from(sponsor_address)
         .with_to(sponsor_address)
+        // Pin the tx nonce to the on-chain count we already fetched (the
+        // authorization is at nonce + 1). Don't rely on the provider's nonce
+        // filler: on this shared paymaster account it can submit a stale value
+        // (observed "nonce too low": tx 0 vs on-chain state 2), since the same
+        // account also issues serial-funding txs.
+        .with_nonce(nonce)
         .with_authorization_list(vec![signed_authorization]);
 
     // Hardcode the gas limit instead of calling estimate_gas: this delegation
@@ -235,6 +241,12 @@ pub(crate) async fn revoke_eip7702_delegation_with_wallet(
     let base_tx = TransactionRequest::default()
         .with_from(sponsor_address)
         .with_to(sponsor_address)
+        // Pin the tx nonce to the on-chain count we already fetched (the
+        // authorization is at nonce + 1). Don't rely on the provider's nonce
+        // filler: on this shared paymaster account it can submit a stale value
+        // (observed "nonce too low": tx 0 vs on-chain state 2), since the same
+        // account also issues serial-funding txs.
+        .with_nonce(nonce)
         .with_authorization_list(vec![signed_authorization]);
 
     // Fixed gas limit (see DELEGATION_TX_GAS_LIMIT) — same fixed-shape 7702 tx
