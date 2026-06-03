@@ -461,6 +461,7 @@ impl EvmTransferMatcher {
             block_hash: Some(transfer.block_hash.to_string()),
             observed_at: Utc::now(),
             indexer_candidate_id: None,
+            utxos: Vec::new(),
         })
     }
 }

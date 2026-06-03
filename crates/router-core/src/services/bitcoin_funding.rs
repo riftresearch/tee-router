@@ -1,5 +1,6 @@
 use crate::models::DepositVaultFundingObservation;
 use alloy::primitives::U256;
+use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservedBitcoinOutpoint {
@@ -46,6 +47,77 @@ pub fn observed_bitcoin_outpoint(
 
     Ok(Some(ObservedBitcoinOutpoint {
         tx_hash: tx_hash.clone(),
+        vout,
+        amount_sats: amount.to::<u64>(),
+    }))
+}
+
+/// All observed spendable outpoints for a deposit vault, parsed from the funding
+/// observation's `evidence.utxos` snapshot (the full set sauron observed at the
+/// deposit address). Falls back to the single primary outpoint for older hints
+/// that predate the UTXO-set field. Skips structurally-incomplete entries; an
+/// entry with an invalid/zero/oversized amount or oversized vout is an error
+/// (mirrors `observed_bitcoin_outpoint`).
+pub fn observed_bitcoin_utxos(
+    observation: Option<&DepositVaultFundingObservation>,
+) -> Result<Vec<ObservedBitcoinOutpoint>, String> {
+    let Some(observation) = observation else {
+        return Ok(Vec::new());
+    };
+    if let Some(entries) = observation
+        .evidence
+        .get("utxos")
+        .and_then(Value::as_array)
+    {
+        let mut outpoints = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if let Some(outpoint) = utxo_from_evidence_entry(entry)? {
+                outpoints.push(outpoint);
+            }
+        }
+        if !outpoints.is_empty() {
+            return Ok(outpoints);
+        }
+    }
+    // Backward compatibility: hints without a utxos snapshot carry only the
+    // single primary outpoint in the structured observation fields.
+    Ok(observed_bitcoin_outpoint(Some(observation))?
+        .into_iter()
+        .collect())
+}
+
+fn utxo_from_evidence_entry(entry: &Value) -> Result<Option<ObservedBitcoinOutpoint>, String> {
+    let Some(tx_hash) = entry
+        .get("tx_hash")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some(vout_u64) = entry.get("vout").and_then(Value::as_u64) else {
+        return Ok(None);
+    };
+    let vout = u32::try_from(vout_u64)
+        .map_err(|_| format!("bitcoin funding vout {vout_u64} exceeds u32 range"))?;
+    let Some(amount_str) = entry
+        .get("amount")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let amount = U256::from_str_radix(amount_str, 10)
+        .map_err(|_| format!("invalid bitcoin funding amount {amount_str}"))?;
+    if amount == U256::ZERO {
+        return Err("bitcoin funding amount must be positive".to_string());
+    }
+    if amount > U256::from(u64::MAX) {
+        return Err(format!(
+            "bitcoin funding amount {amount_str} exceeds u64 satoshi range"
+        ));
+    }
+    Ok(Some(ObservedBitcoinOutpoint {
+        tx_hash: tx_hash.to_string(),
         vout,
         amount_sats: amount.to::<u64>(),
     }))
@@ -127,5 +199,71 @@ mod tests {
         invalid.transfer_index = Some(u64::from(u32::MAX) + 1);
 
         assert!(observed_bitcoin_outpoint(Some(&invalid)).is_err());
+    }
+
+    fn observation_with_utxos(utxos: serde_json::Value) -> DepositVaultFundingObservation {
+        let mut obs = observation();
+        obs.evidence = json!({ "utxos": utxos });
+        obs
+    }
+
+    #[test]
+    fn observed_bitcoin_utxos_parses_full_set() {
+        let obs = observation_with_utxos(json!([
+            { "tx_hash": "aa", "vout": 0, "amount": "1000" },
+            { "tx_hash": "bb", "vout": 3, "amount": "2500" },
+        ]));
+
+        assert_eq!(
+            observed_bitcoin_utxos(Some(&obs)).expect("valid"),
+            vec![
+                ObservedBitcoinOutpoint {
+                    tx_hash: "aa".to_string(),
+                    vout: 0,
+                    amount_sats: 1000,
+                },
+                ObservedBitcoinOutpoint {
+                    tx_hash: "bb".to_string(),
+                    vout: 3,
+                    amount_sats: 2500,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn observed_bitcoin_utxos_falls_back_to_single_outpoint() {
+        // Old hints (no utxos array) fall back to the single primary outpoint.
+        assert_eq!(
+            observed_bitcoin_utxos(Some(&observation())).expect("valid"),
+            vec![ObservedBitcoinOutpoint {
+                tx_hash: "abc".to_string(),
+                vout: 7,
+                amount_sats: 12_345,
+            }]
+        );
+    }
+
+    #[test]
+    fn observed_bitcoin_utxos_empty_for_none() {
+        assert!(observed_bitcoin_utxos(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn observed_bitcoin_utxos_skips_incomplete_but_rejects_bad_amount() {
+        // Missing vout -> skipped; the valid sibling still parses.
+        let partial = observation_with_utxos(json!([
+            { "tx_hash": "aa", "amount": "1000" },
+            { "tx_hash": "bb", "vout": 1, "amount": "2000" },
+        ]));
+        let utxos = observed_bitcoin_utxos(Some(&partial)).expect("valid");
+        assert_eq!(utxos.len(), 1);
+        assert_eq!(utxos[0].tx_hash, "bb");
+
+        // A present-but-zero amount is an error, not a skip.
+        let zero = observation_with_utxos(json!([
+            { "tx_hash": "aa", "vout": 0, "amount": "0" },
+        ]));
+        assert!(observed_bitcoin_utxos(Some(&zero)).is_err());
     }
 }

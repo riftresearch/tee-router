@@ -95,6 +95,25 @@ pub struct DetectedDeposit {
     pub block_hash: Option<String>,
     pub observed_at: DateTime<Utc>,
     pub indexer_candidate_id: Option<String>,
+    /// The full set of spendable outputs observed at the deposit address (a
+    /// point-in-time snapshot). The single tx_hash/transfer_index/amount above
+    /// remain the "primary" (best) output for backward compatibility; this
+    /// carries every output so the router can store/spend the complete set.
+    /// Empty for non-UTXO chains (EVM/HL), which report one event per deposit.
+    pub utxos: Vec<DetectedUtxo>,
+}
+
+/// A single spendable output observed at a deposit address. Serialized into the
+/// funding-hint evidence JSON as `utxos: [...]` (amounts as decimal strings, to
+/// match the router's existing amount parsing).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetectedUtxo {
+    pub tx_hash: String,
+    pub vout: u64,
+    pub amount: U256,
+    pub confirmation_state: DepositConfirmationState,
+    pub block_height: Option<u64>,
+    pub block_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,6 +148,10 @@ struct DetectedDepositKey {
     tx_hash: String,
     transfer_index: u64,
     confirmation_state: DepositConfirmationState,
+    /// Fingerprint of the full observed UTXO set so a change in the set (a new
+    /// output, or an output confirming) re-emits the snapshot hint even when the
+    /// "best" output is unchanged. Empty string for non-UTXO chains.
+    utxos_fingerprint: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -966,6 +989,14 @@ fn build_detected_deposit_evidence(
             "block_height": detected.block_height,
             "block_hash": detected.block_hash,
             "observed_at": detected.observed_at,
+            "utxos": detected.utxos.iter().map(|utxo| json!({
+                "tx_hash": utxo.tx_hash,
+                "vout": utxo.vout,
+                "amount": utxo.amount.to_string(),
+                "confirmation_state": utxo.confirmation_state.as_str(),
+                "block_height": utxo.block_height,
+                "block_hash": utxo.block_hash,
+            })).collect::<Vec<_>>(),
         }),
         other => unreachable!(
             "submit_detected_deposit only emits BtcDepositObserved/PossibleProgress, got {other:?}"
@@ -1002,17 +1033,43 @@ fn detected_deposit_key(detected: &DetectedDeposit) -> DetectedDepositKey {
         tx_hash: detected.tx_hash.clone(),
         transfer_index: detected.transfer_index,
         confirmation_state: detected.confirmation_state,
+        utxos_fingerprint: utxos_fingerprint(&detected.utxos),
     }
+}
+
+/// Stable digest of the observed UTXO set. Sorted so ordering is irrelevant, and
+/// keyed on `confirmation_state` (mempool/confirmed) rather than the raw
+/// confirmation count so the fingerprint only changes when the set membership or
+/// a confirmation transition changes — not on every block.
+fn utxos_fingerprint(utxos: &[DetectedUtxo]) -> String {
+    if utxos.is_empty() {
+        return String::new();
+    }
+    let mut entries: Vec<String> = utxos
+        .iter()
+        .map(|utxo| {
+            format!(
+                "{}:{}:{}:{}",
+                utxo.tx_hash,
+                utxo.vout,
+                utxo.amount,
+                utxo.confirmation_state.as_str()
+            )
+        })
+        .collect();
+    entries.sort();
+    alloy::hex::encode(Sha256::digest(entries.join("|").as_bytes()))
 }
 
 fn detected_deposit_hint_idempotency_key(backend_name: &str, detected: &DetectedDeposit) -> String {
     let material = format!(
-        "{backend_name}:{}:{}:{}:{}:{}",
+        "{backend_name}:{}:{}:{}:{}:{}:{}",
         detected.watch_target.as_str(),
         detected.watch_id,
         detected.tx_hash,
         detected.transfer_index,
-        detected.confirmation_state.as_str()
+        detected.confirmation_state.as_str(),
+        utxos_fingerprint(&detected.utxos)
     );
     let digest = Sha256::digest(material.as_bytes());
     let idempotency_key = format!(
@@ -1225,6 +1282,7 @@ mod tests {
             block_hash: None,
             observed_at: Utc::now(),
             indexer_candidate_id: None,
+            utxos: Vec::new(),
         }
     }
 

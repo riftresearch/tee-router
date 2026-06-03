@@ -220,6 +220,7 @@ fn detected_from_hyperliquid_event(
         block_hash: None,
         observed_at: Utc::now(),
         indexer_candidate_id: None,
+        utxos: Vec::new(),
     }
 }
 

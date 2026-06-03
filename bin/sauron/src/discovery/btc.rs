@@ -13,7 +13,8 @@ use tracing::warn;
 use crate::{
     config::SauronArgs,
     discovery::{
-        BlockCursor, BlockScan, DepositConfirmationState, DetectedDeposit, DiscoveryBackend,
+        BlockCursor, BlockScan, DepositConfirmationState, DetectedDeposit, DetectedUtxo,
+        DiscoveryBackend,
     },
     error::{Error, Result},
     watch::{SharedWatchEntry, WatchEntry},
@@ -132,16 +133,27 @@ pub async fn output_for_watch(
     let min_amount = u256_to_u64(watch.min_amount, "min_amount")?;
     let max_amount = u256_to_u64(watch.max_amount, "max_amount").unwrap_or(u64::MAX);
     let address = parse_bitcoin_address(&watch.address)?;
-    let output = best_output(client, address, min_amount, max_amount).await?;
-    Ok(output.map(|output| detected_from_output(watch, output)))
+    let outputs = spendable_outputs(client, address, min_amount, max_amount).await?;
+    let Some(best) = outputs.iter().cloned().max_by_key(|output| {
+        (
+            output.confirmations,
+            output.block_height.unwrap_or_default(),
+        )
+    }) else {
+        return Ok(None);
+    };
+    Ok(Some(detected_from_output(watch, best, &outputs)))
 }
 
-pub async fn best_output(
+/// Fetch the full set of spendable (non-removed, in-range) outputs at the
+/// address. The router stores this complete set; the caller still selects a
+/// single "best" output for the primary funding fields.
+pub async fn spendable_outputs(
     client: &BitcoinIndexerClient,
     address: Address<NetworkUnchecked>,
     min_amount: u64,
     max_amount: u64,
-) -> Result<Option<TxOutput>> {
+) -> Result<Vec<TxOutput>> {
     let mut query = TxOutputQuery::new(address);
     query.min_amount = Some(min_amount);
     query.limit = Some(250);
@@ -154,6 +166,18 @@ pub async fn best_output(
         .into_iter()
         .filter(|output| !output.removed)
         .filter(|output| output.amount_sats >= min_amount && output.amount_sats <= max_amount)
+        .collect())
+}
+
+pub async fn best_output(
+    client: &BitcoinIndexerClient,
+    address: Address<NetworkUnchecked>,
+    min_amount: u64,
+    max_amount: u64,
+) -> Result<Option<TxOutput>> {
+    Ok(spendable_outputs(client, address, min_amount, max_amount)
+        .await?
+        .into_iter()
         .max_by_key(|output| {
             (
                 output.confirmations,
@@ -162,8 +186,30 @@ pub async fn best_output(
         }))
 }
 
-fn detected_from_output(watch: &WatchEntry, output: TxOutput) -> DetectedDeposit {
-    let confirmed = output.confirmations > 0 && output.block_height.is_some();
+fn output_confirmation_state(output: &TxOutput) -> DepositConfirmationState {
+    if output.confirmations > 0 && output.block_height.is_some() {
+        DepositConfirmationState::Confirmed
+    } else {
+        DepositConfirmationState::Mempool
+    }
+}
+
+fn detected_utxo_from_output(output: &TxOutput) -> DetectedUtxo {
+    DetectedUtxo {
+        tx_hash: output.txid.to_string(),
+        vout: u64::from(output.vout),
+        amount: U256::from(output.amount_sats),
+        confirmation_state: output_confirmation_state(output),
+        block_height: output.block_height,
+        block_hash: output.block_hash.as_ref().map(|hash| hash.to_string()),
+    }
+}
+
+fn detected_from_output(
+    watch: &WatchEntry,
+    output: TxOutput,
+    all_outputs: &[TxOutput],
+) -> DetectedDeposit {
     DetectedDeposit {
         watch_target: watch.watch_target,
         watch_id: watch.watch_id,
@@ -176,15 +222,12 @@ fn detected_from_output(watch: &WatchEntry, output: TxOutput) -> DetectedDeposit
         tx_hash: output.txid.to_string(),
         transfer_index: u64::from(output.vout),
         amount: U256::from(output.amount_sats),
-        confirmation_state: if confirmed {
-            DepositConfirmationState::Confirmed
-        } else {
-            DepositConfirmationState::Mempool
-        },
+        confirmation_state: output_confirmation_state(&output),
         block_height: output.block_height,
         block_hash: output.block_hash.map(|hash| hash.to_string()),
         observed_at: Utc::now(),
         indexer_candidate_id: None,
+        utxos: all_outputs.iter().map(detected_utxo_from_output).collect(),
     }
 }
 
