@@ -98,7 +98,6 @@ pub struct MarketPricingSnapshot {
     pub ethereum_gas_price_wei: u64,
     pub arbitrum_gas_price_wei: u64,
     pub base_gas_price_wei: u64,
-
 }
 
 #[derive(Debug, Clone)]
@@ -107,7 +106,6 @@ pub struct MarketPricingOracleConfig {
     pub ethereum_rpc_url: Url,
     pub arbitrum_rpc_url: Url,
     pub base_rpc_url: Url,
-
 
     pub hyperliquid_api_base_url: Url,
     pub timeout: Duration,
@@ -127,7 +125,6 @@ impl MarketPricingOracleConfig {
             ethereum_rpc_url: parse_http_url(ethereum_rpc_url.as_ref())?,
             arbitrum_rpc_url: parse_http_url(arbitrum_rpc_url.as_ref())?,
             base_rpc_url: parse_http_url(base_rpc_url.as_ref())?,
-
 
             hyperliquid_api_base_url: parse_http_url(
                 hyperliquid_api_base_url.unwrap_or(HYPERLIQUID_INFO_DEFAULT_BASE_URL),
@@ -151,7 +148,6 @@ pub struct MarketPricingOracle {
     arbitrum_http: reqwest::Client,
     base_http: reqwest::Client,
     hyperliquid_http: reqwest::Client,
-
 }
 
 impl MarketPricingOracle {
@@ -166,7 +162,6 @@ impl MarketPricingOracle {
         arbitrum_rpc_proxy_url: Option<&str>,
         base_rpc_proxy_url: Option<&str>,
         hyperliquid_proxy_url: Option<&str>,
-
     ) -> MarketPricingResult<Self> {
         let coinbase_http = pricing_http_client(config.timeout, coinbase_proxy_url)?;
         let ethereum_http = pricing_http_client(config.timeout, ethereum_rpc_proxy_url)?;
@@ -181,7 +176,6 @@ impl MarketPricingOracle {
             arbitrum_http,
             base_http,
             hyperliquid_http,
-
         })
     }
 
@@ -212,7 +206,6 @@ impl MarketPricingOracle {
         )?;
         let hype_usd_micro = self.optional_hyperliquid_hype_usd_micro().await;
 
-
         Ok(MarketPricingSnapshot {
             source: "coinbase_spot_plus_rpc_gas_v1".to_string(),
             captured_at,
@@ -224,7 +217,6 @@ impl MarketPricingOracle {
             ethereum_gas_price_wei,
             arbitrum_gas_price_wei,
             base_gas_price_wei,
-
         })
     }
 
@@ -291,7 +283,6 @@ impl MarketPricingOracle {
         ensure_positive_price("hyperliquid HYPE", value)?;
         Ok(value)
     }
-
 
     async fn evm_gas_price_wei(
         &self,
@@ -1004,7 +995,6 @@ mod tests {
             ethereum_rpc_url,
             env::var("ARBITRUM_RPC_URL").expect("ARBITRUM_RPC_URL"),
             env::var("BASE_RPC_URL").expect("BASE_RPC_URL"),
-
             None,
         )
         .unwrap();

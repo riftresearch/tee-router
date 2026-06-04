@@ -64,11 +64,7 @@ pub fn observed_bitcoin_utxos(
     let Some(observation) = observation else {
         return Ok(Vec::new());
     };
-    if let Some(entries) = observation
-        .evidence
-        .get("utxos")
-        .and_then(Value::as_array)
-    {
+    if let Some(entries) = observation.evidence.get("utxos").and_then(Value::as_array) {
         let mut outpoints = Vec::with_capacity(entries.len());
         for entry in entries {
             if let Some(outpoint) = utxo_from_evidence_entry(entry)? {
@@ -128,7 +124,13 @@ fn utxo_from_evidence_entry(entry: &Value) -> Result<Option<ObservedBitcoinOutpo
 pub fn bitcoin_outpoint_tuples(outpoints: &[ObservedBitcoinOutpoint]) -> Vec<(String, u32, u64)> {
     outpoints
         .iter()
-        .map(|outpoint| (outpoint.tx_hash.clone(), outpoint.vout, outpoint.amount_sats))
+        .map(|outpoint| {
+            (
+                outpoint.tx_hash.clone(),
+                outpoint.vout,
+                outpoint.amount_sats,
+            )
+        })
         .collect()
 }
 

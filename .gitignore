@@ -53,6 +53,7 @@ railway/env/*.env
 *.swo
 *~
 tmp/
+paymaster-system-overview.html
 .cache/
 
 # Logs

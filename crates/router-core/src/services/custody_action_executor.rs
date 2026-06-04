@@ -506,8 +506,7 @@ impl CustodyActionExecutor {
                                     chain: vault.chain,
                                 });
                             };
-                            let observed_utxos =
-                                self.observed_bitcoin_source_utxos(&vault).await?;
+                            let observed_utxos = self.observed_bitcoin_source_utxos(&vault).await?;
                             let observed_spend = if observed_utxos.is_empty() {
                                 None
                             } else {
@@ -669,10 +668,12 @@ impl CustodyActionExecutor {
                     });
                 };
                 let observed_utxos = observed_bitcoin_utxos(vault.funding_observation.as_ref())
-                    .map_err(|reason| CustodyActionError::InvalidBitcoinFundingObservation {
-                        vault_id: vault.id,
-                        reason,
-                    })?;
+                    .map_err(
+                        |reason| CustodyActionError::InvalidBitcoinFundingObservation {
+                            vault_id: vault.id,
+                            reason,
+                        },
+                    )?;
                 if !observed_utxos.is_empty() {
                     // Sum the spendable value of each observed outpoint (RPC). A
                     // spent/reorged outpoint contributes 0, so a stale snapshot

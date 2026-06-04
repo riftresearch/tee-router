@@ -18,8 +18,8 @@ use router_core::{
             CctpHttpProviderConfig, CctpTransferMode, VeloraHttpProviderConfig,
         },
         custody_action_executor::{
-            evm_address_from_private_key, CustodyActionExecutor,
-            HyperliquidCallNetwork, HyperliquidRuntimeConfig, PaymasterRegistry,
+            evm_address_from_private_key, CustodyActionExecutor, HyperliquidCallNetwork,
+            HyperliquidRuntimeConfig, PaymasterRegistry,
         },
         upstream_proxy::{
             effective_proxy, normalize_optional_string as normalize_proxy_string, ProxyUrl,
@@ -115,7 +115,6 @@ pub struct OrderWorkerRuntimeArgs {
     /// Arbitrum paymaster private key used to top up EVM token vault gas
     #[arg(long, env = "ARBITRUM_PAYMASTER_PRIVATE_KEY")]
     pub arbitrum_paymaster_private_key: Option<String>,
-
 
     /// Bitcoin RPC URL
     #[arg(long, env = "BITCOIN_RPC_URL")]
@@ -604,7 +603,6 @@ fn initialize_pricing_provider(
         &args.ethereum_mainnet_rpc_url,
         &args.arbitrum_rpc_url,
         &args.base_rpc_url,
-
         args.hyperliquid_api_url.as_deref(),
     )
     .map_err(|source| config_error(format!("invalid USD pricing oracle config: {source}")))?;
@@ -616,7 +614,6 @@ fn initialize_pricing_provider(
             proxies.arbitrum_rpc.as_ref().map(ProxyUrl::as_str),
             proxies.base_rpc.as_ref().map(ProxyUrl::as_str),
             proxies.hyperliquid.as_ref().map(ProxyUrl::as_str),
-
         )
         .map_err(|source| {
             config_error(format!("failed to initialize USD pricing oracle: {source}"))

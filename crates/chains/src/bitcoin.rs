@@ -910,7 +910,12 @@ impl BitcoinChain {
         let mut outputs = Vec::with_capacity(outpoints.len());
         for (tx_hash, vout, expected_amount_sats) in outpoints {
             match self
-                .spendable_output_from_outpoint(sender_address, tx_hash, *vout, *expected_amount_sats)
+                .spendable_output_from_outpoint(
+                    sender_address,
+                    tx_hash,
+                    *vout,
+                    *expected_amount_sats,
+                )
                 .await
             {
                 Ok(output) => outputs.push(output),
@@ -968,7 +973,8 @@ impl BitcoinChain {
                 message: "Bitcoin transfer input amount overflow".to_string(),
             })?;
         let fee_sats = bitcoin_transfer_fee_sats(
-            self.estimate_p2wpkh_transfer_fee_sats(utxos.len(), 2).await?,
+            self.estimate_p2wpkh_transfer_fee_sats(utxos.len(), 2)
+                .await?,
             fee_budget,
         )?;
         let required_sats =
@@ -1017,7 +1023,10 @@ impl BitcoinChain {
                     satisfaction_weight,
                 )
                 .map_err(|e| crate::Error::DumpToAddress {
-                    message: format!("Failed to add foreign UTXO {}:{}: {e}", utxo.txid, utxo.vout),
+                    message: format!(
+                        "Failed to add foreign UTXO {}:{}: {e}",
+                        utxo.txid, utxo.vout
+                    ),
                 })?;
         }
 
@@ -1078,7 +1087,9 @@ impl BitcoinChain {
         }
         // Fee from the verified input count (single-output sweep), so a partly
         // stale snapshot does not overpay.
-        let fee_sats = self.estimate_p2wpkh_transfer_fee_sats(utxos.len(), 1).await?;
+        let fee_sats = self
+            .estimate_p2wpkh_transfer_fee_sats(utxos.len(), 1)
+            .await?;
         Ok(Some(self.build_signed_p2wpkh_sweep_from_outputs(
             private_key,
             recipient_address,
@@ -1112,14 +1123,18 @@ impl BitcoinChain {
         let sender_address =
             Address::p2wpkh(&compressed_public_key_for(&private_key)?, self.network);
 
-        let utxos = self.spendable_outputs_for_address(&sender_address, 1).await?;
+        let utxos = self
+            .spendable_outputs_for_address(&sender_address, 1)
+            .await?;
         if utxos.is_empty() {
             return Ok(None);
         }
         // Fee from the discovered input count (single-output sweep). A fixed
         // single-input estimate underpays a multi-UTXO sweep and is rejected
         // for failing the minimum relay fee.
-        let fee_sats = self.estimate_p2wpkh_transfer_fee_sats(utxos.len(), 1).await?;
+        let fee_sats = self
+            .estimate_p2wpkh_transfer_fee_sats(utxos.len(), 1)
+            .await?;
         Ok(Some(self.build_signed_p2wpkh_sweep_from_outputs(
             private_key,
             recipient_address,
